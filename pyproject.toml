@@ -10,7 +10,7 @@ authors = [
 ]
 dependencies = [
     "asyncio>=3.4.3",
-    "qh3>=1.2.0",
+    "qh3>=1.5.0",
     "sortedcontainers>=2.4.0",
 ]
 
