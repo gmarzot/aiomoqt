@@ -286,7 +286,7 @@ class SubscribeDone(MOQTMessage):
     reason: str
 
     def __post_init__(self):
-        self.type = MOQTMessageType.SUBSCRIBE_DONE
+        self.type = MOQTMessageType.PUBLISH_DONE
 
     def serialize(self) -> bytes:
         # First encode the payload
@@ -342,7 +342,7 @@ class MaxSubscribeId(MOQTMessage):
     subscribe_id: int
 
     def __post_init__(self):
-        self.type = MOQTMessageType.MAX_SUBSCRIBE_ID
+        self.type = MOQTMessageType.MAX_REQUEST_ID
 
     def serialize(self) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
@@ -367,7 +367,7 @@ class SubscribesBlocked(MOQTMessage):
     maximum_subscribe_id: int
 
     def __post_init__(self):
-        self.type = MOQTMessageType.SUBSCRIBES_BLOCKED
+        self.type = MOQTMessageType.REQUESTS_BLOCKED
 
     def serialize(self) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)

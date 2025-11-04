@@ -148,7 +148,7 @@ SERVER_SETUP_TEST_CASES = [
         {
             "selected_version": 0xff0000A,
             "parameters": {
-                SetupParamType.MAX_SUBSCRIBER_ID: 1000,
+                SetupParamType.MAX_REQUEST_ID: 1000,
             }
         },
         MOQTMessageType.SERVER_SETUP,
@@ -174,7 +174,7 @@ CLIENT_SETUP_TEST_CASES = [
         {
             "versions": [1, 2],
             "parameters": {
-                SetupParamType.MAX_SUBSCRIBER_ID: 100,
+                SetupParamType.MAX_REQUEST_ID: 100,
                 SetupParamType.ENDPOINT_PATH: b"/path/to/endpoint"
             }
         },
@@ -220,55 +220,55 @@ GOAWAY_TEST_CASES = [
 TEST_CASES = [
     # (class, params, type_id, needs_len, test_id)
     (
-        Announce,
+        PublishNamespace,
         {
             'namespace': (b'vivohcast', b'net', b'live'),
             'parameters': {
-                ParamType.AUTHORIZATION_INFO: b'auth-token-123',
+                ParamType.AUTHORIZATION_TOKEN: b'auth-token-123',
                 ParamType.GREASE_1_PARAM: b'\xDE\xAD\xBE\xEF'
             }
         },
-        MOQTMessageType.ANNOUNCE,
+        MOQTMessageType.PUBLISH_NAMESPACE,
         False
     ),
     (
-        AnnounceOk,
+        PublishNamespaceOk,
         {
             'namespace': (b'vivohcast', b'net', b'live')
         },
-        MOQTMessageType.ANNOUNCE_OK,
+        MOQTMessageType.PUBLISH_NAMESPACE_OK,
         False
     ),
     (
-        AnnounceError,
+        PublishNamespaceError,
         {
             'namespace': (b'vivohcast', b'net', b'live'),
             'error_code': 404,
             'reason': 'Not found'
         },
-        MOQTMessageType.ANNOUNCE_ERROR,
+        MOQTMessageType.PUBLISH_NAMESPACE_ERROR,
         False
     ),
     (
-        Unannounce,
+        PublishNamespaceDone,
         {
             'namespace': (b'vivohcast', b'net', b'live')
         },
-        MOQTMessageType.UNANNOUNCE,
+        MOQTMessageType.PUBLISH_NAMESPACE_DONE,
         False,
     ),
     (
-        AnnounceCancel,
+        PublishNamespaceCancel,
         {
             'namespace': (b'vivohcast', b'net', b'live'),
             'error_code': 503,
             'reason': 'Service unavailable'
         },
-        MOQTMessageType.ANNOUNCE_CANCEL,
+        MOQTMessageType.PUBLISH_NAMESPACE_CANCEL,
         False,
     ),
     (
-        SubscribeAnnounces,
+        SubscribeNamespace,
         {
             'namespace_prefix': (b'vivohcast', b'net'),
             'parameters': {
@@ -276,33 +276,33 @@ TEST_CASES = [
                 2: b'param2'
             }
         },
-        MOQTMessageType.SUBSCRIBE_ANNOUNCES,
+        MOQTMessageType.SUBSCRIBE_NAMESPACE,
         False,
     ),
     (
-        SubscribeAnnouncesOk,
+        SubscribeNamespaceOk,
         {
             'namespace_prefix': (b'vivohcast', b'net')
         },
-        MOQTMessageType.SUBSCRIBE_ANNOUNCES_OK,
+        MOQTMessageType.SUBSCRIBE_NAMESPACE_OK,
         False,
     ),
     (
-        SubscribeAnnouncesError,
+        SubscribeNamespaceError,
         {
             'namespace_prefix': (b'vivohcast', b'net'),
             'error_code': 400,
             'reason': 'Bad request'
         },
-        MOQTMessageType.SUBSCRIBE_ANNOUNCES_ERROR,
+        MOQTMessageType.SUBSCRIBE_NAMESPACE_ERROR,
         False,
     ),
     (
-        UnsubscribeAnnounces,
+        UnsubscribeNamespace,
         {
             'namespace_prefix': (b'vivohcast', b'net')
         },
-        MOQTMessageType.UNSUBSCRIBE_ANNOUNCES,
+        MOQTMessageType.UNSUBSCRIBE_NAMESPACE,
         False,
     ),
     (

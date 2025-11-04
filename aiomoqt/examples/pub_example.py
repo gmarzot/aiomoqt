@@ -289,7 +289,7 @@ async def main(host: str, port: int, endpoint: str, namespace: str, trackname: s
     logger.info(f"MOQT app: publish session connecting: {client}")
     async with client.connect() as session:
         try:
-            # # experiment socker options
+            # # experiment socket options
             # sock = session._transport.get_extra_info('socket')
             # current_rcvbuf = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
             # current_sndbuf = sock.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)
@@ -298,13 +298,13 @@ async def main(host: str, port: int, endpoint: str, namespace: str, trackname: s
             # Complete the MoQT session setup
             await session.client_session_init()
 
-            logger.info(f"MOQT app: announce namespace: {namespace}")
-            response = await session.announce(
+            logger.info(f"MOQT app: publish_namespace: {namespace}")
+            response = await session.publish_namespace(
                 namespace=namespace,
-                parameters={ParamType.AUTHORIZATION_INFO: b"auth-token-123"},
+                parameters={ParamType.AUTHORIZATION_TOKEN: b"auth-token-123"},
                 wait_response=True,
             )
-            logger.info(f"MOQT app: announce reponse: {response}")
+            logger.info(f"MOQT app: publish_namespace reponse: {response}")
             
             # Process subscriptions until closed
             await session.async_closed()

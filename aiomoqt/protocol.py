@@ -91,8 +91,8 @@ class MOQTSession(QuicConnectionProtocol):
         self._data_streams: Dict[int, int] = {}  # keep track of active data streams
         self._track_aliases: Dict[int, int] = {}  # map alias to subscription_id
         self._subscriptions: Dict[int, List] = {}  # map subscription_id to request
-        self._announce_responses: Dict[int, Future[MOQTMessage]] = {}
-        self._subscribe_announces_responses: Dict[int, Future[MOQTMessage]] = {}
+        self._publish_namepace_responses: Dict[int, Future[MOQTMessage]] = {}
+        self._subscribe_namespace_responses: Dict[int, Future[MOQTMessage]] = {}
         self._subscribe_responses: Dict[int, Future[MOQTMessage]] = {}
         self._unsubscribe_responses: Dict[int, Future[MOQTMessage]] = {}
         self._fetch_responses: Dict[int, Future[MOQTMessage]] = {} 
@@ -170,7 +170,7 @@ class MOQTSession(QuicConnectionProtocol):
         try:
             start_pos = buf.tell()
             msg_type = buf.pull_uint_var()
-            msg_len = buf.pull_uint_var()
+            msg_len = buf.pull_uint16()
             hdr_len = buf.tell() - start_pos
             end_pos = start_pos + hdr_len + msg_len
             assert buf.tell() + msg_len <= buf_len
@@ -803,7 +803,9 @@ class MOQTSession(QuicConnectionProtocol):
         # Send CLIENT_SETUP
         client_setup = self.client_setup(
             versions=MOQT_VERSIONS,
-            parameters={SetupParamType.MAX_SUBSCRIBER_ID: MOQTMessage._varint_encode(1000)}
+            parameters={
+                SetupParamType.MAX_REQUEST_ID: 1000
+            }
         )
 
         # Wait for SERVER_SETUP
@@ -1202,15 +1204,15 @@ class MOQTSession(QuicConnectionProtocol):
         self.send_control_message(message.serialize())
         return message
 
-    def announce(
+    def publish_namespace(
         self,
         namespace: Union[str, Tuple[str, ...]],
         parameters: Optional[Dict[int, bytes]] = None,
         wait_response: Optional[bool] = False
     ) -> Optional[MOQTMessage]:
-        """Announce track namespace availability."""
+        """PublishNamespace track namespace availability."""
         namespace_tuple = self._make_namespace_tuple(namespace)
-        message = Announce(
+        message = PublishNamespace(
             namespace=namespace_tuple,
             parameters=parameters or {}
         )
@@ -1221,51 +1223,51 @@ class MOQTSession(QuicConnectionProtocol):
             return message
 
         # Create future for response
-        announce_fut = self._loop.create_future()
-        self._announce_responses[namespace_tuple] = announce_fut
+        publish_namepace_fut = self._loop.create_future()
+        self._publish_namepace_responses[namespace_tuple] = publish_namepace_fut
 
         async def wait_for_response():
             try:
                 async with asyncio.timeout(10):
-                    response = await announce_fut
+                    response = await publish_namepace_fut
             except asyncio.TimeoutError:
                 # Create synthetic error response
-                response = AnnounceError(
+                response = PublishNamespaceError(
                     namespace=namespace,
                     error_code=0x5,  # TIMEOUT error code
                     reason="Response timeout"
                 )
-                logger.error(f"Timeout waiting for announce response")
+                logger.error(f"Timeout waiting for publish_namespace response")
             finally:
-                self._announce_responses.pop(namespace, None)
+                self._publish_namepace_responses.pop(namespace, None)
             return response
 
         return wait_for_response()
 
-    def announce_ok(
+    def publish_namepace_ok(
         self,
         namespace: Union[str, Tuple[str, ...]],
     ) -> Optional[MOQTMessage]:
         """Create and send a ANNOUNCE_OK response."""
         namespace_tuple = self._make_namespace_tuple(namespace)
-        message = AnnounceOk(
+        message = PublishNamespaceOk(
             namespace=namespace_tuple,
         )
         logger.info(f"MOQT send: {message}")
         self.send_control_message(message.serialize())
         return message
 
-    def unannounce(
+    def publish_namespace_done(
         self,
         namespace: Tuple[bytes, ...]
     ) -> Optional[MOQTMessage]:
         """Withdraw track namespace announcement. (no reply expected)"""        
-        message =  Unannounce(namespace=namespace)
+        message =  PublishNamespaceDone(namespace=namespace)
         logger.info(f"MOQT send: {message}")
         self.send_control_message(message.serialize())
         return message
 
-    def subscribe_announces(
+    def subscribe_namespace(
         self,
         namespace_prefix: str,
         parameters: Optional[Dict[int, bytes]] = None,
@@ -1276,7 +1278,7 @@ class MOQTSession(QuicConnectionProtocol):
             parameters = {}
 
         prefix = self._make_namespace_tuple(namespace_prefix)
-        message = SubscribeAnnounces(
+        message = SubscribeNamespace(
             namespace_prefix=prefix,
             parameters=parameters
         )
@@ -1287,46 +1289,46 @@ class MOQTSession(QuicConnectionProtocol):
             return message
 
         # Create future for response
-        sub_announces_fut = self._loop.create_future()
-        self._subscribe_announces_responses[prefix] = sub_announces_fut
+        sub_namespace_fut = self._loop.create_future()
+        self._subscribe_namespace_responses[prefix] = sub_namespace_fut
 
         async def wait_for_response():
             try:
                 async with asyncio.timeout(10):
-                    response = await sub_announces_fut
+                    response = await sub_namespace_fut
             except asyncio.TimeoutError:
                 # Create synthetic error response
-                response = SubscribeAnnouncesError(
+                response = SubscribeNamespaceError(
                     namespace_prefix=prefix,
                     error_code=0x5,  # TIMEOUT error code
                     reason="Response timeout"
                 )
                 logger.error(f"Timeout waiting for announce subscribe response")
             finally:
-                self._subscribe_announces_responses.pop(prefix, None)
+                self._subscribe_namespace_responses.pop(prefix, None)
             
             return response
 
         return wait_for_response()
 
-    def subscribe_announces_ok(
+    def subscribe_namespace_ok(
         self,
         namespace_prefix: Union[str, Tuple[str, ...]],
     ) -> Optional[MOQTMessage]:
         """Create and send a SUBSCRIBE_ANNOUNCES_OK response."""
         namespace_tuple = self._make_namespace_tuple(namespace_prefix)
-        message = SubscribeAnnouncesOk(namespace_prefix=namespace_tuple)
+        message = SubscribeNamespaceOk(namespace_prefix=namespace_tuple)
         logger.info(f"MOQT send: {message}")
         self.send_control_message(message.serialize())
         return message
 
-    def unsubscribe_announces(
+    def unsubscribe_namespace(
         self,
         namespace_prefix: str
     ) -> Optional[MOQTMessage]:
         """Unsubscribe from announcements for a namespace prefix."""        
         prefix = self._make_namespace_tuple(namespace_prefix)
-        message = UnsubscribeAnnounces(namespace_prefix=prefix)
+        message = UnsubscribeNamespace(namespace_prefix=prefix)
         logger.info(f"MOQT send: {message}")
         self.send_control_message(message.serialize())
         return message
@@ -1418,9 +1420,9 @@ class MOQTSession(QuicConnectionProtocol):
             content_exists=ContentExistsCode.NO_CONTENT,
         )
 
-    async def _handle_announce(self, msg: Announce) -> None:
+    async def _handle_publish_namepace(self, msg: PublishNamespace) -> None:
         logger.info(f"MOQT receive: {msg}")
-        self.announce_ok(msg.namespace)
+        self.publish_namepace_ok(msg.namespace)
 
     async def _handle_subscribe_update(self, msg: SubscribeUpdate) -> None:
         logger.info(f"MOQT event: handle {msg}")
@@ -1448,25 +1450,25 @@ class MOQTSession(QuicConnectionProtocol):
         else:
             logger.warning(f"MOQT messages: unsolicited SubscribeError(msg.subscribe_id)")
             
-    async def _handle_announce_ok(self, msg: AnnounceOk) -> None:
+    async def _handle_publish_namepace_ok(self, msg: PublishNamespaceOk) -> None:
         logger.info(f"MOQT event: handle {msg}")
         # Set future result for announcer waiting for response
-        future = self._announce_responses.get(msg.namespace)
+        future = self._publish_namepace_responses.get(msg.namespace)
         if future and not future.done():
             future.set_result(msg)
 
-    async def _handle_announce_error(self, msg: AnnounceError) -> None:
+    async def _handle_publish_namepace_error(self, msg: PublishNamespaceError) -> None:
         logger.info(f"MOQT event: handle {msg}")
         # Set future result for announcer waiting for response
-        future = self._announce_responses.get(msg.namespace)
+        future = self._publish_namepace_responses.get(msg.namespace)
         if future and not future.done():
             future.set_result(msg)
 
-    async def _handle_unannounce(self, msg: Unannounce) -> None:
+    async def _handle_publish_namepace_done(self, msg: PublishNamespaceDone) -> None:
         logger.info(f"MOQT event: handle {msg}")
-        self.announce_ok(msg.namespace)
+        self.publish_namepace_ok(msg.namespace)
 
-    async def _handle_announce_cancel(self, msg: AnnounceCancel) -> None:
+    async def _handle_publish_namepace_cancel(self, msg: PublishNamespaceCancel) -> None:
         logger.info(f"MOQT event: handle {msg}")
         # Handle announcement cancellation
 
@@ -1501,27 +1503,27 @@ class MOQTSession(QuicConnectionProtocol):
         logger.info(f"MOQT event: handle {msg}")
         # Handle session migration request
 
-    async def _handle_subscribe_announces(self, msg: SubscribeAnnounces) -> None:
+    async def _handle_subscribe_namespace(self, msg: SubscribeNamespace) -> None:
         logger.info(f"MOQT event: handle {msg}")
-        self.subscribe_announces_ok(msg.namespace_prefix)
+        self.subscribe_namespace_ok(msg.namespace_prefix)
            
-    async def _handle_subscribe_announces_ok(self, msg: SubscribeAnnouncesOk) -> None:
+    async def _handle_subscribe_namespace_ok(self, msg: SubscribeNamespaceOk) -> None:
         logger.info(f"MOQT event: handle {msg}")
         # Set future result for subscriber waiting for response
-        future = self._subscribe_announces_responses.get(msg.namespace_prefix)
+        future = self._subscribe_namespace_responses.get(msg.namespace_prefix)
         if future and not future.done():
             future.set_result(msg)
 
-    async def _handle_subscribe_announces_error(self, msg: SubscribeAnnouncesError) -> None:
+    async def _handle_subscribe_namespace_error(self, msg: SubscribeNamespaceError) -> None:
         logger.info(f"MOQT event: handle {msg}")
         # Set future result for subscriber waiting for response
-        future = self._subscribe_announces_responses.get(msg.namespace_prefix)
+        future = self._subscribe_namespace_responses.get(msg.namespace_prefix)
         if future and not future.done():
             future.set_result(msg)
 
-    async def _handle_unsubscribe_announces(self, msg: UnsubscribeAnnounces) -> None:
+    async def _handle_unsubscribe_namespace(self, msg: UnsubscribeNamespace) -> None:
         logger.info(f"MOQT event: handle {msg}")
-        self.subscribe_announces_ok(msg.namespace_prefix)
+        self.subscribe_namespace_ok(msg.namespace_prefix)
 
     async def _handle_fetch(self, msg: Fetch) -> None:
         logger.info(f"MOQT event: handle {msg}")
@@ -1615,18 +1617,18 @@ class MOQTSession(QuicConnectionProtocol):
        MOQTMessageType.SUBSCRIBE_OK: (SubscribeOk, _handle_subscribe_ok), 
        MOQTMessageType.SUBSCRIBE_ERROR: (SubscribeError, _handle_subscribe_error),
 
-       # Announce messages
-       MOQTMessageType.ANNOUNCE: (Announce, _handle_announce),
-       MOQTMessageType.ANNOUNCE_OK: (AnnounceOk, _handle_announce_ok),
-       MOQTMessageType.ANNOUNCE_ERROR: (AnnounceError, _handle_announce_error),
-       MOQTMessageType.UNANNOUNCE: (Unannounce, _handle_unannounce),
-       MOQTMessageType.ANNOUNCE_CANCEL: (AnnounceCancel, _handle_announce_cancel),
+       # PublishNamespace messages
+       MOQTMessageType.PUBLISH_NAMESPACE: (PublishNamespace, _handle_publish_namepace),
+       MOQTMessageType.PUBLISH_NAMESPACE_OK: (PublishNamespaceOk, _handle_publish_namepace_ok),
+       MOQTMessageType.PUBLISH_NAMESPACE_ERROR: (PublishNamespaceError, _handle_publish_namepace_error),
+       MOQTMessageType.PUBLISH_NAMESPACE_DONE: (PublishNamespaceDone, _handle_publish_namepace_done),
+       MOQTMessageType.PUBLISH_NAMESPACE_CANCEL: (PublishNamespaceCancel, _handle_publish_namepace_cancel),
 
        # Subscribe control messages
        MOQTMessageType.UNSUBSCRIBE: (Unsubscribe, _handle_unsubscribe),
-       MOQTMessageType.SUBSCRIBE_DONE: (SubscribeDone, _handle_subscribe_done),
-       MOQTMessageType.MAX_SUBSCRIBE_ID: (MaxSubscribeId, _handle_max_subscribe_id),
-       MOQTMessageType.SUBSCRIBES_BLOCKED: (SubscribesBlocked, _handle_subscribes_blocked),
+       MOQTMessageType.PUBLISH_DONE: (SubscribeDone, _handle_subscribe_done),
+       MOQTMessageType.MAX_REQUEST_ID: (MaxSubscribeId, _handle_max_subscribe_id),
+       MOQTMessageType.REQUESTS_BLOCKED: (SubscribesBlocked, _handle_subscribes_blocked),
 
        # Status messages
        MOQTMessageType.TRACK_STATUS_REQUEST: (TrackStatusRequest, _handle_track_status_request),
@@ -1635,11 +1637,11 @@ class MOQTSession(QuicConnectionProtocol):
        # Session control messages
        MOQTMessageType.GOAWAY: (GoAway, _handle_goaway),
 
-       # Subscribe announces messages
-       MOQTMessageType.SUBSCRIBE_ANNOUNCES: (SubscribeAnnounces, _handle_subscribe_announces),
-       MOQTMessageType.SUBSCRIBE_ANNOUNCES_OK: (SubscribeAnnouncesOk, _handle_subscribe_announces_ok),
-       MOQTMessageType.SUBSCRIBE_ANNOUNCES_ERROR: (SubscribeAnnouncesError, _handle_subscribe_announces_error),
-       MOQTMessageType.UNSUBSCRIBE_ANNOUNCES: (UnsubscribeAnnounces, _handle_unsubscribe_announces),
+       # Subscribe namespace messages
+       MOQTMessageType.SUBSCRIBE_NAMESPACE: (SubscribeNamespace, _handle_subscribe_namespace),
+       MOQTMessageType.SUBSCRIBE_NAMESPACE_OK: (SubscribeNamespaceOk, _handle_subscribe_namespace_ok),
+       MOQTMessageType.SUBSCRIBE_NAMESPACE_ERROR: (SubscribeNamespaceError, _handle_subscribe_namespace_error),
+       MOQTMessageType.UNSUBSCRIBE_NAMESPACE: (UnsubscribeNamespace, _handle_unsubscribe_namespace),
 
        # Fetch messages
        MOQTMessageType.FETCH: (Fetch, _handle_fetch),

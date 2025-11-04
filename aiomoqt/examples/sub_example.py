@@ -9,7 +9,7 @@ from aiomoqt.types import ParamType, MOQTException
 from aiomoqt.client import MOQTClient
 from aiomoqt.protocol import MOQTException
 from aiomoqt.messages.subscribe import SubscribeError
-from aiomoqt.messages.announce import SubscribeAnnouncesError 
+from aiomoqt.messages.namespace import SubscribeAnnouncesError 
 from aiomoqt.utils.logger import *
 
 
@@ -46,7 +46,7 @@ async def main(host: str, port: int, endpoint: str, namespace: str, track_name: 
                 
                 response = await session.subscribe_announces(
                     namespace_prefix=namespace,
-                    parameters={ParamType.AUTHORIZATION_INFO: b"auth-token-123"},
+                    parameters={ParamType.AUTHORIZATION_TOKEN: b"auth-token-123"},
                     wait_response=True
                 )
                 
@@ -59,7 +59,7 @@ async def main(host: str, port: int, endpoint: str, namespace: str, track_name: 
                     track_name=track_name,
                     parameters={
                         ParamType.MAX_CACHE_DURATION: 100,
-                        ParamType.AUTHORIZATION_INFO: b"auth-token-123",
+                        ParamType.AUTHORIZATION_TOKEN: b"auth-token-123",
                         ParamType.DELIVERY_TIMEOUT: 10,
                     },
                     wait_response=True

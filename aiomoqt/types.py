@@ -1,15 +1,9 @@
 from enum import IntEnum
 
 MOQT_VERSIONS = [
-    0xff000008, 
-    0xff080000, 
-    0xff000009, 
-    0xff090000, 
-    0xff00000a, 
-    0xff0a0000
-
+    0xff00000e
 ]
-MOQT_CUR_VERSION = 0xff00000a
+MOQT_CUR_VERSION = 0xff00000e
 
 MOQT_ALPN_PROTO = "moq-00"
 
@@ -19,37 +13,40 @@ MOQT_TIMESTAMP_EXT = 0x20
 
 class MOQTMessageType(IntEnum):
     """MOQT message type constants."""
-    CLIENT_SETUP = 0x40
-    SERVER_SETUP = 0x41
-    SUBSCRIBE_UPDATE = 0x02
+    CLIENT_SETUP = 0x20 # changed from 0x40 in draft-14
+    SERVER_SETUP = 0x21 # changed from 0x41 in draft-14
+    GOAWAY = 0x10
+    MAX_REQUEST_ID = 0x15
+    REQUESTS_BLOCKED = 0x1A
     SUBSCRIBE = 0x03
     SUBSCRIBE_OK = 0x04
     SUBSCRIBE_ERROR = 0x05
-    ANNOUNCE = 0x06
-    ANNOUNCE_OK = 0x07
-    ANNOUNCE_ERROR = 0x08
-    UNANNOUNCE = 0x09
+    SUBSCRIBE_UPDATE = 0x02
     UNSUBSCRIBE = 0x0A
-    SUBSCRIBE_DONE = 0x0B
-    ANNOUNCE_CANCEL = 0x0C
+    PUBLISH_NAMESPACE = 0x06
+    PUBLISH_NAMESPACE_OK = 0x07
+    PUBLISH_NAMESPACE_ERROR = 0x08
+    PUBLISH_NAMESPACE_DONE = 0x09
+    PUBLISH_DONE = 0x0B
+    PUBLISH_NAMESPACE_CANCEL = 0x0C
     TRACK_STATUS_REQUEST = 0x0D
     TRACK_STATUS = 0x0E
-    GOAWAY = 0x10
-    SUBSCRIBE_ANNOUNCES = 0x11
-    SUBSCRIBE_ANNOUNCES_OK = 0x12
-    SUBSCRIBE_ANNOUNCES_ERROR = 0x13
-    UNSUBSCRIBE_ANNOUNCES = 0x14
-    MAX_SUBSCRIBE_ID = 0x15
+    SUBSCRIBE_NAMESPACE = 0x11
+    SUBSCRIBE_NAMESPACE_OK = 0x12
+    SUBSCRIBE_NAMESPACE_ERROR = 0x13
+    UNSUBSCRIBE_NAMESPACE = 0x14
     FETCH = 0x16
     FETCH_CANCEL = 0x17
     FETCH_OK = 0x18
     FETCH_ERROR = 0x19
-    SUBSCRIBES_BLOCKED = 0x1A
+    PUBLISH = 0x1B  # New in draft-14
+    PUBLISH_OK = 0x1C
+    PUBLISH_ERROR = 0x1D
 
 
 class ParamType(IntEnum):
     """Parameter types for MOQT messages."""
-    AUTHORIZATION_INFO = 0x02
+    AUTHORIZATION_TOKEN = 0x02
     DELIVERY_TIMEOUT = 0x03
     MAX_CACHE_DURATION = 0x04
     GREASE_1_PARAM = 0x25
@@ -58,9 +55,10 @@ class ParamType(IntEnum):
 
 class SetupParamType(IntEnum):
     """Setup Parameter type constants"""
-    CLIENT_ROLE = 0x0  # deprecated - removed in draft-8
     ENDPOINT_PATH = 0x01  # only relevant to raw QUIC connection
-    MAX_SUBSCRIBER_ID = 0x02  # currently encoded as varint in draft0-10 - this will change
+    MAX_REQUEST_ID = 0x02  # currently encoded as varint in draft0-10 - this will change
+    AUTHORITY = 0x03  # New in draft 14
+    IMPLEMENTATION = 0x04  # New in draft 14    
 
 
 class SessionCloseCode(IntEnum):

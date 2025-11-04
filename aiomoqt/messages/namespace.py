@@ -9,13 +9,13 @@ logger = get_logger(__name__)
 
 
 @dataclass
-class Announce(MOQTMessage):
+class PublishNamespace(MOQTMessage):
     """ANNOUNCE message for advertising a track namespace."""
     namespace: Tuple[bytes, ...] = None  # Track namespace as a tuple of bytes
     parameters: Dict[int, bytes] = None  # Optional parameters
 
     def __post_init__(self):
-        self.type = MOQTMessageType.ANNOUNCE
+        self.type = MOQTMessageType.PUBLISH_NAMESPACE
 
     def serialize(self) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
@@ -38,13 +38,13 @@ class Announce(MOQTMessage):
         buf.push_uint_var(self.type)
         buf.push_uint_var(payload.tell())
         buf.push_bytes(payload.data_slice(0,payload.tell()))
-        logger.info(f"MOQT messages: Announce.serialize: 0x{buf.data_slice(0,buf.tell()).hex()}")
+        logger.info(f"MOQT messages: PublishNamespace.serialize: 0x{buf.data_slice(0,buf.tell()).hex()}")
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'Announce':
+    def deserialize(cls, buf: Buffer) -> 'PublishNamespace':
         # Deserialize namespace tuple
-        logger.info(f"MOQT messages: Announce.deserialize: 0x{buf.data_slice(buf.tell(),buf.capacity).hex()}")
+        logger.info(f"MOQT messages: PublishNamespace.deserialize: 0x{buf.data_slice(buf.tell(),buf.capacity).hex()}")
 
         tuple_len = buf.pull_uint_var()
         namespace = []
@@ -65,12 +65,12 @@ class Announce(MOQTMessage):
         return cls(namespace=namespace, parameters=params)
 
 @dataclass
-class AnnounceOk(MOQTMessage):
+class PublishNamespaceOk(MOQTMessage):
     """ANNOUNCE_OK response message."""
     namespace: Tuple[bytes, ...]
 
     def __post_init__(self):
-        self.type = MOQTMessageType.ANNOUNCE_OK
+        self.type = MOQTMessageType.PUBLISH_NAMESPACE_OK
 
     def serialize(self) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
@@ -87,7 +87,7 @@ class AnnounceOk(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'AnnounceOk':
+    def deserialize(cls, buf: Buffer) -> 'PublishNamespaceOk':
 
         tuple_len = buf.pull_uint_var()
         namespace = []
@@ -98,14 +98,14 @@ class AnnounceOk(MOQTMessage):
         return cls(namespace=tuple(namespace))
 
 @dataclass
-class AnnounceError(MOQTMessage):
+class PublishNamespaceError(MOQTMessage):
     """ANNOUNCE_ERROR response message."""
     namespace: Tuple[bytes, ...]
     error_code: int
     reason: str
 
     def __post_init__(self):
-        self.type = MOQTMessageType.ANNOUNCE_ERROR
+        self.type = MOQTMessageType.PUBLISH_NAMESPACE_ERROR
 
     def serialize(self) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
@@ -128,7 +128,7 @@ class AnnounceError(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'AnnounceError':
+    def deserialize(cls, buf: Buffer) -> 'PublishNamespaceError':
 
         tuple_len = buf.pull_uint_var()
         namespace = []
@@ -143,12 +143,12 @@ class AnnounceError(MOQTMessage):
         return cls(namespace=tuple(namespace), error_code=error_code, reason=reason)
 
 @dataclass
-class Unannounce(MOQTMessage):
+class PublishNamespaceDone(MOQTMessage):
     """UNANNOUNCE message to withdraw track namespace."""
     namespace: Tuple[bytes, ...]
 
     def __post_init__(self):
-        self.type = MOQTMessageType.UNANNOUNCE
+        self.type = MOQTMessageType.PUBLISH_NAMESPACE_DONE
 
     def serialize(self) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
@@ -165,7 +165,7 @@ class Unannounce(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'Unannounce':
+    def deserialize(cls, buf: Buffer) -> 'PublishNamespaceDone':
 
         tuple_len = buf.pull_uint_var()
         namespace = []
@@ -176,14 +176,14 @@ class Unannounce(MOQTMessage):
         return cls(namespace=tuple(namespace))
 
 @dataclass
-class AnnounceCancel(MOQTMessage):
+class PublishNamespaceCancel(MOQTMessage):
     """ANNOUNCE_CANCEL message to withdraw announcement acceptance."""
     namespace: Tuple[bytes, ...]
     error_code: int
     reason: str
 
     def __post_init__(self):
-        self.type = MOQTMessageType.ANNOUNCE_CANCEL
+        self.type = MOQTMessageType.PUBLISH_NAMESPACE_CANCEL
 
     def serialize(self) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
@@ -201,12 +201,12 @@ class AnnounceCancel(MOQTMessage):
         payload.push_bytes(reason_bytes)
 
         buf.push_uint_var(self.type)
-        buf.push_uint_var(len(payload.data))
+        buf.push_uint16(len(payload.data))
         buf.push_bytes(payload.data)
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'AnnounceCancel':
+    def deserialize(cls, buf: Buffer) -> 'PublishNamespaceCancel':
 
         tuple_len = buf.pull_uint_var()
         namespace = []
@@ -221,13 +221,13 @@ class AnnounceCancel(MOQTMessage):
         return cls(namespace=tuple(namespace), error_code=error_code, reason=reason)
 
 @dataclass
-class SubscribeAnnounces(MOQTMessage):
+class SubscribeNamespace(MOQTMessage):
     """SUBSCRIBE_ANNOUNCES message to subscribe to announcements."""
     namespace_prefix: Tuple[bytes, ...]  # Track namespace prefix as tuple
     parameters: Dict[int, bytes]
 
     def __post_init__(self):
-        self.type = MOQTMessageType.SUBSCRIBE_ANNOUNCES
+        self.type = MOQTMessageType.SUBSCRIBE_NAMESPACE
 
     def serialize(self) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
@@ -250,7 +250,7 @@ class SubscribeAnnounces(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'SubscribeAnnounces':
+    def deserialize(cls, buf: Buffer) -> 'SubscribeNamespace':
 
         tuple_len = buf.pull_uint_var()
         namespace_prefix = []
@@ -269,12 +269,12 @@ class SubscribeAnnounces(MOQTMessage):
         return cls(namespace_prefix=tuple(namespace_prefix), parameters=params)
 
 @dataclass
-class SubscribeAnnouncesOk(MOQTMessage):
+class SubscribeNamespaceOk(MOQTMessage):
     """SUBSCRIBE_ANNOUNCES_OK response message."""
     namespace_prefix: Tuple[bytes, ...]
 
     def __post_init__(self):
-        self.type = MOQTMessageType.SUBSCRIBE_ANNOUNCES_OK
+        self.type = MOQTMessageType.SUBSCRIBE_NAMESPACE_OK
 
     def serialize(self) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
@@ -291,7 +291,7 @@ class SubscribeAnnouncesOk(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'SubscribeAnnouncesOk':
+    def deserialize(cls, buf: Buffer) -> 'SubscribeNamespaceOk':
 
         tuple_len = buf.pull_uint_var()
         namespace_prefix = []
@@ -302,14 +302,14 @@ class SubscribeAnnouncesOk(MOQTMessage):
         return cls(namespace_prefix=tuple(namespace_prefix))
 
 @dataclass
-class SubscribeAnnouncesError(MOQTMessage):
+class SubscribeNamespaceError(MOQTMessage):
     """SUBSCRIBE_ANNOUNCES_ERROR response message."""
     namespace_prefix: Tuple[bytes, ...]
     error_code: int
     reason: str
 
     def __post_init__(self):
-        self.type = MOQTMessageType.SUBSCRIBE_ANNOUNCES_ERROR
+        self.type = MOQTMessageType.SUBSCRIBE_NAMESPACE_ERROR
 
     def serialize(self) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
@@ -332,7 +332,7 @@ class SubscribeAnnouncesError(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'SubscribeAnnouncesError':
+    def deserialize(cls, buf: Buffer) -> 'SubscribeNamespaceError':
 
         tuple_len = buf.pull_uint_var()
         namespace_prefix = []
@@ -347,12 +347,12 @@ class SubscribeAnnouncesError(MOQTMessage):
         return cls(namespace_prefix=tuple(namespace_prefix), error_code=error_code, reason=reason)
 
 @dataclass 
-class UnsubscribeAnnounces(MOQTMessage):
+class UnsubscribeNamespace(MOQTMessage):
     """UNSUBSCRIBE_ANNOUNCES message."""
     namespace_prefix: Tuple[bytes, ...]
 
     def __post_init__(self):
-        self.type = MOQTMessageType.UNSUBSCRIBE_ANNOUNCES
+        self.type = MOQTMessageType.UNSUBSCRIBE_NAMESPACE
 
     def serialize(self) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
@@ -369,7 +369,7 @@ class UnsubscribeAnnounces(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'UnsubscribeAnnounces':
+    def deserialize(cls, buf: Buffer) -> 'UnsubscribeNamespace':
 
         tuple_len = buf.pull_uint_var()
         namespace_prefix = []
