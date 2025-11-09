@@ -259,16 +259,17 @@ def parse_args():
     parser.add_argument('--port', type=int, default=4433, help='Port to connect to')
     parser.add_argument('--namespace', type=str, default='test', help='Namespace')
     parser.add_argument('--trackname', type=str, default='track', help='Track')
-    parser.add_argument('--endpoint', type=str, default='moq', help='MOQT WT endpoint')
+    parser.add_argument('--use-quic', action='store_true', help='Enable QUIC transport')
+    parser.add_argument('--endpoint', type=str, default='moq', help='MOQT endpoint')
     parser.add_argument('--datagram', action='store_true', help='Emit ObjectDatagrams')
     parser.add_argument('--debug', action='store_true', help='Enable debug output')
-    parser.add_argument('--quic-debug', action='store_true',  help='Enable quic debug output')
+    parser.add_argument('--quic-debug', action='store_true', help='Enable quic debug output')
     parser.add_argument('--keylogfile', type=str, default=None, help='TLS secrets file')
                        
     return parser.parse_args()
 
 
-async def main(host: str, port: int, endpoint: str, namespace: str, trackname: str, debug: bool, datagram: bool):
+async def main(host: str, port: int, endpoint: str, namespace: str, trackname: str, debug: bool, datagram: bool, use_quic: bool, quic_debug: bool):
     log_level = logging.DEBUG if debug else logging.INFO
     set_log_level(log_level)
     logger = get_logger(__name__)
@@ -277,8 +278,10 @@ async def main(host: str, port: int, endpoint: str, namespace: str, trackname: s
         host,
         port,
         endpoint=endpoint,
+        use_quic=use_quic,
+        debug=debug,
+        quic_debug=quic_debug,
         keylog_filename=args.keylogfile,
-        debug=debug
     )
     # Register our data gen version of the subscribe handler
     if datagram:
@@ -301,7 +304,7 @@ async def main(host: str, port: int, endpoint: str, namespace: str, trackname: s
             logger.info(f"MOQT app: publish_namespace: {namespace}")
             response = await session.publish_namespace(
                 namespace=namespace,
-                parameters={ParamType.AUTHORIZATION_TOKEN: b"auth-token-123"},
+                parameters={ParamType.AUTH_TOKEN: b"auth-token-123"},
                 wait_response=True,
             )
             logger.info(f"MOQT app: publish_namespace reponse: {response}")
@@ -323,10 +326,12 @@ if __name__ == "__main__":
             host=args.host,
             port=args.port,
             endpoint=args.endpoint,
+            use_quic=args.use_quic,
             namespace=args.namespace,
             trackname=args.trackname,
             datagram=args.datagram,
-            debug=args.debug
+            debug=args.debug,
+            quic_debug=args.quic_debug,
         ))
       
     except KeyboardInterrupt:

@@ -9,7 +9,7 @@ FETCH_TEST_CASES = [
     (
         Fetch,
         {
-            "subscribe_id": 42,
+            "request_id": 42,
             "fetch_type": FetchType.FETCH,
             "namespace": (b"live", b"sports"),
             "track_name": b"football",
@@ -19,7 +19,7 @@ FETCH_TEST_CASES = [
             "start_object": 5,
             "end_group": 20,
             "end_object": 15,
-            "parameters": {0x0: b'param0', 0x01: b"param1"}
+            "parameters": {SetupParamType.AUTH_TOKEN: b'param0', ParamType.DELIVERY_TIMEOUT: 300}
         },
         MOQTMessageType.FETCH,
         False,
@@ -28,7 +28,7 @@ FETCH_TEST_CASES = [
     (
         Fetch,
         {
-            "subscribe_id": 123,
+            "request_id": 123,
             "fetch_type": FetchType.FETCH,
             "namespace": (b"vod", b"movies", b"action"),
             "track_name": b"stream1",
@@ -48,12 +48,12 @@ FETCH_TEST_CASES = [
         Fetch,
         {
             "fetch_type": FetchType.JOINING_FETCH,
-            "subscribe_id": 789,
+            "request_id": 789,
             "subscriber_priority": 255,
             "group_order": GroupOrder.DESCENDING,
             "joining_sub_id": 45,
             "pre_group_offset": 3,
-            "parameters": {3: b"param3"}
+            "parameters": {ParamType.GROUP_ORDER: GroupOrder.ASCENDING}
         },
         MOQTMessageType.FETCH,
         False,
@@ -66,7 +66,7 @@ FETCH_CANCEL_TEST_CASES = [
     (
         FetchCancel,
         {
-            "subscribe_id": 42
+            "request_id": 42
         },
         MOQTMessageType.FETCH_CANCEL,
         False,
@@ -75,7 +75,7 @@ FETCH_CANCEL_TEST_CASES = [
     (
         FetchCancel,
         {
-            "subscribe_id": 9999
+            "request_id": 9999
         },
         MOQTMessageType.FETCH_CANCEL,
         False,
@@ -88,12 +88,12 @@ FETCH_OK_TEST_CASES = [
     (
         FetchOk,
         {
-            "subscribe_id": 42,
+            "request_id": 42,
             "group_order": 0,
             "end_of_track": 0,
             "largest_group_id": 50,
             "largest_object_id": 200,
-            "parameters": {1: b"param1", 2: b"param2"}
+            "parameters": {ParamType.AUTH_TOKEN: b"param1", ParamType.SUBSCRIBER_PRIORITY: 255}
         },
         MOQTMessageType.FETCH_OK,
         False,
@@ -102,7 +102,7 @@ FETCH_OK_TEST_CASES = [
     (
         FetchOk,
         {
-            "subscribe_id": 123,
+            "request_id": 123,
             "group_order": 1,
             "end_of_track": 1,
             "largest_group_id": 100,
@@ -120,7 +120,7 @@ FETCH_ERROR_TEST_CASES = [
     (
         FetchError,
         {
-            "subscribe_id": 42,
+            "request_id": 42,
             "error_code": 404,
             "reason": "Not Found"
         },
@@ -131,7 +131,7 @@ FETCH_ERROR_TEST_CASES = [
     (
         FetchError,
         {
-            "subscribe_id": 123,
+            "request_id": 123,
             "error_code": 500,
             "reason": "Internal Server Error"
         },
@@ -175,7 +175,12 @@ CLIENT_SETUP_TEST_CASES = [
             "versions": [1, 2],
             "parameters": {
                 SetupParamType.MAX_REQUEST_ID: 100,
-                SetupParamType.ENDPOINT_PATH: b"/path/to/endpoint"
+                SetupParamType.PATH: b"/path/to/endpoint",
+                SetupParamType.IMPLEMENTATION: b"aiomoqt-1.0/dev",
+                SetupParamType.AUTH_TOKEN: b"token123",
+                SetupParamType.MAX_AUTH_TOKEN_CACHE_SIZE: 1024,
+                SetupParamType.GREASE_1_PARAM: b'\xBA\xAD\xF0\x0D',
+                SetupParamType.GREASE_2_PARAM: 0xDEADBEEF,
             }
         },
         MOQTMessageType.CLIENT_SETUP,
@@ -185,7 +190,7 @@ CLIENT_SETUP_TEST_CASES = [
     (
         ClientSetup,
         {
-            "versions": [0xff00009],
+            "versions": [0xff0000e],
             "parameters": {}
         },
         MOQTMessageType.CLIENT_SETUP,
@@ -224,8 +229,9 @@ TEST_CASES = [
         {
             'namespace': (b'vivohcast', b'net', b'live'),
             'parameters': {
-                ParamType.AUTHORIZATION_TOKEN: b'auth-token-123',
-                ParamType.GREASE_1_PARAM: b'\xDE\xAD\xBE\xEF'
+                ParamType.AUTH_TOKEN: b'auth-token-123',
+                ParamType.GREASE_1_PARAM: b'\xBA\xAD\xF0\x0D',
+                ParamType.GREASE_2_PARAM: 1234,
             }
         },
         MOQTMessageType.PUBLISH_NAMESPACE,
@@ -234,7 +240,7 @@ TEST_CASES = [
     (
         PublishNamespaceOk,
         {
-            'namespace': (b'vivohcast', b'net', b'live')
+            'request_id': 0,
         },
         MOQTMessageType.PUBLISH_NAMESPACE_OK,
         False
@@ -242,7 +248,7 @@ TEST_CASES = [
     (
         PublishNamespaceError,
         {
-            'namespace': (b'vivohcast', b'net', b'live'),
+            'request_id': 0,
             'error_code': 404,
             'reason': 'Not found'
         },
@@ -270,10 +276,11 @@ TEST_CASES = [
     (
         SubscribeNamespace,
         {
+            'request_id': 0,
             'namespace_prefix': (b'vivohcast', b'net'),
             'parameters': {
-                1: b'param1',
-                2: b'param2'
+                ParamType.AUTH_TOKEN: b'auth-token-456',
+                ParamType.GREASE_2_PARAM: 1111111111
             }
         },
         MOQTMessageType.SUBSCRIBE_NAMESPACE,
@@ -282,7 +289,7 @@ TEST_CASES = [
     (
         SubscribeNamespaceOk,
         {
-            'namespace_prefix': (b'vivohcast', b'net')
+            'request_id': 0,
         },
         MOQTMessageType.SUBSCRIBE_NAMESPACE_OK,
         False,
@@ -290,7 +297,7 @@ TEST_CASES = [
     (
         SubscribeNamespaceError,
         {
-            'namespace_prefix': (b'vivohcast', b'net'),
+            'request_id': 0,
             'error_code': 400,
             'reason': 'Bad request'
         },
@@ -330,7 +337,7 @@ TEST_CASES = [
     (
         FetchHeader,
         {
-            'subscribe_id': 42
+            'request_id': 42
         },
         DataStreamType.FETCH_HEADER,
         False,
@@ -427,7 +434,7 @@ def test_object_header():
 
 def test_fetch_header():
     params = {
-        'subscribe_id': 42
+        'request_id': 42
     }
     assert moqt_message_serialization(FetchHeader, params, DataStreamType.FETCH_HEADER)
 
@@ -485,7 +492,7 @@ def test_object_header():
 
 def test_fetch_header():
     params = {
-        'subscribe_id': 42
+        'request_id': 42
     }
     assert moqt_message_serialization(FetchHeader, params, DataStreamType.FETCH_HEADER)
 

@@ -42,7 +42,7 @@ def moqt_message_serialization(cls, params, type_id=None, needs_len=False):
 
     # Check/strip type for typed messages
     if isinstance(type_id, MOQTMessageType):
-        msg_len = buf.pull_uint_var()
+        msg_len = buf.pull_uint16()
         
     if needs_len:
         new_obj = cls.deserialize(buf, buf_len)

@@ -17,28 +17,33 @@ class MOQTClient(MOQTPeer):  # New connection manager class
         host: str,
         port: int,
         endpoint: Optional[str] = None,
+        use_quic: Optional[bool] = False,
         configuration: Optional[QuicConfiguration] = None,
-        keylog_filename: Optional[str] = None,
         debug: Optional[bool] = False,
         quic_debug: Optional[bool] = False,
+        keylog_filename: Optional[str] = None,
     ):
         super().__init__()
         self.host = host
         self.port = port
-        self.debug = debug
         self.endpoint = endpoint
+        self.use_quic = use_quic
+        self.debug = debug
+        
+        logger.debug(f"MOQT: client session: {self} use_quic={use_quic} endpoint={endpoint}")
+
         if configuration is None:
-            keylog_file = open(keylog_filename, 'a') if keylog_filename else None
             configuration = QuicConfiguration(
-                alpn_protocols=H3_ALPN,
+                alpn_protocols= [MOQT_ALPN] if use_quic else H3_ALPN,
                 is_client=True,
                 verify_mode=ssl.CERT_NONE,
                 max_data=2**24,
                 max_stream_data=2**24,
                 max_datagram_frame_size=64*1024,
-                quic_logger=QuicDebugLogger() if quic_debug else None,
-                secrets_log_file=keylog_file
             )
+        keylog_file = open(keylog_filename, 'a') if keylog_filename else None
+        configuration.secrets_log_file = keylog_file
+        configuration.quic_logger = QuicDebugLogger() if quic_debug else None
         self.configuration = configuration
 
     def connect(self) -> AsyncContextManager[MOQTSession]:

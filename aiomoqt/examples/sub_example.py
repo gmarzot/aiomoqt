@@ -46,7 +46,7 @@ async def main(host: str, port: int, endpoint: str, namespace: str, track_name: 
                 
                 response = await session.subscribe_announces(
                     namespace_prefix=namespace,
-                    parameters={ParamType.AUTHORIZATION_TOKEN: b"auth-token-123"},
+                    parameters={ParamType.AUTH_TOKEN: b"auth-token-123"},
                     wait_response=True
                 )
                 
@@ -59,7 +59,7 @@ async def main(host: str, port: int, endpoint: str, namespace: str, track_name: 
                     track_name=track_name,
                     parameters={
                         ParamType.MAX_CACHE_DURATION: 100,
-                        ParamType.AUTHORIZATION_TOKEN: b"auth-token-123",
+                        ParamType.AUTH_TOKEN: b"auth-token-123",
                         ParamType.DELIVERY_TIMEOUT: 10,
                     },
                     wait_response=True

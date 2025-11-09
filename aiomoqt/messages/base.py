@@ -8,7 +8,7 @@ from ..utils.logger import *
 
 logger = get_logger(__name__)
 
-BUF_SIZE = 64
+BUF_SIZE = 4 * 1024  # 4KB buffer size for messages
 
 
 class MOQTUnderflow(Exception):
@@ -118,82 +118,78 @@ class MOQTMessage:
     def __str__(self) -> str:
         """Generic string representation showing all fields."""
         parts = []
-        class_fields = fields(self.__class__)
         
-        # Fields that are typically UTF-8 text even though defined as bytes
-        TEXT_LIKE_FIELDS = {
-            'track_namespace', 'track_name', 'namespace', 'name',
-            'new_session_uri', 'uri', 'path', 'authority', 
-            'reason_phrase', 'reason'
-        }
-
-        for field in class_fields:
+        for field in fields(self.__class__):
             value = getattr(self, field.name)
             
-            # Skip 'type' field as it's redundant with class name
+            # Skip redundant type field
             if field.name == 'type':
                 continue
                 
             if value is None:
                 parts.append(f"{field.name}=None")
                 continue
-                
-            str_val = ''
             
+            # Format based on value type
             if "version" in field.name.lower():
+                # Version fields - show in hex
                 if isinstance(value, (list, tuple)):
                     str_val = "[" + ", ".join(f"0x{x:x}" for x in value) + "]"
                 else:
                     str_val = f"0x{value:x}"
                     
             elif field.name == "parameters":
-                # Decode parameter types and values
-                if not value:
-                    str_val = "{}"
-                else:
-                    items = []
-                    enum = SetupParamType if class_name(self).endswith('Setup') else ParamType
-                    for k, v in value.items():
-                        try:
-                            param_name = enum(k).name
-                        except ValueError:
-                            param_name = f"0x{k:02x}"
-                        
-                        # Display based on Key-Value-Pair structure
-                        if k % 2 == 0:  # Even type - varint
-                            items.append(f"{param_name}={v}")
-                        else:  # Odd type - bytes (often text like PATH, AUTHORITY)
-                            if isinstance(v, bytes):
-                                items.append(f"{param_name}={MOQTMessage._format_bytes(v, prefer_text=True)}")
-                            else:
-                                items.append(f"{param_name}={v}")
-                    
-                    str_val = "{" + ", ".join(items) + "}"
-                    
-            elif isinstance(value, bytes):
-                # Check if this field is typically text
-                prefer_text = field.name in TEXT_LIKE_FIELDS
-                str_val = MOQTMessage._format_bytes(value, prefer_text=prefer_text)
+                # Parameters dict - special formatting
+                str_val = self._format_parameters(value, class_name(self))
                 
             elif isinstance(value, (list, tuple)) and value and isinstance(value[0], bytes):
-                # Handle tuples of bytes (like namespace tuples)
-                decoded_items = []
-                for item in value:
-                    decoded_items.append(MOQTMessage._format_bytes(item, prefer_text=True))
-                str_val = "[" + ", ".join(decoded_items) + "]"
+                # Namespace tuple - decode each part
+                items = [self._format_bytes(item, prefer_text=True) for item in value]
+                str_val = "[" + ", ".join(items) + "]"
                 
-            elif isinstance(value, dict):
-                if not value:
-                    str_val = "{}"
-                else:
-                    str_val = "{" + ", ".join(f"{k}: {v}" for k, v in value.items()) + "}"
-                    
+            elif isinstance(value, bytes):
+                # Bytes field - try UTF-8 decode
+                str_val = self._format_bytes(value, prefer_text=True)
+                
             else:
+                # Everything else - use default string representation
                 str_val = str(value)
                 
             parts.append(f"{field.name}={str_val}")
 
         return f"{class_name(self)}({', '.join(parts)})"
+
+    @staticmethod
+    def _format_parameters(params: dict, message_class_name: str) -> str:
+        """Format parameters dict for display."""
+        if not params:
+            return "{}"
+        
+        # Determine which enum to use based on message type
+        is_setup = message_class_name.endswith('Setup')
+        
+        items = []
+        for k, v in params.items():
+            # Try to get enum name
+            try:
+                if is_setup:
+                    param_name = SetupParamType(k).name
+                else:
+                    param_name = ParamType(k).name
+            except ValueError:
+                param_name = f"0x{k:02x}"
+            
+            # Format value - even types are ints, odd types are bytes
+            if k % 2 == 0:
+                items.append(f"{param_name}={v}")
+            else:
+                if isinstance(v, bytes):
+                    items.append(f"{param_name}={MOQTMessage._format_bytes(v, prefer_text=True)}")
+                else:
+                    items.append(f"{param_name}=\"{v}\"")
+        
+        return "{" + ", ".join(items) + "}"
+
 
     @staticmethod
     def _format_bytes(data: bytes, prefer_text: bool = False, max_len: int = 32) -> str:
@@ -248,18 +244,21 @@ class MOQTMessage:
             payload.push_uint_var(param_type)  # Type
             
             if param_type % 2 == 1:  # Odd type - includes Length field
-                # Value is bytes
-                if isinstance(param_value, int):
-                    param_value = MOQTMessage._varint_encode(param_value)
+                # Value is bytes or string
                 if isinstance(param_value, str):
                     param_value = param_value.encode()
+                if not isinstance(param_value, bytes):
+                    raise TypeError(f"Param {param_type} expects bytes, got {type(param_value)}")
+                logger.info(f"Serializing param {param_type} length {len(param_value)}")
                 payload.push_uint_var(len(param_value))  # Length
                 payload.push_bytes(param_value)  # Value
             else:  # Even type - Value is varint (no Length field)
-                # Convert bytes to int if needed
-                if isinstance(param_value, bytes):
-                    param_value = Buffer(data=param_value).pull_uint_var()
+                if not isinstance(param_value, int):
+                    raise TypeError(f"Param {param_type} expects uint, got {type(param_value)}")
+                logger.info(f"Serializing param {param_type} value {param_value}")
                 payload.push_uint_var(param_value)  # Value as varint
+                
+        logger.info(f"Serialized {len(parameters)} parameters: {payload.data_slice(0,12)}")
 
 
     def _deserialize_params(buf: Buffer) -> Dict[int, Any]:
@@ -279,6 +278,7 @@ class MOQTMessage:
                 param_len = buf.pull_uint_var()
                 if param_len > 65535:  # 2^16-1 maximum
                     raise BufferReadError("Parameter length exceeds maximum of 65535 bytes")
+                logger.info(f"deserializing param {param_type} length {param_len}")
                 param_value = buf.pull_bytes(param_len)
             else:  # Even type - Value is varint
                 param_value = buf.pull_uint_var()

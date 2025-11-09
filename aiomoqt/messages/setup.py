@@ -36,7 +36,6 @@ class ServerSetup(MOQTMessage):
     @classmethod
     def deserialize(cls, buf: Buffer) -> 'ServerSetup':
         """Handle SERVER_SETUP message."""
-        # length = buf.pull_uint16()  # Length (16)
         version = buf.pull_uint_var()
         params = MOQTMessage._deserialize_params(buf)
         return cls(selected_version=version, parameters=params)
@@ -67,12 +66,12 @@ class ClientSetup(MOQTMessage):
         buf.push_uint_var(self.type)  # CLIENT_SETUP type
         buf.push_uint16(payload.tell())
         buf.push_bytes(payload.data)
+        logger.debug(f"ClientSetup.serialize: payload size: {payload.tell()} payload data len: {len(payload.data)} buf size: {buf.tell()}")
         return buf
 
     @classmethod
     def deserialize(cls, buf: Buffer) -> 'ClientSetup':
         """Handle CLIENT_SETUP message."""
-        # length = buf.pull_uint16()  # Length (16)
         versions = []
         version_count = buf.pull_uint_var()
         for _ in range(version_count):
@@ -110,8 +109,7 @@ class GoAway(MOQTMessage):
 
     @classmethod
     def deserialize(cls, buf: Buffer) -> 'GoAway':
-        length = buf.pull_uint16()  # Length (16)
-        
+        """Handle GOAWAY message."""        
         uri_len = buf.pull_uint_var()
         
         # Enforce maximum URI length of 8,192 bytes

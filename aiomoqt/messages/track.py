@@ -185,20 +185,20 @@ class ObjectHeader(MOQTMessage):
 @dataclass
 class FetchHeader(MOQTMessage):
     """MOQT fetch stream header."""
-    subscribe_id: int
+    request_id: int
 
     def serialize(self) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
         buf.push_uint_var(DataStreamType.FETCH_HEADER)
         
-        buf.push_uint_var(self.subscribe_id)
+        buf.push_uint_var(self.request_id)
 
         return buf
 
     @classmethod
     def deserialize(cls, buf: Buffer) -> 'FetchHeader':
-        subscribe_id = buf.pull_uint_var()
-        return cls(subscribe_id=subscribe_id)
+        request_id = buf.pull_uint_var()
+        return cls(request_id=request_id)
 
 @dataclass
 class FetchObject(MOQTMessage):

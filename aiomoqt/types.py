@@ -5,7 +5,7 @@ MOQT_VERSIONS = [
 ]
 MOQT_CUR_VERSION = 0xff00000e
 
-MOQT_ALPN_PROTO = "moq-00"
+MOQT_ALPN = "moq-00"
 
 MOQT_DEFAULT_PRIORITY = 128
 
@@ -46,20 +46,32 @@ class MOQTMessageType(IntEnum):
 
 class ParamType(IntEnum):
     """Parameter types for MOQT messages."""
-    AUTHORIZATION_TOKEN = 0x02
-    DELIVERY_TIMEOUT = 0x03
+    DELIVERY_TIMEOUT = 0x02
+    AUTH_TOKEN = 0x03
     MAX_CACHE_DURATION = 0x04
-    GREASE_1_PARAM = 0x25
-    GREASE_2_PARAM = 0x3D
+    EXPIRES = 0x08
+    LARGEST_OBJECT = 0x09
+    PUBLISHER_PRIORITY = 0x0E
+    FORWARD = 0x10
+    SUBSCRIBER_PRIORITY = 0x20
+    SUBSCRIPTION_FILTER = 0x21
+    GROUP_ORDER = 0x22
+    DYNAMIC_GROUPS = 0x30
+    NEW_GROUP_REQUEST = 0x32
+    GREASE_1_PARAM = 0x55
+    GREASE_2_PARAM = 0x8A
 
 
 class SetupParamType(IntEnum):
     """Setup Parameter type constants"""
-    ENDPOINT_PATH = 0x01  # only relevant to raw QUIC connection
-    MAX_REQUEST_ID = 0x02  # currently encoded as varint in draft0-10 - this will change
-    AUTHORITY = 0x03  # New in draft 14
-    IMPLEMENTATION = 0x04  # New in draft 14    
-
+    PATH = 0x01  # only relevant to raw QUIC connection
+    MAX_REQUEST_ID = 0x02
+    AUTH_TOKEN = 0x03 
+    MAX_AUTH_TOKEN_CACHE_SIZE = 0x04
+    AUTHORITY = 0x05
+    IMPLEMENTATION = 0x07  # Wrong in draft 14, draft-15 fixed it to this value
+    GREASE_1_PARAM = 0x77
+    GREASE_2_PARAM = 0x92
 
 class SessionCloseCode(IntEnum):
     """Session close error codes."""

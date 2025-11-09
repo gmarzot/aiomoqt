@@ -30,7 +30,7 @@ logger = get_logger(__name__)
 class H3CustomConnection(H3Connection):
     """Custom H3Connection wrapper to support alternate SETTINGS"""
     
-    def __init__(self, quic: QuicConnection, table_capacity: int = 4096, **kwargs) -> None:
+    def __init__(self, quic: QuicConnection, table_capacity: int = 0, **kwargs) -> None:
         # settings table capacity can be overridden - this should be generalized
         self._max_table_capacity = table_capacity
         self._max_table_capacity_cfg = table_capacity
@@ -81,8 +81,7 @@ class MOQTSession(QuicConnectionProtocol):
         self._moqt_version: int = MOQT_CUR_VERSION
         self._moqt_session_setup: Future[bool] = self._loop.create_future()
         self._moqt_session_closed: Future[Tuple[int,str]] = self._loop.create_future()
-        self._next_subscribe_id = 1  # prime subscribe id generator
-        self._next_track_alias = 1  # prime track alias generator
+        self._next_request_id = 0 if self._quic.configuration.is_client else 1
         self._stream_queues: DefaultDict[int, asyncio.Queue[Buffer]] = defaultdict(asyncio.Queue)
         self._stream_tasks: Dict[int, asyncio.Task] = {}
         self._tasks: Set[asyncio.Task] = set()
@@ -121,17 +120,17 @@ class MOQTSession(QuicConnectionProtocol):
             return tuple(part.encode() if isinstance(part, str) else part for part in namespace)
         raise ValueError("namespace must be string with '/' delimiters or tuple")
 
-    def _allocate_subscribe_id(self) -> int:
+    def _allocate_request_id(self) -> int:
         """Get next available subscribe ID."""
-        subscribe_id = self._next_subscribe_id
-        self._next_subscribe_id += 1
-        return subscribe_id
+        request_id = self._next_request_id
+        self._next_request_id += 2
+        return request_id
 
-    def _allocate_track_alias(self, subscribe_id: int = 1) -> int:
+    def _allocate_track_alias(self, request_id: int = 1) -> int:
         """Get next available track alias."""
         track_alias = self._next_track_alias
         self._next_track_alias += 1
-        self._track_aliases[track_alias] = subscribe_id
+        self._track_aliases[track_alias] = request_id
         return track_alias
     
     def _control_task_done(self, task: asyncio.Task) -> None:
@@ -448,8 +447,10 @@ class MOQTSession(QuicConnectionProtocol):
     def connection_made(self, transport):
         """Called when QUIC connection is established."""
         super().connection_made(transport)
-        self._h3 = H3CustomConnection(self._quic, enable_webtransport=True)
-        logger.info("H3 connection initialized")
+        logger.info(f"MOQT: session connection initialized: {self._session.use_quic}")
+        if not self._session.use_quic:
+            self._h3 = H3CustomConnection(self._quic, enable_webtransport=True)
+            logger.info("H3 connection initialized")
 
     # primary event handling for all QUIC messaging
     def quic_event_received(self, event: QuicEvent) -> None:
@@ -476,8 +477,7 @@ class MOQTSession(QuicConnectionProtocol):
             # Enforce supported ALPN
             if event.alpn_protocol in H3_ALPN:
                 logger.debug(f"QUIC event: ALPN ProtocolNegotiated: {event.alpn_protocol}")
-            elif event.alpn_protocol == MOQT_ALPN_PROTO:
-                # XXX - handle QUIC connection
+            elif event.alpn_protocol == MOQT_ALPN:
                 logger.debug(f"QUIC event: ALPN ProtocolNegotiated alpn: {event.alpn_protocol}")
             else:
                 logger.error(f"QUIC error: unknown ALPN: {event.alpn_protocol}")
@@ -512,6 +512,7 @@ class MOQTSession(QuicConnectionProtocol):
                 if self._control_stream_id is None:
                     self._control_stream_id = stream_id
                     # strip of initial WT stream identifier
+                    logger.debug(f"QUIC event: detecting control stream: {stream_id}")
                     msg_buf.pull_uint_var()
                     msg_buf.pull_uint_var()
                 elif stream_id != self._control_stream_id:
@@ -758,54 +759,73 @@ class MOQTSession(QuicConnectionProtocol):
 
     async def client_session_init(self, timeout: int = 10) -> bool:
         """Initialize WebTransport and MoQT client session."""
-        # Create WebTransport session
-        self._session_id = self._h3._quic.get_next_available_stream_id(is_unidirectional=False)
-        host = self._session.host
-        port = self._session.port
-        headers = [
-            (b":method", b"CONNECT"),
-            (b":scheme", b"https"),
-            (b":authority", f"{host}:{port}".encode()),
-            (b":path", f"/{self._session.endpoint}".encode()),
-            (b":protocol", b"webtransport"),
-            (b"sec-webtransport-http3-draft", b"draft02"),
-            (b"wt-available-protocols", MOQT_ALPN_PROTO.encode()),
-            (b"user-agent", USER_AGENT.encode()),
-        ]
 
-        logger.info(f"H3 send: WebTransport CONNECT: session id: {self._session_id}")
-        for name, value in headers:
-            logger.debug(f"  {name.decode()}: {value.decode()}")
+        use_quic = self._session.use_quic
+        params = {}
+        if use_quic:
+            # Raw QUIC flow
+            logger.info(f"MOQT: Using raw QUIC transport")
             
-        self._h3.send_headers(stream_id=self._session_id, headers=headers, end_stream=False)
-        self.transmit()
-        
-        # Wait for WebTransport session establishment
-        try:
-            async with asyncio.timeout(timeout):
-                result = await self._wt_session_setup
-            result = "SUCCESS" if result else "FAILED"
-            logger.info(f"H3 event: WebTransport setup: {result}")
-        except asyncio.TimeoutError:
-            error = f"WebTransport session establishment timeout: {timeout} sec"
-            logger.error("H3 error: " + error)
-            self._close_session(SessionCloseCode.CONTROL_MESSAGE_TIMEOUT, error)
-            raise MOQTException(*self._close_err)
+            # For raw QUIC, immediately mark WebTransport as "done" since we skip it
+            self._wt_session_setup.set_result(True)
+            
+            # Create MoQT control stream (raw QUIC bidirectional stream)
+            self._control_stream_id = self._quic.get_next_available_stream_id(is_unidirectional=False)
+            logger.info(f"MOQT: QUIC control stream created stream id: {self._control_stream_id}")
+            
+            # CLIENT_SETUP parameters for raw QUIC (include PATH/AUTHORITY)
+            params[SetupParamType.PATH] = f"/{self._session.endpoint}"
+            params[SetupParamType.AUTHORITY] = f"{self._session.host}:{self._session.port}"
+        else:
+            # WebTransport over H3 flow
+            self._session_id = self._h3._quic.get_next_available_stream_id(is_unidirectional=False)
+            # Create WebTransport session
+            host = self._session.host
+            port = self._session.port
+            headers = [
+                (b":method", b"CONNECT"),
+                (b":scheme", b"https"),
+                (b":authority", f"{host}:{port}".encode()),
+                (b":path", f"/{self._session.endpoint}".encode()),
+                (b":protocol", b"webtransport"),
+                (b"sec-webtransport-http3-draft", b"draft02"),
+                (b"wt-available-protocols", MOQT_ALPN.encode()),
+                (b"user-agent", USER_AGENT.encode()),
+            ]
 
-        # Check for H3 connection close
-        if self._close_err is not None:
-            raise MOQTException(*self._close_err)
+            logger.info(f"H3 send: WebTransport CONNECT: session id: {self._session_id}")
+            for name, value in headers:
+                logger.debug(f"  {name.decode()}: {value.decode()}")
+                
+            self._h3.send_headers(stream_id=self._session_id, headers=headers, end_stream=False)
+            self.transmit()
         
-        # Create MoQT control stream
-        self._control_stream_id = self._h3.create_webtransport_stream(session_id=self._session_id)
-        logger.info(f"MOQT: control stream created stream id: {self._control_stream_id}")
+            # Wait for WebTransport session establishment
+            try:
+                async with asyncio.timeout(timeout):
+                    result = await self._wt_session_setup
+                result = "SUCCESS" if result else "FAILED"
+                logger.info(f"H3 event: WebTransport setup: {result}")
+            except asyncio.TimeoutError:
+                error = f"WebTransport session establishment timeout: {timeout} sec"
+                logger.error("H3 error: " + error)
+                self._close_session(SessionCloseCode.CONTROL_MESSAGE_TIMEOUT, error)
+                raise MOQTException(*self._close_err)
+
+            # Check for H3 connection close
+            if self._close_err is not None:
+                raise MOQTException(*self._close_err)
+            
+            # Create MoQT control stream
+            self._control_stream_id = self._h3.create_webtransport_stream(session_id=self._session_id)
+            logger.info(f"MOQT: WT control stream created stream id: {self._control_stream_id}")
 
         # Send CLIENT_SETUP
+        params[SetupParamType.MAX_REQUEST_ID] = 10000
+        params[SetupParamType.IMPLEMENTATION] = USER_AGENT.encode()
         client_setup = self.client_setup(
             versions=MOQT_VERSIONS,
-            parameters={
-                SetupParamType.MAX_REQUEST_ID: 1000
-            }
+            parameters=params
         )
 
         # Wait for SERVER_SETUP
@@ -823,7 +843,7 @@ class MOQTSession(QuicConnectionProtocol):
             logger.error(f"MOQT error: session setup failed: {session_setup}")
             raise MOQTException(*self._close_err)
         
-        logger.info(f"MOQT session: setup complete: {result}")
+        logger.info(f"MOQT session: setup complete: {session_setup}")
 
 
 
@@ -832,7 +852,7 @@ class MOQTSession(QuicConnectionProtocol):
         if self._quic is None or self._control_stream_id is None:
             raise MOQTException(SessionCloseCode.INTERNAL_ERROR, "control stream not intialized")
         
-        logger.debug(f"QUIC send: control message: {buf.capacity} bytes")
+        logger.debug(f"QUIC send: control message: {buf.tell()} bytes")
 
         self._quic.send_stream_data(
             stream_id=self._control_stream_id,
@@ -908,14 +928,13 @@ class MOQTSession(QuicConnectionProtocol):
         """Subscribe to a track with configurable options."""
         if parameters is None:
             parameters = {}
-        subscribe_id = self._allocate_subscribe_id()
-        track_alias = self._allocate_track_alias(subscribe_id)
+        request_id = self._allocate_request_id()
+        track_alias = self._allocate_track_alias(request_id)
         namespace_tuple = self._make_namespace_tuple(namespace)
         track_name = track_name.encode() if isinstance(track_name, str) else track_name
 
         message = Subscribe(
-            subscribe_id=subscribe_id,
-            track_alias=track_alias,
+            request_id=request_id,
             namespace=namespace_tuple,
             track_name=track_name,
             priority=priority,
@@ -926,7 +945,7 @@ class MOQTSession(QuicConnectionProtocol):
             end_group=end_group,
             parameters=parameters
         )
-        self._subscriptions[subscribe_id] = [message]
+        self._subscriptions[request_id] = [message]
         logger.info(f"MOQT send: {message}")
         self.send_control_message(message.serialize())
 
@@ -935,7 +954,7 @@ class MOQTSession(QuicConnectionProtocol):
 
         # Create future for response
         subscribe_fut = self._loop.create_future()
-        self._subscribe_responses[subscribe_id] = subscribe_fut
+        self._subscribe_responses[request_id] = subscribe_fut
 
         async def wait_for_response():
             try:
@@ -944,22 +963,22 @@ class MOQTSession(QuicConnectionProtocol):
             except asyncio.TimeoutError:
                 # Create synthetic error response
                 response = SubscribeError(
-                    subscribe_id=subscribe_id,
+                    request_id=request_id,
                     error_code=0x5,  # TIMEOUT error code
                     reason="Subscribe Response Timeout",
                     track_alias=0
                 )
                 logger.error(f"Timeout waiting for subscribe response")
             finally:
-                logger.debug(f"MOQT: removing subscribe response future: {subscribe_id}")
-                self._subscribe_responses.pop(subscribe_id, None)    
+                logger.debug(f"MOQT: removing subscribe response future: {request_id}")
+                self._subscribe_responses.pop(request_id, None)    
             return response
 
         return wait_for_response()
 
     def subscribe_ok(
         self,
-        subscribe_id: int,
+        request_msg: Subscribe,
         expires: int = 0,  # 0 means no expiry
         group_order: int = GroupOrder.ASCENDING,
         content_exists: int = 0,
@@ -969,7 +988,7 @@ class MOQTSession(QuicConnectionProtocol):
     ) -> Optional[MOQTMessage]:
         """Create and send a SUBSCRIBE_OK response."""
         message = SubscribeOk(
-            subscribe_id=subscribe_id,
+            request_id=request_msg.request_id,
             expires=expires,
             group_order=group_order,
             content_exists=content_exists,
@@ -983,14 +1002,14 @@ class MOQTSession(QuicConnectionProtocol):
 
     def subscribe_error(
         self,
-        subscribe_id: int,
+        request_id: int,
         error_code: int = SubscribeErrorCode.INTERNAL_ERROR,
         reason: str = "Internal error",
         track_alias: Optional[int] = None
     ) -> Optional[MOQTMessage]:
         """Create and send a SUBSCRIBE_ERROR response."""
         message = SubscribeError(
-            subscribe_id=subscribe_id,
+            request_id=request_id,
             error_code=error_code,
             reason=reason,
             track_alias=track_alias
@@ -1001,10 +1020,10 @@ class MOQTSession(QuicConnectionProtocol):
     
     def unsubscribe(
         self,
-        subscribe_id: int,
+        request_id: int,
     ) -> Optional[MOQTMessage]:
         """Unsubscribe from a track."""
-        message = Unsubscribe(subscribe_id=subscribe_id)
+        message = Unsubscribe(request_id=request_id)
         logger.info(f"MOQT send: {message}")
         self.send_control_message(message.serialize())
  
@@ -1022,13 +1041,13 @@ class MOQTSession(QuicConnectionProtocol):
     ) -> Optional[Tuple[MOQTMessage, MOQTMessage]]:
         """Subscribe and Joining Fetch."""
         parameters = {} if parameters is None else parameters
-        subscribe_id = self._allocate_subscribe_id()
-        track_alias = self._allocate_track_alias(subscribe_id)
+        request_id = self._allocate_request_id()
+        track_alias = self._allocate_track_alias(request_id)
         namespace = self._make_namespace_tuple(namespace)
         track_name = track_name.encode() if isinstance(track_name, str) else track_name
 
         message = Subscribe(
-            subscribe_id=subscribe_id,
+            request_id=request_id,
             track_alias=track_alias,
             namespace=namespace,
             track_name=track_name,
@@ -1037,22 +1056,22 @@ class MOQTSession(QuicConnectionProtocol):
             filter_type=FilterType.LATEST_OBJECT,
             parameters=parameters
         )
-        self._subscriptions[subscribe_id] = [message]
+        self._subscriptions[request_id] = [message]
         logger.info(f"MOQT send: {message}")
         self.send_control_message(message.serialize())
 
-        fetch_subscribe_id = self._allocate_subscribe_id()
+        fetch_request_id = self._allocate_request_id()
         message = Fetch(
-            subscribe_id=fetch_subscribe_id,
+            request_id=fetch_request_id,
             subscriber_priority=subscriber_priority,
             group_order=group_order,
-            joining_sub_id=subscribe_id,
+            joining_sub_id=request_id,
             fetch_type=FetchType.JOINING_FETCH,
             pre_group_offset=pre_group_offset,
             parameters=parameters
         )
         
-        self._subscriptions[subscribe_id] = [message]
+        self._subscriptions[request_id] = [message]
         logger.info(f"MOQT send: {message}")
         self.send_control_message(message.serialize())
 
@@ -1061,10 +1080,10 @@ class MOQTSession(QuicConnectionProtocol):
 
         # Create future for response
         subscribe_fut = self._loop.create_future()
-        self._subscribe_responses[subscribe_id] = subscribe_fut        
+        self._subscribe_responses[request_id] = subscribe_fut        
 
         fetch_fut = self._loop.create_future()
-        self._fetch_responses[fetch_subscribe_id] = fetch_fut
+        self._fetch_responses[fetch_request_id] = fetch_fut
 
         async def wait_for_response():
             try:
@@ -1077,7 +1096,7 @@ class MOQTSession(QuicConnectionProtocol):
             except asyncio.TimeoutError:
                 # Create synthetic error response
                 response = SubscribeError(
-                    subscribe_id=subscribe_id,
+                    request_id=request_id,
                     error_code=0x5,  # TIMEOUT error code
                     reason="Subscribe Response Timeout",
                     track_alias=0
@@ -1086,9 +1105,9 @@ class MOQTSession(QuicConnectionProtocol):
                 sub_response = response if sub_response is None else sub_response
                 fetch_response = response if fetch_response is None else fetch_response
             finally:
-                logger.debug(f"MOQT: removing subscribe response future: {subscribe_id}")
-                self._subscribe_responses.pop(subscribe_id, None)    
-                self._fetch_responses.pop(fetch_subscribe_id, None)
+                logger.debug(f"MOQT: removing subscribe response future: {request_id}")
+                self._subscribe_responses.pop(request_id, None)    
+                self._fetch_responses.pop(fetch_request_id, None)
                 
             return sub_response, fetch_response
 
@@ -1109,15 +1128,15 @@ class MOQTSession(QuicConnectionProtocol):
     ) -> Optional[MOQTMessage]:
         """Fetch data from a track with configurable options."""
         parameters = {} if parameters is None else parameters
-        subscribe_id = self._allocate_subscribe_id()
-        track_alias = self._allocate_track_alias(subscribe_id)
+        request_id = self._allocate_request_id()
+        track_alias = self._allocate_track_alias(request_id)
         namespace = self._make_namespace_tuple(namespace)
 
         if isinstance(track_name, str):
             track_name = track_name.encode()
 
         message = Fetch(
-            subscribe_id=subscribe_id,
+            request_id=request_id,
             track_alias=track_alias,
             namespace=namespace,
             track_name=track_name,
@@ -1131,7 +1150,7 @@ class MOQTSession(QuicConnectionProtocol):
             parameters=parameters
         )
         
-        self._subscriptions[subscribe_id] = [message]
+        self._subscriptions[request_id] = [message]
         logger.info(f"MOQT send: {message}")
         self.send_control_message(message.serialize())
 
@@ -1140,7 +1159,7 @@ class MOQTSession(QuicConnectionProtocol):
 
         # Create future for response
         subscribe_fut = self._loop.create_future()
-        self._subscribe_responses[subscribe_id] = subscribe_fut
+        self._subscribe_responses[request_id] = subscribe_fut
 
         async def wait_for_response():
             try:
@@ -1149,22 +1168,22 @@ class MOQTSession(QuicConnectionProtocol):
             except asyncio.TimeoutError:
                 # Create synthetic error response
                 response = SubscribeError(
-                    subscribe_id=subscribe_id,
+                    request_id=request_id,
                     error_code=0x5,  # TIMEOUT error code
                     reason="Subscribe Response Timeout",
                     track_alias=0
                 )
                 logger.error(f"Timeout waiting for subscribe response")
             finally:
-                logger.debug(f"MOQT: removing subscribe response future: {subscribe_id}")
-                self._subscribe_responses.pop(subscribe_id, None)    
+                logger.debug(f"MOQT: removing subscribe response future: {request_id}")
+                self._subscribe_responses.pop(request_id, None)    
             return response
 
         return wait_for_response()
 
     def fetch_ok(
         self,
-        subscribe_id: int,
+        request_id: int,
         expires: int = 0,  # 0 means no expiry
         group_order: int = GroupOrder.ASCENDING,
         content_exists: int = 0,
@@ -1174,7 +1193,7 @@ class MOQTSession(QuicConnectionProtocol):
     ) -> Optional[MOQTMessage]:
         """Create and send a SUBSCRIBE_OK response."""
         message = SubscribeOk(
-            subscribe_id=subscribe_id,
+            request_id=request_id,
             expires=expires,
             group_order=group_order,
             content_exists=content_exists,
@@ -1188,14 +1207,14 @@ class MOQTSession(QuicConnectionProtocol):
 
     def fetch_error(
         self,
-        subscribe_id: int,
+        request_id: int,
         error_code: int = SubscribeErrorCode.INTERNAL_ERROR,
         reason: str = "Internal error",
         track_alias: Optional[int] = None
     ) -> Optional[MOQTMessage]:
         """Create and send a SUBSCRIBE_ERROR response."""
         message = SubscribeError(
-            subscribe_id=subscribe_id,
+            request_id=request_id,
             error_code=error_code,
             reason=reason,
             track_alias=track_alias
@@ -1212,7 +1231,9 @@ class MOQTSession(QuicConnectionProtocol):
     ) -> Optional[MOQTMessage]:
         """PublishNamespace track namespace availability."""
         namespace_tuple = self._make_namespace_tuple(namespace)
+        request_id = self._allocate_request_id()
         message = PublishNamespace(
+            request_id=request_id,
             namespace=namespace_tuple,
             parameters=parameters or {}
         )
@@ -1224,7 +1245,7 @@ class MOQTSession(QuicConnectionProtocol):
 
         # Create future for response
         publish_namepace_fut = self._loop.create_future()
-        self._publish_namepace_responses[namespace_tuple] = publish_namepace_fut
+        self._publish_namepace_responses[request_id] = publish_namepace_fut
 
         async def wait_for_response():
             try:
@@ -1233,27 +1254,26 @@ class MOQTSession(QuicConnectionProtocol):
             except asyncio.TimeoutError:
                 # Create synthetic error response
                 response = PublishNamespaceError(
-                    namespace=namespace,
+                    request_id=request_id,
                     error_code=0x5,  # TIMEOUT error code
                     reason="Response timeout"
                 )
                 logger.error(f"Timeout waiting for publish_namespace response")
             finally:
-                self._publish_namepace_responses.pop(namespace, None)
+                self._publish_namepace_responses.pop(request_id, None)
             return response
 
         return wait_for_response()
 
     def publish_namepace_ok(
         self,
-        namespace: Union[str, Tuple[str, ...]],
+        msg: PublishNamespace,
     ) -> Optional[MOQTMessage]:
         """Create and send a ANNOUNCE_OK response."""
-        namespace_tuple = self._make_namespace_tuple(namespace)
         message = PublishNamespaceOk(
-            namespace=namespace_tuple,
+            request_id=msg.request_id,
         )
-        logger.info(f"MOQT send: {message}")
+        logger.info(f"MOQT send: {message} request_id: {msg.request_id} namespace: {msg.namespace}")
         self.send_control_message(message.serialize())
         return message
 
@@ -1412,9 +1432,9 @@ class MOQTSession(QuicConnectionProtocol):
         
     async def _handle_subscribe(self, msg: Subscribe) -> None:
         logger.info(f"MOQT receive: {msg}")
-        self._track_aliases[msg.track_alias] = msg.subscribe_id
+        self._track_aliases[msg.track_alias] = msg.request_id
         self.subscribe_ok(
-            subscribe_id=msg.subscribe_id,
+            request_id=msg.request_id,
             expires=0,
             group_order=GroupOrder.ASCENDING,
             content_exists=ContentExistsCode.NO_CONTENT,
@@ -1422,7 +1442,7 @@ class MOQTSession(QuicConnectionProtocol):
 
     async def _handle_publish_namepace(self, msg: PublishNamespace) -> None:
         logger.info(f"MOQT receive: {msg}")
-        self.publish_namepace_ok(msg.namespace)
+        self.publish_namepace_ok(msg)
 
     async def _handle_subscribe_update(self, msg: SubscribeUpdate) -> None:
         logger.info(f"MOQT event: handle {msg}")
@@ -1431,42 +1451,42 @@ class MOQTSession(QuicConnectionProtocol):
     async def _handle_subscribe_ok(self, msg: SubscribeOk) -> None:
         logger.info(f"MOQT event: handle {msg}")
         # Set future result for subscriber waiting for response
-        future = self._subscribe_responses.get(msg.subscribe_id)
+        future = self._subscribe_responses.get(msg.request_id)
         if future and not future.done():
             future.set_result(msg)
-        if msg.subscribe_id in self._subscriptions:
-            self._subscriptions[msg.subscribe_id].append(msg)
+        if msg.request_id in self._subscriptions:
+            self._subscriptions[msg.request_id].append(msg)
         else:
-            logger.warning(f"MOQT messages: unsolicited SubscribeOk(msg.subscribe_id)")
+            logger.warning(f"MOQT messages: unsolicited SubscribeOk(msg.request_id)")
 
     async def _handle_subscribe_error(self, msg: SubscribeError) -> None:
         logger.info(f"MOQT event: handle {msg}")
         # Set future result for subscriber waiting for response
-        future = self._subscribe_responses.get(msg.subscribe_id)
+        future = self._subscribe_responses.get(msg.request_id)
         if future and not future.done():
             future.set_result(msg)
-        if msg.subscribe_id in self._subscriptions:
-            self._subscriptions[msg.subscribe_id].append(msg)
+        if msg.request_id in self._subscriptions:
+            self._subscriptions[msg.request_id].append(msg)
         else:
-            logger.warning(f"MOQT messages: unsolicited SubscribeError(msg.subscribe_id)")
+            logger.warning(f"MOQT messages: unsolicited SubscribeError(msg.request_id)")
             
     async def _handle_publish_namepace_ok(self, msg: PublishNamespaceOk) -> None:
         logger.info(f"MOQT event: handle {msg}")
         # Set future result for announcer waiting for response
-        future = self._publish_namepace_responses.get(msg.namespace)
+        future = self._publish_namepace_responses.get(msg.request_id)
         if future and not future.done():
             future.set_result(msg)
 
     async def _handle_publish_namepace_error(self, msg: PublishNamespaceError) -> None:
         logger.info(f"MOQT event: handle {msg}")
         # Set future result for announcer waiting for response
-        future = self._publish_namepace_responses.get(msg.namespace)
+        future = self._publish_namepace_responses.get(msg.request_id)
         if future and not future.done():
             future.set_result(msg)
 
     async def _handle_publish_namepace_done(self, msg: PublishNamespaceDone) -> None:
         logger.info(f"MOQT event: handle {msg}")
-        self.publish_namepace_ok(msg.namespace)
+        self.publish_namepace_ok(msg)
 
     async def _handle_publish_namepace_cancel(self, msg: PublishNamespaceCancel) -> None:
         logger.info(f"MOQT event: handle {msg}")
@@ -1479,11 +1499,11 @@ class MOQTSession(QuicConnectionProtocol):
     async def _handle_subscribe_done(self, msg: SubscribeDone) -> None:
         logger.info(f"MOQT event: handle {msg}")
         # Set future result for subscriber waiting for completion
-        future = self._subscribe_responses.get(msg.subscribe_id)
+        future = self._subscribe_responses.get(msg.request_id)
         if future and not future.done():
             future.set_result(msg)
 
-    async def _handle_max_subscribe_id(self, msg: MaxSubscribeId) -> None:
+    async def _handle_max_request_id(self, msg: MaxSubscribeId) -> None:
         logger.info(f"MOQT event: handle {msg}")
         # Update maximum subscribe ID
 
@@ -1510,7 +1530,7 @@ class MOQTSession(QuicConnectionProtocol):
     async def _handle_subscribe_namespace_ok(self, msg: SubscribeNamespaceOk) -> None:
         logger.info(f"MOQT event: handle {msg}")
         # Set future result for subscriber waiting for response
-        future = self._subscribe_namespace_responses.get(msg.namespace_prefix)
+        future = self._subscribe_namespace_responses.get(msg.request_id)
         if future and not future.done():
             future.set_result(msg)
 
@@ -1523,11 +1543,11 @@ class MOQTSession(QuicConnectionProtocol):
 
     async def _handle_unsubscribe_namespace(self, msg: UnsubscribeNamespace) -> None:
         logger.info(f"MOQT event: handle {msg}")
-        self.subscribe_namespace_ok(msg.namespace_prefix)
+        self.subscribe_namespace_ok(msg)
 
     async def _handle_fetch(self, msg: Fetch) -> None:
         logger.info(f"MOQT event: handle {msg}")
-        self.fetch_ok(msg.subscribe_id)
+        self.fetch_ok(msg)
 
     async def _handle_fetch_cancel(self, msg: FetchCancel) -> None:
         logger.info(f"MOQT event: handle {msg}")
@@ -1536,14 +1556,14 @@ class MOQTSession(QuicConnectionProtocol):
     async def _handle_fetch_ok(self, msg: FetchOk) -> None:
         logger.info(f"MOQT event: handle {msg}")
         # Set future result for fetcher waiting for response
-        future = self._fetch_responses.get(msg.subscribe_id)
+        future = self._fetch_responses.get(msg.request_id)
         if future and not future.done():
             future.set_result(msg)
 
     async def _handle_fetch_error(self, msg: FetchError) -> None:
         logger.info(f"MOQT event: handle {msg}")
         # Set future result for fetcher waiting for response
-        future = self._fetch_responses.get(msg.subscribe_id)
+        future = self._fetch_responses.get(msg.request_id)
         if future and not future.done():
             future.set_result(msg)
 
@@ -1563,9 +1583,9 @@ class MOQTSession(QuicConnectionProtocol):
         """Handle fetch header message."""
         logger.info(f"MOQT event: handle {msg}")
         # Process fetch header
-        # Validate subscribe_id exists
-        if msg.subscribe_id not in self._subscriptions:
-            logger.error(f"MOQT error: fetch for unknown subscription: {msg.subscribe_id}")
+        # Validate request_id exists
+        if msg.request_id not in self._subscriptions:
+            logger.error(f"MOQT error: fetch for unknown subscription: {msg.request_id}")
             self.close(
                 error_code=SessionCloseCode.PROTOCOL_VIOLATION,
                 reason_phrase="Invalid subscription ID in fetch"
@@ -1577,8 +1597,8 @@ class MOQTSession(QuicConnectionProtocol):
         logger.info(f"MOQT event: handle {msg}")
         # Process object datagram
         # Validate track alias exists
-        subscribe_id = self._track_aliases.get(msg.track_alias)
-        if subscribe_id is None:
+        request_id = self._track_aliases.get(msg.track_alias)
+        if request_id is None:
             logger.error(f"MOQT error: datagram for unknown track: {msg.track_alias}")
             self._close_session(
                 error_code=SessionCloseCode.PROTOCOL_VIOLATION,
@@ -1627,7 +1647,7 @@ class MOQTSession(QuicConnectionProtocol):
        # Subscribe control messages
        MOQTMessageType.UNSUBSCRIBE: (Unsubscribe, _handle_unsubscribe),
        MOQTMessageType.PUBLISH_DONE: (SubscribeDone, _handle_subscribe_done),
-       MOQTMessageType.MAX_REQUEST_ID: (MaxSubscribeId, _handle_max_subscribe_id),
+       MOQTMessageType.MAX_REQUEST_ID: (MaxSubscribeId, _handle_max_request_id),
        MOQTMessageType.REQUESTS_BLOCKED: (SubscribesBlocked, _handle_subscribes_blocked),
 
        # Status messages
