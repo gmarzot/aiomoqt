@@ -56,12 +56,7 @@ class Fetch(MOQTMessage):
         else:
             raise RuntimeError
 
-        payload.push_uint_var(len(self.parameters))
-        for param_id, param_value in self.parameters.items():
-            payload.push_uint_var(param_id)
-            param_value = MOQTMessage._bytes_encode(param_value)
-            payload.push_uint_var(len(param_value))
-            payload.push_bytes(param_value)
+        MOQTMessage._serialize_params(payload, self.parameters)
 
         buf.push_uint_var(self.type)
         buf.push_uint16(payload.tell())
@@ -106,13 +101,7 @@ class Fetch(MOQTMessage):
             raise RuntimeError
         
         # Parameters
-        params = {}
-        param_count = buf.pull_uint_var()
-        for _ in range(param_count):
-            param_id = buf.pull_uint_var()
-            param_len = buf.pull_uint_var()
-            param_value = buf.pull_bytes(param_len)
-            params[param_id] = param_value
+        params = MOQTMessage._deserialize_params(buf)
 
         return cls(
             fetch_type=fetch_type,
@@ -154,12 +143,7 @@ class FetchOk(MOQTMessage):
         payload.push_uint_var(self.largest_object_id)
 
         # Parameters
-        payload.push_uint_var(len(self.parameters))
-        for param_id, param_value in self.parameters.items():
-            payload.push_uint_var(param_id)
-            param_value = MOQTMessage._bytes_encode(param_value)
-            payload.push_uint_var(len(param_value))
-            payload.push_bytes(param_value)
+        MOQTMessage._serialize_params(payload, self.parameters)
 
         buf.push_uint_var(self.type)
         buf.push_uint16(payload.tell())
@@ -175,13 +159,7 @@ class FetchOk(MOQTMessage):
         largest_group_id = buf.pull_uint_var()
         largest_object_id = buf.pull_uint_var()
 
-        params = {}
-        param_count = buf.pull_uint_var()
-        for _ in range(param_count):
-            param_id = buf.pull_uint_var()
-            param_len = buf.pull_uint_var()
-            param_value = buf.pull_bytes(param_len)
-            params[param_id] = param_value
+        params = MOQTMessage._deserialize_params(buf)
 
         return cls(
             request_id=request_id,

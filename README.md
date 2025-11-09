@@ -4,7 +4,7 @@
 
 ## Overview
 
-This package implements the [MoQT Specification](https://moq-wg.github.io/moq-transport/draft-ietf-moq-transport.html) (currently **draft-10**). It is desinged for general use as an MoQT client and server library, supporting both 'publish' and 'subscribe' roles.
+This package implements the [MoQT Specification](https://moq-wg.github.io/moq-transport/draft-ietf-moq-transport.html) (currently **draft-14**). It is desinged for general use as an MoQT client and server library, supporting both 'publish' and 'subscribe' roles.
 
 The architecture follows the [asyncio.Protocol](https://pypi.org/project/asyncio/) design pattern, and extends the [qh3 QuicConnectionProtocol](https://pypi.org/project/qh3/) protocol.
 
@@ -14,6 +14,7 @@ The architecture follows the [asyncio.Protocol](https://pypi.org/project/asyncio
 - Supports asynchronous and awaitable synchronous calls via an optional flag.
 - High-level API for control messages with default and custom response handlers.
 - Low-level API for control and data message serialization and deserialization.
+- Supports H3/WT and raw QUIC connection
 
 🚀 **Status:** Alpha
 
@@ -81,7 +82,6 @@ uv pip install -e .
 
 ## TODO
 
-* Direct QUIC connection
 * Flesh out more message sending and handling API's
 * Support for completion call back to replace or augment default handling
 * Move track data read/write API to aiomoqt.messages.track
