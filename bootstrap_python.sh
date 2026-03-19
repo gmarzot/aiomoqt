@@ -10,9 +10,8 @@ COLOR_RED="\033[0;31m"
 COLOR_OFF="\033[0m"
 
 $ECHO "${COLOR_GREEN}Setting up Python/Cython test environment... ${COLOR_OFF}"
-PYTHON_VERSION="3.14"   # Latest Python version to install via uv
-# CYTHON_VERSION="3.0.11" # Target Cython release (3.1.0a1 crashes - use 3.1.0 when released)
-CYTHON_VERSION="3.1.0" # Target Cython release (3.1.0a1 crashes - use 3.1.0 when released)
+PYTHON_VERSION="3.14t"  # Free-threaded build (nogil, PEP 779)
+CYTHON_VERSION="3.2.4"  # Full free-threading support (pymutex, critical sections)
 
 PLATFORM="$(uname -s)"
 case "${PLATFORM}" in

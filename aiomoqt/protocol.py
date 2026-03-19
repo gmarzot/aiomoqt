@@ -1511,13 +1511,17 @@ class MOQTSession(QuicConnectionProtocol):
         logger.info(f"MOQT event: handle {msg}")
         # Handle subscribes blocked notification
 
-    async def _handle_track_status_request(self, msg: TrackStatusRequest) -> None:
-        logger.info(f"MOQT event: handle {msg}")
-        # Send track status in response
-
     async def _handle_track_status(self, msg: TrackStatus) -> None:
         logger.info(f"MOQT event: handle {msg}")
-        # Handle track status update
+        # Handle track status request (same format as SUBSCRIBE)
+
+    async def _handle_track_status_ok(self, msg: TrackStatusOk) -> None:
+        logger.info(f"MOQT event: handle {msg}")
+        # Handle track status response (same format as SUBSCRIBE_OK)
+
+    async def _handle_track_status_error(self, msg: TrackStatusError) -> None:
+        logger.info(f"MOQT event: handle {msg}")
+        # Handle track status error (same format as SUBSCRIBE_ERROR)
 
     async def _handle_goaway(self, msg: GoAway) -> None:
         logger.info(f"MOQT event: handle {msg}")
@@ -1651,8 +1655,9 @@ class MOQTSession(QuicConnectionProtocol):
        MOQTMessageType.REQUESTS_BLOCKED: (SubscribesBlocked, _handle_subscribes_blocked),
 
        # Status messages
-       MOQTMessageType.TRACK_STATUS_REQUEST: (TrackStatusRequest, _handle_track_status_request),
        MOQTMessageType.TRACK_STATUS: (TrackStatus, _handle_track_status),
+       MOQTMessageType.TRACK_STATUS_OK: (TrackStatusOk, _handle_track_status_ok),
+       MOQTMessageType.TRACK_STATUS_ERROR: (TrackStatusError, _handle_track_status_error),
 
        # Session control messages
        MOQTMessageType.GOAWAY: (GoAway, _handle_goaway),

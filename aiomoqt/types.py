@@ -29,8 +29,8 @@ class MOQTMessageType(IntEnum):
     PUBLISH_NAMESPACE_DONE = 0x09
     PUBLISH_DONE = 0x0B
     PUBLISH_NAMESPACE_CANCEL = 0x0C
-    TRACK_STATUS_REQUEST = 0x0D
-    TRACK_STATUS = 0x0E
+    TRACK_STATUS = 0x0D
+    TRACK_STATUS_OK = 0x0E
     SUBSCRIBE_NAMESPACE = 0x11
     SUBSCRIBE_NAMESPACE_OK = 0x12
     SUBSCRIBE_NAMESPACE_ERROR = 0x13
@@ -39,9 +39,10 @@ class MOQTMessageType(IntEnum):
     FETCH_CANCEL = 0x17
     FETCH_OK = 0x18
     FETCH_ERROR = 0x19
-    PUBLISH = 0x1B  # New in draft-14
-    PUBLISH_OK = 0x1C
-    PUBLISH_ERROR = 0x1D
+    TRACK_STATUS_ERROR = 0x0F
+    PUBLISH = 0x1D  # New in draft-14
+    PUBLISH_OK = 0x1E
+    PUBLISH_ERROR = 0x1F
 
 
 class ParamType(IntEnum):
@@ -78,12 +79,23 @@ class SessionCloseCode(IntEnum):
     INTERNAL_ERROR = 0x01
     UNAUTHORIZED = 0x02
     PROTOCOL_VIOLATION = 0x03
-    DUPLICATE_TRACK_ALIAS = 0x04
-    PARAMETER_LENGTH_MISMATCH = 0x05
-    TOO_MANY_SUBSCRIBES = 0x06
+    INVALID_REQUEST_ID = 0x04
+    DUPLICATE_TRACK_ALIAS = 0x05
+    KEY_VALUE_FORMATTING_ERROR = 0x06
+    TOO_MANY_REQUESTS = 0x07
+    INVALID_PATH = 0x08
+    MALFORMED_PATH = 0x09
     GOAWAY_TIMEOUT = 0x10
     CONTROL_MESSAGE_TIMEOUT = 0x11
     DATA_STREAM_TIMEOUT = 0x12
+    AUTH_TOKEN_CACHE_OVERFLOW = 0x13
+    DUPLICATE_AUTH_TOKEN_ALIAS = 0x14
+    VERSION_NEGOTIATION_FAILED = 0x15
+    MALFORMED_AUTH_TOKEN = 0x16
+    UNKNOWN_AUTH_TOKEN_ALIAS = 0x17
+    EXPIRED_AUTH_TOKEN = 0x18
+    INVALID_AUTHORITY = 0x19
+    MALFORMED_AUTHORITY = 0x1A
 
 class ContentExistsCode(IntEnum):
     """Content Exists Code"""
@@ -93,23 +105,25 @@ class ContentExistsCode(IntEnum):
 class SubscribeErrorCode(IntEnum):
     """SUBSCRIBE_ERROR error codes."""
     INTERNAL_ERROR = 0x0
-    INVALID_RANGE = 0x01
-    RETRY_TRACK_ALIAS = 0x02
-    TRACK_DOES_NOT_EXIST = 0x03
-    UNAUTHORIZED = 0x04
-    TIMEOUT = 0x05
+    UNAUTHORIZED = 0x01
+    TIMEOUT = 0x02
+    NOT_SUPPORTED = 0x03
+    TRACK_DOES_NOT_EXIST = 0x04
+    INVALID_RANGE = 0x05
+    MALFORMED_AUTH_TOKEN = 0x10
+    EXPIRED_AUTH_TOKEN = 0x12
 
 
 class SubscribeDoneCode(IntEnum):
-    """SUBSCRIBE_DONE status codes."""
-    UNSUBSCRIBED = 0x0
-    INTERNAL_ERROR = 0x01
-    UNAUTHORIZED = 0x02
-    TRACK_ENDED = 0x03
-    SUBSCRIPTION_ENDED = 0x04
-    GOING_AWAY = 0x05
-    EXPIRED = 0x06
-    TOO_FAR_BEHIND = 0x07
+    """SUBSCRIBE_DONE / PUBLISH_DONE status codes."""
+    INTERNAL_ERROR = 0x0
+    UNAUTHORIZED = 0x01
+    TRACK_ENDED = 0x02
+    SUBSCRIPTION_ENDED = 0x03
+    GOING_AWAY = 0x04
+    EXPIRED = 0x05
+    TOO_FAR_BEHIND = 0x06
+    MALFORMED_TRACK = 0x07
 
 
 class TrackStatusCode(IntEnum):
@@ -123,6 +137,7 @@ class TrackStatusCode(IntEnum):
 
 class FilterType(IntEnum):
     """Subscription filter types."""
+    NEXT_GROUP_START = 0x01
     LATEST_OBJECT = 0x02
     ABSOLUTE_START = 0x03
     ABSOLUTE_RANGE = 0x04
@@ -140,13 +155,11 @@ class ObjectStatus(IntEnum):
     NORMAL = 0x0
     DOES_NOT_EXIST = 0x01
     END_OF_GROUP = 0x03
-    END_OF_TRACK_AND_GROUP = 0x04
-    END_OF_TRACK = 0x05
+    END_OF_TRACK = 0x04
 
 
 class ForwardingPreference(IntEnum):
     """Object forwarding preferences."""
-    TRACK = 0x0
     SUBGROUP = 0x01
     DATAGRAM = 0x02
 
@@ -154,6 +167,7 @@ class ForwardingPreference(IntEnum):
 class FetchType(IntEnum):
     FETCH = 0x01
     JOINING_FETCH = 0x02
+    ABSOLUTE_JOINING = 0x03
 
 
 class DataStreamType(IntEnum):
