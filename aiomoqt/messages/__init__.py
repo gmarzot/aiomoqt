@@ -3,6 +3,7 @@ from .base import *
 from .setup import *
 from .namespace import *
 from .subscribe import *
+from .publish import *
 from .fetch import *
 from .track import *
 
@@ -11,7 +12,8 @@ __all__ = [
     'ClientSetup', 'ServerSetup', 'GoAway',
     'Subscribe', 'SubscribeOk', 'SubscribeError', 'SubscribeUpdate',
     'Unsubscribe', 'SubscribeDone', 'MaxSubscribeId', 'SubscribesBlocked',
-    'TrackStatusRequest', 'TrackStatus',
+    'TrackStatus', 'TrackStatusOk', 'TrackStatusError',
+    'Publish', 'PublishOk', 'PublishError',
     'PublishNamespace', 'PublishNamespaceOk', 'PublishNamespaceError',
     'PublishNamespaceDone', 'PublishNamespaceCancel',
     'SubscribeNamespace', 'SubscribeNamespaceOk', 'SubscribeNamespaceError',

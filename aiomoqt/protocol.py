@@ -305,7 +305,7 @@ class MOQTSession(QuicConnectionProtocol):
                     status = ObjectStatus(msg_obj.status).name
                     id = f"{group_id}.{subgroup_id}.{object_id}"
                     now = int(time.time()*1000)
-                    msg_ts = msg_obj.extensions.get(MOQT_TIMESTAMP_EXT)
+                    msg_ts = msg_obj.extensions.get(MOQT_TIMESTAMP_EXT) if msg_obj.extensions else None
                     delay = f"delay: {now - msg_ts} ms" if msg_ts else ""
                     logstr = f"{id} status: {status} size: {consumed} bytes {delay}"
                     if status != ObjectStatus.NORMAL:
@@ -339,7 +339,7 @@ class MOQTSession(QuicConnectionProtocol):
         if buf.capacity == 0 or buf.tell() >= buf.capacity:
             logger.error(f"MOQT stream({stream_id}): no data at position: {buf.tell()}")
             return
-        
+
         try:
             pos = buf.tell()
             msg_header = None
@@ -347,29 +347,40 @@ class MOQTSession(QuicConnectionProtocol):
             if self._data_streams.get(stream_id) is None:
                 # Get stream type from first byte
                 stream_type = buf.pull_uint_var()
-                if stream_type == DataStreamType.SUBGROUP_HEADER:
-                    msg_header = SubgroupHeader.deserialize(buf)
-                    data_type = DataStreamType(stream_type).name
+                # Draft-14: SubgroupHeader types 0x10-0x1D (12 valid, 0x16-0x17 reserved)
+                if 0x10 <= stream_type <= 0x1D and ((stream_type >> 1) & 0x03) != 3:
+                    msg_header = SubgroupHeader.deserialize(buf, type_val=stream_type)
+                    data_type = "SUBGROUP_HEADER"
                 elif stream_type == DataStreamType.FETCH_HEADER:
                     msg_header = FetchHeader.deserialize(buf)
-                    data_type = DataStreamType(stream_type).name
+                    data_type = "FETCH_HEADER"
                 else:
-                    data_type = f"0x{hex(stream_type)}"
-                    logger.error(f"MOQT stream({stream_id}): unexpected data stream type: {stream_type}")
+                    data_type = f"0x{stream_type:x}"
+                    logger.error(f"MOQT stream({stream_id}): unexpected data stream type: {data_type}")
 
                 if msg_header is None:
                     error = f"data stream {stream_id}: {data_type} parse failed at: {buf.tell()}"
                     logger.error(f"MOQT error: " + error)
                     self._close_session(SessionCloseCode.PROTOCOL_VIOLATION, error)
                     return None
-                
+
                 # record that the data stream header has been processed
-                consumed = buf.tell() - pos            
+                consumed = buf.tell() - pos
                 logger.debug(f"MOQT stream({stream_id}): {msg_header} consumed: {consumed} bytes")
                 self._data_streams[stream_id] = msg_header
             else:
                 if isinstance(self._data_streams[stream_id], SubgroupHeader):
-                    msg_header = ObjectHeader.deserialize(buf, len)
+                    sg_header = self._data_streams[stream_id]
+                    msg_header = ObjectHeader.deserialize(
+                        buf, len,
+                        extensions_present=sg_header.extensions_present,
+                        prev_object_id=sg_header._last_object_id
+                    )
+                    # Update delta tracking state
+                    sg_header._last_object_id = msg_header.object_id
+                    # Resolve subgroup_id for FIRST_OBJ mode
+                    if sg_header.subgroup_id_mode == SUBGROUP_ID_FIRST_OBJ and sg_header.subgroup_id is None:
+                        sg_header.subgroup_id = msg_header.object_id
 
                 elif isinstance(self._data_streams[stream_id], FetchHeader):
                     msg_header = FetchObject.deserialize(buf)
@@ -379,62 +390,65 @@ class MOQTSession(QuicConnectionProtocol):
                     logger.error(f"MOQT error: " + error)
                     self._close_session(SessionCloseCode.PROTOCOL_VIOLATION, error)
                     return None
-                consumed = buf.tell() - pos        
+                consumed = buf.tell() - pos
                 logger.debug(f"MOQT stream({stream_id}): {class_name(msg_header)} consumed: {consumed} bytes")
 
-                    
+
             return msg_header
         except Exception:
             raise
 
     def _moqt_handle_data_dgram(self, buf: Buffer) -> MOQTMessageType:
-        """Process incoming data messages (not control messages)."""
+        """Process incoming datagram messages."""
         if buf.capacity == 0 or buf.tell() >= buf.capacity:
             logger.error(f"MOQT datagram: no data {buf.tell()}")
             return
         logger.debug(f"MOQT handle datagram: 0x{buf.data_slice(0,min(buf.capacity,12))}")
-        # Get stream type from first byte
+        # Get datagram type from first byte
         pos = buf.tell()
         dgram_type = buf.pull_uint_var()
-        if dgram_type == DatagramType.OBJECT_DATAGRAM:
-            msg = ObjectDatagram.deserialize(buf,buf.capacity)
+        # Draft-14: ObjectDatagram types 0x00-0x07 (payload datagrams)
+        if 0x00 <= dgram_type <= 0x07:
+            msg = ObjectDatagram.deserialize(buf, buf.capacity, type_val=dgram_type)
             if msg is None:
                 error = f"datagram parsing failed at: {buf.tell()}"
                 logger.error(f"MOQT error: " + error)
                 self._close_session(SessionCloseCode.PROTOCOL_VIOLATION, error)
                 return msg
-            
-            consumed = buf.tell() - pos        
+
+            consumed = buf.tell() - pos
             group_id = msg.group_id
             object_id = msg.object_id
             id = f"{group_id}.{object_id}"
             now = int(time.time()*1000)
-            msg_ts = msg.extensions.get(MOQT_TIMESTAMP_EXT)
+            msg_ts = msg.extensions.get(MOQT_TIMESTAMP_EXT) if msg.extensions else None
             delay = f"delay: {now - msg_ts} ms" if msg_ts else ""
             logstr = f"{id} size: {consumed} bytes {delay}"
 
             logger.info(f"MOQT event: ObjectDatagram: {logstr}")
-            return msg            
-        elif dgram_type == DatagramType.OBJECT_DATAGRAM_STATUS:
-            msg = ObjectDatagramStatus.deserialize(buf)
+            return msg
+        # Draft-14: ObjectDatagramStatus types 0x20-0x21 (status datagrams)
+        elif 0x20 <= dgram_type <= 0x21:
+            msg = ObjectDatagramStatus.deserialize(buf, type_val=dgram_type)
             if msg is None:
                 error = f"datagram parsing failed at: {buf.tell()}"
                 logger.error(f"MOQT error: " + error)
                 self._close_session(SessionCloseCode.PROTOCOL_VIOLATION, error)
                 return msg
-            
-            consumed = buf.tell() - pos        
+
+            consumed = buf.tell() - pos
             group_id = msg.group_id
             object_id = msg.object_id
             id = f"{group_id}.{object_id}"
             now = int(time.time()*1000)
-            msg_ts = msg.extensions.get(MOQT_TIMESTAMP_EXT)
+            msg_ts = msg.extensions.get(MOQT_TIMESTAMP_EXT) if msg.extensions else None
             delay = f"delay: {now - msg_ts} ms" if msg_ts else ""
             logstr = f"{id} size: {consumed} bytes {delay}"
-            
-            logger.info(f"MOQT event: ObjectDatagramStatus: {logstr}")               
+
+            logger.info(f"MOQT event: ObjectDatagramStatus: {logstr}")
+            return msg
         else:
-            error = f"datagram type unknown: {dgram_type}"
+            error = f"datagram type unknown: 0x{dgram_type:x}"
             logger.error(f"MOQT error: " + error)
             self._close_session(SessionCloseCode.PROTOCOL_VIOLATION, error)
             return
@@ -1549,6 +1563,18 @@ class MOQTSession(QuicConnectionProtocol):
         logger.info(f"MOQT event: handle {msg}")
         self.subscribe_namespace_ok(msg)
 
+    async def _handle_publish(self, msg: Publish) -> None:
+        logger.info(f"MOQT event: handle {msg}")
+        # Publisher has announced a track — accept by default
+
+    async def _handle_publish_ok(self, msg: PublishOk) -> None:
+        logger.info(f"MOQT event: handle {msg}")
+        # Subscriber accepted our PUBLISH
+
+    async def _handle_publish_error(self, msg: PublishError) -> None:
+        logger.info(f"MOQT event: handle {msg}")
+        # Subscriber rejected our PUBLISH
+
     async def _handle_fetch(self, msg: Fetch) -> None:
         logger.info(f"MOQT event: handle {msg}")
         self.fetch_ok(msg)
@@ -1673,16 +1699,21 @@ class MOQTSession(QuicConnectionProtocol):
        MOQTMessageType.FETCH_CANCEL: (FetchCancel, _handle_fetch_cancel),
        MOQTMessageType.FETCH_OK: (FetchOk, _handle_fetch_ok),
        MOQTMessageType.FETCH_ERROR: (FetchError, _handle_fetch_error),
+
+       # Publish messages (draft-14)
+       MOQTMessageType.PUBLISH: (Publish, _handle_publish),
+       MOQTMessageType.PUBLISH_OK: (PublishOk, _handle_publish_ok),
+       MOQTMessageType.PUBLISH_ERROR: (PublishError, _handle_publish_error),
    }
 
-    # Stream data message types    
-    MOQT_STREAM_DATA_REGISTRY: Dict[DataStreamType, Tuple[Type[MOQTMessage], Callable]] = {
-        DataStreamType.SUBGROUP_HEADER: (SubgroupHeader, _handle_subgroup_header),
+    # Stream data message types (dispatch by range check, not registry lookup)
+    MOQT_STREAM_DATA_REGISTRY: Dict[int, Tuple[Type[MOQTMessage], Callable]] = {
         DataStreamType.FETCH_HEADER: (FetchHeader, _handle_fetch_header),
+        # SubgroupHeader: types 0x10-0x1D dispatched by range check
     }
-    
-    # Datagram data message types
-    MOQT_DGRAM_DATA_REGISTRY: Dict[DataStreamType, Tuple[Type[MOQTMessage], Callable]] = {
-        DatagramType.OBJECT_DATAGRAM: (ObjectDatagram, _handle_object_datagram),
-        DatagramType.OBJECT_DATAGRAM_STATUS: (ObjectDatagramStatus, _handle_object_datagram_status),
+
+    # Datagram data message types (dispatch by range check, not registry lookup)
+    MOQT_DGRAM_DATA_REGISTRY: Dict[int, Tuple[Type[MOQTMessage], Callable]] = {
+        # ObjectDatagram: types 0x00-0x07 dispatched by range check
+        # ObjectDatagramStatus: types 0x20-0x21 dispatched by range check
     }

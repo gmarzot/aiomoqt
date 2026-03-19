@@ -221,7 +221,7 @@ GOAWAY_TEST_CASES = [
     )
 ]
 
-# Define test cases for parameterized testing
+# Control message test cases (use generic conftest helper)
 TEST_CASES = [
     # (class, params, type_id, needs_len, test_id)
     (
@@ -313,28 +313,6 @@ TEST_CASES = [
         False,
     ),
     (
-        SubgroupHeader, 
-        {
-            'track_alias': 123,
-            'group_id': 456,
-            'subgroup_id': 789,
-            'publisher_priority': 10
-        },
-        DataStreamType.SUBGROUP_HEADER,
-        False,
-    ),
-    (
-        ObjectHeader,
-        {
-            'object_id': 1,
-            'extensions': {0: 4207849484, 1: b'\xfa\xce\xb0\x0c'},
-            'status': ObjectStatus.NORMAL,
-            'payload': b'Hello World'
-        },
-        None,
-        True,
-    ),
-    (
         FetchHeader,
         {
             'request_id': 42
@@ -368,32 +346,78 @@ TEST_CASES = [
         None,
         False,
     ),
+    # PUBLISH control messages (draft-14)
     (
-        ObjectDatagram,
+        Publish,
         {
-            'track_alias': 123,
-            'group_id': 456,
-            'object_id': 789,
-            'publisher_priority': 255,
-            'extensions': {0: 4207849484, 1: b'\xfa\xce\xb0\x0c'},
-            'payload': b'Hello World'
+            'request_id': 1,
+            'track_namespace': (b'live', b'sports'),
+            'track_name': b'football',
+            'track_alias': 42,
+            'group_order': GroupOrder.ASCENDING,
+            'content_exists': ContentExistsCode.NO_CONTENT,
+            'forward': ForwardingPreference.SUBGROUP,
+            'parameters': {}
         },
-        DatagramType.OBJECT_DATAGRAM,
-        True,
+        MOQTMessageType.PUBLISH,
+        False,
     ),
     (
-        ObjectDatagramStatus,
+        Publish,
         {
-            'track_alias': 123,
-            'group_id': 456,
-            'object_id': 789,
-            'publisher_priority': 0,
-            'extensions': {0: 4207849484, 1: b'\xfa\xce\xb0\x0c'},
-            'status': ObjectStatus.DOES_NOT_EXIST
+            'request_id': 2,
+            'track_namespace': (b'vod',),
+            'track_name': b'movie1',
+            'track_alias': 99,
+            'group_order': GroupOrder.DESCENDING,
+            'content_exists': ContentExistsCode.EXISTS,
+            'largest_group_id': 50,
+            'largest_object_id': 200,
+            'forward': ForwardingPreference.DATAGRAM,
+            'parameters': {ParamType.DELIVERY_TIMEOUT: 5000}
         },
-        DatagramType.OBJECT_DATAGRAM_STATUS,
+        MOQTMessageType.PUBLISH,
         False,
-    ), 
+    ),
+    (
+        PublishOk,
+        {
+            'request_id': 1,
+            'forward': ForwardingPreference.SUBGROUP,
+            'priority': 128,
+            'group_order': GroupOrder.ASCENDING,
+            'filter_type': FilterType.LATEST_OBJECT,
+            'parameters': {}
+        },
+        MOQTMessageType.PUBLISH_OK,
+        False,
+    ),
+    (
+        PublishOk,
+        {
+            'request_id': 2,
+            'forward': ForwardingPreference.DATAGRAM,
+            'priority': 255,
+            'group_order': GroupOrder.DESCENDING,
+            'filter_type': FilterType.ABSOLUTE_RANGE,
+            'start_group': 10,
+            'start_object': 5,
+            'end_group': 100,
+            'parameters': {}
+        },
+        MOQTMessageType.PUBLISH_OK,
+        False,
+    ),
+    (
+        PublishError,
+        {
+            'request_id': 1,
+            'error_code': PublishErrorCode.UNINTERESTED,
+            'reason': 'Not interested'
+        },
+        MOQTMessageType.PUBLISH_ERROR,
+        False,
+    ),
 ]
 
 TEST_CASES.extend(FETCH_TEST_CASES)
@@ -414,143 +438,248 @@ def test_moqt_messages(cls, params, type_id, needs_len):
     assert moqt_message_serialization(cls, params, type_id, needs_len)
 
 
-def test_subgroup_header():
-    params = {
-        'track_alias': 123,
-        'group_id': 456,
-        'subgroup_id': 789,
-        'publisher_priority': 10
-    }
-    assert moqt_message_serialization(SubgroupHeader, params, DataStreamType.SUBGROUP_HEADER)
+# ---- Draft-14 SubgroupHeader tests (type variants 0x10-0x1D) ----
 
-def test_object_header():
-    params = {
-        'object_id': 1,
-        'extensions': {0: 4207849484, 1: b'\xfa\xce\xb0\x0c'},
-        'status': ObjectStatus.NORMAL,
-        'payload': b'Hello World'
-    }
-    assert moqt_message_serialization(ObjectHeader, params, needs_len=True)
-
-def test_fetch_header():
-    params = {
-        'request_id': 42
-    }
-    assert moqt_message_serialization(FetchHeader, params, DataStreamType.FETCH_HEADER)
-
-def test_fetch_object():
-    params = {
-        'group_id': 1,
-        'subgroup_id': 2,
-        'object_id': 3,
-        'publisher_priority': 56,
-        'extensions': {},
-        'payload': b'Sample payload'
-    }
-    assert moqt_message_serialization(FetchObject, params)
-
-def test_object_datagram():
-    params = {
-        'track_alias': 123,
-        'group_id': 456,
-        'object_id': 789,
-        'publisher_priority': 255,
-        'extensions': {0: 4207849484, 1: b'\xfa\xce\xb0\x0c'},
-        'payload': b'Hello World'
-    }
-    assert moqt_message_serialization(ObjectDatagram, params, DatagramType.OBJECT_DATAGRAM)
-
-def test_object_datagram_status():
-    params = {
-        'track_alias': 123,
-        'group_id': 456,
-        'object_id': 789,
-        'publisher_priority': 0,
-        'extensions': {},
-        'status': ObjectStatus.DOES_NOT_EXIST
-    }
-    assert moqt_message_serialization(ObjectDatagramStatus, params, DatagramType.OBJECT_DATAGRAM_STATUS)
-
-# Example usage for each message class
-def test_subgroup_header():
-    params = {
-        'track_alias': 123,
-        'group_id': 456,
-        'subgroup_id': 789,
-        'publisher_priority': 10
-    }
-    assert moqt_message_serialization(SubgroupHeader, params, DataStreamType.SUBGROUP_HEADER)
-
-def test_object_header():
-    params = {
-        'object_id': 1,
-        'extensions': {0: 4207849484, 1: b'\xfa\xce\xb0\x0c'},
-        'status': ObjectStatus.NORMAL,
-        'payload': b''
-    }
-    assert moqt_message_serialization(ObjectHeader, params, needs_len=True)
-
-def test_fetch_header():
-    params = {
-        'request_id': 42
-    }
-    assert moqt_message_serialization(FetchHeader, params, DataStreamType.FETCH_HEADER)
-
-def test_fetch_object():
-    params = {
-        'group_id': 1,
-        'subgroup_id': 2,
-        'object_id': 3,
-        'publisher_priority': 56,
-        'extensions': {0: 4207849484, 1: b'\xfa\xce\xb0\x0c'},
-        'payload': b'Sample payload'
-    }
-    assert moqt_message_serialization(FetchObject, params)
-
-def test_object_datagram():
-    params = {
-        'track_alias': 123,
-        'group_id': 456,
-        'object_id': 789,
-        'publisher_priority': 255,
-        'extensions': {0: 4207849484, 1: b'\xfa\xce\xb0\x0c'},
-        'payload': b'Hello World'
-    }
-    assert moqt_message_serialization(ObjectDatagram, params, DatagramType.OBJECT_DATAGRAM, needs_len=True)
-
-def test_object_datagram_status():
-    params = {
-        'track_alias': 123,
-        'group_id': 456,
-        'object_id': 789,
-        'publisher_priority': 0,
-        'extensions': {10000: 4207849484, 100000001: b'\xfa\xce\xb0\x0c'},
-        'status': ObjectStatus.END_OF_GROUP
-    }
-    assert moqt_message_serialization(ObjectDatagramStatus, params, DatagramType.OBJECT_DATAGRAM_STATUS)
-
-def test_ObjectHeader():
-    data_bytes = b'\xfa\xce\xb0\x0c'
-    obj = ObjectHeader(
-        object_id = 1,
-        status = ObjectStatus.NORMAL,
-        extensions = {
-            0: 4207849484,
-            1: data_bytes,
-        },
-        payload = b'Hello World'
+def test_subgroup_header_explicit():
+    """SubgroupHeader with explicit subgroup_id (mode 2), no extensions, no end_of_group."""
+    sg = SubgroupHeader(
+        track_alias=123, group_id=456, subgroup_id=789,
+        publisher_priority=10, subgroup_id_mode=SUBGROUP_ID_EXPLICIT,
     )
+    buf = sg.serialize()
+    buf_len = buf.tell()
+    buf.seek(0)
+    type_val = buf.pull_uint_var()
+    assert type_val == 0x14  # base 0x10 | (2 << 1) = 0x14
+    new_sg = SubgroupHeader.deserialize(buf, type_val)
+    assert new_sg.track_alias == 123
+    assert new_sg.group_id == 456
+    assert new_sg.subgroup_id == 789
+    assert new_sg.publisher_priority == 10
+    assert new_sg.extensions_present is False
+    assert new_sg.end_of_group is False
+    assert new_sg.subgroup_id_mode == SUBGROUP_ID_EXPLICIT
 
-    obj_buf  = obj.serialize()
-    obj_len = obj_buf.tell()
-    obj_buf.seek(0)
-    new_obj = ObjectHeader.deserialize(obj_buf, obj_len)
-    
-    assert obj.object_id == new_obj.object_id
-    assert obj.status == new_obj.status
-    if obj.extensions is None:
-        assert new_obj.extensions is None
-    else:
-        assert len(obj.extensions) == len(new_obj.extensions)
-        
-    assert len(obj.payload) == len(new_obj.payload)
+
+def test_subgroup_header_zero():
+    """SubgroupHeader with zero subgroup_id (mode 0)."""
+    sg = SubgroupHeader(
+        track_alias=1, group_id=2, subgroup_id=0,
+        publisher_priority=128, subgroup_id_mode=SUBGROUP_ID_ZERO,
+    )
+    buf = sg.serialize()
+    buf_len = buf.tell()
+    buf.seek(0)
+    type_val = buf.pull_uint_var()
+    assert type_val == 0x10  # base, mode=0, no flags
+    new_sg = SubgroupHeader.deserialize(buf, type_val)
+    assert new_sg.subgroup_id == 0
+    assert new_sg.subgroup_id_mode == SUBGROUP_ID_ZERO
+
+
+def test_subgroup_header_with_extensions_and_eog():
+    """SubgroupHeader with extensions + end_of_group + explicit subgroup_id."""
+    sg = SubgroupHeader(
+        track_alias=10, group_id=20, subgroup_id=30,
+        publisher_priority=5, subgroup_id_mode=SUBGROUP_ID_EXPLICIT,
+        extensions_present=True, end_of_group=True,
+    )
+    buf = sg.serialize()
+    buf.seek(0)
+    type_val = buf.pull_uint_var()
+    # 0x10 | 0x01 (ext) | (2 << 1) (explicit) | 0x08 (eog) = 0x1D
+    assert type_val == 0x1D
+    new_sg = SubgroupHeader.deserialize(buf, type_val)
+    assert new_sg.extensions_present is True
+    assert new_sg.end_of_group is True
+    assert new_sg.subgroup_id == 30
+
+
+def test_subgroup_header_first_obj_mode():
+    """SubgroupHeader with first_obj_id mode (subgroup_id resolved later)."""
+    sg = SubgroupHeader(
+        track_alias=1, group_id=2,
+        publisher_priority=128, subgroup_id_mode=SUBGROUP_ID_FIRST_OBJ,
+    )
+    buf = sg.serialize()
+    buf.seek(0)
+    type_val = buf.pull_uint_var()
+    assert type_val == 0x12  # base | (1 << 1)
+    new_sg = SubgroupHeader.deserialize(buf, type_val)
+    assert new_sg.subgroup_id is None  # resolved when first object arrives
+    assert new_sg.subgroup_id_mode == SUBGROUP_ID_FIRST_OBJ
+
+
+# ---- Draft-14 ObjectHeader tests (delta encoding + conditional extensions) ----
+
+def test_object_header_first_object_with_extensions():
+    """First object in subgroup: delta == absolute object_id, extensions present."""
+    obj = ObjectHeader(
+        object_id=5,
+        extensions={0x20: 1234},
+        status=ObjectStatus.NORMAL,
+        payload=b'Hello World'
+    )
+    buf = obj.serialize(extensions_present=True, prev_object_id=None)
+    buf_len = buf.tell()
+    buf.seek(0)
+    new_obj = ObjectHeader.deserialize(buf, buf_len, extensions_present=True, prev_object_id=None)
+    assert new_obj.object_id == 5
+    assert new_obj.extensions[0x20] == 1234
+    assert new_obj.payload == b'Hello World'
+
+
+def test_object_header_delta_encoding():
+    """Subsequent object: delta = obj_id - prev_id - 1."""
+    obj = ObjectHeader(
+        object_id=10,
+        status=ObjectStatus.NORMAL,
+        payload=b'data'
+    )
+    # Sequential: prev=9, so delta = 10 - 9 - 1 = 0
+    buf = obj.serialize(extensions_present=False, prev_object_id=9)
+    buf_len = buf.tell()
+    buf.seek(0)
+    new_obj = ObjectHeader.deserialize(buf, buf_len, extensions_present=False, prev_object_id=9)
+    assert new_obj.object_id == 10
+    assert new_obj.extensions is None
+    assert new_obj.payload == b'data'
+
+
+def test_object_header_no_extensions():
+    """Object without extensions (subgroup header extensions_present=False)."""
+    obj = ObjectHeader(
+        object_id=0,
+        status=ObjectStatus.END_OF_GROUP,
+        payload=b''
+    )
+    buf = obj.serialize(extensions_present=False)
+    buf_len = buf.tell()
+    buf.seek(0)
+    new_obj = ObjectHeader.deserialize(buf, buf_len, extensions_present=False)
+    assert new_obj.object_id == 0
+    assert new_obj.extensions is None
+    assert new_obj.status == ObjectStatus.END_OF_GROUP
+
+
+# ---- Draft-14 ObjectDatagram tests (type variants 0x00-0x07) ----
+
+def test_object_datagram_basic():
+    """ObjectDatagram with object_id, no extensions, no end_of_group."""
+    dg = ObjectDatagram(
+        track_alias=123, group_id=456, object_id=789,
+        publisher_priority=255, payload=b'Hello World'
+    )
+    buf = dg.serialize()
+    buf_len = buf.tell()
+    buf.seek(0)
+    type_val = buf.pull_uint_var()
+    assert type_val == 0x00  # no flags
+    new_dg = ObjectDatagram.deserialize(buf, buf_len, type_val)
+    assert new_dg.track_alias == 123
+    assert new_dg.group_id == 456
+    assert new_dg.object_id == 789
+    assert new_dg.payload == b'Hello World'
+    assert new_dg.end_of_group is False
+
+
+def test_object_datagram_with_extensions():
+    """ObjectDatagram with extensions."""
+    dg = ObjectDatagram(
+        track_alias=1, group_id=2, object_id=3,
+        publisher_priority=128,
+        extensions={MOQT_TIMESTAMP_EXT: 1234567890},
+        payload=b'payload'
+    )
+    buf = dg.serialize()
+    buf_len = buf.tell()
+    buf.seek(0)
+    type_val = buf.pull_uint_var()
+    assert type_val & 0x01  # extensions bit set
+    new_dg = ObjectDatagram.deserialize(buf, buf_len, type_val)
+    assert new_dg.extensions[MOQT_TIMESTAMP_EXT] == 1234567890
+
+
+def test_object_datagram_no_object_id():
+    """ObjectDatagram with object_id=0 (no_object_id flag set)."""
+    dg = ObjectDatagram(
+        track_alias=1, group_id=2, object_id=0,
+        publisher_priority=128, payload=b'first'
+    )
+    buf = dg.serialize()
+    buf_len = buf.tell()
+    buf.seek(0)
+    type_val = buf.pull_uint_var()
+    assert type_val & 0x04  # no_object_id bit set
+    new_dg = ObjectDatagram.deserialize(buf, buf_len, type_val)
+    assert new_dg.object_id == 0
+
+
+def test_object_datagram_end_of_group():
+    """ObjectDatagram with end_of_group flag."""
+    dg = ObjectDatagram(
+        track_alias=1, group_id=2, object_id=99,
+        publisher_priority=128, payload=b'last',
+        end_of_group=True,
+    )
+    buf = dg.serialize()
+    buf_len = buf.tell()
+    buf.seek(0)
+    type_val = buf.pull_uint_var()
+    assert type_val & 0x02  # end_of_group bit set
+    new_dg = ObjectDatagram.deserialize(buf, buf_len, type_val)
+    assert new_dg.end_of_group is True
+
+
+# ---- Draft-14 ObjectDatagramStatus tests (type variants 0x20-0x21) ----
+
+def test_object_datagram_status_basic():
+    """ObjectDatagramStatus without extensions."""
+    ds = ObjectDatagramStatus(
+        track_alias=123, group_id=456, object_id=789,
+        publisher_priority=0, status=ObjectStatus.END_OF_GROUP
+    )
+    buf = ds.serialize()
+    buf_len = buf.tell()
+    buf.seek(0)
+    type_val = buf.pull_uint_var()
+    assert type_val == 0x20
+    new_ds = ObjectDatagramStatus.deserialize(buf, type_val)
+    assert new_ds.track_alias == 123
+    assert new_ds.object_id == 789
+    assert new_ds.status == ObjectStatus.END_OF_GROUP
+
+
+def test_object_datagram_status_with_extensions():
+    """ObjectDatagramStatus with extensions."""
+    ds = ObjectDatagramStatus(
+        track_alias=1, group_id=2, object_id=3,
+        publisher_priority=0,
+        extensions={0x20: 999},
+        status=ObjectStatus.DOES_NOT_EXIST
+    )
+    buf = ds.serialize()
+    buf.seek(0)
+    type_val = buf.pull_uint_var()
+    assert type_val == 0x21  # extensions bit set
+    new_ds = ObjectDatagramStatus.deserialize(buf, type_val)
+    assert new_ds.extensions[0x20] == 999
+    assert new_ds.status == ObjectStatus.DOES_NOT_EXIST
+
+
+def test_fetch_header():
+    params = {
+        'request_id': 42
+    }
+    assert moqt_message_serialization(FetchHeader, params, DataStreamType.FETCH_HEADER)
+
+def test_fetch_object():
+    params = {
+        'group_id': 1,
+        'subgroup_id': 2,
+        'object_id': 3,
+        'publisher_priority': 56,
+        'extensions': {},
+        'payload': b'Sample payload'
+    }
+    assert moqt_message_serialization(FetchObject, params)

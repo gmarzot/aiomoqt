@@ -170,16 +170,32 @@ class FetchType(IntEnum):
     ABSOLUTE_JOINING = 0x03
 
 
+class PublishErrorCode(IntEnum):
+    """PUBLISH_ERROR error codes."""
+    INTERNAL_ERROR = 0x0
+    UNAUTHORIZED = 0x01
+    TIMEOUT = 0x02
+    NOT_SUPPORTED = 0x03
+    UNINTERESTED = 0x04
+
+
 class DataStreamType(IntEnum):
     """Stream type identifiers."""
-    SUBGROUP_HEADER = 0x04
     FETCH_HEADER = 0x05
 
 
-class DatagramType(IntEnum):
-    """Datagram type identifiers."""
-    OBJECT_DATAGRAM = 0x01
-    OBJECT_DATAGRAM_STATUS = 0x02
+# Draft-14 SubgroupHeader type range: 0x10-0x1D (12 valid types, 0x16-0x17 reserved)
+# Bits: 0=extensions_present, 1-2=subgroup_id_mode, 3=end_of_group
+SUBGROUP_HEADER_BASE = 0x10
+SUBGROUP_ID_ZERO = 0        # subgroup_id = 0 (no field on wire)
+SUBGROUP_ID_FIRST_OBJ = 1   # subgroup_id = first object's ID (no field on wire)
+SUBGROUP_ID_EXPLICIT = 2    # subgroup_id present on wire
+
+# Draft-14 ObjectDatagram type range: 0x00-0x07 (payload), 0x20-0x21 (status)
+# Payload types bits: 0=extensions, 1=end_of_group, 2=no_object_id
+# Status types bits: 0=extensions
+OBJECT_DATAGRAM_BASE = 0x00
+OBJECT_DATAGRAM_STATUS_BASE = 0x20
 
 
 class MOQTException(Exception):
