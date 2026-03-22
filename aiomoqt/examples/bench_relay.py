@@ -51,8 +51,8 @@ examples:
         '-s', '--object-size', type=int, default=1024,
         help='Object payload size bytes (default: 1024)')
     parser.add_argument(
-        '-g', '--group-size', type=int, default=60,
-        help='Objects per group (default: 60)')
+        '-g', '--group-size', type=int, default=10000,
+        help='Objects per group (default: 10000)')
     parser.add_argument(
         '-P', '--streams', type=int, default=1,
         help='Parallel subgroup streams (default: 1)')

@@ -40,6 +40,7 @@ async def subscribe_data_generator(session: MOQTSession, msg: Subscribe,
                 subgroup_id=subgroup_id,
                 track_alias=ok.track_alias,
                 priority=priority,
+                num_subgroups=num_tasks,
                 object_size=object_size,
                 group_size=group_size,
                 rate=rate,
@@ -143,9 +144,15 @@ async def generate_group_dgram(session: MOQTSession, track_alias: int, priority:
 
 async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
                                    track_alias: int, priority: int,
+                                   num_subgroups: int = 1,
                                    object_size: int = 1024, group_size: int = 60,
                                    rate: float = 0):
-    """Generate subgroup stream objects. rate=0 means max speed."""
+    """Generate subgroup stream objects. rate=0 means max speed.
+
+    Each subgroup sends a disjoint slice of object IDs within the group:
+    subgroup N sends object IDs N, N+num_subgroups, N+2*num_subgroups, ...
+    This avoids payload conflicts in the relay cache.
+    """
     logger = get_logger(__name__)
     if session._h3 is None:
         return
@@ -202,7 +209,9 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
                 session.transmit()
 
             obj_id = header.next_object_id
-            seq_info = f"{group_id}.{subgroup_id}.{obj_id}".encode()
+            # Payload must be identical across subgroups for same
+            # (group_id, object_id) to avoid relay cache conflicts
+            seq_info = f"{group_id}.{obj_id}".encode()
             payload = (seq_info + b'|' + pad)[:object_size]
 
             extensions = {MOQT_TIMESTAMP_EXT: int(time.time() * 1000)}
@@ -255,8 +264,8 @@ examples:
                         help='Use datagrams instead of streams')
     parser.add_argument('-s', '--object-size', type=int, default=1024,
                         help='Object payload size in bytes (default: 1024)')
-    parser.add_argument('-g', '--group-size', type=int, default=60,
-                        help='Objects per group (default: 60)')
+    parser.add_argument('-g', '--group-size', type=int, default=10000,
+                        help='Objects per group (default: 10000)')
     parser.add_argument('-P', '--streams', type=int, default=1,
                         help='Parallel subgroup streams (default: 1)')
     parser.add_argument('-r', '--rate', type=float, default=0,
