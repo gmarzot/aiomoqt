@@ -29,8 +29,20 @@ from aiomoqt.examples.bench_pub import (
 )
 from aiomoqt.examples.bench_sub import BenchStats
 
-CERT = "/home/gmarzot/Projects/moq/picoquic/certs/cert.pem"
-KEY = "/home/gmarzot/Projects/moq/picoquic/certs/key.pem"
+def _find_default_cert():
+    """Search common locations for test certificates."""
+    import os
+    candidates = [
+        os.path.join(os.path.dirname(__file__), '..', '..', 'certs', 'cert.pem'),
+        os.path.expanduser('~/.local/share/moqt/cert.pem'),
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return os.path.realpath(c)
+    return None
+
+CERT = _find_default_cert()
+KEY = CERT.replace('cert.pem', 'key.pem') if CERT else None
 
 
 def parse_args():
@@ -45,8 +57,8 @@ def parse_args():
         '-s', '--object-size', type=int, default=4096,
         help='Object payload size bytes (default: 4096)')
     parser.add_argument(
-        '-g', '--group-size', type=int, default=100000,
-        help='Objects per group (default: 100000)')
+        '-g', '--group-size', type=int, default=10000,
+        help='Objects per group (default: 10000)')
     parser.add_argument(
         '-P', '--streams', type=int, default=1,
         help='Parallel subgroup streams (default: 1)')
@@ -186,6 +198,11 @@ async def main():
 
     stats = BenchStats(report_interval=args.interval)
     print_banner(args)
+
+    if not args.cert or not args.key:
+        print("  Error: TLS certificate required. Use --cert and --key,")
+        print("  or place cert.pem/key.pem in <project>/certs/")
+        return
 
     # Start server
     print("  Starting server...")

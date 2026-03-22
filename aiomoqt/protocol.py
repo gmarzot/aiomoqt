@@ -1532,7 +1532,7 @@ class MOQTSession(QuicConnectionProtocol):
 
     async def _handle_publish_namepace_done(self, msg: PublishNamespaceDone) -> None:
         logger.info(f"MOQT event: handle {msg}")
-        self.publish_namepace_ok(msg)
+        # PublishNamespaceDone is a notification, no response required
 
     async def _handle_publish_namepace_cancel(self, msg: PublishNamespaceCancel) -> None:
         logger.info(f"MOQT event: handle {msg}")
@@ -1667,7 +1667,7 @@ class MOQTSession(QuicConnectionProtocol):
                 reason_phrase="Invalid track alias in datagram"
             )
             return
-        logger.debug(f"MOQT event: datagram object: {msg.group_id}.{msg.s}")
+        logger.debug(f"MOQT event: datagram object: {msg.group_id}.{msg.object_id}")
         # Process object data
         # Could add to local storage or forward to subscribers
 
