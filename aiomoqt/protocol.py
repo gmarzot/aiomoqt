@@ -29,7 +29,7 @@ logger = get_logger(__name__)
 
 class H3CustomConnection(H3Connection):
     """Custom H3Connection wrapper to support alternate SETTINGS"""
-    
+
     def __init__(self, quic: QuicConnection, table_capacity: int = 0, **kwargs) -> None:
         # settings table capacity can be overridden - this should be generalized
         self._max_table_capacity = table_capacity
@@ -41,6 +41,20 @@ class H3CustomConnection(H3Connection):
             logger.debug("H3 SETTINGS sent:")
             for setting_id, value in settings.items():
                 logger.debug(f"  Setting 0x{setting_id:x} = {value}")
+
+    def _validate_settings(self, settings: dict) -> None:
+        """Relaxed validation: allow ENABLE_WEBTRANSPORT without H3_DATAGRAM.
+
+        Some relays (e.g. Red5) send ENABLE_WEBTRANSPORT=1 without H3_DATAGRAM,
+        which is technically invalid per RFC 9297 but works in practice.
+        """
+        from qh3.h3.connection import Setting
+        patched = dict(settings)
+        if (patched.get(Setting.ENABLE_WEBTRANSPORT) == 1
+                and patched.get(Setting.H3_DATAGRAM) != 1):
+            logger.warning("H3: relay sent ENABLE_WEBTRANSPORT without H3_DATAGRAM, accepting anyway")
+            patched[Setting.H3_DATAGRAM] = 1
+        super()._validate_settings(patched)
 
     @property
     def _max_table_capacity(self):
