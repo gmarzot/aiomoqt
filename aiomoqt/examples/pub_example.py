@@ -23,12 +23,12 @@ GROUP_SIZE = 60
 
 async def dgram_subscribe_data_generator(session: MOQTSession, msg: Subscribe) -> None:
     """Subscribe handler that spawns datagram data generation."""
-    session.default_message_handler(msg.type, msg)
-    logger.debug(f"dgram_subscribe_data_generator: track_alias: {msg.track_alias}")
+    ok = session.subscribe_ok(request_msg=msg)
+    logger.debug(f"dgram_subscribe_data_generator: track_alias: {ok.track_alias}")
     task = asyncio.create_task(
         generate_group_dgram(
             session=session,
-            track_alias=msg.track_alias,
+            track_alias=ok.track_alias,
             priority=255
         )
     )
@@ -42,7 +42,7 @@ async def dgram_subscribe_data_generator(session: MOQTSession, msg: Subscribe) -
 async def subscribe_data_generator(session: MOQTSession, msg: Subscribe,
                                    num_tasks: int = NUM_SUBGROUP_TASKS) -> None:
     """Subscribe handler that spawns subgroup stream data generation."""
-    session.default_message_handler(msg.type, msg)
+    ok = session.subscribe_ok(request_msg=msg)
 
     for subgroup_id in range(num_tasks):
         priority = 255 if subgroup_id == 0 else 0
@@ -50,7 +50,7 @@ async def subscribe_data_generator(session: MOQTSession, msg: Subscribe,
             generate_subgroup_stream(
                 session=session,
                 subgroup_id=subgroup_id,
-                track_alias=msg.track_alias,
+                track_alias=ok.track_alias,
                 priority=priority
             )
         )

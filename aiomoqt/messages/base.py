@@ -1,7 +1,7 @@
 from typing import Any, Union, Dict
 from dataclasses import dataclass, fields
 
-from . import ParamType, SetupParamType
+from . import ParamType, SetupParamType, AuthTokenAliasType
 from ..context import get_moqt_ctx_version, get_major_version
 from ..utils.buffer import Buffer, BufferReadError
 from ..utils.logger import *
@@ -249,6 +249,16 @@ class MOQTMessage:
                     param_value = param_value.encode()
                 if not isinstance(param_value, bytes):
                     raise TypeError(f"Param {param_type} expects bytes, got {type(param_value)}")
+
+                # AUTH_TOKEN requires Token structure wrapping (Section 9.2.1.1)
+                if param_type in (ParamType.AUTH_TOKEN, SetupParamType.AUTH_TOKEN):
+                    token_buf = Buffer(capacity=BUF_SIZE)
+                    token_buf.push_uint_var(AuthTokenAliasType.USE_VALUE)  # Alias Type
+                    token_buf.push_uint_var(0)  # Token Type (0 = out-of-band)
+                    token_buf.push_bytes(param_value)  # Token Value (rest of param)
+                    param_value = token_buf.data_slice(0, token_buf.tell())
+                    logger.info(f"Serializing AUTH_TOKEN param as Token(USE_VALUE): {len(param_value)} bytes")
+
                 logger.info(f"Serializing param {param_type} length {len(param_value)}")
                 payload.push_uint_var(len(param_value))  # Length
                 payload.push_bytes(param_value)  # Value
@@ -280,6 +290,22 @@ class MOQTMessage:
                     raise BufferReadError("Parameter length exceeds maximum of 65535 bytes")
                 logger.info(f"deserializing param {param_type} length {param_len}")
                 param_value = buf.pull_bytes(param_len)
+
+                # AUTH_TOKEN: unwrap Token structure (Section 9.2.1.1)
+                if param_type in (ParamType.AUTH_TOKEN, SetupParamType.AUTH_TOKEN) and param_len > 0:
+                    token_buf = Buffer(data=param_value)
+                    alias_type = token_buf.pull_uint_var()
+                    if alias_type == AuthTokenAliasType.USE_VALUE:
+                        token_type = token_buf.pull_uint_var()
+                        param_value = token_buf.pull_bytes(param_len - token_buf.tell())
+                    elif alias_type == AuthTokenAliasType.USE_ALIAS:
+                        token_alias = token_buf.pull_uint_var()
+                        param_value = param_value  # keep raw for now
+                    elif alias_type == AuthTokenAliasType.REGISTER:
+                        token_alias = token_buf.pull_uint_var()
+                        token_type = token_buf.pull_uint_var()
+                        param_value = token_buf.pull_bytes(param_len - token_buf.tell())
+                    logger.info(f"AUTH_TOKEN: alias_type={alias_type} value={len(param_value)} bytes")
             else:  # Even type - Value is varint
                 param_value = buf.pull_uint_var()
             

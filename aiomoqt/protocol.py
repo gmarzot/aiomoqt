@@ -82,6 +82,7 @@ class MOQTSession(QuicConnectionProtocol):
         self._moqt_session_setup: Future[bool] = self._loop.create_future()
         self._moqt_session_closed: Future[Tuple[int,str]] = self._loop.create_future()
         self._next_request_id = 0 if self._quic.configuration.is_client else 1
+        self._next_track_alias = 0
         self._stream_queues: DefaultDict[int, asyncio.Queue[Buffer]] = defaultdict(asyncio.Queue)
         self._stream_tasks: Dict[int, asyncio.Task] = {}
         self._tasks: Set[asyncio.Task] = set()
@@ -101,6 +102,10 @@ class MOQTSession(QuicConnectionProtocol):
 
         self._stream_data_registry = dict(MOQTSession.MOQT_STREAM_DATA_REGISTRY)
         self._dgram_data_registry = dict(MOQTSession.MOQT_DGRAM_DATA_REGISTRY)
+
+        # Optional callback for received data objects:
+        #   fn(msg, size_bytes, recv_time_ms, group_id, subgroup_id)
+        self.on_object_received: Optional[Callable] = None
     
         
 
@@ -195,7 +200,7 @@ class MOQTSession(QuicConnectionProtocol):
 
             # Schedule handler if one exists
             if handler is not None:
-                logger.debug(f"MOQT event: creating handler task: {handler.__name__}")
+                logger.debug(f"MOQT event: creating handler task: {getattr(handler, '__name__', repr(handler))}")
                 task = asyncio.create_task(handler(self, msg))
                 task.add_done_callback(self._control_task_done)
                 self._tasks.add(task)
@@ -314,6 +319,8 @@ class MOQTSession(QuicConnectionProtocol):
                                 self._stream_queues[stream_id].closed = True
                                 return
                     logger.info(f"MOQT stream({stream_id}): {logstr}")
+                    if self.on_object_received:
+                        self.on_object_received(msg_obj, consumed, now, group_id, subgroup_id)
                 elif isinstance(msg_obj, SubgroupHeader):
                     logger.info(f"MOQT stream({stream_id}): {msg_obj} size: {consumed} bytes")
                     assert group_id is None or msg_obj.group_id > group_id
@@ -426,6 +433,8 @@ class MOQTSession(QuicConnectionProtocol):
             logstr = f"{id} size: {consumed} bytes {delay}"
 
             logger.info(f"MOQT event: ObjectDatagram: {logstr}")
+            if self.on_object_received:
+                self.on_object_received(msg, consumed, now, group_id, None)
             return msg
         # Draft-14: ObjectDatagramStatus types 0x20-0x21 (status datagrams)
         elif 0x20 <= dgram_type <= 0x21:
@@ -501,87 +510,94 @@ class MOQTSession(QuicConnectionProtocol):
                 )
             return
         elif isinstance(event, StreamDataReceived) and self._wt_session_setup.done():
-            if self._closed.is_set() or self._close_err is not None:
+            stream_id = event.stream_id
+
+            # WT session stream (CONNECT) — pass through to H3 for capsule processing
+            if stream_id == self._session_id:
+                logger.debug(f"MOQT event: WT session stream data({stream_id}): {len(event.data)} bytes 0x{event.data[:16].hex()}")
+                # fall through to H3 handler below
+
+            elif self._closed.is_set() or self._close_err is not None:
                 close_condition = f"MOQT: {self._close_err} QUIC: {self._closed.is_set()}"
                 logger.warning(f"QUIC event: stream data after close: " + close_condition)
                 return
-            
+
             # Detect abrupt closure of critical streams
-            stream_id = event.stream_id
-            if (event.end_stream and len(event.data) == 0 and
+            elif (event.end_stream and len(event.data) == 0 and
                 stream_id in [self._control_stream_id, self._session_id]):
                 self._close_session(
-                    SessionCloseCode.INTERNAL_ERROR, 
+                    SessionCloseCode.INTERNAL_ERROR,
                     f"critical stream closed by remote peer: {stream_id}"
                 )
                 return
-            
-            msg_buf = Buffer(data=event.data)
-            msg_len = msg_buf.capacity
-            logger.debug(f"MOQT event: StreamDataReceived: stream: {stream_id} len: {msg_len}")
-            
-            # Handle possible MoQT control stream 
-            if not stream_is_unidirectional(stream_id):
-                # Assume first bidi stream is MoQT control stream
-                if self._control_stream_id is None:
-                    self._control_stream_id = stream_id
-                    # strip of initial WT stream identifier
-                    logger.debug(f"QUIC event: detecting control stream: {stream_id}")
-                    msg_buf.pull_uint_var()
-                    msg_buf.pull_uint_var()
-                elif stream_id != self._control_stream_id:
-                    # XXX ignore additional bidi stream for now - for now
-                    logger.warning(f"MOQT event: unrecognized bidirectional stream({stream_id}):")
-                    return                      
-                        
-            # Handle MoQT control messages
-            if stream_id == self._control_stream_id:
-                # XXX handle underflow in control stream as well
-                while msg_buf.tell() < msg_len:
-                    msg = self._moqt_handle_control_message(msg_buf)
-                    if msg is None:
-                        error = f"control stream: parsing failed at position: {msg_buf.tell()} of {msg_len} bytes"
-                        logger.error(f"MOQT error: " + error)
-                        self._close_session(SessionCloseCode.PROTOCOL_VIOLATION, error)
-                        break
-                return
 
-            # Handle MoQT data messages
-            is_quic_internal = stream_id in self._h3._stream and self._h3._stream[stream_id].stream_type in (
-                StreamType.CONTROL,
-                StreamType.QPACK_ENCODER,
-                StreamType.QPACK_DECODER,
-            )
-            if is_quic_internal:
-                logger.debug(f"MOQT event: stream type internal: {self._h3._stream[stream_id].stream_type}")
+            else:
+                msg_buf = Buffer(data=event.data)
+                msg_len = msg_buf.capacity
+                logger.debug(f"MOQT event: StreamDataReceived: stream: {stream_id} len: {msg_len}")
 
-            if stream_is_unidirectional(stream_id) and not is_quic_internal:
-                if stream_id not in self._data_streams:
-                    logger.debug(f"MOQT event: new data stream: id: {stream_id} {msg_len} bytes")
-                    # strip of initial H3/WT stream identifier
-                    try:
+                # Handle possible MoQT control stream
+                if not stream_is_unidirectional(stream_id):
+                    # Assume first bidi stream is MoQT control stream
+                    if self._control_stream_id is None:
+                        self._control_stream_id = stream_id
+                        # strip of initial WT stream identifier
+                        logger.debug(f"QUIC event: detecting control stream: {stream_id}")
                         msg_buf.pull_uint_var()
                         msg_buf.pull_uint_var()
-                    except BufferReadError:
-                        logger.error(f"MOQT error: data stream({stream_id}) parse fail at: {msg_buf.tell()}")
+                    elif stream_id != self._control_stream_id:
+                        logger.warning(f"MOQT event: unrecognized bidirectional stream({stream_id}):")
                         return
-                    # record the stream exists and stream id stripped
-                    self._data_streams[stream_id] = None
-                    # create a handler task for this stream
-                    assert stream_id not in self._stream_tasks
-                    task = asyncio.create_task(self._process_data_stream(stream_id))
-                    self._stream_tasks[stream_id] = task
-                    task.add_done_callback(partial(self._stream_task_done, stream_id))
-                    logger.info(f"MOQT event: creating _process_data_stream task: {stream_id} num streams: {len(self._data_streams)}")
-                    
-                # Queue the event data buffer for processing
-                if msg_buf.tell() < msg_len:
-                    logger.debug(f"MOQT event: pushing data on stream: {stream_id} pos: {msg_buf.tell()} len: {msg_len}")
-                    self._stream_queues[stream_id].put_nowait(msg_buf)
-                else:
-                    logger.debug(f"MOQT event: skipping empty data: {stream_id} pos: {msg_buf.tell()} len: {msg_len}")
 
-                return
+                # Handle MoQT control messages
+                if stream_id == self._control_stream_id:
+                    # XXX handle underflow in control stream as well
+                    while msg_buf.tell() < msg_len:
+                        msg = self._moqt_handle_control_message(msg_buf)
+                        if msg is None:
+                            error = f"control stream: parsing failed at position: {msg_buf.tell()} of {msg_len} bytes"
+                            logger.error(f"MOQT error: " + error)
+                            self._close_session(SessionCloseCode.PROTOCOL_VIOLATION, error)
+                            break
+                    return
+
+                # Handle MoQT data streams (unidirectional only)
+                if stream_is_unidirectional(stream_id):
+                    # For new streams, peek first byte to detect H3 internal
+                    # streams (SETTINGS=0x00, QPACK_ENC=0x02, QPACK_DEC=0x03)
+                    # and pass those to H3 handler below instead
+                    is_h3_internal = (
+                        stream_id not in self._data_streams
+                        and msg_len >= 1
+                        and event.data[0] in (0x00, 0x02, 0x03)
+                    )
+                    if not is_h3_internal:
+                        if stream_id not in self._data_streams:
+                            logger.debug(f"MOQT event: new data stream: id: {stream_id} {msg_len} bytes")
+                            # strip WT 2-varint stream header
+                            try:
+                                msg_buf.pull_uint_var()
+                                msg_buf.pull_uint_var()
+                            except BufferReadError:
+                                logger.error(f"MOQT error: data stream({stream_id}) parse fail at: {msg_buf.tell()}")
+                                return
+                            self._data_streams[stream_id] = None
+                            assert stream_id not in self._stream_tasks
+                            task = asyncio.create_task(self._process_data_stream(stream_id))
+                            self._stream_tasks[stream_id] = task
+                            task.add_done_callback(partial(self._stream_task_done, stream_id))
+                            logger.info(f"MOQT event: creating _process_data_stream task: {stream_id} num streams: {len(self._data_streams)}")
+
+                        # Queue the event data buffer for processing
+                        if msg_buf.tell() < msg_len:
+                            logger.debug(f"MOQT event: pushing data on stream: {stream_id} pos: {msg_buf.tell()} len: {msg_len}")
+                            self._stream_queues[stream_id].put_nowait(msg_buf)
+                        else:
+                            logger.debug(f"MOQT event: skipping empty data: {stream_id} pos: {msg_buf.tell()} len: {msg_len}")
+                        return
+                    else:
+                        logger.debug(f"MOQT event: H3 internal uni stream {stream_id} type=0x{event.data[0]:02x}")
+                        # fall through to H3 handler below
 
         elif isinstance(event, DatagramFrameReceived) and self._wt_session_setup.done():
             msg_buf = Buffer(data=event.data)
@@ -932,6 +948,7 @@ class MOQTSession(QuicConnectionProtocol):
         track_name: str,
         priority: int = 128,
         group_order: GroupOrder = GroupOrder.ASCENDING,
+        forward: int = 1,
         filter_type: FilterType = FilterType.LATEST_OBJECT,
         start_group: Optional[int] = 0,
         start_object: Optional[int] = 0,
@@ -949,10 +966,11 @@ class MOQTSession(QuicConnectionProtocol):
 
         message = Subscribe(
             request_id=request_id,
-            namespace=namespace_tuple,
+            track_namespace=namespace_tuple,
             track_name=track_name,
             priority=priority,
             group_order=group_order,
+            forward=forward,
             filter_type=filter_type,
             start_group=start_group,
             start_object=start_object,
@@ -980,7 +998,6 @@ class MOQTSession(QuicConnectionProtocol):
                     request_id=request_id,
                     error_code=0x5,  # TIMEOUT error code
                     reason="Subscribe Response Timeout",
-                    track_alias=0
                 )
                 logger.error(f"Timeout waiting for subscribe response")
             finally:
@@ -1001,8 +1018,12 @@ class MOQTSession(QuicConnectionProtocol):
         parameters: Optional[Dict[int, bytes]] = None
     ) -> Optional[MOQTMessage]:
         """Create and send a SUBSCRIBE_OK response."""
+        track_alias = self._allocate_track_alias(request_msg.request_id)
+        # Set track_alias on the Subscribe msg so custom handlers can use it
+        request_msg.track_alias = track_alias
         message = SubscribeOk(
             request_id=request_msg.request_id,
+            track_alias=track_alias,
             expires=expires,
             group_order=group_order,
             content_exists=content_exists,
@@ -1019,14 +1040,12 @@ class MOQTSession(QuicConnectionProtocol):
         request_id: int,
         error_code: int = SubscribeErrorCode.INTERNAL_ERROR,
         reason: str = "Internal error",
-        track_alias: Optional[int] = None
     ) -> Optional[MOQTMessage]:
         """Create and send a SUBSCRIBE_ERROR response."""
         message = SubscribeError(
             request_id=request_id,
             error_code=error_code,
             reason=reason,
-            track_alias=track_alias
         )
         logger.info(f"MOQT send: {message}")
         self.send_control_message(message.serialize())
@@ -1113,7 +1132,6 @@ class MOQTSession(QuicConnectionProtocol):
                     request_id=request_id,
                     error_code=0x5,  # TIMEOUT error code
                     reason="Subscribe Response Timeout",
-                    track_alias=0
                 )
                 logger.error(f"Timeout waiting for subscribe response")
                 sub_response = response if sub_response is None else sub_response
@@ -1185,7 +1203,6 @@ class MOQTSession(QuicConnectionProtocol):
                     request_id=request_id,
                     error_code=0x5,  # TIMEOUT error code
                     reason="Subscribe Response Timeout",
-                    track_alias=0
                 )
                 logger.error(f"Timeout waiting for subscribe response")
             finally:
@@ -1312,7 +1329,9 @@ class MOQTSession(QuicConnectionProtocol):
             parameters = {}
 
         prefix = self._make_namespace_tuple(namespace_prefix)
+        request_id = self._allocate_request_id()
         message = SubscribeNamespace(
+            request_id=request_id,
             namespace_prefix=prefix,
             parameters=parameters
         )
@@ -1324,7 +1343,7 @@ class MOQTSession(QuicConnectionProtocol):
 
         # Create future for response
         sub_namespace_fut = self._loop.create_future()
-        self._subscribe_namespace_responses[prefix] = sub_namespace_fut
+        self._subscribe_namespace_responses[request_id] = sub_namespace_fut
 
         async def wait_for_response():
             try:
@@ -1333,25 +1352,24 @@ class MOQTSession(QuicConnectionProtocol):
             except asyncio.TimeoutError:
                 # Create synthetic error response
                 response = SubscribeNamespaceError(
-                    namespace_prefix=prefix,
+                    request_id=request_id,
                     error_code=0x5,  # TIMEOUT error code
                     reason="Response timeout"
                 )
-                logger.error(f"Timeout waiting for announce subscribe response")
+                logger.error(f"Timeout waiting for subscribe_namespace response")
             finally:
-                self._subscribe_namespace_responses.pop(prefix, None)
-            
+                self._subscribe_namespace_responses.pop(request_id, None)
+
             return response
 
         return wait_for_response()
 
     def subscribe_namespace_ok(
         self,
-        namespace_prefix: Union[str, Tuple[str, ...]],
+        msg: SubscribeNamespace,
     ) -> Optional[MOQTMessage]:
-        """Create and send a SUBSCRIBE_ANNOUNCES_OK response."""
-        namespace_tuple = self._make_namespace_tuple(namespace_prefix)
-        message = SubscribeNamespaceOk(namespace_prefix=namespace_tuple)
+        """Create and send a SUBSCRIBE_NAMESPACE_OK response."""
+        message = SubscribeNamespaceOk(request_id=msg.request_id)
         logger.info(f"MOQT send: {message}")
         self.send_control_message(message.serialize())
         return message
@@ -1446,9 +1464,8 @@ class MOQTSession(QuicConnectionProtocol):
         
     async def _handle_subscribe(self, msg: Subscribe) -> None:
         logger.info(f"MOQT receive: {msg}")
-        self._track_aliases[msg.track_alias] = msg.request_id
         self.subscribe_ok(
-            request_id=msg.request_id,
+            request_msg=msg,
             expires=0,
             group_order=GroupOrder.ASCENDING,
             content_exists=ContentExistsCode.NO_CONTENT,
@@ -1543,7 +1560,7 @@ class MOQTSession(QuicConnectionProtocol):
 
     async def _handle_subscribe_namespace(self, msg: SubscribeNamespace) -> None:
         logger.info(f"MOQT event: handle {msg}")
-        self.subscribe_namespace_ok(msg.namespace_prefix)
+        self.subscribe_namespace_ok(msg)
            
     async def _handle_subscribe_namespace_ok(self, msg: SubscribeNamespaceOk) -> None:
         logger.info(f"MOQT event: handle {msg}")
@@ -1555,13 +1572,13 @@ class MOQTSession(QuicConnectionProtocol):
     async def _handle_subscribe_namespace_error(self, msg: SubscribeNamespaceError) -> None:
         logger.info(f"MOQT event: handle {msg}")
         # Set future result for subscriber waiting for response
-        future = self._subscribe_namespace_responses.get(msg.namespace_prefix)
+        future = self._subscribe_namespace_responses.get(msg.request_id)
         if future and not future.done():
             future.set_result(msg)
 
     async def _handle_unsubscribe_namespace(self, msg: UnsubscribeNamespace) -> None:
         logger.info(f"MOQT event: handle {msg}")
-        self.subscribe_namespace_ok(msg)
+        # No response required per draft-14
 
     async def _handle_publish(self, msg: Publish) -> None:
         logger.info(f"MOQT event: handle {msg}")

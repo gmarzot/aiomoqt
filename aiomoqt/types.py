@@ -102,6 +102,14 @@ class ContentExistsCode(IntEnum):
     NO_CONTENT = 0x0
     EXISTS = 0x01
     
+class AuthTokenAliasType(IntEnum):
+    """Authorization Token Alias Types (Section 9.2.1.1)."""
+    DELETE = 0x0      # Alias only — retire the alias and its token
+    REGISTER = 0x1    # Alias + Type + Value — register alias for reuse
+    USE_ALIAS = 0x2   # Alias only — use previously registered token
+    USE_VALUE = 0x3   # Type + Value only — one-shot, no alias
+
+
 class SubscribeErrorCode(IntEnum):
     """SUBSCRIBE_ERROR error codes."""
     INTERNAL_ERROR = 0x0
