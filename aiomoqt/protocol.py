@@ -484,8 +484,9 @@ class MOQTSession(QuicConnectionProtocol):
     def connection_made(self, transport):
         """Called when QUIC connection is established."""
         super().connection_made(transport)
-        logger.info(f"MOQT: session connection initialized: {self._session.use_quic}")
-        if not self._session.use_quic:
+        use_quic = getattr(self._session, 'use_quic', False)
+        logger.info(f"MOQT: session connection initialized: {use_quic}")
+        if not use_quic:
             self._h3 = H3CustomConnection(self._quic, enable_webtransport=True)
             logger.info("H3 connection initialized")
 
