@@ -104,8 +104,8 @@ See `aiomoqt/examples/` for complete working examples:
 To set up a development environment:
 
 ```bash
-git clone https://github.com/gmarzot/aiomoqt-python.git
-cd aiomoqt-python
+git clone https://github.com/gmarzot/aiomoqt.git
+cd aiomoqt
 ./bootstrap_python.sh
 source .venv/bin/activate
 ```
@@ -148,7 +148,7 @@ For major changes, please open an issue first to discuss your proposal.
 - [MoQT Specification](https://moq-wg.github.io/moq-transport/draft-ietf-moq-transport.html)
 - [Media Over QUIC Working Group](https://datatracker.ietf.org/wg/moq/about/)
 - [MoQ Interop Runner](https://github.com/englishm/moq-interop-runner)
-- [`aiomoqt` GitHub Repository](https://github.com/gmarzot/aiomoqt-python)
+- [`aiomoqt` GitHub Repository](https://github.com/gmarzot/aiomoqt)
 
 ---
 

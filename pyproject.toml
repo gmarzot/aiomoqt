@@ -15,8 +15,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/gmarzot/aiomoqt-python"
-Repository = "https://github.com/gmarzot/aiomoqt-python.git"
+Homepage = "https://github.com/gmarzot/aiomoqt"
+Repository = "https://github.com/gmarzot/aiomoqt.git"
 
 [project.optional-dependencies]
 test = [
