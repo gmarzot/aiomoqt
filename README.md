@@ -35,8 +35,8 @@ Test cases: `setup-only`, `announce-only`, `publish-namespace-done`, `subscribe-
 
 ```bash
 # Run interop tests
-python -m aiomoqt.examples.moq_interop_client -r "moqt://draft-14.cloudflare.mediaoverquic.com:443" --tls-disable-verify
-python -m aiomoqt.examples.moq_interop_client -r "moqt://fb.mvfst.net:9448" --tls-disable-verify
+python -m aiomoqt.examples.moq_interop_client -r "moqt://draft-14.cloudflare.mediaoverquic.com:443"
+python -m aiomoqt.examples.moq_interop_client -r "moqt://fb.mvfst.net:9448"
 ```
 
 ## Installation
