@@ -2,6 +2,7 @@
 import ssl
 from typing import Optional, AsyncContextManager
 
+import certifi
 from qh3.quic.configuration import QuicConfiguration
 from qh3.asyncio.client import connect
 from qh3.h3.connection import H3_ALPN
@@ -18,6 +19,7 @@ class MOQTClient(MOQTPeer):  # New connection manager class
         port: int,
         endpoint: Optional[str] = None,
         use_quic: Optional[bool] = False,
+        verify_tls: Optional[bool] = True,
         configuration: Optional[QuicConfiguration] = None,
         debug: Optional[bool] = False,
         quic_debug: Optional[bool] = False,
@@ -29,14 +31,16 @@ class MOQTClient(MOQTPeer):  # New connection manager class
         self.endpoint = endpoint
         self.use_quic = use_quic
         self.debug = debug
-        
+
         logger.debug(f"MOQT: client session: {self} use_quic={use_quic} endpoint={endpoint}")
 
         if configuration is None:
+            verify_mode = ssl.CERT_REQUIRED if verify_tls else ssl.CERT_NONE
             configuration = QuicConfiguration(
                 alpn_protocols= [MOQT_ALPN] if use_quic else H3_ALPN,
                 is_client=True,
-                verify_mode=ssl.CERT_NONE,
+                verify_mode=verify_mode,
+                cafile=certifi.where() if verify_tls else None,
                 max_data=2**24,
                 max_stream_data=2**24,
                 max_datagram_frame_size=64*1024,

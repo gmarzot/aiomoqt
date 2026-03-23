@@ -108,6 +108,7 @@ def _make_client(host: str, port: int, endpoint: str, use_quic: bool,
         host, port,
         endpoint=endpoint,
         use_quic=use_quic,
+        verify_tls=not tls_disable_verify,
         debug=debug,
     )
 
