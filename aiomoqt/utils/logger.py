@@ -3,7 +3,7 @@ import json
 import sys
 from logging import getLevelName
 from typing import Optional, Dict, Any
-from aioquic.quic.logger import QuicLogger, QuicLoggerTrace, QLOG_VERSION
+from qh3.quic.logger import QuicLogger, QuicLoggerTrace, QLOG_VERSION
 
 # Cache to store created loggers
 _loggers: Dict[str, logging.Logger] = {}

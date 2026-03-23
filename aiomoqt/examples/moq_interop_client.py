@@ -1,0 +1,572 @@
+#!/usr/bin/env python3
+"""
+MoQ Interop Test Client — implements the 6 standard test cases from
+https://github.com/englishm/moq-interop-runner
+
+Output: TAP version 14 with YAML diagnostics.
+CLI interface matches TEST-CLIENT-INTERFACE.md spec.
+"""
+
+import argparse
+import asyncio
+import logging
+import os
+import sys
+import time
+from dataclasses import dataclass, field
+from typing import Optional
+from urllib.parse import urlparse
+
+from aiomoqt.types import (
+    MOQTMessageType, ParamType, FilterType, GroupOrder,
+    SessionCloseCode, MOQTException,
+)
+from aiomoqt.messages import (
+    SubscribeError, SubscribeOk,
+    PublishNamespaceOk, PublishNamespaceError,
+    SubscribeNamespaceError,
+)
+from aiomoqt.client import MOQTClient
+from aiomoqt.utils.logger import get_logger, set_log_level
+
+INTEROP_NAMESPACE = "moq-test/interop"
+INTEROP_TRACK = "test-track"
+
+ALL_TESTS = [
+    "setup-only",
+    "announce-only",
+    "publish-namespace-done",
+    "subscribe-error",
+    "announce-subscribe",
+    "subscribe-before-announce",
+]
+
+
+@dataclass
+class TestResult:
+    name: str
+    passed: bool
+    duration_ms: float = 0.0
+    message: str = ""
+    connection_id: str = ""
+    publisher_connection_id: str = ""
+    subscriber_connection_id: str = ""
+    expected: str = ""
+    received: str = ""
+    skipped: bool = False
+    skip_reason: str = ""
+
+
+class TAPReporter:
+    """Emit TAP version 14 output."""
+
+    def __init__(self):
+        self.results: list[TestResult] = []
+
+    def add(self, result: TestResult):
+        self.results.append(result)
+
+    def report(self) -> str:
+        lines = ["TAP version 14", f"1..{len(self.results)}"]
+        for i, r in enumerate(self.results, 1):
+            status = "ok" if r.passed else "not ok"
+            skip = f" # SKIP {r.skip_reason}" if r.skipped else ""
+            lines.append(f"{status} {i} - {r.name}{skip}")
+            # YAML diagnostic block
+            lines.append("  ---")
+            lines.append(f"  duration_ms: {r.duration_ms:.1f}")
+            if r.connection_id:
+                lines.append(f"  connection_id: {r.connection_id}")
+            if r.publisher_connection_id:
+                lines.append(f"  publisher_connection_id: {r.publisher_connection_id}")
+            if r.subscriber_connection_id:
+                lines.append(f"  subscriber_connection_id: {r.subscriber_connection_id}")
+            if r.message:
+                lines.append(f"  message: {r.message}")
+            if r.expected:
+                lines.append(f"  expected: {r.expected}")
+            if r.received:
+                lines.append(f"  received: {r.received}")
+            lines.append("  ...")
+        return "\n".join(lines)
+
+
+def _get_connection_id(session) -> str:
+    """Extract QUIC connection ID from session for diagnostics."""
+    try:
+        quic = session._quic
+        cid = quic._host_cids[0].cid if quic._host_cids else b""
+        return cid.hex() if cid else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _make_client(host: str, port: int, endpoint: str, use_quic: bool,
+                 tls_disable_verify: bool, debug: bool) -> MOQTClient:
+    """Create a configured MOQTClient."""
+    return MOQTClient(
+        host, port,
+        endpoint=endpoint,
+        use_quic=use_quic,
+        debug=debug,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test implementations
+# ---------------------------------------------------------------------------
+
+async def test_setup_only(host, port, endpoint, use_quic, tls_disable_verify,
+                          debug, timeout=2.0) -> TestResult:
+    """Test 1: Connect, exchange SETUP, graceful close."""
+    t0 = time.monotonic()
+    client = _make_client(host, port, endpoint, use_quic, tls_disable_verify, debug)
+    try:
+        async with asyncio.timeout(timeout):
+            async with client.connect() as session:
+                await session.client_session_init()
+                cid = _get_connection_id(session)
+                session.close()
+        return TestResult(
+            name="setup-only", passed=True,
+            duration_ms=(time.monotonic() - t0) * 1000,
+            connection_id=cid,
+            message="SERVER_SETUP received with compatible version",
+        )
+    except Exception as e:
+        return TestResult(
+            name="setup-only", passed=False,
+            duration_ms=(time.monotonic() - t0) * 1000,
+            message=f"Failed: {e}",
+            expected="SERVER_SETUP received",
+            received=str(e),
+        )
+
+
+async def test_announce_only(host, port, endpoint, use_quic, tls_disable_verify,
+                             debug, timeout=2.0) -> TestResult:
+    """Test 2: SETUP + PUBLISH_NAMESPACE + receive OK."""
+    t0 = time.monotonic()
+    client = _make_client(host, port, endpoint, use_quic, tls_disable_verify, debug)
+    try:
+        async with asyncio.timeout(timeout):
+            async with client.connect() as session:
+                await session.client_session_init()
+                cid = _get_connection_id(session)
+
+                response = await session.publish_namespace(
+                    namespace=INTEROP_NAMESPACE,
+                    parameters={ParamType.AUTH_TOKEN: b"interop-test"},
+                    wait_response=True,
+                )
+                if isinstance(response, PublishNamespaceError):
+                    return TestResult(
+                        name="announce-only", passed=False,
+                        duration_ms=(time.monotonic() - t0) * 1000,
+                        connection_id=cid,
+                        message=f"PUBLISH_NAMESPACE_ERROR: {response.reason}",
+                        expected="PUBLISH_NAMESPACE_OK",
+                        received=f"error_code={response.error_code}",
+                    )
+                session.close()
+        return TestResult(
+            name="announce-only", passed=True,
+            duration_ms=(time.monotonic() - t0) * 1000,
+            connection_id=cid,
+            message="PUBLISH_NAMESPACE_OK received",
+        )
+    except Exception as e:
+        return TestResult(
+            name="announce-only", passed=False,
+            duration_ms=(time.monotonic() - t0) * 1000,
+            message=f"Failed: {e}",
+            expected="PUBLISH_NAMESPACE_OK",
+            received=str(e),
+        )
+
+
+async def test_publish_namespace_done(host, port, endpoint, use_quic,
+                                      tls_disable_verify, debug,
+                                      timeout=2.0) -> TestResult:
+    """Test 3: SETUP + PUBLISH_NAMESPACE + OK + PUBLISH_NAMESPACE_DONE + close."""
+    t0 = time.monotonic()
+    client = _make_client(host, port, endpoint, use_quic, tls_disable_verify, debug)
+    try:
+        async with asyncio.timeout(timeout):
+            async with client.connect() as session:
+                await session.client_session_init()
+                cid = _get_connection_id(session)
+
+                response = await session.publish_namespace(
+                    namespace=INTEROP_NAMESPACE,
+                    parameters={ParamType.AUTH_TOKEN: b"interop-test"},
+                    wait_response=True,
+                )
+                if isinstance(response, PublishNamespaceError):
+                    return TestResult(
+                        name="publish-namespace-done", passed=False,
+                        duration_ms=(time.monotonic() - t0) * 1000,
+                        connection_id=cid,
+                        message=f"PUBLISH_NAMESPACE_ERROR: {response.reason}",
+                        expected="PUBLISH_NAMESPACE_OK",
+                        received=f"error_code={response.error_code}",
+                    )
+
+                # Now send PUBLISH_NAMESPACE_DONE
+                ns_tuple = session._make_namespace_tuple(INTEROP_NAMESPACE)
+                session.publish_namespace_done(namespace=ns_tuple)
+                # Brief pause to let the message flush
+                await asyncio.sleep(0.1)
+                session.close()
+
+        return TestResult(
+            name="publish-namespace-done", passed=True,
+            duration_ms=(time.monotonic() - t0) * 1000,
+            connection_id=cid,
+            message="PUBLISH_NAMESPACE_OK received, PUBLISH_NAMESPACE_DONE sent",
+        )
+    except Exception as e:
+        return TestResult(
+            name="publish-namespace-done", passed=False,
+            duration_ms=(time.monotonic() - t0) * 1000,
+            message=f"Failed: {e}",
+            expected="PUBLISH_NAMESPACE_OK + PUBLISH_NAMESPACE_DONE",
+            received=str(e),
+        )
+
+
+async def test_subscribe_error(host, port, endpoint, use_quic,
+                               tls_disable_verify, debug,
+                               timeout=2.0) -> TestResult:
+    """Test 4: SUBSCRIBE to non-existent track, expect SUBSCRIBE_ERROR."""
+    t0 = time.monotonic()
+    client = _make_client(host, port, endpoint, use_quic, tls_disable_verify, debug)
+    try:
+        async with asyncio.timeout(timeout):
+            async with client.connect() as session:
+                await session.client_session_init()
+                cid = _get_connection_id(session)
+
+                response = await session.subscribe(
+                    namespace="nonexistent/namespace",
+                    track_name="test-track",
+                    wait_response=True,
+                )
+                if isinstance(response, SubscribeError):
+                    session.close()
+                    return TestResult(
+                        name="subscribe-error", passed=True,
+                        duration_ms=(time.monotonic() - t0) * 1000,
+                        connection_id=cid,
+                        message=f"SUBSCRIBE_ERROR received (expected): code={response.error_code}",
+                    )
+                elif isinstance(response, SubscribeOk):
+                    session.close()
+                    return TestResult(
+                        name="subscribe-error", passed=False,
+                        duration_ms=(time.monotonic() - t0) * 1000,
+                        connection_id=cid,
+                        message="Unexpected SUBSCRIBE_OK for non-existent track",
+                        expected="SUBSCRIBE_ERROR",
+                        received="SUBSCRIBE_OK",
+                    )
+                else:
+                    session.close()
+                    return TestResult(
+                        name="subscribe-error", passed=False,
+                        duration_ms=(time.monotonic() - t0) * 1000,
+                        connection_id=cid,
+                        message=f"Unexpected response: {type(response).__name__}",
+                        expected="SUBSCRIBE_ERROR",
+                        received=str(response),
+                    )
+    except Exception as e:
+        return TestResult(
+            name="subscribe-error", passed=False,
+            duration_ms=(time.monotonic() - t0) * 1000,
+            message=f"Failed: {e}",
+            expected="SUBSCRIBE_ERROR",
+            received=str(e),
+        )
+
+
+async def test_announce_subscribe(host, port, endpoint, use_quic,
+                                  tls_disable_verify, debug,
+                                  timeout=3.0) -> TestResult:
+    """Test 5: Two connections — publisher announces, subscriber subscribes."""
+    t0 = time.monotonic()
+    pub_cid = "unknown"
+    sub_cid = "unknown"
+
+    try:
+        async with asyncio.timeout(timeout):
+            # Publisher connection
+            pub_client = _make_client(host, port, endpoint, use_quic,
+                                      tls_disable_verify, debug)
+            sub_client = _make_client(host, port, endpoint, use_quic,
+                                      tls_disable_verify, debug)
+
+            async with pub_client.connect() as pub_session:
+                await pub_session.client_session_init()
+                pub_cid = _get_connection_id(pub_session)
+
+                # Publisher announces namespace
+                pub_response = await pub_session.publish_namespace(
+                    namespace=INTEROP_NAMESPACE,
+                    parameters={ParamType.AUTH_TOKEN: b"interop-test"},
+                    wait_response=True,
+                )
+                if isinstance(pub_response, PublishNamespaceError):
+                    return TestResult(
+                        name="announce-subscribe", passed=False,
+                        duration_ms=(time.monotonic() - t0) * 1000,
+                        publisher_connection_id=pub_cid,
+                        message=f"Publisher PUBLISH_NAMESPACE_ERROR: {pub_response.reason}",
+                        expected="PUBLISH_NAMESPACE_OK",
+                        received=f"error_code={pub_response.error_code}",
+                    )
+
+                # Subscriber connection
+                async with sub_client.connect() as sub_session:
+                    await sub_session.client_session_init()
+                    sub_cid = _get_connection_id(sub_session)
+
+                    sub_response = await sub_session.subscribe(
+                        namespace=INTEROP_NAMESPACE,
+                        track_name=INTEROP_TRACK,
+                        wait_response=True,
+                    )
+
+                    passed = isinstance(sub_response, SubscribeOk)
+                    msg = ("SUBSCRIBE_OK received — relay routed subscription"
+                           if passed
+                           else f"SUBSCRIBE_ERROR: {getattr(sub_response, 'reason', sub_response)}")
+
+                    sub_session.close()
+                pub_session.close()
+
+        return TestResult(
+            name="announce-subscribe", passed=passed,
+            duration_ms=(time.monotonic() - t0) * 1000,
+            publisher_connection_id=pub_cid,
+            subscriber_connection_id=sub_cid,
+            message=msg,
+            expected="SUBSCRIBE_OK" if not passed else "",
+            received=type(sub_response).__name__ if not passed else "",
+        )
+    except Exception as e:
+        return TestResult(
+            name="announce-subscribe", passed=False,
+            duration_ms=(time.monotonic() - t0) * 1000,
+            publisher_connection_id=pub_cid,
+            subscriber_connection_id=sub_cid,
+            message=f"Failed: {e}",
+        )
+
+
+async def test_subscribe_before_announce(host, port, endpoint, use_quic,
+                                         tls_disable_verify, debug,
+                                         timeout=3.5) -> TestResult:
+    """Test 6: Subscriber connects first, publisher 500ms later. Both outcomes valid."""
+    t0 = time.monotonic()
+    pub_cid = "unknown"
+    sub_cid = "unknown"
+    sub_response = None
+
+    try:
+        async with asyncio.timeout(timeout):
+            sub_client = _make_client(host, port, endpoint, use_quic,
+                                      tls_disable_verify, debug)
+            pub_client = _make_client(host, port, endpoint, use_quic,
+                                      tls_disable_verify, debug)
+
+            async with sub_client.connect() as sub_session:
+                await sub_session.client_session_init()
+                sub_cid = _get_connection_id(sub_session)
+
+                # Subscriber sends SUBSCRIBE before publisher announces
+                sub_task = asyncio.create_task(
+                    sub_session.subscribe(
+                        namespace=INTEROP_NAMESPACE,
+                        track_name=INTEROP_TRACK,
+                        wait_response=True,
+                    )
+                )
+
+                # Wait 500ms then publisher connects and announces
+                await asyncio.sleep(0.5)
+
+                async with pub_client.connect() as pub_session:
+                    await pub_session.client_session_init()
+                    pub_cid = _get_connection_id(pub_session)
+
+                    pub_response = await pub_session.publish_namespace(
+                        namespace=INTEROP_NAMESPACE,
+                        parameters={ParamType.AUTH_TOKEN: b"interop-test"},
+                        wait_response=True,
+                    )
+
+                    # Wait for subscriber response (may have already arrived)
+                    try:
+                        async with asyncio.timeout(2.0):
+                            sub_response = await sub_task
+                    except asyncio.TimeoutError:
+                        sub_response = None
+
+                    pub_session.close()
+                sub_session.close()
+
+        # Both SUBSCRIBE_OK and SUBSCRIBE_ERROR are valid outcomes
+        if sub_response is None:
+            msg = "Timeout waiting for subscriber response"
+            passed = False
+        elif isinstance(sub_response, SubscribeOk):
+            msg = "SUBSCRIBE_OK received after delayed announce (relay buffered)"
+            passed = True
+        elif isinstance(sub_response, SubscribeError):
+            msg = f"SUBSCRIBE_ERROR received (valid: relay didn't buffer): code={sub_response.error_code}"
+            passed = True
+        else:
+            msg = f"Unexpected response: {type(sub_response).__name__}"
+            passed = False
+
+        return TestResult(
+            name="subscribe-before-announce", passed=passed,
+            duration_ms=(time.monotonic() - t0) * 1000,
+            publisher_connection_id=pub_cid,
+            subscriber_connection_id=sub_cid,
+            message=msg,
+        )
+    except Exception as e:
+        return TestResult(
+            name="subscribe-before-announce", passed=False,
+            duration_ms=(time.monotonic() - t0) * 1000,
+            publisher_connection_id=pub_cid,
+            subscriber_connection_id=sub_cid,
+            message=f"Failed: {e}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test dispatch
+# ---------------------------------------------------------------------------
+
+TEST_FUNCTIONS = {
+    "setup-only": test_setup_only,
+    "announce-only": test_announce_only,
+    "publish-namespace-done": test_publish_namespace_done,
+    "subscribe-error": test_subscribe_error,
+    "announce-subscribe": test_announce_subscribe,
+    "subscribe-before-announce": test_subscribe_before_announce,
+}
+
+
+def parse_relay_url(url: str):
+    """Parse relay URL into (host, port, endpoint, use_quic)."""
+    parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
+
+    if scheme == "moqt":
+        use_quic = True
+        port = parsed.port or 443
+    elif scheme in ("https", "wss"):
+        use_quic = False
+        port = parsed.port or 443
+    else:
+        # Bare host:port — default to WebTransport
+        use_quic = False
+        port = parsed.port or 4433
+
+    host = parsed.hostname or url.split(":")[0]
+    endpoint = parsed.path.lstrip("/") or "moq"
+
+    return host, port, endpoint, use_quic
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="MoQ Interop Test Client (aiomoqt)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Environment variables: RELAY_URL, TESTCASE, TLS_DISABLE_VERIFY, VERBOSE",
+    )
+    parser.add_argument("-r", "--relay", type=str,
+                        default=os.environ.get("RELAY_URL", "https://localhost:4443"),
+                        help="Relay URL (default: $RELAY_URL or https://localhost:4443)")
+    parser.add_argument("-t", "--test", type=str,
+                        default=os.environ.get("TESTCASE", None),
+                        help="Run specific test case")
+    parser.add_argument("-l", "--list", action="store_true",
+                        help="List available test cases")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        default=os.environ.get("VERBOSE", "").lower() in ("1", "true"),
+                        help="Verbose output")
+    parser.add_argument("--tls-disable-verify", action="store_true",
+                        default=os.environ.get("TLS_DISABLE_VERIFY", "").lower() in ("1", "true"),
+                        help="Skip TLS certificate verification")
+    parser.add_argument("--debug", action="store_true",
+                        help="Enable debug logging to stderr")
+    return parser.parse_args()
+
+
+async def run_tests(tests: list[str], host: str, port: int, endpoint: str,
+                    use_quic: bool, tls_disable_verify: bool,
+                    debug: bool) -> TAPReporter:
+    reporter = TAPReporter()
+    for test_name in tests:
+        fn = TEST_FUNCTIONS.get(test_name)
+        if fn is None:
+            reporter.add(TestResult(
+                name=test_name, passed=True, skipped=True,
+                skip_reason="Unknown test case",
+            ))
+            continue
+        result = await fn(host, port, endpoint, use_quic, tls_disable_verify, debug)
+        reporter.add(result)
+        # Print progress to stderr if verbose
+        status = "PASS" if result.passed else "FAIL"
+        print(f"  [{status}] {result.name}: {result.message}", file=sys.stderr)
+    return reporter
+
+
+def main():
+    args = parse_args()
+
+    if args.list:
+        for name in ALL_TESTS:
+            print(name)
+        sys.exit(0)
+
+    # Configure logging
+    log_level = logging.DEBUG if args.debug else logging.WARNING
+    set_log_level(log_level)
+    logging.basicConfig(level=log_level, stream=sys.stderr,
+                        format="%(levelname)s %(name)s: %(message)s")
+
+    host, port, endpoint, use_quic = parse_relay_url(args.relay)
+
+    if args.verbose:
+        transport = "QUIC" if use_quic else "WebTransport"
+        print(f"# Relay: {args.relay} ({host}:{port}/{endpoint} via {transport})",
+              file=sys.stderr)
+
+    # Select tests
+    if args.test:
+        tests = [args.test]
+    else:
+        tests = ALL_TESTS
+
+    reporter = asyncio.run(
+        run_tests(tests, host, port, endpoint, use_quic,
+                  args.tls_disable_verify, args.debug)
+    )
+
+    # TAP output to stdout
+    print(reporter.report())
+
+    # Exit code
+    all_passed = all(r.passed for r in reporter.results)
+    sys.exit(0 if all_passed else 1)
+
+
+if __name__ == "__main__":
+    main()

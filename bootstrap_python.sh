@@ -10,8 +10,8 @@ COLOR_RED="\033[0;31m"
 COLOR_OFF="\033[0m"
 
 $ECHO "${COLOR_GREEN}Setting up Python/Cython test environment... ${COLOR_OFF}"
-PYTHON_VERSION="3.13"   # Latest Python version to install via uv
-CYTHON_VERSION="3.0.11" # Target Cython release (3.1.0a1 crashes - use 3.1.0 when released)
+PYTHON_VERSION="3.14t"  # Free-threaded build (nogil, PEP 779)
+CYTHON_VERSION="3.2.4"  # Full free-threading support (pymutex, critical sections)
 
 PLATFORM="$(uname -s)"
 case "${PLATFORM}" in
@@ -70,7 +70,7 @@ ${UV_PIP_INSTALL} build wheel setuptools
 #${UV_PIP_INSTALL} "git+https://github.com/cython/cython.git"
 ${UV_PIP_INSTALL} "cython==${CYTHON_VERSION}"
 ${UV_PIP_INSTALL} pytest pytest-asyncio pytest-cov pytest-xdist
-${UV_PIP_INSTALL} aioquic
+${UV_PIP_INSTALL} qh3
 
 version=$(python --version 2>&1 | awk '{print $NF}')
 if [ $? -ne 0 ]; then

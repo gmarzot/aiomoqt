@@ -3,17 +3,17 @@ from typing import Any, Optional, Tuple, Coroutine
 
 import asyncio
 from asyncio.futures import Future
-from aioquic.quic.configuration import QuicConfiguration
-from aioquic.asyncio.server import QuicServer, serve
-from aioquic.h3.connection import H3_ALPN
+from qh3.quic.configuration import QuicConfiguration
+from qh3.asyncio.server import QuicServer, serve
+from qh3.h3.connection import H3_ALPN
 
-from .protocol import MOQTSession, MOQTSessionProtocol
+from .protocol import MOQTPeer, MOQTSession
 from .utils.logger import *
 
 logger = get_logger(__name__)
 
 
-class MOQTServerSession(MOQTSession):
+class MOQTServer(MOQTPeer):
     """Server-side session manager."""
     def __init__(
         self,
@@ -24,8 +24,11 @@ class MOQTServerSession(MOQTSession):
         endpoint: Optional[str] = "moq",
         congestion_control_algorithm: Optional[str] = 'reno',
         configuration: Optional[QuicConfiguration] = None,
-        debug: bool = False
+        keylog_filename: Optional[str] = None,
+        debug: Optional[bool] = False,
+        quic_debug: Optional[bool] = False,
     ):
+        super().__init__()
         self.host = host
         self.port = port
         self.endpoint = endpoint
@@ -34,6 +37,8 @@ class MOQTServerSession(MOQTSession):
         self._server_closed:Future[Tuple[int,str]] = self._loop.create_future()
         self._next_subscribe_id = 1  # prime subscribe id generator
 
+        keylog_file = open(keylog_filename, 'a') if keylog_filename else None
+
         if configuration is None:
             configuration = QuicConfiguration(
                 is_client=False,
@@ -41,31 +46,27 @@ class MOQTServerSession(MOQTSession):
                 verify_mode=ssl.CERT_NONE,
                 certificate=certificate,
                 private_key=private_key,
-                congestion_control_algorithm=congestion_control_algorithm,
-                max_datagram_frame_size=65536,
-                max_datagram_size=QuicConfiguration.max_datagram_size,
-                quic_logger=QuicDebugLogger() if debug else None,
-                secrets_log_file=open("/tmp/keylog.server.txt", "a") if debug else None
+                max_data=2**24,
+                max_stream_data=2**24,
+                max_datagram_frame_size=64*1024,
+                quic_logger=QuicDebugLogger() if quic_debug else None,
+                secrets_log_file=keylog_file if keylog_file else None
             )        
         # load SSL certificate and key
         configuration.load_cert_chain(certificate, private_key)
-        
         self.configuration = configuration
-        logger.debug(f"quic_logger: {class_name(configuration.quic_logger)}")
 
     def serve(self) -> Coroutine[Any, Any, QuicServer]:
         """Start the MOQT server."""
         logger.info(f"Starting MOQT server on {self.host}:{self.port}")
-        
-        protocol = lambda *args, **kwargs: MOQTSessionProtocol(*args, **kwargs, session=self)
-
+        protocol = lambda *args, **kwargs: MOQTSession(*args, **kwargs, session=self)
         return serve(
             self.host,
             self.port,
             configuration=self.configuration,
             create_protocol=protocol,
         )
-
+        
     async def closed(self) -> bool:
         if not self._server_closed.done():
             self._server_closed = await self._server_closed

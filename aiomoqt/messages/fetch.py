@@ -1,8 +1,9 @@
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Tuple
-from aioquic.buffer import Buffer
+
 from .base import MOQTMessage, BUF_SIZE
 from ..types import *
+from ..utils.buffer import Buffer, BufferReadError
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -11,7 +12,7 @@ logger = get_logger(__name__)
 class Fetch(MOQTMessage):
     """FETCH message to request a range of objects."""
     fetch_type: int
-    subscribe_id: int
+    request_id: int
     subscriber_priority: int = 128
     group_order: int = GroupOrder.DESCENDING
     namespace: Optional[Tuple[bytes, ...]] = None
@@ -31,7 +32,7 @@ class Fetch(MOQTMessage):
         buf = Buffer(capacity=BUF_SIZE)
         payload = Buffer(capacity=BUF_SIZE)
 
-        payload.push_uint_var(self.subscribe_id)
+        payload.push_uint_var(self.request_id)
         payload.push_uint8(self.subscriber_priority)
         payload.push_uint8(self.group_order)
         payload.push_uint_var(self.fetch_type)
@@ -55,15 +56,10 @@ class Fetch(MOQTMessage):
         else:
             raise RuntimeError
 
-        payload.push_uint_var(len(self.parameters))
-        for param_id, param_value in self.parameters.items():
-            payload.push_uint_var(param_id)
-            param_value = MOQTMessage._bytes_encode(param_value)
-            payload.push_uint_var(len(param_value))
-            payload.push_bytes(param_value)
+        MOQTMessage._serialize_params(payload, self.parameters)
 
         buf.push_uint_var(self.type)
-        buf.push_uint_var(payload.tell())
+        buf.push_uint16(payload.tell())
         buf.push_bytes(payload.data)
         return buf
 
@@ -79,7 +75,7 @@ class Fetch(MOQTMessage):
         joining_sub_id = None
         pre_group_offset = None
 
-        subscribe_id = buf.pull_uint_var()
+        request_id = buf.pull_uint_var()
         subscriber_priority = buf.pull_uint8()
         group_order = buf.pull_uint8()
         fetch_type = buf.pull_uint_var()
@@ -105,17 +101,11 @@ class Fetch(MOQTMessage):
             raise RuntimeError
         
         # Parameters
-        params = {}
-        param_count = buf.pull_uint_var()
-        for _ in range(param_count):
-            param_id = buf.pull_uint_var()
-            param_len = buf.pull_uint_var()
-            param_value = buf.pull_bytes(param_len)
-            params[param_id] = param_value
+        params = MOQTMessage._deserialize_params(buf)
 
         return cls(
             fetch_type=fetch_type,
-            subscribe_id=subscribe_id,
+            request_id=request_id,
             namespace=namespace,
             subscriber_priority=subscriber_priority,
             group_order=group_order,
@@ -132,7 +122,7 @@ class Fetch(MOQTMessage):
 @dataclass
 class FetchOk(MOQTMessage):
     """FETCH_OK response message."""
-    subscribe_id: int
+    request_id: int
     group_order: int
     end_of_track: int
     largest_group_id: int
@@ -146,44 +136,33 @@ class FetchOk(MOQTMessage):
         buf = Buffer(capacity=BUF_SIZE)
         payload = Buffer(capacity=BUF_SIZE)
 
-        payload.push_uint_var(self.subscribe_id)
+        payload.push_uint_var(self.request_id)
         payload.push_uint8(self.group_order)
         payload.push_uint8(self.end_of_track)
         payload.push_uint_var(self.largest_group_id)
         payload.push_uint_var(self.largest_object_id)
 
         # Parameters
-        payload.push_uint_var(len(self.parameters))
-        for param_id, param_value in self.parameters.items():
-            payload.push_uint_var(param_id)
-            param_value = MOQTMessage._bytes_encode(param_value)
-            payload.push_uint_var(len(param_value))
-            payload.push_bytes(param_value)
+        MOQTMessage._serialize_params(payload, self.parameters)
 
         buf.push_uint_var(self.type)
-        buf.push_uint_var(len(payload.data))
+        buf.push_uint16(payload.tell())
         buf.push_bytes(payload.data)
         return buf
 
     @classmethod
     def deserialize(cls, buf: Buffer) -> 'FetchOk':
 
-        subscribe_id = buf.pull_uint_var()
+        request_id = buf.pull_uint_var()
         group_order = buf.pull_uint8()
         end_of_track = buf.pull_uint8()
         largest_group_id = buf.pull_uint_var()
         largest_object_id = buf.pull_uint_var()
 
-        params = {}
-        param_count = buf.pull_uint_var()
-        for _ in range(param_count):
-            param_id = buf.pull_uint_var()
-            param_len = buf.pull_uint_var()
-            param_value = buf.pull_bytes(param_len)
-            params[param_id] = param_value
+        params = MOQTMessage._deserialize_params(buf)
 
         return cls(
-            subscribe_id=subscribe_id,
+            request_id=request_id,
             group_order=group_order,
             end_of_track=end_of_track,
             largest_group_id=largest_group_id,
@@ -194,7 +173,7 @@ class FetchOk(MOQTMessage):
 @dataclass
 class FetchError(MOQTMessage):
     """FETCH_ERROR response message."""
-    subscribe_id: int
+    request_id: int
     error_code: int
     reason: str
 
@@ -205,7 +184,7 @@ class FetchError(MOQTMessage):
         buf = Buffer(capacity=BUF_SIZE)
         payload = Buffer(capacity=BUF_SIZE)
 
-        payload.push_uint_var(self.subscribe_id)
+        payload.push_uint_var(self.request_id)
         payload.push_uint_var(self.error_code)
         
         reason_bytes = self.reason.encode()
@@ -213,20 +192,20 @@ class FetchError(MOQTMessage):
         payload.push_bytes(reason_bytes)
 
         buf.push_uint_var(self.type)
-        buf.push_uint_var(len(payload.data))
+        buf.push_uint16(payload.tell())
         buf.push_bytes(payload.data)
         return buf
 
     @classmethod
     def deserialize(cls, buf: Buffer) -> 'FetchError':
 
-        subscribe_id = buf.pull_uint_var()
+        request_id = buf.pull_uint_var()
         error_code = buf.pull_uint_var()
         reason_len = buf.pull_uint_var()
         reason = buf.pull_bytes(reason_len).decode()
 
         return cls(
-            subscribe_id=subscribe_id,
+            request_id=request_id,
             error_code=error_code,
             reason=reason
         )
@@ -234,7 +213,7 @@ class FetchError(MOQTMessage):
 @dataclass
 class FetchCancel(MOQTMessage):
     """FETCH_CANCEL message to cancel an ongoing fetch."""
-    subscribe_id: int
+    request_id: int
 
     def __post_init__(self):
         self.type = MOQTMessageType.FETCH_CANCEL
@@ -243,16 +222,16 @@ class FetchCancel(MOQTMessage):
         buf = Buffer(capacity=BUF_SIZE)
         payload = Buffer(capacity=BUF_SIZE)
 
-        payload.push_uint_var(self.subscribe_id)
+        payload.push_uint_var(self.request_id)
 
         buf.push_uint_var(self.type)
-        buf.push_uint_var(len(payload.data))
+        buf.push_uint16(payload.tell())
         buf.push_bytes(payload.data)
         return buf
 
     @classmethod
     def deserialize(cls, buf: Buffer) -> 'FetchCancel':
 
-        subscribe_id = buf.pull_uint_var()
+        request_id = buf.pull_uint_var()
 
-        return cls(subscribe_id=subscribe_id)
+        return cls(request_id=request_id)

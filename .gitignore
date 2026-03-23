@@ -5,6 +5,7 @@ __pycache__/
 .Python
 .python*
 build/
+certs/
 develop-eggs/
 dist/
 downloads/
@@ -20,3 +21,4 @@ wheels/
 .installed.cfg
 *.egg
 .DS_Store
+*.prof
