@@ -20,12 +20,13 @@ class MOQTClient(MOQTPeer):  # New connection manager class
         endpoint: Optional[str] = None,
         use_quic: Optional[bool] = False,
         verify_tls: Optional[bool] = True,
+        allow_optional_dgram: Optional[bool] = False,
         configuration: Optional[QuicConfiguration] = None,
         debug: Optional[bool] = False,
         quic_debug: Optional[bool] = False,
         keylog_filename: Optional[str] = None,
     ):
-        super().__init__()
+        super().__init__(allow_optional_dgram=allow_optional_dgram)
         self.host = host
         self.port = port
         self.endpoint = endpoint

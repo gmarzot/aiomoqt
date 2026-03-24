@@ -30,10 +30,11 @@ logger = get_logger(__name__)
 class H3CustomConnection(H3Connection):
     """Custom H3Connection wrapper to support alternate SETTINGS"""
 
-    def __init__(self, quic: QuicConnection, table_capacity: int = 0, **kwargs) -> None:
-        # settings table capacity can be overridden - this should be generalized
+    def __init__(self, quic: QuicConnection, table_capacity: int = 0,
+                 allow_optional_dgram: bool = False, **kwargs) -> None:
         self._max_table_capacity = table_capacity
         self._max_table_capacity_cfg = table_capacity
+        self._allow_optional_dgram = allow_optional_dgram
         super().__init__(quic, **kwargs)
         # report sent settings
         settings = self.sent_settings
@@ -43,18 +44,23 @@ class H3CustomConnection(H3Connection):
                 logger.debug(f"  Setting 0x{setting_id:x} = {value}")
 
     def _validate_settings(self, settings: dict) -> None:
-        """Relaxed validation: allow ENABLE_WEBTRANSPORT without H3_DATAGRAM.
+        """Validate received H3 SETTINGS.
 
-        Some relays (e.g. Red5) send ENABLE_WEBTRANSPORT=1 without H3_DATAGRAM,
-        which is technically invalid per RFC 9297 but works in practice.
+        By default, rejects ENABLE_WEBTRANSPORT without H3_DATAGRAM per
+        RFC 9297. Set allow_optional_dgram=True to accept non-compliant
+        peers (e.g. some relays omit H3_DATAGRAM).
         """
         from qh3.h3.connection import Setting
-        patched = dict(settings)
-        if (patched.get(Setting.ENABLE_WEBTRANSPORT) == 1
-                and patched.get(Setting.H3_DATAGRAM) != 1):
-            logger.warning("H3: relay sent ENABLE_WEBTRANSPORT without H3_DATAGRAM, accepting anyway")
-            patched[Setting.H3_DATAGRAM] = 1
-        super()._validate_settings(patched)
+        if self._allow_optional_dgram:
+            patched = dict(settings)
+            if (patched.get(Setting.ENABLE_WEBTRANSPORT) == 1
+                    and patched.get(Setting.H3_DATAGRAM) != 1):
+                logger.warning("H3: peer sent ENABLE_WEBTRANSPORT without "
+                               "H3_DATAGRAM — accepting (allow_optional_dgram=True)")
+                patched[Setting.H3_DATAGRAM] = 1
+            super()._validate_settings(patched)
+        else:
+            super()._validate_settings(settings)
 
     @property
     def _max_table_capacity(self):
@@ -69,9 +75,10 @@ class H3CustomConnection(H3Connection):
 # base class for client and server session objects
 class MOQTPeer:
     """MOQT client and server base-class."""
-    def __init__(self):
+    def __init__(self, allow_optional_dgram: bool = False):
         #  message handlers
         self._control_msg_handlers: Dict[int, Tuple[Type, Callable]] = {}
+        self.allow_optional_dgram = allow_optional_dgram
 
     def register_handler(self, msg_type: int, handler: Callable) -> None:
         """Register a custom message handler."""
@@ -487,7 +494,10 @@ class MOQTSession(QuicConnectionProtocol):
         use_quic = getattr(self._session, 'use_quic', False)
         logger.info(f"MOQT: session connection initialized: {use_quic}")
         if not use_quic:
-            self._h3 = H3CustomConnection(self._quic, enable_webtransport=True)
+            allow_dgram = getattr(self._session, 'allow_optional_dgram', False)
+            self._h3 = H3CustomConnection(
+                self._quic, enable_webtransport=True,
+                allow_optional_dgram=allow_dgram)
             logger.info("H3 connection initialized")
 
     # primary event handling for all QUIC messaging
