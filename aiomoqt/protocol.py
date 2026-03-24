@@ -10,8 +10,18 @@ from asyncio import Future
 from qh3.asyncio.protocol import QuicConnectionProtocol
 from qh3.quic.connection import QuicConnection, QuicErrorCode, stream_is_unidirectional
 from qh3.quic.events import QuicEvent, StreamDataReceived, ProtocolNegotiated, DatagramFrameReceived, StopSendingReceived, StreamReset
-from qh3.h3.connection import H3Connection, StreamType, ErrorCode, H3_ALPN
+from qh3.h3.connection import H3Connection, StreamType, ErrorCode, H3_ALPN, Setting
 from qh3.h3.events import HeadersReceived
+
+# Monkey-patch qh3 Setting enum: H3_DATAGRAM should be 0x33 (RFC 9297),
+# not 0xFFD277 (old experimental value). Remove when qh3 is fixed or
+# when we move to aiopquic native H3.
+if Setting.H3_DATAGRAM.value != 0x33:
+    _old = Setting.H3_DATAGRAM.value
+    Setting._value2member_map_.pop(_old, None)
+    Setting._value2member_map_.pop(0x33, None)  # remove DUMMY mapping
+    Setting.H3_DATAGRAM._value_ = 0x33
+    Setting._value2member_map_[0x33] = Setting.H3_DATAGRAM
 
 from .types import *
 from .context import *
@@ -44,23 +54,25 @@ class H3CustomConnection(H3Connection):
                 logger.debug(f"  Setting 0x{setting_id:x} = {value}")
 
     def _validate_settings(self, settings: dict) -> None:
-        """Validate received H3 SETTINGS.
+        """Validate received H3 SETTINGS with qh3 enum fixup.
 
-        By default, rejects ENABLE_WEBTRANSPORT without H3_DATAGRAM per
-        RFC 9297. Set allow_optional_dgram=True to accept non-compliant
-        peers (e.g. some relays omit H3_DATAGRAM).
+        qh3 uses wrong value for H3_DATAGRAM (0xFFD277 instead of 0x33).
+        We patch the enum at import time, but also need to remap the raw
+        settings dict keys since qh3 parses them before our patch takes
+        effect on the wire format.
         """
-        from qh3.h3.connection import Setting
+        patched = dict(settings)
+        # Remap raw 0x33 to the (now-patched) Setting.H3_DATAGRAM enum key
+        if 0x33 in patched and Setting.H3_DATAGRAM not in patched:
+            patched[Setting.H3_DATAGRAM] = patched.pop(0x33)
+        logger.debug(f"H3 SETTINGS received: { {(f'0x{k:x}' if isinstance(k, int) else k.name): v for k, v in patched.items()} }")
         if self._allow_optional_dgram:
-            patched = dict(settings)
             if (patched.get(Setting.ENABLE_WEBTRANSPORT) == 1
                     and patched.get(Setting.H3_DATAGRAM) != 1):
                 logger.warning("H3: peer sent ENABLE_WEBTRANSPORT without "
                                "H3_DATAGRAM — accepting (allow_optional_dgram=True)")
                 patched[Setting.H3_DATAGRAM] = 1
-            super()._validate_settings(patched)
-        else:
-            super()._validate_settings(settings)
+        super()._validate_settings(patched)
 
     @property
     def _max_table_capacity(self):
