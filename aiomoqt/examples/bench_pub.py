@@ -167,6 +167,8 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
     paced = rate > 0
     frame_interval = 1.0 / rate if paced else 0
     total_sent = 0
+    from collections import deque
+    wire_trace = deque(maxlen=5)
 
     stream_id = session._h3.create_webtransport_stream(
         session_id=session._session_id,
@@ -187,6 +189,7 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
                     buf = header.end_group(extensions=extensions)
                     if session._close_err or session._h3 is None:
                         raise asyncio.CancelledError
+                    wire_trace.append((stream_id, total_sent, group_id, -1, len(buf.data), buf.data[:20].hex()))
                     session._quic.send_stream_data(stream_id, buf.data, end_stream=True)
                     session.transmit()
 
@@ -211,6 +214,7 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
                 msg = header.serialize()
                 if session._close_err is not None:
                     raise asyncio.CancelledError
+                wire_trace.append((stream_id, total_sent, group_id, -2, len(msg.data), msg.data.hex()))
                 session._quic.send_stream_data(stream_id, msg.data, end_stream=False)
                 session.transmit()
 
@@ -225,6 +229,7 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
 
             if session._close_err is not None:
                 raise asyncio.CancelledError
+            wire_trace.append((stream_id, total_sent, group_id, obj_id, len(buf.data), buf.data[:20].hex()))
             session._quic.send_stream_data(stream_id, buf.data, end_stream=False)
             session.transmit()
             total_sent += 1
@@ -239,6 +244,8 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
 
     except asyncio.CancelledError:
         logger.info(f"moqperf pub: stream {subgroup_id} sent {total_sent} objects")
+        for sid, n, gid, oid, sz, hx in wire_trace:
+            logger.warning(f"  wire[{n}] stream={sid} g={gid} o={oid} len={sz} head={hx}")
         raise
 
 
