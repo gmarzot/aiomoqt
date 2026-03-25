@@ -167,6 +167,9 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
     paced = rate > 0
     frame_interval = 1.0 / rate if paced else 0
     total_sent = 0
+    total_bytes = 0  # track bytes written per stream
+    from collections import deque
+    wire_trace = deque(maxlen=8)
 
     stream_id = session._h3.create_webtransport_stream(
         session_id=session._session_id,
@@ -187,8 +190,13 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
                     buf = header.end_group(extensions=extensions)
                     if session._close_err or session._h3 is None:
                         raise asyncio.CancelledError
+                    wire_trace.append(
+                        f"END_GROUP stream={stream_id} g={group_id} "
+                        f"bytes={total_bytes} len={len(buf.data)} "
+                        f"hex={buf.data[:20].hex()}")
                     session._quic.send_stream_data(stream_id, buf.data, end_stream=True)
                     session.transmit()
+                    total_bytes = 0
 
                     if stream_id in session._data_streams:
                         del session._data_streams[stream_id]
@@ -211,7 +219,11 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
                 msg = header.serialize()
                 if session._close_err is not None:
                     raise asyncio.CancelledError
+                wire_trace.append(
+                    f"SUBGROUP_HDR stream={stream_id} g={group_id} "
+                    f"len={len(msg.data)} hex={msg.data.hex()}")
                 session._quic.send_stream_data(stream_id, msg.data, end_stream=False)
+                total_bytes += len(msg.data)
                 session.transmit()
 
             obj_id = header.next_object_id
@@ -226,6 +238,7 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
             if session._close_err is not None:
                 raise asyncio.CancelledError
             session._quic.send_stream_data(stream_id, buf.data, end_stream=False)
+            total_bytes += len(buf.data)
             session.transmit()
             total_sent += 1
 
@@ -238,7 +251,10 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
                     await asyncio.sleep(0)
 
     except asyncio.CancelledError:
-        logger.info(f"moqperf pub: stream {subgroup_id} sent {total_sent} objects")
+        logger.warning(f"moqperf pub: stream {subgroup_id} sent {total_sent} "
+                       f"objects, {total_bytes} bytes on stream {stream_id}")
+        for t in wire_trace:
+            logger.warning(f"  wire: {t}")
         raise
 
 
