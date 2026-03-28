@@ -22,6 +22,7 @@ from aiomoqt.types import (
     SessionCloseCode, MOQTException,
     MOQT_VERSION_DRAFT14, MOQT_VERSION_DRAFT16,
 )
+from aiomoqt.types import MOQTRequestError
 from aiomoqt.messages import (
     SubscribeError, SubscribeOk,
     PublishNamespaceOk, PublishNamespaceError,
@@ -159,20 +160,11 @@ async def test_announce_only(host, port, endpoint, use_quic, tls_disable_verify,
                 await session.client_session_init()
                 cid = _get_connection_id(session)
 
-                response = await session.publish_namespace(
+                await session.publish_namespace(
                     namespace=INTEROP_NAMESPACE,
                     parameters={ParamType.AUTH_TOKEN: b"interop-test"},
                     wait_response=True,
                 )
-                if isinstance(response, PublishNamespaceError):
-                    return TestResult(
-                        name="announce-only", passed=False,
-                        duration_ms=(time.monotonic() - t0) * 1000,
-                        connection_id=cid,
-                        message=f"PUBLISH_NAMESPACE_ERROR: {response.reason}",
-                        expected="PUBLISH_NAMESPACE_OK",
-                        received=f"error_code={response.error_code}",
-                    )
                 session.close()
         return TestResult(
             name="announce-only", passed=True,
@@ -207,16 +199,6 @@ async def test_publish_namespace_done(host, port, endpoint, use_quic,
                     parameters={ParamType.AUTH_TOKEN: b"interop-test"},
                     wait_response=True,
                 )
-                if isinstance(response, PublishNamespaceError):
-                    return TestResult(
-                        name="publish-namespace-done", passed=False,
-                        duration_ms=(time.monotonic() - t0) * 1000,
-                        connection_id=cid,
-                        message=f"PUBLISH_NAMESPACE_ERROR: {response.reason}",
-                        expected="PUBLISH_NAMESPACE_OK",
-                        received=f"error_code={response.error_code}",
-                    )
-
                 # Now send PUBLISH_NAMESPACE_DONE
                 ns_tuple = session._make_namespace_tuple(INTEROP_NAMESPACE)
                 session.publish_namespace_done(
@@ -248,52 +230,43 @@ async def test_subscribe_error(host, port, endpoint, use_quic,
                                draft_version=None, timeout=2.0) -> TestResult:
     """Test 4: SUBSCRIBE to non-existent track, expect SUBSCRIBE_ERROR."""
     t0 = time.monotonic()
+    cid = "unknown"
     client = _make_client(host, port, endpoint, use_quic, tls_disable_verify, debug, draft_version=draft_version)
     try:
         async with asyncio.timeout(timeout):
             async with client.connect() as session:
                 await session.client_session_init()
                 cid = _get_connection_id(session)
-
-                response = await session.subscribe(
-                    namespace="nonexistent/namespace",
-                    track_name="test-track",
-                    wait_response=True,
-                )
-                if isinstance(response, (SubscribeError, RequestError)):
-                    session.close()
-                    return TestResult(
-                        name="subscribe-error", passed=True,
-                        duration_ms=(time.monotonic() - t0) * 1000,
-                        connection_id=cid,
-                        message=f"{'REQUEST_ERROR' if isinstance(response, RequestError) else 'SUBSCRIBE_ERROR'} received (expected): code={response.error_code}",
+                try:
+                    await session.subscribe(
+                        namespace="nonexistent/namespace",
+                        track_name="test-track",
+                        wait_response=True,
                     )
-                elif isinstance(response, SubscribeOk):
+                    # If we get here, no error — unexpected
                     session.close()
                     return TestResult(
                         name="subscribe-error", passed=False,
                         duration_ms=(time.monotonic() - t0) * 1000,
                         connection_id=cid,
                         message="Unexpected SUBSCRIBE_OK for non-existent track",
-                        expected="SUBSCRIBE_ERROR",
+                        expected="error response",
                         received="SUBSCRIBE_OK",
                     )
-                else:
+                except MOQTRequestError as e:
                     session.close()
                     return TestResult(
-                        name="subscribe-error", passed=False,
+                        name="subscribe-error", passed=True,
                         duration_ms=(time.monotonic() - t0) * 1000,
                         connection_id=cid,
-                        message=f"Unexpected response: {type(response).__name__}",
-                        expected="SUBSCRIBE_ERROR",
-                        received=str(response),
+                        message=f"Error received (expected): code={e.error_code}",
                     )
     except Exception as e:
         return TestResult(
             name="subscribe-error", passed=False,
             duration_ms=(time.monotonic() - t0) * 1000,
             message=f"Failed: {e}",
-            expected="SUBSCRIBE_ERROR",
+            expected="error response",
             received=str(e),
         )
 
@@ -319,36 +292,28 @@ async def test_announce_subscribe(host, port, endpoint, use_quic,
                 pub_cid = _get_connection_id(pub_session)
 
                 # Publisher announces namespace
-                pub_response = await pub_session.publish_namespace(
+                await pub_session.publish_namespace(
                     namespace=INTEROP_NAMESPACE,
                     parameters={ParamType.AUTH_TOKEN: b"interop-test"},
                     wait_response=True,
                 )
-                if isinstance(pub_response, PublishNamespaceError):
-                    return TestResult(
-                        name="announce-subscribe", passed=False,
-                        duration_ms=(time.monotonic() - t0) * 1000,
-                        publisher_connection_id=pub_cid,
-                        message=f"Publisher PUBLISH_NAMESPACE_ERROR: {pub_response.reason}",
-                        expected="PUBLISH_NAMESPACE_OK",
-                        received=f"error_code={pub_response.error_code}",
-                    )
 
                 # Subscriber connection
                 async with sub_client.connect() as sub_session:
                     await sub_session.client_session_init()
                     sub_cid = _get_connection_id(sub_session)
 
-                    sub_response = await sub_session.subscribe(
-                        namespace=INTEROP_NAMESPACE,
-                        track_name=INTEROP_TRACK,
-                        wait_response=True,
-                    )
-
-                    passed = isinstance(sub_response, SubscribeOk)
-                    msg = ("SUBSCRIBE_OK received — relay routed subscription"
-                           if passed
-                           else f"SUBSCRIBE_ERROR: {getattr(sub_response, 'reason', sub_response)}")
+                    try:
+                        await sub_session.subscribe(
+                            namespace=INTEROP_NAMESPACE,
+                            track_name=INTEROP_TRACK,
+                            wait_response=True,
+                        )
+                        msg = "SUBSCRIBE_OK received — relay routed subscription"
+                        passed = True
+                    except MOQTRequestError as e:
+                        msg = f"SUBSCRIBE_ERROR: upstream subscribe failed: {e.reason}"
+                        passed = False
 
                     sub_session.close()
                 pub_session.close()
@@ -359,8 +324,6 @@ async def test_announce_subscribe(host, port, endpoint, use_quic,
             publisher_connection_id=pub_cid,
             subscriber_connection_id=sub_cid,
             message=msg,
-            expected="SUBSCRIBE_OK" if not passed else "",
-            received=type(sub_response).__name__ if not passed else "",
         )
     except Exception as e:
         return TestResult(
@@ -418,25 +381,24 @@ async def test_subscribe_before_announce(host, port, endpoint, use_quic,
                     try:
                         async with asyncio.timeout(2.0):
                             sub_response = await sub_task
+                    except MOQTRequestError as e:
+                        sub_response = e  # error is a valid outcome
                     except asyncio.TimeoutError:
                         sub_response = None
 
                     pub_session.close()
                 sub_session.close()
 
-        # Both SUBSCRIBE_OK and SUBSCRIBE_ERROR are valid outcomes
+        # Both SUBSCRIBE_OK and error are valid outcomes
         if sub_response is None:
             msg = "Timeout waiting for subscriber response"
             passed = False
-        elif isinstance(sub_response, SubscribeOk):
-            msg = "SUBSCRIBE_OK received after delayed announce (relay buffered)"
-            passed = True
-        elif isinstance(sub_response, SubscribeError):
-            msg = f"SUBSCRIBE_ERROR received (valid: relay didn't buffer): code={sub_response.error_code}"
+        elif isinstance(sub_response, MOQTRequestError):
+            msg = f"Error received (valid: relay didn't buffer): code={sub_response.error_code}"
             passed = True
         else:
-            msg = f"Unexpected response: {type(sub_response).__name__}"
-            passed = False
+            msg = "SUBSCRIBE_OK received after delayed announce (relay buffered)"
+            passed = True
 
         return TestResult(
             name="subscribe-before-announce", passed=passed,
