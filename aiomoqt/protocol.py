@@ -1081,28 +1081,7 @@ class MOQTSession(QuicConnectionProtocol):
         if not wait_response:
             return message
 
-        # Create future for response
-        subscribe_fut = self._loop.create_future()
-        self._subscribe_responses[request_id] = subscribe_fut
-
-        async def wait_for_response():
-            try:
-                async with asyncio.timeout(10):
-                    response = await subscribe_fut
-            except asyncio.TimeoutError:
-                # Create synthetic error response
-                response = SubscribeError(
-                    request_id=request_id,
-                    error_code=0x5,  # TIMEOUT error code
-                    reason="Subscribe Response Timeout",
-                )
-                logger.error(f"Timeout waiting for subscribe response")
-            finally:
-                logger.debug(f"MOQT: removing subscribe response future: {request_id}")
-                self._subscribe_responses.pop(request_id, None)    
-            return response
-
-        return wait_for_response()
+        return self._await_response(request_id)
 
     def subscribe_ok(
         self,
@@ -1286,28 +1265,7 @@ class MOQTSession(QuicConnectionProtocol):
         if not wait_response:
             return message
 
-        # Create future for response
-        subscribe_fut = self._loop.create_future()
-        self._subscribe_responses[request_id] = subscribe_fut
-
-        async def wait_for_response():
-            try:
-                async with asyncio.timeout(10):
-                    response = await subscribe_fut
-            except asyncio.TimeoutError:
-                # Create synthetic error response
-                response = SubscribeError(
-                    request_id=request_id,
-                    error_code=0x5,  # TIMEOUT error code
-                    reason="Subscribe Response Timeout",
-                )
-                logger.error(f"Timeout waiting for subscribe response")
-            finally:
-                logger.debug(f"MOQT: removing subscribe response future: {request_id}")
-                self._subscribe_responses.pop(request_id, None)    
-            return response
-
-        return wait_for_response()
+        return self._await_response(request_id)
 
     def fetch_ok(
         self,
@@ -1371,27 +1329,7 @@ class MOQTSession(QuicConnectionProtocol):
         if not wait_response:
             return message
 
-        # Create future for response
-        publish_namepace_fut = self._loop.create_future()
-        self._publish_namepace_responses[request_id] = publish_namepace_fut
-
-        async def wait_for_response():
-            try:
-                async with asyncio.timeout(10):
-                    response = await publish_namepace_fut
-            except asyncio.TimeoutError:
-                # Create synthetic error response
-                response = PublishNamespaceError(
-                    request_id=request_id,
-                    error_code=0x5,  # TIMEOUT error code
-                    reason="Response timeout"
-                )
-                logger.error(f"Timeout waiting for publish_namespace response")
-            finally:
-                self._publish_namepace_responses.pop(request_id, None)
-            return response
-
-        return wait_for_response()
+        return self._await_response(request_id)
 
     def publish_namepace_ok(
         self,
@@ -1443,28 +1381,7 @@ class MOQTSession(QuicConnectionProtocol):
         if not wait_response:
             return message
 
-        # Create future for response
-        sub_namespace_fut = self._loop.create_future()
-        self._subscribe_namespace_responses[request_id] = sub_namespace_fut
-
-        async def wait_for_response():
-            try:
-                async with asyncio.timeout(10):
-                    response = await sub_namespace_fut
-            except asyncio.TimeoutError:
-                # Create synthetic error response
-                response = SubscribeNamespaceError(
-                    request_id=request_id,
-                    error_code=0x5,  # TIMEOUT error code
-                    reason="Response timeout"
-                )
-                logger.error(f"Timeout waiting for subscribe_namespace response")
-            finally:
-                self._subscribe_namespace_responses.pop(request_id, None)
-
-            return response
-
-        return wait_for_response()
+        return self._await_response(request_id)
 
     def subscribe_namespace_ok(
         self,
@@ -1586,39 +1503,23 @@ class MOQTSession(QuicConnectionProtocol):
 
     async def _handle_subscribe_ok(self, msg: SubscribeOk) -> None:
         logger.info(f"MOQT event: handle {msg}")
-        # Set future result for subscriber waiting for response
-        future = self._subscribe_responses.get(msg.request_id)
-        if future and not future.done():
-            future.set_result(msg)
         if msg.request_id in self._subscriptions:
             self._subscriptions[msg.request_id].append(msg)
-        else:
-            logger.warning(f"MOQT messages: unsolicited SubscribeOk(msg.request_id)")
+        self._resolve_request(msg.request_id, msg)
 
     async def _handle_subscribe_error(self, msg: SubscribeError) -> None:
         logger.info(f"MOQT event: handle {msg}")
-        # Set future result for subscriber waiting for response
-        future = self._subscribe_responses.get(msg.request_id)
-        if future and not future.done():
-            future.set_result(msg)
         if msg.request_id in self._subscriptions:
             self._subscriptions[msg.request_id].append(msg)
-        else:
-            logger.warning(f"MOQT messages: unsolicited SubscribeError(msg.request_id)")
-            
+        self._resolve_request(msg.request_id, msg)
+
     async def _handle_publish_namepace_ok(self, msg: PublishNamespaceOk) -> None:
         logger.info(f"MOQT event: handle {msg}")
-        # Set future result for announcer waiting for response
-        future = self._publish_namepace_responses.get(msg.request_id)
-        if future and not future.done():
-            future.set_result(msg)
+        self._resolve_request(msg.request_id, msg)
 
     async def _handle_publish_namepace_error(self, msg: PublishNamespaceError) -> None:
         logger.info(f"MOQT event: handle {msg}")
-        # Set future result for announcer waiting for response
-        future = self._publish_namepace_responses.get(msg.request_id)
-        if future and not future.done():
-            future.set_result(msg)
+        self._resolve_request(msg.request_id, msg)
 
     async def _handle_publish_namepace_done(self, msg: PublishNamespaceDone) -> None:
         logger.info(f"MOQT event: handle {msg}")
@@ -1634,10 +1535,7 @@ class MOQTSession(QuicConnectionProtocol):
 
     async def _handle_subscribe_done(self, msg: SubscribeDone) -> None:
         logger.info(f"MOQT event: handle {msg}")
-        # Set future result for subscriber waiting for completion
-        future = self._subscribe_responses.get(msg.request_id)
-        if future and not future.done():
-            future.set_result(msg)
+        self._resolve_request(msg.request_id, msg)
 
     async def _handle_max_request_id(self, msg: MaxSubscribeId) -> None:
         logger.info(f"MOQT event: handle {msg}")
@@ -1669,17 +1567,11 @@ class MOQTSession(QuicConnectionProtocol):
            
     async def _handle_subscribe_namespace_ok(self, msg: SubscribeNamespaceOk) -> None:
         logger.info(f"MOQT event: handle {msg}")
-        # Set future result for subscriber waiting for response
-        future = self._subscribe_namespace_responses.get(msg.request_id)
-        if future and not future.done():
-            future.set_result(msg)
+        self._resolve_request(msg.request_id, msg)
 
     async def _handle_subscribe_namespace_error(self, msg: SubscribeNamespaceError) -> None:
         logger.info(f"MOQT event: handle {msg}")
-        # Set future result for subscriber waiting for response
-        future = self._subscribe_namespace_responses.get(msg.request_id)
-        if future and not future.done():
-            future.set_result(msg)
+        self._resolve_request(msg.request_id, msg)
 
     async def _handle_unsubscribe_namespace(self, msg: UnsubscribeNamespace) -> None:
         logger.info(f"MOQT event: handle {msg}")
@@ -1707,17 +1599,11 @@ class MOQTSession(QuicConnectionProtocol):
 
     async def _handle_fetch_ok(self, msg: FetchOk) -> None:
         logger.info(f"MOQT event: handle {msg}")
-        # Set future result for fetcher waiting for response
-        future = self._fetch_responses.get(msg.request_id)
-        if future and not future.done():
-            future.set_result(msg)
+        self._resolve_request(msg.request_id, msg)
 
     async def _handle_fetch_error(self, msg: FetchError) -> None:
         logger.info(f"MOQT event: handle {msg}")
-        # Set future result for fetcher waiting for response
-        future = self._fetch_responses.get(msg.request_id)
-        if future and not future.done():
-            future.set_result(msg)
+        self._resolve_request(msg.request_id, msg)
 
 
     # Data handlers need full update - stream reader in progress
@@ -1832,27 +1718,11 @@ class MOQTSession(QuicConnectionProtocol):
     # When is_draft16_or_later(), these take precedence over the main registry.
     async def _handle_request_ok(self, msg: RequestOk) -> None:
         logger.info(f"MOQT event: handle {msg}")
-        # REQUEST_OK can be response to REQUEST_UPDATE, TRACK_STATUS,
-        # SUBSCRIBE_NAMESPACE, or PUBLISH_NAMESPACE
-        for responses in (self._subscribe_responses, self._publish_namepace_responses,
-                          self._subscribe_namespace_responses):
-            future = responses.get(msg.request_id)
-            if future and not future.done():
-                future.set_result(msg)
-                return
-        logger.warning(f"MOQT event: unsolicited RequestOk({msg.request_id})")
+        self._resolve_request(msg.request_id, msg)
 
     async def _handle_request_error(self, msg: RequestError) -> None:
         logger.info(f"MOQT event: handle {msg}")
-        # REQUEST_ERROR is the universal error for all request types
-        for responses in (self._subscribe_responses, self._fetch_responses,
-                          self._publish_namepace_responses,
-                          self._subscribe_namespace_responses):
-            future = responses.get(msg.request_id)
-            if future and not future.done():
-                future.set_result(msg)
-                return
-        logger.warning(f"MOQT event: unsolicited RequestError({msg.request_id})")
+        self._resolve_request(msg.request_id, msg)
 
     async def _handle_namespace(self, msg) -> None:
         logger.info(f"MOQT event: handle Namespace: {msg}")
