@@ -283,4 +283,20 @@ class MOQTException(Exception):
         self.error_code = error_code
         self.reason_phrase = reason_phrase
         super().__init__(f"{reason_phrase} ({error_code})")
-        
+
+
+class MOQTRequestError(Exception):
+    """Raised when a MoQT request receives an error response.
+
+    Works for both draft-14 (SubscribeError, PublishError, etc.) and
+    draft-16 (RequestError). User code catches this without needing
+    to know the draft version.
+    """
+    def __init__(self, error_code: int, reason: str = "",
+                 retry_interval: int = 0, response=None):
+        self.error_code = error_code
+        self.reason = reason
+        self.retry_interval = retry_interval  # d16: ms before retry+1; 0=don't retry
+        self.response = response              # original message object
+        super().__init__(f"request error: code={error_code} reason={reason}")
+

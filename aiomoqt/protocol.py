@@ -124,11 +124,7 @@ class MOQTSession(QuicConnectionProtocol):
         self._data_streams: Dict[int, int] = {}  # keep track of active data streams
         self._track_aliases: Dict[int, int] = {}  # map alias to subscription_id
         self._subscriptions: Dict[int, List] = {}  # map subscription_id to request
-        self._publish_namepace_responses: Dict[int, Future[MOQTMessage]] = {}
-        self._subscribe_namespace_responses: Dict[int, Future[MOQTMessage]] = {}
-        self._subscribe_responses: Dict[int, Future[MOQTMessage]] = {}
-        self._unsubscribe_responses: Dict[int, Future[MOQTMessage]] = {}
-        self._fetch_responses: Dict[int, Future[MOQTMessage]] = {} 
+        self._pending_requests: Dict[int, Future[MOQTMessage]] = {}  # unified response futures
         
         self._control_msg_registry = dict(MOQTSession.MOQT_CONTROL_MESSAGE_REGISTRY)
         self._control_msg_registry.update(session._control_msg_handlers)
@@ -139,6 +135,53 @@ class MOQTSession(QuicConnectionProtocol):
         # Optional callback for received data objects:
         #   fn(msg, size_bytes, recv_time_ms, group_id, subgroup_id)
         self.on_object_received: Optional[Callable] = None
+
+    # -- Error response types (any version) --
+    _ERROR_TYPES = (SubscribeError, PublishError, FetchError,
+                    PublishNamespaceError, SubscribeNamespaceError,
+                    TrackStatusError, RequestError)
+
+    @staticmethod
+    def _is_error_response(msg: MOQTMessage) -> bool:
+        """Check if a message is any kind of error response (d14 or d16)."""
+        return isinstance(msg, MOQTSession._ERROR_TYPES)
+
+    def _resolve_request(self, request_id: int, msg: MOQTMessage) -> None:
+        """Resolve a pending request future by request_id."""
+        future = self._pending_requests.get(request_id)
+        if future and not future.done():
+            future.set_result(msg)
+        else:
+            logger.warning(f"MOQT event: unsolicited response for request_id={request_id}: {type(msg).__name__}")
+
+    async def _await_response(self, request_id: int, timeout: float = 10.0):
+        """Await a pending request response, raise MOQTRequestError on error.
+
+        Returns the OK response message. Raises MOQTRequestError if the
+        response is an error (any draft version), or on timeout.
+        """
+        fut = self._loop.create_future()
+        self._pending_requests[request_id] = fut
+        try:
+            async with asyncio.timeout(timeout):
+                response = await fut
+        except asyncio.TimeoutError:
+            raise MOQTRequestError(
+                error_code=0x02,  # TIMEOUT
+                reason="Request timed out",
+                retry_interval=0,
+            )
+        finally:
+            self._pending_requests.pop(request_id, None)
+
+        if self._is_error_response(response):
+            raise MOQTRequestError(
+                error_code=getattr(response, 'error_code', 0),
+                reason=getattr(response, 'reason', ''),
+                retry_interval=getattr(response, 'retry_interval', 0),
+                response=response,
+            )
+        return response
 
     def _get_control_entry(self, msg_type: int) -> Tuple[Type[MOQTMessage], Callable]:
         """Get the (message_class, handler) for a control message type.
