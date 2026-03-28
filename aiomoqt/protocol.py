@@ -139,8 +139,16 @@ class MOQTSession(QuicConnectionProtocol):
         # Optional callback for received data objects:
         #   fn(msg, size_bytes, recv_time_ms, group_id, subgroup_id)
         self.on_object_received: Optional[Callable] = None
-    
-        
+
+    def _get_control_entry(self, msg_type: int) -> Tuple[Type[MOQTMessage], Callable]:
+        """Get the (message_class, handler) for a control message type.
+
+        Handles version-aware dispatch for code points that are reused
+        between draft-14 and draft-16 (0x05, 0x07, 0x08, 0x0E).
+        """
+        if is_draft16_or_later() and msg_type in self.MOQT_D16_OVERRIDE_REGISTRY:
+            return self.MOQT_D16_OVERRIDE_REGISTRY[msg_type]
+        return self._control_msg_registry[msg_type]
 
     async def __aexit__(self, exc_type, exc, tb):
         # Clean up the context when the session exits
@@ -219,8 +227,8 @@ class MOQTSession(QuicConnectionProtocol):
                 # Skip the rest of this message if possible
                 buf.seek(end_pos)
                 return
-            # Look up message class
-            message_class, handler = self._control_msg_registry[msg_type]
+            # Look up message class (version-aware for shared code points)
+            message_class, handler = self._get_control_entry(msg_type)
             logger.debug(f"MOQT event: control message: {message_class.__name__} ({msg_len} bytes)")
             # Deserialize message
             msg = message_class.deserialize(buf)
@@ -1759,6 +1767,54 @@ class MOQTSession(QuicConnectionProtocol):
        MOQTMessageType.PUBLISH_OK: (PublishOk, _handle_publish_ok),
        MOQTMessageType.PUBLISH_ERROR: (PublishError, _handle_publish_error),
    }
+
+    # Draft-16 override registry for repurposed code points.
+    # When is_draft16_or_later(), these take precedence over the main registry.
+    async def _handle_request_ok(self, msg: RequestOk) -> None:
+        logger.info(f"MOQT event: handle {msg}")
+        # REQUEST_OK can be response to REQUEST_UPDATE, TRACK_STATUS,
+        # SUBSCRIBE_NAMESPACE, or PUBLISH_NAMESPACE
+        for responses in (self._subscribe_responses, self._publish_namepace_responses,
+                          self._subscribe_namespace_responses):
+            future = responses.get(msg.request_id)
+            if future and not future.done():
+                future.set_result(msg)
+                return
+        logger.warning(f"MOQT event: unsolicited RequestOk({msg.request_id})")
+
+    async def _handle_request_error(self, msg: RequestError) -> None:
+        logger.info(f"MOQT event: handle {msg}")
+        # REQUEST_ERROR is the universal error for all request types
+        for responses in (self._subscribe_responses, self._fetch_responses,
+                          self._publish_namepace_responses,
+                          self._subscribe_namespace_responses):
+            future = responses.get(msg.request_id)
+            if future and not future.done():
+                future.set_result(msg)
+                return
+        logger.warning(f"MOQT event: unsolicited RequestError({msg.request_id})")
+
+    async def _handle_namespace(self, msg) -> None:
+        logger.info(f"MOQT event: handle Namespace: {msg}")
+
+    async def _handle_namespace_done(self, msg) -> None:
+        logger.info(f"MOQT event: handle NamespaceDone: {msg}")
+
+    async def _handle_request_update(self, msg: RequestUpdate) -> None:
+        logger.info(f"MOQT event: handle RequestUpdate: {msg}")
+
+    MOQT_D16_OVERRIDE_REGISTRY: Dict[int, Tuple[Type[MOQTMessage], Callable]] = {
+        # Code point 0x05: d14=SUBSCRIBE_ERROR, d16=REQUEST_ERROR
+        0x05: (RequestError, _handle_request_error),
+        # Code point 0x07: d14=PUBLISH_NAMESPACE_OK, d16=REQUEST_OK
+        0x07: (RequestOk, _handle_request_ok),
+        # Code point 0x08: d14=PUBLISH_NAMESPACE_ERROR, d16=NAMESPACE
+        0x08: (Namespace, _handle_namespace),
+        # Code point 0x0E: d14=TRACK_STATUS_OK, d16=NAMESPACE_DONE
+        0x0E: (NamespaceDone, _handle_namespace_done),
+        # Code point 0x02: d14=SUBSCRIBE_UPDATE, d16=REQUEST_UPDATE
+        0x02: (RequestUpdate, _handle_request_update),
+    }
 
     # Stream data message types (dispatch by range check, not registry lookup)
     MOQT_STREAM_DATA_REGISTRY: Dict[int, Tuple[Type[MOQTMessage], Callable]] = {

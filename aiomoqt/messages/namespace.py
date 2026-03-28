@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import Dict, Tuple, Any
 
 from . import MOQTMessageType, MOQTMessage, BUF_SIZE
+from ..context import is_draft16_or_later
 from ..utils.buffer import Buffer, BufferReadError
 from ..utils.logger import get_logger
 
@@ -111,8 +112,13 @@ class PublishNamespaceError(MOQTMessage):
 
 @dataclass
 class PublishNamespaceDone(MOQTMessage):
-    """PUBLISH_NAMESPACE_DONE message to withdraw track namespace."""
+    """PUBLISH_NAMESPACE_DONE message to withdraw track namespace.
+
+    Draft-14: Track Namespace (tuple)
+    Draft-16: Request ID (i)
+    """
     namespace: Tuple[bytes, ...] = None
+    request_id: int = None  # d16 only
 
     def __post_init__(self):
         self.type = MOQTMessageType.PUBLISH_NAMESPACE_DONE
@@ -121,30 +127,41 @@ class PublishNamespaceDone(MOQTMessage):
         buf = Buffer(capacity=BUF_SIZE)
         payload = Buffer(capacity=BUF_SIZE)
 
-        payload.push_uint_var(len(self.namespace))
-        for part in self.namespace:
-            payload.push_uint_var(len(part))
-            payload.push_bytes(part)
+        if is_draft16_or_later():
+            payload.push_uint_var(self.request_id)
+        else:
+            payload.push_uint_var(len(self.namespace))
+            for part in self.namespace:
+                payload.push_uint_var(len(part))
+                payload.push_bytes(part)
 
         buf.push_uint_var(self.type)
         buf.push_uint16(payload.tell())
-        logger.info(f"PublishNamespaceDone.serialize: payload.tell: {payload.tell()} payload.data len: {len(payload.data)}")
         buf.push_bytes(payload.data)
         return buf
 
     @classmethod
     def deserialize(cls, buf: Buffer) -> 'PublishNamespaceDone':
-        tuple_len = buf.pull_uint_var()
-        namespace = tuple(buf.pull_bytes(buf.pull_uint_var()) for _ in range(tuple_len))
-        return cls(namespace=namespace)
+        if is_draft16_or_later():
+            request_id = buf.pull_uint_var()
+            return cls(request_id=request_id)
+        else:
+            tuple_len = buf.pull_uint_var()
+            namespace = tuple(buf.pull_bytes(buf.pull_uint_var()) for _ in range(tuple_len))
+            return cls(namespace=namespace)
 
 
 @dataclass
 class PublishNamespaceCancel(MOQTMessage):
-    """PUBLISH_NAMESPACE_CANCEL message to withdraw announcement acceptance."""
+    """PUBLISH_NAMESPACE_CANCEL message to withdraw announcement acceptance.
+
+    Draft-14: Track Namespace (tuple), Error Code (i), Error Reason
+    Draft-16: Request ID (i), Error Code (i), Error Reason
+    """
     namespace: Tuple[bytes, ...] = None
     error_code: int = None
     reason: str = None
+    request_id: int = None  # d16 only
 
     def __post_init__(self):
         self.type = MOQTMessageType.PUBLISH_NAMESPACE_CANCEL
@@ -153,14 +170,17 @@ class PublishNamespaceCancel(MOQTMessage):
         buf = Buffer(capacity=BUF_SIZE)
         payload = Buffer(capacity=BUF_SIZE)
 
-        payload.push_uint_var(len(self.namespace))
-        for part in self.namespace:
-            payload.push_uint_var(len(part))
-            payload.push_bytes(part)
-            
+        if is_draft16_or_later():
+            payload.push_uint_var(self.request_id)
+        else:
+            payload.push_uint_var(len(self.namespace))
+            for part in self.namespace:
+                payload.push_uint_var(len(part))
+                payload.push_bytes(part)
+
         payload.push_uint_var(self.error_code)
-        
-        reason_bytes = self.reason.encode()
+
+        reason_bytes = (self.reason or "").encode()
         payload.push_uint_var(len(reason_bytes))
         payload.push_bytes(reason_bytes)
 
@@ -171,12 +191,17 @@ class PublishNamespaceCancel(MOQTMessage):
 
     @classmethod
     def deserialize(cls, buf: Buffer) -> 'PublishNamespaceCancel':
-        tuple_len = buf.pull_uint_var()
-        namespace = tuple(buf.pull_bytes(buf.pull_uint_var()) for _ in range(tuple_len))
+        namespace = None
+        request_id = None
+        if is_draft16_or_later():
+            request_id = buf.pull_uint_var()
+        else:
+            tuple_len = buf.pull_uint_var()
+            namespace = tuple(buf.pull_bytes(buf.pull_uint_var()) for _ in range(tuple_len))
         error_code = buf.pull_uint_var()
         reason_len = buf.pull_uint_var()
         reason = buf.pull_bytes(reason_len).decode()
-        return cls(namespace=namespace, error_code=error_code, reason=reason)
+        return cls(namespace=namespace, error_code=error_code, reason=reason, request_id=request_id)
 
 
 @dataclass
