@@ -31,7 +31,8 @@ class ServerSetup(MOQTMessage):
         if not is_draft16_or_later():
             payload.push_uint_var(self.selected_version)
 
-        MOQTMessage._serialize_params(payload, self.parameters)
+        MOQTMessage._serialize_params(payload, self.parameters,
+                                      delta_keys=None)
 
         buf.push_uint_var(self.type)
         buf.push_uint16(payload.tell())
@@ -44,7 +45,8 @@ class ServerSetup(MOQTMessage):
         version = None
         if not is_draft16_or_later():
             version = buf.pull_uint_var()
-        params = MOQTMessage._deserialize_params(buf)
+        params = MOQTMessage._deserialize_params(buf,
+                                                  delta_keys=None)
         return cls(selected_version=version, parameters=params)
 
 
@@ -72,7 +74,8 @@ class ClientSetup(MOQTMessage):
             for version in self.versions:
                 payload.push_uint_var(version)
 
-        MOQTMessage._serialize_params(payload, self.parameters)
+        MOQTMessage._serialize_params(payload, self.parameters,
+                                      delta_keys=None)
 
         buf.push_uint_var(self.type)
         buf.push_uint16(payload.tell())
@@ -87,7 +90,8 @@ class ClientSetup(MOQTMessage):
             version_count = buf.pull_uint_var()
             for _ in range(version_count):
                 versions.append(buf.pull_uint_var())
-        params = MOQTMessage._deserialize_params(buf)
+        params = MOQTMessage._deserialize_params(buf,
+                                                  delta_keys=None)
         return cls(versions=versions, parameters=params)
         
 

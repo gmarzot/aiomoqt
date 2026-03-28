@@ -231,17 +231,32 @@ class MOQTMessage:
             return f"0x{truncated}{suffix}"
     
     @staticmethod
-    def _serialize_params(payload: Buffer, parameters: Dict[int, Any]) -> None:
+    def _serialize_params(payload: Buffer, parameters: Dict[int, Any],
+                          delta_keys: bool = None) -> None:
         """
         Serialize parameters using Key-Value-Pair structure. Payload is modified in place.
-        
+
         Key-Value-Pair structure:
         - Even type: Type (varint) + Value (varint)
         - Odd type: Type (varint) + Length (varint) + Value (bytes)
+
+        If delta_keys=True (or auto-detected from draft-16+ context),
+        keys are sorted and written as deltas: key_on_wire = key - previous_key.
         """
+        if delta_keys is None:
+            from ..context import is_draft16_or_later
+            delta_keys = is_draft16_or_later()
+        if delta_keys:
+            # Sort by key for delta encoding
+            parameters = dict(sorted(parameters.items()))
         payload.push_uint_var(len(parameters))
+        prev_key = 0
         for param_type, param_value in parameters.items():
-            payload.push_uint_var(param_type)  # Type
+            if delta_keys:
+                payload.push_uint_var(param_type - prev_key)
+                prev_key = param_type
+            else:
+                payload.push_uint_var(param_type)  # Type
             
             if param_type % 2 == 1:  # Odd type - includes Length field
                 # Value is bytes or string
@@ -271,18 +286,30 @@ class MOQTMessage:
         logger.info(f"Serialized {len(parameters)} parameters: {payload.data_slice(0,12)}")
 
 
-    def _deserialize_params(buf: Buffer) -> Dict[int, Any]:
+    def _deserialize_params(buf: Buffer, delta_keys: bool = None) -> Dict[int, Any]:
         """
         Deserialize parameters using Key-Value-Pair structure.
+
+        If delta_keys=True (or auto-detected from draft-16+ context),
+        keys are delta-decoded.
 
         Returns:
             Dict mapping parameter type to value
         """
+        if delta_keys is None:
+            from ..context import is_draft16_or_later
+            delta_keys = is_draft16_or_later()
         params = {}
         param_count = buf.pull_uint_var()
-        
+        prev_key = 0
+
         for _ in range(param_count):
-            param_type = buf.pull_uint_var()
+            raw_key = buf.pull_uint_var()
+            if delta_keys:
+                param_type = prev_key + raw_key
+                prev_key = param_type
+            else:
+                param_type = raw_key
             
             if param_type % 2 == 1:  # Odd type - includes Length field
                 param_len = buf.pull_uint_var()

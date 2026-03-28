@@ -8,6 +8,8 @@ from qh3.asyncio.client import connect
 from qh3.h3.connection import H3_ALPN
 
 from .protocol import *
+from .types import moqt_alpn_for_version
+from .context import set_moqt_ctx_version
 from .utils.logger import *
 
 logger = get_logger(__name__)
@@ -25,6 +27,7 @@ class MOQTClient(MOQTPeer):  # New connection manager class
         debug: Optional[bool] = False,
         quic_debug: Optional[bool] = False,
         keylog_filename: Optional[str] = None,
+        draft_version: Optional[int] = None,
     ):
         super().__init__(allow_optional_dgram=allow_optional_dgram)
         self.host = host
@@ -32,13 +35,26 @@ class MOQTClient(MOQTPeer):  # New connection manager class
         self.endpoint = endpoint
         self.use_quic = use_quic
         self.debug = debug
+        self.draft_version = draft_version
+
+        # Set the global version context if explicitly requested
+        if draft_version is not None:
+            set_moqt_ctx_version(draft_version)
 
         logger.debug(f"MOQT: client session: {self} use_quic={use_quic} endpoint={endpoint}")
 
         if configuration is None:
+            # Choose ALPN based on draft version
+            if use_quic:
+                if draft_version is not None:
+                    alpn = [moqt_alpn_for_version(draft_version)]
+                else:
+                    alpn = [MOQT_ALPN]
+            else:
+                alpn = H3_ALPN
             verify_mode = ssl.CERT_REQUIRED if verify_tls else ssl.CERT_NONE
             configuration = QuicConfiguration(
-                alpn_protocols= [MOQT_ALPN] if use_quic else H3_ALPN,
+                alpn_protocols=alpn,
                 is_client=True,
                 verify_mode=verify_mode,
                 cafile=certifi.where() if verify_tls else None,

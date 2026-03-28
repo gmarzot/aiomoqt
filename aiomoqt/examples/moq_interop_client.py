@@ -20,11 +20,13 @@ from urllib.parse import urlparse
 from aiomoqt.types import (
     MOQTMessageType, ParamType, FilterType, GroupOrder,
     SessionCloseCode, MOQTException,
+    MOQT_VERSION_DRAFT14, MOQT_VERSION_DRAFT16,
 )
 from aiomoqt.messages import (
     SubscribeError, SubscribeOk,
     PublishNamespaceOk, PublishNamespaceError,
     SubscribeNamespaceError,
+    RequestOk, RequestError,
 )
 from aiomoqt.client import MOQTClient
 from aiomoqt.utils.logger import get_logger, set_log_level
@@ -102,7 +104,8 @@ def _get_connection_id(session) -> str:
 
 
 def _make_client(host: str, port: int, endpoint: str, use_quic: bool,
-                 tls_disable_verify: bool, debug: bool) -> MOQTClient:
+                 tls_disable_verify: bool, debug: bool,
+                 draft_version: int = None) -> MOQTClient:
     """Create a configured MOQTClient."""
     return MOQTClient(
         host, port,
@@ -110,6 +113,7 @@ def _make_client(host: str, port: int, endpoint: str, use_quic: bool,
         use_quic=use_quic,
         verify_tls=not tls_disable_verify,
         debug=debug,
+        draft_version=draft_version,
     )
 
 
@@ -118,10 +122,10 @@ def _make_client(host: str, port: int, endpoint: str, use_quic: bool,
 # ---------------------------------------------------------------------------
 
 async def test_setup_only(host, port, endpoint, use_quic, tls_disable_verify,
-                          debug, timeout=2.0) -> TestResult:
+                          debug, draft_version=None, timeout=2.0) -> TestResult:
     """Test 1: Connect, exchange SETUP, graceful close."""
     t0 = time.monotonic()
-    client = _make_client(host, port, endpoint, use_quic, tls_disable_verify, debug)
+    client = _make_client(host, port, endpoint, use_quic, tls_disable_verify, debug, draft_version=draft_version)
     try:
         async with asyncio.timeout(timeout):
             async with client.connect() as session:
@@ -145,10 +149,10 @@ async def test_setup_only(host, port, endpoint, use_quic, tls_disable_verify,
 
 
 async def test_announce_only(host, port, endpoint, use_quic, tls_disable_verify,
-                             debug, timeout=2.0) -> TestResult:
+                             debug, draft_version=None, timeout=2.0) -> TestResult:
     """Test 2: SETUP + PUBLISH_NAMESPACE + receive OK."""
     t0 = time.monotonic()
-    client = _make_client(host, port, endpoint, use_quic, tls_disable_verify, debug)
+    client = _make_client(host, port, endpoint, use_quic, tls_disable_verify, debug, draft_version=draft_version)
     try:
         async with asyncio.timeout(timeout):
             async with client.connect() as session:
@@ -188,10 +192,10 @@ async def test_announce_only(host, port, endpoint, use_quic, tls_disable_verify,
 
 async def test_publish_namespace_done(host, port, endpoint, use_quic,
                                       tls_disable_verify, debug,
-                                      timeout=2.0) -> TestResult:
+                                      draft_version=None, timeout=2.0) -> TestResult:
     """Test 3: SETUP + PUBLISH_NAMESPACE + OK + PUBLISH_NAMESPACE_DONE + close."""
     t0 = time.monotonic()
-    client = _make_client(host, port, endpoint, use_quic, tls_disable_verify, debug)
+    client = _make_client(host, port, endpoint, use_quic, tls_disable_verify, debug, draft_version=draft_version)
     try:
         async with asyncio.timeout(timeout):
             async with client.connect() as session:
@@ -215,7 +219,10 @@ async def test_publish_namespace_done(host, port, endpoint, use_quic,
 
                 # Now send PUBLISH_NAMESPACE_DONE
                 ns_tuple = session._make_namespace_tuple(INTEROP_NAMESPACE)
-                session.publish_namespace_done(namespace=ns_tuple)
+                session.publish_namespace_done(
+                    namespace=ns_tuple,
+                    request_id=response.request_id,
+                )
                 # Brief pause to let the message flush
                 await asyncio.sleep(0.1)
                 session.close()
@@ -238,10 +245,10 @@ async def test_publish_namespace_done(host, port, endpoint, use_quic,
 
 async def test_subscribe_error(host, port, endpoint, use_quic,
                                tls_disable_verify, debug,
-                               timeout=2.0) -> TestResult:
+                               draft_version=None, timeout=2.0) -> TestResult:
     """Test 4: SUBSCRIBE to non-existent track, expect SUBSCRIBE_ERROR."""
     t0 = time.monotonic()
-    client = _make_client(host, port, endpoint, use_quic, tls_disable_verify, debug)
+    client = _make_client(host, port, endpoint, use_quic, tls_disable_verify, debug, draft_version=draft_version)
     try:
         async with asyncio.timeout(timeout):
             async with client.connect() as session:
@@ -253,13 +260,13 @@ async def test_subscribe_error(host, port, endpoint, use_quic,
                     track_name="test-track",
                     wait_response=True,
                 )
-                if isinstance(response, SubscribeError):
+                if isinstance(response, (SubscribeError, RequestError)):
                     session.close()
                     return TestResult(
                         name="subscribe-error", passed=True,
                         duration_ms=(time.monotonic() - t0) * 1000,
                         connection_id=cid,
-                        message=f"SUBSCRIBE_ERROR received (expected): code={response.error_code}",
+                        message=f"{'REQUEST_ERROR' if isinstance(response, RequestError) else 'SUBSCRIBE_ERROR'} received (expected): code={response.error_code}",
                     )
                 elif isinstance(response, SubscribeOk):
                     session.close()
@@ -293,7 +300,7 @@ async def test_subscribe_error(host, port, endpoint, use_quic,
 
 async def test_announce_subscribe(host, port, endpoint, use_quic,
                                   tls_disable_verify, debug,
-                                  timeout=3.0) -> TestResult:
+                                  draft_version=None, timeout=3.0) -> TestResult:
     """Test 5: Two connections — publisher announces, subscriber subscribes."""
     t0 = time.monotonic()
     pub_cid = "unknown"
@@ -303,9 +310,9 @@ async def test_announce_subscribe(host, port, endpoint, use_quic,
         async with asyncio.timeout(timeout):
             # Publisher connection
             pub_client = _make_client(host, port, endpoint, use_quic,
-                                      tls_disable_verify, debug)
+                                      tls_disable_verify, debug, draft_version=draft_version)
             sub_client = _make_client(host, port, endpoint, use_quic,
-                                      tls_disable_verify, debug)
+                                      tls_disable_verify, debug, draft_version=draft_version)
 
             async with pub_client.connect() as pub_session:
                 await pub_session.client_session_init()
@@ -367,7 +374,7 @@ async def test_announce_subscribe(host, port, endpoint, use_quic,
 
 async def test_subscribe_before_announce(host, port, endpoint, use_quic,
                                          tls_disable_verify, debug,
-                                         timeout=3.5) -> TestResult:
+                                         draft_version=None, timeout=3.5) -> TestResult:
     """Test 6: Subscriber connects first, publisher 500ms later. Both outcomes valid."""
     t0 = time.monotonic()
     pub_cid = "unknown"
@@ -377,9 +384,9 @@ async def test_subscribe_before_announce(host, port, endpoint, use_quic,
     try:
         async with asyncio.timeout(timeout):
             sub_client = _make_client(host, port, endpoint, use_quic,
-                                      tls_disable_verify, debug)
+                                      tls_disable_verify, debug, draft_version=draft_version)
             pub_client = _make_client(host, port, endpoint, use_quic,
-                                      tls_disable_verify, debug)
+                                      tls_disable_verify, debug, draft_version=draft_version)
 
             async with sub_client.connect() as sub_session:
                 await sub_session.client_session_init()
@@ -506,12 +513,14 @@ def parse_args():
                         help="Skip TLS certificate verification")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug logging to stderr")
+    parser.add_argument("--draft", type=int, default=None,
+                        help="MoQT draft version (14 or 16, default: auto/14)")
     return parser.parse_args()
 
 
 async def run_tests(tests: list[str], host: str, port: int, endpoint: str,
                     use_quic: bool, tls_disable_verify: bool,
-                    debug: bool) -> TAPReporter:
+                    debug: bool, draft_version: int = None) -> TAPReporter:
     reporter = TAPReporter()
     for test_name in tests:
         fn = TEST_FUNCTIONS.get(test_name)
@@ -521,7 +530,8 @@ async def run_tests(tests: list[str], host: str, port: int, endpoint: str,
                 skip_reason="Unknown test case",
             ))
             continue
-        result = await fn(host, port, endpoint, use_quic, tls_disable_verify, debug)
+        result = await fn(host, port, endpoint, use_quic, tls_disable_verify,
+                          debug, draft_version=draft_version)
         reporter.add(result)
         # Print progress to stderr if verbose
         status = "PASS" if result.passed else "FAIL"
@@ -545,9 +555,15 @@ def main():
 
     host, port, endpoint, use_quic = parse_relay_url(args.relay)
 
+    # Resolve draft version
+    draft_version = None
+    if args.draft:
+        draft_version = 0xff000000 + args.draft
+
     if args.verbose:
         transport = "QUIC" if use_quic else "WebTransport"
-        print(f"# Relay: {args.relay} ({host}:{port}/{endpoint} via {transport})",
+        draft_str = f" draft-{args.draft}" if args.draft else ""
+        print(f"# Relay: {args.relay} ({host}:{port}/{endpoint} via {transport}{draft_str})",
               file=sys.stderr)
 
     # Select tests
@@ -558,7 +574,8 @@ def main():
 
     reporter = asyncio.run(
         run_tests(tests, host, port, endpoint, use_quic,
-                  args.tls_disable_verify, args.debug)
+                  args.tls_disable_verify, args.debug,
+                  draft_version=draft_version)
     )
 
     # TAP output to stdout

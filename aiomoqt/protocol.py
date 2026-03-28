@@ -543,15 +543,24 @@ class MOQTSession(QuicConnectionProtocol):
         
         if isinstance(event, ProtocolNegotiated):
             # Enforce supported ALPN
-            if event.alpn_protocol in H3_ALPN:
-                logger.debug(f"QUIC event: ALPN ProtocolNegotiated: {event.alpn_protocol}")
-            elif event.alpn_protocol == MOQT_ALPN:
-                logger.debug(f"QUIC event: ALPN ProtocolNegotiated alpn: {event.alpn_protocol}")
+            alpn = event.alpn_protocol
+            if alpn in H3_ALPN:
+                logger.debug(f"QUIC event: ALPN ProtocolNegotiated: {alpn}")
+            elif alpn == MOQT_ALPN or (alpn and alpn.startswith("moqt-")):
+                logger.debug(f"QUIC event: ALPN ProtocolNegotiated alpn: {alpn}")
+                # Set version from ALPN (draft-16+: version is ALPN-negotiated)
+                try:
+                    version = moqt_version_from_alpn(alpn)
+                    set_moqt_ctx_version(version)
+                    self._moqt_version = version
+                    logger.info(f"MOQT: version set from ALPN: {alpn} -> 0x{version:x}")
+                except ValueError:
+                    pass
             else:
-                logger.error(f"QUIC error: unknown ALPN: {event.alpn_protocol}")
+                logger.error(f"QUIC error: unknown ALPN: {alpn}")
                 self._close_session(
-                    SessionCloseCode.UNAUTHORIZED, 
-                    f"unsupported ALPN: {event.alpn_protocol}"
+                    SessionCloseCode.UNAUTHORIZED,
+                    f"unsupported ALPN: {alpn}"
                 )
             return
         elif isinstance(event, StreamDataReceived) and self._wt_session_setup.done():
@@ -1355,10 +1364,15 @@ class MOQTSession(QuicConnectionProtocol):
 
     def publish_namespace_done(
         self,
-        namespace: Tuple[bytes, ...]
+        namespace: Tuple[bytes, ...] = None,
+        request_id: int = None,
     ) -> Optional[MOQTMessage]:
-        """Withdraw track namespace announcement. (no reply expected)"""        
-        message =  PublishNamespaceDone(namespace=namespace)
+        """Withdraw track namespace announcement. (no reply expected)
+
+        Draft-14: takes namespace tuple.
+        Draft-16: takes request_id of the original PUBLISH_NAMESPACE.
+        """
+        message = PublishNamespaceDone(namespace=namespace, request_id=request_id)
         logger.info(f"MOQT send: {message}")
         self.send_control_message(message.serialize())
         return message
@@ -1469,6 +1483,10 @@ class MOQTSession(QuicConnectionProtocol):
             )
         else:
             selected_version = msg.selected_version
+            if selected_version is None:
+                # Draft-16+: version already negotiated via ALPN
+                selected_version = self._moqt_version
+                logger.info(f"MOQT event: d16+ ServerSetup (version from ALPN: 0x{selected_version:x})")
             if selected_version not in MOQT_VERSIONS:
                 error = f"MOQT event: unsupported version in ServerSetup {hex(selected_version)}"
                 logger.debug(error)
@@ -1478,7 +1496,6 @@ class MOQTSession(QuicConnectionProtocol):
                 )
             else:
                 self._moqt_version = selected_version
-                # set version context scoped to the session and save prev state token
                 set_moqt_ctx_version(self._moqt_version)
 
             # indicate moqt session setup is complete
