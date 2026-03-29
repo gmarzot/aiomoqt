@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Tuple
+from typing import Any, Optional, Dict, Tuple
 
 from .base import MOQTMessage, BUF_SIZE
 from ..types import *

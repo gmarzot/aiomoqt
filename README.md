@@ -54,6 +54,8 @@ python -m aiomoqt.examples.relay_probe
 
 ## Installation
 
+Requires Python 3.12+ (tested on 3.12, 3.13, and 3.14).
+
 Install using `pip`:
 
 ```bash

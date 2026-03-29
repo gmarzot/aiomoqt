@@ -3,7 +3,7 @@ name = "aiomoqt"
 dynamic = ["version"]
 description = "Python asyncio implementation of the MoQT protocol"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 license = "MIT"
 authors = [
     { name = "Giovanni Marzot", email = "gmarzot@marzresearch.net" }
