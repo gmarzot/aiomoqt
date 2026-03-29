@@ -23,12 +23,13 @@ class MOQTMessage:
     # type: Optional[int] = None - let subclass set it - annoying warnings
 
     @staticmethod
-    def _extensions_encode(buf: Buffer, exts: Dict) -> None:
+    def _extensions_encode(buf: Buffer, exts: Dict,
+                           with_length: bool = True) -> None:
         vers = get_moqt_ctx_version()
         major_version = get_major_version(vers)
-        # logger.debug(f"MOQTMessage._extensions_encode(): {vers} maj: {major_version}")
         if exts is None or len(exts) == 0:
-            buf.push_uint_var(0)
+            if with_length:
+                buf.push_uint_var(0)
             return
         
         if major_version > 8:
@@ -46,7 +47,8 @@ class MOQTMessage:
                     payload.push_bytes(ext_value)
 
             exts_len = payload.tell()
-            buf.push_uint_var(exts_len)
+            if with_length:
+                buf.push_uint_var(exts_len)
             buf.push_bytes(payload.data)
         else:
             buf.push_uint_var(len(exts))
@@ -63,27 +65,34 @@ class MOQTMessage:
 
     exts_err_count = 0
     @staticmethod
-    def _extensions_decode(buf: Buffer) -> Dict[int, Union[int, bytes]]:
+    def _extensions_decode(buf: Buffer, with_length: bool = True,
+                           buf_end: int = None) -> Dict[int, Union[int, bytes]]:
         exts = {}
-        exts_len = buf.pull_uint_var()
-        if exts_len > (1024*16):
-            global exts_err_count
-            exts_err_count += 1
-            logger.warning(f"MOQTMessage._extensions_decode(): corrupted buffer : ext_len: {exts_len} count: {exts_err_count}")
-            return exts
+        if with_length:
+            exts_len = buf.pull_uint_var()
+            if exts_len > (1024*16):
+                global exts_err_count
+                exts_err_count += 1
+                logger.warning(f"MOQTMessage._extensions_decode(): corrupted buffer : ext_len: {exts_len} count: {exts_err_count}")
+                return exts
+            if exts_len == 0:
+                return exts
+            exts_end = buf.tell() + exts_len
+        else:
+            # No length prefix — read until buf_end or buffer exhaustion
+            exts_end = buf_end if buf_end is not None else buf.capacity
 
-        if exts_len > 0:
-            pos = buf.tell()
-            exts_end = pos + exts_len
-            while buf.tell() < exts_end:
+        while buf.tell() < exts_end:
+            try:
                 ext_id = buf.pull_uint_var()
-                if ext_id % 2 == 0:  # even extension types are simple var int
+                if ext_id % 2 == 0:
                     ext_value = buf.pull_uint_var()
                 else:
                     value_len = buf.pull_uint_var()
                     ext_value = buf.pull_bytes(value_len)
                 exts[ext_id] = ext_value
-        # assert buf.tell() == exts_end, f"Payload length mismatch: {exts_len} {buf.tell()-pos}"
+            except BufferReadError:
+                break  # no more extensions to read
 
         return exts
           

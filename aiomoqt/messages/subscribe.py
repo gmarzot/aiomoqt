@@ -429,7 +429,7 @@ class SubscribeOk(MOQTMessage):
             exts = dict(self.track_extensions or {})
             if self.group_order is not None:
                 exts[0x22] = self.group_order  # DEFAULT_PUBLISHER_GROUP_ORDER
-            MOQTMessage._extensions_encode(payload, exts)
+            MOQTMessage._extensions_encode(payload, exts, with_length=False)
         else:
             # d14: fixed fields
             payload.push_uint_var(self.expires)
@@ -468,7 +468,7 @@ class SubscribeOk(MOQTMessage):
                 content_exists = ContentExistsCode.EXISTS
             else:
                 content_exists = ContentExistsCode.NO_CONTENT
-            track_extensions = MOQTMessage._extensions_decode(buf)
+            track_extensions = MOQTMessage._extensions_decode(buf, with_length=False)
             group_order_val = track_extensions.pop(0x22, None)
             if group_order_val is not None:
                 group_order = GroupOrder(group_order_val)

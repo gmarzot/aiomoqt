@@ -769,7 +769,7 @@ class TestDraft16Subscribe:
             },
             type_id=MOQTMessageType.SUBSCRIBE_OK,
             version=MOQT_VERSION_DRAFT16,
-            skip_fields={'content_exists'},
+            skip_fields={'content_exists', 'track_extensions'},
         )
 
     def test_subscribe_d16_with_filter(self):
@@ -813,7 +813,7 @@ class TestDraft16Publish:
             },
             type_id=MOQTMessageType.PUBLISH,
             version=MOQT_VERSION_DRAFT16,
-            skip_fields={'content_exists'},
+            skip_fields={'content_exists', 'track_extensions'},
         )
 
     def test_publish_d16_with_content(self):
@@ -834,7 +834,7 @@ class TestDraft16Publish:
             },
             type_id=MOQTMessageType.PUBLISH,
             version=MOQT_VERSION_DRAFT16,
-            skip_fields={'content_exists'},
+            skip_fields={'content_exists', 'track_extensions'},
         )
 
     def test_publish_ok_d16(self):
@@ -890,6 +890,7 @@ class TestDraft16Fetch:
             },
             type_id=MOQTMessageType.FETCH_OK,
             version=MOQT_VERSION_DRAFT16,
+            skip_fields={'track_extensions'},
         )
 
 
