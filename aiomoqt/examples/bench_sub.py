@@ -239,8 +239,11 @@ examples:
         '-Q', '--force-quic', action='store_true',
         help='Force raw QUIC even for https:// URLs')
     parser.add_argument(
-        '-n', '--namespace', type=str, default='bench',
-        help='MoQT namespace (default: bench)')
+    import time
+    _ts = hex(int(time.time()) // 60 & 0xFFF)[2:]
+    parser.add_argument(
+        '-n', '--namespace', type=str, default=f'bench/{_ts}',
+        help='MoQT namespace (default: bench/<time>)')
     parser.add_argument(
         '--trackname', type=str, default='track',
         help='MoQT track name (default: track)')

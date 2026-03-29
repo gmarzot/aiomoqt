@@ -32,8 +32,12 @@ from aiomoqt.messages import (
 from aiomoqt.client import MOQTClient
 from aiomoqt.utils.logger import get_logger, set_log_level
 
-INTEROP_NAMESPACE = "moq-test/interop"
-INTEROP_TRACK = "test-track"
+def _unique_suffix():
+    """Short hex timestamp for unique namespace/track per run."""
+    return hex(int(time.time()) & 0xFFFF)[2:]
+
+INTEROP_NAMESPACE = f"moq-test/{_unique_suffix()}/interop"
+INTEROP_TRACK = f"track-{_unique_suffix()}"
 
 ALL_TESTS = [
     "setup-only",
