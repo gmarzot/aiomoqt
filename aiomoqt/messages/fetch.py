@@ -3,6 +3,7 @@ from typing import Optional, Dict, Tuple
 
 from .base import MOQTMessage, BUF_SIZE
 from ..types import *
+from ..context import is_draft16_or_later
 from ..utils.buffer import Buffer, BufferReadError
 from ..utils.logger import get_logger
 
@@ -33,16 +34,22 @@ class Fetch(MOQTMessage):
         payload = Buffer(capacity=BUF_SIZE)
 
         payload.push_uint_var(self.request_id)
-        payload.push_uint8(self.subscriber_priority)
-        payload.push_uint8(self.group_order)
-        payload.push_uint_var(self.fetch_type)
-        
+
+        if is_draft16_or_later():
+            # d16: priority and group_order moved to params
+            payload.push_uint_var(self.fetch_type)
+        else:
+            # d14: priority and group_order as fixed fields before fetch_type
+            payload.push_uint8(self.subscriber_priority)
+            payload.push_uint8(self.group_order)
+            payload.push_uint_var(self.fetch_type)
+
         if self.fetch_type == FetchType.FETCH:
             payload.push_uint_var(len(self.namespace))
             for part in self.namespace:
                 payload.push_uint_var(len(part))
                 payload.push_bytes(part)
-                
+
             payload.push_uint_var(len(self.track_name))
             payload.push_bytes(self.track_name)
 
@@ -56,7 +63,15 @@ class Fetch(MOQTMessage):
         else:
             raise RuntimeError
 
-        MOQTMessage._serialize_params(payload, self.parameters)
+        if is_draft16_or_later():
+            params = dict(self.parameters)
+            if self.subscriber_priority is not None:
+                params[ParamType.SUBSCRIBER_PRIORITY] = self.subscriber_priority
+            if self.group_order is not None:
+                params[ParamType.GROUP_ORDER] = self.group_order
+            MOQTMessage._serialize_params(payload, params)
+        else:
+            MOQTMessage._serialize_params(payload, self.parameters)
 
         buf.push_uint_var(self.type)
         buf.push_uint16(payload.tell())
@@ -74,20 +89,25 @@ class Fetch(MOQTMessage):
         end_object = None
         joining_sub_id = None
         pre_group_offset = None
+        subscriber_priority = 128
+        group_order = GroupOrder.DESCENDING
 
         request_id = buf.pull_uint_var()
-        subscriber_priority = buf.pull_uint8()
-        group_order = buf.pull_uint8()
-        fetch_type = buf.pull_uint_var()
+
+        if is_draft16_or_later():
+            fetch_type = buf.pull_uint_var()
+        else:
+            subscriber_priority = buf.pull_uint8()
+            group_order = buf.pull_uint8()
+            fetch_type = buf.pull_uint_var()
+
         if fetch_type == FetchType.FETCH:
-            # Namespace tuple
             namespace = []
             ns_len = buf.pull_uint_var()
             for _ in range(ns_len):
                 part_len = buf.pull_uint_var()
                 namespace.append(buf.pull_bytes(part_len))
             namespace = tuple(namespace)
-            # Track name
             track_name_len = buf.pull_uint_var()
             track_name = buf.pull_bytes(track_name_len)
             start_group = buf.pull_uint_var()
@@ -99,9 +119,12 @@ class Fetch(MOQTMessage):
             pre_group_offset = buf.pull_uint_var()
         else:
             raise RuntimeError
-        
-        # Parameters
+
         params = MOQTMessage._deserialize_params(buf)
+
+        if is_draft16_or_later():
+            subscriber_priority = params.pop(ParamType.SUBSCRIBER_PRIORITY, 128)
+            group_order = params.pop(ParamType.GROUP_ORDER, GroupOrder.DESCENDING)
 
         return cls(
             fetch_type=fetch_type,
@@ -121,29 +144,49 @@ class Fetch(MOQTMessage):
 
 @dataclass
 class FetchOk(MOQTMessage):
-    """FETCH_OK response message."""
+    """FETCH_OK response message.
+
+    Draft-14: Request ID, Group Order (8), End of Track (8),
+              Largest Group ID, Largest Object ID, Params
+    Draft-16: Request ID, End of Track (8), End Location, Params, Track Extensions
+              (group_order removed; now a parameter 0x22)
+    """
     request_id: int
-    group_order: int
-    end_of_track: int
-    largest_group_id: int
-    largest_object_id: int
-    parameters: Dict[int, bytes]
+    group_order: int = GroupOrder.DESCENDING
+    end_of_track: int = 0
+    largest_group_id: int = 0
+    largest_object_id: int = 0
+    parameters: Dict[int, bytes] = None
+    track_extensions: Optional[Dict[int, Any]] = None  # d16 only
 
     def __post_init__(self):
         self.type = MOQTMessageType.FETCH_OK
+        if self.parameters is None:
+            self.parameters = {}
 
     def serialize(self) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
         payload = Buffer(capacity=BUF_SIZE)
 
         payload.push_uint_var(self.request_id)
-        payload.push_uint8(self.group_order)
-        payload.push_uint8(self.end_of_track)
-        payload.push_uint_var(self.largest_group_id)
-        payload.push_uint_var(self.largest_object_id)
 
-        # Parameters
-        MOQTMessage._serialize_params(payload, self.parameters)
+        if is_draft16_or_later():
+            # d16: no group_order fixed field
+            payload.push_uint8(self.end_of_track)
+            payload.push_uint_var(self.largest_group_id)
+            payload.push_uint_var(self.largest_object_id)
+            params = dict(self.parameters)
+            if self.group_order is not None:
+                params[ParamType.GROUP_ORDER] = self.group_order
+            MOQTMessage._serialize_params(payload, params)
+            MOQTMessage._extensions_encode(payload, self.track_extensions or {}, with_length=False)
+        else:
+            # d14: group_order as fixed field
+            payload.push_uint8(self.group_order)
+            payload.push_uint8(self.end_of_track)
+            payload.push_uint_var(self.largest_group_id)
+            payload.push_uint_var(self.largest_object_id)
+            MOQTMessage._serialize_params(payload, self.parameters)
 
         buf.push_uint_var(self.type)
         buf.push_uint16(payload.tell())
@@ -152,14 +195,22 @@ class FetchOk(MOQTMessage):
 
     @classmethod
     def deserialize(cls, buf: Buffer) -> 'FetchOk':
-
         request_id = buf.pull_uint_var()
-        group_order = buf.pull_uint8()
-        end_of_track = buf.pull_uint8()
-        largest_group_id = buf.pull_uint_var()
-        largest_object_id = buf.pull_uint_var()
+        track_extensions = None
 
-        params = MOQTMessage._deserialize_params(buf)
+        if is_draft16_or_later():
+            end_of_track = buf.pull_uint8()
+            largest_group_id = buf.pull_uint_var()
+            largest_object_id = buf.pull_uint_var()
+            params = MOQTMessage._deserialize_params(buf)
+            group_order = params.pop(ParamType.GROUP_ORDER, GroupOrder.DESCENDING)
+            track_extensions = MOQTMessage._extensions_decode(buf, with_length=False)
+        else:
+            group_order = buf.pull_uint8()
+            end_of_track = buf.pull_uint8()
+            largest_group_id = buf.pull_uint_var()
+            largest_object_id = buf.pull_uint_var()
+            params = MOQTMessage._deserialize_params(buf)
 
         return cls(
             request_id=request_id,
@@ -167,7 +218,8 @@ class FetchOk(MOQTMessage):
             end_of_track=end_of_track,
             largest_group_id=largest_group_id,
             largest_object_id=largest_object_id,
-            parameters=params
+            parameters=params,
+            track_extensions=track_extensions,
         )
 
 @dataclass

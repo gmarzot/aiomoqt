@@ -18,12 +18,11 @@ import math
 import time
 
 from aiomoqt.types import (
-    ParamType, MOQTException,
+    ParamType, MOQTException, MOQTRequestError,
     MOQT_TIMESTAMP_EXT, ObjectStatus,
 )
 from aiomoqt.client import MOQTClient
 from aiomoqt.messages import (
-    SubscribeError, SubscribeNamespaceError,
     ObjectHeader, ObjectDatagram,
 )
 from aiomoqt.utils.logger import set_log_level, get_logger
@@ -239,9 +238,11 @@ examples:
     parser.add_argument(
         '-Q', '--force-quic', action='store_true',
         help='Force raw QUIC even for https:// URLs')
+    import time
+    _ts = hex(int(time.time()) // 60 & 0xFFF)[2:]
     parser.add_argument(
-        '-n', '--namespace', type=str, default='bench',
-        help='MoQT namespace (default: bench)')
+        '-n', '--namespace', type=str, default=f'bench/{_ts}',
+        help='MoQT namespace (default: bench/<time>)')
     parser.add_argument(
         '--trackname', type=str, default='track',
         help='MoQT track name (default: track)')
@@ -296,18 +297,7 @@ async def run(args):
             try:
                 await session.client_session_init()
 
-                resp = await session.subscribe_namespace(
-                    namespace_prefix=args.namespace,
-                    parameters={
-                        ParamType.AUTH_TOKEN: b"bench-token",
-                    },
-                    wait_response=True,
-                )
-                if isinstance(resp, SubscribeNamespaceError):
-                    raise MOQTException(
-                        resp.error_code, resp.reason)
-
-                resp = await session.subscribe(
+                await session.subscribe(
                     namespace=args.namespace,
                     track_name=args.trackname,
                     parameters={
@@ -317,9 +307,6 @@ async def run(args):
                     },
                     wait_response=True,
                 )
-                if isinstance(resp, SubscribeError):
-                    raise MOQTException(
-                        resp.error_code, resp.reason)
 
                 print("  Subscribed, receiving...\n")
 
@@ -331,6 +318,9 @@ async def run(args):
                 except asyncio.TimeoutError:
                     pass
 
+            except MOQTRequestError as e:
+                print(f"  Request error: {e}")
+                session.close()
             except MOQTException as e:
                 print(f"  MoQT error: {e}")
                 session.close(

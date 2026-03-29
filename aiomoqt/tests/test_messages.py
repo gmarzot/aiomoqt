@@ -683,3 +683,281 @@ def test_fetch_object():
         'payload': b'Sample payload'
     }
     assert moqt_message_serialization(FetchObject, params)
+
+
+# ========================================================================
+# Draft-16 message serialization tests
+# ========================================================================
+
+from conftest import moqt_message_serialization_versioned
+from aiomoqt.types import MOQT_VERSION_DRAFT14, MOQT_VERSION_DRAFT16
+from aiomoqt.messages import (RequestOk, RequestError, RequestUpdate,
+                               Namespace, NamespaceDone)
+from aiomoqt.types import D16MessageType
+
+
+class TestDraft16Setup:
+    """Draft-16 CLIENT_SETUP/SERVER_SETUP: no version fields, delta-encoded params."""
+
+    def test_client_setup_d16(self):
+        assert moqt_message_serialization_versioned(
+            ClientSetup,
+            {'versions': [], 'parameters': {
+                SetupParamType.PATH: b'/moq',
+                SetupParamType.MAX_REQUEST_ID: 10000,
+                SetupParamType.IMPLEMENTATION: b'test-1.0',
+            }},
+            type_id=MOQTMessageType.CLIENT_SETUP,
+            version=MOQT_VERSION_DRAFT16,
+        )
+
+    def test_server_setup_d16(self):
+        assert moqt_message_serialization_versioned(
+            ServerSetup,
+            {'selected_version': None, 'parameters': {
+                SetupParamType.MAX_REQUEST_ID: 100,
+            }},
+            type_id=MOQTMessageType.SERVER_SETUP,
+            version=MOQT_VERSION_DRAFT16,
+        )
+
+    def test_client_setup_d14_still_works(self):
+        """Ensure d14 round-trip is unbroken."""
+        assert moqt_message_serialization_versioned(
+            ClientSetup,
+            {'versions': [0xff00000e], 'parameters': {
+                SetupParamType.MAX_REQUEST_ID: 100,
+            }},
+            type_id=MOQTMessageType.CLIENT_SETUP,
+            version=MOQT_VERSION_DRAFT14,
+        )
+
+
+class TestDraft16Subscribe:
+    """Draft-16 SUBSCRIBE/SUBSCRIBE_OK: fixed fields moved to params."""
+
+    def test_subscribe_d16(self):
+        assert moqt_message_serialization_versioned(
+            Subscribe,
+            {
+                'request_id': 0,
+                'track_namespace': (b'live', b'sports'),
+                'track_name': b'football',
+                'priority': 128,
+                'group_order': GroupOrder.ASCENDING,
+                'forward': 1,
+                'filter_type': FilterType.LATEST_OBJECT,
+                'parameters': {},
+            },
+            type_id=MOQTMessageType.SUBSCRIBE,
+            version=MOQT_VERSION_DRAFT16,
+        )
+
+    def test_subscribe_ok_d16(self):
+        assert moqt_message_serialization_versioned(
+            SubscribeOk,
+            {
+                'request_id': 0,
+                'track_alias': 42,
+                'expires': 300,
+                'group_order': GroupOrder.ASCENDING,
+                'content_exists': ContentExistsCode.EXISTS,
+                'largest_group_id': 50,
+                'largest_object_id': 200,
+                'parameters': {},
+                'track_extensions': {},
+            },
+            type_id=MOQTMessageType.SUBSCRIBE_OK,
+            version=MOQT_VERSION_DRAFT16,
+            skip_fields={'content_exists', 'track_extensions'},
+        )
+
+    def test_subscribe_d16_with_filter(self):
+        """SUBSCRIBE with ABSOLUTE_RANGE filter in params."""
+        assert moqt_message_serialization_versioned(
+            Subscribe,
+            {
+                'request_id': 2,
+                'track_namespace': (b'vod',),
+                'track_name': b'movie',
+                'priority': 255,
+                'group_order': GroupOrder.DESCENDING,
+                'forward': 2,
+                'filter_type': FilterType.ABSOLUTE_RANGE,
+                'start_group': 10,
+                'start_object': 5,
+                'end_group': 100,
+                'parameters': {},
+            },
+            type_id=MOQTMessageType.SUBSCRIBE,
+            version=MOQT_VERSION_DRAFT16,
+        )
+
+
+class TestDraft16Publish:
+    """Draft-16 PUBLISH/PUBLISH_OK: fixed fields moved to params + track extensions."""
+
+    def test_publish_d16_no_content(self):
+        assert moqt_message_serialization_versioned(
+            Publish,
+            {
+                'request_id': 1,
+                'track_namespace': (b'live', b'sports'),
+                'track_name': b'football',
+                'track_alias': 42,
+                'group_order': GroupOrder.ASCENDING,
+                'content_exists': ContentExistsCode.NO_CONTENT,
+                'forward': ForwardingPreference.SUBGROUP,
+                'parameters': {},
+                'track_extensions': {},
+            },
+            type_id=MOQTMessageType.PUBLISH,
+            version=MOQT_VERSION_DRAFT16,
+            skip_fields={'content_exists', 'track_extensions'},
+        )
+
+    def test_publish_d16_with_content(self):
+        assert moqt_message_serialization_versioned(
+            Publish,
+            {
+                'request_id': 2,
+                'track_namespace': (b'vod',),
+                'track_name': b'movie1',
+                'track_alias': 99,
+                'group_order': GroupOrder.DESCENDING,
+                'content_exists': ContentExistsCode.EXISTS,
+                'largest_group_id': 50,
+                'largest_object_id': 200,
+                'forward': ForwardingPreference.DATAGRAM,
+                'parameters': {},
+                'track_extensions': {},
+            },
+            type_id=MOQTMessageType.PUBLISH,
+            version=MOQT_VERSION_DRAFT16,
+            skip_fields={'content_exists', 'track_extensions'},
+        )
+
+    def test_publish_ok_d16(self):
+        assert moqt_message_serialization_versioned(
+            PublishOk,
+            {
+                'request_id': 1,
+                'forward': ForwardingPreference.SUBGROUP,
+                'priority': 128,
+                'group_order': GroupOrder.ASCENDING,
+                'filter_type': FilterType.LATEST_OBJECT,
+                'parameters': {},
+            },
+            type_id=MOQTMessageType.PUBLISH_OK,
+            version=MOQT_VERSION_DRAFT16,
+        )
+
+
+class TestDraft16Fetch:
+    """Draft-16 FETCH/FETCH_OK: priority/group_order moved to params."""
+
+    def test_fetch_d16(self):
+        assert moqt_message_serialization_versioned(
+            Fetch,
+            {
+                'request_id': 42,
+                'fetch_type': FetchType.FETCH,
+                'namespace': (b'live', b'sports'),
+                'track_name': b'football',
+                'subscriber_priority': 1,
+                'group_order': GroupOrder.ASCENDING,
+                'start_group': 10,
+                'start_object': 5,
+                'end_group': 20,
+                'end_object': 15,
+                'parameters': {},
+            },
+            type_id=MOQTMessageType.FETCH,
+            version=MOQT_VERSION_DRAFT16,
+        )
+
+    def test_fetch_ok_d16(self):
+        assert moqt_message_serialization_versioned(
+            FetchOk,
+            {
+                'request_id': 42,
+                'group_order': GroupOrder.ASCENDING,
+                'end_of_track': 0,
+                'largest_group_id': 50,
+                'largest_object_id': 200,
+                'parameters': {},
+                'track_extensions': {},
+            },
+            type_id=MOQTMessageType.FETCH_OK,
+            version=MOQT_VERSION_DRAFT16,
+            skip_fields={'track_extensions'},
+        )
+
+
+class TestDraft16Namespace:
+    """Draft-16 namespace messages: RequestID-based done/cancel."""
+
+    def test_publish_namespace_done_d16(self):
+        assert moqt_message_serialization_versioned(
+            PublishNamespaceDone,
+            {'request_id': 42},
+            type_id=MOQTMessageType.PUBLISH_NAMESPACE_DONE,
+            version=MOQT_VERSION_DRAFT16,
+            skip_fields={'namespace'},
+        )
+
+    def test_publish_namespace_cancel_d16(self):
+        assert moqt_message_serialization_versioned(
+            PublishNamespaceCancel,
+            {'request_id': 7, 'error_code': 0x10, 'reason': 'gone'},
+            type_id=MOQTMessageType.PUBLISH_NAMESPACE_CANCEL,
+            version=MOQT_VERSION_DRAFT16,
+            skip_fields={'namespace'},
+        )
+
+
+class TestDraft16NewMessages:
+    """Draft-16 new message types: RequestOk, RequestError, RequestUpdate,
+    Namespace, NamespaceDone."""
+
+    def test_request_ok(self):
+        assert moqt_message_serialization_versioned(
+            RequestOk,
+            {'request_id': 5, 'parameters': {ParamType.EXPIRES: 300}},
+            type_id=D16MessageType.REQUEST_OK,
+            version=MOQT_VERSION_DRAFT16,
+        )
+
+    def test_request_error(self):
+        assert moqt_message_serialization_versioned(
+            RequestError,
+            {'request_id': 5, 'error_code': 0x10,
+             'retry_interval': 1000, 'reason': 'does not exist'},
+            type_id=D16MessageType.REQUEST_ERROR,
+            version=MOQT_VERSION_DRAFT16,
+        )
+
+    def test_request_update(self):
+        assert moqt_message_serialization_versioned(
+            RequestUpdate,
+            {'request_id': 10, 'existing_request_id': 5,
+             'parameters': {ParamType.FORWARD: 1}},
+            type_id=D16MessageType.REQUEST_UPDATE,
+            version=MOQT_VERSION_DRAFT16,
+        )
+
+    def test_namespace(self):
+        assert moqt_message_serialization_versioned(
+            Namespace,
+            {'namespace_suffix': (b'live', b'sports')},
+            type_id=D16MessageType.NAMESPACE,
+            version=MOQT_VERSION_DRAFT16,
+        )
+
+    def test_namespace_done(self):
+        assert moqt_message_serialization_versioned(
+            NamespaceDone,
+            {'namespace_suffix': (b'live', b'sports')},
+            type_id=D16MessageType.NAMESPACE_DONE,
+            version=MOQT_VERSION_DRAFT16,
+        )

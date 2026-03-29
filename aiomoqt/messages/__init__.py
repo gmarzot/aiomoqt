@@ -6,6 +6,7 @@ from .subscribe import *
 from .publish import *
 from .fetch import *
 from .track import *
+from .request import *
 
 __all__ = [
     'MOQTMessage', 'MOQTMessageType', 'MOQTUnderflow', 'BUF_SIZE',
@@ -21,4 +22,7 @@ __all__ = [
     'Fetch', 'FetchObject', 'FetchOk', 'FetchError', 'FetchCancel',
     'SubgroupHeader', 'FetchHeader',
     'ObjectDatagram', 'ObjectDatagramStatus', 'ObjectHeader',
+    # Draft-16 new message types
+    'RequestOk', 'RequestError', 'RequestUpdate',
+    'Namespace', 'NamespaceDone',
 ]

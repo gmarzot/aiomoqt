@@ -23,12 +23,13 @@ class MOQTMessage:
     # type: Optional[int] = None - let subclass set it - annoying warnings
 
     @staticmethod
-    def _extensions_encode(buf: Buffer, exts: Dict) -> None:
+    def _extensions_encode(buf: Buffer, exts: Dict,
+                           with_length: bool = True) -> None:
         vers = get_moqt_ctx_version()
         major_version = get_major_version(vers)
-        # logger.debug(f"MOQTMessage._extensions_encode(): {vers} maj: {major_version}")
         if exts is None or len(exts) == 0:
-            buf.push_uint_var(0)
+            if with_length:
+                buf.push_uint_var(0)
             return
         
         if major_version > 8:
@@ -46,7 +47,8 @@ class MOQTMessage:
                     payload.push_bytes(ext_value)
 
             exts_len = payload.tell()
-            buf.push_uint_var(exts_len)
+            if with_length:
+                buf.push_uint_var(exts_len)
             buf.push_bytes(payload.data)
         else:
             buf.push_uint_var(len(exts))
@@ -63,27 +65,34 @@ class MOQTMessage:
 
     exts_err_count = 0
     @staticmethod
-    def _extensions_decode(buf: Buffer) -> Dict[int, Union[int, bytes]]:
+    def _extensions_decode(buf: Buffer, with_length: bool = True,
+                           buf_end: int = None) -> Dict[int, Union[int, bytes]]:
         exts = {}
-        exts_len = buf.pull_uint_var()
-        if exts_len > (1024*16):
-            global exts_err_count
-            exts_err_count += 1
-            logger.warning(f"MOQTMessage._extensions_decode(): corrupted buffer : ext_len: {exts_len} count: {exts_err_count}")
-            return exts
+        if with_length:
+            exts_len = buf.pull_uint_var()
+            if exts_len > (1024*16):
+                global exts_err_count
+                exts_err_count += 1
+                logger.warning(f"MOQTMessage._extensions_decode(): corrupted buffer : ext_len: {exts_len} count: {exts_err_count}")
+                return exts
+            if exts_len == 0:
+                return exts
+            exts_end = buf.tell() + exts_len
+        else:
+            # No length prefix — read until buf_end or buffer exhaustion
+            exts_end = buf_end if buf_end is not None else buf.capacity
 
-        if exts_len > 0:
-            pos = buf.tell()
-            exts_end = pos + exts_len
-            while buf.tell() < exts_end:
+        while buf.tell() < exts_end:
+            try:
                 ext_id = buf.pull_uint_var()
-                if ext_id % 2 == 0:  # even extension types are simple var int
+                if ext_id % 2 == 0:
                     ext_value = buf.pull_uint_var()
                 else:
                     value_len = buf.pull_uint_var()
                     ext_value = buf.pull_bytes(value_len)
                 exts[ext_id] = ext_value
-        # assert buf.tell() == exts_end, f"Payload length mismatch: {exts_len} {buf.tell()-pos}"
+            except BufferReadError:
+                break  # no more extensions to read
 
         return exts
           
@@ -231,17 +240,32 @@ class MOQTMessage:
             return f"0x{truncated}{suffix}"
     
     @staticmethod
-    def _serialize_params(payload: Buffer, parameters: Dict[int, Any]) -> None:
+    def _serialize_params(payload: Buffer, parameters: Dict[int, Any],
+                          delta_keys: bool = None) -> None:
         """
         Serialize parameters using Key-Value-Pair structure. Payload is modified in place.
-        
+
         Key-Value-Pair structure:
         - Even type: Type (varint) + Value (varint)
         - Odd type: Type (varint) + Length (varint) + Value (bytes)
+
+        If delta_keys=True (or auto-detected from draft-16+ context),
+        keys are sorted and written as deltas: key_on_wire = key - previous_key.
         """
+        if delta_keys is None:
+            from ..context import is_draft16_or_later
+            delta_keys = is_draft16_or_later()
+        if delta_keys:
+            # Sort by key for delta encoding
+            parameters = dict(sorted(parameters.items()))
         payload.push_uint_var(len(parameters))
+        prev_key = 0
         for param_type, param_value in parameters.items():
-            payload.push_uint_var(param_type)  # Type
+            if delta_keys:
+                payload.push_uint_var(param_type - prev_key)
+                prev_key = param_type
+            else:
+                payload.push_uint_var(param_type)  # Type
             
             if param_type % 2 == 1:  # Odd type - includes Length field
                 # Value is bytes or string
@@ -271,18 +295,30 @@ class MOQTMessage:
         logger.info(f"Serialized {len(parameters)} parameters: {payload.data_slice(0,12)}")
 
 
-    def _deserialize_params(buf: Buffer) -> Dict[int, Any]:
+    def _deserialize_params(buf: Buffer, delta_keys: bool = None) -> Dict[int, Any]:
         """
         Deserialize parameters using Key-Value-Pair structure.
+
+        If delta_keys=True (or auto-detected from draft-16+ context),
+        keys are delta-decoded.
 
         Returns:
             Dict mapping parameter type to value
         """
+        if delta_keys is None:
+            from ..context import is_draft16_or_later
+            delta_keys = is_draft16_or_later()
         params = {}
         param_count = buf.pull_uint_var()
-        
+        prev_key = 0
+
         for _ in range(param_count):
-            param_type = buf.pull_uint_var()
+            raw_key = buf.pull_uint_var()
+            if delta_keys:
+                param_type = prev_key + raw_key
+                prev_key = param_type
+            else:
+                param_type = raw_key
             
             if param_type % 2 == 1:  # Odd type - includes Length field
                 param_len = buf.pull_uint_var()

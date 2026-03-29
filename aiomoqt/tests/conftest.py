@@ -1,5 +1,7 @@
 from dataclasses import fields
 from aiomoqt.messages import MOQTMessageType
+from aiomoqt.context import set_moqt_ctx_version, get_moqt_ctx_version
+from aiomoqt.types import MOQT_VERSION_DRAFT14, MOQT_VERSION_DRAFT16
 
 
 def moqt_test_id(case):
@@ -71,3 +73,60 @@ def moqt_message_serialization(cls, params, type_id=None, needs_len=False):
             assert original_value == new_value, f"'{field.name}' doesn't match after deserialization"
     
     return True
+
+
+def moqt_message_serialization_versioned(cls, params, type_id=None,
+                                          needs_len=False, version=None,
+                                          skip_fields=None):
+    """Test serialization round-trip at a specific draft version.
+
+    Args:
+        version: MOQT version code (e.g. MOQT_VERSION_DRAFT16)
+        skip_fields: set of field names to skip comparison (e.g. fields
+                     that are None on wire in d16 but set in the input)
+    """
+    prev = get_moqt_ctx_version()
+    if version is not None:
+        set_moqt_ctx_version(version)
+    try:
+        obj = cls(**params)
+        buf = obj.serialize()
+        buf_len = buf.tell()
+        buf.seek(0)
+
+        if type_id is not None:
+            id = buf.pull_uint_var()
+            assert id == type_id
+            # All control messages have uint16 length after type
+            msg_len = buf.pull_uint16()
+
+        if needs_len:
+            new_obj = cls.deserialize(buf, buf_len)
+        else:
+            new_obj = cls.deserialize(buf)
+
+        skip = skip_fields or set()
+        for field in fields(cls):
+            if field.name in skip:
+                continue
+            original_value = getattr(obj, field.name)
+            new_value = getattr(new_obj, field.name)
+            if original_value is None and new_value is None:
+                continue
+            if isinstance(original_value, dict):
+                assert (original_value or {}).keys() == (new_value or {}).keys(), \
+                    f"`{field.name}` keys don't match"
+                for key in (original_value or {}):
+                    assert original_value[key] == new_value[key], \
+                        f"`{field.name}` values don't match for key {key}"
+            elif isinstance(original_value, tuple):
+                assert isinstance(new_value, tuple)
+                assert len(original_value) == len(new_value)
+                for a, b in zip(original_value, new_value):
+                    assert a == b, f"'{field.name}' tuple mismatch"
+            else:
+                assert original_value == new_value, \
+                    f"'{field.name}' doesn't match: {original_value} != {new_value}"
+        return True
+    finally:
+        set_moqt_ctx_version(prev)

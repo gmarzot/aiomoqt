@@ -18,10 +18,9 @@ from qh3.quic.configuration import QuicConfiguration
 from qh3.asyncio.server import serve
 from qh3.h3.connection import H3_ALPN
 
-from aiomoqt.types import MOQTMessageType, ParamType
+from aiomoqt.types import MOQTMessageType, ParamType, MOQTRequestError
 from aiomoqt.client import MOQTClient
 from aiomoqt.protocol import MOQTPeer, MOQTSession
-from aiomoqt.messages import SubscribeError, SubscribeNamespaceError
 from aiomoqt.utils.logger import set_log_level, get_logger
 from aiomoqt.examples.bench_pub import (
     subscribe_data_generator,
@@ -157,16 +156,13 @@ async def run_subscriber(args, stats):
 
             await session.client_session_init()
 
-            resp = await session.subscribe_namespace(
+            await session.subscribe_namespace(
                 namespace_prefix="bench",
                 parameters={ParamType.AUTH_TOKEN: b"bench"},
                 wait_response=True,
             )
-            if isinstance(resp, SubscribeNamespaceError):
-                print(f"  SubscribeNamespace error: {resp}")
-                return
 
-            resp = await session.subscribe(
+            await session.subscribe(
                 namespace="bench",
                 track_name="track",
                 parameters={
@@ -174,9 +170,6 @@ async def run_subscriber(args, stats):
                 },
                 wait_response=True,
             )
-            if isinstance(resp, SubscribeError):
-                print(f"  Subscribe error: {resp}")
-                return
 
             print("  Subscriber connected, receiving...\n")
 
