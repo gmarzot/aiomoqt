@@ -901,7 +901,8 @@ class MOQTSession(QuicConnectionProtocol):
             logger.info(f"MOQT: QUIC control stream created stream id: {self._control_stream_id}")
             
             # CLIENT_SETUP parameters for raw QUIC (include PATH/AUTHORITY)
-            params[SetupParamType.PATH] = f"/{self._session.endpoint}"
+            endpoint = self._session.endpoint or ""
+            params[SetupParamType.PATH] = f"/{endpoint}"
             params[SetupParamType.AUTHORITY] = f"{self._session.host}:{self._session.port}"
         else:
             # WebTransport over H3 flow

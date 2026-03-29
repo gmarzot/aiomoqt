@@ -238,7 +238,6 @@ examples:
     parser.add_argument(
         '-Q', '--force-quic', action='store_true',
         help='Force raw QUIC even for https:// URLs')
-    parser.add_argument(
     import time
     _ts = hex(int(time.time()) // 60 & 0xFFF)[2:]
     parser.add_argument(
@@ -297,14 +296,6 @@ async def run(args):
 
             try:
                 await session.client_session_init()
-
-                await session.subscribe_namespace(
-                    namespace_prefix=args.namespace,
-                    parameters={
-                        ParamType.AUTH_TOKEN: b"bench-token",
-                    },
-                    wait_response=True,
-                )
 
                 await session.subscribe(
                     namespace=args.namespace,
