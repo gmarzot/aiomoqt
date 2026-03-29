@@ -1187,39 +1187,12 @@ class MOQTSession(QuicConnectionProtocol):
         if not wait_response:
             return message
 
-        # Create future for response
-        subscribe_fut = self._loop.create_future()
-        self._subscribe_responses[request_id] = subscribe_fut        
-
-        fetch_fut = self._loop.create_future()
-        self._fetch_responses[fetch_request_id] = fetch_fut
-
-        async def wait_for_response():
-            try:
-                async with asyncio.timeout(10):
-                    sub_response = await subscribe_fut
-                    
-                async with asyncio.timeout(10):
-                    fetch_response = await fetch_fut
-
-            except asyncio.TimeoutError:
-                # Create synthetic error response
-                response = SubscribeError(
-                    request_id=request_id,
-                    error_code=0x5,  # TIMEOUT error code
-                    reason="Subscribe Response Timeout",
-                )
-                logger.error(f"Timeout waiting for subscribe response")
-                sub_response = response if sub_response is None else sub_response
-                fetch_response = response if fetch_response is None else fetch_response
-            finally:
-                logger.debug(f"MOQT: removing subscribe response future: {request_id}")
-                self._subscribe_responses.pop(request_id, None)    
-                self._fetch_responses.pop(fetch_request_id, None)
-                
+        async def wait_for_both():
+            sub_response = await self._await_response(request_id)
+            fetch_response = await self._await_response(fetch_request_id)
             return sub_response, fetch_response
 
-        return wait_for_response()
+        return wait_for_both()
 
     def fetch(
         self,
