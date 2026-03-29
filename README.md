@@ -4,39 +4,52 @@
 
 ## Overview
 
-This package implements the [MoQT Specification](https://moq-wg.github.io/moq-transport/draft-ietf-moq-transport.html) (**draft-14**). It is designed for general use as an MoQT client and server library, supporting both 'publish' and 'subscribe' roles.
+This package implements the [MoQT Specification](https://moq-wg.github.io/moq-transport/draft-ietf-moq-transport.html) with **dual draft-14 and draft-16 support**. It is designed for general use as an MoQT client and server library, supporting both 'publish' and 'subscribe' roles.
 
 The architecture follows the [asyncio.Protocol](https://docs.python.org/3/library/asyncio-protocol.html) design pattern, and extends the [qh3 QuicConnectionProtocol](https://pypi.org/project/qh3/).
 
 ### Features
 
-- Full draft-14 protocol compliance (all message types, enums, wire formats)
+- **Dual draft-14/draft-16 support** — version-conditional serialization following moxygen's branching pattern
+- ALPN-based version negotiation (`moq-00` for draft-14, `moqt-16` for draft-16)
 - Supports H3/WebTransport and raw QUIC transports
 - Async context manager support for session connection management
-- Supports asynchronous and awaitable synchronous calls via an optional flag
+- Version-agnostic user API: `MOQTRequestError` exception (no isinstance checks needed)
 - High-level API for control messages with default and custom response handlers
 - Low-level API for control and data message serialization/deserialization
-- SubgroupHeader stream variants (0x10-0x1D) with flag encoding
-- ObjectDatagram variants (0x00-0x07, 0x20-0x21) with flag encoding
+- Draft-16 features: delta-encoded parameter keys, track extensions, unified REQUEST_OK/REQUEST_ERROR
+- SubgroupHeader stream variants with flag encoding
+- ObjectDatagram variants with flag encoding
 - Delta-encoded object IDs in subgroup streams
 - Interop test client implementing the [moq-interop-runner](https://github.com/englishm/moq-interop-runner) test cases
+- Relay version probe tool (`relay_probe.py`)
 
 ## Interop Test Results
 
-All 6 standard [moq-interop-runner](https://github.com/englishm/moq-interop-runner) test cases pass against multiple relay implementations:
+All 6 standard [moq-interop-runner](https://github.com/englishm/moq-interop-runner) test cases pass against multiple relay implementations on both draft-14 and draft-16:
 
-| Relay | Transport | Tests | Result |
-|-------|-----------|-------|--------|
-| Cloudflare moq-rs (draft-14) | Raw QUIC | 6/6 | PASS |
-| Meta moxygen (draft-14) | Raw QUIC | 6/6 | PASS |
-| Meta moxygen (draft-14) | WebTransport | 6/6 | PASS |
+| Relay | Draft | Transport | Tests | Result |
+|-------|-------|-----------|-------|--------|
+| OpenMoQ moxygen | draft-16 | Raw QUIC | 6/6 | PASS |
+| OpenMoQ moxygen | draft-14 | Raw QUIC | 6/6 | PASS |
+| Meta moxygen (`fb.mvfst.net`) | draft-16 | Raw QUIC | 6/6 | PASS |
+| Meta moxygen (`fb.mvfst.net`) | draft-14 | Raw QUIC | 6/6 | PASS |
+| Cloudflare moq-rs | draft-14 | Raw QUIC | 6/6 | PASS |
+| Red5 Pro | draft-14 | Raw QUIC | 6/6 | PASS |
+| Red5 Pro | draft-14 | WebTransport | 6/6 | PASS |
+| Quicr (libquicr) | draft-14 | Raw QUIC | 5/6 | PASS |
 
 Test cases: `setup-only`, `announce-only`, `publish-namespace-done`, `subscribe-error`, `announce-subscribe`, `subscribe-before-announce`
 
 ```bash
-# Run interop tests
-python -m aiomoqt.examples.moq_interop_client -r "moqt://draft-14.cloudflare.mediaoverquic.com:443"
-python -m aiomoqt.examples.moq_interop_client -r "moqt://fb.mvfst.net:9448"
+# Run interop tests (draft-14, auto-detected)
+python -m aiomoqt.examples.moq_interop_client -r "moqt://moqx-000.ci.openmoq.org:4433"
+
+# Run interop tests (draft-16, explicit)
+python -m aiomoqt.examples.moq_interop_client -r "moqt://moqx-000.ci.openmoq.org:4433" --draft 16
+
+# Probe relay for supported versions
+python -m aiomoqt.examples.relay_probe
 ```
 
 ## Installation
@@ -60,21 +73,23 @@ uv pip install aiomoqt
 ```python
 import asyncio
 from aiomoqt.client import MOQTClient
+from aiomoqt.types import MOQTRequestError
 
 async def main():
-    client = MOQTClient('localhost', 4433, endpoint='moq')
+    client = MOQTClient('relay.example.com', 4433,
+                        endpoint='moq', use_quic=True)
 
     async with client.connect() as session:
         try:
             await session.client_session_init()
-            response = await session.subscribe(
-                'namespace',
-                'track_name',
-                wait_response=True
+            await session.subscribe(
+                'namespace', 'track_name',
+                wait_response=True,
             )
             # wait for session close, process data and control messages
             await session.async_closed()
-        except Exception as e:
+        except MOQTRequestError as e:
+            print(f"Request error: {e.error_code} {e.reason}")
             session.close()
 
 asyncio.run(main())
@@ -97,6 +112,8 @@ See `aiomoqt/examples/` for complete working examples:
 | `bench_pub.py` | High-performance publisher with configurable parameters |
 | `bench_sub.py` | Subscriber with latency/jitter/loss statistics |
 | `server_example.py` | WebTransport server (origin) |
+| `relay_probe.py` | Relay version probe — detects draft-14/16 support |
+| `moq_interop_client.py` | Interop test client (6 standard test cases, `--draft` flag) |
 | `moq_interop_client.py` | Interop test client (6 standard test cases, TAP14 output) |
 
 ## Development
