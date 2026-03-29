@@ -18,12 +18,11 @@ import math
 import time
 
 from aiomoqt.types import (
-    ParamType, MOQTException,
+    ParamType, MOQTException, MOQTRequestError,
     MOQT_TIMESTAMP_EXT, ObjectStatus,
 )
 from aiomoqt.client import MOQTClient
 from aiomoqt.messages import (
-    SubscribeError, SubscribeNamespaceError,
     ObjectHeader, ObjectDatagram,
 )
 from aiomoqt.utils.logger import set_log_level, get_logger
@@ -296,18 +295,15 @@ async def run(args):
             try:
                 await session.client_session_init()
 
-                resp = await session.subscribe_namespace(
+                await session.subscribe_namespace(
                     namespace_prefix=args.namespace,
                     parameters={
                         ParamType.AUTH_TOKEN: b"bench-token",
                     },
                     wait_response=True,
                 )
-                if isinstance(resp, SubscribeNamespaceError):
-                    raise MOQTException(
-                        resp.error_code, resp.reason)
 
-                resp = await session.subscribe(
+                await session.subscribe(
                     namespace=args.namespace,
                     track_name=args.trackname,
                     parameters={
@@ -317,9 +313,6 @@ async def run(args):
                     },
                     wait_response=True,
                 )
-                if isinstance(resp, SubscribeError):
-                    raise MOQTException(
-                        resp.error_code, resp.reason)
 
                 print("  Subscribed, receiving...\n")
 
@@ -331,6 +324,9 @@ async def run(args):
                 except asyncio.TimeoutError:
                     pass
 
+            except MOQTRequestError as e:
+                print(f"  Request error: {e}")
+                session.close()
             except MOQTException as e:
                 print(f"  MoQT error: {e}")
                 session.close(

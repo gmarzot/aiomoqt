@@ -4,9 +4,8 @@ import asyncio
 import argparse
 import logging
 
-from aiomoqt.types import ParamType, MOQTException
+from aiomoqt.types import ParamType, MOQTException, MOQTRequestError
 from aiomoqt.client import MOQTClient
-from aiomoqt.messages import SubscribeError, SubscribeNamespaceError
 from aiomoqt.utils.logger import *
 
 
@@ -45,17 +44,13 @@ async def main(host: str, port: int, endpoint: str, namespace: str, track_name: 
             try:
                 response = await session.client_session_init()
 
-                response = await session.subscribe_namespace(
+                await session.subscribe_namespace(
                     namespace_prefix=namespace,
                     parameters={ParamType.AUTH_TOKEN: b"auth-token-123"},
                     wait_response=True
                 )
 
-                if isinstance(response, SubscribeNamespaceError):
-                    logger.error(f"MOQT app: {response}")
-                    raise MOQTException(response.error_code, response.reason)
-
-                response = await session.subscribe(
+                await session.subscribe(
                     namespace=namespace,
                     track_name=track_name,
                     parameters={
@@ -65,14 +60,14 @@ async def main(host: str, port: int, endpoint: str, namespace: str, track_name: 
                     },
                     wait_response=True
                 )
-                if isinstance(response, SubscribeError):
-                    logger.error(f"MOQT app: {response}")
-                    raise MOQTException(response.error_code, response.reason)
 
                 # process subscription - publisher will open stream and send data
                 await session.async_closed()
                 logger.info(f"MOQT app: exiting client session")
 
+            except MOQTRequestError as e:
+                logger.error(f"MOQT app: request error: {e}")
+                session.close()
             except MOQTException as e:
                 logger.error(f"MOQT app: session exception: {e}")
                 session.close(e.error_code, e.reason_phrase)
