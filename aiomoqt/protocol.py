@@ -660,24 +660,27 @@ class MOQTSession(QuicConnectionProtocol):
 
                 # Handle MoQT data streams (unidirectional only)
                 if stream_is_unidirectional(stream_id):
-                    # For new streams, peek first byte to detect H3 internal
-                    # streams (SETTINGS=0x00, QPACK_ENC=0x02, QPACK_DEC=0x03)
-                    # and pass those to H3 handler below instead
+                    # For WebTransport streams, peek first byte to detect H3
+                    # internal streams (SETTINGS=0x00, QPACK_ENC=0x02,
+                    # QPACK_DEC=0x03) and pass those to H3 handler below.
+                    # Raw QUIC has no H3 framing — skip this check.
                     is_h3_internal = (
-                        stream_id not in self._data_streams
+                        self._h3 is not None
+                        and stream_id not in self._data_streams
                         and msg_len >= 1
                         and event.data[0] in (0x00, 0x02, 0x03)
                     )
                     if not is_h3_internal:
                         if stream_id not in self._data_streams:
                             logger.debug(f"MOQT event: new data stream: id: {stream_id} {msg_len} bytes")
-                            # strip WT 2-varint stream header
-                            try:
-                                msg_buf.pull_uint_var()
-                                msg_buf.pull_uint_var()
-                            except BufferReadError:
-                                logger.error(f"MOQT error: data stream({stream_id}) parse fail at: {msg_buf.tell()}")
-                                return
+                            # Strip WT 2-varint stream header (WebTransport only)
+                            if self._h3 is not None:
+                                try:
+                                    msg_buf.pull_uint_var()
+                                    msg_buf.pull_uint_var()
+                                except BufferReadError:
+                                    logger.error(f"MOQT error: data stream({stream_id}) parse fail at: {msg_buf.tell()}")
+                                    return
                             self._data_streams[stream_id] = None
                             assert stream_id not in self._stream_tasks
                             task = asyncio.create_task(self._process_data_stream(stream_id))

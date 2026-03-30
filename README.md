@@ -250,11 +250,13 @@ Test cases: `setup-only`, `announce-only`, `publish-namespace-done`,
 ```bash
 git clone https://github.com/gmarzot/aiomoqt.git
 cd aiomoqt
-./bootstrap_python.sh
-source .venv/bin/activate
-uv pip install -e ".[test]"
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e ".[test]"
 pytest aiomoqt/tests/
 ```
+
+Optionally, `./bootstrap_python.sh` sets up a full uv-managed environment
+with a specific Python version and Cython.
 
 ## TODO
 

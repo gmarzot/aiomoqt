@@ -10,7 +10,9 @@ COLOR_RED="\033[0;31m"
 COLOR_OFF="\033[0m"
 
 $ECHO "${COLOR_GREEN}Setting up Python/Cython test environment... ${COLOR_OFF}"
-PYTHON_VERSION="3.14t"  # Free-threaded build (nogil, PEP 779)
+PYTHON_VERSION="3.14"
+# Dev option: free-threaded build for aiopquic work
+#PYTHON_VERSION="3.14t"  # Free-threaded build (nogil, PEP 779)
 CYTHON_VERSION="3.2.4"  # Full free-threading support (pymutex, critical sections)
 
 PLATFORM="$(uname -s)"
