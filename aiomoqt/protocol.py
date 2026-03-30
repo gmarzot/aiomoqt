@@ -111,6 +111,7 @@ class MOQTSession(QuicConnectionProtocol):
         self._control_stream_id: Optional[int] = None
         self._loop = asyncio.get_running_loop()
         self._wt_session_setup: Future[bool] = self._loop.create_future()
+        self._wt_selected_protocol: Optional[str] = None
         self._moqt_version: int = MOQT_CUR_VERSION
         self._moqt_session_setup: Future[bool] = self._loop.create_future()
         self._moqt_session_closed: Future[Tuple[int,str]] = self._loop.create_future()
@@ -786,6 +787,12 @@ class MOQTSession(QuicConnectionProtocol):
                 
         if is_client:
             if status == b"200":
+                # Capture WT protocol negotiation result
+                # Server may use wt-protocol or wt-selected-protocol
+                for name, value in event.headers:
+                    if name in (b"wt-protocol", b"wt-selected-protocol"):
+                        self._wt_selected_protocol = value.decode().strip('"')
+                        logger.info(f"H3 event: {name.decode()}: {self._wt_selected_protocol}")
                 logger.debug(f"H3 event: WebTransport client session setup: session id: {stream_id}")
                 self._wt_session_setup.set_result(True)
             else:
@@ -857,27 +864,41 @@ class MOQTSession(QuicConnectionProtocol):
         if not self._moqt_session_closed.done():
             self._moqt_session_closed.set_result((error_code, reason_phrase))
         
-    def close(self, 
-              error_code: SessionCloseCode = SessionCloseCode.NO_ERROR, 
+    def close(self,
+              error_code: SessionCloseCode = SessionCloseCode.NO_ERROR,
               reason_phrase: str = "no error"
         ) -> None:
         """Session Protocol Close"""
         if self._close_err is not None:
-            error_code, reason_phrase =  self._close_err
+            error_code, reason_phrase = self._close_err
         logger.info(f"MOQT session: closing: {reason_phrase} ({error_code})")
-        if self._session_id is not None:
-            self._h3._quic.close(QuicErrorCode.NO_ERROR)
-            logger.debug(f"H3 session: closing: {class_name(self._h3)} ({self._session_id})  QUIC: {self._h3._is_done}")
-            if not self._h3._is_done:
-                self._h3.send_data(self._session_id, b"", end_stream=True)
+
+        # Gracefully FIN open streams before closing the connection
+        try:
+            # FIN the control stream
+            if self._control_stream_id is not None:
+                self._quic.send_stream_data(
+                    self._control_stream_id, b"", end_stream=True)
+                self._control_stream_id = None
+
+            # FIN any open data streams
+            for stream_id in list(self._data_streams.keys()):
+                self._quic.send_stream_data(
+                    stream_id, b"", end_stream=True)
+            self._data_streams.clear()
+        except Exception:
+            pass  # best-effort during teardown
+
+        if self._h3 is not None and self._session_id is not None:
+            logger.debug(f"H3 session: closing: {class_name(self._h3)} "
+                         f"({self._session_id})")
             self._session_id = None
-        # drop H3 session
         self._h3 = None
+
         # set the async exit condition for session
         if not self._moqt_session_closed.done():
             self._moqt_session_closed.set_result((error_code, reason_phrase))
-        # call parent close and transmit all
-        #super().close(error_code=error_code, reason_phrase=reason_phrase)
+        # close QUIC connection and transmit
         super().close()
         self.transmit()
         
@@ -913,6 +934,8 @@ class MOQTSession(QuicConnectionProtocol):
             # Create WebTransport session
             host = self._session.host
             port = self._session.port
+            # Build WT CONNECT headers
+            draft = getattr(self._session, 'draft_version', None)
             headers = [
                 (b":method", b"CONNECT"),
                 (b":scheme", b"https"),
@@ -920,17 +943,24 @@ class MOQTSession(QuicConnectionProtocol):
                 (b":path", f"/{self._session.endpoint}".encode()),
                 (b":protocol", b"webtransport"),
                 (b"sec-webtransport-http3-draft", b"draft02"),
-                (b"wt-available-protocols", MOQT_ALPN.encode()),
                 (b"user-agent", USER_AGENT.encode()),
             ]
+            # For draft-15+, include wt-available-protocols to negotiate
+            # the MoQT version over WT. RFC 8941 quoted string.
+            # For draft-14 (moq-00), omit — version negotiation is in-band.
+            if draft is not None and draft >= 15:
+                wt_proto = moqt_alpn_for_version(draft)
+                headers.append(
+                    (b"wt-available-protocols", f'"{wt_proto}"'.encode()),
+                )
 
             logger.info(f"H3 send: WebTransport CONNECT: session id: {self._session_id}")
             for name, value in headers:
                 logger.debug(f"  {name.decode()}: {value.decode()}")
-                
+
             self._h3.send_headers(stream_id=self._session_id, headers=headers, end_stream=False)
             self.transmit()
-        
+
             # Wait for WebTransport session establishment
             try:
                 async with asyncio.timeout(timeout):
@@ -946,7 +976,22 @@ class MOQTSession(QuicConnectionProtocol):
             # Check for H3 connection close
             if self._close_err is not None:
                 raise MOQTException(*self._close_err)
-            
+
+            # Set version context based on WT protocol negotiation
+            if self._wt_selected_protocol:
+                # Server negotiated a specific MoQT version via WT
+                version = moqt_version_from_alpn(self._wt_selected_protocol)
+                set_moqt_ctx_version(version)
+                self._moqt_version = version
+                logger.info(f"MOQT: version set from WT protocol: "
+                            f"{self._wt_selected_protocol} -> 0x{version:x}")
+            elif draft is not None:
+                # Server didn't echo protocol — fall back to d14 in-band
+                logger.info(f"MOQT: WT protocol not negotiated, "
+                            f"falling back to in-band version negotiation")
+                set_moqt_ctx_version(MOQT_VERSION_DRAFT14)
+                self._moqt_version = MOQT_VERSION_DRAFT14
+
             # Create MoQT control stream
             self._control_stream_id = self._h3.create_webtransport_stream(session_id=self._session_id)
             logger.info(f"MOQT: WT control stream created stream id: {self._control_stream_id}")
@@ -954,8 +999,17 @@ class MOQTSession(QuicConnectionProtocol):
         # Send CLIENT_SETUP
         params[SetupParamType.MAX_REQUEST_ID] = 10000
         params[SetupParamType.IMPLEMENTATION] = USER_AGENT.encode()
+        # For raw QUIC with explicit draft: single version
+        # For H3/WT: version list depends on whether WT protocol was negotiated
+        #   - negotiated: is_draft16_or_later() is set, no version array needed
+        #   - not negotiated: d14 format, include version array
+        draft = getattr(self._session, 'draft_version', None)
+        if use_quic and draft is not None:
+            versions = [moqt_version_from_alpn(moqt_alpn_for_version(draft))]
+        else:
+            versions = MOQT_VERSIONS
         client_setup = self.client_setup(
-            versions=MOQT_VERSIONS,
+            versions=versions,
             parameters=params
         )
 

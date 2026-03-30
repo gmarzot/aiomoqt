@@ -37,8 +37,9 @@ class MOQTClient(MOQTPeer):  # New connection manager class
         self.debug = debug
         self.draft_version = draft_version
 
-        # Set the global version context if explicitly requested
-        if draft_version is not None:
+        # For raw QUIC, set version context now (ALPN carries the version).
+        # For H3/WT, defer until wt-available-protocols negotiation completes.
+        if draft_version is not None and use_quic:
             set_moqt_ctx_version(draft_version)
 
         logger.debug(f"MOQT: client session: {self} use_quic={use_quic} endpoint={endpoint}")

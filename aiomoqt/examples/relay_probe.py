@@ -227,4 +227,23 @@ async def run_loop():
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog="python -m aiomoqt.examples.relay_probe",
+        description="MOQ relay probe — probes relays for liveness and draft version support.",
+        epilog="""environment variables:
+  RELAYS_FILE      path to relay list JSON (default: /app/relays.json)
+  OUTPUT_FILE      status JSON output path (default: /output/relay-status.json)
+  PROBE_TIMEOUT    per-probe timeout in seconds (default: 8)
+  PROBE_INTERVAL   seconds between probe cycles (default: 300)
+  PROBE_ONCE       set "1" for single run then exit (default: loop)
+
+Reads RELAYS_FILE for relay definitions. If not found, uses built-in
+defaults (OpenMoQ, Meta moxygen, Cloudflare). Each relay endpoint is
+probed for draft-16 and draft-14 support. Results are written as JSON
+to OUTPUT_FILE.
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.parse_args()
     asyncio.run(run_loop())
