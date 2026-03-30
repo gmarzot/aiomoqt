@@ -161,26 +161,48 @@ async def probe_relay(relay):
     }
 
 
-async def probe_all(relays):
-    """Probe all relays in parallel."""
-    logger.info(f"Probing {len(relays)} relays...")
-    tasks = [probe_relay(relay) for relay in relays]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+async def probe_all(relays, last_probed, cached_results):
+    """Probe relays in parallel, honoring per-relay interval."""
+    now = time.monotonic()
+    to_probe = []
+    skipped = []
+    for relay in relays:
+        rid = relay.get("id", relay.get("name", "unknown"))
+        interval = relay.get("interval", PROBE_INTERVAL)
+        elapsed = now - last_probed.get(rid, 0)
+        if elapsed >= interval:
+            to_probe.append(relay)
+        else:
+            remaining = int(interval - elapsed)
+            logger.debug(f"Skipping {rid}: next probe in {remaining}s")
+            skipped.append(relay)
+
+    if to_probe:
+        logger.info(f"Probing {len(to_probe)} relays "
+                     f"({len(skipped)} skipped)...")
+        tasks = [probe_relay(relay) for relay in to_probe]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for relay, result in zip(to_probe, results):
+            rid = relay.get("id", relay.get("name", "unknown"))
+            last_probed[rid] = time.monotonic()
+            if isinstance(result, Exception):
+                cached_results[rid] = {
+                    "name": rid, "live": False, "error": str(result),
+                }
+            else:
+                cached_results[rid] = result
+    else:
+        logger.debug("All relays within their probe interval, skipping")
 
     report = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "relays": {},
     }
-    for relay, result in zip(relays, results):
+    for relay in relays:
         rid = relay.get("id", relay.get("name", "unknown"))
-        if isinstance(result, Exception):
-            report["relays"][rid] = {
-                "name": rid,
-                "live": False,
-                "error": str(result),
-            }
-        else:
-            report["relays"][rid] = result
+        if rid in cached_results:
+            report["relays"][rid] = cached_results[rid]
 
     up = sum(1 for r in report["relays"].values() if r.get("live"))
     logger.info(f"Done: {up}/{len(relays)} live")
@@ -199,7 +221,8 @@ async def run_loop():
                 {"url": "moqt://moqx-000.ci.openmoq.org:4433"},
                 {"url": "https://moqx-000.ci.openmoq.org:4433/moq-relay"},
             ]},
-            {"id": "moxygen", "name": "Moxygen/Meta", "endpoints": [
+            {"id": "moxygen", "name": "Moxygen/Meta", "interval": 120,
+             "endpoints": [
                 {"url": "moqt://fb.mvfst.net:9448"},
             ]},
             {"id": "cloudflare", "name": "Cloudflare", "endpoints": [
@@ -208,9 +231,11 @@ async def run_loop():
         ]
 
     once = os.getenv("PROBE_ONCE", "").lower() in ("1", "true", "yes")
+    last_probed = {}  # relay_id -> monotonic time of last probe
+    cached_results = {}  # relay_id -> last probe result
 
     while True:
-        report = await probe_all(relays)
+        report = await probe_all(relays, last_probed, cached_results)
 
         out = Path(OUTPUT_FILE)
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -242,6 +267,10 @@ Reads RELAYS_FILE for relay definitions. If not found, uses built-in
 defaults (OpenMoQ, Meta moxygen, Cloudflare). Each relay endpoint is
 probed for draft-16 and draft-14 support. Results are written as JSON
 to OUTPUT_FILE.
+
+Relays may specify a per-relay "interval" (seconds) in relays.json
+to override PROBE_INTERVAL for that relay. Cached results are used
+between probes.
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
