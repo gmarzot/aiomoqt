@@ -975,6 +975,17 @@ class MOQTSession(QuicConnectionProtocol):
 
 
 
+    def open_uni_stream(self) -> int:
+        """Open a unidirectional data stream. Returns the stream ID."""
+        if self._h3 is not None:
+            return self._h3.create_webtransport_stream(
+                session_id=self._session_id, is_unidirectional=True)
+        return self._quic.get_next_available_stream_id(is_unidirectional=True)
+
+    def stream_write(self, stream_id: int, data: bytes, end_stream: bool = False) -> None:
+        """Write data to a stream."""
+        self._quic.send_stream_data(stream_id, data, end_stream=end_stream)
+
     def send_control_message(self, buf: Buffer) -> None:
         """Send a MoQT message on the control stream."""
         if self._quic is None or self._control_stream_id is None:
