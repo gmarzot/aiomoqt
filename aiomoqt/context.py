@@ -1,16 +1,16 @@
-import contextvars
 from aiomoqt.types import MOQT_CUR_VERSION
 
-# Per-task version context — each asyncio task (session, probe) gets
-# its own version without leaking to other concurrent sessions.
-_moqt_version: contextvars.ContextVar[int] = contextvars.ContextVar(
-    'moqt_version', default=MOQT_CUR_VERSION)
+# Global version context. Set per-session before serialization/parsing.
+# Note: for concurrent sessions (e.g. relay probe), callers must
+# set this before each session's setup sequence.
+moqt_version = MOQT_CUR_VERSION
 
 def get_moqt_ctx_version() -> int:
-    return _moqt_version.get()
+    return moqt_version
 
 def set_moqt_ctx_version(version: int = MOQT_CUR_VERSION) -> int:
-    _moqt_version.set(version)
+    global moqt_version
+    moqt_version = version
     return version
 
 def get_major_version(version: int) -> int:
@@ -30,5 +30,5 @@ def is_draft16_or_later(version: int = None) -> bool:
     of `getDraftMajorVersion(version) >= 16`.
     """
     if version is None:
-        version = _moqt_version.get()
+        version = moqt_version
     return get_major_version(version) >= 16
