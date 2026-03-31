@@ -873,19 +873,19 @@ class MOQTSession(QuicConnectionProtocol):
             error_code, reason_phrase = self._close_err
         logger.info(f"MOQT session: closing: {reason_phrase} ({error_code})")
 
-        # Gracefully FIN open streams before closing the connection
+        # Gracefully FIN open streams before closing the connection.
+        # Transmit FINs separately so they don't get batched with
+        # CONNECTION_CLOSE (which causes reset_stream on the peer).
         try:
-            # FIN the control stream
             if self._control_stream_id is not None:
                 self._quic.send_stream_data(
                     self._control_stream_id, b"", end_stream=True)
                 self._control_stream_id = None
-
-            # FIN any open data streams
             for stream_id in list(self._data_streams.keys()):
                 self._quic.send_stream_data(
                     stream_id, b"", end_stream=True)
             self._data_streams.clear()
+            self.transmit()  # flush FINs before CONNECTION_CLOSE
         except Exception:
             pass  # best-effort during teardown
 
@@ -898,7 +898,7 @@ class MOQTSession(QuicConnectionProtocol):
         # set the async exit condition for session
         if not self._moqt_session_closed.done():
             self._moqt_session_closed.set_result((error_code, reason_phrase))
-        # close QUIC connection and transmit
+        # close QUIC connection
         super().close()
         self.transmit()
         
@@ -947,7 +947,8 @@ class MOQTSession(QuicConnectionProtocol):
             ]
             # For draft-15+, include wt-available-protocols to negotiate
             # the MoQT version over WT. RFC 8941 quoted string.
-            # For draft-14 (moq-00), omit — version negotiation is in-band.
+            # Draft-14 predates this header — version negotiation is
+            # entirely in-band via CLIENT_SETUP version array.
             if draft is not None and draft >= 15:
                 wt_proto = moqt_alpn_for_version(draft)
                 headers.append(
