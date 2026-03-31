@@ -949,7 +949,7 @@ class MOQTSession(QuicConnectionProtocol):
             # the MoQT version over WT. RFC 8941 quoted string.
             # Draft-14 predates this header — version negotiation is
             # entirely in-band via CLIENT_SETUP version array.
-            if draft is not None and draft >= 15:
+            if draft is not None and get_major_version(draft) >= 15:
                 wt_proto = moqt_alpn_for_version(draft)
                 headers.append(
                     (b"wt-available-protocols", f'"{wt_proto}"'.encode()),

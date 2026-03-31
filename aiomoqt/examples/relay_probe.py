@@ -38,10 +38,12 @@ PROBE_INTERVAL = int(os.getenv("PROBE_INTERVAL", "300"))
 RELAYS_FILE = os.getenv("RELAYS_FILE", "/app/relays.json")
 OUTPUT_FILE = os.getenv("OUTPUT_FILE", "/output/relay-status.json")
 
-# Draft versions to probe, newest first
+# Draft versions to probe, oldest first — d14 bare WT CONNECT must
+# run before d16 (which sends wt-available-protocols) to avoid
+# relay state issues on sequential probes to the same endpoint.
 DRAFT_PROBES = [
-    ("draft-16", MOQT_VERSION_DRAFT16),
     ("draft-14", MOQT_VERSION_DRAFT14),
+    ("draft-16", MOQT_VERSION_DRAFT16),
 ]
 
 
