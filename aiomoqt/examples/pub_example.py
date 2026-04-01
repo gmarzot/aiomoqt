@@ -13,12 +13,12 @@ from aiomoqt.client import *
 from aiomoqt.utils import *
 
 # Create fixed padding buffers once
-NUM_SUBGROUP_TASKS = 4
-I_FRAME_PAD = b'I' * 1024 * 64
-P_FRAME_PAD = b'P' * 1024 * 64
+NUM_SUBGROUP_TASKS = 1
+I_FRAME_PAD = b'I' * 1024
+P_FRAME_PAD = b'P' * 1024
 
-FRAME_INTERVAL = 1/60
-GROUP_SIZE = 60
+FRAME_INTERVAL = 1/30
+GROUP_SIZE = 30
 
 
 async def dgram_subscribe_data_generator(session: MOQTSession, msg: Subscribe) -> None:
@@ -132,13 +132,7 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
     and object_id tracking.
     """
     logger = get_logger(__name__)
-    if session._h3 is None:
-        return
-
-    stream_id = session._h3.create_webtransport_stream(
-        session_id=session._session_id,
-        is_unidirectional=True
-    )
+    stream_id = session.open_uni_stream()
     logger.info(f"MOQT app: created data stream({stream_id}): subgroup: {subgroup_id}")
 
     next_frame_time = time.monotonic()
@@ -156,12 +150,12 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
                 if header is not None:
                     extensions = {MOQT_TIMESTAMP_EXT: int(time.time()*1000)} if use_extensions else None
                     buf = header.end_group(extensions=extensions)
-                    if session._close_err or session._h3 is None:
+                    if session._close_err:
                         raise asyncio.CancelledError
                     logger.info(f"MOQT app: sending END_OF_GROUP: "
                                 f"{group_id-1}.{subgroup_id}.{header._last_object_id} "
                                 f"{buf.tell()} bytes")
-                    session._quic.send_stream_data(stream_id, buf.data, end_stream=True)
+                    session.stream_write(stream_id, buf.data, end_stream=True)
                     session.transmit()
 
                     # Clean up old stream
@@ -172,10 +166,7 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
                         del session._stream_tasks[stream_id]
 
                     # Create new stream for next group
-                    stream_id = session._h3.create_webtransport_stream(
-                        session_id=session._session_id,
-                        is_unidirectional=True
-                    )
+                    stream_id = session.open_uni_stream()
 
                 # Start new subgroup header — tracks object_id and delta state
                 header = SubgroupHeader(
@@ -189,7 +180,7 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
                 if session._close_err is not None:
                     raise asyncio.CancelledError
                 logger.info(f"MOQT app: sending {header} {msg.tell()} bytes")
-                session._quic.send_stream_data(stream_id, msg.data, end_stream=False)
+                session.stream_write(stream_id, msg.data)
                 session.transmit()
 
                 # I-frame for first object in group
@@ -210,7 +201,7 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
             logger.info(f"MOQT app: sending ObjectHeader: "
                         f"{group_id}.{subgroup_id}.{header._last_object_id} "
                         f"{buf.tell()} bytes")
-            session._quic.send_stream_data(stream_id, buf.data, end_stream=False)
+            session.stream_write(stream_id, buf.data)
             session.transmit()
 
             next_frame_time += FRAME_INTERVAL
