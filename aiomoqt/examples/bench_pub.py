@@ -160,18 +160,12 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
     This avoids payload conflicts in the relay cache.
     """
     logger = get_logger(__name__)
-    if session._h3 is None:
-        return
-
     pad = b'\x00' * object_size
     paced = rate > 0
     frame_interval = 1.0 / rate if paced else 0
     total_sent = 0
 
-    stream_id = session._h3.create_webtransport_stream(
-        session_id=session._session_id,
-        is_unidirectional=True
-    )
+    stream_id = session.open_uni_stream()
 
     next_frame_time = time.monotonic()
     group_id = -1
@@ -185,9 +179,9 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
                 if header is not None:
                     extensions = {MOQT_TIMESTAMP_EXT: int(time.time() * 1000)}
                     buf = header.end_group(extensions=extensions)
-                    if session._close_err or session._h3 is None:
+                    if session._close_err:
                         raise asyncio.CancelledError
-                    session._quic.send_stream_data(stream_id, buf.data, end_stream=True)
+                    session.stream_write(stream_id, buf.data, end_stream=True)
                     session.transmit()
 
                     if stream_id in session._data_streams:
@@ -196,10 +190,7 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
                         session._stream_tasks[stream_id].cancel()
                         del session._stream_tasks[stream_id]
 
-                    stream_id = session._h3.create_webtransport_stream(
-                        session_id=session._session_id,
-                        is_unidirectional=True
-                    )
+                    stream_id = session.open_uni_stream()
 
                 header = SubgroupHeader(
                     track_alias=track_alias,
@@ -211,7 +202,7 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
                 msg = header.serialize()
                 if session._close_err is not None:
                     raise asyncio.CancelledError
-                session._quic.send_stream_data(stream_id, msg.data, end_stream=False)
+                session.stream_write(stream_id, msg.data)
                 session.transmit()
 
             obj_id = header.next_object_id
@@ -225,7 +216,7 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
 
             if session._close_err is not None:
                 raise asyncio.CancelledError
-            session._quic.send_stream_data(stream_id, buf.data, end_stream=False)
+            session.stream_write(stream_id, buf.data)
             session.transmit()
             total_sent += 1
 
