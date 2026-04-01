@@ -1,17 +1,20 @@
-import time
-
-from functools import partial
-from collections import defaultdict
-from typing import Optional, Type, Union, List, Set, Tuple, Dict, DefaultDict, Callable
-
 import asyncio
+import time
 from asyncio import Future
+from collections import defaultdict
+from functools import partial
+from typing import (Callable, DefaultDict, Dict, List, Optional, Set, Tuple,
+                    Type, Union)
 
 from qh3.asyncio.protocol import QuicConnectionProtocol
-from qh3.quic.connection import QuicConnection, QuicErrorCode, stream_is_unidirectional
-from qh3.quic.events import QuicEvent, StreamDataReceived, ProtocolNegotiated, DatagramFrameReceived, StopSendingReceived, StreamReset
-from qh3.h3.connection import H3Connection, StreamType, ErrorCode, H3_ALPN, Setting
+from qh3.h3.connection import (H3_ALPN, ErrorCode, H3Connection, Setting,
+                               StreamType)
 from qh3.h3.events import HeadersReceived
+from qh3.quic.connection import (QuicConnection, QuicErrorCode,
+                                 stream_is_unidirectional)
+from qh3.quic.events import (DatagramFrameReceived, ProtocolNegotiated,
+                             QuicEvent, StopSendingReceived,
+                             StreamDataReceived, StreamReset)
 
 # Monkey-patch qh3 Setting enum: H3_DATAGRAM should be 0x33 (RFC 9297),
 # not 0xFFD277 (old experimental value). Remove when qh3 is fixed or
@@ -23,13 +26,14 @@ if Setting.H3_DATAGRAM.value != 0x33:
     Setting.H3_DATAGRAM._value_ = 0x33
     Setting._value2member_map_[0x33] = Setting.H3_DATAGRAM
 
-from .types import *
+from importlib.metadata import version
+
 from .context import *
 from .messages import *
-from .utils.logger import *
+from .types import *
 from .utils.buffer import Buffer, BufferReadError
+from .utils.logger import *
 
-from importlib.metadata import version
 USER_AGENT = f"aiomoqt/{version('aiomoqt')}"
 
 MOQT_IDLE_STREAM_TIMEOUT = 5
@@ -1706,6 +1710,25 @@ class MOQTSession(QuicConnectionProtocol):
         # Update object status in local storage or notify subscribers            
 
 
+    # Draft-16 override registry for repurposed code points.
+    # When is_draft16_or_later(), these take precedence over the main registry.
+    async def _handle_request_ok(self, msg: RequestOk) -> None:
+        logger.info(f"MOQT event: handle {msg}")
+        self._resolve_request(msg.request_id, msg)
+
+    async def _handle_request_error(self, msg: RequestError) -> None:
+        logger.info(f"MOQT event: handle {msg}")
+        self._resolve_request(msg.request_id, msg)
+
+    async def _handle_namespace(self, msg) -> None:
+        logger.info(f"MOQT event: handle Namespace: {msg}")
+
+    async def _handle_namespace_done(self, msg) -> None:
+        logger.info(f"MOQT event: handle NamespaceDone: {msg}")
+
+    async def _handle_request_update(self, msg: RequestUpdate) -> None:
+        logger.info(f"MOQT event: handle RequestUpdate: {msg}")
+
     # MoQT message classes for serialize/deserialize, message handler methods (unbound)       
     MOQT_CONTROL_MESSAGE_REGISTRY: Dict[MOQTMessageType, Tuple[Type[MOQTMessage], Callable]] = {
        # Setup messages
@@ -1755,26 +1778,7 @@ class MOQTSession(QuicConnectionProtocol):
        MOQTMessageType.PUBLISH: (Publish, _handle_publish),
        MOQTMessageType.PUBLISH_OK: (PublishOk, _handle_publish_ok),
        MOQTMessageType.PUBLISH_ERROR: (PublishError, _handle_publish_error),
-   }
-
-    # Draft-16 override registry for repurposed code points.
-    # When is_draft16_or_later(), these take precedence over the main registry.
-    async def _handle_request_ok(self, msg: RequestOk) -> None:
-        logger.info(f"MOQT event: handle {msg}")
-        self._resolve_request(msg.request_id, msg)
-
-    async def _handle_request_error(self, msg: RequestError) -> None:
-        logger.info(f"MOQT event: handle {msg}")
-        self._resolve_request(msg.request_id, msg)
-
-    async def _handle_namespace(self, msg) -> None:
-        logger.info(f"MOQT event: handle Namespace: {msg}")
-
-    async def _handle_namespace_done(self, msg) -> None:
-        logger.info(f"MOQT event: handle NamespaceDone: {msg}")
-
-    async def _handle_request_update(self, msg: RequestUpdate) -> None:
-        logger.info(f"MOQT event: handle RequestUpdate: {msg}")
+    }
 
     MOQT_D16_OVERRIDE_REGISTRY: Dict[int, Tuple[Type[MOQTMessage], Callable]] = {
         # Code point 0x05: d14=SUBSCRIBE_ERROR, d16=REQUEST_ERROR
@@ -1796,6 +1800,16 @@ class MOQTSession(QuicConnectionProtocol):
     }
 
     # Datagram data message types (dispatch by range check, not registry lookup)
+    MOQT_DGRAM_DATA_REGISTRY: Dict[int, Tuple[Type[MOQTMessage], Callable]] = {
+        # ObjectDatagram: types 0x00-0x07 dispatched by range check
+        # ObjectDatagramStatus: types 0x20-0x21 dispatched by range check
+    }
+    
+    MOQT_DGRAM_DATA_REGISTRY: Dict[int, Tuple[Type[MOQTMessage], Callable]] = {
+        # ObjectDatagram: types 0x00-0x07 dispatched by range check
+        # ObjectDatagramStatus: types 0x20-0x21 dispatched by range check
+    }
+    
     MOQT_DGRAM_DATA_REGISTRY: Dict[int, Tuple[Type[MOQTMessage], Callable]] = {
         # ObjectDatagram: types 0x00-0x07 dispatched by range check
         # ObjectDatagramStatus: types 0x20-0x21 dispatched by range check
