@@ -43,7 +43,6 @@ async def subscribe_data_generator(session: MOQTSession, msg: Subscribe,
                                    num_tasks: int = NUM_SUBGROUP_TASKS) -> None:
     """Subscribe handler that spawns subgroup stream data generation."""
     ok = session.subscribe_ok(request_msg=msg)
-    await asyncio.sleep(0.1)  # let relay register track alias
 
     for subgroup_id in range(num_tasks):
         priority = 255 if subgroup_id == 0 else 0
