@@ -256,6 +256,9 @@ examples:
         '-d', '--debug', action='store_true')
     parser.add_argument(
         '--keylogfile', type=str, default=None)
+    parser.add_argument(
+        '-k', '--insecure', action='store_true',
+        help='Skip TLS certificate verification')
     return parser.parse_args()
 
 
@@ -285,6 +288,7 @@ async def run(args):
         relay.host, relay.port,
         endpoint=relay.endpoint,
         use_quic=relay.use_quic,
+        verify_tls=not args.insecure,
         debug=args.debug,
         keylog_filename=args.keylogfile,
     )

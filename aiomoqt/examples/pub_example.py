@@ -12,10 +12,9 @@ from aiomoqt.messages import (
 from aiomoqt.client import *
 from aiomoqt.utils import *
 
-# Create fixed padding buffers once
+# Defaults
 NUM_SUBGROUP_TASKS = 1
-I_FRAME_PAD = b'I' * 1024
-P_FRAME_PAD = b'P' * 1024
+DEFAULT_OBJECT_SIZE = 1024
 
 FRAME_INTERVAL = 1/30
 GROUP_SIZE = 30
@@ -40,7 +39,8 @@ async def dgram_subscribe_data_generator(session: MOQTSession, msg: Subscribe) -
 
 
 async def subscribe_data_generator(session: MOQTSession, msg: Subscribe,
-                                   num_tasks: int = NUM_SUBGROUP_TASKS) -> None:
+                                   num_tasks: int = NUM_SUBGROUP_TASKS,
+                                   object_size: int = DEFAULT_OBJECT_SIZE) -> None:
     """Subscribe handler that spawns subgroup stream data generation."""
     ok = session.subscribe_ok(request_msg=msg)
 
@@ -51,11 +51,14 @@ async def subscribe_data_generator(session: MOQTSession, msg: Subscribe,
                 session=session,
                 subgroup_id=subgroup_id,
                 track_alias=ok.track_alias,
-                priority=priority
+                priority=priority,
+                object_size=object_size,
             )
         )
         task.add_done_callback(lambda t: session._tasks.discard(t))
         session._tasks.add(task)
+        # Stagger stream starts so relay processes each header before the next
+        await asyncio.sleep(0.1)
 
     await session.async_closed()
     session._close_session()
@@ -125,13 +128,16 @@ async def generate_group_dgram(session: MOQTSession, track_alias: int, priority:
 
 
 async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
-                                   track_alias: int, priority: int):
+                                   track_alias: int, priority: int,
+                                   object_size: int = DEFAULT_OBJECT_SIZE):
     """Generate subgroup stream objects simulating video frames.
 
     Uses SubgroupHeader.next_object() for automatic delta encoding
     and object_id tracking.
     """
     logger = get_logger(__name__)
+    I_FRAME_PAD = b'I' * object_size
+    P_FRAME_PAD = b'P' * object_size
     stream_id = session.open_uni_stream()
     logger.info(f"MOQT app: created data stream({stream_id}): subgroup: {subgroup_id}")
 
@@ -184,13 +190,14 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
                 session.transmit()
 
                 # I-frame for first object in group
-                info = f"| {group_id}.{subgroup_id}.0 |".encode()
-                payload = info + I_FRAME_PAD
+                obj_id = 0
+                info = f"| {group_id}.{obj_id} |".encode()
+                payload = (info + I_FRAME_PAD)[:object_size]
             else:
                 # P-frame for subsequent objects
                 obj_id = header.next_object_id
-                info = f"| {group_id}.{subgroup_id}.{obj_id} |".encode()
-                payload = info + P_FRAME_PAD
+                info = f"| {group_id}.{obj_id} |".encode()
+                payload = (info + P_FRAME_PAD)[:object_size]
 
             # Send next object — delta encoding handled automatically
             extensions = {MOQT_TIMESTAMP_EXT: int(time.time()*1000)} if use_extensions else None
@@ -225,12 +232,19 @@ def parse_args():
     parser.add_argument('--debug', action='store_true', help='Enable debug output')
     parser.add_argument('--quic-debug', action='store_true', help='Enable quic debug output')
     parser.add_argument('--keylogfile', type=str, default=None, help='TLS secrets file')
+    parser.add_argument('--insecure', action='store_true', help='Skip TLS certificate verification')
+    parser.add_argument('--auth-token', type=str, default=None, help='Auth token')
+    parser.add_argument('--draft', type=int, default=None, help='MoQT draft version (e.g. 14, 16)')
+    parser.add_argument('-P', '--streams', type=int, default=1, help='Parallel subgroup streams (default: 1)')
+    parser.add_argument('-s', '--object-size', type=int, default=1024, help='Object payload size bytes (default: 1024)')
 
     return parser.parse_args()
 
 
 async def main(host: str, port: int, endpoint: str, namespace: str, trackname: str,
-               debug: bool, datagram: bool, use_quic: bool, quic_debug: bool):
+               debug: bool, datagram: bool, use_quic: bool, quic_debug: bool,
+               insecure: bool = False, auth_token: str = None, draft: int = None,
+               streams: int = 1, object_size: int = 1024):
     log_level = logging.DEBUG if debug else logging.INFO
     set_log_level(log_level)
     logger = get_logger(__name__)
@@ -240,6 +254,8 @@ async def main(host: str, port: int, endpoint: str, namespace: str, trackname: s
         port,
         endpoint=endpoint,
         use_quic=use_quic,
+        verify_tls=not insecure,
+        draft_version=draft,
         debug=debug,
         quic_debug=quic_debug,
         keylog_filename=args.keylogfile,
@@ -248,7 +264,9 @@ async def main(host: str, port: int, endpoint: str, namespace: str, trackname: s
     if datagram:
         client.register_handler(MOQTMessageType.SUBSCRIBE, dgram_subscribe_data_generator)
     else:
-        client.register_handler(MOQTMessageType.SUBSCRIBE, subscribe_data_generator)
+        from functools import partial
+        handler = partial(subscribe_data_generator, num_tasks=streams, object_size=object_size)
+        client.register_handler(MOQTMessageType.SUBSCRIBE, handler)
 
     logger.info(f"MOQT app: publish session connecting: {client}")
     async with client.connect() as session:
@@ -256,9 +274,10 @@ async def main(host: str, port: int, endpoint: str, namespace: str, trackname: s
             await session.client_session_init()
 
             logger.info(f"MOQT app: publish_namespace: {namespace}")
+            params = {ParamType.AUTH_TOKEN: auth_token.encode()} if auth_token else {}
             response = await session.publish_namespace(
                 namespace=namespace,
-                parameters={ParamType.AUTH_TOKEN: b"auth-token-123"},
+                parameters=params,
                 wait_response=True,
             )
             logger.info(f"MOQT app: publish_namespace response: {response}")
@@ -285,6 +304,11 @@ if __name__ == "__main__":
             datagram=args.datagram,
             debug=args.debug,
             quic_debug=args.quic_debug,
+            insecure=args.insecure,
+            auth_token=args.auth_token,
+            draft=args.draft,
+            streams=args.streams,
+            object_size=args.object_size,
         ))
 
     except KeyboardInterrupt:

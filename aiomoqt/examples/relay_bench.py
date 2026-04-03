@@ -69,6 +69,9 @@ examples:
         '-d', '--debug', action='store_true')
     parser.add_argument(
         '--keylogfile', type=str, default=None)
+    parser.add_argument(
+        '-k', '--insecure', action='store_true',
+        help='Skip TLS certificate verification')
     return parser.parse_args()
 
 
@@ -89,6 +92,7 @@ async def main():
         duration=args.duration,
         debug=args.debug,
         keylogfile=args.keylogfile,
+        insecure=args.insecure,
     )
 
     sub_args = argparse.Namespace(
@@ -100,11 +104,12 @@ async def main():
         interval=args.interval,
         debug=args.debug,
         keylogfile=args.keylogfile,
+        insecure=args.insecure,
     )
 
     # Import run functions
-    from aiomoqt.examples.bench_pub import run as pub_run
-    from aiomoqt.examples.bench_sub import run as sub_run
+    from aiomoqt.examples.pub_bench import run as pub_run
+    from aiomoqt.examples.sub_bench import run as sub_run
 
     # Start publisher first so it registers the namespace,
     # then subscriber connects and subscribes.

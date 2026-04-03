@@ -251,18 +251,18 @@ class ObjectHeader(MOQTMessage):
 
         # Get payload or status
         payload_len = buf.pull_uint_var()
-        pos = buf.tell()
+        remaining = buf_len - buf.tell()
         if payload_len == 0:  # Zero length means status code follows
             status = ObjectStatus(buf.pull_uint_var())
             payload = b''
-        elif payload_len > (buf_len - pos):
-            raise MOQTUnderflow(pos, pos + payload_len)
+        elif payload_len > remaining:
+            raise MOQTUnderflow(buf.tell(), buf.tell() + payload_len)
         else:
             status = ObjectStatus.NORMAL
             try:
                 payload = buf.pull_bytes(payload_len)
             except BufferReadError:
-                raise MOQTUnderflow(pos, pos + payload_len)
+                raise MOQTUnderflow(buf.tell(), buf.tell() + payload_len)
 
         return cls(
             object_id=object_id,
