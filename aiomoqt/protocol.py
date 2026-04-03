@@ -380,8 +380,11 @@ class MOQTSession(QuicConnectionProtocol):
                 try:
                     msg_obj = self._moqt_handle_data_stream(stream_id, msg_buf, msg_len)
                 except MOQTUnderflow as e:
-                    logger.debug(f"MOQT MOQTUnderflow({stream_id}): at pos: {e.pos} need: {e.needed}")
-                    needed = e.needed
+                    # e.needed is absolute buffer position; convert to bytes beyond msg_len
+                    needed = e.needed - msg_len
+                    if needed <= 0:
+                        needed = 1  # at least request one more byte
+                    logger.debug(f"MOQT MOQTUnderflow({stream_id}): at pos: {e.pos} abs: {e.needed} msg_len: {msg_len} need: {needed}")
                     break
                 except BufferReadError as e:
                     logger.debug(f"MOQT BufferReadError({stream_id}): cur_pos: {cur_pos} tell: {msg_buf.tell()}")
