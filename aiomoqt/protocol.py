@@ -425,6 +425,7 @@ class MOQTSession(QuicConnectionProtocol):
                     logger.error(f"MOQT stream({stream_id}): {msg_obj} size: {consumed} bytes")
                     # raise RuntimeError
 
+
             if needed > 0:
                 have = msg_len - cur_pos
                 # yuck - python memove - custom stream reader in progress
@@ -709,6 +710,10 @@ class MOQTSession(QuicConnectionProtocol):
                             self._stream_queues[stream_id].put_nowait(msg_buf)
                         else:
                             logger.debug(f"MOQT event: skipping empty data: {stream_id} pos: {msg_buf.tell()} len: {msg_len}")
+                        # Signal stream task that stream is done (FIN received)
+                        if event.end_stream:
+                            logger.debug(f"MOQT event: stream FIN: {stream_id}")
+                            self._stream_queues[stream_id].put_nowait(None)
                         return
                     else:
                         logger.debug(f"MOQT event: H3 internal uni stream {stream_id} type=0x{event.data[0]:02x}")
