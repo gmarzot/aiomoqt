@@ -202,7 +202,7 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
                 msg = header.serialize()
                 if session._close_err is not None:
                     raise asyncio.CancelledError
-                session.stream_write(stream_id, msg.data)
+                await session.stream_write_drain(stream_id, msg.data)
                 session.transmit()
 
             obj_id = header.next_object_id
@@ -216,7 +216,7 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
 
             if session._close_err is not None:
                 raise asyncio.CancelledError
-            session.stream_write(stream_id, buf.data)
+            await session.stream_write_drain(stream_id, buf.data)
             session.transmit()
             total_sent += 1
 
@@ -273,6 +273,8 @@ examples:
                         help='Duration in seconds (default: 30)')
     parser.add_argument('-d', '--debug', action='store_true')
     parser.add_argument('--keylogfile', type=str, default=None)
+    parser.add_argument('-k', '--insecure', action='store_true',
+                        help='Skip TLS certificate verification')
     return parser.parse_args()
 
 
@@ -312,6 +314,7 @@ async def run(args):
         relay.host, relay.port,
         endpoint=relay.endpoint,
         use_quic=relay.use_quic,
+        verify_tls=not args.insecure,
         debug=args.debug,
         keylog_filename=args.keylogfile,
     )

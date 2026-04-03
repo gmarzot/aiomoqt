@@ -22,11 +22,11 @@ from aiomoqt.types import MOQTMessageType, ParamType, MOQTRequestError
 from aiomoqt.client import MOQTClient
 from aiomoqt.protocol import MOQTPeer, MOQTSession
 from aiomoqt.utils.logger import set_log_level, get_logger
-from aiomoqt.examples.bench_pub import (
+from aiomoqt.examples.pub_bench import (
     subscribe_data_generator,
     dgram_subscribe_data_generator,
 )
-from aiomoqt.examples.bench_sub import BenchStats
+from aiomoqt.examples.sub_bench import BenchStats
 
 def _find_default_cert():
     """Search common locations for test certificates."""
@@ -147,6 +147,7 @@ async def run_subscriber(args, stats):
     client = MOQTClient(
         "localhost", args.port,
         endpoint="moq",
+        verify_tls=False,
         debug=args.debug,
     )
 

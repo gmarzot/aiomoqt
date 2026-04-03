@@ -71,9 +71,8 @@ class MOQTMessage:
         if with_length:
             exts_len = buf.pull_uint_var()
             if exts_len > (1024*16):
-                global exts_err_count
-                exts_err_count += 1
-                logger.warning(f"MOQTMessage._extensions_decode(): corrupted buffer : ext_len: {exts_len} count: {exts_err_count}")
+                MOQTMessage.exts_err_count += 1
+                logger.warning(f"MOQTMessage._extensions_decode(): corrupted buffer : ext_len: {exts_len} count: {MOQTMessage.exts_err_count}")
                 return exts
             if exts_len == 0:
                 return exts

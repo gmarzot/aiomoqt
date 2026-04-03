@@ -127,6 +127,8 @@ class MOQTSession(QuicConnectionProtocol):
         self._close_err = None  # tuple holding latest (error_code, Reason_phrase)
         
         self._data_streams: Dict[int, int] = {}  # keep track of active data streams
+        self._bidi_streams: Dict[int, int] = {}  # map request_id to bidi stream_id (d16)
+        self._bidi_stream_requests: Dict[int, int] = {}  # map bidi stream_id to request_id (d16)
         self._track_aliases: Dict[int, int] = {}  # map alias to subscription_id
         self._subscriptions: Dict[int, List] = {}  # map subscription_id to request
         self._pending_requests: Dict[int, Future[MOQTMessage]] = {}  # unified response futures
@@ -317,7 +319,8 @@ class MOQTSession(QuicConnectionProtocol):
             e = task.exception()
             if e:
                 error_code = QuicErrorCode.APPLICATION_ERROR
-                logger.error(f"MOQT stream({stream_id}): task failed with exception: {type(e).__name__}")
+                import traceback
+                logger.error(f"MOQT stream({stream_id}): task failed with exception: {type(e).__name__}\n{''.join(traceback.format_exception(e))}")
             else:
                 logger.debug(f"MOQT stream({stream_id}): task completed")
                 
@@ -327,7 +330,7 @@ class MOQTSession(QuicConnectionProtocol):
     # task for processing incoming data streams
     async def _process_data_stream(self, stream_id: int) -> None:
         ''' Subgroup stream data processing task '''
-        re_buf = Buffer(capacity=(1024*1024*8))  # pre-allocate large buffer accumulator
+        re_buf = Buffer(capacity=(1024*1024*32))  # pre-allocate large buffer accumulator
         cur_pos: int = 0
         consumed: int = 0
         needed: int = 0
@@ -648,6 +651,10 @@ class MOQTSession(QuicConnectionProtocol):
                         msg_buf.pull_uint_var()
                         msg_buf.pull_uint_var()
                     elif stream_id != self._control_stream_id:
+                        # d16: bidi streams carry SUBSCRIBE_NAMESPACE and responses
+                        if is_draft16_or_later():
+                            self._handle_bidi_stream(stream_id, msg_buf, msg_len)
+                            return
                         logger.warning(f"MOQT event: unrecognized bidirectional stream({stream_id}):")
                         return
 
@@ -1044,8 +1051,39 @@ class MOQTSession(QuicConnectionProtocol):
                 session_id=self._session_id, is_unidirectional=True)
         return self._quic.get_next_available_stream_id(is_unidirectional=True)
 
+    def open_bidi_stream(self) -> int:
+        """Open a bidirectional stream. Returns the stream ID."""
+        if self._h3 is not None:
+            return self._h3.create_webtransport_stream(
+                session_id=self._session_id, is_unidirectional=False)
+        return self._quic.get_next_available_stream_id(is_unidirectional=False)
+
     def stream_write(self, stream_id: int, data: bytes, end_stream: bool = False) -> None:
         """Write data to a stream."""
+        self._quic.send_stream_data(stream_id, data, end_stream=end_stream)
+
+    async def stream_write_drain(self, stream_id: int, data: bytes,
+                                 end_stream: bool = False) -> None:
+        """Write data to a stream, respecting QUIC congestion control.
+
+        Waits for the congestion window to have capacity before writing,
+        preventing buffer bloat and relay overload.
+        """
+        # Check stream hasn't been reset
+        stream = self._quic._streams.get(stream_id)
+        if stream is not None and stream.sender._reset_error_code is not None:
+            return
+
+        # Wait for congestion window to have space
+        loss = self._quic._loss
+        while loss.bytes_in_flight >= loss.congestion_window:
+            self.transmit()
+            await asyncio.sleep(0.001)
+            # Re-check stream state after yielding
+            stream = self._quic._streams.get(stream_id)
+            if stream is None or stream.sender._reset_error_code is not None:
+                return
+
         self._quic.send_stream_data(stream_id, data, end_stream=end_stream)
 
     def send_control_message(self, buf: Buffer) -> None:
@@ -1061,6 +1099,30 @@ class MOQTSession(QuicConnectionProtocol):
             end_stream=False
         )
         self.transmit()
+
+    def _handle_bidi_stream(self, stream_id: int, buf: Buffer, buf_len: int) -> None:
+        """Handle d16 bidirectional stream messages (SUBSCRIBE_NAMESPACE, responses)."""
+        # Check if this is a response to our outbound request
+        request_id = self._bidi_stream_requests.get(stream_id)
+        if request_id is not None:
+            # Response on a bidi stream we opened — parse as control message
+            while buf.tell() < buf_len:
+                msg = self._moqt_handle_control_message(buf)
+                if msg is None:
+                    break
+            return
+
+        # New incoming bidi stream from peer — strip WT stream header if present
+        if self._h3 is not None:
+            buf.pull_uint_var()  # WT session/stream identifier
+            buf.pull_uint_var()
+
+        # Parse the message
+        msg = self._moqt_handle_control_message(buf)
+        if msg is not None and isinstance(msg, SubscribeNamespace):
+            # Track the stream so we can respond on it
+            self._bidi_stream_requests[stream_id] = msg.request_id
+            self._bidi_streams[msg.request_id] = stream_id
 
     def send_dgram_message(self, buf: Buffer) -> None:
         """Send a MoQT message on the control stream."""
@@ -1411,7 +1473,11 @@ class MOQTSession(QuicConnectionProtocol):
         parameters: Optional[Dict[int, bytes]] = None,
         wait_response: Optional[bool] = False
     ) -> Optional[MOQTMessage]:
-        """Subscribe to announcements for a namespace prefix."""
+        """Subscribe to announcements for a namespace prefix.
+
+        In d16+, sends on a new bidirectional stream per spec Section 9.25.
+        In d14, sends on the control stream.
+        """
         if parameters is None:
             parameters = {}
 
@@ -1423,7 +1489,17 @@ class MOQTSession(QuicConnectionProtocol):
             parameters=parameters
         )
         logger.info(f"MOQT send: {message}")
-        self.send_control_message(message.serialize())
+
+        if is_draft16_or_later():
+            stream_id = self.open_bidi_stream()
+            buf = message.serialize()
+            self.stream_write(stream_id, buf.data)
+            self.transmit()
+            # Track bidi stream ↔ request mapping for response routing
+            self._bidi_streams[request_id] = stream_id
+            self._bidi_stream_requests[stream_id] = request_id
+        else:
+            self.send_control_message(message.serialize())
 
         if not wait_response:
             return message
@@ -1433,11 +1509,20 @@ class MOQTSession(QuicConnectionProtocol):
     def subscribe_namespace_ok(
         self,
         msg: SubscribeNamespace,
+        stream_id: int = None,
     ) -> Optional[MOQTMessage]:
-        """Create and send a SUBSCRIBE_NAMESPACE_OK response."""
+        """Create and send a SUBSCRIBE_NAMESPACE_OK response.
+
+        In d16+, responds on the same bidi stream the request came on.
+        """
         message = SubscribeNamespaceOk(request_id=msg.request_id)
         logger.info(f"MOQT send: {message}")
-        self.send_control_message(message.serialize())
+        if stream_id is not None and is_draft16_or_later():
+            buf = message.serialize()
+            self.stream_write(stream_id, buf.data)
+            self.transmit()
+        else:
+            self.send_control_message(message.serialize())
         return message
 
     def unsubscribe_namespace(
@@ -1610,7 +1695,9 @@ class MOQTSession(QuicConnectionProtocol):
 
     async def _handle_subscribe_namespace(self, msg: SubscribeNamespace) -> None:
         logger.info(f"MOQT event: handle {msg}")
-        self.subscribe_namespace_ok(msg)
+        stream_id = self._bidi_streams.get(msg.request_id)
+        logger.debug(f"MOQT event: subscribe_namespace bidi_stream={stream_id} request_id={msg.request_id} bidi_streams={self._bidi_streams}")
+        self.subscribe_namespace_ok(msg, stream_id=stream_id)
            
     async def _handle_subscribe_namespace_ok(self, msg: SubscribeNamespaceOk) -> None:
         logger.info(f"MOQT event: handle {msg}")

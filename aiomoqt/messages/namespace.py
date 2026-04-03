@@ -209,21 +209,26 @@ class SubscribeNamespace(MOQTMessage):
     """SUBSCRIBE_NAMESPACE message to subscribe to announcements."""
     request_id: int = 0  # Request ID field from spec
     namespace_prefix: Tuple[bytes, ...] = None
+    subscribe_options: int = 0  # d16: Subscribe Options field
     parameters: Dict[int, Any] = None
 
     def __post_init__(self):
         self.type = MOQTMessageType.SUBSCRIBE_NAMESPACE
 
     def serialize(self) -> bytes:
+        from ..context import is_draft16_or_later
         buf = Buffer(capacity=BUF_SIZE)
         payload = Buffer(capacity=BUF_SIZE)
 
         payload.push_uint_var(self.request_id)
-        
+
         payload.push_uint_var(len(self.namespace_prefix))
         for part in self.namespace_prefix:
             payload.push_uint_var(len(part))
             payload.push_bytes(part)
+
+        if is_draft16_or_later():
+            payload.push_uint_var(self.subscribe_options)
 
         MOQTMessage._serialize_params(payload, self.parameters)
 
@@ -234,11 +239,16 @@ class SubscribeNamespace(MOQTMessage):
 
     @classmethod
     def deserialize(cls, buf: Buffer) -> 'SubscribeNamespace':
+        from ..context import is_draft16_or_later
         request_id = buf.pull_uint_var()
         tuple_len = buf.pull_uint_var()
         namespace_prefix = tuple(buf.pull_bytes(buf.pull_uint_var()) for _ in range(tuple_len))
+        subscribe_options = 0
+        if is_draft16_or_later():
+            subscribe_options = buf.pull_uint_var()
         params = MOQTMessage._deserialize_params(buf)
-        return cls(request_id=request_id, namespace_prefix=namespace_prefix, parameters=params)
+        return cls(request_id=request_id, namespace_prefix=namespace_prefix,
+                   subscribe_options=subscribe_options, parameters=params)
 
 
 @dataclass
