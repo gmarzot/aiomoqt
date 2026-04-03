@@ -213,8 +213,11 @@ class ObjectHeader(MOQTMessage):
         buf.push_uint_var(delta)
 
         # Extensions conditional on subgroup header flag
-        if extensions_present:
+        # Per spec: extensions MUST NOT be present on non-NORMAL status objects
+        if extensions_present and self.status == ObjectStatus.NORMAL:
             MOQTMessage._extensions_encode(buf, self.extensions)
+        elif extensions_present:
+            MOQTMessage._extensions_encode(buf, None)  # empty extensions
 
         if self.status == ObjectStatus.NORMAL and self.payload:
             buf.push_uint_var(payload_len)
