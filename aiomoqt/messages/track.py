@@ -108,15 +108,22 @@ class SubgroupHeader(MOQTMessage):
 
     def next_object(self, payload: bytes = b'',
                     extensions: Optional[Dict] = None,
-                    status: ObjectStatus = ObjectStatus.NORMAL) -> Buffer:
+                    status: ObjectStatus = ObjectStatus.NORMAL,
+                    object_id: Optional[int] = None) -> Buffer:
         """Create and serialize the next object in this subgroup.
 
         Handles object_id assignment, delta encoding, and extensions_present
         flag automatically. Tracks state across calls.
 
+        Args:
+            object_id: Explicit object_id. If None, auto-increments from last.
+
         Returns: Buffer ready to send on the stream.
         """
-        obj_id = 0 if self._last_object_id is None else self._last_object_id + 1
+        if object_id is not None:
+            obj_id = object_id
+        else:
+            obj_id = 0 if self._last_object_id is None else self._last_object_id + 1
         obj = ObjectHeader(
             object_id=obj_id,
             extensions=extensions,
@@ -133,15 +140,20 @@ class SubgroupHeader(MOQTMessage):
             self.subgroup_id = obj_id
         return buf
 
-    def end_group(self, extensions: Optional[Dict] = None) -> Buffer:
+    def end_group(self, extensions: Optional[Dict] = None,
+                  object_id: Optional[int] = None) -> Buffer:
         """Create and serialize an END_OF_GROUP status object.
+
+        Args:
+            object_id: Explicit object_id for the status object. If None, auto-increments.
 
         Returns: Buffer ready to send on the stream (typically with end_stream=True).
         """
         return self.next_object(
             payload=b'',
             extensions=extensions,
-            status=ObjectStatus.END_OF_GROUP
+            status=ObjectStatus.END_OF_GROUP,
+            object_id=object_id,
         )
 
     @property
@@ -213,8 +225,11 @@ class ObjectHeader(MOQTMessage):
         buf.push_uint_var(delta)
 
         # Extensions conditional on subgroup header flag
-        if extensions_present:
+        # Per spec: extensions MUST NOT be present on non-NORMAL status objects
+        if extensions_present and self.status == ObjectStatus.NORMAL:
             MOQTMessage._extensions_encode(buf, self.extensions)
+        elif extensions_present:
+            MOQTMessage._extensions_encode(buf, None)  # empty extensions
 
         if self.status == ObjectStatus.NORMAL and self.payload:
             buf.push_uint_var(payload_len)

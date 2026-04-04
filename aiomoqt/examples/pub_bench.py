@@ -171,17 +171,25 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
     group_id = -1
     header = None
 
+    # Disjoint object IDs: subgroup N sends IDs N, N+num_subgroups, N+2*num_subgroups...
+    # Cache key is (ns, track, group, object_id) — payload must be identical for same object_id
+    cur_obj_id = subgroup_id
+
     try:
         while True:
-            if header is None or header.next_object_id >= group_size:
+            if header is None or cur_obj_id >= group_size:
                 group_id += 1
+                cur_obj_id = subgroup_id
 
                 if header is not None:
-                    extensions = {MOQT_TIMESTAMP_EXT: int(time.time() * 1000)}
-                    buf = header.end_group(extensions=extensions)
+                    # Close the stream — only one subgroup needs END_OF_GROUP
                     if session._close_err:
                         raise asyncio.CancelledError
-                    session.stream_write(stream_id, buf.data, end_stream=True)
+                    if subgroup_id == 0:
+                        buf = header.end_group(object_id=group_size)
+                        session.stream_write(stream_id, buf.data, end_stream=True)
+                    else:
+                        session.stream_write(stream_id, b'', end_stream=True)
                     session.transmit()
 
                     if stream_id in session._data_streams:
@@ -205,14 +213,13 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
                 await session.stream_write_drain(stream_id, msg.data)
                 session.transmit()
 
-            obj_id = header.next_object_id
-            # Payload must be identical across subgroups for same
-            # (group_id, object_id) to avoid relay cache conflicts
-            seq_info = f"{group_id}.{obj_id}".encode()
+            seq_info = f"{group_id}.{cur_obj_id}".encode()
             payload = (seq_info + b'|' + pad)[:object_size]
 
             extensions = {MOQT_TIMESTAMP_EXT: int(time.time() * 1000)}
-            buf = header.next_object(payload=payload, extensions=extensions)
+            buf = header.next_object(payload=payload, extensions=extensions,
+                                     object_id=cur_obj_id)
+            cur_obj_id += num_subgroups
 
             if session._close_err is not None:
                 raise asyncio.CancelledError
