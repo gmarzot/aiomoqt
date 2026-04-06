@@ -305,14 +305,16 @@ async def run(args):
             try:
                 await session.client_session_init()
 
+                await session.subscribe_namespace(
+                    namespace_prefix=args.namespace,
+                    parameters={},
+                    wait_response=True,
+                )
+
                 await session.subscribe(
                     namespace=args.namespace,
                     track_name=args.trackname,
-                    parameters={
-                        ParamType.MAX_CACHE_DURATION: 100,
-                        ParamType.AUTH_TOKEN: b"bench-token",
-                        ParamType.DELIVERY_TIMEOUT: 10,
-                    },
+                    parameters={},
                     wait_response=True,
                 )
 
