@@ -1639,7 +1639,13 @@ class MOQTSession(QuicConnectionProtocol):
 
     async def _handle_publish_namepace(self, msg: PublishNamespace) -> None:
         logger.info(f"MOQT receive: {msg}")
-        self.publish_namepace_ok(msg)
+        if is_draft16_or_later():
+            # d16: respond with REQUEST_OK instead of PublishNamespaceOk
+            message = RequestOk(request_id=msg.request_id)
+            logger.info(f"MOQT send: {message} request_id: {msg.request_id} namespace: {msg.namespace}")
+            self.send_control_message(message.serialize())
+        else:
+            self.publish_namepace_ok(msg)
 
     async def _handle_subscribe_update(self, msg: SubscribeUpdate) -> None:
         logger.info(f"MOQT event: handle {msg}")
