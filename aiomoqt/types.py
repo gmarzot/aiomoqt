@@ -105,6 +105,11 @@ class ParamType(IntEnum):
     SUBSCRIBER_PRIORITY = 0x20
     SUBSCRIPTION_FILTER = 0x21
     GROUP_ORDER = 0x22
+    # libquicr-style per-filter-type param keys (non-standard, Quicr/libquicr#375)
+    LOCATION_FILTER = 0x21  # same as SUBSCRIPTION_FILTER but different encoding
+    GROUP_FILTER = 0x23
+    SUBGROUP_FILTER = 0x25
+    OBJECT_FILTER = 0x27
     DYNAMIC_GROUPS = 0x30
     NEW_GROUP_REQUEST = 0x32
     GREASE_1_PARAM = 0x55

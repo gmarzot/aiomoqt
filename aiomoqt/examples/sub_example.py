@@ -23,6 +23,7 @@ def parse_args():
     parser.add_argument('--insecure', action='store_true', help='Skip TLS certificate verification')
     parser.add_argument('--auth-token', type=str, default=None, help='Auth token')
     parser.add_argument('--draft', type=int, default=None, help='MoQT draft version (e.g. 14, 16)')
+    parser.add_argument('--libquicr-compat', action='store_true', help='Use libquicr filter encoding (LAPS)')
 
     return parser.parse_args()
 
@@ -76,7 +77,7 @@ class SimpleStats:
 
 async def main(host: str, port: int, endpoint: str, namespace: str, track_name: str,
                use_quic: bool, debug: bool, quic_debug: bool, insecure: bool = False,
-               auth_token: str = None, draft: int = None):
+               auth_token: str = None, draft: int = None, libquicr_compat: bool = False):
     log_level = logging.DEBUG if debug else logging.INFO
     set_log_level(log_level)
     logger = get_logger(__name__)
@@ -89,6 +90,7 @@ async def main(host: str, port: int, endpoint: str, namespace: str, track_name: 
         use_quic=use_quic,
         verify_tls=not insecure,
         draft_version=draft,
+        libquicr_compat=libquicr_compat,
         debug=debug,
         quic_debug=quic_debug,
         keylog_filename=args.keylogfile,
@@ -147,6 +149,7 @@ if __name__ == "__main__":
             insecure=args.insecure,
             auth_token=args.auth_token,
             draft=args.draft,
+            libquicr_compat=args.libquicr_compat,
         ), debug=args.debug)
 
     except KeyboardInterrupt:

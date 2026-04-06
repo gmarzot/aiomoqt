@@ -91,10 +91,11 @@ class H3CustomConnection(H3Connection):
 # base class for client and server session objects
 class MOQTPeer:
     """MOQT client and server base-class."""
-    def __init__(self, allow_optional_dgram: bool = False):
+    def __init__(self, allow_optional_dgram: bool = False, libquicr_compat: bool = False):
         #  message handlers
         self._control_msg_handlers: Dict[int, Tuple[Type, Callable]] = {}
         self.allow_optional_dgram = allow_optional_dgram
+        self.libquicr_compat = libquicr_compat
 
     def register_handler(self, msg_type: int, handler: Callable) -> None:
         """Register a custom message handler."""
@@ -1220,6 +1221,7 @@ class MOQTSession(QuicConnectionProtocol):
             end_group=end_group,
             parameters=parameters
         )
+        message.libquicr_compat = self._session.libquicr_compat
         self._subscriptions[request_id] = [message]
         logger.info(f"MOQT send: {message}")
         self.send_control_message(message.serialize())

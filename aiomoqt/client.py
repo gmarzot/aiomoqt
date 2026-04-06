@@ -28,8 +28,9 @@ class MOQTClient(MOQTPeer):  # New connection manager class
         quic_debug: Optional[bool] = False,
         keylog_filename: Optional[str] = None,
         draft_version: Optional[int] = None,
+        libquicr_compat: Optional[bool] = False,
     ):
-        super().__init__(allow_optional_dgram=allow_optional_dgram)
+        super().__init__(allow_optional_dgram=allow_optional_dgram, libquicr_compat=libquicr_compat)
         self.host = host
         self.port = port
         self.endpoint = endpoint
