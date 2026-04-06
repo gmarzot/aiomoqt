@@ -281,43 +281,23 @@ class Subscribe(MOQTMessage):
         if is_draft16_or_later():
             # d16: priority, group_order, forward, filter all go into params
             params = dict(self.parameters or {})
-            if not getattr(self, 'libquicr_compat', False):
-                # Standard d16 params
-                if self.priority is not None:
-                    params[ParamType.SUBSCRIBER_PRIORITY] = self.priority
-                if self.group_order is not None:
-                    params[ParamType.GROUP_ORDER] = self.group_order
-                if self.forward is not None:
-                    params[ParamType.FORWARD] = self.forward
+            if self.priority is not None:
+                params[ParamType.SUBSCRIBER_PRIORITY] = self.priority
+            if self.group_order is not None:
+                params[ParamType.GROUP_ORDER] = self.group_order
+            if self.forward is not None:
+                params[ParamType.FORWARD] = self.forward
             if self.filter_type is not None:
-                # Build filter value: [start_group + start_obj [+ end_group]]
+                # SUBSCRIPTION_FILTER param (0x21) is odd → bytes value
+                # Encode: filter_type varint [+ start_group + start_obj [+ end_group]]
                 fbuf = Buffer(capacity=64)
-                if getattr(self, 'libquicr_compat', False):
-                    # libquicr-style: filter type determines param key, no filter_type varint
-                    # Quicr/libquicr#375 — non-standard but needed for LAPS interop
-                    # For LatestObject/NextGroupStart, omit filter param entirely (default)
-                    if self.filter_type in (3, 4):
-                        filter_key_map = {
-                            3: ParamType.LOCATION_FILTER,   # AbsoluteStart → 0x21
-                            4: ParamType.GROUP_FILTER,       # AbsoluteRange → 0x23
-                        }
-                        param_key = filter_key_map[self.filter_type]
-                        fbuf.push_uint_var(self.start_group or 0)
-                        fbuf.push_uint_var(self.start_object or 0)
-                        if self.filter_type == 4:
-                            fbuf.push_uint_var(self.end_group or 0)
-                        params[param_key] = fbuf.data_slice(0, fbuf.tell())
-                    # else: filter_type 1 or 2 — omit filter param (default behavior)
-                else:
-                    # Standard d16: SUBSCRIPTION_FILTER param (0x21) is odd → bytes value
-                    # Encode: filter_type varint [+ start_group + start_obj [+ end_group]]
-                    fbuf.push_uint_var(self.filter_type)
-                    if self.filter_type in (3, 4):
-                        fbuf.push_uint_var(self.start_group or 0)
-                        fbuf.push_uint_var(self.start_object or 0)
-                    if self.filter_type == 4:
-                        fbuf.push_uint_var(self.end_group or 0)
-                    params[ParamType.SUBSCRIPTION_FILTER] = fbuf.data_slice(0, fbuf.tell())
+                fbuf.push_uint_var(self.filter_type)
+                if self.filter_type in (3, 4):
+                    fbuf.push_uint_var(self.start_group or 0)
+                    fbuf.push_uint_var(self.start_object or 0)
+                if self.filter_type == 4:
+                    fbuf.push_uint_var(self.end_group or 0)
+                params[ParamType.SUBSCRIPTION_FILTER] = fbuf.data_slice(0, fbuf.tell())
             MOQTMessage._serialize_params(payload, params)
         else:
             # d14: fixed fields on wire
