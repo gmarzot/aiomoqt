@@ -281,12 +281,14 @@ class Subscribe(MOQTMessage):
         if is_draft16_or_later():
             # d16: priority, group_order, forward, filter all go into params
             params = dict(self.parameters or {})
-            if self.priority is not None:
-                params[ParamType.SUBSCRIBER_PRIORITY] = self.priority
-            if self.group_order is not None:
-                params[ParamType.GROUP_ORDER] = self.group_order
-            if self.forward is not None:
-                params[ParamType.FORWARD] = self.forward
+            if not getattr(self, 'libquicr_compat', False):
+                # Standard d16 params
+                if self.priority is not None:
+                    params[ParamType.SUBSCRIBER_PRIORITY] = self.priority
+                if self.group_order is not None:
+                    params[ParamType.GROUP_ORDER] = self.group_order
+                if self.forward is not None:
+                    params[ParamType.FORWARD] = self.forward
             if self.filter_type is not None:
                 # Build filter value: [start_group + start_obj [+ end_group]]
                 fbuf = Buffer(capacity=64)
