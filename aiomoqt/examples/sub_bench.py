@@ -311,10 +311,17 @@ async def run(args):
                     wait_response=True,
                 )
 
+                sub_params = {}
+                if not args.draft or args.draft < 16:
+                    sub_params = {
+                        ParamType.MAX_CACHE_DURATION: 100,
+                        ParamType.AUTH_TOKEN: b"bench-token",
+                        ParamType.DELIVERY_TIMEOUT: 10,
+                    }
                 await session.subscribe(
                     namespace=args.namespace,
                     track_name=args.trackname,
-                    parameters={},
+                    parameters=sub_params,
                     wait_response=True,
                 )
 
