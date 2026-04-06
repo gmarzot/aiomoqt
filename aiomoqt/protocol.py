@@ -650,10 +650,11 @@ class MOQTSession(QuicConnectionProtocol):
                     # Assume first bidi stream is MoQT control stream
                     if self._control_stream_id is None:
                         self._control_stream_id = stream_id
-                        # strip of initial WT stream identifier
                         logger.debug(f"QUIC event: detecting control stream: {stream_id}")
-                        msg_buf.pull_uint_var()
-                        msg_buf.pull_uint_var()
+                        # Strip WT stream header (WebTransport only)
+                        if self._h3 is not None:
+                            msg_buf.pull_uint_var()
+                            msg_buf.pull_uint_var()
                     elif stream_id != self._control_stream_id:
                         # d16: bidi streams carry SUBSCRIBE_NAMESPACE and responses
                         if is_draft16_or_later():
@@ -723,8 +724,9 @@ class MOQTSession(QuicConnectionProtocol):
             msg_buf = Buffer(data=event.data)
             msg_len = msg_buf.capacity
             logger.debug(f"MOQT event: DatagramFrameReceived: 0x{msg_buf.data_slice(0,min(msg_len,16)).hex()}")
-            # strip off some QUIC quarter identifier
-            msg_buf.pull_uint_var()
+            # Strip WT Quarter Stream ID / Context ID (WebTransport only)
+            if self._h3 is not None:
+                msg_buf.pull_uint_var()
             self._moqt_handle_data_dgram(msg_buf)
             return
         elif isinstance(event, StopSendingReceived):
