@@ -259,6 +259,9 @@ examples:
     parser.add_argument(
         '-k', '--insecure', action='store_true',
         help='Skip TLS certificate verification')
+    parser.add_argument(
+        '--draft', type=int, default=None,
+        help='MoQT draft version (e.g. 14, 16)')
     return parser.parse_args()
 
 
@@ -289,6 +292,7 @@ async def run(args):
         endpoint=relay.endpoint,
         use_quic=relay.use_quic,
         verify_tls=not args.insecure,
+        draft_version=args.draft,
         debug=args.debug,
         keylog_filename=args.keylogfile,
     )
