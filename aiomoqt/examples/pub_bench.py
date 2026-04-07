@@ -86,7 +86,7 @@ async def generate_group_dgram(session: MOQTSession, track_alias: int, priority:
                                rate: float = 0):
     """Generate datagram objects. rate=0 means max speed."""
     logger = get_logger(__name__)
-    pad = b'\x00' * object_size
+    pad = b'\xBB' * object_size
     paced = rate > 0
     frame_interval = 1.0 / rate if paced else 0
     total_sent = 0
@@ -160,7 +160,7 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
     This avoids payload conflicts in the relay cache.
     """
     logger = get_logger(__name__)
-    pad = b'\x00' * object_size
+    pad = b'\xBB' * object_size
     paced = rate > 0
     frame_interval = 1.0 / rate if paced else 0
     total_sent = 0
