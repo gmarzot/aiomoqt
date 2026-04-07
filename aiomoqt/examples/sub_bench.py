@@ -305,11 +305,12 @@ async def run(args):
             try:
                 await session.client_session_init()
 
-                await session.subscribe_namespace(
-                    namespace_prefix=args.namespace,
-                    parameters={},
-                    wait_response=True,
-                )
+                if args.draft and args.draft >= 16:
+                    await session.subscribe_namespace(
+                        namespace_prefix=args.namespace,
+                        parameters={},
+                        wait_response=True,
+                    )
 
                 sub_params = {}
                 if not args.draft or args.draft < 16:

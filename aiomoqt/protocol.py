@@ -409,13 +409,6 @@ class MOQTSession(QuicConnectionProtocol):
                 consumed = msg_buf.tell() - cur_pos
                 cur_pos = msg_buf.tell()
                 if isinstance(msg_obj, ObjectHeader):
-                    # Debug: detect short-parsed objects (payload read shorter than actual)
-                    if msg_obj.status == ObjectStatus.NORMAL and len(msg_obj.payload) < 100:
-                        hex_before = msg_buf.data_slice(max(0, cur_pos - 20), min(msg_len, cur_pos + 20)).hex()
-                        logger.error(f"MOQT stream({stream_id}): SHORT OBJECT consumed={consumed} "
-                                     f"payload_len={len(msg_obj.payload)} prev_obj_id={object_id} "
-                                     f"obj_id={msg_obj.object_id} cur_pos={cur_pos} msg_len={msg_len} "
-                                     f"hex_around={hex_before}")
                     assert object_id is None or msg_obj.object_id > object_id
                     object_id = msg_obj.object_id
                     status = ObjectStatus(msg_obj.status).name
