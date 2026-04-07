@@ -391,6 +391,14 @@ class MOQTSession(QuicConnectionProtocol):
                     logger.debug(f"MOQT BufferReadError({stream_id}): cur_pos: {cur_pos} tell: {msg_buf.tell()}")
                     needed = 1  # just get the next msg_buf - we dont know amount needed
                     break
+                except Exception as e:
+                    # Dump buffer state for debugging parse failures
+                    tell = msg_buf.tell()
+                    hex_at = msg_buf.data_slice(max(0, cur_pos), min(msg_len, cur_pos + 40)).hex()
+                    logger.error(f"MOQT stream({stream_id}): PARSE EXCEPTION at cur_pos={cur_pos} tell={tell} msg_len={msg_len} "
+                                 f"needed_was={needed} hex@cur_pos={hex_at} "
+                                 f"object_id={object_id} group_id={group_id}")
+                    raise
                     
                 if msg_obj is None:
                     error = f"MOQT error: data stream({stream_id}):: parsing failed at position: "
@@ -401,6 +409,13 @@ class MOQTSession(QuicConnectionProtocol):
                 consumed = msg_buf.tell() - cur_pos
                 cur_pos = msg_buf.tell()
                 if isinstance(msg_obj, ObjectHeader):
+                    # Debug: detect short-parsed objects (payload read shorter than actual)
+                    if msg_obj.status == ObjectStatus.NORMAL and len(msg_obj.payload) < 100:
+                        hex_before = msg_buf.data_slice(max(0, cur_pos - 20), min(msg_len, cur_pos + 20)).hex()
+                        logger.error(f"MOQT stream({stream_id}): SHORT OBJECT consumed={consumed} "
+                                     f"payload_len={len(msg_obj.payload)} prev_obj_id={object_id} "
+                                     f"obj_id={msg_obj.object_id} cur_pos={cur_pos} msg_len={msg_len} "
+                                     f"hex_around={hex_before}")
                     assert object_id is None or msg_obj.object_id > object_id
                     object_id = msg_obj.object_id
                     status = ObjectStatus(msg_obj.status).name
