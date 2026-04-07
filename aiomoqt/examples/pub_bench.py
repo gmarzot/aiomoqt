@@ -86,7 +86,7 @@ async def generate_group_dgram(session: MOQTSession, track_alias: int, priority:
                                rate: float = 0):
     """Generate datagram objects. rate=0 means max speed."""
     logger = get_logger(__name__)
-    pad = b'\x00' * object_size
+    pad = b'\xBB' * object_size
     paced = rate > 0
     frame_interval = 1.0 / rate if paced else 0
     total_sent = 0
@@ -160,7 +160,7 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
     This avoids payload conflicts in the relay cache.
     """
     logger = get_logger(__name__)
-    pad = b'\x00' * object_size
+    pad = b'\xBB' * object_size
     paced = rate > 0
     frame_interval = 1.0 / rate if paced else 0
     total_sent = 0
@@ -282,6 +282,8 @@ examples:
     parser.add_argument('--keylogfile', type=str, default=None)
     parser.add_argument('-k', '--insecure', action='store_true',
                         help='Skip TLS certificate verification')
+    parser.add_argument('--draft', type=int, default=None,
+                        help='MoQT draft version (e.g. 14, 16)')
     return parser.parse_args()
 
 
@@ -322,6 +324,7 @@ async def run(args):
         endpoint=relay.endpoint,
         use_quic=relay.use_quic,
         verify_tls=not args.insecure,
+        draft_version=args.draft,
         debug=args.debug,
         keylog_filename=args.keylogfile,
     )

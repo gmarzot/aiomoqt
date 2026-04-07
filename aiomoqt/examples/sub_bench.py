@@ -259,6 +259,9 @@ examples:
     parser.add_argument(
         '-k', '--insecure', action='store_true',
         help='Skip TLS certificate verification')
+    parser.add_argument(
+        '--draft', type=int, default=None,
+        help='MoQT draft version (e.g. 14, 16)')
     return parser.parse_args()
 
 
@@ -289,6 +292,7 @@ async def run(args):
         endpoint=relay.endpoint,
         use_quic=relay.use_quic,
         verify_tls=not args.insecure,
+        draft_version=args.draft,
         debug=args.debug,
         keylog_filename=args.keylogfile,
     )
@@ -301,14 +305,24 @@ async def run(args):
             try:
                 await session.client_session_init()
 
-                await session.subscribe(
-                    namespace=args.namespace,
-                    track_name=args.trackname,
-                    parameters={
+                if args.draft and args.draft >= 16:
+                    await session.subscribe_namespace(
+                        namespace_prefix=args.namespace,
+                        parameters={},
+                        wait_response=True,
+                    )
+
+                sub_params = {}
+                if not args.draft or args.draft < 16:
+                    sub_params = {
                         ParamType.MAX_CACHE_DURATION: 100,
                         ParamType.AUTH_TOKEN: b"bench-token",
                         ParamType.DELIVERY_TIMEOUT: 10,
-                    },
+                    }
+                await session.subscribe(
+                    namespace=args.namespace,
+                    track_name=args.trackname,
+                    parameters=sub_params,
                     wait_response=True,
                 )
 

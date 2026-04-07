@@ -91,10 +91,11 @@ class H3CustomConnection(H3Connection):
 # base class for client and server session objects
 class MOQTPeer:
     """MOQT client and server base-class."""
-    def __init__(self, allow_optional_dgram: bool = False):
+    def __init__(self, allow_optional_dgram: bool = False, libquicr_compat: bool = False):
         #  message handlers
         self._control_msg_handlers: Dict[int, Tuple[Type, Callable]] = {}
         self.allow_optional_dgram = allow_optional_dgram
+        self.libquicr_compat = libquicr_compat
 
     def register_handler(self, msg_type: int, handler: Callable) -> None:
         """Register a custom message handler."""
@@ -390,6 +391,14 @@ class MOQTSession(QuicConnectionProtocol):
                     logger.debug(f"MOQT BufferReadError({stream_id}): cur_pos: {cur_pos} tell: {msg_buf.tell()}")
                     needed = 1  # just get the next msg_buf - we dont know amount needed
                     break
+                except Exception as e:
+                    # Dump buffer state for debugging parse failures
+                    tell = msg_buf.tell()
+                    hex_at = msg_buf.data_slice(max(0, cur_pos), min(msg_len, cur_pos + 40)).hex()
+                    logger.error(f"MOQT stream({stream_id}): PARSE EXCEPTION at cur_pos={cur_pos} tell={tell} msg_len={msg_len} "
+                                 f"needed_was={needed} hex@cur_pos={hex_at} "
+                                 f"object_id={object_id} group_id={group_id}")
+                    raise
                     
                 if msg_obj is None:
                     error = f"MOQT error: data stream({stream_id}):: parsing failed at position: "
@@ -650,10 +659,11 @@ class MOQTSession(QuicConnectionProtocol):
                     # Assume first bidi stream is MoQT control stream
                     if self._control_stream_id is None:
                         self._control_stream_id = stream_id
-                        # strip of initial WT stream identifier
                         logger.debug(f"QUIC event: detecting control stream: {stream_id}")
-                        msg_buf.pull_uint_var()
-                        msg_buf.pull_uint_var()
+                        # Strip WT stream header (WebTransport only)
+                        if self._h3 is not None:
+                            msg_buf.pull_uint_var()
+                            msg_buf.pull_uint_var()
                     elif stream_id != self._control_stream_id:
                         # d16: bidi streams carry SUBSCRIBE_NAMESPACE and responses
                         if is_draft16_or_later():
@@ -723,8 +733,9 @@ class MOQTSession(QuicConnectionProtocol):
             msg_buf = Buffer(data=event.data)
             msg_len = msg_buf.capacity
             logger.debug(f"MOQT event: DatagramFrameReceived: 0x{msg_buf.data_slice(0,min(msg_len,16)).hex()}")
-            # strip off some QUIC quarter identifier
-            msg_buf.pull_uint_var()
+            # Strip WT Quarter Stream ID / Context ID (WebTransport only)
+            if self._h3 is not None:
+                msg_buf.pull_uint_var()
             self._moqt_handle_data_dgram(msg_buf)
             return
         elif isinstance(event, StopSendingReceived):
@@ -1218,6 +1229,7 @@ class MOQTSession(QuicConnectionProtocol):
             end_group=end_group,
             parameters=parameters
         )
+        message.libquicr_compat = self._session.libquicr_compat
         self._subscriptions[request_id] = [message]
         logger.info(f"MOQT send: {message}")
         self.send_control_message(message.serialize())
@@ -1635,7 +1647,13 @@ class MOQTSession(QuicConnectionProtocol):
 
     async def _handle_publish_namepace(self, msg: PublishNamespace) -> None:
         logger.info(f"MOQT receive: {msg}")
-        self.publish_namepace_ok(msg)
+        if is_draft16_or_later():
+            # d16: respond with REQUEST_OK instead of PublishNamespaceOk
+            message = RequestOk(request_id=msg.request_id)
+            logger.info(f"MOQT send: {message} request_id: {msg.request_id} namespace: {msg.namespace}")
+            self.send_control_message(message.serialize())
+        else:
+            self.publish_namepace_ok(msg)
 
     async def _handle_subscribe_update(self, msg: SubscribeUpdate) -> None:
         logger.info(f"MOQT event: handle {msg}")
