@@ -4,15 +4,15 @@ Scheme determines transport:
   moqt://host:port           -> raw QUIC (ALPN: moq-00)
   https://host:port/endpoint -> H3/WebTransport
 
-Default ports: moqt:// -> 4443, https:// -> 4433
+Default ports: moqt:// -> 443, https:// -> 443
 """
 from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import urlparse
 
 
-MOQT_DEFAULT_PORT = 4443
-HTTPS_DEFAULT_PORT = 4433
+MOQT_DEFAULT_PORT = 443
+HTTPS_DEFAULT_PORT = 443
 
 
 @dataclass
@@ -25,9 +25,11 @@ class MOQTRelay:
 
     def __str__(self):
         if self.use_quic:
-            return f"moqt://{self.host}:{self.port}"
+            port_s = "" if self.port == MOQT_DEFAULT_PORT else f":{self.port}"
+            return f"moqt://{self.host}{port_s}"
         ep = f"/{self.endpoint}" if self.endpoint else ""
-        return f"https://{self.host}:{self.port}{ep}"
+        port_s = "" if self.port == HTTPS_DEFAULT_PORT else f":{self.port}"
+        return f"https://{self.host}{port_s}{ep}"
 
     @property
     def transport_name(self) -> str:

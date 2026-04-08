@@ -7,8 +7,8 @@ endpoints are on the same machine.
 
 Usage:
   python -m aiomoqt.examples.bench_relay relay.example.com
-  python -m aiomoqt.examples.bench_relay moqt://relay:4443 -s 4096 -P 4
-  python -m aiomoqt.examples.bench_relay relay:4433 --datagram -t 60
+  python -m aiomoqt.examples.bench_relay moqt://relay -s 4096 -P 4
+  python -m aiomoqt.examples.bench_relay relay --datagram -t 60
 """
 import argparse
 import asyncio
@@ -24,15 +24,15 @@ Runs bench_pub and bench_sub concurrently against the same
 relay. All publisher options are passed through.
 
 relay URL forms:
-  moqt://host:port            raw QUIC (port default 4443)
-  https://host:port/endpoint  H3/WT (port default 4433)
+  moqt://host:port            raw QUIC (port default 443)
+  https://host:port/endpoint  H3/WT (port default 443)
   host:port                   H3/WT
-  host                        H3/WT, port 4433, endpoint /moq
+  host                        H3/WT, port 443, endpoint /moq
 
 examples:
   %(prog)s relay.example.com
   %(prog)s relay.example.com -s 4096 -P 4 -r 120
-  %(prog)s moqt://relay:4443 --datagram -t 60
+  %(prog)s moqt://relay --datagram -t 60
 """)
     parser.add_argument(
         'relay', type=str,

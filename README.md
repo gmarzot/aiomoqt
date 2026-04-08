@@ -58,7 +58,7 @@ def on_object(msg, size, recv_time_ms, group_id=None, subgroup_id=None):
 
 async def main():
     client = MOQTClient(
-        'relay.example.com', 4433, endpoint='moq',
+        'relay.example.com', 443, endpoint='moq',
         use_quic=True, draft_version=16, debug=True,
     )
     async with client.connect() as session:
@@ -80,7 +80,7 @@ from aiomoqt.messages import SubgroupHeader
 
 async def main():
     client = MOQTClient(
-        'relay.example.com', 4433,
+        'relay.example.com', 443,
         endpoint='moq', use_quic=True, draft_version=16,
     )
     client.register_handler(MOQTMessageType.SUBSCRIBE, on_subscribe)
@@ -126,10 +126,10 @@ req = await session.subscribe('ns', 'track')
 Examples and benchmarks accept relay URLs in several forms:
 
 ```
-moqt://host:port            Raw QUIC (default port 4443)
-https://host:port/endpoint  H3/WebTransport (default port 4433)
+moqt://host:port            Raw QUIC (default port 443)
+https://host:port/endpoint  H3/WebTransport (default port 443)
 host:port                   H3/WebTransport
-host                        H3/WebTransport, port 4433, endpoint /moq
+host                        H3/WebTransport, port 443, endpoint /moq
 ```
 
 ## Examples
@@ -138,16 +138,16 @@ host                        H3/WebTransport, port 4433, endpoint /moq
 
 ```bash
 # Publish (SubgroupHeader streams)
-python -m aiomoqt.examples.pub_example --host relay.ex.com --port 4433 --use-quic
+python -m aiomoqt.examples.pub_example --host relay.ex.com --use-quic
 
 # Publish (ObjectDatagrams)
-python -m aiomoqt.examples.pub_example --host relay.ex.com --port 4433 --use-quic --datagram
+python -m aiomoqt.examples.pub_example --host relay.ex.com --use-quic --datagram
 
 # Subscribe
-python -m aiomoqt.examples.sub_example --host relay.ex.com --port 4433 --use-quic
+python -m aiomoqt.examples.sub_example --host relay.ex.com --use-quic
 
 # Subscribe + FETCH (join mid-stream)
-python -m aiomoqt.examples.join_example --host relay.ex.com --port 4433 --use-quic
+python -m aiomoqt.examples.join_example --host relay.ex.com --use-quic
 ```
 
 Common options: `--namespace`, `--trackname`, `--endpoint`, `--debug`, `--keylogfile`
@@ -156,13 +156,13 @@ Common options: `--namespace`, `--trackname`, `--endpoint`, `--debug`, `--keylog
 
 ```bash
 # Publisher — configurable size, rate, parallelism
-python -m aiomoqt.examples.bench_pub moqt://relay.ex.com:4443 -s 4096 -P 4 -r 120 -t 60
+python -m aiomoqt.examples.bench_pub moqt://relay.ex.com -s 4096 -P 4 -r 120 -t 60
 
 # Subscriber — latency/jitter/loss stats
-python -m aiomoqt.examples.bench_sub moqt://relay.ex.com:4443 -t 60
+python -m aiomoqt.examples.bench_sub moqt://relay.ex.com -t 60
 
 # Combined pub/sub
-python -m aiomoqt.examples.bench_relay moqt://relay.ex.com:4443 -s 1024 -g 10000 -t 30
+python -m aiomoqt.examples.bench_relay moqt://relay.ex.com -s 1024 -g 10000 -t 30
 
 # Local loopback (no relay needed)
 python -m aiomoqt.examples.bench_loopback -s 4096 -P 4 -t 20
@@ -189,7 +189,7 @@ python -m aiomoqt.examples.moq_interop_client -r "moqt://moqx-000.ci.openmoq.org
 python -m aiomoqt.examples.moq_interop_client -r "moqt://moqx-000.ci.openmoq.org:4433" --draft 16
 
 # Single test case
-python -m aiomoqt.examples.moq_interop_client -r "moqt://relay:4433" -t subscribe-error
+python -m aiomoqt.examples.moq_interop_client -r "moqt://relay" -t subscribe-error
 
 # List test cases
 python -m aiomoqt.examples.moq_interop_client -l
@@ -208,7 +208,7 @@ Environment variables: `RELAYS_FILE`, `OUTPUT_FILE`,
 
 ```bash
 python -m aiomoqt.examples.server_example \
-    --certificate cert.pem --private-key key.pem --port 4433
+    --certificate cert.pem --private-key key.pem --port 443
 ```
 
 ### Example Reference

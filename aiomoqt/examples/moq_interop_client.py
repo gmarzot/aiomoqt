@@ -449,7 +449,7 @@ def parse_relay_url(url: str):
     else:
         # Bare host:port — default to WebTransport
         use_quic = False
-        port = parsed.port or 4433
+        port = parsed.port or 443
 
     host = parsed.hostname or url.split(":")[0]
     endpoint = parsed.path.lstrip("/") or "moq"
@@ -464,8 +464,8 @@ def parse_args():
         epilog="Environment variables: RELAY_URL, TESTCASE, TLS_DISABLE_VERIFY, VERBOSE",
     )
     parser.add_argument("-r", "--relay", type=str,
-                        default=os.environ.get("RELAY_URL", "https://localhost:4443"),
-                        help="Relay URL (default: $RELAY_URL or https://localhost:4443)")
+                        default=os.environ.get("RELAY_URL", "https://localhost"),
+                        help="Relay URL (default: $RELAY_URL or https://localhost)")
     parser.add_argument("-t", "--test", type=str,
                         default=os.environ.get("TESTCASE", None),
                         help="Run specific test case")

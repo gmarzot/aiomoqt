@@ -223,7 +223,7 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
 def parse_args():
     parser = argparse.ArgumentParser(description='MOQT WebTransport Client')
     parser.add_argument('--host', type=str, default='localhost', help='Host to connect to')
-    parser.add_argument('--port', type=int, default=4433, help='Port to connect to')
+    parser.add_argument('--port', type=int, default=443, help='Port to connect to')
     parser.add_argument('--namespace', type=str, default='test', help='Namespace')
     parser.add_argument('--trackname', type=str, default='track', help='Track')
     parser.add_argument('--use-quic', action='store_true', help='Enable QUIC transport')

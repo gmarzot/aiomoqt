@@ -15,7 +15,7 @@ def parse_args():
     
     parser = argparse.ArgumentParser(description='MOQT WebTransport Server')
     parser.add_argument('--host', type=str, default='localhost', help='Host to bind to')
-    parser.add_argument('--port', type=int, default=4433, help='Port to bind to')
+    parser.add_argument('--port', type=int, default=443, help='Port to bind to')
     parser.add_argument('--certificate', type=str, required=True, help='TLS server certificate')
     parser.add_argument('--private-key', type=str, required=True, help='TLS private key')
     parser.add_argument('--endpoint', type=str, default="moq", help='MOQT WebTransport endpoint')

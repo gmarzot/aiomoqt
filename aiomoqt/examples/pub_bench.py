@@ -3,12 +3,12 @@
 
 Usage:
   # H3/WebTransport (default)
-  python -m aiomoqt.examples.bench_pub https://relay.example.com:4433/moq
+  python -m aiomoqt.examples.bench_pub https://relay.example.com/moq
 
   # Raw QUIC
-  python -m aiomoqt.examples.bench_pub moqt://relay.example.com:4443
+  python -m aiomoqt.examples.bench_pub moqt://relay.example.com
 
-  # Bare hostname (defaults to https, port 4433, endpoint /moq)
+  # Bare hostname (defaults to https, port 443, endpoint /moq)
   python -m aiomoqt.examples.bench_pub relay.example.com
 
   # With options
@@ -246,13 +246,13 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 relay URL forms:
-  moqt://host:port            raw QUIC (default port 4443)
-  https://host:port/endpoint  H3/WebTransport (default port 4433)
+  moqt://host:port            raw QUIC (default port 443)
+  https://host:port/endpoint  H3/WebTransport (default port 443)
   host:port                   H3/WebTransport
-  host                        H3/WebTransport, port 4433, endpoint /moq
+  host                        H3/WebTransport, port 443, endpoint /moq
 
 examples:
-  %(prog)s moqt://relay.example.com:4443
+  %(prog)s moqt://relay.example.com
   %(prog)s relay.example.com -s 4096 -P 4
   %(prog)s relay.example.com --datagram -s 1100 -r 120 -t 60
 """)
