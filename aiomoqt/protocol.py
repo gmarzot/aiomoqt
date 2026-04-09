@@ -309,7 +309,7 @@ class MOQTSession(QuicConnectionProtocol):
             raise
  
     def _stream_task_done(self, stream_id: int, task: asyncio.Task) -> None:
-        logger.info(f"MOQT stream({stream_id}): stream task done: num stream tasks: {len(self._stream_tasks)}")
+        logger.debug(f"MOQT stream({stream_id}): stream task done: num stream tasks: {len(self._stream_tasks)}")
 
         if self._stream_tasks.pop(stream_id, None) is None:
             logger.error(f"MOQT stream({stream_id}): _stream_task_done error: stream task does not exist")
@@ -427,14 +427,14 @@ class MOQTSession(QuicConnectionProtocol):
                     logstr = f"{id} status: {status} size: {consumed} bytes {delay}"
                     if status != ObjectStatus.NORMAL:
                         if msg_obj.status in (ObjectStatus.END_OF_GROUP, ObjectStatus.END_OF_TRACK):
-                                logger.info(f"MOQT stream({stream_id}): {logstr}")
+                                logger.debug(f"MOQT stream({stream_id}): {logstr}")
                                 self._stream_queues[stream_id].closed = True
                                 return
-                    logger.info(f"MOQT stream({stream_id}): {logstr}")
+                    logger.debug(f"MOQT stream({stream_id}): {logstr}")
                     if self.on_object_received:
                         self.on_object_received(msg_obj, consumed, now, group_id, subgroup_id)
                 elif isinstance(msg_obj, SubgroupHeader):
-                    logger.info(f"MOQT stream({stream_id}): {msg_obj} size: {consumed} bytes")
+                    logger.debug(f"MOQT stream({stream_id}): {msg_obj} {consumed} bytes")
                     assert group_id is None or msg_obj.group_id > group_id
                     group_id = msg_obj.group_id
                     subgroup_id = msg_obj.subgroup_id
@@ -545,7 +545,7 @@ class MOQTSession(QuicConnectionProtocol):
             delay = f"delay: {now - msg_ts} ms" if msg_ts else ""
             logstr = f"{id} size: {consumed} bytes {delay}"
 
-            logger.info(f"MOQT event: ObjectDatagram: {logstr}")
+            logger.debug(f"MOQT event: ObjectDatagram: {logstr}")
             if self.on_object_received:
                 self.on_object_received(msg, consumed, now, group_id, None)
             return msg
@@ -567,7 +567,7 @@ class MOQTSession(QuicConnectionProtocol):
             delay = f"delay: {now - msg_ts} ms" if msg_ts else ""
             logstr = f"{id} size: {consumed} bytes {delay}"
 
-            logger.info(f"MOQT event: ObjectDatagramStatus: {logstr}")
+            logger.debug(f"MOQT event: ObjectDatagramStatus: {logstr}")
             return msg
         else:
             error = f"datagram type unknown: 0x{dgram_type:x}"
@@ -720,7 +720,7 @@ class MOQTSession(QuicConnectionProtocol):
                             task = asyncio.create_task(self._process_data_stream(stream_id))
                             self._stream_tasks[stream_id] = task
                             task.add_done_callback(partial(self._stream_task_done, stream_id))
-                            logger.info(f"MOQT event: creating _process_data_stream task: {stream_id} num streams: {len(self._data_streams)}")
+                            logger.debug(f"MOQT event: creating _process_data_stream task: {stream_id} num streams: {len(self._data_streams)}")
 
                         # Queue the event data buffer for processing
                         if msg_buf.tell() < msg_len:

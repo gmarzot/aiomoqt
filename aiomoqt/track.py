@@ -18,20 +18,15 @@ Usage:
 """
 import asyncio
 import time
-import uuid
 from enum import IntEnum
-from dataclasses import dataclass, field
-from functools import partial
-from typing import Optional, Dict, Callable, Union, Tuple, Any
+from typing import Optional, Callable
 
 from .types import (
-    MOQTMessageType, ParamType, ObjectStatus,
-    GroupOrder, FilterType, ContentExistsCode,
+    MOQTMessageType, ParamType,
     MOQT_TIMESTAMP_EXT,
 )
 from .messages import (
-    Subscribe, SubscribeOk, SubgroupHeader, Publish, PublishOk,
-    RequestUpdate, RequestOk,
+    SubgroupHeader, PublishOk, RequestUpdate,
 )
 from .context import is_draft16_or_later
 from .utils.logger import get_logger
@@ -175,17 +170,28 @@ class PublishedTrack(Track):
             self._generating = True
             await self.generate(session, self.track_alias)
 
+    _stats_header_printed = False
+
+    def _print_stats_header(self):
+        """Print the column header for periodic stats. Deferred to first interval."""
+        if self._stats_header_printed:
+            return
+        self._stats_header_printed = True
+        self._do_print_stats_header()
+
+    def _do_print_stats_header(self):
+        print(f"\n  {'Interval':<12}{'Groups':<18}{'Objects':<22}{'Bitrate'}")
+        print("  " + "─" * 60)
+
     async def generate(self, session, track_alias: int):
         """Generate data for subscribers. Override for custom content.
 
         Default implementation sends padded objects at the configured rate.
         """
+
         pad = b'\xBB' * self.object_size
         paced = self.rate > 0
         frame_interval = 1.0 / self.rate if paced else 0
-        total_sent = 0
-        total_bytes = 0
-        start_time = time.monotonic()
 
         for subgroup_id in range(self.num_subgroups):
             priority = self.priority if subgroup_id == 0 else 0
@@ -214,6 +220,7 @@ class PublishedTrack(Track):
         """Generate a single subgroup stream."""
         total_sent = 0
         total_bytes = 0
+        total_groups = 0
         start_time = time.monotonic()
         last_report = start_time
         iv_objects = 0
@@ -224,17 +231,17 @@ class PublishedTrack(Track):
 
         # Only subgroup 0 prints stats
         report = (subgroup_id == 0)
-        if report:
-            print(f"{'Interval':>10}  {'Obj':>7}  {'Rate':>8}  {'Thput':>9}")
-            print("─" * 42)
 
         cur_obj_id = subgroup_id
+        iv_groups = 0
         stream_id = session.open_uni_stream()
 
         try:
             while True:
                 if header is None or cur_obj_id >= self.group_size:
                     group_id += 1
+                    total_groups += 1
+                    iv_groups += 1
                     cur_obj_id = subgroup_id
 
                     if header is not None:
@@ -294,13 +301,18 @@ class PublishedTrack(Track):
                 if report and now - last_report >= report_interval:
                     dt = now - last_report
                     elapsed = now - start_time
-                    r = iv_objects / dt
+                    obj_s = iv_objects / dt
+                    grp_s = iv_groups / dt
                     mbps = (iv_bytes * 8) / (dt * 1e6)
                     iv = f"{elapsed - dt:.0f}-{elapsed:.0f}s"
-                    print(f"{iv:>10}  {iv_objects:>7}  "
-                          f"{r:>6.1f}/s  {mbps:>7.2f}Mb")
+                    self._print_stats_header()
+                    grp_col = f"{total_groups} ({grp_s:.1f}/s)"
+                    obj_col = f"{total_sent:,} ({obj_s:.1f}/s)"
+                    print(f"  {iv:<12}{grp_col:<18}"
+                          f"{obj_col:<22}{mbps:.2f} Mbps")
                     iv_objects = 0
                     iv_bytes = 0
+                    iv_groups = 0
                     last_report = now
 
                 if paced:
@@ -315,7 +327,10 @@ class PublishedTrack(Track):
             dur = time.monotonic() - start_time
             if dur > 0 and report:
                 mbps = (total_bytes * 8) / (dur * 1e6)
+                obj_s = total_sent / dur
                 print(f"\n  Sent: {total_sent:,} objects, "
+                      f"{total_groups} groups, "
+                      f"{obj_s:.1f} obj/s, "
                       f"{mbps:.2f} Mbps ({dur:.1f}s)")
             logger.info(f"Track: subgroup {subgroup_id} "
                         f"sent {total_sent} objects")
@@ -443,3 +458,241 @@ class SubscribedTrack(Track):
         except asyncio.TimeoutError:
             pass
         self.state = TrackState.CLOSED
+
+
+class VideoTrack(PublishedTrack):
+    """Simulates realistic video track with I/B/P frame sizes.
+
+    Models H.264/H.265 GOP structure with configurable frame sizes
+    and B-frame pattern. Each group = one GOP (1 second by default).
+
+    Usage:
+        track = VideoTrack(session, "live", "1080p-120fps",
+                           resolution="1080p", fps=120)
+        await track.publish()
+    """
+
+    # Typical frame sizes by resolution (bytes)
+    PROFILES = {
+        "720p":  {"i_frame": 80_000,  "p_frame": 12_000, "b_frame": 6_000},
+        "1080p": {"i_frame": 200_000, "p_frame": 25_000, "b_frame": 10_000},
+        "1440p": {"i_frame": 350_000, "p_frame": 40_000, "b_frame": 18_000},
+        "4k":    {"i_frame": 600_000, "p_frame": 60_000, "b_frame": 30_000},
+    }
+
+    def __init__(self, session, namespace: str, trackname: str = 'video',
+                 resolution: str = "1080p", fps: float = 30,
+                 gop_pattern: str = "ibp", gop_seconds: float = 1.0,
+                 i_frame_size: int = None, p_frame_size: int = None,
+                 b_frame_size: int = None,
+                 draft: Optional[int] = None, **kwargs):
+        # GOP = 1 second of frames by default
+        gop_size = int(fps * gop_seconds)
+
+        profile = self.PROFILES.get(resolution, self.PROFILES["1080p"])
+        self.i_frame_size = i_frame_size or profile["i_frame"]
+        self.p_frame_size = p_frame_size or profile["p_frame"]
+        self.b_frame_size = b_frame_size or profile["b_frame"]
+        self.gop_pattern_name = gop_pattern
+        self.fps = fps
+
+        # Build GOP pattern: I then repeating B..P sequence
+        self._gop = self._build_gop(gop_pattern, gop_size)
+
+        # Compute average object size for base class
+        total = sum(self._frame_size(ft) for ft in self._gop)
+        avg_size = total // len(self._gop)
+
+        super().__init__(
+            session, namespace, trackname,
+            object_size=avg_size,
+            group_size=gop_size,
+            num_subgroups=1,
+            rate=fps,
+            draft=draft,
+            **kwargs,
+        )
+
+    @staticmethod
+    def _build_gop(pattern: str, length: int) -> str:
+        """Build GOP frame type sequence.
+
+        ibp: I B B P B B P B B P ... (3:1 B-to-P ratio)
+        ip:  I P P P P P ...
+        ionly: I I I I ...
+        """
+        if pattern == "ibp":
+            gop = ['I']
+            while len(gop) < length:
+                gop.extend(['B', 'B', 'P'])
+            return ''.join(gop[:length])
+        elif pattern == "ip":
+            return 'I' + 'P' * (length - 1)
+        elif pattern == "ionly":
+            return 'I' * length
+        else:
+            # Custom pattern string, repeat to fill
+            reps = (length // len(pattern)) + 1
+            return (pattern * reps)[:length]
+
+    def _frame_size(self, frame_type: str) -> int:
+        if frame_type == 'I':
+            return self.i_frame_size
+        elif frame_type == 'P':
+            return self.p_frame_size
+        return self.b_frame_size
+
+    def _print_stats_header(self):
+        """Print GOP info and column header."""
+        gop_bytes = sum(self._frame_size(ft) for ft in self._gop)
+        gop_mbps = (gop_bytes * 8 * self.fps
+                    / self.group_size / 1e6)
+        print(f"  GOP:         {self.gop_pattern_name} "
+              f"({self.group_size} frames, "
+              f"{self.group_size / self.fps:.1f}s)")
+        print(f"  I/P/B:       {self.i_frame_size // 1000}KB / "
+              f"{self.p_frame_size // 1000}KB / "
+              f"{self.b_frame_size // 1000}KB")
+        print(f"  bitrate:     ~{gop_mbps:.1f} Mbps")
+        print(f"\n  {'Interval':<12}{'GOPs':<18}{'Objects':<22}{'Bitrate'}")
+        print("  " + "─" * 60)
+
+    async def _generate_subgroup(self, session, subgroup_id: int,
+                                  track_alias: int, priority: int,
+                                  pad: bytes, paced: bool,
+                                  frame_interval: float,
+                                  report_interval: float = 5.0):
+        """Generate video frames with variable I/B/P sizes."""
+        total_sent = 0
+        total_bytes = 0
+        total_groups = 0
+        start_time = time.monotonic()
+        last_report = start_time
+        iv_objects = 0
+        iv_bytes = 0
+        iv_groups = 0
+        next_frame_time = time.monotonic()
+        group_id = -1
+        header = None
+
+        report = (subgroup_id == 0)
+
+        cur_obj_id = subgroup_id
+        stream_id = session.open_uni_stream()
+
+        # Pre-generate padding per frame type
+        i_pad = b'\x49' * self.i_frame_size  # 'I'
+        p_pad = b'\x50' * self.p_frame_size  # 'P'
+        b_pad = b'\x42' * self.b_frame_size  # 'B'
+
+        try:
+            while True:
+                if header is None or cur_obj_id >= self.group_size:
+                    group_id += 1
+                    total_groups += 1
+                    iv_groups += 1
+                    cur_obj_id = subgroup_id
+
+                    if header is not None:
+                        if session._close_err:
+                            raise asyncio.CancelledError
+                        buf = header.end_group(
+                            object_id=self.group_size)
+                        session.stream_write(stream_id, buf.data,
+                                             end_stream=True)
+                        session.transmit()
+
+                        if stream_id in session._data_streams:
+                            del session._data_streams[stream_id]
+                        if stream_id in session._stream_tasks:
+                            session._stream_tasks[stream_id].cancel()
+                            del session._stream_tasks[stream_id]
+
+                        stream_id = session.open_uni_stream()
+
+                    header = SubgroupHeader(
+                        track_alias=track_alias,
+                        group_id=group_id,
+                        subgroup_id=subgroup_id,
+                        publisher_priority=255,
+                        extensions_present=True,
+                    )
+                    msg = header.serialize()
+                    if session._close_err is not None:
+                        raise asyncio.CancelledError
+                    await session.stream_write_drain(
+                        stream_id, msg.data)
+                    session.transmit()
+
+                # Frame type and size from GOP pattern
+                ft = self._gop[cur_obj_id % len(self._gop)]
+                frame_size = self._frame_size(ft)
+                if ft == 'I':
+                    frame_pad = i_pad
+                elif ft == 'P':
+                    frame_pad = p_pad
+                else:
+                    frame_pad = b_pad
+
+                seq_info = f"{group_id}.{cur_obj_id}.{ft}".encode()
+                payload = (seq_info + b'|'
+                           + frame_pad)[:frame_size]
+
+                extensions = {
+                    MOQT_TIMESTAMP_EXT: int(time.time() * 1000)}
+                buf = header.next_object(
+                    payload=payload,
+                    extensions=extensions,
+                    object_id=cur_obj_id)
+                obj_bytes = len(buf.data)
+                cur_obj_id += self.num_subgroups
+
+                if session._close_err is not None:
+                    raise asyncio.CancelledError
+                await session.stream_write_drain(
+                    stream_id, buf.data)
+                session.transmit()
+                total_sent += 1
+                total_bytes += obj_bytes
+                iv_objects += 1
+                iv_bytes += obj_bytes
+
+                now = time.monotonic()
+                if report and now - last_report >= report_interval:
+                    dt = now - last_report
+                    elapsed = now - start_time
+                    obj_s = iv_objects / dt
+                    grp_s = iv_groups / dt
+                    mbps = (iv_bytes * 8) / (dt * 1e6)
+                    iv = f"{elapsed - dt:.0f}-{elapsed:.0f}s"
+                    self._print_stats_header()
+                    grp_col = f"{total_groups} ({grp_s:.1f}/s)"
+                    obj_col = f"{total_sent:,} ({obj_s:.1f}/s)"
+                    print(f"  {iv:<12}{grp_col:<18}"
+                          f"{obj_col:<22}{mbps:.2f} Mbps")
+                    iv_objects = 0
+                    iv_bytes = 0
+                    iv_groups = 0
+                    last_report = now
+
+                if paced:
+                    next_frame_time += frame_interval
+                    sleep_time = max(0,
+                        next_frame_time - time.monotonic())
+                    await asyncio.sleep(sleep_time)
+                else:
+                    if total_sent % 64 == 0:
+                        await asyncio.sleep(0)
+
+        except asyncio.CancelledError:
+            dur = time.monotonic() - start_time
+            if dur > 0 and report:
+                mbps = (total_bytes * 8) / (dur * 1e6)
+                obj_s = total_sent / dur
+                print(f"\n  Sent: {total_sent:,} objects, "
+                      f"{total_groups} GOPs, "
+                      f"{obj_s:.1f} obj/s, "
+                      f"{mbps:.2f} Mbps ({dur:.1f}s)")
+            logger.info(f"VideoTrack: subgroup {subgroup_id} "
+                        f"sent {total_sent} objects")
+            raise

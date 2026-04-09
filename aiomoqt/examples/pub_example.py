@@ -10,7 +10,7 @@ from aiomoqt.messages import (
     ObjectDatagramStatus,
 )
 from aiomoqt.client import *
-from aiomoqt.track import PublishedTrack
+from aiomoqt.track import PublishedTrack, VideoTrack
 from aiomoqt.utils import *
 
 # Defaults
@@ -238,7 +238,14 @@ def parse_args():
     parser.add_argument('--draft', type=int, default=None, help='MoQT draft version (e.g. 14, 16)')
     parser.add_argument('-P', '--streams', type=int, default=1, help='Parallel subgroup streams (default: 1)')
     parser.add_argument('-s', '--object-size', type=int, default=1024, help='Object payload size bytes (default: 1024)')
+    parser.add_argument('-r', '--rate', type=float, default=30, help='Frames per second (default: 30)')
     parser.add_argument('-t', '--duration', type=int, default=120, help='Duration in seconds (default: 120)')
+    parser.add_argument('--video', type=str, default=None, metavar='RES',
+                        choices=['720p', '1080p', '1440p', '4k'],
+                        help='Video simulation mode with I/B/P frames (720p, 1080p, 1440p, 4k)')
+    parser.add_argument('--gop-pattern', type=str, default='ibp',
+                        choices=['ibp', 'ip', 'ionly'],
+                        help='GOP pattern (default: ibp)')
 
     return parser.parse_args()
 
@@ -246,7 +253,8 @@ def parse_args():
 async def main(host: str, port: int, endpoint: str, namespace: str, trackname: str,
                debug: bool, datagram: bool, use_quic: bool, quic_debug: bool,
                insecure: bool = False, auth_token: str = None, draft: int = None,
-               streams: int = 1, object_size: int = 1024, duration: int = 120):
+               streams: int = 1, object_size: int = 1024, rate: float = 30,
+               duration: int = 120, video: str = None, gop_pattern: str = 'ibp'):
     log_level = logging.DEBUG if debug else logging.INFO
     set_log_level(log_level)
     logger = get_logger(__name__)
@@ -263,23 +271,36 @@ async def main(host: str, port: int, endpoint: str, namespace: str, trackname: s
         keylog_filename=args.keylogfile,
     )
 
+    auth = auth_token.encode() if auth_token else b""
+
     logger.info(f"MOQT app: publish session connecting: {client}")
     async with client.connect() as session:
         try:
             await session.client_session_init()
 
-            track = PublishedTrack(
-                session,
-                namespace=namespace,
-                trackname=trackname,
-                object_size=object_size,
-                group_size=GROUP_SIZE,
-                num_subgroups=streams,
-                rate=30,
-                draft=draft,
-                auth_token=(auth_token.encode()
-                            if auth_token else b""),
-            )
+            if video:
+                track = VideoTrack(
+                    session,
+                    namespace=namespace,
+                    trackname=trackname,
+                    resolution=video,
+                    fps=rate,
+                    gop_pattern=gop_pattern,
+                    draft=draft,
+                    auth_token=auth,
+                )
+            else:
+                track = PublishedTrack(
+                    session,
+                    namespace=namespace,
+                    trackname=trackname,
+                    object_size=object_size,
+                    group_size=GROUP_SIZE,
+                    num_subgroups=streams,
+                    rate=rate,
+                    draft=draft,
+                    auth_token=auth,
+                )
             await track.publish()
             logger.info(f"MOQT app: published {track.fqtn}")
 
@@ -309,7 +330,10 @@ if __name__ == "__main__":
             draft=args.draft,
             streams=args.streams,
             object_size=args.object_size,
+            rate=args.rate,
             duration=args.duration,
+            video=args.video,
+            gop_pattern=args.gop_pattern,
         ))
 
     except KeyboardInterrupt:

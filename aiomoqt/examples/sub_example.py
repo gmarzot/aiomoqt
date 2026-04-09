@@ -33,36 +33,77 @@ import time
 
 
 class SimpleStats:
-    """Lightweight stats for sub_example."""
+    """Lightweight stats for sub_example with latency tracking."""
+    TIMESTAMP_EXT = 0x20  # MOQT_TIMESTAMP_EXT
+
     def __init__(self, interval: float = 5.0):
         self.interval = interval
         self.start = 0.0
         self.last_report = 0.0
         self.iv_objects = 0
         self.iv_bytes = 0
+        self.iv_groups = set()
+        self.iv_latencies = []
         self.total_objects = 0
         self.total_bytes = 0
+        self.total_groups = set()
+        self.all_latencies = []
+        self._header_printed = False
 
-    def on_object(self, msg, size_bytes, recv_time_ms, group_id=None, subgroup_id=None):
+    def _print_header(self):
+        if self._header_printed:
+            return
+        self._header_printed = True
+        print(f"\n  {'Interval':<12}{'Groups':<18}"
+              f"{'Objects':<22}{'Bitrate':<14}{'Latency'}")
+        print("  " + "─" * 72)
+
+    def on_object(self, msg, size_bytes, recv_time_ms,
+                  group_id=None, subgroup_id=None):
         now = time.monotonic()
         if self.start == 0:
             self.start = now
             self.last_report = now
-            print(f"{'Interval':>10}  {'Obj':>7}  {'Rate':>8}  {'Thput':>9}")
-            print("─" * 42)
+
         self.iv_objects += 1
         self.iv_bytes += size_bytes
+        if group_id is not None:
+            self.iv_groups.add(group_id)
+            self.total_groups.add(group_id)
         self.total_objects += 1
         self.total_bytes += size_bytes
+
+        # Latency from timestamp extension
+        send_ms = (msg.extensions.get(self.TIMESTAMP_EXT)
+                   if msg.extensions else None)
+        if send_ms is not None:
+            latency = recv_time_ms - send_ms
+            if abs(latency) < 60000:
+                self.iv_latencies.append(latency)
+                self.all_latencies.append(latency)
+
         if now - self.last_report >= self.interval:
+            self._print_header()
             dt = now - self.last_report
             elapsed = now - self.start
-            rate = self.iv_objects / dt
+            obj_s = self.iv_objects / dt
+            grps = len(self.total_groups)
+            grp_s = len(self.iv_groups) / dt
             mbps = (self.iv_bytes * 8) / (dt * 1e6)
             iv = f"{elapsed - dt:.0f}-{elapsed:.0f}s"
-            print(f"{iv:>10}  {self.iv_objects:>7}  {rate:>6.1f}/s  {mbps:>7.2f}Mb")
+            grp_col = f"{grps} ({grp_s:.1f}/s)"
+            obj_col = f"{self.total_objects:,} ({obj_s:.1f}/s)"
+            lat = ""
+            if self.iv_latencies:
+                avg = sum(self.iv_latencies) / len(self.iv_latencies)
+                lat = f"{avg:.0f} ms"
+            print(f"  {iv:<12}{grp_col:<18}"
+                  f"{obj_col:<22}{mbps:.2f} Mbps"
+                  f"{'':>4}{lat}")
             self.iv_objects = 0
             self.iv_bytes = 0
+            self.iv_groups = set()
+            self.iv_latencies = []
             self.last_report = now
 
     def summary(self):
@@ -72,9 +113,18 @@ class SimpleStats:
         dur = time.monotonic() - self.start
         if dur <= 0:
             return
-        rate = self.total_objects / dur
+        obj_s = self.total_objects / dur
+        grps = len(self.total_groups)
         mbps = (self.total_bytes * 8) / (dur * 1e6)
-        print(f"\n  Total: {self.total_objects:,} objects, {mbps:.2f} Mbps, {rate:.1f} obj/s ({dur:.1f}s)")
+        lat_s = ""
+        if self.all_latencies:
+            avg = sum(self.all_latencies) / len(self.all_latencies)
+            p50 = sorted(self.all_latencies)[len(self.all_latencies) // 2]
+            lat_s = f", latency avg={avg:.0f}ms p50={p50:.0f}ms"
+        print(f"\n  Total: {self.total_objects:,} objects, "
+              f"{grps:,} groups, "
+              f"{obj_s:.1f} obj/s, "
+              f"{mbps:.2f} Mbps{lat_s} ({dur:.1f}s)")
 
 
 async def main(host: str, port: int, endpoint: str, namespace: str, track_name: str,
