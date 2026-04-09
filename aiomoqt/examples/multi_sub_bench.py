@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""moqbench fanout — 1 publisher, N subscribers through a relay.
+"""moqbench multi-sub — 1 publisher, N subscribers through a relay.
 
 Tests relay fan-out capacity by spawning one publisher process
 and N subscriber processes, each with its own QUIC connection.
 
 Usage:
   # 100 subscribers, 1080p 30fps, through local moqx
-  python -m aiomoqt.examples.fanout_bench \
+  python -m aiomoqt.examples.multi_sub_bench \
     moqt://localhost:4433 --video 1080p -r 30 -n 100 -t 60
 
   # 50 subscribers, 1KB objects at 120fps
-  python -m aiomoqt.examples.fanout_bench \
+  python -m aiomoqt.examples.multi_sub_bench \
     moqt://localhost:4433 -s 1024 -r 120 -n 50 -t 30 -k
 """
 import argparse
@@ -28,7 +28,7 @@ from aiomoqt.utils.url import parse_relay_url
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='moqbench fanout — 1 pub, N subs',
+        description='moqbench multi-sub — 1 pub, N subs',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument('relay', type=str,
@@ -57,17 +57,30 @@ def parse_args():
     parser.add_argument('-d', '--debug', action='store_true')
     parser.add_argument('--stagger', type=float, default=0.1,
                         help='Delay between subscriber spawns (default: 0.1s)')
+    parser.add_argument('--startup', type=float, default=5.0,
+                        help='Seconds to wait for publisher before spawning subs (default: 5)')
+    parser.add_argument('--logdir', type=str, default=None,
+                        help='Directory for per-process debug logs (pub.log, sub-N.log)')
     return parser.parse_args()
 
 
 def run_publisher(relay_url, namespace, trackname, args):
-    """Publisher process — output suppressed."""
+    """Publisher process."""
     import logging
     devnull = open(os.devnull, 'w')
     sys.stdout = devnull
     sys.stderr = devnull
-    logging.basicConfig(stream=devnull, force=True)
-    set_log_level(logging.CRITICAL)
+    if args.logdir:
+        os.makedirs(args.logdir, exist_ok=True)
+        logfile = os.path.join(args.logdir, 'pub.log')
+        lvl = logging.DEBUG if args.debug else logging.INFO
+        logging.basicConfig(filename=logfile, force=True,
+                            level=lvl,
+                            format='%(asctime)s %(levelname)s %(message)s')
+        set_log_level(lvl)
+    else:
+        logging.basicConfig(stream=devnull, force=True)
+        set_log_level(logging.CRITICAL)
 
     async def _pub():
         relay = parse_relay_url(relay_url, force_quic=args.force_quic)
@@ -105,14 +118,24 @@ def run_publisher(relay_url, namespace, trackname, args):
         pass
 
 
-def run_subscriber(sub_id, relay_url, namespace, args, result_dict):
-    """Subscriber process — output suppressed, results in shared dict."""
+def run_subscriber(sub_id, relay_url, namespace, trackname, args,
+                   result_dict):
+    """Subscriber process — results in shared dict."""
     import logging
     devnull = open(os.devnull, 'w')
     sys.stdout = devnull
     sys.stderr = devnull
-    logging.basicConfig(stream=devnull, force=True)
-    set_log_level(logging.CRITICAL)
+    if args.logdir:
+        os.makedirs(args.logdir, exist_ok=True)
+        logfile = os.path.join(args.logdir, f'sub-{sub_id}.log')
+        lvl = logging.DEBUG if args.debug else logging.INFO
+        logging.basicConfig(filename=logfile, force=True,
+                            level=lvl,
+                            format='%(asctime)s %(levelname)s %(message)s')
+        set_log_level(lvl)
+    else:
+        logging.basicConfig(stream=devnull, force=True)
+        set_log_level(logging.CRITICAL)
 
     stats = {'id': sub_id, 'objects': 0, 'bytes': 0,
              'latencies': [], 'duration': 0, 'error': None}
@@ -139,8 +162,12 @@ def run_subscriber(sub_id, relay_url, namespace, args, result_dict):
         try:
             async with client.connect() as session:
                 await session.client_session_init()
+                # d16: trackname=None triggers auto-discovery
+                # d14: must pass trackname explicitly
+                tn = None if args.draft and args.draft >= 16 else trackname
                 track = SubscribedTrack(
                     session, namespace,
+                    trackname=tn,
                     draft=args.draft,
                     on_object=on_object,
                 )
@@ -175,7 +202,7 @@ def main():
     relay_url = args.relay
 
     print("─" * 60)
-    print("  moqbench fanout")
+    print("  moqbench multi-sub")
     print("─" * 60)
     print(f"  relay:        {relay_url}")
     print(f"  namespace:    {args.namespace}")
@@ -204,7 +231,8 @@ def main():
     pub_proc.start()
 
     # Wait for publisher to register with relay
-    time.sleep(2.0)
+    print(f"  Waiting {args.startup}s for publisher to register...")
+    time.sleep(args.startup)
 
     # Spawn subscribers
     print(f"  Spawning {args.subscribers} subscribers "
@@ -213,7 +241,8 @@ def main():
     for i in range(args.subscribers):
         p = multiprocessing.Process(
             target=run_subscriber,
-            args=(i, relay_url, args.namespace, args, results),
+            args=(i, relay_url, args.namespace, trackname,
+                  args, results),
             daemon=True,
         )
         p.start()
@@ -244,13 +273,18 @@ def main():
 
     # Report
     print("\n" + "═" * 60)
-    print("  moqbench fanout results")
+    print("  moqbench multi-sub results")
     print("═" * 60)
 
     total_objects = 0
     total_bytes = 0
     all_lats = []
     errors = 0
+    resets = 0
+
+    def _sub_expected(r):
+        """Expected objects based on subscriber's actual run time."""
+        return int(args.rate * r['duration'] * 0.85)
 
     for i in range(args.subscribers):
         r = results.get(i)
@@ -259,19 +293,21 @@ def main():
             continue
         if r['error']:
             errors += 1
+        elif r['objects'] < _sub_expected(r):
+            resets += 1
         total_objects += r['objects']
         total_bytes += r['bytes']
         if r['lat_avg'] > 0:
             all_lats.append(r['lat_avg'])
 
     n = args.subscribers
-    active = n - errors
-    avg_objects = total_objects / active if active else 0
-    avg_mbps = (total_bytes * 8) / (args.duration * 1e6) if active else 0
-    per_sub_mbps = avg_mbps / active if active else 0
+    ok = n - errors - resets
+    avg_objects = total_objects / n if n else 0
+    avg_mbps = (total_bytes * 8) / (args.duration * 1e6) if n else 0
+    per_sub_mbps = avg_mbps / n if n else 0
 
-    print(f"  Subscribers:   {active}/{n} active "
-          f"({errors} errors)")
+    print(f"  Subscribers:   {ok}/{n} ok"
+          f"  ({errors} errors, {resets} resets)")
     print(f"  Total objects: {total_objects:,} "
           f"({avg_objects:,.0f} avg/sub)")
     print(f"  Total output:  {avg_mbps:.2f} Mbps "
@@ -283,17 +319,23 @@ def main():
     # Per-subscriber detail
     print(f"\n  {'Sub':>4}  {'Objects':>8}  {'Mbps':>8}  "
           f"{'Latency':>8}  {'Status'}")
-    print("  " + "─" * 48)
+    print("  " + "─" * 52)
     for i in range(min(n, 20)):  # show first 20
         r = results.get(i)
         if r is None:
             print(f"  {i:>4}  {'???':>8}  {'???':>8}  "
-                  f"{'???':>8}  no result")
+                  f"{'???':>8}  NO RESULT")
             continue
         dur = r['duration'] or 1
         mbps = (r['bytes'] * 8) / (dur * 1e6)
         lat = f"{r['lat_avg']:.0f}ms" if r['lat_avg'] else "n/a"
-        status = r['error'] or "ok"
+        if r['error']:
+            status = r['error']
+        elif r['objects'] < _sub_expected(r):
+            status = (f"reset ({r['objects']}/"
+                      f"{_sub_expected(r)})")
+        else:
+            status = "ok"
         print(f"  {i:>4}  {r['objects']:>8}  {mbps:>7.2f}"
               f"  {lat:>8}  {status}")
     if n > 20:

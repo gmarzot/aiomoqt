@@ -23,10 +23,21 @@ Repository = "https://github.com/gmarzot/aiomoqt.git"
 test = [
     "pytest",
 ]
-
+dev = [
+    "pytest",
+    "ruff",
+    "ty",
+]
 examples = [
     "argparse",
 ]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E501"]  # line length handled by formatter
 
 [build-system]
 requires = ["setuptools>=45", "setuptools_scm[toml]>=6.2"]
