@@ -786,7 +786,7 @@ class MOQTSession(QuicConnectionProtocol):
                 logger.error(f"H3 error: error handling event: {e}")
                 raise
         else:
-            logger.error(f"QUIC event: event not handled({event_class})")
+            logger.debug(f"QUIC event: event not handled({event_class})")
   
     def _h3_handle_event(self, event: QuicEvent) -> None:
         """Handle H3-specific events."""
