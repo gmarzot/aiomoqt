@@ -1,38 +1,36 @@
 #!/usr/bin/env python3
-"""moqperf loopback - direct pub-to-sub benchmark without a relay.
+"""moqbench loopback - direct pub-to-sub benchmark without a relay.
 
 Runs the publisher as a server that the subscriber connects to directly.
 This measures pure Python/qh3 throughput without relay overhead.
 
 Usage:
-  python -m aiomoqt.examples.bench_loopback -s 4096 -r 5000 -t 20
-  python -m aiomoqt.examples.bench_loopback -D -s 1100 -r 20000
+  python -m aiomoqt.examples.loopback_bench -s 4096 -r 5000 -t 20
+  python -m aiomoqt.examples.loopback_bench -P 4 -s 16384 -r 60 -t 20
 """
 import argparse
 import asyncio
 import logging
 import ssl
-from functools import partial
 
 from qh3.quic.configuration import QuicConfiguration
 from qh3.asyncio.server import serve
 from qh3.h3.connection import H3_ALPN
 
-from aiomoqt.types import MOQTMessageType, ParamType, MOQTRequestError
+from aiomoqt.types import MOQTMessageType, ParamType
 from aiomoqt.client import MOQTClient
 from aiomoqt.protocol import MOQTPeer, MOQTSession
+from aiomoqt.track import PublishedTrack, SubscribedTrack
 from aiomoqt.utils.logger import set_log_level, get_logger
-from aiomoqt.examples.pub_bench import (
-    subscribe_data_generator,
-    dgram_subscribe_data_generator,
-)
 from aiomoqt.examples.sub_bench import BenchStats
+
 
 def _find_default_cert():
     """Search common locations for test certificates."""
     import os
     candidates = [
-        os.path.join(os.path.dirname(__file__), '..', '..', 'certs', 'cert.pem'),
+        os.path.join(os.path.dirname(__file__),
+                     '..', '..', 'certs', 'cert.pem'),
         os.path.expanduser('~/.local/share/moqt/cert.pem'),
     ]
     for c in candidates:
@@ -46,12 +44,9 @@ KEY = CERT.replace('cert.pem', 'key.pem') if CERT else None
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='moqperf loopback - direct pub/sub, no relay',
+        description='moqbench loopback - direct pub/sub, no relay',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument(
-        '-D', '--datagram', action='store_true',
-        help='Use datagrams instead of streams')
     parser.add_argument(
         '-s', '--object-size', type=int, default=4096,
         help='Object payload size bytes (default: 4096)')
@@ -83,14 +78,13 @@ def parse_args():
 
 
 def print_banner(args):
-    mode = "DATAGRAM" if args.datagram else f"STREAM x{args.streams}"
+    mode = f"STREAM x{args.streams}"
     if args.rate > 0:
-        n = 1 if args.datagram else args.streams
         rate_s = f"{args.rate}/s per stream"
     else:
         rate_s = "max"
     print("─" * 56)
-    print("  moqperf loopback (no relay)")
+    print("  moqbench loopback (no relay)")
     print("─" * 56)
     print(f"  mode:        {mode}")
     print(f"  object size: {args.object_size} B")
@@ -101,24 +95,33 @@ def print_banner(args):
     print("─" * 56)
 
 
+async def _on_subscribe(session, msg, args):
+    """Server-side subscribe handler using PublishedTrack."""
+    track = PublishedTrack(
+        session,
+        namespace="bench",
+        trackname="track",
+        object_size=args.object_size,
+        group_size=args.group_size,
+        num_subgroups=args.streams,
+        rate=args.rate,
+    )
+    # d14 direct connection: respond with subscribe_ok and generate
+    ok = session.subscribe_ok(request_msg=msg)
+    track.track_alias = ok.track_alias
+    track._generating = True
+    await track.generate(session, ok.track_alias)
+
+
 async def run_server(args):
     """Run a server that generates data when subscribers connect."""
+    from functools import partial
+
     server_peer = MOQTPeer()
     server_peer.endpoint = "moq"
-
-    # Register the data generator as the subscribe handler
-    if args.datagram:
-        handler = partial(dgram_subscribe_data_generator,
-                          object_size=args.object_size,
-                          group_size=args.group_size,
-                          rate=args.rate)
-    else:
-        handler = partial(subscribe_data_generator,
-                          num_tasks=args.streams,
-                          object_size=args.object_size,
-                          group_size=args.group_size,
-                          rate=args.rate)
-    server_peer.register_handler(MOQTMessageType.SUBSCRIBE, handler)
+    server_peer.register_handler(
+        MOQTMessageType.SUBSCRIBE,
+        partial(_on_subscribe, args=args))
 
     config = QuicConfiguration(
         is_client=False,
@@ -153,34 +156,20 @@ async def run_subscriber(args, stats):
 
     try:
         async with client.connect() as session:
-            session.on_object_received = stats.on_object
-
             await session.client_session_init()
 
-            await session.subscribe_namespace(
-                namespace_prefix="bench",
-                parameters={ParamType.AUTH_TOKEN: b"bench"},
-                wait_response=True,
-            )
-
-            await session.subscribe(
+            track = SubscribedTrack(
+                session,
                 namespace="bench",
-                track_name="track",
-                parameters={
-                    ParamType.AUTH_TOKEN: b"bench",
-                },
-                wait_response=True,
+                trackname="track",
+                on_object=stats.on_object,
             )
+            # d14 direct: explicit subscribe (no relay, no PUBLISH flow)
+            await track.subscribe()
 
             print("  Subscriber connected, receiving...\n")
 
-            try:
-                await asyncio.wait_for(
-                    session.async_closed(),
-                    timeout=args.duration,
-                )
-            except asyncio.TimeoutError:
-                pass
+            await track.wait_closed(timeout=args.duration)
     except Exception as e:
         print(f"  Subscriber error: {e}")
 
@@ -194,7 +183,8 @@ async def main():
     print_banner(args)
 
     if not args.cert or not args.key:
-        print("  Error: TLS certificate required. Use --cert and --key,")
+        print("  Error: TLS certificate required. "
+              "Use --cert and --key,")
         print("  or place cert.pem/key.pem in <project>/certs/")
         return
 

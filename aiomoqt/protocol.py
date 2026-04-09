@@ -144,6 +144,11 @@ class MOQTSession(QuicConnectionProtocol):
         #   fn(msg, size_bytes, recv_time_ms, group_id, subgroup_id)
         self.on_object_received: Optional[Callable] = None
 
+        # Queue for namespace announcements (populated by _handle_namespace)
+        self._namespace_announcements: asyncio.Queue = asyncio.Queue()
+        # Queue for track announcements (populated by _handle_publish)
+        self._publish_announcements: asyncio.Queue = asyncio.Queue()
+
     # -- Error response types (any version) --
     _ERROR_TYPES = (SubscribeError, PublishError, FetchError,
                     PublishNamespaceError, SubscribeNamespaceError,
@@ -320,8 +325,11 @@ class MOQTSession(QuicConnectionProtocol):
             e = task.exception()
             if e:
                 error_code = QuicErrorCode.APPLICATION_ERROR
-                import traceback
-                logger.error(f"MOQT stream({stream_id}): task failed with exception: {type(e).__name__}\n{''.join(traceback.format_exception(e))}")
+                if isinstance(e, TimeoutError):
+                    logger.debug(f"MOQT stream({stream_id}): stream idle timeout")
+                else:
+                    import traceback
+                    logger.error(f"MOQT stream({stream_id}): task failed with exception: {type(e).__name__}\n{''.join(traceback.format_exception(e))}")
             else:
                 logger.debug(f"MOQT stream({stream_id}): task completed")
                 
@@ -363,7 +371,7 @@ class MOQTSession(QuicConnectionProtocol):
                         break
                         
             except asyncio.TimeoutError:
-                logger.warning(f"MOQT stream({stream_id}): idle timeout: {group_id}.{subgroup_id}.{object_id}")
+                logger.debug(f"MOQT stream({stream_id}): idle timeout: {group_id}.{subgroup_id}.{object_id}")
                 raise
             
             # if more data was needed, add it to re_buf accumulator and reprocess
@@ -1460,6 +1468,35 @@ class MOQTSession(QuicConnectionProtocol):
 
         return self._await_response(request_id)
 
+    def publish(
+        self,
+        namespace: Union[str, Tuple[str, ...]],
+        track_name: str,
+        content_exists: int = 0,
+        parameters: Optional[Dict[int, Any]] = None,
+        wait_response: Optional[bool] = False,
+    ) -> Optional[MOQTMessage]:
+        """PUBLISH — announce a specific track to the relay/subscriber."""
+        namespace_tuple = self._make_namespace_tuple(namespace)
+        request_id = self._allocate_request_id()
+        track_alias = self._allocate_track_alias(request_id)
+        track_name_bytes = track_name.encode() if isinstance(track_name, str) else track_name
+        message = Publish(
+            request_id=request_id,
+            track_namespace=namespace_tuple,
+            track_name=track_name_bytes,
+            track_alias=track_alias,
+            content_exists=content_exists,
+            parameters=parameters or {},
+        )
+        logger.info(f"MOQT send: {message}")
+        self.send_control_message(message.serialize())
+
+        if not wait_response:
+            return message
+
+        return self._await_response(request_id)
+
     def publish_namepace_ok(
         self,
         msg: PublishNamespace,
@@ -1544,6 +1581,24 @@ class MOQTSession(QuicConnectionProtocol):
         else:
             self.send_control_message(message.serialize())
         return message
+
+    async def await_namespace(self, timeout: float = 10.0):
+        """Wait for a NAMESPACE announcement from the relay.
+
+        Returns the Namespace message with namespace_suffix, or raises
+        TimeoutError if no announcement arrives within timeout.
+        """
+        return await asyncio.wait_for(
+            self._namespace_announcements.get(), timeout=timeout)
+
+    async def await_publish(self, timeout: float = 10.0):
+        """Wait for a PUBLISH (track announcement) from the relay.
+
+        Returns the Publish message with track_namespace and track_name,
+        or raises TimeoutError if no announcement arrives within timeout.
+        """
+        return await asyncio.wait_for(
+            self._publish_announcements.get(), timeout=timeout)
 
     def unsubscribe_namespace(
         self,
@@ -1739,7 +1794,7 @@ class MOQTSession(QuicConnectionProtocol):
 
     async def _handle_publish(self, msg: Publish) -> None:
         logger.info(f"MOQT event: handle {msg}")
-        # Publisher has announced a track — accept by default
+        self._publish_announcements.put_nowait(msg)
 
     async def _handle_publish_ok(self, msg: PublishOk) -> None:
         logger.info(f"MOQT event: handle {msg}")
@@ -1835,6 +1890,7 @@ class MOQTSession(QuicConnectionProtocol):
 
     async def _handle_namespace(self, msg) -> None:
         logger.info(f"MOQT event: handle Namespace: {msg}")
+        self._namespace_announcements.put_nowait(msg)
 
     async def _handle_namespace_done(self, msg) -> None:
         logger.info(f"MOQT event: handle NamespaceDone: {msg}")

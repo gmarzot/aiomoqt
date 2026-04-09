@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""moqperf subscriber - receives MoQT objects and reports stats.
+"""moqbench subscriber - receives MoQT objects and reports stats.
 
 Usage:
   # H3/WebTransport (default)
@@ -22,11 +22,13 @@ from aiomoqt.types import (
     MOQT_TIMESTAMP_EXT, ObjectStatus,
 )
 from aiomoqt.client import MOQTClient
-from aiomoqt.messages import (
-    ObjectHeader, ObjectDatagram,
-)
+from aiomoqt.messages import ObjectDatagram
+from aiomoqt.track import SubscribedTrack
 from aiomoqt.utils.logger import set_log_level, get_logger
 from aiomoqt.utils.url import parse_relay_url
+
+
+logger = get_logger(__name__)
 
 
 class BenchStats:
@@ -73,8 +75,14 @@ class BenchStats:
                    if msg.extensions else None)
         if send_ms is not None:
             latency = recv_time_ms - send_ms
-            self.iv_latencies.append(latency)
-            self.all_latencies.append(latency)
+            # Reject corrupt timestamps (>60s latency = parse error)
+            if abs(latency) > 60000:
+                logger.warning(f"BenchStats: corrupt timestamp: "
+                               f"send={send_ms} recv={recv_time_ms}")
+                send_ms = None
+            else:
+                self.iv_latencies.append(latency)
+                self.all_latencies.append(latency)
 
             # RFC 3550 jitter
             if self.last_recv_ms > 0:
@@ -180,7 +188,7 @@ class BenchStats:
 
         print()
         print("═" * 56)
-        print(f"  moqperf results  ({dur:.1f}s)")
+        print(f"  moqbench results  ({dur:.1f}s)")
         print("═" * 56)
         print(f"  Objects:     {self.total_objects:,}")
         print(f"  Bytes:       {self.total_bytes:,}")
@@ -217,7 +225,7 @@ class BenchStats:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='moqperf subscriber - MoQT benchmark receiver',
+        description='moqbench subscriber - MoQT benchmark receiver',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 relay URL forms:
@@ -238,14 +246,12 @@ examples:
     parser.add_argument(
         '-Q', '--force-quic', action='store_true',
         help='Force raw QUIC even for https:// URLs')
-    import time
-    _ts = hex(int(time.time()) // 60 & 0xFFF)[2:]
     parser.add_argument(
-        '-n', '--namespace', type=str, default=f'bench/{_ts}',
-        help='MoQT namespace (default: bench/<time>)')
+        '-n', '--namespace', type=str, default='bench',
+        help='MoQT namespace (default: bench)')
     parser.add_argument(
-        '--trackname', type=str, default='track',
-        help='MoQT track name (default: track)')
+        '--trackname', type=str, default=None,
+        help='MoQT track name (default: auto-discover from namespace)')
     parser.add_argument(
         '-t', '--duration', type=int, default=30,
         help='Duration in seconds (default: 30)')
@@ -267,11 +273,12 @@ examples:
 
 def print_banner(relay, args):
     print("─" * 56)
-    print("  moqperf subscriber")
+    print("  moqbench subscriber")
     print("─" * 56)
     print(f"  relay:       {relay}")
     print(f"  transport:   {relay.transport_name}")
-    print(f"  namespace:   {args.namespace}/{args.trackname}")
+    print(f"  namespace:   {args.namespace}")
+    print(f"  trackname:   {args.trackname or '(auto-discover)'}")
     print(f"  duration:    {args.duration}s")
     print(f"  interval:    {args.interval}s")
     print("─" * 56)
@@ -300,41 +307,20 @@ async def run(args):
     try:
         print("  Connecting...")
         async with client.connect() as session:
-            session.on_object_received = stats.on_object
-
             try:
                 await session.client_session_init()
 
-                if args.draft and args.draft >= 16:
-                    await session.subscribe_namespace(
-                        namespace_prefix=args.namespace,
-                        parameters={},
-                        wait_response=True,
-                    )
-
-                sub_params = {}
-                if not args.draft or args.draft < 16:
-                    sub_params = {
-                        ParamType.MAX_CACHE_DURATION: 100,
-                        ParamType.AUTH_TOKEN: b"bench-token",
-                        ParamType.DELIVERY_TIMEOUT: 10,
-                    }
-                await session.subscribe(
+                track = SubscribedTrack(
+                    session,
                     namespace=args.namespace,
-                    track_name=args.trackname,
-                    parameters=sub_params,
-                    wait_response=True,
+                    trackname=args.trackname,
+                    draft=args.draft,
+                    on_object=stats.on_object,
                 )
+                await track.subscribe()
+                print(f"  Subscribed to '{track.fqtn}', receiving...\n")
 
-                print("  Subscribed, receiving...\n")
-
-                try:
-                    await asyncio.wait_for(
-                        session.async_closed(),
-                        timeout=args.duration,
-                    )
-                except asyncio.TimeoutError:
-                    pass
+                await track.wait_closed(timeout=args.duration)
 
             except MOQTRequestError as e:
                 print(f"  Request error: {e}")

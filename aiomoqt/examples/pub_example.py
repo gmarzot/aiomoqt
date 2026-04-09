@@ -10,6 +10,7 @@ from aiomoqt.messages import (
     ObjectDatagramStatus,
 )
 from aiomoqt.client import *
+from aiomoqt.track import PublishedTrack
 from aiomoqt.utils import *
 
 # Defaults
@@ -237,6 +238,7 @@ def parse_args():
     parser.add_argument('--draft', type=int, default=None, help='MoQT draft version (e.g. 14, 16)')
     parser.add_argument('-P', '--streams', type=int, default=1, help='Parallel subgroup streams (default: 1)')
     parser.add_argument('-s', '--object-size', type=int, default=1024, help='Object payload size bytes (default: 1024)')
+    parser.add_argument('-t', '--duration', type=int, default=120, help='Duration in seconds (default: 120)')
 
     return parser.parse_args()
 
@@ -244,7 +246,7 @@ def parse_args():
 async def main(host: str, port: int, endpoint: str, namespace: str, trackname: str,
                debug: bool, datagram: bool, use_quic: bool, quic_debug: bool,
                insecure: bool = False, auth_token: str = None, draft: int = None,
-               streams: int = 1, object_size: int = 1024):
+               streams: int = 1, object_size: int = 1024, duration: int = 120):
     log_level = logging.DEBUG if debug else logging.INFO
     set_log_level(log_level)
     logger = get_logger(__name__)
@@ -260,30 +262,28 @@ async def main(host: str, port: int, endpoint: str, namespace: str, trackname: s
         quic_debug=quic_debug,
         keylog_filename=args.keylogfile,
     )
-    # Register our data gen version of the subscribe handler
-    if datagram:
-        client.register_handler(MOQTMessageType.SUBSCRIBE, dgram_subscribe_data_generator)
-    else:
-        from functools import partial
-        handler = partial(subscribe_data_generator, num_tasks=streams, object_size=object_size)
-        client.register_handler(MOQTMessageType.SUBSCRIBE, handler)
 
     logger.info(f"MOQT app: publish session connecting: {client}")
     async with client.connect() as session:
         try:
             await session.client_session_init()
 
-            logger.info(f"MOQT app: publish_namespace: {namespace}")
-            params = {ParamType.AUTH_TOKEN: auth_token.encode()} if auth_token else {}
-            response = await session.publish_namespace(
+            track = PublishedTrack(
+                session,
                 namespace=namespace,
-                parameters=params,
-                wait_response=True,
+                trackname=trackname,
+                object_size=object_size,
+                group_size=GROUP_SIZE,
+                num_subgroups=streams,
+                rate=30,
+                draft=draft,
+                auth_token=(auth_token.encode()
+                            if auth_token else b""),
             )
-            logger.info(f"MOQT app: publish_namespace response: {response}")
+            await track.publish()
+            logger.info(f"MOQT app: published {track.fqtn}")
 
-            # Process subscriptions until closed
-            await session.async_closed()
+            await track.wait_closed(timeout=duration)
         except Exception as e:
             logger.error(f"MOQT session exception: {e}")
 
@@ -309,6 +309,7 @@ if __name__ == "__main__":
             draft=args.draft,
             streams=args.streams,
             object_size=args.object_size,
+            duration=args.duration,
         ))
 
     except KeyboardInterrupt:

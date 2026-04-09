@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""moqperf publisher - sends timestamped MoQT objects through a relay.
+"""moqbench publisher - sends timestamped MoQT objects through a relay.
 
 Usage:
   # H3/WebTransport (default)
@@ -17,232 +17,16 @@ Usage:
 import argparse
 import asyncio
 import logging
-import time
-from functools import partial
 
-from aiomoqt.types import (
-    MOQTMessageType, ParamType, ObjectStatus, MOQT_TIMESTAMP_EXT,
-)
-from aiomoqt.messages import (
-    Subscribe, SubgroupHeader, ObjectDatagram, ObjectDatagramStatus,
-)
 from aiomoqt.client import MOQTClient
-from aiomoqt.protocol import MOQTSession
+from aiomoqt.track import PublishedTrack, TrackState
 from aiomoqt.utils.logger import set_log_level, get_logger
 from aiomoqt.utils.url import parse_relay_url
 
 
-async def subscribe_data_generator(session: MOQTSession, msg: Subscribe,
-                                   num_tasks: int = 1, object_size: int = 1024,
-                                   group_size: int = 60, rate: float = 0) -> None:
-    """Subscribe handler that spawns subgroup stream data generation."""
-    ok = session.subscribe_ok(request_msg=msg)
-
-    for subgroup_id in range(num_tasks):
-        priority = 255 if subgroup_id == 0 else 0
-        task = asyncio.create_task(
-            generate_subgroup_stream(
-                session=session,
-                subgroup_id=subgroup_id,
-                track_alias=ok.track_alias,
-                priority=priority,
-                num_subgroups=num_tasks,
-                object_size=object_size,
-                group_size=group_size,
-                rate=rate,
-            )
-        )
-        task.add_done_callback(lambda t: session._tasks.discard(t))
-        session._tasks.add(task)
-
-    await session.async_closed()
-    session._close_session()
-
-
-async def dgram_subscribe_data_generator(session: MOQTSession, msg: Subscribe,
-                                         object_size: int = 1100,
-                                         group_size: int = 60,
-                                         rate: float = 0) -> None:
-    """Subscribe handler for datagram mode."""
-    ok = session.subscribe_ok(request_msg=msg)
-    task = asyncio.create_task(
-        generate_group_dgram(
-            session=session,
-            track_alias=ok.track_alias,
-            priority=255,
-            object_size=object_size,
-            group_size=group_size,
-            rate=rate,
-        )
-    )
-    task.add_done_callback(lambda t: session._tasks.discard(t))
-    session._tasks.add(task)
-    await session.async_closed()
-    session._close_session()
-
-
-async def generate_group_dgram(session: MOQTSession, track_alias: int, priority: int,
-                               object_size: int = 1100, group_size: int = 60,
-                               rate: float = 0):
-    """Generate datagram objects. rate=0 means max speed."""
-    logger = get_logger(__name__)
-    pad = b'\xBB' * object_size
-    paced = rate > 0
-    frame_interval = 1.0 / rate if paced else 0
-    total_sent = 0
-
-    next_frame_time = time.monotonic()
-    object_id = 0
-    group_id = -1
-
-    try:
-        while True:
-            if (object_id % group_size) == 0:
-                group_id += 1
-                if group_id > 0:
-                    obj = ObjectDatagramStatus(
-                        track_alias=track_alias,
-                        group_id=group_id - 1,
-                        object_id=object_id,
-                        publisher_priority=priority,
-                        status=ObjectStatus.END_OF_GROUP,
-                        extensions={MOQT_TIMESTAMP_EXT: int(time.time() * 1000)}
-                    )
-                    msg = obj.serialize()
-                    if session._close_err is not None:
-                        raise asyncio.CancelledError
-                    session._quic.send_datagram_frame(b'\0' + msg.data)
-                    session.transmit()
-                object_id = 0
-
-            seq_info = f"{group_id}.{object_id}".encode()
-            payload = (seq_info + b'|' + pad)[:object_size]
-
-            obj = ObjectDatagram(
-                track_alias=track_alias,
-                group_id=group_id,
-                object_id=object_id,
-                publisher_priority=priority,
-                extensions={MOQT_TIMESTAMP_EXT: int(time.time() * 1000)},
-                payload=payload,
-                end_of_group=(object_id == group_size - 1),
-            )
-            msg = obj.serialize()
-            if session._close_err is not None:
-                raise asyncio.CancelledError
-            session._quic.send_datagram_frame(b'\0' + msg.data)
-            session.transmit()
-            total_sent += 1
-
-            object_id += 1
-            if paced:
-                next_frame_time += frame_interval
-                sleep_time = max(0, next_frame_time - time.monotonic())
-                await asyncio.sleep(sleep_time)
-            else:
-                # Yield to event loop periodically
-                if total_sent % 64 == 0:
-                    await asyncio.sleep(0)
-
-    except asyncio.CancelledError:
-        logger.info(f"moqperf pub: sent {total_sent} datagrams")
-
-
-async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
-                                   track_alias: int, priority: int,
-                                   num_subgroups: int = 1,
-                                   object_size: int = 1024, group_size: int = 60,
-                                   rate: float = 0):
-    """Generate subgroup stream objects. rate=0 means max speed.
-
-    Each subgroup sends a disjoint slice of object IDs within the group:
-    subgroup N sends object IDs N, N+num_subgroups, N+2*num_subgroups, ...
-    This avoids payload conflicts in the relay cache.
-    """
-    logger = get_logger(__name__)
-    pad = b'\xBB' * object_size
-    paced = rate > 0
-    frame_interval = 1.0 / rate if paced else 0
-    total_sent = 0
-
-    stream_id = session.open_uni_stream()
-
-    next_frame_time = time.monotonic()
-    group_id = -1
-    header = None
-
-    # Disjoint object IDs: subgroup N sends IDs N, N+num_subgroups, N+2*num_subgroups...
-    # Cache key is (ns, track, group, object_id) — payload must be identical for same object_id
-    cur_obj_id = subgroup_id
-
-    try:
-        while True:
-            if header is None or cur_obj_id >= group_size:
-                group_id += 1
-                cur_obj_id = subgroup_id
-
-                if header is not None:
-                    # Close the stream — only one subgroup needs END_OF_GROUP
-                    if session._close_err:
-                        raise asyncio.CancelledError
-                    if subgroup_id == 0:
-                        buf = header.end_group(object_id=group_size)
-                        session.stream_write(stream_id, buf.data, end_stream=True)
-                    else:
-                        session.stream_write(stream_id, b'', end_stream=True)
-                    session.transmit()
-
-                    if stream_id in session._data_streams:
-                        del session._data_streams[stream_id]
-                    if stream_id in session._stream_tasks:
-                        session._stream_tasks[stream_id].cancel()
-                        del session._stream_tasks[stream_id]
-
-                    stream_id = session.open_uni_stream()
-
-                header = SubgroupHeader(
-                    track_alias=track_alias,
-                    group_id=group_id,
-                    subgroup_id=subgroup_id,
-                    publisher_priority=priority,
-                    extensions_present=True,
-                )
-                msg = header.serialize()
-                if session._close_err is not None:
-                    raise asyncio.CancelledError
-                await session.stream_write_drain(stream_id, msg.data)
-                session.transmit()
-
-            seq_info = f"{group_id}.{cur_obj_id}".encode()
-            payload = (seq_info + b'|' + pad)[:object_size]
-
-            extensions = {MOQT_TIMESTAMP_EXT: int(time.time() * 1000)}
-            buf = header.next_object(payload=payload, extensions=extensions,
-                                     object_id=cur_obj_id)
-            cur_obj_id += num_subgroups
-
-            if session._close_err is not None:
-                raise asyncio.CancelledError
-            await session.stream_write_drain(stream_id, buf.data)
-            session.transmit()
-            total_sent += 1
-
-            if paced:
-                next_frame_time += frame_interval
-                sleep_time = max(0, next_frame_time - time.monotonic())
-                await asyncio.sleep(sleep_time)
-            else:
-                if total_sent % 64 == 0:
-                    await asyncio.sleep(0)
-
-    except asyncio.CancelledError:
-        logger.info(f"moqperf pub: stream {subgroup_id} sent {total_sent} objects")
-        raise
-
-
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='moqperf publisher - MoQT benchmark sender',
+        description='moqbench publisher - MoQT benchmark sender',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 relay URL forms:
@@ -260,12 +44,10 @@ examples:
                         help='Relay URL: moqt://host:port, https://host:port/ep, or host[:port]')
     parser.add_argument('-Q', '--force-quic', action='store_true',
                         help='Force raw QUIC even for https:// URLs')
-    import time
-    _ts = hex(int(time.time()) // 60 & 0xFFF)[2:]  # changes every minute
-    parser.add_argument('-n', '--namespace', type=str, default=f'bench/{_ts}',
-                        help='MoQT namespace (default: bench/<time>)')
-    parser.add_argument('--trackname', type=str, default='track',
-                        help='MoQT track name (default: track)')
+    parser.add_argument('-n', '--namespace', type=str, default='bench',
+                        help='MoQT namespace (default: bench)')
+    parser.add_argument('--trackname', type=str, default=None,
+                        help='MoQT track name (default: <profile>-<uuid4>)')
     parser.add_argument('-D', '--datagram', action='store_true',
                         help='Use datagrams instead of streams')
     parser.add_argument('-s', '--object-size', type=int, default=1024,
@@ -284,7 +66,16 @@ examples:
                         help='Skip TLS certificate verification')
     parser.add_argument('--draft', type=int, default=None,
                         help='MoQT draft version (e.g. 14, 16)')
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.trackname is None:
+        import uuid
+        sz = args.object_size
+        sz_s = f"{sz // 1000}k" if sz >= 1000 else f"{sz}b"
+        rate_s = f"{int(args.rate)}fps" if args.rate > 0 else "max"
+        mode = "dgram" if args.datagram else f"x{args.streams}"
+        uid = uuid.uuid4().hex[:4]
+        args.trackname = f"{sz_s}-{rate_s}-{mode}-{uid}"
+    return args
 
 
 def print_banner(relay, args):
@@ -298,11 +89,12 @@ def print_banner(relay, args):
         rate_s = "max"
         target_s = "max"
     print("─" * 56)
-    print("  moqperf publisher")
+    print("  moqbench publisher")
     print("─" * 56)
     print(f"  relay:       {relay}")
     print(f"  transport:   {relay.transport_name}")
-    print(f"  namespace:   {args.namespace}/{args.trackname}")
+    print(f"  namespace:   {args.namespace}")
+    print(f"  trackname:   {args.trackname}")
     print(f"  mode:        {mode}")
     print(f"  object size: {args.object_size} B")
     print(f"  group size:  {args.group_size} objects")
@@ -329,34 +121,26 @@ async def run(args):
         keylog_filename=args.keylogfile,
     )
 
-    if args.datagram:
-        handler = partial(dgram_subscribe_data_generator,
-                          object_size=args.object_size,
-                          group_size=args.group_size,
-                          rate=args.rate)
-    else:
-        handler = partial(subscribe_data_generator,
-                          num_tasks=args.streams,
-                          object_size=args.object_size,
-                          group_size=args.group_size,
-                          rate=args.rate)
-    client.register_handler(MOQTMessageType.SUBSCRIBE, handler)
-
     print(f"  Connecting...")
     async with client.connect() as session:
         try:
             await session.client_session_init()
 
-            response = await session.publish_namespace(
+            track = PublishedTrack(
+                session,
                 namespace=args.namespace,
-                parameters={ParamType.AUTH_TOKEN: b"bench-token"},
-                wait_response=True,
+                trackname=args.trackname,
+                object_size=args.object_size,
+                group_size=args.group_size,
+                num_subgroups=args.streams,
+                rate=args.rate,
+                draft=args.draft,
             )
-            print(f"  Published namespace '{args.namespace}', waiting for subscriber...")
+            await track.publish()
+            print(f"  Published '{track.fqtn}', waiting for subscriber...")
 
-            try:
-                await asyncio.wait_for(session.async_closed(), timeout=args.duration)
-            except asyncio.TimeoutError:
+            await track.wait_closed(timeout=args.duration)
+            if track.state != TrackState.CLOSED:
                 print(f"\n  Duration {args.duration}s reached.")
         except Exception as e:
             print(f"  Error: {e}")

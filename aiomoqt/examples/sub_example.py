@@ -6,6 +6,7 @@ import logging
 
 from aiomoqt.types import ParamType, MOQTException, MOQTRequestError
 from aiomoqt.client import MOQTClient
+from aiomoqt.track import SubscribedTrack
 from aiomoqt.utils.logger import *
 
 
@@ -24,6 +25,7 @@ def parse_args():
     parser.add_argument('--auth-token', type=str, default=None, help='Auth token')
     parser.add_argument('--draft', type=int, default=None, help='MoQT draft version (e.g. 14, 16)')
     parser.add_argument('--libquicr-compat', action='store_true', help='Use libquicr filter encoding (LAPS)')
+    parser.add_argument('-t', '--duration', type=int, default=120, help='Duration in seconds (default: 120)')
 
     return parser.parse_args()
 
@@ -77,7 +79,8 @@ class SimpleStats:
 
 async def main(host: str, port: int, endpoint: str, namespace: str, track_name: str,
                use_quic: bool, debug: bool, quic_debug: bool, insecure: bool = False,
-               auth_token: str = None, draft: int = None, libquicr_compat: bool = False):
+               auth_token: str = None, draft: int = None, libquicr_compat: bool = False,
+               duration: int = 120):
     log_level = logging.DEBUG if debug else logging.INFO
     set_log_level(log_level)
     logger = get_logger(__name__)
@@ -98,26 +101,20 @@ async def main(host: str, port: int, endpoint: str, namespace: str, track_name: 
     logger.info(f"MOQT app: subscribe session connecting: {client}")
     try:
         async with client.connect() as session:
-            session.on_object_received = stats.on_object
             try:
-                response = await session.client_session_init()
+                await session.client_session_init()
 
-                params = {ParamType.AUTH_TOKEN: auth_token.encode()} if auth_token else {}
-                await session.subscribe_namespace(
-                    namespace_prefix=namespace,
-                    parameters=params,
-                    wait_response=True
-                )
-
-                await session.subscribe(
+                track = SubscribedTrack(
+                    session,
                     namespace=namespace,
-                    track_name=track_name,
-                    parameters=params,
-                    wait_response=True
+                    trackname=track_name,
+                    draft=draft,
+                    on_object=stats.on_object,
                 )
+                await track.subscribe()
+                logger.info(f"MOQT app: subscribed to {track.fqtn}")
 
-                # process subscription - publisher will open stream and send data
-                await session.async_closed()
+                await track.wait_closed(timeout=duration)
                 logger.info(f"MOQT app: exiting client session")
 
             except MOQTRequestError as e:
@@ -150,6 +147,7 @@ if __name__ == "__main__":
             auth_token=args.auth_token,
             draft=args.draft,
             libquicr_compat=args.libquicr_compat,
+            duration=args.duration,
         ), debug=args.debug)
 
     except KeyboardInterrupt:
