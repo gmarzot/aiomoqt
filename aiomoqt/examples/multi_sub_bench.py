@@ -173,6 +173,8 @@ def run_subscriber(sub_id, relay_url, namespace, trackname, args,
                 )
                 await track.subscribe(timeout=30.0)
                 await track.wait_closed(timeout=args.duration)
+                if not track.completed:
+                    stats['error'] = 'StreamReset'
         except Exception as e:
             stats['error'] = str(e)
         stats['duration'] = time.monotonic() - start
@@ -291,7 +293,9 @@ def main():
         if r is None:
             errors += 1
             continue
-        if r['error']:
+        if r['error'] == 'StreamReset':
+            resets += 1
+        elif r['error']:
             errors += 1
         elif r['objects'] < _sub_expected(r):
             resets += 1

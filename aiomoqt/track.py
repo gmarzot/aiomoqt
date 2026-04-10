@@ -101,6 +101,8 @@ class PublishedTrack(Track):
         self.auth_token = auth_token
         self._subscriber_event = asyncio.Event()
         self._generating = False
+        self._stream_count = 0  # tracks streams opened for PUBLISH_DONE
+        self._subscribe_request_id = None  # request_id from relay's SUBSCRIBE
 
     async def publish(self):
         """Announce namespace and track to the relay."""
@@ -160,6 +162,7 @@ class PublishedTrack(Track):
         """Handle incoming SUBSCRIBE (d14)."""
         ok = session.subscribe_ok(request_msg=msg)
         self.track_alias = ok.track_alias
+        self._subscribe_request_id = msg.request_id
         logger.info(f"Track: subscriber via SUBSCRIBE, "
                      f"alias={self.track_alias}")
 
@@ -169,6 +172,29 @@ class PublishedTrack(Track):
         if not self._generating:
             self._generating = True
             await self.generate(session, self.track_alias)
+
+    def _send_publish_done(self, session, status_code=0x2):
+        """Send PUBLISH_DONE with stream count for clean shutdown.
+
+        Status codes: 0x0=INTERNAL_ERROR, 0x2=TRACK_ENDED,
+        0x3=SUBSCRIPTION_ENDED, 0x4=GOING_AWAY
+        """
+        from .messages import SubscribeDone
+        req_id = self._subscribe_request_id
+        if req_id is None:
+            return
+        msg = SubscribeDone(
+            request_id=req_id,
+            status_code=status_code,
+            stream_count=self._stream_count,
+            reason="track ended",
+        )
+        logger.info(f"Track: PUBLISH_DONE request_id={req_id} "
+                    f"streams={self._stream_count}")
+        try:
+            session.send_control_message(msg.serialize())
+        except Exception:
+            pass  # session may already be closing
 
     _stats_header_printed = False
 
@@ -210,6 +236,8 @@ class PublishedTrack(Track):
             self._tasks.add(task)
 
         await session.async_closed()
+        # Send PUBLISH_DONE to indicate clean track completion
+        self._send_publish_done(session)
         session._close_session()
 
     async def _generate_subgroup(self, session, subgroup_id: int,
@@ -235,6 +263,7 @@ class PublishedTrack(Track):
         cur_obj_id = subgroup_id
         iv_groups = 0
         stream_id = session.open_uni_stream()
+        self._stream_count += 1
 
         try:
             while True:
@@ -263,6 +292,7 @@ class PublishedTrack(Track):
                             del session._stream_tasks[stream_id]
 
                         stream_id = session.open_uni_stream()
+                        self._stream_count += 1
 
                     header = SubgroupHeader(
                         track_alias=track_alias,
@@ -373,6 +403,8 @@ class SubscribedTrack(Track):
         self._auto_discover = (trackname is None)
         self.on_object = on_object
         self.report_interval = report_interval
+        self.publish_done: Optional[object] = None  # received PUBLISH_DONE
+        self.completed = False  # True if track ended cleanly
 
     async def subscribe(self, timeout: float = 30.0,
                         forward: int = 1):
@@ -448,7 +480,10 @@ class SubscribedTrack(Track):
         logger.info(f"Track: subscribed to {self.fqtn}")
 
     async def wait_closed(self, timeout: float = None):
-        """Wait for session to close or timeout."""
+        """Wait for session to close or timeout.
+
+        Sets self.completed if track ended cleanly (no StreamReset).
+        """
         try:
             if timeout:
                 await asyncio.wait_for(
@@ -456,8 +491,18 @@ class SubscribedTrack(Track):
             else:
                 await self.session.async_closed()
         except asyncio.TimeoutError:
-            pass
+            self.completed = True  # duration reached = clean
         self.state = TrackState.CLOSED
+
+        # Check close reason
+        if hasattr(self.session, '_close_err') and self.session._close_err:
+            code, reason = self.session._close_err
+            if reason and 'StreamReset' in str(reason):
+                self.completed = False
+                logger.warning(f"Track: {self.fqtn} ended with "
+                               f"StreamReset")
+                return
+        self.completed = True
 
 
 class VideoTrack(PublishedTrack):
@@ -609,6 +654,7 @@ class VideoTrack(PublishedTrack):
                             del session._stream_tasks[stream_id]
 
                         stream_id = session.open_uni_stream()
+                        self._stream_count += 1
 
                     header = SubgroupHeader(
                         track_alias=track_alias,
