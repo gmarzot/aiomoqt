@@ -168,7 +168,7 @@ class BenchStats:
         if lat:
             avg = int(sum(lat) / len(lat))
             p99 = int(self._pct(lat, 99))
-            lat_s = f"{avg}ms (p99:{p99}ms)"
+            lat_s = f"{avg}ms p99:{p99}ms"
         else:
             lat_s = "--"
 
