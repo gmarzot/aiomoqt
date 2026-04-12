@@ -148,12 +148,12 @@ class BenchStats:
 
     def _print_header(self):
         print(
-            f"{'Interval':>10}  {'Grp':>4} {'Objects':>8}  "
-            f"{'ObjRate':>8}  {'DataRate':>9}  "
-            f"{'Latency':>18}  "
-            f"{'Jitter':>7}  {'Lost':>5}"
+            f"  {'Interval':<10} {'Grp':>4} {'Objects':>8}"
+            f"  {'ObjRate':>8} {'DataRate':>9}"
+            f"  {'Latency':>7} {'(p99)':>7}"
+            f"  {'Jitter':>6} {'Lost':>5}"
         )
-        print("─" * 82)
+        print("  " + "─" * 84)
 
     def _print_interval(self, now: float):
         dt = now - self.last_report_time
@@ -168,17 +168,19 @@ class BenchStats:
         if lat:
             avg = sum(lat) / len(lat)
             p99 = self._pct(lat, 99)
-            lat_s = f"{avg:.0f}ms (p99:{p99:.0f}ms)"
+            lat_s = f"{int(avg):>5}ms"
+            p99_s = f"{int(p99):>5}ms"
         else:
-            lat_s = f"{'--':>18}"
+            lat_s = f"{'--':>7}"
+            p99_s = f"{'--':>7}"
 
         iv = f"{elapsed - dt:.0f}-{elapsed:.0f}s"
         grps = len(self.total_groups)
         print(
-            f"{iv:>10}  {grps:>4} {self.total_objects:>8}  "
-            f"{rate:>6.1f}/s  {mbps:>7.2f}Mb  "
-            f"{lat_s:>18}  "
-            f"{self.jitter:>5.1f}ms  {self.total_lost:>5}"
+            f"  {iv:<10} {grps:>4} {self.total_objects:>8}"
+            f"  {rate:>6.1f}/s {mbps:>7.2f}Mb"
+            f"  {lat_s} {p99_s}"
+            f"  {self.jitter:>4.1f}ms {self.total_lost:>5}"
         )
 
         self.iv_objects = 0
