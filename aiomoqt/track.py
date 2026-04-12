@@ -246,6 +246,12 @@ class PublishedTrack(Track):
         await session.async_closed()
         # Send PUBLISH_DONE to indicate clean track completion
         self._send_publish_done(session)
+        # Release the namespace so the relay cleans up
+        try:
+            session.publish_namespace_done(
+                namespace=self.namespace)
+        except Exception:
+            pass
         session._close_session()
 
     async def _generate_subgroup(self, session, subgroup_id: int,
