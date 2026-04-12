@@ -149,7 +149,7 @@ class BenchStats:
     def _print_header(self):
         print(
             f"  {'Interval':<10} {'Grp':>4} {'Objects':>8}"
-            f"  {'ObjRate':>8} {'DataRate':>9}"
+            f"  {'ObjRate':>8} {'Bitrate':>9}"
             f"  {'Latency':>7} {'(p99)':>7}"
             f"  {'Jitter':>6} {'Lost':>5}"
         )
