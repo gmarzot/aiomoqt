@@ -153,7 +153,7 @@ class BenchStats:
             f"    {'Latency':<14}"
             f"     {'Jitter':>6} {'Lost':>5}"
         )
-        print("  " + "─" * 76)
+        print("  " + "─" * 88)
 
     def _print_interval(self, now: float):
         dt = now - self.last_report_time
