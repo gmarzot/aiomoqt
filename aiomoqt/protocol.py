@@ -1544,6 +1544,7 @@ class MOQTSession(QuicConnectionProtocol):
             track_name=track_name,
             priority=subscriber_priority,
             group_order=group_order,
+            forward=1,
             filter_type=FilterType.LATEST_OBJECT,  # spec §9.16.2
             parameters=parameters,
         )
