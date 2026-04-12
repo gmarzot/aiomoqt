@@ -183,6 +183,12 @@ class MOQTSession(QuicConnectionProtocol):
         # and the stream is expected to FIN shortly after).
         self.on_fetch_object: Optional[Callable] = None
 
+        # Per-fetch completion futures. Resolved when the fetch uni
+        # stream's processing task exits (FIN, RESET, or error).
+        # JoinedTrack registers a future here to get notified when
+        # the fetch buffer fill is done.
+        self._fetch_done_futures: Dict[int, Future] = {}  # request_id → Future
+
         # Queue for namespace announcements (populated by _handle_namespace)
         self._namespace_announcements: asyncio.Queue = asyncio.Queue()
         # Queue for track announcements (populated by _handle_publish)
@@ -234,6 +240,37 @@ class MOQTSession(QuicConnectionProtocol):
                 response=response,
             )
         return response
+
+    async def await_fetch_done(self, request_id: int,
+                              timeout: float = 10.0) -> bool:
+        """Wait for a fetch stream to complete (FIN).
+
+        The future is pre-registered by join() or fetch() before
+        messages are sent, so there's no race with fast completions.
+        Returns True if the stream completed cleanly, False on
+        error/timeout.
+
+        Args:
+            request_id: The fetch request_id (from the Fetch message
+                or FetchOk.request_id).
+            timeout: seconds to wait.
+        """
+        fut = self._fetch_done_futures.get(request_id)
+        if fut is None:
+            # No future registered — check if stream already gone
+            if request_id not in self._fetch_stream_by_request:
+                return True
+            fut = self._loop.create_future()
+            self._fetch_done_futures[request_id] = fut
+
+        if fut.done():
+            return fut.result()
+
+        try:
+            async with asyncio.timeout(timeout):
+                return await fut
+        except asyncio.TimeoutError:
+            return False
 
     def _get_control_entry(self, msg_type: int) -> Tuple[Type[MOQTMessage], Callable]:
         """Get the (message_class, handler) for a control message type.
@@ -371,9 +408,17 @@ class MOQTSession(QuicConnectionProtocol):
                     logger.error(f"MOQT stream({stream_id}): task failed with exception: {type(e).__name__}\n{''.join(traceback.format_exception(e))}")
             else:
                 logger.debug(f"MOQT stream({stream_id}): task completed")
-                
-        # if stream_id in self._quic._streams and self._quic._streams[stream_id].receiver is not None:
-        #     self._quic._streams[stream_id].receiver.stop(error_code=error_code)
+
+        # Resolve fetch completion future if this was a fetch stream
+        key = self._data_stream_key.get(stream_id)
+        if key and len(key) == 2 and key[0] == 'fetch':
+            request_id = key[1]
+            fut = self._fetch_done_futures.pop(request_id, None)
+            if fut and not fut.done():
+                fut.set_result(error_code == QuicErrorCode.NO_ERROR)
+                logger.debug(f"MOQT stream({stream_id}): fetch "
+                             f"request_id={request_id} complete")
+        self._unbind_stream(stream_id)
  
     # task for processing incoming data streams
     async def _process_data_stream(self, stream_id: int) -> None:
@@ -1563,6 +1608,10 @@ class MOQTSession(QuicConnectionProtocol):
             parameters=dict(parameters),
         )
         self._subscriptions[fetch_request_id] = [fetch_msg]
+        # Pre-register the fetch-done future before sending so we
+        # don't miss the stream FIN in fast-completion scenarios.
+        self._fetch_done_futures[fetch_request_id] = \
+            self._loop.create_future()
         logger.info(f"MOQT send: {fetch_msg}")
         self.send_control_message(fetch_msg.serialize())
 
@@ -1611,6 +1660,8 @@ class MOQTSession(QuicConnectionProtocol):
             parameters=parameters,
         )
         self._subscriptions[request_id] = [message]
+        self._fetch_done_futures[request_id] = \
+            self._loop.create_future()
         logger.info(f"MOQT send: {message}")
         self.send_control_message(message.serialize())
 

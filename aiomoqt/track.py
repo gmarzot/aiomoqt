@@ -15,6 +15,14 @@ Usage:
     track.on_object = stats.on_object
     await track.subscribe()
     await track.wait_closed()
+
+    # Join (subscribe + fetch for playback buffer fill)
+    # Uses session.join() directly — fetch is a protocol primitive,
+    # not a Track subclass.
+    sub_resp, fetch_resp = await session.join(
+        namespace="bench", track_name="track", joining_start=3)
+    # session.on_fetch_object fires for historic objects
+    # session.on_object_received fires for live objects
 """
 import asyncio
 import time
@@ -503,6 +511,7 @@ class SubscribedTrack(Track):
                                f"StreamReset")
                 return
         self.completed = True
+
 
 
 class VideoTrack(PublishedTrack):

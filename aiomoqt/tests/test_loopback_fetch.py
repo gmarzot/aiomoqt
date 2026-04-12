@@ -34,6 +34,7 @@ from aiomoqt.messages import Fetch, Subscribe
 from aiomoqt.messages.track import FetchHeader, FetchObject, SubgroupHeader
 from aiomoqt.client import MOQTClient
 from aiomoqt.protocol import MOQTPeer, MOQTSession
+from aiomoqt.messages import FetchOk, FetchCancel
 
 # ---------------------------------------------------------------------------
 # Test certs
@@ -368,3 +369,237 @@ async def test_fetch_invalid_range():
 
     finally:
         server.close()
+
+
+# ---------------------------------------------------------------------------
+# Fetch completion future test (protocol-level)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_fetch_done_future():
+    """session._fetch_done_futures resolves when fetch stream FINs."""
+    port = _BASE_PORT + 4
+    cache = FetchTestCache(num_groups=5, objects_per_group=10,
+                           object_size=64)
+    server = await _start_server(port, cache)
+
+    fetched = []
+    live = []
+
+    def on_fetch(msg, size, ts, rid):
+        fetched.append((msg.group_id, msg.object_id))
+
+    def on_live(msg, size, ts, gid, sid):
+        live.append((gid, msg.object_id))
+
+    try:
+        client = await _connect_client(port)
+        async with client.connect() as session:
+            await session.client_session_init()
+
+            session.on_fetch_object = on_fetch
+            session.on_object_received = on_live
+
+            sub_resp, fetch_resp = await session.join(
+                namespace="bench",
+                track_name="track",
+                joining_start=2,
+                wait_response=True,
+            )
+
+            assert isinstance(fetch_resp, FetchOk)
+
+            # Wait for fetch stream to complete (handles race
+            # where stream FINs before we call this)
+            ok = await session.await_fetch_done(
+                fetch_resp.request_id, timeout=5)
+            assert ok, "Fetch stream did not complete cleanly"
+            # joining_start=2 → start = largest(4) - 2 = group 2
+            # range is groups 2,3,4 inclusive = 30 objects
+            assert len(fetched) == 30
+
+            # Wait for some live data
+            await asyncio.sleep(0.3)
+
+        assert len(live) > 0
+
+    finally:
+        server.close()
+
+
+# ---------------------------------------------------------------------------
+# Tier 2 — Fetch boundary tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_fetch_start_equals_largest():
+    """Fetch where start == largest group — should return 1 group."""
+    port = _BASE_PORT + 5
+    cache = FetchTestCache(num_groups=5, objects_per_group=10,
+                           object_size=64)
+    server = await _start_server(port, cache)
+
+    fetched = []
+
+    def on_fetch(msg, size, ts, rid):
+        fetched.append((msg.group_id, msg.object_id))
+
+    try:
+        client = await _connect_client(port)
+        async with client.connect() as session:
+            await session.client_session_init()
+            session.on_fetch_object = on_fetch
+
+            await session.fetch(
+                namespace="bench",
+                track_name="track",
+                start_group=4,  # == largest
+                start_object=0,
+                end_group=4,
+                end_object=9,
+                wait_response=True,
+            )
+            await asyncio.sleep(0.5)
+
+        assert len(fetched) == 10
+        assert all(g == 4 for g, o in fetched)
+
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_fetch_single_object():
+    """Fetch a single object — smallest possible range."""
+    port = _BASE_PORT + 6
+    cache = FetchTestCache(num_groups=5, objects_per_group=10,
+                           object_size=64)
+    server = await _start_server(port, cache)
+
+    fetched = []
+
+    def on_fetch(msg, size, ts, rid):
+        fetched.append((msg.group_id, msg.object_id))
+
+    try:
+        client = await _connect_client(port)
+        async with client.connect() as session:
+            await session.client_session_init()
+            session.on_fetch_object = on_fetch
+
+            await session.fetch(
+                namespace="bench",
+                track_name="track",
+                start_group=2,
+                start_object=5,
+                end_group=2,
+                end_object=5,
+                wait_response=True,
+            )
+            await asyncio.sleep(0.5)
+
+        assert len(fetched) == 1
+        assert fetched[0] == (2, 5)
+
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_fetch_cancel_mid_stream():
+    """Tier 2: Send FETCH_CANCEL while server is pushing objects.
+
+    Server uses a slow cache (delay between objects) so the client
+    can cancel mid-stream and verify the stream terminates.
+    """
+    port = _BASE_PORT + 7
+    # Large cache so fetch takes a while
+    cache = FetchTestCache(num_groups=10, objects_per_group=50,
+                           object_size=128)
+
+    # Custom slow fetch handler
+    async def _slow_fetch(session, msg):
+        request_id = msg.request_id
+        session.fetch_ok(
+            request_id=request_id,
+            largest_group_id=cache.largest_group,
+            largest_object_id=cache.largest_object,
+            group_order=GroupOrder.ASCENDING,
+        )
+        stream_id = session.open_uni_stream()
+        header = FetchHeader(request_id=request_id)
+        session.stream_write(stream_id, header.serialize().data)
+
+        for g in range(cache.num_groups):
+            for o in range(cache.objects_per_group):
+                payload = cache.objects.get((g, o), b'')
+                obj = FetchObject(
+                    group_id=g, subgroup_id=0, object_id=o,
+                    publisher_priority=128, payload=payload,
+                )
+                buf = obj.serialize()
+                try:
+                    session.stream_write(stream_id, buf.data)
+                    session.transmit()
+                except Exception:
+                    return  # stream was reset
+                await asyncio.sleep(0.005)  # slow drip
+
+        session.stream_write(stream_id, b'', end_stream=True)
+        session.transmit()
+
+    peer = MOQTPeer()
+    peer.endpoint = "moq"
+    peer.register_handler(MOQTMessageType.FETCH, _slow_fetch)
+
+    config = QuicConfiguration(
+        is_client=False, alpn_protocols=H3_ALPN,
+        verify_mode=ssl.CERT_NONE,
+        max_data=2**24, max_stream_data=2**24,
+        max_datagram_frame_size=64 * 1024,
+    )
+    config.load_cert_chain(CERT, KEY)
+
+    server_handle = await serve(
+        "localhost", port, configuration=config,
+        create_protocol=lambda *a, **kw: MOQTSession(
+            *a, **kw, session=peer),
+    )
+
+    fetched = []
+
+    def on_fetch(msg, size, ts, rid):
+        fetched.append((msg.group_id, msg.object_id))
+
+    try:
+        client = await _connect_client(port)
+        async with client.connect() as session:
+            await session.client_session_init()
+            session.on_fetch_object = on_fetch
+
+            # Send fetch for full range
+            fetch_msg = session.fetch(
+                namespace="bench",
+                track_name="track",
+                start_group=0, start_object=0,
+                end_group=9, end_object=49,
+            )
+
+            # Wait for some objects to arrive then cancel
+            await asyncio.sleep(0.2)
+            early_count = len(fetched)
+            assert early_count > 0, "No objects before cancel"
+
+            # Send FETCH_CANCEL
+            cancel = FetchCancel(request_id=fetch_msg.request_id)
+            session.send_control_message(cancel.serialize())
+
+            await asyncio.sleep(0.3)
+
+        # Verify we got some objects but NOT all 500
+        total = cache.num_groups * cache.objects_per_group
+        assert len(fetched) < total, \
+            f"Got all {total} objects despite cancel"
+
+    finally:
+        server_handle.close()
