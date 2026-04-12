@@ -267,7 +267,7 @@ examples:
         '--trackname', type=str, default=None,
         help='MoQT track name (default: auto-discover from namespace)')
     parser.add_argument(
-        '-t', '--duration', type=int, default=30,
+        '-t', '--duration', type=int, default=0,
         help='Duration in seconds (default: 30)')
     parser.add_argument(
         '-i', '--interval', type=float, default=5.0,
