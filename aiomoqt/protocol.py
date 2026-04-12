@@ -839,8 +839,11 @@ class MOQTSession(QuicConnectionProtocol):
         
         event_class = class_name(event)
 
-        # QUIC errors terminate the session
-        if hasattr(event, 'error_code'):  # Log any errors
+        # CONNECTION_CLOSE events terminate the session.
+        # StopSendingReceived and StreamReset also have error_code but
+        # are stream-level events handled below — do NOT catch them here.
+        if (hasattr(event, 'error_code')
+                and not isinstance(event, (StopSendingReceived, StreamReset))):
             error = getattr(event, 'error_code', QuicErrorCode.INTERNAL_ERROR)
             reason = getattr(event, 'reason_phrase', event_class)
             if error == 0:
