@@ -294,9 +294,30 @@ class MOQTSession(QuicConnectionProtocol):
 
     @staticmethod
     def _make_namespace_tuple(namespace: Union[str, Tuple[str, ...]]) -> Tuple[bytes, ...]:
-        """Convert string or tuple into bytes tuple."""
+        """Convert string or tuple into bytes tuple.
+
+        Splits on '/' by default. Use '\\/' to escape a literal slash
+        within a namespace element (e.g. 'live\\/stream1' → single
+        element b'live/stream1').
+        """
         if isinstance(namespace, str):
-            return tuple(part.encode() for part in namespace.split('/'))
+            # Split on unescaped '/' only
+            parts = []
+            current = []
+            i = 0
+            while i < len(namespace):
+                if namespace[i] == '\\' and i + 1 < len(namespace) and namespace[i + 1] == '/':
+                    current.append('/')
+                    i += 2
+                elif namespace[i] == '/':
+                    parts.append(''.join(current))
+                    current = []
+                    i += 1
+                else:
+                    current.append(namespace[i])
+                    i += 1
+            parts.append(''.join(current))
+            return tuple(p.encode() for p in parts if p)
         elif isinstance(namespace, tuple):
             if all(isinstance(x, bytes) for x in namespace):
                 return namespace
