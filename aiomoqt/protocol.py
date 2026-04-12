@@ -938,16 +938,19 @@ class MOQTSession(QuicConnectionProtocol):
 
                 # Handle MoQT data streams (unidirectional only)
                 if stream_is_unidirectional(stream_id):
-                    # For WebTransport streams, peek first byte to detect H3
-                    # internal streams (SETTINGS=0x00, QPACK_ENC=0x02,
-                    # QPACK_DEC=0x03) and pass those to H3 handler below.
+                    # Identify H3 internal uni streams (SETTINGS, QPACK
+                    # encoder/decoder) so they pass through to the H3
+                    # handler below. All other uni streams are MoQT data.
                     # Raw QUIC has no H3 framing — skip this check.
-                    is_h3_internal = (
-                        self._h3 is not None
-                        and stream_id not in self._data_streams
-                        and msg_len >= 1
-                        and event.data[0] in (0x00, 0x02, 0x03)
-                    )
+                    if self._h3 is not None:
+                        h3_peer_streams = {
+                            self._h3._peer_control_stream_id,
+                            self._h3._peer_encoder_stream_id,
+                            self._h3._peer_decoder_stream_id,
+                        }
+                        is_h3_internal = stream_id in h3_peer_streams
+                    else:
+                        is_h3_internal = False
                     if not is_h3_internal:
                         # Handle WT header continuation for fragmented streams
                         if stream_id in self._wt_header_pending:
