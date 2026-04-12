@@ -1392,7 +1392,7 @@ class MOQTSession(QuicConnectionProtocol):
         """Check if a stream is still writable (not reset or FIN'd)."""
         stream = self._quic._streams.get(stream_id)
         if stream is None:
-            return False
+            return True  # stream not yet registered — allow write
         if stream.sender._reset_error_code is not None:
             return False
         if stream.sender._buffer_fin is not None:
