@@ -483,11 +483,7 @@ class SubscribedTrack(Track):
                 namespace=self.namespace,
                 track_name=self.trackname,
                 forward=forward,
-                parameters={
-                    ParamType.MAX_CACHE_DURATION: 100,
-                    ParamType.AUTH_TOKEN: b"bench-token",
-                    ParamType.DELIVERY_TIMEOUT: 10,
-                },
+                parameters={},
                 wait_response=True,
             )
 
