@@ -1539,3 +1539,317 @@ class TestFetchObjectD16:
                 FetchObject.deserialize(buf, prior=None)
         finally:
             set_moqt_ctx_version(prev)
+
+
+# ========================================================================
+# Tier 1 — PublishOk filter type matrix (d14 + d16)
+# ========================================================================
+
+_PUBLISHOK_BASE_D14 = {
+    'request_id': 5,
+    'forward': ForwardingPreference.SUBGROUP,
+    'priority': 128,
+    'group_order': GroupOrder.ASCENDING,
+    'parameters': {},
+}
+
+_PUBLISHOK_BASE_D16 = {
+    'request_id': 5,
+    'forward': ForwardingPreference.SUBGROUP,
+    'priority': 128,
+    'group_order': GroupOrder.ASCENDING,
+    'parameters': {},
+}
+
+
+class TestPublishOkFilterD14:
+    """PublishOk filter round-trips in draft-14."""
+
+    def test_latest_object(self):
+        assert moqt_message_serialization_versioned(
+            PublishOk,
+            {**_PUBLISHOK_BASE_D14,
+             'filter_type': FilterType.LATEST_OBJECT},
+            type_id=MOQTMessageType.PUBLISH_OK,
+            version=MOQT_VERSION_DRAFT14,
+        )
+
+    def test_next_group_start(self):
+        assert moqt_message_serialization_versioned(
+            PublishOk,
+            {**_PUBLISHOK_BASE_D14,
+             'filter_type': FilterType.NEXT_GROUP_START},
+            type_id=MOQTMessageType.PUBLISH_OK,
+            version=MOQT_VERSION_DRAFT14,
+        )
+
+    def test_absolute_start(self):
+        assert moqt_message_serialization_versioned(
+            PublishOk,
+            {**_PUBLISHOK_BASE_D14,
+             'filter_type': FilterType.ABSOLUTE_START,
+             'start_group': 5,
+             'start_object': 3},
+            type_id=MOQTMessageType.PUBLISH_OK,
+            version=MOQT_VERSION_DRAFT14,
+        )
+
+    def test_absolute_range(self):
+        assert moqt_message_serialization_versioned(
+            PublishOk,
+            {**_PUBLISHOK_BASE_D14,
+             'filter_type': FilterType.ABSOLUTE_RANGE,
+             'start_group': 10,
+             'start_object': 0,
+             'end_group': 50},
+            type_id=MOQTMessageType.PUBLISH_OK,
+            version=MOQT_VERSION_DRAFT14,
+        )
+
+
+class TestPublishOkFilterD16:
+    """PublishOk filter round-trips in draft-16 (params encoding)."""
+
+    def test_latest_object(self):
+        assert moqt_message_serialization_versioned(
+            PublishOk,
+            {**_PUBLISHOK_BASE_D16,
+             'filter_type': FilterType.LATEST_OBJECT},
+            type_id=MOQTMessageType.PUBLISH_OK,
+            version=MOQT_VERSION_DRAFT16,
+        )
+
+    def test_next_group_start(self):
+        assert moqt_message_serialization_versioned(
+            PublishOk,
+            {**_PUBLISHOK_BASE_D16,
+             'filter_type': FilterType.NEXT_GROUP_START},
+            type_id=MOQTMessageType.PUBLISH_OK,
+            version=MOQT_VERSION_DRAFT16,
+        )
+
+    def test_absolute_start(self):
+        assert moqt_message_serialization_versioned(
+            PublishOk,
+            {**_PUBLISHOK_BASE_D16,
+             'filter_type': FilterType.ABSOLUTE_START,
+             'start_group': 5,
+             'start_object': 3},
+            type_id=MOQTMessageType.PUBLISH_OK,
+            version=MOQT_VERSION_DRAFT16,
+        )
+
+    def test_absolute_range(self):
+        assert moqt_message_serialization_versioned(
+            PublishOk,
+            {**_PUBLISHOK_BASE_D16,
+             'filter_type': FilterType.ABSOLUTE_RANGE,
+             'start_group': 10,
+             'start_object': 0,
+             'end_group': 50},
+            type_id=MOQTMessageType.PUBLISH_OK,
+            version=MOQT_VERSION_DRAFT16,
+        )
+
+
+# ========================================================================
+# Tier 1 — TrackStatus round-trip tests (d14 + d16)
+# ========================================================================
+
+_TRACKSTATUS_BASE = {
+    'request_id': 7,
+    'track_namespace': (b'live', b'sports'),
+    'track_name': b'video',
+    'priority': 128,
+    'group_order': GroupOrder.ASCENDING,
+    'forward': 1,
+    'parameters': {},
+}
+
+
+class TestTrackStatusD14:
+    """TrackStatus round-trips in draft-14."""
+
+    def test_latest_object(self):
+        assert moqt_message_serialization_versioned(
+            TrackStatus,
+            {**_TRACKSTATUS_BASE,
+             'filter_type': FilterType.LATEST_OBJECT},
+            type_id=MOQTMessageType.TRACK_STATUS,
+            version=MOQT_VERSION_DRAFT14,
+        )
+
+    def test_next_group_start(self):
+        assert moqt_message_serialization_versioned(
+            TrackStatus,
+            {**_TRACKSTATUS_BASE,
+             'filter_type': FilterType.NEXT_GROUP_START},
+            type_id=MOQTMessageType.TRACK_STATUS,
+            version=MOQT_VERSION_DRAFT14,
+        )
+
+    def test_absolute_start(self):
+        assert moqt_message_serialization_versioned(
+            TrackStatus,
+            {**_TRACKSTATUS_BASE,
+             'filter_type': FilterType.ABSOLUTE_START,
+             'start_group': 5,
+             'start_object': 3},
+            type_id=MOQTMessageType.TRACK_STATUS,
+            version=MOQT_VERSION_DRAFT14,
+        )
+
+    def test_absolute_range(self):
+        assert moqt_message_serialization_versioned(
+            TrackStatus,
+            {**_TRACKSTATUS_BASE,
+             'filter_type': FilterType.ABSOLUTE_RANGE,
+             'start_group': 10,
+             'start_object': 0,
+             'end_group': 50},
+            type_id=MOQTMessageType.TRACK_STATUS,
+            version=MOQT_VERSION_DRAFT14,
+        )
+
+
+class TestTrackStatusD16:
+    """TrackStatus round-trips in draft-16 (params encoding)."""
+
+    def test_latest_object(self):
+        assert moqt_message_serialization_versioned(
+            TrackStatus,
+            {**_TRACKSTATUS_BASE,
+             'filter_type': FilterType.LATEST_OBJECT},
+            type_id=MOQTMessageType.TRACK_STATUS,
+            version=MOQT_VERSION_DRAFT16,
+        )
+
+    def test_next_group_start(self):
+        assert moqt_message_serialization_versioned(
+            TrackStatus,
+            {**_TRACKSTATUS_BASE,
+             'filter_type': FilterType.NEXT_GROUP_START},
+            type_id=MOQTMessageType.TRACK_STATUS,
+            version=MOQT_VERSION_DRAFT16,
+        )
+
+    def test_absolute_start(self):
+        assert moqt_message_serialization_versioned(
+            TrackStatus,
+            {**_TRACKSTATUS_BASE,
+             'filter_type': FilterType.ABSOLUTE_START,
+             'start_group': 5,
+             'start_object': 3},
+            type_id=MOQTMessageType.TRACK_STATUS,
+            version=MOQT_VERSION_DRAFT16,
+        )
+
+    def test_absolute_range(self):
+        assert moqt_message_serialization_versioned(
+            TrackStatus,
+            {**_TRACKSTATUS_BASE,
+             'filter_type': FilterType.ABSOLUTE_RANGE,
+             'start_group': 10,
+             'start_object': 0,
+             'end_group': 50},
+            type_id=MOQTMessageType.TRACK_STATUS,
+            version=MOQT_VERSION_DRAFT16,
+        )
+
+
+# ========================================================================
+# Tier 1 — forward=0 round-trip tests
+# ========================================================================
+
+class TestForwardZero:
+    """Round-trip tests for forward=0 (don't send data) state."""
+
+    def test_subscribe_forward_0_d14(self):
+        assert moqt_message_serialization_versioned(
+            Subscribe,
+            {**_SUBSCRIBE_BASE, 'forward': 0,
+             'filter_type': FilterType.LATEST_OBJECT},
+            type_id=MOQTMessageType.SUBSCRIBE,
+            version=MOQT_VERSION_DRAFT14,
+        )
+
+    def test_subscribe_forward_0_d16(self):
+        assert moqt_message_serialization_versioned(
+            Subscribe,
+            {**_SUBSCRIBE_BASE, 'forward': 0,
+             'filter_type': FilterType.LATEST_OBJECT},
+            type_id=MOQTMessageType.SUBSCRIBE,
+            version=MOQT_VERSION_DRAFT16,
+        )
+
+    def test_publish_forward_0_d14(self):
+        assert moqt_message_serialization_versioned(
+            Publish,
+            {
+                'request_id': 1,
+                'track_namespace': (b'live', b'sports'),
+                'track_name': b'football',
+                'track_alias': 42,
+                'group_order': GroupOrder.ASCENDING,
+                'content_exists': ContentExistsCode.NO_CONTENT,
+                'forward': 0,
+                'parameters': {},
+            },
+            type_id=MOQTMessageType.PUBLISH,
+            version=MOQT_VERSION_DRAFT14,
+        )
+
+    def test_publish_forward_0_d16(self):
+        assert moqt_message_serialization_versioned(
+            Publish,
+            {
+                'request_id': 1,
+                'track_namespace': (b'live', b'sports'),
+                'track_name': b'football',
+                'track_alias': 42,
+                'group_order': GroupOrder.ASCENDING,
+                'content_exists': ContentExistsCode.NO_CONTENT,
+                'forward': 0,
+                'parameters': {},
+                'track_extensions': {},
+            },
+            type_id=MOQTMessageType.PUBLISH,
+            version=MOQT_VERSION_DRAFT16,
+            skip_fields={'content_exists', 'track_extensions'},
+        )
+
+    def test_publish_ok_forward_0_d14(self):
+        assert moqt_message_serialization_versioned(
+            PublishOk,
+            {**_PUBLISHOK_BASE_D14, 'forward': 0,
+             'filter_type': FilterType.LATEST_OBJECT},
+            type_id=MOQTMessageType.PUBLISH_OK,
+            version=MOQT_VERSION_DRAFT14,
+        )
+
+    def test_publish_ok_forward_0_d16(self):
+        assert moqt_message_serialization_versioned(
+            PublishOk,
+            {**_PUBLISHOK_BASE_D16, 'forward': 0,
+             'filter_type': FilterType.LATEST_OBJECT},
+            type_id=MOQTMessageType.PUBLISH_OK,
+            version=MOQT_VERSION_DRAFT16,
+        )
+
+    def test_track_status_forward_0_d14(self):
+        assert moqt_message_serialization_versioned(
+            TrackStatus,
+            {**_TRACKSTATUS_BASE, 'forward': 0,
+             'filter_type': FilterType.LATEST_OBJECT},
+            type_id=MOQTMessageType.TRACK_STATUS,
+            version=MOQT_VERSION_DRAFT14,
+        )
+
+    def test_track_status_forward_0_d16(self):
+        assert moqt_message_serialization_versioned(
+            TrackStatus,
+            {**_TRACKSTATUS_BASE, 'forward': 0,
+             'filter_type': FilterType.LATEST_OBJECT},
+            type_id=MOQTMessageType.TRACK_STATUS,
+            version=MOQT_VERSION_DRAFT16,
+        )
