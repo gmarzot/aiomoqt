@@ -59,7 +59,7 @@ async def main(host: str, port: int, endpoint: str, namespace: str, track_name: 
                         ParamType.AUTH_TOKEN: b"auth-token-123",
                         ParamType.DELIVERY_TIMEOUT: 10,
                     },
-                    pre_group_offset=2,
+                    joining_start=2,  # 2 groups before live edge
                     wait_response=True
                 )
 

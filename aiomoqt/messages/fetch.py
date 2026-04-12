@@ -2,16 +2,34 @@ from dataclasses import dataclass, field
 from typing import Any, Optional, Dict, Tuple
 
 from .base import MOQTMessage, BUF_SIZE
-from ..types import *
+from ..types import (
+    MOQTMessageType, FetchType, GroupOrder, ParamType,
+    SessionCloseCode,
+)
 from ..context import is_draft16_or_later
-from ..utils.buffer import Buffer, BufferReadError
+from ..utils.buffer import Buffer
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+
+def _is_joining(fetch_type: int) -> bool:
+    return fetch_type in (FetchType.RELATIVE_JOINING,
+                          FetchType.ABSOLUTE_JOINING)
+
+
 @dataclass
 class Fetch(MOQTMessage):
-    """FETCH message to request a range of objects."""
+    """FETCH message to request a range of objects.
+
+    Three variants (MoQT §9.16):
+      STANDALONE (0x1):       namespace + track_name + [start_loc, end_loc]
+      RELATIVE_JOINING (0x2): joining_request_id + joining_start (delta)
+      ABSOLUTE_JOINING (0x3): joining_request_id + joining_start (abs group)
+
+    The wire format of Relative and Absolute Joining Fetch is identical;
+    only the publisher's range computation differs.
+    """
     fetch_type: int
     request_id: int
     subscriber_priority: int = 128
@@ -22,21 +40,22 @@ class Fetch(MOQTMessage):
     start_object: Optional[int] = None
     end_group: Optional[int] = None
     end_object: Optional[int] = None
-    joining_sub_id: Optional[int] = None
-    pre_group_offset: Optional[int] = None
+    # Joining fetch fields (spec: Joining Request ID, Joining Start)
+    joining_request_id: Optional[int] = None
+    joining_start: Optional[int] = None
     parameters: Dict[int, bytes] = field(default_factory=dict)
 
     def __post_init__(self):
         self.type = MOQTMessageType.FETCH
 
-    def serialize(self) -> bytes:
+    def serialize(self) -> Buffer:
         buf = Buffer(capacity=BUF_SIZE)
         payload = Buffer(capacity=BUF_SIZE)
 
         payload.push_uint_var(self.request_id)
 
         if is_draft16_or_later():
-            # d16: priority and group_order moved to params
+            # d16: priority and group_order live in params
             payload.push_uint_var(self.fetch_type)
         else:
             # d14: priority and group_order as fixed fields before fetch_type
@@ -44,24 +63,24 @@ class Fetch(MOQTMessage):
             payload.push_uint8(self.group_order)
             payload.push_uint_var(self.fetch_type)
 
-        if self.fetch_type == FetchType.FETCH:
+        if self.fetch_type == FetchType.STANDALONE:
             payload.push_uint_var(len(self.namespace))
             for part in self.namespace:
                 payload.push_uint_var(len(part))
                 payload.push_bytes(part)
-
             payload.push_uint_var(len(self.track_name))
             payload.push_bytes(self.track_name)
-
             payload.push_uint_var(self.start_group)
             payload.push_uint_var(self.start_object)
             payload.push_uint_var(self.end_group)
             payload.push_uint_var(self.end_object)
-        elif self.fetch_type == FetchType.JOINING_FETCH:
-            payload.push_uint_var(self.joining_sub_id)
-            payload.push_uint_var(self.pre_group_offset)
+        elif _is_joining(self.fetch_type):
+            payload.push_uint_var(self.joining_request_id)
+            payload.push_uint_var(self.joining_start)
         else:
-            raise RuntimeError
+            raise ValueError(
+                f"Invalid fetch_type: {self.fetch_type} "
+                f"(must be 0x1, 0x2, or 0x3)")
 
         if is_draft16_or_later():
             params = dict(self.parameters)
@@ -80,15 +99,14 @@ class Fetch(MOQTMessage):
 
     @classmethod
     def deserialize(cls, buf: Buffer) -> 'Fetch':
-
         namespace = None
         track_name = None
         start_group = None
         start_object = None
         end_group = None
         end_object = None
-        joining_sub_id = None
-        pre_group_offset = None
+        joining_request_id = None
+        joining_start = None
         subscriber_priority = 128
         group_order = GroupOrder.DESCENDING
 
@@ -101,30 +119,34 @@ class Fetch(MOQTMessage):
             group_order = buf.pull_uint8()
             fetch_type = buf.pull_uint_var()
 
-        if fetch_type == FetchType.FETCH:
-            namespace = []
+        if fetch_type == FetchType.STANDALONE:
+            ns = []
             ns_len = buf.pull_uint_var()
             for _ in range(ns_len):
                 part_len = buf.pull_uint_var()
-                namespace.append(buf.pull_bytes(part_len))
-            namespace = tuple(namespace)
+                ns.append(buf.pull_bytes(part_len))
+            namespace = tuple(ns)
             track_name_len = buf.pull_uint_var()
             track_name = buf.pull_bytes(track_name_len)
             start_group = buf.pull_uint_var()
             start_object = buf.pull_uint_var()
             end_group = buf.pull_uint_var()
             end_object = buf.pull_uint_var()
-        elif fetch_type == FetchType.JOINING_FETCH:
-            joining_sub_id = buf.pull_uint_var()
-            pre_group_offset = buf.pull_uint_var()
+        elif _is_joining(fetch_type):
+            joining_request_id = buf.pull_uint_var()
+            joining_start = buf.pull_uint_var()
         else:
-            raise RuntimeError
+            raise ValueError(
+                f"Invalid fetch_type: {fetch_type} "
+                f"(spec §9.16: must be 0x1, 0x2, or 0x3)")
 
         params = MOQTMessage._deserialize_params(buf)
 
         if is_draft16_or_later():
-            subscriber_priority = params.pop(ParamType.SUBSCRIBER_PRIORITY, 128)
-            group_order = params.pop(ParamType.GROUP_ORDER, GroupOrder.DESCENDING)
+            subscriber_priority = params.pop(
+                ParamType.SUBSCRIBER_PRIORITY, 128)
+            group_order = params.pop(
+                ParamType.GROUP_ORDER, GroupOrder.DESCENDING)
 
         return cls(
             fetch_type=fetch_type,
@@ -137,8 +159,8 @@ class Fetch(MOQTMessage):
             start_object=start_object,
             end_group=end_group,
             end_object=end_object,
-            joining_sub_id=joining_sub_id,
-            pre_group_offset=pre_group_offset,
+            joining_request_id=joining_request_id,
+            joining_start=joining_start,
             parameters=params
         )
 

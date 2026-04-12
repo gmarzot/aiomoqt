@@ -245,9 +245,19 @@ class ForwardingPreference(IntEnum):
 
 
 class FetchType(IntEnum):
+    """FETCH message types per MoQT spec §9.16.
+
+    STANDALONE:       Independent fetch of a range in a track
+    RELATIVE_JOINING: Joining fetch with start = largest_group - joining_start
+    ABSOLUTE_JOINING: Joining fetch with start = joining_start (absolute group)
+    """
+    STANDALONE = 0x01
+    RELATIVE_JOINING = 0x02
+    ABSOLUTE_JOINING = 0x03
+
+    # Backwards-compat aliases (deprecated names from pre-v0.7)
     FETCH = 0x01
     JOINING_FETCH = 0x02
-    ABSOLUTE_JOINING = 0x03
 
 
 class PublishErrorCode(IntEnum):

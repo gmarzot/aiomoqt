@@ -39,6 +39,21 @@ USER_AGENT = f"aiomoqt/{version('aiomoqt')}"
 MOQT_IDLE_STREAM_TIMEOUT = 5
 
 logger = get_logger(__name__)
+
+
+class MOQTStreamReject(Exception):
+    """Raised by the data-stream parser when an incoming uni stream fails
+    MoQT-level admission (unknown request_id/track_alias, budget exceeded,
+    or reuse of a (track_alias, group_id, subgroup_id) tuple).
+
+    The caller is expected to catch this, send STOP_SENDING via
+    _reject_stream(), and end the stream task. This is strictly a
+    stream-level rejection — it never closes the session.
+    """
+    def __init__(self, error_code: int, reason: str):
+        super().__init__(reason)
+        self.error_code = error_code
+        self.reason = reason
     
 
 class H3CustomConnection(H3Connection):
@@ -127,13 +142,32 @@ class MOQTSession(QuicConnectionProtocol):
         self._tasks: Set[asyncio.Task] = set()
         self._close_err = None  # tuple holding latest (error_code, Reason_phrase)
         
-        self._data_streams: Dict[int, int] = {}  # keep track of active data streams
+        # Active uni data streams. Value is None when the stream has been
+        # registered but no header has been parsed yet; after header
+        # parsing it holds a FetchHeader or SubgroupHeader instance
+        # (carrying per-stream runtime state like _prior_obj /
+        # _last_object_id) until the stream closes.
+        self._data_streams: Dict[int, Optional[MOQTMessage]] = {}
         self._bidi_streams: Dict[int, int] = {}  # map request_id to bidi stream_id (d16)
         self._bidi_stream_requests: Dict[int, int] = {}  # map bidi stream_id to request_id (d16)
         self._track_aliases: Dict[int, int] = {}  # map alias to subscription_id
         self._subscriptions: Dict[int, List] = {}  # map subscription_id to request
         self._pending_requests: Dict[int, Future[MOQTMessage]] = {}  # unified response futures
-        
+
+        # MoQT-level request ↔ uni stream binding (subscriber side).
+        # Populated when a FETCH_HEADER or SubgroupHeader is admitted.
+        # Consulted on FETCH_ERROR / FETCH_CANCEL / UNSUBSCRIBE to find the
+        # data stream that belongs to a request, so we can terminate it.
+        # Keyed as follows:
+        #   _fetch_stream_by_request[request_id]                  -> stream_id
+        #   _subgroup_stream_by_key[(track_alias, group, subgrp)] -> stream_id
+        # The reverse lookup (_data_stream_key[stream_id]) stores whichever
+        # key is appropriate for the stream so stream-close cleanup can
+        # remove both sides of the binding.
+        self._fetch_stream_by_request: Dict[int, int] = {}
+        self._subgroup_stream_by_key: Dict[Tuple[int, int, Optional[int]], int] = {}
+        self._data_stream_key: Dict[int, Tuple] = {}
+
         self._control_msg_registry = dict(MOQTSession.MOQT_CONTROL_MESSAGE_REGISTRY)
         self._control_msg_registry.update(session._control_msg_handlers)
 
@@ -143,6 +177,11 @@ class MOQTSession(QuicConnectionProtocol):
         # Optional callback for received data objects:
         #   fn(msg, size_bytes, recv_time_ms, group_id, subgroup_id)
         self.on_object_received: Optional[Callable] = None
+        # Optional callback for received FetchObjects (fetch uni stream):
+        #   fn(msg, size_bytes, recv_time_ms, request_id)
+        # Fires for normal objects only (end-of-range markers are logged
+        # and the stream is expected to FIN shortly after).
+        self.on_fetch_object: Optional[Callable] = None
 
         # Queue for namespace announcements (populated by _handle_namespace)
         self._namespace_announcements: asyncio.Queue = asyncio.Queue()
@@ -388,6 +427,11 @@ class MOQTSession(QuicConnectionProtocol):
                 msg_obj = None
                 try:
                     msg_obj = self._moqt_handle_data_stream(stream_id, msg_buf, msg_len)
+                except MOQTStreamReject as e:
+                    # Phase 1c: admission failure — reject at the stream
+                    # level only (STOP_SENDING), NOT a session close.
+                    self._reject_stream(stream_id, e.error_code, e.reason)
+                    return
                 except MOQTUnderflow as e:
                     # e.needed is absolute buffer position; convert to bytes beyond msg_len
                     needed = e.needed - msg_len
@@ -438,6 +482,36 @@ class MOQTSession(QuicConnectionProtocol):
                     assert group_id is None or msg_obj.group_id > group_id
                     group_id = msg_obj.group_id
                     subgroup_id = msg_obj.subgroup_id
+                elif isinstance(msg_obj, FetchHeader):
+                    logger.debug(f"MOQT stream({stream_id}): {msg_obj} {consumed} bytes")
+                    # request_id stays on the header (also in the binding
+                    # table) — nothing to dispatch until FetchObjects arrive
+                elif isinstance(msg_obj, FetchObject):
+                    now = int(time.time()*1000)
+                    # Look up the fetch request_id from the stream's
+                    # FetchHeader state so the callback can correlate.
+                    stream_state = self._data_streams.get(stream_id)
+                    request_id = (stream_state.request_id
+                                   if isinstance(stream_state, FetchHeader)
+                                   else None)
+                    if msg_obj.end_of_range is not None:
+                        # d16 end-of-range marker (0x8C/0x10C) — logs and
+                        # waits for the stream FIN that must follow.
+                        logger.debug(
+                            f"MOQT stream({stream_id}): FetchObject "
+                            f"end-of-range 0x{msg_obj.end_of_range:x} "
+                            f"at {msg_obj.group_id}.{msg_obj.object_id}")
+                    else:
+                        id = f"{msg_obj.group_id}.{msg_obj.subgroup_id}.{msg_obj.object_id}"
+                        msg_ts = (msg_obj.extensions.get(MOQT_TIMESTAMP_EXT)
+                                  if msg_obj.extensions else None)
+                        delay = (f"delay: {now - msg_ts} ms"
+                                 if isinstance(msg_ts, int) else "")
+                        logger.debug(
+                            f"MOQT stream({stream_id}): FetchObject "
+                            f"{id} size: {consumed} bytes {delay}")
+                        if self.on_fetch_object:
+                            self.on_fetch_object(msg_obj, consumed, now, request_id)
                 else:
                     logger.error(f"MOQT stream({stream_id}): {msg_obj} size: {consumed} bytes")
                     # raise RuntimeError
@@ -454,8 +528,111 @@ class MOQTSession(QuicConnectionProtocol):
                 logger.debug(f"MOQT stream({stream_id}): saved {have} bytes still need: {needed}")
                 cur_pos = 0
 
+    def _reject_stream(self, stream_id: int, error_code: int, reason: str) -> None:
+        """Terminate a uni stream at the MoQT layer via STOP_SENDING.
+
+        Used for admission failures (unknown request_id/track_alias, stream
+        reuse, budget exceeded). Stream-level only — never closes the
+        session. Removes any binding table entries for the stream.
+        """
+        logger.warning(f"MOQT stream({stream_id}): rejecting: "
+                       f"{reason} (code=0x{error_code:x})")
+        try:
+            self._quic.stop_stream(stream_id, error_code)
+        except Exception as e:
+            logger.debug(f"MOQT stream({stream_id}): stop_stream failed: {e}")
+        self._unbind_stream(stream_id)
+        # Drop any parsing state and signal the task to exit
+        self._data_streams.pop(stream_id, None)
+        if stream_id in self._stream_queues:
+            self._stream_queues[stream_id].put_nowait(None)
+
+    def _unbind_stream(self, stream_id: int) -> None:
+        """Remove a stream from the request↔stream binding table."""
+        key = self._data_stream_key.pop(stream_id, None)
+        if key is None:
+            return
+        if len(key) == 2 and key[0] == 'fetch':
+            self._fetch_stream_by_request.pop(key[1], None)
+        elif len(key) == 2 and key[0] == 'subgroup':
+            self._subgroup_stream_by_key.pop(key[1], None)
+
+    def _admit_fetch_stream(self, stream_id: int, header: 'FetchHeader') -> None:
+        """Admit a FETCH_HEADER stream or raise MOQTStreamReject.
+
+        Admission rules (Phase 1c):
+        - request_id MUST match an outstanding FETCH we sent
+          (present in _subscriptions with a Fetch message)
+        - at most one uni stream per FETCH request (no reuse)
+        """
+        request_id = header.request_id
+        outstanding = self._subscriptions.get(request_id)
+        is_fetch = (outstanding is not None
+                    and any(isinstance(m, Fetch) for m in outstanding))
+        if not is_fetch:
+            raise MOQTStreamReject(
+                SessionCloseCode.PROTOCOL_VIOLATION,
+                f"fetch stream for unknown request_id={request_id}")
+        if request_id in self._fetch_stream_by_request:
+            existing = self._fetch_stream_by_request[request_id]
+            if existing != stream_id:
+                raise MOQTStreamReject(
+                    SessionCloseCode.PROTOCOL_VIOLATION,
+                    f"duplicate fetch stream for request_id={request_id} "
+                    f"(already bound to stream {existing})")
+        self._fetch_stream_by_request[request_id] = stream_id
+        self._data_stream_key[stream_id] = ('fetch', request_id)
+
+    def _admit_subgroup_stream(self, stream_id: int,
+                                header: 'SubgroupHeader') -> None:
+        """Admit a SubgroupHeader stream or raise MOQTStreamReject.
+
+        Admission rules (Phase 1c):
+        - track_alias MUST map to a live subscription
+        - at most one stream per (track_alias, group_id, subgroup_id)
+          tuple. For FIRST_OBJ mode, subgroup_id is None at header time
+          and the uniqueness check is deferred until the first object.
+        """
+        if header.track_alias not in self._track_aliases:
+            raise MOQTStreamReject(
+                SessionCloseCode.PROTOCOL_VIOLATION,
+                f"subgroup stream for unknown track_alias="
+                f"{header.track_alias}")
+        # subgroup_id is None in FIRST_OBJ mode — resolved on first object
+        key = (header.track_alias, header.group_id, header.subgroup_id)
+        if header.subgroup_id is not None:
+            if key in self._subgroup_stream_by_key:
+                existing = self._subgroup_stream_by_key[key]
+                if existing != stream_id:
+                    raise MOQTStreamReject(
+                        SessionCloseCode.PROTOCOL_VIOLATION,
+                        f"duplicate subgroup stream for {key} "
+                        f"(already bound to stream {existing})")
+            self._subgroup_stream_by_key[key] = stream_id
+            self._data_stream_key[stream_id] = ('subgroup', key)
+
+    def _bind_subgroup_first_obj(self, stream_id: int,
+                                  header: 'SubgroupHeader') -> None:
+        """Complete FIRST_OBJ-mode subgroup binding once subgroup_id is
+        resolved from the first object."""
+        key = (header.track_alias, header.group_id, header.subgroup_id)
+        if key in self._subgroup_stream_by_key:
+            existing = self._subgroup_stream_by_key[key]
+            if existing != stream_id:
+                raise MOQTStreamReject(
+                    SessionCloseCode.PROTOCOL_VIOLATION,
+                    f"duplicate subgroup stream for {key} "
+                    f"(already bound to stream {existing})")
+        self._subgroup_stream_by_key[key] = stream_id
+        self._data_stream_key[stream_id] = ('subgroup', key)
+
     def _moqt_handle_data_stream(self, stream_id: int, buf: Buffer, len: int) -> MOQTMessage:
-        """Process incoming data messages (not control messages)."""
+        """Process incoming data messages (not control messages).
+
+        Raises MOQTStreamReject on MoQT-level admission failure. Caller
+        must catch and invoke _reject_stream(). Data-plane parse errors
+        still return None (session-closing behavior).
+        """
         if buf.capacity == 0 or buf.tell() >= buf.capacity:
             logger.error(f"MOQT stream({stream_id}): no data at position: {buf.tell()}")
             return
@@ -471,9 +648,13 @@ class MOQTSession(QuicConnectionProtocol):
                 if 0x10 <= stream_type <= 0x1D and ((stream_type >> 1) & 0x03) != 3:
                     msg_header = SubgroupHeader.deserialize(buf, type_val=stream_type)
                     data_type = "SUBGROUP_HEADER"
+                    # Phase 1c admission check
+                    self._admit_subgroup_stream(stream_id, msg_header)
                 elif stream_type == DataStreamType.FETCH_HEADER:
                     msg_header = FetchHeader.deserialize(buf)
                     data_type = "FETCH_HEADER"
+                    # Phase 1c admission check
+                    self._admit_fetch_stream(stream_id, msg_header)
                 else:
                     data_type = f"0x{stream_type:x}"
                     logger.error(f"MOQT stream({stream_id}): unexpected data stream type: {data_type}")
@@ -489,8 +670,9 @@ class MOQTSession(QuicConnectionProtocol):
                 logger.debug(f"MOQT stream({stream_id}): {msg_header} consumed: {consumed} bytes")
                 self._data_streams[stream_id] = msg_header
             else:
-                if isinstance(self._data_streams[stream_id], SubgroupHeader):
-                    sg_header = self._data_streams[stream_id]
+                stream_state = self._data_streams[stream_id]
+                if isinstance(stream_state, SubgroupHeader):
+                    sg_header: SubgroupHeader = stream_state
                     msg_header = ObjectHeader.deserialize(
                         buf, len,
                         extensions_present=sg_header.extensions_present,
@@ -498,12 +680,19 @@ class MOQTSession(QuicConnectionProtocol):
                     )
                     # Update delta tracking state
                     sg_header._last_object_id = msg_header.object_id
-                    # Resolve subgroup_id for FIRST_OBJ mode
-                    if sg_header.subgroup_id_mode == SUBGROUP_ID_FIRST_OBJ and sg_header.subgroup_id is None:
+                    # Resolve subgroup_id for FIRST_OBJ mode and complete
+                    # the deferred subgroup binding
+                    if (sg_header.subgroup_id_mode == SUBGROUP_ID_FIRST_OBJ
+                            and sg_header.subgroup_id is None):
                         sg_header.subgroup_id = msg_header.object_id
+                        self._bind_subgroup_first_obj(stream_id, sg_header)
 
-                elif isinstance(self._data_streams[stream_id], FetchHeader):
-                    msg_header = FetchObject.deserialize(buf)
+                elif isinstance(stream_state, FetchHeader):
+                    fh: FetchHeader = stream_state
+                    msg_header = FetchObject.deserialize(buf, prior=fh._prior_obj)
+                    # Track prior object for d16 delta-encoded references
+                    if msg_header.end_of_range is None:
+                        fh._prior_obj = msg_header
 
                 if msg_header is None:
                     error = f"MOQT stream({stream_id}): ObjectHeader parse failed at: {buf.tell()}"
@@ -515,6 +704,8 @@ class MOQTSession(QuicConnectionProtocol):
 
 
             return msg_header
+        except MOQTStreamReject:
+            raise
         except Exception:
             raise
 
@@ -747,8 +938,9 @@ class MOQTSession(QuicConnectionProtocol):
             self._moqt_handle_data_dgram(msg_buf)
             return
         elif isinstance(event, StopSendingReceived):
-            logger.debug(f"MOQT event: StopSendingReceived: ")
-            self._quic.reset_stream(stream_id=stream_id,error_code=event.error_code)
+            logger.debug(f"MOQT event: StopSendingReceived: stream {event.stream_id}")
+            self._quic.reset_stream(stream_id=event.stream_id, error_code=event.error_code)
+            self._unbind_stream(event.stream_id)
             if event.stream_id in self._data_streams:
                 del self._data_streams[event.stream_id]
             if event.stream_id in self._stream_tasks:
@@ -756,10 +948,10 @@ class MOQTSession(QuicConnectionProtocol):
                 del self._stream_tasks[event.stream_id]
             return
         elif isinstance(event, StreamReset):
-            logger.debug(f"MOQT event: StreamReset: ")
+            logger.debug(f"MOQT event: StreamReset: stream {event.stream_id}")
+            self._unbind_stream(event.stream_id)
             if event.stream_id in self._data_streams:
                 del self._data_streams[event.stream_id]
-            
             if event.stream_id in self._stream_tasks:
                 self._stream_tasks[event.stream_id].cancel()
                 del self._stream_tasks[event.stream_id]
@@ -1302,127 +1494,148 @@ class MOQTSession(QuicConnectionProtocol):
  
         return message       
 
-    def join(
+    async def join(
         self,
-        namespace: Union[Tuple[bytes,...]|List[Union[bytes,str]]|str],
-        track_name: Union[bytes|str],
+        namespace: Union[Tuple[bytes, ...], List[Union[bytes, str]], str],
+        track_name: Union[bytes, str],
         subscriber_priority: int = 128,
         group_order: GroupOrder = GroupOrder.DESCENDING,
-        pre_group_offset: Optional[int] = 0,
+        fetch_type: FetchType = FetchType.RELATIVE_JOINING,
+        joining_start: int = 0,
         parameters: Optional[Dict[int, bytes]] = None,
         wait_response: Optional[bool] = False,
-    ) -> Optional[Tuple[MOQTMessage, MOQTMessage]]:
-        """Subscribe and Joining Fetch."""
-        parameters = {} if parameters is None else parameters
-        request_id = self._allocate_request_id()
-        track_alias = self._allocate_track_alias(request_id)
-        namespace = self._make_namespace_tuple(namespace)
-        track_name = track_name.encode() if isinstance(track_name, str) else track_name
+    ) -> Union[Tuple[MOQTMessage, MOQTMessage], Tuple[MOQTMessage, MOQTMessage, 'asyncio.Future']]:
+        """Subscribe + Joining Fetch (atomic pair).
 
-        message = Subscribe(
-            request_id=request_id,
-            track_alias=track_alias,
-            namespace=namespace,
+        Sends a SUBSCRIBE with filter=LATEST_OBJECT (required by spec for
+        joining fetches) followed immediately by a FETCH of type
+        RELATIVE_JOINING (default) or ABSOLUTE_JOINING referencing the
+        subscribe's request_id.
+
+        Args:
+            fetch_type: FetchType.RELATIVE_JOINING (spec: start =
+                largest_group - joining_start) or FetchType.ABSOLUTE_JOINING
+                (start = joining_start).
+            joining_start: relative offset (relative) or absolute group
+                id (absolute) — see spec §9.16.2.1.
+            wait_response: if True, awaits and returns
+                (subscribe_ok, fetch_ok). If False, returns
+                (subscribe_msg, fetch_msg) sent messages.
+
+        Returns:
+            (subscribe_response, fetch_response) when wait_response=True,
+            (subscribe_msg, fetch_msg) when wait_response=False.
+        """
+        if fetch_type not in (FetchType.RELATIVE_JOINING,
+                               FetchType.ABSOLUTE_JOINING):
+            raise ValueError(
+                f"join() requires a joining fetch_type, got {fetch_type}")
+
+        parameters = {} if parameters is None else parameters
+        sub_request_id = self._allocate_request_id()
+        self._allocate_track_alias(sub_request_id)
+        namespace_tuple = self._make_namespace_tuple(namespace)
+        if isinstance(track_name, str):
+            track_name = track_name.encode()
+
+        sub_msg = Subscribe(
+            request_id=sub_request_id,
+            track_namespace=namespace_tuple,
             track_name=track_name,
             priority=subscriber_priority,
             group_order=group_order,
-            filter_type=FilterType.LATEST_OBJECT,
-            parameters=parameters
+            filter_type=FilterType.LATEST_OBJECT,  # spec §9.16.2
+            parameters=parameters,
         )
-        self._subscriptions[request_id] = [message]
-        logger.info(f"MOQT send: {message}")
-        self.send_control_message(message.serialize())
+        self._subscriptions[sub_request_id] = [sub_msg]
+        logger.info(f"MOQT send: {sub_msg}")
+        self.send_control_message(sub_msg.serialize())
 
         fetch_request_id = self._allocate_request_id()
-        message = Fetch(
+        fetch_msg = Fetch(
             request_id=fetch_request_id,
+            fetch_type=fetch_type,
             subscriber_priority=subscriber_priority,
             group_order=group_order,
-            joining_sub_id=request_id,
-            fetch_type=FetchType.JOINING_FETCH,
-            pre_group_offset=pre_group_offset,
-            parameters=parameters
+            joining_request_id=sub_request_id,
+            joining_start=joining_start,
+            parameters=dict(parameters),
         )
-        
-        self._subscriptions[request_id] = [message]
-        logger.info(f"MOQT send: {message}")
-        self.send_control_message(message.serialize())
+        self._subscriptions[fetch_request_id] = [fetch_msg]
+        logger.info(f"MOQT send: {fetch_msg}")
+        self.send_control_message(fetch_msg.serialize())
 
         if not wait_response:
-            return message
+            return (sub_msg, fetch_msg)
 
-        async def wait_for_both():
-            sub_response = await self._await_response(request_id)
-            fetch_response = await self._await_response(fetch_request_id)
-            return sub_response, fetch_response
-
-        return wait_for_both()
+        sub_response = await self._await_response(sub_request_id)
+        fetch_response = await self._await_response(fetch_request_id)
+        return (sub_response, fetch_response)
 
     def fetch(
         self,
-        namespace: Union[Tuple[bytes,...]|List[Union[bytes,str]]|str],
-        track_name: Union[bytes|str],
+        namespace: Union[Tuple[bytes, ...], List[Union[bytes, str]], str],
+        track_name: Union[bytes, str],
         subscriber_priority: int = 128,
         group_order: GroupOrder = GroupOrder.ASCENDING,
-        start_group: Optional[int] = 0,
-        start_object: Optional[int] = 0,
-        end_group: Optional[int] = 0,
-        end_object: Optional[int] = 0,
+        start_group: int = 0,
+        start_object: int = 0,
+        end_group: int = 0,
+        end_object: int = 0,
         parameters: Optional[Dict[int, bytes]] = None,
         wait_response: Optional[bool] = False,
     ) -> Optional[MOQTMessage]:
-        """Fetch data from a track with configurable options."""
+        """Standalone FETCH of a range of objects from a track.
+
+        Per spec §9.16.1: End Location.Object of 0 means the entire end
+        group is requested.
+        """
         parameters = {} if parameters is None else parameters
         request_id = self._allocate_request_id()
-        track_alias = self._allocate_track_alias(request_id)
         namespace = self._make_namespace_tuple(namespace)
-
         if isinstance(track_name, str):
             track_name = track_name.encode()
 
         message = Fetch(
             request_id=request_id,
-            track_alias=track_alias,
+            fetch_type=FetchType.STANDALONE,
+            subscriber_priority=subscriber_priority,
+            group_order=group_order,
             namespace=namespace,
             track_name=track_name,
-            priority=subscriber_priority,
-            fetch_type=FetchType.FETCH,
-            group_order=group_order,
             start_group=start_group,
             start_object=start_object,
             end_group=end_group,
             end_object=end_object,
-            parameters=parameters
+            parameters=parameters,
         )
-        
         self._subscriptions[request_id] = [message]
         logger.info(f"MOQT send: {message}")
         self.send_control_message(message.serialize())
 
         if not wait_response:
             return message
-
         return self._await_response(request_id)
 
     def fetch_ok(
         self,
         request_id: int,
-        expires: int = 0,  # 0 means no expiry
+        end_of_track: int = 0,
+        largest_group_id: int = 0,
+        largest_object_id: int = 0,
         group_order: int = GroupOrder.ASCENDING,
-        content_exists: int = 0,
-        largest_group_id: Optional[int] = None,
-        largest_object_id: Optional[int] = None,
-        parameters: Optional[Dict[int, bytes]] = None
+        parameters: Optional[Dict[int, bytes]] = None,
+        track_extensions: Optional[Dict[int, Any]] = None,
     ) -> Optional[MOQTMessage]:
-        """Create and send a SUBSCRIBE_OK response."""
-        message = SubscribeOk(
+        """Create and send a FETCH_OK response (spec §9.17)."""
+        message = FetchOk(
             request_id=request_id,
-            expires=expires,
-            group_order=group_order,
-            content_exists=content_exists,
+            end_of_track=end_of_track,
             largest_group_id=largest_group_id,
             largest_object_id=largest_object_id,
-            parameters=parameters or {}
+            group_order=group_order,
+            parameters=parameters or {},
+            track_extensions=track_extensions or {},
         )
         logger.info(f"MOQT send: {message}")
         self.send_control_message(message.serialize())
@@ -1431,16 +1644,14 @@ class MOQTSession(QuicConnectionProtocol):
     def fetch_error(
         self,
         request_id: int,
-        error_code: int = SubscribeErrorCode.INTERNAL_ERROR,
+        error_code: int = 0,
         reason: str = "Internal error",
-        track_alias: Optional[int] = None
     ) -> Optional[MOQTMessage]:
-        """Create and send a SUBSCRIBE_ERROR response."""
-        message = SubscribeError(
+        """Create and send a FETCH_ERROR response (spec §9.16)."""
+        message = FetchError(
             request_id=request_id,
             error_code=error_code,
             reason=reason,
-            track_alias=track_alias
         )
         logger.info(f"MOQT send: {message}")
         self.send_control_message(message.serialize())
@@ -1805,19 +2016,58 @@ class MOQTSession(QuicConnectionProtocol):
         # Subscriber rejected our PUBLISH
 
     async def _handle_fetch(self, msg: Fetch) -> None:
+        """Default handler for incoming FETCH.
+
+        Auto-accepts with FETCH_OK. Override via register_handler(FETCH, ...)
+        for custom fetch handling (e.g. open uni stream and send objects).
+        """
         logger.info(f"MOQT event: handle {msg}")
-        self.fetch_ok(msg)
+        self.fetch_ok(request_id=msg.request_id)
 
     async def _handle_fetch_cancel(self, msg: FetchCancel) -> None:
+        """Publisher-side: FETCH_CANCEL received for a fetch we are
+        serving. Reset the associated uni stream to release our write
+        side, and resolve any pending request state.
+
+        Phase 1b publisher side: only operative when the application
+        registered the fetch's uni stream with bind_fetch_tx_stream().
+        """
         logger.info(f"MOQT event: handle {msg}")
-        # Handle fetch cancellation
+        stream_id = self._fetch_stream_by_request.pop(msg.request_id, None)
+        if stream_id is not None:
+            self._data_stream_key.pop(stream_id, None)
+            try:
+                self._quic.reset_stream(
+                    stream_id, SessionCloseCode.NO_ERROR)
+                logger.debug(f"MOQT stream({stream_id}): reset on FETCH_CANCEL "
+                             f"for request_id={msg.request_id}")
+            except Exception as e:
+                logger.debug(f"MOQT stream({stream_id}): reset_stream failed: {e}")
+        self._resolve_request(msg.request_id, msg)
 
     async def _handle_fetch_ok(self, msg: FetchOk) -> None:
         logger.info(f"MOQT event: handle {msg}")
         self._resolve_request(msg.request_id, msg)
 
     async def _handle_fetch_error(self, msg: FetchError) -> None:
+        """Subscriber-side: FETCH_ERROR received for a fetch we issued.
+
+        If the publisher already opened a fetch uni stream (legitimate
+        per spec §9.16.3 — FETCH_OK/ERROR can arrive at any time relative
+        to object delivery), send STOP_SENDING to release the peer's
+        write side. Then resolve the pending request future with the
+        error.
+        """
         logger.info(f"MOQT event: handle {msg}")
+        stream_id = self._fetch_stream_by_request.pop(msg.request_id, None)
+        if stream_id is not None:
+            self._data_stream_key.pop(stream_id, None)
+            try:
+                self._quic.stop_stream(stream_id, msg.error_code)
+                logger.debug(f"MOQT stream({stream_id}): stop_sending on "
+                             f"FETCH_ERROR request_id={msg.request_id}")
+            except Exception as e:
+                logger.debug(f"MOQT stream({stream_id}): stop_stream failed: {e}")
         self._resolve_request(msg.request_id, msg)
 
 
@@ -1833,16 +2083,16 @@ class MOQTSession(QuicConnectionProtocol):
             logger.error(f"MOQT error: unrecognized track alias: {msg.track_alias}")
 
     async def _handle_fetch_header(self, msg: FetchHeader) -> None:
-        """Handle fetch header message."""
+        """Handle fetch header message.
+
+        NOTE: This registry handler is not currently dispatched by the
+        data-stream path. Admission checks and binding-table registration
+        happen inline in _moqt_handle_data_stream (Phase 1c), where
+        unknown request_ids are rejected at the stream level via
+        STOP_SENDING — not at the session level. This method is retained
+        for registry completeness / user override.
+        """
         logger.info(f"MOQT event: handle {msg}")
-        # Process fetch header
-        # Validate request_id exists
-        if msg.request_id not in self._subscriptions:
-            logger.error(f"MOQT error: fetch for unknown subscription: {msg.request_id}")
-            self.close(
-                error_code=SessionCloseCode.PROTOCOL_VIOLATION,
-                reason_phrase="Invalid subscription ID in fetch"
-            )
         return
 
     async def _handle_object_datagram(self, msg: ObjectDatagram) -> None:

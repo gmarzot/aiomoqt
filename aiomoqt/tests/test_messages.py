@@ -4,6 +4,7 @@ from conftest import moqt_message_serialization, moqt_test_id
 
 from aiomoqt.types import *
 from aiomoqt.messages import *
+from aiomoqt.utils.buffer import Buffer
 
 FETCH_TEST_CASES = [
     (
@@ -47,17 +48,32 @@ FETCH_TEST_CASES = [
     (
         Fetch,
         {
-            "fetch_type": FetchType.JOINING_FETCH,
+            "fetch_type": FetchType.RELATIVE_JOINING,
             "request_id": 789,
             "subscriber_priority": 255,
             "group_order": GroupOrder.DESCENDING,
-            "joining_sub_id": 45,
-            "pre_group_offset": 3,
+            "joining_request_id": 45,
+            "joining_start": 3,
             "parameters": {ParamType.GROUP_ORDER: GroupOrder.ASCENDING}
         },
         MOQTMessageType.FETCH,
         False,
-        "joining_fetch"
+        "relative_joining_fetch"
+    ),
+    (
+        Fetch,
+        {
+            "fetch_type": FetchType.ABSOLUTE_JOINING,
+            "request_id": 791,
+            "subscriber_priority": 128,
+            "group_order": GroupOrder.ASCENDING,
+            "joining_request_id": 45,
+            "joining_start": 100,
+            "parameters": {}
+        },
+        MOQTMessageType.FETCH,
+        False,
+        "absolute_joining_fetch"
     )
 ]
 
@@ -961,3 +977,565 @@ class TestDraft16NewMessages:
             type_id=D16MessageType.NAMESPACE_DONE,
             version=MOQT_VERSION_DRAFT16,
         )
+
+
+# ========================================================================
+# Phase 2 — SUBSCRIBE filter type matrix (d14 + d16)
+# ========================================================================
+
+_SUBSCRIBE_BASE = {
+    'request_id': 10,
+    'track_namespace': (b'live', b'sports'),
+    'track_name': b'video',
+    'priority': 128,
+    'group_order': GroupOrder.ASCENDING,
+    'forward': 1,
+    'parameters': {},
+}
+
+
+class TestSubscribeFilterD14:
+    """Round-trip every FilterType in draft-14 wire format."""
+
+    def test_latest_object(self):
+        assert moqt_message_serialization_versioned(
+            Subscribe,
+            {**_SUBSCRIBE_BASE, 'filter_type': FilterType.LATEST_OBJECT},
+            type_id=MOQTMessageType.SUBSCRIBE,
+            version=MOQT_VERSION_DRAFT14,
+        )
+
+    def test_next_group_start(self):
+        assert moqt_message_serialization_versioned(
+            Subscribe,
+            {**_SUBSCRIBE_BASE, 'filter_type': FilterType.NEXT_GROUP_START},
+            type_id=MOQTMessageType.SUBSCRIBE,
+            version=MOQT_VERSION_DRAFT14,
+        )
+
+    def test_absolute_start(self):
+        assert moqt_message_serialization_versioned(
+            Subscribe,
+            {**_SUBSCRIBE_BASE,
+             'filter_type': FilterType.ABSOLUTE_START,
+             'start_group': 5,
+             'start_object': 3},
+            type_id=MOQTMessageType.SUBSCRIBE,
+            version=MOQT_VERSION_DRAFT14,
+        )
+
+    def test_absolute_range(self):
+        assert moqt_message_serialization_versioned(
+            Subscribe,
+            {**_SUBSCRIBE_BASE,
+             'filter_type': FilterType.ABSOLUTE_RANGE,
+             'start_group': 10,
+             'start_object': 0,
+             'end_group': 50},
+            type_id=MOQTMessageType.SUBSCRIBE,
+            version=MOQT_VERSION_DRAFT14,
+        )
+
+
+class TestSubscribeFilterD16:
+    """Round-trip every FilterType in draft-16 (SUBSCRIPTION_FILTER param)."""
+
+    def test_latest_object(self):
+        assert moqt_message_serialization_versioned(
+            Subscribe,
+            {**_SUBSCRIBE_BASE, 'filter_type': FilterType.LATEST_OBJECT},
+            type_id=MOQTMessageType.SUBSCRIBE,
+            version=MOQT_VERSION_DRAFT16,
+        )
+
+    def test_next_group_start(self):
+        assert moqt_message_serialization_versioned(
+            Subscribe,
+            {**_SUBSCRIBE_BASE, 'filter_type': FilterType.NEXT_GROUP_START},
+            type_id=MOQTMessageType.SUBSCRIBE,
+            version=MOQT_VERSION_DRAFT16,
+        )
+
+    def test_absolute_start(self):
+        assert moqt_message_serialization_versioned(
+            Subscribe,
+            {**_SUBSCRIBE_BASE,
+             'filter_type': FilterType.ABSOLUTE_START,
+             'start_group': 5,
+             'start_object': 3},
+            type_id=MOQTMessageType.SUBSCRIBE,
+            version=MOQT_VERSION_DRAFT16,
+        )
+
+    def test_absolute_range(self):
+        assert moqt_message_serialization_versioned(
+            Subscribe,
+            {**_SUBSCRIBE_BASE,
+             'filter_type': FilterType.ABSOLUTE_RANGE,
+             'start_group': 10,
+             'start_object': 0,
+             'end_group': 50},
+            type_id=MOQTMessageType.SUBSCRIBE,
+            version=MOQT_VERSION_DRAFT16,
+        )
+
+
+# ========================================================================
+# Phase 3 — Fetch message type matrix (d14 + d16)
+# ========================================================================
+
+class TestFetchD16AllTypes:
+    """Draft-16 round-trip for all 3 Fetch types."""
+
+    def test_standalone_d16(self):
+        assert moqt_message_serialization_versioned(
+            Fetch,
+            {
+                'request_id': 42,
+                'fetch_type': FetchType.STANDALONE,
+                'namespace': (b'live', b'sports'),
+                'track_name': b'football',
+                'subscriber_priority': 1,
+                'group_order': GroupOrder.ASCENDING,
+                'start_group': 10,
+                'start_object': 5,
+                'end_group': 20,
+                'end_object': 15,
+                'parameters': {},
+            },
+            type_id=MOQTMessageType.FETCH,
+            version=MOQT_VERSION_DRAFT16,
+        )
+
+    def test_relative_joining_d16(self):
+        assert moqt_message_serialization_versioned(
+            Fetch,
+            {
+                'request_id': 100,
+                'fetch_type': FetchType.RELATIVE_JOINING,
+                'subscriber_priority': 255,
+                'group_order': GroupOrder.DESCENDING,
+                'joining_request_id': 98,
+                'joining_start': 5,
+                'parameters': {},
+            },
+            type_id=MOQTMessageType.FETCH,
+            version=MOQT_VERSION_DRAFT16,
+        )
+
+    def test_absolute_joining_d16(self):
+        assert moqt_message_serialization_versioned(
+            Fetch,
+            {
+                'request_id': 200,
+                'fetch_type': FetchType.ABSOLUTE_JOINING,
+                'subscriber_priority': 64,
+                'group_order': GroupOrder.ASCENDING,
+                'joining_request_id': 198,
+                'joining_start': 42,
+                'parameters': {ParamType.DELIVERY_TIMEOUT: 5000},
+            },
+            type_id=MOQTMessageType.FETCH,
+            version=MOQT_VERSION_DRAFT16,
+        )
+
+
+class TestFetchD14AllTypes:
+    """Draft-14 round-trip for all 3 Fetch types (regression)."""
+
+    def test_standalone_d14(self):
+        assert moqt_message_serialization_versioned(
+            Fetch,
+            {
+                'request_id': 42,
+                'fetch_type': FetchType.STANDALONE,
+                'namespace': (b'live', b'sports'),
+                'track_name': b'football',
+                'subscriber_priority': 1,
+                'group_order': GroupOrder.ASCENDING,
+                'start_group': 10,
+                'start_object': 5,
+                'end_group': 20,
+                'end_object': 15,
+                'parameters': {},
+            },
+            type_id=MOQTMessageType.FETCH,
+            version=MOQT_VERSION_DRAFT14,
+        )
+
+    def test_relative_joining_d14(self):
+        assert moqt_message_serialization_versioned(
+            Fetch,
+            {
+                'request_id': 789,
+                'fetch_type': FetchType.RELATIVE_JOINING,
+                'subscriber_priority': 255,
+                'group_order': GroupOrder.DESCENDING,
+                'joining_request_id': 45,
+                'joining_start': 3,
+                'parameters': {},
+            },
+            type_id=MOQTMessageType.FETCH,
+            version=MOQT_VERSION_DRAFT14,
+        )
+
+    def test_absolute_joining_d14(self):
+        assert moqt_message_serialization_versioned(
+            Fetch,
+            {
+                'request_id': 791,
+                'fetch_type': FetchType.ABSOLUTE_JOINING,
+                'subscriber_priority': 128,
+                'group_order': GroupOrder.ASCENDING,
+                'joining_request_id': 45,
+                'joining_start': 100,
+                'parameters': {},
+            },
+            type_id=MOQTMessageType.FETCH,
+            version=MOQT_VERSION_DRAFT14,
+        )
+
+
+# ========================================================================
+# Phase 3 — FetchObject round-trip matrix
+# ========================================================================
+
+from aiomoqt.context import set_moqt_ctx_version, get_moqt_ctx_version
+from aiomoqt.messages.track import (
+    FETCH_FLAG_SG_ZERO, FETCH_FLAG_SG_PRIOR, FETCH_FLAG_SG_PRIOR_PLUS,
+    FETCH_FLAG_SG_PRESENT, FETCH_FLAG_OBJECT_ID_PRESENT,
+    FETCH_FLAG_GROUP_ID_PRESENT, FETCH_FLAG_PRIORITY_PRESENT,
+    FETCH_FLAG_EXTENSIONS_PRESENT, FETCH_FLAG_DATAGRAM,
+    FETCH_FLAGS_END_NON_EXISTENT, FETCH_FLAGS_END_UNKNOWN,
+)
+
+
+def _fetch_object_roundtrip(obj, version, prior=None):
+    """Serialize and deserialize a FetchObject, return the result."""
+    prev = get_moqt_ctx_version()
+    set_moqt_ctx_version(version)
+    try:
+        buf = obj.serialize()
+        buf.seek(0)
+        return FetchObject.deserialize(buf, prior=prior)
+    finally:
+        set_moqt_ctx_version(prev)
+
+
+class TestFetchObjectD14:
+    """Draft-14 FetchObject: explicit fields, no flags."""
+
+    def test_normal_payload(self):
+        obj = FetchObject(group_id=5, subgroup_id=0, object_id=10,
+                          publisher_priority=128,
+                          extensions={0x20: 1234},
+                          payload=b'hello world')
+        result = _fetch_object_roundtrip(obj, MOQT_VERSION_DRAFT14)
+        assert result.group_id == 5
+        assert result.subgroup_id == 0
+        assert result.object_id == 10
+        assert result.publisher_priority == 128
+        assert result.extensions[0x20] == 1234
+        assert result.payload == b'hello world'
+        assert result.status == ObjectStatus.NORMAL
+
+    def test_empty_payload_with_status(self):
+        obj = FetchObject(group_id=3, subgroup_id=1, object_id=99,
+                          publisher_priority=0,
+                          status=ObjectStatus.END_OF_GROUP,
+                          payload=b'')
+        result = _fetch_object_roundtrip(obj, MOQT_VERSION_DRAFT14)
+        assert result.status == ObjectStatus.END_OF_GROUP
+        assert result.payload == b''
+
+    def test_no_extensions(self):
+        obj = FetchObject(group_id=0, subgroup_id=0, object_id=0,
+                          publisher_priority=200,
+                          extensions={},
+                          payload=b'data')
+        result = _fetch_object_roundtrip(obj, MOQT_VERSION_DRAFT14)
+        assert result.object_id == 0
+        assert result.payload == b'data'
+
+    def test_end_of_track_status(self):
+        obj = FetchObject(group_id=10, subgroup_id=0, object_id=50,
+                          publisher_priority=128,
+                          status=ObjectStatus.END_OF_TRACK,
+                          payload=b'')
+        result = _fetch_object_roundtrip(obj, MOQT_VERSION_DRAFT14)
+        assert result.status == ObjectStatus.END_OF_TRACK
+
+
+class TestFetchObjectD16:
+    """Draft-16 FetchObject: Serialization Flags + delta references."""
+
+    def test_all_explicit(self):
+        """Default encoder: all flags set, all fields explicit."""
+        obj = FetchObject(group_id=10, subgroup_id=3, object_id=7,
+                          publisher_priority=64,
+                          payload=b'test payload')
+        result = _fetch_object_roundtrip(obj, MOQT_VERSION_DRAFT16)
+        assert result.group_id == 10
+        assert result.subgroup_id == 3
+        assert result.object_id == 7
+        assert result.publisher_priority == 64
+        assert result.payload == b'test payload'
+
+    def test_all_explicit_with_extensions(self):
+        """All-explicit with extensions flag set."""
+        obj = FetchObject(group_id=1, subgroup_id=0, object_id=0,
+                          publisher_priority=128,
+                          extensions={0x20: 42, 0x21: b'\xca\xfe'},
+                          payload=b'ext')
+        result = _fetch_object_roundtrip(obj, MOQT_VERSION_DRAFT16)
+        assert result.extensions[0x20] == 42
+        assert result.extensions[0x21] == b'\xca\xfe'
+        assert result.payload == b'ext'
+
+    def test_delta_object_id(self):
+        """Object ID absent (flag 0x04 unset) → derived as prior + 1."""
+        prior = FetchObject(group_id=5, subgroup_id=0, object_id=10,
+                            publisher_priority=128, payload=b'')
+        # Manually build a delta-encoded buffer: flags without OBJECT_ID
+        prev = get_moqt_ctx_version()
+        set_moqt_ctx_version(MOQT_VERSION_DRAFT16)
+        try:
+            from aiomoqt.messages.track import BUF_SIZE
+            buf = Buffer(capacity=BUF_SIZE)
+            flags = (FETCH_FLAG_SG_PRESENT
+                     | FETCH_FLAG_GROUP_ID_PRESENT
+                     | FETCH_FLAG_PRIORITY_PRESENT)
+            # Note: OBJECT_ID_PRESENT is NOT set
+            buf.push_uint_var(flags)
+            buf.push_uint_var(5)   # group_id
+            buf.push_uint_var(0)   # subgroup_id (SG_PRESENT)
+            # object_id omitted — derived as prior.object_id + 1 = 11
+            buf.push_uint8(128)    # priority
+            buf.push_uint_var(4)   # payload_len
+            buf.push_bytes(b'next')
+            buf.seek(0)
+            result = FetchObject.deserialize(buf, prior=prior)
+        finally:
+            set_moqt_ctx_version(prev)
+        assert result.object_id == 11
+
+    def test_delta_group_id(self):
+        """Group ID absent (flag 0x08 unset) → same as prior group."""
+        prior = FetchObject(group_id=7, subgroup_id=0, object_id=3,
+                            publisher_priority=128, payload=b'')
+        prev = get_moqt_ctx_version()
+        set_moqt_ctx_version(MOQT_VERSION_DRAFT16)
+        try:
+            from aiomoqt.messages.track import BUF_SIZE
+            buf = Buffer(capacity=BUF_SIZE)
+            flags = (FETCH_FLAG_SG_PRESENT
+                     | FETCH_FLAG_OBJECT_ID_PRESENT
+                     | FETCH_FLAG_PRIORITY_PRESENT)
+            # GROUP_ID_PRESENT NOT set
+            buf.push_uint_var(flags)
+            # group_id omitted — derived from prior
+            buf.push_uint_var(2)   # subgroup_id (SG_PRESENT)
+            buf.push_uint_var(4)   # object_id
+            buf.push_uint8(100)    # priority
+            buf.push_uint_var(3)
+            buf.push_bytes(b'dat')
+            buf.seek(0)
+            result = FetchObject.deserialize(buf, prior=prior)
+        finally:
+            set_moqt_ctx_version(prev)
+        assert result.group_id == 7  # from prior
+
+    def test_delta_priority(self):
+        """Priority absent (flag 0x10 unset) → same as prior."""
+        prior = FetchObject(group_id=1, subgroup_id=0, object_id=0,
+                            publisher_priority=42, payload=b'')
+        prev = get_moqt_ctx_version()
+        set_moqt_ctx_version(MOQT_VERSION_DRAFT16)
+        try:
+            from aiomoqt.messages.track import BUF_SIZE
+            buf = Buffer(capacity=BUF_SIZE)
+            flags = (FETCH_FLAG_SG_PRESENT
+                     | FETCH_FLAG_OBJECT_ID_PRESENT
+                     | FETCH_FLAG_GROUP_ID_PRESENT)
+            # PRIORITY_PRESENT NOT set
+            buf.push_uint_var(flags)
+            buf.push_uint_var(1)   # group_id
+            buf.push_uint_var(0)   # subgroup_id
+            buf.push_uint_var(1)   # object_id
+            # priority omitted
+            buf.push_uint_var(2)
+            buf.push_bytes(b'ab')
+            buf.seek(0)
+            result = FetchObject.deserialize(buf, prior=prior)
+        finally:
+            set_moqt_ctx_version(prev)
+        assert result.publisher_priority == 42  # from prior
+
+    def test_subgroup_mode_zero(self):
+        """SG mode 0x00 → subgroup_id = 0."""
+        prev = get_moqt_ctx_version()
+        set_moqt_ctx_version(MOQT_VERSION_DRAFT16)
+        try:
+            from aiomoqt.messages.track import BUF_SIZE
+            buf = Buffer(capacity=BUF_SIZE)
+            flags = (FETCH_FLAG_SG_ZERO
+                     | FETCH_FLAG_OBJECT_ID_PRESENT
+                     | FETCH_FLAG_GROUP_ID_PRESENT
+                     | FETCH_FLAG_PRIORITY_PRESENT)
+            buf.push_uint_var(flags)
+            buf.push_uint_var(2)   # group_id
+            # subgroup_id NOT present (mode=zero)
+            buf.push_uint_var(5)   # object_id
+            buf.push_uint8(128)
+            buf.push_uint_var(0)
+            buf.push_uint_var(ObjectStatus.END_OF_GROUP)
+            buf.seek(0)
+            result = FetchObject.deserialize(buf, prior=None)
+        finally:
+            set_moqt_ctx_version(prev)
+        assert result.subgroup_id == 0
+
+    def test_subgroup_mode_prior(self):
+        """SG mode 0x01 → subgroup_id = prior's subgroup_id."""
+        prior = FetchObject(group_id=1, subgroup_id=7, object_id=0,
+                            publisher_priority=128, payload=b'')
+        prev = get_moqt_ctx_version()
+        set_moqt_ctx_version(MOQT_VERSION_DRAFT16)
+        try:
+            from aiomoqt.messages.track import BUF_SIZE
+            buf = Buffer(capacity=BUF_SIZE)
+            flags = (FETCH_FLAG_SG_PRIOR
+                     | FETCH_FLAG_OBJECT_ID_PRESENT
+                     | FETCH_FLAG_GROUP_ID_PRESENT
+                     | FETCH_FLAG_PRIORITY_PRESENT)
+            buf.push_uint_var(flags)
+            buf.push_uint_var(1)   # group_id
+            buf.push_uint_var(1)   # object_id
+            buf.push_uint8(128)
+            buf.push_uint_var(1)
+            buf.push_bytes(b'x')
+            buf.seek(0)
+            result = FetchObject.deserialize(buf, prior=prior)
+        finally:
+            set_moqt_ctx_version(prev)
+        assert result.subgroup_id == 7  # from prior
+
+    def test_subgroup_mode_prior_plus(self):
+        """SG mode 0x02 → subgroup_id = prior + 1."""
+        prior = FetchObject(group_id=1, subgroup_id=7, object_id=0,
+                            publisher_priority=128, payload=b'')
+        prev = get_moqt_ctx_version()
+        set_moqt_ctx_version(MOQT_VERSION_DRAFT16)
+        try:
+            from aiomoqt.messages.track import BUF_SIZE
+            buf = Buffer(capacity=BUF_SIZE)
+            flags = (FETCH_FLAG_SG_PRIOR_PLUS
+                     | FETCH_FLAG_OBJECT_ID_PRESENT
+                     | FETCH_FLAG_GROUP_ID_PRESENT
+                     | FETCH_FLAG_PRIORITY_PRESENT)
+            buf.push_uint_var(flags)
+            buf.push_uint_var(1)   # group_id
+            buf.push_uint_var(1)   # object_id
+            buf.push_uint8(128)
+            buf.push_uint_var(1)
+            buf.push_bytes(b'y')
+            buf.seek(0)
+            result = FetchObject.deserialize(buf, prior=prior)
+        finally:
+            set_moqt_ctx_version(prev)
+        assert result.subgroup_id == 8  # prior + 1
+
+    def test_datagram_pref(self):
+        """Datagram preference flag (0x40) → subgroup_id = 0."""
+        prev = get_moqt_ctx_version()
+        set_moqt_ctx_version(MOQT_VERSION_DRAFT16)
+        try:
+            from aiomoqt.messages.track import BUF_SIZE
+            buf = Buffer(capacity=BUF_SIZE)
+            flags = (FETCH_FLAG_DATAGRAM
+                     | FETCH_FLAG_OBJECT_ID_PRESENT
+                     | FETCH_FLAG_GROUP_ID_PRESENT
+                     | FETCH_FLAG_PRIORITY_PRESENT)
+            buf.push_uint_var(flags)
+            buf.push_uint_var(1)   # group_id
+            buf.push_uint_var(0)   # object_id
+            buf.push_uint8(128)
+            buf.push_uint_var(4)
+            buf.push_bytes(b'dgrm')
+            buf.seek(0)
+            result = FetchObject.deserialize(buf, prior=None)
+        finally:
+            set_moqt_ctx_version(prev)
+        assert result.subgroup_id == 0
+
+    def test_end_of_range_non_existent(self):
+        """End-of-range marker 0x8C (Non-Existent Range)."""
+        obj = FetchObject(group_id=10, object_id=5,
+                          end_of_range=FETCH_FLAGS_END_NON_EXISTENT)
+        result = _fetch_object_roundtrip(obj, MOQT_VERSION_DRAFT16)
+        assert result.end_of_range == FETCH_FLAGS_END_NON_EXISTENT
+        assert result.group_id == 10
+        assert result.object_id == 5
+
+    def test_end_of_range_unknown(self):
+        """End-of-range marker 0x10C (Unknown Range)."""
+        obj = FetchObject(group_id=20, object_id=0,
+                          end_of_range=FETCH_FLAGS_END_UNKNOWN)
+        result = _fetch_object_roundtrip(obj, MOQT_VERSION_DRAFT16)
+        assert result.end_of_range == FETCH_FLAGS_END_UNKNOWN
+        assert result.group_id == 20
+
+    def test_status_end_of_group(self):
+        """payload_len=0 with END_OF_GROUP status code."""
+        obj = FetchObject(group_id=3, subgroup_id=0, object_id=30,
+                          publisher_priority=128,
+                          status=ObjectStatus.END_OF_GROUP,
+                          payload=b'')
+        result = _fetch_object_roundtrip(obj, MOQT_VERSION_DRAFT16)
+        assert result.status == ObjectStatus.END_OF_GROUP
+        assert result.payload == b''
+
+    def test_status_end_of_track(self):
+        """payload_len=0 with END_OF_TRACK status code."""
+        obj = FetchObject(group_id=5, subgroup_id=0, object_id=100,
+                          publisher_priority=128,
+                          status=ObjectStatus.END_OF_TRACK,
+                          payload=b'')
+        result = _fetch_object_roundtrip(obj, MOQT_VERSION_DRAFT16)
+        assert result.status == ObjectStatus.END_OF_TRACK
+
+    def test_first_object_missing_group_id_raises(self):
+        """First object on stream missing Group ID → ValueError."""
+        prev = get_moqt_ctx_version()
+        set_moqt_ctx_version(MOQT_VERSION_DRAFT16)
+        try:
+            from aiomoqt.messages.track import BUF_SIZE
+            buf = Buffer(capacity=BUF_SIZE)
+            # flags: no GROUP_ID, no OBJECT_ID
+            flags = (FETCH_FLAG_SG_PRESENT | FETCH_FLAG_PRIORITY_PRESENT)
+            buf.push_uint_var(flags)
+            buf.push_uint_var(0)   # subgroup_id
+            buf.push_uint8(128)
+            buf.push_uint_var(1)
+            buf.push_bytes(b'x')
+            buf.seek(0)
+            with pytest.raises(ValueError, match="first object"):
+                FetchObject.deserialize(buf, prior=None)
+        finally:
+            set_moqt_ctx_version(prev)
+
+    def test_invalid_flags_high_bit(self):
+        """Flags >= 0x80 (excluding known end-of-range) → ValueError."""
+        prev = get_moqt_ctx_version()
+        set_moqt_ctx_version(MOQT_VERSION_DRAFT16)
+        try:
+            from aiomoqt.messages.track import BUF_SIZE
+            buf = Buffer(capacity=BUF_SIZE)
+            buf.push_uint_var(0x80)  # invalid flags
+            buf.push_uint_var(0)
+            buf.push_uint_var(0)
+            buf.seek(0)
+            with pytest.raises(ValueError, match="invalid serialization flags"):
+                FetchObject.deserialize(buf, prior=None)
+        finally:
+            set_moqt_ctx_version(prev)
