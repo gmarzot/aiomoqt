@@ -2080,8 +2080,14 @@ class MOQTSession(QuicConnectionProtocol):
         # Handle unsubscribe request
 
     async def _handle_subscribe_done(self, msg: SubscribeDone) -> None:
-        logger.info(f"MOQT event: handle {msg}")
-        self._resolve_request(msg.request_id, msg)
+        logger.info(f"MOQT event: handle SubscribeDone "
+                     f"request_id={msg.request_id} "
+                     f"status={msg.status_code} "
+                     f"streams={msg.stream_count}")
+        # Resolve if anyone is waiting, otherwise just log
+        future = self._pending_requests.get(msg.request_id)
+        if future and not future.done():
+            future.set_result(msg)
         # Publisher is done — close session gracefully
         self._close_session(SessionCloseCode.NO_ERROR,
                             "publisher done")
