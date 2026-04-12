@@ -50,7 +50,8 @@ class BenchStats:
         self.all_latencies: list = []
 
         # Loss tracking per group/subgroup
-        self.expected_seq: dict = {}
+        self.expected_seq: dict = {}   # key → next expected object_id
+        self.stride: dict = {}         # key → object_id stride (auto-detected)
         self.total_lost: int = 0
         self.total_ooo: int = 0
 
@@ -106,12 +107,24 @@ class BenchStats:
                 sid = subgroup_id if subgroup_id is not None else 0
                 key = f"sg_{gid}_{sid}"
 
-            expected = self.expected_seq.get(key, 0)
-            if oid > expected:
-                self.total_lost += (oid - expected)
-            elif oid < expected:
-                self.total_ooo += 1
-            self.expected_seq[key] = oid + 1
+            expected = self.expected_seq.get(key)
+            if expected is None:
+                # First object on this subgroup — record start
+                self.expected_seq[key] = oid
+            else:
+                # Detect stride from second object, then use it
+                st = self.stride.get(key)
+                if st is None and oid > expected:
+                    st = oid - expected
+                    self.stride[key] = st
+                st = st or 1
+                if oid > expected:
+                    lost = (oid - expected) // st - 1
+                    if lost > 0:
+                        self.total_lost += lost
+                elif oid < expected:
+                    self.total_ooo += 1
+            self.expected_seq[key] = oid + (self.stride.get(key) or 1)
 
         self.iv_objects += 1
         self.iv_bytes += size_bytes
