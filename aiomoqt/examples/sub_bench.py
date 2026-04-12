@@ -150,7 +150,7 @@ class BenchStats:
         print(
             f"  {'Interval':<10} {'Grps':>5} {'Objs':>8}"
             f"  {'ObjRate':>8} {'Bitrate':>9}"
-            f"  {'Latency':>14}"
+            f"  {'Latency':<14}"
             f"  {'Jitter':>6} {'Lost':>5}"
         )
         print("  " + "─" * 76)
