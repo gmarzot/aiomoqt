@@ -80,12 +80,13 @@ class BenchStats:
                 logger.warning(f"BenchStats: corrupt timestamp: "
                                f"send={send_ms} recv={recv_time_ms}")
                 send_ms = None
-            else:
-                self.iv_latencies.append(latency)
-                self.all_latencies.append(latency)
+
+        if send_ms is not None:
+            self.iv_latencies.append(latency)
+            self.all_latencies.append(latency)
 
             # RFC 3550 jitter
-            if self.last_recv_ms > 0:
+            if self.last_recv_ms > 0 and self.last_send_ms is not None:
                 d = abs((recv_time_ms - self.last_recv_ms)
                         - (send_ms - self.last_send_ms))
                 self.jitter += (d - self.jitter) / 16.0
