@@ -1377,19 +1377,34 @@ class MOQTSession(QuicConnectionProtocol):
         return self._quic.get_next_available_stream_id(is_unidirectional=False)
 
     def stream_write(self, stream_id: int, data: bytes, end_stream: bool = False) -> None:
-        """Write data to a stream."""
-        self._quic.send_stream_data(stream_id, data, end_stream=end_stream)
+        """Write data to a stream. No-op if stream is reset or FIN'd."""
+        if not self._stream_is_writable(stream_id) and not end_stream:
+            return
+        try:
+            self._quic.send_stream_data(stream_id, data, end_stream=end_stream)
+        except AssertionError:
+            pass  # stream already FIN'd — race with close()
+
+    def _stream_is_writable(self, stream_id: int) -> bool:
+        """Check if a stream is still writable (not reset or FIN'd)."""
+        stream = self._quic._streams.get(stream_id)
+        if stream is None:
+            return False
+        if stream.sender._reset_error_code is not None:
+            return False
+        if stream.sender._buffer_fin is not None:
+            return False  # FIN already queued (close() sent it)
+        return True
 
     async def stream_write_drain(self, stream_id: int, data: bytes,
                                  end_stream: bool = False) -> None:
         """Write data to a stream, respecting QUIC congestion control.
 
         Waits for the congestion window to have capacity before writing,
-        preventing buffer bloat and relay overload.
+        preventing buffer bloat and relay overload. Returns silently if
+        the stream has been reset or FIN'd (e.g. by close()).
         """
-        # Check stream hasn't been reset
-        stream = self._quic._streams.get(stream_id)
-        if stream is not None and stream.sender._reset_error_code is not None:
+        if not self._stream_is_writable(stream_id):
             return
 
         # Wait for congestion window to have space
@@ -1397,9 +1412,7 @@ class MOQTSession(QuicConnectionProtocol):
         while loss.bytes_in_flight >= loss.congestion_window:
             self.transmit()
             await asyncio.sleep(0.001)
-            # Re-check stream state after yielding
-            stream = self._quic._streams.get(stream_id)
-            if stream is None or stream.sender._reset_error_code is not None:
+            if not self._stream_is_writable(stream_id):
                 return
 
         self._quic.send_stream_data(stream_id, data, end_stream=end_stream)
