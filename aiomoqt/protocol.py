@@ -2082,6 +2082,9 @@ class MOQTSession(QuicConnectionProtocol):
     async def _handle_subscribe_done(self, msg: SubscribeDone) -> None:
         logger.info(f"MOQT event: handle {msg}")
         self._resolve_request(msg.request_id, msg)
+        # Publisher is done — close session gracefully
+        self._close_session(SessionCloseCode.NO_ERROR,
+                            "publisher done")
 
     async def _handle_max_request_id(self, msg: MaxSubscribeId) -> None:
         logger.info(f"MOQT event: handle {msg}")
