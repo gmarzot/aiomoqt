@@ -265,8 +265,9 @@ class PublishedTrack(Track):
         group_id = -1
         header = None
 
-        # Only subgroup 0 prints stats
-        report = (subgroup_id == 0)
+        # Only subgroup 0 prints stats (unless _quiet is set)
+        report = (subgroup_id == 0
+                  and not getattr(self, '_quiet', False))
 
         cur_obj_id = subgroup_id
         iv_groups = 0

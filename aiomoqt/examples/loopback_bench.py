@@ -106,6 +106,10 @@ async def _on_subscribe(session, msg, args):
         num_subgroups=args.streams,
         rate=args.rate,
     )
+    # Suppress publisher periodic stats in loopback mode —
+    # both sides print to the same terminal, causing interleaved output
+    track._stats_header_printed = True  # skip header
+    track._quiet = True  # checked in _generate_subgroup
     # d14 direct connection: respond with subscribe_ok and generate
     ok = session.subscribe_ok(request_msg=msg)
     track.track_alias = ok.track_alias
