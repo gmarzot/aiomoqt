@@ -150,7 +150,7 @@ class BenchStats:
         print(
             f"  {'Interval':<10} {'Grps':>5} {'Objs':>8}"
             f"  {'ObjRate':>8} {'Bitrate':>9}"
-            f"  {'Latency':<14}"
+            f"    {'Latency':<14}"
             f"  {'Jitter':>6} {'Lost':>5}"
         )
         print("  " + "─" * 76)
@@ -177,7 +177,7 @@ class BenchStats:
         print(
             f"  {iv:<10} {grps:>5} {self.total_objects:>8}"
             f"  {rate:>6.1f}/s {mbps:>7.2f}Mb"
-            f"  {lat_s:>14}"
+            f"    {lat_s:<16}"
             f"  {self.jitter:>4.1f}ms {self.total_lost:>5}"
         )
 
