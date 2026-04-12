@@ -54,6 +54,9 @@ def parse_args():
         epilog=__doc__,
     )
     parser.add_argument(
+        '-H', '--host', type=str, default='localhost',
+        help='Bind address (default: localhost)')
+    parser.add_argument(
         '-p', '--port', type=int, default=4434,
         help='Listen port (default: 4434)')
     parser.add_argument(
@@ -134,21 +137,21 @@ async def main():
     config.load_cert_chain(args.cert, args.key)
 
     quic_server = await serve(
-        "localhost", args.port,
+        args.host, args.port,
         configuration=config,
         create_protocol=lambda *a, **kw: MOQTSession(
             *a, **kw, session=peer),
     )
 
     rate_s = f"{args.rate}/s" if args.rate > 0 else "max"
-    print(f"MoQT publisher server ready on :{args.port}")
+    print(f"MoQT publisher server ready on {args.host}:{args.port}")
     print(f"  namespace: {args.namespace}/{args.trackname}")
     print(f"  objects:   {args.object_size}B x {args.streams} streams")
     print(f"  groups:    {args.group_size} objects/group")
     print(f"  rate:      {rate_s}")
-    print(f"\nConnect subscriber:")
+    print("\nConnect subscriber:")
     print(f"  python -m aiomoqt.examples.sub_bench "
-          f"https://localhost:{args.port}/moq -t 30 -i 5")
+          f"https://{args.host}:{args.port}/moq -t 30 -i 5")
 
     try:
         await asyncio.Event().wait()
