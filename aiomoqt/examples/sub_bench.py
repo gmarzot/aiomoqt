@@ -47,6 +47,7 @@ class BenchStats:
         # Cumulative
         self.total_objects: int = 0
         self.total_bytes: int = 0
+        self.total_groups: set = set()  # unique group_ids seen
         self.all_latencies: list = []
 
         # Loss tracking per group/subgroup
@@ -130,6 +131,9 @@ class BenchStats:
         self.iv_bytes += size_bytes
         self.total_objects += 1
         self.total_bytes += size_bytes
+        gid = getattr(msg, 'group_id', group_id)
+        if gid is not None:
+            self.total_groups.add(gid)
 
         if now - self.last_report_time >= self.report_interval:
             self._print_interval(now)
@@ -144,12 +148,12 @@ class BenchStats:
 
     def _print_header(self):
         print(
-            f"{'Interval':>10}  {'Objects':>8}  "
+            f"{'Interval':>10}  {'Grp':>4} {'Objects':>8}  "
             f"{'ObjRate':>8}  {'DataRate':>9}  "
             f"{'Latency':>18}  "
             f"{'Jitter':>7}  {'Lost':>5}"
         )
-        print("─" * 76)
+        print("─" * 82)
 
     def _print_interval(self, now: float):
         dt = now - self.last_report_time
@@ -169,8 +173,9 @@ class BenchStats:
             lat_s = f"{'--':>18}"
 
         iv = f"{elapsed - dt:.0f}-{elapsed:.0f}s"
+        grps = len(self.total_groups)
         print(
-            f"{iv:>10}  {self.total_objects:>8}  "
+            f"{iv:>10}  {grps:>4} {self.total_objects:>8}  "
             f"{rate:>6.1f}/s  {mbps:>7.2f}Mb  "
             f"{lat_s:>18}  "
             f"{self.jitter:>5.1f}ms  {self.total_lost:>5}"
