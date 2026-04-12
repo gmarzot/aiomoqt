@@ -472,28 +472,7 @@ class SubscribedTrack(Track):
             self.session.send_control_message(ok.serialize())
 
         else:
-            # d14: subscribe_namespace for discovery, then explicit subscribe
-            if self._auto_discover:
-                await self.session.subscribe_namespace(
-                    namespace_prefix=self.namespace,
-                    parameters={},
-                    wait_response=True,
-                )
-                print(f"  Waiting for publisher on "
-                      f"'{self.namespace}'...")
-                pub_msg = await self.session.await_publish(
-                    timeout=timeout)
-                self.namespace = '/'.join(
-                    p.decode() if isinstance(p, bytes) else p
-                    for p in pub_msg.track_namespace
-                )
-                self.trackname = (
-                    pub_msg.track_name.decode()
-                    if isinstance(pub_msg.track_name, bytes)
-                    else pub_msg.track_name
-                )
-                print(f"  Discovered: {self.fqtn}")
-
+            # d14: explicit subscribe
             await self.session.subscribe(
                 namespace=self.namespace,
                 track_name=self.trackname,
