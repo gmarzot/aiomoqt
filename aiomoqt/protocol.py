@@ -1193,14 +1193,26 @@ class MOQTSession(QuicConnectionProtocol):
         # Gracefully FIN open streams before closing the connection.
         # Transmit FINs separately so they don't get batched with
         # CONNECTION_CLOSE (which causes reset_stream on the peer).
+        # Only FIN streams we own the write side of — sending
+        # end_stream on peer-initiated uni streams produces
+        # RESET_STREAM which confuses relays.
+        is_client = self._quic.configuration.is_client
         try:
             if self._control_stream_id is not None:
                 self._quic.send_stream_data(
                     self._control_stream_id, b"", end_stream=True)
                 self._control_stream_id = None
             for stream_id in list(self._data_streams.keys()):
-                self._quic.send_stream_data(
-                    stream_id, b"", end_stream=True)
+                # We own the write side if we initiated the stream.
+                # QUIC stream ID bits 0-1: 0=client-bidi, 1=server-bidi,
+                # 2=client-uni, 3=server-uni
+                locally_initiated = (
+                    (is_client and (stream_id & 0x1) == 0) or
+                    (not is_client and (stream_id & 0x1) == 1)
+                )
+                if locally_initiated:
+                    self._quic.send_stream_data(
+                        stream_id, b"", end_stream=True)
             self._data_streams.clear()
             self.transmit()  # flush FINs before CONNECTION_CLOSE
         except Exception:
