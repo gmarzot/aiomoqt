@@ -174,6 +174,11 @@ class MOQTSession(QuicConnectionProtocol):
         self._stream_data_registry = dict(MOQTSession.MOQT_STREAM_DATA_REGISTRY)
         self._dgram_data_registry = dict(MOQTSession.MOQT_DGRAM_DATA_REGISTRY)
 
+        # Partial WT header buffer for streams where the 2-varint
+        # WebTransport stream header was fragmented across QUIC packets.
+        # Keyed by stream_id → bytes of the partial header.
+        self._wt_header_pending: Dict[int, bytes] = {}
+
         # Optional callback for received data objects:
         #   fn(msg, size_bytes, recv_time_ms, group_id, subgroup_id)
         self.on_object_received: Optional[Callable] = None
@@ -388,10 +393,10 @@ class MOQTSession(QuicConnectionProtocol):
         logger.debug(f"MOQT stream({stream_id}): stream task done: num stream tasks: {len(self._stream_tasks)}")
 
         if self._stream_tasks.pop(stream_id, None) is None:
-            logger.error(f"MOQT stream({stream_id}): _stream_task_done error: stream task does not exist")
+            logger.warning(f"MOQT stream({stream_id}): stream task already removed")
 
         if stream_id not in self._data_streams:
-            logger.error(f"MOQT stream({stream_id}): _stream_task_done error: stream does not exist")
+            logger.warning(f"MOQT stream({stream_id}): stream already removed")
 
         error_code = QuicErrorCode.NO_ERROR
         if task.cancelled():
@@ -679,7 +684,7 @@ class MOQTSession(QuicConnectionProtocol):
         still return None (session-closing behavior).
         """
         if buf.capacity == 0 or buf.tell() >= buf.capacity:
-            logger.error(f"MOQT stream({stream_id}): no data at position: {buf.tell()}")
+            logger.warning(f"MOQT stream({stream_id}): no data at position: {buf.tell()}")
             return
 
         try:
@@ -702,7 +707,7 @@ class MOQTSession(QuicConnectionProtocol):
                     self._admit_fetch_stream(stream_id, msg_header)
                 else:
                     data_type = f"0x{stream_type:x}"
-                    logger.error(f"MOQT stream({stream_id}): unexpected data stream type: {data_type}")
+                    logger.warning(f"MOQT stream({stream_id}): unexpected data stream type: {data_type}")
 
                 if msg_header is None:
                     error = f"data stream {stream_id}: {data_type} parse failed at: {buf.tell()}"
@@ -838,7 +843,10 @@ class MOQTSession(QuicConnectionProtocol):
         if hasattr(event, 'error_code'):  # Log any errors
             error = getattr(event, 'error_code', QuicErrorCode.INTERNAL_ERROR)
             reason = getattr(event, 'reason_phrase', event_class)
-            logger.error(f"QUIC error: code: {error} reason: {reason}")
+            if error == 0:
+                logger.info(f"QUIC: connection closed: code: {error}")
+            else:
+                logger.error(f"QUIC error: code: {error} reason: {reason}")
             self._close_session(error, reason)
             return
         
@@ -941,6 +949,31 @@ class MOQTSession(QuicConnectionProtocol):
                         and event.data[0] in (0x00, 0x02, 0x03)
                     )
                     if not is_h3_internal:
+                        # Handle WT header continuation for fragmented streams
+                        if stream_id in self._wt_header_pending:
+                            combined = self._wt_header_pending.pop(stream_id) + event.data
+                            msg_buf = Buffer(data=combined)
+                            msg_len = msg_buf.capacity
+                            try:
+                                msg_buf.pull_uint_var()
+                                msg_buf.pull_uint_var()
+                            except BufferReadError:
+                                # Still not enough data — re-save and wait
+                                self._wt_header_pending[stream_id] = combined
+                                logger.debug(f"MOQT stream({stream_id}): WT header still incomplete ({len(combined)} bytes)")
+                                return
+                            logger.debug(f"MOQT stream({stream_id}): WT header completed from {len(combined)} bytes")
+                            self._data_streams[stream_id] = None
+                            assert stream_id not in self._stream_tasks
+                            task = asyncio.create_task(self._process_data_stream(stream_id))
+                            self._stream_tasks[stream_id] = task
+                            task.add_done_callback(partial(self._stream_task_done, stream_id))
+                            if msg_buf.tell() < msg_len:
+                                self._stream_queues[stream_id].put_nowait(msg_buf)
+                            if event.end_stream:
+                                self._stream_queues[stream_id].put_nowait(None)
+                            return
+
                         if stream_id not in self._data_streams:
                             logger.debug(f"MOQT event: new data stream: id: {stream_id} {msg_len} bytes")
                             # Strip WT 2-varint stream header (WebTransport only)
@@ -949,7 +982,10 @@ class MOQTSession(QuicConnectionProtocol):
                                     msg_buf.pull_uint_var()
                                     msg_buf.pull_uint_var()
                                 except BufferReadError:
-                                    logger.error(f"MOQT error: data stream({stream_id}) parse fail at: {msg_buf.tell()}")
+                                    # WT header fragmented across QUIC packets —
+                                    # save partial bytes and wait for continuation
+                                    self._wt_header_pending[stream_id] = event.data
+                                    logger.debug(f"MOQT stream({stream_id}): WT header fragmented, buffering {msg_len} bytes")
                                     return
                             self._data_streams[stream_id] = None
                             assert stream_id not in self._stream_tasks
@@ -1124,7 +1160,10 @@ class MOQTSession(QuicConnectionProtocol):
               error_code: SessionCloseCode = SessionCloseCode.NO_ERROR, 
               reason_phrase: str = "no error") -> None:
         """Close the MoQT session."""
-        logger.error(f"MOQT error: closing: {reason_phrase} ({error_code})")
+        if error_code == SessionCloseCode.NO_ERROR:
+            logger.info(f"MOQT: closing: {reason_phrase} ({error_code})")
+        else:
+            logger.error(f"MOQT error: closing: {reason_phrase} ({error_code})")
         self._close_err = (error_code, reason_phrase)
 
         # Signal all stream tasks to shut down gracefully with sentinel value
@@ -2132,7 +2171,7 @@ class MOQTSession(QuicConnectionProtocol):
         if sub_id is not None:
             sub_state = self._subscriptions[sub_id]
         else:
-            logger.error(f"MOQT error: unrecognized track alias: {msg.track_alias}")
+            logger.warning(f"MOQT: unrecognized track alias: {msg.track_alias}")
 
     async def _handle_fetch_header(self, msg: FetchHeader) -> None:
         """Handle fetch header message.
