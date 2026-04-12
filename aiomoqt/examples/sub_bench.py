@@ -144,9 +144,9 @@ class BenchStats:
 
     def _print_header(self):
         print(
-            f"{'Interval':>10}  {'Obj':>7}  "
-            f"{'Rate':>8}  {'Thput':>9}  "
-            f"{'Lat avg':>8}  {'p99':>6}  "
+            f"{'Interval':>10}  {'Objects':>8}  "
+            f"{'ObjRate':>8}  {'DataRate':>9}  "
+            f"{'Latency':>18}  "
             f"{'Jitter':>7}  {'Lost':>5}"
         )
         print("─" * 76)
@@ -164,17 +164,15 @@ class BenchStats:
         if lat:
             avg = sum(lat) / len(lat)
             p99 = self._pct(lat, 99)
-            lat_s = f"{avg:6.1f}ms"
-            p99_s = f"{p99:.1f}"
+            lat_s = f"{avg:5.1f}ms (p99:{p99:5.1f})"
         else:
-            lat_s = f"{'--':>8}"
-            p99_s = "--"
+            lat_s = f"{'--':>18}"
 
         iv = f"{elapsed - dt:.0f}-{elapsed:.0f}s"
         print(
-            f"{iv:>10}  {self.iv_objects:>7}  "
+            f"{iv:>10}  {self.total_objects:>8}  "
             f"{rate:>6.1f}/s  {mbps:>7.2f}Mb  "
-            f"{lat_s:>8}  {p99_s:>6}  "
+            f"{lat_s:>18}  "
             f"{self.jitter:>5.1f}ms  {self.total_lost:>5}"
         )
 
