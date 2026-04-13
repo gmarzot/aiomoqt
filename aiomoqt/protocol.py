@@ -1001,7 +1001,9 @@ class MOQTSession(QuicConnectionProtocol):
                                 return
                             logger.debug(f"MOQT stream({stream_id}): WT header completed from {len(combined)} bytes")
                             self._data_streams[stream_id] = None
-                            assert stream_id not in self._stream_tasks
+                            if stream_id in self._stream_tasks:
+                                logger.warning(f"MOQT stream({stream_id}): replacing existing task")
+                                self._stream_tasks[stream_id].cancel()
                             task = asyncio.create_task(self._process_data_stream(stream_id))
                             self._stream_tasks[stream_id] = task
                             task.add_done_callback(partial(self._stream_task_done, stream_id))
@@ -1025,7 +1027,9 @@ class MOQTSession(QuicConnectionProtocol):
                                     logger.debug(f"MOQT stream({stream_id}): WT header fragmented, buffering {msg_len} bytes")
                                     return
                             self._data_streams[stream_id] = None
-                            assert stream_id not in self._stream_tasks
+                            if stream_id in self._stream_tasks:
+                                logger.warning(f"MOQT stream({stream_id}): replacing existing task")
+                                self._stream_tasks[stream_id].cancel()
                             task = asyncio.create_task(self._process_data_stream(stream_id))
                             self._stream_tasks[stream_id] = task
                             task.add_done_callback(partial(self._stream_task_done, stream_id))

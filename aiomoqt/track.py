@@ -502,6 +502,13 @@ class SubscribedTrack(Track):
                 )
                 print(f"  Discovered: {self.fqtn}")
 
+            # Register the track_alias from the relay's PUBLISH so
+            # incoming data streams are recognized by admission control.
+            if hasattr(pub_msg, 'track_alias'):
+                self.track_alias = pub_msg.track_alias
+                self.session._track_aliases[
+                    pub_msg.track_alias] = pub_msg.request_id
+
             # PUBLISH_OK with forward=1 establishes subscription
             ok = PublishOk(
                 request_id=pub_msg.request_id,
@@ -512,7 +519,7 @@ class SubscribedTrack(Track):
                 parameters={},
             )
             logger.info(f"Track: PUBLISH_OK {self.fqtn} "
-                        f"forward={forward}")
+                        f"alias={self.track_alias} forward={forward}")
             self.session.send_control_message(ok.serialize())
             discovered = True
 
