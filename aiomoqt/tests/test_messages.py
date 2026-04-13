@@ -526,6 +526,101 @@ def test_subgroup_header_first_obj_mode():
     assert new_sg.subgroup_id_mode == SUBGROUP_ID_FIRST_OBJ
 
 
+# ---- Draft-16 SubgroupHeader tests (DEFAULT_PRIORITY bit, types 0x30-0x3D) ----
+
+def test_subgroup_header_d16_default_priority_no_extensions():
+    """Type 0x30: default priority, no extensions, subgroup_id_mode=0."""
+    buf = Buffer(capacity=64)
+    buf.push_uint_var(0x30)
+    buf.push_uint_var(5)     # track_alias
+    buf.push_uint_var(10)    # group_id
+    # no subgroup_id (mode 0 = zero)
+    # no priority (DEFAULT_PRIORITY bit set)
+    buf.seek(0)
+    type_val = buf.pull_uint_var()
+    assert type_val == 0x30
+    sg = SubgroupHeader.deserialize(buf, type_val)
+    assert sg.track_alias == 5
+    assert sg.group_id == 10
+    assert sg.subgroup_id == 0
+    assert sg.publisher_priority == MOQT_DEFAULT_PRIORITY
+    assert sg.extensions_present is False
+    assert sg.end_of_group is False
+
+
+def test_subgroup_header_d16_default_priority_with_extensions():
+    """Type 0x31: default priority + extensions (what Red5 sends)."""
+    buf = Buffer(capacity=64)
+    buf.push_uint_var(0x31)
+    buf.push_uint_var(1)     # track_alias
+    buf.push_uint_var(0)     # group_id
+    # no subgroup_id (mode 0)
+    # no priority (DEFAULT_PRIORITY)
+    buf.seek(0)
+    type_val = buf.pull_uint_var()
+    assert type_val == 0x31
+    sg = SubgroupHeader.deserialize(buf, type_val)
+    assert sg.track_alias == 1
+    assert sg.group_id == 0
+    assert sg.subgroup_id == 0
+    assert sg.publisher_priority == MOQT_DEFAULT_PRIORITY
+    assert sg.extensions_present is True
+
+
+def test_subgroup_header_d16_default_priority_explicit_subgroup():
+    """Type 0x34: default priority + explicit subgroup_id (mode 2)."""
+    buf = Buffer(capacity=64)
+    buf.push_uint_var(0x34)  # 0x30 | 0x04 (explicit mode = 2 << 1)
+    buf.push_uint_var(0)     # track_alias
+    buf.push_uint_var(7)     # group_id
+    buf.push_uint_var(3)     # subgroup_id (explicit)
+    # no priority (DEFAULT_PRIORITY)
+    buf.seek(0)
+    type_val = buf.pull_uint_var()
+    sg = SubgroupHeader.deserialize(buf, type_val)
+    assert sg.track_alias == 0
+    assert sg.group_id == 7
+    assert sg.subgroup_id == 3
+    assert sg.subgroup_id_mode == SUBGROUP_ID_EXPLICIT
+    assert sg.publisher_priority == MOQT_DEFAULT_PRIORITY
+
+
+def test_subgroup_header_d16_default_priority_eog_extensions():
+    """Type 0x39: default priority + end_of_group + extensions."""
+    buf = Buffer(capacity=64)
+    buf.push_uint_var(0x39)  # 0x30 | 0x08 (eog) | 0x01 (ext)
+    buf.push_uint_var(2)     # track_alias
+    buf.push_uint_var(99)    # group_id
+    # no subgroup_id (mode 0)
+    # no priority (DEFAULT_PRIORITY)
+    buf.seek(0)
+    type_val = buf.pull_uint_var()
+    sg = SubgroupHeader.deserialize(buf, type_val)
+    assert sg.track_alias == 2
+    assert sg.group_id == 99
+    assert sg.subgroup_id == 0
+    assert sg.publisher_priority == MOQT_DEFAULT_PRIORITY
+    assert sg.extensions_present is True
+    assert sg.end_of_group is True
+
+
+def test_subgroup_header_d16_priority_present_still_works():
+    """Type 0x15: d14-range with priority present (regression)."""
+    sg = SubgroupHeader(
+        track_alias=10, group_id=20, subgroup_id=30,
+        publisher_priority=42, subgroup_id_mode=SUBGROUP_ID_EXPLICIT,
+        extensions_present=True,
+    )
+    buf = sg.serialize()
+    buf.seek(0)
+    type_val = buf.pull_uint_var()
+    assert type_val == 0x15  # 0x10 | 0x01 (ext) | 0x04 (explicit)
+    new_sg = SubgroupHeader.deserialize(buf, type_val)
+    assert new_sg.publisher_priority == 42  # explicit, not default
+    assert new_sg.track_alias == 10
+    assert new_sg.subgroup_id == 30
+
+
 # ---- Draft-14 ObjectHeader tests (delta encoding + conditional extensions) ----
 
 def test_object_header_first_object_with_extensions():
