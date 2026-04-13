@@ -1892,12 +1892,16 @@ class MOQTSession(QuicConnectionProtocol):
         self,
         namespace_prefix: str,
         parameters: Optional[Dict[int, bytes]] = None,
+        subscribe_options: int = 1,
         wait_response: Optional[bool] = False
     ) -> Optional[MOQTMessage]:
         """Subscribe to announcements for a namespace prefix.
 
         In d16+, sends on a new bidirectional stream per spec Section 9.25.
         In d14, sends on the control stream.
+
+        Args:
+            subscribe_options: d16 only — 0=PUBLISH, 1=NAMESPACE, 2=both
         """
         if parameters is None:
             parameters = {}
@@ -1907,6 +1911,7 @@ class MOQTSession(QuicConnectionProtocol):
         message = SubscribeNamespace(
             request_id=request_id,
             namespace_prefix=prefix,
+            subscribe_options=subscribe_options,
             parameters=parameters
         )
         logger.info(f"MOQT send: {message}")
