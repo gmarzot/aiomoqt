@@ -30,7 +30,7 @@ from enum import IntEnum
 from typing import Optional, Callable
 
 from .types import (
-    MOQTMessageType, ParamType,
+    MOQTMessageType, ParamType, FilterType, GroupOrder,
     MOQT_TIMESTAMP_EXT,
 )
 from .messages import (
@@ -506,6 +506,9 @@ class SubscribedTrack(Track):
             ok = PublishOk(
                 request_id=pub_msg.request_id,
                 forward=forward,
+                priority=128,
+                group_order=GroupOrder.ASCENDING,
+                filter_type=FilterType.LATEST_OBJECT,
                 parameters={},
             )
             logger.info(f"Track: PUBLISH_OK {self.fqtn} "
