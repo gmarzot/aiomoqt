@@ -26,6 +26,8 @@ def parse_args():
     parser.add_argument('--draft', type=int, default=None, help='MoQT draft version (e.g. 14, 16)')
     parser.add_argument('--libquicr-compat', action='store_true', help='Use libquicr filter encoding (LAPS)')
     parser.add_argument('-t', '--duration', type=int, default=120, help='Duration in seconds (default: 120)')
+    parser.add_argument('--subscribe-options', type=int, default=None,
+                        help='d16 subscribe_namespace options: 0=PUBLISH, 1=NAMESPACE, 2=both')
 
     return parser.parse_args()
 
@@ -130,7 +132,8 @@ class SimpleStats:
 async def main(host: str, port: int, endpoint: str, namespace: str, track_name: str,
                use_quic: bool, debug: bool, quic_debug: bool, insecure: bool = False,
                auth_token: str = None, draft: int = None, libquicr_compat: bool = False,
-               duration: int = 120):
+               duration: int = 120,
+               subscribe_options: int = None):
     log_level = logging.DEBUG if debug else logging.INFO
     set_log_level(log_level)
     logger = get_logger(__name__)
@@ -161,7 +164,8 @@ async def main(host: str, port: int, endpoint: str, namespace: str, track_name: 
                     draft=draft,
                     on_object=stats.on_object,
                 )
-                await track.subscribe()
+                await track.subscribe(
+                    subscribe_options=subscribe_options)
                 logger.info(f"MOQT app: subscribed to {track.fqtn}")
 
                 await track.wait_closed(timeout=duration)
@@ -198,6 +202,7 @@ if __name__ == "__main__":
             draft=args.draft,
             libquicr_compat=args.libquicr_compat,
             duration=args.duration,
+            subscribe_options=args.subscribe_options,
         ), debug=args.debug)
 
     except KeyboardInterrupt:

@@ -422,7 +422,8 @@ class SubscribedTrack(Track):
         self.completed = False  # True if track ended cleanly
 
     async def subscribe(self, timeout: float = 30.0,
-                        forward: int = 1):
+                        forward: int = 1,
+                        subscribe_options: int = None):
         """Subscribe to the track.
 
         d16: subscribe_namespace → wait for PUBLISH → PUBLISH_OK(forward=1)
@@ -438,10 +439,14 @@ class SubscribedTrack(Track):
 
         if is_draft16_or_later():
             # Register interest in namespace
+            ns_kwargs = {}
+            if subscribe_options is not None:
+                ns_kwargs['subscribe_options'] = subscribe_options
             await self.session.subscribe_namespace(
                 namespace_prefix=self.namespace,
                 parameters={},
                 wait_response=True,
+                **ns_kwargs,
             )
             self.state = TrackState.ANNOUNCED
 
