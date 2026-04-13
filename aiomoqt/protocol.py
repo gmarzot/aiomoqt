@@ -659,16 +659,18 @@ class MOQTSession(QuicConnectionProtocol):
         """Admit a SubgroupHeader stream or raise MOQTStreamReject.
 
         Admission rules (Phase 1c):
-        - track_alias MUST map to a live subscription
+        - track_alias SHOULD map to a live subscription, but per spec
+          §10.4.2 data may arrive before the control message that
+          establishes the alias — tolerate with a warning.
         - at most one stream per (track_alias, group_id, subgroup_id)
           tuple. For FIRST_OBJ mode, subgroup_id is None at header time
           and the uniqueness check is deferred until the first object.
         """
         if header.track_alias not in self._track_aliases:
-            raise MOQTStreamReject(
-                SessionCloseCode.PROTOCOL_VIOLATION,
-                f"subgroup stream for unknown track_alias="
-                f"{header.track_alias}")
+            logger.warning(
+                f"MOQT stream({stream_id}): subgroup with "
+                f"unknown track_alias={header.track_alias} "
+                f"(may resolve via pending control message)")
         # subgroup_id is None in FIRST_OBJ mode — resolved on first object
         key = (header.track_alias, header.group_id, header.subgroup_id)
         if header.subgroup_id is not None:
