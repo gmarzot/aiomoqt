@@ -715,8 +715,16 @@ class MOQTSession(QuicConnectionProtocol):
             if self._data_streams.get(stream_id) is None:
                 # Get stream type from first byte
                 stream_type = buf.pull_uint_var()
-                # Draft-14: SubgroupHeader types 0x10-0x1D (12 valid, 0x16-0x17 reserved)
-                if 0x10 <= stream_type <= 0x1D and ((stream_type >> 1) & 0x03) != 3:
+                # SubgroupHeader type ranges:
+                #   d14: 0x10-0x1D (bit 4 set, bits 0-3 = flags)
+                #   d16: also 0x30-0x3D (bit 5 = DEFAULT_PRIORITY)
+                # Reserved: subgroup_id_mode 0b11 (bits 1-2)
+                is_subgroup = (
+                    (0x10 <= stream_type <= 0x1D or
+                     0x30 <= stream_type <= 0x3D)
+                    and ((stream_type >> 1) & 0x03) != 3
+                )
+                if is_subgroup:
                     msg_header = SubgroupHeader.deserialize(buf, type_val=stream_type)
                     data_type = "SUBGROUP_HEADER"
                     # Phase 1c admission check

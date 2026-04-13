@@ -163,10 +163,16 @@ class SubgroupHeader(MOQTMessage):
 
     @classmethod
     def deserialize(cls, buf: Buffer, type_val: int) -> 'SubgroupHeader':
-        """Deserialize SubgroupHeader from wire, given the already-read type byte."""
+        """Deserialize SubgroupHeader from wire, given the already-read type byte.
+
+        d16 adds bit 5 (0x20 = DEFAULT_PRIORITY): when set, the Priority
+        field is omitted and inherited from the subscription control message.
+        Type ranges: d14 = 0x10-0x1D, d16 = 0x10-0x1D + 0x30-0x3D.
+        """
         extensions_present = bool(type_val & 0x01)
         subgroup_id_mode = (type_val >> 1) & 0x03
         end_of_group = bool(type_val & 0x08)
+        default_priority = bool(type_val & 0x20)
 
         track_alias = buf.pull_uint_var()
         group_id = buf.pull_uint_var()
@@ -178,7 +184,10 @@ class SubgroupHeader(MOQTMessage):
         else:  # SUBGROUP_ID_FIRST_OBJ — resolved when first object arrives
             subgroup_id = None
 
-        publisher_priority = buf.pull_uint8()
+        if default_priority:
+            publisher_priority = MOQT_DEFAULT_PRIORITY
+        else:
+            publisher_priority = buf.pull_uint8()
 
         return cls(
             track_alias=track_alias,
