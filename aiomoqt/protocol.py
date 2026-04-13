@@ -1857,6 +1857,7 @@ class MOQTSession(QuicConnectionProtocol):
             track_namespace=namespace_tuple,
             track_name=track_name_bytes,
             track_alias=track_alias,
+            group_order=GroupOrder.ASCENDING,
             forward=forward,
             content_exists=content_exists,
             parameters=parameters or {},
