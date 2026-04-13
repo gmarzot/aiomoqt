@@ -113,7 +113,18 @@ class PublishedTrack(Track):
         self._subscribe_request_id = None  # request_id from relay's SUBSCRIBE
 
     async def publish(self):
-        """Announce namespace and track to the relay."""
+        """Announce namespace and track to the relay.
+
+        Flow (d14 + d16):
+          1. PUBLISH_NAMESPACE → relay accepts namespace
+          2. PUBLISH(forward=0) → relay knows track exists
+          3. Wait for subscriber signal:
+             - PUBLISH_OK(forward=1): relay has subscribers, start now
+             - PUBLISH_OK(forward=0): no subscribers yet, wait
+             - SUBSCRIBE: relay forwarded a subscriber's subscribe
+             - SUBSCRIBE_UPDATE(forward=1): subscriber arrived later
+             - REQUEST_UPDATE(forward=1): d16 subscriber wants data
+        """
         # 1. Publish namespace
         await self.session.publish_namespace(
             namespace=self.namespace,
@@ -123,20 +134,14 @@ class PublishedTrack(Track):
         self.state = TrackState.ANNOUNCED
         logger.info(f"Track: announced namespace '{self.namespace}'")
 
-        # 2. Publish track (d16 sends PUBLISH message)
-        if is_draft16_or_later():
-            response = self.session.publish(
-                namespace=self.namespace,
-                track_name=self.trackname,
-            )
-            self.track_alias = response.track_alias
-            self.request_id = response.request_id
-            self.state = TrackState.PUBLISHED
-            logger.info(f"Track: published {self.fqtn} alias={self.track_alias}")
-
-        # 3. Register handlers for incoming subscribe
+        # 2. Register handlers BEFORE sending PUBLISH so we don't
+        # miss a fast PUBLISH_OK(forward=1) or SUBSCRIBE.
         self.session.register_handler(
             MOQTMessageType.SUBSCRIBE, self._on_subscribe)
+        self.session.register_handler(
+            MOQTMessageType.PUBLISH_OK, self._on_publish_ok)
+        self.session.register_handler(
+            MOQTMessageType.SUBSCRIBE_UPDATE, self._on_subscribe_update)
 
         # d16: REQUEST_UPDATE (code point 0x02) signals subscriber arrival
         if is_draft16_or_later():
@@ -146,40 +151,60 @@ class PublishedTrack(Track):
             self.session.MOQT_D16_OVERRIDE_REGISTRY[0x02] = (
                 RequestUpdate, _request_update_handler)
 
-    async def _on_request_update(self, session, msg: RequestUpdate):
-        """Handle d16 REQUEST_UPDATE — subscriber wants data.
+        # 3. Publish track — announce availability (forward=0).
+        # Both d14 and d16: PUBLISH announces individual tracks.
+        # Relay responds with PUBLISH_OK. If forward=1 in the
+        # response, subscribers are waiting — start immediately.
+        pub_msg = self.session.publish(
+            namespace=self.namespace,
+            track_name=self.trackname,
+            forward=0,
+        )
+        self.track_alias = pub_msg.track_alias
+        self.request_id = pub_msg.request_id
+        self.state = TrackState.PUBLISHED
+        logger.info(f"Track: published {self.fqtn} "
+                     f"alias={self.track_alias}")
 
-        Unlike d14 SUBSCRIBE, no response is needed. Just start generating.
-        """
-        logger.info(f"Track: REQUEST_UPDATE: {msg}")
-        forward = msg.parameters.get(ParamType.FORWARD) if msg.parameters else None
-        if not forward or forward <= 0:
-            return
+    async def _start_generating(self, session, trigger: str):
+        """Start data generation if not already running."""
         if self._generating:
-            logger.info(f"Track: ignoring duplicate REQUEST_UPDATE")
+            logger.info(f"Track: ignoring duplicate {trigger}")
             return
-
-        logger.info(f"Track: subscriber arrived via REQUEST_UPDATE, "
+        logger.info(f"Track: subscriber arrived via {trigger}, "
                      f"alias={self.track_alias}")
         self.state = TrackState.SUBSCRIBED
         self._subscriber_event.set()
         self._generating = True
         await self.generate(session, self.track_alias)
 
+    async def _on_publish_ok(self, session, msg: PublishOk):
+        """Relay accepted our PUBLISH. If forward=1, start generating."""
+        logger.info(f"Track: PUBLISH_OK: forward={msg.forward}")
+        if msg.forward and msg.forward >= 1:
+            await self._start_generating(session, "PUBLISH_OK")
+
+    async def _on_request_update(self, session, msg: RequestUpdate):
+        """d16 REQUEST_UPDATE — subscriber wants data."""
+        logger.info(f"Track: REQUEST_UPDATE: {msg}")
+        forward = (msg.parameters.get(ParamType.FORWARD)
+                   if msg.parameters else None)
+        if not forward or forward <= 0:
+            return
+        await self._start_generating(session, "REQUEST_UPDATE")
+
+    async def _on_subscribe_update(self, session, msg):
+        """SUBSCRIBE_UPDATE — subscriber changed forward state."""
+        logger.info(f"Track: SUBSCRIBE_UPDATE: forward={msg.forward}")
+        if msg.forward and msg.forward >= 1:
+            await self._start_generating(session, "SUBSCRIBE_UPDATE")
+
     async def _on_subscribe(self, session, msg):
-        """Handle incoming SUBSCRIBE (d14)."""
+        """Relay forwarded a subscriber's SUBSCRIBE."""
         ok = session.subscribe_ok(request_msg=msg)
         self.track_alias = ok.track_alias
         self._subscribe_request_id = msg.request_id
-        logger.info(f"Track: subscriber via SUBSCRIBE, "
-                     f"alias={self.track_alias}")
-
-        self.state = TrackState.SUBSCRIBED
-        self._subscriber_event.set()
-
-        if not self._generating:
-            self._generating = True
-            await self.generate(session, self.track_alias)
+        await self._start_generating(session, "SUBSCRIBE")
 
     def _send_publish_done(self, session, status_code=0x2):
         """Send PUBLISH_DONE with stream count for clean shutdown.
@@ -426,21 +451,26 @@ class SubscribedTrack(Track):
                         subscribe_options: int = None):
         """Subscribe to the track.
 
-        d16: subscribe_namespace → wait for PUBLISH → PUBLISH_OK(forward=1)
-             establishes the subscription. No explicit subscribe() needed.
-        d14: explicit subscribe() with parameters.
+        Unified d14/d16 flow:
+          subscribe_namespace → relay sends PUBLISH → extract trackname
+          → respond with PUBLISH_OK(forward=1) → data flows
 
         Args:
-            timeout: seconds to wait for PUBLISH or subscribe response
+            timeout: seconds to wait for PUBLISH announcement
             forward: forwarding preference (1=send objects, 0=hold)
+            subscribe_options: d16 only — 0=PUBLISH, 1=NAMESPACE, 2=both
         """
         if self.on_object:
             self.session.on_object_received = self.on_object
 
-        if is_draft16_or_later():
-            # Register interest in namespace
+        # Try PUBLISH-based discovery: subscribe_namespace → relay
+        # sends PUBLISH → extract trackname → PUBLISH_OK(forward=1).
+        # Works in both d14 and d16 when the publisher sends PUBLISH.
+        # Falls back to legacy d14 direct SUBSCRIBE if discovery fails.
+        discovered = False
+        try:
             ns_kwargs = {}
-            if subscribe_options is not None:
+            if subscribe_options is not None and is_draft16_or_later():
                 ns_kwargs['subscribe_options'] = subscribe_options
             await self.session.subscribe_namespace(
                 namespace_prefix=self.namespace,
@@ -481,40 +511,15 @@ class SubscribedTrack(Track):
             logger.info(f"Track: PUBLISH_OK {self.fqtn} "
                         f"forward={forward}")
             self.session.send_control_message(ok.serialize())
+            discovered = True
 
-        else:
-            # d14: subscribe_namespace for discovery if auto-discover,
-            # then explicit subscribe with discovered or given trackname
-            if self._auto_discover:
-                try:
-                    await self.session.subscribe_namespace(
-                        namespace_prefix=self.namespace,
-                        parameters={},
-                        wait_response=True,
-                    )
-                    print(f"  Waiting for publisher on "
-                          f"'{self.namespace}'...")
-                    pub_msg = await self.session.await_publish(
-                        timeout=timeout)
-                    self.namespace = '/'.join(
-                        p.decode() if isinstance(p, bytes) else p
-                        for p in pub_msg.track_namespace
-                    )
-                    self.trackname = (
-                        pub_msg.track_name.decode()
-                        if isinstance(pub_msg.track_name, bytes)
-                        else pub_msg.track_name
-                    )
-                    print(f"  Discovered: {self.fqtn}")
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        f"Track: d14 discovery timed out, "
-                        f"falling back to '{self.fqtn}'")
-                except Exception as e:
-                    logger.warning(
-                        f"Track: d14 discovery failed: {e}, "
-                        f"falling back to '{self.fqtn}'")
+        except (asyncio.TimeoutError, Exception) as e:
+            logger.warning(f"Track: discovery failed ({e}), "
+                           f"falling back to direct SUBSCRIBE")
 
+        # Fallback: legacy d14 direct SUBSCRIBE (when relay doesn't
+        # forward PUBLISH announcements or discovery timed out)
+        if not discovered:
             await self.session.subscribe(
                 namespace=self.namespace,
                 track_name=self.trackname,

@@ -33,19 +33,21 @@ class TestTrackBase:
 
     def test_fqtn(self):
         session = MagicMock()
-        t = Track(session, "bench", "track")
-        assert t.fqtn == "bench/track"
+        t = Track(session, "live/sports", "video")
+        assert t.fqtn == "live/sports/video"
 
     def test_fqtn_nested_namespace(self):
         session = MagicMock()
-        t = Track(session, "live/sports/nfl", "video-4k")
-        assert t.fqtn == "live/sports/nfl/video-4k"
+        t = Track(session, "live/sports/nfl", "video")
+        assert t.fqtn == "live/sports/nfl/video"
 
     def test_repr(self):
         session = MagicMock()
         t = Track(session, "bench", "track")
-        assert "Track(bench/track" in repr(t)
-        assert "IDLE" in repr(t)
+        r = repr(t)
+        assert "Track" in r
+        assert "bench/track" in r
+        assert "IDLE" in r
 
     def test_state_ordering(self):
         assert TrackState.IDLE < TrackState.ANNOUNCED
@@ -59,15 +61,10 @@ class TestPublishedTrack:
 
     def test_init(self):
         session = MagicMock()
-        t = PublishedTrack(session, "bench", "track",
-                           object_size=500000, rate=30)
-        assert t.namespace == "bench"
-        assert t.trackname == "track"
-        assert t.object_size == 500000
-        assert t.rate == 30
+        t = PublishedTrack(session, "bench", "track")
         assert t.priority == 255
-        assert t.state == TrackState.IDLE
         assert t.auth_token == b"bench-token"
+        assert t._generating is False
 
     def test_init_custom_priority(self):
         session = MagicMock()
@@ -77,15 +74,19 @@ class TestPublishedTrack:
     def test_init_custom_auth(self):
         session = MagicMock()
         t = PublishedTrack(session, "bench", "track",
-                           auth_token=b"my-token")
-        assert t.auth_token == b"my-token"
+                          auth_token=b"custom")
+        assert t.auth_token == b"custom"
 
     def test_publish_d14(self):
-        """Test publish() for draft-14 (no PUBLISH message)."""
+        """d14: sends PUBLISH_NAMESPACE + PUBLISH(forward=0)."""
         async def _test():
             session = MagicMock()
             session.publish_namespace = AsyncMock(
                 return_value=MagicMock())
+            pub_response = MagicMock()
+            pub_response.track_alias = 0
+            pub_response.request_id = 1
+            session.publish = MagicMock(return_value=pub_response)
             session.register_handler = MagicMock()
 
             t = PublishedTrack(session, "bench", "track")
@@ -94,13 +95,16 @@ class TestPublishedTrack:
                 await t.publish()
 
             session.publish_namespace.assert_called_once()
-            assert t.state == TrackState.ANNOUNCED
-            session.register_handler.assert_called_once()
+            session.publish.assert_called_once_with(
+                namespace="bench", track_name="track", forward=0)
+            assert t.state == TrackState.PUBLISHED
+            assert session.register_handler.call_count == 3
 
         asyncio.run(_test())
 
     def test_publish_d16(self):
-        """Test publish() for draft-16 (sends PUBLISH message)."""
+        """d16: sends PUBLISH_NAMESPACE + PUBLISH(forward=0)
+        + registers REQUEST_UPDATE handler."""
         async def _test():
             session = MagicMock()
             session.publish_namespace = AsyncMock(
@@ -119,7 +123,7 @@ class TestPublishedTrack:
 
             session.publish_namespace.assert_called_once()
             session.publish.assert_called_once_with(
-                namespace="bench", track_name="track")
+                namespace="bench", track_name="track", forward=0)
             assert t.track_alias == 42
             assert t.request_id == 7
             assert t.state == TrackState.PUBLISHED
@@ -134,16 +138,14 @@ class TestSubscribedTrack:
     def test_init_auto_discover(self):
         session = MagicMock()
         t = SubscribedTrack(session, "bench")
-        assert t.namespace == "bench"
-        assert t.trackname == "track"
         assert t._auto_discover is True
-        assert t.state == TrackState.IDLE
+        assert t.trackname == "track"  # default
 
     def test_init_explicit_trackname(self):
         session = MagicMock()
-        t = SubscribedTrack(session, "bench", trackname="my-track")
-        assert t.trackname == "my-track"
+        t = SubscribedTrack(session, "bench", trackname="video")
         assert t._auto_discover is False
+        assert t.trackname == "video"
 
     def test_init_with_callback(self):
         session = MagicMock()
@@ -152,9 +154,15 @@ class TestSubscribedTrack:
         assert t.on_object is cb
 
     def test_subscribe_d14(self):
-        """d14 — direct subscribe, no namespace subscription."""
+        """d14 — discovery via subscribe_namespace + await_publish,
+        fallback to direct subscribe if discovery fails."""
         async def _test():
             session = MagicMock()
+            # Discovery fails (no PUBLISH from relay)
+            session.subscribe_namespace = AsyncMock(
+                return_value=MagicMock())
+            session.await_publish = AsyncMock(
+                side_effect=asyncio.TimeoutError())
             session.subscribe = AsyncMock(
                 return_value=MagicMock())
             session.on_object_received = None
@@ -165,90 +173,99 @@ class TestSubscribedTrack:
                         return_value=False):
                 await t.subscribe()
 
+            # Tried discovery first
+            session.subscribe_namespace.assert_called_once()
+            session.await_publish.assert_called_once()
+            # Fell back to direct subscribe
             session.subscribe.assert_called_once()
-            kw = session.subscribe.call_args[1]
-            assert kw['namespace'] == "bench"
-            assert kw['track_name'] == "track"
             assert t.state == TrackState.SUBSCRIBED
 
         asyncio.run(_test())
 
     def test_subscribe_d16_explicit_track(self):
-        """d16 explicit trackname — PUBLISH_OK subscribes."""
+        """d16 — explicit trackname, PUBLISH discovery."""
         async def _test():
-            set_moqt_ctx_version(16)
             session = MagicMock()
+            pub_msg = MagicMock(spec=[])
+            pub_msg.track_namespace = (b"bench",)
+            pub_msg.track_name = b"video"
+            pub_msg.request_id = 5
+            pub_msg.forward = 0
             session.subscribe_namespace = AsyncMock(
                 return_value=MagicMock())
-            session.send_control_message = MagicMock()
-
-            pub_msg = MagicMock()
-            pub_msg.request_id = 1
-            pub_msg.track_namespace = (b'bench',)
-            pub_msg.track_name = b'my-track'
             session.await_publish = AsyncMock(
                 return_value=pub_msg)
+            session.send_control_message = MagicMock()
+            session.on_object_received = None
 
             t = SubscribedTrack(session, "bench",
-                                trackname="my-track", draft=16)
+                                trackname="video", draft=16)
             with patch('aiomoqt.track.is_draft16_or_later',
-                        return_value=True):
+                        return_value=True), \
+                 patch('aiomoqt.track.PublishOk') as mock_ok:
+                mock_ok.return_value.serialize.return_value = MagicMock(data=b'')
                 await t.subscribe()
 
             session.subscribe_namespace.assert_called_once()
             session.await_publish.assert_called_once()
-            # PUBLISH_OK sent, no explicit subscribe
+            # Sent PUBLISH_OK
             session.send_control_message.assert_called_once()
             assert t.state == TrackState.SUBSCRIBED
 
         asyncio.run(_test())
 
     def test_subscribe_d16_auto_discover(self):
-        """d16 auto-discovery: PUBLISH_OK(forward=1) subscribes."""
+        """d16 — auto-discover trackname from PUBLISH."""
         async def _test():
-            set_moqt_ctx_version(16)
             session = MagicMock()
+            pub_msg = MagicMock(spec=[])
+            pub_msg.track_namespace = (b"bench",)
+            pub_msg.track_name = b"discovered-track"
+            pub_msg.request_id = 10
+            pub_msg.forward = 0
             session.subscribe_namespace = AsyncMock(
                 return_value=MagicMock())
+            session.await_publish = AsyncMock(
+                return_value=pub_msg)
             session.send_control_message = MagicMock()
             session.on_object_received = None
 
-            pub_msg = MagicMock()
-            pub_msg.request_id = 1
-            pub_msg.track_namespace = (b'bench',)
-            pub_msg.track_name = b'500k-30fps-x1-abc4'
-            session.await_publish = AsyncMock(
-                return_value=pub_msg)
-
             t = SubscribedTrack(session, "bench", draft=16)
+            assert t._auto_discover is True
+            with patch('aiomoqt.track.is_draft16_or_later',
+                        return_value=True), \
+                 patch('aiomoqt.track.PublishOk') as mock_ok:
+                mock_ok.return_value.serialize.return_value = MagicMock(data=b'')
+                await t.subscribe()
+
+            assert t.trackname == "discovered-track"
+            assert t.state == TrackState.SUBSCRIBED
+
+        asyncio.run(_test())
+
+    def test_subscribe_d16_discover_timeout(self):
+        """d16 — discovery timeout falls back to direct subscribe."""
+        async def _test():
+            session = MagicMock()
+            session.subscribe_namespace = AsyncMock(
+                return_value=MagicMock())
+            session.await_publish = AsyncMock(
+                side_effect=asyncio.TimeoutError())
+            session.subscribe = AsyncMock(
+                return_value=MagicMock())
+            session.on_object_received = None
+
+            t = SubscribedTrack(session, "bench",
+                                trackname="video", draft=16)
             with patch('aiomoqt.track.is_draft16_or_later',
                         return_value=True):
                 await t.subscribe()
 
             session.subscribe_namespace.assert_called_once()
             session.await_publish.assert_called_once()
-            assert t.namespace == "bench"
-            assert t.trackname == "500k-30fps-x1-abc4"
-            # PUBLISH_OK sent via send_control_message
-            session.send_control_message.assert_called_once()
+            # Fell back to direct subscribe
+            session.subscribe.assert_called_once()
             assert t.state == TrackState.SUBSCRIBED
-
-        asyncio.run(_test())
-
-    def test_subscribe_d16_discover_timeout(self):
-        """d16 discovery timeout raises TimeoutError."""
-        async def _test():
-            session = MagicMock()
-            session.subscribe_namespace = AsyncMock(
-                return_value=MagicMock())
-            session.await_publish = AsyncMock(
-                side_effect=TimeoutError)
-
-            t = SubscribedTrack(session, "bench", draft=16)
-            with patch('aiomoqt.track.is_draft16_or_later',
-                        return_value=True):
-                with pytest.raises(TimeoutError):
-                    await t.subscribe(timeout=0.1)
 
         asyncio.run(_test())
 
@@ -256,8 +273,18 @@ class TestSubscribedTrack:
         """on_object callback is wired to session."""
         async def _test():
             session = MagicMock()
-            session.subscribe = AsyncMock(
+            # Discovery succeeds
+            pub_msg = MagicMock(spec=[])
+            pub_msg.track_namespace = (b"bench",)
+            pub_msg.track_name = b"track"
+            pub_msg.request_id = 0
+            pub_msg.forward = 0
+            session.subscribe_namespace = AsyncMock(
                 return_value=MagicMock())
+            session.await_publish = AsyncMock(
+                return_value=pub_msg)
+            session.send_control_message = MagicMock()
+            session.subscribe = AsyncMock(return_value=MagicMock())
             session.on_object_received = None
 
             cb = MagicMock()

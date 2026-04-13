@@ -1836,11 +1836,18 @@ class MOQTSession(QuicConnectionProtocol):
         self,
         namespace: Union[str, Tuple[str, ...]],
         track_name: str,
+        forward: int = 0,
         content_exists: int = 0,
         parameters: Optional[Dict[int, Any]] = None,
         wait_response: Optional[bool] = False,
     ) -> Optional[MOQTMessage]:
-        """PUBLISH — announce a specific track to the relay/subscriber."""
+        """PUBLISH — announce a specific track to the relay/subscriber.
+
+        Args:
+            forward: 0 = announce availability only, 1 = start data.
+                     Subscriber responds with PUBLISH_OK(forward=1)
+                     to request data flow.
+        """
         namespace_tuple = self._make_namespace_tuple(namespace)
         request_id = self._allocate_request_id()
         track_alias = self._allocate_track_alias(request_id)
@@ -1850,6 +1857,7 @@ class MOQTSession(QuicConnectionProtocol):
             track_namespace=namespace_tuple,
             track_name=track_name_bytes,
             track_alias=track_alias,
+            forward=forward,
             content_exists=content_exists,
             parameters=parameters or {},
         )
