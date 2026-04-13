@@ -1901,7 +1901,7 @@ class MOQTSession(QuicConnectionProtocol):
         self,
         namespace_prefix: str,
         parameters: Optional[Dict[int, bytes]] = None,
-        subscribe_options: int = 1,
+        subscribe_options: int = 0,
         wait_response: Optional[bool] = False
     ) -> Optional[MOQTMessage]:
         """Subscribe to announcements for a namespace prefix.
