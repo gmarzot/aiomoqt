@@ -27,8 +27,8 @@ jobs:
         python -m pip install --upgrade pip
         pip install pytest
         pip install -e .
-    - name: Run unit-tier regression
-      run: python tests/release-regression-test.py --test-tier unit
+    - name: Run unit + integration tiers
+      run: python tests/release-regression-test.py --test-tier unit --test-tier integration
 
   publish-test:
     needs: test

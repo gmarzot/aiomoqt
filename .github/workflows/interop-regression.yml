@@ -1,9 +1,9 @@
-name: Relay regression
+name: Interop regression
 
-# The relay tier exercises live external relays (moqx-main, Cloudflare).
-# It is not run on every PR because external availability is outside our
-# control. Trigger manually from the Actions tab for release validation,
-# or let the weekly schedule run it.
+# The interop tier exercises live external relays listed in
+# tests/relays.json. It is not run on every PR because external
+# availability is outside our control. Trigger manually from the
+# Actions tab for release validation, or let the weekly schedule run it.
 
 on:
   workflow_dispatch:
@@ -11,7 +11,7 @@ on:
     - cron: '17 3 * * 1'    # Mondays 03:17 UTC
 
 jobs:
-  relay:
+  interop:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v3
@@ -26,11 +26,11 @@ jobs:
         python -m pip install --upgrade pip
         pip install pytest
         pip install -e .
-    - name: Run relay-tier regression
-      run: python tests/release-regression-test.py --test-tier relay
+    - name: Run interop-tier regression
+      run: python tests/release-regression-test.py --test-tier interop
     - name: Upload logs on failure
       if: failure()
       uses: actions/upload-artifact@v4
       with:
-        name: relay-regression-logs
+        name: interop-regression-logs
         path: /tmp/aiomoqt-regression.*/

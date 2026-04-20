@@ -106,8 +106,9 @@ asyncio.run(main())
 ```
 
 The `on_subscribe` handler above — stream setup, header serialization,
-object writing — is the pattern that track data modules will encapsulate
-into a higher-level `TrackWriter` / `TrackReader` API.
+object writing — is wrapped by the higher-level `PublishedTrack` /
+`SubscribedTrack` classes in `aiomoqt.track`. See the `*_bench.py`
+examples for typical usage.
 
 ### Control Message API
 
@@ -156,16 +157,27 @@ Common options: `--namespace`, `--trackname`, `--endpoint`, `--debug`, `--keylog
 
 ```bash
 # Publisher — configurable size, rate, parallelism
-python -m aiomoqt.examples.bench_pub moqt://relay.ex.com -s 4096 -P 4 -r 120 -t 60
+python -m aiomoqt.examples.pub_bench moqt://relay.ex.com -s 4096 -P 4 -r 120 -t 60
 
-# Subscriber — latency/jitter/loss stats
-python -m aiomoqt.examples.bench_sub moqt://relay.ex.com -t 60
+# Subscriber — latency/jitter/loss stats (omit -t; subscriber exits on PUBLISH_DONE)
+python -m aiomoqt.examples.sub_bench moqt://relay.ex.com
 
-# Combined pub/sub
-python -m aiomoqt.examples.bench_relay moqt://relay.ex.com -s 1024 -g 10000 -t 30
+# Combined pub/sub in one process
+python -m aiomoqt.examples.relay_bench moqt://relay.ex.com -s 1024 -g 10000 -t 30
+
+# 1 publisher, N subscribers in one process (fanout capacity)
+python -m aiomoqt.examples.multi_sub_bench moqt://relay.ex.com -n 100 --video 720p -t 60
 
 # Local loopback (no relay needed)
-python -m aiomoqt.examples.bench_loopback -s 4096 -P 4 -t 20
+python -m aiomoqt.examples.loopback_bench -s 4096 -P 4 -t 20
+```
+
+Publisher flow selection (for relays that require a specific message pattern):
+
+```bash
+--pub-ns     # send only PUBLISH_NAMESPACE (wait for SUBSCRIBE)
+--pub-both   # send PUBLISH_NAMESPACE and PUBLISH (required by Cloudflare d14)
+             # default: send only PUBLISH
 ```
 
 | Option | Description | Default |
@@ -218,10 +230,11 @@ python -m aiomoqt.examples.server_example \
 | `pub_example.py` | Publisher — SubgroupHeader streams or ObjectDatagrams |
 | `sub_example.py` | Subscriber — receives data from a relay |
 | `join_example.py` | SUBSCRIBE + FETCH (join mid-stream) |
-| `bench_pub.py` | Publisher benchmark, configurable parameters |
-| `bench_sub.py` | Subscriber with latency/jitter/loss stats |
-| `bench_relay.py` | Combined pub/sub benchmark |
-| `bench_loopback.py` | Local loopback benchmark (no relay) |
+| `pub_bench.py` | Publisher benchmark, configurable parameters |
+| `sub_bench.py` | Subscriber with latency/jitter/loss stats |
+| `relay_bench.py` | Combined pub/sub in one process |
+| `multi_sub_bench.py` | 1 publisher, N subscribers in one process |
+| `loopback_bench.py` | Local loopback (no relay) |
 | `server_example.py` | WebTransport server (origin) |
 | `relay_probe.py` | Relay version probe (draft-14/16) |
 | `moq_interop_client.py` | Interop test client (6 test cases, TAP14) |

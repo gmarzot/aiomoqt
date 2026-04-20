@@ -1,23 +1,67 @@
 # Pre-Release Test Plan
 
-Run all tests before tagging a release. All must pass unless noted as known issues.
+Run all tests before tagging a release. All must pass.
 
-Use unique tracknames for every test to avoid relay cache collisions.
-The bench tools auto-generate unique tracknames from test parameters + uuid.
+Bench tools auto-generate unique tracknames from test parameters to
+avoid relay cache collisions.
+
+## Automated runner
+
+`tests/release-regression-test.py` executes three tiers:
+
+- **unit**:        `pytest`, `test_rebuf` — pure Python, no network
+- **integration**: `loopback` — local pub/sub over QUIC, no relay
+- **interop**:     `relay-smoke`, `multi-sub` × each relay in
+                   `tests/relays.json` × each supported transport / draft
+
+```bash
+# full matrix (both tiers, every relay)
+python tests/release-regression-test.py
+
+# tier selection (repeatable)
+python tests/release-regression-test.py --test-tier unit
+python tests/release-regression-test.py --test-tier interop
+
+# individual suite (repeatable; ignores tier grouping)
+python tests/release-regression-test.py --test-suite pytest
+python tests/release-regression-test.py --test-suite loopback --test-suite relay-smoke
+
+# interop tier scoped to one relay from the catalog
+python tests/release-regression-test.py --test-tier interop --only moqx-main
+python tests/release-regression-test.py --test-tier interop --only cloudflare-d14
+
+# alternate catalog
+python tests/release-regression-test.py --catalog /path/to/relays.json
+```
+
+Exit 0 iff every test passed. Per-test logs land in a temp directory
+printed at start/end of the run.
+
+To add a relay to the catalog, edit `tests/relays.json`:
+
+```json
+{
+  "name": "short-id",
+  "urls": {
+    "raw-quic": "moqt://host:port",
+    "h3-wt":    "https://host:port/endpoint"
+  },
+  "drafts": [14, 16],
+  "pub_mode": "publish"
+}
+```
+
+`pub_mode` selects the multi-sub publisher behavior for that relay:
+`publish` (default, sends PUBLISH only), `publish-ns` (PUBLISH_NAMESPACE
+only, waits for SUBSCRIBE), or `publish-both` (both messages; required
+by Cloudflare d14 moq-rs).
+
+Sections below document the underlying commands for manual runs.
 
 ## Prerequisites
 
-```bash
-# Local moqx docker relay running (fresh restart for clean cache)
-docker rm -f moqx 2>/dev/null
-cd ~/Projects/moq/openmoq/moqx
-docker compose -f docker/docker-compose.yml up -d moqx
-sleep 3
-docker ps --filter name=moqx
-
-# Remote relay accessible
-# moqx-000.ci.openmoq.org:4433
-```
+A local moqx relay and a remote one accessible at
+`moqx-000.ci.openmoq.org:4433`.
 
 ## 1. Unit Tests
 
@@ -168,12 +212,7 @@ Expected: high throughput, tests congestion control under load
 ## Known Issues
 
 - Occasional corrupt timestamp extension at high throughput (re_buf
-  misalignment). Filtered in BenchStats, logged as warning. Pre-existing
-  issue in protocol.py buffer reassembly.
-- moqx stale cache: restarting publisher with different object size on
-  same namespace/trackname causes Payload mismatch. Bench tools generate
-  unique tracknames per run to avoid this.
-- Loopback throughput limited to ~54 Mbps by Python/qh3 overhead.
-- Stream idle timeout warnings at group boundaries (downgraded to DEBUG).
-- d16 PUBLISH_OK establishes subscription — no explicit subscribe()
-  needed after subscribe_namespace + PUBLISH flow.
+  misalignment). Filtered in BenchStats, logged as warning.
+- moqx caches by (namespace, trackname); reusing a trackname after a
+  publisher size/rate change yields Payload mismatch. Bench tools
+  auto-generate unique tracknames per run.

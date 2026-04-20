@@ -22,7 +22,7 @@
         "raw-quic": "moqt://draft-14.cloudflare.mediaoverquic.com:443"
       },
       "drafts": [14],
-      "pub_mode": "both-publish",
+      "pub_mode": "publish-both",
       "notes": "CF d14 moq-rs: publisher must send PUB_NS + PUBLISH"
     }
   ]

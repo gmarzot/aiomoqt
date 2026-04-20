@@ -28,9 +28,14 @@ DEFAULT_CATALOG = Path(__file__).parent / "relays.json"
 
 # Tiers group suites by scope. The CLI accepts either a tier name
 # (runs every suite in that tier) or a specific suite name.
+#   unit        — pure-Python unit tests, no network
+#   integration — local pub/sub over QUIC (loopback, no relay)
+#   interop     — external relay matrix (relay-smoke + multi-sub per
+#                 catalog entry × transport × draft)
 TIERS = {
-    "unit":  ["pytest", "test_rebuf", "loopback"],
-    "relay": ["interop", "multi_sub"],
+    "unit":        ["pytest", "test_rebuf"],
+    "integration": ["loopback"],
+    "interop":     ["relay-smoke", "multi-sub"],
 }
 TIER_CHOICES = tuple(TIERS.keys())
 SUITE_CHOICES = tuple(s for suites in TIERS.values() for s in suites)
@@ -98,7 +103,7 @@ def _loopback(log_dir: Path) -> tuple[str, str]:
     return ("PASS" if ok and no_loss else "FAIL"), f"{tput} Mbps"
 
 
-def _interop(url: str, draft: int, log: Path) -> tuple[str, str]:
+def _smoke(url: str, draft: int, log: Path) -> tuple[str, str]:
     cmd = ["python", "-m", "aiomoqt.examples.moq_interop_client",
            "-r", url, "--draft", str(draft)]
     ok, _ = _run(cmd, log, 90)
@@ -138,7 +143,7 @@ def main() -> int:
                     help=f"run this specific suite (repeatable). "
                          f"Choices: {', '.join(SUITE_CHOICES)}")
     ap.add_argument("--only", metavar="RELAY",
-                    help="within the relay tier, only test this relay "
+                    help="within the interop tier, only test this relay "
                          "by name")
     ap.add_argument("--catalog", default=str(DEFAULT_CATALOG),
                     help=f"relay catalog JSON (default: {DEFAULT_CATALOG})")
@@ -184,12 +189,15 @@ def main() -> int:
             record(*_pytest(log_dir), "pytest")
         if "test_rebuf" in enabled:
             record(*_rebuf(log_dir), "test_rebuf")
-        if "loopback" in enabled:
-            record(*_loopback(log_dir), "loopback bench")
 
-    # --- relay tier ---
-    run_relay = bool(enabled & set(TIERS["relay"]))
-    if not run_relay:
+    # --- integration tier ---
+    if enabled & set(TIERS["integration"]):
+        print("\n== integration tier ==")
+        if "loopback" in enabled:
+            record(*_loopback(log_dir), "loopback")
+
+    # --- interop tier ---
+    if not enabled & set(TIERS["interop"]):
         relays = []
     for relay in relays:
         print(f"\n== relay: {relay['name']} ==")
@@ -201,16 +209,16 @@ def main() -> int:
                 tag = f"{relay['name']}/{transport}/d{draft}"
                 slug = tag.replace("/", "_")
 
-                if "interop" in enabled:
-                    log = log_dir / f"interop-{slug}.log"
-                    record(*_interop(url, draft, log),
-                           f"interop   {tag}")
+                if "relay-smoke" in enabled:
+                    log = log_dir / f"relay-smoke-{slug}.log"
+                    record(*_smoke(url, draft, log),
+                           f"relay-smoke {tag}")
 
-                if "multi_sub" in enabled:
+                if "multi-sub" in enabled:
                     tn = f"rr-{relay['name']}-{draft}"
-                    log = log_dir / f"multi_sub-{slug}.log"
+                    log = log_dir / f"multi-sub-{slug}.log"
                     record(*_multi_sub(url, draft, pub_mode, log, tn),
-                           f"multi_sub {tag} [{pub_mode}]")
+                           f"multi-sub   {tag} [{pub_mode}]")
 
     # --- summary ---
     print("\n" + "═" * 60)
