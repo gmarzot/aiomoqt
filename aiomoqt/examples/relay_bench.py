@@ -17,7 +17,7 @@ import sys
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='moqperf - combined pub/sub benchmark',
+        description='aiomoqt-bench relay - combined pub/sub benchmark',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Runs bench_pub and bench_sub concurrently against the same
@@ -41,9 +41,9 @@ examples:
         '-Q', '--force-quic', action='store_true',
         help='Force raw QUIC even for https:// URLs')
     parser.add_argument(
-        '-n', '--namespace', type=str, default='bench')
+        '-n', '--namespace', type=str, default='aiomoqt')
     parser.add_argument(
-        '--trackname', type=str, default='track')
+        '--trackname', type=str, default=None)
     parser.add_argument(
         '-D', '--datagram', action='store_true',
         help='Use datagrams instead of streams')

@@ -7,9 +7,8 @@ from typing import (Callable, DefaultDict, Dict, List, Optional, Set, Tuple,
                     Type, Union)
 
 from qh3.asyncio.protocol import QuicConnectionProtocol
-from qh3.h3.connection import (H3_ALPN, ErrorCode, H3Connection, Setting,
-                               StreamType)
-from qh3.h3.events import HeadersReceived
+from qh3.h3.connection import (H3_ALPN, ErrorCode, H3Connection, Setting)
+from qh3.h3.events import HeadersReceived, WebTransportStreamDataReceived
 from qh3.quic.connection import (QuicConnection, QuicErrorCode,
                                  stream_is_unidirectional)
 from qh3.quic.events import (DatagramFrameReceived, ProtocolNegotiated,
@@ -37,6 +36,11 @@ from .utils.logger import *
 USER_AGENT = f"aiomoqt/{version('aiomoqt')}"
 
 MOQT_IDLE_STREAM_TIMEOUT = 5
+
+# WebTransport stream header wire constants (draft-ietf-webtrans-http3).
+# Every WT stream is prefixed with <type, session_id> as two QUIC varints.
+WT_UNI_STREAM_TYPE = 0x54    # WEBTRANSPORT_STREAM (uni)
+WT_BIDI_FRAME_TYPE = 0x41    # WEBTRANSPORT_STREAM frame (bidi)
 
 logger = get_logger(__name__)
 
@@ -101,8 +105,8 @@ class H3CustomConnection(H3Connection):
     def _max_table_capacity(self, value):
         # Ignore the parent class attempt to set it
         pass
-    
-    
+
+
 # base class for client and server session objects
 class MOQTPeer:
     """MOQT client and server base-class."""
@@ -116,8 +120,6 @@ class MOQTPeer:
         """Register a custom message handler."""
         (msg_class, _) = MOQTSession.MOQT_CONTROL_MESSAGE_REGISTRY[msg_type]
         self._control_msg_handlers[msg_type] = (msg_class, handler)
-        
-
 
 
 class MOQTSession(QuicConnectionProtocol):
@@ -173,11 +175,6 @@ class MOQTSession(QuicConnectionProtocol):
 
         self._stream_data_registry = dict(MOQTSession.MOQT_STREAM_DATA_REGISTRY)
         self._dgram_data_registry = dict(MOQTSession.MOQT_DGRAM_DATA_REGISTRY)
-
-        # Partial WT header buffer for streams where the 2-varint
-        # WebTransport stream header was fragmented across QUIC packets.
-        # Keyed by stream_id → bytes of the partial header.
-        self._wt_header_pending: Dict[int, bytes] = {}
 
         # Optional callback for received data objects:
         #   fn(msg, size_bytes, recv_time_ms, group_id, subgroup_id)
@@ -336,7 +333,7 @@ class MOQTSession(QuicConnectionProtocol):
         self._next_track_alias += 1
         self._track_aliases[track_alias] = request_id
         return track_alias
-    
+
     def _control_task_done(self, task: asyncio.Task) -> None:
         """Remove control task from set."""
         self._tasks.discard(task)
@@ -355,20 +352,20 @@ class MOQTSession(QuicConnectionProtocol):
             endpoint = endpoint.decode('utf-8')
         if isinstance(path, bytes):
             path = path.decode('utf-8')
-            
+
         # Strip trailing slashes
         endpoint = endpoint.strip('/')
         path = path.strip('/')
         logger.debug(f"H3 event: endpoint: {endpoint} path: {path}")
         return endpoint == path
-            
+
     def _moqt_handle_control_message(self, buf: Buffer) -> Optional[MOQTMessage]:
         """Process an incoming message."""
         buf_len = buf.capacity
         if buf_len == 0:
             logger.warning("MOQT event: handle control message: no data")
             return None
-        pos = buf.tell()
+
         logger.debug(f"MOQT event: handle control message: ({buf_len} bytes) 0x{buf.data_slice(0, buf_len).hex()}")
         try:
             start_pos = buf.tell()
@@ -394,7 +391,7 @@ class MOQTSession(QuicConnectionProtocol):
             if end_pos > buf.tell():
                 logger.debug(f"MOQT event: control message: seeking msg end: {end_pos}")
                 buf.seek(end_pos)
-            #assert start_pos + msg_len == (buf.tell())
+            # assert start_pos + msg_len == (buf.tell())
             logger.info(f"MOQT event: control message parsed: {msg})")
 
             # Schedule handler if one exists
@@ -403,13 +400,13 @@ class MOQTSession(QuicConnectionProtocol):
                 task = asyncio.create_task(handler(self, msg))
                 task.add_done_callback(self._control_task_done)
                 self._tasks.add(task)
-                
+
             return msg
 
         except Exception as e:
             logger.error(f"handle_control_message: error handling control message: {e}")
             raise
- 
+
     def _stream_task_done(self, stream_id: int, task: asyncio.Task) -> None:
         logger.debug(f"MOQT stream({stream_id}): stream task done: num stream tasks: {len(self._stream_tasks)}")
 
@@ -445,7 +442,57 @@ class MOQTSession(QuicConnectionProtocol):
                 logger.debug(f"MOQT stream({stream_id}): fetch "
                              f"request_id={request_id} complete")
         self._unbind_stream(stream_id)
- 
+
+    def _strip_wt_header(self, stream_id: int, buf: Buffer,
+                         *, is_unidirectional: bool) -> bool:
+        """Strip the WT 2-varint stream prefix in-place on `buf`.
+
+        Returns True on success, False if the prefix is incomplete (caller
+        should buffer the raw bytes and retry on the next chunk). A
+        mismatched type or session_id is logged as a warning but not
+        treated as fatal — the strip still advances `buf` past the two
+        varints so downstream parsing can continue.
+        """
+        expected = WT_UNI_STREAM_TYPE if is_unidirectional else WT_BIDI_FRAME_TYPE
+        try:
+            st = buf.pull_uint_var()
+            sid = buf.pull_uint_var()
+        except BufferReadError:
+            return False
+        if st != expected or sid != self._session_id:
+            logger.warning(
+                f"MOQT stream({stream_id}): unexpected WT header "
+                f"type=0x{st:x} session={sid} "
+                f"(expected 0x{expected:x}/session={self._session_id})")
+        return True
+
+    def _on_stream_data(self, stream_id: int, data: bytes,
+                        end_stream: bool) -> None:
+        """Enqueue a data-stream chunk and spawn its processing task on
+        first arrival. `data` must be pure MoQT payload — any transport
+        framing (WT prefix, etc.) has already been stripped by the caller.
+        `end_stream` pushes the FIN sentinel for the processing task.
+        """
+        if stream_id not in self._data_streams:
+            logger.debug(f"MOQT event: new data stream: id: {stream_id} {len(data)} bytes")
+            self._data_streams[stream_id] = None
+            if stream_id in self._stream_tasks:
+                logger.warning(f"MOQT stream({stream_id}): replacing existing task")
+                self._stream_tasks[stream_id].cancel()
+            task = asyncio.create_task(self._process_data_stream(stream_id))
+            self._stream_tasks[stream_id] = task
+            task.add_done_callback(partial(self._stream_task_done, stream_id))
+            logger.debug(f"MOQT event: creating _process_data_stream task: {stream_id} num streams: {len(self._data_streams)}")
+
+        if len(data) > 0:
+            msg_buf = Buffer(data=data)
+            logger.debug(f"MOQT event: pushing data on stream: {stream_id} len: {len(data)}")
+            self._stream_queues[stream_id].put_nowait(msg_buf)
+
+        if end_stream:
+            logger.debug(f"MOQT event: stream FIN: {stream_id}")
+            self._stream_queues[stream_id].put_nowait(None)
+
     # task for processing incoming data streams
     async def _process_data_stream(self, stream_id: int) -> None:
         ''' Subgroup stream data processing task '''
@@ -453,6 +500,7 @@ class MOQTSession(QuicConnectionProtocol):
         cur_pos: int = 0
         consumed: int = 0
         needed: int = 0
+        have: int = 0
         group_id = None
         subgroup_id = None
         object_id = None
@@ -465,25 +513,29 @@ class MOQTSession(QuicConnectionProtocol):
                     if msg_buf is None:  # Sentinel done value - return
                         logger.debug(f"MOQT stream({stream_id}): queue closed: task shutdown")
                         return
-                    
+
                     cur_pos = msg_buf.tell()
                     msg_len = msg_buf.capacity
+                    available = msg_len - cur_pos
 
-                    if msg_len < needed:
-                        needed -= msg_len
+                    if available < needed:
+                        needed -= available
                         re_buf.push_bytes(msg_buf.data_slice(cur_pos, msg_len))
                         have = re_buf.tell()
                         logger.debug(f"MOQT stream({stream_id}): data added: len: {msg_len} have: {have} still need: {needed}")
                     elif cur_pos == msg_len:
-                        continue  # special case where the stream id is all we got - next
+                        # Producer filters tell()==capacity buffers so this
+                        # branch is not expected to fire in practice.
+                        logger.warning(f"MOQT stream({stream_id}): cur_pos==msg_len: {cur_pos} have: {have} still need: {needed}")
+                        continue
                     else:
                         logger.debug(f"MOQT stream({stream_id}): data received: pos: {cur_pos} len: {msg_len} needed: {needed}")
                         break
-                        
+
             except asyncio.TimeoutError:
                 logger.debug(f"MOQT stream({stream_id}): idle timeout: {group_id}.{subgroup_id}.{object_id}")
                 raise
-            
+
             # if more data was needed, add it to re_buf accumulator and reprocess
             if needed > 0:
                 re_buf.push_bytes(msg_buf.data_slice(cur_pos,msg_buf.capacity))
@@ -522,7 +574,7 @@ class MOQTSession(QuicConnectionProtocol):
                                  f"needed_was={needed} hex@cur_pos={hex_at} "
                                  f"object_id={object_id} group_id={group_id}")
                     raise
-                    
+
                 if msg_obj is None:
                     error = f"MOQT error: data stream({stream_id}):: parsing failed at position: "
                     logger.error(error + f"{msg_buf.tell()} of {msg_len} bytes")
@@ -590,7 +642,10 @@ class MOQTSession(QuicConnectionProtocol):
 
             if needed > 0:
                 have = msg_len - cur_pos
-                # yuck - python memove - custom stream reader in progress
+                # yuck - python memmove - custom stream reader in progress.
+                # seek(0)+push_bytes resets the logical length: the top of
+                # the outer loop recomputes msg_len from re_buf.tell(), so
+                # stale trailing bytes beyond tell() are never read.
                 saved_bytes = msg_buf.data_slice(cur_pos, msg_len)
                 if have < needed:  # we might not know how much we need
                     needed -= have
@@ -946,10 +1001,18 @@ class MOQTSession(QuicConnectionProtocol):
                     if self._control_stream_id is None:
                         self._control_stream_id = stream_id
                         logger.debug(f"QUIC event: detecting control stream: {stream_id}")
-                        # Strip WT stream header (WebTransport only)
+                        # Strip WT stream header (WebTransport only). A partial
+                        # header here indicates a peer-side bug — fail loud
+                        # with byte-level diagnostics.
                         if self._h3 is not None:
-                            msg_buf.pull_uint_var()
-                            msg_buf.pull_uint_var()
+                            if not self._strip_wt_header(
+                                    stream_id, msg_buf, is_unidirectional=False):
+                                hex_bytes = event.data[:16].hex()
+                                self._close_session(
+                                    SessionCloseCode.PROTOCOL_VIOLATION,
+                                    f"control stream({stream_id}) WT header incomplete: "
+                                    f"got {len(event.data)} bytes: 0x{hex_bytes}")
+                                return
                     elif stream_id != self._control_stream_id:
                         # d16: bidi streams carry SUBSCRIBE_NAMESPACE and responses
                         if is_draft16_or_later():
@@ -970,85 +1033,15 @@ class MOQTSession(QuicConnectionProtocol):
                             break
                     return
 
-                # Handle MoQT data streams (unidirectional only)
+                # Uni MoQT data streams. Raw QUIC dispatches directly;
+                # the WT path falls through to H3 which emits
+                # WebTransportStreamDataReceived with the WT prefix
+                # already stripped.
                 if stream_is_unidirectional(stream_id):
-                    # Identify H3 internal uni streams (SETTINGS, QPACK
-                    # encoder/decoder) so they pass through to the H3
-                    # handler below. All other uni streams are MoQT data.
-                    # Raw QUIC has no H3 framing — skip this check.
-                    if self._h3 is not None:
-                        h3_peer_streams = {
-                            self._h3._peer_control_stream_id,
-                            self._h3._peer_encoder_stream_id,
-                            self._h3._peer_decoder_stream_id,
-                        }
-                        is_h3_internal = stream_id in h3_peer_streams
-                    else:
-                        is_h3_internal = False
-                    if not is_h3_internal:
-                        # Handle WT header continuation for fragmented streams
-                        if stream_id in self._wt_header_pending:
-                            combined = self._wt_header_pending.pop(stream_id) + event.data
-                            msg_buf = Buffer(data=combined)
-                            msg_len = msg_buf.capacity
-                            try:
-                                msg_buf.pull_uint_var()
-                                msg_buf.pull_uint_var()
-                            except BufferReadError:
-                                # Still not enough data — re-save and wait
-                                self._wt_header_pending[stream_id] = combined
-                                logger.debug(f"MOQT stream({stream_id}): WT header still incomplete ({len(combined)} bytes)")
-                                return
-                            logger.debug(f"MOQT stream({stream_id}): WT header completed from {len(combined)} bytes")
-                            self._data_streams[stream_id] = None
-                            if stream_id in self._stream_tasks:
-                                logger.warning(f"MOQT stream({stream_id}): replacing existing task")
-                                self._stream_tasks[stream_id].cancel()
-                            task = asyncio.create_task(self._process_data_stream(stream_id))
-                            self._stream_tasks[stream_id] = task
-                            task.add_done_callback(partial(self._stream_task_done, stream_id))
-                            if msg_buf.tell() < msg_len:
-                                self._stream_queues[stream_id].put_nowait(msg_buf)
-                            if event.end_stream:
-                                self._stream_queues[stream_id].put_nowait(None)
-                            return
-
-                        if stream_id not in self._data_streams:
-                            logger.debug(f"MOQT event: new data stream: id: {stream_id} {msg_len} bytes")
-                            # Strip WT 2-varint stream header (WebTransport only)
-                            if self._h3 is not None:
-                                try:
-                                    msg_buf.pull_uint_var()
-                                    msg_buf.pull_uint_var()
-                                except BufferReadError:
-                                    # WT header fragmented across QUIC packets —
-                                    # save partial bytes and wait for continuation
-                                    self._wt_header_pending[stream_id] = event.data
-                                    logger.debug(f"MOQT stream({stream_id}): WT header fragmented, buffering {msg_len} bytes")
-                                    return
-                            self._data_streams[stream_id] = None
-                            if stream_id in self._stream_tasks:
-                                logger.warning(f"MOQT stream({stream_id}): replacing existing task")
-                                self._stream_tasks[stream_id].cancel()
-                            task = asyncio.create_task(self._process_data_stream(stream_id))
-                            self._stream_tasks[stream_id] = task
-                            task.add_done_callback(partial(self._stream_task_done, stream_id))
-                            logger.debug(f"MOQT event: creating _process_data_stream task: {stream_id} num streams: {len(self._data_streams)}")
-
-                        # Queue the event data buffer for processing
-                        if msg_buf.tell() < msg_len:
-                            logger.debug(f"MOQT event: pushing data on stream: {stream_id} pos: {msg_buf.tell()} len: {msg_len}")
-                            self._stream_queues[stream_id].put_nowait(msg_buf)
-                        else:
-                            logger.debug(f"MOQT event: skipping empty data: {stream_id} pos: {msg_buf.tell()} len: {msg_len}")
-                        # Signal stream task that stream is done (FIN received)
-                        if event.end_stream:
-                            logger.debug(f"MOQT event: stream FIN: {stream_id}")
-                            self._stream_queues[stream_id].put_nowait(None)
+                    if self._h3 is None:
+                        self._on_stream_data(
+                            stream_id, event.data, event.end_stream)
                         return
-                    else:
-                        logger.debug(f"MOQT event: H3 internal uni stream {stream_id} type=0x{event.data[0]:02x}")
-                        # fall through to H3 handler below
 
         elif isinstance(event, DatagramFrameReceived) and self._wt_session_setup.done():
             msg_buf = Buffer(data=event.data)
@@ -1107,12 +1100,17 @@ class MOQTSession(QuicConnectionProtocol):
         logger.debug(f"H3 event: _h3_handle_event {event}")
         if isinstance(event, HeadersReceived):
             return self._h3_handle_headers_received(event)
+        if isinstance(event, WebTransportStreamDataReceived):
+            # Bidi WT streams still flow through the raw StreamDataReceived
+            # path; only dispatch uni MoQT data streams here.
+            if stream_is_unidirectional(event.stream_id):
+                self._on_stream_data(
+                    event.stream_id, event.data, event.stream_ended)
+                return
         msg_class = class_name(event)
         data = getattr(event, 'data', None)
         hex_data = f"0x{data.hex()}" if data is not None else "<no data>"
         logger.debug(f"H3 event: stream {event.stream_id}: {msg_class}: {hex_data}")
-        # pass to parent H3 to handle - XX not required?
-        # self._h3.handle_event(event)
 
     def _h3_handle_headers_received(self, event: HeadersReceived) -> None:
         """Process incoming H3 headers."""
@@ -1459,7 +1457,6 @@ class MOQTSession(QuicConnectionProtocol):
         """Send a MoQT message on the control stream."""
         if self._quic is None or self._control_stream_id is None:
             raise MOQTException(SessionCloseCode.INTERNAL_ERROR, "control stream not intialized")
-        
         logger.debug(f"QUIC send: control message: {buf.tell()} bytes")
 
         self._quic.send_stream_data(
@@ -1483,8 +1480,14 @@ class MOQTSession(QuicConnectionProtocol):
 
         # New incoming bidi stream from peer — strip WT stream header if present
         if self._h3 is not None:
-            buf.pull_uint_var()  # WT session/stream identifier
-            buf.pull_uint_var()
+            if not self._strip_wt_header(
+                    stream_id, buf, is_unidirectional=False):
+                hex_bytes = buf.data_slice(0, min(buf_len, 16)).hex()
+                self._close_session(
+                    SessionCloseCode.PROTOCOL_VIOLATION,
+                    f"bidi stream({stream_id}) WT header incomplete: "
+                    f"got {buf_len} bytes: 0x{hex_bytes}")
+                return
 
         # Parse the message
         msg = self._moqt_handle_control_message(buf)
@@ -1497,7 +1500,7 @@ class MOQTSession(QuicConnectionProtocol):
         """Send a MoQT message on the control stream."""
         if self._quic is None:
             raise MOQTException(SessionCloseCode.INTERNAL_ERROR, "QUIC not intialized")
-                
+
         logger.debug(f"QUIC send: datagram message: {buf.capacity} bytes")
 
         self._quic.send_datagram_frame(
@@ -1973,14 +1976,28 @@ class MOQTSession(QuicConnectionProtocol):
         return await asyncio.wait_for(
             self._namespace_announcements.get(), timeout=timeout)
 
-    async def await_publish(self, timeout: float = 10.0):
+    async def await_publish(self, timeout: float = 10.0,
+                            trackname: Optional[str] = None):
         """Wait for a PUBLISH (track announcement) from the relay.
 
-        Returns the Publish message with track_namespace and track_name,
-        or raises TimeoutError if no announcement arrives within timeout.
+        If `trackname` is given, announcements whose track_name does not
+        match are discarded until a matching one arrives (or timeout).
+        Without it, returns the first announcement off the queue.
         """
-        return await asyncio.wait_for(
-            self._publish_announcements.get(), timeout=timeout)
+        async def _next_matching():
+            while True:
+                msg = await self._publish_announcements.get()
+                if trackname is None:
+                    return msg
+                name = (msg.track_name.decode()
+                        if isinstance(msg.track_name, bytes)
+                        else msg.track_name)
+                if name == trackname:
+                    return msg
+                logger.debug(
+                    f"await_publish: dropping announcement for "
+                    f"'{name}' (waiting for '{trackname}')")
+        return await asyncio.wait_for(_next_matching(), timeout=timeout)
 
     def unsubscribe_namespace(
         self,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""moqbench subscriber - receives MoQT objects and reports stats.
+"""aiomoqt-bench subscriber - receives MoQT objects and reports stats.
 
 Usage:
   # H3/WebTransport (default)
@@ -24,6 +24,7 @@ from aiomoqt.types import (
 from aiomoqt.client import MOQTClient
 from aiomoqt.messages import ObjectDatagram
 from aiomoqt.track import SubscribedTrack
+from aiomoqt.utils.format import fmt_bps, fmt_ms, fmt_rate
 from aiomoqt.utils.logger import set_log_level, get_logger
 from aiomoqt.utils.url import parse_relay_url
 
@@ -148,12 +149,12 @@ class BenchStats:
 
     def _print_header(self):
         print(
-            f"  {'Interval':<10} {'Grps':>5} {'Objs':>8}"
-            f"  {'ObjRate':>8} {'Bitrate':>9}"
-            f"    {'Latency':<14}"
-            f"     {'Jitter':>6} {'Lost':>5}"
+            f"  {'Interval':<10}{'Grps':<8}{'Objs':<10}"
+            f"{'ObjRate':<10}{'Bitrate':<10}"
+            f"{'Latency':<20}"
+            f"{'Jitter':<8}{'Loss':<17}"
         )
-        print("  " + "─" * 88)
+        print("  " + "─" * 93)
 
     def _print_interval(self, now: float):
         dt = now - self.last_report_time
@@ -162,23 +163,30 @@ class BenchStats:
 
         elapsed = now - self.start_time
         rate = self.iv_objects / dt
-        mbps = (self.iv_bytes * 8) / (dt * 1e6)
+        bps = (self.iv_bytes * 8) / dt
 
         lat = self.iv_latencies
         if lat:
-            avg = int(sum(lat) / len(lat))
-            p99 = int(self._pct(lat, 99))
-            lat_s = f"{avg}ms p99:{p99}ms"
+            avg = sum(lat) / len(lat)
+            p99 = self._pct(lat, 99)
+            lat_s = f"{fmt_ms(avg)} p99: {fmt_ms(p99)}"
         else:
             lat_s = "--"
 
         iv = f"{elapsed - dt:.0f}-{elapsed:.0f}s"
         grps = len(self.total_groups)
+        rate_s = fmt_rate(rate)
+        bps_s = fmt_bps(bps)
+        jitter_s = fmt_ms(self.jitter)
+        expected = self.total_objects + self.total_lost
+        loss_pct = int(round(
+            100 * self.total_lost / expected)) if expected else 0
+        loss_s = f"{loss_pct}% ({self.total_lost} objs)"
         print(
-            f"  {iv:<10} {grps:>5} {self.total_objects:>8}"
-            f"  {rate:>6.1f}/s {mbps:>7.2f}Mb"
-            f"    {lat_s:<16}"
-            f"  {self.jitter:>4.1f}ms {self.total_lost:>5}"
+            f"  {iv:<10}{grps:<8}{self.total_objects:<10}"
+            f"{rate_s:<10}{bps_s:<10}"
+            f"{lat_s:<20}"
+            f"{jitter_s:<8}{loss_s:<17}"
         )
 
         self.iv_objects = 0
@@ -205,7 +213,7 @@ class BenchStats:
 
         print()
         print("═" * 56)
-        print(f"  moqbench results  ({dur:.1f}s)")
+        print(f"  aiomoqt-bench results  ({dur:.1f}s)")
         print("═" * 56)
         print(f"  Objects:     {self.total_objects:,}")
         print(f"  Bytes:       {self.total_bytes:,}")
@@ -242,7 +250,7 @@ class BenchStats:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='moqbench subscriber - MoQT benchmark receiver',
+        description='aiomoqt-bench subscriber - MoQT benchmark receiver',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 relay URL forms:
@@ -264,8 +272,8 @@ examples:
         '-Q', '--force-quic', action='store_true',
         help='Force raw QUIC even for https:// URLs')
     parser.add_argument(
-        '-n', '--namespace', type=str, default='bench',
-        help='MoQT namespace (default: bench)')
+        '-n', '--namespace', type=str, default='aiomoqt',
+        help='MoQT namespace (default: aiomoqt)')
     parser.add_argument(
         '--trackname', type=str, default=None,
         help='MoQT track name (default: auto-discover from namespace)')
@@ -290,7 +298,7 @@ examples:
 
 def print_banner(relay, args):
     print("─" * 56)
-    print("  moqbench subscriber")
+    print("  aiomoqt-bench subscriber")
     print("─" * 56)
     print(f"  relay:       {relay}")
     print(f"  transport:   {relay.transport_name}")

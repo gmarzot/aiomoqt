@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""moqbench publisher - sends timestamped MoQT objects through a relay.
+"""aiomoqt-bench publisher - sends timestamped MoQT objects through a relay.
 
 Usage:
   # H3/WebTransport (default)
@@ -26,7 +26,7 @@ from aiomoqt.utils.url import parse_relay_url
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='moqbench publisher - MoQT benchmark sender',
+        description='aiomoqt-bench publisher - MoQT benchmark sender',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 relay URL forms:
@@ -44,8 +44,8 @@ examples:
                         help='Relay URL: moqt://host:port, https://host:port/ep, or host[:port]')
     parser.add_argument('-Q', '--force-quic', action='store_true',
                         help='Force raw QUIC even for https:// URLs')
-    parser.add_argument('-n', '--namespace', type=str, default='bench',
-                        help='MoQT namespace (default: bench)')
+    parser.add_argument('-n', '--namespace', type=str, default='aiomoqt',
+                        help='MoQT namespace (default: aiomoqt)')
     parser.add_argument('--trackname', type=str, default=None,
                         help='MoQT track name (default: <profile>-<uuid4>)')
     parser.add_argument('-D', '--datagram', action='store_true',
@@ -89,7 +89,7 @@ def print_banner(relay, args):
         rate_s = "max"
         target_s = "max"
     print("─" * 56)
-    print("  moqbench publisher")
+    print("  aiomoqt-bench publisher")
     print("─" * 56)
     print(f"  relay:       {relay}")
     print(f"  transport:   {relay.transport_name}")

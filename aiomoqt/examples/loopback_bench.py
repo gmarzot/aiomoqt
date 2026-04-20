@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""moqbench loopback - direct pub-to-sub benchmark without a relay.
+"""aiomoqt-bench loopback - direct pub-to-sub benchmark without a relay.
 
 Runs the publisher as a server that the subscriber connects to directly.
 This measures pure Python/qh3 throughput without relay overhead.
@@ -44,7 +44,7 @@ KEY = CERT.replace('cert.pem', 'key.pem') if CERT else None
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='moqbench loopback - direct pub/sub, no relay',
+        description='aiomoqt-bench loopback - direct pub/sub, no relay',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
@@ -84,7 +84,7 @@ def print_banner(args):
     else:
         rate_s = "max"
     print("─" * 56)
-    print("  moqbench loopback (no relay)")
+    print("  aiomoqt-bench loopback (no relay)")
     print("─" * 56)
     print(f"  mode:        {mode}")
     print(f"  object size: {args.object_size} B")
@@ -99,7 +99,7 @@ async def _on_subscribe(session, msg, args):
     """Server-side subscribe handler using PublishedTrack."""
     track = PublishedTrack(
         session,
-        namespace="bench",
+        namespace="aiomoqt",
         trackname="track",
         object_size=args.object_size,
         group_size=args.group_size,
@@ -164,7 +164,7 @@ async def run_subscriber(args, stats):
 
             track = SubscribedTrack(
                 session,
-                namespace="bench",
+                namespace="aiomoqt",
                 trackname="track",
                 on_object=stats.on_object,
             )

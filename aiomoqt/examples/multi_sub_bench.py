@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""moqbench multi-sub — 1 publisher, N subscribers through a relay.
+"""aiomoqt-bench multi-sub — 1 publisher, N subscribers through a relay.
 
-Tests relay fan-out capacity by spawning one publisher process
+Measures relay connection density by spawning one publisher process
 and N subscriber processes, each with its own QUIC connection.
 
 Usage:
@@ -26,9 +26,18 @@ from aiomoqt.utils.logger import set_log_level
 from aiomoqt.utils.url import parse_relay_url
 
 
+def _quiet_logging(debug: bool) -> None:
+    """Silence aiomoqt INFO chatter in the parent process so the
+    setup header and results stay readable. `-d` opts in to INFO."""
+    import logging
+    lvl = logging.DEBUG if debug else logging.WARNING
+    logging.basicConfig(level=lvl, force=True)
+    set_log_level(lvl)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='moqbench multi-sub — 1 pub, N subs',
+        description='aiomoqt-bench multi-sub — 1 pub, N subs',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument('relay', type=str,
@@ -48,13 +57,25 @@ def parse_args():
     parser.add_argument('--draft', type=int, default=16,
                         help='MoQT draft version (default: 16)')
     parser.add_argument('--video', type=str, default=None,
-                        choices=['720p', '1080p', '1440p', '4k'],
+                        choices=['240p', '270p', '360p', '480p',
+                                 '720p', '1080p', '1440p', '4k'],
                         help='Video simulation mode')
-    parser.add_argument('--namespace', type=str, default='fanout',
-                        help='Namespace (default: fanout)')
+    parser.add_argument('--namespace', type=str, default='aiomoqt',
+                        help='Namespace (default: aiomoqt)')
+    parser.add_argument('--trackname', type=str, default=None,
+                        help='Explicit track name (default: '
+                             'auto-discover on namespace)')
+    parser.add_argument('-P', '--no-pub', action='store_true',
+                        help='Skip publisher, run subscribers only '
+                             '(publisher must be running elsewhere on '
+                             'the same namespace)')
+    parser.add_argument('-N', '--no-sub-ns', action='store_true',
+                        help='Skip subscribe_namespace; send direct '
+                             'SUBSCRIBE (requires --trackname)')
     parser.add_argument('-Q', '--force-quic', action='store_true',
                         help='Force raw QUIC')
-    parser.add_argument('-d', '--debug', action='store_true')
+    parser.add_argument('-d', '--debug', action='store_true',
+                        help='Verbose logging (default: WARN+)')
     parser.add_argument('--stagger', type=float, default=0.1,
                         help='Delay between subscriber spawns (default: 0.1s)')
     parser.add_argument('--startup', type=float, default=5.0,
@@ -162,16 +183,16 @@ def run_subscriber(sub_id, relay_url, namespace, trackname, args,
         try:
             async with client.connect() as session:
                 await session.client_session_init()
-                # d16: trackname=None triggers auto-discovery
-                # d14: must pass trackname explicitly
-                tn = None if args.draft and args.draft >= 16 else trackname
                 track = SubscribedTrack(
                     session, namespace,
-                    trackname=tn,
+                    trackname=trackname,
                     draft=args.draft,
                     on_object=on_object,
                 )
-                await track.subscribe(timeout=30.0)
+                await track.subscribe(
+                    timeout=30.0,
+                    use_namespace=not args.no_sub_ns,
+                )
                 await track.wait_closed(timeout=args.duration)
                 if not track.completed:
                     stats['error'] = 'StreamReset'
@@ -199,16 +220,32 @@ def run_subscriber(sub_id, relay_url, namespace, trackname, args,
 
 def main():
     args = parse_args()
-    import uuid
-    trackname = f"fanout-{uuid.uuid4().hex[:4]}"
     relay_url = args.relay
 
+    # Default-quiet aiomoqt logging in the parent; workers handle their own.
+    _quiet_logging(args.debug)
+
+    if args.no_sub_ns and not args.trackname:
+        print("error: --no-sub-ns (-N) requires --trackname",
+              file=sys.stderr)
+        sys.exit(2)
+
+    # Subs always auto-discover unless --trackname is explicit.
+    # The embedded publisher (when not --no-pub) needs a concrete name;
+    # generate one if not supplied.
+    sub_trackname = args.trackname
+    if args.no_pub:
+        pub_trackname = None
+    else:
+        import uuid
+        pub_trackname = args.trackname or f"bench-{uuid.uuid4().hex[:4]}"
+
     print("─" * 60)
-    print("  moqbench multi-sub")
+    print("  aiomoqt-bench multi-sub")
     print("─" * 60)
     print(f"  relay:        {relay_url}")
     print(f"  namespace:    {args.namespace}")
-    print(f"  trackname:    {trackname}")
+    print(f"  trackname:    {sub_trackname or '(auto-discover)'}")
     print(f"  subscribers:  {args.subscribers}")
     if args.video:
         print(f"  video:        {args.video} {args.rate}fps")
@@ -217,24 +254,28 @@ def main():
         print(f"  rate:         {args.rate}/s")
     print(f"  duration:     {args.duration}s")
     print(f"  stagger:      {args.stagger}s")
+    print(f"  publisher:    "
+          f"{'external (--no-pub)' if args.no_pub else 'embedded'}")
     print("─" * 60)
 
     # Shared dict for results
     manager = multiprocessing.Manager()
     results = manager.dict()
 
-    # Start publisher
-    print("\n  Starting publisher...")
-    pub_proc = multiprocessing.Process(
-        target=run_publisher,
-        args=(relay_url, args.namespace, trackname, args),
-        daemon=True,
-    )
-    pub_proc.start()
-
-    # Wait for publisher to register with relay
-    print(f"  Waiting {args.startup}s for publisher to register...")
-    time.sleep(args.startup)
+    pub_proc = None
+    if not args.no_pub:
+        print("\n  Starting publisher...")
+        pub_proc = multiprocessing.Process(
+            target=run_publisher,
+            args=(relay_url, args.namespace, pub_trackname, args),
+            daemon=True,
+        )
+        pub_proc.start()
+        print(f"  Waiting {args.startup}s for publisher to register...")
+        time.sleep(args.startup)
+    else:
+        print(f"\n  Skipping publisher (--no-pub). Subscribers will "
+              f"auto-discover on namespace '{args.namespace}'.")
 
     # Spawn subscribers
     print(f"  Spawning {args.subscribers} subscribers "
@@ -243,7 +284,7 @@ def main():
     for i in range(args.subscribers):
         p = multiprocessing.Process(
             target=run_subscriber,
-            args=(i, relay_url, args.namespace, trackname,
+            args=(i, relay_url, args.namespace, sub_trackname,
                   args, results),
             daemon=True,
         )
@@ -269,13 +310,13 @@ def main():
         time.sleep(2.0)
     print()
 
-    # Stop publisher
-    pub_proc.terminate()
-    pub_proc.join(timeout=5)
+    if pub_proc is not None:
+        pub_proc.terminate()
+        pub_proc.join(timeout=5)
 
     # Report
     print("\n" + "═" * 60)
-    print("  moqbench multi-sub results")
+    print("  aiomoqt-bench multi-sub results")
     print("═" * 60)
 
     total_objects = 0

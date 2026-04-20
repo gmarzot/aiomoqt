@@ -36,6 +36,7 @@ MOQT_DEFAULT_PRIORITY = 128
 
 MOQT_TIMESTAMP_EXT = 0x20
 
+
 class MOQTMessageType(IntEnum):
     """MOQT message type constants.
 
@@ -67,16 +68,16 @@ class MOQTMessageType(IntEnum):
     PUBLISH_OK = 0x1E
 
     # -- Draft-14 only (removed or repurposed in draft-16) --
-    SUBSCRIBE_ERROR = 0x05         # d16: repurposed as REQUEST_ERROR
-    PUBLISH_NAMESPACE_OK = 0x07    # d16: repurposed as REQUEST_OK
-    PUBLISH_NAMESPACE_ERROR = 0x08 # d16: repurposed as NAMESPACE
-    TRACK_STATUS_OK = 0x0E         # d16: repurposed as NAMESPACE_DONE
-    TRACK_STATUS_ERROR = 0x0F      # d16: removed
-    SUBSCRIBE_NAMESPACE_OK = 0x12  # d16: removed
+    SUBSCRIBE_ERROR = 0x05          # d16: repurposed as REQUEST_ERROR
+    PUBLISH_NAMESPACE_OK = 0x07     # d16: repurposed as REQUEST_OK
+    PUBLISH_NAMESPACE_ERROR = 0x08  # d16: repurposed as NAMESPACE
+    TRACK_STATUS_OK = 0x0E          # d16: repurposed as NAMESPACE_DONE
+    TRACK_STATUS_ERROR = 0x0F       # d16: removed
+    SUBSCRIBE_NAMESPACE_OK = 0x12   # d16: removed
     SUBSCRIBE_NAMESPACE_ERROR = 0x13  # d16: removed
-    UNSUBSCRIBE_NAMESPACE = 0x14   # d16: removed
-    FETCH_ERROR = 0x19             # d16: removed
-    PUBLISH_ERROR = 0x1F           # d16: removed (use REQUEST_ERROR)
+    UNSUBSCRIBE_NAMESPACE = 0x14    # d16: removed
+    FETCH_ERROR = 0x19              # d16: removed
+    PUBLISH_ERROR = 0x1F            # d16: removed (use REQUEST_ERROR)
 
     # -- Draft-16 aliases (same code points, different semantics) --
     # These are aliases for the code points above, for clarity in d16 code paths.
@@ -314,4 +315,3 @@ class MOQTRequestError(Exception):
         self.retry_interval = retry_interval  # d16: ms before retry+1; 0=don't retry
         self.response = response              # original message object
         super().__init__(f"request error: code={error_code} reason={reason}")
-

@@ -138,13 +138,11 @@ class TestSubscribedTrack:
     def test_init_auto_discover(self):
         session = MagicMock()
         t = SubscribedTrack(session, "bench")
-        assert t._auto_discover is True
-        assert t.trackname == "track"  # default
+        assert t.trackname is None  # auto-discover mode
 
     def test_init_explicit_trackname(self):
         session = MagicMock()
         t = SubscribedTrack(session, "bench", trackname="video")
-        assert t._auto_discover is False
         assert t.trackname == "video"
 
     def test_init_with_callback(self):
@@ -154,30 +152,31 @@ class TestSubscribedTrack:
         assert t.on_object is cb
 
     def test_subscribe_d14(self):
-        """d14 — discovery via subscribe_namespace + await_publish,
-        fallback to direct subscribe if discovery fails."""
+        """d14 — subscribe_namespace + await_publish succeeds."""
         async def _test():
             session = MagicMock()
-            # Discovery fails (no PUBLISH from relay)
+            pub_msg = MagicMock(spec=[])
+            pub_msg.track_namespace = (b"bench",)
+            pub_msg.track_name = b"video"
+            pub_msg.request_id = 7
+            pub_msg.forward = 0
             session.subscribe_namespace = AsyncMock(
                 return_value=MagicMock())
-            session.await_publish = AsyncMock(
-                side_effect=asyncio.TimeoutError())
-            session.subscribe = AsyncMock(
-                return_value=MagicMock())
+            session.await_publish = AsyncMock(return_value=pub_msg)
+            session.send_control_message = MagicMock()
             session.on_object_received = None
 
             t = SubscribedTrack(session, "bench",
-                                trackname="track", draft=14)
+                                trackname="video", draft=14)
             with patch('aiomoqt.track.is_draft16_or_later',
-                        return_value=False):
+                        return_value=False), \
+                 patch('aiomoqt.track.PublishOk') as mock_ok:
+                mock_ok.return_value.serialize.return_value = MagicMock(data=b'')
                 await t.subscribe()
 
-            # Tried discovery first
             session.subscribe_namespace.assert_called_once()
             session.await_publish.assert_called_once()
-            # Fell back to direct subscribe
-            session.subscribe.assert_called_once()
+            session.send_control_message.assert_called_once()
             assert t.state == TrackState.SUBSCRIBED
 
         asyncio.run(_test())
@@ -231,7 +230,7 @@ class TestSubscribedTrack:
             session.on_object_received = None
 
             t = SubscribedTrack(session, "bench", draft=16)
-            assert t._auto_discover is True
+            assert t.trackname is None
             with patch('aiomoqt.track.is_draft16_or_later',
                         return_value=True), \
                  patch('aiomoqt.track.PublishOk') as mock_ok:
@@ -244,7 +243,7 @@ class TestSubscribedTrack:
         asyncio.run(_test())
 
     def test_subscribe_d16_discover_timeout(self):
-        """d16 — discovery timeout falls back to direct subscribe."""
+        """d16 — discovery timeout raises, no silent fallback."""
         async def _test():
             session = MagicMock()
             session.subscribe_namespace = AsyncMock(
@@ -259,13 +258,16 @@ class TestSubscribedTrack:
                                 trackname="video", draft=16)
             with patch('aiomoqt.track.is_draft16_or_later',
                         return_value=True):
-                await t.subscribe()
+                try:
+                    await t.subscribe()
+                    assert False, "expected TimeoutError"
+                except asyncio.TimeoutError:
+                    pass
 
             session.subscribe_namespace.assert_called_once()
             session.await_publish.assert_called_once()
-            # Fell back to direct subscribe
-            session.subscribe.assert_called_once()
-            assert t.state == TrackState.SUBSCRIBED
+            # No fallback direct SUBSCRIBE
+            session.subscribe.assert_not_called()
 
         asyncio.run(_test())
 

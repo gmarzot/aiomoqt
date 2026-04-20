@@ -37,6 +37,7 @@ from .messages import (
     SubgroupHeader, PublishOk, RequestUpdate,
 )
 from .context import is_draft16_or_later
+from .utils.format import fmt_bps, fmt_rate
 from .utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -84,8 +85,8 @@ class Track:
 
     @property
     def fqtn(self) -> str:
-        """Fully qualified track name."""
-        return f"{self.namespace}/{self.trackname}"
+        """Fully qualified track name; trackname may be None pre-discovery."""
+        return f"{self.namespace}/{self.trackname or '*'}"
 
     def __repr__(self):
         return f"{self.__class__.__name__}({self.fqtn}, state={self.state.name})"
@@ -111,6 +112,13 @@ class PublishedTrack(Track):
         self._generating = False
         self._stream_count = 0  # tracks streams opened for PUBLISH_DONE
         self._subscribe_request_id = None  # request_id from relay's SUBSCRIBE
+        # Aggregate stats across all subgroup streams; subgroup 0 reports.
+        self._iv_objects = 0
+        self._iv_bytes = 0
+        self._iv_groups = 0
+        self._total_sent = 0
+        self._total_bytes = 0
+        self._total_groups = 0
 
     async def publish(self):
         """Announce namespace and track to the relay.
@@ -239,8 +247,9 @@ class PublishedTrack(Track):
         self._do_print_stats_header()
 
     def _do_print_stats_header(self):
-        print(f"\n  {'Interval':<12}{'Groups':<18}{'Objects':<22}{'Bitrate'}")
-        print("  " + "─" * 60)
+        print(f"\n  {'Interval':<10}{'Grps':<8}{'Objs':<10}"
+              f"{'ObjRate':<10}{'Bitrate':<10}")
+        print("  " + "─" * 48)
 
     async def generate(self, session, track_alias: int):
         """Generate data for subscribers. Override for custom content.
@@ -285,13 +294,8 @@ class PublishedTrack(Track):
                                   frame_interval: float,
                                   report_interval: float = 5.0):
         """Generate a single subgroup stream."""
-        total_sent = 0
-        total_bytes = 0
-        total_groups = 0
         start_time = time.monotonic()
         last_report = start_time
-        iv_objects = 0
-        iv_bytes = 0
         next_frame_time = time.monotonic()
         group_id = -1
         header = None
@@ -301,16 +305,20 @@ class PublishedTrack(Track):
                   and not getattr(self, '_quiet', False))
 
         cur_obj_id = subgroup_id
-        iv_groups = 0
         stream_id = session.open_uni_stream()
         self._stream_count += 1
+
+        local_sent = 0
 
         try:
             while True:
                 if header is None or cur_obj_id >= self.group_size:
                     group_id += 1
-                    total_groups += 1
-                    iv_groups += 1
+                    # group_id is shared across subgroups in lockstep;
+                    # only subgroup 0 counts so totals match the sub side.
+                    if subgroup_id == 0:
+                        self._total_groups += 1
+                        self._iv_groups += 1
                     cur_obj_id = subgroup_id
 
                     if header is not None:
@@ -361,28 +369,29 @@ class PublishedTrack(Track):
                     raise asyncio.CancelledError
                 await session.stream_write_drain(stream_id, buf.data)
                 session.transmit()
-                total_sent += 1
-                total_bytes += obj_bytes
-                iv_objects += 1
-                iv_bytes += obj_bytes
+                local_sent += 1
+                self._total_sent += 1
+                self._total_bytes += obj_bytes
+                self._iv_objects += 1
+                self._iv_bytes += obj_bytes
 
-                # Periodic stats
+                # Periodic stats — subgroup 0 reports the aggregate.
                 now = time.monotonic()
                 if report and now - last_report >= report_interval:
                     dt = now - last_report
                     elapsed = now - start_time
-                    obj_s = iv_objects / dt
-                    grp_s = iv_groups / dt
-                    mbps = (iv_bytes * 8) / (dt * 1e6)
+                    obj_s = self._iv_objects / dt
+                    bps = (self._iv_bytes * 8) / dt
+                    rate_s = fmt_rate(obj_s)
+                    bps_s = fmt_bps(bps)
                     iv = f"{elapsed - dt:.0f}-{elapsed:.0f}s"
                     self._print_stats_header()
-                    grp_col = f"{total_groups} ({grp_s:.1f}/s)"
-                    obj_col = f"{total_sent:,} ({obj_s:.1f}/s)"
-                    print(f"  {iv:<12}{grp_col:<18}"
-                          f"{obj_col:<22}{mbps:.2f} Mbps")
-                    iv_objects = 0
-                    iv_bytes = 0
-                    iv_groups = 0
+                    print(f"  {iv:<10}{self._total_groups:<8}"
+                          f"{self._total_sent:<10}{rate_s:<10}"
+                          f"{bps_s:<10}")
+                    self._iv_objects = 0
+                    self._iv_bytes = 0
+                    self._iv_groups = 0
                     last_report = now
 
                 if paced:
@@ -390,20 +399,20 @@ class PublishedTrack(Track):
                     sleep_time = max(0, next_frame_time - time.monotonic())
                     await asyncio.sleep(sleep_time)
                 else:
-                    if total_sent % 64 == 0:
+                    if local_sent % 64 == 0:
                         await asyncio.sleep(0)
 
         except asyncio.CancelledError:
             dur = time.monotonic() - start_time
             if dur > 0 and report:
-                mbps = (total_bytes * 8) / (dur * 1e6)
-                obj_s = total_sent / dur
-                print(f"\n  Sent: {total_sent:,} objects, "
-                      f"{total_groups} groups, "
-                      f"{obj_s:.1f} obj/s, "
-                      f"{mbps:.2f} Mbps ({dur:.1f}s)")
+                bps = (self._total_bytes * 8) / dur
+                obj_s = self._total_sent / dur
+                print(f"\n  Sent: {self._total_sent:,} objects, "
+                      f"{self._total_groups} groups, "
+                      f"{fmt_rate(obj_s)}, "
+                      f"{fmt_bps(bps)} ({dur:.1f}s)")
             logger.info(f"Track: subgroup {subgroup_id} "
-                        f"sent {total_sent} objects")
+                        f"sent {local_sent} objects")
             raise
 
     async def wait_for_subscribers(self, timeout: float = None):
@@ -438,9 +447,7 @@ class SubscribedTrack(Track):
                  draft: Optional[int] = None,
                  on_object: Optional[Callable] = None,
                  report_interval: float = 5.0):
-        super().__init__(session, namespace, trackname or 'track',
-                         draft=draft)
-        self._auto_discover = (trackname is None)
+        super().__init__(session, namespace, trackname, draft=draft)
         self.on_object = on_object
         self.report_interval = report_interval
         self.publish_done: Optional[object] = None  # received PUBLISH_DONE
@@ -448,88 +455,30 @@ class SubscribedTrack(Track):
 
     async def subscribe(self, timeout: float = 30.0,
                         forward: int = 1,
-                        subscribe_options: int = None):
+                        subscribe_options: int = None,
+                        use_namespace: bool = True):
         """Subscribe to the track.
 
-        Unified d14/d16 flow:
-          subscribe_namespace → relay sends PUBLISH → extract trackname
-          → respond with PUBLISH_OK(forward=1) → data flows
+        Default flow: subscribe_namespace → await PUBLISH (optionally
+        filtered to self.trackname) → PUBLISH_OK(forward=1) → data flows.
+
+        With use_namespace=False, skip namespace subscription and send a
+        direct SUBSCRIBE for (self.namespace, self.trackname). Requires
+        self.trackname to be set.
 
         Args:
             timeout: seconds to wait for PUBLISH announcement
             forward: forwarding preference (1=send objects, 0=hold)
             subscribe_options: d16 only — 0=PUBLISH, 1=NAMESPACE, 2=both
+            use_namespace: run the full namespace-discovery path (default)
         """
         if self.on_object:
             self.session.on_object_received = self.on_object
 
-        # Try PUBLISH-based discovery: subscribe_namespace → relay
-        # sends PUBLISH → extract trackname → PUBLISH_OK(forward=1).
-        # Works in both d14 and d16 when the publisher sends PUBLISH.
-        # Falls back to legacy d14 direct SUBSCRIBE if discovery fails.
-        discovered = False
-        try:
-            ns_kwargs = {}
-            if subscribe_options is not None and is_draft16_or_later():
-                ns_kwargs['subscribe_options'] = subscribe_options
-            await self.session.subscribe_namespace(
-                namespace_prefix=self.namespace,
-                parameters={},
-                wait_response=True,
-                **ns_kwargs,
-            )
-            self.state = TrackState.ANNOUNCED
-
-            # Wait for PUBLISH from relay
-            if self._auto_discover:
-                print(f"  Waiting for publisher on "
-                      f"'{self.namespace}'...")
-            else:
-                print(f"  Waiting for track '{self.fqtn}'...")
-            pub_msg = await self.session.await_publish(
-                timeout=timeout)
-
-            # Extract namespace/trackname from PUBLISH
-            if self._auto_discover:
-                self.namespace = '/'.join(
-                    p.decode() if isinstance(p, bytes) else p
-                    for p in pub_msg.track_namespace
-                )
-                self.trackname = (
-                    pub_msg.track_name.decode()
-                    if isinstance(pub_msg.track_name, bytes)
-                    else pub_msg.track_name
-                )
-                print(f"  Discovered: {self.fqtn}")
-
-            # Register the track_alias from the relay's PUBLISH so
-            # incoming data streams are recognized by admission control.
-            if hasattr(pub_msg, 'track_alias'):
-                self.track_alias = pub_msg.track_alias
-                self.session._track_aliases[
-                    pub_msg.track_alias] = pub_msg.request_id
-
-            # PUBLISH_OK with forward=1 establishes subscription
-            ok = PublishOk(
-                request_id=pub_msg.request_id,
-                forward=forward,
-                priority=128,
-                group_order=GroupOrder.ASCENDING,
-                filter_type=FilterType.LATEST_OBJECT,
-                parameters={},
-            )
-            logger.info(f"Track: PUBLISH_OK {self.fqtn} "
-                        f"alias={self.track_alias} forward={forward}")
-            self.session.send_control_message(ok.serialize())
-            discovered = True
-
-        except (asyncio.TimeoutError, Exception) as e:
-            logger.warning(f"Track: discovery failed ({e}), "
-                           f"falling back to direct SUBSCRIBE")
-
-        # Fallback: legacy d14 direct SUBSCRIBE (when relay doesn't
-        # forward PUBLISH announcements or discovery timed out)
-        if not discovered:
+        if not use_namespace:
+            if self.trackname is None:
+                raise ValueError(
+                    "use_namespace=False requires an explicit trackname")
             await self.session.subscribe(
                 namespace=self.namespace,
                 track_name=self.trackname,
@@ -537,6 +486,64 @@ class SubscribedTrack(Track):
                 parameters={},
                 wait_response=True,
             )
+            self.state = TrackState.SUBSCRIBED
+            logger.info(f"Track: subscribed (direct) to {self.fqtn}")
+            return
+
+        # Namespace-based discovery: subscribe_namespace → relay sends
+        # PUBLISH → extract trackname → PUBLISH_OK(forward=1). If a
+        # trackname is set, only a matching PUBLISH is accepted; others
+        # are dropped. No fallback — discovery failure raises.
+        ns_kwargs = {}
+        if subscribe_options is not None and is_draft16_or_later():
+            ns_kwargs['subscribe_options'] = subscribe_options
+        await self.session.subscribe_namespace(
+            namespace_prefix=self.namespace,
+            parameters={},
+            wait_response=True,
+            **ns_kwargs,
+        )
+        self.state = TrackState.ANNOUNCED
+
+        if self.trackname is None:
+            print(f"  Waiting for publisher on "
+                  f"'{self.namespace}'...")
+        else:
+            print(f"  Waiting for track '{self.fqtn}'...")
+        pub_msg = await self.session.await_publish(
+            timeout=timeout, trackname=self.trackname)
+
+        # Extract namespace/trackname from PUBLISH (namespace may have
+        # grown past the prefix we subscribed to).
+        self.namespace = '/'.join(
+            p.decode() if isinstance(p, bytes) else p
+            for p in pub_msg.track_namespace
+        )
+        if self.trackname is None:
+            self.trackname = (
+                pub_msg.track_name.decode()
+                if isinstance(pub_msg.track_name, bytes)
+                else pub_msg.track_name
+            )
+            print(f"  Discovered: {self.fqtn}")
+
+        # Register track_alias so incoming data streams pass admission.
+        if hasattr(pub_msg, 'track_alias'):
+            self.track_alias = pub_msg.track_alias
+            self.session._track_aliases[
+                pub_msg.track_alias] = pub_msg.request_id
+
+        ok = PublishOk(
+            request_id=pub_msg.request_id,
+            forward=forward,
+            priority=128,
+            group_order=GroupOrder.ASCENDING,
+            filter_type=FilterType.LATEST_OBJECT,
+            parameters={},
+        )
+        logger.info(f"Track: PUBLISH_OK {self.fqtn} "
+                    f"alias={self.track_alias} forward={forward}")
+        self.session.send_control_message(ok.serialize())
 
         self.state = TrackState.SUBSCRIBED
         logger.info(f"Track: subscribed to {self.fqtn}")
@@ -582,6 +589,10 @@ class VideoTrack(PublishedTrack):
 
     # Typical frame sizes by resolution (bytes)
     PROFILES = {
+        "240p":  {"i_frame": 8_000,   "p_frame": 1_500,  "b_frame": 800},
+        "270p":  {"i_frame": 13_000,  "p_frame": 2_000,  "b_frame": 1_000},
+        "360p":  {"i_frame": 26_000,  "p_frame": 4_000,  "b_frame": 2_000},
+        "480p":  {"i_frame": 40_000,  "p_frame": 6_000,  "b_frame": 3_000},
         "720p":  {"i_frame": 80_000,  "p_frame": 12_000, "b_frame": 6_000},
         "1080p": {"i_frame": 200_000, "p_frame": 25_000, "b_frame": 10_000},
         "1440p": {"i_frame": 350_000, "p_frame": 40_000, "b_frame": 18_000},
@@ -671,14 +682,8 @@ class VideoTrack(PublishedTrack):
                                   frame_interval: float,
                                   report_interval: float = 5.0):
         """Generate video frames with variable I/B/P sizes."""
-        total_sent = 0
-        total_bytes = 0
-        total_groups = 0
         start_time = time.monotonic()
         last_report = start_time
-        iv_objects = 0
-        iv_bytes = 0
-        iv_groups = 0
         next_frame_time = time.monotonic()
         group_id = -1
         header = None
@@ -687,6 +692,7 @@ class VideoTrack(PublishedTrack):
 
         cur_obj_id = subgroup_id
         stream_id = session.open_uni_stream()
+        local_sent = 0
 
         # Pre-generate padding per frame type
         i_pad = b'\x49' * self.i_frame_size  # 'I'
@@ -697,8 +703,8 @@ class VideoTrack(PublishedTrack):
             while True:
                 if header is None or cur_obj_id >= self.group_size:
                     group_id += 1
-                    total_groups += 1
-                    iv_groups += 1
+                    self._total_groups += 1
+                    self._iv_groups += 1
                     cur_obj_id = subgroup_id
 
                     if header is not None:
@@ -761,27 +767,28 @@ class VideoTrack(PublishedTrack):
                 await session.stream_write_drain(
                     stream_id, buf.data)
                 session.transmit()
-                total_sent += 1
-                total_bytes += obj_bytes
-                iv_objects += 1
-                iv_bytes += obj_bytes
+                local_sent += 1
+                self._total_sent += 1
+                self._total_bytes += obj_bytes
+                self._iv_objects += 1
+                self._iv_bytes += obj_bytes
 
                 now = time.monotonic()
                 if report and now - last_report >= report_interval:
                     dt = now - last_report
                     elapsed = now - start_time
-                    obj_s = iv_objects / dt
-                    grp_s = iv_groups / dt
-                    mbps = (iv_bytes * 8) / (dt * 1e6)
+                    obj_s = self._iv_objects / dt
+                    grp_s = self._iv_groups / dt
+                    bps = (self._iv_bytes * 8) / dt
                     iv = f"{elapsed - dt:.0f}-{elapsed:.0f}s"
                     self._print_stats_header()
-                    grp_col = f"{total_groups} ({grp_s:.1f}/s)"
-                    obj_col = f"{total_sent:,} ({obj_s:.1f}/s)"
+                    grp_col = f"{self._total_groups} ({fmt_rate(grp_s)})"
+                    obj_col = f"{self._total_sent:,} ({fmt_rate(obj_s)})"
                     print(f"  {iv:<12}{grp_col:<18}"
-                          f"{obj_col:<22}{mbps:.2f} Mbps")
-                    iv_objects = 0
-                    iv_bytes = 0
-                    iv_groups = 0
+                          f"{obj_col:<22}{fmt_bps(bps)}")
+                    self._iv_objects = 0
+                    self._iv_bytes = 0
+                    self._iv_groups = 0
                     last_report = now
 
                 if paced:
@@ -790,18 +797,18 @@ class VideoTrack(PublishedTrack):
                         next_frame_time - time.monotonic())
                     await asyncio.sleep(sleep_time)
                 else:
-                    if total_sent % 64 == 0:
+                    if local_sent % 64 == 0:
                         await asyncio.sleep(0)
 
         except asyncio.CancelledError:
             dur = time.monotonic() - start_time
             if dur > 0 and report:
-                mbps = (total_bytes * 8) / (dur * 1e6)
-                obj_s = total_sent / dur
-                print(f"\n  Sent: {total_sent:,} objects, "
-                      f"{total_groups} GOPs, "
-                      f"{obj_s:.1f} obj/s, "
-                      f"{mbps:.2f} Mbps ({dur:.1f}s)")
+                bps = (self._total_bytes * 8) / dur
+                obj_s = self._total_sent / dur
+                print(f"\n  Sent: {self._total_sent:,} objects, "
+                      f"{self._total_groups} GOPs, "
+                      f"{fmt_rate(obj_s)}, "
+                      f"{fmt_bps(bps)} ({dur:.1f}s)")
             logger.info(f"VideoTrack: subgroup {subgroup_id} "
-                        f"sent {total_sent} objects")
+                        f"sent {local_sent} objects")
             raise
