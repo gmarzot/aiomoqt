@@ -2135,7 +2135,12 @@ class MOQTSession(QuicConnectionProtocol):
 
     async def _handle_publish_namepace_done(self, msg: PublishNamespaceDone) -> None:
         logger.info(f"MOQT event: handle {msg}")
-        # PublishNamespaceDone is a notification, no response required
+        # Publisher is releasing the namespace — for subscribers whose
+        # only interest is this namespace, that's a clean end-of-track
+        # signal. Close the session so bench tools exit promptly
+        # instead of hanging for the QUIC idle timeout.
+        self._close_session(SessionCloseCode.NO_ERROR,
+                            "publisher namespace done")
 
     async def _handle_publish_namepace_cancel(self, msg: PublishNamespaceCancel) -> None:
         logger.info(f"MOQT event: handle {msg}")
@@ -2150,13 +2155,14 @@ class MOQTSession(QuicConnectionProtocol):
                      f"request_id={msg.request_id} "
                      f"status={msg.status_code} "
                      f"streams={msg.stream_count}")
-        # Resolve if anyone is waiting, otherwise just log
         future = self._pending_requests.get(msg.request_id)
         if future and not future.done():
             future.set_result(msg)
-        # Publisher is done — close session gracefully
+        # Per spec, every SubscribeDone is terminal for that subscribe.
+        # Sessions with a single active subscribe (bench tools) treat
+        # it as a clean end-of-session signal.
         self._close_session(SessionCloseCode.NO_ERROR,
-                            "publisher done")
+                            f"subscribe done: {msg.status_code}")
 
     async def _handle_max_request_id(self, msg: MaxSubscribeId) -> None:
         logger.info(f"MOQT event: handle {msg}")

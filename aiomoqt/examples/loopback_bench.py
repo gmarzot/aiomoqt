@@ -78,7 +78,7 @@ def parse_args():
 
 
 def print_banner(args):
-    mode = f"STREAM x{args.streams}"
+    mode = f"SUBGROUP x{args.streams}"
     if args.rate > 0:
         rate_s = f"{args.rate}/s per stream"
     else:
@@ -168,7 +168,8 @@ async def run_subscriber(args, stats):
                 trackname="track",
                 on_object=stats.on_object,
             )
-            # d14 direct: explicit subscribe (no relay, no PUBLISH flow)
+            # Loopback server does not send PUBLISH; use direct SUBSCRIBE.
+            # Loopback passes explicit trackname → auto-routes to direct.
             await track.subscribe()
 
             print("  Subscriber connected, receiving...\n")

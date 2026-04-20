@@ -77,58 +77,128 @@ class TestPublishedTrack:
                           auth_token=b"custom")
         assert t.auth_token == b"custom"
 
-    def test_publish_d14(self):
-        """d14: sends PUBLISH_NAMESPACE + PUBLISH(forward=0)."""
-        async def _test():
-            session = MagicMock()
-            session.publish_namespace = AsyncMock(
-                return_value=MagicMock())
-            pub_response = MagicMock()
-            pub_response.track_alias = 0
-            pub_response.request_id = 1
-            session.publish = MagicMock(return_value=pub_response)
-            session.register_handler = MagicMock()
+    def _pub_session(self, track_alias=0, request_id=1):
+        """Mock session configured for PublishedTrack.publish() calls."""
+        session = MagicMock()
+        session.publish_namespace = AsyncMock(return_value=MagicMock())
+        pub_response = MagicMock()
+        pub_response.track_alias = track_alias
+        pub_response.request_id = request_id
+        session.publish = MagicMock(return_value=pub_response)
+        session.register_handler = MagicMock()
+        session.MOQT_D16_OVERRIDE_REGISTRY = {}
+        return session
 
+    # ----- Flow B: bare PUBLISH (default) -----
+
+    def test_publish_flow_b_default_d14(self):
+        """d14 default: Flow B — bare PUBLISH, no PUB_NS."""
+        async def _test():
+            session = self._pub_session()
             t = PublishedTrack(session, "bench", "track")
             with patch('aiomoqt.track.is_draft16_or_later',
                         return_value=False):
                 await t.publish()
-
-            session.publish_namespace.assert_called_once()
+            session.publish_namespace.assert_not_called()
             session.publish.assert_called_once_with(
                 namespace="bench", track_name="track", forward=0)
             assert t.state == TrackState.PUBLISHED
-            assert session.register_handler.call_count == 3
-
         asyncio.run(_test())
 
-    def test_publish_d16(self):
-        """d16: sends PUBLISH_NAMESPACE + PUBLISH(forward=0)
-        + registers REQUEST_UPDATE handler."""
+    def test_publish_flow_b_default_d16(self):
+        """d16 default: Flow B — bare PUBLISH, no PUB_NS; REQUEST_UPDATE
+        handler registered."""
         async def _test():
-            session = MagicMock()
-            session.publish_namespace = AsyncMock(
-                return_value=MagicMock())
-            pub_response = MagicMock()
-            pub_response.track_alias = 42
-            pub_response.request_id = 7
-            session.publish = MagicMock(return_value=pub_response)
-            session.register_handler = MagicMock()
-            session.MOQT_D16_OVERRIDE_REGISTRY = {}
-
+            session = self._pub_session(track_alias=42, request_id=7)
             t = PublishedTrack(session, "bench", "track")
             with patch('aiomoqt.track.is_draft16_or_later',
                         return_value=True):
                 await t.publish()
-
-            session.publish_namespace.assert_called_once()
-            session.publish.assert_called_once_with(
-                namespace="bench", track_name="track", forward=0)
+            session.publish_namespace.assert_not_called()
+            session.publish.assert_called_once()
             assert t.track_alias == 42
             assert t.request_id == 7
             assert t.state == TrackState.PUBLISHED
             assert 0x02 in session.MOQT_D16_OVERRIDE_REGISTRY
+        asyncio.run(_test())
 
+    # ----- Flow A: PUB_NS only -----
+
+    def test_publish_flow_a_d14(self):
+        """d14 Flow A: PUB_NS only, no PUBLISH; waits for SUBSCRIBE."""
+        async def _test():
+            session = self._pub_session()
+            t = PublishedTrack(session, "bench", "track")
+            with patch('aiomoqt.track.is_draft16_or_later',
+                        return_value=False):
+                await t.publish(announce_namespace=True,
+                                publish_track=False)
+            session.publish_namespace.assert_called_once()
+            session.publish.assert_not_called()
+            assert t.state == TrackState.ANNOUNCED
+        asyncio.run(_test())
+
+    def test_publish_flow_a_d16(self):
+        """d16 Flow A: PUB_NS only, no PUBLISH."""
+        async def _test():
+            session = self._pub_session()
+            t = PublishedTrack(session, "bench", "track")
+            with patch('aiomoqt.track.is_draft16_or_later',
+                        return_value=True):
+                await t.publish(announce_namespace=True,
+                                publish_track=False)
+            session.publish_namespace.assert_called_once()
+            session.publish.assert_not_called()
+            assert t.state == TrackState.ANNOUNCED
+        asyncio.run(_test())
+
+    # ----- Hybrid: both PUB_NS and PUBLISH -----
+
+    def test_publish_hybrid_d14(self):
+        """d14 hybrid: PUB_NS + PUBLISH (legacy relays that want both)."""
+        async def _test():
+            session = self._pub_session()
+            t = PublishedTrack(session, "bench", "track")
+            with patch('aiomoqt.track.is_draft16_or_later',
+                        return_value=False):
+                await t.publish(announce_namespace=True,
+                                publish_track=True)
+            session.publish_namespace.assert_called_once()
+            session.publish.assert_called_once()
+            assert t.state == TrackState.PUBLISHED
+        asyncio.run(_test())
+
+    def test_publish_hybrid_d16(self):
+        """d16 hybrid: PUB_NS + PUBLISH."""
+        async def _test():
+            session = self._pub_session()
+            t = PublishedTrack(session, "bench", "track")
+            with patch('aiomoqt.track.is_draft16_or_later',
+                        return_value=True):
+                await t.publish(announce_namespace=True,
+                                publish_track=True)
+            session.publish_namespace.assert_called_once()
+            session.publish.assert_called_once()
+            assert t.state == TrackState.PUBLISHED
+        asyncio.run(_test())
+
+    # ----- error cases -----
+
+    def test_publish_both_false_raises(self):
+        """publish() with both flags False is invalid."""
+        async def _test():
+            session = self._pub_session()
+            t = PublishedTrack(session, "bench", "track")
+            with patch('aiomoqt.track.is_draft16_or_later',
+                        return_value=True):
+                try:
+                    await t.publish(announce_namespace=False,
+                                    publish_track=False)
+                    assert False, "expected ValueError"
+                except ValueError:
+                    pass
+            session.publish_namespace.assert_not_called()
+            session.publish.assert_not_called()
         asyncio.run(_test())
 
 
@@ -151,14 +221,66 @@ class TestSubscribedTrack:
         t = SubscribedTrack(session, "bench", on_object=cb)
         assert t.on_object is cb
 
-    def test_subscribe_d14(self):
-        """d14 — subscribe_namespace + await_publish succeeds."""
+    # ----- Pathway A: direct SUBSCRIBE (explicit trackname) -----
+
+    def test_subscribe_d14_direct(self):
+        """d14 + explicit trackname → direct SUBSCRIBE, no namespace."""
+        async def _test():
+            session = MagicMock()
+            session.subscribe_namespace = AsyncMock(
+                return_value=MagicMock())
+            session.await_publish = AsyncMock(
+                return_value=MagicMock())
+            session.subscribe = AsyncMock(return_value=MagicMock())
+            session.on_object_received = None
+
+            t = SubscribedTrack(session, "bench",
+                                trackname="video", draft=14)
+            with patch('aiomoqt.track.is_draft16_or_later',
+                        return_value=False):
+                await t.subscribe()
+
+            session.subscribe.assert_called_once()
+            session.subscribe_namespace.assert_not_called()
+            session.await_publish.assert_not_called()
+            assert t.state == TrackState.SUBSCRIBED
+
+        asyncio.run(_test())
+
+    def test_subscribe_d16_direct(self):
+        """d16 + explicit trackname → direct SUBSCRIBE, no namespace."""
+        async def _test():
+            session = MagicMock()
+            session.subscribe_namespace = AsyncMock(
+                return_value=MagicMock())
+            session.await_publish = AsyncMock(
+                return_value=MagicMock())
+            session.subscribe = AsyncMock(return_value=MagicMock())
+            session.on_object_received = None
+
+            t = SubscribedTrack(session, "bench",
+                                trackname="video", draft=16)
+            with patch('aiomoqt.track.is_draft16_or_later',
+                        return_value=True):
+                await t.subscribe()
+
+            session.subscribe.assert_called_once()
+            session.subscribe_namespace.assert_not_called()
+            session.await_publish.assert_not_called()
+            assert t.state == TrackState.SUBSCRIBED
+
+        asyncio.run(_test())
+
+    # ----- Pathway B: namespace discovery (trackname=None) -----
+
+    def test_subscribe_d14_discover(self):
+        """d14 + trackname=None → subscribe_namespace, learn from PUBLISH."""
         async def _test():
             session = MagicMock()
             pub_msg = MagicMock(spec=[])
             pub_msg.track_namespace = (b"bench",)
-            pub_msg.track_name = b"video"
-            pub_msg.request_id = 7
+            pub_msg.track_name = b"discovered-d14"
+            pub_msg.request_id = 3
             pub_msg.forward = 0
             session.subscribe_namespace = AsyncMock(
                 return_value=MagicMock())
@@ -166,8 +288,8 @@ class TestSubscribedTrack:
             session.send_control_message = MagicMock()
             session.on_object_received = None
 
-            t = SubscribedTrack(session, "bench",
-                                trackname="video", draft=14)
+            t = SubscribedTrack(session, "bench", draft=14)
+            assert t.trackname is None
             with patch('aiomoqt.track.is_draft16_or_later',
                         return_value=False), \
                  patch('aiomoqt.track.PublishOk') as mock_ok:
@@ -176,56 +298,23 @@ class TestSubscribedTrack:
 
             session.subscribe_namespace.assert_called_once()
             session.await_publish.assert_called_once()
-            session.send_control_message.assert_called_once()
+            assert t.trackname == "discovered-d14"
             assert t.state == TrackState.SUBSCRIBED
 
         asyncio.run(_test())
 
-    def test_subscribe_d16_explicit_track(self):
-        """d16 — explicit trackname, PUBLISH discovery."""
+    def test_subscribe_d16_discover(self):
+        """d16 + trackname=None → subscribe_namespace, learn from PUBLISH."""
         async def _test():
             session = MagicMock()
             pub_msg = MagicMock(spec=[])
             pub_msg.track_namespace = (b"bench",)
-            pub_msg.track_name = b"video"
-            pub_msg.request_id = 5
-            pub_msg.forward = 0
-            session.subscribe_namespace = AsyncMock(
-                return_value=MagicMock())
-            session.await_publish = AsyncMock(
-                return_value=pub_msg)
-            session.send_control_message = MagicMock()
-            session.on_object_received = None
-
-            t = SubscribedTrack(session, "bench",
-                                trackname="video", draft=16)
-            with patch('aiomoqt.track.is_draft16_or_later',
-                        return_value=True), \
-                 patch('aiomoqt.track.PublishOk') as mock_ok:
-                mock_ok.return_value.serialize.return_value = MagicMock(data=b'')
-                await t.subscribe()
-
-            session.subscribe_namespace.assert_called_once()
-            session.await_publish.assert_called_once()
-            # Sent PUBLISH_OK
-            session.send_control_message.assert_called_once()
-            assert t.state == TrackState.SUBSCRIBED
-
-        asyncio.run(_test())
-
-    def test_subscribe_d16_auto_discover(self):
-        """d16 — auto-discover trackname from PUBLISH."""
-        async def _test():
-            session = MagicMock()
-            pub_msg = MagicMock(spec=[])
-            pub_msg.track_namespace = (b"bench",)
-            pub_msg.track_name = b"discovered-track"
+            pub_msg.track_name = b"discovered-d16"
             pub_msg.request_id = 10
             pub_msg.forward = 0
             session.subscribe_namespace = AsyncMock(
                 return_value=MagicMock())
-            session.await_publish = AsyncMock(
-                return_value=pub_msg)
+            session.await_publish = AsyncMock(return_value=pub_msg)
             session.send_control_message = MagicMock()
             session.on_object_received = None
 
@@ -237,25 +326,25 @@ class TestSubscribedTrack:
                 mock_ok.return_value.serialize.return_value = MagicMock(data=b'')
                 await t.subscribe()
 
-            assert t.trackname == "discovered-track"
+            session.subscribe_namespace.assert_called_once()
+            session.await_publish.assert_called_once()
+            assert t.trackname == "discovered-d16"
             assert t.state == TrackState.SUBSCRIBED
 
         asyncio.run(_test())
 
-    def test_subscribe_d16_discover_timeout(self):
-        """d16 — discovery timeout raises, no silent fallback."""
+    def test_subscribe_discover_timeout_raises(self):
+        """Discovery timeout raises, no silent fallback to direct."""
         async def _test():
             session = MagicMock()
             session.subscribe_namespace = AsyncMock(
                 return_value=MagicMock())
             session.await_publish = AsyncMock(
                 side_effect=asyncio.TimeoutError())
-            session.subscribe = AsyncMock(
-                return_value=MagicMock())
+            session.subscribe = AsyncMock(return_value=MagicMock())
             session.on_object_received = None
 
-            t = SubscribedTrack(session, "bench",
-                                trackname="video", draft=16)
+            t = SubscribedTrack(session, "bench", draft=16)
             with patch('aiomoqt.track.is_draft16_or_later',
                         return_value=True):
                 try:
@@ -266,7 +355,6 @@ class TestSubscribedTrack:
 
             session.subscribe_namespace.assert_called_once()
             session.await_publish.assert_called_once()
-            # No fallback direct SUBSCRIBE
             session.subscribe.assert_not_called()
 
         asyncio.run(_test())

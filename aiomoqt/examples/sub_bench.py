@@ -39,6 +39,8 @@ class BenchStats:
         self.report_interval = report_interval
         self.start_time: float = 0
         self.last_report_time: float = 0
+        self.first_object_time: float = 0
+        self.last_object_time: float = 0
 
         # Per-interval (reset each report)
         self.iv_objects: int = 0
@@ -132,6 +134,9 @@ class BenchStats:
         self.iv_bytes += size_bytes
         self.total_objects += 1
         self.total_bytes += size_bytes
+        if self.first_object_time == 0:
+            self.first_object_time = now
+        self.last_object_time = now
         gid = getattr(msg, 'group_id', group_id)
         if gid is not None:
             self.total_groups.add(gid)
@@ -202,8 +207,13 @@ class BenchStats:
         if dur <= 0:
             return
 
-        rate = self.total_objects / dur
-        mbps = (self.total_bytes * 8) / (dur * 1e6)
+        # Rate and throughput use the active window (first → last
+        # object received) so post-pub idle time doesn't dilute them.
+        active = (self.last_object_time - self.first_object_time
+                  if self.first_object_time else 0)
+        active = active if active > 0 else dur
+        rate = self.total_objects / active
+        mbps = (self.total_bytes * 8) / (active * 1e6)
         lat = self.all_latencies
         total_expected = self.total_objects + self.total_lost
         loss_pct = (
@@ -213,7 +223,8 @@ class BenchStats:
 
         print()
         print("═" * 56)
-        print(f"  aiomoqt-bench results  ({dur:.1f}s)")
+        print(f"  aiomoqt-bench results  ({active:.1f}s active "
+              f"/ {dur:.1f}s elapsed)")
         print("═" * 56)
         print(f"  Objects:     {self.total_objects:,}")
         print(f"  Bytes:       {self.total_bytes:,}")
@@ -276,7 +287,12 @@ examples:
         help='MoQT namespace (default: aiomoqt)')
     parser.add_argument(
         '--trackname', type=str, default=None,
-        help='MoQT track name (default: auto-discover from namespace)')
+        help='MoQT track name. Explicit → direct SUBSCRIBE. '
+             'Omit → SUBSCRIBE_NAMESPACE auto-discovery.')
+    parser.add_argument(
+        '--auth-token', type=str, default=None,
+        help='Send this token as AUTH_TOKEN parameter on SUBSCRIBE '
+             '(required by some relays)')
     parser.add_argument(
         '-t', '--duration', type=int, default=0,
         help='Duration in seconds (default: 30)')
@@ -341,6 +357,8 @@ async def run(args):
                     trackname=args.trackname,
                     draft=args.draft,
                     on_object=stats.on_object,
+                    auth_token=(args.auth_token.encode()
+                                if args.auth_token else None),
                 )
                 await track.subscribe()
                 print(f"  Subscribed to '{track.fqtn}', receiving...\n")
@@ -364,7 +382,6 @@ async def run(args):
 
 if __name__ == "__main__":
     try:
-        args = parse_args()
-        asyncio.run(run(args))
+        asyncio.run(run(parse_args()))
     except KeyboardInterrupt:
         print("\n  Interrupted.")

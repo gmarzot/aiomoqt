@@ -120,30 +120,39 @@ class PublishedTrack(Track):
         self._total_bytes = 0
         self._total_groups = 0
 
-    async def publish(self):
-        """Announce namespace and track to the relay.
+    async def publish(self, announce_namespace: bool = False,
+                      publish_track: bool = True):
+        """Announce this publisher to the relay.
 
-        Flow (d14 + d16):
-          1. PUBLISH_NAMESPACE → relay accepts namespace
-          2. PUBLISH(forward=0) → relay knows track exists
-          3. Wait for subscriber signal:
-             - PUBLISH_OK(forward=1): relay has subscribers, start now
-             - PUBLISH_OK(forward=0): no subscribers yet, wait
-             - SUBSCRIBE: relay forwarded a subscriber's subscribe
-             - SUBSCRIBE_UPDATE(forward=1): subscriber arrived later
-             - REQUEST_UPDATE(forward=1): d16 subscriber wants data
+        Three valid combinations (Alan: a publisher picks one flow):
+
+          announce_namespace=False, publish_track=True  (default, Flow B):
+            Send bare PUBLISH — relay caches the track, subscribers
+            can SUBSCRIBE directly or discover via SUBSCRIBE_NAMESPACE.
+
+          announce_namespace=True, publish_track=False  (Flow A):
+            Send PUB_NS only — publisher is the authority for the
+            namespace; relay routes unknown SUBSCRIBEs to this publisher.
+
+          announce_namespace=True, publish_track=True  (hybrid):
+            Rare; some relays want both. Breaks on CF d14 moq-rs.
         """
-        # 1. Publish namespace
-        await self.session.publish_namespace(
-            namespace=self.namespace,
-            parameters={ParamType.AUTH_TOKEN: self.auth_token},
-            wait_response=True,
-        )
-        self.state = TrackState.ANNOUNCED
-        logger.info(f"Track: announced namespace '{self.namespace}'")
+        if not (announce_namespace or publish_track):
+            raise ValueError(
+                "publish(): need at least one of "
+                "announce_namespace or publish_track")
 
-        # 2. Register handlers BEFORE sending PUBLISH so we don't
-        # miss a fast PUBLISH_OK(forward=1) or SUBSCRIBE.
+        if announce_namespace:
+            await self.session.publish_namespace(
+                namespace=self.namespace,
+                parameters={ParamType.AUTH_TOKEN: self.auth_token},
+                wait_response=True,
+            )
+            self.state = TrackState.ANNOUNCED
+            logger.info(f"Track: announced namespace '{self.namespace}'")
+
+        # Register handlers BEFORE sending PUBLISH (or waiting for
+        # SUBSCRIBE) so a fast relay response isn't missed.
         self.session.register_handler(
             MOQTMessageType.SUBSCRIBE, self._on_subscribe)
         self.session.register_handler(
@@ -159,20 +168,17 @@ class PublishedTrack(Track):
             self.session.MOQT_D16_OVERRIDE_REGISTRY[0x02] = (
                 RequestUpdate, _request_update_handler)
 
-        # 3. Publish track — announce availability (forward=0).
-        # Both d14 and d16: PUBLISH announces individual tracks.
-        # Relay responds with PUBLISH_OK. If forward=1 in the
-        # response, subscribers are waiting — start immediately.
-        pub_msg = self.session.publish(
-            namespace=self.namespace,
-            track_name=self.trackname,
-            forward=0,
-        )
-        self.track_alias = pub_msg.track_alias
-        self.request_id = pub_msg.request_id
-        self.state = TrackState.PUBLISHED
-        logger.info(f"Track: published {self.fqtn} "
-                     f"alias={self.track_alias}")
+        if publish_track:
+            pub_msg = self.session.publish(
+                namespace=self.namespace,
+                track_name=self.trackname,
+                forward=0,
+            )
+            self.track_alias = pub_msg.track_alias
+            self.request_id = pub_msg.request_id
+            self.state = TrackState.PUBLISHED
+            logger.info(f"Track: published {self.fqtn} "
+                         f"alias={self.track_alias}")
 
     async def _start_generating(self, session, trigger: str):
         """Start data generation if not already running."""
@@ -446,44 +452,42 @@ class SubscribedTrack(Track):
     def __init__(self, session, namespace: str, trackname: str = None,
                  draft: Optional[int] = None,
                  on_object: Optional[Callable] = None,
-                 report_interval: float = 5.0):
+                 report_interval: float = 5.0,
+                 auth_token: Optional[bytes] = None):
         super().__init__(session, namespace, trackname, draft=draft)
         self.on_object = on_object
         self.report_interval = report_interval
+        self.auth_token = auth_token
         self.publish_done: Optional[object] = None  # received PUBLISH_DONE
         self.completed = False  # True if track ended cleanly
 
     async def subscribe(self, timeout: float = 30.0,
                         forward: int = 1,
-                        subscribe_options: int = None,
-                        use_namespace: bool = True):
+                        subscribe_options: int = None):
         """Subscribe to the track.
 
-        Default flow: subscribe_namespace → await PUBLISH (optionally
-        filtered to self.trackname) → PUBLISH_OK(forward=1) → data flows.
-
-        With use_namespace=False, skip namespace subscription and send a
-        direct SUBSCRIBE for (self.namespace, self.trackname). Requires
-        self.trackname to be set.
+        Auto-routed on trackname presence:
+          - trackname explicit: direct SUBSCRIBE(namespace, trackname)
+          - trackname is None: SUBSCRIBE_NAMESPACE + await PUBLISH to
+            discover the trackname, then PUBLISH_OK(forward=1)
 
         Args:
             timeout: seconds to wait for PUBLISH announcement
             forward: forwarding preference (1=send objects, 0=hold)
             subscribe_options: d16 only — 0=PUBLISH, 1=NAMESPACE, 2=both
-            use_namespace: run the full namespace-discovery path (default)
         """
         if self.on_object:
             self.session.on_object_received = self.on_object
 
-        if not use_namespace:
-            if self.trackname is None:
-                raise ValueError(
-                    "use_namespace=False requires an explicit trackname")
+        if self.trackname is not None:
+            params = {}
+            if self.auth_token is not None:
+                params[ParamType.AUTH_TOKEN] = self.auth_token
             await self.session.subscribe(
                 namespace=self.namespace,
                 track_name=self.trackname,
                 forward=forward,
-                parameters={},
+                parameters=params,
                 wait_response=True,
             )
             self.state = TrackState.SUBSCRIBED
@@ -497,9 +501,12 @@ class SubscribedTrack(Track):
         ns_kwargs = {}
         if subscribe_options is not None and is_draft16_or_later():
             ns_kwargs['subscribe_options'] = subscribe_options
+        ns_params = {}
+        if self.auth_token is not None:
+            ns_params[ParamType.AUTH_TOKEN] = self.auth_token
         await self.session.subscribe_namespace(
             namespace_prefix=self.namespace,
-            parameters={},
+            parameters=ns_params,
             wait_response=True,
             **ns_kwargs,
         )

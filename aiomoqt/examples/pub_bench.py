@@ -60,6 +60,14 @@ examples:
                         help='Objects/sec per stream (0=max, default: max)')
     parser.add_argument('-t', '--duration', type=int, default=30,
                         help='Duration in seconds (default: 30)')
+    pub_mode = parser.add_mutually_exclusive_group()
+    pub_mode.add_argument('--pub-ns', action='store_true',
+                          help='Flow A: PUB_NS only, wait for SUBSCRIBE '
+                               '(no PUBLISH). Default is Flow B: bare '
+                               'PUBLISH.')
+    pub_mode.add_argument('--pub-both', action='store_true',
+                          help='Hybrid: PUB_NS + PUBLISH (legacy relays '
+                               'that want both; breaks on CF d14).')
     parser.add_argument('-d', '--debug', action='store_true')
     parser.add_argument('--keylogfile', type=str, default=None)
     parser.add_argument('-k', '--insecure', action='store_true',
@@ -79,7 +87,7 @@ examples:
 
 
 def print_banner(relay, args):
-    mode = "DATAGRAM" if args.datagram else f"STREAM x{args.streams}"
+    mode = "DATAGRAM" if args.datagram else f"SUBGROUP x{args.streams}"
     if args.rate > 0:
         n = 1 if args.datagram else args.streams
         mbps = args.object_size * args.rate * n * 8 / 1e6
@@ -136,7 +144,10 @@ async def run(args):
                 rate=args.rate,
                 draft=args.draft,
             )
-            await track.publish()
+            await track.publish(
+                announce_namespace=(args.pub_ns or args.pub_both),
+                publish_track=(not args.pub_ns or args.pub_both),
+            )
             print(f"  Published '{track.fqtn}', waiting for subscriber...")
 
             await track.wait_closed(timeout=args.duration)

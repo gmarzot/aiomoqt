@@ -26,6 +26,9 @@ from aiomoqt.utils.logger import set_log_level
 from aiomoqt.utils.url import parse_relay_url
 
 
+SUBSCRIBE_TIMEOUT = 30.0   # seconds to wait for SUBSCRIBE_OK / PUBLISH
+
+
 def _quiet_logging(debug: bool) -> None:
     """Silence aiomoqt INFO chatter in the parent process so the
     setup header and results stay readable. `-d` opts in to INFO."""
@@ -54,8 +57,8 @@ def parse_args():
                         help='Duration seconds (default: 30)')
     parser.add_argument('-k', '--insecure', action='store_true',
                         help='Skip TLS verification')
-    parser.add_argument('--draft', type=int, default=16,
-                        help='MoQT draft version (default: 16)')
+    parser.add_argument('--draft', type=int, default=None,
+                        help='MoQT draft version (default: negotiate)')
     parser.add_argument('--video', type=str, default=None,
                         choices=['240p', '270p', '360p', '480p',
                                  '720p', '1080p', '1440p', '4k'],
@@ -69,9 +72,13 @@ def parse_args():
                         help='Skip publisher, run subscribers only '
                              '(publisher must be running elsewhere on '
                              'the same namespace)')
-    parser.add_argument('-N', '--no-sub-ns', action='store_true',
-                        help='Skip subscribe_namespace; send direct '
-                             'SUBSCRIBE (requires --trackname)')
+    pub_mode = parser.add_mutually_exclusive_group()
+    pub_mode.add_argument('--pub-ns', action='store_true',
+                          help='Flow A: PUB_NS only (no PUBLISH). '
+                               'Default is Flow B: bare PUBLISH.')
+    pub_mode.add_argument('--pub-both', action='store_true',
+                          help='Hybrid: PUB_NS + PUBLISH. Breaks on '
+                               'CF d14 moq-rs.')
     parser.add_argument('-Q', '--force-quic', action='store_true',
                         help='Force raw QUIC')
     parser.add_argument('-d', '--debug', action='store_true',
@@ -130,7 +137,10 @@ def run_publisher(relay_url, namespace, trackname, args):
                     rate=args.rate,
                     draft=args.draft,
                 )
-            await track.publish()
+            await track.publish(
+                announce_namespace=(args.pub_ns or args.pub_both),
+                publish_track=(not args.pub_ns or args.pub_both),
+            )
             await track.wait_closed(timeout=args.duration + 10)
 
     try:
@@ -189,10 +199,7 @@ def run_subscriber(sub_id, relay_url, namespace, trackname, args,
                     draft=args.draft,
                     on_object=on_object,
                 )
-                await track.subscribe(
-                    timeout=30.0,
-                    use_namespace=not args.no_sub_ns,
-                )
+                await track.subscribe(timeout=SUBSCRIBE_TIMEOUT)
                 await track.wait_closed(timeout=args.duration)
                 if not track.completed:
                     stats['error'] = 'StreamReset'
@@ -224,11 +231,6 @@ def main():
 
     # Default-quiet aiomoqt logging in the parent; workers handle their own.
     _quiet_logging(args.debug)
-
-    if args.no_sub_ns and not args.trackname:
-        print("error: --no-sub-ns (-N) requires --trackname",
-              file=sys.stderr)
-        sys.exit(2)
 
     # Subs always auto-discover unless --trackname is explicit.
     # The embedded publisher (when not --no-pub) needs a concrete name;
