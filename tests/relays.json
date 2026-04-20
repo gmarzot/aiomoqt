@@ -1,0 +1,29 @@
+{
+  "_schema": {
+    "name":     "short id used in results table",
+    "urls":     "map of transport → URL; keys: raw-quic, h3-wt",
+    "drafts":   "list of MoQT draft numbers (14, 16)",
+    "pub_mode": "publisher messages: publish | publish-ns | publish-both",
+    "notes":    "freeform (optional)"
+  },
+  "relays": [
+    {
+      "name": "moqx-main",
+      "urls": {
+        "raw-quic": "moqt://moqx-main.ci.openmoq.org:4433",
+        "h3-wt":    "https://moqx-main.ci.openmoq.org:4433/moq-relay"
+      },
+      "drafts": [14, 16],
+      "pub_mode": "publish"
+    },
+    {
+      "name": "cloudflare-d14",
+      "urls": {
+        "raw-quic": "moqt://draft-14.cloudflare.mediaoverquic.com:443"
+      },
+      "drafts": [14],
+      "pub_mode": "both-publish",
+      "notes": "CF d14 moq-rs: publisher must send PUB_NS + PUBLISH"
+    }
+  ]
+}
