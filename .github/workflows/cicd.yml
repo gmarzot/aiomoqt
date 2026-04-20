@@ -27,6 +27,12 @@ jobs:
         python -m pip install --upgrade pip
         pip install pytest
         pip install -e .
+    - name: Generate self-signed cert for loopback
+      run: |
+        mkdir -p certs
+        openssl req -x509 -newkey rsa:2048 -nodes \
+          -keyout certs/key.pem -out certs/cert.pem \
+          -days 1 -subj "/CN=localhost"
     - name: Run unit + integration tiers
       run: python tests/release-regression-test.py --test-tier unit --test-tier integration
 
