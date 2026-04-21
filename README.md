@@ -260,7 +260,7 @@ Error codes are validated to spec-conformant values
 | Meta moxygen | d16 | QUIC | 6/6 | 3/3 |
 | Meta moxygen | d16 | H3/WT | 6/6 | 3/3 |
 | Cloudflare moq-rs | d14 | QUIC | 5/6 | 3/3 |
-| Cloudflare moq-rs (draft-16, manish) | d16 | QUIC | 6/6 | unverified |
+| Cloudflare moq-rs (d16 interop branch) | d16 | QUIC | 6/6 | unverified |
 | Red5 Pro | d14 | H3/WT | 6/6 | unverified |
 | Red5 Pro | d16 | H3/WT | 6/6 | unverified |
 | Quicr libquicr | d14 | QUIC | 5/6 | 3/3 |
