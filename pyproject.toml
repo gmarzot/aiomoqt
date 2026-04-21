@@ -9,7 +9,6 @@ authors = [
     { name = "Giovanni Marzot", email = "gmarzot@marzresearch.net" }
 ]
 dependencies = [
-    "asyncio>=3.4.3",
     "certifi",
     "qh3>=1.7.0",
     "sortedcontainers>=2.4.0",
@@ -45,8 +44,9 @@ ignore = ["E501"]  # line length handled by formatter
 requires = ["setuptools>=45", "setuptools_scm[toml]>=6.2"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools]
-packages = ["aiomoqt"]
+[tool.setuptools.packages.find]
+include = ["aiomoqt*"]
+exclude = ["aiomoqt.tests*"]
 
 [tool.setuptools_scm]
 

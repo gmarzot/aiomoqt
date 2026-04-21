@@ -1,5 +1,6 @@
 {
     "recommendations": [
-        "ms-python.python", // Official Python extension
+        "ms-python.python",
+        "charliermarsh.ruff"
     ]
 }

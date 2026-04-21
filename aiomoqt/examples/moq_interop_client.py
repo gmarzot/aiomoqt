@@ -13,24 +13,13 @@ import logging
 import os
 import sys
 import time
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 from urllib.parse import urlparse
 
-from aiomoqt.types import (
-    MOQTMessageType, ParamType, FilterType, GroupOrder,
-    SessionCloseCode, MOQTException,
-    MOQT_VERSION_DRAFT14, MOQT_VERSION_DRAFT16,
-)
-from aiomoqt.types import MOQTRequestError
-from aiomoqt.messages import (
-    SubscribeError, SubscribeOk,
-    PublishNamespaceOk, PublishNamespaceError,
-    SubscribeNamespaceError,
-    RequestOk, RequestError,
-)
+from aiomoqt.types import ParamType, FetchType, MOQTRequestError
 from aiomoqt.client import MOQTClient
-from aiomoqt.utils.logger import get_logger, set_log_level
+from aiomoqt.utils.logger import set_log_level
+
 
 def _unique_suffix():
     """Short hex timestamp for unique namespace/track per run."""
@@ -39,7 +28,7 @@ def _unique_suffix():
 INTEROP_NAMESPACE = f"moq-test/{_unique_suffix()}/interop"
 INTEROP_TRACK = f"track-{_unique_suffix()}"
 
-ALL_TESTS = [
+STANDARD_TESTS = [
     "setup-only",
     "announce-only",
     "publish-namespace-done",
@@ -375,7 +364,7 @@ async def test_subscribe_before_announce(host, port, endpoint, use_quic,
                     await pub_session.client_session_init()
                     pub_cid = _get_connection_id(pub_session)
 
-                    pub_response = await pub_session.publish_namespace(
+                    await pub_session.publish_namespace(
                         namespace=INTEROP_NAMESPACE,
                         parameters={ParamType.AUTH_TOKEN: b"interop-test"},
                         wait_response=True,
@@ -421,6 +410,86 @@ async def test_subscribe_before_announce(host, port, endpoint, use_quic,
         )
 
 
+async def test_fetch(host, port, endpoint, use_quic, tls_disable_verify,
+                     debug, draft_version=None, timeout=3.0) -> TestResult:
+    """FETCH probe: send a standalone FETCH; relay handles if it responds
+    with FETCH_OK or structured FETCH_ERROR. Timeout/close = fail."""
+    t0 = time.monotonic()
+    client = _make_client(host, port, endpoint, use_quic,
+                          tls_disable_verify, debug,
+                          draft_version=draft_version)
+    try:
+        async with asyncio.timeout(timeout):
+            async with client.connect() as session:
+                await session.client_session_init()
+                cid = _get_connection_id(session)
+                try:
+                    await session.fetch(
+                        namespace=INTEROP_NAMESPACE,
+                        track_name=INTEROP_TRACK,
+                        start_group=0, start_object=0,
+                        end_group=0, end_object=0,
+                        wait_response=True,
+                    )
+                    msg = "FETCH_OK received"
+                except MOQTRequestError as e:
+                    msg = f"FETCH_ERROR (valid): code={e.error_code}"
+                session.close()
+        return TestResult(
+            name="fetch", passed=True,
+            duration_ms=(time.monotonic() - t0) * 1000,
+            connection_id=cid, message=msg,
+        )
+    except Exception as e:
+        return TestResult(
+            name="fetch", passed=False,
+            duration_ms=(time.monotonic() - t0) * 1000,
+            message=f"Failed: {e}",
+            expected="FETCH_OK or FETCH_ERROR",
+            received=str(e),
+        )
+
+
+async def test_join(host, port, endpoint, use_quic, tls_disable_verify,
+                    debug, draft_version=None, timeout=3.0) -> TestResult:
+    """JOIN probe: send SUBSCRIBE + JOINING_FETCH(RELATIVE, start=0).
+    Relay handles if it responds (OK or structured error). Timeout = fail."""
+    t0 = time.monotonic()
+    client = _make_client(host, port, endpoint, use_quic,
+                          tls_disable_verify, debug,
+                          draft_version=draft_version)
+    try:
+        async with asyncio.timeout(timeout):
+            async with client.connect() as session:
+                await session.client_session_init()
+                cid = _get_connection_id(session)
+                try:
+                    await session.join(
+                        namespace=INTEROP_NAMESPACE,
+                        track_name=INTEROP_TRACK,
+                        fetch_type=FetchType.RELATIVE_JOINING,
+                        joining_start=0,
+                        wait_response=True,
+                    )
+                    msg = "SUBSCRIBE_OK + FETCH_OK received"
+                except MOQTRequestError as e:
+                    msg = f"structured error (valid): code={e.error_code}"
+                session.close()
+        return TestResult(
+            name="join", passed=True,
+            duration_ms=(time.monotonic() - t0) * 1000,
+            connection_id=cid, message=msg,
+        )
+    except Exception as e:
+        return TestResult(
+            name="join", passed=False,
+            duration_ms=(time.monotonic() - t0) * 1000,
+            message=f"Failed: {e}",
+            expected="SUBSCRIBE_OK + FETCH_OK or structured error",
+            received=str(e),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Test dispatch
 # ---------------------------------------------------------------------------
@@ -432,6 +501,8 @@ TEST_FUNCTIONS = {
     "subscribe-error": test_subscribe_error,
     "announce-subscribe": test_announce_subscribe,
     "subscribe-before-announce": test_subscribe_before_announce,
+    "fetch": test_fetch,
+    "join": test_join,
 }
 
 
@@ -509,7 +580,7 @@ def main():
     args = parse_args()
 
     if args.list:
-        for name in ALL_TESTS:
+        for name in TEST_FUNCTIONS:
             print(name)
         sys.exit(0)
 
@@ -534,9 +605,14 @@ def main():
 
     # Select tests
     if args.test:
+        if args.test not in TEST_FUNCTIONS:
+            print("TAP version 14")
+            print("1..1")
+            print(f"not ok 1 - {args.test} # SKIP unsupported test case")
+            sys.exit(127)
         tests = [args.test]
     else:
-        tests = ALL_TESTS
+        tests = STANDARD_TESTS
 
     reporter = asyncio.run(
         run_tests(tests, host, port, endpoint, use_quic,

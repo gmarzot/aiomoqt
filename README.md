@@ -235,9 +235,10 @@ python -m aiomoqt.examples.server_example \
 | `relay_bench.py` | Combined pub/sub in one process |
 | `multi_sub_bench.py` | 1 publisher, N subscribers in one process |
 | `loopback_bench.py` | Local loopback (no relay) |
+| `adaptive_bench.py` | Ramps rate until buffer growth; loopback or relay |
 | `server_example.py` | WebTransport server (origin) |
 | `relay_probe.py` | Relay version probe (draft-14/16) |
-| `moq_interop_client.py` | Interop test client (6 test cases, TAP14) |
+| `moq_interop_client.py` | Interop test client (TAP v14 out; 6 standard + `fetch`/`join`) |
 
 ## Interop Test Results
 

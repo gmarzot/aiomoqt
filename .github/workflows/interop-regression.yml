@@ -4,6 +4,9 @@ name: Interop regression
 # tests/relays.json. It is not run on every PR because external
 # availability is outside our control. Trigger manually from the
 # Actions tab for release validation, or let the weekly schedule run it.
+#
+# workflow_dispatch is restricted to repo collaborators with write access
+# by default, so the button is not exposed to fork PRs or random viewers.
 
 on:
   workflow_dispatch:
@@ -14,11 +17,11 @@ jobs:
   interop:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
       with:
         fetch-depth: 0
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: "3.14"
     - name: Install dependencies

@@ -7,24 +7,31 @@ avoid relay cache collisions.
 
 ## Automated runner
 
-`tests/release-regression-test.py` executes three tiers:
+`tests/release-regression-test.py` executes four tiers:
 
-- **unit**:        `pytest`, `test_rebuf` — pure Python, no network
-- **integration**: `loopback` — local pub/sub over QUIC, no relay
-- **interop**:     `relay-smoke`, `multi-sub` × each relay in
-                   `tests/relays.json` × each supported transport / draft
+- **unit**:        `buffer`, `message`, `track` — pure Python, no network
+- **integration**: `loopback-setup`, `loopback-pub-sub`, `loopback-join`,
+                   `loopback-fetch` — local pub/sub over QUIC, no relay
+- **interop**:     `relay-ctrl-msg`, `relay-pub-sub`, `relay-join`,
+                   `relay-fetch` × each relay in `tests/relays.json`
+                   × each supported transport / draft
+- **bench**:       `loopback-adaptive-bench` — manual dispatch only
+                   (not PR-gated; measures host throughput ceiling)
 
 ```bash
-# full matrix (both tiers, every relay)
-python tests/release-regression-test.py
+# full unit + integration (CI path)
+python tests/release-regression-test.py --test-tier unit --test-tier integration
 
 # tier selection (repeatable)
 python tests/release-regression-test.py --test-tier unit
 python tests/release-regression-test.py --test-tier interop
 
 # individual suite (repeatable; ignores tier grouping)
-python tests/release-regression-test.py --test-suite pytest
-python tests/release-regression-test.py --test-suite loopback --test-suite relay-smoke
+python tests/release-regression-test.py --test-suite message
+python tests/release-regression-test.py --test-suite loopback-pub-sub --test-suite relay-ctrl-msg
+
+# interop runs relays in parallel; tune concurrency
+python tests/release-regression-test.py --test-tier interop --interop-parallel 4
 
 # interop tier scoped to one relay from the catalog
 python tests/release-regression-test.py --test-tier interop --only moqx-main
@@ -34,8 +41,9 @@ python tests/release-regression-test.py --test-tier interop --only cloudflare-d1
 python tests/release-regression-test.py --catalog /path/to/relays.json
 ```
 
-Exit 0 iff every test passed. Per-test logs land in a temp directory
-printed at start/end of the run.
+Exit 0 iff every test passed. `[skip]` suites (per-relay `disabled_suites`)
+do not count. Per-test logs land in a temp directory printed at start/end
+of the run.
 
 To add a relay to the catalog, edit `tests/relays.json`:
 
@@ -47,7 +55,9 @@ To add a relay to the catalog, edit `tests/relays.json`:
     "h3-wt":    "https://host:port/endpoint"
   },
   "drafts": [14, 16],
-  "pub_mode": "publish"
+  "pub_mode": "publish",
+  "disabled_suites": ["relay-join", "relay-fetch"],
+  "notes": "freeform"
 }
 ```
 
@@ -55,6 +65,9 @@ To add a relay to the catalog, edit `tests/relays.json`:
 `publish` (default, sends PUBLISH only), `publish-ns` (PUBLISH_NAMESPACE
 only, waits for SUBSCRIBE), or `publish-both` (both messages; required
 by Cloudflare d14 moq-rs).
+
+`disabled_suites` lists interop suite names that should skip for this
+relay (most relays do not implement `relay-join` / `relay-fetch` yet).
 
 Sections below document the underlying commands for manual runs.
 
@@ -69,7 +82,8 @@ A local moqx relay and a remote one accessible at
 pytest aiomoqt/tests/ -v
 ```
 
-Expected: all pass (156+ tests including track module)
+Expected: all pass (messages + track + loopback-setup + loopback-join +
+loopback-fetch).
 
 ## 2. Buffer Reassembly Tests
 
@@ -78,6 +92,16 @@ python tests/test_rebuf.py
 ```
 
 Expected: 6/6 pass
+
+## 2a. Adaptive Throughput Bench (manual)
+
+```bash
+python -m aiomoqt.examples.adaptive_bench --ramp 10,5,10,200
+```
+
+Ramps rate until buffer growth is observed. Reports the last stable
+rate. Use `-r <url> -k` for relay mode. Not in PR CI (variable on
+shared runners).
 
 ## 3. Interop Tests (moqx-000 remote)
 

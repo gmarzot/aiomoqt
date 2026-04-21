@@ -1,22 +1,31 @@
 #!/usr/bin/env python3
 """aiomoqt release regression bank.
 
-Runs unit tests plus a live test matrix against every relay in
-tests/relays.py (each relay × supported transport × supported draft).
+Runs unit, integration, interop, and bench tiers against a relay catalog.
+Each suite is a discrete test with its own status line; tiers group them.
 
 Usage:
     cd ~/Projects/moq/aiomoqt
-    tests/release-regression.py
 
-    # Limit to one relay:
-    tests/release-regression.py --only moqx-main
-    tests/release-regression.py --only cloudflare-d14
+    # CI path: unit + integration (no network)
+    tests/release-regression-test.py --test-tier unit --test-tier integration
 
-Exit 0 iff every test passed.
+    # Interop across every relay in catalog, 4 relays in parallel
+    tests/release-regression-test.py --test-tier interop --interop-parallel 4
+
+    # Limit to one relay
+    tests/release-regression-test.py --only moqx-main
+    tests/release-regression-test.py --only cloudflare-d14
+
+    # Adaptive throughput bench (manual dispatch only)
+    tests/release-regression-test.py --test-tier bench
+
+Exit 0 iff every test passed. `[skip]` suites don't count.
 """
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import re
 import subprocess
@@ -26,16 +35,13 @@ from pathlib import Path
 
 DEFAULT_CATALOG = Path(__file__).parent / "relays.json"
 
-# Tiers group suites by scope. The CLI accepts either a tier name
-# (runs every suite in that tier) or a specific suite name.
-#   unit        — pure-Python unit tests, no network
-#   integration — local pub/sub over QUIC (loopback, no relay)
-#   interop     — external relay matrix (relay-smoke + multi-sub per
-#                 catalog entry × transport × draft)
 TIERS = {
-    "unit":        ["pytest", "test_rebuf"],
-    "integration": ["loopback"],
-    "interop":     ["relay-smoke", "multi-sub"],
+    "unit":        ["buffer", "message", "track"],
+    "integration": ["loopback-setup", "loopback-pub-sub",
+                    "loopback-join", "loopback-fetch"],
+    "interop":     ["relay-ctrl-msg", "relay-pub-sub",
+                    "relay-join", "relay-fetch"],
+    "bench":       ["loopback-adaptive-bench"],
 }
 TIER_CHOICES = tuple(TIERS.keys())
 SUITE_CHOICES = tuple(s for suites in TIERS.values() for s in suites)
@@ -44,16 +50,23 @@ MULTI_SUB_ARGS_COMMON = [
     "-n", "3", "-s", "1024", "-r", "30", "-g", "60", "-t", "30", "-k",
 ]
 PUB_MODE_FLAGS = {
-    "publish":      [],                 # sends only PUBLISH
-    "publish-ns":   ["--pub-ns"],       # sends only PUB_NS
-    "publish-both": ["--pub-both"],     # sends both
+    "publish":      [],
+    "publish-ns":   ["--pub-ns"],
+    "publish-both": ["--pub-both"],
 }
 
 
 def _host(url: str) -> str:
-    # Extract host:port part for compact labels.
     m = re.match(r"^[a-z]+://([^/]+)", url)
     return m.group(1) if m else url
+
+
+def _relay_host(relay: dict) -> str:
+    """Pick a representative host:port for a relay catalog entry."""
+    for transport in ("raw-quic", "h3-wt"):
+        if transport in relay.get("urls", {}):
+            return _host(relay["urls"][transport])
+    return "(no url)"
 
 
 def _run(cmd: list[str], log: Path, timeout: int) -> tuple[bool, str]:
@@ -68,19 +81,21 @@ def _run(cmd: list[str], log: Path, timeout: int) -> tuple[bool, str]:
     return True, "\n".join(tail)
 
 
-def _pytest(log_dir: Path) -> tuple[str, str]:
-    log = log_dir / "pytest.log"
-    ok, _ = _run(["pytest", "-q"], log, 180)
+# ---------------------------------------------------------------------------
+# Unit-tier runners
+# ---------------------------------------------------------------------------
+def _pytest_file(test_file: str, log: Path) -> tuple[str, str]:
+    ok, _ = _run(["pytest", "-q", test_file], log, 180)
     if not ok:
         return "FAIL", "timeout"
     text = log.read_text().strip()
     last = text.splitlines()[-1] if text else ""
     passed = "passed" in last and "failed" not in last
-    return ("PASS" if passed else "FAIL"), last
+    return ("PASS" if passed else "FAIL"), last or "(no summary)"
 
 
-def _rebuf(log_dir: Path) -> tuple[str, str]:
-    log = log_dir / "rebuf.log"
+def _buffer(log_dir: Path) -> tuple[str, str]:
+    log = log_dir / "buffer.log"
     ok, _ = _run(["python", "tests/test_rebuf.py"], log, 60)
     text = log.read_text()
     m = re.search(r"(\d+) passed,\s*(\d+) failed", text)
@@ -89,8 +104,26 @@ def _rebuf(log_dir: Path) -> tuple[str, str]:
     return ("PASS" if passed else "FAIL"), summary
 
 
-def _loopback(log_dir: Path) -> tuple[str, str]:
-    log = log_dir / "loopback.log"
+def _message(log_dir: Path) -> tuple[str, str]:
+    return _pytest_file("aiomoqt/tests/test_messages.py",
+                        log_dir / "message.log")
+
+
+def _track(log_dir: Path) -> tuple[str, str]:
+    return _pytest_file("aiomoqt/tests/test_track.py",
+                        log_dir / "track.log")
+
+
+# ---------------------------------------------------------------------------
+# Integration-tier runners
+# ---------------------------------------------------------------------------
+def _loopback_setup(log_dir: Path) -> tuple[str, str]:
+    return _pytest_file("aiomoqt/tests/test_loopback_setup.py",
+                        log_dir / "loopback-setup.log")
+
+
+def _loopback_pub_sub(log_dir: Path) -> tuple[str, str]:
+    log = log_dir / "loopback-pub-sub.log"
     cmd = [
         "python", "-m", "aiomoqt.examples.loopback_bench",
         "-P", "4", "-s", "16384", "-r", "60", "-t", "10",
@@ -98,12 +131,25 @@ def _loopback(log_dir: Path) -> tuple[str, str]:
     ok, _ = _run(cmd, log, 40)
     text = log.read_text()
     m = re.search(r"Throughput:\s+([\d.]+)\s*Mbps", text)
-    no_loss = "Lost:" in text and "Lost:" in text and "Lost:        0 (0.00%)" in text
+    no_loss = "Lost:        0 (0.00%)" in text
     tput = m.group(1) if m else "?"
     return ("PASS" if ok and no_loss else "FAIL"), f"{tput} Mbps"
 
 
-def _smoke(url: str, draft: int, log: Path) -> tuple[str, str]:
+def _loopback_join(log_dir: Path) -> tuple[str, str]:
+    return _pytest_file("aiomoqt/tests/test_loopback_join.py",
+                        log_dir / "loopback-join.log")
+
+
+def _loopback_fetch(log_dir: Path) -> tuple[str, str]:
+    return _pytest_file("aiomoqt/tests/test_loopback_fetch.py",
+                        log_dir / "loopback-fetch.log")
+
+
+# ---------------------------------------------------------------------------
+# Interop-tier runners (per relay × transport × draft)
+# ---------------------------------------------------------------------------
+def _relay_ctrl_msg(url: str, draft: int, log: Path) -> tuple[str, str]:
     cmd = ["python", "-m", "aiomoqt.examples.moq_interop_client",
            "-r", url, "--draft", str(draft)]
     ok, _ = _run(cmd, log, 90)
@@ -114,8 +160,8 @@ def _smoke(url: str, draft: int, log: Path) -> tuple[str, str]:
     return ("PASS" if ok_count == 6 else "FAIL"), f"{ok_count}/6"
 
 
-def _multi_sub(url: str, draft: int, pub_mode: str, log: Path,
-               trackname: str) -> tuple[str, str]:
+def _relay_pub_sub(url: str, draft: int, pub_mode: str, log: Path,
+                   trackname: str) -> tuple[str, str]:
     cmd = ["python", "-m", "aiomoqt.examples.multi_sub_bench",
            url, *MULTI_SUB_ARGS_COMMON, "--draft", str(draft),
            "--trackname", trackname, *PUB_MODE_FLAGS[pub_mode]]
@@ -130,6 +176,128 @@ def _multi_sub(url: str, draft: int, pub_mode: str, log: Path,
     return ("PASS" if got == want else "FAIL"), f"{got}/{want} ok"
 
 
+def _relay_tap_case(url: str, draft: int, case: str,
+                    log: Path) -> tuple[str, str]:
+    cmd = ["python", "-m", "aiomoqt.examples.moq_interop_client",
+           "-r", url, "--draft", str(draft), "-t", case]
+    ok, _ = _run(cmd, log, 90)
+    if not ok:
+        return "FAIL", "timeout"
+    text = log.read_text()
+    # TAP line for a single-case run: "ok 1 - <case>" or "not ok 1 - ..."
+    if re.search(rf"^ok 1 - {re.escape(case)}", text, re.MULTILINE):
+        return "PASS", "ok"
+    last = text.splitlines()[-1] if text else "no output"
+    return "FAIL", last
+
+
+def _relay_join(url: str, draft: int, log: Path) -> tuple[str, str]:
+    return _relay_tap_case(url, draft, "join", log)
+
+
+def _relay_fetch(url: str, draft: int, log: Path) -> tuple[str, str]:
+    return _relay_tap_case(url, draft, "fetch", log)
+
+
+# ---------------------------------------------------------------------------
+# Bench-tier runners
+# ---------------------------------------------------------------------------
+def _loopback_adaptive_bench(log_dir: Path) -> tuple[str, str]:
+    log = log_dir / "loopback-adaptive-bench.log"
+    cmd = ["python", "-m", "aiomoqt.examples.adaptive_bench",
+           "--ramp", "10,5,10,200"]
+    ok, _ = _run(cmd, log, 300)
+    if not ok:
+        return "FAIL", "timeout"
+    text = log.read_text()
+    m = re.search(r"Ceiling:\s+([\d.]+)\s*Mbps\s*\(([^)]+)\)", text)
+    if m:
+        return "PASS", f"{m.group(1)} Mbps ceiling ({m.group(2)})"
+    m = re.search(r"No ceiling up to\s+([\d.]+)\s*Mbps", text)
+    if m:
+        return "PASS", f"no ceiling to {m.group(1)} Mbps"
+    return "FAIL", "(no ceiling summary)"
+
+
+# ---------------------------------------------------------------------------
+# Record / print helpers
+# ---------------------------------------------------------------------------
+# Result tuple: (status, test_label, detail, log_path)
+#   status ∈ {"PASS", "FAIL", "SKIP"}
+Result = tuple[str, str, str, Path]
+
+
+def _marker(status: str) -> str:
+    return {"PASS": "[✓]  ", "FAIL": "[✗]  ", "SKIP": "[skip]"}[status]
+
+
+def _print_result(res: Result) -> None:
+    status, test, detail, _ = res
+    print(f"  {_marker(status)} {test:<34} {detail}")
+
+
+# ---------------------------------------------------------------------------
+# Per-relay matrix runner (one worker of ThreadPoolExecutor)
+# ---------------------------------------------------------------------------
+def _run_relay_matrix(relay: dict, enabled: set[str],
+                      log_dir: Path) -> list[Result]:
+    results: list[Result] = []
+    disabled = set(relay.get("disabled_suites", []))
+    pub_mode = relay.get("pub_mode", "publish")
+
+    for transport, url in relay["urls"].items():
+        for draft in relay["drafts"]:
+            tag = f"{transport}/d{draft}"
+            slug = f"{relay['name']}_{transport}_d{draft}"
+
+            if "relay-ctrl-msg" in enabled:
+                if "relay-ctrl-msg" in disabled:
+                    results.append(("SKIP", f"relay-ctrl-msg {tag}",
+                                    f"(disabled: {relay.get('notes', 'not supported')})",
+                                    Path("/dev/null")))
+                else:
+                    log = log_dir / f"relay-ctrl-msg_{slug}.log"
+                    status, detail = _relay_ctrl_msg(url, draft, log)
+                    results.append((status, f"relay-ctrl-msg {tag}", detail, log))
+
+            if "relay-pub-sub" in enabled:
+                if "relay-pub-sub" in disabled:
+                    results.append(("SKIP", f"relay-pub-sub  {tag}",
+                                    f"(disabled: {relay.get('notes', 'not supported')})",
+                                    Path("/dev/null")))
+                else:
+                    tn = f"rr-{relay['name']}-{draft}"
+                    log = log_dir / f"relay-pub-sub_{slug}.log"
+                    status, detail = _relay_pub_sub(url, draft, pub_mode, log, tn)
+                    results.append((status, f"relay-pub-sub  {tag} [{pub_mode}]",
+                                    detail, log))
+
+            if "relay-join" in enabled:
+                if "relay-join" in disabled:
+                    results.append(("SKIP", f"relay-join     {tag}",
+                                    "(disabled: JOIN not supported)",
+                                    Path("/dev/null")))
+                else:
+                    log = log_dir / f"relay-join_{slug}.log"
+                    status, detail = _relay_join(url, draft, log)
+                    results.append((status, f"relay-join     {tag}", detail, log))
+
+            if "relay-fetch" in enabled:
+                if "relay-fetch" in disabled:
+                    results.append(("SKIP", f"relay-fetch    {tag}",
+                                    "(disabled: FETCH not supported)",
+                                    Path("/dev/null")))
+                else:
+                    log = log_dir / f"relay-fetch_{slug}.log"
+                    status, detail = _relay_fetch(url, draft, log)
+                    results.append((status, f"relay-fetch    {tag}", detail, log))
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--test-tier", action="append", default=[],
@@ -149,9 +317,11 @@ def main() -> int:
                     help=f"relay catalog JSON (default: {DEFAULT_CATALOG})")
     ap.add_argument("--log-dir", default=None,
                     help="directory for per-test logs (default: tmp)")
+    ap.add_argument("--interop-parallel", type=int, default=4,
+                    metavar="N", help="relays to run concurrently in the "
+                                      "interop tier (default: 4)")
     args = ap.parse_args()
 
-    # Resolve which suites to run.
     if args.test_tiers or args.test_suites:
         enabled: set[str] = set(args.test_suites)
         for t in args.test_tiers:
@@ -175,68 +345,98 @@ def main() -> int:
               file=sys.stderr)
         return 2
 
-    # (status, test, detail, log_path)
-    results: list[tuple[str, str, str, Path]] = []
+    results: list[Result] = []
 
-    def record(result, test, log_path):
-        status, detail = result
-        marker = "✓" if status == "PASS" else "✗"
-        print(f"  [{marker}] {test:<40} {detail}")
-        results.append((status, test, detail, log_path))
+    def record_and_print(res: Result) -> None:
+        _print_result(res)
+        results.append(res)
 
     # --- unit tier ---
     if enabled & set(TIERS["unit"]):
-        print("\n== unit tier ==")
-        if "pytest" in enabled:
-            record(_pytest(log_dir), "pytest",
-                   log_dir / "pytest.log")
-        if "test_rebuf" in enabled:
-            record(_rebuf(log_dir), "test_rebuf",
-                   log_dir / "rebuf.log")
+        print("\n== unit ==")
+        if "buffer" in enabled:
+            status, detail = _buffer(log_dir)
+            record_and_print((status, "buffer", detail,
+                              log_dir / "buffer.log"))
+        if "message" in enabled:
+            status, detail = _message(log_dir)
+            record_and_print((status, "message", detail,
+                              log_dir / "message.log"))
+        if "track" in enabled:
+            status, detail = _track(log_dir)
+            record_and_print((status, "track", detail,
+                              log_dir / "track.log"))
 
     # --- integration tier ---
     if enabled & set(TIERS["integration"]):
-        print("\n== integration tier ==")
-        if "loopback" in enabled:
-            record(_loopback(log_dir), "loopback",
-                   log_dir / "loopback.log")
+        print("\n== integration ==")
+        if "loopback-setup" in enabled:
+            status, detail = _loopback_setup(log_dir)
+            record_and_print((status, "loopback-setup", detail,
+                              log_dir / "loopback-setup.log"))
+        if "loopback-pub-sub" in enabled:
+            status, detail = _loopback_pub_sub(log_dir)
+            record_and_print((status, "loopback-pub-sub", detail,
+                              log_dir / "loopback-pub-sub.log"))
+        if "loopback-join" in enabled:
+            status, detail = _loopback_join(log_dir)
+            record_and_print((status, "loopback-join", detail,
+                              log_dir / "loopback-join.log"))
+        if "loopback-fetch" in enabled:
+            status, detail = _loopback_fetch(log_dir)
+            record_and_print((status, "loopback-fetch", detail,
+                              log_dir / "loopback-fetch.log"))
 
-    # --- interop tier ---
-    if not enabled & set(TIERS["interop"]):
-        relays = []
-    for relay in relays:
-        print(f"\n== relay: {relay['name']} ==")
-        if "notes" in relay:
-            print(f"   note: {relay['notes']}")
-        pub_mode = relay["pub_mode"]
-        for transport, url in relay["urls"].items():
-            for draft in relay["drafts"]:
-                tag = f"{relay['name']}/{transport}/d{draft}"
-                slug = tag.replace("/", "_")
+    # --- interop tier (parallel per relay) ---
+    if enabled & set(TIERS["interop"]) and relays:
+        workers = max(1, min(args.interop_parallel, len(relays)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = {
+                ex.submit(_run_relay_matrix, relay, enabled, log_dir): relay
+                for relay in relays
+            }
+            relay_results: dict[str, list[Result]] = {}
+            for fut in concurrent.futures.as_completed(futures):
+                relay = futures[fut]
+                try:
+                    relay_results[relay["name"]] = fut.result()
+                except Exception as e:
+                    relay_results[relay["name"]] = [
+                        ("FAIL", f"relay-matrix {relay['name']}",
+                         f"exception: {e}", Path("/dev/null"))
+                    ]
 
-                if "relay-smoke" in enabled:
-                    log = log_dir / f"relay-smoke-{slug}.log"
-                    record(_smoke(url, draft, log),
-                           f"relay-smoke {tag}", log)
+        # Print in catalog order for stable output
+        for relay in relays:
+            host = _relay_host(relay)
+            print(f"\n== interop: {relay['name']} ({host}) ==")
+            if "notes" in relay:
+                print(f"   note: {relay['notes']}")
+            for res in relay_results.get(relay["name"], []):
+                record_and_print(res)
 
-                if "multi-sub" in enabled:
-                    tn = f"rr-{relay['name']}-{draft}"
-                    log = log_dir / f"multi-sub-{slug}.log"
-                    record(_multi_sub(url, draft, pub_mode, log, tn),
-                           f"multi-sub   {tag} [{pub_mode}]", log)
+    # --- bench tier ---
+    if enabled & set(TIERS["bench"]):
+        print("\n== bench ==")
+        if "loopback-adaptive-bench" in enabled:
+            status, detail = _loopback_adaptive_bench(log_dir)
+            record_and_print((status, "loopback-adaptive-bench", detail,
+                              log_dir / "loopback-adaptive-bench.log"))
 
     # --- summary ---
     print("\n" + "═" * 60)
     fails = [r for r in results if r[0] == "FAIL"]
-    for status, test, detail, _ in results:
-        marker = "PASS" if status == "PASS" else "FAIL"
-        print(f"  {marker}  {test:<42} {detail}")
+    skips = [r for r in results if r[0] == "SKIP"]
+    for res in results:
+        print(f"  {res[0]:<4}  {res[1]:<42} {res[2]}")
     print("═" * 60)
     print(f"  Logs: {log_dir}")
+    if skips:
+        print(f"  {len(skips)} SKIPPED")
     if fails:
         print(f"  {len(fails)} FAILED — tails follow")
         for _, test, _, log in fails:
-            if log.exists():
+            if log.exists() and log != Path("/dev/null"):
                 print(f"\n--- {test} ({log.name}) ---")
                 tail = log.read_text().splitlines()[-40:]
                 for line in tail:
