@@ -22,9 +22,11 @@ Repository = "https://github.com/gmarzot/aiomoqt.git"
 [project.optional-dependencies]
 test = [
     "pytest",
+    "pytest-asyncio",
 ]
 dev = [
     "pytest",
+    "pytest-asyncio",
     "ruff",
     "ty",
 ]
