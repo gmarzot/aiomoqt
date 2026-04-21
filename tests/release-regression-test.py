@@ -267,19 +267,27 @@ def _run_relay_matrix(relay: dict, enabled: set[str],
 
     def _dispatch(suite: str, label_suffix: str, tag: str, slug: str,
                   fn, *fn_args) -> None:
-        label = f"{suite}{label_suffix} {rname} {tag}"
+        # Order label so the eye can scan relay-then-transport-then-suite
+        label = f"{rname:<14} {tag:<14} {suite}{label_suffix}"
         if suite in disabled:
-            marker = ("(disabled: JOIN not supported)" if suite == "relay-join"
-                      else "(disabled: FETCH not supported)" if suite == "relay-fetch"
-                      else f"(disabled: {relay.get('notes', 'not supported')})")
+            # Relay-join / relay-fetch are disabled on almost every
+            # relay by default — don't print a line per combo, just
+            # record the SKIP for the summary. Real relay-specific
+            # disables (e.g. red5 pub-sub) still announce themselves.
+            default_disabled = suite in ("relay-join", "relay-fetch")
+            if default_disabled:
+                marker = f"(disabled: {suite.split('-')[-1].upper()} "
+                marker += "not supported)"
+                results.append(("SKIP", label, marker, Path("/dev/null")))
+                return
+            marker = f"(disabled: {relay.get('notes', 'not supported')})"
             results.append(("SKIP", label, marker, Path("/dev/null")))
             _progress(f"  [skip] {label}  {marker}")
             return
         log = log_dir / f"{suite}_{slug}.log"
-        _progress(f"  ...   {label} running")
         status, detail = fn(*fn_args, log)
         results.append((status, label, detail, log))
-        marker = "[✓]  " if status == "PASS" else "[✗]  "
+        marker = "[PASS]" if status == "PASS" else "[FAIL]"
         _progress(f"  {marker} {label}  {detail}")
 
     for transport, url in relay["urls"].items():
@@ -359,11 +367,6 @@ def main() -> int:
             return 2
     else:
         relays = [r for r in relays_all if not r.get("disabled", False)]
-        disabled_names = [r["name"] for r in relays_all
-                          if r.get("disabled", False)]
-        if disabled_names:
-            print(f"  (disabled relays, use --only to probe: "
-                  f"{', '.join(disabled_names)})")
 
     results: list[Result] = []
 
@@ -447,13 +450,21 @@ def main() -> int:
                               log_dir / "loopback-adaptive-bench.log"))
 
     # --- summary ---
-    print("\n" + "═" * 60)
+    print("\n" + "═" * 72)
     fails = [r for r in results if r[0] == "FAIL"]
     skips = [r for r in results if r[0] == "SKIP"]
     passes = [r for r in results if r[0] == "PASS"]
+    # Hide default-disabled relay-join/relay-fetch SKIPs from the
+    # summary block — they are a permanent property of every active
+    # relay in the catalog and only add noise. The SKIP count still
+    # reflects them.
     for res in results:
-        print(f"  {res[0]:<4}  {res[1]:<42} {res[2]}")
-    print("═" * 60)
+        if res[0] == "SKIP" and (
+                "JOIN not supported" in res[2]
+                or "FETCH not supported" in res[2]):
+            continue
+        print(f"  {res[0]:<4}  {res[1]:<50} {res[2]}")
+    print("═" * 72)
     print(f"  Logs: {log_dir}")
     print(f"  {len(passes)} passed, {len(fails)} failed, {len(skips)} skipped")
 
