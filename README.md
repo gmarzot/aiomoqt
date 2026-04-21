@@ -252,25 +252,32 @@ Error codes are validated to spec-conformant values
 | Relay | Draft | Transport | ctrl-msg | pub-sub |
 |-------|-------|-----------|----------|---------|
 | OpenMoQ moqx | d14 | Raw QUIC | 6/6 | 3/3 |
-| OpenMoQ moqx | d14 | WebTransport | 6/6 | 3/3 |
+| OpenMoQ moqx | d14 | H3/WT | 6/6 | 3/3 |
 | OpenMoQ moqx | d16 | Raw QUIC | 6/6 | 3/3 |
-| OpenMoQ moqx | d16 | WebTransport | 6/6 | 3/3 |
+| OpenMoQ moqx | d16 | H3/WT | 6/6 | 3/3 |
 | Meta moxygen | d14 | Raw QUIC | 6/6 | 3/3 |
-| Meta moxygen | d14 | WebTransport | 6/6 | 3/3 |
+| Meta moxygen | d14 | H3/WT | 6/6 | 3/3 |
 | Meta moxygen | d16 | Raw QUIC | 6/6 | 3/3 |
-| Meta moxygen | d16 | WebTransport | 6/6 | 3/3 |
-| Cloudflare moq-rs | d14 | Raw QUIC | 4/6 | 3/3 |
-| Red5 Pro | d14 | WebTransport | 6/6 | unverified |
-| Red5 Pro | d16 | WebTransport | 6/6 | unverified |
+| Meta moxygen | d16 | H3/WT | 6/6 | 3/3 |
+| Cloudflare moq-rs | d14 | Raw QUIC | 5/6 | 3/3 |
+| Cloudflare moq-rs (draft-16, manish) | d16 | Raw QUIC | 6/6 | unverified |
+| Red5 Pro | d14 | H3/WT | 6/6 | unverified |
+| Red5 Pro | d16 | H3/WT | 6/6 | unverified |
 | Quicr libquicr | d14 | Raw QUIC | 5/6 | 3/3 |
-| Quicr libquicr | d14 | WebTransport | 5/6 | 3/3 |
+| Quicr libquicr | d14 | H3/WT | 5/6 | 3/3 |
 | Quicr libquicr | d16 | Raw QUIC | unverified | unverified |
-| Quicr libquicr | d16 | WebTransport | 5/6 | 3/3 |
+| Quicr libquicr | d16 | H3/WT | 5/6 | 3/3 |
+| Meetecho imquic | d16 | Raw QUIC | 6/6 | unverified |
+| Meetecho imquic | d16 | H3/WT | 5/6 | unverified |
+| OzU moqtail | d14 | H3/WT | 6/6 | unverified |
 
-Entries marked `unverified` did not complete successfully against our
+Entries marked `unverified` did not complete end-to-end against our
 current client and are pending further investigation on our side or
-the peer's. A few relays in the catalog are disabled by default and
-can be re-probed individually with `--only`: `cdn.moq.dev/anon`
+the peer's. Additional advertised endpoints that our client cannot
+yet complete a SETUP with are tracked in
+[`tests/relays.json`](tests/relays.json) (e.g. Red5's raw-QUIC port
+8443, Cloudflare draft-16 H3/WT, imquic draft-14). Fully disabled in
+the default catalog (re-probe with `--only`): `cdn.moq.dev/anon`
 (subscriber-only endpoint in our current test harness) and
 `quichemoq.dev` (connection did not complete during our probe).
 

@@ -273,14 +273,14 @@ def _run_relay_matrix(relay: dict, enabled: set[str],
             # Relay-join / relay-fetch are disabled on almost every
             # relay by default — don't print a line per combo, just
             # record the SKIP for the summary. Real relay-specific
-            # disables (e.g. red5 pub-sub) still announce themselves.
+            # disables still announce themselves on a single line.
             default_disabled = suite in ("relay-join", "relay-fetch")
             if default_disabled:
                 marker = f"(disabled: {suite.split('-')[-1].upper()} "
                 marker += "not supported)"
                 results.append(("SKIP", label, marker, Path("/dev/null")))
                 return
-            marker = f"(disabled: {relay.get('notes', 'not supported')})"
+            marker = "(disabled for this relay)"
             results.append(("SKIP", label, marker, Path("/dev/null")))
             _progress(f"  [skip] {label}  {marker}")
             return

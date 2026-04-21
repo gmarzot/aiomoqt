@@ -83,7 +83,38 @@
       "drafts": [14, 16],
       "pub_mode": "publish",
       "disabled_suites": ["relay-join", "relay-fetch", "relay-pub-sub"],
-      "notes": "Red5 Pro (endpoint /moq, not /moq-relay). ctrl-msg 6/6 clean on d14+d16; pub-sub subscribers get reset 0/3 — disabled pending investigation."
+      "notes": "Red5 Pro picoquic (endpoint /moq, not /moq-relay). ctrl-msg 6/6 clean on d14+d16; pub-sub subscribers get reset 0/3 — disabled pending investigation. Raw-quic endpoint moqt://moq-relay.red5.net:8443 is advertised in upstream registries but does not complete SETUP for us (ConnectionError) — unverified."
+    },
+    {
+      "name": "moqtail",
+      "urls": {
+        "h3-wt": "https://relay.moqtail.dev"
+      },
+      "drafts": [14],
+      "pub_mode": "publish",
+      "disabled_suites": ["relay-join", "relay-fetch"],
+      "notes": "OzU moqtail (Rust). WT d14 only."
+    },
+    {
+      "name": "imquic",
+      "urls": {
+        "raw-quic": "moqt://lminiero.it:9000",
+        "h3-wt":    "https://lminiero.it:9000"
+      },
+      "drafts": [16],
+      "pub_mode": "publish",
+      "disabled_suites": ["relay-join", "relay-fetch"],
+      "notes": "Meetecho imquic (C). d14 probes rejected (WT: \"No WebTransport protocol offered\"; QUIC close 376); only d16 tested here."
+    },
+    {
+      "name": "cf-d16-manish",
+      "urls": {
+        "raw-quic": "moqt://draft-16-manish.cloudflare.mediaoverquic.com:443"
+      },
+      "drafts": [16],
+      "pub_mode": "publish",
+      "disabled_suites": ["relay-join", "relay-fetch"],
+      "notes": "Cloudflare moq-rs draft-16 interop branch (itzmanish PR #131). WT endpoint https://.../moq is advertised but our client hits a SETUP parse error (\"Read out of bounds\") — raw QUIC only here until that's resolved."
     }
   ]
 }
