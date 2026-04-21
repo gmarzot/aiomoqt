@@ -13,24 +13,42 @@ import logging
 import os
 import sys
 import time
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 from urllib.parse import urlparse
 
 from aiomoqt.types import (
-    MOQTMessageType, ParamType, FilterType, GroupOrder,
-    SessionCloseCode, MOQTException,
-    MOQT_VERSION_DRAFT14, MOQT_VERSION_DRAFT16,
+    ParamType, FetchType, MOQTRequestError,
+    SubscribeErrorCode, RequestErrorCode,
 )
-from aiomoqt.types import MOQTRequestError
-from aiomoqt.messages import (
-    SubscribeError, SubscribeOk,
-    PublishNamespaceOk, PublishNamespaceError,
-    SubscribeNamespaceError,
-    RequestOk, RequestError,
-)
+
+# Spec-compliant "track not found" codes across drafts:
+# d14 SubscribeErrorCode.TRACK_DOES_NOT_EXIST = 0x04
+# d16 RequestErrorCode.DOES_NOT_EXIST         = 0x10
+TRACK_NOT_FOUND_CODES = frozenset({
+    int(SubscribeErrorCode.TRACK_DOES_NOT_EXIST),
+    int(RequestErrorCode.DOES_NOT_EXIST),
+})
+
+# INTERNAL_ERROR (0x0) is not an acceptable answer to a well-formed
+# request that names a non-existent track — the relay must be specific.
+SUBSCRIBE_BENIGN_ERROR_CODES = frozenset({
+    int(SubscribeErrorCode.UNAUTHORIZED),
+    int(SubscribeErrorCode.TIMEOUT),
+    int(SubscribeErrorCode.NOT_SUPPORTED),
+    int(SubscribeErrorCode.TRACK_DOES_NOT_EXIST),
+    int(SubscribeErrorCode.MALFORMED_AUTH_TOKEN),
+    int(SubscribeErrorCode.EXPIRED_AUTH_TOKEN),
+    int(RequestErrorCode.MALFORMED_AUTH_TOKEN),
+    int(RequestErrorCode.EXPIRED_AUTH_TOKEN),
+    int(RequestErrorCode.DOES_NOT_EXIST),
+    int(RequestErrorCode.MALFORMED_TRACK),
+    int(RequestErrorCode.UNAUTHORIZED),
+    int(RequestErrorCode.NOT_SUPPORTED),
+    int(RequestErrorCode.TIMEOUT),
+})
 from aiomoqt.client import MOQTClient
-from aiomoqt.utils.logger import get_logger, set_log_level
+from aiomoqt.utils.logger import set_log_level
+
 
 def _unique_suffix():
     """Short hex timestamp for unique namespace/track per run."""
@@ -39,7 +57,7 @@ def _unique_suffix():
 INTEROP_NAMESPACE = f"moq-test/{_unique_suffix()}/interop"
 INTEROP_TRACK = f"track-{_unique_suffix()}"
 
-ALL_TESTS = [
+STANDARD_TESTS = [
     "setup-only",
     "announce-only",
     "publish-namespace-done",
@@ -259,11 +277,24 @@ async def test_subscribe_error(host, port, endpoint, use_quic,
                     )
                 except MOQTRequestError as e:
                     session.close()
+                    spec_ok = int(e.error_code) in TRACK_NOT_FOUND_CODES
                     return TestResult(
-                        name="subscribe-error", passed=True,
+                        name="subscribe-error",
+                        passed=spec_ok,
                         duration_ms=(time.monotonic() - t0) * 1000,
                         connection_id=cid,
-                        message=f"Error received (expected): code={e.error_code}",
+                        message=(
+                            f"Error received (expected): "
+                            f"code={e.error_code}"
+                            if spec_ok else
+                            f"Non-conformant: expected TRACK_DOES_NOT_EXIST "
+                            f"(d14=0x04 / d16=0x10), got code={e.error_code}"
+                        ),
+                        expected="SUBSCRIBE_ERROR code=TRACK_DOES_NOT_EXIST",
+                        received=(
+                            "" if spec_ok
+                            else f"SUBSCRIBE_ERROR code={e.error_code}"
+                        ),
                     )
     except Exception as e:
         return TestResult(
@@ -375,7 +406,7 @@ async def test_subscribe_before_announce(host, port, endpoint, use_quic,
                     await pub_session.client_session_init()
                     pub_cid = _get_connection_id(pub_session)
 
-                    pub_response = await pub_session.publish_namespace(
+                    await pub_session.publish_namespace(
                         namespace=INTEROP_NAMESPACE,
                         parameters={ParamType.AUTH_TOKEN: b"interop-test"},
                         wait_response=True,
@@ -393,15 +424,29 @@ async def test_subscribe_before_announce(host, port, endpoint, use_quic,
                     pub_session.close()
                 sub_session.close()
 
-        # Both SUBSCRIBE_OK and error are valid outcomes
+        # Valid outcomes: SUBSCRIBE_OK (relay buffered pre-announce sub)
+        # OR a structured SUBSCRIBE_ERROR with a spec-defined code
+        # (relay chose not to buffer — represented by codes like
+        # TRACK_DOES_NOT_EXIST or UNINTERESTED). INTERNAL_ERROR (0x0)
+        # is rejected: it signals a server-side failure, not a policy
+        # choice, and should not pass a conformance test.
         if sub_response is None:
             msg = "Timeout waiting for subscriber response"
             passed = False
         elif isinstance(sub_response, MOQTRequestError):
-            msg = f"Error received (valid: relay didn't buffer): code={sub_response.error_code}"
-            passed = True
+            spec_ok = int(sub_response.error_code) in SUBSCRIBE_BENIGN_ERROR_CODES
+            passed = spec_ok
+            msg = (
+                f"Error received (valid: relay didn't buffer): "
+                f"code={sub_response.error_code}"
+                if spec_ok else
+                f"Non-conformant error: expected a benign code "
+                f"(TRACK_DOES_NOT_EXIST / UNAUTHORIZED / TIMEOUT / "
+                f"NOT_SUPPORTED), got code={sub_response.error_code}"
+            )
         else:
-            msg = "SUBSCRIBE_OK received after delayed announce (relay buffered)"
+            msg = ("SUBSCRIBE_OK received after delayed announce "
+                   "(relay buffered)")
             passed = True
 
         return TestResult(
@@ -421,6 +466,99 @@ async def test_subscribe_before_announce(host, port, endpoint, use_quic,
         )
 
 
+async def test_fetch(host, port, endpoint, use_quic, tls_disable_verify,
+                     debug, draft_version=None, timeout=3.0) -> TestResult:
+    """FETCH probe: send a standalone FETCH; relay handles if it responds
+    with FETCH_OK or structured FETCH_ERROR. Timeout/close = fail."""
+    t0 = time.monotonic()
+    client = _make_client(host, port, endpoint, use_quic,
+                          tls_disable_verify, debug,
+                          draft_version=draft_version)
+    try:
+        async with asyncio.timeout(timeout):
+            async with client.connect() as session:
+                await session.client_session_init()
+                cid = _get_connection_id(session)
+                spec_ok = True
+                try:
+                    await session.fetch(
+                        namespace=INTEROP_NAMESPACE,
+                        track_name=INTEROP_TRACK,
+                        start_group=0, start_object=0,
+                        end_group=0, end_object=0,
+                        wait_response=True,
+                    )
+                    msg = "FETCH_OK received"
+                except MOQTRequestError as e:
+                    spec_ok = int(e.error_code) in SUBSCRIBE_BENIGN_ERROR_CODES
+                    msg = (
+                        f"FETCH_ERROR (valid): code={e.error_code}"
+                        if spec_ok else
+                        f"Non-conformant FETCH_ERROR code={e.error_code} "
+                        f"(expected benign code or FETCH_OK)"
+                    )
+                session.close()
+        return TestResult(
+            name="fetch", passed=spec_ok,
+            duration_ms=(time.monotonic() - t0) * 1000,
+            connection_id=cid, message=msg,
+        )
+    except Exception as e:
+        return TestResult(
+            name="fetch", passed=False,
+            duration_ms=(time.monotonic() - t0) * 1000,
+            message=f"Failed: {e}",
+            expected="FETCH_OK or FETCH_ERROR",
+            received=str(e),
+        )
+
+
+async def test_join(host, port, endpoint, use_quic, tls_disable_verify,
+                    debug, draft_version=None, timeout=3.0) -> TestResult:
+    """JOIN probe: send SUBSCRIBE + JOINING_FETCH(RELATIVE, start=0).
+    Relay handles if it responds (OK or structured error). Timeout = fail."""
+    t0 = time.monotonic()
+    client = _make_client(host, port, endpoint, use_quic,
+                          tls_disable_verify, debug,
+                          draft_version=draft_version)
+    try:
+        async with asyncio.timeout(timeout):
+            async with client.connect() as session:
+                await session.client_session_init()
+                cid = _get_connection_id(session)
+                spec_ok = True
+                try:
+                    await session.join(
+                        namespace=INTEROP_NAMESPACE,
+                        track_name=INTEROP_TRACK,
+                        fetch_type=FetchType.RELATIVE_JOINING,
+                        joining_start=0,
+                        wait_response=True,
+                    )
+                    msg = "SUBSCRIBE_OK + FETCH_OK received"
+                except MOQTRequestError as e:
+                    spec_ok = int(e.error_code) in SUBSCRIBE_BENIGN_ERROR_CODES
+                    msg = (
+                        f"structured error (valid): code={e.error_code}"
+                        if spec_ok else
+                        f"Non-conformant error: code={e.error_code}"
+                    )
+                session.close()
+        return TestResult(
+            name="join", passed=spec_ok,
+            duration_ms=(time.monotonic() - t0) * 1000,
+            connection_id=cid, message=msg,
+        )
+    except Exception as e:
+        return TestResult(
+            name="join", passed=False,
+            duration_ms=(time.monotonic() - t0) * 1000,
+            message=f"Failed: {e}",
+            expected="SUBSCRIBE_OK + FETCH_OK or structured error",
+            received=str(e),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Test dispatch
 # ---------------------------------------------------------------------------
@@ -432,6 +570,8 @@ TEST_FUNCTIONS = {
     "subscribe-error": test_subscribe_error,
     "announce-subscribe": test_announce_subscribe,
     "subscribe-before-announce": test_subscribe_before_announce,
+    "fetch": test_fetch,
+    "join": test_join,
 }
 
 
@@ -509,7 +649,7 @@ def main():
     args = parse_args()
 
     if args.list:
-        for name in ALL_TESTS:
+        for name in TEST_FUNCTIONS:
             print(name)
         sys.exit(0)
 
@@ -534,9 +674,14 @@ def main():
 
     # Select tests
     if args.test:
+        if args.test not in TEST_FUNCTIONS:
+            print("TAP version 14")
+            print("1..1")
+            print(f"not ok 1 - {args.test} # SKIP unsupported test case")
+            sys.exit(127)
         tests = [args.test]
     else:
-        tests = ALL_TESTS
+        tests = STANDARD_TESTS
 
     reporter = asyncio.run(
         run_tests(tests, host, port, endpoint, use_quic,

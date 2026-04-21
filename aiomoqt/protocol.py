@@ -15,16 +15,6 @@ from qh3.quic.events import (DatagramFrameReceived, ProtocolNegotiated,
                              QuicEvent, StopSendingReceived,
                              StreamDataReceived, StreamReset)
 
-# Monkey-patch qh3 Setting enum: H3_DATAGRAM should be 0x33 (RFC 9297),
-# not 0xFFD277 (old experimental value). Remove when qh3 is fixed or
-# when we move to aiopquic native H3.
-if Setting.H3_DATAGRAM.value != 0x33:
-    _old = Setting.H3_DATAGRAM.value
-    Setting._value2member_map_.pop(_old, None)
-    Setting._value2member_map_.pop(0x33, None)  # remove DUMMY mapping
-    Setting.H3_DATAGRAM._value_ = 0x33
-    Setting._value2member_map_[0x33] = Setting.H3_DATAGRAM
-
 from importlib.metadata import version
 
 from .context import *
@@ -77,15 +67,14 @@ class H3CustomConnection(H3Connection):
                 logger.debug(f"  Setting 0x{setting_id:x} = {value}")
 
     def _validate_settings(self, settings: dict) -> None:
-        """Validate received H3 SETTINGS with qh3 enum fixup.
+        """Validate received H3 SETTINGS with a defensive H3_DATAGRAM remap.
 
-        qh3 uses wrong value for H3_DATAGRAM (0xFFD277 instead of 0x33).
-        We patch the enum at import time, but also need to remap the raw
-        settings dict keys since qh3 parses them before our patch takes
-        effect on the wire format.
+        Since qh3 1.7.2, SETTINGS_H3_DATAGRAM uses the RFC 9297 value
+        0x33 natively, and legacy 0xFFD277 from older peers still decodes
+        to the enum. The raw-0x33 remap here is belt-and-braces in case
+        a peer emits a bare int key the enum parser didn't recognize.
         """
         patched = dict(settings)
-        # Remap raw 0x33 to the (now-patched) Setting.H3_DATAGRAM enum key
         if 0x33 in patched and Setting.H3_DATAGRAM not in patched:
             patched[Setting.H3_DATAGRAM] = patched.pop(0x33)
         logger.debug(f"H3 SETTINGS received: { {(f'0x{k:x}' if isinstance(k, int) else k.name): v for k, v in patched.items()} }")

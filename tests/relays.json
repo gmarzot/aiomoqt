@@ -1,10 +1,13 @@
 {
   "_schema": {
-    "name":     "short id used in results table",
-    "urls":     "map of transport → URL; keys: raw-quic, h3-wt",
-    "drafts":   "list of MoQT draft numbers (14, 16)",
-    "pub_mode": "publisher messages: publish | publish-ns | publish-both",
-    "notes":    "freeform (optional)"
+    "name":             "short id used in results table",
+    "urls":             "map of transport → URL; keys: raw-quic, h3-wt",
+    "drafts":           "list of MoQT draft numbers (14, 16)",
+    "pub_mode":         "publisher messages: publish | publish-ns | publish-both",
+    "insecure":         "bool; if true, pass --tls-disable-verify / -k (default false)",
+    "disabled":         "bool; if true, skip this relay entirely (default false)",
+    "disabled_suites":  "list of interop suite names to skip for this relay",
+    "notes":            "freeform (optional)"
   },
   "relays": [
     {
@@ -14,7 +17,8 @@
         "h3-wt":    "https://moqx-main.ci.openmoq.org:4433/moq-relay"
       },
       "drafts": [14, 16],
-      "pub_mode": "publish"
+      "pub_mode": "publish",
+      "disabled_suites": ["relay-join", "relay-fetch"]
     },
     {
       "name": "cloudflare-d14",
@@ -23,7 +27,63 @@
       },
       "drafts": [14],
       "pub_mode": "publish-both",
+      "disabled_suites": ["relay-join", "relay-fetch"],
       "notes": "CF d14 moq-rs: publisher must send PUB_NS + PUBLISH"
+    },
+    {
+      "name": "moxygen-fb",
+      "urls": {
+        "raw-quic": "moqt://fb.mvfst.net:9448",
+        "h3-wt":    "https://fb.mvfst.net:9448/moq-relay"
+      },
+      "drafts": [14, 16],
+      "pub_mode": "publish",
+      "disabled_suites": ["relay-join", "relay-fetch"],
+      "notes": "Upstream moxygen reference relay"
+    },
+    {
+      "name": "moq-dev-anon",
+      "urls": {
+        "h3-wt": "https://cdn.moq.dev:443/anon"
+      },
+      "drafts": [14, 16],
+      "pub_mode": "publish",
+      "disabled": true,
+      "disabled_suites": ["relay-join", "relay-fetch"],
+      "notes": "Subscriber-only anon endpoint: publish is rejected at QUIC (code 91141958510816), SUBSCRIBE returns non-spec code=404 Broadcast-not-found. Re-enable if a write-capable path becomes available."
+    },
+    {
+      "name": "quichemoq",
+      "urls": {
+        "h3-wt": "https://quichemoq.dev:443"
+      },
+      "drafts": [14, 16],
+      "pub_mode": "publish",
+      "disabled": true,
+      "disabled_suites": ["relay-join", "relay-fetch"],
+      "notes": "Every connect drops with bare ConnectionError (no QUIC code, no reason). Possibly not MoQT-speaking on this port. Re-probe before enabling."
+    },
+    {
+      "name": "quicr-west",
+      "urls": {
+        "raw-quic": "moqt://us-west-2.relay.quicr.org:33437",
+        "h3-wt":    "https://us-west-2.relay.quicr.org:33437/relay"
+      },
+      "drafts": [14, 16],
+      "pub_mode": "publish",
+      "insecure": true,
+      "disabled_suites": ["relay-join", "relay-fetch"],
+      "notes": "Cisco libquicr (server cert unacceptable → insecure)"
+    },
+    {
+      "name": "red5-moq",
+      "urls": {
+        "h3-wt": "https://moq-relay.red5.net:4433/moq"
+      },
+      "drafts": [14, 16],
+      "pub_mode": "publish",
+      "disabled_suites": ["relay-join", "relay-fetch", "relay-pub-sub"],
+      "notes": "Red5 Pro (endpoint /moq, not /moq-relay). ctrl-msg 6/6 clean on d14+d16; pub-sub subscribers get reset 0/3 — disabled pending investigation."
     }
   ]
 }
