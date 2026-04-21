@@ -175,26 +175,31 @@ def main() -> int:
               file=sys.stderr)
         return 2
 
-    results: list[tuple[str, str, str]] = []   # (status, test, detail)
+    # (status, test, detail, log_path)
+    results: list[tuple[str, str, str, Path]] = []
 
-    def record(status, test, detail):
+    def record(result, test, log_path):
+        status, detail = result
         marker = "✓" if status == "PASS" else "✗"
         print(f"  [{marker}] {test:<40} {detail}")
-        results.append((status, test, detail))
+        results.append((status, test, detail, log_path))
 
     # --- unit tier ---
     if enabled & set(TIERS["unit"]):
         print("\n== unit tier ==")
         if "pytest" in enabled:
-            record(*_pytest(log_dir), "pytest")
+            record(_pytest(log_dir), "pytest",
+                   log_dir / "pytest.log")
         if "test_rebuf" in enabled:
-            record(*_rebuf(log_dir), "test_rebuf")
+            record(_rebuf(log_dir), "test_rebuf",
+                   log_dir / "rebuf.log")
 
     # --- integration tier ---
     if enabled & set(TIERS["integration"]):
         print("\n== integration tier ==")
         if "loopback" in enabled:
-            record(*_loopback(log_dir), "loopback")
+            record(_loopback(log_dir), "loopback",
+                   log_dir / "loopback.log")
 
     # --- interop tier ---
     if not enabled & set(TIERS["interop"]):
@@ -211,25 +216,31 @@ def main() -> int:
 
                 if "relay-smoke" in enabled:
                     log = log_dir / f"relay-smoke-{slug}.log"
-                    record(*_smoke(url, draft, log),
-                           f"relay-smoke {tag}")
+                    record(_smoke(url, draft, log),
+                           f"relay-smoke {tag}", log)
 
                 if "multi-sub" in enabled:
                     tn = f"rr-{relay['name']}-{draft}"
                     log = log_dir / f"multi-sub-{slug}.log"
-                    record(*_multi_sub(url, draft, pub_mode, log, tn),
-                           f"multi-sub   {tag} [{pub_mode}]")
+                    record(_multi_sub(url, draft, pub_mode, log, tn),
+                           f"multi-sub   {tag} [{pub_mode}]", log)
 
     # --- summary ---
     print("\n" + "═" * 60)
     fails = [r for r in results if r[0] == "FAIL"]
-    for status, test, detail in results:
+    for status, test, detail, _ in results:
         marker = "PASS" if status == "PASS" else "FAIL"
         print(f"  {marker}  {test:<42} {detail}")
     print("═" * 60)
     print(f"  Logs: {log_dir}")
     if fails:
-        print(f"  {len(fails)} FAILED")
+        print(f"  {len(fails)} FAILED — tails follow")
+        for _, test, _, log in fails:
+            if log.exists():
+                print(f"\n--- {test} ({log.name}) ---")
+                tail = log.read_text().splitlines()[-40:]
+                for line in tail:
+                    print(line)
         return 1
     print("  all green")
     return 0
