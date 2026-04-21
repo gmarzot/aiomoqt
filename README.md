@@ -272,18 +272,10 @@ Error codes are validated to spec-conformant values
 | Meetecho imquic | d16 | H3/WT | 5/6 | unverified |
 | OzU moqtail | d14 | H3/WT | 6/6 | unverified |
 
-Entries marked `unverified` did not complete end-to-end against our
-current client and are pending further investigation on our side or
-the peer's. `unreachable` means the UDP/QUIC handshake never got a
-response — Red5's advertised raw-QUIC endpoint
-`moqt://moq-relay.red5.net:8443` falls in this bucket on every draft
-we probe (their H3/WT on 4433 works fine). Additional advertised
-endpoints that our client cannot yet complete a SETUP with are
-tracked in [`tests/relays.json`](tests/relays.json) (e.g. Cloudflare
-draft-16 H3/WT, imquic draft-14). Fully disabled in the default
-catalog (re-probe with `--only`): `cdn.moq.dev/anon` (subscriber-only
-endpoint in our current test harness) and `quichemoq.dev` (connection
-did not complete during our probe).
+- `unverified` — suite did not complete end-to-end.
+- `unreachable` — no response to QUIC Initial.
+- See [`tests/relays.json`](tests/relays.json) for the full catalog,
+  per-endpoint notes, and relays disabled by default.
 
 Test cases: `setup-only`, `announce-only`, `publish-namespace-done`,
 `subscribe-error`, `announce-subscribe`, `subscribe-before-announce`,

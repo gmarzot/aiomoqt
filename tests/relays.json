@@ -107,14 +107,14 @@
       "notes": "Meetecho imquic (C). d14 probes rejected (WT: \"No WebTransport protocol offered\"; QUIC close 376); only d16 tested here."
     },
     {
-      "name": "cf-d16-manish",
+      "name": "cf-d16-interop",
       "urls": {
         "raw-quic": "moqt://draft-16-manish.cloudflare.mediaoverquic.com:443"
       },
       "drafts": [16],
       "pub_mode": "publish",
       "disabled_suites": ["relay-join", "relay-fetch"],
-      "notes": "Cloudflare moq-rs draft-16 interop branch (itzmanish PR #131). WT endpoint https://.../moq is advertised but our client hits a SETUP parse error (\"Read out of bounds\") — raw QUIC only here until that's resolved."
+      "notes": "Cloudflare moq-rs draft-16 interop branch. Upstream also advertises an H3/WT endpoint at https://.../moq but our client hits a SETUP parse error (\"Read out of bounds\") — QUIC only here until that's resolved."
     }
   ]
 }
