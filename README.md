@@ -263,6 +263,7 @@ Error codes are validated to spec-conformant values
 | Cloudflare moq-rs (d16 interop branch) | d16 | QUIC | 6/6 | unverified |
 | Red5 Pro | d14 | H3/WT | 6/6 | unverified |
 | Red5 Pro | d16 | H3/WT | 6/6 | unverified |
+| Red5 Pro | d14/d16 | QUIC | unreachable | unreachable |
 | Quicr libquicr | d14 | QUIC | 5/6 | 3/3 |
 | Quicr libquicr | d14 | H3/WT | 5/6 | 3/3 |
 | Quicr libquicr | d16 | QUIC | unverified | unverified |
@@ -273,13 +274,16 @@ Error codes are validated to spec-conformant values
 
 Entries marked `unverified` did not complete end-to-end against our
 current client and are pending further investigation on our side or
-the peer's. Additional advertised endpoints that our client cannot
-yet complete a SETUP with are tracked in
-[`tests/relays.json`](tests/relays.json) (e.g. Red5's raw-QUIC port
-8443, Cloudflare draft-16 H3/WT, imquic draft-14). Fully disabled in
-the default catalog (re-probe with `--only`): `cdn.moq.dev/anon`
-(subscriber-only endpoint in our current test harness) and
-`quichemoq.dev` (connection did not complete during our probe).
+the peer's. `unreachable` means the UDP/QUIC handshake never got a
+response — Red5's advertised raw-QUIC endpoint
+`moqt://moq-relay.red5.net:8443` falls in this bucket on every draft
+we probe (their H3/WT on 4433 works fine). Additional advertised
+endpoints that our client cannot yet complete a SETUP with are
+tracked in [`tests/relays.json`](tests/relays.json) (e.g. Cloudflare
+draft-16 H3/WT, imquic draft-14). Fully disabled in the default
+catalog (re-probe with `--only`): `cdn.moq.dev/anon` (subscriber-only
+endpoint in our current test harness) and `quichemoq.dev` (connection
+did not complete during our probe).
 
 Test cases: `setup-only`, `announce-only`, `publish-namespace-done`,
 `subscribe-error`, `announce-subscribe`, `subscribe-before-announce`,
