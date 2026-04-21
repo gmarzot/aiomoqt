@@ -31,7 +31,15 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
+
+_PRINT_LOCK = threading.Lock()
+
+
+def _progress(msg: str) -> None:
+    with _PRINT_LOCK:
+        print(msg, flush=True)
 
 DEFAULT_CATALOG = Path(__file__).parent / "relays.json"
 
@@ -47,7 +55,7 @@ TIER_CHOICES = tuple(TIERS.keys())
 SUITE_CHOICES = tuple(s for suites in TIERS.values() for s in suites)
 
 MULTI_SUB_ARGS_COMMON = [
-    "-n", "3", "-s", "1024", "-r", "30", "-g", "60", "-t", "30", "-k",
+    "-n", "3", "-s", "1024", "-r", "30", "-g", "60", "-t", "30",
 ]
 PUB_MODE_FLAGS = {
     "publish":      [],
@@ -149,9 +157,12 @@ def _loopback_fetch(log_dir: Path) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 # Interop-tier runners (per relay × transport × draft)
 # ---------------------------------------------------------------------------
-def _relay_ctrl_msg(url: str, draft: int, log: Path) -> tuple[str, str]:
+def _relay_ctrl_msg(url: str, draft: int, insecure: bool,
+                    log: Path) -> tuple[str, str]:
     cmd = ["python", "-m", "aiomoqt.examples.moq_interop_client",
            "-r", url, "--draft", str(draft)]
+    if insecure:
+        cmd.append("--tls-disable-verify")
     ok, _ = _run(cmd, log, 90)
     if not ok:
         return "FAIL", "timeout"
@@ -160,11 +171,13 @@ def _relay_ctrl_msg(url: str, draft: int, log: Path) -> tuple[str, str]:
     return ("PASS" if ok_count == 6 else "FAIL"), f"{ok_count}/6"
 
 
-def _relay_pub_sub(url: str, draft: int, pub_mode: str, log: Path,
-                   trackname: str) -> tuple[str, str]:
+def _relay_pub_sub(url: str, draft: int, pub_mode: str, insecure: bool,
+                   log: Path, trackname: str) -> tuple[str, str]:
     cmd = ["python", "-m", "aiomoqt.examples.multi_sub_bench",
            url, *MULTI_SUB_ARGS_COMMON, "--draft", str(draft),
            "--trackname", trackname, *PUB_MODE_FLAGS[pub_mode]]
+    if insecure:
+        cmd.append("-k")
     ok, _ = _run(cmd, log, 120)
     if not ok:
         return "FAIL", "timeout"
@@ -176,10 +189,12 @@ def _relay_pub_sub(url: str, draft: int, pub_mode: str, log: Path,
     return ("PASS" if got == want else "FAIL"), f"{got}/{want} ok"
 
 
-def _relay_tap_case(url: str, draft: int, case: str,
+def _relay_tap_case(url: str, draft: int, case: str, insecure: bool,
                     log: Path) -> tuple[str, str]:
     cmd = ["python", "-m", "aiomoqt.examples.moq_interop_client",
            "-r", url, "--draft", str(draft), "-t", case]
+    if insecure:
+        cmd.append("--tls-disable-verify")
     ok, _ = _run(cmd, log, 90)
     if not ok:
         return "FAIL", "timeout"
@@ -191,12 +206,14 @@ def _relay_tap_case(url: str, draft: int, case: str,
     return "FAIL", last
 
 
-def _relay_join(url: str, draft: int, log: Path) -> tuple[str, str]:
-    return _relay_tap_case(url, draft, "join", log)
+def _relay_join(url: str, draft: int, insecure: bool,
+                log: Path) -> tuple[str, str]:
+    return _relay_tap_case(url, draft, "join", insecure, log)
 
 
-def _relay_fetch(url: str, draft: int, log: Path) -> tuple[str, str]:
-    return _relay_tap_case(url, draft, "fetch", log)
+def _relay_fetch(url: str, draft: int, insecure: bool,
+                 log: Path) -> tuple[str, str]:
+    return _relay_tap_case(url, draft, "fetch", insecure, log)
 
 
 # ---------------------------------------------------------------------------
@@ -244,53 +261,46 @@ def _run_relay_matrix(relay: dict, enabled: set[str],
     results: list[Result] = []
     disabled = set(relay.get("disabled_suites", []))
     pub_mode = relay.get("pub_mode", "publish")
+    insecure = bool(relay.get("insecure", False))
+    rname = relay["name"]
+
+    def _dispatch(suite: str, label_suffix: str, tag: str, slug: str,
+                  fn, *fn_args) -> None:
+        label = f"{suite}{label_suffix} {rname} {tag}"
+        if suite in disabled:
+            marker = ("(disabled: JOIN not supported)" if suite == "relay-join"
+                      else "(disabled: FETCH not supported)" if suite == "relay-fetch"
+                      else f"(disabled: {relay.get('notes', 'not supported')})")
+            results.append(("SKIP", label, marker, Path("/dev/null")))
+            _progress(f"  [skip] {label}  {marker}")
+            return
+        log = log_dir / f"{suite}_{slug}.log"
+        _progress(f"  ...   {label} running")
+        status, detail = fn(*fn_args, log)
+        results.append((status, label, detail, log))
+        marker = "[✓]  " if status == "PASS" else "[✗]  "
+        _progress(f"  {marker} {label}  {detail}")
 
     for transport, url in relay["urls"].items():
         for draft in relay["drafts"]:
             tag = f"{transport}/d{draft}"
-            slug = f"{relay['name']}_{transport}_d{draft}"
+            slug = f"{rname}_{transport}_d{draft}"
 
             if "relay-ctrl-msg" in enabled:
-                if "relay-ctrl-msg" in disabled:
-                    results.append(("SKIP", f"relay-ctrl-msg {tag}",
-                                    f"(disabled: {relay.get('notes', 'not supported')})",
-                                    Path("/dev/null")))
-                else:
-                    log = log_dir / f"relay-ctrl-msg_{slug}.log"
-                    status, detail = _relay_ctrl_msg(url, draft, log)
-                    results.append((status, f"relay-ctrl-msg {tag}", detail, log))
-
+                _dispatch("relay-ctrl-msg", "", tag, slug,
+                          _relay_ctrl_msg, url, draft, insecure)
             if "relay-pub-sub" in enabled:
-                if "relay-pub-sub" in disabled:
-                    results.append(("SKIP", f"relay-pub-sub  {tag}",
-                                    f"(disabled: {relay.get('notes', 'not supported')})",
-                                    Path("/dev/null")))
-                else:
-                    tn = f"rr-{relay['name']}-{draft}"
-                    log = log_dir / f"relay-pub-sub_{slug}.log"
-                    status, detail = _relay_pub_sub(url, draft, pub_mode, log, tn)
-                    results.append((status, f"relay-pub-sub  {tag} [{pub_mode}]",
-                                    detail, log))
-
+                tn = f"rr-{rname}-{draft}"
+                _dispatch("relay-pub-sub", f"[{pub_mode}]", tag, slug,
+                          lambda u, d, log: _relay_pub_sub(
+                              u, d, pub_mode, insecure, log, tn),
+                          url, draft)
             if "relay-join" in enabled:
-                if "relay-join" in disabled:
-                    results.append(("SKIP", f"relay-join     {tag}",
-                                    "(disabled: JOIN not supported)",
-                                    Path("/dev/null")))
-                else:
-                    log = log_dir / f"relay-join_{slug}.log"
-                    status, detail = _relay_join(url, draft, log)
-                    results.append((status, f"relay-join     {tag}", detail, log))
-
+                _dispatch("relay-join", "", tag, slug,
+                          _relay_join, url, draft, insecure)
             if "relay-fetch" in enabled:
-                if "relay-fetch" in disabled:
-                    results.append(("SKIP", f"relay-fetch    {tag}",
-                                    "(disabled: FETCH not supported)",
-                                    Path("/dev/null")))
-                else:
-                    log = log_dir / f"relay-fetch_{slug}.log"
-                    status, detail = _relay_fetch(url, draft, log)
-                    results.append((status, f"relay-fetch    {tag}", detail, log))
+                _dispatch("relay-fetch", "", tag, slug,
+                          _relay_fetch, url, draft, insecure)
 
     return results
 
@@ -388,7 +398,14 @@ def main() -> int:
                               log_dir / "loopback-fetch.log"))
 
     # --- interop tier (parallel per relay) ---
+    # Per-suite progress prints live from worker threads via _progress().
+    # Catalog-order rollup lives in the summary block at end.
     if enabled & set(TIERS["interop"]) and relays:
+        print("\n== interop ==")
+        for relay in relays:
+            print(f"  relay: {relay['name']} ({_relay_host(relay)})")
+        print(f"  workers: {args.interop_parallel}")
+        print()
         workers = max(1, min(args.interop_parallel, len(relays)))
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
             futures = {
@@ -406,14 +423,10 @@ def main() -> int:
                          f"exception: {e}", Path("/dev/null"))
                     ]
 
-        # Print in catalog order for stable output
+        # Collect results in catalog order for the summary block
         for relay in relays:
-            host = _relay_host(relay)
-            print(f"\n== interop: {relay['name']} ({host}) ==")
-            if "notes" in relay:
-                print(f"   note: {relay['notes']}")
             for res in relay_results.get(relay["name"], []):
-                record_and_print(res)
+                results.append(res)
 
     # --- bench tier ---
     if enabled & set(TIERS["bench"]):

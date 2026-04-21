@@ -4,6 +4,7 @@
     "urls":             "map of transport → URL; keys: raw-quic, h3-wt",
     "drafts":           "list of MoQT draft numbers (14, 16)",
     "pub_mode":         "publisher messages: publish | publish-ns | publish-both",
+    "insecure":         "bool; if true, pass --tls-disable-verify / -k (default false)",
     "disabled_suites":  "list of interop suite names to skip for this relay",
     "notes":            "freeform (optional)"
   },
@@ -67,8 +68,9 @@
       },
       "drafts": [14, 16],
       "pub_mode": "publish",
+      "insecure": true,
       "disabled_suites": ["relay-join", "relay-fetch"],
-      "notes": "Cisco libquicr"
+      "notes": "Cisco libquicr (server cert unacceptable → insecure)"
     },
     {
       "name": "red5-moq",
