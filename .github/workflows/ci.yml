@@ -1,11 +1,15 @@
-name: PR
+name: CI
 
-# Fires on pull_request only. Runs the unit + integration tiers across
-# supported Python versions. No publish/release jobs — those live in
-# release.yml and fire on tag push.
+# Fires on pull_request and on push to main. Runs the unit +
+# integration tiers across supported Python versions. No publish /
+# release jobs — release.yml is manually dispatched from the Actions
+# tab when a release is ready to cut.
 
 on:
   pull_request:
+  push:
+    branches:
+      - main
 
 jobs:
   test:

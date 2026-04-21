@@ -242,22 +242,42 @@ python -m aiomoqt.examples.server_example \
 
 ## Interop Test Results
 
-All 6 [moq-interop-runner](https://github.com/englishm/moq-interop-runner)
-test cases pass against multiple relays on draft-14 and draft-16:
+Results against live public relays, as probed by
+`tests/release-regression-test.py --test-tier interop` in v0.8.1.
+Tests use the 6 [moq-interop-runner](https://github.com/englishm/moq-interop-runner)
+cases plus `relay-pub-sub` (3-subscriber multi-sub bench).
+Error codes are validated to spec-conformant values
+(e.g. `subscribe-error` requires `TRACK_DOES_NOT_EXIST`, not `INTERNAL_ERROR`).
 
-| Relay | Draft | Transport | Tests | Result |
-|-------|-------|-----------|-------|--------|
-| OpenMoQ moqx | draft-16 | Raw QUIC | 6/6 | PASS |
-| OpenMoQ moqx | draft-14 | Raw QUIC | 6/6 | PASS |
-| Meta moxygen | draft-16 | Raw QUIC | 6/6 | PASS |
-| Meta moxygen | draft-14 | Raw QUIC | 6/6 | PASS |
-| Cloudflare moq-rs | draft-14 | Raw QUIC | 6/6 | PASS |
-| Red5 Pro | draft-14 | Raw QUIC | 6/6 | PASS |
-| Red5 Pro | draft-14 | WebTransport | 6/6 | PASS |
-| Quicr libquicr | draft-14 | Raw QUIC | 5/6 | PASS |
+| Relay | Draft | Transport | ctrl-msg | pub-sub |
+|-------|-------|-----------|----------|---------|
+| OpenMoQ moqx | d14 | Raw QUIC | 6/6 | 3/3 |
+| OpenMoQ moqx | d14 | WebTransport | 6/6 | 3/3 |
+| OpenMoQ moqx | d16 | Raw QUIC | 6/6 | 3/3 |
+| OpenMoQ moqx | d16 | WebTransport | 6/6 | 3/3 |
+| Meta moxygen | d14 | Raw QUIC | 6/6 | 3/3 |
+| Meta moxygen | d14 | WebTransport | 6/6 | 3/3 |
+| Meta moxygen | d16 | Raw QUIC | 6/6 | 3/3 |
+| Meta moxygen | d16 | WebTransport | 6/6 | 3/3 |
+| Cloudflare moq-rs | d14 | Raw QUIC | 4/6 | 3/3 |
+| Red5 Pro | d14 | WebTransport | 6/6 | unverified |
+| Red5 Pro | d16 | WebTransport | 6/6 | unverified |
+| Quicr libquicr | d14 | Raw QUIC | 5/6 | 3/3 |
+| Quicr libquicr | d14 | WebTransport | 5/6 | 3/3 |
+| Quicr libquicr | d16 | Raw QUIC | unverified | unverified |
+| Quicr libquicr | d16 | WebTransport | 5/6 | 3/3 |
+
+Entries marked `unverified` did not complete successfully against our
+current client and are pending further investigation on our side or
+the peer's. A few relays in the catalog are disabled by default and
+can be re-probed individually with `--only`: `cdn.moq.dev/anon`
+(subscriber-only endpoint in our current test harness) and
+`quichemoq.dev` (connection did not complete during our probe).
 
 Test cases: `setup-only`, `announce-only`, `publish-namespace-done`,
-`subscribe-error`, `announce-subscribe`, `subscribe-before-announce`
+`subscribe-error`, `announce-subscribe`, `subscribe-before-announce`,
+plus `fetch` and `join` probes (not in default catalog matrix —
+most relays do not implement these yet).
 
 ## Development
 
@@ -280,7 +300,6 @@ with a specific Python version and Cython.
   - Interactive chat
   - MSF/LOC media packaging
   - CMSF media packaging
-* Dockerize interop test client for moq-interop-runner registration
 * Simple relay implementation
 
 ## Contributing
