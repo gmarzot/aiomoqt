@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
+import os
 import re
 import subprocess
 import sys
@@ -440,12 +441,18 @@ def main() -> int:
     print("\n" + "═" * 60)
     fails = [r for r in results if r[0] == "FAIL"]
     skips = [r for r in results if r[0] == "SKIP"]
+    passes = [r for r in results if r[0] == "PASS"]
     for res in results:
         print(f"  {res[0]:<4}  {res[1]:<42} {res[2]}")
     print("═" * 60)
     print(f"  Logs: {log_dir}")
-    if skips:
-        print(f"  {len(skips)} SKIPPED")
+    print(f"  {len(passes)} passed, {len(fails)} failed, {len(skips)} skipped")
+
+    # Markdown summary for GitHub Actions runners.
+    gh_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if gh_summary:
+        _write_gh_summary(Path(gh_summary), results, log_dir)
+
     if fails:
         print(f"  {len(fails)} FAILED — tails follow")
         for _, test, _, log in fails:
@@ -457,6 +464,33 @@ def main() -> int:
         return 1
     print("  all green")
     return 0
+
+
+def _write_gh_summary(summary_path: Path, results: list[Result],
+                      log_dir: Path) -> None:
+    """Append a markdown table + totals to the GitHub Actions run summary."""
+    emoji = {"PASS": "✅", "FAIL": "❌", "SKIP": "⚪"}
+    lines = [
+        "## aiomoqt regression",
+        "",
+        "| Status | Suite | Detail |",
+        "|---|---|---|",
+    ]
+    for status, test, detail, _ in results:
+        detail_safe = detail.replace("|", "\\|")
+        lines.append(f"| {emoji[status]} {status} | `{test}` | {detail_safe} |")
+    fails = sum(1 for r in results if r[0] == "FAIL")
+    skips = sum(1 for r in results if r[0] == "SKIP")
+    passes = sum(1 for r in results if r[0] == "PASS")
+    lines.extend([
+        "",
+        f"**{passes} passed · {fails} failed · {skips} skipped**",
+        "",
+        f"Logs: `{log_dir}`",
+        "",
+    ])
+    with summary_path.open("a") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 if __name__ == "__main__":

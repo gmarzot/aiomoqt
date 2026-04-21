@@ -1,7 +1,10 @@
-name: CI/CD
+name: Release
+
+# Fires on tag push only (N.N.N). Re-runs the full unit+integration
+# test matrix as a final gate, then publishes to TestPyPI → PyPI,
+# cuts a GitHub Release, and pushes the Docker image to GHCR.
 
 on:
-  pull_request:
   push:
     tags:
       - '*.*.*'
@@ -12,7 +15,6 @@ jobs:
     strategy:
       matrix:
         python-version: ["3.12", "3.13", "3.14"]
-
     steps:
     - uses: actions/checkout@v4
       with:
@@ -32,11 +34,18 @@ jobs:
           -keyout certs/key.pem -out certs/cert.pem \
           -days 1 -subj "/CN=localhost"
     - name: Run unit + integration tiers
-      run: python tests/release-regression-test.py --test-tier unit --test-tier integration
+      run: |
+        python tests/release-regression-test.py \
+          --test-tier unit --test-tier integration
+    - name: Upload logs on failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: regression-logs-py${{ matrix.python-version }}
+        path: /tmp/aiomoqt-regression.*/
 
   publish-test:
     needs: test
-    if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
@@ -62,7 +71,6 @@ jobs:
 
   publish-prod:
     needs: [test, publish-test]
-    if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
@@ -88,7 +96,6 @@ jobs:
 
   github-release:
     needs: [publish-prod]
-    if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -108,7 +115,6 @@ jobs:
 
   docker-publish:
     needs: [publish-prod]
-    if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
       packages: write
