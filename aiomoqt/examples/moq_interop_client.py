@@ -16,7 +16,36 @@ import time
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
-from aiomoqt.types import ParamType, FetchType, MOQTRequestError
+from aiomoqt.types import (
+    ParamType, FetchType, MOQTRequestError,
+    SubscribeErrorCode, RequestErrorCode,
+)
+
+# Spec-compliant "track not found" codes across drafts:
+# d14 SubscribeErrorCode.TRACK_DOES_NOT_EXIST = 0x04
+# d16 RequestErrorCode.DOES_NOT_EXIST         = 0x10
+TRACK_NOT_FOUND_CODES = frozenset({
+    int(SubscribeErrorCode.TRACK_DOES_NOT_EXIST),
+    int(RequestErrorCode.DOES_NOT_EXIST),
+})
+
+# INTERNAL_ERROR (0x0) is not an acceptable answer to a well-formed
+# request that names a non-existent track — the relay must be specific.
+SUBSCRIBE_BENIGN_ERROR_CODES = frozenset({
+    int(SubscribeErrorCode.UNAUTHORIZED),
+    int(SubscribeErrorCode.TIMEOUT),
+    int(SubscribeErrorCode.NOT_SUPPORTED),
+    int(SubscribeErrorCode.TRACK_DOES_NOT_EXIST),
+    int(SubscribeErrorCode.MALFORMED_AUTH_TOKEN),
+    int(SubscribeErrorCode.EXPIRED_AUTH_TOKEN),
+    int(RequestErrorCode.MALFORMED_AUTH_TOKEN),
+    int(RequestErrorCode.EXPIRED_AUTH_TOKEN),
+    int(RequestErrorCode.DOES_NOT_EXIST),
+    int(RequestErrorCode.MALFORMED_TRACK),
+    int(RequestErrorCode.UNAUTHORIZED),
+    int(RequestErrorCode.NOT_SUPPORTED),
+    int(RequestErrorCode.TIMEOUT),
+})
 from aiomoqt.client import MOQTClient
 from aiomoqt.utils.logger import set_log_level
 
@@ -248,11 +277,24 @@ async def test_subscribe_error(host, port, endpoint, use_quic,
                     )
                 except MOQTRequestError as e:
                     session.close()
+                    spec_ok = int(e.error_code) in TRACK_NOT_FOUND_CODES
                     return TestResult(
-                        name="subscribe-error", passed=True,
+                        name="subscribe-error",
+                        passed=spec_ok,
                         duration_ms=(time.monotonic() - t0) * 1000,
                         connection_id=cid,
-                        message=f"Error received (expected): code={e.error_code}",
+                        message=(
+                            f"Error received (expected): "
+                            f"code={e.error_code}"
+                            if spec_ok else
+                            f"Non-conformant: expected TRACK_DOES_NOT_EXIST "
+                            f"(d14=0x04 / d16=0x10), got code={e.error_code}"
+                        ),
+                        expected="SUBSCRIBE_ERROR code=TRACK_DOES_NOT_EXIST",
+                        received=(
+                            "" if spec_ok
+                            else f"SUBSCRIBE_ERROR code={e.error_code}"
+                        ),
                     )
     except Exception as e:
         return TestResult(
@@ -382,15 +424,29 @@ async def test_subscribe_before_announce(host, port, endpoint, use_quic,
                     pub_session.close()
                 sub_session.close()
 
-        # Both SUBSCRIBE_OK and error are valid outcomes
+        # Valid outcomes: SUBSCRIBE_OK (relay buffered pre-announce sub)
+        # OR a structured SUBSCRIBE_ERROR with a spec-defined code
+        # (relay chose not to buffer — represented by codes like
+        # TRACK_DOES_NOT_EXIST or UNINTERESTED). INTERNAL_ERROR (0x0)
+        # is rejected: it signals a server-side failure, not a policy
+        # choice, and should not pass a conformance test.
         if sub_response is None:
             msg = "Timeout waiting for subscriber response"
             passed = False
         elif isinstance(sub_response, MOQTRequestError):
-            msg = f"Error received (valid: relay didn't buffer): code={sub_response.error_code}"
-            passed = True
+            spec_ok = int(sub_response.error_code) in SUBSCRIBE_BENIGN_ERROR_CODES
+            passed = spec_ok
+            msg = (
+                f"Error received (valid: relay didn't buffer): "
+                f"code={sub_response.error_code}"
+                if spec_ok else
+                f"Non-conformant error: expected a benign code "
+                f"(TRACK_DOES_NOT_EXIST / UNAUTHORIZED / TIMEOUT / "
+                f"NOT_SUPPORTED), got code={sub_response.error_code}"
+            )
         else:
-            msg = "SUBSCRIBE_OK received after delayed announce (relay buffered)"
+            msg = ("SUBSCRIBE_OK received after delayed announce "
+                   "(relay buffered)")
             passed = True
 
         return TestResult(
@@ -423,6 +479,7 @@ async def test_fetch(host, port, endpoint, use_quic, tls_disable_verify,
             async with client.connect() as session:
                 await session.client_session_init()
                 cid = _get_connection_id(session)
+                spec_ok = True
                 try:
                     await session.fetch(
                         namespace=INTEROP_NAMESPACE,
@@ -433,10 +490,16 @@ async def test_fetch(host, port, endpoint, use_quic, tls_disable_verify,
                     )
                     msg = "FETCH_OK received"
                 except MOQTRequestError as e:
-                    msg = f"FETCH_ERROR (valid): code={e.error_code}"
+                    spec_ok = int(e.error_code) in SUBSCRIBE_BENIGN_ERROR_CODES
+                    msg = (
+                        f"FETCH_ERROR (valid): code={e.error_code}"
+                        if spec_ok else
+                        f"Non-conformant FETCH_ERROR code={e.error_code} "
+                        f"(expected benign code or FETCH_OK)"
+                    )
                 session.close()
         return TestResult(
-            name="fetch", passed=True,
+            name="fetch", passed=spec_ok,
             duration_ms=(time.monotonic() - t0) * 1000,
             connection_id=cid, message=msg,
         )
@@ -463,6 +526,7 @@ async def test_join(host, port, endpoint, use_quic, tls_disable_verify,
             async with client.connect() as session:
                 await session.client_session_init()
                 cid = _get_connection_id(session)
+                spec_ok = True
                 try:
                     await session.join(
                         namespace=INTEROP_NAMESPACE,
@@ -473,10 +537,15 @@ async def test_join(host, port, endpoint, use_quic, tls_disable_verify,
                     )
                     msg = "SUBSCRIBE_OK + FETCH_OK received"
                 except MOQTRequestError as e:
-                    msg = f"structured error (valid): code={e.error_code}"
+                    spec_ok = int(e.error_code) in SUBSCRIBE_BENIGN_ERROR_CODES
+                    msg = (
+                        f"structured error (valid): code={e.error_code}"
+                        if spec_ok else
+                        f"Non-conformant error: code={e.error_code}"
+                    )
                 session.close()
         return TestResult(
-            name="join", passed=True,
+            name="join", passed=spec_ok,
             duration_ms=(time.monotonic() - t0) * 1000,
             connection_id=cid, message=msg,
         )
