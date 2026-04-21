@@ -349,12 +349,21 @@ def main() -> int:
     log_dir.mkdir(parents=True, exist_ok=True)
     print(f"Logs: {log_dir}")
 
-    relays = [r for r in relays_all
-              if args.only is None or r["name"] == args.only]
-    if args.only and not relays:
-        print(f"error: no relay named {args.only!r} in catalog",
-              file=sys.stderr)
-        return 2
+    if args.only is not None:
+        # --only bypasses the disabled flag so you can still probe
+        # a disabled relay without editing the catalog.
+        relays = [r for r in relays_all if r["name"] == args.only]
+        if not relays:
+            print(f"error: no relay named {args.only!r} in catalog",
+                  file=sys.stderr)
+            return 2
+    else:
+        relays = [r for r in relays_all if not r.get("disabled", False)]
+        disabled_names = [r["name"] for r in relays_all
+                          if r.get("disabled", False)]
+        if disabled_names:
+            print(f"  (disabled relays, use --only to probe: "
+                  f"{', '.join(disabled_names)})")
 
     results: list[Result] = []
 

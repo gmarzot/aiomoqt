@@ -5,6 +5,7 @@
     "drafts":           "list of MoQT draft numbers (14, 16)",
     "pub_mode":         "publisher messages: publish | publish-ns | publish-both",
     "insecure":         "bool; if true, pass --tls-disable-verify / -k (default false)",
+    "disabled":         "bool; if true, skip this relay entirely (default false)",
     "disabled_suites":  "list of interop suite names to skip for this relay",
     "notes":            "freeform (optional)"
   },
@@ -47,8 +48,9 @@
       },
       "drafts": [14, 16],
       "pub_mode": "publish",
+      "disabled": true,
       "disabled_suites": ["relay-join", "relay-fetch"],
-      "notes": "Anonymous path on cdn.moq.dev"
+      "notes": "Subscriber-only anon endpoint: publish is rejected at QUIC (code 91141958510816), SUBSCRIBE returns non-spec code=404 Broadcast-not-found. Re-enable if a write-capable path becomes available."
     },
     {
       "name": "quichemoq",
@@ -57,8 +59,9 @@
       },
       "drafts": [14, 16],
       "pub_mode": "publish",
+      "disabled": true,
       "disabled_suites": ["relay-join", "relay-fetch"],
-      "notes": "Draft support unconfirmed; probe each draft before relying on catalog"
+      "notes": "Every connect drops with bare ConnectionError (no QUIC code, no reason). Possibly not MoQT-speaking on this port. Re-probe before enabling."
     },
     {
       "name": "quicr-west",
@@ -79,8 +82,8 @@
       },
       "drafts": [14, 16],
       "pub_mode": "publish",
-      "disabled_suites": ["relay-join", "relay-fetch"],
-      "notes": "Red5 Pro (endpoint /moq, not /moq-relay)"
+      "disabled_suites": ["relay-join", "relay-fetch", "relay-pub-sub"],
+      "notes": "Red5 Pro (endpoint /moq, not /moq-relay). ctrl-msg 6/6 clean on d14+d16; pub-sub subscribers get reset 0/3 — disabled pending investigation."
     }
   ]
 }
