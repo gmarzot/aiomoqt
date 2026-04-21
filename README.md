@@ -261,9 +261,10 @@ Error codes are validated to spec-conformant values
 | Meta moxygen | d16 | H3/WT | 6/6 | 3/3 |
 | Cloudflare moq-rs | d14 | QUIC | 5/6 | 3/3 |
 | Cloudflare moq-rs (d16 interop branch) | d16 | QUIC | 6/6 | unverified |
+| Red5 Pro | d14 | QUIC | unreachable | unreachable |
 | Red5 Pro | d14 | H3/WT | 6/6 | unverified |
+| Red5 Pro | d16 | QUIC | unreachable | unreachable |
 | Red5 Pro | d16 | H3/WT | 6/6 | unverified |
-| Red5 Pro | d14/d16 | QUIC | unreachable | unreachable |
 | Quicr libquicr | d14 | QUIC | 5/6 | 3/3 |
 | Quicr libquicr | d14 | H3/WT | 5/6 | 3/3 |
 | Quicr libquicr | d16 | QUIC | unverified | unverified |
