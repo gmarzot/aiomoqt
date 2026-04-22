@@ -8,17 +8,17 @@ Usage:
     cd ~/Projects/moq/aiomoqt
 
     # CI path: unit + integration (no network)
-    tests/release-regression-test.py --test-tier unit --test-tier integration
+    tests/release_regression_test.py --test-tier unit --test-tier integration
 
     # Interop across every relay in catalog, 4 relays in parallel
-    tests/release-regression-test.py --test-tier interop --interop-parallel 4
+    tests/release_regression_test.py --test-tier interop --interop-parallel 4
 
     # Limit to one relay
-    tests/release-regression-test.py --only moqx-main
-    tests/release-regression-test.py --only cloudflare-d14
+    tests/release_regression_test.py --only moqx-main
+    tests/release_regression_test.py --only cloudflare-d14
 
     # Adaptive throughput bench (manual dispatch only)
-    tests/release-regression-test.py --test-tier bench
+    tests/release_regression_test.py --test-tier bench
 
 Exit 0 iff every test passed. `[skip]` suites don't count.
 """

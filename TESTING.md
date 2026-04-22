@@ -16,13 +16,13 @@ Prerequisite: **MOQ relay instance w/ certs** (local or remote, either works). E
 export RELAY=moqt://your-relay.example:4433
 
 # 1. Unit + integration (CI will also run this on the PR)
-python tests/release-regression-test.py --test-tier unit --test-tier integration
+python tests/release_regression_test.py --test-tier unit --test-tier integration
 
 # 2. Interop across the active relay catalog
-python tests/release-regression-test.py --test-tier interop --interop-parallel 4
+python tests/release_regression_test.py --test-tier interop --interop-parallel 4
 
 # 3. Adaptive throughput bench (measurement only; not a pass/fail gate)
-python tests/release-regression-test.py --test-tier bench
+python tests/release_regression_test.py --test-tier bench
 
 # 4. Docker image smoke — build, list cases, run live
 docker build --build-arg VERSION=0.0.0 -t aiomoqt-test .
@@ -91,32 +91,32 @@ or `--test-suite <suite>` (runs a single suite, ignoring tier).
 
 ## Automated runner
 
-`tests/release-regression-test.py` drives every tier. All commands are
+`tests/release_regression_test.py` drives every tier. All commands are
 one-liners and chainable:
 
 ```bash
 # CI path — runs on every PR to main
-python tests/release-regression-test.py --test-tier unit --test-tier integration
+python tests/release_regression_test.py --test-tier unit --test-tier integration
 
 # Single tier
-python tests/release-regression-test.py --test-tier unit
-python tests/release-regression-test.py --test-tier interop
+python tests/release_regression_test.py --test-tier unit
+python tests/release_regression_test.py --test-tier interop
 
 # Individual suite (bypasses tier grouping)
-python tests/release-regression-test.py --test-suite message
-python tests/release-regression-test.py --test-suite loopback-pub-sub --test-suite relay-ctrl-msg
+python tests/release_regression_test.py --test-suite message
+python tests/release_regression_test.py --test-suite loopback-pub-sub --test-suite relay-ctrl-msg
 
 # Interop in parallel across relays
-python tests/release-regression-test.py --test-tier interop --interop-parallel 4
+python tests/release_regression_test.py --test-tier interop --interop-parallel 4
 
 # Interop scoped to one relay (works on disabled entries too)
-python tests/release-regression-test.py --test-tier interop --only moqx-main
+python tests/release_regression_test.py --test-tier interop --only moqx-main
 
 # Custom catalog
-python tests/release-regression-test.py --catalog /path/to/my-relays.json
+python tests/release_regression_test.py --catalog /path/to/my-relays.json
 
 # Adaptive bench
-python tests/release-regression-test.py --test-tier bench
+python tests/release_regression_test.py --test-tier bench
 ```
 
 Exit 0 iff every non-skipped test passed. `[skip]` entries (per-relay
@@ -165,7 +165,7 @@ Adding a new relay — minimal recipe:
 ```bash
 # 1. Add a stub entry
 # 2. Probe it manually
-python tests/release-regression-test.py --test-tier interop --only <your-name>
+python tests/release_regression_test.py --test-tier interop --only <your-name>
 # 3. Based on results, tune disabled_suites or set disabled: true
 ```
 
