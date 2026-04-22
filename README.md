@@ -199,7 +199,7 @@ python -m aiomoqt.examples.moq_interop_client -r "moqt://relay.ex.com:4433"
 python -m aiomoqt.examples.moq_interop_client -r "moqt://relay.ex.com:4433" --draft 16
 
 # Single test case
-python -m aiomoqt.examples.moq_interop_client -r "moqt://relay" -t subscribe-error
+python -m aiomoqt.examples.moq_interop_client -r "moqt://relay.ex.com:4433" -t subscribe-error
 
 # List test cases
 python -m aiomoqt.examples.moq_interop_client -l
@@ -207,12 +207,28 @@ python -m aiomoqt.examples.moq_interop_client -l
 
 ### Relay Probe
 
+Batch liveness + draft-version check. Reads a relay list, does a
+real CLIENT_SETUP / SERVER_SETUP handshake per (endpoint × draft) —
+no bare-ALPN tricks — and writes a JSON status report.
+
 ```bash
+# one-shot probe of RELAYS_FILE, write OUTPUT_FILE, exit
+PROBE_ONCE=1 RELAYS_FILE=relays.json OUTPUT_FILE=relay-status.json \
+  python -m aiomoqt.examples.relay_probe
+
+# long-running monitor: re-probe every PROBE_INTERVAL seconds
 python -m aiomoqt.examples.relay_probe
 ```
 
-Environment variables: `RELAYS_FILE`, `OUTPUT_FILE`,
-`PROBE_TIMEOUT`, `PROBE_INTERVAL`, `PROBE_ONCE`
+Environment variables:
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `RELAYS_FILE` | `/app/relays.json` | input relay list |
+| `OUTPUT_FILE` | `/output/relay-status.json` | status report destination |
+| `PROBE_TIMEOUT` | `8` | per-probe handshake timeout (s) |
+| `PROBE_INTERVAL` | `300` | re-probe cadence in monitor mode (s) |
+| `PROBE_ONCE` | unset | if set, probe once and exit |
 
 ### WebTransport Server
 
