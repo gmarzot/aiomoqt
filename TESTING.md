@@ -15,6 +15,13 @@ Before tagging, run these four high-level commands in order. Each is
 the "do them all" form of its tier — individual suites are spelled
 out in later sections but are not part of the release gate.
 
+Prerequisite: a **local MoQT relay running with real TLS certs**,
+reachable on the host doing the validation. The automated `integration`
+tier uses an in-process qh3 loopback (good for correctness, not for
+realistic throughput/fanout). The local relay is the environment that
+surfaces real-cert handshake, real network pacing, and multi-subscriber
+fanout behavior.
+
 ```bash
 # 1. Unit + integration (CI will also run this on the PR)
 python tests/release-regression-test.py --test-tier unit --test-tier integration
@@ -30,6 +37,18 @@ docker build --build-arg VERSION=0.0.0 -t aiomoqt-test .
 docker run --rm aiomoqt-test -l
 docker run --rm -e RELAY_URL=moqt://moqx-main.ci.openmoq.org:4433 \
   aiomoqt-test --draft 14
+
+# 5. Local relay — high-throughput pub/sub (d16 raw QUIC shown; run d14 and
+#    h3-wt variants too by swapping --draft and the URL scheme)
+#    Shell A (publisher):
+python -m aiomoqt.examples.pub_bench moqt://$LOCAL_RELAY:4433 \
+  -s 500000 -t 60 -r 30 -g 30 -k --draft 16
+#    Shell B (subscriber):
+python -m aiomoqt.examples.sub_bench moqt://$LOCAL_RELAY:4433 -k --draft 16
+
+# 6. Local relay — multi-subscriber fanout (pub + N subs in one process)
+python -m aiomoqt.examples.multi_sub_bench moqt://$LOCAL_RELAY:4433 \
+  -n 30 -s 1024 -r 60 -t 60 -k --draft 16
 ```
 
 Pass criteria:
@@ -38,6 +57,8 @@ Pass criteria:
 - **(2)** active relays green; known `unverified` / `unreachable` OK.
 - **(3)** reports a ceiling without crashing. Not a gate.
 - **(4)** build clean; `-l` lists 8 cases; live run exits 0.
+- **(5)** > 100 Mbps sustained, zero loss, p50 < ~5 ms.
+- **(6)** N/N subscribers ok, zero resets.
 
 ---
 
