@@ -45,8 +45,7 @@ pip install aiomoqt
 uv pip install aiomoqt
 ```
 
-> For a clean `uv`-managed dev setup with a pinned Python and Cython,
-> run `./bootstrap_python.sh` from a repo clone.
+**note:** `./bootstrap_python.sh` sets up a clean `uv`-managed environment with pinned Python and Cython, for convenience.
 
 ## Quick Start
 
@@ -295,9 +294,6 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[test]"
 pytest aiomoqt/tests/
 ```
-
-Optionally, `./bootstrap_python.sh` sets up a full uv-managed environment
-with a specific Python version and Cython.
 
 ## TODO
 
