@@ -22,18 +22,18 @@ an interop test client compatible with the
 ### Features
 
 - H3/WebTransport and raw QUIC transports
+- **Draft-14/16:** ALPN negotiation (`moq-00` / `moqt-16`)
+- **Draft-16:** delta-encoded param keys, track extensions, unified request response
+- Wire format: SubgroupHeader / ObjectDatagram flag encoding, delta-encoded object IDs
+- Version-independent API: `MOQTRequestError` exception across drafts
 - Async context manager for session lifecycle
 - High-level control message API with sync/async response handling
+- High-level publisher API ([`PublishedTrack`](aiomoqt/track.py)): stream setup, subgroup writing, pacing
+- High-level subscriber API ([`SubscribedTrack`](aiomoqt/track.py)): object reassembly, FETCH / JOIN handling
 - Low-level message serialization/deserialization
-- Version-independent API: `MOQTRequestError` exception across drafts
 - Pluggable message handlers via `register_handler()`
 - Data publishing via SubgroupHeader streams or ObjectDatagrams
 - Data reception via `on_object_received` callback
-- **Draft-14/16:** ALPN negotiation (`moq-00` / `moqt-16`)
-- **Draft-16:** delta-encoded parameter keys, track extensions,
-  unified REQUEST_OK/REQUEST_ERROR
-- **Wire format:** SubgroupHeader/ObjectDatagram flag encoding,
-  delta-encoded object IDs
 
 ## Installation
 
@@ -44,6 +44,8 @@ pip install aiomoqt
 # or
 uv pip install aiomoqt
 ```
+
+**note:** `./bootstrap_python.sh` provided for easy `uv`-based Python venv install
 
 ## Quick Start
 
@@ -122,17 +124,6 @@ resp = await session.subscribe('ns', 'track', wait_response=True)
 req = await session.subscribe('ns', 'track')
 ```
 
-### Relay URL Formats
-
-Examples and benchmarks accept relay URLs in several forms:
-
-```
-moqt://host:port            Raw QUIC (default port 443)
-https://host:port/endpoint  H3/WebTransport (default port 443)
-host:port                   H3/WebTransport
-host                        H3/WebTransport, port 443, endpoint /moq
-```
-
 ## Examples
 
 ### Publisher / Subscriber
@@ -154,6 +145,13 @@ python -m aiomoqt.examples.join_example --host relay.ex.com --use-quic
 Common options: `--namespace`, `--trackname`, `--endpoint`, `--debug`, `--keylogfile`
 
 ### Benchmarks
+
+Bench tools take a positional relay URL:
+
+```
+moqt://host[:port]              Raw QUIC (default port 443)
+https://host[:port]/[endpoint]  H3/WebTransport (default port 443)
+```
 
 ```bash
 # Publisher — configurable size, rate, parallelism
@@ -195,13 +193,13 @@ Publisher flow selection (for relays that require a specific message pattern):
 
 ```bash
 # All tests (draft-14, auto-detected)
-python -m aiomoqt.examples.moq_interop_client -r "moqt://moqx-000.ci.openmoq.org:4433"
+python -m aiomoqt.examples.moq_interop_client -r "moqt://relay.ex.com:4433"
 
 # All tests (draft-16)
-python -m aiomoqt.examples.moq_interop_client -r "moqt://moqx-000.ci.openmoq.org:4433" --draft 16
+python -m aiomoqt.examples.moq_interop_client -r "moqt://relay.ex.com:4433" --draft 16
 
 # Single test case
-python -m aiomoqt.examples.moq_interop_client -r "moqt://relay" -t subscribe-error
+python -m aiomoqt.examples.moq_interop_client -r "moqt://relay.ex.com:4433" -t subscribe-error
 
 # List test cases
 python -m aiomoqt.examples.moq_interop_client -l
@@ -209,12 +207,31 @@ python -m aiomoqt.examples.moq_interop_client -l
 
 ### Relay Probe
 
+Batch liveness + draft-version check. Reads a relay list, does a
+real CLIENT_SETUP / SERVER_SETUP handshake per (endpoint × draft) —
+no bare-ALPN tricks — and writes a JSON status report.
+
+Accepts CLI flags, environment variables, or both (CLI overrides env):
+
 ```bash
-python -m aiomoqt.examples.relay_probe
+# CLI form (typical interactive use)
+python -m aiomoqt.examples.relay_probe -f relays.json -o status.json --once
+
+# Env form (typical container/daemon deployment)
+RELAYS_FILE=relays.json OUTPUT_FILE=status.json PROBE_ONCE=1 \
+  python -m aiomoqt.examples.relay_probe
+
+# Long-running monitor (re-probe every --interval seconds)
+python -m aiomoqt.examples.relay_probe -f relays.json -o status.json
 ```
 
-Environment variables: `RELAYS_FILE`, `OUTPUT_FILE`,
-`PROBE_TIMEOUT`, `PROBE_INTERVAL`, `PROBE_ONCE`
+| CLI flag | Env var | Default | Meaning |
+|----------|---------|---------|---------|
+| `-f / --relays-file` | `RELAYS_FILE` | `/app/relays.json` | input relay list |
+| `-o / --output-file` | `OUTPUT_FILE` | `/output/relay-status.json` | status report destination |
+| `--timeout` | `PROBE_TIMEOUT` | `8` | per-probe handshake timeout (s) |
+| `--interval` | `PROBE_INTERVAL` | `300` | re-probe cadence in monitor mode (s) |
+| `--once` | `PROBE_ONCE=1` | unset | probe once and exit |
 
 ### WebTransport Server
 
@@ -251,28 +268,32 @@ Error codes are validated to spec-conformant values
 
 | Relay | Draft | Transport | ctrl-msg | pub-sub |
 |-------|-------|-----------|----------|---------|
-| OpenMoQ moqx | d14 | Raw QUIC | 6/6 | 3/3 |
-| OpenMoQ moqx | d14 | WebTransport | 6/6 | 3/3 |
-| OpenMoQ moqx | d16 | Raw QUIC | 6/6 | 3/3 |
-| OpenMoQ moqx | d16 | WebTransport | 6/6 | 3/3 |
-| Meta moxygen | d14 | Raw QUIC | 6/6 | 3/3 |
-| Meta moxygen | d14 | WebTransport | 6/6 | 3/3 |
-| Meta moxygen | d16 | Raw QUIC | 6/6 | 3/3 |
-| Meta moxygen | d16 | WebTransport | 6/6 | 3/3 |
-| Cloudflare moq-rs | d14 | Raw QUIC | 4/6 | 3/3 |
-| Red5 Pro | d14 | WebTransport | 6/6 | unverified |
-| Red5 Pro | d16 | WebTransport | 6/6 | unverified |
-| Quicr libquicr | d14 | Raw QUIC | 5/6 | 3/3 |
-| Quicr libquicr | d14 | WebTransport | 5/6 | 3/3 |
-| Quicr libquicr | d16 | Raw QUIC | unverified | unverified |
-| Quicr libquicr | d16 | WebTransport | 5/6 | 3/3 |
+| OpenMoQ moqx | d14 | QUIC | 6/6 | 3/3 |
+| OpenMoQ moqx | d14 | H3/WT | 6/6 | 3/3 |
+| OpenMoQ moqx | d16 | QUIC | 6/6 | 3/3 |
+| OpenMoQ moqx | d16 | H3/WT | 6/6 | 3/3 |
+| Meta moxygen | d14 | QUIC | 6/6 | 3/3 |
+| Meta moxygen | d14 | H3/WT | 6/6 | 3/3 |
+| Meta moxygen | d16 | QUIC | 6/6 | 3/3 |
+| Meta moxygen | d16 | H3/WT | 6/6 | 3/3 |
+| Cloudflare moq-rs | d14 | QUIC | 5/6 | 3/3 |
+| Cloudflare moq-rs (d16 interop branch) | d16 | QUIC | 6/6 | unverified |
+| Red5 Pro | d14 | QUIC | unreachable | unreachable |
+| Red5 Pro | d14 | H3/WT | 6/6 | unverified |
+| Red5 Pro | d16 | QUIC | unreachable | unreachable |
+| Red5 Pro | d16 | H3/WT | 6/6 | unverified |
+| Quicr libquicr | d14 | QUIC | 5/6 | 3/3 |
+| Quicr libquicr | d14 | H3/WT | 5/6 | 3/3 |
+| Quicr libquicr | d16 | QUIC | unverified | unverified |
+| Quicr libquicr | d16 | H3/WT | 5/6 | 3/3 |
+| Meetecho imquic | d16 | QUIC | 6/6 | unverified |
+| Meetecho imquic | d16 | H3/WT | 5/6 | unverified |
+| OzU moqtail | d14 | H3/WT | 6/6 | unverified |
 
-Entries marked `unverified` did not complete successfully against our
-current client and are pending further investigation on our side or
-the peer's. A few relays in the catalog are disabled by default and
-can be re-probed individually with `--only`: `cdn.moq.dev/anon`
-(subscriber-only endpoint in our current test harness) and
-`quichemoq.dev` (connection did not complete during our probe).
+- `unverified` — suite did not complete end-to-end.
+- `unreachable` — no response to QUIC Initial.
+- See [`tests/relays.json`](tests/relays.json) for the full catalog,
+  per-endpoint notes, and relays disabled by default.
 
 Test cases: `setup-only`, `announce-only`, `publish-namespace-done`,
 `subscribe-error`, `announce-subscribe`, `subscribe-before-announce`,
@@ -288,9 +309,6 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[test]"
 pytest aiomoqt/tests/
 ```
-
-Optionally, `./bootstrap_python.sh` sets up a full uv-managed environment
-with a specific Python version and Cython.
 
 ## TODO
 

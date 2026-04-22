@@ -23,3 +23,5 @@ wheels/
 .DS_Store
 *.prof
 *.bin
+.claude/
+.vscode/settings.json.local
