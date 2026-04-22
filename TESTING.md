@@ -4,9 +4,6 @@ This document is the checklist run before tagging a release. CI runs
 the unit + integration tiers automatically on every PR to main; the
 interop and bench tiers are owner-dispatched or run locally.
 
-Bench tools auto-generate unique tracknames from test parameters to
-avoid stale-cache collisions on relays that key by (namespace, trackname).
-
 ---
 
 ## Pre-Release Checklist
@@ -189,6 +186,10 @@ The runner covers `unit`, `integration`, `interop`, and `bench` tiers
 in one invocation. The sections below are for ad-hoc investigation
 against a local relay — useful during protocol work, not needed for a
 release gate.
+
+Bench tools (`pub_bench`, `sub_bench`, `relay_bench`, `multi_sub_bench`)
+auto-generate unique tracknames from test parameters to avoid
+stale-cache collisions on relays that key by (namespace, trackname).
 
 ### Local relay pub/sub — d16 raw QUIC, 500 KB objects
 
