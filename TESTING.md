@@ -25,22 +25,19 @@ python tests/release-regression-test.py --test-tier interop --interop-parallel 4
 # 3. Adaptive throughput bench (measurement only; not a pass/fail gate)
 python tests/release-regression-test.py --test-tier bench
 
-# 4. Docker image builds cleanly (release workflow does this on tag;
-#    smoke-test locally if you've touched the Dockerfile or pyproject)
+# 4. Docker image smoke — build, list cases, run live against a known-good relay
 docker build --build-arg VERSION=0.0.0 -t aiomoqt-test .
 docker run --rm aiomoqt-test -l
+docker run --rm -e RELAY_URL=moqt://moqx-main.ci.openmoq.org:4433 \
+  aiomoqt-test --draft 14
 ```
 
 Pass criteria:
 
-- **(1)** all suites green. This one is blocking; don't tag if it fails.
-- **(2)** active relays green; `unverified` / `unreachable` entries
-  already noted in `tests/relays.json` are expected. New failures on
-  previously-green relays should be investigated.
-- **(3)** reports a ceiling (or `no ceiling up to N Mbps`) without
-  crashing. The number itself is host-dependent and not a gate —
-  useful for trend comparison against prior releases.
-- **(4)** image builds; `-l` lists the 8 test-case names.
+- **(1)** all green. Blocking.
+- **(2)** active relays green; known `unverified` / `unreachable` OK.
+- **(3)** reports a ceiling without crashing. Not a gate.
+- **(4)** build clean; `-l` lists 8 cases; live run exits 0.
 
 ---
 
