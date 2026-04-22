@@ -126,13 +126,6 @@ req = await session.subscribe('ns', 'track')
 
 ## Examples
 
-Examples and benchmarks accept relay URLs in two forms:
-
-```
-moqt://host[:port]              Raw QUIC (default port 443)
-https://host[:port]/[endpoint]  H3/WebTransport (default port 443)
-```
-
 ### Publisher / Subscriber
 
 ```bash
@@ -152,6 +145,13 @@ python -m aiomoqt.examples.join_example --host relay.ex.com --use-quic
 Common options: `--namespace`, `--trackname`, `--endpoint`, `--debug`, `--keylogfile`
 
 ### Benchmarks
+
+Bench tools take a positional relay URL:
+
+```
+moqt://host[:port]              Raw QUIC (default port 443)
+https://host[:port]/[endpoint]  H3/WebTransport (default port 443)
+```
 
 ```bash
 # Publisher — configurable size, rate, parallelism
