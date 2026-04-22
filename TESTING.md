@@ -8,7 +8,7 @@ interop and bench tiers are owner-dispatched or run locally.
 
 ## Pre-Release Checklist
 
-Before tagging a new release, run these four high-level commands in order taking argumenbts to cover all test suites in each tier. The automated `integration` tier uses an in-process qh3 loopback. The local relay provides a higher fidelity test target for performance a can conformance verification
+Before tagging a new release, run these high-level commands in order taking arguments to cover all test suites in each tier. The automated `integration` tier uses an in-process qh3 loopback. Using an actual relay instance provides a higher fidelity test target for performance measurements and conformance tests.
 
 Prerequisite: **MOQ relay instance w/ certs** (local or remote, either works). Export its URL once:
 
