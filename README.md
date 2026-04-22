@@ -211,24 +211,27 @@ Batch liveness + draft-version check. Reads a relay list, does a
 real CLIENT_SETUP / SERVER_SETUP handshake per (endpoint × draft) —
 no bare-ALPN tricks — and writes a JSON status report.
 
+Accepts CLI flags, environment variables, or both (CLI overrides env):
+
 ```bash
-# one-shot probe of RELAYS_FILE, write OUTPUT_FILE, exit
-PROBE_ONCE=1 RELAYS_FILE=relays.json OUTPUT_FILE=relay-status.json \
+# CLI form (typical interactive use)
+python -m aiomoqt.examples.relay_probe -f relays.json -o status.json --once
+
+# Env form (typical container/daemon deployment)
+RELAYS_FILE=relays.json OUTPUT_FILE=status.json PROBE_ONCE=1 \
   python -m aiomoqt.examples.relay_probe
 
-# long-running monitor: re-probe every PROBE_INTERVAL seconds
-python -m aiomoqt.examples.relay_probe
+# Long-running monitor (re-probe every --interval seconds)
+python -m aiomoqt.examples.relay_probe -f relays.json -o status.json
 ```
 
-Environment variables:
-
-| Variable | Default | Meaning |
-|----------|---------|---------|
-| `RELAYS_FILE` | `/app/relays.json` | input relay list |
-| `OUTPUT_FILE` | `/output/relay-status.json` | status report destination |
-| `PROBE_TIMEOUT` | `8` | per-probe handshake timeout (s) |
-| `PROBE_INTERVAL` | `300` | re-probe cadence in monitor mode (s) |
-| `PROBE_ONCE` | unset | if set, probe once and exit |
+| CLI flag | Env var | Default | Meaning |
+|----------|---------|---------|---------|
+| `-f / --relays-file` | `RELAYS_FILE` | `/app/relays.json` | input relay list |
+| `-o / --output-file` | `OUTPUT_FILE` | `/output/relay-status.json` | status report destination |
+| `--timeout` | `PROBE_TIMEOUT` | `8` | per-probe handshake timeout (s) |
+| `--interval` | `PROBE_INTERVAL` | `300` | re-probe cadence in monitor mode (s) |
+| `--once` | `PROBE_ONCE=1` | unset | probe once and exit |
 
 ### WebTransport Server
 

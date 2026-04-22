@@ -33,10 +33,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("relay-probe")
 
+# Runtime config. Values read from env at import time so existing
+# container deployments keep working; the CLI parser in __main__
+# rebinds these from argparse defaults when the module is invoked
+# directly, giving CLI-over-env precedence.
 PROBE_TIMEOUT = int(os.getenv("PROBE_TIMEOUT", "8"))
 PROBE_INTERVAL = int(os.getenv("PROBE_INTERVAL", "300"))
 RELAYS_FILE = os.getenv("RELAYS_FILE", "/app/relays.json")
 OUTPUT_FILE = os.getenv("OUTPUT_FILE", "/output/relay-status.json")
+PROBE_ONCE = os.getenv("PROBE_ONCE", "").lower() in ("1", "true", "yes")
 
 # Draft versions to probe, oldest first — d14 bare WT CONNECT must
 # run before d16 (which sends wt-available-protocols) to avoid
@@ -232,7 +237,6 @@ async def run_loop():
             ]},
         ]
 
-    once = os.getenv("PROBE_ONCE", "").lower() in ("1", "true", "yes")
     last_probed = {}  # relay_id -> monotonic time of last probe
     cached_results = {}  # relay_id -> last probe result
 
@@ -246,35 +250,60 @@ async def run_loop():
         tmp.rename(out)
         logger.info(f"Wrote {out}")
 
-        if once:
+        if PROBE_ONCE:
             break
 
         logger.info(f"Next probe in {PROBE_INTERVAL}s")
         await asyncio.sleep(PROBE_INTERVAL)
 
 
-if __name__ == "__main__":
+def _parse_args():
     import argparse
-    parser = argparse.ArgumentParser(
+    p = argparse.ArgumentParser(
         prog="python -m aiomoqt.examples.relay_probe",
-        description="MOQ relay probe — probes relays for liveness and draft version support.",
-        epilog="""environment variables:
-  RELAYS_FILE      path to relay list JSON (default: /app/relays.json)
-  OUTPUT_FILE      status JSON output path (default: /output/relay-status.json)
-  PROBE_TIMEOUT    per-probe timeout in seconds (default: 8)
-  PROBE_INTERVAL   seconds between probe cycles (default: 300)
-  PROBE_ONCE       set "1" for single run then exit (default: loop)
-
-Reads RELAYS_FILE for relay definitions. If not found, uses built-in
-defaults (OpenMoQ, Meta moxygen, Cloudflare). Each relay endpoint is
-probed for draft-16 and draft-14 support. Results are written as JSON
-to OUTPUT_FILE.
-
-Relays may specify a per-relay "interval" (seconds) in relays.json
-to override PROBE_INTERVAL for that relay. Cached results are used
-between probes.
-""",
+        description="MOQ relay probe — liveness and draft-version check.",
+        epilog=(
+            "Each CLI flag defaults from its matching environment "
+            "variable (RELAYS_FILE, OUTPUT_FILE, PROBE_TIMEOUT, "
+            "PROBE_INTERVAL, PROBE_ONCE), so container deployments "
+            "that set env vars keep working unchanged. CLI flags "
+            "override env. A per-relay 'interval' field in the "
+            "relays file overrides --interval for that relay. "
+            "If the relays file is missing, a small built-in list "
+            "is used so the process always has something to probe."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.parse_args()
+    p.add_argument(
+        "-f", "--relays-file", default=RELAYS_FILE, metavar="PATH",
+        help=f"input relay list JSON (env: RELAYS_FILE; "
+             f"default: {RELAYS_FILE!r})")
+    p.add_argument(
+        "-o", "--output-file", default=OUTPUT_FILE, metavar="PATH",
+        help=f"status JSON output path (env: OUTPUT_FILE; "
+             f"default: {OUTPUT_FILE!r})")
+    p.add_argument(
+        "--timeout", type=int, default=PROBE_TIMEOUT, metavar="SEC",
+        help=f"per-probe handshake timeout (env: PROBE_TIMEOUT; "
+             f"default: {PROBE_TIMEOUT})")
+    p.add_argument(
+        "--interval", type=int, default=PROBE_INTERVAL, metavar="SEC",
+        help=f"seconds between probe cycles (env: PROBE_INTERVAL; "
+             f"default: {PROBE_INTERVAL})")
+    p.add_argument(
+        "--once", action="store_true", default=PROBE_ONCE,
+        help="probe once and exit (env: PROBE_ONCE=1)")
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    args = _parse_args()
+    # CLI overrides env overrides hard default. Rebinding module-level
+    # constants keeps existing references in probe_version / probe_all
+    # / run_loop working with zero signature churn.
+    RELAYS_FILE = args.relays_file
+    OUTPUT_FILE = args.output_file
+    PROBE_TIMEOUT = args.timeout
+    PROBE_INTERVAL = args.interval
+    PROBE_ONCE = args.once
     asyncio.run(run_loop())
