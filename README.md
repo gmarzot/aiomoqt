@@ -28,9 +28,7 @@ an interop test client compatible with the
 - Version-independent API: `MOQTRequestError` exception across drafts
 - Async context manager for session lifecycle
 - High-level control message API with sync/async response handling
-- **Track API:** `PublishedTrack` / `SubscribedTrack` wrap stream setup,
-  subgroup/object writing, pacing, and FETCH/JOIN reassembly
-  (see [`aiomoqt.track`](aiomoqt/track.py))
+- **Track API** ([`aiomoqt.track`](aiomoqt/track.py)): `PublishedTrack` / `SubscribedTrack` wrap stream setup, subgroup writing, pacing, FETCH/JOIN reassembly
 - Low-level message serialization/deserialization
 - Pluggable message handlers via `register_handler()`
 - Data publishing via SubgroupHeader streams or ObjectDatagrams
