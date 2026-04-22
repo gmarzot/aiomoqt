@@ -216,18 +216,18 @@ class AIMDController:
     is user-driven (Ctrl-C) or --max-mbps.
 
     - Every `interval_s`, snapshot metrics and decide.
-    - Ramp: +step_mbps while loss==0 and p99 stays near baseline.
+    - Ramp: +step_mbps while loss==0 and p50 stays under SLA.
     - Back off: multiply aggregate by backoff_factor on any signal.
     - Signals:
         * loss_pct > loss_threshold_pct in the last window
-        * p99 > threshold (or baseline*1.5) for 2 consecutive intervals
+        * p50 > p50_threshold_ms for 2 consecutive intervals
         * achieved rx_bitrate < shortfall_ratio * commanded for 2 intervals
     - Tracks high_water_mbps = highest stable rate seen so far.
     """
 
     def __init__(self, scenario: Scenario, state: BenchState,
                  stats: LiveStats, writer=None,
-                 p99_threshold_ms: Optional[float] = None,
+                 p50_threshold_ms: float = 100.0,
                  backoff_factor: float = 0.9,
                  shortfall_ratio: float = 0.85,
                  loss_threshold_pct: float = 0.5):
@@ -235,14 +235,11 @@ class AIMDController:
         self.state = state
         self.stats = stats
         self.writer = writer
-        # Absolute SLA mode: reject once p99 exceeds this. If None, fall
-        # back to the relative "p99 > baseline * 1.5 for 2 intervals" rule.
-        self.p99_threshold_ms = p99_threshold_ms
+        self.p50_threshold_ms = p50_threshold_ms
         self.backoff_factor = backoff_factor
         self.shortfall_ratio = shortfall_ratio
         self.loss_threshold_pct = loss_threshold_pct
-        self.baseline_p99 = None
-        self.high_p99_streak = 0
+        self.high_latency_streak = 0
         self.shortfall_streak = 0
         self.high_water_mbps = scenario.start_mbps
         self.samples = 0
@@ -283,35 +280,18 @@ class AIMDController:
                 self._print_row(snap, "warming")
                 continue
 
-            # Establish baseline p99 from the first stable sample
-            if self.baseline_p99 is None:
-                self.baseline_p99 = snap.p99_ms
-                self.high_water_mbps = snap.commanded_mbps
-
             # Ceiling signal evaluation
             reason = None
             if snap.loss_pct > self.loss_threshold_pct:
                 reason = f"loss={snap.loss_pct:.1f}%"
 
-            # p99 ceiling: absolute SLA if --p99-threshold is set,
-            # otherwise relative-to-baseline (requires 2 consecutive
-            # high samples to avoid reacting to one-off spikes).
-            if self.p99_threshold_ms is not None:
-                if snap.p99_ms > self.p99_threshold_ms:
-                    self.high_p99_streak += 1
-                    if self.high_p99_streak >= 2 and reason is None:
-                        reason = (f"p99={snap.p99_ms:.0f}ms > "
-                                  f"threshold {self.p99_threshold_ms:.0f}ms")
-                else:
-                    self.high_p99_streak = 0
+            if snap.p50_ms > self.p50_threshold_ms:
+                self.high_latency_streak += 1
+                if self.high_latency_streak >= 2 and reason is None:
+                    reason = (f"p50={snap.p50_ms:.0f}ms > "
+                              f"{self.p50_threshold_ms:.0f}ms")
             else:
-                if snap.p99_ms > self.baseline_p99 * 1.5:
-                    self.high_p99_streak += 1
-                    if self.high_p99_streak >= 2 and reason is None:
-                        reason = (f"p99={snap.p99_ms:.0f}ms > "
-                                  f"baseline*1.5 ({self.baseline_p99*1.5:.0f})")
-                else:
-                    self.high_p99_streak = 0
+                self.high_latency_streak = 0
 
             if snap.commanded_mbps > 0 and snap.rx_bitrate_mbps > 0:
                 ratio = snap.rx_bitrate_mbps / snap.commanded_mbps
@@ -332,7 +312,7 @@ class AIMDController:
                                 f"hi-water={self.high_water_mbps:.1f}")
                 self._set_rate(new_mbps)
                 # Reset streaks so we don't immediately re-trip on stale state
-                self.high_p99_streak = 0
+                self.high_latency_streak = 0
                 self.shortfall_streak = 0
                 continue
 
@@ -579,11 +559,10 @@ def parse_args():
     p.add_argument("--key", default=KEY)
     p.add_argument("--report", metavar="PATH",
                    help="write per-sample metrics as CSV to PATH")
-    p.add_argument("-l", "--latency-threshold", type=float, default=None,
+    p.add_argument("-l", "--latency-threshold", type=float, default=100.0,
                    metavar="MS", dest="latency_threshold",
-                   help="absolute p99 latency SLA in ms; back off once "
-                        "exceeded. If unset, uses relative "
-                        "'p99 > baseline * 1.5' policy")
+                   help="p50 latency SLA in ms; back off after 2 intervals "
+                        "over (default: 100)")
     p.add_argument("--backoff-factor", type=float, default=0.9,
                    dest="backoff_factor", metavar="F",
                    help="multiplicative back-off factor on ceiling signal "
@@ -666,7 +645,7 @@ async def main():
 
     controller = AIMDController(
         args.scenario, state, stats, writer=csv_writer,
-        p99_threshold_ms=args.latency_threshold,
+        p50_threshold_ms=args.latency_threshold,
         backoff_factor=args.backoff_factor,
         shortfall_ratio=args.shortfall_ratio,
     )
