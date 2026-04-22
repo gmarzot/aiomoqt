@@ -280,6 +280,20 @@ class AIMDController:
                 self._print_row(snap, "warming")
                 continue
 
+            # Dead-air guard: rx=0 for 3 consecutive intervals means
+            # no data is flowing (subscribe failed, publisher stuck,
+            # etc.). Don't climb a phantom ramp.
+            if snap.rx_bitrate_mbps <= 0:
+                self.no_data_streak = getattr(self, 'no_data_streak', 0) + 1
+                if self.no_data_streak >= 3:
+                    state.ceiling_reason = "no data received — subscribe failed or publisher stalled"
+                    self._print_row(snap, "ABORT: rx=0 for 3 intervals")
+                    state.stop.set()
+                    return
+                self._print_row(snap, f"rx=0 (streak {self.no_data_streak}/3)")
+                continue
+            self.no_data_streak = 0
+
             # Ceiling signal evaluation
             reason = None
             if snap.loss_pct > self.loss_threshold_pct:
@@ -380,8 +394,8 @@ async def run_loopback_server(args, state: BenchState):
         per_subgroup = state.rate_ops / max(1, args.scenario.subgroups)
         track = PublishedTrack(
             session,
-            namespace="bench.load",
-            trackname="track",
+            namespace=args.namespace,
+            trackname=args.trackname,
             object_size=args.scenario.object_size,
             group_size=10000,
             num_subgroups=args.scenario.subgroups,
@@ -442,6 +456,7 @@ async def run_loopback_server(args, state: BenchState):
 
 async def run_subscriber_client(host: str, port: int, endpoint: str,
                                 use_quic: bool, verify_tls: bool,
+                                args,
                                 state: BenchState,
                                 stats: LiveStats):
     client = MOQTClient(
@@ -449,23 +464,41 @@ async def run_subscriber_client(host: str, port: int, endpoint: str,
         endpoint=endpoint,
         use_quic=use_quic,
         verify_tls=verify_tls,
+        draft_version=args.draft,
     )
     try:
         async with client.connect() as session:
             await session.client_session_init()
-            track = SubscribedTrack(
-                session,
-                namespace="bench.load",
-                trackname="track",
-                on_object=stats.on_object,
-            )
-            await track.subscribe()
-            # Loaded; keep running until the controller sets stop.
+            deadline = time.monotonic() + 15.0
+            track = None
+            while time.monotonic() < deadline and not state.stop.is_set():
+                track = SubscribedTrack(
+                    session,
+                    namespace=args.namespace,
+                    trackname=args.trackname,
+                    on_object=stats.on_object,
+                )
+                try:
+                    await track.subscribe()
+                    break
+                except Exception as e:
+                    msg = str(e)
+                    if "code=4" in msg or "does not exist" in msg \
+                            or "no such namespace" in msg:
+                        await asyncio.sleep(0.3)
+                        continue
+                    raise
+            else:
+                print(f"  subscriber error: publisher never announced "
+                      f"{args.namespace}/{args.trackname} within 15s")
+                state.stop.set()
+                return
             while not state.stop.is_set():
                 await asyncio.sleep(0.2)
             session.close()
     except Exception as e:
         print(f"  subscriber error: {e}")
+        state.stop.set()
 
 
 # ---------------------------------------------------------------------------
@@ -483,6 +516,7 @@ async def run_publisher_client(host: str, port: int, endpoint: str,
         endpoint=endpoint,
         use_quic=use_quic,
         verify_tls=verify_tls,
+        draft_version=args.draft,
     )
     try:
         async with client.connect() as session:
@@ -490,12 +524,13 @@ async def run_publisher_client(host: str, port: int, endpoint: str,
             per_subgroup = state.rate_ops / max(1, args.scenario.subgroups)
             track = PublishedTrack(
                 session,
-                namespace="bench.load",
-                trackname="track",
+                namespace=args.namespace,
+                trackname=args.trackname,
                 object_size=args.scenario.object_size,
                 group_size=10000,
                 num_subgroups=args.scenario.subgroups,
                 rate=per_subgroup,
+                draft=args.draft,
             )
             track._quiet = True
             track._stats_header_printed = True
@@ -511,10 +546,15 @@ async def run_publisher_client(host: str, port: int, endpoint: str,
 
             sync = asyncio.create_task(_rate_sync())
             try:
-                # publish() sends PUBLISH_NAMESPACE + PUBLISH and then
-                # produces data when a SUBSCRIBE arrives.
                 await track.publish(
-                    announce_namespace=True, publish_track=True)
+                    announce_namespace=(args.pub_ns or args.pub_both),
+                    publish_track=(not args.pub_ns or args.pub_both),
+                )
+                # Keep the session alive until the controller stops us.
+                # track.publish() only emits PUB_NS / PUBLISH; data flow
+                # happens in response to incoming SUBSCRIBE.
+                while not state.stop.is_set():
+                    await asyncio.sleep(0.2)
             finally:
                 sync.cancel()
                 try:
@@ -524,6 +564,7 @@ async def run_publisher_client(host: str, port: int, endpoint: str,
                 session.close()
     except Exception as e:
         print(f"  publisher error: {e}")
+        state.stop.set()
 
 
 # ---------------------------------------------------------------------------
@@ -546,6 +587,19 @@ def parse_args():
                    help="cap; controller stops on signal first (default: 10000)")
     p.add_argument("--interval", type=float, default=5.0,
                    metavar="S", help="controller tick period seconds (default: 5)")
+    p.add_argument("--draft", type=int, default=None,
+                   help="MoQT draft version (14 or 16)")
+    p.add_argument("-n", "--namespace", default="bench.load",
+                   help="MoQT namespace (default: bench.load)")
+    p.add_argument("--trackname", default=None,
+                   help="MoQT trackname (default: auto-unique)")
+    pub_mode = p.add_mutually_exclusive_group()
+    pub_mode.add_argument("--pub-ns", action="store_true",
+                          dest="pub_ns",
+                          help="publish via PUB_NS only")
+    pub_mode.add_argument("--pub-both", action="store_true",
+                          dest="pub_both",
+                          help="publish via PUB_NS+PUBLISH (moqx/moq-rs default)")
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("-r", "--relay-url", default=None, metavar="URL",
                       dest="relay_url",
@@ -573,6 +627,12 @@ def parse_args():
                         "(default: 0.85)")
     p.add_argument("-d", "--debug", action="store_true")
     args = p.parse_args()
+
+    if not args.pub_ns and not args.pub_both:
+        args.pub_both = True
+
+    if args.trackname is None:
+        args.trackname = f"bench-{os.getpid()}-{int(time.time()) % 100000}"
 
     args.scenario = Scenario(
         object_size=args.object_size,
@@ -666,14 +726,14 @@ async def main():
                 host, port, endpoint, use_quic, verify, args, state))
             await asyncio.sleep(0.3)
             sub_task = asyncio.create_task(run_subscriber_client(
-                host, port, endpoint, use_quic, verify, state, stats))
+                host, port, endpoint, use_quic, verify, args, state, stats))
         else:
             args.port = loopback_port  # server code still reads args.port
             server = await run_loopback_server(args, state)
             await asyncio.sleep(0.3)
             sub_task = asyncio.create_task(run_subscriber_client(
                 "localhost", loopback_port, "moq", False, False,
-                state, stats))
+                args, state, stats))
 
         ctrl_task = asyncio.create_task(controller.run())
         try:
