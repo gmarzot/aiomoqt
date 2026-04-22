@@ -1,12 +1,46 @@
 # Pre-Release Test Plan
 
 This document is the checklist run before tagging a release. CI runs
-the same tiers automatically on every PR to main (`unit` +
-`integration`); the `interop` and `bench` tiers are owner-dispatched
-or run locally.
+the unit + integration tiers automatically on every PR to main; the
+interop and bench tiers are owner-dispatched or run locally.
 
 Bench tools auto-generate unique tracknames from test parameters to
 avoid stale-cache collisions on relays that key by (namespace, trackname).
+
+---
+
+## Pre-Release Checklist
+
+Before tagging, run these four high-level commands in order. Each is
+the "do them all" form of its tier — individual suites are spelled
+out in later sections but are not part of the release gate.
+
+```bash
+# 1. Unit + integration (CI will also run this on the PR)
+python tests/release-regression-test.py --test-tier unit --test-tier integration
+
+# 2. Interop across the active relay catalog
+python tests/release-regression-test.py --test-tier interop --interop-parallel 4
+
+# 3. Adaptive throughput bench (measurement only; not a pass/fail gate)
+python tests/release-regression-test.py --test-tier bench
+
+# 4. Docker image builds cleanly (release workflow does this on tag;
+#    smoke-test locally if you've touched the Dockerfile or pyproject)
+docker build --build-arg VERSION=0.0.0 -t aiomoqt-test .
+docker run --rm aiomoqt-test -l
+```
+
+Pass criteria:
+
+- **(1)** all suites green. This one is blocking; don't tag if it fails.
+- **(2)** active relays green; `unverified` / `unreachable` entries
+  already noted in `tests/relays.json` are expected. New failures on
+  previously-green relays should be investigated.
+- **(3)** reports a ceiling (or `no ceiling up to N Mbps`) without
+  crashing. The number itself is host-dependent and not a gate —
+  useful for trend comparison against prior releases.
+- **(4)** image builds; `-l` lists the 8 test-case names.
 
 ---
 
