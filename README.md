@@ -22,18 +22,19 @@ an interop test client compatible with the
 ### Features
 
 - H3/WebTransport and raw QUIC transports
+- **Draft-14/16:** ALPN negotiation (`moq-00` / `moqt-16`)
+- **Draft-16:** delta-encoded param keys, track extensions, unified request response
+- **Wire format:** SubgroupHeader/ObjectDatagram flag encoding, delta-encoded object IDs
+- Version-independent API: `MOQTRequestError` exception across drafts
 - Async context manager for session lifecycle
 - High-level control message API with sync/async response handling
+- **Track API:** `PublishedTrack` / `SubscribedTrack` wrap stream setup,
+  subgroup/object writing, pacing, and FETCH/JOIN reassembly
+  (see [`aiomoqt.track`](aiomoqt/track.py))
 - Low-level message serialization/deserialization
-- Version-independent API: `MOQTRequestError` exception across drafts
 - Pluggable message handlers via `register_handler()`
 - Data publishing via SubgroupHeader streams or ObjectDatagrams
 - Data reception via `on_object_received` callback
-- **Draft-14/16:** ALPN negotiation (`moq-00` / `moqt-16`)
-- **Draft-16:** delta-encoded parameter keys, track extensions,
-  unified REQUEST_OK/REQUEST_ERROR
-- **Wire format:** SubgroupHeader/ObjectDatagram flag encoding,
-  delta-encoded object IDs
 
 ## Installation
 
