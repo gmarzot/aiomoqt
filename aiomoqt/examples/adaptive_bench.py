@@ -40,6 +40,7 @@ from aiomoqt.client import MOQTClient
 from aiomoqt.protocol import MOQTPeer, MOQTSession
 from aiomoqt.track import PublishedTrack, SubscribedTrack
 from aiomoqt.utils.logger import set_log_level
+from aiomoqt.utils.format import fmt_bps, fmt_ms
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +72,7 @@ class Snapshot:
     commanded_mbps: float       # what the controller asked for
     rx_rate_ops: float          # objects/sec arriving at subscriber
     rx_bitrate_mbps: float      # equivalent bitrate
+    mean_ms: float
     p50_ms: float
     p99_ms: float
     loss_pct: float
@@ -177,13 +179,14 @@ class LiveStats:
         if not self._events:
             return Snapshot(t=t, commanded_mbps=commanded_mbps,
                             rx_rate_ops=0.0, rx_bitrate_mbps=0.0,
-                            p50_ms=0.0, p99_ms=0.0,
+                            mean_ms=0.0, p50_ms=0.0, p99_ms=0.0,
                             loss_pct=0.0, jitter_ms=self._jitter)
 
         window_t = max(0.01, self._events[-1][0] - self._events[0][0])
         n = len(self._events)
         total_bytes = sum(e[1] for e in self._events)
         lats = sorted(e[2] for e in self._events if e[2] is not None)
+        mean = sum(lats) / len(lats) if lats else 0.0
         p50 = lats[len(lats) // 2] if lats else 0.0
         p99 = lats[min(int(len(lats) * 0.99), len(lats) - 1)] if lats else 0.0
 
@@ -195,6 +198,7 @@ class LiveStats:
             commanded_mbps=commanded_mbps,
             rx_rate_ops=n / window_t,
             rx_bitrate_mbps=(total_bytes * 8) / (window_t * 1e6),
+            mean_ms=mean,
             p50_ms=p50,
             p99_ms=p99,
             loss_pct=loss_pct,
@@ -243,11 +247,8 @@ class AIMDController:
         self.shortfall_streak = 0
         self.high_water_mbps = scenario.start_mbps
         self.samples = 0
-        # Bracket-narrowing state:
-        #   last_bad_mbps: rate that last tripped a signal (upper bound)
-        #   draining:      holding rate while p50 returns below threshold
-        self.last_bad_mbps = None
         self.draining = False
+        self.t0 = time.monotonic()
 
     async def run(self):
         state = self.state
@@ -299,97 +300,96 @@ class AIMDController:
                 continue
             self.no_data_streak = 0
 
-            # Ceiling signal evaluation
-            reason = None
+            # P-control: headroom ∈ [-∞, 1], where
+            #   1.0 = p50 is zero (idle)
+            #   0.0 = p50 at SLA
+            #   <0  = p50 over SLA (overshoot)
+            headroom = (self.p50_threshold_ms - snap.p50_ms) \
+                / self.p50_threshold_ms
+
+            # Hard signals override headroom.
             if snap.loss_pct > self.loss_threshold_pct:
-                reason = f"loss={snap.loss_pct:.1f}%"
-
-            if snap.p50_ms > self.p50_threshold_ms:
-                self.high_latency_streak += 1
-                if self.high_latency_streak >= 2 and reason is None:
-                    reason = (f"p50={snap.p50_ms:.0f}ms > "
-                              f"{self.p50_threshold_ms:.0f}ms")
-            else:
-                self.high_latency_streak = 0
-
-            if snap.commanded_mbps > 0 and snap.rx_bitrate_mbps > 0:
-                ratio = snap.rx_bitrate_mbps / snap.commanded_mbps
-                if ratio < self.shortfall_ratio:
-                    self.shortfall_streak += 1
-                    if self.shortfall_streak >= 2 and reason is None:
-                        reason = (f"achieved {snap.rx_bitrate_mbps:.1f} < "
-                                  f"{self.shortfall_ratio:.0%}*commanded "
-                                  f"({self.shortfall_ratio*snap.commanded_mbps:.1f})")
-                else:
-                    self.shortfall_streak = 0
-
-            if reason is not None:
-                # Record the bad rate so the next ramp narrows toward it.
-                self.last_bad_mbps = snap.commanded_mbps
-                new_mbps = max(sc.start_mbps,
-                               snap.commanded_mbps * self.backoff_factor)
-                self._print_row(snap,
-                                f"back-off → {new_mbps:.1f} Mbps ({reason}); "
-                                f"bad={self.last_bad_mbps:.1f} "
-                                f"hi-water={self.high_water_mbps:.1f}")
+                new_mbps = snap.commanded_mbps * self.backoff_factor
+                self._print_row(snap, "back-off")
                 self._set_rate(new_mbps)
-                self.high_latency_streak = 0
+                self.draining = True
+                continue
+            shortfall = (snap.commanded_mbps > 0
+                         and snap.rx_bitrate_mbps
+                         < self.shortfall_ratio * snap.commanded_mbps)
+            if shortfall:
+                self.shortfall_streak += 1
+            else:
+                self.shortfall_streak = 0
+            if self.shortfall_streak >= 2:
+                new_mbps = snap.commanded_mbps * self.backoff_factor
+                self._print_row(snap, "back-off")
+                self._set_rate(new_mbps)
                 self.shortfall_streak = 0
                 self.draining = True
                 continue
 
-            # Drain phase: hold rate until p50 falls back below threshold.
-            # Otherwise we'd stack more objects on top of a queue that's
-            # still bleeding off from the last over-commit.
-            if self.draining:
-                if snap.p50_ms > self.p50_threshold_ms:
-                    self._print_row(snap,
-                                    f"drain: p50={snap.p50_ms:.0f}ms > "
-                                    f"{self.p50_threshold_ms:.0f}ms; "
-                                    f"hold {snap.commanded_mbps:.1f} Mbps")
-                    continue
-                self.draining = False
+            if headroom < 0:
+                # Overshoot: retreat proportional to how far over we are.
+                # retreat factor ∈ [backoff_factor, 1). E.g. headroom = -1
+                # (p50 = 2× SLA) → retreat by max(0.5, backoff_factor).
+                retreat = max(self.backoff_factor, 1.0 + headroom)
+                new_mbps = max(sc.start_mbps,
+                               snap.commanded_mbps * retreat)
+                self._print_row(snap, "back-off")
+                self._set_rate(new_mbps)
+                self.draining = True
+                continue
 
-            # Stable — advance high-water mark and compute next step.
-            if snap.commanded_mbps > self.high_water_mbps:
-                self.high_water_mbps = snap.commanded_mbps
+            if self.draining:
+                # Hold until p50 returns below SLA (headroom crosses 0).
+                self._print_row(snap, "drain")
+                if headroom >= 0.2:
+                    self.draining = False
+                continue
+
+            # Stable. Ramp with gain tapering toward zero as we approach
+            # the SLA, so we converge instead of overshooting.
             if snap.commanded_mbps >= sc.max_mbps:
                 state.ceiling_mbps = self.high_water_mbps
                 state.ceiling_reason = f"reached --max-mbps {sc.max_mbps}"
-                self._print_row(snap, "MAX reached")
+                self._print_row(snap, "max")
                 state.stop.set()
                 return
-            # Narrow the step when we have a known-bad upper bound:
-            # target = midpoint(current, bad) — standard bisect step.
-            # Capped by --step-mbps so we never jump more than the user
-            # configured. Floor 0.5 Mbps to avoid infinite micro-steps.
-            if self.last_bad_mbps is not None \
-                    and self.last_bad_mbps > snap.commanded_mbps:
-                bracket_step = (self.last_bad_mbps - snap.commanded_mbps) * 0.5
-                step = max(0.5, min(sc.step_mbps, bracket_step))
+            if snap.commanded_mbps > self.high_water_mbps:
+                self.high_water_mbps = snap.commanded_mbps
+            # Gain curve: full step when headroom > 0.5, linearly taper
+            # to zero at headroom = 0.05. Below that → hold.
+            if headroom >= 0.5:
+                gain = 1.0
+            elif headroom >= 0.05:
+                gain = (headroom - 0.05) / 0.45
             else:
-                step = sc.step_mbps
+                gain = 0.0
+            step = sc.step_mbps * gain
+            if step < 0.1:
+                self._print_row(snap, "hold")
+                continue
             new_mbps = min(sc.max_mbps, snap.commanded_mbps + step)
-            self._print_row(snap,
-                            f"ramp → {new_mbps:.1f} Mbps (step=+{step:.1f} "
-                            f"bad={self.last_bad_mbps or 0:.1f} "
-                            f"hi-water={self.high_water_mbps:.1f})")
+            self._print_row(snap, "ramp")
             self._set_rate(new_mbps)
 
     def _set_rate(self, mbps: float) -> None:
         self.state.commanded_mbps = mbps
         self.state.rate_ops = self.scenario.aggregate_ops(mbps)
 
-    @staticmethod
-    def _print_row(snap: Snapshot, note: str) -> None:
+    def _print_row(self, snap: Snapshot, action: str) -> None:
+        # t relative to bench start (not monotonic), fmt_bps/fmt_ms for
+        # adaptive units matching the other *_bench tools.
+        t_rel = snap.t - self.t0
         print(
-            f"  {snap.t:>8.1f}s  "
-            f"cmd={snap.commanded_mbps:>6.1f}Mbps  "
-            f"rx={snap.rx_bitrate_mbps:>6.1f}Mbps  "
-            f"p50={snap.p50_ms:>5.1f}ms  "
-            f"p99={snap.p99_ms:>6.1f}ms  "
-            f"loss={snap.loss_pct:>4.1f}%  "
-            f"{note}",
+            f"  t={t_rel:>5.1f}s  "
+            f"Tx={fmt_bps(snap.commanded_mbps * 1e6):>8}  "
+            f"Rx={fmt_bps(snap.rx_bitrate_mbps * 1e6):>8}  "
+            f"mean={fmt_ms(snap.mean_ms):>7}  "
+            f"p50={fmt_ms(snap.p50_ms):>7}  "
+            f"loss={snap.loss_pct:>5.2f}%  "
+            f"{action}",
             flush=True,
         )
 
@@ -679,16 +679,24 @@ def parse_args():
 
 def _print_banner(args):
     sc = args.scenario
+    pub_mode = ("PUB-BOTH" if args.pub_both
+                else "PUB-NS" if args.pub_ns
+                else "PUBLISH")
     print("─" * 68)
     print("  aiomoqt adaptive bench")
     print("─" * 68)
     print(f"  host:         {platform.node()} ({platform.machine()})")
+    print(f"  namespace:    {args.namespace}")
+    print(f"  trackname:    {args.trackname}")
+    print(f"  draft:        {args.draft or 'auto'}")
+    print(f"  pub mode:     {pub_mode}")
     print(f"  object size:  {sc.object_size} B")
     print(f"  streams (P):  {sc.subgroups}")
-    print(f"  start:        {sc.start_mbps} Mbps")
-    print(f"  step:         +{sc.step_mbps} Mbps")
-    print(f"  max:          {sc.max_mbps} Mbps")
-    print(f"  interval:     {sc.interval_s} s")
+    print(f"  start:        {sc.start_mbps:.1f} Mbps")
+    print(f"  step:         +{sc.step_mbps:.1f} Mbps")
+    print(f"  max:          {sc.max_mbps:.1f} Mbps")
+    print(f"  interval:     {sc.interval_s:.1f} s")
+    print(f"  p50 SLA:      {args.latency_threshold:.0f} ms")
     print("─" * 68)
 
 
