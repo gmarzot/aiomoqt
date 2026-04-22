@@ -243,6 +243,11 @@ class AIMDController:
         self.shortfall_streak = 0
         self.high_water_mbps = scenario.start_mbps
         self.samples = 0
+        # Bracket-narrowing state:
+        #   last_bad_mbps: rate that last tripped a signal (upper bound)
+        #   draining:      holding rate while p50 returns below threshold
+        self.last_bad_mbps = None
+        self.draining = False
 
     async def run(self):
         state = self.state
@@ -319,18 +324,33 @@ class AIMDController:
                     self.shortfall_streak = 0
 
             if reason is not None:
+                # Record the bad rate so the next ramp narrows toward it.
+                self.last_bad_mbps = snap.commanded_mbps
                 new_mbps = max(sc.start_mbps,
                                snap.commanded_mbps * self.backoff_factor)
                 self._print_row(snap,
                                 f"back-off → {new_mbps:.1f} Mbps ({reason}); "
+                                f"bad={self.last_bad_mbps:.1f} "
                                 f"hi-water={self.high_water_mbps:.1f}")
                 self._set_rate(new_mbps)
-                # Reset streaks so we don't immediately re-trip on stale state
                 self.high_latency_streak = 0
                 self.shortfall_streak = 0
+                self.draining = True
                 continue
 
-            # Stable — advance high-water mark and ramp up
+            # Drain phase: hold rate until p50 falls back below threshold.
+            # Otherwise we'd stack more objects on top of a queue that's
+            # still bleeding off from the last over-commit.
+            if self.draining:
+                if snap.p50_ms > self.p50_threshold_ms:
+                    self._print_row(snap,
+                                    f"drain: p50={snap.p50_ms:.0f}ms > "
+                                    f"{self.p50_threshold_ms:.0f}ms; "
+                                    f"hold {snap.commanded_mbps:.1f} Mbps")
+                    continue
+                self.draining = False
+
+            # Stable — advance high-water mark and compute next step.
             if snap.commanded_mbps > self.high_water_mbps:
                 self.high_water_mbps = snap.commanded_mbps
             if snap.commanded_mbps >= sc.max_mbps:
@@ -339,10 +359,21 @@ class AIMDController:
                 self._print_row(snap, "MAX reached")
                 state.stop.set()
                 return
-            new_mbps = min(sc.max_mbps, snap.commanded_mbps + sc.step_mbps)
+            # Narrow the step when we have a known-bad upper bound:
+            # target = midpoint(current, bad) — standard bisect step.
+            # Capped by --step-mbps so we never jump more than the user
+            # configured. Floor 0.5 Mbps to avoid infinite micro-steps.
+            if self.last_bad_mbps is not None \
+                    and self.last_bad_mbps > snap.commanded_mbps:
+                bracket_step = (self.last_bad_mbps - snap.commanded_mbps) * 0.5
+                step = max(0.5, min(sc.step_mbps, bracket_step))
+            else:
+                step = sc.step_mbps
+            new_mbps = min(sc.max_mbps, snap.commanded_mbps + step)
             self._print_row(snap,
-                            f"ramp → {new_mbps:.1f} Mbps "
-                            f"(hi-water={self.high_water_mbps:.1f})")
+                            f"ramp → {new_mbps:.1f} Mbps (step=+{step:.1f} "
+                            f"bad={self.last_bad_mbps or 0:.1f} "
+                            f"hi-water={self.high_water_mbps:.1f})")
             self._set_rate(new_mbps)
 
     def _set_rate(self, mbps: float) -> None:
