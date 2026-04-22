@@ -609,19 +609,15 @@ def parse_args():
                    help="override scenario object size")
     p.add_argument("--streams", "-P", type=int, default=None,
                    help="override scenario subgroup stream count")
-    p.add_argument("-r", "--relay", default=None, metavar="URL",
-                   help="relay URL (moqt://... or https://...). "
-                        "Publisher and subscriber both connect to this "
-                        "relay. This is the right mode for real throughput "
-                        "measurements.")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("-r", "--relay-url", default=None, metavar="URL",
+                      dest="relay_url",
+                      help="relay URL (moqt://... or https://...)")
+    mode.add_argument("-p", "--loopback-port", type=int, default=None,
+                      metavar="PORT", dest="loopback_port",
+                      help="UDP port for the in-process self-test loopback")
     p.add_argument("-k", "--insecure", action="store_true",
-                   help="skip TLS verification for relay mode")
-    p.add_argument("-p", "--port", type=int, default=4435,
-                   help="(loopback mode only) UDP port for the in-process "
-                        "qh3 server. Ignored when -r is given. Loopback "
-                        "mode is primarily a self-test: its ceiling "
-                        "reflects single-process Python overhead, not a "
-                        "network or relay limit.")
+                   help="skip TLS verification")
     p.add_argument("--cert", default=CERT)
     p.add_argument("--key", default=KEY)
     p.add_argument("--report", metavar="PATH",
@@ -690,7 +686,9 @@ async def main():
     args = parse_args()
     _print_banner(args)
 
-    relay_mode = args.relay is not None
+    relay_mode = args.relay_url is not None
+    # Default to loopback self-test if neither mode flag given
+    loopback_port = args.loopback_port or 4435
     if not relay_mode and (not args.cert or not args.key):
         print("  error: TLS cert/key not found. Set --cert / --key or place "
               "cert.pem/key.pem under <project>/certs/",
@@ -727,26 +725,24 @@ async def main():
     sub_task = None
     try:
         if relay_mode:
-            relay = parse_relay_url(args.relay)
+            relay = parse_relay_url(args.relay_url)
             host, port = relay.host, relay.port
             endpoint = relay.endpoint or "moq"
             use_quic = relay.use_quic
             verify = not args.insecure
-            print(f"  relay: {args.relay} ({host}:{port}/{endpoint} "
+            print(f"  relay: {args.relay_url} ({host}:{port}/{endpoint} "
                   f"via {'QUIC' if use_quic else 'H3/WT'})")
-            # Publisher first so PUBLISH_NAMESPACE is in flight before
-            # the subscriber's SUBSCRIBE arrives at the relay.
             pub_task = asyncio.create_task(run_publisher_client(
                 host, port, endpoint, use_quic, verify, args, state))
             await asyncio.sleep(0.3)
             sub_task = asyncio.create_task(run_subscriber_client(
                 host, port, endpoint, use_quic, verify, state, stats))
         else:
+            args.port = loopback_port  # server code still reads args.port
             server = await run_loopback_server(args, state)
             await asyncio.sleep(0.3)
-            # Loopback cert is self-signed; always verify_tls=False.
             sub_task = asyncio.create_task(run_subscriber_client(
-                "localhost", args.port, "moq", False, False,
+                "localhost", loopback_port, "moq", False, False,
                 state, stats))
 
         ctrl_task = asyncio.create_task(controller.run())
