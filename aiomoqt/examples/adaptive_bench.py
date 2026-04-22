@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
-"""aiomoqt adaptive bench v2 — single-process feedback-driven loopback.
+"""aiomoqt adaptive bench — single-process feedback-driven ramp.
 
-Runs a publisher + subscriber pair in one Python process over qh3
-loopback. The publisher's rate is live-mutated by a controller task
-reading subscriber-side snapshots (p99 latency, loss, achieved
-throughput) out of a shared BenchState. No subprocess-per-step loop
-like v1 — one continuous steady-state publisher whose pacing the
-controller nudges up or down per interval.
+Runs a publisher + subscriber pair in one Python process (loopback
+self-test) or against a relay. The publisher's rate is live-mutated
+by a controller task reading subscriber-side snapshots (p99 latency,
+loss, achieved throughput) out of a shared BenchState. One continuous
+steady-state publisher whose pacing the controller nudges up or down
+per interval — no subprocess-per-step loop.
 
-Scenarios pin some load axes (object size, number of parallel
-subgroup streams P) and ramp the aggregate bitrate. With P > 1, each
-subgroup gets aggregate_ops / P so the total offered load matches the
-scenario's commanded Mbps regardless of parallelism.
+Load axes are independent CLI flags: --object-size, -P streams,
+--start-mbps, --step-mbps, --max-mbps. With P > 1, each subgroup gets
+aggregate_ops / P so total offered load matches the commanded Mbps
+regardless of parallelism.
 
 Usage:
-  python -m aiomoqt.examples.adaptive_bench --scenario single-high
-  python -m aiomoqt.examples.adaptive_bench --scenario parallel-streams
-  python -m aiomoqt.examples.adaptive_bench --scenario single-high \\
-      --report /tmp/bench.csv --max-mbps 300
+  python -m aiomoqt.examples.adaptive_bench
+  python -m aiomoqt.examples.adaptive_bench -P 4 --step-mbps 20
+  python -m aiomoqt.examples.adaptive_bench -r moqt://host:4433 -k --max-mbps 500
 """
 import argparse
 import asyncio
@@ -44,12 +43,11 @@ from aiomoqt.utils.logger import set_log_level
 
 
 # ---------------------------------------------------------------------------
-# Scenarios: pin some axes, ramp aggregate bitrate
+# Load config: pinned axes, ramp aggregate bitrate
 # ---------------------------------------------------------------------------
 
 @dataclass
 class Scenario:
-    name: str
     object_size: int            # bytes per MoQT object
     subgroups: int              # parallel subgroup streams (P)
     start_mbps: float           # initial aggregate commanded bitrate
@@ -57,43 +55,9 @@ class Scenario:
     max_mbps: float             # cap
     interval_s: float           # controller tick period
     settle_s: float             # hold last stable before stopping
-    description: str = ""
 
     def aggregate_ops(self, mbps: float) -> float:
-        """Convert aggregate Mbps to aggregate objects/sec."""
         return (mbps * 1e6) / (self.object_size * 8)
-
-
-SCENARIOS = {
-    "single-high": Scenario(
-        name="single-high",
-        object_size=4096, subgroups=1,
-        start_mbps=10.0, step_mbps=5.0, max_mbps=500.0,
-        interval_s=5.0, settle_s=15.0,
-        description="1 sub, 1 stream, 4KB objects; ramp bitrate",
-    ),
-    "parallel-streams": Scenario(
-        name="parallel-streams",
-        object_size=4096, subgroups=4,
-        start_mbps=10.0, step_mbps=10.0, max_mbps=500.0,
-        interval_s=5.0, settle_s=15.0,
-        description="1 sub, 4 streams, 4KB objects; aggregate split P-ways",
-    ),
-    "small-fast": Scenario(
-        name="small-fast",
-        object_size=512, subgroups=1,
-        start_mbps=1.0, step_mbps=1.0, max_mbps=100.0,
-        interval_s=5.0, settle_s=15.0,
-        description="tiny 512B objects; tests pacing/control limits",
-    ),
-    "large-objects": Scenario(
-        name="large-objects",
-        object_size=65536, subgroups=1,
-        start_mbps=20.0, step_mbps=20.0, max_mbps=1000.0,
-        interval_s=5.0, settle_s=15.0,
-        description="1 sub, 1 stream, 64KB objects; stream CC stress",
-    ),
-}
 
 
 # ---------------------------------------------------------------------------
@@ -245,15 +209,20 @@ class LiveStats:
 class AIMDController:
     """Simple additive-increase / multiplicative-decrease policy.
 
+    Keeps probing forever. QUIC windows widen under pressure, so a
+    rate that tripped a signal once may be fine a minute later. The
+    controller never locks in a ceiling — it just backs off on a
+    signal and immediately resumes ramping from the lower rate. Exit
+    is user-driven (Ctrl-C) or --max-mbps.
+
     - Every `interval_s`, snapshot metrics and decide.
     - Ramp: +step_mbps while loss==0 and p99 stays near baseline.
-    - Back off: multiply aggregate by 0.9 on any ceiling signal.
-    - Ceiling signals (any one trips it):
-        * loss_pct > 0.5% in the last window
-        * p99 > baseline * 1.5 for 2 consecutive intervals
-        * achieved rx_bitrate < 0.85 * commanded for 2 consecutive intervals
-    - After 2 consecutive back-offs from the same rate, lock in ceiling
-      and settle for `settle_s`.
+    - Back off: multiply aggregate by backoff_factor on any signal.
+    - Signals:
+        * loss_pct > loss_threshold_pct in the last window
+        * p99 > threshold (or baseline*1.5) for 2 consecutive intervals
+        * achieved rx_bitrate < shortfall_ratio * commanded for 2 intervals
+    - Tracks high_water_mbps = highest stable rate seen so far.
     """
 
     def __init__(self, scenario: Scenario, state: BenchState,
@@ -275,8 +244,7 @@ class AIMDController:
         self.baseline_p99 = None
         self.high_p99_streak = 0
         self.shortfall_streak = 0
-        self.backoff_streak = 0
-        self.last_stable_mbps = scenario.start_mbps
+        self.high_water_mbps = scenario.start_mbps
         self.samples = 0
 
     async def run(self):
@@ -318,7 +286,7 @@ class AIMDController:
             # Establish baseline p99 from the first stable sample
             if self.baseline_p99 is None:
                 self.baseline_p99 = snap.p99_ms
-                self.last_stable_mbps = snap.commanded_mbps
+                self.high_water_mbps = snap.commanded_mbps
 
             # Ceiling signal evaluation
             reason = None
@@ -357,35 +325,30 @@ class AIMDController:
                     self.shortfall_streak = 0
 
             if reason is not None:
-                self.backoff_streak += 1
                 new_mbps = max(sc.start_mbps,
                                snap.commanded_mbps * self.backoff_factor)
-                self._print_row(snap, f"BACK-OFF ({reason})")
-                if self.backoff_streak >= 2:
-                    # Ceiling confirmed
-                    state.ceiling_mbps = self.last_stable_mbps
-                    state.ceiling_reason = reason
-                    self._print_row(snap,
-                                    f"CEILING @ {self.last_stable_mbps:.1f} Mbps "
-                                    f"({reason}); settling")
-                    await asyncio.sleep(sc.settle_s)
-                    state.stop.set()
-                    return
+                self._print_row(snap,
+                                f"back-off → {new_mbps:.1f} Mbps ({reason}); "
+                                f"hi-water={self.high_water_mbps:.1f}")
                 self._set_rate(new_mbps)
+                # Reset streaks so we don't immediately re-trip on stale state
+                self.high_p99_streak = 0
+                self.shortfall_streak = 0
                 continue
 
-            # Stable — remember and ramp up
-            self.backoff_streak = 0
-            self.last_stable_mbps = snap.commanded_mbps
+            # Stable — advance high-water mark and ramp up
+            if snap.commanded_mbps > self.high_water_mbps:
+                self.high_water_mbps = snap.commanded_mbps
             if snap.commanded_mbps >= sc.max_mbps:
-                # Hit configured ceiling without a signal
-                state.ceiling_mbps = None
-                state.ceiling_reason = f"no ceiling up to {sc.max_mbps} Mbps"
-                self._print_row(snap, "MAX reached; no ceiling signal")
+                state.ceiling_mbps = self.high_water_mbps
+                state.ceiling_reason = f"reached --max-mbps {sc.max_mbps}"
+                self._print_row(snap, "MAX reached")
                 state.stop.set()
                 return
             new_mbps = min(sc.max_mbps, snap.commanded_mbps + sc.step_mbps)
-            self._print_row(snap, f"ramp → {new_mbps:.1f} Mbps")
+            self._print_row(snap,
+                            f"ramp → {new_mbps:.1f} Mbps "
+                            f"(hi-water={self.high_water_mbps:.1f})")
             self._set_rate(new_mbps)
 
     def _set_rate(self, mbps: float) -> None:
@@ -589,26 +552,20 @@ async def run_publisher_client(host: str, port: int, endpoint: str,
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="aiomoqt adaptive bench v2 — feedback-driven loopback",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=("Scenarios:\n"
-                + "\n".join(f"  {n:<20} {s.description}"
-                            for n, s in SCENARIOS.items())),
+        description="aiomoqt adaptive bench — feedback-driven bitrate ramp",
     )
-    p.add_argument("--scenario", required=True, choices=list(SCENARIOS),
-                   help="load profile (see epilog)")
-    p.add_argument("--start-mbps", type=float, default=None,
-                   help="override scenario start bitrate")
-    p.add_argument("--step-mbps", type=float, default=None,
-                   help="override scenario step size")
-    p.add_argument("--max-mbps", type=float, default=None,
-                   help="override scenario max bitrate")
-    p.add_argument("--interval", type=float, default=None,
-                   metavar="S", help="controller tick period seconds")
-    p.add_argument("--object-size", type=int, default=None,
-                   help="override scenario object size")
-    p.add_argument("--streams", "-P", type=int, default=None,
-                   help="override scenario subgroup stream count")
+    p.add_argument("-s", "--object-size", type=int, default=4096,
+                   metavar="B", help="bytes per MoQT object (default: 4096)")
+    p.add_argument("-P", "--streams", type=int, default=1,
+                   help="parallel subgroup streams (default: 1)")
+    p.add_argument("--start-mbps", type=float, default=10.0,
+                   help="initial aggregate bitrate (default: 10)")
+    p.add_argument("--step-mbps", type=float, default=10.0,
+                   help="ramp step size (default: 10)")
+    p.add_argument("--max-mbps", type=float, default=10000.0,
+                   help="cap; controller stops on signal first (default: 10000)")
+    p.add_argument("--interval", type=float, default=5.0,
+                   metavar="S", help="controller tick period seconds (default: 5)")
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("-r", "--relay-url", default=None, metavar="URL",
                       dest="relay_url",
@@ -638,18 +595,14 @@ def parse_args():
     p.add_argument("-d", "--debug", action="store_true")
     args = p.parse_args()
 
-    # Assemble the effective scenario from overrides.
-    base = SCENARIOS[args.scenario]
     args.scenario = Scenario(
-        name=base.name,
-        object_size=args.object_size or base.object_size,
-        subgroups=args.streams if args.streams is not None else base.subgroups,
-        start_mbps=args.start_mbps if args.start_mbps is not None else base.start_mbps,
-        step_mbps=args.step_mbps if args.step_mbps is not None else base.step_mbps,
-        max_mbps=args.max_mbps if args.max_mbps is not None else base.max_mbps,
-        interval_s=args.interval if args.interval is not None else base.interval_s,
-        settle_s=base.settle_s,
-        description=base.description,
+        object_size=args.object_size,
+        subgroups=args.streams,
+        start_mbps=args.start_mbps,
+        step_mbps=args.step_mbps,
+        max_mbps=args.max_mbps,
+        interval_s=args.interval,
+        settle_s=15.0,
     )
     return args
 
@@ -657,7 +610,7 @@ def parse_args():
 def _print_banner(args):
     sc = args.scenario
     print("─" * 68)
-    print(f"  aiomoqt adaptive bench — scenario '{sc.name}'")
+    print("  aiomoqt adaptive bench")
     print("─" * 68)
     print(f"  host:         {platform.node()} ({platform.machine()})")
     print(f"  object size:  {sc.object_size} B")
@@ -669,15 +622,13 @@ def _print_banner(args):
     print("─" * 68)
 
 
-def _print_summary(state: BenchState, samples: int, args):
+def _print_summary(state: BenchState, controller, samples: int, args):
     print()
     print("═" * 68)
-    if state.ceiling_mbps is not None:
-        print(f"  Ceiling: {state.ceiling_mbps:.1f} Mbps  "
-              f"({state.ceiling_reason})")
-    else:
-        print(f"  {state.ceiling_reason or 'stopped before ceiling'}")
-    print(f"  Samples: {samples}  scenario: {args.scenario.name}")
+    print(f"  High-water: {controller.high_water_mbps:.1f} Mbps")
+    if state.ceiling_reason:
+        print(f"  Reason:     {state.ceiling_reason}")
+    print(f"  Samples:    {samples}")
     print("═" * 68)
 
 
@@ -746,7 +697,10 @@ async def main():
                 state, stats))
 
         ctrl_task = asyncio.create_task(controller.run())
-        await ctrl_task
+        try:
+            await ctrl_task
+        except asyncio.CancelledError:
+            pass
     finally:
         state.stop.set()
         for t in (sub_task, pub_task):
@@ -762,8 +716,7 @@ async def main():
             server.close()
         if csv_file:
             csv_file.close()
-
-    _print_summary(state, controller.samples, args)
+        _print_summary(state, controller, controller.samples, args)
     return 0
 
 
