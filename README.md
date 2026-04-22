@@ -193,10 +193,10 @@ Publisher flow selection (for relays that require a specific message pattern):
 
 ```bash
 # All tests (draft-14, auto-detected)
-python -m aiomoqt.examples.moq_interop_client -r "moqt://moqx-000.ci.openmoq.org:4433"
+python -m aiomoqt.examples.moq_interop_client -r "moqt://relay.ex.com:4433"
 
 # All tests (draft-16)
-python -m aiomoqt.examples.moq_interop_client -r "moqt://moqx-000.ci.openmoq.org:4433" --draft 16
+python -m aiomoqt.examples.moq_interop_client -r "moqt://relay.ex.com:4433" --draft 16
 
 # Single test case
 python -m aiomoqt.examples.moq_interop_client -r "moqt://relay" -t subscribe-error
