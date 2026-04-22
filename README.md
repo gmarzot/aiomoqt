@@ -45,7 +45,7 @@ pip install aiomoqt
 uv pip install aiomoqt
 ```
 
-**note:** `./bootstrap_python.sh` sets up a clean `uv`-managed environment with pinned Python and Cython, for convenience.
+**note:** `./bootstrap_python.sh` provided for easy `uv`-based Python venv install
 
 ## Quick Start
 
@@ -124,18 +124,14 @@ resp = await session.subscribe('ns', 'track', wait_response=True)
 req = await session.subscribe('ns', 'track')
 ```
 
-### Relay URL Formats
-
-Examples and benchmarks accept relay URLs in several forms:
-
-```
-moqt://host:port            Raw QUIC (default port 443)
-https://host:port/endpoint  H3/WebTransport (default port 443)
-host:port                   H3/WebTransport
-host                        H3/WebTransport, port 443, endpoint /moq
-```
-
 ## Examples
+
+Examples and benchmarks accept relay URLs in two forms:
+
+```
+moqt://host[:port]              Raw QUIC (default port 443)
+https://host[:port]/[endpoint]  H3/WebTransport (default port 443)
+```
 
 ### Publisher / Subscriber
 
