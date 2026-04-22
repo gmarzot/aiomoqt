@@ -45,6 +45,9 @@ pip install aiomoqt
 uv pip install aiomoqt
 ```
 
+> For a clean `uv`-managed dev setup with a pinned Python and Cython,
+> run `./bootstrap_python.sh` from a repo clone.
+
 ## Quick Start
 
 ### Subscriber
