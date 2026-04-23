@@ -80,6 +80,25 @@ class Snapshot:
 
 
 @dataclass
+class Signal:
+    """Mode-agnostic observation passed from actuator to controller.
+
+    All the pieces the brain needs to decide 'ramp / hold / back-off'
+    without knowing whether the load axis is Mbps or subscriber count.
+    The commanded/rx_mbps fields are for logging only — the brain uses
+    latency + loss + shortfall for decisions.
+    """
+    t: float
+    latency_mean_ms: float
+    latency_p50_ms: float
+    latency_p99_ms: float
+    loss_pct: float
+    shortfall: bool
+    commanded_mbps: float
+    rx_mbps: float
+
+
+@dataclass
 class BenchState:
     """Shared state between loader, subscriber, and controller tasks.
 
@@ -207,7 +226,58 @@ class LiveStats:
 
 
 # ---------------------------------------------------------------------------
-# Controller: AIMD-ish policy
+# LoadActuator: the "how do we apply a load level" abstraction
+# ---------------------------------------------------------------------------
+
+class BWActuator:
+    """Actuator for bandwidth-ramp mode.
+
+    level == aggregate commanded Mbps. Apply writes state.rate_ops,
+    which the publisher polls to mutate its paced send rate. Observe
+    pulls a rolling-window snapshot from the single subscriber's
+    LiveStats and packages it as a mode-agnostic Signal.
+    """
+    unit = "Mbps"
+
+    def __init__(self, state: 'BenchState', stats: LiveStats,
+                 scenario: Scenario,
+                 shortfall_ratio: float = 0.85):
+        self.state = state
+        self.stats = stats
+        self.scenario = scenario
+        self.shortfall_ratio = shortfall_ratio
+        self.min_level = scenario.start_mbps
+        self.max_level = scenario.max_mbps
+        self.step_floor = 0.5
+        self.initial_step = scenario.step_mbps
+        self.initial_level = scenario.start_mbps
+
+    async def apply(self, level: float) -> None:
+        self.state.commanded_mbps = level
+        self.state.rate_ops = self.scenario.aggregate_ops(level)
+
+    async def observe(self) -> Signal:
+        snap = self.stats.snapshot(commanded_mbps=self.state.commanded_mbps)
+        shortfall = (snap.commanded_mbps > 0
+                     and snap.rx_bitrate_mbps
+                     < self.shortfall_ratio * snap.commanded_mbps)
+        return Signal(
+            t=snap.t,
+            latency_mean_ms=snap.mean_ms,
+            latency_p50_ms=snap.p50_ms,
+            latency_p99_ms=snap.p99_ms,
+            loss_pct=snap.loss_pct,
+            shortfall=shortfall,
+            commanded_mbps=snap.commanded_mbps,
+            rx_mbps=snap.rx_bitrate_mbps,
+        )
+
+    async def shutdown(self) -> None:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Controller: scalar P-control over a LoadActuator
 # ---------------------------------------------------------------------------
 
 class AIMDController:
@@ -229,135 +299,114 @@ class AIMDController:
     - Tracks high_water_mbps = highest stable rate seen so far.
     """
 
-    def __init__(self, scenario: Scenario, state: BenchState,
-                 stats: LiveStats, writer=None,
+    def __init__(self, actuator, state: BenchState,
+                 interval_s: float, writer=None,
                  p50_threshold_ms: float = 100.0,
                  backoff_factor: float = 0.9,
-                 shortfall_ratio: float = 0.85,
                  loss_threshold_pct: float = 0.5):
-        self.scenario = scenario
+        self.actuator = actuator
         self.state = state
-        self.stats = stats
+        self.interval_s = interval_s
         self.writer = writer
         self.p50_threshold_ms = p50_threshold_ms
         self.backoff_factor = backoff_factor
-        self.shortfall_ratio = shortfall_ratio
         self.loss_threshold_pct = loss_threshold_pct
-        self.high_latency_streak = 0
         self.shortfall_streak = 0
-        self.high_water_mbps = scenario.start_mbps
+        self.high_water = actuator.initial_level
         self.samples = 0
         self.draining = False
         self.t0 = time.monotonic()
 
     async def run(self):
         state = self.state
-        sc = self.scenario
+        a = self.actuator
 
-        # Prime the first commanded rate.
-        self._set_rate(sc.start_mbps)
+        await a.apply(a.initial_level)
 
         while not state.stop.is_set():
             try:
                 await asyncio.wait_for(state.stop.wait(),
-                                       timeout=sc.interval_s)
+                                       timeout=self.interval_s)
                 break
             except asyncio.TimeoutError:
                 pass
 
-            snap = self.stats.snapshot(commanded_mbps=state.commanded_mbps)
-            state.latest = snap
-            state.history.append(snap)
+            sig = await a.observe()
             self.samples += 1
             if self.writer:
                 self.writer.writerow([
-                    f"{snap.t:.3f}",
-                    f"{snap.commanded_mbps:.2f}",
-                    f"{snap.rx_bitrate_mbps:.2f}",
-                    f"{snap.rx_rate_ops:.2f}",
-                    f"{snap.p50_ms:.2f}",
-                    f"{snap.p99_ms:.2f}",
-                    f"{snap.loss_pct:.3f}",
-                    f"{snap.jitter_ms:.3f}",
+                    f"{sig.t:.3f}",
+                    f"{sig.commanded_mbps:.2f}",
+                    f"{sig.rx_mbps:.2f}",
+                    f"{sig.latency_mean_ms:.2f}",
+                    f"{sig.latency_p50_ms:.2f}",
+                    f"{sig.latency_p99_ms:.2f}",
+                    f"{sig.loss_pct:.3f}",
                 ])
 
-            # Wait a few samples to let pacing settle before deciding.
             if self.samples < 2:
-                self._print_row(snap, "warming")
+                self._print_row(sig, "warming")
                 continue
 
             # Dead-air guard: rx=0 for 3 consecutive intervals means
             # no data is flowing (subscribe failed, publisher stuck,
             # etc.). Don't climb a phantom ramp.
-            if snap.rx_bitrate_mbps <= 0:
+            if sig.rx_mbps <= 0:
                 self.no_data_streak = getattr(self, 'no_data_streak', 0) + 1
                 if self.no_data_streak >= 3:
-                    state.ceiling_reason = "no data received — subscribe failed or publisher stalled"
-                    self._print_row(snap, "ABORT: rx=0 for 3 intervals")
+                    state.ceiling_reason = ("no data received — subscribe "
+                                            "failed or publisher stalled")
+                    self._print_row(sig, "ABORT: rx=0 for 3 intervals")
                     state.stop.set()
                     return
-                self._print_row(snap, f"rx=0 (streak {self.no_data_streak}/3)")
+                self._print_row(sig, f"rx=0 (streak {self.no_data_streak}/3)")
                 continue
             self.no_data_streak = 0
 
-            # P-control: headroom ∈ [-∞, 1], where
-            #   1.0 = p50 is zero (idle)
-            #   0.0 = p50 at SLA
-            #   <0  = p50 over SLA (overshoot)
-            headroom = (self.p50_threshold_ms - snap.p50_ms) \
+            level = sig.commanded_mbps  # same scalar space the actuator uses
+
+            # P-control over latency: headroom ∈ [-∞, 1].
+            #   1.0 = idle (p50 = 0), 0.0 = at SLA, <0 = overshoot.
+            headroom = (self.p50_threshold_ms - sig.latency_p50_ms) \
                 / self.p50_threshold_ms
 
             # Hard signals override headroom.
-            if snap.loss_pct > self.loss_threshold_pct:
-                new_mbps = snap.commanded_mbps * self.backoff_factor
-                self._print_row(snap, "back-off")
-                self._set_rate(new_mbps)
+            if sig.loss_pct > self.loss_threshold_pct:
+                await self._apply(level * self.backoff_factor, sig, "back-off")
                 self.draining = True
                 continue
-            shortfall = (snap.commanded_mbps > 0
-                         and snap.rx_bitrate_mbps
-                         < self.shortfall_ratio * snap.commanded_mbps)
-            if shortfall:
+            if sig.shortfall:
                 self.shortfall_streak += 1
             else:
                 self.shortfall_streak = 0
             if self.shortfall_streak >= 2:
-                new_mbps = snap.commanded_mbps * self.backoff_factor
-                self._print_row(snap, "back-off")
-                self._set_rate(new_mbps)
+                await self._apply(level * self.backoff_factor, sig, "back-off")
                 self.shortfall_streak = 0
                 self.draining = True
                 continue
 
             if headroom < 0:
                 # Overshoot: retreat proportional to how far over we are.
-                # retreat factor ∈ [backoff_factor, 1). E.g. headroom = -1
-                # (p50 = 2× SLA) → retreat by max(0.5, backoff_factor).
                 retreat = max(self.backoff_factor, 1.0 + headroom)
-                new_mbps = max(sc.start_mbps,
-                               snap.commanded_mbps * retreat)
-                self._print_row(snap, "back-off")
-                self._set_rate(new_mbps)
+                new_level = max(a.min_level, level * retreat)
+                await self._apply(new_level, sig, "back-off")
                 self.draining = True
                 continue
 
             if self.draining:
-                # Hold until p50 returns below SLA (headroom crosses 0).
-                self._print_row(snap, "drain")
+                self._print_row(sig, "drain")
                 if headroom >= 0.2:
                     self.draining = False
                 continue
 
-            # Stable. Ramp with gain tapering toward zero as we approach
-            # the SLA, so we converge instead of overshooting.
-            if snap.commanded_mbps >= sc.max_mbps:
-                state.ceiling_mbps = self.high_water_mbps
-                state.ceiling_reason = f"reached --max-mbps {sc.max_mbps}"
-                self._print_row(snap, "max")
+            if level >= a.max_level:
+                state.ceiling_mbps = self.high_water
+                state.ceiling_reason = f"reached max {a.max_level} {a.unit}"
+                self._print_row(sig, "max")
                 state.stop.set()
                 return
-            if snap.commanded_mbps > self.high_water_mbps:
-                self.high_water_mbps = snap.commanded_mbps
+            if level > self.high_water:
+                self.high_water = level
             # Gain curve: full step when headroom > 0.5, linearly taper
             # to zero at headroom = 0.05. Below that → hold.
             if headroom >= 0.5:
@@ -366,30 +415,38 @@ class AIMDController:
                 gain = (headroom - 0.05) / 0.45
             else:
                 gain = 0.0
-            step = sc.step_mbps * gain
-            if step < 0.1:
-                self._print_row(snap, "hold")
+            step = a.initial_step * gain
+            if step < a.step_floor:
+                self._print_row(sig, "hold")
                 continue
-            new_mbps = min(sc.max_mbps, snap.commanded_mbps + step)
-            self._print_row(snap, "ramp")
-            self._set_rate(new_mbps)
+            await self._apply(min(a.max_level, level + step), sig, "ramp")
 
-    def _set_rate(self, mbps: float) -> None:
-        self.state.commanded_mbps = mbps
-        self.state.rate_ops = self.scenario.aggregate_ops(mbps)
+    async def _apply(self, new_level: float, sig: Signal, action: str) -> None:
+        self._print_row(sig, action)
+        await self.actuator.apply(new_level)
 
-    def _print_row(self, snap: Snapshot, action: str) -> None:
-        # t relative to bench start (not monotonic), fmt_bps/fmt_ms for
-        # adaptive units matching the other *_bench tools.
-        t_rel = snap.t - self.t0
+    def _print_header(self) -> None:
         print(
-            f"  t={t_rel:>5.1f}s  "
-            f"Tx={fmt_bps(snap.commanded_mbps * 1e6):>8}  "
-            f"Rx={fmt_bps(snap.rx_bitrate_mbps * 1e6):>8}  "
-            f"mean={fmt_ms(snap.mean_ms):>7}  "
-            f"p50={fmt_ms(snap.p50_ms):>7}  "
-            f"loss={snap.loss_pct:>5.2f}%  "
-            f"{action}",
+            f"  {'time':>6}  "
+            f"{'Tx':>7}  {'Rx':>7}  │  "
+            f"{'mean':>6}  {'p50':>6}  {'p99':>6}  │  "
+            f"{'loss':>6}  action"
+        )
+        print("─" * 68)
+
+    def _print_row(self, sig: Signal, action: str) -> None:
+        if not getattr(self, '_hdr_done', False):
+            self._print_header()
+            self._hdr_done = True
+        t_rel = sig.t - self.t0
+        print(
+            f"  {t_rel:>5.1f}s  "
+            f"{fmt_bps(sig.commanded_mbps * 1e6):>7}  "
+            f"{fmt_bps(sig.rx_mbps * 1e6):>7}  │  "
+            f"{fmt_ms(sig.latency_mean_ms):>6}  "
+            f"{fmt_ms(sig.latency_p50_ms):>6}  "
+            f"{fmt_ms(sig.latency_p99_ms):>6}  │  "
+            f"{sig.loss_pct:>5.2f}%  {action}",
             flush=True,
         )
 
@@ -703,7 +760,7 @@ def _print_banner(args):
 def _print_summary(state: BenchState, controller, samples: int, args):
     print()
     print("═" * 68)
-    print(f"  High-water: {controller.high_water_mbps:.1f} Mbps")
+    print(f"  High-water: {controller.high_water:.1f} {controller.actuator.unit}")
     if state.ceiling_reason:
         print(f"  Reason:     {state.ceiling_reason}")
     print(f"  Samples:    {samples}")
@@ -738,15 +795,20 @@ async def main():
         csv_file = open(args.report, "w", newline="")
         csv_writer = csv.writer(csv_file)
         csv_writer.writerow([
-            "t_monotonic", "commanded_mbps", "rx_mbps", "rx_ops",
-            "p50_ms", "p99_ms", "loss_pct", "jitter_ms",
+            "t_monotonic", "commanded_mbps", "rx_mbps",
+            "mean_ms", "p50_ms", "p99_ms", "loss_pct",
         ])
 
+    actuator = BWActuator(
+        state, stats, args.scenario,
+        shortfall_ratio=args.shortfall_ratio,
+    )
     controller = AIMDController(
-        args.scenario, state, stats, writer=csv_writer,
+        actuator, state,
+        interval_s=args.scenario.interval_s,
+        writer=csv_writer,
         p50_threshold_ms=args.latency_threshold,
         backoff_factor=args.backoff_factor,
-        shortfall_ratio=args.shortfall_ratio,
     )
 
     server = None
