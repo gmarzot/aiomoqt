@@ -319,6 +319,12 @@ class AIMDController:
         self.samples = 0
         self.draining = False
         self.t0 = time.monotonic()
+        # Equilibrium learning: record every direction flip (ramp↔back-off)
+        # as a pivot. Step size shrinks with pivot count, and eq_level is an
+        # EWMA of pivots so later steps converge around the true ceiling.
+        self.pivots: list[float] = []
+        self.eq_level: float = actuator.initial_level
+        self.direction: int = +1   # +1 ramping, -1 backed-off
 
     async def run(self):
         state = self.state
@@ -414,18 +420,33 @@ class AIMDController:
             # Gain curve: full step when headroom > 0.5, linearly taper
             # to zero at headroom = 0.05. Below that → hold.
             if headroom >= 0.5:
-                gain = 1.0
+                latency_gain = 1.0
             elif headroom >= 0.05:
-                gain = (headroom - 0.05) / 0.45
+                latency_gain = (headroom - 0.05) / 0.45
             else:
-                gain = 0.0
-            step = a.initial_step * gain
+                latency_gain = 0.0
+            # Pivot-count gain: 1.0 → 0.71 → 0.55 → 0.45 → ... floored at 0.05.
+            # Each direction flip observed shrinks the step, so later passes
+            # converge inside the bracket we've already bisected.
+            pivot_gain = 1.0 / (1.0 + 0.4 * len(self.pivots))
+            step = a.initial_step * latency_gain * pivot_gain
             if step < a.step_floor:
                 self._print_row(sig, "hold")
                 continue
             await self._apply(min(a.max_level, level + step), sig, "ramp")
 
     async def _apply(self, new_level: float, sig: Signal, action: str) -> None:
+        # Record a pivot whenever direction flips (ramp ↔ back-off).
+        # Updates eq_level as an EWMA so future decisions converge on
+        # the learned equilibrium point.
+        new_direction = +1 if new_level > sig.target_mbps else -1
+        if new_direction != self.direction:
+            self.pivots.append(sig.target_mbps)
+            if len(self.pivots) > 10:
+                self.pivots.pop(0)
+            alpha = 0.3
+            self.eq_level = (1 - alpha) * self.eq_level + alpha * sig.target_mbps
+            self.direction = new_direction
         self._print_row(sig, action)
         await self.actuator.apply(new_level)
 
@@ -791,12 +812,15 @@ def _print_banner(args):
 
 
 def _print_summary(state: BenchState, controller, samples: int, args):
+    unit = controller.actuator.unit
     print()
     print("═" * 68)
-    print(f"  High-water: {controller.high_water:.1f} {controller.actuator.unit}")
+    print(f"  High-water:  {controller.high_water:.1f} {unit}")
+    print(f"  Equilibrium: {controller.eq_level:.1f} {unit}  "
+          f"(from {len(controller.pivots)} pivots)")
     if state.ceiling_reason:
-        print(f"  Reason:     {state.ceiling_reason}")
-    print(f"  Samples:    {samples}")
+        print(f"  Reason:      {state.ceiling_reason}")
+    print(f"  Samples:     {samples}")
     print("═" * 68)
 
 
