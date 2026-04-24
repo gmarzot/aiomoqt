@@ -32,18 +32,17 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import Optional
 
-from qh3.quic.configuration import QuicConfiguration
 from qh3.asyncio.server import serve
 from qh3.h3.connection import H3_ALPN
+from qh3.quic.configuration import QuicConfiguration
 
-from aiomoqt.types import (MOQTMessageType, MOQT_TIMESTAMP_EXT,
-                           ObjectStatus, FilterType)
 from aiomoqt.client import MOQTClient
 from aiomoqt.protocol import MOQTPeer, MOQTSession
 from aiomoqt.track import PublishedTrack, SubscribedTrack
-from aiomoqt.utils.logger import set_log_level
+from aiomoqt.types import (MOQT_TIMESTAMP_EXT, FilterType, MOQTMessageType,
+                           ObjectStatus)
 from aiomoqt.utils.format import fmt_bps, fmt_ms
-
+from aiomoqt.utils.logger import set_log_level
 
 # ---------------------------------------------------------------------------
 # Load config: pinned axes, ramp aggregate bitrate
@@ -340,7 +339,8 @@ class SubsActuator:
         # Lifecycle counters for summary + shortfall detection:
         self._subscribed_ever: set = set()
         self._failed_window = 0     # resets each observe()
-        self._last_stats_t: dict = {}  # sub_id -> monotonic when last 'stats' arrived
+        self._last_stats_t: dict = {}    # last 'stats' event time per sub
+        self._last_bytes_t: dict = {}    # last time we saw rx_bytes > 0 per sub
         self._shortfall_streak = 0
         self._t_last_observe = time.monotonic()
 
@@ -387,6 +387,7 @@ class SubsActuator:
             proc.join(timeout=1.0)
         self._latest_stats.pop(sid, None)
         self._last_stats_t.pop(sid, None)
+        self._last_bytes_t.pop(sid, None)
 
     async def observe(self) -> Signal:
         # Drain all pending events from workers.
@@ -402,6 +403,8 @@ class SubsActuator:
             if kind == 'stats':
                 self._latest_stats[sid] = msg
                 self._last_stats_t[sid] = time.monotonic()
+                if msg.get('rx_bytes', 0) > 0:
+                    self._last_bytes_t[sid] = self._last_stats_t[sid]
             elif kind == 'health':
                 state = msg.get('state')
                 if state == 'subscribed':
@@ -414,12 +417,38 @@ class SubsActuator:
                         stop_ev.set()
                         proc.join(timeout=0.5)
 
-        # Aggregate from latest stats per sub (only subs that produced
-        # a stats event in the last ~3s are "active").
+        # Aggregate from latest stats per sub. "Active" = delivered bytes
+        # recently. A worker whose QUIC conn went idle can still post
+        # zero-byte stats events and look alive without actually
+        # contributing — those subs must not be counted as delivering.
         now = time.monotonic()
-        active_cutoff = now - 3.0
-        active_ids = [sid for sid, t in self._last_stats_t.items()
-                      if t >= active_cutoff]
+        bytes_cutoff = now - 3.0
+        active_ids = [sid for sid, t in self._last_bytes_t.items()
+                      if t >= bytes_cutoff and sid in self._workers]
+
+        # Starvation reap: any spawned worker that has never received
+        # bytes OR hasn't received bytes for 10s is effectively dead.
+        # Kill it and score as failed so watch/clamp back-off engages.
+        starve_cutoff = now - 10.0
+        starved = []
+        for sid, (proc, stop_ev) in list(self._workers.items()):
+            last_bytes = self._last_bytes_t.get(sid)
+            spawned = self._last_stats_t.get(sid, now)
+            # Skip freshly spawned subs that haven't had a chance yet
+            # (no stats event received and < 10s since spawn).
+            if last_bytes is None and (now - spawned) < 10.0:
+                continue
+            if last_bytes is None or last_bytes < starve_cutoff:
+                starved.append(sid)
+        for sid in starved:
+            proc, stop_ev = self._workers.pop(sid, (None, None))
+            if proc is not None:
+                stop_ev.set()
+                proc.join(timeout=0.5)
+            self._latest_stats.pop(sid, None)
+            self._last_stats_t.pop(sid, None)
+            self._last_bytes_t.pop(sid, None)
+            failed_this_window += 1
 
         rx_bps_total = 0.0
         worst_p90 = 0.0
@@ -700,8 +729,8 @@ class AIMDController:
         latency_span = 6 + 2 + 6
         time_pad = 10    # 'time' column + breathing space before BW
         print(
-            f"  {' '*time_pad}  "
-            f"{'Target'.ljust(target_span)}  │  "
+            f"  {' '*time_pad}"
+            f"{'Target'.center(target_span)}  │  "
             f"{'Actual'.center(actual_span)}  │  "
             f"{'Latency'.center(latency_span)}  │"
         )
