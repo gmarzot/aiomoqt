@@ -971,7 +971,7 @@ def parse_args():
     p.add_argument("-n", "--namespace", default="aiomoqt",
                    help="MoQT namespace (default: aiomoqt)")
     p.add_argument("--trackname", default=None,
-                   help="MoQT trackname (default: adaptive-bench-<uuid4>)")
+                   help="MoQT trackname (default: adaptive-bench-<rand4>)")
     pub_mode = p.add_mutually_exclusive_group()
     pub_mode.add_argument("--pub-ns", action="store_true",
                           dest="pub_ns",
@@ -1022,7 +1022,7 @@ def parse_args():
         args.pub_both = True
 
     if args.trackname is None:
-        args.trackname = f"adaptive-bench-{uuid.uuid4()}"
+        args.trackname = f"adaptive-bench-{uuid.uuid4().hex[:4]}"
 
     args.scenario = Scenario(
         object_size=args.object_size,
@@ -1041,36 +1041,28 @@ def _print_banner(args):
     pub_mode = ("PUB-BOTH" if args.pub_both
                 else "PUB-NS" if args.pub_ns
                 else "PUBLISH")
+    draft_s = f"draft-{args.draft}" if args.draft else "draft-auto"
     print("─" * 68)
     print("  aiomoqt adaptive bench")
     print("─" * 68)
-    print(f"  host:         {platform.node()} ({platform.machine()})")
+    print(f"  host:               {platform.node()} ({platform.machine()})")
     if args.relay_url:
         from aiomoqt.utils.url import parse_relay_url
         relay = parse_relay_url(args.relay_url)
         transport = "QUIC" if relay.use_quic else "H3/WebTransport"
-        print(f"  relay:        {args.relay_url} ({transport})")
+        print(f"  relay:              {args.relay_url} ({transport}/{draft_s})")
     else:
-        print("  relay:        loopback self-test")
-    print(f"  namespace:    {args.namespace}")
-    print(f"  trackname:    {args.trackname}")
-    print(f"  draft:        {args.draft or 'auto'}")
-    print(f"  pub mode:     {pub_mode}")
-    print(f"  object size:  {sc.object_size} B")
-    print(f"  streams (P):  {sc.subgroups}")
-    print(f"  mode:         {args.mode}")
+        print(f"  relay:              loopback self-test ({draft_s})")
+    print(f"  namespace:          {args.namespace}")
+    print(f"  trackname:          {args.trackname}")
+    publish_parts = [pub_mode, f"obj={sc.object_size}B", f"P={sc.subgroups}"]
     if args.mode == "subs":
-        print(f"  start:        {args.start_subs} subs")
-        print(f"  step:         +{args.step_subs} subs")
-        print(f"  max:          {args.max_subs} subs")
-        print(f"  per-sub rate: {args.sub_mbps:.1f} Mbps")
-    else:
-        print(f"  start:        {sc.start_mbps:.1f} Mbps")
-        print(f"  step:         +{sc.step_mbps:.1f} Mbps")
-        print(f"  max:          {sc.max_mbps:.1f} Mbps")
-    print(f"  interval:     {sc.interval_s:.1f} s")
-    print(f"  p90 SLA:      {args.latency_threshold:.0f} ms")
+        publish_parts.append(f"rate={args.sub_mbps:.1f}Mbps")
+    print(f"  publish:            {' / '.join(publish_parts)}")
+    print(f"  latency threshold:  {args.latency_threshold:.0f} ms")
     print("─" * 68)
+    print()
+    print()
 
 
 def _print_summary(state: BenchState, controller, samples: int, args):
