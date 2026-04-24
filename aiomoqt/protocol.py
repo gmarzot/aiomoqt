@@ -1143,7 +1143,7 @@ class MOQTSession(QuicConnectionProtocol):
                 authority = value
             elif name == b':status':
                 status = value
-                
+
         if is_client:
             if status == b"200":
                 # Capture WT protocol negotiation result
@@ -1203,7 +1203,7 @@ class MOQTSession(QuicConnectionProtocol):
                     end_stream=True
                 )
                 self.transmit()
-            
+
     def _close_session(self, 
               error_code: SessionCloseCode = SessionCloseCode.NO_ERROR, 
               reason_phrase: str = "no error") -> None:
@@ -1218,14 +1218,14 @@ class MOQTSession(QuicConnectionProtocol):
         for stream_id in list(self._stream_tasks.keys()):
             if stream_id in self._stream_queues:
                 self._stream_queues[stream_id].put_nowait(None)
-                
+
         if not self._wt_session_setup.done():
             self._wt_session_setup.set_result(False)
         if not self._moqt_session_setup.done():
             self._moqt_session_setup.set_result(False)
         if not self._moqt_session_closed.done():
             self._moqt_session_closed.set_result((error_code, reason_phrase))
-        
+
     def close(self,
               error_code: SessionCloseCode = SessionCloseCode.NO_ERROR,
               reason_phrase: str = "no error"
@@ -1542,7 +1542,6 @@ class MOQTSession(QuicConnectionProtocol):
     ################################################################################################
     #  Outbound control message API - note: awaitable messages support 'wait_response' param       #
     ################################################################################################
-    
     def client_setup(
         self,
         versions: List[int] = MOQT_VERSIONS,
@@ -1551,14 +1550,14 @@ class MOQTSession(QuicConnectionProtocol):
         """Send CLIENT_SETUP message and optionally wait for SERVER_SETUP response."""
         if parameters is None:
             parameters = {}
-        
+
         message = ClientSetup(
             versions=versions,
             parameters=parameters
         )
         logger.info(f"MOQT send: {message}")
         self.send_control_message(message.serialize())
-        
+
         return message
 
     def server_setup(
@@ -1569,7 +1568,7 @@ class MOQTSession(QuicConnectionProtocol):
         """Send SERVER_SETUP message in response to CLIENT_SETUP."""
         if parameters is None:
             parameters = {}
-        
+
         message = ServerSetup(
             selected_version=selected_version,
             parameters=parameters
@@ -1577,7 +1576,7 @@ class MOQTSession(QuicConnectionProtocol):
         logger.info(f"MOQT send: {message}")
         self.send_control_message(message.serialize())
         return message
-  
+
     def subscribe(
         self,
         namespace: str,
