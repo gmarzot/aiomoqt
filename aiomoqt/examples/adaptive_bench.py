@@ -668,15 +668,15 @@ class AIMDController:
         if has_subs:
             print(
                 f"  {'time':>6}   "
-                f"{'BW':>7}  {'Nsubs':>5}  │  "
-                f"{'Tx':>7}  {'Rx':>7}  {'Nsubs':>5}  │  "
+                f"{'BW':<7}  {'Nsubs':>5}  │  "
+                f"{'Tx':<7}  {'Rx':<7}  {'Nsubs':>5}  │  "
                 f"{'mean':>6}  {'p90':>6}  │"
             )
         else:
             print(
                 f"  {'time':>6}   "
-                f"{'BW':>7}  │  "
-                f"{'Tx':>7}  {'Rx':>7}  │  "
+                f"{'BW':<7}  │  "
+                f"{'Tx':<7}  {'Rx':<7}  │  "
                 f"{'mean':>6}  {'p90':>6}  │"
             )
         total_w = time_pad + 2 + target_span + 5 + actual_span + 5 + latency_span + 5 + 14
@@ -695,19 +695,19 @@ class AIMDController:
         if self.actuator.unit == "subs":
             print(
                 f"  {t_rel:>5.1f}s  "
-                f"{bw:>7}  {sig.target_subs:>5}  │  "
-                f"{tx:>7}  {rx:>7}  {sig.active_subs:>5}  │  "
-                f"{mean:>6}  {p90:>6}  │  "
-                f"{sig.loss_pct:>4.1f}%  {action}",
+                f"{bw:<7}  {sig.target_subs:<5}  │  "
+                f"{tx:<7}  {rx:<7}  {sig.active_subs:<5}  │  "
+                f"{mean:<6}  {p90:<6}  │  "
+                f"{f'{sig.loss_pct:.1f}%':<5}  {action}",
                 flush=True,
             )
         else:
             print(
                 f"  {t_rel:>5.1f}s  "
-                f"{bw:>7}  │  "
-                f"{tx:>7}  {rx:>7}  │  "
-                f"{mean:>6}  {p90:>6}  │  "
-                f"{sig.loss_pct:>4.1f}%  {action}",
+                f"{bw:<7}  │  "
+                f"{tx:<7}  {rx:<7}  │  "
+                f"{mean:<6}  {p90:<6}  │  "
+                f"{f'{sig.loss_pct:.1f}%':<5}  {action}",
                 flush=True,
             )
 
@@ -1151,8 +1151,10 @@ async def main():
             endpoint = relay.endpoint or ""
             use_quic = relay.use_quic
             verify = not args.insecure
-            print(f"  relay: {args.relay_url} ({host}:{port}/{endpoint} "
-                  f"via {'QUIC' if use_quic else 'H3/WT'})")
+            transport = "QUIC" if use_quic else "H3/WebTransport"
+            print(f"  relay: {args.relay_url} "
+                  f"({host}:{port}/{endpoint}) ({transport})")
+            print()
             pub_task = asyncio.create_task(run_publisher_client(
                 host, port, endpoint, use_quic, verify, args, state))
             await asyncio.sleep(0.3)
