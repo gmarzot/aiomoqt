@@ -654,7 +654,7 @@ class AIMDController:
         # Target:  BW(7) + gap(2) + [Nsubs(5) + gap(2)] if subs
         # Actual:  Tx(7) + gap(2) + Rx(7) + gap(2) + [Nsubs(5) + gap(2)]
         # Latency: mean(6) + gap(2) + p90(6)
-        target_span = 7 + (3 + 5 if has_subs else 0)
+        target_span = 7 + (4 + 5 if has_subs else 0)
         actual_span = 7 + 2 + 7 + (3 + 5 if has_subs else 0)
         latency_span = 6 + 2 + 6
         time_pad = 10    # 'time' column + breathing space before BW
@@ -667,7 +667,7 @@ class AIMDController:
         if has_subs:
             print(
                 f"  {'time':>6}      "
-                f"{'BW':<7}   {'Nsub':<5}  │  "
+                f"{'BW':<7}    {'Nsub':<5}  │  "
                 f"{'Tx':<7}  {'Rx':<7}   {'Nsub':<5}  │  "
                 f"{'mean':>6}  {'p90':>6}  │  "
                 f"loss   action"
@@ -696,7 +696,7 @@ class AIMDController:
         if self.actuator.unit == "subs":
             print(
                 f"  {t_rel:>5.1f}s     "
-                f"{bw:<7}   {sig.target_subs:<5}  │  "
+                f"{bw:<7}    {sig.target_subs:<5}  │  "
                 f"{tx:<7}  {rx:<7}   {sig.active_subs:<5}  │  "
                 f"{mean:<6}  {p90:<6}  │  "
                 f"{f'{sig.loss_pct:.1f}%':<5}  {action}",
@@ -1044,6 +1044,13 @@ def _print_banner(args):
     print("  aiomoqt adaptive bench")
     print("─" * 68)
     print(f"  host:         {platform.node()} ({platform.machine()})")
+    if args.relay_url:
+        from aiomoqt.utils.url import parse_relay_url
+        relay = parse_relay_url(args.relay_url)
+        transport = "QUIC" if relay.use_quic else "H3/WebTransport"
+        print(f"  relay:        {args.relay_url} ({transport})")
+    else:
+        print(f"  relay:        loopback self-test")
     print(f"  namespace:    {args.namespace}")
     print(f"  trackname:    {args.trackname}")
     print(f"  draft:        {args.draft or 'auto'}")
@@ -1151,10 +1158,6 @@ async def main():
             endpoint = relay.endpoint or ""
             use_quic = relay.use_quic
             verify = not args.insecure
-            transport = "QUIC" if use_quic else "H3/WebTransport"
-            print(f"  relay: {args.relay_url} "
-                  f"({host}:{port}/{endpoint}) ({transport})")
-            print()
             pub_task = asyncio.create_task(run_publisher_client(
                 host, port, endpoint, use_quic, verify, args, state))
             await asyncio.sleep(0.3)
