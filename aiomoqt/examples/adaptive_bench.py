@@ -661,14 +661,14 @@ class AIMDController:
         print(
             f"  {' '*time_pad}  "
             f"{'Target'.center(target_span)}  │  "
-            f"{'Measured'.center(actual_span)}  │  "
+            f"{'Actual'.center(actual_span)}  │  "
             f"{'Latency'.center(latency_span)}  │"
         )
         if has_subs:
             print(
                 f"  {'time':>6}   "
-                f"{'BW':<7}  {'Nsubs':>5}  │  "
-                f"{'Tx':<7}  {'Rx':<7}  {'Nsubs':>5}  │  "
+                f"{'BW':<7}  {'Nsub':>5}  │  "
+                f"{'Tx':<7}  {'Rx':<7}  {'Nsub':>5}  │  "
                 f"{'mean':>6}  {'p90':>6}  │  "
                 f"loss   action"
             )
