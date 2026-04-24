@@ -85,7 +85,7 @@ class Signal:
 
     All the pieces the brain needs to decide 'ramp / hold / back-off'
     without knowing whether the load axis is Mbps or subscriber count.
-    The commanded/rx_mbps fields are for logging only — the brain uses
+    target/tx/rx_mbps fields are for logging only — the brain uses
     latency + loss + shortfall for decisions.
     """
     t: float
@@ -94,8 +94,9 @@ class Signal:
     latency_p99_ms: float
     loss_pct: float
     shortfall: bool
-    commanded_mbps: float
-    rx_mbps: float
+    target_mbps: float      # controller's ask
+    tx_mbps: float          # publisher-side measured (delta bytes / s)
+    rx_mbps: float          # subscriber-side measured (on-wire rx)
 
 
 @dataclass
@@ -109,6 +110,7 @@ class BenchState:
     """
     rate_ops: float = 0.0           # aggregate objects/sec commanded
     commanded_mbps: float = 0.0     # mirror of rate_ops in Mbps
+    tx_rate_mbps: float = 0.0       # writer: publisher (rolling tx rate)
     latest: Optional[Snapshot] = None
     history: deque = field(default_factory=lambda: deque(maxlen=64))
     stop: asyncio.Event = field(default_factory=asyncio.Event)
@@ -268,7 +270,8 @@ class BWActuator:
             latency_p99_ms=snap.p99_ms,
             loss_pct=snap.loss_pct,
             shortfall=shortfall,
-            commanded_mbps=snap.commanded_mbps,
+            target_mbps=snap.commanded_mbps,
+            tx_mbps=self.state.tx_rate_mbps,
             rx_mbps=snap.rx_bitrate_mbps,
         )
 
@@ -336,7 +339,8 @@ class AIMDController:
             if self.writer:
                 self.writer.writerow([
                     f"{sig.t:.3f}",
-                    f"{sig.commanded_mbps:.2f}",
+                    f"{sig.target_mbps:.2f}",
+                    f"{sig.tx_mbps:.2f}",
                     f"{sig.rx_mbps:.2f}",
                     f"{sig.latency_mean_ms:.2f}",
                     f"{sig.latency_p50_ms:.2f}",
@@ -363,7 +367,7 @@ class AIMDController:
                 continue
             self.no_data_streak = 0
 
-            level = sig.commanded_mbps  # same scalar space the actuator uses
+            level = sig.target_mbps  # same scalar space the actuator uses
 
             # P-control over latency: headroom ∈ [-∞, 1].
             #   1.0 = idle (p50 = 0), 0.0 = at SLA, <0 = overshoot.
@@ -428,11 +432,11 @@ class AIMDController:
     def _print_header(self) -> None:
         print(
             f"  {'time':>6}  "
-            f"{'Tx':>7}  {'Rx':>7}  │  "
+            f"{'Target':>7}  {'Tx':>7}  {'Rx':>7}  │  "
             f"{'mean':>6}  {'p50':>6}  {'p99':>6}  │  "
             f"{'loss':>6}  action"
         )
-        print("─" * 68)
+        print("─" * 76)
 
     def _print_row(self, sig: Signal, action: str) -> None:
         if not getattr(self, '_hdr_done', False):
@@ -441,7 +445,8 @@ class AIMDController:
         t_rel = sig.t - self.t0
         print(
             f"  {t_rel:>5.1f}s  "
-            f"{fmt_bps(sig.commanded_mbps * 1e6):>7}  "
+            f"{fmt_bps(sig.target_mbps * 1e6):>7}  "
+            f"{fmt_bps(sig.tx_mbps * 1e6):>7}  "
             f"{fmt_bps(sig.rx_mbps * 1e6):>7}  │  "
             f"{fmt_ms(sig.latency_mean_ms):>6}  "
             f"{fmt_ms(sig.latency_p50_ms):>6}  "
@@ -498,12 +503,26 @@ async def run_loopback_server(args, state: BenchState):
 
         async def _rate_sync():
             last = -1.0
+            last_bytes = track._total_bytes
+            last_t = time.monotonic()
+            tick = 0
             while not state.stop.is_set():
                 await asyncio.sleep(0.05)
                 if state.rate_ops != last:
                     track.rate = (state.rate_ops
                                   / max(1, args.scenario.subgroups))
                     last = state.rate_ops
+                tick += 1
+                if tick >= 20:  # ~1s at 50ms tick
+                    tick = 0
+                    now = time.monotonic()
+                    cur_bytes = track._total_bytes
+                    dt = now - last_t
+                    if dt > 0:
+                        state.tx_rate_mbps = (cur_bytes - last_bytes) \
+                            * 8.0 / (dt * 1e6)
+                    last_t = now
+                    last_bytes = cur_bytes
 
         sync = asyncio.create_task(_rate_sync())
         try:
@@ -625,12 +644,26 @@ async def run_publisher_client(host: str, port: int, endpoint: str,
 
             async def _rate_sync():
                 last = -1.0
+                last_bytes = track._total_bytes
+                last_t = time.monotonic()
+                tick = 0
                 while not state.stop.is_set():
                     await asyncio.sleep(0.05)
                     if state.rate_ops != last:
                         track.rate = (state.rate_ops
                                       / max(1, args.scenario.subgroups))
                         last = state.rate_ops
+                    tick += 1
+                    if tick >= 20:  # ~1s at 50ms tick
+                        tick = 0
+                        now = time.monotonic()
+                        cur_bytes = track._total_bytes
+                        dt = now - last_t
+                        if dt > 0:
+                            state.tx_rate_mbps = (cur_bytes - last_bytes) \
+                                * 8.0 / (dt * 1e6)
+                        last_t = now
+                        last_bytes = cur_bytes
 
             sync = asyncio.create_task(_rate_sync())
             try:
@@ -795,7 +828,7 @@ async def main():
         csv_file = open(args.report, "w", newline="")
         csv_writer = csv.writer(csv_file)
         csv_writer.writerow([
-            "t_monotonic", "commanded_mbps", "rx_mbps",
+            "t_monotonic", "target_mbps", "tx_mbps", "rx_mbps",
             "mean_ms", "p50_ms", "p99_ms", "loss_pct",
         ])
 
