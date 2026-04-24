@@ -662,22 +662,23 @@ class AIMDController:
             f"  {' '*time_pad}  "
             f"{'Target'.center(target_span)}  │  "
             f"{'Measured'.center(actual_span)}  │  "
-            f"{'Latency'.center(latency_span)}  │  "
-            f"loss   action"
+            f"{'Latency'.center(latency_span)}  │"
         )
         if has_subs:
             print(
                 f"  {'time':>6}   "
                 f"{'BW':<7}  {'Nsubs':>5}  │  "
                 f"{'Tx':<7}  {'Rx':<7}  {'Nsubs':>5}  │  "
-                f"{'mean':>6}  {'p90':>6}  │"
+                f"{'mean':>6}  {'p90':>6}  │  "
+                f"loss   action"
             )
         else:
             print(
                 f"  {'time':>6}   "
                 f"{'BW':<7}  │  "
                 f"{'Tx':<7}  {'Rx':<7}  │  "
-                f"{'mean':>6}  {'p90':>6}  │"
+                f"{'mean':>6}  {'p90':>6}  │  "
+                f"loss   action"
             )
         total_w = time_pad + 2 + target_span + 5 + actual_span + 5 + latency_span + 5 + 14
         print("─" * total_w)
