@@ -26,6 +26,7 @@ import platform
 import ssl
 import sys
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from functools import partial
@@ -654,7 +655,7 @@ class AIMDController:
         # Target:  BW(7) + gap(2) + [Nsubs(5) + gap(2)] if subs
         # Actual:  Tx(7) + gap(2) + Rx(7) + gap(2) + [Nsubs(5) + gap(2)]
         # Latency: mean(6) + gap(2) + p90(6)
-        target_span = 7 + (4 + 5 if has_subs else 0)
+        target_span = 7 + (3 + 5 if has_subs else 0)
         actual_span = 7 + 2 + 7 + (3 + 5 if has_subs else 0)
         latency_span = 6 + 2 + 6
         time_pad = 10    # 'time' column + breathing space before BW
@@ -667,7 +668,7 @@ class AIMDController:
         if has_subs:
             print(
                 f"  {'time':>6}      "
-                f"{'BW':<7}    {'Nsub':<5}  │  "
+                f"{'BW':<7}   {'Nsub':<5}  │  "
                 f"{'Tx':<7}  {'Rx':<7}   {'Nsub':<5}  │  "
                 f"{'mean':>6}  {'p90':>6}  │  "
                 f"loss   action"
@@ -967,10 +968,10 @@ def parse_args():
                    metavar="S", help="controller tick period seconds (default: 5)")
     p.add_argument("--draft", type=int, default=None,
                    help="MoQT draft version (14 or 16)")
-    p.add_argument("-n", "--namespace", default="bench.load",
-                   help="MoQT namespace (default: bench.load)")
+    p.add_argument("-n", "--namespace", default="aiomoqt",
+                   help="MoQT namespace (default: aiomoqt)")
     p.add_argument("--trackname", default=None,
-                   help="MoQT trackname (default: auto-unique)")
+                   help="MoQT trackname (default: adaptive-bench-<uuid4>)")
     pub_mode = p.add_mutually_exclusive_group()
     pub_mode.add_argument("--pub-ns", action="store_true",
                           dest="pub_ns",
@@ -1021,7 +1022,7 @@ def parse_args():
         args.pub_both = True
 
     if args.trackname is None:
-        args.trackname = f"bench-{os.getpid()}-{int(time.time()) % 100000}"
+        args.trackname = f"adaptive-bench-{uuid.uuid4()}"
 
     args.scenario = Scenario(
         object_size=args.object_size,
@@ -1050,7 +1051,7 @@ def _print_banner(args):
         transport = "QUIC" if relay.use_quic else "H3/WebTransport"
         print(f"  relay:        {args.relay_url} ({transport})")
     else:
-        print(f"  relay:        loopback self-test")
+        print("  relay:        loopback self-test")
     print(f"  namespace:    {args.namespace}")
     print(f"  trackname:    {args.trackname}")
     print(f"  draft:        {args.draft or 'auto'}")
