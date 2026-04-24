@@ -30,7 +30,7 @@ jobs:
         pip install pytest
         pip install -e .
     - name: Run interop-tier regression
-      run: python tests/release-regression-test.py --test-tier interop
+      run: python tests/release_regression_test.py --test-tier interop
     - name: Upload logs on failure
       if: failure()
       uses: actions/upload-artifact@v4

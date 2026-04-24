@@ -228,7 +228,7 @@ def parse_args():
     parser.add_argument('--namespace', type=str, default='test', help='Namespace')
     parser.add_argument('--trackname', type=str, default='track', help='Track')
     parser.add_argument('--use-quic', action='store_true', help='Enable QUIC transport')
-    parser.add_argument('--endpoint', type=str, default='moq', help='MOQT endpoint')
+    parser.add_argument('--endpoint', type=str, default='', help='MOQT endpoint path (default: "/")')
     parser.add_argument('--datagram', action='store_true', help='Emit ObjectDatagrams')
     parser.add_argument('--debug', action='store_true', help='Enable debug output')
     parser.add_argument('--quic-debug', action='store_true', help='Enable quic debug output')

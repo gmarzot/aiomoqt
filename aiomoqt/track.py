@@ -261,11 +261,12 @@ class PublishedTrack(Track):
         """Generate data for subscribers. Override for custom content.
 
         Default implementation sends padded objects at the configured rate.
+        `self.rate` is re-read on every iteration of the per-subgroup
+        send loop, so callers (e.g. adaptive_bench's controller) can
+        mutate `track.rate` in-place to change pacing live.
         """
 
         pad = b'\xBB' * self.object_size
-        paced = self.rate > 0
-        frame_interval = 1.0 / self.rate if paced else 0
 
         for subgroup_id in range(self.num_subgroups):
             priority = self.priority if subgroup_id == 0 else 0
@@ -276,8 +277,6 @@ class PublishedTrack(Track):
                     track_alias=track_alias,
                     priority=priority,
                     pad=pad,
-                    paced=paced,
-                    frame_interval=frame_interval,
                 )
             )
             task.add_done_callback(lambda t: self._tasks.discard(t))
@@ -296,8 +295,7 @@ class PublishedTrack(Track):
 
     async def _generate_subgroup(self, session, subgroup_id: int,
                                   track_alias: int, priority: int,
-                                  pad: bytes, paced: bool,
-                                  frame_interval: float,
+                                  pad: bytes,
                                   report_interval: float = 5.0):
         """Generate a single subgroup stream."""
         start_time = time.monotonic()
@@ -400,8 +398,11 @@ class PublishedTrack(Track):
                     self._iv_groups = 0
                     last_report = now
 
-                if paced:
-                    next_frame_time += frame_interval
+                # Re-read rate each iteration so callers can mutate
+                # self.rate in-place and have it take effect live.
+                current_rate = self.rate
+                if current_rate > 0:
+                    next_frame_time += 1.0 / current_rate
                     sleep_time = max(0, next_frame_time - time.monotonic())
                     await asyncio.sleep(sleep_time)
                 else:
@@ -463,7 +464,8 @@ class SubscribedTrack(Track):
 
     async def subscribe(self, timeout: float = 30.0,
                         forward: int = 1,
-                        subscribe_options: int = None):
+                        subscribe_options: int = None,
+                        filter_type: FilterType = FilterType.LATEST_OBJECT):
         """Subscribe to the track.
 
         Auto-routed on trackname presence:
@@ -475,6 +477,10 @@ class SubscribedTrack(Track):
             timeout: seconds to wait for PUBLISH announcement
             forward: forwarding preference (1=send objects, 0=hold)
             subscribe_options: d16 only — 0=PUBLISH, 1=NAMESPACE, 2=both
+            filter_type: d14/d16 §9.7 — LATEST_OBJECT (live forward),
+                NEXT_GROUP_START (skip current group), ABSOLUTE_START,
+                ABSOLUTE_RANGE. ABSOLUTE_START/RANGE not currently
+                plumbed through (no Start Location parameter).
         """
         if self.on_object:
             self.session.on_object_received = self.on_object
@@ -487,6 +493,7 @@ class SubscribedTrack(Track):
                 namespace=self.namespace,
                 track_name=self.trackname,
                 forward=forward,
+                filter_type=filter_type,
                 parameters=params,
                 wait_response=True,
             )
@@ -685,8 +692,7 @@ class VideoTrack(PublishedTrack):
 
     async def _generate_subgroup(self, session, subgroup_id: int,
                                   track_alias: int, priority: int,
-                                  pad: bytes, paced: bool,
-                                  frame_interval: float,
+                                  pad: bytes,
                                   report_interval: float = 5.0):
         """Generate video frames with variable I/B/P sizes."""
         start_time = time.monotonic()
@@ -798,8 +804,9 @@ class VideoTrack(PublishedTrack):
                     self._iv_groups = 0
                     last_report = now
 
-                if paced:
-                    next_frame_time += frame_interval
+                current_rate = self.rate
+                if current_rate > 0:
+                    next_frame_time += 1.0 / current_rate
                     sleep_time = max(0,
                         next_frame_time - time.monotonic())
                     await asyncio.sleep(sleep_time)

@@ -260,7 +260,7 @@ python -m aiomoqt.examples.server_example \
 ## Interop Test Results
 
 Results against live public relays, as probed by
-`tests/release-regression-test.py --test-tier interop` in v0.8.1.
+`tests/release_regression_test.py --test-tier interop` in v0.8.1.
 Tests use the 6 [moq-interop-runner](https://github.com/englishm/moq-interop-runner)
 cases plus `relay-pub-sub` (3-subscriber multi-sub bench).
 Error codes are validated to spec-conformant values

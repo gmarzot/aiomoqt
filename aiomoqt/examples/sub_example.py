@@ -16,7 +16,7 @@ def parse_args():
     parser.add_argument('--port', type=int, default=443, help='Port to connect to')
     parser.add_argument('--namespace', type=str, default="live/test", help='Track Namespace')
     parser.add_argument('--trackname', type=str, default="track", help='Track Name')
-    parser.add_argument('--endpoint', type=str, default="moq", help='MOQT WT endpoint')
+    parser.add_argument('--endpoint', type=str, default="", help='MOQT WT endpoint path (default: "/")')
     parser.add_argument('--use-quic', action='store_true', help='Enable QUIC transport')
     parser.add_argument('--debug', action='store_true', help='Enable debug output')
     parser.add_argument('--quic-debug', action='store_true',  help='Enable quic debug output')

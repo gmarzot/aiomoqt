@@ -8,17 +8,17 @@ Usage:
     cd ~/Projects/moq/aiomoqt
 
     # CI path: unit + integration (no network)
-    tests/release-regression-test.py --test-tier unit --test-tier integration
+    tests/release_regression_test.py --test-tier unit --test-tier integration
 
     # Interop across every relay in catalog, 4 relays in parallel
-    tests/release-regression-test.py --test-tier interop --interop-parallel 4
+    tests/release_regression_test.py --test-tier interop --interop-parallel 4
 
     # Limit to one relay
-    tests/release-regression-test.py --only moqx-main
-    tests/release-regression-test.py --only cloudflare-d14
+    tests/release_regression_test.py --only moqx-main
+    tests/release_regression_test.py --only cloudflare-d14
 
     # Adaptive throughput bench (manual dispatch only)
-    tests/release-regression-test.py --test-tier bench
+    tests/release_regression_test.py --test-tier bench
 
 Exit 0 iff every test passed. `[skip]` suites don't count.
 """
@@ -222,19 +222,19 @@ def _relay_fetch(url: str, draft: int, insecure: bool,
 # ---------------------------------------------------------------------------
 def _loopback_adaptive_bench(log_dir: Path) -> tuple[str, str]:
     log = log_dir / "loopback-adaptive-bench.log"
-    cmd = ["python", "-m", "aiomoqt.examples.adaptive_bench",
-           "--ramp", "10,5,10,200"]
-    ok, _ = _run(cmd, log, 300)
-    if not ok:
-        return "FAIL", "timeout"
+    # Loopback self-test: short ramp, kill after ~30s so the runner
+    # isn't held open by the forever-probing controller.
+    cmd = ["timeout", "--signal=INT", "--kill-after=3", "30",
+           "python", "-m", "aiomoqt.examples.adaptive_bench",
+           "--start-mbps", "10", "--step-mbps", "10",
+           "--max-mbps", "500", "--interval", "3",
+           "-l", "100"]
+    _run(cmd, log, 45)
     text = log.read_text()
-    m = re.search(r"Ceiling:\s+([\d.]+)\s*Mbps\s*\(([^)]+)\)", text)
+    m = re.search(r"High-water:\s+([\d.]+)\s+(\S+)", text)
     if m:
-        return "PASS", f"{m.group(1)} Mbps ceiling ({m.group(2)})"
-    m = re.search(r"No ceiling up to\s+([\d.]+)\s*Mbps", text)
-    if m:
-        return "PASS", f"no ceiling to {m.group(1)} Mbps"
-    return "FAIL", "(no ceiling summary)"
+        return "PASS", f"high-water {m.group(1)} {m.group(2)}"
+    return "FAIL", "(no summary — check log)"
 
 
 # ---------------------------------------------------------------------------

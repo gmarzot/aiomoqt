@@ -29,9 +29,6 @@ MOQT_IDLE_STREAM_TIMEOUT = 5
 
 # WebTransport stream header wire constants (draft-ietf-webtrans-http3).
 # Every WT stream is prefixed with <type, session_id> as two QUIC varints.
-WT_UNI_STREAM_TYPE = 0x54    # WEBTRANSPORT_STREAM (uni)
-WT_BIDI_FRAME_TYPE = 0x41    # WEBTRANSPORT_STREAM frame (bidi)
-
 logger = get_logger(__name__)
 
 
@@ -431,29 +428,6 @@ class MOQTSession(QuicConnectionProtocol):
                 logger.debug(f"MOQT stream({stream_id}): fetch "
                              f"request_id={request_id} complete")
         self._unbind_stream(stream_id)
-
-    def _strip_wt_header(self, stream_id: int, buf: Buffer,
-                         *, is_unidirectional: bool) -> bool:
-        """Strip the WT 2-varint stream prefix in-place on `buf`.
-
-        Returns True on success, False if the prefix is incomplete (caller
-        should buffer the raw bytes and retry on the next chunk). A
-        mismatched type or session_id is logged as a warning but not
-        treated as fatal — the strip still advances `buf` past the two
-        varints so downstream parsing can continue.
-        """
-        expected = WT_UNI_STREAM_TYPE if is_unidirectional else WT_BIDI_FRAME_TYPE
-        try:
-            st = buf.pull_uint_var()
-            sid = buf.pull_uint_var()
-        except BufferReadError:
-            return False
-        if st != expected or sid != self._session_id:
-            logger.warning(
-                f"MOQT stream({stream_id}): unexpected WT header "
-                f"type=0x{st:x} session={sid} "
-                f"(expected 0x{expected:x}/session={self._session_id})")
-        return True
 
     def _on_stream_data(self, stream_id: int, data: bytes,
                         end_stream: bool) -> None:
@@ -970,6 +944,15 @@ class MOQTSession(QuicConnectionProtocol):
                 logger.warning(f"QUIC event: stream data after close: " + close_condition)
                 return
 
+            elif self._h3 is not None:
+                # WT mode: qh3 emits WebTransportStreamDataReceived for
+                # the WT-prefix-stripped payload. Bidi and uni are both
+                # routed in _h3_handle_wt_stream. The client-opened bidi
+                # case relies on _h3_bind_wt_bidi() at stream creation
+                # (QH3_WT_BIDI_WORKAROUND).
+                pass  # fall through to H3 dispatch below
+
+            # Raw-QUIC mode below: handle bidi/control/uni inline.
             # Detect abrupt closure of critical streams
             elif (event.end_stream and len(event.data) == 0 and
                 stream_id in [self._control_stream_id, self._session_id]):
@@ -984,26 +967,12 @@ class MOQTSession(QuicConnectionProtocol):
                 msg_len = msg_buf.capacity
                 logger.debug(f"MOQT event: StreamDataReceived: stream: {stream_id} len: {msg_len}")
 
-                # Handle possible MoQT control stream
+                # Handle possible MoQT control stream (raw QUIC)
                 if not stream_is_unidirectional(stream_id):
-                    # Assume first bidi stream is MoQT control stream
                     if self._control_stream_id is None:
                         self._control_stream_id = stream_id
                         logger.debug(f"QUIC event: detecting control stream: {stream_id}")
-                        # Strip WT stream header (WebTransport only). A partial
-                        # header here indicates a peer-side bug — fail loud
-                        # with byte-level diagnostics.
-                        if self._h3 is not None:
-                            if not self._strip_wt_header(
-                                    stream_id, msg_buf, is_unidirectional=False):
-                                hex_bytes = event.data[:16].hex()
-                                self._close_session(
-                                    SessionCloseCode.PROTOCOL_VIOLATION,
-                                    f"control stream({stream_id}) WT header incomplete: "
-                                    f"got {len(event.data)} bytes: 0x{hex_bytes}")
-                                return
                     elif stream_id != self._control_stream_id:
-                        # d16: bidi streams carry SUBSCRIBE_NAMESPACE and responses
                         if is_draft16_or_later():
                             self._handle_bidi_stream(stream_id, msg_buf, msg_len)
                             return
@@ -1012,7 +981,6 @@ class MOQTSession(QuicConnectionProtocol):
 
                 # Handle MoQT control messages
                 if stream_id == self._control_stream_id:
-                    # XXX handle underflow in control stream as well
                     while msg_buf.tell() < msg_len:
                         msg = self._moqt_handle_control_message(msg_buf)
                         if msg is None:
@@ -1022,15 +990,11 @@ class MOQTSession(QuicConnectionProtocol):
                             break
                     return
 
-                # Uni MoQT data streams. Raw QUIC dispatches directly;
-                # the WT path falls through to H3 which emits
-                # WebTransportStreamDataReceived with the WT prefix
-                # already stripped.
+                # Uni MoQT data streams dispatch directly on raw QUIC.
                 if stream_is_unidirectional(stream_id):
-                    if self._h3 is None:
-                        self._on_stream_data(
-                            stream_id, event.data, event.end_stream)
-                        return
+                    self._on_stream_data(
+                        stream_id, event.data, event.end_stream)
+                    return
 
         elif isinstance(event, DatagramFrameReceived) and self._wt_session_setup.done():
             msg_buf = Buffer(data=event.data)
@@ -1090,16 +1054,72 @@ class MOQTSession(QuicConnectionProtocol):
         if isinstance(event, HeadersReceived):
             return self._h3_handle_headers_received(event)
         if isinstance(event, WebTransportStreamDataReceived):
-            # Bidi WT streams still flow through the raw StreamDataReceived
-            # path; only dispatch uni MoQT data streams here.
-            if stream_is_unidirectional(event.stream_id):
-                self._on_stream_data(
-                    event.stream_id, event.data, event.stream_ended)
-                return
+            self._h3_handle_wt_stream(event)
+            return
         msg_class = class_name(event)
         data = getattr(event, 'data', None)
         hex_data = f"0x{data.hex()}" if data is not None else "<no data>"
-        logger.debug(f"H3 event: stream {event.stream_id}: {msg_class}: {hex_data}")
+        stream_id = getattr(event, 'stream_id', '?')
+        logger.debug(f"H3 event: stream {stream_id}: {msg_class}: {hex_data}")
+
+    def _h3_handle_wt_stream(
+            self, event: WebTransportStreamDataReceived) -> None:
+        """Dispatch WT stream data (qh3 strips the 2-varint prefix).
+
+        Uni streams carry MoQT subgroup/fetch payloads. The first
+        peer-initiated bidi stream is the MoQT control stream;
+        subsequent bidi streams carry d16 request/response pairs.
+        Client-opened bidi streams are tagged by _h3_bind_wt_bidi()
+        so this path also sees their peer replies correctly
+        (QH3_WT_BIDI_WORKAROUND).
+        """
+        stream_id = event.stream_id
+
+        if stream_id == self._session_id:
+            # WT CONNECT stream — qh3 manages it internally
+            return
+
+        # Uni MoQT data stream (subgroup / fetch)
+        if stream_is_unidirectional(stream_id):
+            self._on_stream_data(
+                stream_id, event.data, event.stream_ended)
+            return
+
+        # First bidi event with payload is the MoQT control stream
+        # (only used server-side; client sets _control_stream_id at
+        # create_webtransport_stream time via client_session_init).
+        if self._control_stream_id is None and event.data:
+            self._control_stream_id = stream_id
+            logger.debug(
+                f"H3 event: detecting MoQT control stream: {stream_id}")
+
+        if not event.data:
+            # Lifecycle event (empty FIN etc.) — QUIC-level close /
+            # StreamReset covers real error cases elsewhere.
+            return
+
+        msg_buf = Buffer(data=event.data)
+        msg_len = msg_buf.capacity
+
+        if stream_id == self._control_stream_id:
+            while msg_buf.tell() < msg_len:
+                msg = self._moqt_handle_control_message(msg_buf)
+                if msg is None:
+                    error = (f"control stream: parsing failed at "
+                             f"position: {msg_buf.tell()} of {msg_len} bytes")
+                    logger.error(f"MOQT error: " + error)
+                    self._close_session(
+                        SessionCloseCode.PROTOCOL_VIOLATION, error)
+                    break
+            return
+
+        # Non-control bidi (d16 SUBSCRIBE_NAMESPACE etc.)
+        if is_draft16_or_later():
+            self._handle_bidi_stream(stream_id, msg_buf, msg_len)
+            return
+
+        logger.warning(
+            f"H3 event: unrecognized bidirectional stream({stream_id})")
 
     def _h3_handle_headers_received(self, event: HeadersReceived) -> None:
         """Process incoming H3 headers."""
@@ -1123,7 +1143,7 @@ class MOQTSession(QuicConnectionProtocol):
                 authority = value
             elif name == b':status':
                 status = value
-                
+
         if is_client:
             if status == b"200":
                 # Capture WT protocol negotiation result
@@ -1183,7 +1203,7 @@ class MOQTSession(QuicConnectionProtocol):
                     end_stream=True
                 )
                 self.transmit()
-            
+
     def _close_session(self, 
               error_code: SessionCloseCode = SessionCloseCode.NO_ERROR, 
               reason_phrase: str = "no error") -> None:
@@ -1198,14 +1218,14 @@ class MOQTSession(QuicConnectionProtocol):
         for stream_id in list(self._stream_tasks.keys()):
             if stream_id in self._stream_queues:
                 self._stream_queues[stream_id].put_nowait(None)
-                
+
         if not self._wt_session_setup.done():
             self._wt_session_setup.set_result(False)
         if not self._moqt_session_setup.done():
             self._moqt_session_setup.set_result(False)
         if not self._moqt_session_closed.done():
             self._moqt_session_closed.set_result((error_code, reason_phrase))
-        
+
     def close(self,
               error_code: SessionCloseCode = SessionCloseCode.NO_ERROR,
               reason_phrase: str = "no error"
@@ -1349,6 +1369,7 @@ class MOQTSession(QuicConnectionProtocol):
 
             # Create MoQT control stream
             self._control_stream_id = self._h3.create_webtransport_stream(session_id=self._session_id)
+            self._h3_bind_wt_bidi(self._control_stream_id)  # QH3_WT_BIDI_WORKAROUND
             logger.info(f"MOQT: WT control stream created stream id: {self._control_stream_id}")
 
         # Send CLIENT_SETUP
@@ -1387,6 +1408,36 @@ class MOQTSession(QuicConnectionProtocol):
 
 
 
+    # =====================================================================
+    # BEGIN QH3_WT_BIDI_WORKAROUND
+    # qh3 (and aioquic) up to 1.7.2: create_webtransport_stream() for bidi
+    # writes the WT 2-varint prefix outbound but never populates the H3
+    # stream's frame_type / session_id. Peer replies on our client-opened
+    # bidi WT streams therefore don't trigger the WT shortcut at
+    # qh3/h3/connection.py:_receive_request_or_push_data, so inbound data
+    # arrives mis-parsed (qh3 consumes the first two varints as
+    # frame_type + frame_size). Mirror what qh3 *would* have set if it
+    # tracked client-opened bidi WT state.
+    #
+    # Remove this helper and its call sites once qh3 >= <FIXED-VERSION>
+    # lands the same fix inside create_webtransport_stream. Upstream
+    # tracker: <aioquic-issue-url> / <qh3-issue-url>.
+    # =====================================================================
+    def _h3_bind_wt_bidi(self, stream_id: int) -> None:
+        """Tag a client-opened bidi WT stream in qh3's internal state
+        so incoming data is routed as WebTransport payload."""
+        if self._h3 is None:
+            return
+        from qh3.h3.connection import H3Stream, FrameType
+        h3 = self._h3
+        h3s = h3._stream.get(stream_id)
+        if h3s is None:
+            h3s = H3Stream(stream_id)
+            h3._stream[stream_id] = h3s
+        h3s.frame_type = FrameType.WEBTRANSPORT_STREAM
+        h3s.session_id = self._session_id
+    # END QH3_WT_BIDI_WORKAROUND
+
     def open_uni_stream(self) -> int:
         """Open a unidirectional data stream. Returns the stream ID."""
         if self._h3 is not None:
@@ -1397,8 +1448,10 @@ class MOQTSession(QuicConnectionProtocol):
     def open_bidi_stream(self) -> int:
         """Open a bidirectional stream. Returns the stream ID."""
         if self._h3 is not None:
-            return self._h3.create_webtransport_stream(
+            stream_id = self._h3.create_webtransport_stream(
                 session_id=self._session_id, is_unidirectional=False)
+            self._h3_bind_wt_bidi(stream_id)  # QH3_WT_BIDI_WORKAROUND
+            return stream_id
         return self._quic.get_next_available_stream_id(is_unidirectional=False)
 
     def stream_write(self, stream_id: int, data: bytes, end_stream: bool = False) -> None:
@@ -1456,32 +1509,21 @@ class MOQTSession(QuicConnectionProtocol):
         self.transmit()
 
     def _handle_bidi_stream(self, stream_id: int, buf: Buffer, buf_len: int) -> None:
-        """Handle d16 bidirectional stream messages (SUBSCRIBE_NAMESPACE, responses)."""
-        # Check if this is a response to our outbound request
+        """Handle d16 bidirectional stream messages (SUBSCRIBE_NAMESPACE,
+        responses). The WT 2-varint prefix is stripped upstream — by qh3
+        for WT mode, and absent in raw QUIC — so this handler always
+        sees clean MoQT payload.
+        """
         request_id = self._bidi_stream_requests.get(stream_id)
         if request_id is not None:
-            # Response on a bidi stream we opened — parse as control message
             while buf.tell() < buf_len:
                 msg = self._moqt_handle_control_message(buf)
                 if msg is None:
                     break
             return
 
-        # New incoming bidi stream from peer — strip WT stream header if present
-        if self._h3 is not None:
-            if not self._strip_wt_header(
-                    stream_id, buf, is_unidirectional=False):
-                hex_bytes = buf.data_slice(0, min(buf_len, 16)).hex()
-                self._close_session(
-                    SessionCloseCode.PROTOCOL_VIOLATION,
-                    f"bidi stream({stream_id}) WT header incomplete: "
-                    f"got {buf_len} bytes: 0x{hex_bytes}")
-                return
-
-        # Parse the message
         msg = self._moqt_handle_control_message(buf)
         if msg is not None and isinstance(msg, SubscribeNamespace):
-            # Track the stream so we can respond on it
             self._bidi_stream_requests[stream_id] = msg.request_id
             self._bidi_streams[msg.request_id] = stream_id
 
@@ -1500,7 +1542,6 @@ class MOQTSession(QuicConnectionProtocol):
     ################################################################################################
     #  Outbound control message API - note: awaitable messages support 'wait_response' param       #
     ################################################################################################
-    
     def client_setup(
         self,
         versions: List[int] = MOQT_VERSIONS,
@@ -1509,14 +1550,14 @@ class MOQTSession(QuicConnectionProtocol):
         """Send CLIENT_SETUP message and optionally wait for SERVER_SETUP response."""
         if parameters is None:
             parameters = {}
-        
+
         message = ClientSetup(
             versions=versions,
             parameters=parameters
         )
         logger.info(f"MOQT send: {message}")
         self.send_control_message(message.serialize())
-        
+
         return message
 
     def server_setup(
@@ -1527,7 +1568,7 @@ class MOQTSession(QuicConnectionProtocol):
         """Send SERVER_SETUP message in response to CLIENT_SETUP."""
         if parameters is None:
             parameters = {}
-        
+
         message = ServerSetup(
             selected_version=selected_version,
             parameters=parameters
@@ -1535,7 +1576,7 @@ class MOQTSession(QuicConnectionProtocol):
         logger.info(f"MOQT send: {message}")
         self.send_control_message(message.serialize())
         return message
-  
+
     def subscribe(
         self,
         namespace: str,

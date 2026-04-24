@@ -68,7 +68,10 @@ def parse_args():
     parser.add_argument('--trackname', type=str, default=None,
                         help='Explicit track name (default: '
                              'auto-discover on namespace)')
-    parser.add_argument('-P', '--no-pub', action='store_true',
+    parser.add_argument('-P', '--streams', type=int, default=1,
+                        help='Parallel subgroup streams on publisher '
+                             '(default: 1; matches pub_bench -P)')
+    parser.add_argument('--no-pub', action='store_true',
                         help='Skip publisher, run subscribers only '
                              '(publisher must be running elsewhere on '
                              'the same namespace)')
@@ -134,6 +137,7 @@ def run_publisher(relay_url, namespace, trackname, args):
                     session, namespace, trackname,
                     object_size=args.object_size,
                     group_size=group_size,
+                    num_subgroups=args.streams,
                     rate=args.rate,
                     draft=args.draft,
                 )

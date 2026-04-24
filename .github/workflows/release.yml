@@ -73,7 +73,7 @@ jobs:
           -days 1 -subj "/CN=localhost"
     - name: Run unit + integration tiers
       run: |
-        python tests/release-regression-test.py \
+        python tests/release_regression_test.py \
           --test-tier unit --test-tier integration
     - name: Upload logs on failure
       if: failure()

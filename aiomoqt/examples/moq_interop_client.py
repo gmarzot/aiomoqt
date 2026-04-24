@@ -592,7 +592,7 @@ def parse_relay_url(url: str):
         port = parsed.port or 443
 
     host = parsed.hostname or url.split(":")[0]
-    endpoint = parsed.path.lstrip("/") or "moq"
+    endpoint = parsed.path.lstrip("/")
 
     return host, port, endpoint, use_quic
 
