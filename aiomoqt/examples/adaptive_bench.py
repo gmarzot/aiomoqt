@@ -535,7 +535,7 @@ async def run_loopback_server(args, state: BenchState):
                 pass
 
     peer = MOQTPeer()
-    peer.endpoint = "moq"
+    peer.endpoint = ""
     peer.register_handler(MOQTMessageType.SUBSCRIBE,
                           partial(_on_subscribe))
 
@@ -851,7 +851,7 @@ async def main():
         if relay_mode:
             relay = parse_relay_url(args.relay_url)
             host, port = relay.host, relay.port
-            endpoint = relay.endpoint or "moq"
+            endpoint = relay.endpoint or ""
             use_quic = relay.use_quic
             verify = not args.insecure
             print(f"  relay: {args.relay_url} ({host}:{port}/{endpoint} "
@@ -866,7 +866,7 @@ async def main():
             server = await run_loopback_server(args, state)
             await asyncio.sleep(0.3)
             sub_task = asyncio.create_task(run_subscriber_client(
-                "localhost", loopback_port, "moq", False, False,
+                "localhost", loopback_port, "", False, False,
                 args, state, stats))
 
         ctrl_task = asyncio.create_task(controller.run())

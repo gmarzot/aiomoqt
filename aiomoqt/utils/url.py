@@ -37,7 +37,7 @@ class MOQTRelay:
 
 
 def parse_relay_url(url: str, force_quic: bool = False,
-                    default_endpoint: str = "moq") -> MOQTRelay:
+                    default_endpoint: str = "") -> MOQTRelay:
     """Parse a relay URL into connection parameters.
 
     Args:
@@ -47,7 +47,9 @@ def parse_relay_url(url: str, force_quic: bool = False,
             - "host:port"               -> H3/WebTransport (default)
             - "host"                    -> H3/WebTransport, default port
         force_quic: Override to use raw QUIC even for https:// URLs.
-        default_endpoint: WebTransport endpoint when not in URL (default: "moq").
+        default_endpoint: WebTransport endpoint when not in URL.
+            Defaults to "" (= root path "/"). Callers that need a
+            specific path (e.g. "moq-relay") must pass it explicitly.
 
     Returns:
         MOQTRelay with parsed connection parameters.
