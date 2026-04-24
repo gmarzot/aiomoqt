@@ -313,7 +313,8 @@ class SubsActuator:
                  min_subs: int, max_subs: int,
                  start_subs: int, step_subs: int,
                  object_size: int, per_sub_mbps: float,
-                 sub_filter: FilterType = FilterType.LATEST_OBJECT):
+                 sub_filter: FilterType = FilterType.LATEST_OBJECT,
+                 interval_s: float = 5.0):
         self.relay_url = relay_url
         self.namespace = namespace
         self.trackname = trackname
@@ -328,6 +329,7 @@ class SubsActuator:
         self.object_size = object_size
         self.per_sub_mbps = per_sub_mbps
         self.sub_filter = sub_filter
+        self.interval_s = interval_s
 
         import multiprocessing as mp
         self._mp = mp
@@ -427,18 +429,21 @@ class SubsActuator:
                       if t >= bytes_cutoff and sid in self._workers]
 
         # Starvation reap: any spawned worker that has never received
-        # bytes OR hasn't received bytes for 10s is effectively dead.
-        # Kill it and score as failed so watch/clamp back-off engages.
-        starve_cutoff = now - 10.0
+        # bytes OR hasn't received bytes for 2 * interval is dead.
+        # Scaled with interval so fast-tick configs reap quickly and
+        # slow-tick configs stay patient. Kill + score as failed so
+        # watch/clamp back-off engages.
+        starve_window = 2.0 * self.interval_s
+        starve_cutoff = now - starve_window
         starved = []
         for sid, (proc, stop_ev) in list(self._workers.items()):
             last_bytes = self._last_bytes_t.get(sid)
             spawned = self._last_stats_t.get(sid, now)
-            # Skip freshly spawned subs that haven't had a chance yet
-            # (no stats event received and < 10s since spawn).
-            if last_bytes is None and (now - spawned) < 10.0:
+            # Skip freshly spawned subs: no bytes yet AND not older than
+            # the starve window (grace for QUIC handshake + subscribe).
+            if last_bytes is None and (now - spawned) < starve_window:
                 continue
-            if last_bytes is None or last_bytes < starve_cutoff:
+            if last_bytes is None or last_bytes <= starve_cutoff:
                 starved.append(sid)
         for sid in starved:
             proc, stop_ev = self._workers.pop(sid, (None, None))
@@ -730,7 +735,7 @@ class AIMDController:
         time_pad = 10    # 'time' column + breathing space before BW
         print(
             f"  {' '*time_pad}"
-            f"{'Target'.center(target_span)}  │  "
+            f"{'Target'.center(target_span)}    │  "
             f"{'Actual'.center(actual_span)}  │  "
             f"{'Latency'.center(latency_span)}  │"
         )
@@ -1218,6 +1223,7 @@ async def main():
             object_size=args.scenario.object_size,
             per_sub_mbps=args.sub_mbps,
             sub_filter=args.sub_filter,
+            interval_s=args.scenario.interval_s,
         )
     else:
         actuator = BWActuator(
