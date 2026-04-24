@@ -530,13 +530,31 @@ class MOQTSession(QuicConnectionProtocol):
                     needed = 1  # just get the next msg_buf - we dont know amount needed
                     break
                 except Exception as e:
-                    # Dump buffer state for debugging parse failures
+                    # Data-plane parse failure — the deframer lost its
+                    # alignment on this stream. Abandon the stream via
+                    # STOP_SENDING and keep the session alive; other
+                    # concurrent subgroup streams are unaffected.
+                    # Pre-hardening, this raised and killed the whole
+                    # session, taking down every in-flight subscription.
                     tell = msg_buf.tell()
-                    hex_at = msg_buf.data_slice(max(0, cur_pos), min(msg_len, cur_pos + 40)).hex()
-                    logger.error(f"MOQT stream({stream_id}): PARSE EXCEPTION at cur_pos={cur_pos} tell={tell} msg_len={msg_len} "
-                                 f"needed_was={needed} hex@cur_pos={hex_at} "
-                                 f"object_id={object_id} group_id={group_id}")
-                    raise
+                    hex_at = msg_buf.data_slice(
+                        max(0, cur_pos),
+                        min(msg_len, cur_pos + 40),
+                    ).hex()
+                    logger.error(
+                        f"MOQT stream({stream_id}): PARSE EXCEPTION "
+                        f"at cur_pos={cur_pos} tell={tell} "
+                        f"msg_len={msg_len} needed_was={needed} "
+                        f"hex@cur_pos={hex_at} "
+                        f"object_id={object_id} group_id={group_id} "
+                        f"exc={type(e).__name__}: {e}"
+                    )
+                    self._reject_stream(
+                        stream_id,
+                        SessionCloseCode.PROTOCOL_VIOLATION,
+                        f"parse error: {type(e).__name__}",
+                    )
+                    return
 
                 if msg_obj is None:
                     error = f"MOQT error: data stream({stream_id}):: parsing failed at position: "

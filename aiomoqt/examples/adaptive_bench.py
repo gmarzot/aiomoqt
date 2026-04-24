@@ -165,7 +165,11 @@ class LiveStats:
         latency = None
         if send_ms is not None:
             raw = recv_time_ms - send_ms
-            if abs(raw) < 60000:
+            # Accept up to 10 minutes (under load latency really can
+            # exceed 60s); reject negatives and absurd values that
+            # come from deframer garbage (varint misdecode gives
+            # send_ms = 2^40-ish).
+            if -1000 <= raw <= 600_000:
                 latency = raw
                 if self._last_recv_ms and self._last_send_ms:
                     d = abs((recv_time_ms - self._last_recv_ms)

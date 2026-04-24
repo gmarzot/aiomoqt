@@ -63,9 +63,12 @@ class _RollingStats:
         lat_ms = None
         exts = getattr(msg, 'extensions', None) or {}
         send_ms = exts.get(0x20)
-        if send_ms is not None and recv_time_ms is not None \
-                and abs(recv_time_ms - send_ms) < 60000:
-            lat_ms = recv_time_ms - send_ms
+        if send_ms is not None and recv_time_ms is not None:
+            raw = recv_time_ms - send_ms
+            # Reject negatives + absurd values from deframer garbage;
+            # accept up to 10 minutes (real under-load latency).
+            if -1000 <= raw <= 600_000:
+                lat_ms = raw
         self._events.append((t, size_bytes, lat_ms))
         self._total_bytes += size_bytes
         self._total_objs += 1
