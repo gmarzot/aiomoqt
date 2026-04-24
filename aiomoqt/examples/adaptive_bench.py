@@ -657,7 +657,7 @@ class AIMDController:
         target_span = 7 + (2 + 5 if has_subs else 0)
         actual_span = 7 + 2 + 7 + (2 + 5 if has_subs else 0)
         latency_span = 6 + 2 + 6
-        time_pad = 7  # width of the 'time' column (" xx.xs ")
+        time_pad = 10    # 'time' column + breathing space before BW
         print(
             f"  {' '*time_pad}  "
             f"{'Target'.center(target_span)}  │  "
@@ -666,15 +666,15 @@ class AIMDController:
         )
         if has_subs:
             print(
-                f"  {'time':>6}   "
-                f"{'BW':<7}  {'Nsub':>5}  │  "
-                f"{'Tx':<7}  {'Rx':<7}  {'Nsub':>5}  │  "
+                f"  {'time':>6}      "
+                f"{'BW':<7}  {'Nsub':<5}  │  "
+                f"{'Tx':<7}  {'Rx':<7}  {'Nsub':<5}  │  "
                 f"{'mean':>6}  {'p90':>6}  │  "
                 f"loss   action"
             )
         else:
             print(
-                f"  {'time':>6}   "
+                f"  {'time':>6}      "
                 f"{'BW':<7}  │  "
                 f"{'Tx':<7}  {'Rx':<7}  │  "
                 f"{'mean':>6}  {'p90':>6}  │  "
@@ -695,7 +695,7 @@ class AIMDController:
         p90 = fmt_ms(sig.latency_p90_ms)
         if self.actuator.unit == "subs":
             print(
-                f"  {t_rel:>5.1f}s  "
+                f"  {t_rel:>5.1f}s     "
                 f"{bw:<7}  {sig.target_subs:<5}  │  "
                 f"{tx:<7}  {rx:<7}  {sig.active_subs:<5}  │  "
                 f"{mean:<6}  {p90:<6}  │  "
@@ -704,7 +704,7 @@ class AIMDController:
             )
         else:
             print(
-                f"  {t_rel:>5.1f}s  "
+                f"  {t_rel:>5.1f}s     "
                 f"{bw:<7}  │  "
                 f"{tx:<7}  {rx:<7}  │  "
                 f"{mean:<6}  {p90:<6}  │  "
@@ -1070,8 +1070,7 @@ def _print_summary(state: BenchState, controller, samples: int, args):
     print()
     print("═" * 68)
     print(f"  High-water:  {controller.high_water:.1f} {unit}")
-    print(f"  Equilibrium: {controller.eq_level:.1f} {unit}  "
-          f"(from {len(controller.pivots)} pivots)")
+    print(f"  Equilibrium: {controller.eq_level:.1f} {unit}")
     if state.ceiling_reason:
         print(f"  Reason:      {state.ceiling_reason}")
     print(f"  Samples:     {samples}")
