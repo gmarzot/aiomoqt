@@ -31,6 +31,7 @@ from typing import Any, Dict
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.track import SubscribedTrack, TrackState
+from aiomoqt.types import FilterType
 from aiomoqt.utils.url import parse_relay_url
 from aiomoqt.utils.logger import set_log_level
 
@@ -192,7 +193,12 @@ async def _subscriber_task(config: Dict[str, Any], mp_stop_event,
                     on_object=_on_object,
                 )
                 try:
-                    await track.subscribe(timeout=SUBSCRIBE_EACH_TIMEOUT_S)
+                    ft = FilterType(config.get('sub_filter',
+                                               FilterType.LATEST_OBJECT))
+                    await track.subscribe(
+                        timeout=SUBSCRIBE_EACH_TIMEOUT_S,
+                        filter_type=ft,
+                    )
                     break
                 except Exception as e:
                     m = str(e)

@@ -36,7 +36,8 @@ from qh3.quic.configuration import QuicConfiguration
 from qh3.asyncio.server import serve
 from qh3.h3.connection import H3_ALPN
 
-from aiomoqt.types import MOQTMessageType, MOQT_TIMESTAMP_EXT, ObjectStatus
+from aiomoqt.types import (MOQTMessageType, MOQT_TIMESTAMP_EXT,
+                            ObjectStatus, FilterType)
 from aiomoqt.client import MOQTClient
 from aiomoqt.protocol import MOQTPeer, MOQTSession
 from aiomoqt.track import PublishedTrack, SubscribedTrack
@@ -312,7 +313,8 @@ class SubsActuator:
                  draft, insecure: bool, force_quic: bool,
                  min_subs: int, max_subs: int,
                  start_subs: int, step_subs: int,
-                 object_size: int, per_sub_mbps: float):
+                 object_size: int, per_sub_mbps: float,
+                 sub_filter: FilterType = FilterType.LATEST_OBJECT):
         self.relay_url = relay_url
         self.namespace = namespace
         self.trackname = trackname
@@ -326,6 +328,7 @@ class SubsActuator:
         self.initial_level = float(start_subs)
         self.object_size = object_size
         self.per_sub_mbps = per_sub_mbps
+        self.sub_filter = sub_filter
 
         import multiprocessing as mp
         self._mp = mp
@@ -357,6 +360,7 @@ class SubsActuator:
                 draft=self.draft,
                 insecure=self.insecure,
                 force_quic=self.force_quic,
+                sub_filter=int(self.sub_filter),
             )
             from aiomoqt.examples._bench_workers import sub_worker_entry
             p = self._mp.Process(
@@ -1051,8 +1055,27 @@ def parse_args():
     p.add_argument("--sub-mbps", type=float, default=10.0,
                    help="subs-mode: fixed per-track publisher bitrate "
                         "(default: 10 Mbps)")
+    # CLI names from FilterType enum: kebab-case of the member name.
+    # NEXT_GROUP_START → next-group-start, LATEST_OBJECT → latest-object,
+    # etc. ABSOLUTE_START/RANGE are enumerated here but rejected below
+    # because they require a Start Location we don't plumb yet.
+    filter_choices = {
+        f.name.lower().replace("_", "-"): f for f in FilterType
+    }
+    p.add_argument("--sub-filter",
+                   choices=sorted(filter_choices),
+                   default="latest-object",
+                   help="subscribe filter (default: latest-object). "
+                        "'next-group-start' skips current-group replay "
+                        "some relays do on latest-object.")
     p.add_argument("-d", "--debug", action="store_true")
     args = p.parse_args()
+    args.sub_filter = filter_choices[args.sub_filter]
+    if args.sub_filter in (FilterType.ABSOLUTE_START,
+                           FilterType.ABSOLUTE_RANGE):
+        p.error(f"--sub-filter {args.sub_filter.name.lower()} requires "
+                "a Start Location which is not yet plumbed; use "
+                "latest-object or next-group-start.")
 
     if not args.pub_ns and not args.pub_both:
         args.pub_both = True
@@ -1094,6 +1117,9 @@ def _print_banner(args):
     if args.mode == "subs":
         publish_parts.append(f"rate={args.sub_mbps:.1f}Mbps")
     print(f"  publish:            {', '.join(publish_parts)}")
+    if args.mode == "subs":
+        cli_name = args.sub_filter.name.lower().replace("_", "-")
+        print(f"  subscribe filter:   {cli_name}")
     print(f"  latency threshold:  {args.latency_threshold:.0f} ms")
     print("─" * 68)
     print()
@@ -1162,6 +1188,7 @@ async def main():
             start_subs=args.start_subs, step_subs=args.step_subs,
             object_size=args.scenario.object_size,
             per_sub_mbps=args.sub_mbps,
+            sub_filter=args.sub_filter,
         )
     else:
         actuator = BWActuator(

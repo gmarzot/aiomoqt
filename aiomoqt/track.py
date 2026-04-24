@@ -464,7 +464,8 @@ class SubscribedTrack(Track):
 
     async def subscribe(self, timeout: float = 30.0,
                         forward: int = 1,
-                        subscribe_options: int = None):
+                        subscribe_options: int = None,
+                        filter_type: FilterType = FilterType.LATEST_OBJECT):
         """Subscribe to the track.
 
         Auto-routed on trackname presence:
@@ -476,6 +477,10 @@ class SubscribedTrack(Track):
             timeout: seconds to wait for PUBLISH announcement
             forward: forwarding preference (1=send objects, 0=hold)
             subscribe_options: d16 only — 0=PUBLISH, 1=NAMESPACE, 2=both
+            filter_type: d14/d16 §9.7 — LATEST_OBJECT (live forward),
+                NEXT_GROUP_START (skip current group), ABSOLUTE_START,
+                ABSOLUTE_RANGE. ABSOLUTE_START/RANGE not currently
+                plumbed through (no Start Location parameter).
         """
         if self.on_object:
             self.session.on_object_received = self.on_object
@@ -488,6 +493,7 @@ class SubscribedTrack(Track):
                 namespace=self.namespace,
                 track_name=self.trackname,
                 forward=forward,
+                filter_type=filter_type,
                 parameters=params,
                 wait_response=True,
             )
