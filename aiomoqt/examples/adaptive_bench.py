@@ -37,7 +37,7 @@ from qh3.asyncio.server import serve
 from qh3.h3.connection import H3_ALPN
 
 from aiomoqt.types import (MOQTMessageType, MOQT_TIMESTAMP_EXT,
-                            ObjectStatus, FilterType)
+                           ObjectStatus, FilterType)
 from aiomoqt.client import MOQTClient
 from aiomoqt.protocol import MOQTPeer, MOQTSession
 from aiomoqt.track import PublishedTrack, SubscribedTrack
@@ -710,7 +710,7 @@ class AIMDController:
                 f"  {'time':>6}      "
                 f"{'BW':<7}   {'Nsub':<5}  │  "
                 f"{'Tx':<7}  {'Rx':<7}   {'Nsub':<5}  │  "
-                f"{'mean':>6}  {'p90':>6}  │  "
+                f"{'mean':<6}  {'p90':<6}  │  "
                 f"loss   action"
             )
         else:
@@ -718,7 +718,7 @@ class AIMDController:
                 f"  {'time':>6}      "
                 f"{'BW':<7}  │  "
                 f"{'Tx':<7}  {'Rx':<7}  │  "
-                f"{'mean':>6}  {'p90':>6}  │  "
+                f"{'mean':<6}  {'p90':<6}  │  "
                 f"loss   action"
             )
         total_w = time_pad + 2 + target_span + 5 + actual_span + 5 + latency_span + 5 + 14
