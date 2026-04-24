@@ -649,36 +649,67 @@ class AIMDController:
         await self.actuator.apply(new_level)
 
     def _print_header(self) -> None:
-        subs_col = (f"{'subs':>8}  " if self.actuator.unit == "subs" else "")
+        has_subs = self.actuator.unit == "subs"
+        # Group spans — must match widths used by _print_row.
+        # Target:  BW(7) + gap(2) + [Nsubs(5) + gap(2)] if subs
+        # Actual:  Tx(7) + gap(2) + Rx(7) + gap(2) + [Nsubs(5) + gap(2)]
+        # Latency: mean(6) + gap(2) + p90(6)
+        target_span = 7 + (2 + 5 if has_subs else 0)
+        actual_span = 7 + 2 + 7 + (2 + 5 if has_subs else 0)
+        latency_span = 6 + 2 + 6
+        time_pad = 7  # width of the 'time' column (" xx.xs ")
         print(
-            f"  {'time':>6}  "
-            f"{subs_col}"
-            f"{'Target':>7}  {'Tx':>7}  {'Rx':>7}  │  "
-            f"{'mean':>6}  {'p90':>6}  │  "
-            f"{'loss':>6}  action"
+            f"  {' '*time_pad}  "
+            f"{'Target'.center(target_span)}  │  "
+            f"{'Measured'.center(actual_span)}  │  "
+            f"{'Latency'.center(latency_span)}  │  "
+            f"loss   action"
         )
-        print("─" * (68 + (10 if self.actuator.unit == "subs" else 0)))
+        if has_subs:
+            print(
+                f"  {'time':>6}   "
+                f"{'BW':>7}  {'Nsubs':>5}  │  "
+                f"{'Tx':>7}  {'Rx':>7}  {'Nsubs':>5}  │  "
+                f"{'mean':>6}  {'p90':>6}  │"
+            )
+        else:
+            print(
+                f"  {'time':>6}   "
+                f"{'BW':>7}  │  "
+                f"{'Tx':>7}  {'Rx':>7}  │  "
+                f"{'mean':>6}  {'p90':>6}  │"
+            )
+        total_w = time_pad + 2 + target_span + 5 + actual_span + 5 + latency_span + 5 + 14
+        print("─" * total_w)
 
     def _print_row(self, sig: Signal, action: str) -> None:
         if not getattr(self, '_hdr_done', False):
             self._print_header()
             self._hdr_done = True
         t_rel = sig.t - self.t0
+        bw = fmt_bps(sig.target_mbps * 1e6)
+        tx = fmt_bps(sig.tx_mbps * 1e6)
+        rx = fmt_bps(sig.rx_mbps * 1e6)
+        mean = fmt_ms(sig.latency_mean_ms)
+        p90 = fmt_ms(sig.latency_p90_ms)
         if self.actuator.unit == "subs":
-            subs_col = f"{sig.active_subs:>3}/{sig.target_subs:<3}  "
+            print(
+                f"  {t_rel:>5.1f}s  "
+                f"{bw:>7}  {sig.target_subs:>5}  │  "
+                f"{tx:>7}  {rx:>7}  {sig.active_subs:>5}  │  "
+                f"{mean:>6}  {p90:>6}  │  "
+                f"{sig.loss_pct:>4.1f}%  {action}",
+                flush=True,
+            )
         else:
-            subs_col = ""
-        print(
-            f"  {t_rel:>5.1f}s  "
-            f"{subs_col}"
-            f"{fmt_bps(sig.target_mbps * 1e6):>7}  "
-            f"{fmt_bps(sig.tx_mbps * 1e6):>7}  "
-            f"{fmt_bps(sig.rx_mbps * 1e6):>7}  │  "
-            f"{fmt_ms(sig.latency_mean_ms):>6}  "
-            f"{fmt_ms(sig.latency_p90_ms):>6}  │  "
-            f"{sig.loss_pct:>5.2f}%  {action}",
-            flush=True,
-        )
+            print(
+                f"  {t_rel:>5.1f}s  "
+                f"{bw:>7}  │  "
+                f"{tx:>7}  {rx:>7}  │  "
+                f"{mean:>6}  {p90:>6}  │  "
+                f"{sig.loss_pct:>4.1f}%  {action}",
+                flush=True,
+            )
 
 
 # ---------------------------------------------------------------------------
