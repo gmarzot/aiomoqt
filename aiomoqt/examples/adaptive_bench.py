@@ -664,10 +664,10 @@ class AIMDController:
             f"  {'time':>6}  "
             f"{subs_col}"
             f"{'Target':>7}  {'Tx':>7}  {'Rx':>7}  │  "
-            f"{'mean':>6}  {'p50':>6}  {'p99':>6}  │  "
+            f"{'mean':>6}  {'p50':>6}  │  "
             f"{'loss':>6}  action"
         )
-        print("─" * (76 + (10 if self.actuator.unit == "subs" else 0)))
+        print("─" * (68 + (10 if self.actuator.unit == "subs" else 0)))
 
     def _print_row(self, sig: Signal, action: str) -> None:
         if not getattr(self, '_hdr_done', False):
@@ -685,8 +685,7 @@ class AIMDController:
             f"{fmt_bps(sig.tx_mbps * 1e6):>7}  "
             f"{fmt_bps(sig.rx_mbps * 1e6):>7}  │  "
             f"{fmt_ms(sig.latency_mean_ms):>6}  "
-            f"{fmt_ms(sig.latency_p50_ms):>6}  "
-            f"{fmt_ms(sig.latency_p99_ms):>6}  │  "
+            f"{fmt_ms(sig.latency_p50_ms):>6}  │  "
             f"{sig.loss_pct:>5.2f}%  {action}",
             flush=True,
         )
