@@ -513,6 +513,7 @@ class AIMDController:
         self.backoff_factor = backoff_factor
         self.loss_threshold_pct = loss_threshold_pct
         self.shortfall_streak = 0
+        self.pressure_streak = 0
         self.high_water = actuator.initial_level
         self.samples = 0
         self.draining = False
@@ -579,28 +580,48 @@ class AIMDController:
             headroom = (self.latency_threshold_ms - sig.latency_p90_ms) \
                 / self.latency_threshold_ms
 
-            # Hard signals override headroom.
-            if sig.loss_pct > self.loss_threshold_pct:
-                await self._apply(level * self.backoff_factor, sig, "back-off")
-                self.draining = True
-                continue
+            # Unified back-off signal with watch + clamped retreat:
+            # any of {loss, sustained shortfall, p90 overshoot} increments
+            # a pressure streak. First bad interval just 'watches' — we
+            # don't kill anything unless the signal persists. Keeps
+            # transient spikes (GC pause, QUIC RTT jitter) from
+            # triggering a sub-reap cliff.
+            over_p90 = headroom < 0
+            over_loss = sig.loss_pct > self.loss_threshold_pct
             if sig.shortfall:
                 self.shortfall_streak += 1
             else:
                 self.shortfall_streak = 0
-            if self.shortfall_streak >= 2:
-                await self._apply(level * self.backoff_factor, sig, "back-off")
+            over_shortfall = self.shortfall_streak >= 2
+            if over_p90 or over_loss or over_shortfall:
+                self.pressure_streak += 1
+                reasons = []
+                if over_p90:
+                    reasons.append(f"p90 over")
+                if over_loss:
+                    reasons.append(f"loss {sig.loss_pct:.1f}%")
+                if over_shortfall:
+                    reasons.append("shortfall")
+                if self.pressure_streak < 2:
+                    self._print_row(sig, f"watch ({', '.join(reasons)})")
+                    continue
+                # Persistent pressure — back off, but clamp to at most
+                # one --step so we never drop 30% of subs in one swing.
+                if over_p90:
+                    retreat = max(self.backoff_factor, 1.0 + headroom)
+                    new_level = level * retreat
+                else:
+                    new_level = level * self.backoff_factor
+                new_level = max(a.min_level, new_level)
+                # Symmetric clamp with ramp: drop at most initial_step.
+                new_level = max(new_level, level - a.initial_step)
+                self.pressure_streak = 0
                 self.shortfall_streak = 0
+                await self._apply(new_level, sig,
+                                  f"back-off ({', '.join(reasons)})")
                 self.draining = True
                 continue
-
-            if headroom < 0:
-                # Overshoot: retreat proportional to how far over we are.
-                retreat = max(self.backoff_factor, 1.0 + headroom)
-                new_level = max(a.min_level, level * retreat)
-                await self._apply(new_level, sig, "back-off")
-                self.draining = True
-                continue
+            self.pressure_streak = 0
 
             if self.draining:
                 self._print_row(sig, "drain")
