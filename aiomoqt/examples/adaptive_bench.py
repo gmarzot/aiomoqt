@@ -62,14 +62,14 @@ class Scenario:
 
 
 # ---------------------------------------------------------------------------
-# Snapshot / shared state
+# Sample / shared state
 # ---------------------------------------------------------------------------
 
 @dataclass
-class Snapshot:
+class Sample:
     """Subscriber-observed metrics over the current rolling window."""
     t: float
-    commanded_mbps: float       # what the controller asked for
+    target_mbps: float       # what the controller is asking for
     rx_rate_ops: float          # objects/sec arriving at subscriber
     rx_bitrate_mbps: float      # equivalent bitrate
     mean_ms: float
@@ -83,20 +83,30 @@ class Snapshot:
 class Signal:
     """Mode-agnostic observation passed from actuator to controller.
 
-    All the pieces the brain needs to decide 'ramp / hold / back-off'
-    without knowing whether the load axis is Mbps or subscriber count.
-    target/tx/rx_mbps fields are for logging only — the brain uses
-    latency + loss + shortfall for decisions.
+    All the pieces the controller needs to decide 'ramp / hold /
+    back-off' without knowing whether the load axis is Mbps or
+    subscriber count. target/tx/rx_mbps fields are for logging only —
+    the controller uses latency + loss + shortfall for decisions.
     """
     t: float
+    # Controller scalar — unit matches the actuator (Mbps in bw, count in subs).
+    # Used by the controller's ramp/back-off decisions.
+    level: float
     latency_mean_ms: float
     latency_p50_ms: float
     latency_p99_ms: float
     loss_pct: float
     shortfall: bool
+    # Logging-only fields (Mbps for uniform display):
     target_mbps: float      # controller's ask
     tx_mbps: float          # publisher-side measured (delta bytes / s)
-    rx_mbps: float          # subscriber-side measured (on-wire rx)
+    # subscriber-side rx (sum across active subs in subs-mode):
+    rx_mbps: float
+    # Liveness — meaningful in subs-mode; BWActuator fills defaults.
+    target_subs: int = 1    # count the actuator is trying to maintain
+    active_subs: int = 1    # subs currently receiving data
+    failed_subs: int = 0    # new subscribe/reset failures in this interval
+    health: str = "ok"      # "ok" | "degraded" | "failing"
 
 
 @dataclass
@@ -109,9 +119,9 @@ class BenchState:
       stop/ceiling_* — writer: main or controller
     """
     rate_ops: float = 0.0           # aggregate objects/sec commanded
-    commanded_mbps: float = 0.0     # mirror of rate_ops in Mbps
+    target_mbps: float = 0.0        # mirror of rate_ops in Mbps
     tx_rate_mbps: float = 0.0       # writer: publisher (rolling tx rate)
-    latest: Optional[Snapshot] = None
+    latest: Optional[Sample] = None
     history: deque = field(default_factory=lambda: deque(maxlen=64))
     stop: asyncio.Event = field(default_factory=asyncio.Event)
     ceiling_reason: Optional[str] = None
@@ -192,16 +202,16 @@ class LiveStats:
                     self._last_seen[key] = oid
                 # else: reorder/duplicate within this subgroup — ignore
 
-    def snapshot(self, commanded_mbps: float) -> Snapshot:
+    def sample(self, target_mbps: float) -> Sample:
         t = time.monotonic()
         cutoff = t - self.window_s
         while self._events and self._events[0][0] < cutoff:
             self._events.popleft()
         if not self._events:
-            return Snapshot(t=t, commanded_mbps=commanded_mbps,
-                            rx_rate_ops=0.0, rx_bitrate_mbps=0.0,
-                            mean_ms=0.0, p50_ms=0.0, p99_ms=0.0,
-                            loss_pct=0.0, jitter_ms=self._jitter)
+            return Sample(t=t, target_mbps=target_mbps,
+                          rx_rate_ops=0.0, rx_bitrate_mbps=0.0,
+                          mean_ms=0.0, p50_ms=0.0, p99_ms=0.0,
+                          loss_pct=0.0, jitter_ms=self._jitter)
 
         window_t = max(0.01, self._events[-1][0] - self._events[0][0])
         n = len(self._events)
@@ -214,9 +224,9 @@ class LiveStats:
         total_expected = n + self._lost
         loss_pct = 100.0 * self._lost / total_expected if total_expected else 0.0
 
-        return Snapshot(
+        return Sample(
             t=t,
-            commanded_mbps=commanded_mbps,
+            target_mbps=target_mbps,
             rx_rate_ops=n / window_t,
             rx_bitrate_mbps=(total_bytes * 8) / (window_t * 1e6),
             mean_ms=mean,
@@ -255,28 +265,226 @@ class BWActuator:
         self.initial_level = scenario.start_mbps
 
     async def apply(self, level: float) -> None:
-        self.state.commanded_mbps = level
+        self.state.target_mbps = level
         self.state.rate_ops = self.scenario.aggregate_ops(level)
 
     async def observe(self) -> Signal:
-        snap = self.stats.snapshot(commanded_mbps=self.state.commanded_mbps)
-        shortfall = (snap.commanded_mbps > 0
-                     and snap.rx_bitrate_mbps
-                     < self.shortfall_ratio * snap.commanded_mbps)
+        sample = self.stats.sample(target_mbps=self.state.target_mbps)
+        shortfall = (sample.target_mbps > 0
+                     and sample.rx_bitrate_mbps
+                     < self.shortfall_ratio * sample.target_mbps)
         return Signal(
-            t=snap.t,
-            latency_mean_ms=snap.mean_ms,
-            latency_p50_ms=snap.p50_ms,
-            latency_p99_ms=snap.p99_ms,
-            loss_pct=snap.loss_pct,
+            t=sample.t,
+            level=sample.target_mbps,
+            latency_mean_ms=sample.mean_ms,
+            latency_p50_ms=sample.p50_ms,
+            latency_p99_ms=sample.p99_ms,
+            loss_pct=sample.loss_pct,
             shortfall=shortfall,
-            target_mbps=snap.commanded_mbps,
+            target_mbps=sample.target_mbps,
             tx_mbps=self.state.tx_rate_mbps,
-            rx_mbps=snap.rx_bitrate_mbps,
+            rx_mbps=sample.rx_bitrate_mbps,
         )
 
     async def shutdown(self) -> None:
         pass
+
+
+class SubsActuator:
+    """Actuator for subscriber-ramp mode.
+
+    level == commanded count of live subscribers. apply(level) spawns
+    or terminates multiprocessing workers to reach round(level) healthy
+    subs. observe() drains events from the worker queue and aggregates:
+
+      rx_mbps      = sum of per-sub rx_mbps (from last 1s each)
+      latency      = worst-sub p50 (SLA is 'no sub is unhappy')
+      loss_pct     = max per-sub loss_pct
+      shortfall    = active_subs < target_subs for 2+ intervals
+      failed_subs  = number of subscribe_failed / stream_reset events
+                     since the last observe()
+      active_subs  = subs that posted stats in the last window
+
+    Each sub is its own Process (GIL-isolated). Publisher stays
+    in-process in the parent (single publisher, fixed rate from
+    --sub-mbps — relay does fan-out, so pub is not the bottleneck).
+    """
+    unit = "subs"
+
+    def __init__(self, relay_url: str,
+                 namespace: str, trackname: str,
+                 draft, insecure: bool, force_quic: bool,
+                 min_subs: int, max_subs: int,
+                 start_subs: int, step_subs: int,
+                 object_size: int, per_sub_mbps: float):
+        self.relay_url = relay_url
+        self.namespace = namespace
+        self.trackname = trackname
+        self.draft = draft
+        self.insecure = insecure
+        self.force_quic = force_quic
+        self.min_level = float(min_subs)
+        self.max_level = float(max_subs)
+        self.step_floor = 1.0
+        self.initial_step = float(step_subs)
+        self.initial_level = float(start_subs)
+        self.object_size = object_size
+        self.per_sub_mbps = per_sub_mbps
+
+        import multiprocessing as mp
+        self._mp = mp
+        self._events_q = mp.Queue(maxsize=10000)
+        self._workers: dict = {}    # sub_id -> (Process, stop_event)
+        self._next_sub_id = 0
+        # Per-sub rolling stats (last 'stats' event received):
+        self._latest_stats: dict = {}
+        # Lifecycle counters for summary + shortfall detection:
+        self._subscribed_ever: set = set()
+        self._failed_window = 0     # resets each observe()
+        self._last_stats_t: dict = {}  # sub_id -> monotonic when last 'stats' arrived
+        self._shortfall_streak = 0
+        self._t_last_observe = time.monotonic()
+
+    async def apply(self, level: float) -> None:
+        target = max(int(self.min_level), min(int(self.max_level),
+                                              int(round(level))))
+        # spawn up
+        while len(self._workers) < target:
+            sid = self._next_sub_id
+            self._next_sub_id += 1
+            stop_ev = self._mp.Event()
+            cfg = dict(
+                sub_id=sid,
+                relay_url=self.relay_url,
+                namespace=self.namespace,
+                trackname=self.trackname,
+                draft=self.draft,
+                insecure=self.insecure,
+                force_quic=self.force_quic,
+            )
+            from aiomoqt.examples._bench_workers import sub_worker_entry
+            p = self._mp.Process(
+                target=sub_worker_entry,
+                args=(cfg, stop_ev, self._events_q),
+                daemon=True,
+            )
+            p.start()
+            self._workers[sid] = (p, stop_ev)
+        # wind down
+        while len(self._workers) > target:
+            sid = next(iter(self._workers))
+            self._kill_sub(sid)
+
+    def _kill_sub(self, sid):
+        proc, stop_ev = self._workers.pop(sid, (None, None))
+        if proc is None:
+            return
+        stop_ev.set()
+        # Best-effort: give it 1s to exit cleanly then terminate.
+        proc.join(timeout=1.0)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=1.0)
+        self._latest_stats.pop(sid, None)
+        self._last_stats_t.pop(sid, None)
+
+    async def observe(self) -> Signal:
+        # Drain all pending events from workers.
+        from queue import Empty
+        failed_this_window = 0
+        while True:
+            try:
+                msg = self._events_q.get_nowait()
+            except Empty:
+                break
+            kind = msg.get('kind')
+            sid = msg.get('sub_id')
+            if kind == 'stats':
+                self._latest_stats[sid] = msg
+                self._last_stats_t[sid] = time.monotonic()
+            elif kind == 'health':
+                state = msg.get('state')
+                if state == 'subscribed':
+                    self._subscribed_ever.add(sid)
+                elif state in ('subscribe_failed', 'stream_reset'):
+                    failed_this_window += 1
+                    # Reap the process — it's done.
+                    proc, stop_ev = self._workers.pop(sid, (None, None))
+                    if proc is not None:
+                        stop_ev.set()
+                        proc.join(timeout=0.5)
+
+        # Aggregate from latest stats per sub (only subs that produced
+        # a stats event in the last ~3s are "active").
+        now = time.monotonic()
+        active_cutoff = now - 3.0
+        active_ids = [sid for sid, t in self._last_stats_t.items()
+                      if t >= active_cutoff]
+
+        rx_bps_total = 0.0
+        worst_p50 = 0.0
+        worst_mean = 0.0
+        worst_p99 = 0.0
+        max_loss_pct = 0.0
+
+        self._t_last_observe = now
+
+        for sid in active_ids:
+            s = self._latest_stats.get(sid, {})
+            # rx_bytes is a rolling-window (5s) byte count; convert to Mbps
+            # using the rolling window length if known, else 5s.
+            rx_bytes = s.get('rx_bytes', 0)
+            # rough: 5s window assumed by worker
+            per_sub_mbps = (rx_bytes * 8) / (5.0 * 1e6)
+            rx_bps_total += per_sub_mbps * 1e6
+            p50 = s.get('lat_p50_ms', 0.0)
+            mean = s.get('lat_mean_ms', 0.0)
+            p99 = s.get('lat_p99_ms', 0.0)
+            loss_ct = s.get('loss', 0)
+            total = s.get('total_objs', 0) or 1
+            lpct = 100.0 * loss_ct / (loss_ct + total) if (loss_ct + total) else 0.0
+            worst_p50 = max(worst_p50, p50)
+            worst_mean = max(worst_mean, mean)
+            worst_p99 = max(worst_p99, p99)
+            max_loss_pct = max(max_loss_pct, lpct)
+
+        target_subs = len(self._workers)
+        active_subs = len(active_ids)
+
+        if active_subs < target_subs:
+            self._shortfall_streak += 1
+        else:
+            self._shortfall_streak = 0
+        shortfall = self._shortfall_streak >= 2 or failed_this_window > 0
+
+        if failed_this_window > 0:
+            health = "failing"
+        elif active_subs < target_subs:
+            health = "degraded"
+        else:
+            health = "ok"
+
+        target_mbps = target_subs * self.per_sub_mbps
+        return Signal(
+            t=now,
+            level=float(target_subs),
+            latency_mean_ms=worst_mean,
+            latency_p50_ms=worst_p50,
+            latency_p99_ms=worst_p99,
+            loss_pct=max_loss_pct,
+            shortfall=shortfall,
+            target_mbps=target_mbps,
+            tx_mbps=target_mbps,   # single publisher; assume delivers
+            rx_mbps=rx_bps_total / 1e6,
+            target_subs=target_subs,
+            active_subs=active_subs,
+            failed_subs=failed_this_window,
+            health=health,
+        )
+
+    async def shutdown(self) -> None:
+        for sid in list(self._workers):
+            self._kill_sub(sid)
 
 
 # ---------------------------------------------------------------------------
@@ -373,7 +581,7 @@ class AIMDController:
                 continue
             self.no_data_streak = 0
 
-            level = sig.target_mbps  # same scalar space the actuator uses
+            level = sig.level  # controller's scalar, unit matches actuator
 
             # P-control over latency: headroom ∈ [-∞, 1].
             #   1.0 = idle (p50 = 0), 0.0 = at SLA, <0 = overshoot.
@@ -439,13 +647,13 @@ class AIMDController:
         # Record a pivot whenever direction flips (ramp ↔ back-off).
         # Updates eq_level as an EWMA so future decisions converge on
         # the learned equilibrium point.
-        new_direction = +1 if new_level > sig.target_mbps else -1
+        new_direction = +1 if new_level > sig.level else -1
         if new_direction != self.direction:
-            self.pivots.append(sig.target_mbps)
+            self.pivots.append(sig.level)
             if len(self.pivots) > 10:
                 self.pivots.pop(0)
             alpha = 0.3
-            self.eq_level = (1 - alpha) * self.eq_level + alpha * sig.target_mbps
+            self.eq_level = (1 - alpha) * self.eq_level + alpha * sig.level
             self.direction = new_direction
         self._print_row(sig, action)
         await self.actuator.apply(new_level)
@@ -767,6 +975,17 @@ def parse_args():
                    dest="shortfall_ratio", metavar="R",
                    help="flag shortfall when achieved/commanded < R "
                         "(default: 0.85)")
+    p.add_argument("--mode", choices=["bw", "subs"], default="bw",
+                   help="ramp axis: bandwidth (default) or subscriber count")
+    p.add_argument("--start-subs", type=int, default=1,
+                   help="subs-mode: initial subscriber count (default: 1)")
+    p.add_argument("--step-subs", type=int, default=1,
+                   help="subs-mode: subs added per ramp step (default: 1)")
+    p.add_argument("--max-subs", type=int, default=200,
+                   help="subs-mode: cap (default: 200)")
+    p.add_argument("--sub-mbps", type=float, default=10.0,
+                   help="subs-mode: fixed per-track publisher bitrate "
+                        "(default: 10 Mbps)")
     p.add_argument("-d", "--debug", action="store_true")
     args = p.parse_args()
 
@@ -803,9 +1022,16 @@ def _print_banner(args):
     print(f"  pub mode:     {pub_mode}")
     print(f"  object size:  {sc.object_size} B")
     print(f"  streams (P):  {sc.subgroups}")
-    print(f"  start:        {sc.start_mbps:.1f} Mbps")
-    print(f"  step:         +{sc.step_mbps:.1f} Mbps")
-    print(f"  max:          {sc.max_mbps:.1f} Mbps")
+    print(f"  mode:         {args.mode}")
+    if args.mode == "subs":
+        print(f"  start:        {args.start_subs} subs")
+        print(f"  step:         +{args.step_subs} subs")
+        print(f"  max:          {args.max_subs} subs")
+        print(f"  per-sub rate: {args.sub_mbps:.1f} Mbps")
+    else:
+        print(f"  start:        {sc.start_mbps:.1f} Mbps")
+        print(f"  step:         +{sc.step_mbps:.1f} Mbps")
+        print(f"  max:          {sc.max_mbps:.1f} Mbps")
     print(f"  interval:     {sc.interval_s:.1f} s")
     print(f"  p50 SLA:      {args.latency_threshold:.0f} ms")
     print("─" * 68)
@@ -843,7 +1069,7 @@ async def main():
     state = BenchState()
     stats = LiveStats(object_size=args.scenario.object_size,
                       window_s=max(args.scenario.interval_s, 2.0))
-    state.commanded_mbps = args.scenario.start_mbps
+    state.target_mbps = args.scenario.start_mbps
     state.rate_ops = args.scenario.aggregate_ops(args.scenario.start_mbps)
 
     csv_file = None
@@ -856,10 +1082,30 @@ async def main():
             "mean_ms", "p50_ms", "p99_ms", "loss_pct",
         ])
 
-    actuator = BWActuator(
-        state, stats, args.scenario,
-        shortfall_ratio=args.shortfall_ratio,
-    )
+    if args.mode == "subs":
+        if not relay_mode:
+            print("  error: --mode subs requires -r RELAY_URL "
+                  "(loopback self-test is bw-only)", file=sys.stderr)
+            return 2
+        # Publisher runs fixed-rate; fold sub-mbps into scenario so the
+        # in-process publisher emits at that rate.
+        args.scenario.start_mbps = args.sub_mbps
+        state.target_mbps = args.sub_mbps
+        state.rate_ops = args.scenario.aggregate_ops(args.sub_mbps)
+        actuator = SubsActuator(
+            args.relay_url,
+            args.namespace, args.trackname,
+            args.draft, args.insecure, force_quic=False,
+            min_subs=1, max_subs=args.max_subs,
+            start_subs=args.start_subs, step_subs=args.step_subs,
+            object_size=args.scenario.object_size,
+            per_sub_mbps=args.sub_mbps,
+        )
+    else:
+        actuator = BWActuator(
+            state, stats, args.scenario,
+            shortfall_ratio=args.shortfall_ratio,
+        )
     controller = AIMDController(
         actuator, state,
         interval_s=args.scenario.interval_s,
@@ -883,8 +1129,9 @@ async def main():
             pub_task = asyncio.create_task(run_publisher_client(
                 host, port, endpoint, use_quic, verify, args, state))
             await asyncio.sleep(0.3)
-            sub_task = asyncio.create_task(run_subscriber_client(
-                host, port, endpoint, use_quic, verify, args, state, stats))
+            if args.mode == "bw":
+                sub_task = asyncio.create_task(run_subscriber_client(
+                    host, port, endpoint, use_quic, verify, args, state, stats))
         else:
             args.port = loopback_port  # server code still reads args.port
             server = await run_loopback_server(args, state)
@@ -909,6 +1156,10 @@ async def main():
                 t.cancel()
             except Exception:
                 pass
+        try:
+            await actuator.shutdown()
+        except Exception:
+            pass
         if server is not None:
             server.close()
         if csv_file:
