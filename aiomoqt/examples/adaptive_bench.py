@@ -659,21 +659,28 @@ class AIMDController:
         await self.actuator.apply(new_level)
 
     def _print_header(self) -> None:
+        subs_col = (f"{'subs':>8}  " if self.actuator.unit == "subs" else "")
         print(
             f"  {'time':>6}  "
+            f"{subs_col}"
             f"{'Target':>7}  {'Tx':>7}  {'Rx':>7}  │  "
             f"{'mean':>6}  {'p50':>6}  {'p99':>6}  │  "
             f"{'loss':>6}  action"
         )
-        print("─" * 76)
+        print("─" * (76 + (10 if self.actuator.unit == "subs" else 0)))
 
     def _print_row(self, sig: Signal, action: str) -> None:
         if not getattr(self, '_hdr_done', False):
             self._print_header()
             self._hdr_done = True
         t_rel = sig.t - self.t0
+        if self.actuator.unit == "subs":
+            subs_col = f"{sig.active_subs:>3}/{sig.target_subs:<3}  "
+        else:
+            subs_col = ""
         print(
             f"  {t_rel:>5.1f}s  "
+            f"{subs_col}"
             f"{fmt_bps(sig.target_mbps * 1e6):>7}  "
             f"{fmt_bps(sig.tx_mbps * 1e6):>7}  "
             f"{fmt_bps(sig.rx_mbps * 1e6):>7}  │  "
