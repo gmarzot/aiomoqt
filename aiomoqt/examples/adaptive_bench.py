@@ -514,6 +514,7 @@ class AIMDController:
         self.loss_threshold_pct = loss_threshold_pct
         self.shortfall_streak = 0
         self.pressure_streak = 0
+        self.hold_intervals = 0
         self.high_water = actuator.initial_level
         self.samples = 0
         self.draining = False
@@ -597,7 +598,7 @@ class AIMDController:
                 self.pressure_streak += 1
                 reasons = []
                 if over_p90:
-                    reasons.append(f"p90 over")
+                    reasons.append("p90 over")
                 if over_loss:
                     reasons.append(f"loss {sig.loss_pct:.1f}%")
                 if over_shortfall:
@@ -651,8 +652,22 @@ class AIMDController:
             pivot_gain = 1.0 / (1.0 + 0.4 * len(self.pivots))
             step = a.initial_step * latency_gain * pivot_gain
             if step < a.step_floor:
+                # Held by pivot-gain convergence. If headroom is plentiful
+                # (conditions clearly healthy), probe upward by step_floor
+                # every few intervals — watch+clamp protect us from a bad
+                # probe. Prevents the controller from sitting forever at
+                # a stale equilibrium when the network has freed up.
+                self.hold_intervals += 1
+                if headroom >= 0.5 and self.hold_intervals >= 5:
+                    self.hold_intervals = 0
+                    await self._apply(
+                        min(a.max_level, level + a.step_floor),
+                        sig, "probe"
+                    )
+                    continue
                 self._print_row(sig, "hold")
                 continue
+            self.hold_intervals = 0
             await self._apply(min(a.max_level, level + step), sig, "ramp")
 
     async def _apply(self, new_level: float, sig: Signal, action: str) -> None:
