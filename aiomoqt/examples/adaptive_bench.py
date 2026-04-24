@@ -701,7 +701,7 @@ class AIMDController:
         time_pad = 10    # 'time' column + breathing space before BW
         print(
             f"  {' '*time_pad}  "
-            f"{'Target'.center(target_span)}  │  "
+            f"{'Target'.ljust(target_span)}  │  "
             f"{'Actual'.center(actual_span)}  │  "
             f"{'Latency'.center(latency_span)}  │"
         )
