@@ -3,7 +3,7 @@
 
 Runs a publisher + subscriber pair in one Python process (loopback
 self-test) or against a relay. The publisher's rate is live-mutated
-by a controller task reading subscriber-side snapshots (p99 latency,
+by a controller task reading subscriber-side samples (p90 latency,
 loss, achieved throughput) out of a shared BenchState. One continuous
 steady-state publisher whose pacing the controller nudges up or down
 per interval — no subprocess-per-step loop.
@@ -73,8 +73,7 @@ class Sample:
     rx_rate_ops: float          # objects/sec arriving at subscriber
     rx_bitrate_mbps: float      # equivalent bitrate
     mean_ms: float
-    p50_ms: float
-    p99_ms: float
+    p90_ms: float
     loss_pct: float
     jitter_ms: float
 
@@ -93,8 +92,7 @@ class Signal:
     # Used by the controller's ramp/back-off decisions.
     level: float
     latency_mean_ms: float
-    latency_p50_ms: float
-    latency_p99_ms: float
+    latency_p90_ms: float
     loss_pct: float
     shortfall: bool
     # Logging-only fields (Mbps for uniform display):
@@ -210,7 +208,7 @@ class LiveStats:
         if not self._events:
             return Sample(t=t, target_mbps=target_mbps,
                           rx_rate_ops=0.0, rx_bitrate_mbps=0.0,
-                          mean_ms=0.0, p50_ms=0.0, p99_ms=0.0,
+                          mean_ms=0.0, p90_ms=0.0,
                           loss_pct=0.0, jitter_ms=self._jitter)
 
         window_t = max(0.01, self._events[-1][0] - self._events[0][0])
@@ -218,8 +216,7 @@ class LiveStats:
         total_bytes = sum(e[1] for e in self._events)
         lats = sorted(e[2] for e in self._events if e[2] is not None)
         mean = sum(lats) / len(lats) if lats else 0.0
-        p50 = lats[len(lats) // 2] if lats else 0.0
-        p99 = lats[min(int(len(lats) * 0.99), len(lats) - 1)] if lats else 0.0
+        p90 = lats[min(int(len(lats) * 0.90), len(lats) - 1)] if lats else 0.0
 
         total_expected = n + self._lost
         loss_pct = 100.0 * self._lost / total_expected if total_expected else 0.0
@@ -230,8 +227,7 @@ class LiveStats:
             rx_rate_ops=n / window_t,
             rx_bitrate_mbps=(total_bytes * 8) / (window_t * 1e6),
             mean_ms=mean,
-            p50_ms=p50,
-            p99_ms=p99,
+            p90_ms=p90,
             loss_pct=loss_pct,
             jitter_ms=self._jitter,
         )
@@ -277,8 +273,7 @@ class BWActuator:
             t=sample.t,
             level=sample.target_mbps,
             latency_mean_ms=sample.mean_ms,
-            latency_p50_ms=sample.p50_ms,
-            latency_p99_ms=sample.p99_ms,
+            latency_p90_ms=sample.p90_ms,
             loss_pct=sample.loss_pct,
             shortfall=shortfall,
             target_mbps=sample.target_mbps,
@@ -422,30 +417,25 @@ class SubsActuator:
                       if t >= active_cutoff]
 
         rx_bps_total = 0.0
-        worst_p50 = 0.0
+        worst_p90 = 0.0
         worst_mean = 0.0
-        worst_p99 = 0.0
         max_loss_pct = 0.0
 
         self._t_last_observe = now
 
         for sid in active_ids:
             s = self._latest_stats.get(sid, {})
-            # rx_bytes is a rolling-window (5s) byte count; convert to Mbps
-            # using the rolling window length if known, else 5s.
+            # rx_bytes is a rolling-window (5s) byte count; convert to Mbps.
             rx_bytes = s.get('rx_bytes', 0)
-            # rough: 5s window assumed by worker
             per_sub_mbps = (rx_bytes * 8) / (5.0 * 1e6)
             rx_bps_total += per_sub_mbps * 1e6
-            p50 = s.get('lat_p50_ms', 0.0)
+            p90 = s.get('lat_p90_ms', 0.0)
             mean = s.get('lat_mean_ms', 0.0)
-            p99 = s.get('lat_p99_ms', 0.0)
             loss_ct = s.get('loss', 0)
             total = s.get('total_objs', 0) or 1
             lpct = 100.0 * loss_ct / (loss_ct + total) if (loss_ct + total) else 0.0
-            worst_p50 = max(worst_p50, p50)
+            worst_p90 = max(worst_p90, p90)
             worst_mean = max(worst_mean, mean)
-            worst_p99 = max(worst_p99, p99)
             max_loss_pct = max(max_loss_pct, lpct)
 
         target_subs = len(self._workers)
@@ -469,8 +459,7 @@ class SubsActuator:
             t=now,
             level=float(target_subs),
             latency_mean_ms=worst_mean,
-            latency_p50_ms=worst_p50,
-            latency_p99_ms=worst_p99,
+            latency_p90_ms=worst_p90,
             loss_pct=max_loss_pct,
             shortfall=shortfall,
             target_mbps=target_mbps,
@@ -505,21 +494,21 @@ class AIMDController:
     - Back off: multiply aggregate by backoff_factor on any signal.
     - Signals:
         * loss_pct > loss_threshold_pct in the last window
-        * p50 > p50_threshold_ms for 2 consecutive intervals
+        * p90 > latency_threshold_ms for 2 consecutive intervals
         * achieved rx_bitrate < shortfall_ratio * commanded for 2 intervals
     - Tracks high_water_mbps = highest stable rate seen so far.
     """
 
     def __init__(self, actuator, state: BenchState,
                  interval_s: float, writer=None,
-                 p50_threshold_ms: float = 100.0,
+                 latency_threshold_ms: float = 100.0,
                  backoff_factor: float = 0.9,
                  loss_threshold_pct: float = 0.5):
         self.actuator = actuator
         self.state = state
         self.interval_s = interval_s
         self.writer = writer
-        self.p50_threshold_ms = p50_threshold_ms
+        self.latency_threshold_ms = latency_threshold_ms
         self.backoff_factor = backoff_factor
         self.loss_threshold_pct = loss_threshold_pct
         self.shortfall_streak = 0
@@ -557,8 +546,7 @@ class AIMDController:
                     f"{sig.tx_mbps:.2f}",
                     f"{sig.rx_mbps:.2f}",
                     f"{sig.latency_mean_ms:.2f}",
-                    f"{sig.latency_p50_ms:.2f}",
-                    f"{sig.latency_p99_ms:.2f}",
+                    f"{sig.latency_p90_ms:.2f}",
                     f"{sig.loss_pct:.3f}",
                 ])
 
@@ -584,9 +572,11 @@ class AIMDController:
             level = sig.level  # controller's scalar, unit matches actuator
 
             # P-control over latency: headroom ∈ [-∞, 1].
-            #   1.0 = idle (p50 = 0), 0.0 = at SLA, <0 = overshoot.
-            headroom = (self.p50_threshold_ms - sig.latency_p50_ms) \
-                / self.p50_threshold_ms
+            #   1.0 = idle (p90 = 0), 0.0 = at SLA, <0 = overshoot.
+            # p90 is more sensitive than p50 — catches queue build-up
+            # sooner while being less noisy than p99.
+            headroom = (self.latency_threshold_ms - sig.latency_p90_ms) \
+                / self.latency_threshold_ms
 
             # Hard signals override headroom.
             if sig.loss_pct > self.loss_threshold_pct:
@@ -664,7 +654,7 @@ class AIMDController:
             f"  {'time':>6}  "
             f"{subs_col}"
             f"{'Target':>7}  {'Tx':>7}  {'Rx':>7}  │  "
-            f"{'mean':>6}  {'p50':>6}  │  "
+            f"{'mean':>6}  {'p90':>6}  │  "
             f"{'loss':>6}  action"
         )
         print("─" * (68 + (10 if self.actuator.unit == "subs" else 0)))
@@ -685,7 +675,7 @@ class AIMDController:
             f"{fmt_bps(sig.tx_mbps * 1e6):>7}  "
             f"{fmt_bps(sig.rx_mbps * 1e6):>7}  │  "
             f"{fmt_ms(sig.latency_mean_ms):>6}  "
-            f"{fmt_ms(sig.latency_p50_ms):>6}  │  "
+            f"{fmt_ms(sig.latency_p90_ms):>6}  │  "
             f"{sig.loss_pct:>5.2f}%  {action}",
             flush=True,
         )
@@ -971,7 +961,7 @@ def parse_args():
                    help="write per-sample metrics as CSV to PATH")
     p.add_argument("-l", "--latency-threshold", type=float, default=100.0,
                    metavar="MS", dest="latency_threshold",
-                   help="p50 latency SLA in ms; back off after 2 intervals "
+                   help="p90 latency SLA in ms; back off after 2 intervals "
                         "over (default: 100)")
     p.add_argument("--backoff-factor", type=float, default=0.9,
                    dest="backoff_factor", metavar="F",
@@ -1039,7 +1029,7 @@ def _print_banner(args):
         print(f"  step:         +{sc.step_mbps:.1f} Mbps")
         print(f"  max:          {sc.max_mbps:.1f} Mbps")
     print(f"  interval:     {sc.interval_s:.1f} s")
-    print(f"  p50 SLA:      {args.latency_threshold:.0f} ms")
+    print(f"  p90 SLA:      {args.latency_threshold:.0f} ms")
     print("─" * 68)
 
 
@@ -1085,7 +1075,7 @@ async def main():
         csv_writer = csv.writer(csv_file)
         csv_writer.writerow([
             "t_monotonic", "target_mbps", "tx_mbps", "rx_mbps",
-            "mean_ms", "p50_ms", "p99_ms", "loss_pct",
+            "mean_ms", "p90_ms", "loss_pct",
         ])
 
     if args.mode == "subs":
@@ -1116,7 +1106,7 @@ async def main():
         actuator, state,
         interval_s=args.scenario.interval_s,
         writer=csv_writer,
-        p50_threshold_ms=args.latency_threshold,
+        latency_threshold_ms=args.latency_threshold,
         backoff_factor=args.backoff_factor,
     )
 

@@ -93,17 +93,16 @@ class _RollingStats:
         n = len(self._events)
         if n == 0:
             return dict(t=t, rx_bytes=0, rx_objs=0,
-                        lat_mean_ms=0.0, lat_p50_ms=0.0, lat_p99_ms=0.0,
+                        lat_mean_ms=0.0, lat_p90_ms=0.0,
                         loss=self._lost,
                         total_bytes=self._total_bytes,
                         total_objs=self._total_objs)
         total_bytes = sum(e[1] for e in self._events)
         lats = sorted(e[2] for e in self._events if e[2] is not None)
         mean = sum(lats) / len(lats) if lats else 0.0
-        p50 = lats[len(lats) // 2] if lats else 0.0
-        p99 = lats[min(int(len(lats) * 0.99), len(lats) - 1)] if lats else 0.0
+        p90 = lats[min(int(len(lats) * 0.90), len(lats) - 1)] if lats else 0.0
         return dict(t=t, rx_bytes=total_bytes, rx_objs=n,
-                    lat_mean_ms=mean, lat_p50_ms=p50, lat_p99_ms=p99,
+                    lat_mean_ms=mean, lat_p90_ms=p90,
                     loss=self._lost,
                     total_bytes=self._total_bytes,
                     total_objs=self._total_objs)
