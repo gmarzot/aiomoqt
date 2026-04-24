@@ -1053,12 +1053,11 @@ def _print_banner(args):
         print(f"  relay:              {args.relay_url} ({transport}/{draft_s})")
     else:
         print(f"  relay:              loopback self-test ({draft_s})")
-    print(f"  namespace:          {args.namespace}")
-    print(f"  trackname:          {args.trackname}")
+    print(f"  trackname:          {args.namespace}/{args.trackname}")
     publish_parts = [pub_mode, f"obj={sc.object_size}B", f"P={sc.subgroups}"]
     if args.mode == "subs":
         publish_parts.append(f"rate={args.sub_mbps:.1f}Mbps")
-    print(f"  publish:            {' / '.join(publish_parts)}")
+    print(f"  publish:            {', '.join(publish_parts)}")
     print(f"  latency threshold:  {args.latency_threshold:.0f} ms")
     print("─" * 68)
     print()
