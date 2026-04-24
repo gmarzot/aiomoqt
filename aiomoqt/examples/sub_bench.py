@@ -80,8 +80,12 @@ class BenchStats:
                    if msg.extensions else None)
         if send_ms is not None:
             latency = recv_time_ms - send_ms
-            # Reject corrupt timestamps (>60s latency = parse error)
-            if abs(latency) > 60000:
+            # Reject genuinely corrupt timestamps — negatives and
+            # absurdly-large values (varint-garbage from a misaligned
+            # deframer pulls values like 2^40 which make the minute-
+            # threshold trip on real data). Real under-load latency
+            # can legitimately exceed 60s; cap at 10 minutes.
+            if latency < -1000 or latency > 600_000:
                 logger.warning(f"BenchStats: corrupt timestamp: "
                                f"send={send_ms} recv={recv_time_ms}")
                 send_ms = None
