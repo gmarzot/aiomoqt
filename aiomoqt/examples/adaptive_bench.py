@@ -654,8 +654,8 @@ class AIMDController:
         # Target:  BW(7) + gap(2) + [Nsubs(5) + gap(2)] if subs
         # Actual:  Tx(7) + gap(2) + Rx(7) + gap(2) + [Nsubs(5) + gap(2)]
         # Latency: mean(6) + gap(2) + p90(6)
-        target_span = 7 + (2 + 5 if has_subs else 0)
-        actual_span = 7 + 2 + 7 + (2 + 5 if has_subs else 0)
+        target_span = 7 + (3 + 5 if has_subs else 0)
+        actual_span = 7 + 2 + 7 + (3 + 5 if has_subs else 0)
         latency_span = 6 + 2 + 6
         time_pad = 10    # 'time' column + breathing space before BW
         print(
@@ -667,8 +667,8 @@ class AIMDController:
         if has_subs:
             print(
                 f"  {'time':>6}      "
-                f"{'BW':<7}  {'Nsub':<5}  │  "
-                f"{'Tx':<7}  {'Rx':<7}  {'Nsub':<5}  │  "
+                f"{'BW':<7}   {'Nsub':<5}  │  "
+                f"{'Tx':<7}  {'Rx':<7}   {'Nsub':<5}  │  "
                 f"{'mean':>6}  {'p90':>6}  │  "
                 f"loss   action"
             )
@@ -696,8 +696,8 @@ class AIMDController:
         if self.actuator.unit == "subs":
             print(
                 f"  {t_rel:>5.1f}s     "
-                f"{bw:<7}  {sig.target_subs:<5}  │  "
-                f"{tx:<7}  {rx:<7}  {sig.active_subs:<5}  │  "
+                f"{bw:<7}   {sig.target_subs:<5}  │  "
+                f"{tx:<7}  {rx:<7}   {sig.active_subs:<5}  │  "
                 f"{mean:<6}  {p90:<6}  │  "
                 f"{f'{sig.loss_pct:.1f}%':<5}  {action}",
                 flush=True,
