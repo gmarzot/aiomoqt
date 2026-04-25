@@ -24,4 +24,4 @@ wheels/
 *.prof
 *.bin
 .claude/
-.vscode/settings.json.local
+.vscode/
