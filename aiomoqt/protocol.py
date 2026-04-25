@@ -22,6 +22,7 @@ from .messages import *
 from .types import *
 from .utils.buffer import Buffer, BufferReadError
 from .utils.logger import *
+from .utils.streamchain import StreamChain
 
 USER_AGENT = f"aiomoqt/{version('aiomoqt')}"
 
@@ -125,7 +126,11 @@ class MOQTSession(QuicConnectionProtocol):
         self._moqt_session_closed: Future[Tuple[int,str]] = self._loop.create_future()
         self._next_request_id = 0 if self._quic.configuration.is_client else 1
         self._next_track_alias = 0
-        self._stream_queues: DefaultDict[int, asyncio.Queue[Buffer]] = defaultdict(asyncio.Queue)
+        # Per-stream queues feeding _process_data_stream. Each entry is
+        # an incoming chunk (bytes or memoryview) or None as FIN sentinel.
+        self._stream_queues: DefaultDict[
+            int, asyncio.Queue[Optional[Union[bytes, memoryview]]]
+        ] = defaultdict(asyncio.Queue)
         self._stream_tasks: Dict[int, asyncio.Task] = {}
         self._tasks: Set[asyncio.Task] = set()
         self._close_err = None  # tuple holding latest (error_code, Reason_phrase)
@@ -448,9 +453,11 @@ class MOQTSession(QuicConnectionProtocol):
             logger.debug(f"MOQT event: creating _process_data_stream task: {stream_id} num streams: {len(self._data_streams)}")
 
         if len(data) > 0:
-            msg_buf = Buffer(data=data)
+            # Push the chunk by reference; StreamChain accepts bytes or
+            # memoryview, no Buffer wrap needed. Avoids one copy when the
+            # underlying transport already delivers a memoryview (aiopquic).
             logger.debug(f"MOQT event: pushing data on stream: {stream_id} len: {len(data)}")
-            self._stream_queues[stream_id].put_nowait(msg_buf)
+            self._stream_queues[stream_id].put_nowait(data)
 
         if end_stream:
             logger.debug(f"MOQT event: stream FIN: {stream_id}")
@@ -458,94 +465,94 @@ class MOQTSession(QuicConnectionProtocol):
 
     # task for processing incoming data streams
     async def _process_data_stream(self, stream_id: int) -> None:
-        ''' Subgroup stream data processing task '''
-        re_buf = Buffer(capacity=(1024*1024*32))  # pre-allocate large buffer accumulator
-        cur_pos: int = 0
+        """Subgroup / fetch stream data processing task.
+
+        Per-stream byte accumulator (StreamChain) holds incoming chunks
+        by reference and walks across chunk boundaries during parse.
+        On successful parse: commit (drop the consumed prefix, reset
+        tell to 0). On MOQTUnderflow / BufferReadError: rollback to
+        the start of the failed parse attempt and await more bytes.
+        Bounded by un-parsed bytes only; no fixed-size accumulator.
+        """
+        chain = StreamChain()
         consumed: int = 0
-        needed: int = 0
-        have: int = 0
         group_id = None
         subgroup_id = None
         object_id = None
+
         while True:
             try:
-                while True:
-                    async with asyncio.timeout(MOQT_IDLE_STREAM_TIMEOUT):
-                        msg_buf = await self._stream_queues[stream_id].get()
-
-                    if msg_buf is None:  # Sentinel done value - return
-                        logger.debug(f"MOQT stream({stream_id}): queue closed: task shutdown")
-                        return
-
-                    cur_pos = msg_buf.tell()
-                    msg_len = msg_buf.capacity
-                    available = msg_len - cur_pos
-
-                    if available < needed:
-                        needed -= available
-                        re_buf.push_bytes(msg_buf.data_slice(cur_pos, msg_len))
-                        have = re_buf.tell()
-                        logger.debug(f"MOQT stream({stream_id}): data added: len: {msg_len} have: {have} still need: {needed}")
-                    elif cur_pos == msg_len:
-                        # Producer filters tell()==capacity buffers so this
-                        # branch is not expected to fire in practice.
-                        logger.warning(f"MOQT stream({stream_id}): cur_pos==msg_len: {cur_pos} have: {have} still need: {needed}")
-                        continue
-                    else:
-                        logger.debug(f"MOQT stream({stream_id}): data received: pos: {cur_pos} len: {msg_len} needed: {needed}")
-                        break
-
+                async with asyncio.timeout(MOQT_IDLE_STREAM_TIMEOUT):
+                    msg_buf = await self._stream_queues[stream_id].get()
             except asyncio.TimeoutError:
-                logger.debug(f"MOQT stream({stream_id}): idle timeout: {group_id}.{subgroup_id}.{object_id}")
+                logger.debug(
+                    f"MOQT stream({stream_id}): idle timeout: "
+                    f"{group_id}.{subgroup_id}.{object_id}"
+                )
                 raise
 
-            # if more data was needed, add it to re_buf accumulator and reprocess
-            if needed > 0:
-                re_buf.push_bytes(msg_buf.data_slice(cur_pos,msg_buf.capacity))
-                msg_len = re_buf.tell()
-                msg_buf = re_buf  # process accumulator, GC msg_buf
-                msg_buf.seek(0)
-                cur_pos = 0
-                needed = 0
-                
-            while cur_pos < msg_len:
-                logger.debug(f"MOQT stream({stream_id}): process message: pos: {cur_pos} len: {msg_len}")
+            if msg_buf is None:  # FIN sentinel
+                logger.debug(
+                    f"MOQT stream({stream_id}): queue closed: task shutdown"
+                )
+                return
+
+            chain.extend(msg_buf)
+            logger.debug(
+                f"MOQT stream({stream_id}): chunk received: "
+                f"chunk_len={len(msg_buf)} chain_total={chain.capacity}"
+            )
+
+            # Drain as many complete messages as the chain currently holds.
+            while chain.capacity > 0:
+                chain.save()
                 msg_obj = None
                 try:
-                    msg_obj = self._moqt_handle_data_stream(stream_id, msg_buf, msg_len)
+                    # StreamChain is duck-compatible with Buffer for the
+                    # parser's needs (pull_uint_var, pull_bytes, tell,
+                    # capacity). Proper Protocol-based typing is a
+                    # separate cleanup.
+                    msg_obj = self._moqt_handle_data_stream(
+                        stream_id, chain, chain.capacity  # type: ignore[arg-type]
+                    )
                 except MOQTStreamReject as e:
-                    # Phase 1c: admission failure — reject at the stream
-                    # level only (STOP_SENDING), NOT a session close.
+                    # Phase 1c admission failure — STOP_SENDING the
+                    # stream, do not close the session.
                     self._reject_stream(stream_id, e.error_code, e.reason)
                     return
                 except MOQTUnderflow as e:
-                    # e.needed is absolute buffer position; convert to bytes beyond msg_len
-                    needed = e.needed - msg_len
-                    if needed <= 0:
-                        needed = 1  # at least request one more byte
-                    logger.debug(f"MOQT MOQTUnderflow({stream_id}): at pos: {e.pos} abs: {e.needed} msg_len: {msg_len} need: {needed}")
+                    # Need more bytes; rewind to start of attempt and
+                    # await next chunk.
+                    chain.rollback()
+                    logger.debug(
+                        f"MOQT MOQTUnderflow({stream_id}): at pos: "
+                        f"{e.pos} abs: {e.needed} chain_total: "
+                        f"{chain.capacity} need: "
+                        f"{e.needed - chain.capacity}"
+                    )
                     break
-                except BufferReadError as e:
-                    logger.debug(f"MOQT BufferReadError({stream_id}): cur_pos: {cur_pos} tell: {msg_buf.tell()}")
-                    needed = 1  # just get the next msg_buf - we dont know amount needed
+                except BufferReadError:
+                    # Same posture as underflow.
+                    chain.rollback()
+                    logger.debug(
+                        f"MOQT BufferReadError({stream_id}): "
+                        f"at pos: {chain.tell()}"
+                    )
                     break
                 except Exception as e:
-                    # Data-plane parse failure — the deframer lost its
-                    # alignment on this stream. Abandon the stream via
-                    # STOP_SENDING and keep the session alive; other
-                    # concurrent subgroup streams are unaffected.
-                    # Pre-hardening, this raised and killed the whole
-                    # session, taking down every in-flight subscription.
-                    tell = msg_buf.tell()
-                    hex_at = msg_buf.data_slice(
-                        max(0, cur_pos),
-                        min(msg_len, cur_pos + 40),
+                    # Data-plane parse failure — deframer lost
+                    # alignment. Abandon this stream via STOP_SENDING;
+                    # keep the session alive (other concurrent streams
+                    # are unaffected). Pre-hardening this raised and
+                    # killed the whole session.
+                    tell = chain.tell()
+                    hex_at = chain.data_slice(
+                        0, min(40, chain.capacity)
                     ).hex()
                     logger.error(
                         f"MOQT stream({stream_id}): PARSE EXCEPTION "
-                        f"at cur_pos={cur_pos} tell={tell} "
-                        f"msg_len={msg_len} needed_was={needed} "
-                        f"hex@cur_pos={hex_at} "
+                        f"at tell={tell} chain_total={chain.capacity} "
+                        f"hex@anchor={hex_at} "
                         f"object_id={object_id} group_id={group_id} "
                         f"exc={type(e).__name__}: {e}"
                     )
@@ -557,83 +564,104 @@ class MOQTSession(QuicConnectionProtocol):
                     return
 
                 if msg_obj is None:
-                    error = f"MOQT error: data stream({stream_id}):: parsing failed at position: "
-                    logger.error(error + f"{msg_buf.tell()} of {msg_len} bytes")
-                    self._close_session(SessionCloseCode.PROTOCOL_VIOLATION, error)
-                    raise asyncio.CancelledError(SessionCloseCode.PROTOCOL_VIOLATION, error)
-                
-                consumed = msg_buf.tell() - cur_pos
-                cur_pos = msg_buf.tell()
+                    error = (
+                        f"MOQT error: data stream({stream_id}): parsing "
+                        f"returned None at position: {chain.tell()} of "
+                        f"{chain.capacity} bytes"
+                    )
+                    logger.error(error)
+                    self._close_session(
+                        SessionCloseCode.PROTOCOL_VIOLATION, error
+                    )
+                    raise asyncio.CancelledError(
+                        SessionCloseCode.PROTOCOL_VIOLATION, error
+                    )
+
+                consumed = chain.tell()  # bytes parsed since save() (= 0)
+                chain.commit()  # drop consumed prefix; tell() reset to 0
+
                 if isinstance(msg_obj, ObjectHeader):
                     assert object_id is None or msg_obj.object_id > object_id
                     object_id = msg_obj.object_id
                     status = ObjectStatus(msg_obj.status).name
                     id = f"{group_id}.{subgroup_id}.{object_id}"
-                    now = int(time.time()*1000)
-                    msg_ts = msg_obj.extensions.get(MOQT_TIMESTAMP_EXT) if msg_obj.extensions else None
+                    now = int(time.time() * 1000)
+                    msg_ts = (
+                        msg_obj.extensions.get(MOQT_TIMESTAMP_EXT)
+                        if msg_obj.extensions else None
+                    )
                     delay = f"delay: {now - msg_ts} ms" if msg_ts else ""
-                    logstr = f"{id} status: {status} size: {consumed} bytes {delay}"
+                    logstr = (
+                        f"{id} status: {status} size: {consumed} bytes "
+                        f"{delay}"
+                    )
                     if status != ObjectStatus.NORMAL:
-                        if msg_obj.status in (ObjectStatus.END_OF_GROUP, ObjectStatus.END_OF_TRACK):
-                                logger.debug(f"MOQT stream({stream_id}): {logstr}")
-                                self._stream_queues[stream_id].closed = True
-                                return
+                        if msg_obj.status in (
+                            ObjectStatus.END_OF_GROUP,
+                            ObjectStatus.END_OF_TRACK,
+                        ):
+                            logger.debug(
+                                f"MOQT stream({stream_id}): {logstr}"
+                            )
+                            return
                     logger.debug(f"MOQT stream({stream_id}): {logstr}")
                     if self.on_object_received:
-                        self.on_object_received(msg_obj, consumed, now, group_id, subgroup_id)
+                        self.on_object_received(
+                            msg_obj, consumed, now, group_id, subgroup_id
+                        )
                 elif isinstance(msg_obj, SubgroupHeader):
-                    logger.debug(f"MOQT stream({stream_id}): {msg_obj} {consumed} bytes")
+                    logger.debug(
+                        f"MOQT stream({stream_id}): {msg_obj} "
+                        f"{consumed} bytes"
+                    )
                     assert group_id is None or msg_obj.group_id > group_id
                     group_id = msg_obj.group_id
                     subgroup_id = msg_obj.subgroup_id
                 elif isinstance(msg_obj, FetchHeader):
-                    logger.debug(f"MOQT stream({stream_id}): {msg_obj} {consumed} bytes")
-                    # request_id stays on the header (also in the binding
-                    # table) — nothing to dispatch until FetchObjects arrive
+                    logger.debug(
+                        f"MOQT stream({stream_id}): {msg_obj} "
+                        f"{consumed} bytes"
+                    )
                 elif isinstance(msg_obj, FetchObject):
-                    now = int(time.time()*1000)
-                    # Look up the fetch request_id from the stream's
-                    # FetchHeader state so the callback can correlate.
+                    now = int(time.time() * 1000)
                     stream_state = self._data_streams.get(stream_id)
-                    request_id = (stream_state.request_id
-                                   if isinstance(stream_state, FetchHeader)
-                                   else None)
+                    request_id = (
+                        stream_state.request_id
+                        if isinstance(stream_state, FetchHeader)
+                        else None
+                    )
                     if msg_obj.end_of_range is not None:
-                        # d16 end-of-range marker (0x8C/0x10C) — logs and
-                        # waits for the stream FIN that must follow.
                         logger.debug(
                             f"MOQT stream({stream_id}): FetchObject "
                             f"end-of-range 0x{msg_obj.end_of_range:x} "
-                            f"at {msg_obj.group_id}.{msg_obj.object_id}")
+                            f"at {msg_obj.group_id}.{msg_obj.object_id}"
+                        )
                     else:
-                        id = f"{msg_obj.group_id}.{msg_obj.subgroup_id}.{msg_obj.object_id}"
-                        msg_ts = (msg_obj.extensions.get(MOQT_TIMESTAMP_EXT)
-                                  if msg_obj.extensions else None)
-                        delay = (f"delay: {now - msg_ts} ms"
-                                 if isinstance(msg_ts, int) else "")
+                        id = (
+                            f"{msg_obj.group_id}.{msg_obj.subgroup_id}."
+                            f"{msg_obj.object_id}"
+                        )
+                        msg_ts = (
+                            msg_obj.extensions.get(MOQT_TIMESTAMP_EXT)
+                            if msg_obj.extensions else None
+                        )
+                        delay = (
+                            f"delay: {now - msg_ts} ms"
+                            if isinstance(msg_ts, int) else ""
+                        )
                         logger.debug(
                             f"MOQT stream({stream_id}): FetchObject "
-                            f"{id} size: {consumed} bytes {delay}")
+                            f"{id} size: {consumed} bytes {delay}"
+                        )
                         if self.on_fetch_object:
-                            self.on_fetch_object(msg_obj, consumed, now, request_id)
+                            self.on_fetch_object(
+                                msg_obj, consumed, now, request_id
+                            )
                 else:
-                    logger.error(f"MOQT stream({stream_id}): {msg_obj} size: {consumed} bytes")
-                    # raise RuntimeError
-
-
-            if needed > 0:
-                have = msg_len - cur_pos
-                # yuck - python memmove - custom stream reader in progress.
-                # seek(0)+push_bytes resets the logical length: the top of
-                # the outer loop recomputes msg_len from re_buf.tell(), so
-                # stale trailing bytes beyond tell() are never read.
-                saved_bytes = msg_buf.data_slice(cur_pos, msg_len)
-                if have < needed:  # we might not know how much we need
-                    needed -= have
-                re_buf.seek(0)
-                re_buf.push_bytes(saved_bytes)
-                logger.debug(f"MOQT stream({stream_id}): saved {have} bytes still need: {needed}")
-                cur_pos = 0
+                    logger.error(
+                        f"MOQT stream({stream_id}): {msg_obj} "
+                        f"size: {consumed} bytes"
+                    )
 
     def _reject_stream(self, stream_id: int, error_code: int, reason: str) -> None:
         """Terminate a uni stream at the MoQT layer via STOP_SENDING.
