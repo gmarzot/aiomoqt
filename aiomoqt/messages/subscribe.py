@@ -263,6 +263,10 @@ class Subscribe(MOQTMessage):
     # with SubscribeOk. Not on the wire (Subscribe doesn't carry alias);
     # declared as a slot field so server handlers can assign it.
     track_alias: Optional[int] = field(default=None, init=False)
+    # Runtime: client-side libquicr filter encoding flag, set by the
+    # protocol layer just before serialize so the LAPS variant of
+    # filter encoding is emitted. Not on the wire as such.
+    libquicr_compat: bool = field(default=False, init=False)
 
     def __post_init__(self):
         self.type = MOQTMessageType.SUBSCRIBE

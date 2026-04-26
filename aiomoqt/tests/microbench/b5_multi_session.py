@@ -25,7 +25,6 @@ import resource
 import ssl
 import sys
 import time
-from functools import partial
 
 from aiomoqt.tests.microbench._stats import Stats
 
@@ -80,6 +79,7 @@ async def _run_qh3_for_n(n_sessions, args):
         is_client=False, alpn_protocols=H3_ALPN,
         verify_mode=ssl.CERT_NONE,
         max_data=2**24, max_stream_data=2**24,
+        max_datagram_frame_size=64 * 1024,
     )
     server_cfg.load_cert_chain(cert, key)
 
@@ -95,7 +95,7 @@ async def _run_qh3_for_n(n_sessions, args):
     TIMESTAMP_EXT = 0x20
 
     def on_object(msg, size_bytes, recv_time_ms,
-                   group_id=None, subgroup_id=None):
+                  group_id=None, subgroup_id=None):
         send_ms = (msg.extensions.get(TIMESTAMP_EXT)
                    if msg.extensions else None)
         if send_ms is not None:
