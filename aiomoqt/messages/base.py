@@ -1,5 +1,5 @@
-from typing import Any, Union, Dict
-from dataclasses import dataclass, fields
+from typing import Any, Optional, Union, Dict
+from dataclasses import dataclass, field, fields
 
 from . import ParamType, SetupParamType, AuthTokenAliasType
 from ..context import get_moqt_ctx_version, get_major_version
@@ -17,10 +17,15 @@ class MOQTUnderflow(Exception):
         self.needed = needed
 
 
-@dataclass
+@dataclass(slots=True)
 class MOQTMessage:
-    """Base class for all MOQT messages."""
-    # type: Optional[int] = None - let subclass set it - annoying warnings
+    """Base class for all MOQT messages.
+
+    Declared `type` slot so subclasses can assign their MOQTMessageType
+    in __post_init__ (and consumers can read it generically) under
+    slots=True. Default None; concrete subclasses override.
+    """
+    type: Optional[int] = field(default=None, kw_only=True)
 
     @staticmethod
     def _extensions_encode(buf: Buffer, exts: Dict,

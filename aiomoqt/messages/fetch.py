@@ -18,7 +18,7 @@ def _is_joining(fetch_type: int) -> bool:
                           FetchType.ABSOLUTE_JOINING)
 
 
-@dataclass
+@dataclass(slots=True)
 class Fetch(MOQTMessage):
     """FETCH message to request a range of objects.
 
@@ -164,7 +164,7 @@ class Fetch(MOQTMessage):
             parameters=params
         )
 
-@dataclass
+@dataclass(slots=True)
 class FetchOk(MOQTMessage):
     """FETCH_OK response message.
 
@@ -244,7 +244,7 @@ class FetchOk(MOQTMessage):
             track_extensions=track_extensions,
         )
 
-@dataclass
+@dataclass(slots=True)
 class FetchError(MOQTMessage):
     """FETCH_ERROR response message."""
     request_id: int
@@ -284,7 +284,7 @@ class FetchError(MOQTMessage):
             reason=reason
         )
     
-@dataclass
+@dataclass(slots=True)
 class FetchCancel(MOQTMessage):
     """FETCH_CANCEL message to cancel an ongoing fetch."""
     request_id: int

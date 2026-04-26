@@ -18,7 +18,7 @@ from ..utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-@dataclass
+@dataclass(slots=True)
 class RequestOk(MOQTMessage):
     """REQUEST_OK (0x07) — draft-16 universal OK response.
 
@@ -49,7 +49,7 @@ class RequestOk(MOQTMessage):
         return cls(request_id=request_id, parameters=params)
 
 
-@dataclass
+@dataclass(slots=True)
 class RequestError(MOQTMessage):
     """REQUEST_ERROR (0x05) — draft-16 universal error response.
 
@@ -100,7 +100,7 @@ class RequestError(MOQTMessage):
         )
 
 
-@dataclass
+@dataclass(slots=True)
 class RequestUpdate(MOQTMessage):
     """REQUEST_UPDATE (0x02) — draft-16 universal update.
 
@@ -143,7 +143,7 @@ class RequestUpdate(MOQTMessage):
         )
 
 
-@dataclass
+@dataclass(slots=True)
 class Namespace(MOQTMessage):
     """NAMESPACE (0x08) — draft-16 namespace report.
 
@@ -180,7 +180,7 @@ class Namespace(MOQTMessage):
         return cls(namespace_suffix=namespace_suffix)
 
 
-@dataclass
+@dataclass(slots=True)
 class NamespaceDone(MOQTMessage):
     """NAMESPACE_DONE (0x0E) — draft-16 namespace withdrawal.
 

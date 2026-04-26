@@ -1,6 +1,6 @@
 from ..types import *
 from typing import Tuple, Dict, Optional, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from . import MOQTMessage, BUF_SIZE
 from ..context import is_draft16_or_later
@@ -10,7 +10,7 @@ from ..utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-@dataclass
+@dataclass(slots=True)
 class TrackStatus(MOQTMessage):
     """TRACK_STATUS (0x0D) — identical format to SUBSCRIBE.
 
@@ -141,7 +141,7 @@ class TrackStatus(MOQTMessage):
         )
 
 
-@dataclass
+@dataclass(slots=True)
 class TrackStatusOk(MOQTMessage):
     """TRACK_STATUS_OK (0x0E) — identical format to SUBSCRIBE_OK."""
     request_id: int = 0
@@ -205,7 +205,7 @@ class TrackStatusOk(MOQTMessage):
         )
 
 
-@dataclass
+@dataclass(slots=True)
 class TrackStatusError(MOQTMessage):
     """TRACK_STATUS_ERROR (0x0F) — identical format to SUBSCRIBE_ERROR."""
     request_id: int = None
@@ -246,7 +246,7 @@ class TrackStatusError(MOQTMessage):
         )
 
 
-@dataclass
+@dataclass(slots=True)
 class Subscribe(MOQTMessage):
     request_id: int = 0  # This is the Request ID
     track_namespace: Tuple[bytes, ...] = None
@@ -259,6 +259,10 @@ class Subscribe(MOQTMessage):
     start_object: Optional[int] = None
     end_group: Optional[int] = None
     parameters: Optional[Dict[int, Any]] = None
+    # Server-side runtime: set by allocate_track_alias when responding
+    # with SubscribeOk. Not on the wire (Subscribe doesn't carry alias);
+    # declared as a slot field so server handlers can assign it.
+    track_alias: Optional[int] = field(default=None, init=False)
 
     def __post_init__(self):
         self.type = MOQTMessageType.SUBSCRIBE
@@ -384,7 +388,7 @@ class Subscribe(MOQTMessage):
         )
 
 
-@dataclass
+@dataclass(slots=True)
 class SubscribeOk(MOQTMessage):
     """SUBSCRIBE_OK (0x04).
 
@@ -494,7 +498,7 @@ class SubscribeOk(MOQTMessage):
         )
 
 
-@dataclass
+@dataclass(slots=True)
 class SubscribeError(MOQTMessage):
     request_id: int = None
     error_code: int = None
@@ -534,7 +538,7 @@ class SubscribeError(MOQTMessage):
         )
 
 
-@dataclass
+@dataclass(slots=True)
 class SubscribeUpdate(MOQTMessage):
     request_id: int = None
     subscription_request_id: int = None
@@ -591,7 +595,7 @@ class SubscribeUpdate(MOQTMessage):
         )
 
 
-@dataclass
+@dataclass(slots=True)
 class Unsubscribe(MOQTMessage):
     request_id: int = None
 
@@ -616,7 +620,7 @@ class Unsubscribe(MOQTMessage):
         return cls(request_id=request_id)
 
 
-@dataclass
+@dataclass(slots=True)
 class SubscribeDone(MOQTMessage):
     request_id: int = None
     status_code: int = None
@@ -660,7 +664,7 @@ class SubscribeDone(MOQTMessage):
         )
 
 
-@dataclass
+@dataclass(slots=True)
 class MaxSubscribeId(MOQTMessage):
     request_id: int = None
 
@@ -685,7 +689,7 @@ class MaxSubscribeId(MOQTMessage):
         return cls(request_id=request_id)
 
 
-@dataclass
+@dataclass(slots=True)
 class SubscribesBlocked(MOQTMessage):
     maximum_request_id: int = None
 
