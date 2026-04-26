@@ -21,16 +21,12 @@ from __future__ import annotations
 
 import argparse
 import time
-from typing import Optional
 
 from aiomoqt.context import set_moqt_ctx_version
-from aiomoqt.messages import ObjectStatus
 from aiomoqt.messages.base import MOQTUnderflow
-from aiomoqt.messages.track import (
-    SubgroupHeader, ObjectHeader, FetchHeader, FetchObject,
-)
+from aiomoqt.messages.track import SubgroupHeader, ObjectHeader
 from aiomoqt.types import MOQT_VERSION_DRAFT16
-from aiomoqt.utils.streamchain import StreamChain
+from aiopquic.streamchain import StreamChain
 from aiomoqt.tests.microbench._bytestream import (
     make_subgroup_stream, chunked,
 )

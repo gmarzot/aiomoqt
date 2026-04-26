@@ -22,7 +22,7 @@ from .messages import *
 from .types import *
 from .utils.buffer import Buffer, BufferReadError
 from .utils.logger import *
-from .utils.streamchain import StreamChain
+from aiopquic.streamchain import StreamChain
 
 USER_AGENT = f"aiomoqt/{version('aiomoqt')}"
 

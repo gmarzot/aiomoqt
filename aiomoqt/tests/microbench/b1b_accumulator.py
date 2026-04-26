@@ -28,7 +28,7 @@ from aiomoqt.tests.microbench._bytestream import (
 
 def _bench_streamchain(data: bytes, chunk_size: int, duration: float):
     """Benchmark StreamChain: extend + walk-and-commit."""
-    from aiomoqt.utils.streamchain import StreamChain
+    from aiopquic.streamchain import StreamChain
     chunks = chunked(data, chunk_size) if chunk_size else [data]
     n_bytes = len(data)
     end = time.perf_counter() + duration
