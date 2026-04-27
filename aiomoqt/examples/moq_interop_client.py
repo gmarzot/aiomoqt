@@ -126,13 +126,13 @@ def _get_connection_id(session) -> str:
         return "unknown"
 
 
-def _make_client(host: str, port: int, endpoint: str, use_quic: bool,
+def _make_client(host: str, port: int, path: str, use_quic: bool,
                  tls_disable_verify: bool, debug: bool,
                  draft_version: int = None) -> MOQTClient:
     """Create a configured MOQTClient."""
     return MOQTClient(
         host, port,
-        endpoint=endpoint,
+        path=path,
         use_quic=use_quic,
         verify_tls=not tls_disable_verify,
         debug=debug,
@@ -144,11 +144,11 @@ def _make_client(host: str, port: int, endpoint: str, use_quic: bool,
 # Test implementations
 # ---------------------------------------------------------------------------
 
-async def test_setup_only(host, port, endpoint, use_quic, tls_disable_verify,
+async def test_setup_only(host, port, path, use_quic, tls_disable_verify,
                           debug, draft_version=None, timeout=2.0) -> TestResult:
     """Test 1: Connect, exchange SETUP, graceful close."""
     t0 = time.monotonic()
-    client = _make_client(host, port, endpoint, use_quic, tls_disable_verify, debug, draft_version=draft_version)
+    client = _make_client(host, port, path, use_quic, tls_disable_verify, debug, draft_version=draft_version)
     try:
         async with asyncio.timeout(timeout):
             async with client.connect() as session:
@@ -171,11 +171,11 @@ async def test_setup_only(host, port, endpoint, use_quic, tls_disable_verify,
         )
 
 
-async def test_announce_only(host, port, endpoint, use_quic, tls_disable_verify,
+async def test_announce_only(host, port, path, use_quic, tls_disable_verify,
                              debug, draft_version=None, timeout=2.0) -> TestResult:
     """Test 2: SETUP + PUBLISH_NAMESPACE + receive OK."""
     t0 = time.monotonic()
-    client = _make_client(host, port, endpoint, use_quic, tls_disable_verify, debug, draft_version=draft_version)
+    client = _make_client(host, port, path, use_quic, tls_disable_verify, debug, draft_version=draft_version)
     try:
         async with asyncio.timeout(timeout):
             async with client.connect() as session:
@@ -204,12 +204,12 @@ async def test_announce_only(host, port, endpoint, use_quic, tls_disable_verify,
         )
 
 
-async def test_publish_namespace_done(host, port, endpoint, use_quic,
+async def test_publish_namespace_done(host, port, path, use_quic,
                                       tls_disable_verify, debug,
                                       draft_version=None, timeout=2.0) -> TestResult:
     """Test 3: SETUP + PUBLISH_NAMESPACE + OK + PUBLISH_NAMESPACE_DONE + close."""
     t0 = time.monotonic()
-    client = _make_client(host, port, endpoint, use_quic, tls_disable_verify, debug, draft_version=draft_version)
+    client = _make_client(host, port, path, use_quic, tls_disable_verify, debug, draft_version=draft_version)
     try:
         async with asyncio.timeout(timeout):
             async with client.connect() as session:
@@ -247,13 +247,13 @@ async def test_publish_namespace_done(host, port, endpoint, use_quic,
         )
 
 
-async def test_subscribe_error(host, port, endpoint, use_quic,
+async def test_subscribe_error(host, port, path, use_quic,
                                tls_disable_verify, debug,
                                draft_version=None, timeout=2.0) -> TestResult:
     """Test 4: SUBSCRIBE to non-existent track, expect SUBSCRIBE_ERROR."""
     t0 = time.monotonic()
     cid = "unknown"
-    client = _make_client(host, port, endpoint, use_quic, tls_disable_verify, debug, draft_version=draft_version)
+    client = _make_client(host, port, path, use_quic, tls_disable_verify, debug, draft_version=draft_version)
     try:
         async with asyncio.timeout(timeout):
             async with client.connect() as session:
@@ -306,7 +306,7 @@ async def test_subscribe_error(host, port, endpoint, use_quic,
         )
 
 
-async def test_announce_subscribe(host, port, endpoint, use_quic,
+async def test_announce_subscribe(host, port, path, use_quic,
                                   tls_disable_verify, debug,
                                   draft_version=None, timeout=3.0) -> TestResult:
     """Test 5: Two connections — publisher announces, subscriber subscribes."""
@@ -317,9 +317,9 @@ async def test_announce_subscribe(host, port, endpoint, use_quic,
     try:
         async with asyncio.timeout(timeout):
             # Publisher connection
-            pub_client = _make_client(host, port, endpoint, use_quic,
+            pub_client = _make_client(host, port, path, use_quic,
                                       tls_disable_verify, debug, draft_version=draft_version)
-            sub_client = _make_client(host, port, endpoint, use_quic,
+            sub_client = _make_client(host, port, path, use_quic,
                                       tls_disable_verify, debug, draft_version=draft_version)
 
             async with pub_client.connect() as pub_session:
@@ -370,7 +370,7 @@ async def test_announce_subscribe(host, port, endpoint, use_quic,
         )
 
 
-async def test_subscribe_before_announce(host, port, endpoint, use_quic,
+async def test_subscribe_before_announce(host, port, path, use_quic,
                                          tls_disable_verify, debug,
                                          draft_version=None, timeout=3.5) -> TestResult:
     """Test 6: Subscriber connects first, publisher 500ms later. Both outcomes valid."""
@@ -381,9 +381,9 @@ async def test_subscribe_before_announce(host, port, endpoint, use_quic,
 
     try:
         async with asyncio.timeout(timeout):
-            sub_client = _make_client(host, port, endpoint, use_quic,
+            sub_client = _make_client(host, port, path, use_quic,
                                       tls_disable_verify, debug, draft_version=draft_version)
-            pub_client = _make_client(host, port, endpoint, use_quic,
+            pub_client = _make_client(host, port, path, use_quic,
                                       tls_disable_verify, debug, draft_version=draft_version)
 
             async with sub_client.connect() as sub_session:
@@ -466,12 +466,12 @@ async def test_subscribe_before_announce(host, port, endpoint, use_quic,
         )
 
 
-async def test_fetch(host, port, endpoint, use_quic, tls_disable_verify,
+async def test_fetch(host, port, path, use_quic, tls_disable_verify,
                      debug, draft_version=None, timeout=3.0) -> TestResult:
     """FETCH probe: send a standalone FETCH; relay handles if it responds
     with FETCH_OK or structured FETCH_ERROR. Timeout/close = fail."""
     t0 = time.monotonic()
-    client = _make_client(host, port, endpoint, use_quic,
+    client = _make_client(host, port, path, use_quic,
                           tls_disable_verify, debug,
                           draft_version=draft_version)
     try:
@@ -513,12 +513,12 @@ async def test_fetch(host, port, endpoint, use_quic, tls_disable_verify,
         )
 
 
-async def test_join(host, port, endpoint, use_quic, tls_disable_verify,
+async def test_join(host, port, path, use_quic, tls_disable_verify,
                     debug, draft_version=None, timeout=3.0) -> TestResult:
     """JOIN probe: send SUBSCRIBE + JOINING_FETCH(RELATIVE, start=0).
     Relay handles if it responds (OK or structured error). Timeout = fail."""
     t0 = time.monotonic()
-    client = _make_client(host, port, endpoint, use_quic,
+    client = _make_client(host, port, path, use_quic,
                           tls_disable_verify, debug,
                           draft_version=draft_version)
     try:
@@ -576,7 +576,7 @@ TEST_FUNCTIONS = {
 
 
 def parse_relay_url(url: str):
-    """Parse relay URL into (host, port, endpoint, use_quic)."""
+    """Parse relay URL into (host, port, path, use_quic)."""
     parsed = urlparse(url)
     scheme = parsed.scheme.lower()
 
@@ -592,9 +592,9 @@ def parse_relay_url(url: str):
         port = parsed.port or 443
 
     host = parsed.hostname or url.split(":")[0]
-    endpoint = parsed.path.lstrip("/")
+    path = parsed.path.lstrip("/")
 
-    return host, port, endpoint, use_quic
+    return host, port, path, use_quic
 
 
 def parse_args():
@@ -624,7 +624,7 @@ def parse_args():
     return parser.parse_args()
 
 
-async def run_tests(tests: list[str], host: str, port: int, endpoint: str,
+async def run_tests(tests: list[str], host: str, port: int, path: str,
                     use_quic: bool, tls_disable_verify: bool,
                     debug: bool, draft_version: int = None) -> TAPReporter:
     reporter = TAPReporter()
@@ -636,7 +636,7 @@ async def run_tests(tests: list[str], host: str, port: int, endpoint: str,
                 skip_reason="Unknown test case",
             ))
             continue
-        result = await fn(host, port, endpoint, use_quic, tls_disable_verify,
+        result = await fn(host, port, path, use_quic, tls_disable_verify,
                           debug, draft_version=draft_version)
         reporter.add(result)
         # Print progress to stderr if verbose
@@ -659,7 +659,7 @@ def main():
     logging.basicConfig(level=log_level, stream=sys.stderr,
                         format="%(levelname)s %(name)s: %(message)s")
 
-    host, port, endpoint, use_quic = parse_relay_url(args.relay)
+    host, port, path, use_quic = parse_relay_url(args.relay)
 
     # Resolve draft version
     draft_version = None
@@ -669,7 +669,7 @@ def main():
     if args.verbose:
         transport = "QUIC" if use_quic else "WebTransport"
         draft_str = f" draft-{args.draft}" if args.draft else ""
-        print(f"# Relay: {args.relay} ({host}:{port}/{endpoint} via {transport}{draft_str})",
+        print(f"# Relay: {args.relay} ({host}:{port}/{path} via {transport}{draft_str})",
               file=sys.stderr)
 
     # Select tests
@@ -684,7 +684,7 @@ def main():
         tests = STANDARD_TESTS
 
     reporter = asyncio.run(
-        run_tests(tests, host, port, endpoint, use_quic,
+        run_tests(tests, host, port, path, use_quic,
                   args.tls_disable_verify, args.debug,
                   draft_version=draft_version)
     )

@@ -122,7 +122,7 @@ async def run_server(args):
     from functools import partial
 
     server_peer = MOQTPeer()
-    server_peer.endpoint = "moq"
+    server_peer.path = "moq"
     server_peer.register_handler(
         MOQTMessageType.SUBSCRIBE,
         partial(_on_subscribe, args=args))
@@ -153,7 +153,7 @@ async def run_subscriber(args, stats):
     """Connect as subscriber and collect stats."""
     client = MOQTClient(
         "localhost", args.port,
-        endpoint="moq",
+        path="moq",
         verify_tls=False,
         debug=args.debug,
     )

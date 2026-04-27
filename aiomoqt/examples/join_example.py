@@ -14,14 +14,14 @@ def parse_args():
     parser.add_argument('--port', type=int, default=443, help='Port to connect to')
     parser.add_argument('--namespace', type=str, default="live/test", help='Track Namespace')
     parser.add_argument('--trackname', type=str, default="track", help='Track Name')
-    parser.add_argument('--endpoint', type=str, default="", help='MOQT WT endpoint path (default: "/")')
+    parser.add_argument('--path', type=str, default="", help='MOQT WT path (default: "/")')
     parser.add_argument('--use-quic', action='store_true', help='Enable QUIC transport')
     parser.add_argument('--debug', action='store_true', help='Enable debug output')
     parser.add_argument('--keylogfile', type=str, default=None, help='TLS secrets file')
     return parser.parse_args()
 
 
-async def main(host: str, port: int, endpoint: str, namespace: str, track_name: str,
+async def main(host: str, port: int, path: str, namespace: str, track_name: str,
                use_quic: bool, debug: bool):
     log_level = logging.DEBUG if debug else logging.INFO
     set_log_level(log_level)
@@ -30,7 +30,7 @@ async def main(host: str, port: int, endpoint: str, namespace: str, track_name: 
     client = MOQTClient(
         host,
         port,
-        endpoint=endpoint,
+        path=path,
         use_quic=use_quic,
         keylog_filename=args.keylogfile,
         debug=debug
@@ -86,7 +86,7 @@ if __name__ == "__main__":
         asyncio.run(main(
             host=args.host,
             port=args.port,
-            endpoint=args.endpoint,
+            path=args.path,
             namespace=args.namespace,
             track_name=args.trackname,
             use_quic=args.use_quic,

@@ -121,7 +121,7 @@ async def main():
         return
 
     peer = MOQTPeer()
-    peer.endpoint = "moq"
+    peer.path = "moq"
     peer.register_handler(
         MOQTMessageType.SUBSCRIBE,
         partial(_on_subscribe, args=args))

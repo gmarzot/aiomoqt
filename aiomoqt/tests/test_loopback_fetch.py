@@ -199,7 +199,7 @@ def _make_subscribe_handler(cache: FetchTestCache):
 async def _start_server(port: int, cache: FetchTestCache):
     """Start a loopback server with fetch + subscribe handlers."""
     peer = MOQTPeer()
-    peer.endpoint = "moq"
+    peer.path = "moq"
     peer.register_handler(
         MOQTMessageType.SUBSCRIBE,
         _make_subscribe_handler(cache))
@@ -229,7 +229,7 @@ async def _connect_client(port: int):
     """Create a client connected to localhost."""
     client = MOQTClient(
         "localhost", port,
-        endpoint="moq",
+        path="moq",
         verify_tls=False,
     )
     return client
@@ -549,7 +549,7 @@ async def test_fetch_cancel_mid_stream():
         session.transmit()
 
     peer = MOQTPeer()
-    peer.endpoint = "moq"
+    peer.path = "moq"
     peer.register_handler(MOQTMessageType.FETCH, _slow_fetch)
 
     config = QuicConfiguration(

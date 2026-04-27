@@ -167,7 +167,7 @@ async def _subscriber_task(config: Dict[str, Any], mp_stop_event,
                             force_quic=config.get('force_quic', False))
     client = MOQTClient(
         relay.host, relay.port,
-        endpoint=relay.endpoint or "",
+        path=relay.path or "",
         use_quic=relay.use_quic,
         verify_tls=not config.get('insecure', False),
         draft_version=config.get('draft'),

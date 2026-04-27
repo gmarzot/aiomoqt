@@ -270,9 +270,9 @@ def parse_args():
         epilog="""
 relay URL forms:
   moqt://host:port            raw QUIC (port default 443)
-  https://host:port/endpoint  H3/WT (port default 443)
+  https://host:port/path  H3/WT (port default 443)
   host:port                   H3/WT
-  host                        H3/WT, port 443, endpoint /moq
+  host                        H3/WT, port 443, no default path
 
 examples:
   %(prog)s relay.example.com
@@ -341,7 +341,7 @@ async def run(args):
 
     client = MOQTClient(
         relay.host, relay.port,
-        endpoint=relay.endpoint,
+        path=relay.path,
         use_quic=relay.use_quic,
         verify_tls=not args.insecure,
         draft_version=args.draft,

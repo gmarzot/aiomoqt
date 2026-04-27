@@ -4,10 +4,11 @@ from typing import Optional, AsyncContextManager
 
 import certifi
 from qh3.quic.configuration import QuicConfiguration
-from qh3.asyncio.client import connect
+from qh3.asyncio.client import connect as qh3_connect
 from qh3.h3.connection import H3_ALPN
 
 from .protocol import *
+from .protocol import MOQTSessionQuic
 from .types import moqt_alpn_for_version
 from .context import set_moqt_ctx_version
 from .utils.logger import *
@@ -19,7 +20,7 @@ class MOQTClient(MOQTPeer):  # New connection manager class
         self,
         host: str,
         port: int,
-        endpoint: Optional[str] = None,
+        path: Optional[str] = None,
         use_quic: Optional[bool] = False,
         verify_tls: Optional[bool] = True,
         allow_optional_dgram: Optional[bool] = False,
@@ -33,7 +34,7 @@ class MOQTClient(MOQTPeer):  # New connection manager class
         super().__init__(allow_optional_dgram=allow_optional_dgram, libquicr_compat=libquicr_compat)
         self.host = host
         self.port = port
-        self.endpoint = endpoint
+        self.path = path
         self.use_quic = use_quic
         self.debug = debug
         self.draft_version = draft_version
@@ -44,7 +45,7 @@ class MOQTClient(MOQTPeer):  # New connection manager class
         if draft_version is not None:
             set_moqt_ctx_version(draft_version)
 
-        logger.debug(f"MOQT: client session: {self} use_quic={use_quic} endpoint={endpoint}")
+        logger.debug(f"MOQT: client session: {self} use_quic={use_quic} path={path}")
 
         if configuration is None:
             # Choose ALPN based on draft version
@@ -73,8 +74,32 @@ class MOQTClient(MOQTPeer):  # New connection manager class
     def connect(self) -> AsyncContextManager[MOQTSession]:
         """Return a context manager that creates MOQTSessionProtocol instance."""
         logger.debug(f"MOQT: session connect: {self}")
+
+        if self.use_quic and MOQTSessionQuic is not None:
+            # Phase D-partial: raw QUIC via aiopquic
+            from aiopquic.asyncio.client import connect as aiopquic_connect
+            from aiopquic.quic.configuration import (
+                QuicConfiguration as AioPQuicConfiguration,
+            )
+            cfg = AioPQuicConfiguration(
+                alpn_protocols=self.configuration.alpn_protocols,
+                is_client=True,
+                verify_mode=self.configuration.verify_mode,
+                max_data=self.configuration.max_data,
+                max_stream_data=self.configuration.max_stream_data,
+                max_datagram_frame_size=self.configuration.max_datagram_frame_size,
+                server_name=self.host,
+            )
+            protocol = lambda *a, **kw: MOQTSessionQuic(*a, **kw, session=self)
+            return aiopquic_connect(
+                self.host,
+                self.port,
+                configuration=cfg,
+                create_protocol=protocol,
+            )
+
         protocol = lambda *args, **kwargs: MOQTSession(*args, **kwargs, session=self)
-        return connect(
+        return qh3_connect(
             self.host,
             self.port,
             configuration=self.configuration,

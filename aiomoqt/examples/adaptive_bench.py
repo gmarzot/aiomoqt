@@ -871,7 +871,7 @@ async def run_loopback_server(args, state: BenchState):
                 pass
 
     peer = MOQTPeer()
-    peer.endpoint = ""
+    peer.path = ""
     peer.register_handler(MOQTMessageType.SUBSCRIBE,
                           partial(_on_subscribe))
 
@@ -897,14 +897,14 @@ async def run_loopback_server(args, state: BenchState):
 # Client: subscriber role, feeds LiveStats that the controller reads
 # ---------------------------------------------------------------------------
 
-async def run_subscriber_client(host: str, port: int, endpoint: str,
+async def run_subscriber_client(host: str, port: int, path: str,
                                 use_quic: bool, verify_tls: bool,
                                 args,
                                 state: BenchState,
                                 stats: LiveStats):
     client = MOQTClient(
         host, port,
-        endpoint=endpoint,
+        path=path,
         use_quic=use_quic,
         verify_tls=verify_tls,
         draft_version=args.draft,
@@ -950,13 +950,13 @@ async def run_subscriber_client(host: str, port: int, endpoint: str,
 # loopback server).
 # ---------------------------------------------------------------------------
 
-async def run_publisher_client(host: str, port: int, endpoint: str,
+async def run_publisher_client(host: str, port: int, path: str,
                                use_quic: bool, verify_tls: bool,
                                args,
                                state: BenchState):
     client = MOQTClient(
         host, port,
-        endpoint=endpoint,
+        path=path,
         use_quic=use_quic,
         verify_tls=verify_tls,
         draft_version=args.draft,
@@ -1249,15 +1249,15 @@ async def main():
         if relay_mode:
             relay = parse_relay_url(args.relay_url)
             host, port = relay.host, relay.port
-            endpoint = relay.endpoint or ""
+            path = relay.path or ""
             use_quic = relay.use_quic
             verify = not args.insecure
             pub_task = asyncio.create_task(run_publisher_client(
-                host, port, endpoint, use_quic, verify, args, state))
+                host, port, path, use_quic, verify, args, state))
             await asyncio.sleep(0.3)
             if args.mode == "bw":
                 sub_task = asyncio.create_task(run_subscriber_client(
-                    host, port, endpoint, use_quic, verify, args, state, stats))
+                    host, port, path, use_quic, verify, args, state, stats))
         else:
             args.port = loopback_port  # server code still reads args.port
             server = await run_loopback_server(args, state)

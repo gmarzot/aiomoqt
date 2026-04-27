@@ -8,7 +8,7 @@ Usage:
   # Raw QUIC
   python -m aiomoqt.examples.bench_pub moqt://relay.example.com
 
-  # Bare hostname (defaults to https, port 443, endpoint /moq)
+  # Bare hostname (defaults to https, port 443, no default path)
   python -m aiomoqt.examples.bench_pub relay.example.com
 
   # With options
@@ -31,9 +31,9 @@ def parse_args():
         epilog="""
 relay URL forms:
   moqt://host:port            raw QUIC (default port 443)
-  https://host:port/endpoint  H3/WebTransport (default port 443)
+  https://host:port/path  H3/WebTransport (default port 443)
   host:port                   H3/WebTransport
-  host                        H3/WebTransport, port 443, endpoint /moq
+  host                        H3/WebTransport, port 443, no default path
 
 examples:
   %(prog)s moqt://relay.example.com
@@ -121,7 +121,7 @@ async def run(args):
 
     client = MOQTClient(
         relay.host, relay.port,
-        endpoint=relay.endpoint,
+        path=relay.path,
         use_quic=relay.use_quic,
         verify_tls=not args.insecure,
         draft_version=args.draft,

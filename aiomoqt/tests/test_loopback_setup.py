@@ -39,7 +39,7 @@ async def _start_server(port: int, on_publish_namespace=None):
     """Minimal loopback server that accepts SETUP and optionally handles
     PUBLISH_NAMESPACE via the provided callback."""
     peer = MOQTPeer()
-    peer.endpoint = "moq"
+    peer.path = "moq"
 
     if on_publish_namespace is not None:
         peer.register_handler(
@@ -74,7 +74,7 @@ async def test_setup_draft14():
     server = await _start_server(port)
     try:
         client = MOQTClient(
-            "localhost", port, endpoint="moq",
+            "localhost", port, path="moq",
             verify_tls=False, draft_version=MOQT_VERSION_DRAFT14,
         )
         async with client.connect() as session:
@@ -92,7 +92,7 @@ async def test_setup_draft16():
     server = await _start_server(port)
     try:
         client = MOQTClient(
-            "localhost", port, endpoint="moq",
+            "localhost", port, path="moq",
             verify_tls=False, draft_version=MOQT_VERSION_DRAFT16,
         )
         async with client.connect() as session:
@@ -117,7 +117,7 @@ async def test_setup_auth_token_roundtrip():
 
     server = await _start_server(port, on_publish_namespace=_handle_pub_ns)
     try:
-        client = MOQTClient("localhost", port, endpoint="moq",
+        client = MOQTClient("localhost", port, path="moq",
                             verify_tls=False)
         async with client.connect() as session:
             await session.client_session_init()

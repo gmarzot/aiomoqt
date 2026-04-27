@@ -18,7 +18,7 @@ def parse_args():
     parser.add_argument('--port', type=int, default=443, help='Port to bind to')
     parser.add_argument('--certificate', type=str, required=True, help='TLS server certificate')
     parser.add_argument('--private-key', type=str, required=True, help='TLS private key')
-    parser.add_argument('--endpoint', type=str, default="", help='MOQT WebTransport endpoint path (default: "/")')
+    parser.add_argument('--path', type=str, default="", help='MOQT WebTransport path (default: "/")')
     parser.add_argument('--retry', action='store_true', help='send a retry for new connections')
     parser.add_argument('--debug', action='store_true', help='Enable debug output')
     parser.add_argument('--quic-debug', action='store_true',  help='Enable quic debug output')
@@ -36,7 +36,7 @@ async def main(args):
         port=args.port,
         certificate=args.certificate,
         private_key=args.private_key,
-        endpoint=args.endpoint,
+        path=args.path,
         debug=args.debug
     )
 

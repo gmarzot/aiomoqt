@@ -228,7 +228,7 @@ def parse_args():
     parser.add_argument('--namespace', type=str, default='test', help='Namespace')
     parser.add_argument('--trackname', type=str, default='track', help='Track')
     parser.add_argument('--use-quic', action='store_true', help='Enable QUIC transport')
-    parser.add_argument('--endpoint', type=str, default='', help='MOQT endpoint path (default: "/")')
+    parser.add_argument('--path', type=str, default='', help='MOQT path (default: "/")')
     parser.add_argument('--datagram', action='store_true', help='Emit ObjectDatagrams')
     parser.add_argument('--debug', action='store_true', help='Enable debug output')
     parser.add_argument('--quic-debug', action='store_true', help='Enable quic debug output')
@@ -250,7 +250,7 @@ def parse_args():
     return parser.parse_args()
 
 
-async def main(host: str, port: int, endpoint: str, namespace: str, trackname: str,
+async def main(host: str, port: int, path: str, namespace: str, trackname: str,
                debug: bool, datagram: bool, use_quic: bool, quic_debug: bool,
                insecure: bool = False, auth_token: str = None, draft: int = None,
                streams: int = 1, object_size: int = 1024, rate: float = 30,
@@ -262,7 +262,7 @@ async def main(host: str, port: int, endpoint: str, namespace: str, trackname: s
     client = MOQTClient(
         host,
         port,
-        endpoint=endpoint,
+        path=path,
         use_quic=use_quic,
         verify_tls=not insecure,
         draft_version=draft,
@@ -318,7 +318,7 @@ if __name__ == "__main__":
         asyncio.run(main(
             host=args.host,
             port=args.port,
-            endpoint=args.endpoint,
+            path=args.path,
             use_quic=args.use_quic,
             namespace=args.namespace,
             trackname=args.trackname,

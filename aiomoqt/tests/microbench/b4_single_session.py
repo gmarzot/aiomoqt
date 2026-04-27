@@ -62,7 +62,7 @@ async def _run_qh3(args):
 
     # ---- server: publisher generates on subscribe ----
     server_peer = MOQTPeer()
-    server_peer.endpoint = "moq"
+    server_peer.path = "moq"
 
     async def on_subscribe(session, msg):
         track = PublishedTrack(
@@ -111,7 +111,7 @@ async def _run_qh3(args):
         bytes_done += size_bytes
 
     client = MOQTClient(
-        '127.0.0.1', args.port, endpoint='moq',
+        '127.0.0.1', args.port, path='moq',
         verify_tls=False, debug=False,
     )
 
@@ -140,10 +140,86 @@ async def _run_qh3(args):
 
 
 async def _run_aiopquic(args):
-    print("backend=aiopquic: not wired yet — completes after Phase D "
-          "(aiomoqt qh3→aiopquic backend swap). Stubbed for now.",
-          file=sys.stderr)
-    sys.exit(2)
+    from aiomoqt.client import MOQTClient
+    from aiomoqt.server import MOQTServer
+    from aiomoqt.track import PublishedTrack, SubscribedTrack
+    from aiomoqt.types import MOQTMessageType, MOQT_VERSION_DRAFT16
+
+    cert = _find_cert()
+    if not cert:
+        print("ERROR: no cert found", file=sys.stderr)
+        sys.exit(1)
+    key = cert.replace('cert.pem', 'key.pem')
+
+    # ---- server: publisher generates on subscribe ----
+    async def on_subscribe(session, msg):
+        track = PublishedTrack(
+            session, namespace="bench", trackname="track",
+            object_size=args.object_size, group_size=10000,
+            num_subgroups=1, rate=args.rate,
+        )
+        track._stats_header_printed = True
+        track._quiet = True
+        ok = session.subscribe_ok(request_msg=msg)
+        track.track_alias = ok.track_alias
+        track._generating = True
+        await track.generate(session, ok.track_alias)
+
+    server = MOQTServer(
+        host='127.0.0.1', port=args.port,
+        certificate=cert, private_key=key,
+        path="moq",
+        use_quic=True,
+        draft_version=MOQT_VERSION_DRAFT16,
+    )
+    server.register_handler(MOQTMessageType.SUBSCRIBE, on_subscribe)
+    server_handle = await server.serve()
+
+    # ---- client: subscribe + stat per-object ----
+    stats = Stats(name='e2e-latency')
+    n_objects = 0
+    bytes_done = 0
+    TIMESTAMP_EXT = 0x20
+
+    def on_object(msg, size_bytes, recv_time_ms,
+                   group_id=None, subgroup_id=None):
+        nonlocal n_objects, bytes_done
+        send_ms = (msg.extensions.get(TIMESTAMP_EXT)
+                   if msg.extensions else None)
+        if send_ms is not None:
+            stats.record(recv_time_ms - send_ms)
+        n_objects += 1
+        bytes_done += size_bytes
+
+    client = MOQTClient(
+        '127.0.0.1', args.port, path='moq',
+        use_quic=True,
+        verify_tls=False, debug=False,
+        draft_version=MOQT_VERSION_DRAFT16,
+    )
+
+    t0 = time.perf_counter()
+    try:
+        async with client.connect() as session:
+            await session.client_session_init()
+            track = SubscribedTrack(
+                session, namespace="bench", trackname="track",
+                on_object=on_object,
+            )
+            await track.subscribe()
+            await track.wait_closed(timeout=args.duration)
+    finally:
+        if hasattr(server_handle, 'close'):
+            server_handle.close()
+
+    elapsed = time.perf_counter() - t0
+    obj_s = n_objects / elapsed if elapsed > 0 else 0
+    mbps = (bytes_done * 8) / (elapsed * 1e6) if elapsed > 0 else 0
+    print(f"backend: aiopquic  rate-target={args.rate}/s "
+          f"object-size={args.object_size}B duration={args.duration}s")
+    print(f"  delivered: {n_objects:,} objs ({obj_s:,.0f}/s) "
+          f"{bytes_done:,} bytes ({mbps:.1f} Mbps) in {elapsed:.1f}s")
+    print(f"  {stats.summary(unit='ms')}")
 
 
 def main():

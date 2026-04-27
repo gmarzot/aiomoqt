@@ -67,7 +67,7 @@ async def test_setup(host, port, draft):
     """Test 1: CLIENT_SETUP / SERVER_SETUP handshake."""
     r = ConformanceResult("setup")
     try:
-        client = MOQTClient(host, port, endpoint='',
+        client = MOQTClient(host, port, path='',
                             use_quic=True, draft_version=draft)
         async with client.connect() as session:
             await session.client_session_init()
@@ -81,7 +81,7 @@ async def test_publish_namespace(host, port, draft, namespace):
     """Test 2: PUBLISH_NAMESPACE → must get PUBLISH_NAMESPACE_OK or error."""
     r = ConformanceResult("publish_namespace response")
     try:
-        client = MOQTClient(host, port, endpoint='',
+        client = MOQTClient(host, port, path='',
                             use_quic=True, draft_version=draft)
         async with client.connect() as session:
             await session.client_session_init()
@@ -109,7 +109,7 @@ async def test_publish_response(host, port, draft, namespace, trackname):
     PUBLISH_ERROR in response to a PUBLISH.'"""
     r = ConformanceResult("publish response (forward=0)")
     try:
-        client = MOQTClient(host, port, endpoint='',
+        client = MOQTClient(host, port, path='',
                             use_quic=True, draft_version=draft)
         async with client.connect() as session:
             await session.client_session_init()
@@ -144,7 +144,7 @@ async def test_subscribe_namespace_response(host, port, draft, namespace):
     """Test 4: SUBSCRIBE_NAMESPACE → must get OK/ERROR response."""
     r = ConformanceResult("subscribe_namespace response")
     try:
-        client = MOQTClient(host, port, endpoint='',
+        client = MOQTClient(host, port, path='',
                             use_quic=True, draft_version=draft)
         async with client.connect() as session:
             await session.client_session_init()
@@ -171,7 +171,7 @@ async def test_subscribe_namespace_publish_forwarding(
     NAMESPACE_DONE or PUBLISH messages for that namespace.'"""
     r = ConformanceResult("subscribe_namespace forwards PUBLISH")
     try:
-        client = MOQTClient(host, port, endpoint='',
+        client = MOQTClient(host, port, path='',
                             use_quic=True, draft_version=draft)
         async with client.connect() as session:
             await session.client_session_init()
@@ -205,7 +205,7 @@ async def test_subscribe_response(host, port, draft, namespace, trackname):
     SUBSCRIBE_ERROR in response to a SUBSCRIBE.'"""
     r = ConformanceResult("subscribe response")
     try:
-        client = MOQTClient(host, port, endpoint='',
+        client = MOQTClient(host, port, path='',
                             use_quic=True, draft_version=draft)
         async with client.connect() as session:
             await session.client_session_init()
@@ -244,7 +244,7 @@ async def test_subscribe_data_delivery(host, port, draft,
         objects.append((gid, msg.object_id, size))
 
     try:
-        client = MOQTClient(host, port, endpoint='',
+        client = MOQTClient(host, port, path='',
                             use_quic=True, draft_version=draft)
         async with client.connect() as session:
             await session.client_session_init()
@@ -294,7 +294,7 @@ async def test_track_alias_established(host, port, draft,
         pass  # data callback
 
     try:
-        client = MOQTClient(host, port, endpoint='',
+        client = MOQTClient(host, port, path='',
                             use_quic=True, draft_version=draft)
         async with client.connect() as session:
             await session.client_session_init()
