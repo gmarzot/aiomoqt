@@ -2584,14 +2584,89 @@ class MOQTSession(_MOQTSessionMixin, QuicConnectionProtocol):
 
 
 MOQTSessionQuic: Optional[Type[_MOQTSessionMixin]] = None
+MOQTSessionWTClient: Optional[Type[_MOQTSessionMixin]] = None
+MOQTSessionWTServer: Optional[Type[_MOQTSessionMixin]] = None
 try:
     from aiopquic.asyncio.protocol import (
         QuicConnectionProtocol as _AioPQuicConnectionProtocol,
+    )
+    from aiopquic.asyncio.webtransport import (
+        WebTransportClient as _AioPWTClient,
+        WebTransportServerSession as _AioPWTServerSession,
     )
 
     class MOQTSessionQuic(_MOQTSessionMixin, _AioPQuicConnectionProtocol):  # type: ignore[no-redef]
         """aiopquic-backed MoQT session — used for raw QUIC (use_quic=True)."""
         pass
+
+
+    class _WTSessionMixin:
+        """Shared init for WT-base MOQTSession subclasses.
+
+        Sets self._quic = self so the mixin's transport-agnostic
+        send-side calls (self._quic.send_stream_data etc.) land on
+        WebTransportSession's matching API. Pre-resolves
+        self._wt_session_setup since the WT session is established
+        at construction (server) or by open() (client, after the
+        CONNECT round-trip).
+        """
+
+        def _moqt_wt_finalize(self) -> None:
+            self._quic = self
+            if not self._wt_session_setup.done():
+                self._wt_session_setup.set_result(True)
+
+        def _on_event(self, ev_tuple) -> None:
+            """Translate WT-specific events into the QuicEvent classes
+            the mixin's quic_event_received already handles, then
+            dispatch through that path. Falls back to WebTransportSession
+            base handling for session-level signals (ready/closed)."""
+            super()._on_event(ev_tuple)
+            evt_type, sid, data, _is_fin, error_code, _cnx, _ = ev_tuple
+            from aiopquic.quic.events import (
+                StreamDataReceived as _SD, StreamReset as _SR,
+                StopSendingReceived as _SS, DatagramFrameReceived as _DG,
+            )
+            from aiopquic.asyncio.webtransport import (
+                _EVT_WT_STREAM_DATA, _EVT_WT_STREAM_FIN,
+                _EVT_WT_STREAM_RESET, _EVT_WT_STOP_SENDING,
+                _EVT_WT_DATAGRAM,
+            )
+            if evt_type == _EVT_WT_STREAM_DATA:
+                self.quic_event_received(_SD(stream_id=sid, data=data,
+                                              end_stream=False))
+            elif evt_type == _EVT_WT_STREAM_FIN:
+                self.quic_event_received(_SD(stream_id=sid, data=data,
+                                              end_stream=True))
+            elif evt_type == _EVT_WT_STREAM_RESET:
+                self.quic_event_received(_SR(stream_id=sid,
+                                              error_code=error_code))
+            elif evt_type == _EVT_WT_STOP_SENDING:
+                self.quic_event_received(_SS(stream_id=sid,
+                                              error_code=error_code))
+            elif evt_type == _EVT_WT_DATAGRAM:
+                self.quic_event_received(_DG(data=data))
+
+
+    class MOQTSessionWTClient(
+            _WTSessionMixin, _MOQTSessionMixin, _AioPWTClient):  # type: ignore[no-redef]
+        """aiopquic-backed MoQT session — initiator-side WT (client)."""
+
+        def __init__(self, transport, host: str, port: int, path: str,
+                     sni: Optional[str] = None, *,
+                     session: 'MOQTPeer'):
+            super().__init__(transport, host, port, path,
+                             sni=sni, session=session)
+            self._moqt_wt_finalize()
+
+
+    class MOQTSessionWTServer(
+            _WTSessionMixin, _MOQTSessionMixin, _AioPWTServerSession):  # type: ignore[no-redef]
+        """aiopquic-backed MoQT session — acceptor-side WT (server)."""
+
+        def __init__(self, transport, state, *, session: 'MOQTPeer'):
+            super().__init__(transport, state, session=session)
+            self._moqt_wt_finalize()
 
 except ImportError:
     pass
