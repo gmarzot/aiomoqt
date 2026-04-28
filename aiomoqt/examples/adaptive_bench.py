@@ -23,7 +23,6 @@ import asyncio
 import csv
 import os
 import platform
-import ssl
 import sys
 import time
 import uuid
@@ -32,12 +31,8 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import Optional
 
-from qh3.asyncio.server import serve
-from qh3.h3.connection import H3_ALPN
-from qh3.quic.configuration import QuicConfiguration
-
 from aiomoqt.client import MOQTClient
-from aiomoqt.protocol import MOQTPeer, MOQTSession
+from aiomoqt.server import MOQTServer
 from aiomoqt.track import PublishedTrack, SubscribedTrack
 from aiomoqt.types import (MOQT_TIMESTAMP_EXT, FilterType, MOQTMessageType,
                            ObjectStatus)
@@ -870,27 +865,14 @@ async def run_loopback_server(args, state: BenchState):
             except (asyncio.CancelledError, Exception):
                 pass
 
-    peer = MOQTPeer()
-    peer.path = ""
-    peer.register_handler(MOQTMessageType.SUBSCRIBE,
-                          partial(_on_subscribe))
-
-    config = QuicConfiguration(
-        is_client=False,
-        alpn_protocols=H3_ALPN,
-        verify_mode=ssl.CERT_NONE,
-        max_data=2**24,
-        max_stream_data=2**24,
-        max_datagram_frame_size=64 * 1024,
+    server = MOQTServer(
+        host="localhost", port=args.port,
+        certificate=args.cert, private_key=args.key,
+        path="",
     )
-    config.load_cert_chain(args.cert, args.key)
-
-    return await serve(
-        "localhost", args.port,
-        configuration=config,
-        create_protocol=lambda *a, **kw:
-            MOQTSession(*a, **kw, session=peer),
-    )
+    server.register_handler(
+        MOQTMessageType.SUBSCRIBE, partial(_on_subscribe))
+    return await server.serve()
 
 
 # ---------------------------------------------------------------------------

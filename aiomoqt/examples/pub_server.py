@@ -137,7 +137,7 @@ async def main():
         partial(_on_subscribe, args=args))
     quic_server = await server.serve()
 
-    transport = "raw QUIC (aiopquic)" if args.quic else "H3/WebTransport (qh3)"
+    transport = "raw QUIC" if args.quic else "H3/WebTransport"
     rate_s = f"{args.rate}/s" if args.rate > 0 else "max"
     print(f"MoQT publisher server ready on {args.host}:{args.port}")
     print(f"  transport: {transport}")

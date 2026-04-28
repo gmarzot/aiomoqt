@@ -1,6 +1,6 @@
 """Phase 5 — Loopback fetch self-tests.
 
-Runs publisher + subscriber in a single process via qh3 on localhost.
+Runs publisher + subscriber in a single process via aiopquic on localhost.
 No relay needed. Tests validate the full FETCH lifecycle:
 - FetchHeader + FetchObject wire path
 - on_fetch_object callback delivery
@@ -17,14 +17,9 @@ Test matrix:
 """
 import asyncio
 import os
-import ssl
 import time
 
 import pytest
-
-from qh3.quic.configuration import QuicConfiguration
-from qh3.asyncio.server import serve
-from qh3.h3.connection import H3_ALPN
 
 from aiomoqt.types import (
     MOQTMessageType, FetchType, GroupOrder,
@@ -33,7 +28,7 @@ from aiomoqt.types import (
 from aiomoqt.messages import Fetch, Subscribe
 from aiomoqt.messages.track import FetchHeader, FetchObject, SubgroupHeader
 from aiomoqt.client import MOQTClient
-from aiomoqt.protocol import MOQTPeer, MOQTSession
+from aiomoqt.server import MOQTServer
 from aiomoqt.messages import FetchOk, FetchCancel
 
 # ---------------------------------------------------------------------------
@@ -84,7 +79,7 @@ def _make_fetch_handler(cache: FetchTestCache):
     3. Opens a uni stream, writes FETCH_HEADER + FetchObjects, FINs it
     """
 
-    async def _handle_fetch(session: MOQTSession, msg: Fetch):
+    async def _handle_fetch(session, msg: Fetch):
         request_id = msg.request_id
 
         if msg.fetch_type == FetchType.STANDALONE:
@@ -140,7 +135,6 @@ def _make_fetch_handler(cache: FetchTestCache):
 
         # FIN the stream
         session.stream_write(stream_id, b'', end_stream=True)
-        session.transmit()
 
     return _handle_fetch
 
@@ -152,7 +146,7 @@ def _make_subscribe_handler(cache: FetchTestCache):
     generating live objects from the next group onward.
     """
 
-    async def _handle_subscribe(session: MOQTSession, msg: Subscribe):
+    async def _handle_subscribe(session, msg: Subscribe):
         ok = session.subscribe_ok(
             request_msg=msg,
             content_exists=1,
@@ -172,7 +166,6 @@ def _make_subscribe_handler(cache: FetchTestCache):
             extensions_present=True,
         )
         session.stream_write(stream_id, header.serialize().data)
-        session.transmit()
 
         # Send a few live objects
         for obj_id in range(5):
@@ -183,12 +176,10 @@ def _make_subscribe_handler(cache: FetchTestCache):
                 object_id=obj_id,
             )
             session.stream_write(stream_id, buf.data)
-            session.transmit()
             await asyncio.sleep(0.01)
 
         # FIN
         session.stream_write(stream_id, b'', end_stream=True)
-        session.transmit()
 
     return _handle_subscribe
 
@@ -196,47 +187,41 @@ def _make_subscribe_handler(cache: FetchTestCache):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-async def _start_server(port: int, cache: FetchTestCache):
-    """Start a loopback server with fetch + subscribe handlers."""
-    peer = MOQTPeer()
-    peer.path = "moq"
-    peer.register_handler(
+async def _start_server(port: int, cache: FetchTestCache,
+                          use_quic: bool = True):
+    """Start a loopback MOQTServer with fetch + subscribe handlers."""
+    server = MOQTServer(
+        host="localhost", port=port,
+        certificate=CERT, private_key=KEY,
+        path="moq",
+        use_quic=use_quic,
+    )
+    server.register_handler(
         MOQTMessageType.SUBSCRIBE,
         _make_subscribe_handler(cache))
-    peer.register_handler(
+    server.register_handler(
         MOQTMessageType.FETCH,
         _make_fetch_handler(cache))
-
-    config = QuicConfiguration(
-        is_client=False,
-        alpn_protocols=H3_ALPN,
-        verify_mode=ssl.CERT_NONE,
-        max_data=2**24,
-        max_stream_data=2**24,
-        max_datagram_frame_size=64 * 1024,
-    )
-    config.load_cert_chain(CERT, KEY)
-
-    quic_server = await serve(
-        "localhost", port,
-        configuration=config,
-        create_protocol=lambda *a, **kw: MOQTSession(*a, **kw, session=peer),
-    )
-    return quic_server
+    return await server.serve()
 
 
-async def _connect_client(port: int):
+async def _connect_client(port: int, use_quic: bool = True):
     """Create a client connected to localhost."""
-    client = MOQTClient(
+    return MOQTClient(
         "localhost", port,
         path="moq",
+        use_quic=use_quic,
         verify_tls=False,
     )
-    return client
 
 
 # Use a base port and offset by test to avoid port conflicts
 _BASE_PORT = 14434
+
+
+@pytest.fixture(params=[True, False], ids=["use_quic", "wt"])
+def use_quic(request):
+    return request.param
 
 
 # ---------------------------------------------------------------------------
@@ -244,11 +229,11 @@ _BASE_PORT = 14434
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_joining_fetch_relative():
+async def test_joining_fetch_relative(use_quic):
     """RELATIVE_JOINING fetch: subscribe + join, verify fetched + live objects."""
-    port = _BASE_PORT + 1
+    port = _BASE_PORT + 1 + (0 if use_quic else 100)
     cache = FetchTestCache(num_groups=5, objects_per_group=10, object_size=64)
-    server = await _start_server(port, cache)
+    server = await _start_server(port, cache, use_quic)
 
     fetched_objects = []
     live_objects = []
@@ -260,7 +245,7 @@ async def test_joining_fetch_relative():
         live_objects.append((group_id, msg.object_id))
 
     try:
-        client = await _connect_client(port)
+        client = await _connect_client(port, use_quic)
         async with client.connect() as session:
             await session.client_session_init()
 
@@ -301,11 +286,11 @@ async def test_joining_fetch_relative():
 
 
 @pytest.mark.asyncio
-async def test_standalone_fetch():
+async def test_standalone_fetch(use_quic):
     """STANDALONE fetch: explicit range, verify exact objects returned."""
-    port = _BASE_PORT + 2
+    port = _BASE_PORT + 2 + (0 if use_quic else 100)
     cache = FetchTestCache(num_groups=5, objects_per_group=10, object_size=64)
-    server = await _start_server(port, cache)
+    server = await _start_server(port, cache, use_quic)
 
     fetched_objects = []
 
@@ -313,7 +298,7 @@ async def test_standalone_fetch():
         fetched_objects.append((msg.group_id, msg.object_id))
 
     try:
-        client = await _connect_client(port)
+        client = await _connect_client(port, use_quic)
         async with client.connect() as session:
             await session.client_session_init()
             session.on_fetch_object = on_fetch
@@ -344,14 +329,14 @@ async def test_standalone_fetch():
 
 
 @pytest.mark.asyncio
-async def test_fetch_invalid_range():
+async def test_fetch_invalid_range(use_quic):
     """FETCH with start > largest → FETCH_ERROR (INVALID_RANGE)."""
-    port = _BASE_PORT + 3
+    port = _BASE_PORT + 3 + (0 if use_quic else 100)
     cache = FetchTestCache(num_groups=5, objects_per_group=10, object_size=64)
-    server = await _start_server(port, cache)
+    server = await _start_server(port, cache, use_quic)
 
     try:
-        client = await _connect_client(port)
+        client = await _connect_client(port, use_quic)
         async with client.connect() as session:
             await session.client_session_init()
 
@@ -376,12 +361,12 @@ async def test_fetch_invalid_range():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_fetch_done_future():
+async def test_fetch_done_future(use_quic):
     """session._fetch_done_futures resolves when fetch stream FINs."""
-    port = _BASE_PORT + 4
+    port = _BASE_PORT + 4 + (0 if use_quic else 100)
     cache = FetchTestCache(num_groups=5, objects_per_group=10,
                            object_size=64)
-    server = await _start_server(port, cache)
+    server = await _start_server(port, cache, use_quic)
 
     fetched = []
     live = []
@@ -393,7 +378,7 @@ async def test_fetch_done_future():
         live.append((gid, msg.object_id))
 
     try:
-        client = await _connect_client(port)
+        client = await _connect_client(port, use_quic)
         async with client.connect() as session:
             await session.client_session_init()
 
@@ -432,12 +417,12 @@ async def test_fetch_done_future():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_fetch_start_equals_largest():
+async def test_fetch_start_equals_largest(use_quic):
     """Fetch where start == largest group — should return 1 group."""
-    port = _BASE_PORT + 5
+    port = _BASE_PORT + 5 + (0 if use_quic else 100)
     cache = FetchTestCache(num_groups=5, objects_per_group=10,
                            object_size=64)
-    server = await _start_server(port, cache)
+    server = await _start_server(port, cache, use_quic)
 
     fetched = []
 
@@ -445,7 +430,7 @@ async def test_fetch_start_equals_largest():
         fetched.append((msg.group_id, msg.object_id))
 
     try:
-        client = await _connect_client(port)
+        client = await _connect_client(port, use_quic)
         async with client.connect() as session:
             await session.client_session_init()
             session.on_fetch_object = on_fetch
@@ -469,12 +454,12 @@ async def test_fetch_start_equals_largest():
 
 
 @pytest.mark.asyncio
-async def test_fetch_single_object():
+async def test_fetch_single_object(use_quic):
     """Fetch a single object — smallest possible range."""
-    port = _BASE_PORT + 6
+    port = _BASE_PORT + 6 + (0 if use_quic else 100)
     cache = FetchTestCache(num_groups=5, objects_per_group=10,
                            object_size=64)
-    server = await _start_server(port, cache)
+    server = await _start_server(port, cache, use_quic)
 
     fetched = []
 
@@ -482,7 +467,7 @@ async def test_fetch_single_object():
         fetched.append((msg.group_id, msg.object_id))
 
     try:
-        client = await _connect_client(port)
+        client = await _connect_client(port, use_quic)
         async with client.connect() as session:
             await session.client_session_init()
             session.on_fetch_object = on_fetch
@@ -506,13 +491,13 @@ async def test_fetch_single_object():
 
 
 @pytest.mark.asyncio
-async def test_fetch_cancel_mid_stream():
+async def test_fetch_cancel_mid_stream(use_quic):
     """Tier 2: Send FETCH_CANCEL while server is pushing objects.
 
     Server uses a slow cache (delay between objects) so the client
     can cancel mid-stream and verify the stream terminates.
     """
-    port = _BASE_PORT + 7
+    port = _BASE_PORT + 7 + (0 if use_quic else 100)
     # Large cache so fetch takes a while
     cache = FetchTestCache(num_groups=10, objects_per_group=50,
                            object_size=128)
@@ -540,31 +525,20 @@ async def test_fetch_cancel_mid_stream():
                 buf = obj.serialize()
                 try:
                     session.stream_write(stream_id, buf.data)
-                    session.transmit()
                 except Exception:
                     return  # stream was reset
                 await asyncio.sleep(0.005)  # slow drip
 
         session.stream_write(stream_id, b'', end_stream=True)
-        session.transmit()
 
-    peer = MOQTPeer()
-    peer.path = "moq"
-    peer.register_handler(MOQTMessageType.FETCH, _slow_fetch)
-
-    config = QuicConfiguration(
-        is_client=False, alpn_protocols=H3_ALPN,
-        verify_mode=ssl.CERT_NONE,
-        max_data=2**24, max_stream_data=2**24,
-        max_datagram_frame_size=64 * 1024,
+    server = MOQTServer(
+        host="localhost", port=port,
+        certificate=CERT, private_key=KEY,
+        path="moq",
+        use_quic=use_quic,
     )
-    config.load_cert_chain(CERT, KEY)
-
-    server_handle = await serve(
-        "localhost", port, configuration=config,
-        create_protocol=lambda *a, **kw: MOQTSession(
-            *a, **kw, session=peer),
-    )
+    server.register_handler(MOQTMessageType.FETCH, _slow_fetch)
+    server_handle = await server.serve()
 
     fetched = []
 
@@ -572,7 +546,7 @@ async def test_fetch_cancel_mid_stream():
         fetched.append((msg.group_id, msg.object_id))
 
     try:
-        client = await _connect_client(port)
+        client = await _connect_client(port, use_quic)
         async with client.connect() as session:
             await session.client_session_init()
             session.on_fetch_object = on_fetch

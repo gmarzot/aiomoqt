@@ -4,25 +4,20 @@ Confirms that the aiomoqt client + server agree on the MoQT session
 handshake at each supported draft version, and that optional SETUP-time
 parameters (AUTH_TOKEN on PUBLISH_NAMESPACE) round-trip.
 
-Runs publisher + subscriber in a single process via qh3 on localhost.
-No relay needed.
+Runs publisher + subscriber in a single process via aiopquic on localhost.
+Parameterized over use_quic=True (raw QUIC) and use_quic=False (WT).
 """
 import asyncio
 import os
-import ssl
 
 import pytest
-
-from qh3.quic.configuration import QuicConfiguration
-from qh3.asyncio.server import serve
-from qh3.h3.connection import H3_ALPN
 
 from aiomoqt.types import (
     MOQTMessageType, ParamType,
     MOQT_VERSION_DRAFT14, MOQT_VERSION_DRAFT16,
 )
 from aiomoqt.client import MOQTClient
-from aiomoqt.protocol import MOQTPeer, MOQTSession
+from aiomoqt.server import MOQTServer
 
 
 _CERT_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'certs')
@@ -35,46 +30,39 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-async def _start_server(port: int, on_publish_namespace=None):
-    """Minimal loopback server that accepts SETUP and optionally handles
-    PUBLISH_NAMESPACE via the provided callback."""
-    peer = MOQTPeer()
-    peer.path = "moq"
-
+async def _start_server(port: int, draft_version, use_quic,
+                         on_publish_namespace=None):
+    server = MOQTServer(
+        host="localhost", port=port,
+        certificate=CERT, private_key=KEY,
+        path="moq",
+        use_quic=use_quic,
+        draft_version=draft_version,
+    )
     if on_publish_namespace is not None:
-        peer.register_handler(
+        server.register_handler(
             MOQTMessageType.PUBLISH_NAMESPACE, on_publish_namespace)
-
-    config = QuicConfiguration(
-        is_client=False,
-        alpn_protocols=H3_ALPN,
-        verify_mode=ssl.CERT_NONE,
-        max_data=2**24,
-        max_stream_data=2**24,
-        max_datagram_frame_size=64 * 1024,
-    )
-    config.load_cert_chain(CERT, KEY)
-
-    server = await serve(
-        "localhost", port,
-        configuration=config,
-        create_protocol=lambda *a, **kw:
-            MOQTSession(*a, **kw, session=peer),
-    )
-    return server
+    return await server.serve()
 
 
 _BASE_PORT = 14450
 
 
+@pytest.fixture(params=[True, False], ids=["use_quic", "wt"])
+def use_quic(request):
+    return request.param
+
+
 @pytest.mark.asyncio
-async def test_setup_draft14():
-    """Client with draft_version=14 completes session handshake."""
-    port = _BASE_PORT + 1
-    server = await _start_server(port)
+async def test_setup_draft14(use_quic):
+    """Client + server complete the d14 handshake on both transports."""
+    port = _BASE_PORT + (1 if use_quic else 4)
+    server = await _start_server(
+        port, draft_version=MOQT_VERSION_DRAFT14, use_quic=use_quic)
     try:
         client = MOQTClient(
             "localhost", port, path="moq",
+            use_quic=use_quic,
             verify_tls=False, draft_version=MOQT_VERSION_DRAFT14,
         )
         async with client.connect() as session:
@@ -86,13 +74,15 @@ async def test_setup_draft14():
 
 
 @pytest.mark.asyncio
-async def test_setup_draft16():
-    """Client with draft_version=16 completes session handshake."""
-    port = _BASE_PORT + 2
-    server = await _start_server(port)
+async def test_setup_draft16(use_quic):
+    """Client + server complete the d16 handshake on both transports."""
+    port = _BASE_PORT + (2 if use_quic else 5)
+    server = await _start_server(
+        port, draft_version=MOQT_VERSION_DRAFT16, use_quic=use_quic)
     try:
         client = MOQTClient(
             "localhost", port, path="moq",
+            use_quic=use_quic,
             verify_tls=False, draft_version=MOQT_VERSION_DRAFT16,
         )
         async with client.connect() as session:
@@ -104,9 +94,9 @@ async def test_setup_draft16():
 
 
 @pytest.mark.asyncio
-async def test_setup_auth_token_roundtrip():
+async def test_setup_auth_token_roundtrip(use_quic):
     """AUTH_TOKEN parameter on PUBLISH_NAMESPACE reaches the server."""
-    port = _BASE_PORT + 3
+    port = _BASE_PORT + (3 if use_quic else 6)
     received_tokens: list[bytes] = []
 
     async def _handle_pub_ns(session, msg):
@@ -115,10 +105,15 @@ async def test_setup_auth_token_roundtrip():
             received_tokens.append(token)
         session.publish_namepace_ok(msg)
 
-    server = await _start_server(port, on_publish_namespace=_handle_pub_ns)
+    server = await _start_server(
+        port, draft_version=MOQT_VERSION_DRAFT16, use_quic=use_quic,
+        on_publish_namespace=_handle_pub_ns)
     try:
-        client = MOQTClient("localhost", port, path="moq",
-                            verify_tls=False)
+        client = MOQTClient(
+            "localhost", port, path="moq",
+            use_quic=use_quic,
+            verify_tls=False, draft_version=MOQT_VERSION_DRAFT16,
+        )
         async with client.connect() as session:
             await session.client_session_init()
             await session.publish_namespace(

@@ -6,34 +6,11 @@ from functools import partial
 from typing import (Callable, DefaultDict, Dict, List, Optional, Set, Tuple,
                     Type, Union)
 
-from qh3.asyncio.protocol import QuicConnectionProtocol
-from qh3.h3.connection import (H3_ALPN, ErrorCode, H3Connection, Setting)
-from qh3.h3.events import HeadersReceived, WebTransportStreamDataReceived
-from qh3.quic.connection import (QuicConnection, QuicErrorCode,
-                                 stream_is_unidirectional)
-from qh3.quic.events import (DatagramFrameReceived, ProtocolNegotiated,
-                             QuicEvent, StopSendingReceived,
-                             StreamDataReceived, StreamReset)
-
-try:
-    from aiopquic.quic.events import (
-        DatagramFrameReceived as _AioPDatagramFrameReceived,
-        ProtocolNegotiated as _AioPProtocolNegotiated,
-        StopSendingReceived as _AioPStopSendingReceived,
-        StreamDataReceived as _AioPStreamDataReceived,
-        StreamReset as _AioPStreamReset,
-    )
-    _AnyDatagramFrameReceived = (DatagramFrameReceived, _AioPDatagramFrameReceived)
-    _AnyProtocolNegotiated = (ProtocolNegotiated, _AioPProtocolNegotiated)
-    _AnyStopSendingReceived = (StopSendingReceived, _AioPStopSendingReceived)
-    _AnyStreamDataReceived = (StreamDataReceived, _AioPStreamDataReceived)
-    _AnyStreamReset = (StreamReset, _AioPStreamReset)
-except ImportError:
-    _AnyDatagramFrameReceived = (DatagramFrameReceived,)
-    _AnyProtocolNegotiated = (ProtocolNegotiated,)
-    _AnyStopSendingReceived = (StopSendingReceived,)
-    _AnyStreamDataReceived = (StreamDataReceived,)
-    _AnyStreamReset = (StreamReset,)
+from aiopquic.quic.connection import QuicErrorCode, stream_is_unidirectional
+from aiopquic.quic.events import (
+    DatagramFrameReceived, ProtocolNegotiated, QuicEvent,
+    StopSendingReceived, StreamDataReceived, StreamReset,
+)
 
 from importlib.metadata import version
 
@@ -68,52 +45,6 @@ class MOQTStreamReject(Exception):
         self.reason = reason
     
 
-class H3CustomConnection(H3Connection):
-    """Custom H3Connection wrapper to support alternate SETTINGS"""
-
-    def __init__(self, quic: QuicConnection, table_capacity: int = 0,
-                 allow_optional_dgram: bool = False, **kwargs) -> None:
-        self._max_table_capacity = table_capacity
-        self._max_table_capacity_cfg = table_capacity
-        self._allow_optional_dgram = allow_optional_dgram
-        super().__init__(quic, **kwargs)
-        # report sent settings
-        settings = self.sent_settings
-        if settings is not None:
-            logger.debug("H3 SETTINGS sent:")
-            for setting_id, value in settings.items():
-                logger.debug(f"  Setting 0x{setting_id:x} = {value}")
-
-    def _validate_settings(self, settings: dict) -> None:
-        """Validate received H3 SETTINGS with a defensive H3_DATAGRAM remap.
-
-        Since qh3 1.7.2, SETTINGS_H3_DATAGRAM uses the RFC 9297 value
-        0x33 natively, and legacy 0xFFD277 from older peers still decodes
-        to the enum. The raw-0x33 remap here is belt-and-braces in case
-        a peer emits a bare int key the enum parser didn't recognize.
-        """
-        patched = dict(settings)
-        if 0x33 in patched and Setting.H3_DATAGRAM not in patched:
-            patched[Setting.H3_DATAGRAM] = patched.pop(0x33)
-        logger.debug(f"H3 SETTINGS received: { {(f'0x{k:x}' if isinstance(k, int) else k.name): v for k, v in patched.items()} }")
-        if self._allow_optional_dgram:
-            if (patched.get(Setting.ENABLE_WEBTRANSPORT) == 1
-                    and patched.get(Setting.H3_DATAGRAM) != 1):
-                logger.warning("H3: peer sent ENABLE_WEBTRANSPORT without "
-                               "H3_DATAGRAM — accepting (allow_optional_dgram=True)")
-                patched[Setting.H3_DATAGRAM] = 1
-        super()._validate_settings(patched)
-
-    @property
-    def _max_table_capacity(self):
-        return self._max_table_capacity_cfg
-
-    @_max_table_capacity.setter
-    def _max_table_capacity(self, value):
-        # Ignore the parent class attempt to set it
-        pass
-
-
 # base class for client and server session objects
 class MOQTPeer:
     """MOQT client and server base-class."""
@@ -130,10 +61,11 @@ class MOQTPeer:
 
 
 class _MOQTSessionMixin:
-    """MoQT session methods. Mix with a transport-specific
-    QuicConnectionProtocol (qh3 for WT, aiopquic for raw QUIC) to
-    instantiate. Concrete classes are MOQTSession and MOQTSessionQuic
-    defined at the end of this file.
+    """MoQT session methods. Mix with an aiopquic transport base —
+    QuicConnectionProtocol for raw QUIC, WebTransportSession (via
+    _WTSessionMixin) for WebTransport. Concrete classes are
+    MOQTSessionQuic / MOQTSessionWTClient / MOQTSessionWTServer at
+    the end of this file.
     """
 
     @property
@@ -151,17 +83,15 @@ class _MOQTSessionMixin:
     def __init__(self, *args, session: 'MOQTPeer', **kwargs):
         super().__init__(*args, **kwargs)
         self._session: MOQTPeer = session  # backref to session object with config
-        self._h3: Optional[H3Connection] = None
         self._session_id: Optional[int] = None
         self._control_stream_id: Optional[int] = None
         self._loop = asyncio.get_running_loop()
         self._wt_session_setup: Future[bool] = self._loop.create_future()
         # Raw-QUIC mode has no WT setup phase. Pre-resolve so
         # StreamDataReceived processing isn't gated on a never-resolved
-        # future (server side has no equivalent of HeadersReceived).
+        # future. WT mode resolves it in _moqt_wt_finalize().
         if getattr(session, 'use_quic', False):
             self._wt_session_setup.set_result(True)
-        self._wt_selected_protocol: Optional[str] = None
         self._moqt_version: int = MOQT_CUR_VERSION
         self._moqt_session_setup: Future[bool] = self._loop.create_future()
         self._moqt_session_closed: Future[Tuple[int,str]] = self._loop.create_future()
@@ -251,9 +181,14 @@ class _MOQTSessionMixin:
 
         Returns the OK response message. Raises MOQTRequestError if the
         response is an error (any draft version), or on timeout.
+        Honors a future pre-registered by the sender (see join()) so
+        responses arriving on the loopback hot path before the awaiter
+        registers don't get marked unsolicited.
         """
-        fut = self._loop.create_future()
-        self._pending_requests[request_id] = fut
+        fut = self._pending_requests.get(request_id)
+        if fut is None:
+            fut = self._loop.create_future()
+            self._pending_requests[request_id] = fut
         try:
             async with asyncio.timeout(timeout):
                 response = await fut
@@ -956,34 +891,17 @@ class _MOQTSessionMixin:
             self._close_session(SessionCloseCode.PROTOCOL_VIOLATION, error)
             return
     
-    # def transmit(self) -> None:
-    #     """Transmit pending data."""
-    #     logger.debug("Transmitting data")
-    #     super().transmit()
-
-    def connection_made(self, transport):
-        """Called when QUIC connection is established."""
-        super().connection_made(transport)
-        use_quic = getattr(self._session, 'use_quic', False)
-        logger.info(f"MOQT: session connection initialized: {use_quic}")
-        if not use_quic:
-            allow_dgram = getattr(self._session, 'allow_optional_dgram', False)
-            self._h3 = H3CustomConnection(
-                self._quic, enable_webtransport=True,
-                allow_optional_dgram=allow_dgram)
-            logger.info("H3 connection initialized")
-
     # primary event handling for all QUIC messaging
     def quic_event_received(self, event: QuicEvent) -> None:
         """Handle incoming QUIC events."""
-        
+
         event_class = class_name(event)
 
         # CONNECTION_CLOSE events terminate the session.
         # StopSendingReceived and StreamReset also have error_code but
         # are stream-level events handled below — do NOT catch them here.
         if (hasattr(event, 'error_code')
-                and not isinstance(event, _AnyStopSendingReceived + _AnyStreamReset)):
+                and not isinstance(event, (StopSendingReceived, StreamReset))):
             error = getattr(event, 'error_code', QuicErrorCode.INTERNAL_ERROR)
             reason = getattr(event, 'reason_phrase', event_class)
             if error == 0:
@@ -992,22 +910,13 @@ class _MOQTSessionMixin:
                 logger.error(f"QUIC error: code: {error} reason: {reason}")
             self._close_session(error, reason)
             return
-        
-        data_len = len(event.data) if hasattr(event, 'data') else 0
-        data = "<none>"
-        if data_len > 0:
-            data = event.data.hex()
-            
-        logger.debug(f"QUIC event: {event_class}: len: {data_len} bytes data: {data}")
-        
-        if isinstance(event, _AnyProtocolNegotiated):
-            # Enforce supported ALPN
+
+        if isinstance(event, ProtocolNegotiated):
+            # Enforce supported ALPN. WT path runs over H3 inside picoquic;
+            # only MoQT-on-raw-QUIC ALPNs surface here.
             alpn = event.alpn_protocol
-            if alpn in H3_ALPN:
-                logger.debug(f"QUIC event: ALPN ProtocolNegotiated: {alpn}")
-            elif alpn == MOQT_ALPN or (alpn and alpn.startswith("moqt-")):
+            if alpn == MOQT_ALPN or (alpn and alpn.startswith("moqt-")):
                 logger.debug(f"QUIC event: ALPN ProtocolNegotiated alpn: {alpn}")
-                # Set version from ALPN (draft-16+: version is ALPN-negotiated)
                 try:
                     version = moqt_version_from_alpn(alpn)
                     set_moqt_ctx_version(version)
@@ -1022,85 +931,66 @@ class _MOQTSessionMixin:
                     f"unsupported ALPN: {alpn}"
                 )
             return
-        elif isinstance(event, _AnyStreamDataReceived) and self._wt_session_setup.done():
+        elif isinstance(event, StreamDataReceived) and self._wt_session_setup.done():
             stream_id = event.stream_id
 
-            # WT session stream (CONNECT) — pass through to H3 for capsule processing
-            if stream_id == self._session_id:
-                logger.debug(f"MOQT event: WT session stream data({stream_id}): {len(event.data)} bytes 0x{event.data[:16].hex()}")
-                # fall through to H3 handler below
-
-            elif self._closed.is_set() or self._close_err is not None:
-                close_condition = f"MOQT: {self._close_err} QUIC: {self._closed.is_set()}"
-                logger.warning(f"QUIC event: stream data after close: " + close_condition)
+            if self._close_err is not None or (
+                    hasattr(self, '_closed') and self._closed.is_set()):
+                logger.warning(f"QUIC event: stream data after close: stream {stream_id}")
                 return
 
-            elif self._h3 is not None:
-                # WT mode: qh3 emits WebTransportStreamDataReceived for
-                # the WT-prefix-stripped payload. Bidi and uni are both
-                # routed in _h3_handle_wt_stream. The client-opened bidi
-                # case relies on _h3_bind_wt_bidi() at stream creation
-                # (QH3_WT_BIDI_WORKAROUND).
-                pass  # fall through to H3 dispatch below
+            data = event.data if event.data is not None else b""
 
-            # Raw-QUIC mode below: handle bidi/control/uni inline.
-            # Detect abrupt closure of critical streams
-            elif (event.end_stream and len(event.data) == 0 and
-                stream_id in [self._control_stream_id, self._session_id]):
+            # Abrupt close of a critical stream
+            if (event.end_stream and len(data) == 0 and
+                    stream_id in (self._control_stream_id, self._session_id)):
                 self._close_session(
                     SessionCloseCode.INTERNAL_ERROR,
                     f"critical stream closed by remote peer: {stream_id}"
                 )
                 return
 
-            else:
-                # Uni MoQT data streams: skip Buffer construction; the
-                # hot path runs through StreamChain (memoryview-native).
-                if stream_is_unidirectional(stream_id):
-                    self._on_stream_data(
-                        stream_id, event.data, event.end_stream)
-                    return
+            # Uni MoQT data streams: hot path through StreamChain
+            # (memoryview-native; no Buffer construction).
+            if stream_is_unidirectional(stream_id):
+                self._on_stream_data(
+                    stream_id, data, event.end_stream)
+                return
 
-                # Bidi/control: small messages. qh3.Buffer (Rust) wants
-                # bytes; aiopquic delivers memoryview, so coerce here.
-                # One short copy per control chunk, off the data hot path.
-                data = event.data
-                if not isinstance(data, (bytes, bytearray)):
-                    data = bytes(data)
-                msg_buf = Buffer(data=data)
-                msg_len = msg_buf.capacity
-                logger.debug(f"MOQT event: StreamDataReceived: stream: {stream_id} len: {msg_len}")
-
-                if self._control_stream_id is None:
-                    self._control_stream_id = stream_id
-                    logger.debug(f"QUIC event: detecting control stream: {stream_id}")
-                elif stream_id != self._control_stream_id:
-                    if is_draft16_or_later():
-                        self._handle_bidi_stream(stream_id, msg_buf, msg_len)
-                        return
-                    logger.warning(f"MOQT event: unrecognized bidirectional stream({stream_id}):")
-                    return
-
-                if stream_id == self._control_stream_id:
-                    while msg_buf.tell() < msg_len:
-                        msg = self._moqt_handle_control_message(msg_buf)
-                        if msg is None:
-                            error = f"control stream: parsing failed at position: {msg_buf.tell()} of {msg_len} bytes"
-                            logger.error(f"MOQT error: " + error)
-                            self._close_session(SessionCloseCode.PROTOCOL_VIOLATION, error)
-                            break
-                    return
-
-        elif isinstance(event, _AnyDatagramFrameReceived) and self._wt_session_setup.done():
-            msg_buf = Buffer(data=event.data)
+            # Bidi/control: small messages. aiopquic delivers memoryview;
+            # Buffer wants bytes for now.
+            if not isinstance(data, (bytes, bytearray)):
+                data = bytes(data)
+            msg_buf = Buffer(data=data)
             msg_len = msg_buf.capacity
-            logger.debug(f"MOQT event: DatagramFrameReceived: 0x{msg_buf.data_slice(0,min(msg_len,16)).hex()}")
-            # Strip WT Quarter Stream ID / Context ID (WebTransport only)
-            if self._h3 is not None:
-                msg_buf.pull_uint_var()
+            logger.debug(f"MOQT event: StreamDataReceived: stream: {stream_id} len: {msg_len}")
+
+            if self._control_stream_id is None:
+                self._control_stream_id = stream_id
+                logger.debug(f"QUIC event: detecting control stream: {stream_id}")
+            elif stream_id != self._control_stream_id:
+                if is_draft16_or_later():
+                    self._handle_bidi_stream(stream_id, msg_buf, msg_len)
+                    return
+                logger.warning(f"MOQT event: unrecognized bidirectional stream({stream_id})")
+                return
+
+            if stream_id == self._control_stream_id:
+                while msg_buf.tell() < msg_len:
+                    msg = self._moqt_handle_control_message(msg_buf)
+                    if msg is None:
+                        error = f"control stream: parsing failed at position: {msg_buf.tell()} of {msg_len} bytes"
+                        logger.error(f"MOQT error: " + error)
+                        self._close_session(SessionCloseCode.PROTOCOL_VIOLATION, error)
+                        break
+                return
+
+        elif isinstance(event, DatagramFrameReceived) and self._wt_session_setup.done():
+            msg_buf = Buffer(data=event.data)
+            logger.debug(f"MOQT event: DatagramFrameReceived: 0x{msg_buf.data_slice(0,min(msg_buf.capacity,16)).hex()}")
             self._moqt_handle_data_dgram(msg_buf)
             return
-        elif isinstance(event, _AnyStopSendingReceived):
+        elif isinstance(event, StopSendingReceived):
             logger.debug(f"MOQT event: StopSendingReceived: stream {event.stream_id}")
             self._quic.reset_stream(stream_id=event.stream_id, error_code=event.error_code)
             self._unbind_stream(event.stream_id)
@@ -1110,7 +1000,7 @@ class _MOQTSessionMixin:
                 self._stream_tasks[event.stream_id].cancel()
                 del self._stream_tasks[event.stream_id]
             return
-        elif isinstance(event, _AnyStreamReset):
+        elif isinstance(event, StreamReset):
             logger.debug(f"MOQT event: StreamReset: stream {event.stream_id}")
             self._unbind_stream(event.stream_id)
             if event.stream_id in self._data_streams:
@@ -1120,184 +1010,7 @@ class _MOQTSessionMixin:
                 del self._stream_tasks[event.stream_id]
             return
 
-        # Pass remaining events to H3
-        if self._h3 is not None:
-            settings = self._h3.received_settings
-            try:
-                logger.debug(f"MOQT event: h3 processing: {event_class} len: {data_len}")
-                if hasattr(event, "stream_id"):
-                    logger.debug(f"MOQT event: H3 stream: {event.stream_id} {stream_is_unidirectional(event.stream_id)}")
-                for h3_event in self._h3.handle_event(event):
-                    logger.debug(f"MOQT event: h3 processing: {h3_event.__class__.__name__}")
-                    self._h3_handle_event(h3_event)
-                # Check if settings just received
-                if self._h3.received_settings != settings:
-                    settings = self._h3.received_settings
-                    logger.debug(f"H3 event: SETTINGS received:")
-                    if settings is not None:
-                        for setting_id, value in settings.items():
-                            logger.debug(f"  Setting 0x{setting_id:x} = {value}")
-            except Exception as e:
-                logger.error(f"H3 error: error handling event: {e}")
-                raise
-        else:
-            logger.debug(f"QUIC event: event not handled({event_class})")
-  
-    def _h3_handle_event(self, event: QuicEvent) -> None:
-        """Handle H3-specific events."""
-        logger.debug(f"H3 event: _h3_handle_event {event}")
-        if isinstance(event, HeadersReceived):
-            return self._h3_handle_headers_received(event)
-        if isinstance(event, WebTransportStreamDataReceived):
-            self._h3_handle_wt_stream(event)
-            return
-        msg_class = class_name(event)
-        data = getattr(event, 'data', None)
-        hex_data = f"0x{data.hex()}" if data is not None else "<no data>"
-        stream_id = getattr(event, 'stream_id', '?')
-        logger.debug(f"H3 event: stream {stream_id}: {msg_class}: {hex_data}")
-
-    def _h3_handle_wt_stream(
-            self, event: WebTransportStreamDataReceived) -> None:
-        """Dispatch WT stream data (qh3 strips the 2-varint prefix).
-
-        Uni streams carry MoQT subgroup/fetch payloads. The first
-        peer-initiated bidi stream is the MoQT control stream;
-        subsequent bidi streams carry d16 request/response pairs.
-        Client-opened bidi streams are tagged by _h3_bind_wt_bidi()
-        so this path also sees their peer replies correctly
-        (QH3_WT_BIDI_WORKAROUND).
-        """
-        stream_id = event.stream_id
-
-        if stream_id == self._session_id:
-            # WT CONNECT stream — qh3 manages it internally
-            return
-
-        # Uni MoQT data stream (subgroup / fetch)
-        if stream_is_unidirectional(stream_id):
-            self._on_stream_data(
-                stream_id, event.data, event.stream_ended)
-            return
-
-        # First bidi event with payload is the MoQT control stream
-        # (only used server-side; client sets _control_stream_id at
-        # create_webtransport_stream time via client_session_init).
-        if self._control_stream_id is None and event.data:
-            self._control_stream_id = stream_id
-            logger.debug(
-                f"H3 event: detecting MoQT control stream: {stream_id}")
-
-        if not event.data:
-            # Lifecycle event (empty FIN etc.) — QUIC-level close /
-            # StreamReset covers real error cases elsewhere.
-            return
-
-        msg_buf = Buffer(data=event.data)
-        msg_len = msg_buf.capacity
-
-        if stream_id == self._control_stream_id:
-            while msg_buf.tell() < msg_len:
-                msg = self._moqt_handle_control_message(msg_buf)
-                if msg is None:
-                    error = (f"control stream: parsing failed at "
-                             f"position: {msg_buf.tell()} of {msg_len} bytes")
-                    logger.error(f"MOQT error: " + error)
-                    self._close_session(
-                        SessionCloseCode.PROTOCOL_VIOLATION, error)
-                    break
-            return
-
-        # Non-control bidi (d16 SUBSCRIBE_NAMESPACE etc.)
-        if is_draft16_or_later():
-            self._handle_bidi_stream(stream_id, msg_buf, msg_len)
-            return
-
-        logger.warning(
-            f"H3 event: unrecognized bidirectional stream({stream_id})")
-
-    def _h3_handle_headers_received(self, event: HeadersReceived) -> None:
-        """Process incoming H3 headers."""
-        method = None
-        protocol = None
-        path = None
-        authority = None
-        status = None
-        is_client = self._is_client
-        stream_id = event.stream_id
-        logger.info(f"H3 event: HeadersReceived: session id: {stream_id} is_client: {is_client} ")
-        for name, value in event.headers:
-            logger.debug(f"  {name.decode()}: {value.decode()}")
-            if name == b":method":
-                method = value
-            elif name == b":protocol":
-                protocol = value
-            elif name == b":path":
-                path = value
-            elif name == b":authority":
-                authority = value
-            elif name == b':status':
-                status = value
-
-        if is_client:
-            if status == b"200":
-                # Capture WT protocol negotiation result
-                # Server may use wt-protocol or wt-selected-protocol
-                for name, value in event.headers:
-                    if name in (b"wt-protocol", b"wt-selected-protocol"):
-                        self._wt_selected_protocol = value.decode().strip('"')
-                        logger.info(f"H3 event: {name.decode()}: {self._wt_selected_protocol}")
-                logger.debug(f"H3 event: WebTransport client session setup: session id: {stream_id}")
-                self._wt_session_setup.set_result(True)
-            else:
-                error = f"WebTransport session setup failed ({status})"
-                logger.error(f"H3 error: stream {stream_id}: " + error)
-                self._close_session(ErrorCode.H3_CONNECT_ERROR, error)
-        else:
-            # Server: Handle incoming WebTransport CONNECT request
-            if method == b"CONNECT" and protocol == b"webtransport":
-                if self._path_match(path):
-                    self._session_id = stream_id
-                    # Send 200 response with WebTransport headers
-                    response_headers = [
-                        (b":status", b"200"),
-                        (b"server", USER_AGENT.encode()),
-                        (b"sec-webtransport-http3-draft", b"draft02"),
-                    ]
-                    self._h3.send_headers(
-                        stream_id=stream_id,
-                        headers=response_headers,
-                        end_stream=False
-                    )
-                    self.transmit()
-                    logger.debug(f"H3 event: WebTransport server session setup: session id: {stream_id}")
-                    self._wt_session_setup.set_result(True)
-                else:
-                    # Endpoint doesn't match, return 404
-                    logger.warning(f"H3 event: path not found: {path}")
-                    error_headers = [
-                        (b":status", b"404"),
-                        (b"server", USER_AGENT.encode()),
-                    ]
-                    self._h3.send_headers(
-                        stream_id=stream_id,
-                        headers=error_headers,
-                        end_stream=True
-                    )
-                    self.transmit()
-            else:
-                # Unsupported HTTP transaction
-                logger.warning(f"H3 event: path not found: {path}")
-                error_headers = [
-                    (b":status", b"500"),
-                    (b"server", USER_AGENT.encode()),
-                ]
-                self._h3.send_headers(
-                    stream_id=stream_id,
-                    headers=error_headers,
-                    end_stream=True
-                )
-                self.transmit()
+        logger.debug(f"QUIC event: event not handled({event_class})")
 
     def _close_session(self, 
               error_code: SessionCloseCode = SessionCloseCode.NO_ERROR, 
@@ -1354,22 +1067,16 @@ class _MOQTSessionMixin:
                     self._quic.send_stream_data(
                         stream_id, b"", end_stream=True)
             self._data_streams.clear()
-            self.transmit()  # flush FINs before CONNECTION_CLOSE
         except Exception:
             pass  # best-effort during teardown
 
-        if self._h3 is not None and self._session_id is not None:
-            logger.debug(f"H3 session: closing: {class_name(self._h3)} "
-                         f"({self._session_id})")
-            self._session_id = None
-        self._h3 = None
+        self._session_id = None
 
         # set the async exit condition for session
         if not self._moqt_session_closed.done():
             self._moqt_session_closed.set_result((error_code, reason_phrase))
         # close QUIC connection
         super().close()
-        self.transmit()
         
     async def async_closed(self) -> bool:
         if not self._moqt_session_closed.done():
@@ -1383,87 +1090,32 @@ class _MOQTSessionMixin:
         use_quic = self._session.use_quic
         params = {}
         if use_quic:
-            # Raw QUIC flow
+            # Raw QUIC flow. _wt_session_setup is pre-resolved in __init__.
             logger.info(f"MOQT: Using raw QUIC transport")
-            # _wt_session_setup pre-resolved in __init__ for raw-QUIC mode
-
-            # Create MoQT control stream (raw QUIC bidirectional stream)
-            self._control_stream_id = self._quic.get_next_available_stream_id(is_unidirectional=False)
-            logger.info(f"MOQT: QUIC control stream created stream id: {self._control_stream_id}")
-            
-            # CLIENT_SETUP parameters for raw QUIC (include PATH/AUTHORITY)
+            self._control_stream_id = self._quic.get_next_available_stream_id(
+                is_unidirectional=False)
+            logger.info(
+                f"MOQT: QUIC control stream created stream id: "
+                f"{self._control_stream_id}")
             req_path = self._session.path or ""
             params[SetupParamType.PATH] = f"/{req_path}"
-            params[SetupParamType.AUTHORITY] = f"{self._session.host}:{self._session.port}"
+            params[SetupParamType.AUTHORITY] = (
+                f"{self._session.host}:{self._session.port}")
         else:
-            # WebTransport over H3 flow
-            self._session_id = self._h3._quic.get_next_available_stream_id(is_unidirectional=False)
-            # Create WebTransport session
-            host = self._session.host
-            port = self._session.port
-            # Build WT CONNECT headers
+            # WebTransport over aiopquic. The WT session is open by the
+            # time client_session_init runs (open() awaited already);
+            # _wt_session_setup is resolved in _moqt_wt_finalize. Open
+            # the MoQT control bidi stream and pin the version from
+            # draft (in-band wt-available-protocols negotiation isn't
+            # wired for v0.9.0; picowt supports it).
             draft = getattr(self._session, 'draft_version', None)
-            headers = [
-                (b":method", b"CONNECT"),
-                (b":scheme", b"https"),
-                (b":authority", f"{host}:{port}".encode()),
-                (b":path", f"/{self._session.path or ''}".encode()),
-                (b":protocol", b"webtransport"),
-                (b"sec-webtransport-http3-draft", b"draft02"),
-                (b"user-agent", USER_AGENT.encode()),
-            ]
-            # For draft-15+, include wt-available-protocols to negotiate
-            # the MoQT version over WT. RFC 8941 quoted string.
-            # Draft-14 predates this header — version negotiation is
-            # entirely in-band via CLIENT_SETUP version array.
-            if draft is not None and get_major_version(draft) >= 15:
-                wt_proto = moqt_alpn_for_version(draft)
-                headers.append(
-                    (b"wt-available-protocols", f'"{wt_proto}"'.encode()),
-                )
-
-            logger.info(f"H3 send: WebTransport CONNECT: session id: {self._session_id}")
-            for name, value in headers:
-                logger.debug(f"  {name.decode()}: {value.decode()}")
-
-            self._h3.send_headers(stream_id=self._session_id, headers=headers, end_stream=False)
-            self.transmit()
-
-            # Wait for WebTransport session establishment
-            try:
-                async with asyncio.timeout(timeout):
-                    result = await self._wt_session_setup
-                result = "SUCCESS" if result else "FAILED"
-                logger.info(f"H3 event: WebTransport setup: {result}")
-            except asyncio.TimeoutError:
-                error = f"WebTransport session establishment timeout: {timeout} sec"
-                logger.error("H3 error: " + error)
-                self._close_session(SessionCloseCode.CONTROL_MESSAGE_TIMEOUT, error)
-                raise MOQTException(*self._close_err)
-
-            # Check for H3 connection close
-            if self._close_err is not None:
-                raise MOQTException(*self._close_err)
-
-            # Set version context based on WT protocol negotiation
-            if self._wt_selected_protocol:
-                # Server negotiated a specific MoQT version via WT
-                version = moqt_version_from_alpn(self._wt_selected_protocol)
-                set_moqt_ctx_version(version)
-                self._moqt_version = version
-                logger.info(f"MOQT: version set from WT protocol: "
-                            f"{self._wt_selected_protocol} -> 0x{version:x}")
-            elif draft is not None:
-                # Server didn't echo protocol — fall back to d14 in-band
-                logger.info(f"MOQT: WT protocol not negotiated, "
-                            f"falling back to in-band version negotiation")
-                set_moqt_ctx_version(MOQT_VERSION_DRAFT14)
-                self._moqt_version = MOQT_VERSION_DRAFT14
-
-            # Create MoQT control stream
-            self._control_stream_id = self._h3.create_webtransport_stream(session_id=self._session_id)
-            self._h3_bind_wt_bidi(self._control_stream_id)  # QH3_WT_BIDI_WORKAROUND
-            logger.info(f"MOQT: WT control stream created stream id: {self._control_stream_id}")
+            if draft is not None:
+                set_moqt_ctx_version(draft)
+                self._moqt_version = draft
+            self._control_stream_id = await self.open_bidi_stream()
+            logger.info(
+                f"MOQT: WT control stream created stream id: "
+                f"{self._control_stream_id}")
 
         # Send CLIENT_SETUP
         params[SetupParamType.MAX_REQUEST_ID] = 10000
@@ -1501,51 +1153,19 @@ class _MOQTSessionMixin:
 
 
 
-    # =====================================================================
-    # BEGIN QH3_WT_BIDI_WORKAROUND
-    # qh3 (and aioquic) up to 1.7.2: create_webtransport_stream() for bidi
-    # writes the WT 2-varint prefix outbound but never populates the H3
-    # stream's frame_type / session_id. Peer replies on our client-opened
-    # bidi WT streams therefore don't trigger the WT shortcut at
-    # qh3/h3/connection.py:_receive_request_or_push_data, so inbound data
-    # arrives mis-parsed (qh3 consumes the first two varints as
-    # frame_type + frame_size). Mirror what qh3 *would* have set if it
-    # tracked client-opened bidi WT state.
-    #
-    # Remove this helper and its call sites once qh3 >= <FIXED-VERSION>
-    # lands the same fix inside create_webtransport_stream. Upstream
-    # tracker: <aioquic-issue-url> / <qh3-issue-url>.
-    # =====================================================================
-    def _h3_bind_wt_bidi(self, stream_id: int) -> None:
-        """Tag a client-opened bidi WT stream in qh3's internal state
-        so incoming data is routed as WebTransport payload."""
-        if self._h3 is None:
-            return
-        from qh3.h3.connection import H3Stream, FrameType
-        h3 = self._h3
-        h3s = h3._stream.get(stream_id)
-        if h3s is None:
-            h3s = H3Stream(stream_id)
-            h3._stream[stream_id] = h3s
-        h3s.frame_type = FrameType.WEBTRANSPORT_STREAM
-        h3s.session_id = self._session_id
-    # END QH3_WT_BIDI_WORKAROUND
-
     async def open_uni_stream(self) -> int:
         """Open a unidirectional data stream. Returns the stream ID."""
-        if self._h3 is not None:
-            return self._h3.create_webtransport_stream(
-                session_id=self._session_id, is_unidirectional=True)
-        return self._quic.get_next_available_stream_id(is_unidirectional=True)
+        if getattr(self._session, 'use_quic', False):
+            return self._quic.get_next_available_stream_id(is_unidirectional=True)
+        # aiopquic-WT: round-trip to picoquic for stream-id allocation
+        return await self.create_stream(bidir=False)
 
     async def open_bidi_stream(self) -> int:
         """Open a bidirectional stream. Returns the stream ID."""
-        if self._h3 is not None:
-            stream_id = self._h3.create_webtransport_stream(
-                session_id=self._session_id, is_unidirectional=False)
-            self._h3_bind_wt_bidi(stream_id)  # QH3_WT_BIDI_WORKAROUND
-            return stream_id
-        return self._quic.get_next_available_stream_id(is_unidirectional=False)
+        if getattr(self._session, 'use_quic', False):
+            return self._quic.get_next_available_stream_id(is_unidirectional=False)
+        # aiopquic-WT
+        return await self.create_stream(bidir=True)
 
     def stream_write(self, stream_id: int, data: bytes, end_stream: bool = False) -> None:
         """Write data to a stream. No-op if stream is reset or FIN'd."""
@@ -1559,46 +1179,20 @@ class _MOQTSessionMixin:
     def _stream_is_writable(self, stream_id: int) -> bool:
         """Check if a stream is still writable (not reset or FIN'd).
 
-        Probes qh3-internal stream state when available. aiopquic owns
-        stream state in picoquic and doesn't expose it; in that case
-        return True and let send_stream_data raise on a bad stream
-        (caught by the wrapper).
+        aiopquic owns stream state in picoquic and doesn't expose it,
+        so return True optimistically; send_stream_data raises on a
+        bad stream and the caller swallows it.
         """
-        streams = getattr(self._quic, '_streams', None)
-        if streams is None:
-            return True
-        stream = streams.get(stream_id)
-        if stream is None:
-            return True  # stream not yet registered — allow write
-        if stream.sender._reset_error_code is not None:
-            return False
-        if stream.sender._buffer_fin is not None:
-            return False  # FIN already queued (close() sent it)
         return True
 
     async def stream_write_drain(self, stream_id: int, data: bytes,
                                  end_stream: bool = False) -> None:
-        """Write data to a stream, respecting QUIC congestion control.
+        """Write data to a stream, yielding when the SPSC TX ring is full.
 
-        Waits for the congestion window to have capacity before writing,
-        preventing buffer bloat and relay overload. Returns silently if
-        the stream has been reset or FIN'd (e.g. by close()).
+        aiopquic owns congestion control on its picoquic pthread; we
+        only need to backpressure on the SPSC TX ring (BufferError)
+        when Python pushes faster than picoquic drains.
         """
-        if not self._stream_is_writable(stream_id):
-            return
-
-        # Wait for congestion window to have space (qh3 path).
-        loss = getattr(self._quic, '_loss', None)
-        if loss is not None:
-            while loss.bytes_in_flight >= loss.congestion_window:
-                self.transmit()
-                await asyncio.sleep(0.001)
-                if not self._stream_is_writable(stream_id):
-                    return
-
-        # aiopquic owns CC on its picoquic pthread, but its SPSC TX
-        # ring can fill if Python pushes faster than picoquic drains.
-        # Yield to asyncio on BufferError so the pthread can catch up.
         while True:
             try:
                 self._quic.send_stream_data(
@@ -1606,8 +1200,6 @@ class _MOQTSessionMixin:
                 return
             except BufferError:
                 await asyncio.sleep(0.0001)
-                if not self._stream_is_writable(stream_id):
-                    return
 
     def send_control_message(self, buf: Buffer) -> None:
         """Send a MoQT message on the control stream."""
@@ -1620,13 +1212,11 @@ class _MOQTSessionMixin:
             data=buf.data,
             end_stream=False
         )
-        self.transmit()
 
     def _handle_bidi_stream(self, stream_id: int, buf: Buffer, buf_len: int) -> None:
         """Handle d16 bidirectional stream messages (SUBSCRIBE_NAMESPACE,
-        responses). The WT 2-varint prefix is stripped upstream — by qh3
-        for WT mode, and absent in raw QUIC — so this handler always
-        sees clean MoQT payload.
+        responses). aiopquic delivers clean MoQT payload either way —
+        WT prefix is stripped in C; raw QUIC has no prefix.
         """
         request_id = self._bidi_stream_requests.get(stream_id)
         if request_id is not None:
@@ -1846,6 +1436,9 @@ class _MOQTSessionMixin:
             parameters=parameters,
         )
         self._subscriptions[sub_request_id] = [sub_msg]
+        # Pre-register response futures before send so loopback / low-RTT
+        # peers can't resolve them before our awaiter registers.
+        self._pending_requests[sub_request_id] = self._loop.create_future()
         logger.info(f"MOQT send: {sub_msg}")
         self.send_control_message(sub_msg.serialize())
 
@@ -1860,6 +1453,7 @@ class _MOQTSessionMixin:
             parameters=dict(parameters),
         )
         self._subscriptions[fetch_request_id] = [fetch_msg]
+        self._pending_requests[fetch_request_id] = self._loop.create_future()
         # Pre-register the fetch-done future before sending so we
         # don't miss the stream FIN in fast-completion scenarios.
         self._fetch_done_futures[fetch_request_id] = \
@@ -2025,10 +1619,16 @@ class _MOQTSessionMixin:
         self,
         msg: PublishNamespace,
     ) -> Optional[MOQTMessage]:
-        """Create and send a ANNOUNCE_OK response."""
-        message = PublishNamespaceOk(
-            request_id=msg.request_id,
-        )
+        """Send a positive response to PUBLISH_NAMESPACE.
+
+        Draft-14 sends PublishNamespaceOk on code point 0x07.
+        Draft-16+ reuses 0x07 as REQUEST_OK (universal positive
+        response — adds Num Parameters).
+        """
+        if is_draft16_or_later():
+            message = RequestOk(request_id=msg.request_id)
+        else:
+            message = PublishNamespaceOk(request_id=msg.request_id)
         logger.info(f"MOQT send: {message} request_id: {msg.request_id} namespace: {msg.namespace}")
         self.send_control_message(message.serialize())
         return message
@@ -2578,95 +2178,84 @@ class _MOQTSessionMixin:
     }
 
 
-class MOQTSession(_MOQTSessionMixin, QuicConnectionProtocol):
-    """qh3-backed MoQT session — used for WebTransport over H3."""
+from aiopquic.asyncio.protocol import (
+    QuicConnectionProtocol as _AioPQuicConnectionProtocol,
+)
+from aiopquic.asyncio.webtransport import (
+    WebTransportClient as _AioPWTClient,
+    WebTransportServerSession as _AioPWTServerSession,
+)
+
+
+class MOQTSessionQuic(_MOQTSessionMixin, _AioPQuicConnectionProtocol):
+    """aiopquic-backed MoQT session — used for raw QUIC (use_quic=True)."""
     pass
 
 
-MOQTSessionQuic: Optional[Type[_MOQTSessionMixin]] = None
-MOQTSessionWTClient: Optional[Type[_MOQTSessionMixin]] = None
-MOQTSessionWTServer: Optional[Type[_MOQTSessionMixin]] = None
-try:
-    from aiopquic.asyncio.protocol import (
-        QuicConnectionProtocol as _AioPQuicConnectionProtocol,
-    )
-    from aiopquic.asyncio.webtransport import (
-        WebTransportClient as _AioPWTClient,
-        WebTransportServerSession as _AioPWTServerSession,
-    )
+class _WTSessionMixin:
+    """Shared init for WT-base MOQTSession subclasses.
 
-    class MOQTSessionQuic(_MOQTSessionMixin, _AioPQuicConnectionProtocol):  # type: ignore[no-redef]
-        """aiopquic-backed MoQT session — used for raw QUIC (use_quic=True)."""
-        pass
+    Sets self._quic = self so the mixin's transport-agnostic
+    send-side calls (self._quic.send_stream_data etc.) land on
+    WebTransportSession's matching API. Resolves
+    self._wt_session_setup once the WT session is established
+    (set on the server at construction; on the client by open()
+    after the CONNECT round-trip).
+    """
 
+    def _moqt_wt_finalize(self) -> None:
+        self._quic = self
+        if not self._wt_session_setup.done():
+            self._wt_session_setup.set_result(True)
 
-    class _WTSessionMixin:
-        """Shared init for WT-base MOQTSession subclasses.
-
-        Sets self._quic = self so the mixin's transport-agnostic
-        send-side calls (self._quic.send_stream_data etc.) land on
-        WebTransportSession's matching API. Pre-resolves
-        self._wt_session_setup since the WT session is established
-        at construction (server) or by open() (client, after the
-        CONNECT round-trip).
-        """
-
-        def _moqt_wt_finalize(self) -> None:
-            self._quic = self
-            if not self._wt_session_setup.done():
-                self._wt_session_setup.set_result(True)
-
-        def _on_event(self, ev_tuple) -> None:
-            """Translate WT-specific events into the QuicEvent classes
-            the mixin's quic_event_received already handles, then
-            dispatch through that path. Falls back to WebTransportSession
-            base handling for session-level signals (ready/closed)."""
-            super()._on_event(ev_tuple)
-            evt_type, sid, data, _is_fin, error_code, _cnx, _ = ev_tuple
-            from aiopquic.quic.events import (
-                StreamDataReceived as _SD, StreamReset as _SR,
-                StopSendingReceived as _SS, DatagramFrameReceived as _DG,
-            )
-            from aiopquic.asyncio.webtransport import (
-                _EVT_WT_STREAM_DATA, _EVT_WT_STREAM_FIN,
-                _EVT_WT_STREAM_RESET, _EVT_WT_STOP_SENDING,
-                _EVT_WT_DATAGRAM,
-            )
-            if evt_type == _EVT_WT_STREAM_DATA:
-                self.quic_event_received(_SD(stream_id=sid, data=data,
-                                              end_stream=False))
-            elif evt_type == _EVT_WT_STREAM_FIN:
-                self.quic_event_received(_SD(stream_id=sid, data=data,
-                                              end_stream=True))
-            elif evt_type == _EVT_WT_STREAM_RESET:
-                self.quic_event_received(_SR(stream_id=sid,
-                                              error_code=error_code))
-            elif evt_type == _EVT_WT_STOP_SENDING:
-                self.quic_event_received(_SS(stream_id=sid,
-                                              error_code=error_code))
-            elif evt_type == _EVT_WT_DATAGRAM:
-                self.quic_event_received(_DG(data=data))
+    def _on_event(self, ev_tuple) -> None:
+        """Translate WT-specific events into the QuicEvent classes
+        the mixin's quic_event_received already handles, then
+        dispatch through that path. Falls back to WebTransportSession
+        base handling for session-level signals (ready/closed)."""
+        super()._on_event(ev_tuple)
+        evt_type, sid, data, _is_fin, error_code, _cnx, _ = ev_tuple
+        from aiopquic.quic.events import (
+            StreamDataReceived as _SD, StreamReset as _SR,
+            StopSendingReceived as _SS, DatagramFrameReceived as _DG,
+        )
+        from aiopquic.asyncio.webtransport import (
+            _EVT_WT_STREAM_DATA, _EVT_WT_STREAM_FIN,
+            _EVT_WT_STREAM_RESET, _EVT_WT_STOP_SENDING,
+            _EVT_WT_DATAGRAM,
+        )
+        if evt_type == _EVT_WT_STREAM_DATA:
+            self.quic_event_received(_SD(stream_id=sid, data=data,
+                                          end_stream=False))
+        elif evt_type == _EVT_WT_STREAM_FIN:
+            self.quic_event_received(_SD(stream_id=sid, data=data,
+                                          end_stream=True))
+        elif evt_type == _EVT_WT_STREAM_RESET:
+            self.quic_event_received(_SR(stream_id=sid,
+                                          error_code=error_code))
+        elif evt_type == _EVT_WT_STOP_SENDING:
+            self.quic_event_received(_SS(stream_id=sid,
+                                          error_code=error_code))
+        elif evt_type == _EVT_WT_DATAGRAM:
+            self.quic_event_received(_DG(data=data))
 
 
-    class MOQTSessionWTClient(
-            _WTSessionMixin, _MOQTSessionMixin, _AioPWTClient):  # type: ignore[no-redef]
-        """aiopquic-backed MoQT session — initiator-side WT (client)."""
+class MOQTSessionWTClient(
+        _WTSessionMixin, _MOQTSessionMixin, _AioPWTClient):
+    """aiopquic-backed MoQT session — initiator-side WT (client)."""
 
-        def __init__(self, transport, host: str, port: int, path: str,
-                     sni: Optional[str] = None, *,
-                     session: 'MOQTPeer'):
-            super().__init__(transport, host, port, path,
-                             sni=sni, session=session)
-            self._moqt_wt_finalize()
+    def __init__(self, transport, host: str, port: int, path: str,
+                 sni: Optional[str] = None, *,
+                 session: 'MOQTPeer'):
+        super().__init__(transport, host, port, path,
+                         sni=sni, session=session)
+        self._moqt_wt_finalize()
 
 
-    class MOQTSessionWTServer(
-            _WTSessionMixin, _MOQTSessionMixin, _AioPWTServerSession):  # type: ignore[no-redef]
-        """aiopquic-backed MoQT session — acceptor-side WT (server)."""
+class MOQTSessionWTServer(
+        _WTSessionMixin, _MOQTSessionMixin, _AioPWTServerSession):
+    """aiopquic-backed MoQT session — acceptor-side WT (server)."""
 
-        def __init__(self, transport, state, *, session: 'MOQTPeer'):
-            super().__init__(transport, state, session=session)
-            self._moqt_wt_finalize()
-
-except ImportError:
-    pass
+    def __init__(self, transport, state, *, session: 'MOQTPeer'):
+        super().__init__(transport, state, session=session)
+        self._moqt_wt_finalize()

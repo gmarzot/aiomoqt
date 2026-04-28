@@ -5,12 +5,7 @@ sends one stream of N bytes, awaits the echo, records elapsed.
 Sweeps through a target rate to characterize the latency floor +
 distribution.
 
-Selects backend with --backend qh3|aiopquic. qh3 path uses
-qh3.asyncio.{client,server}; aiopquic path uses
-aiopquic.asyncio.{client,server} + the SPSC bridge.
-
 Args:
-  --backend qh3|aiopquic    transport (default aiopquic)
   --n-bytes N               echo payload size (default 64)
   --rate R                  target echoes/sec (default 1000)
   --duration S              measurement window (default 5)
@@ -28,63 +23,13 @@ import time
 from aiomoqt.tests.microbench._stats import Stats
 
 
-# Locate certs relative to the aiopquic dir (we know the layout)
 AIOPQUIC = os.environ.get(
     'AIOPQUIC_DIR', '/home/gmarzot/Projects/moq/aiopquic')
 CERT = os.path.join(AIOPQUIC, 'third_party/picoquic/certs/cert.pem')
 KEY = os.path.join(AIOPQUIC, 'third_party/picoquic/certs/key.pem')
 
 
-# ---------------- qh3 path ----------------
-async def _qh3_run(args):
-    from qh3.quic.configuration import QuicConfiguration
-    from qh3.asyncio.server import serve
-    from qh3.asyncio.client import connect
-    from qh3.quic.events import StreamDataReceived
-    from qh3.asyncio.protocol import QuicConnectionProtocol
-
-    class EchoServer(QuicConnectionProtocol):
-        def quic_event_received(self, event):
-            if isinstance(event, StreamDataReceived):
-                # Echo back on the same stream id
-                self._quic.send_stream_data(
-                    event.stream_id, event.data, end_stream=event.end_stream)
-
-    class EchoClient(QuicConnectionProtocol):
-        def __init__(self, *a, **kw):
-            super().__init__(*a, **kw)
-            self.echoes: dict[int, asyncio.Future] = {}
-
-        def quic_event_received(self, event):
-            if isinstance(event, StreamDataReceived):
-                fut = self.echoes.get(event.stream_id)
-                if fut and not fut.done():
-                    fut.set_result(event.data)
-
-    server_cfg = QuicConfiguration(is_client=False, alpn_protocols=['echo'])
-    server_cfg.load_cert_chain(CERT, KEY)
-
-    client_cfg = QuicConfiguration(
-        is_client=True, alpn_protocols=['echo'],
-        verify_mode=ssl.CERT_NONE,
-    )
-
-    s = await serve(
-        host='127.0.0.1', port=args.port,
-        configuration=server_cfg,
-        create_protocol=EchoServer,
-    )
-    try:
-        async with connect('127.0.0.1', args.port,
-                           configuration=client_cfg,
-                           create_protocol=EchoClient) as client:
-            await _drive_rtt(client, args, qh3=True)
-    finally:
-        s.close()
-
-
-# ---------------- aiopquic path ----------------
-async def _aiopquic_run(args):
+async def _run(args):
     from aiopquic.quic.configuration import QuicConfiguration
     from aiopquic.asyncio.server import serve
     from aiopquic.asyncio.client import connect
@@ -127,13 +72,13 @@ async def _aiopquic_run(args):
         async with connect('127.0.0.1', args.port,
                            configuration=client_cfg,
                            create_protocol=EchoClient) as client:
-            await _drive_rtt(client, args, qh3=False)
+            await _drive_rtt(client, args)
     finally:
         if hasattr(server, 'close'):
             server.close()
 
 
-async def _drive_rtt(client, args, *, qh3: bool):
+async def _drive_rtt(client, args):
     # Warmup: a few echoes to amortize first-stream costs
     for _ in range(20):
         sid = client._quic.get_next_available_stream_id()
@@ -141,8 +86,6 @@ async def _drive_rtt(client, args, *, qh3: bool):
         client.echoes[sid] = fut
         client._quic.send_stream_data(sid, b'x' * args.n_bytes,
                                        end_stream=True)
-        if qh3:
-            client.transmit()
         await asyncio.wait_for(fut, timeout=2.0)
 
     interval = 1.0 / args.rate
@@ -152,7 +95,6 @@ async def _drive_rtt(client, args, *, qh3: bool):
     next_send = time.perf_counter()
     payload = b'x' * args.n_bytes
     while time.perf_counter() < end:
-        # Pace
         now = time.perf_counter()
         if now < next_send:
             await asyncio.sleep(next_send - now)
@@ -161,8 +103,6 @@ async def _drive_rtt(client, args, *, qh3: bool):
         client.echoes[sid] = fut
         t0 = time.perf_counter_ns()
         client._quic.send_stream_data(sid, payload, end_stream=True)
-        if qh3:
-            client.transmit()
         try:
             await asyncio.wait_for(fut, timeout=2.0)
         except asyncio.TimeoutError:
@@ -173,7 +113,7 @@ async def _drive_rtt(client, args, *, qh3: bool):
         sent += 1
         next_send += interval
 
-    print(f"backend: {'qh3' if qh3 else 'aiopquic'}  "
+    print(f"backend: aiopquic  "
           f"rate={args.rate}/s payload={args.n_bytes}B  "
           f"sent={sent}")
     print(f"  {stats.summary(unit='ms')}")
@@ -181,8 +121,6 @@ async def _drive_rtt(client, args, *, qh3: bool):
 
 def main():
     ap = argparse.ArgumentParser(description="Round-trip stream latency")
-    ap.add_argument('--backend', choices=['qh3', 'aiopquic'],
-                    default='aiopquic')
     ap.add_argument('--n-bytes', type=int, default=64)
     ap.add_argument('--rate', type=int, default=1000,
                     help='target echoes/sec')
@@ -193,14 +131,9 @@ def main():
     if not (os.path.exists(CERT) and os.path.exists(KEY)):
         print(f"ERROR: server cert/key not found at {CERT} / {KEY}",
               file=sys.stderr)
-        print("Set AIOPQUIC_DIR or place certs at "
-              "<aiopquic>/third_party/picoquic/certs/", file=sys.stderr)
         sys.exit(1)
 
-    if args.backend == 'qh3':
-        asyncio.run(_qh3_run(args))
-    else:
-        asyncio.run(_aiopquic_run(args))
+    asyncio.run(_run(args))
 
 
 if __name__ == '__main__':

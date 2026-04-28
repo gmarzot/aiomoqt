@@ -1,7 +1,22 @@
 from dataclasses import fields
+
+import pytest
+
 from aiomoqt.messages import MOQTMessageType
 from aiomoqt.context import set_moqt_ctx_version, get_moqt_ctx_version
-from aiomoqt.types import MOQT_VERSION_DRAFT14, MOQT_VERSION_DRAFT16
+from aiomoqt.types import (
+    MOQT_CUR_VERSION, MOQT_VERSION_DRAFT14, MOQT_VERSION_DRAFT16,
+)
+
+
+@pytest.fixture(autouse=True)
+def _reset_moqt_version():
+    """Restore the global MoQT version context after each test.
+    Session tests (MOQTClient.connect) set the version as a side
+    effect; without this fixture the leaked state breaks later tests
+    that assume the default draft."""
+    yield
+    set_moqt_ctx_version(MOQT_CUR_VERSION)
 
 
 def moqt_test_id(case):
