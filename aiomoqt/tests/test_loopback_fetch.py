@@ -120,7 +120,7 @@ def _make_fetch_handler(cache: FetchTestCache):
         )
 
         # Open uni stream and write FETCH_HEADER + objects
-        stream_id = session.open_uni_stream()
+        stream_id = await session.open_uni_stream()
         header = FetchHeader(request_id=request_id)
         session.stream_write(stream_id, header.serialize().data)
 
@@ -163,7 +163,7 @@ def _make_subscribe_handler(cache: FetchTestCache):
 
         # Start generating "live" objects from next group
         live_group = cache.largest_group + 1
-        stream_id = session.open_uni_stream()
+        stream_id = await session.open_uni_stream()
         header = SubgroupHeader(
             track_alias=track_alias,
             group_id=live_group,
@@ -526,7 +526,7 @@ async def test_fetch_cancel_mid_stream():
             largest_object_id=cache.largest_object,
             group_order=GroupOrder.ASCENDING,
         )
-        stream_id = session.open_uni_stream()
+        stream_id = await session.open_uni_stream()
         header = FetchHeader(request_id=request_id)
         session.stream_write(stream_id, header.serialize().data)
 

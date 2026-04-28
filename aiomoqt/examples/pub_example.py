@@ -139,7 +139,7 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
     logger = get_logger(__name__)
     I_FRAME_PAD = b'I' * object_size
     P_FRAME_PAD = b'P' * object_size
-    stream_id = session.open_uni_stream()
+    stream_id = await session.open_uni_stream()
     logger.info(f"MOQT app: created data stream({stream_id}): subgroup: {subgroup_id}")
 
     next_frame_time = time.monotonic()
@@ -173,7 +173,7 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
                         del session._stream_tasks[stream_id]
 
                     # Create new stream for next group
-                    stream_id = session.open_uni_stream()
+                    stream_id = await session.open_uni_stream()
 
                 # Start new subgroup header — tracks object_id and delta state
                 header = SubgroupHeader(

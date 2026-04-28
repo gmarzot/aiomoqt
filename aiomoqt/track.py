@@ -309,7 +309,7 @@ class PublishedTrack(Track):
                   and not getattr(self, '_quiet', False))
 
         cur_obj_id = subgroup_id
-        stream_id = session.open_uni_stream()
+        stream_id = await session.open_uni_stream()
         self._stream_count += 1
 
         local_sent = 0
@@ -343,7 +343,7 @@ class PublishedTrack(Track):
                             session._stream_tasks[stream_id].cancel()
                             del session._stream_tasks[stream_id]
 
-                        stream_id = session.open_uni_stream()
+                        stream_id = await session.open_uni_stream()
                         self._stream_count += 1
 
                     header = SubgroupHeader(
@@ -704,7 +704,7 @@ class VideoTrack(PublishedTrack):
         report = (subgroup_id == 0)
 
         cur_obj_id = subgroup_id
-        stream_id = session.open_uni_stream()
+        stream_id = await session.open_uni_stream()
         local_sent = 0
 
         # Pre-generate padding per frame type
@@ -735,7 +735,7 @@ class VideoTrack(PublishedTrack):
                             session._stream_tasks[stream_id].cancel()
                             del session._stream_tasks[stream_id]
 
-                        stream_id = session.open_uni_stream()
+                        stream_id = await session.open_uni_stream()
                         self._stream_count += 1
 
                     header = SubgroupHeader(

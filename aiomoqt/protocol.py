@@ -1519,14 +1519,14 @@ class _MOQTSessionMixin:
         h3s.session_id = self._session_id
     # END QH3_WT_BIDI_WORKAROUND
 
-    def open_uni_stream(self) -> int:
+    async def open_uni_stream(self) -> int:
         """Open a unidirectional data stream. Returns the stream ID."""
         if self._h3 is not None:
             return self._h3.create_webtransport_stream(
                 session_id=self._session_id, is_unidirectional=True)
         return self._quic.get_next_available_stream_id(is_unidirectional=True)
 
-    def open_bidi_stream(self) -> int:
+    async def open_bidi_stream(self) -> int:
         """Open a bidirectional stream. Returns the stream ID."""
         if self._h3 is not None:
             stream_id = self._h3.create_webtransport_stream(
@@ -2036,7 +2036,7 @@ class _MOQTSessionMixin:
         self.send_control_message(message.serialize())
         return message
 
-    def subscribe_namespace(
+    async def subscribe_namespace(
         self,
         namespace_prefix: str,
         parameters: Optional[Dict[int, bytes]] = None,
@@ -2065,7 +2065,7 @@ class _MOQTSessionMixin:
         logger.info(f"MOQT send: {message}")
 
         if is_draft16_or_later():
-            stream_id = self.open_bidi_stream()
+            stream_id = await self.open_bidi_stream()
             buf = message.serialize()
             self.stream_write(stream_id, buf.data)
             self.transmit()

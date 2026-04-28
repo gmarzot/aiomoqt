@@ -41,7 +41,7 @@ def _make_subscribe_handler(num_objects: int, object_size: int):
         )
         track_alias = ok.track_alias
         group_id = 0
-        stream_id = session.open_uni_stream()
+        stream_id = await session.open_uni_stream()
         header = SubgroupHeader(
             track_alias=track_alias,
             group_id=group_id,
