@@ -69,16 +69,41 @@ class MOQTMessage:
                     buf.push_bytes(ext_value)
 
     exts_err_count = 0
+    EXTENSIONS_LEN_LIMIT = 1024 * 16
+
     @staticmethod
     def _extensions_decode(buf: Buffer, with_length: bool = True,
                            buf_end: int = None) -> Dict[int, Union[int, bytes]]:
         exts = {}
         if with_length:
+            pos_before = buf.tell()
             exts_len = buf.pull_uint_var()
-            if exts_len > (1024*16):
+            if exts_len > MOQTMessage.EXTENSIONS_LEN_LIMIT:
+                # Framer has lost alignment: this varint is being read
+                # from a position that doesn't actually point at an
+                # extensions block. Returning silently here ratchets
+                # the desync — caller advances past garbage and reads
+                # more garbage. Raise so the outer loop terminates the
+                # stream cleanly via STOP_SENDING.
                 MOQTMessage.exts_err_count += 1
-                logger.warning(f"MOQTMessage._extensions_decode(): corrupted buffer : ext_len: {exts_len} count: {MOQTMessage.exts_err_count}")
-                return exts
+                if MOQTMessage.exts_err_count == 1:
+                    # First-corruption diagnostic — dump anchor bytes
+                    # so the misalignment can be reverse-engineered.
+                    try:
+                        cap = buf.capacity
+                        head = buf.data_slice(0, min(64, cap)).hex()
+                    except Exception:
+                        head = "<unavailable>"
+                    logger.error(
+                        "MOQT framer desync: ext_len=%d at pos=%d "
+                        "(cap=%d) head_hex=%s",
+                        exts_len, pos_before, cap, head,
+                    )
+                raise RuntimeError(
+                    f"framer desync: ext_len={exts_len} exceeds "
+                    f"limit {MOQTMessage.EXTENSIONS_LEN_LIMIT} "
+                    f"at pos={pos_before}"
+                )
             if exts_len == 0:
                 return exts
             exts_end = buf.tell() + exts_len

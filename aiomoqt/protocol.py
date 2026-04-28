@@ -605,6 +605,12 @@ class _MOQTSessionMixin:
                     )
 
                 consumed = chain.tell()  # bytes parsed since save() (= 0)
+                # Diagnostic: remember last successful parse before
+                # commit, so a downstream framer-desync can dump it.
+                self._last_parse_consumed = consumed
+                self._last_parse_obj_id = (
+                    msg_obj.object_id if hasattr(msg_obj, 'object_id') else None
+                )
                 chain.commit()  # drop consumed prefix; tell() reset to 0
 
                 if isinstance(msg_obj, ObjectHeader):
