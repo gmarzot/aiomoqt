@@ -136,6 +136,18 @@ class _MOQTSessionMixin:
     defined at the end of this file.
     """
 
+    @property
+    def _is_client(self) -> bool:
+        """Transport-agnostic is-client signal. Raw-QUIC bases expose
+        self._quic.configuration.is_client; WT bases expose
+        self.is_client directly."""
+        quic = getattr(self, '_quic', None)
+        if quic is not None:
+            cfg = getattr(quic, 'configuration', None)
+            if cfg is not None:
+                return cfg.is_client
+        return self.is_client
+
     def __init__(self, *args, session: 'MOQTPeer', **kwargs):
         super().__init__(*args, **kwargs)
         self._session: MOQTPeer = session  # backref to session object with config
@@ -153,7 +165,7 @@ class _MOQTSessionMixin:
         self._moqt_version: int = MOQT_CUR_VERSION
         self._moqt_session_setup: Future[bool] = self._loop.create_future()
         self._moqt_session_closed: Future[Tuple[int,str]] = self._loop.create_future()
-        self._next_request_id = 0 if self._quic.configuration.is_client else 1
+        self._next_request_id = 0 if self._is_client else 1
         self._next_track_alias = 0
         # Per-stream queues feeding _process_data_stream. Each entry is
         # an incoming chunk (bytes or memoryview) or None as FIN sentinel.
@@ -1211,7 +1223,7 @@ class _MOQTSessionMixin:
         path = None
         authority = None
         status = None
-        is_client = self._quic.configuration.is_client
+        is_client = self._is_client
         stream_id = event.stream_id
         logger.info(f"H3 event: HeadersReceived: session id: {stream_id} is_client: {is_client} ")
         for name, value in event.headers:
@@ -1324,7 +1336,7 @@ class _MOQTSessionMixin:
         # Only FIN streams we own the write side of — sending
         # end_stream on peer-initiated uni streams produces
         # RESET_STREAM which confuses relays.
-        is_client = self._quic.configuration.is_client
+        is_client = self._is_client
         try:
             if self._control_stream_id is not None:
                 self._quic.send_stream_data(
@@ -2165,7 +2177,7 @@ class _MOQTSessionMixin:
     async def _handle_server_setup(self, msg: ServerSetup) -> None:
         logger.info(f"MOQT event: handle {msg}")
 
-        if not self._quic.configuration.is_client:
+        if not self._is_client:
             error = "MOQT event: received SERVER_SETUP message as server"
             logger.debug(error)
             self._close_session(
@@ -2202,7 +2214,7 @@ class _MOQTSessionMixin:
     async def _handle_client_setup(self, msg: ClientSetup) -> None:
         logger.info(f"MOQT event: handle {msg}")
         # Send SERVER_SETUP in response
-        if self._quic.configuration.is_client:
+        if self._is_client:
             error = "MOQT event: received CLIENT_SETUP message as client"
             logger.error(error)
             self._close_session(
