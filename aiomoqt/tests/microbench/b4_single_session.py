@@ -228,6 +228,8 @@ def main():
     ap.add_argument('--rate', type=float, default=100.0,
                     help='objects/sec target')
     ap.add_argument('--object-size', type=int, default=4096)
+    ap.add_argument('--subgroups', type=int, default=1,
+                    help='subgroups per group (each = separate QUIC stream)')
     ap.add_argument('--duration', type=float, default=30.0)
     ap.add_argument('--port', type=int, default=47445)
     args = ap.parse_args()

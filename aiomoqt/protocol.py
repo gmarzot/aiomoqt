@@ -1569,10 +1569,7 @@ class _MOQTSessionMixin:
         if not self._stream_is_writable(stream_id):
             return
 
-        # Wait for congestion window to have space (qh3 only).
-        # aiopquic owns CC inside picoquic and applies stream-level
-        # flow control on the picoquic thread; send_stream_data blocks
-        # internally if the window is closed, so no Python-side gating.
+        # Wait for congestion window to have space (qh3 path).
         loss = getattr(self._quic, '_loss', None)
         if loss is not None:
             while loss.bytes_in_flight >= loss.congestion_window:
@@ -1581,7 +1578,18 @@ class _MOQTSessionMixin:
                 if not self._stream_is_writable(stream_id):
                     return
 
-        self._quic.send_stream_data(stream_id, data, end_stream=end_stream)
+        # aiopquic owns CC on its picoquic pthread, but its SPSC TX
+        # ring can fill if Python pushes faster than picoquic drains.
+        # Yield to asyncio on BufferError so the pthread can catch up.
+        while True:
+            try:
+                self._quic.send_stream_data(
+                    stream_id, data, end_stream=end_stream)
+                return
+            except BufferError:
+                await asyncio.sleep(0.0001)
+                if not self._stream_is_writable(stream_id):
+                    return
 
     def send_control_message(self, buf: Buffer) -> None:
         """Send a MoQT message on the control stream."""
