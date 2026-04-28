@@ -3,18 +3,20 @@ parser dispatch).
 
 Measures raw extend / pull_uint_var / pull_bytes / commit cycles
 per second. Isolates the accumulator cost from the rest of the
-parser. Run on each branch (`main` for re_buf+qh3.Buffer, this
-branch for StreamChain) and diff.
+parser. Two backends:
 
-Two tests:
-  - varint heavy: many small pulls, exercises pull_uint_var path.
-  - bulk pull: pull_bytes(N) with N large, exercises memcpy/slice.
+  - StreamChain: chunked PEP-3118 model (push memoryview chunks,
+    walk across boundaries). The aiomoqt RX hot path.
+  - Buffer: single-contiguous-buffer model (push_bytes once, walk).
+    Mirrors the qh3.Buffer-era accumulator shape — kept as baseline
+    so we can spot regressions in either lane.
 
 Args:
   --n-objects N      objects-per-stream worth of bytes (default 1000)
   --payload-size N   bytes per object (default 4096)
   --chunk-size N     ingest chunk size, 0 = single shot (default 1500)
   --duration S       seconds per test (default 3)
+  --accumulator      streamchain | buffer | both  (default both)
 """
 from __future__ import annotations
 
@@ -62,37 +64,34 @@ def _bench_streamchain(data: bytes, chunk_size: int, duration: float):
     return iterations, bytes_consumed
 
 
-def _bench_qh3_buffer(data: bytes, chunk_size: int, duration: float):
-    """Benchmark qh3 Buffer + re_buf-style accumulation."""
-    from qh3._hazmat import Buffer
+def _bench_buffer(data: bytes, chunk_size: int, duration: float):
+    """Benchmark aiopquic Buffer in the single-contiguous accumulator
+    pattern. Push all chunks once, seek(0), walk."""
+    from aiopquic.buffer import Buffer
     chunks = chunked(data, chunk_size) if chunk_size else [data]
     n_bytes = len(data)
     end = time.perf_counter() + duration
     iterations = 0
     bytes_consumed = 0
     while time.perf_counter() < end:
-        # re_buf approximation: concat all chunks into one Buffer
-        # before walking. (The real re_buf uses seek(0)+push_bytes,
-        # but for steady-state accumulator throughput the cost shape
-        # is similar.)
-        re_buf = Buffer(capacity=n_bytes + 1024)
+        buf = Buffer(capacity=n_bytes + 1024)
         for c in chunks:
-            re_buf.push_bytes(c)
-        re_buf.seek(0)
+            buf.push_bytes(c)
+        buf.seek(0)
         try:
-            re_buf.pull_uint_var()
-            re_buf.pull_uint_var()
-            re_buf.pull_uint_var()
-            re_buf.pull_uint_var()
-            re_buf.pull_uint8()
-            cap = re_buf.capacity
-            while re_buf.tell() < cap:
-                re_buf.pull_uint_var()
-                payload_len = re_buf.pull_uint_var()
+            buf.pull_uint_var()
+            buf.pull_uint_var()
+            buf.pull_uint_var()
+            buf.pull_uint_var()
+            buf.pull_uint8()
+            cap = buf.capacity
+            while buf.tell() < cap:
+                buf.pull_uint_var()
+                payload_len = buf.pull_uint_var()
                 if payload_len > 0:
-                    re_buf.pull_bytes(payload_len)
+                    buf.pull_bytes(payload_len)
                 else:
-                    re_buf.pull_uint_var()
+                    buf.pull_uint_var()
         except Exception:
             pass
         iterations += 1
@@ -106,7 +105,8 @@ def main():
     ap.add_argument('--payload-size', type=int, default=4096)
     ap.add_argument('--chunk-size', type=int, default=1500)
     ap.add_argument('--duration', type=float, default=3.0)
-    ap.add_argument('--accumulator', choices=['streamchain', 'qh3', 'both'],
+    ap.add_argument('--accumulator',
+                    choices=['streamchain', 'buffer', 'both'],
                     default='both')
     args = ap.parse_args()
 
@@ -123,17 +123,14 @@ def main():
               f"= {rate:,.0f} streams/s, {mbps:,.0f} Mbps "
               f"({rate * args.n_objects:,.0f} obj/s)")
 
-    if args.accumulator in ('qh3', 'both'):
-        try:
-            iters, bytes_done = _bench_qh3_buffer(
-                data, args.chunk_size, args.duration)
-            rate = iters / args.duration
-            mbps = (bytes_done * 8) / (args.duration * 1e6)
-            print(f"qh3.Buffer:  {iters:,} iters in {args.duration}s "
-                  f"= {rate:,.0f} streams/s, {mbps:,.0f} Mbps "
-                  f"({rate * args.n_objects:,.0f} obj/s)")
-        except ImportError:
-            print("qh3.Buffer:  (qh3 not installed, skipping)")
+    if args.accumulator in ('buffer', 'both'):
+        iters, bytes_done = _bench_buffer(
+            data, args.chunk_size, args.duration)
+        rate = iters / args.duration
+        mbps = (bytes_done * 8) / (args.duration * 1e6)
+        print(f"buffer:      {iters:,} iters in {args.duration}s "
+              f"= {rate:,.0f} streams/s, {mbps:,.0f} Mbps "
+              f"({rate * args.n_objects:,.0f} obj/s)")
 
 
 if __name__ == '__main__':
