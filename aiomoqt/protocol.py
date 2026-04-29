@@ -1713,6 +1713,10 @@ class _MOQTSessionMixin:
             namespace=namespace_tuple,
             parameters=parameters or {}
         )
+        # Pre-register response future before send so a fast peer can't
+        # resolve before the awaiter registers (race we hit in join()).
+        if wait_response:
+            self._pending_requests[request_id] = self._loop.create_future()
         logger.info(f"MOQT send: {message}")
         self.send_control_message(message.serialize())
 

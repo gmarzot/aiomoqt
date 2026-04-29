@@ -57,6 +57,12 @@ class _RollingStats:
         self._lost = 0
         self._total_bytes = 0
         self._total_objs = 0
+        # Per-snapshot deltas — snapshot() returns bytes/objs/loss
+        # since the last call so the consumer can sum across its own
+        # window without double-counting our rolling window.
+        self._last_total_bytes = 0
+        self._last_total_objs = 0
+        self._last_lost = 0
 
     def on_object(self, msg, size_bytes, recv_time_us):
         """Timestamps on the wire are us; lat is float ms."""
@@ -91,24 +97,28 @@ class _RollingStats:
                 self._last_seen[key] = oid
 
     def snapshot(self) -> dict:
+        """Per-snapshot delta. rx_bytes / rx_objs / iv_lost cover the
+        time since the last snapshot — the consumer can sum them over
+        its own window without double-counting our rolling window.
+        Latency stats stay windowed (need samples for percentiles)."""
         t = time.monotonic()
         cutoff = t - self.window_s
         while self._events and self._events[0][0] < cutoff:
             self._events.popleft()
-        n = len(self._events)
-        if n == 0:
-            return dict(t=t, rx_bytes=0, rx_objs=0,
-                        lat_mean_ms=0.0, lat_p90_ms=0.0,
-                        loss=self._lost,
-                        total_bytes=self._total_bytes,
-                        total_objs=self._total_objs)
-        total_bytes = sum(e[1] for e in self._events)
+        # Latency from the rolling window
         lats = sorted(e[2] for e in self._events if e[2] is not None)
         mean = sum(lats) / len(lats) if lats else 0.0
         p90 = lats[min(int(len(lats) * 0.90), len(lats) - 1)] if lats else 0.0
-        return dict(t=t, rx_bytes=total_bytes, rx_objs=n,
+        # Bytes / objs / loss as DELTAS since last call
+        iv_bytes = self._total_bytes - self._last_total_bytes
+        iv_objs = self._total_objs - self._last_total_objs
+        iv_lost = self._lost - self._last_lost
+        self._last_total_bytes = self._total_bytes
+        self._last_total_objs = self._total_objs
+        self._last_lost = self._lost
+        return dict(t=t, rx_bytes=iv_bytes, rx_objs=iv_objs,
                     lat_mean_ms=mean, lat_p90_ms=p90,
-                    loss=self._lost,
+                    iv_lost=iv_lost, loss=self._lost,
                     total_bytes=self._total_bytes,
                     total_objs=self._total_objs)
 
