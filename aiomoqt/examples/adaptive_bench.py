@@ -612,6 +612,8 @@ class SubsActuator:
         worst_p90 = 0.0
         worst_mean = 0.0
         max_loss_pct = 0.0
+        jitter_sum = 0.0
+        jitter_n = 0
 
         self._t_last_observe = now
 
@@ -629,6 +631,10 @@ class SubsActuator:
             worst_p90 = max(worst_p90, p90)
             worst_mean = max(worst_mean, mean)
             max_loss_pct = max(max_loss_pct, lpct)
+            jit = s.get('jitter_ms')
+            if jit is not None:
+                jitter_sum += jit
+                jitter_n += 1
 
         target_subs = len(self._workers)
         active_subs = len(active_ids)
@@ -647,6 +653,7 @@ class SubsActuator:
             health = "ok"
 
         target_mbps = target_subs * self.per_sub_mbps
+        avg_jitter_ms = jitter_sum / jitter_n if jitter_n else 0.0
         return Signal(
             t=now,
             level=float(target_subs),
@@ -657,6 +664,7 @@ class SubsActuator:
             target_mbps=target_mbps,
             tx_mbps=target_mbps,   # single publisher; assume delivers
             rx_mbps=rx_bps_total / 1e6,
+            jitter_ms=avg_jitter_ms,
             target_subs=target_subs,
             active_subs=active_subs,
             failed_subs=failed_this_window,
