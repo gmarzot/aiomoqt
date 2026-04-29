@@ -1,8 +1,16 @@
+import os
 from enum import IntEnum
 from dataclasses import dataclass, field
 from sortedcontainers import SortedDict
 from typing import Optional, Dict, List, Tuple, Union
 import time
+
+# Set AIOMOQT_STRICT_SERIALIZE=1 to enable per-object payload-length
+# self-check in ObjectHeader.serialize (catches publisher-side
+# declared-vs-actual byte mismatches that surface downstream as
+# 'framer desync ext_len exceeds limit'). Off by default; one extra
+# tell() per object on the hot path, so leave it gated.
+_STRICT_SERIALIZE = bool(int(os.environ.get('AIOMOQT_STRICT_SERIALIZE', '0')))
 
 from . import (MOQTUnderflow, MOQTMessage, ObjectStatus, DataStreamType,
                MOQT_DEFAULT_PRIORITY, BUF_SIZE,
@@ -244,8 +252,26 @@ class ObjectHeader(MOQTMessage):
             MOQTMessage._extensions_encode(buf, None)  # empty extensions
 
         if self.status == ObjectStatus.NORMAL and self.payload:
+            len_pos = buf.tell()
             buf.push_uint_var(payload_len)
+            len_varint_bytes = buf.tell() - len_pos
+            payload_pos = buf.tell()
             buf.push_bytes(self.payload)
+            actual_payload_bytes = buf.tell() - payload_pos
+            # Strict-serialize check (env-gated, hot-path-cheap):
+            # catches publisher-side payload_len/actual-bytes mismatch
+            # at the moment of mis-serialization — far easier than
+            # reverse-engineering from a downstream framer-desync.
+            if (_STRICT_SERIALIZE
+                    and actual_payload_bytes != payload_len):
+                raise AssertionError(
+                    f"ObjectHeader.serialize payload mismatch: "
+                    f"declared payload_len={payload_len} "
+                    f"(varint {len_varint_bytes}B), "
+                    f"actually wrote {actual_payload_bytes}B; "
+                    f"object_id={self.object_id} "
+                    f"payload_type={type(self.payload).__name__}"
+                )
         else:
             buf.push_uint_var(0)  # Zero length
             buf.push_uint_var(self.status)  # Status code
