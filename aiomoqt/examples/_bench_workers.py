@@ -58,17 +58,18 @@ class _RollingStats:
         self._total_bytes = 0
         self._total_objs = 0
 
-    def on_object(self, msg, size_bytes, recv_time_ms):
+    def on_object(self, msg, size_bytes, recv_time_us):
+        """Timestamps on the wire are us; lat is float ms."""
         t = time.monotonic()
         lat_ms = None
         exts = getattr(msg, 'extensions', None) or {}
-        send_ms = exts.get(0x20)
-        if send_ms is not None and recv_time_ms is not None:
-            raw = recv_time_ms - send_ms
+        send_us = exts.get(0x20)
+        if send_us is not None and recv_time_us is not None:
+            raw_us = recv_time_us - send_us
             # Reject negatives + absurd values from deframer garbage;
             # accept up to 10 minutes (real under-load latency).
-            if -1000 <= raw <= 600_000:
-                lat_ms = raw
+            if -1_000_000 <= raw_us <= 600_000_000:
+                lat_ms = raw_us / 1000.0
         self._events.append((t, size_bytes, lat_ms))
         self._total_bytes += size_bytes
         self._total_objs += 1
