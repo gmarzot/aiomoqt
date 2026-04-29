@@ -85,7 +85,7 @@ async def generate_group_dgram(session: MOQTSession, track_alias: int, priority:
                         object_id=object_id,
                         publisher_priority=priority,
                         status=ObjectStatus.END_OF_GROUP,
-                        extensions={MOQT_TIMESTAMP_EXT: int(time.time()*1000)}
+                        extensions={MOQT_TIMESTAMP_EXT: int(time.time() * 1_000_000)}
                     )
                     msg = obj.serialize()
                     if session._close_err is not None:
@@ -107,7 +107,7 @@ async def generate_group_dgram(session: MOQTSession, track_alias: int, priority:
                 group_id=group_id,
                 object_id=object_id,
                 publisher_priority=priority,
-                extensions={MOQT_TIMESTAMP_EXT: int(time.time()*1000)},
+                extensions={MOQT_TIMESTAMP_EXT: int(time.time() * 1_000_000)},
                 payload=payload,
                 end_of_group=(object_id == GROUP_SIZE - 1),
             )
@@ -155,7 +155,7 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
 
                 # End the previous group
                 if header is not None:
-                    extensions = {MOQT_TIMESTAMP_EXT: int(time.time()*1000)} if use_extensions else None
+                    extensions = {MOQT_TIMESTAMP_EXT: int(time.time() * 1_000_000)} if use_extensions else None
                     buf = header.end_group(extensions=extensions)
                     if session._close_err:
                         raise asyncio.CancelledError
@@ -201,7 +201,7 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
                 payload = (info + P_FRAME_PAD)[:object_size]
 
             # Send next object — delta encoding handled automatically
-            extensions = {MOQT_TIMESTAMP_EXT: int(time.time()*1000)} if use_extensions else None
+            extensions = {MOQT_TIMESTAMP_EXT: int(time.time() * 1_000_000)} if use_extensions else None
             buf = header.next_object(payload=payload, extensions=extensions)
 
             if session._close_err is not None:

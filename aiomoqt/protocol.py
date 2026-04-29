@@ -459,6 +459,20 @@ class _MOQTSessionMixin:
         if not hasattr(self, '_stream_bytes_total'):
             self._stream_bytes_total = {}
         self._stream_bytes_total[stream_id] = 0
+        # Rolling history: last 8 (object_id, consumed, ext_pre_chunk_id,
+        # ext_pre_chunk_off, n_chunks_spanned) so we can see whether the
+        # desyncing object's framing crossed an extend() boundary.
+        from collections import deque
+        last_objs = deque(maxlen=8)
+        # Rolling history: last 8 chunks (size, total_after_extend).
+        last_chunks = deque(maxlen=8)
+        # State for tracking chunk-boundary spans during a single object
+        # parse. Reset at each save(): we capture chain.capacity at the
+        # parse anchor; if more extend()s happen mid-parse (via underflow
+        # rollback path), n_chunks_spanned increments.
+        chunks_at_save = 0
+        chunk_id_at_save = 0  # cumulative count of extend()s so far
+        n_extends = 0
 
         while True:
             try:
@@ -478,6 +492,8 @@ class _MOQTSessionMixin:
                 return
 
             chain.extend(msg_buf)
+            n_extends += 1
+            last_chunks.append((len(msg_buf), chain.capacity, n_extends))
             logger.debug(
                 f"MOQT stream({stream_id}): chunk received: "
                 f"chunk_len={len(msg_buf)} chain_total={chain.capacity}"
@@ -486,6 +502,8 @@ class _MOQTSessionMixin:
             # Drain as many complete messages as the chain currently holds.
             while chain.capacity > 0:
                 chain.save()
+                chunks_at_save = chain.capacity
+                chunk_id_at_save = n_extends
                 msg_obj = None
                 try:
                     # StreamChain is duck-compatible with Buffer for the
@@ -557,6 +575,27 @@ class _MOQTSessionMixin:
                         f"[{max(0, tell - 16)}, {min(tell + 48, chain.capacity)}): "
                         f"{hex_at_tell}"
                     )
+                    # Last 8 successful parses: (obj_id, consumed,
+                    # chain_capacity_at_save, n_chunks_spanned)
+                    logger.error(
+                        f"MOQT stream({stream_id}): last 8 parses: "
+                        f"{list(last_objs)}"
+                    )
+                    # Last 8 chunk arrivals: (chunk_size,
+                    # chain_total_after_extend, extend_seq)
+                    logger.error(
+                        f"MOQT stream({stream_id}): last 8 chunks: "
+                        f"{list(last_chunks)}"
+                    )
+                    # Failed-parse-attempt context: where save()
+                    # anchored, how many chunks have arrived since.
+                    logger.error(
+                        f"MOQT stream({stream_id}): failed parse: "
+                        f"chunks_at_save={chunks_at_save} "
+                        f"chunk_id_at_save={chunk_id_at_save} "
+                        f"n_extends_now={n_extends} "
+                        f"chunks_spanned={n_extends - chunk_id_at_save + 1}"
+                    )
                     self._reject_stream(
                         stream_id,
                         SessionCloseCode.PROTOCOL_VIOLATION,
@@ -588,6 +627,17 @@ class _MOQTSessionMixin:
                 self._stream_bytes_total[stream_id] = (
                     self._stream_bytes_total.get(stream_id, 0) + consumed
                 )
+                # Forensic: record per-object metadata. n_chunks_spanned
+                # = how many extend()s happened between the save() at
+                # parse-start and now. >1 means this object's framing
+                # crossed a chunk boundary — high-leverage signal for
+                # the desync investigation.
+                last_objs.append((
+                    self._last_parse_obj_id,
+                    consumed,
+                    chunks_at_save,
+                    n_extends - chunk_id_at_save + 1,
+                ))
                 chain.commit()  # drop consumed prefix; tell() reset to 0
 
                 if isinstance(msg_obj, ObjectHeader):
@@ -595,7 +645,7 @@ class _MOQTSessionMixin:
                     object_id = msg_obj.object_id
                     status = ObjectStatus(msg_obj.status).name
                     id = f"{group_id}.{subgroup_id}.{object_id}"
-                    now = int(time.time() * 1000)
+                    now = int(time.time() * 1_000_000)
                     msg_ts = (
                         msg_obj.extensions.get(MOQT_TIMESTAMP_EXT)
                         if msg_obj.extensions else None
@@ -633,7 +683,7 @@ class _MOQTSessionMixin:
                         f"{consumed} bytes"
                     )
                 elif isinstance(msg_obj, FetchObject):
-                    now = int(time.time() * 1000)
+                    now = int(time.time() * 1_000_000)
                     stream_state = self._data_streams.get(stream_id)
                     request_id = (
                         stream_state.request_id
@@ -883,7 +933,7 @@ class _MOQTSessionMixin:
             group_id = msg.group_id
             object_id = msg.object_id
             id = f"{group_id}.{object_id}"
-            now = int(time.time()*1000)
+            now = int(time.time() * 1_000_000)
             msg_ts = msg.extensions.get(MOQT_TIMESTAMP_EXT) if msg.extensions else None
             delay = f"delay: {now - msg_ts} ms" if msg_ts else ""
             logstr = f"{id} size: {consumed} bytes {delay}"
@@ -905,7 +955,7 @@ class _MOQTSessionMixin:
             group_id = msg.group_id
             object_id = msg.object_id
             id = f"{group_id}.{object_id}"
-            now = int(time.time()*1000)
+            now = int(time.time() * 1_000_000)
             msg_ts = msg.extensions.get(MOQT_TIMESTAMP_EXT) if msg.extensions else None
             delay = f"delay: {now - msg_ts} ms" if msg_ts else ""
             logstr = f"{id} size: {consumed} bytes {delay}"

@@ -51,7 +51,7 @@ def _make_subscribe_handler(num_objects: int, object_size: int):
         )
         session.stream_write(stream_id, header.serialize().data)
         for obj_id in range(num_objects):
-            ext = {MOQT_TIMESTAMP_EXT: int(time.time() * 1000)}
+            ext = {MOQT_TIMESTAMP_EXT: int(time.time() * 1_000_000)}
             buf = header.next_object(
                 payload=f"obj-{obj_id}".encode().ljust(object_size, b'\x00'),
                 extensions=ext,

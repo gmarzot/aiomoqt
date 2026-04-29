@@ -359,7 +359,7 @@ class PublishedTrack(Track):
                 seq_info = f"{group_id}.{cur_obj_id}".encode()
                 payload = (seq_info + b'|' + pad)[:self.object_size]
 
-                extensions = {MOQT_TIMESTAMP_EXT: int(time.time() * 1000)}
+                extensions = {MOQT_TIMESTAMP_EXT: int(time.time() * 1_000_000)}
                 buf = header.next_object(payload=payload,
                                          extensions=extensions,
                                          object_id=cur_obj_id)
@@ -767,7 +767,7 @@ class VideoTrack(PublishedTrack):
                            + frame_pad)[:frame_size]
 
                 extensions = {
-                    MOQT_TIMESTAMP_EXT: int(time.time() * 1000)}
+                    MOQT_TIMESTAMP_EXT: int(time.time() * 1_000_000)}
                 buf = header.next_object(
                     payload=payload,
                     extensions=extensions,

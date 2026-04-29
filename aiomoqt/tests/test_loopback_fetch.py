@@ -169,7 +169,7 @@ def _make_subscribe_handler(cache: FetchTestCache):
 
         # Send a few live objects
         for obj_id in range(5):
-            extensions = {MOQT_TIMESTAMP_EXT: int(time.time() * 1000)}
+            extensions = {MOQT_TIMESTAMP_EXT: int(time.time() * 1_000_000)}
             buf = header.next_object(
                 payload=f"live-{live_group}.{obj_id}".encode().ljust(64, b'\x00'),
                 extensions=extensions,

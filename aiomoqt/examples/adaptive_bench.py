@@ -145,8 +145,10 @@ class LiveStats:
         self._last_send_ms = 0
         self._jitter = 0.0
 
-    def on_object(self, msg, size_bytes, recv_time_ms,
+    def on_object(self, msg, size_bytes, recv_time_us,
                   group_id=None, subgroup_id=None):
+        """Timestamps are microseconds since epoch on the wire;
+        latency stats are float ms (sub-millisecond resolution)."""
         t = time.monotonic()
 
         # Skip status (non-NORMAL) objects
@@ -154,24 +156,22 @@ class LiveStats:
                      and getattr(msg, 'status', ObjectStatus.NORMAL)
                      != ObjectStatus.NORMAL)
 
-        send_ms = None
+        send_us = None
         if getattr(msg, 'extensions', None):
-            send_ms = msg.extensions.get(MOQT_TIMESTAMP_EXT)
+            send_us = msg.extensions.get(MOQT_TIMESTAMP_EXT)
         latency = None
-        if send_ms is not None:
-            raw = recv_time_ms - send_ms
-            # Accept up to 10 minutes (under load latency really can
-            # exceed 60s); reject negatives and absurd values that
-            # come from deframer garbage (varint misdecode gives
-            # send_ms = 2^40-ish).
-            if -1000 <= raw <= 600_000:
-                latency = raw
+        if send_us is not None:
+            raw_us = recv_time_us - send_us
+            # Accept up to 10 minutes (under-load latency can exceed
+            # 60s); reject negatives and varint-garbage outliers.
+            if -1_000_000 <= raw_us <= 600_000_000:
+                latency = raw_us / 1000.0  # float ms
                 if self._last_recv_ms and self._last_send_ms:
-                    d = abs((recv_time_ms - self._last_recv_ms)
-                            - (send_ms - self._last_send_ms))
+                    d = abs((recv_time_us - self._last_recv_ms)
+                            - (send_us - self._last_send_ms)) / 1000.0
                     self._jitter += (d - self._jitter) / 16.0
-                self._last_recv_ms = recv_time_ms
-                self._last_send_ms = send_ms
+                self._last_recv_ms = recv_time_us
+                self._last_send_ms = send_us
 
         self._events.append((t, size_bytes, latency))
         cutoff = t - self.window_s
