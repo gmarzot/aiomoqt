@@ -124,11 +124,15 @@ class _RollingStats:
 
 
 def _setup_quiet_logging(logdir, name, debug):
-    """Redirect stdout; keep stderr for errors; log files if logdir set.
+    """Redirect stdout; route logs based on (logdir, debug):
 
-    stdout gets redirected because periodic print() calls from the sub
-    library would interleave with the parent's controller output. stderr
-    stays for warnings/tracebacks so silent failures are debuggable.
+      logdir + debug=True  : DEBUG level to <logdir>/<name>.log
+      logdir + debug=False : INFO  level to <logdir>/<name>.log
+      no logdir + debug    : DEBUG to stderr (visible in parent terminal)
+      no logdir + no debug : WARNING to stderr (errors only)
+
+    stdout always goes to /dev/null so periodic print() in subordinate
+    libraries doesn't interleave with the parent's controller output.
     """
     devnull = open(os.devnull, 'w')
     sys.stdout = devnull
@@ -140,8 +144,10 @@ def _setup_quiet_logging(logdir, name, debug):
                             format='%(asctime)s %(levelname)s %(message)s')
         set_log_level(lvl)
     else:
-        logging.basicConfig(stream=devnull, force=True)
-        set_log_level(logging.WARNING)
+        lvl = logging.DEBUG if debug else logging.WARNING
+        logging.basicConfig(stream=sys.stderr, force=True, level=lvl,
+                            format=f'[{name}] %(asctime)s %(levelname)s %(message)s')
+        set_log_level(lvl)
 
 
 def _bridge_stop_event(mp_stop_event):
