@@ -335,12 +335,10 @@ class PublishedTrack(Track):
                         else:
                             session.stream_fin(stream_id)
 
-                        if stream_id in session._data_streams:
-                            del session._data_streams[stream_id]
-                        if stream_id in session._stream_tasks:
-                            session._stream_tasks[stream_id].cancel()
-                            del session._stream_tasks[stream_id]
-
+                        # Publisher has no _data_streams entry to clean
+                        # up; that dict tracks subscriber-side parser
+                        # state. The done-callback handles cleanup when
+                        # the receiver's parser exits.
                         stream_id = await session.open_uni_stream()
                         self._stream_count += 1
 
@@ -730,12 +728,10 @@ class VideoTrack(PublishedTrack):
                         session.stream_write(stream_id, buf.data,
                                              end_stream=True)
 
-                        if stream_id in session._data_streams:
-                            del session._data_streams[stream_id]
-                        if stream_id in session._stream_tasks:
-                            session._stream_tasks[stream_id].cancel()
-                            del session._stream_tasks[stream_id]
-
+                        # Publisher has no _data_streams entry to clean
+                        # up; that dict tracks subscriber-side parser
+                        # state. The done-callback handles cleanup when
+                        # the receiver's parser exits.
                         stream_id = await session.open_uni_stream()
                         self._stream_count += 1
 

@@ -2,6 +2,7 @@ import asyncio
 import time
 from asyncio import Future
 from collections import defaultdict
+from dataclasses import dataclass, field
 from functools import partial
 from typing import (Callable, DefaultDict, Dict, List, Optional, Set, Tuple,
                     Type, Union)
@@ -60,6 +61,26 @@ class MOQTPeer:
         self._control_msg_handlers[msg_type] = (msg_class, handler)
 
 
+@dataclass(slots=True)
+class _DataStreamState:
+    """Per-uni-data-stream state.
+
+    queue:  inbound chunks + None FIN sentinel feeding the parser task.
+    task:   the per-stream _process_data_stream parser task.
+    parser: FetchHeader or SubgroupHeader after admission, holding
+            per-stream runtime state (_prior_obj, _last_object_id).
+    key:    binding tuple for the reverse maps —
+            ('fetch', request_id) or
+            ('subgroup', (track_alias, group_id, subgroup_id)).
+    bytes_total: cumulative bytes successfully parsed (forensic).
+    """
+    queue: asyncio.Queue
+    task: Optional[asyncio.Task] = None
+    parser: Optional['MOQTMessage'] = None
+    key: Optional[tuple] = None
+    bytes_total: int = 0
+
+
 class _MOQTSessionMixin:
     """MoQT session methods. Mix with an aiopquic transport base —
     QuicConnectionProtocol for raw QUIC, WebTransportSession (via
@@ -97,40 +118,25 @@ class _MOQTSessionMixin:
         self._moqt_session_closed: Future[Tuple[int,str]] = self._loop.create_future()
         self._next_request_id = 0 if self._is_client else 1
         self._next_track_alias = 0
-        # Per-stream queues feeding _process_data_stream. Each entry is
-        # an incoming chunk (bytes or memoryview) or None as FIN sentinel.
-        self._stream_queues: DefaultDict[
-            int, asyncio.Queue[Optional[Union[bytes, memoryview]]]
-        ] = defaultdict(asyncio.Queue)
-        self._stream_tasks: Dict[int, asyncio.Task] = {}
+        # Single dict per stream — _DataStreamState consolidates queue,
+        # task, parser, binding-key, and forensic counter into one
+        # slotted object. See class docstring above.
+        self._data_streams: Dict[int, _DataStreamState] = {}
         self._tasks: Set[asyncio.Task] = set()
         self._close_err = None  # tuple holding latest (error_code, Reason_phrase)
-        
-        # Active uni data streams. Value is None when the stream has been
-        # registered but no header has been parsed yet; after header
-        # parsing it holds a FetchHeader or SubgroupHeader instance
-        # (carrying per-stream runtime state like _prior_obj /
-        # _last_object_id) until the stream closes.
-        self._data_streams: Dict[int, Optional[MOQTMessage]] = {}
+
         self._bidi_streams: Dict[int, int] = {}  # map request_id to bidi stream_id (d16)
         self._bidi_stream_requests: Dict[int, int] = {}  # map bidi stream_id to request_id (d16)
         self._track_aliases: Dict[int, int] = {}  # map alias to subscription_id
         self._subscriptions: Dict[int, List] = {}  # map subscription_id to request
         self._pending_requests: Dict[int, Future[MOQTMessage]] = {}  # unified response futures
 
-        # MoQT-level request ↔ uni stream binding (subscriber side).
-        # Populated when a FETCH_HEADER or SubgroupHeader is admitted.
-        # Consulted on FETCH_ERROR / FETCH_CANCEL / UNSUBSCRIBE to find the
-        # data stream that belongs to a request, so we can terminate it.
-        # Keyed as follows:
-        #   _fetch_stream_by_request[request_id]                  -> stream_id
-        #   _subgroup_stream_by_key[(track_alias, group, subgrp)] -> stream_id
-        # The reverse lookup (_data_stream_key[stream_id]) stores whichever
-        # key is appropriate for the stream so stream-close cleanup can
-        # remove both sides of the binding.
+        # Reverse maps for binding lookups. The forward direction is
+        # _streams[sid].key = ('fetch', request_id) or
+        # ('subgroup', (track_alias, group_id, subgroup_id));
+        # _unbind_stream uses .key to drop the matching reverse entry.
         self._fetch_stream_by_request: Dict[int, int] = {}
         self._subgroup_stream_by_key: Dict[Tuple[int, int, Optional[int]], int] = {}
-        self._data_stream_key: Dict[int, Tuple] = {}
 
         self._control_msg_registry = dict(_MOQTSessionMixin.MOQT_CONTROL_MESSAGE_REGISTRY)
         self._control_msg_registry.update(session._control_msg_handlers)
@@ -383,14 +389,8 @@ class _MOQTSessionMixin:
     def _stream_task_done(self, stream_id: int, task: asyncio.Task) -> None:
         """Per-uni-stream done-callback. Hot path at high stream churn —
         avoid f-string formatting, log only real anomalies, single
-        cleanup pass per entry. The pre-existing track.py cleanup
-        pattern relies on this no-op'ing cleanly when entries are
-        already gone."""
-        # Unconditional pop — no warning if already absent. The clean-
-        # FIN path arrives here with entries still present; the
-        # double-cleanup path (track.py group-boundary) doesn't.
-        self._stream_tasks.pop(stream_id, None)
-        self._data_streams.pop(stream_id, None)
+        dict-pop per stream end."""
+        state = self._data_streams.pop(stream_id, None)
 
         error_code = QuicErrorCode.NO_ERROR
         if task.cancelled():
@@ -400,8 +400,6 @@ class _MOQTSessionMixin:
             if e is not None:
                 error_code = QuicErrorCode.APPLICATION_ERROR
                 if not isinstance(e, TimeoutError):
-                    # Real failure — keep loud. %-style lazy-format
-                    # so non-error path doesn't pay traceback cost.
                     import traceback
                     logger.error(
                         "MOQT stream(%d): task failed: %s\n%s",
@@ -410,13 +408,14 @@ class _MOQTSessionMixin:
                     )
 
         # Resolve fetch completion future if this was a fetch stream.
-        key = self._data_stream_key.get(stream_id)
+        key = state.key if state is not None else None
         if key and len(key) == 2 and key[0] == 'fetch':
             request_id = key[1]
             fut = self._fetch_done_futures.pop(request_id, None)
             if fut and not fut.done():
                 fut.set_result(error_code == QuicErrorCode.NO_ERROR)
-        self._unbind_stream(stream_id)
+        # Drop reverse-map entry for the stream's binding key.
+        self._unbind_key(key)
 
     def _on_stream_data(self, stream_id: int, data: bytes,
                         end_stream: bool) -> None:
@@ -425,27 +424,22 @@ class _MOQTSessionMixin:
         framing (WT prefix, etc.) has already been stripped by the caller.
         `end_stream` pushes the FIN sentinel for the processing task.
         """
-        if stream_id not in self._data_streams:
-            logger.debug(f"MOQT event: new data stream: id: {stream_id} {len(data)} bytes")
-            self._data_streams[stream_id] = None
-            if stream_id in self._stream_tasks:
-                logger.warning(f"MOQT stream({stream_id}): replacing existing task")
-                self._stream_tasks[stream_id].cancel()
+        state = self._data_streams.get(stream_id)
+        if state is None:
+            state = _DataStreamState(queue=asyncio.Queue())
+            self._data_streams[stream_id] = state
             task = asyncio.create_task(self._process_data_stream(stream_id))
-            self._stream_tasks[stream_id] = task
+            state.task = task
             task.add_done_callback(partial(self._stream_task_done, stream_id))
-            logger.debug(f"MOQT event: creating _process_data_stream task: {stream_id} num streams: {len(self._data_streams)}")
 
         if len(data) > 0:
             # Push the chunk by reference; StreamChain accepts bytes or
             # memoryview, no Buffer wrap needed. Avoids one copy when the
             # underlying transport already delivers a memoryview (aiopquic).
-            logger.debug(f"MOQT event: pushing data on stream: {stream_id} len: {len(data)}")
-            self._stream_queues[stream_id].put_nowait(data)
+            state.queue.put_nowait(data)
 
         if end_stream:
-            logger.debug(f"MOQT event: stream FIN: {stream_id}")
-            self._stream_queues[stream_id].put_nowait(None)
+            state.queue.put_nowait(None)
 
     # task for processing incoming data streams
     async def _process_data_stream(self, stream_id: int) -> None:
@@ -458,17 +452,15 @@ class _MOQTSessionMixin:
         the start of the failed parse attempt and await more bytes.
         Bounded by un-parsed bytes only; no fixed-size accumulator.
         """
+        state = self._data_streams.get(stream_id)
+        if state is None:
+            return  # stream torn down before task could read
+        queue = state.queue
         chain = StreamChain()
         consumed: int = 0
         group_id = None
         subgroup_id = None
         object_id = None
-        # Forensic counters for the desync-under-load investigation.
-        # Track running stream offset so the failure point is reported
-        # in absolute stream-byte position, not just chain offset.
-        if not hasattr(self, '_stream_bytes_total'):
-            self._stream_bytes_total = {}
-        self._stream_bytes_total[stream_id] = 0
         # Rolling history: last 8 (object_id, consumed, ext_pre_chunk_id,
         # ext_pre_chunk_off, n_chunks_spanned) so we can see whether the
         # desyncing object's framing crossed an extend() boundary.
@@ -487,7 +479,7 @@ class _MOQTSessionMixin:
         while True:
             try:
                 async with asyncio.timeout(MOQT_IDLE_STREAM_TIMEOUT):
-                    msg_buf = await self._stream_queues[stream_id].get()
+                    msg_buf = await queue.get()
             except asyncio.TimeoutError:
                 logger.debug(
                     f"MOQT stream({stream_id}): idle timeout: "
@@ -525,8 +517,8 @@ class _MOQTSessionMixin:
                         stream_id, chain, chain.capacity  # type: ignore[arg-type]
                     )
                 except MOQTStreamReject as e:
-                    # Phase 1c admission failure — STOP_SENDING the
-                    # stream, do not close the session.
+                    # MoQT-level admission failure — STOP_SENDING the
+                    # stream; the session itself stays open.
                     self._reject_stream(stream_id, e.error_code, e.reason)
                     return
                 except MOQTUnderflow as e:
@@ -566,8 +558,7 @@ class _MOQTSessionMixin:
                         self, '_last_parse_consumed', None)
                     last_obj = getattr(
                         self, '_last_parse_obj_id', None)
-                    bytes_since_clean = getattr(
-                        self, '_stream_bytes_total', {}).get(stream_id, 0)
+                    bytes_since_clean = state.bytes_total
                     logger.error(
                         f"MOQT stream({stream_id}): PARSE EXCEPTION "
                         f"at tell={tell} chain_total={chain.capacity} "
@@ -635,9 +626,7 @@ class _MOQTSessionMixin:
                 self._last_parse_obj_id = (
                     msg_obj.object_id if hasattr(msg_obj, 'object_id') else None
                 )
-                self._stream_bytes_total[stream_id] = (
-                    self._stream_bytes_total.get(stream_id, 0) + consumed
-                )
+                state.bytes_total += consumed
                 # Forensic: record per-object metadata. n_chunks_spanned
                 # = how many extend()s happened between the save() at
                 # parse-start and now. >1 means this object's framing
@@ -695,10 +684,10 @@ class _MOQTSessionMixin:
                     )
                 elif isinstance(msg_obj, FetchObject):
                     now = int(time.time() * 1_000_000)
-                    stream_state = self._data_streams.get(stream_id)
+                    parser = state.parser
                     request_id = (
-                        stream_state.request_id
-                        if isinstance(stream_state, FetchHeader)
+                        parser.request_id
+                        if isinstance(parser, FetchHeader)
                         else None
                     )
                     if msg_obj.end_of_range is not None:
@@ -744,15 +733,19 @@ class _MOQTSessionMixin:
         logger.warning(f"MOQT stream({stream_id}): rejecting: "
                        f"{reason} (code=0x{error_code:x})")
         self.stream_stop_sending(stream_id, error_code)
-        self._unbind_stream(stream_id)
-        # Drop any parsing state and signal the task to exit
-        self._data_streams.pop(stream_id, None)
-        if stream_id in self._stream_queues:
-            self._stream_queues[stream_id].put_nowait(None)
+        # Drop the StreamState entry and signal the parser task to exit.
+        # _stream_task_done will run when the task actually exits and
+        # clean up the reverse-map binding via _unbind_key.
+        state = self._data_streams.get(stream_id)
+        if state is not None:
+            state.queue.put_nowait(None)
 
-    def _unbind_stream(self, stream_id: int) -> None:
-        """Remove a stream from the request↔stream binding table."""
-        key = self._data_stream_key.pop(stream_id, None)
+    def _unbind_key(self, key) -> None:
+        """Drop the reverse-map entry for a binding key tuple.
+
+        key is the StreamState.key field — ('fetch', request_id) or
+        ('subgroup', (track_alias, group_id, subgroup_id)) — or None.
+        """
         if key is None:
             return
         if len(key) == 2 and key[0] == 'fetch':
@@ -760,13 +753,22 @@ class _MOQTSessionMixin:
         elif len(key) == 2 and key[0] == 'subgroup':
             self._subgroup_stream_by_key.pop(key[1], None)
 
+    def _unbind_stream(self, stream_id: int) -> None:
+        """Compat shim: look up the stream's binding key and drop the
+        reverse-map entry. Prefer _unbind_key when the caller already
+        has the key in hand."""
+        state = self._data_streams.get(stream_id)
+        if state is not None:
+            self._unbind_key(state.key)
+            state.key = None
+
     def _admit_fetch_stream(self, stream_id: int, header: 'FetchHeader') -> None:
         """Admit a FETCH_HEADER stream or raise MOQTStreamReject.
 
-        Admission rules (Phase 1c):
+        Admission rules:
         - request_id MUST match an outstanding FETCH we sent
-          (present in _subscriptions with a Fetch message)
-        - at most one uni stream per FETCH request (no reuse)
+          (present in _subscriptions with a Fetch message).
+        - at most one uni stream per FETCH request (no reuse).
         """
         request_id = header.request_id
         outstanding = self._subscriptions.get(request_id)
@@ -784,18 +786,20 @@ class _MOQTSessionMixin:
                     f"duplicate fetch stream for request_id={request_id} "
                     f"(already bound to stream {existing})")
         self._fetch_stream_by_request[request_id] = stream_id
-        self._data_stream_key[stream_id] = ('fetch', request_id)
+        state = self._data_streams.get(stream_id)
+        if state is not None:
+            state.key = ('fetch', request_id)
 
     def _admit_subgroup_stream(self, stream_id: int,
                                 header: 'SubgroupHeader') -> None:
         """Admit a SubgroupHeader stream or raise MOQTStreamReject.
 
-        Admission rules (Phase 1c):
+        Admission rules:
         - track_alias SHOULD map to a live subscription, but per spec
           §10.4.2 data may arrive before the control message that
           establishes the alias — tolerate with a warning.
         - at most one stream per (track_alias, group_id, subgroup_id)
-          tuple. For FIRST_OBJ mode, subgroup_id is None at header time
+          tuple. In FIRST_OBJ mode subgroup_id is None at header time
           and the uniqueness check is deferred until the first object.
         """
         if header.track_alias not in self._track_aliases:
@@ -814,7 +818,9 @@ class _MOQTSessionMixin:
                         f"duplicate subgroup stream for {key} "
                         f"(already bound to stream {existing})")
             self._subgroup_stream_by_key[key] = stream_id
-            self._data_stream_key[stream_id] = ('subgroup', key)
+            state = self._data_streams.get(stream_id)
+            if state is not None:
+                state.key = ('subgroup', key)
 
     def _bind_subgroup_first_obj(self, stream_id: int,
                                   header: 'SubgroupHeader') -> None:
@@ -829,7 +835,9 @@ class _MOQTSessionMixin:
                     f"duplicate subgroup stream for {key} "
                     f"(already bound to stream {existing})")
         self._subgroup_stream_by_key[key] = stream_id
-        self._data_stream_key[stream_id] = ('subgroup', key)
+        state = self._data_streams.get(stream_id)
+        if state is not None:
+            state.key = ('subgroup', key)
 
     def _moqt_handle_data_stream(self, stream_id: int, buf: Buffer, len: int) -> MOQTMessage:
         """Process incoming data messages (not control messages).
@@ -845,8 +853,9 @@ class _MOQTSessionMixin:
         try:
             pos = buf.tell()
             msg_header = None
-            # new data streams will not yet have an entry
-            if self._data_streams.get(stream_id) is None:
+            # new data streams will not yet have a parser bound
+            stream_state = self._data_streams.get(stream_id)
+            if stream_state is None or stream_state.parser is None:
                 # Get stream type from first byte
                 stream_type = buf.pull_uint_var()
                 # SubgroupHeader type ranges:
@@ -861,12 +870,10 @@ class _MOQTSessionMixin:
                 if is_subgroup:
                     msg_header = SubgroupHeader.deserialize(buf, type_val=stream_type)
                     data_type = "SUBGROUP_HEADER"
-                    # Phase 1c admission check
                     self._admit_subgroup_stream(stream_id, msg_header)
                 elif stream_type == DataStreamType.FETCH_HEADER:
                     msg_header = FetchHeader.deserialize(buf)
                     data_type = "FETCH_HEADER"
-                    # Phase 1c admission check
                     self._admit_fetch_stream(stream_id, msg_header)
                 else:
                     data_type = f"0x{stream_type:x}"
@@ -881,11 +888,12 @@ class _MOQTSessionMixin:
                 # record that the data stream header has been processed
                 consumed = buf.tell() - pos
                 logger.debug(f"MOQT stream({stream_id}): {msg_header} consumed: {consumed} bytes")
-                self._data_streams[stream_id] = msg_header
+                if stream_state is not None:
+                    stream_state.parser = msg_header
             else:
-                stream_state = self._data_streams[stream_id]
-                if isinstance(stream_state, SubgroupHeader):
-                    sg_header: SubgroupHeader = stream_state
+                parser = stream_state.parser
+                if isinstance(parser, SubgroupHeader):
+                    sg_header: SubgroupHeader = parser
                     msg_header = ObjectHeader.deserialize(
                         buf, len,
                         extensions_present=sg_header.extensions_present,
@@ -900,8 +908,8 @@ class _MOQTSessionMixin:
                         sg_header.subgroup_id = msg_header.object_id
                         self._bind_subgroup_first_obj(stream_id, sg_header)
 
-                elif isinstance(stream_state, FetchHeader):
-                    fh: FetchHeader = stream_state
+                elif isinstance(parser, FetchHeader):
+                    fh: FetchHeader = parser
                     msg_header = FetchObject.deserialize(buf, prior=fh._prior_obj)
                     # Track prior object for d16 delta-encoded references
                     if msg_header.end_of_range is None:
@@ -1082,21 +1090,19 @@ class _MOQTSessionMixin:
             logger.debug(f"MOQT event: StopSendingReceived: stream {event.stream_id}")
             # RFC 9000: STOP_SENDING from peer → reciprocal RESET_STREAM.
             self.stream_reset(event.stream_id, event.error_code)
-            self._unbind_stream(event.stream_id)
-            if event.stream_id in self._data_streams:
-                del self._data_streams[event.stream_id]
-            if event.stream_id in self._stream_tasks:
-                self._stream_tasks[event.stream_id].cancel()
-                del self._stream_tasks[event.stream_id]
+            state = self._data_streams.pop(event.stream_id, None)
+            if state is not None:
+                self._unbind_key(state.key)
+                if state.task is not None:
+                    state.task.cancel()
             return
         elif isinstance(event, StreamReset):
             logger.debug(f"MOQT event: StreamReset: stream {event.stream_id}")
-            self._unbind_stream(event.stream_id)
-            if event.stream_id in self._data_streams:
-                del self._data_streams[event.stream_id]
-            if event.stream_id in self._stream_tasks:
-                self._stream_tasks[event.stream_id].cancel()
-                del self._stream_tasks[event.stream_id]
+            state = self._data_streams.pop(event.stream_id, None)
+            if state is not None:
+                self._unbind_key(state.key)
+                if state.task is not None:
+                    state.task.cancel()
             return
 
         logger.debug(f"QUIC event: event not handled({event_class})")
@@ -1111,10 +1117,12 @@ class _MOQTSessionMixin:
             logger.error(f"MOQT error: closing: {reason_phrase} ({error_code})")
         self._close_err = (error_code, reason_phrase)
 
-        # Signal all stream tasks to shut down gracefully with sentinel value
-        for stream_id in list(self._stream_tasks.keys()):
-            if stream_id in self._stream_queues:
-                self._stream_queues[stream_id].put_nowait(None)
+        # Signal all stream tasks to shut down gracefully via FIN sentinel.
+        for state in self._data_streams.values():
+            try:
+                state.queue.put_nowait(None)
+            except Exception:
+                pass
 
         if not self._wt_session_setup.done():
             self._wt_session_setup.set_result(False)
@@ -1333,7 +1341,9 @@ class _MOQTSessionMixin:
             logger.debug(f"stream({stream_id}): stop_sending race: {e}")
 
     def _stream_is_writable(self, stream_id: int) -> bool:
-        """Compat shim for older call sites."""
+        """Whether send_stream_data on this session can be expected to
+        succeed. Stream-id-specific state lives in picoquic; we only
+        check session-level closed/torn-down here."""
         return self._session_writable()
 
     def send_control_message(self, buf: Buffer) -> None:
@@ -2044,11 +2054,11 @@ class _MOQTSessionMixin:
             for key, sid in list(self._subgroup_stream_by_key.items()):
                 if key[0] == track_alias:
                     self.stream_reset(sid, SessionCloseCode.NO_ERROR)
-                    self._unbind_stream(sid)
-                    self._data_streams.pop(sid, None)
-                    task = self._stream_tasks.pop(sid, None)
-                    if task is not None:
-                        task.cancel()
+                    state = self._data_streams.pop(sid, None)
+                    if state is not None:
+                        self._unbind_key(state.key)
+                        if state.task is not None:
+                            state.task.cancel()
         self._subscriptions.pop(msg.request_id, None)
 
     async def _handle_subscribe_done(self, msg: SubscribeDone) -> None:
@@ -2148,7 +2158,9 @@ class _MOQTSessionMixin:
         logger.info(f"MOQT event: handle {msg}")
         stream_id = self._fetch_stream_by_request.pop(msg.request_id, None)
         if stream_id is not None:
-            self._data_stream_key.pop(stream_id, None)
+            state = self._data_streams.get(stream_id)
+            if state is not None:
+                state.key = None  # reverse map already popped above
             self.stream_reset(stream_id, SessionCloseCode.NO_ERROR)
             logger.debug(f"MOQT stream({stream_id}): reset on FETCH_CANCEL "
                          f"for request_id={msg.request_id}")
@@ -2170,7 +2182,9 @@ class _MOQTSessionMixin:
         logger.info(f"MOQT event: handle {msg}")
         stream_id = self._fetch_stream_by_request.pop(msg.request_id, None)
         if stream_id is not None:
-            self._data_stream_key.pop(stream_id, None)
+            state = self._data_streams.get(stream_id)
+            if state is not None:
+                state.key = None
             self.stream_stop_sending(stream_id, msg.error_code)
             logger.debug(f"MOQT stream({stream_id}): stop_sending on "
                          f"FETCH_ERROR request_id={msg.request_id}")
@@ -2189,15 +2203,10 @@ class _MOQTSessionMixin:
             logger.warning(f"MOQT: unrecognized track alias: {msg.track_alias}")
 
     async def _handle_fetch_header(self, msg: FetchHeader) -> None:
-        """Handle fetch header message.
-
-        NOTE: This registry handler is not currently dispatched by the
-        data-stream path. Admission checks and binding-table registration
-        happen inline in _moqt_handle_data_stream (Phase 1c), where
-        unknown request_ids are rejected at the stream level via
-        STOP_SENDING — not at the session level. This method is retained
-        for registry completeness / user override.
-        """
+        """Registry handler for FetchHeader. Admission + binding happen
+        inline in _moqt_handle_data_stream — unknown request_ids are
+        rejected at the stream level via STOP_SENDING. Kept here for
+        registry completeness so user overrides can hook in."""
         logger.info(f"MOQT event: handle {msg}")
         return
 
