@@ -31,7 +31,7 @@ from typing import Optional, Callable
 
 from .types import (
     MOQTMessageType, ParamType, FilterType, GroupOrder,
-    MOQT_TIMESTAMP_EXT,
+    MOQT_TIMESTAMP_EXT, SessionCloseCode,
 )
 from .messages import (
     SubgroupHeader, PublishOk, RequestUpdate,
@@ -333,9 +333,7 @@ class PublishedTrack(Track):
                             session.stream_write(stream_id, buf.data,
                                                  end_stream=True)
                         else:
-                            session.stream_write(stream_id, b'',
-                                                 end_stream=True)
-                        session.transmit()
+                            session.stream_fin(stream_id)
 
                         if stream_id in session._data_streams:
                             del session._data_streams[stream_id]
@@ -357,7 +355,6 @@ class PublishedTrack(Track):
                     if session._close_err is not None:
                         raise asyncio.CancelledError
                     await session.stream_write_drain(stream_id, msg.data)
-                    session.transmit()
 
                 seq_info = f"{group_id}.{cur_obj_id}".encode()
                 payload = (seq_info + b'|' + pad)[:self.object_size]
@@ -372,7 +369,6 @@ class PublishedTrack(Track):
                 if session._close_err is not None:
                     raise asyncio.CancelledError
                 await session.stream_write_drain(stream_id, buf.data)
-                session.transmit()
                 local_sent += 1
                 self._total_sent += 1
                 self._total_bytes += obj_bytes
@@ -410,6 +406,12 @@ class PublishedTrack(Track):
                         await asyncio.sleep(0)
 
         except asyncio.CancelledError:
+            # Sender cancelled mid-subgroup → spec wants a RESET so the
+            # subscriber sees a definitive end (not silent stall). Skip
+            # if the session is already torn down — the primitive
+            # short-circuits anyway, but avoid the bookkeeping noise.
+            if session._close_err is None:
+                session.stream_reset(stream_id, SessionCloseCode.NO_ERROR)
             dur = time.monotonic() - start_time
             if dur > 0 and report:
                 bps = (self._total_bytes * 8) / dur
@@ -727,7 +729,6 @@ class VideoTrack(PublishedTrack):
                             object_id=self.group_size)
                         session.stream_write(stream_id, buf.data,
                                              end_stream=True)
-                        session.transmit()
 
                         if stream_id in session._data_streams:
                             del session._data_streams[stream_id]
@@ -750,7 +751,6 @@ class VideoTrack(PublishedTrack):
                         raise asyncio.CancelledError
                     await session.stream_write_drain(
                         stream_id, msg.data)
-                    session.transmit()
 
                 # Frame type and size from GOP pattern
                 ft = self._gop[cur_obj_id % len(self._gop)]
@@ -779,7 +779,6 @@ class VideoTrack(PublishedTrack):
                     raise asyncio.CancelledError
                 await session.stream_write_drain(
                     stream_id, buf.data)
-                session.transmit()
                 local_sent += 1
                 self._total_sent += 1
                 self._total_bytes += obj_bytes

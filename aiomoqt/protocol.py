@@ -453,6 +453,12 @@ class _MOQTSessionMixin:
         group_id = None
         subgroup_id = None
         object_id = None
+        # Forensic counters for the desync-under-load investigation.
+        # Track running stream offset so the failure point is reported
+        # in absolute stream-byte position, not just chain offset.
+        if not hasattr(self, '_stream_bytes_total'):
+            self._stream_bytes_total = {}
+        self._stream_bytes_total[stream_id] = 0
 
         while True:
             try:
@@ -515,20 +521,41 @@ class _MOQTSessionMixin:
                     break
                 except Exception as e:
                     # Data-plane parse failure — deframer lost
-                    # alignment. Abandon this stream via STOP_SENDING;
-                    # keep the session alive (other concurrent streams
-                    # are unaffected). Pre-hardening this raised and
-                    # killed the whole session.
+                    # alignment. Capture forensic state for the desync-
+                    # under-load investigation: the bytes the parser
+                    # was about to walk, plus the running totals from
+                    # the last clean object so we can correlate stream
+                    # offset to MoQT object position.
                     tell = chain.tell()
-                    hex_at = chain.data_slice(
-                        0, min(40, chain.capacity)
+                    hex_anchor = chain.data_slice(
+                        0, min(64, chain.capacity)
                     ).hex()
+                    hex_at_tell = chain.data_slice(
+                        max(0, tell - 16), min(tell + 48, chain.capacity)
+                    ).hex() if chain.capacity > 0 else ""
+                    last_consumed = getattr(
+                        self, '_last_parse_consumed', None)
+                    last_obj = getattr(
+                        self, '_last_parse_obj_id', None)
+                    bytes_since_clean = getattr(
+                        self, '_stream_bytes_total', {}).get(stream_id, 0)
                     logger.error(
                         f"MOQT stream({stream_id}): PARSE EXCEPTION "
                         f"at tell={tell} chain_total={chain.capacity} "
-                        f"hex@anchor={hex_at} "
+                        f"last_obj_id={last_obj} "
+                        f"last_consumed={last_consumed} "
+                        f"stream_bytes={bytes_since_clean} "
                         f"object_id={object_id} group_id={group_id} "
                         f"exc={type(e).__name__}: {e}"
+                    )
+                    logger.error(
+                        f"MOQT stream({stream_id}): hex anchor (first 64): "
+                        f"{hex_anchor}"
+                    )
+                    logger.error(
+                        f"MOQT stream({stream_id}): hex around tell "
+                        f"[{max(0, tell - 16)}, {min(tell + 48, chain.capacity)}): "
+                        f"{hex_at_tell}"
                     )
                     self._reject_stream(
                         stream_id,
@@ -557,6 +584,9 @@ class _MOQTSessionMixin:
                 self._last_parse_consumed = consumed
                 self._last_parse_obj_id = (
                     msg_obj.object_id if hasattr(msg_obj, 'object_id') else None
+                )
+                self._stream_bytes_total[stream_id] = (
+                    self._stream_bytes_total.get(stream_id, 0) + consumed
                 )
                 chain.commit()  # drop consumed prefix; tell() reset to 0
 
@@ -652,10 +682,7 @@ class _MOQTSessionMixin:
         """
         logger.warning(f"MOQT stream({stream_id}): rejecting: "
                        f"{reason} (code=0x{error_code:x})")
-        try:
-            self._quic.stop_stream(stream_id, error_code)
-        except Exception as e:
-            logger.debug(f"MOQT stream({stream_id}): stop_stream failed: {e}")
+        self.stream_stop_sending(stream_id, error_code)
         self._unbind_stream(stream_id)
         # Drop any parsing state and signal the task to exit
         self._data_streams.pop(stream_id, None)
@@ -992,7 +1019,8 @@ class _MOQTSessionMixin:
             return
         elif isinstance(event, StopSendingReceived):
             logger.debug(f"MOQT event: StopSendingReceived: stream {event.stream_id}")
-            self._quic.reset_stream(stream_id=event.stream_id, error_code=event.error_code)
+            # RFC 9000: STOP_SENDING from peer → reciprocal RESET_STREAM.
+            self.stream_reset(event.stream_id, event.error_code)
             self._unbind_stream(event.stream_id)
             if event.stream_id in self._data_streams:
                 del self._data_streams[event.stream_id]
@@ -1167,39 +1195,85 @@ class _MOQTSessionMixin:
         # aiopquic-WT
         return await self.create_stream(bidir=True)
 
-    def stream_write(self, stream_id: int, data: bytes, end_stream: bool = False) -> None:
-        """Write data to a stream. No-op if stream is reset or FIN'd."""
-        if not self._stream_is_writable(stream_id) and not end_stream:
+    # -- spec-aligned stream lifecycle primitives ---------------------
+    # All three short-circuit when the session is closing/closed so a
+    # task racing a teardown doesn't blow up the asyncio loop. The
+    # underlying aiopquic calls also raise on stale streams; we swallow
+    # those at this layer because by the time we got here the stream
+    # is already gone — nothing useful left for the caller to do.
+
+    def _session_writable(self) -> bool:
+        return self._close_err is None and self._quic is not None
+
+    def stream_write(self, stream_id: int, data: bytes,
+                      end_stream: bool = False) -> None:
+        """Write bytes (and optional FIN) to stream_id."""
+        if not self._session_writable():
             return
         try:
-            self._quic.send_stream_data(stream_id, data, end_stream=end_stream)
-        except AssertionError:
-            pass  # stream already FIN'd — race with close()
-
-    def _stream_is_writable(self, stream_id: int) -> bool:
-        """Check if a stream is still writable (not reset or FIN'd).
-
-        aiopquic owns stream state in picoquic and doesn't expose it,
-        so return True optimistically; send_stream_data raises on a
-        bad stream and the caller swallows it.
-        """
-        return True
+            self._quic.send_stream_data(
+                stream_id, data, end_stream=end_stream)
+        except (AssertionError, AttributeError, BufferError) as e:
+            logger.debug(f"stream({stream_id}): write race: {e}")
 
     async def stream_write_drain(self, stream_id: int, data: bytes,
-                                 end_stream: bool = False) -> None:
-        """Write data to a stream, yielding when the SPSC TX ring is full.
+                                  end_stream: bool = False) -> None:
+        """Write bytes, yielding to asyncio when the SPSC TX ring fills.
 
         aiopquic owns congestion control on its picoquic pthread; we
         only need to backpressure on the SPSC TX ring (BufferError)
         when Python pushes faster than picoquic drains.
         """
         while True:
+            if not self._session_writable():
+                return
             try:
                 self._quic.send_stream_data(
                     stream_id, data, end_stream=end_stream)
                 return
             except BufferError:
                 await asyncio.sleep(0.0001)
+            except (AssertionError, AttributeError) as e:
+                logger.debug(f"stream({stream_id}): write race: {e}")
+                return
+
+    def stream_fin(self, stream_id: int) -> None:
+        """End-of-data on a sender-owned stream. Subgroup last object,
+        fetch range complete, control GOAWAY+close use this."""
+        if not self._session_writable():
+            return
+        try:
+            self._quic.send_stream_data(stream_id, b"", end_stream=True)
+        except (AssertionError, AttributeError, BufferError) as e:
+            logger.debug(f"stream({stream_id}): fin race: {e}")
+
+    def stream_reset(self, stream_id: int,
+                      error_code: int = SessionCloseCode.NO_ERROR) -> None:
+        """RESET_STREAM. Sender-side abrupt termination — UNSUBSCRIBE,
+        FETCH_CANCEL on the publisher, track teardown, error abort.
+        Also the canonical reply to a peer's STOP_SENDING."""
+        if not self._session_writable():
+            return
+        try:
+            self._quic.reset_stream(stream_id, error_code)
+        except (AssertionError, AttributeError) as e:
+            logger.debug(f"stream({stream_id}): reset race: {e}")
+
+    def stream_stop_sending(self, stream_id: int,
+                             error_code: int = SessionCloseCode.NO_ERROR) -> None:
+        """STOP_SENDING. Receiver-side request to cancel a peer-owned
+        stream — UNSUBSCRIBE on the subscriber, FETCH_CANCEL on the
+        subscriber, FETCH_ERROR while the fetch stream is still open."""
+        if not self._session_writable():
+            return
+        try:
+            self._quic.stop_stream(stream_id, error_code)
+        except (AssertionError, AttributeError) as e:
+            logger.debug(f"stream({stream_id}): stop_sending race: {e}")
+
+    def _stream_is_writable(self, stream_id: int) -> bool:
+        """Compat shim for older call sites."""
+        return self._session_writable()
 
     def send_control_message(self, buf: Buffer) -> None:
         """Send a MoQT message on the control stream."""
@@ -1241,7 +1315,6 @@ class _MOQTSessionMixin:
         self._quic.send_datagram_frame(
             data=buf.data
         )
-        self.transmit()
 
     ################################################################################################
     #  Outbound control message API - note: awaitable messages support 'wait_response' param       #
@@ -1680,7 +1753,6 @@ class _MOQTSessionMixin:
             stream_id = await self.open_bidi_stream()
             buf = message.serialize()
             self.stream_write(stream_id, buf.data)
-            self.transmit()
             # Track bidi stream ↔ request mapping for response routing
             self._bidi_streams[request_id] = stream_id
             self._bidi_stream_requests[stream_id] = request_id
@@ -1706,7 +1778,6 @@ class _MOQTSessionMixin:
         if stream_id is not None and is_draft16_or_later():
             buf = message.serialize()
             self.stream_write(stream_id, buf.data)
-            self.transmit()
         else:
             self.send_control_message(message.serialize())
         return message
@@ -1897,14 +1968,45 @@ class _MOQTSessionMixin:
         # Handle announcement cancellation
 
     async def _handle_unsubscribe(self, msg: Unsubscribe) -> None:
+        """Publisher-side: subscriber wants out. RESET every subgroup uni
+        stream we still have open for this subscription's track_alias,
+        then drop the subscription state. The subscriber's matching
+        STOP_SENDING (if it raced) is reciprocated separately by the
+        StopSendingReceived handler."""
         logger.info(f"MOQT event: handle {msg}")
-        # Handle unsubscribe request
+        # Map request_id back to the track_alias we issued in subscribe_ok.
+        track_alias = next(
+            (ta for ta, rid in self._track_aliases.items()
+             if rid == msg.request_id),
+            None)
+        if track_alias is not None:
+            for key, sid in list(self._subgroup_stream_by_key.items()):
+                if key[0] == track_alias:
+                    self.stream_reset(sid, SessionCloseCode.NO_ERROR)
+                    self._unbind_stream(sid)
+                    self._data_streams.pop(sid, None)
+                    task = self._stream_tasks.pop(sid, None)
+                    if task is not None:
+                        task.cancel()
+        self._subscriptions.pop(msg.request_id, None)
 
     async def _handle_subscribe_done(self, msg: SubscribeDone) -> None:
+        """Subscriber-side: publisher signals end-of-subscription.
+        STOP_SENDING any subgroup stream still receiving for this
+        subscribe's track_alias so the publisher's write side can
+        release cleanly."""
         logger.info(f"MOQT event: handle SubscribeDone "
                      f"request_id={msg.request_id} "
                      f"status={msg.status_code} "
                      f"streams={msg.stream_count}")
+        track_alias = next(
+            (ta for ta, rid in self._track_aliases.items()
+             if rid == msg.request_id),
+            None)
+        if track_alias is not None:
+            for key, sid in list(self._subgroup_stream_by_key.items()):
+                if key[0] == track_alias:
+                    self.stream_stop_sending(sid, SessionCloseCode.NO_ERROR)
         future = self._pending_requests.get(msg.request_id)
         if future and not future.done():
             future.set_result(msg)
@@ -1981,21 +2083,14 @@ class _MOQTSessionMixin:
         """Publisher-side: FETCH_CANCEL received for a fetch we are
         serving. Reset the associated uni stream to release our write
         side, and resolve any pending request state.
-
-        Phase 1b publisher side: only operative when the application
-        registered the fetch's uni stream with bind_fetch_tx_stream().
         """
         logger.info(f"MOQT event: handle {msg}")
         stream_id = self._fetch_stream_by_request.pop(msg.request_id, None)
         if stream_id is not None:
             self._data_stream_key.pop(stream_id, None)
-            try:
-                self._quic.reset_stream(
-                    stream_id, SessionCloseCode.NO_ERROR)
-                logger.debug(f"MOQT stream({stream_id}): reset on FETCH_CANCEL "
-                             f"for request_id={msg.request_id}")
-            except Exception as e:
-                logger.debug(f"MOQT stream({stream_id}): reset_stream failed: {e}")
+            self.stream_reset(stream_id, SessionCloseCode.NO_ERROR)
+            logger.debug(f"MOQT stream({stream_id}): reset on FETCH_CANCEL "
+                         f"for request_id={msg.request_id}")
         self._resolve_request(msg.request_id, msg)
 
     async def _handle_fetch_ok(self, msg: FetchOk) -> None:
@@ -2015,12 +2110,9 @@ class _MOQTSessionMixin:
         stream_id = self._fetch_stream_by_request.pop(msg.request_id, None)
         if stream_id is not None:
             self._data_stream_key.pop(stream_id, None)
-            try:
-                self._quic.stop_stream(stream_id, msg.error_code)
-                logger.debug(f"MOQT stream({stream_id}): stop_sending on "
-                             f"FETCH_ERROR request_id={msg.request_id}")
-            except Exception as e:
-                logger.debug(f"MOQT stream({stream_id}): stop_stream failed: {e}")
+            self.stream_stop_sending(stream_id, msg.error_code)
+            logger.debug(f"MOQT stream({stream_id}): stop_sending on "
+                         f"FETCH_ERROR request_id={msg.request_id}")
         self._resolve_request(msg.request_id, msg)
 
 
