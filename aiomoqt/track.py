@@ -102,7 +102,7 @@ class PublishedTrack(Track):
     def __init__(self, session, namespace: str, trackname: str = 'track',
                  object_size: int = 1024, group_size: int = 60,
                  num_subgroups: int = 1, rate: float = 0,
-                 priority: int = 255, draft: Optional[int] = None,
+                 priority: int = 128, draft: Optional[int] = None,
                  auth_token: bytes = b"bench-token"):
         super().__init__(session, namespace, trackname,
                          object_size, group_size, num_subgroups, rate, draft)
@@ -739,7 +739,7 @@ class VideoTrack(PublishedTrack):
                         track_alias=track_alias,
                         group_id=group_id,
                         subgroup_id=subgroup_id,
-                        publisher_priority=255,
+                        publisher_priority=priority,
                         extensions_present=True,
                     )
                     msg = header.serialize()

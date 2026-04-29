@@ -430,10 +430,13 @@ async def _publisher_task(config: Dict[str, Any], mp_stop_event,
                     })
 
             async def _gen_when_subscribed():
-                """Block until a subscriber arrives, then generate."""
+                """Wait for the subscriber-arrived signal — generation
+                itself is launched by track.publish()'s handler chain
+                (_on_subscribe → _start_generating → track.generate).
+                Calling generate() here too would race the handler and
+                produce TWO concurrent generators per (track,group,
+                subgroup) — the relay rejects with 'duplicate group'."""
                 await track.wait_for_subscribers()
-                track._generating = True
-                await track.generate(session, track.track_alias)
 
             rate_task = asyncio.create_task(_rate_listener())
             stats_task = asyncio.create_task(_stats_loop())
