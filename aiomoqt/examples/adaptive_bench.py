@@ -910,7 +910,7 @@ class AIMDController:
         jit = fmt_ms(sig.jitter_ms)
         if self.actuator.unit == "subs":
             print(
-                f"  {t_rel:>5.1f}s     "
+                f"  {int(round(t_rel)):>5d}s     "
                 f"{bw:<7}    {sig.target_subs:<5}  │  "
                 f"{tx:<7}  {rx:<7}   {sig.active_subs:<5}  │  "
                 f"{mean:<6}  {p90:<6}  {jit:<6}  │  "
@@ -919,7 +919,7 @@ class AIMDController:
             )
         else:
             print(
-                f"  {t_rel:>5.1f}s     "
+                f"  {int(round(t_rel)):>5d}s     "
                 f"{bw:<7}  │  "
                 f"{tx:<7}  {rx:<7}  │  "
                 f"{mean:<6}  {p90:<6}  {jit:<6}  │  "
