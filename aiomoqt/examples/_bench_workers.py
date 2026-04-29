@@ -429,28 +429,23 @@ async def _publisher_task(config: Dict[str, Any], mp_stop_event,
                         'cumulative_wire_bytes': cur_wire,
                     })
 
-            async def _gen_when_subscribed():
-                """Wait for the subscriber-arrived signal — generation
-                itself is launched by track.publish()'s handler chain
-                (_on_subscribe → _start_generating → track.generate).
-                Calling generate() here too would race the handler and
-                produce TWO concurrent generators per (track,group,
-                subgroup) — the relay rejects with 'duplicate group'."""
-                await track.wait_for_subscribers()
-
+            # Generation is launched by track.publish()'s handler
+            # chain (_on_subscribe → _start_generating → track.generate)
+            # when the subscriber arrives. The worker just needs to
+            # stay alive — wait on rate / stats / stop tasks; the gen
+            # task lives inside the session's _tasks set.
             rate_task = asyncio.create_task(_rate_listener())
             stats_task = asyncio.create_task(_stats_loop())
-            gen_task = asyncio.create_task(_gen_when_subscribed())
             stop_task = asyncio.create_task(stop_ev.wait())
             try:
                 await asyncio.wait(
-                    {rate_task, stats_task, gen_task, stop_task},
+                    {rate_task, stats_task, stop_task},
                     return_when=asyncio.FIRST_COMPLETED,
                 )
             finally:
-                for t in (rate_task, stats_task, gen_task, stop_task):
+                for t in (rate_task, stats_task, stop_task):
                     t.cancel()
-                for t in (rate_task, stats_task, gen_task, stop_task):
+                for t in (rate_task, stats_task, stop_task):
                     try:
                         await t
                     except (asyncio.CancelledError, Exception):

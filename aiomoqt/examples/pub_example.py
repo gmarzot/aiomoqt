@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import asyncio
+import uuid
 
 from aiomoqt.types import MOQTMessageType, ParamType, ObjectStatus, MOQTException, MOQT_TIMESTAMP_EXT
 from aiomoqt.messages import (
@@ -226,7 +227,13 @@ def parse_args():
     parser.add_argument('--host', type=str, default='localhost', help='Host to connect to')
     parser.add_argument('--port', type=int, default=443, help='Port to connect to')
     parser.add_argument('--namespace', type=str, default='test', help='Namespace')
-    parser.add_argument('--trackname', type=str, default='track', help='Track')
+    parser.add_argument(
+        '--trackname', type=str,
+        default=f"track-{uuid.uuid4().hex[:4]}",
+        help='Track name (default: track-<rand4> — relay caches '
+             'reject differing payload bytes for the same trackname '
+             'across runs, so the random suffix avoids spurious '
+             'cache mismatches)')
     parser.add_argument('--use-quic', action='store_true', help='Enable QUIC transport')
     parser.add_argument('--path', type=str, default='', help='MOQT path (default: "/")')
     parser.add_argument('--datagram', action='store_true', help='Emit ObjectDatagrams')
