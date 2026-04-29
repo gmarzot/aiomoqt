@@ -296,3 +296,146 @@ def sub_worker_entry(config: Dict[str, Any], mp_stop_event, events_queue):
         asyncio.run(_subscriber_task(config, mp_stop_event, events_queue))
     except KeyboardInterrupt:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Publisher worker — for adaptive_bench BW mode + (eventually) loopback bench
+# ---------------------------------------------------------------------------
+
+async def _publisher_task(config: Dict[str, Any], mp_stop_event,
+                          rate_queue, events_queue):
+    """Connect to relay, publish a track, drive paced object generation
+    at a rate controllable from the parent via rate_queue.
+
+    rate_queue messages: {'rate_ops': float}  (objects/sec aggregate)
+    events_queue stats: {'kind':'pub_stats', 't', 'tx_bytes', 'tx_objs',
+                          'cumulative_bytes', 'cumulative_objs'} every 1s.
+    """
+    from aiomoqt.types import MOQTMessageType
+    from aiomoqt.track import PublishedTrack
+
+    relay = parse_relay_url(config['relay_url'],
+                            force_quic=config.get('force_quic', False))
+    client = MOQTClient(
+        relay.host, relay.port,
+        path=relay.path or "",
+        use_quic=relay.use_quic,
+        verify_tls=not config.get('insecure', False),
+        draft_version=config.get('draft'),
+    )
+
+    stop_ev = _bridge_stop_event(mp_stop_event)
+    iv_bytes = 0
+    iv_objs = 0
+    total_bytes = 0
+    total_objs = 0
+
+    try:
+        async with client.connect() as session:
+            await session.client_session_init()
+
+            track = PublishedTrack(
+                session,
+                namespace=config['namespace'],
+                trackname=config['trackname'],
+                object_size=config['object_size'],
+                group_size=config.get('group_size', 10000),
+                num_subgroups=config.get('num_subgroups', 1),
+                rate=config.get('initial_rate_ops', 0.0),
+            )
+            track._stats_header_printed = True
+            track._quiet = True
+
+            await track.publish(
+                announce_namespace=config.get('pub_ns', False)
+                                   or config.get('pub_both', False),
+                publish_track=not config.get('pub_ns', False)
+                              or config.get('pub_both', False),
+            )
+
+            _post(events_queue, {
+                'kind': 'pub_health', 'state': 'published',
+                't': time.monotonic(),
+            })
+
+            async def _rate_listener():
+                """Drain rate_queue without blocking; mutate track.rate."""
+                while not stop_ev.is_set():
+                    try:
+                        msg = rate_queue.get_nowait()
+                        if isinstance(msg, dict) and 'rate_ops' in msg:
+                            track.rate = float(msg['rate_ops'])
+                    except Exception:
+                        await asyncio.sleep(0.05)
+                        continue
+
+            async def _stats_loop():
+                nonlocal iv_bytes, iv_objs, total_bytes, total_objs
+                last_total_bytes = 0
+                last_total_objs = 0
+                while not stop_ev.is_set():
+                    await asyncio.sleep(STATS_INTERVAL_S)
+                    cur_bytes = getattr(track, '_total_bytes', 0)
+                    cur_objs = getattr(track, '_total_sent', 0)
+                    iv_bytes = cur_bytes - last_total_bytes
+                    iv_objs = cur_objs - last_total_objs
+                    last_total_bytes = cur_bytes
+                    last_total_objs = cur_objs
+                    total_bytes = cur_bytes
+                    total_objs = cur_objs
+                    _post(events_queue, {
+                        'kind': 'pub_stats',
+                        't': time.monotonic(),
+                        'tx_bytes': iv_bytes,
+                        'tx_objs': iv_objs,
+                        'cumulative_bytes': total_bytes,
+                        'cumulative_objs': total_objs,
+                    })
+
+            async def _gen_when_subscribed():
+                """Block until a subscriber arrives, then generate."""
+                await track.wait_for_subscribers()
+                track._generating = True
+                await track.generate(session, track.track_alias)
+
+            rate_task = asyncio.create_task(_rate_listener())
+            stats_task = asyncio.create_task(_stats_loop())
+            gen_task = asyncio.create_task(_gen_when_subscribed())
+            stop_task = asyncio.create_task(stop_ev.wait())
+            try:
+                await asyncio.wait(
+                    {rate_task, stats_task, gen_task, stop_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                for t in (rate_task, stats_task, gen_task, stop_task):
+                    t.cancel()
+                for t in (rate_task, stats_task, gen_task, stop_task):
+                    try:
+                        await t
+                    except (asyncio.CancelledError, Exception):
+                        pass
+
+            _post(events_queue, {
+                'kind': 'pub_health', 'state': 'closed',
+                't': time.monotonic(),
+            })
+            session.close()
+    except Exception as e:
+        _post(events_queue, {
+            'kind': 'pub_health', 'state': 'failed',
+            'detail': f'publisher error: {e}',
+            't': time.monotonic(),
+        })
+
+
+def pub_worker_entry(config: Dict[str, Any], mp_stop_event,
+                     rate_queue, events_queue):
+    """Process entrypoint. Spawned via multiprocessing.Process."""
+    _setup_quiet_logging(config.get('logdir'), 'pub',
+                         config.get('debug', False))
+    try:
+        asyncio.run(_publisher_task(config, mp_stop_event,
+                                     rate_queue, events_queue))
+    except KeyboardInterrupt:
+        pass
