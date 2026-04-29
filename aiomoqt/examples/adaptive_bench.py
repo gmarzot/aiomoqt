@@ -1409,8 +1409,33 @@ async def main():
         if relay_mode:
             if args.mode == "bw" and pub_proc is not None and sub_proc is not None:
                 # Multiprocess: pub and sub each in their own process.
-                # No in-process asyncio tasks for them.
+                # Sequence the spawn — publisher must reach 'published'
+                # before the subscriber subscribes, otherwise the relay
+                # races the subscribe against the announce and replies
+                # SubscribeOk + SubscribeDone(upstream disconnect)
+                # before the publisher's track is registered.
                 pub_proc.start()
+                # Wait up to 5s for pub_health: published — drain
+                # events into the actuator's pre-published peek path.
+                from queue import Empty
+                deadline = time.monotonic() + 5.0
+                published = False
+                while time.monotonic() < deadline and not published:
+                    try:
+                        ev = mp_events_q.get(timeout=0.1)
+                    except Empty:
+                        continue
+                    if (ev.get('kind') == 'pub_health'
+                            and ev.get('state') == 'published'):
+                        published = True
+                        break
+                    # Re-queue any non-target event so the actuator's
+                    # observe() drains them later.
+                    mp_events_q.put(ev)
+                if not published:
+                    print("  warning: publisher didn't report "
+                          "'published' within 5s; subscribing anyway "
+                          "— may race", file=sys.stderr)
                 sub_proc.start()
                 await asyncio.sleep(0.3)
             else:
