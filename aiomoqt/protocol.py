@@ -369,7 +369,15 @@ class _MOQTSessionMixin:
             return msg
 
         except Exception as e:
-            logger.error(f"handle_control_message: error handling control message: {e}")
+            import traceback
+            logger.error(
+                f"handle_control_message: error handling control "
+                f"message: {type(e).__name__}: {e!r}"
+            )
+            logger.error(
+                f"handle_control_message: traceback:\n"
+                f"{''.join(traceback.format_exception(type(e), e, e.__traceback__))}"
+            )
             raise
 
     def _stream_task_done(self, stream_id: int, task: asyncio.Task) -> None:
