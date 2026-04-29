@@ -63,6 +63,11 @@ class _RollingStats:
         self._last_total_bytes = 0
         self._last_total_objs = 0
         self._last_lost = 0
+        # RFC 3550 jitter: smooth |D| where D = inter-arrival skew
+        # vs source pacing. Updated per-object in on_object().
+        self._jitter_ms = 0.0
+        self._last_recv_us: int = 0
+        self._last_send_us: int = 0
 
     def on_object(self, msg, size_bytes, recv_time_us):
         """Timestamps on the wire are us; lat is float ms."""
@@ -76,6 +81,13 @@ class _RollingStats:
             # accept up to 10 minutes (real under-load latency).
             if -1_000_000 <= raw_us <= 600_000_000:
                 lat_ms = raw_us / 1000.0
+                if self._last_recv_us and self._last_send_us:
+                    d_us = abs((recv_time_us - self._last_recv_us)
+                               - (send_us - self._last_send_us))
+                    self._jitter_ms += (d_us / 1000.0
+                                        - self._jitter_ms) / 16.0
+                self._last_recv_us = recv_time_us
+                self._last_send_us = send_us
         self._events.append((t, size_bytes, lat_ms))
         self._total_bytes += size_bytes
         self._total_objs += 1
@@ -118,6 +130,7 @@ class _RollingStats:
         self._last_lost = self._lost
         return dict(t=t, rx_bytes=iv_bytes, rx_objs=iv_objs,
                     lat_mean_ms=mean, lat_p90_ms=p90,
+                    jitter_ms=self._jitter_ms,
                     iv_lost=iv_lost, loss=self._lost,
                     total_bytes=self._total_bytes,
                     total_objs=self._total_objs)

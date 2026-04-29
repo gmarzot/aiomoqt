@@ -96,6 +96,8 @@ class Signal:
     tx_mbps: float          # publisher-side measured (delta bytes / s)
     # subscriber-side rx (sum across active subs in subs-mode):
     rx_mbps: float
+    # RFC 3550 jitter — exponential smooth of inter-arrival deviation.
+    jitter_ms: float = 0.0
     # Liveness — meaningful in subs-mode; BWActuator fills defaults.
     target_subs: int = 1    # count the actuator is trying to maintain
     active_subs: int = 1    # subs currently receiving data
@@ -284,6 +286,9 @@ class BWActuator:
         #              (slow-start + cwnd ground truth).
         self._mp_tx_window = []     # (t, tx_bytes)
         self._mp_wire_window = []   # (t, wire_bytes)
+        # Per-sub-id latest jitter; aggregate = mean across active
+        # subs so multi-sub mode reports avg-of-subs not last-of-subs.
+        self._mp_jitter_per_sub: dict[int, float] = {}
 
     @property
     def is_mp(self) -> bool:
@@ -330,6 +335,12 @@ class BWActuator:
                         self._mp_lat_window.append((t, m))
                 self._mp_total_objs += ev.get('rx_objs', 0)
                 self._mp_total_lost += ev.get('iv_lost', 0)
+                # Per-sub-id smoothed jitter; aggregate is averaged
+                # across active subs in observe().
+                jit = ev.get('jitter_ms')
+                if jit is not None:
+                    sid = ev.get('sub_id', 0)
+                    self._mp_jitter_per_sub[sid] = jit
             # health events: no-op for stats; logged elsewhere.
         # Trim windows.
         cutoff = time.monotonic() - self._mp_window_s
@@ -363,6 +374,7 @@ class BWActuator:
                 target_mbps=sample.target_mbps,
                 tx_mbps=self.state.tx_rate_mbps,
                 rx_mbps=sample.rx_bitrate_mbps,
+                jitter_ms=sample.jitter_ms,
             )
         # Multiprocess path
         self._drain_events()
@@ -391,6 +403,10 @@ class BWActuator:
         shortfall = (self.state.target_mbps > 0
                      and rx_mbps
                      < self.shortfall_ratio * self.state.target_mbps)
+        # avg jitter across active subs (BW mode = 1 sub; subs mode = N).
+        jitter_ms = (sum(self._mp_jitter_per_sub.values())
+                     / len(self._mp_jitter_per_sub)
+                     if self._mp_jitter_per_sub else 0.0)
         return Signal(
             t=t,
             level=self.state.target_mbps,
@@ -401,6 +417,7 @@ class BWActuator:
             target_mbps=self.state.target_mbps,
             tx_mbps=tx_mbps,
             rx_mbps=rx_mbps,
+            jitter_ms=jitter_ms,
         )
 
     async def shutdown(self) -> None:
@@ -850,11 +867,11 @@ class AIMDController:
         # Group spans — must match widths used by _print_row.
         # Target:  BW(7) + gap(2) + [Nsubs(5) + gap(2)] if subs
         # Actual:  Tx(7) + gap(2) + Rx(7) + gap(2) + [Nsubs(5) + gap(2)]
-        # Latency: mean(6) + gap(2) + p90(6)
+        # Latency: mean(6) + gap(2) + p90(6) + gap(2) + jitter(6)
         target_span = 7 + (3 + 5 if has_subs else 0)
         actual_span = 7 + 2 + 7 + (3 + 5 if has_subs else 0)
-        latency_span = 6 + 2 + 6
-        time_pad = 10    # 'time' column + breathing space before BW
+        latency_span = 6 + 2 + 6 + 2 + 6
+        time_pad = 10
         print(
             f"  {' '*time_pad}"
             f"{'Target'.center(target_span)}    │  "
@@ -866,7 +883,7 @@ class AIMDController:
                 f"  {'time':>6}      "
                 f"{'BW':<7}   {'Nsub':<5}  │  "
                 f"{'Tx':<7}  {'Rx':<7}   {'Nsub':<5}  │  "
-                f"{'mean':<6}  {'p90':<6}  │  "
+                f"{'mean':<6}  {'p90':<6}  {'jitter':<6}  │  "
                 f"loss   action"
             )
         else:
@@ -874,7 +891,7 @@ class AIMDController:
                 f"  {'time':>6}      "
                 f"{'BW':<7}  │  "
                 f"{'Tx':<7}  {'Rx':<7}  │  "
-                f"{'mean':<6}  {'p90':<6}  │  "
+                f"{'mean':<6}  {'p90':<6}  {'jitter':<6}  │  "
                 f"loss   action"
             )
         total_w = time_pad + 2 + target_span + 5 + actual_span + 5 + latency_span + 5 + 14
@@ -890,12 +907,13 @@ class AIMDController:
         rx = fmt_bps(sig.rx_mbps * 1e6)
         mean = fmt_ms(sig.latency_mean_ms)
         p90 = fmt_ms(sig.latency_p90_ms)
+        jit = fmt_ms(sig.jitter_ms)
         if self.actuator.unit == "subs":
             print(
                 f"  {t_rel:>5.1f}s     "
                 f"{bw:<7}    {sig.target_subs:<5}  │  "
                 f"{tx:<7}  {rx:<7}   {sig.active_subs:<5}  │  "
-                f"{mean:<6}  {p90:<6}  │  "
+                f"{mean:<6}  {p90:<6}  {jit:<6}  │  "
                 f"{f'{sig.loss_pct:.1f}%':<5}  {action}",
                 flush=True,
             )
@@ -904,7 +922,7 @@ class AIMDController:
                 f"  {t_rel:>5.1f}s     "
                 f"{bw:<7}  │  "
                 f"{tx:<7}  {rx:<7}  │  "
-                f"{mean:<6}  {p90:<6}  │  "
+                f"{mean:<6}  {p90:<6}  {jit:<6}  │  "
                 f"{f'{sig.loss_pct:.1f}%':<5}  {action}",
                 flush=True,
             )

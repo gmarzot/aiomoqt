@@ -13,7 +13,9 @@ def parse_args():
     parser.add_argument('--host', type=str, default='localhost', help='Host to connect to')
     parser.add_argument('--port', type=int, default=443, help='Port to connect to')
     parser.add_argument('--namespace', type=str, default="live/test", help='Track Namespace')
-    parser.add_argument('--trackname', type=str, default="track", help='Track Name')
+    parser.add_argument(
+        '--trackname', type=str, default=None,
+        help='Track Name (default: auto-discover via SUBSCRIBE_NAMESPACE)')
     parser.add_argument('--path', type=str, default="", help='MOQT WT path (default: "/")')
     parser.add_argument('--use-quic', action='store_true', help='Enable QUIC transport')
     parser.add_argument('--debug', action='store_true', help='Enable debug output')
