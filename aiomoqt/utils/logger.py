@@ -40,6 +40,10 @@ def get_logger(name: str, level: Optional[int] = None) -> logging.Logger:
             _handler = handler
 
         logger.addHandler(_handler)
+        # Don't bubble to root — root may have its own StreamHandler
+        # (e.g. multiprocessing workers calling logging.basicConfig)
+        # which would emit each message twice.
+        logger.propagate = False
 
     if _level is not None:
         level = _level
