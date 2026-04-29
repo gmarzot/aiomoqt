@@ -619,9 +619,10 @@ class SubsActuator:
 
         for sid in active_ids:
             s = self._latest_stats.get(sid, {})
-            # rx_bytes is a rolling-window (5s) byte count; convert to Mbps.
+            # rx_bytes is a per-snapshot delta (~1s of bytes since the
+            # last stats event); convert to Mbps using STATS_INTERVAL_S.
             rx_bytes = s.get('rx_bytes', 0)
-            per_sub_mbps = (rx_bytes * 8) / (5.0 * 1e6)
+            per_sub_mbps = (rx_bytes * 8) / (1.0 * 1e6)
             rx_bps_total += per_sub_mbps * 1e6
             p90 = s.get('lat_p90_ms', 0.0)
             mean = s.get('lat_mean_ms', 0.0)
