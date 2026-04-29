@@ -381,39 +381,41 @@ class _MOQTSessionMixin:
             raise
 
     def _stream_task_done(self, stream_id: int, task: asyncio.Task) -> None:
-        logger.debug(f"MOQT stream({stream_id}): stream task done: num stream tasks: {len(self._stream_tasks)}")
-
-        if self._stream_tasks.pop(stream_id, None) is None:
-            logger.warning(f"MOQT stream({stream_id}): stream task already removed")
-
-        if stream_id not in self._data_streams:
-            logger.warning(f"MOQT stream({stream_id}): stream already removed")
+        """Per-uni-stream done-callback. Hot path at high stream churn —
+        avoid f-string formatting, log only real anomalies, single
+        cleanup pass per entry. The pre-existing track.py cleanup
+        pattern relies on this no-op'ing cleanly when entries are
+        already gone."""
+        # Unconditional pop — no warning if already absent. The clean-
+        # FIN path arrives here with entries still present; the
+        # double-cleanup path (track.py group-boundary) doesn't.
+        self._stream_tasks.pop(stream_id, None)
+        self._data_streams.pop(stream_id, None)
 
         error_code = QuicErrorCode.NO_ERROR
         if task.cancelled():
             error_code = QuicErrorCode.APPLICATION_ERROR
-            logger.warning(f"MOQT stream({stream_id}): task cancelled")
         else:
             e = task.exception()
-            if e:
+            if e is not None:
                 error_code = QuicErrorCode.APPLICATION_ERROR
-                if isinstance(e, TimeoutError):
-                    logger.debug(f"MOQT stream({stream_id}): stream idle timeout")
-                else:
+                if not isinstance(e, TimeoutError):
+                    # Real failure — keep loud. %-style lazy-format
+                    # so non-error path doesn't pay traceback cost.
                     import traceback
-                    logger.error(f"MOQT stream({stream_id}): task failed with exception: {type(e).__name__}\n{''.join(traceback.format_exception(e))}")
-            else:
-                logger.debug(f"MOQT stream({stream_id}): task completed")
+                    logger.error(
+                        "MOQT stream(%d): task failed: %s\n%s",
+                        stream_id, type(e).__name__,
+                        ''.join(traceback.format_exception(e)),
+                    )
 
-        # Resolve fetch completion future if this was a fetch stream
+        # Resolve fetch completion future if this was a fetch stream.
         key = self._data_stream_key.get(stream_id)
         if key and len(key) == 2 and key[0] == 'fetch':
             request_id = key[1]
             fut = self._fetch_done_futures.pop(request_id, None)
             if fut and not fut.done():
                 fut.set_result(error_code == QuicErrorCode.NO_ERROR)
-                logger.debug(f"MOQT stream({stream_id}): fetch "
-                             f"request_id={request_id} complete")
         self._unbind_stream(stream_id)
 
     def _on_stream_data(self, stream_id: int, data: bytes,
@@ -495,7 +497,8 @@ class _MOQTSessionMixin:
 
             if msg_buf is None:  # FIN sentinel
                 logger.debug(
-                    f"MOQT stream({stream_id}): queue closed: task shutdown"
+                    "MOQT stream(%d): queue closed: task shutdown",
+                    stream_id,
                 )
                 return
 
