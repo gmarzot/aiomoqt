@@ -370,9 +370,16 @@ async def _publisher_task(config: Dict[str, Any], mp_stop_event,
                         continue
 
             async def _stats_loop():
+                """Per-second pub stats. tx_bytes counts bytes the
+                publisher has *queued* via send_stream_data; wire_bytes
+                counts what picoquic has actually placed on the wire.
+                The two diverge during slow-start and any time the
+                publisher's queue grows beyond the cwnd."""
                 nonlocal iv_bytes, iv_objs, total_bytes, total_objs
                 last_total_bytes = 0
                 last_total_objs = 0
+                last_wire_bytes = 0
+                quic = getattr(session, '_quic', None)
                 while not stop_ev.is_set():
                     await asyncio.sleep(STATS_INTERVAL_S)
                     cur_bytes = getattr(track, '_total_bytes', 0)
@@ -383,13 +390,24 @@ async def _publisher_task(config: Dict[str, Any], mp_stop_event,
                     last_total_objs = cur_objs
                     total_bytes = cur_bytes
                     total_objs = cur_objs
+                    # Wire-bytes from picoquic's internal counter.
+                    cur_wire = 0
+                    try:
+                        if quic is not None:
+                            cur_wire = quic.bytes_sent
+                    except Exception:
+                        cur_wire = 0
+                    iv_wire = max(0, cur_wire - last_wire_bytes)
+                    last_wire_bytes = cur_wire
                     _post(events_queue, {
                         'kind': 'pub_stats',
                         't': time.monotonic(),
                         'tx_bytes': iv_bytes,
                         'tx_objs': iv_objs,
+                        'wire_bytes': iv_wire,
                         'cumulative_bytes': total_bytes,
                         'cumulative_objs': total_objs,
+                        'cumulative_wire_bytes': cur_wire,
                     })
 
             async def _gen_when_subscribed():

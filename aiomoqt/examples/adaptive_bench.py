@@ -278,8 +278,12 @@ class BWActuator:
         self._mp_total_lost = 0
         self._mp_total_objs = 0
         self._mp_window_s = 5.0
-        # publisher tx rate from pub_stats events
-        self._mp_tx_window = []   # (t, tx_bytes)
+        # publisher rates from pub_stats events.
+        # tx_bytes  = bytes the publisher queued via send_stream_data.
+        # wire_bytes = bytes picoquic actually placed on the wire
+        #              (slow-start + cwnd ground truth).
+        self._mp_tx_window = []     # (t, tx_bytes)
+        self._mp_wire_window = []   # (t, wire_bytes)
 
     @property
     def is_mp(self) -> bool:
@@ -308,6 +312,7 @@ class BWActuator:
             t = ev.get('t', time.monotonic())
             if kind == 'pub_stats':
                 self._mp_tx_window.append((t, ev.get('tx_bytes', 0)))
+                self._mp_wire_window.append((t, ev.get('wire_bytes', 0)))
             elif kind == 'stats':
                 rx_bytes = ev.get('rx_bytes', 0)
                 if rx_bytes:
@@ -336,6 +341,9 @@ class BWActuator:
         ]
         self._mp_tx_window = [
             (t, b) for (t, b) in self._mp_tx_window if t >= cutoff
+        ]
+        self._mp_wire_window = [
+            (t, b) for (t, b) in self._mp_wire_window if t >= cutoff
         ]
 
     async def observe(self) -> Signal:
@@ -368,7 +376,13 @@ class BWActuator:
             mean = 0.0
             p90 = 0.0
         rx_bytes = sum(b for (_, b) in self._mp_rx_window)
-        tx_bytes = sum(b for (_, b) in self._mp_tx_window)
+        # tx column reports wire-bytes (picoquic ground truth); falls
+        # back to queued bytes if the wire counter isn't available.
+        wire_bytes = sum(b for (_, b) in self._mp_wire_window)
+        if wire_bytes > 0:
+            tx_bytes = wire_bytes
+        else:
+            tx_bytes = sum(b for (_, b) in self._mp_tx_window)
         win = max(0.5, self._mp_window_s)
         rx_mbps = (rx_bytes * 8) / (win * 1e6)
         tx_mbps = (tx_bytes * 8) / (win * 1e6)
