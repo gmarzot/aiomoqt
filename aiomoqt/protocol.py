@@ -344,7 +344,21 @@ class _MOQTSessionMixin:
             msg_len = buf.pull_uint16()
             hdr_len = buf.tell() - start_pos
             end_pos = start_pos + hdr_len + msg_len
-            assert buf.tell() + msg_len <= buf_len
+            if buf.tell() + msg_len > buf_len:
+                # Truncated chunk — the message claims more payload
+                # than we have. Per-event control parsing currently
+                # assumes whole messages per chunk; if the relay
+                # fragments, we surface a clear error and dump the
+                # buffer rather than asserting.
+                head_hex = buf.data_slice(
+                    start_pos, min(start_pos + 64, buf_len)).hex()
+                logger.error(
+                    "MOQT control: truncated msg type=0x%x msg_len=%d "
+                    "tell=%d buf_len=%d head_hex=%s",
+                    int(msg_type), msg_len, buf.tell(), buf_len, head_hex,
+                )
+                buf.seek(buf_len)
+                return None
             # Check that msg_type exists
             try:
                 msg_type = MOQTMessageType(msg_type)
