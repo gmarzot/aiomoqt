@@ -1361,6 +1361,7 @@ async def main():
                     args.scenario.start_mbps),
                 pub_ns=args.pub_ns,
                 pub_both=args.pub_both,
+                debug=args.debug,
             )
             sub_cfg = dict(
                 sub_id=0,
@@ -1371,6 +1372,7 @@ async def main():
                 insecure=args.insecure,
                 force_quic=False,
                 sub_filter=int(FilterType.LATEST_OBJECT),
+                debug=args.debug,
             )
             pub_proc = mp.Process(
                 target=pub_worker_entry,
