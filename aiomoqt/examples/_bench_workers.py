@@ -400,13 +400,16 @@ async def _publisher_task(config: Dict[str, Any], mp_stop_event,
                     last_total_objs = cur_objs
                     total_bytes = cur_bytes
                     total_objs = cur_objs
-                    # Wire-bytes from picoquic's internal counter.
+                    # Wire-bytes from picoquic's internal counter. The
+                    # cnx pointer is only valid while the cnx is alive;
+                    # swallow anything thrown by the FFI to keep the
+                    # stats loop running through teardown.
                     cur_wire = 0
                     try:
                         if quic is not None:
                             cur_wire = quic.bytes_sent
-                    except Exception:
-                        cur_wire = 0
+                    except (Exception, SystemError):
+                        cur_wire = last_wire_bytes
                     iv_wire = max(0, cur_wire - last_wire_bytes)
                     last_wire_bytes = cur_wire
                     _post(events_queue, {
