@@ -1486,10 +1486,16 @@ class MOQTSession(QuicConnectionProtocol):
         stream = self._quic._streams.get(stream_id)
         if stream is None:
             return True  # stream not yet registered — allow write
-        if stream.sender._reset_error_code is not None:
-            return False
-        if stream.sender._buffer_fin is not None:
-            return False  # FIN already queued (close() sent it)
+        sender = stream.sender
+        # qh3 1.8.0 (patch-perf) renamed internals → boolean properties.
+        if hasattr(sender, 'reset_pending'):
+            if sender.reset_pending or sender.is_finished:
+                return False
+        else:
+            if sender._reset_error_code is not None:
+                return False
+            if sender._buffer_fin is not None:
+                return False
         return True
 
     async def stream_write_drain(self, stream_id: int, data: bytes,
