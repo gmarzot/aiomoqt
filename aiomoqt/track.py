@@ -121,7 +121,8 @@ class PublishedTrack(Track):
         self._total_groups = 0
 
     async def publish(self, announce_namespace: bool = False,
-                      publish_track: bool = True):
+                      publish_track: bool = True,
+                      forward: int = 0):
         """Announce this publisher to the relay.
 
         Three valid combinations (Alan: a publisher picks one flow):
@@ -136,6 +137,21 @@ class PublishedTrack(Track):
 
           announce_namespace=True, publish_track=True  (hybrid):
             Rare; some relays want both. Breaks on CF d14 moq-rs.
+
+        Args:
+          forward: initial Forward State in PUBLISH (d16 §8.2). Default
+            0 = "I'll wait" (spec-conservative; generation starts when
+            relay's PUBLISH_OK or a SUBSCRIBE/REQUEST_UPDATE signals
+            forward=1). Pass forward=1 to declare optimistic intent —
+            generation starts immediately after sending PUBLISH, before
+            waiting for PUBLISH_OK.
+            **EXPERIMENTAL — NOT SUPPORTED BY THE SPEC.** Per Alan
+            Frindell, MoQT does not support sending objects before the
+            PUBLISH_OK handshake completes; relays will reject the
+            unsolicited uni streams (every first-object parse fails).
+            Kept in the API for future use should the spec evolve, and
+            for low-level wire experimentation. Do not rely on this in
+            production.
         """
         if not (announce_namespace or publish_track):
             raise ValueError(
@@ -172,13 +188,19 @@ class PublishedTrack(Track):
             pub_msg = self.session.publish(
                 namespace=self.namespace,
                 track_name=self.trackname,
-                forward=0,
+                forward=forward,
             )
             self.track_alias = pub_msg.track_alias
             self.request_id = pub_msg.request_id
             self.state = TrackState.PUBLISHED
             logger.info(f"Track: published {self.fqtn} "
-                         f"alias={self.track_alias}")
+                         f"alias={self.track_alias} forward={forward}")
+            # Optimistic mode: don't wait for PUBLISH_OK before generating.
+            # The relay may RESET our streams or downshift to forward=0;
+            # both are handled by existing reset / SUBSCRIBE_UPDATE paths.
+            if forward:
+                asyncio.create_task(
+                    self._start_generating(self.session, "OPTIMISTIC"))
 
     async def _start_generating(self, session, trigger: str):
         """Start data generation if not already running."""
@@ -193,9 +215,12 @@ class PublishedTrack(Track):
         await self.generate(session, self.track_alias)
 
     async def _on_publish_ok(self, session, msg: PublishOk):
-        """Relay accepted our PUBLISH. If forward=1, start generating."""
+        """Relay accepted our PUBLISH. forward=1 starts generation if
+        not already running (no-op if optimistic publish already kicked
+        off the generator). forward=0 is logged but does not stop a
+        running generator — relay can RESET streams to enforce."""
         logger.info(f"Track: PUBLISH_OK: forward={msg.forward}")
-        if msg.forward and msg.forward >= 1:
+        if msg.forward:
             await self._start_generating(session, "PUBLISH_OK")
 
     async def _on_request_update(self, session, msg: RequestUpdate):
@@ -203,14 +228,14 @@ class PublishedTrack(Track):
         logger.info(f"Track: REQUEST_UPDATE: {msg}")
         forward = (msg.parameters.get(ParamType.FORWARD)
                    if msg.parameters else None)
-        if not forward or forward <= 0:
+        if not forward:
             return
         await self._start_generating(session, "REQUEST_UPDATE")
 
     async def _on_subscribe_update(self, session, msg):
         """SUBSCRIBE_UPDATE — subscriber changed forward state."""
         logger.info(f"Track: SUBSCRIBE_UPDATE: forward={msg.forward}")
-        if msg.forward and msg.forward >= 1:
+        if msg.forward:
             await self._start_generating(session, "SUBSCRIBE_UPDATE")
 
     async def _on_subscribe(self, session, msg):
