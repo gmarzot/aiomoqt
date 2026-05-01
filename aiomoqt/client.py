@@ -70,6 +70,7 @@ class MOQTClient(MOQTPeer):
                     max_data=2**24, max_stream_data=2**24,
                     max_datagram_frame_size=64 * 1024,
                     server_name=self.host,
+                    secrets_log_file=self.keylog_filename,
                 )
             protocol = lambda *a, **kw: MOQTSessionQuic(*a, **kw, session=self)
             return aiopquic_connect(
