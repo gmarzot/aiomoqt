@@ -201,6 +201,7 @@ async def _subscriber_task(config: Dict[str, Any], mp_stop_event,
         use_quic=relay.use_quic,
         verify_tls=not config.get('insecure', False),
         draft_version=config.get('draft'),
+        keylog_filename=config.get('keylogfile'),
     )
 
     stop_ev = _bridge_stop_event(mp_stop_event)
@@ -351,6 +352,7 @@ async def _publisher_task(config: Dict[str, Any], mp_stop_event,
         use_quic=relay.use_quic,
         verify_tls=not config.get('insecure', False),
         draft_version=config.get('draft'),
+        keylog_filename=config.get('keylogfile'),
     )
 
     stop_ev = _bridge_stop_event(mp_stop_event)

@@ -1239,6 +1239,12 @@ def parse_args():
                         "'next-group-start' skips current-group replay "
                         "some relays do on latest-object.")
     p.add_argument("-d", "--debug", action="store_true")
+    p.add_argument("--keylogfile", default=None,
+                   help="TLS secrets log path (NSS Key Log Format) for "
+                        "Wireshark decryption of pcap captures. Each MP "
+                        "worker (publisher / subscriber) gets a "
+                        "process-suffixed file: PATH.pub.<pid>, "
+                        "PATH.sub.<pid> — combined when decrypting.")
     args = p.parse_args()
     args.sub_filter = filter_choices[args.sub_filter]
     if args.sub_filter in (FilterType.ABSOLUTE_START,
@@ -1389,6 +1395,8 @@ async def main():
                 pub_ns=args.pub_ns,
                 pub_both=args.pub_both,
                 debug=args.debug,
+                keylogfile=(f"{args.keylogfile}.pub"
+                            if args.keylogfile else None),
             )
             sub_cfg = dict(
                 sub_id=0,
@@ -1400,6 +1408,8 @@ async def main():
                 force_quic=False,
                 sub_filter=int(FilterType.LATEST_OBJECT),
                 debug=args.debug,
+                keylogfile=(f"{args.keylogfile}.sub"
+                            if args.keylogfile else None),
             )
             pub_proc = mp.Process(
                 target=pub_worker_entry,
