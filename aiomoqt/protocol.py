@@ -1,5 +1,7 @@
 import asyncio
+import os
 import time
+import zlib
 from asyncio import Future
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -25,6 +27,15 @@ from aiopquic.streamchain import StreamChain
 USER_AGENT = f"aiomoqt/{version('aiomoqt')}"
 
 MOQT_IDLE_STREAM_TIMEOUT = 5
+
+# Per-stream byte-count trace for desync forensics. AIOMOQT_DESYNC_TRACE=1
+# adds cheap per-stream byte counters at TX and RX boundaries — fast
+# enough to leave on at production rates. AIOMOQT_DESYNC_CRC=1 layers
+# rolling CRC32 on top; needed when byte totals match but content
+# diverges. CRC has measurable CPU cost at >100Mbps; only enable when a
+# byte-count mismatch isn't the answer.
+_DESYNC_TRACE = bool(int(os.environ.get('AIOMOQT_DESYNC_TRACE', '0')))
+_DESYNC_CRC = bool(int(os.environ.get('AIOMOQT_DESYNC_CRC', '0')))
 
 # WebTransport stream header wire constants (draft-ietf-webtrans-http3).
 # Every WT stream is prefixed with <type, session_id> as two QUIC varints.
@@ -79,6 +90,11 @@ class _DataStreamState:
     parser: Optional['MOQTMessage'] = None
     key: Optional[tuple] = None
     bytes_total: int = 0
+    # Desync trace: cumulative bytes that arrived in chain.extend (NOT
+    # bytes parsed) plus rolling CRC32 of those bytes. Lets us correlate
+    # to the publisher's stream_write_drain CRC at the same byte offset.
+    rx_bytes: int = 0
+    rx_crc: int = 0
 
 
 class _MOQTSessionMixin:
@@ -122,6 +138,11 @@ class _MOQTSessionMixin:
         # task, parser, binding-key, and forensic counter into one
         # slotted object. See class docstring above.
         self._data_streams: Dict[int, _DataStreamState] = {}
+        # Desync trace: per-stream cumulative bytes pushed to the wire
+        # (publisher side via stream_write_drain) and rolling CRC32. Only
+        # populated when AIOMOQT_DESYNC_TRACE=1.
+        self._tx_bytes: Dict[int, int] = {}
+        self._tx_crc: Dict[int, int] = {}
         self._tasks: Set[asyncio.Task] = set()
         self._close_err = None  # tuple holding latest (error_code, Reason_phrase)
 
@@ -511,6 +532,14 @@ class _MOQTSessionMixin:
             chain.extend(msg_buf)
             n_extends += 1
             last_chunks.append((len(msg_buf), chain.capacity, n_extends))
+            if _DESYNC_TRACE:
+                # Convert memoryview/bytes-like to bytes for crc32; the
+                # cost is acceptable here because the trace gate is off
+                # in normal runs.
+                buf_bytes = bytes(msg_buf) if not isinstance(
+                    msg_buf, (bytes, bytearray)) else msg_buf
+                state.rx_bytes += len(buf_bytes)
+                state.rx_crc = zlib.crc32(buf_bytes, state.rx_crc)
             logger.debug(
                 f"MOQT stream({stream_id}): chunk received: "
                 f"chunk_len={len(msg_buf)} chain_total={chain.capacity}"
@@ -612,6 +641,19 @@ class _MOQTSessionMixin:
                         f"n_extends_now={n_extends} "
                         f"chunks_spanned={n_extends - chunk_id_at_save + 1}"
                     )
+                    if _DESYNC_TRACE:
+                        # Subscriber's authoritative wire-byte view. The
+                        # publisher's stream_write_drain accumulates the
+                        # same metric in self._tx_bytes/_tx_crc; on
+                        # loopback runs both endpoints are in this
+                        # process and you can read both directly. On
+                        # remote, the publisher process will dump on
+                        # session close.
+                        logger.error(
+                            f"MOQT stream({stream_id}): RX trace "
+                            f"rx_bytes={state.rx_bytes} "
+                            f"rx_crc=0x{state.rx_crc:08x}"
+                        )
                     self._reject_stream(
                         stream_id,
                         SessionCloseCode.PROTOCOL_VIOLATION,
@@ -1046,7 +1088,19 @@ class _MOQTSessionMixin:
 
             if self._close_err is not None or (
                     hasattr(self, '_closed') and self._closed.is_set()):
-                logger.warning(f"QUIC event: stream data after close: stream {stream_id}")
+                # Rate-limit: log once per stream_id to avoid drowning
+                # other diagnostics when a closed-but-still-arriving
+                # stream gets flooded with packets.
+                seen = getattr(self, '_post_close_warned', None)
+                if seen is None:
+                    seen = set()
+                    self._post_close_warned = seen
+                if stream_id not in seen:
+                    seen.add(stream_id)
+                    logger.warning(
+                        f"QUIC event: stream data after close: stream {stream_id} "
+                        f"(rate-limited to once per stream)"
+                    )
                 return
 
             data = event.data if event.data is not None else b""
@@ -1129,6 +1183,12 @@ class _MOQTSessionMixin:
             logger.info(f"MOQT: closing: {reason_phrase} ({error_code})")
         else:
             logger.error(f"MOQT error: closing: {reason_phrase} ({error_code})")
+        if _DESYNC_TRACE and self._tx_bytes:
+            for sid, total in self._tx_bytes.items():
+                logger.error(
+                    f"MOQT stream({sid}): TX trace tx_bytes={total} "
+                    f"tx_crc=0x{self._tx_crc.get(sid, 0):08x}"
+                )
         self._close_err = (error_code, reason_phrase)
 
         # Signal all stream tasks to shut down gracefully via FIN sentinel.
@@ -1313,6 +1373,11 @@ class _MOQTSessionMixin:
             try:
                 self._quic.send_stream_data(
                     stream_id, data, end_stream=end_stream)
+                if _DESYNC_TRACE and data:
+                    self._tx_bytes[stream_id] = (
+                        self._tx_bytes.get(stream_id, 0) + len(data))
+                    self._tx_crc[stream_id] = zlib.crc32(
+                        data, self._tx_crc.get(stream_id, 0))
                 return
             except BufferError:
                 await asyncio.sleep(0.0001)

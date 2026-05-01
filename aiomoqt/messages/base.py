@@ -1,3 +1,4 @@
+import os
 from typing import Any, Optional, Union, Dict
 from dataclasses import dataclass, field, fields
 
@@ -7,6 +8,11 @@ from ..utils.buffer import Buffer, BufferReadError
 from ..utils.logger import *
 
 logger = get_logger(__name__)
+
+# Same env gate as the ObjectHeader.serialize strict-check, extended to
+# cover the extensions block. Catches publisher-side declared-vs-actual
+# mismatches in the temp-buffer extensions encode path.
+_STRICT_SERIALIZE = bool(int(os.environ.get('AIOMOQT_STRICT_SERIALIZE', '0')))
 
 BUF_SIZE = 4 * 1024  # 4KB buffer size for messages
 
@@ -52,9 +58,23 @@ class MOQTMessage:
                     payload.push_bytes(ext_value)
 
             exts_len = payload.tell()
+            if _STRICT_SERIALIZE and len(payload.data) != exts_len:
+                raise AssertionError(
+                    f"_extensions_encode payload mismatch: "
+                    f"declared exts_len={exts_len} "
+                    f"actual payload.data bytes={len(payload.data)}"
+                )
             if with_length:
                 buf.push_uint_var(exts_len)
+            payload_bytes_before = buf.tell()
             buf.push_bytes(payload.data)
+            actual_pushed = buf.tell() - payload_bytes_before
+            if _STRICT_SERIALIZE and actual_pushed != exts_len:
+                raise AssertionError(
+                    f"_extensions_encode push_bytes mismatch: "
+                    f"declared exts_len={exts_len} "
+                    f"actually pushed={actual_pushed}"
+                )
         else:
             buf.push_uint_var(len(exts))
             for ext_id, ext_value in exts.items():
