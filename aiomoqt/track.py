@@ -291,7 +291,14 @@ class PublishedTrack(Track):
         mutate `track.rate` in-place to change pacing live.
         """
 
-        pad = b'\xBB' * self.object_size
+        # Counted byte pattern (0..255 repeating). Pre-allocated once
+        # per generate() call. Combined with the per-object f"{group}.
+        # {obj}|" prefix in payload, every byte at every offset of every
+        # object has a deterministic, predictable value — visible in
+        # decrypted pcap and easy to spot duplicates / skips / random
+        # corruption. The prefix identifies WHICH object the bytes came
+        # from; the counted suffix shows offset-within-object.
+        pad = bytes(i & 0xFF for i in range(self.object_size))
 
         for subgroup_id in range(self.num_subgroups):
             priority = self.priority if subgroup_id == 0 else 0

@@ -704,7 +704,8 @@ class AIMDController:
                  interval_s: float, writer=None,
                  latency_threshold_ms: float = 100.0,
                  backoff_factor: float = 0.9,
-                 loss_threshold_pct: float = 0.5):
+                 loss_threshold_pct: float = 0.5,
+                 duration_s: float | None = None):
         self.actuator = actuator
         self.state = state
         self.interval_s = interval_s
@@ -712,6 +713,7 @@ class AIMDController:
         self.latency_threshold_ms = latency_threshold_ms
         self.backoff_factor = backoff_factor
         self.loss_threshold_pct = loss_threshold_pct
+        self.duration_s = duration_s
         self.shortfall_streak = 0
         self.pressure_streak = 0
         self.hold_intervals = 0
@@ -739,6 +741,15 @@ class AIMDController:
                 break
             except asyncio.TimeoutError:
                 pass
+
+            # Hard wall-clock cap. Checked at interval boundaries so
+            # the in-progress sample completes and gets reported.
+            if (self.duration_s is not None
+                    and time.monotonic() - self.t0 >= self.duration_s):
+                state.ceiling_reason = (
+                    f"duration cap reached ({self.duration_s:.0f}s)")
+                state.stop.set()
+                break
 
             sig = await a.observe()
             self.samples += 1
@@ -1239,6 +1250,12 @@ def parse_args():
                         "'next-group-start' skips current-group replay "
                         "some relays do on latest-object.")
     p.add_argument("-d", "--debug", action="store_true")
+    p.add_argument("-t", "--duration", type=float, default=None,
+                   metavar="SECONDS",
+                   help="hard wall-clock cap; controller exits after "
+                        "this many seconds even if --max-mbps / --max-subs "
+                        "hasn't been reached. Useful for fixed-budget "
+                        "regression runs.")
     p.add_argument("--keylogfile", default=None,
                    help="TLS secrets log path (NSS Key Log Format) for "
                         "Wireshark decryption of pcap captures. Each MP "
@@ -1437,6 +1454,7 @@ async def main():
         writer=csv_writer,
         latency_threshold_ms=args.latency_threshold,
         backoff_factor=args.backoff_factor,
+        duration_s=args.duration,
     )
 
     server = None

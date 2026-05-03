@@ -36,6 +36,20 @@ MOQT_IDLE_STREAM_TIMEOUT = 5
 # byte-count mismatch isn't the answer.
 _DESYNC_TRACE = bool(int(os.environ.get('AIOMOQT_DESYNC_TRACE', '0')))
 _DESYNC_CRC = bool(int(os.environ.get('AIOMOQT_DESYNC_CRC', '0')))
+# AIOMOQT_DESYNC_FOCUS=N — restrict per-chunk logging to stream_id N.
+# AIOMOQT_DESYNC_STRIDE=K — log every Kth chunk (plus chunk 0) on every
+#   stream; pair with AIOPQUIC_RX_STRIDE=K so whichever stream desyncs
+#   already has a strided trace in the log without rerunning.
+# Both gates emit chunk index, cumulative byte offset, head[16] hex,
+# and tail[8] hex when chunk len > 16.
+def _env_int(name: str, default: Optional[int]) -> Optional[int]:
+    v = os.environ.get(name)
+    if v and v.isdigit():
+        return int(v)
+    return default
+
+_DESYNC_FOCUS: Optional[int] = _env_int('AIOMOQT_DESYNC_FOCUS', None)
+_DESYNC_STRIDE: int = _env_int('AIOMOQT_DESYNC_STRIDE', 0) or 0
 
 # WebTransport stream header wire constants (draft-ietf-webtrans-http3).
 # Every WT stream is prefixed with <type, session_id> as two QUIC varints.
@@ -95,6 +109,7 @@ class _DataStreamState:
     # to the publisher's stream_write_drain CRC at the same byte offset.
     rx_bytes: int = 0
     rx_crc: int = 0
+    rx_chunks: int = 0
 
 
 class _MOQTSessionMixin:
@@ -530,16 +545,35 @@ class _MOQTSessionMixin:
                 return
 
             chain.extend(msg_buf)
-            n_extends += 1
-            last_chunks.append((len(msg_buf), chain.capacity, n_extends))
             if _DESYNC_TRACE:
-                # Convert memoryview/bytes-like to bytes for crc32; the
-                # cost is acceptable here because the trace gate is off
-                # in normal runs.
-                buf_bytes = bytes(msg_buf) if not isinstance(
-                    msg_buf, (bytes, bytearray)) else msg_buf
-                state.rx_bytes += len(buf_bytes)
-                state.rx_crc = zlib.crc32(buf_bytes, state.rx_crc)
+                _chunk_len = len(msg_buf)
+                n_extends += 1
+                last_chunks.append((_chunk_len, chain.capacity, n_extends))
+                state.rx_bytes += _chunk_len
+                state.rx_chunks += 1
+                # Heavy work (bytes() copy, hex, CRC32, log emit) only when
+                # an explicit focus/stride/CRC gate is on AND this chunk is
+                # selected. Healthy-path overhead is one len() + 2 adds.
+                _emit_chunk = False
+                if _chunk_len > 0:
+                    if _DESYNC_FOCUS is not None and stream_id == _DESYNC_FOCUS:
+                        _emit_chunk = True
+                    elif _DESYNC_STRIDE > 0 and (
+                            (state.rx_chunks - 1) % _DESYNC_STRIDE == 0):
+                        _emit_chunk = True
+                if _emit_chunk or _DESYNC_CRC:
+                    buf_bytes = bytes(msg_buf) if not isinstance(
+                        msg_buf, (bytes, bytearray)) else msg_buf
+                    if _DESYNC_CRC:
+                        state.rx_crc = zlib.crc32(buf_bytes, state.rx_crc)
+                    if _emit_chunk:
+                        head = buf_bytes[:16].hex()
+                        tail = buf_bytes[-8:].hex() if _chunk_len > 16 else ''
+                        logger.error(
+                            f"MOQT stream({stream_id}): chunk={state.rx_chunks - 1} "
+                            f"off={state.rx_bytes - _chunk_len} len={_chunk_len} "
+                            f"head={head}" + (f" tail={tail}" if tail else "")
+                        )
             logger.debug(
                 f"MOQT stream({stream_id}): chunk received: "
                 f"chunk_len={len(msg_buf)} chain_total={chain.capacity}"
@@ -548,8 +582,9 @@ class _MOQTSessionMixin:
             # Drain as many complete messages as the chain currently holds.
             while chain.capacity > 0:
                 chain.save()
-                chunks_at_save = chain.capacity
-                chunk_id_at_save = n_extends
+                if _DESYNC_TRACE:
+                    chunks_at_save = chain.capacity
+                    chunk_id_at_save = n_extends
                 msg_obj = None
                 try:
                     # StreamChain is duck-compatible with Buffer for the
@@ -676,24 +711,19 @@ class _MOQTSessionMixin:
                     )
 
                 consumed = chain.tell()  # bytes parsed since save() (= 0)
-                # Diagnostic: remember last successful parse before
-                # commit, so a downstream framer-desync can dump it.
-                self._last_parse_consumed = consumed
-                self._last_parse_obj_id = (
-                    msg_obj.object_id if hasattr(msg_obj, 'object_id') else None
-                )
                 state.bytes_total += consumed
-                # Forensic: record per-object metadata. n_chunks_spanned
-                # = how many extend()s happened between the save() at
-                # parse-start and now. >1 means this object's framing
-                # crossed a chunk boundary — high-leverage signal for
-                # the desync investigation.
-                last_objs.append((
-                    self._last_parse_obj_id,
-                    consumed,
-                    chunks_at_save,
-                    n_extends - chunk_id_at_save + 1,
-                ))
+                if _DESYNC_TRACE:
+                    self._last_parse_consumed = consumed
+                    self._last_parse_obj_id = (
+                        msg_obj.object_id
+                        if hasattr(msg_obj, 'object_id') else None
+                    )
+                    last_objs.append((
+                        self._last_parse_obj_id,
+                        consumed,
+                        chunks_at_save,
+                        n_extends - chunk_id_at_save + 1,
+                    ))
                 chain.commit()  # drop consumed prefix; tell() reset to 0
 
                 if isinstance(msg_obj, ObjectHeader):
@@ -1184,11 +1214,36 @@ class _MOQTSessionMixin:
         else:
             logger.error(f"MOQT error: closing: {reason_phrase} ({error_code})")
         if _DESYNC_TRACE and self._tx_bytes:
+            # Pull the aiopquic per-stream byte ring stats. By design
+            # pushed == popped at close (single-producer/single-consumer
+            # FIFO). Hashes match only if AIOPQUIC_TX_HASH=1 was set;
+            # equal hashes prove byte-level conservation through the ring.
+            qc = getattr(self, '_quic', None)
+            get_sb = getattr(qc, 'get_stream_buf_stats', None) if qc else None
             for sid, total in self._tx_bytes.items():
-                logger.error(
-                    f"MOQT stream({sid}): TX trace tx_bytes={total} "
-                    f"tx_crc=0x{self._tx_crc.get(sid, 0):08x}"
-                )
+                msg = (f"MOQT stream({sid}): TX trace tx_bytes={total} "
+                       f"tx_crc=0x{self._tx_crc.get(sid, 0):08x}")
+                if get_sb is not None:
+                    sb_stats = get_sb(sid)
+                    if sb_stats is not None:
+                        pushed, popped, ph, ppoph = sb_stats
+                        # In-flight streams at close-time naturally have
+                        # popped < pushed (residual bytes buffered for
+                        # picoquic to drain). Only flag MISMATCH when both
+                        # the byte counts AND the running hashes don't line
+                        # up — that's a real ring conservation failure.
+                        diff = pushed - popped
+                        if diff == 0 and ph == ppoph:
+                            sb_state = 'OK'
+                        elif diff > 0 and ph != ppoph:
+                            sb_state = f'in-flight diff={diff}'
+                        else:
+                            sb_state = 'MISMATCH'
+                        msg += (f" sb_pushed={pushed} sb_popped={popped} "
+                                f"sb_push_hash=0x{ph:08x} "
+                                f"sb_pop_hash=0x{ppoph:08x} "
+                                f"sb_state={sb_state}")
+                logger.error(msg)
         self._close_err = (error_code, reason_phrase)
 
         # Signal all stream tasks to shut down gracefully via FIN sentinel.
