@@ -10,7 +10,7 @@ authors = [
 ]
 dependencies = [
     "certifi",
-    "aiopquic",
+    "aiopquic>=0.2.0",
     "sortedcontainers>=2.4.0",
 ]
 
