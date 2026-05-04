@@ -518,24 +518,13 @@ class _MOQTSessionMixin:
                     # stream; the session itself stays open.
                     self._reject_stream(stream_id, e.error_code, e.reason)
                     return
-                except MOQTUnderflow as e:
+                except MOQTUnderflow:
                     # Need more bytes; rewind to start of attempt and
                     # await next chunk.
                     chain.rollback()
-                    logger.debug(
-                        f"MOQT MOQTUnderflow({stream_id}): at pos: "
-                        f"{e.pos} abs: {e.needed} chain_total: "
-                        f"{chain.capacity} need: "
-                        f"{e.needed - chain.capacity}"
-                    )
                     break
                 except BufferReadError:
-                    # Same posture as underflow.
                     chain.rollback()
-                    logger.debug(
-                        f"MOQT BufferReadError({stream_id}): "
-                        f"at pos: {chain.tell()}"
-                    )
                     break
                 except Exception as e:
                     # Data-plane parse failure — deframer lost
@@ -594,84 +583,38 @@ class _MOQTSessionMixin:
                 if isinstance(msg_obj, ObjectHeader):
                     assert object_id is None or msg_obj.object_id > object_id
                     object_id = msg_obj.object_id
-                    status = ObjectStatus(msg_obj.status).name
-                    id = f"{group_id}.{subgroup_id}.{object_id}"
-                    now = int(time.time() * 1_000_000)
-                    msg_ts = (
-                        msg_obj.extensions.get(MOQT_TIMESTAMP_EXT)
-                        if msg_obj.extensions else None
-                    )
-                    delay = f"delay: {now - msg_ts} ms" if msg_ts else ""
-                    logstr = (
-                        f"{id} status: {status} size: {consumed} bytes "
-                        f"{delay}"
-                    )
-                    if status != ObjectStatus.NORMAL:
-                        if msg_obj.status in (
-                            ObjectStatus.END_OF_GROUP,
-                            ObjectStatus.END_OF_TRACK,
-                        ):
-                            logger.debug(
-                                f"MOQT stream({stream_id}): {logstr}"
-                            )
-                            return
-                    logger.debug(f"MOQT stream({stream_id}): {logstr}")
+                    if msg_obj.status in (
+                        ObjectStatus.END_OF_GROUP,
+                        ObjectStatus.END_OF_TRACK,
+                    ):
+                        return
                     if self.on_object_received:
+                        now = int(time.time() * 1_000_000)
                         self.on_object_received(
                             msg_obj, consumed, now, group_id, subgroup_id
                         )
                 elif isinstance(msg_obj, SubgroupHeader):
-                    logger.debug(
-                        f"MOQT stream({stream_id}): {msg_obj} "
-                        f"{consumed} bytes"
-                    )
                     assert group_id is None or msg_obj.group_id > group_id
                     group_id = msg_obj.group_id
                     subgroup_id = msg_obj.subgroup_id
                 elif isinstance(msg_obj, FetchHeader):
-                    logger.debug(
-                        f"MOQT stream({stream_id}): {msg_obj} "
-                        f"{consumed} bytes"
-                    )
+                    pass
                 elif isinstance(msg_obj, FetchObject):
-                    now = int(time.time() * 1_000_000)
-                    parser = state.parser
-                    request_id = (
-                        parser.request_id
-                        if isinstance(parser, FetchHeader)
-                        else None
-                    )
-                    if msg_obj.end_of_range is not None:
-                        logger.debug(
-                            f"MOQT stream({stream_id}): FetchObject "
-                            f"end-of-range 0x{msg_obj.end_of_range:x} "
-                            f"at {msg_obj.group_id}.{msg_obj.object_id}"
+                    if msg_obj.end_of_range is None and self.on_fetch_object:
+                        parser = state.parser
+                        request_id = (
+                            parser.request_id
+                            if isinstance(parser, FetchHeader)
+                            else None
                         )
-                    else:
-                        id = (
-                            f"{msg_obj.group_id}.{msg_obj.subgroup_id}."
-                            f"{msg_obj.object_id}"
+                        now = int(time.time() * 1_000_000)
+                        self.on_fetch_object(
+                            msg_obj, consumed, now, request_id
                         )
-                        msg_ts = (
-                            msg_obj.extensions.get(MOQT_TIMESTAMP_EXT)
-                            if msg_obj.extensions else None
-                        )
-                        delay = (
-                            f"delay: {now - msg_ts} ms"
-                            if isinstance(msg_ts, int) else ""
-                        )
-                        logger.debug(
-                            f"MOQT stream({stream_id}): FetchObject "
-                            f"{id} size: {consumed} bytes {delay}"
-                        )
-                        if self.on_fetch_object:
-                            self.on_fetch_object(
-                                msg_obj, consumed, now, request_id
-                            )
                 else:
                     logger.error(
-                        f"MOQT stream({stream_id}): {msg_obj} "
-                        f"size: {consumed} bytes"
+                        f"MOQT stream({stream_id}): unexpected msg "
+                        f"{type(msg_obj).__name__} size: {consumed} bytes"
                     )
 
     def _reject_stream(self, stream_id: int, error_code: int, reason: str) -> None:
