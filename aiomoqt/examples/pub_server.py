@@ -16,14 +16,9 @@ import argparse
 import asyncio
 import logging
 import os
-import ssl
 
-from qh3.quic.configuration import QuicConfiguration
-from qh3.asyncio.server import serve
-from qh3.h3.connection import H3_ALPN
-
-from aiomoqt.types import MOQTMessageType
-from aiomoqt.protocol import MOQTPeer, MOQTSession
+from aiomoqt.server import MOQTServer
+from aiomoqt.types import MOQTMessageType, MOQT_VERSION_DRAFT16
 from aiomoqt.track import PublishedTrack
 from aiomoqt.utils.logger import set_log_level, get_logger
 
@@ -71,6 +66,12 @@ def parse_args():
     parser.add_argument(
         '-r', '--rate', type=float, default=0,
         help='Objects/sec per stream (0=max, default: max)')
+    parser.add_argument(
+        '-Q', '--quic', action='store_true',
+        help='Serve raw QUIC (aiopquic) instead of H3/WebTransport')
+    parser.add_argument(
+        '--draft', type=int, default=16,
+        help='MoQT draft version when --quic (default: 16)')
     parser.add_argument(
         '-n', '--namespace', type=str, default='bench',
         help='Track namespace (default: bench)')
@@ -120,38 +121,37 @@ async def main():
               "Use --cert and --key, or place cert.pem/key.pem in certs/")
         return
 
-    peer = MOQTPeer()
-    peer.endpoint = "moq"
-    peer.register_handler(
+    draft_version = (
+        {14: 0xff00000e, 15: 0xff00000f, 16: 0xff000010}[args.draft]
+        if args.quic else None
+    )
+    server = MOQTServer(
+        host=args.host, port=args.port,
+        certificate=args.cert, private_key=args.key,
+        path="moq",
+        use_quic=args.quic,
+        draft_version=draft_version,
+    )
+    server.register_handler(
         MOQTMessageType.SUBSCRIBE,
         partial(_on_subscribe, args=args))
+    quic_server = await server.serve()
 
-    config = QuicConfiguration(
-        is_client=False,
-        alpn_protocols=H3_ALPN,
-        verify_mode=ssl.CERT_NONE,
-        max_data=2**24,
-        max_stream_data=2**24,
-        max_datagram_frame_size=64 * 1024,
-    )
-    config.load_cert_chain(args.cert, args.key)
-
-    quic_server = await serve(
-        args.host, args.port,
-        configuration=config,
-        create_protocol=lambda *a, **kw: MOQTSession(
-            *a, **kw, session=peer),
-    )
-
+    transport = "raw QUIC" if args.quic else "H3/WebTransport"
     rate_s = f"{args.rate}/s" if args.rate > 0 else "max"
     print(f"MoQT publisher server ready on {args.host}:{args.port}")
+    print(f"  transport: {transport}")
     print(f"  namespace: {args.namespace}/{args.trackname}")
     print(f"  objects:   {args.object_size}B x {args.streams} streams")
     print(f"  groups:    {args.group_size} objects/group")
     print(f"  rate:      {rate_s}")
     print("\nConnect subscriber:")
-    print(f"  python -m aiomoqt.examples.sub_bench "
-          f"https://{args.host}:{args.port}/moq -t 30 -i 5")
+    if args.quic:
+        print(f"  python -m aiomoqt.examples.sub_bench "
+              f"moqt://{args.host}:{args.port} -t 30 -i 5 --draft {args.draft} -k")
+    else:
+        print(f"  python -m aiomoqt.examples.sub_bench "
+              f"https://{args.host}:{args.port}/moq -t 30 -i 5 -k")
 
     try:
         await asyncio.Event().wait()

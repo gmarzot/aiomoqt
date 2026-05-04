@@ -1,24 +1,19 @@
-import time
 import logging
 import argparse
-import datetime
 
 import asyncio
-from qh3.h3.connection import H3_ALPN
 
-from qh3.quic.configuration import QuicConfiguration
 from aiomoqt.server import MOQTServer
 from aiomoqt.utils.logger import get_logger, set_log_level
 
+
 def parse_args():
-    defaults = QuicConfiguration(is_client=False)
-    
     parser = argparse.ArgumentParser(description='MOQT WebTransport Server')
     parser.add_argument('--host', type=str, default='localhost', help='Host to bind to')
     parser.add_argument('--port', type=int, default=443, help='Port to bind to')
     parser.add_argument('--certificate', type=str, required=True, help='TLS server certificate')
     parser.add_argument('--private-key', type=str, required=True, help='TLS private key')
-    parser.add_argument('--endpoint', type=str, default="", help='MOQT WebTransport endpoint path (default: "/")')
+    parser.add_argument('--path', type=str, default="", help='MOQT WebTransport path (default: "/")')
     parser.add_argument('--retry', action='store_true', help='send a retry for new connections')
     parser.add_argument('--debug', action='store_true', help='Enable debug output')
     parser.add_argument('--quic-debug', action='store_true',  help='Enable quic debug output')
@@ -36,7 +31,7 @@ async def main(args):
         port=args.port,
         certificate=args.certificate,
         private_key=args.private_key,
-        endpoint=args.endpoint,
+        path=args.path,
         debug=args.debug
     )
 

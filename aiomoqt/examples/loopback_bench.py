@@ -2,7 +2,7 @@
 """aiomoqt-bench loopback - direct pub-to-sub benchmark without a relay.
 
 Runs the publisher as a server that the subscriber connects to directly.
-This measures pure Python/qh3 throughput without relay overhead.
+Measures pure Python throughput on the aiopquic stack without relay overhead.
 
 Usage:
   python -m aiomoqt.examples.loopback_bench -s 4096 -r 5000 -t 20
@@ -11,17 +11,12 @@ Usage:
 import argparse
 import asyncio
 import logging
-import ssl
 
-from qh3.quic.configuration import QuicConfiguration
-from qh3.asyncio.server import serve
-from qh3.h3.connection import H3_ALPN
-
-from aiomoqt.types import MOQTMessageType, ParamType
+from aiomoqt.types import MOQTMessageType
 from aiomoqt.client import MOQTClient
-from aiomoqt.protocol import MOQTPeer, MOQTSession
+from aiomoqt.server import MOQTServer
 from aiomoqt.track import PublishedTrack, SubscribedTrack
-from aiomoqt.utils.logger import set_log_level, get_logger
+from aiomoqt.utils.logger import set_log_level
 from aiomoqt.examples.sub_bench import BenchStats
 
 
@@ -118,42 +113,25 @@ async def _on_subscribe(session, msg, args):
 
 
 async def run_server(args):
-    """Run a server that generates data when subscribers connect."""
+    """Run a MOQTServer that generates data when subscribers connect."""
     from functools import partial
 
-    server_peer = MOQTPeer()
-    server_peer.endpoint = "moq"
-    server_peer.register_handler(
+    server = MOQTServer(
+        host="localhost", port=args.port,
+        certificate=args.cert, private_key=args.key,
+        path="moq",
+    )
+    server.register_handler(
         MOQTMessageType.SUBSCRIBE,
         partial(_on_subscribe, args=args))
-
-    config = QuicConfiguration(
-        is_client=False,
-        alpn_protocols=H3_ALPN,
-        verify_mode=ssl.CERT_NONE,
-        max_data=2**24,
-        max_stream_data=2**24,
-        max_datagram_frame_size=64 * 1024,
-    )
-    config.load_cert_chain(args.cert, args.key)
-
-    protocol_factory = (
-        lambda *a, **kw: MOQTSession(*a, **kw, session=server_peer)
-    )
-
-    quic_server = await serve(
-        "localhost", args.port,
-        configuration=config,
-        create_protocol=protocol_factory,
-    )
-    return quic_server
+    return await server.serve()
 
 
 async def run_subscriber(args, stats):
     """Connect as subscriber and collect stats."""
     client = MOQTClient(
         "localhost", args.port,
-        endpoint="moq",
+        path="moq",
         verify_tls=False,
         debug=args.debug,
     )

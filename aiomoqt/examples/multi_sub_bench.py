@@ -117,7 +117,7 @@ def run_publisher(relay_url, namespace, trackname, args):
         relay = parse_relay_url(relay_url, force_quic=args.force_quic)
         client = MOQTClient(
             relay.host, relay.port,
-            endpoint=relay.endpoint,
+            path=relay.path,
             use_quic=relay.use_quic,
             verify_tls=not args.insecure,
             draft_version=args.draft,
@@ -188,7 +188,7 @@ def run_subscriber(sub_id, relay_url, namespace, trackname, args,
         relay = parse_relay_url(relay_url, force_quic=args.force_quic)
         client = MOQTClient(
             relay.host, relay.port,
-            endpoint=relay.endpoint,
+            path=relay.path,
             use_quic=relay.use_quic,
             verify_tls=not args.insecure,
             draft_version=args.draft,

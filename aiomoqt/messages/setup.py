@@ -9,7 +9,7 @@ from ..utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-@dataclass
+@dataclass(slots=True)
 class ServerSetup(MOQTMessage):
     """SERVER_SETUP message for accepting MOQT session.
 
@@ -50,7 +50,7 @@ class ServerSetup(MOQTMessage):
         return cls(selected_version=version, parameters=params)
 
 
-@dataclass
+@dataclass(slots=True)
 class ClientSetup(MOQTMessage):
     """CLIENT_SETUP message for initializing MOQT session.
 
@@ -95,7 +95,7 @@ class ClientSetup(MOQTMessage):
         return cls(versions=versions, parameters=params)
         
 
-@dataclass
+@dataclass(slots=True)
 class GoAway(MOQTMessage):
     new_session_uri: str = None
 

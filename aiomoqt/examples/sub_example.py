@@ -15,8 +15,10 @@ def parse_args():
     parser.add_argument('--host', type=str, default='localhost', help='Host to connect to')
     parser.add_argument('--port', type=int, default=443, help='Port to connect to')
     parser.add_argument('--namespace', type=str, default="live/test", help='Track Namespace')
-    parser.add_argument('--trackname', type=str, default="track", help='Track Name')
-    parser.add_argument('--endpoint', type=str, default="", help='MOQT WT endpoint path (default: "/")')
+    parser.add_argument(
+        '--trackname', type=str, default=None,
+        help='Track Name (default: auto-discover via SUBSCRIBE_NAMESPACE)')
+    parser.add_argument('--path', type=str, default="", help='MOQT WT path (default: "/")')
     parser.add_argument('--use-quic', action='store_true', help='Enable QUIC transport')
     parser.add_argument('--debug', action='store_true', help='Enable debug output')
     parser.add_argument('--quic-debug', action='store_true',  help='Enable quic debug output')
@@ -129,7 +131,7 @@ class SimpleStats:
               f"{mbps:.2f} Mbps{lat_s} ({dur:.1f}s)")
 
 
-async def main(host: str, port: int, endpoint: str, namespace: str, track_name: str,
+async def main(host: str, port: int, path: str, namespace: str, track_name: str,
                use_quic: bool, debug: bool, quic_debug: bool, insecure: bool = False,
                auth_token: str = None, draft: int = None, libquicr_compat: bool = False,
                duration: int = 120,
@@ -142,7 +144,7 @@ async def main(host: str, port: int, endpoint: str, namespace: str, track_name: 
     client = MOQTClient(
         host,
         port,
-        endpoint=endpoint,
+        path=path,
         use_quic=use_quic,
         verify_tls=not insecure,
         draft_version=draft,
@@ -191,7 +193,7 @@ if __name__ == "__main__":
         asyncio.run(main(
             host=args.host,
             port=args.port,
-            endpoint=args.endpoint,
+            path=args.path,
             namespace=args.namespace,
             track_name=args.trackname,
             use_quic=args.use_quic,

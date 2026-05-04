@@ -23,7 +23,6 @@ import asyncio
 import csv
 import os
 import platform
-import ssl
 import sys
 import time
 import uuid
@@ -32,12 +31,8 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import Optional
 
-from qh3.asyncio.server import serve
-from qh3.h3.connection import H3_ALPN
-from qh3.quic.configuration import QuicConfiguration
-
 from aiomoqt.client import MOQTClient
-from aiomoqt.protocol import MOQTPeer, MOQTSession
+from aiomoqt.server import MOQTServer
 from aiomoqt.track import PublishedTrack, SubscribedTrack
 from aiomoqt.types import (MOQT_TIMESTAMP_EXT, FilterType, MOQTMessageType,
                            ObjectStatus)
@@ -101,6 +96,8 @@ class Signal:
     tx_mbps: float          # publisher-side measured (delta bytes / s)
     # subscriber-side rx (sum across active subs in subs-mode):
     rx_mbps: float
+    # RFC 3550 jitter — exponential smooth of inter-arrival deviation.
+    jitter_ms: float = 0.0
     # Liveness — meaningful in subs-mode; BWActuator fills defaults.
     target_subs: int = 1    # count the actuator is trying to maintain
     active_subs: int = 1    # subs currently receiving data
@@ -150,8 +147,10 @@ class LiveStats:
         self._last_send_ms = 0
         self._jitter = 0.0
 
-    def on_object(self, msg, size_bytes, recv_time_ms,
+    def on_object(self, msg, size_bytes, recv_time_us,
                   group_id=None, subgroup_id=None):
+        """Timestamps are microseconds since epoch on the wire;
+        latency stats are float ms (sub-millisecond resolution)."""
         t = time.monotonic()
 
         # Skip status (non-NORMAL) objects
@@ -159,20 +158,22 @@ class LiveStats:
                      and getattr(msg, 'status', ObjectStatus.NORMAL)
                      != ObjectStatus.NORMAL)
 
-        send_ms = None
+        send_us = None
         if getattr(msg, 'extensions', None):
-            send_ms = msg.extensions.get(MOQT_TIMESTAMP_EXT)
+            send_us = msg.extensions.get(MOQT_TIMESTAMP_EXT)
         latency = None
-        if send_ms is not None:
-            raw = recv_time_ms - send_ms
-            if abs(raw) < 60000:
-                latency = raw
+        if send_us is not None:
+            raw_us = recv_time_us - send_us
+            # Accept up to 10 minutes (under-load latency can exceed
+            # 60s); reject negatives and varint-garbage outliers.
+            if -1_000_000 <= raw_us <= 600_000_000:
+                latency = raw_us / 1000.0  # float ms
                 if self._last_recv_ms and self._last_send_ms:
-                    d = abs((recv_time_ms - self._last_recv_ms)
-                            - (send_ms - self._last_send_ms))
+                    d = abs((recv_time_us - self._last_recv_ms)
+                            - (send_us - self._last_send_ms)) / 1000.0
                     self._jitter += (d - self._jitter) / 16.0
-                self._last_recv_ms = recv_time_ms
-                self._last_send_ms = send_ms
+                self._last_recv_ms = recv_time_us
+                self._last_send_ms = send_us
 
         self._events.append((t, size_bytes, latency))
         cutoff = t - self.window_s
@@ -241,18 +242,25 @@ class LiveStats:
 class BWActuator:
     """Actuator for bandwidth-ramp mode.
 
-    level == aggregate commanded Mbps. Apply writes state.rate_ops,
-    which the publisher polls to mutate its paced send rate. Observe
-    pulls a rolling-window snapshot from the single subscriber's
-    LiveStats and packages it as a mode-agnostic Signal.
+    Loopback mode (no -r): publisher + subscriber tasks share the main
+    asyncio loop; rate is mutated by writing self.state.rate_ops which
+    the in-process publisher polls. Stats from the in-process LiveStats.
+
+    Relay mode (-r URL): publisher and subscriber each run in their own
+    multiprocessing.Process. Rate flows pub-ward via a rate_queue;
+    stats flow subscriber-ward via events_queue. Aggregated by the
+    actuator into the same Signal shape so the controller is mode-blind.
     """
     unit = "Mbps"
 
     def __init__(self, state: 'BenchState', stats: LiveStats,
                  scenario: Scenario,
-                 shortfall_ratio: float = 0.85):
+                 shortfall_ratio: float = 0.85,
+                 mp_pub_proc=None, mp_sub_proc=None,
+                 mp_rate_queue=None, mp_events_queue=None,
+                 mp_stop_event=None):
         self.state = state
-        self.stats = stats
+        self.stats = stats          # used in loopback mode only
         self.scenario = scenario
         self.shortfall_ratio = shortfall_ratio
         self.min_level = scenario.start_mbps
@@ -260,30 +268,175 @@ class BWActuator:
         self.step_floor = 0.5
         self.initial_step = scenario.step_mbps
         self.initial_level = scenario.start_mbps
+        # multiprocess plumbing (None in loopback mode)
+        self._pub_proc = mp_pub_proc
+        self._sub_proc = mp_sub_proc
+        self._rate_q = mp_rate_queue
+        self._events_q = mp_events_queue
+        self._stop_ev = mp_stop_event
+        # rolling stats aggregated from sub-worker events
+        self._mp_lat_window = []  # (t, lat_ms)
+        self._mp_rx_window = []   # (t, rx_bytes)
+        self._mp_total_lost = 0
+        self._mp_total_objs = 0
+        self._mp_window_s = 5.0
+        # publisher rates from pub_stats events.
+        # tx_bytes  = bytes the publisher queued via send_stream_data.
+        # wire_bytes = bytes picoquic actually placed on the wire
+        #              (slow-start + cwnd ground truth).
+        self._mp_tx_window = []     # (t, tx_bytes)
+        self._mp_wire_window = []   # (t, wire_bytes)
+        # Per-sub-id latest jitter; aggregate = mean across active
+        # subs so multi-sub mode reports avg-of-subs not last-of-subs.
+        self._mp_jitter_per_sub: dict[int, float] = {}
+
+    @property
+    def is_mp(self) -> bool:
+        return self._rate_q is not None
 
     async def apply(self, level: float) -> None:
         self.state.target_mbps = level
-        self.state.rate_ops = self.scenario.aggregate_ops(level)
+        rate_ops = self.scenario.aggregate_ops(level)
+        self.state.rate_ops = rate_ops
+        if self.is_mp:
+            try:
+                self._rate_q.put_nowait({'rate_ops': rate_ops})
+            except Exception:
+                pass
+
+    def _drain_events(self) -> None:
+        """Pull every available event from the worker events queue
+        and update rolling windows. Called from observe()."""
+        from queue import Empty
+        while True:
+            try:
+                ev = self._events_q.get_nowait()
+            except Empty:
+                break
+            kind = ev.get('kind')
+            t = ev.get('t', time.monotonic())
+            if kind == 'pub_stats':
+                self._mp_tx_window.append((t, ev.get('tx_bytes', 0)))
+                self._mp_wire_window.append((t, ev.get('wire_bytes', 0)))
+            elif kind == 'stats':
+                rx_bytes = ev.get('rx_bytes', 0)
+                if rx_bytes:
+                    self._mp_rx_window.append((t, rx_bytes))
+                # _RollingStats.snapshot() exposes mean/p99 plus a
+                # raw 'lat_samples' tuple if present; otherwise we
+                # synthesize a single sample at the reported mean.
+                samples = ev.get('lat_samples') or ()
+                if samples:
+                    for lat in samples:
+                        self._mp_lat_window.append((t, lat))
+                else:
+                    m = ev.get('lat_mean_ms')
+                    if m is not None:
+                        self._mp_lat_window.append((t, m))
+                self._mp_total_objs += ev.get('rx_objs', 0)
+                self._mp_total_lost += ev.get('iv_lost', 0)
+                # Per-sub-id smoothed jitter; aggregate is averaged
+                # across active subs in observe().
+                jit = ev.get('jitter_ms')
+                if jit is not None:
+                    sid = ev.get('sub_id', 0)
+                    self._mp_jitter_per_sub[sid] = jit
+            # health events: no-op for stats; logged elsewhere.
+        # Trim windows.
+        cutoff = time.monotonic() - self._mp_window_s
+        self._mp_lat_window = [
+            (t, lat) for (t, lat) in self._mp_lat_window if t >= cutoff
+        ]
+        self._mp_rx_window = [
+            (t, b) for (t, b) in self._mp_rx_window if t >= cutoff
+        ]
+        self._mp_tx_window = [
+            (t, b) for (t, b) in self._mp_tx_window if t >= cutoff
+        ]
+        self._mp_wire_window = [
+            (t, b) for (t, b) in self._mp_wire_window if t >= cutoff
+        ]
 
     async def observe(self) -> Signal:
-        sample = self.stats.sample(target_mbps=self.state.target_mbps)
-        shortfall = (sample.target_mbps > 0
-                     and sample.rx_bitrate_mbps
-                     < self.shortfall_ratio * sample.target_mbps)
+        if not self.is_mp:
+            sample = self.stats.sample(
+                target_mbps=self.state.target_mbps)
+            shortfall = (sample.target_mbps > 0
+                         and sample.rx_bitrate_mbps
+                         < self.shortfall_ratio * sample.target_mbps)
+            return Signal(
+                t=sample.t,
+                level=sample.target_mbps,
+                latency_mean_ms=sample.mean_ms,
+                latency_p90_ms=sample.p90_ms,
+                loss_pct=sample.loss_pct,
+                shortfall=shortfall,
+                target_mbps=sample.target_mbps,
+                tx_mbps=self.state.tx_rate_mbps,
+                rx_mbps=sample.rx_bitrate_mbps,
+                jitter_ms=sample.jitter_ms,
+            )
+        # Multiprocess path
+        self._drain_events()
+        t = time.monotonic()
+        lats = sorted(lat for (_, lat) in self._mp_lat_window
+                      if lat is not None)
+        if lats:
+            mean = sum(lats) / len(lats)
+            p90 = lats[min(int(len(lats) * 0.90), len(lats) - 1)]
+        else:
+            mean = 0.0
+            p90 = 0.0
+        rx_bytes = sum(b for (_, b) in self._mp_rx_window)
+        # tx column reports wire-bytes (picoquic ground truth); falls
+        # back to queued bytes if the wire counter isn't available.
+        wire_bytes = sum(b for (_, b) in self._mp_wire_window)
+        if wire_bytes > 0:
+            tx_bytes = wire_bytes
+        else:
+            tx_bytes = sum(b for (_, b) in self._mp_tx_window)
+        win = max(0.5, self._mp_window_s)
+        rx_mbps = (rx_bytes * 8) / (win * 1e6)
+        tx_mbps = (tx_bytes * 8) / (win * 1e6)
+        loss_pct = (100.0 * self._mp_total_lost
+                    / max(1, self._mp_total_objs))
+        shortfall = (self.state.target_mbps > 0
+                     and rx_mbps
+                     < self.shortfall_ratio * self.state.target_mbps)
+        # avg jitter across active subs (BW mode = 1 sub; subs mode = N).
+        jitter_ms = (sum(self._mp_jitter_per_sub.values())
+                     / len(self._mp_jitter_per_sub)
+                     if self._mp_jitter_per_sub else 0.0)
         return Signal(
-            t=sample.t,
-            level=sample.target_mbps,
-            latency_mean_ms=sample.mean_ms,
-            latency_p90_ms=sample.p90_ms,
-            loss_pct=sample.loss_pct,
+            t=t,
+            level=self.state.target_mbps,
+            latency_mean_ms=mean,
+            latency_p90_ms=p90,
+            loss_pct=loss_pct,
             shortfall=shortfall,
-            target_mbps=sample.target_mbps,
-            tx_mbps=self.state.tx_rate_mbps,
-            rx_mbps=sample.rx_bitrate_mbps,
+            target_mbps=self.state.target_mbps,
+            tx_mbps=tx_mbps,
+            rx_mbps=rx_mbps,
+            jitter_ms=jitter_ms,
         )
 
     async def shutdown(self) -> None:
-        pass
+        if not self.is_mp:
+            return
+        try:
+            self._stop_ev.set()
+        except Exception:
+            pass
+        for proc in (self._pub_proc, self._sub_proc):
+            if proc is None:
+                continue
+            try:
+                proc.join(timeout=2.0)
+                if proc.is_alive():
+                    proc.terminate()
+                    proc.join(timeout=1.0)
+            except Exception:
+                pass
 
 
 class SubsActuator:
@@ -459,14 +612,17 @@ class SubsActuator:
         worst_p90 = 0.0
         worst_mean = 0.0
         max_loss_pct = 0.0
+        jitter_sum = 0.0
+        jitter_n = 0
 
         self._t_last_observe = now
 
         for sid in active_ids:
             s = self._latest_stats.get(sid, {})
-            # rx_bytes is a rolling-window (5s) byte count; convert to Mbps.
+            # rx_bytes is a per-snapshot delta (~1s of bytes since the
+            # last stats event); convert to Mbps using STATS_INTERVAL_S.
             rx_bytes = s.get('rx_bytes', 0)
-            per_sub_mbps = (rx_bytes * 8) / (5.0 * 1e6)
+            per_sub_mbps = (rx_bytes * 8) / (1.0 * 1e6)
             rx_bps_total += per_sub_mbps * 1e6
             p90 = s.get('lat_p90_ms', 0.0)
             mean = s.get('lat_mean_ms', 0.0)
@@ -476,6 +632,10 @@ class SubsActuator:
             worst_p90 = max(worst_p90, p90)
             worst_mean = max(worst_mean, mean)
             max_loss_pct = max(max_loss_pct, lpct)
+            jit = s.get('jitter_ms')
+            if jit is not None:
+                jitter_sum += jit
+                jitter_n += 1
 
         target_subs = len(self._workers)
         active_subs = len(active_ids)
@@ -494,6 +654,7 @@ class SubsActuator:
             health = "ok"
 
         target_mbps = target_subs * self.per_sub_mbps
+        avg_jitter_ms = jitter_sum / jitter_n if jitter_n else 0.0
         return Signal(
             t=now,
             level=float(target_subs),
@@ -504,6 +665,7 @@ class SubsActuator:
             target_mbps=target_mbps,
             tx_mbps=target_mbps,   # single publisher; assume delivers
             rx_mbps=rx_bps_total / 1e6,
+            jitter_ms=avg_jitter_ms,
             target_subs=target_subs,
             active_subs=active_subs,
             failed_subs=failed_this_window,
@@ -542,7 +704,8 @@ class AIMDController:
                  interval_s: float, writer=None,
                  latency_threshold_ms: float = 100.0,
                  backoff_factor: float = 0.9,
-                 loss_threshold_pct: float = 0.5):
+                 loss_threshold_pct: float = 0.5,
+                 duration_s: float | None = None):
         self.actuator = actuator
         self.state = state
         self.interval_s = interval_s
@@ -550,6 +713,7 @@ class AIMDController:
         self.latency_threshold_ms = latency_threshold_ms
         self.backoff_factor = backoff_factor
         self.loss_threshold_pct = loss_threshold_pct
+        self.duration_s = duration_s
         self.shortfall_streak = 0
         self.pressure_streak = 0
         self.hold_intervals = 0
@@ -577,6 +741,15 @@ class AIMDController:
                 break
             except asyncio.TimeoutError:
                 pass
+
+            # Hard wall-clock cap. Checked at interval boundaries so
+            # the in-progress sample completes and gets reported.
+            if (self.duration_s is not None
+                    and time.monotonic() - self.t0 >= self.duration_s):
+                state.ceiling_reason = (
+                    f"duration cap reached ({self.duration_s:.0f}s)")
+                state.stop.set()
+                break
 
             sig = await a.observe()
             self.samples += 1
@@ -619,45 +792,31 @@ class AIMDController:
             headroom = (self.latency_threshold_ms - sig.latency_p90_ms) \
                 / self.latency_threshold_ms
 
-            # Unified back-off signal with watch + clamped retreat:
-            # any of {loss, sustained shortfall, p90 overshoot} increments
-            # a pressure streak. First bad interval just 'watches' — we
-            # don't kill anything unless the signal persists. Keeps
-            # transient spikes (GC pause, QUIC RTT jitter) from
-            # triggering a sub-reap cliff.
-            over_p90 = headroom < 0
-            over_loss = sig.loss_pct > self.loss_threshold_pct
+            # Back-off triggers ONLY on sustained p90 latency overshoot.
+            # Shortfall and loss are reported in the row but never drive
+            # the ramp — we want the bench to reveal the actual
+            # throughput/latency curve, not throttle on transient
+            # bandwidth dips that QUIC will recover from on its own.
+            # First bad interval just 'watches' — back off after two
+            # consecutive overshoots so transient RTT spikes don't
+            # trigger a cliff.
             if sig.shortfall:
                 self.shortfall_streak += 1
             else:
                 self.shortfall_streak = 0
-            over_shortfall = self.shortfall_streak >= 2
-            if over_p90 or over_loss or over_shortfall:
+            over_p90 = headroom < 0
+            if over_p90:
                 self.pressure_streak += 1
-                reasons = []
-                if over_p90:
-                    reasons.append("p90 over")
-                if over_loss:
-                    reasons.append(f"loss {sig.loss_pct:.1f}%")
-                if over_shortfall:
-                    reasons.append("shortfall")
                 if self.pressure_streak < 2:
-                    self._print_row(sig, f"watch ({', '.join(reasons)})")
+                    self._print_row(sig, "watch (p90 over)")
                     continue
-                # Persistent pressure — back off, but clamp to at most
-                # one --step so we never drop 30% of subs in one swing.
-                if over_p90:
-                    retreat = max(self.backoff_factor, 1.0 + headroom)
-                    new_level = level * retreat
-                else:
-                    new_level = level * self.backoff_factor
+                retreat = max(self.backoff_factor, 1.0 + headroom)
+                new_level = level * retreat
                 new_level = max(a.min_level, new_level)
                 # Symmetric clamp with ramp: drop at most initial_step.
                 new_level = max(new_level, level - a.initial_step)
                 self.pressure_streak = 0
-                self.shortfall_streak = 0
-                await self._apply(new_level, sig,
-                                  f"back-off ({', '.join(reasons)})")
+                await self._apply(new_level, sig, "back-off (p90 over)")
                 self.draining = True
                 continue
             self.pressure_streak = 0
@@ -728,11 +887,11 @@ class AIMDController:
         # Group spans — must match widths used by _print_row.
         # Target:  BW(7) + gap(2) + [Nsubs(5) + gap(2)] if subs
         # Actual:  Tx(7) + gap(2) + Rx(7) + gap(2) + [Nsubs(5) + gap(2)]
-        # Latency: mean(6) + gap(2) + p90(6)
+        # Latency: mean(6) + gap(2) + p90(6) + gap(2) + jitter(6)
         target_span = 7 + (3 + 5 if has_subs else 0)
         actual_span = 7 + 2 + 7 + (3 + 5 if has_subs else 0)
-        latency_span = 6 + 2 + 6
-        time_pad = 10    # 'time' column + breathing space before BW
+        latency_span = 6 + 2 + 6 + 2 + 6
+        time_pad = 10
         print(
             f"  {' '*time_pad}"
             f"{'Target'.center(target_span)}    │  "
@@ -744,7 +903,7 @@ class AIMDController:
                 f"  {'time':>6}      "
                 f"{'BW':<7}   {'Nsub':<5}  │  "
                 f"{'Tx':<7}  {'Rx':<7}   {'Nsub':<5}  │  "
-                f"{'mean':<6}  {'p90':<6}  │  "
+                f"{'mean':<6}  {'p90':<6}  {'jitter':<6}  │  "
                 f"loss   action"
             )
         else:
@@ -752,7 +911,7 @@ class AIMDController:
                 f"  {'time':>6}      "
                 f"{'BW':<7}  │  "
                 f"{'Tx':<7}  {'Rx':<7}  │  "
-                f"{'mean':<6}  {'p90':<6}  │  "
+                f"{'mean':<6}  {'p90':<6}  {'jitter':<6}  │  "
                 f"loss   action"
             )
         total_w = time_pad + 2 + target_span + 5 + actual_span + 5 + latency_span + 5 + 14
@@ -768,21 +927,22 @@ class AIMDController:
         rx = fmt_bps(sig.rx_mbps * 1e6)
         mean = fmt_ms(sig.latency_mean_ms)
         p90 = fmt_ms(sig.latency_p90_ms)
+        jit = fmt_ms(sig.jitter_ms)
         if self.actuator.unit == "subs":
             print(
-                f"  {t_rel:>5.1f}s     "
+                f"  {int(round(t_rel)):>5d}s     "
                 f"{bw:<7}    {sig.target_subs:<5}  │  "
                 f"{tx:<7}  {rx:<7}   {sig.active_subs:<5}  │  "
-                f"{mean:<6}  {p90:<6}  │  "
+                f"{mean:<6}  {p90:<6}  {jit:<6}  │  "
                 f"{f'{sig.loss_pct:.1f}%':<5}  {action}",
                 flush=True,
             )
         else:
             print(
-                f"  {t_rel:>5.1f}s     "
+                f"  {int(round(t_rel)):>5d}s     "
                 f"{bw:<7}  │  "
                 f"{tx:<7}  {rx:<7}  │  "
-                f"{mean:<6}  {p90:<6}  │  "
+                f"{mean:<6}  {p90:<6}  {jit:<6}  │  "
                 f"{f'{sig.loss_pct:.1f}%':<5}  {action}",
                 flush=True,
             )
@@ -866,41 +1026,28 @@ async def run_loopback_server(args, state: BenchState):
             except (asyncio.CancelledError, Exception):
                 pass
 
-    peer = MOQTPeer()
-    peer.endpoint = ""
-    peer.register_handler(MOQTMessageType.SUBSCRIBE,
-                          partial(_on_subscribe))
-
-    config = QuicConfiguration(
-        is_client=False,
-        alpn_protocols=H3_ALPN,
-        verify_mode=ssl.CERT_NONE,
-        max_data=2**24,
-        max_stream_data=2**24,
-        max_datagram_frame_size=64 * 1024,
+    server = MOQTServer(
+        host="localhost", port=args.port,
+        certificate=args.cert, private_key=args.key,
+        path="",
     )
-    config.load_cert_chain(args.cert, args.key)
-
-    return await serve(
-        "localhost", args.port,
-        configuration=config,
-        create_protocol=lambda *a, **kw:
-            MOQTSession(*a, **kw, session=peer),
-    )
+    server.register_handler(
+        MOQTMessageType.SUBSCRIBE, partial(_on_subscribe))
+    return await server.serve()
 
 
 # ---------------------------------------------------------------------------
 # Client: subscriber role, feeds LiveStats that the controller reads
 # ---------------------------------------------------------------------------
 
-async def run_subscriber_client(host: str, port: int, endpoint: str,
+async def run_subscriber_client(host: str, port: int, path: str,
                                 use_quic: bool, verify_tls: bool,
                                 args,
                                 state: BenchState,
                                 stats: LiveStats):
     client = MOQTClient(
         host, port,
-        endpoint=endpoint,
+        path=path,
         use_quic=use_quic,
         verify_tls=verify_tls,
         draft_version=args.draft,
@@ -946,13 +1093,13 @@ async def run_subscriber_client(host: str, port: int, endpoint: str,
 # loopback server).
 # ---------------------------------------------------------------------------
 
-async def run_publisher_client(host: str, port: int, endpoint: str,
+async def run_publisher_client(host: str, port: int, path: str,
                                use_quic: bool, verify_tls: bool,
                                args,
                                state: BenchState):
     client = MOQTClient(
         host, port,
-        endpoint=endpoint,
+        path=path,
         use_quic=use_quic,
         verify_tls=verify_tls,
         draft_version=args.draft,
@@ -1103,6 +1250,18 @@ def parse_args():
                         "'next-group-start' skips current-group replay "
                         "some relays do on latest-object.")
     p.add_argument("-d", "--debug", action="store_true")
+    p.add_argument("-t", "--duration", type=float, default=None,
+                   metavar="SECONDS",
+                   help="hard wall-clock cap; controller exits after "
+                        "this many seconds even if --max-mbps / --max-subs "
+                        "hasn't been reached. Useful for fixed-budget "
+                        "regression runs.")
+    p.add_argument("--keylogfile", default=None,
+                   help="TLS secrets log path (NSS Key Log Format) for "
+                        "Wireshark decryption of pcap captures. Each MP "
+                        "worker (publisher / subscriber) gets a "
+                        "process-suffixed file: PATH.pub.<pid>, "
+                        "PATH.sub.<pid> — combined when decrypting.")
     args = p.parse_args()
     args.sub_filter = filter_choices[args.sub_filter]
     if args.sub_filter in (FilterType.ABSOLUTE_START,
@@ -1226,9 +1385,68 @@ async def main():
             interval_s=args.scenario.interval_s,
         )
     else:
+        # BW mode. Loopback runs publisher + subscriber as in-process
+        # asyncio tasks (loopback test, no relay). Relay mode spawns
+        # them in separate processes so neither blocks the other's loop
+        # — single-process coupling was masking real stack tail latency.
+        if relay_mode:
+            import multiprocessing as mp
+            from aiomoqt.examples._bench_workers import (
+                pub_worker_entry, sub_worker_entry,
+            )
+            mp_stop_event = mp.Event()
+            mp_rate_q = mp.Queue(maxsize=128)
+            mp_events_q = mp.Queue(maxsize=10000)
+            pub_cfg = dict(
+                relay_url=args.relay_url,
+                namespace=args.namespace,
+                trackname=args.trackname,
+                draft=args.draft,
+                insecure=args.insecure,
+                force_quic=False,
+                object_size=args.scenario.object_size,
+                group_size=10000,
+                num_subgroups=args.scenario.subgroups,
+                initial_rate_ops=args.scenario.aggregate_ops(
+                    args.scenario.start_mbps),
+                pub_ns=args.pub_ns,
+                pub_both=args.pub_both,
+                debug=args.debug,
+                keylogfile=(f"{args.keylogfile}.pub"
+                            if args.keylogfile else None),
+            )
+            sub_cfg = dict(
+                sub_id=0,
+                relay_url=args.relay_url,
+                namespace=args.namespace,
+                trackname=args.trackname,
+                draft=args.draft,
+                insecure=args.insecure,
+                force_quic=False,
+                sub_filter=int(FilterType.LATEST_OBJECT),
+                debug=args.debug,
+                keylogfile=(f"{args.keylogfile}.sub"
+                            if args.keylogfile else None),
+            )
+            pub_proc = mp.Process(
+                target=pub_worker_entry,
+                args=(pub_cfg, mp_stop_event, mp_rate_q, mp_events_q),
+                daemon=True,
+            )
+            sub_proc = mp.Process(
+                target=sub_worker_entry,
+                args=(sub_cfg, mp_stop_event, mp_events_q),
+                daemon=True,
+            )
+        else:
+            mp_stop_event = mp_rate_q = mp_events_q = None
+            pub_proc = sub_proc = None
         actuator = BWActuator(
             state, stats, args.scenario,
             shortfall_ratio=args.shortfall_ratio,
+            mp_pub_proc=pub_proc, mp_sub_proc=sub_proc,
+            mp_rate_queue=mp_rate_q, mp_events_queue=mp_events_q,
+            mp_stop_event=mp_stop_event,
         )
     controller = AIMDController(
         actuator, state,
@@ -1236,6 +1454,7 @@ async def main():
         writer=csv_writer,
         latency_threshold_ms=args.latency_threshold,
         backoff_factor=args.backoff_factor,
+        duration_s=args.duration,
     )
 
     server = None
@@ -1243,17 +1462,48 @@ async def main():
     sub_task = None
     try:
         if relay_mode:
-            relay = parse_relay_url(args.relay_url)
-            host, port = relay.host, relay.port
-            endpoint = relay.endpoint or ""
-            use_quic = relay.use_quic
-            verify = not args.insecure
-            pub_task = asyncio.create_task(run_publisher_client(
-                host, port, endpoint, use_quic, verify, args, state))
-            await asyncio.sleep(0.3)
-            if args.mode == "bw":
-                sub_task = asyncio.create_task(run_subscriber_client(
-                    host, port, endpoint, use_quic, verify, args, state, stats))
+            if args.mode == "bw" and pub_proc is not None and sub_proc is not None:
+                # Multiprocess: pub and sub each in their own process.
+                # Sequence the spawn — publisher must reach 'published'
+                # before the subscriber subscribes, otherwise the relay
+                # races the subscribe against the announce and replies
+                # SubscribeOk + SubscribeDone(upstream disconnect)
+                # before the publisher's track is registered.
+                pub_proc.start()
+                # Wait up to 5s for pub_health: published — drain
+                # events into the actuator's pre-published peek path.
+                from queue import Empty
+                deadline = time.monotonic() + 5.0
+                published = False
+                while time.monotonic() < deadline and not published:
+                    try:
+                        ev = mp_events_q.get(timeout=0.1)
+                    except Empty:
+                        continue
+                    if (ev.get('kind') == 'pub_health'
+                            and ev.get('state') == 'published'):
+                        published = True
+                        break
+                    # Re-queue any non-target event so the actuator's
+                    # observe() drains them later.
+                    mp_events_q.put(ev)
+                if not published:
+                    print("  warning: publisher didn't report "
+                          "'published' within 5s; subscribing anyway "
+                          "— may race", file=sys.stderr)
+                sub_proc.start()
+                await asyncio.sleep(0.3)
+            else:
+                # Subs mode: in-process publisher + sub workers spawned
+                # by SubsActuator.
+                relay = parse_relay_url(args.relay_url)
+                host, port = relay.host, relay.port
+                path = relay.path or ""
+                use_quic = relay.use_quic
+                verify = not args.insecure
+                pub_task = asyncio.create_task(run_publisher_client(
+                    host, port, path, use_quic, verify, args, state))
+                await asyncio.sleep(0.3)
         else:
             args.port = loopback_port  # server code still reads args.port
             server = await run_loopback_server(args, state)

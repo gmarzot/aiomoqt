@@ -1,3 +1,8 @@
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
 
-__version__ = version("aiomoqt")
+try:
+    __version__ = _pkg_version("aiomoqt")
+except PackageNotFoundError:
+    __version__ = "0.0.0+unknown"
+
+del _pkg_version, PackageNotFoundError

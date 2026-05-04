@@ -62,14 +62,14 @@ class TestPublishedTrack:
     def test_init(self):
         session = MagicMock()
         t = PublishedTrack(session, "bench", "track")
-        assert t.priority == 255
+        assert t.priority == 128
         assert t.auth_token == b"bench-token"
         assert t._generating is False
 
     def test_init_custom_priority(self):
         session = MagicMock()
-        t = PublishedTrack(session, "bench", "track", priority=128)
-        assert t.priority == 128
+        t = PublishedTrack(session, "bench", "track", priority=255)
+        assert t.priority == 255
 
     def test_init_custom_auth(self):
         session = MagicMock()

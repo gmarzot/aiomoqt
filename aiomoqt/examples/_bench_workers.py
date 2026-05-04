@@ -57,15 +57,37 @@ class _RollingStats:
         self._lost = 0
         self._total_bytes = 0
         self._total_objs = 0
+        # Per-snapshot deltas — snapshot() returns bytes/objs/loss
+        # since the last call so the consumer can sum across its own
+        # window without double-counting our rolling window.
+        self._last_total_bytes = 0
+        self._last_total_objs = 0
+        self._last_lost = 0
+        # RFC 3550 jitter: smooth |D| where D = inter-arrival skew
+        # vs source pacing. Updated per-object in on_object().
+        self._jitter_ms = 0.0
+        self._last_recv_us: int = 0
+        self._last_send_us: int = 0
 
-    def on_object(self, msg, size_bytes, recv_time_ms):
+    def on_object(self, msg, size_bytes, recv_time_us):
+        """Timestamps on the wire are us; lat is float ms."""
         t = time.monotonic()
         lat_ms = None
         exts = getattr(msg, 'extensions', None) or {}
-        send_ms = exts.get(0x20)
-        if send_ms is not None and recv_time_ms is not None \
-                and abs(recv_time_ms - send_ms) < 60000:
-            lat_ms = recv_time_ms - send_ms
+        send_us = exts.get(0x20)
+        if send_us is not None and recv_time_us is not None:
+            raw_us = recv_time_us - send_us
+            # Reject negatives + absurd values from deframer garbage;
+            # accept up to 10 minutes (real under-load latency).
+            if -1_000_000 <= raw_us <= 600_000_000:
+                lat_ms = raw_us / 1000.0
+                if self._last_recv_us and self._last_send_us:
+                    d_us = abs((recv_time_us - self._last_recv_us)
+                               - (send_us - self._last_send_us))
+                    self._jitter_ms += (d_us / 1000.0
+                                        - self._jitter_ms) / 16.0
+                self._last_recv_us = recv_time_us
+                self._last_send_us = send_us
         self._events.append((t, size_bytes, lat_ms))
         self._total_bytes += size_bytes
         self._total_objs += 1
@@ -87,34 +109,43 @@ class _RollingStats:
                 self._last_seen[key] = oid
 
     def snapshot(self) -> dict:
+        """Per-snapshot delta. rx_bytes / rx_objs / iv_lost cover the
+        time since the last snapshot — the consumer can sum them over
+        its own window without double-counting our rolling window.
+        Latency stats stay windowed (need samples for percentiles)."""
         t = time.monotonic()
         cutoff = t - self.window_s
         while self._events and self._events[0][0] < cutoff:
             self._events.popleft()
-        n = len(self._events)
-        if n == 0:
-            return dict(t=t, rx_bytes=0, rx_objs=0,
-                        lat_mean_ms=0.0, lat_p90_ms=0.0,
-                        loss=self._lost,
-                        total_bytes=self._total_bytes,
-                        total_objs=self._total_objs)
-        total_bytes = sum(e[1] for e in self._events)
+        # Latency from the rolling window
         lats = sorted(e[2] for e in self._events if e[2] is not None)
         mean = sum(lats) / len(lats) if lats else 0.0
         p90 = lats[min(int(len(lats) * 0.90), len(lats) - 1)] if lats else 0.0
-        return dict(t=t, rx_bytes=total_bytes, rx_objs=n,
+        # Bytes / objs / loss as DELTAS since last call
+        iv_bytes = self._total_bytes - self._last_total_bytes
+        iv_objs = self._total_objs - self._last_total_objs
+        iv_lost = self._lost - self._last_lost
+        self._last_total_bytes = self._total_bytes
+        self._last_total_objs = self._total_objs
+        self._last_lost = self._lost
+        return dict(t=t, rx_bytes=iv_bytes, rx_objs=iv_objs,
                     lat_mean_ms=mean, lat_p90_ms=p90,
-                    loss=self._lost,
+                    jitter_ms=self._jitter_ms,
+                    iv_lost=iv_lost, loss=self._lost,
                     total_bytes=self._total_bytes,
                     total_objs=self._total_objs)
 
 
 def _setup_quiet_logging(logdir, name, debug):
-    """Redirect stdout; keep stderr for errors; log files if logdir set.
+    """Redirect stdout; route logs based on (logdir, debug):
 
-    stdout gets redirected because periodic print() calls from the sub
-    library would interleave with the parent's controller output. stderr
-    stays for warnings/tracebacks so silent failures are debuggable.
+      logdir + debug=True  : DEBUG level to <logdir>/<name>.log
+      logdir + debug=False : INFO  level to <logdir>/<name>.log
+      no logdir + debug    : DEBUG to stderr (visible in parent terminal)
+      no logdir + no debug : WARNING to stderr (errors only)
+
+    stdout always goes to /dev/null so periodic print() in subordinate
+    libraries doesn't interleave with the parent's controller output.
     """
     devnull = open(os.devnull, 'w')
     sys.stdout = devnull
@@ -126,8 +157,10 @@ def _setup_quiet_logging(logdir, name, debug):
                             format='%(asctime)s %(levelname)s %(message)s')
         set_log_level(lvl)
     else:
-        logging.basicConfig(stream=devnull, force=True)
-        set_log_level(logging.WARNING)
+        lvl = logging.DEBUG if debug else logging.WARNING
+        logging.basicConfig(stream=sys.stderr, force=True, level=lvl,
+                            format=f'[{name}] %(asctime)s %(levelname)s %(message)s')
+        set_log_level(lvl)
 
 
 def _bridge_stop_event(mp_stop_event):
@@ -164,10 +197,11 @@ async def _subscriber_task(config: Dict[str, Any], mp_stop_event,
                             force_quic=config.get('force_quic', False))
     client = MOQTClient(
         relay.host, relay.port,
-        endpoint=relay.endpoint or "",
+        path=relay.path or "",
         use_quic=relay.use_quic,
         verify_tls=not config.get('insecure', False),
         draft_version=config.get('draft'),
+        keylog_filename=config.get('keylogfile'),
     )
 
     stop_ev = _bridge_stop_event(mp_stop_event)
@@ -290,5 +324,172 @@ def sub_worker_entry(config: Dict[str, Any], mp_stop_event, events_queue):
                          config.get('debug', False))
     try:
         asyncio.run(_subscriber_task(config, mp_stop_event, events_queue))
+    except KeyboardInterrupt:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Publisher worker — for adaptive_bench BW mode + (eventually) loopback bench
+# ---------------------------------------------------------------------------
+
+async def _publisher_task(config: Dict[str, Any], mp_stop_event,
+                          rate_queue, events_queue):
+    """Connect to relay, publish a track, drive paced object generation
+    at a rate controllable from the parent via rate_queue.
+
+    rate_queue messages: {'rate_ops': float}  (objects/sec aggregate)
+    events_queue stats: {'kind':'pub_stats', 't', 'tx_bytes', 'tx_objs',
+                          'cumulative_bytes', 'cumulative_objs'} every 1s.
+    """
+    from aiomoqt.types import MOQTMessageType
+    from aiomoqt.track import PublishedTrack
+
+    relay = parse_relay_url(config['relay_url'],
+                            force_quic=config.get('force_quic', False))
+    client = MOQTClient(
+        relay.host, relay.port,
+        path=relay.path or "",
+        use_quic=relay.use_quic,
+        verify_tls=not config.get('insecure', False),
+        draft_version=config.get('draft'),
+        keylog_filename=config.get('keylogfile'),
+    )
+
+    stop_ev = _bridge_stop_event(mp_stop_event)
+    iv_bytes = 0
+    iv_objs = 0
+    total_bytes = 0
+    total_objs = 0
+
+    try:
+        async with client.connect() as session:
+            await session.client_session_init()
+
+            _num_sg = max(1, config.get('num_subgroups', 1))
+            track = PublishedTrack(
+                session,
+                namespace=config['namespace'],
+                trackname=config['trackname'],
+                object_size=config['object_size'],
+                group_size=config.get('group_size', 10000),
+                num_subgroups=_num_sg,
+                rate=config.get('initial_rate_ops', 0.0) / _num_sg,
+            )
+            track._stats_header_printed = True
+            track._quiet = True
+
+            await track.publish(
+                announce_namespace=config.get('pub_ns', False)
+                                   or config.get('pub_both', False),
+                publish_track=not config.get('pub_ns', False)
+                              or config.get('pub_both', False),
+            )
+
+            _post(events_queue, {
+                'kind': 'pub_health', 'state': 'published',
+                't': time.monotonic(),
+            })
+
+            async def _rate_listener():
+                """Drain rate_queue without blocking; mutate track.rate.
+                rate_ops on the wire is the AGGREGATE objects/sec target;
+                track.rate is per-subgroup, so divide by num_subgroups.
+                """
+                while not stop_ev.is_set():
+                    try:
+                        msg = rate_queue.get_nowait()
+                        if isinstance(msg, dict) and 'rate_ops' in msg:
+                            track.rate = float(msg['rate_ops']) / _num_sg
+                    except Exception:
+                        await asyncio.sleep(0.05)
+                        continue
+
+            async def _stats_loop():
+                """Per-second pub stats. tx_bytes counts bytes the
+                publisher has *queued* via send_stream_data; wire_bytes
+                counts what picoquic has actually placed on the wire.
+                The two diverge during slow-start and any time the
+                publisher's queue grows beyond the cwnd."""
+                nonlocal iv_bytes, iv_objs, total_bytes, total_objs
+                last_total_bytes = 0
+                last_total_objs = 0
+                last_wire_bytes = 0
+                quic = getattr(session, '_quic', None)
+                while not stop_ev.is_set():
+                    await asyncio.sleep(STATS_INTERVAL_S)
+                    cur_bytes = getattr(track, '_total_bytes', 0)
+                    cur_objs = getattr(track, '_total_sent', 0)
+                    iv_bytes = cur_bytes - last_total_bytes
+                    iv_objs = cur_objs - last_total_objs
+                    last_total_bytes = cur_bytes
+                    last_total_objs = cur_objs
+                    total_bytes = cur_bytes
+                    total_objs = cur_objs
+                    # Wire-bytes from picoquic's internal counter. The
+                    # cnx pointer is only valid while the cnx is alive;
+                    # swallow anything thrown by the FFI to keep the
+                    # stats loop running through teardown.
+                    cur_wire = 0
+                    try:
+                        if quic is not None:
+                            cur_wire = quic.bytes_sent
+                    except (Exception, SystemError):
+                        cur_wire = last_wire_bytes
+                    iv_wire = max(0, cur_wire - last_wire_bytes)
+                    last_wire_bytes = cur_wire
+                    _post(events_queue, {
+                        'kind': 'pub_stats',
+                        't': time.monotonic(),
+                        'tx_bytes': iv_bytes,
+                        'tx_objs': iv_objs,
+                        'wire_bytes': iv_wire,
+                        'cumulative_bytes': total_bytes,
+                        'cumulative_objs': total_objs,
+                        'cumulative_wire_bytes': cur_wire,
+                    })
+
+            # Generation is launched by track.publish()'s handler
+            # chain (_on_subscribe → _start_generating → track.generate)
+            # when the subscriber arrives. The worker just needs to
+            # stay alive — wait on rate / stats / stop tasks; the gen
+            # task lives inside the session's _tasks set.
+            rate_task = asyncio.create_task(_rate_listener())
+            stats_task = asyncio.create_task(_stats_loop())
+            stop_task = asyncio.create_task(stop_ev.wait())
+            try:
+                await asyncio.wait(
+                    {rate_task, stats_task, stop_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                for t in (rate_task, stats_task, stop_task):
+                    t.cancel()
+                for t in (rate_task, stats_task, stop_task):
+                    try:
+                        await t
+                    except (asyncio.CancelledError, Exception):
+                        pass
+
+            _post(events_queue, {
+                'kind': 'pub_health', 'state': 'closed',
+                't': time.monotonic(),
+            })
+            session.close()
+    except Exception as e:
+        _post(events_queue, {
+            'kind': 'pub_health', 'state': 'failed',
+            'detail': f'publisher error: {e}',
+            't': time.monotonic(),
+        })
+
+
+def pub_worker_entry(config: Dict[str, Any], mp_stop_event,
+                     rate_queue, events_queue):
+    """Process entrypoint. Spawned via multiprocessing.Process."""
+    _setup_quiet_logging(config.get('logdir'), 'pub',
+                         config.get('debug', False))
+    try:
+        asyncio.run(_publisher_task(config, mp_stop_event,
+                                     rate_queue, events_queue))
     except KeyboardInterrupt:
         pass

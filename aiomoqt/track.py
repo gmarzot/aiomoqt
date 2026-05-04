@@ -31,7 +31,7 @@ from typing import Optional, Callable
 
 from .types import (
     MOQTMessageType, ParamType, FilterType, GroupOrder,
-    MOQT_TIMESTAMP_EXT,
+    MOQT_TIMESTAMP_EXT, SessionCloseCode,
 )
 from .messages import (
     SubgroupHeader, PublishOk, RequestUpdate,
@@ -102,7 +102,7 @@ class PublishedTrack(Track):
     def __init__(self, session, namespace: str, trackname: str = 'track',
                  object_size: int = 1024, group_size: int = 60,
                  num_subgroups: int = 1, rate: float = 0,
-                 priority: int = 255, draft: Optional[int] = None,
+                 priority: int = 128, draft: Optional[int] = None,
                  auth_token: bytes = b"bench-token"):
         super().__init__(session, namespace, trackname,
                          object_size, group_size, num_subgroups, rate, draft)
@@ -121,7 +121,8 @@ class PublishedTrack(Track):
         self._total_groups = 0
 
     async def publish(self, announce_namespace: bool = False,
-                      publish_track: bool = True):
+                      publish_track: bool = True,
+                      forward: int = 0):
         """Announce this publisher to the relay.
 
         Three valid combinations (Alan: a publisher picks one flow):
@@ -136,6 +137,21 @@ class PublishedTrack(Track):
 
           announce_namespace=True, publish_track=True  (hybrid):
             Rare; some relays want both. Breaks on CF d14 moq-rs.
+
+        Args:
+          forward: initial Forward State in PUBLISH (d16 §8.2). Default
+            0 = "I'll wait" (spec-conservative; generation starts when
+            relay's PUBLISH_OK or a SUBSCRIBE/REQUEST_UPDATE signals
+            forward=1). Pass forward=1 to declare optimistic intent —
+            generation starts immediately after sending PUBLISH, before
+            waiting for PUBLISH_OK.
+            **EXPERIMENTAL — NOT SUPPORTED BY THE SPEC.** Per Alan
+            Frindell, MoQT does not support sending objects before the
+            PUBLISH_OK handshake completes; relays will reject the
+            unsolicited uni streams (every first-object parse fails).
+            Kept in the API for future use should the spec evolve, and
+            for low-level wire experimentation. Do not rely on this in
+            production.
         """
         if not (announce_namespace or publish_track):
             raise ValueError(
@@ -172,13 +188,19 @@ class PublishedTrack(Track):
             pub_msg = self.session.publish(
                 namespace=self.namespace,
                 track_name=self.trackname,
-                forward=0,
+                forward=forward,
             )
             self.track_alias = pub_msg.track_alias
             self.request_id = pub_msg.request_id
             self.state = TrackState.PUBLISHED
             logger.info(f"Track: published {self.fqtn} "
-                         f"alias={self.track_alias}")
+                         f"alias={self.track_alias} forward={forward}")
+            # Optimistic mode: don't wait for PUBLISH_OK before generating.
+            # The relay may RESET our streams or downshift to forward=0;
+            # both are handled by existing reset / SUBSCRIBE_UPDATE paths.
+            if forward:
+                asyncio.create_task(
+                    self._start_generating(self.session, "OPTIMISTIC"))
 
     async def _start_generating(self, session, trigger: str):
         """Start data generation if not already running."""
@@ -193,9 +215,12 @@ class PublishedTrack(Track):
         await self.generate(session, self.track_alias)
 
     async def _on_publish_ok(self, session, msg: PublishOk):
-        """Relay accepted our PUBLISH. If forward=1, start generating."""
+        """Relay accepted our PUBLISH. forward=1 starts generation if
+        not already running (no-op if optimistic publish already kicked
+        off the generator). forward=0 is logged but does not stop a
+        running generator — relay can RESET streams to enforce."""
         logger.info(f"Track: PUBLISH_OK: forward={msg.forward}")
-        if msg.forward and msg.forward >= 1:
+        if msg.forward:
             await self._start_generating(session, "PUBLISH_OK")
 
     async def _on_request_update(self, session, msg: RequestUpdate):
@@ -203,14 +228,14 @@ class PublishedTrack(Track):
         logger.info(f"Track: REQUEST_UPDATE: {msg}")
         forward = (msg.parameters.get(ParamType.FORWARD)
                    if msg.parameters else None)
-        if not forward or forward <= 0:
+        if not forward:
             return
         await self._start_generating(session, "REQUEST_UPDATE")
 
     async def _on_subscribe_update(self, session, msg):
         """SUBSCRIBE_UPDATE — subscriber changed forward state."""
         logger.info(f"Track: SUBSCRIBE_UPDATE: forward={msg.forward}")
-        if msg.forward and msg.forward >= 1:
+        if msg.forward:
             await self._start_generating(session, "SUBSCRIBE_UPDATE")
 
     async def _on_subscribe(self, session, msg):
@@ -266,7 +291,14 @@ class PublishedTrack(Track):
         mutate `track.rate` in-place to change pacing live.
         """
 
-        pad = b'\xBB' * self.object_size
+        # Counted byte pattern (0..255 repeating). Pre-allocated once
+        # per generate() call. Combined with the per-object f"{group}.
+        # {obj}|" prefix in payload, every byte at every offset of every
+        # object has a deterministic, predictable value — visible in
+        # decrypted pcap and easy to spot duplicates / skips / random
+        # corruption. The prefix identifies WHICH object the bytes came
+        # from; the counted suffix shows offset-within-object.
+        pad = bytes(i & 0xFF for i in range(self.object_size))
 
         for subgroup_id in range(self.num_subgroups):
             priority = self.priority if subgroup_id == 0 else 0
@@ -309,7 +341,7 @@ class PublishedTrack(Track):
                   and not getattr(self, '_quiet', False))
 
         cur_obj_id = subgroup_id
-        stream_id = session.open_uni_stream()
+        stream_id = await session.open_uni_stream()
         self._stream_count += 1
 
         local_sent = 0
@@ -333,17 +365,13 @@ class PublishedTrack(Track):
                             session.stream_write(stream_id, buf.data,
                                                  end_stream=True)
                         else:
-                            session.stream_write(stream_id, b'',
-                                                 end_stream=True)
-                        session.transmit()
+                            session.stream_fin(stream_id)
 
-                        if stream_id in session._data_streams:
-                            del session._data_streams[stream_id]
-                        if stream_id in session._stream_tasks:
-                            session._stream_tasks[stream_id].cancel()
-                            del session._stream_tasks[stream_id]
-
-                        stream_id = session.open_uni_stream()
+                        # Publisher has no _data_streams entry to clean
+                        # up; that dict tracks subscriber-side parser
+                        # state. The done-callback handles cleanup when
+                        # the receiver's parser exits.
+                        stream_id = await session.open_uni_stream()
                         self._stream_count += 1
 
                     header = SubgroupHeader(
@@ -357,12 +385,11 @@ class PublishedTrack(Track):
                     if session._close_err is not None:
                         raise asyncio.CancelledError
                     await session.stream_write_drain(stream_id, msg.data)
-                    session.transmit()
 
                 seq_info = f"{group_id}.{cur_obj_id}".encode()
                 payload = (seq_info + b'|' + pad)[:self.object_size]
 
-                extensions = {MOQT_TIMESTAMP_EXT: int(time.time() * 1000)}
+                extensions = {MOQT_TIMESTAMP_EXT: int(time.time() * 1_000_000)}
                 buf = header.next_object(payload=payload,
                                          extensions=extensions,
                                          object_id=cur_obj_id)
@@ -372,7 +399,6 @@ class PublishedTrack(Track):
                 if session._close_err is not None:
                     raise asyncio.CancelledError
                 await session.stream_write_drain(stream_id, buf.data)
-                session.transmit()
                 local_sent += 1
                 self._total_sent += 1
                 self._total_bytes += obj_bytes
@@ -410,6 +436,12 @@ class PublishedTrack(Track):
                         await asyncio.sleep(0)
 
         except asyncio.CancelledError:
+            # Sender cancelled mid-subgroup → spec wants a RESET so the
+            # subscriber sees a definitive end (not silent stall). Skip
+            # if the session is already torn down — the primitive
+            # short-circuits anyway, but avoid the bookkeeping noise.
+            if session._close_err is None:
+                session.stream_reset(stream_id, SessionCloseCode.NO_ERROR)
             dur = time.monotonic() - start_time
             if dur > 0 and report:
                 bps = (self._total_bytes * 8) / dur
@@ -704,7 +736,7 @@ class VideoTrack(PublishedTrack):
         report = (subgroup_id == 0)
 
         cur_obj_id = subgroup_id
-        stream_id = session.open_uni_stream()
+        stream_id = await session.open_uni_stream()
         local_sent = 0
 
         # Pre-generate padding per frame type
@@ -727,22 +759,19 @@ class VideoTrack(PublishedTrack):
                             object_id=self.group_size)
                         session.stream_write(stream_id, buf.data,
                                              end_stream=True)
-                        session.transmit()
 
-                        if stream_id in session._data_streams:
-                            del session._data_streams[stream_id]
-                        if stream_id in session._stream_tasks:
-                            session._stream_tasks[stream_id].cancel()
-                            del session._stream_tasks[stream_id]
-
-                        stream_id = session.open_uni_stream()
+                        # Publisher has no _data_streams entry to clean
+                        # up; that dict tracks subscriber-side parser
+                        # state. The done-callback handles cleanup when
+                        # the receiver's parser exits.
+                        stream_id = await session.open_uni_stream()
                         self._stream_count += 1
 
                     header = SubgroupHeader(
                         track_alias=track_alias,
                         group_id=group_id,
                         subgroup_id=subgroup_id,
-                        publisher_priority=255,
+                        publisher_priority=priority,
                         extensions_present=True,
                     )
                     msg = header.serialize()
@@ -750,7 +779,6 @@ class VideoTrack(PublishedTrack):
                         raise asyncio.CancelledError
                     await session.stream_write_drain(
                         stream_id, msg.data)
-                    session.transmit()
 
                 # Frame type and size from GOP pattern
                 ft = self._gop[cur_obj_id % len(self._gop)]
@@ -767,7 +795,7 @@ class VideoTrack(PublishedTrack):
                            + frame_pad)[:frame_size]
 
                 extensions = {
-                    MOQT_TIMESTAMP_EXT: int(time.time() * 1000)}
+                    MOQT_TIMESTAMP_EXT: int(time.time() * 1_000_000)}
                 buf = header.next_object(
                     payload=payload,
                     extensions=extensions,
@@ -779,7 +807,6 @@ class VideoTrack(PublishedTrack):
                     raise asyncio.CancelledError
                 await session.stream_write_drain(
                     stream_id, buf.data)
-                session.transmit()
                 local_sent += 1
                 self._total_sent += 1
                 self._total_bytes += obj_bytes

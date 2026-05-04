@@ -65,9 +65,11 @@ class BenchStats:
         self.jitter: float = 0.0
         self.jitter_samples: list = []
 
-    def on_object(self, msg, size_bytes: int, recv_time_ms: int,
+    def on_object(self, msg, size_bytes: int, recv_time_us: int,
                   group_id: int = None, subgroup_id: int = None):
-        """Callback for each received data object."""
+        """Callback for each received data object. Timestamps are
+        microseconds since epoch on the wire; latency stats are
+        float ms (sub-millisecond resolution preserved)."""
         if self.start_time == 0:
             self.start_time = time.monotonic()
             self.last_report_time = self.start_time
@@ -75,29 +77,33 @@ class BenchStats:
 
         now = time.monotonic()
 
-        # Latency from timestamp extension
-        send_ms = (msg.extensions.get(MOQT_TIMESTAMP_EXT)
+        # Latency from timestamp extension (microseconds → float ms)
+        send_us = (msg.extensions.get(MOQT_TIMESTAMP_EXT)
                    if msg.extensions else None)
-        if send_ms is not None:
-            latency = recv_time_ms - send_ms
-            # Reject corrupt timestamps (>60s latency = parse error)
-            if abs(latency) > 60000:
+        latency = None
+        if send_us is not None:
+            raw_us = recv_time_us - send_us
+            # Reject corrupt timestamps. Real under-load latency can
+            # legitimately exceed 60s; cap at 10 minutes (in us).
+            if -1_000_000 <= raw_us <= 600_000_000:
+                latency = raw_us / 1000.0  # float ms
+            else:
                 logger.warning(f"BenchStats: corrupt timestamp: "
-                               f"send={send_ms} recv={recv_time_ms}")
-                send_ms = None
+                               f"send={send_us} recv={recv_time_us}")
+                send_us = None
 
-        if send_ms is not None:
+        if latency is not None:
             self.iv_latencies.append(latency)
             self.all_latencies.append(latency)
 
-            # RFC 3550 jitter
+            # RFC 3550 jitter (us domain → ms result)
             if self.last_recv_ms > 0 and self.last_send_ms is not None:
-                d = abs((recv_time_ms - self.last_recv_ms)
-                        - (send_ms - self.last_send_ms))
+                d = abs((recv_time_us - self.last_recv_ms)
+                        - (send_us - self.last_send_ms)) / 1000.0
                 self.jitter += (d - self.jitter) / 16.0
                 self.jitter_samples.append(self.jitter)
-            self.last_recv_ms = recv_time_ms
-            self.last_send_ms = send_ms
+            self.last_recv_ms = recv_time_us
+            self.last_send_ms = send_us
 
         # Loss detection (skip status messages)
         is_status = (hasattr(msg, 'status')
@@ -266,9 +272,9 @@ def parse_args():
         epilog="""
 relay URL forms:
   moqt://host:port            raw QUIC (port default 443)
-  https://host:port/endpoint  H3/WT (port default 443)
+  https://host:port/path  H3/WT (port default 443)
   host:port                   H3/WT
-  host                        H3/WT, port 443, endpoint /moq
+  host                        H3/WT, port 443, no default path
 
 examples:
   %(prog)s relay.example.com
@@ -337,7 +343,7 @@ async def run(args):
 
     client = MOQTClient(
         relay.host, relay.port,
-        endpoint=relay.endpoint,
+        path=relay.path,
         use_quic=relay.use_quic,
         verify_tls=not args.insecure,
         draft_version=args.draft,

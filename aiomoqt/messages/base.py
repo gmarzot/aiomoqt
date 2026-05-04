@@ -1,5 +1,6 @@
-from typing import Any, Union, Dict
-from dataclasses import dataclass, fields
+import os
+from typing import Any, Optional, Union, Dict
+from dataclasses import dataclass, field, fields
 
 from . import ParamType, SetupParamType, AuthTokenAliasType
 from ..context import get_moqt_ctx_version, get_major_version
@@ -7,6 +8,11 @@ from ..utils.buffer import Buffer, BufferReadError
 from ..utils.logger import *
 
 logger = get_logger(__name__)
+
+# Same env gate as the ObjectHeader.serialize strict-check, extended to
+# cover the extensions block. Catches publisher-side declared-vs-actual
+# mismatches in the temp-buffer extensions encode path.
+_STRICT_SERIALIZE = bool(int(os.environ.get('AIOMOQT_STRICT_SERIALIZE', '0')))
 
 BUF_SIZE = 4 * 1024  # 4KB buffer size for messages
 
@@ -17,10 +23,15 @@ class MOQTUnderflow(Exception):
         self.needed = needed
 
 
-@dataclass
+@dataclass(slots=True)
 class MOQTMessage:
-    """Base class for all MOQT messages."""
-    # type: Optional[int] = None - let subclass set it - annoying warnings
+    """Base class for all MOQT messages.
+
+    Declared `type` slot so subclasses can assign their MOQTMessageType
+    in __post_init__ (and consumers can read it generically) under
+    slots=True. Default None; concrete subclasses override.
+    """
+    type: Optional[int] = field(default=None, kw_only=True)
 
     @staticmethod
     def _extensions_encode(buf: Buffer, exts: Dict,
@@ -47,9 +58,23 @@ class MOQTMessage:
                     payload.push_bytes(ext_value)
 
             exts_len = payload.tell()
+            if _STRICT_SERIALIZE and len(payload.data) != exts_len:
+                raise AssertionError(
+                    f"_extensions_encode payload mismatch: "
+                    f"declared exts_len={exts_len} "
+                    f"actual payload.data bytes={len(payload.data)}"
+                )
             if with_length:
                 buf.push_uint_var(exts_len)
+            payload_bytes_before = buf.tell()
             buf.push_bytes(payload.data)
+            actual_pushed = buf.tell() - payload_bytes_before
+            if _STRICT_SERIALIZE and actual_pushed != exts_len:
+                raise AssertionError(
+                    f"_extensions_encode push_bytes mismatch: "
+                    f"declared exts_len={exts_len} "
+                    f"actually pushed={actual_pushed}"
+                )
         else:
             buf.push_uint_var(len(exts))
             for ext_id, ext_value in exts.items():
@@ -64,16 +89,41 @@ class MOQTMessage:
                     buf.push_bytes(ext_value)
 
     exts_err_count = 0
+    EXTENSIONS_LEN_LIMIT = 1024 * 16
+
     @staticmethod
     def _extensions_decode(buf: Buffer, with_length: bool = True,
                            buf_end: int = None) -> Dict[int, Union[int, bytes]]:
         exts = {}
         if with_length:
+            pos_before = buf.tell()
             exts_len = buf.pull_uint_var()
-            if exts_len > (1024*16):
+            if exts_len > MOQTMessage.EXTENSIONS_LEN_LIMIT:
+                # Framer has lost alignment: this varint is being read
+                # from a position that doesn't actually point at an
+                # extensions block. Returning silently here ratchets
+                # the desync — caller advances past garbage and reads
+                # more garbage. Raise so the outer loop terminates the
+                # stream cleanly via STOP_SENDING.
                 MOQTMessage.exts_err_count += 1
-                logger.warning(f"MOQTMessage._extensions_decode(): corrupted buffer : ext_len: {exts_len} count: {MOQTMessage.exts_err_count}")
-                return exts
+                if MOQTMessage.exts_err_count == 1:
+                    # First-corruption diagnostic — dump anchor bytes
+                    # so the misalignment can be reverse-engineered.
+                    try:
+                        cap = buf.capacity
+                        head = buf.data_slice(0, min(64, cap)).hex()
+                    except Exception:
+                        head = "<unavailable>"
+                    logger.error(
+                        "MOQT framer desync: ext_len=%d at pos=%d "
+                        "(cap=%d) head_hex=%s",
+                        exts_len, pos_before, cap, head,
+                    )
+                raise RuntimeError(
+                    f"framer desync: ext_len={exts_len} exceeds "
+                    f"limit {MOQTMessage.EXTENSIONS_LEN_LIMIT} "
+                    f"at pos={pos_before}"
+                )
             if exts_len == 0:
                 return exts
             exts_end = buf.tell() + exts_len

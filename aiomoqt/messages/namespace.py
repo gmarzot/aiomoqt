@@ -9,7 +9,7 @@ from ..utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-@dataclass
+@dataclass(slots=True)
 class PublishNamespace(MOQTMessage):
     """PUBLISH_NAMESPACE message for advertising a track namespace."""
     request_id: int = 0  # Request ID field from spec
@@ -50,7 +50,7 @@ class PublishNamespace(MOQTMessage):
         return cls(request_id=request_id, namespace=namespace, parameters=params)
 
 
-@dataclass
+@dataclass(slots=True)
 class PublishNamespaceOk(MOQTMessage):
     """PUBLISH_NAMESPACE_OK response message."""
     request_id: int = 0  # Spec says Request ID, not namespace
@@ -75,7 +75,7 @@ class PublishNamespaceOk(MOQTMessage):
         return cls(request_id=request_id)
 
 
-@dataclass
+@dataclass(slots=True)
 class PublishNamespaceError(MOQTMessage):
     """PUBLISH_NAMESPACE_ERROR response message."""
     request_id: int = 0  # Spec says Request ID, not namespace
@@ -110,7 +110,7 @@ class PublishNamespaceError(MOQTMessage):
         return cls(request_id=request_id, error_code=error_code, reason=reason)
 
 
-@dataclass
+@dataclass(slots=True)
 class PublishNamespaceDone(MOQTMessage):
     """PUBLISH_NAMESPACE_DONE message to withdraw track namespace.
 
@@ -151,7 +151,7 @@ class PublishNamespaceDone(MOQTMessage):
             return cls(namespace=namespace)
 
 
-@dataclass
+@dataclass(slots=True)
 class PublishNamespaceCancel(MOQTMessage):
     """PUBLISH_NAMESPACE_CANCEL message to withdraw announcement acceptance.
 
@@ -204,7 +204,7 @@ class PublishNamespaceCancel(MOQTMessage):
         return cls(namespace=namespace, error_code=error_code, reason=reason, request_id=request_id)
 
 
-@dataclass
+@dataclass(slots=True)
 class SubscribeNamespace(MOQTMessage):
     """SUBSCRIBE_NAMESPACE message to subscribe to announcements."""
     request_id: int = 0  # Request ID field from spec
@@ -251,7 +251,7 @@ class SubscribeNamespace(MOQTMessage):
                    subscribe_options=subscribe_options, parameters=params)
 
 
-@dataclass
+@dataclass(slots=True)
 class SubscribeNamespaceOk(MOQTMessage):
     """SUBSCRIBE_NAMESPACE_OK response message."""
     request_id: int = 0  # Spec says Request ID, not namespace_prefix
@@ -276,7 +276,7 @@ class SubscribeNamespaceOk(MOQTMessage):
         return cls(request_id=request_id)
 
 
-@dataclass
+@dataclass(slots=True)
 class SubscribeNamespaceError(MOQTMessage):
     """SUBSCRIBE_NAMESPACE_ERROR response message."""
     request_id: int = 0  # Spec says Request ID, not namespace_prefix

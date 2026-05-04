@@ -10,7 +10,7 @@ from ..utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-@dataclass
+@dataclass(slots=True)
 class Publish(MOQTMessage):
     """PUBLISH (0x1D) — Publisher announces a track to subscriber.
 
@@ -141,7 +141,7 @@ class Publish(MOQTMessage):
         )
 
 
-@dataclass
+@dataclass(slots=True)
 class PublishOk(MOQTMessage):
     """PUBLISH_OK (0x1E) — Subscriber accepts a PUBLISH.
 
@@ -257,7 +257,7 @@ class PublishOk(MOQTMessage):
         )
 
 
-@dataclass
+@dataclass(slots=True)
 class PublishError(MOQTMessage):
     """PUBLISH_ERROR (0x1F) — Subscriber rejects a PUBLISH.
 

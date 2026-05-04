@@ -8,7 +8,7 @@ Usage:
   # Raw QUIC
   python -m aiomoqt.examples.bench_pub moqt://relay.example.com
 
-  # Bare hostname (defaults to https, port 443, endpoint /moq)
+  # Bare hostname (defaults to https, port 443, no default path)
   python -m aiomoqt.examples.bench_pub relay.example.com
 
   # With options
@@ -31,9 +31,9 @@ def parse_args():
         epilog="""
 relay URL forms:
   moqt://host:port            raw QUIC (default port 443)
-  https://host:port/endpoint  H3/WebTransport (default port 443)
+  https://host:port/path  H3/WebTransport (default port 443)
   host:port                   H3/WebTransport
-  host                        H3/WebTransport, port 443, endpoint /moq
+  host                        H3/WebTransport, port 443, no default path
 
 examples:
   %(prog)s moqt://relay.example.com
@@ -68,6 +68,20 @@ examples:
     pub_mode.add_argument('--pub-both', action='store_true',
                           help='Hybrid: PUB_NS + PUBLISH (legacy relays '
                                'that want both; breaks on CF d14).')
+    parser.add_argument('--forward', type=int, nargs='?', const=1, default=0,
+                        choices=(0, 1),
+                        help='[EXPERIMENTAL] Initial Forward State in '
+                             'PUBLISH (d16 §8.2). Default 0 = '
+                             'spec-conservative; generation waits for the '
+                             'relay or subscriber to request forward=1. '
+                             '--forward (or --forward 1) declares '
+                             'optimistic intent — generation starts '
+                             'immediately after PUBLISH, before PUBLISH_OK '
+                             'arrives. NOT supported by the MoQT spec '
+                             '(per Alan Frindell): relays reject the '
+                             'unsolicited uni streams (every first-object '
+                             'parse fails). Retained for low-level wire '
+                             'experimentation.')
     parser.add_argument('-d', '--debug', action='store_true')
     parser.add_argument('--keylogfile', type=str, default=None)
     parser.add_argument('-k', '--insecure', action='store_true',
@@ -121,7 +135,7 @@ async def run(args):
 
     client = MOQTClient(
         relay.host, relay.port,
-        endpoint=relay.endpoint,
+        path=relay.path,
         use_quic=relay.use_quic,
         verify_tls=not args.insecure,
         draft_version=args.draft,
@@ -147,6 +161,7 @@ async def run(args):
             await track.publish(
                 announce_namespace=(args.pub_ns or args.pub_both),
                 publish_track=(not args.pub_ns or args.pub_both),
+                forward=args.forward,
             )
             print(f"  Published '{track.fqtn}', waiting for subscriber...")
 

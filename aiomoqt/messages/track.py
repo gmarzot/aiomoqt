@@ -1,8 +1,16 @@
+import os
 from enum import IntEnum
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from sortedcontainers import SortedDict
 from typing import Optional, Dict, List, Tuple, Union
 import time
+
+# Set AIOMOQT_STRICT_SERIALIZE=1 to enable per-object payload-length
+# self-check in ObjectHeader.serialize (catches publisher-side
+# declared-vs-actual byte mismatches that surface downstream as
+# 'framer desync ext_len exceeds limit'). Off by default; one extra
+# tell() per object on the hot path, so leave it gated.
+_STRICT_SERIALIZE = bool(int(os.environ.get('AIOMOQT_STRICT_SERIALIZE', '0')))
 
 from . import (MOQTUnderflow, MOQTMessage, ObjectStatus, DataStreamType,
                MOQT_DEFAULT_PRIORITY, BUF_SIZE,
@@ -15,7 +23,7 @@ logger = get_logger(__name__)
 
 
 
-@dataclass
+@dataclass(slots=True)
 class Group:
     """MOQT Group data accumulator"""
     group_id: int
@@ -43,7 +51,7 @@ class Group:
 
 
 
-@dataclass
+@dataclass(slots=True)
 class Track:
     """Represents a MOQT track."""
     namespace: Tuple[bytes, ...]
@@ -62,7 +70,7 @@ class Track:
         return group
 
 
-@dataclass
+@dataclass(slots=True)
 class SubgroupHeader(MOQTMessage):
     """Draft-14 SUBGROUP_HEADER (types 0x10-0x1D).
 
@@ -81,10 +89,13 @@ class SubgroupHeader(MOQTMessage):
     extensions_present: bool = False
     end_of_group: bool = False
     subgroup_id_mode: int = SUBGROUP_ID_EXPLICIT
+    # Runtime parser state for object-id delta decoding within this
+    # subgroup; not on the wire. Declared as a field so slots=True
+    # admits the per-instance assignment in __post_init__.
+    _last_object_id: Optional[int] = field(default=None, init=False)
 
     def __post_init__(self):
         self.type = SUBGROUP_HEADER_BASE
-        self._last_object_id = None  # runtime state for delta decoding
 
     def _compute_type(self) -> int:
         """Compute wire type byte from flags."""
@@ -200,7 +211,7 @@ class SubgroupHeader(MOQTMessage):
         )
 
 
-@dataclass
+@dataclass(slots=True)
 class ObjectHeader(MOQTMessage):
     """Draft-14 object within a subgroup stream.
 
@@ -241,8 +252,26 @@ class ObjectHeader(MOQTMessage):
             MOQTMessage._extensions_encode(buf, None)  # empty extensions
 
         if self.status == ObjectStatus.NORMAL and self.payload:
+            len_pos = buf.tell()
             buf.push_uint_var(payload_len)
+            len_varint_bytes = buf.tell() - len_pos
+            payload_pos = buf.tell()
             buf.push_bytes(self.payload)
+            actual_payload_bytes = buf.tell() - payload_pos
+            # Strict-serialize check (env-gated, hot-path-cheap):
+            # catches publisher-side payload_len/actual-bytes mismatch
+            # at the moment of mis-serialization — far easier than
+            # reverse-engineering from a downstream framer-desync.
+            if (_STRICT_SERIALIZE
+                    and actual_payload_bytes != payload_len):
+                raise AssertionError(
+                    f"ObjectHeader.serialize payload mismatch: "
+                    f"declared payload_len={payload_len} "
+                    f"(varint {len_varint_bytes}B), "
+                    f"actually wrote {actual_payload_bytes}B; "
+                    f"object_id={self.object_id} "
+                    f"payload_type={type(self.payload).__name__}"
+                )
         else:
             buf.push_uint_var(0)  # Zero length
             buf.push_uint_var(self.status)  # Status code
@@ -296,7 +325,7 @@ class ObjectHeader(MOQTMessage):
         )
 
 
-@dataclass
+@dataclass(slots=True)
 class FetchHeader(MOQTMessage):
     """MOQT fetch stream header.
 
@@ -305,9 +334,13 @@ class FetchHeader(MOQTMessage):
     the wire format.
     """
     request_id: int
+    # Runtime parser state for FetchObject delta decoding (d16 §10.4.4);
+    # not on the wire. Declared as a slot field so per-instance
+    # assignment works under slots=True.
+    _prior_obj: Optional['FetchObject'] = field(default=None, init=False)
 
     def __post_init__(self):
-        self._prior_obj: Optional['FetchObject'] = None
+        pass
 
     def serialize(self) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
@@ -341,7 +374,7 @@ FETCH_FLAGS_END_NON_EXISTENT = 0x8C  # End of Non-Existent Range
 FETCH_FLAGS_END_UNKNOWN = 0x10C      # End of Unknown Range
 
 
-@dataclass
+@dataclass(slots=True)
 class FetchObject(MOQTMessage):
     """Object within a fetch stream.
 
@@ -548,7 +581,7 @@ class FetchObject(MOQTMessage):
         )
 
 
-@dataclass
+@dataclass(slots=True)
 class ObjectDatagram(MOQTMessage):
     """Draft-14 object datagram (types 0x00-0x07).
 
@@ -627,7 +660,7 @@ class ObjectDatagram(MOQTMessage):
             end_of_group=end_of_group,
         )
 
-@dataclass
+@dataclass(slots=True)
 class ObjectDatagramStatus(MOQTMessage):
     """Draft-14 object datagram status (types 0x20-0x21).
 

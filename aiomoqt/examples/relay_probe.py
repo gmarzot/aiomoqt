@@ -69,7 +69,7 @@ async def probe_version(host, port, path, use_quic, draft_version,
     try:
         client = MOQTClient(
             host, port,
-            endpoint=path,
+            path=path,
             use_quic=use_quic,
             verify_tls=verify_tls,
             draft_version=draft_version,
@@ -104,7 +104,7 @@ async def probe_endpoint(url, verify_tls=False):
     Returns endpoint status with list of supported drafts.
     """
     relay = parse_relay_url(url)
-    host, port, path, use_quic = relay.host, relay.port, relay.endpoint or "", relay.use_quic
+    host, port, path, use_quic = relay.host, relay.port, relay.path or "", relay.use_quic
     transport = "QUIC" if use_quic else "H3/WT"
 
     t0 = time.monotonic()

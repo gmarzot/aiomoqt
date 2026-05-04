@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import asyncio
+import uuid
 
 from aiomoqt.types import MOQTMessageType, ParamType, ObjectStatus, MOQTException, MOQT_TIMESTAMP_EXT
 from aiomoqt.messages import (
@@ -85,7 +86,7 @@ async def generate_group_dgram(session: MOQTSession, track_alias: int, priority:
                         object_id=object_id,
                         publisher_priority=priority,
                         status=ObjectStatus.END_OF_GROUP,
-                        extensions={MOQT_TIMESTAMP_EXT: int(time.time()*1000)}
+                        extensions={MOQT_TIMESTAMP_EXT: int(time.time() * 1_000_000)}
                     )
                     msg = obj.serialize()
                     if session._close_err is not None:
@@ -107,7 +108,7 @@ async def generate_group_dgram(session: MOQTSession, track_alias: int, priority:
                 group_id=group_id,
                 object_id=object_id,
                 publisher_priority=priority,
-                extensions={MOQT_TIMESTAMP_EXT: int(time.time()*1000)},
+                extensions={MOQT_TIMESTAMP_EXT: int(time.time() * 1_000_000)},
                 payload=payload,
                 end_of_group=(object_id == GROUP_SIZE - 1),
             )
@@ -139,7 +140,7 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
     logger = get_logger(__name__)
     I_FRAME_PAD = b'I' * object_size
     P_FRAME_PAD = b'P' * object_size
-    stream_id = session.open_uni_stream()
+    stream_id = await session.open_uni_stream()
     logger.info(f"MOQT app: created data stream({stream_id}): subgroup: {subgroup_id}")
 
     next_frame_time = time.monotonic()
@@ -155,7 +156,7 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
 
                 # End the previous group
                 if header is not None:
-                    extensions = {MOQT_TIMESTAMP_EXT: int(time.time()*1000)} if use_extensions else None
+                    extensions = {MOQT_TIMESTAMP_EXT: int(time.time() * 1_000_000)} if use_extensions else None
                     buf = header.end_group(extensions=extensions)
                     if session._close_err:
                         raise asyncio.CancelledError
@@ -173,7 +174,7 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
                         del session._stream_tasks[stream_id]
 
                     # Create new stream for next group
-                    stream_id = session.open_uni_stream()
+                    stream_id = await session.open_uni_stream()
 
                 # Start new subgroup header — tracks object_id and delta state
                 header = SubgroupHeader(
@@ -201,7 +202,7 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
                 payload = (info + P_FRAME_PAD)[:object_size]
 
             # Send next object — delta encoding handled automatically
-            extensions = {MOQT_TIMESTAMP_EXT: int(time.time()*1000)} if use_extensions else None
+            extensions = {MOQT_TIMESTAMP_EXT: int(time.time() * 1_000_000)} if use_extensions else None
             buf = header.next_object(payload=payload, extensions=extensions)
 
             if session._close_err is not None:
@@ -226,9 +227,15 @@ def parse_args():
     parser.add_argument('--host', type=str, default='localhost', help='Host to connect to')
     parser.add_argument('--port', type=int, default=443, help='Port to connect to')
     parser.add_argument('--namespace', type=str, default='test', help='Namespace')
-    parser.add_argument('--trackname', type=str, default='track', help='Track')
+    parser.add_argument(
+        '--trackname', type=str,
+        default=f"track-{uuid.uuid4().hex[:4]}",
+        help='Track name (default: track-<rand4> — relay caches '
+             'reject differing payload bytes for the same trackname '
+             'across runs, so the random suffix avoids spurious '
+             'cache mismatches)')
     parser.add_argument('--use-quic', action='store_true', help='Enable QUIC transport')
-    parser.add_argument('--endpoint', type=str, default='', help='MOQT endpoint path (default: "/")')
+    parser.add_argument('--path', type=str, default='', help='MOQT path (default: "/")')
     parser.add_argument('--datagram', action='store_true', help='Emit ObjectDatagrams')
     parser.add_argument('--debug', action='store_true', help='Enable debug output')
     parser.add_argument('--quic-debug', action='store_true', help='Enable quic debug output')
@@ -250,7 +257,7 @@ def parse_args():
     return parser.parse_args()
 
 
-async def main(host: str, port: int, endpoint: str, namespace: str, trackname: str,
+async def main(host: str, port: int, path: str, namespace: str, trackname: str,
                debug: bool, datagram: bool, use_quic: bool, quic_debug: bool,
                insecure: bool = False, auth_token: str = None, draft: int = None,
                streams: int = 1, object_size: int = 1024, rate: float = 30,
@@ -262,7 +269,7 @@ async def main(host: str, port: int, endpoint: str, namespace: str, trackname: s
     client = MOQTClient(
         host,
         port,
-        endpoint=endpoint,
+        path=path,
         use_quic=use_quic,
         verify_tls=not insecure,
         draft_version=draft,
@@ -318,7 +325,7 @@ if __name__ == "__main__":
         asyncio.run(main(
             host=args.host,
             port=args.port,
-            endpoint=args.endpoint,
+            path=args.path,
             use_quic=args.use_quic,
             namespace=args.namespace,
             trackname=args.trackname,

@@ -2,7 +2,7 @@
 
 Scheme determines transport:
   moqt://host:port           -> raw QUIC (ALPN: moq-00)
-  https://host:port/endpoint -> H3/WebTransport
+  https://host:port/path     -> H3/WebTransport
 
 Default ports: moqt:// -> 443, https:// -> 443
 """
@@ -21,13 +21,13 @@ class MOQTRelay:
     host: str
     port: int
     use_quic: bool  # True = raw QUIC, False = H3/WebTransport
-    endpoint: Optional[str]  # WebTransport endpoint path (None for raw QUIC)
+    path: Optional[str]  # MoQT path (URL :path component; None for raw QUIC)
 
     def __str__(self):
         if self.use_quic:
             port_s = "" if self.port == MOQT_DEFAULT_PORT else f":{self.port}"
             return f"moqt://{self.host}{port_s}"
-        ep = f"/{self.endpoint}" if self.endpoint else ""
+        ep = f"/{self.path}" if self.path else ""
         port_s = "" if self.port == HTTPS_DEFAULT_PORT else f":{self.port}"
         return f"https://{self.host}{port_s}{ep}"
 
@@ -37,7 +37,7 @@ class MOQTRelay:
 
 
 def parse_relay_url(url: str, force_quic: bool = False,
-                    default_endpoint: str = "") -> MOQTRelay:
+                    default_path: str = "") -> MOQTRelay:
     """Parse a relay URL into connection parameters.
 
     Args:
@@ -47,7 +47,7 @@ def parse_relay_url(url: str, force_quic: bool = False,
             - "host:port"               -> H3/WebTransport (default)
             - "host"                    -> H3/WebTransport, default port
         force_quic: Override to use raw QUIC even for https:// URLs.
-        default_endpoint: WebTransport endpoint when not in URL.
+        default_path: MoQT path when not in URL.
             Defaults to "" (= root path "/"). Callers that need a
             specific path (e.g. "moq-relay") must pass it explicitly.
 
@@ -65,7 +65,7 @@ def parse_relay_url(url: str, force_quic: bool = False,
                     host=host,
                     port=port,
                     use_quic=force_quic,
-                    endpoint=None if force_quic else default_endpoint,
+                    path=None if force_quic else default_path,
                 )
             except ValueError:
                 pass
@@ -74,7 +74,7 @@ def parse_relay_url(url: str, force_quic: bool = False,
             host=url,
             port=MOQT_DEFAULT_PORT if force_quic else HTTPS_DEFAULT_PORT,
             use_quic=force_quic,
-            endpoint=None if force_quic else default_endpoint,
+            path=None if force_quic else default_path,
         )
 
     parsed = urlparse(url)
@@ -85,15 +85,15 @@ def parse_relay_url(url: str, force_quic: bool = False,
             host=parsed.hostname or "localhost",
             port=parsed.port or MOQT_DEFAULT_PORT,
             use_quic=True,
-            endpoint=None,
+            path=None,
         )
     elif scheme == "https":
-        endpoint = parsed.path.strip("/") or default_endpoint
+        path = parsed.path.strip("/") or default_path
         return MOQTRelay(
             host=parsed.hostname or "localhost",
             port=parsed.port or HTTPS_DEFAULT_PORT,
             use_quic=force_quic,
-            endpoint=None if force_quic else endpoint,
+            path=None if force_quic else path,
         )
     else:
         raise ValueError(f"unsupported scheme: {scheme}:// (use moqt:// or https://)")

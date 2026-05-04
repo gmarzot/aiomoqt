@@ -3,7 +3,7 @@
 
 Convenience wrapper that launches both bench_pub and bench_sub
 as concurrent tasks against the same relay. Useful when both
-endpoints are on the same machine.
+relay and clients are on the same machine.
 
 Usage:
   python -m aiomoqt.examples.bench_relay relay.example.com
@@ -25,9 +25,9 @@ relay. All publisher options are passed through.
 
 relay URL forms:
   moqt://host:port            raw QUIC (port default 443)
-  https://host:port/endpoint  H3/WT (port default 443)
+  https://host:port/path  H3/WT (port default 443)
   host:port                   H3/WT
-  host                        H3/WT, port 443, endpoint /moq
+  host                        H3/WT, port 443, no default path
 
 examples:
   %(prog)s relay.example.com
