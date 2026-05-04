@@ -1,6 +1,6 @@
  aiomoqt - Media over QUIC Transport (MoQT)
 
-`aiomoqt` is an implementation of the MoQT protocol, based on `asyncio` and `qh3`.
+`aiomoqt` is an implementation of the MoQT protocol, based on `asyncio` and `aiopquic`.
 
 ## Overview
 
@@ -9,7 +9,7 @@ with **dual draft-14 and draft-16 support**. It is designed for general use as
 an MoQT client and server library, supporting both 'publish' and 'subscribe' roles.
 
 The architecture follows the [asyncio.Protocol](https://docs.python.org/3/library/asyncio-protocol.html)
-design pattern, extending the [qh3 QuicConnectionProtocol](https://pypi.org/project/qh3/).
+design pattern, extending the [aiopquic QuicConnectionProtocol](https://pypi.org/project/aiopquic/).
 It supports both H3/WebTransport and raw QUIC transports, with ALPN-based
 draft version negotiation, and has been interop tested against 6 relay
 implementations across draft-14 and draft-16.
