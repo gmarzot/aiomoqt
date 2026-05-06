@@ -97,10 +97,29 @@ def _pytest_file(test_file: str, log: Path) -> tuple[str, str]:
     ok, _ = _run(["pytest", "-q", test_file], log, 180)
     if not ok:
         return "FAIL", "timeout"
-    text = log.read_text().strip()
-    last = text.splitlines()[-1] if text else ""
-    passed = "passed" in last and "failed" not in last
-    return ("PASS" if passed else "FAIL"), last or "(no summary)"
+    # Search for the pytest summary line anywhere in the captured
+    # output, not just the last line. Stray output from atexit /
+    # connection-cleanup ("Received a connection close request") often
+    # follows the summary on stderr and would otherwise mask a passing
+    # run. Match the canonical pytest format: "N passed[, M failed]
+    # [, K skipped] in T.TTs".
+    text = log.read_text()
+    summary_re = re.compile(
+        r"^(\d+) passed(?:,\s*(\d+) failed)?(?:,\s*\d+ skipped)?\s+in\s+",
+        re.MULTILINE,
+    )
+    m = summary_re.search(text)
+    if m is None:
+        return "FAIL", "(no pytest summary)"
+    failed_count = int(m.group(2) or 0)
+    summary_line = m.group(0).rstrip()
+    # Strip trailing "in" — that's the start of "in T.TTs" but the
+    # match captured up to the literal " in ". Recover the full line:
+    # find the matched start and read through to end-of-line.
+    start = m.start()
+    end = text.find("\n", start)
+    summary_line = text[start:end if end != -1 else None].strip()
+    return ("PASS" if failed_count == 0 else "FAIL"), summary_line
 
 
 def _buffer(log_dir: Path) -> tuple[str, str]:
