@@ -69,7 +69,7 @@ async def test_aiopquic_rawquic_handshake():
     server = MOQTServer(
         host="localhost", port=port,
         certificate=CERT, private_key=KEY,
-        path="moq",
+        path="/",
         use_quic=True,
         draft_version=MOQT_VERSION_DRAFT16,
     )
@@ -77,7 +77,7 @@ async def test_aiopquic_rawquic_handshake():
     try:
         client = MOQTClient(
             host="localhost", port=port,
-            path="moq",
+            path="/",
             use_quic=True,
             verify_tls=False,
             draft_version=MOQT_VERSION_DRAFT16,
@@ -100,7 +100,7 @@ async def test_aiopquic_rawquic_pubsub_one_subgroup():
     server = MOQTServer(
         host="localhost", port=port,
         certificate=CERT, private_key=KEY,
-        path="moq",
+        path="/",
         use_quic=True,
         draft_version=MOQT_VERSION_DRAFT16,
     )
@@ -118,7 +118,7 @@ async def test_aiopquic_rawquic_pubsub_one_subgroup():
     try:
         client = MOQTClient(
             host="localhost", port=port,
-            path="moq",
+            path="/",
             use_quic=True,
             verify_tls=False,
             draft_version=MOQT_VERSION_DRAFT16,

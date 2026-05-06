@@ -193,7 +193,7 @@ async def _start_server(port: int, cache: FetchTestCache,
     server = MOQTServer(
         host="localhost", port=port,
         certificate=CERT, private_key=KEY,
-        path="moq",
+        path="/",
         use_quic=use_quic,
     )
     server.register_handler(
@@ -209,7 +209,7 @@ async def _connect_client(port: int, use_quic: bool = True):
     """Create a client connected to localhost."""
     return MOQTClient(
         "localhost", port,
-        path="moq",
+        path="/",
         use_quic=use_quic,
         verify_tls=False,
     )
@@ -534,7 +534,7 @@ async def test_fetch_cancel_mid_stream(use_quic):
     server = MOQTServer(
         host="localhost", port=port,
         certificate=CERT, private_key=KEY,
-        path="moq",
+        path="/",
         use_quic=use_quic,
     )
     server.register_handler(MOQTMessageType.FETCH, _slow_fetch)

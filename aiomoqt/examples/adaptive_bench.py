@@ -39,6 +39,19 @@ from aiomoqt.types import (MOQT_TIMESTAMP_EXT, FilterType, MOQTMessageType,
 from aiomoqt.utils.format import fmt_bps, fmt_ms
 from aiomoqt.utils.logger import set_log_level
 
+
+def _try_install_uvloop() -> bool:
+    """Drop in uvloop if available — typically 2-4× over stock asyncio
+    on selector-heavy workloads. Stock CPython falls back if the
+    import fails. Caller decides when to call (must be before any
+    asyncio.run / loop creation)."""
+    try:
+        import uvloop
+        uvloop.install()
+        return True
+    except ImportError:
+        return False
+
 # ---------------------------------------------------------------------------
 # Load config: pinned axes, ramp aggregate bitrate
 # ---------------------------------------------------------------------------
@@ -103,6 +116,13 @@ class Signal:
     active_subs: int = 1    # subs currently receiving data
     failed_subs: int = 0    # new subscribe/reset failures in this interval
     health: str = "ok"      # "ok" | "degraded" | "failing"
+    # aiopquic SPSC TX ring depth (bytes queued in the publisher's
+    # send rings, summed across streams). Sustained growth means
+    # picoquic's worker isn't draining fast enough for the commanded
+    # rate — bytes accumulate in our ring instead of going on the wire.
+    tx_ring_depth_bytes: int = 0
+    tx_ring_depth_max_bytes: int = 0
+    tx_ring_streams: int = 0
 
 
 @dataclass
@@ -286,6 +306,14 @@ class BWActuator:
         #              (slow-start + cwnd ground truth).
         self._mp_tx_window = []     # (t, tx_bytes)
         self._mp_wire_window = []   # (t, wire_bytes)
+        # Latest snapshot of aiopquic SPSC TX ring depth (bytes
+        # queued in the per-stream send rings, summed across streams).
+        # Sustained growth = picoquic worker can't drain fast enough
+        # for the commanded rate; this is the cleanest "memory bloat"
+        # signal we have on the publisher side.
+        self._mp_tx_ring_depth = 0
+        self._mp_tx_ring_depth_max = 0
+        self._mp_tx_ring_streams = 0
         # Per-sub-id latest jitter; aggregate = mean across active
         # subs so multi-sub mode reports avg-of-subs not last-of-subs.
         self._mp_jitter_per_sub: dict[int, float] = {}
@@ -318,6 +346,12 @@ class BWActuator:
             if kind == 'pub_stats':
                 self._mp_tx_window.append((t, ev.get('tx_bytes', 0)))
                 self._mp_wire_window.append((t, ev.get('wire_bytes', 0)))
+                self._mp_tx_ring_depth = ev.get(
+                    'tx_ring_depth_bytes', 0)
+                self._mp_tx_ring_depth_max = ev.get(
+                    'tx_ring_depth_max_bytes', 0)
+                self._mp_tx_ring_streams = ev.get(
+                    'tx_ring_streams', 0)
             elif kind == 'stats':
                 rx_bytes = ev.get('rx_bytes', 0)
                 if rx_bytes:
@@ -418,6 +452,9 @@ class BWActuator:
             tx_mbps=tx_mbps,
             rx_mbps=rx_mbps,
             jitter_ms=jitter_ms,
+            tx_ring_depth_bytes=self._mp_tx_ring_depth,
+            tx_ring_depth_max_bytes=self._mp_tx_ring_depth_max,
+            tx_ring_streams=self._mp_tx_ring_streams,
         )
 
     async def shutdown(self) -> None:
@@ -467,7 +504,8 @@ class SubsActuator:
                  start_subs: int, step_subs: int,
                  object_size: int, per_sub_mbps: float,
                  sub_filter: FilterType = FilterType.LATEST_OBJECT,
-                 interval_s: float = 5.0):
+                 interval_s: float = 5.0,
+                 no_uvloop: bool = False):
         self.relay_url = relay_url
         self.namespace = namespace
         self.trackname = trackname
@@ -483,6 +521,7 @@ class SubsActuator:
         self.per_sub_mbps = per_sub_mbps
         self.sub_filter = sub_filter
         self.interval_s = interval_s
+        self.no_uvloop = no_uvloop
 
         import multiprocessing as mp
         self._mp = mp
@@ -516,6 +555,7 @@ class SubsActuator:
                 insecure=self.insecure,
                 force_quic=self.force_quic,
                 sub_filter=int(self.sub_filter),
+                no_uvloop=self.no_uvloop,
             )
             from aiomoqt.examples._bench_workers import sub_worker_entry
             p = self._mp.Process(
@@ -673,8 +713,33 @@ class SubsActuator:
         )
 
     async def shutdown(self) -> None:
-        for sid in list(self._workers):
-            self._kill_sub(sid)
+        # Parallel shutdown: signal all stops at once, join with one
+        # shared deadline, terminate stragglers, then a final short
+        # join. Serial _kill_sub at 1s/worker would block ~Nsubs s
+        # at large fan-out and starve the asyncio loop.
+        items = list(self._workers.items())
+        self._workers.clear()
+        for _sid, (_p, stop_ev) in items:
+            stop_ev.set()
+        deadline = time.monotonic() + 2.0
+        for _sid, (proc, _ev) in items:
+            remaining = max(0.0, deadline - time.monotonic())
+            proc.join(timeout=remaining)
+        for _sid, (proc, _ev) in items:
+            if proc.is_alive():
+                proc.terminate()
+        for _sid, (proc, _ev) in items:
+            proc.join(timeout=1.0)
+        self._latest_stats.clear()
+        self._last_stats_t.clear()
+        self._last_bytes_t.clear()
+        # Don't let the parent's atexit hook block on the events queue
+        # feeder thread — workers may have left bytes pending.
+        try:
+            self._events_q.cancel_join_thread()
+            self._events_q.close()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -717,7 +782,9 @@ class AIMDController:
         self.shortfall_streak = 0
         self.pressure_streak = 0
         self.hold_intervals = 0
-        self.high_water = actuator.initial_level
+        # Tracks the *delivered* metric (bw: rx_mbps; subs: active count).
+        # Starts at 0 — initial_level is a *target*, not a measurement.
+        self.high_water = 0.0
         self.samples = 0
         self.draining = False
         self.t0 = time.monotonic()
@@ -833,8 +900,19 @@ class AIMDController:
                 self._print_row(sig, "max")
                 state.stop.set()
                 return
-            if level > self.high_water:
-                self.high_water = level
+            # High-water tracks the *delivered* metric (bw: rx_mbps;
+            # subs: active sub count), not the commanded target —
+            # a target the system can't sustain shouldn't pollute the
+            # mark. Only count intervals with healthy headroom and
+            # no shortfall.
+            if a.unit == "Mbps":
+                observed = sig.rx_mbps
+            else:
+                observed = float(sig.active_subs)
+            if (observed > self.high_water
+                    and headroom >= 0.2
+                    and not sig.shortfall):
+                self.high_water = observed
             # Gain curve: full step when headroom > 0.5, linearly taper
             # to zero at headroom = 0.05. Below that → hold.
             if headroom >= 0.5:
@@ -912,7 +990,7 @@ class AIMDController:
                 f"{'BW':<7}  │  "
                 f"{'Tx':<7}  {'Rx':<7}  │  "
                 f"{'mean':<6}  {'p90':<6}  {'jitter':<6}  │  "
-                f"loss   action"
+                f"loss   txQ      action"
             )
         total_w = time_pad + 2 + target_span + 5 + actual_span + 5 + latency_span + 5 + 14
         print("─" * total_w)
@@ -938,12 +1016,16 @@ class AIMDController:
                 flush=True,
             )
         else:
+            ring_kb = sig.tx_ring_depth_bytes / 1024.0
+            ring_col = (f"{ring_kb:>6,.0f}KB"
+                        if sig.tx_ring_streams else "      --")
             print(
                 f"  {int(round(t_rel)):>5d}s     "
                 f"{bw:<7}  │  "
                 f"{tx:<7}  {rx:<7}  │  "
                 f"{mean:<6}  {p90:<6}  {jit:<6}  │  "
-                f"{f'{sig.loss_pct:.1f}%':<5}  {action}",
+                f"{f'{sig.loss_pct:.1f}%':<5}  "
+                f"{ring_col}  {action}",
                 flush=True,
             )
 
@@ -1262,6 +1344,11 @@ def parse_args():
                         "worker (publisher / subscriber) gets a "
                         "process-suffixed file: PATH.pub.<pid>, "
                         "PATH.sub.<pid> — combined when decrypting.")
+    p.add_argument("--no-uvloop", action="store_true",
+                   help="Skip uvloop installation; use stock asyncio. "
+                        "uvloop is on by default when available — "
+                        "typically 2-4× faster on selector-heavy "
+                        "workloads.")
     args = p.parse_args()
     args.sub_filter = filter_choices[args.sub_filter]
     if args.sub_filter in (FilterType.ABSOLUTE_START,
@@ -1323,7 +1410,12 @@ def _print_summary(state: BenchState, controller, samples: int, args):
     unit = controller.actuator.unit
     print()
     print("═" * 68)
-    print(f"  High-water:  {controller.high_water:.1f} {unit}")
+    if unit == "Mbps":
+        from aiomoqt.utils.format import fmt_bps
+        print(f"  High-water:  {fmt_bps(controller.high_water * 1e6)} "
+              f"(rx delivered)")
+    else:
+        print(f"  High-water:  {controller.high_water:.1f} {unit}")
     print(f"  Equilibrium: {controller.eq_level:.1f} {unit}")
     if state.ceiling_reason:
         print(f"  Reason:      {state.ceiling_reason}")
@@ -1363,6 +1455,7 @@ async def main():
             "mean_ms", "p90_ms", "loss_pct",
         ])
 
+    mp_cleanup_queues: list = []
     if args.mode == "subs":
         if not relay_mode:
             print("  error: --mode subs requires -r RELAY_URL "
@@ -1383,6 +1476,7 @@ async def main():
             per_sub_mbps=args.sub_mbps,
             sub_filter=args.sub_filter,
             interval_s=args.scenario.interval_s,
+            no_uvloop=args.no_uvloop,
         )
     else:
         # BW mode. Loopback runs publisher + subscriber as in-process
@@ -1397,6 +1491,7 @@ async def main():
             mp_stop_event = mp.Event()
             mp_rate_q = mp.Queue(maxsize=128)
             mp_events_q = mp.Queue(maxsize=10000)
+            mp_cleanup_queues.extend([mp_rate_q, mp_events_q])
             pub_cfg = dict(
                 relay_url=args.relay_url,
                 namespace=args.namespace,
@@ -1412,6 +1507,7 @@ async def main():
                 pub_ns=args.pub_ns,
                 pub_both=args.pub_both,
                 debug=args.debug,
+                no_uvloop=args.no_uvloop,
                 keylogfile=(f"{args.keylogfile}.pub"
                             if args.keylogfile else None),
             )
@@ -1425,6 +1521,7 @@ async def main():
                 force_quic=False,
                 sub_filter=int(FilterType.LATEST_OBJECT),
                 debug=args.debug,
+                no_uvloop=args.no_uvloop,
                 keylogfile=(f"{args.keylogfile}.sub"
                             if args.keylogfile else None),
             )
@@ -1532,6 +1629,15 @@ async def main():
             await actuator.shutdown()
         except Exception:
             pass
+        # BW-mode mp queues: detach feeder threads so atexit doesn't
+        # block on Queue.put_thread joins after a pub/sub child has
+        # been terminated mid-write.
+        for q in mp_cleanup_queues:
+            try:
+                q.cancel_join_thread()
+                q.close()
+            except Exception:
+                pass
         if server is not None:
             server.close()
         if csv_file:
@@ -1541,6 +1647,15 @@ async def main():
 
 
 if __name__ == "__main__":
+    # Install uvloop in the controller process before asyncio.run.
+    # Worker processes (publisher / subscriber MP) install it in
+    # _bench_workers.{pub,sub}_worker_entry — they're separate
+    # interpreters and can't inherit the policy.
+    if "--no-uvloop" not in sys.argv:
+        if _try_install_uvloop():
+            print("  uvloop: enabled")
+        else:
+            print("  uvloop: not installed (using stock asyncio)")
     try:
         sys.exit(asyncio.run(main()))
     except KeyboardInterrupt:

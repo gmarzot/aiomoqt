@@ -317,11 +317,23 @@ async def _subscriber_task(config: Dict[str, Any], mp_stop_event,
         })
 
 
+def _try_install_uvloop() -> None:
+    """Best-effort uvloop install in this worker process. Workers are
+    separate interpreters so the parent's policy doesn't carry over."""
+    try:
+        import uvloop
+        uvloop.install()
+    except ImportError:
+        pass
+
+
 def sub_worker_entry(config: Dict[str, Any], mp_stop_event, events_queue):
     """Process entrypoint. Spawned via multiprocessing.Process."""
     _setup_quiet_logging(config.get('logdir'),
                          f"sub-{config['sub_id']}",
                          config.get('debug', False))
+    if not config.get('no_uvloop', False):
+        _try_install_uvloop()
     try:
         asyncio.run(_subscriber_task(config, mp_stop_event, events_queue))
     except KeyboardInterrupt:
@@ -437,6 +449,29 @@ async def _publisher_task(config: Dict[str, Any], mp_stop_event,
                         cur_wire = last_wire_bytes
                     iv_wire = max(0, cur_wire - last_wire_bytes)
                     last_wire_bytes = cur_wire
+                    # Per-stream TX ring depth (bytes queued in the
+                    # aiopquic SPSC ring waiting for picoquic to drain).
+                    # Sum and max across all open streams. Bloat shows
+                    # up here when target_tx > picoquic drain rate; if
+                    # this stays small but Python memory still grows,
+                    # the queueing is upstream of the ring.
+                    ring_depth_sum = 0
+                    ring_depth_max = 0
+                    n_streams = 0
+                    try:
+                        if quic is not None:
+                            for sid in list(quic._stream_ctxs):
+                                st = quic.get_stream_buf_stats(sid)
+                                if st is None:
+                                    continue
+                                pushed, popped = st[0], st[1]
+                                depth = max(0, pushed - popped)
+                                ring_depth_sum += depth
+                                if depth > ring_depth_max:
+                                    ring_depth_max = depth
+                                n_streams += 1
+                    except (Exception, SystemError):
+                        pass
                     _post(events_queue, {
                         'kind': 'pub_stats',
                         't': time.monotonic(),
@@ -446,6 +481,9 @@ async def _publisher_task(config: Dict[str, Any], mp_stop_event,
                         'cumulative_bytes': total_bytes,
                         'cumulative_objs': total_objs,
                         'cumulative_wire_bytes': cur_wire,
+                        'tx_ring_depth_bytes': ring_depth_sum,
+                        'tx_ring_depth_max_bytes': ring_depth_max,
+                        'tx_ring_streams': n_streams,
                     })
 
             # Generation is launched by track.publish()'s handler
@@ -488,6 +526,8 @@ def pub_worker_entry(config: Dict[str, Any], mp_stop_event,
     """Process entrypoint. Spawned via multiprocessing.Process."""
     _setup_quiet_logging(config.get('logdir'), 'pub',
                          config.get('debug', False))
+    if not config.get('no_uvloop', False):
+        _try_install_uvloop()
     try:
         asyncio.run(_publisher_task(config, mp_stop_event,
                                      rate_queue, events_queue))

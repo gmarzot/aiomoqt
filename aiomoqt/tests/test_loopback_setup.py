@@ -35,7 +35,7 @@ async def _start_server(port: int, draft_version, use_quic,
     server = MOQTServer(
         host="localhost", port=port,
         certificate=CERT, private_key=KEY,
-        path="moq",
+        path="/",
         use_quic=use_quic,
         draft_version=draft_version,
     )
@@ -61,7 +61,7 @@ async def test_setup_draft14(use_quic):
         port, draft_version=MOQT_VERSION_DRAFT14, use_quic=use_quic)
     try:
         client = MOQTClient(
-            "localhost", port, path="moq",
+            "localhost", port, path="/",
             use_quic=use_quic,
             verify_tls=False, draft_version=MOQT_VERSION_DRAFT14,
         )
@@ -81,7 +81,7 @@ async def test_setup_draft16(use_quic):
         port, draft_version=MOQT_VERSION_DRAFT16, use_quic=use_quic)
     try:
         client = MOQTClient(
-            "localhost", port, path="moq",
+            "localhost", port, path="/",
             use_quic=use_quic,
             verify_tls=False, draft_version=MOQT_VERSION_DRAFT16,
         )
@@ -110,7 +110,7 @@ async def test_setup_auth_token_roundtrip(use_quic):
         on_publish_namespace=_handle_pub_ns)
     try:
         client = MOQTClient(
-            "localhost", port, path="moq",
+            "localhost", port, path="/",
             use_quic=use_quic,
             verify_tls=False, draft_version=MOQT_VERSION_DRAFT16,
         )

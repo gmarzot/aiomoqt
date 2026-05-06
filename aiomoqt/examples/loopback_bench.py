@@ -119,7 +119,7 @@ async def run_server(args):
     server = MOQTServer(
         host="localhost", port=args.port,
         certificate=args.cert, private_key=args.key,
-        path="moq",
+        path="/",
     )
     server.register_handler(
         MOQTMessageType.SUBSCRIBE,
@@ -131,7 +131,7 @@ async def run_subscriber(args, stats):
     """Connect as subscriber and collect stats."""
     client = MOQTClient(
         "localhost", args.port,
-        path="moq",
+        path="/",
         verify_tls=False,
         debug=args.debug,
     )

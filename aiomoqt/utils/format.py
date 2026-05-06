@@ -24,7 +24,7 @@ def fmt_bps(bps: float) -> str:
         return _num2(bps) + "bps"
     if bps < 500_000:
         return _num2(bps / 1_000) + "Kbps"
-    if bps < 500_000_000:
+    if bps < 1_000_000_000:
         return _num2(bps / 1_000_000) + "Mbps"
     return _num2(bps / 1_000_000_000) + "Gbps"
 

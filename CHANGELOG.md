@@ -1,10 +1,36 @@
 # Changelog
 
-## v0.9.0 (2026-05-04)
+## v0.9.0 (2026-05-06)
 
 Transport migration to **aiopquic** (vendored picoquic-backed asyncio
-QUIC) plus perf hardening. Pairs with [aiopquic 0.2.0](https://pypi.org/project/aiopquic/0.2.0/);
-the dependency floor is `aiopquic>=0.2.0`.
+QUIC) plus perf hardening. Pairs with [aiopquic 0.2.2](https://pypi.org/project/aiopquic/0.2.2/);
+the dependency floor is `aiopquic>=0.2.2`.
+
+### Release-blocker resolution
+
+This release was held while a close-time segfault was investigated.
+Root cause: double-close UAF in picoquic's `picoquic_close_ex`
+wake-list path; fixed in aiopquic 0.2.2. aiomoqt 0.9.0 ships against
+the fixed wheel — 0/100 segfaults on full pytest under release-
+equivalent build (`-O3 -g`), down from 15/100 on the released 0.2.0
+wheel before the fix.
+
+### What changed beyond PR #12
+
+- Dependency floor bumped from `aiopquic>=0.2.0` to `aiopquic>=0.2.2`
+  (transitively gets the segfault fix, picoquic submodule bump
+  including #2095 worker perf, WebTransport empty-path normalization,
+  AB8/AB9 stress benches).
+- `path` defaults updated across tests/examples: `"moq"` → `""`/`"/"`
+  per the project convention. aiopquic 0.2.2 normalizes empty WT path
+  to `/` so consumers don't need to think about it.
+- `b7_framer.py` microbench added — TX framer hot-path measurement
+  (proven NOT the bottleneck: 395K obj/s sync at 8KB single-stream).
+- Adaptive bench polish: `--no-uvloop` flag, `fmt_bps` Mbps→Gbps
+  cutover at 1 Gbps (was 500 Mbps), high-water = `rx delivered` (not
+  commanded target), uvloop default, txQ ring-depth column,
+  parallel `SubsActuator` shutdown, `mp.Queue.cancel_join_thread()`
+  to avoid atexit hangs after worker terminate.
 
 ### Highlights
 

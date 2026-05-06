@@ -92,7 +92,7 @@ async def _run(args):
     server = MOQTServer(
         host='127.0.0.1', port=args.port,
         certificate=cert, private_key=key,
-        path="moq",
+        path="/",
         use_quic=True,
         draft_version=MOQT_VERSION_DRAFT16,
     )

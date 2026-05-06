@@ -128,7 +128,7 @@ async def main():
     server = MOQTServer(
         host=args.host, port=args.port,
         certificate=args.cert, private_key=args.key,
-        path="moq",
+        path="/",
         use_quic=args.quic,
         draft_version=draft_version,
     )
