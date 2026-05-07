@@ -60,7 +60,7 @@ def on_object(msg, size, recv_time_ms, group_id=None, subgroup_id=None):
 
 async def main():
     client = MOQTClient(
-        'relay.example.com', 443, endpoint='moq',
+        'relay.example.com', 443, path='moq',
         use_quic=True, draft_version=16, debug=True,
     )
     async with client.connect() as session:
@@ -83,7 +83,7 @@ from aiomoqt.messages import SubgroupHeader
 async def main():
     client = MOQTClient(
         'relay.example.com', 443,
-        endpoint='moq', use_quic=True, draft_version=16,
+        path='moq', use_quic=True, draft_version=16,
     )
     client.register_handler(MOQTMessageType.SUBSCRIBE, on_subscribe)
 
