@@ -1289,6 +1289,10 @@ def parse_args():
     mode.add_argument("-p", "--loopback-port", type=int, default=None,
                       metavar="PORT", dest="loopback_port",
                       help="UDP port for the in-process self-test loopback")
+    p.add_argument("--mp-loopback", action="store_true", dest="mp_loopback",
+                   help="loopback self-test with publisher and subscriber "
+                        "in separate processes (use when measuring tx "
+                        "ceilings — single-process loopback is GIL-bound).")
     p.add_argument("-k", "--insecure", action="store_true",
                    help="skip TLS verification")
     p.add_argument("--cert", default=CERT)
@@ -1390,6 +1394,8 @@ def _print_banner(args):
         relay = parse_relay_url(args.relay_url)
         transport = "QUIC" if relay.use_quic else "H3/WebTransport"
         print(f"  relay:              {args.relay_url} ({transport}/{draft_s})")
+    elif args.mp_loopback:
+        print(f"  relay:              loopback self-test, mp ({draft_s})")
     else:
         print(f"  relay:              loopback self-test ({draft_s})")
     print(f"  trackname:          {args.namespace}/{args.trackname}")
@@ -1479,57 +1485,97 @@ async def main():
             no_uvloop=args.no_uvloop,
         )
     else:
-        # BW mode. Loopback runs publisher + subscriber as in-process
-        # asyncio tasks (loopback test, no relay). Relay mode spawns
-        # them in separate processes so neither blocks the other's loop
-        # — single-process coupling was masking real stack tail latency.
-        if relay_mode:
+        # BW mode. SP loopback runs publisher + subscriber as in-process
+        # asyncio tasks (fast smoke test, GIL-bound). Relay mode and
+        # --mp-loopback spawn them in separate processes so neither
+        # blocks the other's loop — single-process coupling masks
+        # real stack tail latency and caps throughput at one core.
+        mp_loopback = (not relay_mode) and args.mp_loopback
+        if relay_mode or mp_loopback:
             import multiprocessing as mp
             from aiomoqt.examples._bench_workers import (
-                pub_worker_entry, sub_worker_entry,
+                pub_worker_entry, sub_worker_entry, loopback_server_entry,
             )
             mp_stop_event = mp.Event()
             mp_rate_q = mp.Queue(maxsize=128)
             mp_events_q = mp.Queue(maxsize=10000)
             mp_cleanup_queues.extend([mp_rate_q, mp_events_q])
-            pub_cfg = dict(
-                relay_url=args.relay_url,
-                namespace=args.namespace,
-                trackname=args.trackname,
-                draft=args.draft,
-                insecure=args.insecure,
-                force_quic=False,
-                object_size=args.scenario.object_size,
-                group_size=10000,
-                num_subgroups=args.scenario.subgroups,
-                initial_rate_ops=args.scenario.aggregate_ops(
-                    args.scenario.start_mbps),
-                pub_ns=args.pub_ns,
-                pub_both=args.pub_both,
-                debug=args.debug,
-                no_uvloop=args.no_uvloop,
-                keylogfile=(f"{args.keylogfile}.pub"
-                            if args.keylogfile else None),
-            )
-            sub_cfg = dict(
-                sub_id=0,
-                relay_url=args.relay_url,
-                namespace=args.namespace,
-                trackname=args.trackname,
-                draft=args.draft,
-                insecure=args.insecure,
-                force_quic=False,
-                sub_filter=int(FilterType.LATEST_OBJECT),
-                debug=args.debug,
-                no_uvloop=args.no_uvloop,
-                keylogfile=(f"{args.keylogfile}.sub"
-                            if args.keylogfile else None),
-            )
-            pub_proc = mp.Process(
-                target=pub_worker_entry,
-                args=(pub_cfg, mp_stop_event, mp_rate_q, mp_events_q),
-                daemon=True,
-            )
+            if mp_loopback:
+                # Server proc replaces the relay+pub_proc pair: it both
+                # listens for the subscriber and generates data on
+                # subscribe (acts as publisher). Sub proc connects to
+                # localhost over WT.
+                sub_relay_url = (
+                    f"https://localhost:{loopback_port}/")
+                pub_cfg = dict(
+                    host="localhost", port=loopback_port,
+                    cert=args.cert, key=args.key, path="",
+                    namespace=args.namespace,
+                    trackname=args.trackname,
+                    object_size=args.scenario.object_size,
+                    group_size=10000,
+                    num_subgroups=args.scenario.subgroups,
+                    initial_rate_ops=args.scenario.aggregate_ops(
+                        args.scenario.start_mbps),
+                    debug=args.debug,
+                    no_uvloop=args.no_uvloop,
+                )
+                sub_cfg = dict(
+                    sub_id=0,
+                    relay_url=sub_relay_url,
+                    namespace=args.namespace,
+                    trackname=args.trackname,
+                    draft=args.draft,
+                    insecure=True,  # loopback self-signed cert
+                    force_quic=False,
+                    sub_filter=int(FilterType.LATEST_OBJECT),
+                    debug=args.debug,
+                    no_uvloop=args.no_uvloop,
+                )
+                pub_proc = mp.Process(
+                    target=loopback_server_entry,
+                    args=(pub_cfg, mp_stop_event, mp_rate_q, mp_events_q),
+                    daemon=True,
+                )
+            else:
+                pub_cfg = dict(
+                    relay_url=args.relay_url,
+                    namespace=args.namespace,
+                    trackname=args.trackname,
+                    draft=args.draft,
+                    insecure=args.insecure,
+                    force_quic=False,
+                    object_size=args.scenario.object_size,
+                    group_size=10000,
+                    num_subgroups=args.scenario.subgroups,
+                    initial_rate_ops=args.scenario.aggregate_ops(
+                        args.scenario.start_mbps),
+                    pub_ns=args.pub_ns,
+                    pub_both=args.pub_both,
+                    debug=args.debug,
+                    no_uvloop=args.no_uvloop,
+                    keylogfile=(f"{args.keylogfile}.pub"
+                                if args.keylogfile else None),
+                )
+                sub_cfg = dict(
+                    sub_id=0,
+                    relay_url=args.relay_url,
+                    namespace=args.namespace,
+                    trackname=args.trackname,
+                    draft=args.draft,
+                    insecure=args.insecure,
+                    force_quic=False,
+                    sub_filter=int(FilterType.LATEST_OBJECT),
+                    debug=args.debug,
+                    no_uvloop=args.no_uvloop,
+                    keylogfile=(f"{args.keylogfile}.sub"
+                                if args.keylogfile else None),
+                )
+                pub_proc = mp.Process(
+                    target=pub_worker_entry,
+                    args=(pub_cfg, mp_stop_event, mp_rate_q, mp_events_q),
+                    daemon=True,
+                )
             sub_proc = mp.Process(
                 target=sub_worker_entry,
                 args=(sub_cfg, mp_stop_event, mp_events_q),
@@ -1558,7 +1604,7 @@ async def main():
     pub_task = None
     sub_task = None
     try:
-        if relay_mode:
+        if relay_mode or (args.mode == "bw" and args.mp_loopback):
             if args.mode == "bw" and pub_proc is not None and sub_proc is not None:
                 # Multiprocess: pub and sub each in their own process.
                 # Sequence the spawn — publisher must reach 'published'

@@ -94,7 +94,15 @@ def _run(cmd: list[str], log: Path, timeout: int) -> tuple[bool, str]:
 # Unit-tier runners
 # ---------------------------------------------------------------------------
 def _pytest_file(test_file: str, log: Path) -> tuple[str, str]:
-    ok, _ = _run(["pytest", "-q", test_file], log, 180)
+    # Use `python -m pytest` rather than the `pytest` binary so the
+    # current working directory is added to sys.path. Without that, an
+    # installed copy of aiomoqt under site-packages may shadow the
+    # source tree at import time, and tests that compute paths relative
+    # to their own __file__ (e.g. CERT_DIR = ../../certs) will resolve
+    # to the wheel location which has no neighbouring certs/. Result:
+    # tests that should run get silently skipped.
+    ok, _ = _run([sys.executable, "-m", "pytest", "-q", test_file],
+                 log, 180)
     if not ok:
         return "FAIL", "timeout"
     # Search for the pytest summary line anywhere in the captured
@@ -250,7 +258,9 @@ def _loopback_adaptive_bench(log_dir: Path) -> tuple[str, str]:
            "-l", "100"]
     _run(cmd, log, 45)
     text = log.read_text()
-    m = re.search(r"High-water:\s+([\d.]+)\s+(\S+)", text)
+    # fmt_bps emits e.g. "80Mbps" or "1.2Gbps" (no space) — match both
+    # space-and-no-space forms.
+    m = re.search(r"High-water:\s+([\d.]+)\s*([KMGT]?bps)", text)
     if m:
         return "PASS", f"high-water {m.group(1)} {m.group(2)}"
     return "FAIL", "(no summary — check log)"

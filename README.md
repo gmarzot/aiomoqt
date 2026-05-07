@@ -1,51 +1,38 @@
- aiomoqt - Media over QUIC Transport (MoQT)
+# aiomoqt - Media over QUIC Transport (MoQT)
 
-`aiomoqt` is an implementation of the MoQT protocol, based on `asyncio` and `aiopquic`.
+`aiomoqt` is an implementation of [MoQT](https://moq-wg.github.io/moq-transport/draft-ietf-moq-transport.html) for `asyncio`, layered on [aiopquic](https://pypi.org/project/aiopquic/).
 
 ## Overview
 
-This package implements the [MoQT Specification](https://moq-wg.github.io/moq-transport/draft-ietf-moq-transport.html)
-with **dual draft-14 and draft-16 support**. It is designed for general use as
-an MoQT client and server library, supporting both 'publish' and 'subscribe' roles.
-
-The architecture follows the [asyncio.Protocol](https://docs.python.org/3/library/asyncio-protocol.html)
-design pattern, extending the [aiopquic QuicConnectionProtocol](https://pypi.org/project/aiopquic/).
-It supports both H3/WebTransport and raw QUIC transports, with ALPN-based
-draft version negotiation, and has been interop tested against 6 relay
-implementations across draft-14 and draft-16.
-
-The package includes publisher and subscriber example clients, a benchmark
-suite for throughput/latency measurement, a relay version probe tool, and
-an interop test client compatible with the
-[moq-interop-runner](https://github.com/englishm/moq-interop-runner) framework.
+`aiomoqt` implements the MoQT protocol with **dual draft-14 / draft-16 support**, both publish and subscribe roles, H3/WebTransport and raw QUIC transports, and ALPN-based draft negotiation. The architecture extends `aiopquic.asyncio.QuicConnectionProtocol`. The package ships publisher / subscriber example clients, a benchmark suite, a relay version probe, and a [moq-interop-runner](https://github.com/englishm/moq-interop-runner)-compatible test client.
 
 ### Features
 
 - H3/WebTransport and raw QUIC transports
-- **Draft-14/16:** ALPN negotiation (`moq-00` / `moqt-16`)
-- **Draft-16:** delta-encoded param keys, track extensions, unified request response
-- Wire format: SubgroupHeader / ObjectDatagram flag encoding, delta-encoded object IDs
-- Version-independent API: `MOQTRequestError` exception across drafts
+- Draft-14 / draft-16 ALPN negotiation (`moq-00` / `moqt-16`)
+- Draft-16 wire format: delta-encoded param keys, track extensions, unified request/response
+- SubgroupHeader / ObjectDatagram flag encoding, delta-encoded object IDs
+- Version-independent control: `MOQTRequestError` exception across drafts
 - Async context manager for session lifecycle
-- High-level control message API with sync/async response handling
-- High-level publisher API ([`PublishedTrack`](aiomoqt/track.py)): stream setup, subgroup writing, pacing
-- High-level subscriber API ([`SubscribedTrack`](aiomoqt/track.py)): object reassembly, FETCH / JOIN handling
-- Low-level message serialization/deserialization
+- Sync / async response handling on every control message via `wait_response`
+- High-level publisher: [`PublishedTrack`](aiomoqt/track.py) — stream setup, subgroup writing, pacing
+- High-level subscriber: [`SubscribedTrack`](aiomoqt/track.py) — object reassembly, FETCH / JOIN handling
 - Pluggable message handlers via `register_handler()`
 - Data publishing via SubgroupHeader streams or ObjectDatagrams
 - Data reception via `on_object_received` callback
+- Low-level message serialization / deserialization for custom protocol work
 
 ## Installation
 
-Requires Python 3.12+ (tested on 3.12, 3.13, and 3.14).
+Pure Python, requires Python 3.12+ (tested on 3.12, 3.13, 3.14):
 
 ```bash
-pip install aiomoqt
-# or
-uv pip install aiomoqt
+uv pip install aiomoqt    # or: pip install aiomoqt
 ```
 
-**note:** `./bootstrap_python.sh` provided for easy `uv`-based Python venv install
+`aiopquic` (the QUIC transport) installs as a binary wheel automatically. Only Linux (glibc 2.34+, RHEL 9 / Ubuntu 22.04+) and macOS arm64 have prebuilt wheels; other systems pull `aiopquic` via sdist and need a C build toolchain — see [aiopquic install notes](https://github.com/gmarzot/aiopquic#installation).
+
+A `./bootstrap_python.sh` script is provided for a uv-managed `.venv` if you want a clean dev environment.
 
 ## Quick Start
 
@@ -59,10 +46,8 @@ def on_object(msg, size, recv_time_ms, group_id=None, subgroup_id=None):
     print(f"g={group_id} obj={msg.object_id} {size}B payload={msg.payload}")
 
 async def main():
-    client = MOQTClient(
-        'relay.example.com', 443, path='moq',
-        use_quic=True, draft_version=16, debug=True,
-    )
+    client = MOQTClient('relay.example.com', 443, path='moq',
+                         use_quic=True, draft_version=16)
     async with client.connect() as session:
         await session.client_session_init()
         session.on_object_received = on_object
@@ -81,12 +66,9 @@ from aiomoqt.types import MOQTMessageType
 from aiomoqt.messages import SubgroupHeader
 
 async def main():
-    client = MOQTClient(
-        'relay.example.com', 443,
-        path='moq', use_quic=True, draft_version=16,
-    )
+    client = MOQTClient('relay.example.com', 443, path='moq',
+                         use_quic=True, draft_version=16)
     client.register_handler(MOQTMessageType.SUBSCRIBE, on_subscribe)
-
     async with client.connect() as session:
         await session.client_session_init()
         await session.publish_namespace('ns', wait_response=True)
@@ -96,10 +78,7 @@ async def on_subscribe(session, msg):
     """Called when a subscriber requests a track."""
     ok = session.subscribe_ok(request_msg=msg)
     stream_id = session.open_uni_stream()
-    hdr = SubgroupHeader(
-        track_alias=ok.track_alias,
-        group_id=0, subgroup_id=0, publisher_priority=0,
-    )
+    hdr = SubgroupHeader(track_alias=ok.track_alias, group_id=0, subgroup_id=0, publisher_priority=0)
     session.stream_write(stream_id, hdr.serialize().data)
     session.stream_write(stream_id, hdr.next_object(payload=b"hello").data)
     session.transmit()
@@ -107,10 +86,7 @@ async def on_subscribe(session, msg):
 asyncio.run(main())
 ```
 
-The `on_subscribe` handler above — stream setup, header serialization,
-object writing — is wrapped by the higher-level `PublishedTrack` /
-`SubscribedTrack` classes in `aiomoqt.track`. See the `*_bench.py`
-examples for typical usage.
+The `on_subscribe` handler above — stream setup, header serialization, object writing — is wrapped by the higher-level `PublishedTrack` / `SubscribedTrack` classes in `aiomoqt.track`. See `*_bench.py` examples for typical usage.
 
 ### Control Message API
 
@@ -142,7 +118,7 @@ python -m aiomoqt.examples.sub_example --host relay.ex.com --use-quic
 python -m aiomoqt.examples.join_example --host relay.ex.com --use-quic
 ```
 
-Common options: `--namespace`, `--trackname`, `--endpoint`, `--debug`, `--keylogfile`
+Common options: `--namespace`, `--trackname`, `--path`, `--debug`, `--keylogfile`
 
 ### Benchmarks
 
@@ -252,7 +228,7 @@ python -m aiomoqt.examples.server_example \
 | `relay_bench.py` | Combined pub/sub in one process |
 | `multi_sub_bench.py` | 1 publisher, N subscribers in one process |
 | `loopback_bench.py` | Local loopback (no relay) |
-| `adaptive_bench.py` | Ramps rate until buffer growth; loopback or relay |
+| `adaptive_bench.py` | Ramps rate until buffer growth; loopback (`--mp-loopback` for proc-isolated pub/sub) or relay |
 | `server_example.py` | WebTransport server (origin) |
 | `relay_probe.py` | Relay version probe (draft-14/16) |
 | `moq_interop_client.py` | Interop test client (TAP v14 out; 6 standard + `fetch`/`join`) |
@@ -300,19 +276,37 @@ Test cases: `setup-only`, `announce-only`, `publish-namespace-done`,
 plus `fetch` and `join` probes (not in default catalog matrix —
 most relays do not implement these yet).
 
+## Performance
+
+Single-host loopback on AMD Ryzen 7 PRO 7840U (Zen 4), Linux, Python 3.14, against `aiopquic` 0.2.5. Single-publisher single-subscriber MoQT loopback (in-process, raw QUIC):
+
+| obj | obj/s | throughput | notes |
+|---|---|---|---|
+| 8 KiB | 16,084 | 1,055 Mbps | b6 subgroup-churn microbench |
+| 1 KiB | 99,000 | 810 Mbps | adaptive_bench `--mp-loopback`, P=4, tx-side |
+
+`aiopquic` (the underlying transport) sustains 2.4–2.7 Gbps single-stream and peaks at **5.5 Gbps** with P=64 × 16 KiB concurrent streams — see [aiopquic perf table](https://github.com/gmarzot/aiopquic#performance). The aiomoqt-level gap to the transport ceiling is per-object framer + asyncio orchestration cost; closing it is on the 0.9.x roadmap (framer batching).
+
 ## Development
 
 ```bash
 git clone https://github.com/gmarzot/aiomoqt.git
 cd aiomoqt
 python3 -m venv .venv && source .venv/bin/activate
-pip install -e ".[test]"
+uv pip install -e ".[test]"    # or: pip install -e ".[test]"
 pytest aiomoqt/tests/
 ```
 
+## Known Limitations
+
+- **WebTransport fetch / join routing** -- four `[wt]` test variants of FETCH and JOINING_SUBSCRIBE return empty results when the underlying transport is WebTransport. Raw-QUIC variants of the same tests pass and cover the MoQT-level invariant. Tracked separately; affects WT-only consumers of fetch/join.
+- **Subscriber framer desync at high tx rates** -- under sustained tx > ~400 Mbps the subscriber's data-stream parser occasionally rejects a stream with a `framer desync` error. Stream-level reject (not session-fatal); the publisher continues. Pre-existing; surfaced more visibly by `--mp-loopback` headroom. Tracked for 0.9.x.
+
 ## TODO
 
-* Transition from qh3 to aiopquic transport for performance
+* Diagnose and fix the subscriber framer desync at high tx rates
+* Close the aiomoqt-level perf gap to the aiopquic transport ceiling (framer batching)
+* Fix WebTransport fetch / join routing (the 4 `[wt]` tests currently skipped)
 * Track data modules:
   - File transfer (or [MOQT File Format](https://datatracker.ietf.org/doc/html/draft-jennings-moq-file-00)?)
   - Interactive chat

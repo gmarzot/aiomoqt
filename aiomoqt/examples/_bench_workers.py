@@ -533,3 +533,165 @@ def pub_worker_entry(config: Dict[str, Any], mp_stop_event,
                                      rate_queue, events_queue))
     except KeyboardInterrupt:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Loopback server worker — adaptive_bench --mp-loopback. Acts as the
+# publisher endpoint for a co-located subscriber proc; talks the same
+# rate_queue / pub_stats events_queue protocol as pub_worker_entry, so
+# the parent's BWActuator MP path drains both modes the same way.
+# ---------------------------------------------------------------------------
+
+async def _loopback_server_task(config: Dict[str, Any], mp_stop_event,
+                                  rate_queue, events_queue):
+    from aiomoqt.server import MOQTServer
+    from aiomoqt.types import MOQTMessageType
+    from aiomoqt.track import PublishedTrack
+
+    stop_ev = _bridge_stop_event(mp_stop_event)
+    _num_sg = max(1, config.get('num_subgroups', 1))
+    initial_rate = config.get('initial_rate_ops', 0.0) / _num_sg
+    track_holder: Dict[str, Any] = {'track': None}
+
+    async def _on_subscribe(session, msg):
+        track = PublishedTrack(
+            session,
+            namespace=config['namespace'],
+            trackname=config['trackname'],
+            object_size=config['object_size'],
+            group_size=config.get('group_size', 10000),
+            num_subgroups=_num_sg,
+            rate=initial_rate,
+        )
+        track._stats_header_printed = True
+        track._quiet = True
+        ok = session.subscribe_ok(request_msg=msg)
+        track.track_alias = ok.track_alias
+        track._generating = True
+        track_holder['track'] = track
+        try:
+            await track.generate(session, ok.track_alias)
+        finally:
+            track_holder['track'] = None
+
+    async def _rate_listener():
+        while not stop_ev.is_set():
+            try:
+                rmsg = rate_queue.get_nowait()
+                track = track_holder['track']
+                if (track is not None and isinstance(rmsg, dict)
+                        and 'rate_ops' in rmsg):
+                    track.rate = float(rmsg['rate_ops']) / _num_sg
+            except Exception:
+                await asyncio.sleep(0.05)
+                continue
+
+    async def _stats_loop():
+        last_total_bytes = 0
+        last_total_objs = 0
+        last_wire_bytes = 0
+        while not stop_ev.is_set():
+            await asyncio.sleep(STATS_INTERVAL_S)
+            track = track_holder['track']
+            if track is None:
+                continue
+            cur_bytes = getattr(track, '_total_bytes', 0)
+            cur_objs = getattr(track, '_total_sent', 0)
+            iv_bytes = cur_bytes - last_total_bytes
+            iv_objs = cur_objs - last_total_objs
+            last_total_bytes = cur_bytes
+            last_total_objs = cur_objs
+            cur_wire = 0
+            quic = getattr(track.session, '_quic', None)
+            try:
+                if quic is not None:
+                    cur_wire = quic.bytes_sent
+            except (Exception, SystemError):
+                cur_wire = last_wire_bytes
+            iv_wire = max(0, cur_wire - last_wire_bytes)
+            last_wire_bytes = cur_wire
+            ring_depth_sum = 0
+            ring_depth_max = 0
+            n_streams = 0
+            try:
+                if quic is not None:
+                    for sid in list(quic._stream_ctxs):
+                        st = quic.get_stream_buf_stats(sid)
+                        if st is None:
+                            continue
+                        pushed, popped = st[0], st[1]
+                        depth = max(0, pushed - popped)
+                        ring_depth_sum += depth
+                        if depth > ring_depth_max:
+                            ring_depth_max = depth
+                        n_streams += 1
+            except (Exception, SystemError):
+                pass
+            _post(events_queue, {
+                'kind': 'pub_stats',
+                't': time.monotonic(),
+                'tx_bytes': iv_bytes,
+                'tx_objs': iv_objs,
+                'wire_bytes': iv_wire,
+                'cumulative_bytes': cur_bytes,
+                'cumulative_objs': cur_objs,
+                'cumulative_wire_bytes': cur_wire,
+                'tx_ring_depth_bytes': ring_depth_sum,
+                'tx_ring_depth_max_bytes': ring_depth_max,
+                'tx_ring_streams': n_streams,
+            })
+
+    server = MOQTServer(
+        host=config.get('host', 'localhost'),
+        port=config['port'],
+        certificate=config['cert'],
+        private_key=config['key'],
+        path=config.get('path', ''),
+    )
+    server.register_handler(MOQTMessageType.SUBSCRIBE, _on_subscribe)
+    await server.serve()
+    _post(events_queue, {
+        'kind': 'pub_health', 'state': 'published',
+        't': time.monotonic(),
+    })
+
+    rate_task = asyncio.create_task(_rate_listener())
+    stats_task = asyncio.create_task(_stats_loop())
+    stop_task = asyncio.create_task(stop_ev.wait())
+    try:
+        await asyncio.wait(
+            {rate_task, stats_task, stop_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    finally:
+        for t in (rate_task, stats_task, stop_task):
+            t.cancel()
+        for t in (rate_task, stats_task, stop_task):
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+        try:
+            server.close()
+        except Exception:
+            pass
+
+    _post(events_queue, {
+        'kind': 'pub_health', 'state': 'closed',
+        't': time.monotonic(),
+    })
+
+
+def loopback_server_entry(config: Dict[str, Any], mp_stop_event,
+                           rate_queue, events_queue):
+    """Process entrypoint. Spawned via multiprocessing.Process for
+    --mp-loopback mode (adaptive_bench)."""
+    _setup_quiet_logging(config.get('logdir'), 'loopback-server',
+                         config.get('debug', False))
+    if not config.get('no_uvloop', False):
+        _try_install_uvloop()
+    try:
+        asyncio.run(_loopback_server_task(config, mp_stop_event,
+                                            rate_queue, events_queue))
+    except KeyboardInterrupt:
+        pass
