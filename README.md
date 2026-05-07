@@ -278,14 +278,23 @@ most relays do not implement these yet).
 
 ## Performance
 
-Single-host loopback on AMD Ryzen 7 PRO 7840U (Zen 4), Linux, Python 3.14, against `aiopquic` 0.2.5. Single-publisher single-subscriber MoQT loopback (in-process, raw QUIC):
+`aiomoqt` sits on top of [`aiopquic`](https://github.com/gmarzot/aiopquic), which sits on picoquic + the kernel UDP path. Throughput at the aiomoqt layer is bounded by the layer below.
+
+On AMD Ryzen 7 PRO 7840U / WSL2 / Linux 6.6, single-publisher single-subscriber MoQT loopback (raw QUIC, 30s steady-state, in-process publisher and subscriber):
 
 | obj | obj/s | throughput | notes |
 |---|---|---|---|
 | 8 KiB | 16,084 | 1,055 Mbps | b6 subgroup-churn microbench |
-| 1 KiB | 99,000 | 810 Mbps | adaptive_bench `--mp-loopback`, P=4, tx-side |
 
-`aiopquic` (the underlying transport) sustains 2.4–2.7 Gbps single-stream and peaks at **5.5 Gbps** with P=64 × 16 KiB concurrent streams — see [aiopquic perf table](https://github.com/gmarzot/aiopquic#performance). The aiomoqt-level gap to the transport ceiling is per-object framer + asyncio orchestration cost; closing it is on the 0.9.x roadmap (framer batching).
+`aiopquic` highlevel throughput on the same hardware sits at ~2.0 Gbps for ≥4 KiB objects (UDP-loopback-bound at QUIC MTU). The aiomoqt layer adds per-object MoQT framer + asyncio orchestration cost; the gap between aiomoqt and aiopquic is the headroom we work on in 0.9.x. See the [aiopquic Performance section](https://github.com/gmarzot/aiopquic#performance) for the layer breakdown including the `sim_link` protocol-only reference.
+
+Numbers vary by platform — kernel UDP loopback rates differ noticeably (Apple M-series macOS sits around 1 Gbps regardless of obj size due to a slower UDP loopback path). Calibrate on your own hardware:
+
+```bash
+python -m aiomoqt.examples.adaptive_bench -P 4 \
+    --start-mbps 50 --max-mbps 2000 --step-mbps 100 \
+    --interval 5 -s 4096 -t 60 --mp-loopback
+```
 
 ## Development
 
