@@ -1064,7 +1064,7 @@ async def run_loopback_server(args, state: BenchState):
             namespace=args.namespace,
             trackname=args.trackname,
             object_size=args.scenario.object_size,
-            group_size=10000,
+            group_size=args.group_size,
             num_subgroups=args.scenario.subgroups,
             rate=per_subgroup,
         )
@@ -1195,7 +1195,7 @@ async def run_publisher_client(host: str, port: int, path: str,
                 namespace=args.namespace,
                 trackname=args.trackname,
                 object_size=args.scenario.object_size,
-                group_size=10000,
+                group_size=args.group_size,
                 num_subgroups=args.scenario.subgroups,
                 rate=per_subgroup,
                 draft=args.draft,
@@ -1261,6 +1261,9 @@ def parse_args():
                    metavar="B", help="bytes per MoQT object (default: 4096)")
     p.add_argument("-P", "--streams", type=int, default=1,
                    help="parallel subgroup streams (default: 1)")
+    p.add_argument("-g", "--group-size", type=int, default=10000,
+                   dest="group_size",
+                   help="objects per group (default: 10000)")
     p.add_argument("--start-mbps", type=float, default=10.0,
                    help="initial aggregate bitrate (default: 10)")
     p.add_argument("--step-mbps", type=float, default=10.0,
@@ -1513,7 +1516,7 @@ async def main():
                     namespace=args.namespace,
                     trackname=args.trackname,
                     object_size=args.scenario.object_size,
-                    group_size=10000,
+                    group_size=args.group_size,
                     num_subgroups=args.scenario.subgroups,
                     initial_rate_ops=args.scenario.aggregate_ops(
                         args.scenario.start_mbps),
@@ -1546,7 +1549,7 @@ async def main():
                     insecure=args.insecure,
                     force_quic=False,
                     object_size=args.scenario.object_size,
-                    group_size=10000,
+                    group_size=args.group_size,
                     num_subgroups=args.scenario.subgroups,
                     initial_rate_ops=args.scenario.aggregate_ops(
                         args.scenario.start_mbps),

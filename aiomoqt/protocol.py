@@ -774,10 +774,27 @@ class _MOQTSessionMixin:
                     logger.warning(f"MOQT stream({stream_id}): unexpected data stream type: {data_type}")
 
                 if msg_header is None:
-                    error = f"data stream {stream_id}: {data_type} parse failed at: {buf.tell()}"
-                    logger.error(f"MOQT error: " + error)
-                    self._close_session(SessionCloseCode.PROTOCOL_VIOLATION, error)
-                    return None
+                    # Stream-level parse failure on the data stream type
+                    # byte. Caused by data-corruption races at high
+                    # stream-churn rates (see issue: known framer desync
+                    # under load). Reject this stream and let the session
+                    # keep running rather than tearing the whole session
+                    # down for one corrupt stream — the publisher will
+                    # see STOP_SENDING and abandon, the rest of the
+                    # session continues. Forensic anchor logged below.
+                    try:
+                        anchor = buf.data_slice(0, min(64, buf.capacity)).hex()
+                    except Exception:
+                        anchor = "<unavailable>"
+                    logger.warning(
+                        f"MOQT stream({stream_id}): {data_type} parse "
+                        f"failed at {buf.tell()} of {buf.capacity}; "
+                        f"rejecting (head_hex={anchor})"
+                    )
+                    raise MOQTStreamReject(
+                        SessionCloseCode.PROTOCOL_VIOLATION,
+                        f"stream-type parse failed: {data_type}",
+                    )
 
                 # record that the data stream header has been processed
                 consumed = buf.tell() - pos
