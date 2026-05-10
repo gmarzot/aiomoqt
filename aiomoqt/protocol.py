@@ -1,4 +1,5 @@
 import asyncio
+import os
 import time
 from asyncio import Future
 from collections import defaultdict
@@ -21,6 +22,11 @@ from .types import *
 from .utils.buffer import Buffer, BufferReadError
 from .utils.logger import *
 from aiopquic.streamchain import StreamChain
+
+# Resolved once at import time; the trace check is then a single
+# Python bool test on the hot send/recv paths (effectively free
+# when disabled). Set AIOMOQT_DESYNC_TRACE=1 in the env to enable.
+_AIOMOQT_DESYNC_TRACE = bool(os.environ.get("AIOMOQT_DESYNC_TRACE"))
 
 USER_AGENT = f"aiomoqt/{version('aiomoqt')}"
 
@@ -123,6 +129,24 @@ class _MOQTSessionMixin:
         # task, parser, binding-key, and forensic counter into one
         # slotted object. See class docstring above.
         self._data_streams: Dict[int, _DataStreamState] = {}
+        # Tombstone map: stream_ids whose state was popped in response
+        # to RESET / STOP_SENDING / UNSUBSCRIBE / SubscribeDone teardown.
+        # _on_stream_data drops chunks for these — the publisher's
+        # in-flight bytes can arrive AFTER the local state pop (a few
+        # hundred ms of in-flight + buffered data at multi-Gbps).
+        # Recreating fresh state would race with the already-parsed
+        # prefix and parse-fail at byte 0 with the WRONG-looking
+        # SubgroupHeader signature.
+        #
+        # Time-based eviction (30s window) bounds memory in long-running
+        # sessions and is far longer than any reasonable in-flight
+        # window. At 100K streams/s churn the dict holds ~3M entries =
+        # ~84 MB peak — acceptable for a bench, and a real workload
+        # at sustained 100K stream/s would have other priorities. For
+        # production tracks the entries get evicted eventually.
+        self._stream_torn_down: Dict[int, float] = {}
+        self._stream_torn_down_evict_after: float = 30.0
+        self._stream_torn_down_last_sweep: float = 0.0
         self._tasks: Set[asyncio.Task] = set()
         self._close_err = None  # tuple holding latest (error_code, Reason_phrase)
 
@@ -406,6 +430,11 @@ class _MOQTSessionMixin:
         avoid f-string formatting, log only real anomalies, single
         dict-pop per stream end."""
         state = self._data_streams.pop(stream_id, None)
+        # Tombstone: even if the task ended naturally (FIN sentinel +
+        # successful parse), late chunks could still arrive (asyncio
+        # reordering, kernel buffer flush). Drop them rather than
+        # recreate fresh state.
+        self._mark_stream_torn_down(stream_id)
 
         error_code = QuicErrorCode.NO_ERROR
         if task.cancelled():
@@ -432,6 +461,24 @@ class _MOQTSessionMixin:
         # Drop reverse-map entry for the stream's binding key.
         self._unbind_key(key)
 
+    def _mark_stream_torn_down(self, stream_id: int) -> None:
+        """Mark a stream torn down so subsequent in-flight chunks are
+        dropped rather than recreating fresh state (which would parse-
+        fail at byte 0). Time-based eviction (sweep at most once per
+        second; entries older than _stream_torn_down_evict_after are
+        dropped)."""
+        now = time.monotonic()
+        self._stream_torn_down[stream_id] = now
+        # Sweep at most once per second to bound CPU under high churn.
+        if now - self._stream_torn_down_last_sweep > 1.0:
+            self._stream_torn_down_last_sweep = now
+            cutoff = now - self._stream_torn_down_evict_after
+            # Build the evict list inline to avoid mutating during iter.
+            stale = [sid for sid, t in self._stream_torn_down.items()
+                       if t < cutoff]
+            for sid in stale:
+                self._stream_torn_down.pop(sid, None)
+
     def _on_stream_data(self, stream_id: int, data: bytes,
                         end_stream: bool) -> None:
         """Enqueue a data-stream chunk and spawn its processing task on
@@ -439,6 +486,24 @@ class _MOQTSessionMixin:
         framing (WT prefix, etc.) has already been stripped by the caller.
         `end_stream` pushes the FIN sentinel for the processing task.
         """
+        # Drop chunks for streams torn down by RESET / STOP_SENDING /
+        # UNSUBSCRIBE / SubscribeDone teardown. Recreating fresh state
+        # for an already-cancelled stream would parse-fail because the
+        # in-flight bytes are mid-stream (post-SubgroupHeader).
+        if stream_id in self._stream_torn_down:
+            return
+        if _AIOMOQT_DESYNC_TRACE:
+            seen = getattr(self, "_desync_rx_seen", None)
+            if seen is None:
+                seen = set()
+                self._desync_rx_seen = seen
+            if stream_id not in seen:
+                seen.add(stream_id)
+                head = bytes(data[:16]).hex() if data else ""
+                logger.warning(
+                    f"[DESYNC-TRACE RX] stream({stream_id}) first chunk "
+                    f"len={len(data) if data else 0} fin={end_stream} "
+                    f"head_hex={head}")
         state = self._data_streams.get(stream_id)
         if state is None:
             state = _DataStreamState(queue=asyncio.Queue())
@@ -1014,6 +1079,7 @@ class _MOQTSessionMixin:
             # RFC 9000: STOP_SENDING from peer → reciprocal RESET_STREAM.
             self.stream_reset(event.stream_id, event.error_code)
             state = self._data_streams.pop(event.stream_id, None)
+            self._mark_stream_torn_down(event.stream_id)
             if state is not None:
                 self._unbind_key(state.key)
                 if state.task is not None:
@@ -1022,6 +1088,7 @@ class _MOQTSessionMixin:
         elif isinstance(event, StreamReset):
             logger.debug(f"MOQT event: StreamReset: stream {event.stream_id}")
             state = self._data_streams.pop(event.stream_id, None)
+            self._mark_stream_torn_down(event.stream_id)
             if state is not None:
                 self._unbind_key(state.key)
                 if state.task is not None:
@@ -1041,7 +1108,11 @@ class _MOQTSessionMixin:
         self._close_err = (error_code, reason_phrase)
 
         # Signal all stream tasks to shut down gracefully via FIN sentinel.
-        for state in self._data_streams.values():
+        # Tombstone each stream_id BEFORE the FIN goes in so any chunk
+        # arriving between FIN-processing and task_done's pop is dropped
+        # rather than recreating fresh state.
+        for stream_id, state in self._data_streams.items():
+            self._mark_stream_torn_down(stream_id)
             try:
                 state.queue.put_nowait(None)
             except Exception:
@@ -1086,6 +1157,8 @@ class _MOQTSessionMixin:
                 if locally_initiated:
                     self._quic.send_stream_data(
                         stream_id, b"", end_stream=True)
+            for sid in list(self._data_streams.keys()):
+                self._mark_stream_torn_down(sid)
             self._data_streams.clear()
         except Exception:
             pass  # best-effort during teardown
@@ -1216,6 +1289,18 @@ class _MOQTSessionMixin:
         only need to backpressure on the SPSC TX ring (BufferError)
         when Python pushes faster than picoquic drains.
         """
+        if _AIOMOQT_DESYNC_TRACE:
+            seen = getattr(self, "_desync_tx_seen", None)
+            if seen is None:
+                seen = set()
+                self._desync_tx_seen = seen
+            if stream_id not in seen:
+                seen.add(stream_id)
+                head = bytes(data[:16]).hex() if data else ""
+                logger.warning(
+                    f"[DESYNC-TRACE TX] stream({stream_id}) first write "
+                    f"len={len(data) if data else 0} fin={end_stream} "
+                    f"head_hex={head}")
         while True:
             if not self._session_writable():
                 return
@@ -1982,6 +2067,7 @@ class _MOQTSessionMixin:
                 if key[0] == track_alias:
                     self.stream_reset(sid, SessionCloseCode.NO_ERROR)
                     state = self._data_streams.pop(sid, None)
+                    self._mark_stream_torn_down(sid)
                     if state is not None:
                         self._unbind_key(state.key)
                         if state.task is not None:
@@ -2005,6 +2091,12 @@ class _MOQTSessionMixin:
             for key, sid in list(self._subgroup_stream_by_key.items()):
                 if key[0] == track_alias:
                     self.stream_stop_sending(sid, SessionCloseCode.NO_ERROR)
+                    # Tombstone here too: the publisher's RESET that
+                    # results from our STOP_SENDING will arrive after
+                    # any in-flight bytes are already at our doorstep.
+                    # Without this mark, those bytes recreate state
+                    # with parser=None and parse-fail.
+                    self._mark_stream_torn_down(sid)
         future = self._pending_requests.get(msg.request_id)
         if future and not future.done():
             future.set_result(msg)
