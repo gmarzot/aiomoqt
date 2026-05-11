@@ -1,5 +1,89 @@
 # Changelog
 
+## v0.9.2 (2026-05-11)
+
+Pairs with [aiopquic 0.3.0](https://pypi.org/project/aiopquic/0.3.0/);
+dependency floor bumped from `aiopquic>=0.2.5` to `aiopquic>=0.3.0`.
+
+The bulk of the v0.9.2 win lives in aiopquic 0.3.0 — receiver-side
+durability + WT backpressure that converts data corruption under
+slow-consumer conditions into honest latency growth. See the
+aiopquic 0.3.0 CHANGELOG for the full architecture writeup.
+
+aiomoqt-side changes in this release:
+
+### Teardown-race fix (`_data_streams` tombstone set)
+
+aiomoqt mp-loopback at end-of-bench produced 1-2 spurious
+`stream-type parse failed: 0x1` rejections per run with the classic
+missing-5-byte-SubgroupHeader signature. Diagnosed as a teardown
+race: `_handle_subscribe_done` sent STOP_SENDING on streams still
+actively receiving → publisher's reciprocal RESET_STREAM pop'd the
+subscriber's `_data_streams[sid]` state → chunks already in flight
+on the wire arrived after the pop → `_on_stream_data` created
+fresh state with `parser=None` → parser read the next chunk's first
+byte (an ObjectHeader's `0x01`, not a SubgroupHeader type byte)
+and failed.
+
+Fix: tombstone dict `_stream_torn_down` populated at every
+state-pop site triggered by RESET / STOP_SENDING / UNSUBSCRIBE /
+SubscribeDone / session close / natural task-done.
+`_on_stream_data` checks this set first and silently drops chunks
+for torn-down streams rather than recreating fresh state. Time-
+based eviction (30 s window, swept at most once per second) bounds
+memory in long-running sessions.
+
+### `AIOMOQT_DESYNC_TRACE=1` debug aid
+
+Env-gated TX / RX first-byte trace at `stream_write_drain` and
+`_on_stream_data`. Resolved once at import time so the hot path is
+a single Python bool test (effectively free when disabled). When
+enabled, logs the first send / first chunk per stream-id with
+head_hex so future similar desync investigations have an
+out-of-the-box first-anchor.
+
+### Honest sustained verification
+
+60-second mp-loopback sustained runs against aiopquic 0.3.0 on
+Ryzen WSL2 (`-P 2 -s 1024 -g 120 --mp-loopback`):
+
+| Target | Delivered | avg latency | Loss |
+|---|---|---|---|
+|   83 Mbps |   83 Mbps |   5 ms | 0 / 0.6M objects |
+|  249 Mbps |  249 Mbps |  32 ms | 0 / 1.8M objects |
+|  490 Mbps |  493 Mbps | 567 ms | 0 / 3.6M objects |
+|  980 Mbps |  534 Mbps (capped) | 3938 ms | 0 / 3.9M objects |
+
+The 534 Mbps cap is aiomoqt's subscriber-side parse/dispatch CPU
+saturation. At sub-saturation rates Phase B holds tight latency
+floor; at-saturation Phase B trades latency for integrity (the
+TCP trade-off). 0 lost objects across all rates — there are no
+parse rejects at any sustained rate in this matrix.
+
+Comparison to the pre-fix world (0.9.1 + aiopquic 0.2.7) at the
+same harness and 15 s windows: 250M = 1-2 parse rejects per run,
+500M = 2, 1000M = 4063, 1500M = 7130, 2000M = many.
+
+### Smaller items
+
+- `-g` / `--group-size` flag on `adaptive_bench` for tuning the
+  publisher's group cadence.
+- `MOQTStreamReject` raised on stream-type parse failures (the
+  reject-not-abort path) lets a corrupt stream tear itself down
+  without taking the whole session with it. Diagnostic-only in
+  v0.9.2 (the underlying race is fixed); kept as defense-in-depth
+  for whatever the next desync class turns out to be.
+- README: dropped earlier suspect "5× drop" framing on
+  loopback-vs-wire performance; linked the aiopquic perf breakdown
+  for the honest numbers.
+
+## v0.9.1 (2026-05-09)
+
+`--mp-loopback` flag on `adaptive_bench` for multi-process
+loopback testing (publisher + subscriber in separate processes,
+real UDP loopback through kernel sockets). aiopquic floor bumped
+to `>=0.2.5`. README cleanup.
+
 ## v0.9.0 (2026-05-06)
 
 Transport migration to **aiopquic** (vendored picoquic-backed asyncio
