@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import time
 from asyncio import Future
@@ -561,10 +562,6 @@ class _MOQTSessionMixin:
                 return
 
             chain.extend(msg_buf)
-            logger.debug(
-                f"MOQT stream({stream_id}): chunk received: "
-                f"chunk_len={len(msg_buf)} chain_total={chain.capacity}"
-            )
 
             # Drain as many complete messages as the chain currently holds.
             while chain.capacity > 0:
@@ -870,11 +867,19 @@ class _MOQTSessionMixin:
                 parser = stream_state.parser
                 if isinstance(parser, SubgroupHeader):
                     sg_header: SubgroupHeader = parser
-                    msg_header = ObjectHeader.deserialize(
+                    # Reuse a per-stream cached ObjectHeader — saves the
+                    # dataclass allocation on every object. Subscriber
+                    # callback contract is "msg valid until next call".
+                    obj = sg_header._obj_cache
+                    if obj is None:
+                        obj = ObjectHeader.__new__(ObjectHeader)
+                        sg_header._obj_cache = obj
+                    obj.deserialize_into(
                         buf, len,
                         extensions_present=sg_header.extensions_present,
                         prev_object_id=sg_header._last_object_id
                     )
+                    msg_header = obj
                     # Update delta tracking state
                     sg_header._last_object_id = msg_header.object_id
                     # Resolve subgroup_id for FIRST_OBJ mode and complete
@@ -896,8 +901,6 @@ class _MOQTSessionMixin:
                     logger.error(f"MOQT error: " + error)
                     self._close_session(SessionCloseCode.PROTOCOL_VIOLATION, error)
                     return None
-                consumed = buf.tell() - pos
-                logger.debug(f"MOQT stream({stream_id}): {class_name(msg_header)} consumed: {consumed} bytes")
 
 
             return msg_header
@@ -967,15 +970,13 @@ class _MOQTSessionMixin:
     def quic_event_received(self, event: QuicEvent) -> None:
         """Handle incoming QUIC events."""
 
-        event_class = class_name(event)
-
         # CONNECTION_CLOSE events terminate the session.
         # StopSendingReceived and StreamReset also have error_code but
         # are stream-level events handled below — do NOT catch them here.
         if (hasattr(event, 'error_code')
                 and not isinstance(event, (StopSendingReceived, StreamReset))):
             error = getattr(event, 'error_code', QuicErrorCode.INTERNAL_ERROR)
-            reason = getattr(event, 'reason_phrase', event_class)
+            reason = getattr(event, 'reason_phrase', None) or class_name(event)
             if error == 0:
                 logger.info(f"QUIC: connection closed: code: {error}")
             else:
@@ -1095,7 +1096,8 @@ class _MOQTSessionMixin:
                     state.task.cancel()
             return
 
-        logger.debug(f"QUIC event: event not handled({event_class})")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"QUIC event: event not handled({class_name(event)})")
 
     def _close_session(self, 
               error_code: SessionCloseCode = SessionCloseCode.NO_ERROR, 

@@ -93,6 +93,10 @@ class SubgroupHeader(MOQTMessage):
     # subgroup; not on the wire. Declared as a field so slots=True
     # admits the per-instance assignment in __post_init__.
     _last_object_id: Optional[int] = field(default=None, init=False)
+    # Per-stream cached ObjectHeader for in-place deserialize. Reused
+    # across all objects on this subgroup to avoid per-object dataclass
+    # allocation. Lazily created on first object.
+    _obj_cache: Optional['ObjectHeader'] = field(default=None, init=False)
 
     def __post_init__(self):
         self.type = SUBGROUP_HEADER_BASE
@@ -278,6 +282,40 @@ class ObjectHeader(MOQTMessage):
 
         return buf
 
+    def deserialize_into(self, buf: Buffer, buf_len: int,
+                         extensions_present: bool = True,
+                         prev_object_id: Optional[int] = None) -> None:
+        """In-place fill — avoids per-object dataclass allocation.
+
+        Caller pre-allocates one ObjectHeader and mutates it for each
+        object on a subgroup stream. Subscriber callback contract is
+        "msg valid until next call" (consumer must not retain ref).
+        """
+        delta = buf.pull_uint_var()
+        if prev_object_id is None:
+            self.object_id = delta
+        else:
+            self.object_id = prev_object_id + delta + 1
+
+        if extensions_present:
+            self.extensions = MOQTMessage._extensions_decode(buf)
+        else:
+            self.extensions = None
+
+        payload_len = buf.pull_uint_var()
+        remaining = buf_len - buf.tell()
+        if payload_len == 0:
+            self.status = ObjectStatus(buf.pull_uint_var())
+            self.payload = b''
+        elif payload_len > remaining:
+            raise MOQTUnderflow(buf.tell(), buf.tell() + payload_len)
+        else:
+            self.status = ObjectStatus.NORMAL
+            try:
+                self.payload = buf.pull_bytes(payload_len)
+            except BufferReadError:
+                raise MOQTUnderflow(buf.tell(), buf.tell() + payload_len)
+
     @classmethod
     def deserialize(cls, buf: Buffer, buf_len: int,
                     extensions_present: bool = True,
@@ -289,40 +327,9 @@ class ObjectHeader(MOQTMessage):
             extensions_present: Whether subgroup header has extensions flag set.
             prev_object_id: Previous object's ID for delta decoding (None = first object).
         """
-        delta = buf.pull_uint_var()
-
-        # Resolve actual object_id from delta
-        if prev_object_id is None:
-            object_id = delta
-        else:
-            object_id = prev_object_id + delta + 1
-
-        # Extensions conditional on subgroup header flag
-        extensions = None
-        if extensions_present:
-            extensions = MOQTMessage._extensions_decode(buf)
-
-        # Get payload or status
-        payload_len = buf.pull_uint_var()
-        remaining = buf_len - buf.tell()
-        if payload_len == 0:  # Zero length means status code follows
-            status = ObjectStatus(buf.pull_uint_var())
-            payload = b''
-        elif payload_len > remaining:
-            raise MOQTUnderflow(buf.tell(), buf.tell() + payload_len)
-        else:
-            status = ObjectStatus.NORMAL
-            try:
-                payload = buf.pull_bytes(payload_len)
-            except BufferReadError:
-                raise MOQTUnderflow(buf.tell(), buf.tell() + payload_len)
-
-        return cls(
-            object_id=object_id,
-            extensions=extensions,
-            status=status,
-            payload=payload
-        )
+        obj = cls.__new__(cls)
+        obj.deserialize_into(buf, buf_len, extensions_present, prev_object_id)
+        return obj
 
 
 @dataclass(slots=True)
