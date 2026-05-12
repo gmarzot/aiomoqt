@@ -17,10 +17,10 @@ _STRICT_SERIALIZE = bool(int(os.environ.get('AIOMOQT_STRICT_SERIALIZE', '0')))
 BUF_SIZE = 4 * 1024  # 4KB buffer size for messages
 
 
-class MOQTUnderflow(Exception):
-    def __init__(self, pos: int, needed: int):
-        self.pos = pos
-        self.needed = needed
+# Aliased from aiopquic so transport-layer pull_*/parse_* raises are
+# catchable as MOQTUnderflow in aiomoqt without introducing an upward
+# dependency (aiopquic must not import aiomoqt).
+from aiopquic.exceptions import StreamUnderflow as MOQTUnderflow  # noqa: E402
 
 
 @dataclass(slots=True)
@@ -93,8 +93,7 @@ class MOQTMessage:
 
     @staticmethod
     def _extensions_decode(buf: Buffer, with_length: bool = True,
-                           buf_end: int = None) -> Dict[int, Union[int, bytes]]:
-        exts = {}
+                           buf_end: int = None) -> Optional[Dict[int, Union[int, bytes]]]:
         if with_length:
             pos_before = buf.tell()
             exts_len = buf.pull_uint_var()
@@ -125,12 +124,13 @@ class MOQTMessage:
                     f"at pos={pos_before}"
                 )
             if exts_len == 0:
-                return exts
+                return None
             exts_end = buf.tell() + exts_len
         else:
             # No length prefix — read until buf_end or buffer exhaustion
             exts_end = buf_end if buf_end is not None else buf.capacity
 
+        exts = {}
         while buf.tell() < exts_end:
             try:
                 ext_id = buf.pull_uint_var()
@@ -143,7 +143,7 @@ class MOQTMessage:
             except BufferReadError:
                 break  # no more extensions to read
 
-        return exts
+        return exts if exts else None
           
     @staticmethod
     def _bytes_encode(value: Any) -> bytes:

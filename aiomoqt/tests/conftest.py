@@ -71,7 +71,13 @@ def moqt_message_serialization(cls, params, type_id=None, needs_len=False):
         original_value = getattr(obj, field.name)
         new_value = getattr(new_obj, field.name)
         print(f"moqt_message_serialization: original: {original_value}  new: {new_value}")
-        if isinstance(original_value, dict):
+        if isinstance(original_value, dict) or isinstance(new_value, dict):
+            # Empty extensions block on the wire decodes to None — treat
+            # {} and None as equivalent ("no extensions").
+            if not original_value and not new_value:
+                continue
+            assert original_value is not None and new_value is not None, \
+                f"`{field.name}`: {original_value!r} vs {new_value!r}"
             assert original_value.keys() == new_value.keys(), f"`{field.name}` keys don't match"
             for key in original_value:
                 assert original_value[key] == new_value[key], f"`{field.name}` values don't match for key {key}"
