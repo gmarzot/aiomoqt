@@ -334,8 +334,23 @@ def sub_worker_entry(config: Dict[str, Any], mp_stop_event, events_queue):
                          config.get('debug', False))
     if not config.get('no_uvloop', False):
         _try_install_uvloop()
+    # AIOMOQT_PROFILE_SUB=<path> wraps this worker's main loop in
+    # cProfile. Writes <path>.<sub_id> .prof on exit so multi-sub runs
+    # don't clobber each other. Effectively free when the env is unset.
+    import os as _os
+    _profile_path = _os.environ.get('AIOMOQT_PROFILE_SUB')
     try:
-        asyncio.run(_subscriber_task(config, mp_stop_event, events_queue))
+        if _profile_path:
+            import cProfile
+            prof = cProfile.Profile()
+            prof.enable()
+            try:
+                asyncio.run(_subscriber_task(config, mp_stop_event, events_queue))
+            finally:
+                prof.disable()
+                prof.dump_stats(f"{_profile_path}.{config['sub_id']}.prof")
+        else:
+            asyncio.run(_subscriber_task(config, mp_stop_event, events_queue))
     except KeyboardInterrupt:
         pass
 
