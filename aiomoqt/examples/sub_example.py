@@ -62,7 +62,7 @@ class SimpleStats:
               f"{'Objects':<22}{'Bitrate':<14}{'Latency'}")
         print("  " + "─" * 72)
 
-    def on_object(self, msg, size_bytes, recv_time_ms,
+    def on_object(self, msg, size_bytes, recv_time_us,
                   group_id=None, subgroup_id=None):
         now = time.monotonic()
         if self.start == 0:
@@ -77,14 +77,17 @@ class SimpleStats:
         self.total_objects += 1
         self.total_bytes += size_bytes
 
-        # Latency from timestamp extension
-        send_ms = (msg.extensions.get(self.TIMESTAMP_EXT)
+        # Latency from MOQT_TIMESTAMP_EXT. Both ends store microseconds
+        # since epoch (int(time.time() * 1_000_000)). Convert the diff
+        # to ms for the display. Filter out absurd values (>10 min of
+        # one-way latency = clock skew or stale objects).
+        send_us = (msg.extensions.get(self.TIMESTAMP_EXT)
                    if msg.extensions else None)
-        if send_ms is not None:
-            latency = recv_time_ms - send_ms
-            if abs(latency) < 60000:
-                self.iv_latencies.append(latency)
-                self.all_latencies.append(latency)
+        if send_us is not None:
+            latency_ms = (recv_time_us - send_us) / 1000.0
+            if -1000.0 <= latency_ms <= 600_000.0:
+                self.iv_latencies.append(latency_ms)
+                self.all_latencies.append(latency_ms)
 
         if now - self.last_report >= self.interval:
             self._print_header()

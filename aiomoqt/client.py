@@ -25,6 +25,7 @@ class MOQTClient(MOQTPeer):
         configuration: Optional[QuicConfiguration] = None,
         debug: Optional[bool] = False,
         keylog_filename: Optional[str] = None,
+        quic_debug_log: Optional[str] = None,
         draft_version: Optional[int] = None,
         libquicr_compat: Optional[bool] = False,
     ):
@@ -36,6 +37,13 @@ class MOQTClient(MOQTPeer):
         self.use_quic = use_quic
         self.verify_tls = verify_tls
         self.debug = debug
+        # Path to picoquic text log file. When set, aiopquic enables
+        # picoquic_set_log_level(1) + picoquic_set_textlog on the
+        # transport so QUIC-layer events (packets, ACKs, RTT, CC) go
+        # to that file. Spiritual replacement of qh3-era
+        # QuicDebugLogger; only meaningful for the raw QUIC path (and
+        # for the WT path's underlying QUIC transport).
+        self.quic_debug_log = quic_debug_log
         # Public API contract: draft_version is the IETF draft number as
         # an integer (e.g. 14, 16). Internal state stores the full IETF
         # version code (e.g. 0xff000010) — what goes on the wire, what
@@ -82,6 +90,14 @@ class MOQTClient(MOQTPeer):
                     secrets_log_file=self.keylog_filename,
                 )
             protocol = lambda *a, **kw: MOQTSessionQuic(*a, **kw, session=self)
+            # quic_debug_log not wired on raw-QUIC path yet: aiopquic
+            # 0.3.1's `connect()` helper doesn't forward debug_log to
+            # TransportContext.start. Tracked for aiopquic 0.3.2.
+            if self.quic_debug_log is not None:
+                logger.warning(
+                    "MOQT: quic_debug_log requested for raw-QUIC client; "
+                    "not yet plumbed in aiopquic.connect (use WT or wait "
+                    "for aiopquic 0.3.2)")
             return aiopquic_connect(
                 self.host, self.port,
                 configuration=cfg,
@@ -96,6 +112,7 @@ class MOQTClient(MOQTPeer):
         transport.start(
             is_client=True, alpn="h3",
             max_datagram_frame_size=64 * 1024,
+            debug_log=self.quic_debug_log,
         )
         # MoQT version negotiation over WebTransport (per moq-transport-16
         # §3.1): drafts >= 15 carry the version in WT-Available-Protocols
