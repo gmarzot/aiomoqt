@@ -150,7 +150,6 @@ async def main(host: str, port: int, path: str, namespace: str, track_name: str,
         draft_version=draft,
         libquicr_compat=libquicr_compat,
         debug=debug,
-        quic_debug=quic_debug,
         keylog_filename=args.keylogfile,
     )
     logger.info(f"MOQT app: subscribe session connecting: {client}")

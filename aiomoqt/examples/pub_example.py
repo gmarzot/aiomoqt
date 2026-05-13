@@ -274,7 +274,6 @@ async def main(host: str, port: int, path: str, namespace: str, trackname: str,
         verify_tls=not insecure,
         draft_version=draft,
         debug=debug,
-        quic_debug=quic_debug,
         keylog_filename=args.keylogfile,
     )
 
