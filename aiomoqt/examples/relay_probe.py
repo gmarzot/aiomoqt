@@ -47,8 +47,11 @@ PROBE_ONCE = os.getenv("PROBE_ONCE", "").lower() in ("1", "true", "yes")
 # run before d16 (which sends wt-available-protocols) to avoid
 # relay state issues on sequential probes to the same endpoint.
 DRAFT_PROBES = [
-    ("draft-14", MOQT_VERSION_DRAFT14),
-    ("draft-16", MOQT_VERSION_DRAFT16),
+    # Draft numbers (short int) — public MoQTClient API form.
+    # MOQT_VERSION_DRAFT14/16 constants are currently the full hex
+    # wire-form pending refactor (see memory:project_int_form_refactor).
+    ("draft-14", 14),
+    ("draft-16", 16),
 ]
 
 

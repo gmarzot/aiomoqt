@@ -68,7 +68,7 @@ async def _run(args):
         certificate=cert, private_key=key,
         path="/",
         use_quic=True,
-        draft_version=MOQT_VERSION_DRAFT16,
+        draft_version=16,
     )
     server.register_handler(MOQTMessageType.SUBSCRIBE, on_subscribe)
     server_handle = await server.serve()
@@ -93,7 +93,7 @@ async def _run(args):
         '127.0.0.1', args.port, path='moq',
         use_quic=True,
         verify_tls=False, debug=False,
-        draft_version=MOQT_VERSION_DRAFT16,
+        draft_version=16,
     )
 
     t0 = time.perf_counter()
