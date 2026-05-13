@@ -1,5 +1,120 @@
 # Changelog
 
+## v0.9.3 (2026-05-13)
+
+Pairs with [aiopquic 0.3.1](https://pypi.org/project/aiopquic/0.3.1/);
+dependency floor bumped from `aiopquic>=0.3.0` to `aiopquic>=0.3.1`.
+
+Two stacked regressions that broke WT against every moxygen / mvfst
+real relay starting in 0.9.0 (only loopback was being tested before
+this release). Also picks up the receiver-side dispatch perf wins
+from aiopquic 0.3.1 (Cython drain_rx coalescing, WT Queue allocation
+bug, layering cleanup).
+
+Sustained mp-loopback verification on Ryzen WSL2 (paired with
+aiopquic 0.3.1, 30 s windows):
+
+| Target | Delivered | avg lat (0.9.2 / 0.9.3) | Loss |
+|---|---|---|---|
+|  250 Mbps |  250 Mbps |  32 ms / **3.9 ms** | 0 |
+|  500 Mbps |  506 Mbps | 567 ms / **8 ms**   | 0 |
+|  980 Mbps |  987 Mbps | 3938 ms / **65 ms** | 0 |
+| 1500 Mbps | 1.3-1.4 Gbps | — / ~150 ms       | 0 |
+
+Cross-platform sanity on argo (Apple M4, native macOS):
+
+| Target | Tx | Rx | avg lat |
+|---|---|---|---|
+| 250 Mbps  | 253 Mbps  | 261 Mbps  | **0.5-0.9 ms** |
+| 500 Mbps  | 506 Mbps  | 526 Mbps  | **1-2 ms**     |
+
+### Interop fixes (WT against real relays)
+
+Both bugs were invisible in loopback testing because both ends of
+the connection were aiomoqt and committed the same spec violations
+symmetrically. Only real-relay interop exposed them.
+
+**Bug 1 — `utils/url.py:91` stripped leading `/` from path**
+
+`parsed.path.strip("/")` produced `:path: moq-relay` on the wire
+instead of `:path: /moq-relay`. qh3 in 0.8.x silently re-prepended;
+aiopquic does not (only normalizes empty path to "/"). Result:
+HTTP/3 servers correctly rejected the malformed `:path`
+pseudo-header. Fix: rstrip trailing only, then prepend `/` when
+missing.
+
+**Bug 2 — `WT-Available-Protocols` not advertised in d16+ WT**
+
+Per moq-transport-16 §3.1: "MOQT uses ALPN in QUIC and
+'WT-Available-Protocols' in WebTransport to perform version
+negotiation." aiopquic was passing NULL for picowt_connect's
+subprotocol arg (no `WT-Available-Protocols` header sent), so
+moxygen had nothing to bind its negotiated `version_` to and fell
+back to legacy CLIENT_SETUP version-array parsing, which d16
+omits per spec — connection rejected.
+
+Fix: aiopquic 0.3.1 plumbs `wt_available_protocols: list[str]`
+through to `picowt_connect`. aiomoqt's `MOQTClient._connect_wt`
+derives the subprotocol from the configured draft
+(`["moqt-16"]` for d16+; nothing for d14 legacy WT).
+
+**Bug 3 — Draft API conflated short int and full IETF hex**
+
+CLI/example callers were passing the bare draft number (e.g.
+`16`) into `MOQTClient(draft_version=...)`; the internal
+`_moqt_version` stored that bare `16`, then compared it against
+`MOQT_VERSIONS = [0xff00000e, 0xff000010]`. The comparison
+always failed; ServerSetup was rejected "unsupported version
+0x10".
+
+Fix: new `moqt_version_from_draft(draft) -> int` helper in
+`types.py` validates input is a recognized draft number and
+normalizes to the IETF version code at the MOQTClient/MOQTServer
+API boundary. Strict reject of unsupported drafts or hex form
+with a clear error.
+
+(Future refactor planned to keep draft as int throughout aiomoqt
+internals, deferred from 0.9.3 — see memory note.)
+
+### Verification matrix
+
+All 4 corners green against local moqx (mvfst :4433 +
+picoquic :4434) and public moqx-main.ci.openmoq.org:
+
+| | raw QUIC | WebTransport |
+|---|---|---|
+| **d14** | ✅ pub-sub roundtrip, 0% loss | ✅ pub-sub roundtrip, 0% loss |
+| **d16** | ✅ pub-sub roundtrip, 0% loss | ✅ pub-sub roundtrip, 0% loss |
+
+Catalog-wide relay_probe (probed per-relay to avoid handshake
+rate-limit artifacts): moqx-main, moxygen-fb, quicr-west,
+red5-moq, moqtail, imquic, cloudflare-d14, cf-d16-interop all
+respond on at least one supported transport/draft combo.
+
+### Regression lockdown
+
+New `aiomoqt/tests/test_interop_invariants.py` — 16 unit tests
+(no network) locking down the specific wire-format invariants
+where the 0.9.x bugs manifested:
+
+- URL path leading-slash preservation
+- `moqt_version_from_draft` validates input form
+- ALPN derivation by draft number
+- `MOQTClient` rejects unsupported drafts and hex wire form
+- Supported-version set pinned
+
+Test suite: 175 → 191 (16 new lockdowns).
+
+### Compatibility
+
+- `MOQTClient(draft_version=N)` now strictly accepts the draft
+  number (e.g. `14`, `16`). Internal callers that previously
+  passed the full IETF code (e.g. `MOQT_VERSION_DRAFT16 =
+  0xff000010`) need to switch to the draft number. In-tree
+  callers (tests, examples, microbench) already updated.
+- No wire-format change. Existing `MOQT_VERSION_DRAFT14/16`
+  constants still hold the IETF code values for internal use.
+
 ## v0.9.2 (2026-05-11)
 
 Pairs with [aiopquic 0.3.0](https://pypi.org/project/aiopquic/0.3.0/);
