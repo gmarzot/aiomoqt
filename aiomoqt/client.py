@@ -36,6 +36,15 @@ class MOQTClient(MOQTPeer):
         self.use_quic = use_quic
         self.verify_tls = verify_tls
         self.debug = debug
+        # Public API contract: draft_version is the IETF draft number as
+        # an integer (e.g. 14, 16). Internal state stores the full IETF
+        # version code (e.g. 0xff000010) — what goes on the wire, what
+        # ALPN encodes, what CLIENT_SETUP carries. The conversion is
+        # done here at the API boundary so internal code never has to
+        # think about which form it's holding.
+        if draft_version is not None:
+            from .types import moqt_version_from_draft
+            draft_version = moqt_version_from_draft(draft_version)
         self.draft_version = draft_version
         self.keylog_filename = keylog_filename
         self.configuration = configuration
@@ -88,10 +97,21 @@ class MOQTClient(MOQTPeer):
             is_client=True, alpn="h3",
             max_datagram_frame_size=64 * 1024,
         )
+        # MoQT version negotiation over WebTransport (per moq-transport-16
+        # §3.1): drafts >= 15 carry the version in WT-Available-Protocols
+        # ("moqt-NN") rather than CLIENT_SETUP's versions array. d14 and
+        # earlier use the legacy in-band CLIENT_SETUP path and advertise
+        # nothing here.
+        wt_protocols = None
+        if self.draft_version is not None:
+            draft_major = self.draft_version & 0xFF
+            if draft_major >= 15:
+                wt_protocols = [f"moqt-{draft_major:d}"]
         session = MOQTSessionWTClient(
             transport,
             self.host, self.port, self.path or "",
             sni=self.host,
+            wt_available_protocols=wt_protocols,
             session=self,
         )
         try:

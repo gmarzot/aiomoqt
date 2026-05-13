@@ -88,7 +88,11 @@ def parse_relay_url(url: str, force_quic: bool = False,
             path=None,
         )
     elif scheme == "https":
-        path = parsed.path.strip("/") or default_path
+        path = parsed.path.rstrip("/") or default_path
+        # WT CONNECT requires :path to start with /. qh3 auto-prepended;
+        # aiopquic passes through verbatim, so this layer must normalize.
+        if path and not path.startswith("/"):
+            path = "/" + path
         return MOQTRelay(
             host=parsed.hostname or "localhost",
             port=parsed.port or HTTPS_DEFAULT_PORT,

@@ -32,6 +32,35 @@ def moqt_version_from_alpn(alpn: str) -> int:
         return 0xff000000 + draft_num
     raise ValueError(f"Unknown MoQT ALPN: {alpn}")
 
+
+def moqt_version_from_draft(draft: int) -> int:
+    """Map a human draft number (e.g. 16) to its IETF version code
+    (e.g. 0xff000010 = MOQT_VERSION_DRAFT16).
+
+    The public aiomoqt API takes draft numbers (14, 16, 18...). This
+    helper performs the normalization to the wire-level IETF code at
+    the API boundary so internal modules (ALPN encoding, CLIENT_SETUP,
+    context tracking) can speak a single form.
+
+    Raises ValueError if `draft` is not a plain draft number (e.g.
+    callers passing the full hex form like 0xff000010 hit this) or
+    if the draft number is not one aiomoqt knows how to speak.
+    """
+    supported = sorted(v & 0xff for v in MOQT_VERSIONS)
+    if not isinstance(draft, int) or draft < 0 or draft > 0xff:
+        raise ValueError(
+            f"MOQT draft must be a small integer (e.g. {supported}); "
+            f"got {draft!r}. Pass the draft number, not the IETF "
+            f"version code."
+        )
+    full = 0xff000000 | (draft & 0xff)
+    if full not in MOQT_VERSIONS:
+        raise ValueError(
+            f"MOQT draft {draft} not supported. "
+            f"Supported drafts: {supported}"
+        )
+    return full
+
 MOQT_DEFAULT_PRIORITY = 128
 
 MOQT_TIMESTAMP_EXT = 0x20

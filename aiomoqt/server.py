@@ -31,6 +31,12 @@ class MOQTServer(MOQTPeer):
         self.port = port
         self.path = path
         self.use_quic = use_quic
+        # Public API: draft_version is the integer draft number (e.g.
+        # 14, 16). Normalize to the full IETF code internally so the
+        # rest of the codebase sees one form.
+        if draft_version is not None:
+            from .types import moqt_version_from_draft
+            draft_version = moqt_version_from_draft(draft_version)
         self.draft_version = draft_version
         self.certificate = certificate
         self.private_key = private_key

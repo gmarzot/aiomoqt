@@ -2429,9 +2429,12 @@ class MOQTSessionWTClient(
 
     def __init__(self, transport, host: str, port: int, path: str,
                  sni: Optional[str] = None, *,
+                 wt_available_protocols: Optional[list] = None,
                  session: 'MOQTPeer'):
         super().__init__(transport, host, port, path,
-                         sni=sni, session=session)
+                         sni=sni,
+                         wt_available_protocols=wt_available_protocols,
+                         session=session)
         self._moqt_wt_finalize()
 
 
