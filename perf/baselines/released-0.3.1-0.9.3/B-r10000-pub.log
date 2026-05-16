@@ -1,0 +1,28 @@
+2026-05-16 09:15:31.320 WARNING: MOQT warn: control task cancelled
+────────────────────────────────────────────────────────
+  aiomoqt-bench publisher
+────────────────────────────────────────────────────────
+  relay:       moqt://moqx-local.marzresearch.net:4433
+  transport:   QUIC
+  namespace:   aiomoqt
+  trackname:   bench-r10000-B-838b3be1
+  mode:        SUBGROUP x2
+  object size: 1024 B
+  group size:  120 objects
+  rate:        10000.0/s per stream
+  target:      163.84 Mbps
+  duration:    30s
+────────────────────────────────────────────────────────
+  Connecting...
+  Published 'aiomoqt/bench-r10000-B-838b3be1', waiting for subscriber...
+
+  Interval  Grps    Objs      ObjRate   Bitrate   
+  ────────────────────────────────────────────────
+  0-5s      834     99995     19999/s   166Mbps   
+  5-10s     1667    199977    19996/s   166Mbps   
+  10-15s    2500    299981    20000/s   166Mbps   
+  15-20s    3334    399989    20001/s   166Mbps   
+  20-25s    4167    500003    20003/s   166Mbps   
+  Done.
+
+  Sent: 560,799 objects, 4674 groups, 19994/s, 166Mbps (28.0s)

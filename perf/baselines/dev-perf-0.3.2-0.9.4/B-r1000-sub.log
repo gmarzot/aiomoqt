@@ -1,0 +1,33 @@
+────────────────────────────────────────────────────────
+  aiomoqt-bench subscriber
+────────────────────────────────────────────────────────
+  relay:       moqt://moqx-local.marzresearch.net:4433
+  transport:   QUIC
+  namespace:   aiomoqt
+  trackname:   bench-r1000-B-da84370a
+  duration:    22s
+  interval:    5.0s
+────────────────────────────────────────────────────────
+  Connecting...
+  Subscribed to 'aiomoqt/bench-r1000-B-da84370a', receiving...
+
+  Interval  Grps    Objs      ObjRate   Bitrate   Latency             Jitter  Loss             
+  ─────────────────────────────────────────────────────────────────────────────────────────────
+  0-5s      84      10001     2000/s    17Mbps    2.1ms p99: 74ms     97us    0% (0 objs)      
+  5-10s     167     20003     2000/s    17Mbps    358us p99: 709us    105us   0% (0 objs)      
+  10-15s    251     30003     2000/s    17Mbps    340us p99: 709us    104us   0% (0 objs)      
+  15-20s    334     40005     2000/s    17Mbps    348us p99: 704us    70us    0% (0 objs)      
+
+════════════════════════════════════════════════════════
+  aiomoqt-bench results  (22.0s active / 22.0s elapsed)
+════════════════════════════════════════════════════════
+  Objects:     44,000
+  Bytes:       45,628,000
+  Rate:        2000.1 obj/s
+  Throughput:  16.59 Mbps
+  Latency:     min=0.1  avg=0.8  max=128.9  sd=5.6 ms
+               p50=0.3  p95=0.5  p99=0.9 ms
+  Jitter:      0.06 ms (final)  avg=0.10 ms
+  Lost:        0 (0.00%)
+  Out-of-order:   0
+════════════════════════════════════════════════════════

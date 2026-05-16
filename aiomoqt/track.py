@@ -390,15 +390,15 @@ class PublishedTrack(Track):
                 payload = (seq_info + b'|' + pad)[:self.object_size]
 
                 extensions = {MOQT_TIMESTAMP_EXT: int(time.time() * 1_000_000)}
-                buf = header.next_object(payload=payload,
-                                         extensions=extensions,
-                                         object_id=cur_obj_id)
-                obj_bytes = len(buf.data)
+                data = header.next_object_bytes(payload=payload,
+                                                extensions=extensions,
+                                                object_id=cur_obj_id)
+                obj_bytes = len(data)
                 cur_obj_id += self.num_subgroups
 
                 if session._close_err is not None:
                     raise asyncio.CancelledError
-                await session.stream_write_drain(stream_id, buf.data)
+                await session.stream_write_drain(stream_id, data)
                 local_sent += 1
                 self._total_sent += 1
                 self._total_bytes += obj_bytes

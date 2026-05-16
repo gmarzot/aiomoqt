@@ -18,6 +18,7 @@ from . import (MOQTUnderflow, MOQTMessage, ObjectStatus, DataStreamType,
                OBJECT_DATAGRAM_BASE, OBJECT_DATAGRAM_STATUS_BASE)
 from ..utils.buffer import Buffer, BufferReadError
 from ..utils.logger import get_logger
+from aiopquic._binding._streamchain import encode_object_subgroup
 
 logger = get_logger(__name__)
 
@@ -155,6 +156,34 @@ class SubgroupHeader(MOQTMessage):
             self.subgroup_id = obj_id
         return buf
 
+    def next_object_bytes(self, payload: bytes = b'',
+                          extensions: Optional[Dict] = None,
+                          status: ObjectStatus = ObjectStatus.NORMAL,
+                          object_id: Optional[int] = None) -> bytes:
+        """Fast-path equivalent to next_object: returns wire bytes
+        directly via the Cython encode_object_subgroup helper, skipping
+        the ObjectHeader dataclass and intermediate Buffer allocation.
+        Updates internal _last_object_id and subgroup_id identically."""
+        if object_id is not None:
+            obj_id = object_id
+        else:
+            obj_id = (0 if self._last_object_id is None
+                      else self._last_object_id + 1)
+        if self._last_object_id is None:
+            delta = obj_id
+        else:
+            delta = obj_id - self._last_object_id - 1
+        status_int = (status.value if hasattr(status, 'value')
+                      else int(status))
+        data = encode_object_subgroup(
+            delta, extensions, status_int, payload,
+            self.extensions_present)
+        self._last_object_id = obj_id
+        if (self.subgroup_id_mode == SUBGROUP_ID_FIRST_OBJ
+                and self.subgroup_id is None):
+            self.subgroup_id = obj_id
+        return data
+
     def end_group(self, extensions: Optional[Dict] = None,
                   object_id: Optional[int] = None) -> Buffer:
         """Create and serialize an END_OF_GROUP status object.
@@ -282,7 +311,7 @@ class ObjectHeader(MOQTMessage):
 
         return buf
 
-    def deserialize_into(self, buf: Buffer, buf_len: int,
+    def deserialize_into(self, buf, buf_len: int,
                          extensions_present: bool = True,
                          prev_object_id: Optional[int] = None) -> None:
         """In-place fill — avoids per-object dataclass allocation.
@@ -290,31 +319,41 @@ class ObjectHeader(MOQTMessage):
         Caller pre-allocates one ObjectHeader and mutates it for each
         object on a subgroup stream. Subscriber callback contract is
         "msg valid until next call" (consumer must not retain ref).
+
+        Hot path (StreamChain): single Cython call into
+        parse_object_subgroup, which keeps all inner pull_uint_var /
+        pull_bytes calls inside Cython.
+        Slow path (Buffer): legacy field-by-field decode for the
+        test + microbench paths that pre-bake a Buffer.
         """
-        delta = buf.pull_uint_var()
-        if prev_object_id is None:
-            self.object_id = delta
-        else:
-            self.object_id = prev_object_id + delta + 1
-
-        if extensions_present:
-            self.extensions = MOQTMessage._extensions_decode(buf)
-        else:
-            self.extensions = None
-
-        payload_len = buf.pull_uint_var()
-        remaining = buf_len - buf.tell()
-        if payload_len == 0:
-            self.status = ObjectStatus(buf.pull_uint_var())
-            self.payload = b''
-        elif payload_len > remaining:
-            raise MOQTUnderflow(buf.tell(), buf.tell() + payload_len)
-        else:
-            self.status = ObjectStatus.NORMAL
-            try:
-                self.payload = buf.pull_bytes(payload_len)
-            except BufferReadError:
+        try:
+            delta, exts, status, payload = buf.parse_object_subgroup(
+                extensions_present, MOQTMessage.EXTENSIONS_LEN_LIMIT)
+        except AttributeError:
+            delta = buf.pull_uint_var()
+            if extensions_present:
+                exts = MOQTMessage._extensions_decode(buf)
+            else:
+                exts = None
+            payload_len = buf.pull_uint_var()
+            remaining = buf_len - buf.tell()
+            if payload_len == 0:
+                status = buf.pull_uint_var()
+                payload = b""
+            elif payload_len > remaining:
                 raise MOQTUnderflow(buf.tell(), buf.tell() + payload_len)
+            else:
+                status = 0
+                try:
+                    payload = buf.pull_bytes(payload_len)
+                except BufferReadError:
+                    raise MOQTUnderflow(
+                        buf.tell(), buf.tell() + payload_len)
+        self.object_id = (delta if prev_object_id is None
+                          else prev_object_id + delta + 1)
+        self.extensions = exts
+        self.status = ObjectStatus(status)
+        self.payload = payload
 
     @classmethod
     def deserialize(cls, buf: Buffer, buf_len: int,
