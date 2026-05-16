@@ -576,25 +576,12 @@ TEST_FUNCTIONS = {
 
 
 def parse_relay_url(url: str):
-    """Parse relay URL into (host, port, path, use_quic)."""
-    parsed = urlparse(url)
-    scheme = parsed.scheme.lower()
-
-    if scheme == "moqt":
-        use_quic = True
-        port = parsed.port or 443
-    elif scheme in ("https", "wss"):
-        use_quic = False
-        port = parsed.port or 443
-    else:
-        # Bare host:port — default to WebTransport
-        use_quic = False
-        port = parsed.port or 443
-
-    host = parsed.hostname or url.split(":")[0]
-    path = parsed.path.lstrip("/")
-
-    return host, port, path, use_quic
+    """Parse relay URL into (host, port, path, use_quic). Thin tuple
+    wrapper around aiomoqt.utils.url.parse_relay_url (which normalizes
+    the WT :path)."""
+    from aiomoqt.utils.url import parse_relay_url as _parse
+    r = _parse(url)
+    return r.host, r.port, r.path or "", r.use_quic
 
 
 def parse_args():
@@ -661,10 +648,9 @@ def main():
 
     host, port, path, use_quic = parse_relay_url(args.relay)
 
-    # Resolve draft version
-    draft_version = None
-    if args.draft:
-        draft_version = 0xff000000 + args.draft
+    # Public API takes the draft NUMBER (14, 16, ...). MOQTClient
+    # normalizes to the wire form internally; pass args.draft through.
+    draft_version = args.draft if args.draft else None
 
     if args.verbose:
         transport = "QUIC" if use_quic else "WebTransport"

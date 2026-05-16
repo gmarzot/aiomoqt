@@ -31,9 +31,10 @@ class MOQTClient(MOQTPeer):
     ):
         super().__init__(allow_optional_dgram=allow_optional_dgram,
                          libquicr_compat=libquicr_compat)
+        from .utils.url import normalize_wt_path
         self.host = host
         self.port = port
-        self.path = path
+        self.path = normalize_wt_path(path)
         self.use_quic = use_quic
         self.verify_tls = verify_tls
         self.debug = debug
