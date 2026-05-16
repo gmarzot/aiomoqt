@@ -34,17 +34,16 @@ class MOQTMessage:
     type: Optional[int] = field(default=None, kw_only=True)
 
     @staticmethod
-    def _extensions_encode(buf: Buffer, exts: Dict,
-                           with_length: bool = True) -> None:
+    def _extensions_encode(buf: Buffer, exts: Dict) -> None:
+        """Spec-compliant Extensions encode (always length-prefixed).
+        See draft-ietf-moq-transport §10.2.1.2."""
         vers = get_moqt_ctx_version()
         major_version = get_major_version(vers)
         if exts is None or len(exts) == 0:
-            if with_length:
-                buf.push_uint_var(0)
+            buf.push_uint_var(0)
             return
-        
+
         if major_version > 8:
-            pos = buf.tell()
             payload = Buffer(capacity=BUF_SIZE)
             for ext_id, ext_value in exts.items():
                 payload.push_uint_var(ext_id)
@@ -64,8 +63,7 @@ class MOQTMessage:
                     f"declared exts_len={exts_len} "
                     f"actual payload.data bytes={len(payload.data)}"
                 )
-            if with_length:
-                buf.push_uint_var(exts_len)
+            buf.push_uint_var(exts_len)
             payload_bytes_before = buf.tell()
             buf.push_bytes(payload.data)
             actual_pushed = buf.tell() - payload_bytes_before
@@ -92,43 +90,38 @@ class MOQTMessage:
     EXTENSIONS_LEN_LIMIT = 1024 * 16
 
     @staticmethod
-    def _extensions_decode(buf: Buffer, with_length: bool = True,
-                           buf_end: int = None) -> Optional[Dict[int, Union[int, bytes]]]:
-        if with_length:
-            pos_before = buf.tell()
-            exts_len = buf.pull_uint_var()
-            if exts_len > MOQTMessage.EXTENSIONS_LEN_LIMIT:
-                # Framer has lost alignment: this varint is being read
-                # from a position that doesn't actually point at an
-                # extensions block. Returning silently here ratchets
-                # the desync — caller advances past garbage and reads
-                # more garbage. Raise so the outer loop terminates the
-                # stream cleanly via STOP_SENDING.
-                MOQTMessage.exts_err_count += 1
-                if MOQTMessage.exts_err_count == 1:
-                    # First-corruption diagnostic — dump anchor bytes
-                    # so the misalignment can be reverse-engineered.
-                    try:
-                        cap = buf.capacity
-                        head = buf.data_slice(0, min(64, cap)).hex()
-                    except Exception:
-                        head = "<unavailable>"
-                    logger.error(
-                        "MOQT framer desync: ext_len=%d at pos=%d "
-                        "(cap=%d) head_hex=%s",
-                        exts_len, pos_before, cap, head,
-                    )
-                raise RuntimeError(
-                    f"framer desync: ext_len={exts_len} exceeds "
-                    f"limit {MOQTMessage.EXTENSIONS_LEN_LIMIT} "
-                    f"at pos={pos_before}"
+    def _extensions_decode(buf: Buffer) -> Optional[Dict[int, Union[int, bytes]]]:
+        """Spec-compliant Extensions decode (always length-prefixed).
+        See draft-ietf-moq-transport §10.2.1.2."""
+        pos_before = buf.tell()
+        exts_len = buf.pull_uint_var()
+        if exts_len > MOQTMessage.EXTENSIONS_LEN_LIMIT:
+            # Framer has lost alignment: this varint is being read
+            # from a position that doesn't actually point at an
+            # extensions block. Raise so the outer loop terminates
+            # the stream cleanly via STOP_SENDING.
+            MOQTMessage.exts_err_count += 1
+            if MOQTMessage.exts_err_count == 1:
+                # First-corruption diagnostic — dump anchor bytes
+                # so the misalignment can be reverse-engineered.
+                try:
+                    cap = buf.capacity
+                    head = buf.data_slice(0, min(64, cap)).hex()
+                except Exception:
+                    head = "<unavailable>"
+                logger.error(
+                    "MOQT framer desync: ext_len=%d at pos=%d "
+                    "(cap=%d) head_hex=%s",
+                    exts_len, pos_before, cap, head,
                 )
-            if exts_len == 0:
-                return None
-            exts_end = buf.tell() + exts_len
-        else:
-            # No length prefix — read until buf_end or buffer exhaustion
-            exts_end = buf_end if buf_end is not None else buf.capacity
+            raise RuntimeError(
+                f"framer desync: ext_len={exts_len} exceeds "
+                f"limit {MOQTMessage.EXTENSIONS_LEN_LIMIT} "
+                f"at pos={pos_before}"
+            )
+        if exts_len == 0:
+            return None
+        exts_end = buf.tell() + exts_len
 
         exts = {}
         while buf.tell() < exts_end:

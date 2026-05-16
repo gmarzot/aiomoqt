@@ -201,7 +201,7 @@ class FetchOk(MOQTMessage):
             if self.group_order is not None:
                 params[ParamType.GROUP_ORDER] = self.group_order
             MOQTMessage._serialize_params(payload, params)
-            MOQTMessage._extensions_encode(payload, self.track_extensions or {}, with_length=False)
+            MOQTMessage._extensions_encode(payload, self.track_extensions or {})
         else:
             # d14: group_order as fixed field
             payload.push_uint8(self.group_order)
@@ -226,7 +226,7 @@ class FetchOk(MOQTMessage):
             largest_object_id = buf.pull_uint_var()
             params = MOQTMessage._deserialize_params(buf)
             group_order = params.pop(ParamType.GROUP_ORDER, GroupOrder.DESCENDING)
-            track_extensions = MOQTMessage._extensions_decode(buf, with_length=False)
+            track_extensions = MOQTMessage._extensions_decode(buf)
         else:
             group_order = buf.pull_uint8()
             end_of_track = buf.pull_uint8()

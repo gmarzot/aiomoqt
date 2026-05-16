@@ -97,7 +97,7 @@ def parse_relay_url(url: str, force_quic: bool = False,
             path=None,
         )
     elif scheme == "https":
-        path = normalize_wt_path(parsed.path) or default_path
+        path = normalize_wt_path(parsed.path or default_path)
         return MOQTRelay(
             host=parsed.hostname or "localhost",
             port=parsed.port or HTTPS_DEFAULT_PORT,
