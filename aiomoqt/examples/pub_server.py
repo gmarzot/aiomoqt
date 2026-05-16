@@ -121,16 +121,17 @@ async def main():
               "Use --cert and --key, or place cert.pem/key.pem in certs/")
         return
 
-    draft_version = (
-        {14: 0xff00000e, 15: 0xff00000f, 16: 0xff000010}[args.draft]
-        if args.quic else None
-    )
+    # Public API takes the draft NUMBER (14, 16, ...); MOQTServer
+    # normalizes to the wire-form internally. The MoQT session layer
+    # needs the draft for either transport (raw QUIC or WT) to pick
+    # the right message-encoding rules; only the QUIC ALPN derivation
+    # differs.
     server = MOQTServer(
         host=args.host, port=args.port,
         certificate=args.cert, private_key=args.key,
         path="/",
         use_quic=args.quic,
-        draft_version=draft_version,
+        draft_version=args.draft,
     )
     server.register_handler(
         MOQTMessageType.SUBSCRIBE,
