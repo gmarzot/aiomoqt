@@ -15,6 +15,14 @@ MOQT_DEFAULT_PORT = 443
 HTTPS_DEFAULT_PORT = 443
 
 
+def normalize_wt_path(path: Optional[str]) -> Optional[str]:
+    """Normalize a WT :path: strip trailing '/', ensure leading '/'."""
+    if not path:
+        return path
+    path = path.rstrip("/")
+    return path if path.startswith("/") else "/" + path
+
+
 @dataclass
 class MOQTRelay:
     """Parsed MoQT relay connection parameters."""
@@ -27,7 +35,8 @@ class MOQTRelay:
         if self.use_quic:
             port_s = "" if self.port == MOQT_DEFAULT_PORT else f":{self.port}"
             return f"moqt://{self.host}{port_s}"
-        ep = f"/{self.path}" if self.path else ""
+        # self.path already starts with "/" when present; don't double-add
+        ep = self.path if self.path else ""
         port_s = "" if self.port == HTTPS_DEFAULT_PORT else f":{self.port}"
         return f"https://{self.host}{port_s}{ep}"
 
@@ -88,11 +97,7 @@ def parse_relay_url(url: str, force_quic: bool = False,
             path=None,
         )
     elif scheme == "https":
-        path = parsed.path.rstrip("/") or default_path
-        # WT CONNECT requires :path to start with /. qh3 auto-prepended;
-        # aiopquic passes through verbatim, so this layer must normalize.
-        if path and not path.startswith("/"):
-            path = "/" + path
+        path = normalize_wt_path(parsed.path or default_path)
         return MOQTRelay(
             host=parsed.hostname or "localhost",
             port=parsed.port or HTTPS_DEFAULT_PORT,

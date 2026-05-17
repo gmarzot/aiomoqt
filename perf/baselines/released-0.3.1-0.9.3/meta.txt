@@ -1,0 +1,9 @@
+label:    released-0.3.1-0.9.3
+date:     2026-05-16T13:12:14Z
+host:     StingRay Linux 6.6.87.2-microsoft-standard-WSL2 x86_64
+python:   /tmp/aiomoqt-release-test/bin/python
+versions: aiopquic=0.3.1 aiomoqt=0.8.3.dev48+g96213eeb2
+relay:    moqt://moqx-local.marzresearch.net:4433
+draft:    16
+config:   -P 2 -s 1024 -g 120 -t 30 --pub-both
+rates:    1000 5000 10000

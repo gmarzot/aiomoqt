@@ -135,7 +135,7 @@ def _pytest_file(test_file: str, log: Path) -> tuple[str, str]:
 
 def _buffer(log_dir: Path) -> tuple[str, str]:
     log = log_dir / "buffer.log"
-    ok, _ = _run(["python", "tests/test_rebuf.py"], log, 60)
+    ok, _ = _run([sys.executable, "tests/test_rebuf.py"], log, 60)
     text = log.read_text()
     m = re.search(r"(\d+) passed,\s*(\d+) failed", text)
     passed = ok and m and m.group(2) == "0"
@@ -164,7 +164,7 @@ def _loopback_setup(log_dir: Path) -> tuple[str, str]:
 def _loopback_pub_sub(log_dir: Path) -> tuple[str, str]:
     log = log_dir / "loopback-pub-sub.log"
     cmd = [
-        "python", "-m", "aiomoqt.examples.loopback_bench",
+        sys.executable, "-m", "aiomoqt.examples.loopback_bench",
         "-P", "4", "-s", "16384", "-r", "60", "-t", "10",
     ]
     ok, _ = _run(cmd, log, 40)
@@ -239,7 +239,7 @@ def _loopback_fetch(log_dir: Path) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 def _relay_ctrl_msg(url: str, draft: int, insecure: bool,
                     log: Path) -> tuple[str, str]:
-    cmd = ["python", "-m", "aiomoqt.examples.moq_interop_client",
+    cmd = [sys.executable, "-m", "aiomoqt.examples.moq_interop_client",
            "-r", url, "--draft", str(draft)]
     if insecure:
         cmd.append("--tls-disable-verify")
@@ -253,7 +253,7 @@ def _relay_ctrl_msg(url: str, draft: int, insecure: bool,
 
 def _relay_pub_sub(url: str, draft: int, pub_mode: str, insecure: bool,
                    log: Path, trackname: str) -> tuple[str, str]:
-    cmd = ["python", "-m", "aiomoqt.examples.multi_sub_bench",
+    cmd = [sys.executable, "-m", "aiomoqt.examples.multi_sub_bench",
            url, *MULTI_SUB_ARGS_COMMON, "--draft", str(draft),
            "--trackname", trackname, *PUB_MODE_FLAGS[pub_mode]]
     if insecure:
@@ -271,7 +271,7 @@ def _relay_pub_sub(url: str, draft: int, pub_mode: str, insecure: bool,
 
 def _relay_tap_case(url: str, draft: int, case: str, insecure: bool,
                     log: Path) -> tuple[str, str]:
-    cmd = ["python", "-m", "aiomoqt.examples.moq_interop_client",
+    cmd = [sys.executable, "-m", "aiomoqt.examples.moq_interop_client",
            "-r", url, "--draft", str(draft), "-t", case]
     if insecure:
         cmd.append("--tls-disable-verify")
@@ -304,7 +304,7 @@ def _loopback_adaptive_bench(log_dir: Path) -> tuple[str, str]:
     # Loopback self-test: short ramp, kill after ~30s so the runner
     # isn't held open by the forever-probing controller.
     cmd = ["timeout", "--signal=INT", "--kill-after=3", "30",
-           "python", "-m", "aiomoqt.examples.adaptive_bench",
+           sys.executable, "-m", "aiomoqt.examples.adaptive_bench",
            "--start-mbps", "10", "--step-mbps", "10",
            "--max-mbps", "500", "--interval", "3",
            "-l", "100"]

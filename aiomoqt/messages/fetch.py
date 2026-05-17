@@ -98,7 +98,7 @@ class Fetch(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'Fetch':
+    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'Fetch':
         namespace = None
         track_name = None
         start_group = None
@@ -216,7 +216,10 @@ class FetchOk(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'FetchOk':
+    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'FetchOk':
+        # buf_end is the absolute end-of-message position derived from
+        # the outer frame length. Required for d16 (Track Extensions
+        # have no length prefix; sequence runs to end of message).
         request_id = buf.pull_uint_var()
         track_extensions = None
 
@@ -226,7 +229,8 @@ class FetchOk(MOQTMessage):
             largest_object_id = buf.pull_uint_var()
             params = MOQTMessage._deserialize_params(buf)
             group_order = params.pop(ParamType.GROUP_ORDER, GroupOrder.DESCENDING)
-            track_extensions = MOQTMessage._extensions_decode(buf, with_length=False)
+            track_extensions = MOQTMessage._extensions_decode(
+                buf, with_length=False, buf_end=buf_end)
         else:
             group_order = buf.pull_uint8()
             end_of_track = buf.pull_uint8()
@@ -271,7 +275,7 @@ class FetchError(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'FetchError':
+    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'FetchError':
 
         request_id = buf.pull_uint_var()
         error_code = buf.pull_uint_var()
@@ -304,7 +308,7 @@ class FetchCancel(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'FetchCancel':
+    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'FetchCancel':
 
         request_id = buf.pull_uint_var()
 

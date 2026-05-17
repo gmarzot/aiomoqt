@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 
 from . import MOQTMessageType, MOQTMessage, SetupParamType, BUF_SIZE
 from ..context import is_draft16_or_later
@@ -40,7 +40,7 @@ class ServerSetup(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'ServerSetup':
+    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'ServerSetup':
         """Handle SERVER_SETUP message."""
         version = None
         if not is_draft16_or_later():
@@ -83,7 +83,7 @@ class ClientSetup(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'ClientSetup':
+    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'ClientSetup':
         """Handle CLIENT_SETUP message."""
         versions = []
         if not is_draft16_or_later():
@@ -123,7 +123,7 @@ class GoAway(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'GoAway':
+    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'GoAway':
         """Handle GOAWAY message."""        
         uri_len = buf.pull_uint_var()
         

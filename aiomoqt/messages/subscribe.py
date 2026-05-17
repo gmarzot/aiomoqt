@@ -82,7 +82,7 @@ class TrackStatus(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'TrackStatus':
+    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'TrackStatus':
 
         request_id = buf.pull_uint_var()
 
@@ -178,7 +178,7 @@ class TrackStatusOk(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'TrackStatusOk':
+    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'TrackStatusOk':
         request_id = buf.pull_uint_var()
         track_alias = buf.pull_uint_var()
         expires = buf.pull_uint_var()
@@ -232,7 +232,7 @@ class TrackStatusError(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'TrackStatusError':
+    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'TrackStatusError':
 
         request_id = buf.pull_uint_var()
         error_code = buf.pull_uint_var()
@@ -329,7 +329,7 @@ class Subscribe(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'Subscribe':
+    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'Subscribe':
 
         request_id = buf.pull_uint_var()
 
@@ -454,7 +454,10 @@ class SubscribeOk(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'SubscribeOk':
+    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'SubscribeOk':
+        # buf_end is the absolute end-of-message position derived from
+        # the outer frame length. Required for d16 (Track Extensions
+        # have no length prefix; sequence runs to end of message).
         request_id = buf.pull_uint_var()
         track_alias = buf.pull_uint_var()
 
@@ -476,7 +479,8 @@ class SubscribeOk(MOQTMessage):
                 content_exists = ContentExistsCode.EXISTS
             else:
                 content_exists = ContentExistsCode.NO_CONTENT
-            track_extensions = MOQTMessage._extensions_decode(buf, with_length=False)
+            track_extensions = MOQTMessage._extensions_decode(
+                buf, with_length=False, buf_end=buf_end)
             group_order_val = track_extensions.pop(0x22, None)
             if group_order_val is not None:
                 group_order = GroupOrder(group_order_val)
@@ -528,7 +532,7 @@ class SubscribeError(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'SubscribeError':
+    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'SubscribeError':
 
         request_id = buf.pull_uint_var()
         error_code = buf.pull_uint_var()
@@ -576,7 +580,7 @@ class SubscribeUpdate(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'SubscribeUpdate':
+    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'SubscribeUpdate':
 
         request_id = buf.pull_uint_var()
         subscription_request_id = buf.pull_uint_var()
@@ -618,7 +622,7 @@ class Unsubscribe(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'Unsubscribe':
+    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'Unsubscribe':
 
         request_id = buf.pull_uint_var()
         return cls(request_id=request_id)
@@ -652,7 +656,7 @@ class SubscribeDone(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'SubscribeDone':
+    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'SubscribeDone':
 
         request_id = buf.pull_uint_var()
         status_code = buf.pull_uint_var()
@@ -687,7 +691,7 @@ class MaxSubscribeId(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'MaxSubscribeId':
+    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'MaxSubscribeId':
 
         request_id = buf.pull_uint_var()
         return cls(request_id=request_id)
@@ -712,7 +716,7 @@ class SubscribesBlocked(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'SubscribesBlocked':
+    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'SubscribesBlocked':
 
         maximum_request_id = buf.pull_uint_var()
         return cls(maximum_request_id=maximum_request_id)

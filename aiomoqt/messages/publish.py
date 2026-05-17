@@ -85,7 +85,10 @@ class Publish(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'Publish':
+    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'Publish':
+        # buf_end is the absolute end-of-message position derived from
+        # the outer frame length. Required for d16 (Track Extensions
+        # have no length prefix; sequence runs to end of message).
         request_id = buf.pull_uint_var()
 
         tuple_len = buf.pull_uint_var()
@@ -113,7 +116,8 @@ class Publish(MOQTMessage):
                 content_exists = ContentExistsCode.EXISTS
             else:
                 content_exists = ContentExistsCode.NO_CONTENT
-            track_extensions = MOQTMessage._extensions_decode(buf, with_length=False)
+            track_extensions = MOQTMessage._extensions_decode(
+                buf, with_length=False, buf_end=buf_end)
             go_val = track_extensions.pop(0x22, None)
             if go_val is not None:
                 group_order = go_val
@@ -207,7 +211,7 @@ class PublishOk(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'PublishOk':
+    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'PublishOk':
         request_id = buf.pull_uint_var()
 
         forward = None
@@ -288,7 +292,7 @@ class PublishError(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'PublishError':
+    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'PublishError':
         request_id = buf.pull_uint_var()
         error_code = buf.pull_uint_var()
         reason_len = buf.pull_uint_var()

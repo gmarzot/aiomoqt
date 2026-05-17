@@ -1,0 +1,9 @@
+label:    dev-perf-0.3.2-0.9.4
+date:     2026-05-16T14:41:20Z
+host:     StingRay Linux 6.6.87.2-microsoft-standard-WSL2 x86_64
+python:   /tmp/aiomoqt-dev-test/bin/python
+versions: aiopquic=0.3.1 aiomoqt=0.9.2.dev13+gd30bcf8ea.d20260516
+relay:    moqt://moqx-local.marzresearch.net:4433
+draft:    16
+config:   -P 2 -s 1024 -g 120 -t 30 --pub-both
+rates:    1000 5000 10000

@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, Tuple, Any
+from typing import Dict, Tuple, Any, Optional
 
 from . import MOQTMessageType, MOQTMessage, BUF_SIZE
 from ..context import is_draft16_or_later
@@ -40,7 +40,7 @@ class PublishNamespace(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'PublishNamespace':
+    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'PublishNamespace':
         request_id = buf.pull_uint_var()
         
         tuple_len = buf.pull_uint_var()
@@ -70,7 +70,7 @@ class PublishNamespaceOk(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'PublishNamespaceOk':
+    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'PublishNamespaceOk':
         request_id = buf.pull_uint_var()
         return cls(request_id=request_id)
 
@@ -102,7 +102,7 @@ class PublishNamespaceError(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'PublishNamespaceError':
+    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'PublishNamespaceError':
         request_id = buf.pull_uint_var()
         error_code = buf.pull_uint_var()
         reason_len = buf.pull_uint_var()
@@ -141,7 +141,7 @@ class PublishNamespaceDone(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'PublishNamespaceDone':
+    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'PublishNamespaceDone':
         if is_draft16_or_later():
             request_id = buf.pull_uint_var()
             return cls(request_id=request_id)
@@ -190,7 +190,7 @@ class PublishNamespaceCancel(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'PublishNamespaceCancel':
+    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'PublishNamespaceCancel':
         namespace = None
         request_id = None
         if is_draft16_or_later():
@@ -238,7 +238,7 @@ class SubscribeNamespace(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'SubscribeNamespace':
+    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'SubscribeNamespace':
         from ..context import is_draft16_or_later
         request_id = buf.pull_uint_var()
         tuple_len = buf.pull_uint_var()
@@ -271,7 +271,7 @@ class SubscribeNamespaceOk(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'SubscribeNamespaceOk':
+    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'SubscribeNamespaceOk':
         request_id = buf.pull_uint_var()
         return cls(request_id=request_id)
 
@@ -303,7 +303,7 @@ class SubscribeNamespaceError(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'SubscribeNamespaceError':
+    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'SubscribeNamespaceError':
         request_id = buf.pull_uint_var()
         error_code = buf.pull_uint_var()
         reason_len = buf.pull_uint_var()
@@ -334,7 +334,7 @@ class UnsubscribeNamespace(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'UnsubscribeNamespace':
+    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'UnsubscribeNamespace':
         tuple_len = buf.pull_uint_var()
         namespace_prefix = tuple(buf.pull_bytes(buf.pull_uint_var()) for _ in range(tuple_len))
         return cls(namespace_prefix=namespace_prefix)
