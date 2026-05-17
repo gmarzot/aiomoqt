@@ -142,8 +142,13 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e '.[test]'
-      - name: Set up Docker
-        uses: docker/setup-buildx-action@v3
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cargo build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: moq-rs -> moq-rs/target
+          shared-key: moq-rs-d14
       - name: Generate self-signed cert
         run: |
           mkdir -p certs
@@ -151,55 +156,49 @@ jobs:
             -keyout certs/key.pem -out certs/cert.pem \
             -days 1 -subj "/CN=localhost" \
             -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
-      - name: Build + run cloudflare/moq-rs relay container
+      - name: Clone + build cloudflare/moq-rs (d14)
         run: |
-          # Build moq-rs from upstream main (d14). Long-running; cache
-          # if/when this proves valuable.
-          docker run -d --name moq-relay --network host \
-            -v "$PWD/certs:/certs" \
-            --entrypoint sh \
-            rust:1.85 -c '
-              git clone --depth=1 https://github.com/cloudflare/moq-rs /moq-rs &&
-              cd /moq-rs &&
-              cargo build --release --bin moq-relay-ietf &&
-              ./target/release/moq-relay-ietf \
-                --bind [::]:4443 \
-                --tls-cert /certs/cert.pem \
-                --tls-key /certs/key.pem \
-                --dev
-            ' &
-          # Wait for relay to be ready (best-effort).
-          for i in $(seq 1 90); do
-            sleep 2
-            if docker logs moq-relay 2>&1 | grep -q "listening on"; then
-              echo "relay up after ${i} iterations"
+          git clone --depth=1 https://github.com/cloudflare/moq-rs.git
+          cd moq-rs
+          cargo build --release --bin moq-relay-ietf --bin moq-clock-ietf
+      - name: Start relay + clock publisher
+        run: |
+          ./moq-rs/target/release/moq-relay-ietf \
+            --bind "[::]:4443" \
+            --tls-cert certs/cert.pem \
+            --tls-key certs/key.pem \
+            --dev > /tmp/relay.log 2>&1 &
+          # Wait for relay to be ready.
+          for i in $(seq 1 30); do
+            sleep 1
+            if grep -q "listening on" /tmp/relay.log 2>/dev/null; then
+              echo "relay up after ${i}s"
               break
             fi
           done
+          ./moq-rs/target/release/moq-clock-ietf --tls-disable-verify \
+            --publish --namespace clock --track now \
+            https://localhost:4443 > /tmp/clock-pub.log 2>&1 &
+          sleep 2
       - name: aiomoqt sub_bench against moq-rs relay (clock track)
         timeout-minutes: 3
         run: |
-          # moq-clock-ietf as publisher in the relay container
-          docker exec moq-relay sh -c '
-            cd /moq-rs &&
-            ./target/release/moq-clock-ietf --tls-disable-verify \
-              --publish --namespace clock --track now \
-              https://localhost:4443 > /tmp/clock-pub.log 2>&1 &
-          '
-          sleep 2
-          # aiomoqt subscriber
           timeout 12 python -m aiomoqt.examples.sub_bench \
             -n clock --trackname now --draft 14 -k -t 8 \
             https://localhost:4443 \
             > /tmp/sub.log 2>&1 || true
           echo === sub.log ===
           tail -25 /tmp/sub.log
+          echo === relay.log ===
+          tail -10 /tmp/relay.log
           # Require at least 5 clock objects (1 Hz publish rate).
           grep -E "Objects: *[0-9]+" /tmp/sub.log | tail -1 \
             | awk '{n=$2+0; if (n < 5) {print "FAIL: only " n " clock objs"; exit 1} else {print "OK: " n " clock objs"}}'
-      - name: Cleanup relay container
+      - name: Cleanup
         if: always()
-        run: docker rm -f moq-relay 2>/dev/null || true
+        run: |
+          pkill -f moq-relay-ietf 2>/dev/null || true
+          pkill -f moq-clock-ietf 2>/dev/null || true
 
   perf-gate:
     name: perf gate (parser microbench)
