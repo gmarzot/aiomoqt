@@ -12,9 +12,19 @@ on:
   workflow_dispatch:
   schedule:
     - cron: '17 3 * * 1'    # Mondays 03:17 UTC
+  # PR opt-in: contributors add the `ci:run-interop` label when their
+  # change touches wire-format or session-protocol code. Avoids burning
+  # the weekly slot AND avoids hitting public relays on every doc PR.
+  pull_request:
+    types: [labeled, synchronize]
 
 jobs:
   interop:
+    # Skip on label-PR runs unless the label is actually present.
+    # For workflow_dispatch + schedule there's no label gate.
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'ci:run-interop')
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4

@@ -4,6 +4,20 @@ name: CI
 # integration tiers across supported Python versions. No publish /
 # release jobs — release.yml is manually dispatched from the Actions
 # tab when a release is ready to cut.
+#
+# Tiers (post-enhancement):
+#   - core: unit + integration via release_regression_test.py. Required
+#     on (linux, macos) x (3.12, 3.13, 3.14).
+#   - multi-proc: pub_server in one process, sub_bench in another.
+#     Catches Phase-7 backpressure / control-stream parser regressions
+#     that single-process loopback masks. continue-on-error initially.
+#   - cross-impl: aiomoqt sub_bench against cloudflare/moq-rs draft-14
+#     relay running in a Docker container. continue-on-error initially.
+#   - perf-gate: parser microbench short window. continue-on-error
+#     initially.
+#
+# The interop tier (live external relays) stays in interop-regression.yml
+# but gains a PR-label trigger there so contributors can opt-in.
 
 on:
   pull_request:
@@ -11,37 +25,197 @@ on:
     branches:
       - main
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
-    runs-on: ubuntu-latest
+  core:
+    name: core / ${{ matrix.os }} / py${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest, macos-latest]
         python-version: ["3.12", "3.13", "3.14"]
     steps:
-    - uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
-      with:
-        python-version: ${{ matrix.python-version }}
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -e '.[test]'
-    - name: Generate self-signed cert for loopback
-      run: |
-        mkdir -p certs
-        openssl req -x509 -newkey rsa:2048 -nodes \
-          -keyout certs/key.pem -out certs/cert.pem \
-          -days 1 -subj "/CN=localhost"
-    - name: Run unit + integration tiers
-      run: |
-        python tests/release_regression_test.py \
-          --test-tier unit --test-tier integration
-    - name: Upload logs on failure
-      if: failure()
-      uses: actions/upload-artifact@v4
-      with:
-        name: regression-logs-py${{ matrix.python-version }}
-        path: /tmp/aiomoqt-regression.*/
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[test]'
+      - name: Generate self-signed cert for loopback
+        run: |
+          mkdir -p certs
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout certs/key.pem -out certs/cert.pem \
+            -days 1 -subj "/CN=localhost"
+      - name: Run unit + integration tiers
+        run: |
+          python tests/release_regression_test.py \
+            --test-tier unit --test-tier integration
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-logs-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: /tmp/aiomoqt-regression.*/
+
+  multi-proc:
+    name: multi-process pub_server / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[test]'
+      - name: Generate self-signed cert
+        run: |
+          mkdir -p certs
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout certs/key.pem -out certs/cert.pem \
+            -days 1 -subj "/CN=localhost"
+      - name: pub_server <-> sub_bench loopback smoke (raw QUIC)
+        timeout-minutes: 4
+        run: |
+          # Spawn pub_server in background, run sub_bench against it.
+          # Asserts at least some object delivery in a 12 s window.
+          # Catches Phase-7 backpressure / TX-ring-fill stalls that
+          # in-process loopback doesn't exercise.
+          python -m aiomoqt.examples.pub_server \
+            --cert certs/cert.pem --key certs/key.pem \
+            -p 4434 -s 4096 -g 10000 -P 1 \
+            --draft 16 --quic > /tmp/pub-srv.log 2>&1 &
+          PUB_PID=$!
+          sleep 1.5
+          timeout 14 python -m aiomoqt.examples.sub_bench \
+            -Q --draft 16 -n bench --trackname track \
+            -t 12 -i 5 moqt://localhost:4434 \
+            > /tmp/sub.log 2>&1 || true
+          kill $PUB_PID 2>/dev/null || true
+          echo === sub.log ===
+          tail -30 /tmp/sub.log
+          echo === pub-srv.log ===
+          tail -20 /tmp/pub-srv.log
+          # Require at least 1000 objects delivered in 12 s.
+          # Conservative floor; the actual rate target is much higher.
+          grep -E "Objects: *[0-9]+" /tmp/sub.log | tail -1 \
+            | awk '{n=$2+0; if (n < 1000) {print "FAIL: only " n " objects"; exit 1} else {print "OK: " n " objects"}}'
+
+  cross-impl:
+    name: cross-impl interop (cloudflare/moq-rs d14)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[test]'
+      - name: Set up Docker
+        uses: docker/setup-buildx-action@v3
+      - name: Generate self-signed cert
+        run: |
+          mkdir -p certs
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout certs/key.pem -out certs/cert.pem \
+            -days 1 -subj "/CN=localhost" \
+            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+      - name: Build + run cloudflare/moq-rs relay container
+        run: |
+          # Build moq-rs from upstream main (d14). Long-running; cache
+          # if/when this proves valuable.
+          docker run -d --name moq-relay --network host \
+            -v "$PWD/certs:/certs" \
+            --entrypoint sh \
+            rust:1.85 -c '
+              git clone --depth=1 https://github.com/cloudflare/moq-rs /moq-rs &&
+              cd /moq-rs &&
+              cargo build --release --bin moq-relay-ietf &&
+              ./target/release/moq-relay-ietf \
+                --bind [::]:4443 \
+                --tls-cert /certs/cert.pem \
+                --tls-key /certs/key.pem \
+                --dev
+            ' &
+          # Wait for relay to be ready (best-effort).
+          for i in $(seq 1 90); do
+            sleep 2
+            if docker logs moq-relay 2>&1 | grep -q "listening on"; then
+              echo "relay up after ${i} iterations"
+              break
+            fi
+          done
+      - name: aiomoqt sub_bench against moq-rs relay (clock track)
+        timeout-minutes: 3
+        run: |
+          # moq-clock-ietf as publisher in the relay container
+          docker exec moq-relay sh -c '
+            cd /moq-rs &&
+            ./target/release/moq-clock-ietf --tls-disable-verify \
+              --publish --namespace clock --track now \
+              https://localhost:4443 > /tmp/clock-pub.log 2>&1 &
+          '
+          sleep 2
+          # aiomoqt subscriber
+          timeout 12 python -m aiomoqt.examples.sub_bench \
+            -n clock --trackname now --draft 14 -k -t 8 \
+            https://localhost:4443 \
+            > /tmp/sub.log 2>&1 || true
+          echo === sub.log ===
+          tail -25 /tmp/sub.log
+          # Require at least 5 clock objects (1 Hz publish rate).
+          grep -E "Objects: *[0-9]+" /tmp/sub.log | tail -1 \
+            | awk '{n=$2+0; if (n < 5) {print "FAIL: only " n " clock objs"; exit 1} else {print "OK: " n " clock objs"}}'
+      - name: Cleanup relay container
+        if: always()
+        run: docker rm -f moq-relay 2>/dev/null || true
+
+  perf-gate:
+    name: perf gate (parser microbench)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[test]'
+      - name: Run parser microbench
+        timeout-minutes: 5
+        run: |
+          # b1_parser is parser-only, no transport; reliable on
+          # hosted runners. Floor enforcement deferred until we have
+          # a few runs to calibrate runner noise.
+          python -m aiomoqt.tests.microbench.b1_parser \
+            --duration 3 || true
