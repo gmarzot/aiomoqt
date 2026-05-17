@@ -47,6 +47,9 @@ DEFAULT_CATALOG = Path(__file__).parent / "relays.json"
 TIERS = {
     "unit":        ["buffer", "message", "track"],
     "integration": ["loopback-setup", "loopback-pub-sub",
+                    "loopback-pub-sub-tiny",
+                    "loopback-pub-sub-streams",
+                    "loopback-pub-sub-paced",
                     "loopback-join", "loopback-fetch"],
     "interop":     ["relay-ctrl-msg", "relay-pub-sub",
                     "relay-join", "relay-fetch"],
@@ -170,6 +173,55 @@ def _loopback_pub_sub(log_dir: Path) -> tuple[str, str]:
     no_loss = "Lost:        0 (0.00%)" in text
     tput = m.group(1) if m else "?"
     return ("PASS" if ok and no_loss else "FAIL"), f"{tput} Mbps"
+
+
+def _loopback_pub_sub_variant(log_dir: Path, slug: str, flags: list[str],
+                                timeout: int) -> tuple[str, str]:
+    """Generic runner for loopback_bench variants."""
+    log = log_dir / f"{slug}.log"
+    cmd = [
+        "python", "-m", "aiomoqt.examples.loopback_bench",
+        *flags,
+    ]
+    ok, _ = _run(cmd, log, timeout)
+    text = log.read_text()
+    m = re.search(r"Throughput:\s+([\d.]+)\s*Mbps", text)
+    no_loss = "Lost:        0 (0.00%)" in text
+    tput = m.group(1) if m else "?"
+    return ("PASS" if ok and no_loss else "FAIL"), f"{tput} Mbps"
+
+
+def _loopback_pub_sub_tiny(log_dir: Path) -> tuple[str, str]:
+    # Tiny objects at high obj/s — stresses per-object Python overhead,
+    # parser/framer hot path. Target rate ~4 Mbps.
+    return _loopback_pub_sub_variant(
+        log_dir, "loopback-pub-sub-tiny",
+        ["-P", "1", "-s", "64", "-r", "8000", "-g", "1000", "-t", "5"],
+        timeout=30,
+    )
+
+
+def _loopback_pub_sub_streams(log_dir: Path) -> tuple[str, str]:
+    # High stream churn: 4 streams × 2000 obj/s with group_size=100
+    # means a new stream every ~50 ms (~400 stream lifecycles over the
+    # run). Stresses stream-open / per-stream byte ring / cleanup.
+    # Target rate ~16 Mbps.
+    return _loopback_pub_sub_variant(
+        log_dir, "loopback-pub-sub-streams",
+        ["-P", "4", "-s", "256", "-r", "2000", "-g", "100", "-t", "5"],
+        timeout=30,
+    )
+
+
+def _loopback_pub_sub_paced(log_dir: Path) -> tuple[str, str]:
+    # Paced high-BW (not saturating): 4 streams × 800 obj/s × 8 KiB =
+    # ~205 Mbps target. Tests flow control + pacer behavior at a real
+    # video-class rate without hitting saturation.
+    return _loopback_pub_sub_variant(
+        log_dir, "loopback-pub-sub-paced",
+        ["-P", "4", "-s", "8192", "-r", "800", "-g", "5000", "-t", "8"],
+        timeout=40,
+    )
 
 
 def _loopback_join(log_dir: Path) -> tuple[str, str]:
@@ -430,6 +482,18 @@ def main() -> int:
             status, detail = _loopback_pub_sub(log_dir)
             record_and_print((status, "loopback-pub-sub", detail,
                               log_dir / "loopback-pub-sub.log"))
+        if "loopback-pub-sub-tiny" in enabled:
+            status, detail = _loopback_pub_sub_tiny(log_dir)
+            record_and_print((status, "loopback-pub-sub-tiny", detail,
+                              log_dir / "loopback-pub-sub-tiny.log"))
+        if "loopback-pub-sub-streams" in enabled:
+            status, detail = _loopback_pub_sub_streams(log_dir)
+            record_and_print((status, "loopback-pub-sub-streams", detail,
+                              log_dir / "loopback-pub-sub-streams.log"))
+        if "loopback-pub-sub-paced" in enabled:
+            status, detail = _loopback_pub_sub_paced(log_dir)
+            record_and_print((status, "loopback-pub-sub-paced", detail,
+                              log_dir / "loopback-pub-sub-paced.log"))
         if "loopback-join" in enabled:
             status, detail = _loopback_join(log_dir)
             record_and_print((status, "loopback-join", detail,
