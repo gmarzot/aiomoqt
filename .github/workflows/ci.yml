@@ -124,8 +124,8 @@ jobs:
           grep -E "Objects: *[0-9]+" /tmp/sub.log | tail -1 \
             | awk '{n=$2+0; if (n < 1000) {print "FAIL: only " n " objects"; exit 1} else {print "OK: " n " objects"}}'
 
-  cross-impl:
-    name: cross-impl interop (cloudflare/moq-rs d14)
+  peer-interop:
+    name: peer interop
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
@@ -200,8 +200,8 @@ jobs:
           pkill -f moq-relay-ietf 2>/dev/null || true
           pkill -f moq-clock-ietf 2>/dev/null || true
 
-  perf-gate:
-    name: perf gate (parser microbench)
+  benchmark:
+    name: benchmark
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
