@@ -42,7 +42,7 @@ class MOQTMessage:
             if with_length:
                 buf.push_uint_var(0)
             return
-        
+
         if major_version > 8:
             pos = buf.tell()
             payload = Buffer(capacity=BUF_SIZE)
@@ -93,7 +93,18 @@ class MOQTMessage:
 
     @staticmethod
     def _extensions_decode(buf: Buffer, with_length: bool = True,
-                           buf_end: int = None) -> Optional[Dict[int, Union[int, bytes]]]:
+                           buf_end: Optional[int] = None) -> Optional[Dict[int, Union[int, bytes]]]:
+        # Two framing modes:
+        #   with_length=True  — Object Extensions (§10.2.1.2): the
+        #     extensions block is `{ Length, Headers }`. Bound is
+        #     read from the wire here.
+        #   with_length=False — d16 Track Extensions on control
+        #     messages (§9.13 etc.): no length on the wire; sequence
+        #     runs to end of the containing message. Caller MUST
+        #     supply buf_end derived from the outer frame length.
+        #     No buf.capacity fallback: capacity is the allocated
+        #     buffer size (e.g. 4 KB), not data length — reading past
+        #     data reads uninitialized heap.
         if with_length:
             pos_before = buf.tell()
             exts_len = buf.pull_uint_var()
@@ -127,21 +138,52 @@ class MOQTMessage:
                 return None
             exts_end = buf.tell() + exts_len
         else:
-            # No length prefix — read until buf_end or buffer exhaustion
-            exts_end = buf_end if buf_end is not None else buf.capacity
+            if buf_end is None:
+                raise ValueError(
+                    "_extensions_decode(with_length=False) requires "
+                    "buf_end from the caller (outer message frame "
+                    "length). buf.capacity is allocated size, not "
+                    "data length — using it reads uninitialized memory."
+                )
+            exts_end = buf_end
+            if buf.tell() == exts_end:
+                return None
 
         exts = {}
         while buf.tell() < exts_end:
-            try:
-                ext_id = buf.pull_uint_var()
-                if ext_id % 2 == 0:
-                    ext_value = buf.pull_uint_var()
-                else:
-                    value_len = buf.pull_uint_var()
-                    ext_value = buf.pull_bytes(value_len)
-                exts[ext_id] = ext_value
-            except BufferReadError:
-                break  # no more extensions to read
+            kvp_start = buf.tell()
+            # BufferReadError (aliased as MOQTUnderflow) means the
+            # underlying buffer ran out mid-pull — the caller's
+            # re-buffering path uses this to wait for more data, so
+            # let it propagate without wrapping.
+            ext_id = buf.pull_uint_var()
+            if ext_id % 2 == 0:
+                # even type → varint value (self-bounded by varint prefix)
+                ext_value = buf.pull_uint_var()
+            else:
+                # odd type → length-prefixed bytes value
+                value_len = buf.pull_uint_var()
+                ext_value = buf.pull_bytes(value_len)
+            if buf.tell() > exts_end:
+                # KVP read succeeded against buf.capacity but crossed
+                # our logical end-of-message — malformed framing.
+                try:
+                    head = buf.data_slice(
+                        kvp_start, min(buf.tell(), kvp_start + 32)
+                    ).hex()
+                except Exception:
+                    head = "<unavailable>"
+                logger.warning(
+                    "MOQT extensions decode overrun: pos=%d exts_end=%d "
+                    "kvp_start=%d ext_id=0x%x head_hex=%s",
+                    buf.tell(), exts_end, kvp_start, ext_id, head,
+                )
+                raise RuntimeError(
+                    f"extensions decode overrun: pos={buf.tell()} "
+                    f"exts_end={exts_end} kvp_start={kvp_start} "
+                    f"ext_id=0x{ext_id:x}"
+                )
+            exts[ext_id] = ext_value
 
         return exts if exts else None
           
@@ -165,8 +207,16 @@ class MOQTMessage:
         return buf.pull_uint_var()
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'MOQTMessage':
-        """Create message from buf containing payload."""
+    def deserialize(cls, buf: Buffer,
+                    buf_end: Optional[int] = None) -> 'MOQTMessage':
+        """Create message from buf containing payload.
+
+        buf_end is the absolute end-of-message position; required by
+        deserialize implementations that parse trailing fields with no
+        wire-level length prefix (d16 Track Extensions in PUBLISH /
+        SUBSCRIBE_OK / FETCH_OK). Other message types accept and
+        ignore it for signature uniformity.
+        """
         raise NotImplementedError()
 
     def serialize(self) -> bytes:

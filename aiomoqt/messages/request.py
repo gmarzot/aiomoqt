@@ -43,7 +43,7 @@ class RequestOk(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'RequestOk':
+    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'RequestOk':
         request_id = buf.pull_uint_var()
         params = MOQTMessage._deserialize_params(buf)
         return cls(request_id=request_id, parameters=params)
@@ -85,7 +85,7 @@ class RequestError(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'RequestError':
+    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'RequestError':
         request_id = buf.pull_uint_var()
         error_code = buf.pull_uint_var()
         retry_interval = buf.pull_uint_var()
@@ -131,7 +131,7 @@ class RequestUpdate(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'RequestUpdate':
+    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'RequestUpdate':
         request_id = buf.pull_uint_var()
         existing_request_id = buf.pull_uint_var()
         params = MOQTMessage._deserialize_params(buf)
@@ -172,7 +172,7 @@ class Namespace(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'Namespace':
+    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'Namespace':
         tuple_len = buf.pull_uint_var()
         namespace_suffix = tuple(
             buf.pull_bytes(buf.pull_uint_var()) for _ in range(tuple_len)
@@ -209,7 +209,7 @@ class NamespaceDone(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer) -> 'NamespaceDone':
+    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'NamespaceDone':
         tuple_len = buf.pull_uint_var()
         namespace_suffix = tuple(
             buf.pull_bytes(buf.pull_uint_var()) for _ in range(tuple_len)

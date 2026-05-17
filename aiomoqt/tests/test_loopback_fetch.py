@@ -231,10 +231,6 @@ def use_quic(request):
 @pytest.mark.asyncio
 async def test_joining_fetch_relative(use_quic):
     """RELATIVE_JOINING fetch: subscribe + join, verify fetched + live objects."""
-    if not use_quic:
-        pytest.skip("WT fetch path returns empty results — known issue, "
-                    "tracked separately. Raw QUIC variant covers the "
-                    "MoQT-level invariant.")
     port = _BASE_PORT + 1 + (0 if use_quic else 100)
     cache = FetchTestCache(num_groups=5, objects_per_group=10, object_size=64)
     server = await _start_server(port, cache, use_quic)
@@ -367,10 +363,6 @@ async def test_fetch_invalid_range(use_quic):
 @pytest.mark.asyncio
 async def test_fetch_done_future(use_quic):
     """session._fetch_done_futures resolves when fetch stream FINs."""
-    if not use_quic:
-        pytest.skip("WT fetch path returns empty results — known issue, "
-                    "tracked separately. Raw QUIC variant covers the "
-                    "MoQT-level invariant.")
     port = _BASE_PORT + 4 + (0 if use_quic else 100)
     cache = FetchTestCache(num_groups=5, objects_per_group=10,
                            object_size=64)

@@ -399,8 +399,12 @@ class _MOQTSessionMixin:
             # Look up message class (version-aware for shared code points)
             message_class, handler = self._get_control_entry(msg_type)
             logger.debug(f"MOQT event: control message: {message_class.__name__} ({msg_len} bytes)")
-            # Deserialize message
-            msg = message_class.deserialize(buf)
+            # Deserialize message. Pass end_pos so trailing fields
+            # without a wire-level length prefix (d16 Track Extensions
+            # in PUBLISH / SUBSCRIBE_OK / FETCH_OK) know where to stop
+            # instead of reading past the payload. Other message types
+            # accept and ignore it for signature uniformity.
+            msg = message_class.deserialize(buf, buf_end=end_pos)
             msg_len += hdr_len
             if end_pos > buf.tell():
                 logger.debug(f"MOQT event: control message: seeking msg end: {end_pos}")
