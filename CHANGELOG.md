@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.9.4 (2026-05-16)
+
+Pairs with [aiopquic 0.3.2](https://pypi.org/project/aiopquic/0.3.2/);
+dep floor `aiopquic>=0.3.1` → `aiopquic>=0.3.2`.
+
+### `_extensions_decode` buf_end plumbing (d16 Track Extensions)
+
+`_extensions_decode(with_length=False)` fell back to `buf.capacity`
+(allocated size, not data length) when no end was supplied — read
+past payload into uninitialized heap. Surfaced as a macOS test-order
+flake where prior-test bytes shaped like a valid KVP overwrote the
+real value. d16 §9.13 has no sequence terminator on Track
+Extensions; the bound must come from the outer frame length.
+
+Fix: `_extensions_decode` requires `buf_end` when `with_length=False`;
+raises on overrun with diagnostic logs. Every control-message
+`deserialize` now takes `buf_end: Optional[int] = None` uniformly;
+the dispatcher always passes it.
+
+### Perf
+
+Single drain coroutine, `next_object_bytes` push API, event-driven
+TX backpressure — paired with aiopquic 0.3.2's GSO send_length_max,
+Cython `parse_object_subgroup`/`drain_rx_callback`, and SPSC
+TX-drain wakeup.
+
+### Test hygiene
+
+Four stale WT `pytest.skip("WT fetch path returns empty results")`
+blocks removed — the underlying picoquic_close UAF is fixed in
+aiopquic 0.3.2. **195 passed / 0 skipped** (was 191/4).
+
+### Verification
+
+Pytest 195/0/0; regression unit + integration green; interop
+`moqx-main` and `moxygen-fb` both 6/6 ctrl + 3/3 pub-sub on all
+4 corners (d14/d16 × WT/raw-QUIC); linux + macOS argo confirmed.
+
 ## v0.9.3 (2026-05-13)
 
 Pairs with [aiopquic 0.3.1](https://pypi.org/project/aiopquic/0.3.1/);
