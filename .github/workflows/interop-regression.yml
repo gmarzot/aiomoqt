@@ -12,11 +12,13 @@ on:
   workflow_dispatch:
   schedule:
     - cron: '17 3 * * 1'    # Mondays 03:17 UTC
-  # PR opt-in: contributors add the `ci:run-interop` label when their
-  # change touches wire-format or session-protocol code. Avoids burning
-  # the weekly slot AND avoids hitting public relays on every doc PR.
+  # PR opt-in: maintainer adds the `ci:run-interop` label when a PR
+  # touches wire-format or session-protocol code. Triggers only on
+  # the label event (not synchronize), so PR sync doesn't fire a
+  # skipped run in the actions list. To re-run interop after new
+  # commits on a labeled PR, toggle the label off and on.
   pull_request:
-    types: [labeled, synchronize]
+    types: [labeled]
 
 jobs:
   interop:
