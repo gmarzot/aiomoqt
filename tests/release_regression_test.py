@@ -161,26 +161,17 @@ def _loopback_setup(log_dir: Path) -> tuple[str, str]:
                         log_dir / "loopback-setup.log")
 
 
-def _loopback_pub_sub(log_dir: Path) -> tuple[str, str]:
-    log = log_dir / "loopback-pub-sub.log"
-    cmd = [
-        "python", "-m", "aiomoqt.examples.loopback_bench",
-        "-P", "4", "-s", "16384", "-r", "60", "-t", "10",
-    ]
-    ok, _ = _run(cmd, log, 40)
-    text = log.read_text()
-    m = re.search(r"Throughput:\s+([\d.]+)\s*Mbps", text)
-    no_loss = "Lost:        0 (0.00%)" in text
-    tput = m.group(1) if m else "?"
-    return ("PASS" if ok and no_loss else "FAIL"), f"{tput} Mbps"
-
-
 def _loopback_pub_sub_variant(log_dir: Path, slug: str, flags: list[str],
-                                timeout: int) -> tuple[str, str]:
-    """Generic runner for loopback_bench variants."""
+                              timeout: int, port: int) -> tuple[str, str]:
+    """Generic runner for loopback_bench variants.
+
+    port is passed via -p so multiple variants can run concurrently
+    without port collisions (see --integration-parallel).
+    """
     log = log_dir / f"{slug}.log"
     cmd = [
         "python", "-m", "aiomoqt.examples.loopback_bench",
+        "-p", str(port),
         *flags,
     ]
     ok, _ = _run(cmd, log, timeout)
@@ -191,13 +182,22 @@ def _loopback_pub_sub_variant(log_dir: Path, slug: str, flags: list[str],
     return ("PASS" if ok and no_loss else "FAIL"), f"{tput} Mbps"
 
 
+def _loopback_pub_sub(log_dir: Path) -> tuple[str, str]:
+    # Baseline: mid-size, mid-rate, paced. ~31 Mbps.
+    return _loopback_pub_sub_variant(
+        log_dir, "loopback-pub-sub",
+        ["-P", "4", "-s", "16384", "-r", "60", "-t", "10"],
+        timeout=40, port=4434,
+    )
+
+
 def _loopback_pub_sub_tiny(log_dir: Path) -> tuple[str, str]:
     # Tiny objects at high obj/s — stresses per-object Python overhead,
     # parser/framer hot path. Target rate ~4 Mbps.
     return _loopback_pub_sub_variant(
         log_dir, "loopback-pub-sub-tiny",
         ["-P", "1", "-s", "64", "-r", "8000", "-g", "1000", "-t", "5"],
-        timeout=30,
+        timeout=30, port=4435,
     )
 
 
@@ -209,7 +209,7 @@ def _loopback_pub_sub_streams(log_dir: Path) -> tuple[str, str]:
     return _loopback_pub_sub_variant(
         log_dir, "loopback-pub-sub-streams",
         ["-P", "4", "-s", "256", "-r", "2000", "-g", "100", "-t", "5"],
-        timeout=30,
+        timeout=30, port=4436,
     )
 
 
@@ -220,8 +220,21 @@ def _loopback_pub_sub_paced(log_dir: Path) -> tuple[str, str]:
     return _loopback_pub_sub_variant(
         log_dir, "loopback-pub-sub-paced",
         ["-P", "4", "-s", "8192", "-r", "800", "-g", "5000", "-t", "8"],
-        timeout=40,
+        timeout=40, port=4437,
     )
+
+
+# Suite-name -> (runner_func, log_basename). Drives both sequential
+# and parallel integration-tier dispatch.
+INTEGRATION_DISPATCH = {
+    "loopback-setup":           (_loopback_setup,           "loopback-setup.log"),
+    "loopback-pub-sub":         (_loopback_pub_sub,         "loopback-pub-sub.log"),
+    "loopback-pub-sub-tiny":    (_loopback_pub_sub_tiny,    "loopback-pub-sub-tiny.log"),
+    "loopback-pub-sub-streams": (_loopback_pub_sub_streams, "loopback-pub-sub-streams.log"),
+    "loopback-pub-sub-paced":   (_loopback_pub_sub_paced,   "loopback-pub-sub-paced.log"),
+    "loopback-join":            (_loopback_join,            "loopback-join.log"),
+    "loopback-fetch":           (_loopback_fetch,           "loopback-fetch.log"),
+}
 
 
 def _loopback_join(log_dir: Path) -> tuple[str, str]:
@@ -420,6 +433,11 @@ def main() -> int:
     ap.add_argument("--interop-parallel", type=int, default=4,
                     metavar="N", help="relays to run concurrently in the "
                                       "interop tier (default: 4)")
+    ap.add_argument("--integration-parallel", type=int, default=1,
+                    metavar="N", help="loopback suites to run "
+                                      "concurrently in the integration "
+                                      "tier (default: 1 = sequential; "
+                                      "set 4 in CI for ~3x wall speedup)")
     args = ap.parse_args()
 
     if args.test_tiers or args.test_suites:
@@ -474,34 +492,30 @@ def main() -> int:
     # --- integration tier ---
     if enabled & set(TIERS["integration"]):
         print("\n== integration ==")
-        if "loopback-setup" in enabled:
-            status, detail = _loopback_setup(log_dir)
-            record_and_print((status, "loopback-setup", detail,
-                              log_dir / "loopback-setup.log"))
-        if "loopback-pub-sub" in enabled:
-            status, detail = _loopback_pub_sub(log_dir)
-            record_and_print((status, "loopback-pub-sub", detail,
-                              log_dir / "loopback-pub-sub.log"))
-        if "loopback-pub-sub-tiny" in enabled:
-            status, detail = _loopback_pub_sub_tiny(log_dir)
-            record_and_print((status, "loopback-pub-sub-tiny", detail,
-                              log_dir / "loopback-pub-sub-tiny.log"))
-        if "loopback-pub-sub-streams" in enabled:
-            status, detail = _loopback_pub_sub_streams(log_dir)
-            record_and_print((status, "loopback-pub-sub-streams", detail,
-                              log_dir / "loopback-pub-sub-streams.log"))
-        if "loopback-pub-sub-paced" in enabled:
-            status, detail = _loopback_pub_sub_paced(log_dir)
-            record_and_print((status, "loopback-pub-sub-paced", detail,
-                              log_dir / "loopback-pub-sub-paced.log"))
-        if "loopback-join" in enabled:
-            status, detail = _loopback_join(log_dir)
-            record_and_print((status, "loopback-join", detail,
-                              log_dir / "loopback-join.log"))
-        if "loopback-fetch" in enabled:
-            status, detail = _loopback_fetch(log_dir)
-            record_and_print((status, "loopback-fetch", detail,
-                              log_dir / "loopback-fetch.log"))
+        integ_suites = [s for s in TIERS["integration"] if s in enabled]
+        workers = max(1, args.integration_parallel)
+        if workers == 1 or len(integ_suites) <= 1:
+            # Sequential — preserves prior behavior + ordering.
+            for name in integ_suites:
+                func, log_name = INTEGRATION_DISPATCH[name]
+                status, detail = func(log_dir)
+                record_and_print((status, name, detail,
+                                  log_dir / log_name))
+        else:
+            # Parallel — distinct ports per loopback variant let the
+            # variants run concurrently without bind collisions.
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=workers) as ex:
+                futures = {
+                    ex.submit(INTEGRATION_DISPATCH[name][0], log_dir): name
+                    for name in integ_suites
+                }
+                for fut in concurrent.futures.as_completed(futures):
+                    name = futures[fut]
+                    _, log_name = INTEGRATION_DISPATCH[name]
+                    status, detail = fut.result()
+                    record_and_print((status, name, detail,
+                                      log_dir / log_name))
 
     # --- interop tier (parallel per relay) ---
     # Per-suite progress prints live from worker threads via _progress().

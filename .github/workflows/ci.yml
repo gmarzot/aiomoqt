@@ -60,8 +60,12 @@ jobs:
             -days 1 -subj "/CN=localhost"
       - name: Run unit + integration tiers
         run: |
+          # --integration-parallel 4: loopback variants use distinct
+          # ports and run concurrently in a ThreadPoolExecutor. Cuts
+          # integration tier wall time ~3x (slowest suite is the floor).
           python tests/release_regression_test.py \
-            --test-tier unit --test-tier integration
+            --test-tier unit --test-tier integration \
+            --integration-parallel 4
       - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
