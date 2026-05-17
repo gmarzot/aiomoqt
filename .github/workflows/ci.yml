@@ -1,4 +1,3 @@
-name: CI
 
 # Fires on pull_request and on push to main. Runs the unit +
 # integration tiers across supported Python versions. No publish /
