@@ -1,6 +1,6 @@
 from ..types import *
 from .base import *
-from .setup import *
+from .session_setup import *
 from .namespace import *
 from .subscribe import *
 from .publish import *
