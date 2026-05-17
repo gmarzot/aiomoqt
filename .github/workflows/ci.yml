@@ -109,7 +109,10 @@ jobs:
             --draft 16 --quic > /tmp/pub-srv.log 2>&1 &
           PUB_PID=$!
           sleep 1.5
-          timeout 14 python -m aiomoqt.examples.sub_bench \
+          # sub_bench self-times out via -t 12; don't wrap with the
+          # external `timeout` binary (macOS lacks it by default and
+          # would silently skip the run, producing a false-pass).
+          python -m aiomoqt.examples.sub_bench \
             -Q --draft 16 -n bench --trackname track \
             -t 12 -i 5 moqt://localhost:4434 \
             > /tmp/sub.log 2>&1 || true
@@ -120,9 +123,14 @@ jobs:
           tail -20 /tmp/pub-srv.log
           # Require at least 100 objects delivered in 12 s. The path
           # works when non-zero; threshold gives generous margin for
-          # variable CI runner perf (Linux ubuntu-latest hosts can be
-          # very slow at times).
-          grep -E "Objects: *[0-9]+" /tmp/sub.log | tail -1 \
+          # variable CI runner perf. Fails loudly when no Objects line
+          # was emitted at all (sub_bench failed to start / connect).
+          LINE=$(grep -E "Objects: *[0-9]+" /tmp/sub.log | tail -1)
+          if [ -z "$LINE" ]; then
+            echo "FAIL: no 'Objects:' line in sub.log — sub_bench did not run"
+            exit 1
+          fi
+          echo "$LINE" \
             | awk '{n=$2+0; if (n < 100) {print "FAIL: only " n " objects"; exit 1} else {print "OK: " n " objects"}}'
 
   peer-interop:
