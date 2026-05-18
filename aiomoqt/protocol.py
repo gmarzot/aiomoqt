@@ -36,6 +36,14 @@ USER_AGENT = f"aiomoqt/{version('aiomoqt')}"
 logger = get_logger(__name__)
 
 
+# Producer-side bytes cap on the aiopquic TX SPSC ring. Used as the
+# default for MOQTPeer.tx_max_inflight_bytes. 2 MB corresponds to ~10 ms
+# of queue at 1.6 Gbps drain — a workable starting point across typical
+# bandwidths. A future tx_target_latency_ms API will derive the byte
+# budget from a latency target + auto-tracked drain rate.
+DEFAULT_TX_MAX_INFLIGHT_BYTES = 2_000_000
+
+
 class MOQTStreamReject(Exception):
     """Raised by the data-stream parser when an incoming uni stream fails
     MoQT-level admission (unknown request_id/track_alias, budget exceeded,
@@ -56,7 +64,8 @@ class MOQTPeer:
     """MOQT client and server base-class."""
     def __init__(self, allow_optional_dgram: bool = False,
                  libquicr_compat: bool = False,
-                 tx_max_inflight_bytes: Optional[int] = 2_000_000):
+                 tx_max_inflight_bytes: Optional[int] =
+                     DEFAULT_TX_MAX_INFLIGHT_BYTES):
         #  message handlers
         self._control_msg_handlers: Dict[int, Tuple[Type, Callable]] = {}
         self.allow_optional_dgram = allow_optional_dgram
