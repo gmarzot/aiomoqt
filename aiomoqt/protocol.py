@@ -1238,6 +1238,14 @@ class _MOQTSessionMixin:
             try:
                 self._quic.send_stream_data(
                     stream_id, data, end_stream=end_stream)
+                # Soft backpressure: release the GIL when the picoquic
+                # worker has TX entries pending. Without this, a fast
+                # publish loop can monopolize the event loop on Python
+                # paths where send_stream_data succeeds repeatedly
+                # without ever awaiting (no hard BufferError), starving
+                # the worker.
+                if self._quic.tx_pressure(stream_id) > 0.5:
+                    await asyncio.sleep(0)
                 return
             except BufferError:
                 if event is not None:

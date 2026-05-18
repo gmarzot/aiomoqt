@@ -5,19 +5,23 @@
 Pairs with [aiopquic 0.3.3](https://pypi.org/project/aiopquic/0.3.3/);
 dep floor `aiopquic>=0.3.2` → `aiopquic>=0.3.3`.
 
-### Publisher `r=0` yield heuristic — pressure-based
+### Pressure-based yield in `stream_write_drain`
 
 `PublishedTrack._generate_subgroup` previously yielded with
 `asyncio.sleep(0)` every 64 objects on the unbounded-rate (`-r 0`)
-path. On fast Python publish loops the count-based yield can starve
-the picoquic worker thread between yields, capping single-stream
-throughput well below the transport ceiling.
+path. On fast Python publish loops that count-based heuristic can
+starve the picoquic worker between yields, capping throughput well
+below the transport ceiling.
 
-Switch to `session._quic.tx_pressure(stream_id) > 0.5` as the yield
-trigger. The publisher releases the GIL whenever aiopquic reports
-its TX-ring is filling, regardless of how many objects have been
-sent. Bounded-rate (`-r N>0`) callers are unchanged — they pace via
-`asyncio.sleep(1/rate)` as before.
+`MOQTSession.stream_write_drain` now performs a soft pressure-based
+yield: after a successful (non-`BufferError`) write, it checks
+`tx_pressure(stream_id)` and `await asyncio.sleep(0)` if pressure
+exceeds 0.5. Every aiomoqt sender benefits — including third-party
+publishers that drive the API directly, not just `PublishedTrack`.
+
+The count-based `else: ... asyncio.sleep(0)` block in
+`_generate_subgroup` is removed; bounded-rate (`-r N>0`) callers pace
+via `asyncio.sleep(1/rate)` as before.
 
 ## v0.9.4 (2026-05-16)
 
