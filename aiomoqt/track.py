@@ -432,7 +432,13 @@ class PublishedTrack(Track):
                     sleep_time = max(0, next_frame_time - time.monotonic())
                     await asyncio.sleep(sleep_time)
                 else:
-                    if local_sent % 64 == 0:
+                    # Pressure-based yield: release the GIL when the
+                    # picoquic worker has pending TX entries to drain.
+                    # A pure count-based yield can starve the worker
+                    # on fast Python paths (one syscall sending many
+                    # objects per batch), so use the soft signal from
+                    # aiopquic instead.
+                    if session._quic.tx_pressure(stream_id) > 0.5:
                         await asyncio.sleep(0)
 
         except asyncio.CancelledError:
@@ -838,7 +844,13 @@ class VideoTrack(PublishedTrack):
                         next_frame_time - time.monotonic())
                     await asyncio.sleep(sleep_time)
                 else:
-                    if local_sent % 64 == 0:
+                    # Pressure-based yield: release the GIL when the
+                    # picoquic worker has pending TX entries to drain.
+                    # A pure count-based yield can starve the worker
+                    # on fast Python paths (one syscall sending many
+                    # objects per batch), so use the soft signal from
+                    # aiopquic instead.
+                    if session._quic.tx_pressure(stream_id) > 0.5:
                         await asyncio.sleep(0)
 
         except asyncio.CancelledError:

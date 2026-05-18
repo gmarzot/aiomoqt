@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.9.5 (unreleased)
+
+Pairs with [aiopquic 0.3.3](https://pypi.org/project/aiopquic/0.3.3/);
+dep floor `aiopquic>=0.3.2` → `aiopquic>=0.3.3`.
+
+### Publisher `r=0` yield heuristic — pressure-based
+
+`PublishedTrack._generate_subgroup` previously yielded with
+`asyncio.sleep(0)` every 64 objects on the unbounded-rate (`-r 0`)
+path. On fast Python publish loops the count-based yield can starve
+the picoquic worker thread between yields, capping single-stream
+throughput well below the transport ceiling.
+
+Switch to `session._quic.tx_pressure(stream_id) > 0.5` as the yield
+trigger. The publisher releases the GIL whenever aiopquic reports
+its TX-ring is filling, regardless of how many objects have been
+sent. Bounded-rate (`-r N>0`) callers are unchanged — they pace via
+`asyncio.sleep(1/rate)` as before.
+
 ## v0.9.4 (2026-05-16)
 
 Pairs with [aiopquic 0.3.2](https://pypi.org/project/aiopquic/0.3.2/);
