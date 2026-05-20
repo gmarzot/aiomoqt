@@ -39,15 +39,7 @@ jobs:
     - uses: actions/checkout@v4
       with:
         fetch-depth: 0
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: "3.14"
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install pytest
-        pip install -e .
+    - uses: ./.github/actions/setup-aiomoqt
     - name: Run interop-tier regression
       run: python tests/release_regression_test.py --test-tier interop
     - name: Upload logs on failure
