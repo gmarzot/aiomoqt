@@ -29,6 +29,13 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Opt every job + every third-party action into the Node 24 runtime
+# ahead of GitHub's 2026-06-02 hard cutover (Node 20 removed entirely
+# 2026-09-16). One env beats per-action version cherry-picking and
+# covers actions that haven't shipped a Node-24 release yet.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   core:
     name: core / ${{ matrix.os }} / py${{ matrix.python-version }}
