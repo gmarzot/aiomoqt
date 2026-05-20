@@ -36,6 +36,14 @@ USER_AGENT = f"aiomoqt/{version('aiomoqt')}"
 logger = get_logger(__name__)
 
 
+# Producer-side bytes cap on the aiopquic TX SPSC ring. Used as the
+# default for MOQTPeer.tx_max_inflight_bytes. 2 MB corresponds to ~10 ms
+# of queue at 1.6 Gbps drain — a workable starting point across typical
+# bandwidths. A future tx_target_latency_ms API will derive the byte
+# budget from a latency target + auto-tracked drain rate.
+DEFAULT_TX_MAX_INFLIGHT_BYTES = 2_000_000
+
+
 class MOQTStreamReject(Exception):
     """Raised by the data-stream parser when an incoming uni stream fails
     MoQT-level admission (unknown request_id/track_alias, budget exceeded,
@@ -54,11 +62,29 @@ class MOQTStreamReject(Exception):
 # base class for client and server session objects
 class MOQTPeer:
     """MOQT client and server base-class."""
-    def __init__(self, allow_optional_dgram: bool = False, libquicr_compat: bool = False):
+    def __init__(self, allow_optional_dgram: bool = False,
+                 libquicr_compat: bool = False,
+                 tx_max_inflight_bytes: Optional[int] =
+                     DEFAULT_TX_MAX_INFLIGHT_BYTES):
         #  message handlers
         self._control_msg_handlers: Dict[int, Tuple[Type, Callable]] = {}
         self.allow_optional_dgram = allow_optional_dgram
         self.libquicr_compat = libquicr_compat
+        # Bytes-aware producer backpressure target. When set,
+        # MOQTSession.stream_write_drain awaits a TX-ring drain before
+        # pushing more bytes once aiopquic reports tx_pending_bytes()
+        # above this threshold. Independent of the SPSC ring's entry
+        # capacity (settable via QuicConfiguration.event_ring_capacity).
+        #
+        # Default 2 MB corresponds to ~10 ms of queue at 1.6 Gbps drain
+        # — a reasonable starting point across typical workloads. Pass
+        # None to opt out of the byte cap entirely (the ring's entry
+        # capacity becomes the only backpressure boundary).
+        #
+        # Sizing: target_latency_ms * target_throughput_bytes_per_sec.
+        # Future API (0.9.6+): tx_target_latency_ms with auto-tracked
+        # drain rate, so callers can express the budget directly.
+        self.tx_max_inflight_bytes = tx_max_inflight_bytes
 
     def register_handler(self, msg_type: int, handler: Callable) -> None:
         """Register a custom message handler."""
@@ -1233,11 +1259,41 @@ class _MOQTSessionMixin:
         while True:
             if not self._session_writable():
                 return
+            # Bytes-aware producer backpressure. When the caller has
+            # set MOQTPeer.tx_max_inflight_bytes and the TX-ring's
+            # pending byte total exceeds it, wait for a drain rather
+            # than queuing more. Bounds queue-time-in-flight to
+            # (max_inflight_bytes / drain_rate) regardless of object
+            # size or ring entry capacity. Independent of the ring-
+            # entry-count threshold below.
+            max_bytes = self._session.tx_max_inflight_bytes
+            if (event is not None and max_bytes is not None
+                    and self._quic.tx_pending_bytes(stream_id) > max_bytes):
+                event.clear()
+                await event.wait()
+                continue
+            # Above the hard event-ratio threshold, also wait for a
+            # drain — bounds ring fill independent of object size.
+            # This is the ring-saturation guard; the byte-bound check
+            # above kicks in earlier for latency-sensitive callers.
+            if (event is not None
+                    and self._quic.tx_pressure(stream_id) > 0.9):
+                event.clear()
+                await event.wait()
+                continue
             if event is not None:
                 event.clear()
             try:
                 self._quic.send_stream_data(
                     stream_id, data, end_stream=end_stream)
+                # Soft backpressure: release the GIL when the picoquic
+                # worker has TX entries pending. Without this, a fast
+                # publish loop can monopolize the event loop on Python
+                # paths where send_stream_data succeeds repeatedly
+                # without ever awaiting (no hard BufferError), starving
+                # the worker.
+                if self._quic.tx_pressure(stream_id) > 0.5:
+                    await asyncio.sleep(0)
                 return
             except BufferError:
                 if event is not None:

@@ -15,6 +15,13 @@ on:
         required: true
         type: string
 
+# Opt every job + every third-party action into the Node 24 runtime
+# ahead of GitHub's 2026-06-02 hard cutover (Node 20 removed entirely
+# 2026-09-16). One env beats per-action version cherry-picking and
+# covers actions that haven't shipped a Node-24 release yet.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   tag:
     runs-on: ubuntu-latest
@@ -57,14 +64,9 @@ jobs:
       with:
         ref: ${{ needs.tag.outputs.version }}
         fetch-depth: 0
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
+    - uses: ./.github/actions/setup-aiomoqt
       with:
         python-version: ${{ matrix.python-version }}
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -e '.[test]'
     - name: Generate self-signed cert for loopback
       run: |
         mkdir -p certs

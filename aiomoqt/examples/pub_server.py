@@ -67,6 +67,12 @@ def parse_args():
         '-r', '--rate', type=float, default=0,
         help='Objects/sec per stream (0=max, default: max)')
     parser.add_argument(
+        '--max-inflight-bytes', type=int, default=None,
+        help='Producer backpressure: pause once aiopquic reports this '
+             'many bytes pending in the TX ring (default: unbounded). '
+             'Bounds queue depth and tail latency. e.g. 2_000_000 ~10ms '
+             '@ 1.6 Gbps.')
+    parser.add_argument(
         '-Q', '--quic', action='store_true',
         help='Serve raw QUIC (aiopquic) instead of H3/WebTransport')
     parser.add_argument(
@@ -131,6 +137,7 @@ async def main():
         certificate=args.cert, private_key=args.key,
         path="/",
         use_quic=args.quic,
+        tx_max_inflight_bytes=args.max_inflight_bytes,
         draft_version=args.draft,
     )
     server.register_handler(

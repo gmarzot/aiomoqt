@@ -1,0 +1,36 @@
+name: 'Set up aiomoqt env'
+description: >
+  Set up Python with pip cache, then install aiomoqt in editable mode
+  with the requested extras. Centralizes the env-setup dance that
+  every CI job in this repo would otherwise repeat.
+
+inputs:
+  python-version:
+    description: 'Python version to install (e.g. "3.14", "3.13", "3.12")'
+    required: false
+    default: '3.14'
+  extras:
+    description: >
+      Pip install extras key (e.g. "test" → installs ".[test]").
+      Use "" to install with no extras.
+    required: false
+    default: 'test'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Python ${{ inputs.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+        cache: 'pip'
+        cache-dependency-path: 'pyproject.toml'
+    - name: Install aiomoqt (editable)
+      shell: bash
+      run: |
+        python -m pip install --upgrade pip
+        if [ -n "${{ inputs.extras }}" ]; then
+          pip install -e ".[${{ inputs.extras }}]"
+        else
+          pip install -e .
+        fi

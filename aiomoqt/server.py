@@ -25,8 +25,9 @@ class MOQTServer(MOQTPeer):
         use_quic: Optional[bool] = False,
         draft_version: Optional[int] = None,
         debug: Optional[bool] = False,
+        tx_max_inflight_bytes: Optional[int] = None,
     ):
-        super().__init__()
+        super().__init__(tx_max_inflight_bytes=tx_max_inflight_bytes)
         self.host = host
         self.port = port
         self.path = path
