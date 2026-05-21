@@ -1,14 +1,21 @@
-"""SIGUSR1 asyncio task-dump diagnostic.
+"""SIGUSR1 / SIGUSR2 diagnostic signal handlers.
 
-When AIOMOQT_TASK_DUMP=1 is set, install() registers a SIGUSR1 handler
-that prints every asyncio Task's stack to stderr. Send the signal during
-a hang to see exactly what every coroutine is awaiting:
+When AIOMOQT_TASK_DUMP=1 is set, install() registers:
 
-    kill -USR1 <pid>
+  SIGUSR1: asyncio task-dump. Prints every asyncio Task's stack to
+    stderr — use for "what's every coroutine awaiting" diagnosis.
+        kill -USR1 <pid>
 
-Default-off so production runs aren't surprised by a registered signal
-handler they didn't ask for. Idempotent: calling install() twice with
-the env var set just re-registers the same handler.
+  SIGUSR2: aiopquic counter-dump. Walks the live TransportContext
+    registry and prints per-context forensic counters (tx_ring
+    pushes/pops/arms/fires, wake calls, sc->tx drain arms/fires,
+    ns-resolution timestamps). Use to localize wake-chain stalls:
+    arms-without-fires, pops-without-pushes, etc.
+        kill -USR2 <pid>
+
+Default-off so production runs aren't surprised by registered signal
+handlers they didn't ask for. Idempotent: calling install() twice
+with the env var set just re-registers the same handlers.
 """
 from __future__ import annotations
 
@@ -18,14 +25,14 @@ import sys
 
 
 def install() -> bool:
-    """Register the SIGUSR1 handler iff AIOMOQT_TASK_DUMP=1 in env.
+    """Register SIGUSR1 + SIGUSR2 handlers iff AIOMOQT_TASK_DUMP=1.
 
     Returns True if installed, False otherwise.
     """
     if not os.environ.get("AIOMOQT_TASK_DUMP"):
         return False
 
-    def _dump(signum, frame):
+    def _dump_tasks(signum, frame):
         import asyncio
         try:
             tasks = list(asyncio.all_tasks())
@@ -54,9 +61,31 @@ def install() -> bool:
         print("=== end task-dump ===\n", file=sys.stderr)
         sys.stderr.flush()
 
-    signal.signal(signal.SIGUSR1, _dump)
+    def _dump_counters(signum, frame):
+        # Lazy import — aiopquic may not be importable in every
+        # context that loads aiomoqt (tests, tooling). Failing here
+        # should not break the SIGUSR1 task-dump path.
+        try:
+            from aiopquic._binding._transport import dump_all_counters
+        except ImportError as e:
+            print(f"(SIGUSR2 counter-dump: aiopquic unavailable: {e})",
+                  file=sys.stderr, flush=True)
+            return
+        print(f"\n=== aiopquic counter-dump (SIGUSR2) ===",
+              file=sys.stderr, flush=True)
+        try:
+            dump_all_counters(file=sys.stderr)
+        except Exception as e:
+            print(f"(SIGUSR2 counter-dump failed: {e})",
+                  file=sys.stderr, flush=True)
+        print("=== end counter-dump ===\n",
+              file=sys.stderr, flush=True)
+
+    signal.signal(signal.SIGUSR1, _dump_tasks)
+    signal.signal(signal.SIGUSR2, _dump_counters)
     print(
-        "(AIOMOQT_TASK_DUMP=1: SIGUSR1 will dump asyncio task stacks)",
+        "(AIOMOQT_TASK_DUMP=1: SIGUSR1=task stacks, "
+        "SIGUSR2=aiopquic counters)",
         file=sys.stderr,
     )
     return True
