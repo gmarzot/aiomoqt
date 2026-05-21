@@ -89,6 +89,8 @@ class MOQTClient(MOQTPeer):
                     max_datagram_frame_size=64 * 1024,
                     server_name=self.host,
                     secrets_log_file=self.keylog_filename,
+                    # See server.py note: BBR over NewReno.
+                    congestion_control_algorithm="bbr",
                 )
             protocol = lambda *a, **kw: MOQTSessionQuic(*a, **kw, session=self)
             # quic_debug_log not wired on raw-QUIC path yet: aiopquic

@@ -59,6 +59,13 @@ class MOQTServer(MOQTPeer):
                 alpn_protocols=alpn, is_client=False,
                 max_data=2**24, max_stream_data=2**24,
                 max_datagram_frame_size=64 * 1024,
+                # BBR over picoquic's default NewReno. NewReno collapses
+                # to cwin=2*MSS on misdetected loss (e.g. GIL contention
+                # spiking loopback RTT 10000x), then can't recover and
+                # the connection enters an RTO storm until disconnect.
+                # BBR's delay-based behavior tolerates transient RTT
+                # spikes without collapsing.
+                congestion_control_algorithm="bbr",
             )
             cfg.load_cert_chain(self.certificate, self.private_key)
             protocol = lambda *a, **kw: MOQTSessionQuic(*a, **kw, session=self)
