@@ -336,6 +336,12 @@ async def run(args):
                  else logging.WARNING)
     set_log_level(log_level)
 
+    # AIOMOQT_TASK_DUMP=1 installs a SIGUSR1 handler that dumps every
+    # asyncio task's stack to stderr. Useful for diagnosing hangs:
+    # `kill -USR1 <pid>` while the bench is stuck. No-op when unset.
+    from aiomoqt.utils.taskdump import install as _install_task_dump
+    _install_task_dump()
+
     relay = parse_relay_url(
         args.relay, force_quic=args.force_quic)
     stats = BenchStats(report_interval=args.interval)

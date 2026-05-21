@@ -18,6 +18,9 @@ dependencies = [
 Homepage = "https://github.com/gmarzot/aiomoqt"
 Repository = "https://github.com/gmarzot/aiomoqt.git"
 
+[project.scripts]
+aiomoqt-versions = "aiomoqt.versions:main"
+
 [project.optional-dependencies]
 test = [
     "pytest",

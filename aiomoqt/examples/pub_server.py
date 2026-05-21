@@ -112,7 +112,15 @@ async def _on_subscribe(session, msg, args):
     track._generating = True
     logger.info(f"Subscriber connected, generating data "
                 f"({args.object_size}B x {args.streams} streams)")
-    await track.generate(session, ok.track_alias)
+    try:
+        await track.generate(session, ok.track_alias)
+    except BaseException as e:
+        import sys, traceback
+        print(f"\n=== _on_subscribe: track.generate raised {type(e).__name__}: {e} ===",
+              file=sys.stderr, flush=True)
+        traceback.print_exc(file=sys.stderr)
+        print("=== end ===\n", file=sys.stderr, flush=True)
+        raise
 
 
 async def main():
@@ -121,6 +129,12 @@ async def main():
     args = parse_args()
     log_level = logging.DEBUG if args.debug else logging.WARNING
     set_log_level(log_level)
+
+    # AIOMOQT_TASK_DUMP=1 installs a SIGUSR1 handler that dumps every
+    # asyncio task's stack to stderr. Useful for diagnosing hangs:
+    # `kill -USR1 <pid>` while the server is stuck. No-op when unset.
+    from aiomoqt.utils.taskdump import install as _install_task_dump
+    _install_task_dump()
 
     if not args.cert or not args.key:
         print("Error: TLS certificate required. "
@@ -158,8 +172,9 @@ async def main():
         print(f"  python -m aiomoqt.examples.sub_bench "
               f"moqt://{args.host}:{args.port} -t 30 -i 5 --draft {args.draft} -k")
     else:
+        # WT path matches MOQTServer(path="/") above; no /moq suffix.
         print(f"  python -m aiomoqt.examples.sub_bench "
-              f"https://{args.host}:{args.port}/moq -t 30 -i 5 -k")
+              f"https://{args.host}:{args.port}/ -t 30 -i 5 --draft {args.draft} -k")
 
     try:
         await asyncio.Event().wait()
