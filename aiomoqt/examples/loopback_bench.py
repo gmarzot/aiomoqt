@@ -69,6 +69,14 @@ def parse_args():
         '--key', type=str, default=KEY)
     parser.add_argument(
         '-d', '--debug', action='store_true')
+    parser.add_argument(
+        '--quic', action='store_true',
+        help='Use raw QUIC instead of WebTransport (default: WT)')
+    parser.add_argument(
+        '--cc-algo', type=str, default='bbr',
+        help='Congestion control algorithm '
+             '(bbr | bbr1 | newreno | cubic | dcubic | prague | fast). '
+             'Default: bbr')
     return parser.parse_args()
 
 
@@ -120,6 +128,8 @@ async def run_server(args):
         host="localhost", port=args.port,
         certificate=args.cert, private_key=args.key,
         path="/",
+        use_quic=args.quic,
+        congestion_control_algorithm=args.cc_algo,
     )
     server.register_handler(
         MOQTMessageType.SUBSCRIBE,
@@ -132,8 +142,10 @@ async def run_subscriber(args, stats):
     client = MOQTClient(
         "localhost", args.port,
         path="/",
+        use_quic=args.quic,
         verify_tls=False,
         debug=args.debug,
+        congestion_control_algorithm=args.cc_algo,
     )
 
     try:
@@ -161,6 +173,11 @@ async def main():
     args = parse_args()
     log_level = logging.DEBUG if args.debug else logging.WARNING
     set_log_level(log_level)
+
+    # AIOMOQT_TASK_DUMP=1 installs SIGUSR1 (task stacks) + SIGUSR2
+    # (aiopquic counters) handlers. No-op when env not set.
+    from aiomoqt.utils.taskdump import install as _install_task_dump
+    _install_task_dump()
 
     stats = BenchStats(report_interval=args.interval)
     print_banner(args)

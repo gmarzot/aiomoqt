@@ -93,6 +93,11 @@ def parse_args():
     parser.add_argument(
         '-d', '--debug', action='store_true',
         help='Enable debug output')
+    parser.add_argument(
+        '--cc-algo', type=str, default='bbr',
+        help='Congestion control algorithm '
+             '(bbr | bbr1 | newreno | cubic | dcubic | prague | fast). '
+             'Default: bbr')
     return parser.parse_args()
 
 
@@ -153,6 +158,7 @@ async def main():
         use_quic=args.quic,
         tx_max_inflight_bytes=args.max_inflight_bytes,
         draft_version=args.draft,
+        congestion_control_algorithm=args.cc_algo,
     )
     server.register_handler(
         MOQTMessageType.SUBSCRIBE,

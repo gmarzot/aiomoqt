@@ -1112,6 +1112,7 @@ async def run_loopback_server(args, state: BenchState):
         host="localhost", port=args.port,
         certificate=args.cert, private_key=args.key,
         path="",
+        congestion_control_algorithm=args.cc_algo,
     )
     server.register_handler(
         MOQTMessageType.SUBSCRIBE, partial(_on_subscribe))
@@ -1133,6 +1134,7 @@ async def run_subscriber_client(host: str, port: int, path: str,
         use_quic=use_quic,
         verify_tls=verify_tls,
         draft_version=args.draft,
+        congestion_control_algorithm=args.cc_algo,
     )
     try:
         async with client.connect() as session:
@@ -1185,6 +1187,7 @@ async def run_publisher_client(host: str, port: int, path: str,
         use_quic=use_quic,
         verify_tls=verify_tls,
         draft_version=args.draft,
+        congestion_control_algorithm=args.cc_algo,
     )
     try:
         async with client.connect() as session:
@@ -1356,6 +1359,10 @@ def parse_args():
                         "uvloop is on by default when available — "
                         "typically 2-4× faster on selector-heavy "
                         "workloads.")
+    p.add_argument("--cc-algo", type=str, default="bbr",
+                   help="Congestion control algorithm "
+                        "(bbr | bbr1 | newreno | cubic | dcubic | "
+                        "prague | fast). Default: bbr")
     args = p.parse_args()
     args.sub_filter = filter_choices[args.sub_filter]
     if args.sub_filter in (FilterType.ABSOLUTE_START,

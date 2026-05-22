@@ -92,6 +92,10 @@ def parse_args():
                         help='Seconds to wait for publisher before spawning subs (default: 5)')
     parser.add_argument('--logdir', type=str, default=None,
                         help='Directory for per-process debug logs (pub.log, sub-N.log)')
+    parser.add_argument('--cc-algo', type=str, default='bbr',
+                        help='Congestion control algorithm '
+                             '(bbr | bbr1 | newreno | cubic | dcubic | '
+                             'prague | fast). Default: bbr')
     return parser.parse_args()
 
 
@@ -121,6 +125,7 @@ def run_publisher(relay_url, namespace, trackname, args):
             use_quic=relay.use_quic,
             verify_tls=not args.insecure,
             draft_version=args.draft,
+            congestion_control_algorithm=args.cc_algo,
         )
         async with client.connect() as session:
             await session.client_session_init()
@@ -192,6 +197,7 @@ def run_subscriber(sub_id, relay_url, namespace, trackname, args,
             use_quic=relay.use_quic,
             verify_tls=not args.insecure,
             draft_version=args.draft,
+            congestion_control_algorithm=args.cc_algo,
         )
         start = time.monotonic()
         try:

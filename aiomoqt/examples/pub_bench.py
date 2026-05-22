@@ -88,6 +88,10 @@ examples:
                         help='Skip TLS certificate verification')
     parser.add_argument('--draft', type=int, default=None,
                         help='MoQT draft version (e.g. 14, 16)')
+    parser.add_argument('--cc-algo', type=str, default='bbr',
+                        help='Congestion control algorithm '
+                             '(bbr | bbr1 | newreno | cubic | dcubic | '
+                             'prague | fast). Default: bbr')
     args = parser.parse_args()
     if args.trackname is None:
         import uuid
@@ -147,6 +151,7 @@ async def run(args):
         draft_version=args.draft,
         debug=args.debug,
         keylog_filename=args.keylogfile,
+        congestion_control_algorithm=args.cc_algo,
     )
 
     print(f"  Connecting...")

@@ -20,11 +20,15 @@ def parse_args():
     parser.add_argument('--use-quic', action='store_true', help='Enable QUIC transport')
     parser.add_argument('--debug', action='store_true', help='Enable debug output')
     parser.add_argument('--keylogfile', type=str, default=None, help='TLS secrets file')
+    parser.add_argument('--cc-algo', type=str, default='bbr',
+                        help='Congestion control algorithm '
+                             '(bbr | bbr1 | newreno | cubic | dcubic | '
+                             'prague | fast). Default: bbr')
     return parser.parse_args()
 
 
 async def main(host: str, port: int, path: str, namespace: str, track_name: str,
-               use_quic: bool, debug: bool):
+               use_quic: bool, debug: bool, cc_algo: str = 'bbr'):
     log_level = logging.DEBUG if debug else logging.INFO
     set_log_level(log_level)
     logger = get_logger(__name__)
@@ -35,7 +39,8 @@ async def main(host: str, port: int, path: str, namespace: str, track_name: str,
         path=path,
         use_quic=use_quic,
         keylog_filename=args.keylogfile,
-        debug=debug
+        debug=debug,
+        congestion_control_algorithm=cc_algo,
     )
     logger.info(f"MOQT app: join session connecting: {client}")
     try:
@@ -92,7 +97,8 @@ if __name__ == "__main__":
             namespace=args.namespace,
             track_name=args.trackname,
             use_quic=args.use_quic,
-            debug=args.debug
+            debug=args.debug,
+            cc_algo=args.cc_algo,
         ), debug=args.debug)
 
     except KeyboardInterrupt:

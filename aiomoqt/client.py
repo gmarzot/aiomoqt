@@ -28,6 +28,7 @@ class MOQTClient(MOQTPeer):
         quic_debug_log: Optional[str] = None,
         draft_version: Optional[int] = None,
         libquicr_compat: Optional[bool] = False,
+        congestion_control_algorithm: Optional[str] = "bbr",
     ):
         super().__init__(allow_optional_dgram=allow_optional_dgram,
                          libquicr_compat=libquicr_compat)
@@ -57,6 +58,7 @@ class MOQTClient(MOQTPeer):
         self.draft_version = draft_version
         self.keylog_filename = keylog_filename
         self.configuration = configuration
+        self.congestion_control_algorithm = congestion_control_algorithm
 
         if draft_version is not None:
             set_moqt_ctx_version(draft_version)
@@ -89,8 +91,10 @@ class MOQTClient(MOQTPeer):
                     max_datagram_frame_size=64 * 1024,
                     server_name=self.host,
                     secrets_log_file=self.keylog_filename,
-                    # See server.py note: BBR over NewReno.
-                    congestion_control_algorithm="bbr",
+                    # Default "bbr"; operator-overridable via MOQTClient
+                    # constructor. See server.py for rationale.
+                    congestion_control_algorithm=(
+                        self.congestion_control_algorithm),
                 )
             protocol = lambda *a, **kw: MOQTSessionQuic(*a, **kw, session=self)
             # quic_debug_log not wired on raw-QUIC path yet: aiopquic
