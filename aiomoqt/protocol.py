@@ -2468,4 +2468,8 @@ class MOQTSessionWTServer(
 
     def __init__(self, transport, state, *, session: 'MOQTPeer'):
         super().__init__(transport, state, session=session)
+        draft = getattr(session, 'draft_version', None)
+        if draft is not None:
+            set_moqt_ctx_version(draft)
+            self._moqt_version = draft
         self._moqt_wt_finalize()
