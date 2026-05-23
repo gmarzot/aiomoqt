@@ -510,6 +510,7 @@ async def test_subscribe_before_announce(host, port, path, use_quic,
                                          compat=frozenset(),
                                          timeout=3.5) -> TestResult:
     """Test 6: Subscriber connects first, publisher 500ms later. Both outcomes valid."""
+    moq_dev_compat = _compat_active(compat, "moq-dev")
     t0 = time.monotonic()
     pub_cid = "unknown"
     sub_cid = "unknown"
@@ -566,6 +567,8 @@ async def test_subscribe_before_announce(host, port, path, use_quic,
         # TRACK_DOES_NOT_EXIST or UNINTERESTED). INTERNAL_ERROR (0x0)
         # is rejected: it signals a server-side failure, not a policy
         # choice, and should not pass a conformance test.
+        compat_used = False
+        compat_reason = ""
         if sub_response is None:
             msg = "Timeout waiting for subscriber response"
             passed = False
@@ -575,6 +578,18 @@ async def test_subscribe_before_announce(host, port, path, use_quic,
             if spec_ok:
                 msg = f"Error received (valid: relay didn't buffer): code={sub_response.error_code}"
                 passed = True
+            elif moq_dev_compat:
+                msg = (
+                    f"Non-spec error code={sub_response.error_code} accepted "
+                    f"as benign 'did not buffer'"
+                )
+                passed = True
+                compat_used = True
+                compat_reason = (
+                    f"moq-dev returns non-spec error code "
+                    f"{sub_response.error_code} for not-found; spec "
+                    f"expects a benign code"
+                )
             else:
                 msg = (
                     f"Non-conformant error: expected a benign code "
@@ -593,6 +608,8 @@ async def test_subscribe_before_announce(host, port, path, use_quic,
             publisher_connection_id=pub_cid,
             subscriber_connection_id=sub_cid,
             message=msg,
+            compat=compat_used,
+            compat_note=compat_reason,
         )
     except Exception as e:
         return TestResult(
@@ -808,6 +825,13 @@ async def run_tests(tests: list[str], host: str, port: int, path: str,
                     reporter: TAPReporter = None) -> TAPReporter:
     if reporter is None:
         reporter = TAPReporter(compat=compat)
+    # Per-test namespace slot. Stricter relays (e.g. itzmanish/moq-rs)
+    # cache PUBLISH_NAMESPACE_DONE state, so a later test that
+    # reannounces the same namespace gets `code=0 reason=done` back.
+    # Append the test name as a final segment so each test owns its
+    # own announce slot.
+    global INTEROP_NAMESPACE
+    base_namespace = INTEROP_NAMESPACE
     for test_name in tests:
         fn = TEST_FUNCTIONS.get(test_name)
         if fn is None:
@@ -816,6 +840,7 @@ async def run_tests(tests: list[str], host: str, port: int, path: str,
                 skip_reason="Unknown test case",
             ))
             continue
+        INTEROP_NAMESPACE = f"{base_namespace}/{test_name}"
         nc_before = MOQTMessage._trailing_extensions_truncation_count
         result = await fn(host, port, path, use_quic, tls_disable_verify,
                           debug, draft_version=draft_version, compat=compat)
