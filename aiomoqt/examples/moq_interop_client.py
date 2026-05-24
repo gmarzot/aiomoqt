@@ -70,7 +70,8 @@ SUBSCRIBE_BENIGN_ERROR_CODES = frozenset({
 # reader can see that strict spec was not met. Real failures (connection
 # refused, decode error, transport reset) are never compat-passed.
 KNOWN_COMPAT_IMPLS = frozenset({
-    "moq-dev",            # cdn.moq.dev /anon — endpoint quirks
+    "moq-dev",            # cdn.moq.dev /anon — returns 404 for not-found
+    "moq-rs",             # cloudflare moq-rs d14 — returns code=0 for not-found
     "moq-rs-d16",         # itzmanish/moq-rs draft-16 fork (CF endpoint)
     "lenient-extensions",  # tolerate truncated trailing extensions block
     "all",                # enable every known compat tolerance
@@ -359,12 +360,14 @@ async def test_subscribe_error(host, port, path, use_quic,
                                timeout=2.0) -> TestResult:
     """Test 4: SUBSCRIBE to non-existent track, expect SUBSCRIBE_ERROR.
 
-    Compat (`moq-dev`): the relay returns its own non-spec "not found"
-    code (e.g. 404). We accept *any* structured error as a valid
-    "track not found" signal with annotation. A timeout or transport
-    error still fails.
+    Compat (`moq-dev` / `moq-rs`): the relay returns its own non-spec
+    "not found" code (404 for moq-dev, 0 for moq-rs d14). We accept
+    *any* structured error as a valid "track not found" signal with
+    annotation. A timeout or transport error still fails.
     """
     moq_dev_compat = _compat_active(compat, "moq-dev")
+    moq_rs_compat = _compat_active(compat, "moq-rs")
+    accept_any_error = moq_dev_compat or moq_rs_compat
     t0 = time.monotonic()
     cid = "unknown"
     client = _make_client(host, port, path, use_quic, tls_disable_verify, debug, draft_version=draft_version)
@@ -401,7 +404,8 @@ async def test_subscribe_error(host, port, path, use_quic,
                             message=f"Error received (expected): code={e.error_code}",
                             expected="SUBSCRIBE_ERROR code=TRACK_DOES_NOT_EXIST",
                         )
-                    if moq_dev_compat:
+                    if accept_any_error:
+                        impl = "moq-rs" if moq_rs_compat else "moq-dev"
                         return TestResult(
                             name="subscribe-error", passed=True,
                             duration_ms=(time.monotonic() - t0) * 1000,
@@ -414,8 +418,9 @@ async def test_subscribe_error(host, port, path, use_quic,
                             received=f"SUBSCRIBE_ERROR code={e.error_code}",
                             compat=True,
                             compat_note=(
-                                f"moq-dev returns non-spec error code {e.error_code} "
-                                f"for not-found; spec expects 0x04 (d14) or 0x10 (d16)"
+                                f"{impl} returns non-spec error code "
+                                f"{e.error_code} for not-found; spec expects "
+                                f"0x04 (d14) or 0x10 (d16)"
                             ),
                         )
                     return TestResult(
@@ -511,6 +516,8 @@ async def test_subscribe_before_announce(host, port, path, use_quic,
                                          timeout=3.5) -> TestResult:
     """Test 6: Subscriber connects first, publisher 500ms later. Both outcomes valid."""
     moq_dev_compat = _compat_active(compat, "moq-dev")
+    moq_rs_compat = _compat_active(compat, "moq-rs")
+    accept_any_error = moq_dev_compat or moq_rs_compat
     t0 = time.monotonic()
     pub_cid = "unknown"
     sub_cid = "unknown"
@@ -578,7 +585,8 @@ async def test_subscribe_before_announce(host, port, path, use_quic,
             if spec_ok:
                 msg = f"Error received (valid: relay didn't buffer): code={sub_response.error_code}"
                 passed = True
-            elif moq_dev_compat:
+            elif accept_any_error:
+                impl = "moq-rs" if moq_rs_compat else "moq-dev"
                 msg = (
                     f"Non-spec error code={sub_response.error_code} accepted "
                     f"as benign 'did not buffer'"
@@ -586,7 +594,7 @@ async def test_subscribe_before_announce(host, port, path, use_quic,
                 passed = True
                 compat_used = True
                 compat_reason = (
-                    f"moq-dev returns non-spec error code "
+                    f"{impl} returns non-spec error code "
                     f"{sub_response.error_code} for not-found; spec "
                     f"expects a benign code"
                 )
