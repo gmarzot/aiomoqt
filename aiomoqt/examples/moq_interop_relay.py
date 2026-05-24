@@ -1,10 +1,20 @@
 #!/usr/bin/env python3
-"""Minimal MoQT relay for the interop runner.
+"""EXPERIMENTAL — minimal MoQT interop relay (not a production relay).
 
-Implements just enough control-plane to satisfy the 6 standard interop
-test cases at https://github.com/englishm/moq-interop-runner. There is
-no actual data forwarding: the suite tests SETUP / PUBLISH_NAMESPACE /
-SUBSCRIBE / PUBLISH_NAMESPACE_DONE flow and never sends objects.
+This is a CONTROL-PLANE-ONLY skeleton intended solely for exercising
+the 6 standard interop test cases at
+https://github.com/englishm/moq-interop-runner. It has:
+
+  * NO data forwarding (objects are never relayed)
+  * NO multi-subscriber fan-out
+  * NO authentication, authorization, or rate limiting
+  * NO load handling, backpressure, or production hardening
+  * An in-memory namespace table that is global to the process
+
+Use moxygen, moq-rs, or another real relay for any actual workload.
+This relay exists so aiomoqt's server-side primitives (MOQTServer,
+the announce / subscribe handlers) have a working demonstrator and
+so we can run the interop conformance suite against ourselves.
 
 Routing model (cross-session, single relay instance):
   - PUBLISH_NAMESPACE: record the namespace tuple in `_announced`,
@@ -34,7 +44,6 @@ import asyncio
 import logging
 import os
 import sys
-from functools import partial
 
 from aiomoqt.server import MOQTServer
 from aiomoqt.types import (
@@ -200,7 +209,15 @@ async def main():
     quic_server = await server.serve()
 
     transport = "raw QUIC" if args.quic else "H3/WebTransport"
-    print(f"MoQT interop relay listening on {args.bind}:{args.port} "
+    print(
+        "=" * 64
+        + "\n EXPERIMENTAL aiomoqt interop relay — control-plane only.\n"
+        " NOT a production relay: no data forwarding, no auth,\n"
+        " no scale handling. Use moxygen / moq-rs for real workloads.\n"
+        + "=" * 64,
+        file=sys.stderr,
+    )
+    print(f"Listening on {args.bind}:{args.port} "
           f"({transport}, draft-{args.draft})", file=sys.stderr)
 
     try:

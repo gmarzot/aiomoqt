@@ -17,6 +17,11 @@ RUN pip install --no-cache-dir .
 # relay (selected via MOQT_ROLE=relay). The relay binds UDP/4443 by
 # default and loads /certs/cert.pem + /certs/priv.key per the runner's
 # certs convention.
+#
+# WARNING: MOQT_ROLE=relay starts an EXPERIMENTAL control-plane-only
+# interop relay. It does not forward data, has no authentication, and
+# is not intended for any workload outside the interop conformance
+# tests. Use moxygen / moq-rs for production traffic.
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
