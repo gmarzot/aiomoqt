@@ -73,6 +73,7 @@ KNOWN_COMPAT_IMPLS = frozenset({
     "moq-dev",            # cdn.moq.dev /anon — returns 404 for not-found
     "moq-rs",             # cloudflare moq-rs d14 — returns code=0 for not-found
     "moq-rs-d16",         # itzmanish/moq-rs draft-16 fork (CF endpoint)
+    "libquicr",           # Cisco libquicr — accepts SUBSCRIBE to unknown tracks
     "lenient-extensions",  # tolerate truncated trailing extensions block
     "all",                # enable every known compat tolerance
 })
@@ -367,6 +368,7 @@ async def test_subscribe_error(host, port, path, use_quic,
     """
     moq_dev_compat = _compat_active(compat, "moq-dev")
     moq_rs_compat = _compat_active(compat, "moq-rs")
+    libquicr_compat = _compat_active(compat, "libquicr")
     accept_any_error = moq_dev_compat or moq_rs_compat
     t0 = time.monotonic()
     cid = "unknown"
@@ -382,8 +384,26 @@ async def test_subscribe_error(host, port, path, use_quic,
                         track_name="test-track",
                         wait_response=True,
                     )
-                    # If we get here, no error — unexpected
+                    # If we get here, no error.
                     session.close()
+                    if libquicr_compat:
+                        return TestResult(
+                            name="subscribe-error", passed=True,
+                            duration_ms=(time.monotonic() - t0) * 1000,
+                            connection_id=cid,
+                            message=(
+                                "SUBSCRIBE_OK for non-existent track accepted "
+                                "(libquicr deferred-delivery policy)"
+                            ),
+                            expected="error response",
+                            received="SUBSCRIBE_OK",
+                            compat=True,
+                            compat_note=(
+                                "libquicr accepts SUBSCRIBE to any track "
+                                "(deferred-delivery policy); does not "
+                                "verify track existence at subscribe time"
+                            ),
+                        )
                     return TestResult(
                         name="subscribe-error", passed=False,
                         duration_ms=(time.monotonic() - t0) * 1000,
