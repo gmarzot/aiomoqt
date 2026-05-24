@@ -12,4 +12,12 @@ COPY . .
 
 RUN pip install --no-cache-dir .
 
-ENTRYPOINT ["python", "-m", "aiomoqt.examples.moq_interop_client"]
+# Role switch for the moq-interop-runner. The runner expects two
+# container shapes from a single image: a client (default) and a
+# relay (selected via MOQT_ROLE=relay). The relay binds UDP/4443 by
+# default and loads /certs/cert.pem + /certs/priv.key per the runner's
+# certs convention.
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
