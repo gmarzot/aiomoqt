@@ -2,8 +2,21 @@
 
 ## v0.9.5 (unreleased)
 
-Pairs with [aiopquic 0.3.3](https://pypi.org/project/aiopquic/0.3.3/);
-dep floor `aiopquic>=0.3.2` → `aiopquic>=0.3.3`.
+Pairs with [aiopquic 0.3.5](https://pypi.org/project/aiopquic/0.3.5/);
+dep floor `aiopquic>=0.3.2` → `aiopquic>=0.3.5`.
+
+### WT-server d16 draft pin
+
+`MOQTSessionWTServer.__init__` now calls `set_moqt_ctx_version(session.draft_version)` symmetrically with the raw-QUIC ALPN handler and the WT-client init path. Without it, the global `moqt_version` stayed at `MOQT_VERSION_DRAFT14` on the server, so `ClientSetup.deserialize` expected the d14 wire format (version list first) while a d16 client sent the d16 format (no version list) — observable as `BufferReadError` on the first incoming `ClientSetup`. Unblocks 2-proc WT d16; validated at 2.2-2.3 Gbps p99 75ms.
+
+### Observability
+
+- `--cc-algo` flag exposed on `MOQTServer` / `MOQTClient` and 11 example tools (`loopback_bench`, `pub_server`, `sub_bench`, `pub_bench`, `multi_sub_bench`, `adaptive_bench`, `relay_bench`, `pub_example`, `sub_example`, `server_example`, `join_example`). Passes through to `QuicConfiguration.congestion_control_algorithm`. Default BBR.
+- `python -m aiomoqt.versions` / `aiomoqt-versions` documented in README ("Reporting issues" section). Chains through `aiopquic.versions` for full stack: aiomoqt + aiopquic + picoquic + picotls.
+
+### Tooling
+
+- `[tool.ruff] line-length = 100` retained as the standard (aiopquic now matches).
 
 ### Pressure-based yield in `stream_write_drain`
 
