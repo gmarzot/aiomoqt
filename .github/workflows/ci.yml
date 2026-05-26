@@ -95,7 +95,10 @@ jobs:
           # Asserts at least some object delivery in a 12 s window.
           # Catches Phase-7 backpressure / TX-ring-fill stalls that
           # in-process loopback doesn't exercise.
-          python -m aiomoqt.examples.pub_server \
+          # -u so the "ready on" banner reaches /tmp/pub-srv.log
+          # before our poll grep runs (Python buffers stdout in 4KB
+          # chunks when redirected to a file).
+          python -u -m aiomoqt.examples.pub_server \
             --cert certs/cert.pem --key certs/key.pem \
             -p 4434 -s 4096 -g 10000 -P 1 \
             --draft 16 --quic > /tmp/pub-srv.log 2>&1 &
