@@ -100,7 +100,24 @@ jobs:
             -p 4434 -s 4096 -g 10000 -P 1 \
             --draft 16 --quic > /tmp/pub-srv.log 2>&1 &
           PUB_PID=$!
-          sleep 1.5
+          # Poll up to 10s for pub_server's "ready on" line. Bare
+          # `sleep 1.5` was flaky on busier Linux runners — pub_server
+          # not yet bound at 1.5s leads to sub_bench connect failure
+          # which then hangs in await track.subscribe() (no upper
+          # time bound there, -t only applies post-subscribe).
+          for i in $(seq 1 20); do
+            if grep -q "ready on" /tmp/pub-srv.log 2>/dev/null; then
+              echo "pub_server ready after $((i*500))ms"
+              break
+            fi
+            sleep 0.5
+          done
+          if ! grep -q "ready on" /tmp/pub-srv.log 2>/dev/null; then
+            echo "FAIL: pub_server not ready in 10s"
+            tail -20 /tmp/pub-srv.log
+            kill $PUB_PID 2>/dev/null || true
+            exit 1
+          fi
           # sub_bench self-times out via -t 12; don't wrap with the
           # external `timeout` binary (macOS lacks it by default and
           # would silently skip the run, producing a false-pass).
