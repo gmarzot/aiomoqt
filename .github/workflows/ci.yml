@@ -121,13 +121,26 @@ jobs:
             kill $PUB_PID 2>/dev/null || true
             exit 1
           fi
-          # sub_bench self-times out via -t 12; don't wrap with the
-          # external `timeout` binary (macOS lacks it by default and
-          # would silently skip the run, producing a false-pass).
-          python -m aiomoqt.examples.sub_bench \
+          # sub_bench's -t timeout doesn't reliably fire (track.
+          # wait_closed timeout=12 keeps running into bufferbloat at
+          # this rate). Wrap with a bash watchdog so the step always
+          # captures sub.log before the runner SIGTERMs us — bounded
+          # cleanup + visible failure mode. The underlying sub_bench
+          # -t bug is tracked for 0.9.6.
+          python -u -m aiomoqt.examples.sub_bench \
             -Q --draft 16 -n bench --trackname track \
             -t 12 -i 5 moqt://localhost:4434 \
-            > /tmp/sub.log 2>&1 || true
+            > /tmp/sub.log 2>&1 &
+          SUB_PID=$!
+          # Up to 20s (12s -t + 8s slack), then force-kill.
+          for i in $(seq 1 40); do
+            if ! kill -0 $SUB_PID 2>/dev/null; then break; fi
+            sleep 0.5
+          done
+          kill $SUB_PID 2>/dev/null || true
+          sleep 0.5
+          kill -9 $SUB_PID 2>/dev/null || true
+          wait $SUB_PID 2>/dev/null || true
           kill $PUB_PID 2>/dev/null || true
           echo === sub.log ===
           tail -30 /tmp/sub.log
