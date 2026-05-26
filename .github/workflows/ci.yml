@@ -146,17 +146,21 @@ jobs:
           tail -30 /tmp/sub.log
           echo === pub-srv.log ===
           tail -20 /tmp/pub-srv.log
-          # Require at least 100 objects delivered in 12 s. The path
-          # works when non-zero; threshold gives generous margin for
-          # variable CI runner perf. Fails loudly when no Objects line
-          # was emitted at all (sub_bench failed to start / connect).
-          LINE=$(grep -E "Objects: *[0-9]+" /tmp/sub.log | tail -1)
-          if [ -z "$LINE" ]; then
-            echo "FAIL: no 'Objects:' line in sub.log — sub_bench did not run"
+          # Assertion reads the per-interval table (always emitted even
+          # when watchdog kills sub_bench) instead of the "Objects:"
+          # summary block (only emitted on natural exit). Interval
+          # format: "  10-15s    65      642256    29330/s   964Mbps ..."
+          # — column 3 is the cumulative obj count.
+          LAST_OBJS=$(grep -oE '^[[:space:]]+[0-9]+-[0-9]+s[[:space:]]+[0-9]+[[:space:]]+[0-9]+' /tmp/sub.log | tail -1 | awk '{print $3}')
+          if [ -z "$LAST_OBJS" ]; then
+            echo "FAIL: no interval data in sub.log — sub_bench did not run"
             exit 1
           fi
-          echo "$LINE" \
-            | awk '{n=$2+0; if (n < 100) {print "FAIL: only " n " objects"; exit 1} else {print "OK: " n " objects"}}'
+          if [ "$LAST_OBJS" -lt 100 ]; then
+            echo "FAIL: only $LAST_OBJS objects"
+            exit 1
+          fi
+          echo "OK: $LAST_OBJS objects in last interval"
 
   peer-interop:
     name: peer interop
