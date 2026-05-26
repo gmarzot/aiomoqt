@@ -15,7 +15,14 @@ import argparse
 import asyncio
 import logging
 import math
+import os
 import time
+import tracemalloc
+
+# Opt-in memory profiling: AIOMOQT_TRACEMALLOC=1 enables tracemalloc and
+# dumps top allocators at exit. Default off — zero perf impact when unset.
+if os.environ.get("AIOMOQT_TRACEMALLOC") == "1":
+    tracemalloc.start(25)  # 25-frame stack capture per allocation
 
 from aiomoqt.types import (
     ParamType, MOQTException, MOQTRequestError,
@@ -396,6 +403,14 @@ async def run(args):
         print(f"  Connection failed: {e}")
 
     stats.print_summary()
+
+    if tracemalloc.is_tracing():
+        snap = tracemalloc.take_snapshot()
+        top = snap.statistics("filename")
+        print("\n=== tracemalloc top 25 by filename ===")
+        for stat in top[:25]:
+            print(f"  {stat.size / (1024 * 1024):8.1f} MB  "
+                  f"{stat.count:>8d} blocks  {stat.traceback}")
 
 
 if __name__ == "__main__":

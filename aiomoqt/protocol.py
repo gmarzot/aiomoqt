@@ -459,6 +459,47 @@ class _MOQTSessionMixin:
             )
             raise
 
+    def _dump_data_streams(self, file=None) -> dict:
+        """Per-stream chain-introspection. Returns and prints a dict of
+        {stream_id: (chain_chunks, chain_total_bytes, bytes_parsed,
+                     group_id, object_id, parser_type)}.
+        Used by SIGUSR2 to localize where bytes are pinned downstream
+        of aiopquic's drain. Called from aiomoqt.utils.taskdump."""
+        import sys
+        if file is None:
+            file = sys.stderr
+        out = {}
+        total_chains = 0
+        total_chunks = 0
+        total_bytes = 0
+        for sid, state in self._data_streams.items():
+            chain = state.chain
+            # _chunks is the internal deque; len() is the count.
+            try:
+                chunks_n = len(chain._chunks)
+            except Exception:
+                chunks_n = -1
+            total_chunks += max(0, chunks_n)
+            total_bytes += chain.capacity
+            total_chains += 1
+            out[sid] = (chunks_n, chain.capacity, state.bytes_total,
+                        state.group_id, state.object_id,
+                        type(state.parser).__name__ if state.parser
+                        else None)
+        print(f"=== aiomoqt chain-dump "
+              f"({total_chains} active streams, "
+              f"{total_chunks} chunks pinned, "
+              f"{total_bytes} bytes pending parse) ===",
+              file=file, flush=True)
+        for sid in sorted(out.keys()):
+            n_chunks, cap, parsed, gid, oid, pt = out[sid]
+            print(f"  sid={sid:<5} chunks={n_chunks:<6} "
+                  f"chain_bytes={cap:<10} parsed={parsed:<12} "
+                  f"group={gid} object={oid} parser={pt}",
+                  file=file, flush=True)
+        print(f"=== end chain-dump ===", file=file, flush=True)
+        return out
+
     def _cleanup_stream(self, stream_id: int,
                         error_code: int = QuicErrorCode.NO_ERROR) -> None:
         """Per-uni-stream end-of-life. Replaces the per-task done
@@ -2419,8 +2460,18 @@ class _WTSessionMixin:
         """Translate WT-specific events into the QuicEvent classes
         the mixin's quic_event_received already handles, then
         dispatch through that path. Falls back to WebTransportSession
-        base handling for session-level signals (ready/closed)."""
-        super()._on_event(ev_tuple)
+        base handling for session-level signals (ready/closed).
+
+        IMPORTANT: For event types we translate AND dispatch via
+        quic_event_received here, we MUST NOT call super()._on_event
+        — the base WebTransportSession enqueues those events into
+        per-stream inbox / session event queues that we never drain,
+        which pins the data memoryview (and the StreamChunk behind
+        it) forever. That was the WT-bloat root cause: chunks_alive
+        grew unbounded because every WT_STREAM_DATA event held a
+        memoryview ref via the never-drained _stream_inbox queue.
+        Only call super() for event types we do NOT translate here.
+        """
         evt_type, sid, data, _is_fin, error_code, _cnx, _, _sc = ev_tuple
         from aiopquic.quic.events import (
             StreamDataReceived as _SD, StreamReset as _SR,
@@ -2431,6 +2482,17 @@ class _WTSessionMixin:
             _EVT_WT_STREAM_RESET, _EVT_WT_STOP_SENDING,
             _EVT_WT_DATAGRAM,
         )
+        translated = {
+            _EVT_WT_STREAM_DATA, _EVT_WT_STREAM_FIN,
+            _EVT_WT_STREAM_RESET, _EVT_WT_STOP_SENDING,
+            _EVT_WT_DATAGRAM,
+        }
+        if evt_type not in translated:
+            # Session-level events (ready/closed/draining, new_stream,
+            # tx_drained, etc) still need base handling for queue/event
+            # signaling; they don't carry stream payload that pins
+            # chunks.
+            super()._on_event(ev_tuple)
         if evt_type == _EVT_WT_STREAM_DATA:
             self.quic_event_received(_SD(stream_id=sid, data=data,
                                           end_stream=False))

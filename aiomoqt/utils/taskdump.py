@@ -78,7 +78,34 @@ def install() -> bool:
         except Exception as e:
             print(f"(SIGUSR2 counter-dump failed: {e})",
                   file=sys.stderr, flush=True)
-        print("=== end counter-dump ===\n",
+        print("=== end counter-dump ===",
+              file=sys.stderr, flush=True)
+
+        # Per-session data-stream chain stats. Localizes where bytes
+        # are pinned downstream of aiopquic's drain.
+        try:
+            import gc
+            seen = 0
+            for obj in gc.get_objects():
+                try:
+                    dumper = getattr(obj, '_dump_data_streams', None)
+                    streams = getattr(obj, '_data_streams', None)
+                    if (dumper is None or not callable(dumper)
+                            or not isinstance(streams, dict)):
+                        continue
+                    print(f"\n=== aiomoqt session #{seen} ===",
+                          file=sys.stderr, flush=True)
+                    dumper(file=sys.stderr)
+                    seen += 1
+                except Exception:
+                    continue
+            if seen == 0:
+                print("(no live MOQTSession instances)",
+                      file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"(SIGUSR2 chain-dump failed: {e})",
+                  file=sys.stderr, flush=True)
+        print("=== end SIGUSR2 ===\n",
               file=sys.stderr, flush=True)
 
     signal.signal(signal.SIGUSR1, _dump_tasks)

@@ -86,9 +86,11 @@ def print_banner(args):
         rate_s = f"{args.rate}/s per stream"
     else:
         rate_s = "max"
+    transport_label = "QUIC" if args.quic else "H3/WebTransport"
     print("─" * 56)
     print("  aiomoqt-bench loopback (no relay)")
     print("─" * 56)
+    print(f"  transport:   {transport_label}")
     print(f"  mode:        {mode}")
     print(f"  object size: {args.object_size} B")
     print(f"  group size:  {args.group_size} objects")
