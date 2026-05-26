@@ -22,6 +22,7 @@ import time
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.track import PublishedTrack, VideoTrack, SubscribedTrack
+from aiomoqt.utils import wait_cond_timeout
 from aiomoqt.utils.logger import set_log_level
 from aiomoqt.utils.url import parse_relay_url
 
@@ -150,7 +151,8 @@ def run_publisher(relay_url, namespace, trackname, args):
                 announce_namespace=(args.pub_ns or args.pub_both),
                 publish_track=(not args.pub_ns or args.pub_both),
             )
-            await track.wait_closed(timeout=args.duration + 10)
+            await wait_cond_timeout(
+                track.wait_closed(), timeout=args.duration)
 
     try:
         asyncio.run(_pub())
@@ -210,7 +212,9 @@ def run_subscriber(sub_id, relay_url, namespace, trackname, args,
                     on_object=on_object,
                 )
                 await track.subscribe(timeout=SUBSCRIBE_TIMEOUT)
-                await track.wait_closed(timeout=args.duration)
+                if not await wait_cond_timeout(
+                        track.wait_closed(), timeout=args.duration):
+                    track.completed = True
                 if not track.completed:
                     stats['error'] = 'StreamReset'
         except Exception as e:

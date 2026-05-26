@@ -461,16 +461,9 @@ class PublishedTrack(Track):
         else:
             await self._subscriber_event.wait()
 
-    async def wait_closed(self, timeout: float = None):
-        """Wait for session to close or timeout."""
-        try:
-            if timeout:
-                await asyncio.wait_for(
-                    self.session.async_closed(), timeout=timeout)
-            else:
-                await self.session.async_closed()
-        except asyncio.TimeoutError:
-            pass
+    async def wait_closed(self):
+        """Wait for session to close."""
+        await self.session.async_closed()
         self.state = TrackState.CLOSED
 
 
@@ -593,22 +586,14 @@ class SubscribedTrack(Track):
         self.state = TrackState.SUBSCRIBED
         logger.info(f"Track: subscribed to {self.fqtn}")
 
-    async def wait_closed(self, timeout: float = None):
-        """Wait for session to close or timeout.
+    async def wait_closed(self):
+        """Wait for session to close.
 
         Sets self.completed if track ended cleanly (no StreamReset).
         """
-        try:
-            if timeout:
-                await asyncio.wait_for(
-                    self.session.async_closed(), timeout=timeout)
-            else:
-                await self.session.async_closed()
-        except asyncio.TimeoutError:
-            self.completed = True  # duration reached = clean
+        await self.session.async_closed()
         self.state = TrackState.CLOSED
 
-        # Check close reason
         if hasattr(self.session, '_close_err') and self.session._close_err:
             code, reason = self.session._close_err
             if reason and 'StreamReset' in str(reason):

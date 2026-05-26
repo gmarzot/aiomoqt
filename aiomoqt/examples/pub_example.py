@@ -316,7 +316,7 @@ async def main(host: str, port: int, path: str, namespace: str, trackname: str,
             await track.publish()
             logger.info(f"MOQT app: published {track.fqtn}")
 
-            await track.wait_closed(timeout=duration)
+            await wait_cond_timeout(track.wait_closed(), timeout=duration)
         except Exception as e:
             logger.error(f"MOQT session exception: {e}")
 

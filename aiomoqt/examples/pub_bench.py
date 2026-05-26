@@ -20,6 +20,7 @@ import logging
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.track import PublishedTrack, TrackState
+from aiomoqt.utils import wait_cond_timeout
 from aiomoqt.utils.logger import set_log_level, get_logger
 from aiomoqt.utils.url import parse_relay_url
 
@@ -176,8 +177,8 @@ async def run(args):
             )
             print(f"  Published '{track.fqtn}', waiting for subscriber...")
 
-            await track.wait_closed(timeout=args.duration)
-            if track.state != TrackState.CLOSED:
+            if not await wait_cond_timeout(
+                    track.wait_closed(), timeout=args.duration):
                 print(f"\n  Duration {args.duration}s reached.")
         except Exception as e:
             print(f"  Error: {e}")

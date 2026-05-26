@@ -16,6 +16,7 @@ from aiomoqt.types import MOQTMessageType
 from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
 from aiomoqt.track import PublishedTrack, SubscribedTrack
+from aiomoqt.utils import wait_cond_timeout
 from aiomoqt.utils.logger import set_log_level
 from aiomoqt.examples.sub_bench import BenchStats
 
@@ -166,7 +167,9 @@ async def run_subscriber(args, stats):
 
             print("  Subscriber connected, receiving...\n")
 
-            await track.wait_closed(timeout=args.duration)
+            if not await wait_cond_timeout(
+                    track.wait_closed(), timeout=args.duration):
+                track.completed = True
     except Exception as e:
         print(f"  Subscriber error: {e}")
 

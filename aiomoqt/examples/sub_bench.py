@@ -31,6 +31,7 @@ from aiomoqt.types import (
 from aiomoqt.client import MOQTClient
 from aiomoqt.messages import ObjectDatagram
 from aiomoqt.track import SubscribedTrack
+from aiomoqt.utils import wait_cond_timeout
 from aiomoqt.utils.format import fmt_bps, fmt_ms, fmt_rate
 from aiomoqt.utils.logger import set_log_level, get_logger
 from aiomoqt.utils.url import parse_relay_url
@@ -388,7 +389,9 @@ async def run(args):
                 await track.subscribe()
                 print(f"  Subscribed to '{track.fqtn}', receiving...\n")
 
-                await track.wait_closed(timeout=args.duration)
+                if not await wait_cond_timeout(
+                        track.wait_closed(), timeout=args.duration):
+                    track.completed = True
 
             except MOQTRequestError as e:
                 print(f"  Request error: {e}")
