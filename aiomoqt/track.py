@@ -431,9 +431,8 @@ class PublishedTrack(Track):
                     next_frame_time += 1.0 / current_rate
                     sleep_time = max(0, next_frame_time - time.monotonic())
                     await asyncio.sleep(sleep_time)
-                else:
-                    if local_sent % 64 == 0:
-                        await asyncio.sleep(0)
+                # No explicit yield in the r=0 path: stream_write_drain
+                # handles pressure-based GIL release internally.
 
         except asyncio.CancelledError:
             # Sender cancelled mid-subgroup → spec wants a RESET so the
@@ -837,9 +836,8 @@ class VideoTrack(PublishedTrack):
                     sleep_time = max(0,
                         next_frame_time - time.monotonic())
                     await asyncio.sleep(sleep_time)
-                else:
-                    if local_sent % 64 == 0:
-                        await asyncio.sleep(0)
+                # No explicit yield in the r=0 path: stream_write_drain
+                # handles pressure-based GIL release internally.
 
         except asyncio.CancelledError:
             dur = time.monotonic() - start_time

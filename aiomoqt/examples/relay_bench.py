@@ -72,6 +72,11 @@ examples:
     parser.add_argument(
         '-k', '--insecure', action='store_true',
         help='Skip TLS certificate verification')
+    parser.add_argument(
+        '--cc-algo', type=str, default='bbr',
+        help='Congestion control algorithm '
+             '(bbr | bbr1 | newreno | cubic | dcubic | prague | fast). '
+             'Default: bbr')
     return parser.parse_args()
 
 
@@ -93,6 +98,7 @@ async def main():
         debug=args.debug,
         keylogfile=args.keylogfile,
         insecure=args.insecure,
+        cc_algo=args.cc_algo,
     )
 
     sub_args = argparse.Namespace(
@@ -105,6 +111,7 @@ async def main():
         debug=args.debug,
         keylogfile=args.keylogfile,
         insecure=args.insecure,
+        cc_algo=args.cc_algo,
     )
 
     # Import run functions

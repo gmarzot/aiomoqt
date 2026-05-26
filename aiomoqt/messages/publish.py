@@ -118,9 +118,10 @@ class Publish(MOQTMessage):
                 content_exists = ContentExistsCode.NO_CONTENT
             track_extensions = MOQTMessage._extensions_decode(
                 buf, with_length=False, buf_end=buf_end)
-            go_val = track_extensions.pop(0x22, None)
-            if go_val is not None:
-                group_order = go_val
+            if track_extensions is not None:
+                go_val = track_extensions.pop(0x22, None)
+                if go_val is not None:
+                    group_order = go_val
         else:
             group_order = buf.pull_uint8()
             content_exists = buf.pull_uint8()

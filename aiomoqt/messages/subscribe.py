@@ -481,9 +481,10 @@ class SubscribeOk(MOQTMessage):
                 content_exists = ContentExistsCode.NO_CONTENT
             track_extensions = MOQTMessage._extensions_decode(
                 buf, with_length=False, buf_end=buf_end)
-            group_order_val = track_extensions.pop(0x22, None)
-            if group_order_val is not None:
-                group_order = GroupOrder(group_order_val)
+            if track_extensions is not None:
+                group_order_val = track_extensions.pop(0x22, None)
+                if group_order_val is not None:
+                    group_order = GroupOrder(group_order_val)
         else:
             expires = buf.pull_uint_var()
             group_order = GroupOrder(buf.pull_uint8())

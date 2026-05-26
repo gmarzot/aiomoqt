@@ -29,6 +29,13 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Opt every job + every third-party action into the Node 24 runtime
+# ahead of GitHub's 2026-06-02 hard cutover (Node 20 removed entirely
+# 2026-09-16). One env beats per-action version cherry-picking and
+# covers actions that haven't shipped a Node-24 release yet.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   core:
     name: core / ${{ matrix.os }} / py${{ matrix.python-version }}
@@ -42,16 +49,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - uses: ./.github/actions/setup-aiomoqt
         with:
           python-version: ${{ matrix.python-version }}
-          cache: 'pip'
-          cache-dependency-path: 'pyproject.toml'
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e '.[test]'
       - name: Generate self-signed cert for loopback
         run: |
           mkdir -p certs
@@ -81,16 +81,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Set up Python 3.14
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.14"
-          cache: 'pip'
-          cache-dependency-path: 'pyproject.toml'
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e '.[test]'
+      - uses: ./.github/actions/setup-aiomoqt
       - name: Generate self-signed cert
         run: |
           mkdir -p certs
@@ -104,35 +95,72 @@ jobs:
           # Asserts at least some object delivery in a 12 s window.
           # Catches Phase-7 backpressure / TX-ring-fill stalls that
           # in-process loopback doesn't exercise.
-          python -m aiomoqt.examples.pub_server \
+          # -u so the "ready on" banner reaches /tmp/pub-srv.log
+          # before our poll grep runs (Python buffers stdout in 4KB
+          # chunks when redirected to a file).
+          python -u -m aiomoqt.examples.pub_server \
             --cert certs/cert.pem --key certs/key.pem \
             -p 4434 -s 4096 -g 10000 -P 1 \
             --draft 16 --quic > /tmp/pub-srv.log 2>&1 &
           PUB_PID=$!
-          sleep 1.5
-          # sub_bench self-times out via -t 12; don't wrap with the
-          # external `timeout` binary (macOS lacks it by default and
-          # would silently skip the run, producing a false-pass).
-          python -m aiomoqt.examples.sub_bench \
+          # Poll up to 10s for pub_server's "ready on" line. Bare
+          # `sleep 1.5` was flaky on busier Linux runners — pub_server
+          # not yet bound at 1.5s leads to sub_bench connect failure
+          # which then hangs in await track.subscribe() (no upper
+          # time bound there, -t only applies post-subscribe).
+          for i in $(seq 1 20); do
+            if grep -q "ready on" /tmp/pub-srv.log 2>/dev/null; then
+              echo "pub_server ready after $((i*500))ms"
+              break
+            fi
+            sleep 0.5
+          done
+          if ! grep -q "ready on" /tmp/pub-srv.log 2>/dev/null; then
+            echo "FAIL: pub_server not ready in 10s"
+            tail -20 /tmp/pub-srv.log
+            kill $PUB_PID 2>/dev/null || true
+            exit 1
+          fi
+          # sub_bench's -t timeout doesn't reliably fire (track.
+          # wait_closed timeout=12 keeps running into bufferbloat at
+          # this rate). Wrap with a bash watchdog so the step always
+          # captures sub.log before the runner SIGTERMs us — bounded
+          # cleanup + visible failure mode. The underlying sub_bench
+          # -t bug is tracked for 0.9.6.
+          python -u -m aiomoqt.examples.sub_bench \
             -Q --draft 16 -n bench --trackname track \
             -t 12 -i 5 moqt://localhost:4434 \
-            > /tmp/sub.log 2>&1 || true
+            > /tmp/sub.log 2>&1 &
+          SUB_PID=$!
+          # Up to 20s (12s -t + 8s slack), then force-kill.
+          for i in $(seq 1 40); do
+            if ! kill -0 $SUB_PID 2>/dev/null; then break; fi
+            sleep 0.5
+          done
+          kill $SUB_PID 2>/dev/null || true
+          sleep 0.5
+          kill -9 $SUB_PID 2>/dev/null || true
+          wait $SUB_PID 2>/dev/null || true
           kill $PUB_PID 2>/dev/null || true
           echo === sub.log ===
           tail -30 /tmp/sub.log
           echo === pub-srv.log ===
           tail -20 /tmp/pub-srv.log
-          # Require at least 100 objects delivered in 12 s. The path
-          # works when non-zero; threshold gives generous margin for
-          # variable CI runner perf. Fails loudly when no Objects line
-          # was emitted at all (sub_bench failed to start / connect).
-          LINE=$(grep -E "Objects: *[0-9]+" /tmp/sub.log | tail -1)
-          if [ -z "$LINE" ]; then
-            echo "FAIL: no 'Objects:' line in sub.log — sub_bench did not run"
+          # Assertion reads the per-interval table (always emitted even
+          # when watchdog kills sub_bench) instead of the "Objects:"
+          # summary block (only emitted on natural exit). Interval
+          # format: "  10-15s    65      642256    29330/s   964Mbps ..."
+          # — column 3 is the cumulative obj count.
+          LAST_OBJS=$(grep -oE '^[[:space:]]+[0-9]+-[0-9]+s[[:space:]]+[0-9]+[[:space:]]+[0-9]+' /tmp/sub.log | tail -1 | awk '{print $3}')
+          if [ -z "$LAST_OBJS" ]; then
+            echo "FAIL: no interval data in sub.log — sub_bench did not run"
             exit 1
           fi
-          echo "$LINE" \
-            | awk '{n=$2+0; if (n < 100) {print "FAIL: only " n " objects"; exit 1} else {print "OK: " n " objects"}}'
+          if [ "$LAST_OBJS" -lt 100 ]; then
+            echo "FAIL: only $LAST_OBJS objects"
+            exit 1
+          fi
+          echo "OK: $LAST_OBJS objects in last interval"
 
   peer-interop:
     name: peer interop
@@ -142,16 +170,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Set up Python 3.14
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.14"
-          cache: 'pip'
-          cache-dependency-path: 'pyproject.toml'
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e '.[test]'
+      - uses: ./.github/actions/setup-aiomoqt
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Cargo build cache
@@ -218,16 +237,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Set up Python 3.14
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.14"
-          cache: 'pip'
-          cache-dependency-path: 'pyproject.toml'
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e '.[test]'
+      - uses: ./.github/actions/setup-aiomoqt
       - name: Run parser microbench
         timeout-minutes: 5
         run: |

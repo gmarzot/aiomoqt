@@ -15,7 +15,14 @@ import argparse
 import asyncio
 import logging
 import math
+import os
 import time
+import tracemalloc
+
+# Opt-in memory profiling: AIOMOQT_TRACEMALLOC=1 enables tracemalloc and
+# dumps top allocators at exit. Default off — zero perf impact when unset.
+if os.environ.get("AIOMOQT_TRACEMALLOC") == "1":
+    tracemalloc.start(25)  # 25-frame stack capture per allocation
 
 from aiomoqt.types import (
     ParamType, MOQTException, MOQTRequestError,
@@ -315,6 +322,11 @@ examples:
     parser.add_argument(
         '--draft', type=int, default=None,
         help='MoQT draft version (e.g. 14, 16)')
+    parser.add_argument(
+        '--cc-algo', type=str, default='bbr',
+        help='Congestion control algorithm '
+             '(bbr | bbr1 | newreno | cubic | dcubic | prague | fast). '
+             'Default: bbr')
     return parser.parse_args()
 
 
@@ -336,6 +348,12 @@ async def run(args):
                  else logging.WARNING)
     set_log_level(log_level)
 
+    # AIOMOQT_TASK_DUMP=1 installs a SIGUSR1 handler that dumps every
+    # asyncio task's stack to stderr. Useful for diagnosing hangs:
+    # `kill -USR1 <pid>` while the bench is stuck. No-op when unset.
+    from aiomoqt.utils.taskdump import install as _install_task_dump
+    _install_task_dump()
+
     relay = parse_relay_url(
         args.relay, force_quic=args.force_quic)
     stats = BenchStats(report_interval=args.interval)
@@ -349,6 +367,7 @@ async def run(args):
         draft_version=args.draft,
         debug=args.debug,
         keylog_filename=args.keylogfile,
+        congestion_control_algorithm=args.cc_algo,
     )
 
     try:
@@ -384,6 +403,14 @@ async def run(args):
         print(f"  Connection failed: {e}")
 
     stats.print_summary()
+
+    if tracemalloc.is_tracing():
+        snap = tracemalloc.take_snapshot()
+        top = snap.statistics("filename")
+        print("\n=== tracemalloc top 25 by filename ===")
+        for stat in top[:25]:
+            print(f"  {stat.size / (1024 * 1024):8.1f} MB  "
+                  f"{stat.count:>8d} blocks  {stat.traceback}")
 
 
 if __name__ == "__main__":

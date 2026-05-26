@@ -91,6 +91,16 @@ class MOQTMessage:
     exts_err_count = 0
     EXTENSIONS_LEN_LIMIT = 1024 * 16
 
+    # Wire-noncompliance tolerance. Strict by default: a truncated
+    # trailing extensions block (peer's wire-level msg_len declares
+    # more bytes than form a valid KVP) is a spec violation and is
+    # raised through the normal control-message error path. Interop
+    # clients can opt-in to tolerance by setting this flag; truncation
+    # then becomes a counted, ERROR-logged event and the partially
+    # parsed dict is returned so the rest of the message dispatches.
+    _tolerate_trailing_extensions = False
+    _trailing_extensions_truncation_count = 0
+
     @staticmethod
     def _extensions_decode(buf: Buffer, with_length: bool = True,
                            buf_end: Optional[int] = None) -> Optional[Dict[int, Union[int, bytes]]]:
@@ -153,17 +163,51 @@ class MOQTMessage:
         while buf.tell() < exts_end:
             kvp_start = buf.tell()
             # BufferReadError (aliased as MOQTUnderflow) means the
-            # underlying buffer ran out mid-pull — the caller's
-            # re-buffering path uses this to wait for more data, so
-            # let it propagate without wrapping.
-            ext_id = buf.pull_uint_var()
-            if ext_id % 2 == 0:
-                # even type → varint value (self-bounded by varint prefix)
-                ext_value = buf.pull_uint_var()
-            else:
-                # odd type → length-prefixed bytes value
-                value_len = buf.pull_uint_var()
-                ext_value = buf.pull_bytes(value_len)
+            # underlying buffer ran out mid-pull. For data streams
+            # (with_length=True) the caller's re-buffering path uses
+            # this to wait for more data, so let it propagate.
+            # For control messages (with_length=False) the buffer is
+            # single-shot: a truncation here means the peer sent a
+            # message whose wire-level length declares more extension
+            # bytes than were actually transmitted (we have seen this
+            # from relays during teardown). Returning the partial dict
+            # lets the dispatcher process the message body (which we
+            # already finished parsing) without a noisy traceback.
+            try:
+                ext_id = buf.pull_uint_var()
+                if ext_id % 2 == 0:
+                    # even type → varint value (self-bounded by varint prefix)
+                    ext_value = buf.pull_uint_var()
+                else:
+                    # odd type → length-prefixed bytes value
+                    value_len = buf.pull_uint_var()
+                    ext_value = buf.pull_bytes(value_len)
+            except BufferReadError:
+                if with_length:
+                    raise
+                # Trailing extensions block on a control message is
+                # truncated: the peer's wire-level msg_len declares
+                # more bytes than form a valid KVP. This is a spec
+                # violation (d16 §9.13). Count it regardless of
+                # policy so the event is always recorded.
+                MOQTMessage._trailing_extensions_truncation_count += 1
+                if not MOQTMessage._tolerate_trailing_extensions:
+                    raise RuntimeError(
+                        f"non-compliant peer: truncated trailing "
+                        f"extensions block (kvp_start={kvp_start} "
+                        f"tell={buf.tell()} exts_end={exts_end} "
+                        f"parsed_kvps={len(exts)})"
+                    )
+                logger.error(
+                    "MOQT wire non-compliance tolerated: truncated "
+                    "trailing extensions block "
+                    "(kvp_start=%d tell=%d exts_end=%d) — "
+                    "returned %d KVPs; enabled by "
+                    "--compat lenient-extensions",
+                    kvp_start, buf.tell(), exts_end, len(exts),
+                )
+                buf.seek(exts_end)
+                return exts if exts else None
             if buf.tell() > exts_end:
                 # KVP read succeeded against buf.capacity but crossed
                 # our logical end-of-message — malformed framing.

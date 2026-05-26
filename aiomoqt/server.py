@@ -25,8 +25,10 @@ class MOQTServer(MOQTPeer):
         use_quic: Optional[bool] = False,
         draft_version: Optional[int] = None,
         debug: Optional[bool] = False,
+        tx_max_inflight_bytes: Optional[int] = None,
+        congestion_control_algorithm: Optional[str] = "bbr",
     ):
-        super().__init__()
+        super().__init__(tx_max_inflight_bytes=tx_max_inflight_bytes)
         self.host = host
         self.port = port
         self.path = path
@@ -41,6 +43,7 @@ class MOQTServer(MOQTPeer):
         self.certificate = certificate
         self.private_key = private_key
         self.debug = debug
+        self.congestion_control_algorithm = congestion_control_algorithm
         self._loop = asyncio.get_running_loop()
         self._server_closed: Future[Tuple[int, str]] = self._loop.create_future()
         self._next_subscribe_id = 1
@@ -58,6 +61,12 @@ class MOQTServer(MOQTPeer):
                 alpn_protocols=alpn, is_client=False,
                 max_data=2**24, max_stream_data=2**24,
                 max_datagram_frame_size=64 * 1024,
+                # Default "bbr" — NewReno collapses to cwin=2*MSS on
+                # misdetected loss (GIL-induced loopback RTT spikes)
+                # and can't recover. Operator-overridable via
+                # MOQTServer(congestion_control_algorithm=...).
+                congestion_control_algorithm=(
+                    self.congestion_control_algorithm),
             )
             cfg.load_cert_chain(self.certificate, self.private_key)
             protocol = lambda *a, **kw: MOQTSessionQuic(*a, **kw, session=self)

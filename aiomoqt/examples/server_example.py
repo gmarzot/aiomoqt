@@ -18,7 +18,11 @@ def parse_args():
     parser.add_argument('--debug', action='store_true', help='Enable debug output')
     parser.add_argument('--quic-debug', action='store_true',  help='Enable quic debug output')
     parser.add_argument('--keylogfile', type=str, default=None, help='TLS secrets file')
-    
+    parser.add_argument('--cc-algo', type=str, default='bbr',
+                        help='Congestion control algorithm '
+                             '(bbr | bbr1 | newreno | cubic | dcubic | '
+                             'prague | fast). Default: bbr')
+
     return parser.parse_args()
 
 async def main(args):
@@ -32,7 +36,8 @@ async def main(args):
         certificate=args.certificate,
         private_key=args.private_key,
         path=args.path,
-        debug=args.debug
+        debug=args.debug,
+        congestion_control_algorithm=args.cc_algo,
     )
 
     logger.info(f"MOQT server: starting session: {server}")

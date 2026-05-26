@@ -88,6 +88,10 @@ examples:
                         help='Skip TLS certificate verification')
     parser.add_argument('--draft', type=int, default=None,
                         help='MoQT draft version (e.g. 14, 16)')
+    parser.add_argument('--cc-algo', type=str, default='bbr',
+                        help='Congestion control algorithm '
+                             '(bbr | bbr1 | newreno | cubic | dcubic | '
+                             'prague | fast). Default: bbr')
     args = parser.parse_args()
     if args.trackname is None:
         import uuid
@@ -130,6 +134,12 @@ async def run(args):
     log_level = logging.DEBUG if args.debug else logging.WARNING
     set_log_level(log_level)
 
+    # AIOMOQT_TASK_DUMP=1 installs a SIGUSR1 handler that dumps every
+    # asyncio task's stack to stderr. Useful for diagnosing hangs:
+    # `kill -USR1 <pid>` while the bench is stuck. No-op when unset.
+    from aiomoqt.utils.taskdump import install as _install_task_dump
+    _install_task_dump()
+
     relay = parse_relay_url(args.relay, force_quic=args.force_quic)
     print_banner(relay, args)
 
@@ -141,6 +151,7 @@ async def run(args):
         draft_version=args.draft,
         debug=args.debug,
         keylog_filename=args.keylogfile,
+        congestion_control_algorithm=args.cc_algo,
     )
 
     print(f"  Connecting...")

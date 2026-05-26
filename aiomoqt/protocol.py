@@ -36,6 +36,14 @@ USER_AGENT = f"aiomoqt/{version('aiomoqt')}"
 logger = get_logger(__name__)
 
 
+# Producer-side bytes cap on the aiopquic TX SPSC ring. Used as the
+# default for MOQTPeer.tx_max_inflight_bytes. 2 MB corresponds to ~10 ms
+# of queue at 1.6 Gbps drain — a workable starting point across typical
+# bandwidths. A future tx_target_latency_ms API will derive the byte
+# budget from a latency target + auto-tracked drain rate.
+DEFAULT_TX_MAX_INFLIGHT_BYTES = 2_000_000
+
+
 class MOQTStreamReject(Exception):
     """Raised by the data-stream parser when an incoming uni stream fails
     MoQT-level admission (unknown request_id/track_alias, budget exceeded,
@@ -54,11 +62,29 @@ class MOQTStreamReject(Exception):
 # base class for client and server session objects
 class MOQTPeer:
     """MOQT client and server base-class."""
-    def __init__(self, allow_optional_dgram: bool = False, libquicr_compat: bool = False):
+    def __init__(self, allow_optional_dgram: bool = False,
+                 libquicr_compat: bool = False,
+                 tx_max_inflight_bytes: Optional[int] =
+                     DEFAULT_TX_MAX_INFLIGHT_BYTES):
         #  message handlers
         self._control_msg_handlers: Dict[int, Tuple[Type, Callable]] = {}
         self.allow_optional_dgram = allow_optional_dgram
         self.libquicr_compat = libquicr_compat
+        # Bytes-aware producer backpressure target. When set,
+        # MOQTSession.stream_write_drain awaits a TX-ring drain before
+        # pushing more bytes once aiopquic reports tx_pending_bytes()
+        # above this threshold. Independent of the SPSC ring's entry
+        # capacity (settable via QuicConfiguration.event_ring_capacity).
+        #
+        # Default 2 MB corresponds to ~10 ms of queue at 1.6 Gbps drain
+        # — a reasonable starting point across typical workloads. Pass
+        # None to opt out of the byte cap entirely (the ring's entry
+        # capacity becomes the only backpressure boundary).
+        #
+        # Sizing: target_latency_ms * target_throughput_bytes_per_sec.
+        # Future API (0.9.6+): tx_target_latency_ms with auto-tracked
+        # drain rate, so callers can express the budget directly.
+        self.tx_max_inflight_bytes = tx_max_inflight_bytes
 
     def register_handler(self, msg_type: int, handler: Callable) -> None:
         """Register a custom message handler."""
@@ -432,6 +458,47 @@ class _MOQTSessionMixin:
                 f"{''.join(traceback.format_exception(type(e), e, e.__traceback__))}"
             )
             raise
+
+    def _dump_data_streams(self, file=None) -> dict:
+        """Per-stream chain-introspection. Returns and prints a dict of
+        {stream_id: (chain_chunks, chain_total_bytes, bytes_parsed,
+                     group_id, object_id, parser_type)}.
+        Used by SIGUSR2 to localize where bytes are pinned downstream
+        of aiopquic's drain. Called from aiomoqt.utils.taskdump."""
+        import sys
+        if file is None:
+            file = sys.stderr
+        out = {}
+        total_chains = 0
+        total_chunks = 0
+        total_bytes = 0
+        for sid, state in self._data_streams.items():
+            chain = state.chain
+            # _chunks is the internal deque; len() is the count.
+            try:
+                chunks_n = len(chain._chunks)
+            except Exception:
+                chunks_n = -1
+            total_chunks += max(0, chunks_n)
+            total_bytes += chain.capacity
+            total_chains += 1
+            out[sid] = (chunks_n, chain.capacity, state.bytes_total,
+                        state.group_id, state.object_id,
+                        type(state.parser).__name__ if state.parser
+                        else None)
+        print(f"=== aiomoqt chain-dump "
+              f"({total_chains} active streams, "
+              f"{total_chunks} chunks pinned, "
+              f"{total_bytes} bytes pending parse) ===",
+              file=file, flush=True)
+        for sid in sorted(out.keys()):
+            n_chunks, cap, parsed, gid, oid, pt = out[sid]
+            print(f"  sid={sid:<5} chunks={n_chunks:<6} "
+                  f"chain_bytes={cap:<10} parsed={parsed:<12} "
+                  f"group={gid} object={oid} parser={pt}",
+                  file=file, flush=True)
+        print(f"=== end chain-dump ===", file=file, flush=True)
+        return out
 
     def _cleanup_stream(self, stream_id: int,
                         error_code: int = QuicErrorCode.NO_ERROR) -> None:
@@ -1226,22 +1293,91 @@ class _MOQTSessionMixin:
                     f"[DESYNC-TRACE TX] stream({stream_id}) first write "
                     f"len={len(data) if data else 0} fin={end_stream} "
                     f"head_hex={head}")
-        # WT connection objects don't yet implement get_tx_drain_event;
-        # fall back to polling sleep on that path.
+        # Per-stream sc->tx wakeup (signaled when picoquic worker drains
+        # this stream's outbound byte ring). WT connection objects may
+        # not implement get_tx_drain_event yet — fall back path below.
         get_event = getattr(self._quic, 'get_tx_drain_event', None)
-        event = get_event(stream_id) if get_event is not None else None
+        sc_event = get_event(stream_id) if get_event is not None else None
+        # Connection-global TX SPSC ring wakeup (signaled when worker
+        # drains the event ring below low-water while we've armed
+        # tx_ring_drain_pending). Use this for ring-pressure waits;
+        # the per-stream sc_event is only armed when sc->tx fills.
+        transport = getattr(self._quic, '_transport', None)
+        ring_event = (transport.tx_ring_drain_event
+                       if transport is not None else None)
+        max_bytes = self._session.tx_max_inflight_bytes
         while True:
             if not self._session_writable():
                 return
-            if event is not None:
-                event.clear()
+            # Bytes-aware producer backpressure. tx_pending_bytes is
+            # per-stream sc->tx->used in the pull model — so the wait
+            # MUST align with sc->tx drain (per-stream sc_event), NOT
+            # SPSC ring drain (connection-global ring_event). Wrong
+            # alignment causes a busy-loop-throttle: producer wakes on
+            # every MARK_ACTIVE pop, rechecks sc->tx, finds it still
+            # > max_bytes, waits again — throughput collapses to the
+            # rate at which the SPSC ring cycles.
+            sc_ptr = (self._quic._stream_ctxs.get(stream_id)
+                      if hasattr(self._quic, '_stream_ctxs') else None)
+            if (transport is not None and sc_event is not None
+                    and sc_ptr and max_bytes is not None
+                    and self._quic.tx_pending_bytes(stream_id) > max_bytes):
+                sc_event.clear()
+                transport.arm_stream_tx_drain_pending(sc_ptr)
+                if self._quic.tx_pending_bytes(stream_id) <= max_bytes:
+                    transport.clear_stream_tx_drain_pending(sc_ptr)
+                    continue
+                await sc_event.wait()
+                continue
+            # Ring-fill saturation guard (connection-global tx_pressure).
+            # Same clear-arm-recheck-wait pattern.
+            if (transport is not None and ring_event is not None
+                    and self._quic.tx_pressure(stream_id) > 0.9):
+                ring_event.clear()
+                transport.arm_tx_ring_drain_pending()
+                if self._quic.tx_pressure(stream_id) <= 0.9:
+                    transport.clear_tx_ring_drain_pending()
+                    continue
+                await ring_event.wait()
+                continue
+            # Clear both events BEFORE the send. If the worker fires
+            # them during our send_stream_data call (race between
+            # Cython arming and us catching the exception), the set
+            # will land AFTER our clear → captured on the wait.
+            # Clearing AFTER the BufferError loses the wakeup.
+            if sc_event is not None:
+                sc_event.clear()
+            if ring_event is not None:
+                ring_event.clear()
             try:
                 self._quic.send_stream_data(
                     stream_id, data, end_stream=end_stream)
+                # Soft backpressure: release the GIL when the picoquic
+                # worker has TX entries pending. Without this, a fast
+                # publish loop can monopolize the event loop on Python
+                # paths where send_stream_data succeeds repeatedly
+                # without ever awaiting (no hard BufferError), starving
+                # the worker.
+                if self._quic.tx_pressure(stream_id) > 0.5:
+                    await asyncio.sleep(0)
                 return
             except BufferError:
-                if event is not None:
-                    await event.wait()
+                # Cython side armed the appropriate signal — sc->tx full
+                # arms per-stream event; TX-ring full arms connection-
+                # global event. Wait on whichever fires first; events
+                # were cleared BEFORE the call so no lost wakeup.
+                if sc_event is not None and ring_event is not None:
+                    sc_wait = asyncio.create_task(sc_event.wait())
+                    ring_wait = asyncio.create_task(ring_event.wait())
+                    done, pending = await asyncio.wait(
+                        [sc_wait, ring_wait],
+                        return_when=asyncio.FIRST_COMPLETED)
+                    for t in pending:
+                        t.cancel()
+                elif sc_event is not None:
+                    await sc_event.wait()
+                elif ring_event is not None:
+                    await ring_event.wait()
                 else:
                     await asyncio.sleep(0.0001)
             except (AssertionError, AttributeError) as e:
@@ -1780,7 +1916,7 @@ class _MOQTSessionMixin:
         if not wait_response:
             return message
 
-        return self._await_response(request_id)
+        return await self._await_response(request_id)
 
     def subscribe_namespace_ok(
         self,
@@ -2324,9 +2460,19 @@ class _WTSessionMixin:
         """Translate WT-specific events into the QuicEvent classes
         the mixin's quic_event_received already handles, then
         dispatch through that path. Falls back to WebTransportSession
-        base handling for session-level signals (ready/closed)."""
-        super()._on_event(ev_tuple)
-        evt_type, sid, data, _is_fin, error_code, _cnx, _ = ev_tuple
+        base handling for session-level signals (ready/closed).
+
+        IMPORTANT: For event types we translate AND dispatch via
+        quic_event_received here, we MUST NOT call super()._on_event
+        — the base WebTransportSession enqueues those events into
+        per-stream inbox / session event queues that we never drain,
+        which pins the data memoryview (and the StreamChunk behind
+        it) forever. That was the WT-bloat root cause: chunks_alive
+        grew unbounded because every WT_STREAM_DATA event held a
+        memoryview ref via the never-drained _stream_inbox queue.
+        Only call super() for event types we do NOT translate here.
+        """
+        evt_type, sid, data, _is_fin, error_code, _cnx, _, _sc = ev_tuple
         from aiopquic.quic.events import (
             StreamDataReceived as _SD, StreamReset as _SR,
             StopSendingReceived as _SS, DatagramFrameReceived as _DG,
@@ -2336,6 +2482,17 @@ class _WTSessionMixin:
             _EVT_WT_STREAM_RESET, _EVT_WT_STOP_SENDING,
             _EVT_WT_DATAGRAM,
         )
+        translated = {
+            _EVT_WT_STREAM_DATA, _EVT_WT_STREAM_FIN,
+            _EVT_WT_STREAM_RESET, _EVT_WT_STOP_SENDING,
+            _EVT_WT_DATAGRAM,
+        }
+        if evt_type not in translated:
+            # Session-level events (ready/closed/draining, new_stream,
+            # tx_drained, etc) still need base handling for queue/event
+            # signaling; they don't carry stream payload that pins
+            # chunks.
+            super()._on_event(ev_tuple)
         if evt_type == _EVT_WT_STREAM_DATA:
             self.quic_event_received(_SD(stream_id=sid, data=data,
                                           end_stream=False))
@@ -2373,4 +2530,8 @@ class MOQTSessionWTServer(
 
     def __init__(self, transport, state, *, session: 'MOQTPeer'):
         super().__init__(transport, state, session=session)
+        draft = getattr(session, 'draft_version', None)
+        if draft is not None:
+            set_moqt_ctx_version(draft)
+            self._moqt_version = draft
         self._moqt_wt_finalize()

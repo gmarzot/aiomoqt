@@ -10,13 +10,16 @@ authors = [
 ]
 dependencies = [
     "certifi",
-    "aiopquic>=0.3.2",
+    "aiopquic>=0.3.5",
     "sortedcontainers>=2.4.0",
 ]
 
 [project.urls]
 Homepage = "https://github.com/gmarzot/aiomoqt"
 Repository = "https://github.com/gmarzot/aiomoqt.git"
+
+[project.scripts]
+aiomoqt-versions = "aiomoqt.versions:main"
 
 [project.optional-dependencies]
 test = [

@@ -253,6 +253,10 @@ def parse_args():
     parser.add_argument('--gop-pattern', type=str, default='ibp',
                         choices=['ibp', 'ip', 'ionly'],
                         help='GOP pattern (default: ibp)')
+    parser.add_argument('--cc-algo', type=str, default='bbr',
+                        help='Congestion control algorithm '
+                             '(bbr | bbr1 | newreno | cubic | dcubic | '
+                             'prague | fast). Default: bbr')
 
     return parser.parse_args()
 
@@ -261,7 +265,8 @@ async def main(host: str, port: int, path: str, namespace: str, trackname: str,
                debug: bool, datagram: bool, use_quic: bool, quic_debug: bool,
                insecure: bool = False, auth_token: str = None, draft: int = None,
                streams: int = 1, object_size: int = 1024, rate: float = 30,
-               duration: int = 120, video: str = None, gop_pattern: str = 'ibp'):
+               duration: int = 120, video: str = None, gop_pattern: str = 'ibp',
+               cc_algo: str = 'bbr'):
     log_level = logging.DEBUG if debug else logging.INFO
     set_log_level(log_level)
     logger = get_logger(__name__)
@@ -275,6 +280,7 @@ async def main(host: str, port: int, path: str, namespace: str, trackname: str,
         draft_version=draft,
         debug=debug,
         keylog_filename=args.keylogfile,
+        congestion_control_algorithm=cc_algo,
     )
 
     auth = auth_token.encode() if auth_token else b""
@@ -340,6 +346,7 @@ if __name__ == "__main__":
             duration=args.duration,
             video=args.video,
             gop_pattern=args.gop_pattern,
+            cc_algo=args.cc_algo,
         ))
 
     except KeyboardInterrupt:

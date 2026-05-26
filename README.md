@@ -34,6 +34,25 @@ uv pip install aiomoqt    # or: pip install aiomoqt
 
 A `./bootstrap_python.sh` script is provided for a uv-managed `.venv` if you want a clean dev environment.
 
+### Reporting issues
+
+Include the full version report in any issue. It captures aiomoqt, aiopquic, and the picoquic + picotls submodule SHAs aiopquic was built from — useful for diagnosing version-pair mismatches across the stack:
+
+```bash
+python -m aiomoqt.versions   # or the console script: aiomoqt-versions
+```
+
+Sample output:
+
+```
+aiomoqt  0.9.5.dev7+g69f55724e.d20260520
+         /path/to/aiomoqt
+aiopquic 0.3.5.dev4+g2ffe8947d.d20260522
+         /path/to/aiopquic
+picoquic 2b1e14d5a46532eadf691edef5bd747da6de6557
+picotls  f350eab60742138ac62b42ee444adf04c7898b0d
+```
+
 ## Quick Start
 
 ### Subscriber

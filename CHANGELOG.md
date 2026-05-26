@@ -1,5 +1,52 @@
 # Changelog
 
+## v0.9.5 (unreleased)
+
+Pairs with [aiopquic 0.3.5](https://pypi.org/project/aiopquic/0.3.5/);
+dep floor `aiopquic>=0.3.2` → `aiopquic>=0.3.5`.
+
+### WT receiver bloat (RELEASE BLOCKER) — root cause + fix
+
+`_WTSessionMixin._on_event` in `protocol.py` previously called `super()._on_event(ev_tuple)` for every WT event, then re-dispatched stream/datagram events via `quic_event_received` for the MoQT data path. The `super()` call enqueued `_EVT_WT_STREAM_DATA` / `_EVT_WT_STREAM_FIN` / `_EVT_WT_DATAGRAM` events into per-stream `asyncio.Queue` instances inside `WebTransportSession._stream_inbox` — but aiomoqt never consumes those queues (it routes via the QuicEvent translation path instead). Every queued event held a reference to the `memoryview` payload, which in turn pinned the underlying `aiopquic` `StreamChunk` alive. At 2.5 Gbps the leak grew ~60K chunks/sec → 5–18 GB RSS within 30–60 s.
+
+Fix: skip `super()._on_event(ev_tuple)` for the event types we translate locally. Session-level events (ready / closed / draining / new_stream / tx_drained) still go through the base handler for their queue / Future signaling. After the fix: `chunks_alive_total` stays in single digits, RSS bounded, throughput unchanged (~2.3 Gbps), p99 latency drops from 384 ms (cliff) to 39 ms. Verified at 60 s sustained loopback with SIGUSR2 counter dumps.
+
+### Per-session data-stream chain introspection
+
+- `_MOQTSessionMixin._dump_data_streams(file=stderr)` walks `_data_streams` and reports per-stream `StreamChain` capacity + parse progress (`bytes_total`, `group_id`, `object_id`, parser type). Returns the dict for programmatic use.
+- `aiomoqt.utils.taskdump`'s SIGUSR2 handler extended to walk live `MOQTSession` instances and emit the chain dump after the aiopquic counter dump. Tells you in one signal whether bytes are pinned at the chain layer (parser hot path) or downstream (was the diagnostic that localized the bloat above).
+
+### WT-server d16 draft pin
+
+`MOQTSessionWTServer.__init__` now calls `set_moqt_ctx_version(session.draft_version)` symmetrically with the raw-QUIC ALPN handler and the WT-client init path. Without it, the global `moqt_version` stayed at `MOQT_VERSION_DRAFT14` on the server, so `ClientSetup.deserialize` expected the d14 wire format (version list first) while a d16 client sent the d16 format (no version list) — observable as `BufferReadError` on the first incoming `ClientSetup`. Unblocks 2-proc WT d16; validated at 2.2-2.3 Gbps p99 75ms.
+
+### Observability
+
+- `--cc-algo` flag exposed on `MOQTServer` / `MOQTClient` and 11 example tools (`loopback_bench`, `pub_server`, `sub_bench`, `pub_bench`, `multi_sub_bench`, `adaptive_bench`, `relay_bench`, `pub_example`, `sub_example`, `server_example`, `join_example`). Passes through to `QuicConfiguration.congestion_control_algorithm`. Default BBR.
+- `python -m aiomoqt.versions` / `aiomoqt-versions` documented in README ("Reporting issues" section). Chains through `aiopquic.versions` for full stack: aiomoqt + aiopquic + picoquic + picotls.
+
+### Tooling
+
+- `[tool.ruff] line-length = 100` retained as the standard (aiopquic now matches).
+
+### Pressure-based yield in `stream_write_drain`
+
+`PublishedTrack._generate_subgroup` previously yielded with
+`asyncio.sleep(0)` every 64 objects on the unbounded-rate (`-r 0`)
+path. On fast Python publish loops that count-based heuristic can
+starve the picoquic worker between yields, capping throughput well
+below the transport ceiling.
+
+`MOQTSession.stream_write_drain` now performs a soft pressure-based
+yield: after a successful (non-`BufferError`) write, it checks
+`tx_pressure(stream_id)` and `await asyncio.sleep(0)` if pressure
+exceeds 0.5. Every aiomoqt sender benefits — including third-party
+publishers that drive the API directly, not just `PublishedTrack`.
+
+The count-based `else: ... asyncio.sleep(0)` block in
+`_generate_subgroup` is removed; bounded-rate (`-r N>0`) callers pace
+via `asyncio.sleep(1/rate)` as before.
+
 ## v0.9.4 (2026-05-16)
 
 Pairs with [aiopquic 0.3.2](https://pypi.org/project/aiopquic/0.3.2/);

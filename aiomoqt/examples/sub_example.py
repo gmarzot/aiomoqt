@@ -30,6 +30,10 @@ def parse_args():
     parser.add_argument('-t', '--duration', type=int, default=120, help='Duration in seconds (default: 120)')
     parser.add_argument('--subscribe-options', type=int, default=None,
                         help='d16 subscribe_namespace options: 0=PUBLISH, 1=NAMESPACE, 2=both')
+    parser.add_argument('--cc-algo', type=str, default='bbr',
+                        help='Congestion control algorithm '
+                             '(bbr | bbr1 | newreno | cubic | dcubic | '
+                             'prague | fast). Default: bbr')
 
     return parser.parse_args()
 
@@ -138,7 +142,8 @@ async def main(host: str, port: int, path: str, namespace: str, track_name: str,
                use_quic: bool, debug: bool, quic_debug: bool, insecure: bool = False,
                auth_token: str = None, draft: int = None, libquicr_compat: bool = False,
                duration: int = 120,
-               subscribe_options: int = None):
+               subscribe_options: int = None,
+               cc_algo: str = 'bbr'):
     log_level = logging.DEBUG if debug else logging.INFO
     set_log_level(log_level)
     logger = get_logger(__name__)
@@ -154,6 +159,7 @@ async def main(host: str, port: int, path: str, namespace: str, track_name: str,
         libquicr_compat=libquicr_compat,
         debug=debug,
         keylog_filename=args.keylogfile,
+        congestion_control_algorithm=cc_algo,
     )
     logger.info(f"MOQT app: subscribe session connecting: {client}")
     try:
@@ -207,6 +213,7 @@ if __name__ == "__main__":
             libquicr_compat=args.libquicr_compat,
             duration=args.duration,
             subscribe_options=args.subscribe_options,
+            cc_algo=args.cc_algo,
         ), debug=args.debug)
 
     except KeyboardInterrupt:
