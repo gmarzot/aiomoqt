@@ -1303,7 +1303,7 @@ class _MOQTSessionMixin:
         # tx_ring_drain_pending). Use this for ring-pressure waits;
         # the per-stream sc_event is only armed when sc->tx fills.
         transport = getattr(self._quic, '_transport', None)
-        ring_event = (transport.tx_ring_drain_event
+        ring_event = (transport.tx_event_ring_drain_event
                        if transport is not None else None)
         max_bytes = self._session.tx_max_inflight_bytes
         while True:
@@ -1334,9 +1334,9 @@ class _MOQTSessionMixin:
             if (transport is not None and ring_event is not None
                     and self._quic.tx_pressure(stream_id) > 0.9):
                 ring_event.clear()
-                transport.arm_tx_ring_drain_pending()
+                transport.arm_tx_event_ring_drain_pending()
                 if self._quic.tx_pressure(stream_id) <= 0.9:
-                    transport.clear_tx_ring_drain_pending()
+                    transport.clear_tx_event_ring_drain_pending()
                     continue
                 await ring_event.wait()
                 continue
