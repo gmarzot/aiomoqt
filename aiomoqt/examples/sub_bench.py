@@ -16,6 +16,7 @@ import asyncio
 import logging
 import math
 import os
+import random
 import time
 import tracemalloc
 
@@ -50,7 +51,9 @@ class BenchStats:
         self.first_object_time: float = 0
         self.last_object_time: float = 0
 
-        # Per-interval (reset each report)
+        # Per-interval (reset each report). Latency list is bounded by
+        # interval × rate, not by run length, so it stays small for any
+        # reasonable -i.
         self.iv_objects: int = 0
         self.iv_bytes: int = 0
         self.iv_latencies: list = []
@@ -59,7 +62,19 @@ class BenchStats:
         self.total_objects: int = 0
         self.total_bytes: int = 0
         self.total_groups: set = set()  # unique group_ids seen
-        self.all_latencies: list = []
+
+        # Cumulative latency stats — constant-memory replacements for
+        # the previous all_latencies list. min/max/avg/sd computed from
+        # running sums; percentiles estimated from a bounded reservoir
+        # sample (Algorithm R), which gives unbiased estimates of any
+        # quantile from a stream of unknown total length.
+        self.lat_count: int = 0
+        self.lat_sum: float = 0.0
+        self.lat_sum_sq: float = 0.0
+        self.lat_min: float = float('inf')
+        self.lat_max: float = float('-inf')
+        self.lat_reservoir: list = []
+        self.lat_reservoir_max: int = 10000  # ~250 KB at 8 B / float
 
         # Loss tracking per group/subgroup
         self.expected_seq: dict = {}   # key → next expected object_id
@@ -67,11 +82,13 @@ class BenchStats:
         self.total_lost: int = 0
         self.total_ooo: int = 0
 
-        # RFC 3550 interarrival jitter
+        # RFC 3550 interarrival jitter — running sum + count (constant
+        # memory) instead of full-history list.
         self.last_recv_ms: float = 0
         self.last_send_ms: float = 0
         self.jitter: float = 0.0
-        self.jitter_samples: list = []
+        self.jitter_sum: float = 0.0
+        self.jitter_count: int = 0
 
     def on_object(self, msg, size_bytes: int, recv_time_us: int,
                   group_id: int = None, subgroup_id: int = None):
@@ -102,14 +119,31 @@ class BenchStats:
 
         if latency is not None:
             self.iv_latencies.append(latency)
-            self.all_latencies.append(latency)
+
+            # Update cumulative latency running stats + reservoir.
+            self.lat_sum += latency
+            self.lat_sum_sq += latency * latency
+            if latency < self.lat_min:
+                self.lat_min = latency
+            if latency > self.lat_max:
+                self.lat_max = latency
+            if len(self.lat_reservoir) < self.lat_reservoir_max:
+                self.lat_reservoir.append(latency)
+            else:
+                # Algorithm R: replace index k with probability
+                # reservoir_max / count_seen.
+                j = random.randint(0, self.lat_count)
+                if j < self.lat_reservoir_max:
+                    self.lat_reservoir[j] = latency
+            self.lat_count += 1
 
             # RFC 3550 jitter (us domain → ms result)
             if self.last_recv_ms > 0 and self.last_send_ms is not None:
                 d = abs((recv_time_us - self.last_recv_ms)
                         - (send_us - self.last_send_ms)) / 1000.0
                 self.jitter += (d - self.jitter) / 16.0
-                self.jitter_samples.append(self.jitter)
+                self.jitter_sum += self.jitter
+                self.jitter_count += 1
             self.last_recv_ms = recv_time_us
             self.last_send_ms = send_us
 
@@ -228,7 +262,6 @@ class BenchStats:
         active = active if active > 0 else dur
         rate = self.total_objects / active
         mbps = (self.total_bytes * 8) / (active * 1e6)
-        lat = self.all_latencies
         total_expected = self.total_objects + self.total_lost
         loss_pct = (
             self.total_lost / total_expected * 100
@@ -245,24 +278,27 @@ class BenchStats:
         print(f"  Rate:        {rate:.1f} obj/s")
         print(f"  Throughput:  {mbps:.2f} Mbps")
 
-        if lat:
-            avg = sum(lat) / len(lat)
-            var = sum((x - avg) ** 2 for x in lat) / len(lat)
+        if self.lat_count > 0:
+            avg = self.lat_sum / self.lat_count
+            var = max(0.0, self.lat_sum_sq / self.lat_count - avg * avg)
             sd = math.sqrt(var)
             print(
-                f"  Latency:     min={min(lat):.1f}  "
-                f"avg={avg:.1f}  max={max(lat):.1f}  "
+                f"  Latency:     min={self.lat_min:.1f}  "
+                f"avg={avg:.1f}  max={self.lat_max:.1f}  "
                 f"sd={sd:.1f} ms"
             )
+            # Percentiles from reservoir sample (Algorithm R). With a
+            # 10K reservoir we get unbiased p50/p95/p99 estimates from
+            # any-length stream at constant memory.
+            sample = self.lat_reservoir
             print(
-                f"               p50={self._pct(lat, 50):.1f}  "
-                f"p95={self._pct(lat, 95):.1f}  "
-                f"p99={self._pct(lat, 99):.1f} ms"
+                f"               p50={self._pct(sample, 50):.1f}  "
+                f"p95={self._pct(sample, 95):.1f}  "
+                f"p99={self._pct(sample, 99):.1f} ms"
             )
 
-        if self.jitter_samples:
-            javg = (sum(self.jitter_samples)
-                    / len(self.jitter_samples))
+        if self.jitter_count > 0:
+            javg = self.jitter_sum / self.jitter_count
             print(
                 f"  Jitter:      {self.jitter:.2f} ms (final)  "
                 f"avg={javg:.2f} ms"
