@@ -439,8 +439,16 @@ class PublishedTrack(Track):
                                 if self.num_subgroups > 1 else self.rate)
                 if current_rate > 0:
                     next_frame_time += 1.0 / current_rate
-                    sleep_time = max(0, next_frame_time - time.monotonic())
-                    await asyncio.sleep(sleep_time)
+                    sleep_time = next_frame_time - time.monotonic()
+                    # asyncio.sleep can't reliably hit sub-ms targets on
+                    # Linux/WSL2 (precision floor ~50-200 µs depending on
+                    # host). When requested sleep is below the floor, fall
+                    # through to the no-sleep path — the catchup arithmetic
+                    # (next_frame_time +=) still bounds the AVERAGE rate at
+                    # the target; we just burst up to whatever per-iter
+                    # loop overhead allows, same shape as the r=0 path.
+                    if sleep_time > 0.0005:
+                        await asyncio.sleep(sleep_time)
                 # No explicit yield in the r=0 path: stream_write_drain
                 # handles pressure-based GIL release internally.
 
@@ -827,13 +835,15 @@ class VideoTrack(PublishedTrack):
 
                 # self.rate is AGGREGATE; per-stream cadence is
                 # rate / num_subgroups. See note in PublishedTrack.
+                # Sub-ms requested sleep falls through to no-sleep —
+                # see the matching block in _generate_subgroup.
                 current_rate = (self.rate / self.num_subgroups
                                 if self.num_subgroups > 1 else self.rate)
                 if current_rate > 0:
                     next_frame_time += 1.0 / current_rate
-                    sleep_time = max(0,
-                        next_frame_time - time.monotonic())
-                    await asyncio.sleep(sleep_time)
+                    sleep_time = next_frame_time - time.monotonic()
+                    if sleep_time > 0.0005:
+                        await asyncio.sleep(sleep_time)
                 # No explicit yield in the r=0 path: stream_write_drain
                 # handles pressure-based GIL release internally.
 
