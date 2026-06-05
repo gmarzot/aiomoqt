@@ -442,13 +442,17 @@ class PublishedTrack(Track):
                     sleep_time = next_frame_time - time.monotonic()
                     # asyncio.sleep can't reliably hit sub-ms targets on
                     # Linux/WSL2 (precision floor ~50-200 µs depending on
-                    # host). When requested sleep is below the floor, fall
-                    # through to the no-sleep path — the catchup arithmetic
-                    # (next_frame_time +=) still bounds the AVERAGE rate at
-                    # the target; we just burst up to whatever per-iter
-                    # loop overhead allows, same shape as the r=0 path.
+                    # host). When requested sleep is below the floor,
+                    # yield with sleep(0) instead — gets us close to the
+                    # r=0 ceiling while keeping the asyncio loop fair so
+                    # other tasks (RX dispatch, sub-side parsing) run.
+                    # Skipping the yield entirely starves the loop at
+                    # high P, triggering BBR cwin collapse from spurious
+                    # RTT spikes.
                     if sleep_time > 0.0005:
                         await asyncio.sleep(sleep_time)
+                    else:
+                        await asyncio.sleep(0)
                 # No explicit yield in the r=0 path: stream_write_drain
                 # handles pressure-based GIL release internally.
 
@@ -844,6 +848,8 @@ class VideoTrack(PublishedTrack):
                     sleep_time = next_frame_time - time.monotonic()
                     if sleep_time > 0.0005:
                         await asyncio.sleep(sleep_time)
+                    else:
+                        await asyncio.sleep(0)
                 # No explicit yield in the r=0 path: stream_write_drain
                 # handles pressure-based GIL release internally.
 
