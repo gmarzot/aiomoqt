@@ -70,6 +70,13 @@ class Track:
         rate: float = 0,
         draft: Optional[int] = None,
     ):
+        """
+        rate is the AGGREGATE target objects/sec across all subgroup
+        streams (0 = max, no pacing). Per-stream emit pacing is derived
+        as rate / num_subgroups inside the send loop, so num_subgroups
+        only changes parallelism — not offered load. Live mutation of
+        self.rate still picks up on the next iteration.
+        """
         self.session = session
         self.namespace = namespace
         self.trackname = trackname
@@ -426,7 +433,10 @@ class PublishedTrack(Track):
 
                 # Re-read rate each iteration so callers can mutate
                 # self.rate in-place and have it take effect live.
-                current_rate = self.rate
+                # self.rate is AGGREGATE across all subgroups; per-stream
+                # cadence is rate / num_subgroups.
+                current_rate = (self.rate / self.num_subgroups
+                                if self.num_subgroups > 1 else self.rate)
                 if current_rate > 0:
                     next_frame_time += 1.0 / current_rate
                     sleep_time = max(0, next_frame_time - time.monotonic())
@@ -815,7 +825,10 @@ class VideoTrack(PublishedTrack):
                     self._iv_groups = 0
                     last_report = now
 
-                current_rate = self.rate
+                # self.rate is AGGREGATE; per-stream cadence is
+                # rate / num_subgroups. See note in PublishedTrack.
+                current_rate = (self.rate / self.num_subgroups
+                                if self.num_subgroups > 1 else self.rate)
                 if current_rate > 0:
                     next_frame_time += 1.0 / current_rate
                     sleep_time = max(0,

@@ -58,7 +58,10 @@ examples:
     parser.add_argument('-P', '--streams', type=int, default=1,
                         help='Parallel subgroup streams (default: 1)')
     parser.add_argument('-r', '--rate', type=float, default=0,
-                        help='Objects/sec per stream (0=max, default: max)')
+                        help='Aggregate objects/sec across all streams '
+                             '(0=max, default: max). Per-stream emit rate '
+                             'is rate/streams. -P only changes parallelism, '
+                             'not offered load.')
     parser.add_argument('-t', '--duration', type=int, default=30,
                         help='Duration in seconds (default: 30)')
     pub_mode = parser.add_mutually_exclusive_group()
@@ -108,9 +111,11 @@ examples:
 def print_banner(relay, args):
     mode = "DATAGRAM" if args.datagram else f"SUBGROUP x{args.streams}"
     if args.rate > 0:
+        # rate is aggregate; per-stream is rate/streams (datagrams = 1 stream)
         n = 1 if args.datagram else args.streams
-        mbps = args.object_size * args.rate * n * 8 / 1e6
-        rate_s = f"{args.rate}/s per stream"
+        per_stream = args.rate / n
+        mbps = args.object_size * args.rate * 8 / 1e6
+        rate_s = f"{args.rate}/s total ({per_stream:.1f}/s per stream)"
         target_s = f"{mbps:.2f} Mbps"
     else:
         rate_s = "max"

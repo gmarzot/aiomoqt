@@ -54,7 +54,9 @@ def parse_args():
         help='Parallel subgroup streams (default: 1)')
     parser.add_argument(
         '-r', '--rate', type=float, default=0,
-        help='Objects/sec per stream (0=max, default: max)')
+        help='Aggregate objects/sec across all streams (0=max, '
+             'default: max). Per-stream emit rate is rate/streams. '
+             '-P only changes parallelism, not offered load.')
     parser.add_argument(
         '-t', '--duration', type=int, default=20,
         help='Duration seconds (default: 20)')
@@ -84,7 +86,9 @@ def parse_args():
 def print_banner(args):
     mode = f"SUBGROUP x{args.streams}"
     if args.rate > 0:
-        rate_s = f"{args.rate}/s per stream"
+        per_stream = (args.rate / args.streams
+                      if args.streams > 1 else args.rate)
+        rate_s = f"{args.rate}/s total ({per_stream:.1f}/s per stream)"
     else:
         rate_s = "max"
     transport_label = "QUIC" if args.quic else "H3/WebTransport"

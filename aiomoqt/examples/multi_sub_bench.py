@@ -51,7 +51,9 @@ def parse_args():
     parser.add_argument('-s', '--object-size', type=int, default=1024,
                         help='Object size bytes (default: 1024)')
     parser.add_argument('-r', '--rate', type=float, default=30,
-                        help='Objects/sec (default: 30)')
+                        help='Aggregate objects/sec across all streams '
+                             '(default: 30). Per-stream emit rate is '
+                             'rate/streams. For VideoTrack, treated as fps.')
     parser.add_argument('-g', '--group-size', type=int, default=None,
                         help='Objects per group (default: rate)')
     parser.add_argument('-t', '--duration', type=int, default=30,
