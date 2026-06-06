@@ -99,6 +99,13 @@ class Track:
         return f"{self.__class__.__name__}({self.fqtn}, state={self.state.name})"
 
 
+# 1-in-N gate for the paced fall-through yield. sleep(0) costs a few
+# microseconds; at -r 70000 every-iter cost dominates throughput. ~2 kHz
+# yields keeps RX dispatch fair (the prior raw-QUIC P=8 BBR cwin collapse
+# required near-zero yields). Power of two so the gate is a bitwise AND.
+_PACED_YIELD_EVERY = 32
+
+
 class PublishedTrack(Track):
     """Publisher-side track — announces namespace/track and generates data.
 
@@ -126,6 +133,11 @@ class PublishedTrack(Track):
         self._total_sent = 0
         self._total_bytes = 0
         self._total_groups = 0
+        # Tick counter gating the sub-precision-floor yield in the paced
+        # producer loop. Shared across this track's subgroup tasks;
+        # VideoTrack inherits via super().__init__. Bounded to 16 bits to
+        # avoid CPython bigint promotion in long-running processes.
+        self._yield_tick = 0
 
     async def publish(self, announce_namespace: bool = False,
                       publish_track: bool = True,
@@ -440,19 +452,21 @@ class PublishedTrack(Track):
                 if current_rate > 0:
                     next_frame_time += 1.0 / current_rate
                     sleep_time = next_frame_time - time.monotonic()
-                    # asyncio.sleep can't reliably hit sub-ms targets on
-                    # Linux/WSL2 (precision floor ~50-200 µs depending on
-                    # host). When requested sleep is below the floor,
-                    # yield with sleep(0) instead — gets us close to the
-                    # r=0 ceiling while keeping the asyncio loop fair so
-                    # other tasks (RX dispatch, sub-side parsing) run.
-                    # Skipping the yield entirely starves the loop at
-                    # high P, triggering BBR cwin collapse from spurious
-                    # RTT spikes.
+                    # asyncio.sleep precision floor is ~50-200 µs on Linux/WSL2.
+                    # Above floor: real sleep (itself a yield). Below floor:
+                    # the 1-in-N sleep(0) IS the cooperative point — raw-QUIC
+                    # stream_write_drain only suspends under backpressure, so
+                    # the fast path has no other yield. Skipping yields
+                    # entirely starves the loop at high P, triggering BBR cwin
+                    # collapse from spurious RTT spikes. Aggregate yield rate
+                    # is ~ track-rate / N independent of num_subgroups
+                    # (current_rate already divides by it).
                     if sleep_time > 0.0005:
                         await asyncio.sleep(sleep_time)
                     else:
-                        await asyncio.sleep(0)
+                        self._yield_tick = (self._yield_tick + 1) & 0xFFFF
+                        if self._yield_tick & (_PACED_YIELD_EVERY - 1) == 0:
+                            await asyncio.sleep(0)
                 # No explicit yield in the r=0 path: stream_write_drain
                 # handles pressure-based GIL release internally.
 
@@ -849,7 +863,11 @@ class VideoTrack(PublishedTrack):
                     if sleep_time > 0.0005:
                         await asyncio.sleep(sleep_time)
                     else:
-                        await asyncio.sleep(0)
+                        # 1-in-N yield throttle; see PublishedTrack
+                        # ._generate_subgroup for rationale.
+                        self._yield_tick = (self._yield_tick + 1) & 0xFFFF
+                        if self._yield_tick & (_PACED_YIELD_EVERY - 1) == 0:
+                            await asyncio.sleep(0)
                 # No explicit yield in the r=0 path: stream_write_drain
                 # handles pressure-based GIL release internally.
 
