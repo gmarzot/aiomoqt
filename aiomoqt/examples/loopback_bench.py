@@ -80,6 +80,12 @@ def parse_args():
         help='Congestion control algorithm '
              '(bbr | bbr1 | newreno | cubic | dcubic | prague | fast). '
              'Default: bbr')
+    parser.add_argument(
+        '--max-inflight-bytes', type=int, default=0,
+        help='Per-stream producer byte-budget cap '
+             '(stream_tx_buf_used > N parks producer). '
+             '0 = off (default). Hysteresis: park at N, '
+             'resume at N//2.')
     return parser.parse_args()
 
 
@@ -137,6 +143,8 @@ async def run_server(args):
         path="/",
         use_quic=args.quic,
         congestion_control_algorithm=args.cc_algo,
+        tx_max_inflight_bytes=(args.max_inflight_bytes
+                               if args.max_inflight_bytes > 0 else None),
     )
     server.register_handler(
         MOQTMessageType.SUBSCRIBE,
