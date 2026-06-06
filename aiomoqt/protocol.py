@@ -36,14 +36,19 @@ USER_AGENT = f"aiomoqt/{version('aiomoqt')}"
 logger = get_logger(__name__)
 
 
-# Producer-side bytes cap on the aiopquic TX SPSC ring. Used as the
-# default for MOQTPeer.tx_max_inflight_bytes. None = off — the cap
-# is opt-in for callers that need a latency bound. Apps that opt in
-# should pick a value sized for their target latency × drain rate;
-# 16 MB is a workable starting point at 2-4 Gbps loopback (~32 ms
-# queue depth). A future tx_target_latency_ms API will derive the
-# byte budget from a latency target + auto-tracked drain rate.
-DEFAULT_TX_MAX_INFLIGHT_BYTES = None
+# Producer-side bytes cap on the per-stream sc->tx queue. Used as
+# the default for MOQTPeer.tx_max_inflight_bytes. 16 MB is sized to
+# never engage in healthy LAN/loopback steady-state (where producer
+# ≈ consumer rate, sc->tx queue stays well below the cap), but acts
+# as a fail-safe ceiling when the consumer falls behind — preventing
+# the unbounded producer-side memory growth that can otherwise
+# trigger OOM under sub-side stress. Apps with stricter latency
+# requirements can dial this down (2 MB ≈ 8 ms at 2 Gbps; smaller
+# values give lower latency at the cost of throughput headroom when
+# the consumer momentarily slows). Pass None to opt out entirely.
+# A future tx_target_latency_ms API will derive the byte budget
+# from a latency target + auto-tracked drain rate.
+DEFAULT_TX_MAX_INFLIGHT_BYTES = 16_000_000
 
 
 class MOQTStreamReject(Exception):
