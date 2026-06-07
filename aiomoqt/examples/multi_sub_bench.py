@@ -184,14 +184,19 @@ def run_subscriber(sub_id, relay_url, namespace, trackname, args,
     stats = {'id': sub_id, 'objects': 0, 'bytes': 0,
              'latencies': [], 'duration': 0, 'error': None}
 
-    def on_object(msg, size_bytes, recv_time_ms,
+    def on_object(msg, size_bytes, recv_time_us,
                   group_id=None, subgroup_id=None):
+        # protocol.py passes microseconds (int(time.time() * 1_000_000));
+        # MOQT_TIMESTAMP_EXT is in the same unit. Store latencies as
+        # float ms. Bounds match sub_bench: -1s to +10min in µs.
         stats['objects'] += 1
         stats['bytes'] += size_bytes
-        send_ms = (msg.extensions.get(0x20)
+        send_us = (msg.extensions.get(0x20)
                    if msg.extensions else None)
-        if send_ms and abs(recv_time_ms - send_ms) < 60000:
-            stats['latencies'].append(recv_time_ms - send_ms)
+        if send_us is not None:
+            raw_us = recv_time_us - send_us
+            if -1_000_000 <= raw_us <= 600_000_000:
+                stats['latencies'].append(raw_us / 1000.0)
 
     async def _sub():
         relay = parse_relay_url(relay_url, force_quic=args.force_quic)
@@ -344,8 +349,12 @@ def main():
     resets = 0
 
     def _sub_expected(r):
-        """Expected objects based on subscriber's actual run time."""
-        return int(args.rate * r['duration'] * 0.85)
+        """Informational target — rate × subscriber's actual run time.
+        Used for low-count flagging in the per-sub status, NOT for
+        pass/fail (the 0.85 fudge was too sensitive to pub-startup
+        offset and produced flaky 'reset' verdicts on healthy runs).
+        Actual stream resets are surfaced as r['error']=='StreamReset'."""
+        return int(args.rate * r['duration'])
 
     for i in range(args.subscribers):
         r = results.get(i)
@@ -356,8 +365,6 @@ def main():
             resets += 1
         elif r['error']:
             errors += 1
-        elif r['objects'] < _sub_expected(r):
-            resets += 1
         total_objects += r['objects']
         total_bytes += r['bytes']
         if r['lat_avg'] > 0:
@@ -394,8 +401,8 @@ def main():
         lat = f"{r['lat_avg']:.0f}ms" if r['lat_avg'] else "n/a"
         if r['error']:
             status = r['error']
-        elif r['objects'] < _sub_expected(r):
-            status = (f"reset ({r['objects']}/"
+        elif r['objects'] < int(_sub_expected(r) * 0.85):
+            status = (f"low ({r['objects']}/"
                       f"{_sub_expected(r)})")
         else:
             status = "ok"
