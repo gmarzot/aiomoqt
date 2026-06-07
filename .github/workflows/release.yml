@@ -106,6 +106,9 @@ jobs:
         TWINE_PASSWORD: ${{ secrets.TEST_PYPI_API_TOKEN }}
         TWINE_REPOSITORY_URL: https://test.pypi.org/legacy/
         PYTHONWARNINGS: "ignore::UserWarning"
+        # Force exact version, bypassing setuptools_scm git/tree
+        # detection. Insurance against dirty-tree at the tagged commit.
+        SETUPTOOLS_SCM_PRETEND_VERSION_FOR_AIOMOQT: ${{ needs.tag.outputs.version }}
       run: |
         python -m build
         twine upload dist/*
@@ -132,6 +135,9 @@ jobs:
         TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
         TWINE_REPOSITORY_URL: https://upload.pypi.org/legacy/
         PYTHONWARNINGS: "ignore::UserWarning"
+        # Force exact version, bypassing setuptools_scm git/tree
+        # detection. Insurance against dirty-tree at the tagged commit.
+        SETUPTOOLS_SCM_PRETEND_VERSION_FOR_AIOMOQT: ${{ needs.tag.outputs.version }}
       run: |
         python -m build
         twine upload dist/*

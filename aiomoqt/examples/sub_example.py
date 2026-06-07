@@ -7,6 +7,7 @@ import logging
 from aiomoqt.types import ParamType, MOQTException, MOQTRequestError
 from aiomoqt.client import MOQTClient
 from aiomoqt.track import SubscribedTrack
+from aiomoqt.utils import wait_cond_timeout
 from aiomoqt.utils.logger import *
 
 
@@ -178,7 +179,9 @@ async def main(host: str, port: int, path: str, namespace: str, track_name: str,
                     subscribe_options=subscribe_options)
                 logger.info(f"MOQT app: subscribed to {track.fqtn}")
 
-                await track.wait_closed(timeout=duration)
+                if not await wait_cond_timeout(
+                        track.wait_closed(), timeout=duration):
+                    track.completed = True
                 logger.info(f"MOQT app: exiting client session")
 
             except MOQTRequestError as e:

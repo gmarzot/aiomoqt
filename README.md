@@ -55,6 +55,23 @@ picotls  f350eab60742138ac62b42ee444adf04c7898b0d
 
 ## Quick Start
 
+### Verify install + relay liveness
+
+Confirm the stack is wired up before writing any code:
+
+```bash
+# Versions of aiomoqt + aiopquic + picoquic + picotls
+python -m aiomoqt.versions   # or: aiomoqt-versions
+
+# Liveness + supported drafts against a single relay (one line per probed transport).
+# Exit 0 if the relay answered SERVER_SETUP for at least one draft.
+python -m aiomoqt.examples.relay_probe --url moqt://moqx-main.ci.openmoq.org:4433
+# → moqx-main.ci.openmoq.org:4433  quic   draft-14,draft-16  ✓ (405ms)
+
+python -m aiomoqt.examples.relay_probe --url https://moqx-main.ci.openmoq.org:4433/moq-relay
+# → moqx-main.ci.openmoq.org:4433  h3/wt  draft-14,draft-16  ✓ (315ms)
+```
+
 ### Subscriber
 
 ```python

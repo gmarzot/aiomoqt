@@ -36,12 +36,19 @@ USER_AGENT = f"aiomoqt/{version('aiomoqt')}"
 logger = get_logger(__name__)
 
 
-# Producer-side bytes cap on the aiopquic TX SPSC ring. Used as the
-# default for MOQTPeer.tx_max_inflight_bytes. 2 MB corresponds to ~10 ms
-# of queue at 1.6 Gbps drain — a workable starting point across typical
-# bandwidths. A future tx_target_latency_ms API will derive the byte
-# budget from a latency target + auto-tracked drain rate.
-DEFAULT_TX_MAX_INFLIGHT_BYTES = 2_000_000
+# Producer-side bytes cap on the per-stream sc->tx queue. Used as
+# the default for MOQTPeer.tx_max_inflight_bytes. 16 MB is sized to
+# never engage in healthy LAN/loopback steady-state (where producer
+# ≈ consumer rate, sc->tx queue stays well below the cap), but acts
+# as a fail-safe ceiling when the consumer falls behind — preventing
+# the unbounded producer-side memory growth that can otherwise
+# trigger OOM under sub-side stress. Apps with stricter latency
+# requirements can dial this down (2 MB ≈ 8 ms at 2 Gbps; smaller
+# values give lower latency at the cost of throughput headroom when
+# the consumer momentarily slows). Pass None to opt out entirely.
+# A future tx_target_latency_ms API will derive the byte budget
+# from a latency target + auto-tracked drain rate.
+DEFAULT_TX_MAX_INFLIGHT_BYTES = 16_000_000
 
 
 class MOQTStreamReject(Exception):
@@ -71,19 +78,24 @@ class MOQTPeer:
         self.allow_optional_dgram = allow_optional_dgram
         self.libquicr_compat = libquicr_compat
         # Bytes-aware producer backpressure target. When set,
-        # MOQTSession.stream_write_drain awaits a TX-ring drain before
-        # pushing more bytes once aiopquic reports tx_pending_bytes()
-        # above this threshold. Independent of the SPSC ring's entry
+        # MOQTSession.stream_write_drain awaits per-stream sc->tx
+        # drain before pushing more bytes once aiopquic reports
+        # stream_tx_buf_used() above this threshold. Per-stream,
+        # data-ring scoped — independent of the SPSC event-ring entry
         # capacity (settable via QuicConfiguration.event_ring_capacity).
         #
-        # Default 2 MB corresponds to ~10 ms of queue at 1.6 Gbps drain
-        # — a reasonable starting point across typical workloads. Pass
-        # None to opt out of the byte cap entirely (the ring's entry
-        # capacity becomes the only backpressure boundary).
+        # Hysteresis: producer parks at HIGH water (this value),
+        # resumes at LOW water (this value // 2). Prevents the
+        # packet-granularity wake-bounce that would otherwise reduce
+        # effective throughput to ~packet_size / asyncio_turn.
         #
+        # Default None = no cap. Opt in for latency-bounded workloads.
         # Sizing: target_latency_ms * target_throughput_bytes_per_sec.
-        # Future API (0.9.6+): tx_target_latency_ms with auto-tracked
-        # drain rate, so callers can express the budget directly.
+        # At 2 Gbps loopback, 16 MB cap ≈ 64 ms latency budget; 2 MB
+        # cap ≈ 8 ms. The cap engages only above HIGH water so
+        # steady-state queue depth oscillates between HIGH/2 and HIGH.
+        # Future API: tx_target_latency_ms with auto-tracked drain
+        # rate, so callers can express the budget directly.
         self.tx_max_inflight_bytes = tx_max_inflight_bytes
 
     def register_handler(self, msg_type: int, handler: Callable) -> None:
@@ -1271,16 +1283,17 @@ class _MOQTSessionMixin:
 
     async def stream_write_drain(self, stream_id: int, data: bytes,
                                   end_stream: bool = False) -> None:
-        """Write bytes with event-driven backpressure on the TX ring.
+        """Write bytes with backpressure (Lens B delegation).
 
-        aiopquic owns wire-level congestion control. We backpressure
-        only on Python-vs-picoquic-worker rate mismatch: when sc->tx
-        fills, send_stream_data atomically arms tx_drain_pending and
-        raises BufferError; the worker CAS-clears that flag after
-        its next pop and fires SPSC_EVT_STREAM_TX_DRAINED, which
-        sets the per-stream asyncio.Event we await here. No timer-
-        heap polling on the hot saturation path.
+        aiomoqt-owned policy: optional per-stream byte-budget cap
+        with hysteresis (MOQTPeer.tx_max_inflight_bytes). The
+        wire-level mechanic (TX-ring saturation guard, BufferError
+        retry, soft post-send yield, close-time clean exit) is
+        delegated to aiopquic's send_stream_data_drained — single
+        source of truth per the backpressure-placement principle.
         """
+        if not self._session_writable():
+            return
         if _AIOMOQT_DESYNC_TRACE:
             seen = getattr(self, "_desync_tx_seen", None)
             if seen is None:
@@ -1293,96 +1306,29 @@ class _MOQTSessionMixin:
                     f"[DESYNC-TRACE TX] stream({stream_id}) first write "
                     f"len={len(data) if data else 0} fin={end_stream} "
                     f"head_hex={head}")
-        # Per-stream sc->tx wakeup (signaled when picoquic worker drains
-        # this stream's outbound byte ring). WT connection objects may
-        # not implement get_tx_drain_event yet — fall back path below.
-        get_event = getattr(self._quic, 'get_tx_drain_event', None)
-        sc_event = get_event(stream_id) if get_event is not None else None
-        # Connection-global TX SPSC ring wakeup (signaled when worker
-        # drains the event ring below low-water while we've armed
-        # tx_ring_drain_pending). Use this for ring-pressure waits;
-        # the per-stream sc_event is only armed when sc->tx fills.
-        transport = getattr(self._quic, '_transport', None)
-        ring_event = (transport.tx_ring_drain_event
-                       if transport is not None else None)
+        quic = self._quic
         max_bytes = self._session.tx_max_inflight_bytes
-        while True:
-            if not self._session_writable():
-                return
-            # Bytes-aware producer backpressure. tx_pending_bytes is
-            # per-stream sc->tx->used in the pull model — so the wait
-            # MUST align with sc->tx drain (per-stream sc_event), NOT
-            # SPSC ring drain (connection-global ring_event). Wrong
-            # alignment causes a busy-loop-throttle: producer wakes on
-            # every MARK_ACTIVE pop, rechecks sc->tx, finds it still
-            # > max_bytes, waits again — throughput collapses to the
-            # rate at which the SPSC ring cycles.
-            sc_ptr = (self._quic._stream_ctxs.get(stream_id)
-                      if hasattr(self._quic, '_stream_ctxs') else None)
-            if (transport is not None and sc_event is not None
-                    and sc_ptr and max_bytes is not None
-                    and self._quic.tx_pending_bytes(stream_id) > max_bytes):
+        # Byte-budget gate (aiomoqt-owned policy). Hysteresis: park at
+        # HIGH water (max_bytes), resume at LOW water (max_bytes // 2).
+        if (max_bytes is not None
+                and quic.stream_tx_buf_used(stream_id) > max_bytes):
+            low_water = max_bytes // 2
+            sc_event = quic.get_tx_drain_event(stream_id)
+            while quic.stream_tx_buf_used(stream_id) > low_water:
+                if not self._session_writable():
+                    return
                 sc_event.clear()
-                transport.arm_stream_tx_drain_pending(sc_ptr)
-                if self._quic.tx_pending_bytes(stream_id) <= max_bytes:
-                    transport.clear_stream_tx_drain_pending(sc_ptr)
-                    continue
+                quic.arm_stream_tx_drain_pending(stream_id)
+                if quic.stream_tx_buf_used(stream_id) <= low_water:
+                    quic.clear_stream_tx_drain_pending(stream_id)
+                    break
                 await sc_event.wait()
-                continue
-            # Ring-fill saturation guard (connection-global tx_pressure).
-            # Same clear-arm-recheck-wait pattern.
-            if (transport is not None and ring_event is not None
-                    and self._quic.tx_pressure(stream_id) > 0.9):
-                ring_event.clear()
-                transport.arm_tx_ring_drain_pending()
-                if self._quic.tx_pressure(stream_id) <= 0.9:
-                    transport.clear_tx_ring_drain_pending()
-                    continue
-                await ring_event.wait()
-                continue
-            # Clear both events BEFORE the send. If the worker fires
-            # them during our send_stream_data call (race between
-            # Cython arming and us catching the exception), the set
-            # will land AFTER our clear → captured on the wait.
-            # Clearing AFTER the BufferError loses the wakeup.
-            if sc_event is not None:
-                sc_event.clear()
-            if ring_event is not None:
-                ring_event.clear()
-            try:
-                self._quic.send_stream_data(
-                    stream_id, data, end_stream=end_stream)
-                # Soft backpressure: release the GIL when the picoquic
-                # worker has TX entries pending. Without this, a fast
-                # publish loop can monopolize the event loop on Python
-                # paths where send_stream_data succeeds repeatedly
-                # without ever awaiting (no hard BufferError), starving
-                # the worker.
-                if self._quic.tx_pressure(stream_id) > 0.5:
-                    await asyncio.sleep(0)
-                return
-            except BufferError:
-                # Cython side armed the appropriate signal — sc->tx full
-                # arms per-stream event; TX-ring full arms connection-
-                # global event. Wait on whichever fires first; events
-                # were cleared BEFORE the call so no lost wakeup.
-                if sc_event is not None and ring_event is not None:
-                    sc_wait = asyncio.create_task(sc_event.wait())
-                    ring_wait = asyncio.create_task(ring_event.wait())
-                    done, pending = await asyncio.wait(
-                        [sc_wait, ring_wait],
-                        return_when=asyncio.FIRST_COMPLETED)
-                    for t in pending:
-                        t.cancel()
-                elif sc_event is not None:
-                    await sc_event.wait()
-                elif ring_event is not None:
-                    await ring_event.wait()
-                else:
-                    await asyncio.sleep(0.0001)
-            except (AssertionError, AttributeError) as e:
-                logger.debug(f"stream({stream_id}): write race: {e}")
-                return
+        # Delegate wire-level send + backpressure to aiopquic.
+        try:
+            await quic.send_stream_data_drained(
+                stream_id, data, end_stream=end_stream)
+        except (AssertionError, AttributeError) as e:
+            logger.debug(f"stream({stream_id}): write race: {e}")
 
     def stream_fin(self, stream_id: int) -> None:
         """End-of-data on a sender-owned stream. Subgroup last object,

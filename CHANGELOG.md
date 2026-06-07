@@ -1,5 +1,51 @@
 # Changelog
 
+## v0.9.6 (unreleased)
+
+Pairs with [aiopquic 0.3.6](https://pypi.org/project/aiopquic/0.3.6/);
+dep floor `aiopquic>=0.3.5` → `aiopquic>=0.3.6` (Lens B primitives,
+per-stream typed pressure helpers, picoquic patches upstreamed,
+ring-rename catch-up).
+
+### Lens B stream_write_drain refactor + paced yield throttle
+
+- `MOQTSession.stream_write_drain` shrunk from ~150 lines to ~55 by delegating wire-level mechanics to aiopquic's `send_stream_data_drained`. The per-stream sc->tx ring + edge-trigger drain event is in aiopquic where the rings live; aiomoqt only owns the application-layer **policy** (byte budget, latency target, cancellation). This is the backpressure-placement principle landed: aiopquic provides primitives, aiomoqt expresses intent.
+- Paced-rate fall-through fix: when `track.rate` drops below the asyncio sleep precision floor (~50-200 µs on Linux/WSL2), the loop now yields `sleep(0)` 1-in-N (`_PACED_YIELD_EVERY = 32`) instead of skipping yields entirely. Skipping was starving `-P 8 -r 70K` runs and triggering BBR cwin collapse from spurious RTT spikes.
+- `-r` is now an **AGGREGATE** rate across all subgroup streams (not per-stream). Per-stream emit cadence is `rate / num_subgroups`. CLI semantics now match the natural reading: `-r 80000 -P 8` means 80K obj/s total at 10K/s per stream.
+
+### tx_max_inflight_bytes safety ceiling (16 MB default)
+
+- `MOQTSession.DEFAULT_TX_MAX_INFLIGHT_BYTES = 16_000_000` ships as a producer-side byte-budget cap. Hysteresis: producer parks at `stream_tx_buf_used > HIGH`, resumes at `< HIGH // 2`. Without this, sustained max-rate sends could overrun aiopquic's tx ring and cascade memory growth. The 16 MB ceiling lets the typical user approach the API and get high performance with the least likelihood of crashing; advanced users can override via the constructor or `--max-inflight-bytes N` on `loopback_bench`.
+- The byte-budget gate uses the typed primitive `stream_tx_buf_used(sid)` (introduced in aiopquic 0.3.6 Lens B), not a heuristic. Was a no-op in 0.3.5 because it queried the wrong primitive.
+
+### Bounded sub_bench memory
+
+- `sub_bench` previously held every per-object latency sample in an unbounded list, causing 5–18 GB RSS on long runs. Now keeps running stats (count, sum, sum-of-squares, min, max) + a reservoir-sampled subset (default 10K entries) for percentile estimation. RSS bounded regardless of duration.
+
+### loopback_bench tracemalloc + post-shutdown counter dump
+
+- `AIOMOQT_TRACEMALLOC=1` (off by default) starts tracemalloc with a baseline snapshot at +2 s after the subscriber connects and an end snapshot before cleanup. The diff localizes what GREW during steady-state operation — isolates Python-side allocation from aiopquic C-side rings.
+- `AIOMOQT_TASK_DUMP=1` (off by default) also enables a final post-shutdown aiopquic counter dump after `quic_server.close()` + 500 ms drain delay. Standing diagnostic capability for future memory / lifecycle investigations.
+
+### Catch up to aiopquic ring rename
+
+- `tx_ring` / `rx_ring` references updated to `tx_event_ring` / `rx_event_ring` (matches aiopquic 0.3.6's nomenclature pass). `get_tx_drain_event` becomes `tx_event_ring_drain_event`.
+
+### Utility
+
+- `wait_cond_timeout(coro, timeout)` helper added; `track.wait_closed()` drops its `timeout` parameter (callers compose with `wait_cond_timeout` for clearer call-site semantics).
+
+### CI hardening
+
+- bash watchdog around `sub_bench` so the log is captured before SIGTERM hits the process.
+- `pub_server -u` so the "ready on" banner reaches the log before grep races against it.
+- Polling for `pub_server` ready instead of a fixed `sleep 1.5`.
+- Interval table assertion replaces "Objects" summary check (interval table always emitted, summary block can be cut off by close-time signal).
+
+### Known issues (deferred)
+
+- Saturation-stress edge cases on the producer-side stream lifecycle (see aiopquic 0.3.6 Known Issues — pub-stream orphan at saturation, shutdown drain miss, `-P 8 -g 200` double-free). Sub-saturation workloads are clean; these manifest only at sustained max-rate.
+
 ## v0.9.5 (unreleased)
 
 Pairs with [aiopquic 0.3.5](https://pypi.org/project/aiopquic/0.3.5/);

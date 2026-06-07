@@ -16,6 +16,7 @@ from aiomoqt.types import MOQTMessageType
 from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
 from aiomoqt.track import PublishedTrack, SubscribedTrack
+from aiomoqt.utils import wait_cond_timeout
 from aiomoqt.utils.logger import set_log_level
 from aiomoqt.examples.sub_bench import BenchStats
 
@@ -53,7 +54,9 @@ def parse_args():
         help='Parallel subgroup streams (default: 1)')
     parser.add_argument(
         '-r', '--rate', type=float, default=0,
-        help='Objects/sec per stream (0=max, default: max)')
+        help='Aggregate objects/sec across all streams (0=max, '
+             'default: max). Per-stream emit rate is rate/streams. '
+             '-P only changes parallelism, not offered load.')
     parser.add_argument(
         '-t', '--duration', type=int, default=20,
         help='Duration seconds (default: 20)')
@@ -77,13 +80,21 @@ def parse_args():
         help='Congestion control algorithm '
              '(bbr | bbr1 | newreno | cubic | dcubic | prague | fast). '
              'Default: bbr')
+    parser.add_argument(
+        '--max-inflight-bytes', type=int, default=0,
+        help='Per-stream producer byte-budget cap '
+             '(stream_tx_buf_used > N parks producer). '
+             '0 = off (default). Hysteresis: park at N, '
+             'resume at N//2.')
     return parser.parse_args()
 
 
 def print_banner(args):
     mode = f"SUBGROUP x{args.streams}"
     if args.rate > 0:
-        rate_s = f"{args.rate}/s per stream"
+        per_stream = (args.rate / args.streams
+                      if args.streams > 1 else args.rate)
+        rate_s = f"{args.rate}/s total ({per_stream:.1f}/s per stream)"
     else:
         rate_s = "max"
     transport_label = "QUIC" if args.quic else "H3/WebTransport"
@@ -132,6 +143,8 @@ async def run_server(args):
         path="/",
         use_quic=args.quic,
         congestion_control_algorithm=args.cc_algo,
+        tx_max_inflight_bytes=(args.max_inflight_bytes
+                               if args.max_inflight_bytes > 0 else None),
     )
     server.register_handler(
         MOQTMessageType.SUBSCRIBE,
@@ -166,7 +179,9 @@ async def run_subscriber(args, stats):
 
             print("  Subscriber connected, receiving...\n")
 
-            await track.wait_closed(timeout=args.duration)
+            if not await wait_cond_timeout(
+                    track.wait_closed(), timeout=args.duration):
+                track.completed = True
     except Exception as e:
         print(f"  Subscriber error: {e}")
 
@@ -180,6 +195,17 @@ async def main():
     # (aiopquic counters) handlers. No-op when env not set.
     from aiomoqt.utils.taskdump import install as _install_task_dump
     _install_task_dump()
+
+    # AIOMOQT_TRACEMALLOC=1 enables Python-level allocation tracking.
+    # Baseline snap is taken 2s after subscriber connects; end snap is
+    # taken right before cleanup. The diff (end - baseline) localizes
+    # what GREW during steady-state operation — the sub-side retention
+    # signature is exactly this case.
+    import os as _os
+    import tracemalloc as _tm
+    _trace_enabled = _os.environ.get("AIOMOQT_TRACEMALLOC") == "1"
+    if _trace_enabled:
+        _tm.start(25)
 
     stats = BenchStats(report_interval=args.interval)
     print_banner(args)
@@ -197,13 +223,55 @@ async def main():
     # Give server a moment
     await asyncio.sleep(0.5)
 
+    # Baseline tracemalloc snap 2 s after subscriber connects.
+    _baseline_snap = [None]
+    if _trace_enabled:
+        async def _take_baseline():
+            await asyncio.sleep(2.0)
+            _baseline_snap[0] = _tm.take_snapshot()
+        asyncio.create_task(_take_baseline())
+
     # Run subscriber
     print("  Connecting subscriber...")
     await run_subscriber(args, stats)
 
+    # End tracemalloc snap before cleanup; diff against baseline.
+    if _trace_enabled and _baseline_snap[0] is not None:
+        end_snap = _tm.take_snapshot()
+        diff = end_snap.compare_to(_baseline_snap[0], 'lineno')
+        print()
+        print("=" * 70)
+        print("  tracemalloc: top 30 growers (baseline @ +2s → end)")
+        print("=" * 70)
+        for s in diff[:30]:
+            frame = s.traceback[0] if s.traceback else None
+            loc = (f"{frame.filename.split('/')[-1]}:{frame.lineno}"
+                   if frame else "<no frame>")
+            sign = "+" if s.size_diff >= 0 else ""
+            print(f"  {sign}{s.size_diff/1024/1024:7.2f} MB  "
+                  f"{sign}{s.count_diff:7d} blocks  {loc}")
+        print("=" * 70)
+
     # Cleanup
     quic_server.close()
+    # Give worker thread + close walker a tick to run before we sample.
+    await asyncio.sleep(0.5)
     stats.print_summary()
+
+    # AIOMOQT_TASK_DUMP=1 also enables a final post-shutdown counter dump
+    # so we can tell whether the close-walker swept leaked WT links
+    # (deferred-destroy pattern) or they truly leak.
+    import os as _os2
+    if _os2.environ.get("AIOMOQT_TASK_DUMP") == "1":
+        import sys as _sys2
+        try:
+            from aiopquic._binding._transport import dump_all_counters
+            print("\n=== aiopquic counter-dump (post-shutdown) ===",
+                  file=_sys2.stderr)
+            dump_all_counters(file=_sys2.stderr)
+        except Exception as _e2:
+            print(f"(post-shutdown counter dump failed: {_e2})",
+                  file=_sys2.stderr)
 
 
 if __name__ == "__main__":

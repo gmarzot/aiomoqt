@@ -70,6 +70,13 @@ class Track:
         rate: float = 0,
         draft: Optional[int] = None,
     ):
+        """
+        rate is the AGGREGATE target objects/sec across all subgroup
+        streams (0 = max, no pacing). Per-stream emit pacing is derived
+        as rate / num_subgroups inside the send loop, so num_subgroups
+        only changes parallelism — not offered load. Live mutation of
+        self.rate still picks up on the next iteration.
+        """
         self.session = session
         self.namespace = namespace
         self.trackname = trackname
@@ -90,6 +97,13 @@ class Track:
 
     def __repr__(self):
         return f"{self.__class__.__name__}({self.fqtn}, state={self.state.name})"
+
+
+# 1-in-N gate for the paced fall-through yield. sleep(0) costs a few
+# microseconds; at -r 70000 every-iter cost dominates throughput. ~2 kHz
+# yields keeps RX dispatch fair (the prior raw-QUIC P=8 BBR cwin collapse
+# required near-zero yields). Power of two so the gate is a bitwise AND.
+_PACED_YIELD_EVERY = 32
 
 
 class PublishedTrack(Track):
@@ -119,6 +133,11 @@ class PublishedTrack(Track):
         self._total_sent = 0
         self._total_bytes = 0
         self._total_groups = 0
+        # Tick counter gating the sub-precision-floor yield in the paced
+        # producer loop. Shared across this track's subgroup tasks;
+        # VideoTrack inherits via super().__init__. Bounded to 16 bits to
+        # avoid CPython bigint promotion in long-running processes.
+        self._yield_tick = 0
 
     async def publish(self, announce_namespace: bool = False,
                       publish_track: bool = True,
@@ -426,11 +445,28 @@ class PublishedTrack(Track):
 
                 # Re-read rate each iteration so callers can mutate
                 # self.rate in-place and have it take effect live.
-                current_rate = self.rate
+                # self.rate is AGGREGATE across all subgroups; per-stream
+                # cadence is rate / num_subgroups.
+                current_rate = (self.rate / self.num_subgroups
+                                if self.num_subgroups > 1 else self.rate)
                 if current_rate > 0:
                     next_frame_time += 1.0 / current_rate
-                    sleep_time = max(0, next_frame_time - time.monotonic())
-                    await asyncio.sleep(sleep_time)
+                    sleep_time = next_frame_time - time.monotonic()
+                    # asyncio.sleep precision floor is ~50-200 µs on Linux/WSL2.
+                    # Above floor: real sleep (itself a yield). Below floor:
+                    # the 1-in-N sleep(0) IS the cooperative point — raw-QUIC
+                    # stream_write_drain only suspends under backpressure, so
+                    # the fast path has no other yield. Skipping yields
+                    # entirely starves the loop at high P, triggering BBR cwin
+                    # collapse from spurious RTT spikes. Aggregate yield rate
+                    # is ~ track-rate / N independent of num_subgroups
+                    # (current_rate already divides by it).
+                    if sleep_time > 0.0005:
+                        await asyncio.sleep(sleep_time)
+                    else:
+                        self._yield_tick = (self._yield_tick + 1) & 0xFFFF
+                        if self._yield_tick & (_PACED_YIELD_EVERY - 1) == 0:
+                            await asyncio.sleep(0)
                 # No explicit yield in the r=0 path: stream_write_drain
                 # handles pressure-based GIL release internally.
 
@@ -461,16 +497,9 @@ class PublishedTrack(Track):
         else:
             await self._subscriber_event.wait()
 
-    async def wait_closed(self, timeout: float = None):
-        """Wait for session to close or timeout."""
-        try:
-            if timeout:
-                await asyncio.wait_for(
-                    self.session.async_closed(), timeout=timeout)
-            else:
-                await self.session.async_closed()
-        except asyncio.TimeoutError:
-            pass
+    async def wait_closed(self):
+        """Wait for session to close."""
+        await self.session.async_closed()
         self.state = TrackState.CLOSED
 
 
@@ -593,22 +622,14 @@ class SubscribedTrack(Track):
         self.state = TrackState.SUBSCRIBED
         logger.info(f"Track: subscribed to {self.fqtn}")
 
-    async def wait_closed(self, timeout: float = None):
-        """Wait for session to close or timeout.
+    async def wait_closed(self):
+        """Wait for session to close.
 
         Sets self.completed if track ended cleanly (no StreamReset).
         """
-        try:
-            if timeout:
-                await asyncio.wait_for(
-                    self.session.async_closed(), timeout=timeout)
-            else:
-                await self.session.async_closed()
-        except asyncio.TimeoutError:
-            self.completed = True  # duration reached = clean
+        await self.session.async_closed()
         self.state = TrackState.CLOSED
 
-        # Check close reason
         if hasattr(self.session, '_close_err') and self.session._close_err:
             code, reason = self.session._close_err
             if reason and 'StreamReset' in str(reason):
@@ -830,12 +851,23 @@ class VideoTrack(PublishedTrack):
                     self._iv_groups = 0
                     last_report = now
 
-                current_rate = self.rate
+                # self.rate is AGGREGATE; per-stream cadence is
+                # rate / num_subgroups. See note in PublishedTrack.
+                # Sub-ms requested sleep falls through to no-sleep —
+                # see the matching block in _generate_subgroup.
+                current_rate = (self.rate / self.num_subgroups
+                                if self.num_subgroups > 1 else self.rate)
                 if current_rate > 0:
                     next_frame_time += 1.0 / current_rate
-                    sleep_time = max(0,
-                        next_frame_time - time.monotonic())
-                    await asyncio.sleep(sleep_time)
+                    sleep_time = next_frame_time - time.monotonic()
+                    if sleep_time > 0.0005:
+                        await asyncio.sleep(sleep_time)
+                    else:
+                        # 1-in-N yield throttle; see PublishedTrack
+                        # ._generate_subgroup for rationale.
+                        self._yield_tick = (self._yield_tick + 1) & 0xFFFF
+                        if self._yield_tick & (_PACED_YIELD_EVERY - 1) == 0:
+                            await asyncio.sleep(0)
                 # No explicit yield in the r=0 path: stream_write_drain
                 # handles pressure-based GIL release internally.
 

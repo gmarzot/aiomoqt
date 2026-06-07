@@ -65,7 +65,8 @@ def parse_args():
         help='Parallel subgroup streams (default: 1)')
     parser.add_argument(
         '-r', '--rate', type=float, default=0,
-        help='Objects/sec per stream (0=max, default: max)')
+        help='Aggregate objects/sec across all streams (0=max, '
+             'default: max). Per-stream emit rate is rate/streams.')
     parser.add_argument(
         '--max-inflight-bytes', type=int, default=None,
         help='Producer backpressure: pause once aiopquic reports this '

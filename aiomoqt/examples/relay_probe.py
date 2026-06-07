@@ -296,11 +296,52 @@ def _parse_args():
     p.add_argument(
         "--once", action="store_true", default=PROBE_ONCE,
         help="probe once and exit (env: PROBE_ONCE=1)")
+    p.add_argument(
+        "--url", default=None, metavar="URL",
+        help="probe a single relay URL (e.g. moqt://host:port or "
+             "https://host:port/path) and print one line per probed "
+             "draft to stdout; bypasses --relays-file / --output-file. "
+             "Intended for quick interactive liveness checks.")
+    p.add_argument(
+        "-d", "--debug", action="store_true", default=False,
+        help="verbose handshake logging (DEBUG level on aiomoqt + "
+             "relay-probe loggers). Off by default in --url mode so "
+             "stdout stays clean for scripting.")
     return p.parse_args()
+
+
+async def _probe_single_url(url, timeout, debug=False):
+    """One-shot probe: print one human-readable line per (draft, transport)
+    combo. No JSON, no file I/O. Exits with code 0 if any draft was LIVE,
+    else 1 — easy to wire into shell scripts."""
+    from aiomoqt.utils.logger import set_log_level
+    # Default quiet: suppress aiomoqt's INFO chatter so stdout is one
+    # clean line. --debug bumps everything (incl. handshake details).
+    set_log_level(logging.DEBUG if debug else logging.WARNING)
+    logging.getLogger("relay-probe").setLevel(
+        logging.DEBUG if debug else logging.WARNING)
+    global PROBE_TIMEOUT
+    PROBE_TIMEOUT = timeout
+    result = await probe_endpoint(url)
+    transport = result["transport"]
+    if result["live"]:
+        drafts = ",".join(result["drafts"])
+        print(f"{result['host']}:{result['port']}  {transport.lower():<8}"
+              f"  {drafts}  ✓ ({result['latency_ms']}ms)")
+        return 0
+    err = result.get("error") or "unreachable"
+    print(f"{result['host']}:{result['port']}  {transport.lower():<8}"
+          f"  ✗ {err}")
+    return 1
 
 
 if __name__ == "__main__":
     args = _parse_args()
+    if args.url:
+        # Single-URL mode: skip the relays-file / output-file machinery.
+        rc = asyncio.run(_probe_single_url(
+            args.url, args.timeout, debug=args.debug))
+        raise SystemExit(rc)
     # CLI overrides env overrides hard default. Rebinding module-level
     # constants keeps existing references in probe_version / probe_all
     # / run_loop working with zero signature churn.

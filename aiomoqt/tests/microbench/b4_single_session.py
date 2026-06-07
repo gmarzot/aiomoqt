@@ -42,6 +42,7 @@ async def _run(args):
     from aiomoqt.server import MOQTServer
     from aiomoqt.track import PublishedTrack, SubscribedTrack
     from aiomoqt.types import MOQTMessageType, MOQT_VERSION_DRAFT16
+    from aiomoqt.utils import wait_cond_timeout
 
     cert = _find_cert()
     if not cert:
@@ -105,7 +106,9 @@ async def _run(args):
                 on_object=on_object,
             )
             await track.subscribe()
-            await track.wait_closed(timeout=args.duration)
+            if not await wait_cond_timeout(
+                    track.wait_closed(), timeout=args.duration):
+                track.completed = True
     finally:
         if hasattr(server_handle, 'close'):
             server_handle.close()
