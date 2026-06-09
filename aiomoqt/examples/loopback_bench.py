@@ -81,11 +81,12 @@ def parse_args():
              '(bbr | bbr1 | newreno | cubic | dcubic | prague | fast). '
              'Default: bbr')
     parser.add_argument(
-        '--max-inflight-bytes', type=int, default=0,
+        '--max-inflight-bytes', type=int, default=None,
         help='Per-stream producer byte-budget cap '
              '(stream_tx_buf_used > N parks producer). '
-             '0 = off (default). Hysteresis: park at N, '
-             'resume at N//2.')
+             'Default: protocol-layer 16 MB (~64 ms latency @ 2 Gbps). '
+             'Pass 0 to opt out entirely. '
+             'Hysteresis: park at N, resume at N//2.')
     return parser.parse_args()
 
 
@@ -143,8 +144,11 @@ async def run_server(args):
         path="/",
         use_quic=args.quic,
         congestion_control_algorithm=args.cc_algo,
-        tx_max_inflight_bytes=(args.max_inflight_bytes
-                               if args.max_inflight_bytes > 0 else None),
+        # None = honor protocol default (16 MB); 0 = opt out.
+        **({'tx_max_inflight_bytes':
+            (None if args.max_inflight_bytes == 0
+             else args.max_inflight_bytes)}
+           if args.max_inflight_bytes is not None else {}),
     )
     server.register_handler(
         MOQTMessageType.SUBSCRIBE,

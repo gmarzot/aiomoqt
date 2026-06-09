@@ -70,9 +70,10 @@ def parse_args():
     parser.add_argument(
         '--max-inflight-bytes', type=int, default=None,
         help='Producer backpressure: pause once aiopquic reports this '
-             'many bytes pending in the TX ring (default: unbounded). '
-             'Bounds queue depth and tail latency. e.g. 2_000_000 ~10ms '
-             '@ 1.6 Gbps.')
+             'many bytes pending in the per-stream TX ring. '
+             'Default: protocol-layer 16 MB (~64 ms latency @ 2 Gbps). '
+             'Pass 0 to opt out entirely (unbounded). e.g. 2_000_000 '
+             '~10ms @ 1.6 Gbps for stricter latency.')
     parser.add_argument(
         '-Q', '--quic', action='store_true',
         help='Serve raw QUIC (aiopquic) instead of H3/WebTransport')
@@ -152,15 +153,25 @@ async def main():
     # needs the draft for either transport (raw QUIC or WT) to pick
     # the right message-encoding rules; only the QUIC ALPN derivation
     # differs.
-    server = MOQTServer(
+    # CLI semantics: None = honor protocol-layer default (16 MB);
+    # 0 = explicit opt-out (unbounded); >0 = explicit value.
+    if args.max_inflight_bytes is None:
+        _tx_max = ...  # let MOQTServer/MOQTPeer apply DEFAULT
+    elif args.max_inflight_bytes == 0:
+        _tx_max = None  # explicit opt-out
+    else:
+        _tx_max = args.max_inflight_bytes
+    _server_kwargs = dict(
         host=args.host, port=args.port,
         certificate=args.cert, private_key=args.key,
         path="/",
         use_quic=args.quic,
-        tx_max_inflight_bytes=args.max_inflight_bytes,
         draft_version=args.draft,
         congestion_control_algorithm=args.cc_algo,
     )
+    if _tx_max is not ...:
+        _server_kwargs['tx_max_inflight_bytes'] = _tx_max
+    server = MOQTServer(**_server_kwargs)
     server.register_handler(
         MOQTMessageType.SUBSCRIBE,
         partial(_on_subscribe, args=args))

@@ -6,7 +6,8 @@ from aiopquic.asyncio.server import serve as aiopquic_serve
 from aiopquic.asyncio.webtransport import serve_webtransport
 from aiopquic.quic.configuration import QuicConfiguration
 
-from .protocol import MOQTPeer, MOQTSessionQuic, MOQTSessionWTServer
+from .protocol import (DEFAULT_TX_MAX_INFLIGHT_BYTES, MOQTPeer,
+                        MOQTSessionQuic, MOQTSessionWTServer)
 from .types import moqt_alpn_for_version, MOQT_ALPN
 from .utils.logger import *
 
@@ -25,7 +26,7 @@ class MOQTServer(MOQTPeer):
         use_quic: Optional[bool] = False,
         draft_version: Optional[int] = None,
         debug: Optional[bool] = False,
-        tx_max_inflight_bytes: Optional[int] = None,
+        tx_max_inflight_bytes: Optional[int] = DEFAULT_TX_MAX_INFLIGHT_BYTES,
         congestion_control_algorithm: Optional[str] = "bbr",
     ):
         super().__init__(tx_max_inflight_bytes=tx_max_inflight_bytes)

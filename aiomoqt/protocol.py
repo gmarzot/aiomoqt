@@ -36,19 +36,34 @@ USER_AGENT = f"aiomoqt/{version('aiomoqt')}"
 logger = get_logger(__name__)
 
 
-# Producer-side bytes cap on the per-stream sc->tx queue. Used as
-# the default for MOQTPeer.tx_max_inflight_bytes. 16 MB is sized to
-# never engage in healthy LAN/loopback steady-state (where producer
-# ≈ consumer rate, sc->tx queue stays well below the cap), but acts
-# as a fail-safe ceiling when the consumer falls behind — preventing
-# the unbounded producer-side memory growth that can otherwise
-# trigger OOM under sub-side stress. Apps with stricter latency
-# requirements can dial this down (2 MB ≈ 8 ms at 2 Gbps; smaller
-# values give lower latency at the cost of throughput headroom when
-# the consumer momentarily slows). Pass None to opt out entirely.
-# A future tx_target_latency_ms API will derive the byte budget
-# from a latency target + auto-tracked drain rate.
-DEFAULT_TX_MAX_INFLIGHT_BYTES = 16_000_000
+# Per-stream producer cap on TOTAL bytes in flight — Python sc->tx
+# queue PLUS picoquic's per-stream retransmit buffer (sent but not
+# acked by peer). Bounds actual memory commitment per stream, not
+# just the Python-side queue depth.
+#
+# Per-stream → preserves QUIC stream independence (HOLB-free
+# backpressure). Aggregate per-cnx memory bound is delivered by the
+# QUIC protocol mechanisms — initial_max_streams_uni/bidi (cap on
+# concurrent stream count) and initial_max_data (cap on aggregate
+# unacked bytes) — both exposed via QuicConfiguration.
+#
+# Hysteresis: producer parks at HIGH water (this value), resumes at
+# LOW water (this value // 2). Prevents the packet-granularity wake-
+# bounce that would otherwise reduce effective throughput to
+# ~packet_size / asyncio_turn.
+#
+# Sizing: target_latency_ms * target_throughput_bytes_per_sec.
+# At 2 Gbps loopback, 16 MiB cap ≈ 64 ms latency budget; 2 MiB
+# cap ≈ 8 ms.
+#
+# Default 16 MiB sized to never engage in healthy steady-state
+# (producer ≈ consumer, in-flight stays well below the cap), but
+# acts as a fail-safe ceiling when the consumer falls behind —
+# preventing the unbounded producer-side memory growth that can
+# otherwise trigger OOM under sub-side stress. Pass None to opt
+# out entirely. Future API: tx_target_latency_ms with auto-tracked
+# drain rate.
+DEFAULT_TX_MAX_INFLIGHT_BYTES = 2 * 1024 * 1024
 
 
 class MOQTStreamReject(Exception):
@@ -77,25 +92,17 @@ class MOQTPeer:
         self._control_msg_handlers: Dict[int, Tuple[Type, Callable]] = {}
         self.allow_optional_dgram = allow_optional_dgram
         self.libquicr_compat = libquicr_compat
-        # Bytes-aware producer backpressure target. When set,
-        # MOQTSession.stream_write_drain awaits per-stream sc->tx
-        # drain before pushing more bytes once aiopquic reports
-        # stream_tx_buf_used() above this threshold. Per-stream,
-        # data-ring scoped — independent of the SPSC event-ring entry
-        # capacity (settable via QuicConfiguration.event_ring_capacity).
-        #
-        # Hysteresis: producer parks at HIGH water (this value),
-        # resumes at LOW water (this value // 2). Prevents the
-        # packet-granularity wake-bounce that would otherwise reduce
-        # effective throughput to ~packet_size / asyncio_turn.
-        #
-        # Default None = no cap. Opt in for latency-bounded workloads.
-        # Sizing: target_latency_ms * target_throughput_bytes_per_sec.
-        # At 2 Gbps loopback, 16 MB cap ≈ 64 ms latency budget; 2 MB
-        # cap ≈ 8 ms. The cap engages only above HIGH water so
-        # steady-state queue depth oscillates between HIGH/2 and HIGH.
-        # Future API: tx_target_latency_ms with auto-tracked drain
-        # rate, so callers can express the budget directly.
+        # Per-stream producer soft cap on bytes pending in the sc->tx
+        # data ring. Engages only when set BELOW
+        # QuicConfiguration.stream_ring_cap (the hard cap). Producer
+        # parks on the per-stream drain event with hysteresis: park
+        # at HIGH (this value), resume at LOW (this value // 2).
+        # Per-stream → preserves QUIC stream independence (no HOLB).
+        # Aggregate per-cnx memory bound is delivered by the QUIC
+        # protocol mechanisms: max_data caps cnx-level bytes in
+        # flight, initial_max_streams_uni/bidi caps concurrent
+        # streams (both in QuicConfiguration). Pass None to opt out
+        # entirely.
         self.tx_max_inflight_bytes = tx_max_inflight_bytes
 
     def register_handler(self, msg_type: int, handler: Callable) -> None:
@@ -1308,8 +1315,12 @@ class _MOQTSessionMixin:
                     f"head_hex={head}")
         quic = self._quic
         max_bytes = self._session.tx_max_inflight_bytes
-        # Byte-budget gate (aiomoqt-owned policy). Hysteresis: park at
-        # HIGH water (max_bytes), resume at LOW water (max_bytes // 2).
+        # Byte-budget gate (aiomoqt-owned policy). Per-stream sc->tx
+        # queue depth — preserves QUIC stream independence (no HOLB).
+        # Hysteresis: park at HIGH water (max_bytes), resume at LOW
+        # water (max_bytes // 2). max_bytes MUST be <
+        # QuicConfiguration.stream_ring_cap to engage (the cap is
+        # bounded by ring capacity).
         if (max_bytes is not None
                 and quic.stream_tx_buf_used(stream_id) > max_bytes):
             low_water = max_bytes // 2
@@ -1374,9 +1385,9 @@ class _MOQTSessionMixin:
     def send_control_message(self, buf: Buffer) -> None:
         """Send a MoQT message on the control stream."""
         if self._quic is None or self._control_stream_id is None:
-            raise MOQTException(SessionCloseCode.INTERNAL_ERROR, "control stream not intialized")
+            raise MOQTException(SessionCloseCode.INTERNAL_ERROR,
+                                "control stream not initialized")
         logger.debug(f"QUIC send: control message: {buf.tell()} bytes")
-
         self._quic.send_stream_data(
             stream_id=self._control_stream_id,
             data=buf.data,
@@ -1402,15 +1413,12 @@ class _MOQTSessionMixin:
             self._bidi_streams[msg.request_id] = stream_id
 
     def send_dgram_message(self, buf: Buffer) -> None:
-        """Send a MoQT message on the control stream."""
+        """Send a MoQT message via QUIC datagram (best-effort)."""
         if self._quic is None:
-            raise MOQTException(SessionCloseCode.INTERNAL_ERROR, "QUIC not intialized")
-
+            raise MOQTException(SessionCloseCode.INTERNAL_ERROR,
+                                "QUIC not initialized")
         logger.debug(f"QUIC send: datagram message: {buf.capacity} bytes")
-
-        self._quic.send_datagram_frame(
-            data=buf.data
-        )
+        self._quic.send_datagram_frame(data=buf.data)
 
     ################################################################################################
     #  Outbound control message API - note: awaitable messages support 'wait_response' param       #
