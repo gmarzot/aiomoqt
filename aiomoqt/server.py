@@ -85,11 +85,29 @@ class MOQTServer(MOQTPeer):
         async def handler(_session):
             pass  # session lifetime owned by the dispatcher
 
+        # Build a QuicConfiguration so FC sizing (max_data,
+        # max_stream_data, max_streams_uni/bidi) and the CC algorithm
+        # actually reach picoquic's transport params. Without this,
+        # serve_webtransport runs with picoquic defaults (1 MiB
+        # MAX_DATA, default MAX_STREAM_DATA), which caps loopback
+        # throughput and distorts FC-driven backpressure measurements.
+        # ALPN, cert, key are owned by serve_webtransport itself
+        # (alpn="h3" + cert_file/key_file kwargs) so we don't set them
+        # on the cfg here.
+        wt_cfg = QuicConfiguration(
+            is_client=False,
+            max_data=2**24, max_stream_data=2**24,
+            max_datagram_frame_size=64 * 1024,
+            congestion_control_algorithm=(
+                self.congestion_control_algorithm),
+        )
+
         return serve_webtransport(
             self.host, self.port, self.path or "",
             handler=handler,
             cert_file=self.certificate, key_file=self.private_key,
             session_factory=factory,
+            configuration=wt_cfg,
         )
 
     async def closed(self) -> bool:

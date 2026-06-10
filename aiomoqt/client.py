@@ -116,10 +116,28 @@ class MOQTClient(MOQTPeer):
     @asynccontextmanager
     async def _connect_wt(self):
         transport = TransportContext()
+        # FC sizing source-of-truth: self.configuration when set, else
+        # the 16 MiB matching default the QUIC branch uses. Without
+        # this plumb-through, peer advertises picoquic defaults
+        # (1 MiB MAX_DATA, default MAX_STREAM_DATA), which caps
+        # sustained loopback throughput and distorts FC-driven
+        # backpressure measurements.
+        wt_cfg = self.configuration if self.configuration is not None \
+            else QuicConfiguration(
+                is_client=True,
+                max_data=2**24, max_stream_data=2**24,
+                max_datagram_frame_size=64 * 1024,
+                congestion_control_algorithm=(
+                    self.congestion_control_algorithm),
+            )
         transport.start(
             is_client=True, alpn="h3",
             max_datagram_frame_size=64 * 1024,
             debug_log=self.quic_debug_log,
+            rx_ring_cap=wt_cfg.max_stream_data,
+            initial_max_data=wt_cfg.max_data,
+            initial_max_streams_uni=wt_cfg.max_streams_uni,
+            initial_max_streams_bidi=wt_cfg.max_streams_bidi,
         )
         # MoQT version negotiation over WebTransport (per moq-transport-16
         # §3.1): drafts >= 15 carry the version in WT-Available-Protocols
