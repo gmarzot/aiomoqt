@@ -29,6 +29,7 @@ class MOQTClient(MOQTPeer):
         draft_version: Optional[int] = None,
         libquicr_compat: Optional[bool] = False,
         congestion_control_algorithm: Optional[str] = "bbr",
+        tx_max_queued_bytes: Optional[int] = None,
     ):
         super().__init__(allow_optional_dgram=allow_optional_dgram,
                          libquicr_compat=libquicr_compat)
@@ -59,6 +60,11 @@ class MOQTClient(MOQTPeer):
         self.keylog_filename = keylog_filename
         self.configuration = configuration
         self.congestion_control_algorithm = congestion_control_algorithm
+        # Aggregate TX gate budget (QuicConfiguration.tx_max_queued_bytes):
+        # bounds publisher run-ahead across ALL streams; steady-state
+        # added latency ≈ value / drain rate. None = honor the aiopquic
+        # default (8 MiB); 0 = disable.
+        self.tx_max_queued_bytes = tx_max_queued_bytes
 
         if draft_version is not None:
             set_moqt_ctx_version(draft_version)
@@ -96,6 +102,8 @@ class MOQTClient(MOQTPeer):
                     congestion_control_algorithm=(
                         self.congestion_control_algorithm),
                 )
+            if self.tx_max_queued_bytes is not None:
+                cfg.tx_max_queued_bytes = self.tx_max_queued_bytes
             protocol = lambda *a, **kw: MOQTSessionQuic(*a, **kw, session=self)
             # quic_debug_log not wired on raw-QUIC path yet: aiopquic
             # 0.3.1's `connect()` helper doesn't forward debug_log to
@@ -130,6 +138,8 @@ class MOQTClient(MOQTPeer):
                 congestion_control_algorithm=(
                     self.congestion_control_algorithm),
             )
+        if self.tx_max_queued_bytes is not None:
+            wt_cfg.tx_max_queued_bytes = self.tx_max_queued_bytes
         transport.start(
             is_client=True, alpn="h3",
             max_datagram_frame_size=64 * 1024,
@@ -156,6 +166,11 @@ class MOQTClient(MOQTPeer):
             wt_available_protocols=wt_protocols,
             session=self,
         )
+        # Stamp the aggregate TX gate budget on the WT session (the
+        # client constructs the session directly rather than via
+        # connect_webtransport, so the configuration hand-off there
+        # doesn't apply).
+        session.tx_max_queued_bytes = wt_cfg.tx_max_queued_bytes
         try:
             await session.open(timeout=10.0)
             yield session

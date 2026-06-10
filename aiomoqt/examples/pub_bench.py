@@ -86,6 +86,13 @@ examples:
                              'unsolicited uni streams (every first-object '
                              'parse fails). Retained for low-level wire '
                              'experimentation.')
+    parser.add_argument(
+        '--max-queued-bytes', type=int, default=None,
+        help='Aggregate publisher byte budget across ALL streams '
+             '(QuicConfiguration.tx_max_queued_bytes): producer parks '
+             'at stream rollover while total un-transmitted TX bytes '
+             'exceed this. Steady-state latency ~ value / throughput. '
+             'Default: aiopquic default (8 MiB). Pass 0 to disable.')
     parser.add_argument('-d', '--debug', action='store_true')
     parser.add_argument('--keylogfile', type=str, default=None)
     parser.add_argument('-k', '--insecure', action='store_true',
@@ -158,6 +165,7 @@ async def run(args):
         debug=args.debug,
         keylog_filename=args.keylogfile,
         congestion_control_algorithm=args.cc_algo,
+        tx_max_queued_bytes=args.max_queued_bytes,
     )
 
     print(f"  Connecting...")

@@ -27,6 +27,7 @@ class MOQTServer(MOQTPeer):
         draft_version: Optional[int] = None,
         debug: Optional[bool] = False,
         tx_max_inflight_bytes: Optional[int] = DEFAULT_TX_MAX_INFLIGHT_BYTES,
+        tx_max_queued_bytes: Optional[int] = None,
         congestion_control_algorithm: Optional[str] = "bbr",
     ):
         super().__init__(tx_max_inflight_bytes=tx_max_inflight_bytes)
@@ -44,6 +45,11 @@ class MOQTServer(MOQTPeer):
         self.certificate = certificate
         self.private_key = private_key
         self.debug = debug
+        # Aggregate TX gate budget (QuicConfiguration.tx_max_queued_bytes):
+        # bounds publisher run-ahead across ALL streams; steady-state
+        # added latency ≈ value / drain rate. None = honor the aiopquic
+        # default (8 MiB); 0 = disable.
+        self.tx_max_queued_bytes = tx_max_queued_bytes
         self.congestion_control_algorithm = congestion_control_algorithm
         self._loop = asyncio.get_running_loop()
         self._server_closed: Future[Tuple[int, str]] = self._loop.create_future()
@@ -69,6 +75,8 @@ class MOQTServer(MOQTPeer):
                 congestion_control_algorithm=(
                     self.congestion_control_algorithm),
             )
+            if self.tx_max_queued_bytes is not None:
+                cfg.tx_max_queued_bytes = self.tx_max_queued_bytes
             cfg.load_cert_chain(self.certificate, self.private_key)
             protocol = lambda *a, **kw: MOQTSessionQuic(*a, **kw, session=self)
             return aiopquic_serve(
@@ -101,6 +109,8 @@ class MOQTServer(MOQTPeer):
             congestion_control_algorithm=(
                 self.congestion_control_algorithm),
         )
+        if self.tx_max_queued_bytes is not None:
+            wt_cfg.tx_max_queued_bytes = self.tx_max_queued_bytes
 
         return serve_webtransport(
             self.host, self.port, self.path or "",

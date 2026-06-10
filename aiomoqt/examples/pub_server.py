@@ -75,6 +75,14 @@ def parse_args():
              'Pass 0 to opt out entirely (unbounded). e.g. 2_000_000 '
              '~10ms @ 1.6 Gbps for stricter latency.')
     parser.add_argument(
+        '--max-queued-bytes', type=int, default=None,
+        help='Aggregate publisher byte budget across ALL streams '
+             '(QuicConfiguration.tx_max_queued_bytes): producer parks '
+             'at stream rollover while total un-transmitted TX bytes '
+             'exceed this. Steady-state latency ~ value / throughput '
+             '(8 MiB ~ 11-22 ms @ 3 Gbps). Default: aiopquic default '
+             '(8 MiB). Pass 0 to disable.')
+    parser.add_argument(
         '-Q', '--quic', action='store_true',
         help='Serve raw QUIC (aiopquic) instead of H3/WebTransport')
     parser.add_argument(
@@ -171,6 +179,8 @@ async def main():
     )
     if _tx_max is not ...:
         _server_kwargs['tx_max_inflight_bytes'] = _tx_max
+    if args.max_queued_bytes is not None:
+        _server_kwargs['tx_max_queued_bytes'] = args.max_queued_bytes
     server = MOQTServer(**_server_kwargs)
     server.register_handler(
         MOQTMessageType.SUBSCRIBE,

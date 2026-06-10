@@ -211,6 +211,13 @@ def parse_args():
              'Default: protocol-layer 16 MB (~64 ms latency @ 2 Gbps). '
              'Pass 0 to opt out entirely. '
              'Hysteresis: park at N, resume at N//2.')
+    parser.add_argument(
+        '--max-queued-bytes', type=int, default=None,
+        help='Aggregate publisher byte budget across ALL streams '
+             '(QuicConfiguration.tx_max_queued_bytes): producer parks '
+             'at stream rollover while total un-transmitted TX bytes '
+             'exceed this. Steady-state latency ~ value / throughput. '
+             'Default: aiopquic default (8 MiB). Pass 0 to disable.')
     return parser.parse_args()
 
 
@@ -275,6 +282,8 @@ async def run_server(args, mon=None):
             (None if args.max_inflight_bytes == 0
              else args.max_inflight_bytes)}
            if args.max_inflight_bytes is not None else {}),
+        **({'tx_max_queued_bytes': args.max_queued_bytes}
+           if args.max_queued_bytes is not None else {}),
     )
     server.register_handler(
         MOQTMessageType.SUBSCRIBE,
