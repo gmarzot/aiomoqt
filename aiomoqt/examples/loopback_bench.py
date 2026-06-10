@@ -200,10 +200,10 @@ def parse_args():
         '--quic', action='store_true',
         help='Use raw QUIC instead of WebTransport (default: WT)')
     parser.add_argument(
-        '--cc-algo', type=str, default='bbr',
+        '--cc-algo', type=str, default=None,
         help='Congestion control algorithm '
              '(bbr | bbr1 | newreno | cubic | dcubic | prague | fast). '
-             'Default: bbr')
+             'Default: aiopquic default (bbr1)')
     parser.add_argument(
         '--max-inflight-bytes', type=int, default=None,
         help='Per-stream producer byte-budget cap '

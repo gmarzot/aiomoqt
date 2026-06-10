@@ -28,7 +28,7 @@ class MOQTClient(MOQTPeer):
         quic_debug_log: Optional[str] = None,
         draft_version: Optional[int] = None,
         libquicr_compat: Optional[bool] = False,
-        congestion_control_algorithm: Optional[str] = "bbr",
+        congestion_control_algorithm: Optional[str] = None,
         tx_max_queued_bytes: Optional[int] = None,
     ):
         super().__init__(allow_optional_dgram=allow_optional_dgram,
@@ -97,11 +97,11 @@ class MOQTClient(MOQTPeer):
                     max_datagram_frame_size=64 * 1024,
                     server_name=self.host,
                     secrets_log_file=self.keylog_filename,
-                    # Default "bbr"; operator-overridable via MOQTClient
-                    # constructor. See server.py for rationale.
-                    congestion_control_algorithm=(
-                        self.congestion_control_algorithm),
                 )
+            # None defers to the aiopquic default (bbr1).
+            if self.congestion_control_algorithm is not None:
+                cfg.congestion_control_algorithm = (
+                    self.congestion_control_algorithm)
             if self.tx_max_queued_bytes is not None:
                 cfg.tx_max_queued_bytes = self.tx_max_queued_bytes
             protocol = lambda *a, **kw: MOQTSessionQuic(*a, **kw, session=self)
@@ -123,23 +123,28 @@ class MOQTClient(MOQTPeer):
 
     @asynccontextmanager
     async def _connect_wt(self):
-        transport = TransportContext()
-        # FC sizing source-of-truth: self.configuration when set, else
-        # the 16 MiB matching default the QUIC branch uses. Without
-        # this plumb-through, peer advertises picoquic defaults
-        # (1 MiB MAX_DATA, default MAX_STREAM_DATA), which caps
-        # sustained loopback throughput and distorts FC-driven
-        # backpressure measurements.
+        # Config source-of-truth: self.configuration when set, else
+        # the matching defaults the QUIC branch uses. Everything the
+        # connection's behavior depends on must be forwarded here —
+        # FC sizing, stream caps, idle timeout, and the CC algorithm
+        # all reach picoquic only through transport.start().
         wt_cfg = self.configuration if self.configuration is not None \
             else QuicConfiguration(
                 is_client=True,
                 max_data=2**24, max_stream_data=2**24,
                 max_datagram_frame_size=64 * 1024,
-                congestion_control_algorithm=(
-                    self.congestion_control_algorithm),
             )
+        # None defers to the aiopquic default (bbr1).
+        if self.congestion_control_algorithm is not None:
+            wt_cfg.congestion_control_algorithm = (
+                self.congestion_control_algorithm)
         if self.tx_max_queued_bytes is not None:
             wt_cfg.tx_max_queued_bytes = self.tx_max_queued_bytes
+        if wt_cfg.event_ring_capacity is not None:
+            transport = TransportContext(
+                ring_capacity=wt_cfg.event_ring_capacity)
+        else:
+            transport = TransportContext()
         transport.start(
             is_client=True, alpn="h3",
             max_datagram_frame_size=64 * 1024,
@@ -148,6 +153,9 @@ class MOQTClient(MOQTPeer):
             initial_max_data=wt_cfg.max_data,
             initial_max_streams_uni=wt_cfg.max_streams_uni,
             initial_max_streams_bidi=wt_cfg.max_streams_bidi,
+            idle_timeout_ms=int(wt_cfg.idle_timeout * 1000),
+            congestion_control_algorithm=(
+                wt_cfg.congestion_control_algorithm),
         )
         # MoQT version negotiation over WebTransport (per moq-transport-16
         # §3.1): drafts >= 15 carry the version in WT-Available-Protocols
@@ -166,11 +174,12 @@ class MOQTClient(MOQTPeer):
             wt_available_protocols=wt_protocols,
             session=self,
         )
-        # Stamp the aggregate TX gate budget on the WT session (the
-        # client constructs the session directly rather than via
-        # connect_webtransport, so the configuration hand-off there
-        # doesn't apply).
+        # Stamp the aggregate TX gate budget and per-stream ring cap
+        # on the WT session (the client constructs the session
+        # directly rather than via connect_webtransport, so the
+        # configuration hand-off there doesn't apply).
         session.tx_max_queued_bytes = wt_cfg.tx_max_queued_bytes
+        session.stream_ring_cap = wt_cfg.stream_ring_cap
         try:
             await session.open(timeout=10.0)
             yield session

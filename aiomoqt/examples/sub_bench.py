@@ -360,10 +360,10 @@ examples:
         '--draft', type=int, default=None,
         help='MoQT draft version (e.g. 14, 16)')
     parser.add_argument(
-        '--cc-algo', type=str, default='bbr',
+        '--cc-algo', type=str, default=None,
         help='Congestion control algorithm '
              '(bbr | bbr1 | newreno | cubic | dcubic | prague | fast). '
-             'Default: bbr')
+             'Default: aiopquic default (bbr1)')
     return parser.parse_args()
 
 

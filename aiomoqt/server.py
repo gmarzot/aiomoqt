@@ -28,7 +28,7 @@ class MOQTServer(MOQTPeer):
         debug: Optional[bool] = False,
         tx_max_inflight_bytes: Optional[int] = DEFAULT_TX_MAX_INFLIGHT_BYTES,
         tx_max_queued_bytes: Optional[int] = None,
-        congestion_control_algorithm: Optional[str] = "bbr",
+        congestion_control_algorithm: Optional[str] = None,
     ):
         super().__init__(tx_max_inflight_bytes=tx_max_inflight_bytes)
         self.host = host
@@ -68,13 +68,12 @@ class MOQTServer(MOQTPeer):
                 alpn_protocols=alpn, is_client=False,
                 max_data=2**24, max_stream_data=2**24,
                 max_datagram_frame_size=64 * 1024,
-                # Default "bbr" — NewReno collapses to cwin=2*MSS on
-                # misdetected loss (GIL-induced loopback RTT spikes)
-                # and can't recover. Operator-overridable via
-                # MOQTServer(congestion_control_algorithm=...).
-                congestion_control_algorithm=(
-                    self.congestion_control_algorithm),
             )
+            # None defers to the aiopquic default (bbr1) — loss-based
+            # CCs collapse on GIL-induced loss blips and can't recover.
+            if self.congestion_control_algorithm is not None:
+                cfg.congestion_control_algorithm = (
+                    self.congestion_control_algorithm)
             if self.tx_max_queued_bytes is not None:
                 cfg.tx_max_queued_bytes = self.tx_max_queued_bytes
             cfg.load_cert_chain(self.certificate, self.private_key)
@@ -106,9 +105,10 @@ class MOQTServer(MOQTPeer):
             is_client=False,
             max_data=2**24, max_stream_data=2**24,
             max_datagram_frame_size=64 * 1024,
-            congestion_control_algorithm=(
-                self.congestion_control_algorithm),
         )
+        if self.congestion_control_algorithm is not None:
+            wt_cfg.congestion_control_algorithm = (
+                self.congestion_control_algorithm)
         if self.tx_max_queued_bytes is not None:
             wt_cfg.tx_max_queued_bytes = self.tx_max_queued_bytes
 

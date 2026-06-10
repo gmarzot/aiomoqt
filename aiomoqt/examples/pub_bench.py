@@ -99,10 +99,10 @@ examples:
                         help='Skip TLS certificate verification')
     parser.add_argument('--draft', type=int, default=None,
                         help='MoQT draft version (e.g. 14, 16)')
-    parser.add_argument('--cc-algo', type=str, default='bbr',
+    parser.add_argument('--cc-algo', type=str, default=None,
                         help='Congestion control algorithm '
                              '(bbr | bbr1 | newreno | cubic | dcubic | '
-                             'prague | fast). Default: bbr')
+                             'prague | fast). Default: aiopquic default (bbr1)')
     args = parser.parse_args()
     if args.trackname is None:
         import uuid

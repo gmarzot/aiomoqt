@@ -53,17 +53,13 @@ logger = get_logger(__name__)
 # ~packet_size / asyncio_turn.
 #
 # Sizing: target_latency_ms * target_throughput_bytes_per_sec.
-# At 2 Gbps loopback, 16 MiB cap ≈ 64 ms latency budget; 2 MiB
-# cap ≈ 8 ms.
-#
-# Default 16 MiB sized to never engage in healthy steady-state
-# (producer ≈ consumer, in-flight stays well below the cap), but
-# acts as a fail-safe ceiling when the consumer falls behind —
-# preventing the unbounded producer-side memory growth that can
-# otherwise trigger OOM under sub-side stress. Pass None to opt
-# out entirely. Future API: tx_target_latency_ms with auto-tracked
-# drain rate.
-DEFAULT_TX_MAX_INFLIGHT_BYTES = 2 * 1024 * 1024
+# 1 MiB ≈ 2.7 ms standing-queue contribution per stream at 3 Gbps.
+# Works with the aiopquic aggregate gate (tx_max_queued_bytes): this
+# knob bounds ONE stream's queue (fairness, binds on long-lived
+# streams); the aggregate bounds the sum across streams. Pass None
+# to opt out. Future API: tx_target_latency_ms with auto-tracked
+# drain rate derives both.
+DEFAULT_TX_MAX_INFLIGHT_BYTES = 1 * 1024 * 1024
 
 
 class MOQTStreamReject(Exception):
