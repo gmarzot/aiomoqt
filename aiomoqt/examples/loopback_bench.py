@@ -217,7 +217,7 @@ def parse_args():
              '(QuicConfiguration.tx_max_queued_bytes): producer parks '
              'at stream rollover while total un-transmitted TX bytes '
              'exceed this. Steady-state latency ~ value / throughput. '
-             'Default: aiopquic default (8 MiB). Pass 0 to disable.')
+             'Default: aiopquic default (4 MiB). Pass 0 to disable.')
     return parser.parse_args()
 
 

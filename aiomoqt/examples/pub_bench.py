@@ -92,7 +92,7 @@ examples:
              '(QuicConfiguration.tx_max_queued_bytes): producer parks '
              'at stream rollover while total un-transmitted TX bytes '
              'exceed this. Steady-state latency ~ value / throughput. '
-             'Default: aiopquic default (8 MiB). Pass 0 to disable.')
+             'Default: aiopquic default (4 MiB). Pass 0 to disable.')
     parser.add_argument('-d', '--debug', action='store_true')
     parser.add_argument('--keylogfile', type=str, default=None)
     parser.add_argument('-k', '--insecure', action='store_true',

@@ -80,8 +80,8 @@ def parse_args():
              '(QuicConfiguration.tx_max_queued_bytes): producer parks '
              'at stream rollover while total un-transmitted TX bytes '
              'exceed this. Steady-state latency ~ value / throughput '
-             '(8 MiB ~ 11-22 ms @ 3 Gbps). Default: aiopquic default '
-             '(8 MiB). Pass 0 to disable.')
+             '(4 MiB ~ 8 ms @ 3 Gbps). Default: aiopquic default '
+             '(4 MiB). Pass 0 to disable.')
     parser.add_argument(
         '-Q', '--quic', action='store_true',
         help='Serve raw QUIC (aiopquic) instead of H3/WebTransport')
