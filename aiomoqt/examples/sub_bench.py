@@ -70,6 +70,14 @@ class BenchStats:
         self.iv_lat_count: int = 0
         self.iv_lat_max: int = 16384
 
+        # Per-subgroup latency reservoirs — discriminates scheduler
+        # skew (tail concentrated in specific subgroup streams) from
+        # group-boundary bursts (same bimodal shape in every
+        # subgroup). Printed in the final summary when more than one
+        # subgroup was seen. sg → [count, reservoir_list].
+        self.sg_lat: dict = {}
+        self.sg_lat_max: int = 4096
+
         # Cumulative
         self.total_objects: int = 0
         self.total_bytes: int = 0
@@ -137,6 +145,18 @@ class BenchStats:
                 if j < self.iv_lat_max:
                     self.iv_latencies[j] = latency
             self.iv_lat_count += 1
+
+            if subgroup_id is not None:
+                ent = self.sg_lat.get(subgroup_id)
+                if ent is None:
+                    ent = self.sg_lat[subgroup_id] = [0, []]
+                if len(ent[1]) < self.sg_lat_max:
+                    ent[1].append(latency)
+                else:
+                    j = random.randint(0, ent[0])
+                    if j < self.sg_lat_max:
+                        ent[1][j] = latency
+                ent[0] += 1
 
             # Update cumulative latency running stats + reservoir.
             self.lat_sum += latency
@@ -319,6 +339,16 @@ class BenchStats:
                 f"p95={self._pct(sample, 95):.1f}  "
                 f"p99={self._pct(sample, 99):.1f} ms"
             )
+            if len(self.sg_lat) > 1:
+                print("  Per-subgroup latency (reservoir-sampled):")
+                for sg in sorted(self.sg_lat):
+                    n, res = self.sg_lat[sg]
+                    print(
+                        f"    sg={sg:<3d} n={n:<9d} "
+                        f"p50={self._pct(res, 50):6.1f}  "
+                        f"p95={self._pct(res, 95):6.1f}  "
+                        f"p99={self._pct(res, 99):6.1f} ms"
+                    )
 
         if self.jitter_count > 0:
             javg = self.jitter_sum / self.jitter_count
