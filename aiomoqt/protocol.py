@@ -22,6 +22,7 @@ from .types import *
 from .utils.buffer import Buffer, BufferReadError
 from .utils.logger import *
 from aiopquic.streamchain import StreamChain
+from aiopquic.asyncio.webtransport import WebTransportError
 
 # Resolved once at import time; the trace check is then a single
 # Python bool test on the hot send/recv paths (effectively free
@@ -1254,7 +1255,16 @@ class _MOQTSessionMixin:
         if getattr(self._session, 'use_quic', False):
             return self._quic.get_next_available_stream_id(is_unidirectional=True)
         # aiopquic-WT: round-trip to picoquic for stream-id allocation
-        return await self.create_stream(bidir=False)
+        try:
+            return await self.create_stream(bidir=False)
+        except WebTransportError:
+            # Session torn down while a producer was at a stream
+            # rollover. Convert to the cancellation path the track
+            # generators already handle cleanly instead of surfacing
+            # a task exception at every shutdown.
+            if not self._session_writable():
+                raise asyncio.CancelledError()
+            raise
 
     async def open_bidi_stream(self) -> int:
         """Open a bidirectional stream. Returns the stream ID."""
@@ -1281,7 +1291,8 @@ class _MOQTSessionMixin:
         try:
             self._quic.send_stream_data(
                 stream_id, data, end_stream=end_stream)
-        except (AssertionError, AttributeError, BufferError) as e:
+        except (AssertionError, AttributeError, BufferError,
+                WebTransportError) as e:
             logger.debug(f"stream({stream_id}): write race: {e}")
 
     async def stream_write_drain(self, stream_id: int, data: bytes,
@@ -1345,7 +1356,7 @@ class _MOQTSessionMixin:
         try:
             self._quic.send_stream_data(stream_id, b"", end_stream=True)
         except (AssertionError, AttributeError, BufferError,
-                RuntimeError) as e:
+                RuntimeError, WebTransportError) as e:
             logger.debug(f"stream({stream_id}): fin race: {e}")
 
     def stream_reset(self, stream_id: int,
