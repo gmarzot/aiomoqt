@@ -64,8 +64,7 @@ class BenchStats:
         # the NEXT interval's latencies with the bench's own stall —
         # visible only in 2-process runs (in-process the producer
         # co-stalls, so no queue forms). 16K samples keep the sort
-        # ~1.5 ms with negligible percentile error. The rpt= field on
-        # each interval line discloses the report's residual self-cost.
+        # ~1.5 ms with negligible percentile error.
         self.iv_latencies: list = []
         self.iv_lat_count: int = 0
         self.iv_lat_max: int = 16384
@@ -257,12 +256,9 @@ class BenchStats:
         bps = (self.iv_bytes * 8) / dt
 
         lat = self.iv_latencies
-        rpt_ms = 0.0
         if lat:
-            t0 = time.perf_counter()
             avg = sum(lat) / len(lat)
             p99 = self._pct(lat, 99)
-            rpt_ms = (time.perf_counter() - t0) * 1000
             lat_s = f"{fmt_ms(avg)} p99: {fmt_ms(p99)}"
         else:
             lat_s = "--"
@@ -281,7 +277,6 @@ class BenchStats:
             f"{rate_s:<10}{bps_s:<10}"
             f"{lat_s:<20}"
             f"{jitter_s:<8}{loss_s:<17}"
-            f"rpt={rpt_ms:.1f}ms"
         )
 
         self.iv_objects = 0
