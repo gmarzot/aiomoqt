@@ -348,7 +348,8 @@ examples:
         help='Relay URL: moqt://host:port, '
              'https://host:port/ep, or host[:port]')
     parser.add_argument(
-        '-Q', '--force-quic', action='store_true',
+        '-Q', '--quic', '--force-quic', action='store_true',
+        dest='force_quic',
         help='Force raw QUIC even for https:// URLs')
     parser.add_argument(
         '-n', '--namespace', type=str, default='aiomoqt',

@@ -69,11 +69,10 @@ def parse_args():
              'default: max). Per-stream emit rate is rate/streams.')
     parser.add_argument(
         '--max-inflight-bytes', type=int, default=None,
-        help='Producer backpressure: pause once aiopquic reports this '
-             'many bytes pending in the per-stream TX ring. '
-             'Default: protocol-layer 16 MB (~64 ms latency @ 2 Gbps). '
-             'Pass 0 to opt out entirely (unbounded). e.g. 2_000_000 '
-             '~10ms @ 1.6 Gbps for stricter latency.')
+        help='Per-stream TX budget (aiomoqt tx_max_inflight_bytes): '
+             'producer pauses while one stream\'s un-transmitted bytes '
+             'exceed this. Default: aiomoqt default (1 MiB). '
+             'Pass 0 to disable.')
     parser.add_argument(
         '--max-queued-bytes', type=int, default=None,
         help='Aggregate publisher byte budget across ALL streams '

@@ -197,7 +197,7 @@ def parse_args():
     parser.add_argument(
         '-d', '--debug', action='store_true')
     parser.add_argument(
-        '--quic', action='store_true',
+        '-Q', '--quic', action='store_true',
         help='Use raw QUIC instead of WebTransport (default: WT)')
     parser.add_argument(
         '--cc-algo', type=str, default=None,
@@ -206,11 +206,10 @@ def parse_args():
              'Default: aiopquic default (bbr1)')
     parser.add_argument(
         '--max-inflight-bytes', type=int, default=None,
-        help='Per-stream producer byte-budget cap '
-             '(stream_tx_buf_used > N parks producer). '
-             'Default: protocol-layer 16 MB (~64 ms latency @ 2 Gbps). '
-             'Pass 0 to opt out entirely. '
-             'Hysteresis: park at N, resume at N//2.')
+        help='Per-stream TX budget (aiomoqt tx_max_inflight_bytes): '
+             'producer pauses while one stream\'s un-transmitted bytes '
+             'exceed this. Default: aiomoqt default (1 MiB). '
+             'Pass 0 to disable.')
     parser.add_argument(
         '--max-queued-bytes', type=int, default=None,
         help='Aggregate publisher byte budget across ALL streams '

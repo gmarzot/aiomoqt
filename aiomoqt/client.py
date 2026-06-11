@@ -5,7 +5,10 @@ from aiopquic.asyncio.client import connect as aiopquic_connect
 from aiopquic._binding._transport import TransportContext
 from aiopquic.quic.configuration import QuicConfiguration
 
-from .protocol import MOQTPeer, MOQTSessionQuic, MOQTSessionWTClient
+from .protocol import (
+    MOQTPeer, MOQTSessionQuic, MOQTSessionWTClient,
+    DEFAULT_TX_MAX_INFLIGHT_BYTES,
+)
 from .types import moqt_alpn_for_version, MOQT_ALPN
 from .context import set_moqt_ctx_version
 from .utils.logger import *
@@ -29,10 +32,12 @@ class MOQTClient(MOQTPeer):
         draft_version: Optional[int] = None,
         libquicr_compat: Optional[bool] = False,
         congestion_control_algorithm: Optional[str] = None,
+        tx_max_inflight_bytes: Optional[int] = DEFAULT_TX_MAX_INFLIGHT_BYTES,
         tx_max_queued_bytes: Optional[int] = None,
     ):
         super().__init__(allow_optional_dgram=allow_optional_dgram,
-                         libquicr_compat=libquicr_compat)
+                         libquicr_compat=libquicr_compat,
+                         tx_max_inflight_bytes=tx_max_inflight_bytes)
         from .utils.url import normalize_wt_path
         self.host = host
         self.port = port
@@ -63,7 +68,7 @@ class MOQTClient(MOQTPeer):
         # Aggregate TX gate budget (QuicConfiguration.tx_max_queued_bytes):
         # bounds publisher run-ahead across ALL streams; steady-state
         # added latency ≈ value / drain rate. None = honor the aiopquic
-        # default (8 MiB); 0 = disable.
+        # default (4 MiB); 0 = disable.
         self.tx_max_queued_bytes = tx_max_queued_bytes
 
         if draft_version is not None:

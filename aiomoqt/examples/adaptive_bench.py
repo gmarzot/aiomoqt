@@ -1113,6 +1113,11 @@ async def run_loopback_server(args, state: BenchState):
         certificate=args.cert, private_key=args.key,
         path="",
         congestion_control_algorithm=args.cc_algo,
+        tx_max_queued_bytes=args.max_queued_bytes,
+        **({'tx_max_inflight_bytes':
+            (None if args.max_inflight_bytes == 0
+             else args.max_inflight_bytes)}
+           if args.max_inflight_bytes is not None else {}),
     )
     server.register_handler(
         MOQTMessageType.SUBSCRIBE, partial(_on_subscribe))
@@ -1188,6 +1193,11 @@ async def run_publisher_client(host: str, port: int, path: str,
         verify_tls=verify_tls,
         draft_version=args.draft,
         congestion_control_algorithm=args.cc_algo,
+        tx_max_queued_bytes=args.max_queued_bytes,
+        **({'tx_max_inflight_bytes':
+            (None if args.max_inflight_bytes == 0
+             else args.max_inflight_bytes)}
+           if args.max_inflight_bytes is not None else {}),
     )
     try:
         async with client.connect() as session:
@@ -1359,10 +1369,25 @@ def parse_args():
                         "uvloop is on by default when available — "
                         "typically 2-4× faster on selector-heavy "
                         "workloads.")
-    p.add_argument("--cc-algo", type=str, default="bbr",
+    p.add_argument("--cc-algo", type=str, default=None,
                    help="Congestion control algorithm "
                         "(bbr | bbr1 | newreno | cubic | dcubic | "
-                        "prague | fast). Default: bbr")
+                        "prague | fast). Default: aiopquic default "
+                        "(bbr1)")
+    p.add_argument("--max-queued-bytes", type=int, default=None,
+                   help="Aggregate publisher byte budget across ALL "
+                        "streams (QuicConfiguration.tx_max_queued_bytes): "
+                        "producer parks at stream rollover while total "
+                        "un-transmitted TX bytes exceed this. "
+                        "Steady-state latency ~ value / throughput. "
+                        "Default: aiopquic default (4 MiB). "
+                        "Pass 0 to disable.")
+    p.add_argument("--max-inflight-bytes", type=int, default=None,
+                   help="Per-stream TX budget (aiomoqt "
+                        "tx_max_inflight_bytes): producer pauses while "
+                        "one stream's un-transmitted bytes exceed this. "
+                        "Default: aiomoqt default (1 MiB). "
+                        "Pass 0 to disable.")
     args = p.parse_args()
     args.sub_filter = filter_choices[args.sub_filter]
     if args.sub_filter in (FilterType.ABSOLUTE_START,

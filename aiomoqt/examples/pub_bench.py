@@ -43,7 +43,8 @@ examples:
 """)
     parser.add_argument('relay', type=str,
                         help='Relay URL: moqt://host:port, https://host:port/ep, or host[:port]')
-    parser.add_argument('-Q', '--force-quic', action='store_true',
+    parser.add_argument('-Q', '--quic', '--force-quic', action='store_true',
+                        dest='force_quic',
                         help='Force raw QUIC even for https:// URLs')
     parser.add_argument('-n', '--namespace', type=str, default='aiomoqt',
                         help='MoQT namespace (default: aiomoqt)')
@@ -93,6 +94,12 @@ examples:
              'at stream rollover while total un-transmitted TX bytes '
              'exceed this. Steady-state latency ~ value / throughput. '
              'Default: aiopquic default (4 MiB). Pass 0 to disable.')
+    parser.add_argument(
+        '--max-inflight-bytes', type=int, default=None,
+        help='Per-stream TX budget (aiomoqt tx_max_inflight_bytes): '
+             'producer pauses while one stream\'s un-transmitted bytes '
+             'exceed this. Default: aiomoqt default (1 MiB). '
+             'Pass 0 to disable.')
     parser.add_argument('-d', '--debug', action='store_true')
     parser.add_argument('--keylogfile', type=str, default=None)
     parser.add_argument('-k', '--insecure', action='store_true',
@@ -166,6 +173,10 @@ async def run(args):
         keylog_filename=args.keylogfile,
         congestion_control_algorithm=args.cc_algo,
         tx_max_queued_bytes=args.max_queued_bytes,
+        **({'tx_max_inflight_bytes':
+            (None if args.max_inflight_bytes == 0
+             else args.max_inflight_bytes)}
+           if args.max_inflight_bytes is not None else {}),
     )
 
     print(f"  Connecting...")

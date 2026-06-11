@@ -38,7 +38,8 @@ examples:
         'relay', type=str,
         help='Relay URL (see forms above)')
     parser.add_argument(
-        '-Q', '--force-quic', action='store_true',
+        '-Q', '--quic', '--force-quic', action='store_true',
+        dest='force_quic',
         help='Force raw QUIC even for https:// URLs')
     parser.add_argument(
         '-n', '--namespace', type=str, default='aiomoqt')
@@ -74,10 +75,26 @@ examples:
         '-k', '--insecure', action='store_true',
         help='Skip TLS certificate verification')
     parser.add_argument(
-        '--cc-algo', type=str, default='bbr',
+        '--draft', type=int, default=None,
+        help='MoQT draft version (default: tool default)')
+    parser.add_argument(
+        '--cc-algo', type=str, default=None,
         help='Congestion control algorithm '
              '(bbr | bbr1 | newreno | cubic | dcubic | prague | fast). '
-             'Default: bbr')
+             'Default: aiopquic default (bbr1)')
+    parser.add_argument(
+        '--max-queued-bytes', type=int, default=None,
+        help='Aggregate publisher byte budget across ALL streams '
+             '(QuicConfiguration.tx_max_queued_bytes): producer parks '
+             'at stream rollover while total un-transmitted TX bytes '
+             'exceed this. Steady-state latency ~ value / throughput. '
+             'Default: aiopquic default (4 MiB). Pass 0 to disable.')
+    parser.add_argument(
+        '--max-inflight-bytes', type=int, default=None,
+        help='Per-stream TX budget (aiomoqt tx_max_inflight_bytes): '
+             'producer pauses while one stream\'s un-transmitted bytes '
+             'exceed this. Default: aiomoqt default (1 MiB). '
+             'Pass 0 to disable.')
     return parser.parse_args()
 
 
@@ -99,7 +116,13 @@ async def main():
         debug=args.debug,
         keylogfile=args.keylogfile,
         insecure=args.insecure,
+        draft=args.draft,
         cc_algo=args.cc_algo,
+        max_queued_bytes=args.max_queued_bytes,
+        max_inflight_bytes=args.max_inflight_bytes,
+        pub_ns=False,
+        pub_both=False,
+        forward=0,
     )
 
     sub_args = argparse.Namespace(
@@ -112,7 +135,9 @@ async def main():
         debug=args.debug,
         keylogfile=args.keylogfile,
         insecure=args.insecure,
+        draft=args.draft,
         cc_algo=args.cc_algo,
+        auth_token=None,
     )
 
     # Import run functions

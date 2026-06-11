@@ -85,7 +85,8 @@ def parse_args():
     pub_mode.add_argument('--pub-both', action='store_true',
                           help='Hybrid: PUB_NS + PUBLISH. Breaks on '
                                'CF d14 moq-rs.')
-    parser.add_argument('-Q', '--force-quic', action='store_true',
+    parser.add_argument('-Q', '--quic', '--force-quic', action='store_true',
+                        dest='force_quic',
                         help='Force raw QUIC')
     parser.add_argument('-d', '--debug', action='store_true',
                         help='Verbose logging (default: WARN+)')
@@ -95,10 +96,24 @@ def parse_args():
                         help='Seconds to wait for publisher before spawning subs (default: 5)')
     parser.add_argument('--logdir', type=str, default=None,
                         help='Directory for per-process debug logs (pub.log, sub-N.log)')
-    parser.add_argument('--cc-algo', type=str, default='bbr',
+    parser.add_argument('--cc-algo', type=str, default=None,
                         help='Congestion control algorithm '
                              '(bbr | bbr1 | newreno | cubic | dcubic | '
-                             'prague | fast). Default: bbr')
+                             'prague | fast). Default: aiopquic default '
+                             '(bbr1)')
+    parser.add_argument(
+        '--max-queued-bytes', type=int, default=None,
+        help='Aggregate publisher byte budget across ALL streams '
+             '(QuicConfiguration.tx_max_queued_bytes): producer parks '
+             'at stream rollover while total un-transmitted TX bytes '
+             'exceed this. Steady-state latency ~ value / throughput. '
+             'Default: aiopquic default (4 MiB). Pass 0 to disable.')
+    parser.add_argument(
+        '--max-inflight-bytes', type=int, default=None,
+        help='Per-stream TX budget (aiomoqt tx_max_inflight_bytes): '
+             'producer pauses while one stream\'s un-transmitted bytes '
+             'exceed this. Default: aiomoqt default (1 MiB). '
+             'Pass 0 to disable.')
     return parser.parse_args()
 
 
@@ -129,6 +144,11 @@ def run_publisher(relay_url, namespace, trackname, args):
             verify_tls=not args.insecure,
             draft_version=args.draft,
             congestion_control_algorithm=args.cc_algo,
+            tx_max_queued_bytes=args.max_queued_bytes,
+            **({'tx_max_inflight_bytes':
+                (None if args.max_inflight_bytes == 0
+                 else args.max_inflight_bytes)}
+               if args.max_inflight_bytes is not None else {}),
         )
         async with client.connect() as session:
             await session.client_session_init()

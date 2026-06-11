@@ -48,7 +48,7 @@ class MOQTServer(MOQTPeer):
         # Aggregate TX gate budget (QuicConfiguration.tx_max_queued_bytes):
         # bounds publisher run-ahead across ALL streams; steady-state
         # added latency ≈ value / drain rate. None = honor the aiopquic
-        # default (8 MiB); 0 = disable.
+        # default (4 MiB); 0 = disable.
         self.tx_max_queued_bytes = tx_max_queued_bytes
         self.congestion_control_algorithm = congestion_control_algorithm
         self._loop = asyncio.get_running_loop()
