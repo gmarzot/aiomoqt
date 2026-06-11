@@ -52,6 +52,12 @@ class _RollingStats:
     def __init__(self, window_s: float = 5.0):
         self.window_s = window_s
         self._events: deque = deque()   # (t, bytes, lat_ms_or_None)
+        # Latency sampling stride — adaptively raised by snapshot()
+        # so the percentile sort stays bounded; a full 5 s window at
+        # 100K+ obj/s is 500K+ entries and sorting it stalls the
+        # consumer loop ~100 ms, queueing arrivals it then measures.
+        self._lat_stride: int = 1
+        self._n_events: int = 0
         self._last_seen: Dict = {}       # (group, subgroup) -> last obj_id
         self._stride: Dict = {}
         self._lost = 0
@@ -88,7 +94,9 @@ class _RollingStats:
                                         - self._jitter_ms) / 16.0
                 self._last_recv_us = recv_time_us
                 self._last_send_us = send_us
-        self._events.append((t, size_bytes, lat_ms))
+        self._n_events += 1
+        if self._n_events % self._lat_stride == 0:
+            self._events.append((t, size_bytes, lat_ms))
         self._total_bytes += size_bytes
         self._total_objs += 1
         oid = getattr(msg, 'object_id', None)
@@ -117,6 +125,11 @@ class _RollingStats:
         cutoff = t - self.window_s
         while self._events and self._events[0][0] < cutoff:
             self._events.popleft()
+        # Adaptive thinning: bound the percentile sort so the snapshot
+        # cannot stall the consumer loop at high object rates.
+        if len(self._events) > 24576:
+            self._events = deque(list(self._events)[::2])
+            self._lat_stride *= 2
         # Latency from the rolling window
         lats = sorted(e[2] for e in self._events if e[2] is not None)
         mean = sum(lats) / len(lats) if lats else 0.0

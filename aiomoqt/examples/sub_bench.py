@@ -56,7 +56,19 @@ class BenchStats:
         # reasonable -i.
         self.iv_objects: int = 0
         self.iv_bytes: int = 0
+        # Interval latency RESERVOIR (Algorithm R, same as the
+        # cumulative lat_reservoir below). Capped because the interval
+        # report runs INSIDE on_object on the receive loop: sorting a
+        # full 5 s window (500K+ floats at 100K+ obj/s) blocks the
+        # drain ~100-170 ms, queueing arrivals in sc->rx and poisoning
+        # the NEXT interval's latencies with the bench's own stall —
+        # visible only in 2-process runs (in-process the producer
+        # co-stalls, so no queue forms). 16K samples keep the sort
+        # ~1.5 ms with negligible percentile error. The rpt= field on
+        # each interval line discloses the report's residual self-cost.
         self.iv_latencies: list = []
+        self.iv_lat_count: int = 0
+        self.iv_lat_max: int = 16384
 
         # Cumulative
         self.total_objects: int = 0
@@ -118,7 +130,13 @@ class BenchStats:
                 send_us = None
 
         if latency is not None:
-            self.iv_latencies.append(latency)
+            if len(self.iv_latencies) < self.iv_lat_max:
+                self.iv_latencies.append(latency)
+            else:
+                j = random.randint(0, self.iv_lat_count)
+                if j < self.iv_lat_max:
+                    self.iv_latencies[j] = latency
+            self.iv_lat_count += 1
 
             # Update cumulative latency running stats + reservoir.
             self.lat_sum += latency
@@ -219,9 +237,12 @@ class BenchStats:
         bps = (self.iv_bytes * 8) / dt
 
         lat = self.iv_latencies
+        rpt_ms = 0.0
         if lat:
+            t0 = time.perf_counter()
             avg = sum(lat) / len(lat)
             p99 = self._pct(lat, 99)
+            rpt_ms = (time.perf_counter() - t0) * 1000
             lat_s = f"{fmt_ms(avg)} p99: {fmt_ms(p99)}"
         else:
             lat_s = "--"
@@ -240,11 +261,13 @@ class BenchStats:
             f"{rate_s:<10}{bps_s:<10}"
             f"{lat_s:<20}"
             f"{jitter_s:<8}{loss_s:<17}"
+            f"rpt={rpt_ms:.1f}ms"
         )
 
         self.iv_objects = 0
         self.iv_bytes = 0
         self.iv_latencies = []
+        self.iv_lat_count = 0
 
     def print_summary(self):
         if self.start_time == 0:
