@@ -45,12 +45,10 @@ python -m aiomoqt.versions   # or the console script: aiomoqt-versions
 Sample output:
 
 ```
-aiomoqt  0.9.5.dev7+g69f55724e.d20260520
-         /path/to/aiomoqt
-aiopquic 0.3.5.dev4+g2ffe8947d.d20260522
-         /path/to/aiopquic
-picoquic 2b1e14d5a46532eadf691edef5bd747da6de6557
-picotls  f350eab60742138ac62b42ee444adf04c7898b0d
+aiomoqt:   0.9.7.dev7+g0fa185338 (~/src/aiomoqt/aiomoqt) [2026-06-11 11:57]
+aiopquic:  0.3.7.dev12+g6eef9caf6 (~/src/aiopquic/src/aiopquic) [2026-06-11 11:58]
+  - picoquic:  1.1.49.2 (d6c5653d) [2026-06-05]
+  - picotls:   master (bfa67875) [2026-04-20]
 ```
 
 ## Quick Start
@@ -142,64 +140,34 @@ req = await session.subscribe('ns', 'track')
 
 ```bash
 # Publish (SubgroupHeader streams)
-python -m aiomoqt.examples.pub_example --host relay.ex.com --use-quic
+python -m aiomoqt.examples.pub_example -h relay.ex.com -q
 
 # Publish (ObjectDatagrams)
-python -m aiomoqt.examples.pub_example --host relay.ex.com --use-quic --datagram
+python -m aiomoqt.examples.pub_example -h relay.ex.com -q --datagram
 
 # Subscribe
-python -m aiomoqt.examples.sub_example --host relay.ex.com --use-quic
+python -m aiomoqt.examples.sub_example -h relay.ex.com -q
 
 # Subscribe + FETCH (join mid-stream)
-python -m aiomoqt.examples.join_example --host relay.ex.com --use-quic
+python -m aiomoqt.examples.join_example -h relay.ex.com -q
 ```
 
-Common options: `--namespace`, `--trackname`, `--path`, `--debug`, `--keylogfile`
+Common options: `--namespace`, `--trackname`, `--path`, `--debug`, `--keylogfile`. Every tool prints its full option set with `-?` / `--help`.
 
 ### Benchmarks
 
-Bench tools take a positional relay URL:
-
-```
-moqt://host[:port]              Raw QUIC (default port 443)
-https://host[:port]/[endpoint]  H3/WebTransport (default port 443)
-```
+Bench tools take a positional relay URL — `moqt://host[:port]` for raw QUIC, `https://host[:port]/[endpoint]` for H3/WebTransport — except `loopback_bench`, which needs no relay at all:
 
 ```bash
-# Publisher — configurable size, rate, parallelism
-python -m aiomoqt.examples.pub_bench moqt://relay.ex.com -s 4096 -P 4 -r 120 -t 60
-
-# Subscriber — latency/jitter/loss stats (omit -t; subscriber exits on PUBLISH_DONE)
-python -m aiomoqt.examples.sub_bench moqt://relay.ex.com
-
-# Combined pub/sub in one process
-python -m aiomoqt.examples.relay_bench moqt://relay.ex.com -s 1024 -g 10000 -t 30
-
-# 1 publisher, N subscribers in one process (fanout capacity)
-python -m aiomoqt.examples.multi_sub_bench moqt://relay.ex.com -n 100 --video 720p -t 60
-
-# Local loopback (no relay needed)
+# Local loopback (canonical stack benchmark, no relay)
 python -m aiomoqt.examples.loopback_bench -s 4096 -P 4 -t 20
+
+# Publisher / subscriber through a relay
+python -m aiomoqt.examples.pub_bench moqt://relay.ex.com -s 4096 -P 4 -r 120 -t 60
+python -m aiomoqt.examples.sub_bench moqt://relay.ex.com
 ```
 
-Publisher flow selection (for relays that require a specific message pattern):
-
-```bash
---pub-ns     # send only PUBLISH_NAMESPACE (wait for SUBSCRIBE)
---pub-both   # send PUBLISH_NAMESPACE and PUBLISH (required by Cloudflare d14)
-             # default: send only PUBLISH
-```
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `-s, --object-size` | Payload size (bytes) | 1024 |
-| `-g, --group-size` | Objects per group | 10000 |
-| `-P, --streams` | Parallel subgroup streams | 1 |
-| `-r, --rate` | Objects/sec per stream (0=max) | 0 |
-| `-t, --duration` | Duration (seconds) | 30 |
-| `-i, --interval` | Report interval (seconds) | 5.0 |
-| `-D, --datagram` | Use datagrams instead of streams | off |
-| `-Q, --force-quic` | Force raw QUIC for https:// URLs | off |
+The full tool matrix (two-process, fanout, adaptive ramp), all options, latency methodology (paced vs unpaced, TX budgets), and observed numbers live in [PERFORMANCE.md](PERFORMANCE.md).
 
 ### Interop Testing
 
@@ -269,68 +237,28 @@ python -m aiomoqt.examples.server_example \
 | `relay_probe.py` | Relay version probe (draft-14/16) |
 | `moq_interop_client.py` | Interop test client (TAP v14 out; 6 standard + `fetch`/`join`) |
 
-## Interop Test Results
+## Interop
 
-Results against live public relays, as probed by
-`tests/release_regression_test.py --test-tier interop` in v0.8.1.
-Tests use the 6 [moq-interop-runner](https://github.com/englishm/moq-interop-runner)
-cases plus `relay-pub-sub` (3-subscriber multi-sub bench).
-Error codes are validated to spec-conformant values
-(e.g. `subscribe-error` requires `TRACK_DOES_NOT_EXIST`, not `INTERNAL_ERROR`).
-
-| Relay | Draft | Transport | ctrl-msg | pub-sub |
-|-------|-------|-----------|----------|---------|
-| OpenMoQ moqx | d14 | QUIC | 6/6 | 3/3 |
-| OpenMoQ moqx | d14 | H3/WT | 6/6 | 3/3 |
-| OpenMoQ moqx | d16 | QUIC | 6/6 | 3/3 |
-| OpenMoQ moqx | d16 | H3/WT | 6/6 | 3/3 |
-| Meta moxygen | d14 | QUIC | 6/6 | 3/3 |
-| Meta moxygen | d14 | H3/WT | 6/6 | 3/3 |
-| Meta moxygen | d16 | QUIC | 6/6 | 3/3 |
-| Meta moxygen | d16 | H3/WT | 6/6 | 3/3 |
-| Cloudflare moq-rs | d14 | QUIC | 5/6 | 3/3 |
-| Cloudflare moq-rs (d16 interop branch) | d16 | QUIC | 6/6 | unverified |
-| Red5 Pro | d14 | QUIC | unreachable | unreachable |
-| Red5 Pro | d14 | H3/WT | 6/6 | unverified |
-| Red5 Pro | d16 | QUIC | unreachable | unreachable |
-| Red5 Pro | d16 | H3/WT | 6/6 | unverified |
-| Quicr libquicr | d14 | QUIC | 5/6 | 3/3 |
-| Quicr libquicr | d14 | H3/WT | 5/6 | 3/3 |
-| Quicr libquicr | d16 | QUIC | unverified | unverified |
-| Quicr libquicr | d16 | H3/WT | 5/6 | 3/3 |
-| Meetecho imquic | d16 | QUIC | 6/6 | unverified |
-| Meetecho imquic | d16 | H3/WT | 5/6 | unverified |
-| OzU moqtail | d14 | H3/WT | 6/6 | unverified |
-
-- `unverified` — suite did not complete end-to-end.
-- `unreachable` — no response to QUIC Initial.
-- See [`tests/relays.json`](tests/relays.json) for the full catalog,
-  per-endpoint notes, and relays disabled by default.
-
-Test cases: `setup-only`, `announce-only`, `publish-namespace-done`,
-`subscribe-error`, `announce-subscribe`, `subscribe-before-announce`,
-plus `fetch` and `join` probes (not in default catalog matrix —
-most relays do not implement these yet).
+Validated against live public relays — OpenMoQ moqx, Meta moxygen,
+Cloudflare moq-rs, Quicr libquicr, Meetecho imquic, Red5 Pro, OzU
+moqtail — across draft-14/draft-16 and both transports, using the
+[moq-interop-runner](https://github.com/englishm/moq-interop-runner)
+cases plus a multi-subscriber pub-sub bench. The full point-in-time
+matrix lives in [PERFORMANCE.md](PERFORMANCE.md#interop-matrix-point-in-time);
+the relay catalog with per-endpoint notes is
+[`tests/relays.json`](tests/relays.json).
 
 ## Performance
 
-`aiomoqt` sits on top of [`aiopquic`](https://github.com/gmarzot/aiopquic), which sits on picoquic + the kernel UDP path. Throughput at the aiomoqt layer is bounded by the layer below.
-
-On AMD Ryzen 7 PRO 7840U / WSL2 / Linux 6.6, single-publisher single-subscriber MoQT loopback (raw QUIC, 30s steady-state, in-process publisher and subscriber):
-
-| obj | obj/s | throughput | notes |
-|---|---|---|---|
-| 8 KiB | 16,084 | 1,055 Mbps | b6 subgroup-churn microbench |
-
-`aiopquic` highlevel throughput on the same hardware sits at ~2.0 Gbps for ≥4 KiB objects (UDP-loopback-bound at QUIC MTU). The aiomoqt layer adds per-object MoQT framer + asyncio orchestration cost; the gap between aiomoqt and aiopquic is the headroom we work on in 0.9.x. See the [aiopquic Performance section](https://github.com/gmarzot/aiopquic#performance) for the layer breakdown including the `sim_link` protocol-only reference.
-
-Numbers vary by platform — kernel UDP loopback rates differ noticeably (Apple M-series macOS sits around 1 Gbps regardless of obj size due to a slower UDP loopback path). Calibrate on your own hardware:
-
-```bash
-python -m aiomoqt.examples.adaptive_bench -P 4 \
-    --start-mbps 50 --max-mbps 2000 --step-mbps 100 \
-    --interval 5 -s 4096 -t 60 --mp-loopback
-```
+`aiomoqt` sits on [`aiopquic`](https://github.com/gmarzot/aiopquic),
+which sits on picoquic + the kernel UDP path; throughput at this layer
+is bounded by the layers below. Observed on commodity hardware over
+loopback: multi-Gbps sustained throughput at ~4 KiB objects with
+bounded memory under stream churn, and sub-millisecond to
+low-millisecond latency when paced below saturation. Numbers vary
+substantially by platform — methodology, observed figures, the
+paced-vs-unpaced distinction, and TX budget tuning are in
+[PERFORMANCE.md](PERFORMANCE.md).
 
 ## Development
 
@@ -345,12 +273,9 @@ pytest aiomoqt/tests/
 ## Known Limitations
 
 - **WebTransport fetch / join routing** -- four `[wt]` test variants of FETCH and JOINING_SUBSCRIBE return empty results when the underlying transport is WebTransport. Raw-QUIC variants of the same tests pass and cover the MoQT-level invariant. Tracked separately; affects WT-only consumers of fetch/join.
-- **Subscriber framer desync at high tx rates** -- under sustained tx > ~400 Mbps the subscriber's data-stream parser occasionally rejects a stream with a `framer desync` error. Stream-level reject (not session-fatal); the publisher continues. Pre-existing; surfaced more visibly by `--mp-loopback` headroom. Tracked for 0.9.x.
 
 ## TODO
 
-* Diagnose and fix the subscriber framer desync at high tx rates
-* Close the aiomoqt-level perf gap to the aiopquic transport ceiling (framer batching)
 * Fix WebTransport fetch / join routing (the 4 `[wt]` tests currently skipped)
 * Track data modules:
   - File transfer (or [MOQT File Format](https://datatracker.ietf.org/doc/html/draft-jennings-moq-file-00)?)
