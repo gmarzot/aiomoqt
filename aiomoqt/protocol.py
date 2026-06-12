@@ -1306,8 +1306,15 @@ class _MOQTSessionMixin:
         delegated to aiopquic's send_stream_data_drained — single
         source of truth per the backpressure-placement principle.
         """
-        if not self._session_writable():
-            return
+        if (not self._session_writable()
+                or getattr(self._quic, 'closed', False)):
+            # Dead session or closed connection: convert to the
+            # cancellation path the track generators handle (mirror
+            # of the WT open_uni_stream guard). A silent no-op here
+            # livelocks unpaced producers — the await completes
+            # without ever suspending, so the event loop starves and
+            # task cancellation can never be delivered.
+            raise asyncio.CancelledError()
         if _AIOMOQT_DESYNC_TRACE:
             seen = getattr(self, "_desync_tx_seen", None)
             if seen is None:
