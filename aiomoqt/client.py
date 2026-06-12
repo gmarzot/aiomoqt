@@ -154,13 +154,14 @@ class MOQTClient(MOQTPeer):
             is_client=True, alpn="h3",
             max_datagram_frame_size=64 * 1024,
             debug_log=self.quic_debug_log,
-            rx_ring_cap=wt_cfg.max_stream_data,
+            rx_data_ring_cap=wt_cfg.max_stream_data,
             initial_max_data=wt_cfg.max_data,
             initial_max_streams_uni=wt_cfg.max_streams_uni,
             initial_max_streams_bidi=wt_cfg.max_streams_bidi,
             idle_timeout_ms=int(wt_cfg.idle_timeout * 1000),
             congestion_control_algorithm=(
                 wt_cfg.congestion_control_algorithm),
+            qlog_dir=wt_cfg.qlog_dir,
         )
         # MoQT version negotiation over WebTransport (per moq-transport-16
         # §3.1): drafts >= 15 carry the version in WT-Available-Protocols
