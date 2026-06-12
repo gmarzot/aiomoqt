@@ -234,7 +234,7 @@ def parse_args():
              'reject differing payload bytes for the same trackname '
              'across runs, so the random suffix avoids spurious '
              'cache mismatches)')
-    parser.add_argument('-Q', '--quic', '--use-quic', action='store_true',
+    parser.add_argument('-q', '--quic', '--use-quic', action='store_true',
                         dest='use_quic', help='Enable QUIC transport')
     parser.add_argument('--path', type=str, default='', help='MOQT path (default: "/")')
     parser.add_argument('--datagram', action='store_true', help='Emit ObjectDatagrams')

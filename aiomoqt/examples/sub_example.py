@@ -20,7 +20,7 @@ def parse_args():
         '--trackname', type=str, default=None,
         help='Track Name (default: auto-discover via SUBSCRIBE_NAMESPACE)')
     parser.add_argument('--path', type=str, default="", help='MOQT WT path (default: "/")')
-    parser.add_argument('-Q', '--quic', '--use-quic', action='store_true',
+    parser.add_argument('-q', '--quic', '--use-quic', action='store_true',
                         dest='use_quic', help='Enable QUIC transport')
     parser.add_argument('--debug', action='store_true', help='Enable debug output')
     parser.add_argument('--quic-debug', action='store_true',  help='Enable quic debug output')

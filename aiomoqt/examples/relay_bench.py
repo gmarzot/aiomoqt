@@ -38,7 +38,7 @@ examples:
         'relay', type=str,
         help='Relay URL (see forms above)')
     parser.add_argument(
-        '-Q', '--quic', '--use-quic', action='store_true',
+        '-q', '--quic', '--use-quic', action='store_true',
         dest='force_quic',
         help='Raw QUIC even for https:// URLs')
     parser.add_argument(
