@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import os
 import time
 from asyncio import Future
 from collections import defaultdict
@@ -23,11 +22,6 @@ from .utils.buffer import Buffer, BufferReadError
 from .utils.logger import *
 from aiopquic.streamchain import StreamChain
 from aiopquic.asyncio.webtransport import WebTransportError
-
-# Resolved once at import time; the trace check is then a single
-# Python bool test on the hot send/recv paths (effectively free
-# when disabled). Set AIOMOQT_DESYNC_TRACE=1 in the env to enable.
-_AIOMOQT_DESYNC_TRACE = bool(os.environ.get("AIOMOQT_DESYNC_TRACE"))
 
 USER_AGENT = f"aiomoqt/{version('aiomoqt')}"
 
@@ -561,18 +555,6 @@ class _MOQTSessionMixin:
         """
         if stream_id in self._stream_torn_down:
             return
-        if _AIOMOQT_DESYNC_TRACE:
-            seen = getattr(self, "_desync_rx_seen", None)
-            if seen is None:
-                seen = set()
-                self._desync_rx_seen = seen
-            if stream_id not in seen:
-                seen.add(stream_id)
-                head = bytes(data[:16]).hex() if data else ""
-                logger.warning(
-                    f"[DESYNC-TRACE RX] stream({stream_id}) first chunk "
-                    f"len={len(data) if data else 0} fin={end_stream} "
-                    f"head_hex={head}")
         state = self._data_streams.get(stream_id)
         if state is None:
             state = _DataStreamState(chain=StreamChain())
@@ -1297,7 +1279,7 @@ class _MOQTSessionMixin:
 
     async def stream_write_drain(self, stream_id: int, data: bytes,
                                   end_stream: bool = False) -> None:
-        """Write bytes with backpressure (Lens B delegation).
+        """Write bytes with backpressure.
 
         aiomoqt-owned policy: optional per-stream byte-budget cap
         with hysteresis (MOQTPeer.tx_max_inflight_bytes). The
@@ -1315,18 +1297,6 @@ class _MOQTSessionMixin:
             # without ever suspending, so the event loop starves and
             # task cancellation can never be delivered.
             raise asyncio.CancelledError()
-        if _AIOMOQT_DESYNC_TRACE:
-            seen = getattr(self, "_desync_tx_seen", None)
-            if seen is None:
-                seen = set()
-                self._desync_tx_seen = seen
-            if stream_id not in seen:
-                seen.add(stream_id)
-                head = bytes(data[:16]).hex() if data else ""
-                logger.warning(
-                    f"[DESYNC-TRACE TX] stream({stream_id}) first write "
-                    f"len={len(data) if data else 0} fin={end_stream} "
-                    f"head_hex={head}")
         quic = self._quic
         max_bytes = self._session.tx_max_inflight_bytes
         # Byte-budget gate (aiomoqt-owned policy). Per-stream sc->tx

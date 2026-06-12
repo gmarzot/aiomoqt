@@ -38,130 +38,6 @@ CERT = _find_default_cert()
 KEY = CERT.replace('cert.pem', 'key.pem') if CERT else None
 
 
-def _rss_mb() -> float:
-    """Current RSS in MB (Linux /proc; ru_maxrss high-water fallback)."""
-    import os
-    try:
-        with open('/proc/self/statm') as f:
-            pages = int(f.read().split()[1])
-        return pages * os.sysconf('SC_PAGESIZE') / 1e6
-    except Exception:
-        try:
-            import resource
-            return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e3
-        except Exception:
-            return 0.0
-
-
-class _BackpressureMonitor:
-    """Per-interval sampler that localizes where bytes pool between
-    producer encode and subscriber delivery.
-
-    pub_txq: sum of the publisher session's per-stream sc->tx ring
-        depths (bytes encoded but not yet pulled by the picoquic
-        worker) and the count of streams holding bytes. Growth here
-        means producer run-ahead past the wire drain rate.
-    sub_chain: sum of the subscriber session's StreamChain capacities
-        (bytes received but not yet parsed past an object boundary)
-        and the live parser-state count. Growth here means the parse
-        pipeline is the bottleneck.
-    sc/chk/rxq: process-wide aiopquic counters (loopback runs both
-        sides in one process, so these aggregate pub+sub).
-    drop/fc/scD: per-interval deltas summed across both transports.
-    """
-
-    def __init__(self, interval: float):
-        self.interval = interval
-        self.pub_session = None
-        self.sub_session = None
-        self._prev = {}
-
-    @staticmethod
-    def _tx_queued(session):
-        quic = getattr(session, '_quic', None)
-        if quic is None:
-            return 0, 0
-        sids = (getattr(quic, '_stream_tx_ctxs', None)
-                or getattr(quic, '_stream_ctxs', None))
-        if not sids:
-            return 0, 0
-        total = n = 0
-        for sid in list(sids):
-            try:
-                used = quic.tx_data_ring_used(sid)
-            except Exception:
-                continue
-            if used:
-                total += used
-                n += 1
-        return total, n
-
-    @staticmethod
-    def _chain_backlog(session):
-        ds = getattr(session, '_data_streams', None)
-        if not ds:
-            return 0, 0
-        total = 0
-        for state in list(ds.values()):
-            try:
-                total += state.chain.capacity
-            except Exception:
-                continue
-        return total, len(ds)
-
-    @staticmethod
-    def _counters(session):
-        quic = getattr(session, '_quic', None)
-        t = getattr(quic, '_transport', None)
-        if t is None:
-            return {}
-        try:
-            c = t.counters
-            return c() if callable(c) else c
-        except Exception:
-            return {}
-
-    def sample(self):
-        pub_q = pub_n = sub_q = sub_n = 0
-        if self.pub_session is not None:
-            pub_q, pub_n = self._tx_queued(self.pub_session)
-        if self.sub_session is not None:
-            sub_q, sub_n = self._chain_backlog(self.sub_session)
-        c_pub = self._counters(self.pub_session) if self.pub_session else {}
-        c_sub = self._counters(self.sub_session) if self.sub_session else {}
-        g = c_pub or c_sub  # process-wide totals identical either side
-        drops = (c_pub.get('rx_event_drops', 0)
-                 + c_sub.get('rx_event_drops', 0))
-        fc_p = (c_pub.get('fc_credit_pushed', 0)
-                + c_sub.get('fc_credit_pushed', 0))
-        fc_h = (c_pub.get('fc_credit_handled', 0)
-                + c_sub.get('fc_credit_handled', 0))
-        created = g.get('sc_created_total', 0)
-        destroyed = g.get('sc_destroyed_total', 0)
-        prev = self._prev
-        print(f"  [mon] pub_txq={pub_q/1e6:7.1f}MB/{pub_n:<3d}"
-              f" sub_chain={sub_q/1e6:8.1f}MB/{sub_n:<4d}"
-              f" sc={g.get('sc_alive_total', 0):<5d}"
-              f" chk={g.get('chunks_alive_total', 0):<6d}"
-              f" rxq={g.get('sc_rx_bytes_in_flight', 0)/1e6:6.1f}MB"
-              f" drop=+{drops - prev.get('drops', 0):<3d}"
-              f" fc=+{fc_p - prev.get('fc_p', 0)}"
-              f"/+{fc_h - prev.get('fc_h', 0)}"
-              f" scD=+{created - prev.get('created', 0)}"
-              f"/-{destroyed - prev.get('destroyed', 0)}"
-              f" rss={_rss_mb():.0f}MB")
-        self._prev = dict(drops=drops, fc_p=fc_p, fc_h=fc_h,
-                          created=created, destroyed=destroyed)
-
-    async def run(self):
-        while True:
-            await asyncio.sleep(self.interval)
-            try:
-                self.sample()
-            except Exception as e:
-                print(f"  [mon] sample error: {e}")
-
-
 def parse_args():
     parser = argparse.ArgumentParser(
         add_help=False,
@@ -246,10 +122,8 @@ def print_banner(args):
     print("─" * 56)
 
 
-async def _on_subscribe(session, msg, args, mon=None):
+async def _on_subscribe(session, msg, args):
     """Server-side subscribe handler using PublishedTrack."""
-    if mon is not None:
-        mon.pub_session = session
     track = PublishedTrack(
         session,
         namespace="aiomoqt",
@@ -270,7 +144,7 @@ async def _on_subscribe(session, msg, args, mon=None):
     await track.generate(session, ok.track_alias)
 
 
-async def run_server(args, mon=None):
+async def run_server(args):
     """Run a MOQTServer that generates data when subscribers connect."""
     from functools import partial
 
@@ -290,11 +164,11 @@ async def run_server(args, mon=None):
     )
     server.register_handler(
         MOQTMessageType.SUBSCRIBE,
-        partial(_on_subscribe, args=args, mon=mon))
+        partial(_on_subscribe, args=args))
     return await server.serve()
 
 
-async def run_subscriber(args, stats, mon=None):
+async def run_subscriber(args, stats):
     """Connect as subscriber and collect stats."""
     client = MOQTClient(
         "localhost", args.port,
@@ -307,8 +181,6 @@ async def run_subscriber(args, stats, mon=None):
 
     try:
         async with client.connect() as session:
-            if mon is not None:
-                mon.sub_session = session
             await session.client_session_init()
 
             track = SubscribedTrack(
@@ -360,15 +232,8 @@ async def main():
         print("  or place cert.pem/key.pem in <project>/certs/")
         return
 
-    # Start server. AIOMOQT_MON=1 enables the per-interval
-    # backpressure sampler line (diagnostic; off by default).
     print("  Starting server...")
-    mon = None
-    mon_task = None
-    if _os.environ.get("AIOMOQT_MON") == "1":
-        mon = _BackpressureMonitor(args.interval)
-        mon_task = asyncio.create_task(mon.run())
-    quic_server = await run_server(args, mon=mon)
+    quic_server = await run_server(args)
 
     # Give server a moment
     await asyncio.sleep(0.5)
@@ -383,11 +248,7 @@ async def main():
 
     # Run subscriber
     print("  Connecting subscriber...")
-    await run_subscriber(args, stats, mon=mon)
-    if mon_task is not None:
-        mon_task.cancel()
-        # Final sample after the run so end-state pooling is visible.
-        mon.sample()
+    await run_subscriber(args, stats)
 
     # End tracemalloc snap before cleanup; diff against baseline.
     if _trace_enabled and _baseline_snap[0] is not None:
