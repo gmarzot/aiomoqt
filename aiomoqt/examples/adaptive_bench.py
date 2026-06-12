@@ -963,11 +963,18 @@ class AIMDController:
         # the learned equilibrium point.
         new_direction = +1 if new_level > sig.level else -1
         if new_direction != self.direction:
+            # First pivot SETS eq_level (the initial_level seed is a
+            # target, not a measurement, and must not pollute the
+            # learned value); later pivots refine it as an EWMA.
+            if not self.pivots:
+                self.eq_level = sig.level
+            else:
+                alpha = 0.3
+                self.eq_level = ((1 - alpha) * self.eq_level
+                                 + alpha * sig.level)
             self.pivots.append(sig.level)
             if len(self.pivots) > 10:
                 self.pivots.pop(0)
-            alpha = 0.3
-            self.eq_level = (1 - alpha) * self.eq_level + alpha * sig.level
             self.direction = new_direction
         self._print_row(sig, action)
         await self.actuator.apply(new_level)
@@ -1475,7 +1482,12 @@ def _print_summary(state: BenchState, controller, samples: int, args):
               f"(rx delivered)")
     else:
         print(f"  High-water:  {controller.high_water:.1f} {unit}")
-    print(f"  Equilibrium: {controller.eq_level:.1f} {unit}")
+    if controller.pivots:
+        print(f"  Equilibrium: {controller.eq_level:.1f} {unit} "
+              f"({len(controller.pivots)} pivots)")
+    else:
+        print("  Equilibrium: not reached — no ramp/back-off pivot "
+              "(ended while still climbing)")
     if state.ceiling_reason:
         print(f"  Reason:      {state.ceiling_reason}")
     print(f"  Samples:     {samples}")
