@@ -1336,16 +1336,16 @@ class _MOQTSessionMixin:
         # QuicConfiguration.stream_ring_cap to engage (the cap is
         # bounded by ring capacity).
         if (max_bytes is not None
-                and quic.stream_tx_buf_used(stream_id) > max_bytes):
+                and quic.tx_data_ring_used(stream_id) > max_bytes):
             low_water = max_bytes // 2
-            sc_event = quic.get_tx_drain_event(stream_id)
-            while quic.stream_tx_buf_used(stream_id) > low_water:
+            sc_event = quic.get_tx_data_drain_event(stream_id)
+            while quic.tx_data_ring_used(stream_id) > low_water:
                 if not self._session_writable():
                     return
                 sc_event.clear()
-                quic.arm_stream_tx_drain_pending(stream_id)
-                if quic.stream_tx_buf_used(stream_id) <= low_water:
-                    quic.clear_stream_tx_drain_pending(stream_id)
+                quic.set_tx_data_drain_pending(stream_id)
+                if quic.tx_data_ring_used(stream_id) <= low_water:
+                    quic.clear_tx_data_drain_pending(stream_id)
                     break
                 await sc_event.wait()
         # Delegate wire-level send + backpressure to aiopquic.

@@ -88,7 +88,7 @@ class _BackpressureMonitor:
         total = n = 0
         for sid in list(sids):
             try:
-                used = quic.stream_tx_buf_used(sid)
+                used = quic.tx_data_ring_used(sid)
             except Exception:
                 continue
             if used:
