@@ -2370,6 +2370,9 @@ from aiopquic.asyncio.protocol import (
 from aiopquic.asyncio.webtransport import (
     WebTransportClient as _AioPWTClient,
     WebTransportServerSession as _AioPWTServerSession,
+    _EVT_WT_STREAM_DATA, _EVT_WT_STREAM_FIN,
+    _EVT_WT_STREAM_RESET, _EVT_WT_STOP_SENDING,
+    _EVT_WT_DATAGRAM,
 )
 
 
@@ -2395,56 +2398,35 @@ class _WTSessionMixin:
             self._wt_session_setup.set_result(True)
 
     def _on_event(self, ev_tuple) -> None:
-        """Translate WT-specific events into the QuicEvent classes
-        the mixin's quic_event_received already handles, then
-        dispatch through that path. Falls back to WebTransportSession
-        base handling for session-level signals (ready/closed).
+        """Translate WT data-path events into the QuicEvent classes
+        the mixin's quic_event_received already handles — one event
+        vocabulary for both transports, so everything above this
+        adapter is transport-agnostic. Session-level signals
+        (ready/closed/draining, stream-created, tx-drained) fall
+        through to the base WebTransportSession handling.
 
-        IMPORTANT: For event types we translate AND dispatch via
-        quic_event_received here, we MUST NOT call super()._on_event
-        — the base WebTransportSession enqueues those events into
-        per-stream inbox / session event queues that we never drain,
-        which pins the data memoryview (and the StreamChunk behind
-        it) forever. That was the WT-bloat root cause: chunks_alive
-        grew unbounded because every WT_STREAM_DATA event held a
-        memoryview ref via the never-drained _stream_inbox queue.
-        Only call super() for event types we do NOT translate here.
+        Translated events MUST NOT also reach super()._on_event —
+        the base enqueues them into per-stream inbox queues nothing
+        here drains, which pins the data memoryview (and the
+        StreamChunk behind it) forever.
         """
         evt_type, sid, data, _is_fin, error_code, _cnx, _, _sc = ev_tuple
-        from aiopquic.quic.events import (
-            StreamDataReceived as _SD, StreamReset as _SR,
-            StopSendingReceived as _SS, DatagramFrameReceived as _DG,
-        )
-        from aiopquic.asyncio.webtransport import (
-            _EVT_WT_STREAM_DATA, _EVT_WT_STREAM_FIN,
-            _EVT_WT_STREAM_RESET, _EVT_WT_STOP_SENDING,
-            _EVT_WT_DATAGRAM,
-        )
-        translated = {
-            _EVT_WT_STREAM_DATA, _EVT_WT_STREAM_FIN,
-            _EVT_WT_STREAM_RESET, _EVT_WT_STOP_SENDING,
-            _EVT_WT_DATAGRAM,
-        }
-        if evt_type not in translated:
-            # Session-level events (ready/closed/draining, new_stream,
-            # tx_drained, etc) still need base handling for queue/event
-            # signaling; they don't carry stream payload that pins
-            # chunks.
-            super()._on_event(ev_tuple)
         if evt_type == _EVT_WT_STREAM_DATA:
-            self.quic_event_received(_SD(stream_id=sid, data=data,
-                                          end_stream=False))
+            self.quic_event_received(StreamDataReceived(
+                stream_id=sid, data=data, end_stream=False))
         elif evt_type == _EVT_WT_STREAM_FIN:
-            self.quic_event_received(_SD(stream_id=sid, data=data,
-                                          end_stream=True))
+            self.quic_event_received(StreamDataReceived(
+                stream_id=sid, data=data, end_stream=True))
         elif evt_type == _EVT_WT_STREAM_RESET:
-            self.quic_event_received(_SR(stream_id=sid,
-                                          error_code=error_code))
+            self.quic_event_received(StreamReset(
+                stream_id=sid, error_code=error_code))
         elif evt_type == _EVT_WT_STOP_SENDING:
-            self.quic_event_received(_SS(stream_id=sid,
-                                          error_code=error_code))
+            self.quic_event_received(StopSendingReceived(
+                stream_id=sid, error_code=error_code))
         elif evt_type == _EVT_WT_DATAGRAM:
-            self.quic_event_received(_DG(data=data))
+            self.quic_event_received(DatagramFrameReceived(data=data))
+        else:
+            super()._on_event(ev_tuple)
 
 
 class MOQTSessionWTClient(
