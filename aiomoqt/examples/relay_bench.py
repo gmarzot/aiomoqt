@@ -38,9 +38,9 @@ examples:
         'relay', type=str,
         help='Relay URL (see forms above)')
     parser.add_argument(
-        '-Q', '--quic', '--force-quic', action='store_true',
+        '-Q', '--quic', '--use-quic', action='store_true',
         dest='force_quic',
-        help='Force raw QUIC even for https:// URLs')
+        help='Raw QUIC even for https:// URLs')
     parser.add_argument(
         '-n', '--namespace', type=str, default='aiomoqt')
     parser.add_argument(

@@ -43,9 +43,9 @@ examples:
 """)
     parser.add_argument('relay', type=str,
                         help='Relay URL: moqt://host:port, https://host:port/ep, or host[:port]')
-    parser.add_argument('-Q', '--quic', '--force-quic', action='store_true',
+    parser.add_argument('-Q', '--quic', '--use-quic', action='store_true',
                         dest='force_quic',
-                        help='Force raw QUIC even for https:// URLs')
+                        help='Raw QUIC even for https:// URLs')
     parser.add_argument('-n', '--namespace', type=str, default='aiomoqt',
                         help='MoQT namespace (default: aiomoqt)')
     parser.add_argument('--trackname', type=str, default=None,

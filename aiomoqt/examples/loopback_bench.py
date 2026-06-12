@@ -197,7 +197,7 @@ def parse_args():
     parser.add_argument(
         '-d', '--debug', action='store_true')
     parser.add_argument(
-        '-Q', '--quic', action='store_true',
+        '-Q', '--quic', '--use-quic', action='store_true',
         help='Use raw QUIC instead of WebTransport (default: WT)')
     parser.add_argument(
         '--cc-algo', type=str, default=None,

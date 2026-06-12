@@ -85,9 +85,9 @@ def parse_args():
     pub_mode.add_argument('--pub-both', action='store_true',
                           help='Hybrid: PUB_NS + PUBLISH. Breaks on '
                                'CF d14 moq-rs.')
-    parser.add_argument('-Q', '--quic', '--force-quic', action='store_true',
+    parser.add_argument('-Q', '--quic', '--use-quic', action='store_true',
                         dest='force_quic',
-                        help='Force raw QUIC')
+                        help='Raw QUIC')
     parser.add_argument('-d', '--debug', action='store_true',
                         help='Verbose logging (default: WARN+)')
     parser.add_argument('--stagger', type=float, default=0.1,

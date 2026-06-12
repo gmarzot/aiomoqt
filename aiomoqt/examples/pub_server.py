@@ -82,7 +82,7 @@ def parse_args():
              '(4 MiB ~ 8 ms @ 3 Gbps). Default: aiopquic default '
              '(4 MiB). Pass 0 to disable.')
     parser.add_argument(
-        '-Q', '--quic', action='store_true',
+        '-Q', '--quic', '--use-quic', action='store_true',
         help='Serve raw QUIC (aiopquic) instead of H3/WebTransport')
     parser.add_argument(
         '--draft', type=int, default=16,
