@@ -860,13 +860,16 @@ class AIMDController:
                 / self.latency_threshold_ms
 
             # Back-off triggers ONLY on sustained p90 latency overshoot.
-            # Shortfall and loss are reported in the row but never drive
-            # the ramp — we want the bench to reveal the actual
-            # throughput/latency curve, not throttle on transient
-            # bandwidth dips that QUIC will recover from on its own.
-            # First bad interval just 'watches' — back off after two
-            # consecutive overshoots so transient RTT spikes don't
-            # trigger a cliff.
+            # Loss is reported in the row but never drives the ramp —
+            # we want the bench to reveal the actual throughput/latency
+            # curve, not throttle on transient dips QUIC will recover
+            # from on its own. Shortfall is tolerated for transients
+            # but HOLDS the ramp when sustained (see below): delivery
+            # structurally below command means a producer/CPU wall, and
+            # ramping past it only inflates the target into fiction.
+            # First bad latency interval just 'watches' — back off
+            # after two consecutive overshoots so transient RTT spikes
+            # don't trigger a cliff.
             if sig.shortfall:
                 self.shortfall_streak += 1
             else:
@@ -892,6 +895,15 @@ class AIMDController:
                 self._print_row(sig, "drain")
                 if headroom >= 0.2:
                     self.draining = False
+                continue
+
+            # Sustained shortfall with healthy latency: the producer
+            # (or path) can't deliver the commanded level. Hold rather
+            # than ramp — the high-water mark already excludes
+            # shortfall intervals, and a target the system can't
+            # deliver carries no information.
+            if self.shortfall_streak >= 3:
+                self._print_row(sig, "hold (shortfall)")
                 continue
 
             if level >= a.max_level:
@@ -1052,13 +1064,15 @@ KEY = CERT.replace('cert.pem', 'key.pem') if CERT else None
 async def run_loopback_server(args, state: BenchState):
     """Server publishes bench.load at a rate controlled by state.rate_ops.
 
-    On each SUBSCRIBE, create a PublishedTrack whose per-subgroup rate
-    is driven by the controller via an in-process sync task that
-    polls state.rate_ops and mutates track.rate.
+    On each SUBSCRIBE, create a PublishedTrack whose rate is driven by
+    the controller via an in-process sync task that polls
+    state.rate_ops and mutates track.rate.
     """
 
     async def _on_subscribe(session, msg):
-        per_subgroup = state.rate_ops / max(1, args.scenario.subgroups)
+        # PublishedTrack.rate is AGGREGATE across subgroups (the track
+        # divides by num_subgroups in its send loop) — pass rate_ops
+        # straight through.
         track = PublishedTrack(
             session,
             namespace=args.namespace,
@@ -1066,7 +1080,7 @@ async def run_loopback_server(args, state: BenchState):
             object_size=args.scenario.object_size,
             group_size=args.group_size,
             num_subgroups=args.scenario.subgroups,
-            rate=per_subgroup,
+            rate=state.rate_ops,
         )
         # Silence the per-track stats printer — we print our own.
         track._quiet = True
@@ -1083,8 +1097,7 @@ async def run_loopback_server(args, state: BenchState):
             while not state.stop.is_set():
                 await asyncio.sleep(0.05)
                 if state.rate_ops != last:
-                    track.rate = (state.rate_ops
-                                  / max(1, args.scenario.subgroups))
+                    track.rate = state.rate_ops
                     last = state.rate_ops
                 tick += 1
                 if tick >= 20:  # ~1s at 50ms tick
@@ -1202,7 +1215,8 @@ async def run_publisher_client(host: str, port: int, path: str,
     try:
         async with client.connect() as session:
             await session.client_session_init()
-            per_subgroup = state.rate_ops / max(1, args.scenario.subgroups)
+            # PublishedTrack.rate is AGGREGATE across subgroups — no
+            # pre-division (the track divides in its send loop).
             track = PublishedTrack(
                 session,
                 namespace=args.namespace,
@@ -1210,7 +1224,7 @@ async def run_publisher_client(host: str, port: int, path: str,
                 object_size=args.scenario.object_size,
                 group_size=args.group_size,
                 num_subgroups=args.scenario.subgroups,
-                rate=per_subgroup,
+                rate=state.rate_ops,
                 draft=args.draft,
             )
             track._quiet = True

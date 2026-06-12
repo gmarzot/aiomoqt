@@ -413,7 +413,7 @@ async def _publisher_task(config: Dict[str, Any], mp_stop_event,
                 object_size=config['object_size'],
                 group_size=config.get('group_size', 10000),
                 num_subgroups=_num_sg,
-                rate=config.get('initial_rate_ops', 0.0) / _num_sg,
+                rate=config.get('initial_rate_ops', 0.0),
             )
             track._stats_header_printed = True
             track._quiet = True
@@ -432,14 +432,15 @@ async def _publisher_task(config: Dict[str, Any], mp_stop_event,
 
             async def _rate_listener():
                 """Drain rate_queue without blocking; mutate track.rate.
-                rate_ops on the wire is the AGGREGATE objects/sec target;
-                track.rate is per-subgroup, so divide by num_subgroups.
+                Both rate_ops on the wire and PublishedTrack.rate are
+                AGGREGATE objects/sec (the track divides by
+                num_subgroups in its send loop) — assign verbatim.
                 """
                 while not stop_ev.is_set():
                     try:
                         msg = rate_queue.get_nowait()
                         if isinstance(msg, dict) and 'rate_ops' in msg:
-                            track.rate = float(msg['rate_ops']) / _num_sg
+                            track.rate = float(msg['rate_ops'])
                     except Exception:
                         await asyncio.sleep(0.05)
                         continue
@@ -578,7 +579,7 @@ async def _loopback_server_task(config: Dict[str, Any], mp_stop_event,
 
     stop_ev = _bridge_stop_event(mp_stop_event)
     _num_sg = max(1, config.get('num_subgroups', 1))
-    initial_rate = config.get('initial_rate_ops', 0.0) / _num_sg
+    initial_rate = config.get('initial_rate_ops', 0.0)
     track_holder: Dict[str, Any] = {'track': None}
 
     async def _on_subscribe(session, msg):
@@ -609,7 +610,7 @@ async def _loopback_server_task(config: Dict[str, Any], mp_stop_event,
                 track = track_holder['track']
                 if (track is not None and isinstance(rmsg, dict)
                         and 'rate_ops' in rmsg):
-                    track.rate = float(rmsg['rate_ops']) / _num_sg
+                    track.rate = float(rmsg['rate_ops'])
             except Exception:
                 await asyncio.sleep(0.05)
                 continue
