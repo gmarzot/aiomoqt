@@ -17,6 +17,7 @@ import sys
 
 def parse_args():
     parser = argparse.ArgumentParser(
+        add_help=False,
         description='aiomoqt-bench relay - combined pub/sub benchmark',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
@@ -95,6 +96,9 @@ examples:
              'producer pauses while one stream\'s un-transmitted bytes '
              'exceed this. Default: aiomoqt default (1 MiB). '
              'Pass 0 to disable.')
+    parser.add_argument(
+        '-?', '--help', action='help',
+        help='Show this help message and exit')
     return parser.parse_args()
 
 

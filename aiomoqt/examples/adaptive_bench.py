@@ -1268,6 +1268,7 @@ async def run_publisher_client(host: str, port: int, path: str,
 
 def parse_args():
     p = argparse.ArgumentParser(
+        add_help=False,
         description="aiomoqt adaptive bench — feedback-driven bitrate ramp",
     )
     p.add_argument("-s", "--object-size", type=int, default=4096,
@@ -1388,6 +1389,9 @@ def parse_args():
                         "one stream's un-transmitted bytes exceed this. "
                         "Default: aiomoqt default (1 MiB). "
                         "Pass 0 to disable.")
+    p.add_argument(
+        '-?', '--help', action='help',
+        help='Show this help message and exit')
     args = p.parse_args()
     args.sub_filter = filter_choices[args.sub_filter]
     if args.sub_filter in (FilterType.ABSOLUTE_START,

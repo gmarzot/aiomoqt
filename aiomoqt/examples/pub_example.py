@@ -223,8 +223,8 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='MOQT WebTransport Client')
-    parser.add_argument('--host', type=str, default='localhost', help='Host to connect to')
+    parser = argparse.ArgumentParser(description='MOQT WebTransport Client', add_help=False)
+    parser.add_argument('-h', '--host', type=str, default='localhost', help='Host to connect to')
     parser.add_argument('--port', type=int, default=443, help='Port to connect to')
     parser.add_argument('--namespace', type=str, default='test', help='Namespace')
     parser.add_argument(
@@ -273,6 +273,9 @@ def parse_args():
              'exceed this. Default: aiomoqt default (1 MiB). '
              'Pass 0 to disable.')
 
+    parser.add_argument(
+        '-?', '--help', action='help',
+        help='Show this help message and exit')
     return parser.parse_args()
 
 

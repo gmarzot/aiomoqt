@@ -329,6 +329,7 @@ class BenchStats:
 
 def parse_args():
     parser = argparse.ArgumentParser(
+        add_help=False,
         description='aiomoqt-bench subscriber - MoQT benchmark receiver',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
@@ -383,6 +384,9 @@ examples:
         help='Congestion control algorithm '
              '(bbr | bbr1 | newreno | cubic | dcubic | prague | fast). '
              'Default: aiopquic default (bbr1)')
+    parser.add_argument(
+        '-?', '--help', action='help',
+        help='Show this help message and exit')
     return parser.parse_args()
 
 

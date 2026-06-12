@@ -41,6 +41,7 @@ def _quiet_logging(debug: bool) -> None:
 
 def parse_args():
     parser = argparse.ArgumentParser(
+        add_help=False,
         description='aiomoqt-bench multi-sub — 1 pub, N subs',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -114,6 +115,9 @@ def parse_args():
              'producer pauses while one stream\'s un-transmitted bytes '
              'exceed this. Default: aiomoqt default (1 MiB). '
              'Pass 0 to disable.')
+    parser.add_argument(
+        '-?', '--help', action='help',
+        help='Show this help message and exit')
     return parser.parse_args()
 
 

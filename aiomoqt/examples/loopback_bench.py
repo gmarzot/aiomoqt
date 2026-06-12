@@ -164,6 +164,7 @@ class _BackpressureMonitor:
 
 def parse_args():
     parser = argparse.ArgumentParser(
+        add_help=False,
         description='aiomoqt-bench loopback - direct pub/sub, no relay',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -217,6 +218,9 @@ def parse_args():
              'at stream rollover while total un-transmitted TX bytes '
              'exceed this. Steady-state latency ~ value / throughput. '
              'Default: aiopquic default (4 MiB). Pass 0 to disable.')
+    parser.add_argument(
+        '-?', '--help', action='help',
+        help='Show this help message and exit')
     return parser.parse_args()
 
 

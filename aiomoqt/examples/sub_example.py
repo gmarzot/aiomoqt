@@ -12,8 +12,8 @@ from aiomoqt.utils.logger import *
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='MOQT WebTransport Client')
-    parser.add_argument('--host', type=str, default='localhost', help='Host to connect to')
+    parser = argparse.ArgumentParser(description='MOQT WebTransport Client', add_help=False)
+    parser.add_argument('-h', '--host', type=str, default='localhost', help='Host to connect to')
     parser.add_argument('--port', type=int, default=443, help='Port to connect to')
     parser.add_argument('--namespace', type=str, default="live/test", help='Track Namespace')
     parser.add_argument(
@@ -37,6 +37,9 @@ def parse_args():
                              '(bbr | bbr1 | newreno | cubic | dcubic | '
                              'prague | fast). Default: bbr')
 
+    parser.add_argument(
+        '-?', '--help', action='help',
+        help='Show this help message and exit')
     return parser.parse_args()
 
 import time
