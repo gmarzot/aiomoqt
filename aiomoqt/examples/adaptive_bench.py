@@ -1464,11 +1464,12 @@ def parse_args():
                         "worker (publisher / subscriber) gets a "
                         "process-suffixed file: PATH.pub.<pid>, "
                         "PATH.sub.<pid> — combined when decrypting.")
-    p.add_argument("--no-uvloop", action="store_true",
-                   help="Skip uvloop installation; use stock asyncio. "
-                        "uvloop is on by default when available — "
-                        "typically 2-4× faster on selector-heavy "
-                        "workloads.")
+    p.add_argument("--uvloop", action="store_true",
+                   help="Install uvloop instead of stock asyncio "
+                        "(experimental test option — measured marginal "
+                        "on this stack, where per-event Python work "
+                        "dominates loop turnaround. Default: stock "
+                        "asyncio.)")
     p.add_argument("--cc-algo", type=str, default=None,
                    help="Congestion control algorithm "
                         "(bbr | bbr1 | newreno | cubic | dcubic | "
@@ -1492,6 +1493,9 @@ def parse_args():
         '-?', '--help', action='help',
         help='Show this help message and exit')
     args = p.parse_args()
+    # Internal plumbing (workers, actuators) still carries no_uvloop;
+    # the CLI is opt-in (--uvloop), so invert once here.
+    args.no_uvloop = not args.uvloop
     args.sub_filter = filter_choices[args.sub_filter]
     if args.sub_filter in (FilterType.ABSOLUTE_START,
                            FilterType.ABSOLUTE_RANGE):
@@ -1841,11 +1845,12 @@ if __name__ == "__main__":
     # Worker processes (publisher / subscriber MP) install it in
     # _bench_workers.{pub,sub}_worker_entry — they're separate
     # interpreters and can't inherit the policy.
-    if "--no-uvloop" not in sys.argv:
+    if "--uvloop" in sys.argv:
         if _try_install_uvloop():
-            print("  uvloop: enabled")
+            print("  uvloop: enabled (experimental)")
         else:
-            print("  uvloop: not installed (using stock asyncio)")
+            print("  uvloop: requested but not installed "
+                  "(using stock asyncio)")
     try:
         sys.exit(asyncio.run(main()))
     except KeyboardInterrupt:
