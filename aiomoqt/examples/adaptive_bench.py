@@ -575,18 +575,17 @@ class SubsActuator:
         target = max(int(self.min_level), min(int(self.max_level),
                                               int(round(level))))
         self._targeted = float(target)
-        # Spawn-up is BOUNDED per call: after a failure burst, a mass
-        # respawn fires dozens of simultaneous handshakes at a relay
-        # that is already struggling — the exact condition that kills
-        # more subscribers (observed as relay-side Initial-decrypt
-        # failures feeding a death spiral). Recover at ramp pace
-        # instead; reconcile runs every interval, so the gap closes.
+        # Spawn-up is BOUNDED per call to initial_step (one group): the
+        # controller adds a group every --join-rate, so an unbounded
+        # respawn can't fire dozens of simultaneous handshakes at a
+        # struggling relay (the death-spiral amplifier). Within the
+        # group, consecutive handshakes are spaced by --stagger.
         spawn_budget = max(1, int(self.initial_step))
         spawned_this_call = 0
         while len(self._workers) < target and spawn_budget > 0:
             spawn_budget -= 1
-            # Space consecutive handshakes by --stagger (first is
-            # immediate) so a batch spawn doesn't fire simultaneous
+            # --stagger: gap between individual joins within this group
+            # (first is immediate) so a group doesn't fire simultaneous
             # QUIC Initials at the relay.
             if spawned_this_call and self.stagger > 0:
                 await asyncio.sleep(self.stagger)
@@ -836,10 +835,24 @@ class AIMDController:
                  latency_threshold_ms: float = 100.0,
                  backoff_factor: float = 0.9,
                  loss_threshold_pct: float = 0.5,
-                 duration_s: float | None = None):
+                 duration_s: float | None = None,
+                 tick_s: float | None = None):
         self.actuator = actuator
         self.state = state
         self.interval_s = interval_s
+        # tick_s = how often we observe / decide / add a group; report_s
+        # = how often we print a row + write CSV. Subs mode passes
+        # tick_s=join_rate so a group is added every --join-rate while
+        # rows print every --interval. BW mode leaves tick_s=interval,
+        # so every tick reports — byte-identical to the old behavior.
+        self.report_s = interval_s
+        self.tick_s = tick_s if (tick_s and tick_s > 0) else interval_s
+        # Streaks are wall-clock windows; express them in ticks so the
+        # dead-air / back-off / shortfall reaction times stay constant
+        # when tick_s < report_s (otherwise a fast --join-rate would
+        # make a dead-air abort fire in ~2s instead of ~3 intervals).
+        self._tpr = max(1, round(self.report_s / self.tick_s))
+        self._last_report_t = 0.0
         self.writer = writer
         self.latency_threshold_ms = latency_threshold_ms
         self.backoff_factor = backoff_factor
@@ -870,13 +883,13 @@ class AIMDController:
         while not state.stop.is_set():
             try:
                 await asyncio.wait_for(state.stop.wait(),
-                                       timeout=self.interval_s)
+                                       timeout=self.tick_s)
                 break
             except asyncio.TimeoutError:
                 pass
 
-            # Hard wall-clock cap. Checked at interval boundaries so
-            # the in-progress sample completes and gets reported.
+            # Hard wall-clock cap. Checked at tick boundaries so the
+            # in-progress sample completes and gets reported.
             if (self.duration_s is not None
                     and time.monotonic() - self.t0 >= self.duration_s):
                 state.ceiling_reason = (
@@ -886,33 +899,23 @@ class AIMDController:
 
             sig = await a.observe()
             self.samples += 1
-            if self.writer:
-                self.writer.writerow([
-                    f"{sig.t:.3f}",
-                    f"{sig.target_mbps:.2f}",
-                    f"{sig.tx_mbps:.2f}",
-                    f"{sig.rx_mbps:.2f}",
-                    f"{sig.latency_mean_ms:.2f}",
-                    f"{sig.latency_p90_ms:.2f}",
-                    f"{sig.loss_pct:.3f}",
-                ])
 
             if self.samples < 2:
-                self._print_row(sig, "warming")
+                self._emit(sig, "warming")
                 continue
 
-            # Dead-air guard: rx=0 for 3 consecutive intervals means
-            # no data is flowing (subscribe failed, publisher stuck,
-            # etc.). Don't climb a phantom ramp.
+            # Dead-air guard: rx=0 for ~3 report intervals means no data
+            # is flowing (subscribe failed, publisher stuck, etc.).
+            # Don't climb a phantom ramp.
             if sig.rx_mbps <= 0:
                 self.no_data_streak = getattr(self, 'no_data_streak', 0) + 1
-                if self.no_data_streak >= 3:
+                if self.no_data_streak >= 3 * self._tpr:
                     state.ceiling_reason = ("no data received — subscribe "
                                             "failed or publisher stalled")
-                    self._print_row(sig, "ABORT: rx=0 for 3 intervals")
+                    self._emit(sig, "ABORT: rx=0", force=True)
                     state.stop.set()
                     return
-                self._print_row(sig, f"rx=0 (streak {self.no_data_streak}/3)")
+                self._emit(sig, "rx=0 (no data)")
                 continue
             self.no_data_streak = 0
 
@@ -943,8 +946,8 @@ class AIMDController:
             over_p90 = headroom < 0
             if over_p90:
                 self.pressure_streak += 1
-                if self.pressure_streak < 2:
-                    self._print_row(sig, "watch (p90 over)")
+                if self.pressure_streak < 2 * self._tpr:
+                    self._emit(sig, "watch (p90 over)")
                     continue
                 retreat = max(self.backoff_factor, 1.0 + headroom)
                 new_level = level * retreat
@@ -952,13 +955,14 @@ class AIMDController:
                 # Symmetric clamp with ramp: drop at most initial_step.
                 new_level = max(new_level, level - a.initial_step)
                 self.pressure_streak = 0
-                await self._apply(new_level, sig, "back-off (p90 over)")
+                await self._apply(new_level, sig, "back-off (p90 over)",
+                                  force=True)
                 self.draining = True
                 continue
             self.pressure_streak = 0
 
             if self.draining:
-                self._print_row(sig, "drain")
+                self._emit(sig, "drain")
                 if headroom >= 0.2:
                     self.draining = False
                 continue
@@ -972,15 +976,15 @@ class AIMDController:
             # reconcile hook (subs mode reaps dead workers and
             # respawns to the commanded count), so a lost subscriber
             # is replaced instead of pinning the hold forever.
-            if self.shortfall_streak >= 3:
-                self._print_row(sig, "hold (shortfall)")
+            if self.shortfall_streak >= 3 * self._tpr:
+                self._emit(sig, "hold (shortfall)")
                 await a.apply(level)
                 continue
 
             if level >= a.max_level:
                 state.ceiling_mbps = self.high_water
                 state.ceiling_reason = f"reached max {a.max_level} {a.unit}"
-                self._print_row(sig, "max")
+                self._emit(sig, "max", force=True)
                 state.stop.set()
                 return
             # High-water tracks the *delivered* metric (bw: rx_mbps;
@@ -1016,20 +1020,42 @@ class AIMDController:
                 # probe. Prevents the controller from sitting forever at
                 # a stale equilibrium when the network has freed up.
                 self.hold_intervals += 1
-                if headroom >= 0.5 and self.hold_intervals >= 5:
+                if headroom >= 0.5 and self.hold_intervals >= 5 * self._tpr:
                     self.hold_intervals = 0
                     await self._apply(
                         min(a.max_level, level + a.step_floor),
                         sig, "probe"
                     )
                     continue
-                self._print_row(sig, "hold")
+                self._emit(sig, "hold")
                 await a.apply(level)   # reconcile (no level change)
                 continue
             self.hold_intervals = 0
             await self._apply(min(a.max_level, level + step), sig, "ramp")
 
-    async def _apply(self, new_level: float, sig: Signal, action: str) -> None:
+    def _emit(self, sig: Signal, action: str, force: bool = False) -> None:
+        """Throttle console + CSV output to report_s. The control loop
+        ticks at tick_s (= --join-rate in subs mode), but rows print at
+        --interval; force=True always emits (terminal + back-off rows
+        the user must not miss)."""
+        now = time.monotonic()
+        if not (force or (now - self._last_report_t) >= self.report_s):
+            return
+        self._last_report_t = now
+        if self.writer:
+            self.writer.writerow([
+                f"{sig.t:.3f}",
+                f"{sig.target_mbps:.2f}",
+                f"{sig.tx_mbps:.2f}",
+                f"{sig.rx_mbps:.2f}",
+                f"{sig.latency_mean_ms:.2f}",
+                f"{sig.latency_p90_ms:.2f}",
+                f"{sig.loss_pct:.3f}",
+            ])
+        self._print_row(sig, action)
+
+    async def _apply(self, new_level: float, sig: Signal, action: str,
+                     force: bool = False) -> None:
         # Record a pivot whenever direction flips (ramp ↔ back-off).
         # Updates eq_level as an EWMA so future decisions converge on
         # the learned equilibrium point.
@@ -1048,7 +1074,7 @@ class AIMDController:
             if len(self.pivots) > 10:
                 self.pivots.pop(0)
             self.direction = new_direction
-        self._print_row(sig, action)
+        self._emit(sig, action, force=force)
         await self.actuator.apply(new_level)
 
     def _print_header(self) -> None:
@@ -1426,18 +1452,24 @@ def parse_args():
     p.add_argument("--start-subs", type=int, default=1,
                    help="subs-mode: initial subscriber count (default: 1)")
     p.add_argument("--step-subs", type=int, default=1,
-                   help="subs-mode: subs added per ramp step (default: 1)")
+                   help="subs-mode: subscribers added per group "
+                        "(default: 1)")
     p.add_argument("--max-subs", type=int, default=200,
                    help="subs-mode: cap (default: 200)")
     p.add_argument("--sub-mbps", type=float, default=10.0,
                    help="subs-mode: fixed per-track publisher bitrate "
                         "(default: 10 Mbps)")
+    p.add_argument("-j", "--join-rate", type=float, default=None,
+                   dest="join_rate", metavar="SEC",
+                   help="subs-mode: seconds between subscriber GROUPS "
+                        "(a group = --step-subs subs). The ramp cadence, "
+                        "independent of --interval (reporting). Default: "
+                        "--interval (one group per report).")
     p.add_argument("-S", "--stagger", type=float, default=0.1,
-                   help="subs-mode: seconds between consecutive "
-                        "subscriber handshakes within a spawn batch, "
-                        "independent of --interval (default: 0.1). "
-                        "Spaces QUIC Initials so a batch spawn doesn't "
-                        "burst the relay. 0 = fire simultaneously.")
+                   help="subs-mode: seconds between individual joins "
+                        "WITHIN a group (default: 0.1). Spaces QUIC "
+                        "Initials so a group doesn't burst the relay. "
+                        "0 = fire the group simultaneously.")
     # CLI names from FilterType enum: kebab-case of the member name.
     # NEXT_GROUP_START → next-group-start, LATEST_OBJECT → latest-object,
     # etc. ABSOLUTE_START/RANGE are enumerated here but rejected below
@@ -1739,6 +1771,8 @@ async def main():
             mp_rate_queue=mp_rate_q, mp_events_queue=mp_events_q,
             mp_stop_event=mp_stop_event,
         )
+    # Subs mode adds a group (--step-subs) every --join-rate while rows
+    # print every --interval; BW mode ticks at --interval (tick_s=None).
     controller = AIMDController(
         actuator, state,
         interval_s=args.scenario.interval_s,
@@ -1746,6 +1780,7 @@ async def main():
         latency_threshold_ms=args.latency_threshold,
         backoff_factor=args.backoff_factor,
         duration_s=args.duration,
+        tick_s=(args.join_rate if args.mode == "subs" else None),
     )
 
     server = None
