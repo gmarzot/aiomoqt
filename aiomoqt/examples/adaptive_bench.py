@@ -1892,6 +1892,41 @@ async def main():
                 "localhost", loopback_port, "", False, False,
                 args, state, stats))
 
+        # Loop-lag probe (AIOMOQT_LOOP_LAG=1): measures how late the
+        # parent event loop services a 0.1s timer. In subs mode the
+        # publisher task and the 590-worker stats drain share this one
+        # loop; if lag climbs with sub count and spikes when the
+        # publisher resets, the wall is single-loop tail latency
+        # (harness coupling), not the pico/mvfst stacks. Prints peak +
+        # mean lag each report interval.
+        lag_task = None
+        if os.environ.get("AIOMOQT_LOOP_LAG") == "1":
+            async def _loop_lag_probe():
+                period = 0.1
+                report_every = max(1.0, args.interval)
+                peak = 0.0
+                acc = 0.0
+                n = 0
+                t_last = time.monotonic()
+                t_report = t_last
+                while not state.stop.is_set():
+                    await asyncio.sleep(period)
+                    now = time.monotonic()
+                    lag = (now - t_last) - period
+                    t_last = now
+                    if lag > 0:
+                        peak = max(peak, lag)
+                        acc += lag
+                        n += 1
+                    if now - t_report >= report_every:
+                        mean = (acc / n * 1000) if n else 0.0
+                        print(f"  [loop-lag] peak={peak * 1000:.1f}ms "
+                              f"mean={mean:.1f}ms over {report_every:.0f}s")
+                        peak = acc = 0.0
+                        n = 0
+                        t_report = now
+            lag_task = asyncio.create_task(_loop_lag_probe())
+
         ctrl_task = asyncio.create_task(controller.run())
         try:
             await ctrl_task
@@ -1899,6 +1934,8 @@ async def main():
             pass
     finally:
         state.stop.set()
+        if lag_task is not None:
+            lag_task.cancel()
         for t in (sub_task, pub_task):
             if t is None:
                 continue
