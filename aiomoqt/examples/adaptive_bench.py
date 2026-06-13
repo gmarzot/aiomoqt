@@ -967,18 +967,32 @@ class AIMDController:
                     self.draining = False
                 continue
 
-            # Sustained shortfall with healthy latency: the producer
-            # (or path) can't deliver the commanded level. Hold rather
-            # than ramp — the high-water mark already excludes
-            # shortfall intervals, and a target the system can't
-            # deliver carries no information. Re-apply the current
-            # level while holding: apply() is the actuator's
-            # reconcile hook (subs mode reaps dead workers and
-            # respawns to the commanded count), so a lost subscriber
-            # is replaced instead of pinning the hold forever.
+            # Sustained shortfall = past the ceiling: delivery can't
+            # follow the commanded level (queue building, but latency
+            # may still be under the SLA). Response differs by mode:
             if self.shortfall_streak >= 3 * self._tpr:
-                self._emit(sig, "hold (shortfall)")
-                await a.apply(level)
+                if a.unit == "Mbps":
+                    # BW: back off the target toward what's actually
+                    # delivered, so Target settles at the real ceiling
+                    # instead of sitting inflated over a growing TX
+                    # queue. Drop by at least backoff_factor, no higher
+                    # than the achieved rate; record the pivot so
+                    # eq_level converges. Drain until latency recovers.
+                    new_level = max(a.min_level,
+                                    min(level * self.backoff_factor,
+                                        sig.rx_mbps))
+                    self.shortfall_streak = 0
+                    await self._apply(new_level, sig,
+                                      "back-off (shortfall)", force=True)
+                    self.draining = True
+                else:
+                    # Subs: a shortfall is usually a lost subscriber the
+                    # reaper will replace — hold + reconcile (apply at
+                    # the SAME target respawns it). Backing off here
+                    # would kill more subs and re-introduce the
+                    # setpoint-decay-on-loss bug.
+                    self._emit(sig, "hold (shortfall)")
+                    await a.apply(level)
                 continue
 
             if level >= a.max_level:
