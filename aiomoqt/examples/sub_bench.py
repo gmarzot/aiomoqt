@@ -385,6 +385,11 @@ examples:
              '(bbr | bbr1 | newreno | cubic | dcubic | prague | fast). '
              'Default: aiopquic default (bbr1)')
     parser.add_argument(
+        '--keepalive', type=float, default=None, metavar='SEC',
+        help='QUIC keep-alive interval in seconds (PING) so a '
+             'flow-controlled, consumer-stalled connection is not '
+             'dropped on the idle timeout. Default: off.')
+    parser.add_argument(
         '-?', '--help', action='help',
         help='Show this help message and exit')
     return parser.parse_args()
@@ -428,6 +433,7 @@ async def run(args):
         debug=args.debug,
         keylog_filename=args.keylogfile,
         congestion_control_algorithm=args.cc_algo,
+        keep_alive_interval=args.keepalive,
     )
 
     try:

@@ -215,6 +215,7 @@ async def _subscriber_task(config: Dict[str, Any], mp_stop_event,
         verify_tls=not config.get('insecure', False),
         draft_version=config.get('draft'),
         keylog_filename=config.get('keylogfile'),
+        keep_alive_interval=config.get('keep_alive_interval'),
     )
 
     stop_ev = _bridge_stop_event(mp_stop_event)
@@ -393,6 +394,7 @@ async def _publisher_task(config: Dict[str, Any], mp_stop_event,
         verify_tls=not config.get('insecure', False),
         draft_version=config.get('draft'),
         keylog_filename=config.get('keylogfile'),
+        keep_alive_interval=config.get('keep_alive_interval'),
     )
 
     stop_ev = _bridge_stop_event(mp_stop_event)

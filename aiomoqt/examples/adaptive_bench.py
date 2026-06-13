@@ -506,7 +506,8 @@ class SubsActuator:
                  sub_filter: FilterType = FilterType.LATEST_OBJECT,
                  interval_s: float = 5.0,
                  stagger: float = 0.1,
-                 no_uvloop: bool = False):
+                 no_uvloop: bool = False,
+                 keep_alive_interval: float | None = None):
         self.relay_url = relay_url
         self.namespace = namespace
         self.trackname = trackname
@@ -527,6 +528,7 @@ class SubsActuator:
         # without changing the report cadence.
         self.stagger = stagger
         self.no_uvloop = no_uvloop
+        self.keep_alive_interval = keep_alive_interval
 
         import multiprocessing as mp
         self._mp = mp
@@ -603,6 +605,7 @@ class SubsActuator:
                 force_quic=self.force_quic,
                 sub_filter=int(self.sub_filter),
                 no_uvloop=self.no_uvloop,
+                keep_alive_interval=self.keep_alive_interval,
             )
             from aiomoqt.examples._bench_workers import sub_worker_entry
             p = self._mp.Process(
@@ -1553,6 +1556,10 @@ def parse_args():
                         "(bbr | bbr1 | newreno | cubic | dcubic | "
                         "prague | fast). Default: aiopquic default "
                         "(bbr1)")
+    p.add_argument("--keepalive", type=float, default=None, metavar="SEC",
+                   help="QUIC keep-alive interval in seconds (PING) so a "
+                        "flow-controlled, consumer-stalled connection "
+                        "isn't dropped on the idle timeout. Default: off.")
     p.add_argument("--max-queued-bytes", type=int, default=None,
                    help="Aggregate publisher byte budget across ALL "
                         "streams (QuicConfiguration.tx_max_queued_bytes): "
@@ -1709,6 +1716,7 @@ async def main():
             interval_s=args.scenario.interval_s,
             stagger=args.stagger,
             no_uvloop=args.no_uvloop,
+            keep_alive_interval=args.keepalive,
         )
     else:
         # BW mode. SP loopback runs publisher + subscriber as in-process
