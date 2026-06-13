@@ -505,6 +505,7 @@ class SubsActuator:
                  object_size: int, per_sub_mbps: float,
                  sub_filter: FilterType = FilterType.LATEST_OBJECT,
                  interval_s: float = 5.0,
+                 stagger: float = 0.1,
                  no_uvloop: bool = False):
         self.relay_url = relay_url
         self.namespace = namespace
@@ -521,6 +522,10 @@ class SubsActuator:
         self.per_sub_mbps = per_sub_mbps
         self.sub_filter = sub_filter
         self.interval_s = interval_s
+        # Seconds between consecutive handshakes in a spawn batch —
+        # decoupled from interval_s so handshake spacing is tunable
+        # without changing the report cadence.
+        self.stagger = stagger
         self.no_uvloop = no_uvloop
 
         import multiprocessing as mp
@@ -577,8 +582,15 @@ class SubsActuator:
         # failures feeding a death spiral). Recover at ramp pace
         # instead; reconcile runs every interval, so the gap closes.
         spawn_budget = max(1, int(self.initial_step))
+        spawned_this_call = 0
         while len(self._workers) < target and spawn_budget > 0:
             spawn_budget -= 1
+            # Space consecutive handshakes by --stagger (first is
+            # immediate) so a batch spawn doesn't fire simultaneous
+            # QUIC Initials at the relay.
+            if spawned_this_call and self.stagger > 0:
+                await asyncio.sleep(self.stagger)
+            spawned_this_call += 1
             sid = self._next_sub_id
             self._next_sub_id += 1
             stop_ev = self._mp.Event()
@@ -1420,6 +1432,12 @@ def parse_args():
     p.add_argument("--sub-mbps", type=float, default=10.0,
                    help="subs-mode: fixed per-track publisher bitrate "
                         "(default: 10 Mbps)")
+    p.add_argument("-S", "--stagger", type=float, default=0.1,
+                   help="subs-mode: seconds between consecutive "
+                        "subscriber handshakes within a spawn batch, "
+                        "independent of --interval (default: 0.1). "
+                        "Spaces QUIC Initials so a batch spawn doesn't "
+                        "burst the relay. 0 = fire simultaneously.")
     # CLI names from FilterType enum: kebab-case of the member name.
     # NEXT_GROUP_START → next-group-start, LATEST_OBJECT → latest-object,
     # etc. ABSOLUTE_START/RANGE are enumerated here but rejected below
@@ -1607,6 +1625,7 @@ async def main():
             per_sub_mbps=args.sub_mbps,
             sub_filter=args.sub_filter,
             interval_s=args.scenario.interval_s,
+            stagger=args.stagger,
             no_uvloop=args.no_uvloop,
         )
     else:
