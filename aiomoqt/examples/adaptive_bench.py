@@ -528,6 +528,13 @@ class SubsActuator:
         self._events_q = mp.Queue(maxsize=10000)
         self._workers: dict = {}    # sub_id -> (Process, stop_event)
         self._next_sub_id = 0
+        # Targeted setpoint — the count the controller is aiming for.
+        # Distinct from len(self._workers): reaping a dead sub drops
+        # the live count but NOT the setpoint, so the next apply()
+        # spawns a replacement. observe() reports against this, not
+        # the live count, so a lost sub never silently lowers the
+        # target.
+        self._targeted = float(start_subs)
         # Per-sub rolling stats (last 'stats' event received):
         self._latest_stats: dict = {}
         # Lifecycle counters for summary + shortfall detection:
@@ -561,8 +568,16 @@ class SubsActuator:
         self._reap_dead()
         target = max(int(self.min_level), min(int(self.max_level),
                                               int(round(level))))
-        # spawn up
-        while len(self._workers) < target:
+        self._targeted = float(target)
+        # Spawn-up is BOUNDED per call: after a failure burst, a mass
+        # respawn fires dozens of simultaneous handshakes at a relay
+        # that is already struggling — the exact condition that kills
+        # more subscribers (observed as relay-side Initial-decrypt
+        # failures feeding a death spiral). Recover at ramp pace
+        # instead; reconcile runs every interval, so the gap closes.
+        spawn_budget = max(1, int(self.initial_step))
+        while len(self._workers) < target and spawn_budget > 0:
+            spawn_budget -= 1
             sid = self._next_sub_id
             self._next_sub_id += 1
             stop_ev = self._mp.Event()
@@ -697,7 +712,11 @@ class SubsActuator:
                 jitter_sum += jit
                 jitter_n += 1
 
-        target_subs = len(self._workers)
+        # Setpoint is the TARGETED count, not the live worker dict —
+        # reaping must not silently lower the target the controller
+        # ramps against (otherwise a lost sub permanently decays the
+        # run instead of triggering a replacement).
+        target_subs = int(self._targeted)
         active_subs = len(active_ids)
 
         if active_subs < target_subs:
