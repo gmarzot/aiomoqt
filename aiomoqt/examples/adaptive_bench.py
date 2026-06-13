@@ -1044,6 +1044,28 @@ class AIMDController:
                 self._emit(sig, "hold")
                 await a.apply(level)   # reconcile (no level change)
                 continue
+
+            # Ceiling cap: once a back-off has revealed the sustainable
+            # ceiling (>=1 pivot), don't ramp command past the best
+            # delivered rate by more than a small margin. Hold there and
+            # probe up only occasionally — otherwise the ramp re-climbs
+            # to the same overshoot and crashes back every cycle (a wide
+            # saw-tooth around the ceiling). A probe that delivers more
+            # raises high_water, lifting the cap naturally if the path
+            # frees up.
+            ceiling_margin = 1.05
+            if (self.pivots
+                    and self.high_water > 0
+                    and (level + step) > self.high_water * ceiling_margin):
+                self.hold_intervals += 1
+                if headroom >= 0.5 and self.hold_intervals >= 4 * self._tpr:
+                    self.hold_intervals = 0
+                    await self._apply(min(a.max_level, level + a.step_floor),
+                                      sig, "probe (ceiling)")
+                    continue
+                self._emit(sig, "hold (ceiling)")
+                await a.apply(level)
+                continue
             self.hold_intervals = 0
             await self._apply(min(a.max_level, level + step), sig, "ramp")
 
