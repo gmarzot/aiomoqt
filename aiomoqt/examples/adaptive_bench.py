@@ -542,13 +542,14 @@ class SubsActuator:
         self._failed_window = 0     # resets each observe()
         self._last_stats_t: dict = {}    # last 'stats' event time per sub
         self._last_bytes_t: dict = {}    # last time we saw rx_bytes > 0 per sub
+        self._spawned_t: dict = {}       # spawn time per sub (startup grace)
         self._shortfall_streak = 0
         self._t_last_observe = time.monotonic()
 
     def _reap_dead(self) -> int:
         """Remove workers whose process died or whose stats went
         silent, so apply() respawns replacements. Without this a
-        single lost subscriber pins active < commanded forever: the
+        single lost subscriber pins active < targeted forever: the
         worker dict still counts it, apply() sees nothing to spawn,
         and the controller holds on permanent shortfall."""
         now = time.monotonic()
@@ -600,6 +601,7 @@ class SubsActuator:
             )
             p.start()
             self._workers[sid] = (p, stop_ev)
+            self._spawned_t[sid] = time.monotonic()
         # wind down
         while len(self._workers) > target:
             sid = next(iter(self._workers))
@@ -618,6 +620,7 @@ class SubsActuator:
         self._latest_stats.pop(sid, None)
         self._last_stats_t.pop(sid, None)
         self._last_bytes_t.pop(sid, None)
+        self._spawned_t.pop(sid, None)
 
     async def observe(self) -> Signal:
         # Drain all pending events from workers.
@@ -652,24 +655,34 @@ class SubsActuator:
         # zero-byte stats events and look alive without actually
         # contributing — those subs must not be counted as delivering.
         now = time.monotonic()
-        bytes_cutoff = now - 3.0
+        # ONE window governs both "active" (counted as delivering) and
+        # "kept" (not reaped). Using a single window eliminates the
+        # limbo band — a sub that is neither active nor reaped pins
+        # shortfall forever. Scaled with interval (a sub that delivered
+        # within the last measurement window is active) with a floor so
+        # sub-second intervals don't reap on normal jitter.
+        keep_window = max(3.0, 1.5 * self.interval_s)
+        bytes_cutoff = now - keep_window
         active_ids = [sid for sid, t in self._last_bytes_t.items()
                       if t >= bytes_cutoff and sid in self._workers]
 
-        # Starvation reap: any spawned worker that has never received
-        # bytes OR hasn't received bytes for 2 * interval is dead.
-        # Scaled with interval so fast-tick configs reap quickly and
-        # slow-tick configs stay patient. Kill + score as failed so
-        # watch/clamp back-off engages.
-        starve_window = 2.0 * self.interval_s
-        starve_cutoff = now - starve_window
+        # Startup grace is a FIXED floor, not interval-scaled: QUIC
+        # handshake + SUBSCRIBE is a ~constant cost, so a small
+        # --interval must not reap a replacement before it can come
+        # online (that produced a respawn-churn that never converged).
+        startup_grace = max(8.0, keep_window)
+        starve_cutoff = now - keep_window
         starved = []
         for sid, (proc, stop_ev) in list(self._workers.items()):
             last_bytes = self._last_bytes_t.get(sid)
-            spawned = self._last_stats_t.get(sid, now)
-            # Skip freshly spawned subs: no bytes yet AND not older than
-            # the starve window (grace for QUIC handshake + subscribe).
-            if last_bytes is None and (now - spawned) < starve_window:
+            # REAL spawn time — never refreshed by stats events. The old
+            # last-stats proxy made a never-delivering zombie immortal:
+            # it kept posting zero-byte stats, perpetually resetting its
+            # own grace, so it was never reaped and never active (the
+            # permanent "one sub short" hold).
+            spawned = self._spawned_t.get(sid, now)
+            # Skip freshly spawned subs still inside the startup grace.
+            if last_bytes is None and (now - spawned) < startup_grace:
                 continue
             if last_bytes is None or last_bytes <= starve_cutoff:
                 starved.append(sid)
@@ -681,6 +694,7 @@ class SubsActuator:
             self._latest_stats.pop(sid, None)
             self._last_stats_t.pop(sid, None)
             self._last_bytes_t.pop(sid, None)
+            self._spawned_t.pop(sid, None)
             failed_this_window += 1
 
         rx_bps_total = 0.0
@@ -772,6 +786,7 @@ class SubsActuator:
         self._latest_stats.clear()
         self._last_stats_t.clear()
         self._last_bytes_t.clear()
+        self._spawned_t.clear()
         # Don't let the parent's atexit hook block on the events queue
         # feeder thread — workers may have left bytes pending.
         try:
