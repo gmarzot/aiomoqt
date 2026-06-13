@@ -34,6 +34,7 @@ class MOQTClient(MOQTPeer):
         congestion_control_algorithm: Optional[str] = None,
         tx_max_inflight_bytes: Optional[int] = DEFAULT_TX_MAX_INFLIGHT_BYTES,
         tx_max_queued_bytes: Optional[int] = None,
+        keep_alive_interval: Optional[float] = None,
     ):
         super().__init__(allow_optional_dgram=allow_optional_dgram,
                          libquicr_compat=libquicr_compat,
@@ -70,6 +71,10 @@ class MOQTClient(MOQTPeer):
         # added latency ≈ value / drain rate. None = honor the aiopquic
         # default (4 MiB); 0 = disable.
         self.tx_max_queued_bytes = tx_max_queued_bytes
+        # QUIC keep-alive interval (seconds). None = disabled. Sends
+        # PING frames so a flow-controlled connection whose consumer
+        # stalls isn't dropped by the idle timeout.
+        self.keep_alive_interval = keep_alive_interval
 
         if draft_version is not None:
             set_moqt_ctx_version(draft_version)
@@ -109,6 +114,8 @@ class MOQTClient(MOQTPeer):
                     self.congestion_control_algorithm)
             if self.tx_max_queued_bytes is not None:
                 cfg.tx_max_queued_bytes = self.tx_max_queued_bytes
+            if self.keep_alive_interval is not None:
+                cfg.keep_alive_interval = self.keep_alive_interval
             protocol = lambda *a, **kw: MOQTSessionQuic(*a, **kw, session=self)
             # quic_debug_log not wired on raw-QUIC path yet: aiopquic
             # 0.3.1's `connect()` helper doesn't forward debug_log to
@@ -161,6 +168,8 @@ class MOQTClient(MOQTPeer):
             idle_timeout_ms=int(wt_cfg.idle_timeout * 1000),
             congestion_control_algorithm=(
                 wt_cfg.congestion_control_algorithm),
+            keep_alive_interval_ms=int(
+                (self.keep_alive_interval or 0) * 1000),
             qlog_dir=wt_cfg.qlog_dir,
         )
         # MoQT version negotiation over WebTransport (per moq-transport-16

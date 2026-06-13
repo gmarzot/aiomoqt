@@ -124,6 +124,12 @@ class PublishedTrack(Track):
         self.auth_token = auth_token
         self._subscriber_event = asyncio.Event()
         self._generating = False
+        # Terminal flag: set once PUBLISH_DONE has been sent. Generation
+        # is then permanently refused — a late REQUEST_UPDATE / SUBSCRIBE
+        # from the relay must NOT restart object production after we have
+        # declared the track done (the relay rejects it as "publish after
+        # publishDone").
+        self._done = False
         self._stream_count = 0  # tracks streams opened for PUBLISH_DONE
         self._subscribe_request_id = None  # request_id from relay's SUBSCRIBE
         # Aggregate stats across all subgroup streams; subgroup 0 reports.
@@ -223,6 +229,13 @@ class PublishedTrack(Track):
 
     async def _start_generating(self, session, trigger: str):
         """Start data generation if not already running."""
+        if self._done:
+            # Track has been declared done — refuse to restart. A relay
+            # that sends a late REQUEST_UPDATE/SUBSCRIBE after our
+            # PUBLISH_DONE would otherwise pull us into "publish after
+            # publishDone".
+            logger.info(f"Track: {trigger} after PUBLISH_DONE — ignored")
+            return
         if self._generating:
             logger.info(f"Track: ignoring duplicate {trigger}")
             return
@@ -271,8 +284,17 @@ class PublishedTrack(Track):
         0x3=SUBSCRIPTION_ENDED, 0x4=GOING_AWAY
         """
         from .messages import SubscribeDone
+        # d14 carries the relay's SUBSCRIBE request_id; d16's REQUEST_
+        # UPDATE flow has none, so fall back to our own PUBLISH
+        # request_id. Sending request_id=0/None makes the relay reject
+        # it as "publishDone for invalid id=0".
         req_id = self._subscribe_request_id
         if req_id is None:
+            req_id = self.request_id
+        # Mark terminal regardless: we are ending the track, so refuse
+        # any later restart even if there is no valid id to send on.
+        self._done = True
+        if not req_id:
             return
         msg = SubscribeDone(
             request_id=req_id,
