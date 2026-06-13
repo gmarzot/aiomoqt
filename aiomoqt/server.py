@@ -30,6 +30,7 @@ class MOQTServer(MOQTPeer):
         tx_max_queued_bytes: Optional[int] = None,
         congestion_control_algorithm: Optional[str] = None,
         keep_alive_interval: Optional[float] = None,
+        socket_buffer_size: Optional[int] = None,
     ):
         super().__init__(tx_max_inflight_bytes=tx_max_inflight_bytes)
         self.host = host
@@ -56,6 +57,9 @@ class MOQTServer(MOQTPeer):
         # frames hold a flow-controlled, consumer-stalled connection
         # open past the idle timeout instead of dropping it.
         self.keep_alive_interval = keep_alive_interval
+        # UDP SO_RCVBUF/SO_SNDBUF request (bytes). None = aiopquic
+        # default (64 MiB, kernel-clamped to rmem_max/wmem_max).
+        self.socket_buffer_size = socket_buffer_size
         self._loop = asyncio.get_running_loop()
         self._server_closed: Future[Tuple[int, str]] = self._loop.create_future()
         self._next_subscribe_id = 1
@@ -83,6 +87,8 @@ class MOQTServer(MOQTPeer):
                 cfg.tx_max_queued_bytes = self.tx_max_queued_bytes
             if self.keep_alive_interval is not None:
                 cfg.keep_alive_interval = self.keep_alive_interval
+            if self.socket_buffer_size is not None:
+                cfg.socket_buffer_size = self.socket_buffer_size
             cfg.load_cert_chain(self.certificate, self.private_key)
             protocol = lambda *a, **kw: MOQTSessionQuic(*a, **kw, session=self)
             return aiopquic_serve(
@@ -120,6 +126,8 @@ class MOQTServer(MOQTPeer):
             wt_cfg.tx_max_queued_bytes = self.tx_max_queued_bytes
         if self.keep_alive_interval is not None:
             wt_cfg.keep_alive_interval = self.keep_alive_interval
+        if self.socket_buffer_size is not None:
+            wt_cfg.socket_buffer_size = self.socket_buffer_size
 
         return serve_webtransport(
             self.host, self.port, self.path or "",

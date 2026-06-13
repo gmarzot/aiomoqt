@@ -35,6 +35,7 @@ class MOQTClient(MOQTPeer):
         tx_max_inflight_bytes: Optional[int] = DEFAULT_TX_MAX_INFLIGHT_BYTES,
         tx_max_queued_bytes: Optional[int] = None,
         keep_alive_interval: Optional[float] = None,
+        socket_buffer_size: Optional[int] = None,
     ):
         super().__init__(allow_optional_dgram=allow_optional_dgram,
                          libquicr_compat=libquicr_compat,
@@ -75,6 +76,9 @@ class MOQTClient(MOQTPeer):
         # PING frames so a flow-controlled connection whose consumer
         # stalls isn't dropped by the idle timeout.
         self.keep_alive_interval = keep_alive_interval
+        # UDP SO_RCVBUF/SO_SNDBUF request (bytes). None = aiopquic
+        # default (64 MiB, kernel-clamped to rmem_max/wmem_max).
+        self.socket_buffer_size = socket_buffer_size
 
         if draft_version is not None:
             set_moqt_ctx_version(draft_version)
@@ -116,6 +120,8 @@ class MOQTClient(MOQTPeer):
                 cfg.tx_max_queued_bytes = self.tx_max_queued_bytes
             if self.keep_alive_interval is not None:
                 cfg.keep_alive_interval = self.keep_alive_interval
+            if self.socket_buffer_size is not None:
+                cfg.socket_buffer_size = self.socket_buffer_size
             protocol = lambda *a, **kw: MOQTSessionQuic(*a, **kw, session=self)
             # quic_debug_log not wired on raw-QUIC path yet: aiopquic
             # 0.3.1's `connect()` helper doesn't forward debug_log to
@@ -170,6 +176,7 @@ class MOQTClient(MOQTPeer):
                 wt_cfg.congestion_control_algorithm),
             keep_alive_interval_ms=int(
                 (self.keep_alive_interval or 0) * 1000),
+            socket_buffer_size=(self.socket_buffer_size or 0),
             qlog_dir=wt_cfg.qlog_dir,
         )
         # MoQT version negotiation over WebTransport (per moq-transport-16
