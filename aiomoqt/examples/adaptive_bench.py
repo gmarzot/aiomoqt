@@ -538,7 +538,27 @@ class SubsActuator:
         self._shortfall_streak = 0
         self._t_last_observe = time.monotonic()
 
+    def _reap_dead(self) -> int:
+        """Remove workers whose process died or whose stats went
+        silent, so apply() respawns replacements. Without this a
+        single lost subscriber pins active < commanded forever: the
+        worker dict still counts it, apply() sees nothing to spawn,
+        and the controller holds on permanent shortfall."""
+        now = time.monotonic()
+        dead = []
+        for sid, (p, _ev) in self._workers.items():
+            if not p.is_alive():
+                dead.append(sid)
+                continue
+            t = self._last_stats_t.get(sid)
+            if t is not None and now - t > 15.0:
+                dead.append(sid)
+        for sid in dead:
+            self._kill_sub(sid)
+        return len(dead)
+
     async def apply(self, level: float) -> None:
+        self._reap_dead()
         target = max(int(self.min_level), min(int(self.max_level),
                                               int(round(level))))
         # spawn up
@@ -901,9 +921,14 @@ class AIMDController:
             # (or path) can't deliver the commanded level. Hold rather
             # than ramp — the high-water mark already excludes
             # shortfall intervals, and a target the system can't
-            # deliver carries no information.
+            # deliver carries no information. Re-apply the current
+            # level while holding: apply() is the actuator's
+            # reconcile hook (subs mode reaps dead workers and
+            # respawns to the commanded count), so a lost subscriber
+            # is replaced instead of pinning the hold forever.
             if self.shortfall_streak >= 3:
                 self._print_row(sig, "hold (shortfall)")
+                await a.apply(level)
                 continue
 
             if level >= a.max_level:
@@ -953,6 +978,7 @@ class AIMDController:
                     )
                     continue
                 self._print_row(sig, "hold")
+                await a.apply(level)   # reconcile (no level change)
                 continue
             self.hold_intervals = 0
             await self._apply(min(a.max_level, level + step), sig, "ramp")
