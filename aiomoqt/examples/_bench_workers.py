@@ -40,6 +40,7 @@ SUBSCRIBE_RETRY_WINDOW_S = 30.0
 SUBSCRIBE_EACH_TIMEOUT_S = 5.0
 STATS_INTERVAL_S = 1.0
 STOP_POLL_S = 0.1
+SELF_HEAL_BACKOFF_S = 0.5
 
 
 class _RollingStats:
@@ -52,6 +53,12 @@ class _RollingStats:
     def __init__(self, window_s: float = 5.0):
         self.window_s = window_s
         self._events: deque = deque()   # (t, bytes, lat_ms_or_None)
+        # Latency sampling stride — adaptively raised by snapshot()
+        # so the percentile sort stays bounded; a full 5 s window at
+        # 100K+ obj/s is 500K+ entries and sorting it stalls the
+        # consumer loop ~100 ms, queueing arrivals it then measures.
+        self._lat_stride: int = 1
+        self._n_events: int = 0
         self._last_seen: Dict = {}       # (group, subgroup) -> last obj_id
         self._stride: Dict = {}
         self._lost = 0
@@ -88,7 +95,9 @@ class _RollingStats:
                                         - self._jitter_ms) / 16.0
                 self._last_recv_us = recv_time_us
                 self._last_send_us = send_us
-        self._events.append((t, size_bytes, lat_ms))
+        self._n_events += 1
+        if self._n_events % self._lat_stride == 0:
+            self._events.append((t, size_bytes, lat_ms))
         self._total_bytes += size_bytes
         self._total_objs += 1
         oid = getattr(msg, 'object_id', None)
@@ -117,6 +126,11 @@ class _RollingStats:
         cutoff = t - self.window_s
         while self._events and self._events[0][0] < cutoff:
             self._events.popleft()
+        # Adaptive thinning: bound the percentile sort so the snapshot
+        # cannot stall the consumer loop at high object rates.
+        if len(self._events) > 24576:
+            self._events = deque(list(self._events)[::2])
+            self._lat_stride *= 2
         # Latency from the rolling window
         lats = sorted(e[2] for e in self._events if e[2] is not None)
         mean = sum(lats) / len(lats) if lats else 0.0
@@ -202,6 +216,7 @@ async def _subscriber_task(config: Dict[str, Any], mp_stop_event,
         verify_tls=not config.get('insecure', False),
         draft_version=config.get('draft'),
         keylog_filename=config.get('keylogfile'),
+        keep_alive_interval=config.get('keep_alive_interval'),
     )
 
     stop_ev = _bridge_stop_event(mp_stop_event)
@@ -356,6 +371,192 @@ def sub_worker_entry(config: Dict[str, Any], mp_stop_event, events_queue):
 
 
 # ---------------------------------------------------------------------------
+# Batched subscriber worker — one process hosts K subscriptions, each
+# self-healing (reopened on close/reset). Reports ONE aggregate
+# batch_stats per interval. Lets adaptive_bench drive thousands of subs
+# without one OS process per sub, while keeping the relay's view at N
+# connections.
+# ---------------------------------------------------------------------------
+
+async def _slot_supervisor(config, relay, stop_ev, stats, state,
+                           initial_delay):
+    """Maintain ONE subscription for the batch's lifetime: connect,
+    subscribe, receive until the track closes/resets, then reopen after
+    a short backoff. Runs until stop_ev. The per-slot _RollingStats is
+    passed in and persists across reopens, so a transient drop doesn't
+    reset the batch's cumulative totals or latency window.
+
+    state['active'] reflects whether this slot is currently subscribed
+    and delivering — the batch stats loop sums it for the active count.
+    """
+    if initial_delay > 0:
+        try:
+            await asyncio.wait_for(stop_ev.wait(), timeout=initial_delay)
+            return
+        except asyncio.TimeoutError:
+            pass
+
+    def _on_object(msg, size_bytes, recv_time_ms, *_args, **_kw):
+        stats.on_object(msg, size_bytes, recv_time_ms)
+
+    insecure = config.get('insecure', False)
+    while not stop_ev.is_set():
+        state['active'] = False
+        try:
+            client = MOQTClient(
+                relay.host, relay.port,
+                path=relay.path or "",
+                use_quic=relay.use_quic,
+                verify_tls=not insecure,
+                draft_version=config.get('draft'),
+                keep_alive_interval=config.get('keep_alive_interval'),
+            )
+            async with client.connect() as session:
+                await session.client_session_init()
+                deadline = time.monotonic() + SUBSCRIBE_RETRY_WINDOW_S
+                track = None
+                subscribed = False
+                while time.monotonic() < deadline and not stop_ev.is_set():
+                    track = SubscribedTrack(
+                        session, config['namespace'],
+                        trackname=config['trackname'],
+                        draft=config.get('draft'),
+                        on_object=_on_object,
+                    )
+                    try:
+                        ft = FilterType(config.get('sub_filter',
+                                                   FilterType.LATEST_OBJECT))
+                        await track.subscribe(
+                            timeout=SUBSCRIBE_EACH_TIMEOUT_S,
+                            filter_type=ft,
+                        )
+                        subscribed = True
+                        break
+                    except Exception as e:
+                        m = str(e)
+                        if ('code=4' in m or 'does not exist' in m
+                                or 'no such namespace' in m):
+                            await asyncio.sleep(0.3)
+                            continue
+                        # Other subscribe error: drop the connection and
+                        # let the outer loop reopen the whole slot.
+                        break
+                if subscribed:
+                    state['active'] = True
+                    while not stop_ev.is_set():
+                        if getattr(track, 'state', None) == TrackState.CLOSED:
+                            break
+                        await asyncio.sleep(STOP_POLL_S)
+                    state['active'] = False
+                session.close()
+        except Exception:
+            pass
+        if stop_ev.is_set():
+            break
+        # Self-heal: brief backoff, then reopen this slot. Interruptible
+        # so a stop during backoff exits promptly.
+        try:
+            await asyncio.wait_for(stop_ev.wait(),
+                                   timeout=SELF_HEAL_BACKOFF_S)
+        except asyncio.TimeoutError:
+            pass
+    state['active'] = False
+
+
+async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
+                                 events_queue):
+    """Host config['batch_size'] subscriptions on one event loop, each
+    self-healing via _slot_supervisor. Posts one aggregate batch_stats
+    event per STATS_INTERVAL_S:
+
+      {"kind": "batch_stats", "worker_id": W, "batch_size": K,
+       "active": <subscribed slots>, "t",
+       "rx_bytes", "rx_objs" (deltas since last post),
+       "lat_p90_ms", "lat_mean_ms" (worst across slots),
+       "jitter_ms", "loss", "total_bytes", "total_objs"}
+    """
+    worker_id = config['worker_id']
+    K = max(1, int(config.get('batch_size', 1)))
+    stagger = float(config.get('stagger', 0.0))
+    relay = parse_relay_url(config['relay_url'],
+                            force_quic=config.get('force_quic', False))
+    stop_ev = _bridge_stop_event(mp_stop_event)
+
+    # (stats, state) per slot; stats persist across a slot's reopens.
+    slots = [(_RollingStats(), {'active': False}) for _ in range(K)]
+
+    async def _batch_stats_loop():
+        while not stop_ev.is_set():
+            await asyncio.sleep(STATS_INTERVAL_S)
+            agg_bytes = agg_objs = agg_iv_lost = 0
+            cum_loss = total_bytes = total_objs = 0
+            worst_p90 = worst_mean = 0.0
+            jitter_sum = 0.0
+            jitter_n = 0
+            active = 0
+            for stats, state in slots:
+                snap = stats.snapshot()
+                agg_bytes += snap['rx_bytes']
+                agg_objs += snap['rx_objs']
+                agg_iv_lost += snap['iv_lost']
+                cum_loss += snap['loss']
+                total_bytes += snap['total_bytes']
+                total_objs += snap['total_objs']
+                if snap['lat_p90_ms'] > worst_p90:
+                    worst_p90 = snap['lat_p90_ms']
+                if snap['lat_mean_ms'] > worst_mean:
+                    worst_mean = snap['lat_mean_ms']
+                jitter_sum += snap['jitter_ms']
+                jitter_n += 1
+                if state['active']:
+                    active += 1
+            _post(events_queue, {
+                'kind': 'batch_stats', 'worker_id': worker_id,
+                'batch_size': K, 'active': active,
+                't': time.monotonic(),
+                'rx_bytes': agg_bytes, 'rx_objs': agg_objs,
+                'iv_lost': agg_iv_lost, 'loss': cum_loss,
+                'lat_p90_ms': worst_p90, 'lat_mean_ms': worst_mean,
+                'jitter_ms': jitter_sum / jitter_n if jitter_n else 0.0,
+                'total_bytes': total_bytes, 'total_objs': total_objs,
+            })
+
+    supervisors = [
+        asyncio.create_task(
+            _slot_supervisor(config, relay, stop_ev, stats, state,
+                             i * stagger))
+        for i, (stats, state) in enumerate(slots)
+    ]
+    stats_task = asyncio.create_task(_batch_stats_loop())
+    stop_task = asyncio.create_task(stop_ev.wait())
+    try:
+        await stop_task
+    finally:
+        for t in [stats_task, *supervisors]:
+            t.cancel()
+        for t in [stats_task, *supervisors]:
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+
+
+def sub_batch_worker_entry(config: Dict[str, Any], mp_stop_event,
+                           events_queue):
+    """Process entrypoint for a batched subscriber worker."""
+    _setup_quiet_logging(config.get('logdir'),
+                         f"subw-{config['worker_id']}",
+                         config.get('debug', False))
+    if not config.get('no_uvloop', False):
+        _try_install_uvloop()
+    try:
+        asyncio.run(_subscriber_batch_task(config, mp_stop_event,
+                                           events_queue))
+    except KeyboardInterrupt:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Publisher worker — for adaptive_bench BW mode + (eventually) loopback bench
 # ---------------------------------------------------------------------------
 
@@ -380,6 +581,7 @@ async def _publisher_task(config: Dict[str, Any], mp_stop_event,
         verify_tls=not config.get('insecure', False),
         draft_version=config.get('draft'),
         keylog_filename=config.get('keylogfile'),
+        keep_alive_interval=config.get('keep_alive_interval'),
     )
 
     stop_ev = _bridge_stop_event(mp_stop_event)
@@ -400,7 +602,7 @@ async def _publisher_task(config: Dict[str, Any], mp_stop_event,
                 object_size=config['object_size'],
                 group_size=config.get('group_size', 10000),
                 num_subgroups=_num_sg,
-                rate=config.get('initial_rate_ops', 0.0) / _num_sg,
+                rate=config.get('initial_rate_ops', 0.0),
             )
             track._stats_header_printed = True
             track._quiet = True
@@ -419,14 +621,15 @@ async def _publisher_task(config: Dict[str, Any], mp_stop_event,
 
             async def _rate_listener():
                 """Drain rate_queue without blocking; mutate track.rate.
-                rate_ops on the wire is the AGGREGATE objects/sec target;
-                track.rate is per-subgroup, so divide by num_subgroups.
+                Both rate_ops on the wire and PublishedTrack.rate are
+                AGGREGATE objects/sec (the track divides by
+                num_subgroups in its send loop) — assign verbatim.
                 """
                 while not stop_ev.is_set():
                     try:
                         msg = rate_queue.get_nowait()
                         if isinstance(msg, dict) and 'rate_ops' in msg:
-                            track.rate = float(msg['rate_ops']) / _num_sg
+                            track.rate = float(msg['rate_ops'])
                     except Exception:
                         await asyncio.sleep(0.05)
                         continue
@@ -565,7 +768,7 @@ async def _loopback_server_task(config: Dict[str, Any], mp_stop_event,
 
     stop_ev = _bridge_stop_event(mp_stop_event)
     _num_sg = max(1, config.get('num_subgroups', 1))
-    initial_rate = config.get('initial_rate_ops', 0.0) / _num_sg
+    initial_rate = config.get('initial_rate_ops', 0.0)
     track_holder: Dict[str, Any] = {'track': None}
 
     async def _on_subscribe(session, msg):
@@ -596,7 +799,7 @@ async def _loopback_server_task(config: Dict[str, Any], mp_stop_event,
                 track = track_holder['track']
                 if (track is not None and isinstance(rmsg, dict)
                         and 'rate_ops' in rmsg):
-                    track.rate = float(rmsg['rate_ops']) / _num_sg
+                    track.rate = float(rmsg['rate_ops'])
             except Exception:
                 await asyncio.sleep(0.05)
                 continue

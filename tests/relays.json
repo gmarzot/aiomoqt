@@ -69,11 +69,12 @@
         "raw-quic": "moqt://us-west-2.relay.quicr.org:33437",
         "h3-wt":    "https://us-west-2.relay.quicr.org:33437/relay"
       },
-      "drafts": [14, 16],
+      "drafts": [16],
       "pub_mode": "publish",
       "insecure": true,
+      "compat": ["libquicr"],
       "disabled_suites": ["relay-join", "relay-fetch"],
-      "notes": "Cisco libquicr (server cert unacceptable → insecure)"
+      "notes": "Cisco libquicr (server cert unacceptable → insecure). d14 dropped (raw + WT now unresponsive — relay appears d16-only). compat=libquicr: relay returns SUBSCRIBE_OK for a nonexistent track (deferred-delivery policy), tolerated + annotated."
     },
     {
       "name": "moqtail",
@@ -82,8 +83,9 @@
       },
       "drafts": [14],
       "pub_mode": "publish",
+      "disabled": true,
       "disabled_suites": ["relay-join", "relay-fetch"],
-      "notes": "OzU moqtail (Rust). WT d14 only."
+      "notes": "OzU moqtail (Rust), WT d14 only. Disabled: WT CONNECT refused (code=0) at the catalog URL (no :path). Re-enable once the correct WebTransport path is known / relay confirmed up."
     },
     {
       "name": "imquic",

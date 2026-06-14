@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import os
 import time
 from asyncio import Future
 from collections import defaultdict
@@ -22,11 +21,7 @@ from .types import *
 from .utils.buffer import Buffer, BufferReadError
 from .utils.logger import *
 from aiopquic.streamchain import StreamChain
-
-# Resolved once at import time; the trace check is then a single
-# Python bool test on the hot send/recv paths (effectively free
-# when disabled). Set AIOMOQT_DESYNC_TRACE=1 in the env to enable.
-_AIOMOQT_DESYNC_TRACE = bool(os.environ.get("AIOMOQT_DESYNC_TRACE"))
+from aiopquic.asyncio.webtransport import WebTransportError
 
 USER_AGENT = f"aiomoqt/{version('aiomoqt')}"
 
@@ -36,19 +31,30 @@ USER_AGENT = f"aiomoqt/{version('aiomoqt')}"
 logger = get_logger(__name__)
 
 
-# Producer-side bytes cap on the per-stream sc->tx queue. Used as
-# the default for MOQTPeer.tx_max_inflight_bytes. 16 MB is sized to
-# never engage in healthy LAN/loopback steady-state (where producer
-# ≈ consumer rate, sc->tx queue stays well below the cap), but acts
-# as a fail-safe ceiling when the consumer falls behind — preventing
-# the unbounded producer-side memory growth that can otherwise
-# trigger OOM under sub-side stress. Apps with stricter latency
-# requirements can dial this down (2 MB ≈ 8 ms at 2 Gbps; smaller
-# values give lower latency at the cost of throughput headroom when
-# the consumer momentarily slows). Pass None to opt out entirely.
-# A future tx_target_latency_ms API will derive the byte budget
-# from a latency target + auto-tracked drain rate.
-DEFAULT_TX_MAX_INFLIGHT_BYTES = 16_000_000
+# Per-stream producer cap on TOTAL bytes in flight — Python sc->tx
+# queue PLUS picoquic's per-stream retransmit buffer (sent but not
+# acked by peer). Bounds actual memory commitment per stream, not
+# just the Python-side queue depth.
+#
+# Per-stream → preserves QUIC stream independence (HOLB-free
+# backpressure). Aggregate per-cnx memory bound is delivered by the
+# QUIC protocol mechanisms — initial_max_streams_uni/bidi (cap on
+# concurrent stream count) and initial_max_data (cap on aggregate
+# unacked bytes) — both exposed via QuicConfiguration.
+#
+# Hysteresis: producer parks at HIGH water (this value), resumes at
+# LOW water (this value // 2). Prevents the packet-granularity wake-
+# bounce that would otherwise reduce effective throughput to
+# ~packet_size / asyncio_turn.
+#
+# Sizing: target_latency_ms * target_throughput_bytes_per_sec.
+# 1 MiB ≈ 2.7 ms standing-queue contribution per stream at 3 Gbps.
+# Works with the aiopquic aggregate gate (tx_max_queued_bytes): this
+# knob bounds ONE stream's queue (fairness, binds on long-lived
+# streams); the aggregate bounds the sum across streams. Pass None
+# to opt out. Future API: tx_target_latency_ms with auto-tracked
+# drain rate derives both.
+DEFAULT_TX_MAX_INFLIGHT_BYTES = 1 * 1024 * 1024
 
 
 class MOQTStreamReject(Exception):
@@ -77,25 +83,17 @@ class MOQTPeer:
         self._control_msg_handlers: Dict[int, Tuple[Type, Callable]] = {}
         self.allow_optional_dgram = allow_optional_dgram
         self.libquicr_compat = libquicr_compat
-        # Bytes-aware producer backpressure target. When set,
-        # MOQTSession.stream_write_drain awaits per-stream sc->tx
-        # drain before pushing more bytes once aiopquic reports
-        # stream_tx_buf_used() above this threshold. Per-stream,
-        # data-ring scoped — independent of the SPSC event-ring entry
-        # capacity (settable via QuicConfiguration.event_ring_capacity).
-        #
-        # Hysteresis: producer parks at HIGH water (this value),
-        # resumes at LOW water (this value // 2). Prevents the
-        # packet-granularity wake-bounce that would otherwise reduce
-        # effective throughput to ~packet_size / asyncio_turn.
-        #
-        # Default None = no cap. Opt in for latency-bounded workloads.
-        # Sizing: target_latency_ms * target_throughput_bytes_per_sec.
-        # At 2 Gbps loopback, 16 MB cap ≈ 64 ms latency budget; 2 MB
-        # cap ≈ 8 ms. The cap engages only above HIGH water so
-        # steady-state queue depth oscillates between HIGH/2 and HIGH.
-        # Future API: tx_target_latency_ms with auto-tracked drain
-        # rate, so callers can express the budget directly.
+        # Per-stream producer soft cap on bytes pending in the sc->tx
+        # data ring. Engages only when set BELOW
+        # QuicConfiguration.stream_ring_cap (the hard cap). Producer
+        # parks on the per-stream drain event with hysteresis: park
+        # at HIGH (this value), resume at LOW (this value // 2).
+        # Per-stream → preserves QUIC stream independence (no HOLB).
+        # Aggregate per-cnx memory bound is delivered by the QUIC
+        # protocol mechanisms: max_data caps cnx-level bytes in
+        # flight, initial_max_streams_uni/bidi caps concurrent
+        # streams (both in QuicConfiguration). Pass None to opt out
+        # entirely.
         self.tx_max_inflight_bytes = tx_max_inflight_bytes
 
     def register_handler(self, msg_type: int, handler: Callable) -> None:
@@ -557,18 +555,6 @@ class _MOQTSessionMixin:
         """
         if stream_id in self._stream_torn_down:
             return
-        if _AIOMOQT_DESYNC_TRACE:
-            seen = getattr(self, "_desync_rx_seen", None)
-            if seen is None:
-                seen = set()
-                self._desync_rx_seen = seen
-            if stream_id not in seen:
-                seen.add(stream_id)
-                head = bytes(data[:16]).hex() if data else ""
-                logger.warning(
-                    f"[DESYNC-TRACE RX] stream({stream_id}) first chunk "
-                    f"len={len(data) if data else 0} fin={end_stream} "
-                    f"head_hex={head}")
         state = self._data_streams.get(stream_id)
         if state is None:
             state = _DataStreamState(chain=StreamChain())
@@ -1251,7 +1237,16 @@ class _MOQTSessionMixin:
         if getattr(self._session, 'use_quic', False):
             return self._quic.get_next_available_stream_id(is_unidirectional=True)
         # aiopquic-WT: round-trip to picoquic for stream-id allocation
-        return await self.create_stream(bidir=False)
+        try:
+            return await self.create_stream(bidir=False)
+        except WebTransportError:
+            # Session torn down while a producer was at a stream
+            # rollover. Convert to the cancellation path the track
+            # generators already handle cleanly instead of surfacing
+            # a task exception at every shutdown.
+            if not self._session_writable():
+                raise asyncio.CancelledError()
+            raise
 
     async def open_bidi_stream(self) -> int:
         """Open a bidirectional stream. Returns the stream ID."""
@@ -1278,12 +1273,13 @@ class _MOQTSessionMixin:
         try:
             self._quic.send_stream_data(
                 stream_id, data, end_stream=end_stream)
-        except (AssertionError, AttributeError, BufferError) as e:
+        except (AssertionError, AttributeError, BufferError,
+                WebTransportError) as e:
             logger.debug(f"stream({stream_id}): write race: {e}")
 
     async def stream_write_drain(self, stream_id: int, data: bytes,
                                   end_stream: bool = False) -> None:
-        """Write bytes with backpressure (Lens B delegation).
+        """Write bytes with backpressure.
 
         aiomoqt-owned policy: optional per-stream byte-budget cap
         with hysteresis (MOQTPeer.tx_max_inflight_bytes). The
@@ -1292,35 +1288,34 @@ class _MOQTSessionMixin:
         delegated to aiopquic's send_stream_data_drained — single
         source of truth per the backpressure-placement principle.
         """
-        if not self._session_writable():
-            return
-        if _AIOMOQT_DESYNC_TRACE:
-            seen = getattr(self, "_desync_tx_seen", None)
-            if seen is None:
-                seen = set()
-                self._desync_tx_seen = seen
-            if stream_id not in seen:
-                seen.add(stream_id)
-                head = bytes(data[:16]).hex() if data else ""
-                logger.warning(
-                    f"[DESYNC-TRACE TX] stream({stream_id}) first write "
-                    f"len={len(data) if data else 0} fin={end_stream} "
-                    f"head_hex={head}")
+        if (not self._session_writable()
+                or getattr(self._quic, 'closed', False)):
+            # Dead session or closed connection: convert to the
+            # cancellation path the track generators handle (mirror
+            # of the WT open_uni_stream guard). A silent no-op here
+            # livelocks unpaced producers — the await completes
+            # without ever suspending, so the event loop starves and
+            # task cancellation can never be delivered.
+            raise asyncio.CancelledError()
         quic = self._quic
         max_bytes = self._session.tx_max_inflight_bytes
-        # Byte-budget gate (aiomoqt-owned policy). Hysteresis: park at
-        # HIGH water (max_bytes), resume at LOW water (max_bytes // 2).
+        # Byte-budget gate (aiomoqt-owned policy). Per-stream sc->tx
+        # queue depth — preserves QUIC stream independence (no HOLB).
+        # Hysteresis: park at HIGH water (max_bytes), resume at LOW
+        # water (max_bytes // 2). max_bytes MUST be <
+        # QuicConfiguration.stream_ring_cap to engage (the cap is
+        # bounded by ring capacity).
         if (max_bytes is not None
-                and quic.stream_tx_buf_used(stream_id) > max_bytes):
+                and quic.tx_data_ring_used(stream_id) > max_bytes):
             low_water = max_bytes // 2
-            sc_event = quic.get_tx_drain_event(stream_id)
-            while quic.stream_tx_buf_used(stream_id) > low_water:
+            sc_event = quic.get_tx_data_drain_event(stream_id)
+            while quic.tx_data_ring_used(stream_id) > low_water:
                 if not self._session_writable():
                     return
                 sc_event.clear()
-                quic.arm_stream_tx_drain_pending(stream_id)
-                if quic.stream_tx_buf_used(stream_id) <= low_water:
-                    quic.clear_stream_tx_drain_pending(stream_id)
+                quic.set_tx_data_drain_pending(stream_id)
+                if quic.tx_data_ring_used(stream_id) <= low_water:
+                    quic.clear_tx_data_drain_pending(stream_id)
                     break
                 await sc_event.wait()
         # Delegate wire-level send + backpressure to aiopquic.
@@ -1338,7 +1333,7 @@ class _MOQTSessionMixin:
         try:
             self._quic.send_stream_data(stream_id, b"", end_stream=True)
         except (AssertionError, AttributeError, BufferError,
-                RuntimeError) as e:
+                RuntimeError, WebTransportError) as e:
             logger.debug(f"stream({stream_id}): fin race: {e}")
 
     def stream_reset(self, stream_id: int,
@@ -1374,9 +1369,9 @@ class _MOQTSessionMixin:
     def send_control_message(self, buf: Buffer) -> None:
         """Send a MoQT message on the control stream."""
         if self._quic is None or self._control_stream_id is None:
-            raise MOQTException(SessionCloseCode.INTERNAL_ERROR, "control stream not intialized")
+            raise MOQTException(SessionCloseCode.INTERNAL_ERROR,
+                                "control stream not initialized")
         logger.debug(f"QUIC send: control message: {buf.tell()} bytes")
-
         self._quic.send_stream_data(
             stream_id=self._control_stream_id,
             data=buf.data,
@@ -1402,15 +1397,12 @@ class _MOQTSessionMixin:
             self._bidi_streams[msg.request_id] = stream_id
 
     def send_dgram_message(self, buf: Buffer) -> None:
-        """Send a MoQT message on the control stream."""
+        """Send a MoQT message via QUIC datagram (best-effort)."""
         if self._quic is None:
-            raise MOQTException(SessionCloseCode.INTERNAL_ERROR, "QUIC not intialized")
-
+            raise MOQTException(SessionCloseCode.INTERNAL_ERROR,
+                                "QUIC not initialized")
         logger.debug(f"QUIC send: datagram message: {buf.capacity} bytes")
-
-        self._quic.send_datagram_frame(
-            data=buf.data
-        )
+        self._quic.send_datagram_frame(data=buf.data)
 
     ################################################################################################
     #  Outbound control message API - note: awaitable messages support 'wait_response' param       #
@@ -1965,9 +1957,14 @@ class _MOQTSessionMixin:
         else:
             selected_version = msg.selected_version
             if selected_version is None:
-                # Draft-16+: version already negotiated via ALPN
+                # Draft-16+ carries no version in ServerSetup: it was
+                # negotiated out-of-band — QUIC ALPN ("moqt-NN") for raw
+                # QUIC, WT-Available-Protocols for WebTransport. These are
+                # distinct mechanisms; don't conflate them.
                 selected_version = self._moqt_version
-                logger.info(f"MOQT event: d16+ ServerSetup (version from ALPN: 0x{selected_version:x})")
+                _src = ("ALPN" if getattr(self, 'use_quic', False)
+                        else "WT-Available-Protocols")
+                logger.info(f"MOQT event: d16+ ServerSetup (version from {_src}: 0x{selected_version:x})")
             if selected_version not in MOQT_VERSIONS:
                 error = f"MOQT event: unsupported version in ServerSetup {hex(selected_version)}"
                 logger.debug(error)
@@ -2378,6 +2375,9 @@ from aiopquic.asyncio.protocol import (
 from aiopquic.asyncio.webtransport import (
     WebTransportClient as _AioPWTClient,
     WebTransportServerSession as _AioPWTServerSession,
+    _EVT_WT_STREAM_DATA, _EVT_WT_STREAM_FIN,
+    _EVT_WT_STREAM_RESET, _EVT_WT_STOP_SENDING,
+    _EVT_WT_DATAGRAM,
 )
 
 
@@ -2403,56 +2403,35 @@ class _WTSessionMixin:
             self._wt_session_setup.set_result(True)
 
     def _on_event(self, ev_tuple) -> None:
-        """Translate WT-specific events into the QuicEvent classes
-        the mixin's quic_event_received already handles, then
-        dispatch through that path. Falls back to WebTransportSession
-        base handling for session-level signals (ready/closed).
+        """Translate WT data-path events into the QuicEvent classes
+        the mixin's quic_event_received already handles — one event
+        vocabulary for both transports, so everything above this
+        adapter is transport-agnostic. Session-level signals
+        (ready/closed/draining, stream-created, tx-drained) fall
+        through to the base WebTransportSession handling.
 
-        IMPORTANT: For event types we translate AND dispatch via
-        quic_event_received here, we MUST NOT call super()._on_event
-        — the base WebTransportSession enqueues those events into
-        per-stream inbox / session event queues that we never drain,
-        which pins the data memoryview (and the StreamChunk behind
-        it) forever. That was the WT-bloat root cause: chunks_alive
-        grew unbounded because every WT_STREAM_DATA event held a
-        memoryview ref via the never-drained _stream_inbox queue.
-        Only call super() for event types we do NOT translate here.
+        Translated events MUST NOT also reach super()._on_event —
+        the base enqueues them into per-stream inbox queues nothing
+        here drains, which pins the data memoryview (and the
+        StreamChunk behind it) forever.
         """
         evt_type, sid, data, _is_fin, error_code, _cnx, _, _sc = ev_tuple
-        from aiopquic.quic.events import (
-            StreamDataReceived as _SD, StreamReset as _SR,
-            StopSendingReceived as _SS, DatagramFrameReceived as _DG,
-        )
-        from aiopquic.asyncio.webtransport import (
-            _EVT_WT_STREAM_DATA, _EVT_WT_STREAM_FIN,
-            _EVT_WT_STREAM_RESET, _EVT_WT_STOP_SENDING,
-            _EVT_WT_DATAGRAM,
-        )
-        translated = {
-            _EVT_WT_STREAM_DATA, _EVT_WT_STREAM_FIN,
-            _EVT_WT_STREAM_RESET, _EVT_WT_STOP_SENDING,
-            _EVT_WT_DATAGRAM,
-        }
-        if evt_type not in translated:
-            # Session-level events (ready/closed/draining, new_stream,
-            # tx_drained, etc) still need base handling for queue/event
-            # signaling; they don't carry stream payload that pins
-            # chunks.
-            super()._on_event(ev_tuple)
         if evt_type == _EVT_WT_STREAM_DATA:
-            self.quic_event_received(_SD(stream_id=sid, data=data,
-                                          end_stream=False))
+            self.quic_event_received(StreamDataReceived(
+                stream_id=sid, data=data, end_stream=False))
         elif evt_type == _EVT_WT_STREAM_FIN:
-            self.quic_event_received(_SD(stream_id=sid, data=data,
-                                          end_stream=True))
+            self.quic_event_received(StreamDataReceived(
+                stream_id=sid, data=data, end_stream=True))
         elif evt_type == _EVT_WT_STREAM_RESET:
-            self.quic_event_received(_SR(stream_id=sid,
-                                          error_code=error_code))
+            self.quic_event_received(StreamReset(
+                stream_id=sid, error_code=error_code))
         elif evt_type == _EVT_WT_STOP_SENDING:
-            self.quic_event_received(_SS(stream_id=sid,
-                                          error_code=error_code))
+            self.quic_event_received(StopSendingReceived(
+                stream_id=sid, error_code=error_code))
         elif evt_type == _EVT_WT_DATAGRAM:
-            self.quic_event_received(_DG(data=data))
+            self.quic_event_received(DatagramFrameReceived(data=data))
+        else:
+            super()._on_event(ev_tuple)
 
 
 class MOQTSessionWTClient(

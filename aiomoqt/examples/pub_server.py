@@ -44,12 +44,13 @@ KEY = CERT.replace('cert.pem', 'key.pem') if CERT else None
 
 def parse_args():
     parser = argparse.ArgumentParser(
+        add_help=False,
         description='MoQT publisher server — standalone, no relay',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     parser.add_argument(
-        '-H', '--host', type=str, default='localhost',
+        '-h', '--host', type=str, default='localhost',
         help='Bind address (default: localhost)')
     parser.add_argument(
         '-p', '--port', type=int, default=4434,
@@ -69,22 +70,38 @@ def parse_args():
              'default: max). Per-stream emit rate is rate/streams.')
     parser.add_argument(
         '--max-inflight-bytes', type=int, default=None,
-        help='Producer backpressure: pause once aiopquic reports this '
-             'many bytes pending in the TX ring (default: unbounded). '
-             'Bounds queue depth and tail latency. e.g. 2_000_000 ~10ms '
-             '@ 1.6 Gbps.')
+        help='Per-stream TX budget (aiomoqt tx_max_inflight_bytes): '
+             'producer pauses while one stream\'s un-transmitted bytes '
+             'exceed this. Default: aiomoqt default (1 MiB). '
+             'Pass 0 to disable.')
     parser.add_argument(
-        '-Q', '--quic', action='store_true',
+        '--max-queued-bytes', type=int, default=None,
+        help='Aggregate publisher byte budget across ALL streams '
+             '(QuicConfiguration.tx_max_queued_bytes): producer parks '
+             'at stream rollover while total un-transmitted TX bytes '
+             'exceed this. Steady-state latency ~ value / throughput '
+             '(4 MiB ~ 8 ms @ 3 Gbps). Default: aiopquic default '
+             '(4 MiB). Pass 0 to disable.')
+    parser.add_argument(
+        '-q', '--quic', '--use-quic', action='store_true',
         help='Serve raw QUIC (aiopquic) instead of H3/WebTransport')
     parser.add_argument(
         '--draft', type=int, default=16,
         help='MoQT draft version when --quic (default: 16)')
     parser.add_argument(
-        '-n', '--namespace', type=str, default='bench',
-        help='Track namespace (default: bench)')
+        '-n', '--namespace', type=str, default='aiomoqt',
+        help='Track namespace (default: aiomoqt)')
     parser.add_argument(
         '--trackname', type=str, default='track',
         help='Track name (default: track)')
+    parser.add_argument(
+        '--pub-ns', action='store_true',
+        help='On discovery (SUBSCRIBE_NAMESPACE) announce the namespace '
+             '(PUBLISH_NAMESPACE) only, not the track')
+    parser.add_argument(
+        '--pub-both', action='store_true',
+        help='On discovery announce BOTH namespace (PUBLISH_NAMESPACE) '
+             'and track (PUBLISH). Default: track (PUBLISH) only')
     parser.add_argument(
         '--cert', type=str, default=CERT,
         help='TLS certificate file')
@@ -95,10 +112,13 @@ def parse_args():
         '-d', '--debug', action='store_true',
         help='Enable debug output')
     parser.add_argument(
-        '--cc-algo', type=str, default='bbr',
+        '--cc-algo', type=str, default=None,
         help='Congestion control algorithm '
              '(bbr | bbr1 | newreno | cubic | dcubic | prague | fast). '
-             'Default: bbr')
+             'Default: aiopquic default (bbr1)')
+    parser.add_argument(
+        '-?', '--help', action='help',
+        help='Show this help message and exit')
     return parser.parse_args()
 
 
@@ -129,6 +149,37 @@ async def _on_subscribe(session, msg, args):
         raise
 
 
+async def _on_subscribe_namespace(session, msg, args):
+    """Discovery responder: a subscriber sent SUBSCRIBE_NAMESPACE to
+    learn what we publish (it omitted --trackname). Ack it, then
+    announce the track with PUBLISH (and PUBLISH_NAMESPACE under
+    --pub-ns/--pub-both). The subscriber's await_publish learns the
+    trackname and replies PUBLISH_OK(forward=1), which the track's own
+    handler turns into generation. Keeps the track alive for the
+    session via wait_closed()."""
+    stream_id = session._bidi_streams.get(msg.request_id)
+    session.subscribe_namespace_ok(msg, stream_id=stream_id)
+    track = PublishedTrack(
+        session,
+        namespace=args.namespace,
+        trackname=args.trackname,
+        object_size=args.object_size,
+        group_size=args.group_size,
+        num_subgroups=args.streams,
+        rate=args.rate,
+    )
+    await track.publish(
+        announce_namespace=(args.pub_ns or args.pub_both),
+        publish_track=(not args.pub_ns or args.pub_both),
+        forward=0,
+    )
+    logger.info(f"Discovery: announced '{track.fqtn}' to subscriber")
+    try:
+        await track.wait_closed()
+    except asyncio.CancelledError:
+        pass
+
+
 async def main():
     from functools import partial
 
@@ -152,18 +203,33 @@ async def main():
     # needs the draft for either transport (raw QUIC or WT) to pick
     # the right message-encoding rules; only the QUIC ALPN derivation
     # differs.
-    server = MOQTServer(
+    # CLI semantics: None = honor protocol-layer default (16 MB);
+    # 0 = explicit opt-out (unbounded); >0 = explicit value.
+    if args.max_inflight_bytes is None:
+        _tx_max = ...  # let MOQTServer/MOQTPeer apply DEFAULT
+    elif args.max_inflight_bytes == 0:
+        _tx_max = None  # explicit opt-out
+    else:
+        _tx_max = args.max_inflight_bytes
+    _server_kwargs = dict(
         host=args.host, port=args.port,
         certificate=args.cert, private_key=args.key,
         path="/",
         use_quic=args.quic,
-        tx_max_inflight_bytes=args.max_inflight_bytes,
         draft_version=args.draft,
         congestion_control_algorithm=args.cc_algo,
     )
+    if _tx_max is not ...:
+        _server_kwargs['tx_max_inflight_bytes'] = _tx_max
+    if args.max_queued_bytes is not None:
+        _server_kwargs['tx_max_queued_bytes'] = args.max_queued_bytes
+    server = MOQTServer(**_server_kwargs)
     server.register_handler(
         MOQTMessageType.SUBSCRIBE,
         partial(_on_subscribe, args=args))
+    server.register_handler(
+        MOQTMessageType.SUBSCRIBE_NAMESPACE,
+        partial(_on_subscribe_namespace, args=args))
     quic_server = await server.serve()
 
     transport = "raw QUIC" if args.quic else "H3/WebTransport"
@@ -174,14 +240,17 @@ async def main():
     print(f"  objects:   {args.object_size}B x {args.streams} streams")
     print(f"  groups:    {args.group_size} objects/group")
     print(f"  rate:      {rate_s}")
-    print("\nConnect subscriber:")
+    print("\nConnect subscriber (track-name discovery; -t on the sub):")
+    # URL carries the path: raw QUIC has none; WT serves at "/" (the
+    # MOQTServer(path="/") above) — not "/moq". sub_bench needs -k for
+    # the self-signed loopback cert. With discovery, --trackname is
+    # optional; -n must match this server's namespace.
     if args.quic:
-        print(f"  python -m aiomoqt.examples.sub_bench "
-              f"moqt://{args.host}:{args.port} -t 30 -i 5 --draft {args.draft} -k")
+        url = f"moqt://{args.host}:{args.port}"
     else:
-        # WT path matches MOQTServer(path="/") above; no /moq suffix.
-        print(f"  python -m aiomoqt.examples.sub_bench "
-              f"https://{args.host}:{args.port}/ -t 30 -i 5 --draft {args.draft} -k")
+        url = f"https://{args.host}:{args.port}/"
+    print(f"  python -m aiomoqt.examples.sub_bench {url} "
+          f"-n {args.namespace} -t 30 -i 5 --draft {args.draft} -k")
 
     try:
         await asyncio.Event().wait()

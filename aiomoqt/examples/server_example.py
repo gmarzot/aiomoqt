@@ -8,8 +8,8 @@ from aiomoqt.utils.logger import get_logger, set_log_level
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='MOQT WebTransport Server')
-    parser.add_argument('--host', type=str, default='localhost', help='Host to bind to')
+    parser = argparse.ArgumentParser(description='MOQT WebTransport Server', add_help=False)
+    parser.add_argument('-h', '--host', type=str, default='localhost', help='Host to bind to')
     parser.add_argument('--port', type=int, default=443, help='Port to bind to')
     parser.add_argument('--certificate', type=str, required=True, help='TLS server certificate')
     parser.add_argument('--private-key', type=str, required=True, help='TLS private key')
@@ -23,6 +23,9 @@ def parse_args():
                              '(bbr | bbr1 | newreno | cubic | dcubic | '
                              'prague | fast). Default: bbr')
 
+    parser.add_argument(
+        '-?', '--help', action='help',
+        help='Show this help message and exit')
     return parser.parse_args()
 
 async def main(args):

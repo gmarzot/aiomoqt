@@ -223,8 +223,8 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='MOQT WebTransport Client')
-    parser.add_argument('--host', type=str, default='localhost', help='Host to connect to')
+    parser = argparse.ArgumentParser(description='MOQT WebTransport Client', add_help=False)
+    parser.add_argument('-h', '--host', type=str, default='localhost', help='Host to connect to')
     parser.add_argument('--port', type=int, default=443, help='Port to connect to')
     parser.add_argument('--namespace', type=str, default='test', help='Namespace')
     parser.add_argument(
@@ -234,7 +234,8 @@ def parse_args():
              'reject differing payload bytes for the same trackname '
              'across runs, so the random suffix avoids spurious '
              'cache mismatches)')
-    parser.add_argument('--use-quic', action='store_true', help='Enable QUIC transport')
+    parser.add_argument('-q', '--quic', '--use-quic', action='store_true',
+                        dest='use_quic', help='Enable QUIC transport')
     parser.add_argument('--path', type=str, default='', help='MOQT path (default: "/")')
     parser.add_argument('--datagram', action='store_true', help='Emit ObjectDatagrams')
     parser.add_argument('--debug', action='store_true', help='Enable debug output')
@@ -253,11 +254,28 @@ def parse_args():
     parser.add_argument('--gop-pattern', type=str, default='ibp',
                         choices=['ibp', 'ip', 'ionly'],
                         help='GOP pattern (default: ibp)')
-    parser.add_argument('--cc-algo', type=str, default='bbr',
+    parser.add_argument('--cc-algo', type=str, default=None,
                         help='Congestion control algorithm '
                              '(bbr | bbr1 | newreno | cubic | dcubic | '
-                             'prague | fast). Default: bbr')
+                             'prague | fast). Default: aiopquic default '
+                             '(bbr1)')
+    parser.add_argument(
+        '--max-queued-bytes', type=int, default=None,
+        help='Aggregate publisher byte budget across ALL streams '
+             '(QuicConfiguration.tx_max_queued_bytes): producer parks '
+             'at stream rollover while total un-transmitted TX bytes '
+             'exceed this. Steady-state latency ~ value / throughput. '
+             'Default: aiopquic default (4 MiB). Pass 0 to disable.')
+    parser.add_argument(
+        '--max-inflight-bytes', type=int, default=None,
+        help='Per-stream TX budget (aiomoqt tx_max_inflight_bytes): '
+             'producer pauses while one stream\'s un-transmitted bytes '
+             'exceed this. Default: aiomoqt default (1 MiB). '
+             'Pass 0 to disable.')
 
+    parser.add_argument(
+        '-?', '--help', action='help',
+        help='Show this help message and exit')
     return parser.parse_args()
 
 
@@ -266,7 +284,8 @@ async def main(host: str, port: int, path: str, namespace: str, trackname: str,
                insecure: bool = False, auth_token: str = None, draft: int = None,
                streams: int = 1, object_size: int = 1024, rate: float = 30,
                duration: int = 120, video: str = None, gop_pattern: str = 'ibp',
-               cc_algo: str = 'bbr'):
+               cc_algo: str = None, max_queued_bytes: int = None,
+               max_inflight_bytes: int = None):
     log_level = logging.DEBUG if debug else logging.INFO
     set_log_level(log_level)
     logger = get_logger(__name__)
@@ -281,6 +300,10 @@ async def main(host: str, port: int, path: str, namespace: str, trackname: str,
         debug=debug,
         keylog_filename=args.keylogfile,
         congestion_control_algorithm=cc_algo,
+        tx_max_queued_bytes=max_queued_bytes,
+        **({'tx_max_inflight_bytes':
+            (None if max_inflight_bytes == 0 else max_inflight_bytes)}
+           if max_inflight_bytes is not None else {}),
     )
 
     auth = auth_token.encode() if auth_token else b""
@@ -347,6 +370,8 @@ if __name__ == "__main__":
             video=args.video,
             gop_pattern=args.gop_pattern,
             cc_algo=args.cc_algo,
+            max_queued_bytes=args.max_queued_bytes,
+            max_inflight_bytes=args.max_inflight_bytes,
         ))
 
     except KeyboardInterrupt:

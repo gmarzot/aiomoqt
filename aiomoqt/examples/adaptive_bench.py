@@ -479,21 +479,24 @@ class BWActuator:
 class SubsActuator:
     """Actuator for subscriber-ramp mode.
 
-    level == commanded count of live subscribers. apply(level) spawns
-    or terminates multiprocessing workers to reach round(level) healthy
-    subs. observe() drains events from the worker queue and aggregates:
+    level == targeted count of live subscribers. Subs are hosted in
+    BATCHES: each worker process runs K = --step-subs subscriptions and
+    self-heals individual drops internally, so the relay still sees one
+    QUIC connection per sub without one OS process per sub. apply(level)
+    spawns/terminates whole workers to reach ceil(level / K). observe()
+    drains batch_stats events and aggregates:
 
-      rx_mbps      = sum of per-sub rx_mbps (from last 1s each)
-      latency      = worst-sub p50 (SLA is 'no sub is unhappy')
-      loss_pct     = max per-sub loss_pct
+      rx_mbps      = sum of per-worker batch rx_mbps (last 1s each)
+      latency      = worst batch p90 across workers
+      loss_pct     = max per-batch loss_pct
       shortfall    = active_subs < target_subs for 2+ intervals
-      failed_subs  = number of subscribe_failed / stream_reset events
-                     since the last observe()
-      active_subs  = subs that posted stats in the last window
+      failed_subs  = subs lost to reaped (dead/silent) workers since
+                     the last observe()
+      active_subs  = sum of workers' currently-subscribed slot counts
 
-    Each sub is its own Process (GIL-isolated). Publisher stays
-    in-process in the parent (single publisher, fixed rate from
-    --sub-mbps — relay does fan-out, so pub is not the bottleneck).
+    Each worker is GIL-isolated. The publisher runs in its own process
+    (spawned by the subs-mode entrypoint) so its event loop is never
+    starved by the controller's batch-stats drain.
     """
     unit = "subs"
 
@@ -505,7 +508,9 @@ class SubsActuator:
                  object_size: int, per_sub_mbps: float,
                  sub_filter: FilterType = FilterType.LATEST_OBJECT,
                  interval_s: float = 5.0,
-                 no_uvloop: bool = False):
+                 stagger: float = 0.1,
+                 no_uvloop: bool = False,
+                 keep_alive_interval: float | None = None):
         self.relay_url = relay_url
         self.namespace = namespace
         self.trackname = trackname
@@ -521,33 +526,81 @@ class SubsActuator:
         self.per_sub_mbps = per_sub_mbps
         self.sub_filter = sub_filter
         self.interval_s = interval_s
+        # Seconds between consecutive handshakes in a spawn batch —
+        # decoupled from interval_s so handshake spacing is tunable
+        # without changing the report cadence.
+        self.stagger = stagger
         self.no_uvloop = no_uvloop
+        self.keep_alive_interval = keep_alive_interval
+        # Each worker process hosts a BATCH of subscriptions and
+        # self-heals individual drops internally. --step-subs doubles as
+        # the batch size K: one worker == one group of K subs, so the
+        # controller adding a group per --join-rate spawns one worker.
+        self.batch_size = max(1, int(step_subs))
 
         import multiprocessing as mp
         self._mp = mp
         self._events_q = mp.Queue(maxsize=10000)
-        self._workers: dict = {}    # sub_id -> (Process, stop_event)
-        self._next_sub_id = 0
-        # Per-sub rolling stats (last 'stats' event received):
-        self._latest_stats: dict = {}
+        self._workers: dict = {}    # worker_id -> (Process, stop_event)
+        self._next_worker_id = 0
+        # Targeted setpoint, in SUBS — the count the controller aims for.
+        # Distinct from hosted capacity (workers x K): reaping a dead
+        # worker drops live subs but NOT the setpoint, so the next
+        # apply() respawns. observe() reports against this, not the live
+        # count, so a lost worker never silently lowers the target.
+        self._targeted = float(start_subs)
+        # Per-worker latest batch_stats event:
+        self._latest_batch: dict = {}
         # Lifecycle counters for summary + shortfall detection:
         self._subscribed_ever: set = set()
         self._failed_window = 0     # resets each observe()
-        self._last_stats_t: dict = {}    # last 'stats' event time per sub
-        self._last_bytes_t: dict = {}    # last time we saw rx_bytes > 0 per sub
+        self._last_batch_t: dict = {}    # last batch_stats time per worker
+        self._last_bytes_t: dict = {}    # last batch rx_bytes>0 per worker
+        self._spawned_t: dict = {}       # spawn time per worker (grace)
         self._shortfall_streak = 0
         self._t_last_observe = time.monotonic()
 
+    def _reap_dead(self) -> int:
+        """Remove workers whose process died or whose batch stats went
+        silent, so apply() respawns replacements. Individual sub drops
+        are self-healed inside the worker; only a dead/silent worker
+        process reaches here. Without this a lost worker pins active <
+        targeted forever and the controller holds on permanent
+        shortfall."""
+        now = time.monotonic()
+        dead = []
+        for wid, (p, _ev) in self._workers.items():
+            if not p.is_alive():
+                dead.append(wid)
+                continue
+            t = self._last_batch_t.get(wid)
+            if t is not None and now - t > 15.0:
+                dead.append(wid)
+        for wid in dead:
+            self._kill_worker(wid)
+        return len(dead)
+
     async def apply(self, level: float) -> None:
+        self._reap_dead()
         target = max(int(self.min_level), min(int(self.max_level),
                                               int(round(level))))
-        # spawn up
-        while len(self._workers) < target:
-            sid = self._next_sub_id
-            self._next_sub_id += 1
+        self._targeted = float(target)
+        # Workers host K subs each; cover the targeted sub count by
+        # ceil(target / K) worker processes.
+        workers_target = -(-target // self.batch_size)
+        # Spawn-up is BOUNDED to one worker (one group of K) per call:
+        # the controller adds a group every --join-rate, so an unbounded
+        # respawn can't fire dozens of simultaneous batches at a
+        # struggling relay (the death-spiral amplifier). Each worker
+        # spaces its own K handshakes internally by --stagger.
+        if len(self._workers) < workers_target:
+            wid = self._next_worker_id
+            self._next_worker_id += 1
             stop_ev = self._mp.Event()
             cfg = dict(
-                sub_id=sid,
+                worker_id=wid,
+                batch_size=self.batch_size,
+                stagger=self.stagger,
                 relay_url=self.relay_url,
                 namespace=self.namespace,
                 trackname=self.trackname,
@@ -556,22 +609,24 @@ class SubsActuator:
                 force_quic=self.force_quic,
                 sub_filter=int(self.sub_filter),
                 no_uvloop=self.no_uvloop,
+                keep_alive_interval=self.keep_alive_interval,
             )
-            from aiomoqt.examples._bench_workers import sub_worker_entry
+            from aiomoqt.examples._bench_workers import sub_batch_worker_entry
             p = self._mp.Process(
-                target=sub_worker_entry,
+                target=sub_batch_worker_entry,
                 args=(cfg, stop_ev, self._events_q),
                 daemon=True,
             )
             p.start()
-            self._workers[sid] = (p, stop_ev)
+            self._workers[wid] = (p, stop_ev)
+            self._spawned_t[wid] = time.monotonic()
         # wind down
-        while len(self._workers) > target:
-            sid = next(iter(self._workers))
-            self._kill_sub(sid)
+        while len(self._workers) > workers_target:
+            wid = next(iter(self._workers))
+            self._kill_worker(wid)
 
-    def _kill_sub(self, sid):
-        proc, stop_ev = self._workers.pop(sid, (None, None))
+    def _kill_worker(self, wid):
+        proc, stop_ev = self._workers.pop(wid, (None, None))
         if proc is None:
             return
         stop_ev.set()
@@ -580,12 +635,13 @@ class SubsActuator:
         if proc.is_alive():
             proc.terminate()
             proc.join(timeout=1.0)
-        self._latest_stats.pop(sid, None)
-        self._last_stats_t.pop(sid, None)
-        self._last_bytes_t.pop(sid, None)
+        self._latest_batch.pop(wid, None)
+        self._last_batch_t.pop(wid, None)
+        self._last_bytes_t.pop(wid, None)
+        self._spawned_t.pop(wid, None)
 
     async def observe(self) -> Signal:
-        # Drain all pending events from workers.
+        # Drain all pending batch_stats events from workers.
         from queue import Empty
         failed_this_window = 0
         while True:
@@ -593,60 +649,62 @@ class SubsActuator:
                 msg = self._events_q.get_nowait()
             except Empty:
                 break
-            kind = msg.get('kind')
-            sid = msg.get('sub_id')
-            if kind == 'stats':
-                self._latest_stats[sid] = msg
-                self._last_stats_t[sid] = time.monotonic()
-                if msg.get('rx_bytes', 0) > 0:
-                    self._last_bytes_t[sid] = self._last_stats_t[sid]
-            elif kind == 'health':
-                state = msg.get('state')
-                if state == 'subscribed':
-                    self._subscribed_ever.add(sid)
-                elif state in ('subscribe_failed', 'stream_reset'):
-                    failed_this_window += 1
-                    # Reap the process — it's done.
-                    proc, stop_ev = self._workers.pop(sid, (None, None))
-                    if proc is not None:
-                        stop_ev.set()
-                        proc.join(timeout=0.5)
+            if msg.get('kind') != 'batch_stats':
+                continue
+            wid = msg.get('worker_id')
+            self._latest_batch[wid] = msg
+            self._last_batch_t[wid] = time.monotonic()
+            if msg.get('rx_bytes', 0) > 0:
+                self._last_bytes_t[wid] = self._last_batch_t[wid]
+            if msg.get('active', 0) > 0:
+                self._subscribed_ever.add(wid)
 
-        # Aggregate from latest stats per sub. "Active" = delivered bytes
-        # recently. A worker whose QUIC conn went idle can still post
-        # zero-byte stats events and look alive without actually
-        # contributing — those subs must not be counted as delivering.
+        # "Active" subs = subs delivering recently. A worker self-heals
+        # individual drops, so its reported active count is the truth of
+        # how many of its K slots are currently subscribed; we still gate
+        # the worker on recent bytes so a stalled connection's batch
+        # isn't counted as delivering.
         now = time.monotonic()
-        bytes_cutoff = now - 3.0
-        active_ids = [sid for sid, t in self._last_bytes_t.items()
-                      if t >= bytes_cutoff and sid in self._workers]
+        # ONE window governs both "active" (counted as delivering) and
+        # "kept" (not reaped) — eliminates the limbo band where a worker
+        # is neither active nor reaped and pins shortfall forever. Scaled
+        # with interval, floored so sub-second intervals don't reap on
+        # normal jitter.
+        keep_window = max(3.0, 1.5 * self.interval_s)
+        bytes_cutoff = now - keep_window
+        live_ids = [wid for wid, t in self._last_bytes_t.items()
+                    if t >= bytes_cutoff and wid in self._workers]
 
-        # Starvation reap: any spawned worker that has never received
-        # bytes OR hasn't received bytes for 2 * interval is dead.
-        # Scaled with interval so fast-tick configs reap quickly and
-        # slow-tick configs stay patient. Kill + score as failed so
-        # watch/clamp back-off engages.
-        starve_window = 2.0 * self.interval_s
-        starve_cutoff = now - starve_window
+        # Startup grace is a FIXED floor, not interval-scaled: QUIC
+        # handshake + SUBSCRIBE is a ~constant cost (and a batch opens K
+        # of them staggered), so a small --interval must not reap a
+        # worker before it can come online.
+        startup_grace = max(8.0, keep_window
+                            + self.batch_size * max(0.0, self.stagger))
+        starve_cutoff = now - keep_window
         starved = []
-        for sid, (proc, stop_ev) in list(self._workers.items()):
-            last_bytes = self._last_bytes_t.get(sid)
-            spawned = self._last_stats_t.get(sid, now)
-            # Skip freshly spawned subs: no bytes yet AND not older than
-            # the starve window (grace for QUIC handshake + subscribe).
-            if last_bytes is None and (now - spawned) < starve_window:
+        for wid, (proc, stop_ev) in list(self._workers.items()):
+            last_bytes = self._last_bytes_t.get(wid)
+            # REAL spawn time — never refreshed by stats events, so a
+            # never-delivering zombie can't make itself immortal by
+            # posting zero-byte batches.
+            spawned = self._spawned_t.get(wid, now)
+            if last_bytes is None and (now - spawned) < startup_grace:
                 continue
             if last_bytes is None or last_bytes <= starve_cutoff:
-                starved.append(sid)
-        for sid in starved:
-            proc, stop_ev = self._workers.pop(sid, (None, None))
+                starved.append(wid)
+        for wid in starved:
+            lost = self._latest_batch.get(wid, {}).get('active',
+                                                       self.batch_size)
+            proc, stop_ev = self._workers.pop(wid, (None, None))
             if proc is not None:
                 stop_ev.set()
                 proc.join(timeout=0.5)
-            self._latest_stats.pop(sid, None)
-            self._last_stats_t.pop(sid, None)
-            self._last_bytes_t.pop(sid, None)
-            failed_this_window += 1
+            self._latest_batch.pop(wid, None)
+            self._last_batch_t.pop(wid, None)
+            self._last_bytes_t.pop(wid, None)
+            self._spawned_t.pop(wid, None)
+            failed_this_window += max(1, int(lost))
 
         rx_bps_total = 0.0
         worst_p90 = 0.0
@@ -654,31 +712,33 @@ class SubsActuator:
         max_loss_pct = 0.0
         jitter_sum = 0.0
         jitter_n = 0
+        active_subs = 0
 
         self._t_last_observe = now
 
-        for sid in active_ids:
-            s = self._latest_stats.get(sid, {})
-            # rx_bytes is a per-snapshot delta (~1s of bytes since the
-            # last stats event); convert to Mbps using STATS_INTERVAL_S.
+        for wid in live_ids:
+            s = self._latest_batch.get(wid, {})
+            active_subs += int(s.get('active', 0))
+            # rx_bytes is the batch's per-snapshot delta (~1s); convert
+            # to Mbps using STATS_INTERVAL_S.
             rx_bytes = s.get('rx_bytes', 0)
-            per_sub_mbps = (rx_bytes * 8) / (1.0 * 1e6)
-            rx_bps_total += per_sub_mbps * 1e6
-            p90 = s.get('lat_p90_ms', 0.0)
-            mean = s.get('lat_mean_ms', 0.0)
+            rx_bps_total += rx_bytes * 8
+            worst_p90 = max(worst_p90, s.get('lat_p90_ms', 0.0))
+            worst_mean = max(worst_mean, s.get('lat_mean_ms', 0.0))
             loss_ct = s.get('loss', 0)
             total = s.get('total_objs', 0) or 1
             lpct = 100.0 * loss_ct / (loss_ct + total) if (loss_ct + total) else 0.0
-            worst_p90 = max(worst_p90, p90)
-            worst_mean = max(worst_mean, mean)
             max_loss_pct = max(max_loss_pct, lpct)
             jit = s.get('jitter_ms')
             if jit is not None:
                 jitter_sum += jit
                 jitter_n += 1
 
-        target_subs = len(self._workers)
-        active_subs = len(active_ids)
+        # Setpoint is the TARGETED count, not live capacity — reaping a
+        # worker must not silently lower the target the controller ramps
+        # against (else a lost worker permanently decays the run instead
+        # of triggering a respawn).
+        target_subs = int(self._targeted)
 
         if active_subs < target_subs:
             self._shortfall_streak += 1
@@ -715,7 +775,7 @@ class SubsActuator:
     async def shutdown(self) -> None:
         # Parallel shutdown: signal all stops at once, join with one
         # shared deadline, terminate stragglers, then a final short
-        # join. Serial _kill_sub at 1s/worker would block ~Nsubs s
+        # join. Serial _kill_worker at 1s each would block ~Nworkers s
         # at large fan-out and starve the asyncio loop.
         items = list(self._workers.items())
         self._workers.clear()
@@ -730,9 +790,10 @@ class SubsActuator:
                 proc.terminate()
         for _sid, (proc, _ev) in items:
             proc.join(timeout=1.0)
-        self._latest_stats.clear()
-        self._last_stats_t.clear()
+        self._latest_batch.clear()
+        self._last_batch_t.clear()
         self._last_bytes_t.clear()
+        self._spawned_t.clear()
         # Don't let the parent's atexit hook block on the events queue
         # feeder thread — workers may have left bytes pending.
         try:
@@ -770,10 +831,24 @@ class AIMDController:
                  latency_threshold_ms: float = 100.0,
                  backoff_factor: float = 0.9,
                  loss_threshold_pct: float = 0.5,
-                 duration_s: float | None = None):
+                 duration_s: float | None = None,
+                 tick_s: float | None = None):
         self.actuator = actuator
         self.state = state
         self.interval_s = interval_s
+        # tick_s = how often we observe / decide / add a group; report_s
+        # = how often we print a row + write CSV. Subs mode passes
+        # tick_s=join_rate so a group is added every --join-rate while
+        # rows print every --interval. BW mode leaves tick_s=interval,
+        # so every tick reports — byte-identical to the old behavior.
+        self.report_s = interval_s
+        self.tick_s = tick_s if (tick_s and tick_s > 0) else interval_s
+        # Streaks are wall-clock windows; express them in ticks so the
+        # dead-air / back-off / shortfall reaction times stay constant
+        # when tick_s < report_s (otherwise a fast --join-rate would
+        # make a dead-air abort fire in ~2s instead of ~3 intervals).
+        self._tpr = max(1, round(self.report_s / self.tick_s))
+        self._last_report_t = 0.0
         self.writer = writer
         self.latency_threshold_ms = latency_threshold_ms
         self.backoff_factor = backoff_factor
@@ -804,13 +879,13 @@ class AIMDController:
         while not state.stop.is_set():
             try:
                 await asyncio.wait_for(state.stop.wait(),
-                                       timeout=self.interval_s)
+                                       timeout=self.tick_s)
                 break
             except asyncio.TimeoutError:
                 pass
 
-            # Hard wall-clock cap. Checked at interval boundaries so
-            # the in-progress sample completes and gets reported.
+            # Hard wall-clock cap. Checked at tick boundaries so the
+            # in-progress sample completes and gets reported.
             if (self.duration_s is not None
                     and time.monotonic() - self.t0 >= self.duration_s):
                 state.ceiling_reason = (
@@ -820,33 +895,23 @@ class AIMDController:
 
             sig = await a.observe()
             self.samples += 1
-            if self.writer:
-                self.writer.writerow([
-                    f"{sig.t:.3f}",
-                    f"{sig.target_mbps:.2f}",
-                    f"{sig.tx_mbps:.2f}",
-                    f"{sig.rx_mbps:.2f}",
-                    f"{sig.latency_mean_ms:.2f}",
-                    f"{sig.latency_p90_ms:.2f}",
-                    f"{sig.loss_pct:.3f}",
-                ])
 
             if self.samples < 2:
-                self._print_row(sig, "warming")
+                self._emit(sig, "warming")
                 continue
 
-            # Dead-air guard: rx=0 for 3 consecutive intervals means
-            # no data is flowing (subscribe failed, publisher stuck,
-            # etc.). Don't climb a phantom ramp.
+            # Dead-air guard: rx=0 for ~3 report intervals means no data
+            # is flowing (subscribe failed, publisher stuck, etc.).
+            # Don't climb a phantom ramp.
             if sig.rx_mbps <= 0:
                 self.no_data_streak = getattr(self, 'no_data_streak', 0) + 1
-                if self.no_data_streak >= 3:
+                if self.no_data_streak >= 3 * self._tpr:
                     state.ceiling_reason = ("no data received — subscribe "
                                             "failed or publisher stalled")
-                    self._print_row(sig, "ABORT: rx=0 for 3 intervals")
+                    self._emit(sig, "ABORT: rx=0", force=True)
                     state.stop.set()
                     return
-                self._print_row(sig, f"rx=0 (streak {self.no_data_streak}/3)")
+                self._emit(sig, "rx=0 (no data)")
                 continue
             self.no_data_streak = 0
 
@@ -860,13 +925,16 @@ class AIMDController:
                 / self.latency_threshold_ms
 
             # Back-off triggers ONLY on sustained p90 latency overshoot.
-            # Shortfall and loss are reported in the row but never drive
-            # the ramp — we want the bench to reveal the actual
-            # throughput/latency curve, not throttle on transient
-            # bandwidth dips that QUIC will recover from on its own.
-            # First bad interval just 'watches' — back off after two
-            # consecutive overshoots so transient RTT spikes don't
-            # trigger a cliff.
+            # Loss is reported in the row but never drives the ramp —
+            # we want the bench to reveal the actual throughput/latency
+            # curve, not throttle on transient dips QUIC will recover
+            # from on its own. Shortfall is tolerated for transients
+            # but HOLDS the ramp when sustained (see below): delivery
+            # structurally below command means a producer/CPU wall, and
+            # ramping past it only inflates the target into fiction.
+            # First bad latency interval just 'watches' — back off
+            # after two consecutive overshoots so transient RTT spikes
+            # don't trigger a cliff.
             if sig.shortfall:
                 self.shortfall_streak += 1
             else:
@@ -874,8 +942,8 @@ class AIMDController:
             over_p90 = headroom < 0
             if over_p90:
                 self.pressure_streak += 1
-                if self.pressure_streak < 2:
-                    self._print_row(sig, "watch (p90 over)")
+                if self.pressure_streak < 2 * self._tpr:
+                    self._emit(sig, "watch (p90 over)")
                     continue
                 retreat = max(self.backoff_factor, 1.0 + headroom)
                 new_level = level * retreat
@@ -883,21 +951,60 @@ class AIMDController:
                 # Symmetric clamp with ramp: drop at most initial_step.
                 new_level = max(new_level, level - a.initial_step)
                 self.pressure_streak = 0
-                await self._apply(new_level, sig, "back-off (p90 over)")
+                await self._apply(new_level, sig, "back-off (p90 over)",
+                                  force=True)
                 self.draining = True
                 continue
             self.pressure_streak = 0
 
             if self.draining:
-                self._print_row(sig, "drain")
+                self._emit(sig, "drain")
                 if headroom >= 0.2:
                     self.draining = False
+                continue
+
+            # Shortfall = delivery has fallen behind command (queue
+            # building, though latency may still be under the SLA).
+            # Stop ramping the MOMENT we fall behind — climbing further
+            # over a growing queue only inflates the target. Hold to
+            # let the relay catch up; back off only if it stays behind
+            # for the sustained window.
+            if sig.shortfall:
+                if self.shortfall_streak < 3 * self._tpr:
+                    # Onset: hold and watch. apply(level) is a reconcile
+                    # (subs respawns lost workers); BW it's a no-op.
+                    self._emit(sig, "hold (watch)")
+                    await a.apply(level)
+                    continue
+                # Sustained — the relay isn't catching up.
+                if a.unit == "Mbps":
+                    # BW: back off the target toward what's actually
+                    # delivered, so Target settles at the real ceiling
+                    # instead of sitting inflated over a growing TX
+                    # queue. Drop by at least backoff_factor, no higher
+                    # than the achieved rate; record the pivot so
+                    # eq_level converges. Drain until latency recovers.
+                    new_level = max(a.min_level,
+                                    min(level * self.backoff_factor,
+                                        sig.rx_mbps))
+                    self.shortfall_streak = 0
+                    await self._apply(new_level, sig,
+                                      "back-off (shortfall)", force=True)
+                    self.draining = True
+                else:
+                    # Subs: a sustained shortfall is usually a lost
+                    # subscriber the reaper will replace — hold +
+                    # reconcile (apply at the SAME target respawns it).
+                    # Backing off here would kill more subs and
+                    # re-introduce the setpoint-decay-on-loss bug.
+                    self._emit(sig, "hold (shortfall)")
+                    await a.apply(level)
                 continue
 
             if level >= a.max_level:
                 state.ceiling_mbps = self.high_water
                 state.ceiling_reason = f"reached max {a.max_level} {a.unit}"
-                self._print_row(sig, "max")
+                self._emit(sig, "max", force=True)
                 state.stop.set()
                 return
             # High-water tracks the *delivered* metric (bw: rx_mbps;
@@ -933,31 +1040,83 @@ class AIMDController:
                 # probe. Prevents the controller from sitting forever at
                 # a stale equilibrium when the network has freed up.
                 self.hold_intervals += 1
-                if headroom >= 0.5 and self.hold_intervals >= 5:
+                if headroom >= 0.5 and self.hold_intervals >= 5 * self._tpr:
                     self.hold_intervals = 0
                     await self._apply(
                         min(a.max_level, level + a.step_floor),
                         sig, "probe"
                     )
                     continue
-                self._print_row(sig, "hold")
+                self._emit(sig, "hold")
+                await a.apply(level)   # reconcile (no level change)
+                continue
+
+            # Ceiling cap: once a back-off has revealed the sustainable
+            # ceiling (>=1 pivot), don't ramp command past the best
+            # delivered rate by more than a small margin. Hold there and
+            # probe up only occasionally — otherwise the ramp re-climbs
+            # to the same overshoot and crashes back every cycle (a wide
+            # saw-tooth around the ceiling). A probe that delivers more
+            # raises high_water, lifting the cap naturally if the path
+            # frees up.
+            ceiling_margin = 1.05
+            if (self.pivots
+                    and self.high_water > 0
+                    and (level + step) > self.high_water * ceiling_margin):
+                self.hold_intervals += 1
+                if headroom >= 0.5 and self.hold_intervals >= 4 * self._tpr:
+                    self.hold_intervals = 0
+                    await self._apply(min(a.max_level, level + a.step_floor),
+                                      sig, "probe (ceiling)")
+                    continue
+                self._emit(sig, "hold (ceiling)")
+                await a.apply(level)
                 continue
             self.hold_intervals = 0
             await self._apply(min(a.max_level, level + step), sig, "ramp")
 
-    async def _apply(self, new_level: float, sig: Signal, action: str) -> None:
+    def _emit(self, sig: Signal, action: str, force: bool = False) -> None:
+        """Throttle console + CSV output to report_s. The control loop
+        ticks at tick_s (= --join-rate in subs mode), but rows print at
+        --interval; force=True always emits (terminal + back-off rows
+        the user must not miss)."""
+        now = time.monotonic()
+        if not (force or (now - self._last_report_t) >= self.report_s):
+            return
+        self._last_report_t = now
+        if self.writer:
+            self.writer.writerow([
+                f"{sig.t:.3f}",
+                f"{sig.target_mbps:.2f}",
+                f"{sig.tx_mbps:.2f}",
+                f"{sig.rx_mbps:.2f}",
+                f"{sig.latency_mean_ms:.2f}",
+                f"{sig.latency_p90_ms:.2f}",
+                f"{sig.loss_pct:.3f}",
+            ])
+        self._print_row(sig, action)
+
+    async def _apply(self, new_level: float, sig: Signal, action: str,
+                     force: bool = False) -> None:
         # Record a pivot whenever direction flips (ramp ↔ back-off).
         # Updates eq_level as an EWMA so future decisions converge on
         # the learned equilibrium point.
         new_direction = +1 if new_level > sig.level else -1
         if new_direction != self.direction:
+            # First pivot SETS eq_level (the initial_level seed is a
+            # target, not a measurement, and must not pollute the
+            # learned value); later pivots refine it as an EWMA.
+            if not self.pivots:
+                self.eq_level = sig.level
+            else:
+                alpha = 0.3
+                self.eq_level = ((1 - alpha) * self.eq_level
+                                 + alpha * sig.level)
             self.pivots.append(sig.level)
             if len(self.pivots) > 10:
                 self.pivots.pop(0)
-            alpha = 0.3
-            self.eq_level = (1 - alpha) * self.eq_level + alpha * sig.level
             self.direction = new_direction
-        self._print_row(sig, action)
+        self._emit(sig, action, force=force)
         await self.actuator.apply(new_level)
 
     def _print_header(self) -> None:
@@ -1052,13 +1211,15 @@ KEY = CERT.replace('cert.pem', 'key.pem') if CERT else None
 async def run_loopback_server(args, state: BenchState):
     """Server publishes bench.load at a rate controlled by state.rate_ops.
 
-    On each SUBSCRIBE, create a PublishedTrack whose per-subgroup rate
-    is driven by the controller via an in-process sync task that
-    polls state.rate_ops and mutates track.rate.
+    On each SUBSCRIBE, create a PublishedTrack whose rate is driven by
+    the controller via an in-process sync task that polls
+    state.rate_ops and mutates track.rate.
     """
 
     async def _on_subscribe(session, msg):
-        per_subgroup = state.rate_ops / max(1, args.scenario.subgroups)
+        # PublishedTrack.rate is AGGREGATE across subgroups (the track
+        # divides by num_subgroups in its send loop) — pass rate_ops
+        # straight through.
         track = PublishedTrack(
             session,
             namespace=args.namespace,
@@ -1066,7 +1227,7 @@ async def run_loopback_server(args, state: BenchState):
             object_size=args.scenario.object_size,
             group_size=args.group_size,
             num_subgroups=args.scenario.subgroups,
-            rate=per_subgroup,
+            rate=state.rate_ops,
         )
         # Silence the per-track stats printer — we print our own.
         track._quiet = True
@@ -1083,8 +1244,7 @@ async def run_loopback_server(args, state: BenchState):
             while not state.stop.is_set():
                 await asyncio.sleep(0.05)
                 if state.rate_ops != last:
-                    track.rate = (state.rate_ops
-                                  / max(1, args.scenario.subgroups))
+                    track.rate = state.rate_ops
                     last = state.rate_ops
                 tick += 1
                 if tick >= 20:  # ~1s at 50ms tick
@@ -1113,6 +1273,11 @@ async def run_loopback_server(args, state: BenchState):
         certificate=args.cert, private_key=args.key,
         path="",
         congestion_control_algorithm=args.cc_algo,
+        tx_max_queued_bytes=args.max_queued_bytes,
+        **({'tx_max_inflight_bytes':
+            (None if args.max_inflight_bytes == 0
+             else args.max_inflight_bytes)}
+           if args.max_inflight_bytes is not None else {}),
     )
     server.register_handler(
         MOQTMessageType.SUBSCRIBE, partial(_on_subscribe))
@@ -1188,11 +1353,17 @@ async def run_publisher_client(host: str, port: int, path: str,
         verify_tls=verify_tls,
         draft_version=args.draft,
         congestion_control_algorithm=args.cc_algo,
+        tx_max_queued_bytes=args.max_queued_bytes,
+        **({'tx_max_inflight_bytes':
+            (None if args.max_inflight_bytes == 0
+             else args.max_inflight_bytes)}
+           if args.max_inflight_bytes is not None else {}),
     )
     try:
         async with client.connect() as session:
             await session.client_session_init()
-            per_subgroup = state.rate_ops / max(1, args.scenario.subgroups)
+            # PublishedTrack.rate is AGGREGATE across subgroups — no
+            # pre-division (the track divides in its send loop).
             track = PublishedTrack(
                 session,
                 namespace=args.namespace,
@@ -1200,7 +1371,7 @@ async def run_publisher_client(host: str, port: int, path: str,
                 object_size=args.scenario.object_size,
                 group_size=args.group_size,
                 num_subgroups=args.scenario.subgroups,
-                rate=per_subgroup,
+                rate=state.rate_ops,
                 draft=args.draft,
             )
             track._quiet = True
@@ -1258,6 +1429,7 @@ async def run_publisher_client(host: str, port: int, path: str,
 
 def parse_args():
     p = argparse.ArgumentParser(
+        add_help=False,
         description="aiomoqt adaptive bench — feedback-driven bitrate ramp",
     )
     p.add_argument("-s", "--object-size", type=int, default=4096,
@@ -1322,12 +1494,26 @@ def parse_args():
     p.add_argument("--start-subs", type=int, default=1,
                    help="subs-mode: initial subscriber count (default: 1)")
     p.add_argument("--step-subs", type=int, default=1,
-                   help="subs-mode: subs added per ramp step (default: 1)")
+                   help="subs-mode: subscribers per group (default: 1). "
+                        "Also the batch size: one worker process hosts a "
+                        "group of this many self-healing subscriptions.")
     p.add_argument("--max-subs", type=int, default=200,
                    help="subs-mode: cap (default: 200)")
     p.add_argument("--sub-mbps", type=float, default=10.0,
                    help="subs-mode: fixed per-track publisher bitrate "
                         "(default: 10 Mbps)")
+    p.add_argument("-j", "--join-rate", type=float, default=None,
+                   dest="join_rate", metavar="SEC",
+                   help="subs-mode: seconds between subscriber GROUPS "
+                        "(a group = --step-subs subs). The ramp cadence, "
+                        "independent of --interval (reporting). Default: "
+                        "--interval (one group per report).")
+    p.add_argument("-S", "--stagger", type=float, default=0.1,
+                   help="subs-mode: seconds between individual joins "
+                        "WITHIN a group (default: 0.1), applied inside "
+                        "the worker as it opens its batch. Spaces QUIC "
+                        "Initials so a group doesn't burst the relay. "
+                        "0 = open the batch simultaneously.")
     # CLI names from FilterType enum: kebab-case of the member name.
     # NEXT_GROUP_START → next-group-start, LATEST_OBJECT → latest-object,
     # etc. ABSOLUTE_START/RANGE are enumerated here but rejected below
@@ -1354,16 +1540,42 @@ def parse_args():
                         "worker (publisher / subscriber) gets a "
                         "process-suffixed file: PATH.pub.<pid>, "
                         "PATH.sub.<pid> — combined when decrypting.")
-    p.add_argument("--no-uvloop", action="store_true",
-                   help="Skip uvloop installation; use stock asyncio. "
-                        "uvloop is on by default when available — "
-                        "typically 2-4× faster on selector-heavy "
-                        "workloads.")
-    p.add_argument("--cc-algo", type=str, default="bbr",
+    p.add_argument("--uvloop", action="store_true",
+                   help="Install uvloop instead of stock asyncio "
+                        "(experimental test option — measured marginal "
+                        "on this stack, where per-event Python work "
+                        "dominates loop turnaround. Default: stock "
+                        "asyncio.)")
+    p.add_argument("--cc-algo", type=str, default=None,
                    help="Congestion control algorithm "
                         "(bbr | bbr1 | newreno | cubic | dcubic | "
-                        "prague | fast). Default: bbr")
+                        "prague | fast). Default: aiopquic default "
+                        "(bbr1)")
+    p.add_argument("--keepalive", type=float, default=None, metavar="SEC",
+                   help="QUIC keep-alive interval in seconds (PING) so a "
+                        "flow-controlled, consumer-stalled connection "
+                        "isn't dropped on the idle timeout. Default: off.")
+    p.add_argument("--max-queued-bytes", type=int, default=None,
+                   help="Aggregate publisher byte budget across ALL "
+                        "streams (QuicConfiguration.tx_max_queued_bytes): "
+                        "producer parks at stream rollover while total "
+                        "un-transmitted TX bytes exceed this. "
+                        "Steady-state latency ~ value / throughput. "
+                        "Default: aiopquic default (4 MiB). "
+                        "Pass 0 to disable.")
+    p.add_argument("--max-inflight-bytes", type=int, default=None,
+                   help="Per-stream TX budget (aiomoqt "
+                        "tx_max_inflight_bytes): producer pauses while "
+                        "one stream's un-transmitted bytes exceed this. "
+                        "Default: aiomoqt default (1 MiB). "
+                        "Pass 0 to disable.")
+    p.add_argument(
+        '-?', '--help', action='help',
+        help='Show this help message and exit')
     args = p.parse_args()
+    # Internal plumbing (workers, actuators) still carries no_uvloop;
+    # the CLI is opt-in (--uvloop), so invert once here.
+    args.no_uvloop = not args.uvloop
     args.sub_filter = filter_choices[args.sub_filter]
     if args.sub_filter in (FilterType.ABSOLUTE_START,
                            FilterType.ABSOLUTE_RANGE):
@@ -1432,7 +1644,12 @@ def _print_summary(state: BenchState, controller, samples: int, args):
               f"(rx delivered)")
     else:
         print(f"  High-water:  {controller.high_water:.1f} {unit}")
-    print(f"  Equilibrium: {controller.eq_level:.1f} {unit}")
+    if controller.pivots:
+        print(f"  Equilibrium: {controller.eq_level:.1f} {unit} "
+              f"({len(controller.pivots)} pivots)")
+    else:
+        print("  Equilibrium: not reached — no ramp/back-off pivot "
+              "(ended while still climbing)")
     if state.ceiling_reason:
         print(f"  Reason:      {state.ceiling_reason}")
     print(f"  Samples:     {samples}")
@@ -1440,7 +1657,6 @@ def _print_summary(state: BenchState, controller, samples: int, args):
 
 
 async def main():
-    from aiomoqt.utils.url import parse_relay_url
     args = parse_args()
     _print_banner(args)
 
@@ -1492,7 +1708,9 @@ async def main():
             per_sub_mbps=args.sub_mbps,
             sub_filter=args.sub_filter,
             interval_s=args.scenario.interval_s,
+            stagger=args.stagger,
             no_uvloop=args.no_uvloop,
+            keep_alive_interval=args.keepalive,
         )
     else:
         # BW mode. SP loopback runs publisher + subscriber as in-process
@@ -1601,6 +1819,8 @@ async def main():
             mp_rate_queue=mp_rate_q, mp_events_queue=mp_events_q,
             mp_stop_event=mp_stop_event,
         )
+    # Subs mode adds a group (--step-subs) every --join-rate while rows
+    # print every --interval; BW mode ticks at --interval (tick_s=None).
     controller = AIMDController(
         actuator, state,
         interval_s=args.scenario.interval_s,
@@ -1608,11 +1828,14 @@ async def main():
         latency_threshold_ms=args.latency_threshold,
         backoff_factor=args.backoff_factor,
         duration_s=args.duration,
+        tick_s=(args.join_rate if args.mode == "subs" else None),
     )
 
     server = None
     pub_task = None
     sub_task = None
+    pub_proc = None       # subs-mode publisher process (isolated loop)
+    pub_stop = None
     try:
         if relay_mode or (args.mode == "bw" and args.mp_loopback):
             if args.mode == "bw" and pub_proc is not None and sub_proc is not None:
@@ -1647,15 +1870,68 @@ async def main():
                 sub_proc.start()
                 await asyncio.sleep(0.3)
             else:
-                # Subs mode: in-process publisher + sub workers spawned
-                # by SubsActuator.
-                relay = parse_relay_url(args.relay_url)
-                host, port = relay.host, relay.port
-                path = relay.path or ""
-                use_quic = relay.use_quic
-                verify = not args.insecure
-                pub_task = asyncio.create_task(run_publisher_client(
-                    host, port, path, use_quic, verify, args, state))
+                # Subs mode: publisher in its OWN process. As an
+                # in-process task it shared the parent event loop with
+                # the controller's per-worker stats drain; past ~600
+                # subs that drain monopolized the loop (measured loop
+                # lag spiking to 500ms+), starved the publisher task,
+                # and the relay reset it. Isolating it removes the
+                # coupling. Sub workers are still spawned by
+                # SubsActuator; the publisher runs at a fixed
+                # --sub-mbps rate (no rate_queue updates needed).
+                import multiprocessing as mp
+                from aiomoqt.examples._bench_workers import pub_worker_entry
+                pub_stop = mp.Event()
+                pub_events_q = mp.Queue(maxsize=10000)
+                pub_rate_q = mp.Queue(maxsize=8)
+                mp_cleanup_queues.extend([pub_events_q, pub_rate_q])
+                pub_cfg = dict(
+                    relay_url=args.relay_url,
+                    namespace=args.namespace,
+                    trackname=args.trackname,
+                    draft=args.draft,
+                    insecure=args.insecure,
+                    force_quic=False,
+                    object_size=args.scenario.object_size,
+                    group_size=args.group_size,
+                    num_subgroups=args.scenario.subgroups,
+                    initial_rate_ops=args.scenario.aggregate_ops(
+                        args.sub_mbps),
+                    pub_ns=args.pub_ns,
+                    pub_both=args.pub_both,
+                    debug=args.debug,
+                    no_uvloop=args.no_uvloop,
+                    keep_alive_interval=args.keepalive,
+                )
+                pub_proc = mp.Process(
+                    target=pub_worker_entry,
+                    args=(pub_cfg, pub_stop, pub_rate_q, pub_events_q),
+                    daemon=True,
+                )
+                pub_proc.start()
+                # Wait for 'published' before subs subscribe, else the
+                # relay races subscribe against announce.
+                from queue import Empty
+                deadline = time.monotonic() + 5.0
+                published = False
+                while time.monotonic() < deadline and not published:
+                    # Non-blocking poll: get_nowait + await sleep yields
+                    # to the loop. A blocking get(timeout=) would stall
+                    # the event loop for the whole deadline if the
+                    # publisher is slow (or the relay is down).
+                    try:
+                        ev = pub_events_q.get_nowait()
+                    except Empty:
+                        await asyncio.sleep(0.1)
+                        continue
+                    if (ev.get("kind") == "pub_health"
+                            and ev.get("state") == "published"):
+                        published = True
+                        break
+                if not published:
+                    print("  warning: publisher didn't report "
+                          "'published' within 5s; subscribing anyway "
+                          "— may race", file=sys.stderr)
                 await asyncio.sleep(0.3)
         else:
             args.port = loopback_port  # server code still reads args.port
@@ -1665,6 +1941,41 @@ async def main():
                 "localhost", loopback_port, "", False, False,
                 args, state, stats))
 
+        # Loop-lag probe (AIOMOQT_LOOP_LAG=1): measures how late the
+        # parent event loop services a 0.1s timer. In subs mode the
+        # publisher task and the 590-worker stats drain share this one
+        # loop; if lag climbs with sub count and spikes when the
+        # publisher resets, the wall is single-loop tail latency
+        # (harness coupling), not the pico/mvfst stacks. Prints peak +
+        # mean lag each report interval.
+        lag_task = None
+        if os.environ.get("AIOMOQT_LOOP_LAG") == "1":
+            async def _loop_lag_probe():
+                period = 0.1
+                report_every = max(1.0, args.interval)
+                peak = 0.0
+                acc = 0.0
+                n = 0
+                t_last = time.monotonic()
+                t_report = t_last
+                while not state.stop.is_set():
+                    await asyncio.sleep(period)
+                    now = time.monotonic()
+                    lag = (now - t_last) - period
+                    t_last = now
+                    if lag > 0:
+                        peak = max(peak, lag)
+                        acc += lag
+                        n += 1
+                    if now - t_report >= report_every:
+                        mean = (acc / n * 1000) if n else 0.0
+                        print(f"  [loop-lag] peak={peak * 1000:.1f}ms "
+                              f"mean={mean:.1f}ms over {report_every:.0f}s")
+                        peak = acc = 0.0
+                        n = 0
+                        t_report = now
+            lag_task = asyncio.create_task(_loop_lag_probe())
+
         ctrl_task = asyncio.create_task(controller.run())
         try:
             await ctrl_task
@@ -1672,6 +1983,8 @@ async def main():
             pass
     finally:
         state.stop.set()
+        if lag_task is not None:
+            lag_task.cancel()
         for t in (sub_task, pub_task):
             if t is None:
                 continue
@@ -1685,6 +1998,20 @@ async def main():
             await actuator.shutdown()
         except Exception:
             pass
+        # Subs-mode publisher process: signal stop, then join/terminate.
+        if pub_stop is not None:
+            try:
+                pub_stop.set()
+            except Exception:
+                pass
+        if pub_proc is not None:
+            try:
+                pub_proc.join(timeout=5.0)
+                if pub_proc.is_alive():
+                    pub_proc.terminate()
+                    pub_proc.join(timeout=2.0)
+            except Exception:
+                pass
         # BW-mode mp queues: detach feeder threads so atexit doesn't
         # block on Queue.put_thread joins after a pub/sub child has
         # been terminated mid-write.
@@ -1707,11 +2034,12 @@ if __name__ == "__main__":
     # Worker processes (publisher / subscriber MP) install it in
     # _bench_workers.{pub,sub}_worker_entry — they're separate
     # interpreters and can't inherit the policy.
-    if "--no-uvloop" not in sys.argv:
+    if "--uvloop" in sys.argv:
         if _try_install_uvloop():
-            print("  uvloop: enabled")
+            print("  uvloop: enabled (experimental)")
         else:
-            print("  uvloop: not installed (using stock asyncio)")
+            print("  uvloop: requested but not installed "
+                  "(using stock asyncio)")
     try:
         sys.exit(asyncio.run(main()))
     except KeyboardInterrupt:

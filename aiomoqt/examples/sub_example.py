@@ -12,15 +12,16 @@ from aiomoqt.utils.logger import *
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='MOQT WebTransport Client')
-    parser.add_argument('--host', type=str, default='localhost', help='Host to connect to')
+    parser = argparse.ArgumentParser(description='MOQT WebTransport Client', add_help=False)
+    parser.add_argument('-h', '--host', type=str, default='localhost', help='Host to connect to')
     parser.add_argument('--port', type=int, default=443, help='Port to connect to')
     parser.add_argument('--namespace', type=str, default="live/test", help='Track Namespace')
     parser.add_argument(
         '--trackname', type=str, default=None,
         help='Track Name (default: auto-discover via SUBSCRIBE_NAMESPACE)')
     parser.add_argument('--path', type=str, default="", help='MOQT WT path (default: "/")')
-    parser.add_argument('--use-quic', action='store_true', help='Enable QUIC transport')
+    parser.add_argument('-q', '--quic', '--use-quic', action='store_true',
+                        dest='use_quic', help='Enable QUIC transport')
     parser.add_argument('--debug', action='store_true', help='Enable debug output')
     parser.add_argument('--quic-debug', action='store_true',  help='Enable quic debug output')
     parser.add_argument('--keylogfile', type=str, default=None, help='TLS secrets file')
@@ -36,6 +37,9 @@ def parse_args():
                              '(bbr | bbr1 | newreno | cubic | dcubic | '
                              'prague | fast). Default: bbr')
 
+    parser.add_argument(
+        '-?', '--help', action='help',
+        help='Show this help message and exit')
     return parser.parse_args()
 
 import time

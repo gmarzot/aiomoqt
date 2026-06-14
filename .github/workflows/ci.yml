@@ -128,7 +128,7 @@ jobs:
           # cleanup + visible failure mode. The underlying sub_bench
           # -t bug is tracked for 0.9.6.
           python -u -m aiomoqt.examples.sub_bench \
-            -Q --draft 16 -n bench --trackname track \
+            -q --draft 16 -n aiomoqt --trackname track \
             -t 12 -i 5 moqt://localhost:4434 \
             > /tmp/sub.log 2>&1 &
           SUB_PID=$!

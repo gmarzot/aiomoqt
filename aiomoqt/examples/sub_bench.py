@@ -56,7 +56,18 @@ class BenchStats:
         # reasonable -i.
         self.iv_objects: int = 0
         self.iv_bytes: int = 0
+        # Interval latency RESERVOIR (Algorithm R, same as the
+        # cumulative lat_reservoir below). Capped because the interval
+        # report runs INSIDE on_object on the receive loop: sorting a
+        # full 5 s window (500K+ floats at 100K+ obj/s) blocks the
+        # drain ~100-170 ms, queueing arrivals in sc->rx and poisoning
+        # the NEXT interval's latencies with the bench's own stall —
+        # visible only in 2-process runs (in-process the producer
+        # co-stalls, so no queue forms). 16K samples keep the sort
+        # ~1.5 ms with negligible percentile error.
         self.iv_latencies: list = []
+        self.iv_lat_count: int = 0
+        self.iv_lat_max: int = 16384
 
         # Cumulative
         self.total_objects: int = 0
@@ -118,7 +129,13 @@ class BenchStats:
                 send_us = None
 
         if latency is not None:
-            self.iv_latencies.append(latency)
+            if len(self.iv_latencies) < self.iv_lat_max:
+                self.iv_latencies.append(latency)
+            else:
+                j = random.randint(0, self.iv_lat_count)
+                if j < self.iv_lat_max:
+                    self.iv_latencies[j] = latency
+            self.iv_lat_count += 1
 
             # Update cumulative latency running stats + reservoir.
             self.lat_sum += latency
@@ -245,6 +262,7 @@ class BenchStats:
         self.iv_objects = 0
         self.iv_bytes = 0
         self.iv_latencies = []
+        self.iv_lat_count = 0
 
     def print_summary(self):
         if self.start_time == 0:
@@ -311,6 +329,7 @@ class BenchStats:
 
 def parse_args():
     parser = argparse.ArgumentParser(
+        add_help=False,
         description='aiomoqt-bench subscriber - MoQT benchmark receiver',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
@@ -330,8 +349,9 @@ examples:
         help='Relay URL: moqt://host:port, '
              'https://host:port/ep, or host[:port]')
     parser.add_argument(
-        '-Q', '--force-quic', action='store_true',
-        help='Force raw QUIC even for https:// URLs')
+        '-q', '--quic', '--use-quic', action='store_true',
+        dest='force_quic',
+        help='Raw QUIC even for https:// URLs')
     parser.add_argument(
         '-n', '--namespace', type=str, default='aiomoqt',
         help='MoQT namespace (default: aiomoqt)')
@@ -360,10 +380,18 @@ examples:
         '--draft', type=int, default=None,
         help='MoQT draft version (e.g. 14, 16)')
     parser.add_argument(
-        '--cc-algo', type=str, default='bbr',
+        '--cc-algo', type=str, default=None,
         help='Congestion control algorithm '
              '(bbr | bbr1 | newreno | cubic | dcubic | prague | fast). '
-             'Default: bbr')
+             'Default: aiopquic default (bbr1)')
+    parser.add_argument(
+        '--keepalive', type=float, default=None, metavar='SEC',
+        help='QUIC keep-alive interval in seconds (PING) so a '
+             'flow-controlled, consumer-stalled connection is not '
+             'dropped on the idle timeout. Default: off.')
+    parser.add_argument(
+        '-?', '--help', action='help',
+        help='Show this help message and exit')
     return parser.parse_args()
 
 
@@ -405,6 +433,7 @@ async def run(args):
         debug=args.debug,
         keylog_filename=args.keylogfile,
         congestion_control_algorithm=args.cc_algo,
+        keep_alive_interval=args.keepalive,
     )
 
     try:

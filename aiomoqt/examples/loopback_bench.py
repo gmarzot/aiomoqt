@@ -40,6 +40,7 @@ KEY = CERT.replace('cert.pem', 'key.pem') if CERT else None
 
 def parse_args():
     parser = argparse.ArgumentParser(
+        add_help=False,
         description='aiomoqt-bench loopback - direct pub/sub, no relay',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -73,19 +74,29 @@ def parse_args():
     parser.add_argument(
         '-d', '--debug', action='store_true')
     parser.add_argument(
-        '--quic', action='store_true',
+        '-q', '--quic', '--use-quic', action='store_true',
         help='Use raw QUIC instead of WebTransport (default: WT)')
     parser.add_argument(
-        '--cc-algo', type=str, default='bbr',
+        '--cc-algo', type=str, default=None,
         help='Congestion control algorithm '
              '(bbr | bbr1 | newreno | cubic | dcubic | prague | fast). '
-             'Default: bbr')
+             'Default: aiopquic default (bbr1)')
     parser.add_argument(
-        '--max-inflight-bytes', type=int, default=0,
-        help='Per-stream producer byte-budget cap '
-             '(stream_tx_buf_used > N parks producer). '
-             '0 = off (default). Hysteresis: park at N, '
-             'resume at N//2.')
+        '--max-inflight-bytes', type=int, default=None,
+        help='Per-stream TX budget (aiomoqt tx_max_inflight_bytes): '
+             'producer pauses while one stream\'s un-transmitted bytes '
+             'exceed this. Default: aiomoqt default (1 MiB). '
+             'Pass 0 to disable.')
+    parser.add_argument(
+        '--max-queued-bytes', type=int, default=None,
+        help='Aggregate publisher byte budget across ALL streams '
+             '(QuicConfiguration.tx_max_queued_bytes): producer parks '
+             'at stream rollover while total un-transmitted TX bytes '
+             'exceed this. Steady-state latency ~ value / throughput. '
+             'Default: aiopquic default (4 MiB). Pass 0 to disable.')
+    parser.add_argument(
+        '-?', '--help', action='help',
+        help='Show this help message and exit')
     return parser.parse_args()
 
 
@@ -143,8 +154,13 @@ async def run_server(args):
         path="/",
         use_quic=args.quic,
         congestion_control_algorithm=args.cc_algo,
-        tx_max_inflight_bytes=(args.max_inflight_bytes
-                               if args.max_inflight_bytes > 0 else None),
+        # None = honor protocol default (16 MB); 0 = opt out.
+        **({'tx_max_inflight_bytes':
+            (None if args.max_inflight_bytes == 0
+             else args.max_inflight_bytes)}
+           if args.max_inflight_bytes is not None else {}),
+        **({'tx_max_queued_bytes': args.max_queued_bytes}
+           if args.max_queued_bytes is not None else {}),
     )
     server.register_handler(
         MOQTMessageType.SUBSCRIBE,
@@ -216,7 +232,6 @@ async def main():
         print("  or place cert.pem/key.pem in <project>/certs/")
         return
 
-    # Start server
     print("  Starting server...")
     quic_server = await run_server(args)
 
