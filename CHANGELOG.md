@@ -2,9 +2,13 @@
 
 ## v0.9.8 (unreleased)
 
+Pairs with aiopquic 0.3.8; dep floor `aiopquic>=0.3.7` → `aiopquic>=0.3.8`
+(needs 0.3.8's real-negotiated-ALPN reporting).
+
 ### Multi-version negotiation on auto-draft (raw QUIC)
 
-- When no `--draft` / `draft_version` is given, the raw-QUIC client now offers **every supported version's ALPN**, newest first (`["moqt-16", "moq-00"]`), instead of only `moq-00` (draft-14). A draft-16-only peer negotiates `moqt-16`; a draft-14 peer falls back to `moq-00`; the session sets its version from whichever ALPN the peer selects. Previously auto offered d14-only, so draft-16-only relays closed the connection (QUIC code 376) before SERVER_SETUP — the dominant failure against d16-only peers in the public moq-interop-runner. Explicit `--draft` is unchanged. (WebTransport auto already resolves to the latest draft as of 0.9.7; d14-only WT peers still require explicit `--draft 14`.)
+- When no `--draft` / `draft_version` is given, the raw-QUIC client now offers **every supported version's ALPN**, newest first (`["moqt-16", "moq-00"]`), instead of only `moq-00` (draft-14). A draft-16-only peer negotiates `moqt-16`; a draft-14 peer falls back to `moq-00`; the session sets its version from whichever ALPN the peer **actually** selected (via aiopquic 0.3.8's real-negotiated-ALPN reporting — offering multiple ALPNs is only correct once the negotiated one is known, not assumed to be the first offered). Previously auto offered d14-only, so draft-16-only relays closed the connection (QUIC code 376 = `no_application_protocol`) before SERVER_SETUP — the dominant failure against d16-only peers in the public moq-interop-runner. Explicit `--draft` is unchanged. (WebTransport auto already resolves to the latest draft as of 0.9.7; d14-only WT peers still require explicit `--draft 14`.)
+- Loopback fetch/join self-tests now pin an explicit draft (single ALPN per side) rather than relying on the accidental d14 auto-default; auto/multi-version negotiation is exercised against real relays. Server-side multi-ALPN acceptance (so an aiopquic server can take an auto client's multi-version offer) is deferred to the relay-column work.
 
 ## v0.9.7
 
