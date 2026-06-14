@@ -89,11 +89,19 @@ def parse_args():
         '--draft', type=int, default=16,
         help='MoQT draft version when --quic (default: 16)')
     parser.add_argument(
-        '-n', '--namespace', type=str, default='bench',
-        help='Track namespace (default: bench)')
+        '-n', '--namespace', type=str, default='aiomoqt',
+        help='Track namespace (default: aiomoqt)')
     parser.add_argument(
         '--trackname', type=str, default='track',
         help='Track name (default: track)')
+    parser.add_argument(
+        '--pub-ns', action='store_true',
+        help='On discovery (SUBSCRIBE_NAMESPACE) announce the namespace '
+             '(PUBLISH_NAMESPACE) only, not the track')
+    parser.add_argument(
+        '--pub-both', action='store_true',
+        help='On discovery announce BOTH namespace (PUBLISH_NAMESPACE) '
+             'and track (PUBLISH). Default: track (PUBLISH) only')
     parser.add_argument(
         '--cert', type=str, default=CERT,
         help='TLS certificate file')
@@ -139,6 +147,37 @@ async def _on_subscribe(session, msg, args):
         traceback.print_exc(file=sys.stderr)
         print("=== end ===\n", file=sys.stderr, flush=True)
         raise
+
+
+async def _on_subscribe_namespace(session, msg, args):
+    """Discovery responder: a subscriber sent SUBSCRIBE_NAMESPACE to
+    learn what we publish (it omitted --trackname). Ack it, then
+    announce the track with PUBLISH (and PUBLISH_NAMESPACE under
+    --pub-ns/--pub-both). The subscriber's await_publish learns the
+    trackname and replies PUBLISH_OK(forward=1), which the track's own
+    handler turns into generation. Keeps the track alive for the
+    session via wait_closed()."""
+    stream_id = session._bidi_streams.get(msg.request_id)
+    session.subscribe_namespace_ok(msg, stream_id=stream_id)
+    track = PublishedTrack(
+        session,
+        namespace=args.namespace,
+        trackname=args.trackname,
+        object_size=args.object_size,
+        group_size=args.group_size,
+        num_subgroups=args.streams,
+        rate=args.rate,
+    )
+    await track.publish(
+        announce_namespace=(args.pub_ns or args.pub_both),
+        publish_track=(not args.pub_ns or args.pub_both),
+        forward=0,
+    )
+    logger.info(f"Discovery: announced '{track.fqtn}' to subscriber")
+    try:
+        await track.wait_closed()
+    except asyncio.CancelledError:
+        pass
 
 
 async def main():
@@ -188,6 +227,9 @@ async def main():
     server.register_handler(
         MOQTMessageType.SUBSCRIBE,
         partial(_on_subscribe, args=args))
+    server.register_handler(
+        MOQTMessageType.SUBSCRIBE_NAMESPACE,
+        partial(_on_subscribe_namespace, args=args))
     quic_server = await server.serve()
 
     transport = "raw QUIC" if args.quic else "H3/WebTransport"
@@ -198,14 +240,17 @@ async def main():
     print(f"  objects:   {args.object_size}B x {args.streams} streams")
     print(f"  groups:    {args.group_size} objects/group")
     print(f"  rate:      {rate_s}")
-    print("\nConnect subscriber:")
+    print("\nConnect subscriber (track-name discovery; -t on the sub):")
+    # URL carries the path: raw QUIC has none; WT serves at "/" (the
+    # MOQTServer(path="/") above) — not "/moq". sub_bench needs -k for
+    # the self-signed loopback cert. With discovery, --trackname is
+    # optional; -n must match this server's namespace.
     if args.quic:
-        print(f"  python -m aiomoqt.examples.sub_bench "
-              f"moqt://{args.host}:{args.port} -t 30 -i 5 --draft {args.draft} -k")
+        url = f"moqt://{args.host}:{args.port}"
     else:
-        # WT path matches MOQTServer(path="/") above; no /moq suffix.
-        print(f"  python -m aiomoqt.examples.sub_bench "
-              f"https://{args.host}:{args.port}/ -t 30 -i 5 --draft {args.draft} -k")
+        url = f"https://{args.host}:{args.port}/"
+    print(f"  python -m aiomoqt.examples.sub_bench {url} "
+          f"-n {args.namespace} -t 30 -i 5 --draft {args.draft} -k")
 
     try:
         await asyncio.Event().wait()

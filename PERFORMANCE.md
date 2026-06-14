@@ -28,9 +28,13 @@ transport-layer baselines and runtime tuning (jemalloc, GSO) in
 # Single-process loopback (no relay; -q = raw QUIC, default WT)
 python -m aiomoqt.examples.loopback_bench -P 8 -s 4096 -g 200 -t 30 -q
 
-# Two-process (shell 1 publisher, shell 2 subscriber)
-python -m aiomoqt.examples.pub_server -P 8 -s 4096 -g 200 -r 35000
-python -m aiomoqt.examples.sub_bench https://localhost:4434/moq -i 5
+# Two-process (shell 1 publisher, shell 2 subscriber). The publisher
+# serves WT at "/" (raw QUIC with -q has no path); the subscriber needs
+# -k for the self-signed loopback cert. -t goes on the subscriber here
+# (pub_server runs until Ctrl-C). Omit --trackname to exercise track-
+# name discovery; -n must match the server's namespace.
+python -m aiomoqt.examples.pub_server -P 8 -s 4096 -g 200 -r 35000 -n aiomoqt
+python -m aiomoqt.examples.sub_bench https://localhost:4434/ -n aiomoqt --draft 16 -k -t 30 -i 5
 
 # Through a relay
 python -m aiomoqt.examples.pub_bench moqt://relay.ex.com -s 4096 -P 4 -r 8000 -t 30
