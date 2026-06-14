@@ -188,13 +188,20 @@ def _make_subscribe_handler(cache: FetchTestCache):
 # Helpers
 # ---------------------------------------------------------------------------
 async def _start_server(port: int, cache: FetchTestCache,
-                          use_quic: bool = True):
-    """Start a loopback MOQTServer with fetch + subscribe handlers."""
+                          use_quic: bool = True, draft: int = 14):
+    """Start a loopback MOQTServer with fetch + subscribe handlers.
+
+    draft is explicit (not auto): the loopback exercises one negotiated
+    version deterministically. Auto/multi-version negotiation is covered
+    against real relays — an aiopquic server takes a single ALPN, so an
+    auto client's multi-ALPN offer can't be matched locally.
+    """
     server = MOQTServer(
         host="localhost", port=port,
         certificate=CERT, private_key=KEY,
         path="/",
         use_quic=use_quic,
+        draft_version=draft,
     )
     server.register_handler(
         MOQTMessageType.SUBSCRIBE,
@@ -205,12 +212,14 @@ async def _start_server(port: int, cache: FetchTestCache,
     return await server.serve()
 
 
-async def _connect_client(port: int, use_quic: bool = True):
-    """Create a client connected to localhost."""
+async def _connect_client(port: int, use_quic: bool = True, draft: int = 14):
+    """Create a client connected to localhost (explicit draft — see
+    _start_server)."""
     return MOQTClient(
         "localhost", port,
         path="/",
         use_quic=use_quic,
+        draft_version=draft,
         verify_tls=False,
     )
 

@@ -104,7 +104,15 @@ class MOQTClient(MOQTPeer):
                 if self.draft_version is not None:
                     alpn = [moqt_alpn_for_version(self.draft_version)]
                 else:
-                    alpn = [MOQT_ALPN]
+                    # No explicit draft: offer every supported version's
+                    # ALPN, newest first, so a d16-only peer negotiates
+                    # moqt-16 and a d14 peer falls back to moq-00. The
+                    # session sets its version from whichever ALPN the
+                    # peer selects (version-from-ALPN). Without this, auto
+                    # offered only moq-00 (d14) and d16-only relays closed
+                    # the connection (376) before SERVER_SETUP.
+                    alpn = [moqt_alpn_for_version(v)
+                            for v in sorted(MOQT_VERSIONS, reverse=True)]
                 cfg = QuicConfiguration(
                     alpn_protocols=alpn, is_client=True,
                     max_data=2**24, max_stream_data=2**24,
