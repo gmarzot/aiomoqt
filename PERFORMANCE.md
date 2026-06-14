@@ -150,3 +150,34 @@ Test cases: `setup-only`, `announce-only`, `publish-namespace-done`,
 `subscribe-error`, `announce-subscribe`, `subscribe-before-announce`,
 plus `fetch` and `join` probes (not in the default matrix — most
 relays do not implement these yet).
+
+## Appendix: example loopback runs (single box)
+
+Raw results from one machine, for shape — not averaged, not a
+benchmark claim. `loopback_bench`, single process (publisher and
+subscriber share the host), no relay.
+
+**Box:** OCI Ampere A1 (free tier), 4 vCPU aarch64, Ubuntu, CPython
+3.14.6 (no WSL). aiopquic/aiomoqt built on-box.
+
+| transport | object | rate | result |
+|---|---|---|---|
+| WT  | 3100 B | max     | 1.83 Gbps, p50 14.3 ms, p99 31.8 ms, 0 loss |
+| raw | 3100 B | max     | 1.99 Gbps, p50 7.2 ms,  p99 9.5 ms,  0 loss |
+| raw | 2048 B | max     | 1.37 Gbps, p50 61.1 ms, p99 66.6 ms, 0 loss |
+| raw | 2048 B | 80k/s   | 1.24 Gbps, p50 0.4 ms,  p99 0.5 ms,  0 loss |
+| WT  | 2048 B | 80k/s   | 1.11 Gbps, p50 0.3 ms,  p99 0.6 ms,  0 loss |
+| WT  | 4096 B | max, -P8 -g200 | 1.98 Gbps, p50 2.1 ms, p99 4.1 ms, 0 loss |
+| raw | 4096 B | max, -P8 -g200 | 2.14 Gbps, p50 3.1 ms, p99 3.8 ms, 0 loss |
+
+Notes on reading these:
+- **Unpaced (`max`) latency is queue depth, not stack latency.** Same
+  2048 B config: unpaced p50 61 ms vs paced (`-r 80000`) p50 0.4 ms —
+  the difference is the TX budget the unpaced producer keeps full (see
+  the paced-vs-unpaced section above), not stack overhead.
+- The paced p50/p99 (~0.3–0.6 ms) is the stack's latency floor on this
+  box; unpaced numbers trade that for throughput by design.
+- Per-core bound: single-stream throughput here (~1.8–2.0 Gbps) is
+  below x86 desktop figures — single-stream loopback is CPU-bound on
+  one core, and these are small shared cores. AES-GCM also differs:
+  picoquic's x86 Fusion path is unavailable on aarch64.
