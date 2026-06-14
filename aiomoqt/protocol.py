@@ -1957,9 +1957,14 @@ class _MOQTSessionMixin:
         else:
             selected_version = msg.selected_version
             if selected_version is None:
-                # Draft-16+: version already negotiated via ALPN
+                # Draft-16+ carries no version in ServerSetup: it was
+                # negotiated out-of-band — QUIC ALPN ("moqt-NN") for raw
+                # QUIC, WT-Available-Protocols for WebTransport. These are
+                # distinct mechanisms; don't conflate them.
                 selected_version = self._moqt_version
-                logger.info(f"MOQT event: d16+ ServerSetup (version from ALPN: 0x{selected_version:x})")
+                _src = ("ALPN" if getattr(self, 'use_quic', False)
+                        else "WT-Available-Protocols")
+                logger.info(f"MOQT event: d16+ ServerSetup (version from {_src}: 0x{selected_version:x})")
             if selected_version not in MOQT_VERSIONS:
                 error = f"MOQT event: unsupported version in ServerSetup {hex(selected_version)}"
                 logger.debug(error)

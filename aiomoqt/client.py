@@ -9,7 +9,7 @@ from .protocol import (
     MOQTPeer, MOQTSessionQuic, MOQTSessionWTClient,
     DEFAULT_TX_MAX_INFLIGHT_BYTES,
 )
-from .types import moqt_alpn_for_version, MOQT_ALPN
+from .types import moqt_alpn_for_version, MOQT_ALPN, MOQT_VERSIONS
 from .context import set_moqt_ctx_version
 from .utils.logger import *
 
@@ -179,16 +179,21 @@ class MOQTClient(MOQTPeer):
             socket_buffer_size=(self.socket_buffer_size or 0),
             qlog_dir=wt_cfg.qlog_dir,
         )
-        # MoQT version negotiation over WebTransport (per moq-transport-16
-        # §3.1): drafts >= 15 carry the version in WT-Available-Protocols
-        # ("moqt-NN") rather than CLIENT_SETUP's versions array. d14 and
-        # earlier use the legacy in-band CLIENT_SETUP path and advertise
-        # nothing here.
+        # MoQT version over WebTransport: the ALPN is "h3", so unlike raw
+        # QUIC it carries no MoQT version — we resolve it here. Explicit
+        # draft_version wins; otherwise default to the latest supported
+        # draft (auto). Drafts >= 15 advertise the version in
+        # WT-Available-Protocols ("moqt-NN", per moq-transport-16 §3.1);
+        # d14 uses the legacy in-band CLIENT_SETUP path. Either way the
+        # encoding context is set to match so the peer's ServerSetup
+        # (and every message after) parses under the right draft.
+        wt_version = (self.draft_version if self.draft_version is not None
+                      else max(MOQT_VERSIONS))
+        set_moqt_ctx_version(wt_version)
         wt_protocols = None
-        if self.draft_version is not None:
-            draft_major = self.draft_version & 0xFF
-            if draft_major >= 15:
-                wt_protocols = [f"moqt-{draft_major:d}"]
+        draft_major = wt_version & 0xFF
+        if draft_major >= 15:
+            wt_protocols = [f"moqt-{draft_major:d}"]
         session = MOQTSessionWTClient(
             transport,
             self.host, self.port, self.path or "",
@@ -196,6 +201,11 @@ class MOQTClient(MOQTPeer):
             wt_available_protocols=wt_protocols,
             session=self,
         )
+        # Stamp the resolved MoQT version: over WT the ALPN is "h3" so
+        # the session never learns it from ProtocolNegotiated (as raw
+        # QUIC does). Without this the d16 ServerSetup handler reads the
+        # d14 default from _moqt_version and reverts the context.
+        session._moqt_version = wt_version
         # Stamp the aggregate TX gate budget and per-stream ring cap
         # on the WT session (the client constructs the session
         # directly rather than via connect_webtransport, so the
