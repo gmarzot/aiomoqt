@@ -267,6 +267,13 @@ git clone https://github.com/gmarzot/aiomoqt.git
 cd aiomoqt
 python3 -m venv .venv && source .venv/bin/activate
 uv pip install -e ".[test]"    # or: pip install -e ".[test]"
+
+# Self-signed cert for the loopback server (loopback_bench, pub_server,
+# and the test_loopback_* suites; skipped if certs/ is absent). One time:
+mkdir -p certs && openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+  -keyout certs/key.pem -out certs/cert.pem -subj "/CN=localhost" \
+  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+
 pytest aiomoqt/tests/
 ```
 

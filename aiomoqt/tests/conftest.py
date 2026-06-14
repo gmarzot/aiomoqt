@@ -1,3 +1,5 @@
+import os
+import subprocess
 from dataclasses import fields
 
 import pytest
@@ -7,6 +9,32 @@ from aiomoqt.context import set_moqt_ctx_version, get_moqt_ctx_version
 from aiomoqt.types import (
     MOQT_CUR_VERSION, MOQT_VERSION_DRAFT14, MOQT_VERSION_DRAFT16,
 )
+
+
+def pytest_configure(config):
+    """Generate a self-signed loopback cert if absent so the
+    test_loopback_* suites run on a fresh clone without a manual step.
+
+    Runs at configure time (before collection) so the modules'
+    cert-existence skipif sees the freshly written certs. Best-effort:
+    if openssl is missing or fails, the certs stay absent and those
+    suites skip exactly as before — no hard dependency, no failure."""
+    certs_dir = os.path.realpath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "certs"))
+    cert = os.path.join(certs_dir, "cert.pem")
+    key = os.path.join(certs_dir, "key.pem")
+    if os.path.exists(cert) and os.path.exists(key):
+        return
+    os.makedirs(certs_dir, exist_ok=True)
+    try:
+        subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+             "-days", "3650", "-keyout", key, "-out", cert,
+             "-subj", "/CN=localhost",
+             "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1"],
+            check=True, capture_output=True)
+    except Exception:
+        pass  # openssl absent/failed → loopback suites skip as before
 
 
 @pytest.fixture(autouse=True)
