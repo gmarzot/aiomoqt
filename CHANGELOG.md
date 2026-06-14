@@ -1,6 +1,45 @@
 # Changelog
 
-## v0.9.6 (unreleased)
+## v0.9.7 (unreleased)
+
+Pairs with aiopquic 0.3.7; dep floor `aiopquic>=0.3.6` → `aiopquic>=0.3.7`.
+
+### Saturation / stream-churn under load
+
+- Two-budget producer model: per-stream `tx_max_inflight_bytes` (1 MiB) over aiopquic's aggregate `tx_max_queued_bytes` gate (4 MiB). Bounded RSS and latency under high group/stream churn on both transports.
+
+### Teardown livelock fix
+
+- Writes to a dead session/connection raise `CancelledError` instead of spinning, so producer tasks unwind promptly at shutdown (pairs with the aiopquic closed-connection suspend fix).
+
+### Publisher lifecycle + liveness
+
+- PUBLISH_DONE lifecycle guard: a track that has sent SubscribeDone no longer generates objects (ends "publish after done"); d16 request-id fallback when the subscribe request-id is absent.
+- `keep_alive_interval` and `socket_buffer_size` passthrough to the transport.
+
+### CLI uniformity (example tools)
+
+- `--max-queued-bytes` / `--max-inflight-bytes` across the bench tools.
+- Transport flag standardized to `-q` / `--quic` / `--use-quic`.
+- `-h` = host, `-?` = help (mysql/psql convention).
+
+### Interop
+
+- Interop client per-case timeout hardening (absorbs WAN / cold-relay latency; ships in the GHCR image the public moq-interop-runner uses).
+- Regression harness: per-relay `compat` forwarding; catalog cleanup (quicr-west → d16-only + `libquicr` compat; moqtail disabled pending a known WT path).
+
+### Bench harness (adaptive_bench)
+
+- Batched, self-healing subscriber workers: one process hosts K = `--step-subs` subscriptions and reopens individual drops internally — drives thousands of subscribers without one OS process per sub.
+- Subs-mode publisher isolated into its own process (decoupled from the controller event loop).
+- Three-timescale knobs (`--join-rate` / `--stagger` / `--interval`); loop-lag probe (`AIOMOQT_LOOP_LAG=1`); uvloop opt-in.
+
+### Diagnostics / docs
+
+- Diagnostic audit: removed the `AIOMOQT_MON` backpressure monitor and `DESYNC_TRACE`.
+- Benchmark/performance content extracted to PERFORMANCE.md.
+
+## v0.9.6
 
 Pairs with [aiopquic 0.3.6](https://pypi.org/project/aiopquic/0.3.6/);
 dep floor `aiopquic>=0.3.5` → `aiopquic>=0.3.6` (Lens B primitives,
