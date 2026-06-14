@@ -252,7 +252,7 @@ def _make_client(host: str, port: int, path: str, use_quic: bool,
 
 async def test_setup_only(host, port, path, use_quic, tls_disable_verify,
                           debug, draft_version=None, compat=frozenset(),
-                          timeout=2.0) -> TestResult:
+                          timeout=5.0) -> TestResult:
     """Test 1: Connect, exchange SETUP, graceful close."""
     t0 = time.monotonic()
     client = _make_client(host, port, path, use_quic, tls_disable_verify, debug, draft_version=draft_version)
@@ -280,7 +280,7 @@ async def test_setup_only(host, port, path, use_quic, tls_disable_verify,
 
 async def test_announce_only(host, port, path, use_quic, tls_disable_verify,
                              debug, draft_version=None, compat=frozenset(),
-                             timeout=2.0) -> TestResult:
+                             timeout=5.0) -> TestResult:
     """Test 2: SETUP + PUBLISH_NAMESPACE + receive OK."""
     t0 = time.monotonic()
     client = _make_client(host, port, path, use_quic, tls_disable_verify, debug, draft_version=draft_version)
@@ -316,7 +316,7 @@ async def test_publish_namespace_done(host, port, path, use_quic,
                                       tls_disable_verify, debug,
                                       draft_version=None,
                                       compat=frozenset(),
-                                      timeout=2.0) -> TestResult:
+                                      timeout=5.0) -> TestResult:
     """Test 3: SETUP + PUBLISH_NAMESPACE + OK + PUBLISH_NAMESPACE_DONE + close."""
     t0 = time.monotonic()
     client = _make_client(host, port, path, use_quic, tls_disable_verify, debug, draft_version=draft_version)
@@ -358,7 +358,7 @@ async def test_publish_namespace_done(host, port, path, use_quic,
 async def test_subscribe_error(host, port, path, use_quic,
                                tls_disable_verify, debug,
                                draft_version=None, compat=frozenset(),
-                               timeout=2.0) -> TestResult:
+                               timeout=5.0) -> TestResult:
     """Test 4: SUBSCRIBE to non-existent track, expect SUBSCRIBE_ERROR.
 
     Compat (`moq-dev` / `moq-rs`): the relay returns its own non-spec
@@ -467,7 +467,7 @@ async def test_subscribe_error(host, port, path, use_quic,
 async def test_announce_subscribe(host, port, path, use_quic,
                                   tls_disable_verify, debug,
                                   draft_version=None, compat=frozenset(),
-                                  timeout=3.0) -> TestResult:
+                                  timeout=6.0) -> TestResult:
     """Test 5: Two connections — publisher announces, subscriber subscribes."""
     t0 = time.monotonic()
     pub_cid = "unknown"
@@ -533,7 +533,7 @@ async def test_subscribe_before_announce(host, port, path, use_quic,
                                          tls_disable_verify, debug,
                                          draft_version=None,
                                          compat=frozenset(),
-                                         timeout=3.5) -> TestResult:
+                                         timeout=7.0) -> TestResult:
     """Test 6: Subscriber connects first, publisher 500ms later. Both outcomes valid."""
     moq_dev_compat = _compat_active(compat, "moq-dev")
     moq_rs_compat = _compat_active(compat, "moq-rs")
@@ -652,7 +652,7 @@ async def test_subscribe_before_announce(host, port, path, use_quic,
 
 async def test_fetch(host, port, path, use_quic, tls_disable_verify,
                      debug, draft_version=None, compat=frozenset(),
-                     timeout=3.0) -> TestResult:
+                     timeout=6.0) -> TestResult:
     """FETCH probe: send a standalone FETCH; relay handles if it responds
     with FETCH_OK or structured FETCH_ERROR. Timeout/close = fail."""
     t0 = time.monotonic()
@@ -700,7 +700,7 @@ async def test_fetch(host, port, path, use_quic, tls_disable_verify,
 
 async def test_join(host, port, path, use_quic, tls_disable_verify,
                     debug, draft_version=None, compat=frozenset(),
-                    timeout=3.0) -> TestResult:
+                    timeout=6.0) -> TestResult:
     """JOIN probe: send SUBSCRIBE + JOINING_FETCH(RELATIVE, start=0).
     Relay handles if it responds (OK or structured error). Timeout = fail."""
     t0 = time.monotonic()

@@ -238,11 +238,13 @@ def _loopback_fetch(log_dir: Path) -> tuple[str, str]:
 # Interop-tier runners (per relay × transport × draft)
 # ---------------------------------------------------------------------------
 def _relay_ctrl_msg(url: str, draft: int, insecure: bool,
-                    log: Path) -> tuple[str, str]:
+                    compat: str, log: Path) -> tuple[str, str]:
     cmd = [sys.executable, "-m", "aiomoqt.examples.moq_interop_client",
            "-r", url, "--draft", str(draft)]
     if insecure:
         cmd.append("--tls-disable-verify")
+    if compat:
+        cmd += ["--compat", compat]
     ok, _ = _run(cmd, log, 90)
     if not ok:
         return "FAIL", "timeout"
@@ -344,6 +346,10 @@ def _run_relay_matrix(relay: dict, enabled: set[str],
     disabled = set(relay.get("disabled_suites", []))
     pub_mode = relay.get("pub_mode", "publish")
     insecure = bool(relay.get("insecure", False))
+    # Per-relay compat tolerances forwarded to the interop client for
+    # known non-spec relay behaviors (e.g. libquicr SUBSCRIBE_OK for a
+    # nonexistent track). Tolerated outcomes are annotated, not hidden.
+    compat_csv = ",".join(relay.get("compat", []))
     rname = relay["name"]
 
     def _dispatch(suite: str, label_suffix: str, tag: str, slug: str,
@@ -378,7 +384,7 @@ def _run_relay_matrix(relay: dict, enabled: set[str],
 
             if "relay-ctrl-msg" in enabled:
                 _dispatch("relay-ctrl-msg", "", tag, slug,
-                          _relay_ctrl_msg, url, draft, insecure)
+                          _relay_ctrl_msg, url, draft, insecure, compat_csv)
             if "relay-pub-sub" in enabled:
                 tn = f"rr-{rname}-{draft}"
                 _dispatch("relay-pub-sub", f"[{pub_mode}]", tag, slug,
