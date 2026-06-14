@@ -1662,7 +1662,6 @@ def _print_summary(state: BenchState, controller, samples: int, args):
 
 
 async def main():
-    from aiomoqt.utils.url import parse_relay_url
     args = parse_args()
     _print_banner(args)
 
@@ -1840,6 +1839,8 @@ async def main():
     server = None
     pub_task = None
     sub_task = None
+    pub_proc = None       # subs-mode publisher process (isolated loop)
+    pub_stop = None
     try:
         if relay_mode or (args.mode == "bw" and args.mp_loopback):
             if args.mode == "bw" and pub_proc is not None and sub_proc is not None:
@@ -1874,15 +1875,68 @@ async def main():
                 sub_proc.start()
                 await asyncio.sleep(0.3)
             else:
-                # Subs mode: in-process publisher + sub workers spawned
-                # by SubsActuator.
-                relay = parse_relay_url(args.relay_url)
-                host, port = relay.host, relay.port
-                path = relay.path or ""
-                use_quic = relay.use_quic
-                verify = not args.insecure
-                pub_task = asyncio.create_task(run_publisher_client(
-                    host, port, path, use_quic, verify, args, state))
+                # Subs mode: publisher in its OWN process. As an
+                # in-process task it shared the parent event loop with
+                # the controller's per-worker stats drain; past ~600
+                # subs that drain monopolized the loop (measured loop
+                # lag spiking to 500ms+), starved the publisher task,
+                # and the relay reset it. Isolating it removes the
+                # coupling. Sub workers are still spawned by
+                # SubsActuator; the publisher runs at a fixed
+                # --sub-mbps rate (no rate_queue updates needed).
+                import multiprocessing as mp
+                from aiomoqt.examples._bench_workers import pub_worker_entry
+                pub_stop = mp.Event()
+                pub_events_q = mp.Queue(maxsize=10000)
+                pub_rate_q = mp.Queue(maxsize=8)
+                mp_cleanup_queues.extend([pub_events_q, pub_rate_q])
+                pub_cfg = dict(
+                    relay_url=args.relay_url,
+                    namespace=args.namespace,
+                    trackname=args.trackname,
+                    draft=args.draft,
+                    insecure=args.insecure,
+                    force_quic=False,
+                    object_size=args.scenario.object_size,
+                    group_size=args.group_size,
+                    num_subgroups=args.scenario.subgroups,
+                    initial_rate_ops=args.scenario.aggregate_ops(
+                        args.sub_mbps),
+                    pub_ns=args.pub_ns,
+                    pub_both=args.pub_both,
+                    debug=args.debug,
+                    no_uvloop=args.no_uvloop,
+                    keep_alive_interval=args.keepalive,
+                )
+                pub_proc = mp.Process(
+                    target=pub_worker_entry,
+                    args=(pub_cfg, pub_stop, pub_rate_q, pub_events_q),
+                    daemon=True,
+                )
+                pub_proc.start()
+                # Wait for 'published' before subs subscribe, else the
+                # relay races subscribe against announce.
+                from queue import Empty
+                deadline = time.monotonic() + 5.0
+                published = False
+                while time.monotonic() < deadline and not published:
+                    # Non-blocking poll: get_nowait + await sleep yields
+                    # to the loop. A blocking get(timeout=) would stall
+                    # the event loop for the whole deadline if the
+                    # publisher is slow (or the relay is down).
+                    try:
+                        ev = pub_events_q.get_nowait()
+                    except Empty:
+                        await asyncio.sleep(0.1)
+                        continue
+                    if (ev.get("kind") == "pub_health"
+                            and ev.get("state") == "published"):
+                        published = True
+                        break
+                if not published:
+                    print("  warning: publisher didn't report "
+                          "'published' within 5s; subscribing anyway "
+                          "— may race", file=sys.stderr)
                 await asyncio.sleep(0.3)
         else:
             args.port = loopback_port  # server code still reads args.port
@@ -1949,6 +2003,20 @@ async def main():
             await actuator.shutdown()
         except Exception:
             pass
+        # Subs-mode publisher process: signal stop, then join/terminate.
+        if pub_stop is not None:
+            try:
+                pub_stop.set()
+            except Exception:
+                pass
+        if pub_proc is not None:
+            try:
+                pub_proc.join(timeout=5.0)
+                if pub_proc.is_alive():
+                    pub_proc.terminate()
+                    pub_proc.join(timeout=2.0)
+            except Exception:
+                pass
         # BW-mode mp queues: detach feeder threads so atexit doesn't
         # block on Queue.put_thread joins after a pub/sub child has
         # been terminated mid-write.
