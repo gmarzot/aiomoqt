@@ -1,6 +1,12 @@
 # Changelog
 
-## v0.9.7 (unreleased)
+## v0.9.8 (unreleased)
+
+### Multi-version negotiation on auto-draft (raw QUIC)
+
+- When no `--draft` / `draft_version` is given, the raw-QUIC client now offers **every supported version's ALPN**, newest first (`["moqt-16", "moq-00"]`), instead of only `moq-00` (draft-14). A draft-16-only peer negotiates `moqt-16`; a draft-14 peer falls back to `moq-00`; the session sets its version from whichever ALPN the peer selects. Previously auto offered d14-only, so draft-16-only relays closed the connection (QUIC code 376) before SERVER_SETUP — the dominant failure against d16-only peers in the public moq-interop-runner. Explicit `--draft` is unchanged. (WebTransport auto already resolves to the latest draft as of 0.9.7; d14-only WT peers still require explicit `--draft 14`.)
+
+## v0.9.7
 
 Pairs with aiopquic 0.3.7; dep floor `aiopquic>=0.3.6` → `aiopquic>=0.3.7`.
 
