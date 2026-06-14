@@ -479,21 +479,24 @@ class BWActuator:
 class SubsActuator:
     """Actuator for subscriber-ramp mode.
 
-    level == commanded count of live subscribers. apply(level) spawns
-    or terminates multiprocessing workers to reach round(level) healthy
-    subs. observe() drains events from the worker queue and aggregates:
+    level == targeted count of live subscribers. Subs are hosted in
+    BATCHES: each worker process runs K = --step-subs subscriptions and
+    self-heals individual drops internally, so the relay still sees one
+    QUIC connection per sub without one OS process per sub. apply(level)
+    spawns/terminates whole workers to reach ceil(level / K). observe()
+    drains batch_stats events and aggregates:
 
-      rx_mbps      = sum of per-sub rx_mbps (from last 1s each)
-      latency      = worst-sub p50 (SLA is 'no sub is unhappy')
-      loss_pct     = max per-sub loss_pct
+      rx_mbps      = sum of per-worker batch rx_mbps (last 1s each)
+      latency      = worst batch p90 across workers
+      loss_pct     = max per-batch loss_pct
       shortfall    = active_subs < target_subs for 2+ intervals
-      failed_subs  = number of subscribe_failed / stream_reset events
-                     since the last observe()
-      active_subs  = subs that posted stats in the last window
+      failed_subs  = subs lost to reaped (dead/silent) workers since
+                     the last observe()
+      active_subs  = sum of workers' currently-subscribed slot counts
 
-    Each sub is its own Process (GIL-isolated). Publisher stays
-    in-process in the parent (single publisher, fixed rate from
-    --sub-mbps — relay does fan-out, so pub is not the bottleneck).
+    Each worker is GIL-isolated. The publisher runs in its own process
+    (spawned by the subs-mode entrypoint) so its event loop is never
+    starved by the controller's batch-stats drain.
     """
     unit = "subs"
 
@@ -529,47 +532,52 @@ class SubsActuator:
         self.stagger = stagger
         self.no_uvloop = no_uvloop
         self.keep_alive_interval = keep_alive_interval
+        # Each worker process hosts a BATCH of subscriptions and
+        # self-heals individual drops internally. --step-subs doubles as
+        # the batch size K: one worker == one group of K subs, so the
+        # controller adding a group per --join-rate spawns one worker.
+        self.batch_size = max(1, int(step_subs))
 
         import multiprocessing as mp
         self._mp = mp
         self._events_q = mp.Queue(maxsize=10000)
-        self._workers: dict = {}    # sub_id -> (Process, stop_event)
-        self._next_sub_id = 0
-        # Targeted setpoint — the count the controller is aiming for.
-        # Distinct from len(self._workers): reaping a dead sub drops
-        # the live count but NOT the setpoint, so the next apply()
-        # spawns a replacement. observe() reports against this, not
-        # the live count, so a lost sub never silently lowers the
-        # target.
+        self._workers: dict = {}    # worker_id -> (Process, stop_event)
+        self._next_worker_id = 0
+        # Targeted setpoint, in SUBS — the count the controller aims for.
+        # Distinct from hosted capacity (workers x K): reaping a dead
+        # worker drops live subs but NOT the setpoint, so the next
+        # apply() respawns. observe() reports against this, not the live
+        # count, so a lost worker never silently lowers the target.
         self._targeted = float(start_subs)
-        # Per-sub rolling stats (last 'stats' event received):
-        self._latest_stats: dict = {}
+        # Per-worker latest batch_stats event:
+        self._latest_batch: dict = {}
         # Lifecycle counters for summary + shortfall detection:
         self._subscribed_ever: set = set()
         self._failed_window = 0     # resets each observe()
-        self._last_stats_t: dict = {}    # last 'stats' event time per sub
-        self._last_bytes_t: dict = {}    # last time we saw rx_bytes > 0 per sub
-        self._spawned_t: dict = {}       # spawn time per sub (startup grace)
+        self._last_batch_t: dict = {}    # last batch_stats time per worker
+        self._last_bytes_t: dict = {}    # last batch rx_bytes>0 per worker
+        self._spawned_t: dict = {}       # spawn time per worker (grace)
         self._shortfall_streak = 0
         self._t_last_observe = time.monotonic()
 
     def _reap_dead(self) -> int:
-        """Remove workers whose process died or whose stats went
-        silent, so apply() respawns replacements. Without this a
-        single lost subscriber pins active < targeted forever: the
-        worker dict still counts it, apply() sees nothing to spawn,
-        and the controller holds on permanent shortfall."""
+        """Remove workers whose process died or whose batch stats went
+        silent, so apply() respawns replacements. Individual sub drops
+        are self-healed inside the worker; only a dead/silent worker
+        process reaches here. Without this a lost worker pins active <
+        targeted forever and the controller holds on permanent
+        shortfall."""
         now = time.monotonic()
         dead = []
-        for sid, (p, _ev) in self._workers.items():
+        for wid, (p, _ev) in self._workers.items():
             if not p.is_alive():
-                dead.append(sid)
+                dead.append(wid)
                 continue
-            t = self._last_stats_t.get(sid)
+            t = self._last_batch_t.get(wid)
             if t is not None and now - t > 15.0:
-                dead.append(sid)
-        for sid in dead:
-            self._kill_sub(sid)
+                dead.append(wid)
+        for wid in dead:
+            self._kill_worker(wid)
         return len(dead)
 
     async def apply(self, level: float) -> None:
@@ -577,26 +585,22 @@ class SubsActuator:
         target = max(int(self.min_level), min(int(self.max_level),
                                               int(round(level))))
         self._targeted = float(target)
-        # Spawn-up is BOUNDED per call to initial_step (one group): the
-        # controller adds a group every --join-rate, so an unbounded
-        # respawn can't fire dozens of simultaneous handshakes at a
-        # struggling relay (the death-spiral amplifier). Within the
-        # group, consecutive handshakes are spaced by --stagger.
-        spawn_budget = max(1, int(self.initial_step))
-        spawned_this_call = 0
-        while len(self._workers) < target and spawn_budget > 0:
-            spawn_budget -= 1
-            # --stagger: gap between individual joins within this group
-            # (first is immediate) so a group doesn't fire simultaneous
-            # QUIC Initials at the relay.
-            if spawned_this_call and self.stagger > 0:
-                await asyncio.sleep(self.stagger)
-            spawned_this_call += 1
-            sid = self._next_sub_id
-            self._next_sub_id += 1
+        # Workers host K subs each; cover the targeted sub count by
+        # ceil(target / K) worker processes.
+        workers_target = -(-target // self.batch_size)
+        # Spawn-up is BOUNDED to one worker (one group of K) per call:
+        # the controller adds a group every --join-rate, so an unbounded
+        # respawn can't fire dozens of simultaneous batches at a
+        # struggling relay (the death-spiral amplifier). Each worker
+        # spaces its own K handshakes internally by --stagger.
+        if len(self._workers) < workers_target:
+            wid = self._next_worker_id
+            self._next_worker_id += 1
             stop_ev = self._mp.Event()
             cfg = dict(
-                sub_id=sid,
+                worker_id=wid,
+                batch_size=self.batch_size,
+                stagger=self.stagger,
                 relay_url=self.relay_url,
                 namespace=self.namespace,
                 trackname=self.trackname,
@@ -607,22 +611,22 @@ class SubsActuator:
                 no_uvloop=self.no_uvloop,
                 keep_alive_interval=self.keep_alive_interval,
             )
-            from aiomoqt.examples._bench_workers import sub_worker_entry
+            from aiomoqt.examples._bench_workers import sub_batch_worker_entry
             p = self._mp.Process(
-                target=sub_worker_entry,
+                target=sub_batch_worker_entry,
                 args=(cfg, stop_ev, self._events_q),
                 daemon=True,
             )
             p.start()
-            self._workers[sid] = (p, stop_ev)
-            self._spawned_t[sid] = time.monotonic()
+            self._workers[wid] = (p, stop_ev)
+            self._spawned_t[wid] = time.monotonic()
         # wind down
-        while len(self._workers) > target:
-            sid = next(iter(self._workers))
-            self._kill_sub(sid)
+        while len(self._workers) > workers_target:
+            wid = next(iter(self._workers))
+            self._kill_worker(wid)
 
-    def _kill_sub(self, sid):
-        proc, stop_ev = self._workers.pop(sid, (None, None))
+    def _kill_worker(self, wid):
+        proc, stop_ev = self._workers.pop(wid, (None, None))
         if proc is None:
             return
         stop_ev.set()
@@ -631,13 +635,13 @@ class SubsActuator:
         if proc.is_alive():
             proc.terminate()
             proc.join(timeout=1.0)
-        self._latest_stats.pop(sid, None)
-        self._last_stats_t.pop(sid, None)
-        self._last_bytes_t.pop(sid, None)
-        self._spawned_t.pop(sid, None)
+        self._latest_batch.pop(wid, None)
+        self._last_batch_t.pop(wid, None)
+        self._last_bytes_t.pop(wid, None)
+        self._spawned_t.pop(wid, None)
 
     async def observe(self) -> Signal:
-        # Drain all pending events from workers.
+        # Drain all pending batch_stats events from workers.
         from queue import Empty
         failed_this_window = 0
         while True:
@@ -645,71 +649,62 @@ class SubsActuator:
                 msg = self._events_q.get_nowait()
             except Empty:
                 break
-            kind = msg.get('kind')
-            sid = msg.get('sub_id')
-            if kind == 'stats':
-                self._latest_stats[sid] = msg
-                self._last_stats_t[sid] = time.monotonic()
-                if msg.get('rx_bytes', 0) > 0:
-                    self._last_bytes_t[sid] = self._last_stats_t[sid]
-            elif kind == 'health':
-                state = msg.get('state')
-                if state == 'subscribed':
-                    self._subscribed_ever.add(sid)
-                elif state in ('subscribe_failed', 'stream_reset'):
-                    failed_this_window += 1
-                    # Reap the process — it's done.
-                    proc, stop_ev = self._workers.pop(sid, (None, None))
-                    if proc is not None:
-                        stop_ev.set()
-                        proc.join(timeout=0.5)
+            if msg.get('kind') != 'batch_stats':
+                continue
+            wid = msg.get('worker_id')
+            self._latest_batch[wid] = msg
+            self._last_batch_t[wid] = time.monotonic()
+            if msg.get('rx_bytes', 0) > 0:
+                self._last_bytes_t[wid] = self._last_batch_t[wid]
+            if msg.get('active', 0) > 0:
+                self._subscribed_ever.add(wid)
 
-        # Aggregate from latest stats per sub. "Active" = delivered bytes
-        # recently. A worker whose QUIC conn went idle can still post
-        # zero-byte stats events and look alive without actually
-        # contributing — those subs must not be counted as delivering.
+        # "Active" subs = subs delivering recently. A worker self-heals
+        # individual drops, so its reported active count is the truth of
+        # how many of its K slots are currently subscribed; we still gate
+        # the worker on recent bytes so a stalled connection's batch
+        # isn't counted as delivering.
         now = time.monotonic()
         # ONE window governs both "active" (counted as delivering) and
-        # "kept" (not reaped). Using a single window eliminates the
-        # limbo band — a sub that is neither active nor reaped pins
-        # shortfall forever. Scaled with interval (a sub that delivered
-        # within the last measurement window is active) with a floor so
-        # sub-second intervals don't reap on normal jitter.
+        # "kept" (not reaped) — eliminates the limbo band where a worker
+        # is neither active nor reaped and pins shortfall forever. Scaled
+        # with interval, floored so sub-second intervals don't reap on
+        # normal jitter.
         keep_window = max(3.0, 1.5 * self.interval_s)
         bytes_cutoff = now - keep_window
-        active_ids = [sid for sid, t in self._last_bytes_t.items()
-                      if t >= bytes_cutoff and sid in self._workers]
+        live_ids = [wid for wid, t in self._last_bytes_t.items()
+                    if t >= bytes_cutoff and wid in self._workers]
 
         # Startup grace is a FIXED floor, not interval-scaled: QUIC
-        # handshake + SUBSCRIBE is a ~constant cost, so a small
-        # --interval must not reap a replacement before it can come
-        # online (that produced a respawn-churn that never converged).
-        startup_grace = max(8.0, keep_window)
+        # handshake + SUBSCRIBE is a ~constant cost (and a batch opens K
+        # of them staggered), so a small --interval must not reap a
+        # worker before it can come online.
+        startup_grace = max(8.0, keep_window
+                            + self.batch_size * max(0.0, self.stagger))
         starve_cutoff = now - keep_window
         starved = []
-        for sid, (proc, stop_ev) in list(self._workers.items()):
-            last_bytes = self._last_bytes_t.get(sid)
-            # REAL spawn time — never refreshed by stats events. The old
-            # last-stats proxy made a never-delivering zombie immortal:
-            # it kept posting zero-byte stats, perpetually resetting its
-            # own grace, so it was never reaped and never active (the
-            # permanent "one sub short" hold).
-            spawned = self._spawned_t.get(sid, now)
-            # Skip freshly spawned subs still inside the startup grace.
+        for wid, (proc, stop_ev) in list(self._workers.items()):
+            last_bytes = self._last_bytes_t.get(wid)
+            # REAL spawn time — never refreshed by stats events, so a
+            # never-delivering zombie can't make itself immortal by
+            # posting zero-byte batches.
+            spawned = self._spawned_t.get(wid, now)
             if last_bytes is None and (now - spawned) < startup_grace:
                 continue
             if last_bytes is None or last_bytes <= starve_cutoff:
-                starved.append(sid)
-        for sid in starved:
-            proc, stop_ev = self._workers.pop(sid, (None, None))
+                starved.append(wid)
+        for wid in starved:
+            lost = self._latest_batch.get(wid, {}).get('active',
+                                                       self.batch_size)
+            proc, stop_ev = self._workers.pop(wid, (None, None))
             if proc is not None:
                 stop_ev.set()
                 proc.join(timeout=0.5)
-            self._latest_stats.pop(sid, None)
-            self._last_stats_t.pop(sid, None)
-            self._last_bytes_t.pop(sid, None)
-            self._spawned_t.pop(sid, None)
-            failed_this_window += 1
+            self._latest_batch.pop(wid, None)
+            self._last_batch_t.pop(wid, None)
+            self._last_bytes_t.pop(wid, None)
+            self._spawned_t.pop(wid, None)
+            failed_this_window += max(1, int(lost))
 
         rx_bps_total = 0.0
         worst_p90 = 0.0
@@ -717,35 +712,33 @@ class SubsActuator:
         max_loss_pct = 0.0
         jitter_sum = 0.0
         jitter_n = 0
+        active_subs = 0
 
         self._t_last_observe = now
 
-        for sid in active_ids:
-            s = self._latest_stats.get(sid, {})
-            # rx_bytes is a per-snapshot delta (~1s of bytes since the
-            # last stats event); convert to Mbps using STATS_INTERVAL_S.
+        for wid in live_ids:
+            s = self._latest_batch.get(wid, {})
+            active_subs += int(s.get('active', 0))
+            # rx_bytes is the batch's per-snapshot delta (~1s); convert
+            # to Mbps using STATS_INTERVAL_S.
             rx_bytes = s.get('rx_bytes', 0)
-            per_sub_mbps = (rx_bytes * 8) / (1.0 * 1e6)
-            rx_bps_total += per_sub_mbps * 1e6
-            p90 = s.get('lat_p90_ms', 0.0)
-            mean = s.get('lat_mean_ms', 0.0)
+            rx_bps_total += rx_bytes * 8
+            worst_p90 = max(worst_p90, s.get('lat_p90_ms', 0.0))
+            worst_mean = max(worst_mean, s.get('lat_mean_ms', 0.0))
             loss_ct = s.get('loss', 0)
             total = s.get('total_objs', 0) or 1
             lpct = 100.0 * loss_ct / (loss_ct + total) if (loss_ct + total) else 0.0
-            worst_p90 = max(worst_p90, p90)
-            worst_mean = max(worst_mean, mean)
             max_loss_pct = max(max_loss_pct, lpct)
             jit = s.get('jitter_ms')
             if jit is not None:
                 jitter_sum += jit
                 jitter_n += 1
 
-        # Setpoint is the TARGETED count, not the live worker dict —
-        # reaping must not silently lower the target the controller
-        # ramps against (otherwise a lost sub permanently decays the
-        # run instead of triggering a replacement).
+        # Setpoint is the TARGETED count, not live capacity — reaping a
+        # worker must not silently lower the target the controller ramps
+        # against (else a lost worker permanently decays the run instead
+        # of triggering a respawn).
         target_subs = int(self._targeted)
-        active_subs = len(active_ids)
 
         if active_subs < target_subs:
             self._shortfall_streak += 1
@@ -782,7 +775,7 @@ class SubsActuator:
     async def shutdown(self) -> None:
         # Parallel shutdown: signal all stops at once, join with one
         # shared deadline, terminate stragglers, then a final short
-        # join. Serial _kill_sub at 1s/worker would block ~Nsubs s
+        # join. Serial _kill_worker at 1s each would block ~Nworkers s
         # at large fan-out and starve the asyncio loop.
         items = list(self._workers.items())
         self._workers.clear()
@@ -797,8 +790,8 @@ class SubsActuator:
                 proc.terminate()
         for _sid, (proc, _ev) in items:
             proc.join(timeout=1.0)
-        self._latest_stats.clear()
-        self._last_stats_t.clear()
+        self._latest_batch.clear()
+        self._last_batch_t.clear()
         self._last_bytes_t.clear()
         self._spawned_t.clear()
         # Don't let the parent's atexit hook block on the events queue
@@ -1501,8 +1494,9 @@ def parse_args():
     p.add_argument("--start-subs", type=int, default=1,
                    help="subs-mode: initial subscriber count (default: 1)")
     p.add_argument("--step-subs", type=int, default=1,
-                   help="subs-mode: subscribers added per group "
-                        "(default: 1)")
+                   help="subs-mode: subscribers per group (default: 1). "
+                        "Also the batch size: one worker process hosts a "
+                        "group of this many self-healing subscriptions.")
     p.add_argument("--max-subs", type=int, default=200,
                    help="subs-mode: cap (default: 200)")
     p.add_argument("--sub-mbps", type=float, default=10.0,
@@ -1516,9 +1510,10 @@ def parse_args():
                         "--interval (one group per report).")
     p.add_argument("-S", "--stagger", type=float, default=0.1,
                    help="subs-mode: seconds between individual joins "
-                        "WITHIN a group (default: 0.1). Spaces QUIC "
+                        "WITHIN a group (default: 0.1), applied inside "
+                        "the worker as it opens its batch. Spaces QUIC "
                         "Initials so a group doesn't burst the relay. "
-                        "0 = fire the group simultaneously.")
+                        "0 = open the batch simultaneously.")
     # CLI names from FilterType enum: kebab-case of the member name.
     # NEXT_GROUP_START → next-group-start, LATEST_OBJECT → latest-object,
     # etc. ABSOLUTE_START/RANGE are enumerated here but rejected below
