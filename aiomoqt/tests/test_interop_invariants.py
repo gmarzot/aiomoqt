@@ -120,19 +120,24 @@ class TestAlpnByDraft:
 
 class TestMoqtClientDraftValidation:
     """MOQTClient.draft_version is part of the public API contract;
-    it accepts draft NUMBERS (14, 16, ...), validates against the
-    supported set, normalizes for internal use. Confusion between
-    draft-number form and IETF wire form was the source of the
-    0.9.x silent setup failure.
+    it accepts draft NUMBERS (14, 16, ...) and validates against the
+    supported set. Drafts flow as short ints — draft_version stays the
+    number it was given (the IETF wire form is materialized only at
+    ALPN / CLIENT_SETUP serialization). Confusion between draft-number
+    form and IETF wire form was the source of the 0.9.x silent setup
+    failure.
     """
 
     def test_accepts_supported_draft_number(self):
         from aiomoqt.client import MOQTClient
-        # Should not raise.
+        # draft_version stays the draft number; a pinned draft also
+        # normalizes to a 1-tuple supported_drafts.
         c = MOQTClient("localhost", 4433, draft_version=14)
-        assert c.draft_version == 0xff00000e
+        assert c.draft_version == 14
+        assert c.supported_drafts == (14,)
         c = MOQTClient("localhost", 4433, draft_version=16)
-        assert c.draft_version == 0xff000010
+        assert c.draft_version == 16
+        assert c.supported_drafts == (16,)
 
     def test_rejects_unsupported_draft_number(self):
         from aiomoqt.client import MOQTClient

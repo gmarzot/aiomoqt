@@ -136,8 +136,6 @@ release gates, so treat as indicative — relay deployments change.
 | Meta moxygen | d16 | H3/WT | 6/6 | 3/3 |
 | Cloudflare moq-rs | d14 | QUIC | 5/6 | 3/3 |
 | Cloudflare moq-rs (d16 interop branch) | d16 | QUIC | 6/6 | unverified |
-| Red5 Pro | d14 | H3/WT | 6/6 | unverified |
-| Red5 Pro | d16 | H3/WT | 6/6 | unverified |
 | Quicr libquicr | d14 | QUIC | 5/6 | 3/3 |
 | Quicr libquicr | d14 | H3/WT | 5/6 | 3/3 |
 | Quicr libquicr | d16 | H3/WT | 5/6 | 3/3 |

@@ -111,7 +111,7 @@ async def _on_subscribe(session, msg):
     # On d16+ the universal REQUEST_ERROR (0x05) carries the not-found
     # code (0x10). On d14 the legacy SUBSCRIBE_ERROR (0x05) carries
     # TRACK_DOES_NOT_EXIST (0x04). Send the right shape per version.
-    if is_draft16_or_later():
+    if is_draft16_or_later(session._draft):
         err = RequestError(
             request_id=msg.request_id,
             error_code=int(RequestErrorCode.DOES_NOT_EXIST),
@@ -119,7 +119,7 @@ async def _on_subscribe(session, msg):
             reason="track does not exist",
         )
         logger.info(f"MOQT send: {err}")
-        session.send_control_message(err.serialize())
+        session.send_control_message(err)
     else:
         session.subscribe_error(
             request_id=msg.request_id,

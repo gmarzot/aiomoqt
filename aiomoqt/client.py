@@ -1,5 +1,5 @@
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import List, Optional
 
 from aiopquic.asyncio.client import connect as aiopquic_connect
 from aiopquic._binding._transport import TransportContext
@@ -9,8 +9,7 @@ from .protocol import (
     MOQTPeer, MOQTSessionQuic, MOQTSessionWTClient,
     DEFAULT_TX_MAX_INFLIGHT_BYTES,
 )
-from .types import moqt_alpn_for_version, MOQT_ALPN, MOQT_VERSIONS
-from .context import set_moqt_ctx_version
+from .types import moqt_alpn_for_version, moqt_version_from_draft, MOQTDraft
 from .utils.logger import *
 
 logger = get_logger(__name__)
@@ -30,6 +29,7 @@ class MOQTClient(MOQTPeer):
         keylog_filename: Optional[str] = None,
         quic_debug_log: Optional[str] = None,
         draft_version: Optional[int] = None,
+        supported_drafts: Optional[List[int]] = None,
         libquicr_compat: Optional[bool] = False,
         congestion_control_algorithm: Optional[str] = None,
         tx_max_inflight_bytes: Optional[int] = DEFAULT_TX_MAX_INFLIGHT_BYTES,
@@ -54,15 +54,20 @@ class MOQTClient(MOQTPeer):
         # QuicDebugLogger; only meaningful for the raw QUIC path (and
         # for the WT path's underlying QUIC transport).
         self.quic_debug_log = quic_debug_log
-        # Public API contract: draft_version is the IETF draft number as
-        # an integer (e.g. 14, 16). Internal state stores the full IETF
-        # version code (e.g. 0xff000010) — what goes on the wire, what
-        # ALPN encodes, what CLIENT_SETUP carries. The conversion is
-        # done here at the API boundary so internal code never has to
-        # think about which form it's holding.
+        # Two-attribute discipline: supported_drafts is the set we can
+        # speak (draft numbers, newest-preferred); draft_version is the
+        # single pinned draft (number) or None to offer them all. Drafts
+        # flow as short ints; the IETF version code is materialized only
+        # at ALPN / d14 CLIENT_SETUP serialization.
         if draft_version is not None:
-            from .types import moqt_version_from_draft
-            draft_version = moqt_version_from_draft(draft_version)
+            moqt_version_from_draft(draft_version)  # validate
+            self.supported_drafts = (draft_version,)
+        elif supported_drafts is not None:
+            for _d in supported_drafts:
+                moqt_version_from_draft(_d)  # validate each
+            self.supported_drafts = tuple(supported_drafts)
+        else:
+            self.supported_drafts = (MOQTDraft.DRAFT_16, MOQTDraft.DRAFT_14)
         self.draft_version = draft_version
         self.keylog_filename = keylog_filename
         self.configuration = configuration
@@ -79,9 +84,6 @@ class MOQTClient(MOQTPeer):
         # UDP SO_RCVBUF/SO_SNDBUF request (bytes). None = aiopquic
         # default (64 MiB, kernel-clamped to rmem_max/wmem_max).
         self.socket_buffer_size = socket_buffer_size
-
-        if draft_version is not None:
-            set_moqt_ctx_version(draft_version)
 
         logger.debug(
             f"MOQT: client session: {self} use_quic={use_quic} path={path}")
@@ -101,18 +103,12 @@ class MOQTClient(MOQTPeer):
                 if cfg.server_name is None:
                     cfg.server_name = self.host
             else:
-                if self.draft_version is not None:
-                    alpn = [moqt_alpn_for_version(self.draft_version)]
-                else:
-                    # No explicit draft: offer every supported version's
-                    # ALPN, newest first, so a d16-only peer negotiates
-                    # moqt-16 and a d14 peer falls back to moq-00. The
-                    # session sets its version from whichever ALPN the
-                    # peer selects (version-from-ALPN). Without this, auto
-                    # offered only moq-00 (d14) and d16-only relays closed
-                    # the connection (376) before SERVER_SETUP.
-                    alpn = [moqt_alpn_for_version(v)
-                            for v in sorted(MOQT_VERSIONS, reverse=True)]
+                # Offer every supported draft's ALPN, newest first; the
+                # session locks its draft from whichever ALPN the peer
+                # selects (version-from-ALPN). A pinned client has a
+                # 1-tuple, so this naturally offers just that one.
+                alpn = [moqt_alpn_for_version(d)
+                        for d in sorted(self.supported_drafts, reverse=True)]
                 cfg = QuicConfiguration(
                     alpn_protocols=alpn, is_client=True,
                     max_data=2**24, max_stream_data=2**24,
@@ -195,13 +191,13 @@ class MOQTClient(MOQTPeer):
         # d14 uses the legacy in-band CLIENT_SETUP path. Either way the
         # encoding context is set to match so the peer's ServerSetup
         # (and every message after) parses under the right draft.
-        wt_version = (self.draft_version if self.draft_version is not None
-                      else max(MOQT_VERSIONS))
-        set_moqt_ctx_version(wt_version)
-        wt_protocols = None
-        draft_major = wt_version & 0xFF
-        if draft_major >= 15:
-            wt_protocols = [f"moqt-{draft_major:d}"]
+        wt_draft = (self.draft_version if self.draft_version is not None
+                    else max(self.supported_drafts))
+        # Drafts >= 15 advertise the version in WT-Available-Protocols
+        # ("moqt-NN"); d14 uses the legacy in-band CLIENT_SETUP path.
+        wt_protocols = [f"moqt-{d}" for d in
+                        sorted(self.supported_drafts, reverse=True)
+                        if d >= 15] or None
         session = MOQTSessionWTClient(
             transport,
             self.host, self.port, self.path or "",
@@ -209,11 +205,11 @@ class MOQTClient(MOQTPeer):
             wt_available_protocols=wt_protocols,
             session=self,
         )
-        # Stamp the resolved MoQT version: over WT the ALPN is "h3" so
-        # the session never learns it from ProtocolNegotiated (as raw
-        # QUIC does). Without this the d16 ServerSetup handler reads the
-        # d14 default from _moqt_version and reverts the context.
-        session._moqt_version = wt_version
+        # Stamp the resolved draft: over WT the ALPN is "h3" so the
+        # session never learns it from ProtocolNegotiated (as raw QUIC
+        # does). Without this the d16 ServerSetup handler would read the
+        # default draft.
+        session._draft = wt_draft
         # Stamp the aggregate TX gate budget and per-stream ring cap
         # on the WT session (the client constructs the session
         # directly rather than via connect_webtransport, so the

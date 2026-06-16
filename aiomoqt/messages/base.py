@@ -3,7 +3,8 @@ from typing import Any, Optional, Union, Dict
 from dataclasses import dataclass, field, fields
 
 from . import ParamType, SetupParamType, AuthTokenAliasType
-from ..context import get_moqt_ctx_version, get_major_version
+from ..context import profile_for
+from ..types import MOQTProtocolViolation
 from ..utils.buffer import Buffer, BufferReadError
 from ..utils.logger import *
 
@@ -36,57 +37,45 @@ class MOQTMessage:
     @staticmethod
     def _extensions_encode(buf: Buffer, exts: Dict,
                            with_length: bool = True) -> None:
-        vers = get_moqt_ctx_version()
-        major_version = get_major_version(vers)
+        # The extensions/properties wire form (length-prefixed KVP
+        # block) is identical across every supported draft, so this
+        # codec is version-agnostic: no draft argument and no per-object
+        # version lookup on the hot path.
         if exts is None or len(exts) == 0:
             if with_length:
                 buf.push_uint_var(0)
             return
 
-        if major_version > 8:
-            pos = buf.tell()
-            payload = Buffer(capacity=BUF_SIZE)
-            for ext_id, ext_value in exts.items():
-                payload.push_uint_var(ext_id)
-                if ext_id % 2 == 0:  # even extension types are simple var int
-                    payload.push_uint_var(ext_value)
-                else:
-                    if isinstance(ext_value, str):
-                        ext_value = ext_value.encode()
-                    assert isinstance(ext_value, bytes)
-                    payload.push_uint_var(len(ext_value))
-                    payload.push_bytes(ext_value)
+        payload = Buffer(capacity=BUF_SIZE)
+        for ext_id, ext_value in exts.items():
+            payload.push_uint_var(ext_id)
+            if ext_id % 2 == 0:  # even extension types are simple var int
+                payload.push_uint_var(ext_value)
+            else:
+                if isinstance(ext_value, str):
+                    ext_value = ext_value.encode()
+                assert isinstance(ext_value, bytes)
+                payload.push_uint_var(len(ext_value))
+                payload.push_bytes(ext_value)
 
-            exts_len = payload.tell()
-            if _STRICT_SERIALIZE and len(payload.data) != exts_len:
-                raise AssertionError(
-                    f"_extensions_encode payload mismatch: "
-                    f"declared exts_len={exts_len} "
-                    f"actual payload.data bytes={len(payload.data)}"
-                )
-            if with_length:
-                buf.push_uint_var(exts_len)
-            payload_bytes_before = buf.tell()
-            buf.push_bytes(payload.data)
-            actual_pushed = buf.tell() - payload_bytes_before
-            if _STRICT_SERIALIZE and actual_pushed != exts_len:
-                raise AssertionError(
-                    f"_extensions_encode push_bytes mismatch: "
-                    f"declared exts_len={exts_len} "
-                    f"actually pushed={actual_pushed}"
-                )
-        else:
-            buf.push_uint_var(len(exts))
-            for ext_id, ext_value in exts.items():
-                buf.push_uint_var(ext_id)
-                if ext_id % 2 == 0:
-                    buf.push_uint_var(ext_value)
-                else:
-                    if isinstance(ext_value, str):
-                        ext_value = ext_value.encode()
-                    assert isinstance(ext_value, bytes)
-                    buf.push_uint_var(len(ext_value))
-                    buf.push_bytes(ext_value)
+        exts_len = payload.tell()
+        if _STRICT_SERIALIZE and len(payload.data) != exts_len:
+            raise AssertionError(
+                f"_extensions_encode payload mismatch: "
+                f"declared exts_len={exts_len} "
+                f"actual payload.data bytes={len(payload.data)}"
+            )
+        if with_length:
+            buf.push_uint_var(exts_len)
+        payload_bytes_before = buf.tell()
+        buf.push_bytes(payload.data)
+        actual_pushed = buf.tell() - payload_bytes_before
+        if _STRICT_SERIALIZE and actual_pushed != exts_len:
+            raise AssertionError(
+                f"_extensions_encode push_bytes mismatch: "
+                f"declared exts_len={exts_len} "
+                f"actually pushed={actual_pushed}"
+            )
 
     exts_err_count = 0
     EXTENSIONS_LEN_LIMIT = 1024 * 16
@@ -384,7 +373,7 @@ class MOQTMessage:
     
     @staticmethod
     def _serialize_params(payload: Buffer, parameters: Dict[int, Any],
-                          delta_keys: bool = None) -> None:
+                          *, draft: int, delta_keys: bool = None) -> None:
         """
         Serialize parameters using Key-Value-Pair structure. Payload is modified in place.
 
@@ -392,12 +381,11 @@ class MOQTMessage:
         - Even type: Type (varint) + Value (varint)
         - Odd type: Type (varint) + Length (varint) + Value (bytes)
 
-        If delta_keys=True (or auto-detected from draft-16+ context),
-        keys are sorted and written as deltas: key_on_wire = key - previous_key.
+        delta_keys defaults from the draft's profile (d16+ sorts keys
+        and writes deltas: key_on_wire = key - previous_key).
         """
         if delta_keys is None:
-            from ..context import is_draft16_or_later
-            delta_keys = is_draft16_or_later()
+            delta_keys = profile_for(draft).params_delta_coded
         if delta_keys:
             # Sort by key for delta encoding
             parameters = dict(sorted(parameters.items()))
@@ -438,24 +426,33 @@ class MOQTMessage:
         logger.info(f"Serialized {len(parameters)} parameters: {payload.data_slice(0,12)}")
 
 
-    def _deserialize_params(buf: Buffer, delta_keys: bool = None) -> Dict[int, Any]:
+    @staticmethod
+    def _deserialize_params(buf: Buffer, *, draft: int,
+                            buf_end: Optional[int] = None,
+                            delta_keys: bool = None) -> Dict[int, Any]:
         """
         Deserialize parameters using Key-Value-Pair structure.
 
-        If delta_keys=True (or auto-detected from draft-16+ context),
-        keys are delta-decoded.
+        delta_keys defaults from the draft's profile (d16+ keys are
+        delta-decoded). When buf_end is supplied the parameter block is
+        bounded to it: a declared count or length that would read past
+        buf_end raises MOQTProtocolViolation (spec §9 — the Length
+        field is the authoritative message extent).
 
         Returns:
             Dict mapping parameter type to value
         """
         if delta_keys is None:
-            from ..context import is_draft16_or_later
-            delta_keys = is_draft16_or_later()
+            delta_keys = profile_for(draft).params_delta_coded
         params = {}
         param_count = buf.pull_uint_var()
         prev_key = 0
 
         for _ in range(param_count):
+            if buf_end is not None and buf.tell() >= buf_end:
+                raise MOQTProtocolViolation(
+                    f"parameters declared {param_count} but buffer "
+                    f"exhausted at {buf.tell()}/{buf_end}")
             raw_key = buf.pull_uint_var()
             if delta_keys:
                 param_type = prev_key + raw_key
@@ -466,7 +463,12 @@ class MOQTMessage:
             if param_type % 2 == 1:  # Odd type - includes Length field
                 param_len = buf.pull_uint_var()
                 if param_len > 65535:  # 2^16-1 maximum
-                    raise BufferReadError("Parameter length exceeds maximum of 65535 bytes")
+                    raise MOQTProtocolViolation(
+                        "parameter length exceeds maximum of 65535 bytes")
+                if buf_end is not None and buf.tell() + param_len > buf_end:
+                    raise MOQTProtocolViolation(
+                        f"parameter length {param_len} exceeds remaining "
+                        f"{buf_end - buf.tell()}")
                 logger.info(f"deserializing param {param_type} length {param_len}")
                 param_value = buf.pull_bytes(param_len)
 
@@ -487,7 +489,13 @@ class MOQTMessage:
                     logger.info(f"AUTH_TOKEN: alias_type={alias_type} value={len(param_value)} bytes")
             else:  # Even type - Value is varint
                 param_value = buf.pull_uint_var()
-            
+            # Even-type varints are self-describing, so the frame bound
+            # is checked after the read: an over-read past buf_end is a
+            # wire violation, not a silent consume into the next message.
+            if buf_end is not None and buf.tell() > buf_end:
+                raise MOQTProtocolViolation(
+                    f"parameter overran frame extent: "
+                    f"{buf.tell()}/{buf_end}")
             params[param_type] = param_value
         
         return params

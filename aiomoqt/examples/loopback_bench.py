@@ -95,6 +95,12 @@ def parse_args():
              'exceed this. Steady-state latency ~ value / throughput. '
              'Default: aiopquic default (4 MiB). Pass 0 to disable.')
     parser.add_argument(
+        '--draft', type=int, default=16,
+        help='MoQT draft version for BOTH endpoints (default: 16). '
+             'Pinned explicitly so the in-process client and server '
+             'negotiate one matching ALPN; auto/multi-version is for '
+             'connecting to unknown peers, not this loopback.')
+    parser.add_argument(
         '-?', '--help', action='help',
         help='Show this help message and exit')
     return parser.parse_args()
@@ -153,6 +159,7 @@ async def run_server(args):
         certificate=args.cert, private_key=args.key,
         path="/",
         use_quic=args.quic,
+        draft_version=args.draft,
         congestion_control_algorithm=args.cc_algo,
         # None = honor protocol default (16 MB); 0 = opt out.
         **({'tx_max_inflight_bytes':
@@ -174,6 +181,7 @@ async def run_subscriber(args, stats):
         "localhost", args.port,
         path="/",
         use_quic=args.quic,
+        draft_version=args.draft,
         verify_tls=False,
         debug=args.debug,
         congestion_control_algorithm=args.cc_algo,

@@ -9,6 +9,17 @@ MOQT_VERSIONS = [
 ]
 MOQT_CUR_VERSION = MOQT_VERSION_DRAFT14  # default; set per-session
 
+
+class MOQTDraft(IntEnum):
+    """Supported MoQT draft numbers — the canonical version form for the
+    high/mid layers (dispatch-table keys, supported_drafts, the draft=
+    kwarg). The IETF wire code is MOQT_VERSION_DRAFT*; the ALPN is
+    moqt_alpn_for_version(). draft-18 is added here in Phase 2.
+    """
+    DRAFT_14 = 14
+    DRAFT_16 = 16
+
+
 # ALPN: draft-14 uses legacy "moq-00"; draft-16+ uses "moqt-NN"
 MOQT_ALPN_LEGACY = "moq-00"
 MOQT_ALPN_DRAFT14 = "moq-00"
@@ -328,6 +339,17 @@ class MOQTException(Exception):
         self.error_code = error_code
         self.reason_phrase = reason_phrase
         super().__init__(f"{reason_phrase} ({error_code})")
+
+
+class MOQTProtocolViolation(MOQTException):
+    """Receiver-detected wire-format violation: a control-frame Length
+    that doesn't match its payload extent, parameters that overrun the
+    message frame, or an unknown control code point. Maps to session
+    close code PROTOCOL_VIOLATION; the dispatcher catches it and closes
+    the session.
+    """
+    def __init__(self, reason_phrase: str = ""):
+        super().__init__(SessionCloseCode.PROTOCOL_VIOLATION, reason_phrase)
 
 
 class MOQTRequestError(Exception):

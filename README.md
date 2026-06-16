@@ -240,13 +240,14 @@ python -m aiomoqt.examples.server_example \
 ## Interop
 
 Validated against live public relays — OpenMoQ moqx, Meta moxygen,
-Cloudflare moq-rs, Quicr libquicr, Meetecho imquic, Red5 Pro, OzU
-moqtail — across draft-14/draft-16 and both transports, using the
+Cloudflare moq-rs, Quicr libquicr, Meetecho imquic, OzU moqtail —
+across draft-14/draft-16 and both transports, using the
 [moq-interop-runner](https://github.com/englishm/moq-interop-runner)
 cases plus a multi-subscriber pub-sub bench. The full point-in-time
 matrix lives in [PERFORMANCE.md](PERFORMANCE.md#interop-matrix-point-in-time);
 the relay catalog with per-endpoint notes is
-[`tests/relays.json`](tests/relays.json).
+[`tests/relays.json`](tests/relays.json). Red5 Pro was interop-tested
+in earlier cycles and is currently untested/unverified.
 
 ## Performance
 

@@ -30,12 +30,12 @@ class RequestOk(MOQTMessage):
     def __post_init__(self):
         self.type = D16MessageType.REQUEST_OK
 
-    def serialize(self) -> bytes:
+    def serialize(self, *, draft: int) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
         payload = Buffer(capacity=BUF_SIZE)
 
         payload.push_uint_var(self.request_id)
-        MOQTMessage._serialize_params(payload, self.parameters or {})
+        MOQTMessage._serialize_params(payload, self.parameters or {}, draft=draft)
 
         buf.push_uint_var(self.type)
         buf.push_uint16(payload.tell())
@@ -43,9 +43,9 @@ class RequestOk(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'RequestOk':
+    def deserialize(cls, buf: Buffer, *, draft: int, buf_end: Optional[int] = None) -> 'RequestOk':
         request_id = buf.pull_uint_var()
-        params = MOQTMessage._deserialize_params(buf)
+        params = MOQTMessage._deserialize_params(buf, draft=draft, buf_end=buf_end)
         return cls(request_id=request_id, parameters=params)
 
 
@@ -67,7 +67,7 @@ class RequestError(MOQTMessage):
     def __post_init__(self):
         self.type = D16MessageType.REQUEST_ERROR
 
-    def serialize(self) -> bytes:
+    def serialize(self, *, draft: int) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
         payload = Buffer(capacity=BUF_SIZE)
 
@@ -85,7 +85,7 @@ class RequestError(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'RequestError':
+    def deserialize(cls, buf: Buffer, *, draft: int, buf_end: Optional[int] = None) -> 'RequestError':
         request_id = buf.pull_uint_var()
         error_code = buf.pull_uint_var()
         retry_interval = buf.pull_uint_var()
@@ -117,13 +117,13 @@ class RequestUpdate(MOQTMessage):
     def __post_init__(self):
         self.type = D16MessageType.REQUEST_UPDATE
 
-    def serialize(self) -> bytes:
+    def serialize(self, *, draft: int) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
         payload = Buffer(capacity=BUF_SIZE)
 
         payload.push_uint_var(self.request_id)
         payload.push_uint_var(self.existing_request_id)
-        MOQTMessage._serialize_params(payload, self.parameters or {})
+        MOQTMessage._serialize_params(payload, self.parameters or {}, draft=draft)
 
         buf.push_uint_var(self.type)
         buf.push_uint16(payload.tell())
@@ -131,10 +131,10 @@ class RequestUpdate(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'RequestUpdate':
+    def deserialize(cls, buf: Buffer, *, draft: int, buf_end: Optional[int] = None) -> 'RequestUpdate':
         request_id = buf.pull_uint_var()
         existing_request_id = buf.pull_uint_var()
-        params = MOQTMessage._deserialize_params(buf)
+        params = MOQTMessage._deserialize_params(buf, draft=draft, buf_end=buf_end)
 
         return cls(
             request_id=request_id,
@@ -157,7 +157,7 @@ class Namespace(MOQTMessage):
     def __post_init__(self):
         self.type = D16MessageType.NAMESPACE
 
-    def serialize(self) -> bytes:
+    def serialize(self, *, draft: int) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
         payload = Buffer(capacity=BUF_SIZE)
 
@@ -172,7 +172,7 @@ class Namespace(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'Namespace':
+    def deserialize(cls, buf: Buffer, *, draft: int, buf_end: Optional[int] = None) -> 'Namespace':
         tuple_len = buf.pull_uint_var()
         namespace_suffix = tuple(
             buf.pull_bytes(buf.pull_uint_var()) for _ in range(tuple_len)
@@ -194,7 +194,7 @@ class NamespaceDone(MOQTMessage):
     def __post_init__(self):
         self.type = D16MessageType.NAMESPACE_DONE
 
-    def serialize(self) -> bytes:
+    def serialize(self, *, draft: int) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
         payload = Buffer(capacity=BUF_SIZE)
 
@@ -209,7 +209,7 @@ class NamespaceDone(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'NamespaceDone':
+    def deserialize(cls, buf: Buffer, *, draft: int, buf_end: Optional[int] = None) -> 'NamespaceDone':
         tuple_len = buf.pull_uint_var()
         namespace_suffix = tuple(
             buf.pull_bytes(buf.pull_uint_var()) for _ in range(tuple_len)

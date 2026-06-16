@@ -37,7 +37,7 @@ class Publish(MOQTMessage):
     def __post_init__(self):
         self.type = MOQTMessageType.PUBLISH
 
-    def serialize(self) -> bytes:
+    def serialize(self, *, draft: int) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
         payload = Buffer(capacity=BUF_SIZE)
 
@@ -53,7 +53,7 @@ class Publish(MOQTMessage):
         payload.push_bytes(self.track_name)
         payload.push_uint_var(self.track_alias)
 
-        if is_draft16_or_later():
+        if is_draft16_or_later(draft):
             # d16: group_order, content_exists, forward all in params/extensions
             params = dict(self.parameters or {})
             if self.forward is not None:
@@ -63,7 +63,7 @@ class Publish(MOQTMessage):
                 lbuf.push_uint_var(self.largest_group_id)
                 lbuf.push_uint_var(self.largest_object_id or 0)
                 params[ParamType.LARGEST_OBJECT] = lbuf.data_slice(0, lbuf.tell())
-            MOQTMessage._serialize_params(payload, params)
+            MOQTMessage._serialize_params(payload, params, draft=draft)
             # Track Extensions
             exts = dict(self.track_extensions or {})
             if self.group_order is not None:
@@ -77,7 +77,7 @@ class Publish(MOQTMessage):
                 payload.push_uint_var(self.largest_group_id)
                 payload.push_uint_var(self.largest_object_id)
             payload.push_uint8(self.forward)
-            MOQTMessage._serialize_params(payload, self.parameters or {})
+            MOQTMessage._serialize_params(payload, self.parameters or {}, draft=draft)
 
         buf.push_uint_var(self.type)
         buf.push_uint16(payload.tell())
@@ -85,7 +85,7 @@ class Publish(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'Publish':
+    def deserialize(cls, buf: Buffer, *, draft: int, buf_end: Optional[int] = None) -> 'Publish':
         # buf_end is the absolute end-of-message position derived from
         # the outer frame length. Required for d16 (Track Extensions
         # have no length prefix; sequence runs to end of message).
@@ -105,8 +105,8 @@ class Publish(MOQTMessage):
         forward = None
         track_extensions = None
 
-        if is_draft16_or_later():
-            params = MOQTMessage._deserialize_params(buf)
+        if is_draft16_or_later(draft):
+            params = MOQTMessage._deserialize_params(buf, draft=draft, buf_end=buf_end)
             forward = params.pop(ParamType.FORWARD, None)
             largest_raw = params.pop(ParamType.LARGEST_OBJECT, None)
             if largest_raw is not None:
@@ -129,7 +129,7 @@ class Publish(MOQTMessage):
                 largest_group_id = buf.pull_uint_var()
                 largest_object_id = buf.pull_uint_var()
             forward = buf.pull_uint8()
-            params = MOQTMessage._deserialize_params(buf)
+            params = MOQTMessage._deserialize_params(buf, draft=draft, buf_end=buf_end)
 
         return cls(
             request_id=request_id,
@@ -168,13 +168,13 @@ class PublishOk(MOQTMessage):
     def __post_init__(self):
         self.type = MOQTMessageType.PUBLISH_OK
 
-    def serialize(self) -> bytes:
+    def serialize(self, *, draft: int) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
         payload = Buffer(capacity=BUF_SIZE)
 
         payload.push_uint_var(self.request_id)
 
-        if is_draft16_or_later():
+        if is_draft16_or_later(draft):
             # d16: everything in params
             params = dict(self.parameters or {})
             if self.forward is not None:
@@ -192,7 +192,7 @@ class PublishOk(MOQTMessage):
                 if self.filter_type == 4:
                     fbuf.push_uint_var(self.end_group or 0)
                 params[ParamType.SUBSCRIPTION_FILTER] = fbuf.data_slice(0, fbuf.tell())
-            MOQTMessage._serialize_params(payload, params)
+            MOQTMessage._serialize_params(payload, params, draft=draft)
         else:
             # d14: fixed fields
             payload.push_uint8(self.forward)
@@ -204,7 +204,7 @@ class PublishOk(MOQTMessage):
                 payload.push_uint_var(self.start_object or 0)
             if self.filter_type == 4:
                 payload.push_uint_var(self.end_group or 0)
-            MOQTMessage._serialize_params(payload, self.parameters or {})
+            MOQTMessage._serialize_params(payload, self.parameters or {}, draft=draft)
 
         buf.push_uint_var(self.type)
         buf.push_uint16(payload.tell())
@@ -212,7 +212,7 @@ class PublishOk(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'PublishOk':
+    def deserialize(cls, buf: Buffer, *, draft: int, buf_end: Optional[int] = None) -> 'PublishOk':
         request_id = buf.pull_uint_var()
 
         forward = None
@@ -223,8 +223,8 @@ class PublishOk(MOQTMessage):
         start_object = None
         end_group = None
 
-        if is_draft16_or_later():
-            params = MOQTMessage._deserialize_params(buf)
+        if is_draft16_or_later(draft):
+            params = MOQTMessage._deserialize_params(buf, draft=draft, buf_end=buf_end)
             forward = params.pop(ParamType.FORWARD, None)
             priority = params.pop(ParamType.SUBSCRIBER_PRIORITY, None)
             group_order = params.pop(ParamType.GROUP_ORDER, None)
@@ -247,7 +247,7 @@ class PublishOk(MOQTMessage):
                 start_object = buf.pull_uint_var()
             if filter_type == 4:
                 end_group = buf.pull_uint_var()
-            params = MOQTMessage._deserialize_params(buf)
+            params = MOQTMessage._deserialize_params(buf, draft=draft, buf_end=buf_end)
 
         return cls(
             request_id=request_id,
@@ -276,7 +276,7 @@ class PublishError(MOQTMessage):
     def __post_init__(self):
         self.type = MOQTMessageType.PUBLISH_ERROR
 
-    def serialize(self) -> bytes:
+    def serialize(self, *, draft: int) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
         payload = Buffer(capacity=BUF_SIZE)
 
@@ -293,7 +293,7 @@ class PublishError(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'PublishError':
+    def deserialize(cls, buf: Buffer, *, draft: int, buf_end: Optional[int] = None) -> 'PublishError':
         request_id = buf.pull_uint_var()
         error_code = buf.pull_uint_var()
         reason_len = buf.pull_uint_var()

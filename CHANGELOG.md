@@ -1,5 +1,98 @@
 # Changelog
 
+## v0.10.0 (unreleased)
+
+Version-dispatch refactor — the foundation for multi-draft support
+(draft-18 lands on top of this). Pairs with aiopquic 0.3.8 (dep floor
+unchanged). Internal-API breaking; no public class-surface change.
+
+### Per-session draft dispatch (kills the process global)
+
+- The process-global `context.moqt_version` and its
+  `get/set_moqt_ctx_version` accessors are **deleted**. Draft flows as a
+  required keyword-only `draft=` argument through every `serialize` /
+  `deserialize`, sourced from a per-session `self._draft`. Concurrent
+  sessions on different drafts in one event loop no longer clobber each
+  other (regression: `test_concurrent_versions`).
+- **Version = int draft number throughout the high/mid layers.**
+  `draft_version` and the new `supported_drafts` are plain draft numbers
+  (14, 16); `self._draft`, the `draft=` kwarg, and the dispatch tables
+  are int-keyed. The IETF hex code and ALPN strings are materialized
+  only at the wire boundary (d14 CLIENT_SETUP `versions[]`, ALPN build)
+  — they no longer bleed into higher layers. Subsumes the long-pending
+  int-form refactor. Draft numbers are named by the `MOQTDraft` IntEnum
+  (`DRAFT_14`/`DRAFT_16`), used as the dispatch-table keys and
+  `supported_drafts` defaults instead of bare literals.
+- `send_control_message(msg)` / `send_stream_message(stream_id, msg)`
+  now take the message object and serialize internally at `self._draft`,
+  so no send site threads `draft=` — the class of "forgot the draft
+  kwarg at a send site" is structurally impossible. These are
+  below-the-public-API, undocumented session methods (the high-level
+  `subscribe`/`publish`/`fetch`/… wrap them); only a custom handler that
+  hand-built a frame and called `send_control_message(buf)` directly is
+  affected — now pass the message, not a pre-serialized Buffer.
+
+### Two table-driven dispatch mechanisms
+
+- `CONTROL_REGISTRY[draft]` — one complete control-message table per
+  draft, built from deltas (d16 = d14 base + repurposed
+  0x02/0x05/0x07/0x08/0x0E, minus the d14-only points d16 dropped).
+  Replaces the `is_draft16_or_later()` branch + `MOQT_D16_OVERRIDE_REGISTRY`
+  overlay. Built once at class definition, read-only at runtime (no
+  shared mutable cross-session state). Dispatch is a single keyed lookup;
+  an unknown code point for the draft raises `MOQTProtocolViolation`.
+- `DraftProfile` / `PROFILES[draft]` — named per-draft capability table
+  (`setup_carries_versions`, `params_delta_coded`). Recurring spec-delta
+  behaviors read intent (`profile_for(draft).params_delta_coded`) instead
+  of version arithmetic; localized one-off gates keep the thin
+  `is_draft16_or_later(draft)` predicate (now required-arg).
+
+### Two-attribute negotiation discipline
+
+- `MOQTClient` / `MOQTServer` accept `supported_drafts: list[int]`
+  alongside `draft_version`. A pinned `draft_version` normalizes to a
+  1-tuple; the default offers `(16, 14)` newest-first (preference order).
+  The raw-QUIC client locks its draft from the actually-negotiated ALPN.
+  A single-draft server covers the loopback matrix; multi-draft **server**
+  selection and WT in-band version selection are a deferred aiopquic
+  fast-follow (`alpn_select_fn`, clean no-ALPN failure,
+  `picowt_select_wt_protocol` + `WT-Protocol` read-back).
+
+### Spec-compliant bounded parsing
+
+- `_deserialize_params` enforces the control-frame `Length` extent: a
+  declared count or length that would read past it raises
+  `MOQTProtocolViolation` (session close `PROTOCOL_VIOLATION`, spec §9)
+  instead of a raw `BufferReadError`; the dispatcher catches it and
+  closes cleanly.
+
+### High-level API is version-agnostic
+
+- The track abstraction (`aiomoqt/track.py`) holds no version knowledge:
+  it reacts to logical message types (`isinstance(msg, RequestUpdate)`)
+  and passes logical fields, letting the codec gate the wire by draft.
+  Users do not encode version-specific handling.
+
+### Hot path preserved
+
+- The extensions/properties codec is draft-agnostic (removed the
+  per-object global lookup); `ObjectHeader` and the per-object loop carry
+  no draft argument. loopback_bench parity held across d14/d16 ×
+  raw-QUIC/WT (~2.5–2.8 Gbps).
+
+### Other
+
+- Removed the unmaintained `red5_conformance` example and its test docs
+  (Red5 Pro interop is untested/unverified; noted in README).
+
+### Breaking (internal)
+
+- `serialize(*, draft)` / `deserialize(*, draft, buf_end)` require the
+  kwarg; `context.moqt_version` + `get/set_moqt_ctx_version` removed;
+  `is_draft16_or_later` / `get_major_version` require an argument;
+  `draft_version` is a draft number (was the IETF hex code); session
+  `_moqt_version` renamed `_draft`.
+
 ## v0.9.8 (unreleased)
 
 Pairs with aiopquic 0.3.8; dep floor `aiopquic>=0.3.7` → `aiopquic>=0.3.8`

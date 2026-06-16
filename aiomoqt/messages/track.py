@@ -16,6 +16,7 @@ from . import (MOQTUnderflow, MOQTMessage, ObjectStatus, DataStreamType,
                MOQT_DEFAULT_PRIORITY, BUF_SIZE,
                SUBGROUP_HEADER_BASE, SUBGROUP_ID_ZERO, SUBGROUP_ID_FIRST_OBJ, SUBGROUP_ID_EXPLICIT,
                OBJECT_DATAGRAM_BASE, OBJECT_DATAGRAM_STATUS_BASE)
+from ..context import is_draft16_or_later
 from ..utils.buffer import Buffer, BufferReadError
 from ..utils.logger import get_logger
 from aiopquic._binding._streamchain import encode_object_subgroup
@@ -451,9 +452,8 @@ class FetchObject(MOQTMessage):
     # d16 only: end-of-range marker flag (0x8C or 0x10C)
     end_of_range: Optional[int] = None
 
-    def serialize(self) -> Buffer:
-        from ..context import is_draft16_or_later
-        if is_draft16_or_later():
+    def serialize(self, *, draft: int) -> Buffer:
+        if is_draft16_or_later(draft):
             return self._serialize_d16()
         return self._serialize_d14()
 
@@ -512,9 +512,9 @@ class FetchObject(MOQTMessage):
 
     @classmethod
     def deserialize(cls, buf: Buffer,
-                    prior: Optional['FetchObject'] = None) -> 'FetchObject':
-        from ..context import is_draft16_or_later
-        if is_draft16_or_later():
+                    prior: Optional['FetchObject'] = None,
+                    *, draft: int) -> 'FetchObject':
+        if is_draft16_or_later(draft):
             return cls._deserialize_d16(buf, prior)
         return cls._deserialize_d14(buf)
 

@@ -22,10 +22,8 @@ from __future__ import annotations
 import argparse
 import time
 
-from aiomoqt.context import set_moqt_ctx_version
 from aiomoqt.messages.base import MOQTUnderflow
 from aiomoqt.messages.track import SubgroupHeader, ObjectHeader
-from aiomoqt.types import MOQT_VERSION_DRAFT16
 from aiopquic.streamchain import StreamChain
 from aiomoqt.tests.microbench._bytestream import (
     make_subgroup_stream, chunked,
@@ -37,7 +35,6 @@ def _parse_subgroup_stream(chain: StreamChain) -> int:
 
     Returns object count parsed. Mirrors what _moqt_handle_data_stream
     does (without the protocol-session bookkeeping)."""
-    set_moqt_ctx_version(MOQT_VERSION_DRAFT16)
 
     # Stream type byte (varint) + SubgroupHeader
     stream_type = chain.pull_uint_var()

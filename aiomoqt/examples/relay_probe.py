@@ -80,9 +80,9 @@ async def probe_version(host, port, path, use_quic, draft_version,
         async with asyncio.timeout(PROBE_TIMEOUT):
             async with client.connect() as session:
                 await session.client_session_init(timeout=PROBE_TIMEOUT - 1)
-                v = session._moqt_version
+                v = session._draft
                 result["live"] = True
-                result["version_hex"] = f"0x{v:08x}"
+                result["version_hex"] = f"0x{0xff000000 | v:08x}"
                 result["draft"] = f"draft-{get_major_version(v)}"
                 result["alpn"] = client.configuration.alpn_protocols[0]
                 # Capture setup params from server

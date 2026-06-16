@@ -36,7 +36,6 @@ from .types import (
 from .messages import (
     SubgroupHeader, PublishOk, RequestUpdate,
 )
-from .context import is_draft16_or_later
 from .utils.format import fmt_bps, fmt_rate
 from .utils.logger import get_logger
 
@@ -198,16 +197,19 @@ class PublishedTrack(Track):
             MOQTMessageType.SUBSCRIBE, self._on_subscribe)
         self.session.register_handler(
             MOQTMessageType.PUBLISH_OK, self._on_publish_ok)
-        self.session.register_handler(
-            MOQTMessageType.SUBSCRIBE_UPDATE, self._on_subscribe_update)
-
-        # d16: REQUEST_UPDATE (code point 0x02) signals subscriber arrival
-        if is_draft16_or_later():
-            track = self
-            async def _request_update_handler(session, msg):
+        # Code point 0x02 is SUBSCRIBE_UPDATE (d14) or REQUEST_UPDATE
+        # (d16); the negotiated draft selects the class via the per-draft
+        # CONTROL_REGISTRY, so a single handler dispatches on the parsed
+        # message type — no version branch, works whenever the handshake
+        # settles.
+        track = self
+        async def _update_handler(session, msg):
+            if isinstance(msg, RequestUpdate):
                 await track._on_request_update(session, msg)
-            self.session.MOQT_D16_OVERRIDE_REGISTRY[0x02] = (
-                RequestUpdate, _request_update_handler)
+            else:
+                await track._on_subscribe_update(session, msg)
+        self.session.register_handler(
+            MOQTMessageType.SUBSCRIBE_UPDATE, _update_handler)
 
         if publish_track:
             pub_msg = self.session.publish(
@@ -305,7 +307,7 @@ class PublishedTrack(Track):
         logger.info(f"Track: PUBLISH_DONE request_id={req_id} "
                     f"streams={self._stream_count}")
         try:
-            session.send_control_message(msg.serialize())
+            session.send_control_message(msg)
         except Exception:
             pass  # session may already be closing
 
@@ -588,7 +590,11 @@ class SubscribedTrack(Track):
         # trackname is set, only a matching PUBLISH is accepted; others
         # are dropped. No fallback — discovery failure raises.
         ns_kwargs = {}
-        if subscribe_options is not None and is_draft16_or_later():
+        # Pass the logical field whenever the caller provided it; the
+        # SubscribeNamespace codec decides whether it goes on the wire
+        # for the negotiated draft (d16+ only). The track stays
+        # version-agnostic.
+        if subscribe_options is not None:
             ns_kwargs['subscribe_options'] = subscribe_options
         ns_params = {}
         if self.auth_token is not None:
@@ -639,7 +645,7 @@ class SubscribedTrack(Track):
         )
         logger.info(f"Track: PUBLISH_OK {self.fqtn} "
                     f"alias={self.track_alias} forward={forward}")
-        self.session.send_control_message(ok.serialize())
+        self.session.send_control_message(ok)
 
         self.state = TrackState.SUBSCRIBED
         logger.info(f"Track: subscribed to {self.fqtn}")

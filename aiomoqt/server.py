@@ -1,6 +1,6 @@
 import asyncio
 from asyncio.futures import Future
-from typing import Any, Optional, Tuple, Coroutine
+from typing import Any, List, Optional, Tuple, Coroutine
 
 from aiopquic.asyncio.server import serve as aiopquic_serve
 from aiopquic.asyncio.webtransport import serve_webtransport
@@ -8,7 +8,7 @@ from aiopquic.quic.configuration import QuicConfiguration
 
 from .protocol import (DEFAULT_TX_MAX_INFLIGHT_BYTES, MOQTPeer,
                         MOQTSessionQuic, MOQTSessionWTServer)
-from .types import moqt_alpn_for_version, MOQT_ALPN
+from .types import moqt_alpn_for_version, moqt_version_from_draft, MOQTDraft
 from .utils.logger import *
 
 logger = get_logger(__name__)
@@ -25,6 +25,7 @@ class MOQTServer(MOQTPeer):
         path: Optional[str] = None,
         use_quic: Optional[bool] = False,
         draft_version: Optional[int] = None,
+        supported_drafts: Optional[List[int]] = None,
         debug: Optional[bool] = False,
         tx_max_inflight_bytes: Optional[int] = DEFAULT_TX_MAX_INFLIGHT_BYTES,
         tx_max_queued_bytes: Optional[int] = None,
@@ -37,12 +38,19 @@ class MOQTServer(MOQTPeer):
         self.port = port
         self.path = path
         self.use_quic = use_quic
-        # Public API: draft_version is the integer draft number (e.g.
-        # 14, 16). Normalize to the full IETF code internally so the
-        # rest of the codebase sees one form.
+        # Two-attribute discipline (symmetric with MOQTClient): drafts
+        # as short ints. A single-draft server is the Phase 0 scope;
+        # selecting among multiple client-offered drafts is a fast-follow
+        # that needs the aiopquic server-side ALPN/WT-protocol selector.
         if draft_version is not None:
-            from .types import moqt_version_from_draft
-            draft_version = moqt_version_from_draft(draft_version)
+            moqt_version_from_draft(draft_version)  # validate
+            self.supported_drafts = (draft_version,)
+        elif supported_drafts is not None:
+            for _d in supported_drafts:
+                moqt_version_from_draft(_d)  # validate each
+            self.supported_drafts = tuple(supported_drafts)
+        else:
+            self.supported_drafts = (MOQTDraft.DRAFT_16, MOQTDraft.DRAFT_14)
         self.draft_version = draft_version
         self.certificate = certificate
         self.private_key = private_key
@@ -69,10 +77,8 @@ class MOQTServer(MOQTPeer):
         logger.info(f"Starting MOQT server on {self.host}:{self.port}")
 
         if self.use_quic:
-            if self.draft_version is not None:
-                alpn = [moqt_alpn_for_version(self.draft_version)]
-            else:
-                alpn = [MOQT_ALPN]
+            alpn = [moqt_alpn_for_version(d)
+                    for d in sorted(self.supported_drafts, reverse=True)]
             cfg = QuicConfiguration(
                 alpn_protocols=alpn, is_client=False,
                 max_data=2**24, max_stream_data=2**24,
