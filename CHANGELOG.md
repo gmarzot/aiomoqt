@@ -20,6 +20,11 @@ change.
 ### moq_interop_client: auto-draft ALPN fallback
 
 - In auto mode (no `--draft`) on raw QUIC, the client probes the multi-version ALPN offer once and, if the handshake fails, pins **draft-14** (`moq-00`) for the run (surfaced as a `# note:` in the TAP output). A draft-14-only relay that picks the client's first offered ALPN (`moqt-16`) and refuses — rather than choosing the common `moq-00` — closes with QUIC 376 or stalls the handshake; the fallback recovers it. Verified against the public moq-rs draft-14 (Cloudflare) endpoint: auto goes **0/6 → 6/6**. Explicit `--draft` and WebTransport are unchanged. The 0.9.8 multi-version order was a global tradeoff (won d16-only relays, lost d14-strict moq-rs/xquic); this restores the d14 columns without giving up the d16 wins. General per-draft client negotiation remains the version-negotiation refactor's job.
+- `--draft` also reads a `DRAFT` env var (matching the existing `RELAY_URL` / `TESTCASE` env interface); the ALPN probe's handshake timeout is 5 s (d16 relays clear it in ~0.3 s).
+
+### Interop regression catalog (relays.json)
+
+- `relay-join` / `relay-fetch` no longer skipped wholesale: the suites run on every reachable relay so results are honest — pass where supported, fail where not — instead of hidden behind `disabled_suites`. Verified passing on moqx / moxygen / imquic (d14+d16) and cloudflare-d14 (join); the rest report real fails/timeouts.
 
 ## v0.9.8 (unreleased)
 

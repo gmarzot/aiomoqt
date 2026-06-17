@@ -101,7 +101,7 @@ def _format_exc(e: BaseException) -> str:
 
 
 async def _auto_alpn_ok(host, port, path, use_quic, tls_disable_verify,
-                        debug, timeout: float = 8.0) -> bool:
+                        debug, timeout: float = 5.0) -> bool:
     """Probe whether the auto (multi-version) ALPN offer establishes a
     raw-QUIC session. The auto client offers every version's ALPN,
     newest-first; a draft-14-only relay that picks the first (moqt-16)
@@ -836,8 +836,12 @@ def parse_args():
                         help="Skip TLS certificate verification")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug logging to stderr")
-    parser.add_argument("--draft", type=int, default=None,
-                        help="MoQT draft version (14 or 16, default: auto/14)")
+    parser.add_argument(
+        "--draft", type=int,
+        default=(int(os.environ["DRAFT"])
+                 if os.environ.get("DRAFT", "").strip().isdigit() else None),
+        help="MoQT draft version, e.g. 14 or 16 (env: DRAFT). Default: "
+             "auto — multi-version ALPN with a draft-14 handshake fallback")
     parser.add_argument(
         "--compat", type=str, default=os.environ.get("COMPAT", ""),
         help=(
