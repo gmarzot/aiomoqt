@@ -135,12 +135,20 @@ class MOQTServer(MOQTPeer):
         if self.socket_buffer_size is not None:
             wt_cfg.socket_buffer_size = self.socket_buffer_size
 
+        # Advertise the supported drafts as WT subprotocols (newest first)
+        # so picowt selects the highest mutual against the client's
+        # WT-Available-Protocols. Drafts >= 15 negotiate the version this
+        # way ("moqt-NN"); d14 uses the legacy in-band CLIENT_SETUP path.
+        wt_supported = [f"moqt-{d}"
+                        for d in sorted(self.supported_drafts, reverse=True)
+                        if d >= 15] or None
         return serve_webtransport(
             self.host, self.port, self.path or "",
             handler=handler,
             cert_file=self.certificate, key_file=self.private_key,
             session_factory=factory,
             configuration=wt_cfg,
+            wt_supported_protocols=wt_supported,
         )
 
     async def closed(self) -> bool:

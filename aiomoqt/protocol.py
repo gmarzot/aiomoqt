@@ -1208,13 +1208,22 @@ class _MOQTSessionMixin:
         else:
             # WebTransport over aiopquic. The WT session is open by the
             # time client_session_init runs (open() awaited already);
-            # _wt_session_setup is resolved in _moqt_wt_finalize. Open
-            # the MoQT control bidi stream and pin the version from
-            # draft (in-band wt-available-protocols negotiation isn't
-            # wired for v0.9.0; picowt supports it).
+            # _wt_session_setup is resolved in _moqt_wt_finalize. Resolve
+            # the draft from the negotiated WT-Protocol (in-band
+            # WT-Available-Protocols -> WT-Protocol selection, surfaced by
+            # aiopquic as negotiated_protocol); an explicit draft_version
+            # still wins.
             draft = getattr(self._session, 'draft_version', None)
             if draft is not None:
                 self._draft = get_major_version(draft)
+            else:
+                negotiated = self.negotiated_protocol
+                if negotiated:
+                    self._draft = get_major_version(
+                        moqt_version_from_alpn(negotiated))
+                    logger.info(
+                        f"MOQT: version set from WT-Protocol: "
+                        f"{negotiated} -> draft-{self._draft}")
             self._control_stream_id = await self.open_bidi_stream()
             logger.info(
                 f"MOQT: WT control stream created stream id: "
@@ -2497,13 +2506,17 @@ class MOQTSessionWTServer(
         if draft is not None:
             self._draft = get_major_version(draft)
         else:
-            # WT in-band version selection (WT-Available-Protocols ->
-            # WT-Protocol) isn't surfaced by aiopquic yet, so an unpinned
-            # WT server can't learn the client's draft. Default to the
-            # highest supported draft — matching the default WT client,
-            # which offers only moqt-{newest}. Pin draft_version for a
-            # specific draft until the in-band selector lands.
-            supported = getattr(session, 'supported_drafts', None)
-            if supported:
-                self._draft = max(get_major_version(d) for d in supported)
+            # Learn the client's draft from the WT-Protocol this server
+            # selected (in-band WT-Available-Protocols -> WT-Protocol
+            # negotiation, surfaced by aiopquic as negotiated_protocol).
+            # If no subprotocol was negotiated (client offered none, or no
+            # overlap), fall back to the highest supported draft.
+            negotiated = self.negotiated_protocol
+            if negotiated:
+                self._draft = get_major_version(
+                    moqt_version_from_alpn(negotiated))
+            else:
+                supported = getattr(session, 'supported_drafts', None)
+                if supported:
+                    self._draft = max(get_major_version(d) for d in supported)
         self._moqt_wt_finalize()

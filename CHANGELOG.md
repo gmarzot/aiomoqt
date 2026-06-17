@@ -52,11 +52,30 @@ unchanged). Internal-API breaking; no public class-surface change.
 - `MOQTClient` / `MOQTServer` accept `supported_drafts: list[int]`
   alongside `draft_version`. A pinned `draft_version` normalizes to a
   1-tuple; the default offers `(16, 14)` newest-first (preference order).
-  The raw-QUIC client locks its draft from the actually-negotiated ALPN.
-  A single-draft server covers the loopback matrix; multi-draft **server**
-  selection and WT in-band version selection are a deferred aiopquic
-  fast-follow (`alpn_select_fn`, clean no-ALPN failure,
-  `picowt_select_wt_protocol` + `WT-Protocol` read-back).
+
+### Full multi-version negotiation, both transports
+
+Requires the aiopquic negotiation APIs (aiopquic 0.3.8). Completes the
+fast-follow that was deferred above — both transports now negotiate the
+draft in-band, on the client **and** the server, with no draft pin:
+
+- **Raw QUIC.** A multi-draft client offers every supported ALPN; the
+  server selects the highest mutual (aiopquic's `alpn_select_fn`); both
+  ends lock `self._draft` from the negotiated ALPN (`ProtocolNegotiated`).
+  A client offering several drafts now settles on a **lower** server draft
+  (e.g. d14) too — the former picky-d14 limitation is gone. No common
+  draft fails the connect promptly (clean `ConnectionError`) instead of
+  hanging.
+- **WebTransport.** The server advertises its drafts as
+  `WT-Available-Protocols`; `MOQTServer` passes them via
+  `serve_webtransport(wt_supported_protocols=...)`. Both client and
+  server derive `self._draft` from the negotiated `WT-Protocol`
+  (`negotiated_protocol`) instead of defaulting to `max(supported_drafts)`.
+  No subprotocol negotiated → highest-supported fallback (session still
+  opens; WT-Protocol is optional).
+- `test_multi_version_handshake.py`: the three formerly-skipped matrix
+  cells (multi-offer→lower draft, no-common-ALPN→clean fail, WT in-band
+  read-back) are live and green.
 
 ### Spec-compliant bounded parsing
 
