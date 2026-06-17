@@ -17,6 +17,10 @@ change.
 - **Setpoint quantized:** the targeted count snaps to whole groups (`workers × K`), so the reported Target equals the capacity actually hosted instead of reading below it.
 - **Mature-only latency:** the p90/mean that drive the SLA back-off count only mature workers. A joining group's catch-up burst (old send-timestamps → seconds-scale p90, seen against backlog-replaying relays) no longer trips a false back-off; sustained congestion still registers once a worker matures.
 
+### moq_interop_client: auto-draft ALPN fallback
+
+- In auto mode (no `--draft`) on raw QUIC, the client probes the multi-version ALPN offer once and, if the handshake fails, pins **draft-14** (`moq-00`) for the run (surfaced as a `# note:` in the TAP output). A draft-14-only relay that picks the client's first offered ALPN (`moqt-16`) and refuses — rather than choosing the common `moq-00` — closes with QUIC 376 or stalls the handshake; the fallback recovers it. Verified against the public moq-rs draft-14 (Cloudflare) endpoint: auto goes **0/6 → 6/6**. Explicit `--draft` and WebTransport are unchanged. The 0.9.8 multi-version order was a global tradeoff (won d16-only relays, lost d14-strict moq-rs/xquic); this restores the d14 columns without giving up the d16 wins. General per-draft client negotiation remains the version-negotiation refactor's job.
+
 ## v0.9.8 (unreleased)
 
 Pairs with aiopquic 0.3.8; dep floor `aiopquic>=0.3.7` → `aiopquic>=0.3.8`
