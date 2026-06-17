@@ -46,6 +46,13 @@ PROFILES = {
     MOQTDraft.DRAFT_16: DraftProfile(
         draft=MOQTDraft.DRAFT_16, setup_carries_versions=False,
         params_delta_coded=True),
+    # draft-18 negotiates out-of-band (ALPN/WT-Protocol) like d16 and uses
+    # delta-coded params. The d18-specific behaviors (vi64 codec, uni
+    # control-stream pair, per-type param value encodings) become DraftProfile
+    # columns as the phases that consume them land.
+    MOQTDraft.DRAFT_18: DraftProfile(
+        draft=MOQTDraft.DRAFT_18, setup_carries_versions=False,
+        params_delta_coded=True),
 }
 
 

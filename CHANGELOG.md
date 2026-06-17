@@ -77,6 +77,23 @@ draft in-band, on the client **and** the server, with no draft pin:
   cells (multi-offer→lower draft, no-common-ALPN→clean fail, WT in-band
   read-back) are live and green.
 
+### draft-18 dispatch tier (Phase 2 scaffold)
+
+The structural slot for draft-18, slotting into the Phase 0.C spine — no
+`is_draft18_or_later()` predicate, just one more row/key:
+
+- `MOQTDraft.DRAFT_18 = 18` + `MOQT_VERSION_DRAFT18` (`0xff000012`);
+  `moqt_version_from_draft` now validates the speakable set against
+  `MOQTDraft` (so draft 18 is accepted) rather than the legacy d14 in-band
+  list `MOQT_VERSIONS` (unchanged — d16+ negotiate via ALPN/WT-Protocol).
+- `PROFILES[18]` (out-of-band negotiation, delta-coded params) and a
+  distinct `CONTROL_REGISTRY[18]` (per-draft dict; no shared state with
+  d14/d16). The registry starts from d16 and is amended with the d18 wire
+  deltas as the d18 message classes land (`aiomoqt/messages/d18/`).
+- **Gated**: `AIOMOQT_ENABLE_D18=1` is required to select draft 18
+  (`require_d18_enabled`), so the incomplete d18 wire is never used by
+  accident; default sessions `(16, 14)` are unaffected.
+
 ### Spec-compliant bounded parsing
 
 - `_deserialize_params` enforces the control-frame `Length` extent: a

@@ -2398,9 +2398,21 @@ class _MOQTSessionMixin:
     # d16 namespace discovery against this library.
     _D16_REGISTRY = {**MOQT_CONTROL_MESSAGE_REGISTRY, **_D16_DELTA}
 
+    # draft-18 dispatch tier (Phase 2 scaffold). Starts from the d16
+    # registry — most control messages carry over — and is amended with the
+    # d18 wire deltas as the d18 message classes land: type renumbering
+    # (SUBSCRIBE_NAMESPACE 0x11->0x50, SUBSCRIBE_TRACKS 0x51,
+    # PUBLISH_BLOCKED 0xF, SETUP 0x2F00), Request-ID-dropping replies, and
+    # removed messages (Phases 3/5/6, under aiomoqt/messages/d18/). Gated by
+    # AIOMOQT_ENABLE_D18 at the session API so it stays inert until the d18
+    # wire is complete — a per-draft dict, so it never shares mutable state
+    # with d14/d16 sessions.
+    _D18_REGISTRY = dict(_D16_REGISTRY)
+
     CONTROL_REGISTRY: Dict[int, Dict[int, Tuple[Type[MOQTMessage], Callable]]] = {
         MOQTDraft.DRAFT_14: MOQT_CONTROL_MESSAGE_REGISTRY,
         MOQTDraft.DRAFT_16: _D16_REGISTRY,
+        MOQTDraft.DRAFT_18: _D18_REGISTRY,
     }
 
     # Stream data message types (dispatch by range check, not registry lookup)

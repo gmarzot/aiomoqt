@@ -1,8 +1,13 @@
+import os
 from enum import IntEnum
 
 MOQT_VERSION_DRAFT14 = 0xff00000e
 MOQT_VERSION_DRAFT16 = 0xff000010
+MOQT_VERSION_DRAFT18 = 0xff000012
 
+# Legacy d14 in-band offer list (CLIENT_SETUP versions[]). d16+ negotiate
+# out-of-band via ALPN / WT-Protocol, so d18 is intentionally NOT added
+# here — the set of drafts we can speak is MOQTDraft, below.
 MOQT_VERSIONS = [
     MOQT_VERSION_DRAFT14,
     MOQT_VERSION_DRAFT16,
@@ -14,10 +19,11 @@ class MOQTDraft(IntEnum):
     """Supported MoQT draft numbers — the canonical version form for the
     high/mid layers (dispatch-table keys, supported_drafts, the draft=
     kwarg). The IETF wire code is MOQT_VERSION_DRAFT*; the ALPN is
-    moqt_alpn_for_version(). draft-18 is added here in Phase 2.
+    moqt_alpn_for_version().
     """
     DRAFT_14 = 14
     DRAFT_16 = 16
+    DRAFT_18 = 18
 
 
 # ALPN: draft-14 uses legacy "moq-00"; draft-16+ uses "moqt-NN"
@@ -57,20 +63,37 @@ def moqt_version_from_draft(draft: int) -> int:
     callers passing the full hex form like 0xff000010 hit this) or
     if the draft number is not one aiomoqt knows how to speak.
     """
-    supported = sorted(v & 0xff for v in MOQT_VERSIONS)
+    # The set of drafts we can speak is MOQTDraft (not MOQT_VERSIONS,
+    # which is only the legacy d14 in-band offer list).
+    supported = sorted(int(d) for d in MOQTDraft)
     if not isinstance(draft, int) or draft < 0 or draft > 0xff:
         raise ValueError(
             f"MOQT draft must be a small integer (e.g. {supported}); "
             f"got {draft!r}. Pass the draft number, not the IETF "
             f"version code."
         )
-    full = 0xff000000 | (draft & 0xff)
-    if full not in MOQT_VERSIONS:
+    if draft not in supported:
         raise ValueError(
             f"MOQT draft {draft} not supported. "
             f"Supported drafts: {supported}"
         )
-    return full
+    return 0xff000000 | (draft & 0xff)
+
+
+def require_d18_enabled(drafts) -> None:
+    """Gate experimental draft-18 behind AIOMOQT_ENABLE_D18.
+
+    The d18 wire is built incrementally (type renumbering, uni control
+    pair, vi64 data plane); until it is complete and interop-proven, a
+    session must opt in explicitly so d18 is never selected by accident.
+    No-op unless 18 is among the requested drafts.
+    """
+    if 18 in {int(d) for d in drafts} and not os.environ.get(
+            "AIOMOQT_ENABLE_D18"):
+        raise ValueError(
+            "draft-18 support is experimental and incomplete; set "
+            "AIOMOQT_ENABLE_D18=1 to enable it."
+        )
 
 MOQT_DEFAULT_PRIORITY = 128
 

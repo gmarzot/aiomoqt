@@ -8,7 +8,8 @@ from aiopquic.quic.configuration import QuicConfiguration
 
 from .protocol import (DEFAULT_TX_MAX_INFLIGHT_BYTES, MOQTPeer,
                         MOQTSessionQuic, MOQTSessionWTServer)
-from .types import moqt_alpn_for_version, moqt_version_from_draft, MOQTDraft
+from .types import (moqt_alpn_for_version, moqt_version_from_draft,
+                    MOQTDraft, require_d18_enabled)
 from .utils.logger import *
 
 logger = get_logger(__name__)
@@ -51,6 +52,7 @@ class MOQTServer(MOQTPeer):
             self.supported_drafts = tuple(supported_drafts)
         else:
             self.supported_drafts = (MOQTDraft.DRAFT_16, MOQTDraft.DRAFT_14)
+        require_d18_enabled(self.supported_drafts)
         self.draft_version = draft_version
         self.certificate = certificate
         self.private_key = private_key
