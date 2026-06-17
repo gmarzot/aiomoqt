@@ -77,6 +77,15 @@ def parse_args():
         '-q', '--quic', '--use-quic', action='store_true',
         help='Use raw QUIC instead of WebTransport (default: WT)')
     parser.add_argument(
+        '-D', '--draft', type=int, default=14,
+        help='MoQT draft version to negotiate (e.g. 14 or 16, '
+             'default: 14). Applied to BOTH the loopback publisher '
+             '(server) and subscriber (client) so the raw-QUIC ALPN '
+             '("moq-00" for d14, "moqt-NN" for d16+) and the WT version '
+             'match. Auto-negotiation is intentionally not used here: a '
+             'd14 server offers only "moq-00" while a d16+ client offers '
+             '"moqt-NN", so the asymmetric ALPN offer fails to connect.')
+    parser.add_argument(
         '--cc-algo', type=str, default=None,
         help='Congestion control algorithm '
              '(bbr | bbr1 | newreno | cubic | dcubic | prague | fast). '
@@ -113,6 +122,7 @@ def print_banner(args):
     print("  aiomoqt-bench loopback (no relay)")
     print("─" * 56)
     print(f"  transport:   {transport_label}")
+    print(f"  draft:       {args.draft}")
     print(f"  mode:        {mode}")
     print(f"  object size: {args.object_size} B")
     print(f"  group size:  {args.group_size} objects")
@@ -153,6 +163,7 @@ async def run_server(args):
         certificate=args.cert, private_key=args.key,
         path="/",
         use_quic=args.quic,
+        draft_version=args.draft,
         congestion_control_algorithm=args.cc_algo,
         # None = honor protocol default (16 MB); 0 = opt out.
         **({'tx_max_inflight_bytes':
@@ -176,6 +187,7 @@ async def run_subscriber(args, stats):
         use_quic=args.quic,
         verify_tls=False,
         debug=args.debug,
+        draft_version=args.draft,
         congestion_control_algorithm=args.cc_algo,
     )
 

@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.9.9 (unreleased)
+
+Pairs with aiopquic 0.3.8 (no aiopquic change). Targeted follow-up to
+v0.9.8 fixing two bench-tool regressions; examples only, no core
+library change.
+
+### loopback_bench: explicit draft (raw-QUIC auto fix)
+
+- `loopback_bench` gains `-D` / `--draft` (default **14**), applied to **both** the loopback publisher (server) and subscriber (client) so the raw-QUIC ALPN (`moq-00` for d14, `moqt-NN` for d16+) and the WT version match per side. Previously it passed no draft, so in raw-QUIC mode the auto client offered `["moqt-16", "moq-00"]` while the auto server offered only `moq-00`; aiopquic's server-side ALPN selection rejected the asymmetric offer and the connection closed with QUIC code 376 (`no_application_protocol`) before SERVER_SETUP — the publisher rejecting its own subscriber. This is the same "pin an explicit draft (single ALPN per side)" fix already applied to the loopback fetch/join self-tests in v0.9.8; `loopback_bench` was missed. Server-side multi-ALPN acceptance remains deferred to the version-negotiation refactor.
+
+### adaptive_bench subs-mode controller
+
+- **Shortfall settle gating:** a freshly-added subscriber group (one worker hosting K = `--step-subs` self-healing slots) is no longer counted as a shortfall while it is still bringing its slots online. Shortfall is now judged only against **mature** workers — those past their startup grace — so the controller no longer stalls the ramp the instant it adds a group whose K subs have not finished handshaking/subscribing. A group that never delivers is still caught by the starve reaper.
+- **Group-granular probing:** the subs-mode step floor is now the group size (`--step-subs`) instead of 1. After a back-off, re-probes add one whole self-healing group (a worker that ramps to K) rather than crawling up one subscriber at a time.
+
 ## v0.9.8 (unreleased)
 
 Pairs with aiopquic 0.3.8; dep floor `aiopquic>=0.3.7` → `aiopquic>=0.3.8`
