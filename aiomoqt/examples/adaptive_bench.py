@@ -591,10 +591,14 @@ class SubsActuator:
         self._reap_dead()
         target = max(int(self.min_level), min(int(self.max_level),
                                               int(round(level))))
+        # Quantize the setpoint to whole groups (workers * K) so reported
+        # Target matches the capacity ceil(target / K) actually hosts — a
+        # sub-group back-off would otherwise leave it fractional.
+        max_workers = max(1, -(-int(self.max_level) // self.batch_size))
+        workers_target = max(1, min(max_workers,
+                                    -(-target // self.batch_size)))
+        target = workers_target * self.batch_size
         self._targeted = float(target)
-        # Workers host K subs each; cover the targeted sub count by
-        # ceil(target / K) worker processes.
-        workers_target = -(-target // self.batch_size)
         # Spawn-up is BOUNDED to one worker (one group of K) per call:
         # the controller adds a group every --join-rate, so an unbounded
         # respawn can't fire dozens of simultaneous batches at a
@@ -730,8 +734,14 @@ class SubsActuator:
             # to Mbps using STATS_INTERVAL_S.
             rx_bytes = s.get('rx_bytes', 0)
             rx_bps_total += rx_bytes * 8
-            worst_p90 = max(worst_p90, s.get('lat_p90_ms', 0.0))
-            worst_mean = max(worst_mean, s.get('lat_mean_ms', 0.0))
+            # Latency drives the back-off, so only MATURE workers feed it:
+            # a worker still in its startup grace is catching up (old
+            # send-timestamps -> seconds-scale p90) and would trip the SLA
+            # back-off on every group add. Sustained congestion still
+            # registers once it matures.
+            if (now - self._spawned_t.get(wid, now)) >= startup_grace:
+                worst_p90 = max(worst_p90, s.get('lat_p90_ms', 0.0))
+                worst_mean = max(worst_mean, s.get('lat_mean_ms', 0.0))
             loss_ct = s.get('loss', 0)
             total = s.get('total_objs', 0) or 1
             lpct = 100.0 * loss_ct / (loss_ct + total) if (loss_ct + total) else 0.0
@@ -1060,6 +1070,12 @@ class AIMDController:
             # converge inside the bracket we've already bisected.
             pivot_gain = 1.0 / (1.0 + 0.4 * len(self.pivots))
             step = a.initial_step * latency_gain * pivot_gain
+            if a.unit == "subs":
+                # Group-quantize: the actuator only adds whole workers, so
+                # round the step to whole groups. It ramps one group/tick
+                # until pivot-gain rounds it to zero, then the probe path
+                # below converges — instead of sticky sub-group holds.
+                step = round(step / a.step_floor) * a.step_floor
             if step < a.step_floor:
                 # Held by pivot-gain convergence. If headroom is plentiful
                 # (conditions clearly healthy), probe upward by step_floor

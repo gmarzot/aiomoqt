@@ -3,8 +3,8 @@
 ## v0.9.9 (unreleased)
 
 Pairs with aiopquic 0.3.8 (no aiopquic change). Targeted follow-up to
-v0.9.8 fixing two bench-tool regressions; examples only, no core
-library change.
+v0.9.8 fixing bench-tool regressions; examples only, no core library
+change.
 
 ### loopback_bench: explicit draft (raw-QUIC auto fix)
 
@@ -12,8 +12,10 @@ library change.
 
 ### adaptive_bench subs-mode controller
 
-- **Shortfall settle gating:** a freshly-added subscriber group (one worker hosting K = `--step-subs` self-healing slots) is no longer counted as a shortfall while it is still bringing its slots online. Shortfall is now judged only against **mature** workers — those past their startup grace — so the controller no longer stalls the ramp the instant it adds a group whose K subs have not finished handshaking/subscribing. A group that never delivers is still caught by the starve reaper.
-- **Group-granular probing:** the subs-mode step floor is now the group size (`--step-subs`) instead of 1. After a back-off, re-probes add one whole self-healing group (a worker that ramps to K) rather than crawling up one subscriber at a time.
+- **Shortfall settle gating:** a freshly-added group (one worker hosting K = `--step-subs` self-healing slots) is judged for shortfall only once **mature** (past its startup grace), so the controller no longer stalls the ramp the instant it adds a group whose K subs are still handshaking. A group that never delivers is still caught by the starve reaper.
+- **Group-quantized ramp:** the subs-mode step is rounded to whole groups (floor = `--step-subs`, not 1), so ramps/probes move one whole self-healing group at a time — no 1-subscriber crawl, and no sticky sub-group holds after a back-off.
+- **Setpoint quantized:** the targeted count snaps to whole groups (`workers × K`), so the reported Target equals the capacity actually hosted instead of reading below it.
+- **Mature-only latency:** the p90/mean that drive the SLA back-off count only mature workers. A joining group's catch-up burst (old send-timestamps → seconds-scale p90, seen against backlog-replaying relays) no longer trips a false back-off; sustained congestion still registers once a worker matures.
 
 ## v0.9.8 (unreleased)
 
