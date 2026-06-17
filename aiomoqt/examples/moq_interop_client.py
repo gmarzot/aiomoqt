@@ -100,6 +100,27 @@ def _format_exc(e: BaseException) -> str:
     return f"{cls}: {msg}" if cls not in msg else msg
 
 
+async def _auto_alpn_ok(host, port, path, use_quic, tls_disable_verify,
+                        debug, timeout: float = 5.0) -> bool:
+    """Probe whether the auto (multi-version) ALPN offer establishes a
+    raw-QUIC session. The auto client offers every version's ALPN,
+    newest-first; a draft-14-only relay that picks the first (moqt-16)
+    and refuses — rather than choosing the common moq-00 — fails the
+    handshake (QUIC 376 no_application_protocol, or a stalled handshake
+    that times out). Returns True iff SETUP completes; a False (any
+    handshake/setup failure) is the signal to pin draft-14 (moq-00)."""
+    client = _make_client(host, port, path, use_quic,
+                          tls_disable_verify, debug, draft_version=None)
+    try:
+        async with asyncio.timeout(timeout):
+            async with client.connect() as session:
+                await session.client_session_init()
+                session.close()
+        return True
+    except Exception:
+        return False
+
+
 def _utc_now_iso() -> str:
     return (
         datetime.datetime.now(datetime.timezone.utc)
@@ -163,6 +184,7 @@ class TAPReporter:
         self.compat = compat
         self.started_at = _utc_now_iso()
         self.ended_at = ""
+        self.notes: list[str] = []
 
     def add(self, result: TestResult):
         self.results.append(result)
@@ -182,6 +204,8 @@ class TAPReporter:
             lines.append(f"# version: aiomoqt/{self.aiomoqt_version}")
         if self.compat:
             lines.append(f"# compat: {','.join(sorted(self.compat))}")
+        for note in self.notes:
+            lines.append(f"# note: {note}")
         lines.append(f"1..{len(self.results)}")
         for i, r in enumerate(self.results, 1):
             status = "ok" if r.passed else "not ok"
@@ -812,8 +836,12 @@ def parse_args():
                         help="Skip TLS certificate verification")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug logging to stderr")
-    parser.add_argument("--draft", type=int, default=None,
-                        help="MoQT draft version (14 or 16, default: auto/14)")
+    parser.add_argument(
+        "--draft", type=int,
+        default=(int(os.environ["DRAFT"])
+                 if os.environ.get("DRAFT", "").strip().isdigit() else None),
+        help="MoQT draft version, e.g. 14 or 16 (env: DRAFT). Default: "
+             "auto — multi-version ALPN with a draft-14 handshake fallback")
     parser.add_argument(
         "--compat", type=str, default=os.environ.get("COMPAT", ""),
         help=(
@@ -860,6 +888,17 @@ async def run_tests(tests: list[str], host: str, port: int, path: str,
     # own announce slot.
     global INTEROP_NAMESPACE
     base_namespace = INTEROP_NAMESPACE
+    # Auto-draft ALPN fallback (raw QUIC only): probe the auto offer once;
+    # if its handshake fails, pin draft-14 so a draft-14-only relay that
+    # rejects the multi-version offer (moq-rs / xquic) negotiates moq-00
+    # instead of failing every case. Explicit --draft and WT are untouched.
+    effective_draft = draft_version
+    if draft_version is None and use_quic and not await _auto_alpn_ok(
+            host, port, path, use_quic, tls_disable_verify, debug):
+        effective_draft = 14
+        reporter.notes.append(
+            "auto multi-version ALPN handshake failed; "
+            "pinned draft-14 (moq-00)")
     for test_name in tests:
         fn = TEST_FUNCTIONS.get(test_name)
         if fn is None:
@@ -871,7 +910,7 @@ async def run_tests(tests: list[str], host: str, port: int, path: str,
         INTEROP_NAMESPACE = f"{base_namespace}/{test_name}"
         nc_before = MOQTMessage._trailing_extensions_truncation_count
         result = await fn(host, port, path, use_quic, tls_disable_verify,
-                          debug, draft_version=draft_version, compat=compat)
+                          debug, draft_version=effective_draft, compat=compat)
         nc_delta = (
             MOQTMessage._trailing_extensions_truncation_count - nc_before
         )

@@ -519,7 +519,14 @@ class SubsActuator:
         self.force_quic = force_quic
         self.min_level = float(min_subs)
         self.max_level = float(max_subs)
-        self.step_floor = 1.0
+        # A group (one worker) hosts K = step_subs self-healing subs and
+        # can't be resized after spawn, so the smallest meaningful change
+        # in load is ONE GROUP. Probing/ramping by less than a group is a
+        # no-op until the targeted count crosses a K-boundary (apply()
+        # spawns workers by ceil(target / K)). Floor the step at the group
+        # size so every probe adds a whole worker that then ramps its K
+        # slots up — the worker-granular form of "trend up to --step-subs".
+        self.step_floor = float(max(1, int(step_subs)))
         self.initial_step = float(step_subs)
         self.initial_level = float(start_subs)
         self.object_size = object_size
@@ -584,10 +591,14 @@ class SubsActuator:
         self._reap_dead()
         target = max(int(self.min_level), min(int(self.max_level),
                                               int(round(level))))
+        # Quantize the setpoint to whole groups (workers * K) so reported
+        # Target matches the capacity ceil(target / K) actually hosts — a
+        # sub-group back-off would otherwise leave it fractional.
+        max_workers = max(1, -(-int(self.max_level) // self.batch_size))
+        workers_target = max(1, min(max_workers,
+                                    -(-target // self.batch_size)))
+        target = workers_target * self.batch_size
         self._targeted = float(target)
-        # Workers host K subs each; cover the targeted sub count by
-        # ceil(target / K) worker processes.
-        workers_target = -(-target // self.batch_size)
         # Spawn-up is BOUNDED to one worker (one group of K) per call:
         # the controller adds a group every --join-rate, so an unbounded
         # respawn can't fire dozens of simultaneous batches at a
@@ -723,8 +734,14 @@ class SubsActuator:
             # to Mbps using STATS_INTERVAL_S.
             rx_bytes = s.get('rx_bytes', 0)
             rx_bps_total += rx_bytes * 8
-            worst_p90 = max(worst_p90, s.get('lat_p90_ms', 0.0))
-            worst_mean = max(worst_mean, s.get('lat_mean_ms', 0.0))
+            # Latency drives the back-off, so only MATURE workers feed it:
+            # a worker still in its startup grace is catching up (old
+            # send-timestamps -> seconds-scale p90) and would trip the SLA
+            # back-off on every group add. Sustained congestion still
+            # registers once it matures.
+            if (now - self._spawned_t.get(wid, now)) >= startup_grace:
+                worst_p90 = max(worst_p90, s.get('lat_p90_ms', 0.0))
+                worst_mean = max(worst_mean, s.get('lat_mean_ms', 0.0))
             loss_ct = s.get('loss', 0)
             total = s.get('total_objs', 0) or 1
             lpct = 100.0 * loss_ct / (loss_ct + total) if (loss_ct + total) else 0.0
@@ -740,7 +757,27 @@ class SubsActuator:
         # of triggering a respawn).
         target_subs = int(self._targeted)
 
-        if active_subs < target_subs:
+        # Shortfall is judged only against MATURE workers — those past
+        # their startup grace. A freshly-spawned group spends its first
+        # `startup_grace` bringing K slots online (staggered by --stagger)
+        # and self-healing the stragglers; holding it to its full K
+        # immediately would read that ramp-up as a deficit and trip a
+        # false shortfall the instant the controller adds a group. So a
+        # still-settling group is excluded from BOTH sides of the test
+        # until its slots have had time to come up. Capped at the setpoint
+        # so a partial final batch isn't over-expected. A group that never
+        # delivers is still caught by the starve reaper above
+        # (failed_this_window), which forces the shortfall independently.
+        mature_active = 0
+        mature_target = 0
+        for wid in self._workers:
+            if (now - self._spawned_t.get(wid, now)) < startup_grace:
+                continue
+            mature_active += int(self._latest_batch.get(wid, {}).get('active', 0))
+            mature_target += self.batch_size
+        mature_target = min(mature_target, target_subs)
+
+        if mature_active < mature_target:
             self._shortfall_streak += 1
         else:
             self._shortfall_streak = 0
@@ -748,7 +785,7 @@ class SubsActuator:
 
         if failed_this_window > 0:
             health = "failing"
-        elif active_subs < target_subs:
+        elif mature_active < mature_target:
             health = "degraded"
         else:
             health = "ok"
@@ -1033,6 +1070,12 @@ class AIMDController:
             # converge inside the bracket we've already bisected.
             pivot_gain = 1.0 / (1.0 + 0.4 * len(self.pivots))
             step = a.initial_step * latency_gain * pivot_gain
+            if a.unit == "subs":
+                # Group-quantize: the actuator only adds whole workers, so
+                # round the step to whole groups. It ramps one group/tick
+                # until pivot-gain rounds it to zero, then the probe path
+                # below converges — instead of sticky sub-group holds.
+                step = round(step / a.step_floor) * a.step_floor
             if step < a.step_floor:
                 # Held by pivot-gain convergence. If headroom is plentiful
                 # (conditions clearly healthy), probe upward by step_floor
