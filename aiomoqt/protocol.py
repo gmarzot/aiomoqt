@@ -1608,6 +1608,21 @@ class _MOQTSessionMixin:
         else:
             self.send_control_message(msg)
 
+    def _send_request(self, request_id: int, msg: MOQTMessage) -> None:
+        """Send a request-stream opener. In d18 every request (SUBSCRIBE,
+        PUBLISH, FETCH, TRACK_STATUS, PUBLISH_NAMESPACE, ...) opens its own
+        bidi stream and the response returns on it (no in-band Request ID);
+        pre-d18 requests go on the single control stream. Raw-QUIC stream-id
+        allocation is synchronous, so callers stay sync."""
+        if profile_for(self._draft).control_uni_pair:
+            stream_id = self._quic.get_next_available_stream_id(
+                is_unidirectional=False)
+            self._bidi_streams[request_id] = stream_id
+            self._bidi_stream_requests[stream_id] = request_id
+            self.send_stream_message(stream_id, msg)
+        else:
+            self.send_control_message(msg)
+
     # Messages that open a request stream (must be the first message on a
     # new bidi stream). d16 only uses SUBSCRIBE_NAMESPACE here; d18 routes
     # all requests onto their own bidi stream. (SUBSCRIBE_TRACKS 0x51 lands
@@ -1721,17 +1736,7 @@ class _MOQTSessionMixin:
         message.libquicr_compat = self._session.libquicr_compat
         self._subscriptions[request_id] = [message]
         logger.info(f"MOQT send: {message}")
-        if profile_for(self._draft).control_uni_pair:
-            # d18: each request opens its own bidi stream; the reply comes
-            # back on that same stream (no Request ID). Raw-QUIC stream-id
-            # allocation is synchronous, so subscribe() stays sync.
-            stream_id = self._quic.get_next_available_stream_id(
-                is_unidirectional=False)
-            self._bidi_streams[request_id] = stream_id
-            self._bidi_stream_requests[stream_id] = request_id
-            self.send_stream_message(stream_id, message)
-        else:
-            self.send_control_message(message)
+        self._send_request(request_id, message)
 
         if not wait_response:
             return message
@@ -2005,7 +2010,7 @@ class _MOQTSessionMixin:
         if wait_response:
             self._pending_requests[request_id] = self._loop.create_future()
         logger.info(f"MOQT send: {message}")
-        self.send_control_message(message)
+        self._send_request(request_id, message)
 
         if not wait_response:
             return message
@@ -2043,7 +2048,7 @@ class _MOQTSessionMixin:
             parameters=parameters or {},
         )
         logger.info(f"MOQT send: {message}")
-        self.send_control_message(message)
+        self._send_request(request_id, message)
 
         if not wait_response:
             return message

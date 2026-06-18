@@ -386,18 +386,23 @@ class MOQTMessage:
         """
         if delta_keys is None:
             delta_keys = profile_for(draft).params_delta_coded
+        # d18 encodes every control integer as vi64 (count, delta-keys,
+        # lengths, even-type values); pre-d18 uses the RFC9000 varint.
+        push = (payload.push_uint_vi64
+                if profile_for(draft).varint == "vi64"
+                else payload.push_uint_var)
         if delta_keys:
             # Sort by key for delta encoding
             parameters = dict(sorted(parameters.items()))
-        payload.push_uint_var(len(parameters))
+        push(len(parameters))
         prev_key = 0
         for param_type, param_value in parameters.items():
             if delta_keys:
-                payload.push_uint_var(param_type - prev_key)
+                push(param_type - prev_key)
                 prev_key = param_type
             else:
-                payload.push_uint_var(param_type)  # Type
-            
+                push(param_type)  # Type
+
             if param_type % 2 == 1:  # Odd type - includes Length field
                 # Value is bytes or string
                 if isinstance(param_value, str):
@@ -408,21 +413,24 @@ class MOQTMessage:
                 # AUTH_TOKEN requires Token structure wrapping (Section 9.2.1.1)
                 if param_type in (ParamType.AUTH_TOKEN, SetupParamType.AUTH_TOKEN):
                     token_buf = Buffer(capacity=BUF_SIZE)
-                    token_buf.push_uint_var(AuthTokenAliasType.USE_VALUE)  # Alias Type
-                    token_buf.push_uint_var(0)  # Token Type (0 = out-of-band)
+                    tpush = (token_buf.push_uint_vi64
+                             if profile_for(draft).varint == "vi64"
+                             else token_buf.push_uint_var)
+                    tpush(AuthTokenAliasType.USE_VALUE)  # Alias Type
+                    tpush(0)  # Token Type (0 = out-of-band)
                     token_buf.push_bytes(param_value)  # Token Value (rest of param)
                     param_value = token_buf.data_slice(0, token_buf.tell())
                     logger.info(f"Serializing AUTH_TOKEN param as Token(USE_VALUE): {len(param_value)} bytes")
 
                 logger.info(f"Serializing param {param_type} length {len(param_value)}")
-                payload.push_uint_var(len(param_value))  # Length
+                push(len(param_value))  # Length
                 payload.push_bytes(param_value)  # Value
             else:  # Even type - Value is varint (no Length field)
                 if not isinstance(param_value, int):
                     raise TypeError(f"Param {param_type} expects uint, got {type(param_value)}")
                 logger.info(f"Serializing param {param_type} value {param_value}")
-                payload.push_uint_var(param_value)  # Value as varint
-                
+                push(param_value)  # Value as varint
+
         logger.info(f"Serialized {len(parameters)} parameters: {payload.data_slice(0,12)}")
 
 
@@ -444,8 +452,12 @@ class MOQTMessage:
         """
         if delta_keys is None:
             delta_keys = profile_for(draft).params_delta_coded
+        # d18 decodes every control integer as vi64; pre-d18 RFC9000.
+        pull = (buf.pull_uint_vi64
+                if profile_for(draft).varint == "vi64"
+                else buf.pull_uint_var)
         params = {}
-        param_count = buf.pull_uint_var()
+        param_count = pull()
         prev_key = 0
 
         for _ in range(param_count):
@@ -453,15 +465,15 @@ class MOQTMessage:
                 raise MOQTProtocolViolation(
                     f"parameters declared {param_count} but buffer "
                     f"exhausted at {buf.tell()}/{buf_end}")
-            raw_key = buf.pull_uint_var()
+            raw_key = pull()
             if delta_keys:
                 param_type = prev_key + raw_key
                 prev_key = param_type
             else:
                 param_type = raw_key
-            
+
             if param_type % 2 == 1:  # Odd type - includes Length field
-                param_len = buf.pull_uint_var()
+                param_len = pull()
                 if param_len > 65535:  # 2^16-1 maximum
                     raise MOQTProtocolViolation(
                         "parameter length exceeds maximum of 65535 bytes")
@@ -475,20 +487,23 @@ class MOQTMessage:
                 # AUTH_TOKEN: unwrap Token structure (Section 9.2.1.1)
                 if param_type in (ParamType.AUTH_TOKEN, SetupParamType.AUTH_TOKEN) and param_len > 0:
                     token_buf = Buffer(data=param_value)
-                    alias_type = token_buf.pull_uint_var()
+                    tpull = (token_buf.pull_uint_vi64
+                             if profile_for(draft).varint == "vi64"
+                             else token_buf.pull_uint_var)
+                    alias_type = tpull()
                     if alias_type == AuthTokenAliasType.USE_VALUE:
-                        token_type = token_buf.pull_uint_var()
+                        token_type = tpull()
                         param_value = token_buf.pull_bytes(param_len - token_buf.tell())
                     elif alias_type == AuthTokenAliasType.USE_ALIAS:
-                        token_alias = token_buf.pull_uint_var()
+                        token_alias = tpull()
                         param_value = param_value  # keep raw for now
                     elif alias_type == AuthTokenAliasType.REGISTER:
-                        token_alias = token_buf.pull_uint_var()
-                        token_type = token_buf.pull_uint_var()
+                        token_alias = tpull()
+                        token_type = tpull()
                         param_value = token_buf.pull_bytes(param_len - token_buf.tell())
                     logger.info(f"AUTH_TOKEN: alias_type={alias_type} value={len(param_value)} bytes")
             else:  # Even type - Value is varint
-                param_value = buf.pull_uint_var()
+                param_value = pull()
             # Even-type varints are self-describing, so the frame bound
             # is checked after the read: an over-read past buf_end is a
             # wire violation, not a silent consume into the next message.
