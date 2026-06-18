@@ -1,6 +1,16 @@
 # Changelog
 
-## v0.9.10 (unreleased)
+## v0.9.11 (unreleased)
+
+### moq_interop_client: accept any structured error as a valid rejection
+
+- `subscribe-error`, `subscribe-before-announce`, and `join` now accept **any** structured error response (SUBSCRIBE_ERROR / REQUEST_ERROR, any code) as a valid "relay refused the request" outcome **by default** — the interop assertion is that the relay *rejected*; the exact error code is now *noted*, not required. This lifts relays that reject correctly but with non-spec codes (e.g. moq-dev-rs's HTTP-style `404 "Broadcast not found"`) on the public runner, where no per-relay `--compat` flag is passed. A timeout / transport error still fails (a structured rejection ≠ silence), and spec-defined codes (TRACK_DOES_NOT_EXIST 0x04/0x10) still pass cleanly without annotation. The trailing-extensions check stays strict.
+
+### interop catalog: cf-d16-interop compat=lenient-extensions
+
+- Tolerate moq-rs draft-16's truncated trailing-extensions block on the `cf-d16-interop` regression target, recovering `relay-ctrl-msg` to 6/6 (COMPAT-annotated). `join`/`fetch` and `pub-sub` remain genuine fails (see issue #24). Affects our own interop regression only.
+
+## v0.9.10
 
 Pairs with aiopquic 0.3.8 (no aiopquic change). Bug-fix release.
 
