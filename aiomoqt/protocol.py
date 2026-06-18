@@ -184,7 +184,15 @@ class _MOQTSessionMixin:
         # future. WT mode resolves it in _moqt_wt_finalize().
         if getattr(session, 'use_quic', False):
             self._wt_session_setup.set_result(True)
-        self._draft: int = get_major_version(MOQT_CUR_VERSION)
+        # A pinned draft is known before the handshake, so lock _draft now:
+        # over raw QUIC a peer's SETUP (d18 control uni) can arrive in the
+        # same batch as — or before — ProtocolNegotiated, and it must be
+        # demuxed under the right draft (control_uni_pair) rather than the
+        # default. Auto (unpinned) clients still resolve from the
+        # negotiated ALPN / WT-Protocol.
+        _pinned = getattr(session, 'draft_version', None)
+        self._draft: int = (get_major_version(_pinned) if _pinned is not None
+                            else get_major_version(MOQT_CUR_VERSION))
         self._moqt_session_setup: Future[bool] = self._loop.create_future()
         self._moqt_session_closed: Future[Tuple[int,str]] = self._loop.create_future()
         self._next_request_id = 0 if self._is_client else 1
