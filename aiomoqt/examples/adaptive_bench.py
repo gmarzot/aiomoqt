@@ -1778,9 +1778,16 @@ async def main():
                 # localhost over WT.
                 sub_relay_url = (
                     f"https://localhost:{loopback_port}/")
+                # Self-test: server and sub must agree on a draft. The WT
+                # client auto-resolves to the newest draft (d16), so pin
+                # the server to match — leaving it None keeps the server
+                # at d14 while the sub speaks d16, and the server's
+                # CLIENT_SETUP parse reads out of bounds.
+                mp_draft = args.draft if args.draft is not None else 16
                 pub_cfg = dict(
                     host="localhost", port=loopback_port,
                     cert=args.cert, key=args.key, path="",
+                    draft=mp_draft,
                     namespace=args.namespace,
                     trackname=args.trackname,
                     object_size=args.scenario.object_size,
@@ -1796,7 +1803,7 @@ async def main():
                     relay_url=sub_relay_url,
                     namespace=args.namespace,
                     trackname=args.trackname,
-                    draft=args.draft,
+                    draft=mp_draft,
                     insecure=True,  # loopback self-signed cert
                     force_quic=False,
                     sub_filter=int(FilterType.LATEST_OBJECT),
