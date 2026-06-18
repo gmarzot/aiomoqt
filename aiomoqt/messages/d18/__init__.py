@@ -14,3 +14,6 @@ the d14/d16 classes (Phase 0). They are registered into
 draft is 18 — which the session API gates behind ``AIOMOQT_ENABLE_D18``
 until the d18 wire is complete (Phases 3/5/6).
 """
+from .session_setup import Setup
+
+__all__ = ['Setup']

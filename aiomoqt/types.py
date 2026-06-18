@@ -111,6 +111,7 @@ class MOQTMessageType(IntEnum):
     # -- Common (same semantics in both drafts) --
     CLIENT_SETUP = 0x20
     SERVER_SETUP = 0x21
+    SETUP = 0x2F00  # d18: symmetric SETUP; also the control uni-stream type
     SUBSCRIBE_UPDATE = 0x02  # d14: SUBSCRIBE_UPDATE; d16: REQUEST_UPDATE (same code point)
     SUBSCRIBE = 0x03
     SUBSCRIBE_OK = 0x04

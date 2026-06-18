@@ -497,5 +497,66 @@ class MOQTMessage:
                     f"parameter overran frame extent: "
                     f"{buf.tell()}/{buf_end}")
             params[param_type] = param_value
-        
+
         return params
+
+    @staticmethod
+    def _serialize_kvp_to_end(payload: Buffer, kvps: Dict[int, Any],
+                              *, draft: int) -> None:
+        """Serialize Key-Value-Pairs (Figure 2) with NO count prefix —
+        d18 Setup Options (§10.3) run to the message Length. Keys are
+        ascending delta-coded; even Type = varint Value, odd Type =
+        Length-prefixed bytes. Varint width follows the draft profile
+        (vi64 for d18+). AUTH_TOKEN Token wrapping is not handled here."""
+        push_int = (payload.push_uint_vi64
+                    if profile_for(draft).varint == "vi64"
+                    else payload.push_uint_var)
+        prev_key = 0
+        for key, value in sorted(kvps.items()):
+            push_int(key - prev_key)
+            prev_key = key
+            if key % 2 == 1:  # odd Type → Length-prefixed bytes
+                if isinstance(value, str):
+                    value = value.encode()
+                if not isinstance(value, (bytes, bytearray)):
+                    raise TypeError(
+                        f"KVP {key} expects bytes, got {type(value)}")
+                push_int(len(value))
+                payload.push_bytes(bytes(value))
+            else:  # even Type → varint Value
+                if not isinstance(value, int):
+                    raise TypeError(
+                        f"KVP {key} expects uint, got {type(value)}")
+                push_int(value)
+
+    @staticmethod
+    def _deserialize_kvp_to_end(buf: Buffer, *, draft: int,
+                                buf_end: int) -> Dict[int, Any]:
+        """Deserialize count-less delta-coded Key-Value-Pairs (Figure 2)
+        to buf_end — d18 Setup Options. Mirror of _serialize_kvp_to_end.
+        Over-reads past buf_end raise MOQTProtocolViolation."""
+        pull_int = (buf.pull_uint_vi64
+                    if profile_for(draft).varint == "vi64"
+                    else buf.pull_uint_var)
+        kvps: Dict[int, Any] = {}
+        prev_key = 0
+        while buf.tell() < buf_end:
+            key = prev_key + pull_int()
+            prev_key = key
+            if key % 2 == 1:  # odd Type → Length + bytes
+                vlen = pull_int()
+                if vlen > 65535:  # 2^16-1 maximum (Figure 2)
+                    raise MOQTProtocolViolation(
+                        "KVP value length exceeds maximum of 65535 bytes")
+                if buf.tell() + vlen > buf_end:
+                    raise MOQTProtocolViolation(
+                        f"KVP value length {vlen} exceeds remaining "
+                        f"{buf_end - buf.tell()}")
+                value: Any = buf.pull_bytes(vlen)
+            else:  # even Type → varint Value
+                value = pull_int()
+                if buf.tell() > buf_end:
+                    raise MOQTProtocolViolation(
+                        f"KVP overran frame extent: {buf.tell()}/{buf_end}")
+            kvps[key] = value
+        return kvps

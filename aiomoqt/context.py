@@ -32,27 +32,32 @@ class DraftProfile:
     surface is named in this one table — adding a draft is one row,
     moving a behavior's boundary is one cell. Columns are added as
     later drafts introduce behaviors that aren't a simple version
-    cutoff (e.g. draft-18 vi64, uni control streams).
+    cutoff.
     """
     draft: int
     setup_carries_versions: bool  # d14 negotiates versions in-band in SETUP
     params_delta_coded: bool      # d16+ KVP parameter keys are delta-encoded
+    varint: str                   # "rfc9000" (d14/d16) | "vi64" (d18+)
+    control_uni_pair: bool        # d18 control = pair of uni streams, not bidi
+    reply_has_request_id: bool    # d18 drops Request ID from request replies
 
 
 PROFILES = {
     MOQTDraft.DRAFT_14: DraftProfile(
         draft=MOQTDraft.DRAFT_14, setup_carries_versions=True,
-        params_delta_coded=False),
+        params_delta_coded=False, varint="rfc9000",
+        control_uni_pair=False, reply_has_request_id=True),
     MOQTDraft.DRAFT_16: DraftProfile(
         draft=MOQTDraft.DRAFT_16, setup_carries_versions=False,
-        params_delta_coded=True),
+        params_delta_coded=True, varint="rfc9000",
+        control_uni_pair=False, reply_has_request_id=True),
     # draft-18 negotiates out-of-band (ALPN/WT-Protocol) like d16 and uses
-    # delta-coded params. The d18-specific behaviors (vi64 codec, uni
-    # control-stream pair, per-type param value encodings) become DraftProfile
-    # columns as the phases that consume them land.
+    # delta-coded params, but forks the wire codec to vi64, runs control over
+    # a pair of uni streams, and drops the Request ID from request replies.
     MOQTDraft.DRAFT_18: DraftProfile(
         draft=MOQTDraft.DRAFT_18, setup_carries_versions=False,
-        params_delta_coded=True),
+        params_delta_coded=True, varint="vi64",
+        control_uni_pair=True, reply_has_request_id=False),
 }
 
 
