@@ -50,6 +50,15 @@ TIERS = {
                     "loopback-pub-sub-tiny",
                     "loopback-pub-sub-streams",
                     "loopback-pub-sub-paced",
+                    # draft × transport matrix — catches session-setup /
+                    # framing breaks in our own tools across both drafts
+                    # and transports (the kind that slipped through 0.9.7-9).
+                    "loopback-bench-d14-wt", "loopback-bench-d14-quic",
+                    "loopback-bench-d16-wt", "loopback-bench-d16-quic",
+                    # adaptive BW over the multi-process loopback path
+                    # (the in-process loopback misses the pub/sub-worker
+                    # start path — see the 0.9.10 BW clobber).
+                    "loopback-adaptive-mp-d14", "loopback-adaptive-mp-d16",
                     "loopback-join", "loopback-fetch"],
     "interop":     ["relay-ctrl-msg", "relay-pub-sub",
                     "relay-join", "relay-fetch"],
@@ -232,6 +241,41 @@ def _loopback_join(log_dir: Path) -> tuple[str, str]:
 def _loopback_fetch(log_dir: Path) -> tuple[str, str]:
     return _pytest_file("aiomoqt/tests/test_loopback_fetch.py",
                         log_dir / "loopback-fetch.log")
+
+
+def _loopback_bench_combo(log_dir: Path, draft: int,
+                          quic: bool) -> tuple[str, str]:
+    """loopback_bench smoke for one draft × transport — guards against
+    session-setup / framing regressions in our own tool (e.g. the
+    raw-QUIC auto-draft connect break fixed in 0.9.9)."""
+    transport = "quic" if quic else "wt"
+    flags = ["--draft", str(draft), "-P", "1", "-s", "4096",
+             "-r", "2000", "-g", "1000", "-t", "5"]
+    if quic:
+        flags.append("-q")
+    return _loopback_pub_sub_variant(
+        log_dir, f"loopback-bench-d{draft}-{transport}", flags, timeout=30)
+
+
+def _loopback_adaptive_mp(log_dir: Path, draft: int) -> tuple[str, str]:
+    """adaptive_bench --mp-loopback (BW, separate pub + sub processes) for
+    one draft — exercises the multi-process publisher/subscriber start
+    path the in-process loopback misses (e.g. the BW start-gate clobber
+    fixed in 0.9.10)."""
+    slug = f"loopback-adaptive-mp-d{draft}"
+    log = log_dir / f"{slug}.log"
+    cmd = ["timeout", "--signal=INT", "--kill-after=3", "20",
+           sys.executable, "-m", "aiomoqt.examples.adaptive_bench",
+           "--mp-loopback", "--draft", str(draft),
+           "-P", "1", "-s", "4096", "--start-mbps", "20",
+           "--step-mbps", "10", "--max-mbps", "60", "--interval", "2",
+           "-t", "8"]
+    _run(cmd, log, 30)
+    text = log.read_text()
+    m = re.search(r"High-water:\s+([\d.]+)\s*([KMGT]?bps)", text)
+    if m and float(m.group(1)) > 0 and "Traceback" not in text:
+        return "PASS", f"high-water {m.group(1)} {m.group(2)}"
+    return "FAIL", "no data (rx=0 / crash)"
 
 
 # ---------------------------------------------------------------------------
@@ -500,6 +544,19 @@ def main() -> int:
             status, detail = _loopback_pub_sub_paced(log_dir)
             record_and_print((status, "loopback-pub-sub-paced", detail,
                               log_dir / "loopback-pub-sub-paced.log"))
+        for draft in (14, 16):
+            for quic in (False, True):
+                suite = f"loopback-bench-d{draft}-{'quic' if quic else 'wt'}"
+                if suite in enabled:
+                    status, detail = _loopback_bench_combo(log_dir, draft, quic)
+                    record_and_print((status, suite, detail,
+                                      log_dir / f"{suite}.log"))
+        for draft in (14, 16):
+            suite = f"loopback-adaptive-mp-d{draft}"
+            if suite in enabled:
+                status, detail = _loopback_adaptive_mp(log_dir, draft)
+                record_and_print((status, suite, detail,
+                                  log_dir / f"{suite}.log"))
         if "loopback-join" in enabled:
             status, detail = _loopback_join(log_dir)
             record_and_print((status, "loopback-join", detail,

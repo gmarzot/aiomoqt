@@ -13,6 +13,10 @@ Pairs with aiopquic 0.3.8 (no aiopquic change). Bug-fix release.
 
 - The auto-draft fallback added in 0.9.9 (probe the multi-version offer; on SETUP failure pin draft-14) was guarded to raw QUIC only, so a draft-14-only relay that stalls the d16 SETUP **over WebTransport** still failed every case. The fallback now covers **both transports**. Verified against the public moq-rs draft-14 endpoint: WT goes **0/6 → 6/6** (docker + remote), taking the moq-rs interop column from 6/18 to 18/18. draft-16 WT relays are unaffected — the probe succeeds and no fallback fires (it only adds one connect).
 
+### Release regression: loopback draft × transport matrix
+
+- The integration tier (which PR + main CI run) now includes `loopback_bench` smokes across **draft-14 / draft-16 × raw-QUIC / WebTransport** and an `adaptive_bench --mp-loopback` (multi-process BW pub+sub) smoke per draft. This guards our own tools against the regression classes that slipped through 0.9.7–0.9.9: session-setup / ALPN breaks (caught by the loopback_bench matrix) and the multi-process publisher/subscriber start path (caught by `--mp-loopback`, which the in-process loopback never exercised). No external relay required.
+
 ## v0.9.9 (unreleased)
 
 Pairs with aiopquic 0.3.8 (no aiopquic change). Targeted follow-up to
