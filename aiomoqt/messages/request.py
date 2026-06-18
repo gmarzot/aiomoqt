@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 from .base import MOQTMessage, BUF_SIZE
 from ..types import D16MessageType
+from ..context import profile_for
 from ..utils.buffer import Buffer, BufferReadError
 from ..utils.logger import get_logger
 
@@ -34,7 +35,9 @@ class RequestOk(MOQTMessage):
         buf = Buffer(capacity=BUF_SIZE)
         payload = Buffer(capacity=BUF_SIZE)
 
-        payload.push_uint_var(self.request_id)
+        # d18 replies omit the Request ID (demuxed by request stream, §10.1).
+        if profile_for(draft).reply_has_request_id:
+            payload.push_uint_var(self.request_id)
         MOQTMessage._serialize_params(payload, self.parameters or {}, draft=draft)
 
         buf.push_uint_var(self.type)
@@ -44,7 +47,8 @@ class RequestOk(MOQTMessage):
 
     @classmethod
     def deserialize(cls, buf: Buffer, *, draft: int, buf_end: Optional[int] = None) -> 'RequestOk':
-        request_id = buf.pull_uint_var()
+        request_id = (buf.pull_uint_var()
+                      if profile_for(draft).reply_has_request_id else None)
         params = MOQTMessage._deserialize_params(buf, draft=draft, buf_end=buf_end)
         return cls(request_id=request_id, parameters=params)
 
@@ -71,7 +75,9 @@ class RequestError(MOQTMessage):
         buf = Buffer(capacity=BUF_SIZE)
         payload = Buffer(capacity=BUF_SIZE)
 
-        payload.push_uint_var(self.request_id)
+        # d18 replies omit the Request ID (demuxed by request stream, §10.1).
+        if profile_for(draft).reply_has_request_id:
+            payload.push_uint_var(self.request_id)
         payload.push_uint_var(self.error_code)
         payload.push_uint_var(self.retry_interval)
 
@@ -86,7 +92,8 @@ class RequestError(MOQTMessage):
 
     @classmethod
     def deserialize(cls, buf: Buffer, *, draft: int, buf_end: Optional[int] = None) -> 'RequestError':
-        request_id = buf.pull_uint_var()
+        request_id = (buf.pull_uint_var()
+                      if profile_for(draft).reply_has_request_id else None)
         error_code = buf.pull_uint_var()
         retry_interval = buf.pull_uint_var()
         reason_len = buf.pull_uint_var()
@@ -122,7 +129,11 @@ class RequestUpdate(MOQTMessage):
         payload = Buffer(capacity=BUF_SIZE)
 
         payload.push_uint_var(self.request_id)
-        payload.push_uint_var(self.existing_request_id)
+        # d18 drops Existing-Request-ID — the update targets the request on
+        # whose stream it is sent (§10.9). reply_has_request_id is True
+        # exactly for the drafts (d14/d16) that still carry it.
+        if profile_for(draft).reply_has_request_id:
+            payload.push_uint_var(self.existing_request_id)
         MOQTMessage._serialize_params(payload, self.parameters or {}, draft=draft)
 
         buf.push_uint_var(self.type)
@@ -133,7 +144,9 @@ class RequestUpdate(MOQTMessage):
     @classmethod
     def deserialize(cls, buf: Buffer, *, draft: int, buf_end: Optional[int] = None) -> 'RequestUpdate':
         request_id = buf.pull_uint_var()
-        existing_request_id = buf.pull_uint_var()
+        existing_request_id = (buf.pull_uint_var()
+                               if profile_for(draft).reply_has_request_id
+                               else None)
         params = MOQTMessage._deserialize_params(buf, draft=draft, buf_end=buf_end)
 
         return cls(

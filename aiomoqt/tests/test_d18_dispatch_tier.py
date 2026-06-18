@@ -128,6 +128,28 @@ def test_d18_kvp_uses_vi64_not_rfc9000():
     assert bytes(buf.data_slice(0, 2)) == bytes([0x02, 0x64])
 
 
+def test_d18_replies_omit_request_id():
+    from aiomoqt.messages.request import RequestOk, RequestError, RequestUpdate
+
+    # RequestOk: request_id present in d16, absent in d18.
+    ok16 = bytes(RequestOk(request_id=9, parameters={}).serialize(draft=16).data)
+    ok18 = bytes(RequestOk(request_id=9, parameters={}).serialize(draft=18).data)
+    assert len(ok18) < len(ok16)
+
+    # RequestError: same.
+    e16 = bytes(RequestError(request_id=9, error_code=1, reason="x").serialize(draft=16).data)
+    e18 = bytes(RequestError(request_id=9, error_code=1, reason="x").serialize(draft=18).data)
+    assert len(e18) < len(e16)
+
+    # RequestUpdate keeps request_id but drops existing_request_id in d18.
+    u16 = bytes(RequestUpdate(request_id=9, existing_request_id=7, parameters={}).serialize(draft=16).data)
+    u18 = bytes(RequestUpdate(request_id=9, existing_request_id=7, parameters={}).serialize(draft=18).data)
+    assert len(u18) < len(u16)
+    ru = RequestUpdate.deserialize(Buffer(data=u18[3:]), draft=18, buf_end=len(u18) - 3)
+    assert ru.request_id == 9
+    assert ru.existing_request_id is None
+
+
 def test_d18_setup_message_wire_form():
     from aiomoqt.messages.d18 import Setup
     from aiomoqt.types import MOQTMessageType
