@@ -33,10 +33,14 @@ Run on UDP/4443 with the runner's /certs convention:
       --bind 0.0.0.0 --port 4443 \\
       --cert /certs/cert.pem --key /certs/priv.key
 
-Accepts both raw QUIC and WebTransport on the same port via two
-parallel listeners (different UDP-port binds with separate ALPNs would
-require a second port; for the runner we serve WT only by default and
-add `--quic` to swap to raw QUIC).
+Each listener serves a single transport: WebTransport by default, or
+raw QUIC with `--quic`. Pass `--quic-port N` to also run a *second*
+listener (raw QUIC on port N) in the same process, sharing the global
+namespace table — so one instance can back both a `remote-webtransport`
+endpoint (`--port`) and a `remote-quic` endpoint (`--quic-port`) in the
+interop runner. Serving both transports on a *single* UDP port (h3 +
+moqt-NN ALPNs) would need aiopquic-level per-ALPN stack dispatch; using
+two ports sidesteps that.
 """
 
 import argparse
@@ -169,11 +173,35 @@ def parse_args():
                              "(default: /certs/priv.key)")
     parser.add_argument("--quic", action="store_true",
                         help="Serve raw QUIC instead of WebTransport")
+    parser.add_argument("--quic-port", type=int, default=None,
+                        help="Also serve raw QUIC on this port via a "
+                             "second listener in the same process "
+                             "(shares the namespace table) — lets one "
+                             "instance back both remote-webtransport "
+                             "(--port) and remote-quic (--quic-port)")
     parser.add_argument("--draft", type=int, default=16,
                         help="MoQT draft version (default: 16)")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug logging")
     return parser.parse_args()
+
+
+def _build_server(bind, port, cert, key, use_quic, draft):
+    """Construct a MOQTServer with the relay's control-plane handlers."""
+    server = MOQTServer(
+        host=bind, port=port,
+        certificate=cert, private_key=key,
+        path="/",
+        use_quic=use_quic,
+        draft_version=draft,
+    )
+    server.register_handler(
+        MOQTMessageType.PUBLISH_NAMESPACE, _on_publish_namespace)
+    server.register_handler(
+        MOQTMessageType.PUBLISH_NAMESPACE_DONE, _on_publish_namespace_done)
+    server.register_handler(
+        MOQTMessageType.SUBSCRIBE, _on_subscribe)
+    return server
 
 
 async def main():
@@ -192,23 +220,28 @@ async def main():
               "cert.pem+priv.key at /certs/", file=sys.stderr)
         sys.exit(2)
 
-    server = MOQTServer(
-        host=args.bind, port=args.port,
-        certificate=cert, private_key=key,
-        path="/",
-        use_quic=args.quic,
-        draft_version=args.draft,
-    )
-    server.register_handler(
-        MOQTMessageType.PUBLISH_NAMESPACE, _on_publish_namespace)
-    server.register_handler(
-        MOQTMessageType.PUBLISH_NAMESPACE_DONE, _on_publish_namespace_done)
-    server.register_handler(
-        MOQTMessageType.SUBSCRIBE, _on_subscribe)
+    # Primary listener: WebTransport unless --quic.
+    listeners = [(_build_server(args.bind, args.port, cert, key,
+                                args.quic, args.draft),
+                  args.port,
+                  "raw QUIC" if args.quic else "H3/WebTransport")]
 
-    quic_server = await server.serve()
+    # Optional second listener: raw QUIC on --quic-port, sharing the
+    # global namespace table. One process then backs both a
+    # remote-webtransport and a remote-quic interop endpoint.
+    if args.quic_port is not None:
+        if args.quic_port == args.port:
+            print("Error: --quic-port must differ from --port (two UDP "
+                  "binds can't share one port; same-port dual-ALPN would "
+                  "need aiopquic support)", file=sys.stderr)
+            sys.exit(2)
+        listeners.append(
+            (_build_server(args.bind, args.quic_port, cert, key,
+                           True, args.draft),
+             args.quic_port, "raw QUIC"))
 
-    transport = "raw QUIC" if args.quic else "H3/WebTransport"
+    handles = [await server.serve() for server, _port, _label in listeners]
+
     print(
         "=" * 64
         + "\n EXPERIMENTAL aiomoqt interop relay — control-plane only.\n"
@@ -217,15 +250,17 @@ async def main():
         + "=" * 64,
         file=sys.stderr,
     )
-    print(f"Listening on {args.bind}:{args.port} "
-          f"({transport}, draft-{args.draft})", file=sys.stderr)
+    for _server, port, label in listeners:
+        print(f"Listening on {args.bind}:{port} "
+              f"({label}, draft-{args.draft})", file=sys.stderr)
 
     try:
         await asyncio.Event().wait()
     except asyncio.CancelledError:
         pass
     finally:
-        quic_server.close()
+        for h in handles:
+            h.close()
 
 
 if __name__ == "__main__":

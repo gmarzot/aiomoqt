@@ -102,13 +102,13 @@ def _format_exc(e: BaseException) -> str:
 
 async def _auto_alpn_ok(host, port, path, use_quic, tls_disable_verify,
                         debug, timeout: float = 5.0) -> bool:
-    """Probe whether the auto (multi-version) ALPN offer establishes a
-    raw-QUIC session. The auto client offers every version's ALPN,
-    newest-first; a draft-14-only relay that picks the first (moqt-16)
-    and refuses — rather than choosing the common moq-00 — fails the
-    handshake (QUIC 376 no_application_protocol, or a stalled handshake
-    that times out). Returns True iff SETUP completes; a False (any
-    handshake/setup failure) is the signal to pin draft-14 (moq-00)."""
+    """Probe whether the auto (multi-version) offer reaches SETUP. On raw
+    QUIC the client offers every version's ALPN newest-first; on WT it
+    advertises moqt-16 + a multi-version CLIENT_SETUP. A draft-14-only
+    relay that refuses the d16 offer — QUIC 376 no_application_protocol,
+    or a stalled WT SETUP that times out — fails here. Returns True iff
+    SETUP completes; a False (any handshake/SETUP failure) is the signal
+    to pin draft-14. Works for both transports."""
     client = _make_client(host, port, path, use_quic,
                           tls_disable_verify, debug, draft_version=None)
     try:
@@ -888,17 +888,19 @@ async def run_tests(tests: list[str], host: str, port: int, path: str,
     # own announce slot.
     global INTEROP_NAMESPACE
     base_namespace = INTEROP_NAMESPACE
-    # Auto-draft ALPN fallback (raw QUIC only): probe the auto offer once;
-    # if its handshake fails, pin draft-14 so a draft-14-only relay that
-    # rejects the multi-version offer (moq-rs / xquic) negotiates moq-00
-    # instead of failing every case. Explicit --draft and WT are untouched.
+    # Auto-draft fallback (raw QUIC + WebTransport): probe the auto offer
+    # once; if SETUP fails, pin draft-14 so a draft-14-only relay that
+    # refuses the multi-version offer (moq-rs / xquic) — over raw QUIC by
+    # rejecting the ALPN, or over WT by stalling the d16 SETUP — still
+    # negotiates draft-14 instead of failing every case. Explicit --draft
+    # is untouched; the probe is a no-op against relays that negotiate
+    # auto cleanly (it just adds one connect).
     effective_draft = draft_version
-    if draft_version is None and use_quic and not await _auto_alpn_ok(
+    if draft_version is None and not await _auto_alpn_ok(
             host, port, path, use_quic, tls_disable_verify, debug):
         effective_draft = 14
         reporter.notes.append(
-            "auto multi-version ALPN handshake failed; "
-            "pinned draft-14 (moq-00)")
+            "auto multi-version handshake failed; pinned draft-14")
     for test_name in tests:
         fn = TEST_FUNCTIONS.get(test_name)
         if fn is None:

@@ -1778,9 +1778,16 @@ async def main():
                 # localhost over WT.
                 sub_relay_url = (
                     f"https://localhost:{loopback_port}/")
+                # Self-test: server and sub must agree on a draft. The WT
+                # client auto-resolves to the newest draft (d16), so pin
+                # the server to match — leaving it None keeps the server
+                # at d14 while the sub speaks d16, and the server's
+                # CLIENT_SETUP parse reads out of bounds.
+                mp_draft = args.draft if args.draft is not None else 16
                 pub_cfg = dict(
                     host="localhost", port=loopback_port,
                     cert=args.cert, key=args.key, path="",
+                    draft=mp_draft,
                     namespace=args.namespace,
                     trackname=args.trackname,
                     object_size=args.scenario.object_size,
@@ -1796,7 +1803,7 @@ async def main():
                     relay_url=sub_relay_url,
                     namespace=args.namespace,
                     trackname=args.trackname,
-                    draft=args.draft,
+                    draft=mp_draft,
                     insecure=True,  # loopback self-signed cert
                     force_quic=False,
                     sub_filter=int(FilterType.LATEST_OBJECT),
@@ -1877,8 +1884,12 @@ async def main():
     server = None
     pub_task = None
     sub_task = None
-    pub_proc = None       # subs-mode publisher process (isolated loop)
-    pub_stop = None
+    # Subs-mode isolated publisher (own process). Distinct names from the
+    # BW-mode pub_proc/sub_proc above — reusing `pub_proc` here clobbered
+    # the BW start gate, dropping BW relay runs into this subs branch
+    # (publisher started, but no subscriber → rx stays 0).
+    subs_pub_proc = None
+    subs_pub_stop = None
     try:
         if relay_mode or (args.mode == "bw" and args.mp_loopback):
             if args.mode == "bw" and pub_proc is not None and sub_proc is not None:
@@ -1924,7 +1935,7 @@ async def main():
                 # --sub-mbps rate (no rate_queue updates needed).
                 import multiprocessing as mp
                 from aiomoqt.examples._bench_workers import pub_worker_entry
-                pub_stop = mp.Event()
+                subs_pub_stop = mp.Event()
                 pub_events_q = mp.Queue(maxsize=10000)
                 pub_rate_q = mp.Queue(maxsize=8)
                 mp_cleanup_queues.extend([pub_events_q, pub_rate_q])
@@ -1946,12 +1957,12 @@ async def main():
                     no_uvloop=args.no_uvloop,
                     keep_alive_interval=args.keepalive,
                 )
-                pub_proc = mp.Process(
+                subs_pub_proc = mp.Process(
                     target=pub_worker_entry,
-                    args=(pub_cfg, pub_stop, pub_rate_q, pub_events_q),
+                    args=(pub_cfg, subs_pub_stop, pub_rate_q, pub_events_q),
                     daemon=True,
                 )
-                pub_proc.start()
+                subs_pub_proc.start()
                 # Wait for 'published' before subs subscribe, else the
                 # relay races subscribe against announce.
                 from queue import Empty
@@ -2042,17 +2053,17 @@ async def main():
         except Exception:
             pass
         # Subs-mode publisher process: signal stop, then join/terminate.
-        if pub_stop is not None:
+        if subs_pub_stop is not None:
             try:
-                pub_stop.set()
+                subs_pub_stop.set()
             except Exception:
                 pass
-        if pub_proc is not None:
+        if subs_pub_proc is not None:
             try:
-                pub_proc.join(timeout=5.0)
-                if pub_proc.is_alive():
-                    pub_proc.terminate()
-                    pub_proc.join(timeout=2.0)
+                subs_pub_proc.join(timeout=5.0)
+                if subs_pub_proc.is_alive():
+                    subs_pub_proc.terminate()
+                    subs_pub_proc.join(timeout=2.0)
             except Exception:
                 pass
         # BW-mode mp queues: detach feeder threads so atexit doesn't
