@@ -878,19 +878,29 @@ class _MOQTSessionMixin:
             # new data streams will not yet have a parser bound
             stream_state = self._data_streams.get(stream_id)
             if stream_state is None or stream_state.parser is None:
-                # Get stream type from first byte
-                stream_type = buf.pull_uint_var()
-                # SubgroupHeader type ranges:
-                #   d14: 0x10-0x1D (bit 4 set, bits 0-3 = flags)
-                #   d16: also 0x30-0x3D (bit 5 = DEFAULT_PRIORITY)
-                # Reserved: subgroup_id_mode 0b11 (bits 1-2)
+                # Get stream type from first varint. d18 uses vi64 for the
+                # stream type (and all data-plane ints); pre-d18 RFC9000.
+                vi64 = profile_for(self._draft).varint == "vi64"
+                stream_type = (buf.pull_uint_vi64() if vi64
+                               else buf.pull_uint_var())
+                # SubgroupHeader form 0b0XX1XXXX (bit 4 set): d14 0x10-0x1D,
+                # d16 += 0x30-0x3D (bit 5 DEFAULT_PRIORITY), d18 += 0x50-0x5D
+                # / 0x70-0x7D (bit 6 FIRST_OBJECT) and excludes bit 7.
+                # Reserved subgroup_id_mode 0b11 (bits 1-2) is invalid.
                 is_subgroup = (
-                    (0x10 <= stream_type <= 0x1D or
-                     0x30 <= stream_type <= 0x3D)
+                    (stream_type & 0x10) and not (stream_type & 0x80)
                     and ((stream_type >> 1) & 0x03) != 3
                 )
-                if is_subgroup:
-                    msg_header = SubgroupHeader.deserialize(buf, type_val=stream_type)
+                if stream_type in (PADDING_STREAM_TYPE,):
+                    # d18 PADDING stream: drain + discard (MUST keep flow
+                    # control moving). No parser bound; bytes ignored.
+                    data_type = "PADDING"
+                    msg_header = None
+                    raise MOQTStreamReject(
+                        SessionCloseCode.NO_ERROR, "padding stream drained")
+                elif is_subgroup:
+                    msg_header = SubgroupHeader.deserialize(
+                        buf, type_val=stream_type, draft=self._draft)
                     data_type = "SUBGROUP_HEADER"
                     self._admit_subgroup_stream(stream_id, msg_header)
                 elif stream_type == DataStreamType.FETCH_HEADER:
@@ -943,7 +953,8 @@ class _MOQTSessionMixin:
                     obj.deserialize_into(
                         buf, len,
                         extensions_present=sg_header.extensions_present,
-                        prev_object_id=sg_header._last_object_id
+                        prev_object_id=sg_header._last_object_id,
+                        vi64=sg_header._vi64,
                     )
                     msg_header = obj
                     # Update delta tracking state
@@ -981,9 +992,12 @@ class _MOQTSessionMixin:
             logger.error(f"MOQT datagram: no data {buf.tell()}")
             return
         logger.debug(f"MOQT handle datagram: 0x{buf.data_slice(0,min(buf.capacity,12))}")
-        # Get datagram type from first byte
+        # Get datagram type from first varint (vi64 for d18).
         pos = buf.tell()
-        dgram_type = buf.pull_uint_var()
+        vi64 = profile_for(self._draft).varint == "vi64"
+        dgram_type = buf.pull_uint_vi64() if vi64 else buf.pull_uint_var()
+        if vi64:
+            return self._moqt_handle_data_dgram_d18(buf, pos, dgram_type)
         # Draft-14: ObjectDatagram types 0x00-0x07 (payload datagrams)
         if 0x00 <= dgram_type <= 0x07:
             msg = ObjectDatagram.deserialize(buf, buf.capacity, type_val=dgram_type)
@@ -1031,7 +1045,41 @@ class _MOQTSessionMixin:
             logger.error(f"MOQT error: " + error)
             self._close_session(SessionCloseCode.PROTOCOL_VIOLATION, error)
             return
-    
+
+    # d18 OBJECT_DATAGRAM invalid types: STATUS (0x20) + END_OF_GROUP (0x02)
+    # both set — a status datagram cannot signal end of group (§11.3.1).
+    _D18_DGRAM_INVALID = frozenset(
+        {0x22, 0x23, 0x26, 0x27, 0x2A, 0x2B, 0x2E, 0x2F})
+
+    def _moqt_handle_data_dgram_d18(self, buf: Buffer, pos: int,
+                                    dgram_type: int) -> MOQTMessage:
+        """d18 datagram dispatch. OBJECT_DATAGRAM form 0b00X0XXXX
+        (0x00-0x0F / 0x20-0x2F); PADDING datagram 0x132B3E29 is drained."""
+        if dgram_type == PADDING_DATAGRAM_TYPE:
+            logger.debug("MOQT event: PADDING datagram drained")
+            return
+        valid_form = (dgram_type & ~0x2F) == 0 and (dgram_type & 0x10) == 0
+        if (not valid_form) or dgram_type in self._D18_DGRAM_INVALID:
+            error = f"invalid d18 datagram type: 0x{dgram_type:x}"
+            logger.error(f"MOQT error: " + error)
+            self._close_session(SessionCloseCode.PROTOCOL_VIOLATION, error)
+            return
+        msg = ObjectDatagram.deserialize(
+            buf, buf.capacity, type_val=dgram_type, draft=self._draft)
+        if msg is None:
+            error = f"datagram parsing failed at: {buf.tell()}"
+            logger.error(f"MOQT error: " + error)
+            self._close_session(SessionCloseCode.PROTOCOL_VIOLATION, error)
+            return msg
+        consumed = buf.tell() - pos
+        now = int(time.time() * 1_000_000)
+        logger.debug(
+            f"MOQT event: d18 ObjectDatagram: {msg.group_id}.{msg.object_id} "
+            f"size: {consumed} bytes status: {msg.status}")
+        if msg.status == ObjectStatus.NORMAL and self.on_object_received:
+            self.on_object_received(msg, consumed, now, msg.group_id, None)
+        return msg
+
     def _drain_control_buffer(self, msg_buf: Buffer, msg_len: int) -> None:
         """Parse every whole control message in one event's buffer.
         Shared by the d14/d16 bidi control stream and the d18 uni control

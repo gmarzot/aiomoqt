@@ -423,6 +423,7 @@ class PublishedTrack(Track):
                         subgroup_id=subgroup_id,
                         publisher_priority=priority,
                         extensions_present=True,
+                        draft=session._draft,
                     )
                     msg = header.serialize()
                     if session._close_err is not None:
@@ -821,6 +822,7 @@ class VideoTrack(PublishedTrack):
                         subgroup_id=subgroup_id,
                         publisher_priority=priority,
                         extensions_present=True,
+                        draft=session._draft,
                     )
                     msg = header.serialize()
                     if session._close_err is not None:

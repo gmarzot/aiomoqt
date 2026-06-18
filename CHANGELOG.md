@@ -94,6 +94,33 @@ The structural slot for draft-18, slotting into the Phase 0.C spine — no
   (`require_d18_enabled`), so the incomplete d18 wire is never used by
   accident; default sessions `(16, 14)` are unaffected.
 
+### draft-18 data plane (Phase 4)
+
+The d18 object wire, gated behind `AIOMOQT_ENABLE_D18`. d14/d16 paths are
+byte-for-byte unchanged — the codec is selected per stream/datagram from
+`DraftProfile.varint`, and the perf-critical fused object path uses the
+vi64 twins that already shipped in aiopquic (Phase 1).
+
+- **vi64 across the data plane**: the data-stream type, `SubgroupHeader`
+  fields (Track Alias / Group ID / Subgroup ID), and the per-object fields
+  switch to vi64 for d18. `SubgroupHeader` / `ObjectHeader` carry the draft
+  and route the fused `parse/encode_object_subgroup_vi64` (hot path) or the
+  vi64 field-by-field decode (Buffer slow path).
+- **SUBGROUP_HEADER classification** generalized from hardcoded ranges to
+  the bit-mask form `0b0XX1XXXX` (bit 4 set, bit 7 clear, SUBGROUP_ID_MODE
+  != 0b11), covering the d18 ranges `0x50-0x5D` / `0x70-0x7D`, plus the new
+  `FIRST_OBJECT` bit (0x40).
+- **OBJECT_DATAGRAM relayout** (§11.3.1): form `0b00X0XXXX`, with
+  `PROPERTIES 0x01 / END_OF_GROUP 0x02 / ZERO_OBJECT_ID 0x04 /
+  DEFAULT_PRIORITY 0x08 / STATUS 0x20`. Status merges into the one
+  `ObjectDatagram` family; STATUS+END_OF_GROUP and out-of-form types are
+  rejected with PROTOCOL_VIOLATION.
+- **PADDING** stream `0x132B3E28` / datagram `0x132B3E29` recognized and
+  discarded.
+- Codec round-trips covered by `test_d18_data_plane.py`. End-to-end object
+  loopback + the `loopback_bench` d18≈d16 perf checkpoint are validated
+  during interop/perf testing (Phase 7).
+
 ### draft-18 session establishment + control core (Phase 3)
 
 The d18 control plane, gated behind `AIOMOQT_ENABLE_D18`. Raw QUIC;

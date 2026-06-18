@@ -339,6 +339,12 @@ class DataStreamType(IntEnum):
     FETCH_HEADER = 0x05
 
 
+# d18 PADDING (§11.5): a stream/datagram of these types is accepted and
+# discarded (flow control MUST keep moving).
+PADDING_STREAM_TYPE = 0x132B3E28
+PADDING_DATAGRAM_TYPE = 0x132B3E29
+
+
 # Draft-14 SubgroupHeader type range: 0x10-0x1D (12 valid types, 0x16-0x17 reserved)
 # Bits: 0=extensions_present, 1-2=subgroup_id_mode, 3=end_of_group
 SUBGROUP_HEADER_BASE = 0x10
