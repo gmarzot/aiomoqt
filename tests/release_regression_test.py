@@ -264,8 +264,10 @@ def _loopback_adaptive_mp(log_dir: Path, draft: int) -> tuple[str, str]:
     fixed in 0.9.10)."""
     slug = f"loopback-adaptive-mp-d{draft}"
     log = log_dir / f"{slug}.log"
-    cmd = ["timeout", "--signal=INT", "--kill-after=3", "20",
-           sys.executable, "-m", "aiomoqt.examples.adaptive_bench",
+    # -t 8 self-terminates with a clean High-water summary; _run's
+    # Python-level timeout is the backstop. No external `timeout` binary
+    # (absent on macOS runners — it's `gtimeout` there, if installed).
+    cmd = [sys.executable, "-m", "aiomoqt.examples.adaptive_bench",
            "--mp-loopback", "--draft", str(draft),
            "-P", "1", "-s", "4096", "--start-mbps", "20",
            "--step-mbps", "10", "--max-mbps", "60", "--interval", "2",

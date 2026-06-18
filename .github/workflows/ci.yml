@@ -61,13 +61,14 @@ jobs:
       - name: Run unit + integration tiers
         run: |
           python tests/release_regression_test.py \
-            --test-tier unit --test-tier integration
+            --test-tier unit --test-tier integration \
+            --log-dir "${RUNNER_TEMP}/aiomoqt-regression"
       - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: regression-logs-${{ matrix.os }}-py${{ matrix.python-version }}
-          path: /tmp/aiomoqt-regression.*/
+          path: ${{ runner.temp }}/aiomoqt-regression/
 
   multi-proc:
     name: pub-sub test / ${{ matrix.os }}
