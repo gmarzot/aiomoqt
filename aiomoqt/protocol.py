@@ -431,8 +431,15 @@ class _MOQTSessionMixin:
         logger.debug(f"H3 event: configured path: {configured} request path: {path}")
         return configured == path
 
-    def _moqt_handle_control_message(self, buf: Buffer) -> Optional[MOQTMessage]:
-        """Process an incoming message."""
+    def _moqt_handle_control_message(self, buf: Buffer, *,
+                                     request_id: Optional[int] = None
+                                     ) -> Optional[MOQTMessage]:
+        """Process an incoming message.
+
+        request_id, when supplied (d18 request-stream replies), is the id
+        the stream is bound to. d18 replies omit the Request ID on the
+        wire (demuxed by stream); injecting it lets handlers that key on
+        msg.request_id work unchanged."""
         buf_len = buf.capacity
         if buf_len == 0:
             logger.warning("MOQT event: handle control message: no data")
@@ -490,6 +497,12 @@ class _MOQTSessionMixin:
             # instead of reading past the payload. Other message types
             # accept and ignore it for signature uniformity.
             msg = message_class.deserialize(buf, draft=self._draft, buf_end=end_pos)
+            # d18 replies omit the Request ID (demuxed by request stream);
+            # inject the stream-bound id so handlers key on it unchanged.
+            if (request_id is not None and
+                    not profile_for(self._draft).reply_has_request_id and
+                    hasattr(msg, 'request_id')):
+                msg.request_id = request_id
             msg_len += hdr_len
             if end_pos > buf.tell():
                 logger.debug(f"MOQT event: control message: seeking msg end: {end_pos}")
@@ -1529,21 +1542,42 @@ class _MOQTSessionMixin:
         draft so callers never thread draft=."""
         self.stream_write(stream_id, msg.serialize(draft=self._draft).data)
 
+    def _send_reply(self, request_id: int, msg: MOQTMessage) -> None:
+        """Send a response to a request. In d18 responses travel on the
+        request's own bidi stream (demuxed by stream, no in-band Request
+        ID); pre-d18 they go on the single control stream."""
+        sid = self._bidi_streams.get(request_id)
+        if profile_for(self._draft).control_uni_pair and sid is not None:
+            self.send_stream_message(sid, msg)
+        else:
+            self.send_control_message(msg)
+
+    # Messages that open a request stream (must be the first message on a
+    # new bidi stream). d16 only uses SUBSCRIBE_NAMESPACE here; d18 routes
+    # all requests onto their own bidi stream. (SUBSCRIBE_TRACKS 0x51 lands
+    # with the d18 control-message set in a later phase.)
+    _REQUEST_OPENERS = (Subscribe, Fetch, Publish, TrackStatus,
+                        PublishNamespace, SubscribeNamespace)
+
     def _handle_bidi_stream(self, stream_id: int, buf: Buffer, buf_len: int) -> None:
-        """Handle d16 bidirectional stream messages (SUBSCRIBE_NAMESPACE,
-        responses). aiopquic delivers clean MoQT payload either way —
-        WT prefix is stripped in C; raw QUIC has no prefix.
+        """Handle request bidirectional stream messages. The first message
+        is a request opener (carries the Request ID) and binds the stream;
+        subsequent messages are responses, demuxed by the bound stream.
+        aiopquic delivers clean MoQT payload either way — WT prefix is
+        stripped in C; raw QUIC has no prefix.
         """
         request_id = self._bidi_stream_requests.get(stream_id)
         if request_id is not None:
             while buf.tell() < buf_len:
-                msg = self._moqt_handle_control_message(buf)
+                msg = self._moqt_handle_control_message(
+                    buf, request_id=request_id)
                 if msg is None:
                     break
             return
 
         msg = self._moqt_handle_control_message(buf)
-        if msg is not None and isinstance(msg, SubscribeNamespace):
+        if (msg is not None and isinstance(msg, self._REQUEST_OPENERS) and
+                getattr(msg, 'request_id', None) is not None):
             self._bidi_stream_requests[stream_id] = msg.request_id
             self._bidi_streams[msg.request_id] = stream_id
 
@@ -1631,7 +1665,17 @@ class _MOQTSessionMixin:
         message.libquicr_compat = self._session.libquicr_compat
         self._subscriptions[request_id] = [message]
         logger.info(f"MOQT send: {message}")
-        self.send_control_message(message)
+        if profile_for(self._draft).control_uni_pair:
+            # d18: each request opens its own bidi stream; the reply comes
+            # back on that same stream (no Request ID). Raw-QUIC stream-id
+            # allocation is synchronous, so subscribe() stays sync.
+            stream_id = self._quic.get_next_available_stream_id(
+                is_unidirectional=False)
+            self._bidi_streams[request_id] = stream_id
+            self._bidi_stream_requests[stream_id] = request_id
+            self.send_stream_message(stream_id, message)
+        else:
+            self.send_control_message(message)
 
         if not wait_response:
             return message
@@ -1663,7 +1707,26 @@ class _MOQTSessionMixin:
             parameters=parameters or {}
         )
         logger.info(f"MOQT send: {message}")
-        self.send_control_message(message)
+        self._send_reply(request_msg.request_id, message)
+        return message
+
+    def subscribe_done(
+        self,
+        request_id: int,
+        status_code: int = SubscribeDoneCode.SUBSCRIPTION_ENDED,
+        stream_count: int = 0,
+        reason: str = "",
+    ) -> Optional[MOQTMessage]:
+        """Create and send a PUBLISH_DONE (SUBSCRIBE_DONE) response on the
+        subscription's request stream (d18) or the control stream."""
+        message = SubscribeDone(
+            request_id=request_id,
+            status_code=status_code,
+            stream_count=stream_count,
+            reason=reason,
+        )
+        logger.info(f"MOQT send: {message}")
+        self._send_reply(request_id, message)
         return message
 
     def subscribe_error(

@@ -94,6 +94,41 @@ The structural slot for draft-18, slotting into the Phase 0.C spine — no
   (`require_d18_enabled`), so the incomplete d18 wire is never used by
   accident; default sessions `(16, 14)` are unaffected.
 
+### draft-18 session establishment + control core (Phase 3)
+
+The d18 control plane, gated behind `AIOMOQT_ENABLE_D18`. Raw QUIC;
+WebTransport d18 control is deferred. d14/d16 paths are byte-for-byte
+unchanged — every divergence reads a `DraftProfile` capability flag.
+
+- **Control over a unidirectional stream pair** (§3.3) instead of a single
+  bidirectional stream. Each peer opens one control write-uni beginning
+  with `SETUP` and reads the peer's control read-uni; the read-uni is
+  bound by peeking the leading vi64 for the `0x2F00` stream/message type
+  and demuxed from data uni streams. `_control_write_stream_id` /
+  `_control_read_stream_id` resolve to the single bidi id pre-d18 and to
+  the distinct uni ids for d18 (`control_uni_pair` profile flag), so one
+  branch point carries the whole divergence.
+- **Symmetric `SETUP` (type `0x2F00`)** — `0x2F00` is both the control
+  uni-stream type and the `SETUP` message type, written once at the stream
+  head. Body is count-less delta-coded Key-Value-Pair Setup Options
+  (§10.3) to the message Length: no version array (negotiated via ALPN),
+  no parameter count, no `MAX_REQUEST_ID` option. The control Message Type
+  is read/written as **vi64** for d18 (`AF 00`); the per-draft
+  `CONTROL_REGISTRY` is the type authority (renumbered code points fall
+  outside the contiguous enum). Length stays 16-bit.
+- **Per-request bidirectional streams** (§3.3): each request (`SUBSCRIBE`,
+  …) opens its own bidi stream; the response returns on that same stream.
+  Responses **drop the Request ID** (`reply_has_request_id` flag) — they
+  are demuxed positionally by stream, and the bound id is injected onto the
+  parsed reply so handlers key on `msg.request_id` unchanged. Generalizes
+  the d16 `SUBSCRIBE_NAMESPACE` bidi machinery to the request openers.
+- Raw-QUIC d18 loopback: handshake over the uni pair +
+  `SUBSCRIBE → SUBSCRIBE_OK → PUBLISH_DONE` round trip, replies carrying no
+  Request ID.
+- **Deferred to a later phase**: control-stream priority (needs new
+  aiopquic transport surface), WebTransport d18 control, GOAWAY
+  sender + new Timeout/Request-ID fields.
+
 ### Spec-compliant bounded parsing
 
 - `_deserialize_params` enforces the control-frame `Length` extent: a

@@ -3,7 +3,7 @@ from typing import Tuple, Dict, Optional, Any
 from dataclasses import dataclass, field
 
 from . import MOQTMessage, BUF_SIZE
-from ..context import is_draft16_or_later
+from ..context import is_draft16_or_later, profile_for
 from ..utils.buffer import Buffer, BufferReadError
 from ..utils.logger import get_logger
 
@@ -418,7 +418,10 @@ class SubscribeOk(MOQTMessage):
         buf = Buffer(capacity=BUF_SIZE)
         payload = Buffer(capacity=BUF_SIZE)
 
-        payload.push_uint_var(self.request_id)
+        # d18 replies omit the Request ID — the response is demuxed by the
+        # bidi request stream it arrives on (§10.1).
+        if profile_for(draft).reply_has_request_id:
+            payload.push_uint_var(self.request_id)
         payload.push_uint_var(self.track_alias)
 
         if is_draft16_or_later(draft):
@@ -458,7 +461,9 @@ class SubscribeOk(MOQTMessage):
         # buf_end is the absolute end-of-message position derived from
         # the outer frame length. Required for d16 (Track Extensions
         # have no length prefix; sequence runs to end of message).
-        request_id = buf.pull_uint_var()
+        # d18 replies omit the Request ID (demuxed by request stream).
+        request_id = (buf.pull_uint_var()
+                      if profile_for(draft).reply_has_request_id else None)
         track_alias = buf.pull_uint_var()
 
         expires = None
@@ -642,8 +647,10 @@ class SubscribeDone(MOQTMessage):
     def serialize(self, *, draft: int) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
         payload = Buffer(capacity=BUF_SIZE)
-        
-        payload.push_uint_var(self.request_id)
+
+        # d18 replies omit the Request ID (demuxed by request stream, §10.1).
+        if profile_for(draft).reply_has_request_id:
+            payload.push_uint_var(self.request_id)
         payload.push_uint_var(self.status_code.value if isinstance(self.status_code, SubscribeDoneCode) else self.status_code)
         payload.push_uint_var(self.stream_count)
         
@@ -659,7 +666,9 @@ class SubscribeDone(MOQTMessage):
     @classmethod
     def deserialize(cls, buf: Buffer, *, draft: int, buf_end: Optional[int] = None) -> 'SubscribeDone':
 
-        request_id = buf.pull_uint_var()
+        # d18 replies omit the Request ID (demuxed by request stream).
+        request_id = (buf.pull_uint_var()
+                      if profile_for(draft).reply_has_request_id else None)
         status_code = buf.pull_uint_var()
         stream_count = buf.pull_uint_var()
         reason_len = buf.pull_uint_var()

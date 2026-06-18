@@ -141,6 +141,24 @@ def test_d18_setup_message_wire_form():
     assert payload_len == len(raw) - 4
 
 
+def test_d18_subscribe_ok_omits_request_id():
+    from aiomoqt.messages.subscribe import SubscribeOk
+    from aiomoqt.types import MOQTMessageType
+    kw = dict(request_id=7, track_alias=1, content_exists=0)
+    d16 = bytes(SubscribeOk(**kw).serialize(draft=16).data)
+    d18 = bytes(SubscribeOk(**kw).serialize(draft=18).data)
+    # d18 drops the Request ID varint -> strictly shorter wire form.
+    assert len(d18) < len(d16)
+    # And on the wire there is no Request ID to read back.
+    rbuf = Buffer(data=d18)
+    assert rbuf.pull_uint_vi64() == MOQTMessageType.SUBSCRIBE_OK
+    plen = rbuf.pull_uint16()
+    end = rbuf.tell() + plen
+    msg = SubscribeOk.deserialize(rbuf, draft=18, buf_end=end)
+    assert msg.request_id is None  # absent on the wire; injected by stream
+    assert msg.track_alias == 1
+
+
 def test_d18_setup_message_roundtrip():
     from aiomoqt.messages.d18 import Setup
     opts = {0x04: 0, 0x07: b"aiomoqt/0.10"}
