@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.9.10 (unreleased)
+
+Pairs with aiopquic 0.3.8 (no aiopquic change). Bug-fix release.
+
+### adaptive_bench: BW relay mode fixed (regression since 0.9.7)
+
+- BW (bandwidth-ramp) mode against a relay (`-r URL`, no `--mode subs`) silently delivered no data: the publisher connected and published (`forward=0`) but **no subscriber was ever started**, so the relay never sent `SUBSCRIBE_UPDATE forward=1`, `rx` stayed 0, and the ramp aborted on dead-air. Root cause: the subs-mode isolated publisher (added in 0.9.7) reused the `pub_proc` variable and reset it to `None` *before* the BW start-gate, dropping BW relay runs into the subs-publisher branch — which starts a publisher but no subscriber (subscribers there come from `SubsActuator`, absent in BW mode). The subs publisher now uses distinct `subs_pub_proc` / `subs_pub_stop` names so the BW gate fires and starts both pub and sub. Also fixes the `--mp-loopback` `relay_url=None` crash (same fall-through). Subs mode and BW single-process loopback were unaffected. (The `--mp-loopback` loopback-server forwarder has a separate, pre-existing `_drain` error this fix unmasks — tracked separately.)
+
 ## v0.9.9 (unreleased)
 
 Pairs with aiopquic 0.3.8 (no aiopquic change). Targeted follow-up to
