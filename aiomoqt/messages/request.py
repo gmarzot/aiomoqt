@@ -128,12 +128,14 @@ class RequestUpdate(MOQTMessage):
         buf = Buffer(capacity=BUF_SIZE)
         payload = Buffer(capacity=BUF_SIZE)
 
-        payload.push_uint_var(self.request_id)
-        # d18 drops Existing-Request-ID — the update targets the request on
-        # whose stream it is sent (§10.9). reply_has_request_id is True
-        # exactly for the drafts (d14/d16) that still carry it.
-        if profile_for(draft).reply_has_request_id:
-            payload.push_uint_var(self.existing_request_id)
+        # REQUEST_UPDATE carries both a (new) Request ID and the Existing
+        # Request ID it updates, in d16 and d18 alike — confirmed against
+        # the mvfst/moxygen d18 relay, which sends both. d18 uses vi64.
+        push = (payload.push_uint_vi64
+                if profile_for(draft).varint == "vi64"
+                else payload.push_uint_var)
+        push(self.request_id)
+        push(self.existing_request_id)
         MOQTMessage._serialize_params(payload, self.parameters or {}, draft=draft)
 
         buf.push_uint_var(self.type)
@@ -143,10 +145,11 @@ class RequestUpdate(MOQTMessage):
 
     @classmethod
     def deserialize(cls, buf: Buffer, *, draft: int, buf_end: Optional[int] = None) -> 'RequestUpdate':
-        request_id = buf.pull_uint_var()
-        existing_request_id = (buf.pull_uint_var()
-                               if profile_for(draft).reply_has_request_id
-                               else None)
+        pull = (buf.pull_uint_vi64
+                if profile_for(draft).varint == "vi64"
+                else buf.pull_uint_var)
+        request_id = pull()
+        existing_request_id = pull()
         params = MOQTMessage._deserialize_params(buf, draft=draft, buf_end=buf_end)
 
         return cls(

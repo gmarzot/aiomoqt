@@ -141,13 +141,12 @@ def test_d18_replies_omit_request_id():
     e18 = bytes(RequestError(request_id=9, error_code=1, reason="x").serialize(draft=18).data)
     assert len(e18) < len(e16)
 
-    # RequestUpdate keeps request_id but drops existing_request_id in d18.
-    u16 = bytes(RequestUpdate(request_id=9, existing_request_id=7, parameters={}).serialize(draft=16).data)
+    # RequestUpdate carries BOTH Request ID and Existing Request ID in d18
+    # (confirmed against the mvfst/moxygen relay); d18 just uses vi64.
     u18 = bytes(RequestUpdate(request_id=9, existing_request_id=7, parameters={}).serialize(draft=18).data)
-    assert len(u18) < len(u16)
     ru = RequestUpdate.deserialize(Buffer(data=u18[3:]), draft=18, buf_end=len(u18) - 3)
     assert ru.request_id == 9
-    assert ru.existing_request_id is None
+    assert ru.existing_request_id == 7
 
 
 def test_d18_setup_message_wire_form():
