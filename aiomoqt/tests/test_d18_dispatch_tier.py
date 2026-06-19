@@ -149,6 +149,99 @@ def test_d18_replies_omit_request_id():
     assert ru.existing_request_id == 7
 
 
+def test_d18_typed_param_values_are_uint8():
+    # d18 encodes FORWARD/SUBSCRIBER_PRIORITY/GROUP_ORDER as fixed uint8,
+    # not vi64. The divergence shows at value >= 64: vi64(128) = 2 bytes
+    # (0x40 0x80), uint8(128) = 1 byte (0x80). Default priority is 128.
+    from aiomoqt.types import ParamType
+    buf = Buffer(capacity=16)
+    MOQTMessage._serialize_params(
+        buf, {ParamType.SUBSCRIBER_PRIORITY: 128}, draft=18)
+    raw = bytes(buf.data_slice(0, buf.tell()))
+    # count(1) + delta-key 0x20 + uint8 value 0x80 = 3 bytes.
+    assert raw == bytes([0x01, 0x20, 0x80])
+    out = MOQTMessage._deserialize_params(
+        Buffer(data=raw), draft=18, buf_end=len(raw))
+    assert out == {ParamType.SUBSCRIBER_PRIORITY: 128}
+
+
+def test_d16_param_values_stay_varint():
+    # d16 keeps RFC9000 varints for the same params: 128 -> 0x40 0x80.
+    from aiomoqt.types import ParamType
+    buf = Buffer(capacity=16)
+    MOQTMessage._serialize_params(
+        buf, {ParamType.SUBSCRIBER_PRIORITY: 128}, draft=16)
+    raw = bytes(buf.data_slice(0, buf.tell()))
+    # count(1) + key 0x20 + 2-byte varint 0x40 0x80 = 4 bytes.
+    assert raw == bytes([0x01, 0x20, 0x40, 0x80])
+    out = MOQTMessage._deserialize_params(
+        Buffer(data=raw), draft=16, buf_end=len(raw))
+    assert out == {ParamType.SUBSCRIBER_PRIORITY: 128}
+
+
+def test_d18_typed_params_roundtrip_all_three():
+    # FORWARD 0x10, SUBSCRIBER_PRIORITY 0x20, GROUP_ORDER 0x22 — all uint8.
+    from aiomoqt.types import ParamType
+    params = {
+        ParamType.FORWARD: 1,
+        ParamType.SUBSCRIBER_PRIORITY: 200,
+        ParamType.GROUP_ORDER: 2,
+    }
+    buf = Buffer(capacity=32)
+    MOQTMessage._serialize_params(buf, params, draft=18)
+    n = buf.tell()
+    out = MOQTMessage._deserialize_params(
+        Buffer(data=bytes(buf.data_slice(0, n))), draft=18, buf_end=n)
+    assert out == params
+
+
+def test_d18_nonuint8_even_param_large_value_is_vi64():
+    # A non-uint8 even param (DELIVERY_TIMEOUT 0x02) with value 100 must
+    # go through the buffer's vi64 codec: 1 byte 0x64, NOT RFC9000's 2-byte
+    # 0x40 0x64. Guards buffer-mode tagging for values >= 64 on the ordinary
+    # (non-typed) param path — small-value tests can't see this.
+    from aiomoqt.types import ParamType
+    buf = Buffer(capacity=16)
+    MOQTMessage._serialize_params(
+        buf, {ParamType.DELIVERY_TIMEOUT: 100}, draft=18)
+    raw = bytes(buf.data_slice(0, buf.tell()))
+    assert raw == bytes([0x01, 0x02, 0x64])  # count, delta-key 0x02, vi64(100)
+    out = MOQTMessage._deserialize_params(
+        Buffer(data=raw), draft=18, buf_end=len(raw))
+    assert out == {ParamType.DELIVERY_TIMEOUT: 100}
+
+
+def test_d16_nonuint8_even_param_large_value_is_rfc9000():
+    # Same param/value on d16 stays RFC9000 (2-byte 0x40 0x64) — the
+    # buffer-mode change must not perturb pre-d18.
+    from aiomoqt.types import ParamType
+    buf = Buffer(capacity=16)
+    MOQTMessage._serialize_params(
+        buf, {ParamType.DELIVERY_TIMEOUT: 100}, draft=16)
+    raw = bytes(buf.data_slice(0, buf.tell()))
+    assert raw == bytes([0x01, 0x02, 0x40, 0x64])
+    out = MOQTMessage._deserialize_params(
+        Buffer(data=raw), draft=16, buf_end=len(raw))
+    assert out == {ParamType.DELIVERY_TIMEOUT: 100}
+
+
+def test_d18_request_update_large_ids_round_trip_vi64():
+    # RequestUpdate ids go through the buffer's push_vint. With values >= 64
+    # the vi64 vs RFC9000 forms diverge, so this confirms the payload buffer
+    # was tagged vi64: request_id 100 -> 0x64 (1B), existing 200 -> 0x80C8.
+    from aiomoqt.messages.request import RequestUpdate
+    raw = bytes(RequestUpdate(
+        request_id=100, existing_request_id=200,
+        parameters={}).serialize(draft=18).data)
+    body = raw[3:]  # after type (1B, 0x02) + 16-bit Length
+    assert body[0] == 0x64
+    assert body[1:3] == bytes([0x80, 0xC8])
+    ru = RequestUpdate.deserialize(
+        Buffer(data=body), draft=18, buf_end=len(body))
+    assert ru.request_id == 100
+    assert ru.existing_request_id == 200
+
+
 def test_d18_setup_message_wire_form():
     from aiomoqt.messages.d18 import Setup
     from aiomoqt.types import MOQTMessageType

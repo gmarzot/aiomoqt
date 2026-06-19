@@ -2,7 +2,7 @@ import os
 from typing import Any, Optional, Union, Dict
 from dataclasses import dataclass, field, fields
 
-from . import ParamType, SetupParamType, AuthTokenAliasType
+from . import ParamType, SetupParamType, AuthTokenAliasType, AuthTokenType
 from ..context import profile_for
 from ..types import MOQTProtocolViolation
 from ..utils.buffer import Buffer, BufferReadError
@@ -384,24 +384,24 @@ class MOQTMessage:
         delta_keys defaults from the draft's profile (d16+ sorts keys
         and writes deltas: key_on_wire = key - previous_key).
         """
+        prof = profile_for(draft)
+        # Tag the buffer's varint flavor so push_vint encodes vi64 (d18) or
+        # RFC9000 (pre-d18). All control integers except the 16-bit message
+        # Length go through push_vint.
+        payload.vi64 = prof.vi64
         if delta_keys is None:
-            delta_keys = profile_for(draft).params_delta_coded
-        # d18 encodes every control integer as vi64 (count, delta-keys,
-        # lengths, even-type values); pre-d18 uses the RFC9000 varint.
-        push = (payload.push_uint_vi64
-                if profile_for(draft).varint == "vi64"
-                else payload.push_uint_var)
+            delta_keys = prof.params_delta_coded
         if delta_keys:
             # Sort by key for delta encoding
             parameters = dict(sorted(parameters.items()))
-        push(len(parameters))
+        payload.push_vint(len(parameters))
         prev_key = 0
         for param_type, param_value in parameters.items():
             if delta_keys:
-                push(param_type - prev_key)
+                payload.push_vint(param_type - prev_key)
                 prev_key = param_type
             else:
-                push(param_type)  # Type
+                payload.push_vint(param_type)  # Type
 
             if param_type % 2 == 1:  # Odd type - includes Length field
                 # Value is bytes or string
@@ -412,24 +412,24 @@ class MOQTMessage:
 
                 # AUTH_TOKEN requires Token structure wrapping (Section 9.2.1.1)
                 if param_type in (ParamType.AUTH_TOKEN, SetupParamType.AUTH_TOKEN):
-                    token_buf = Buffer(capacity=BUF_SIZE)
-                    tpush = (token_buf.push_uint_vi64
-                             if profile_for(draft).varint == "vi64"
-                             else token_buf.push_uint_var)
-                    tpush(AuthTokenAliasType.USE_VALUE)  # Alias Type
-                    tpush(0)  # Token Type (0 = out-of-band)
+                    token_buf = Buffer(capacity=BUF_SIZE, vi64=prof.vi64)
+                    token_buf.push_vint(AuthTokenAliasType.USE_VALUE)  # Alias Type
+                    token_buf.push_vint(AuthTokenType.OUT_OF_BAND)  # Token Type
                     token_buf.push_bytes(param_value)  # Token Value (rest of param)
                     param_value = token_buf.data_slice(0, token_buf.tell())
                     logger.info(f"Serializing AUTH_TOKEN param as Token(USE_VALUE): {len(param_value)} bytes")
 
                 logger.info(f"Serializing param {param_type} length {len(param_value)}")
-                push(len(param_value))  # Length
+                payload.push_vint(len(param_value))  # Length
                 payload.push_bytes(param_value)  # Value
             else:  # Even type - Value is varint (no Length field)
                 if not isinstance(param_value, int):
                     raise TypeError(f"Param {param_type} expects uint, got {type(param_value)}")
                 logger.info(f"Serializing param {param_type} value {param_value}")
-                push(param_value)  # Value as varint
+                if param_type in prof.uint8_params:
+                    payload.push_uint8(param_value)  # d18 fixed uint8 width
+                else:
+                    payload.push_vint(param_value)  # Value as varint
 
         logger.info(f"Serialized {len(parameters)} parameters: {payload.data_slice(0,12)}")
 
@@ -450,14 +450,14 @@ class MOQTMessage:
         Returns:
             Dict mapping parameter type to value
         """
+        prof = profile_for(draft)
+        # Tag the buffer's varint flavor so pull_vint decodes vi64 (d18) or
+        # RFC9000 (pre-d18). Only the 16-bit message Length is fixed-width.
+        buf.vi64 = prof.vi64
         if delta_keys is None:
-            delta_keys = profile_for(draft).params_delta_coded
-        # d18 decodes every control integer as vi64; pre-d18 RFC9000.
-        pull = (buf.pull_uint_vi64
-                if profile_for(draft).varint == "vi64"
-                else buf.pull_uint_var)
+            delta_keys = prof.params_delta_coded
         params = {}
-        param_count = pull()
+        param_count = buf.pull_vint()
         prev_key = 0
 
         for _ in range(param_count):
@@ -465,7 +465,7 @@ class MOQTMessage:
                 raise MOQTProtocolViolation(
                     f"parameters declared {param_count} but buffer "
                     f"exhausted at {buf.tell()}/{buf_end}")
-            raw_key = pull()
+            raw_key = buf.pull_vint()
             if delta_keys:
                 param_type = prev_key + raw_key
                 prev_key = param_type
@@ -473,7 +473,7 @@ class MOQTMessage:
                 param_type = raw_key
 
             if param_type % 2 == 1:  # Odd type - includes Length field
-                param_len = pull()
+                param_len = buf.pull_vint()
                 if param_len > 65535:  # 2^16-1 maximum
                     raise MOQTProtocolViolation(
                         "parameter length exceeds maximum of 65535 bytes")
@@ -486,24 +486,24 @@ class MOQTMessage:
 
                 # AUTH_TOKEN: unwrap Token structure (Section 9.2.1.1)
                 if param_type in (ParamType.AUTH_TOKEN, SetupParamType.AUTH_TOKEN) and param_len > 0:
-                    token_buf = Buffer(data=param_value)
-                    tpull = (token_buf.pull_uint_vi64
-                             if profile_for(draft).varint == "vi64"
-                             else token_buf.pull_uint_var)
-                    alias_type = tpull()
+                    token_buf = Buffer(data=param_value, vi64=prof.vi64)
+                    alias_type = token_buf.pull_vint()
                     if alias_type == AuthTokenAliasType.USE_VALUE:
-                        token_type = tpull()
+                        token_type = token_buf.pull_vint()
                         param_value = token_buf.pull_bytes(param_len - token_buf.tell())
                     elif alias_type == AuthTokenAliasType.USE_ALIAS:
-                        token_alias = tpull()
+                        token_alias = token_buf.pull_vint()
                         param_value = param_value  # keep raw for now
                     elif alias_type == AuthTokenAliasType.REGISTER:
-                        token_alias = tpull()
-                        token_type = tpull()
+                        token_alias = token_buf.pull_vint()
+                        token_type = token_buf.pull_vint()
                         param_value = token_buf.pull_bytes(param_len - token_buf.tell())
                     logger.info(f"AUTH_TOKEN: alias_type={alias_type} value={len(param_value)} bytes")
             else:  # Even type - Value is varint
-                param_value = pull()
+                if param_type in prof.uint8_params:
+                    param_value = buf.pull_uint8()  # d18 fixed uint8 width
+                else:
+                    param_value = buf.pull_vint()
             # Even-type varints are self-describing, so the frame bound
             # is checked after the read: an over-read past buf_end is a
             # wire violation, not a silent consume into the next message.
@@ -523,12 +523,10 @@ class MOQTMessage:
         ascending delta-coded; even Type = varint Value, odd Type =
         Length-prefixed bytes. Varint width follows the draft profile
         (vi64 for d18+). AUTH_TOKEN Token wrapping is not handled here."""
-        push_int = (payload.push_uint_vi64
-                    if profile_for(draft).varint == "vi64"
-                    else payload.push_uint_var)
+        payload.vi64 = profile_for(draft).vi64
         prev_key = 0
         for key, value in sorted(kvps.items()):
-            push_int(key - prev_key)
+            payload.push_vint(key - prev_key)
             prev_key = key
             if key % 2 == 1:  # odd Type → Length-prefixed bytes
                 if isinstance(value, str):
@@ -536,13 +534,13 @@ class MOQTMessage:
                 if not isinstance(value, (bytes, bytearray)):
                     raise TypeError(
                         f"KVP {key} expects bytes, got {type(value)}")
-                push_int(len(value))
+                payload.push_vint(len(value))
                 payload.push_bytes(bytes(value))
             else:  # even Type → varint Value
                 if not isinstance(value, int):
                     raise TypeError(
                         f"KVP {key} expects uint, got {type(value)}")
-                push_int(value)
+                payload.push_vint(value)
 
     @staticmethod
     def _deserialize_kvp_to_end(buf: Buffer, *, draft: int,
@@ -550,16 +548,14 @@ class MOQTMessage:
         """Deserialize count-less delta-coded Key-Value-Pairs (Figure 2)
         to buf_end — d18 Setup Options. Mirror of _serialize_kvp_to_end.
         Over-reads past buf_end raise MOQTProtocolViolation."""
-        pull_int = (buf.pull_uint_vi64
-                    if profile_for(draft).varint == "vi64"
-                    else buf.pull_uint_var)
+        buf.vi64 = profile_for(draft).vi64
         kvps: Dict[int, Any] = {}
         prev_key = 0
         while buf.tell() < buf_end:
-            key = prev_key + pull_int()
+            key = prev_key + buf.pull_vint()
             prev_key = key
             if key % 2 == 1:  # odd Type → Length + bytes
-                vlen = pull_int()
+                vlen = buf.pull_vint()
                 if vlen > 65535:  # 2^16-1 maximum (Figure 2)
                     raise MOQTProtocolViolation(
                         "KVP value length exceeds maximum of 65535 bytes")
@@ -569,7 +565,7 @@ class MOQTMessage:
                         f"{buf_end - buf.tell()}")
                 value: Any = buf.pull_bytes(vlen)
             else:  # even Type → varint Value
-                value = pull_int()
+                value = buf.pull_vint()
                 if buf.tell() > buf_end:
                     raise MOQTProtocolViolation(
                         f"KVP overran frame extent: {buf.tell()}/{buf_end}")

@@ -229,6 +229,14 @@ class AuthTokenAliasType(IntEnum):
     USE_VALUE = 0x3   # Type + Value only — one-shot, no alias
 
 
+class AuthTokenType(IntEnum):
+    """Authorization Token Type — the numeric Token-payload identifier in
+    the Token structure (§8.2.1.1; IANA registry "MOQT Auth Token Type",
+    §15.6). Type 0 is reserved for a token whose type is not in the table
+    and is negotiated out-of-band; nonzero values are IANA-registered."""
+    OUT_OF_BAND = 0x0
+
+
 class SubscribeErrorCode(IntEnum):
     """SUBSCRIBE_ERROR error codes (draft-14)."""
     INTERNAL_ERROR = 0x0

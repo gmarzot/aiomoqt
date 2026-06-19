@@ -459,11 +459,9 @@ class _MOQTSessionMixin:
             # d18 control framing uses vi64 for the Message Type (0x2F00
             # -> AF 00); pre-d18 uses the RFC9000 varint. Length stays
             # 16-bit in all drafts (§10.1).
-            vi64 = profile_for(self._draft).varint == "vi64"
-            if vi64:
-                msg_type = buf.pull_uint_vi64()
-            else:
-                msg_type = buf.pull_uint_var()
+            prof = profile_for(self._draft)
+            buf.vi64 = prof.vi64
+            msg_type = buf.pull_vint()
             msg_len = buf.pull_uint16()
             hdr_len = buf.tell() - start_pos
             end_pos = start_pos + hdr_len + msg_len
@@ -488,7 +486,7 @@ class _MOQTSessionMixin:
             # code points (SETUP 0x2F00, SUBSCRIBE_NAMESPACE 0x50, ...) fall
             # outside MOQTMessageType's contiguous range, and an unknown
             # type closes the session via _get_control_entry (§10.1 MUST).
-            if not vi64:
+            if prof.varint != "vi64":
                 try:
                     msg_type = MOQTMessageType(msg_type)
                 except ValueError:
@@ -888,9 +886,8 @@ class _MOQTSessionMixin:
             if stream_state is None or stream_state.parser is None:
                 # Get stream type from first varint. d18 uses vi64 for the
                 # stream type (and all data-plane ints); pre-d18 RFC9000.
-                vi64 = profile_for(self._draft).varint == "vi64"
-                stream_type = (buf.pull_uint_vi64() if vi64
-                               else buf.pull_uint_var())
+                buf.vi64 = profile_for(self._draft).vi64
+                stream_type = buf.pull_vint()
                 # SubgroupHeader form 0b0XX1XXXX (bit 4 set): d14 0x10-0x1D,
                 # d16 += 0x30-0x3D (bit 5 DEFAULT_PRIORITY), d18 += 0x50-0x5D
                 # / 0x70-0x7D (bit 6 FIRST_OBJECT) and excludes bit 7.
@@ -1002,9 +999,10 @@ class _MOQTSessionMixin:
         logger.debug(f"MOQT handle datagram: 0x{buf.data_slice(0,min(buf.capacity,12))}")
         # Get datagram type from first varint (vi64 for d18).
         pos = buf.tell()
-        vi64 = profile_for(self._draft).varint == "vi64"
-        dgram_type = buf.pull_uint_vi64() if vi64 else buf.pull_uint_var()
-        if vi64:
+        prof = profile_for(self._draft)
+        buf.vi64 = prof.vi64
+        dgram_type = buf.pull_vint()
+        if prof.varint == "vi64":
             return self._moqt_handle_data_dgram_d18(buf, pos, dgram_type)
         # Draft-14: ObjectDatagram types 0x00-0x07 (payload datagrams)
         if 0x00 <= dgram_type <= 0x07:

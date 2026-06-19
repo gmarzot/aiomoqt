@@ -131,11 +131,9 @@ class RequestUpdate(MOQTMessage):
         # REQUEST_UPDATE carries both a (new) Request ID and the Existing
         # Request ID it updates, in d16 and d18 alike — confirmed against
         # the mvfst/moxygen d18 relay, which sends both. d18 uses vi64.
-        push = (payload.push_uint_vi64
-                if profile_for(draft).varint == "vi64"
-                else payload.push_uint_var)
-        push(self.request_id)
-        push(self.existing_request_id)
+        payload.vi64 = profile_for(draft).vi64
+        payload.push_vint(self.request_id)
+        payload.push_vint(self.existing_request_id)
         MOQTMessage._serialize_params(payload, self.parameters or {}, draft=draft)
 
         buf.push_uint_var(self.type)
@@ -145,11 +143,9 @@ class RequestUpdate(MOQTMessage):
 
     @classmethod
     def deserialize(cls, buf: Buffer, *, draft: int, buf_end: Optional[int] = None) -> 'RequestUpdate':
-        pull = (buf.pull_uint_vi64
-                if profile_for(draft).varint == "vi64"
-                else buf.pull_uint_var)
-        request_id = pull()
-        existing_request_id = pull()
+        buf.vi64 = profile_for(draft).vi64
+        request_id = buf.pull_vint()
+        existing_request_id = buf.pull_vint()
         params = MOQTMessage._deserialize_params(buf, draft=draft, buf_end=buf_end)
 
         return cls(
