@@ -341,6 +341,48 @@ def test_d18_registry_namespace_renumber():
     assert MOQTMessageType.SUBSCRIBE_NAMESPACE in reg16  # d16 keeps 0x11
 
 
+def test_d18_subscribe_large_request_id_vi64():
+    # Proven-path message: request_id >= 64 must be vi64 in the body.
+    from aiomoqt.messages.subscribe import Subscribe
+    msg = Subscribe(request_id=100, track_namespace=(b"ns",),
+                    track_name=b"clock")
+    raw = bytes(msg.serialize(draft=18).data)
+    body = raw[3:]  # after type 0x03 (1B) + 16-bit Length
+    assert body[0] == 0x64  # vi64(100), not RFC9000 0x40 0x64
+    out = Subscribe.deserialize(
+        Buffer(data=body, vi64=True), draft=18, buf_end=len(body))
+    assert out.request_id == 100
+    assert out.track_namespace == (b"ns",)
+    assert out.track_name == b"clock"
+
+
+def test_d18_subscribe_ok_large_track_alias_vi64():
+    # SubscribeOk drops request_id in d18; body starts with track_alias.
+    # 300 discriminates: vi64 0x81 0x2C vs RFC9000 0x41 0x2C.
+    from aiomoqt.messages.subscribe import SubscribeOk
+    msg = SubscribeOk(request_id=7, track_alias=300)
+    raw = bytes(msg.serialize(draft=18).data)
+    body = raw[3:]
+    assert body[0:2] == bytes([0x81, 0x2C])  # vi64(300)
+    out = SubscribeOk.deserialize(
+        Buffer(data=body, vi64=True), draft=18, buf_end=len(body))
+    assert out.request_id is None  # d18 omits it
+    assert out.track_alias == 300
+
+
+def test_d18_publish_large_ids_vi64():
+    from aiomoqt.messages.publish import Publish
+    msg = Publish(request_id=100, track_namespace=(b"ns",),
+                  track_name=b"clock", track_alias=200)
+    raw = bytes(msg.serialize(draft=18).data)
+    body = raw[3:]  # after type 0x1D (1B) + 16-bit Length
+    assert body[0] == 0x64  # vi64(100) request_id
+    out = Publish.deserialize(
+        Buffer(data=body, vi64=True), draft=18, buf_end=len(body))
+    assert out.request_id == 100
+    assert out.track_alias == 200
+
+
 def test_d18_setup_message_wire_form():
     from aiomoqt.messages.d18 import Setup
     from aiomoqt.types import MOQTMessageType
