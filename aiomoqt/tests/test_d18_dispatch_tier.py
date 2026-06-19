@@ -272,6 +272,75 @@ def test_d16_publish_namespace_request_id_stays_rfc9000():
     assert out.request_id == 100
 
 
+def test_d18_subscribe_namespace_renumbered_0x50_no_options():
+    from aiomoqt.messages.namespace import SubscribeNamespace
+    msg = SubscribeNamespace(request_id=1, namespace_prefix=(b"ex",),
+                             subscribe_options=7, parameters={})
+    raw = bytes(msg.serialize(draft=18).data)
+    # d18 type is vi64 0x50 (1 byte); 0x50 >= 64 so RFC9000 would be 2 bytes.
+    assert raw[0] == 0x50
+    plen = (raw[1] << 8) | raw[2]
+    body = raw[3:3 + plen]
+    out = SubscribeNamespace.deserialize(
+        Buffer(data=body, vi64=True), draft=18, buf_end=len(body))
+    assert out.request_id == 1
+    assert out.namespace_prefix == (b"ex",)
+    assert out.subscribe_options == 0  # d18 dropped it (was set to 7)
+
+
+def test_d16_subscribe_namespace_keeps_0x11_and_options():
+    from aiomoqt.messages.namespace import SubscribeNamespace
+    msg = SubscribeNamespace(request_id=1, namespace_prefix=(b"ex",),
+                             subscribe_options=7, parameters={})
+    raw = bytes(msg.serialize(draft=16).data)
+    assert raw[0] == 0x11  # unchanged code point in d16
+    plen = (raw[1] << 8) | raw[2]
+    body = raw[3:3 + plen]
+    out = SubscribeNamespace.deserialize(
+        Buffer(data=body), draft=16, buf_end=len(body))
+    assert out.subscribe_options == 7  # d16 keeps it
+
+
+def test_d18_subscribe_tracks_round_trip():
+    from aiomoqt.messages.namespace import SubscribeTracks
+    msg = SubscribeTracks(request_id=3, namespace_prefix=(b"ex", b"m"),
+                          parameters={})
+    raw = bytes(msg.serialize(draft=18).data)
+    assert raw[0] == 0x51  # vi64 type
+    plen = (raw[1] << 8) | raw[2]
+    body = raw[3:3 + plen]
+    out = SubscribeTracks.deserialize(
+        Buffer(data=body, vi64=True), draft=18, buf_end=len(body))
+    assert out.request_id == 3
+    assert out.namespace_prefix == (b"ex", b"m")
+
+
+def test_d18_publish_blocked_round_trip():
+    from aiomoqt.messages.namespace import PublishBlocked
+    msg = PublishBlocked(namespace_suffix=(b"p100",), track_name=b"clock")
+    raw = bytes(msg.serialize(draft=18).data)
+    assert raw[0] == 0x0F  # vi64 type (also < 64, single byte)
+    plen = (raw[1] << 8) | raw[2]
+    body = raw[3:3 + plen]
+    out = PublishBlocked.deserialize(
+        Buffer(data=body, vi64=True), draft=18, buf_end=len(body))
+    assert out.namespace_suffix == (b"p100",)
+    assert out.track_name == b"clock"
+
+
+def test_d18_registry_namespace_renumber():
+    from aiomoqt.types import MOQTMessageType, D18MessageType
+    from aiomoqt.messages.namespace import (
+        SubscribeNamespace, SubscribeTracks, PublishBlocked)
+    reg18 = _MOQTSessionMixin.CONTROL_REGISTRY[MOQTDraft.DRAFT_18]
+    assert MOQTMessageType.SUBSCRIBE_NAMESPACE not in reg18  # old 0x11 gone
+    assert reg18[D18MessageType.SUBSCRIBE_NAMESPACE][0] is SubscribeNamespace
+    assert reg18[D18MessageType.SUBSCRIBE_TRACKS][0] is SubscribeTracks
+    assert reg18[D18MessageType.PUBLISH_BLOCKED][0] is PublishBlocked
+    reg16 = _MOQTSessionMixin.CONTROL_REGISTRY[MOQTDraft.DRAFT_16]
+    assert MOQTMessageType.SUBSCRIBE_NAMESPACE in reg16  # d16 keeps 0x11
+
+
 def test_d18_setup_message_wire_form():
     from aiomoqt.messages.d18 import Setup
     from aiomoqt.types import MOQTMessageType

@@ -1631,7 +1631,7 @@ class _MOQTSessionMixin:
     # all requests onto their own bidi stream. (SUBSCRIBE_TRACKS 0x51 lands
     # with the d18 control-message set in a later phase.)
     _REQUEST_OPENERS = (Subscribe, Fetch, Publish, TrackStatus,
-                        PublishNamespace, SubscribeNamespace)
+                        PublishNamespace, SubscribeNamespace, SubscribeTracks)
 
     def _handle_bidi_stream(self, stream_id: int, buf: Buffer, buf_len: int) -> None:
         """Handle request bidirectional stream messages. The first message
@@ -2412,7 +2412,17 @@ class _MOQTSessionMixin:
         stream_id = self._bidi_streams.get(msg.request_id)
         logger.debug(f"MOQT event: subscribe_namespace bidi_stream={stream_id} request_id={msg.request_id} bidi_streams={self._bidi_streams}")
         self.subscribe_namespace_ok(msg, stream_id=stream_id)
-           
+
+    async def _handle_subscribe_tracks(self, msg: SubscribeTracks) -> None:
+        # d18 SUBSCRIBE_TRACKS (0x51) — publisher-side track-prefix subscribe.
+        # Track-publish wiring is a publisher feature; log-only for now.
+        logger.info(f"MOQT event: handle {msg}")
+
+    async def _handle_publish_blocked(self, msg: PublishBlocked) -> None:
+        # d18 PUBLISH_BLOCKED (0x0F) — subscriber-side notice that a track
+        # cannot be published. Log-only for now.
+        logger.info(f"MOQT event: handle {msg}")
+
     async def _handle_subscribe_namespace_ok(self, msg: SubscribeNamespaceOk) -> None:
         logger.info(f"MOQT event: handle {msg}")
         self._resolve_request(msg.request_id, msg)
@@ -2669,6 +2679,16 @@ class _MOQTSessionMixin:
     _D18_REGISTRY.pop(MOQTMessageType.CLIENT_SETUP, None)
     _D18_REGISTRY.pop(MOQTMessageType.SERVER_SETUP, None)
     _D18_REGISTRY[MOQTMessageType.SETUP] = (Setup, _handle_d18_setup)
+    # d18 renumbers SUBSCRIBE_NAMESPACE 0x11 -> 0x50 and adds SUBSCRIBE_TRACKS
+    # 0x51 + PUBLISH_BLOCKED 0x0F (§10.18-10.20). 0x0F overwrites the d14
+    # TRACK_STATUS_ERROR point carried over leniently in the d16 base.
+    _D18_REGISTRY.pop(MOQTMessageType.SUBSCRIBE_NAMESPACE, None)  # old 0x11
+    _D18_REGISTRY[D18MessageType.SUBSCRIBE_NAMESPACE] = (
+        SubscribeNamespace, _handle_subscribe_namespace)
+    _D18_REGISTRY[D18MessageType.SUBSCRIBE_TRACKS] = (
+        SubscribeTracks, _handle_subscribe_tracks)
+    _D18_REGISTRY[D18MessageType.PUBLISH_BLOCKED] = (
+        PublishBlocked, _handle_publish_blocked)
 
     CONTROL_REGISTRY: Dict[int, Dict[int, Tuple[Type[MOQTMessage], Callable]]] = {
         MOQTDraft.DRAFT_14: MOQT_CONTROL_MESSAGE_REGISTRY,

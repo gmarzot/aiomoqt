@@ -158,6 +158,16 @@ class D16MessageType:
     NAMESPACE_DONE = 0x0E       # was TRACK_STATUS_OK
 
 
+class D18MessageType:
+    """Draft-18 message type code points that are new or renumbered.
+    Kept separate from MOQTMessageType because PUBLISH_BLOCKED reuses the
+    d14 TRACK_STATUS_ERROR point (0x0F); per-draft CONTROL_REGISTRY tables
+    disambiguate by the negotiated draft."""
+    SUBSCRIBE_NAMESPACE = 0x50  # was 0x11 in d14/d16
+    SUBSCRIBE_TRACKS = 0x51     # new in d18
+    PUBLISH_BLOCKED = 0x0F      # new in d18 (d14 TRACK_STATUS_ERROR point)
+
+
 class ParamType(IntEnum):
     """Parameter types for MOQT messages."""
     DELIVERY_TIMEOUT = 0x02

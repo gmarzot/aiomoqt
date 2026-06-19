@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import Dict, Tuple, Any, Optional
 
-from . import MOQTMessageType, MOQTMessage, BUF_SIZE
+from . import MOQTMessageType, D18MessageType, MOQTMessage, BUF_SIZE
 from ..context import is_draft16_or_later, profile_for
 from ..utils.buffer import Buffer, BufferReadError
 from ..utils.logger import get_logger
@@ -226,12 +226,17 @@ class SubscribeNamespace(MOQTMessage):
             payload.push_vint(len(part))
             payload.push_bytes(part)
 
-        if is_draft16_or_later(draft):
+        # subscribe_options: d16 only — d18 (SUBSCRIBE_NAMESPACE, 10.18)
+        # removed it.
+        if is_draft16_or_later(draft) and not profile_for(draft).vi64:
             payload.push_vint(self.subscribe_options)
 
         MOQTMessage._serialize_params(payload, self.parameters, draft=draft)
 
-        buf.push_uint_var(self.type)
+        # d18 renumbers this 0x11 -> 0x50 and writes the type as vi64.
+        buf.vi64 = profile_for(draft).vi64
+        buf.push_vint(
+            D18MessageType.SUBSCRIBE_NAMESPACE if buf.vi64 else self.type)
         buf.push_uint16(payload.tell())
         buf.push_bytes(payload.data_slice(0, payload.tell()))
         return buf
@@ -242,11 +247,91 @@ class SubscribeNamespace(MOQTMessage):
         tuple_len = buf.pull_vint()
         namespace_prefix = tuple(buf.pull_bytes(buf.pull_vint()) for _ in range(tuple_len))
         subscribe_options = 0
-        if is_draft16_or_later(draft):
+        if is_draft16_or_later(draft) and not profile_for(draft).vi64:
             subscribe_options = buf.pull_vint()
         params = MOQTMessage._deserialize_params(buf, draft=draft, buf_end=buf_end)
         return cls(request_id=request_id, namespace_prefix=namespace_prefix,
                    subscribe_options=subscribe_options, parameters=params)
+
+
+@dataclass(slots=True)
+class SubscribeTracks(MOQTMessage):
+    """SUBSCRIBE_TRACKS (0x51, draft-18) — request PUBLISH messages for all
+    tracks within matching namespaces. Body is identical to
+    SUBSCRIBE_NAMESPACE: Request ID, Track Namespace Prefix, Parameters."""
+    request_id: int = 0
+    namespace_prefix: Tuple[bytes, ...] = None
+    parameters: Dict[int, Any] = None
+
+    def __post_init__(self):
+        self.type = D18MessageType.SUBSCRIBE_TRACKS
+
+    def serialize(self, *, draft: int) -> bytes:
+        buf = Buffer(capacity=BUF_SIZE)
+        payload = Buffer(capacity=BUF_SIZE, vi64=profile_for(draft).vi64)
+
+        payload.push_vint(self.request_id)
+        payload.push_vint(len(self.namespace_prefix))
+        for part in self.namespace_prefix:
+            payload.push_vint(len(part))
+            payload.push_bytes(part)
+        MOQTMessage._serialize_params(
+            payload, self.parameters or {}, draft=draft)
+
+        buf.vi64 = profile_for(draft).vi64
+        buf.push_vint(self.type)
+        buf.push_uint16(payload.tell())
+        buf.push_bytes(payload.data_slice(0, payload.tell()))
+        return buf
+
+    @classmethod
+    def deserialize(cls, buf: Buffer, *, draft: int, buf_end: Optional[int] = None) -> 'SubscribeTracks':
+        request_id = buf.pull_vint()
+        tuple_len = buf.pull_vint()
+        namespace_prefix = tuple(
+            buf.pull_bytes(buf.pull_vint()) for _ in range(tuple_len))
+        params = MOQTMessage._deserialize_params(buf, draft=draft, buf_end=buf_end)
+        return cls(request_id=request_id, namespace_prefix=namespace_prefix,
+                   parameters=params)
+
+
+@dataclass(slots=True)
+class PublishBlocked(MOQTMessage):
+    """PUBLISH_BLOCKED (0x0F, draft-18) — the publisher cannot send a PUBLISH
+    to start a new subscription for a track in a SUBSCRIBE_TRACKS namespace.
+    Body: Track Namespace Suffix, Track Name (10.20)."""
+    namespace_suffix: Tuple[bytes, ...] = None
+    track_name: bytes = b""
+
+    def __post_init__(self):
+        self.type = D18MessageType.PUBLISH_BLOCKED
+
+    def serialize(self, *, draft: int) -> bytes:
+        buf = Buffer(capacity=BUF_SIZE)
+        payload = Buffer(capacity=BUF_SIZE, vi64=profile_for(draft).vi64)
+
+        payload.push_vint(len(self.namespace_suffix))
+        for part in self.namespace_suffix:
+            payload.push_vint(len(part))
+            payload.push_bytes(part)
+        tn = (self.track_name.encode()
+              if isinstance(self.track_name, str) else self.track_name)
+        payload.push_vint(len(tn))
+        payload.push_bytes(tn)
+
+        buf.vi64 = profile_for(draft).vi64
+        buf.push_vint(self.type)
+        buf.push_uint16(payload.tell())
+        buf.push_bytes(payload.data_slice(0, payload.tell()))
+        return buf
+
+    @classmethod
+    def deserialize(cls, buf: Buffer, *, draft: int, buf_end: Optional[int] = None) -> 'PublishBlocked':
+        tuple_len = buf.pull_vint()
+        namespace_suffix = tuple(
+            buf.pull_bytes(buf.pull_vint()) for _ in range(tuple_len))
+        track_name = buf.pull_bytes(buf.pull_vint())
+        return cls(namespace_suffix=namespace_suffix, track_name=track_name)
 
 
 @dataclass(slots=True)
