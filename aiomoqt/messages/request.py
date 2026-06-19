@@ -33,11 +33,11 @@ class RequestOk(MOQTMessage):
 
     def serialize(self, *, draft: int) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
-        payload = Buffer(capacity=BUF_SIZE)
+        payload = Buffer(capacity=BUF_SIZE, vi64=profile_for(draft).vi64)
 
         # d18 replies omit the Request ID (demuxed by request stream, §10.1).
         if profile_for(draft).reply_has_request_id:
-            payload.push_uint_var(self.request_id)
+            payload.push_vint(self.request_id)
         MOQTMessage._serialize_params(payload, self.parameters or {}, draft=draft)
 
         buf.push_uint_var(self.type)
@@ -47,7 +47,7 @@ class RequestOk(MOQTMessage):
 
     @classmethod
     def deserialize(cls, buf: Buffer, *, draft: int, buf_end: Optional[int] = None) -> 'RequestOk':
-        request_id = (buf.pull_uint_var()
+        request_id = (buf.pull_vint()
                       if profile_for(draft).reply_has_request_id else None)
         params = MOQTMessage._deserialize_params(buf, draft=draft, buf_end=buf_end)
         return cls(request_id=request_id, parameters=params)
@@ -73,16 +73,16 @@ class RequestError(MOQTMessage):
 
     def serialize(self, *, draft: int) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
-        payload = Buffer(capacity=BUF_SIZE)
+        payload = Buffer(capacity=BUF_SIZE, vi64=profile_for(draft).vi64)
 
         # d18 replies omit the Request ID (demuxed by request stream, §10.1).
         if profile_for(draft).reply_has_request_id:
-            payload.push_uint_var(self.request_id)
-        payload.push_uint_var(self.error_code)
-        payload.push_uint_var(self.retry_interval)
+            payload.push_vint(self.request_id)
+        payload.push_vint(self.error_code)
+        payload.push_vint(self.retry_interval)
 
         reason_bytes = (self.reason or "").encode()
-        payload.push_uint_var(len(reason_bytes))
+        payload.push_vint(len(reason_bytes))
         payload.push_bytes(reason_bytes)
 
         buf.push_uint_var(self.type)
@@ -92,11 +92,11 @@ class RequestError(MOQTMessage):
 
     @classmethod
     def deserialize(cls, buf: Buffer, *, draft: int, buf_end: Optional[int] = None) -> 'RequestError':
-        request_id = (buf.pull_uint_var()
+        request_id = (buf.pull_vint()
                       if profile_for(draft).reply_has_request_id else None)
-        error_code = buf.pull_uint_var()
-        retry_interval = buf.pull_uint_var()
-        reason_len = buf.pull_uint_var()
+        error_code = buf.pull_vint()
+        retry_interval = buf.pull_vint()
+        reason_len = buf.pull_vint()
         reason = buf.pull_bytes(reason_len).decode()
 
         return cls(
@@ -126,12 +126,11 @@ class RequestUpdate(MOQTMessage):
 
     def serialize(self, *, draft: int) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
-        payload = Buffer(capacity=BUF_SIZE)
+        payload = Buffer(capacity=BUF_SIZE, vi64=profile_for(draft).vi64)
 
         # REQUEST_UPDATE carries both a (new) Request ID and the Existing
         # Request ID it updates, in d16 and d18 alike — confirmed against
         # the mvfst/moxygen d18 relay, which sends both. d18 uses vi64.
-        payload.vi64 = profile_for(draft).vi64
         payload.push_vint(self.request_id)
         payload.push_vint(self.existing_request_id)
         MOQTMessage._serialize_params(payload, self.parameters or {}, draft=draft)
@@ -143,7 +142,6 @@ class RequestUpdate(MOQTMessage):
 
     @classmethod
     def deserialize(cls, buf: Buffer, *, draft: int, buf_end: Optional[int] = None) -> 'RequestUpdate':
-        buf.vi64 = profile_for(draft).vi64
         request_id = buf.pull_vint()
         existing_request_id = buf.pull_vint()
         params = MOQTMessage._deserialize_params(buf, draft=draft, buf_end=buf_end)
@@ -171,11 +169,11 @@ class Namespace(MOQTMessage):
 
     def serialize(self, *, draft: int) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
-        payload = Buffer(capacity=BUF_SIZE)
+        payload = Buffer(capacity=BUF_SIZE, vi64=profile_for(draft).vi64)
 
-        payload.push_uint_var(len(self.namespace_suffix))
+        payload.push_vint(len(self.namespace_suffix))
         for part in self.namespace_suffix:
-            payload.push_uint_var(len(part))
+            payload.push_vint(len(part))
             payload.push_bytes(part)
 
         buf.push_uint_var(self.type)
@@ -185,9 +183,9 @@ class Namespace(MOQTMessage):
 
     @classmethod
     def deserialize(cls, buf: Buffer, *, draft: int, buf_end: Optional[int] = None) -> 'Namespace':
-        tuple_len = buf.pull_uint_var()
+        tuple_len = buf.pull_vint()
         namespace_suffix = tuple(
-            buf.pull_bytes(buf.pull_uint_var()) for _ in range(tuple_len)
+            buf.pull_bytes(buf.pull_vint()) for _ in range(tuple_len)
         )
         return cls(namespace_suffix=namespace_suffix)
 
@@ -208,11 +206,11 @@ class NamespaceDone(MOQTMessage):
 
     def serialize(self, *, draft: int) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
-        payload = Buffer(capacity=BUF_SIZE)
+        payload = Buffer(capacity=BUF_SIZE, vi64=profile_for(draft).vi64)
 
-        payload.push_uint_var(len(self.namespace_suffix))
+        payload.push_vint(len(self.namespace_suffix))
         for part in self.namespace_suffix:
-            payload.push_uint_var(len(part))
+            payload.push_vint(len(part))
             payload.push_bytes(part)
 
         buf.push_uint_var(self.type)
@@ -222,8 +220,8 @@ class NamespaceDone(MOQTMessage):
 
     @classmethod
     def deserialize(cls, buf: Buffer, *, draft: int, buf_end: Optional[int] = None) -> 'NamespaceDone':
-        tuple_len = buf.pull_uint_var()
+        tuple_len = buf.pull_vint()
         namespace_suffix = tuple(
-            buf.pull_bytes(buf.pull_uint_var()) for _ in range(tuple_len)
+            buf.pull_bytes(buf.pull_vint()) for _ in range(tuple_len)
         )
         return cls(namespace_suffix=namespace_suffix)

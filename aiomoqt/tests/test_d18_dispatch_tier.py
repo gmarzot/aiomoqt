@@ -237,9 +237,39 @@ def test_d18_request_update_large_ids_round_trip_vi64():
     assert body[0] == 0x64
     assert body[1:3] == bytes([0x80, 0xC8])
     ru = RequestUpdate.deserialize(
-        Buffer(data=body), draft=18, buf_end=len(body))
+        Buffer(data=body, vi64=True), draft=18, buf_end=len(body))
     assert ru.request_id == 100
     assert ru.existing_request_id == 200
+
+
+def test_d18_publish_namespace_large_request_id_vi64():
+    # Control-message BODY integers (not just params) must be vi64 in d18.
+    # request_id 100 (>=64) discriminates: vi64 0x64 (1B) vs RFC9000 0x40
+    # 0x64 (2B). Deserialize is fed a vi64-tagged buffer, mirroring the
+    # dispatch chokepoint that tags every control buffer before deserialize.
+    from aiomoqt.messages.namespace import PublishNamespace
+    msg = PublishNamespace(
+        request_id=100, namespace=(b"ex", b"meeting"), parameters={})
+    raw = bytes(msg.serialize(draft=18).data)
+    body = raw[3:]  # after type (1B, 0x06) + 16-bit Length
+    assert body[0] == 0x64  # vi64(100), not RFC9000's 0x40
+    rbuf = Buffer(data=body, vi64=True)
+    out = PublishNamespace.deserialize(rbuf, draft=18, buf_end=len(body))
+    assert out.request_id == 100
+    assert out.namespace == (b"ex", b"meeting")
+
+
+def test_d16_publish_namespace_request_id_stays_rfc9000():
+    # Same message on d16 keeps RFC9000: request_id 100 -> 0x40 0x64.
+    from aiomoqt.messages.namespace import PublishNamespace
+    msg = PublishNamespace(
+        request_id=100, namespace=(b"ex",), parameters={})
+    raw = bytes(msg.serialize(draft=16).data)
+    body = raw[3:]
+    assert body[0:2] == bytes([0x40, 0x64])  # rfc9000(100)
+    out = PublishNamespace.deserialize(
+        Buffer(data=body), draft=16, buf_end=len(body))
+    assert out.request_id == 100
 
 
 def test_d18_setup_message_wire_form():

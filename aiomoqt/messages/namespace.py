@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from typing import Dict, Tuple, Any, Optional
 
 from . import MOQTMessageType, MOQTMessage, BUF_SIZE
-from ..context import is_draft16_or_later
+from ..context import is_draft16_or_later, profile_for
 from ..utils.buffer import Buffer, BufferReadError
 from ..utils.logger import get_logger
 
@@ -21,14 +21,14 @@ class PublishNamespace(MOQTMessage):
 
     def serialize(self, *, draft: int) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
-        payload = Buffer(capacity=BUF_SIZE)
+        payload = Buffer(capacity=BUF_SIZE, vi64=profile_for(draft).vi64)
 
-        payload.push_uint_var(self.request_id)
+        payload.push_vint(self.request_id)
         
         # Serialize namespace tuple
-        payload.push_uint_var(len(self.namespace))
+        payload.push_vint(len(self.namespace))
         for part in self.namespace:
-            payload.push_uint_var(len(part))
+            payload.push_vint(len(part))
             payload.push_bytes(part)
 
         # Serialize parameters
@@ -41,10 +41,10 @@ class PublishNamespace(MOQTMessage):
 
     @classmethod
     def deserialize(cls, buf: Buffer, *, draft: int, buf_end: Optional[int] = None) -> 'PublishNamespace':
-        request_id = buf.pull_uint_var()
+        request_id = buf.pull_vint()
         
-        tuple_len = buf.pull_uint_var()
-        namespace = tuple(buf.pull_bytes(buf.pull_uint_var()) for _ in range(tuple_len))
+        tuple_len = buf.pull_vint()
+        namespace = tuple(buf.pull_bytes(buf.pull_vint()) for _ in range(tuple_len))
         
         params = MOQTMessage._deserialize_params(buf, draft=draft, buf_end=buf_end)
         return cls(request_id=request_id, namespace=namespace, parameters=params)
@@ -60,9 +60,9 @@ class PublishNamespaceOk(MOQTMessage):
 
     def serialize(self, *, draft: int) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
-        payload = Buffer(capacity=BUF_SIZE)
+        payload = Buffer(capacity=BUF_SIZE, vi64=profile_for(draft).vi64)
 
-        payload.push_uint_var(self.request_id)
+        payload.push_vint(self.request_id)
 
         buf.push_uint_var(self.type)
         buf.push_uint16(payload.tell())
@@ -71,7 +71,7 @@ class PublishNamespaceOk(MOQTMessage):
 
     @classmethod
     def deserialize(cls, buf: Buffer, *, draft: int, buf_end: Optional[int] = None) -> 'PublishNamespaceOk':
-        request_id = buf.pull_uint_var()
+        request_id = buf.pull_vint()
         return cls(request_id=request_id)
 
 
@@ -87,13 +87,13 @@ class PublishNamespaceError(MOQTMessage):
 
     def serialize(self, *, draft: int) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
-        payload = Buffer(capacity=BUF_SIZE)
+        payload = Buffer(capacity=BUF_SIZE, vi64=profile_for(draft).vi64)
 
-        payload.push_uint_var(self.request_id)
-        payload.push_uint_var(self.error_code)
+        payload.push_vint(self.request_id)
+        payload.push_vint(self.error_code)
         
         reason_bytes = self.reason.encode()
-        payload.push_uint_var(len(reason_bytes))
+        payload.push_vint(len(reason_bytes))
         payload.push_bytes(reason_bytes)
 
         buf.push_uint_var(self.type)
@@ -103,9 +103,9 @@ class PublishNamespaceError(MOQTMessage):
 
     @classmethod
     def deserialize(cls, buf: Buffer, *, draft: int, buf_end: Optional[int] = None) -> 'PublishNamespaceError':
-        request_id = buf.pull_uint_var()
-        error_code = buf.pull_uint_var()
-        reason_len = buf.pull_uint_var()
+        request_id = buf.pull_vint()
+        error_code = buf.pull_vint()
+        reason_len = buf.pull_vint()
         reason = buf.pull_bytes(reason_len).decode()
         return cls(request_id=request_id, error_code=error_code, reason=reason)
 
@@ -125,14 +125,14 @@ class PublishNamespaceDone(MOQTMessage):
 
     def serialize(self, *, draft: int) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
-        payload = Buffer(capacity=BUF_SIZE)
+        payload = Buffer(capacity=BUF_SIZE, vi64=profile_for(draft).vi64)
 
         if is_draft16_or_later(draft):
-            payload.push_uint_var(self.request_id)
+            payload.push_vint(self.request_id)
         else:
-            payload.push_uint_var(len(self.namespace))
+            payload.push_vint(len(self.namespace))
             for part in self.namespace:
-                payload.push_uint_var(len(part))
+                payload.push_vint(len(part))
                 payload.push_bytes(part)
 
         buf.push_uint_var(self.type)
@@ -143,11 +143,11 @@ class PublishNamespaceDone(MOQTMessage):
     @classmethod
     def deserialize(cls, buf: Buffer, *, draft: int, buf_end: Optional[int] = None) -> 'PublishNamespaceDone':
         if is_draft16_or_later(draft):
-            request_id = buf.pull_uint_var()
+            request_id = buf.pull_vint()
             return cls(request_id=request_id)
         else:
-            tuple_len = buf.pull_uint_var()
-            namespace = tuple(buf.pull_bytes(buf.pull_uint_var()) for _ in range(tuple_len))
+            tuple_len = buf.pull_vint()
+            namespace = tuple(buf.pull_bytes(buf.pull_vint()) for _ in range(tuple_len))
             return cls(namespace=namespace)
 
 
@@ -168,20 +168,20 @@ class PublishNamespaceCancel(MOQTMessage):
 
     def serialize(self, *, draft: int) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
-        payload = Buffer(capacity=BUF_SIZE)
+        payload = Buffer(capacity=BUF_SIZE, vi64=profile_for(draft).vi64)
 
         if is_draft16_or_later(draft):
-            payload.push_uint_var(self.request_id)
+            payload.push_vint(self.request_id)
         else:
-            payload.push_uint_var(len(self.namespace))
+            payload.push_vint(len(self.namespace))
             for part in self.namespace:
-                payload.push_uint_var(len(part))
+                payload.push_vint(len(part))
                 payload.push_bytes(part)
 
-        payload.push_uint_var(self.error_code)
+        payload.push_vint(self.error_code)
 
         reason_bytes = (self.reason or "").encode()
-        payload.push_uint_var(len(reason_bytes))
+        payload.push_vint(len(reason_bytes))
         payload.push_bytes(reason_bytes)
 
         buf.push_uint_var(self.type)
@@ -194,12 +194,12 @@ class PublishNamespaceCancel(MOQTMessage):
         namespace = None
         request_id = None
         if is_draft16_or_later(draft):
-            request_id = buf.pull_uint_var()
+            request_id = buf.pull_vint()
         else:
-            tuple_len = buf.pull_uint_var()
-            namespace = tuple(buf.pull_bytes(buf.pull_uint_var()) for _ in range(tuple_len))
-        error_code = buf.pull_uint_var()
-        reason_len = buf.pull_uint_var()
+            tuple_len = buf.pull_vint()
+            namespace = tuple(buf.pull_bytes(buf.pull_vint()) for _ in range(tuple_len))
+        error_code = buf.pull_vint()
+        reason_len = buf.pull_vint()
         reason = buf.pull_bytes(reason_len).decode()
         return cls(namespace=namespace, error_code=error_code, reason=reason, request_id=request_id)
 
@@ -217,17 +217,17 @@ class SubscribeNamespace(MOQTMessage):
 
     def serialize(self, *, draft: int) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
-        payload = Buffer(capacity=BUF_SIZE)
+        payload = Buffer(capacity=BUF_SIZE, vi64=profile_for(draft).vi64)
 
-        payload.push_uint_var(self.request_id)
+        payload.push_vint(self.request_id)
 
-        payload.push_uint_var(len(self.namespace_prefix))
+        payload.push_vint(len(self.namespace_prefix))
         for part in self.namespace_prefix:
-            payload.push_uint_var(len(part))
+            payload.push_vint(len(part))
             payload.push_bytes(part)
 
         if is_draft16_or_later(draft):
-            payload.push_uint_var(self.subscribe_options)
+            payload.push_vint(self.subscribe_options)
 
         MOQTMessage._serialize_params(payload, self.parameters, draft=draft)
 
@@ -238,12 +238,12 @@ class SubscribeNamespace(MOQTMessage):
 
     @classmethod
     def deserialize(cls, buf: Buffer, *, draft: int, buf_end: Optional[int] = None) -> 'SubscribeNamespace':
-        request_id = buf.pull_uint_var()
-        tuple_len = buf.pull_uint_var()
-        namespace_prefix = tuple(buf.pull_bytes(buf.pull_uint_var()) for _ in range(tuple_len))
+        request_id = buf.pull_vint()
+        tuple_len = buf.pull_vint()
+        namespace_prefix = tuple(buf.pull_bytes(buf.pull_vint()) for _ in range(tuple_len))
         subscribe_options = 0
         if is_draft16_or_later(draft):
-            subscribe_options = buf.pull_uint_var()
+            subscribe_options = buf.pull_vint()
         params = MOQTMessage._deserialize_params(buf, draft=draft, buf_end=buf_end)
         return cls(request_id=request_id, namespace_prefix=namespace_prefix,
                    subscribe_options=subscribe_options, parameters=params)
@@ -259,9 +259,9 @@ class SubscribeNamespaceOk(MOQTMessage):
 
     def serialize(self, *, draft: int) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
-        payload = Buffer(capacity=BUF_SIZE)
+        payload = Buffer(capacity=BUF_SIZE, vi64=profile_for(draft).vi64)
 
-        payload.push_uint_var(self.request_id)
+        payload.push_vint(self.request_id)
 
         buf.push_uint_var(self.type)
         buf.push_uint16(payload.tell())
@@ -270,7 +270,7 @@ class SubscribeNamespaceOk(MOQTMessage):
 
     @classmethod
     def deserialize(cls, buf: Buffer, *, draft: int, buf_end: Optional[int] = None) -> 'SubscribeNamespaceOk':
-        request_id = buf.pull_uint_var()
+        request_id = buf.pull_vint()
         return cls(request_id=request_id)
 
 
@@ -286,13 +286,13 @@ class SubscribeNamespaceError(MOQTMessage):
 
     def serialize(self, *, draft: int) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
-        payload = Buffer(capacity=BUF_SIZE)
+        payload = Buffer(capacity=BUF_SIZE, vi64=profile_for(draft).vi64)
 
-        payload.push_uint_var(self.request_id)
-        payload.push_uint_var(self.error_code)
+        payload.push_vint(self.request_id)
+        payload.push_vint(self.error_code)
         
         reason_bytes = self.reason.encode()
-        payload.push_uint_var(len(reason_bytes))
+        payload.push_vint(len(reason_bytes))
         payload.push_bytes(reason_bytes)
 
         buf.push_uint_var(self.type)
@@ -302,9 +302,9 @@ class SubscribeNamespaceError(MOQTMessage):
 
     @classmethod
     def deserialize(cls, buf: Buffer, *, draft: int, buf_end: Optional[int] = None) -> 'SubscribeNamespaceError':
-        request_id = buf.pull_uint_var()
-        error_code = buf.pull_uint_var()
-        reason_len = buf.pull_uint_var()
+        request_id = buf.pull_vint()
+        error_code = buf.pull_vint()
+        reason_len = buf.pull_vint()
         reason = buf.pull_bytes(reason_len).decode()
         return cls(request_id=request_id, error_code=error_code, reason=reason)
 
@@ -319,11 +319,11 @@ class UnsubscribeNamespace(MOQTMessage):
 
     def serialize(self, *, draft: int) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
-        payload = Buffer(capacity=BUF_SIZE)
+        payload = Buffer(capacity=BUF_SIZE, vi64=profile_for(draft).vi64)
 
-        payload.push_uint_var(len(self.namespace_prefix))
+        payload.push_vint(len(self.namespace_prefix))
         for part in self.namespace_prefix:
-            payload.push_uint_var(len(part))
+            payload.push_vint(len(part))
             payload.push_bytes(part)
 
         buf.push_uint_var(self.type)
@@ -333,6 +333,6 @@ class UnsubscribeNamespace(MOQTMessage):
 
     @classmethod
     def deserialize(cls, buf: Buffer, *, draft: int, buf_end: Optional[int] = None) -> 'UnsubscribeNamespace':
-        tuple_len = buf.pull_uint_var()
-        namespace_prefix = tuple(buf.pull_bytes(buf.pull_uint_var()) for _ in range(tuple_len))
+        tuple_len = buf.pull_vint()
+        namespace_prefix = tuple(buf.pull_bytes(buf.pull_vint()) for _ in range(tuple_len))
         return cls(namespace_prefix=namespace_prefix)

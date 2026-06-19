@@ -458,7 +458,12 @@ class _MOQTSessionMixin:
             start_pos = buf.tell()
             # d18 control framing uses vi64 for the Message Type (0x2F00
             # -> AF 00); pre-d18 uses the RFC9000 varint. Length stays
-            # 16-bit in all drafts (§10.1).
+            # 16-bit in all drafts (§10.1). This is the single chokepoint
+            # for ALL control messages (the bidi, d18 uni, and per-request
+            # paths all route here), so tagging buf.vi64 once here makes
+            # every downstream message deserialize read its body integers
+            # in the negotiated flavor via buf.pull_vint — control message
+            # bodies do not each re-tag.
             prof = profile_for(self._draft)
             buf.vi64 = prof.vi64
             msg_type = buf.pull_vint()
