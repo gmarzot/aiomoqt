@@ -83,24 +83,23 @@ def test_d18_registry_setup_entry():
     assert MOQTMessageType.SERVER_SETUP in reg16
 
 
-def test_d18_gated_off_by_default(monkeypatch):
+def test_d18_selectable_without_env_var(monkeypatch):
+    # d18 is no longer gated behind AIOMOQT_ENABLE_D18 — explicit selection
+    # works with no env var set.
     monkeypatch.delenv("AIOMOQT_ENABLE_D18", raising=False)
-    with pytest.raises(ValueError, match="AIOMOQT_ENABLE_D18"):
-        MOQTClient("localhost", 4433, supported_drafts=[18])
-    with pytest.raises(ValueError, match="AIOMOQT_ENABLE_D18"):
-        MOQTClient("localhost", 4433, draft_version=18)
-
-
-def test_d18_gate_allows_when_enabled(monkeypatch):
-    monkeypatch.setenv("AIOMOQT_ENABLE_D18", "1")
     c = MOQTClient("localhost", 4433, supported_drafts=[18, 16])
     assert c.supported_drafts == (18, 16)
+    c2 = MOQTClient("localhost", 4433, draft_version=18)
+    assert c2.supported_drafts == (18,)
 
 
-def test_default_client_unaffected_by_gate(monkeypatch):
+def test_default_client_offers_d18_on_equal_footing(monkeypatch):
+    # d18 ships on equal footing with d16/d14: the default offer is
+    # (18, 16, 14), newest-first, so a peer that speaks d18 negotiates it
+    # and others fall back gracefully.
     monkeypatch.delenv("AIOMOQT_ENABLE_D18", raising=False)
-    c = MOQTClient("localhost", 4433)  # default (16, 14), no d18
-    assert 18 not in c.supported_drafts
+    c = MOQTClient("localhost", 4433)
+    assert c.supported_drafts == (18, 16, 14)
 
 
 def test_d18_setup_options_kvp_roundtrip():

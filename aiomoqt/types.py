@@ -1,4 +1,3 @@
-import os
 from enum import IntEnum
 
 MOQT_VERSION_DRAFT14 = 0xff00000e
@@ -79,21 +78,6 @@ def moqt_version_from_draft(draft: int) -> int:
         )
     return 0xff000000 | (draft & 0xff)
 
-
-def require_d18_enabled(drafts) -> None:
-    """Gate experimental draft-18 behind AIOMOQT_ENABLE_D18.
-
-    The d18 wire is built incrementally (type renumbering, uni control
-    pair, vi64 data plane); until it is complete and interop-proven, a
-    session must opt in explicitly so d18 is never selected by accident.
-    No-op unless 18 is among the requested drafts.
-    """
-    if 18 in {int(d) for d in drafts} and not os.environ.get(
-            "AIOMOQT_ENABLE_D18"):
-        raise ValueError(
-            "draft-18 support is experimental and incomplete; set "
-            "AIOMOQT_ENABLE_D18=1 to enable it."
-        )
 
 MOQT_DEFAULT_PRIORITY = 128
 

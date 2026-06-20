@@ -12,8 +12,8 @@ end to end in-process:
   * the control plane (uni-pair SETUP, bidi SUBSCRIBE/SUBSCRIBE_OK) runs
     underneath.
 
-d18 is gated behind AIOMOQT_ENABLE_D18; WebTransport d18 control is deferred,
-so this is raw-QUIC only.
+Parametrized over both transports: d18 control now runs over raw QUIC and
+WebTransport (the uni-pair bring-up is transport-aware).
 """
 import asyncio
 import os
@@ -68,8 +68,7 @@ def _make_subscribe_handler(n_objects):
 
 
 @pytest.mark.asyncio
-async def test_d18_subscribe_object_roundtrip(monkeypatch, use_quic):
-    monkeypatch.setenv("AIOMOQT_ENABLE_D18", "1")
+async def test_d18_subscribe_object_roundtrip(use_quic):
     port = _BASE_PORT + 1 + (0 if use_quic else 100)
 
     server = MOQTServer(

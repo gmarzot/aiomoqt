@@ -10,8 +10,8 @@ type). This proves the raw-QUIC uni-pair handshake end to end:
   * the client completes setup on receipt of the server's SETUP.
 
 A returning client_session_init() therefore proves the full exchange.
-d18 is gated behind AIOMOQT_ENABLE_D18. WebTransport d18 control is
-deferred (different surfacing path), so this is raw-QUIC only.
+This self-test covers raw QUIC; the WebTransport d18 control path is
+covered by test_loopback_d18_objects.
 """
 import asyncio
 import os
@@ -50,10 +50,9 @@ async def _start_server(port, on_subscribe=None):
 
 
 @pytest.mark.asyncio
-async def test_d18_setup_handshake_quic(monkeypatch):
+async def test_d18_setup_handshake_quic():
     """Client + server complete the d18 raw-QUIC handshake over the
     control uni-stream pair."""
-    monkeypatch.setenv("AIOMOQT_ENABLE_D18", "1")
     port = _BASE_PORT + 1
     server = await _start_server(port)
     try:
@@ -75,11 +74,10 @@ async def test_d18_setup_handshake_quic(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_d18_subscribe_roundtrip_quic(monkeypatch):
+async def test_d18_subscribe_roundtrip_quic():
     """d18 SUBSCRIBE opens a bidi request stream; SUBSCRIBE_OK and
     PUBLISH_DONE come back on that same stream with NO in-band Request ID
     and are correlated positionally."""
-    monkeypatch.setenv("AIOMOQT_ENABLE_D18", "1")
     port = _BASE_PORT + 2
 
     async def _on_subscribe(session, msg):

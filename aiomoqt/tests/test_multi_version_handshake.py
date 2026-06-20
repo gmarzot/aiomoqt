@@ -106,10 +106,11 @@ async def test_non_intersecting_alpn_fails():
 @pytest.mark.asyncio
 async def test_wt_default_server_and_client_settle_highest():
     """Unpinned WT server + unpinned WT client both default their draft
-    to the highest supported (16). The default WT client offers only
-    moqt-{newest}; the server, lacking in-band WT selection, defaults to
-    max(supported_drafts) — they agree on d16 and the handshake
-    completes. Locks the WT-server-default-draft fix.
+    to the highest supported (18, now on equal footing with d16/d14). The
+    default WT client offers only moqt-{newest}; the server, lacking in-band
+    WT selection, defaults to max(supported_drafts) — they agree on d18 and
+    the handshake completes (d18 control over WebTransport). Locks the
+    WT-server-default-draft fix + d18 default offering.
     """
     port = _BASE_PORT + 60
     server = MOQTServer(
@@ -126,7 +127,7 @@ async def test_wt_default_server_and_client_settle_highest():
         async with client.connect() as session:
             await session.client_session_init()
             assert session._moqt_session_setup.result() is True
-            assert session._draft == 16
+            assert session._draft == 18
     finally:
         handle.close()
 
@@ -137,9 +138,9 @@ async def test_wt_negotiates_protocol_from_wt_protocol():
     supported WT subprotocols; the server selects one and echoes
     WT-Protocol; both ends derive their draft from the negotiated value.
 
-    With the current draft set only moqt-16 is WT-eligible (drafts >= 15),
-    so both settle on 16 — but negotiated_protocol == "moqt-16" proves the
-    draft came from the in-band selection, not the max-supported fallback.
+    Both ends pin supported_drafts=[16] so the in-band selection is
+    deterministic: negotiated_protocol == "moqt-16" proves the draft came
+    from the in-band WT-Protocol selection, not the max-supported fallback.
     The 'highest-of-several' selection mechanics are covered at the
     aiopquic layer (tests/test_negotiation.py) with moqt-18/16/14.
     """
