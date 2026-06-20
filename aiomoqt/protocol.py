@@ -155,7 +155,7 @@ class _MOQTSessionMixin:
         """Stream we write control messages on. d18 runs control over a
         pair of uni streams (we write one, read the peer's); pre-d18 it
         is the single bidi control stream."""
-        if profile_for(self._draft).control_uni_pair:
+        if self._profile.control_uni_pair:
             return self._d18_control_write_sid
         return self._control_stream_id
 
@@ -163,9 +163,24 @@ class _MOQTSessionMixin:
     def _control_read_stream_id(self) -> Optional[int]:
         """Stream we read the peer's control messages from. See
         _control_write_stream_id."""
-        if profile_for(self._draft).control_uni_pair:
+        if self._profile.control_uni_pair:
             return self._d18_control_read_sid
         return self._control_stream_id
+
+    @property
+    def _draft(self) -> int:
+        """Negotiated/pinned MoQT draft number for this session."""
+        return getattr(self, '_draft_v', None)
+
+    @_draft.setter
+    def _draft(self, value: int) -> None:
+        # _profile is the resolved effective DraftProfile for the session,
+        # derived from the draft here so it can never drift out of sync. The
+        # draft is set once it is known: pinned at __init__, or locked when
+        # negotiation completes (ALPN / WT-Protocol). Every per-message
+        # profile lookup then reads self._profile instead of re-resolving.
+        self._draft_v = value
+        self._profile = profile_for(value) if value is not None else None
 
     def __init__(self, *args, session: 'MOQTPeer', **kwargs):
         super().__init__(*args, **kwargs)
@@ -191,8 +206,8 @@ class _MOQTSessionMixin:
         # default. Auto (unpinned) clients still resolve from the
         # negotiated ALPN / WT-Protocol.
         _pinned = getattr(session, 'draft_version', None)
-        self._draft: int = (get_major_version(_pinned) if _pinned is not None
-                            else get_major_version(MOQT_CUR_VERSION))
+        self._draft = (get_major_version(_pinned) if _pinned is not None
+                       else get_major_version(MOQT_CUR_VERSION))
         self._moqt_session_setup: Future[bool] = self._loop.create_future()
         self._moqt_session_closed: Future[Tuple[int,str]] = self._loop.create_future()
         self._next_request_id = 0 if self._is_client else 1
@@ -464,7 +479,7 @@ class _MOQTSessionMixin:
             # every downstream message deserialize read its body integers
             # in the negotiated flavor via buf.pull_vint — control message
             # bodies do not each re-tag.
-            prof = profile_for(self._draft)
+            prof = self._profile
             buf.vi64 = prof.vi64
             msg_type = buf.pull_vint()
             msg_len = buf.pull_uint16()
@@ -511,7 +526,7 @@ class _MOQTSessionMixin:
             # d18 replies omit the Request ID (demuxed by request stream);
             # inject the stream-bound id so handlers key on it unchanged.
             if (request_id is not None and
-                    not profile_for(self._draft).reply_has_request_id and
+                    not self._profile.reply_has_request_id and
                     hasattr(msg, 'request_id')):
                 msg.request_id = request_id
             msg_len += hdr_len
@@ -891,7 +906,7 @@ class _MOQTSessionMixin:
             if stream_state is None or stream_state.parser is None:
                 # Get stream type from first varint. d18 uses vi64 for the
                 # stream type (and all data-plane ints); pre-d18 RFC9000.
-                buf.vi64 = profile_for(self._draft).vi64
+                buf.vi64 = self._profile.vi64
                 stream_type = buf.pull_vint()
                 # SubgroupHeader form 0b0XX1XXXX (bit 4 set): d14 0x10-0x1D,
                 # d16 += 0x30-0x3D (bit 5 DEFAULT_PRIORITY), d18 += 0x50-0x5D
@@ -1004,7 +1019,7 @@ class _MOQTSessionMixin:
         logger.debug(f"MOQT handle datagram: 0x{buf.data_slice(0,min(buf.capacity,12))}")
         # Get datagram type from first varint (vi64 for d18).
         pos = buf.tell()
-        prof = profile_for(self._draft)
+        prof = self._profile
         buf.vi64 = prof.vi64
         dgram_type = buf.pull_vint()
         if prof.varint == "vi64":
@@ -1209,7 +1224,7 @@ class _MOQTSessionMixin:
             # stream is data (object subgroups / fetch) -> StreamChain hot
             # path (memoryview-native; no Buffer construction).
             if stream_is_unidirectional(stream_id):
-                if profile_for(self._draft).control_uni_pair:
+                if self._profile.control_uni_pair:
                     if (self._d18_control_read_sid is None and
                             self._d18_peek_is_setup(data)):
                         self._d18_control_read_sid = stream_id
@@ -1233,7 +1248,7 @@ class _MOQTSessionMixin:
             # d18: control is a uni pair, so every bidi stream is a request
             # stream (SUBSCRIBE/FETCH/...). Pre-d18 the first bidi stream is
             # latched as the single control stream.
-            if profile_for(self._draft).control_uni_pair:
+            if self._profile.control_uni_pair:
                 self._handle_bidi_stream(stream_id, msg_buf, msg_len)
                 return
 
@@ -1356,7 +1371,7 @@ class _MOQTSessionMixin:
         if use_quic:
             # Raw QUIC flow. _wt_session_setup is pre-resolved in __init__.
             logger.info(f"MOQT: Using raw QUIC transport")
-            if profile_for(self._draft).control_uni_pair:
+            if self._profile.control_uni_pair:
                 # d18: control is a uni-stream pair. Open our write-control
                 # uni now; the peer's read-control uni is bound on the first
                 # SETUP it sends (see quic_event_received).
@@ -1396,7 +1411,7 @@ class _MOQTSessionMixin:
                     logger.info(
                         f"MOQT: version set from WT-Protocol: "
                         f"{negotiated} -> draft-{self._draft}")
-            if profile_for(self._draft).control_uni_pair:
+            if self._profile.control_uni_pair:
                 # d18 over WT: control is a uni-stream pair, same as raw
                 # QUIC — open our write-control uni (WT create_stream); the
                 # peer's read-control uni is bound on the first SETUP it
@@ -1417,7 +1432,7 @@ class _MOQTSessionMixin:
         # Option (removed), count-less Setup Options. Pre-d18 sends
         # CLIENT_SETUP with the version list.
         params[SetupParamType.IMPLEMENTATION] = USER_AGENT.encode()
-        if profile_for(self._draft).control_uni_pair:
+        if self._profile.control_uni_pair:
             self.send_control_message(Setup(options=params))
         else:
             params[SetupParamType.MAX_REQUEST_ID] = 10000
@@ -1617,7 +1632,7 @@ class _MOQTSessionMixin:
         request's own bidi stream (demuxed by stream, no in-band Request
         ID); pre-d18 they go on the single control stream."""
         sid = self._bidi_streams.get(request_id)
-        if profile_for(self._draft).control_uni_pair and sid is not None:
+        if self._profile.control_uni_pair and sid is not None:
             self.send_stream_message(sid, msg)
         else:
             self.send_control_message(msg)
@@ -1628,7 +1643,7 @@ class _MOQTSessionMixin:
         bidi stream and the response returns on it (no in-band Request ID);
         pre-d18 requests go on the single control stream. Raw-QUIC stream-id
         allocation is synchronous, so callers stay sync."""
-        if profile_for(self._draft).control_uni_pair:
+        if self._profile.control_uni_pair:
             if getattr(self._session, 'use_quic', False):
                 # Raw QUIC: stream-id allocation is synchronous (lazy
                 # materialization on first send), so stay sync.
