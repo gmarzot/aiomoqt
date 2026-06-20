@@ -1396,10 +1396,21 @@ class _MOQTSessionMixin:
                     logger.info(
                         f"MOQT: version set from WT-Protocol: "
                         f"{negotiated} -> draft-{self._draft}")
-            self._control_stream_id = await self.open_bidi_stream()
-            logger.info(
-                f"MOQT: WT control stream created stream id: "
-                f"{self._control_stream_id}")
+            if profile_for(self._draft).control_uni_pair:
+                # d18 over WT: control is a uni-stream pair, same as raw
+                # QUIC — open our write-control uni (WT create_stream); the
+                # peer's read-control uni is bound on the first SETUP it
+                # sends (the demux in quic_event_received is transport-
+                # agnostic). The data plane already proves WT uni streams.
+                self._d18_control_write_sid = await self.open_uni_stream()
+                logger.info(
+                    f"MOQT: d18 WT control write-uni: "
+                    f"{self._d18_control_write_sid}")
+            else:
+                self._control_stream_id = await self.open_bidi_stream()
+                logger.info(
+                    f"MOQT: WT control stream created stream id: "
+                    f"{self._control_stream_id}")
 
         # Send SETUP. d18 SETUP is symmetric (Setup, type 0x2F00): no
         # version array (negotiated via ALPN), no MAX_REQUEST_ID Setup
@@ -1618,13 +1629,35 @@ class _MOQTSessionMixin:
         pre-d18 requests go on the single control stream. Raw-QUIC stream-id
         allocation is synchronous, so callers stay sync."""
         if profile_for(self._draft).control_uni_pair:
-            stream_id = self._quic.get_next_available_stream_id(
-                is_unidirectional=False)
-            self._bidi_streams[request_id] = stream_id
-            self._bidi_stream_requests[stream_id] = request_id
-            self.send_stream_message(stream_id, msg)
+            if getattr(self._session, 'use_quic', False):
+                # Raw QUIC: stream-id allocation is synchronous (lazy
+                # materialization on first send), so stay sync.
+                stream_id = self._quic.get_next_available_stream_id(
+                    is_unidirectional=False)
+                self._bidi_streams[request_id] = stream_id
+                self._bidi_stream_requests[stream_id] = request_id
+                self.send_stream_message(stream_id, msg)
+            else:
+                # WebTransport: bidi-stream open is async (create_stream
+                # round-trips to picoquic), so defer the open+send to a
+                # task. The reply correlates by request_id once the stream
+                # is bound, and it cannot arrive before we send on it.
+                task = asyncio.create_task(
+                    self._d18_open_request_stream(request_id, msg))
+                self._tasks.add(task)
+                task.add_done_callback(self._control_task_done)
         else:
             self.send_control_message(msg)
+
+    async def _d18_open_request_stream(self, request_id: int,
+                                       msg: MOQTMessage) -> None:
+        """Open a d18 request bidi stream over WebTransport (async
+        create_stream) and send the opener on it. Raw QUIC uses the
+        synchronous path in _send_request instead."""
+        stream_id = await self.open_bidi_stream()
+        self._bidi_streams[request_id] = stream_id
+        self._bidi_stream_requests[stream_id] = request_id
+        self.send_stream_message(stream_id, msg)
 
     # Messages that open a request stream (must be the first message on a
     # new bidi stream). d16 only uses SUBSCRIBE_NAMESPACE here; d18 routes
@@ -2578,9 +2611,9 @@ class _MOQTSessionMixin:
         # SETUP (idempotent). The client brings its write-uni up eagerly in
         # client_session_init.
         if not self._is_client and self._d18_control_write_sid is None:
-            self._d18_control_write_sid = (
-                self._quic.get_next_available_stream_id(
-                    is_unidirectional=True))
+            # Transport-aware: raw QUIC allocates a uni id synchronously,
+            # WT round-trips via create_stream. open_uni_stream handles both.
+            self._d18_control_write_sid = await self.open_uni_stream()
             logger.info(
                 f"MOQT: d18 server control write-uni: "
                 f"{self._d18_control_write_sid}")

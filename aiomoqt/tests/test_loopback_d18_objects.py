@@ -41,6 +41,11 @@ _GROUP = 100          # >= 64 → forces real vi64 in the SUBGROUP_HEADER
 _OBJ_SIZE = 64
 
 
+@pytest.fixture(params=[True, False], ids=["use_quic", "wt"])
+def use_quic(request):
+    return request.param
+
+
 def _make_subscribe_handler(n_objects):
     async def _handle_subscribe(session, msg: Subscribe):
         ok = session.subscribe_ok(request_msg=msg, content_exists=0)
@@ -63,13 +68,13 @@ def _make_subscribe_handler(n_objects):
 
 
 @pytest.mark.asyncio
-async def test_d18_subscribe_object_roundtrip_quic(monkeypatch):
+async def test_d18_subscribe_object_roundtrip(monkeypatch, use_quic):
     monkeypatch.setenv("AIOMOQT_ENABLE_D18", "1")
-    port = _BASE_PORT + 1
+    port = _BASE_PORT + 1 + (0 if use_quic else 100)
 
     server = MOQTServer(
         host="localhost", port=port, certificate=CERT, private_key=KEY,
-        path="/", use_quic=True, draft_version=18,
+        path="/", use_quic=use_quic, draft_version=18,
     )
     server.register_handler(
         MOQTMessageType.SUBSCRIBE, _make_subscribe_handler(_N_OBJECTS))
@@ -83,7 +88,7 @@ async def test_d18_subscribe_object_roundtrip_quic(monkeypatch):
 
     try:
         client = MOQTClient(
-            "localhost", port, path="/", use_quic=True,
+            "localhost", port, path="/", use_quic=use_quic,
             verify_tls=False, draft_version=18,
         )
         async with client.connect() as session:
