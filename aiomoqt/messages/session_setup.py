@@ -99,6 +99,9 @@ class ClientSetup(MOQTMessage):
 class GoAway(MOQTMessage):
     new_session_uri: str = None
 
+    # New Session URI maximum length: 8 KiB.
+    MAX_URI_LENGTH = 8192
+
     def __post_init__(self):
         self.type = MOQTMessageType.GOAWAY
 
@@ -107,15 +110,13 @@ class GoAway(MOQTMessage):
         payload = Buffer(capacity=BUF_SIZE)
 
         uri_bytes = self.new_session_uri.encode()
-        
-        # Enforce maximum URI length of 8,192 bytes
-        if len(uri_bytes) > 8192:
-            raise ValueError("New Session URI exceeds maximum length of 8,192 bytes")
-        
+        if len(uri_bytes) > self.MAX_URI_LENGTH:
+            raise ValueError(
+                "New Session URI exceeds maximum length (8 KiB)")
+
         payload.push_uint_var(len(uri_bytes))  # uri length
         payload.push_bytes(uri_bytes)
-        
-        # Write message
+
         buf.push_uint_var(self.type)
         buf.push_uint16(payload.tell())
         buf.push_bytes(payload.data)
@@ -127,11 +128,10 @@ class GoAway(MOQTMessage):
                     buf_end: Optional[int] = None) -> 'GoAway':
         """Handle GOAWAY message."""
         uri_len = buf.pull_uint_var()
-        
-        # Enforce maximum URI length of 8,192 bytes
-        if uri_len > 8192:
-            raise BufferReadError("New Session URI exceeds maximum length of 8,192 bytes")
-        
+        if uri_len > cls.MAX_URI_LENGTH:
+            raise BufferReadError(
+                "New Session URI exceeds maximum length (8 KiB)")
+
         uri = buf.pull_bytes(uri_len).decode()
 
         return cls(new_session_uri=uri)
