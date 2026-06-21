@@ -1553,8 +1553,10 @@ class _MOQTSessionMixin:
         self,
         namespace: Union[Tuple[bytes, ...], List[Union[bytes, str]], str],
         track_name: Union[bytes, str],
-        subscriber_priority: int = 128,
-        group_order: GroupOrder = GroupOrder.DESCENDING,
+        # None = unspecified: omitted from the d16 wire (conservative
+        # sender — see subscribe()). Pass a value to force it on the wire.
+        subscriber_priority: Optional[int] = None,
+        group_order: Optional[GroupOrder] = None,
         fetch_type: FetchType = FetchType.RELATIVE_JOINING,
         joining_start: int = 0,
         parameters: Optional[Dict[int, bytes]] = None,
@@ -1599,7 +1601,7 @@ class _MOQTSessionMixin:
             track_name=track_name,
             priority=subscriber_priority,
             group_order=group_order,
-            forward=1,
+            forward=None,  # omit (default true) unless caller set it
             filter_type=FilterType.LATEST_OBJECT,  # spec §9.16.2
             parameters=parameters,
         )
@@ -1640,8 +1642,11 @@ class _MOQTSessionMixin:
         self,
         namespace: Union[Tuple[bytes, ...], List[Union[bytes, str]], str],
         track_name: Union[bytes, str],
-        subscriber_priority: int = 128,
-        group_order: GroupOrder = GroupOrder.ASCENDING,
+        # None = unspecified: omit from the d16 wire, relay applies its
+        # default (conservative sender — see subscribe()). Pass a value to
+        # force it on the wire.
+        subscriber_priority: Optional[int] = None,
+        group_order: Optional[GroupOrder] = None,
         start_group: int = 0,
         start_object: int = 0,
         end_group: int = 0,
