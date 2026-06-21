@@ -150,9 +150,13 @@ def moqt_message_serialization_versioned(cls, params, type_id=None,
     buf.seek(0)
 
     if type_id is not None:
-        id = buf.pull_uint_var()
+        # Message Type uses the negotiated varint flavor (vi64 for d18,
+        # RFC9000 otherwise); the Length stays uint16 in all drafts
+        # (§10.1). pull_vint == pull_uint_var when vi64 is False, so this
+        # is unchanged for d14/d16.
+        buf.vi64 = profile_for(draft).vi64
+        id = buf.pull_vint()
         assert id == type_id
-        # All control messages have uint16 length after type
         msg_len = buf.pull_uint16()
         buf_end = buf.tell() + msg_len
         new_obj = _deserialize(cls, buf, draft=draft, buf_end=buf_end)
