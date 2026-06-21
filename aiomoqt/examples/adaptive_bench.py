@@ -1341,7 +1341,7 @@ async def run_subscriber_client(host: str, port: int, path: str,
         path=path,
         use_quic=use_quic,
         verify_tls=verify_tls,
-        draft_version=args.draft,
+        supported_drafts=args.draft,
         congestion_control_algorithm=args.cc_algo,
     )
     try:
@@ -1394,7 +1394,7 @@ async def run_publisher_client(host: str, port: int, path: str,
         path=path,
         use_quic=use_quic,
         verify_tls=verify_tls,
-        draft_version=args.draft,
+        supported_drafts=args.draft,
         congestion_control_algorithm=args.cc_algo,
         tx_max_queued_bytes=args.max_queued_bytes,
         **({'tx_max_inflight_bytes':

@@ -267,7 +267,7 @@ class TestSubscribedTrack:
             session.send_control_message = MagicMock()
             session.on_object_received = None
 
-            session._draft = 14  # exercise real PublishOk.serialize at d14
+            session.negotiated_draft = 14  # exercise real PublishOk.serialize at d14
             t = SubscribedTrack(session, "bench")
             assert t.trackname is None
             await t.subscribe()
@@ -294,7 +294,7 @@ class TestSubscribedTrack:
             session.send_control_message = MagicMock()
             session.on_object_received = None
 
-            session._draft = 16  # exercise real PublishOk.serialize at d16
+            session.negotiated_draft = 16  # exercise real PublishOk.serialize at d16
             t = SubscribedTrack(session, "bench")
             assert t.trackname is None
             await t.subscribe()

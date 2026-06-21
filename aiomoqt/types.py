@@ -86,14 +86,51 @@ def parse_draft_spec(s: str):
         '18,16,14'  -> [18, 16, 14]  (offer the set, in preference order)
 
     The result is passed straight to ``MOQTClient`` / ``MOQTServer``'s
-    ``draft_version`` (which accepts an int or an ordered list). Order is
-    preserved so a caller can put a relay's preferred draft first (some
+    ``supported_drafts`` (which accepts an int or an ordered list). Order
+    is preserved so a caller can put a relay's preferred draft first (some
     relays select the first offered ALPN rather than the highest mutual).
     """
     parts = [int(p) for p in str(s).split(",") if p.strip()]
     if not parts:
         raise ValueError(f"empty --draft value: {s!r}")
     return parts[0] if len(parts) == 1 else parts
+
+
+
+def normalize_supported_drafts(supported_drafts) -> list:
+    """Normalize the public `supported_drafts` argument to a non-empty
+    list of plain draft NUMBERS.
+
+    Accepts the forms the public API allows:
+      - None        → offer every supported draft, newest first (the
+                       "auto" offer)
+      - int         → a single draft number, e.g. 16 → [16]
+      - list[int]   → several draft numbers, e.g. [16, 14]; the caller's
+                      order is preserved (deduped), so a caller can put a
+                      relay's preferred draft first — some relays select
+                      the first offered ALPN rather than the highest mutual.
+
+    Drafts stay as representation-independent ints throughout the
+    codebase; the wire forms (the moq-00 / moqt-16 ALPN and the
+    0xff0000NN IETF version code) are only translated when building or
+    parsing wire SETUP / ALPN. Each entry is validated via
+    moqt_version_from_draft (so the full hex form or an unknown draft
+    raises ValueError at the API boundary). The resulting order is the
+    order ALPN / CLIENT_SETUP / WT-Available-Protocols offer versions in.
+    """
+    if supported_drafts is None:
+        # auto: every supported draft, newest first
+        return sorted((v & 0xff for v in MOQT_VERSIONS), reverse=True)
+    if isinstance(supported_drafts, int):
+        supported_drafts = [supported_drafts]
+    drafts = []
+    for d in supported_drafts:
+        moqt_version_from_draft(d)  # validate (raises on hex form / unknown)
+        if d not in drafts:
+            drafts.append(d)  # dedupe, preserve caller order
+    if not drafts:
+        raise ValueError("supported_drafts must name at least one draft")
+    return drafts
 
 
 MOQT_DEFAULT_PRIORITY = 128

@@ -51,7 +51,7 @@ def _make_subscribe_handler(n_objects):
         ok = session.subscribe_ok(request_msg=msg, content_exists=0)
         track_alias = ok.track_alias
         stream_id = await session.open_uni_stream()
-        # draft=session._draft selects the vi64 codec for the header/objects.
+        # draft=session.negotiated_draft selects the vi64 codec for the header/objects.
         header = SubgroupHeader(
             track_alias=track_alias, group_id=_GROUP, subgroup_id=0,
             publisher_priority=128, extensions_present=False,
@@ -73,7 +73,7 @@ async def test_d18_subscribe_object_roundtrip(use_quic):
 
     server = MOQTServer(
         host="localhost", port=port, certificate=CERT, private_key=KEY,
-        path="/", use_quic=use_quic, draft_version=18,
+        path="/", use_quic=use_quic, supported_drafts=18,
     )
     server.register_handler(
         MOQTMessageType.SUBSCRIBE, _make_subscribe_handler(_N_OBJECTS))
@@ -88,11 +88,11 @@ async def test_d18_subscribe_object_roundtrip(use_quic):
     try:
         client = MOQTClient(
             "localhost", port, path="/", use_quic=use_quic,
-            verify_tls=False, draft_version=18,
+            verify_tls=False, supported_drafts=18,
         )
         async with client.connect() as session:
             await session.client_session_init()
-            assert session._draft == 18
+            assert session.negotiated_draft == 18
             session.on_object_received = on_obj
             await session.subscribe("test/ns", "clock", wait_response=True)
             for _ in range(100):

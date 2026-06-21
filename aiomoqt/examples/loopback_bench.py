@@ -172,7 +172,7 @@ async def run_server(args):
         certificate=args.cert, private_key=args.key,
         path="/",
         use_quic=args.quic,
-        draft_version=args.draft,
+        supported_drafts=args.draft,
         congestion_control_algorithm=args.cc_algo,
         # None = honor protocol default (16 MB); 0 = opt out.
         **({'tx_max_inflight_bytes':
@@ -194,7 +194,7 @@ async def run_subscriber(args, stats):
         "localhost", args.port,
         path="/",
         use_quic=args.quic,
-        draft_version=args.draft,
+        supported_drafts=args.draft,
         verify_tls=False,
         debug=args.debug,
         congestion_control_algorithm=args.cc_algo,

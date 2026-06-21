@@ -31,11 +31,11 @@ pytestmark = pytest.mark.skipif(
 _BASE_PORT = 14480
 
 
-async def _start_server(port, draft_version):
+async def _start_server(port, supported_drafts):
     server = MOQTServer(
         host="localhost", port=port,
         certificate=CERT, private_key=KEY, path="/",
-        use_quic=True, draft_version=draft_version,
+        use_quic=True, supported_drafts=supported_drafts,
     )
     return await server.serve()
 
@@ -52,14 +52,13 @@ async def test_multi_offer_settles_server_draft(server_draft):
     try:
         client = MOQTClient(
             "localhost", port, path="/", use_quic=True,
-            verify_tls=False, draft_version=[16, 14],
+            verify_tls=False, supported_drafts=[16, 14],
         )
-        assert client.draft_version is None        # multi-offer
-        assert client.supported_drafts == (16, 14)
+        assert client.supported_drafts == [16, 14]
         async with client.connect() as session:
             await session.client_session_init()
             assert session._moqt_session_setup.result() is True
-            assert session._draft == server_draft
+            assert session.negotiated_draft == server_draft
     finally:
         server.close()
 
@@ -72,13 +71,13 @@ async def test_pinned_client_against_matching_server():
     try:
         client = MOQTClient(
             "localhost", port, path="/", use_quic=True,
-            verify_tls=False, draft_version=16,
+            verify_tls=False, supported_drafts=16,
         )
-        assert client.supported_drafts == (16,)
+        assert client.supported_drafts == [16]
         async with client.connect() as session:
             await session.client_session_init()
             assert session._moqt_session_setup.result() is True
-            assert session._draft == 16
+            assert session.negotiated_draft == 16
     finally:
         server.close()
 
@@ -93,7 +92,7 @@ async def test_non_intersecting_alpn_fails():
     try:
         client = MOQTClient(
             "localhost", port, path="/", use_quic=True,
-            verify_tls=False, draft_version=16,
+            verify_tls=False, supported_drafts=16,
         )
         with pytest.raises(Exception):
             async with asyncio.timeout(8):
@@ -110,7 +109,7 @@ async def test_wt_default_server_and_client_settle_d16():
     d16, NOT d18. The default WT client offers moqt-16; the server, lacking
     in-band WT selection, defaults to max(supported_drafts) = 16. Guards
     that a no-args session never negotiates onto the beta d18 wire (d18
-    requires an explicit draft_version=18 / supported_drafts opt-in).
+    requires an explicit supported_drafts=18 / supported_drafts opt-in).
     """
     port = _BASE_PORT + 60
     server = MOQTServer(
@@ -127,7 +126,7 @@ async def test_wt_default_server_and_client_settle_d16():
         async with client.connect() as session:
             await session.client_session_init()
             assert session._moqt_session_setup.result() is True
-            assert session._draft == 16
+            assert session.negotiated_draft == 16
     finally:
         handle.close()
 
@@ -138,7 +137,7 @@ async def test_wt_negotiates_protocol_from_wt_protocol():
     supported WT subprotocols; the server selects one and echoes
     WT-Protocol; both ends derive their draft from the negotiated value.
 
-    Both ends pin draft_version=[16] so the in-band selection is
+    Both ends pin supported_drafts=[16] so the in-band selection is
     deterministic: negotiated_protocol == "moqt-16" proves the draft came
     from the in-band WT-Protocol selection, not the max-supported fallback.
     The 'highest-of-several' selection mechanics are covered at the
@@ -148,19 +147,19 @@ async def test_wt_negotiates_protocol_from_wt_protocol():
     server = MOQTServer(
         host="localhost", port=port,
         certificate=CERT, private_key=KEY, path="/",
-        use_quic=False, draft_version=[16],
+        use_quic=False, supported_drafts=[16],
     )
     handle = await server.serve()
     try:
         client = MOQTClient(
             "localhost", port, path="/", use_quic=False,
-            verify_tls=False, draft_version=[16],
+            verify_tls=False, supported_drafts=[16],
         )
         async with client.connect() as session:
             await session.client_session_init()
             assert session._moqt_session_setup.result() is True
             assert session.negotiated_protocol == "moqt-16"
-            assert session._draft == 16
+            assert session.negotiated_draft == 16
     finally:
         handle.close()
 

@@ -1,6 +1,6 @@
 import asyncio
 from asyncio.futures import Future
-from typing import Any, List, Optional, Tuple, Coroutine, Union
+from typing import Any, List, Optional, Tuple, Union, Coroutine
 
 from aiopquic.asyncio.server import serve as aiopquic_serve
 from aiopquic.asyncio.webtransport import serve_webtransport
@@ -8,8 +8,7 @@ from aiopquic.quic.configuration import QuicConfiguration
 
 from .protocol import (DEFAULT_TX_MAX_INFLIGHT_BYTES, MOQTPeer,
                         MOQTSessionQuic, MOQTSessionWTServer)
-from .types import (moqt_alpn_for_version, moqt_version_from_draft,
-                    MOQTDraft)
+from .types import moqt_alpn_for_version, normalize_supported_drafts
 from .utils.logger import *
 
 logger = get_logger(__name__)
@@ -25,7 +24,7 @@ class MOQTServer(MOQTPeer):
         private_key: str,
         path: Optional[str] = None,
         use_quic: Optional[bool] = False,
-        draft_version: Optional[Union[int, List[int]]] = None,
+        supported_drafts: Optional[Union[int, List[int]]] = None,
         debug: Optional[bool] = False,
         tx_max_inflight_bytes: Optional[int] = DEFAULT_TX_MAX_INFLIGHT_BYTES,
         tx_max_queued_bytes: Optional[int] = None,
@@ -38,31 +37,13 @@ class MOQTServer(MOQTPeer):
         self.port = port
         self.path = path
         self.use_quic = use_quic
-        # Two-attribute discipline (symmetric with MOQTClient): drafts
-        # as short ints. A single-draft server is the Phase 0 scope;
-        # selecting among multiple client-offered drafts is a fast-follow
-        # that needs the aiopquic server-side ALPN/WT-protocol selector.
-        if draft_version is not None:
-            # draft_version accepts a single draft (pin -> offer only that
-            # ALPN) or an ordered list (offer the set in the given
-            # preference order).
-            if isinstance(draft_version, (list, tuple)):
-                for _d in draft_version:
-                    moqt_version_from_draft(_d)  # validate each
-                self.supported_drafts = tuple(draft_version)
-                self.draft_version = None  # a list is an offer, not a pin
-            else:
-                moqt_version_from_draft(draft_version)  # validate
-                self.supported_drafts = (draft_version,)
-                self.draft_version = draft_version
-        else:
-            # d18 is beta: opt in explicitly via draft_version=18 (pin) or
-            # draft_version=[18, 16, 14] (offer). The no-args default offers the
-            # stable set only, so an auto session never negotiates onto the
-            # beta d18 wire; d14 stays in the offer for d14-only peers.
-            self.supported_drafts = (
-                MOQTDraft.DRAFT_16, MOQTDraft.DRAFT_14)
-            self.draft_version = None
+        # Public API: supported_drafts is the set of IETF draft numbers
+        # (e.g. 16, or [16, 14]) this server accepts; None means "accept
+        # every supported draft". Stored as a non-empty list of draft
+        # numbers, newest first; the wire forms (ALPN / IETF version
+        # code) are only translated when building ALPN or (de)serializing
+        # SETUP. The peer's chosen ALPN selects the negotiated_draft.
+        self.supported_drafts = normalize_supported_drafts(supported_drafts)
         self.certificate = certificate
         self.private_key = private_key
         self.debug = debug
@@ -88,8 +69,11 @@ class MOQTServer(MOQTPeer):
         logger.info(f"Starting MOQT server on {self.host}:{self.port}")
 
         if self.use_quic:
-            alpn = [moqt_alpn_for_version(d)
-                    for d in self.supported_drafts]
+            # Accept one ALPN per supported draft, newest first. A single
+            # supported draft yields a single ALPN (as the explicit-draft
+            # path did); the auto set accepts every supported draft so a
+            # cross-draft client can negotiate its version via QUIC ALPN.
+            alpn = [moqt_alpn_for_version(d) for d in self.supported_drafts]
             cfg = QuicConfiguration(
                 alpn_protocols=alpn, is_client=False,
                 max_data=2**24, max_stream_data=2**24,
@@ -146,7 +130,7 @@ class MOQTServer(MOQTPeer):
         if self.socket_buffer_size is not None:
             wt_cfg.socket_buffer_size = self.socket_buffer_size
 
-        # Advertise the supported drafts as WT subprotocols (newest first)
+        # Advertise the supported drafts as WT subprotocols (caller order)
         # so picowt selects the highest mutual against the client's
         # WT-Available-Protocols. Drafts >= 15 negotiate the version this
         # way ("moqt-NN"); d14 uses the legacy in-band CLIENT_SETUP path.

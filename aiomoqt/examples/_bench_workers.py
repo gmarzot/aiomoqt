@@ -214,7 +214,7 @@ async def _subscriber_task(config: Dict[str, Any], mp_stop_event,
         path=relay.path or "",
         use_quic=relay.use_quic,
         verify_tls=not config.get('insecure', False),
-        draft_version=config.get('draft'),
+        supported_drafts=config.get('draft'),
         keylog_filename=config.get('keylogfile'),
         keep_alive_interval=config.get('keep_alive_interval'),
     )
@@ -407,7 +407,7 @@ async def _slot_supervisor(config, relay, stop_ev, stats, state,
                 path=relay.path or "",
                 use_quic=relay.use_quic,
                 verify_tls=not insecure,
-                draft_version=config.get('draft'),
+                supported_drafts=config.get('draft'),
                 keep_alive_interval=config.get('keep_alive_interval'),
             )
             async with client.connect() as session:
@@ -577,7 +577,7 @@ async def _publisher_task(config: Dict[str, Any], mp_stop_event,
         path=relay.path or "",
         use_quic=relay.use_quic,
         verify_tls=not config.get('insecure', False),
-        draft_version=config.get('draft'),
+        supported_drafts=config.get('draft'),
         keylog_filename=config.get('keylogfile'),
         keep_alive_interval=config.get('keep_alive_interval'),
     )
@@ -863,7 +863,7 @@ async def _loopback_server_task(config: Dict[str, Any], mp_stop_event,
         certificate=config['cert'],
         private_key=config['key'],
         path=config.get('path', ''),
-        draft_version=config.get('draft'),
+        supported_drafts=config.get('draft'),
     )
     server.register_handler(MOQTMessageType.SUBSCRIBE, _on_subscribe)
     await server.serve()

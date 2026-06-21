@@ -33,7 +33,7 @@ async def _start_server(port, draft):
     server = MOQTServer(
         host="localhost", port=port,
         certificate=CERT, private_key=KEY, path="/",
-        use_quic=True, draft_version=draft,
+        use_quic=True, supported_drafts=draft,
     )
     return await server.serve()
 
@@ -42,12 +42,12 @@ async def _handshake_draft(port, draft):
     """Connect, complete SETUP, and report the session's settled draft."""
     client = MOQTClient(
         "localhost", port, path="/", use_quic=True,
-        verify_tls=False, draft_version=draft,
+        verify_tls=False, supported_drafts=draft,
     )
     async with client.connect() as session:
         await session.client_session_init()
         assert session._moqt_session_setup.result() is True
-        return session._draft
+        return session.negotiated_draft
 
 
 @pytest.mark.asyncio

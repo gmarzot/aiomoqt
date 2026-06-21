@@ -201,7 +201,7 @@ async def _start_server(port: int, cache: FetchTestCache,
         certificate=CERT, private_key=KEY,
         path="/",
         use_quic=use_quic,
-        draft_version=draft,
+        supported_drafts=draft,
     )
     server.register_handler(
         MOQTMessageType.SUBSCRIBE,
@@ -219,7 +219,7 @@ async def _connect_client(port: int, use_quic: bool = True, draft: int = 14):
         "localhost", port,
         path="/",
         use_quic=use_quic,
-        draft_version=draft,
+        supported_drafts=draft,
         verify_tls=False,
     )
 
@@ -545,7 +545,7 @@ async def test_fetch_cancel_mid_stream(use_quic):
         certificate=CERT, private_key=KEY,
         path="/",
         use_quic=use_quic,
-        draft_version=14,
+        supported_drafts=14,
     )
     server.register_handler(MOQTMessageType.FETCH, _slow_fetch)
     server_handle = await server.serve()

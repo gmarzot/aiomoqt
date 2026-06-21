@@ -74,7 +74,7 @@
       "insecure": true,
       "compat": ["libquicr"],
       "disabled_suites": [],
-      "notes": "Cisco libquicr (server cert unacceptable → insecure). d14 dropped (raw + WT now unresponsive — relay appears d16-only). compat=libquicr: relay returns SUBSCRIBE_OK for a nonexistent track (deferred-delivery policy), tolerated + annotated."
+      "notes": "Cisco libquicr (server cert unacceptable → insecure). d14 dropped (raw + WT now unresponsive — relay appears d16-only). compat=libquicr covers two non-spec behaviors, tolerated + annotated: (1) relay returns SUBSCRIBE_OK for a nonexistent track (deferred-delivery policy); (2) relay returns FETCH_ERROR code=0 (INTERNAL_ERROR) for a nonexistent-track FETCH — the fetch probe honors libquicr code=0 as a deliberate refusal (the relay answered structurally in ~85ms; it just uses a poor code), matching how the join probe already accepted its non-spec code=17. Without --compat the fetch probe still fails code=0 by default (0.9.12 stance: 0x0 is not a refusal)."
     },
     {
       "name": "moqtail",
@@ -104,10 +104,10 @@
         "raw-quic": "moqt://draft-16-manish.cloudflare.mediaoverquic.com:443"
       },
       "drafts": [16],
-      "pub_mode": "publish",
+      "pub_mode": "publish-both",
       "compat": ["lenient-extensions"],
       "disabled_suites": ["relay-join", "relay-fetch"],
-      "notes": "Cloudflare moq-rs draft-16 interop branch. compat=lenient-extensions: this fork emits a truncated trailing-extensions KVP block on SubscribeOk (kvp_start=6 tell=7 exts_end=7) which our strict parser rejects as non-compliant; tolerated + annotated, recovering ctrl-msg to 6/6. relay-join + relay-fetch disabled (#24): verified unsupported — itzmanish/moq-rs README also lists FETCH 'Not Soon', and the relay never answers JOIN/FETCH (TimeoutError; join is a joining-fetch). pub-sub[publish] kept as a genuine fail: subscribers get code=4 'Track not found' (publisher's track not visible — a moq-rs publish-routing difference; the same multi_sub_bench flow passes vs moxygen/imquic). Upstream also advertises an H3/WT endpoint at https://.../moq but our client hits a SETUP parse error (\"Read out of bounds\") — QUIC only here until that's resolved."
+      "notes": "Cloudflare moq-rs draft-16 interop branch. compat=lenient-extensions: this fork emits a truncated trailing-extensions KVP block on SubscribeOk (kvp_start=6 tell=7 exts_end=7) which our strict parser rejects as non-compliant; tolerated + annotated, recovering ctrl-msg to 6/6. relay-join + relay-fetch disabled (#24): verified unsupported — itzmanish/moq-rs README also lists FETCH 'Not Soon', and the relay never answers JOIN/FETCH (TimeoutError; join is a joining-fetch). pub-sub[publish] kept as a genuine fail; root-caused 2026-06-21 to two layers: (A) [our side, FIXED] with pub_mode=publish-both the namespace resolves, but the relay's SubscribeOk carries the same truncated trailing-extensions block as its ctrl-msg path, which crashed the multi_sub_bench subscriber (the lenient-extensions tolerance lived only in moq_interop_client, not the bench) — now plumbed via `multi_sub_bench --compat lenient-extensions`; (B) [relay side, confirmed] even with control fully working and the publisher sending 300+ objects, the relay forwards ZERO to subscribers. Ruled out on our side via live tests + spec §10.1: forward=0 and forward=1, alias-matched and alias-diverged all give 0 objects, and the relay never RESETs our data streams (track_alias has no parity rule, only session-uniqueness, which we satisfy). With bare pub_mode=publish the surface symptom is code=4 'Track not found' (relay never got PUB_NS). The same flow delivers objects vs moxygen/imquic/cloudflare-d14, so (B) is a moq-rs d16-fork forwarding bug. Upstream also advertises an H3/WT endpoint at https://.../moq but our client hits a SETUP parse error (\"Read out of bounds\") — QUIC only here until that's resolved."
     }
   ]
 }

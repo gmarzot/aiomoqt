@@ -115,7 +115,7 @@ async def _on_subscribe(session, msg):
     # On d16+ the universal REQUEST_ERROR (0x05) carries the not-found
     # code (0x10). On d14 the legacy SUBSCRIBE_ERROR (0x05) carries
     # TRACK_DOES_NOT_EXIST (0x04). Send the right shape per version.
-    if is_draft16_or_later(session._draft):
+    if is_draft16_or_later(session.negotiated_draft):
         err = RequestError(
             request_id=msg.request_id,
             error_code=int(RequestErrorCode.DOES_NOT_EXIST),
@@ -193,7 +193,7 @@ def _build_server(bind, port, cert, key, use_quic, draft):
         certificate=cert, private_key=key,
         path="/",
         use_quic=use_quic,
-        draft_version=draft,
+        supported_drafts=draft,
     )
     server.register_handler(
         MOQTMessageType.PUBLISH_NAMESPACE, _on_publish_namespace)

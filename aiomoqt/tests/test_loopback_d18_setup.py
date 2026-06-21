@@ -42,7 +42,7 @@ async def _start_server(port, on_subscribe=None):
         certificate=CERT, private_key=KEY,
         path="/",
         use_quic=True,
-        draft_version=18,
+        supported_drafts=18,
     )
     if on_subscribe is not None:
         server.register_handler(MOQTMessageType.SUBSCRIBE, on_subscribe)
@@ -58,13 +58,13 @@ async def test_d18_setup_handshake_quic():
     try:
         client = MOQTClient(
             "localhost", port, path="/",
-            use_quic=True, verify_tls=False, draft_version=18,
+            use_quic=True, verify_tls=False, supported_drafts=18,
         )
         async with client.connect() as session:
             await session.client_session_init()
             assert session._moqt_session_setup.done()
             assert session._moqt_session_setup.result() is True
-            assert session._draft == 18
+            assert session.negotiated_draft == 18
             # Control ran over a uni pair, not a single bidi stream.
             assert session._control_stream_id is None
             assert session._d18_control_write_sid is not None
@@ -96,7 +96,7 @@ async def test_d18_subscribe_roundtrip_quic():
     try:
         client = MOQTClient(
             "localhost", port, path="/",
-            use_quic=True, verify_tls=False, draft_version=18,
+            use_quic=True, verify_tls=False, supported_drafts=18,
         )
         client.register_handler(MOQTMessageType.PUBLISH_DONE, _on_done)
         async with client.connect() as session:
