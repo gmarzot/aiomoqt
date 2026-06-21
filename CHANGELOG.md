@@ -4,9 +4,10 @@
 
 **draft-18 support (beta).** aiomoqt now speaks draft-18 alongside d14/d16,
 over both raw QUIC and WebTransport, built on a version-dispatch refactor
-(per-session draft, `CONTROL_REGISTRY` + `DraftProfile` spine). Pairs with
-aiopquic 0.3.8 (dep floor unchanged). Internal-API breaking; no public
-class-surface change.
+(per-session draft, `CONTROL_REGISTRY` + `DraftProfile` spine). Requires
+aiopquic 0.3.9 (the vi64 buffer codec — `push_vint`/`pull_vint`); dep floor
+`aiopquic>=0.3.8` → `aiopquic>=0.3.9` (bump lands once 0.3.9 publishes).
+Internal-API breaking; no public class-surface change.
 
 ### draft-18 support (beta) — summary
 
