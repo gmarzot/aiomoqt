@@ -1,6 +1,20 @@
 # Changelog
 
-## v0.9.11 (unreleased)
+## v0.9.12 (unreleased)
+
+### SUBSCRIBE: omit default-valued params (conformant "conservative sender")
+
+- `subscribe()` now defaults `priority` / `group_order` / `forward` to `None` = "unspecified", so the **d16 SUBSCRIBE omits them from the wire** and the relay applies the protocol default (forward=true, publisher group order, default priority). aiomoqt previously always emitted all four params (`SUBSCRIBER_PRIORITY` 0x20, `GROUP_ORDER` 0x22, `FORWARD` 0x10, `SUBSCRIPTION_FILTER` 0x21) — legal but non-idiomatic; moxygen/moqx/moq-rs all omit defaults. The extra params tripped **moqtail**'s stricter parser, which silently **dropped** our multi-param SUBSCRIBE — failing `subscribe-error`, `announce-subscribe`, and `subscribe-before-announce` against it. With the filter-only subscribe, **moqtail goes 3/6 → 6/6** and every other relay (moxygen / moqx / imquic / moq-dev-rs / loopback d14+d16) is unchanged. To force a param onto the wire, pass it explicitly — a default-equal value like `forward=1` is still sent when given. The d14 path (mandatory inline fields) substitutes defaults for `None`.
+
+### moq_interop_client: serve the forwarded SUBSCRIBE + tolerate pending-hold
+
+- The `announce-subscribe` publisher now **serves the relay's forwarded SUBSCRIBE** (via `PublishedTrack`), matching moxygen/moqx/moq-rs, so forward-and-wait relays can complete the downstream `SUBSCRIBE_OK`. When a relay holds the subscription pending without an eager OK (a valid forward-and-wait model), the wait timeout is accepted as a pass and annotated (`# COMPAT`) rather than failing. A real `SUBSCRIBE_ERROR` still fails.
+
+### moq_interop_client: tighten the error-code leniency (exclude INTERNAL_ERROR 0x0)
+
+- The 0.9.11 "any structured error = rejection" default was too broad — it accepted `INTERNAL_ERROR (0x0)`, a server fault rather than a refusal. `subscribe-error` / `subscribe-before-announce` / `join` now reject `0x0` by default (accepted only under explicit `moq-rs`/`moq-dev` compat, which use `0` as their not-found code). Spec codes and other non-spec codes (e.g. 404) are unaffected.
+
+## v0.9.11
 
 ### moq_interop_client: accept any structured error as a valid rejection
 
