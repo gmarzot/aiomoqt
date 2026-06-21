@@ -23,8 +23,8 @@ from pathlib import Path
 from aiomoqt.client import MOQTClient
 from aiomoqt.types import (
     MOQT_VERSION_DRAFT14, MOQT_VERSION_DRAFT16, MOQTRequestError,
+    moqt_version_from_draft,
 )
-from aiomoqt.context import get_major_version
 from aiomoqt.utils.url import parse_relay_url
 
 logging.basicConfig(
@@ -55,7 +55,7 @@ DRAFT_PROBES = [
 ]
 
 
-async def probe_version(host, port, path, use_quic, draft_version,
+async def probe_version(host, port, path, use_quic, supported_drafts,
                         verify_tls=False):
     """Single probe: connect, CLIENT_SETUP/SERVER_SETUP, return result.
 
@@ -75,15 +75,17 @@ async def probe_version(host, port, path, use_quic, draft_version,
             path=path,
             use_quic=use_quic,
             verify_tls=verify_tls,
-            draft_version=draft_version,
+            supported_drafts=supported_drafts,
         )
         async with asyncio.timeout(PROBE_TIMEOUT):
             async with client.connect() as session:
                 await session.client_session_init(timeout=PROBE_TIMEOUT - 1)
-                v = session._moqt_version
+                draft = session.negotiated_draft
                 result["live"] = True
-                result["version_hex"] = f"0x{v:08x}"
-                result["draft"] = f"draft-{get_major_version(v)}"
+                # version_hex is a display-only wire form: translate the
+                # negotiated draft to its IETF version code here.
+                result["version_hex"] = f"0x{moqt_version_from_draft(draft):08x}"
+                result["draft"] = f"draft-{draft}"
                 result["alpn"] = client.configuration.alpn_protocols[0]
                 # Capture setup params from server
                 # Clean close
@@ -114,9 +116,9 @@ async def probe_endpoint(url, verify_tls=False):
     drafts = []
     results = []
 
-    for draft_name, draft_version in DRAFT_PROBES:
+    for draft_name, supported_drafts in DRAFT_PROBES:
         r = await probe_version(
-            host, port, path, use_quic, draft_version, verify_tls,
+            host, port, path, use_quic, supported_drafts, verify_tls,
         )
         results.append(r)
         if r["live"]:

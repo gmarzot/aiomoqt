@@ -61,6 +61,39 @@ def moqt_version_from_draft(draft: int) -> int:
         )
     return full
 
+
+def normalize_supported_drafts(supported_drafts) -> list:
+    """Normalize the public `supported_drafts` argument to a non-empty
+    list of plain draft NUMBERS (e.g. [16, 14]), newest draft first.
+
+    Accepts the forms the public API allows:
+      - None        → offer every supported draft (the "auto" offer,
+                       preserving the historical draft_version=None path)
+      - int         → a single draft number, e.g. 16 → [16]
+      - list[int]   → several draft numbers, e.g. [16, 14]
+
+    Drafts stay as representation-independent ints throughout the
+    codebase; the wire forms (the moq-00 / moqt-16 ALPN and the
+    0xff0000NN IETF version code) are only ever translated when building
+    or parsing wire SETUP messages and ALPN. Each entry is validated via
+    moqt_version_from_draft (so the full hex form or an unknown draft
+    raises ValueError at the API boundary), then sorted newest-first —
+    the order ALPN / CLIENT_SETUP should offer versions in.
+    """
+    supported = sorted((v & 0xff for v in MOQT_VERSIONS), reverse=True)
+    if supported_drafts is None:
+        return supported
+    if isinstance(supported_drafts, int):
+        supported_drafts = [supported_drafts]
+    drafts = set()
+    for d in supported_drafts:
+        moqt_version_from_draft(d)  # validate (raises on hex form / unknown)
+        drafts.add(d)
+    if not drafts:
+        raise ValueError("supported_drafts must name at least one draft")
+    return sorted(drafts, reverse=True)
+
+
 MOQT_DEFAULT_PRIORITY = 128
 
 MOQT_TIMESTAMP_EXT = 0x20

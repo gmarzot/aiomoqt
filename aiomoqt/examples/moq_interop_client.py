@@ -130,7 +130,7 @@ async def _auto_alpn_ok(host, port, path, use_quic, tls_disable_verify,
     SETUP completes; a False (any handshake/SETUP failure) is the signal
     to pin draft-14. Works for both transports."""
     client = _make_client(host, port, path, use_quic,
-                          tls_disable_verify, debug, draft_version=None)
+                          tls_disable_verify, debug, supported_drafts=None)
     try:
         async with asyncio.timeout(timeout):
             async with client.connect() as session:
@@ -283,7 +283,7 @@ def _get_connection_id(session) -> str:
 
 def _make_client(host: str, port: int, path: str, use_quic: bool,
                  tls_disable_verify: bool, debug: bool,
-                 draft_version: int = None) -> MOQTClient:
+                 supported_drafts: int = None) -> MOQTClient:
     """Create a configured MOQTClient."""
     return MOQTClient(
         host, port,
@@ -291,7 +291,7 @@ def _make_client(host: str, port: int, path: str, use_quic: bool,
         use_quic=use_quic,
         verify_tls=not tls_disable_verify,
         debug=debug,
-        draft_version=draft_version,
+        supported_drafts=supported_drafts,
     )
 
 
@@ -300,11 +300,11 @@ def _make_client(host: str, port: int, path: str, use_quic: bool,
 # ---------------------------------------------------------------------------
 
 async def test_setup_only(host, port, path, use_quic, tls_disable_verify,
-                          debug, draft_version=None, compat=frozenset(),
+                          debug, supported_drafts=None, compat=frozenset(),
                           timeout=5.0) -> TestResult:
     """Test 1: Connect, exchange SETUP, graceful close."""
     t0 = time.monotonic()
-    client = _make_client(host, port, path, use_quic, tls_disable_verify, debug, draft_version=draft_version)
+    client = _make_client(host, port, path, use_quic, tls_disable_verify, debug, supported_drafts=supported_drafts)
     try:
         async with asyncio.timeout(timeout):
             async with client.connect() as session:
@@ -328,11 +328,11 @@ async def test_setup_only(host, port, path, use_quic, tls_disable_verify,
 
 
 async def test_announce_only(host, port, path, use_quic, tls_disable_verify,
-                             debug, draft_version=None, compat=frozenset(),
+                             debug, supported_drafts=None, compat=frozenset(),
                              timeout=5.0) -> TestResult:
     """Test 2: SETUP + PUBLISH_NAMESPACE + receive OK."""
     t0 = time.monotonic()
-    client = _make_client(host, port, path, use_quic, tls_disable_verify, debug, draft_version=draft_version)
+    client = _make_client(host, port, path, use_quic, tls_disable_verify, debug, supported_drafts=supported_drafts)
     try:
         async with asyncio.timeout(timeout):
             async with client.connect() as session:
@@ -363,12 +363,12 @@ async def test_announce_only(host, port, path, use_quic, tls_disable_verify,
 
 async def test_publish_namespace_done(host, port, path, use_quic,
                                       tls_disable_verify, debug,
-                                      draft_version=None,
+                                      supported_drafts=None,
                                       compat=frozenset(),
                                       timeout=5.0) -> TestResult:
     """Test 3: SETUP + PUBLISH_NAMESPACE + OK + PUBLISH_NAMESPACE_DONE + close."""
     t0 = time.monotonic()
-    client = _make_client(host, port, path, use_quic, tls_disable_verify, debug, draft_version=draft_version)
+    client = _make_client(host, port, path, use_quic, tls_disable_verify, debug, supported_drafts=supported_drafts)
     try:
         async with asyncio.timeout(timeout):
             async with client.connect() as session:
@@ -406,7 +406,7 @@ async def test_publish_namespace_done(host, port, path, use_quic,
 
 async def test_subscribe_error(host, port, path, use_quic,
                                tls_disable_verify, debug,
-                               draft_version=None, compat=frozenset(),
+                               supported_drafts=None, compat=frozenset(),
                                timeout=5.0) -> TestResult:
     """Test 4: SUBSCRIBE to non-existent track, expect an error response.
 
@@ -426,7 +426,7 @@ async def test_subscribe_error(host, port, path, use_quic,
     accept_any_error = True
     t0 = time.monotonic()
     cid = "unknown"
-    client = _make_client(host, port, path, use_quic, tls_disable_verify, debug, draft_version=draft_version)
+    client = _make_client(host, port, path, use_quic, tls_disable_verify, debug, supported_drafts=supported_drafts)
     try:
         async with asyncio.timeout(timeout):
             async with client.connect() as session:
@@ -541,7 +541,7 @@ async def _serve_forwarded_subscribe(session, msg):
 
 async def test_announce_subscribe(host, port, path, use_quic,
                                   tls_disable_verify, debug,
-                                  draft_version=None, compat=frozenset(),
+                                  supported_drafts=None, compat=frozenset(),
                                   timeout=10.0) -> TestResult:
     """Test 5: Two connections — publisher announces, subscriber subscribes."""
     t0 = time.monotonic()
@@ -553,11 +553,11 @@ async def test_announce_subscribe(host, port, path, use_quic,
             # Publisher connection. Serve the relay's forwarded SUBSCRIBE
             # so forward-and-wait relays (moqtail) complete the OK.
             pub_client = _make_client(host, port, path, use_quic,
-                                      tls_disable_verify, debug, draft_version=draft_version)
+                                      tls_disable_verify, debug, supported_drafts=supported_drafts)
             pub_client.register_handler(
                 MOQTMessageType.SUBSCRIBE, _serve_forwarded_subscribe)
             sub_client = _make_client(host, port, path, use_quic,
-                                      tls_disable_verify, debug, draft_version=draft_version)
+                                      tls_disable_verify, debug, supported_drafts=supported_drafts)
 
             async with pub_client.connect() as pub_session:
                 await pub_session.client_session_init()
@@ -629,7 +629,7 @@ async def test_announce_subscribe(host, port, path, use_quic,
 
 async def test_subscribe_before_announce(host, port, path, use_quic,
                                          tls_disable_verify, debug,
-                                         draft_version=None,
+                                         supported_drafts=None,
                                          compat=frozenset(),
                                          timeout=7.0) -> TestResult:
     """Test 6: Subscriber connects first, publisher 500ms later. Both outcomes valid."""
@@ -648,9 +648,9 @@ async def test_subscribe_before_announce(host, port, path, use_quic,
     try:
         async with asyncio.timeout(timeout):
             sub_client = _make_client(host, port, path, use_quic,
-                                      tls_disable_verify, debug, draft_version=draft_version)
+                                      tls_disable_verify, debug, supported_drafts=supported_drafts)
             pub_client = _make_client(host, port, path, use_quic,
-                                      tls_disable_verify, debug, draft_version=draft_version)
+                                      tls_disable_verify, debug, supported_drafts=supported_drafts)
 
             async with sub_client.connect() as sub_session:
                 await sub_session.client_session_init()
@@ -753,14 +753,14 @@ async def test_subscribe_before_announce(host, port, path, use_quic,
 
 
 async def test_fetch(host, port, path, use_quic, tls_disable_verify,
-                     debug, draft_version=None, compat=frozenset(),
+                     debug, supported_drafts=None, compat=frozenset(),
                      timeout=6.0) -> TestResult:
     """FETCH probe: send a standalone FETCH; relay handles if it responds
     with FETCH_OK or structured FETCH_ERROR. Timeout/close = fail."""
     t0 = time.monotonic()
     client = _make_client(host, port, path, use_quic,
                           tls_disable_verify, debug,
-                          draft_version=draft_version)
+                          supported_drafts=supported_drafts)
     try:
         async with asyncio.timeout(timeout):
             async with client.connect() as session:
@@ -816,14 +816,14 @@ async def test_fetch(host, port, path, use_quic, tls_disable_verify,
 
 
 async def test_join(host, port, path, use_quic, tls_disable_verify,
-                    debug, draft_version=None, compat=frozenset(),
+                    debug, supported_drafts=None, compat=frozenset(),
                     timeout=6.0) -> TestResult:
     """JOIN probe: send SUBSCRIBE + JOINING_FETCH(RELATIVE, start=0).
     Relay handles if it responds (OK or structured error). Timeout = fail."""
     t0 = time.monotonic()
     client = _make_client(host, port, path, use_quic,
                           tls_disable_verify, debug,
-                          draft_version=draft_version)
+                          supported_drafts=supported_drafts)
     try:
         async with asyncio.timeout(timeout):
             async with client.connect() as session:
@@ -975,7 +975,7 @@ def parse_args():
 
 async def run_tests(tests: list[str], host: str, port: int, path: str,
                     use_quic: bool, tls_disable_verify: bool,
-                    debug: bool, draft_version: int = None,
+                    debug: bool, supported_drafts: int = None,
                     compat: frozenset = frozenset(),
                     reporter: TAPReporter = None) -> TAPReporter:
     if reporter is None:
@@ -994,8 +994,8 @@ async def run_tests(tests: list[str], host: str, port: int, path: str,
     # negotiates draft-14 instead of failing every case. Explicit --draft
     # is untouched; the probe is a no-op against relays that negotiate
     # auto cleanly (it just adds one connect).
-    effective_draft = draft_version
-    if draft_version is None and not await _auto_alpn_ok(
+    effective_draft = supported_drafts
+    if supported_drafts is None and not await _auto_alpn_ok(
             host, port, path, use_quic, tls_disable_verify, debug):
         effective_draft = 14
         reporter.notes.append(
@@ -1011,7 +1011,7 @@ async def run_tests(tests: list[str], host: str, port: int, path: str,
         INTEROP_NAMESPACE = f"{base_namespace}/{test_name}"
         nc_before = MOQTMessage._trailing_extensions_truncation_count
         result = await fn(host, port, path, use_quic, tls_disable_verify,
-                          debug, draft_version=effective_draft, compat=compat)
+                          debug, supported_drafts=effective_draft, compat=compat)
         nc_delta = (
             MOQTMessage._trailing_extensions_truncation_count - nc_before
         )
@@ -1077,7 +1077,7 @@ def main():
 
     # Public API takes the draft NUMBER (14, 16, ...). MOQTClient
     # normalizes to the wire form internally; pass args.draft through.
-    draft_version = args.draft if args.draft else None
+    supported_drafts = args.draft if args.draft else None
 
     if args.verbose:
         transport = "QUIC" if use_quic else "WebTransport"
@@ -1109,7 +1109,7 @@ def main():
     asyncio.run(
         run_tests(tests, host, port, path, use_quic,
                   args.tls_disable_verify, args.debug,
-                  draft_version=draft_version,
+                  supported_drafts=supported_drafts,
                   compat=compat,
                   reporter=reporter)
     )

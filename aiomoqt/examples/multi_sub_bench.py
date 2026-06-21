@@ -170,7 +170,7 @@ def run_publisher(relay_url, namespace, trackname, args):
             path=relay.path,
             use_quic=relay.use_quic,
             verify_tls=not args.insecure,
-            draft_version=args.draft,
+            supported_drafts=args.draft,
             congestion_control_algorithm=args.cc_algo,
             tx_max_queued_bytes=args.max_queued_bytes,
             **({'tx_max_inflight_bytes':
@@ -254,7 +254,7 @@ def run_subscriber(sub_id, relay_url, namespace, trackname, args,
             path=relay.path,
             use_quic=relay.use_quic,
             verify_tls=not args.insecure,
-            draft_version=args.draft,
+            supported_drafts=args.draft,
             congestion_control_algorithm=args.cc_algo,
         )
         start = time.monotonic()

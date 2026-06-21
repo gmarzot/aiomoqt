@@ -36,7 +36,7 @@ import time
 from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
 from aiomoqt.track import PublishedTrack, SubscribedTrack
-from aiomoqt.types import MOQTMessageType, MOQT_VERSION_DRAFT16
+from aiomoqt.types import MOQTMessageType
 
 
 def _find_cert():
@@ -94,7 +94,7 @@ async def _run(args):
         certificate=cert, private_key=key,
         path="/",
         use_quic=True,
-        draft_version=MOQT_VERSION_DRAFT16,
+        supported_drafts=16,
     )
     server.register_handler(MOQTMessageType.SUBSCRIBE, on_subscribe)
     server_handle = await server.serve()
@@ -119,7 +119,7 @@ async def _run(args):
     client = MOQTClient(
         '127.0.0.1', args.port, path='moq',
         use_quic=True, verify_tls=False,
-        draft_version=MOQT_VERSION_DRAFT16,
+        supported_drafts=16,
     )
 
     t0 = time.perf_counter()

@@ -429,7 +429,7 @@ async def run(args):
         path=relay.path,
         use_quic=relay.use_quic,
         verify_tls=not args.insecure,
-        draft_version=args.draft,
+        supported_drafts=args.draft,
         debug=args.debug,
         keylog_filename=args.keylogfile,
         congestion_control_algorithm=args.cc_algo,

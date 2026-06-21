@@ -71,7 +71,7 @@ async def test_aiopquic_rawquic_handshake():
         certificate=CERT, private_key=KEY,
         path="/",
         use_quic=True,
-        draft_version=16,
+        supported_drafts=16,
     )
     server_handle = await server.serve()
     try:
@@ -80,7 +80,7 @@ async def test_aiopquic_rawquic_handshake():
             path="/",
             use_quic=True,
             verify_tls=False,
-            draft_version=16,
+            supported_drafts=16,
         )
         async with client.connect() as session:
             await session.client_session_init(timeout=5)
@@ -102,7 +102,7 @@ async def test_aiopquic_rawquic_pubsub_one_subgroup():
         certificate=CERT, private_key=KEY,
         path="/",
         use_quic=True,
-        draft_version=16,
+        supported_drafts=16,
     )
     server.register_handler(
         MOQTMessageType.SUBSCRIBE,
@@ -121,7 +121,7 @@ async def test_aiopquic_rawquic_pubsub_one_subgroup():
             path="/",
             use_quic=True,
             verify_tls=False,
-            draft_version=16,
+            supported_drafts=16,
         )
         async with client.connect() as session:
             await session.client_session_init(timeout=5)
