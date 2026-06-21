@@ -14,6 +14,12 @@
 
 - The 0.9.11 "any structured error = rejection" default was too broad — it accepted `INTERNAL_ERROR (0x0)`, a server fault rather than a refusal. `subscribe-error` / `subscribe-before-announce` / `join` now reject `0x0` by default (accepted only under explicit `moq-rs`/`moq-dev` compat, which use `0` as their not-found code). Spec codes and other non-spec codes (e.g. 404) are unaffected.
 
+### Release regression: flake resistance, macOS loopback-fetch, catalog trim
+
+- **Interop tier retries transient flakes.** A failing relay/suite is retried up to 2 extra times; a genuine fail fails every attempt, a flake recovers and is annotated `(flaky: recovered on attempt N)`. External-relay/network jitter (timeouts, the `multi_sub_bench` fixed publisher-register wait racing a relay's namespace registration) no longer reads as a real failure.
+- **macOS skips `loopback-fetch`** (new `--skip-suite` flag): GitHub's macOS runners have ~10-12s/test pytest-asyncio event-loop teardown, tipping loopback-fetch over its timeout. The fetch logic is platform-independent (covered on Linux) and the bench matrix covers macOS loopback delivery.
+- **Catalog trim (#24):** disabled the no-answer / unsupported suites that will never pass — `cloudflare-d14` `relay-fetch` (this d14 build has no standalone FETCH) and `cf-d16-interop` `relay-join`/`relay-fetch` (moq-rs d16 never answers). Genuine conformance fails are kept (cf-d16 pub-sub routing, quicr-west fetch code=0).
+
 ## v0.9.11
 
 ### moq_interop_client: accept any structured error as a valid rejection

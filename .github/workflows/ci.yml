@@ -60,8 +60,15 @@ jobs:
             -days 1 -subj "/CN=localhost"
       - name: Run unit + integration tiers
         run: |
+          # GitHub's macOS runners have pathologically slow pytest-asyncio
+          # per-test event-loop teardown (~10-12s/test), so loopback-fetch
+          # (the most cases) tips over its timeout and flakes. Skip it on
+          # macOS: the fetch logic is platform-independent (covered on
+          # Linux) and the bench matrix covers macOS loopback delivery.
+          SKIP=""
+          [ "$RUNNER_OS" = "macOS" ] && SKIP="--skip-suite loopback-fetch"
           python tests/release_regression_test.py \
-            --test-tier unit --test-tier integration \
+            --test-tier unit --test-tier integration $SKIP \
             --log-dir "${RUNNER_TEMP}/aiomoqt-regression"
       - name: Upload logs on failure
         if: failure()

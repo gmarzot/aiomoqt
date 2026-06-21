@@ -484,6 +484,15 @@ def main() -> int:
                     dest="test_suites",
                     help=f"run this specific suite (repeatable). "
                          f"Choices: {', '.join(SUITE_CHOICES)}")
+    ap.add_argument("--skip-suite", action="append", default=[],
+                    choices=SUITE_CHOICES, metavar="SUITE",
+                    dest="skip_suites",
+                    help="exclude this suite even if its tier is selected "
+                         "(repeatable). macOS CI skips loopback-fetch: its "
+                         "per-test event-loop teardown is pathologically slow "
+                         "on GitHub macOS runners. The fetch logic is covered "
+                         "on Linux, and the bench matrix covers macOS "
+                         "loopback delivery.")
     ap.add_argument("--only", metavar="RELAY",
                     help="within the interop tier, only test this relay "
                          "by name")
@@ -502,6 +511,7 @@ def main() -> int:
             enabled.update(TIERS[t])
     else:
         enabled = set(SUITE_CHOICES)
+    enabled -= set(args.skip_suites)
 
     with open(args.catalog) as f:
         catalog = json.load(f)
