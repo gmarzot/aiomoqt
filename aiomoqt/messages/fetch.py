@@ -58,9 +58,14 @@ class Fetch(MOQTMessage):
             # d16: priority and group_order live in params
             payload.push_uint_var(self.fetch_type)
         else:
-            # d14: priority and group_order as fixed fields before fetch_type
-            payload.push_uint8(self.subscriber_priority)
-            payload.push_uint8(self.group_order)
+            # d14: priority and group_order are mandatory fixed fields (no
+            # optional form like d16's params) — substitute defaults when
+            # the caller left them unset (None).
+            payload.push_uint8(self.subscriber_priority
+                               if self.subscriber_priority is not None else 128)
+            payload.push_uint8(self.group_order
+                               if self.group_order is not None
+                               else GroupOrder.ASCENDING)
             payload.push_uint_var(self.fetch_type)
 
         if self.fetch_type == FetchType.STANDALONE:

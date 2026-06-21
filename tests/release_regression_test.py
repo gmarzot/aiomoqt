@@ -384,6 +384,28 @@ def _print_result(res: Result) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Interop flake handling
+# ---------------------------------------------------------------------------
+# External relays + the network introduce transient failures (timeouts, the
+# multi_sub_bench fixed publisher-register wait racing a relay's namespace
+# registration). Retry a failing interop case a couple of times: a genuine
+# fail fails every attempt; a flake recovers and is annotated — so a flake
+# never reads as a real failure.
+INTEROP_RETRIES = 2
+
+
+def _with_interop_retry(fn, fn_args, log) -> tuple[str, str]:
+    status, detail = "FAIL", "(no attempts)"
+    for attempt in range(INTEROP_RETRIES + 1):
+        status, detail = fn(*fn_args, log)
+        if status != "FAIL":
+            if attempt:
+                detail = f"{detail} (flaky: recovered on attempt {attempt + 1})"
+            return status, detail
+    return status, f"{detail} (failed all {INTEROP_RETRIES + 1} attempts)"
+
+
+# ---------------------------------------------------------------------------
 # Per-relay matrix runner (one worker of ThreadPoolExecutor)
 # ---------------------------------------------------------------------------
 def _run_relay_matrix(relay: dict, enabled: set[str],
@@ -418,7 +440,7 @@ def _run_relay_matrix(relay: dict, enabled: set[str],
             _progress(f"  [skip] {label}  {marker}")
             return
         log = log_dir / f"{suite}_{slug}.log"
-        status, detail = fn(*fn_args, log)
+        status, detail = _with_interop_retry(fn, fn_args, log)
         results.append((status, label, detail, log))
         marker = "[PASS]" if status == "PASS" else "[FAIL]"
         _progress(f"  {marker} {label}  {detail}")
@@ -462,6 +484,15 @@ def main() -> int:
                     dest="test_suites",
                     help=f"run this specific suite (repeatable). "
                          f"Choices: {', '.join(SUITE_CHOICES)}")
+    ap.add_argument("--skip-suite", action="append", default=[],
+                    choices=SUITE_CHOICES, metavar="SUITE",
+                    dest="skip_suites",
+                    help="exclude this suite even if its tier is selected "
+                         "(repeatable). macOS CI skips loopback-fetch: its "
+                         "per-test event-loop teardown is pathologically slow "
+                         "on GitHub macOS runners. The fetch logic is covered "
+                         "on Linux, and the bench matrix covers macOS "
+                         "loopback delivery.")
     ap.add_argument("--only", metavar="RELAY",
                     help="within the interop tier, only test this relay "
                          "by name")
@@ -480,6 +511,7 @@ def main() -> int:
             enabled.update(TIERS[t])
     else:
         enabled = set(SUITE_CHOICES)
+    enabled -= set(args.skip_suites)
 
     with open(args.catalog) as f:
         catalog = json.load(f)
