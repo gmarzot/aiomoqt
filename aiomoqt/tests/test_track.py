@@ -218,7 +218,7 @@ class TestSubscribedTrack:
             session.on_object_received = None
 
             t = SubscribedTrack(session, "bench",
-                                trackname="video", draft=14)
+                                trackname="video")
             await t.subscribe()
 
             session.subscribe.assert_called_once()
@@ -240,7 +240,7 @@ class TestSubscribedTrack:
             session.on_object_received = None
 
             t = SubscribedTrack(session, "bench",
-                                trackname="video", draft=16)
+                                trackname="video")
             await t.subscribe()
 
             session.subscribe.assert_called_once()
@@ -267,8 +267,8 @@ class TestSubscribedTrack:
             session.send_control_message = MagicMock()
             session.on_object_received = None
 
-            session._draft = 14  # exercise real PublishOk.serialize(draft=)
-            t = SubscribedTrack(session, "bench", draft=14)
+            session._draft = 14  # exercise real PublishOk.serialize at d14
+            t = SubscribedTrack(session, "bench")
             assert t.trackname is None
             await t.subscribe()
 
@@ -294,8 +294,8 @@ class TestSubscribedTrack:
             session.send_control_message = MagicMock()
             session.on_object_received = None
 
-            session._draft = 16  # exercise real PublishOk.serialize(draft=)
-            t = SubscribedTrack(session, "bench", draft=16)
+            session._draft = 16  # exercise real PublishOk.serialize at d16
+            t = SubscribedTrack(session, "bench")
             assert t.trackname is None
             await t.subscribe()
 
@@ -317,7 +317,7 @@ class TestSubscribedTrack:
             session.subscribe = AsyncMock(return_value=MagicMock())
             session.on_object_received = None
 
-            t = SubscribedTrack(session, "bench", draft=16)
+            t = SubscribedTrack(session, "bench")
             try:
                 await t.subscribe()
                 assert False, "expected TimeoutError"
@@ -351,7 +351,7 @@ class TestSubscribedTrack:
             cb = MagicMock()
             t = SubscribedTrack(session, "bench",
                                 trackname="track",
-                                on_object=cb, draft=14)
+                                on_object=cb)
             await t.subscribe()
 
             assert session.on_object_received is cb

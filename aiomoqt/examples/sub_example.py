@@ -176,7 +176,6 @@ async def main(host: str, port: int, path: str, namespace: str, track_name: str,
                     session,
                     namespace=namespace,
                     trackname=track_name,
-                    draft=draft,
                     on_object=stats.on_object,
                 )
                 await track.subscribe(

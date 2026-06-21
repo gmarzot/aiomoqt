@@ -34,7 +34,7 @@ from .types import (
     MOQT_TIMESTAMP_EXT, SessionCloseCode,
 )
 from .messages import (
-    SubgroupHeader, PublishOk, RequestUpdate,
+    PublishOk, RequestUpdate,
 )
 from .utils.format import fmt_bps, fmt_rate
 from .utils.logger import get_logger
@@ -67,7 +67,6 @@ class Track:
         group_size: int = 60,
         num_subgroups: int = 1,
         rate: float = 0,
-        draft: Optional[int] = None,
     ):
         """
         rate is the AGGREGATE target objects/sec across all subgroup
@@ -83,7 +82,6 @@ class Track:
         self.group_size = group_size
         self.num_subgroups = num_subgroups
         self.rate = rate
-        self.draft = draft
         self.track_alias: int = 0
         self.request_id: int = 0
         self.state: TrackState = TrackState.IDLE
@@ -115,10 +113,10 @@ class PublishedTrack(Track):
     def __init__(self, session, namespace: str, trackname: str = 'track',
                  object_size: int = 1024, group_size: int = 60,
                  num_subgroups: int = 1, rate: float = 0,
-                 priority: int = 128, draft: Optional[int] = None,
+                 priority: int = 128,
                  auth_token: bytes = b"bench-token"):
         super().__init__(session, namespace, trackname,
-                         object_size, group_size, num_subgroups, rate, draft)
+                         object_size, group_size, num_subgroups, rate)
         self.priority = priority
         self.auth_token = auth_token
         self._subscriber_event = asyncio.Event()
@@ -417,13 +415,12 @@ class PublishedTrack(Track):
                         stream_id = await session.open_uni_stream()
                         self._stream_count += 1
 
-                    header = SubgroupHeader(
+                    header = session.subgroup_header(
                         track_alias=track_alias,
                         group_id=group_id,
                         subgroup_id=subgroup_id,
                         publisher_priority=priority,
                         extensions_present=True,
-                        draft=session._draft,
                     )
                     msg = header.serialize()
                     if session._close_err is not None:
@@ -536,11 +533,10 @@ class SubscribedTrack(Track):
     """
 
     def __init__(self, session, namespace: str, trackname: str = None,
-                 draft: Optional[int] = None,
                  on_object: Optional[Callable] = None,
                  report_interval: float = 5.0,
                  auth_token: Optional[bytes] = None):
-        super().__init__(session, namespace, trackname, draft=draft)
+        super().__init__(session, namespace, trackname)
         self.on_object = on_object
         self.report_interval = report_interval
         self.auth_token = auth_token
@@ -699,7 +695,7 @@ class VideoTrack(PublishedTrack):
                  gop_pattern: str = "ibp", gop_seconds: float = 1.0,
                  i_frame_size: int = None, p_frame_size: int = None,
                  b_frame_size: int = None,
-                 draft: Optional[int] = None, **kwargs):
+                 **kwargs):
         # GOP = 1 second of frames by default
         gop_size = int(fps * gop_seconds)
 
@@ -723,7 +719,6 @@ class VideoTrack(PublishedTrack):
             group_size=gop_size,
             num_subgroups=1,
             rate=fps,
-            draft=draft,
             **kwargs,
         )
 
@@ -816,13 +811,12 @@ class VideoTrack(PublishedTrack):
                         stream_id = await session.open_uni_stream()
                         self._stream_count += 1
 
-                    header = SubgroupHeader(
+                    header = session.subgroup_header(
                         track_alias=track_alias,
                         group_id=group_id,
                         subgroup_id=subgroup_id,
                         publisher_priority=priority,
                         extensions_present=True,
-                        draft=session._draft,
                     )
                     msg = header.serialize()
                     if session._close_err is not None:

@@ -238,7 +238,6 @@ async def _subscriber_task(config: Dict[str, Any], mp_stop_event,
                 track = SubscribedTrack(
                     session, config['namespace'],
                     trackname=config['trackname'],
-                    draft=config.get('draft'),
                     on_object=_on_object,
                 )
                 try:
@@ -420,7 +419,6 @@ async def _slot_supervisor(config, relay, stop_ev, stats, state,
                     track = SubscribedTrack(
                         session, config['namespace'],
                         trackname=config['trackname'],
-                        draft=config.get('draft'),
                         on_object=_on_object,
                     )
                     try:

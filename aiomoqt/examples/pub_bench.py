@@ -196,7 +196,6 @@ async def run(args):
                 group_size=args.group_size,
                 num_subgroups=args.streams,
                 rate=args.rate,
-                draft=args.draft,
             )
             await track.publish(
                 announce_namespace=(args.pub_ns or args.pub_both),

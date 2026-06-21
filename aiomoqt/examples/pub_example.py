@@ -321,7 +321,6 @@ async def main(host: str, port: int, path: str, namespace: str, trackname: str,
                     resolution=video,
                     fps=rate,
                     gop_pattern=gop_pattern,
-                    draft=draft,
                     auth_token=auth,
                 )
             else:
@@ -333,7 +332,6 @@ async def main(host: str, port: int, path: str, namespace: str, trackname: str,
                     group_size=GROUP_SIZE,
                     num_subgroups=streams,
                     rate=rate,
-                    draft=draft,
                     auth_token=auth,
                 )
             await track.publish()

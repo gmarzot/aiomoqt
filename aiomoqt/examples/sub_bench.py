@@ -446,7 +446,6 @@ async def run(args):
                     session,
                     namespace=args.namespace,
                     trackname=args.trackname,
-                    draft=args.draft,
                     on_object=stats.on_object,
                     auth_token=(args.auth_token.encode()
                                 if args.auth_token else None),

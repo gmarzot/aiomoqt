@@ -162,7 +162,6 @@ def run_publisher(relay_url, namespace, trackname, args):
                 track = VideoTrack(
                     session, namespace, trackname,
                     resolution=args.video, fps=args.rate,
-                    draft=args.draft,
                 )
             else:
                 track = PublishedTrack(
@@ -171,7 +170,6 @@ def run_publisher(relay_url, namespace, trackname, args):
                     group_size=group_size,
                     num_subgroups=args.streams,
                     rate=args.rate,
-                    draft=args.draft,
                 )
             await track.publish(
                 announce_namespace=(args.pub_ns or args.pub_both),
@@ -239,7 +237,6 @@ def run_subscriber(sub_id, relay_url, namespace, trackname, args,
                 track = SubscribedTrack(
                     session, namespace,
                     trackname=trackname,
-                    draft=args.draft,
                     on_object=on_object,
                 )
                 await track.subscribe(timeout=SUBSCRIBE_TIMEOUT)

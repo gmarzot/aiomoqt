@@ -8,6 +8,7 @@ the bench can chunk and feed.
 from __future__ import annotations
 
 from aiomoqt.messages import ObjectStatus
+from aiomoqt.context import profile_for
 from aiomoqt.messages.track import (
     SubgroupHeader, FetchHeader, FetchObject,
 )
@@ -53,7 +54,7 @@ def make_fetch_stream(n_objects: int, payload_size: int,
             publisher_priority=128, extensions=None,
             status=ObjectStatus.NORMAL, payload=payload,
         )
-        out += bytes(fo.serialize(draft=16).data)
+        out += bytes(fo.serialize(prof=profile_for(16)).data)
     return bytes(out)
 
 

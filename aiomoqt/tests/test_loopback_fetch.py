@@ -130,7 +130,7 @@ def _make_fetch_handler(cache: FetchTestCache):
                     publisher_priority=128,
                     payload=payload,
                 )
-                buf = obj.serialize(draft=session._draft)
+                buf = obj.serialize(prof=session._profile)
                 session.stream_write(stream_id, buf.data)
 
         # FIN the stream
@@ -531,7 +531,7 @@ async def test_fetch_cancel_mid_stream(use_quic):
                     group_id=g, subgroup_id=0, object_id=o,
                     publisher_priority=128, payload=payload,
                 )
-                buf = obj.serialize(draft=session._draft)
+                buf = obj.serialize(prof=session._profile)
                 try:
                     session.stream_write(stream_id, buf.data)
                 except Exception:

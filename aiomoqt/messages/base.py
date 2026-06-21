@@ -3,7 +3,7 @@ from typing import Any, Optional, Union, Dict
 from dataclasses import dataclass, field, fields
 
 from . import ParamType, SetupParamType, AuthTokenAliasType, AuthTokenType
-from ..context import profile_for
+from ..context import DraftProfile
 from ..types import MOQTProtocolViolation
 from ..utils.buffer import Buffer, BufferReadError
 from ..utils.logger import *
@@ -373,7 +373,8 @@ class MOQTMessage:
     
     @staticmethod
     def _serialize_params(payload: Buffer, parameters: Dict[int, Any],
-                          *, draft: int, delta_keys: bool = None) -> None:
+                          *, prof: DraftProfile,
+                          delta_keys: bool = None) -> None:
         """
         Serialize parameters using Key-Value-Pair structure. Payload is modified in place.
 
@@ -384,7 +385,6 @@ class MOQTMessage:
         delta_keys defaults from the draft's profile (d16+ sorts keys
         and writes deltas: key_on_wire = key - previous_key).
         """
-        prof = profile_for(draft)
         # Tag the buffer's varint flavor so push_vint encodes vi64 (d18) or
         # RFC9000 (pre-d18). All control integers except the 16-bit message
         # Length go through push_vint.
@@ -435,7 +435,7 @@ class MOQTMessage:
 
 
     @staticmethod
-    def _deserialize_params(buf: Buffer, *, draft: int,
+    def _deserialize_params(buf: Buffer, *, prof: DraftProfile,
                             buf_end: Optional[int] = None,
                             delta_keys: bool = None) -> Dict[int, Any]:
         """
@@ -450,7 +450,6 @@ class MOQTMessage:
         Returns:
             Dict mapping parameter type to value
         """
-        prof = profile_for(draft)
         # Tag the buffer's varint flavor so pull_vint decodes vi64 (d18) or
         # RFC9000 (pre-d18). Only the 16-bit message Length is fixed-width.
         buf.vi64 = prof.vi64
@@ -517,13 +516,13 @@ class MOQTMessage:
 
     @staticmethod
     def _serialize_kvp_to_end(payload: Buffer, kvps: Dict[int, Any],
-                              *, draft: int) -> None:
+                              *, prof: DraftProfile) -> None:
         """Serialize Key-Value-Pairs (Figure 2) with NO count prefix —
         d18 Setup Options (§10.3) run to the message Length. Keys are
         ascending delta-coded; even Type = varint Value, odd Type =
         Length-prefixed bytes. Varint width follows the draft profile
         (vi64 for d18+). AUTH_TOKEN Token wrapping is not handled here."""
-        payload.vi64 = profile_for(draft).vi64
+        payload.vi64 = prof.vi64
         prev_key = 0
         for key, value in sorted(kvps.items()):
             payload.push_vint(key - prev_key)
@@ -543,12 +542,12 @@ class MOQTMessage:
                 payload.push_vint(value)
 
     @staticmethod
-    def _deserialize_kvp_to_end(buf: Buffer, *, draft: int,
+    def _deserialize_kvp_to_end(buf: Buffer, *, prof: DraftProfile,
                                 buf_end: int) -> Dict[int, Any]:
         """Deserialize count-less delta-coded Key-Value-Pairs (Figure 2)
         to buf_end — d18 Setup Options. Mirror of _serialize_kvp_to_end.
         Over-reads past buf_end raise MOQTProtocolViolation."""
-        buf.vi64 = profile_for(draft).vi64
+        buf.vi64 = prof.vi64
         kvps: Dict[int, Any] = {}
         prev_key = 0
         while buf.tell() < buf_end:

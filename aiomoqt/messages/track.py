@@ -16,7 +16,7 @@ from . import (MOQTUnderflow, MOQTMessage, ObjectStatus, DataStreamType,
                MOQT_DEFAULT_PRIORITY, BUF_SIZE,
                SUBGROUP_HEADER_BASE, SUBGROUP_ID_ZERO, SUBGROUP_ID_FIRST_OBJ, SUBGROUP_ID_EXPLICIT,
                OBJECT_DATAGRAM_BASE, OBJECT_DATAGRAM_STATUS_BASE)
-from ..context import is_draft16_or_later, profile_for
+from ..context import is_draft16_or_later, DraftProfile
 from ..utils.buffer import Buffer, BufferReadError
 from ..utils.logger import get_logger
 from aiopquic._binding._streamchain import (
@@ -95,10 +95,10 @@ class SubgroupHeader(MOQTMessage):
     # d18 FIRST_OBJECT bit (0x40): the first object on this stream is the
     # first object published in the subgroup. Parsed, not yet emitted.
     first_object: bool = False
-    # Negotiated draft for this stream; selects the integer codec (vi64
-    # for d18, RFC9000 otherwise) for the header and its objects. None
-    # keeps the pre-d18 RFC9000 path.
-    draft: Optional[int] = None
+    # Negotiated draft profile for this stream; selects the integer codec
+    # (vi64 for d18, RFC9000 otherwise) for the header and its objects.
+    # None keeps the pre-d18 RFC9000 path.
+    prof: Optional[DraftProfile] = None
     # Runtime parser state for object-id delta decoding within this
     # subgroup; not on the wire. Declared as a field so slots=True
     # admits the per-instance assignment in __post_init__.
@@ -112,8 +112,7 @@ class SubgroupHeader(MOQTMessage):
 
     def __post_init__(self):
         self.type = SUBGROUP_HEADER_BASE
-        self._vi64 = (self.draft is not None and
-                      profile_for(self.draft).varint == "vi64")
+        self._vi64 = self.prof is not None and self.prof.vi64
 
     def _compute_type(self) -> int:
         """Compute wire type byte from flags."""
@@ -224,7 +223,7 @@ class SubgroupHeader(MOQTMessage):
 
     @classmethod
     def deserialize(cls, buf: Buffer, type_val: int,
-                    draft: Optional[int] = None) -> 'SubgroupHeader':
+                    prof: Optional[DraftProfile] = None) -> 'SubgroupHeader':
         """Deserialize SubgroupHeader from wire, given the already-read type byte.
 
         d16 adds bit 5 (0x20 = DEFAULT_PRIORITY): when set, the Priority
@@ -233,7 +232,7 @@ class SubgroupHeader(MOQTMessage):
         header fields. Type ranges: d14 = 0x10-0x1D, d16 += 0x30-0x3D,
         d18 += 0x50-0x5D / 0x70-0x7D.
         """
-        vi64 = draft is not None and profile_for(draft).varint == "vi64"
+        vi64 = prof is not None and prof.vi64
         pull = buf.pull_uint_vi64 if vi64 else buf.pull_uint_var
         extensions_present = bool(type_val & 0x01)
         subgroup_id_mode = (type_val >> 1) & 0x03
@@ -264,7 +263,7 @@ class SubgroupHeader(MOQTMessage):
             extensions_present=extensions_present,
             end_of_group=end_of_group,
             first_object=first_object,
-            draft=draft,
+            prof=prof,
             subgroup_id_mode=subgroup_id_mode,
         )
 
@@ -489,8 +488,8 @@ class FetchObject(MOQTMessage):
     # d16 only: end-of-range marker flag (0x8C or 0x10C)
     end_of_range: Optional[int] = None
 
-    def serialize(self, *, draft: int) -> Buffer:
-        if is_draft16_or_later(draft):
+    def serialize(self, *, prof: DraftProfile) -> Buffer:
+        if is_draft16_or_later(prof.draft):
             return self._serialize_d16()
         return self._serialize_d14()
 
@@ -550,8 +549,8 @@ class FetchObject(MOQTMessage):
     @classmethod
     def deserialize(cls, buf: Buffer,
                     prior: Optional['FetchObject'] = None,
-                    *, draft: int) -> 'FetchObject':
-        if is_draft16_or_later(draft):
+                    *, prof: DraftProfile) -> 'FetchObject':
+        if is_draft16_or_later(prof.draft):
             return cls._deserialize_d16(buf, prior)
         return cls._deserialize_d14(buf)
 
@@ -690,8 +689,8 @@ class ObjectDatagram(MOQTMessage):
     def __post_init__(self):
         self.type = OBJECT_DATAGRAM_BASE
 
-    def serialize(self, draft: Optional[int] = None) -> Buffer:
-        vi64 = draft is not None and profile_for(draft).varint == "vi64"
+    def serialize(self, prof: Optional[DraftProfile] = None) -> Buffer:
+        vi64 = prof is not None and prof.vi64
         has_extensions = self.extensions is not None and len(self.extensions) > 0
         no_object_id = (self.object_id == 0)
         is_status = self.status != ObjectStatus.NORMAL
@@ -739,9 +738,9 @@ class ObjectDatagram(MOQTMessage):
 
     @classmethod
     def deserialize(cls, buf: Buffer, buf_len: int, type_val: int = 0x00,
-                    draft: Optional[int] = None) -> 'ObjectDatagram':
+                    prof: Optional[DraftProfile] = None) -> 'ObjectDatagram':
         """Deserialize ObjectDatagram, given the already-read type byte."""
-        vi64 = draft is not None and profile_for(draft).varint == "vi64"
+        vi64 = prof is not None and prof.vi64
         pull = buf.pull_uint_vi64 if vi64 else buf.pull_uint_var
 
         extensions_present = bool(type_val & 0x01)

@@ -6,7 +6,7 @@ from dataclasses import fields
 import pytest
 
 from aiomoqt.messages import MOQTMessageType
-from aiomoqt.context import get_major_version
+from aiomoqt.context import get_major_version, profile_for
 
 
 def pytest_configure(config):
@@ -36,18 +36,19 @@ def pytest_configure(config):
 
 
 def _serialize(obj, draft):
-    """obj.serialize(), threading draft= only for classes whose
-    serialize takes it (control messages + FetchObject). The
-    draft-invariant data classes have no draft parameter."""
-    if 'draft' in inspect.signature(type(obj).serialize).parameters:
-        return obj.serialize(draft=draft)
+    """obj.serialize(), threading the resolved DraftProfile only for
+    classes whose serialize takes it (control messages + FetchObject +
+    SubgroupHeader/ObjectDatagram). The profile-invariant data classes
+    have no prof parameter."""
+    if 'prof' in inspect.signature(type(obj).serialize).parameters:
+        return obj.serialize(prof=profile_for(draft))
     return obj.serialize()
 
 
 def _deserialize(cls, *args, draft, **kwargs):
     """Mirror of _serialize for cls.deserialize()."""
-    if 'draft' in inspect.signature(cls.deserialize).parameters:
-        return cls.deserialize(*args, draft=draft, **kwargs)
+    if 'prof' in inspect.signature(cls.deserialize).parameters:
+        return cls.deserialize(*args, prof=profile_for(draft), **kwargs)
     return cls.deserialize(*args, **kwargs)
 
 

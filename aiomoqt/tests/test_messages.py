@@ -1295,7 +1295,7 @@ class TestFetchD14AllTypes:
 # Phase 3 — FetchObject round-trip matrix
 # ========================================================================
 
-from aiomoqt.context import get_major_version
+from aiomoqt.context import get_major_version, profile_for
 from aiomoqt.messages.track import (
     FETCH_FLAG_SG_ZERO, FETCH_FLAG_SG_PRIOR, FETCH_FLAG_SG_PRIOR_PLUS,
     FETCH_FLAG_SG_PRESENT, FETCH_FLAG_OBJECT_ID_PRESENT,
@@ -1308,9 +1308,9 @@ from aiomoqt.messages.track import (
 def _fetch_object_roundtrip(obj, version, prior=None):
     """Serialize and deserialize a FetchObject at the given draft."""
     draft = get_major_version(version)
-    buf = obj.serialize(draft=draft)
+    buf = obj.serialize(prof=profile_for(draft))
     buf.seek(0)
-    return FetchObject.deserialize(buf, prior=prior, draft=draft)
+    return FetchObject.deserialize(buf, prior=prior, prof=profile_for(draft))
 
 
 class TestFetchObjectD14:
@@ -1402,7 +1402,7 @@ class TestFetchObjectD16:
         buf.push_uint_var(4)   # payload_len
         buf.push_bytes(b'next')
         buf.seek(0)
-        result = FetchObject.deserialize(buf, prior=prior, draft=16)
+        result = FetchObject.deserialize(buf, prior=prior, prof=profile_for(16))
         assert result.object_id == 11
 
     def test_delta_group_id(self):
@@ -1423,7 +1423,7 @@ class TestFetchObjectD16:
         buf.push_uint_var(3)
         buf.push_bytes(b'dat')
         buf.seek(0)
-        result = FetchObject.deserialize(buf, prior=prior, draft=16)
+        result = FetchObject.deserialize(buf, prior=prior, prof=profile_for(16))
         assert result.group_id == 7  # from prior
 
     def test_delta_priority(self):
@@ -1444,7 +1444,7 @@ class TestFetchObjectD16:
         buf.push_uint_var(2)
         buf.push_bytes(b'ab')
         buf.seek(0)
-        result = FetchObject.deserialize(buf, prior=prior, draft=16)
+        result = FetchObject.deserialize(buf, prior=prior, prof=profile_for(16))
         assert result.publisher_priority == 42  # from prior
 
     def test_subgroup_mode_zero(self):
@@ -1463,7 +1463,7 @@ class TestFetchObjectD16:
         buf.push_uint_var(0)
         buf.push_uint_var(ObjectStatus.END_OF_GROUP)
         buf.seek(0)
-        result = FetchObject.deserialize(buf, prior=None, draft=16)
+        result = FetchObject.deserialize(buf, prior=None, prof=profile_for(16))
         assert result.subgroup_id == 0
 
     def test_subgroup_mode_prior(self):
@@ -1483,7 +1483,7 @@ class TestFetchObjectD16:
         buf.push_uint_var(1)
         buf.push_bytes(b'x')
         buf.seek(0)
-        result = FetchObject.deserialize(buf, prior=prior, draft=16)
+        result = FetchObject.deserialize(buf, prior=prior, prof=profile_for(16))
         assert result.subgroup_id == 7  # from prior
 
     def test_subgroup_mode_prior_plus(self):
@@ -1503,7 +1503,7 @@ class TestFetchObjectD16:
         buf.push_uint_var(1)
         buf.push_bytes(b'y')
         buf.seek(0)
-        result = FetchObject.deserialize(buf, prior=prior, draft=16)
+        result = FetchObject.deserialize(buf, prior=prior, prof=profile_for(16))
         assert result.subgroup_id == 8  # prior + 1
 
     def test_datagram_pref(self):
@@ -1521,7 +1521,7 @@ class TestFetchObjectD16:
         buf.push_uint_var(4)
         buf.push_bytes(b'dgrm')
         buf.seek(0)
-        result = FetchObject.deserialize(buf, prior=None, draft=16)
+        result = FetchObject.deserialize(buf, prior=None, prof=profile_for(16))
         assert result.subgroup_id == 0
 
     def test_end_of_range_non_existent(self):
@@ -1573,7 +1573,7 @@ class TestFetchObjectD16:
         buf.push_bytes(b'x')
         buf.seek(0)
         with pytest.raises(ValueError, match="first object"):
-            FetchObject.deserialize(buf, prior=None, draft=16)
+            FetchObject.deserialize(buf, prior=None, prof=profile_for(16))
 
     def test_invalid_flags_high_bit(self):
         """Flags >= 0x80 (excluding known end-of-range) → ValueError."""
@@ -1584,7 +1584,7 @@ class TestFetchObjectD16:
         buf.push_uint_var(0)
         buf.seek(0)
         with pytest.raises(ValueError, match="invalid serialization flags"):
-            FetchObject.deserialize(buf, prior=None, draft=16)
+            FetchObject.deserialize(buf, prior=None, prof=profile_for(16))
 
 
 # ========================================================================

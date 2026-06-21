@@ -55,7 +55,7 @@ def _make_subscribe_handler(n_objects):
         header = SubgroupHeader(
             track_alias=track_alias, group_id=_GROUP, subgroup_id=0,
             publisher_priority=128, extensions_present=False,
-            draft=session._draft,
+            prof=session._profile,
         )
         session.stream_write(stream_id, header.serialize().data)
         for obj_id in range(n_objects):

@@ -9,6 +9,7 @@ drafts.
 import pytest
 
 from aiomoqt.messages.base import MOQTMessage
+from aiomoqt.context import profile_for
 from aiomoqt.messages.session_setup import ServerSetup
 from aiomoqt.types import MOQTProtocolViolation, SessionCloseCode
 from aiomoqt.utils.buffer import Buffer
@@ -31,7 +32,7 @@ def test_param_count_overrun_raises(draft):
     buf.push_uint_var(2)
     buf.seek(0)
     with pytest.raises(MOQTProtocolViolation):
-        MOQTMessage._deserialize_params(buf, draft=draft, buf_end=end)
+        MOQTMessage._deserialize_params(buf, prof=profile_for(draft), buf_end=end)
 
 
 @pytest.mark.parametrize("draft", [14, 16])
@@ -45,7 +46,7 @@ def test_param_length_overrun_raises(draft):
     end = buf.tell()
     buf.seek(0)
     with pytest.raises(MOQTProtocolViolation):
-        MOQTMessage._deserialize_params(buf, draft=draft, buf_end=end)
+        MOQTMessage._deserialize_params(buf, prof=profile_for(draft), buf_end=end)
 
 
 def test_setup_with_short_length_raises():
@@ -61,7 +62,7 @@ def test_setup_with_short_length_raises():
     buf.push_uint_var(2)
     buf.seek(0)
     with pytest.raises(MOQTProtocolViolation):
-        ServerSetup.deserialize(buf, draft=16, buf_end=end)
+        ServerSetup.deserialize(buf, prof=profile_for(16), buf_end=end)
 
 
 @pytest.mark.parametrize("draft", [14, 16])
@@ -69,8 +70,8 @@ def test_well_formed_params_round_trip(draft):
     """Sanity: params that fit exactly within buf_end parse cleanly
     (encode + decode under the same draft so key coding matches)."""
     buf = Buffer(capacity=64)
-    MOQTMessage._serialize_params(buf, {0x20: 7, 0x22: 1}, draft=draft)
+    MOQTMessage._serialize_params(buf, {0x20: 7, 0x22: 1}, prof=profile_for(draft))
     end = buf.tell()
     buf.seek(0)
-    params = MOQTMessage._deserialize_params(buf, draft=draft, buf_end=end)
+    params = MOQTMessage._deserialize_params(buf, prof=profile_for(draft), buf_end=end)
     assert params == {0x20: 7, 0x22: 1}

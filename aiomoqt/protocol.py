@@ -522,7 +522,7 @@ class _MOQTSessionMixin:
             # in PUBLISH / SUBSCRIBE_OK / FETCH_OK) know where to stop
             # instead of reading past the payload. Other message types
             # accept and ignore it for signature uniformity.
-            msg = message_class.deserialize(buf, draft=self._draft, buf_end=end_pos)
+            msg = message_class.deserialize(buf, prof=self._profile, buf_end=end_pos)
             # d18 replies omit the Request ID (demuxed by request stream);
             # inject the stream-bound id so handlers key on it unchanged.
             if (request_id is not None and
@@ -925,7 +925,7 @@ class _MOQTSessionMixin:
                         SessionCloseCode.NO_ERROR, "padding stream drained")
                 elif is_subgroup:
                     msg_header = SubgroupHeader.deserialize(
-                        buf, type_val=stream_type, draft=self._draft)
+                        buf, type_val=stream_type, prof=self._profile)
                     data_type = "SUBGROUP_HEADER"
                     self._admit_subgroup_stream(stream_id, msg_header)
                 elif stream_type == DataStreamType.FETCH_HEADER:
@@ -993,7 +993,7 @@ class _MOQTSessionMixin:
 
                 elif isinstance(parser, FetchHeader):
                     fh: FetchHeader = parser
-                    msg_header = FetchObject.deserialize(buf, prior=fh._prior_obj, draft=self._draft)
+                    msg_header = FetchObject.deserialize(buf, prior=fh._prior_obj, prof=self._profile)
                     # Track prior object for d16 delta-encoded references
                     if msg_header.end_of_range is None:
                         fh._prior_obj = msg_header
@@ -1026,7 +1026,7 @@ class _MOQTSessionMixin:
             return self._moqt_handle_data_dgram_d18(buf, pos, dgram_type)
         # Draft-14: ObjectDatagram types 0x00-0x07 (payload datagrams)
         if 0x00 <= dgram_type <= 0x07:
-            msg = ObjectDatagram.deserialize(buf, buf.capacity, type_val=dgram_type)
+            msg = ObjectDatagram.deserialize(buf, buf.capacity, type_val=dgram_type, prof=self._profile)
             if msg is None:
                 error = f"datagram parsing failed at: {buf.tell()}"
                 logger.error(f"MOQT error: " + error)
@@ -1091,7 +1091,7 @@ class _MOQTSessionMixin:
             self._close_session(SessionCloseCode.PROTOCOL_VIOLATION, error)
             return
         msg = ObjectDatagram.deserialize(
-            buf, buf.capacity, type_val=dgram_type, draft=self._draft)
+            buf, buf.capacity, type_val=dgram_type, prof=self._profile)
         if msg is None:
             error = f"datagram parsing failed at: {buf.tell()}"
             logger.error(f"MOQT error: " + error)
@@ -1606,13 +1606,13 @@ class _MOQTSessionMixin:
     def send_control_message(self, msg: MOQTMessage) -> None:
         """Serialize and send a MoQT control message on the control
         stream. Serialization happens here at the session's negotiated
-        draft (`self._draft`), so call sites pass the message object and
-        never thread draft= — they cannot forget it or pass the wrong
+        profile (`self._profile`), so call sites pass the message object
+        and never thread prof= — they cannot forget it or pass the wrong
         one."""
         if self._quic is None or self._control_write_stream_id is None:
             raise MOQTException(SessionCloseCode.INTERNAL_ERROR,
                                 "control stream not initialized")
-        buf = msg.serialize(draft=self._draft)
+        buf = msg.serialize(prof=self._profile)
         logger.debug(f"QUIC send: control message: {buf.tell()} bytes")
         self._quic.send_stream_data(
             stream_id=self._control_write_stream_id,
@@ -1624,8 +1624,17 @@ class _MOQTSessionMixin:
         """Serialize and send a MoQT message on a per-request bidi
         stream (d16+ SUBSCRIBE_NAMESPACE response routing). Like
         send_control_message, serialization happens here at the session
-        draft so callers never thread draft=."""
-        self.stream_write(stream_id, msg.serialize(draft=self._draft).data)
+        profile so callers never thread prof=."""
+        self.stream_write(stream_id, msg.serialize(prof=self._profile).data)
+
+    def subgroup_header(self, track_alias: int, group_id: int,
+                        **kwargs) -> SubgroupHeader:
+        """Build a SubgroupHeader bound to this session's negotiated draft
+        profile — the data-plane mirror of send_control_message. Higher
+        APIs (Track, apps) call this and never thread draft/profile; the
+        header's serialize()/next_object* then use the baked-in codec."""
+        return SubgroupHeader(track_alias=track_alias, group_id=group_id,
+                              prof=self._profile, **kwargs)
 
     def _send_reply(self, request_id: int, msg: MOQTMessage) -> None:
         """Send a response to a request. In d18 responses travel on the

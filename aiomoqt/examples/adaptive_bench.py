@@ -1372,7 +1372,6 @@ async def run_publisher_client(host: str, port: int, path: str,
                 group_size=args.group_size,
                 num_subgroups=args.scenario.subgroups,
                 rate=state.rate_ops,
-                draft=args.draft,
             )
             track._quiet = True
             track._stats_header_printed = True
