@@ -18,7 +18,7 @@ __all__ = [
     'PublishNamespace', 'PublishNamespaceOk', 'PublishNamespaceError',
     'PublishNamespaceDone', 'PublishNamespaceCancel',
     'SubscribeNamespace', 'SubscribeNamespaceOk', 'SubscribeNamespaceError',
-    'UnsubscribeNamespace',
+    'UnsubscribeNamespace', 'SubscribeTracks', 'PublishBlocked',
     'Fetch', 'FetchObject', 'FetchOk', 'FetchError', 'FetchCancel',
     'SubgroupHeader', 'FetchHeader',
     'ObjectDatagram', 'ObjectDatagramStatus', 'ObjectHeader',

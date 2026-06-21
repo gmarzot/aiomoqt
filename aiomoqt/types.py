@@ -2,12 +2,28 @@ from enum import IntEnum
 
 MOQT_VERSION_DRAFT14 = 0xff00000e
 MOQT_VERSION_DRAFT16 = 0xff000010
+MOQT_VERSION_DRAFT18 = 0xff000012
 
+# Legacy d14 in-band offer list (CLIENT_SETUP versions[]). d16+ negotiate
+# out-of-band via ALPN / WT-Protocol, so d18 is intentionally NOT added
+# here — the set of drafts we can speak is MOQTDraft, below.
 MOQT_VERSIONS = [
     MOQT_VERSION_DRAFT14,
     MOQT_VERSION_DRAFT16,
 ]
 MOQT_CUR_VERSION = MOQT_VERSION_DRAFT14  # default; set per-session
+
+
+class MOQTDraft(IntEnum):
+    """Supported MoQT draft numbers — the canonical version form for the
+    high/mid layers (dispatch-table keys, supported_drafts, the draft=
+    kwarg). The IETF wire code is MOQT_VERSION_DRAFT*; the ALPN is
+    moqt_alpn_for_version().
+    """
+    DRAFT_14 = 14
+    DRAFT_16 = 16
+    DRAFT_18 = 18
+
 
 # ALPN: draft-14 uses legacy "moq-00"; draft-16+ uses "moqt-NN"
 MOQT_ALPN_LEGACY = "moq-00"
@@ -46,52 +62,75 @@ def moqt_version_from_draft(draft: int) -> int:
     callers passing the full hex form like 0xff000010 hit this) or
     if the draft number is not one aiomoqt knows how to speak.
     """
-    supported = sorted(v & 0xff for v in MOQT_VERSIONS)
+    # The set of drafts we can speak is MOQTDraft (not MOQT_VERSIONS,
+    # which is only the legacy d14 in-band offer list).
+    supported = sorted(int(d) for d in MOQTDraft)
     if not isinstance(draft, int) or draft < 0 or draft > 0xff:
         raise ValueError(
             f"MOQT draft must be a small integer (e.g. {supported}); "
             f"got {draft!r}. Pass the draft number, not the IETF "
             f"version code."
         )
-    full = 0xff000000 | (draft & 0xff)
-    if full not in MOQT_VERSIONS:
+    if draft not in supported:
         raise ValueError(
             f"MOQT draft {draft} not supported. "
             f"Supported drafts: {supported}"
         )
-    return full
+    return 0xff000000 | (draft & 0xff)
+
+
+def parse_draft_spec(s: str):
+    """Parse a ``--draft`` CLI value into a pin or an ordered offer set.
+
+        '16'        -> 16            (pin: offer only that ALPN)
+        '18,16,14'  -> [18, 16, 14]  (offer the set, in preference order)
+
+    The result is passed straight to ``MOQTClient`` / ``MOQTServer``'s
+    ``supported_drafts`` (which accepts an int or an ordered list). Order
+    is preserved so a caller can put a relay's preferred draft first (some
+    relays select the first offered ALPN rather than the highest mutual).
+    """
+    parts = [int(p) for p in str(s).split(",") if p.strip()]
+    if not parts:
+        raise ValueError(f"empty --draft value: {s!r}")
+    return parts[0] if len(parts) == 1 else parts
+
 
 
 def normalize_supported_drafts(supported_drafts) -> list:
     """Normalize the public `supported_drafts` argument to a non-empty
-    list of plain draft NUMBERS (e.g. [16, 14]), newest draft first.
+    list of plain draft NUMBERS.
 
     Accepts the forms the public API allows:
-      - None        → offer every supported draft (the "auto" offer,
-                       preserving the historical draft_version=None path)
+      - None        → offer every supported draft, newest first (the
+                       "auto" offer)
       - int         → a single draft number, e.g. 16 → [16]
-      - list[int]   → several draft numbers, e.g. [16, 14]
+      - list[int]   → several draft numbers, e.g. [16, 14]; the caller's
+                      order is preserved (deduped), so a caller can put a
+                      relay's preferred draft first — some relays select
+                      the first offered ALPN rather than the highest mutual.
 
     Drafts stay as representation-independent ints throughout the
     codebase; the wire forms (the moq-00 / moqt-16 ALPN and the
-    0xff0000NN IETF version code) are only ever translated when building
-    or parsing wire SETUP messages and ALPN. Each entry is validated via
+    0xff0000NN IETF version code) are only translated when building or
+    parsing wire SETUP / ALPN. Each entry is validated via
     moqt_version_from_draft (so the full hex form or an unknown draft
-    raises ValueError at the API boundary), then sorted newest-first —
-    the order ALPN / CLIENT_SETUP should offer versions in.
+    raises ValueError at the API boundary). The resulting order is the
+    order ALPN / CLIENT_SETUP / WT-Available-Protocols offer versions in.
     """
-    supported = sorted((v & 0xff for v in MOQT_VERSIONS), reverse=True)
     if supported_drafts is None:
-        return supported
+        # auto: every supported draft, newest first
+        return sorted((v & 0xff for v in MOQT_VERSIONS), reverse=True)
     if isinstance(supported_drafts, int):
         supported_drafts = [supported_drafts]
-    drafts = set()
+    drafts = []
     for d in supported_drafts:
         moqt_version_from_draft(d)  # validate (raises on hex form / unknown)
-        drafts.add(d)
+        if d not in drafts:
+            drafts.append(d)  # dedupe, preserve caller order
     if not drafts:
         raise ValueError("supported_drafts must name at least one draft")
-    return sorted(drafts, reverse=True)
+    return drafts
 
 
 MOQT_DEFAULT_PRIORITY = 128
@@ -110,6 +149,7 @@ class MOQTMessageType(IntEnum):
     # -- Common (same semantics in both drafts) --
     CLIENT_SETUP = 0x20
     SERVER_SETUP = 0x21
+    SETUP = 0x2F00  # d18: symmetric SETUP; also the control uni-stream type
     SUBSCRIBE_UPDATE = 0x02  # d14: SUBSCRIBE_UPDATE; d16: REQUEST_UPDATE (same code point)
     SUBSCRIBE = 0x03
     SUBSCRIBE_OK = 0x04
@@ -154,6 +194,16 @@ class D16MessageType:
     REQUEST_OK = 0x07           # was PUBLISH_NAMESPACE_OK
     NAMESPACE = 0x08            # was PUBLISH_NAMESPACE_ERROR
     NAMESPACE_DONE = 0x0E       # was TRACK_STATUS_OK
+
+
+class D18MessageType:
+    """Draft-18 message type code points that are new or renumbered.
+    Kept separate from MOQTMessageType because PUBLISH_BLOCKED reuses the
+    d14 TRACK_STATUS_ERROR point (0x0F); per-draft CONTROL_REGISTRY tables
+    disambiguate by the negotiated draft."""
+    SUBSCRIBE_NAMESPACE = 0x50  # was 0x11 in d14/d16
+    SUBSCRIBE_TRACKS = 0x51     # new in d18
+    PUBLISH_BLOCKED = 0x0F      # new in d18 (d14 TRACK_STATUS_ERROR point)
 
 
 class ParamType(IntEnum):
@@ -225,6 +275,14 @@ class AuthTokenAliasType(IntEnum):
     REGISTER = 0x1    # Alias + Type + Value — register alias for reuse
     USE_ALIAS = 0x2   # Alias only — use previously registered token
     USE_VALUE = 0x3   # Type + Value only — one-shot, no alias
+
+
+class AuthTokenType(IntEnum):
+    """Authorization Token Type — the numeric Token-payload identifier in
+    the Token structure (§8.2.1.1; IANA registry "MOQT Auth Token Type",
+    §15.6). Type 0 is reserved for a token whose type is not in the table
+    and is negotiated out-of-band; nonzero values are IANA-registered."""
+    OUT_OF_BAND = 0x0
 
 
 class SubscribeErrorCode(IntEnum):
@@ -337,6 +395,12 @@ class DataStreamType(IntEnum):
     FETCH_HEADER = 0x05
 
 
+# d18 PADDING (§11.5): a stream/datagram of these types is accepted and
+# discarded (flow control MUST keep moving).
+PADDING_STREAM_TYPE = 0x132B3E28
+PADDING_DATAGRAM_TYPE = 0x132B3E29
+
+
 # Draft-14 SubgroupHeader type range: 0x10-0x1D (12 valid types, 0x16-0x17 reserved)
 # Bits: 0=extensions_present, 1-2=subgroup_id_mode, 3=end_of_group
 SUBGROUP_HEADER_BASE = 0x10
@@ -361,6 +425,17 @@ class MOQTException(Exception):
         self.error_code = error_code
         self.reason_phrase = reason_phrase
         super().__init__(f"{reason_phrase} ({error_code})")
+
+
+class MOQTProtocolViolation(MOQTException):
+    """Receiver-detected wire-format violation: a control-frame Length
+    that doesn't match its payload extent, parameters that overrun the
+    message frame, or an unknown control code point. Maps to session
+    close code PROTOCOL_VIOLATION; the dispatcher catches it and closes
+    the session.
+    """
+    def __init__(self, reason_phrase: str = ""):
+        super().__init__(SessionCloseCode.PROTOCOL_VIOLATION, reason_phrase)
 
 
 class MOQTRequestError(Exception):

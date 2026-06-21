@@ -10,7 +10,6 @@ from .protocol import (
     DEFAULT_TX_MAX_INFLIGHT_BYTES,
 )
 from .types import moqt_alpn_for_version, normalize_supported_drafts
-from .context import set_moqt_ctx_version
 from .utils.logger import *
 
 logger = get_logger(__name__)
@@ -79,13 +78,6 @@ class MOQTClient(MOQTPeer):
         # UDP SO_RCVBUF/SO_SNDBUF request (bytes). None = aiopquic
         # default (64 MiB, kernel-clamped to rmem_max/wmem_max).
         self.socket_buffer_size = socket_buffer_size
-
-        # A single offered draft pins the encoding context now (matches
-        # the historical explicit-draft path). With several drafts (or
-        # the auto offer) the context is set from the negotiated version
-        # once ALPN / WT negotiation resolves it.
-        if len(self.supported_drafts) == 1:
-            set_moqt_ctx_version(self.supported_drafts[0])
 
         logger.debug(
             f"MOQT: client session: {self} use_quic={use_quic} path={path}")
@@ -191,20 +183,18 @@ class MOQTClient(MOQTPeer):
             qlog_dir=wt_cfg.qlog_dir,
         )
         # MoQT draft over WebTransport: the ALPN is "h3", so unlike raw
-        # QUIC it carries no MoQT version — we resolve it here. We pick
-        # the newest offered draft (supported_drafts is sorted newest
-        # first); for a single offered draft that is that draft, and for
-        # the auto offer it is the latest supported draft (matching the
-        # historical behavior). Drafts >= 15 advertise the version in
-        # WT-Available-Protocols ("moqt-NN", per moq-transport-16 §3.1);
-        # d14 uses the legacy in-band CLIENT_SETUP path. Either way the
-        # encoding context is set to match so the peer's ServerSetup
-        # (and every message after) parses under the right draft.
+        # QUIC it carries no MoQT version — it is negotiated in-band via
+        # WT-Available-Protocols -> WT-Protocol. Offer every applicable
+        # draft as a subprotocol in the caller's preference order; the
+        # server selects one and the session locks its draft from that
+        # selection (in client_session_init). Drafts >= 15 advertise via
+        # "moqt-NN" (per moq-transport-16 §3.1); d14 uses the legacy
+        # in-band CLIENT_SETUP path (no subprotocol). wt_draft (the first
+        # offered) is the pre-negotiation guess stamped below; for a
+        # multi-draft offer the WT-Protocol selection overrides it.
         wt_draft = self.supported_drafts[0]
-        set_moqt_ctx_version(wt_draft)
-        wt_protocols = None
-        if wt_draft >= 15:
-            wt_protocols = [f"moqt-{wt_draft:d}"]
+        wt_protocols = [f"moqt-{d}" for d in self.supported_drafts
+                        if d >= 15] or None
         session = MOQTSessionWTClient(
             transport,
             self.host, self.port, self.path or "",

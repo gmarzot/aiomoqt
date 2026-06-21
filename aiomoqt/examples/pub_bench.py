@@ -19,6 +19,7 @@ import asyncio
 import logging
 
 from aiomoqt.client import MOQTClient
+from aiomoqt.types import parse_draft_spec
 from aiomoqt.track import PublishedTrack, TrackState
 from aiomoqt.utils import wait_cond_timeout
 from aiomoqt.utils.logger import set_log_level, get_logger
@@ -105,7 +106,7 @@ examples:
     parser.add_argument('--keylogfile', type=str, default=None)
     parser.add_argument('-k', '--insecure', action='store_true',
                         help='Skip TLS certificate verification')
-    parser.add_argument('--draft', type=int, default=None,
+    parser.add_argument('--draft', type=parse_draft_spec, default=None,
                         help='MoQT draft version (e.g. 14, 16)')
     parser.add_argument('--cc-algo', type=str, default=None,
                         help='Congestion control algorithm '
@@ -196,7 +197,6 @@ async def run(args):
                 group_size=args.group_size,
                 num_subgroups=args.streams,
                 rate=args.rate,
-                draft=args.draft,
             )
             await track.publish(
                 announce_namespace=(args.pub_ns or args.pub_both),

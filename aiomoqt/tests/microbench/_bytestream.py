@@ -7,12 +7,11 @@ the bench can chunk and feed.
 """
 from __future__ import annotations
 
-from aiomoqt.context import set_moqt_ctx_version
 from aiomoqt.messages import ObjectStatus
+from aiomoqt.context import profile_for
 from aiomoqt.messages.track import (
     SubgroupHeader, FetchHeader, FetchObject,
 )
-from aiomoqt.types import MOQT_VERSION_DRAFT16
 
 
 def make_subgroup_stream(
@@ -28,7 +27,6 @@ def make_subgroup_stream(
     payload_size is the length of each object's payload. Returns the
     concatenated bytes ready to feed to the parser.
     """
-    set_moqt_ctx_version(MOQT_VERSION_DRAFT16)
     sg = SubgroupHeader(
         track_alias=track_alias,
         group_id=group_id,
@@ -46,20 +44,17 @@ def make_subgroup_stream(
 def make_fetch_stream(n_objects: int, payload_size: int,
                       *, request_id: int = 0) -> bytes:
     """Build a fetch stream: FETCH_HEADER + n FetchObjects."""
-    set_moqt_ctx_version(MOQT_VERSION_DRAFT16)
     fh = FetchHeader(request_id=request_id)
     out = bytearray()
     out += bytes(fh.serialize().data)
     payload = b"x" * payload_size
-    prev = None
     for i in range(n_objects):
         fo = FetchObject(
             group_id=0, subgroup_id=0, object_id=i,
             publisher_priority=128, extensions=None,
             status=ObjectStatus.NORMAL, payload=payload,
         )
-        out += bytes(fo.serialize(prev_obj=prev).data)
-        prev = fo
+        out += bytes(fo.serialize(prof=profile_for(16)).data)
     return bytes(out)
 
 

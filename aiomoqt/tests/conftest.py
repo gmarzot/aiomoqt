@@ -1,3 +1,4 @@
+import inspect
 import os
 import subprocess
 from dataclasses import fields
@@ -5,10 +6,7 @@ from dataclasses import fields
 import pytest
 
 from aiomoqt.messages import MOQTMessageType
-from aiomoqt.context import set_moqt_ctx_version, get_moqt_ctx_version
-from aiomoqt.types import (
-    MOQT_CUR_VERSION, MOQT_VERSION_DRAFT14, MOQT_VERSION_DRAFT16,
-)
+from aiomoqt.context import get_major_version, profile_for
 
 
 def pytest_configure(config):
@@ -37,14 +35,21 @@ def pytest_configure(config):
         pass  # openssl absent/failed → loopback suites skip as before
 
 
-@pytest.fixture(autouse=True)
-def _reset_moqt_version():
-    """Restore the global MoQT version context after each test.
-    Session tests (MOQTClient.connect) set the version as a side
-    effect; without this fixture the leaked state breaks later tests
-    that assume the default draft."""
-    yield
-    set_moqt_ctx_version(MOQT_CUR_VERSION)
+def _serialize(obj, draft):
+    """obj.serialize(), threading the resolved DraftProfile only for
+    classes whose serialize takes it (control messages + FetchObject +
+    SubgroupHeader/ObjectDatagram). The profile-invariant data classes
+    have no prof parameter."""
+    if 'prof' in inspect.signature(type(obj).serialize).parameters:
+        return obj.serialize(prof=profile_for(draft))
+    return obj.serialize()
+
+
+def _deserialize(cls, *args, draft, **kwargs):
+    """Mirror of _serialize for cls.deserialize()."""
+    if 'prof' in inspect.signature(cls.deserialize).parameters:
+        return cls.deserialize(*args, prof=profile_for(draft), **kwargs)
+    return cls.deserialize(*args, **kwargs)
 
 
 def moqt_test_id(case):
@@ -54,33 +59,35 @@ def moqt_test_id(case):
     """
     if not isinstance(case, (list, tuple)):
         return str(case)
-        
+
     cls = case[0]
     if not hasattr(cls, "__name__"):
         return str(cls)
-        
+
     # Check if a variant name is provided (position 4)
     if len(case) > 4 and case[4]:
         return f"{cls.__name__}_{case[4]}"
     return cls.__name__
 
-def moqt_message_serialization(cls, params, type_id=None, needs_len=False):
+def moqt_message_serialization(cls, params, type_id=None, needs_len=False,
+                               draft=14):
     """
     Test MOQT message class serialization/deserialization
-    
+
     Args:
         cls: MOQT message class
         params: Dictionary of parameters to initialize the class
         type_id: Expected type id (if any)
         needs_len: Whether deserialize needs the buffer length
+        draft: Draft number to (de)serialize under (default 14).
     """
     obj = cls(**params)
-    buf = obj.serialize()
+    buf = _serialize(obj, draft)
 
     buf_len = buf.tell()
     print(f"moqt_message_serialization: {cls.__name__} {buf_len}")
     buf.seek(0)
-    
+
     if type_id is not None:
         id = buf.pull_uint_var()
         assert id == type_id
@@ -89,14 +96,14 @@ def moqt_message_serialization(cls, params, type_id=None, needs_len=False):
     if isinstance(type_id, MOQTMessageType):
         msg_len = buf.pull_uint16()
         buf_end = buf.tell() + msg_len
-        new_obj = cls.deserialize(buf, buf_end=buf_end)
+        new_obj = _deserialize(cls, buf, draft=draft, buf_end=buf_end)
     elif needs_len:
-        new_obj = cls.deserialize(buf, buf_len)
+        new_obj = _deserialize(cls, buf, buf_len, draft=draft)
     else:
-        new_obj = cls.deserialize(buf)
-    
+        new_obj = _deserialize(cls, buf, draft=draft)
+
     # Compare all fields from the dataclass
-    for field in fields(cls):            
+    for field in fields(cls):
         original_value = getattr(obj, field.name)
         new_value = getattr(new_obj, field.name)
         print(f"moqt_message_serialization: original: {original_value}  new: {new_value}")
@@ -110,18 +117,18 @@ def moqt_message_serialization(cls, params, type_id=None, needs_len=False):
             assert original_value.keys() == new_value.keys(), f"`{field.name}` keys don't match"
             for key in original_value:
                 assert original_value[key] == new_value[key], f"`{field.name}` values don't match for key {key}"
-                
+
         elif isinstance(original_value, tuple):
             # Handle tuples of bytes (like namespace)
             assert isinstance(new_value, tuple), f"'{field.name}' expected tuple but got {type(new_value)}"
             assert len(original_value) == len(new_value), f"'{field.name}' tuples have different lengths"
-            
+
             for orig_item, new_item in zip(original_value, new_value):
                 assert orig_item == new_item, f"'{field.name}'  tuple : {orig_item} != {new_item}"
-    
+
         else:
             assert original_value == new_value, f"'{field.name}' doesn't match after deserialization"
-    
+
     return True
 
 
@@ -131,53 +138,53 @@ def moqt_message_serialization_versioned(cls, params, type_id=None,
     """Test serialization round-trip at a specific draft version.
 
     Args:
-        version: MOQT version code (e.g. MOQT_VERSION_DRAFT16)
+        version: MOQT version code (e.g. MOQT_VERSION_DRAFT16) or draft
+                 number; normalized to a draft number for the codec.
         skip_fields: set of field names to skip comparison (e.g. fields
                      that are None on wire in d16 but set in the input)
     """
-    prev = get_moqt_ctx_version()
-    if version is not None:
-        set_moqt_ctx_version(version)
-    try:
-        obj = cls(**params)
-        buf = obj.serialize()
-        buf_len = buf.tell()
-        buf.seek(0)
+    draft = get_major_version(version) if version is not None else 14
+    obj = cls(**params)
+    buf = _serialize(obj, draft)
+    buf_len = buf.tell()
+    buf.seek(0)
 
-        if type_id is not None:
-            id = buf.pull_uint_var()
-            assert id == type_id
-            # All control messages have uint16 length after type
-            msg_len = buf.pull_uint16()
-            buf_end = buf.tell() + msg_len
-            new_obj = cls.deserialize(buf, buf_end=buf_end)
-        elif needs_len:
-            new_obj = cls.deserialize(buf, buf_len)
+    if type_id is not None:
+        # Message Type uses the negotiated varint flavor (vi64 for d18,
+        # RFC9000 otherwise); the Length stays uint16 in all drafts
+        # (§10.1). pull_vint == pull_uint_var when vi64 is False, so this
+        # is unchanged for d14/d16.
+        buf.vi64 = profile_for(draft).vi64
+        id = buf.pull_vint()
+        assert id == type_id
+        msg_len = buf.pull_uint16()
+        buf_end = buf.tell() + msg_len
+        new_obj = _deserialize(cls, buf, draft=draft, buf_end=buf_end)
+    elif needs_len:
+        new_obj = _deserialize(cls, buf, buf_len, draft=draft)
+    else:
+        new_obj = _deserialize(cls, buf, draft=draft)
+
+    skip = skip_fields or set()
+    for field in fields(cls):
+        if field.name in skip:
+            continue
+        original_value = getattr(obj, field.name)
+        new_value = getattr(new_obj, field.name)
+        if original_value is None and new_value is None:
+            continue
+        if isinstance(original_value, dict):
+            assert (original_value or {}).keys() == (new_value or {}).keys(), \
+                f"`{field.name}` keys don't match"
+            for key in (original_value or {}):
+                assert original_value[key] == new_value[key], \
+                    f"`{field.name}` values don't match for key {key}"
+        elif isinstance(original_value, tuple):
+            assert isinstance(new_value, tuple)
+            assert len(original_value) == len(new_value)
+            for a, b in zip(original_value, new_value):
+                assert a == b, f"'{field.name}' tuple mismatch"
         else:
-            new_obj = cls.deserialize(buf)
-
-        skip = skip_fields or set()
-        for field in fields(cls):
-            if field.name in skip:
-                continue
-            original_value = getattr(obj, field.name)
-            new_value = getattr(new_obj, field.name)
-            if original_value is None and new_value is None:
-                continue
-            if isinstance(original_value, dict):
-                assert (original_value or {}).keys() == (new_value or {}).keys(), \
-                    f"`{field.name}` keys don't match"
-                for key in (original_value or {}):
-                    assert original_value[key] == new_value[key], \
-                        f"`{field.name}` values don't match for key {key}"
-            elif isinstance(original_value, tuple):
-                assert isinstance(new_value, tuple)
-                assert len(original_value) == len(new_value)
-                for a, b in zip(original_value, new_value):
-                    assert a == b, f"'{field.name}' tuple mismatch"
-            else:
-                assert original_value == new_value, \
-                    f"'{field.name}' doesn't match: {original_value} != {new_value}"
-        return True
-    finally:
-        set_moqt_ctx_version(prev)
+            assert original_value == new_value, \
+                f"'{field.name}' doesn't match: {original_value} != {new_value}"
+    return True

@@ -29,10 +29,9 @@ from aiomoqt.messages.track import (
     ObjectHeader, SubgroupHeader, SUBGROUP_ID_EXPLICIT,
 )
 from aiomoqt.types import (
-    MOQT_TIMESTAMP_EXT, MOQT_VERSION_DRAFT16, ObjectStatus,
+    MOQT_TIMESTAMP_EXT, ObjectStatus,
 )
 from aiomoqt.utils.buffer import Buffer
-from aiomoqt.context import set_moqt_ctx_version
 
 from ._stats import time_loop
 
@@ -325,9 +324,6 @@ def main() -> int:
     p.add_argument("--csv", default=None)
     p.add_argument("--draft", type=int, default=16)
     args = p.parse_args()
-
-    set_moqt_ctx_version(MOQT_VERSION_DRAFT16
-                         if args.draft == 16 else None)
 
     ext = bool(args.extensions)
     sz = args.object_size

@@ -35,7 +35,7 @@ from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
 from aiomoqt.track import PublishedTrack, SubscribedTrack
 from aiomoqt.types import (MOQT_TIMESTAMP_EXT, FilterType, MOQTMessageType,
-                           ObjectStatus)
+                           ObjectStatus, parse_draft_spec)
 from aiomoqt.utils.format import fmt_bps, fmt_ms
 from aiomoqt.utils.logger import set_log_level
 
@@ -1415,7 +1415,6 @@ async def run_publisher_client(host: str, port: int, path: str,
                 group_size=args.group_size,
                 num_subgroups=args.scenario.subgroups,
                 rate=state.rate_ops,
-                draft=args.draft,
             )
             track._quiet = True
             track._stats_header_printed = True
@@ -1490,7 +1489,7 @@ def parse_args():
                    help="cap; controller stops on signal first (default: 10000)")
     p.add_argument("--interval", type=float, default=5.0,
                    metavar="S", help="controller tick period seconds (default: 5)")
-    p.add_argument("--draft", type=int, default=None,
+    p.add_argument("--draft", type=parse_draft_spec, default=None,
                    help="MoQT draft version (14 or 16)")
     p.add_argument("-n", "--namespace", default="aiomoqt",
                    help="MoQT namespace (default: aiomoqt)")

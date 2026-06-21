@@ -17,6 +17,7 @@ from importlib.metadata import version
 
 from .context import *
 from .messages import *
+from .messages.d18 import Setup
 from .types import *
 from .utils.buffer import Buffer, BufferReadError
 from .utils.logger import *
@@ -80,7 +81,7 @@ class MOQTPeer:
                  tx_max_inflight_bytes: Optional[int] =
                      DEFAULT_TX_MAX_INFLIGHT_BYTES):
         #  message handlers
-        self._control_msg_handlers: Dict[int, Tuple[Type, Callable]] = {}
+        self._control_msg_handlers: Dict[int, Callable] = {}
         self.allow_optional_dgram = allow_optional_dgram
         self.libquicr_compat = libquicr_compat
         # Per-stream producer soft cap on bytes pending in the sc->tx
@@ -97,9 +98,10 @@ class MOQTPeer:
         self.tx_max_inflight_bytes = tx_max_inflight_bytes
 
     def register_handler(self, msg_type: int, handler: Callable) -> None:
-        """Register a custom message handler."""
-        (msg_class, _) = _MOQTSessionMixin.MOQT_CONTROL_MESSAGE_REGISTRY[msg_type]
-        self._control_msg_handlers[msg_type] = (msg_class, handler)
+        """Register a custom handler that overrides the default handler
+        for this message type. The message class is taken from the
+        session's negotiated draft at dispatch time."""
+        self._control_msg_handlers[msg_type] = handler
 
 
 @dataclass(slots=True)
@@ -148,11 +150,51 @@ class _MOQTSessionMixin:
                 return cfg.is_client
         return self.is_client
 
+    @property
+    def _control_write_stream_id(self) -> Optional[int]:
+        """Stream we write control messages on. d18 runs control over a
+        pair of uni streams (we write one, read the peer's); pre-d18 it
+        is the single bidi control stream."""
+        if self._profile.control_uni_pair:
+            return self._d18_control_write_sid
+        return self._control_stream_id
+
+    @property
+    def _control_read_stream_id(self) -> Optional[int]:
+        """Stream we read the peer's control messages from. See
+        _control_write_stream_id."""
+        if self._profile.control_uni_pair:
+            return self._d18_control_read_sid
+        return self._control_stream_id
+
+    @property
+    def negotiated_draft(self) -> int:
+        """Negotiated MoQT draft number for this session. Derived from
+        _profile (the single stored version field) so the two can never
+        drift; assigning it resolves _profile. The wire IETF version code
+        is materialized only when (de)serializing SETUP / building ALPN."""
+        prof = getattr(self, '_profile', None)
+        return prof.draft if prof is not None else get_major_version(MOQT_CUR_VERSION)
+
+    @negotiated_draft.setter
+    def negotiated_draft(self, value: int) -> None:
+        # _profile is the resolved effective DraftProfile for the session;
+        # every per-message codec lookup reads self._profile (a fast stored
+        # attribute on the data hot path). The draft is set once it is
+        # known: a single supported draft is pinned at __init__, otherwise
+        # it is locked when negotiation completes (ALPN / WT-Protocol).
+        self._profile = profile_for(value) if value is not None else None
+
     def __init__(self, *args, session: 'MOQTPeer', **kwargs):
         super().__init__(*args, **kwargs)
         self._session: MOQTPeer = session  # backref to session object with config
         self._session_id: Optional[int] = None
         self._control_stream_id: Optional[int] = None
+        # d18 control = pair of uni streams; pre-d18 the
+        # _control_write/read_stream_id properties both resolve to the
+        # single bidi _control_stream_id above.
+        self._d18_control_write_sid: Optional[int] = None
+        self._d18_control_read_sid: Optional[int] = None
         self._loop = asyncio.get_running_loop()
         self._wt_session_setup: Future[bool] = self._loop.create_future()
         # Raw-QUIC mode has no WT setup phase. Pre-resolve so
@@ -160,11 +202,16 @@ class _MOQTSessionMixin:
         # future. WT mode resolves it in _moqt_wt_finalize().
         if getattr(session, 'use_quic', False):
             self._wt_session_setup.set_result(True)
-        # The negotiated MoQT draft, as a representation-independent draft
-        # number (e.g. 16). Defaults to the current draft until ALPN /
-        # WT-Available-Protocols / SERVER_SETUP resolves it; the wire
-        # IETF version code is only derived when (de)serializing SETUP.
-        self.negotiated_draft: int = get_major_version(MOQT_CUR_VERSION)
+        # A pinned draft is known before the handshake, so lock _draft now:
+        # over raw QUIC a peer's SETUP (d18 control uni) can arrive in the
+        # same batch as — or before — ProtocolNegotiated, and it must be
+        # demuxed under the right draft (control_uni_pair) rather than the
+        # default. Auto (unpinned) clients still resolve from the
+        # negotiated ALPN / WT-Protocol.
+        _drafts = getattr(session, 'supported_drafts', None)
+        _pinned = _drafts[0] if _drafts and len(_drafts) == 1 else None
+        self.negotiated_draft = (get_major_version(_pinned) if _pinned is not None
+                                 else get_major_version(MOQT_CUR_VERSION))
         self._moqt_session_setup: Future[bool] = self._loop.create_future()
         self._moqt_session_closed: Future[Tuple[int,str]] = self._loop.create_future()
         self._next_request_id = 0 if self._is_client else 1
@@ -207,8 +254,9 @@ class _MOQTSessionMixin:
         self._fetch_stream_by_request: Dict[int, int] = {}
         self._subgroup_stream_by_key: Dict[Tuple[int, int, Optional[int]], int] = {}
 
-        self._control_msg_registry = dict(_MOQTSessionMixin.MOQT_CONTROL_MESSAGE_REGISTRY)
-        self._control_msg_registry.update(session._control_msg_handlers)
+        # Per-session custom handler overrides {msg_type: handler}; the
+        # message class always comes from the per-draft CONTROL_REGISTRY.
+        self._control_msg_overrides = dict(session._control_msg_handlers)
 
         self._stream_data_registry = dict(_MOQTSessionMixin.MOQT_STREAM_DATA_REGISTRY)
         self._dgram_data_registry = dict(_MOQTSessionMixin.MOQT_DGRAM_DATA_REGISTRY)
@@ -317,14 +365,25 @@ class _MOQTSessionMixin:
             return False
 
     def _get_control_entry(self, msg_type: int) -> Tuple[Type[MOQTMessage], Callable]:
-        """Get the (message_class, handler) for a control message type.
+        """(message_class, handler) for a control message type on the
+        session's negotiated draft.
 
-        Handles version-aware dispatch for code points that are reused
-        between draft-14 and draft-16 (0x05, 0x07, 0x08, 0x0E).
+        Single keyed lookup into the per-draft CONTROL_REGISTRY — no
+        version branching. A per-session custom handler (register_handler)
+        overrides the default handler; the class always comes from the
+        draft's table. An unknown code point for this draft is a wire
+        violation.
         """
-        if is_draft16_or_later() and msg_type in self.MOQT_D16_OVERRIDE_REGISTRY:
-            return self.MOQT_D16_OVERRIDE_REGISTRY[msg_type]
-        return self._control_msg_registry[msg_type]
+        try:
+            msg_class, handler = self.CONTROL_REGISTRY[self.negotiated_draft][msg_type]
+        except KeyError:
+            raise MOQTProtocolViolation(
+                f"control message type {int(msg_type):#x} not valid for "
+                f"draft-{self.negotiated_draft}")
+        override = self._control_msg_overrides.get(msg_type)
+        if override is not None:
+            handler = override
+        return (msg_class, handler)
 
     async def __aexit__(self, exc_type, exc, tb):
         # Clean up the context when the session exits
@@ -399,8 +458,15 @@ class _MOQTSessionMixin:
         logger.debug(f"H3 event: configured path: {configured} request path: {path}")
         return configured == path
 
-    def _moqt_handle_control_message(self, buf: Buffer) -> Optional[MOQTMessage]:
-        """Process an incoming message."""
+    def _moqt_handle_control_message(self, buf: Buffer, *,
+                                     request_id: Optional[int] = None
+                                     ) -> Optional[MOQTMessage]:
+        """Process an incoming message.
+
+        request_id, when supplied (d18 request-stream replies), is the id
+        the stream is bound to. d18 replies omit the Request ID on the
+        wire (demuxed by stream); injecting it lets handlers that key on
+        msg.request_id work unchanged."""
         buf_len = buf.capacity
         if buf_len == 0:
             logger.warning("MOQT event: handle control message: no data")
@@ -409,7 +475,17 @@ class _MOQTSessionMixin:
         logger.debug(f"MOQT event: handle control message: ({buf_len} bytes) 0x{buf.data_slice(0, buf_len).hex()}")
         try:
             start_pos = buf.tell()
-            msg_type = buf.pull_uint_var()
+            # d18 control framing uses vi64 for the Message Type (0x2F00
+            # -> AF 00); pre-d18 uses the RFC9000 varint. Length stays
+            # 16-bit in all drafts (§10.1). This is the single chokepoint
+            # for ALL control messages (the bidi, d18 uni, and per-request
+            # paths all route here), so tagging buf.vi64 once here makes
+            # every downstream message deserialize read its body integers
+            # in the negotiated flavor via buf.pull_vint — control message
+            # bodies do not each re-tag.
+            prof = self._profile
+            buf.vi64 = prof.vi64
+            msg_type = buf.pull_vint()
             msg_len = buf.pull_uint16()
             hdr_len = buf.tell() - start_pos
             end_pos = start_pos + hdr_len + msg_len
@@ -428,14 +504,20 @@ class _MOQTSessionMixin:
                 )
                 buf.seek(buf_len)
                 return None
-            # Check that msg_type exists
-            try:
-                msg_type = MOQTMessageType(msg_type)
-            except ValueError:
-                logger.error(f"MOQT error: unknown control message: type: {hex(msg_type)} start: {start_pos} len: {msg_len}")
-                # Skip the rest of this message if possible
-                buf.seek(end_pos)
-                return
+            # Resolve the message type. RFC9000 drafts keep the lenient
+            # enum-coercion + skip-unknown surface. vi64 drafts (d18) let
+            # the per-draft CONTROL_REGISTRY be the authority — renumbered
+            # code points (SETUP 0x2F00, SUBSCRIBE_NAMESPACE 0x50, ...) fall
+            # outside MOQTMessageType's contiguous range, and an unknown
+            # type closes the session via _get_control_entry (§10.1 MUST).
+            if prof.varint != "vi64":
+                try:
+                    msg_type = MOQTMessageType(msg_type)
+                except ValueError:
+                    logger.error(f"MOQT error: unknown control message: type: {hex(msg_type)} start: {start_pos} len: {msg_len}")
+                    # Skip the rest of this message if possible
+                    buf.seek(end_pos)
+                    return
             # Look up message class (version-aware for shared code points)
             message_class, handler = self._get_control_entry(msg_type)
             logger.debug(f"MOQT event: control message: {message_class.__name__} ({msg_len} bytes)")
@@ -444,7 +526,13 @@ class _MOQTSessionMixin:
             # in PUBLISH / SUBSCRIBE_OK / FETCH_OK) know where to stop
             # instead of reading past the payload. Other message types
             # accept and ignore it for signature uniformity.
-            msg = message_class.deserialize(buf, buf_end=end_pos)
+            msg = message_class.deserialize(buf, prof=self._profile, buf_end=end_pos)
+            # d18 replies omit the Request ID (demuxed by request stream);
+            # inject the stream-bound id so handlers key on it unchanged.
+            if (request_id is not None and
+                    not self._profile.reply_has_request_id and
+                    hasattr(msg, 'request_id')):
+                msg.request_id = request_id
             msg_len += hdr_len
             if end_pos > buf.tell():
                 logger.debug(f"MOQT event: control message: seeking msg end: {end_pos}")
@@ -461,6 +549,13 @@ class _MOQTSessionMixin:
 
             return msg
 
+        except MOQTProtocolViolation as e:
+            logger.error(
+                f"handle_control_message: protocol violation: "
+                f"{e.reason_phrase}"
+            )
+            self._close_session(e.error_code, e.reason_phrase)
+            return None
         except Exception as e:
             import traceback
             logger.error(
@@ -813,19 +908,28 @@ class _MOQTSessionMixin:
             # new data streams will not yet have a parser bound
             stream_state = self._data_streams.get(stream_id)
             if stream_state is None or stream_state.parser is None:
-                # Get stream type from first byte
-                stream_type = buf.pull_uint_var()
-                # SubgroupHeader type ranges:
-                #   d14: 0x10-0x1D (bit 4 set, bits 0-3 = flags)
-                #   d16: also 0x30-0x3D (bit 5 = DEFAULT_PRIORITY)
-                # Reserved: subgroup_id_mode 0b11 (bits 1-2)
+                # Get stream type from first varint. d18 uses vi64 for the
+                # stream type (and all data-plane ints); pre-d18 RFC9000.
+                buf.vi64 = self._profile.vi64
+                stream_type = buf.pull_vint()
+                # SubgroupHeader form 0b0XX1XXXX (bit 4 set): d14 0x10-0x1D,
+                # d16 += 0x30-0x3D (bit 5 DEFAULT_PRIORITY), d18 += 0x50-0x5D
+                # / 0x70-0x7D (bit 6 FIRST_OBJECT) and excludes bit 7.
+                # Reserved subgroup_id_mode 0b11 (bits 1-2) is invalid.
                 is_subgroup = (
-                    (0x10 <= stream_type <= 0x1D or
-                     0x30 <= stream_type <= 0x3D)
+                    (stream_type & 0x10) and not (stream_type & 0x80)
                     and ((stream_type >> 1) & 0x03) != 3
                 )
-                if is_subgroup:
-                    msg_header = SubgroupHeader.deserialize(buf, type_val=stream_type)
+                if stream_type in (PADDING_STREAM_TYPE,):
+                    # d18 PADDING stream: drain + discard (MUST keep flow
+                    # control moving). No parser bound; bytes ignored.
+                    data_type = "PADDING"
+                    msg_header = None
+                    raise MOQTStreamReject(
+                        SessionCloseCode.NO_ERROR, "padding stream drained")
+                elif is_subgroup:
+                    msg_header = SubgroupHeader.deserialize(
+                        buf, type_val=stream_type, prof=self._profile)
                     data_type = "SUBGROUP_HEADER"
                     self._admit_subgroup_stream(stream_id, msg_header)
                 elif stream_type == DataStreamType.FETCH_HEADER:
@@ -878,7 +982,8 @@ class _MOQTSessionMixin:
                     obj.deserialize_into(
                         buf, len,
                         extensions_present=sg_header.extensions_present,
-                        prev_object_id=sg_header._last_object_id
+                        prev_object_id=sg_header._last_object_id,
+                        vi64=sg_header._vi64,
                     )
                     msg_header = obj
                     # Update delta tracking state
@@ -892,7 +997,7 @@ class _MOQTSessionMixin:
 
                 elif isinstance(parser, FetchHeader):
                     fh: FetchHeader = parser
-                    msg_header = FetchObject.deserialize(buf, prior=fh._prior_obj)
+                    msg_header = FetchObject.deserialize(buf, prior=fh._prior_obj, prof=self._profile)
                     # Track prior object for d16 delta-encoded references
                     if msg_header.end_of_range is None:
                         fh._prior_obj = msg_header
@@ -916,12 +1021,16 @@ class _MOQTSessionMixin:
             logger.error(f"MOQT datagram: no data {buf.tell()}")
             return
         logger.debug(f"MOQT handle datagram: 0x{buf.data_slice(0,min(buf.capacity,12))}")
-        # Get datagram type from first byte
+        # Get datagram type from first varint (vi64 for d18).
         pos = buf.tell()
-        dgram_type = buf.pull_uint_var()
+        prof = self._profile
+        buf.vi64 = prof.vi64
+        dgram_type = buf.pull_vint()
+        if prof.varint == "vi64":
+            return self._moqt_handle_data_dgram_d18(buf, pos, dgram_type)
         # Draft-14: ObjectDatagram types 0x00-0x07 (payload datagrams)
         if 0x00 <= dgram_type <= 0x07:
-            msg = ObjectDatagram.deserialize(buf, buf.capacity, type_val=dgram_type)
+            msg = ObjectDatagram.deserialize(buf, buf.capacity, type_val=dgram_type, prof=self._profile)
             if msg is None:
                 error = f"datagram parsing failed at: {buf.tell()}"
                 logger.error(f"MOQT error: " + error)
@@ -966,7 +1075,79 @@ class _MOQTSessionMixin:
             logger.error(f"MOQT error: " + error)
             self._close_session(SessionCloseCode.PROTOCOL_VIOLATION, error)
             return
-    
+
+    # d18 OBJECT_DATAGRAM invalid types: STATUS (0x20) + END_OF_GROUP (0x02)
+    # both set — a status datagram cannot signal end of group (§11.3.1).
+    _D18_DGRAM_INVALID = frozenset(
+        {0x22, 0x23, 0x26, 0x27, 0x2A, 0x2B, 0x2E, 0x2F})
+
+    def _moqt_handle_data_dgram_d18(self, buf: Buffer, pos: int,
+                                    dgram_type: int) -> MOQTMessage:
+        """d18 datagram dispatch. OBJECT_DATAGRAM form 0b00X0XXXX
+        (0x00-0x0F / 0x20-0x2F); PADDING datagram 0x132B3E29 is drained."""
+        if dgram_type == PADDING_DATAGRAM_TYPE:
+            logger.debug("MOQT event: PADDING datagram drained")
+            return
+        valid_form = (dgram_type & ~0x2F) == 0 and (dgram_type & 0x10) == 0
+        if (not valid_form) or dgram_type in self._D18_DGRAM_INVALID:
+            error = f"invalid d18 datagram type: 0x{dgram_type:x}"
+            logger.error(f"MOQT error: " + error)
+            self._close_session(SessionCloseCode.PROTOCOL_VIOLATION, error)
+            return
+        msg = ObjectDatagram.deserialize(
+            buf, buf.capacity, type_val=dgram_type, prof=self._profile)
+        if msg is None:
+            error = f"datagram parsing failed at: {buf.tell()}"
+            logger.error(f"MOQT error: " + error)
+            self._close_session(SessionCloseCode.PROTOCOL_VIOLATION, error)
+            return msg
+        consumed = buf.tell() - pos
+        now = int(time.time() * 1_000_000)
+        logger.debug(
+            f"MOQT event: d18 ObjectDatagram: {msg.group_id}.{msg.object_id} "
+            f"size: {consumed} bytes status: {msg.status}")
+        if msg.status == ObjectStatus.NORMAL and self.on_object_received:
+            self.on_object_received(msg, consumed, now, msg.group_id, None)
+        return msg
+
+    def _drain_control_buffer(self, msg_buf: Buffer, msg_len: int) -> None:
+        """Parse every whole control message in one event's buffer.
+        Shared by the d14/d16 bidi control stream and the d18 uni control
+        stream."""
+        while msg_buf.tell() < msg_len:
+            msg = self._moqt_handle_control_message(msg_buf)
+            if msg is None:
+                error = (f"control stream: parsing failed at position: "
+                         f"{msg_buf.tell()} of {msg_len} bytes")
+                logger.error(f"MOQT error: " + error)
+                self._close_session(
+                    SessionCloseCode.PROTOCOL_VIOLATION, error)
+                break
+
+    @staticmethod
+    def _d18_peek_is_setup(data) -> bool:
+        """True if a uni stream's leading bytes are the d18 control stream
+        type (SETUP, vi64 0x2F00). Non-consuming."""
+        if not data:
+            return False
+        if not isinstance(data, (bytes, bytearray)):
+            data = bytes(data)
+        try:
+            return Buffer(data=data).pull_uint_vi64() == MOQTMessageType.SETUP
+        except Exception:
+            return False
+
+    def _d18_handle_control_uni(self, data, end_stream: bool) -> None:
+        """Route a d18 control (uni) stream's bytes to the control parser.
+        Each event is assumed to carry whole control messages, matching the
+        d14/d16 bidi control assumption."""
+        if not isinstance(data, (bytes, bytearray)):
+            data = bytes(data)
+        if not data:
+            return
+        msg_buf = Buffer(data=data)
+        self._drain_control_buffer(msg_buf, msg_buf.capacity)
+
     # primary event handling for all QUIC messaging
     def quic_event_received(self, event: QuicEvent) -> None:
         """Handle incoming QUIC events."""
@@ -992,14 +1173,17 @@ class _MOQTSessionMixin:
             if alpn == MOQT_ALPN or (alpn and alpn.startswith("moqt-")):
                 logger.debug(f"QUIC event: ALPN ProtocolNegotiated alpn: {alpn}")
                 try:
-                    version = moqt_version_from_alpn(alpn)  # wire from ALPN
-                    self.negotiated_draft = get_major_version(version)
-                    set_moqt_ctx_version(self.negotiated_draft)
-                    logger.info(
-                        f"MOQT: draft set from ALPN: {alpn} -> "
-                        f"{self.negotiated_draft}")
+                    draft = get_major_version(moqt_version_from_alpn(alpn))
+                    if draft not in PROFILES:
+                        raise ValueError(f"unsupported draft-{draft}")
+                    self.negotiated_draft = draft
+                    logger.info(f"MOQT: version set from ALPN: {alpn} -> draft-{self.negotiated_draft}")
                 except ValueError:
-                    pass
+                    logger.error(f"QUIC error: unsupported ALPN version: {alpn}")
+                    self._close_session(
+                        SessionCloseCode.VERSION_NEGOTIATION_FAILED,
+                        f"unsupported ALPN: {alpn}"
+                    )
             else:
                 logger.error(f"QUIC error: unknown ALPN: {alpn}")
                 self._close_session(
@@ -1031,16 +1215,28 @@ class _MOQTSessionMixin:
 
             # Abrupt close of a critical stream
             if (event.end_stream and len(data) == 0 and
-                    stream_id in (self._control_stream_id, self._session_id)):
+                    stream_id in (self._control_read_stream_id, self._session_id)):
                 self._close_session(
                     SessionCloseCode.INTERNAL_ERROR,
                     f"critical stream closed by remote peer: {stream_id}"
                 )
                 return
 
-            # Uni MoQT data streams: hot path through StreamChain
-            # (memoryview-native; no Buffer construction).
+            # Uni MoQT streams. In d18 the peer's control stream is a uni
+            # stream beginning with SETUP (vi64 0x2F00): bind it on first
+            # contact and route it to the control parser. Every other uni
+            # stream is data (object subgroups / fetch) -> StreamChain hot
+            # path (memoryview-native; no Buffer construction).
             if stream_is_unidirectional(stream_id):
+                if self._profile.control_uni_pair:
+                    if (self._d18_control_read_sid is None and
+                            self._d18_peek_is_setup(data)):
+                        self._d18_control_read_sid = stream_id
+                        logger.debug(
+                            f"MOQT: bound d18 control read-uni: {stream_id}")
+                    if stream_id == self._d18_control_read_sid:
+                        self._d18_handle_control_uni(data, event.end_stream)
+                        return
                 self._on_stream_data(
                     stream_id, data, event.end_stream)
                 return
@@ -1053,24 +1249,25 @@ class _MOQTSessionMixin:
             msg_len = msg_buf.capacity
             logger.debug(f"MOQT event: StreamDataReceived: stream: {stream_id} len: {msg_len}")
 
+            # d18: control is a uni pair, so every bidi stream is a request
+            # stream (SUBSCRIBE/FETCH/...). Pre-d18 the first bidi stream is
+            # latched as the single control stream.
+            if self._profile.control_uni_pair:
+                self._handle_bidi_stream(stream_id, msg_buf, msg_len)
+                return
+
             if self._control_stream_id is None:
                 self._control_stream_id = stream_id
                 logger.debug(f"QUIC event: detecting control stream: {stream_id}")
             elif stream_id != self._control_stream_id:
-                if is_draft16_or_later():
+                if is_draft16_or_later(self.negotiated_draft):
                     self._handle_bidi_stream(stream_id, msg_buf, msg_len)
                     return
                 logger.warning(f"MOQT event: unrecognized bidirectional stream({stream_id})")
                 return
 
-            if stream_id == self._control_stream_id:
-                while msg_buf.tell() < msg_len:
-                    msg = self._moqt_handle_control_message(msg_buf)
-                    if msg is None:
-                        error = f"control stream: parsing failed at position: {msg_buf.tell()} of {msg_len} bytes"
-                        logger.error(f"MOQT error: " + error)
-                        self._close_session(SessionCloseCode.PROTOCOL_VIOLATION, error)
-                        break
+            if stream_id == self._control_read_stream_id:
+                self._drain_control_buffer(msg_buf, msg_len)
                 return
 
         elif isinstance(event, DatagramFrameReceived) and self._wt_session_setup.done():
@@ -1134,10 +1331,11 @@ class _MOQTSessionMixin:
         # RESET_STREAM which confuses relays.
         is_client = self._is_client
         try:
-            if self._control_stream_id is not None:
+            if self._control_write_stream_id is not None:
                 self._quic.send_stream_data(
-                    self._control_stream_id, b"", end_stream=True)
+                    self._control_write_stream_id, b"", end_stream=True)
                 self._control_stream_id = None
+                self._d18_control_write_sid = None
             for stream_id in list(self._data_streams.keys()):
                 # We own the write side if we initiated the stream.
                 # QUIC stream ID bits 0-1: 0=client-bidi, 1=server-bidi,
@@ -1177,11 +1375,23 @@ class _MOQTSessionMixin:
         if use_quic:
             # Raw QUIC flow. _wt_session_setup is pre-resolved in __init__.
             logger.info(f"MOQT: Using raw QUIC transport")
-            self._control_stream_id = self._quic.get_next_available_stream_id(
-                is_unidirectional=False)
-            logger.info(
-                f"MOQT: QUIC control stream created stream id: "
-                f"{self._control_stream_id}")
+            if self._profile.control_uni_pair:
+                # d18: control is a uni-stream pair. Open our write-control
+                # uni now; the peer's read-control uni is bound on the first
+                # SETUP it sends (see quic_event_received).
+                self._d18_control_write_sid = (
+                    self._quic.get_next_available_stream_id(
+                        is_unidirectional=True))
+                logger.info(
+                    f"MOQT: d18 control write-uni: "
+                    f"{self._d18_control_write_sid}")
+            else:
+                self._control_stream_id = (
+                    self._quic.get_next_available_stream_id(
+                        is_unidirectional=False))
+                logger.info(
+                    f"MOQT: QUIC control stream created stream id: "
+                    f"{self._control_stream_id}")
             req_path = self._session.path or ""
             params[SetupParamType.PATH] = f"/{req_path}"
             params[SetupParamType.AUTHORITY] = (
@@ -1189,39 +1399,60 @@ class _MOQTSessionMixin:
         else:
             # WebTransport over aiopquic. The WT session is open by the
             # time client_session_init runs (open() awaited already);
-            # _wt_session_setup is resolved in _moqt_wt_finalize. Open
-            # the MoQT control bidi stream and pin the version from
-            # draft (in-band wt-available-protocols negotiation isn't
-            # wired for v0.9.0; picowt supports it).
-            drafts = getattr(self._session, 'supported_drafts', [])
-            if len(drafts) == 1:
-                set_moqt_ctx_version(drafts[0])
-                self.negotiated_draft = drafts[0]
-            self._control_stream_id = await self.open_bidi_stream()
-            logger.info(
-                f"MOQT: WT control stream created stream id: "
-                f"{self._control_stream_id}")
+            # _wt_session_setup is resolved in _moqt_wt_finalize. Resolve
+            # the draft from the negotiated WT-Protocol (in-band
+            # WT-Available-Protocols -> WT-Protocol selection, surfaced by
+            # aiopquic as negotiated_protocol); a single supported draft
+            # (a pin) still wins.
+            _drafts = getattr(self._session, 'supported_drafts', None)
+            draft = _drafts[0] if _drafts and len(_drafts) == 1 else None
+            if draft is not None:
+                self.negotiated_draft = get_major_version(draft)
+            else:
+                negotiated = self.negotiated_protocol
+                if negotiated:
+                    self.negotiated_draft = get_major_version(
+                        moqt_version_from_alpn(negotiated))
+                    logger.info(
+                        f"MOQT: version set from WT-Protocol: "
+                        f"{negotiated} -> draft-{self.negotiated_draft}")
+            if self._profile.control_uni_pair:
+                # d18 over WT: control is a uni-stream pair, same as raw
+                # QUIC — open our write-control uni (WT create_stream); the
+                # peer's read-control uni is bound on the first SETUP it
+                # sends (the demux in quic_event_received is transport-
+                # agnostic). The data plane already proves WT uni streams.
+                self._d18_control_write_sid = await self.open_uni_stream()
+                logger.info(
+                    f"MOQT: d18 WT control write-uni: "
+                    f"{self._d18_control_write_sid}")
+            else:
+                self._control_stream_id = await self.open_bidi_stream()
+                logger.info(
+                    f"MOQT: WT control stream created stream id: "
+                    f"{self._control_stream_id}")
 
-        # Send CLIENT_SETUP
-        params[SetupParamType.MAX_REQUEST_ID] = 10000
+        # Send SETUP. d18 SETUP is symmetric (Setup, type 0x2F00): no
+        # version array (negotiated via ALPN), no MAX_REQUEST_ID Setup
+        # Option (removed), count-less Setup Options. Pre-d18 sends
+        # CLIENT_SETUP with the version list.
         params[SetupParamType.IMPLEMENTATION] = USER_AGENT.encode()
-        # CLIENT_SETUP carries the offered versions on the wire, so this
-        # is where supported drafts (representation-independent numbers)
-        # are translated to IETF version codes.
-        #   - raw QUIC: offer one wire code per supported draft (a single
-        #     supported draft yields a single version).
-        #   - H3/WT: the version is negotiated via ALPN /
-        #     WT-Available-Protocols; send the full MOQT_VERSIONS list for
-        #     the d14 in-band path (d16+ ignores it).
-        drafts = getattr(self._session, 'supported_drafts', [])
-        if use_quic and drafts:
-            versions = [moqt_version_from_draft(d) for d in drafts]
+        if self._profile.control_uni_pair:
+            self.send_control_message(Setup(options=params))
         else:
-            versions = MOQT_VERSIONS
-        client_setup = self.client_setup(
-            versions=versions,
-            parameters=params
-        )
+            params[SetupParamType.MAX_REQUEST_ID] = 10000
+            # For raw QUIC with explicit draft: single version
+            # For H3/WT: version list depends on whether WT protocol was
+            # negotiated (negotiated -> no version array; else d14 format)
+            drafts = getattr(self._session, 'supported_drafts', [])
+            if use_quic and drafts:
+                versions = [moqt_version_from_draft(d) for d in drafts]
+            else:
+                versions = MOQT_VERSIONS
+            client_setup = self.client_setup(
+                versions=versions,
+                parameters=params
+            )
 
         # Wait for SERVER_SETUP
         session_setup = False
@@ -1376,33 +1607,112 @@ class _MOQTSessionMixin:
         check session-level closed/torn-down here."""
         return self._session_writable()
 
-    def send_control_message(self, buf: Buffer) -> None:
-        """Send a MoQT message on the control stream."""
-        if self._quic is None or self._control_stream_id is None:
+    def send_control_message(self, msg: MOQTMessage) -> None:
+        """Serialize and send a MoQT control message on the control
+        stream. Serialization happens here at the session's negotiated
+        profile (`self._profile`), so call sites pass the message object
+        and never thread prof= — they cannot forget it or pass the wrong
+        one."""
+        if self._quic is None or self._control_write_stream_id is None:
             raise MOQTException(SessionCloseCode.INTERNAL_ERROR,
                                 "control stream not initialized")
+        buf = msg.serialize(prof=self._profile)
         logger.debug(f"QUIC send: control message: {buf.tell()} bytes")
         self._quic.send_stream_data(
-            stream_id=self._control_stream_id,
+            stream_id=self._control_write_stream_id,
             data=buf.data,
             end_stream=False
         )
 
+    def send_stream_message(self, stream_id: int, msg: MOQTMessage) -> None:
+        """Serialize and send a MoQT message on a per-request bidi
+        stream (d16+ SUBSCRIBE_NAMESPACE response routing). Like
+        send_control_message, serialization happens here at the session
+        profile so callers never thread prof=."""
+        self.stream_write(stream_id, msg.serialize(prof=self._profile).data)
+
+    def subgroup_header(self, track_alias: int, group_id: int,
+                        **kwargs) -> SubgroupHeader:
+        """Build a SubgroupHeader bound to this session's negotiated draft
+        profile — the data-plane mirror of send_control_message. Higher
+        APIs (Track, apps) call this and never thread draft/profile; the
+        header's serialize()/next_object* then use the baked-in codec."""
+        return SubgroupHeader(track_alias=track_alias, group_id=group_id,
+                              prof=self._profile, **kwargs)
+
+    def _send_reply(self, request_id: int, msg: MOQTMessage) -> None:
+        """Send a response to a request. In d18 responses travel on the
+        request's own bidi stream (demuxed by stream, no in-band Request
+        ID); pre-d18 they go on the single control stream."""
+        sid = self._bidi_streams.get(request_id)
+        if self._profile.control_uni_pair and sid is not None:
+            self.send_stream_message(sid, msg)
+        else:
+            self.send_control_message(msg)
+
+    def _send_request(self, request_id: int, msg: MOQTMessage) -> None:
+        """Send a request-stream opener. In d18 every request (SUBSCRIBE,
+        PUBLISH, FETCH, TRACK_STATUS, PUBLISH_NAMESPACE, ...) opens its own
+        bidi stream and the response returns on it (no in-band Request ID);
+        pre-d18 requests go on the single control stream. Raw-QUIC stream-id
+        allocation is synchronous, so callers stay sync."""
+        if self._profile.control_uni_pair:
+            if getattr(self._session, 'use_quic', False):
+                # Raw QUIC: stream-id allocation is synchronous (lazy
+                # materialization on first send), so stay sync.
+                stream_id = self._quic.get_next_available_stream_id(
+                    is_unidirectional=False)
+                self._bidi_streams[request_id] = stream_id
+                self._bidi_stream_requests[stream_id] = request_id
+                self.send_stream_message(stream_id, msg)
+            else:
+                # WebTransport: bidi-stream open is async (create_stream
+                # round-trips to picoquic), so defer the open+send to a
+                # task. The reply correlates by request_id once the stream
+                # is bound, and it cannot arrive before we send on it.
+                task = asyncio.create_task(
+                    self._d18_open_request_stream(request_id, msg))
+                self._tasks.add(task)
+                task.add_done_callback(self._control_task_done)
+        else:
+            self.send_control_message(msg)
+
+    async def _d18_open_request_stream(self, request_id: int,
+                                       msg: MOQTMessage) -> None:
+        """Open a d18 request bidi stream over WebTransport (async
+        create_stream) and send the opener on it. Raw QUIC uses the
+        synchronous path in _send_request instead."""
+        stream_id = await self.open_bidi_stream()
+        self._bidi_streams[request_id] = stream_id
+        self._bidi_stream_requests[stream_id] = request_id
+        self.send_stream_message(stream_id, msg)
+
+    # Messages that open a request stream (must be the first message on a
+    # new bidi stream). d16 only uses SUBSCRIBE_NAMESPACE here; d18 routes
+    # all requests onto their own bidi stream. (SUBSCRIBE_TRACKS 0x51 lands
+    # with the d18 control-message set in a later phase.)
+    _REQUEST_OPENERS = (Subscribe, Fetch, Publish, TrackStatus,
+                        PublishNamespace, SubscribeNamespace, SubscribeTracks)
+
     def _handle_bidi_stream(self, stream_id: int, buf: Buffer, buf_len: int) -> None:
-        """Handle d16 bidirectional stream messages (SUBSCRIBE_NAMESPACE,
-        responses). aiopquic delivers clean MoQT payload either way —
-        WT prefix is stripped in C; raw QUIC has no prefix.
+        """Handle request bidirectional stream messages. The first message
+        is a request opener (carries the Request ID) and binds the stream;
+        subsequent messages are responses, demuxed by the bound stream.
+        aiopquic delivers clean MoQT payload either way — WT prefix is
+        stripped in C; raw QUIC has no prefix.
         """
         request_id = self._bidi_stream_requests.get(stream_id)
         if request_id is not None:
             while buf.tell() < buf_len:
-                msg = self._moqt_handle_control_message(buf)
+                msg = self._moqt_handle_control_message(
+                    buf, request_id=request_id)
                 if msg is None:
                     break
             return
 
         msg = self._moqt_handle_control_message(buf)
-        if msg is not None and isinstance(msg, SubscribeNamespace):
+        if (msg is not None and isinstance(msg, self._REQUEST_OPENERS) and
+                getattr(msg, 'request_id', None) is not None):
             self._bidi_stream_requests[stream_id] = msg.request_id
             self._bidi_streams[msg.request_id] = stream_id
 
@@ -1431,7 +1741,7 @@ class _MOQTSessionMixin:
             parameters=parameters
         )
         logger.info(f"MOQT send: {message}")
-        self.send_control_message(message.serialize())
+        self.send_control_message(message)
 
         return message
 
@@ -1449,7 +1759,7 @@ class _MOQTSessionMixin:
             parameters=parameters
         )
         logger.info(f"MOQT send: {message}")
-        self.send_control_message(message.serialize())
+        self.send_control_message(message)
         return message
 
     def subscribe(
@@ -1497,7 +1807,7 @@ class _MOQTSessionMixin:
         message.libquicr_compat = self._session.libquicr_compat
         self._subscriptions[request_id] = [message]
         logger.info(f"MOQT send: {message}")
-        self.send_control_message(message.serialize())
+        self._send_request(request_id, message)
 
         if not wait_response:
             return message
@@ -1529,7 +1839,26 @@ class _MOQTSessionMixin:
             parameters=parameters or {}
         )
         logger.info(f"MOQT send: {message}")
-        self.send_control_message(message.serialize())
+        self._send_reply(request_msg.request_id, message)
+        return message
+
+    def subscribe_done(
+        self,
+        request_id: int,
+        status_code: int = SubscribeDoneCode.SUBSCRIPTION_ENDED,
+        stream_count: int = 0,
+        reason: str = "",
+    ) -> Optional[MOQTMessage]:
+        """Create and send a PUBLISH_DONE (SUBSCRIBE_DONE) response on the
+        subscription's request stream (d18) or the control stream."""
+        message = SubscribeDone(
+            request_id=request_id,
+            status_code=status_code,
+            stream_count=stream_count,
+            reason=reason,
+        )
+        logger.info(f"MOQT send: {message}")
+        self._send_reply(request_id, message)
         return message
 
     def subscribe_error(
@@ -1545,7 +1874,7 @@ class _MOQTSessionMixin:
             reason=reason,
         )
         logger.info(f"MOQT send: {message}")
-        self.send_control_message(message.serialize())
+        self.send_control_message(message)
         return message
     
     def unsubscribe(
@@ -1555,7 +1884,7 @@ class _MOQTSessionMixin:
         """Unsubscribe from a track."""
         message = Unsubscribe(request_id=request_id)
         logger.info(f"MOQT send: {message}")
-        self.send_control_message(message.serialize())
+        self.send_control_message(message)
  
         return message       
 
@@ -1620,7 +1949,7 @@ class _MOQTSessionMixin:
         # peers can't resolve them before our awaiter registers.
         self._pending_requests[sub_request_id] = self._loop.create_future()
         logger.info(f"MOQT send: {sub_msg}")
-        self.send_control_message(sub_msg.serialize())
+        self.send_control_message(sub_msg)
 
         fetch_request_id = self._allocate_request_id()
         fetch_msg = Fetch(
@@ -1639,7 +1968,7 @@ class _MOQTSessionMixin:
         self._fetch_done_futures[fetch_request_id] = \
             self._loop.create_future()
         logger.info(f"MOQT send: {fetch_msg}")
-        self.send_control_message(fetch_msg.serialize())
+        self.send_control_message(fetch_msg)
 
         if not wait_response:
             return (sub_msg, fetch_msg)
@@ -1692,7 +2021,7 @@ class _MOQTSessionMixin:
         self._fetch_done_futures[request_id] = \
             self._loop.create_future()
         logger.info(f"MOQT send: {message}")
-        self.send_control_message(message.serialize())
+        self.send_control_message(message)
 
         if not wait_response:
             return message
@@ -1719,7 +2048,7 @@ class _MOQTSessionMixin:
             track_extensions=track_extensions or {},
         )
         logger.info(f"MOQT send: {message}")
-        self.send_control_message(message.serialize())
+        self.send_control_message(message)
         return message
 
     def fetch_error(
@@ -1735,7 +2064,7 @@ class _MOQTSessionMixin:
             reason=reason,
         )
         logger.info(f"MOQT send: {message}")
-        self.send_control_message(message.serialize())
+        self.send_control_message(message)
         return message
 
     def publish_namespace(
@@ -1757,7 +2086,7 @@ class _MOQTSessionMixin:
         if wait_response:
             self._pending_requests[request_id] = self._loop.create_future()
         logger.info(f"MOQT send: {message}")
-        self.send_control_message(message.serialize())
+        self._send_request(request_id, message)
 
         if not wait_response:
             return message
@@ -1795,7 +2124,7 @@ class _MOQTSessionMixin:
             parameters=parameters or {},
         )
         logger.info(f"MOQT send: {message}")
-        self.send_control_message(message.serialize())
+        self._send_request(request_id, message)
 
         if not wait_response:
             return message
@@ -1812,12 +2141,12 @@ class _MOQTSessionMixin:
         Draft-16+ reuses 0x07 as REQUEST_OK (universal positive
         response — adds Num Parameters).
         """
-        if is_draft16_or_later():
+        if is_draft16_or_later(self.negotiated_draft):
             message = RequestOk(request_id=msg.request_id)
         else:
             message = PublishNamespaceOk(request_id=msg.request_id)
         logger.info(f"MOQT send: {message} request_id: {msg.request_id} namespace: {msg.namespace}")
-        self.send_control_message(message.serialize())
+        self.send_control_message(message)
         return message
 
     def publish_namespace_done(
@@ -1832,7 +2161,7 @@ class _MOQTSessionMixin:
         """
         message = PublishNamespaceDone(namespace=namespace, request_id=request_id)
         logger.info(f"MOQT send: {message}")
-        self.send_control_message(message.serialize())
+        self.send_control_message(message)
         return message
 
     async def subscribe_namespace(
@@ -1863,15 +2192,14 @@ class _MOQTSessionMixin:
         )
         logger.info(f"MOQT send: {message}")
 
-        if is_draft16_or_later():
+        if is_draft16_or_later(self.negotiated_draft):
             stream_id = await self.open_bidi_stream()
-            buf = message.serialize()
-            self.stream_write(stream_id, buf.data)
+            self.send_stream_message(stream_id, message)
             # Track bidi stream ↔ request mapping for response routing
             self._bidi_streams[request_id] = stream_id
             self._bidi_stream_requests[stream_id] = request_id
         else:
-            self.send_control_message(message.serialize())
+            self.send_control_message(message)
 
         if not wait_response:
             return message
@@ -1889,11 +2217,10 @@ class _MOQTSessionMixin:
         """
         message = SubscribeNamespaceOk(request_id=msg.request_id)
         logger.info(f"MOQT send: {message}")
-        if stream_id is not None and is_draft16_or_later():
-            buf = message.serialize()
-            self.stream_write(stream_id, buf.data)
+        if stream_id is not None and is_draft16_or_later(self.negotiated_draft):
+            self.send_stream_message(stream_id, message)
         else:
-            self.send_control_message(message.serialize())
+            self.send_control_message(message)
         return message
 
     async def await_namespace(self, timeout: float = 10.0):
@@ -1936,7 +2263,7 @@ class _MOQTSessionMixin:
         prefix = self._make_namespace_tuple(namespace_prefix)
         message = UnsubscribeNamespace(namespace_prefix=prefix)
         logger.info(f"MOQT send: {message}")
-        self.send_control_message(message.serialize())
+        self.send_control_message(message)
         return message
 
 
@@ -1944,20 +2271,10 @@ class _MOQTSessionMixin:
     #  Inbound MoQT message handlers                                                              #
     ###############################################################################################
     
-    def default_message_handler(self, type: int,  msg: MOQTMessage) -> None:
-        """Call the standard message handler"""
-        _, handler = self.MOQT_CONTROL_MESSAGE_REGISTRY[type]
-        # Schedule handler if one exists
-        logger.info(f"MOQT event: calling default handler: {handler.__qualname__}")
-        if handler is not None:
-            task = asyncio.create_task(handler(self, msg))
-            task.add_done_callback(lambda t: self._tasks.discard(t))
-            self._tasks.add(task)       
-
     def register_handler(self, msg_type: int, handler: Callable) -> None:
-        """Register a custom message handler."""
-        (msg_class, _) = self._control_msg_registry[msg_type]
-        self._control_msg_registry[msg_type] = (msg_class, handler)
+        """Register a custom handler, overriding the default handler for
+        this message type on this session."""
+        self._control_msg_overrides[msg_type] = handler
     
     async def _handle_server_setup(self, msg: ServerSetup) -> None:
         logger.info(f"MOQT event: handle {msg}")
@@ -1977,27 +2294,27 @@ class _MOQTSessionMixin:
                 reason_phrase=error
             )
         else:
-            selected_version = msg.selected_version  # wire code, or None
+            selected_version = msg.selected_version
             if selected_version is None:
                 # Draft-16+ carries no version in ServerSetup: it was
                 # negotiated out-of-band — QUIC ALPN ("moqt-NN") for raw
                 # QUIC, WT-Available-Protocols for WebTransport. These are
-                # distinct mechanisms; don't conflate them. negotiated_draft
-                # is already resolved; derive the wire code for the check.
-                selected_version = moqt_version_from_draft(self.negotiated_draft)
+                # distinct mechanisms; don't conflate them.
+                selected_draft = self.negotiated_draft
                 _src = ("ALPN" if getattr(self, 'use_quic', False)
                         else "WT-Available-Protocols")
-                logger.info(f"MOQT event: d16+ ServerSetup (version from {_src}: 0x{selected_version:x})")
-            if selected_version not in MOQT_VERSIONS:
-                error = f"MOQT event: unsupported version in ServerSetup {hex(selected_version)}"
+                logger.info(f"MOQT event: d16+ ServerSetup (version from {_src}: draft-{selected_draft})")
+            else:
+                selected_draft = get_major_version(selected_version)
+            if selected_draft not in PROFILES:
+                error = f"MOQT event: unsupported version in ServerSetup draft-{selected_draft}"
                 logger.debug(error)
                 self._close_session(
                     error_code=SessionCloseCode.PROTOCOL_VIOLATION,
                     reason_phrase=error
                 )
             else:
-                self.negotiated_draft = get_major_version(selected_version)
-                set_moqt_ctx_version(self.negotiated_draft)
+                self.negotiated_draft = selected_draft
 
             # indicate moqt session setup is complete
             self._moqt_session_setup.set_result(True)
@@ -2022,10 +2339,10 @@ class _MOQTSessionMixin:
         else:
             # d14: version negotiated via msg.versions list.
             # d16+: version negotiated via ALPN; msg.versions is empty
-            # (the wire format omits it). Trust the ALPN-resolved draft
+            # (the wire format omits it). Trust the ALPN-resolved version
             # already set in self.negotiated_draft on ProtocolNegotiated.
             version_ok = (
-                is_draft16_or_later() or MOQT_CUR_VERSION in msg.versions
+                is_draft16_or_later(self.negotiated_draft) or MOQT_CUR_VERSION in msg.versions
             )
             if version_ok:
                 self.server_setup()
@@ -2042,11 +2359,11 @@ class _MOQTSessionMixin:
 
     async def _handle_publish_namepace(self, msg: PublishNamespace) -> None:
         logger.info(f"MOQT receive: {msg}")
-        if is_draft16_or_later():
+        if is_draft16_or_later(self.negotiated_draft):
             # d16: respond with REQUEST_OK instead of PublishNamespaceOk
             message = RequestOk(request_id=msg.request_id)
             logger.info(f"MOQT send: {message} request_id: {msg.request_id} namespace: {msg.namespace}")
-            self.send_control_message(message.serialize())
+            self.send_control_message(message)
         else:
             self.publish_namepace_ok(msg)
 
@@ -2168,7 +2485,17 @@ class _MOQTSessionMixin:
         stream_id = self._bidi_streams.get(msg.request_id)
         logger.debug(f"MOQT event: subscribe_namespace bidi_stream={stream_id} request_id={msg.request_id} bidi_streams={self._bidi_streams}")
         self.subscribe_namespace_ok(msg, stream_id=stream_id)
-           
+
+    async def _handle_subscribe_tracks(self, msg: SubscribeTracks) -> None:
+        # d18 SUBSCRIBE_TRACKS (0x51) — publisher-side track-prefix subscribe.
+        # Track-publish wiring is a publisher feature; log-only for now.
+        logger.info(f"MOQT event: handle {msg}")
+
+    async def _handle_publish_blocked(self, msg: PublishBlocked) -> None:
+        # d18 PUBLISH_BLOCKED (0x0F) — subscriber-side notice that a track
+        # cannot be published. Log-only for now.
+        logger.info(f"MOQT event: handle {msg}")
+
     async def _handle_subscribe_namespace_ok(self, msg: SubscribeNamespaceOk) -> None:
         logger.info(f"MOQT event: handle {msg}")
         self._resolve_request(msg.request_id, msg)
@@ -2295,8 +2622,6 @@ class _MOQTSessionMixin:
         # Update object status in local storage or notify subscribers            
 
 
-    # Draft-16 override registry for repurposed code points.
-    # When is_draft16_or_later(), these take precedence over the main registry.
     async def _handle_request_ok(self, msg: RequestOk) -> None:
         logger.info(f"MOQT event: handle {msg}")
         self._resolve_request(msg.request_id, msg)
@@ -2315,7 +2640,29 @@ class _MOQTSessionMixin:
     async def _handle_request_update(self, msg: RequestUpdate) -> None:
         logger.info(f"MOQT event: handle RequestUpdate: {msg}")
 
-    # MoQT message classes for serialize/deserialize, message handler methods (unbound)       
+    async def _handle_d18_setup(self, msg) -> None:
+        """draft-18 SETUP receive (§10.3). SETUP is symmetric: each peer
+        sends its own SETUP on its control write-uni (the client at
+        session init, the server on binding the control read-uni). On
+        receipt of the peer's SETUP the session is established."""
+        logger.info(f"MOQT event: handle d18 Setup: {msg}")
+        # Server side has no separate session-init step: bring up our own
+        # control write-uni and send SETUP on first receipt of the peer's
+        # SETUP (idempotent). The client brings its write-uni up eagerly in
+        # client_session_init.
+        if not self._is_client and self._d18_control_write_sid is None:
+            # Transport-aware: raw QUIC allocates a uni id synchronously,
+            # WT round-trips via create_stream. open_uni_stream handles both.
+            self._d18_control_write_sid = await self.open_uni_stream()
+            logger.info(
+                f"MOQT: d18 server control write-uni: "
+                f"{self._d18_control_write_sid}")
+            self.send_control_message(Setup(options={
+                SetupParamType.IMPLEMENTATION: USER_AGENT.encode()}))
+        if not self._moqt_session_setup.done():
+            self._moqt_session_setup.set_result(True)
+
+    # MoQT message classes for serialize/deserialize, message handler methods (unbound)
     MOQT_CONTROL_MESSAGE_REGISTRY: Dict[MOQTMessageType, Tuple[Type[MOQTMessage], Callable]] = {
        # Setup messages
        MOQTMessageType.CLIENT_SETUP: (ClientSetup, _handle_client_setup),
@@ -2366,17 +2713,60 @@ class _MOQTSessionMixin:
        MOQTMessageType.PUBLISH_ERROR: (PublishError, _handle_publish_error),
     }
 
-    MOQT_D16_OVERRIDE_REGISTRY: Dict[int, Tuple[Type[MOQTMessage], Callable]] = {
-        # Code point 0x05: d14=SUBSCRIBE_ERROR, d16=REQUEST_ERROR
-        0x05: (RequestError, _handle_request_error),
-        # Code point 0x07: d14=PUBLISH_NAMESPACE_OK, d16=REQUEST_OK
-        0x07: (RequestOk, _handle_request_ok),
-        # Code point 0x08: d14=PUBLISH_NAMESPACE_ERROR, d16=NAMESPACE
-        0x08: (Namespace, _handle_namespace),
-        # Code point 0x0E: d14=TRACK_STATUS_OK, d16=NAMESPACE_DONE
-        0x0E: (NamespaceDone, _handle_namespace_done),
-        # Code point 0x02: d14=SUBSCRIBE_UPDATE, d16=REQUEST_UPDATE
-        0x02: (RequestUpdate, _handle_request_update),
+    # Draft-16 deltas over the draft-14 base: 5 code points repurposed,
+    # 6 d14-only points dropped. The per-draft CONTROL_REGISTRY below is
+    # built from these once at class-definition time and is read-only at
+    # runtime, so a draft-14 session and a draft-16 session in the same
+    # event loop never share mutable dispatch state.
+    _D16_DELTA: Dict[int, Tuple[Type[MOQTMessage], Callable]] = {
+        0x02: (RequestUpdate, _handle_request_update),   # was SUBSCRIBE_UPDATE
+        0x05: (RequestError, _handle_request_error),     # was SUBSCRIBE_ERROR
+        0x07: (RequestOk, _handle_request_ok),           # was PUBLISH_NAMESPACE_OK
+        0x08: (Namespace, _handle_namespace),            # was PUBLISH_NAMESPACE_ERROR
+        0x0E: (NamespaceDone, _handle_namespace_done),   # was TRACK_STATUS_OK
+    }
+    # d16 = d14 base + repurposed code points. The d14-only points d16
+    # dropped (0x0F/0x12/0x13/0x14/0x19/0x1F) are RETAINED here as a
+    # lenient receive surface: the high-level namespace send paths still
+    # emit some of them on d16 (SUBSCRIBE_NAMESPACE_OK 0x12,
+    # UNSUBSCRIBE_NAMESPACE 0x14). Spec-strict pruning lands together
+    # with the d16 send-side corrections (REQUEST_OK 0x07 for
+    # namespace-ok; stream-reset for unsubscribe) as a d16-interop
+    # follow-up — pruning them now would reject those frames and break
+    # d16 namespace discovery against this library.
+    _D16_REGISTRY = {**MOQT_CONTROL_MESSAGE_REGISTRY, **_D16_DELTA}
+
+    # draft-18 dispatch tier (Phase 2 scaffold). Starts from the d16
+    # registry — most control messages carry over — and is amended with the
+    # d18 wire deltas as the d18 message classes land: type renumbering
+    # (SUBSCRIBE_NAMESPACE 0x11->0x50, SUBSCRIBE_TRACKS 0x51,
+    # PUBLISH_BLOCKED 0xF, SETUP 0x2F00), Request-ID-dropping replies, and
+    # removed messages (Phases 3/5/6, under aiomoqt/messages/d18/). Gated by
+    # AIOMOQT_ENABLE_D18 at the session API so it stays inert until the d18
+    # wire is complete — a per-draft dict, so it never shares mutable state
+    # with d14/d16 sessions.
+    _D18_REGISTRY = dict(_D16_REGISTRY)
+    # d18 SETUP is symmetric (type 0x2F00, also the control uni-stream
+    # type). The d16 CLIENT_SETUP/SERVER_SETUP code points (0x20/0x21) are
+    # RESERVED in d18 and never used.
+    _D18_REGISTRY.pop(MOQTMessageType.CLIENT_SETUP, None)
+    _D18_REGISTRY.pop(MOQTMessageType.SERVER_SETUP, None)
+    _D18_REGISTRY[MOQTMessageType.SETUP] = (Setup, _handle_d18_setup)
+    # d18 renumbers SUBSCRIBE_NAMESPACE 0x11 -> 0x50 and adds SUBSCRIBE_TRACKS
+    # 0x51 + PUBLISH_BLOCKED 0x0F (§10.18-10.20). 0x0F overwrites the d14
+    # TRACK_STATUS_ERROR point carried over leniently in the d16 base.
+    _D18_REGISTRY.pop(MOQTMessageType.SUBSCRIBE_NAMESPACE, None)  # old 0x11
+    _D18_REGISTRY[D18MessageType.SUBSCRIBE_NAMESPACE] = (
+        SubscribeNamespace, _handle_subscribe_namespace)
+    _D18_REGISTRY[D18MessageType.SUBSCRIBE_TRACKS] = (
+        SubscribeTracks, _handle_subscribe_tracks)
+    _D18_REGISTRY[D18MessageType.PUBLISH_BLOCKED] = (
+        PublishBlocked, _handle_publish_blocked)
+
+    CONTROL_REGISTRY: Dict[int, Dict[int, Tuple[Type[MOQTMessage], Callable]]] = {
+        MOQTDraft.DRAFT_14: MOQT_CONTROL_MESSAGE_REGISTRY,
+        MOQTDraft.DRAFT_16: _D16_REGISTRY,
+        MOQTDraft.DRAFT_18: _D18_REGISTRY,
     }
 
     # Stream data message types (dispatch by range check, not registry lookup)
@@ -2478,8 +2868,22 @@ class MOQTSessionWTServer(
 
     def __init__(self, transport, state, *, session: 'MOQTPeer'):
         super().__init__(transport, state, session=session)
-        drafts = getattr(session, 'supported_drafts', [])
-        if len(drafts) == 1:
-            set_moqt_ctx_version(drafts[0])
-            self.negotiated_draft = drafts[0]
+        _drafts = getattr(session, 'supported_drafts', None)
+        draft = _drafts[0] if _drafts and len(_drafts) == 1 else None
+        if draft is not None:
+            self.negotiated_draft = get_major_version(draft)
+        else:
+            # Learn the client's draft from the WT-Protocol this server
+            # selected (in-band WT-Available-Protocols -> WT-Protocol
+            # negotiation, surfaced by aiopquic as negotiated_protocol).
+            # If no subprotocol was negotiated (client offered none, or no
+            # overlap), fall back to the highest supported draft.
+            negotiated = self.negotiated_protocol
+            if negotiated:
+                self.negotiated_draft = get_major_version(
+                    moqt_version_from_alpn(negotiated))
+            else:
+                supported = getattr(session, 'supported_drafts', None)
+                if supported:
+                    self.negotiated_draft = max(get_major_version(d) for d in supported)
         self._moqt_wt_finalize()

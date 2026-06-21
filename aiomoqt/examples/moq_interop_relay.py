@@ -51,7 +51,7 @@ import sys
 
 from aiomoqt.server import MOQTServer
 from aiomoqt.types import (
-    MOQTMessageType, RequestErrorCode, SubscribeErrorCode,
+    MOQTMessageType, RequestErrorCode, SubscribeErrorCode, parse_draft_spec,
 )
 from aiomoqt.messages.request import RequestError
 from aiomoqt.context import is_draft16_or_later
@@ -115,7 +115,7 @@ async def _on_subscribe(session, msg):
     # On d16+ the universal REQUEST_ERROR (0x05) carries the not-found
     # code (0x10). On d14 the legacy SUBSCRIBE_ERROR (0x05) carries
     # TRACK_DOES_NOT_EXIST (0x04). Send the right shape per version.
-    if is_draft16_or_later():
+    if is_draft16_or_later(session.negotiated_draft):
         err = RequestError(
             request_id=msg.request_id,
             error_code=int(RequestErrorCode.DOES_NOT_EXIST),
@@ -123,7 +123,7 @@ async def _on_subscribe(session, msg):
             reason="track does not exist",
         )
         logger.info(f"MOQT send: {err}")
-        session.send_control_message(err.serialize())
+        session.send_control_message(err)
     else:
         session.subscribe_error(
             request_id=msg.request_id,
@@ -179,7 +179,7 @@ def parse_args():
                              "(shares the namespace table) — lets one "
                              "instance back both remote-webtransport "
                              "(--port) and remote-quic (--quic-port)")
-    parser.add_argument("--draft", type=int, default=16,
+    parser.add_argument("--draft", type=parse_draft_spec, default=16,
                         help="MoQT draft version (default: 16)")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug logging")

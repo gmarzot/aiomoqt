@@ -6,7 +6,7 @@ from ..types import (
     MOQTMessageType, FetchType, GroupOrder, ParamType,
     SessionCloseCode,
 )
-from ..context import is_draft16_or_later
+from ..context import is_draft16_or_later, DraftProfile
 from ..utils.buffer import Buffer
 from ..utils.logger import get_logger
 
@@ -48,13 +48,13 @@ class Fetch(MOQTMessage):
     def __post_init__(self):
         self.type = MOQTMessageType.FETCH
 
-    def serialize(self) -> Buffer:
+    def serialize(self, *, prof: DraftProfile) -> Buffer:
         buf = Buffer(capacity=BUF_SIZE)
         payload = Buffer(capacity=BUF_SIZE)
 
         payload.push_uint_var(self.request_id)
 
-        if is_draft16_or_later():
+        if is_draft16_or_later(prof.draft):
             # d16: priority and group_order live in params
             payload.push_uint_var(self.fetch_type)
         else:
@@ -87,15 +87,15 @@ class Fetch(MOQTMessage):
                 f"Invalid fetch_type: {self.fetch_type} "
                 f"(must be 0x1, 0x2, or 0x3)")
 
-        if is_draft16_or_later():
+        if is_draft16_or_later(prof.draft):
             params = dict(self.parameters)
             if self.subscriber_priority is not None:
                 params[ParamType.SUBSCRIBER_PRIORITY] = self.subscriber_priority
             if self.group_order is not None:
                 params[ParamType.GROUP_ORDER] = self.group_order
-            MOQTMessage._serialize_params(payload, params)
+            MOQTMessage._serialize_params(payload, params, prof=prof)
         else:
-            MOQTMessage._serialize_params(payload, self.parameters)
+            MOQTMessage._serialize_params(payload, self.parameters, prof=prof)
 
         buf.push_uint_var(self.type)
         buf.push_uint16(payload.tell())
@@ -103,7 +103,7 @@ class Fetch(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'Fetch':
+    def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'Fetch':
         namespace = None
         track_name = None
         start_group = None
@@ -117,7 +117,7 @@ class Fetch(MOQTMessage):
 
         request_id = buf.pull_uint_var()
 
-        if is_draft16_or_later():
+        if is_draft16_or_later(prof.draft):
             fetch_type = buf.pull_uint_var()
         else:
             subscriber_priority = buf.pull_uint8()
@@ -145,9 +145,9 @@ class Fetch(MOQTMessage):
                 f"Invalid fetch_type: {fetch_type} "
                 f"(spec §9.16: must be 0x1, 0x2, or 0x3)")
 
-        params = MOQTMessage._deserialize_params(buf)
+        params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
 
-        if is_draft16_or_later():
+        if is_draft16_or_later(prof.draft):
             subscriber_priority = params.pop(
                 ParamType.SUBSCRIBER_PRIORITY, 128)
             group_order = params.pop(
@@ -191,13 +191,13 @@ class FetchOk(MOQTMessage):
         if self.parameters is None:
             self.parameters = {}
 
-    def serialize(self) -> bytes:
+    def serialize(self, *, prof: DraftProfile) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
         payload = Buffer(capacity=BUF_SIZE)
 
         payload.push_uint_var(self.request_id)
 
-        if is_draft16_or_later():
+        if is_draft16_or_later(prof.draft):
             # d16: no group_order fixed field
             payload.push_uint8(self.end_of_track)
             payload.push_uint_var(self.largest_group_id)
@@ -205,7 +205,7 @@ class FetchOk(MOQTMessage):
             params = dict(self.parameters)
             if self.group_order is not None:
                 params[ParamType.GROUP_ORDER] = self.group_order
-            MOQTMessage._serialize_params(payload, params)
+            MOQTMessage._serialize_params(payload, params, prof=prof)
             MOQTMessage._extensions_encode(payload, self.track_extensions or {}, with_length=False)
         else:
             # d14: group_order as fixed field
@@ -213,7 +213,7 @@ class FetchOk(MOQTMessage):
             payload.push_uint8(self.end_of_track)
             payload.push_uint_var(self.largest_group_id)
             payload.push_uint_var(self.largest_object_id)
-            MOQTMessage._serialize_params(payload, self.parameters)
+            MOQTMessage._serialize_params(payload, self.parameters, prof=prof)
 
         buf.push_uint_var(self.type)
         buf.push_uint16(payload.tell())
@@ -221,18 +221,18 @@ class FetchOk(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'FetchOk':
+    def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'FetchOk':
         # buf_end is the absolute end-of-message position derived from
         # the outer frame length. Required for d16 (Track Extensions
         # have no length prefix; sequence runs to end of message).
         request_id = buf.pull_uint_var()
         track_extensions = None
 
-        if is_draft16_or_later():
+        if is_draft16_or_later(prof.draft):
             end_of_track = buf.pull_uint8()
             largest_group_id = buf.pull_uint_var()
             largest_object_id = buf.pull_uint_var()
-            params = MOQTMessage._deserialize_params(buf)
+            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
             group_order = params.pop(ParamType.GROUP_ORDER, GroupOrder.DESCENDING)
             track_extensions = MOQTMessage._extensions_decode(
                 buf, with_length=False, buf_end=buf_end)
@@ -241,7 +241,7 @@ class FetchOk(MOQTMessage):
             end_of_track = buf.pull_uint8()
             largest_group_id = buf.pull_uint_var()
             largest_object_id = buf.pull_uint_var()
-            params = MOQTMessage._deserialize_params(buf)
+            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
 
         return cls(
             request_id=request_id,
@@ -263,7 +263,7 @@ class FetchError(MOQTMessage):
     def __post_init__(self):
         self.type = MOQTMessageType.FETCH_ERROR
 
-    def serialize(self) -> bytes:
+    def serialize(self, *, prof: DraftProfile) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
         payload = Buffer(capacity=BUF_SIZE)
 
@@ -280,7 +280,7 @@ class FetchError(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'FetchError':
+    def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'FetchError':
 
         request_id = buf.pull_uint_var()
         error_code = buf.pull_uint_var()
@@ -301,7 +301,7 @@ class FetchCancel(MOQTMessage):
     def __post_init__(self):
         self.type = MOQTMessageType.FETCH_CANCEL
 
-    def serialize(self) -> bytes:
+    def serialize(self, *, prof: DraftProfile) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
         payload = Buffer(capacity=BUF_SIZE)
 
@@ -313,7 +313,7 @@ class FetchCancel(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'FetchCancel':
+    def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'FetchCancel':
 
         request_id = buf.pull_uint_var()
 

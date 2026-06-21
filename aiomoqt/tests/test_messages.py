@@ -549,7 +549,7 @@ def test_subgroup_header_d16_default_priority_no_extensions():
 
 
 def test_subgroup_header_d16_default_priority_with_extensions():
-    """Type 0x31: default priority + extensions (what Red5 sends)."""
+    """Type 0x31: default priority + extensions (interop-observed)."""
     buf = Buffer(capacity=64)
     buf.push_uint_var(0x31)
     buf.push_uint_var(1)     # track_alias
@@ -802,9 +802,13 @@ def test_fetch_object():
 
 from conftest import moqt_message_serialization_versioned
 from aiomoqt.types import MOQT_VERSION_DRAFT14, MOQT_VERSION_DRAFT16
+from aiomoqt.types import MOQT_VERSION_DRAFT18
 from aiomoqt.messages import (RequestOk, RequestError, RequestUpdate,
                                Namespace, NamespaceDone)
-from aiomoqt.types import D16MessageType
+from aiomoqt.messages import (SubscribeNamespace,
+                              PublishNamespaceDone, PublishNamespaceCancel)
+from aiomoqt.messages.d18.session_setup import Setup
+from aiomoqt.types import D16MessageType, D18MessageType
 
 
 class TestDraft16Setup:
@@ -1074,6 +1078,212 @@ class TestDraft16NewMessages:
         )
 
 
+class TestDraft18ControlMessages:
+    """Draft-18 column of the control-message round-trip matrix.
+
+    d18 forks the wire codec to vi64, encodes the FORWARD /
+    SUBSCRIBER_PRIORITY / GROUP_ORDER param *values* as uint8
+    (DraftProfile.uint8_params), renumbers SUBSCRIBE_NAMESPACE
+    0x11 -> 0x50, and drops the in-band Request ID from request
+    *replies* (it is demuxed from the request stream and injected by the
+    dispatcher at runtime, so it is absent on the wire here — hence
+    skip_fields={'request_id'} on the replies). SETUP is the symmetric
+    d18 message (0x2F00). d18 Fetch is pending (beta), so FETCH/FETCH_OK
+    are intentionally not covered.
+    """
+
+    D18 = MOQT_VERSION_DRAFT18
+
+    # ---- symmetric SETUP (0x2F00), count-less delta-coded options ----
+    def test_setup_d18(self):
+        assert moqt_message_serialization_versioned(
+            Setup,
+            {'options': {
+                SetupParamType.MAX_REQUEST_ID: 10000,
+                SetupParamType.IMPLEMENTATION: b'test-1.0',
+            }},
+            type_id=MOQTMessageType.SETUP,
+            version=self.D18,
+        )
+
+    # ---- SUBSCRIBE (request: keeps Request ID) ----
+    def test_subscribe_d18(self):
+        assert moqt_message_serialization_versioned(
+            Subscribe,
+            {
+                'request_id': 0,
+                'track_namespace': (b'live', b'sports'),
+                'track_name': b'football',
+                'priority': 128,
+                'group_order': GroupOrder.ASCENDING,
+                'forward': 1,
+                'filter_type': FilterType.LATEST_OBJECT,
+                'parameters': {},
+            },
+            type_id=MOQTMessageType.SUBSCRIBE,
+            version=self.D18,
+        )
+
+    def test_subscribe_d18_with_filter(self):
+        assert moqt_message_serialization_versioned(
+            Subscribe,
+            {
+                'request_id': 2,
+                'track_namespace': (b'vod',),
+                'track_name': b'movie',
+                'priority': 255,
+                'group_order': GroupOrder.DESCENDING,
+                'forward': 2,
+                'filter_type': FilterType.ABSOLUTE_RANGE,
+                'start_group': 10,
+                'start_object': 5,
+                'end_group': 100,
+                'parameters': {},
+            },
+            type_id=MOQTMessageType.SUBSCRIBE,
+            version=self.D18,
+        )
+
+    # ---- SUBSCRIBE_OK (reply: drops Request ID) ----
+    def test_subscribe_ok_d18(self):
+        assert moqt_message_serialization_versioned(
+            SubscribeOk,
+            {
+                'request_id': 0,
+                'track_alias': 42,
+                'expires': 300,
+                'group_order': GroupOrder.ASCENDING,
+                'content_exists': ContentExistsCode.EXISTS,
+                'largest_group_id': 50,
+                'largest_object_id': 200,
+                'parameters': {},
+                'track_extensions': {},
+            },
+            type_id=MOQTMessageType.SUBSCRIBE_OK,
+            version=self.D18,
+            skip_fields={'request_id', 'content_exists', 'track_extensions'},
+        )
+
+    # ---- PUBLISH (request) / PUBLISH_OK (reply) ----
+    def test_publish_d18(self):
+        assert moqt_message_serialization_versioned(
+            Publish,
+            {
+                'request_id': 1,
+                'track_namespace': (b'live', b'sports'),
+                'track_name': b'football',
+                'track_alias': 42,
+                'group_order': GroupOrder.ASCENDING,
+                'content_exists': ContentExistsCode.NO_CONTENT,
+                'forward': ForwardingPreference.SUBGROUP,
+                'parameters': {},
+                'track_extensions': {},
+            },
+            type_id=MOQTMessageType.PUBLISH,
+            version=self.D18,
+            skip_fields={'content_exists', 'track_extensions'},
+        )
+
+    def test_publish_ok_d18(self):
+        # PUBLISH_OK is a response (§10.1) → d18 omits the Request ID on the
+        # wire (demuxed from the request stream; the dispatcher injects it).
+        # request_id is skipped here because it is intentionally absent on
+        # the d18 wire, exactly like SubscribeOk / RequestOk / RequestError.
+        assert moqt_message_serialization_versioned(
+            PublishOk,
+            {
+                'request_id': 1,
+                'forward': ForwardingPreference.SUBGROUP,
+                'priority': 128,
+                'group_order': GroupOrder.ASCENDING,
+                'filter_type': FilterType.LATEST_OBJECT,
+                'parameters': {},
+            },
+            type_id=MOQTMessageType.PUBLISH_OK,
+            version=self.D18,
+            skip_fields={'request_id'},
+        )
+
+    # ---- request replies: RequestOk / RequestError drop Request ID ----
+    def test_request_ok_d18(self):
+        assert moqt_message_serialization_versioned(
+            RequestOk,
+            {'request_id': 5, 'parameters': {ParamType.EXPIRES: 300}},
+            type_id=D16MessageType.REQUEST_OK,
+            version=self.D18,
+            skip_fields={'request_id'},
+        )
+
+    def test_request_error_d18(self):
+        assert moqt_message_serialization_versioned(
+            RequestError,
+            {'request_id': 5, 'error_code': 0x10,
+             'retry_interval': 1000, 'reason': 'does not exist'},
+            type_id=D16MessageType.REQUEST_ERROR,
+            version=self.D18,
+            skip_fields={'request_id'},
+        )
+
+    # ---- REQUEST_UPDATE keeps Request ID; exercises uint8 param value ----
+    def test_request_update_d18_uint8_param(self):
+        # FORWARD (0x10) is a uint8-valued param at d18
+        # (DraftProfile.uint8_params), so this round-trips the uint8
+        # param-value codec path, not the varint one.
+        assert moqt_message_serialization_versioned(
+            RequestUpdate,
+            {'request_id': 10, 'existing_request_id': 5,
+             'parameters': {ParamType.FORWARD: 1}},
+            type_id=D16MessageType.REQUEST_UPDATE,
+            version=self.D18,
+        )
+
+    # ---- NAMESPACE / NAMESPACE_DONE ----
+    def test_namespace_d18(self):
+        assert moqt_message_serialization_versioned(
+            Namespace,
+            {'namespace_suffix': (b'live', b'sports')},
+            type_id=D16MessageType.NAMESPACE,
+            version=self.D18,
+        )
+
+    def test_namespace_done_d18(self):
+        assert moqt_message_serialization_versioned(
+            NamespaceDone,
+            {'namespace_suffix': (b'live', b'sports')},
+            type_id=D16MessageType.NAMESPACE_DONE,
+            version=self.D18,
+        )
+
+    # ---- PUBLISH_NAMESPACE_DONE / _CANCEL (request: keep Request ID) ----
+    def test_publish_namespace_done_d18(self):
+        assert moqt_message_serialization_versioned(
+            PublishNamespaceDone,
+            {'request_id': 42},
+            type_id=MOQTMessageType.PUBLISH_NAMESPACE_DONE,
+            version=self.D18,
+            skip_fields={'namespace'},
+        )
+
+    def test_publish_namespace_cancel_d18(self):
+        assert moqt_message_serialization_versioned(
+            PublishNamespaceCancel,
+            {'request_id': 7, 'error_code': 0x10, 'reason': 'gone'},
+            type_id=MOQTMessageType.PUBLISH_NAMESPACE_CANCEL,
+            version=self.D18,
+            skip_fields={'namespace'},
+        )
+
+    # ---- SUBSCRIBE_NAMESPACE: renumbered 0x11 -> 0x50 at d18 ----
+    def test_subscribe_namespace_d18_renumbered(self):
+        assert moqt_message_serialization_versioned(
+            SubscribeNamespace,
+            {'request_id': 3, 'namespace_prefix': (b'live',),
+             'parameters': {}},
+            type_id=D18MessageType.SUBSCRIBE_NAMESPACE,
+            version=self.D18,
+        )
+
+
 # ========================================================================
 # Phase 2 — SUBSCRIBE filter type matrix (d14 + d16)
 # ========================================================================
@@ -1295,7 +1505,7 @@ class TestFetchD14AllTypes:
 # Phase 3 — FetchObject round-trip matrix
 # ========================================================================
 
-from aiomoqt.context import set_moqt_ctx_version, get_moqt_ctx_version
+from aiomoqt.context import get_major_version, profile_for
 from aiomoqt.messages.track import (
     FETCH_FLAG_SG_ZERO, FETCH_FLAG_SG_PRIOR, FETCH_FLAG_SG_PRIOR_PLUS,
     FETCH_FLAG_SG_PRESENT, FETCH_FLAG_OBJECT_ID_PRESENT,
@@ -1306,15 +1516,11 @@ from aiomoqt.messages.track import (
 
 
 def _fetch_object_roundtrip(obj, version, prior=None):
-    """Serialize and deserialize a FetchObject, return the result."""
-    prev = get_moqt_ctx_version()
-    set_moqt_ctx_version(version)
-    try:
-        buf = obj.serialize()
-        buf.seek(0)
-        return FetchObject.deserialize(buf, prior=prior)
-    finally:
-        set_moqt_ctx_version(prev)
+    """Serialize and deserialize a FetchObject at the given draft."""
+    draft = get_major_version(version)
+    buf = obj.serialize(prof=profile_for(draft))
+    buf.seek(0)
+    return FetchObject.deserialize(buf, prior=prior, prof=profile_for(draft))
 
 
 class TestFetchObjectD14:
@@ -1392,175 +1598,140 @@ class TestFetchObjectD16:
         prior = FetchObject(group_id=5, subgroup_id=0, object_id=10,
                             publisher_priority=128, payload=b'')
         # Manually build a delta-encoded buffer: flags without OBJECT_ID
-        prev = get_moqt_ctx_version()
-        set_moqt_ctx_version(MOQT_VERSION_DRAFT16)
-        try:
-            from aiomoqt.messages.track import BUF_SIZE
-            buf = Buffer(capacity=BUF_SIZE)
-            flags = (FETCH_FLAG_SG_PRESENT
-                     | FETCH_FLAG_GROUP_ID_PRESENT
-                     | FETCH_FLAG_PRIORITY_PRESENT)
-            # Note: OBJECT_ID_PRESENT is NOT set
-            buf.push_uint_var(flags)
-            buf.push_uint_var(5)   # group_id
-            buf.push_uint_var(0)   # subgroup_id (SG_PRESENT)
-            # object_id omitted — derived as prior.object_id + 1 = 11
-            buf.push_uint8(128)    # priority
-            buf.push_uint_var(4)   # payload_len
-            buf.push_bytes(b'next')
-            buf.seek(0)
-            result = FetchObject.deserialize(buf, prior=prior)
-        finally:
-            set_moqt_ctx_version(prev)
+        from aiomoqt.messages.track import BUF_SIZE
+        buf = Buffer(capacity=BUF_SIZE)
+        flags = (FETCH_FLAG_SG_PRESENT
+                 | FETCH_FLAG_GROUP_ID_PRESENT
+                 | FETCH_FLAG_PRIORITY_PRESENT)
+        # Note: OBJECT_ID_PRESENT is NOT set
+        buf.push_uint_var(flags)
+        buf.push_uint_var(5)   # group_id
+        buf.push_uint_var(0)   # subgroup_id (SG_PRESENT)
+        # object_id omitted — derived as prior.object_id + 1 = 11
+        buf.push_uint8(128)    # priority
+        buf.push_uint_var(4)   # payload_len
+        buf.push_bytes(b'next')
+        buf.seek(0)
+        result = FetchObject.deserialize(buf, prior=prior, prof=profile_for(16))
         assert result.object_id == 11
 
     def test_delta_group_id(self):
         """Group ID absent (flag 0x08 unset) → same as prior group."""
         prior = FetchObject(group_id=7, subgroup_id=0, object_id=3,
                             publisher_priority=128, payload=b'')
-        prev = get_moqt_ctx_version()
-        set_moqt_ctx_version(MOQT_VERSION_DRAFT16)
-        try:
-            from aiomoqt.messages.track import BUF_SIZE
-            buf = Buffer(capacity=BUF_SIZE)
-            flags = (FETCH_FLAG_SG_PRESENT
-                     | FETCH_FLAG_OBJECT_ID_PRESENT
-                     | FETCH_FLAG_PRIORITY_PRESENT)
-            # GROUP_ID_PRESENT NOT set
-            buf.push_uint_var(flags)
-            # group_id omitted — derived from prior
-            buf.push_uint_var(2)   # subgroup_id (SG_PRESENT)
-            buf.push_uint_var(4)   # object_id
-            buf.push_uint8(100)    # priority
-            buf.push_uint_var(3)
-            buf.push_bytes(b'dat')
-            buf.seek(0)
-            result = FetchObject.deserialize(buf, prior=prior)
-        finally:
-            set_moqt_ctx_version(prev)
+        from aiomoqt.messages.track import BUF_SIZE
+        buf = Buffer(capacity=BUF_SIZE)
+        flags = (FETCH_FLAG_SG_PRESENT
+                 | FETCH_FLAG_OBJECT_ID_PRESENT
+                 | FETCH_FLAG_PRIORITY_PRESENT)
+        # GROUP_ID_PRESENT NOT set
+        buf.push_uint_var(flags)
+        # group_id omitted — derived from prior
+        buf.push_uint_var(2)   # subgroup_id (SG_PRESENT)
+        buf.push_uint_var(4)   # object_id
+        buf.push_uint8(100)    # priority
+        buf.push_uint_var(3)
+        buf.push_bytes(b'dat')
+        buf.seek(0)
+        result = FetchObject.deserialize(buf, prior=prior, prof=profile_for(16))
         assert result.group_id == 7  # from prior
 
     def test_delta_priority(self):
         """Priority absent (flag 0x10 unset) → same as prior."""
         prior = FetchObject(group_id=1, subgroup_id=0, object_id=0,
                             publisher_priority=42, payload=b'')
-        prev = get_moqt_ctx_version()
-        set_moqt_ctx_version(MOQT_VERSION_DRAFT16)
-        try:
-            from aiomoqt.messages.track import BUF_SIZE
-            buf = Buffer(capacity=BUF_SIZE)
-            flags = (FETCH_FLAG_SG_PRESENT
-                     | FETCH_FLAG_OBJECT_ID_PRESENT
-                     | FETCH_FLAG_GROUP_ID_PRESENT)
-            # PRIORITY_PRESENT NOT set
-            buf.push_uint_var(flags)
-            buf.push_uint_var(1)   # group_id
-            buf.push_uint_var(0)   # subgroup_id
-            buf.push_uint_var(1)   # object_id
-            # priority omitted
-            buf.push_uint_var(2)
-            buf.push_bytes(b'ab')
-            buf.seek(0)
-            result = FetchObject.deserialize(buf, prior=prior)
-        finally:
-            set_moqt_ctx_version(prev)
+        from aiomoqt.messages.track import BUF_SIZE
+        buf = Buffer(capacity=BUF_SIZE)
+        flags = (FETCH_FLAG_SG_PRESENT
+                 | FETCH_FLAG_OBJECT_ID_PRESENT
+                 | FETCH_FLAG_GROUP_ID_PRESENT)
+        # PRIORITY_PRESENT NOT set
+        buf.push_uint_var(flags)
+        buf.push_uint_var(1)   # group_id
+        buf.push_uint_var(0)   # subgroup_id
+        buf.push_uint_var(1)   # object_id
+        # priority omitted
+        buf.push_uint_var(2)
+        buf.push_bytes(b'ab')
+        buf.seek(0)
+        result = FetchObject.deserialize(buf, prior=prior, prof=profile_for(16))
         assert result.publisher_priority == 42  # from prior
 
     def test_subgroup_mode_zero(self):
         """SG mode 0x00 → subgroup_id = 0."""
-        prev = get_moqt_ctx_version()
-        set_moqt_ctx_version(MOQT_VERSION_DRAFT16)
-        try:
-            from aiomoqt.messages.track import BUF_SIZE
-            buf = Buffer(capacity=BUF_SIZE)
-            flags = (FETCH_FLAG_SG_ZERO
-                     | FETCH_FLAG_OBJECT_ID_PRESENT
-                     | FETCH_FLAG_GROUP_ID_PRESENT
-                     | FETCH_FLAG_PRIORITY_PRESENT)
-            buf.push_uint_var(flags)
-            buf.push_uint_var(2)   # group_id
-            # subgroup_id NOT present (mode=zero)
-            buf.push_uint_var(5)   # object_id
-            buf.push_uint8(128)
-            buf.push_uint_var(0)
-            buf.push_uint_var(ObjectStatus.END_OF_GROUP)
-            buf.seek(0)
-            result = FetchObject.deserialize(buf, prior=None)
-        finally:
-            set_moqt_ctx_version(prev)
+        from aiomoqt.messages.track import BUF_SIZE
+        buf = Buffer(capacity=BUF_SIZE)
+        flags = (FETCH_FLAG_SG_ZERO
+                 | FETCH_FLAG_OBJECT_ID_PRESENT
+                 | FETCH_FLAG_GROUP_ID_PRESENT
+                 | FETCH_FLAG_PRIORITY_PRESENT)
+        buf.push_uint_var(flags)
+        buf.push_uint_var(2)   # group_id
+        # subgroup_id NOT present (mode=zero)
+        buf.push_uint_var(5)   # object_id
+        buf.push_uint8(128)
+        buf.push_uint_var(0)
+        buf.push_uint_var(ObjectStatus.END_OF_GROUP)
+        buf.seek(0)
+        result = FetchObject.deserialize(buf, prior=None, prof=profile_for(16))
         assert result.subgroup_id == 0
 
     def test_subgroup_mode_prior(self):
         """SG mode 0x01 → subgroup_id = prior's subgroup_id."""
         prior = FetchObject(group_id=1, subgroup_id=7, object_id=0,
                             publisher_priority=128, payload=b'')
-        prev = get_moqt_ctx_version()
-        set_moqt_ctx_version(MOQT_VERSION_DRAFT16)
-        try:
-            from aiomoqt.messages.track import BUF_SIZE
-            buf = Buffer(capacity=BUF_SIZE)
-            flags = (FETCH_FLAG_SG_PRIOR
-                     | FETCH_FLAG_OBJECT_ID_PRESENT
-                     | FETCH_FLAG_GROUP_ID_PRESENT
-                     | FETCH_FLAG_PRIORITY_PRESENT)
-            buf.push_uint_var(flags)
-            buf.push_uint_var(1)   # group_id
-            buf.push_uint_var(1)   # object_id
-            buf.push_uint8(128)
-            buf.push_uint_var(1)
-            buf.push_bytes(b'x')
-            buf.seek(0)
-            result = FetchObject.deserialize(buf, prior=prior)
-        finally:
-            set_moqt_ctx_version(prev)
+        from aiomoqt.messages.track import BUF_SIZE
+        buf = Buffer(capacity=BUF_SIZE)
+        flags = (FETCH_FLAG_SG_PRIOR
+                 | FETCH_FLAG_OBJECT_ID_PRESENT
+                 | FETCH_FLAG_GROUP_ID_PRESENT
+                 | FETCH_FLAG_PRIORITY_PRESENT)
+        buf.push_uint_var(flags)
+        buf.push_uint_var(1)   # group_id
+        buf.push_uint_var(1)   # object_id
+        buf.push_uint8(128)
+        buf.push_uint_var(1)
+        buf.push_bytes(b'x')
+        buf.seek(0)
+        result = FetchObject.deserialize(buf, prior=prior, prof=profile_for(16))
         assert result.subgroup_id == 7  # from prior
 
     def test_subgroup_mode_prior_plus(self):
         """SG mode 0x02 → subgroup_id = prior + 1."""
         prior = FetchObject(group_id=1, subgroup_id=7, object_id=0,
                             publisher_priority=128, payload=b'')
-        prev = get_moqt_ctx_version()
-        set_moqt_ctx_version(MOQT_VERSION_DRAFT16)
-        try:
-            from aiomoqt.messages.track import BUF_SIZE
-            buf = Buffer(capacity=BUF_SIZE)
-            flags = (FETCH_FLAG_SG_PRIOR_PLUS
-                     | FETCH_FLAG_OBJECT_ID_PRESENT
-                     | FETCH_FLAG_GROUP_ID_PRESENT
-                     | FETCH_FLAG_PRIORITY_PRESENT)
-            buf.push_uint_var(flags)
-            buf.push_uint_var(1)   # group_id
-            buf.push_uint_var(1)   # object_id
-            buf.push_uint8(128)
-            buf.push_uint_var(1)
-            buf.push_bytes(b'y')
-            buf.seek(0)
-            result = FetchObject.deserialize(buf, prior=prior)
-        finally:
-            set_moqt_ctx_version(prev)
+        from aiomoqt.messages.track import BUF_SIZE
+        buf = Buffer(capacity=BUF_SIZE)
+        flags = (FETCH_FLAG_SG_PRIOR_PLUS
+                 | FETCH_FLAG_OBJECT_ID_PRESENT
+                 | FETCH_FLAG_GROUP_ID_PRESENT
+                 | FETCH_FLAG_PRIORITY_PRESENT)
+        buf.push_uint_var(flags)
+        buf.push_uint_var(1)   # group_id
+        buf.push_uint_var(1)   # object_id
+        buf.push_uint8(128)
+        buf.push_uint_var(1)
+        buf.push_bytes(b'y')
+        buf.seek(0)
+        result = FetchObject.deserialize(buf, prior=prior, prof=profile_for(16))
         assert result.subgroup_id == 8  # prior + 1
 
     def test_datagram_pref(self):
         """Datagram preference flag (0x40) → subgroup_id = 0."""
-        prev = get_moqt_ctx_version()
-        set_moqt_ctx_version(MOQT_VERSION_DRAFT16)
-        try:
-            from aiomoqt.messages.track import BUF_SIZE
-            buf = Buffer(capacity=BUF_SIZE)
-            flags = (FETCH_FLAG_DATAGRAM
-                     | FETCH_FLAG_OBJECT_ID_PRESENT
-                     | FETCH_FLAG_GROUP_ID_PRESENT
-                     | FETCH_FLAG_PRIORITY_PRESENT)
-            buf.push_uint_var(flags)
-            buf.push_uint_var(1)   # group_id
-            buf.push_uint_var(0)   # object_id
-            buf.push_uint8(128)
-            buf.push_uint_var(4)
-            buf.push_bytes(b'dgrm')
-            buf.seek(0)
-            result = FetchObject.deserialize(buf, prior=None)
-        finally:
-            set_moqt_ctx_version(prev)
+        from aiomoqt.messages.track import BUF_SIZE
+        buf = Buffer(capacity=BUF_SIZE)
+        flags = (FETCH_FLAG_DATAGRAM
+                 | FETCH_FLAG_OBJECT_ID_PRESENT
+                 | FETCH_FLAG_GROUP_ID_PRESENT
+                 | FETCH_FLAG_PRIORITY_PRESENT)
+        buf.push_uint_var(flags)
+        buf.push_uint_var(1)   # group_id
+        buf.push_uint_var(0)   # object_id
+        buf.push_uint8(128)
+        buf.push_uint_var(4)
+        buf.push_bytes(b'dgrm')
+        buf.seek(0)
+        result = FetchObject.deserialize(buf, prior=None, prof=profile_for(16))
         assert result.subgroup_id == 0
 
     def test_end_of_range_non_existent(self):
@@ -1601,39 +1772,29 @@ class TestFetchObjectD16:
 
     def test_first_object_missing_group_id_raises(self):
         """First object on stream missing Group ID → ValueError."""
-        prev = get_moqt_ctx_version()
-        set_moqt_ctx_version(MOQT_VERSION_DRAFT16)
-        try:
-            from aiomoqt.messages.track import BUF_SIZE
-            buf = Buffer(capacity=BUF_SIZE)
-            # flags: no GROUP_ID, no OBJECT_ID
-            flags = (FETCH_FLAG_SG_PRESENT | FETCH_FLAG_PRIORITY_PRESENT)
-            buf.push_uint_var(flags)
-            buf.push_uint_var(0)   # subgroup_id
-            buf.push_uint8(128)
-            buf.push_uint_var(1)
-            buf.push_bytes(b'x')
-            buf.seek(0)
-            with pytest.raises(ValueError, match="first object"):
-                FetchObject.deserialize(buf, prior=None)
-        finally:
-            set_moqt_ctx_version(prev)
+        from aiomoqt.messages.track import BUF_SIZE
+        buf = Buffer(capacity=BUF_SIZE)
+        # flags: no GROUP_ID, no OBJECT_ID
+        flags = (FETCH_FLAG_SG_PRESENT | FETCH_FLAG_PRIORITY_PRESENT)
+        buf.push_uint_var(flags)
+        buf.push_uint_var(0)   # subgroup_id
+        buf.push_uint8(128)
+        buf.push_uint_var(1)
+        buf.push_bytes(b'x')
+        buf.seek(0)
+        with pytest.raises(ValueError, match="first object"):
+            FetchObject.deserialize(buf, prior=None, prof=profile_for(16))
 
     def test_invalid_flags_high_bit(self):
         """Flags >= 0x80 (excluding known end-of-range) → ValueError."""
-        prev = get_moqt_ctx_version()
-        set_moqt_ctx_version(MOQT_VERSION_DRAFT16)
-        try:
-            from aiomoqt.messages.track import BUF_SIZE
-            buf = Buffer(capacity=BUF_SIZE)
-            buf.push_uint_var(0x80)  # invalid flags
-            buf.push_uint_var(0)
-            buf.push_uint_var(0)
-            buf.seek(0)
-            with pytest.raises(ValueError, match="invalid serialization flags"):
-                FetchObject.deserialize(buf, prior=None)
-        finally:
-            set_moqt_ctx_version(prev)
+        from aiomoqt.messages.track import BUF_SIZE
+        buf = Buffer(capacity=BUF_SIZE)
+        buf.push_uint_var(0x80)  # invalid flags
+        buf.push_uint_var(0)
+        buf.push_uint_var(0)
+        buf.seek(0)
+        with pytest.raises(ValueError, match="invalid serialization flags"):
+            FetchObject.deserialize(buf, prior=None, prof=profile_for(16))
 
 
 # ========================================================================

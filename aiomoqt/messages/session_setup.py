@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Any, Optional
 
 from . import MOQTMessageType, MOQTMessage, SetupParamType, BUF_SIZE
-from ..context import is_draft16_or_later
+from ..context import DraftProfile
 from ..utils.buffer import Buffer, BufferReadError
 from ..utils.logger import get_logger
 
@@ -23,16 +23,15 @@ class ServerSetup(MOQTMessage):
     def __post_init__(self):
         self.type = MOQTMessageType.SERVER_SETUP
 
-    def serialize(self) -> Buffer:
+    def serialize(self, *, prof: DraftProfile) -> Buffer:
         buf = Buffer(capacity=BUF_SIZE)
         payload = Buffer(capacity=BUF_SIZE)
 
         # Draft-14: version on wire; Draft-16: version via ALPN
-        if not is_draft16_or_later():
+        if prof.setup_carries_versions:
             payload.push_uint_var(self.selected_version)
 
-        MOQTMessage._serialize_params(payload, self.parameters,
-                                      delta_keys=None)
+        MOQTMessage._serialize_params(payload, self.parameters, prof=prof)
 
         buf.push_uint_var(self.type)
         buf.push_uint16(payload.tell())
@@ -40,13 +39,14 @@ class ServerSetup(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'ServerSetup':
+    def deserialize(cls, buf: Buffer, *, prof: DraftProfile,
+                    buf_end: Optional[int] = None) -> 'ServerSetup':
         """Handle SERVER_SETUP message."""
         version = None
-        if not is_draft16_or_later():
+        if prof.setup_carries_versions:
             version = buf.pull_uint_var()
-        params = MOQTMessage._deserialize_params(buf,
-                                                  delta_keys=None)
+        params = MOQTMessage._deserialize_params(buf, prof=prof,
+                                                 buf_end=buf_end)
         return cls(selected_version=version, parameters=params)
 
 
@@ -64,18 +64,17 @@ class ClientSetup(MOQTMessage):
     def __post_init__(self):
         self.type = MOQTMessageType.CLIENT_SETUP
 
-    def serialize(self) -> Buffer:
+    def serialize(self, *, prof: DraftProfile) -> Buffer:
         buf = Buffer(capacity=BUF_SIZE)
         payload = Buffer(capacity=BUF_SIZE)
 
         # Draft-14: versions on wire; Draft-16: version via ALPN
-        if not is_draft16_or_later():
+        if prof.setup_carries_versions:
             payload.push_uint_var(len(self.versions))
             for version in self.versions:
                 payload.push_uint_var(version)
 
-        MOQTMessage._serialize_params(payload, self.parameters,
-                                      delta_keys=None)
+        MOQTMessage._serialize_params(payload, self.parameters, prof=prof)
 
         buf.push_uint_var(self.type)
         buf.push_uint16(payload.tell())
@@ -83,15 +82,16 @@ class ClientSetup(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'ClientSetup':
+    def deserialize(cls, buf: Buffer, *, prof: DraftProfile,
+                    buf_end: Optional[int] = None) -> 'ClientSetup':
         """Handle CLIENT_SETUP message."""
         versions = []
-        if not is_draft16_or_later():
+        if prof.setup_carries_versions:
             version_count = buf.pull_uint_var()
             for _ in range(version_count):
                 versions.append(buf.pull_uint_var())
-        params = MOQTMessage._deserialize_params(buf,
-                                                  delta_keys=None)
+        params = MOQTMessage._deserialize_params(buf, prof=prof,
+                                                 buf_end=buf_end)
         return cls(versions=versions, parameters=params)
         
 
@@ -99,23 +99,24 @@ class ClientSetup(MOQTMessage):
 class GoAway(MOQTMessage):
     new_session_uri: str = None
 
+    # New Session URI maximum length: 8 KiB.
+    MAX_URI_LENGTH = 8192
+
     def __post_init__(self):
         self.type = MOQTMessageType.GOAWAY
 
-    def serialize(self) -> Buffer:
+    def serialize(self, *, prof: DraftProfile) -> Buffer:
         buf = Buffer(capacity=BUF_SIZE)
         payload = Buffer(capacity=BUF_SIZE)
-        
+
         uri_bytes = self.new_session_uri.encode()
-        
-        # Enforce maximum URI length of 8,192 bytes
-        if len(uri_bytes) > 8192:
-            raise ValueError("New Session URI exceeds maximum length of 8,192 bytes")
-        
+        if len(uri_bytes) > self.MAX_URI_LENGTH:
+            raise ValueError(
+                "New Session URI exceeds maximum length (8 KiB)")
+
         payload.push_uint_var(len(uri_bytes))  # uri length
         payload.push_bytes(uri_bytes)
-        
-        # Write message
+
         buf.push_uint_var(self.type)
         buf.push_uint16(payload.tell())
         buf.push_bytes(payload.data)
@@ -123,14 +124,14 @@ class GoAway(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'GoAway':
-        """Handle GOAWAY message."""        
+    def deserialize(cls, buf: Buffer, *, prof: DraftProfile,
+                    buf_end: Optional[int] = None) -> 'GoAway':
+        """Handle GOAWAY message."""
         uri_len = buf.pull_uint_var()
-        
-        # Enforce maximum URI length of 8,192 bytes
-        if uri_len > 8192:
-            raise BufferReadError("New Session URI exceeds maximum length of 8,192 bytes")
-        
+        if uri_len > cls.MAX_URI_LENGTH:
+            raise BufferReadError(
+                "New Session URI exceeds maximum length (8 KiB)")
+
         uri = buf.pull_bytes(uri_len).decode()
 
         return cls(new_session_uri=uri)

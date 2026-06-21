@@ -136,11 +136,13 @@ class TestMoqtClientDraftValidation:
         c = MOQTClient("localhost", 4433, supported_drafts=16)
         assert c.supported_drafts == [16]
 
-    def test_accepts_draft_list_normalized_newest_first(self):
+    def test_accepts_draft_list_preserves_caller_order(self):
         from aiomoqt.client import MOQTClient
+        # Explicit lists keep the caller's order (so a relay's preferred
+        # draft can be offered first); only the None auto-offer sorts.
         c = MOQTClient("localhost", 4433, supported_drafts=[14, 16])
-        assert c.supported_drafts == [16, 14]
-        # duplicates collapse
+        assert c.supported_drafts == [14, 16]
+        # duplicates collapse, order preserved
         c = MOQTClient("localhost", 4433, supported_drafts=[16, 16, 14])
         assert c.supported_drafts == [16, 14]
 

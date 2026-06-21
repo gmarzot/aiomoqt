@@ -4,13 +4,14 @@
 
 ## Overview
 
-`aiomoqt` implements the MoQT protocol with **dual draft-14 / draft-16 support**, both publish and subscribe roles, H3/WebTransport and raw QUIC transports, and ALPN-based draft negotiation. The architecture extends `aiopquic.asyncio.QuicConnectionProtocol`. The package ships publisher / subscriber example clients, a benchmark suite, a relay version probe, and a [moq-interop-runner](https://github.com/englishm/moq-interop-runner)-compatible test client.
+`aiomoqt` implements the MoQT protocol with **draft-14 / draft-16 / draft-18 (beta) support**, both publish and subscribe roles, H3/WebTransport and raw QUIC transports, and ALPN-based draft negotiation. The architecture extends `aiopquic.asyncio.QuicConnectionProtocol`. The package ships publisher / subscriber example clients, a benchmark suite, a relay version probe, and a [moq-interop-runner](https://github.com/englishm/moq-interop-runner)-compatible test client.
 
 ### Features
 
 - H3/WebTransport and raw QUIC transports
-- Draft-14 / draft-16 ALPN negotiation (`moq-00` / `moqt-16`)
+- Draft-14 / draft-16 / draft-18 negotiation (ALPN `moq-00` / `moqt-16`; d18 via ALPN / WT-Protocol)
 - Draft-16 wire format: delta-encoded param keys, track extensions, unified request/response
+- Draft-18 (beta): vi64 varints, uni-stream control pair, per-request bidi streams, Request-ID-less replies — over both raw QUIC and WebTransport
 - SubgroupHeader / ObjectDatagram flag encoding, delta-encoded object IDs
 - Version-independent control: `MOQTRequestError` exception across drafts
 - Async context manager for session lifecycle
@@ -240,13 +241,14 @@ python -m aiomoqt.examples.server_example \
 ## Interop
 
 Validated against live public relays — OpenMoQ moqx, Meta moxygen,
-Cloudflare moq-rs, Quicr libquicr, Meetecho imquic, Red5 Pro, OzU
-moqtail — across draft-14/draft-16 and both transports, using the
+Cloudflare moq-rs, Quicr libquicr, Meetecho imquic, OzU moqtail —
+across draft-14/draft-16 and both transports, using the
 [moq-interop-runner](https://github.com/englishm/moq-interop-runner)
 cases plus a multi-subscriber pub-sub bench. The full point-in-time
 matrix lives in [PERFORMANCE.md](PERFORMANCE.md#interop-matrix-point-in-time);
 the relay catalog with per-endpoint notes is
-[`tests/relays.json`](tests/relays.json).
+[`tests/relays.json`](tests/relays.json). Red5 Pro was interop-tested
+in earlier cycles and is currently untested/unverified.
 
 ## Performance
 
@@ -279,6 +281,7 @@ pytest aiomoqt/tests/
 
 ## Known Limitations
 
+- **draft-18 is beta.** Negotiated by default (`(18, 16, 14)`, newest-first) over raw QUIC and WebTransport, with control + SUBGROUP object delivery validated end to end. Not yet complete: SUBSCRIBE / PUBLISH subscription-filter and largest-location still use the d16 nested form; d18 FETCH is pending; Track-Properties extensions encode as RFC9000 varints (correct for the small values in use). draft-14 / draft-16 are unaffected and remain the stable path.
 - **WebTransport fetch / join routing** -- four `[wt]` test variants of FETCH and JOINING_SUBSCRIBE return empty results when the underlying transport is WebTransport. Raw-QUIC variants of the same tests pass and cover the MoQT-level invariant. Tracked separately; affects WT-only consumers of fetch/join.
 
 ## TODO

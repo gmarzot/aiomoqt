@@ -14,6 +14,8 @@ import argparse
 import asyncio
 import sys
 
+from aiomoqt.types import parse_draft_spec
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -76,7 +78,7 @@ examples:
         '-k', '--insecure', action='store_true',
         help='Skip TLS certificate verification')
     parser.add_argument(
-        '--draft', type=int, default=None,
+        '--draft', type=parse_draft_spec, default=None,
         help='MoQT draft version (default: tool default)')
     parser.add_argument(
         '--cc-algo', type=str, default=None,

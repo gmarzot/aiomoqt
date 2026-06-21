@@ -130,7 +130,7 @@ def _make_fetch_handler(cache: FetchTestCache):
                     publisher_priority=128,
                     payload=payload,
                 )
-                buf = obj.serialize()
+                buf = obj.serialize(prof=session._profile)
                 session.stream_write(stream_id, buf.data)
 
         # FIN the stream
@@ -531,7 +531,7 @@ async def test_fetch_cancel_mid_stream(use_quic):
                     group_id=g, subgroup_id=0, object_id=o,
                     publisher_priority=128, payload=payload,
                 )
-                buf = obj.serialize()
+                buf = obj.serialize(prof=session._profile)
                 try:
                     session.stream_write(stream_id, buf.data)
                 except Exception:
@@ -545,6 +545,7 @@ async def test_fetch_cancel_mid_stream(use_quic):
         certificate=CERT, private_key=KEY,
         path="/",
         use_quic=use_quic,
+        supported_drafts=14,
     )
     server.register_handler(MOQTMessageType.FETCH, _slow_fetch)
     server_handle = await server.serve()
@@ -575,7 +576,7 @@ async def test_fetch_cancel_mid_stream(use_quic):
 
             # Send FETCH_CANCEL
             cancel = FetchCancel(request_id=fetch_msg.request_id)
-            session.send_control_message(cancel.serialize())
+            session.send_control_message(cancel)
 
             await asyncio.sleep(0.3)
 

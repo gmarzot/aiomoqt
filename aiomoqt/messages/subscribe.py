@@ -3,7 +3,7 @@ from typing import Tuple, Dict, Optional, Any
 from dataclasses import dataclass, field
 
 from . import MOQTMessage, BUF_SIZE
-from ..context import is_draft16_or_later
+from ..context import is_draft16_or_later, DraftProfile
 from ..utils.buffer import Buffer, BufferReadError
 from ..utils.logger import get_logger
 
@@ -32,21 +32,21 @@ class TrackStatus(MOQTMessage):
     def __post_init__(self):
         self.type = MOQTMessageType.TRACK_STATUS
 
-    def serialize(self) -> bytes:
+    def serialize(self, *, prof: DraftProfile) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
-        payload = Buffer(capacity=BUF_SIZE)
+        payload = Buffer(capacity=BUF_SIZE, vi64=prof.vi64)
 
-        payload.push_uint_var(self.request_id)
+        payload.push_vint(self.request_id)
 
-        payload.push_uint_var(len(self.track_namespace))
+        payload.push_vint(len(self.track_namespace))
         for part in self.track_namespace:
-            payload.push_uint_var(len(part))
+            payload.push_vint(len(part))
             payload.push_bytes(part)
 
-        payload.push_uint_var(len(self.track_name))
+        payload.push_vint(len(self.track_name))
         payload.push_bytes(self.track_name)
 
-        if is_draft16_or_later():
+        if is_draft16_or_later(prof.draft):
             params = dict(self.parameters or {})
             if self.priority is not None:
                 params[ParamType.SUBSCRIBER_PRIORITY] = self.priority
@@ -63,18 +63,18 @@ class TrackStatus(MOQTMessage):
                 if self.filter_type == 4:
                     fbuf.push_uint_var(self.end_group or 0)
                 params[ParamType.SUBSCRIPTION_FILTER] = fbuf.data_slice(0, fbuf.tell())
-            MOQTMessage._serialize_params(payload, params)
+            MOQTMessage._serialize_params(payload, params, prof=prof)
         else:
             payload.push_uint8(self.priority)
             payload.push_uint8(self.group_order)
             payload.push_uint8(self.forward)
-            payload.push_uint_var(self.filter_type)
+            payload.push_vint(self.filter_type)
             if self.filter_type in (3, 4):
-                payload.push_uint_var(self.start_group or 0)
-                payload.push_uint_var(self.start_object or 0)
+                payload.push_vint(self.start_group or 0)
+                payload.push_vint(self.start_object or 0)
             if self.filter_type == 4:
-                payload.push_uint_var(self.end_group or 0)
-            MOQTMessage._serialize_params(payload, self.parameters or {})
+                payload.push_vint(self.end_group or 0)
+            MOQTMessage._serialize_params(payload, self.parameters or {}, prof=prof)
 
         buf.push_uint_var(self.type)
         buf.push_uint16(payload.tell())
@@ -82,14 +82,14 @@ class TrackStatus(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'TrackStatus':
+    def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'TrackStatus':
 
-        request_id = buf.pull_uint_var()
+        request_id = buf.pull_vint()
 
-        tuple_len = buf.pull_uint_var()
-        namespace = tuple(buf.pull_bytes(buf.pull_uint_var()) for _ in range(tuple_len))
+        tuple_len = buf.pull_vint()
+        namespace = tuple(buf.pull_bytes(buf.pull_vint()) for _ in range(tuple_len))
 
-        track_name_len = buf.pull_uint_var()
+        track_name_len = buf.pull_vint()
         track_name = buf.pull_bytes(track_name_len)
 
         priority = None
@@ -100,31 +100,31 @@ class TrackStatus(MOQTMessage):
         start_object = None
         end_group = None
 
-        if is_draft16_or_later():
-            params = MOQTMessage._deserialize_params(buf)
+        if is_draft16_or_later(prof.draft):
+            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
             priority = params.pop(ParamType.SUBSCRIBER_PRIORITY, None)
             group_order = params.pop(ParamType.GROUP_ORDER, None)
             forward = params.pop(ParamType.FORWARD, None)
             filter_raw = params.pop(ParamType.SUBSCRIPTION_FILTER, None)
             if filter_raw is not None:
                 fbuf = Buffer(data=filter_raw)
-                filter_type = fbuf.pull_uint_var()
+                filter_type = fbuf.pull_vint()
                 if filter_type in (3, 4):
-                    start_group = fbuf.pull_uint_var()
-                    start_object = fbuf.pull_uint_var()
+                    start_group = fbuf.pull_vint()
+                    start_object = fbuf.pull_vint()
                 if filter_type == 4:
-                    end_group = fbuf.pull_uint_var()
+                    end_group = fbuf.pull_vint()
         else:
             priority = buf.pull_uint8()
             group_order = buf.pull_uint8()
             forward = buf.pull_uint8()
-            filter_type = buf.pull_uint_var()
+            filter_type = buf.pull_vint()
             if filter_type in (3, 4):
-                start_group = buf.pull_uint_var()
-                start_object = buf.pull_uint_var()
+                start_group = buf.pull_vint()
+                start_object = buf.pull_vint()
             if filter_type == 4:
-                end_group = buf.pull_uint_var()
-            params = MOQTMessage._deserialize_params(buf)
+                end_group = buf.pull_vint()
+            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
 
         return cls(
             request_id=request_id,
@@ -156,21 +156,21 @@ class TrackStatusOk(MOQTMessage):
     def __post_init__(self):
         self.type = MOQTMessageType.TRACK_STATUS_OK
 
-    def serialize(self) -> bytes:
+    def serialize(self, *, prof: DraftProfile) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
-        payload = Buffer(capacity=BUF_SIZE)
+        payload = Buffer(capacity=BUF_SIZE, vi64=prof.vi64)
 
-        payload.push_uint_var(self.request_id)
-        payload.push_uint_var(self.track_alias)
-        payload.push_uint_var(self.expires)
+        payload.push_vint(self.request_id)
+        payload.push_vint(self.track_alias)
+        payload.push_vint(self.expires)
         payload.push_uint8(self.group_order.value)
         payload.push_uint8(self.content_exists)
 
         if self.content_exists == ContentExistsCode.EXISTS:
-            payload.push_uint_var(self.largest_group_id)
-            payload.push_uint_var(self.largest_object_id)
+            payload.push_vint(self.largest_group_id)
+            payload.push_vint(self.largest_object_id)
 
-        MOQTMessage._serialize_params(payload, self.parameters or {})
+        MOQTMessage._serialize_params(payload, self.parameters or {}, prof=prof)
 
         buf.push_uint_var(self.type)
         buf.push_uint16(payload.tell())
@@ -178,20 +178,20 @@ class TrackStatusOk(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'TrackStatusOk':
-        request_id = buf.pull_uint_var()
-        track_alias = buf.pull_uint_var()
-        expires = buf.pull_uint_var()
+    def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'TrackStatusOk':
+        request_id = buf.pull_vint()
+        track_alias = buf.pull_vint()
+        expires = buf.pull_vint()
         group_order = GroupOrder(buf.pull_uint8())
         content_exists = buf.pull_uint8()
 
         largest_group_id = None
         largest_object_id = None
         if content_exists == ContentExistsCode.EXISTS:
-            largest_group_id = buf.pull_uint_var()
-            largest_object_id = buf.pull_uint_var()
+            largest_group_id = buf.pull_vint()
+            largest_object_id = buf.pull_vint()
 
-        params = MOQTMessage._deserialize_params(buf)
+        params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
 
         return cls(
             request_id=request_id,
@@ -215,15 +215,15 @@ class TrackStatusError(MOQTMessage):
     def __post_init__(self):
         self.type = MOQTMessageType.TRACK_STATUS_ERROR
 
-    def serialize(self) -> bytes:
+    def serialize(self, *, prof: DraftProfile) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
-        payload = Buffer(capacity=BUF_SIZE)
+        payload = Buffer(capacity=BUF_SIZE, vi64=prof.vi64)
 
-        payload.push_uint_var(self.request_id)
-        payload.push_uint_var(self.error_code.value if isinstance(self.error_code, SubscribeErrorCode) else self.error_code)
+        payload.push_vint(self.request_id)
+        payload.push_vint(self.error_code.value if isinstance(self.error_code, SubscribeErrorCode) else self.error_code)
 
         reason_bytes = self.reason.encode()
-        payload.push_uint_var(len(reason_bytes))
+        payload.push_vint(len(reason_bytes))
         payload.push_bytes(reason_bytes)
 
         buf.push_uint_var(self.type)
@@ -232,11 +232,11 @@ class TrackStatusError(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'TrackStatusError':
+    def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'TrackStatusError':
 
-        request_id = buf.pull_uint_var()
-        error_code = buf.pull_uint_var()
-        reason_len = buf.pull_uint_var()
+        request_id = buf.pull_vint()
+        error_code = buf.pull_vint()
+        reason_len = buf.pull_vint()
         reason = buf.pull_bytes(reason_len).decode()
 
         return cls(
@@ -271,22 +271,22 @@ class Subscribe(MOQTMessage):
     def __post_init__(self):
         self.type = MOQTMessageType.SUBSCRIBE
 
-    def serialize(self) -> bytes:
+    def serialize(self, *, prof: DraftProfile) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
-        payload = Buffer(capacity=BUF_SIZE)
+        payload = Buffer(capacity=BUF_SIZE, vi64=prof.vi64)
 
-        payload.push_uint_var(self.request_id)
+        payload.push_vint(self.request_id)
 
         # Namespace tuple
-        payload.push_uint_var(len(self.track_namespace))
+        payload.push_vint(len(self.track_namespace))
         for part in self.track_namespace:
-            payload.push_uint_var(len(part))
+            payload.push_vint(len(part))
             payload.push_bytes(part)
 
-        payload.push_uint_var(len(self.track_name))
+        payload.push_vint(len(self.track_name))
         payload.push_bytes(self.track_name)
 
-        if is_draft16_or_later():
+        if is_draft16_or_later(prof.draft):
             # d16: priority, group_order, forward, filter all go into params
             params = dict(self.parameters or {})
             if self.priority is not None:
@@ -306,7 +306,7 @@ class Subscribe(MOQTMessage):
                 if self.filter_type == 4:
                     fbuf.push_uint_var(self.end_group or 0)
                 params[ParamType.SUBSCRIPTION_FILTER] = fbuf.data_slice(0, fbuf.tell())
-            MOQTMessage._serialize_params(payload, params)
+            MOQTMessage._serialize_params(payload, params, prof=prof)
         else:
             # d14: priority / group_order / forward are mandatory fixed
             # fields on the wire (no optional form like d16's params), so
@@ -318,16 +318,16 @@ class Subscribe(MOQTMessage):
                                else GroupOrder.ASCENDING)
             payload.push_uint8(self.forward
                                if self.forward is not None else 1)
-            payload.push_uint_var(self.filter_type)
+            payload.push_vint(self.filter_type)
 
             if self.filter_type in (3, 4):
-                payload.push_uint_var(self.start_group or 0)
-                payload.push_uint_var(self.start_object or 0)
+                payload.push_vint(self.start_group or 0)
+                payload.push_vint(self.start_object or 0)
 
             if self.filter_type == 4:
-                payload.push_uint_var(self.end_group or 0)
+                payload.push_vint(self.end_group or 0)
 
-            MOQTMessage._serialize_params(payload, self.parameters or {})
+            MOQTMessage._serialize_params(payload, self.parameters or {}, prof=prof)
 
         buf.push_uint_var(self.type)
         buf.push_uint16(payload.tell())
@@ -335,14 +335,14 @@ class Subscribe(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'Subscribe':
+    def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'Subscribe':
 
-        request_id = buf.pull_uint_var()
+        request_id = buf.pull_vint()
 
-        tuple_len = buf.pull_uint_var()
-        namespace = tuple(buf.pull_bytes(buf.pull_uint_var()) for _ in range(tuple_len))
+        tuple_len = buf.pull_vint()
+        namespace = tuple(buf.pull_bytes(buf.pull_vint()) for _ in range(tuple_len))
 
-        track_name_len = buf.pull_uint_var()
+        track_name_len = buf.pull_vint()
         track_name = buf.pull_bytes(track_name_len)
 
         priority = None
@@ -353,35 +353,35 @@ class Subscribe(MOQTMessage):
         start_object = None
         end_group = None
 
-        if is_draft16_or_later():
+        if is_draft16_or_later(prof.draft):
             # d16: all fields are in parameters
-            params = MOQTMessage._deserialize_params(buf)
+            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
             priority = params.pop(ParamType.SUBSCRIBER_PRIORITY, None)
             group_order = params.pop(ParamType.GROUP_ORDER, None)
             forward = params.pop(ParamType.FORWARD, None)
             filter_raw = params.pop(ParamType.SUBSCRIPTION_FILTER, None)
             if filter_raw is not None:
                 fbuf = Buffer(data=filter_raw)
-                filter_type = fbuf.pull_uint_var()
+                filter_type = fbuf.pull_vint()
                 if filter_type in (3, 4):
-                    start_group = fbuf.pull_uint_var()
-                    start_object = fbuf.pull_uint_var()
+                    start_group = fbuf.pull_vint()
+                    start_object = fbuf.pull_vint()
                 if filter_type == 4:
-                    end_group = fbuf.pull_uint_var()
+                    end_group = fbuf.pull_vint()
         else:
             # d14: fixed fields on wire
             priority = buf.pull_uint8()
             group_order = buf.pull_uint8()
             forward = buf.pull_uint8()
-            filter_type = buf.pull_uint_var()
+            filter_type = buf.pull_vint()
 
             if filter_type in (3, 4):
-                start_group = buf.pull_uint_var()
-                start_object = buf.pull_uint_var()
+                start_group = buf.pull_vint()
+                start_object = buf.pull_vint()
             if filter_type == 4:
-                end_group = buf.pull_uint_var()
+                end_group = buf.pull_vint()
 
-            params = MOQTMessage._deserialize_params(buf)
+            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
 
         return cls(
             request_id=request_id,
@@ -420,14 +420,17 @@ class SubscribeOk(MOQTMessage):
     def __post_init__(self):
         self.type = MOQTMessageType.SUBSCRIBE_OK
 
-    def serialize(self) -> bytes:
+    def serialize(self, *, prof: DraftProfile) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
-        payload = Buffer(capacity=BUF_SIZE)
+        payload = Buffer(capacity=BUF_SIZE, vi64=prof.vi64)
 
-        payload.push_uint_var(self.request_id)
-        payload.push_uint_var(self.track_alias)
+        # d18 replies omit the Request ID — the response is demuxed by the
+        # bidi request stream it arrives on (§10.1).
+        if prof.reply_has_request_id:
+            payload.push_vint(self.request_id)
+        payload.push_vint(self.track_alias)
 
-        if is_draft16_or_later():
+        if is_draft16_or_later(prof.draft):
             # d16: expires and largest_object go into params
             params = dict(self.parameters or {})
             if self.expires is not None:
@@ -438,7 +441,7 @@ class SubscribeOk(MOQTMessage):
                 lbuf.push_uint_var(self.largest_group_id)
                 lbuf.push_uint_var(self.largest_object_id or 0)
                 params[ParamType.LARGEST_OBJECT] = lbuf.data_slice(0, lbuf.tell())
-            MOQTMessage._serialize_params(payload, params)
+            MOQTMessage._serialize_params(payload, params, prof=prof)
             # Track Extensions (group_order goes here as extension 0x22)
             exts = dict(self.track_extensions or {})
             if self.group_order is not None:
@@ -446,13 +449,13 @@ class SubscribeOk(MOQTMessage):
             MOQTMessage._extensions_encode(payload, exts, with_length=False)
         else:
             # d14: fixed fields
-            payload.push_uint_var(self.expires)
+            payload.push_vint(self.expires)
             payload.push_uint8(self.group_order.value)
             payload.push_uint8(self.content_exists)
             if self.content_exists == ContentExistsCode.EXISTS:
-                payload.push_uint_var(self.largest_group_id)
-                payload.push_uint_var(self.largest_object_id)
-            MOQTMessage._serialize_params(payload, self.parameters or {})
+                payload.push_vint(self.largest_group_id)
+                payload.push_vint(self.largest_object_id)
+            MOQTMessage._serialize_params(payload, self.parameters or {}, prof=prof)
 
         buf.push_uint_var(self.type)
         buf.push_uint16(payload.tell())
@@ -460,12 +463,14 @@ class SubscribeOk(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'SubscribeOk':
+    def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'SubscribeOk':
         # buf_end is the absolute end-of-message position derived from
         # the outer frame length. Required for d16 (Track Extensions
         # have no length prefix; sequence runs to end of message).
-        request_id = buf.pull_uint_var()
-        track_alias = buf.pull_uint_var()
+        # d18 replies omit the Request ID (demuxed by request stream).
+        request_id = (buf.pull_vint()
+                      if prof.reply_has_request_id else None)
+        track_alias = buf.pull_vint()
 
         expires = None
         group_order = None
@@ -474,14 +479,14 @@ class SubscribeOk(MOQTMessage):
         largest_object_id = None
         track_extensions = None
 
-        if is_draft16_or_later():
-            params = MOQTMessage._deserialize_params(buf)
+        if is_draft16_or_later(prof.draft):
+            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
             expires = params.pop(ParamType.EXPIRES, None)
             largest_raw = params.pop(ParamType.LARGEST_OBJECT, None)
             if largest_raw is not None:
                 lbuf = Buffer(data=largest_raw)
-                largest_group_id = lbuf.pull_uint_var()
-                largest_object_id = lbuf.pull_uint_var()
+                largest_group_id = lbuf.pull_vint()
+                largest_object_id = lbuf.pull_vint()
                 content_exists = ContentExistsCode.EXISTS
             else:
                 content_exists = ContentExistsCode.NO_CONTENT
@@ -492,13 +497,13 @@ class SubscribeOk(MOQTMessage):
                 if group_order_val is not None:
                     group_order = GroupOrder(group_order_val)
         else:
-            expires = buf.pull_uint_var()
+            expires = buf.pull_vint()
             group_order = GroupOrder(buf.pull_uint8())
             content_exists = buf.pull_uint8()
             if content_exists == ContentExistsCode.EXISTS:
-                largest_group_id = buf.pull_uint_var()
-                largest_object_id = buf.pull_uint_var()
-            params = MOQTMessage._deserialize_params(buf)
+                largest_group_id = buf.pull_vint()
+                largest_object_id = buf.pull_vint()
+            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
 
         return cls(
             request_id=request_id,
@@ -522,15 +527,15 @@ class SubscribeError(MOQTMessage):
     def __post_init__(self):
         self.type = MOQTMessageType.SUBSCRIBE_ERROR
 
-    def serialize(self) -> bytes:
+    def serialize(self, *, prof: DraftProfile) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
-        payload = Buffer(capacity=BUF_SIZE)
+        payload = Buffer(capacity=BUF_SIZE, vi64=prof.vi64)
 
-        payload.push_uint_var(self.request_id)
-        payload.push_uint_var(self.error_code.value if isinstance(self.error_code, SubscribeErrorCode) else self.error_code)
+        payload.push_vint(self.request_id)
+        payload.push_vint(self.error_code.value if isinstance(self.error_code, SubscribeErrorCode) else self.error_code)
 
         reason_bytes = self.reason.encode()
-        payload.push_uint_var(len(reason_bytes))
+        payload.push_vint(len(reason_bytes))
         payload.push_bytes(reason_bytes)
 
         buf.push_uint_var(self.type)
@@ -539,11 +544,11 @@ class SubscribeError(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'SubscribeError':
+    def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'SubscribeError':
 
-        request_id = buf.pull_uint_var()
-        error_code = buf.pull_uint_var()
-        reason_len = buf.pull_uint_var()
+        request_id = buf.pull_vint()
+        error_code = buf.pull_vint()
+        reason_len = buf.pull_vint()
         reason = buf.pull_bytes(reason_len).decode()
 
         return cls(
@@ -567,19 +572,19 @@ class SubscribeUpdate(MOQTMessage):
     def __post_init__(self):
         self.type = MOQTMessageType.SUBSCRIBE_UPDATE
 
-    def serialize(self) -> bytes:
+    def serialize(self, *, prof: DraftProfile) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
-        payload = Buffer(capacity=BUF_SIZE)
+        payload = Buffer(capacity=BUF_SIZE, vi64=prof.vi64)
 
-        payload.push_uint_var(self.request_id)
-        payload.push_uint_var(self.subscription_request_id)
-        payload.push_uint_var(self.start_group)
-        payload.push_uint_var(self.start_object)
-        payload.push_uint_var(self.end_group)
+        payload.push_vint(self.request_id)
+        payload.push_vint(self.subscription_request_id)
+        payload.push_vint(self.start_group)
+        payload.push_vint(self.start_object)
+        payload.push_vint(self.end_group)
         payload.push_uint8(self.priority)
         payload.push_uint8(self.forward)
 
-        MOQTMessage._serialize_params(payload, self.parameters or {})
+        MOQTMessage._serialize_params(payload, self.parameters or {}, prof=prof)
 
         buf.push_uint_var(self.type)
         buf.push_uint16(payload.tell())
@@ -587,16 +592,16 @@ class SubscribeUpdate(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'SubscribeUpdate':
+    def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'SubscribeUpdate':
 
-        request_id = buf.pull_uint_var()
-        subscription_request_id = buf.pull_uint_var()
-        start_group = buf.pull_uint_var()
-        start_object = buf.pull_uint_var()
-        end_group = buf.pull_uint_var()
+        request_id = buf.pull_vint()
+        subscription_request_id = buf.pull_vint()
+        start_group = buf.pull_vint()
+        start_object = buf.pull_vint()
+        end_group = buf.pull_vint()
         priority = buf.pull_uint8()
         forward = buf.pull_uint8()
-        params = MOQTMessage._deserialize_params(buf)
+        params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
 
         return cls(
             request_id=request_id,
@@ -617,11 +622,11 @@ class Unsubscribe(MOQTMessage):
     def __post_init__(self):
         self.type = MOQTMessageType.UNSUBSCRIBE
 
-    def serialize(self) -> bytes:
+    def serialize(self, *, prof: DraftProfile) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
-        payload = Buffer(capacity=BUF_SIZE)
+        payload = Buffer(capacity=BUF_SIZE, vi64=prof.vi64)
 
-        payload.push_uint_var(self.request_id)
+        payload.push_vint(self.request_id)
 
         buf.push_uint_var(self.type)
         buf.push_uint16(payload.tell())
@@ -629,9 +634,9 @@ class Unsubscribe(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'Unsubscribe':
+    def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'Unsubscribe':
 
-        request_id = buf.pull_uint_var()
+        request_id = buf.pull_vint()
         return cls(request_id=request_id)
 
 
@@ -645,16 +650,18 @@ class SubscribeDone(MOQTMessage):
     def __post_init__(self):
         self.type = MOQTMessageType.PUBLISH_DONE
 
-    def serialize(self) -> bytes:
+    def serialize(self, *, prof: DraftProfile) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
-        payload = Buffer(capacity=BUF_SIZE)
-        
-        payload.push_uint_var(self.request_id)
-        payload.push_uint_var(self.status_code.value if isinstance(self.status_code, SubscribeDoneCode) else self.status_code)
-        payload.push_uint_var(self.stream_count)
+        payload = Buffer(capacity=BUF_SIZE, vi64=prof.vi64)
+
+        # d18 replies omit the Request ID (demuxed by request stream, §10.1).
+        if prof.reply_has_request_id:
+            payload.push_vint(self.request_id)
+        payload.push_vint(self.status_code.value if isinstance(self.status_code, SubscribeDoneCode) else self.status_code)
+        payload.push_vint(self.stream_count)
         
         reason_bytes = self.reason.encode()
-        payload.push_uint_var(len(reason_bytes))
+        payload.push_vint(len(reason_bytes))
         payload.push_bytes(reason_bytes)
 
         buf.push_uint_var(self.type)
@@ -663,12 +670,14 @@ class SubscribeDone(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'SubscribeDone':
+    def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'SubscribeDone':
 
-        request_id = buf.pull_uint_var()
-        status_code = buf.pull_uint_var()
-        stream_count = buf.pull_uint_var()
-        reason_len = buf.pull_uint_var()
+        # d18 replies omit the Request ID (demuxed by request stream).
+        request_id = (buf.pull_vint()
+                      if prof.reply_has_request_id else None)
+        status_code = buf.pull_vint()
+        stream_count = buf.pull_vint()
+        reason_len = buf.pull_vint()
         reason = buf.pull_bytes(reason_len).decode()
 
         return cls(
@@ -686,11 +695,11 @@ class MaxSubscribeId(MOQTMessage):
     def __post_init__(self):
         self.type = MOQTMessageType.MAX_REQUEST_ID
 
-    def serialize(self) -> bytes:
+    def serialize(self, *, prof: DraftProfile) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
-        payload = Buffer(capacity=BUF_SIZE)
+        payload = Buffer(capacity=BUF_SIZE, vi64=prof.vi64)
 
-        payload.push_uint_var(self.request_id)
+        payload.push_vint(self.request_id)
 
         buf.push_uint_var(self.type)
         buf.push_uint16(payload.tell())
@@ -698,9 +707,9 @@ class MaxSubscribeId(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'MaxSubscribeId':
+    def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'MaxSubscribeId':
 
-        request_id = buf.pull_uint_var()
+        request_id = buf.pull_vint()
         return cls(request_id=request_id)
 
 
@@ -711,11 +720,11 @@ class SubscribesBlocked(MOQTMessage):
     def __post_init__(self):
         self.type = MOQTMessageType.REQUESTS_BLOCKED
 
-    def serialize(self) -> bytes:
+    def serialize(self, *, prof: DraftProfile) -> bytes:
         buf = Buffer(capacity=BUF_SIZE)
-        payload = Buffer(capacity=BUF_SIZE)
+        payload = Buffer(capacity=BUF_SIZE, vi64=prof.vi64)
 
-        payload.push_uint_var(self.maximum_request_id)
+        payload.push_vint(self.maximum_request_id)
 
         buf.push_uint_var(self.type)
         buf.push_uint16(payload.tell())
@@ -723,7 +732,7 @@ class SubscribesBlocked(MOQTMessage):
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer, buf_end: Optional[int] = None) -> 'SubscribesBlocked':
+    def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'SubscribesBlocked':
 
-        maximum_request_id = buf.pull_uint_var()
+        maximum_request_id = buf.pull_vint()
         return cls(maximum_request_id=maximum_request_id)

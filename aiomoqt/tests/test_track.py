@@ -1,9 +1,7 @@
 """Unit tests for aiomoqt.track — Track, PublishedTrack, SubscribedTrack."""
 import asyncio
-import pytest
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import MagicMock, AsyncMock
 from aiomoqt.track import Track, PublishedTrack, SubscribedTrack, TrackState
-from aiomoqt.context import set_moqt_ctx_version
 
 
 class TestTrackBase:
@@ -86,7 +84,6 @@ class TestPublishedTrack:
         pub_response.request_id = request_id
         session.publish = MagicMock(return_value=pub_response)
         session.register_handler = MagicMock()
-        session.MOQT_D16_OVERRIDE_REGISTRY = {}
         return session
 
     # ----- Flow B: bare PUBLISH (default) -----
@@ -96,9 +93,7 @@ class TestPublishedTrack:
         async def _test():
             session = self._pub_session()
             t = PublishedTrack(session, "bench", "track")
-            with patch('aiomoqt.track.is_draft16_or_later',
-                        return_value=False):
-                await t.publish()
+            await t.publish()
             session.publish_namespace.assert_not_called()
             session.publish.assert_called_once_with(
                 namespace="bench", track_name="track", forward=0)
@@ -111,15 +106,13 @@ class TestPublishedTrack:
         async def _test():
             session = self._pub_session(track_alias=42, request_id=7)
             t = PublishedTrack(session, "bench", "track")
-            with patch('aiomoqt.track.is_draft16_or_later',
-                        return_value=True):
-                await t.publish()
+            await t.publish()
             session.publish_namespace.assert_not_called()
             session.publish.assert_called_once()
             assert t.track_alias == 42
             assert t.request_id == 7
             assert t.state == TrackState.PUBLISHED
-            assert 0x02 in session.MOQT_D16_OVERRIDE_REGISTRY
+            assert any(c.args[0] == 0x02 for c in session.register_handler.call_args_list)
         asyncio.run(_test())
 
     # ----- Flow A: PUB_NS only -----
@@ -129,10 +122,8 @@ class TestPublishedTrack:
         async def _test():
             session = self._pub_session()
             t = PublishedTrack(session, "bench", "track")
-            with patch('aiomoqt.track.is_draft16_or_later',
-                        return_value=False):
-                await t.publish(announce_namespace=True,
-                                publish_track=False)
+            await t.publish(announce_namespace=True,
+                            publish_track=False)
             session.publish_namespace.assert_called_once()
             session.publish.assert_not_called()
             assert t.state == TrackState.ANNOUNCED
@@ -143,10 +134,8 @@ class TestPublishedTrack:
         async def _test():
             session = self._pub_session()
             t = PublishedTrack(session, "bench", "track")
-            with patch('aiomoqt.track.is_draft16_or_later',
-                        return_value=True):
-                await t.publish(announce_namespace=True,
-                                publish_track=False)
+            await t.publish(announce_namespace=True,
+                            publish_track=False)
             session.publish_namespace.assert_called_once()
             session.publish.assert_not_called()
             assert t.state == TrackState.ANNOUNCED
@@ -159,10 +148,8 @@ class TestPublishedTrack:
         async def _test():
             session = self._pub_session()
             t = PublishedTrack(session, "bench", "track")
-            with patch('aiomoqt.track.is_draft16_or_later',
-                        return_value=False):
-                await t.publish(announce_namespace=True,
-                                publish_track=True)
+            await t.publish(announce_namespace=True,
+                            publish_track=True)
             session.publish_namespace.assert_called_once()
             session.publish.assert_called_once()
             assert t.state == TrackState.PUBLISHED
@@ -173,10 +160,8 @@ class TestPublishedTrack:
         async def _test():
             session = self._pub_session()
             t = PublishedTrack(session, "bench", "track")
-            with patch('aiomoqt.track.is_draft16_or_later',
-                        return_value=True):
-                await t.publish(announce_namespace=True,
-                                publish_track=True)
+            await t.publish(announce_namespace=True,
+                            publish_track=True)
             session.publish_namespace.assert_called_once()
             session.publish.assert_called_once()
             assert t.state == TrackState.PUBLISHED
@@ -189,14 +174,12 @@ class TestPublishedTrack:
         async def _test():
             session = self._pub_session()
             t = PublishedTrack(session, "bench", "track")
-            with patch('aiomoqt.track.is_draft16_or_later',
-                        return_value=True):
-                try:
-                    await t.publish(announce_namespace=False,
-                                    publish_track=False)
-                    assert False, "expected ValueError"
-                except ValueError:
-                    pass
+            try:
+                await t.publish(announce_namespace=False,
+                                publish_track=False)
+                assert False, "expected ValueError"
+            except ValueError:
+                pass
             session.publish_namespace.assert_not_called()
             session.publish.assert_not_called()
         asyncio.run(_test())
@@ -235,10 +218,8 @@ class TestSubscribedTrack:
             session.on_object_received = None
 
             t = SubscribedTrack(session, "bench",
-                                trackname="video", draft=14)
-            with patch('aiomoqt.track.is_draft16_or_later',
-                        return_value=False):
-                await t.subscribe()
+                                trackname="video")
+            await t.subscribe()
 
             session.subscribe.assert_called_once()
             session.subscribe_namespace.assert_not_called()
@@ -259,10 +240,8 @@ class TestSubscribedTrack:
             session.on_object_received = None
 
             t = SubscribedTrack(session, "bench",
-                                trackname="video", draft=16)
-            with patch('aiomoqt.track.is_draft16_or_later',
-                        return_value=True):
-                await t.subscribe()
+                                trackname="video")
+            await t.subscribe()
 
             session.subscribe.assert_called_once()
             session.subscribe_namespace.assert_not_called()
@@ -288,13 +267,10 @@ class TestSubscribedTrack:
             session.send_control_message = MagicMock()
             session.on_object_received = None
 
-            t = SubscribedTrack(session, "bench", draft=14)
+            session.negotiated_draft = 14  # exercise real PublishOk.serialize at d14
+            t = SubscribedTrack(session, "bench")
             assert t.trackname is None
-            with patch('aiomoqt.track.is_draft16_or_later',
-                        return_value=False), \
-                 patch('aiomoqt.track.PublishOk') as mock_ok:
-                mock_ok.return_value.serialize.return_value = MagicMock(data=b'')
-                await t.subscribe()
+            await t.subscribe()
 
             session.subscribe_namespace.assert_called_once()
             session.await_publish.assert_called_once()
@@ -318,13 +294,10 @@ class TestSubscribedTrack:
             session.send_control_message = MagicMock()
             session.on_object_received = None
 
-            t = SubscribedTrack(session, "bench", draft=16)
+            session.negotiated_draft = 16  # exercise real PublishOk.serialize at d16
+            t = SubscribedTrack(session, "bench")
             assert t.trackname is None
-            with patch('aiomoqt.track.is_draft16_or_later',
-                        return_value=True), \
-                 patch('aiomoqt.track.PublishOk') as mock_ok:
-                mock_ok.return_value.serialize.return_value = MagicMock(data=b'')
-                await t.subscribe()
+            await t.subscribe()
 
             session.subscribe_namespace.assert_called_once()
             session.await_publish.assert_called_once()
@@ -344,14 +317,12 @@ class TestSubscribedTrack:
             session.subscribe = AsyncMock(return_value=MagicMock())
             session.on_object_received = None
 
-            t = SubscribedTrack(session, "bench", draft=16)
-            with patch('aiomoqt.track.is_draft16_or_later',
-                        return_value=True):
-                try:
-                    await t.subscribe()
-                    assert False, "expected TimeoutError"
-                except asyncio.TimeoutError:
-                    pass
+            t = SubscribedTrack(session, "bench")
+            try:
+                await t.subscribe()
+                assert False, "expected TimeoutError"
+            except asyncio.TimeoutError:
+                pass
 
             session.subscribe_namespace.assert_called_once()
             session.await_publish.assert_called_once()
@@ -380,10 +351,8 @@ class TestSubscribedTrack:
             cb = MagicMock()
             t = SubscribedTrack(session, "bench",
                                 trackname="track",
-                                on_object=cb, draft=14)
-            with patch('aiomoqt.track.is_draft16_or_later',
-                        return_value=False):
-                await t.subscribe()
+                                on_object=cb)
+            await t.subscribe()
 
             assert session.on_object_received is cb
 

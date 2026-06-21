@@ -34,9 +34,8 @@ from .types import (
     MOQT_TIMESTAMP_EXT, SessionCloseCode,
 )
 from .messages import (
-    SubgroupHeader, PublishOk, RequestUpdate,
+    PublishOk, RequestUpdate,
 )
-from .context import is_draft16_or_later
 from .utils.format import fmt_bps, fmt_rate
 from .utils.logger import get_logger
 
@@ -68,7 +67,6 @@ class Track:
         group_size: int = 60,
         num_subgroups: int = 1,
         rate: float = 0,
-        draft: Optional[int] = None,
     ):
         """
         rate is the AGGREGATE target objects/sec across all subgroup
@@ -84,7 +82,6 @@ class Track:
         self.group_size = group_size
         self.num_subgroups = num_subgroups
         self.rate = rate
-        self.draft = draft
         self.track_alias: int = 0
         self.request_id: int = 0
         self.state: TrackState = TrackState.IDLE
@@ -116,10 +113,10 @@ class PublishedTrack(Track):
     def __init__(self, session, namespace: str, trackname: str = 'track',
                  object_size: int = 1024, group_size: int = 60,
                  num_subgroups: int = 1, rate: float = 0,
-                 priority: int = 128, draft: Optional[int] = None,
+                 priority: int = 128,
                  auth_token: bytes = b"bench-token"):
         super().__init__(session, namespace, trackname,
-                         object_size, group_size, num_subgroups, rate, draft)
+                         object_size, group_size, num_subgroups, rate)
         self.priority = priority
         self.auth_token = auth_token
         self._subscriber_event = asyncio.Event()
@@ -198,16 +195,19 @@ class PublishedTrack(Track):
             MOQTMessageType.SUBSCRIBE, self._on_subscribe)
         self.session.register_handler(
             MOQTMessageType.PUBLISH_OK, self._on_publish_ok)
-        self.session.register_handler(
-            MOQTMessageType.SUBSCRIBE_UPDATE, self._on_subscribe_update)
-
-        # d16: REQUEST_UPDATE (code point 0x02) signals subscriber arrival
-        if is_draft16_or_later():
-            track = self
-            async def _request_update_handler(session, msg):
+        # Code point 0x02 is SUBSCRIBE_UPDATE (d14) or REQUEST_UPDATE
+        # (d16); the negotiated draft selects the class via the per-draft
+        # CONTROL_REGISTRY, so a single handler dispatches on the parsed
+        # message type — no version branch, works whenever the handshake
+        # settles.
+        track = self
+        async def _update_handler(session, msg):
+            if isinstance(msg, RequestUpdate):
                 await track._on_request_update(session, msg)
-            self.session.MOQT_D16_OVERRIDE_REGISTRY[0x02] = (
-                RequestUpdate, _request_update_handler)
+            else:
+                await track._on_subscribe_update(session, msg)
+        self.session.register_handler(
+            MOQTMessageType.SUBSCRIBE_UPDATE, _update_handler)
 
         if publish_track:
             pub_msg = self.session.publish(
@@ -305,7 +305,7 @@ class PublishedTrack(Track):
         logger.info(f"Track: PUBLISH_DONE request_id={req_id} "
                     f"streams={self._stream_count}")
         try:
-            session.send_control_message(msg.serialize())
+            session.send_control_message(msg)
         except Exception:
             pass  # session may already be closing
 
@@ -415,7 +415,7 @@ class PublishedTrack(Track):
                         stream_id = await session.open_uni_stream()
                         self._stream_count += 1
 
-                    header = SubgroupHeader(
+                    header = session.subgroup_header(
                         track_alias=track_alias,
                         group_id=group_id,
                         subgroup_id=subgroup_id,
@@ -533,11 +533,10 @@ class SubscribedTrack(Track):
     """
 
     def __init__(self, session, namespace: str, trackname: str = None,
-                 draft: Optional[int] = None,
                  on_object: Optional[Callable] = None,
                  report_interval: float = 5.0,
                  auth_token: Optional[bytes] = None):
-        super().__init__(session, namespace, trackname, draft=draft)
+        super().__init__(session, namespace, trackname)
         self.on_object = on_object
         self.report_interval = report_interval
         self.auth_token = auth_token
@@ -588,7 +587,11 @@ class SubscribedTrack(Track):
         # trackname is set, only a matching PUBLISH is accepted; others
         # are dropped. No fallback — discovery failure raises.
         ns_kwargs = {}
-        if subscribe_options is not None and is_draft16_or_later():
+        # Pass the logical field whenever the caller provided it; the
+        # SubscribeNamespace codec decides whether it goes on the wire
+        # for the negotiated draft (d16+ only). The track stays
+        # version-agnostic.
+        if subscribe_options is not None:
             ns_kwargs['subscribe_options'] = subscribe_options
         ns_params = {}
         if self.auth_token is not None:
@@ -639,7 +642,7 @@ class SubscribedTrack(Track):
         )
         logger.info(f"Track: PUBLISH_OK {self.fqtn} "
                     f"alias={self.track_alias} forward={forward}")
-        self.session.send_control_message(ok.serialize())
+        self.session.send_control_message(ok)
 
         self.state = TrackState.SUBSCRIBED
         logger.info(f"Track: subscribed to {self.fqtn}")
@@ -692,7 +695,7 @@ class VideoTrack(PublishedTrack):
                  gop_pattern: str = "ibp", gop_seconds: float = 1.0,
                  i_frame_size: int = None, p_frame_size: int = None,
                  b_frame_size: int = None,
-                 draft: Optional[int] = None, **kwargs):
+                 **kwargs):
         # GOP = 1 second of frames by default
         gop_size = int(fps * gop_seconds)
 
@@ -716,7 +719,6 @@ class VideoTrack(PublishedTrack):
             group_size=gop_size,
             num_subgroups=1,
             rate=fps,
-            draft=draft,
             **kwargs,
         )
 
@@ -809,7 +811,7 @@ class VideoTrack(PublishedTrack):
                         stream_id = await session.open_uni_stream()
                         self._stream_count += 1
 
-                    header = SubgroupHeader(
+                    header = session.subgroup_header(
                         track_alias=track_alias,
                         group_id=group_id,
                         subgroup_id=subgroup_id,

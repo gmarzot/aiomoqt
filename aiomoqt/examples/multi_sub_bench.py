@@ -21,6 +21,7 @@ import sys
 import time
 
 from aiomoqt.client import MOQTClient
+from aiomoqt.types import parse_draft_spec
 from aiomoqt.track import PublishedTrack, VideoTrack, SubscribedTrack
 from aiomoqt.utils import wait_cond_timeout
 from aiomoqt.utils.logger import set_log_level
@@ -61,7 +62,7 @@ def parse_args():
                         help='Duration seconds (default: 30)')
     parser.add_argument('-k', '--insecure', action='store_true',
                         help='Skip TLS verification')
-    parser.add_argument('--draft', type=int, default=None,
+    parser.add_argument('--draft', type=parse_draft_spec, default=None,
                         help='MoQT draft version (default: negotiate)')
     parser.add_argument('--video', type=str, default=None,
                         choices=['240p', '270p', '360p', '480p',
@@ -186,7 +187,6 @@ def run_publisher(relay_url, namespace, trackname, args):
                 track = VideoTrack(
                     session, namespace, trackname,
                     resolution=args.video, fps=args.rate,
-                    draft=args.draft,
                 )
             else:
                 track = PublishedTrack(
@@ -195,7 +195,6 @@ def run_publisher(relay_url, namespace, trackname, args):
                     group_size=group_size,
                     num_subgroups=args.streams,
                     rate=args.rate,
-                    draft=args.draft,
                 )
             await track.publish(
                 announce_namespace=(args.pub_ns or args.pub_both),
@@ -264,7 +263,6 @@ def run_subscriber(sub_id, relay_url, namespace, trackname, args,
                 track = SubscribedTrack(
                     session, namespace,
                     trackname=trackname,
-                    draft=args.draft,
                     on_object=on_object,
                 )
                 await track.subscribe(timeout=SUBSCRIBE_TIMEOUT)

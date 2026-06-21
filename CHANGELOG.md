@@ -1,5 +1,316 @@
 # Changelog
 
+## v0.10.0 (unreleased)
+
+**draft-18 support (beta).** aiomoqt now speaks draft-18 alongside d14/d16,
+over both raw QUIC and WebTransport, built on a version-dispatch refactor
+(per-session draft, `CONTROL_REGISTRY` + `DraftProfile` spine). Requires
+aiopquic 0.3.9 (the vi64 buffer codec — `push_vint`/`pull_vint`); dep floor
+`aiopquic>=0.3.8` → `aiopquic>=0.3.9`. Internal-API breaking; no public
+class-surface change.
+
+### draft-18 support (beta) — summary
+
+The sections below trace how it was built phase by phase; this is the
+final state of the release.
+
+- **d18 is opt-in (beta).** The no-args default offers the **stable** set
+  `(16, 14)`, newest-first — an auto session never negotiates onto the beta
+  d18 wire, and d14 stays in the offer for d14-only peers. Select d18
+  explicitly: `supported_drafts=18` or `supported_drafts=[18, 16, 14]`.
+  No env gate — the development-time `AIOMOQT_ENABLE_D18` flag is
+  removed.
+- **All four corners live**: d14/d16/d18 × raw QUIC / WebTransport,
+  validated by in-process loopback object round-trips; loopback perf
+  parity d16↔d18 (2.85–3.09 Gbps, 0% loss).
+- **Wire**: out-of-band negotiation (ALPN / WT-Protocol); control over a
+  pair of uni streams (symmetric `SETUP` `0x2F00`); per-request bidi
+  streams with replies that drop the in-band Request ID; vi64 varints
+  across control bodies and the data plane; `SUBSCRIBE_NAMESPACE`
+  renumbered `0x50` plus `SUBSCRIBE_TRACKS`/`PUBLISH_BLOCKED`.
+- **Beta limitations**: subscribe/publish subscription-filter and
+  largest-location still use the d16 nested form; d18 Fetch is pending;
+  Track-Properties extensions encode as RFC9000 varints (correct for the
+  small values in use). None of these affect d14/d16.
+- **Tests**: a d14/d16/d18 control-message round-trip matrix
+  (`TestDraft18ControlMessages`) covers the vi64 codec, the uint8 param-value
+  path, and reply-drops-request-id; alongside the d18 data-plane, setup,
+  dispatch, and loopback object round-trips.
+
+### Version selection — `supported_drafts` + `negotiated_draft`
+
+- `MOQTClient` / `MOQTServer` take `supported_drafts`: an **int** (a single
+  draft — offer only that ALPN), an **ordered list** (offer the set in the
+  caller's preference order — highest mutual wins, and first-offered matters
+  for relays that select the first ALPN rather than the highest), or **None**
+  (the auto offer: the stable set, newest-first). It is stored as a non-empty
+  list of draft numbers on `self.supported_drafts` — caller order is
+  preserved for explicit lists; only the `None` auto-offer is sorted
+  newest-first. The legacy `draft_version` param and field are **gone** (a
+  single-element list is the pin).
+- The per-session result is `session.negotiated_draft` (a draft number),
+  derived from the resolved `DraftProfile` so the two can never drift; QUIC
+  ALPN / WT-Protocol negotiation sets it.
+- CLI: `--draft` accepts a single draft (`--draft 16`) or a comma list
+  (`--draft 18,16,14`), via `parse_draft_spec`.
+
+### Per-session draft dispatch (kills the process global)
+
+- The process-global `context.moqt_version` and its
+  `get/set_moqt_ctx_version` accessors are **deleted**. Draft flows as a
+  required keyword-only argument through every `serialize` / `deserialize`,
+  sourced from the per-session `negotiated_draft` (threaded as the resolved
+  `prof: DraftProfile` as of Tier B, below). Concurrent
+  sessions on different drafts in one event loop no longer clobber each
+  other (regression: `test_concurrent_versions`).
+- **Version = int draft number throughout the high/mid layers.**
+  `draft_version` and the new `supported_drafts` are plain draft numbers
+  (14, 16); `self._draft`, the `draft=` kwarg, and the dispatch tables
+  are int-keyed. The IETF hex code and ALPN strings are materialized
+  only at the wire boundary (d14 CLIENT_SETUP `versions[]`, ALPN build)
+  — they no longer bleed into higher layers. Subsumes the long-pending
+  int-form refactor. Draft numbers are named by the `MOQTDraft` IntEnum
+  (`DRAFT_14`/`DRAFT_16`), used as the dispatch-table keys and
+  `supported_drafts` defaults instead of bare literals.
+- `send_control_message(msg)` / `send_stream_message(stream_id, msg)`
+  now take the message object and serialize internally at `self._draft`,
+  so no send site threads `draft=` — the class of "forgot the draft
+  kwarg at a send site" is structurally impossible. These are
+  below-the-public-API, undocumented session methods (the high-level
+  `subscribe`/`publish`/`fetch`/… wrap them); only a custom handler that
+  hand-built a frame and called `send_control_message(buf)` directly is
+  affected — now pass the message, not a pre-serialized Buffer.
+
+### Two table-driven dispatch mechanisms
+
+- `CONTROL_REGISTRY[draft]` — one complete control-message table per
+  draft, built from deltas (d16 = d14 base + repurposed
+  0x02/0x05/0x07/0x08/0x0E, minus the d14-only points d16 dropped).
+  Replaces the `is_draft16_or_later()` branch + `MOQT_D16_OVERRIDE_REGISTRY`
+  overlay. Built once at class definition, read-only at runtime (no
+  shared mutable cross-session state). Dispatch is a single keyed lookup;
+  an unknown code point for the draft raises `MOQTProtocolViolation`.
+- `DraftProfile` / `PROFILES[draft]` — named per-draft capability table
+  (`setup_carries_versions`, `params_delta_coded`). Recurring spec-delta
+  behaviors read intent (`profile_for(draft).params_delta_coded`) instead
+  of version arithmetic; localized one-off gates keep the thin
+  `is_draft16_or_later(draft)` predicate (now required-arg).
+
+### Negotiation discipline — one `supported_drafts` list
+
+- `MOQTClient` / `MOQTServer` accept a single `supported_drafts`
+  (int | ordered list | None); a single-element list is the pin, and the
+  default (`None`) offers the stable set `(16, 14)` newest-first. This
+  consolidates an earlier two-attribute (`draft_version` + `supported_drafts`)
+  iteration — the version fields were unified in the 0.9.13-pre
+  reconciliation (see "Version selection" above; the per-session result is
+  `negotiated_draft`).
+
+### Full multi-version negotiation, both transports
+
+Requires the aiopquic negotiation APIs (aiopquic 0.3.8). Completes the
+fast-follow that was deferred above — both transports now negotiate the
+draft in-band, on the client **and** the server, with no draft pin:
+
+- **Raw QUIC.** A multi-draft client offers every supported ALPN; the
+  server selects the highest mutual (aiopquic's `alpn_select_fn`); both
+  ends lock `self._draft` from the negotiated ALPN (`ProtocolNegotiated`).
+  A client offering several drafts now settles on a **lower** server draft
+  (e.g. d14) too — the former picky-d14 limitation is gone. No common
+  draft fails the connect promptly (clean `ConnectionError`) instead of
+  hanging.
+- **WebTransport.** The server advertises its drafts as
+  `WT-Available-Protocols`; `MOQTServer` passes them via
+  `serve_webtransport(wt_supported_protocols=...)`. Both client and
+  server derive `self._draft` from the negotiated `WT-Protocol`
+  (`negotiated_protocol`) instead of defaulting to `max(supported_drafts)`.
+  No subprotocol negotiated → highest-supported fallback (session still
+  opens; WT-Protocol is optional).
+- `test_multi_version_handshake.py`: the three formerly-skipped matrix
+  cells (multi-offer→lower draft, no-common-ALPN→clean fail, WT in-band
+  read-back) are live and green.
+
+### draft-18 dispatch tier (Phase 2 scaffold)
+
+The structural slot for draft-18, slotting into the Phase 0.C spine — no
+`is_draft18_or_later()` predicate, just one more row/key:
+
+- `MOQTDraft.DRAFT_18 = 18` + `MOQT_VERSION_DRAFT18` (`0xff000012`);
+  `moqt_version_from_draft` now validates the speakable set against
+  `MOQTDraft` (so draft 18 is accepted) rather than the legacy d14 in-band
+  list `MOQT_VERSIONS` (unchanged — d16+ negotiate via ALPN/WT-Protocol).
+- `PROFILES[18]` (out-of-band negotiation, delta-coded params) and a
+  distinct `CONTROL_REGISTRY[18]` (per-draft dict; no shared state with
+  d14/d16). The registry starts from d16 and is amended with the d18 wire
+  deltas as the d18 message classes land (`aiomoqt/messages/d18/`).
+- **Gated during development** (removed at GA, below): `AIOMOQT_ENABLE_D18=1`
+  was required to select draft 18 (`require_d18_enabled`) while the d18 wire
+  was incomplete. The gate is gone in this release; d18 is offered by default.
+
+### draft-18 data plane (Phase 4)
+
+The d18 object wire, gated behind `AIOMOQT_ENABLE_D18`. d14/d16 paths are
+byte-for-byte unchanged — the codec is selected per stream/datagram from
+`DraftProfile.varint`, and the perf-critical fused object path uses the
+vi64 twins that already shipped in aiopquic (Phase 1).
+
+- **vi64 across the data plane**: the data-stream type, `SubgroupHeader`
+  fields (Track Alias / Group ID / Subgroup ID), and the per-object fields
+  switch to vi64 for d18. `SubgroupHeader` / `ObjectHeader` carry the draft
+  and route the fused `parse/encode_object_subgroup_vi64` (hot path) or the
+  vi64 field-by-field decode (Buffer slow path).
+- **SUBGROUP_HEADER classification** generalized from hardcoded ranges to
+  the bit-mask form `0b0XX1XXXX` (bit 4 set, bit 7 clear, SUBGROUP_ID_MODE
+  != 0b11), covering the d18 ranges `0x50-0x5D` / `0x70-0x7D`, plus the new
+  `FIRST_OBJECT` bit (0x40).
+- **OBJECT_DATAGRAM relayout** (§11.3.1): form `0b00X0XXXX`, with
+  `PROPERTIES 0x01 / END_OF_GROUP 0x02 / ZERO_OBJECT_ID 0x04 /
+  DEFAULT_PRIORITY 0x08 / STATUS 0x20`. Status merges into the one
+  `ObjectDatagram` family; STATUS+END_OF_GROUP and out-of-form types are
+  rejected with PROTOCOL_VIOLATION.
+- **PADDING** stream `0x132B3E28` / datagram `0x132B3E29` recognized and
+  discarded.
+- Codec round-trips covered by `test_d18_data_plane.py`. End-to-end object
+  loopback + the `loopback_bench` d18≈d16 perf checkpoint are validated
+  during interop/perf testing (Phase 7).
+
+### draft-18 session establishment + control core (Phase 3)
+
+The d18 control plane (raw QUIC first; WebTransport added later — see the
+4-corner note below). d14/d16 paths are byte-for-byte unchanged — every
+divergence reads a `DraftProfile` capability flag.
+
+- **Control over a unidirectional stream pair** (§3.3) instead of a single
+  bidirectional stream. Each peer opens one control write-uni beginning
+  with `SETUP` and reads the peer's control read-uni; the read-uni is
+  bound by peeking the leading vi64 for the `0x2F00` stream/message type
+  and demuxed from data uni streams. `_control_write_stream_id` /
+  `_control_read_stream_id` resolve to the single bidi id pre-d18 and to
+  the distinct uni ids for d18 (`control_uni_pair` profile flag), so one
+  branch point carries the whole divergence.
+- **Symmetric `SETUP` (type `0x2F00`)** — `0x2F00` is both the control
+  uni-stream type and the `SETUP` message type, written once at the stream
+  head. Body is count-less delta-coded Key-Value-Pair Setup Options
+  (§10.3) to the message Length: no version array (negotiated via ALPN),
+  no parameter count, no `MAX_REQUEST_ID` option. The control Message Type
+  is read/written as **vi64** for d18 (`AF 00`); the per-draft
+  `CONTROL_REGISTRY` is the type authority (renumbered code points fall
+  outside the contiguous enum). Length stays 16-bit.
+- **Per-request bidirectional streams** (§3.3): each request (`SUBSCRIBE`,
+  …) opens its own bidi stream; the response returns on that same stream.
+  Responses **drop the Request ID** (`reply_has_request_id` flag) — they
+  are demuxed positionally by stream, and the bound id is injected onto the
+  parsed reply so handlers key on `msg.request_id` unchanged. Generalizes
+  the d16 `SUBSCRIBE_NAMESPACE` bidi machinery to the request openers.
+- Raw-QUIC d18 loopback: handshake over the uni pair +
+  `SUBSCRIBE → SUBSCRIBE_OK → PUBLISH_DONE` round trip, replies carrying no
+  Request ID.
+- **Deferred to a later phase**: control-stream priority (needs new
+  aiopquic transport surface) and the GOAWAY Timeout / new-Request-ID
+  fields. (WebTransport d18 control landed — see below.)
+
+### Spec-compliant bounded parsing
+
+- `_deserialize_params` enforces the control-frame `Length` extent: a
+  declared count or length that would read past it raises
+  `MOQTProtocolViolation` (session close `PROTOCOL_VIOLATION`, spec §9)
+  instead of a raw `BufferReadError`; the dispatcher catches it and
+  closes cleanly.
+
+### High-level API is version-agnostic
+
+- The track abstraction (`aiomoqt/track.py`) holds no version knowledge:
+  it reacts to logical message types (`isinstance(msg, RequestUpdate)`)
+  and passes logical fields, letting the codec gate the wire by draft.
+  Users do not encode version-specific handling.
+
+### Hot path preserved
+
+- The extensions/properties codec is draft-agnostic (removed the
+  per-object global lookup); `ObjectHeader` and the per-object loop carry
+  no draft argument. loopback_bench parity held across d14/d16 ×
+  raw-QUIC/WT (~2.5–2.8 Gbps).
+
+### Other
+
+- Removed the unmaintained `red5_conformance` example and its test docs
+  (Red5 Pro interop is untested/unverified; noted in README).
+
+### draft-18 control message bodies (Phase 5)
+
+- vi64 control bodies for the request / namespace / subscribe / publish
+  families via a buffer-carried varint flavor: aiopquic `Buffer` /
+  `StreamChain` take a `vi64` flag and `push_vint` / `pull_vint` dispatch
+  the codec in C; the control dispatcher tags the buffer once per message
+  from `DraftProfile.vi64`, so message bodies don't each re-resolve it.
+- Even-typed parameter values that are a fixed `uint8` in d18 (FORWARD
+  `0x10`, SUBSCRIBER_PRIORITY `0x20`, GROUP_ORDER `0x22`) encode as a byte,
+  not a varint (`DraftProfile.uint8_params`). AUTH_TOKEN Token Type uses an
+  `AuthTokenType` enum (no magic `0`).
+- **Code-point renumbers**: `SUBSCRIBE_NAMESPACE` `0x11` → `0x50`; new
+  `SUBSCRIBE_TRACKS` (`0x51`) and `PUBLISH_BLOCKED` (`0x0F`).
+  `REQUEST_UPDATE` carries both the new and the Existing Request ID in d18
+  (confirmed against the mvfst/moxygen relay).
+
+### draft-18 GA
+
+- The `AIOMOQT_ENABLE_D18` gate (`require_d18_enabled`) is **removed**;
+  selecting d18 no longer needs an env var. d18 is **beta**, so it is
+  **opt-in**, not auto-negotiated: `MOQTClient` / `MOQTServer` default
+  `supported_drafts` to the stable `(16, 14)`; request d18 with
+  `draft_version=18` (pin) or `supported_drafts=[18, 16, 14]` (offer). This
+  keeps a no-args session on the stable wire and prevents a d18-capable peer
+  from silently negotiating our beta wire on the public interop runner.
+
+### draft-18 over WebTransport (the 4th corner)
+
+- d18 control runs over WebTransport as well as raw QUIC. The receive demux
+  and `stream_write` were already transport-agnostic; only bring-up was
+  raw-QUIC-specific — it now opens the control write-uni via
+  `open_uni_stream()` and per-request bidi streams via the async
+  `create_stream()` path. All four corners (d14/d16/d18 × QUIC/WT) are
+  exercised by a parametrized loopback object round-trip.
+
+### Session owns version-awareness (Tier A + Tier B)
+
+- **Tier A**: the session resolves its effective `DraftProfile` once at
+  draft-lock. A `_draft` property-setter keeps `self._profile` in sync, so
+  per-message code reads `self._profile` instead of calling
+  `profile_for(self._draft)` each time.
+- **Tier B**: `serialize` / `deserialize` take `prof: DraftProfile` instead
+  of `draft: int`, across both control and data planes (the data-plane
+  `SubgroupHeader` stores `prof`; `FetchObject` / `ObjectDatagram` take it).
+  The codec receives the already-resolved profile and the message layer no
+  longer calls `profile_for` — net fewer lines, fewer per-message lookups,
+  and one abstraction to extend for future drafts. `is_draft16_or_later`
+  stays for the monotonic d14↔d16 layout fork (now reads `prof.draft`);
+  d14 remains fully supported.
+- **Data-plane factory**: `session.subgroup_header(...)` — the data-plane
+  mirror of `send_control_message` — bakes in `self._profile`, so the
+  `Track` high-level API and apps never thread draft/profile. The dead
+  `Track(draft=...)` constructor parameter is removed; version flows from
+  the session (`MOQTClient(draft_version=)` negotiation → `self._draft`).
+
+### GoAway
+
+- `GoAway` gains a `MAX_URI_LENGTH` (8 KiB) bound; an over-long New Session
+  URI raises with a trimmed "exceeds maximum length (8 KiB)" message on
+  both encode and decode.
+
+### Breaking (internal)
+
+- `serialize(*, prof: DraftProfile)` / `deserialize(*, prof, buf_end)`
+  require the keyword (was `draft: int`); the session threads its resolved
+  `self._profile`. The data-plane `SubgroupHeader(draft=)`,
+  `ObjectDatagram.serialize(draft=)`, and the `Track(draft=)` ctor parameter
+  are removed (carry/resolve `prof` from the session instead).
+  `context.moqt_version` + `get/set_moqt_ctx_version` removed;
+  `is_draft16_or_later` / `get_major_version` require an argument;
+  `draft_version` is a draft number (was the IETF hex code) and now also
+  accepts an ordered list (offer); the `supported_drafts` constructor param
+  is removed (use `draft_version=[...]`); session `_moqt_version` renamed
+  `_draft`.
+
 ## v0.9.12 (unreleased)
 
 ### SUBSCRIBE: omit default-valued params (conformant "conservative sender")
