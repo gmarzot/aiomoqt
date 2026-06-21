@@ -1446,9 +1446,16 @@ class _MOQTSessionMixin:
         self,
         namespace: str,
         track_name: str,
-        priority: int = 128,
-        group_order: GroupOrder = GroupOrder.ASCENDING,
-        forward: int = 1,
+        # Default to None = "unspecified": omit the param from the wire and
+        # let the relay apply the protocol default (forward=true, publisher
+        # group order, default priority). This matches moxygen/moqx/moq-rs,
+        # which omit default-valued SUBSCRIBE params — a conservative sender
+        # keeps the message to just the SUBSCRIPTION_FILTER. Emitting the
+        # defaults is legal but trips stricter parsers (e.g. moqtail drops a
+        # multi-param SUBSCRIBE). Pass explicit values to override.
+        priority: Optional[int] = None,
+        group_order: Optional[GroupOrder] = None,
+        forward: Optional[int] = None,
         filter_type: FilterType = FilterType.LATEST_OBJECT,
         start_group: Optional[int] = 0,
         start_object: Optional[int] = 0,
