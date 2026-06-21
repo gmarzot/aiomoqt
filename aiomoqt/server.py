@@ -51,8 +51,12 @@ class MOQTServer(MOQTPeer):
                 moqt_version_from_draft(_d)  # validate each
             self.supported_drafts = tuple(supported_drafts)
         else:
+            # d18 is beta: opt in explicitly (draft_version=18, or
+            # supported_drafts=[18, 16, 14]). The no-args default offers the
+            # stable set only, so an auto session never negotiates onto the
+            # beta d18 wire; d14 stays in the offer for d14-only peers.
             self.supported_drafts = (
-                MOQTDraft.DRAFT_18, MOQTDraft.DRAFT_16, MOQTDraft.DRAFT_14)
+                MOQTDraft.DRAFT_16, MOQTDraft.DRAFT_14)
         self.draft_version = draft_version
         self.certificate = certificate
         self.private_key = private_key

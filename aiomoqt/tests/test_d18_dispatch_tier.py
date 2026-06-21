@@ -93,13 +93,15 @@ def test_d18_selectable_without_env_var(monkeypatch):
     assert c2.supported_drafts == (18,)
 
 
-def test_default_client_offers_d18_on_equal_footing(monkeypatch):
-    # d18 ships on equal footing with d16/d14: the default offer is
-    # (18, 16, 14), newest-first, so a peer that speaks d18 negotiates it
-    # and others fall back gracefully.
+def test_default_client_omits_d18_beta(monkeypatch):
+    # d18 ships beta: the no-args default offers the STABLE set (16, 14)
+    # only — an auto session never negotiates onto the beta d18 wire, and
+    # d14 stays in the offer for d14-only peers. d18 is one explicit opt-in
+    # away (draft_version=18 or supported_drafts=[18, 16, 14]).
     monkeypatch.delenv("AIOMOQT_ENABLE_D18", raising=False)
     c = MOQTClient("localhost", 4433)
-    assert c.supported_drafts == (18, 16, 14)
+    assert c.supported_drafts == (16, 14)
+    assert 18 not in c.supported_drafts
 
 
 def test_d18_setup_options_kvp_roundtrip():

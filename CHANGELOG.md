@@ -14,9 +14,12 @@ class-surface change.
 The sections below trace how it was built phase by phase; this is the
 final state of the release.
 
-- **Offered by default**, newest-first with graceful fallback:
-  `supported_drafts` defaults to `(18, 16, 14)`. No env gate — the
-  development-time `AIOMOQT_ENABLE_D18` flag is removed.
+- **d18 is opt-in (beta).** The no-args default offers the **stable** set
+  `(16, 14)`, newest-first — an auto session never negotiates onto the beta
+  d18 wire, and d14 stays in the offer for d14-only peers. Select d18
+  explicitly: `draft_version=18` (pin) or `supported_drafts=[18, 16, 14]`
+  (offer). No env gate — the development-time `AIOMOQT_ENABLE_D18` flag is
+  removed.
 - **All four corners live**: d14/d16/d18 × raw QUIC / WebTransport,
   validated by in-process loopback object round-trips; loopback perf
   parity d16↔d18 (2.85–3.09 Gbps, 0% loss).
@@ -227,9 +230,12 @@ divergence reads a `DraftProfile` capability flag.
 ### draft-18 GA
 
 - The `AIOMOQT_ENABLE_D18` gate (`require_d18_enabled`) is **removed**;
-  draft 18 is offered on equal footing with d14/d16. `MOQTClient` /
-  `MOQTServer` default `supported_drafts` to `(18, 16, 14)` — newest-first,
-  graceful fallback. Selecting d18 no longer needs an env var.
+  selecting d18 no longer needs an env var. d18 is **beta**, so it is
+  **opt-in**, not auto-negotiated: `MOQTClient` / `MOQTServer` default
+  `supported_drafts` to the stable `(16, 14)`; request d18 with
+  `draft_version=18` (pin) or `supported_drafts=[18, 16, 14]` (offer). This
+  keeps a no-args session on the stable wire and prevents a d18-capable peer
+  from silently negotiating our beta wire on the public interop runner.
 
 ### draft-18 over WebTransport (the 4th corner)
 
