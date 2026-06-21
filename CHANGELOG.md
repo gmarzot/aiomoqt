@@ -30,8 +30,6 @@ final state of the release.
   renumbered `0x50` plus `SUBSCRIBE_TRACKS`/`PUBLISH_BLOCKED`.
 - **Beta limitations**: subscribe/publish subscription-filter and
   largest-location still use the d16 nested form; d18 Fetch is pending;
-  `PUBLISH_OK` keeps the in-band Request ID on the d18 wire while the other
-  replies drop it (publish.py is not yet gated on `reply_has_request_id`);
   Track-Properties extensions encode as RFC9000 varints (correct for the
   small values in use). None of these affect d14/d16.
 - **Tests**: a d14/d16/d18 control-message round-trip matrix

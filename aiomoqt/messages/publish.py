@@ -172,7 +172,11 @@ class PublishOk(MOQTMessage):
         buf = Buffer(capacity=BUF_SIZE)
         payload = Buffer(capacity=BUF_SIZE, vi64=prof.vi64)
 
-        payload.push_vint(self.request_id)
+        # PUBLISH_OK is a response (§10.1): d18 omits the Request ID — it is
+        # demuxed from the bidi request stream the response arrives on. Only
+        # request messages (PUBLISH, SUBSCRIBE, ...) carry it.
+        if prof.reply_has_request_id:
+            payload.push_vint(self.request_id)
 
         if is_draft16_or_later(prof.draft):
             # d16: everything in params
@@ -213,7 +217,10 @@ class PublishOk(MOQTMessage):
 
     @classmethod
     def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'PublishOk':
-        request_id = buf.pull_vint()
+        # d18 responses omit the Request ID (injected from the request
+        # stream by the dispatcher); see serialize.
+        request_id = (buf.pull_vint()
+                      if prof.reply_has_request_id else None)
 
         forward = None
         priority = None

@@ -1185,12 +1185,10 @@ class TestDraft18ControlMessages:
         )
 
     def test_publish_ok_d18(self):
-        # NOTE (d18 beta asymmetry): unlike SubscribeOk / RequestOk /
-        # RequestError, PUBLISH_OK currently KEEPS request_id on the d18
-        # wire (publish.py is not gated on reply_has_request_id). request_id
-        # is skipped here so the test stays focused on the vi64 body codec;
-        # the reply-id asymmetry is tracked as a beta detail, not asserted
-        # either way.
+        # PUBLISH_OK is a response (§10.1) → d18 omits the Request ID on the
+        # wire (demuxed from the request stream; the dispatcher injects it).
+        # request_id is skipped here because it is intentionally absent on
+        # the d18 wire, exactly like SubscribeOk / RequestOk / RequestError.
         assert moqt_message_serialization_versioned(
             PublishOk,
             {
