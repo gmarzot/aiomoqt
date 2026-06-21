@@ -68,10 +68,10 @@ async def test_setup(host, port, draft):
     r = ConformanceResult("setup")
     try:
         client = MOQTClient(host, port, path='',
-                            use_quic=True, draft_version=draft)
+                            use_quic=True, supported_drafts=draft)
         async with client.connect() as session:
             await session.client_session_init()
-            r.pass_(f"ServerSetup received, version=0x{session._moqt_version:x}")
+            r.pass_(f"ServerSetup received, draft={session.negotiated_draft}")
     except Exception as e:
         r.fail(str(e))
     return r
@@ -82,7 +82,7 @@ async def test_publish_namespace(host, port, draft, namespace):
     r = ConformanceResult("publish_namespace response")
     try:
         client = MOQTClient(host, port, path='',
-                            use_quic=True, draft_version=draft)
+                            use_quic=True, supported_drafts=draft)
         async with client.connect() as session:
             await session.client_session_init()
             resp = await session.publish_namespace(
@@ -110,7 +110,7 @@ async def test_publish_response(host, port, draft, namespace, trackname):
     r = ConformanceResult("publish response (forward=0)")
     try:
         client = MOQTClient(host, port, path='',
-                            use_quic=True, draft_version=draft)
+                            use_quic=True, supported_drafts=draft)
         async with client.connect() as session:
             await session.client_session_init()
             await session.publish_namespace(
@@ -145,7 +145,7 @@ async def test_subscribe_namespace_response(host, port, draft, namespace):
     r = ConformanceResult("subscribe_namespace response")
     try:
         client = MOQTClient(host, port, path='',
-                            use_quic=True, draft_version=draft)
+                            use_quic=True, supported_drafts=draft)
         async with client.connect() as session:
             await session.client_session_init()
             resp = await session.subscribe_namespace(
@@ -172,7 +172,7 @@ async def test_subscribe_namespace_publish_forwarding(
     r = ConformanceResult("subscribe_namespace forwards PUBLISH")
     try:
         client = MOQTClient(host, port, path='',
-                            use_quic=True, draft_version=draft)
+                            use_quic=True, supported_drafts=draft)
         async with client.connect() as session:
             await session.client_session_init()
             await session.subscribe_namespace(
@@ -206,7 +206,7 @@ async def test_subscribe_response(host, port, draft, namespace, trackname):
     r = ConformanceResult("subscribe response")
     try:
         client = MOQTClient(host, port, path='',
-                            use_quic=True, draft_version=draft)
+                            use_quic=True, supported_drafts=draft)
         async with client.connect() as session:
             await session.client_session_init()
             resp = await session.subscribe(
@@ -245,7 +245,7 @@ async def test_subscribe_data_delivery(host, port, draft,
 
     try:
         client = MOQTClient(host, port, path='',
-                            use_quic=True, draft_version=draft)
+                            use_quic=True, supported_drafts=draft)
         async with client.connect() as session:
             await session.client_session_init()
             session.on_object_received = on_obj
@@ -295,7 +295,7 @@ async def test_track_alias_established(host, port, draft,
 
     try:
         client = MOQTClient(host, port, path='',
-                            use_quic=True, draft_version=draft)
+                            use_quic=True, supported_drafts=draft)
         async with client.connect() as session:
             await session.client_session_init()
             session.on_object_received = on_obj

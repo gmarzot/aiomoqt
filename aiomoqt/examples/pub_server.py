@@ -216,7 +216,7 @@ async def main():
         certificate=args.cert, private_key=args.key,
         path="/",
         use_quic=args.quic,
-        draft_version=args.draft,
+        supported_drafts=args.draft,
         congestion_control_algorithm=args.cc_algo,
     )
     if _tx_max is not ...:

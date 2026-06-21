@@ -116,9 +116,32 @@ def parse_args():
              'exceed this. Default: aiomoqt default (1 MiB). '
              'Pass 0 to disable.')
     parser.add_argument(
+        '--compat', type=str, default='',
+        help='Comma-separated relay compat tolerances (matches the '
+             'moq_interop_client compat keys). Currently honored: '
+             'lenient-extensions (tolerate a relay\'s truncated '
+             'trailing-extensions KVP block on control messages, '
+             'e.g. SubscribeOk from the moq-rs d16 interop fork).')
+    parser.add_argument(
         '-?', '--help', action='help',
         help='Show this help message and exit')
     return parser.parse_args()
+
+
+def _apply_compat(compat: str) -> None:
+    """Enable relay-specific wire tolerances in *this* worker process.
+
+    Mirrors moq_interop_client: the tolerance is a class flag on
+    MOQTMessage, so it must be set inside each spawned worker (the
+    publisher/subscriber processes), not just the parent. Without it,
+    a relay that emits a truncated trailing-extensions block on a
+    control message (the moq-rs d16 interop fork does this on
+    SubscribeOk) makes _extensions_decode raise inside the QUIC
+    callback, killing the subscription before any object arrives."""
+    keys = {k.strip() for k in compat.split(',') if k.strip()}
+    if 'all' in keys or 'lenient-extensions' in keys:
+        from aiomoqt.messages.base import MOQTMessage
+        MOQTMessage._tolerate_trailing_extensions = True
 
 
 def run_publisher(relay_url, namespace, trackname, args):
@@ -138,6 +161,7 @@ def run_publisher(relay_url, namespace, trackname, args):
     else:
         logging.basicConfig(stream=devnull, force=True)
         set_log_level(logging.CRITICAL)
+    _apply_compat(args.compat)
 
     async def _pub():
         relay = parse_relay_url(relay_url, force_quic=args.force_quic)
@@ -146,7 +170,7 @@ def run_publisher(relay_url, namespace, trackname, args):
             path=relay.path,
             use_quic=relay.use_quic,
             verify_tls=not args.insecure,
-            draft_version=args.draft,
+            supported_drafts=args.draft,
             congestion_control_algorithm=args.cc_algo,
             tx_max_queued_bytes=args.max_queued_bytes,
             **({'tx_max_inflight_bytes':
@@ -204,6 +228,7 @@ def run_subscriber(sub_id, relay_url, namespace, trackname, args,
     else:
         logging.basicConfig(stream=devnull, force=True)
         set_log_level(logging.CRITICAL)
+    _apply_compat(args.compat)
 
     stats = {'id': sub_id, 'objects': 0, 'bytes': 0,
              'latencies': [], 'duration': 0, 'error': None}
@@ -229,7 +254,7 @@ def run_subscriber(sub_id, relay_url, namespace, trackname, args,
             path=relay.path,
             use_quic=relay.use_quic,
             verify_tls=not args.insecure,
-            draft_version=args.draft,
+            supported_drafts=args.draft,
             congestion_control_algorithm=args.cc_algo,
         )
         start = time.monotonic()

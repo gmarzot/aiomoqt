@@ -66,7 +66,7 @@ async def _run_for_n(n_sessions, args):
         certificate=cert, private_key=key,
         path="/",
         use_quic=True,
-        draft_version=16,
+        supported_drafts=16,
     )
     server.register_handler(MOQTMessageType.SUBSCRIBE, on_subscribe)
     server_handle = await server.serve()
@@ -89,7 +89,7 @@ async def _run_for_n(n_sessions, args):
             '127.0.0.1', args.port, path='moq',
             use_quic=True,
             verify_tls=False, debug=False,
-            draft_version=16,
+            supported_drafts=16,
         )
         try:
             async with client.connect() as session:

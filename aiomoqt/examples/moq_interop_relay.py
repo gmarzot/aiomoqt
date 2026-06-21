@@ -193,7 +193,7 @@ def _build_server(bind, port, cert, key, use_quic, draft):
         certificate=cert, private_key=key,
         path="/",
         use_quic=use_quic,
-        draft_version=draft,
+        supported_drafts=draft,
     )
     server.register_handler(
         MOQTMessageType.PUBLISH_NAMESPACE, _on_publish_namespace)

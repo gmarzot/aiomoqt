@@ -160,7 +160,11 @@ class _MOQTSessionMixin:
         # future. WT mode resolves it in _moqt_wt_finalize().
         if getattr(session, 'use_quic', False):
             self._wt_session_setup.set_result(True)
-        self._moqt_version: int = MOQT_CUR_VERSION
+        # The negotiated MoQT draft, as a representation-independent draft
+        # number (e.g. 16). Defaults to the current draft until ALPN /
+        # WT-Available-Protocols / SERVER_SETUP resolves it; the wire
+        # IETF version code is only derived when (de)serializing SETUP.
+        self.negotiated_draft: int = get_major_version(MOQT_CUR_VERSION)
         self._moqt_session_setup: Future[bool] = self._loop.create_future()
         self._moqt_session_closed: Future[Tuple[int,str]] = self._loop.create_future()
         self._next_request_id = 0 if self._is_client else 1
@@ -988,10 +992,12 @@ class _MOQTSessionMixin:
             if alpn == MOQT_ALPN or (alpn and alpn.startswith("moqt-")):
                 logger.debug(f"QUIC event: ALPN ProtocolNegotiated alpn: {alpn}")
                 try:
-                    version = moqt_version_from_alpn(alpn)
-                    set_moqt_ctx_version(version)
-                    self._moqt_version = version
-                    logger.info(f"MOQT: version set from ALPN: {alpn} -> 0x{version:x}")
+                    version = moqt_version_from_alpn(alpn)  # wire from ALPN
+                    self.negotiated_draft = get_major_version(version)
+                    set_moqt_ctx_version(self.negotiated_draft)
+                    logger.info(
+                        f"MOQT: draft set from ALPN: {alpn} -> "
+                        f"{self.negotiated_draft}")
                 except ValueError:
                     pass
             else:
@@ -1187,10 +1193,10 @@ class _MOQTSessionMixin:
             # the MoQT control bidi stream and pin the version from
             # draft (in-band wt-available-protocols negotiation isn't
             # wired for v0.9.0; picowt supports it).
-            draft = getattr(self._session, 'draft_version', None)
-            if draft is not None:
-                set_moqt_ctx_version(draft)
-                self._moqt_version = draft
+            drafts = getattr(self._session, 'supported_drafts', [])
+            if len(drafts) == 1:
+                set_moqt_ctx_version(drafts[0])
+                self.negotiated_draft = drafts[0]
             self._control_stream_id = await self.open_bidi_stream()
             logger.info(
                 f"MOQT: WT control stream created stream id: "
@@ -1199,13 +1205,17 @@ class _MOQTSessionMixin:
         # Send CLIENT_SETUP
         params[SetupParamType.MAX_REQUEST_ID] = 10000
         params[SetupParamType.IMPLEMENTATION] = USER_AGENT.encode()
-        # For raw QUIC with explicit draft: single version
-        # For H3/WT: version list depends on whether WT protocol was negotiated
-        #   - negotiated: is_draft16_or_later() is set, no version array needed
-        #   - not negotiated: d14 format, include version array
-        draft = getattr(self._session, 'draft_version', None)
-        if use_quic and draft is not None:
-            versions = [moqt_version_from_alpn(moqt_alpn_for_version(draft))]
+        # CLIENT_SETUP carries the offered versions on the wire, so this
+        # is where supported drafts (representation-independent numbers)
+        # are translated to IETF version codes.
+        #   - raw QUIC: offer one wire code per supported draft (a single
+        #     supported draft yields a single version).
+        #   - H3/WT: the version is negotiated via ALPN /
+        #     WT-Available-Protocols; send the full MOQT_VERSIONS list for
+        #     the d14 in-band path (d16+ ignores it).
+        drafts = getattr(self._session, 'supported_drafts', [])
+        if use_quic and drafts:
+            versions = [moqt_version_from_draft(d) for d in drafts]
         else:
             versions = MOQT_VERSIONS
         client_setup = self.client_setup(
@@ -1967,13 +1977,14 @@ class _MOQTSessionMixin:
                 reason_phrase=error
             )
         else:
-            selected_version = msg.selected_version
+            selected_version = msg.selected_version  # wire code, or None
             if selected_version is None:
                 # Draft-16+ carries no version in ServerSetup: it was
                 # negotiated out-of-band — QUIC ALPN ("moqt-NN") for raw
                 # QUIC, WT-Available-Protocols for WebTransport. These are
-                # distinct mechanisms; don't conflate them.
-                selected_version = self._moqt_version
+                # distinct mechanisms; don't conflate them. negotiated_draft
+                # is already resolved; derive the wire code for the check.
+                selected_version = moqt_version_from_draft(self.negotiated_draft)
                 _src = ("ALPN" if getattr(self, 'use_quic', False)
                         else "WT-Available-Protocols")
                 logger.info(f"MOQT event: d16+ ServerSetup (version from {_src}: 0x{selected_version:x})")
@@ -1985,8 +1996,8 @@ class _MOQTSessionMixin:
                     reason_phrase=error
                 )
             else:
-                self._moqt_version = selected_version
-                set_moqt_ctx_version(self._moqt_version)
+                self.negotiated_draft = get_major_version(selected_version)
+                set_moqt_ctx_version(self.negotiated_draft)
 
             # indicate moqt session setup is complete
             self._moqt_session_setup.set_result(True)
@@ -2011,8 +2022,8 @@ class _MOQTSessionMixin:
         else:
             # d14: version negotiated via msg.versions list.
             # d16+: version negotiated via ALPN; msg.versions is empty
-            # (the wire format omits it). Trust the ALPN-resolved version
-            # already set in self._moqt_version on ProtocolNegotiated.
+            # (the wire format omits it). Trust the ALPN-resolved draft
+            # already set in self.negotiated_draft on ProtocolNegotiated.
             version_ok = (
                 is_draft16_or_later() or MOQT_CUR_VERSION in msg.versions
             )
@@ -2467,8 +2478,8 @@ class MOQTSessionWTServer(
 
     def __init__(self, transport, state, *, session: 'MOQTPeer'):
         super().__init__(transport, state, session=session)
-        draft = getattr(session, 'draft_version', None)
-        if draft is not None:
-            set_moqt_ctx_version(draft)
-            self._moqt_version = draft
+        drafts = getattr(session, 'supported_drafts', [])
+        if len(drafts) == 1:
+            set_moqt_ctx_version(drafts[0])
+            self.negotiated_draft = drafts[0]
         self._moqt_wt_finalize()

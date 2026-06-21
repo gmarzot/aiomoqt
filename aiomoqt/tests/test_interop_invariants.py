@@ -119,42 +119,52 @@ class TestAlpnByDraft:
 # =====================================================================
 
 class TestMoqtClientDraftValidation:
-    """MOQTClient.draft_version is part of the public API contract;
-    it accepts draft NUMBERS (14, 16, ...), validates against the
-    supported set, normalizes for internal use. Confusion between
-    draft-number form and IETF wire form was the source of the
-    0.9.x silent setup failure.
+    """MOQTClient.supported_drafts is part of the public API contract;
+    it accepts draft NUMBERS (14, 16, ...) — a single int or a list —
+    validates against the supported set, and normalizes to a non-empty
+    list of draft numbers (newest first). Drafts stay representation-
+    independent ints; the IETF wire form is only used when building or
+    parsing wire messages. Confusion between draft-number form and IETF
+    wire form was the source of the 0.9.x silent setup failure.
     """
 
     def test_accepts_supported_draft_number(self):
         from aiomoqt.client import MOQTClient
-        # Should not raise.
-        c = MOQTClient("localhost", 4433, draft_version=14)
-        assert c.draft_version == 0xff00000e
-        c = MOQTClient("localhost", 4433, draft_version=16)
-        assert c.draft_version == 0xff000010
+        # Should not raise; a single int normalizes to a one-element list.
+        c = MOQTClient("localhost", 4433, supported_drafts=14)
+        assert c.supported_drafts == [14]
+        c = MOQTClient("localhost", 4433, supported_drafts=16)
+        assert c.supported_drafts == [16]
+
+    def test_accepts_draft_list_normalized_newest_first(self):
+        from aiomoqt.client import MOQTClient
+        c = MOQTClient("localhost", 4433, supported_drafts=[14, 16])
+        assert c.supported_drafts == [16, 14]
+        # duplicates collapse
+        c = MOQTClient("localhost", 4433, supported_drafts=[16, 16, 14])
+        assert c.supported_drafts == [16, 14]
 
     def test_rejects_unsupported_draft_number(self):
         from aiomoqt.client import MOQTClient
         with pytest.raises(ValueError, match="not supported"):
-            MOQTClient("localhost", 4433, draft_version=15)
+            MOQTClient("localhost", 4433, supported_drafts=15)
         with pytest.raises(ValueError, match="not supported"):
-            MOQTClient("localhost", 4433, draft_version=99)
+            MOQTClient("localhost", 4433, supported_drafts=[16, 99])
 
     def test_rejects_hex_wire_form_as_draft_arg(self):
-        # The 0.9.x bug: passing the wire form 0xff000010 as
-        # draft_version "worked" silently but produced inconsistent
-        # internal state. Must now reject clearly.
+        # The 0.9.x bug: passing the wire form 0xff000010 as a draft
+        # "worked" silently but produced inconsistent internal state.
+        # Must now reject clearly.
         from aiomoqt.client import MOQTClient
         with pytest.raises(ValueError):
-            MOQTClient("localhost", 4433, draft_version=0xff000010)
+            MOQTClient("localhost", 4433, supported_drafts=0xff000010)
 
-    def test_none_draft_is_allowed(self):
-        # No draft pinning is legal — aiomoqt offers all known versions
-        # in CLIENT_SETUP, server picks.
+    def test_none_offers_all_drafts_newest_first(self):
+        # No draft pinning is legal — aiomoqt offers all known drafts
+        # (newest first) and the server picks via ALPN / negotiation.
         from aiomoqt.client import MOQTClient
-        c = MOQTClient("localhost", 4433, draft_version=None)
-        assert c.draft_version is None
+        c = MOQTClient("localhost", 4433, supported_drafts=None)
+        assert c.supported_drafts == [16, 14]
 
 
 # =====================================================================

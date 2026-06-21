@@ -30,14 +30,14 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-async def _start_server(port: int, draft_version, use_quic,
+async def _start_server(port: int, supported_drafts, use_quic,
                          on_publish_namespace=None):
     server = MOQTServer(
         host="localhost", port=port,
         certificate=CERT, private_key=KEY,
         path="/",
         use_quic=use_quic,
-        draft_version=draft_version,
+        supported_drafts=supported_drafts,
     )
     if on_publish_namespace is not None:
         server.register_handler(
@@ -58,12 +58,12 @@ async def test_setup_draft14(use_quic):
     """Client + server complete the d14 handshake on both transports."""
     port = _BASE_PORT + (1 if use_quic else 4)
     server = await _start_server(
-        port, draft_version=14, use_quic=use_quic)
+        port, supported_drafts=14, use_quic=use_quic)
     try:
         client = MOQTClient(
             "localhost", port, path="/",
             use_quic=use_quic,
-            verify_tls=False, draft_version=14,
+            verify_tls=False, supported_drafts=14,
         )
         async with client.connect() as session:
             await session.client_session_init()
@@ -78,12 +78,12 @@ async def test_setup_draft16(use_quic):
     """Client + server complete the d16 handshake on both transports."""
     port = _BASE_PORT + (2 if use_quic else 5)
     server = await _start_server(
-        port, draft_version=16, use_quic=use_quic)
+        port, supported_drafts=16, use_quic=use_quic)
     try:
         client = MOQTClient(
             "localhost", port, path="/",
             use_quic=use_quic,
-            verify_tls=False, draft_version=16,
+            verify_tls=False, supported_drafts=16,
         )
         async with client.connect() as session:
             await session.client_session_init()
@@ -106,13 +106,13 @@ async def test_setup_auth_token_roundtrip(use_quic):
         session.publish_namepace_ok(msg)
 
     server = await _start_server(
-        port, draft_version=16, use_quic=use_quic,
+        port, supported_drafts=16, use_quic=use_quic,
         on_publish_namespace=_handle_pub_ns)
     try:
         client = MOQTClient(
             "localhost", port, path="/",
             use_quic=use_quic,
-            verify_tls=False, draft_version=16,
+            verify_tls=False, supported_drafts=16,
         )
         async with client.connect() as session:
             await session.client_session_init()
