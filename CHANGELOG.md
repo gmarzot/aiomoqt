@@ -17,8 +17,8 @@ final state of the release.
 - **d18 is opt-in (beta).** The no-args default offers the **stable** set
   `(16, 14)`, newest-first — an auto session never negotiates onto the beta
   d18 wire, and d14 stays in the offer for d14-only peers. Select d18
-  explicitly: `draft_version=18` (pin) or `supported_drafts=[18, 16, 14]`
-  (offer). No env gate — the development-time `AIOMOQT_ENABLE_D18` flag is
+  explicitly: `supported_drafts=18` or `supported_drafts=[18, 16, 14]`.
+  No env gate — the development-time `AIOMOQT_ENABLE_D18` flag is
   removed.
 - **All four corners live**: d14/d16/d18 × raw QUIC / WebTransport,
   validated by in-process loopback object round-trips; loopback perf
@@ -30,19 +30,29 @@ final state of the release.
   renumbered `0x50` plus `SUBSCRIBE_TRACKS`/`PUBLISH_BLOCKED`.
 - **Beta limitations**: subscribe/publish subscription-filter and
   largest-location still use the d16 nested form; d18 Fetch is pending;
+  `PUBLISH_OK` keeps the in-band Request ID on the d18 wire while the other
+  replies drop it (publish.py is not yet gated on `reply_has_request_id`);
   Track-Properties extensions encode as RFC9000 varints (correct for the
   small values in use). None of these affect d14/d16.
+- **Tests**: a d14/d16/d18 control-message round-trip matrix
+  (`TestDraft18ControlMessages`) covers the vi64 codec, the uint8 param-value
+  path, and reply-drops-request-id; alongside the d18 data-plane, setup,
+  dispatch, and loopback object round-trips.
 
-### Version selection — one `draft_version` (int or ordered list)
+### Version selection — `supported_drafts` + `negotiated_draft`
 
-- `MOQTClient` / `MOQTServer` take a single `draft_version`: an **int** pins
-  one draft (offer only that ALPN); an **ordered list** offers the set in the
-  given preference order (highest mutual wins — first-offered matters for
-  relays that select the first ALPN rather than the highest). The redundant
-  `supported_drafts` **constructor param is removed** — pass
-  `draft_version=[18, 16, 14]` instead. The resolved offer is read back on
-  `self.supported_drafts`; `self.draft_version` is the pin (or `None` for a
-  multi-offer). The offer is no longer force-sorted — caller order is honored.
+- `MOQTClient` / `MOQTServer` take `supported_drafts`: an **int** (a single
+  draft — offer only that ALPN), an **ordered list** (offer the set in the
+  caller's preference order — highest mutual wins, and first-offered matters
+  for relays that select the first ALPN rather than the highest), or **None**
+  (the auto offer: the stable set, newest-first). It is stored as a non-empty
+  list of draft numbers on `self.supported_drafts` — caller order is
+  preserved for explicit lists; only the `None` auto-offer is sorted
+  newest-first. The legacy `draft_version` param and field are **gone** (a
+  single-element list is the pin).
+- The per-session result is `session.negotiated_draft` (a draft number),
+  derived from the resolved `DraftProfile` so the two can never drift; QUIC
+  ALPN / WT-Protocol negotiation sets it.
 - CLI: `--draft` accepts a single draft (`--draft 16`) or a comma list
   (`--draft 18,16,14`), via `parse_draft_spec`.
 
@@ -51,7 +61,7 @@ final state of the release.
 - The process-global `context.moqt_version` and its
   `get/set_moqt_ctx_version` accessors are **deleted**. Draft flows as a
   required keyword-only argument through every `serialize` / `deserialize`,
-  sourced from a per-session `self._draft` (threaded as the resolved
+  sourced from the per-session `negotiated_draft` (threaded as the resolved
   `prof: DraftProfile` as of Tier B, below). Concurrent
   sessions on different drafts in one event loop no longer clobber each
   other (regression: `test_concurrent_versions`).
@@ -88,11 +98,15 @@ final state of the release.
   of version arithmetic; localized one-off gates keep the thin
   `is_draft16_or_later(draft)` predicate (now required-arg).
 
-### Two-attribute negotiation discipline
+### Negotiation discipline — one `supported_drafts` list
 
-- `MOQTClient` / `MOQTServer` accept `supported_drafts: list[int]`
-  alongside `draft_version`. A pinned `draft_version` normalizes to a
-  1-tuple; the default offers `(16, 14)` newest-first (preference order).
+- `MOQTClient` / `MOQTServer` accept a single `supported_drafts`
+  (int | ordered list | None); a single-element list is the pin, and the
+  default (`None`) offers the stable set `(16, 14)` newest-first. This
+  consolidates an earlier two-attribute (`draft_version` + `supported_drafts`)
+  iteration — the version fields were unified in the 0.9.13-pre
+  reconciliation (see "Version selection" above; the per-session result is
+  `negotiated_draft`).
 
 ### Full multi-version negotiation, both transports
 
