@@ -60,11 +60,13 @@ jobs:
             -days 1 -subj "/CN=localhost"
       - name: Run unit + integration tiers
         run: |
-          # GitHub's macOS runners have pathologically slow pytest-asyncio
-          # per-test event-loop teardown (~10-12s/test), so loopback-fetch
-          # (the most cases) tips over its timeout and flakes. Skip it on
-          # macOS: the fetch logic is platform-independent (covered on
-          # Linux) and the bench matrix covers macOS loopback delivery.
+          # On macOS the native QUIC connection close stalls ~10s when a
+          # fetch stream is left un-drained at session exit (confirmed on a
+          # real macOS box — it's the aiopquic/picoquic close drain over
+          # loopback, NOT pytest teardown), so loopback-fetch tips over its
+          # timeout and flakes. Skip it on macOS: the fetch logic is
+          # platform-independent (covered on Linux) and the bench matrix
+          # covers macOS loopback delivery. Tracked as an aiopquic follow-up.
           SKIP=""
           [ "$RUNNER_OS" = "macOS" ] && SKIP="--skip-suite loopback-fetch"
           python tests/release_regression_test.py \

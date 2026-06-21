@@ -17,8 +17,8 @@
 ### Release regression: flake resistance, macOS loopback-fetch, catalog trim
 
 - **Interop tier retries transient flakes.** A failing relay/suite is retried up to 2 extra times; a genuine fail fails every attempt, a flake recovers and is annotated `(flaky: recovered on attempt N)`. External-relay/network jitter (timeouts, the `multi_sub_bench` fixed publisher-register wait racing a relay's namespace registration) no longer reads as a real failure.
-- **macOS skips `loopback-fetch`** (new `--skip-suite` flag): GitHub's macOS runners have ~10-12s/test pytest-asyncio event-loop teardown, tipping loopback-fetch over its timeout. The fetch logic is platform-independent (covered on Linux) and the bench matrix covers macOS loopback delivery.
-- **Catalog trim (#24):** disabled the no-answer / unsupported suites that will never pass — `cloudflare-d14` `relay-fetch` (this d14 build has no standalone FETCH) and `cf-d16-interop` `relay-join`/`relay-fetch` (moq-rs d16 never answers). Genuine conformance fails are kept (cf-d16 pub-sub routing, quicr-west fetch code=0).
+- **macOS skips `loopback-fetch`** (new `--skip-suite` flag): on macOS the native QUIC connection close stalls ~10s when a fetch stream is left un-drained at session exit — confirmed on a real macOS box (argo) that it's the aiopquic/picoquic close drain over loopback, *not* pytest teardown as first assumed — tipping loopback-fetch over its timeout. The fetch logic is platform-independent (covered on Linux) and the bench matrix covers macOS loopback delivery; tracked as an aiopquic follow-up.
+- **Catalog trim (#24):** disabled the no-answer / unsupported suites that will never pass — `cloudflare-d14` `relay-fetch` and `cf-d16-interop` `relay-join`/`relay-fetch`. Verified against the implementations rather than inferred from the timeout: both `cloudflare/moq-rs` and `itzmanish/moq-rs` READMEs list FETCH as "Not Soon", and the relay neither forwards nor errors a FETCH (open upstream issues cloudflare/moq-rs#57 passthrough, #58 error). Genuine conformance fails are kept (cf-d16 pub-sub routing, quicr-west fetch code=0).
 
 ## v0.9.11
 
