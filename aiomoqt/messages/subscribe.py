@@ -308,10 +308,16 @@ class Subscribe(MOQTMessage):
                 params[ParamType.SUBSCRIPTION_FILTER] = fbuf.data_slice(0, fbuf.tell())
             MOQTMessage._serialize_params(payload, params, prof=prof)
         else:
-            # d14: fixed fields on wire
-            payload.push_uint8(self.priority)
-            payload.push_uint8(self.group_order)
-            payload.push_uint8(self.forward)
+            # d14: priority / group_order / forward are mandatory fixed
+            # fields on the wire (no optional form like d16's params), so
+            # substitute defaults when the caller left them unset (None).
+            payload.push_uint8(self.priority
+                               if self.priority is not None else 128)
+            payload.push_uint8(self.group_order
+                               if self.group_order is not None
+                               else GroupOrder.ASCENDING)
+            payload.push_uint8(self.forward
+                               if self.forward is not None else 1)
             payload.push_vint(self.filter_type)
 
             if self.filter_type in (3, 4):

@@ -278,6 +278,83 @@ divergence reads a `DraftProfile` capability flag.
   `draft_version` is a draft number (was the IETF hex code); session
   `_moqt_version` renamed `_draft`.
 
+## v0.9.12 (unreleased)
+
+### SUBSCRIBE: omit default-valued params (conformant "conservative sender")
+
+- `subscribe()` now defaults `priority` / `group_order` / `forward` to `None` = "unspecified", so the **d16 SUBSCRIBE omits them from the wire** and the relay applies the protocol default (forward=true, publisher group order, default priority). aiomoqt previously always emitted all four params (`SUBSCRIBER_PRIORITY` 0x20, `GROUP_ORDER` 0x22, `FORWARD` 0x10, `SUBSCRIPTION_FILTER` 0x21) — legal but non-idiomatic; moxygen/moqx/moq-rs all omit defaults. The extra params tripped **moqtail**'s stricter parser, which silently **dropped** our multi-param SUBSCRIBE — failing `subscribe-error`, `announce-subscribe`, and `subscribe-before-announce` against it. With the filter-only subscribe, **moqtail goes 3/6 → 6/6** and every other relay (moxygen / moqx / imquic / moq-dev-rs / loopback d14+d16) is unchanged. To force a param onto the wire, pass it explicitly — a default-equal value like `forward=1` is still sent when given. The d14 path (mandatory inline fields) substitutes defaults for `None`. The same omit-defaults applies to `fetch()` and `join()` (subscriber priority / group order, and join's subscribe `forward`).
+
+### moq_interop_client: serve the forwarded SUBSCRIBE + tolerate pending-hold
+
+- The `announce-subscribe` publisher now **serves the relay's forwarded SUBSCRIBE** (via `PublishedTrack`), matching moxygen/moqx/moq-rs, so forward-and-wait relays can complete the downstream `SUBSCRIBE_OK`. When a relay holds the subscription pending without an eager OK (a valid forward-and-wait model), the wait timeout is accepted as a pass and annotated (`# COMPAT`) rather than failing. A real `SUBSCRIBE_ERROR` still fails.
+
+### moq_interop_client: tighten the error-code leniency (exclude INTERNAL_ERROR 0x0)
+
+- The 0.9.11 "any structured error = rejection" default was too broad — it accepted `INTERNAL_ERROR (0x0)`, a server fault rather than a refusal. `subscribe-error` / `subscribe-before-announce` / `join` now reject `0x0` by default (accepted only under explicit `moq-rs`/`moq-dev` compat, which use `0` as their not-found code). Spec codes and other non-spec codes (e.g. 404) are unaffected.
+
+### Release regression: flake resistance, macOS loopback-fetch, catalog trim
+
+- **Interop tier retries transient flakes.** A failing relay/suite is retried up to 2 extra times; a genuine fail fails every attempt, a flake recovers and is annotated `(flaky: recovered on attempt N)`. External-relay/network jitter (timeouts, the `multi_sub_bench` fixed publisher-register wait racing a relay's namespace registration) no longer reads as a real failure.
+- **macOS skips `loopback-fetch`** (new `--skip-suite` flag): on macOS the native QUIC connection close stalls ~10s when a fetch stream is left un-drained at session exit — confirmed on a real macOS box (argo) that it's the aiopquic/picoquic close drain over loopback, *not* pytest teardown as first assumed — tipping loopback-fetch over its timeout. The fetch logic is platform-independent (covered on Linux) and the bench matrix covers macOS loopback delivery; tracked as an aiopquic follow-up.
+- **Catalog trim (#24):** disabled the no-answer / unsupported suites that will never pass — `cloudflare-d14` `relay-fetch` and `cf-d16-interop` `relay-join`/`relay-fetch`. Verified against the implementations rather than inferred from the timeout: both `cloudflare/moq-rs` and `itzmanish/moq-rs` READMEs list FETCH as "Not Soon", and the relay neither forwards nor errors a FETCH (open upstream issues cloudflare/moq-rs#57 passthrough, #58 error). Genuine conformance fails are kept (cf-d16 pub-sub routing, quicr-west fetch code=0).
+
+## v0.9.11
+
+### moq_interop_client: accept any structured error as a valid rejection
+
+- `subscribe-error`, `subscribe-before-announce`, and `join` now accept **any** structured error response (SUBSCRIBE_ERROR / REQUEST_ERROR, any code) as a valid "relay refused the request" outcome **by default** — the interop assertion is that the relay *rejected*; the exact error code is now *noted*, not required. This lifts relays that reject correctly but with non-spec codes (e.g. moq-dev-rs's HTTP-style `404 "Broadcast not found"`) on the public runner, where no per-relay `--compat` flag is passed. A timeout / transport error still fails (a structured rejection ≠ silence), and spec-defined codes (TRACK_DOES_NOT_EXIST 0x04/0x10) still pass cleanly without annotation. The trailing-extensions check stays strict.
+
+### interop catalog: cf-d16-interop compat=lenient-extensions
+
+- Tolerate moq-rs draft-16's truncated trailing-extensions block on the `cf-d16-interop` regression target, recovering `relay-ctrl-msg` to 6/6 (COMPAT-annotated). `join`/`fetch` and `pub-sub` remain genuine fails (see issue #24). Affects our own interop regression only.
+
+## v0.9.10
+
+Pairs with aiopquic 0.3.8 (no aiopquic change). Bug-fix release.
+
+### adaptive_bench: BW mode fixes (relay mode broken since 0.9.7)
+
+- **BW relay mode delivered no data.** BW (bandwidth-ramp) mode against a relay (`-r URL`, no `--mode subs`) connected and published (`forward=0`) but **never started a subscriber**, so the relay never sent `SUBSCRIBE_UPDATE forward=1`, `rx` stayed 0, and the ramp aborted on dead-air. Root cause: the subs-mode isolated publisher (added in 0.9.7) reused the `pub_proc` variable and reset it to `None` *before* the BW start-gate, dropping BW relay runs into the subs-publisher branch — which starts a publisher but no subscriber (subscribers there come from `SubsActuator`, absent in BW mode). The subs publisher now uses distinct `subs_pub_proc` / `subs_pub_stop` names so the BW gate fires and starts both pub and sub. Also fixes the `--mp-loopback` `relay_url=None` crash (same fall-through). Subs mode and BW single-process loopback were unaffected.
+- **`--mp-loopback` self-test version mismatch.** The mp-loopback self-test delivered no data and logged `_Dispatcher._drain` → `BufferReadError: read out of bounds`: its loopback-server created a `MOQTServer` with no draft (→ draft-14) while the WT subscriber auto-resolved to draft-16, so the server mis-parsed the d16 `CLIENT_SETUP` params. The loopback-server now honors a `draft`, and the self-test pins server + sub to a matching version (`--draft`, default draft-16). Verified across auto / d14 / d16.
+
+### moq_interop_client: auto-draft fallback now covers WebTransport
+
+- The auto-draft fallback added in 0.9.9 (probe the multi-version offer; on SETUP failure pin draft-14) was guarded to raw QUIC only, so a draft-14-only relay that stalls the d16 SETUP **over WebTransport** still failed every case. The fallback now covers **both transports**. Verified against the public moq-rs draft-14 endpoint: WT goes **0/6 → 6/6** (docker + remote), taking the moq-rs interop column from 6/18 to 18/18. draft-16 WT relays are unaffected — the probe succeeds and no fallback fires (it only adds one connect).
+
+### moq_interop_relay: optional dual-transport (two-listener) mode
+
+- New `--quic-port N` runs a second raw-QUIC listener alongside the default WebTransport listener in one process, sharing the global namespace table. One hosted instance can then back **both** a `remote-webtransport` (`--port`) and a `remote-quic` (`--quic-port`) endpoint in the interop runner — without same-port dual-ALPN (which would require aiopquic-level per-ALPN stack dispatch). The single-port docker registration is unchanged (one transport). The module docstring's prior claim of "both on the same port via two parallel listeners" was inaccurate and is corrected.
+
+### Release regression: loopback draft × transport matrix
+
+- The integration tier (which PR + main CI run) now includes `loopback_bench` smokes across **draft-14 / draft-16 × raw-QUIC / WebTransport** and an `adaptive_bench --mp-loopback` (multi-process BW pub+sub) smoke per draft. This guards our own tools against the regression classes that slipped through 0.9.7–0.9.9: session-setup / ALPN breaks (caught by the loopback_bench matrix) and the multi-process publisher/subscriber start path (caught by `--mp-loopback`, which the in-process loopback never exercised). No external relay required.
+
+## v0.9.9 (unreleased)
+
+Pairs with aiopquic 0.3.8 (no aiopquic change). Targeted follow-up to
+v0.9.8 fixing bench-tool regressions; examples only, no core library
+change.
+
+### loopback_bench: explicit draft (raw-QUIC auto fix)
+
+- `loopback_bench` gains `-D` / `--draft` (default **14**), applied to **both** the loopback publisher (server) and subscriber (client) so the raw-QUIC ALPN (`moq-00` for d14, `moqt-NN` for d16+) and the WT version match per side. Previously it passed no draft, so in raw-QUIC mode the auto client offered `["moqt-16", "moq-00"]` while the auto server offered only `moq-00`; aiopquic's server-side ALPN selection rejected the asymmetric offer and the connection closed with QUIC code 376 (`no_application_protocol`) before SERVER_SETUP — the publisher rejecting its own subscriber. This is the same "pin an explicit draft (single ALPN per side)" fix already applied to the loopback fetch/join self-tests in v0.9.8; `loopback_bench` was missed. Server-side multi-ALPN acceptance remains deferred to the version-negotiation refactor.
+
+### adaptive_bench subs-mode controller
+
+- **Shortfall settle gating:** a freshly-added group (one worker hosting K = `--step-subs` self-healing slots) is judged for shortfall only once **mature** (past its startup grace), so the controller no longer stalls the ramp the instant it adds a group whose K subs are still handshaking. A group that never delivers is still caught by the starve reaper.
+- **Group-quantized ramp:** the subs-mode step is rounded to whole groups (floor = `--step-subs`, not 1), so ramps/probes move one whole self-healing group at a time — no 1-subscriber crawl, and no sticky sub-group holds after a back-off.
+- **Setpoint quantized:** the targeted count snaps to whole groups (`workers × K`), so the reported Target equals the capacity actually hosted instead of reading below it.
+- **Mature-only latency:** the p90/mean that drive the SLA back-off count only mature workers. A joining group's catch-up burst (old send-timestamps → seconds-scale p90, seen against backlog-replaying relays) no longer trips a false back-off; sustained congestion still registers once a worker matures.
+
+### moq_interop_client: auto-draft ALPN fallback
+
+- In auto mode (no `--draft`) on raw QUIC, the client probes the multi-version ALPN offer once and, if the handshake fails, pins **draft-14** (`moq-00`) for the run (surfaced as a `# note:` in the TAP output). A draft-14-only relay that picks the client's first offered ALPN (`moqt-16`) and refuses — rather than choosing the common `moq-00` — closes with QUIC 376 or stalls the handshake; the fallback recovers it. Verified against the public moq-rs draft-14 (Cloudflare) endpoint: auto goes **0/6 → 6/6**. Explicit `--draft` and WebTransport are unchanged. The 0.9.8 multi-version order was a global tradeoff (won d16-only relays, lost d14-strict moq-rs/xquic); this restores the d14 columns without giving up the d16 wins. General per-draft client negotiation remains the version-negotiation refactor's job.
+- `--draft` also reads a `DRAFT` env var (matching the existing `RELAY_URL` / `TESTCASE` env interface); the ALPN probe's handshake timeout is 5 s (d16 relays clear it in ~0.3 s).
+
+### Interop regression catalog (relays.json)
+
+- `relay-join` / `relay-fetch` no longer skipped wholesale: the suites run on every reachable relay so results are honest — pass where supported, fail where not — instead of hidden behind `disabled_suites`. Verified passing on moqx / moxygen / imquic (d14+d16) and cloudflare-d14 (join); the rest report real fails/timeouts.
+
 ## v0.9.8 (unreleased)
 
 Pairs with aiopquic 0.3.8; dep floor `aiopquic>=0.3.7` → `aiopquic>=0.3.8`

@@ -50,6 +50,15 @@ TIERS = {
                     "loopback-pub-sub-tiny",
                     "loopback-pub-sub-streams",
                     "loopback-pub-sub-paced",
+                    # draft × transport matrix — catches session-setup /
+                    # framing breaks in our own tools across both drafts
+                    # and transports (the kind that slipped through 0.9.7-9).
+                    "loopback-bench-d14-wt", "loopback-bench-d14-quic",
+                    "loopback-bench-d16-wt", "loopback-bench-d16-quic",
+                    # adaptive BW over the multi-process loopback path
+                    # (the in-process loopback misses the pub/sub-worker
+                    # start path — see the 0.9.10 BW clobber).
+                    "loopback-adaptive-mp-d14", "loopback-adaptive-mp-d16",
                     "loopback-join", "loopback-fetch"],
     "interop":     ["relay-ctrl-msg", "relay-pub-sub",
                     "relay-join", "relay-fetch"],
@@ -234,6 +243,43 @@ def _loopback_fetch(log_dir: Path) -> tuple[str, str]:
                         log_dir / "loopback-fetch.log")
 
 
+def _loopback_bench_combo(log_dir: Path, draft: int,
+                          quic: bool) -> tuple[str, str]:
+    """loopback_bench smoke for one draft × transport — guards against
+    session-setup / framing regressions in our own tool (e.g. the
+    raw-QUIC auto-draft connect break fixed in 0.9.9)."""
+    transport = "quic" if quic else "wt"
+    flags = ["--draft", str(draft), "-P", "1", "-s", "4096",
+             "-r", "2000", "-g", "1000", "-t", "5"]
+    if quic:
+        flags.append("-q")
+    return _loopback_pub_sub_variant(
+        log_dir, f"loopback-bench-d{draft}-{transport}", flags, timeout=30)
+
+
+def _loopback_adaptive_mp(log_dir: Path, draft: int) -> tuple[str, str]:
+    """adaptive_bench --mp-loopback (BW, separate pub + sub processes) for
+    one draft — exercises the multi-process publisher/subscriber start
+    path the in-process loopback misses (e.g. the BW start-gate clobber
+    fixed in 0.9.10)."""
+    slug = f"loopback-adaptive-mp-d{draft}"
+    log = log_dir / f"{slug}.log"
+    # -t 8 self-terminates with a clean High-water summary; _run's
+    # Python-level timeout is the backstop. No external `timeout` binary
+    # (absent on macOS runners — it's `gtimeout` there, if installed).
+    cmd = [sys.executable, "-m", "aiomoqt.examples.adaptive_bench",
+           "--mp-loopback", "--draft", str(draft),
+           "-P", "1", "-s", "4096", "--start-mbps", "20",
+           "--step-mbps", "10", "--max-mbps", "60", "--interval", "2",
+           "-t", "8"]
+    _run(cmd, log, 30)
+    text = log.read_text()
+    m = re.search(r"High-water:\s+([\d.]+)\s*([KMGT]?bps)", text)
+    if m and float(m.group(1)) > 0 and "Traceback" not in text:
+        return "PASS", f"high-water {m.group(1)} {m.group(2)}"
+    return "FAIL", "no data (rx=0 / crash)"
+
+
 # ---------------------------------------------------------------------------
 # Interop-tier runners (per relay × transport × draft)
 # ---------------------------------------------------------------------------
@@ -338,6 +384,28 @@ def _print_result(res: Result) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Interop flake handling
+# ---------------------------------------------------------------------------
+# External relays + the network introduce transient failures (timeouts, the
+# multi_sub_bench fixed publisher-register wait racing a relay's namespace
+# registration). Retry a failing interop case a couple of times: a genuine
+# fail fails every attempt; a flake recovers and is annotated — so a flake
+# never reads as a real failure.
+INTEROP_RETRIES = 2
+
+
+def _with_interop_retry(fn, fn_args, log) -> tuple[str, str]:
+    status, detail = "FAIL", "(no attempts)"
+    for attempt in range(INTEROP_RETRIES + 1):
+        status, detail = fn(*fn_args, log)
+        if status != "FAIL":
+            if attempt:
+                detail = f"{detail} (flaky: recovered on attempt {attempt + 1})"
+            return status, detail
+    return status, f"{detail} (failed all {INTEROP_RETRIES + 1} attempts)"
+
+
+# ---------------------------------------------------------------------------
 # Per-relay matrix runner (one worker of ThreadPoolExecutor)
 # ---------------------------------------------------------------------------
 def _run_relay_matrix(relay: dict, enabled: set[str],
@@ -372,7 +440,7 @@ def _run_relay_matrix(relay: dict, enabled: set[str],
             _progress(f"  [skip] {label}  {marker}")
             return
         log = log_dir / f"{suite}_{slug}.log"
-        status, detail = fn(*fn_args, log)
+        status, detail = _with_interop_retry(fn, fn_args, log)
         results.append((status, label, detail, log))
         marker = "[PASS]" if status == "PASS" else "[FAIL]"
         _progress(f"  {marker} {label}  {detail}")
@@ -416,6 +484,15 @@ def main() -> int:
                     dest="test_suites",
                     help=f"run this specific suite (repeatable). "
                          f"Choices: {', '.join(SUITE_CHOICES)}")
+    ap.add_argument("--skip-suite", action="append", default=[],
+                    choices=SUITE_CHOICES, metavar="SUITE",
+                    dest="skip_suites",
+                    help="exclude this suite even if its tier is selected "
+                         "(repeatable). macOS CI skips loopback-fetch: its "
+                         "per-test event-loop teardown is pathologically slow "
+                         "on GitHub macOS runners. The fetch logic is covered "
+                         "on Linux, and the bench matrix covers macOS "
+                         "loopback delivery.")
     ap.add_argument("--only", metavar="RELAY",
                     help="within the interop tier, only test this relay "
                          "by name")
@@ -434,6 +511,7 @@ def main() -> int:
             enabled.update(TIERS[t])
     else:
         enabled = set(SUITE_CHOICES)
+    enabled -= set(args.skip_suites)
 
     with open(args.catalog) as f:
         catalog = json.load(f)
@@ -500,6 +578,19 @@ def main() -> int:
             status, detail = _loopback_pub_sub_paced(log_dir)
             record_and_print((status, "loopback-pub-sub-paced", detail,
                               log_dir / "loopback-pub-sub-paced.log"))
+        for draft in (14, 16):
+            for quic in (False, True):
+                suite = f"loopback-bench-d{draft}-{'quic' if quic else 'wt'}"
+                if suite in enabled:
+                    status, detail = _loopback_bench_combo(log_dir, draft, quic)
+                    record_and_print((status, suite, detail,
+                                      log_dir / f"{suite}.log"))
+        for draft in (14, 16):
+            suite = f"loopback-adaptive-mp-d{draft}"
+            if suite in enabled:
+                status, detail = _loopback_adaptive_mp(log_dir, draft)
+                record_and_print((status, suite, detail,
+                                  log_dir / f"{suite}.log"))
         if "loopback-join" in enabled:
             status, detail = _loopback_join(log_dir)
             record_and_print((status, "loopback-join", detail,

@@ -18,7 +18,7 @@
       },
       "drafts": [14, 16],
       "pub_mode": "publish",
-      "disabled_suites": ["relay-join", "relay-fetch"]
+      "disabled_suites": []
     },
     {
       "name": "cloudflare-d14",
@@ -27,8 +27,8 @@
       },
       "drafts": [14],
       "pub_mode": "publish-both",
-      "disabled_suites": ["relay-join", "relay-fetch"],
-      "notes": "CF d14 moq-rs: publisher must send PUB_NS + PUBLISH"
+      "disabled_suites": ["relay-fetch"],
+      "notes": "CF d14 moq-rs: publisher must send PUB_NS + PUBLISH. relay-fetch disabled (#24): verified unsupported — cloudflare/moq-rs README lists FETCH 'Not Soon', and its relay neither forwards nor errors FETCH (open upstream issues cloudflare/moq-rs#57 passthrough, #58 error), so it never answers (TimeoutError). join works."
     },
     {
       "name": "moxygen-fb",
@@ -38,7 +38,7 @@
       },
       "drafts": [14, 16],
       "pub_mode": "publish",
-      "disabled_suites": ["relay-join", "relay-fetch"],
+      "disabled_suites": [],
       "notes": "Upstream moxygen reference relay"
     },
     {
@@ -73,7 +73,7 @@
       "pub_mode": "publish",
       "insecure": true,
       "compat": ["libquicr"],
-      "disabled_suites": ["relay-join", "relay-fetch"],
+      "disabled_suites": [],
       "notes": "Cisco libquicr (server cert unacceptable → insecure). d14 dropped (raw + WT now unresponsive — relay appears d16-only). compat=libquicr: relay returns SUBSCRIBE_OK for a nonexistent track (deferred-delivery policy), tolerated + annotated."
     },
     {
@@ -95,7 +95,7 @@
       },
       "drafts": [16],
       "pub_mode": "publish",
-      "disabled_suites": ["relay-join", "relay-fetch"],
+      "disabled_suites": [],
       "notes": "Meetecho imquic (C). d14 probes rejected (WT: \"No WebTransport protocol offered\"; QUIC close 376); only d16 tested here."
     },
     {
@@ -105,8 +105,9 @@
       },
       "drafts": [16],
       "pub_mode": "publish",
+      "compat": ["lenient-extensions"],
       "disabled_suites": ["relay-join", "relay-fetch"],
-      "notes": "Cloudflare moq-rs draft-16 interop branch. Upstream also advertises an H3/WT endpoint at https://.../moq but our client hits a SETUP parse error (\"Read out of bounds\") — QUIC only here until that's resolved."
+      "notes": "Cloudflare moq-rs draft-16 interop branch. compat=lenient-extensions: this fork emits a truncated trailing-extensions KVP block on SubscribeOk (kvp_start=6 tell=7 exts_end=7) which our strict parser rejects as non-compliant; tolerated + annotated, recovering ctrl-msg to 6/6. relay-join + relay-fetch disabled (#24): verified unsupported — itzmanish/moq-rs README also lists FETCH 'Not Soon', and the relay never answers JOIN/FETCH (TimeoutError; join is a joining-fetch). pub-sub[publish] kept as a genuine fail: subscribers get code=4 'Track not found' (publisher's track not visible — a moq-rs publish-routing difference; the same multi_sub_bench flow passes vs moxygen/imquic). Upstream also advertises an H3/WT endpoint at https://.../moq but our client hits a SETUP parse error (\"Read out of bounds\") — QUIC only here until that's resolved."
     }
   ]
 }

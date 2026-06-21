@@ -34,6 +34,7 @@ def _find_default_cert():
             return os.path.realpath(c)
     return None
 
+
 CERT = _find_default_cert()
 KEY = CERT.replace('cert.pem', 'key.pem') if CERT else None
 
@@ -77,6 +78,15 @@ def parse_args():
         '-q', '--quic', '--use-quic', action='store_true',
         help='Use raw QUIC instead of WebTransport (default: WT)')
     parser.add_argument(
+        '-D', '--draft', type=int, default=14,
+        help='MoQT draft version to negotiate (e.g. 14 or 16, '
+             'default: 14). Applied to BOTH the loopback publisher '
+             '(server) and subscriber (client) so the raw-QUIC ALPN '
+             '("moq-00" for d14, "moqt-NN" for d16+) and the WT version '
+             'match. Auto-negotiation is intentionally not used here: a '
+             'd14 server offers only "moq-00" while a d16+ client offers '
+             '"moqt-NN", so the asymmetric ALPN offer fails to connect.')
+    parser.add_argument(
         '--cc-algo', type=str, default=None,
         help='Congestion control algorithm '
              '(bbr | bbr1 | newreno | cubic | dcubic | prague | fast). '
@@ -95,36 +105,39 @@ def parse_args():
              'exceed this. Steady-state latency ~ value / throughput. '
              'Default: aiopquic default (4 MiB). Pass 0 to disable.')
     parser.add_argument(
-        '--draft', type=int, default=16,
-        help='MoQT draft version for BOTH endpoints (default: 16). '
-             'Pinned explicitly so the in-process client and server '
-             'negotiate one matching ALPN; auto/multi-version is for '
-             'connecting to unknown peers, not this loopback.')
-    parser.add_argument(
         '-?', '--help', action='help',
         help='Show this help message and exit')
     return parser.parse_args()
 
 
 def print_banner(args):
-    mode = f"SUBGROUP x{args.streams}"
+    transport_label = "QUIC" if args.quic else "H3/WebTransport"
+    # url implies port + transport; raw QUIC has no path, WT uses "/"
+    url = (f"moqt://localhost:{args.port}" if args.quic
+           else f"https://localhost:{args.port}/")
+    cc = args.cc_algo or "bbr1 (default)"
     if args.rate > 0:
         per_stream = (args.rate / args.streams
                       if args.streams > 1 else args.rate)
         rate_s = f"{args.rate}/s total ({per_stream:.1f}/s per stream)"
     else:
         rate_s = "max"
-    transport_label = "QUIC" if args.quic else "H3/WebTransport"
+
+    def row(label, value):
+        print(f"  {label + ':':<14}{value}")
+
     print("─" * 56)
     print("  aiomoqt-bench loopback (no relay)")
     print("─" * 56)
-    print(f"  transport:   {transport_label}")
-    print(f"  mode:        {mode}")
-    print(f"  object size: {args.object_size} B")
-    print(f"  group size:  {args.group_size} objects")
-    print(f"  rate:        {rate_s}")
-    print(f"  duration:    {args.duration}s")
-    print(f"  port:        {args.port}")
+    row("draft", args.draft)
+    row("url", url)
+    row("transport", transport_label)
+    row("cc algorithm", cc)
+    row("sub-groups", args.streams)
+    row("group size", f"{args.group_size} objects")
+    row("object size", f"{args.object_size} B")
+    row("object rate", rate_s)
+    row("duration", f"{args.duration}s")
     print("─" * 56)
 
 

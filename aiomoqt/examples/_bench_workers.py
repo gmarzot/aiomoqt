@@ -863,6 +863,7 @@ async def _loopback_server_task(config: Dict[str, Any], mp_stop_event,
         certificate=config['cert'],
         private_key=config['key'],
         path=config.get('path', ''),
+        draft_version=config.get('draft'),
     )
     server.register_handler(MOQTMessageType.SUBSCRIBE, _on_subscribe)
     await server.serve()

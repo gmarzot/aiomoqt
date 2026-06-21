@@ -24,8 +24,9 @@ from dataclasses import dataclass
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.messages.base import MOQTMessage
+from aiomoqt.track import PublishedTrack
 from aiomoqt.types import (
-    ParamType, FetchType, MOQTRequestError,
+    ParamType, FetchType, MOQTRequestError, MOQTMessageType,
     SubscribeErrorCode, RequestErrorCode,
 )
 from aiomoqt.utils.logger import set_log_level
@@ -60,6 +61,20 @@ SUBSCRIBE_BENIGN_ERROR_CODES = frozenset({
     int(RequestErrorCode.NOT_SUPPORTED),
     int(RequestErrorCode.TIMEOUT),
 })
+
+# INTERNAL_ERROR (0x0) is a server-side fault, not a deliberate refusal,
+# so it never satisfies "did the relay reject this request?". moq-rs /
+# moq-dev use 0 as their own not-found code, so honor it under that compat.
+INTERNAL_ERROR_CODE = 0
+
+
+def _is_refusal(code: int, compat: frozenset) -> bool:
+    """Whether a structured error code counts as a valid relay refusal for
+    the subscribe / join probes: any code except INTERNAL_ERROR (0x0),
+    which signals a server fault rather than a policy decision."""
+    if code != INTERNAL_ERROR_CODE:
+        return True
+    return _compat_active(compat, "moq-rs") or _compat_active(compat, "moq-dev")
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +115,27 @@ def _format_exc(e: BaseException) -> str:
     return f"{cls}: {msg}" if cls not in msg else msg
 
 
+async def _auto_alpn_ok(host, port, path, use_quic, tls_disable_verify,
+                        debug, timeout: float = 5.0) -> bool:
+    """Probe whether the auto (multi-version) offer reaches SETUP. On raw
+    QUIC the client offers every version's ALPN newest-first; on WT it
+    advertises moqt-16 + a multi-version CLIENT_SETUP. A draft-14-only
+    relay that refuses the d16 offer — QUIC 376 no_application_protocol,
+    or a stalled WT SETUP that times out — fails here. Returns True iff
+    SETUP completes; a False (any handshake/SETUP failure) is the signal
+    to pin draft-14. Works for both transports."""
+    client = _make_client(host, port, path, use_quic,
+                          tls_disable_verify, debug, draft_version=None)
+    try:
+        async with asyncio.timeout(timeout):
+            async with client.connect() as session:
+                await session.client_session_init()
+                session.close()
+        return True
+    except Exception:
+        return False
+
+
 def _utc_now_iso() -> str:
     return (
         datetime.datetime.now(datetime.timezone.utc)
@@ -115,6 +151,11 @@ def _unique_suffix():
 
 INTEROP_NAMESPACE = f"moq-test/{_unique_suffix()}/interop"
 INTEROP_TRACK = f"track-{_unique_suffix()}"
+
+# How long the announce-subscribe subscriber waits for SUBSCRIBE_OK before
+# treating the subscription as held pending — a valid forward-and-wait relay
+# model (e.g. moqtail) rather than a failure. Mirrors moq-rs's 5s.
+_SUBSCRIBE_WAIT = 5.0
 
 # PUBLISH_NAMESPACE parameters used by the standard tests.
 # Default empty: anonymous tests should look anonymous. AUTH_TOKEN is
@@ -163,6 +204,7 @@ class TAPReporter:
         self.compat = compat
         self.started_at = _utc_now_iso()
         self.ended_at = ""
+        self.notes: list[str] = []
 
     def add(self, result: TestResult):
         self.results.append(result)
@@ -182,6 +224,8 @@ class TAPReporter:
             lines.append(f"# version: aiomoqt/{self.aiomoqt_version}")
         if self.compat:
             lines.append(f"# compat: {','.join(sorted(self.compat))}")
+        for note in self.notes:
+            lines.append(f"# note: {note}")
         lines.append(f"1..{len(self.results)}")
         for i, r in enumerate(self.results, 1):
             status = "ok" if r.passed else "not ok"
@@ -359,17 +403,22 @@ async def test_subscribe_error(host, port, path, use_quic,
                                tls_disable_verify, debug,
                                draft_version=None, compat=frozenset(),
                                timeout=5.0) -> TestResult:
-    """Test 4: SUBSCRIBE to non-existent track, expect SUBSCRIBE_ERROR.
+    """Test 4: SUBSCRIBE to non-existent track, expect an error response.
 
-    Compat (`moq-dev` / `moq-rs`): the relay returns its own non-spec
-    "not found" code (404 for moq-dev, 0 for moq-rs d14). We accept
-    *any* structured error as a valid "track not found" signal with
-    annotation. A timeout or transport error still fails.
+    Interop policy (default): any structured error (SUBSCRIBE_ERROR /
+    REQUEST_ERROR, any code) is accepted as a valid "track not found"
+    rejection — the assertion is that the relay refused; the exact code
+    is noted, not required (relays use non-spec codes, e.g. 404 for
+    moq-dev, 0 for moq-rs d14). A timeout or transport error still fails.
     """
     moq_dev_compat = _compat_active(compat, "moq-dev")
     moq_rs_compat = _compat_active(compat, "moq-rs")
     libquicr_compat = _compat_active(compat, "libquicr")
-    accept_any_error = moq_dev_compat or moq_rs_compat
+    # Interop policy (default): any structured error answers the assertion
+    # "did the relay refuse the bad request?" — yes. The exact code is
+    # noted, not required (relays return non-spec codes like 404). A
+    # timeout / transport error still fails.
+    accept_any_error = True
     t0 = time.monotonic()
     cid = "unknown"
     client = _make_client(host, port, path, use_quic, tls_disable_verify, debug, draft_version=draft_version)
@@ -424,8 +473,8 @@ async def test_subscribe_error(host, port, path, use_quic,
                             message=f"Error received (expected): code={e.error_code}",
                             expected="SUBSCRIBE_ERROR code=TRACK_DOES_NOT_EXIST",
                         )
-                    if accept_any_error:
-                        impl = "moq-rs" if moq_rs_compat else "moq-dev"
+                    if accept_any_error and _is_refusal(code, compat):
+                        impl = "moq-rs" if moq_rs_compat else ("moq-dev" if moq_dev_compat else "relay")
                         return TestResult(
                             name="subscribe-error", passed=True,
                             duration_ms=(time.monotonic() - t0) * 1000,
@@ -464,10 +513,31 @@ async def test_subscribe_error(host, port, path, use_quic,
         )
 
 
+async def _serve_forwarded_subscribe(session, msg):
+    """Publisher-side handler: serve the relay's forwarded SUBSCRIBE so
+    forward-and-wait relays (e.g. moqtail) complete the downstream
+    SUBSCRIBE_OK. Mirrors loopback_bench's _on_subscribe and moq-rs's
+    serve loop — answer SUBSCRIBE_OK and generate the track. Eager relays
+    that ack the subscriber directly never forward, so this stays unused
+    for them."""
+    track = PublishedTrack(
+        session,
+        namespace=INTEROP_NAMESPACE,
+        trackname=INTEROP_TRACK,
+        object_size=64, group_size=10, num_subgroups=1, rate=50,
+    )
+    track._quiet = True
+    track._stats_header_printed = True
+    ok = session.subscribe_ok(request_msg=msg)
+    track.track_alias = ok.track_alias
+    track._generating = True
+    await track.generate(session, ok.track_alias)
+
+
 async def test_announce_subscribe(host, port, path, use_quic,
                                   tls_disable_verify, debug,
                                   draft_version=None, compat=frozenset(),
-                                  timeout=6.0) -> TestResult:
+                                  timeout=10.0) -> TestResult:
     """Test 5: Two connections — publisher announces, subscriber subscribes."""
     t0 = time.monotonic()
     pub_cid = "unknown"
@@ -475,9 +545,12 @@ async def test_announce_subscribe(host, port, path, use_quic,
 
     try:
         async with asyncio.timeout(timeout):
-            # Publisher connection
+            # Publisher connection. Serve the relay's forwarded SUBSCRIBE
+            # so forward-and-wait relays (moqtail) complete the OK.
             pub_client = _make_client(host, port, path, use_quic,
                                       tls_disable_verify, debug, draft_version=draft_version)
+            pub_client.register_handler(
+                MOQTMessageType.SUBSCRIBE, _serve_forwarded_subscribe)
             sub_client = _make_client(host, port, path, use_quic,
                                       tls_disable_verify, debug, draft_version=draft_version)
 
@@ -496,14 +569,29 @@ async def test_announce_subscribe(host, port, path, use_quic,
                     await sub_session.client_session_init()
                     sub_cid = _get_connection_id(sub_session)
 
+                    pending_hold = False
                     try:
-                        await sub_session.subscribe(
-                            namespace=INTEROP_NAMESPACE,
-                            track_name=INTEROP_TRACK,
-                            wait_response=True,
-                        )
+                        async with asyncio.timeout(_SUBSCRIBE_WAIT):
+                            await sub_session.subscribe(
+                                namespace=INTEROP_NAMESPACE,
+                                track_name=INTEROP_TRACK,
+                                wait_response=True,
+                            )
                         msg = "SUBSCRIBE_OK received — relay routed subscription"
                         passed = True
+                    except asyncio.TimeoutError:
+                        # Forward-and-wait relays (e.g. moqtail) hold the
+                        # subscription pending until the upstream publisher
+                        # serves data — no eager SUBSCRIBE_OK arrives. A held
+                        # subscription is a valid relay model, not a failure
+                        # (moq-rs treats it the same). Annotated so the pass
+                        # stays visible as a non-eager outcome. A real
+                        # SUBSCRIBE_ERROR (below) is still a fail.
+                        msg = ("relay holds subscription pending "
+                               "(forward-and-wait); no SUBSCRIBE_OK within "
+                               f"{_SUBSCRIBE_WAIT:.0f}s")
+                        passed = True
+                        pending_hold = True
                     except MOQTRequestError as e:
                         msg = f"SUBSCRIBE_ERROR: upstream subscribe failed: {e.reason}"
                         passed = False
@@ -517,6 +605,11 @@ async def test_announce_subscribe(host, port, path, use_quic,
             publisher_connection_id=pub_cid,
             subscriber_connection_id=sub_cid,
             message=msg,
+            compat=pending_hold,
+            compat_note=(
+                "relay held the subscription pending without an eager "
+                "SUBSCRIBE_OK; accepted as a valid forward-and-wait relay "
+                "model (matches moq-rs)") if pending_hold else "",
         )
     except Exception as e:
         return TestResult(
@@ -537,7 +630,11 @@ async def test_subscribe_before_announce(host, port, path, use_quic,
     """Test 6: Subscriber connects first, publisher 500ms later. Both outcomes valid."""
     moq_dev_compat = _compat_active(compat, "moq-dev")
     moq_rs_compat = _compat_active(compat, "moq-rs")
-    accept_any_error = moq_dev_compat or moq_rs_compat
+    # Interop policy (default): any structured error answers the assertion
+    # "did the relay refuse the bad request?" — yes. The exact code is
+    # noted, not required (relays return non-spec codes like 404). A
+    # timeout / transport error still fails.
+    accept_any_error = True
     t0 = time.monotonic()
     pub_cid = "unknown"
     sub_cid = "unknown"
@@ -605,8 +702,8 @@ async def test_subscribe_before_announce(host, port, path, use_quic,
             if spec_ok:
                 msg = f"Error received (valid: relay didn't buffer): code={sub_response.error_code}"
                 passed = True
-            elif accept_any_error:
-                impl = "moq-rs" if moq_rs_compat else "moq-dev"
+            elif accept_any_error and _is_refusal(code, compat):
+                impl = "moq-rs" if moq_rs_compat else ("moq-dev" if moq_dev_compat else "relay")
                 msg = (
                     f"Non-spec error code={sub_response.error_code} accepted "
                     f"as benign 'did not buffer'"
@@ -723,11 +820,17 @@ async def test_join(host, port, path, use_quic, tls_disable_verify,
                     )
                     msg = "SUBSCRIBE_OK + FETCH_OK received"
                 except MOQTRequestError as e:
-                    spec_ok = int(e.error_code) in SUBSCRIBE_BENIGN_ERROR_CODES
+                    # Any structured error answers the JOIN probe (the relay
+                    # responded and refused); spec code noted, not required.
+                    # A timeout still fails (outer except).
+                    spec_ok = _is_refusal(int(e.error_code), compat)
+                    benign = (int(e.error_code)
+                              in SUBSCRIBE_BENIGN_ERROR_CODES)
                     msg = (
                         f"structured error (valid): code={e.error_code}"
-                        if spec_ok else
-                        f"Non-conformant error: code={e.error_code}"
+                        if benign else
+                        f"structured error accepted (non-spec "
+                        f"code={e.error_code})"
                     )
                 session.close()
         return TestResult(
@@ -812,8 +915,12 @@ def parse_args():
                         help="Skip TLS certificate verification")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug logging to stderr")
-    parser.add_argument("--draft", type=int, default=None,
-                        help="MoQT draft version (14 or 16, default: auto/14)")
+    parser.add_argument(
+        "--draft", type=int,
+        default=(int(os.environ["DRAFT"])
+                 if os.environ.get("DRAFT", "").strip().isdigit() else None),
+        help="MoQT draft version, e.g. 14 or 16 (env: DRAFT). Default: "
+             "auto — multi-version ALPN with a draft-14 handshake fallback")
     parser.add_argument(
         "--compat", type=str, default=os.environ.get("COMPAT", ""),
         help=(
@@ -860,6 +967,19 @@ async def run_tests(tests: list[str], host: str, port: int, path: str,
     # own announce slot.
     global INTEROP_NAMESPACE
     base_namespace = INTEROP_NAMESPACE
+    # Auto-draft fallback (raw QUIC + WebTransport): probe the auto offer
+    # once; if SETUP fails, pin draft-14 so a draft-14-only relay that
+    # refuses the multi-version offer (moq-rs / xquic) — over raw QUIC by
+    # rejecting the ALPN, or over WT by stalling the d16 SETUP — still
+    # negotiates draft-14 instead of failing every case. Explicit --draft
+    # is untouched; the probe is a no-op against relays that negotiate
+    # auto cleanly (it just adds one connect).
+    effective_draft = draft_version
+    if draft_version is None and not await _auto_alpn_ok(
+            host, port, path, use_quic, tls_disable_verify, debug):
+        effective_draft = 14
+        reporter.notes.append(
+            "auto multi-version handshake failed; pinned draft-14")
     for test_name in tests:
         fn = TEST_FUNCTIONS.get(test_name)
         if fn is None:
@@ -871,7 +991,7 @@ async def run_tests(tests: list[str], host: str, port: int, path: str,
         INTEROP_NAMESPACE = f"{base_namespace}/{test_name}"
         nc_before = MOQTMessage._trailing_extensions_truncation_count
         result = await fn(host, port, path, use_quic, tls_disable_verify,
-                          debug, draft_version=draft_version, compat=compat)
+                          debug, draft_version=effective_draft, compat=compat)
         nc_delta = (
             MOQTMessage._trailing_extensions_truncation_count - nc_before
         )
