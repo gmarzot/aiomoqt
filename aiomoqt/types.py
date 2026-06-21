@@ -79,6 +79,23 @@ def moqt_version_from_draft(draft: int) -> int:
     return 0xff000000 | (draft & 0xff)
 
 
+def parse_draft_spec(s: str):
+    """Parse a ``--draft`` CLI value into a pin or an ordered offer set.
+
+        '16'        -> 16            (pin: offer only that ALPN)
+        '18,16,14'  -> [18, 16, 14]  (offer the set, in preference order)
+
+    The result is passed straight to ``MOQTClient`` / ``MOQTServer``'s
+    ``draft_version`` (which accepts an int or an ordered list). Order is
+    preserved so a caller can put a relay's preferred draft first (some
+    relays select the first offered ALPN rather than the highest mutual).
+    """
+    parts = [int(p) for p in str(s).split(",") if p.strip()]
+    if not parts:
+        raise ValueError(f"empty --draft value: {s!r}")
+    return parts[0] if len(parts) == 1 else parts
+
+
 MOQT_DEFAULT_PRIORITY = 128
 
 MOQT_TIMESTAMP_EXT = 0x20

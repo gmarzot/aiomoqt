@@ -27,7 +27,7 @@ if os.environ.get("AIOMOQT_TRACEMALLOC") == "1":
 
 from aiomoqt.types import (
     ParamType, MOQTException, MOQTRequestError,
-    MOQT_TIMESTAMP_EXT, ObjectStatus,
+    MOQT_TIMESTAMP_EXT, ObjectStatus, parse_draft_spec,
 )
 from aiomoqt.client import MOQTClient
 from aiomoqt.messages import ObjectDatagram
@@ -377,7 +377,7 @@ examples:
         '-k', '--insecure', action='store_true',
         help='Skip TLS certificate verification')
     parser.add_argument(
-        '--draft', type=int, default=None,
+        '--draft', type=parse_draft_spec, default=None,
         help='MoQT draft version (e.g. 14, 16)')
     parser.add_argument(
         '--cc-algo', type=str, default=None,

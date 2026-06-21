@@ -12,7 +12,7 @@ import argparse
 import asyncio
 import logging
 
-from aiomoqt.types import MOQTMessageType
+from aiomoqt.types import MOQTMessageType, parse_draft_spec
 from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
 from aiomoqt.track import PublishedTrack, SubscribedTrack
@@ -78,7 +78,7 @@ def parse_args():
         '-q', '--quic', '--use-quic', action='store_true',
         help='Use raw QUIC instead of WebTransport (default: WT)')
     parser.add_argument(
-        '-D', '--draft', type=int, default=14,
+        '-D', '--draft', type=parse_draft_spec, default=14,
         help='MoQT draft version to negotiate (e.g. 14 or 16, '
              'default: 14). Applied to BOTH the loopback publisher '
              '(server) and subscriber (client) so the raw-QUIC ALPN '

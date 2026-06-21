@@ -11,6 +11,7 @@ import pytest
 from aiomoqt.types import (
     MOQTDraft, MOQT_VERSION_DRAFT18,
     moqt_version_from_draft, moqt_version_from_alpn, moqt_alpn_for_version,
+    parse_draft_spec,
 )
 from aiomoqt.context import PROFILES, profile_for, is_draft16_or_later
 from aiomoqt.protocol import _MOQTSessionMixin
@@ -87,7 +88,7 @@ def test_d18_selectable_without_env_var(monkeypatch):
     # d18 is no longer gated behind AIOMOQT_ENABLE_D18 — explicit selection
     # works with no env var set.
     monkeypatch.delenv("AIOMOQT_ENABLE_D18", raising=False)
-    c = MOQTClient("localhost", 4433, supported_drafts=[18, 16])
+    c = MOQTClient("localhost", 4433, draft_version=[18, 16])
     assert c.supported_drafts == (18, 16)
     c2 = MOQTClient("localhost", 4433, draft_version=18)
     assert c2.supported_drafts == (18,)
@@ -97,11 +98,27 @@ def test_default_client_omits_d18_beta(monkeypatch):
     # d18 ships beta: the no-args default offers the STABLE set (16, 14)
     # only — an auto session never negotiates onto the beta d18 wire, and
     # d14 stays in the offer for d14-only peers. d18 is one explicit opt-in
-    # away (draft_version=18 or supported_drafts=[18, 16, 14]).
+    # away (draft_version=18 or draft_version=[18, 16, 14]).
     monkeypatch.delenv("AIOMOQT_ENABLE_D18", raising=False)
     c = MOQTClient("localhost", 4433)
     assert c.supported_drafts == (16, 14)
     assert 18 not in c.supported_drafts
+
+
+def test_draft_version_accepts_int_or_ordered_list():
+    # draft_version is an int (pin -> offer only that ALPN) or an ordered
+    # list (offer the set in the GIVEN order — not re-sorted), so a caller
+    # can put a relay's preferred draft first (first-offered-ALPN relays).
+    assert MOQTClient("h", 1, draft_version=18).supported_drafts == (18,)
+    assert MOQTClient("h", 1, draft_version=18).draft_version == 18  # pinned
+    c = MOQTClient("h", 1, draft_version=[18, 16, 14])
+    assert c.supported_drafts == (18, 16, 14)
+    assert c.draft_version is None  # a list is an offer, not a pin
+    # Caller order is preserved, NOT sorted newest-first.
+    assert MOQTClient("h", 1, draft_version=[14, 16]).supported_drafts == (14, 16)
+    # parse_draft_spec maps the --draft CLI value identically.
+    assert parse_draft_spec("16") == 16
+    assert parse_draft_spec("18,16,14") == [18, 16, 14]
 
 
 def test_d18_setup_options_kvp_roundtrip():

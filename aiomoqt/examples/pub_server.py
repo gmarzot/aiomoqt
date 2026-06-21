@@ -18,7 +18,7 @@ import logging
 import os
 
 from aiomoqt.server import MOQTServer
-from aiomoqt.types import MOQTMessageType, MOQT_VERSION_DRAFT16
+from aiomoqt.types import MOQTMessageType, MOQT_VERSION_DRAFT16, parse_draft_spec
 from aiomoqt.track import PublishedTrack
 from aiomoqt.utils.logger import set_log_level, get_logger
 
@@ -86,7 +86,7 @@ def parse_args():
         '-q', '--quic', '--use-quic', action='store_true',
         help='Serve raw QUIC (aiopquic) instead of H3/WebTransport')
     parser.add_argument(
-        '--draft', type=int, default=16,
+        '--draft', type=parse_draft_spec, default=16,
         help='MoQT draft version when --quic (default: 16)')
     parser.add_argument(
         '-n', '--namespace', type=str, default='aiomoqt',

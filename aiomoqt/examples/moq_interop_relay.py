@@ -51,7 +51,7 @@ import sys
 
 from aiomoqt.server import MOQTServer
 from aiomoqt.types import (
-    MOQTMessageType, RequestErrorCode, SubscribeErrorCode,
+    MOQTMessageType, RequestErrorCode, SubscribeErrorCode, parse_draft_spec,
 )
 from aiomoqt.messages.request import RequestError
 from aiomoqt.context import is_draft16_or_later
@@ -179,7 +179,7 @@ def parse_args():
                              "(shares the namespace table) — lets one "
                              "instance back both remote-webtransport "
                              "(--port) and remote-quic (--quic-port)")
-    parser.add_argument("--draft", type=int, default=16,
+    parser.add_argument("--draft", type=parse_draft_spec, default=16,
                         help="MoQT draft version (default: 16)")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug logging")

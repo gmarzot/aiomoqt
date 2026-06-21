@@ -27,7 +27,7 @@ from aiomoqt.messages.base import MOQTMessage
 from aiomoqt.track import PublishedTrack
 from aiomoqt.types import (
     ParamType, FetchType, MOQTRequestError, MOQTMessageType,
-    SubscribeErrorCode, RequestErrorCode,
+    SubscribeErrorCode, RequestErrorCode, parse_draft_spec,
 )
 from aiomoqt.utils.logger import set_log_level
 
@@ -916,7 +916,7 @@ def parse_args():
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug logging to stderr")
     parser.add_argument(
-        "--draft", type=int,
+        "--draft", type=parse_draft_spec,
         default=(int(os.environ["DRAFT"])
                  if os.environ.get("DRAFT", "").strip().isdigit() else None),
         help="MoQT draft version, e.g. 14 or 16 (env: DRAFT). Default: "

@@ -1,6 +1,6 @@
 import asyncio
 from asyncio.futures import Future
-from typing import Any, List, Optional, Tuple, Coroutine
+from typing import Any, List, Optional, Tuple, Coroutine, Union
 
 from aiopquic.asyncio.server import serve as aiopquic_serve
 from aiopquic.asyncio.webtransport import serve_webtransport
@@ -25,8 +25,7 @@ class MOQTServer(MOQTPeer):
         private_key: str,
         path: Optional[str] = None,
         use_quic: Optional[bool] = False,
-        draft_version: Optional[int] = None,
-        supported_drafts: Optional[List[int]] = None,
+        draft_version: Optional[Union[int, List[int]]] = None,
         debug: Optional[bool] = False,
         tx_max_inflight_bytes: Optional[int] = DEFAULT_TX_MAX_INFLIGHT_BYTES,
         tx_max_queued_bytes: Optional[int] = None,
@@ -44,20 +43,26 @@ class MOQTServer(MOQTPeer):
         # selecting among multiple client-offered drafts is a fast-follow
         # that needs the aiopquic server-side ALPN/WT-protocol selector.
         if draft_version is not None:
-            moqt_version_from_draft(draft_version)  # validate
-            self.supported_drafts = (draft_version,)
-        elif supported_drafts is not None:
-            for _d in supported_drafts:
-                moqt_version_from_draft(_d)  # validate each
-            self.supported_drafts = tuple(supported_drafts)
+            # draft_version accepts a single draft (pin -> offer only that
+            # ALPN) or an ordered list (offer the set in the given
+            # preference order).
+            if isinstance(draft_version, (list, tuple)):
+                for _d in draft_version:
+                    moqt_version_from_draft(_d)  # validate each
+                self.supported_drafts = tuple(draft_version)
+                self.draft_version = None  # a list is an offer, not a pin
+            else:
+                moqt_version_from_draft(draft_version)  # validate
+                self.supported_drafts = (draft_version,)
+                self.draft_version = draft_version
         else:
-            # d18 is beta: opt in explicitly (draft_version=18, or
-            # supported_drafts=[18, 16, 14]). The no-args default offers the
+            # d18 is beta: opt in explicitly via draft_version=18 (pin) or
+            # draft_version=[18, 16, 14] (offer). The no-args default offers the
             # stable set only, so an auto session never negotiates onto the
             # beta d18 wire; d14 stays in the offer for d14-only peers.
             self.supported_drafts = (
                 MOQTDraft.DRAFT_16, MOQTDraft.DRAFT_14)
-        self.draft_version = draft_version
+            self.draft_version = None
         self.certificate = certificate
         self.private_key = private_key
         self.debug = debug
@@ -84,7 +89,7 @@ class MOQTServer(MOQTPeer):
 
         if self.use_quic:
             alpn = [moqt_alpn_for_version(d)
-                    for d in sorted(self.supported_drafts, reverse=True)]
+                    for d in self.supported_drafts]
             cfg = QuicConfiguration(
                 alpn_protocols=alpn, is_client=False,
                 max_data=2**24, max_stream_data=2**24,
@@ -146,7 +151,7 @@ class MOQTServer(MOQTPeer):
         # WT-Available-Protocols. Drafts >= 15 negotiate the version this
         # way ("moqt-NN"); d14 uses the legacy in-band CLIENT_SETUP path.
         wt_supported = [f"moqt-{d}"
-                        for d in sorted(self.supported_drafts, reverse=True)
+                        for d in self.supported_drafts
                         if d >= 15] or None
         return serve_webtransport(
             self.host, self.port, self.path or "",

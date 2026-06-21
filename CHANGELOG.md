@@ -33,6 +33,19 @@ final state of the release.
   Track-Properties extensions encode as RFC9000 varints (correct for the
   small values in use). None of these affect d14/d16.
 
+### Version selection — one `draft_version` (int or ordered list)
+
+- `MOQTClient` / `MOQTServer` take a single `draft_version`: an **int** pins
+  one draft (offer only that ALPN); an **ordered list** offers the set in the
+  given preference order (highest mutual wins — first-offered matters for
+  relays that select the first ALPN rather than the highest). The redundant
+  `supported_drafts` **constructor param is removed** — pass
+  `draft_version=[18, 16, 14]` instead. The resolved offer is read back on
+  `self.supported_drafts`; `self.draft_version` is the pin (or `None` for a
+  multi-offer). The offer is no longer force-sorted — caller order is honored.
+- CLI: `--draft` accepts a single draft (`--draft 16`) or a comma list
+  (`--draft 18,16,14`), via `parse_draft_spec`.
+
 ### Per-session draft dispatch (kills the process global)
 
 - The process-global `context.moqt_version` and its
@@ -281,8 +294,10 @@ divergence reads a `DraftProfile` capability flag.
   are removed (carry/resolve `prof` from the session instead).
   `context.moqt_version` + `get/set_moqt_ctx_version` removed;
   `is_draft16_or_later` / `get_major_version` require an argument;
-  `draft_version` is a draft number (was the IETF hex code); session
-  `_moqt_version` renamed `_draft`.
+  `draft_version` is a draft number (was the IETF hex code) and now also
+  accepts an ordered list (offer); the `supported_drafts` constructor param
+  is removed (use `draft_version=[...]`); session `_moqt_version` renamed
+  `_draft`.
 
 ## v0.9.12 (unreleased)
 

@@ -52,7 +52,7 @@ async def test_multi_offer_settles_server_draft(server_draft):
     try:
         client = MOQTClient(
             "localhost", port, path="/", use_quic=True,
-            verify_tls=False, supported_drafts=[16, 14],
+            verify_tls=False, draft_version=[16, 14],
         )
         assert client.draft_version is None        # multi-offer
         assert client.supported_drafts == (16, 14)
@@ -138,7 +138,7 @@ async def test_wt_negotiates_protocol_from_wt_protocol():
     supported WT subprotocols; the server selects one and echoes
     WT-Protocol; both ends derive their draft from the negotiated value.
 
-    Both ends pin supported_drafts=[16] so the in-band selection is
+    Both ends pin draft_version=[16] so the in-band selection is
     deterministic: negotiated_protocol == "moqt-16" proves the draft came
     from the in-band WT-Protocol selection, not the max-supported fallback.
     The 'highest-of-several' selection mechanics are covered at the
@@ -148,13 +148,13 @@ async def test_wt_negotiates_protocol_from_wt_protocol():
     server = MOQTServer(
         host="localhost", port=port,
         certificate=CERT, private_key=KEY, path="/",
-        use_quic=False, supported_drafts=[16],
+        use_quic=False, draft_version=[16],
     )
     handle = await server.serve()
     try:
         client = MOQTClient(
             "localhost", port, path="/", use_quic=False,
-            verify_tls=False, supported_drafts=[16],
+            verify_tls=False, draft_version=[16],
         )
         async with client.connect() as session:
             await session.client_session_init()
