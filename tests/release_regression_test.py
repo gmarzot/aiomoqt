@@ -384,6 +384,28 @@ def _print_result(res: Result) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Interop flake handling
+# ---------------------------------------------------------------------------
+# External relays + the network introduce transient failures (timeouts, the
+# multi_sub_bench fixed publisher-register wait racing a relay's namespace
+# registration). Retry a failing interop case a couple of times: a genuine
+# fail fails every attempt; a flake recovers and is annotated — so a flake
+# never reads as a real failure.
+INTEROP_RETRIES = 2
+
+
+def _with_interop_retry(fn, fn_args, log) -> tuple[str, str]:
+    status, detail = "FAIL", "(no attempts)"
+    for attempt in range(INTEROP_RETRIES + 1):
+        status, detail = fn(*fn_args, log)
+        if status != "FAIL":
+            if attempt:
+                detail = f"{detail} (flaky: recovered on attempt {attempt + 1})"
+            return status, detail
+    return status, f"{detail} (failed all {INTEROP_RETRIES + 1} attempts)"
+
+
+# ---------------------------------------------------------------------------
 # Per-relay matrix runner (one worker of ThreadPoolExecutor)
 # ---------------------------------------------------------------------------
 def _run_relay_matrix(relay: dict, enabled: set[str],
@@ -418,7 +440,7 @@ def _run_relay_matrix(relay: dict, enabled: set[str],
             _progress(f"  [skip] {label}  {marker}")
             return
         log = log_dir / f"{suite}_{slug}.log"
-        status, detail = fn(*fn_args, log)
+        status, detail = _with_interop_retry(fn, fn_args, log)
         results.append((status, label, detail, log))
         marker = "[PASS]" if status == "PASS" else "[FAIL]"
         _progress(f"  {marker} {label}  {detail}")
