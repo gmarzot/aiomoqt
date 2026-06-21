@@ -300,12 +300,15 @@ def _relay_ctrl_msg(url: str, draft: int, insecure: bool,
 
 
 def _relay_pub_sub(url: str, draft: int, pub_mode: str, insecure: bool,
-                   log: Path, trackname: str) -> tuple[str, str]:
+                   compat: str, log: Path,
+                   trackname: str) -> tuple[str, str]:
     cmd = [sys.executable, "-m", "aiomoqt.examples.multi_sub_bench",
            url, *MULTI_SUB_ARGS_COMMON, "--draft", str(draft),
            "--trackname", trackname, *PUB_MODE_FLAGS[pub_mode]]
     if insecure:
         cmd.append("-k")
+    if compat:
+        cmd += ["--compat", compat]
     ok, _ = _run(cmd, log, 120)
     if not ok:
         return "FAIL", "timeout"
@@ -314,15 +317,30 @@ def _relay_pub_sub(url: str, draft: int, pub_mode: str, insecure: bool,
     if not m:
         return "FAIL", "(no summary)"
     got, want = m.group(1), m.group(2)
-    return ("PASS" if got == want else "FAIL"), f"{got}/{want} ok"
+    status = "PASS" if got == want else "FAIL"
+    detail = f"{got}/{want} ok"
+    # Subscribe count is the pass criterion, but a subscriber can be
+    # "ok" (SUBSCRIBE_OK received) yet receive zero objects — the relay
+    # forwards no data on a successfully subscribed track (seen on
+    # cf-d16-interop and imquic, both unrelated relays; cause under
+    # investigation — forward-state flip / d16 SUBSCRIBE_UPDATE). Flag
+    # it as an advisory note (like the flaky-retry annotation) without
+    # failing, so the false-green stays visible in the output.
+    om = re.search(r"Total objects:\s+([\d,]+)", text)
+    objects = int(om.group(1).replace(",", "")) if om else None
+    if status == "PASS" and objects == 0:
+        detail += " (note: subscribed but 0 objects delivered)"
+    return status, detail
 
 
 def _relay_tap_case(url: str, draft: int, case: str, insecure: bool,
-                    log: Path) -> tuple[str, str]:
+                    compat: str, log: Path) -> tuple[str, str]:
     cmd = [sys.executable, "-m", "aiomoqt.examples.moq_interop_client",
            "-r", url, "--draft", str(draft), "-t", case]
     if insecure:
         cmd.append("--tls-disable-verify")
+    if compat:
+        cmd += ["--compat", compat]
     ok, _ = _run(cmd, log, 90)
     if not ok:
         return "FAIL", "timeout"
@@ -335,13 +353,13 @@ def _relay_tap_case(url: str, draft: int, case: str, insecure: bool,
 
 
 def _relay_join(url: str, draft: int, insecure: bool,
-                log: Path) -> tuple[str, str]:
-    return _relay_tap_case(url, draft, "join", insecure, log)
+                compat: str, log: Path) -> tuple[str, str]:
+    return _relay_tap_case(url, draft, "join", insecure, compat, log)
 
 
 def _relay_fetch(url: str, draft: int, insecure: bool,
-                 log: Path) -> tuple[str, str]:
-    return _relay_tap_case(url, draft, "fetch", insecure, log)
+                 compat: str, log: Path) -> tuple[str, str]:
+    return _relay_tap_case(url, draft, "fetch", insecure, compat, log)
 
 
 # ---------------------------------------------------------------------------
@@ -457,14 +475,15 @@ def _run_relay_matrix(relay: dict, enabled: set[str],
                 tn = f"rr-{rname}-{draft}"
                 _dispatch("relay-pub-sub", f"[{pub_mode}]", tag, slug,
                           lambda u, d, log: _relay_pub_sub(
-                              u, d, pub_mode, insecure, log, tn),
+                              u, d, pub_mode, insecure, compat_csv,
+                              log, tn),
                           url, draft)
             if "relay-join" in enabled:
                 _dispatch("relay-join", "", tag, slug,
-                          _relay_join, url, draft, insecure)
+                          _relay_join, url, draft, insecure, compat_csv)
             if "relay-fetch" in enabled:
                 _dispatch("relay-fetch", "", tag, slug,
-                          _relay_fetch, url, draft, insecure)
+                          _relay_fetch, url, draft, insecure, compat_csv)
 
     return results
 

@@ -64,17 +64,22 @@ SUBSCRIBE_BENIGN_ERROR_CODES = frozenset({
 
 # INTERNAL_ERROR (0x0) is a server-side fault, not a deliberate refusal,
 # so it never satisfies "did the relay reject this request?". moq-rs /
-# moq-dev use 0 as their own not-found code, so honor it under that compat.
+# moq-dev / libquicr use 0 as their own not-found code, so honor it under
+# that compat (libquicr returns code=0 for a FETCH of a nonexistent track).
 INTERNAL_ERROR_CODE = 0
 
 
 def _is_refusal(code: int, compat: frozenset) -> bool:
     """Whether a structured error code counts as a valid relay refusal for
-    the subscribe / join probes: any code except INTERNAL_ERROR (0x0),
-    which signals a server fault rather than a policy decision."""
+    the subscribe / join / fetch probes: any code except INTERNAL_ERROR
+    (0x0), which signals a server fault rather than a policy decision —
+    unless the endpoint's compat declares 0 as its deliberate refusal
+    code (moq-rs / moq-dev / libquicr)."""
     if code != INTERNAL_ERROR_CODE:
         return True
-    return _compat_active(compat, "moq-rs") or _compat_active(compat, "moq-dev")
+    return (_compat_active(compat, "moq-rs")
+            or _compat_active(compat, "moq-dev")
+            or _compat_active(compat, "libquicr"))
 
 
 # ---------------------------------------------------------------------------
@@ -772,13 +777,28 @@ async def test_fetch(host, port, path, use_quic, tls_disable_verify,
                     )
                     msg = "FETCH_OK received"
                 except MOQTRequestError as e:
-                    spec_ok = int(e.error_code) in SUBSCRIBE_BENIGN_ERROR_CODES
-                    msg = (
-                        f"FETCH_ERROR (valid): code={e.error_code}"
-                        if spec_ok else
-                        f"Non-conformant FETCH_ERROR code={e.error_code} "
-                        f"(expected benign code or FETCH_OK)"
-                    )
+                    # Any structured FETCH_ERROR means the relay answered
+                    # the FETCH (it didn't time out / close). Mirror the
+                    # join probe: accept it as a refusal via _is_refusal
+                    # (INTERNAL_ERROR 0x0 only under the endpoint's compat,
+                    # e.g. libquicr returns code=0 for a nonexistent track),
+                    # annotating spec vs non-spec codes. A timeout/close
+                    # still fails via the outer except.
+                    code = int(e.error_code)
+                    spec_ok = _is_refusal(code, compat)
+                    benign = code in SUBSCRIBE_BENIGN_ERROR_CODES
+                    if benign:
+                        msg = f"FETCH_ERROR (valid): code={e.error_code}"
+                    elif spec_ok:
+                        msg = (
+                            f"FETCH_ERROR accepted (non-spec "
+                            f"code={e.error_code})"
+                        )
+                    else:
+                        msg = (
+                            f"Non-conformant FETCH_ERROR code={e.error_code} "
+                            f"(expected benign code or FETCH_OK)"
+                        )
                 session.close()
         return TestResult(
             name="fetch", passed=spec_ok,
