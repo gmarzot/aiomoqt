@@ -49,14 +49,14 @@ class Fetch(MOQTMessage):
         self.type = MOQTMessageType.FETCH
 
     def serialize(self, *, prof: DraftProfile) -> Buffer:
-        buf = Buffer(capacity=BUF_SIZE)
-        payload = Buffer(capacity=BUF_SIZE)
+        buf = Buffer(capacity=BUF_SIZE, vi64=prof.vi64)
+        payload = Buffer(capacity=BUF_SIZE, vi64=prof.vi64)
 
-        payload.push_uint_var(self.request_id)
+        payload.push_vint(self.request_id)
 
         if is_draft16_or_later(prof.draft):
             # d16: priority and group_order live in params
-            payload.push_uint_var(self.fetch_type)
+            payload.push_vint(self.fetch_type)
         else:
             # d14: priority and group_order are mandatory fixed fields (no
             # optional form like d16's params) — substitute defaults when
@@ -66,22 +66,22 @@ class Fetch(MOQTMessage):
             payload.push_uint8(self.group_order
                                if self.group_order is not None
                                else GroupOrder.ASCENDING)
-            payload.push_uint_var(self.fetch_type)
+            payload.push_vint(self.fetch_type)
 
         if self.fetch_type == FetchType.STANDALONE:
-            payload.push_uint_var(len(self.namespace))
+            payload.push_vint(len(self.namespace))
             for part in self.namespace:
-                payload.push_uint_var(len(part))
+                payload.push_vint(len(part))
                 payload.push_bytes(part)
-            payload.push_uint_var(len(self.track_name))
+            payload.push_vint(len(self.track_name))
             payload.push_bytes(self.track_name)
-            payload.push_uint_var(self.start_group)
-            payload.push_uint_var(self.start_object)
-            payload.push_uint_var(self.end_group)
-            payload.push_uint_var(self.end_object)
+            payload.push_vint(self.start_group)
+            payload.push_vint(self.start_object)
+            payload.push_vint(self.end_group)
+            payload.push_vint(self.end_object)
         elif _is_joining(self.fetch_type):
-            payload.push_uint_var(self.joining_request_id)
-            payload.push_uint_var(self.joining_start)
+            payload.push_vint(self.joining_request_id)
+            payload.push_vint(self.joining_start)
         else:
             raise ValueError(
                 f"Invalid fetch_type: {self.fetch_type} "
@@ -97,7 +97,7 @@ class Fetch(MOQTMessage):
         else:
             MOQTMessage._serialize_params(payload, self.parameters, prof=prof)
 
-        buf.push_uint_var(self.type)
+        buf.push_vint(self.type)
         buf.push_uint16(payload.tell())
         buf.push_bytes(payload.data)
         return buf
@@ -115,31 +115,31 @@ class Fetch(MOQTMessage):
         subscriber_priority = 128
         group_order = GroupOrder.DESCENDING
 
-        request_id = buf.pull_uint_var()
+        request_id = buf.pull_vint()
 
         if is_draft16_or_later(prof.draft):
-            fetch_type = buf.pull_uint_var()
+            fetch_type = buf.pull_vint()
         else:
             subscriber_priority = buf.pull_uint8()
             group_order = buf.pull_uint8()
-            fetch_type = buf.pull_uint_var()
+            fetch_type = buf.pull_vint()
 
         if fetch_type == FetchType.STANDALONE:
             ns = []
-            ns_len = buf.pull_uint_var()
+            ns_len = buf.pull_vint()
             for _ in range(ns_len):
-                part_len = buf.pull_uint_var()
+                part_len = buf.pull_vint()
                 ns.append(buf.pull_bytes(part_len))
             namespace = tuple(ns)
-            track_name_len = buf.pull_uint_var()
+            track_name_len = buf.pull_vint()
             track_name = buf.pull_bytes(track_name_len)
-            start_group = buf.pull_uint_var()
-            start_object = buf.pull_uint_var()
-            end_group = buf.pull_uint_var()
-            end_object = buf.pull_uint_var()
+            start_group = buf.pull_vint()
+            start_object = buf.pull_vint()
+            end_group = buf.pull_vint()
+            end_object = buf.pull_vint()
         elif _is_joining(fetch_type):
-            joining_request_id = buf.pull_uint_var()
-            joining_start = buf.pull_uint_var()
+            joining_request_id = buf.pull_vint()
+            joining_start = buf.pull_vint()
         else:
             raise ValueError(
                 f"Invalid fetch_type: {fetch_type} "
@@ -192,16 +192,19 @@ class FetchOk(MOQTMessage):
             self.parameters = {}
 
     def serialize(self, *, prof: DraftProfile) -> bytes:
-        buf = Buffer(capacity=BUF_SIZE)
-        payload = Buffer(capacity=BUF_SIZE)
+        buf = Buffer(capacity=BUF_SIZE, vi64=prof.vi64)
+        payload = Buffer(capacity=BUF_SIZE, vi64=prof.vi64)
 
-        payload.push_uint_var(self.request_id)
+        # FETCH_OK is a response (§10.1): d18 omits the Request ID (demuxed
+        # by the request stream; the dispatcher injects it on parse).
+        if prof.reply_has_request_id:
+            payload.push_vint(self.request_id)
 
         if is_draft16_or_later(prof.draft):
             # d16: no group_order fixed field
             payload.push_uint8(self.end_of_track)
-            payload.push_uint_var(self.largest_group_id)
-            payload.push_uint_var(self.largest_object_id)
+            payload.push_vint(self.largest_group_id)
+            payload.push_vint(self.largest_object_id)
             params = dict(self.parameters)
             if self.group_order is not None:
                 params[ParamType.GROUP_ORDER] = self.group_order
@@ -211,11 +214,11 @@ class FetchOk(MOQTMessage):
             # d14: group_order as fixed field
             payload.push_uint8(self.group_order)
             payload.push_uint8(self.end_of_track)
-            payload.push_uint_var(self.largest_group_id)
-            payload.push_uint_var(self.largest_object_id)
+            payload.push_vint(self.largest_group_id)
+            payload.push_vint(self.largest_object_id)
             MOQTMessage._serialize_params(payload, self.parameters, prof=prof)
 
-        buf.push_uint_var(self.type)
+        buf.push_vint(self.type)
         buf.push_uint16(payload.tell())
         buf.push_bytes(payload.data)
         return buf
@@ -225,13 +228,14 @@ class FetchOk(MOQTMessage):
         # buf_end is the absolute end-of-message position derived from
         # the outer frame length. Required for d16 (Track Extensions
         # have no length prefix; sequence runs to end of message).
-        request_id = buf.pull_uint_var()
+        request_id = (buf.pull_vint()
+                      if prof.reply_has_request_id else None)
         track_extensions = None
 
         if is_draft16_or_later(prof.draft):
             end_of_track = buf.pull_uint8()
-            largest_group_id = buf.pull_uint_var()
-            largest_object_id = buf.pull_uint_var()
+            largest_group_id = buf.pull_vint()
+            largest_object_id = buf.pull_vint()
             params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
             group_order = params.pop(ParamType.GROUP_ORDER, GroupOrder.DESCENDING)
             track_extensions = MOQTMessage._extensions_decode(
@@ -239,8 +243,8 @@ class FetchOk(MOQTMessage):
         else:
             group_order = buf.pull_uint8()
             end_of_track = buf.pull_uint8()
-            largest_group_id = buf.pull_uint_var()
-            largest_object_id = buf.pull_uint_var()
+            largest_group_id = buf.pull_vint()
+            largest_object_id = buf.pull_vint()
             params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
 
         return cls(
@@ -267,14 +271,14 @@ class FetchError(MOQTMessage):
         buf = Buffer(capacity=BUF_SIZE)
         payload = Buffer(capacity=BUF_SIZE)
 
-        payload.push_uint_var(self.request_id)
-        payload.push_uint_var(self.error_code)
+        payload.push_vint(self.request_id)
+        payload.push_vint(self.error_code)
         
         reason_bytes = self.reason.encode()
-        payload.push_uint_var(len(reason_bytes))
+        payload.push_vint(len(reason_bytes))
         payload.push_bytes(reason_bytes)
 
-        buf.push_uint_var(self.type)
+        buf.push_vint(self.type)
         buf.push_uint16(payload.tell())
         buf.push_bytes(payload.data)
         return buf
@@ -282,9 +286,9 @@ class FetchError(MOQTMessage):
     @classmethod
     def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'FetchError':
 
-        request_id = buf.pull_uint_var()
-        error_code = buf.pull_uint_var()
-        reason_len = buf.pull_uint_var()
+        request_id = buf.pull_vint()
+        error_code = buf.pull_vint()
+        reason_len = buf.pull_vint()
         reason = buf.pull_bytes(reason_len).decode()
 
         return cls(
@@ -305,9 +309,9 @@ class FetchCancel(MOQTMessage):
         buf = Buffer(capacity=BUF_SIZE)
         payload = Buffer(capacity=BUF_SIZE)
 
-        payload.push_uint_var(self.request_id)
+        payload.push_vint(self.request_id)
 
-        buf.push_uint_var(self.type)
+        buf.push_vint(self.type)
         buf.push_uint16(payload.tell())
         buf.push_bytes(payload.data)
         return buf
@@ -315,6 +319,6 @@ class FetchCancel(MOQTMessage):
     @classmethod
     def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'FetchCancel':
 
-        request_id = buf.pull_uint_var()
+        request_id = buf.pull_vint()
 
         return cls(request_id=request_id)

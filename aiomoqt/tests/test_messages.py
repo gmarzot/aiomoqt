@@ -1088,8 +1088,9 @@ class TestDraft18ControlMessages:
     *replies* (it is demuxed from the request stream and injected by the
     dispatcher at runtime, so it is absent on the wire here — hence
     skip_fields={'request_id'} on the replies). SETUP is the symmetric
-    d18 message (0x2F00). d18 Fetch is pending (beta), so FETCH/FETCH_OK
-    are intentionally not covered.
+    d18 message (0x2F00). FETCH/FETCH_OK follow the same vi64 +
+    request-id-gate pattern (the d18 "Location"/"End Location" fields are
+    the same varint pairs as d16's start/end and largest_group/object).
     """
 
     D18 = MOQT_VERSION_DRAFT18
@@ -1281,6 +1282,46 @@ class TestDraft18ControlMessages:
              'parameters': {}},
             type_id=D18MessageType.SUBSCRIBE_NAMESPACE,
             version=self.D18,
+        )
+
+    # ---- FETCH (request) / FETCH_OK (reply: drops Request ID) ----
+    def test_fetch_d18(self):
+        assert moqt_message_serialization_versioned(
+            Fetch,
+            {
+                'request_id': 42,
+                'fetch_type': FetchType.STANDALONE,
+                'namespace': (b'live', b'sports'),
+                'track_name': b'football',
+                'subscriber_priority': 1,
+                'group_order': GroupOrder.ASCENDING,
+                'start_group': 10, 'start_object': 5,
+                'end_group': 20, 'end_object': 15,
+                'parameters': {},
+            },
+            type_id=MOQTMessageType.FETCH,
+            version=self.D18,
+        )
+
+    def test_fetch_ok_d18(self):
+        # FETCH_OK is a response → d18 omits request_id; the d18 "End
+        # Location" is the same two varints as largest_group/object, and
+        # group_order rides in params — i.e. the same vi64 + request-id-gate
+        # shape as the other OK replies, not a structural rewrite.
+        assert moqt_message_serialization_versioned(
+            FetchOk,
+            {
+                'request_id': 42,
+                'group_order': GroupOrder.ASCENDING,
+                'end_of_track': 0,
+                'largest_group_id': 50,
+                'largest_object_id': 200,
+                'parameters': {},
+                'track_extensions': {},
+            },
+            type_id=MOQTMessageType.FETCH_OK,
+            version=self.D18,
+            skip_fields={'request_id', 'track_extensions'},
         )
 
 

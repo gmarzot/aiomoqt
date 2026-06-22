@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.10.1 (unreleased)
+
+- **Preference-ordered draft probe (interop client).** A single
+  `moq_interop_client` invocation now probes its `supported_drafts` in
+  preference order, pinning the first draft whose SETUP succeeds. One
+  manifest entry therefore prefers d16 against d16-capable relays yet still
+  reaches d18 against d18-only relays, with no d16→d18 regression. The
+  no-`--draft` default is the preference list `[16, 14, 18]`.
+- **draft-18 Fetch.** `FETCH` / `FETCH_OK` now speak the d18 wire: vi64
+  varints across the body, and `FETCH_OK` (a response) drops the in-band
+  Request ID per §10.1 — the same vi64 + request-id-gate shape as the other
+  OK replies, not a structural rewrite (the d18 "Location"/"End Location"
+  fields are the same varint pairs as d16's start/end and
+  largest_group/object). Round-trip matrix tests added for both. This
+  clears the d18 Fetch beta limitation noted under v0.10.0.
+
 ## v0.10.0 (unreleased)
 
 **draft-18 support (beta).** aiomoqt now speaks draft-18 alongside d14/d16,
