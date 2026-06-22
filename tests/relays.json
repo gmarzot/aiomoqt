@@ -108,6 +108,39 @@
       "compat": ["lenient-extensions"],
       "disabled_suites": ["relay-join", "relay-fetch"],
       "notes": "Cloudflare moq-rs draft-16 interop branch. compat=lenient-extensions: this fork emits a truncated trailing-extensions KVP block on SubscribeOk (kvp_start=6 tell=7 exts_end=7) which our strict parser rejects as non-compliant; tolerated + annotated, recovering ctrl-msg to 6/6. relay-join + relay-fetch disabled (#24): verified unsupported — itzmanish/moq-rs README also lists FETCH 'Not Soon', and the relay never answers JOIN/FETCH (TimeoutError; join is a joining-fetch). pub-sub[publish] kept as a genuine fail; root-caused 2026-06-21 to two layers: (A) [our side, FIXED] with pub_mode=publish-both the namespace resolves, but the relay's SubscribeOk carries the same truncated trailing-extensions block as its ctrl-msg path, which crashed the multi_sub_bench subscriber (the lenient-extensions tolerance lived only in moq_interop_client, not the bench) — now plumbed via `multi_sub_bench --compat lenient-extensions`; (B) [relay side, confirmed] even with control fully working and the publisher sending 300+ objects, the relay forwards ZERO to subscribers. Ruled out on our side via live tests + spec §10.1: forward=0 and forward=1, alias-matched and alias-diverged all give 0 objects, and the relay never RESETs our data streams (track_alias has no parity rule, only session-uniqueness, which we satisfy). With bare pub_mode=publish the surface symptom is code=4 'Track not found' (relay never got PUB_NS). The same flow delivers objects vs moxygen/imquic/cloudflare-d14, so (B) is a moq-rs d16-fork forwarding bug. Upstream also advertises an H3/WT endpoint at https://.../moq but our client hits a SETUP parse error (\"Read out of bounds\") — QUIC only here until that's resolved."
+    },
+    {
+      "name": "fb-mvfst-d18",
+      "urls": {
+        "raw-quic": "moqt://fb.mvfst.net:9448",
+        "h3-wt":    "https://fb.mvfst.net:9448/moq-relay"
+      },
+      "drafts": [18],
+      "pub_mode": "publish",
+      "disabled_suites": [],
+      "notes": "Upstream moxygen/mvfst reference at draft-18 — the conformant d18 reference (control 6/6 over raw-QUIC, 2026-06-22). Separate row from moxygen-fb, which stays d14/d16."
+    },
+    {
+      "name": "nokia-d18",
+      "urls": {
+        "raw-quic": "moqt://moqt.nokiaresearch.com:4443/moq",
+        "h3-wt":    "https://moqt.nokiaresearch.com:4443/moq"
+      },
+      "drafts": [18],
+      "pub_mode": "publish",
+      "disabled_suites": [],
+      "notes": "Nokia Research draft-18 relay (independent impl). ~5/6: announce-subscribe fails relay-side (the reference moq-dev-rs client also fails it there), not an aiomoqt issue."
+    },
+    {
+      "name": "cf-d18-interop",
+      "urls": {
+        "raw-quic": "moqt://draft-18-interop.cloudflare.mediaoverquic.com:443",
+        "h3-wt":    "https://draft-18-interop.cloudflare.mediaoverquic.com:443/moq"
+      },
+      "drafts": [18],
+      "pub_mode": "publish-both",
+      "disabled_suites": [],
+      "notes": "Cloudflare moq-rs draft-18-dev. Setup OK; announce/subscribe fail relay-side — moq-rs draft-18-dev has no accept_bi, so it never reads the per-request bidirectional request streams IETF d18 §3 mandates (verified against a locally-built relay + mlog). Kept as a documented relay-side failure rather than masked."
     }
   ]
 }
