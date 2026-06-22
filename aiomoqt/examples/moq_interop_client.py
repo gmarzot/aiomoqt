@@ -1100,7 +1100,14 @@ def main():
 
     # Public API takes the draft NUMBER (14, 16, ...). MOQTClient
     # normalizes to the wire form internally; pass args.draft through.
-    supported_drafts = args.draft if args.draft else None
+    # No explicit draft (the moq-interop-runner invokes us with RELAY_URL
+    # but no DRAFT) defaults to the preference-ordered probe 16->14->18:
+    # pin d16 for d16-capable relays, fall through to d14, and reach d18
+    # only for d18-only relays. Deterministic single-ALPN per probe — one
+    # client image negotiates the best draft per relay with no manifest
+    # per-column config. An explicit --draft/DRAFT single int still pins
+    # strictly; an explicit list sets a custom probe order.
+    supported_drafts = args.draft if args.draft is not None else [16, 14, 18]
 
     if args.verbose:
         transport = "QUIC" if use_quic else "WebTransport"
