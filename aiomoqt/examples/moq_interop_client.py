@@ -120,17 +120,17 @@ def _format_exc(e: BaseException) -> str:
     return f"{cls}: {msg}" if cls not in msg else msg
 
 
-async def _auto_alpn_ok(host, port, path, use_quic, tls_disable_verify,
-                        debug, timeout: float = 5.0) -> bool:
-    """Probe whether the auto (multi-version) offer reaches SETUP. On raw
-    QUIC the client offers every version's ALPN newest-first; on WT it
-    advertises moqt-16 + a multi-version CLIENT_SETUP. A draft-14-only
-    relay that refuses the d16 offer — QUIC 376 no_application_protocol,
-    or a stalled WT SETUP that times out — fails here. Returns True iff
-    SETUP completes; a False (any handshake/SETUP failure) is the signal
-    to pin draft-14. Works for both transports."""
+async def _probe_setup_ok(host, port, path, use_quic, tls_disable_verify,
+                          debug, draft=None, timeout: float = 5.0) -> bool:
+    """Probe whether SETUP completes for a given offer. draft=None offers
+    the auto (multi-version) set; an int single-pins one draft (one ALPN)
+    — what the preference-ordered probe uses, so each attempt is
+    deterministic with no multi-offer server-choice vagary. A relay that
+    refuses the offer — QUIC 376 no_application_protocol, or a stalled /
+    timed-out WT SETUP — fails here. Returns True iff SETUP completes,
+    False on any handshake/SETUP failure. Works for both transports."""
     client = _make_client(host, port, path, use_quic,
-                          tls_disable_verify, debug, supported_drafts=None)
+                          tls_disable_verify, debug, supported_drafts=draft)
     try:
         async with asyncio.timeout(timeout):
             async with client.connect() as session:
@@ -937,10 +937,12 @@ def parse_args():
                         help="Enable debug logging to stderr")
     parser.add_argument(
         "--draft", type=parse_draft_spec,
-        default=(int(os.environ["DRAFT"])
-                 if os.environ.get("DRAFT", "").strip().isdigit() else None),
-        help="MoQT draft version, e.g. 14 or 16 (env: DRAFT). Default: "
-             "auto — multi-version ALPN with a draft-14 handshake fallback")
+        default=(parse_draft_spec(os.environ["DRAFT"])
+                 if os.environ.get("DRAFT", "").strip() else None),
+        help="MoQT draft, e.g. 16 (single = strict pin) or a comma list "
+             "16,14,18 (preference-ordered probe: pin the first whose SETUP "
+             "completes) (env: DRAFT). Default: auto multi-version ALPN with "
+             "a draft-14 handshake fallback")
     parser.add_argument(
         "--compat", type=str, default=os.environ.get("COMPAT", ""),
         help=(
@@ -995,7 +997,28 @@ async def run_tests(tests: list[str], host: str, port: int, path: str,
     # is untouched; the probe is a no-op against relays that negotiate
     # auto cleanly (it just adds one connect).
     effective_draft = supported_drafts
-    if supported_drafts is None and not await _auto_alpn_ok(
+    if isinstance(supported_drafts, (list, tuple)):
+        # Preference-ordered probe (e.g. --draft 16,14,18 / DRAFT=16,14,18):
+        # pin the FIRST draft whose single-ALPN SETUP completes. A
+        # d16-capable relay keeps d16 (preferred, stable); a d18-only relay
+        # falls through 16 -> 14 -> 18. Each attempt is a deterministic
+        # single-ALPN offer (no multi-offer server-choice vagary), so one
+        # manifest entry can prefer d16 everywhere yet still succeed at d18
+        # against d18-only relays — with no d16->d18 regression on relays
+        # whose d18 diverges (e.g. moq-dev).
+        effective_draft = None
+        for d in supported_drafts:
+            if await _probe_setup_ok(host, port, path, use_quic,
+                                     tls_disable_verify, debug, draft=d):
+                effective_draft = d
+                reporter.notes.append(f"preference probe pinned draft-{d}")
+                break
+        if effective_draft is None:
+            effective_draft = supported_drafts[-1]
+            reporter.notes.append(
+                "preference probe: no offered draft reached SETUP; "
+                f"trying draft-{effective_draft}")
+    elif supported_drafts is None and not await _probe_setup_ok(
             host, port, path, use_quic, tls_disable_verify, debug):
         effective_draft = 14
         reporter.notes.append(
