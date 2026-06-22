@@ -98,9 +98,35 @@ KNOWN_COMPAT_IMPLS = frozenset({
     "all",                # enable every known compat tolerance
 })
 
+# moq-rs advertises NO implementation name in its SERVER_SETUP (it sets only
+# MAX_REQUEST_ID), so compat can't be keyed off a wire-advertised identity.
+# Instead, recognize a known moq-rs interop endpoint by host and self-enable
+# the tolerances that implementation needs. The moq-interop-runner invokes
+# the client with only RELAY_URL (no per-column COMPAT), so a single image
+# must self-select; these are the same opt-in keys as --compat, just
+# endpoint-derived.
+RELAY_COMPAT = {
+    # itzmanish/moq-rs draft-16 fork (Cloudflare interop endpoint): emits a
+    # truncated trailing-extensions KVP block on SUBSCRIBE / SUBSCRIBE_OK.
+    "draft-16-manish.cloudflare.mediaoverquic.com": frozenset({"lenient-extensions"}),
+}
+
 
 def _compat_active(compat: frozenset, key: str) -> bool:
     return "all" in compat or key in compat
+
+
+def _relay_compat(host: str) -> frozenset:
+    """Compat tolerances auto-selected for a known relay endpoint (host
+    substring match). Lets one client image recognize a quirky relay and
+    self-enable the matching opt-in tolerance with no per-column config,
+    since the moq-interop-runner passes only RELAY_URL."""
+    h = (host or "").lower()
+    keys = set()
+    for needle, ks in RELAY_COMPAT.items():
+        if needle in h:
+            keys |= ks
+    return frozenset(keys)
 
 
 def _format_exc(e: BaseException) -> str:
@@ -1078,6 +1104,17 @@ def main():
 
     host, port, path, use_quic = parse_relay_url(args.relay)
     compat = parse_compat(args.compat)
+    # Auto-select endpoint-keyed tolerances (e.g. moq-rs-d16's truncated
+    # trailing-extensions) so the runner needs no per-column COMPAT. Explicit
+    # --compat still adds to whatever the endpoint contributes.
+    relay_compat = _relay_compat(host)
+    if relay_compat - compat:
+        print(
+            f"# Compat (auto for {host}): "
+            f"{','.join(sorted(relay_compat - compat))}",
+            file=sys.stderr,
+        )
+    compat = compat | relay_compat
 
     # Plumb the wire-tolerance flag into the deserializer module
     # before any session is created. Without this the parser stays
