@@ -13,6 +13,10 @@
   is unchanged (those routes fall back to the control stream). The d18
   parameter encoding (uint8 SUBSCRIBER_PRIORITY/GROUP_ORDER/FORWARD per
   §10.2.7/8/12) was already correct — the bug was purely the send path.
+- **Known limitation (draft-18 pub-sub object delivery).** Control, FETCH, and
+  JOIN interop at d18; object *delivery* does not yet — a publisher ends the
+  publish at the `forward=1` trigger before streaming objects, so subscribers
+  receive 0 objects. Tracked for 0.10.3. d14/d16 pub-sub is unaffected.
 
 ## v0.10.1 (unreleased)
 
