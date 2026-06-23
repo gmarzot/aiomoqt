@@ -156,12 +156,15 @@ def test_d18_replies_omit_request_id():
     e18 = bytes(RequestError(request_id=9, error_code=1, reason="x").serialize(prof=profile_for(18)).data)
     assert len(e18) < len(e16)
 
-    # RequestUpdate carries BOTH Request ID and Existing Request ID in d18
-    # (confirmed against the mvfst/moxygen relay); d18 just uses vi64.
+    # d18 (§10.9 Figure 12) dropped Existing Request ID from REQUEST_UPDATE;
+    # d16 still carries it. The d18 wire must omit it (shorter than d16) and
+    # round-trip with no Existing Request ID.
+    u16 = bytes(RequestUpdate(request_id=9, existing_request_id=7, parameters={}).serialize(prof=profile_for(16)).data)
     u18 = bytes(RequestUpdate(request_id=9, existing_request_id=7, parameters={}).serialize(prof=profile_for(18)).data)
+    assert len(u18) < len(u16)
     ru = RequestUpdate.deserialize(Buffer(data=u18[3:]), prof=profile_for(18), buf_end=len(u18) - 3)
     assert ru.request_id == 9
-    assert ru.existing_request_id == 7
+    assert ru.existing_request_id is None
 
 
 def test_d18_typed_param_values_are_uint8():
@@ -243,18 +246,17 @@ def test_d16_nonuint8_even_param_large_value_is_rfc9000():
 def test_d18_request_update_large_ids_round_trip_vi64():
     # RequestUpdate ids go through the buffer's push_vint. With values >= 64
     # the vi64 vs RFC9000 forms diverge, so this confirms the payload buffer
-    # was tagged vi64: request_id 100 -> 0x64 (1B), existing 200 -> 0x80C8.
+    # was tagged vi64. d18 dropped Existing Request ID (§10.9), so the vi64
+    # check rides Request ID: 200 -> 0x80C8 (vi64) vs 0x40C8 (RFC9000).
     from aiomoqt.messages.request import RequestUpdate
     raw = bytes(RequestUpdate(
-        request_id=100, existing_request_id=200,
-        parameters={}).serialize(prof=profile_for(18)).data)
+        request_id=200, parameters={}).serialize(prof=profile_for(18)).data)
     body = raw[3:]  # after type (1B, 0x02) + 16-bit Length
-    assert body[0] == 0x64
-    assert body[1:3] == bytes([0x80, 0xC8])
+    assert body[0:2] == bytes([0x80, 0xC8])
     ru = RequestUpdate.deserialize(
         Buffer(data=body, vi64=True), prof=profile_for(18), buf_end=len(body))
-    assert ru.request_id == 100
-    assert ru.existing_request_id == 200
+    assert ru.request_id == 200
+    assert ru.existing_request_id is None
 
 
 def test_d18_publish_namespace_large_request_id_vi64():

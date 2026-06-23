@@ -1232,7 +1232,7 @@ class TestDraft18ControlMessages:
         # param-value codec path, not the varint one.
         assert moqt_message_serialization_versioned(
             RequestUpdate,
-            {'request_id': 10, 'existing_request_id': 5,
+            {'request_id': 10,
              'parameters': {ParamType.FORWARD: 1}},
             type_id=D16MessageType.REQUEST_UPDATE,
             version=self.D18,

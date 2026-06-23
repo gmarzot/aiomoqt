@@ -114,8 +114,11 @@ class RequestUpdate(MOQTMessage):
     Replaces SUBSCRIBE_UPDATE. Now applies to all request types and
     gets an acknowledgment (REQUEST_OK/REQUEST_ERROR).
 
-    Wire format: Request ID (i), Existing Request ID (i),
-                 Num Parameters (i), Parameters (..) ...
+    Wire format (d16): Request ID (i), Existing Request ID (i),
+                       Num Parameters (i), Parameters (..) ...
+    Wire format (d18): Request ID (i), Num Parameters (i),
+                       Parameters (..) ...  (Existing Request ID removed
+                       per §10.9 Figure 12)
     """
     request_id: int = None
     existing_request_id: int = None
@@ -128,11 +131,12 @@ class RequestUpdate(MOQTMessage):
         buf = Buffer(capacity=BUF_SIZE)
         payload = Buffer(capacity=BUF_SIZE, vi64=prof.vi64)
 
-        # REQUEST_UPDATE carries both a (new) Request ID and the Existing
-        # Request ID it updates, in d16 and d18 alike — confirmed against
-        # the mvfst/moxygen d18 relay, which sends both. d18 uses vi64.
+        # d16 REQUEST_UPDATE carries the Existing Request ID it updates;
+        # d18 (§10.9 Figure 12) removed that field. Request ID is always
+        # present. d18 uses vi64.
         payload.push_vint(self.request_id)
-        payload.push_vint(self.existing_request_id)
+        if prof.draft < 18:
+            payload.push_vint(self.existing_request_id)
         MOQTMessage._serialize_params(payload, self.parameters or {}, prof=prof)
 
         buf.push_uint_var(self.type)
@@ -143,7 +147,7 @@ class RequestUpdate(MOQTMessage):
     @classmethod
     def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'RequestUpdate':
         request_id = buf.pull_vint()
-        existing_request_id = buf.pull_vint()
+        existing_request_id = (buf.pull_vint() if prof.draft < 18 else None)
         params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
 
         return cls(

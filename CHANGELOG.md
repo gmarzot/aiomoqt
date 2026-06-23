@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.10.3 (unreleased)
+
+- **draft-18 pub-sub object delivery fixed (REQUEST_UPDATE wire format).**
+  draft-18 removed the `Existing Request ID` field from `REQUEST_UPDATE`
+  (§10.9, Figure 12); draft-16 still carries it. Our `RequestUpdate` decoder
+  read that field unconditionally, so when a subscriber arrived and the relay
+  sent the *publisher* a `forward=1` `REQUEST_UPDATE`, the extra varint shifted
+  the parse and a delta-coded parameter key byte was misread as a parameter
+  length — a PROTOCOL_VIOLATION that closed the publisher session, which pruned
+  the namespace and left every subscriber with "no such namespace" and 0
+  objects. `existing_request_id` is now draft-gated (kept for d16, omitted for
+  d18+ per the spec). This resolves the draft-18 pub-sub known limitation noted
+  in v0.10.2. Verified live against a draft-18 moxygen relay across all four
+  corners (d16/d18 × raw-QUIC / WebTransport): 3/3 subscribers, objects
+  delivered. d14/d16 pub-sub is unchanged.
+
 ## v0.10.2 (unreleased)
 
 - **draft-18 FETCH / joining-FETCH / FETCH_OK now use the request stream.**
