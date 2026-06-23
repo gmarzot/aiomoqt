@@ -1949,7 +1949,7 @@ class _MOQTSessionMixin:
         # peers can't resolve them before our awaiter registers.
         self._pending_requests[sub_request_id] = self._loop.create_future()
         logger.info(f"MOQT send: {sub_msg}")
-        self.send_control_message(sub_msg)
+        self._send_request(sub_request_id, sub_msg)
 
         fetch_request_id = self._allocate_request_id()
         fetch_msg = Fetch(
@@ -1968,7 +1968,7 @@ class _MOQTSessionMixin:
         self._fetch_done_futures[fetch_request_id] = \
             self._loop.create_future()
         logger.info(f"MOQT send: {fetch_msg}")
-        self.send_control_message(fetch_msg)
+        self._send_request(fetch_request_id, fetch_msg)
 
         if not wait_response:
             return (sub_msg, fetch_msg)
@@ -2021,7 +2021,10 @@ class _MOQTSessionMixin:
         self._fetch_done_futures[request_id] = \
             self._loop.create_future()
         logger.info(f"MOQT send: {message}")
-        self.send_control_message(message)
+        # FETCH is a request opener: at d18 it must open its own bidi
+        # request stream (like SUBSCRIBE/PUBLISH); pre-d18 _send_request
+        # falls back to the single control stream.
+        self._send_request(request_id, message)
 
         if not wait_response:
             return message
@@ -2048,7 +2051,9 @@ class _MOQTSessionMixin:
             track_extensions=track_extensions or {},
         )
         logger.info(f"MOQT send: {message}")
-        self.send_control_message(message)
+        # FETCH_OK is a response: at d18 it returns on the request's own
+        # bidi stream; pre-d18 _send_reply falls back to the control stream.
+        self._send_reply(request_id, message)
         return message
 
     def fetch_error(

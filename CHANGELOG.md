@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.10.2 (unreleased)
+
+- **draft-18 FETCH / joining-FETCH / FETCH_OK now use the request stream.**
+  `fetch()`, the joining-fetch helper, and `fetch_ok()` were sending on the
+  single control stream. At draft-18 every request opener must open its own
+  bidirectional request stream (and its response returns on that stream), so
+  current moxygen rejected a FETCH on the control stream with a
+  PROTOCOL_VIOLATION right after SETUP. These paths now route through
+  `_send_request` / `_send_reply` like SUBSCRIBE/PUBLISH. Verified live against
+  a draft-18 moxygen relay: control 6/6 + `fetch` + `join` all pass. Pre-d18
+  is unchanged (those routes fall back to the control stream). The d18
+  parameter encoding (uint8 SUBSCRIBER_PRIORITY/GROUP_ORDER/FORWARD per
+  §10.2.7/8/12) was already correct — the bug was purely the send path.
+
 ## v0.10.1 (unreleased)
 
 - **Preference-ordered draft probe (interop client).** A single
