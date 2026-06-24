@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.10.4 (unreleased)
+
+- **Cross-draft (d14/d16/d18) microbenchmarks.** New `b8_control_roundtrip`
+  times encode+decode of SUBSCRIBE / SUBSCRIBE_OK / PUBLISH / PUBLISH_OK /
+  REQUEST_UPDATE at all three drafts (each round-trip verified before timing),
+  and `b7_framer --draft all` / `b1_parser --draft all` add cross-draft
+  TX-framing and RX-parse comparisons. Each prints a relative-to-d16 summary.
+  Measured: d16→d18 is parity (within ~2%) across control, framing, and parse —
+  the cost step is d14→d16 (the KVP redesign). Also fixes a latent bug in
+  `b7_framer` where `--draft` was ignored (the probes always built an RFC9000
+  header); it now threads the per-draft profile so each draft encodes its own
+  wire form.
+- **Docs:** README "Developing against a locally built aiopquic" — host-tuned
+  source build vs the portable PyPI wheel, the editable-first install order for a
+  separate venv per repo, and how to verify the local build is actually in use.
+
 ## v0.10.3 (unreleased)
 
 - **draft-18 pub-sub object delivery fixed (REQUEST_UPDATE wire format).**
