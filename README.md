@@ -279,6 +279,48 @@ mkdir -p certs && openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
 pytest aiomoqt/tests/
 ```
 
+### Developing against a locally built aiopquic
+
+The PyPI `aiopquic` wheel is built **portable** (runs on any CPU of the
+architecture). A locally compiled `aiopquic` is **host-tuned** (`-O3
+-march=native -flto`, plus picotls Fusion AES-GCM on x86_64) and is
+measurably faster in many cases — build it from source when benchmarking or
+optimizing, and on bare-metal targets generally.
+
+```bash
+# build aiopquic from source (host-tuned by default)
+git clone https://github.com/gmarzot/aiopquic.git
+cd aiopquic
+git submodule update --init --recursive
+./build_picoquic.sh          # -march/-mcpu=native -flto; AIOPQUIC_WHEEL_BUILD=1 for a portable build
+```
+
+`aiomoqt`'s venv must then have **this editable aiopquic** installed —
+otherwise `uv pip install -e` pulls the portable wheel from PyPI. In a single
+shared venv, install both editable. With a **separate venv per repo** (e.g. two
+shells), install the local aiopquic into the aiomoqt venv **first**, so the
+dependency is already satisfied and no wheel is fetched:
+
+```bash
+# in the aiomoqt venv:
+uv pip install -e ~/aiopquic     # local source, editable — BEFORE aiomoqt
+uv pip install -e '.[test]'      # aiopquic dep already satisfied → no wheel
+```
+
+If aiomoqt already grabbed the wheel, just re-run `uv pip install -e ~/aiopquic`
+— it replaces the wheel install. Confirm the local build is actually in use
+(this catches the wheel sneaking back in):
+
+```bash
+python -c "import aiopquic; print(aiopquic.__file__)"   # must be <repo>/src/aiopquic/…, not …/site-packages/
+python -m aiomoqt.versions                              # aiopquic path + picoquic/picotls SHAs match your build
+```
+
+Both venvs must use the **same Python version** — the editable build's compiled
+extension lives in the aiopquic source tree and is shared across venvs that
+point at it. C/Cython changes need a rebuild (`./build_picoquic.sh` if the C
+libs changed, then `uv pip install -e ~/aiopquic`); pure-Python edits are live.
+
 ## Known Limitations
 
 - **draft-18 is beta.** Negotiated by default (`(18, 16, 14)`, newest-first) over raw QUIC and WebTransport, with control + SUBGROUP object delivery validated end to end. Not yet complete: SUBSCRIBE / PUBLISH subscription-filter and largest-location still use the d16 nested form; d18 FETCH is pending; Track-Properties extensions encode as RFC9000 varints (correct for the small values in use). draft-14 / draft-16 are unaffected and remain the stable path.

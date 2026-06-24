@@ -25,6 +25,7 @@ import sys
 import time
 from typing import Callable
 
+from aiomoqt.context import profile_for
 from aiomoqt.messages.track import (
     ObjectHeader, SubgroupHeader, SUBGROUP_ID_EXPLICIT,
 )
@@ -100,15 +101,16 @@ def bench_object_serialize(size: int, ext: bool) -> Callable[[], None]:
     return _fn
 
 
-def bench_next_object(size: int, ext: bool) -> Callable[[], None]:
+def bench_next_object(size: int, ext: bool, prof=None) -> Callable[[], None]:
     """B7.next-object: full SubgroupHeader.next_object() per object —
     same call the publisher's _generate_subgroup makes today.
-    Includes ObjectHeader.__init__ + .serialize() + extensions encode."""
+    Includes ObjectHeader.__init__ + .serialize() + extensions encode.
+    `prof` selects the draft wire codec (vi64 for d18, RFC9000 else)."""
     payload = make_payload(size)
     sg = SubgroupHeader(
         track_alias=1, group_id=0, subgroup_id=0,
         publisher_priority=128, extensions_present=ext,
-        subgroup_id_mode=SUBGROUP_ID_EXPLICIT,
+        subgroup_id_mode=SUBGROUP_ID_EXPLICIT, prof=prof,
     )
     obj_id = 0
 
@@ -122,7 +124,7 @@ def bench_next_object(size: int, ext: bool) -> Callable[[], None]:
     return _fn
 
 
-def bench_full_emit(size: int, ext: bool) -> Callable[[], None]:
+def bench_full_emit(size: int, ext: bool, prof=None) -> Callable[[], None]:
     """B7.full-emit: the complete per-object publisher hot path
     (modulo network) — payload build + ext dict + next_object +
     immediately discard the resulting Buffer (analog of writing it
@@ -131,7 +133,7 @@ def bench_full_emit(size: int, ext: bool) -> Callable[[], None]:
     sg = SubgroupHeader(
         track_alias=1, group_id=0, subgroup_id=0,
         publisher_priority=128, extensions_present=ext,
-        subgroup_id_mode=SUBGROUP_ID_EXPLICIT,
+        subgroup_id_mode=SUBGROUP_ID_EXPLICIT, prof=prof,
     )
     obj_id = 0
     pending: list[bytes] = []
@@ -151,7 +153,8 @@ def bench_full_emit(size: int, ext: bool) -> Callable[[], None]:
     return _fn
 
 
-def bench_batched_emit(size: int, ext: bool, batch: int) -> Callable[[], None]:
+def bench_batched_emit(size: int, ext: bool, batch: int,
+                       prof=None) -> Callable[[], None]:
     """B7.batched-emit: pack `batch` objects into one Buffer + one
     'send' (stand-in: bytes() of the underlying buffer). Models
     pattern (A) from the publisher discussion — amortizes per-call
@@ -163,7 +166,7 @@ def bench_batched_emit(size: int, ext: bool, batch: int) -> Callable[[], None]:
     sg = SubgroupHeader(
         track_alias=1, group_id=0, subgroup_id=0,
         publisher_priority=128, extensions_present=ext,
-        subgroup_id_mode=SUBGROUP_ID_EXPLICIT,
+        subgroup_id_mode=SUBGROUP_ID_EXPLICIT, prof=prof,
     )
     obj_id = 0
 
@@ -184,7 +187,7 @@ def bench_batched_emit(size: int, ext: bool, batch: int) -> Callable[[], None]:
     return _fn
 
 
-def bench_subgroup_header(ext: bool) -> Callable[[], None]:
+def bench_subgroup_header(ext: bool, prof=None) -> Callable[[], None]:
     """B7.subgroup-header: SubgroupHeader.serialize() — one per new
     subgroup stream open. Measured separately because the controller
     can amortize this over many objects."""
@@ -192,7 +195,7 @@ def bench_subgroup_header(ext: bool) -> Callable[[], None]:
         sg = SubgroupHeader(
             track_alias=1, group_id=42, subgroup_id=0,
             publisher_priority=128, extensions_present=ext,
-            subgroup_id_mode=SUBGROUP_ID_EXPLICIT,
+            subgroup_id_mode=SUBGROUP_ID_EXPLICIT, prof=prof,
         )
         sg.serialize()
     return _fn
@@ -314,6 +317,74 @@ def fmt_row(r: dict) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Cross-draft TX-framing comparison (--draft all / --compare)
+# ---------------------------------------------------------------------------
+
+_COMPARE_DRAFTS = (14, 16, 18)
+
+
+def run_compare(sz: int, ext: bool, duration: float, warmup: float,
+                batch: int) -> int:
+    """Run the key TX-framing rows for d14/d16/d18, threading each draft's
+    DraftProfile so the header/object integers genuinely encode that draft's
+    wire form (RFC9000 for d14/d16, vi64 for d18). Prints a cross-draft
+    ns/obj table with a relative-vs-d16 column and a SUMMARY verdict."""
+
+    # (row label, factory(prof) -> fn, batch_per_iter)
+    rows = [
+        ("subgroup-header",
+         lambda prof: bench_subgroup_header(ext, prof=prof), 1),
+        ("next-object",
+         lambda prof: bench_next_object(sz, ext, prof=prof), 1),
+        ("full-emit",
+         lambda prof: bench_full_emit(sz, ext, prof=prof), 1),
+        (f"batched-emit (N={batch})",
+         lambda prof: bench_batched_emit(sz, ext, batch, prof=prof), batch),
+    ]
+
+    print(f"B7 — cross-draft TX framer comparison   "
+          f"obj_size={sz}B  ext={ext}  duration={duration}s")
+    print()
+
+    # ns/obj per (row, draft)
+    table: dict = {}
+    for label, factory, b in rows:
+        table[label] = {}
+        for d in _COMPARE_DRAFTS:
+            r = run_one(label, factory(profile_for(d)),
+                        duration, warmup, sz, batch=b)
+            table[label][d] = r["ns_per_obj"]
+
+    hdr = (f"  {'row':<24}"
+           + "".join(f"{('d' + str(d) + ' ns/obj'):>14}" for d in _COMPARE_DRAFTS)
+           + f"{'d18/d16':>10}{'d14/d16':>10}")
+    print(hdr)
+    print("  " + "─" * (len(hdr) - 2))
+    for label, _f, _b in rows:
+        v14, v16, v18 = (table[label][d] for d in (14, 16, 18))
+        r18 = v18 / v16 if v16 else 0.0
+        r14 = v14 / v16 if v16 else 0.0
+        print(f"  {label:<24}"
+              f"{v14:>14,.0f}{v16:>14,.0f}{v18:>14,.0f}"
+              f"{r18:>9.2f}x{r14:>9.2f}x")
+
+    # SUMMARY — mean of per-row ratios vs d16.
+    r18s = [table[lbl][18] / table[lbl][16] for lbl, *_ in rows if table[lbl][16]]
+    r14s = [table[lbl][14] / table[lbl][16] for lbl, *_ in rows if table[lbl][16]]
+    m18 = sum(r18s) / len(r18s) if r18s else 0.0
+    m14 = sum(r14s) / len(r14s) if r14s else 0.0
+    print()
+    print("SUMMARY  (relative to d16, mean of per-row ratios)")
+    print(f"  TX framing   d18/d16 {m18:5.2f}x   d14/d16 {m14:5.2f}x")
+    print(f"  -> d18 vi64 header/object framing is within "
+          f"{abs(m18 - 1.0) * 100:.0f}% of d16's RFC9000 path; "
+          f"d14 (no DEFAULT_PRIORITY/ext bits divergence) "
+          f"{('cheaper' if m14 < 1 else 'costlier')} by "
+          f"{abs(m14 - 1.0) * 100:.0f}%.")
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--object-size", type=int, default=8192)
@@ -322,11 +393,19 @@ def main() -> int:
     p.add_argument("--extensions", type=int, choices=(0, 1), default=1)
     p.add_argument("--batch", type=int, default=16)
     p.add_argument("--csv", default=None)
-    p.add_argument("--draft", type=int, default=16)
+    p.add_argument("--draft", default="16",
+                   help="draft number, or 'all' for the cross-draft "
+                        "TX-framing comparison")
+    p.add_argument("--compare", action="store_true",
+                   help="run the cross-draft TX-framing comparison "
+                        "(same as --draft all)")
     args = p.parse_args()
 
     ext = bool(args.extensions)
     sz = args.object_size
+
+    if args.compare or str(args.draft).lower() == "all":
+        return run_compare(sz, ext, args.duration, args.warmup, args.batch)
 
     print(f"B7 — MoQT TX framer microbench   "
           f"obj_size={sz}B  ext={ext}  duration={args.duration}s")
