@@ -60,6 +60,11 @@ DRAFT_PROBES = [
 # list (None = probe all of DRAFT_PROBES).
 DRAFT_FILTER = None
 
+# --url one-line output: left-pad the URL to this column so a host's QUIC and
+# H3/WT lines align (and consecutive single-URL probes line up). Sized to a
+# typical longest relay URL; longer URLs simply extend past it.
+_URL_COL = 48
+
 
 async def probe_version(host, port, path, use_quic, supported_drafts,
                         verify_tls=False):
@@ -379,11 +384,11 @@ async def _probe_single_url(url, timeout, debug=False):
     ms = result.get("latency_ms", 0)
     if result["live"]:
         drafts = ",".join(result["drafts"])
-        print(f"{url:<48}  {transport:<5}  ✓  {drafts}  ({ms}ms)")
+        print(f"{url:<{_URL_COL}}  {transport:<5}  ✓  {drafts}  ({ms}ms)")
         return 0
     err = result.get("error") or "unreachable"
     conclusion = _classify_error(err, transport)
-    print(f"{url:<48}  {transport:<5}  ✗  {conclusion}  ({ms}ms)")
+    print(f"{url:<{_URL_COL}}  {transport:<5}  ✗  {conclusion}  ({ms}ms)")
     return 1
 
 
