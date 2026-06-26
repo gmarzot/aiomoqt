@@ -331,22 +331,22 @@ def _parse_args():
 
 
 def _classify_error(err: str) -> str:
-    """Map a raw probe error to a short human conclusion for the quiet
-    one-line output. The raw error is shown under --debug."""
+    """Map a raw probe error to a short 'status - reason' conclusion for the
+    quiet one-line output. The raw error is shown under --debug."""
     e = (err or "").lower()
     if "error_code=376" in e:  # CRYPTO_ERROR + TLS no_application_protocol
-        return "no compatible draft (no shared ALPN/version)"
+        return "handshake refused - no compatible draft/version"
     if "timeout" in e:
-        return "no response (handshake timeout)"
+        return "no response - handshake timed out"
     if "wt connect refused" in e:
-        return "CONNECT refused (draft not supported, or wrong path)"
+        return "CONNECT refused - draft not supported or wrong path"
     if ("name or service not known" in e or "gaierror" in e
-            or "getaddr" in e):
-        return "DNS lookup failed (host not found)"
+            or "getaddr" in e or "name resolution" in e):
+        return "DNS lookup failed - host did not resolve"
     if "refused" in e:
-        return "connection refused"
+        return "connection refused - nothing listening"
     if "during handshake" in e:
-        return "handshake failed"
+        return "handshake failed - transport error"
     return err or "unreachable"
 
 
