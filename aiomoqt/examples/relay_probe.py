@@ -16,14 +16,16 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.types import (
-    MOQT_VERSION_DRAFT14, MOQT_VERSION_DRAFT16, MOQTRequestError,
+    MOQTRequestError,
     moqt_version_from_draft,
+    parse_draft_spec,
 )
 from aiomoqt.utils.url import parse_relay_url
 
@@ -38,21 +40,30 @@ logger = logging.getLogger("relay-probe")
 # rebinds these from argparse defaults when the module is invoked
 # directly, giving CLI-over-env precedence.
 PROBE_TIMEOUT = int(os.getenv("PROBE_TIMEOUT", "8"))
-PROBE_INTERVAL = int(os.getenv("PROBE_INTERVAL", "300"))
+# PROBE_INTERVAL controls looping: 0 = probe once and exit, >0 = loop every
+# N seconds.
+PROBE_INTERVAL = int(os.getenv("PROBE_INTERVAL", "0"))
 RELAYS_FILE = os.getenv("RELAYS_FILE", "/app/relays.json")
 OUTPUT_FILE = os.getenv("OUTPUT_FILE", "/output/relay-status.json")
-PROBE_ONCE = os.getenv("PROBE_ONCE", "").lower() in ("1", "true", "yes")
 
 # Draft versions to probe, oldest first — d14 bare WT CONNECT must
 # run before d16 (which sends wt-available-protocols) to avoid
 # relay state issues on sequential probes to the same endpoint.
 DRAFT_PROBES = [
-    # Draft numbers (short int) — public MoQTClient API form.
-    # MOQT_VERSION_DRAFT14/16 constants are currently the full hex
-    # wire-form pending refactor (see memory:project_int_form_refactor).
+    # Draft numbers (the public MoQTClient supported_drafts form).
     ("draft-14", 14),
     ("draft-16", 16),
+    ("draft-18", 18),
 ]
+
+# Set from --draft to probe a single draft instead of the full DRAFT_PROBES
+# list (None = probe all of DRAFT_PROBES).
+DRAFT_FILTER = None
+
+# --url one-line output: left-pad the URL to this column so a host's QUIC and
+# H3/WT lines align (and consecutive single-URL probes line up). Sized to a
+# typical longest relay URL; longer URLs simply extend past it.
+_URL_COL = 48
 
 
 async def probe_version(host, port, path, use_quic, supported_drafts,
@@ -116,14 +127,18 @@ async def probe_endpoint(url, verify_tls=False):
     drafts = []
     results = []
 
-    for draft_name, supported_drafts in DRAFT_PROBES:
+    for draft_name, supported_drafts in (DRAFT_FILTER or DRAFT_PROBES):
         r = await probe_version(
             host, port, path, use_quic, supported_drafts, verify_tls,
         )
         results.append(r)
         if r["live"]:
-            drafts.append(draft_name)
-            logger.info(f"  {url} [{transport}] {draft_name}: LIVE"
+            # For a multi-draft offer the label is the offered set; report
+            # which draft the relay actually negotiated.
+            negotiated = r["draft"] or draft_name
+            drafts.append(negotiated)
+            arrow = "" if negotiated == draft_name else f" -> {negotiated}"
+            logger.info(f"  {url} [{transport}] {draft_name}{arrow}: LIVE"
                         f" (alpn={r['alpn']})")
         else:
             logger.info(f"  {url} [{transport}] {draft_name}: {r['error']}")
@@ -255,8 +270,8 @@ async def run_loop():
         tmp.rename(out)
         logger.info(f"Wrote {out}")
 
-        if PROBE_ONCE:
-            break
+        if PROBE_INTERVAL <= 0:
+            break  # interval 0 = probe once and exit
 
         logger.info(f"Next probe in {PROBE_INTERVAL}s")
         await asyncio.sleep(PROBE_INTERVAL)
@@ -270,7 +285,7 @@ def _parse_args():
         epilog=(
             "Each CLI flag defaults from its matching environment "
             "variable (RELAYS_FILE, OUTPUT_FILE, PROBE_TIMEOUT, "
-            "PROBE_INTERVAL, PROBE_ONCE), so container deployments "
+            "PROBE_INTERVAL), so container deployments "
             "that set env vars keep working unchanged. CLI flags "
             "override env. A per-relay 'interval' field in the "
             "relays file overrides --interval for that relay. "
@@ -293,11 +308,19 @@ def _parse_args():
              f"default: {PROBE_TIMEOUT})")
     p.add_argument(
         "--interval", type=int, default=PROBE_INTERVAL, metavar="SEC",
-        help=f"seconds between probe cycles (env: PROBE_INTERVAL; "
-             f"default: {PROBE_INTERVAL})")
+        help=f"loop period: 0 = probe once and exit, >0 = loop every SEC "
+             f"(env: PROBE_INTERVAL; default: {PROBE_INTERVAL}).")
     p.add_argument(
-        "--once", action="store_true", default=PROBE_ONCE,
-        help="probe once and exit (env: PROBE_ONCE=1)")
+        "--draft", default=None, metavar="SPEC",
+        help="draft(s) to probe: a single draft (--draft 18) or a list "
+             "(--draft 18,16). By default each listed draft is probed "
+             "INDIVIDUALLY, in order; with --offer the whole list is offered "
+             "in ONE session. Default (no --draft) probes 14, 16, 18 each.")
+    p.add_argument(
+        "--offer", action="store_true", default=False,
+        help="with a multi-draft --draft, offer the whole list in ONE "
+             "session (ordered as given) and report the draft the relay "
+             "negotiates, instead of probing each draft separately.")
     p.add_argument(
         "--url", default=None, metavar="URL",
         help="probe a single relay URL (e.g. moqt://host:port or "
@@ -312,33 +335,78 @@ def _parse_args():
     return p.parse_args()
 
 
+def _classify_error(err: str, transport: str = "") -> str:
+    """Map a raw probe error to a short 'status - reason' conclusion for the
+    quiet one-line output. The raw error is shown under --debug."""
+    e = (err or "").lower()
+    is_wt = "wt" in transport.lower() or "h3" in transport.lower()
+    if "error_code=376" in e:  # TLS no_application_protocol (ALPN mismatch)
+        # Over H3/WT the offered ALPN is "h3"; 376 means the relay isn't an
+        # H3/WT server. Over QUIC it's the moqt-NN ALPN, so 376 means no
+        # shared version.
+        if is_wt:
+            return "connection refused - H3/WT not supported"
+        return "connection refused - no compatible version"
+    if "wt connect refused" in e:
+        return "connection refused - no compatible version or wrong path"
+    if "timeout" in e:
+        return "connection refused - no response"
+    if ("name or service not known" in e or "gaierror" in e
+            or "getaddr" in e or "name resolution" in e):
+        return "connection refused - could not resolve host"
+    if "refused" in e:
+        return "connection refused - nothing listening"
+    if "during handshake" in e:
+        return "connection refused - handshake failed"
+    return f"connection refused - {err}" if err else "connection refused"
+
+
 async def _probe_single_url(url, timeout, debug=False):
     """One-shot probe: print one human-readable line per (draft, transport)
     combo. No JSON, no file I/O. Exits with code 0 if any draft was LIVE,
     else 1 — easy to wire into shell scripts."""
     from aiomoqt.utils.logger import set_log_level
-    # Default quiet: suppress aiomoqt's INFO chatter so stdout is one
-    # clean line. --debug bumps everything (incl. handshake details).
-    set_log_level(logging.DEBUG if debug else logging.WARNING)
-    logging.getLogger("relay-probe").setLevel(
-        logging.DEBUG if debug else logging.WARNING)
+    # Default quiet: only the one-line result reaches stdout. Suppress the
+    # aiomoqt + aiopquic connection logs (including handshake-failure
+    # WARNING/ERROR) — a failed probe is still reported on the printed ✗ line
+    # with its error code. --debug shows the full handshake.
+    if debug:
+        set_log_level(logging.DEBUG)
+        logging.getLogger("relay-probe").setLevel(logging.DEBUG)
+    else:
+        set_log_level(logging.CRITICAL)
+        logging.getLogger("relay-probe").setLevel(logging.WARNING)
+        logging.getLogger("aiopquic").setLevel(logging.CRITICAL)
     global PROBE_TIMEOUT
     PROBE_TIMEOUT = timeout
     result = await probe_endpoint(url)
     transport = result["transport"]
+    ms = result.get("latency_ms", 0)
     if result["live"]:
         drafts = ",".join(result["drafts"])
-        print(f"{result['host']}:{result['port']}  {transport.lower():<8}"
-              f"  {drafts}  ✓ ({result['latency_ms']}ms)")
+        print(f"{url:<{_URL_COL}}  {transport:<5}  ✓  {drafts}  ({ms}ms)")
         return 0
     err = result.get("error") or "unreachable"
-    print(f"{result['host']}:{result['port']}  {transport.lower():<8}"
-          f"  ✗ {err}")
+    conclusion = _classify_error(err, transport)
+    print(f"{url:<{_URL_COL}}  {transport:<5}  ✗  {conclusion}  ({ms}ms)")
     return 1
 
 
 if __name__ == "__main__":
     args = _parse_args()
+    if args.draft is not None:
+        try:
+            spec = parse_draft_spec(args.draft)
+        except ValueError as e:
+            print(f"relay_probe: bad --draft value: {e}", file=sys.stderr)
+            sys.exit(2)
+        if args.offer:
+            # Offer the whole set in one session (ordered); report negotiated.
+            DRAFT_FILTER = [(f"draft-{args.draft}", spec)]
+        else:
+            # Probe each listed draft individually, in the given order.
+            drafts = spec if isinstance(spec, list) else [spec]
+            DRAFT_FILTER = [(f"draft-{d}", d) for d in drafts]
     if args.url:
         # Single-URL mode: skip the relays-file / output-file machinery.
         rc = asyncio.run(_probe_single_url(
@@ -351,5 +419,4 @@ if __name__ == "__main__":
     OUTPUT_FILE = args.output_file
     PROBE_TIMEOUT = args.timeout
     PROBE_INTERVAL = args.interval
-    PROBE_ONCE = args.once
     asyncio.run(run_loop())

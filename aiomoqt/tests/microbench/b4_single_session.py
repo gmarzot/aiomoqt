@@ -41,7 +41,7 @@ async def _run(args):
     from aiomoqt.client import MOQTClient
     from aiomoqt.server import MOQTServer
     from aiomoqt.track import PublishedTrack, SubscribedTrack
-    from aiomoqt.types import MOQTMessageType, MOQT_VERSION_DRAFT16
+    from aiomoqt.types import MOQTMessageType
     from aiomoqt.utils import wait_cond_timeout
 
     cert = _find_cert()

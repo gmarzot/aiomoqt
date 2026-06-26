@@ -16,9 +16,10 @@
         "raw-quic": "moqt://moqx-main.ci.openmoq.org:4433",
         "h3-wt":    "https://moqx-main.ci.openmoq.org:4433/moq-relay"
       },
-      "drafts": [14, 16],
+      "drafts": [14, 16, 18],
       "pub_mode": "publish",
-      "disabled_suites": []
+      "disabled_suites": [],
+      "notes": "openmoq CI moxygen relay. d18 staged ahead of the deploy that will offer it — until that lands the d18 columns fail at handshake (moqt-18 ALPN not yet advertised: QUIC error 376 / TLS no_application_protocol). d14/d16 are green over both raw-QUIC and H3/WT (/moq-relay)."
     },
     {
       "name": "cloudflare-d14",

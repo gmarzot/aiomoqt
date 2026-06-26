@@ -21,17 +21,21 @@ def make_subgroup_stream(
     track_alias: int = 1,
     group_id: int = 0,
     extensions: bool = False,
+    draft: int = 16,
 ) -> bytes:
     """Build a complete subgroup stream: header + n_objects.
 
-    payload_size is the length of each object's payload. Returns the
-    concatenated bytes ready to feed to the parser.
+    payload_size is the length of each object's payload. `draft` selects
+    the wire codec (vi64 for d18, RFC9000 for d14/d16) so the corpus is
+    valid wire for that draft. Returns the concatenated bytes ready to
+    feed to the parser.
     """
     sg = SubgroupHeader(
         track_alias=track_alias,
         group_id=group_id,
         subgroup_id=0,
         extensions_present=extensions,
+        prof=profile_for(draft),
     )
     out = bytearray()
     out += bytes(sg.serialize().data)

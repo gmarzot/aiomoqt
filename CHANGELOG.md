@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.10.4 (unreleased)
+
+- **Cross-draft (d14/d16/d18) microbenchmarks.** New `b8_control_roundtrip`
+  times encode+decode of SUBSCRIBE / SUBSCRIBE_OK / PUBLISH / PUBLISH_OK /
+  REQUEST_UPDATE at all three drafts (each round-trip verified before timing),
+  and `b7_framer --draft all` / `b1_parser --draft all` add cross-draft
+  TX-framing and RX-parse comparisons. Each prints a relative-to-d16 summary.
+  Measured: d16→d18 is parity (within ~2%) across control, framing, and parse —
+  the cost step is d14→d16 (the KVP redesign). Also fixes a latent bug in
+  `b7_framer` where `--draft` was ignored (the probes always built an RFC9000
+  header); it now threads the per-draft profile so each draft encodes its own
+  wire form.
+- **Docs:** README "Developing against a locally built aiopquic" — host-tuned
+  source build vs the portable PyPI wheel, the editable-first install order for a
+  separate venv per repo, and how to verify the local build is actually in use.
+- **`relay_probe` reworked.** Probes **draft-18** by default (was 14/16 only).
+  **`--draft`** takes a single draft (`--draft 18`) or a list (`--draft 18,16`)
+  probed **each individually, in order**; **`--offer`** instead offers the whole
+  list in one session and reports the draft the relay negotiates. Looping is now
+  controlled solely by **`--interval`** (`0` = probe once and exit [default],
+  `>0` = loop), replacing `--once`. Each result line is aligned as
+  `URL  QUIC|H3/WT  ✓/✗  drafts-or-reason  (elapsed-ms)` — transport-appropriate
+  URL echoed (`moqt://…` / `https://…/moq-relay`), the status mark right after
+  the transport, and the elapsed time on success and failure alike. A failed
+  probe's reason is a short conclusion (e.g. `connection refused - no compatible
+  version`, `connection refused - H3/WT not supported`); the raw error +
+  handshake WARNING/ERROR logs appear only under `--debug`.
+
 ## v0.10.3 (unreleased)
 
 - **draft-18 pub-sub object delivery fixed (REQUEST_UPDATE wire format).**
