@@ -52,7 +52,12 @@ DRAFT_PROBES = [
     # wire-form pending refactor (see memory:project_int_form_refactor).
     ("draft-14", 14),
     ("draft-16", 16),
+    ("draft-18", 18),
 ]
+
+# Set from --draft to probe a single draft instead of the full DRAFT_PROBES
+# list (None = probe all of DRAFT_PROBES).
+DRAFT_FILTER = None
 
 
 async def probe_version(host, port, path, use_quic, supported_drafts,
@@ -116,7 +121,7 @@ async def probe_endpoint(url, verify_tls=False):
     drafts = []
     results = []
 
-    for draft_name, supported_drafts in DRAFT_PROBES:
+    for draft_name, supported_drafts in (DRAFT_FILTER or DRAFT_PROBES):
         r = await probe_version(
             host, port, path, use_quic, supported_drafts, verify_tls,
         )
@@ -299,6 +304,10 @@ def _parse_args():
         "--once", action="store_true", default=PROBE_ONCE,
         help="probe once and exit (env: PROBE_ONCE=1)")
     p.add_argument(
+        "--draft", type=int, default=None, metavar="N",
+        help="probe only this draft number (e.g. --draft 18); default "
+             "probes 14, 16, and 18.")
+    p.add_argument(
         "--url", default=None, metavar="URL",
         help="probe a single relay URL (e.g. moqt://host:port or "
              "https://host:port/path) and print one line per probed "
@@ -339,6 +348,8 @@ async def _probe_single_url(url, timeout, debug=False):
 
 if __name__ == "__main__":
     args = _parse_args()
+    if args.draft is not None:
+        DRAFT_FILTER = [(f"draft-{args.draft}", args.draft)]
     if args.url:
         # Single-URL mode: skip the relays-file / output-file machinery.
         rc = asyncio.run(_probe_single_url(
