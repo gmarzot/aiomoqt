@@ -339,7 +339,7 @@ def _classify_error(err: str) -> str:
     if "timeout" in e:
         return "no response (handshake timeout)"
     if "wt connect refused" in e:
-        return "WebTransport CONNECT refused (wrong path, or not a WT relay)"
+        return "WebTransport CONNECT refused (draft not supported, or wrong path)"
     if ("name or service not known" in e or "gaierror" in e
             or "getaddr" in e):
         return "DNS lookup failed (host not found)"
