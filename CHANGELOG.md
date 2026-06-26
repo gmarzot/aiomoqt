@@ -24,7 +24,7 @@
   transport-appropriate URL
   (`moqt://…` for raw QUIC, `https://…/moq-relay` for H3/WebTransport). A failed
   probe is reported on that one line as a short `status - reason` conclusion
-  (e.g. `handshake refused - no compatible draft/version`); the raw error +
+  (e.g. `connection refused - no compatible draft/version`); the raw error +
   handshake WARNING/ERROR logs appear only under `--debug`.
 
 ## v0.10.3 (unreleased)
