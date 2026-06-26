@@ -330,6 +330,26 @@ def _parse_args():
     return p.parse_args()
 
 
+def _classify_error(err: str) -> str:
+    """Map a raw probe error to a short human conclusion for the quiet
+    one-line output. The raw error is shown under --debug."""
+    e = (err or "").lower()
+    if "error_code=376" in e:  # CRYPTO_ERROR + TLS no_application_protocol
+        return "no compatible draft (no shared ALPN/version)"
+    if "timeout" in e:
+        return "no response (handshake timeout)"
+    if "wt connect refused" in e:
+        return "WebTransport CONNECT refused (wrong path, or not a WT relay)"
+    if ("name or service not known" in e or "gaierror" in e
+            or "getaddr" in e):
+        return "DNS lookup failed (host not found)"
+    if "refused" in e:
+        return "connection refused"
+    if "during handshake" in e:
+        return "handshake failed"
+    return err or "unreachable"
+
+
 async def _probe_single_url(url, timeout, debug=False):
     """One-shot probe: print one human-readable line per (draft, transport)
     combo. No JSON, no file I/O. Exits with code 0 if any draft was LIVE,
@@ -356,7 +376,9 @@ async def _probe_single_url(url, timeout, debug=False):
               f"  {drafts}  ✓ ({result['latency_ms']}ms)")
         return 0
     err = result.get("error") or "unreachable"
-    print(f"{url}  {transport.lower():<8}  ✗ {err}")
+    conclusion = _classify_error(err)
+    suffix = f"  ({err})" if (debug and conclusion != err) else ""
+    print(f"{url}  {transport.lower():<8}  ✗ {conclusion}{suffix}")
     return 1
 
 

@@ -23,8 +23,9 @@
   `>0` = loop), replacing `--once`. Each result line echoes the full
   transport-appropriate URL
   (`moqt://…` for raw QUIC, `https://…/moq-relay` for H3/WebTransport). A failed
-  probe is reported on that one line with its error code; the underlying
-  handshake WARNING/ERROR logs appear only under `--debug`.
+  probe is reported on that one line as a short conclusion (e.g. "no compatible
+  draft (no shared ALPN/version)"); the raw error + handshake WARNING/ERROR logs
+  appear only under `--debug`.
 
 ## v0.10.3 (unreleased)
 
