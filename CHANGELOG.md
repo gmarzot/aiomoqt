@@ -20,12 +20,12 @@
   probed **each individually, in order**; **`--offer`** instead offers the whole
   list in one session and reports the draft the relay negotiates. Looping is now
   controlled solely by **`--interval`** (`0` = probe once and exit [default],
-  `>0` = loop), replacing `--once`. Each result line echoes the full
-  transport-appropriate URL
-  (`moqt://…` for raw QUIC, `https://…/moq-relay` for H3/WebTransport). A failed
-  probe is reported on that one line as a short `status - reason` conclusion
-  (e.g. `connection refused - no compatible version`, `connection refused -
-  H3/WT not supported`); the raw error +
+  `>0` = loop), replacing `--once`. Each result line is aligned as
+  `URL  QUIC|H3/WT  ✓/✗  drafts-or-reason  (elapsed-ms)` — transport-appropriate
+  URL echoed (`moqt://…` / `https://…/moq-relay`), the status mark right after
+  the transport, and the elapsed time on success and failure alike. A failed
+  probe's reason is a short conclusion (e.g. `connection refused - no compatible
+  version`, `connection refused - H3/WT not supported`); the raw error +
   handshake WARNING/ERROR logs appear only under `--debug`.
 
 ## v0.10.3 (unreleased)

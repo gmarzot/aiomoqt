@@ -376,15 +376,14 @@ async def _probe_single_url(url, timeout, debug=False):
     PROBE_TIMEOUT = timeout
     result = await probe_endpoint(url)
     transport = result["transport"]
+    ms = result.get("latency_ms", 0)
     if result["live"]:
         drafts = ",".join(result["drafts"])
-        print(f"{url}  {transport:<8}"
-              f"  {drafts}  ✓ ({result['latency_ms']}ms)")
+        print(f"{url:<48}  {transport:<5}  ✓  {drafts}  ({ms}ms)")
         return 0
     err = result.get("error") or "unreachable"
     conclusion = _classify_error(err, transport)
-    suffix = f"  ({err})" if (debug and conclusion != err) else ""
-    print(f"{url}  {transport:<8}  ✗ {conclusion}{suffix}")
+    print(f"{url:<48}  {transport:<5}  ✗  {conclusion}  ({ms}ms)")
     return 1
 
 
