@@ -40,10 +40,13 @@ logger = logging.getLogger("relay-probe")
 # rebinds these from argparse defaults when the module is invoked
 # directly, giving CLI-over-env precedence.
 PROBE_TIMEOUT = int(os.getenv("PROBE_TIMEOUT", "8"))
-PROBE_INTERVAL = int(os.getenv("PROBE_INTERVAL", "300"))
+# Looping is expressed solely by PROBE_INTERVAL: 0 (default) = probe once and
+# exit; >0 = loop every N seconds. The legacy PROBE_ONCE env is still honored
+# (truthy -> run once) for back-compat with existing deployments.
+_LEGACY_ONCE = os.getenv("PROBE_ONCE", "").lower() in ("1", "true", "yes")
+PROBE_INTERVAL = 0 if _LEGACY_ONCE else int(os.getenv("PROBE_INTERVAL", "0"))
 RELAYS_FILE = os.getenv("RELAYS_FILE", "/app/relays.json")
 OUTPUT_FILE = os.getenv("OUTPUT_FILE", "/output/relay-status.json")
-PROBE_ONCE = os.getenv("PROBE_ONCE", "").lower() in ("1", "true", "yes")
 
 # Draft versions to probe, oldest first — d14 bare WT CONNECT must
 # run before d16 (which sends wt-available-protocols) to avoid
@@ -266,8 +269,8 @@ async def run_loop():
         tmp.rename(out)
         logger.info(f"Wrote {out}")
 
-        if PROBE_ONCE:
-            break
+        if PROBE_INTERVAL <= 0:
+            break  # interval 0 = probe once and exit
 
         logger.info(f"Next probe in {PROBE_INTERVAL}s")
         await asyncio.sleep(PROBE_INTERVAL)
@@ -281,7 +284,8 @@ def _parse_args():
         epilog=(
             "Each CLI flag defaults from its matching environment "
             "variable (RELAYS_FILE, OUTPUT_FILE, PROBE_TIMEOUT, "
-            "PROBE_INTERVAL, PROBE_ONCE), so container deployments "
+            "PROBE_INTERVAL; legacy PROBE_ONCE still maps to interval 0), "
+            "so container deployments "
             "that set env vars keep working unchanged. CLI flags "
             "override env. A per-relay 'interval' field in the "
             "relays file overrides --interval for that relay. "
@@ -304,17 +308,20 @@ def _parse_args():
              f"default: {PROBE_TIMEOUT})")
     p.add_argument(
         "--interval", type=int, default=PROBE_INTERVAL, metavar="SEC",
-        help=f"seconds between probe cycles (env: PROBE_INTERVAL; "
-             f"default: {PROBE_INTERVAL})")
-    p.add_argument(
-        "--once", action="store_true", default=PROBE_ONCE,
-        help="probe once and exit (env: PROBE_ONCE=1)")
+        help=f"loop period: 0 = probe once and exit, >0 = loop every SEC "
+             f"(env: PROBE_INTERVAL; default: {PROBE_INTERVAL}). Replaces the "
+             f"old --once, which is now just the default (--interval 0).")
     p.add_argument(
         "--draft", default=None, metavar="SPEC",
-        help="probe a single draft (e.g. --draft 18) OR an ordered offer "
-             "set in one session (e.g. --draft 18,16 to offer both, 18 "
-             "first) — passed verbatim as the session's supported_drafts, so "
-             "order is preserved. Default probes 14, 16, 18 separately.")
+        help="draft(s) to probe: a single draft (--draft 18) or a list "
+             "(--draft 18,16). By default each listed draft is probed "
+             "INDIVIDUALLY, in order; with --offer the whole list is offered "
+             "in ONE session. Default (no --draft) probes 14, 16, 18 each.")
+    p.add_argument(
+        "--offer", action="store_true", default=False,
+        help="with a multi-draft --draft, offer the whole list in ONE "
+             "session (ordered as given) and report the draft the relay "
+             "negotiates, instead of probing each draft separately.")
     p.add_argument(
         "--url", default=None, metavar="URL",
         help="probe a single relay URL (e.g. moqt://host:port or "
@@ -345,12 +352,11 @@ async def _probe_single_url(url, timeout, debug=False):
     transport = result["transport"]
     if result["live"]:
         drafts = ",".join(result["drafts"])
-        print(f"{result['host']}:{result['port']}  {transport.lower():<8}"
+        print(f"{url}  {transport.lower():<8}"
               f"  {drafts}  ✓ ({result['latency_ms']}ms)")
         return 0
     err = result.get("error") or "unreachable"
-    print(f"{result['host']}:{result['port']}  {transport.lower():<8}"
-          f"  ✗ {err}")
+    print(f"{url}  {transport.lower():<8}  ✗ {err}")
     return 1
 
 
@@ -358,11 +364,17 @@ if __name__ == "__main__":
     args = _parse_args()
     if args.draft is not None:
         try:
-            DRAFT_FILTER = [(f"draft-{args.draft}",
-                             parse_draft_spec(args.draft))]
+            spec = parse_draft_spec(args.draft)
         except ValueError as e:
             print(f"relay_probe: bad --draft value: {e}", file=sys.stderr)
             sys.exit(2)
+        if args.offer:
+            # Offer the whole set in one session (ordered); report negotiated.
+            DRAFT_FILTER = [(f"draft-{args.draft}", spec)]
+        else:
+            # Probe each listed draft individually, in the given order.
+            drafts = spec if isinstance(spec, list) else [spec]
+            DRAFT_FILTER = [(f"draft-{d}", d) for d in drafts]
     if args.url:
         # Single-URL mode: skip the relays-file / output-file machinery.
         rc = asyncio.run(_probe_single_url(
@@ -375,5 +387,4 @@ if __name__ == "__main__":
     OUTPUT_FILE = args.output_file
     PROBE_TIMEOUT = args.timeout
     PROBE_INTERVAL = args.interval
-    PROBE_ONCE = args.once
     asyncio.run(run_loop())

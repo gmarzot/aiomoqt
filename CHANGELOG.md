@@ -15,11 +15,14 @@
 - **Docs:** README "Developing against a locally built aiopquic" — host-tuned
   source build vs the portable PyPI wheel, the editable-first install order for a
   separate venv per repo, and how to verify the local build is actually in use.
-- **`relay_probe`:** probes **draft-18** by default now (was 14/16 only) and
-  adds **`--draft`** — either a single draft (`--draft 18`, to watch a relay's
-  d18 rollout without the extra d14/d16 handshakes) or an ordered offer set in
-  one session (`--draft 18,16`, order preserved) to see which draft the relay
-  negotiates from a given preference list.
+- **`relay_probe` reworked.** Probes **draft-18** by default (was 14/16 only).
+  **`--draft`** takes a single draft (`--draft 18`) or a list (`--draft 18,16`)
+  probed **each individually, in order**; **`--offer`** instead offers the whole
+  list in one session and reports the draft the relay negotiates. Looping is now
+  controlled solely by **`--interval`** (`0` = probe once and exit [default],
+  `>0` = loop) — the old `--once` is removed (legacy `PROBE_ONCE` env still maps
+  to interval 0). Each result line echoes the full transport-appropriate URL
+  (`moqt://…` for raw QUIC, `https://…/moq-relay` for H3/WebTransport).
 
 ## v0.10.3 (unreleased)
 
