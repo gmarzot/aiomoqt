@@ -20,8 +20,8 @@
   probed **each individually, in order**; **`--offer`** instead offers the whole
   list in one session and reports the draft the relay negotiates. Looping is now
   controlled solely by **`--interval`** (`0` = probe once and exit [default],
-  `>0` = loop) — the old `--once` is removed (legacy `PROBE_ONCE` env still maps
-  to interval 0). Each result line echoes the full transport-appropriate URL
+  `>0` = loop), replacing `--once`. Each result line echoes the full
+  transport-appropriate URL
   (`moqt://…` for raw QUIC, `https://…/moq-relay` for H3/WebTransport).
 
 ## v0.10.3 (unreleased)

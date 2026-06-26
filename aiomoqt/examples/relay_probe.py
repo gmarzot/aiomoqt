@@ -23,7 +23,7 @@ from pathlib import Path
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.types import (
-    MOQT_VERSION_DRAFT14, MOQT_VERSION_DRAFT16, MOQTRequestError,
+    MOQTRequestError,
     moqt_version_from_draft,
     parse_draft_spec,
 )
@@ -40,11 +40,9 @@ logger = logging.getLogger("relay-probe")
 # rebinds these from argparse defaults when the module is invoked
 # directly, giving CLI-over-env precedence.
 PROBE_TIMEOUT = int(os.getenv("PROBE_TIMEOUT", "8"))
-# Looping is expressed solely by PROBE_INTERVAL: 0 (default) = probe once and
-# exit; >0 = loop every N seconds. The legacy PROBE_ONCE env is still honored
-# (truthy -> run once) for back-compat with existing deployments.
-_LEGACY_ONCE = os.getenv("PROBE_ONCE", "").lower() in ("1", "true", "yes")
-PROBE_INTERVAL = 0 if _LEGACY_ONCE else int(os.getenv("PROBE_INTERVAL", "0"))
+# PROBE_INTERVAL controls looping: 0 = probe once and exit, >0 = loop every
+# N seconds.
+PROBE_INTERVAL = int(os.getenv("PROBE_INTERVAL", "0"))
 RELAYS_FILE = os.getenv("RELAYS_FILE", "/app/relays.json")
 OUTPUT_FILE = os.getenv("OUTPUT_FILE", "/output/relay-status.json")
 
@@ -52,9 +50,7 @@ OUTPUT_FILE = os.getenv("OUTPUT_FILE", "/output/relay-status.json")
 # run before d16 (which sends wt-available-protocols) to avoid
 # relay state issues on sequential probes to the same endpoint.
 DRAFT_PROBES = [
-    # Draft numbers (short int) — public MoQTClient API form.
-    # MOQT_VERSION_DRAFT14/16 constants are currently the full hex
-    # wire-form pending refactor (see memory:project_int_form_refactor).
+    # Draft numbers (the public MoQTClient supported_drafts form).
     ("draft-14", 14),
     ("draft-16", 16),
     ("draft-18", 18),
@@ -284,8 +280,7 @@ def _parse_args():
         epilog=(
             "Each CLI flag defaults from its matching environment "
             "variable (RELAYS_FILE, OUTPUT_FILE, PROBE_TIMEOUT, "
-            "PROBE_INTERVAL; legacy PROBE_ONCE still maps to interval 0), "
-            "so container deployments "
+            "PROBE_INTERVAL), so container deployments "
             "that set env vars keep working unchanged. CLI flags "
             "override env. A per-relay 'interval' field in the "
             "relays file overrides --interval for that relay. "
@@ -309,8 +304,7 @@ def _parse_args():
     p.add_argument(
         "--interval", type=int, default=PROBE_INTERVAL, metavar="SEC",
         help=f"loop period: 0 = probe once and exit, >0 = loop every SEC "
-             f"(env: PROBE_INTERVAL; default: {PROBE_INTERVAL}). Replaces the "
-             f"old --once, which is now just the default (--interval 0).")
+             f"(env: PROBE_INTERVAL; default: {PROBE_INTERVAL}).")
     p.add_argument(
         "--draft", default=None, metavar="SPEC",
         help="draft(s) to probe: a single draft (--draft 18) or a list "
