@@ -336,24 +336,24 @@ def _classify_error(err: str, transport: str = "") -> str:
     e = (err or "").lower()
     is_wt = "wt" in transport.lower() or "h3" in transport.lower()
     if "error_code=376" in e:  # TLS no_application_protocol (ALPN mismatch)
-        # Over WT the offered ALPN is "h3"; 376 there means the relay isn't
-        # an H3/WebTransport server. Over raw QUIC it's the moqt-NN ALPN, so
-        # 376 means no shared draft.
+        # Over H3/WT the offered ALPN is "h3"; 376 means the relay isn't an
+        # H3/WT server. Over QUIC it's the moqt-NN ALPN, so 376 means no
+        # shared version.
         if is_wt:
-            return "connection refused - h3/webtransport not supported"
-        return "connection refused - no compatible draft/version"
+            return "connection refused - H3/WT not supported"
+        return "connection refused - no compatible version"
     if "wt connect refused" in e:
-        return "connection refused - draft not supported or wrong path"
+        return "connection refused - no compatible version or wrong path"
     if "timeout" in e:
-        return "no response - handshake timed out"
+        return "connection refused - no response"
     if ("name or service not known" in e or "gaierror" in e
             or "getaddr" in e or "name resolution" in e):
-        return "DNS lookup failed - host did not resolve"
+        return "connection refused - could not resolve host"
     if "refused" in e:
         return "connection refused - nothing listening"
     if "during handshake" in e:
         return "connection refused - handshake failed"
-    return err or "unreachable"
+    return f"connection refused - {err}" if err else "connection refused"
 
 
 async def _probe_single_url(url, timeout, debug=False):
@@ -378,13 +378,13 @@ async def _probe_single_url(url, timeout, debug=False):
     transport = result["transport"]
     if result["live"]:
         drafts = ",".join(result["drafts"])
-        print(f"{url}  {transport.lower():<8}"
+        print(f"{url}  {transport:<8}"
               f"  {drafts}  ✓ ({result['latency_ms']}ms)")
         return 0
     err = result.get("error") or "unreachable"
     conclusion = _classify_error(err, transport)
     suffix = f"  ({err})" if (debug and conclusion != err) else ""
-    print(f"{url}  {transport.lower():<8}  ✗ {conclusion}{suffix}")
+    print(f"{url}  {transport:<8}  ✗ {conclusion}{suffix}")
     return 1
 
 
