@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +25,7 @@ from aiomoqt.client import MOQTClient
 from aiomoqt.types import (
     MOQT_VERSION_DRAFT14, MOQT_VERSION_DRAFT16, MOQTRequestError,
     moqt_version_from_draft,
+    parse_draft_spec,
 )
 from aiomoqt.utils.url import parse_relay_url
 
@@ -127,8 +129,12 @@ async def probe_endpoint(url, verify_tls=False):
         )
         results.append(r)
         if r["live"]:
-            drafts.append(draft_name)
-            logger.info(f"  {url} [{transport}] {draft_name}: LIVE"
+            # For a multi-draft offer the label is the offered set; report
+            # which draft the relay actually negotiated.
+            negotiated = r["draft"] or draft_name
+            drafts.append(negotiated)
+            arrow = "" if negotiated == draft_name else f" -> {negotiated}"
+            logger.info(f"  {url} [{transport}] {draft_name}{arrow}: LIVE"
                         f" (alpn={r['alpn']})")
         else:
             logger.info(f"  {url} [{transport}] {draft_name}: {r['error']}")
@@ -304,9 +310,11 @@ def _parse_args():
         "--once", action="store_true", default=PROBE_ONCE,
         help="probe once and exit (env: PROBE_ONCE=1)")
     p.add_argument(
-        "--draft", type=int, default=None, metavar="N",
-        help="probe only this draft number (e.g. --draft 18); default "
-             "probes 14, 16, and 18.")
+        "--draft", default=None, metavar="SPEC",
+        help="probe a single draft (e.g. --draft 18) OR an ordered offer "
+             "set in one session (e.g. --draft 18,16 to offer both, 18 "
+             "first) — passed verbatim as the session's supported_drafts, so "
+             "order is preserved. Default probes 14, 16, 18 separately.")
     p.add_argument(
         "--url", default=None, metavar="URL",
         help="probe a single relay URL (e.g. moqt://host:port or "
@@ -349,7 +357,12 @@ async def _probe_single_url(url, timeout, debug=False):
 if __name__ == "__main__":
     args = _parse_args()
     if args.draft is not None:
-        DRAFT_FILTER = [(f"draft-{args.draft}", args.draft)]
+        try:
+            DRAFT_FILTER = [(f"draft-{args.draft}",
+                             parse_draft_spec(args.draft))]
+        except ValueError as e:
+            print(f"relay_probe: bad --draft value: {e}", file=sys.stderr)
+            sys.exit(2)
     if args.url:
         # Single-URL mode: skip the relays-file / output-file machinery.
         rc = asyncio.run(_probe_single_url(

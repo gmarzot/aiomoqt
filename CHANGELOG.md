@@ -16,8 +16,10 @@
   source build vs the portable PyPI wheel, the editable-first install order for a
   separate venv per repo, and how to verify the local build is actually in use.
 - **`relay_probe`:** probes **draft-18** by default now (was 14/16 only) and
-  adds **`--draft N`** to check a single draft (e.g. `--draft 18` to watch a
-  relay's d18 rollout without the extra d14/d16 handshakes).
+  adds **`--draft`** — either a single draft (`--draft 18`, to watch a relay's
+  d18 rollout without the extra d14/d16 handshakes) or an ordered offer set in
+  one session (`--draft 18,16`, order preserved) to see which draft the relay
+  negotiates from a given preference list.
 
 ## v0.10.3 (unreleased)
 
