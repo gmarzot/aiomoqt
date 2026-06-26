@@ -22,7 +22,9 @@
   controlled solely by **`--interval`** (`0` = probe once and exit [default],
   `>0` = loop), replacing `--once`. Each result line echoes the full
   transport-appropriate URL
-  (`moqt://…` for raw QUIC, `https://…/moq-relay` for H3/WebTransport).
+  (`moqt://…` for raw QUIC, `https://…/moq-relay` for H3/WebTransport). A failed
+  probe is reported on that one line with its error code; the underlying
+  handshake WARNING/ERROR logs appear only under `--debug`.
 
 ## v0.10.3 (unreleased)
 

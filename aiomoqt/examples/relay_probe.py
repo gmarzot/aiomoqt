@@ -335,11 +335,17 @@ async def _probe_single_url(url, timeout, debug=False):
     combo. No JSON, no file I/O. Exits with code 0 if any draft was LIVE,
     else 1 — easy to wire into shell scripts."""
     from aiomoqt.utils.logger import set_log_level
-    # Default quiet: suppress aiomoqt's INFO chatter so stdout is one
-    # clean line. --debug bumps everything (incl. handshake details).
-    set_log_level(logging.DEBUG if debug else logging.WARNING)
-    logging.getLogger("relay-probe").setLevel(
-        logging.DEBUG if debug else logging.WARNING)
+    # Default quiet: only the one-line result reaches stdout. Suppress the
+    # aiomoqt + aiopquic connection logs (including handshake-failure
+    # WARNING/ERROR) — a failed probe is still reported on the printed ✗ line
+    # with its error code. --debug shows the full handshake.
+    if debug:
+        set_log_level(logging.DEBUG)
+        logging.getLogger("relay-probe").setLevel(logging.DEBUG)
+    else:
+        set_log_level(logging.CRITICAL)
+        logging.getLogger("relay-probe").setLevel(logging.WARNING)
+        logging.getLogger("aiopquic").setLevel(logging.CRITICAL)
     global PROBE_TIMEOUT
     PROBE_TIMEOUT = timeout
     result = await probe_endpoint(url)
