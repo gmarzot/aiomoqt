@@ -5,7 +5,6 @@ on `summary()`. Cheap; appends to a list, sort-once at end.
 """
 from __future__ import annotations
 
-import bisect
 import time
 
 

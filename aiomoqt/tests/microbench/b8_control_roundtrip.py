@@ -25,10 +25,6 @@ import logging
 import sys
 from typing import Callable, Optional
 
-# The control serializers log per-param at INFO; silence them so the tight
-# round-trip loop doesn't drown the table in log lines.
-logging.disable(logging.WARNING)
-
 from aiomoqt.context import profile_for
 from aiomoqt.messages import (
     Subscribe, SubscribeOk, Publish, PublishOk, RequestUpdate,
@@ -40,6 +36,10 @@ from aiomoqt.types import (
 from aiomoqt.utils.buffer import Buffer
 
 from ._stats import time_loop
+
+# The control serializers log per-param at INFO; silence them so the tight
+# round-trip loop doesn't drown the table in log lines.
+logging.disable(logging.WARNING)
 
 
 DRAFTS = (14, 16, 18)
