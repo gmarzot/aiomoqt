@@ -9,7 +9,7 @@
 ### Features
 
 - H3/WebTransport and raw QUIC transports
-- Draft-14 / draft-16 / draft-18 negotiation (ALPN `moq-00` / `moqt-16`; d18 via ALPN / WT-Protocol)
+- Draft-14 / draft-16 / draft-18 negotiation (ALPN `moq-00` / `moqt-16` / `moqt-18`, plus WT-Protocol over H3)
 - Draft-16 wire format: delta-encoded param keys, track extensions, unified request/response
 - Draft-18 (beta): vi64 varints, uni-stream control pair, per-request bidi streams, Request-ID-less replies — over both raw QUIC and WebTransport
 - SubgroupHeader / ObjectDatagram flag encoding, delta-encoded object IDs
@@ -65,10 +65,10 @@ python -m aiomoqt.versions   # or: aiomoqt-versions
 # Liveness + supported drafts against a single relay (one line per probed transport).
 # Exit 0 if the relay answered SERVER_SETUP for at least one draft.
 python -m aiomoqt.examples.relay_probe --url moqt://moqx-main.ci.openmoq.org:4433
-# → moqx-main.ci.openmoq.org:4433  quic   draft-14,draft-16  ✓ (405ms)
+# → moqt://moqx-main.ci.openmoq.org:4433              QUIC   ✓  draft-14,draft-16,draft-18  (540ms)
 
 python -m aiomoqt.examples.relay_probe --url https://moqx-main.ci.openmoq.org:4433/moq-relay
-# → moqx-main.ci.openmoq.org:4433  h3/wt  draft-14,draft-16  ✓ (315ms)
+# → https://moqx-main.ci.openmoq.org:4433/moq-relay   H3/WT  ✓  draft-14,draft-16,draft-18  (435ms)
 ```
 
 ### Subscriber
@@ -82,7 +82,7 @@ def on_object(msg, size, recv_time_ms, group_id=None, subgroup_id=None):
 
 async def main():
     client = MOQTClient('relay.example.com', 443, path='moq',
-                         use_quic=True, draft_version=16)
+                         use_quic=True, supported_drafts=16)
     async with client.connect() as session:
         await session.client_session_init()
         session.on_object_received = on_object
@@ -102,7 +102,7 @@ from aiomoqt.messages import SubgroupHeader
 
 async def main():
     client = MOQTClient('relay.example.com', 443, path='moq',
-                         use_quic=True, draft_version=16)
+                         use_quic=True, supported_drafts=16)
     client.register_handler(MOQTMessageType.SUBSCRIBE, on_subscribe)
     async with client.connect() as session:
         await session.client_session_init()
@@ -188,22 +188,17 @@ python -m aiomoqt.examples.moq_interop_client -l
 
 ### Relay Probe
 
-Batch liveness + draft-version check. Reads a relay list, does a
-real CLIENT_SETUP / SERVER_SETUP handshake per (endpoint × draft) —
-no bare-ALPN tricks — and writes a JSON status report.
-
-Accepts CLI flags, environment variables, or both (CLI overrides env):
+Batch liveness + draft-version check: reads a relay list, does a real CLIENT_SETUP / SERVER_SETUP handshake per (endpoint × draft), and writes a JSON status report. Accepts CLI flags, environment variables, or both (CLI overrides env). A single endpoint can also be probed inline with `--url` (see Quick Start above).
 
 ```bash
-# CLI form (typical interactive use)
-python -m aiomoqt.examples.relay_probe -f relays.json -o status.json --once
-
-# Env form (typical container/daemon deployment)
-RELAYS_FILE=relays.json OUTPUT_FILE=status.json PROBE_ONCE=1 \
-  python -m aiomoqt.examples.relay_probe
-
-# Long-running monitor (re-probe every --interval seconds)
+# Probe a relay list once and write a status report (CLI form)
 python -m aiomoqt.examples.relay_probe -f relays.json -o status.json
+
+# Same, env form (typical container/daemon deployment)
+RELAYS_FILE=relays.json OUTPUT_FILE=status.json python -m aiomoqt.examples.relay_probe
+
+# Long-running monitor: re-probe every 300s
+python -m aiomoqt.examples.relay_probe -f relays.json -o status.json --interval 300
 ```
 
 | CLI flag | Env var | Default | Meaning |
@@ -211,14 +206,13 @@ python -m aiomoqt.examples.relay_probe -f relays.json -o status.json
 | `-f / --relays-file` | `RELAYS_FILE` | `/app/relays.json` | input relay list |
 | `-o / --output-file` | `OUTPUT_FILE` | `/output/relay-status.json` | status report destination |
 | `--timeout` | `PROBE_TIMEOUT` | `8` | per-probe handshake timeout (s) |
-| `--interval` | `PROBE_INTERVAL` | `300` | re-probe cadence in monitor mode (s) |
-| `--once` | `PROBE_ONCE=1` | unset | probe once and exit |
+| `--interval` | `PROBE_INTERVAL` | `0` | re-probe cadence (s); `0` probes once and exits |
+| `--draft` | — | all | draft(s) to probe: `--draft 18` or `--draft 18,16` (add `--offer` to offer the list in one session) |
 
 ### WebTransport Server
 
 ```bash
-python -m aiomoqt.examples.server_example \
-    --certificate cert.pem --private-key key.pem --port 443
+python -m aiomoqt.examples.server_example --certificate cert.pem --private-key key.pem --port 443
 ```
 
 ### Example Reference
@@ -235,32 +229,16 @@ python -m aiomoqt.examples.server_example \
 | `loopback_bench.py` | Local loopback (no relay) |
 | `adaptive_bench.py` | Ramps rate until buffer growth; loopback (`--mp-loopback` for proc-isolated pub/sub) or relay |
 | `server_example.py` | WebTransport server (origin) |
-| `relay_probe.py` | Relay version probe (draft-14/16) |
+| `relay_probe.py` | Relay version probe (draft-14/16/18) |
 | `moq_interop_client.py` | Interop test client (TAP v14 out; 6 standard + `fetch`/`join`) |
 
 ## Interop
 
-Validated against live public relays — OpenMoQ moqx, Meta moxygen,
-Cloudflare moq-rs, Quicr libquicr, Meetecho imquic, OzU moqtail —
-across draft-14/draft-16 and both transports, using the
-[moq-interop-runner](https://github.com/englishm/moq-interop-runner)
-cases plus a multi-subscriber pub-sub bench. The full point-in-time
-matrix lives in [PERFORMANCE.md](PERFORMANCE.md#interop-matrix-point-in-time);
-the relay catalog with per-endpoint notes is
-[`tests/relays.json`](tests/relays.json). Red5 Pro was interop-tested
-in earlier cycles and is currently untested/unverified.
+Validated against live public relays — OpenMoQ moqx, Meta moxygen, Cloudflare moq-rs, Quicr libquicr, Meetecho imquic, OzU moqtail, Nokia — across draft-14/draft-16/draft-18 and both transports, using the [moq-interop-runner](https://github.com/englishm/moq-interop-runner) cases plus a multi-subscriber pub-sub bench. The full point-in-time matrix lives in [PERFORMANCE.md](PERFORMANCE.md#interop-matrix-point-in-time); the relay catalog with per-endpoint notes is [`tests/relays.json`](tests/relays.json). Red5 Pro was interop-tested in earlier cycles and is currently untested/unverified.
 
 ## Performance
 
-`aiomoqt` sits on [`aiopquic`](https://github.com/gmarzot/aiopquic),
-which sits on picoquic + the kernel UDP path; throughput at this layer
-is bounded by the layers below. Observed on commodity hardware over
-loopback: multi-Gbps sustained throughput at ~4 KiB objects with
-bounded memory under stream churn, and sub-millisecond to
-low-millisecond latency when paced below saturation. Numbers vary
-substantially by platform — methodology, observed figures, the
-paced-vs-unpaced distinction, and TX budget tuning are in
-[PERFORMANCE.md](PERFORMANCE.md).
+`aiomoqt` sits on [`aiopquic`](https://github.com/gmarzot/aiopquic), which sits on picoquic + the kernel UDP path; throughput at this layer is bounded by the layers below. Observed on commodity hardware over loopback: multi-Gbps sustained throughput at ~4 KiB objects with bounded memory under stream churn, and sub-millisecond to low-millisecond latency when paced below saturation. Numbers vary substantially by platform — methodology, observed figures, the paced-vs-unpaced distinction, and TX budget tuning are in [PERFORMANCE.md](PERFORMANCE.md).
 
 ## Development
 
@@ -270,60 +248,42 @@ cd aiomoqt
 python3 -m venv .venv && source .venv/bin/activate
 uv pip install -e ".[test]"    # or: pip install -e ".[test]"
 
-# Self-signed cert for the loopback server (loopback_bench, pub_server,
-# and the test_loopback_* suites; skipped if certs/ is absent). One time:
-mkdir -p certs && openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
-  -keyout certs/key.pem -out certs/cert.pem -subj "/CN=localhost" \
-  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+# One-time self-signed cert for the loopback server + test_loopback_* suites (skipped if certs/ is absent)
+mkdir -p certs && openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout certs/key.pem -out certs/cert.pem -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
 
 pytest aiomoqt/tests/
 ```
 
 ### Developing against a locally built aiopquic
 
-The PyPI `aiopquic` wheel is built **portable** (runs on any CPU of the
-architecture). A locally compiled `aiopquic` is **host-tuned** (`-O3
--march=native -flto`, plus picotls Fusion AES-GCM on x86_64) and is
-measurably faster in many cases — build it from source when benchmarking or
-optimizing, and on bare-metal targets generally.
+The PyPI `aiopquic` wheel is **portable** (any CPU of the architecture). A locally compiled `aiopquic` is **host-tuned** (`-O3 -march=native -flto`, plus picotls Fusion AES-GCM on x86_64) and is measurably faster — build from source when benchmarking, optimizing, or targeting bare metal.
 
 ```bash
-# build aiopquic from source (host-tuned by default)
+# Build aiopquic from source (host-tuned by default; AIOPQUIC_WHEEL_BUILD=1 for a portable build)
 git clone https://github.com/gmarzot/aiopquic.git
-cd aiopquic
-git submodule update --init --recursive
-./build_picoquic.sh          # -march/-mcpu=native -flto; AIOPQUIC_WHEEL_BUILD=1 for a portable build
+cd aiopquic && git submodule update --init --recursive && ./build_picoquic.sh
 ```
 
-`aiomoqt`'s venv must then have **this editable aiopquic** installed —
-otherwise `uv pip install -e` pulls the portable wheel from PyPI. In a single
-shared venv, install both editable. With a **separate venv per repo** (e.g. two
-shells), install the local aiopquic into the aiomoqt venv **first**, so the
-dependency is already satisfied and no wheel is fetched:
+With a **separate venv per repo**, install the local aiopquic into the aiomoqt venv **first**, so the dependency is already satisfied and no wheel is fetched (re-run it any time the wheel sneaks back in — it replaces the wheel install):
 
 ```bash
 # in the aiomoqt venv:
-uv pip install -e ~/aiopquic     # local source, editable — BEFORE aiomoqt
-uv pip install -e '.[test]'      # aiopquic dep already satisfied → no wheel
+uv pip install -e ~/aiopquic    # local source, editable — BEFORE aiomoqt
+uv pip install -e '.[test]'     # aiopquic already satisfied → no wheel
 ```
 
-If aiomoqt already grabbed the wheel, just re-run `uv pip install -e ~/aiopquic`
-— it replaces the wheel install. Confirm the local build is actually in use
-(this catches the wheel sneaking back in):
+Confirm the local build is actually in use:
 
 ```bash
 python -c "import aiopquic; print(aiopquic.__file__)"   # must be <repo>/src/aiopquic/…, not …/site-packages/
-python -m aiomoqt.versions                              # aiopquic path + picoquic/picotls SHAs match your build
+python -m aiomoqt.versions                              # paths + picoquic/picotls SHAs match your build
 ```
 
-Both venvs must use the **same Python version** — the editable build's compiled
-extension lives in the aiopquic source tree and is shared across venvs that
-point at it. C/Cython changes need a rebuild (`./build_picoquic.sh` if the C
-libs changed, then `uv pip install -e ~/aiopquic`); pure-Python edits are live.
+Both venvs must use the **same Python version**. C/Cython changes need a rebuild (`./build_picoquic.sh` then `uv pip install -e ~/aiopquic`); pure-Python edits are live.
 
 ## Known Limitations
 
-- **draft-18 is beta.** Negotiated by default (`(18, 16, 14)`, newest-first) over raw QUIC and WebTransport, with control + SUBGROUP object delivery validated end to end. Not yet complete: SUBSCRIBE / PUBLISH subscription-filter and largest-location still use the d16 nested form; d18 FETCH is pending; Track-Properties extensions encode as RFC9000 varints (correct for the small values in use). draft-14 / draft-16 are unaffected and remain the stable path.
+- **draft-18 is beta.** Negotiated by default (`(18, 16, 14)`, newest-first) over raw QUIC and WebTransport, with control, FETCH, and SUBGROUP object delivery validated end to end. Not yet complete: SUBSCRIBE / PUBLISH subscription-filter and largest-location still use the d16 nested form; Track-Properties extensions encode as RFC9000 varints (correct for the small values in use). draft-14 / draft-16 are unaffected and remain the stable path.
 - **WebTransport fetch / join routing** -- four `[wt]` test variants of FETCH and JOINING_SUBSCRIBE return empty results when the underlying transport is WebTransport. Raw-QUIC variants of the same tests pass and cover the MoQT-level invariant. Tracked separately; affects WT-only consumers of fetch/join.
 
 ## TODO
@@ -338,8 +298,7 @@ libs changed, then `uv pip install -e ~/aiopquic`); pure-Python edits are live.
 
 ## Contributing
 
-Contributions are welcome! Please fork the repository, create a branch,
-and submit a pull request. For major changes, open an issue first.
+Contributions are welcome! Please fork the repository, create a branch, and submit a pull request. For major changes, open an issue first.
 
 ## Resources
 
@@ -356,6 +315,4 @@ Giovanni Marzot — [gmarzot@marzresearch.net](mailto:gmarzot@marzresearch.net) 
 
 ## Acknowledgements
 
-This project takes inspiration from, and has benefited from the great work
-done by the [OpenMoQ/moxygen](https://github.com/openmoq/moxygen) team,
-and the continued efforts of the MOQ IETF WG.
+This project takes inspiration from, and has benefited from the great work done by the [OpenMoQ/moxygen](https://github.com/openmoq/moxygen) team, and the continued efforts of the MOQ IETF WG.

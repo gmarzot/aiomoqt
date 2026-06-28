@@ -1,6 +1,18 @@
 # Changelog
 
-## v0.10.4 (unreleased)
+## v0.10.5 (unreleased)
+
+- **README accuracy + cleanup pass.** Fixed the Quick Start examples that passed
+  the removed `draft_version=` kwarg (now `supported_drafts=`). Refreshed the
+  relay-probe Quick Start with current output (draft-14/16/18 over raw QUIC and
+  H3/WT) and corrected the Relay Probe reference: dropped the removed
+  `--once`/`PROBE_ONCE`, fixed the `--interval` default (`0` = probe once), added
+  `--draft`. Removed the stale "d18 FETCH is pending" limitation (shipped in
+  0.10.2) and updated the interop / example tables to draft-14/16/18. Trimmed
+  verbose prose, reflowed needless hard wraps, and collapsed `\`-continued shell
+  commands.
+
+## v0.10.4 (2026-06-26)
 
 - **Cross-draft (d14/d16/d18) microbenchmarks.** New `b8_control_roundtrip`
   times encode+decode of SUBSCRIBE / SUBSCRIBE_OK / PUBLISH / PUBLISH_OK /
@@ -28,7 +40,7 @@
   version`, `connection refused - H3/WT not supported`); the raw error +
   handshake WARNING/ERROR logs appear only under `--debug`.
 
-## v0.10.3 (unreleased)
+## v0.10.3 (2026-06-23)
 
 - **draft-18 pub-sub object delivery fixed (REQUEST_UPDATE wire format).**
   draft-18 removed the `Existing Request ID` field from `REQUEST_UPDATE`
@@ -44,7 +56,7 @@
   corners (d16/d18 × raw-QUIC / WebTransport): 3/3 subscribers, objects
   delivered. d14/d16 pub-sub is unchanged.
 
-## v0.10.2 (unreleased)
+## v0.10.2 (2026-06-23)
 
 - **draft-18 FETCH / joining-FETCH / FETCH_OK now use the request stream.**
   `fetch()`, the joining-fetch helper, and `fetch_ok()` were sending on the
@@ -62,7 +74,7 @@
   publish at the `forward=1` trigger before streaming objects, so subscribers
   receive 0 objects. Tracked for 0.10.3. d14/d16 pub-sub is unaffected.
 
-## v0.10.1 (unreleased)
+## v0.10.1 (2026-06-22)
 
 - **Preference-ordered draft probe (interop client).** A single
   `moq_interop_client` invocation now probes its `supported_drafts` in
@@ -88,7 +100,7 @@
   `--compat` still adds to whatever the endpoint contributes. Default-off for
   all other hosts (no global leniency).
 
-## v0.10.0 (unreleased)
+## v0.10.0 (2026-06-21)
 
 **draft-18 support (beta).** aiomoqt now speaks draft-18 alongside d14/d16,
 over both raw QUIC and WebTransport, built on a version-dispatch refactor
