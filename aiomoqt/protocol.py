@@ -174,7 +174,7 @@ class _MOQTSessionMixin:
         drift; assigning it resolves _profile. The wire IETF version code
         is materialized only when (de)serializing SETUP / building ALPN."""
         prof = getattr(self, '_profile', None)
-        return prof.draft if prof is not None else get_major_version(MOQT_CUR_VERSION)
+        return prof.draft if prof is not None else get_major_version(MOQT_VERSION_DRAFT14)
 
     @negotiated_draft.setter
     def negotiated_draft(self, value: int) -> None:
@@ -211,7 +211,7 @@ class _MOQTSessionMixin:
         _drafts = getattr(session, 'supported_drafts', None)
         _pinned = _drafts[0] if _drafts and len(_drafts) == 1 else None
         self.negotiated_draft = (get_major_version(_pinned) if _pinned is not None
-                                 else get_major_version(MOQT_CUR_VERSION))
+                                 else get_major_version(MOQT_VERSION_DRAFT14))
         self._moqt_session_setup: Future[bool] = self._loop.create_future()
         self._moqt_session_closed: Future[Tuple[int,str]] = self._loop.create_future()
         self._next_request_id = 0 if self._is_client else 1
@@ -1747,7 +1747,7 @@ class _MOQTSessionMixin:
 
     def server_setup(
         self,
-        selected_version: int = MOQT_CUR_VERSION,
+        selected_version: int = MOQT_VERSION_DRAFT14,
         parameters: Optional[Dict[int, bytes]] = None
     ) -> ServerSetup:
         """Send SERVER_SETUP message in response to CLIENT_SETUP."""
@@ -2347,7 +2347,7 @@ class _MOQTSessionMixin:
             # (the wire format omits it). Trust the ALPN-resolved version
             # already set in self.negotiated_draft on ProtocolNegotiated.
             version_ok = (
-                is_draft16_or_later(self.negotiated_draft) or MOQT_CUR_VERSION in msg.versions
+                is_draft16_or_later(self.negotiated_draft) or MOQT_VERSION_DRAFT14 in msg.versions
             )
             if version_ok:
                 self.server_setup()

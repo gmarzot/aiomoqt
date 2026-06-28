@@ -25,15 +25,13 @@
 
 ## Installation
 
-Pure Python, requires Python 3.12+ (tested on 3.12, 3.13, 3.14):
+Pure Python, requires Python 3.12+ (tested on 3.12, 3.13, 3.14). For a clean, uv-managed `.venv`, run `./bootstrap_python.sh`; otherwise install into your current environment:
 
 ```bash
 uv pip install aiomoqt    # or: pip install aiomoqt
 ```
 
 `aiopquic` (the QUIC transport) installs as a binary wheel automatically. Only Linux (glibc 2.34+, RHEL 9 / Ubuntu 22.04+) and macOS arm64 have prebuilt wheels; other systems pull `aiopquic` via sdist and need a C build toolchain — see [aiopquic install notes](https://github.com/gmarzot/aiopquic#installation).
-
-A `./bootstrap_python.sh` script is provided for a uv-managed `.venv` if you want a clean dev environment.
 
 ### Reporting issues
 
@@ -56,19 +54,16 @@ aiopquic:  0.3.7.dev12+g6eef9caf6 (~/src/aiopquic/src/aiopquic) [2026-06-11 11:5
 
 ### Verify install + relay liveness
 
-Confirm the stack is wired up before writing any code:
+Confirm the stack and reach a relay before writing any code (probe exits 0 if any draft handshakes):
 
 ```bash
-# Versions of aiomoqt + aiopquic + picoquic + picotls
-python -m aiomoqt.versions   # or: aiomoqt-versions
+python -m aiomoqt.versions
 
-# Liveness + supported drafts against a single relay (one line per probed transport).
-# Exit 0 if the relay answered SERVER_SETUP for at least one draft.
 python -m aiomoqt.examples.relay_probe --url moqt://moqx-main.ci.openmoq.org:4433
-# → moqt://moqx-main.ci.openmoq.org:4433              QUIC   ✓  draft-14,draft-16,draft-18  (540ms)
+moqt://moqx-main.ci.openmoq.org:4433              QUIC   ✓  draft-14,draft-16,draft-18  (540ms)
 
 python -m aiomoqt.examples.relay_probe --url https://moqx-main.ci.openmoq.org:4433/moq-relay
-# → https://moqx-main.ci.openmoq.org:4433/moq-relay   H3/WT  ✓  draft-14,draft-16,draft-18  (435ms)
+https://moqx-main.ci.openmoq.org:4433/moq-relay   H3/WT  ✓  draft-14,draft-16,draft-18  (435ms)
 ```
 
 ### Subscriber

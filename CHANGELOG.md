@@ -2,6 +2,11 @@
 
 ## v0.10.5 (unreleased)
 
+- **Retired the `MOQT_CUR_VERSION` module constant** (closes #4 follow-up). It
+  was a fixed alias for `MOQT_VERSION_DRAFT14` left over from the pre-0.10.0
+  module-global version context; the four remaining read sites now reference the
+  draft-14 constant directly, so nothing implies a mutable "current" version.
+  Per-session version state is unchanged (`self._profile` / `negotiated_draft`).
 - **README accuracy + cleanup pass.** Fixed the Quick Start examples that passed
   the removed `draft_version=` kwarg (now `supported_drafts=`). Refreshed the
   relay-probe Quick Start with current output (draft-14/16/18 over raw QUIC and

@@ -11,7 +11,6 @@ MOQT_VERSIONS = [
     MOQT_VERSION_DRAFT14,
     MOQT_VERSION_DRAFT16,
 ]
-MOQT_CUR_VERSION = MOQT_VERSION_DRAFT14  # default; set per-session
 
 
 class MOQTDraft(IntEnum):
