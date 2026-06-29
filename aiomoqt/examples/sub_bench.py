@@ -365,7 +365,7 @@ examples:
              '(required by some relays)')
     parser.add_argument(
         '-t', '--duration', type=int, default=0,
-        help='Duration in seconds (default: 30)')
+        help='Duration in seconds; 0 = run until the publisher closes (default: 0)')
     parser.add_argument(
         '-i', '--interval', type=float, default=5.0,
         help='Report interval in seconds (default: 5)')
@@ -378,7 +378,7 @@ examples:
         help='Skip TLS certificate verification')
     parser.add_argument(
         '--draft', type=parse_draft_spec, default=None,
-        help='MoQT draft version (e.g. 14, 16)')
+        help='MoQT draft version: 14, 16, or 18')
     parser.add_argument(
         '--cc-algo', type=str, default=None,
         help='Congestion control algorithm '

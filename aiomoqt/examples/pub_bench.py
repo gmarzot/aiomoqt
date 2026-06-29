@@ -107,7 +107,7 @@ examples:
     parser.add_argument('-k', '--insecure', action='store_true',
                         help='Skip TLS certificate verification')
     parser.add_argument('--draft', type=parse_draft_spec, default=None,
-                        help='MoQT draft version (e.g. 14, 16)')
+                        help='MoQT draft version: 14, 16, or 18')
     parser.add_argument('--cc-algo', type=str, default=None,
                         help='Congestion control algorithm '
                              '(bbr | bbr1 | newreno | cubic | dcubic | '

@@ -79,7 +79,7 @@ def parse_args():
         help='Use raw QUIC instead of WebTransport (default: WT)')
     parser.add_argument(
         '-D', '--draft', type=parse_draft_spec, default=14,
-        help='MoQT draft version to negotiate (e.g. 14 or 16, '
+        help='MoQT draft version to negotiate (e.g. 14, 16, or 18, '
              'default: 14). Applied to BOTH the loopback publisher '
              '(server) and subscriber (client) so the raw-QUIC ALPN '
              '("moq-00" for d14, "moqt-NN" for d16+) and the WT version '

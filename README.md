@@ -226,6 +226,7 @@ python -m aiomoqt.examples.server_example --certificate cert.pem --private-key k
 | `server_example.py` | WebTransport server (origin) |
 | `relay_probe.py` | Relay version probe (draft-14/16/18) |
 | `moq_interop_client.py` | Interop test client (TAP v14 out; 6 standard + `fetch`/`join`) |
+| `moq_interop_relay.py` | Minimal interop relay (control plane; experimental) |
 
 ## Interop
 

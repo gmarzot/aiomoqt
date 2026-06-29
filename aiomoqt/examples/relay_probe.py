@@ -2,9 +2,10 @@
 """
 MOQ relay probe — determines relay liveness and supported draft versions.
 
-Each endpoint URL gets exactly 2 probes:
-  - moqt:// URLs: raw QUIC with moqt-16 ALPN, then moq-00 ALPN
-  - https:// URLs: H3/WebTransport with moqt-16, then moq-00
+Each endpoint URL is probed once per draft (14, 16, 18 by default; use
+--draft to narrow), over the transport its scheme selects:
+  - moqt:// URLs: raw QUIC (moqt-NN / moq-00 ALPN)
+  - https:// URLs: H3/WebTransport (WT-Protocol)
 
 Each probe does a proper CLIENT_SETUP/SERVER_SETUP handshake and clean close.
 No bare ALPN probes, no custom protocol classes, no half-open connections.
