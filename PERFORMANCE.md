@@ -1,11 +1,6 @@
 # aiomoqt Performance & Benchmarks
 
-How to benchmark the stack, what governs latency and throughput, and
-point-in-time observed numbers. All figures here are **observations on
-specific hardware under specific conditions, not absolute capabilities**
-— kernel UDP loopback rates, CPU, and scheduler behavior move them
-substantially between platforms. Calibrate on your own hardware with
-the commands below.
+How to benchmark the stack, what governs latency and throughput, and point-in-time observed numbers. All figures are **observations on specific hardware, not absolute capabilities** (UDP loopback rate, CPU, and scheduler move them substantially) — calibrate on your own with the commands below.
 
 The transport-layer view (TX/RX dataflow, flow control, configuration
 parameters) lives in

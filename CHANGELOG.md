@@ -2,6 +2,8 @@
 
 ## v0.10.5 (unreleased)
 
+- **Requires aiopquic >= 0.3.10** (was >= 0.3.9). The paired aiopquic release;
+  no new aiopquic API is used — the floor moves so the pair installs together.
 - **Retired the `MOQT_CUR_VERSION` module constant** (closes #4 follow-up). It
   was a fixed alias for `MOQT_VERSION_DRAFT14` left over from the pre-0.10.0
   module-global version context; the four remaining read sites now reference the
@@ -16,6 +18,13 @@
   0.10.2) and updated the interop / example tables to draft-14/16/18. Trimmed
   verbose prose, reflowed needless hard wraps, and collapsed `\`-continued shell
   commands.
+- **CLI help-text accuracy.** `--draft` help in six example tools listed only
+  "14, 16" → now "14, 16, or 18"; `sub_bench -t/--duration` help said
+  "default: 30" but the default is 0 (run until the publisher closes);
+  `relay_probe`'s module docstring described the retired two-probe design → now
+  one probe per draft over the URL's transport. README example table gained the
+  missing `moq_interop_relay.py` row, and a note that `-h` is `--host` (help is
+  `-?`/`--help`).
 
 ## v0.10.4 (2026-06-26)
 
@@ -416,7 +425,7 @@ divergence reads a `DraftProfile` capability flag.
   is removed (use `draft_version=[...]`); session `_moqt_version` renamed
   `_draft`.
 
-## v0.9.12 (unreleased)
+## v0.9.12 (2026-06-21)
 
 ### SUBSCRIBE: omit default-valued params (conformant "conservative sender")
 
@@ -467,7 +476,7 @@ Pairs with aiopquic 0.3.8 (no aiopquic change). Bug-fix release.
 
 - The integration tier (which PR + main CI run) now includes `loopback_bench` smokes across **draft-14 / draft-16 × raw-QUIC / WebTransport** and an `adaptive_bench --mp-loopback` (multi-process BW pub+sub) smoke per draft. This guards our own tools against the regression classes that slipped through 0.9.7–0.9.9: session-setup / ALPN breaks (caught by the loopback_bench matrix) and the multi-process publisher/subscriber start path (caught by `--mp-loopback`, which the in-process loopback never exercised). No external relay required.
 
-## v0.9.9 (unreleased)
+## v0.9.9 (2026-06-17)
 
 Pairs with aiopquic 0.3.8 (no aiopquic change). Targeted follow-up to
 v0.9.8 fixing bench-tool regressions; examples only, no core library
@@ -493,7 +502,7 @@ change.
 
 - `relay-join` / `relay-fetch` no longer skipped wholesale: the suites run on every reachable relay so results are honest — pass where supported, fail where not — instead of hidden behind `disabled_suites`. Verified passing on moqx / moxygen / imquic (d14+d16) and cloudflare-d14 (join); the rest report real fails/timeouts.
 
-## v0.9.8 (unreleased)
+## v0.9.8 (2026-06-14)
 
 Pairs with aiopquic 0.3.8; dep floor `aiopquic>=0.3.7` → `aiopquic>=0.3.8`
 (needs 0.3.8's real-negotiated-ALPN reporting).
@@ -589,7 +598,7 @@ ring-rename catch-up).
 
 - Saturation-stress edge cases on the producer-side stream lifecycle (see aiopquic 0.3.6 Known Issues — pub-stream orphan at saturation, shutdown drain miss, `-P 8 -g 200` double-free). Sub-saturation workloads are clean; these manifest only at sustained max-rate.
 
-## v0.9.5 (unreleased)
+## v0.9.5 (2026-05-26)
 
 Pairs with [aiopquic 0.3.5](https://pypi.org/project/aiopquic/0.3.5/);
 dep floor `aiopquic>=0.3.2` → `aiopquic>=0.3.5`.

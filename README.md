@@ -148,7 +148,7 @@ python -m aiomoqt.examples.sub_example -h relay.ex.com -q
 python -m aiomoqt.examples.join_example -h relay.ex.com -q
 ```
 
-Common options: `--namespace`, `--trackname`, `--path`, `--debug`, `--keylogfile`. Every tool prints its full option set with `-?` / `--help`.
+Common options: `--namespace`, `--trackname`, `--path`, `--debug`, `--keylogfile`. Every tool prints its full option set with `-?` / `--help` (note: `-h` is `--host`, not help).
 
 ### Benchmarks
 
