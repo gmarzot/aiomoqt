@@ -11,6 +11,15 @@
   objects* failed its SUBSCRIBE with "Request timed out" and the control stream
   desynced; only the first subscriber (empty track, no largest) worked. Surfaced
   by the moqx-main d18 interop regression; covered by a new wire-layout test.
+- **Interop relay adapter honors draft confinement.** `moq_interop_relay` now
+  reads the draft from `$DRAFT` (moq-interop-runner PR #95) / `$MOQT_DRAFT`,
+  exactly like the client: a single draft confines the relay to it; when neither
+  is set (the open-relay context) it advertises all of 14/16/18 so any client
+  negotiates. Previously the relay only took `--draft` (default 16) and ignored
+  the runner's env, so a client pinned to draft-14 could not negotiate against
+  the relay (it kept offering 16/18). The docker entrypoint no longer threads
+  `--draft` (both roles read the env themselves). Works unchanged against the
+  current public runner.
 - **Requires aiopquic >= 0.3.10** (was >= 0.3.9). The paired aiopquic release;
   no new aiopquic API is used — the floor moves so the pair installs together.
 - **Retired the `MOQT_CUR_VERSION` module constant** (closes #4 follow-up). It

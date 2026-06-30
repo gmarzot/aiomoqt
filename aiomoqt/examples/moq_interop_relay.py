@@ -57,6 +57,14 @@ from aiomoqt.messages.request import RequestError
 from aiomoqt.context import is_draft16_or_later
 from aiomoqt.utils.logger import set_log_level, get_logger
 
+# Version confinement. The interop runner injects DRAFT (moq-interop-runner
+# PR #95) — or older MOQT_DRAFT — to pin the relay to one draft; the client
+# is pinned the same way, so negotiation lands on that draft. When neither is
+# set (the open-relay context, where clients offer their full version list),
+# advertise every supported draft so any client negotiates.
+_RELAY_DRAFT_DEFAULT = (os.environ.get("DRAFT")
+                        or os.environ.get("MOQT_DRAFT") or "14,16,18").strip()
+
 logger = get_logger(__name__)
 
 
@@ -179,8 +187,11 @@ def parse_args():
                              "(shares the namespace table) — lets one "
                              "instance back both remote-webtransport "
                              "(--port) and remote-quic (--quic-port)")
-    parser.add_argument("--draft", type=parse_draft_spec, default=16,
-                        help="MoQT draft version (default: 16)")
+    parser.add_argument("--draft", type=parse_draft_spec,
+                        default=parse_draft_spec(_RELAY_DRAFT_DEFAULT),
+                        help="MoQT draft(s) to serve: a single draft confines "
+                             "negotiation to it; a list offers all of them. "
+                             "Default from $DRAFT / $MOQT_DRAFT, else 14,16,18.")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug logging")
     return parser.parse_args()
