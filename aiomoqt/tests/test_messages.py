@@ -1165,6 +1165,36 @@ class TestDraft18ControlMessages:
             skip_fields={'request_id', 'content_exists', 'track_extensions'},
         )
 
+    def test_subscribe_ok_d18_largest_is_inline_location(self):
+        # d18 LARGEST_OBJECT (0x09) is a Location value: group + object
+        # varints written INLINE with NO length prefix (moxygen
+        # paramEncodingV18). Guards the regression where the generic
+        # odd-type rule read the group as a length and overran the buffer
+        # for subscribers joining a track that already has objects.
+        from aiomoqt.context import profile_for
+        prof = profile_for(18)
+        msg = SubscribeOk(
+            request_id=0, track_alias=42, group_order=GroupOrder.ASCENDING,
+            content_exists=ContentExistsCode.EXISTS,
+            largest_group_id=5, largest_object_id=200)
+        raw = bytes(msg.serialize(prof=prof).data)
+        hdr = Buffer(data=raw, vi64=prof.vi64)
+        hdr.pull_vint()                 # message Type
+        hdr.pull_uint16()               # message Length
+        body = raw[hdr.tell():]
+        w = Buffer(data=body, vi64=prof.vi64)
+        assert w.pull_vint() == 42      # track_alias (no request_id on d18 wire)
+        assert w.pull_vint() == 1       # param count
+        assert w.pull_vint() == 0x09    # LARGEST_OBJECT key (delta from 0)
+        # INLINE Location: the next bytes are the group and object varints,
+        # NOT a length prefix. A length-prefixed encoding would read 0x?? here.
+        assert w.pull_vint() == 5       # group
+        assert w.pull_vint() == 200     # object
+        rt = SubscribeOk.deserialize(Buffer(data=body, vi64=prof.vi64),
+                                     prof=prof, buf_end=len(body))
+        assert (rt.largest_group_id, rt.largest_object_id) == (5, 200)
+        assert rt.content_exists == ContentExistsCode.EXISTS
+
     # ---- PUBLISH (request) / PUBLISH_OK (reply) ----
     def test_publish_d18(self):
         assert moqt_message_serialization_versioned(
@@ -1176,6 +1206,28 @@ class TestDraft18ControlMessages:
                 'track_alias': 42,
                 'group_order': GroupOrder.ASCENDING,
                 'content_exists': ContentExistsCode.NO_CONTENT,
+                'forward': ForwardingPreference.SUBGROUP,
+                'parameters': {},
+                'track_extensions': {},
+            },
+            type_id=MOQTMessageType.PUBLISH,
+            version=self.D18,
+            skip_fields={'content_exists', 'track_extensions'},
+        )
+
+    def test_publish_d18_with_content(self):
+        # d18 Publish carrying a largest Location (inline group+object varints).
+        assert moqt_message_serialization_versioned(
+            Publish,
+            {
+                'request_id': 2,
+                'track_namespace': (b'vod',),
+                'track_name': b'movie1',
+                'track_alias': 99,
+                'group_order': GroupOrder.ASCENDING,
+                'content_exists': ContentExistsCode.EXISTS,
+                'largest_group_id': 50,
+                'largest_object_id': 200,
                 'forward': ForwardingPreference.SUBGROUP,
                 'parameters': {},
                 'track_extensions': {},

@@ -243,7 +243,7 @@ def parse_args():
     parser.add_argument('--keylogfile', type=str, default=None, help='TLS secrets file')
     parser.add_argument('--insecure', action='store_true', help='Skip TLS certificate verification')
     parser.add_argument('--auth-token', type=str, default=None, help='Auth token')
-    parser.add_argument('--draft', type=parse_draft_spec, default=None, help='MoQT draft version (e.g. 14, 16)')
+    parser.add_argument('--draft', type=parse_draft_spec, default=None, help='MoQT draft version: 14, 16, or 18')
     parser.add_argument('-P', '--streams', type=int, default=1, help='Parallel subgroup streams (default: 1)')
     parser.add_argument('-s', '--object-size', type=int, default=1024, help='Object payload size bytes (default: 1024)')
     parser.add_argument('-r', '--rate', type=float, default=30, help='Frames per second (default: 30)')

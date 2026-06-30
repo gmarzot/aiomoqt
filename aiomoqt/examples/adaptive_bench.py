@@ -1490,7 +1490,7 @@ def parse_args():
     p.add_argument("--interval", type=float, default=5.0,
                    metavar="S", help="controller tick period seconds (default: 5)")
     p.add_argument("--draft", type=parse_draft_spec, default=None,
-                   help="MoQT draft version (14 or 16)")
+                   help="MoQT draft version: 14, 16, or 18")
     p.add_argument("-n", "--namespace", default="aiomoqt",
                    help="MoQT namespace (default: aiomoqt)")
     p.add_argument("--trackname", default=None,

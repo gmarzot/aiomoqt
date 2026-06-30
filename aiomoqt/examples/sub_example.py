@@ -27,7 +27,7 @@ def parse_args():
     parser.add_argument('--keylogfile', type=str, default=None, help='TLS secrets file')
     parser.add_argument('--insecure', action='store_true', help='Skip TLS certificate verification')
     parser.add_argument('--auth-token', type=str, default=None, help='Auth token')
-    parser.add_argument('--draft', type=parse_draft_spec, default=None, help='MoQT draft version (e.g. 14, 16)')
+    parser.add_argument('--draft', type=parse_draft_spec, default=None, help='MoQT draft version: 14, 16, or 18')
     parser.add_argument('--libquicr-compat', action='store_true', help='Use libquicr filter encoding (LAPS)')
     parser.add_argument('-t', '--duration', type=int, default=120, help='Duration in seconds (default: 120)')
     parser.add_argument('--subscribe-options', type=int, default=None,

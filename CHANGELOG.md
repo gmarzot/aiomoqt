@@ -1,6 +1,50 @@
 # Changelog
 
-## v0.10.4 (unreleased)
+## v0.10.5 (unreleased)
+
+- **Fixed draft-18 `LARGEST_OBJECT` (Location) parameter codec.** At draft-18 the
+  `LARGEST_OBJECT` (0x09) parameter value is an inline Location — group + object
+  varints with no length prefix — not the d16 length-prefixed form. SubscribeOk
+  and Publish now encode/decode it inline (new `location_params` column on
+  `DraftProfile`). Previously the generic odd-type rule read the group as a length
+  and overran the buffer, so a subscriber joining a track that *already had
+  objects* failed its SUBSCRIBE with "Request timed out" and the control stream
+  desynced; only the first subscriber (empty track, no largest) worked. Surfaced
+  by the moqx-main d18 interop regression; covered by a new wire-layout test.
+- **Interop relay adapter honors draft confinement.** `moq_interop_relay` now
+  reads the draft from `$DRAFT` (moq-interop-runner PR #95) / `$MOQT_DRAFT`,
+  exactly like the client: a single draft confines the relay to it; when neither
+  is set (the open-relay context) it advertises all of 14/16/18 so any client
+  negotiates. Previously the relay only took `--draft` (default 16) and ignored
+  the runner's env, so a client pinned to draft-14 could not negotiate against
+  the relay (it kept offering 16/18). The docker entrypoint no longer threads
+  `--draft` (both roles read the env themselves). Works unchanged against the
+  current public runner.
+- **Requires aiopquic >= 0.3.10** (was >= 0.3.9). The paired aiopquic release;
+  no new aiopquic API is used — the floor moves so the pair installs together.
+- **Retired the `MOQT_CUR_VERSION` module constant** (closes #4 follow-up). It
+  was a fixed alias for `MOQT_VERSION_DRAFT14` left over from the pre-0.10.0
+  module-global version context; the four remaining read sites now reference the
+  draft-14 constant directly, so nothing implies a mutable "current" version.
+  Per-session version state is unchanged (`self._profile` / `negotiated_draft`).
+- **README accuracy + cleanup pass.** Fixed the Quick Start examples that passed
+  the removed `draft_version=` kwarg (now `supported_drafts=`). Refreshed the
+  relay-probe Quick Start with current output (draft-14/16/18 over raw QUIC and
+  H3/WT) and corrected the Relay Probe reference: dropped the removed
+  `--once`/`PROBE_ONCE`, fixed the `--interval` default (`0` = probe once), added
+  `--draft`. Removed the stale "d18 FETCH is pending" limitation (shipped in
+  0.10.2) and updated the interop / example tables to draft-14/16/18. Trimmed
+  verbose prose, reflowed needless hard wraps, and collapsed `\`-continued shell
+  commands.
+- **CLI help-text accuracy.** `--draft` help in six example tools listed only
+  "14, 16" → now "14, 16, or 18"; `sub_bench -t/--duration` help said
+  "default: 30" but the default is 0 (run until the publisher closes);
+  `relay_probe`'s module docstring described the retired two-probe design → now
+  one probe per draft over the URL's transport. README example table gained the
+  missing `moq_interop_relay.py` row, and a note that `-h` is `--host` (help is
+  `-?`/`--help`).
+
+## v0.10.4 (2026-06-26)
 
 - **Cross-draft (d14/d16/d18) microbenchmarks.** New `b8_control_roundtrip`
   times encode+decode of SUBSCRIBE / SUBSCRIBE_OK / PUBLISH / PUBLISH_OK /
@@ -28,7 +72,7 @@
   version`, `connection refused - H3/WT not supported`); the raw error +
   handshake WARNING/ERROR logs appear only under `--debug`.
 
-## v0.10.3 (unreleased)
+## v0.10.3 (2026-06-23)
 
 - **draft-18 pub-sub object delivery fixed (REQUEST_UPDATE wire format).**
   draft-18 removed the `Existing Request ID` field from `REQUEST_UPDATE`
@@ -44,7 +88,7 @@
   corners (d16/d18 × raw-QUIC / WebTransport): 3/3 subscribers, objects
   delivered. d14/d16 pub-sub is unchanged.
 
-## v0.10.2 (unreleased)
+## v0.10.2 (2026-06-23)
 
 - **draft-18 FETCH / joining-FETCH / FETCH_OK now use the request stream.**
   `fetch()`, the joining-fetch helper, and `fetch_ok()` were sending on the
@@ -62,7 +106,7 @@
   publish at the `forward=1` trigger before streaming objects, so subscribers
   receive 0 objects. Tracked for 0.10.3. d14/d16 pub-sub is unaffected.
 
-## v0.10.1 (unreleased)
+## v0.10.1 (2026-06-22)
 
 - **Preference-ordered draft probe (interop client).** A single
   `moq_interop_client` invocation now probes its `supported_drafts` in
@@ -88,7 +132,7 @@
   `--compat` still adds to whatever the endpoint contributes. Default-off for
   all other hosts (no global leniency).
 
-## v0.10.0 (unreleased)
+## v0.10.0 (2026-06-21)
 
 **draft-18 support (beta).** aiomoqt now speaks draft-18 alongside d14/d16,
 over both raw QUIC and WebTransport, built on a version-dispatch refactor
@@ -399,7 +443,7 @@ divergence reads a `DraftProfile` capability flag.
   is removed (use `draft_version=[...]`); session `_moqt_version` renamed
   `_draft`.
 
-## v0.9.12 (unreleased)
+## v0.9.12 (2026-06-21)
 
 ### SUBSCRIBE: omit default-valued params (conformant "conservative sender")
 
@@ -450,7 +494,7 @@ Pairs with aiopquic 0.3.8 (no aiopquic change). Bug-fix release.
 
 - The integration tier (which PR + main CI run) now includes `loopback_bench` smokes across **draft-14 / draft-16 × raw-QUIC / WebTransport** and an `adaptive_bench --mp-loopback` (multi-process BW pub+sub) smoke per draft. This guards our own tools against the regression classes that slipped through 0.9.7–0.9.9: session-setup / ALPN breaks (caught by the loopback_bench matrix) and the multi-process publisher/subscriber start path (caught by `--mp-loopback`, which the in-process loopback never exercised). No external relay required.
 
-## v0.9.9 (unreleased)
+## v0.9.9 (2026-06-17)
 
 Pairs with aiopquic 0.3.8 (no aiopquic change). Targeted follow-up to
 v0.9.8 fixing bench-tool regressions; examples only, no core library
@@ -476,7 +520,7 @@ change.
 
 - `relay-join` / `relay-fetch` no longer skipped wholesale: the suites run on every reachable relay so results are honest — pass where supported, fail where not — instead of hidden behind `disabled_suites`. Verified passing on moqx / moxygen / imquic (d14+d16) and cloudflare-d14 (join); the rest report real fails/timeouts.
 
-## v0.9.8 (unreleased)
+## v0.9.8 (2026-06-14)
 
 Pairs with aiopquic 0.3.8; dep floor `aiopquic>=0.3.7` → `aiopquic>=0.3.8`
 (needs 0.3.8's real-negotiated-ALPN reporting).
@@ -572,7 +616,7 @@ ring-rename catch-up).
 
 - Saturation-stress edge cases on the producer-side stream lifecycle (see aiopquic 0.3.6 Known Issues — pub-stream orphan at saturation, shutdown drain miss, `-P 8 -g 200` double-free). Sub-saturation workloads are clean; these manifest only at sustained max-rate.
 
-## v0.9.5 (unreleased)
+## v0.9.5 (2026-05-26)
 
 Pairs with [aiopquic 0.3.5](https://pypi.org/project/aiopquic/0.3.5/);
 dep floor `aiopquic>=0.3.2` → `aiopquic>=0.3.5`.

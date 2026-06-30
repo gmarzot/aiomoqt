@@ -33,7 +33,13 @@ import subprocess
 import sys
 import tempfile
 import threading
+import uuid
 from pathlib import Path
+
+# Unique per regression run. Track names embed this so every published track is
+# distinct across runs AND transports — strict relays (e.g. moqx) reject/mishandle
+# a name republished with different content, so we never reuse one.
+_RUN_ID = uuid.uuid4().hex[:8]
 
 _PRINT_LOCK = threading.Lock()
 
@@ -472,7 +478,7 @@ def _run_relay_matrix(relay: dict, enabled: set[str],
                 _dispatch("relay-ctrl-msg", "", tag, slug,
                           _relay_ctrl_msg, url, draft, insecure, compat_csv)
             if "relay-pub-sub" in enabled:
-                tn = f"rr-{rname}-{draft}"
+                tn = f"rr-{rname}-{transport}-{draft}-{_RUN_ID}"
                 _dispatch("relay-pub-sub", f"[{pub_mode}]", tag, slug,
                           lambda u, d, log: _relay_pub_sub(
                               u, d, pub_mode, insecure, compat_csv,

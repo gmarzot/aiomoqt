@@ -436,11 +436,18 @@ class SubscribeOk(MOQTMessage):
             if self.expires is not None:
                 params[ParamType.EXPIRES] = self.expires
             if self.largest_group_id is not None:
-                # LARGEST_OBJECT param (0x09, odd) = bytes(group_id varint + object_id varint)
-                lbuf = Buffer(capacity=16)
-                lbuf.push_uint_var(self.largest_group_id)
-                lbuf.push_uint_var(self.largest_object_id or 0)
-                params[ParamType.LARGEST_OBJECT] = lbuf.data_slice(0, lbuf.tell())
+                if ParamType.LARGEST_OBJECT in prof.location_params:
+                    # d18: LARGEST_OBJECT is an inline Location value —
+                    # (group, object) tuple, encoded as two bare varints.
+                    params[ParamType.LARGEST_OBJECT] = (
+                        self.largest_group_id, self.largest_object_id or 0)
+                else:
+                    # d16: LARGEST_OBJECT (0x09, odd) = length-prefixed
+                    # bytes(group_id varint + object_id varint)
+                    lbuf = Buffer(capacity=16)
+                    lbuf.push_uint_var(self.largest_group_id)
+                    lbuf.push_uint_var(self.largest_object_id or 0)
+                    params[ParamType.LARGEST_OBJECT] = lbuf.data_slice(0, lbuf.tell())
             MOQTMessage._serialize_params(payload, params, prof=prof)
             # Track Extensions (group_order goes here as extension 0x22)
             exts = dict(self.track_extensions or {})
@@ -482,11 +489,16 @@ class SubscribeOk(MOQTMessage):
         if is_draft16_or_later(prof.draft):
             params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
             expires = params.pop(ParamType.EXPIRES, None)
-            largest_raw = params.pop(ParamType.LARGEST_OBJECT, None)
-            if largest_raw is not None:
-                lbuf = Buffer(data=largest_raw)
-                largest_group_id = lbuf.pull_vint()
-                largest_object_id = lbuf.pull_vint()
+            largest = params.pop(ParamType.LARGEST_OBJECT, None)
+            if largest is not None:
+                if isinstance(largest, tuple):
+                    # d18: inline Location value (group, object)
+                    largest_group_id, largest_object_id = largest
+                else:
+                    # d16: length-prefixed bytes(group varint + object varint)
+                    lbuf = Buffer(data=largest)
+                    largest_group_id = lbuf.pull_vint()
+                    largest_object_id = lbuf.pull_vint()
                 content_exists = ContentExistsCode.EXISTS
             else:
                 content_exists = ContentExistsCode.NO_CONTENT
