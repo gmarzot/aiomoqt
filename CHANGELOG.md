@@ -2,6 +2,15 @@
 
 ## v0.10.5 (unreleased)
 
+- **Fixed draft-18 `LARGEST_OBJECT` (Location) parameter codec.** At draft-18 the
+  `LARGEST_OBJECT` (0x09) parameter value is an inline Location — group + object
+  varints with no length prefix — not the d16 length-prefixed form. SubscribeOk
+  and Publish now encode/decode it inline (new `location_params` column on
+  `DraftProfile`). Previously the generic odd-type rule read the group as a length
+  and overran the buffer, so a subscriber joining a track that *already had
+  objects* failed its SUBSCRIBE with "Request timed out" and the control stream
+  desynced; only the first subscriber (empty track, no largest) worked. Surfaced
+  by the moqx-main d18 interop regression; covered by a new wire-layout test.
 - **Requires aiopquic >= 0.3.10** (was >= 0.3.9). The paired aiopquic release;
   no new aiopquic API is used — the floor moves so the pair installs together.
 - **Retired the `MOQT_CUR_VERSION` module constant** (closes #4 follow-up). It

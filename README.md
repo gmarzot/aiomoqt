@@ -279,7 +279,7 @@ Both venvs must use the **same Python version**. C/Cython changes need a rebuild
 
 ## Known Limitations
 
-- **draft-18 is beta.** Negotiated by default (`(18, 16, 14)`, newest-first) over raw QUIC and WebTransport, with control, FETCH, and SUBGROUP object delivery validated end to end. Not yet complete: SUBSCRIBE / PUBLISH subscription-filter and largest-location still use the d16 nested form; Track-Properties extensions encode as RFC9000 varints (correct for the small values in use). draft-14 / draft-16 are unaffected and remain the stable path.
+- **draft-18 is beta.** Negotiated by default (`(18, 16, 14)`, newest-first) over raw QUIC and WebTransport, with control, FETCH, and SUBGROUP object delivery validated end to end (including subscribers that join a track which already has objects). Not yet complete: the SUBSCRIBE / PUBLISH subscription-filter still uses the d16 nested form; Track-Properties extensions encode as RFC9000 varints (correct for the small values in use). draft-14 / draft-16 are unaffected and remain the stable path.
 - **WebTransport fetch / join routing** -- four `[wt]` test variants of FETCH and JOINING_SUBSCRIBE return empty results when the underlying transport is WebTransport. Raw-QUIC variants of the same tests pass and cover the MoQT-level invariant. Tracked separately; affects WT-only consumers of fetch/join.
 
 ## TODO

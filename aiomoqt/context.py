@@ -44,6 +44,11 @@ class DraftProfile:
                                   # uint8 (not a varint): d18 FORWARD 0x10 /
                                   # SUBSCRIBER_PRIORITY 0x20 / GROUP_ORDER
                                   # 0x22. Empty for d14/d16.
+    location_params: frozenset = frozenset()
+                                  # params whose VALUE is an inline Location
+                                  # (group + object varints, no length prefix):
+                                  # d18 LARGEST_OBJECT 0x09. Empty for d14/d16
+                                  # (there LARGEST_OBJECT is length-prefixed).
 
     @property
     def vi64(self) -> bool:
@@ -75,7 +80,8 @@ PROFILES = {
             ParamType.FORWARD,
             ParamType.SUBSCRIBER_PRIORITY,
             ParamType.GROUP_ORDER,
-        })),
+        }),
+        location_params=frozenset({ParamType.LARGEST_OBJECT})),
 }
 
 

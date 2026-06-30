@@ -403,7 +403,14 @@ class MOQTMessage:
             else:
                 payload.push_vint(param_type)  # Type
 
-            if param_type % 2 == 1:  # Odd type - includes Length field
+            if param_type in prof.location_params:
+                # Inline Location value: group + object varints, no length
+                # prefix (d18 LARGEST_OBJECT 0x09). Value is a (group, object)
+                # tuple.
+                loc_group, loc_object = param_value
+                payload.push_vint(loc_group)
+                payload.push_vint(loc_object)
+            elif param_type % 2 == 1:  # Odd type - includes Length field
                 # Value is bytes or string
                 if isinstance(param_value, str):
                     param_value = param_value.encode()
@@ -471,7 +478,14 @@ class MOQTMessage:
             else:
                 param_type = raw_key
 
-            if param_type % 2 == 1:  # Odd type - includes Length field
+            if param_type in prof.location_params:
+                # Inline Location value: group + object varints, no length
+                # prefix (d18 LARGEST_OBJECT 0x09). Read both regardless of
+                # the odd/even rule; stored as a (group, object) tuple.
+                loc_group = buf.pull_vint()
+                loc_object = buf.pull_vint()
+                param_value = (loc_group, loc_object)
+            elif param_type % 2 == 1:  # Odd type - includes Length field
                 param_len = buf.pull_vint()
                 if param_len > 65535:  # 2^16-1 maximum
                     raise MOQTProtocolViolation(
