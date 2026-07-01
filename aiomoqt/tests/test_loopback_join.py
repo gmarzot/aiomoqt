@@ -8,20 +8,17 @@ case in test_loopback_fetch.py:
 Shares the loopback server harness defined in test_loopback_fetch.
 """
 import asyncio
-import os
 
 import pytest
 
 from aiomoqt.types import FetchType
 
 from aiomoqt.tests.test_loopback_fetch import (
-    FetchTestCache, _start_server, _connect_client, CERT, KEY,
+    FetchTestCache, _start_server, _connect_client,
 )
+from aiomoqt.tests._certs import requires_certs
 
-pytestmark = pytest.mark.skipif(
-    not os.path.exists(CERT) or not os.path.exists(KEY),
-    reason="TLS certs not found in certs/",
-)
+pytestmark = requires_certs
 
 
 _BASE_PORT = 14460
