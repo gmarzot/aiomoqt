@@ -1,6 +1,6 @@
 
 import pytest
-from conftest import moqt_message_serialization, moqt_test_id
+from aiomoqt.tests.conftest import moqt_message_serialization, moqt_test_id
 
 from aiomoqt.types import *
 from aiomoqt.messages import *
@@ -800,7 +800,7 @@ def test_fetch_object():
 # Draft-16 message serialization tests
 # ========================================================================
 
-from conftest import moqt_message_serialization_versioned
+from aiomoqt.tests.conftest import moqt_message_serialization_versioned
 from aiomoqt.types import MOQT_VERSION_DRAFT14, MOQT_VERSION_DRAFT16
 from aiomoqt.types import MOQT_VERSION_DRAFT18
 from aiomoqt.messages import (RequestOk, RequestError, RequestUpdate,

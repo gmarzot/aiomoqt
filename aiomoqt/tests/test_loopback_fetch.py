@@ -16,7 +16,6 @@ Test matrix:
   test_fetch_unknown_rejected  — unknown request_id → STOP_SENDING
 """
 import asyncio
-import os
 import time
 
 import pytest
@@ -31,18 +30,10 @@ from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
 from aiomoqt.messages import FetchOk, FetchCancel
 
-# ---------------------------------------------------------------------------
-# Test certs
-# ---------------------------------------------------------------------------
-_CERT_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'certs')
-CERT = os.path.realpath(os.path.join(_CERT_DIR, 'cert.pem'))
-KEY = os.path.realpath(os.path.join(_CERT_DIR, 'key.pem'))
+from aiomoqt.tests._certs import CERT, KEY, requires_certs
 
 # Skip entire module if test certs are missing
-pytestmark = pytest.mark.skipif(
-    not os.path.exists(CERT) or not os.path.exists(KEY),
-    reason="TLS certs not found in certs/",
-)
+pytestmark = requires_certs
 
 
 # ---------------------------------------------------------------------------

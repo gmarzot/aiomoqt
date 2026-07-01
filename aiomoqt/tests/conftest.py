@@ -16,9 +16,14 @@ def pytest_configure(config):
     Runs at configure time (before collection) so the modules'
     cert-existence skipif sees the freshly written certs. Best-effort:
     if openssl is missing or fails, the certs stay absent and those
-    suites skip exactly as before — no hard dependency, no failure."""
-    certs_dir = os.path.realpath(
-        os.path.join(os.path.dirname(__file__), "..", "..", "certs"))
+    suites skip exactly as before — no hard dependency, no failure.
+
+    Anchors on the pytest rootdir and exports AIOMOQT_TEST_CERTS_DIR so
+    aiomoqt.tests._certs resolves the same directory for every importer,
+    regardless of how a test module was loaded (collected top-level vs
+    cross-imported via the aiomoqt.tests package vs a site-packages copy)."""
+    certs_dir = os.path.realpath(os.path.join(str(config.rootpath), "certs"))
+    os.environ["AIOMOQT_TEST_CERTS_DIR"] = certs_dir
     cert = os.path.join(certs_dir, "cert.pem")
     key = os.path.join(certs_dir, "key.pem")
     if os.path.exists(cert) and os.path.exists(key):
