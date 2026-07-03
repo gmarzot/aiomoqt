@@ -250,6 +250,13 @@ mkdir -p certs && openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout c
 pytest aiomoqt/tests/
 ```
 
+> **Install editable (`-e`).** The standalone bench scripts and the
+> cross-importing loopback tests resolve `certs/` and sibling modules
+> relative to the working tree. A non-editable copy in site-packages
+> silently skips the loopback suites with "TLS certs not found in certs/"
+> even when the certs exist. `pytest` auto-generates `certs/` on first run;
+> the `openssl` line above is only needed for the standalone bench scripts.
+
 ### Developing against a locally built aiopquic
 
 The PyPI `aiopquic` wheel is **portable** (any CPU of the architecture). A locally compiled `aiopquic` is **host-tuned** (`-O3 -march=native -flto`, plus picotls Fusion AES-GCM on x86_64) and is measurably faster — build from source when benchmarking, optimizing, or targeting bare metal.
