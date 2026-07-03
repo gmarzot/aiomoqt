@@ -1367,8 +1367,14 @@ class _MOQTSessionMixin:
         return True
 
 
-    async def client_session_init(self, timeout: int = 10) -> bool:
-        """Initialize WebTransport and MoQT client session."""
+    async def client_session_init(self, timeout: int = 10,
+                                  parameters: Optional[Dict[int, bytes]] = None
+                                  ) -> bool:
+        """Initialize WebTransport and MoQT client session.
+
+        parameters are extra SETUP options merged into the CLIENT_SETUP /
+        Setup message — e.g. {SetupParamType.AUTH_TOKEN: b"..."} for
+        session-level auth (Token-wrapped on the wire)."""
 
         use_quic = self._session.use_quic
         params = {}
@@ -1437,6 +1443,8 @@ class _MOQTSessionMixin:
         # Option (removed), count-less Setup Options. Pre-d18 sends
         # CLIENT_SETUP with the version list.
         params[SetupParamType.IMPLEMENTATION] = USER_AGENT.encode()
+        if parameters:
+            params.update(parameters)  # caller SETUP options (e.g. AUTH_TOKEN)
         if self._profile.control_uni_pair:
             self.send_control_message(Setup(options=params))
         else:

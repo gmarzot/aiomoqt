@@ -239,6 +239,29 @@ class MOQTMessage:
         buf = Buffer(data=data)
         return buf.pull_uint_var()
 
+    @staticmethod
+    def _auth_token_wrap(value: bytes, prof: 'DraftProfile') -> bytes:
+        """Wrap an AUTH_TOKEN value in the spec Token structure (§9.2.1.1):
+        Alias Type USE_VALUE + Token Type OUT_OF_BAND + Value."""
+        tb = Buffer(capacity=BUF_SIZE, vi64=prof.vi64)
+        tb.push_vint(AuthTokenAliasType.USE_VALUE)
+        tb.push_vint(AuthTokenType.OUT_OF_BAND)
+        tb.push_bytes(bytes(value))
+        return tb.data_slice(0, tb.tell())
+
+    @staticmethod
+    def _auth_token_unwrap(raw: bytes, prof: 'DraftProfile') -> bytes:
+        """Best-effort unwrap of a Token structure to its Value. Only the
+        USE_VALUE form is unwrapped; aliased/registered forms are returned
+        as-is (the caller keeps the raw token)."""
+        if not raw:
+            return raw
+        tb = Buffer(data=raw, vi64=prof.vi64)
+        if tb.pull_vint() == AuthTokenAliasType.USE_VALUE:
+            tb.pull_vint()  # Token Type
+            return tb.pull_bytes(len(raw) - tb.tell())
+        return raw
+
     @classmethod
     def deserialize(cls, buf: Buffer,
                     buf_end: Optional[int] = None) -> 'MOQTMessage':
@@ -547,6 +570,8 @@ class MOQTMessage:
                 if not isinstance(value, (bytes, bytearray)):
                     raise TypeError(
                         f"KVP {key} expects bytes, got {type(value)}")
+                if key in (ParamType.AUTH_TOKEN, SetupParamType.AUTH_TOKEN):
+                    value = MOQTMessage._auth_token_wrap(bytes(value), prof)
                 payload.push_vint(len(value))
                 payload.push_bytes(bytes(value))
             else:  # even Type → varint Value
@@ -577,6 +602,8 @@ class MOQTMessage:
                         f"KVP value length {vlen} exceeds remaining "
                         f"{buf_end - buf.tell()}")
                 value: Any = buf.pull_bytes(vlen)
+                if key in (ParamType.AUTH_TOKEN, SetupParamType.AUTH_TOKEN):
+                    value = MOQTMessage._auth_token_unwrap(value, prof)
             else:  # even Type → varint Value
                 value = buf.pull_vint()
                 if buf.tell() > buf_end:

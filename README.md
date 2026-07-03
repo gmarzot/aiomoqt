@@ -130,6 +130,24 @@ resp = await session.subscribe('ns', 'track', wait_response=True)
 req = await session.subscribe('ns', 'track')
 ```
 
+### Auth
+
+`AUTH_TOKEN` rides the SETUP handshake (session-level) and any request message (namespace- or track-level). Values are arbitrary bytes — the codec wraps them in the spec Token structure. Read a peer's token back from the message's `parameters`.
+
+```python
+from aiomoqt.types import SetupParamType, ParamType
+
+# session auth — on the SETUP handshake
+await session.client_session_init(parameters={SetupParamType.AUTH_TOKEN: b"session-tok"})
+
+# namespace auth — on PUBLISH_NAMESPACE (or SUBSCRIBE_NAMESPACE)
+await session.publish_namespace('ns', parameters={ParamType.AUTH_TOKEN: b"ns-tok"}, wait_response=True)
+
+# track auth — on SUBSCRIBE (also FETCH / PUBLISH)
+ok = await session.subscribe('ns', 'track', parameters={ParamType.AUTH_TOKEN: b"track-tok"}, wait_response=True)
+print(ok.parameters.get(ParamType.AUTH_TOKEN))   # token echoed by the peer, if any
+```
+
 ## Examples
 
 ### Publisher / Subscriber

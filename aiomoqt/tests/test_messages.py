@@ -826,6 +826,19 @@ class TestDraft16Setup:
             version=MOQT_VERSION_DRAFT16,
         )
 
+    def test_client_setup_d16_with_auth(self):
+        # Session-level AUTH_TOKEN in d16 CLIENT_SETUP params: Token-wrapped
+        # (§9.2.1.1 USE_VALUE) and unwrapped back to the original value.
+        assert moqt_message_serialization_versioned(
+            ClientSetup,
+            {'versions': [], 'parameters': {
+                SetupParamType.AUTH_TOKEN: b'session-token',
+                SetupParamType.IMPLEMENTATION: b'test-1.0',
+            }},
+            type_id=MOQTMessageType.CLIENT_SETUP,
+            version=MOQT_VERSION_DRAFT16,
+        )
+
     def test_server_setup_d16(self):
         assert moqt_message_serialization_versioned(
             ServerSetup,
@@ -1101,6 +1114,19 @@ class TestDraft18ControlMessages:
             Setup,
             {'options': {
                 SetupParamType.MAX_REQUEST_ID: 10000,
+                SetupParamType.IMPLEMENTATION: b'test-1.0',
+            }},
+            type_id=MOQTMessageType.SETUP,
+            version=self.D18,
+        )
+
+    def test_setup_d18_with_auth(self):
+        # Session-level AUTH_TOKEN in d18 Setup options: Token-wrapped on the
+        # wire (§9.2.1.1 USE_VALUE) and unwrapped back to the original value.
+        assert moqt_message_serialization_versioned(
+            Setup,
+            {'options': {
+                SetupParamType.AUTH_TOKEN: b'session-token',
                 SetupParamType.IMPLEMENTATION: b'test-1.0',
             }},
             type_id=MOQTMessageType.SETUP,
