@@ -2,7 +2,7 @@ import asyncio
 import logging
 import time
 from asyncio import Future
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import (Callable, DefaultDict, Dict, List, Optional, Set, Tuple,
                     Type, Union)
@@ -246,6 +246,12 @@ class _MOQTSessionMixin:
         self._track_aliases: Dict[int, int] = {}  # map alias to subscription_id
         self._subscriptions: Dict[int, List] = {}  # map subscription_id to request
         self._pending_requests: Dict[int, Future[MOQTMessage]] = {}  # unified response futures
+        # Bounded record of request ids WE issued (recorded at allocation).
+        # A response for one of these with no live future is an ack we did
+        # not await — a fire-and-forget publish / publish_namespace
+        # (wait_response=False), or a late / duplicate reply — logged at
+        # DEBUG. A response for an id we never issued stays WARNING.
+        self._sent_requests: deque = deque(maxlen=1024)
 
         # Reverse maps for binding lookups. The forward direction is
         # _streams[sid].key = ('fetch', request_id) or
@@ -292,10 +298,18 @@ class _MOQTSessionMixin:
         return isinstance(msg, _MOQTSessionMixin._ERROR_TYPES)
 
     def _resolve_request(self, request_id: int, msg: MOQTMessage) -> None:
-        """Resolve a pending request future by request_id."""
+        """Resolve a pending request future by request_id.
+
+        A response for an id we issued but are not awaiting — a
+        fire-and-forget publish / publish_namespace (wait_response=False),
+        or a late / duplicate reply — is expected protocol traffic and
+        logged at DEBUG. Only a response for an id we never issued is
+        WARNING-worthy (a genuine peer/demux anomaly)."""
         future = self._pending_requests.get(request_id)
         if future and not future.done():
             future.set_result(msg)
+        elif request_id in self._sent_requests:
+            logger.debug(f"MOQT event: response for un-awaited/duplicate request_id={request_id}: {type(msg).__name__}")
         else:
             logger.warning(f"MOQT event: unsolicited response for request_id={request_id}: {type(msg).__name__}")
 
@@ -426,6 +440,7 @@ class _MOQTSessionMixin:
         """Get next available subscribe ID."""
         request_id = self._next_request_id
         self._next_request_id += 2
+        self._sent_requests.append(request_id)
         return request_id
 
     def _allocate_track_alias(self, request_id: int = 1) -> int:
@@ -2137,6 +2152,11 @@ class _MOQTSessionMixin:
             parameters=parameters or {},
         )
         logger.info(f"MOQT send: {message}")
+        # Pre-register the response future before send (like subscribe /
+        # fetch / publish_namespace) so a fast peer ack can't resolve
+        # before the awaiter registers — a race on loopback.
+        if wait_response:
+            self._pending_requests[request_id] = self._loop.create_future()
         self._send_request(request_id, message)
 
         if not wait_response:
