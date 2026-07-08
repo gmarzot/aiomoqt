@@ -2909,14 +2909,10 @@ class MOQTSessionWTServer(
             # Learn the client's draft from the WT-Protocol this server
             # selected (in-band WT-Available-Protocols -> WT-Protocol
             # negotiation, surfaced by aiopquic as negotiated_protocol).
-            # If no subprotocol was negotiated (client offered none, or no
-            # overlap), fall back to the highest supported draft.
+            # If no subprotocol was negotiated we do NOT guess a draft;
+            # negotiated_draft keeps its conservative __init__ default.
             negotiated = self.negotiated_protocol
             if negotiated:
                 self.negotiated_draft = get_major_version(
                     moqt_version_from_alpn(negotiated))
-            else:
-                supported = getattr(session, 'supported_drafts', None)
-                if supported:
-                    self.negotiated_draft = max(get_major_version(d) for d in supported)
         self._moqt_wt_finalize()

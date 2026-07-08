@@ -332,8 +332,8 @@ Contributions are welcome! Please fork the repository, create a branch, and subm
 
 ## Author
 
-Giovanni Marzot — [gmarzot@marzresearch.net](mailto:gmarzot@marzresearch.net) | [moqarean.marzresearch.net](https://moqarean.marzresearch.net)
+Giovanni Marzot — [gmarzot@marzresearch.net](mailto:gmarzot@marzresearch.net)
 
 ## Acknowledgements
 
-This project takes inspiration from, and has benefited from the great work done by the [OpenMoQ/moxygen](https://github.com/openmoq/moxygen) team, and the continued efforts of the MOQ IETF WG.
+This project takes inspiration from, and has benefited from the great work done by the [OpenMOQ/moqx](https://github.com/openmoq/moqx) and [OpenMoQ/moxygen](https://github.com/openmoq/moxygen) teams, and the continued efforts of the MOQ IETF WG.
