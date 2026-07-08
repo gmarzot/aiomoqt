@@ -10,21 +10,15 @@ clients against matching single-draft servers (no multi-offer, so this
 is independent of the picky-d14 ALPN-selector fast-follow).
 """
 import asyncio
-import os
 
 import pytest
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
 
-_CERT_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'certs')
-CERT = os.path.realpath(os.path.join(_CERT_DIR, 'cert.pem'))
-KEY = os.path.realpath(os.path.join(_CERT_DIR, 'key.pem'))
+from aiomoqt.tests._certs import CERT, KEY, requires_certs
 
-pytestmark = pytest.mark.skipif(
-    not os.path.exists(CERT) or not os.path.exists(KEY),
-    reason="TLS certs not found in certs/",
-)
+pytestmark = requires_certs
 
 _BASE_PORT = 14530
 

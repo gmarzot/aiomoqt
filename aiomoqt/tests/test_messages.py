@@ -1,6 +1,6 @@
 
 import pytest
-from conftest import moqt_message_serialization, moqt_test_id
+from aiomoqt.tests.conftest import moqt_message_serialization, moqt_test_id
 
 from aiomoqt.types import *
 from aiomoqt.messages import *
@@ -800,7 +800,7 @@ def test_fetch_object():
 # Draft-16 message serialization tests
 # ========================================================================
 
-from conftest import moqt_message_serialization_versioned
+from aiomoqt.tests.conftest import moqt_message_serialization_versioned
 from aiomoqt.types import MOQT_VERSION_DRAFT14, MOQT_VERSION_DRAFT16
 from aiomoqt.types import MOQT_VERSION_DRAFT18
 from aiomoqt.messages import (RequestOk, RequestError, RequestUpdate,
@@ -820,6 +820,19 @@ class TestDraft16Setup:
             {'versions': [], 'parameters': {
                 SetupParamType.PATH: b'/moq',
                 SetupParamType.MAX_REQUEST_ID: 10000,
+                SetupParamType.IMPLEMENTATION: b'test-1.0',
+            }},
+            type_id=MOQTMessageType.CLIENT_SETUP,
+            version=MOQT_VERSION_DRAFT16,
+        )
+
+    def test_client_setup_d16_with_auth(self):
+        # Session-level AUTH_TOKEN in d16 CLIENT_SETUP params: Token-wrapped
+        # (§9.2.1.1 USE_VALUE) and unwrapped back to the original value.
+        assert moqt_message_serialization_versioned(
+            ClientSetup,
+            {'versions': [], 'parameters': {
+                SetupParamType.AUTH_TOKEN: b'session-token',
                 SetupParamType.IMPLEMENTATION: b'test-1.0',
             }},
             type_id=MOQTMessageType.CLIENT_SETUP,
@@ -1101,6 +1114,19 @@ class TestDraft18ControlMessages:
             Setup,
             {'options': {
                 SetupParamType.MAX_REQUEST_ID: 10000,
+                SetupParamType.IMPLEMENTATION: b'test-1.0',
+            }},
+            type_id=MOQTMessageType.SETUP,
+            version=self.D18,
+        )
+
+    def test_setup_d18_with_auth(self):
+        # Session-level AUTH_TOKEN in d18 Setup options: Token-wrapped on the
+        # wire (§9.2.1.1 USE_VALUE) and unwrapped back to the original value.
+        assert moqt_message_serialization_versioned(
+            Setup,
+            {'options': {
+                SetupParamType.AUTH_TOKEN: b'session-token',
                 SetupParamType.IMPLEMENTATION: b'test-1.0',
             }},
             type_id=MOQTMessageType.SETUP,

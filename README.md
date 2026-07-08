@@ -130,6 +130,24 @@ resp = await session.subscribe('ns', 'track', wait_response=True)
 req = await session.subscribe('ns', 'track')
 ```
 
+### Auth
+
+`AUTH_TOKEN` rides the SETUP handshake (session-level) and any request message (namespace- or track-level). Values are arbitrary bytes — the codec wraps them in the spec Token structure. Read a peer's token back from the message's `parameters`.
+
+```python
+from aiomoqt.types import SetupParamType, ParamType
+
+# session auth — on the SETUP handshake
+await session.client_session_init(parameters={SetupParamType.AUTH_TOKEN: b"session-tok"})
+
+# namespace auth — on PUBLISH_NAMESPACE (or SUBSCRIBE_NAMESPACE)
+await session.publish_namespace('ns', parameters={ParamType.AUTH_TOKEN: b"ns-tok"}, wait_response=True)
+
+# track auth — on SUBSCRIBE (also FETCH / PUBLISH)
+ok = await session.subscribe('ns', 'track', parameters={ParamType.AUTH_TOKEN: b"track-tok"}, wait_response=True)
+print(ok.parameters.get(ParamType.AUTH_TOKEN))   # token echoed by the peer, if any
+```
+
 ## Examples
 
 ### Publisher / Subscriber
@@ -250,6 +268,13 @@ mkdir -p certs && openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout c
 pytest aiomoqt/tests/
 ```
 
+> **Install editable (`-e`).** The standalone bench scripts and the
+> cross-importing loopback tests resolve `certs/` and sibling modules
+> relative to the working tree. A non-editable copy in site-packages
+> silently skips the loopback suites with "TLS certs not found in certs/"
+> even when the certs exist. `pytest` auto-generates `certs/` on first run;
+> the `openssl` line above is only needed for the standalone bench scripts.
+
 ### Developing against a locally built aiopquic
 
 The PyPI `aiopquic` wheel is **portable** (any CPU of the architecture). A locally compiled `aiopquic` is **host-tuned** (`-O3 -march=native -flto`, plus picotls Fusion AES-GCM on x86_64) and is measurably faster — build from source when benchmarking, optimizing, or targeting bare metal.
@@ -307,8 +332,8 @@ Contributions are welcome! Please fork the repository, create a branch, and subm
 
 ## Author
 
-Giovanni Marzot — [gmarzot@marzresearch.net](mailto:gmarzot@marzresearch.net) | [moqarean.marzresearch.net](https://moqarean.marzresearch.net)
+Giovanni Marzot — [gmarzot@marzresearch.net](mailto:gmarzot@marzresearch.net)
 
 ## Acknowledgements
 
-This project takes inspiration from, and has benefited from the great work done by the [OpenMoQ/moxygen](https://github.com/openmoq/moxygen) team, and the continued efforts of the MOQ IETF WG.
+This project takes inspiration from, and has benefited from the great work done by the [OpenMOQ/moqx](https://github.com/openmoq/moqx) and [OpenMoQ/moxygen](https://github.com/openmoq/moxygen) teams, and the continued efforts of the MOQ IETF WG.

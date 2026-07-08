@@ -16,7 +16,6 @@ Parametrized over both transports: d18 control now runs over raw QUIC and
 WebTransport (the uni-pair bring-up is transport-aware).
 """
 import asyncio
-import os
 
 import pytest
 
@@ -26,14 +25,9 @@ from aiomoqt.messages.track import SubgroupHeader
 from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
 
-_CERT_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'certs')
-CERT = os.path.realpath(os.path.join(_CERT_DIR, 'cert.pem'))
-KEY = os.path.realpath(os.path.join(_CERT_DIR, 'key.pem'))
+from aiomoqt.tests._certs import CERT, KEY, requires_certs
 
-pytestmark = pytest.mark.skipif(
-    not os.path.exists(CERT) or not os.path.exists(KEY),
-    reason="TLS certs not found in certs/",
-)
+pytestmark = requires_certs
 
 _BASE_PORT = 14490
 _N_OBJECTS = 6
