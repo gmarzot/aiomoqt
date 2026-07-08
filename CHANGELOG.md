@@ -4,6 +4,16 @@
 
 Pairs with aiopquic 0.3.11.
 
+- **Fixed WebTransport auto-draft negotiation falling back to draft-14.**
+  An unpinned (multi-draft) WT client resolved its draft from the negotiated
+  WT-Protocol subprotocol, but had no fallback when the peer negotiated none
+  (e.g. a draft-18-only relay that doesn't do in-band WT-Available-Protocols
+  selection). It silently kept the conservative draft-14 `__init__` default
+  and sent a draft-14/16 `CLIENT_SETUP` (type `0x20`), which a draft-18 peer
+  rejects (`InvalidMessage`), so the session never established. The client now
+  defaults to the **highest offered draft** when no WT-Protocol is negotiated,
+  mirroring the WT server path. Regression introduced with the draft-18
+  support in 0.10.0; surfaced against Cloudflare moq-rs `draft-18-dev`.
 - **Fixed a false "unsolicited response" warning for fire-and-forget
   requests.** A `publish` / `publish_namespace` sent with the default
   `wait_response=False` registers no response future, so a
