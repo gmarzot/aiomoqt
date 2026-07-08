@@ -1437,23 +1437,6 @@ class _MOQTSessionMixin:
                     logger.info(
                         f"MOQT: version set from WT-Protocol: "
                         f"{negotiated} -> draft-{self.negotiated_draft}")
-                else:
-                    # No WT-Protocol subprotocol negotiated (the peer
-                    # selected none, or does not do in-band
-                    # WT-Available-Protocols negotiation — e.g. a d18-only
-                    # relay). Default to the HIGHEST offered draft, mirroring
-                    # the WT server path (MOQTSessionWTServer), instead of
-                    # leaving the conservative d14 __init__ default — which
-                    # would send a d14/d16 CLIENT_SETUP (0x20) that a d18-only
-                    # peer rejects (InvalidMessage).
-                    supported = getattr(
-                        self._session, 'supported_drafts', None)
-                    if supported:
-                        self.negotiated_draft = max(
-                            get_major_version(d) for d in supported)
-                        logger.info(
-                            "MOQT: no WT-Protocol negotiated; defaulting to "
-                            f"highest offered draft-{self.negotiated_draft}")
             if self._profile.control_uni_pair:
                 # d18 over WT: control is a uni-stream pair, same as raw
                 # QUIC — open our write-control uni (WT create_stream); the
