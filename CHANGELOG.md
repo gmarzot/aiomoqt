@@ -1,6 +1,40 @@
 # Changelog
 
-## v0.10.5 (unreleased)
+## v0.10.6
+
+Pairs with aiopquic 0.3.11.
+
+- **Fixed a false "unsolicited response" warning for fire-and-forget
+  requests.** A `publish` / `publish_namespace` sent with the default
+  `wait_response=False` registers no response future, so a
+  protocol-compliant peer's single, correct `REQUEST_OK` had nothing to
+  resolve and was logged as `unsolicited response for request_id=N` — a
+  false alarm, not a wire/peer fault. `_resolve_request` now classifies:
+  a response for an id we issued but are not awaiting (a fire-and-forget
+  ack, or a late/duplicate reply) logs at DEBUG; only a response for an id
+  we never issued WARNs. `publish` also now pre-registers its response
+  future when `wait_response=True` (it did not), closing a latent loopback
+  race where a fast ack could resolve before the awaiter registered —
+  consistent with `subscribe` / `fetch` / `publish_namespace`. New
+  `tests/test_request_lifecycle.py` (22 tests) covers request-id
+  allocation, the three-way classification, `_await_response`
+  success / error / timeout / race, `wait_response` vs fire-and-forget for
+  both publish paths, and per-draft response correlation (d14/d16 carry the
+  Request ID in-band; d18 omits it and correlates by the request stream).
+- **Session-level `AUTH_TOKEN` on SETUP.**
+  `client_session_init(parameters=...)` now carries an `AUTH_TOKEN`
+  parameter on the control-plane SETUP; README gains an auth example. MoQT
+  authorization is control-plane only (session / namespace / track); there
+  is no per-object auth.
+- **Import-mode-independent test cert resolution.** Test / loopback
+  certificate lookup no longer depends on how the package was imported.
+- **Requires aiopquic >= 0.3.11** (was >= 0.3.10) — the paired release,
+  which carries the WebTransport TX use-after-free fix. The floor moves so
+  the pair installs together.
+- **Docs:** README note that an editable install is required for the
+  test / bench workflow.
+
+## v0.10.5 (2026-06-30)
 
 - **Fixed draft-18 `LARGEST_OBJECT` (Location) parameter codec.** At draft-18 the
   `LARGEST_OBJECT` (0x09) parameter value is an inline Location — group + object
