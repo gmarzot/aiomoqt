@@ -220,6 +220,11 @@ class _MOQTSessionMixin:
         # task, parser, binding-key, and forensic counter into one
         # slotted object. See class docstring above.
         self._data_streams: Dict[int, _DataStreamState] = {}
+        # Per control/request stream reassembly accumulator — a control
+        # message can arrive split across StreamDataReceived events, so
+        # bytes are held here until whole messages can be parsed (mirror
+        # of the data-plane _data_streams chain).
+        self._control_chains: Dict[int, StreamChain] = {}
         # Tombstone map: stream_ids whose state was popped in response
         # to RESET / STOP_SENDING / UNSUBSCRIBE / SubscribeDone teardown.
         # _on_stream_data drops chunks for these — the publisher's
@@ -505,20 +510,12 @@ class _MOQTSessionMixin:
             hdr_len = buf.tell() - start_pos
             end_pos = start_pos + hdr_len + msg_len
             if buf.tell() + msg_len > buf_len:
-                # Truncated chunk — the message claims more payload
-                # than we have. Per-event control parsing currently
-                # assumes whole messages per chunk; if the relay
-                # fragments, we surface a clear error and dump the
-                # buffer rather than asserting.
-                head_hex = buf.data_slice(
-                    start_pos, min(start_pos + 64, buf_len)).hex()
-                logger.error(
-                    "MOQT control: truncated msg type=0x%x msg_len=%d "
-                    "tell=%d buf_len=%d head_hex=%s",
-                    int(msg_type), msg_len, buf.tell(), buf_len, head_hex,
-                )
-                buf.seek(buf_len)
-                return None
+                # Partial body — the message spans more than this chunk
+                # holds. Signal the drain loop (via underflow) to retain
+                # the bytes and reassemble on the next StreamDataReceived
+                # event, rather than treating a fragmented control message
+                # as a protocol error.
+                raise MOQTUnderflow(buf.tell(), msg_len)
             # Resolve the message type. RFC9000 drafts keep the lenient
             # enum-coercion + skip-unknown surface. vi64 drafts (d18) let
             # the per-draft CONTROL_REGISTRY be the authority — renumbered
@@ -564,6 +561,11 @@ class _MOQTSessionMixin:
 
             return msg
 
+        except (MOQTUnderflow, BufferReadError):
+            # Partial control message split across StreamDataReceived
+            # events — not an error. Propagate silently so the caller
+            # (_on_control_data) rewinds and awaits the next chunk.
+            raise
         except MOQTProtocolViolation as e:
             logger.error(
                 f"handle_control_message: protocol violation: "
@@ -633,6 +635,7 @@ class _MOQTSessionMixin:
         resolves any fetch-completion future, and unbinds the
         reverse-map entry."""
         state = self._data_streams.pop(stream_id, None)
+        self._control_chains.pop(stream_id, None)
         self._mark_stream_torn_down(stream_id)
         key = state.key if state is not None else None
         if key and len(key) == 2 and key[0] == 'fetch':
@@ -1125,19 +1128,50 @@ class _MOQTSessionMixin:
             self.on_object_received(msg, consumed, now, msg.group_id, None)
         return msg
 
-    def _drain_control_buffer(self, msg_buf: Buffer, msg_len: int) -> None:
-        """Parse every whole control message in one event's buffer.
-        Shared by the d14/d16 bidi control stream and the d18 uni control
+    def _on_control_data(self, stream_id: int, data, end_stream: bool,
+                         *, is_request_bidi: bool = False) -> None:
+        """Accumulate a control/request stream's bytes and parse every WHOLE
+        control message, retaining any partial trailing message for the next
+        StreamDataReceived event. Mirrors the data-plane _on_stream_data /
+        _drain_stream save/rollback/commit reassembly so a control message
+        fragmented across events (even mid-header) is reassembled instead of
+        crashing on a short read. Serves the d18 uni control stream, the d18
+        request bidi streams (is_request_bidi), and the d14/d16 bidi control
         stream."""
-        while msg_buf.tell() < msg_len:
-            msg = self._moqt_handle_control_message(msg_buf)
+        chain = self._control_chains.get(stream_id)
+        if chain is None:
+            chain = StreamChain()
+            self._control_chains[stream_id] = chain
+        if data:
+            chain.extend(data)
+        while chain.capacity > 0:
+            request_id = (self._bidi_stream_requests.get(stream_id)
+                          if is_request_bidi else None)
+            chain.save()
+            try:
+                msg = self._moqt_handle_control_message(
+                    chain, request_id=request_id)
+            except (MOQTUnderflow, BufferReadError):
+                chain.rollback()   # partial message — await the next chunk
+                return
             if msg is None:
-                error = (f"control stream: parsing failed at position: "
-                         f"{msg_buf.tell()} of {msg_len} bytes")
-                logger.error(f"MOQT error: " + error)
+                error = (f"control stream({stream_id}): parse failed at "
+                         f"{chain.tell()} of {chain.capacity} bytes")
+                logger.error(f"MOQT error: {error}")
                 self._close_session(
                     SessionCloseCode.PROTOCOL_VIOLATION, error)
-                break
+                return
+            chain.commit()
+            # The first request-opener on a bidi request stream binds it to
+            # its Request ID; later replies demux by the bound stream.
+            if (is_request_bidi and
+                    self._bidi_stream_requests.get(stream_id) is None and
+                    isinstance(msg, self._REQUEST_OPENERS) and
+                    getattr(msg, 'request_id', None) is not None):
+                self._bidi_stream_requests[stream_id] = msg.request_id
+                self._bidi_streams[msg.request_id] = stream_id
+        if end_stream:
+            self._control_chains.pop(stream_id, None)
 
     @staticmethod
     def _d18_peek_is_setup(data) -> bool:
@@ -1152,16 +1186,6 @@ class _MOQTSessionMixin:
         except Exception:
             return False
 
-    def _d18_handle_control_uni(self, data, end_stream: bool) -> None:
-        """Route a d18 control (uni) stream's bytes to the control parser.
-        Each event is assumed to carry whole control messages, matching the
-        d14/d16 bidi control assumption."""
-        if not isinstance(data, (bytes, bytearray)):
-            data = bytes(data)
-        if not data:
-            return
-        msg_buf = Buffer(data=data)
-        self._drain_control_buffer(msg_buf, msg_buf.capacity)
 
     # primary event handling for all QUIC messaging
     def quic_event_received(self, event: QuicEvent) -> None:
@@ -1250,25 +1274,26 @@ class _MOQTSessionMixin:
                         logger.debug(
                             f"MOQT: bound d18 control read-uni: {stream_id}")
                     if stream_id == self._d18_control_read_sid:
-                        self._d18_handle_control_uni(data, event.end_stream)
+                        self._on_control_data(
+                            stream_id, data, event.end_stream)
                         return
                 self._on_stream_data(
                     stream_id, data, event.end_stream)
                 return
 
-            # Bidi/control: small messages. aiopquic delivers memoryview;
-            # Buffer wants bytes for now.
-            if not isinstance(data, (bytes, bytearray)):
-                data = bytes(data)
-            msg_buf = Buffer(data=data)
-            msg_len = msg_buf.capacity
-            logger.debug(f"MOQT event: StreamDataReceived: stream: {stream_id} len: {msg_len}")
+            # Bidi streams: d18 request streams, or the d14/d16 control
+            # stream + d16 request streams. All parse control messages via
+            # the reassembling chain ingest (_on_control_data).
+            logger.debug(
+                f"MOQT event: StreamDataReceived: stream: {stream_id} "
+                f"len: {len(data)}")
 
             # d18: control is a uni pair, so every bidi stream is a request
             # stream (SUBSCRIBE/FETCH/...). Pre-d18 the first bidi stream is
             # latched as the single control stream.
             if self._profile.control_uni_pair:
-                self._handle_bidi_stream(stream_id, msg_buf, msg_len)
+                self._on_control_data(stream_id, data, event.end_stream,
+                                      is_request_bidi=True)
                 return
 
             if self._control_stream_id is None:
@@ -1276,13 +1301,14 @@ class _MOQTSessionMixin:
                 logger.debug(f"QUIC event: detecting control stream: {stream_id}")
             elif stream_id != self._control_stream_id:
                 if is_draft16_or_later(self.negotiated_draft):
-                    self._handle_bidi_stream(stream_id, msg_buf, msg_len)
+                    self._on_control_data(stream_id, data, event.end_stream,
+                                          is_request_bidi=True)
                     return
                 logger.warning(f"MOQT event: unrecognized bidirectional stream({stream_id})")
                 return
 
             if stream_id == self._control_read_stream_id:
-                self._drain_control_buffer(msg_buf, msg_len)
+                self._on_control_data(stream_id, data, event.end_stream)
                 return
 
         elif isinstance(event, DatagramFrameReceived) and self._wt_session_setup.done():
@@ -1321,6 +1347,7 @@ class _MOQTSessionMixin:
         for stream_id in list(self._data_streams.keys()):
             self._mark_stream_torn_down(stream_id)
         self._data_streams.clear()
+        self._control_chains.clear()
 
         if not self._wt_session_setup.done():
             self._wt_session_setup.set_result(False)
@@ -1717,27 +1744,6 @@ class _MOQTSessionMixin:
     _REQUEST_OPENERS = (Subscribe, Fetch, Publish, TrackStatus,
                         PublishNamespace, SubscribeNamespace, SubscribeTracks)
 
-    def _handle_bidi_stream(self, stream_id: int, buf: Buffer, buf_len: int) -> None:
-        """Handle request bidirectional stream messages. The first message
-        is a request opener (carries the Request ID) and binds the stream;
-        subsequent messages are responses, demuxed by the bound stream.
-        aiopquic delivers clean MoQT payload either way — WT prefix is
-        stripped in C; raw QUIC has no prefix.
-        """
-        request_id = self._bidi_stream_requests.get(stream_id)
-        if request_id is not None:
-            while buf.tell() < buf_len:
-                msg = self._moqt_handle_control_message(
-                    buf, request_id=request_id)
-                if msg is None:
-                    break
-            return
-
-        msg = self._moqt_handle_control_message(buf)
-        if (msg is not None and isinstance(msg, self._REQUEST_OPENERS) and
-                getattr(msg, 'request_id', None) is not None):
-            self._bidi_stream_requests[stream_id] = msg.request_id
-            self._bidi_streams[msg.request_id] = stream_id
 
     def send_dgram_message(self, buf: Buffer) -> None:
         """Send a MoQT message via QUIC datagram (best-effort)."""
