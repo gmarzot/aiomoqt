@@ -10,6 +10,8 @@ the control uni by peeking SETUP). Regression for the moq-dev-rs →
 aiomoqt-relay "control task failed with exception: control stream not
 initialized" interop failure.
 """
+import asyncio
+
 import pytest
 
 from aiomoqt.protocol import _MOQTSessionMixin
@@ -108,3 +110,33 @@ def test_ready_stream_sends_immediately():
     s.send_control_message(msg)
     assert s._writes == [(3, _wire(msg, s._profile))]
     assert s._pending_control_msgs == []
+
+
+async def test_d18_setup_handler_flushes_deferred_reply():
+    # The real race, through the real handler: _handle_d18_setup suspends
+    # at open_uni_stream (a WT round-trip in production); a reply fired
+    # during that window defers; when the open completes the handler
+    # sends SETUP and flushes — SETUP first on the stream.
+    s = _send_session(18)
+    s.is_client = False   # server (property falls through the stub _quic)
+    s._moqt_session_setup = asyncio.get_running_loop().create_future()
+    hold = asyncio.Event()
+
+    async def _held_open():
+        await hold.wait()
+        return 9
+
+    s.open_uni_stream = _held_open
+    task = asyncio.create_task(s._handle_d18_setup(Setup(options={})))
+    await asyncio.sleep(0)                      # suspend at the open
+    reply = RequestOk(request_id=7, parameters={})
+    s.send_control_message(reply)               # races the bring-up
+    assert s._writes == []                      # deferred, not raised
+    assert len(s._pending_control_msgs) == 1
+
+    hold.set()
+    await task
+    assert [w[0] for w in s._writes] == [9, 9]  # both on the write-uni
+    assert s._writes[1][1] == _wire(reply, s._profile)   # reply AFTER SETUP
+    assert s._pending_control_msgs == []
+    assert s._moqt_session_setup.done()

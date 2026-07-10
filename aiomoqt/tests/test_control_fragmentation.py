@@ -13,7 +13,7 @@ from collections import deque
 
 import pytest
 
-from aiomoqt.protocol import _MOQTSessionMixin, SessionCloseCode
+from aiomoqt.protocol import _MOQTSessionMixin
 from aiomoqt.messages.request import RequestOk
 from aiomoqt.context import profile_for
 
@@ -113,6 +113,23 @@ async def test_two_messages_one_event(draft):
         prof=s._profile).data)
     s._on_control_data(0, one + one, False)
     assert len(parsed) == 2        # both whole messages drained
+    assert s._closed == []
+
+
+@pytest.mark.parametrize("draft", [16, 18])
+async def test_request_bidi_split_reassembles(draft):
+    # The request bidi streams take the same reassembly path: a reply
+    # split across events on a bound request stream reassembles.
+    s = _control_session(draft)
+    parsed = _spy_parses(s)
+    s._bidi_stream_requests[5] = 7   # stream bound to request 7
+    wire = bytes(RequestOk(request_id=7, parameters={}).serialize(
+        prof=s._profile).data)
+    s._on_control_data(5, wire[:2], False, is_request_bidi=True)
+    assert parsed == []
+    assert s._closed == []
+    s._on_control_data(5, wire[2:], False, is_request_bidi=True)
+    assert len(parsed) == 1
     assert s._closed == []
 
 

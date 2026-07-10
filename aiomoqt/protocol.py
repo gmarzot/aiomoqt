@@ -230,6 +230,10 @@ class _MOQTSessionMixin:
         # handler; replies to a pipelined client can race it). Flushed
         # right after our SETUP goes out.
         self._pending_control_msgs: List[MOQTMessage] = []
+        # Undecided d18 uni-stream classification prefixes: a peer may
+        # split even the stream-type vint across packets, so the first
+        # bytes are held here until SETUP-or-data can be decided.
+        self._uni_peek_stash: Dict[int, bytes] = {}
         # Tombstone map: stream_ids whose state was popped in response
         # to RESET / STOP_SENDING / UNSUBSCRIBE / SubscribeDone teardown.
         # _on_stream_data drops chunks for these — the publisher's
@@ -1179,17 +1183,19 @@ class _MOQTSessionMixin:
             self._control_chains.pop(stream_id, None)
 
     @staticmethod
-    def _d18_peek_is_setup(data) -> bool:
-        """True if a uni stream's leading bytes are the d18 control stream
-        type (SETUP, vi64 0x2F00). Non-consuming."""
+    def _d18_peek_is_setup(data) -> Optional[bool]:
+        """Classify a uni stream's leading bytes against the d18 control
+        stream type (SETUP, vi64 0x2F00). True/False once decidable;
+        None = not enough bytes yet (a vi64 needs up to 8 — a peer may
+        split even the type across packets). Non-consuming."""
         if not data:
-            return False
+            return None
         if not isinstance(data, (bytes, bytearray)):
             data = bytes(data)
         try:
             return Buffer(data=data).pull_uint_vi64() == MOQTMessageType.SETUP
         except Exception:
-            return False
+            return None if len(data) < 8 else False
 
 
     # primary event handling for all QUIC messaging
@@ -1274,10 +1280,26 @@ class _MOQTSessionMixin:
             if stream_is_unidirectional(stream_id):
                 if self._profile.control_uni_pair:
                     if (self._d18_control_read_sid is None and
-                            self._d18_peek_is_setup(data)):
-                        self._d18_control_read_sid = stream_id
-                        logger.debug(
-                            f"MOQT: bound d18 control read-uni: {stream_id}")
+                            stream_id not in self._data_streams and
+                            stream_id not in self._stream_torn_down):
+                        # Classification is sticky: once a stream has
+                        # been routed to the data path it is never
+                        # re-peeked (a later chunk could coincidentally
+                        # start with the SETUP type).
+                        stash = self._uni_peek_stash.pop(stream_id, None)
+                        if stash:
+                            data = stash + bytes(data)
+                        verdict = self._d18_peek_is_setup(data)
+                        if verdict is None:
+                            # Type vint split mid-encoding — hold the
+                            # prefix and classify when more arrives.
+                            if not event.end_stream:
+                                self._uni_peek_stash[stream_id] = bytes(data)
+                            return
+                        if verdict:
+                            self._d18_control_read_sid = stream_id
+                            logger.debug(
+                                f"MOQT: bound d18 control read-uni: {stream_id}")
                     if stream_id == self._d18_control_read_sid:
                         self._on_control_data(
                             stream_id, data, event.end_stream)
@@ -1354,6 +1376,7 @@ class _MOQTSessionMixin:
         self._data_streams.clear()
         self._control_chains.clear()
         self._pending_control_msgs.clear()
+        self._uni_peek_stash.clear()
 
         if not self._wt_session_setup.done():
             self._wt_session_setup.set_result(False)
