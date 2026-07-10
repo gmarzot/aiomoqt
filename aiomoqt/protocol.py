@@ -225,6 +225,11 @@ class _MOQTSessionMixin:
         # bytes are held here until whole messages can be parsed (mirror
         # of the data-plane _data_streams chain).
         self._control_chains: Dict[int, StreamChain] = {}
+        # Control messages generated before the control write stream is
+        # up (the d18 server opens its write-uni inside the SETUP
+        # handler; replies to a pipelined client can race it). Flushed
+        # right after our SETUP goes out.
+        self._pending_control_msgs: List[MOQTMessage] = []
         # Tombstone map: stream_ids whose state was popped in response
         # to RESET / STOP_SENDING / UNSUBSCRIBE / SubscribeDone teardown.
         # _on_stream_data drops chunks for these — the publisher's
@@ -1348,6 +1353,7 @@ class _MOQTSessionMixin:
             self._mark_stream_torn_down(stream_id)
         self._data_streams.clear()
         self._control_chains.clear()
+        self._pending_control_msgs.clear()
 
         if not self._wt_session_setup.done():
             self._wt_session_setup.set_result(False)
@@ -1503,6 +1509,9 @@ class _MOQTSessionMixin:
                 versions=versions,
                 parameters=params
             )
+        # SETUP is on the wire; release anything deferred while the
+        # control write stream was coming up.
+        self._flush_pending_control()
 
         # Wait for SERVER_SETUP
         session_setup = False
@@ -1657,15 +1666,30 @@ class _MOQTSessionMixin:
         check session-level closed/torn-down here."""
         return self._session_writable()
 
+    _PENDING_CONTROL_MAX = 128
+
     def send_control_message(self, msg: MOQTMessage) -> None:
         """Serialize and send a MoQT control message on the control
         stream. Serialization happens here at the session's negotiated
         profile (`self._profile`), so call sites pass the message object
         and never thread prof= — they cannot forget it or pass the wrong
-        one."""
-        if self._quic is None or self._control_write_stream_id is None:
+        one. While the control write stream is still coming up (the d18
+        server opens its write-uni inside the SETUP handler, so replies
+        to a pipelined client can race it), the message is deferred and
+        flushed right after our SETUP so SETUP stays the first message
+        on the control stream."""
+        if self._quic is None:
             raise MOQTException(SessionCloseCode.INTERNAL_ERROR,
-                                "control stream not initialized")
+                                "session not initialized")
+        if self._control_write_stream_id is None:
+            if len(self._pending_control_msgs) >= self._PENDING_CONTROL_MAX:
+                raise MOQTException(SessionCloseCode.INTERNAL_ERROR,
+                                    "control stream not initialized")
+            logger.debug(
+                f"MOQT send: deferred until control write stream is up: "
+                f"{msg}")
+            self._pending_control_msgs.append(msg)
+            return
         buf = msg.serialize(prof=self._profile)
         logger.debug(f"QUIC send: control message: {buf.tell()} bytes")
         self._quic.send_stream_data(
@@ -1673,6 +1697,13 @@ class _MOQTSessionMixin:
             data=buf.data,
             end_stream=False
         )
+
+    def _flush_pending_control(self) -> None:
+        """Send control messages deferred while the control write stream
+        was coming up. Call sites run this right after SETUP is written,
+        keeping SETUP the first message on the control stream."""
+        while self._pending_control_msgs:
+            self.send_control_message(self._pending_control_msgs.pop(0))
 
     def send_stream_message(self, stream_id: int, msg: MOQTMessage) -> None:
         """Serialize and send a MoQT message on a per-request bidi
@@ -2698,6 +2729,9 @@ class _MOQTSessionMixin:
                 f"{self._d18_control_write_sid}")
             self.send_control_message(Setup(options={
                 SetupParamType.IMPLEMENTATION: USER_AGENT.encode()}))
+            # Replies that raced the write-uni bring-up were deferred;
+            # SETUP is on the wire, so release them now.
+            self._flush_pending_control()
         if not self._moqt_session_setup.done():
             self._moqt_session_setup.set_result(True)
 
