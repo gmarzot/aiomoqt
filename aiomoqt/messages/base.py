@@ -151,8 +151,9 @@ class MOQTMessage:
         exts = {}
         while buf.tell() < exts_end:
             kvp_start = buf.tell()
-            # BufferReadError (aliased as MOQTUnderflow) means the
-            # underlying buffer ran out mid-pull. For data streams
+            # A short read here (BufferReadError from Buffer,
+            # StreamUnderflow/MOQTUnderflow from StreamChain — distinct
+            # classes) means the source ran out mid-pull. For data streams
             # (with_length=True) the caller's re-buffering path uses
             # this to wait for more data, so let it propagate.
             # For control messages (with_length=False) the buffer is
@@ -171,7 +172,7 @@ class MOQTMessage:
                     # odd type → length-prefixed bytes value
                     value_len = buf.pull_uint_var()
                     ext_value = buf.pull_bytes(value_len)
-            except BufferReadError:
+            except (BufferReadError, MOQTUnderflow):
                 if with_length:
                     raise
                 # Trailing extensions block on a control message is

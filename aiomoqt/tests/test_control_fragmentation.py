@@ -133,6 +133,73 @@ async def test_request_bidi_split_reassembles(draft):
     assert s._closed == []
 
 
+# --- exception taxonomy: malformation is not fragmentation -----------------
+# The declared-length guard is the ONLY legitimate "wait for more bytes"
+# signal. Once a message's full declared body is present, a short read
+# inside deserialize means the peer sent a malformed body — waiting for
+# more bytes would stall the control stream forever.
+
+@pytest.mark.parametrize("draft", [14, 16, 18])
+async def test_malformed_body_closes_not_stalls(draft):
+    # Draft-portable malformation: declare a zero-length body — the frame
+    # is complete per the header, but every draft's decoder must pull at
+    # least the request_id, which reads past the declared end.
+    from aiomoqt.utils.buffer import Buffer
+    s = _control_session(draft)
+    parsed = _spy_parses(s)
+    wire = bytes(RequestOk(request_id=7, parameters={}).serialize(
+        prof=s._profile).data)
+    hdr = Buffer(data=wire)
+    hdr.vi64 = s._profile.vi64
+    hdr.pull_vint()
+    hdr.pull_uint16()
+    wire = wire[:hdr.tell() - 2] + b"\x00\x00"   # type + len=0, no body
+    s._on_control_data(0, wire, False)
+    assert parsed == []
+    assert s._closed                # protocol violation, not a silent wait
+
+
+async def test_peek_nine_byte_vi64():
+    # vi64 encodes in up to NINE bytes (0xFF prefix + 8); d18 decoders
+    # must accept non-minimal encodings. An 8-byte prefix of a 9-byte
+    # SETUP type is undecidable (None), never False.
+    from aiomoqt.types import MOQTMessageType
+    nine = b"\xff" + int(MOQTMessageType.SETUP).to_bytes(8, "big")
+    peek = _MOQTSessionMixin._d18_peek_is_setup
+    assert peek(nine[:8]) is None
+    assert peek(nine) is True
+    assert peek(b"\xff" + (12345).to_bytes(8, "big")) is False
+
+
+def _exts_chain(data):
+    from aiopquic.streamchain import StreamChain
+    chain = StreamChain()
+    chain.extend(data)
+    return chain
+
+
+@pytest.mark.parametrize("make_buf", [bytes, _exts_chain],
+                         ids=["buffer", "chain"])
+def test_truncated_extensions_tolerated_both_buffers(make_buf):
+    # The lenient-extensions tolerance (d16 §9.13 truncated trailing KVP,
+    # seen live from moq-rs-d16) must fire whether the message parses
+    # from a Buffer (BufferReadError) or a StreamChain (StreamUnderflow).
+    from aiomoqt.messages.base import MOQTMessage
+    from aiomoqt.utils.buffer import Buffer
+    # one whole KVP (id=1 odd, len=2, b"ab") + one truncated (id=3, len=5)
+    data = bytes([1, 2]) + b"ab" + bytes([3, 5]) + b"xy"
+    src = make_buf(data)
+    buf = Buffer(data=src) if isinstance(src, bytes) else src
+    prev = MOQTMessage._tolerate_trailing_extensions
+    MOQTMessage._tolerate_trailing_extensions = True
+    try:
+        exts = MOQTMessage._extensions_decode(
+            buf, with_length=False, buf_end=len(data))
+    finally:
+        MOQTMessage._tolerate_trailing_extensions = prev
+    assert exts == {1: b"ab"}       # partial dict returned, no exception
+
+
 @pytest.mark.parametrize("draft", [14, 16, 18])
 async def test_message_and_a_half(draft):
     # One whole message plus a partial: parse the first, retain the rest.

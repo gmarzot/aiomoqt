@@ -501,30 +501,35 @@ class _MOQTSessionMixin:
             logger.warning("MOQT event: handle control message: no data")
             return None
 
-        logger.debug(f"MOQT event: handle control message: ({buf_len} bytes) 0x{buf.data_slice(0, buf_len).hex()}")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"MOQT event: handle control message: ({buf_len} bytes) "
+                f"0x{buf.data_slice(0, min(buf_len, 64)).hex()}")
+        start_pos = buf.tell()
+        # d18 control framing uses vi64 for the Message Type (0x2F00
+        # -> AF 00); pre-d18 uses the RFC9000 varint. Length stays
+        # 16-bit in all drafts (§10.1). This is the single chokepoint
+        # for ALL control messages (the bidi, d18 uni, and per-request
+        # paths all route here), so tagging buf.vi64 once here makes
+        # every downstream message deserialize read its body integers
+        # in the negotiated flavor via buf.pull_vint — control message
+        # bodies do not each re-tag.
+        prof = self._profile
+        buf.vi64 = prof.vi64
+        # Header pulls and the declared-length guard are the ONLY
+        # legitimate "need more bytes" signals — normalized to
+        # MOQTUnderflow so the drain loop retains the bytes and
+        # reassembles on the next StreamDataReceived event.
         try:
-            start_pos = buf.tell()
-            # d18 control framing uses vi64 for the Message Type (0x2F00
-            # -> AF 00); pre-d18 uses the RFC9000 varint. Length stays
-            # 16-bit in all drafts (§10.1). This is the single chokepoint
-            # for ALL control messages (the bidi, d18 uni, and per-request
-            # paths all route here), so tagging buf.vi64 once here makes
-            # every downstream message deserialize read its body integers
-            # in the negotiated flavor via buf.pull_vint — control message
-            # bodies do not each re-tag.
-            prof = self._profile
-            buf.vi64 = prof.vi64
             msg_type = buf.pull_vint()
             msg_len = buf.pull_uint16()
-            hdr_len = buf.tell() - start_pos
-            end_pos = start_pos + hdr_len + msg_len
-            if buf.tell() + msg_len > buf_len:
-                # Partial body — the message spans more than this chunk
-                # holds. Signal the drain loop (via underflow) to retain
-                # the bytes and reassemble on the next StreamDataReceived
-                # event, rather than treating a fragmented control message
-                # as a protocol error.
-                raise MOQTUnderflow(buf.tell(), msg_len)
+        except (MOQTUnderflow, BufferReadError):
+            raise MOQTUnderflow(start_pos, 3) from None
+        hdr_len = buf.tell() - start_pos
+        end_pos = start_pos + hdr_len + msg_len
+        if buf.tell() + msg_len > buf_len:
+            raise MOQTUnderflow(buf.tell(), msg_len)
+        try:
             # Resolve the message type. RFC9000 drafts keep the lenient
             # enum-coercion + skip-unknown surface. vi64 drafts (d18) let
             # the per-draft CONTROL_REGISTRY be the authority — renumbered
@@ -570,11 +575,16 @@ class _MOQTSessionMixin:
 
             return msg
 
-        except (MOQTUnderflow, BufferReadError):
-            # Partial control message split across StreamDataReceived
-            # events — not an error. Propagate silently so the caller
-            # (_on_control_data) rewinds and awaits the next chunk.
-            raise
+        except (MOQTUnderflow, BufferReadError) as e:
+            # The full declared body was present (guard above), so a
+            # short read inside deserialize is a malformed body — not
+            # fragmentation. Waiting for more bytes would stall the
+            # control stream forever.
+            error = (f"malformed control message: type=0x{int(msg_type):x} "
+                     f"len={msg_len}: {type(e).__name__}")
+            logger.error(f"handle_control_message: {error}")
+            self._close_session(SessionCloseCode.PROTOCOL_VIOLATION, error)
+            return None
         except MOQTProtocolViolation as e:
             logger.error(
                 f"handle_control_message: protocol violation: "
@@ -1160,7 +1170,7 @@ class _MOQTSessionMixin:
             try:
                 msg = self._moqt_handle_control_message(
                     chain, request_id=request_id)
-            except (MOQTUnderflow, BufferReadError):
+            except MOQTUnderflow:
                 chain.rollback()   # partial message — await the next chunk
                 return
             if msg is None:
@@ -1186,7 +1196,7 @@ class _MOQTSessionMixin:
     def _d18_peek_is_setup(data) -> Optional[bool]:
         """Classify a uni stream's leading bytes against the d18 control
         stream type (SETUP, vi64 0x2F00). True/False once decidable;
-        None = not enough bytes yet (a vi64 needs up to 8 — a peer may
+        None = not enough bytes yet (a vi64 needs up to 9 — a peer may
         split even the type across packets). Non-consuming."""
         if not data:
             return None
@@ -1194,8 +1204,8 @@ class _MOQTSessionMixin:
             data = bytes(data)
         try:
             return Buffer(data=data).pull_uint_vi64() == MOQTMessageType.SETUP
-        except Exception:
-            return None if len(data) < 8 else False
+        except BufferReadError:
+            return None   # with 9 bytes buffered a vi64 always decodes
 
 
     # primary event handling for all QUIC messaging
