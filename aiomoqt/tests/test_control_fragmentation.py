@@ -137,34 +137,40 @@ async def test_request_bidi_split_reassembles(draft):
 
 # --- lifecycle: classification, FIN handling, containment ------------------
 
+def _classify_harness(s):
+    s._uni_peek_stash = {}
+    s._data_streams = {}
+    s._stream_torn_down = {}
+    routed = []
+    s._on_stream_data = lambda sid, d, fin: routed.append(("data", sid, bytes(d)))
+    s._on_control_data = lambda sid, d, fin, **kw: routed.append(("ctrl", sid, bytes(d)))
+    return routed
+
+
 async def test_stash_survives_control_binding_on_other_stream():
     # Stream A stashes a partial type vint; stream B then binds as the
     # control read-uni. A's continuation must still merge the stashed
     # prefix and reach the data path with ALL its bytes.
     s = _control_session(18)
-    s._uni_peek_stash = {}
-    s._data_streams = {}
-    s._stream_torn_down = set()
-    s._stream_torn_down = {}
+    routed = _classify_harness(s)
     nine = b"\xff" + (12345).to_bytes(8, "big")   # 9-byte vi64, not SETUP
-    assert s._classify_d18_uni(2, nine[:1], False) is None   # stashed
-    assert 2 in s._uni_peek_stash
-    setup_wire = b"\xaf\x00"                       # vi64 0x2F00
-    assert s._classify_d18_uni(6, setup_wire, False) == setup_wire
-    assert s._d18_control_read_sid == 6            # control bound on B
-    got = s._classify_d18_uni(2, nine[1:], False)  # A's continuation
-    assert got == nine                             # prefix restored
+    s._classify_d18_uni(2, nine[:1], False)
+    assert 2 in s._uni_peek_stash and routed == []   # stashed, nothing routed
+    s._classify_d18_uni(6, b"\xaf\x00", False)        # vi64 0x2F00 = SETUP
+    assert s._d18_control_read_sid == 6               # control bound on B
+    assert routed == [("ctrl", 6, b"\xaf\x00")]
+    s._classify_d18_uni(2, nine[1:], False)           # A's continuation
+    a_bytes = b"".join(d for kind, sid, d in routed if sid == 2)
+    assert a_bytes == nine                            # prefix restored, in order
     assert 2 not in s._uni_peek_stash
 
 
 async def test_stash_dropped_on_fin_and_cleanup():
     s = _control_session(18)
-    s._uni_peek_stash = {}
-    s._data_streams = {}
-    s._stream_torn_down = set()
+    routed = _classify_harness(s)
     # FIN mid-type-vint: undecodable, dropped without stashing.
-    assert s._classify_d18_uni(2, b"\xff", True) is None
-    assert 2 not in s._uni_peek_stash
+    s._classify_d18_uni(2, b"\xff", True)
+    assert routed == [] and 2 not in s._uni_peek_stash
     # Reset/teardown pops a pending stash entry.
     s._uni_peek_stash[10] = b"\xff"
     s._control_chains = {}

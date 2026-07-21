@@ -1244,29 +1244,32 @@ class _MOQTSessionMixin:
         except BufferReadError:
             return None   # with 9 bytes buffered a vi64 always decodes
 
-    def _classify_d18_uni(self, stream_id: int, data, end_stream: bool):
-        """Merge any stashed prefix and classify a d18 uni stream: bind
-        the control read-uni on SETUP, else return the merged bytes for
-        the data path. None = consumed (prefix stashed while the type
-        vint is undecidable, or dropped on FIN). Classification is
-        sticky — once a stream reaches the data path it is never
-        re-peeked (a later chunk could start with the SETUP type)."""
-        stash = self._uni_peek_stash.pop(stream_id, None)
-        if stash:
-            data = stash + bytes(data)
-        verdict = self._d18_peek_is_setup(data)
-        if verdict is None:
+    def _classify_d18_uni(self, stream_id: int, data, end_stream: bool) -> None:
+        """Classify a d18 uni stream by its leading type vint and route
+        its bytes: bind the control read-uni on SETUP, else the data
+        path. Only the first <=9 bytes are ever materialized for the
+        peek; the original chunk is forwarded as-is (zero-copy into the
+        data plane). While the vint is undecidable the (<9-byte) prefix
+        is stashed. Classification is sticky — once a stream reaches the
+        data path it is never re-peeked (a later chunk could start with
+        the SETUP type)."""
+        stash = self._uni_peek_stash.pop(stream_id, None) or b""
+        head = stash + bytes(data[:9])
+        verdict = self._d18_peek_is_setup(head)
+        if verdict is None:        # total buffered < 9 ⇒ head is all of it
             if end_stream:
                 logger.debug(f"MOQT: uni stream({stream_id}) FIN inside "
-                             f"its type vint; dropped {len(data)} bytes")
+                             f"its type vint; dropped {len(head)} bytes")
             else:
-                self._uni_peek_stash[stream_id] = bytes(data)
-            return None
+                self._uni_peek_stash[stream_id] = head
+            return
         if verdict:
             self._d18_control_read_sid = stream_id
             logger.debug(f"MOQT: bound d18 control read-uni: {stream_id}")
-        return data
-
+        ingest = self._on_control_data if verdict else self._on_stream_data
+        if stash:
+            ingest(stream_id, stash, False)
+        ingest(stream_id, data, end_stream)
 
     # primary event handling for all QUIC messaging
     def quic_event_received(self, event: QuicEvent) -> None:
@@ -1353,10 +1356,9 @@ class _MOQTSessionMixin:
                             self._d18_control_read_sid is None and
                             stream_id not in self._data_streams and
                             stream_id not in self._stream_torn_down):
-                        data = self._classify_d18_uni(
+                        self._classify_d18_uni(
                             stream_id, data, event.end_stream)
-                        if data is None:
-                            return
+                        return
                     if stream_id == self._d18_control_read_sid:
                         self._on_control_data(
                             stream_id, data, event.end_stream)
@@ -1863,7 +1865,6 @@ class _MOQTSessionMixin:
     # with the d18 control-message set in a later phase.)
     _REQUEST_OPENERS = (Subscribe, Fetch, Publish, TrackStatus,
                         PublishNamespace, SubscribeNamespace, SubscribeTracks)
-
 
     def send_dgram_message(self, buf: Buffer) -> None:
         """Send a MoQT message via QUIC datagram (best-effort)."""
@@ -2727,7 +2728,6 @@ class _MOQTSessionMixin:
             logger.debug(f"MOQT stream({stream_id}): stop_sending on "
                          f"FETCH_ERROR request_id={msg.request_id}")
         self._resolve_request(msg.request_id, msg)
-
 
     # Data handlers need full update - stream reader in progress
     async def _handle_subgroup_header(self, msg: SubgroupHeader, buf: Buffer) -> None:
