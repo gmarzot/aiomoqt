@@ -195,6 +195,9 @@ class _MOQTSessionMixin:
         # single bidi _control_stream_id above.
         self._d18_control_write_sid: Optional[int] = None
         self._d18_control_read_sid: Optional[int] = None
+        # One SETUP per direction — set on first receipt, dups are a
+        # protocol violation (also closes the double-bring-up window).
+        self._d18_setup_seen = False
         self._loop = asyncio.get_running_loop()
         self._wt_session_setup: Future[bool] = self._loop.create_future()
         # Raw-QUIC mode has no WT setup phase. Pre-resolve so
@@ -1759,7 +1762,13 @@ class _MOQTSessionMixin:
             raise MOQTException(SessionCloseCode.INTERNAL_ERROR,
                                 "session not initialized")
         if self._control_write_stream_id is None:
-            if len(self._pending_control_msgs) >= self._PENDING_CONTROL_MAX:
+            # Deferral exists for one race: the d18 server opens its
+            # write-uni inside the SETUP handler. Pre-d18 the control
+            # stream latches before any handler runs, so a missing
+            # stream is a programming error — fail loudly (there is no
+            # pre-d18 flush site to ever drain a deferred message).
+            if (not self._profile.control_uni_pair or
+                    len(self._pending_control_msgs) >= self._PENDING_CONTROL_MAX):
                 raise MOQTException(SessionCloseCode.INTERNAL_ERROR,
                                     "control stream not initialized")
             logger.debug(
@@ -1778,8 +1787,11 @@ class _MOQTSessionMixin:
     def _flush_pending_control(self) -> None:
         """Send control messages deferred while the control write stream
         was coming up. Call sites run this right after SETUP is written,
-        keeping SETUP the first message on the control stream."""
-        while self._pending_control_msgs:
+        keeping SETUP the first message on the control stream. The
+        stream-id guard prevents a re-append busy loop if ever invoked
+        before the write stream is up."""
+        while (self._pending_control_msgs and
+               self._control_write_stream_id is not None):
             self.send_control_message(self._pending_control_msgs.pop(0))
 
     def send_stream_message(self, stream_id: int, msg: MOQTMessage) -> None:
@@ -2793,9 +2805,19 @@ class _MOQTSessionMixin:
         session init, the server on binding the control read-uni). On
         receipt of the peer's SETUP the session is established."""
         logger.info(f"MOQT event: handle d18 Setup: {msg}")
+        # One SETUP per direction (§10.3). The flag is set synchronously
+        # at first entry, closing the reentry window two pipelined SETUP
+        # handler tasks would otherwise share while the server's
+        # write-uni open is awaited (WT round-trip).
+        if self._d18_setup_seen:
+            error = "received multiple SETUP messages"
+            logger.error(f"MOQT error: {error}")
+            self._close_session(SessionCloseCode.PROTOCOL_VIOLATION, error)
+            return
+        self._d18_setup_seen = True
         # Server side has no separate session-init step: bring up our own
         # control write-uni and send SETUP on first receipt of the peer's
-        # SETUP (idempotent). The client brings its write-uni up eagerly in
+        # SETUP. The client brings its write-uni up eagerly in
         # client_session_init.
         if not self._is_client and self._d18_control_write_sid is None:
             # Transport-aware: raw QUIC allocates a uni id synchronously,

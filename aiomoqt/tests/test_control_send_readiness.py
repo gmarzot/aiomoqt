@@ -38,6 +38,8 @@ def _send_session(draft=18):
             s._writes.append((stream_id, bytes(data)))
 
     s._quic = _Quic()
+    s._closed = []
+    s._close_session = lambda code, reason: s._closed.append((code, reason))
     return s
 
 
@@ -45,14 +47,58 @@ def _wire(msg, prof):
     return bytes(msg.serialize(prof=prof).data)
 
 
-@pytest.mark.parametrize("draft", [14, 16, 18])
-def test_defers_while_write_stream_pending(draft):
-    # The race: a reply generated before the control write stream is up
-    # must be deferred — not raise and kill the handler task.
-    s = _send_session(draft)
+def test_defers_while_write_stream_pending():
+    # The d18 race: a reply generated before the control write stream is
+    # up must be deferred — not raise and kill the handler task.
+    s = _send_session(18)
     s.send_control_message(RequestOk(request_id=7, parameters={}))
     assert s._writes == []                       # nothing hit the wire
     assert len(s._pending_control_msgs) == 1     # deferred
+
+
+@pytest.mark.parametrize("draft", [14, 16])
+def test_pre_d18_send_without_stream_raises(draft):
+    # Pre-d18 the control stream latches before any handler runs, so a
+    # missing stream is a programming error — fail loudly at the call
+    # site (deferral would strand the message: no pre-d18 flush site).
+    s = _send_session(draft)
+    with pytest.raises(MOQTException):
+        s.send_control_message(RequestOk(request_id=7, parameters={}))
+    assert s._pending_control_msgs == []
+
+
+def test_flush_with_unset_stream_returns():
+    # Guard against the re-append cycle: flushing while the write stream
+    # is unset must return (queue intact), never busy-loop.
+    s = _send_session(18)
+    s.send_control_message(RequestOk(request_id=7, parameters={}))
+    s._flush_pending_control()                   # must not hang
+    assert len(s._pending_control_msgs) == 1
+
+
+async def test_duplicate_setup_rejected_single_bringup():
+    # Two pipelined SETUPs spawn two handler tasks; both used to pass the
+    # sid-is-None check before either await completed (WT), opening two
+    # write-unis. The dup must be rejected and only one uni opened.
+    s = _send_session(18)
+    s.is_client = False
+    s._moqt_session_setup = asyncio.get_running_loop().create_future()
+    s._d18_setup_seen = False
+    hold, opens = asyncio.Event(), []
+
+    async def _held_open():
+        opens.append(1)
+        await hold.wait()
+        return 9
+
+    s.open_uni_stream = _held_open
+    t1 = asyncio.create_task(s._handle_d18_setup(Setup(options={})))
+    t2 = asyncio.create_task(s._handle_d18_setup(Setup(options={})))
+    await asyncio.sleep(0)
+    hold.set()
+    await asyncio.gather(t1, t2)
+    assert len(opens) == 1                       # single bring-up
+    assert s._closed                             # duplicate rejected
 
 
 def test_flush_after_setup_keeps_setup_first():
@@ -120,6 +166,7 @@ async def test_d18_setup_handler_flushes_deferred_reply():
     s = _send_session(18)
     s.is_client = False   # server (property falls through the stub _quic)
     s._moqt_session_setup = asyncio.get_running_loop().create_future()
+    s._d18_setup_seen = False
     hold = asyncio.Event()
 
     async def _held_open():
