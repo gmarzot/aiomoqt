@@ -487,6 +487,10 @@ class _MOQTSessionMixin:
         logger.debug(f"H3 event: configured path: {configured} request path: {path}")
         return configured == path
 
+    # Drain-loop sentinel: an ignorable (skip-unknown) message was
+    # consumed — distinct from None, which is fatal.
+    _MSG_SKIPPED = object()
+
     def _moqt_handle_control_message(self, buf: Buffer, *,
                                      request_id: Optional[int] = None
                                      ) -> Optional[MOQTMessage]:
@@ -541,9 +545,10 @@ class _MOQTSessionMixin:
                     msg_type = MOQTMessageType(msg_type)
                 except ValueError:
                     logger.error(f"MOQT error: unknown control message: type: {hex(msg_type)} start: {start_pos} len: {msg_len}")
-                    # Skip the rest of this message if possible
+                    # Skip-unknown surface: consume the message and let
+                    # the drain loop continue (None means fatal there).
                     buf.seek(end_pos)
-                    return
+                    return self._MSG_SKIPPED
             # Look up message class (version-aware for shared code points)
             message_class, handler = self._get_control_entry(msg_type)
             logger.debug(f"MOQT event: control message: {message_class.__name__} ({msg_len} bytes)")
@@ -655,6 +660,7 @@ class _MOQTSessionMixin:
         reverse-map entry."""
         state = self._data_streams.pop(stream_id, None)
         self._control_chains.pop(stream_id, None)
+        self._uni_peek_stash.pop(stream_id, None)
         self._mark_stream_torn_down(stream_id)
         key = state.key if state is not None else None
         if key and len(key) == 2 and key[0] == 'fetch':
@@ -1172,6 +1178,32 @@ class _MOQTSessionMixin:
                     chain, request_id=request_id)
             except MOQTUnderflow:
                 chain.rollback()   # partial message — await the next chunk
+                if end_stream:
+                    # FIN'd mid-message: nothing more can arrive. Release
+                    # the chain; a truncated CONTROL stream is fatal.
+                    logger.error(
+                        f"MOQT control stream({stream_id}): FIN with "
+                        f"truncated message "
+                        f"({chain.capacity - chain.tell()} residual bytes)")
+                    self._control_chains.pop(stream_id, None)
+                    if stream_id == self._control_read_stream_id:
+                        self._close_session(
+                            SessionCloseCode.PROTOCOL_VIOLATION,
+                            "control stream FIN with truncated message")
+                return
+            except Exception as e:
+                # Containment (data-plane _drain_stream parity): a parse
+                # exception must not escape into the transport event loop
+                # (WT would drop the rest of its batch) nor leave the
+                # chain mid-message. A broken control stream is fatal.
+                logger.error(
+                    f"MOQT control stream({stream_id}): parse exception at "
+                    f"tell={chain.tell()} of {chain.capacity}: "
+                    f"{type(e).__name__}: {e} head_hex="
+                    f"{chain.data_slice(0, min(64, chain.capacity)).hex()}")
+                self._close_session(
+                    SessionCloseCode.PROTOCOL_VIOLATION,
+                    f"control parse error: {type(e).__name__}")
                 return
             if msg is None:
                 error = (f"control stream({stream_id}): parse failed at "
@@ -1181,6 +1213,8 @@ class _MOQTSessionMixin:
                     SessionCloseCode.PROTOCOL_VIOLATION, error)
                 return
             chain.commit()
+            if msg is self._MSG_SKIPPED:
+                continue
             # The first request-opener on a bidi request stream binds it to
             # its Request ID; later replies demux by the bound stream.
             if (is_request_bidi and
@@ -1206,6 +1240,29 @@ class _MOQTSessionMixin:
             return Buffer(data=data).pull_uint_vi64() == MOQTMessageType.SETUP
         except BufferReadError:
             return None   # with 9 bytes buffered a vi64 always decodes
+
+    def _classify_d18_uni(self, stream_id: int, data, end_stream: bool):
+        """Merge any stashed prefix and classify a d18 uni stream: bind
+        the control read-uni on SETUP, else return the merged bytes for
+        the data path. None = consumed (prefix stashed while the type
+        vint is undecidable, or dropped on FIN). Classification is
+        sticky — once a stream reaches the data path it is never
+        re-peeked (a later chunk could start with the SETUP type)."""
+        stash = self._uni_peek_stash.pop(stream_id, None)
+        if stash:
+            data = stash + bytes(data)
+        verdict = self._d18_peek_is_setup(data)
+        if verdict is None:
+            if end_stream:
+                logger.debug(f"MOQT: uni stream({stream_id}) FIN inside "
+                             f"its type vint; dropped {len(data)} bytes")
+            else:
+                self._uni_peek_stash[stream_id] = bytes(data)
+            return None
+        if verdict:
+            self._d18_control_read_sid = stream_id
+            logger.debug(f"MOQT: bound d18 control read-uni: {stream_id}")
+        return data
 
 
     # primary event handling for all QUIC messaging
@@ -1289,27 +1346,14 @@ class _MOQTSessionMixin:
             # path (memoryview-native; no Buffer construction).
             if stream_is_unidirectional(stream_id):
                 if self._profile.control_uni_pair:
-                    if (self._d18_control_read_sid is None and
+                    if stream_id in self._uni_peek_stash or (
+                            self._d18_control_read_sid is None and
                             stream_id not in self._data_streams and
                             stream_id not in self._stream_torn_down):
-                        # Classification is sticky: once a stream has
-                        # been routed to the data path it is never
-                        # re-peeked (a later chunk could coincidentally
-                        # start with the SETUP type).
-                        stash = self._uni_peek_stash.pop(stream_id, None)
-                        if stash:
-                            data = stash + bytes(data)
-                        verdict = self._d18_peek_is_setup(data)
-                        if verdict is None:
-                            # Type vint split mid-encoding — hold the
-                            # prefix and classify when more arrives.
-                            if not event.end_stream:
-                                self._uni_peek_stash[stream_id] = bytes(data)
+                        data = self._classify_d18_uni(
+                            stream_id, data, event.end_stream)
+                        if data is None:
                             return
-                        if verdict:
-                            self._d18_control_read_sid = stream_id
-                            logger.debug(
-                                f"MOQT: bound d18 control read-uni: {stream_id}")
                     if stream_id == self._d18_control_read_sid:
                         self._on_control_data(
                             stream_id, data, event.end_stream)
