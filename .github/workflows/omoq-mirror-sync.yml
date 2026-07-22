@@ -1,0 +1,68 @@
+name: mirror sync
+
+# Fast-forward mirror: keeps openmoq/<repo> an exact copy of
+# gmarzot/<repo> main + tags. No fork-local changes are expected; if the
+# fork's main has diverged the sync fails and emails rather than
+# force-pushing.
+#
+# This file lives in the upstream repo so fork == upstream stays
+# byte-identical (sync is always a clean fast-forward); the job is a
+# no-op outside openmoq.
+
+on:
+  schedule:
+    # Mirror stage of the openmoq sync cron cascade (UTC; ET shifts under DST):
+    #   03:03  aiomoqt/aiopquic mirror-sync (gmarzot → openmoq, this workflow)
+    #   03:23  picoquic upstream-sync       (private-octopus → openmoq/picoquic)
+    #   04:23  moxygen  upstream-sync       (facebookexperimental → openmoq/moxygen)
+    #   04:37  moxygen  picoquic-pin sync   (openmoq/picoquic → moxygen picoquic-rev.txt)
+    #   08:23  moqx     moxygen-submodule sync (openmoq/moxygen → moqx deps/moxygen)
+    - cron: '3 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    if: github.repository_owner == 'openmoq'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Fast-forward main + tags from upstream
+        run: |
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          git remote add upstream "https://github.com/gmarzot/${REPO_NAME}.git"
+          git fetch upstream main --tags
+
+          if git merge-base --is-ancestor origin/main upstream/main; then
+            git push origin upstream/main:refs/heads/main
+            git push origin --tags
+            echo "Mirrored gmarzot/${REPO_NAME} main ($(git rev-parse --short upstream/main)) + tags"
+          else
+            echo "::error::Fork main has diverged from upstream — refusing to force-push. Reconcile manually."
+            exit 1
+          fi
+
+      - name: Notify email (mirror failure)
+        if: failure()
+        continue-on-error: true
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.OMOQ_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.OMOQ_AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          SUBJECT="[${GITHUB_REPOSITORY#*/}] mirror sync FAILED"
+          BODY="Mirror sync from gmarzot/${GITHUB_REPOSITORY#*/} failed.\n\nRun: ${RUN_URL}"
+          aws ses send-email \
+            --from "noreply@ci.openmoq.org" \
+            --destination '{"ToAddresses":["github-notifications@openmoq.org"]}' \
+            --message "{
+              \"Subject\": {\"Data\": \"${SUBJECT}\"},
+              \"Body\": {\"Text\": {\"Data\": \"${BODY}\"}}
+            }"
