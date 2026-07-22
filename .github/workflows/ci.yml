@@ -10,9 +10,12 @@ name: CI
 #     on (linux, macos) x (3.12, 3.13, 3.14).
 #   - multi-proc: pub_server in one process, sub_bench in another.
 #     Catches Phase-7 backpressure / control-stream parser regressions
-#     that single-process loopback masks. continue-on-error initially.
-#   - cross-impl: aiomoqt sub_bench against cloudflare/moq-rs (main/latest)
-#     relay running in a Docker container. continue-on-error initially.
+#     that single-process loopback masks.
+#   - cross-impl: hard-fail peer interop — aiomoqt pub/sub through the
+#     moqx relay (gold standard, published image; WT + raw QUIC), and
+#     aiomoqt sub against cloudflare/moq-rs (main/latest) + moq-clock.
+#     An interop failure is a red build: a missing results line means
+#     the session never established and fails loudly.
 #   - perf-gate: parser microbench short window. continue-on-error
 #     initially.
 #
@@ -82,7 +85,6 @@ jobs:
   multi-proc:
     name: pub-sub test / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -175,7 +177,6 @@ jobs:
   peer-interop:
     name: peer interop
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
         with:
@@ -230,14 +231,72 @@ jobs:
           tail -25 /tmp/sub.log
           echo === relay.log ===
           tail -10 /tmp/relay.log
-          # Require at least 5 clock objects (1 Hz publish rate).
-          grep -E "Objects: *[0-9]+" /tmp/sub.log | tail -1 \
+          # Require at least 5 clock objects (1 Hz publish rate). A
+          # missing Objects line means the session never established —
+          # that is a hard FAIL, not a vacuous pass.
+          line=$(grep -E "Objects: *[0-9]+" /tmp/sub.log | tail -1)
+          if [ -z "$line" ]; then
+            echo "FAIL: no Objects line — session never established"
+            exit 1
+          fi
+          echo "$line" \
             | awk '{n=$2+0; if (n < 5) {print "FAIL: only " n " clock objs"; exit 1} else {print "OK: " n " clock objs"}}'
       - name: Cleanup
         if: always()
         run: |
           pkill -f moq-relay-ietf 2>/dev/null || true
           pkill -f moq-clock-ietf 2>/dev/null || true
+      - name: Start moqx relay (gold standard, published image)
+        run: |
+          cp certs/key.pem certs/priv.key
+          docker run -d --name moqx -p 4453:4453/udp \
+            -e MOQX_PORT=4453 -e MOQX_BIND_ADDR=0.0.0.0 \
+            -e MOQX_CERT=/certs/cert.pem -e MOQX_KEY=/certs/priv.key \
+            -e MOQX_ENDPOINT=/ \
+            -v "$PWD/certs:/certs:ro" \
+            ghcr.io/openmoq/moqx:latest
+          # Probe /proc/net/udp for hex port 0x1165 (= 4453) — the slim
+          # image has no ss/netstat.
+          for i in $(seq 1 30); do
+            sleep 1
+            if docker exec moqx sh -c \
+                'grep -qi :1165 /proc/net/udp /proc/net/udp6 2>/dev/null'; then
+              echo "moqx up after ${i}s"; break
+            fi
+          done
+      - name: aiomoqt pub/sub through moqx (WT + raw QUIC)
+        timeout-minutes: 4
+        run: |
+          fail=0
+          for mode in wt quic; do
+            if [ "$mode" = wt ]; then url="https://localhost:4453/"
+            else url="moqt://localhost:4453"; fi
+            python -m aiomoqt.examples.pub_bench "$url" \
+              -n "ci-$mode" --trackname t -s 256 -t 10 -k \
+              > "/tmp/pub-$mode.log" 2>&1 &
+            pub=$!
+            sleep 2
+            timeout 15 python -m aiomoqt.examples.sub_bench "$url" \
+              -n "ci-$mode" --trackname t -k -t 8 \
+              > "/tmp/sub-$mode.log" 2>&1 || true
+            wait $pub || true
+            echo "=== sub-$mode.log ==="; tail -15 "/tmp/sub-$mode.log"
+            line=$(grep -E "Objects: *[0-9]+" "/tmp/sub-$mode.log" | tail -1)
+            if [ -z "$line" ]; then
+              echo "FAIL($mode): no Objects line — session never established"
+              echo "=== pub-$mode.log ==="; tail -20 "/tmp/pub-$mode.log"
+              docker logs moqx 2>&1 | tail -20
+              fail=1
+            else
+              echo "$line" | awk -v m="$mode" \
+                '{n=$2+0; if (n < 50) {print "FAIL("m"): only " n " objs"; exit 1}
+                  else {print "OK("m"): " n " objs"}}' || fail=1
+            fi
+          done
+          exit $fail
+      - name: Cleanup moqx
+        if: always()
+        run: docker rm -f moqx 2>/dev/null || true
 
   benchmark:
     name: benchmark
