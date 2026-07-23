@@ -33,14 +33,11 @@ Run on UDP/4443 with the runner's /certs convention:
       --bind 0.0.0.0 --port 4443 \\
       --cert /certs/cert.pem --key /certs/priv.key
 
-Each listener serves a single transport: WebTransport by default, or
-raw QUIC with `--quic`. Pass `--quic-port N` to also run a *second*
-listener (raw QUIC on port N) in the same process, sharing the global
-namespace table — so one instance can back both a `remote-webtransport`
-endpoint (`--port`) and a `remote-quic` endpoint (`--quic-port`) in the
-interop runner. Serving both transports on a *single* UDP port (h3 +
-moqt-NN ALPNs) would need aiopquic-level per-ALPN stack dispatch; using
-two ports sidesteps that.
+Transports: WebTransport by default, raw QUIC with `--quic`, or BOTH
+on one port with `--dual` (per-connection ALPN dispatch via aiopquic
+serve_dispatch). `--quic-port N` remains as the legacy two-listener
+arrangement (second raw-QUIC listener sharing the global namespace
+table) for runners that expect distinct endpoints.
 """
 
 import argparse
@@ -181,6 +178,10 @@ def parse_args():
                              "(default: /certs/priv.key)")
     parser.add_argument("--quic", action="store_true",
                         help="Serve raw QUIC instead of WebTransport")
+    parser.add_argument("--dual", action="store_true",
+                        help="Serve raw QUIC AND H3/WebTransport on "
+                             "--port (single-port ALPN dispatch); "
+                             "excludes --quic/--quic-port")
     parser.add_argument("--quic-port", type=int, default=None,
                         help="Also serve raw QUIC on this port via a "
                              "second listener in the same process "
@@ -231,11 +232,17 @@ async def main():
               "cert.pem+priv.key at /certs/", file=sys.stderr)
         sys.exit(2)
 
-    # Primary listener: WebTransport unless --quic.
+    if args.dual and (args.quic or args.quic_port is not None):
+        print("Error: --dual excludes --quic/--quic-port (one port "
+              "serves both transports)", file=sys.stderr)
+        sys.exit(2)
+
+    # Primary listener: WebTransport unless --quic; both with --dual.
     listeners = [(_build_server(args.bind, args.port, cert, key,
                                 args.quic, args.draft),
                   args.port,
-                  "raw QUIC" if args.quic else "H3/WebTransport")]
+                  "dual raw QUIC + H3/WebTransport" if args.dual
+                  else ("raw QUIC" if args.quic else "H3/WebTransport"))]
 
     # Optional second listener: raw QUIC on --quic-port, sharing the
     # global namespace table. One process then backs both a
@@ -251,7 +258,8 @@ async def main():
                            True, args.draft),
              args.quic_port, "raw QUIC"))
 
-    handles = [await server.serve() for server, _port, _label in listeners]
+    handles = [await (server.serve_dual() if args.dual else server.serve())
+               for server, _port, _label in listeners]
 
     print(
         "=" * 64

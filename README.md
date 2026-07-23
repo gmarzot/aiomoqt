@@ -334,6 +334,8 @@ Contributions are welcome! Please fork the repository, create a branch, and subm
 
 Giovanni Marzot — [gmarzot@marzresearch.net](mailto:gmarzot@marzresearch.net)
 
+A [Marz Research](https://github.com/gmarzot) project.
+
 ## Acknowledgements
 
-This project takes inspiration from, and has benefited from the great work done by the [OpenMOQ/moqx](https://github.com/openmoq/moqx) and [OpenMoQ/moxygen](https://github.com/openmoq/moxygen) teams, and the continued efforts of the MOQ IETF WG.
+This project takes inspiration from, and has benefited from the great work done by the [OpenMOQ/moqx](https://github.com/openmoq/moqx) team, and the continued efforts of the MOQ IETF WG.
