@@ -138,6 +138,12 @@ class _MOQTSessionMixin:
     the end of this file.
     """
 
+    # Transport identity of the SESSION (not the server: a dual-stack
+    # server hosts both kinds on one port, so its use_quic flag cannot
+    # speak for any one session). WT-based classes flip this via
+    # _WTSessionMixin.
+    _is_wt = False
+
     @property
     def _is_client(self) -> bool:
         """Transport-agnostic is-client signal. Raw-QUIC bases expose
@@ -200,10 +206,12 @@ class _MOQTSessionMixin:
         self._d18_setup_seen = False
         self._loop = asyncio.get_running_loop()
         self._wt_session_setup: Future[bool] = self._loop.create_future()
-        # Raw-QUIC mode has no WT setup phase. Pre-resolve so
+        # Raw-QUIC sessions have no WT setup phase. Pre-resolve so
         # StreamDataReceived processing isn't gated on a never-resolved
-        # future. WT mode resolves it in _moqt_wt_finalize().
-        if getattr(session, 'use_quic', False):
+        # future. WT sessions resolve it in _moqt_wt_finalize(). Keyed
+        # off the session class, not the owning server's use_quic — a
+        # dual-stack server hosts both transports.
+        if not self._is_wt:
             self._wt_session_setup.set_result(True)
         # A pinned draft is known before the handshake, so lock _draft now:
         # over raw QUIC a peer's SETUP (d18 control uni) can arrive in the
@@ -1506,7 +1514,7 @@ class _MOQTSessionMixin:
         Setup message — e.g. {SetupParamType.AUTH_TOKEN: b"..."} for
         session-level auth (Token-wrapped on the wire)."""
 
-        use_quic = self._session.use_quic
+        use_quic = not self._is_wt
         params = {}
         if use_quic:
             # Raw QUIC flow. _wt_session_setup is pre-resolved in __init__.
@@ -1616,7 +1624,7 @@ class _MOQTSessionMixin:
 
     async def open_uni_stream(self) -> int:
         """Open a unidirectional data stream. Returns the stream ID."""
-        if getattr(self._session, 'use_quic', False):
+        if not self._is_wt:
             return self._quic.get_next_available_stream_id(is_unidirectional=True)
         # aiopquic-WT: round-trip to picoquic for stream-id allocation
         try:
@@ -1632,7 +1640,7 @@ class _MOQTSessionMixin:
 
     async def open_bidi_stream(self) -> int:
         """Open a bidirectional stream. Returns the stream ID."""
-        if getattr(self._session, 'use_quic', False):
+        if not self._is_wt:
             return self._quic.get_next_available_stream_id(is_unidirectional=False)
         # aiopquic-WT
         return await self.create_stream(bidir=True)
@@ -1829,7 +1837,7 @@ class _MOQTSessionMixin:
         pre-d18 requests go on the single control stream. Raw-QUIC stream-id
         allocation is synchronous, so callers stay sync."""
         if self._profile.control_uni_pair:
-            if getattr(self._session, 'use_quic', False):
+            if not self._is_wt:
                 # Raw QUIC: stream-id allocation is synchronous (lazy
                 # materialization on first send), so stay sync.
                 stream_id = self._quic.get_next_available_stream_id(
@@ -2461,8 +2469,7 @@ class _MOQTSessionMixin:
                 # QUIC, WT-Available-Protocols for WebTransport. These are
                 # distinct mechanisms; don't conflate them.
                 selected_draft = self.negotiated_draft
-                _src = ("ALPN" if getattr(self, 'use_quic', False)
-                        else "WT-Available-Protocols")
+                _src = ("WT-Available-Protocols" if self._is_wt else "ALPN")
                 logger.info(f"MOQT event: d16+ ServerSetup (version from {_src}: draft-{selected_draft})")
             else:
                 selected_draft = get_major_version(selected_version)
@@ -2981,6 +2988,8 @@ class _WTSessionMixin:
     (set on the server at construction; on the client by open()
     after the CONNECT round-trip).
     """
+
+    _is_wt = True
 
     def _moqt_wt_finalize(self) -> None:
         self._quic = self
