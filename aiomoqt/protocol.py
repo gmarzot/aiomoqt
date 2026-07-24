@@ -269,6 +269,7 @@ class _MOQTSessionMixin:
         self._bidi_streams: Dict[int, int] = {}  # map request_id to bidi stream_id (d16)
         self._bidi_stream_requests: Dict[int, int] = {}  # map bidi stream_id to request_id (d16)
         self._track_aliases: Dict[int, int] = {}  # map alias to subscription_id
+        self._warned_unknown_aliases: set = set()
         self._subscriptions: Dict[int, List] = {}  # map subscription_id to request
         self._pending_requests: Dict[int, Future[MOQTMessage]] = {}  # unified response futures
         # Bounded record of request ids WE issued (recorded at allocation).
@@ -909,7 +910,12 @@ class _MOQTSessionMixin:
           and the uniqueness check is deferred until the first object.
         """
         if header.track_alias not in self._track_aliases:
-            logger.warning(
+            # Once per alias at WARNING, DEBUG after — a persistently
+            # unbound alias otherwise floods the log per subgroup stream.
+            first = header.track_alias not in self._warned_unknown_aliases
+            self._warned_unknown_aliases.add(header.track_alias)
+            logger.log(
+                logging.WARNING if first else logging.DEBUG,
                 f"MOQT stream({stream_id}): subgroup with "
                 f"unknown track_alias={header.track_alias} "
                 f"(may resolve via pending control message)")
@@ -1945,7 +1951,6 @@ class _MOQTSessionMixin:
         if parameters is None:
             parameters = {}
         request_id = self._allocate_request_id()
-        track_alias = self._allocate_track_alias(request_id)
         namespace_tuple = self._make_namespace_tuple(namespace)
         track_name = track_name.encode() if isinstance(track_name, str) else track_name
 
@@ -2087,7 +2092,6 @@ class _MOQTSessionMixin:
 
         parameters = {} if parameters is None else parameters
         sub_request_id = self._allocate_request_id()
-        self._allocate_track_alias(sub_request_id)
         namespace_tuple = self._make_namespace_tuple(namespace)
         if isinstance(track_name, str):
             track_name = track_name.encode()
@@ -2542,6 +2546,10 @@ class _MOQTSessionMixin:
         logger.info(f"MOQT event: handle {msg}")
         if msg.request_id in self._subscriptions:
             self._subscriptions[msg.request_id].append(msg)
+        # The publisher's alias assignment is authoritative — SUBSCRIBE
+        # carries no Track Alias; the registry is keyed from the reply.
+        if msg.track_alias is not None:
+            self._track_aliases[msg.track_alias] = msg.request_id
         self._resolve_request(msg.request_id, msg)
 
     async def _handle_subscribe_error(self, msg: SubscribeError) -> None:
@@ -2589,6 +2597,7 @@ class _MOQTSessionMixin:
                     self.stream_reset(sid, SessionCloseCode.NO_ERROR)
                     self._cleanup_stream(
                         sid, QuicErrorCode.APPLICATION_ERROR)
+            self._track_aliases.pop(track_alias, None)
         self._subscriptions.pop(msg.request_id, None)
 
     async def _handle_subscribe_done(self, msg: SubscribeDone) -> None:
@@ -2614,6 +2623,7 @@ class _MOQTSessionMixin:
                     # Without this mark, those bytes recreate state
                     # with parser=None and parse-fail.
                     self._mark_stream_torn_down(sid)
+            self._track_aliases.pop(track_alias, None)
         future = self._pending_requests.get(msg.request_id)
         if future and not future.done():
             future.set_result(msg)

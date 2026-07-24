@@ -570,7 +570,7 @@ class SubscribedTrack(Track):
             params = {}
             if self.auth_token is not None:
                 params[ParamType.AUTH_TOKEN] = self.auth_token
-            await self.session.subscribe(
+            ok = await self.session.subscribe(
                 namespace=self.namespace,
                 track_name=self.trackname,
                 forward=forward,
@@ -578,6 +578,10 @@ class SubscribedTrack(Track):
                 parameters=params,
                 wait_response=True,
             )
+            # Publisher's SUBSCRIBE_OK alias is authoritative (the
+            # discovery path gets it from PUBLISH instead).
+            if getattr(ok, 'track_alias', None) is not None:
+                self.track_alias = ok.track_alias
             self.state = TrackState.SUBSCRIBED
             logger.info(f"Track: subscribed (direct) to {self.fqtn}")
             return
