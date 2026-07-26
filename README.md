@@ -111,7 +111,6 @@ async def on_subscribe(session, msg):
     hdr = SubgroupHeader(track_alias=ok.track_alias, group_id=0, subgroup_id=0, publisher_priority=0)
     session.stream_write(stream_id, hdr.serialize().data)
     session.stream_write(stream_id, hdr.next_object(payload=b"hello").data)
-    session.transmit()
 
 asyncio.run(main())
 ```

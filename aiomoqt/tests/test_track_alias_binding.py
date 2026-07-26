@@ -45,10 +45,10 @@ async def _on_subscribe(session, msg):
     # Mock a foreign relay's allocation scheme: aliases start at 1000.
     session._next_track_alias = max(session._next_track_alias, _ALIAS_BASE)
     ok = session.subscribe_ok(request_msg=msg, content_exists=0)
-    # Flush the OK ahead of data: the §10.4.2 data-before-OK race is
-    # tolerated-with-warning by design; this test asserts the post-OK
-    # steady state (silent admission under the authoritative alias).
-    session.transmit()
+    # Let the OK reach the subscriber before any data: the §10.4.2
+    # data-before-OK race is tolerated-with-warning by design; this test
+    # asserts the post-OK steady state (silent admission under the
+    # authoritative alias).
     await asyncio.sleep(0.05)
     stream_id = await session.open_uni_stream()
     hdr = SubgroupHeader(track_alias=ok.track_alias, group_id=0,
@@ -59,7 +59,6 @@ async def _on_subscribe(session, msg):
         session.stream_write(
             stream_id, hdr.next_object(payload=f"alias-{i}".encode()).data,
             end_stream=(i == _N_OBJECTS - 1))
-    session.transmit()
 
 
 async def _on_subscribe_datagrams(session, msg):
@@ -69,7 +68,6 @@ async def _on_subscribe_datagrams(session, msg):
         dgram = ObjectDatagram(track_alias=ok.track_alias, group_id=0,
                                object_id=i, payload=f"dgram-{i}".encode())
         session.send_dgram_message(dgram.serialize(prof=session._profile))
-    session.transmit()
 
 
 def _server(port, handler=_on_subscribe, draft=18):

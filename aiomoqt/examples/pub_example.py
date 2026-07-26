@@ -94,7 +94,6 @@ async def generate_group_dgram(session: MOQTSession, track_alias: int, priority:
                     logger.info(f"MOQT app: sending ObjectDatagramStatus END_OF_GROUP: "
                                 f"{group_id-1}.{object_id}")
                     session._quic.send_datagram_frame(b'\0' + msg.data)
-                    session.transmit()
 
                 object_id = 0
                 info = f"| {group_id}.{object_id} |".encode()
@@ -118,7 +117,6 @@ async def generate_group_dgram(session: MOQTSession, track_alias: int, priority:
             logger.info(f"MOQT app: sending ObjectDatagram: "
                         f"{group_id}.{object_id} {len(msg.data)} bytes")
             session._quic.send_datagram_frame(b'\0' + msg.data)
-            session.transmit()
 
             object_id += 1
             next_frame_time += FRAME_INTERVAL
@@ -164,7 +162,6 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
                                 f"{group_id-1}.{subgroup_id}.{header._last_object_id} "
                                 f"{buf.tell()} bytes")
                     session.stream_write(stream_id, buf.data, end_stream=True)
-                    session.transmit()
 
                     # Clean up old stream
                     if stream_id in session._data_streams:
@@ -189,7 +186,6 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
                     raise asyncio.CancelledError
                 logger.info(f"MOQT app: sending {header} {msg.tell()} bytes")
                 session.stream_write(stream_id, msg.data)
-                session.transmit()
 
                 # I-frame for first object in group
                 obj_id = 0
@@ -211,7 +207,6 @@ async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
                         f"{group_id}.{subgroup_id}.{header._last_object_id} "
                         f"{buf.tell()} bytes")
             session.stream_write(stream_id, buf.data)
-            session.transmit()
 
             next_frame_time += FRAME_INTERVAL
             sleep_time = max(0, next_frame_time - time.monotonic())

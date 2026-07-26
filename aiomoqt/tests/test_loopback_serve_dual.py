@@ -33,7 +33,6 @@ async def _on_subscribe(session, msg):
         session.stream_write(
             stream_id, hdr.next_object(payload=f"dual-{i}".encode()).data,
             end_stream=(i == _N_OBJECTS - 1))
-    session.transmit()
 
 
 async def _subscribe_roundtrip(port, use_quic):

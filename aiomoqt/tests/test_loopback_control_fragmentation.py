@@ -52,7 +52,6 @@ async def _fragmented_setup(session, cut):
     assert len(wire) > cut
     for frag in (wire[:cut], wire[cut:]):
         session.stream_write(sid, frag)
-        session.transmit()
         await asyncio.sleep(0.08)
 
 
