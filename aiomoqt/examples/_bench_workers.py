@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import multiprocessing
 import os
 import sys
 import time
@@ -41,6 +42,17 @@ SUBSCRIBE_EACH_TIMEOUT_S = 5.0
 STATS_INTERVAL_S = 1.0
 STOP_POLL_S = 0.1
 SELF_HEAL_BACKOFF_S = 0.5
+
+# Spawn context for all bench parents. Linux pins "fork": Python 3.14
+# switched the Linux default to forkserver, whose by-name SemLock reopen
+# in the child races parent-side queue lifetime (FileNotFoundError in
+# synchronize.__setstate__). Bench parents are pure orchestrators — no
+# QUIC/C threads exist pre-fork, so fork is safe. Other platforms keep
+# their platform default (macOS: spawn, where fork is the unsafe choice).
+if sys.platform == "linux":
+    MP_CTX = multiprocessing.get_context("fork")
+else:
+    MP_CTX = multiprocessing.get_context()
 
 
 class _RollingStats:
@@ -567,7 +579,6 @@ async def _publisher_task(config: Dict[str, Any], mp_stop_event,
     events_queue stats: {'kind':'pub_stats', 't', 'tx_bytes', 'tx_objs',
                           'cumulative_bytes', 'cumulative_objs'} every 1s.
     """
-    from aiomoqt.types import MOQTMessageType
     from aiomoqt.track import PublishedTrack
 
     relay = parse_relay_url(config['relay_url'],

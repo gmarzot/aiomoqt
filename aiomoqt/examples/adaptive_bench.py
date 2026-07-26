@@ -545,7 +545,7 @@ class SubsActuator:
         # controller adding a group per --join-rate spawns one worker.
         self.batch_size = max(1, int(step_subs))
 
-        import multiprocessing as mp
+        from aiomoqt.examples._bench_workers import MP_CTX as mp
         self._mp = mp
         self._events_q = mp.Queue(maxsize=10000)
         self._workers: dict = {}    # worker_id -> (Process, stop_event)
@@ -1762,7 +1762,7 @@ async def main():
         # real stack tail latency and caps throughput at one core.
         mp_loopback = (not relay_mode) and args.mp_loopback
         if relay_mode or mp_loopback:
-            import multiprocessing as mp
+            from aiomoqt.examples._bench_workers import MP_CTX as mp
             from aiomoqt.examples._bench_workers import (
                 pub_worker_entry, sub_worker_entry, loopback_server_entry,
             )
@@ -1932,7 +1932,7 @@ async def main():
                 # coupling. Sub workers are still spawned by
                 # SubsActuator; the publisher runs at a fixed
                 # --sub-mbps rate (no rate_queue updates needed).
-                import multiprocessing as mp
+                from aiomoqt.examples._bench_workers import MP_CTX as mp
                 from aiomoqt.examples._bench_workers import pub_worker_entry
                 subs_pub_stop = mp.Event()
                 pub_events_q = mp.Queue(maxsize=10000)

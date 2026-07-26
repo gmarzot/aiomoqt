@@ -15,7 +15,6 @@ Usage:
 """
 import argparse
 import asyncio
-import multiprocessing
 import os
 import sys
 import time
@@ -26,6 +25,8 @@ from aiomoqt.track import PublishedTrack, VideoTrack, SubscribedTrack
 from aiomoqt.utils import wait_cond_timeout
 from aiomoqt.utils.logger import set_log_level
 from aiomoqt.utils.url import parse_relay_url
+
+from aiomoqt.examples._bench_workers import MP_CTX
 
 
 SUBSCRIBE_TIMEOUT = 30.0   # seconds to wait for SUBSCRIBE_OK / PUBLISH
@@ -329,13 +330,13 @@ def main():
     print("─" * 60)
 
     # Shared dict for results
-    manager = multiprocessing.Manager()
+    manager = MP_CTX.Manager()
     results = manager.dict()
 
     pub_proc = None
     if not args.no_pub:
         print("\n  Starting publisher...")
-        pub_proc = multiprocessing.Process(
+        pub_proc = MP_CTX.Process(
             target=run_publisher,
             args=(relay_url, args.namespace, pub_trackname, args),
             daemon=True,
@@ -352,7 +353,7 @@ def main():
           f"({args.stagger}s stagger)...")
     sub_procs = []
     for i in range(args.subscribers):
-        p = multiprocessing.Process(
+        p = MP_CTX.Process(
             target=run_subscriber,
             args=(i, relay_url, args.namespace, sub_trackname,
                   args, results),
