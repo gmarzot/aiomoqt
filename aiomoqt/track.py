@@ -732,6 +732,9 @@ class SubscribedTrack(Track):
             # discovery path gets it from PUBLISH instead).
             if getattr(ok, 'track_alias', None) is not None:
                 self.track_alias = ok.track_alias
+                if self.on_object:
+                    self.session.register_object_handler(
+                        self.track_alias, self.on_object)
             self.state = TrackState.SUBSCRIBED
             logger.info(f"Track: subscribed (direct) to {self.fqtn}")
             return
@@ -811,6 +814,9 @@ class SubscribedTrack(Track):
             self.track_alias = pub_msg.track_alias
             self.session._track_aliases[
                 pub_msg.track_alias] = pub_msg.request_id
+            if self.on_object:
+                self.session.register_object_handler(
+                    self.track_alias, self.on_object)
 
         ok = PublishOk(
             request_id=pub_msg.request_id,

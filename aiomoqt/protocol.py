@@ -273,6 +273,9 @@ class _MOQTSessionMixin:
         self._bidi_streams: Dict[int, int] = {}  # map request_id to bidi stream_id (d16)
         self._bidi_stream_requests: Dict[int, int] = {}  # map bidi stream_id to request_id (d16)
         self._track_aliases: Dict[int, int] = {}  # map alias to subscription_id
+        # Per-track object delivery keyed by track_alias; falls back to
+        # the session-global on_object_received when no entry matches.
+        self._object_handlers: Dict[int, Callable] = {}
         # Aliases seen on data streams before any control message bound
         # them: {alias: [first_seen_monotonic, streams_admitted]}. Data
         # legitimately races SUBSCRIBE_OK (§10.4.2), so an entry here is
@@ -486,6 +489,22 @@ class _MOQTSessionMixin:
         self._next_track_alias += 1
         self._track_aliases[track_alias] = request_id
         return track_alias
+
+    def register_object_handler(self, track_alias: int,
+                                callback: Callable) -> None:
+        """Route this track's objects to `callback` instead of the
+        session-global on_object_received (same signature). The alias is
+        known once SUBSCRIBE_OK / PUBLISH arrives."""
+        self._object_handlers[track_alias] = callback
+
+    def unregister_object_handler(self, track_alias: int) -> None:
+        self._object_handlers.pop(track_alias, None)
+
+    def _object_cb(self, track_alias) -> Optional[Callable]:
+        """Delivery callback for a track: per-alias route, else global."""
+        cb = (self._object_handlers.get(track_alias)
+              if track_alias is not None else None)
+        return cb or self.on_object_received
 
     def _control_task_done(self, task: asyncio.Task) -> None:
         """Remove control task from set."""
@@ -815,12 +834,12 @@ class _MOQTSessionMixin:
                 ):
                     self._cleanup_stream(stream_id)
                     return
-                if self.on_object_received:
+                cb = self._object_cb(getattr(state.parser, 'track_alias',
+                                             None))
+                if cb:
                     now = int(time.time() * 1_000_000)
-                    self.on_object_received(
-                        msg_obj, consumed, now,
-                        state.group_id, state.subgroup_id
-                    )
+                    cb(msg_obj, consumed, now,
+                       state.group_id, state.subgroup_id)
             elif isinstance(msg_obj, SubgroupHeader):
                 assert (state.group_id is None
                         or msg_obj.group_id > state.group_id)
@@ -1166,8 +1185,9 @@ class _MOQTSessionMixin:
             logstr = f"{id} size: {consumed} bytes {delay}"
 
             logger.debug(f"MOQT event: ObjectDatagram: {logstr}")
-            if self.on_object_received:
-                self.on_object_received(msg, consumed, now, group_id, None)
+            cb = self._object_cb(msg.track_alias)
+            if cb:
+                cb(msg, consumed, now, group_id, None)
             return msg
         # Draft-14: ObjectDatagramStatus types 0x20-0x21 (status datagrams)
         elif 0x20 <= dgram_type <= 0x21:
@@ -1229,8 +1249,10 @@ class _MOQTSessionMixin:
         logger.debug(
             f"MOQT event: d18 ObjectDatagram: {msg.group_id}.{msg.object_id} "
             f"size: {consumed} bytes status: {msg.status}")
-        if msg.status == ObjectStatus.NORMAL and self.on_object_received:
-            self.on_object_received(msg, consumed, now, msg.group_id, None)
+        if msg.status == ObjectStatus.NORMAL:
+            cb = self._object_cb(msg.track_alias)
+            if cb:
+                cb(msg, consumed, now, msg.group_id, None)
         return msg
 
     def _on_control_data(self, stream_id: int, data, end_stream: bool,
@@ -2812,6 +2834,7 @@ class _MOQTSessionMixin:
                     self._cleanup_stream(
                         sid, QuicErrorCode.APPLICATION_ERROR)
             self._track_aliases.pop(track_alias, None)
+            self._object_handlers.pop(track_alias, None)
         self._subscriptions.pop(msg.request_id, None)
 
     async def _handle_subscribe_done(self, msg: SubscribeDone) -> None:
@@ -2838,6 +2861,7 @@ class _MOQTSessionMixin:
                     # with parser=None and parse-fail.
                     self._mark_stream_torn_down(sid)
             self._track_aliases.pop(track_alias, None)
+            self._object_handlers.pop(track_alias, None)
         future = self._pending_requests.get(msg.request_id)
         if future and not future.done():
             future.set_result(msg)
