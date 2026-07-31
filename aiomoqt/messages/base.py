@@ -450,21 +450,17 @@ class MOQTMessage:
                     token_buf.push_vint(AuthTokenType.OUT_OF_BAND)  # Token Type
                     token_buf.push_bytes(param_value)  # Token Value (rest of param)
                     param_value = token_buf.data_slice(0, token_buf.tell())
-                    logger.info(f"Serializing AUTH_TOKEN param as Token(USE_VALUE): {len(param_value)} bytes")
 
-                logger.info(f"Serializing param {param_type} length {len(param_value)}")
                 payload.push_vint(len(param_value))  # Length
                 payload.push_bytes(param_value)  # Value
             else:  # Even type - Value is varint (no Length field)
                 if not isinstance(param_value, int):
                     raise TypeError(f"Param {param_type} expects uint, got {type(param_value)}")
-                logger.info(f"Serializing param {param_type} value {param_value}")
                 if param_type in prof.uint8_params:
                     payload.push_uint8(param_value)  # d18 fixed uint8 width
                 else:
                     payload.push_vint(param_value)  # Value as varint
 
-        logger.info(f"Serialized {len(parameters)} parameters: {payload.data_slice(0,12)}")
 
 
     @staticmethod
@@ -520,7 +516,6 @@ class MOQTMessage:
                     raise MOQTProtocolViolation(
                         f"parameter length {param_len} exceeds remaining "
                         f"{buf_end - buf.tell()}")
-                logger.info(f"deserializing param {param_type} length {param_len}")
                 param_value = buf.pull_bytes(param_len)
 
                 # AUTH_TOKEN: unwrap Token structure (Section 9.2.1.1)
@@ -537,7 +532,6 @@ class MOQTMessage:
                         token_alias = token_buf.pull_vint()
                         token_type = token_buf.pull_vint()
                         param_value = token_buf.pull_bytes(param_len - token_buf.tell())
-                    logger.info(f"AUTH_TOKEN: alias_type={alias_type} value={len(param_value)} bytes")
             else:  # Even type - Value is varint
                 if param_type in prof.uint8_params:
                     param_value = buf.pull_uint8()  # d18 fixed uint8 width
