@@ -2506,7 +2506,48 @@ class _MOQTSessionMixin:
             self.send_stream_message(stream_id, message)
         else:
             self.send_control_message(message)
+        # d18: the ack only opens the report; the namespaces themselves
+        # arrive as NAMESPACE messages on the same stream. A publisher
+        # serving exactly the subscribed prefix reports one empty
+        # suffix, meaning "the prefix itself is the namespace".
+        if self._profile.vi64 and stream_id is not None:
+            ns = Namespace(namespace_suffix=())
+            logger.info(f"MOQT send: {ns}")
+            self.send_stream_message(stream_id, ns)
         return message
+
+    async def subscribe_tracks(
+        self,
+        namespace: Union[str, Tuple[bytes, ...]],
+        parameters: Optional[Dict[int, bytes]] = None,
+        wait_response: Optional[bool] = False,
+    ) -> Optional[MOQTMessage]:
+        """d18 SUBSCRIBE_TRACKS (0x51) — enumerate the tracks in ONE
+        namespace.
+
+        d18 splits discovery in two: SUBSCRIBE_NAMESPACE reports which
+        namespaces exist under a prefix (NAMESPACE messages), and this
+        asks a specific namespace for its tracks, answered with PUBLISH.
+        Pre-d18 the first request did both, which obliged a relay to
+        push a PUBLISH for every track under a broad prefix.
+        """
+        if parameters is None:
+            parameters = {}
+        ns = self._make_namespace_tuple(namespace)
+        request_id = self._allocate_request_id()
+        message = SubscribeTracks(
+            request_id=request_id,
+            namespace_prefix=ns,
+            parameters=parameters,
+        )
+        logger.info(f"MOQT send: {message}")
+        stream_id = await self.open_bidi_stream()
+        self.send_stream_message(stream_id, message)
+        self._bidi_streams[request_id] = stream_id
+        self._bidi_stream_requests[stream_id] = request_id
+        if not wait_response:
+            return message
+        return await self._await_response(request_id)
 
     async def await_namespace(self, timeout: float = 10.0):
         """Wait for a NAMESPACE announcement from the relay.
@@ -2778,9 +2819,19 @@ class _MOQTSessionMixin:
         self.subscribe_namespace_ok(msg, stream_id=stream_id)
 
     async def _handle_subscribe_tracks(self, msg: SubscribeTracks) -> None:
-        # d18 SUBSCRIBE_TRACKS (0x51) — publisher-side track-prefix subscribe.
-        # Track-publish wiring is a publisher feature; log-only for now.
+        """d18 SUBSCRIBE_TRACKS (0x51) — a subscriber asking one
+        namespace for its tracks. Ack it; the application answers with
+        PUBLISH per track (the same announcement d14/d16 relays pushed
+        unprompted from SUBSCRIBE_NAMESPACE). An app that registers its
+        own handler for this type overrides the default ack."""
         logger.info(f"MOQT event: handle {msg}")
+        stream_id = self._bidi_streams.get(msg.request_id)
+        reply = RequestOk(request_id=msg.request_id)
+        logger.info(f"MOQT send: {reply}")
+        if stream_id is not None:
+            self.send_stream_message(stream_id, reply)
+        else:
+            self.send_control_message(reply)
 
     async def _handle_publish_blocked(self, msg: PublishBlocked) -> None:
         # d18 PUBLISH_BLOCKED (0x0F) — subscriber-side notice that a track

@@ -736,8 +736,17 @@ class SubscribedTrack(Track):
             logger.info(f"Track: subscribed (direct) to {self.fqtn}")
             return
 
-        # Namespace-based discovery: subscribe_namespace → relay sends
-        # PUBLISH → extract trackname → PUBLISH_OK(forward=1). If a
+        # Namespace-based discovery. Two shapes:
+        #
+        #   d14/d16 — SUBSCRIBE_NAMESPACE alone; the relay pushes a
+        #     PUBLISH for every track under the prefix.
+        #   d18     — SUBSCRIBE_NAMESPACE reports NAMESPACEs under the
+        #     prefix, then SUBSCRIBE_TRACKS asks one namespace for its
+        #     tracks and that is answered with PUBLISH. Splitting the
+        #     two keeps a broad prefix from obliging the relay to
+        #     announce every track it holds.
+        #
+        # Both converge on PUBLISH → PUBLISH_OK(forward=1). If a
         # trackname is set, only a matching PUBLISH is accepted; others
         # are dropped. No fallback — discovery failure raises.
         ns_kwargs = {}
@@ -757,6 +766,22 @@ class SubscribedTrack(Track):
             **ns_kwargs,
         )
         self.state = TrackState.ANNOUNCED
+
+        if self.session._profile.vi64:
+            # d18: learn which namespaces exist under the prefix, then
+            # ask one of them for its tracks. An empty suffix means the
+            # prefix itself is the namespace.
+            ns_msg = await self.session.await_namespace(timeout=timeout)
+            suffix = tuple(
+                p.decode() if isinstance(p, bytes) else p
+                for p in (ns_msg.namespace_suffix or ())
+            )
+            full_ns = '/'.join(
+                part for part in (self.namespace, *suffix) if part)
+            logger.info(f"Track: d18 namespace discovered: {full_ns}")
+            self.namespace = full_ns
+            await self.session.subscribe_tracks(
+                namespace=full_ns, parameters=ns_params)
 
         if self.trackname is None:
             print(f"  Waiting for publisher on "

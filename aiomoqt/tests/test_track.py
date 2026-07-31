@@ -267,6 +267,7 @@ class TestSubscribedTrack:
             session.send_control_message = MagicMock()
             session.on_object_received = None
 
+            session._profile.vi64 = False
             session.negotiated_draft = 14  # exercise real PublishOk.serialize at d14
             t = SubscribedTrack(session, "bench")
             assert t.trackname is None
@@ -294,6 +295,7 @@ class TestSubscribedTrack:
             session.send_control_message = MagicMock()
             session.on_object_received = None
 
+            session._profile.vi64 = False
             session.negotiated_draft = 16  # exercise real PublishOk.serialize at d16
             t = SubscribedTrack(session, "bench")
             assert t.trackname is None
@@ -314,6 +316,7 @@ class TestSubscribedTrack:
                 return_value=MagicMock())
             session.await_publish = AsyncMock(
                 side_effect=asyncio.TimeoutError())
+            session._profile.vi64 = False
             session.subscribe = AsyncMock(return_value=MagicMock())
             session.on_object_received = None
 
@@ -356,4 +359,73 @@ class TestSubscribedTrack:
 
             assert session.on_object_received is cb
 
+        asyncio.run(_test())
+
+
+class TestD18Discovery:
+    """d18 splits discovery: SUBSCRIBE_NAMESPACE reports NAMESPACEs under
+    a prefix, then SUBSCRIBE_TRACKS asks one namespace for its tracks.
+    Pre-d18 the first request did both, so a broad prefix obliged the
+    relay to announce every track it held."""
+
+    def _d18_session(self, suffix=(), trackname=b"found-d18"):
+        session = MagicMock()
+        session._profile.vi64 = True
+        session.negotiated_draft = 18
+        ns_msg = MagicMock(spec=[])
+        ns_msg.namespace_suffix = suffix
+        pub_msg = MagicMock(spec=[])
+        pub_msg.track_namespace = (b"bench",)
+        pub_msg.track_name = trackname
+        pub_msg.request_id = 11
+        pub_msg.forward = 0
+        session.subscribe_namespace = AsyncMock(return_value=MagicMock())
+        session.await_namespace = AsyncMock(return_value=ns_msg)
+        session.subscribe_tracks = AsyncMock(return_value=MagicMock())
+        session.await_publish = AsyncMock(return_value=pub_msg)
+        session.send_control_message = MagicMock()
+        session.on_object_received = None
+        return session
+
+    def test_d18_walks_namespace_then_tracks(self):
+        async def _test():
+            session = self._d18_session()
+            t = SubscribedTrack(session, "bench")
+            await t.subscribe()
+            session.subscribe_namespace.assert_called_once()
+            session.await_namespace.assert_called_once()
+            # the second, d18-only step
+            session.subscribe_tracks.assert_called_once()
+            assert t.trackname == "found-d18"
+        asyncio.run(_test())
+
+    def test_d18_empty_suffix_means_prefix_is_the_namespace(self):
+        async def _test():
+            session = self._d18_session(suffix=())
+            t = SubscribedTrack(session, "bench")
+            await t.subscribe()
+            assert session.subscribe_tracks.call_args.kwargs[
+                "namespace"] == "bench"
+        asyncio.run(_test())
+
+    def test_d18_suffix_extends_the_prefix(self):
+        async def _test():
+            session = self._d18_session(suffix=(b"live",))
+            t = SubscribedTrack(session, "bench")
+            await t.subscribe()
+            assert session.subscribe_tracks.call_args.kwargs[
+                "namespace"] == "bench/live"
+        asyncio.run(_test())
+
+    def test_pre_d18_does_not_subscribe_tracks(self):
+        """d14/d16 must keep the single-request flow."""
+        async def _test():
+            session = self._d18_session()
+            session._profile.vi64 = False
+            session.negotiated_draft = 16
+            t = SubscribedTrack(session, "bench")
+            await t.subscribe()
+            session.await_namespace.assert_not_called()
+            session.subscribe_tracks.assert_not_called()
+            assert t.trackname == "found-d18"
         asyncio.run(_test())
