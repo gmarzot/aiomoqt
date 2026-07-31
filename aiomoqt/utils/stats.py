@@ -171,6 +171,14 @@ class TrackStats:
         self._last_recv_us = 0
         self._last_send_us = 0
 
+        # Datagram delivery has no subgroup stream, so a "group" is not
+        # something we observe opening — it is inferred from group_ids
+        # that happen to arrive. Under loss (expected for datagrams) a
+        # fully-lost group is never counted at all, making the total a
+        # lower bound rather than a measurement. Report n/a instead of a
+        # number that looks authoritative.
+        self._saw_datagram = False
+
         # Loss bookkeeping
         self._expected: dict = {}
         self._stride: dict = {}
@@ -241,6 +249,8 @@ class TrackStats:
             return
         # Datagrams carry no subgroup; streams key per subgroup.
         has_sg = hasattr(msg, 'subgroup_id') or subgroup_id is not None
+        if not has_sg:
+            self._saw_datagram = True
         sg = (getattr(msg, 'subgroup_id', None)
               if subgroup_id is None else subgroup_id) if has_sg else None
         key = (gid, sg if sg is not None else 0)
@@ -310,9 +320,13 @@ class TrackStats:
             lat_s = "--"
         expected = self.total_objects + self.total_lost
         loss_pct = (100 * self.total_lost / expected) if expected else 0
+        grps = ('n/a' if self._saw_datagram
+                else str(len(self._groups_seen)))
+        grp_rate = ('n/a' if self._saw_datagram
+                    else fmt_rate(self._iv_groups / dt))
         row = (f"  {f'{elapsed - dt:.0f}-{elapsed:.0f}s':<10}"
-               f"{len(self._groups_seen):<7}"
-               f"{fmt_rate(self._iv_groups / dt):<10}"
+               f"{grps:<7}"
+               f"{grp_rate:<10}"
                f"{self.total_objects:<10}"
                f"{fmt_rate(self._iv_objects / dt):<10}"
                f"{fmt_bps(self._iv_bytes * 8 / dt):<10}"
@@ -339,6 +353,7 @@ class TrackStats:
         expected = self.total_objects + self.total_lost
         return dict(
             duration_s=dur, active_s=active,
+            datagram=self._saw_datagram,
             groups=len(self._groups_seen),
             objects=self.total_objects, bytes=self.total_bytes,
             obj_rate=self.total_objects / active,

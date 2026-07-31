@@ -84,10 +84,13 @@ class BenchReporter:
         print(f"  aiomoqt-bench results  ({s['active_s']:.1f}s active "
               f"/ {s['duration_s']:.1f}s elapsed)")
         print("═" * 56)
-        print(f"  Groups:      {s['groups']:,}")
+        grps = 'n/a' if s.get('datagram') else f"{s['groups']:,}"
+        print(f"  Groups:      {grps}")
         print(f"  Objects:     {s['objects']:,}")
         print(f"  Bytes:       {s['bytes']:,}")
-        print(f"  GrpRate:     {s['grp_rate']:.1f} grp/s")
+        grp_rate = ('n/a' if s.get('datagram')
+                    else f"{s['grp_rate']:.1f} grp/s")
+        print(f"  GrpRate:     {grp_rate}")
         print(f"  ObjRate:     {s['obj_rate']:.1f} obj/s")
         print(f"  Throughput:  {s['mbps']:.2f} Mbps")
         if s['lat_mean']:

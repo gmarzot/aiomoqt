@@ -226,3 +226,32 @@ def test_headers_share_column_names():
 
 def test_empty_summary_is_falsy():
     assert TrackStats().summary() == {}
+
+
+def test_datagram_groups_reported_as_not_available():
+    """A receiver cannot count groups for datagram delivery: there is no
+    subgroup stream to observe opening, and a fully-lost group is never
+    seen at all. Reporting a number would look authoritative when it is
+    only a lower bound."""
+    s = TrackStats(windowed=False)
+    us = _now_us()
+    for g in range(3):
+        for o in range(4):
+            s.on_object(Dgram(g, o), 100, us)
+    time.sleep(0.01)
+    row = s.interval_row()
+    assert 'n/a' in row, row
+    assert s.summary()['datagram'] is True
+
+
+def test_stream_groups_still_reported():
+    s = TrackStats(windowed=False)
+    us = _now_us()
+    for g in range(3):
+        for o in range(4):
+            s.on_object(Obj(g, o), 100, us)
+    time.sleep(0.01)
+    row = s.interval_row()
+    assert 'n/a' not in row, row
+    assert s.summary()['datagram'] is False
+    assert s.summary()['groups'] == 3

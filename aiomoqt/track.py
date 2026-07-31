@@ -350,9 +350,12 @@ class PublishedTrack(Track):
         self._do_print_stats_header()
 
     def _do_print_stats_header(self):
-        print(f"\n  {'Interval':<10}{'Grps':<8}{'Objs':<10}"
-              f"{'ObjRate':<10}{'Bitrate':<10}")
-        print("  " + "─" * 48)
+        # Publisher group counts are emitted, not observed: no loss and
+        # no inference, so they stay meaningful for datagram delivery
+        # too (unlike the receiver's, which can miss a fully-lost group).
+        print(f"\n  {'Interval':<10}{'Grps':<8}{'GrpRate':<10}"
+              f"{'Objs':<10}{'ObjRate':<10}{'Bitrate':<10}")
+        print("  " + "─" * 58)
 
     async def generate(self, session, track_alias: int):
         """Generate data for subscribers. Override for custom content.
@@ -475,9 +478,10 @@ class PublishedTrack(Track):
                     bps_s = fmt_bps(bps)
                     iv = f"{elapsed - dt:.0f}-{elapsed:.0f}s"
                     self._print_stats_header()
+                    grp_s = fmt_rate(self._iv_groups / dt)
                     print(f"  {iv:<10}{self._total_groups:<8}"
-                          f"{self._total_sent:<10}{rate_s:<10}"
-                          f"{bps_s:<10}")
+                          f"{grp_s:<10}{self._total_sent:<10}"
+                          f"{rate_s:<10}{bps_s:<10}")
                     self._iv_objects = 0
                     self._iv_bytes = 0
                     self._iv_groups = 0
@@ -600,9 +604,10 @@ class PublishedTrack(Track):
                     bps_s = fmt_bps(bps)
                     iv = f"{elapsed - dt:.0f}-{elapsed:.0f}s"
                     self._print_stats_header()
+                    grp_s = fmt_rate(self._iv_groups / dt)
                     print(f"  {iv:<10}{self._total_groups:<8}"
-                          f"{self._total_sent:<10}{rate_s:<10}"
-                          f"{bps_s:<10}")
+                          f"{grp_s:<10}{self._total_sent:<10}"
+                          f"{rate_s:<10}{bps_s:<10}")
                     self._iv_objects = 0
                     self._iv_bytes = 0
                     self._iv_groups = 0
