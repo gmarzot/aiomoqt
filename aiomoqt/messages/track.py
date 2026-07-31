@@ -295,7 +295,9 @@ class ObjectHeader(MOQTMessage):
             vi64: use the d18 vi64 integer codec for the object fields.
         """
         payload_len = len(self.payload)
-        buf = Buffer(capacity=(BUF_SIZE + payload_len))
+        # vi64 on the buffer keeps the extension block's varints in the
+        # same flavor as the object fields (d18 frames are all-vi64).
+        buf = Buffer(capacity=(BUF_SIZE + payload_len), vi64=vi64)
         push = buf.push_uint_vi64 if vi64 else buf.push_uint_var
 
         # Delta encoding
