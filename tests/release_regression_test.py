@@ -51,22 +51,24 @@ def _progress(msg: str) -> None:
 DEFAULT_CATALOG = Path(__file__).parent / "relays.json"
 
 TIERS = {
-    "unit":        ["buffer", "message", "track"],
-    "integration": ["loopback-setup", "loopback-pub-sub",
+    "unit":        ["pytest"],
+    "integration": ["loopback-pub-sub",
                     "loopback-pub-sub-tiny",
                     "loopback-pub-sub-streams",
                     "loopback-pub-sub-paced",
                     # draft × transport matrix — catches session-setup /
-                    # framing breaks in our own tools across both drafts
-                    # and transports (the kind that slipped through 0.9.7-9).
+                    # framing breaks in our own tools across every draft
+                    # and transport (the kind that slipped through 0.9.7-9).
                     "loopback-bench-d14-wt", "loopback-bench-d14-quic",
                     "loopback-bench-d16-wt", "loopback-bench-d16-quic",
+                    "loopback-bench-d18-wt", "loopback-bench-d18-quic",
                     # adaptive BW over the multi-process loopback path
                     # (the in-process loopback misses the pub/sub-worker
                     # start path — see the 0.9.10 BW clobber).
                     "loopback-adaptive-mp-d14", "loopback-adaptive-mp-d16",
-                    "loopback-join", "loopback-fetch"],
-    "interop":     ["relay-ctrl-msg", "relay-pub-sub",
+                    "loopback-adaptive-mp-d18",
+                    "loopback-fetch"],
+    "interop":     ["relay-ctrl-msg", "relay-pub-sub", "relay-discovery",
                     "relay-join", "relay-fetch"],
     "bench":       ["loopback-adaptive-bench"],
 }
@@ -112,7 +114,8 @@ def _run(cmd: list[str], log: Path, timeout: int) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 # Unit-tier runners
 # ---------------------------------------------------------------------------
-def _pytest_file(test_file: str, log: Path) -> tuple[str, str]:
+def _pytest_file(test_file: str, log: Path,
+                 extra: list[str] = ()) -> tuple[str, str]:
     # Use `python -m pytest` rather than the `pytest` binary so the
     # current working directory is added to sys.path. Without that, an
     # installed copy of aiomoqt under site-packages may shadow the
@@ -120,8 +123,8 @@ def _pytest_file(test_file: str, log: Path) -> tuple[str, str]:
     # to their own __file__ (e.g. CERT_DIR = ../../certs) will resolve
     # to the wheel location which has no neighbouring certs/. Result:
     # tests that should run get silently skipped.
-    ok, _ = _run([sys.executable, "-m", "pytest", "-q", test_file],
-                 log, 180)
+    ok, _ = _run([sys.executable, "-m", "pytest", "-q", test_file, *extra],
+                 log, 300)
     if not ok:
         return "FAIL", "timeout"
     # Search for the pytest summary line anywhere in the captured
@@ -149,32 +152,22 @@ def _pytest_file(test_file: str, log: Path) -> tuple[str, str]:
     return ("PASS" if failed_count == 0 else "FAIL"), summary_line
 
 
-def _buffer(log_dir: Path) -> tuple[str, str]:
-    log = log_dir / "buffer.log"
-    ok, _ = _run([sys.executable, "tests/test_rebuf.py"], log, 60)
-    text = log.read_text()
-    m = re.search(r"(\d+) passed,\s*(\d+) failed", text)
-    passed = ok and m and m.group(2) == "0"
-    summary = m.group(0) if m else "(no summary)"
-    return ("PASS" if passed else "FAIL"), summary
+# Kept out of the whole-tree run so a platform can skip it: on macOS the
+# QUIC close drain stalls ~10s on an un-drained fetch stream.
+_PYTEST_STANDALONE = ("aiomoqt/tests/test_loopback_fetch.py",)
 
 
-def _message(log_dir: Path) -> tuple[str, str]:
-    return _pytest_file("aiomoqt/tests/test_messages.py",
-                        log_dir / "message.log")
-
-
-def _track(log_dir: Path) -> tuple[str, str]:
-    return _pytest_file("aiomoqt/tests/test_track.py",
-                        log_dir / "track.log")
+def _pytest_all(log_dir: Path) -> tuple[str, str]:
+    """Every pytest test in one run. Naming files individually leaves new
+    test modules silently unrun; the tool-driven suites below cover only
+    what pytest cannot reach."""
+    ignores = [f"--ignore={p}" for p in _PYTEST_STANDALONE]
+    return _pytest_file("aiomoqt/tests", log_dir / "pytest.log", ignores)
 
 
 # ---------------------------------------------------------------------------
 # Integration-tier runners
 # ---------------------------------------------------------------------------
-def _loopback_setup(log_dir: Path) -> tuple[str, str]:
-    return _pytest_file("aiomoqt/tests/test_loopback_setup.py",
-                        log_dir / "loopback-setup.log")
 
 
 def _loopback_pub_sub(log_dir: Path) -> tuple[str, str]:
@@ -238,11 +231,6 @@ def _loopback_pub_sub_paced(log_dir: Path) -> tuple[str, str]:
         ["-P", "4", "-s", "8192", "-r", "800", "-g", "5000", "-t", "8"],
         timeout=40,
     )
-
-
-def _loopback_join(log_dir: Path) -> tuple[str, str]:
-    return _pytest_file("aiomoqt/tests/test_loopback_join.py",
-                        log_dir / "loopback-join.log")
 
 
 def _loopback_fetch(log_dir: Path) -> tuple[str, str]:
@@ -369,6 +357,12 @@ def _relay_fetch(url: str, draft: int, insecure: bool,
     return _relay_tap_case(url, draft, "fetch", insecure, compat, log)
 
 
+def _relay_discovery(url: str, draft: int, insecure: bool,
+                     compat: str, log: Path) -> tuple[str, str]:
+    return _relay_tap_case(url, draft, "namespace-discovery",
+                           insecure, compat, log)
+
+
 # ---------------------------------------------------------------------------
 # Bench-tier runners
 # ---------------------------------------------------------------------------
@@ -491,6 +485,9 @@ def _run_relay_matrix(relay: dict, enabled: set[str],
             if "relay-fetch" in enabled:
                 _dispatch("relay-fetch", "", tag, slug,
                           _relay_fetch, url, draft, insecure, compat_csv)
+            if "relay-discovery" in enabled:
+                _dispatch("relay-discovery", "", tag, slug,
+                          _relay_discovery, url, draft, insecure, compat_csv)
 
     return results
 
@@ -568,26 +565,14 @@ def main() -> int:
     # --- unit tier ---
     if enabled & set(TIERS["unit"]):
         print("\n== unit ==")
-        if "buffer" in enabled:
-            status, detail = _buffer(log_dir)
-            record_and_print((status, "buffer", detail,
-                              log_dir / "buffer.log"))
-        if "message" in enabled:
-            status, detail = _message(log_dir)
-            record_and_print((status, "message", detail,
-                              log_dir / "message.log"))
-        if "track" in enabled:
-            status, detail = _track(log_dir)
-            record_and_print((status, "track", detail,
-                              log_dir / "track.log"))
+        if "pytest" in enabled:
+            status, detail = _pytest_all(log_dir)
+            record_and_print((status, "pytest", detail,
+                              log_dir / "pytest.log"))
 
     # --- integration tier ---
     if enabled & set(TIERS["integration"]):
         print("\n== integration ==")
-        if "loopback-setup" in enabled:
-            status, detail = _loopback_setup(log_dir)
-            record_and_print((status, "loopback-setup", detail,
-                              log_dir / "loopback-setup.log"))
         if "loopback-pub-sub" in enabled:
             status, detail = _loopback_pub_sub(log_dir)
             record_and_print((status, "loopback-pub-sub", detail,
@@ -604,23 +589,19 @@ def main() -> int:
             status, detail = _loopback_pub_sub_paced(log_dir)
             record_and_print((status, "loopback-pub-sub-paced", detail,
                               log_dir / "loopback-pub-sub-paced.log"))
-        for draft in (14, 16):
+        for draft in (14, 16, 18):
             for quic in (False, True):
                 suite = f"loopback-bench-d{draft}-{'quic' if quic else 'wt'}"
                 if suite in enabled:
                     status, detail = _loopback_bench_combo(log_dir, draft, quic)
                     record_and_print((status, suite, detail,
                                       log_dir / f"{suite}.log"))
-        for draft in (14, 16):
+        for draft in (14, 16, 18):
             suite = f"loopback-adaptive-mp-d{draft}"
             if suite in enabled:
                 status, detail = _loopback_adaptive_mp(log_dir, draft)
                 record_and_print((status, suite, detail,
                                   log_dir / f"{suite}.log"))
-        if "loopback-join" in enabled:
-            status, detail = _loopback_join(log_dir)
-            record_and_print((status, "loopback-join", detail,
-                              log_dir / "loopback-join.log"))
         if "loopback-fetch" in enabled:
             status, detail = _loopback_fetch(log_dir)
             record_and_print((status, "loopback-fetch", detail,

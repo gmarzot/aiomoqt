@@ -18,7 +18,7 @@ import logging
 import os
 
 from aiomoqt.server import MOQTServer
-from aiomoqt.types import MOQTMessageType, parse_draft_spec
+from aiomoqt.types import D18MessageType, MOQTMessageType, parse_draft_spec
 from aiomoqt.track import PublishedTrack
 from aiomoqt.types import ForwardingPreference
 from aiomoqt.utils.logger import set_log_level, get_logger
@@ -170,14 +170,33 @@ async def _on_subscribe(session, msg, args):
 
 async def _on_subscribe_namespace(session, msg, args):
     """Discovery responder: a subscriber sent SUBSCRIBE_NAMESPACE to
-    learn what we publish (it omitted --trackname). Ack it, then
-    announce the track with PUBLISH (and PUBLISH_NAMESPACE under
+    learn what we publish (it omitted --trackname).
+
+    d14/d16 fuse discovery into this one request, so ack and announce.
+    d18 reports only namespaces here; the tracks follow on
+    SUBSCRIBE_TRACKS.
+    """
+    stream_id = session._bidi_streams.get(msg.request_id)
+    session.subscribe_namespace_ok(msg, stream_id=stream_id)
+    if session._profile.two_level_discovery:
+        session.namespace(stream_id=stream_id)
+        return
+    await _announce_track(session, args)
+
+
+async def _on_subscribe_tracks(session, msg, args):
+    """d18 second-level discovery: the subscriber picked one of the
+    namespaces we reported and is asking for its tracks."""
+    session.subscribe_tracks_ok(msg)
+    await _announce_track(session, args)
+
+
+async def _announce_track(session, args):
+    """Announce the track with PUBLISH (and PUBLISH_NAMESPACE under
     --pub-ns/--pub-both). The subscriber's await_publish learns the
     trackname and replies PUBLISH_OK(forward=1), which the track's own
     handler turns into generation. Keeps the track alive for the
     session via wait_closed()."""
-    stream_id = session._bidi_streams.get(msg.request_id)
-    session.subscribe_namespace_ok(msg, stream_id=stream_id)
     track = PublishedTrack(
         session,
         namespace=args.namespace,
@@ -251,6 +270,9 @@ async def main():
     server.register_handler(
         MOQTMessageType.SUBSCRIBE_NAMESPACE,
         partial(_on_subscribe_namespace, args=args))
+    server.register_handler(
+        D18MessageType.SUBSCRIBE_TRACKS,
+        partial(_on_subscribe_tracks, args=args))
     quic_server = await server.serve()
 
     transport = "raw QUIC" if args.quic else "H3/WebTransport"

@@ -267,7 +267,7 @@ class TestSubscribedTrack:
             session.send_control_message = MagicMock()
             session.on_object_received = None
 
-            session._profile.vi64 = False
+            session._profile.two_level_discovery = False
             session.negotiated_draft = 14  # exercise real PublishOk.serialize at d14
             t = SubscribedTrack(session, "bench")
             assert t.trackname is None
@@ -295,7 +295,7 @@ class TestSubscribedTrack:
             session.send_control_message = MagicMock()
             session.on_object_received = None
 
-            session._profile.vi64 = False
+            session._profile.two_level_discovery = False
             session.negotiated_draft = 16  # exercise real PublishOk.serialize at d16
             t = SubscribedTrack(session, "bench")
             assert t.trackname is None
@@ -316,7 +316,7 @@ class TestSubscribedTrack:
                 return_value=MagicMock())
             session.await_publish = AsyncMock(
                 side_effect=asyncio.TimeoutError())
-            session._profile.vi64 = False
+            session._profile.two_level_discovery = False
             session.subscribe = AsyncMock(return_value=MagicMock())
             session.on_object_received = None
 
@@ -370,7 +370,7 @@ class TestD18Discovery:
 
     def _d18_session(self, suffix=(), trackname=b"found-d18"):
         session = MagicMock()
-        session._profile.vi64 = True
+        session._profile.two_level_discovery = True
         session.negotiated_draft = 18
         ns_msg = MagicMock(spec=[])
         ns_msg.namespace_suffix = suffix
@@ -421,7 +421,7 @@ class TestD18Discovery:
         """d14/d16 must keep the single-request flow."""
         async def _test():
             session = self._d18_session()
-            session._profile.vi64 = False
+            session._profile.two_level_discovery = False
             session.negotiated_draft = 16
             t = SubscribedTrack(session, "bench")
             await t.subscribe()

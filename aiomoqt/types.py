@@ -1,4 +1,5 @@
 from enum import IntEnum
+from typing import Dict, Tuple
 
 MOQT_VERSION_DRAFT14 = 0xff00000e
 MOQT_VERSION_DRAFT16 = 0xff000010
@@ -203,6 +204,17 @@ class D18MessageType:
     SUBSCRIBE_NAMESPACE = 0x50  # was 0x11 in d14/d16
     SUBSCRIBE_TRACKS = 0x51     # new in d18
     PUBLISH_BLOCKED = 0x0F      # new in d18 (d14 TRACK_STATUS_ERROR point)
+
+
+# Code points that denote the same logical message under different
+# numbers across drafts. register_handler() expands a registration to
+# every alias, so a handler registered by one draft's name also fires on
+# the others. Safe because a draft's CONTROL_REGISTRY holds only its own
+# number: the alias key is inert on drafts that don't use it.
+HANDLER_ALIASES: Dict[int, Tuple[int, ...]] = {
+    MOQTMessageType.SUBSCRIBE_NAMESPACE: (D18MessageType.SUBSCRIBE_NAMESPACE,),
+    D18MessageType.SUBSCRIBE_NAMESPACE: (MOQTMessageType.SUBSCRIBE_NAMESPACE,),
+}
 
 
 class ParamType(IntEnum):

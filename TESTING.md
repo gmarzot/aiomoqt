@@ -54,8 +54,8 @@ Pass criteria:
 
 | Tier | Network | CI-gated | Purpose |
 |------|---------|----------|---------|
-| `unit` | none | yes (PR) | pure-Python correctness; messages/track/buffer |
-| `integration` | localhost | yes (PR) | pub/sub + setup + join + fetch over in-process qh3 |
+| `unit` | none | yes (PR) | the entire pytest tree |
+| `integration` | localhost | yes (PR) | tools, multi-process paths, draft × transport matrix |
 | `interop` | public | manual / weekly | live relays in `tests/relays.json` |
 | `bench` | localhost or relay | manual | adaptive throughput ceiling measurement |
 
@@ -68,14 +68,13 @@ or `--test-suite <suite>` (runs a single suite, ignoring tier).
 ## Test Suites
 
 ### `unit` tier
-- **`buffer`** — `tests/test_rebuf.py`; stream reassembly (object-boundary alignment, partial-chunk handling, subgroup reconstruction). Standalone script, not pytest.
-- **`message`** — `pytest aiomoqt/tests/test_messages.py`; round-trip serialization for every MoQT control message across d14 and d16.
-- **`track`** — `pytest aiomoqt/tests/test_track.py`; `PublishedTrack` / `SubscribedTrack` unit tests.
+- **`pytest`** — the whole `aiomoqt/tests` tree in one run. Naming files individually left new test modules silently unrun, so this suite is deliberately a directory, not a list. `test_loopback_fetch.py` is excluded here and runs as its own suite so a platform can skip it.
 
 ### `integration` tier
-- **`loopback-setup`** — d14/d16 session handshake and `AUTH_TOKEN` parameter round-trip, in-process qh3.
-- **`loopback-pub-sub`** — `loopback_bench` at fixed rate; asserts throughput > 0 and zero loss.
-- **`loopback-join`** — `JOINING_SUBSCRIBE` with `ABSOLUTE` and `RELATIVE` fetch types.
+Covers what pytest cannot reach: the tools, the multi-process paths, and the draft × transport matrix.
+- **`loopback-pub-sub`** — `loopback_bench` at fixed rate; asserts throughput > 0 and zero loss. Variants: `-tiny`, `-streams`, `-paced`.
+- **`loopback-bench-d{14,16,18}-{wt,quic}`** — session-setup / framing smoke for every draft × transport.
+- **`loopback-adaptive-mp-d{14,16,18}`** — adaptive BW over the multi-process loopback path.
 - **`loopback-fetch`** — standalone `FETCH` variants: joining-relative, explicit range, invalid-range rejection, unknown request-id rejection.
 
 ### `interop` tier (per active relay × transport × draft)
@@ -83,6 +82,7 @@ or `--test-suite <suite>` (runs a single suite, ignoring tier).
 - **`relay-pub-sub`** — 3-subscriber multi-sub bench against the relay; asserts N/N subscribers receive the published objects.
 - **`relay-join`** — `SUBSCRIBE + JOINING_FETCH` probe (most relays do not implement this yet; disabled by default in the catalog).
 - **`relay-fetch`** — standalone `FETCH` probe (same).
+- **`relay-discovery`** — a subscriber knowing only the namespace learns the trackname. d14/d16 answer `SUBSCRIBE_NAMESPACE` with a `PUBLISH` per track; d18 reports namespaces first (`NAMESPACE`) and answers a second request, `SUBSCRIBE_TRACKS`. The publisher announces with both `PUBLISH_NAMESPACE` and `PUBLISH`, since a relay learns a namespace exists from the former.
 
 ### `bench` tier (manual dispatch only; not PR-gated)
 - **`loopback-adaptive-bench`** — ramps rate in steps, stops on loss / p99 latency growth / throughput shortfall, reports the last stable rate.
@@ -103,7 +103,7 @@ python tests/release_regression_test.py --test-tier unit
 python tests/release_regression_test.py --test-tier interop
 
 # Individual suite (bypasses tier grouping)
-python tests/release_regression_test.py --test-suite message
+python tests/release_regression_test.py --test-suite pytest
 python tests/release_regression_test.py --test-suite loopback-pub-sub --test-suite relay-ctrl-msg
 
 # Interop in parallel across relays

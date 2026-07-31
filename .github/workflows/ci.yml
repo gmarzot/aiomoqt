@@ -322,8 +322,8 @@ jobs:
         if: always()
         run: docker rm -f moqx 2>/dev/null || true
 
-  benchmark:
-    name: benchmark
+  microbenchmark:
+    name: microbenchmark
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
@@ -331,11 +331,13 @@ jobs:
         with:
           fetch-depth: 0
       - uses: ./.github/actions/setup-aiomoqt
-      - name: Run parser microbench
-        timeout-minutes: 5
+      - name: Run codec microbenches (d14/d16/d18)
+        timeout-minutes: 10
         run: |
-          # b1_parser is parser-only, no transport; reliable on
-          # hosted runners. Floor enforcement deferred until we have
-          # a few runs to calibrate runner noise.
-          python -m aiomoqt.tests.microbench.b1_parser \
-            --duration 3 || true
+          # Codec-only, no transport — the subset that is reliable on
+          # hosted runners. Each sweeps all three drafts. Floor
+          # enforcement deferred until enough runs to calibrate noise.
+          python -m aiomoqt.tests.microbench.b1_parser --duration 3 || true
+          python -m aiomoqt.tests.microbench.b7_framer --duration 3 || true
+          python -m aiomoqt.tests.microbench.b8_control_roundtrip \
+            --duration 2 || true

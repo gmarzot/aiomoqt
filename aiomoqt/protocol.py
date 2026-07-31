@@ -98,8 +98,14 @@ class MOQTPeer:
     def register_handler(self, msg_type: int, handler: Callable) -> None:
         """Register a custom handler that overrides the default handler
         for this message type. The message class is taken from the
-        session's negotiated draft at dispatch time."""
+        session's negotiated draft at dispatch time.
+
+        Registration is expanded over HANDLER_ALIASES so a type that is
+        renumbered between drafts stays registered under every number.
+        """
         self._control_msg_handlers[msg_type] = handler
+        for alias in HANDLER_ALIASES.get(msg_type, ()):
+            self._control_msg_handlers[alias] = handler
 
 
 @dataclass(slots=True)
@@ -2496,24 +2502,71 @@ class _MOQTSessionMixin:
         msg: SubscribeNamespace,
         stream_id: int = None,
     ) -> Optional[MOQTMessage]:
-        """Create and send a SUBSCRIBE_NAMESPACE_OK response.
+        """Send a positive response to SUBSCRIBE_NAMESPACE.
 
-        In d16+, responds on the same bidi stream the request came on.
+        Draft-14 sends SubscribeNamespaceOk on code point 0x12; d16
+        removed that type, so d16+ acks with REQUEST_OK and replies on
+        the bidi stream the request arrived on.
+
+        The ack alone reports no namespaces: in d18 the application
+        follows it with namespace() per namespace it serves.
         """
-        message = SubscribeNamespaceOk(request_id=msg.request_id)
+        if is_draft16_or_later(self.negotiated_draft):
+            message = RequestOk(request_id=msg.request_id)
+        else:
+            message = SubscribeNamespaceOk(request_id=msg.request_id)
         logger.info(f"MOQT send: {message}")
         if stream_id is not None and is_draft16_or_later(self.negotiated_draft):
             self.send_stream_message(stream_id, message)
         else:
             self.send_control_message(message)
-        # d18: the ack only opens the report; the namespaces themselves
-        # arrive as NAMESPACE messages on the same stream. A publisher
-        # serving exactly the subscribed prefix reports one empty
-        # suffix, meaning "the prefix itself is the namespace".
-        if self._profile.vi64 and stream_id is not None:
-            ns = Namespace(namespace_suffix=())
-            logger.info(f"MOQT send: {ns}")
-            self.send_stream_message(stream_id, ns)
+        return message
+
+    def subscribe_tracks_ok(
+        self,
+        msg: 'SubscribeTracks',
+        stream_id: int = None,
+    ) -> Optional[MOQTMessage]:
+        """Send a positive response to SUBSCRIBE_TRACKS (d18).
+
+        The ack reports no tracks: the application follows it with a
+        PUBLISH per track in the requested namespace.
+        """
+        if stream_id is None:
+            stream_id = self._bidi_streams.get(msg.request_id)
+        message = RequestOk(request_id=msg.request_id)
+        logger.info(f"MOQT send: {message}")
+        if stream_id is not None:
+            self.send_stream_message(stream_id, message)
+        else:
+            self.send_control_message(message)
+        return message
+
+    def namespace(
+        self,
+        namespace_suffix: Union[str, Tuple[bytes, ...]] = (),
+        stream_id: int = None,
+    ) -> Optional[MOQTMessage]:
+        """Report one namespace under a prefix a peer subscribed to, as
+        a suffix relative to that prefix — an empty suffix means the
+        prefix itself is the namespace.
+
+        d18 discovery is two-level: this answers SUBSCRIBE_NAMESPACE
+        (which namespaces exist), and the peer then asks each one for
+        its tracks with SUBSCRIBE_TRACKS. Send on the request's bidi
+        stream, after subscribe_namespace_ok().
+        """
+        if isinstance(namespace_suffix, str):
+            suffix = (self._make_namespace_tuple(namespace_suffix)
+                      if namespace_suffix else ())
+        else:
+            suffix = tuple(namespace_suffix)
+        message = Namespace(namespace_suffix=suffix)
+        logger.info(f"MOQT send: {message}")
+        if stream_id is not None:
+            self.send_stream_message(stream_id, message)
+        else:
+            self.send_control_message(message)
         return message
 
     async def subscribe_tracks(
@@ -2599,8 +2652,14 @@ class _MOQTSessionMixin:
     
     def register_handler(self, msg_type: int, handler: Callable) -> None:
         """Register a custom handler, overriding the default handler for
-        this message type on this session."""
+        this message type on this session.
+
+        Registration is expanded over HANDLER_ALIASES so a type that is
+        renumbered between drafts stays registered under every number.
+        """
         self._control_msg_overrides[msg_type] = handler
+        for alias in HANDLER_ALIASES.get(msg_type, ()):
+            self._control_msg_overrides[alias] = handler
     
     async def _handle_server_setup(self, msg: ServerSetup) -> None:
         logger.info(f"MOQT event: handle {msg}")
@@ -2825,13 +2884,7 @@ class _MOQTSessionMixin:
         unprompted from SUBSCRIBE_NAMESPACE). An app that registers its
         own handler for this type overrides the default ack."""
         logger.info(f"MOQT event: handle {msg}")
-        stream_id = self._bidi_streams.get(msg.request_id)
-        reply = RequestOk(request_id=msg.request_id)
-        logger.info(f"MOQT send: {reply}")
-        if stream_id is not None:
-            self.send_stream_message(stream_id, reply)
-        else:
-            self.send_control_message(reply)
+        self.subscribe_tracks_ok(msg)
 
     async def _handle_publish_blocked(self, msg: PublishBlocked) -> None:
         # d18 PUBLISH_BLOCKED (0x0F) — subscriber-side notice that a track

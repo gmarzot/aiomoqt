@@ -767,7 +767,7 @@ class SubscribedTrack(Track):
         )
         self.state = TrackState.ANNOUNCED
 
-        if self.session._profile.vi64:
+        if self.session._profile.two_level_discovery:
             # d18: learn which namespaces exist under the prefix, then
             # ask one of them for its tracks. An empty suffix means the
             # prefix itself is the namespace.
@@ -783,11 +783,12 @@ class SubscribedTrack(Track):
             await self.session.subscribe_tracks(
                 namespace=full_ns, parameters=ns_params)
 
-        if self.trackname is None:
-            print(f"  Waiting for publisher on "
-                  f"'{self.namespace}'...")
-        else:
-            print(f"  Waiting for track '{self.fqtn}'...")
+        if not getattr(self, '_quiet', False):
+            if self.trackname is None:
+                print(f"  Waiting for publisher on "
+                      f"'{self.namespace}'...")
+            else:
+                print(f"  Waiting for track '{self.fqtn}'...")
         pub_msg = await self.session.await_publish(
             timeout=timeout, trackname=self.trackname)
 

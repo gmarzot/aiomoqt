@@ -94,7 +94,7 @@ async def _run(args):
         certificate=cert, private_key=key,
         path="/",
         use_quic=True,
-        supported_drafts=16,
+        supported_drafts=args.draft,
     )
     server.register_handler(MOQTMessageType.SUBSCRIBE, on_subscribe)
     server_handle = await server.serve()
@@ -119,7 +119,7 @@ async def _run(args):
     client = MOQTClient(
         '127.0.0.1', args.port, path='moq',
         use_quic=True, verify_tls=False,
-        supported_drafts=16,
+        supported_drafts=args.draft,
     )
 
     t0 = time.perf_counter()
@@ -172,6 +172,8 @@ def main():
     ap.add_argument('--subgroups', type=int, default=1)
     ap.add_argument('--object-size', type=int, default=64)
     ap.add_argument('--duration', type=float, default=30.0)
+    ap.add_argument('--draft', type=int, default=16, choices=(14, 16, 18),
+                    help='MoQT draft to negotiate')
     ap.add_argument('--port', type=int, default=47446)
     args = ap.parse_args()
 

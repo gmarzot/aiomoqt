@@ -49,6 +49,12 @@ class DraftProfile:
                                   # (group + object varints, no length prefix):
                                   # d18 LARGEST_OBJECT 0x09. Empty for d14/d16
                                   # (there LARGEST_OBJECT is length-prefixed).
+    two_level_discovery: bool = False
+                                  # d18 splits discovery: SUBSCRIBE_NAMESPACE
+                                  # reports namespaces (NAMESPACE), and
+                                  # SUBSCRIBE_TRACKS then asks one namespace
+                                  # for its tracks (PUBLISH). d14/d16 fuse
+                                  # both into SUBSCRIBE_NAMESPACE.
 
     @property
     def vi64(self) -> bool:
@@ -71,7 +77,8 @@ PROFILES = {
         uint8_params=frozenset()),
     # draft-18 negotiates out-of-band (ALPN/WT-Protocol) like d16 and uses
     # delta-coded params, but forks the wire codec to vi64, runs control over
-    # a pair of uni streams, and drops the Request ID from request replies.
+    # a pair of uni streams, drops the Request ID from request replies, and
+    # splits track discovery into two requests.
     MOQTDraft.DRAFT_18: DraftProfile(
         draft=MOQTDraft.DRAFT_18, setup_carries_versions=False,
         params_delta_coded=True, varint="vi64",
@@ -81,7 +88,8 @@ PROFILES = {
             ParamType.SUBSCRIBER_PRIORITY,
             ParamType.GROUP_ORDER,
         }),
-        location_params=frozenset({ParamType.LARGEST_OBJECT})),
+        location_params=frozenset({ParamType.LARGEST_OBJECT}),
+        two_level_discovery=True),
 }
 
 
