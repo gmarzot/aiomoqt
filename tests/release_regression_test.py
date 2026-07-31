@@ -161,9 +161,8 @@ def _pytest_all(log_dir: Path) -> tuple[str, str]:
     """Every pytest test in one run. Naming files individually leaves new
     test modules silently unrun; the tool-driven suites below cover only
     what pytest cannot reach."""
-    # --durations names the slow tests in the log: the tree runs in
-    # seconds on Linux but minutes on macOS, where QUIC connection close
-    # stalls at session exit.
+    # --durations names the slow tests in the log: the tree runs in ~2s
+    # on Linux and ~200s on macOS. Cause not established.
     extra = [f"--ignore={p}" for p in _PYTEST_STANDALONE]
     extra.append("--durations=10")
     return _pytest_file("aiomoqt/tests", log_dir / "pytest.log", extra,
