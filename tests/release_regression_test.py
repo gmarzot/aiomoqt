@@ -115,7 +115,7 @@ def _run(cmd: list[str], log: Path, timeout: int) -> tuple[bool, str]:
 # Unit-tier runners
 # ---------------------------------------------------------------------------
 def _pytest_file(test_file: str, log: Path,
-                 extra: list[str] = ()) -> tuple[str, str]:
+                 extra: list[str] = (), timeout: int = 300) -> tuple[str, str]:
     # Use `python -m pytest` rather than the `pytest` binary so the
     # current working directory is added to sys.path. Without that, an
     # installed copy of aiomoqt under site-packages may shadow the
@@ -124,7 +124,7 @@ def _pytest_file(test_file: str, log: Path,
     # to the wheel location which has no neighbouring certs/. Result:
     # tests that should run get silently skipped.
     ok, _ = _run([sys.executable, "-m", "pytest", "-q", test_file, *extra],
-                 log, 300)
+                 log, timeout)
     if not ok:
         return "FAIL", "timeout"
     # Search for the pytest summary line anywhere in the captured
@@ -161,8 +161,13 @@ def _pytest_all(log_dir: Path) -> tuple[str, str]:
     """Every pytest test in one run. Naming files individually leaves new
     test modules silently unrun; the tool-driven suites below cover only
     what pytest cannot reach."""
-    ignores = [f"--ignore={p}" for p in _PYTEST_STANDALONE]
-    return _pytest_file("aiomoqt/tests", log_dir / "pytest.log", ignores)
+    # --durations names the slow tests in the log: the tree runs in
+    # seconds on Linux but minutes on macOS, where QUIC connection close
+    # stalls at session exit.
+    extra = [f"--ignore={p}" for p in _PYTEST_STANDALONE]
+    extra.append("--durations=10")
+    return _pytest_file("aiomoqt/tests", log_dir / "pytest.log", extra,
+                        timeout=900)
 
 
 # ---------------------------------------------------------------------------

@@ -21,7 +21,7 @@ FRAME_INTERVAL = 1/30
 GROUP_SIZE = 30
 
 
-async def subscribe_data_generator(session: MOQTSession, msg: Subscribe,
+async def subscribe_data_generator(session, msg: Subscribe,
                                    num_tasks: int = NUM_SUBGROUP_TASKS,
                                    object_size: int = DEFAULT_OBJECT_SIZE) -> None:
     """Subscribe handler that spawns subgroup stream data generation."""
@@ -47,7 +47,7 @@ async def subscribe_data_generator(session: MOQTSession, msg: Subscribe,
     session._close_session()
 
 
-async def generate_subgroup_stream(session: MOQTSession, subgroup_id: int,
+async def generate_subgroup_stream(session, subgroup_id: int,
                                    track_alias: int, priority: int,
                                    object_size: int = DEFAULT_OBJECT_SIZE):
     """Generate subgroup stream objects simulating video frames.
