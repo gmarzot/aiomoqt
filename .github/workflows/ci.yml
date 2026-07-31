@@ -337,7 +337,11 @@ jobs:
           # Codec-only, no transport — the subset that is reliable on
           # hosted runners. Each sweeps all three drafts. Floor
           # enforcement deferred until enough runs to calibrate noise.
-          python -m aiomoqt.tests.microbench.b1_parser --duration 3 || true
-          python -m aiomoqt.tests.microbench.b7_framer --duration 3 || true
+          # A draft list is the cross-draft sweep; a single value would
+          # report that draft alone.
+          python -m aiomoqt.tests.microbench.b1_parser \
+            --draft 14,16,18 --duration 3 || true
+          python -m aiomoqt.tests.microbench.b7_framer \
+            --draft 14,16,18 --duration 3 || true
           python -m aiomoqt.tests.microbench.b8_control_roundtrip \
             --duration 2 || true
