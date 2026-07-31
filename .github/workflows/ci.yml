@@ -343,9 +343,19 @@ jobs:
           # enforcement deferred until enough runs to calibrate noise.
           # A draft list is the cross-draft sweep; a single value would
           # report that draft alone.
-          python -m aiomoqt.tests.microbench.b1_parser \
-            --draft 14,16,18 --duration 3 || true
-          python -m aiomoqt.tests.microbench.b7_framer \
-            --draft 14,16,18 --duration 3 || true
-          python -m aiomoqt.tests.microbench.b8_control_roundtrip \
-            --duration 2 || true
+          {
+            python -m aiomoqt.tests.microbench.b1_parser \
+              --draft 14,16,18 --duration 3 || true
+            python -m aiomoqt.tests.microbench.b7_framer \
+              --draft 14,16,18 --duration 3 || true
+            python -m aiomoqt.tests.microbench.b8_control_roundtrip \
+              --duration 2 || true
+          } | tee /tmp/microbench.txt
+          {
+            echo "### Codec microbenches — d14/d16/d18"
+            echo "\`${GITHUB_SHA:0:8}\` on \`${RUNNER_OS}\`. Hosted-runner"
+            echo "numbers are noisy; read the ratio columns, not absolutes."
+            echo '```'
+            cat /tmp/microbench.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

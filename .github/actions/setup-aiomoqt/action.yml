@@ -71,8 +71,9 @@ runs:
         echo "pinned=true" >> "$GITHUB_OUTPUT"
         echo "repo=$repo" >> "$GITHUB_OUTPUT"
         echo "sha=$sha" >> "$GITHUB_OUTPUT"
+        # Log only — the pin-guard job owns the run-level summary note,
+        # so writing one here would repeat it once per job.
         echo "aiopquic: pinned to $repo@$ref -> $sha"
-        echo "aiopquic pin: \`$repo@$ref\` -> \`$sha\`" >> "$GITHUB_STEP_SUMMARY"
 
     - name: Restore cached aiopquic wheel
       id: wheel-cache
