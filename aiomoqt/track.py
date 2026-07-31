@@ -440,8 +440,6 @@ class PublishedTrack(Track):
             while True:
                 if cur_obj_id >= self.group_size:
                     group_id += 1
-                    self._total_groups += 1
-                    self._iv_groups += 1
                     cur_obj_id = 0
 
                 seq_info = f"{group_id}.{cur_obj_id}".encode()
@@ -478,9 +476,13 @@ class PublishedTrack(Track):
                     bps_s = fmt_bps(bps)
                     iv = f"{elapsed - dt:.0f}-{elapsed:.0f}s"
                     self._print_stats_header()
-                    grp_s = fmt_rate(self._iv_groups / dt)
-                    print(f"  {iv:<10}{self._total_groups:<8}"
-                          f"{grp_s:<10}{self._total_sent:<10}"
+                    # Datagram delivery emits no groups: there is no
+                    # stream to open or close, only a group_id field
+                    # advancing every group_size objects. Reporting a
+                    # count would invite comparison with the subgroup
+                    # table, where it means stream turnover.
+                    print(f"  {iv:<10}{'n/a':<8}"
+                          f"{'n/a':<10}{self._total_sent:<10}"
                           f"{rate_s:<10}{bps_s:<10}")
                     self._iv_objects = 0
                     self._iv_bytes = 0
