@@ -29,7 +29,7 @@ Routing model (cross-session, single relay instance):
 
 Run on UDP/4443 with the runner's /certs convention:
 
-  python -m aiomoqt.examples.moq_interop_relay \\
+  python -m aiomoqt.tools.moq_interop_relay \\
       --bind 0.0.0.0 --port 4443 \\
       --cert /certs/cert.pem --key /certs/priv.key
 
@@ -280,6 +280,14 @@ async def main():
     finally:
         for h in handles:
             h.close()
+
+
+def cli():
+    """Console entry point (moq-interop-relay)."""
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n  Interrupted.")
 
 
 if __name__ == "__main__":

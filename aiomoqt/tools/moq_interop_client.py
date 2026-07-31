@@ -1189,5 +1189,10 @@ def main():
     sys.exit(0 if all_passed else 1)
 
 
-if __name__ == "__main__":
+def cli():
+    """Console entry point (moq-interop-client)."""
     main()
+
+
+if __name__ == "__main__":
+    cli()

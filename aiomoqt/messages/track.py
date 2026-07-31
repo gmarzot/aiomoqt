@@ -721,7 +721,7 @@ class ObjectDatagram(MOQTMessage):
             push = lambda v: buf_obj.push_uint_var(v)  # noqa: E731
 
         payload_len = 0 if self.payload is None else len(self.payload)
-        buf_obj = Buffer(capacity=BUF_SIZE + payload_len)
+        buf_obj = Buffer(capacity=BUF_SIZE + payload_len, vi64=vi64)
         push(type_val)
         push(self.track_alias)
         push(self.group_id)
@@ -747,7 +747,11 @@ class ObjectDatagram(MOQTMessage):
         end_of_group = bool(type_val & 0x02)
         no_object_id = bool(type_val & 0x04)
         is_status = vi64 and bool(type_val & 0x20)
-        default_priority = vi64 and bool(type_val & 0x08)
+        # DEFAULT_PRIORITY (0x08): priority byte omitted on the wire.
+        # d16 introduced it; d18 keeps it. d14 has no such bit (types
+        # cap at 0x07 in dispatch, so it can't reach here).
+        default_priority = bool(type_val & 0x08) and (
+            vi64 or (prof is not None and prof.draft >= 16))
 
         track_alias = pull()
         group_id = pull()

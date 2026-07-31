@@ -14,9 +14,9 @@ aggregate_ops / P so total offered load matches the commanded Mbps
 regardless of parallelism.
 
 Usage:
-  python -m aiomoqt.examples.adaptive_bench
-  python -m aiomoqt.examples.adaptive_bench -P 4 --step-mbps 20
-  python -m aiomoqt.examples.adaptive_bench -r moqt://host:4433 -k --max-mbps 500
+  python -m aiomoqt.tools.adaptive_bench
+  python -m aiomoqt.tools.adaptive_bench -P 4 --step-mbps 20
+  python -m aiomoqt.tools.adaptive_bench -r moqt://host:4433 -k --max-mbps 500
 """
 import argparse
 import asyncio
@@ -39,18 +39,6 @@ from aiomoqt.types import (MOQT_TIMESTAMP_EXT, FilterType, MOQTMessageType,
 from aiomoqt.utils.format import fmt_bps, fmt_ms
 from aiomoqt.utils.logger import set_log_level
 
-
-def _try_install_uvloop() -> bool:
-    """Drop in uvloop if available — typically 2-4× over stock asyncio
-    on selector-heavy workloads. Stock CPython falls back if the
-    import fails. Caller decides when to call (must be before any
-    asyncio.run / loop creation)."""
-    try:
-        import uvloop
-        uvloop.install()
-        return True
-    except ImportError:
-        return False
 
 # ---------------------------------------------------------------------------
 # Load config: pinned axes, ramp aggregate bitrate
@@ -356,7 +344,7 @@ class BWActuator:
                 rx_bytes = ev.get('rx_bytes', 0)
                 if rx_bytes:
                     self._mp_rx_window.append((t, rx_bytes))
-                # _RollingStats.snapshot() exposes mean/p99 plus a
+                # TrackStats.snapshot() exposes mean/p99 plus a
                 # raw 'lat_samples' tuple if present; otherwise we
                 # synthesize a single sample at the reported mean.
                 samples = ev.get('lat_samples') or ()
@@ -509,7 +497,6 @@ class SubsActuator:
                  sub_filter: FilterType = FilterType.LATEST_OBJECT,
                  interval_s: float = 5.0,
                  stagger: float = 0.1,
-                 no_uvloop: bool = False,
                  keep_alive_interval: float | None = None):
         self.relay_url = relay_url
         self.namespace = namespace
@@ -537,7 +524,6 @@ class SubsActuator:
         # decoupled from interval_s so handshake spacing is tunable
         # without changing the report cadence.
         self.stagger = stagger
-        self.no_uvloop = no_uvloop
         self.keep_alive_interval = keep_alive_interval
         # Each worker process hosts a BATCH of subscriptions and
         # self-heals individual drops internally. --step-subs doubles as
@@ -545,7 +531,7 @@ class SubsActuator:
         # controller adding a group per --join-rate spawns one worker.
         self.batch_size = max(1, int(step_subs))
 
-        from aiomoqt.examples._bench_workers import MP_CTX as mp
+        from aiomoqt.utils.workers import MP_CTX as mp
         self._mp = mp
         self._events_q = mp.Queue(maxsize=10000)
         self._workers: dict = {}    # worker_id -> (Process, stop_event)
@@ -619,10 +605,9 @@ class SubsActuator:
                 insecure=self.insecure,
                 force_quic=self.force_quic,
                 sub_filter=int(self.sub_filter),
-                no_uvloop=self.no_uvloop,
                 keep_alive_interval=self.keep_alive_interval,
             )
-            from aiomoqt.examples._bench_workers import sub_batch_worker_entry
+            from aiomoqt.utils.workers import sub_batch_worker_entry
             p = self._mp.Process(
                 target=sub_batch_worker_entry,
                 args=(cfg, stop_ev, self._events_q),
@@ -1478,7 +1463,7 @@ def parse_args():
                    metavar="B", help="bytes per MoQT object (default: 4096)")
     p.add_argument("-P", "--streams", type=int, default=1,
                    help="parallel subgroup streams (default: 1)")
-    p.add_argument("-g", "--group-size", type=int, default=10000,
+    p.add_argument("-g", "--group-size", type=int, default=4096,
                    dest="group_size",
                    help="objects per group (default: 10000)")
     p.add_argument("--start-mbps", type=float, default=10.0,
@@ -1491,9 +1476,9 @@ def parse_args():
                    metavar="S", help="controller tick period seconds (default: 5)")
     p.add_argument("--draft", type=parse_draft_spec, default=None,
                    help="MoQT draft version: 14, 16, or 18")
-    p.add_argument("-n", "--namespace", default="aiomoqt",
+    p.add_argument("-N", "--namespace", default="aiomoqt",
                    help="MoQT namespace (default: aiomoqt)")
-    p.add_argument("--trackname", default=None,
+    p.add_argument("-T", "--trackname", default=None,
                    help="MoQT trackname (default: adaptive-bench-<rand4>)")
     pub_mode = p.add_mutually_exclusive_group()
     pub_mode.add_argument("--pub-ns", action="store_true",
@@ -1502,17 +1487,26 @@ def parse_args():
     pub_mode.add_argument("--pub-both", action="store_true",
                           dest="pub_both",
                           help="publish via PUB_NS+PUBLISH (moqx/moq-rs default)")
-    mode = p.add_mutually_exclusive_group()
-    mode.add_argument("-r", "--relay-url", default=None, metavar="URL",
-                      dest="relay_url",
-                      help="relay URL (moqt://... or https://...)")
-    mode.add_argument("-p", "--loopback-port", type=int, default=None,
-                      metavar="PORT", dest="loopback_port",
-                      help="UDP port for the in-process self-test loopback")
-    p.add_argument("--mp-loopback", action="store_true", dest="mp_loopback",
-                   help="loopback self-test with publisher and subscriber "
-                        "in separate processes (use when measuring tx "
-                        "ceilings — single-process loopback is GIL-bound).")
+    p.add_argument("relay_url", metavar="URL", nargs="?", default=None,
+                   help="Relay URL — moqt://host[:port] = raw QUIC, "
+                        "https://host[:port][/path] = WebTransport. "
+                        "Omit for the self-hosted loopback self-test.")
+    p.add_argument("--loopback", action="store_true",
+                   help="Explicitly select the loopback self-test "
+                        "(the default when no URL is given)")
+    p.add_argument("-p", "--port", type=int, default=None,
+                   metavar="PORT", dest="loopback_port",
+                   help="Loopback listen port (default: 4435)")
+    p.add_argument("--mp", action="store_true", dest="mp_loopback",
+                   help="Run this role across separate processes rather "
+                        "than one (use when measuring TX ceilings — a "
+                        "single process is GIL-bound).")
+    p.add_argument("--role", choices=("both", "pub", "sub"),
+                   default="both",
+                   help="Which end(s) this process runs (default: both). "
+                        "Splitting across hosts is subs-mode only: there "
+                        "the publisher is fixed-rate and the whole "
+                        "control loop lives on the subscriber side.")
     p.add_argument("-k", "--insecure", action="store_true",
                    help="skip TLS verification")
     p.add_argument("--cert", default=CERT)
@@ -1582,12 +1576,6 @@ def parse_args():
                         "worker (publisher / subscriber) gets a "
                         "process-suffixed file: PATH.pub.<pid>, "
                         "PATH.sub.<pid> — combined when decrypting.")
-    p.add_argument("--uvloop", action="store_true",
-                   help="Install uvloop instead of stock asyncio "
-                        "(experimental test option — measured marginal "
-                        "on this stack, where per-event Python work "
-                        "dominates loop turnaround. Default: stock "
-                        "asyncio.)")
     p.add_argument("--cc-algo", type=str, default=None,
                    help="Congestion control algorithm "
                         "(bbr | bbr1 | newreno | cubic | dcubic | "
@@ -1615,9 +1603,34 @@ def parse_args():
         '-?', '--help', action='help',
         help='Show this help message and exit')
     args = p.parse_args()
-    # Internal plumbing (workers, actuators) still carries no_uvloop;
-    # the CLI is opt-in (--uvloop), so invert once here.
-    args.no_uvloop = not args.uvloop
+
+    # Addressing: a URL says where to dial; loopback options say what to
+    # bind. Never both — silent precedence hides which mode you got.
+    if args.relay_url and (args.loopback or args.loopback_port is not None):
+        p.error("--loopback/-p are self-test options and cannot be "
+                "combined with a URL — a URL says where to dial, "
+                "loopback options say what to bind")
+
+    # Splitting the run across hosts is subs-mode only. In subs mode the
+    # publisher is fixed-rate and the controller's only actuator is the
+    # subscriber worker count, so the whole loop closes on the sub side.
+    # In bw mode the controller actuates the PUBLISHER's rate while
+    # measuring at the subscriber; split those and the loop is cut.
+    if args.role != "both" and args.mode == "bw":
+        p.error("--role is subs-mode only: in bw mode the controller "
+                "actuates the publisher's rate but measures at the "
+                "subscriber, so a split run is an open loop. Use "
+                "--mode subs, or run bw mode with --role both. "
+                "(Planned: actuate over the MoQT control plane itself "
+                "— subscribe/unsubscribe rate-encoded or additive "
+                "layer tracks — so no out-of-band channel is needed.)")
+
+    # Absolute latency is measured as recv_clock - peer send timestamp:
+    # co-located that is one clock, split it inherits the hosts' offset
+    # straight into the controller's back-off signal. Jitter (a
+    # difference of differences) and shortfall (a count) are immune.
+    args.skew_safe_signals = args.role != "both"
+
     args.sub_filter = filter_choices[args.sub_filter]
     if args.sub_filter in (FilterType.ABSOLUTE_START,
                            FilterType.ABSOLUTE_RANGE):
@@ -1698,6 +1711,56 @@ def _print_summary(state: BenchState, controller, samples: int, args):
     print("═" * 68)
 
 
+
+async def _run_fixed_publisher(args) -> int:
+    """--role pub: publish one fixed-rate track and hold it open for
+    --duration. The controller lives on the --role sub host."""
+    from aiomoqt.utils.workers import MP_CTX as mp
+    from aiomoqt.utils.workers import pub_worker_entry
+
+    stop = mp.Event()
+    events_q = mp.Queue(maxsize=10000)
+    rate_q = mp.Queue(maxsize=8)
+    cfg = dict(
+        relay_url=args.relay_url,
+        namespace=args.namespace, trackname=args.trackname,
+        draft=args.draft, insecure=args.insecure, force_quic=False,
+        object_size=args.scenario.object_size,
+        group_size=args.group_size,
+        num_subgroups=args.scenario.subgroups,
+        initial_rate_ops=args.scenario.aggregate_ops(args.sub_mbps),
+        pub_ns=args.pub_ns, pub_both=args.pub_both,
+        debug=args.debug, keep_alive_interval=args.keepalive,
+    )
+    proc = mp.Process(target=pub_worker_entry,
+                      args=(cfg, stop, rate_q, events_q), daemon=True)
+    proc.start()
+    print(f"  role=pub — publishing {args.namespace}/{args.trackname} "
+          f"at {args.sub_mbps} Mbps; run the subscriber host with:")
+    print(f"    moq-adaptive-bench {args.relay_url} --mode subs "
+          f"--role sub -N {args.namespace} -T {args.trackname} "
+          f"--sub-mbps {args.sub_mbps}")
+    try:
+        deadline = (time.monotonic() + args.duration
+                    if args.duration else None)
+        while proc.is_alive():
+            if deadline and time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(0.5)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
+    finally:
+        stop.set()
+        proc.join(timeout=5.0)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=2.0)
+        for q in (events_q, rate_q):
+            q.cancel_join_thread()
+    print("  publisher stopped")
+    return 0
+
+
 async def main():
     args = parse_args()
     _print_banner(args)
@@ -1732,9 +1795,14 @@ async def main():
     mp_cleanup_queues: list = []
     if args.mode == "subs":
         if not relay_mode:
-            print("  error: --mode subs requires -r RELAY_URL "
+            print("  error: --mode subs requires a relay URL "
                   "(loopback self-test is bw-only)", file=sys.stderr)
             return 2
+        if args.role == "pub":
+            # Publisher-only half of a split run: fixed-rate, no
+            # controller. The subscriber host runs --role sub with the
+            # same -N/-T/--sub-mbps and closes the loop there.
+            return await _run_fixed_publisher(args)
         # Publisher runs fixed-rate; fold sub-mbps into scenario so the
         # in-process publisher emits at that rate.
         args.scenario.start_mbps = args.sub_mbps
@@ -1751,7 +1819,6 @@ async def main():
             sub_filter=args.sub_filter,
             interval_s=args.scenario.interval_s,
             stagger=args.stagger,
-            no_uvloop=args.no_uvloop,
             keep_alive_interval=args.keepalive,
         )
     else:
@@ -1762,8 +1829,8 @@ async def main():
         # real stack tail latency and caps throughput at one core.
         mp_loopback = (not relay_mode) and args.mp_loopback
         if relay_mode or mp_loopback:
-            from aiomoqt.examples._bench_workers import MP_CTX as mp
-            from aiomoqt.examples._bench_workers import (
+            from aiomoqt.utils.workers import MP_CTX as mp
+            from aiomoqt.utils.workers import (
                 pub_worker_entry, sub_worker_entry, loopback_server_entry,
             )
             mp_stop_event = mp.Event()
@@ -1795,7 +1862,6 @@ async def main():
                     initial_rate_ops=args.scenario.aggregate_ops(
                         args.scenario.start_mbps),
                     debug=args.debug,
-                    no_uvloop=args.no_uvloop,
                 )
                 sub_cfg = dict(
                     sub_id=0,
@@ -1807,7 +1873,6 @@ async def main():
                     force_quic=False,
                     sub_filter=int(FilterType.LATEST_OBJECT),
                     debug=args.debug,
-                    no_uvloop=args.no_uvloop,
                 )
                 pub_proc = mp.Process(
                     target=loopback_server_entry,
@@ -1830,7 +1895,6 @@ async def main():
                     pub_ns=args.pub_ns,
                     pub_both=args.pub_both,
                     debug=args.debug,
-                    no_uvloop=args.no_uvloop,
                     keylogfile=(f"{args.keylogfile}.pub"
                                 if args.keylogfile else None),
                 )
@@ -1844,7 +1908,6 @@ async def main():
                     force_quic=False,
                     sub_filter=int(FilterType.LATEST_OBJECT),
                     debug=args.debug,
-                    no_uvloop=args.no_uvloop,
                     keylogfile=(f"{args.keylogfile}.sub"
                                 if args.keylogfile else None),
                 )
@@ -1922,6 +1985,13 @@ async def main():
                           "— may race", file=sys.stderr)
                 sub_proc.start()
                 await asyncio.sleep(0.3)
+            elif args.role == "sub":
+                # Split run: the publisher is on the other host at a
+                # fixed --sub-mbps. Nothing to spawn here; the actuator
+                # ramps sub workers against the track it publishes.
+                print(f"  role=sub — expecting an external publisher on "
+                      f"{args.namespace}/{args.trackname} at "
+                      f"{args.sub_mbps} Mbps")
             else:
                 # Subs mode: publisher in its OWN process. As an
                 # in-process task it shared the parent event loop with
@@ -1932,8 +2002,8 @@ async def main():
                 # coupling. Sub workers are still spawned by
                 # SubsActuator; the publisher runs at a fixed
                 # --sub-mbps rate (no rate_queue updates needed).
-                from aiomoqt.examples._bench_workers import MP_CTX as mp
-                from aiomoqt.examples._bench_workers import pub_worker_entry
+                from aiomoqt.utils.workers import MP_CTX as mp
+                from aiomoqt.utils.workers import pub_worker_entry
                 subs_pub_stop = mp.Event()
                 pub_events_q = mp.Queue(maxsize=10000)
                 pub_rate_q = mp.Queue(maxsize=8)
@@ -1953,7 +2023,6 @@ async def main():
                     pub_ns=args.pub_ns,
                     pub_both=args.pub_both,
                     debug=args.debug,
-                    no_uvloop=args.no_uvloop,
                     keep_alive_interval=args.keepalive,
                 )
                 subs_pub_proc = mp.Process(
@@ -2082,17 +2151,15 @@ async def main():
     return 0
 
 
+def cli():
+    """Console entry point (moq-adaptive-bench)."""
+    try:
+        sys.exit(asyncio.run(main()))
+    except KeyboardInterrupt:
+        print("\n  Interrupted.")
+
+
 if __name__ == "__main__":
-    # Install uvloop in the controller process before asyncio.run.
-    # Worker processes (publisher / subscriber MP) install it in
-    # _bench_workers.{pub,sub}_worker_entry — they're separate
-    # interpreters and can't inherit the policy.
-    if "--uvloop" in sys.argv:
-        if _try_install_uvloop():
-            print("  uvloop: enabled (experimental)")
-        else:
-            print("  uvloop: requested but not installed "
-                  "(using stock asyncio)")
     try:
         sys.exit(asyncio.run(main()))
     except KeyboardInterrupt:

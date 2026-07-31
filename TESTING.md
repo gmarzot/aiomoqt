@@ -31,12 +31,12 @@ docker run --rm --network host -e RELAY_URL=$RELAY aiomoqt-test --draft 14
 
 # 5. Throughput pub/sub (d14/d16 QUIC/WebTransport)
 #    Shell A (publisher):
-python -m aiomoqt.examples.pub_bench $RELAY -s 500000 -t 60 -r 30 -g 30 -k --draft 16
+python -m aiomoqt.tools.pub_bench $RELAY -s 500000 -t 60 -r 30 -g 30 -k --draft 16
 #    Shell B (subscriber):
-python -m aiomoqt.examples.sub_bench $RELAY -k --draft 16
+python -m aiomoqt.tools.sub_bench $RELAY -k --draft 16
 
 # 6. Multi-subscriber fanout (pub + N subs in one process)
-python -m aiomoqt.examples.multi_sub_bench $RELAY -n 30 -s 1024 -r 60 -t 60 -k --draft 16
+python -m aiomoqt.tools.load_sim $RELAY --subs 30 -s 1024 -r 60 -t 60 -k --draft 16
 ```
 
 Pass criteria:
@@ -178,7 +178,7 @@ in one invocation. The sections below are for ad-hoc investigation
 against a local relay — useful during protocol work, not needed for a
 release gate.
 
-Bench tools (`pub_bench`, `sub_bench`, `relay_bench`, `multi_sub_bench`)
+Bench tools (`pub_bench`, `sub_bench`, `loopback_bench`, `load_sim`)
 auto-generate unique tracknames from test parameters to avoid
 stale-cache collisions on relays that key by (namespace, trackname).
 
@@ -186,12 +186,12 @@ stale-cache collisions on relays that key by (namespace, trackname).
 
 Shell 1 (publisher):
 ```bash
-python -m aiomoqt.examples.pub_bench moqt://moqx-local-000.marzresearch.net:4433 -s 500000 -t 120 -r 30 -g 30 -k --draft 16
+python -m aiomoqt.tools.pub_bench moqt://moqx-local-000.marzresearch.net:4433 -s 500000 -t 120 -r 30 -g 30 -k --draft 16
 ```
 
 Shell 2 (subscriber):
 ```bash
-python -m aiomoqt.examples.sub_bench moqt://moqx-local-000.marzresearch.net:4433 -k --draft 16
+python -m aiomoqt.tools.sub_bench moqt://moqx-local-000.marzresearch.net:4433 -k --draft 16
 ```
 
 Expected: ~116 Mbps, ~30 obj/s, zero loss, auto-discovered trackname.
@@ -200,12 +200,12 @@ Expected: ~116 Mbps, ~30 obj/s, zero loss, auto-discovered trackname.
 
 Shell 1:
 ```bash
-python -m aiomoqt.examples.pub_bench moqt://moqx-local-000.marzresearch.net:4433 -s 1024 -t 120 -r 120 -g 60 -P 4 -k --draft 16
+python -m aiomoqt.tools.pub_bench moqt://moqx-local-000.marzresearch.net:4433 -s 1024 -t 120 -r 120 -g 60 -P 4 -k --draft 16
 ```
 
 Shell 2:
 ```bash
-python -m aiomoqt.examples.sub_bench moqt://moqx-local-000.marzresearch.net:4433 -k --draft 16
+python -m aiomoqt.tools.sub_bench moqt://moqx-local-000.marzresearch.net:4433 -k --draft 16
 ```
 
 Expected: ~480 obj/s, ~4 Mbps, p50 latency ~1 ms.
@@ -214,12 +214,12 @@ Expected: ~480 obj/s, ~4 Mbps, p50 latency ~1 ms.
 
 Shell 1:
 ```bash
-python -m aiomoqt.examples.pub_bench moqt://moqx-local-000.marzresearch.net:4433 -s 4096 -t 120 -g 1000 -P 4 -k --draft 16
+python -m aiomoqt.tools.pub_bench moqt://moqx-local-000.marzresearch.net:4433 -s 4096 -t 120 -g 1000 -P 4 -k --draft 16
 ```
 
 Shell 2:
 ```bash
-python -m aiomoqt.examples.sub_bench moqt://moqx-local-000.marzresearch.net:4433 -k --draft 16
+python -m aiomoqt.tools.sub_bench moqt://moqx-local-000.marzresearch.net:4433 -k --draft 16
 ```
 
 Expected: sustained high throughput. Watch p99 latency and loss to
@@ -230,7 +230,7 @@ see where your local loop saturates.
 ## moq-interop-runner integration
 
 aiomoqt ships a TAP v14-emitting client at
-`aiomoqt.examples.moq_interop_client` (the same module used internally
+`aiomoqt.tools.moq_interop_client` (the same module used internally
 by `relay-ctrl-msg`). The Dockerfile at the repo root builds an image
 consumable by [englishm/moq-interop-runner](https://github.com/englishm/moq-interop-runner).
 The published image is `ghcr.io/gmarzot/aiomoqt:<version>` and

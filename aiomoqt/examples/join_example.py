@@ -3,23 +3,29 @@ import asyncio
 import argparse
 import logging
 
-from aiomoqt.types import ParamType, MOQTException
+from aiomoqt.types import ParamType, MOQTException, parse_draft_spec
 from aiomoqt.client import MOQTClient
+from aiomoqt.utils.url import parse_relay_url
 from aiomoqt.messages import SubscribeError, SubscribeNamespaceError
 from aiomoqt.utils.logger import *
 
 def parse_args():
     parser = argparse.ArgumentParser(description='MOQT WebTransport Client', add_help=False)
-    parser.add_argument('-h', '--host', type=str, default='localhost', help='Host to connect to')
-    parser.add_argument('--port', type=int, default=443, help='Port to connect to')
-    parser.add_argument('--namespace', type=str, default="live/test", help='Track Namespace')
+    parser.add_argument('url', metavar='URL',
+                        help='Endpoint. moqt://host[:port][/path] '
+                             '= raw QUIC; https://host[:port][/path] '
+                             '= WebTransport; host[:port] = WebTransport.')
+    parser.add_argument('-N', '--namespace', type=str, default="live/test", help='Track Namespace')
     parser.add_argument(
-        '--trackname', type=str, default=None,
+        '-T', '--trackname', type=str, default=None,
         help='Track Name (default: auto-discover via SUBSCRIBE_NAMESPACE)')
-    parser.add_argument('--path', type=str, default="", help='MOQT WT path (default: "/")')
-    parser.add_argument('-q', '--quic', '--use-quic', action='store_true',
-                        dest='use_quic', help='Enable QUIC transport')
-    parser.add_argument('--debug', action='store_true', help='Enable debug output')
+    parser.add_argument('-k', '--insecure', action='store_true',
+                        help='Skip TLS certificate verification')
+    parser.add_argument('--draft', type=parse_draft_spec, default=None,
+                        help='MoQT draft version: 14, 16, or 18')
+    parser.add_argument('-t', '--duration', type=int, default=30,
+                        help='Duration seconds (default: 30)')
+    parser.add_argument('-d', '--debug', action='store_true', help='Enable debug output')
     parser.add_argument('--keylogfile', type=str, default=None, help='TLS secrets file')
     parser.add_argument('--cc-algo', type=str, default=None,
                         help='Congestion control algorithm '
@@ -28,11 +34,18 @@ def parse_args():
     parser.add_argument(
         '-?', '--help', action='help',
         help='Show this help message and exit')
-    return parser.parse_args()
+    args = parser.parse_args()
+    # One positional URL replaces -h/--port/--path/-q: the scheme
+    # selects the transport, exactly like the aiomoqt tools.
+    _r = parse_relay_url(args.url)
+    args.host, args.port = _r.host, _r.port
+    args.path, args.use_quic = _r.path or "", _r.use_quic
+    return args
 
 
 async def main(host: str, port: int, path: str, namespace: str, track_name: str,
-               use_quic: bool, debug: bool, cc_algo: str = None):
+               use_quic: bool, debug: bool, cc_algo: str = None,
+               insecure: bool = False, draft=None, duration: int = 30):
     log_level = logging.DEBUG if debug else logging.INFO
     set_log_level(log_level)
     logger = get_logger(__name__)
@@ -42,6 +55,8 @@ async def main(host: str, port: int, path: str, namespace: str, track_name: str,
         port,
         path=path,
         use_quic=use_quic,
+        verify_tls=not insecure,
+        supported_drafts=draft,
         keylog_filename=args.keylogfile,
         debug=debug,
         congestion_control_algorithm=cc_algo,
@@ -103,6 +118,9 @@ if __name__ == "__main__":
             use_quic=args.use_quic,
             debug=args.debug,
             cc_algo=args.cc_algo,
+            insecure=args.insecure,
+            draft=args.draft,
+            duration=args.duration,
         ), debug=args.debug)
 
     except KeyboardInterrupt:

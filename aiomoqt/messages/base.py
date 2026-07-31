@@ -37,25 +37,27 @@ class MOQTMessage:
     @staticmethod
     def _extensions_encode(buf: Buffer, exts: Dict,
                            with_length: bool = True) -> None:
-        # The extensions/properties wire form (length-prefixed KVP
-        # block) is identical across every supported draft, so this
-        # codec is version-agnostic: no draft argument and no per-object
-        # version lookup on the hot path.
+        # The KVP block SHAPE is draft-independent, but the varint
+        # FLAVOR is not: d18 encodes varints as vi64. Follow the target
+        # buffer's flavor via push_vint rather than hardcoding the
+        # standard encoder — mixing vi64 header fields with
+        # standard-varint extensions produces a frame the peer rejects
+        # (moxygen closes the session with PROTOCOL_VIOLATION).
         if exts is None or len(exts) == 0:
             if with_length:
-                buf.push_uint_var(0)
+                buf.push_vint(0)
             return
 
-        payload = Buffer(capacity=BUF_SIZE)
+        payload = Buffer(capacity=BUF_SIZE, vi64=buf.vi64)
         for ext_id, ext_value in exts.items():
-            payload.push_uint_var(ext_id)
+            payload.push_vint(ext_id)
             if ext_id % 2 == 0:  # even extension types are simple var int
-                payload.push_uint_var(ext_value)
+                payload.push_vint(ext_value)
             else:
                 if isinstance(ext_value, str):
                     ext_value = ext_value.encode()
                 assert isinstance(ext_value, bytes)
-                payload.push_uint_var(len(ext_value))
+                payload.push_vint(len(ext_value))
                 payload.push_bytes(ext_value)
 
         exts_len = payload.tell()
@@ -66,7 +68,7 @@ class MOQTMessage:
                 f"actual payload.data bytes={len(payload.data)}"
             )
         if with_length:
-            buf.push_uint_var(exts_len)
+            buf.push_vint(exts_len)
         payload_bytes_before = buf.tell()
         buf.push_bytes(payload.data)
         actual_pushed = buf.tell() - payload_bytes_before
@@ -106,7 +108,7 @@ class MOQTMessage:
         #     data reads uninitialized heap.
         if with_length:
             pos_before = buf.tell()
-            exts_len = buf.pull_uint_var()
+            exts_len = buf.pull_vint()
             if exts_len > MOQTMessage.EXTENSIONS_LEN_LIMIT:
                 # Framer has lost alignment: this varint is being read
                 # from a position that doesn't actually point at an
@@ -164,13 +166,13 @@ class MOQTMessage:
             # lets the dispatcher process the message body (which we
             # already finished parsing) without a noisy traceback.
             try:
-                ext_id = buf.pull_uint_var()
+                ext_id = buf.pull_vint()
                 if ext_id % 2 == 0:
                     # even type → varint value (self-bounded by varint prefix)
-                    ext_value = buf.pull_uint_var()
+                    ext_value = buf.pull_vint()
                 else:
                     # odd type → length-prefixed bytes value
-                    value_len = buf.pull_uint_var()
+                    value_len = buf.pull_vint()
                     ext_value = buf.pull_bytes(value_len)
             except (BufferReadError, MOQTUnderflow):
                 if with_length:

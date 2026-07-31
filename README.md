@@ -19,7 +19,7 @@
 - High-level publisher: [`PublishedTrack`](aiomoqt/track.py) — stream setup, subgroup writing, pacing
 - High-level subscriber: [`SubscribedTrack`](aiomoqt/track.py) — object reassembly, FETCH / JOIN handling
 - Pluggable message handlers via `register_handler()`
-- Data publishing via SubgroupHeader streams or ObjectDatagrams
+- Data publishing via SubgroupHeader streams (ObjectDatagram RX + codec complete; datagram publishing in progress)
 - Data reception via `on_object_received` callback
 - Low-level message serialization / deserialization for custom protocol work
 
@@ -59,10 +59,10 @@ Confirm the stack and reach a relay before writing any code (probe exits 0 if an
 ```bash
 python -m aiomoqt.versions
 
-python -m aiomoqt.examples.relay_probe --url moqt://moqx-main.ci.openmoq.org:4433
+python -m aiomoqt.tools.relay_probe --url moqt://moqx-main.ci.openmoq.org:4433
 moqt://moqx-main.ci.openmoq.org:4433              QUIC   ✓  draft-14,draft-16,draft-18  (540ms)
 
-python -m aiomoqt.examples.relay_probe --url https://moqx-main.ci.openmoq.org:4433/moq-relay
+python -m aiomoqt.tools.relay_probe --url https://moqx-main.ci.openmoq.org:4433/moq-relay
 https://moqx-main.ci.openmoq.org:4433/moq-relay   H3/WT  ✓  draft-14,draft-16,draft-18  (435ms)
 ```
 
@@ -153,16 +153,13 @@ print(ok.parameters.get(ParamType.AUTH_TOKEN))   # token echoed by the peer, if 
 
 ```bash
 # Publish (SubgroupHeader streams)
-python -m aiomoqt.examples.pub_example -h relay.ex.com -q
-
-# Publish (ObjectDatagrams)
-python -m aiomoqt.examples.pub_example -h relay.ex.com -q --datagram
+python -m aiomoqt.examples.pub_example moqt://relay.ex.com
 
 # Subscribe
-python -m aiomoqt.examples.sub_example -h relay.ex.com -q
+python -m aiomoqt.examples.sub_example moqt://relay.ex.com
 
 # Subscribe + FETCH (join mid-stream)
-python -m aiomoqt.examples.join_example -h relay.ex.com -q
+python -m aiomoqt.examples.join_example moqt://relay.ex.com
 ```
 
 Common options: `--namespace`, `--trackname`, `--path`, `--debug`, `--keylogfile`. Every tool prints its full option set with `-?` / `--help` (note: `-h` is `--host`, not help).
@@ -173,11 +170,11 @@ Bench tools take a positional relay URL — `moqt://host[:port]` for raw QUIC, `
 
 ```bash
 # Local loopback (canonical stack benchmark, no relay)
-python -m aiomoqt.examples.loopback_bench -s 4096 -P 4 -t 20
+python -m aiomoqt.tools.loopback_bench -s 4096 -P 4 -t 20
 
 # Publisher / subscriber through a relay
-python -m aiomoqt.examples.pub_bench moqt://relay.ex.com -s 4096 -P 4 -r 120 -t 60
-python -m aiomoqt.examples.sub_bench moqt://relay.ex.com
+python -m aiomoqt.tools.pub_bench moqt://relay.ex.com -s 4096 -P 4 -r 120 -t 60
+python -m aiomoqt.tools.sub_bench moqt://relay.ex.com
 ```
 
 The full tool matrix (two-process, fanout, adaptive ramp), all options, latency methodology (paced vs unpaced, TX budgets), and observed numbers live in [PERFORMANCE.md](PERFORMANCE.md).
@@ -186,16 +183,16 @@ The full tool matrix (two-process, fanout, adaptive ramp), all options, latency 
 
 ```bash
 # All tests (draft-14, auto-detected)
-python -m aiomoqt.examples.moq_interop_client -r "moqt://relay.ex.com:4433"
+python -m aiomoqt.tools.moq_interop_client -r "moqt://relay.ex.com:4433"
 
 # All tests (draft-16)
-python -m aiomoqt.examples.moq_interop_client -r "moqt://relay.ex.com:4433" --draft 16
+python -m aiomoqt.tools.moq_interop_client -r "moqt://relay.ex.com:4433" --draft 16
 
 # Single test case
-python -m aiomoqt.examples.moq_interop_client -r "moqt://relay.ex.com:4433" -t subscribe-error
+python -m aiomoqt.tools.moq_interop_client -r "moqt://relay.ex.com:4433" -t subscribe-error
 
 # List test cases
-python -m aiomoqt.examples.moq_interop_client -l
+python -m aiomoqt.tools.moq_interop_client -l
 ```
 
 ### Relay Probe
@@ -204,13 +201,13 @@ Batch liveness + draft-version check: reads a relay list, does a real CLIENT_SET
 
 ```bash
 # Probe a relay list once and write a status report (CLI form)
-python -m aiomoqt.examples.relay_probe -f relays.json -o status.json
+python -m aiomoqt.tools.relay_probe -f relays.json -o status.json
 
 # Same, env form (typical container/daemon deployment)
-RELAYS_FILE=relays.json OUTPUT_FILE=status.json python -m aiomoqt.examples.relay_probe
+RELAYS_FILE=relays.json OUTPUT_FILE=status.json python -m aiomoqt.tools.relay_probe
 
 # Long-running monitor: re-probe every 300s
-python -m aiomoqt.examples.relay_probe -f relays.json -o status.json --interval 300
+python -m aiomoqt.tools.relay_probe -f relays.json -o status.json --interval 300
 ```
 
 | CLI flag | Env var | Default | Meaning |
@@ -224,22 +221,20 @@ python -m aiomoqt.examples.relay_probe -f relays.json -o status.json --interval 
 ### WebTransport Server
 
 ```bash
-python -m aiomoqt.examples.server_example --certificate cert.pem --private-key key.pem --port 443
+python -m aiomoqt.examples.server_example --cert cert.pem --key key.pem -p 4433
 ```
 
 ### Example Reference
 
 | Example | Description |
 |---------|-------------|
-| `pub_example.py` | Publisher — SubgroupHeader streams or ObjectDatagrams |
+| `pub_example.py` | Publisher — SubgroupHeader streams |
 | `sub_example.py` | Subscriber — receives data from a relay |
 | `join_example.py` | SUBSCRIBE + FETCH (join mid-stream) |
 | `pub_bench.py` | Publisher benchmark, configurable parameters |
 | `sub_bench.py` | Subscriber with latency/jitter/loss stats |
-| `relay_bench.py` | Combined pub/sub in one process |
-| `multi_sub_bench.py` | 1 publisher, N subscribers in one process |
 | `loopback_bench.py` | Local loopback (no relay) |
-| `adaptive_bench.py` | Ramps rate until buffer growth; loopback (`--mp-loopback` for proc-isolated pub/sub) or relay |
+| `adaptive_bench.py` | Ramps rate or subscriber count; loopback (`--mp` for proc-isolated pub/sub) or relay |
 | `server_example.py` | WebTransport server (origin) |
 | `relay_probe.py` | Relay version probe (draft-14/16/18) |
 | `moq_interop_client.py` | Interop test client (TAP v14 out; 6 standard + `fetch`/`join`) |

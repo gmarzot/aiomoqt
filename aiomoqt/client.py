@@ -23,7 +23,6 @@ class MOQTClient(MOQTPeer):
         path: Optional[str] = None,
         use_quic: Optional[bool] = False,
         verify_tls: Optional[bool] = True,
-        allow_optional_dgram: Optional[bool] = False,
         configuration: Optional[QuicConfiguration] = None,
         debug: Optional[bool] = False,
         keylog_filename: Optional[str] = None,
@@ -36,8 +35,7 @@ class MOQTClient(MOQTPeer):
         keep_alive_interval: Optional[float] = None,
         socket_buffer_size: Optional[int] = None,
     ):
-        super().__init__(allow_optional_dgram=allow_optional_dgram,
-                         libquicr_compat=libquicr_compat,
+        super().__init__(libquicr_compat=libquicr_compat,
                          tx_max_inflight_bytes=tx_max_inflight_bytes)
         from .utils.url import normalize_wt_path
         self.host = host

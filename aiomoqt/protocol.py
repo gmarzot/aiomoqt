@@ -76,13 +76,11 @@ class MOQTStreamReject(Exception):
 # base class for client and server session objects
 class MOQTPeer:
     """MOQT client and server base-class."""
-    def __init__(self, allow_optional_dgram: bool = False,
-                 libquicr_compat: bool = False,
+    def __init__(self, libquicr_compat: bool = False,
                  tx_max_inflight_bytes: Optional[int] =
                      DEFAULT_TX_MAX_INFLIGHT_BYTES):
         #  message handlers
         self._control_msg_handlers: Dict[int, Callable] = {}
-        self.allow_optional_dgram = allow_optional_dgram
         self.libquicr_compat = libquicr_compat
         # Per-stream producer soft cap on bytes pending in the sc->tx
         # data ring. Engages only when set BELOW
@@ -269,7 +267,15 @@ class _MOQTSessionMixin:
         self._bidi_streams: Dict[int, int] = {}  # map request_id to bidi stream_id (d16)
         self._bidi_stream_requests: Dict[int, int] = {}  # map bidi stream_id to request_id (d16)
         self._track_aliases: Dict[int, int] = {}  # map alias to subscription_id
-        self._warned_unknown_aliases: set = set()
+        # Aliases seen on data streams before any control message bound
+        # them: {alias: [first_seen_monotonic, streams_admitted]}. Data
+        # legitimately races SUBSCRIBE_OK (§10.4.2), so an entry here is
+        # only a problem if it never clears — see _check_unbound_aliases.
+        # Datagrams that failed to parse — dropped objects, not
+        # session errors. Surfaced in stats rather than raising.
+        self._dgram_parse_errors: int = 0
+        self._unbound_aliases: dict = {}
+        self._unbound_escalated: set = set()
         self._subscriptions: Dict[int, List] = {}  # map subscription_id to request
         self._pending_requests: Dict[int, Future[MOQTMessage]] = {}  # unified response futures
         # Bounded record of request ids WE issued (recorded at allocation).
@@ -291,7 +297,6 @@ class _MOQTSessionMixin:
         self._control_msg_overrides = dict(session._control_msg_handlers)
 
         self._stream_data_registry = dict(_MOQTSessionMixin.MOQT_STREAM_DATA_REGISTRY)
-        self._dgram_data_registry = dict(_MOQTSessionMixin.MOQT_DGRAM_DATA_REGISTRY)
 
         # Optional callback for received data objects:
         #   fn(msg, size_bytes, recv_time_ms, group_id, subgroup_id)
@@ -910,15 +915,21 @@ class _MOQTSessionMixin:
           and the uniqueness check is deferred until the first object.
         """
         if header.track_alias not in self._track_aliases:
-            # Once per alias at WARNING, DEBUG after — a persistently
-            # unbound alias otherwise floods the log per subgroup stream.
-            first = header.track_alias not in self._warned_unknown_aliases
-            self._warned_unknown_aliases.add(header.track_alias)
-            logger.log(
-                logging.WARNING if first else logging.DEBUG,
+            # Data before the control message that binds the alias is
+            # legal (§10.4.2), so this alone is not an error — it is
+            # only a defect if the alias NEVER binds. Record and stay
+            # quiet; _check_unbound_aliases escalates on the failure
+            # shape (still unbound after a grace period AND more
+            # streams than a single race could explain).
+            st = self._unbound_aliases.setdefault(
+                header.track_alias, [time.monotonic(), 0])
+            st[1] += 1
+            logger.debug(
                 f"MOQT stream({stream_id}): subgroup with "
                 f"unknown track_alias={header.track_alias} "
-                f"(may resolve via pending control message)")
+                f"(stream {st[1]} under this alias; "
+                f"awaiting control message)")
+            self._check_unbound_aliases(header.track_alias)
         # subgroup_id is None in FIRST_OBJ mode — resolved on first object
         key = (header.track_alias, header.group_id, header.subgroup_id)
         if header.subgroup_id is not None:
@@ -933,6 +944,44 @@ class _MOQTSessionMixin:
             state = self._data_streams.get(stream_id)
             if state is not None:
                 state.key = ('subgroup', key)
+
+    # An unbound alias is normal for the moment between the first data
+    # stream and the SUBSCRIBE_OK that binds it. It is a DEFECT when it
+    # outlives both: more streams than one race can produce, and longer
+    # than a control round trip. Either alone is inconclusive.
+    UNBOUND_ALIAS_GRACE_S = 5.0
+    UNBOUND_ALIAS_MAX_STREAMS = 4
+
+    def _check_unbound_aliases(self, alias: int) -> None:
+        """Escalate once per alias when it is provably stuck."""
+        st = self._unbound_aliases.get(alias)
+        if st is None or alias in self._unbound_escalated:
+            return
+        first_seen, streams = st
+        age = time.monotonic() - first_seen
+        if (streams >= self.UNBOUND_ALIAS_MAX_STREAMS
+                and age >= self.UNBOUND_ALIAS_GRACE_S):
+            self._unbound_escalated.add(alias)
+            logger.warning(
+                f"MOQT: track_alias={alias} still unbound after "
+                f"{streams} data streams over {age:.1f}s — the peer is "
+                f"sending under an alias no control message assigned. "
+                f"Objects still deliver (delivery does not consult the "
+                f"registry) but per-track routing cannot work. Check "
+                f"that SUBSCRIBE_OK/PUBLISH carried this alias.")
+
+    def _resolve_unbound_alias(self, alias: int) -> None:
+        """Called when a control message binds an alias — clears the
+        pending record and reports how long the race lasted."""
+        st = self._unbound_aliases.pop(alias, None)
+        self._unbound_escalated.discard(alias)
+        if st is not None:
+            first_seen, streams = st
+            logger.debug(
+                f"MOQT: track_alias={alias} bound after "
+                f"{(time.monotonic() - first_seen) * 1000:.0f}ms "
+                f"and {streams} early stream(s) — data/control race "
+                f"resolved")
 
     def _bind_subgroup_first_obj(self, stream_id: int,
                                   header: 'SubgroupHeader') -> None:
@@ -1088,8 +1137,12 @@ class _MOQTSessionMixin:
         dgram_type = buf.pull_vint()
         if prof.varint == "vi64":
             return self._moqt_handle_data_dgram_d18(buf, pos, dgram_type)
-        # Draft-14: ObjectDatagram types 0x00-0x07 (payload datagrams)
-        if 0x00 <= dgram_type <= 0x07:
+        # d14: ObjectDatagram types 0x00-0x07. d16 adds the
+        # DEFAULT_PRIORITY bit (0x08) — priority byte omitted on the
+        # wire — so 0x08-0x0F are legal there and must not close the
+        # session as unknown types.
+        _dgram_max = 0x0F if prof.draft >= 16 else 0x07
+        if 0x00 <= dgram_type <= _dgram_max:
             msg = ObjectDatagram.deserialize(buf, buf.capacity, type_val=dgram_type, prof=self._profile)
             if msg is None:
                 error = f"datagram parsing failed at: {buf.tell()}"
@@ -1129,6 +1182,10 @@ class _MOQTSessionMixin:
             logstr = f"{id} size: {consumed} bytes {delay}"
 
             logger.debug(f"MOQT event: ObjectDatagramStatus: {logstr}")
+            # Deliberate: status datagrams are wire-level signals (end
+            # of group / track markers), not data objects — they are
+            # parsed and logged but NOT delivered to on_object_received,
+            # so subscriber object/byte counters stay data-only.
             return msg
         else:
             error = f"datagram type unknown: 0x{dgram_type:x}"
@@ -1414,7 +1471,26 @@ class _MOQTSessionMixin:
         elif isinstance(event, DatagramFrameReceived) and self._wt_session_setup.done():
             msg_buf = Buffer(data=event.data)
             logger.debug(f"MOQT event: DatagramFrameReceived: 0x{msg_buf.data_slice(0,min(msg_buf.capacity,16)).hex()}")
-            self._moqt_handle_data_dgram(msg_buf)
+            # A datagram is a self-contained, unreliable message: one we
+            # cannot parse is a dropped object, never a dead session.
+            # Letting the parse raise here propagated out of the asyncio
+            # callback and killed the whole connection on a single bad
+            # frame. Count, log the first one with its bytes for
+            # diagnosis, and keep receiving.
+            try:
+                self._moqt_handle_data_dgram(msg_buf)
+            except Exception as e:
+                self._dgram_parse_errors += 1
+                if self._dgram_parse_errors == 1:
+                    logger.warning(
+                        f"MOQT: datagram parse failed ({type(e).__name__}: "
+                        f"{e}) — object dropped, session continues. "
+                        f"first 32B: "
+                        f"0x{msg_buf.data_slice(0, min(msg_buf.capacity, 32)).hex()}")
+                else:
+                    logger.debug(
+                        f"MOQT: datagram parse failed "
+                        f"(#{self._dgram_parse_errors}): {e}")
             return
         elif isinstance(event, StopSendingReceived):
             logger.debug(f"MOQT event: StopSendingReceived: stream {event.stream_id}")
@@ -1880,13 +1956,50 @@ class _MOQTSessionMixin:
     _REQUEST_OPENERS = (Subscribe, Fetch, Publish, TrackStatus,
                         PublishNamespace, SubscribeNamespace, SubscribeTracks)
 
-    def send_dgram_message(self, buf: Buffer) -> None:
-        """Send a MoQT message via QUIC datagram (best-effort)."""
+    def send_dgram_message(self, buf: Buffer) -> int:
+        """Send a MoQT message via QUIC datagram, fire-and-forget.
+
+        Returns bytes accepted; 0 means the per-connection datagram
+        ring is full (backpressure). Paced producers should use
+        dgram_write_drain instead, which parks until the ring drains.
+        """
         if self._quic is None:
             raise MOQTException(SessionCloseCode.INTERNAL_ERROR,
                                 "QUIC not initialized")
         logger.debug(f"QUIC send: datagram message: {buf.capacity} bytes")
-        self._quic.send_datagram_frame(data=buf.data)
+        return self._quic.send_datagram_frame(data=buf.data)
+
+    def datagram_max_payload(self) -> int:
+        """Usable per-datagram payload ceiling on this session's
+        transport: min(local TP, peer TP, guaranteed MTU floor). 0 =
+        datagrams unavailable (peer didn't negotiate, handshake not
+        complete, or WT transport — WT datagram TX isn't wired yet)."""
+        if getattr(self, '_is_wt', False):
+            return 0
+        q = self._quic
+        if q is None or not hasattr(q, 'max_datagram_payload'):
+            return 0
+        return q.max_datagram_payload()
+
+    async def dgram_write_drain(self, buf: Buffer) -> None:
+        """Send a MoQT datagram, parking on transport backpressure.
+
+        The per-connection record ring bounds queued datagrams (ring
+        size / throughput = queuing latency); when it is full, wait for
+        the worker's drain edge instead of dropping. Raises
+        CancelledError once the session is closing, mirroring
+        stream_write_drain.
+        """
+        data = buf.data
+        while True:
+            if self._close_err is not None or self._quic is None:
+                raise asyncio.CancelledError
+            try:
+                if self._quic.send_datagram_frame(data=data):
+                    return
+            except ConnectionError:
+                raise asyncio.CancelledError
+            await self._quic.get_datagram_tx_drain_event().wait()
 
     ################################################################################################
     #  Outbound control message API - note: awaitable messages support 'wait_response' param       #
@@ -2550,6 +2663,7 @@ class _MOQTSessionMixin:
         # carries no Track Alias; the registry is keyed from the reply.
         if msg.track_alias is not None:
             self._track_aliases[msg.track_alias] = msg.request_id
+            self._resolve_unbound_alias(msg.track_alias)
         self._resolve_request(msg.request_id, msg)
 
     async def _handle_subscribe_error(self, msg: SubscribeError) -> None:
@@ -2765,39 +2879,6 @@ class _MOQTSessionMixin:
         logger.info(f"MOQT event: handle {msg}")
         return
 
-    async def _handle_object_datagram(self, msg: ObjectDatagram) -> None:
-        """Handle object datagram message."""
-        logger.info(f"MOQT event: handle {msg}")
-        # Process object datagram
-        # Validate track alias exists
-        request_id = self._track_aliases.get(msg.track_alias)
-        if request_id is None:
-            logger.error(f"MOQT error: datagram for unknown track: {msg.track_alias}")
-            self._close_session(
-                error_code=SessionCloseCode.PROTOCOL_VIOLATION,
-                reason_phrase="Invalid track alias in datagram"
-            )
-            return
-        logger.debug(f"MOQT event: datagram object: {msg.group_id}.{msg.object_id}")
-        # Process object data
-        # Could add to local storage or forward to subscribers
-
-    async def _handle_object_datagram_status(self, msg: ObjectDatagramStatus) -> None:
-        """Handle object datagram status message."""
-        logger.info(f"MOQT event: handle {msg}")
-        # Process object status
-        # Update status in local tracking
-        subscibe_id = self._track_aliases.get(msg.track_alias)
-        if subscibe_id is None:
-            logger.error(f"MOQT error: datagram status for unknown track: {msg.track_alias}")
-            self._close_session(
-                error_code=SessionCloseCode.PROTOCOL_VIOLATION,
-                reason_phrase="Invalid track alias in status"
-            )
-            return
-        # Update object status in local storage or notify subscribers            
-
-
     async def _handle_request_ok(self, msg: RequestOk) -> None:
         logger.info(f"MOQT event: handle {msg}")
         self._resolve_request(msg.request_id, msg)
@@ -2962,12 +3043,6 @@ class _MOQTSessionMixin:
     MOQT_STREAM_DATA_REGISTRY: Dict[int, Tuple[Type[MOQTMessage], Callable]] = {
         DataStreamType.FETCH_HEADER: (FetchHeader, _handle_fetch_header),
         # SubgroupHeader: types 0x10-0x1D dispatched by range check
-    }
-
-    # Datagram data message types (dispatch by range check, not registry lookup)
-    MOQT_DGRAM_DATA_REGISTRY: Dict[int, Tuple[Type[MOQTMessage], Callable]] = {
-        # ObjectDatagram: types 0x00-0x07 dispatched by range check
-        # ObjectDatagramStatus: types 0x20-0x21 dispatched by range check
     }
 
 

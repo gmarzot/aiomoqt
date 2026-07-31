@@ -7,10 +7,10 @@ testing where each side gets its own CPU core.
 
 Usage:
   # Shell 1: start publisher server
-  python -m aiomoqt.examples.pub_server -s 16384 -g 10000 -P 4 -r 0
+  python -m aiomoqt.tools.pub_server -s 16384 -g 10000 -P 4 -r 0
 
   # Shell 2: connect subscriber
-  python -m aiomoqt.examples.sub_bench https://localhost:4434/moq -t 30 -i 5
+  python -m aiomoqt.tools.sub_bench https://localhost:4434/moq -t 30 -i 5
 """
 import argparse
 import asyncio
@@ -18,8 +18,9 @@ import logging
 import os
 
 from aiomoqt.server import MOQTServer
-from aiomoqt.types import MOQTMessageType, MOQT_VERSION_DRAFT16, parse_draft_spec
+from aiomoqt.types import MOQTMessageType, parse_draft_spec
 from aiomoqt.track import PublishedTrack
+from aiomoqt.types import ForwardingPreference
 from aiomoqt.utils.logger import set_log_level, get_logger
 
 logger = get_logger(__name__)
@@ -50,7 +51,7 @@ def parse_args():
         epilog=__doc__,
     )
     parser.add_argument(
-        '-h', '--host', type=str, default='localhost',
+        '--bind', dest='host', type=str, default='localhost',
         help='Bind address (default: localhost)')
     parser.add_argument(
         '-p', '--port', type=int, default=4434,
@@ -59,7 +60,7 @@ def parse_args():
         '-s', '--object-size', type=int, default=4096,
         help='Object payload size bytes (default: 4096)')
     parser.add_argument(
-        '-g', '--group-size', type=int, default=10000,
+        '-g', '--group-size', type=int, default=4096,
         help='Objects per group (default: 10000)')
     parser.add_argument(
         '-P', '--streams', type=int, default=1,
@@ -83,16 +84,18 @@ def parse_args():
              '(4 MiB ~ 8 ms @ 3 Gbps). Default: aiopquic default '
              '(4 MiB). Pass 0 to disable.')
     parser.add_argument(
-        '-q', '--quic', '--use-quic', action='store_true',
-        help='Serve raw QUIC (aiopquic) instead of H3/WebTransport')
+        '-Q', '--quic', action='store_true', help='Serve raw QUIC')
+    parser.add_argument(
+        '-W', '--wt', action='store_true',
+        help='Serve H3/WebTransport (default if neither given)')
     parser.add_argument(
         '--draft', type=parse_draft_spec, default=16,
         help='MoQT draft version when --quic (default: 16)')
     parser.add_argument(
-        '-n', '--namespace', type=str, default='aiomoqt',
+        '-N', '--namespace', type=str, default='aiomoqt',
         help='Track namespace (default: aiomoqt)')
     parser.add_argument(
-        '--trackname', type=str, default='track',
+        '-T', '--trackname', type=str, default='track',
         help='Track name (default: track)')
     parser.add_argument(
         '--pub-ns', action='store_true',
@@ -119,7 +122,20 @@ def parse_args():
     parser.add_argument(
         '-?', '--help', action='help',
         help='Show this help message and exit')
-    return parser.parse_args()
+    parser.add_argument(
+        '-D', '--datagram', action='store_true',
+        help='ObjectDatagrams instead of subgroup streams (requires '
+             '-q raw QUIC; object must fit one packet, ~1150B max)')
+    args = parser.parse_args()
+    if not args.quic and not args.wt:
+        args.wt = True
+    if args.datagram and not args.quic:
+        parser.error("-D/--datagram requires -Q (raw QUIC); "
+                     "WT datagram TX is not wired yet")
+    if args.datagram and args.object_size > 1152:
+        parser.error(f"-D/--datagram: object_size {args.object_size} "
+                     f"can never fit a DATAGRAM frame (max ~1152B)")
+    return args
 
 
 async def _on_subscribe(session, msg, args):
@@ -132,6 +148,8 @@ async def _on_subscribe(session, msg, args):
         group_size=args.group_size,
         num_subgroups=args.streams,
         rate=args.rate,
+        forwarding=(ForwardingPreference.DATAGRAM if args.datagram
+                    else ForwardingPreference.SUBGROUP),
     )
     ok = session.subscribe_ok(request_msg=msg)
     track.track_alias = ok.track_alias
@@ -141,7 +159,8 @@ async def _on_subscribe(session, msg, args):
     try:
         await track.generate(session, ok.track_alias)
     except BaseException as e:
-        import sys, traceback
+        import sys
+        import traceback
         print(f"\n=== _on_subscribe: track.generate raised {type(e).__name__}: {e} ===",
               file=sys.stderr, flush=True)
         traceback.print_exc(file=sys.stderr)
@@ -167,6 +186,8 @@ async def _on_subscribe_namespace(session, msg, args):
         group_size=args.group_size,
         num_subgroups=args.streams,
         rate=args.rate,
+        forwarding=(ForwardingPreference.DATAGRAM if args.datagram
+                    else ForwardingPreference.SUBGROUP),
     )
     await track.publish(
         announce_namespace=(args.pub_ns or args.pub_both),
@@ -249,7 +270,7 @@ async def main():
         url = f"moqt://{args.host}:{args.port}"
     else:
         url = f"https://{args.host}:{args.port}/"
-    print(f"  python -m aiomoqt.examples.sub_bench {url} "
+    print(f"  python -m aiomoqt.tools.sub_bench {url} "
           f"-n {args.namespace} -t 30 -i 5 --draft {args.draft} -k")
 
     try:
@@ -259,6 +280,14 @@ async def main():
     finally:
         quic_server.close()
         print("\nServer stopped.")
+
+
+def cli():
+    """Console entry point (moq-pub-server)."""
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n  Interrupted.")
 
 
 if __name__ == "__main__":

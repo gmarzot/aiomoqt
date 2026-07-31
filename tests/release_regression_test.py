@@ -73,8 +73,9 @@ TIERS = {
 TIER_CHOICES = tuple(TIERS.keys())
 SUITE_CHOICES = tuple(s for suites in TIERS.values() for s in suites)
 
+# load_sim quick mode: N subscribers on one synthesized track.
 MULTI_SUB_ARGS_COMMON = [
-    "-n", "3", "-s", "1024", "-r", "30", "-g", "60", "-t", "30",
+    "--subs", "3", "-s", "1024", "-r", "30", "-g", "60", "-t", "30",
 ]
 PUB_MODE_FLAGS = {
     "publish":      [],
@@ -179,7 +180,7 @@ def _loopback_setup(log_dir: Path) -> tuple[str, str]:
 def _loopback_pub_sub(log_dir: Path) -> tuple[str, str]:
     log = log_dir / "loopback-pub-sub.log"
     cmd = [
-        sys.executable, "-m", "aiomoqt.examples.loopback_bench",
+        sys.executable, "-m", "aiomoqt.tools.loopback_bench",
         "-P", "4", "-s", "16384", "-r", "60", "-t", "10",
     ]
     ok, _ = _run(cmd, log, 40)
@@ -195,7 +196,7 @@ def _loopback_pub_sub_variant(log_dir: Path, slug: str, flags: list[str],
     """Generic runner for loopback_bench variants."""
     log = log_dir / f"{slug}.log"
     cmd = [
-        "python", "-m", "aiomoqt.examples.loopback_bench",
+        "python", "-m", "aiomoqt.tools.loopback_bench",
         *flags,
     ]
     ok, _ = _run(cmd, log, timeout)
@@ -258,13 +259,13 @@ def _loopback_bench_combo(log_dir: Path, draft: int,
     flags = ["--draft", str(draft), "-P", "1", "-s", "4096",
              "-r", "2000", "-g", "1000", "-t", "5"]
     if quic:
-        flags.append("-q")
+        flags.append("-Q")
     return _loopback_pub_sub_variant(
         log_dir, f"loopback-bench-d{draft}-{transport}", flags, timeout=30)
 
 
 def _loopback_adaptive_mp(log_dir: Path, draft: int) -> tuple[str, str]:
-    """adaptive_bench --mp-loopback (BW, separate pub + sub processes) for
+    """adaptive_bench --mp (BW, separate pub + sub processes) for
     one draft — exercises the multi-process publisher/subscriber start
     path the in-process loopback misses (e.g. the BW start-gate clobber
     fixed in 0.9.10)."""
@@ -273,8 +274,8 @@ def _loopback_adaptive_mp(log_dir: Path, draft: int) -> tuple[str, str]:
     # -t 8 self-terminates with a clean High-water summary; _run's
     # Python-level timeout is the backstop. No external `timeout` binary
     # (absent on macOS runners — it's `gtimeout` there, if installed).
-    cmd = [sys.executable, "-m", "aiomoqt.examples.adaptive_bench",
-           "--mp-loopback", "--draft", str(draft),
+    cmd = [sys.executable, "-m", "aiomoqt.tools.adaptive_bench",
+           "--mp", "--draft", str(draft),
            "-P", "1", "-s", "4096", "--start-mbps", "20",
            "--step-mbps", "10", "--max-mbps", "60", "--interval", "2",
            "-t", "8"]
@@ -291,7 +292,7 @@ def _loopback_adaptive_mp(log_dir: Path, draft: int) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 def _relay_ctrl_msg(url: str, draft: int, insecure: bool,
                     compat: str, log: Path) -> tuple[str, str]:
-    cmd = [sys.executable, "-m", "aiomoqt.examples.moq_interop_client",
+    cmd = [sys.executable, "-m", "aiomoqt.tools.moq_interop_client",
            "-r", url, "--draft", str(draft)]
     if insecure:
         cmd.append("--tls-disable-verify")
@@ -308,9 +309,9 @@ def _relay_ctrl_msg(url: str, draft: int, insecure: bool,
 def _relay_pub_sub(url: str, draft: int, pub_mode: str, insecure: bool,
                    compat: str, log: Path,
                    trackname: str) -> tuple[str, str]:
-    cmd = [sys.executable, "-m", "aiomoqt.examples.multi_sub_bench",
+    cmd = [sys.executable, "-m", "aiomoqt.tools.load_sim",
            url, *MULTI_SUB_ARGS_COMMON, "--draft", str(draft),
-           "--trackname", trackname, *PUB_MODE_FLAGS[pub_mode]]
+           "-T", trackname, *PUB_MODE_FLAGS[pub_mode]]
     if insecure:
         cmd.append("-k")
     if compat:
@@ -319,7 +320,7 @@ def _relay_pub_sub(url: str, draft: int, pub_mode: str, insecure: bool,
     if not ok:
         return "FAIL", "timeout"
     text = log.read_text()
-    m = re.search(r"Subscribers:\s+(\d+)/(\d+)\s+ok", text)
+    m = re.search(r"peak\s+(\d+)/(\d+)", text)
     if not m:
         return "FAIL", "(no summary)"
     got, want = m.group(1), m.group(2)
@@ -341,7 +342,7 @@ def _relay_pub_sub(url: str, draft: int, pub_mode: str, insecure: bool,
 
 def _relay_tap_case(url: str, draft: int, case: str, insecure: bool,
                     compat: str, log: Path) -> tuple[str, str]:
-    cmd = [sys.executable, "-m", "aiomoqt.examples.moq_interop_client",
+    cmd = [sys.executable, "-m", "aiomoqt.tools.moq_interop_client",
            "-r", url, "--draft", str(draft), "-t", case]
     if insecure:
         cmd.append("--tls-disable-verify")
@@ -376,7 +377,7 @@ def _loopback_adaptive_bench(log_dir: Path) -> tuple[str, str]:
     # Loopback self-test: short ramp, kill after ~30s so the runner
     # isn't held open by the forever-probing controller.
     cmd = ["timeout", "--signal=INT", "--kill-after=3", "30",
-           sys.executable, "-m", "aiomoqt.examples.adaptive_bench",
+           sys.executable, "-m", "aiomoqt.tools.adaptive_bench",
            "--start-mbps", "10", "--step-mbps", "10",
            "--max-mbps", "500", "--interval", "3",
            "-l", "100"]
@@ -411,7 +412,7 @@ def _print_result(res: Result) -> None:
 # Interop flake handling
 # ---------------------------------------------------------------------------
 # External relays + the network introduce transient failures (timeouts, the
-# multi_sub_bench fixed publisher-register wait racing a relay's namespace
+# load_sim's fixed publisher-register wait racing a relay's namespace
 # registration). Retry a failing interop case a couple of times: a genuine
 # fail fails every attempt; a flake recovers and is annotated — so a flake
 # never reads as a real failure.

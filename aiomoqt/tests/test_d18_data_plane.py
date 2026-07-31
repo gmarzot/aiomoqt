@@ -5,13 +5,14 @@ OBJECT_DATAGRAM relayout. Values >= 64 are used so vi64 and RFC9000
 genuinely diverge (vi64 1-byte vs RFC9000 2-byte), proving the d18 codec
 is actually taken. d14/d16 paths are covered by the existing suite.
 """
+import pytest
 from aiomoqt.utils.buffer import Buffer
 from aiomoqt.messages.track import (
     SubgroupHeader, ObjectHeader, ObjectDatagram)
 from aiomoqt.messages import ObjectStatus
 from aiomoqt.context import profile_for
 from aiomoqt.types import (
-    SUBGROUP_ID_EXPLICIT, OBJECT_DATAGRAM_BASE)
+    SUBGROUP_ID_EXPLICIT)
 
 
 def test_d18_subgroup_header_roundtrip():
@@ -85,3 +86,56 @@ def test_d18_datagram_status_roundtrip():
     assert out.status == ObjectStatus.END_OF_GROUP
     assert out.payload == b""
     assert out.object_id == 300
+
+
+# -- d18 extension varint flavor -------------------------------------
+#
+# Regression: the extension KVP block was encoded with the STANDARD
+# varint encoder while the surrounding d18 header fields used vi64.
+# Self-testing could not see it — our encoder and decoder were both
+# standard, so loopback round-tripped fine — but moxygen parses the
+# whole frame as vi64, reads garbage, and closes the session with
+# PROTOCOL_VIOLATION. Caught only by publishing to a real d18 relay.
+
+class _Prof:
+    def __init__(self, vi64):
+        self.vi64 = vi64
+        self.draft = 18 if vi64 else 16
+
+
+def test_d18_extensions_use_vi64_not_standard_varint():
+    from aiomoqt.messages.track import ObjectDatagram
+    big = 1_700_000_000_000_000        # a value whose encodings differ
+    d16 = ObjectDatagram(track_alias=1, group_id=2, object_id=3,
+                         extensions={0x20: big}, payload=b"xy")
+    d18 = ObjectDatagram(track_alias=1, group_id=2, object_id=3,
+                         extensions={0x20: big}, payload=b"xy")
+    b16 = d16.serialize(prof=_Prof(False))
+    b18 = d18.serialize(prof=_Prof(True))
+    raw16 = bytes(b16.data_slice(0, b16.tell()))
+    raw18 = bytes(b18.data_slice(0, b18.tell()))
+    assert raw16 != raw18, (
+        "d18 datagram encodes identically to d16 — the extension block "
+        "is not following the vi64 flavor")
+    # standard varint tags a 8-byte value 0xc0..., vi64 uses 0xfe...
+    assert raw16.hex().find("c0060a24181e4000") > 0, raw16.hex()
+    assert raw18.hex().find("fe060a24181e4000") > 0, raw18.hex()
+
+
+@pytest.mark.parametrize("vi64", [False, True])
+def test_datagram_extension_round_trip_both_flavors(vi64):
+    from aiomoqt.messages.track import ObjectDatagram
+    from aiomoqt.utils.buffer import Buffer
+    prof = _Prof(vi64)
+    big = 1_700_000_000_000_000
+    o = ObjectDatagram(track_alias=7, group_id=9, object_id=11,
+                       extensions={0x20: big}, payload=b"payload")
+    b = o.serialize(prof=prof)
+    raw = bytes(b.data_slice(0, b.tell()))
+    rb = Buffer(data=raw, vi64=vi64)
+    type_val = rb.pull_vint()
+    got = ObjectDatagram.deserialize(rb, len(raw), type_val=type_val,
+                                     prof=prof)
+    assert got.extensions == {0x20: big}
+    assert got.payload == b"payload"
+    assert (got.track_alias, got.group_id, got.object_id) == (7, 9, 11)

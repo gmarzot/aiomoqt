@@ -40,6 +40,30 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
+  # .github/aiopquic-pin builds aiopquic from source at a given ref, which is
+  # how a PR pairs with an unreleased aiopquic change. Legitimate while paired,
+  # never on main or a release: it would ship a dependency nobody can install.
+  pin-guard:
+    name: aiopquic pin guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reject an aiopquic pin on main / release
+        shell: bash
+        run: |
+          if [ ! -f .github/aiopquic-pin ]; then
+            echo "no aiopquic pin — resolving from PyPI"
+            exit 0
+          fi
+          spec=$(grep -vE '^[[:space:]]*(#|$)' .github/aiopquic-pin | head -n1 || true)
+          gated="${{ github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'release') }}"
+          if [ "$gated" = "true" ]; then
+            echo "::error::.github/aiopquic-pin is present ($spec) — delete it and depend on a published aiopquic"
+            exit 1
+          fi
+          echo "::warning::aiopquic pinned to $spec — delete .github/aiopquic-pin before merging to main"
+          echo "aiopquic pinned to \`$spec\` — delete the pin before merging" >> "$GITHUB_STEP_SUMMARY"
+
   core:
     name: core / ${{ matrix.os }} / py${{ matrix.python-version }}
     runs-on: ${{ matrix.os }}
@@ -110,10 +134,10 @@ jobs:
           # -u so the "ready on" banner reaches /tmp/pub-srv.log
           # before our poll grep runs (Python buffers stdout in 4KB
           # chunks when redirected to a file).
-          python -u -m aiomoqt.examples.pub_server \
+          python -u -m aiomoqt.tools.pub_server \
             --cert certs/cert.pem --key certs/key.pem \
-            -p 4434 -s 4096 -g 10000 -P 1 \
-            --draft 16 --quic > /tmp/pub-srv.log 2>&1 &
+            -p 4434 -s 4096 -g 4096 -P 1 \
+            --draft 16 -Q > /tmp/pub-srv.log 2>&1 &
           PUB_PID=$!
           # Poll up to 10s for pub_server's "ready on" line. Bare
           # `sleep 1.5` was flaky on busier Linux runners — pub_server
@@ -139,8 +163,8 @@ jobs:
           # captures sub.log before the runner SIGTERMs us — bounded
           # cleanup + visible failure mode. The underlying sub_bench
           # -t bug is tracked for 0.9.6.
-          python -u -m aiomoqt.examples.sub_bench \
-            -q --draft 16 -n aiomoqt --trackname track \
+          python -u -m aiomoqt.tools.sub_bench \
+            --draft 16 -N aiomoqt -T track \
             -t 12 -i 5 moqt://localhost:4434 \
             > /tmp/sub.log 2>&1 &
           SUB_PID=$!
@@ -223,7 +247,7 @@ jobs:
       - name: aiomoqt sub_bench against moq-rs relay (clock track)
         timeout-minutes: 3
         run: |
-          timeout 12 python -m aiomoqt.examples.sub_bench \
+          timeout 12 python -m aiomoqt.tools.sub_bench \
             -n clock --trackname now --draft 18,16,14 -k -t 8 \
             https://localhost:4443 \
             > /tmp/sub.log 2>&1 || true
@@ -271,13 +295,13 @@ jobs:
           for mode in wt quic; do
             if [ "$mode" = wt ]; then url="https://localhost:4453/"
             else url="moqt://localhost:4453"; fi
-            python -m aiomoqt.examples.pub_bench "$url" \
-              -n "ci-$mode" --trackname t -s 256 -t 10 -k \
+            python -m aiomoqt.tools.pub_bench "$url" \
+              -N "ci-$mode" -T t -s 256 -t 10 -k \
               > "/tmp/pub-$mode.log" 2>&1 &
             pub=$!
             sleep 2
-            timeout 15 python -m aiomoqt.examples.sub_bench "$url" \
-              -n "ci-$mode" --trackname t -k -t 8 \
+            timeout 15 python -m aiomoqt.tools.sub_bench "$url" \
+              -N "ci-$mode" -T t -k -t 8 \
               > "/tmp/sub-$mode.log" 2>&1 || true
             wait $pub || true
             echo "=== sub-$mode.log ==="; tail -15 "/tmp/sub-$mode.log"

@@ -14,10 +14,8 @@ two message types to a multiprocessing.Queue:
 Each worker is GIL-isolated. Parent never shares Python objects with
 children except the queue and stop_event. Config is a picklable dict.
 
-Consumers today: aiomoqt.examples.adaptive_bench SubsActuator
-(ramps subscriber count dynamically). aiomoqt.examples.multi_sub_bench
-is a candidate to port next — its run_subscriber has the same shape
-but reports once at end-of-run instead of periodically.
+Consumers: aiomoqt.tools.adaptive_bench (ramps subscriber count
+dynamically) and aiomoqt.tools.load_sim (matrix + churn simulation).
 """
 from __future__ import annotations
 
@@ -35,6 +33,7 @@ from aiomoqt.track import SubscribedTrack, TrackState
 from aiomoqt.types import FilterType
 from aiomoqt.utils.url import parse_relay_url
 from aiomoqt.utils.logger import set_log_level
+from aiomoqt.utils.stats import TrackStats
 
 
 SUBSCRIBE_RETRY_WINDOW_S = 30.0
@@ -53,113 +52,6 @@ if sys.platform == "linux":
     MP_CTX = multiprocessing.get_context("fork")
 else:
     MP_CTX = multiprocessing.get_context()
-
-
-class _RollingStats:
-    """5s rolling window, mirrors adaptive_bench.LiveStats semantics.
-
-    Stride-aware loss: when objects are striped across parallel
-    subgroups the per-subgroup object_id sequence skips by stride.
-    """
-
-    def __init__(self, window_s: float = 5.0):
-        self.window_s = window_s
-        self._events: deque = deque()   # (t, bytes, lat_ms_or_None)
-        # Latency sampling stride — adaptively raised by snapshot()
-        # so the percentile sort stays bounded; a full 5 s window at
-        # 100K+ obj/s is 500K+ entries and sorting it stalls the
-        # consumer loop ~100 ms, queueing arrivals it then measures.
-        self._lat_stride: int = 1
-        self._n_events: int = 0
-        self._last_seen: Dict = {}       # (group, subgroup) -> last obj_id
-        self._stride: Dict = {}
-        self._lost = 0
-        self._total_bytes = 0
-        self._total_objs = 0
-        # Per-snapshot deltas — snapshot() returns bytes/objs/loss
-        # since the last call so the consumer can sum across its own
-        # window without double-counting our rolling window.
-        self._last_total_bytes = 0
-        self._last_total_objs = 0
-        self._last_lost = 0
-        # RFC 3550 jitter: smooth |D| where D = inter-arrival skew
-        # vs source pacing. Updated per-object in on_object().
-        self._jitter_ms = 0.0
-        self._last_recv_us: int = 0
-        self._last_send_us: int = 0
-
-    def on_object(self, msg, size_bytes, recv_time_us):
-        """Timestamps on the wire are us; lat is float ms."""
-        t = time.monotonic()
-        lat_ms = None
-        exts = getattr(msg, 'extensions', None) or {}
-        send_us = exts.get(0x20)
-        if send_us is not None and recv_time_us is not None:
-            raw_us = recv_time_us - send_us
-            # Reject negatives + absurd values from deframer garbage;
-            # accept up to 10 minutes (real under-load latency).
-            if -1_000_000 <= raw_us <= 600_000_000:
-                lat_ms = raw_us / 1000.0
-                if self._last_recv_us and self._last_send_us:
-                    d_us = abs((recv_time_us - self._last_recv_us)
-                               - (send_us - self._last_send_us))
-                    self._jitter_ms += (d_us / 1000.0
-                                        - self._jitter_ms) / 16.0
-                self._last_recv_us = recv_time_us
-                self._last_send_us = send_us
-        self._n_events += 1
-        if self._n_events % self._lat_stride == 0:
-            self._events.append((t, size_bytes, lat_ms))
-        self._total_bytes += size_bytes
-        self._total_objs += 1
-        oid = getattr(msg, 'object_id', None)
-        gid = getattr(msg, 'group_id', None)
-        sg = getattr(msg, 'subgroup_id', 0) or 0
-        if oid is not None and gid is not None:
-            key = (gid, sg)
-            last = self._last_seen.get(key)
-            if last is None:
-                self._last_seen[key] = oid
-            else:
-                stride = self._stride.get(key)
-                if stride is None and oid > last:
-                    stride = oid - last
-                    self._stride[key] = stride
-                if stride is not None and stride > 0 and oid > last + stride:
-                    self._lost += (oid - last - stride) // stride
-                self._last_seen[key] = oid
-
-    def snapshot(self) -> dict:
-        """Per-snapshot delta. rx_bytes / rx_objs / iv_lost cover the
-        time since the last snapshot — the consumer can sum them over
-        its own window without double-counting our rolling window.
-        Latency stats stay windowed (need samples for percentiles)."""
-        t = time.monotonic()
-        cutoff = t - self.window_s
-        while self._events and self._events[0][0] < cutoff:
-            self._events.popleft()
-        # Adaptive thinning: bound the percentile sort so the snapshot
-        # cannot stall the consumer loop at high object rates.
-        if len(self._events) > 24576:
-            self._events = deque(list(self._events)[::2])
-            self._lat_stride *= 2
-        # Latency from the rolling window
-        lats = sorted(e[2] for e in self._events if e[2] is not None)
-        mean = sum(lats) / len(lats) if lats else 0.0
-        p90 = lats[min(int(len(lats) * 0.90), len(lats) - 1)] if lats else 0.0
-        # Bytes / objs / loss as DELTAS since last call
-        iv_bytes = self._total_bytes - self._last_total_bytes
-        iv_objs = self._total_objs - self._last_total_objs
-        iv_lost = self._lost - self._last_lost
-        self._last_total_bytes = self._total_bytes
-        self._last_total_objs = self._total_objs
-        self._last_lost = self._lost
-        return dict(t=t, rx_bytes=iv_bytes, rx_objs=iv_objs,
-                    lat_mean_ms=mean, lat_p90_ms=p90,
-                    jitter_ms=self._jitter_ms,
-                    iv_lost=iv_lost, loss=self._lost,
-                    total_bytes=self._total_bytes,
-                    total_objs=self._total_objs)
 
 
 def _setup_quiet_logging(logdir, name, debug):
@@ -232,7 +124,7 @@ async def _subscriber_task(config: Dict[str, Any], mp_stop_event,
     )
 
     stop_ev = _bridge_stop_event(mp_stop_event)
-    stats = _RollingStats()
+    stats = TrackStats()
 
     def _on_object(msg, size_bytes, recv_time_ms, *_args, **_kw):
         stats.on_object(msg, size_bytes, recv_time_ms)
@@ -343,23 +235,11 @@ async def _subscriber_task(config: Dict[str, Any], mp_stop_event,
         })
 
 
-def _try_install_uvloop() -> None:
-    """Best-effort uvloop install in this worker process. Workers are
-    separate interpreters so the parent's policy doesn't carry over."""
-    try:
-        import uvloop
-        uvloop.install()
-    except ImportError:
-        pass
-
-
 def sub_worker_entry(config: Dict[str, Any], mp_stop_event, events_queue):
     """Process entrypoint. Spawned via multiprocessing.Process."""
     _setup_quiet_logging(config.get('logdir'),
                          f"sub-{config['sub_id']}",
                          config.get('debug', False))
-    if not config.get('no_uvloop', False):
-        _try_install_uvloop()
     # AIOMOQT_PROFILE_SUB=<path> wraps this worker's main loop in
     # cProfile. Writes <path>.<sub_id> .prof on exit so multi-sub runs
     # don't clobber each other. Effectively free when the env is unset.
@@ -393,7 +273,7 @@ async def _slot_supervisor(config, relay, stop_ev, stats, state,
                            initial_delay):
     """Maintain ONE subscription for the batch's lifetime: connect,
     subscribe, receive until the track closes/resets, then reopen after
-    a short backoff. Runs until stop_ev. The per-slot _RollingStats is
+    a short backoff. Runs until stop_ev. The per-slot TrackStats is
     passed in and persists across reopens, so a transient drop doesn't
     reset the batch's cumulative totals or latency window.
 
@@ -493,7 +373,7 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
     stop_ev = _bridge_stop_event(mp_stop_event)
 
     # (stats, state) per slot; stats persist across a slot's reopens.
-    slots = [(_RollingStats(), {'active': False}) for _ in range(K)]
+    slots = [(TrackStats(), {'active': False}) for _ in range(K)]
 
     async def _batch_stats_loop():
         while not stop_ev.is_set():
@@ -557,8 +437,6 @@ def sub_batch_worker_entry(config: Dict[str, Any], mp_stop_event,
     _setup_quiet_logging(config.get('logdir'),
                          f"subw-{config['worker_id']}",
                          config.get('debug', False))
-    if not config.get('no_uvloop', False):
-        _try_install_uvloop()
     try:
         asyncio.run(_subscriber_batch_task(config, mp_stop_event,
                                            events_queue))
@@ -604,6 +482,10 @@ async def _publisher_task(config: Dict[str, Any], mp_stop_event,
             await session.client_session_init()
 
             _num_sg = max(1, config.get('num_subgroups', 1))
+            from aiomoqt.types import ForwardingPreference
+            _fwd = (ForwardingPreference.DATAGRAM
+                    if config.get('delivery') == 'datagram'
+                    else ForwardingPreference.SUBGROUP)
             track = PublishedTrack(
                 session,
                 namespace=config['namespace'],
@@ -612,6 +494,7 @@ async def _publisher_task(config: Dict[str, Any], mp_stop_event,
                 group_size=config.get('group_size', 10000),
                 num_subgroups=_num_sg,
                 rate=config.get('initial_rate_ops', 0.0),
+                forwarding=_fwd,
             )
             track._stats_header_printed = True
             track._quiet = True
@@ -753,8 +636,6 @@ def pub_worker_entry(config: Dict[str, Any], mp_stop_event,
     """Process entrypoint. Spawned via multiprocessing.Process."""
     _setup_quiet_logging(config.get('logdir'), 'pub',
                          config.get('debug', False))
-    if not config.get('no_uvloop', False):
-        _try_install_uvloop()
     try:
         asyncio.run(_publisher_task(config, mp_stop_event,
                                      rate_queue, events_queue))
@@ -916,8 +797,6 @@ def loopback_server_entry(config: Dict[str, Any], mp_stop_event,
     --mp-loopback mode (adaptive_bench)."""
     _setup_quiet_logging(config.get('logdir'), 'loopback-server',
                          config.get('debug', False))
-    if not config.get('no_uvloop', False):
-        _try_install_uvloop()
     try:
         asyncio.run(_loopback_server_task(config, mp_stop_event,
                                             rate_queue, events_queue))

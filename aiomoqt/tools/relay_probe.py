@@ -278,10 +278,10 @@ async def run_loop():
         await asyncio.sleep(PROBE_INTERVAL)
 
 
-def _parse_args():
+def parse_args(argv=None):
     import argparse
     p = argparse.ArgumentParser(
-        prog="python -m aiomoqt.examples.relay_probe",
+        prog="python -m aiomoqt.tools.relay_probe",
         description="MOQ relay probe — liveness and draft-version check.",
         epilog=(
             "Each CLI flag defaults from its matching environment "
@@ -333,7 +333,7 @@ def _parse_args():
         help="verbose handshake logging (DEBUG level on aiomoqt + "
              "relay-probe loggers). Off by default in --url mode so "
              "stdout stays clean for scripting.")
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
 def _classify_error(err: str, transport: str = "") -> str:
@@ -393,8 +393,11 @@ async def _probe_single_url(url, timeout, debug=False):
     return 1
 
 
-if __name__ == "__main__":
-    args = _parse_args()
+def cli():
+    """Console entry point (moq-relay-probe)."""
+    global DRAFT_FILTER, RELAYS_FILE, OUTPUT_FILE
+    global PROBE_TIMEOUT, PROBE_INTERVAL
+    args = parse_args()
     if args.draft is not None:
         try:
             spec = parse_draft_spec(args.draft)
@@ -421,3 +424,7 @@ if __name__ == "__main__":
     PROBE_TIMEOUT = args.timeout
     PROBE_INTERVAL = args.interval
     asyncio.run(run_loop())
+
+
+if __name__ == "__main__":
+    cli()

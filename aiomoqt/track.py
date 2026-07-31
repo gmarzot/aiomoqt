@@ -30,11 +30,11 @@ from enum import IntEnum
 from typing import Optional, Callable
 
 from .types import (
-    MOQTMessageType, ParamType, FilterType, GroupOrder,
-    MOQT_TIMESTAMP_EXT, SessionCloseCode,
+    MOQTMessageType, ParamType, FilterType, ForwardingPreference,
+    GroupOrder, MOQT_TIMESTAMP_EXT, SessionCloseCode,
 )
 from .messages import (
-    PublishOk, RequestUpdate,
+    ObjectDatagram, PublishOk, RequestUpdate,
 )
 from .utils.format import fmt_bps, fmt_rate
 from .utils.logger import get_logger
@@ -102,6 +102,11 @@ class Track:
 # required near-zero yields). Power of two so the gate is a bitwise AND.
 _PACED_YIELD_EVERY = 32
 
+# Reserved wire-header margin when checking object_size against the
+# transport's datagram payload ceiling: type/alias/group/object varints
+# + priority byte + the per-object timestamp extension.
+_DGRAM_HEADER_MARGIN = 48
+
 
 class PublishedTrack(Track):
     """Publisher-side track — announces namespace/track and generates data.
@@ -114,9 +119,12 @@ class PublishedTrack(Track):
                  object_size: int = 1024, group_size: int = 60,
                  num_subgroups: int = 1, rate: float = 0,
                  priority: int = 128,
-                 auth_token: bytes = b"bench-token"):
+                 auth_token: bytes = b"bench-token",
+                 forwarding: ForwardingPreference =
+                     ForwardingPreference.SUBGROUP):
         super().__init__(session, namespace, trackname,
                          object_size, group_size, num_subgroups, rate)
+        self.forwarding = forwarding
         self.priority = priority
         self.auth_token = auth_token
         self._subscriber_event = asyncio.Event()
@@ -180,6 +188,9 @@ class PublishedTrack(Track):
                 "publish(): need at least one of "
                 "announce_namespace or publish_track")
 
+        if self.forwarding == ForwardingPreference.DATAGRAM:
+            self._check_datagram_fit()
+
         if announce_namespace:
             await self.session.publish_namespace(
                 namespace=self.namespace,
@@ -226,6 +237,26 @@ class PublishedTrack(Track):
             if forward:
                 asyncio.create_task(
                     self._start_generating(self.session, "OPTIMISTIC"))
+
+    def _check_datagram_fit(self) -> None:
+        """Refuse datagram delivery that could never reach the wire —
+        DATAGRAM frames cannot be fragmented, so an oversize object is
+        a configuration error, not backpressure."""
+        cap = self.session.datagram_max_payload()
+        if cap == 0:
+            raise ValueError(
+                "datagram delivery unavailable on this session "
+                "(peer did not negotiate QUIC datagrams, or the "
+                "transport is WebTransport — WT datagram TX is not "
+                "wired yet)")
+        if self.object_size + _DGRAM_HEADER_MARGIN > cap:
+            raise ValueError(
+                f"object_size={self.object_size} cannot fit one "
+                f"datagram (payload ceiling {cap}B minus "
+                f"{_DGRAM_HEADER_MARGIN}B header margin = "
+                f"{cap - _DGRAM_HEADER_MARGIN}B max). DATAGRAM frames "
+                f"cannot be fragmented — use subgroup delivery for "
+                f"objects this large")
 
     async def _start_generating(self, session, trigger: str):
         """Start data generation if not already running."""
@@ -341,6 +372,26 @@ class PublishedTrack(Track):
         # from; the counted suffix shows offset-within-object.
         pad = bytes(i & 0xFF for i in range(self.object_size))
 
+        if self.forwarding == ForwardingPreference.DATAGRAM:
+            self._check_datagram_fit()
+            if self.num_subgroups > 1:
+                logger.warning(
+                    "Track: num_subgroups ignored for datagram delivery "
+                    "(no streams to parallelize)")
+            task = asyncio.create_task(
+                self._generate_datagrams(
+                    session=session, track_alias=track_alias, pad=pad))
+            task.add_done_callback(lambda t: self._tasks.discard(t))
+            self._tasks.add(task)
+            await session.async_closed()
+            self._send_publish_done(session)
+            try:
+                session.publish_namespace_done(namespace=self.namespace)
+            except Exception:
+                pass
+            session._close_session()
+            return
+
         for subgroup_id in range(self.num_subgroups):
             priority = self.priority if subgroup_id == 0 else 0
             task = asyncio.create_task(
@@ -365,6 +416,98 @@ class PublishedTrack(Track):
         except Exception:
             pass
         session._close_session()
+
+    async def _generate_datagrams(self, session, track_alias: int,
+                                  pad: bytes,
+                                  report_interval: float = 5.0):
+        """Generate the track as OBJECT_DATAGRAMs — one datagram per
+        object, paced exactly like the subgroup path. Transport
+        backpressure is the bounded per-connection record ring
+        (dgram_write_drain parks when full); loss is expected and
+        unrepaired by design."""
+        start_time = time.monotonic()
+        last_report = start_time
+        next_frame_time = time.monotonic()
+        group_id = -1
+        cur_obj_id = self.group_size  # force group roll on first object
+        prof = session._profile
+        report = not getattr(self, '_quiet', False)
+
+        try:
+            while True:
+                if cur_obj_id >= self.group_size:
+                    group_id += 1
+                    self._total_groups += 1
+                    self._iv_groups += 1
+                    cur_obj_id = 0
+
+                seq_info = f"{group_id}.{cur_obj_id}".encode()
+                payload = (seq_info + b'|' + pad)[:self.object_size]
+                obj = ObjectDatagram(
+                    track_alias=track_alias,
+                    group_id=group_id,
+                    object_id=cur_obj_id,
+                    publisher_priority=self.priority,
+                    extensions={
+                        MOQT_TIMESTAMP_EXT: int(time.time() * 1_000_000)},
+                    payload=payload,
+                    end_of_group=(cur_obj_id == self.group_size - 1),
+                )
+                buf = obj.serialize(prof=prof)
+                obj_bytes = buf.tell()
+                cur_obj_id += 1
+
+                if session._close_err is not None:
+                    raise asyncio.CancelledError
+                await session.dgram_write_drain(buf)
+                self._total_sent += 1
+                self._total_bytes += obj_bytes
+                self._iv_objects += 1
+                self._iv_bytes += obj_bytes
+
+                now = time.monotonic()
+                if report and now - last_report >= report_interval:
+                    dt = now - last_report
+                    elapsed = now - start_time
+                    obj_s = self._iv_objects / dt
+                    bps = (self._iv_bytes * 8) / dt
+                    rate_s = fmt_rate(obj_s)
+                    bps_s = fmt_bps(bps)
+                    iv = f"{elapsed - dt:.0f}-{elapsed:.0f}s"
+                    self._print_stats_header()
+                    print(f"  {iv:<10}{self._total_groups:<8}"
+                          f"{self._total_sent:<10}{rate_s:<10}"
+                          f"{bps_s:<10}")
+                    self._iv_objects = 0
+                    self._iv_bytes = 0
+                    self._iv_groups = 0
+                    last_report = now
+
+                # Same absolute-deadline pacer as the subgroup path;
+                # datagrams have a single sender so rate is undivided.
+                current_rate = self.rate
+                if current_rate > 0:
+                    next_frame_time += 1.0 / current_rate
+                    sleep_time = next_frame_time - time.monotonic()
+                    if sleep_time > 0.0005:
+                        await asyncio.sleep(sleep_time)
+                    else:
+                        self._yield_tick = (self._yield_tick + 1) & 0xFFFF
+                        if self._yield_tick & (_PACED_YIELD_EVERY - 1) == 0:
+                            await asyncio.sleep(0)
+                else:
+                    # Max-rate: dgram_write_drain only suspends when the
+                    # record ring fills, so keep a periodic cooperative
+                    # yield exactly like the paced fall-through.
+                    self._yield_tick = (self._yield_tick + 1) & 0xFFFF
+                    if self._yield_tick & (_PACED_YIELD_EVERY - 1) == 0:
+                        await asyncio.sleep(0)
+
+        except asyncio.CancelledError:
+            dur = time.monotonic() - start_time
+            logger.info(
+                f"Track: datagram generation ended: {self._total_sent} "
+                f"objects, {self._total_bytes} bytes in {dur:.1f}s")
 
     async def _generate_subgroup(self, session, subgroup_id: int,
                                   track_alias: int, priority: int,

@@ -20,6 +20,15 @@ Repository = "https://github.com/gmarzot/aiomoqt.git"
 
 [project.scripts]
 aiomoqt-versions = "aiomoqt.versions:main"
+moq-pub-bench = "aiomoqt.tools.pub_bench:cli"
+moq-sub-bench = "aiomoqt.tools.sub_bench:cli"
+moq-loopback-bench = "aiomoqt.tools.loopback_bench:cli"
+moq-adaptive-bench = "aiomoqt.tools.adaptive_bench:cli"
+moq-pub-server = "aiomoqt.tools.pub_server:cli"
+moq-load-sim = "aiomoqt.tools.load_sim:cli"
+moq-relay-probe = "aiomoqt.tools.relay_probe:cli"
+moq-interop-client = "aiomoqt.tools.moq_interop_client:cli"
+moq-interop-relay = "aiomoqt.tools.moq_interop_relay:cli"
 
 [project.optional-dependencies]
 test = [
@@ -50,6 +59,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["aiomoqt*"]
 exclude = ["aiomoqt.tests*"]
+
+[tool.setuptools.package-data]
+"aiomoqt.tools" = ["scenarios/*.json"]
 
 [tool.setuptools_scm]
 

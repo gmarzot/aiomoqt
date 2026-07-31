@@ -201,3 +201,67 @@ async def test_datagram_delivery_survives(plog):
              if "PROTOCOL_VIOLATION" in r.getMessage()
              or "unknown track" in r.getMessage()]
     assert not fatal, fatal
+
+
+# -- unbound-alias criteria ------------------------------------------
+#
+# Data may legitimately arrive before the control message that binds an
+# alias (§10.4.2). That race is NOT an error, so it must stay at DEBUG.
+# It becomes an error only when it never clears. These pin both edges.
+
+def _session_stub(draft=18):
+    """Bare mixin instance with only the alias state these paths use."""
+    from aiomoqt.protocol import _MOQTSessionMixin
+    s = object.__new__(_MOQTSessionMixin)
+    s._track_aliases = {}
+    s._unbound_aliases = {}
+    s._unbound_escalated = set()
+    return s
+
+
+class _Hdr:
+    def __init__(self, alias, group=0, subgroup=0):
+        self.track_alias, self.group_id, self.subgroup_id = (
+            alias, group, subgroup)
+
+
+def test_brief_unbound_race_stays_quiet(plog):
+    """One or two early streams then a bind = benign; nothing above
+    DEBUG, and the pending record clears."""
+    s = _session_stub()
+    s._subgroup_stream_by_key = {}
+    s._data_streams = {}
+    for i in range(2):
+        s._admit_subgroup_stream(7 + i, _Hdr(alias=5, subgroup=i))
+    assert 5 in s._unbound_aliases
+    assert not [r for r in plog.records if r.levelname == "WARNING"]
+    s._resolve_unbound_alias(5)
+    assert 5 not in s._unbound_aliases
+
+
+def test_never_bound_alias_escalates_once(plog):
+    """Many streams over a long window with no bind = real defect."""
+    import time as _t
+    s = _session_stub()
+    s._subgroup_stream_by_key = {}
+    s._data_streams = {}
+    for i in range(s.UNBOUND_ALIAS_MAX_STREAMS + 2):
+        s._admit_subgroup_stream(7 + i, _Hdr(alias=9, subgroup=i))
+        # age the record past the grace window
+        s._unbound_aliases[9][0] = _t.monotonic() - (
+            s.UNBOUND_ALIAS_GRACE_S + 1)
+    warns = [r for r in plog.records
+             if r.levelname == "WARNING" and "still unbound" in r.message]
+    assert len(warns) == 1, f"expected exactly one escalation, got {len(warns)}"
+    assert "track_alias=9" in warns[0].message
+
+
+def test_streams_alone_do_not_escalate(plog):
+    """Many streams inside the grace window is still just a fast race."""
+    s = _session_stub()
+    s._subgroup_stream_by_key = {}
+    s._data_streams = {}
+    for i in range(s.UNBOUND_ALIAS_MAX_STREAMS + 3):
+        s._admit_subgroup_stream(7 + i, _Hdr(alias=11, subgroup=i))
+    assert not [r for r in plog.records
+                if r.levelname == "WARNING" and "still unbound" in r.message]

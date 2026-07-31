@@ -45,7 +45,7 @@ Split roles across hosts by running the same scenario with --role pub on
 the publisher box and --role sub elsewhere (start within a few seconds
 of each other; the subscribe retry window absorbs the skew).
 
-`python -m aiomoqt.examples.load_sim --example` prints a demo scenario.
+`python -m aiomoqt.tools.load_sim --example` prints a demo scenario.
 """
 from __future__ import annotations
 
@@ -58,6 +58,7 @@ import signal
 import sys
 import time
 from collections import deque
+from pathlib import Path
 from typing import Any, Dict, List
 
 from aiomoqt.client import MOQTClient
@@ -65,13 +66,12 @@ from aiomoqt.track import SubscribedTrack, TrackState
 from aiomoqt.types import FilterType
 from aiomoqt.utils.url import parse_relay_url
 from aiomoqt.utils.format import fmt_bps
+from aiomoqt.utils.stats import TrackStats
 
-from aiomoqt.examples._bench_workers import (
-    _RollingStats,
+from aiomoqt.utils.workers import (
     _bridge_stop_event,
     _post,
     _setup_quiet_logging,
-    _try_install_uvloop,
     pub_worker_entry,
     MP_CTX,
     SUBSCRIBE_RETRY_WINDOW_S,
@@ -81,6 +81,9 @@ from aiomoqt.examples._bench_workers import (
 )
 
 TICK_S = 1.0
+# Grace after the last publisher ends before the controller stops
+# subscriber shards that a relay is still holding open.
+SUBS_DRAIN_GRACE_S = 5.0
 CMD_POLL_S = 0.1
 # Join commands in flight count against the group target until the host
 # reports an outcome; expire unanswered ones so a wedged shard can't
@@ -160,7 +163,7 @@ async def _slot_task(cfg, relay, slot, events_q, group, shard,
     the refill path, so every death is visible as a leave+join on the
     relay, which is the point of a dashboard load test."""
     stop_ev: asyncio.Event = slot["stop"]
-    stats: _RollingStats = slot["stats"]
+    stats: TrackStats = slot["stats"]
     if start_delay > 0:
         try:
             await asyncio.wait_for(stop_ev.wait(), timeout=start_delay)
@@ -209,6 +212,7 @@ async def _slot_task(cfg, relay, slot, events_q, group, shard,
             if not subscribed:
                 _post(events_q, {"kind": "evt", "ev": "join_failed",
                                  "group": group, "shard": shard})
+                outcome = "reported"   # finally must not post again
                 session.close()
                 return
             slot["live"] = True
@@ -230,7 +234,7 @@ async def _slot_task(cfg, relay, slot, events_q, group, shard,
         was_live = slot["live"]
         slot["live"] = False
         slot["done"] = True
-        if was_live or outcome == "died":
+        if outcome != "reported" and (was_live or outcome == "died"):
             _post(events_q, {"kind": "evt", "ev": outcome,
                              "group": group, "shard": shard})
 
@@ -249,7 +253,7 @@ async def _group_host_task(cfg, mp_stop_event, cmd_q, events_q):
         nonlocal next_sid
         sid = next_sid
         next_sid += 1
-        slot = {"stop": asyncio.Event(), "stats": _RollingStats(),
+        slot = {"stop": asyncio.Event(), "stats": TrackStats(),
                 "live": False, "done": False, "task": None}
         slot["task"] = asyncio.create_task(
             _slot_task(cfg, relay, slot, events_q, group, shard, delay))
@@ -334,8 +338,6 @@ def group_host_entry(cfg, mp_stop_event, cmd_q, events_q):
     _setup_quiet_logging(cfg.get("logdir"),
                          f"grp-{cfg['group']}-{cfg['shard']}",
                          cfg.get("debug", False))
-    if not cfg.get("no_uvloop", False):
-        _try_install_uvloop()
     try:
         asyncio.run(_group_host_task(cfg, mp_stop_event, cmd_q, events_q))
     except KeyboardInterrupt:
@@ -366,6 +368,16 @@ class PubSpec:
         gop_s = float(cfg.get("gop_s", 2.0))
         self.group_size = max(1, int(self.fps * gop_s))
         self.streams = int(cfg.get("streams", 1))
+        self.delivery = cfg.get("delivery", "subgroup")
+        if self.delivery not in ("subgroup", "datagram"):
+            raise ValueError(f"{self.key}: delivery must be 'subgroup' "
+                             f"or 'datagram', got {self.delivery!r}")
+        if self.delivery == "datagram" and self.object_size > 1150:
+            raise ValueError(
+                f"{self.key}: object_size={self.object_size} too large "
+                f"for datagram delivery (~1150B max — DATAGRAM frames "
+                f"cannot fragment); lower the bitrate/fps or use "
+                f"subgroup delivery")
         self.start_delay = float(cfg.get("start_delay", 0)) * dscale
         self.duration = float(cfg.get("duration", 300)) * dscale
 
@@ -374,16 +386,31 @@ class PubSpec:
 
 
 class GroupSpec:
-    def __init__(self, gid: int, cfg: dict, pub: PubSpec):
+    def __init__(self, gid: int, cfg: dict, pub: PubSpec, dscale: float = 1.0):
         self.gid = gid
         self.pub = pub
         self.key = pub.key
         self.max_subs = int(cfg["subs"])
         self.join_rate = max(1, int(cfg.get("join_rate", 10)))
-        self.join_delay = float(cfg.get("join_delay", 0))
         self.churn_rate = float(cfg.get("churn_rate", 0.02))
-        self.leave_early = float(cfg.get("leave_early", 0))
         self.leave_rate = int(cfg.get("leave_rate", 0))
+        # Subscriber timings scale with --duration-scale exactly like the
+        # publisher timeline they are relative to. Scaling one and not
+        # the other silently reshapes the scenario.
+        self.join_delay = float(cfg.get("join_delay", 0)) * dscale
+        self.leave_early = float(cfg.get("leave_early", 0)) * dscale
+        # An exodus window at least as long as the track means the group
+        # is in exodus from t=0 — joins are suppressed for the whole run
+        # and the group never populates. Clamp and say so rather than
+        # silently producing an empty group.
+        if self.leave_early >= pub.duration and pub.duration > 0:
+            clamped = pub.duration / 2
+            print(f"  warning: {self.key} group {gid}: leave_early="
+                  f"{self.leave_early:.0f}s >= track duration "
+                  f"{pub.duration:.0f}s — the group would be in exodus "
+                  f"for the entire run and never populate; clamping to "
+                  f"{clamped:.0f}s")
+            self.leave_early = clamped
 
 
 class PubRT:
@@ -454,9 +481,26 @@ class GroupRT:
 # Controller
 # ---------------------------------------------------------------------------
 
-def _load_scenario(path: str) -> dict:
+def _resolve_scenario(name: str):
+    """Packaged name or filesystem path. A bare name resolves against
+    the scenarios shipped inside the package, so an installed user gets
+    working defaults without a checkout."""
+    cand = Path(name)
+    if cand.suffix == ".json" or cand.exists() or "/" in name:
+        return cand
+    pkg = Path(__file__).parent / "scenarios" / f"{name}.json"
+    if pkg.exists():
+        return pkg
+    avail = sorted(q.stem for q in (Path(__file__).parent / "scenarios")
+                   .glob("*.json"))
+    raise SystemExit(f"unknown scenario {name!r}; packaged: "
+                     f"{', '.join(avail)} (or pass a .json path)")
+
+
+def _load_scenario(name: str) -> tuple:
+    path = _resolve_scenario(name)
     with open(path) as f:
-        return json.load(f)
+        return json.load(f), path
 
 
 def _tick_group(g: GroupRT, t: float, rng: random.Random):
@@ -542,25 +586,51 @@ def _predict_egress(pubs: List[PubSpec], groups: List[GroupSpec]):
     return total, per_track
 
 
-def main():
+def parse_args(argv=None):
     p = argparse.ArgumentParser(
-        prog="python -m aiomoqt.examples.load_sim",
+        add_help=False,
+        prog="python -m aiomoqt.tools.load_sim",
         description="aiomoqt load_sim — MoQT load simulator "
                     "(namespaces x tracks x churning audience)")
-    p.add_argument("scenario", nargs="?", help="Scenario JSON path")
+    p.add_argument("url", metavar="URL", nargs="?", default=None,
+                   help="Relay URL — overrides the scenario's 'relay'. "
+                        "moqt://host[:port] = raw QUIC; "
+                        "https://host[:port][/path] = WebTransport.")
+    p.add_argument("-f", "--scenario-file", dest="scenario",
+                   default="default", metavar="NAME|PATH",
+                   help="Scenario: a packaged name (default, rich-matrix, "
+                        "churn-storm, datagram-mix) or a path to JSON "
+                        "(default: default)")
     p.add_argument("--example", action="store_true",
                    help="Print a demo scenario JSON and exit")
-    p.add_argument("-r", "--relay-url", default=None,
-                   help="Relay URL (overrides scenario 'relay')")
+
     p.add_argument("--role", choices=("both", "pub", "sub"), default="both",
                    help="Run publishers, subscribers, or both (default)")
-    p.add_argument("-q", "--quic", action="store_true",
-                   help="Raw QUIC even for https:// URLs")
+    quick = p.add_argument_group(
+        "quick mode",
+        "Synthesize a one-track scenario instead of loading a file — "
+        "the simple 'N subscribers on one track' case.")
+    quick.add_argument("-N", "--namespace", type=str, default="aiomoqt",
+                       help="quick mode: namespace (default: aiomoqt)")
+    quick.add_argument("-T", "--trackname", type=str, default="track",
+                       help="quick mode: track name (default: track)")
+    quick.add_argument("-t", "--duration", type=int, default=30,
+                       help="quick mode: seconds (default: 30)")
+    quick.add_argument("--subs", type=int, default=None,
+                       help="Subscriber count (enables quick mode)")
+    quick.add_argument("-s", "--object-size", type=int, default=1024,
+                       help="quick mode: object bytes (default: 1024)")
+    quick.add_argument("-r", "--rate", type=float, default=30,
+                       help="quick mode: objects/sec (default: 30)")
+    quick.add_argument("-g", "--group-size", type=int, default=None,
+                       help="quick mode: objects per group (default: rate)")
+    quick.add_argument("--pub-both", action="store_true",
+                       help="quick mode: PUB_NS + PUBLISH")
     p.add_argument("-k", "--insecure", action="store_true",
                    help="Skip TLS verification")
     p.add_argument("--draft", type=int, default=None,
                    help="MoQT draft version: 14, 16, or 18")
-    p.add_argument("-D", "--duration-scale", type=float, default=1.0,
+    p.add_argument("--duration-scale", type=float, default=1.0,
                    help="Multiply publisher start/duration timelines")
     p.add_argument("--subs-per-proc", type=int, default=100,
                    help="Max subscriber slots per host process "
@@ -580,20 +650,43 @@ def main():
     p.add_argument("--logdir", default=None,
                    help="Per-process debug log directory")
     p.add_argument("-d", "--debug", action="store_true")
-    p.add_argument("--uvloop", dest="use_uvloop", action="store_true",
-                   help="Install uvloop in workers")
-    args = p.parse_args()
+    p.add_argument("-?", "--help", action="help",
+                   help="Show this help message and exit")
+    args = p.parse_args(argv)
+    return p, args
+
+
+def main():
+    p, args = parse_args()
 
     if args.example:
         print(json.dumps(EXAMPLE_SCENARIO, indent=2))
         return 0
-    if not args.scenario:
-        p.error("scenario path required (or --example)")
 
-    scenario = _load_scenario(args.scenario)
-    relay_url = args.relay_url or scenario.get("relay")
+    if args.subs is not None:
+        fps = args.rate or 30
+        scenario = {
+            "publishers": [{
+                "namespace": args.namespace, "track": args.trackname,
+                "bitrate_kbps": int(args.object_size * fps * 8 / 1000),
+                "fps": fps, "object_size": args.object_size,
+                "gop_s": (args.group_size / fps) if args.group_size else 1.0,
+                "start_delay": 0, "duration": args.duration,
+            }],
+            "subscribers": [{
+                "namespace": args.namespace, "track": args.trackname,
+                "subs": args.subs, "join_rate": max(1, args.subs // 3),
+                "join_delay": 0, "churn_rate": 0.0,
+                "leave_early": 0, "leave_rate": 0,
+            }],
+        }
+        scenario_path = f"(quick: {args.subs} subs x 1 track)"
+    else:
+        scenario, scenario_path = _load_scenario(args.scenario)
+    relay_url = args.url or scenario.get("relay")
     if not relay_url:
-        p.error("no relay URL: pass -r or set 'relay' in the scenario")
+        p.error("no relay URL: pass one as the positional "
+                "argument or set 'relay' in the scenario")
 
     rng = random.Random(args.seed)
     pub_specs = [PubSpec(c, args.duration_scale)
@@ -604,7 +697,8 @@ def main():
         key = f"{c['namespace']}/{c['track']}"
         if key not in by_key:
             p.error(f"subscriber group {i} references unknown track {key}")
-        group_specs.append(GroupSpec(i, c, by_key[key]))
+        group_specs.append(
+            GroupSpec(i, c, by_key[key], args.duration_scale))
 
     total_bps, per_track_subs = _predict_egress(pub_specs, group_specs)
     horizon = max((ps.start_delay + ps.duration for ps in pub_specs),
@@ -615,6 +709,7 @@ def main():
     print("  aiomoqt load_sim")
     print("─" * 72)
     print(f"  relay:       {relay_url}   role={args.role}")
+    print(f"  scenario:    {scenario_path}")
     print(f"  tracks:      {len(pub_specs)} across "
           f"{len({ps.namespace for ps in pub_specs})} namespaces")
     print(f"  subscribers: {peak_subs} peak target across "
@@ -627,13 +722,13 @@ def main():
         subs = per_track_subs.get(ps.key, 0)
         print(f"    {ps.key:<28} {fmt_bps(ps.bps):>10} x {subs:>4} subs"
               f"  T+{ps.start_delay:.0f}s..{ps.start_delay + ps.duration:.0f}s"
-              f"  obj={ps.object_size}B @ {ps.fps:g}/s")
+              f"  obj={ps.object_size}B @ {ps.fps:g}/s"
+              + ("  [datagram]" if ps.delivery == "datagram" else ""))
     print("─" * 72)
 
     common = dict(
-        relay_url=relay_url, force_quic=args.quic, insecure=args.insecure,
+        relay_url=relay_url, force_quic=False, insecure=args.insecure,
         draft=args.draft, debug=args.debug, logdir=args.logdir,
-        no_uvloop=not args.use_uvloop,
     )
 
     pubs = {ps.key: PubRT(ps) for ps in pub_specs} \
@@ -697,6 +792,7 @@ def main():
                                object_size=ps.object_size,
                                group_size=ps.group_size,
                                num_subgroups=ps.streams,
+                               delivery=ps.delivery,
                                initial_rate_ops=_pub_rate_ops(ps),
                                pub_ns=args.pub_ns,
                                pub_both=not args.pub_ns)
@@ -777,11 +873,21 @@ def main():
             # --- end conditions ---
             pubs_done = all(prt.ended for prt in pubs.values()) if pubs \
                 else t >= horizon
-            subs_done = (not groups
-                         or (pubs_done
-                             and sum(g.live() for g in groups.values()) == 0
-                             and t >= horizon + 5))
-            if stopping or (pubs_done and subs_done):
+            # Subscribers do NOT self-terminate when a publisher stops:
+            # a relay keeps the subscription open and simply delivers
+            # nothing, so waiting for live==0 hangs forever against a
+            # real relay (loopback hid this — there the session closed).
+            # The controller owns lifecycle: once every publisher is
+            # done and the drain grace has passed, tear the shards down.
+            live = sum(g.live() for g in groups.values()) if groups else 0
+            drained = live == 0
+            past_grace = t >= horizon + SUBS_DRAIN_GRACE_S
+            if stopping or (pubs_done and (drained or past_grace)):
+                if pubs_done and not drained and past_grace:
+                    print(f"  {live} subscriber(s) still attached "
+                          f"{SUBS_DRAIN_GRACE_S:.0f}s after the last "
+                          f"publisher ended — relay holds subscriptions "
+                          f"open; stopping them.")
                 break
             time.sleep(max(0.0, TICK_S - (time.monotonic() - now)))
     finally:
@@ -834,6 +940,11 @@ def main():
                 failed = True
     print(f"  {'RESULT: FAIL' if failed else 'RESULT: OK'}")
     return 1 if failed else 0
+
+
+def cli():
+    """Console entry point (moq-load-sim)."""
+    sys.exit(main())
 
 
 if __name__ == "__main__":
