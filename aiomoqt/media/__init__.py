@@ -4,9 +4,17 @@ from .catalog import (
     MSF_VERSIONS, CATALOG_TRACK_NAME,
     PACKAGING_LOC, PACKAGING_CMAF,
 )
+from .loc import (
+    LocFrame, LocTrackPublisher, LocTrackSubscriber, StreamMapping,
+    LOC_PROP_TIMESTAMP, LOC_PROP_TIMESCALE,
+    LOC_PROP_VIDEO_CONFIG, LOC_PROP_FRAME_MARKING,
+)
 
 __all__ = [
     "Catalog", "CatalogTrack", "DeltaOp", "InitData", "CatalogError",
     "MSF_VERSIONS", "CATALOG_TRACK_NAME",
     "PACKAGING_LOC", "PACKAGING_CMAF",
+    "LocFrame", "LocTrackPublisher", "LocTrackSubscriber", "StreamMapping",
+    "LOC_PROP_TIMESTAMP", "LOC_PROP_TIMESCALE",
+    "LOC_PROP_VIDEO_CONFIG", "LOC_PROP_FRAME_MARKING",
 ]
