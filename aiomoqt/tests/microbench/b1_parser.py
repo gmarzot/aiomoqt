@@ -129,12 +129,6 @@ def run_compare(n_objects, payload_size, chunk_size, duration, warmup,
               f"{r['mbps']:>12,.0f}{rel:>11.2f}x")
 
     print()
-    print(f"SUMMARY  (parse ns/obj relative to d{ref})")
-    rels = {d: (res[d]["ns_per_obj"] / base if base else 0.0)
-            for d in drafts if d != ref}
-    if rels:
-        print("  RX parse   " + "   ".join(
-            f"d{d}/d{ref} {v:5.2f}x" for d, v in rels.items()))
     return 0
 
 

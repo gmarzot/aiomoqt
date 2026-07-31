@@ -370,16 +370,7 @@ def run_compare(sz: int, ext: bool, duration: float, warmup: float,
               + "".join(f"{(table[label][d] / base if base else 0):>9.2f}x"
                         for d in others))
 
-    # SUMMARY — mean of per-row ratios vs the reference draft.
     print()
-    print(f"SUMMARY  (relative to d{ref}, mean of per-row ratios)")
-    means = {}
-    for d in others:
-        rs = [table[lbl][d] / table[lbl][ref]
-              for lbl, *_ in rows if table[lbl][ref]]
-        means[d] = sum(rs) / len(rs) if rs else 0.0
-    print("  TX framing   " + "   ".join(
-        f"d{d}/d{ref} {v:5.2f}x" for d, v in means.items()))
     return 0
 
 
