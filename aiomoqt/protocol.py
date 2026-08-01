@@ -2866,10 +2866,13 @@ class _MOQTSessionMixin:
         if future and not future.done():
             future.set_result(msg)
         # Per spec, every SubscribeDone is terminal for that subscribe.
-        # Sessions with a single active subscribe (bench tools) treat
-        # it as a clean end-of-session signal.
-        self._close_session(SessionCloseCode.NO_ERROR,
-                            f"subscribe done: {msg.status_code}")
+        # The session closes only when it was the LAST active subscribe
+        # (single-track bench tools keep their clean-exit signal; a
+        # multi-track media session outlives per-track completion).
+        self._subscriptions.pop(msg.request_id, None)
+        if not self._subscriptions:
+            self._close_session(SessionCloseCode.NO_ERROR,
+                                f"subscribe done: {msg.status_code}")
 
     async def _handle_max_request_id(self, msg: MaxSubscribeId) -> None:
         logger.info(f"MOQT event: handle {msg}")
