@@ -104,22 +104,26 @@ async def _pace(start: float, ts_us: int, pace: bool):
             await asyncio.sleep(delay)
 
 
-async def _feed_tone(track, args):
+async def _feed_tone(track, args, epoch_us: int):
     start = time.monotonic()
     for payload, ts in pcm_tone_frames(
             duration_s=args.duration, freq=args.freq,
             samplerate=_SAMPLERATE, channels=_CHANNELS,
             frame_ms=_FRAME_MS):
         await _pace(start, ts, not args.no_pace)
-        await track.send_frame(payload, key_frame=True, timestamp=ts)
+        # LOC timestamps without a TIMESCALE property are µs since the
+        # Unix epoch — players schedule against the wall clock.
+        await track.send_frame(payload, key_frame=True,
+                               timestamp=epoch_us + ts)
     await track.finish()
 
 
-async def _feed_mp4_track(track, source, args, *, all_key=False,
-                          gap_us=33_333):
-    """Feed an mp4 track's samples, paced to their timestamps; --loop
-    restarts the file as later timestamps (audio: every AU is a sync
-    frame, giving LOC's one-object-per-group audio mapping)."""
+async def _feed_mp4_track(track, source, args, epoch_us: int, *,
+                          all_key=False, gap_us=33_333):
+    """Feed an mp4 track's samples, paced to their media timestamps and
+    stamped as wall-clock µs (LOC default clock); --loop restarts the
+    file at later timestamps (audio: every AU is a sync frame, giving
+    LOC's one-object-per-group audio mapping)."""
     start = time.monotonic()
     base_us = 0
     while True:
@@ -131,7 +135,7 @@ async def _feed_mp4_track(track, source, args, *, all_key=False,
             await _pace(start, ts, not args.no_pace)
             await track.send_frame(s.payload,
                                    key_frame=all_key or s.key_frame,
-                                   timestamp=ts)
+                                   timestamp=epoch_us + ts)
             last = ts
         base_us = last + gap_us
         if not args.loop or base_us > args.duration * 1_000_000:
@@ -161,6 +165,7 @@ async def run(args):
     async with client.connect() as session:
         await session.client_session_init()
         pub = MediaPublisher(session, args.namespace, catalog)
+        epoch_us = int(time.time() * 1_000_000)
         feeders = []
         if not args.no_audio:
             audio_track = pub.add_track(LocTrackPublisher(
@@ -170,16 +175,17 @@ async def run(args):
                 loc01_compat=args.loc01_compat))
             if mp4_audio is not None:
                 feeders.append(_feed_mp4_track(
-                    audio_track, mp4_audio, args, all_key=True,
+                    audio_track, mp4_audio, args, epoch_us, all_key=True,
                     gap_us=1_000_000 * 1024 // mp4_audio.samplerate))
             else:
-                feeders.append(_feed_tone(audio_track, args))
+                feeders.append(_feed_tone(audio_track, args, epoch_us))
         if video is not None:
             feeders.append(_feed_mp4_track(
                 pub.add_track(LocTrackPublisher(
                     session, args.namespace, 'video', config=video.avcc,
                     loc01_compat=args.loc01_compat)),
-                video, args, gap_us=int(1e6 / (video.fps or 30))))
+                video, args, epoch_us,
+                gap_us=int(1e6 / (video.fps or 30))))
         await pub.start()
         print("  publishing...")
         await asyncio.gather(*feeders)
