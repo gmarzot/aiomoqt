@@ -28,6 +28,7 @@ import wave
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.media import MediaSubscriber
+from aiomoqt.types import MOQTRequestError
 from aiomoqt.media.sources import avcc_param_sets, lp_to_annexb
 from aiomoqt.utils import cli as _cli
 from aiomoqt.utils.logger import set_log_level
@@ -47,6 +48,9 @@ def parse_args():
                              'into a player (video: Annex-B h264; audio: '
                              's16le pcm). Status moves to stderr; the '
                              'other track still writes to --out.')
+    parser.add_argument('--show-catalog', action='store_true',
+                        help='Print the full catalog JSON (and every '
+                             'applied update) to stderr')
     _cli.add_run(parser, duration=30, interval=False)
     _cli.add_session(parser, keepalive=True)
     _cli.add_help(parser)
@@ -129,10 +133,22 @@ async def run(args):
     _status(f"  relay: {relay}  namespace: {args.namespace}")
     async with client.connect() as session:
         await session.client_session_init()
-        sub = MediaSubscriber(session, args.namespace)
+        sub = MediaSubscriber(
+            session, args.namespace,
+            on_catalog=((lambda c: _status(c.to_json(indent=2)))
+                        if args.show_catalog else None))
         writers = _Writers(args.out, sub, pipe_role=args.pipe)
         sub.on_frame = writers.on_frame
-        catalog = await sub.start(timeout=args.duration)
+        try:
+            catalog = await sub.start(timeout=args.duration)
+        except MOQTRequestError as e:
+            _status(f"  error: {e} — no publisher on "
+                    f"'{args.namespace}'?")
+            sys.exit(2)
+        except asyncio.TimeoutError:
+            _status(f"  error: no catalog received on "
+                    f"'{args.namespace}' within {args.duration}s")
+            sys.exit(2)
         _status(f"  catalog: {[t.name for t in catalog.tracks]}")
         if args.pipe == 'audio':
             a = catalog.find('audio')
