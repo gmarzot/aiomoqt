@@ -197,6 +197,10 @@ class Catalog:
                  "publishTracks", "deltaUpdate", "initDataList"}
         is_delta = bool(d.get("deltaUpdate"))
         version = d.get("version")
+        # MSF-00-era catalogs carry numeric versions; same value, same
+        # meaning — normalize before the gate.
+        if isinstance(version, int):
+            version = str(version)
         if not is_delta and version not in MSF_VERSIONS and not lenient:
             raise CatalogError(f"unsupported MSF catalog version: {version!r}")
         return cls(

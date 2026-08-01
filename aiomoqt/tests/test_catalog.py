@@ -77,6 +77,7 @@ def test_unknown_fields_tolerated_and_preserved():
 
 
 def test_version_gate():
+    assert Catalog.from_dict(dict(_AV_CATALOG, version=1)).version == "1"
     with pytest.raises(CatalogError, match="version"):
         Catalog.from_dict(dict(_AV_CATALOG, version="99"))
     assert Catalog.from_dict(dict(_AV_CATALOG, version="99"),
