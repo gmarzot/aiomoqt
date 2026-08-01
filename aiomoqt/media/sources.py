@@ -136,6 +136,14 @@ class _TrackReader:
     def _parse_entry(self, ebody, eend):
         raise NotImplementedError
 
+    @property
+    def avg_bitrate(self) -> Optional[int]:
+        """Mean track bitrate in bps from the sample tables."""
+        dur = sum(c * delta for c, delta in self._stts)
+        if not dur:
+            return None
+        return int(sum(self._sizes) * 8 * self.timescale / dur)
+
     def _offsets(self) -> List[int]:
         """Absolute file offset per sample via stsc/stco."""
         runs = self._stsc

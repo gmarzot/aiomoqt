@@ -78,7 +78,7 @@ def _build_catalog(args, video, audio) -> Catalog:
             renderGroup=1, codec=audio.codec_string,
             samplerate=audio.samplerate,
             channelConfig=str(audio.channels),
-            bitrate=128_000, initRef='a0'))
+            bitrate=audio.avg_bitrate or 128_000, initRef='a0'))
         init.append(InitData.from_bytes('a0', audio.asc))
     elif not args.no_audio:
         tracks.append(CatalogTrack(
@@ -91,7 +91,8 @@ def _build_catalog(args, video, audio) -> Catalog:
             name='video', packaging='loc', isLive=True, role='video',
             renderGroup=1, codec=avcc_codec_string(video.avcc),
             width=video.width, height=video.height,
-            framerate=video.fps, bitrate=2_000_000, initRef='v0'))
+            framerate=video.fps,
+            bitrate=video.avg_bitrate or 2_000_000, initRef='v0'))
         init.append(InitData.from_bytes('v0', video.avcc))
     return Catalog(generatedAt=int(time.time() * 1000), tracks=tracks,
                    initDataList=init or None)
