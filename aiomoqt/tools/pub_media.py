@@ -53,6 +53,12 @@ def parse_args():
     parser.add_argument('-D', '--datagram', action='store_true',
                         help='Send the AUDIO track as ObjectDatagrams '
                              '(raw QUIC only)')
+    parser.add_argument('--no-audio', action='store_true',
+                        help='Video only — omit the audio track')
+    parser.add_argument('--loc01-compat', action='store_true',
+                        help='Also emit timestamps under loc-01\'s '
+                             'property id 0x02 for players not yet on '
+                             'loc-02 numbering (moq-playa)')
     _cli.add_run(parser, duration=30, interval=False)
     _cli.add_session(parser, keepalive=True)
     _cli.add_help(parser)
@@ -60,11 +66,13 @@ def parse_args():
 
 
 def _build_catalog(args, video: 'Mp4AvcReader | None') -> Catalog:
-    tracks = [CatalogTrack(
-        name='audio', packaging='loc', isLive=True, role='audio',
-        renderGroup=1, codec='pcm-s16', samplerate=_SAMPLERATE,
-        channelConfig=str(_CHANNELS),
-        bitrate=_SAMPLERATE * _CHANNELS * 16)]
+    tracks = []
+    if not getattr(args, 'no_audio', False):
+        tracks.append(CatalogTrack(
+            name='audio', packaging='loc', isLive=True, role='audio',
+            renderGroup=1, codec='pcm-s16', samplerate=_SAMPLERATE,
+            channelConfig=str(_CHANNELS),
+            bitrate=_SAMPLERATE * _CHANNELS * 16))
     init = None
     if video is not None:
         tracks.insert(0, CatalogTrack(
@@ -133,15 +141,17 @@ async def run(args):
     async with client.connect() as session:
         await session.client_session_init()
         pub = MediaPublisher(session, args.namespace, catalog)
-        feeders = [
-            _feed_audio(pub.add_track(LocTrackPublisher(
+        feeders = []
+        if not args.no_audio:
+            feeders.append(_feed_audio(pub.add_track(LocTrackPublisher(
                 session, args.namespace, 'audio',
                 mapping=(StreamMapping.DATAGRAM if args.datagram
-                         else StreamMapping.PER_GROUP))), args)]
+                         else StreamMapping.PER_GROUP),
+                loc01_compat=args.loc01_compat)), args))
         if reader is not None:
             feeders.append(_feed_video(pub.add_track(LocTrackPublisher(
-                session, args.namespace, 'video', config=reader.avcc)),
-                reader, args))
+                session, args.namespace, 'video', config=reader.avcc,
+                loc01_compat=args.loc01_compat)), reader, args))
         await pub.start()
         print("  publishing...")
         await asyncio.gather(*feeders)

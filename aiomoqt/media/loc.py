@@ -35,6 +35,10 @@ LOC_PROP_TIMESCALE = 0x08   # vi64; timestamp units per second
 LOC_PROP_VIDEO_CONFIG = 13  # odd → bytes: codec extradata (avcC/hvcC…)
 LOC_PROP_FRAME_MARKING = 4  # vi64: RFC 9626 flags
 
+# loc-01's Capture Timestamp ID — players still on loc-01 numbering
+# (moq-playa) read timestamps here instead of 0x06.
+LOC01_PROP_CAPTURE_TS = 0x02
+
 # MoQ Streaming Format registry (loc-02 §6.2).
 LOC_STREAMING_FORMAT_TYPE = 0x002
 
@@ -72,12 +76,17 @@ class LocTrackPublisher(PublishedTrack):
                  priority: int = 128,
                  timescale: Optional[int] = None,
                  auth_token: bytes = b"bench-token",
-                 queue_size: int = 256):
+                 queue_size: int = 256,
+                 loc01_compat: bool = False):
         super().__init__(session, namespace, trackname,
                          priority=priority, auth_token=auth_token)
         self.config = config
         self.mapping = mapping
         self.timescale = timescale
+        # Dual-emit the timestamp under loc-01's 0x02 as well; unknown
+        # properties are ignored by conformant receivers, so this only
+        # costs a few bytes per object.
+        self.loc01_compat = loc01_compat
         self._frames: asyncio.Queue = asyncio.Queue(maxsize=queue_size)
 
     async def send_frame(self, payload: bytes, *, key_frame: bool = False,
@@ -97,6 +106,8 @@ class LocTrackPublisher(PublishedTrack):
         exts[LOC_PROP_TIMESTAMP] = (
             frame.timestamp if frame.timestamp is not None
             else int(time.time() * 1_000_000))
+        if self.loc01_compat:
+            exts[LOC01_PROP_CAPTURE_TS] = exts[LOC_PROP_TIMESTAMP]
         if group_start:
             if self.timescale is not None:
                 exts[LOC_PROP_TIMESCALE] = self.timescale
