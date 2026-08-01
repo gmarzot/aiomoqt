@@ -206,15 +206,36 @@ class MediaSubscriber:
         self._catalog_sub: Optional[SubscribedTrack] = None
 
     async def start(self, timeout: float = 10.0) -> Catalog:
-        """Subscribe the catalog track, await the first complete
-        catalog, subscribe its media tracks. Returns the catalog."""
-        self._catalog_sub = SubscribedTrack(
-            self.session, self.namespace, CATALOG_TRACK_NAME,
-            on_object=self._on_catalog_object)
-        await self._catalog_sub.subscribe()
+        """Join the catalog track (SUBSCRIBE + joining FETCH, msf-01 §5
+        — a late joiner needs the relay-cached complete catalog), await
+        the first one, subscribe its media tracks. Falls back to plain
+        SUBSCRIBE when the peer can't serve the fetch."""
+        self.session.on_fetch_object = self._on_catalog_fetch_object
+        # Global fallback catches catalog objects that arrive before the
+        # per-alias registration (§10.4.2 data-before-OK race).
+        self.session.on_object_received = self._on_catalog_object
+        try:
+            sub_ok, _fetch_ok = await self.session.join(
+                self.namespace, CATALOG_TRACK_NAME, joining_start=0,
+                wait_response=True)
+            alias = getattr(sub_ok, 'track_alias', None)
+            if alias is not None:
+                self.session.register_object_handler(
+                    alias, self._on_catalog_object)
+        except Exception as e:
+            logger.info(f"MediaSubscriber: catalog join failed ({e}); "
+                        f"falling back to plain subscribe")
+            self._catalog_sub = SubscribedTrack(
+                self.session, self.namespace, CATALOG_TRACK_NAME,
+                on_object=self._on_catalog_object)
+            await self._catalog_sub.subscribe()
         await asyncio.wait_for(self._have_catalog.wait(), timeout)
         await self._subscribe_media()
         return self.catalog
+
+    def _on_catalog_fetch_object(self, msg, size, ts,
+                                 request_id) -> None:
+        self._on_catalog_object(msg, size, ts, None, None)
 
     def _on_catalog_object(self, msg, size, ts, group_id,
                            subgroup_id) -> None:
