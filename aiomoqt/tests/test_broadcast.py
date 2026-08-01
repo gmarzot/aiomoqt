@@ -124,6 +124,49 @@ async def test_broadcast_round_trip():
 
 
 @pytest.mark.asyncio
+async def test_demux_routes_d16_update_and_serves_catalog_fetch():
+    # REQUEST_UPDATE references the original request via
+    # existing_request_id; a joining FETCH of the catalog is served
+    # with the current complete catalog on a fetch stream.
+    from types import SimpleNamespace
+    from aiomoqt.messages import RequestUpdate
+    from aiomoqt.context import profile_for
+
+    writes = []
+
+    async def _open_uni():
+        return 42
+
+    session = SimpleNamespace(
+        fetch_ok=lambda request_id: writes.append(('ok', request_id)),
+        open_uni_stream=_open_uni,
+        stream_write=lambda sid, data, end_stream=False:
+            writes.append(('w', sid, bytes(data), end_stream)),
+        _profile=profile_for(18),
+    )
+    pub = MediaPublisher(session, _NS, _catalog())
+    pub.catalog_track.request_id = 7
+    routed = []
+
+    async def _on_update(s, m):
+        routed.append(m.existing_request_id)
+    pub.catalog_track._on_request_update = _on_update
+
+    await pub._demux_update(session, RequestUpdate(
+        request_id=99, existing_request_id=7,
+        parameters={}))
+    assert routed == [7]
+
+    fetch = SimpleNamespace(track_name=None, joining_request_id=7,
+                            request_id=3)
+    await pub._demux_fetch(session, fetch)
+    assert writes[0] == ('ok', 3)
+    assert writes[1][1] == 42                      # FetchHeader
+    payload = writes[2][2]
+    assert b'"tracks"' in payload and writes[2][3]  # catalog + FIN
+
+
+@pytest.mark.asyncio
 async def test_broadcast_delta_update():
     port = _BASE_PORT + 2
     delta = Catalog.delta([DeltaOp("clone", [CatalogTrack(

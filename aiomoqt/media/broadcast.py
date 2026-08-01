@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 from typing import Callable, Dict, Optional
 
-from ..messages import SubgroupHeader
+from ..messages import FetchHeader, FetchObject, SubgroupHeader
 from ..track import PublishedTrack, SubscribedTrack
 from ..types import MOQTMessageType
 from ..utils.logger import get_logger
@@ -118,6 +118,8 @@ class MediaPublisher:
             MOQTMessageType.PUBLISH_OK, self._demux_publish_ok)
         self.session.register_handler(
             MOQTMessageType.SUBSCRIBE_UPDATE, self._demux_update)
+        self.session.register_handler(
+            MOQTMessageType.FETCH, self._demux_fetch)
 
     def _track_for_request(self, request_id) -> Optional[PublishedTrack]:
         for track in self._by_name.values():
@@ -140,13 +142,40 @@ class MediaPublisher:
         if track is not None:
             await track._on_publish_ok(session, msg)
 
+    async def _demux_fetch(self, session, msg) -> None:
+        """Serve a joining/absolute FETCH of the catalog track with the
+        current complete catalog (a joining subscriber's first need,
+        msf-01 §5); other fetches keep the default bare FETCH_OK."""
+        track = None
+        name = msg.track_name
+        if name is not None:
+            name = name.decode() if isinstance(name, bytes) else name
+            track = self._by_name.get(name)
+        if track is None and msg.joining_request_id is not None:
+            track = self._track_for_request(msg.joining_request_id)
+        session.fetch_ok(request_id=msg.request_id)
+        if track is not self.catalog_track:
+            return
+        sid = await session.open_uni_stream()
+        session.stream_write(
+            sid, FetchHeader(request_id=msg.request_id).serialize().data)
+        obj = FetchObject(
+            payload=self.catalog_track.catalog.to_json().encode())
+        session.stream_write(sid, obj.serialize(prof=session._profile).data,
+                             end_stream=True)
+
     async def _demux_update(self, session, msg) -> None:
-        track = self._track_for_request(msg.request_id)
+        from ..messages import RequestUpdate
+        # d16 REQUEST_UPDATE references the original request via
+        # existing_request_id (its request_id is the update's own);
+        # d14 SUBSCRIBE_UPDATE keys on request_id directly.
+        rid = (msg.existing_request_id if isinstance(msg, RequestUpdate)
+               else msg.request_id)
+        track = self._track_for_request(rid)
         if track is None:
             logger.warning(f"MediaPublisher: update for unknown "
-                           f"request_id={msg.request_id}")
+                           f"request_id={rid}")
             return
-        from ..messages import RequestUpdate
         if isinstance(msg, RequestUpdate):
             await track._on_request_update(session, msg)
         else:
