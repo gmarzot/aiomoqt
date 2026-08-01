@@ -23,7 +23,7 @@ from aiomoqt.media import (
     StreamMapping,
 )
 from aiomoqt.media.sources import (
-    Mp4AvcReader, avcc_codec_string, pcm_tone_frames,
+    Mp4Reader, avcc_codec_string, pcm_tone_frames,
 )
 from aiomoqt.utils import cli as _cli
 from aiomoqt.utils.logger import set_log_level
@@ -55,6 +55,10 @@ def parse_args():
                              '(raw QUIC only)')
     parser.add_argument('--no-audio', action='store_true',
                         help='Video only — omit the audio track')
+    parser.add_argument('--tone', action='store_true',
+                        help='Synthesized pcm-s16 tone audio even when '
+                             'the mp4 has an AAC track (default: use '
+                             'the mp4\'s AAC audio when present)')
     parser.add_argument('--loc01-compat', action='store_true',
                         help='Also emit timestamps under loc-01\'s '
                              'property id 0x02 for players not yet on '
@@ -65,24 +69,32 @@ def parse_args():
     return parser.parse_args()
 
 
-def _build_catalog(args, video: 'Mp4AvcReader | None') -> Catalog:
+def _build_catalog(args, video, audio) -> Catalog:
     tracks = []
-    if not getattr(args, 'no_audio', False):
+    init = []
+    if audio is not None:
+        tracks.append(CatalogTrack(
+            name='audio', packaging='loc', isLive=True, role='audio',
+            renderGroup=1, codec=audio.codec_string,
+            samplerate=audio.samplerate,
+            channelConfig=str(audio.channels),
+            bitrate=128_000, initRef='a0'))
+        init.append(InitData.from_bytes('a0', audio.asc))
+    elif not args.no_audio:
         tracks.append(CatalogTrack(
             name='audio', packaging='loc', isLive=True, role='audio',
             renderGroup=1, codec='pcm-s16', samplerate=_SAMPLERATE,
             channelConfig=str(_CHANNELS),
             bitrate=_SAMPLERATE * _CHANNELS * 16))
-    init = None
     if video is not None:
         tracks.insert(0, CatalogTrack(
             name='video', packaging='loc', isLive=True, role='video',
             renderGroup=1, codec=avcc_codec_string(video.avcc),
             width=video.width, height=video.height,
             framerate=video.fps, bitrate=2_000_000, initRef='v0'))
-        init = [InitData.from_bytes('v0', video.avcc)]
+        init.append(InitData.from_bytes('v0', video.avcc))
     return Catalog(generatedAt=int(time.time() * 1000), tracks=tracks,
-                   initDataList=init)
+                   initDataList=init or None)
 
 
 async def _pace(start: float, ts_us: int, pace: bool):
@@ -92,7 +104,7 @@ async def _pace(start: float, ts_us: int, pace: bool):
             await asyncio.sleep(delay)
 
 
-async def _feed_audio(track, args):
+async def _feed_tone(track, args):
     start = time.monotonic()
     for payload, ts in pcm_tone_frames(
             duration_s=args.duration, freq=args.freq,
@@ -103,20 +115,25 @@ async def _feed_audio(track, args):
     await track.finish()
 
 
-async def _feed_video(track, reader, args):
+async def _feed_mp4_track(track, source, args, *, all_key=False,
+                          gap_us=33_333):
+    """Feed an mp4 track's samples, paced to their timestamps; --loop
+    restarts the file as later timestamps (audio: every AU is a sync
+    frame, giving LOC's one-object-per-group audio mapping)."""
     start = time.monotonic()
     base_us = 0
     while True:
         last = 0
-        for s in reader.samples():
+        for s in source.samples():
             ts = base_us + s.timestamp_us
             if ts > args.duration * 1_000_000:
                 break
             await _pace(start, ts, not args.no_pace)
-            await track.send_frame(s.payload, key_frame=s.key_frame,
+            await track.send_frame(s.payload,
+                                   key_frame=all_key or s.key_frame,
                                    timestamp=ts)
             last = ts
-        base_us = last + int(1e6 / (reader.fps or 30))
+        base_us = last + gap_us
         if not args.loop or base_us > args.duration * 1_000_000:
             break
     await track.finish()
@@ -125,8 +142,11 @@ async def _feed_video(track, reader, args):
 async def run(args):
     set_log_level(logging.DEBUG if args.debug else logging.WARNING)
     relay = parse_relay_url(args.url)
-    reader = Mp4AvcReader(args.mp4) if args.mp4 else None
-    catalog = _build_catalog(args, reader)
+    reader = Mp4Reader(args.mp4) if args.mp4 else None
+    video = reader.video if reader else None
+    mp4_audio = (reader.audio
+                 if reader and not (args.tone or args.no_audio) else None)
+    catalog = _build_catalog(args, video, mp4_audio)
 
     client = MOQTClient(
         relay.host, relay.port, path=relay.path,
@@ -143,15 +163,23 @@ async def run(args):
         pub = MediaPublisher(session, args.namespace, catalog)
         feeders = []
         if not args.no_audio:
-            feeders.append(_feed_audio(pub.add_track(LocTrackPublisher(
+            audio_track = pub.add_track(LocTrackPublisher(
                 session, args.namespace, 'audio',
                 mapping=(StreamMapping.DATAGRAM if args.datagram
                          else StreamMapping.PER_GROUP),
-                loc01_compat=args.loc01_compat)), args))
-        if reader is not None:
-            feeders.append(_feed_video(pub.add_track(LocTrackPublisher(
-                session, args.namespace, 'video', config=reader.avcc,
-                loc01_compat=args.loc01_compat)), reader, args))
+                loc01_compat=args.loc01_compat))
+            if mp4_audio is not None:
+                feeders.append(_feed_mp4_track(
+                    audio_track, mp4_audio, args, all_key=True,
+                    gap_us=1_000_000 * 1024 // mp4_audio.samplerate))
+            else:
+                feeders.append(_feed_tone(audio_track, args))
+        if video is not None:
+            feeders.append(_feed_mp4_track(
+                pub.add_track(LocTrackPublisher(
+                    session, args.namespace, 'video', config=video.avcc,
+                    loc01_compat=args.loc01_compat)),
+                video, args, gap_us=int(1e6 / (video.fps or 30))))
         await pub.start()
         print("  publishing...")
         await asyncio.gather(*feeders)

@@ -71,80 +71,56 @@ def _find(data, start, end, *path):
     return None
 
 
-class Mp4AvcReader:
-    """One H.264 (avc1/avc3) video track out of a plain MP4.
+def _traks(d: bytes):
+    """Yield (sample_entry_type, entry_body, entry_end, trak_span)."""
+    moov = _find(d, 0, len(d), b'moov')
+    if moov is None:
+        raise Mp4Error("no moov box (fragmented mp4 unsupported)")
+    for btype, body, bend in _boxes(d, *moov):
+        if btype != b'trak':
+            continue
+        stsd = _find(d, body, bend, b'mdia', b'minf', b'stbl', b'stsd')
+        if stsd is None:
+            continue
+        for etype, ebody, eend in _boxes(d, stsd[0] + 8, stsd[1]):
+            yield etype, ebody, eend, (body, bend)
 
-    Exposes avcc (VIDEO_CONFIG extradata), width/height, timescale,
-    and samples() yielding VideoSample in stored (decode) order.
-    Fragmented MP4 (moof) is not supported.
-    """
 
-    def __init__(self, path: str):
-        with open(path, 'rb') as f:
-            self._data = f.read()
-        d = self._data
-        moov = _find(d, 0, len(d), b'moov')
-        if moov is None:
-            raise Mp4Error("no moov box (fragmented mp4 unsupported)")
-        trak = self._video_trak(*moov)
-        if trak is None:
-            raise Mp4Error("no avc1/avc3 video track")
-        self._parse_trak(*trak)
+class _TrackReader:
+    """Shared ISO-BMFF sample-table machinery for one trak."""
 
-    def _video_trak(self, moov_body, moov_end):
-        d = self._data
-        for btype, body, bend in _boxes(d, moov_body, moov_end):
-            if btype != b'trak':
-                continue
-            stsd = _find(d, body, bend, b'mdia', b'minf', b'stbl', b'stsd')
-            if stsd is None:
-                continue
-            for etype, ebody, eend in _boxes(d, stsd[0] + 8, stsd[1]):
-                if etype in (b'avc1', b'avc3'):
-                    return body, bend
-        return None
-
-    def _parse_trak(self, body, bend):
-        d = self._data
+    def __init__(self, data: bytes, entry, trak):
+        d = self._data = data
+        body, bend = trak
         mdhd = _find(d, body, bend, b'mdia', b'mdhd')
         version = d[mdhd[0]]
         self.timescale = struct.unpack_from(
             '>I', d, mdhd[0] + (20 if version == 1 else 12))[0]
+        self._parse_entry(*entry)
         stbl = _find(d, body, bend, b'mdia', b'minf', b'stbl')
-        stsd = _find(d, *stbl, b'stsd')
-        for etype, ebody, eend in _boxes(d, stsd[0] + 8, stsd[1]):
-            if etype in (b'avc1', b'avc3'):
-                self.width, self.height = struct.unpack_from(
-                    '>HH', d, ebody + 24)
-                avcc = _find(d, ebody + 78, eend, b'avcC')
-                if avcc is None:
-                    raise Mp4Error("no avcC in sample entry")
-                self.avcc = d[avcc[0]:avcc[1]]
-                break
 
-        def table(name, *, full=True):
+        def table(name):
             box = _find(d, *stbl, name)
-            return None if box is None else (box[0] + (4 if full else 0),
-                                             box[1])
+            return None if box is None else (box[0] + 4, box[1])
 
         # stsz: sample sizes
-        pos, end = table(b'stsz')
+        pos, _ = table(b'stsz')
         fixed, count = struct.unpack_from('>II', d, pos)
         self._sizes = ([fixed] * count if fixed else
                        list(struct.unpack_from(f'>{count}I', d, pos + 8)))
         # stco/co64: chunk offsets
         co = table(b'stco') or table(b'co64')
         big = _find(d, *stbl, b'stco') is None
-        pos, end = co
+        pos, _ = co
         n = struct.unpack_from('>I', d, pos)[0]
         self._chunk_offsets = list(struct.unpack_from(
             f'>{n}{"Q" if big else "I"}', d, pos + 4))
         # stsc: sample-to-chunk runs
-        pos, end = table(b'stsc')
+        pos, _ = table(b'stsc')
         n = struct.unpack_from('>I', d, pos)[0]
         self._stsc = [struct.unpack_from('>III', d, pos + 4 + 12 * i)
                       for i in range(n)]
-        # stss: sync samples (absent = all sync)
+        # stss: sync samples (absent = all sync, e.g. audio)
         st = table(b'stss')
         if st is None:
             self._sync = None
@@ -152,16 +128,13 @@ class Mp4AvcReader:
             n = struct.unpack_from('>I', d, st[0])[0]
             self._sync = set(struct.unpack_from(f'>{n}I', d, st[0] + 4))
         # stts: decode timestamps
-        pos, end = table(b'stts')
+        pos, _ = table(b'stts')
         n = struct.unpack_from('>I', d, pos)[0]
         self._stts = [struct.unpack_from('>II', d, pos + 4 + 8 * i)
                       for i in range(n)]
 
-    @property
-    def fps(self) -> Optional[float]:
-        total = sum(c for c, _ in self._stts)
-        dur = sum(c * delta for c, delta in self._stts)
-        return round(total * self.timescale / dur, 2) if dur else None
+    def _parse_entry(self, ebody, eend):
+        raise NotImplementedError
 
     def _offsets(self) -> List[int]:
         """Absolute file offset per sample via stsc/stco."""
@@ -193,6 +166,125 @@ class Mp4AvcReader:
                 timestamp_us=t * 1_000_000 // self.timescale,
             )
             t += next(ts_iter)
+
+
+class Mp4VideoTrack(_TrackReader):
+    """H.264 (avc1/avc3) track: samples are 4-byte-length-prefixed AVC
+    = LOC canonical payloads; avcc = VIDEO_CONFIG extradata."""
+
+    def _parse_entry(self, ebody, eend):
+        d = self._data
+        self.width, self.height = struct.unpack_from('>HH', d, ebody + 24)
+        avcc = _find(d, ebody + 78, eend, b'avcC')
+        if avcc is None:
+            raise Mp4Error("no avcC in sample entry")
+        self.avcc = d[avcc[0]:avcc[1]]
+
+    @property
+    def fps(self) -> Optional[float]:
+        total = sum(c for c, _ in self._stts)
+        dur = sum(c * delta for c, delta in self._stts)
+        return round(total * self.timescale / dur, 2) if dur else None
+
+
+def _read_descriptor(d: bytes, pos: int):
+    """MPEG-4 descriptor: tag byte + 7-bit-continued length."""
+    tag = d[pos]
+    pos += 1
+    size = 0
+    while True:
+        b = d[pos]
+        pos += 1
+        size = (size << 7) | (b & 0x7F)
+        if not b & 0x80:
+            break
+    return tag, size, pos
+
+
+class Mp4AudioTrack(_TrackReader):
+    """AAC (mp4a) track: samples are raw AAC access units — LOC payload
+    for mp4a.40.x; asc = AudioSpecificConfig (decoder description /
+    catalog init data)."""
+
+    def _parse_entry(self, ebody, eend):
+        d = self._data
+        self.channels = struct.unpack_from('>H', d, ebody + 16)[0]
+        self.samplerate = struct.unpack_from('>I', d, ebody + 24)[0] >> 16
+        esds = _find(d, ebody + 28, eend, b'esds')
+        if esds is None:
+            raise Mp4Error("no esds in mp4a sample entry")
+        pos = esds[0] + 4  # version/flags
+        tag, _, pos = _read_descriptor(d, pos)
+        if tag != 0x03:
+            raise Mp4Error(f"expected ES descriptor, got {tag:#x}")
+        pos += 3  # ES_ID + streamDependence/URL/OCR flags (none set)
+        tag, _, pos = _read_descriptor(d, pos)
+        if tag != 0x04:
+            raise Mp4Error(f"expected DecoderConfig descriptor, got {tag:#x}")
+        self.object_type_indication = d[pos]  # 0x40 = MPEG-4 Audio
+        pos += 13
+        tag, size, pos = _read_descriptor(d, pos)
+        if tag != 0x05:
+            raise Mp4Error("no DecoderSpecificInfo (AudioSpecificConfig)")
+        self.asc = d[pos:pos + size]
+
+    @property
+    def codec_string(self) -> str:
+        """RFC 6381 (e.g. mp4a.40.2) from the ASC audioObjectType."""
+        return f"mp4a.40.{(self.asc[0] >> 3) & 0x1F}"
+
+
+class Mp4Reader:
+    """Plain (non-fragmented) MP4: first H.264 video and/or first AAC
+    audio track. At least one must be present."""
+
+    def __init__(self, path: str):
+        with open(path, 'rb') as f:
+            data = f.read()
+        self.video: Optional[Mp4VideoTrack] = None
+        self.audio: Optional[Mp4AudioTrack] = None
+        for etype, ebody, eend, trak in _traks(data):
+            if etype in (b'avc1', b'avc3') and self.video is None:
+                self.video = Mp4VideoTrack(data, (ebody, eend), trak)
+            elif etype == b'mp4a' and self.audio is None:
+                self.audio = Mp4AudioTrack(data, (ebody, eend), trak)
+        if self.video is None and self.audio is None:
+            raise Mp4Error("no avc1/avc3 or mp4a track")
+
+
+class Mp4AvcReader(Mp4VideoTrack):
+    """Video-only compatibility entry point."""
+
+    def __init__(self, path: str):
+        with open(path, 'rb') as f:
+            data = f.read()
+        for etype, ebody, eend, trak in _traks(data):
+            if etype in (b'avc1', b'avc3'):
+                super().__init__(data, (ebody, eend), trak)
+                return
+        raise Mp4Error("no avc1/avc3 video track")
+
+
+# ADTS sampling_frequency_index table (ISO 14496-3).
+_ADTS_FREQ = (96000, 88200, 64000, 48000, 44100, 32000, 24000,
+              22050, 16000, 12000, 11025, 8000, 7350)
+
+
+def adts_frame(asc: bytes, payload: bytes) -> bytes:
+    """Wrap one raw AAC AU in an ADTS header — concatenation of these
+    is a playable .aac stream."""
+    obj = (asc[0] >> 3) & 0x1F
+    freq_idx = ((asc[0] & 7) << 1) | (asc[1] >> 7)
+    chan = (asc[1] >> 3) & 0xF
+    n = len(payload) + 7
+    return bytes([
+        0xFF, 0xF1,  # syncword, MPEG-4, layer 0, no CRC
+        ((obj - 1) << 6) | (freq_idx << 2) | (chan >> 2),
+        ((chan & 3) << 6) | ((n >> 11) & 0x3),
+        (n >> 3) & 0xFF,
+        ((n & 0x7) << 5) | 0x1F,
+        0xFC,
+    ]) + payload
 
 
 # -- Annex-B ----------------------------------------------------------

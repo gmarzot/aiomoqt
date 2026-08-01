@@ -29,7 +29,7 @@ import wave
 from aiomoqt.client import MOQTClient
 from aiomoqt.media import MediaSubscriber
 from aiomoqt.types import MOQTRequestError
-from aiomoqt.media.sources import avcc_param_sets, lp_to_annexb
+from aiomoqt.media.sources import adts_frame, avcc_param_sets, lp_to_annexb
 from aiomoqt.utils import cli as _cli
 from aiomoqt.utils.logger import set_log_level
 from aiomoqt.utils.url import parse_relay_url
@@ -68,6 +68,7 @@ class _Writers:
         self.pipe_role = pipe_role
         self.video = None
         self.wav = None
+        self.aac = None
         self.counts = {}
         self.pipe_closed = False
 
@@ -94,6 +95,19 @@ class _Writers:
                                   'wb')
             self.video.write(param_sets)
             self.video.write(lp_to_annexb(frame.payload))
+        elif role == 'audio' and (entry.codec or '').startswith('mp4a'):
+            # Raw AAC AUs; the AudioSpecificConfig arrives via catalog
+            # initRef. ADTS-wrapped output is directly playable.
+            asc = self.sub.tracks[name].config
+            if asc is None:
+                return
+            data = adts_frame(asc, frame.payload)
+            if self.pipe_role == 'audio':
+                self._pipe(data)
+                return
+            if self.aac is None:
+                self.aac = open(os.path.join(self.out, 'audio.aac'), 'wb')
+            self.aac.write(data)
         elif role == 'audio' and (entry.codec or '').startswith('pcm-s16'):
             if self.pipe_role == 'audio':
                 self._pipe(frame.payload)
@@ -111,6 +125,8 @@ class _Writers:
             self.video.close()
         if self.wav:
             self.wav.close()
+        if self.aac:
+            self.aac.close()
 
 
 def _status(*parts):
@@ -152,11 +168,14 @@ async def run(args):
         _status(f"  catalog: {[t.name for t in catalog.tracks]}")
         if args.pipe == 'audio':
             a = catalog.find('audio')
-            layout = ('mono' if (a and a.channelConfig == '1')
-                      else 'stereo')
-            _status(f"  piping s16le — play with: ffplay -f s16le "
-                    f"-ar {a.samplerate if a else 48000} "
-                    f"-ch_layout {layout} -i -")
+            if a and (a.codec or '').startswith('mp4a'):
+                _status("  piping ADTS aac — play with: ffplay -i -")
+            else:
+                layout = ('mono' if (a and a.channelConfig == '1')
+                          else 'stereo')
+                _status(f"  piping s16le — play with: ffplay -f s16le "
+                        f"-ar {a.samplerate if a else 48000} "
+                        f"-ch_layout {layout} -i -")
         elif args.pipe == 'video':
             _status("  piping h264 — play with: ffplay -fflags nobuffer "
                     "-flags low_delay -probesize 32 -f h264 -i -")
@@ -173,9 +192,11 @@ async def run(args):
     for name, n in sorted(writers.counts.items()):
         _status(f"  {name}: {n} frames")
     if args.pipe is None:
-        _status(f"  wrote {args.out}/  — play with: "
-                f"ffplay {args.out}/video.h264 | "
-                f"ffplay {args.out}/audio.wav")
+        files = [n for n, f in (("video.h264", writers.video),
+                                ("audio.wav", writers.wav),
+                                ("audio.aac", writers.aac)) if f]
+        _status(f"  wrote {args.out}/{{{', '.join(files)}}} — "
+                f"play each with ffplay")
 
 
 def main():

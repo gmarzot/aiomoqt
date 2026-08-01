@@ -15,8 +15,8 @@ def test_build_catalog_from_mp4(tmp_path):
     path = tmp_path / "t.mp4"
     path.write_bytes(_mp4())
     reader = Mp4AvcReader(str(path))
-    args = SimpleNamespace()
-    cat = _build_catalog(args, reader)
+    args = SimpleNamespace(no_audio=False)
+    cat = _build_catalog(args, reader, None)
     assert cat.validate() == []
     video = cat.find("video")
     assert video.codec == "avc1.64001F"
