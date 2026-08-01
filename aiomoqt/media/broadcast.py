@@ -1,0 +1,227 @@
+"""MSF broadcast orchestration — one session, many tracks.
+
+MediaPublisher publishes the catalog track plus LOC media tracks and
+demuxes relay control messages to the right track (PublishedTrack's own
+handler registration assumes one track per session and clobbers).
+MediaSubscriber consumes the catalog, then subscribes the media tracks
+it describes.
+
+Catalog wire placement (msf-01 §5): each update is one object in
+subgroup 0; Object 0 of a group is a complete independent catalog,
+higher objects are deltas; a new independent catalog starts a new group.
+"""
+from __future__ import annotations
+
+import asyncio
+from typing import Callable, Dict, Optional
+
+from ..messages import SubgroupHeader
+from ..track import PublishedTrack, SubscribedTrack
+from ..types import MOQTMessageType
+from ..utils.logger import get_logger
+from .catalog import Catalog, CATALOG_TRACK_NAME, PACKAGING_LOC
+from .loc import LocTrackPublisher, LocTrackSubscriber
+
+logger = get_logger(__name__)
+
+
+class CatalogTrackPublisher(PublishedTrack):
+    """Publishes the "catalog" track: the current independent catalog
+    opens each group; queued deltas follow as Objects >= 1."""
+
+    def __init__(self, session, namespace: str, catalog: Catalog):
+        super().__init__(session, namespace, CATALOG_TRACK_NAME)
+        self.catalog = catalog
+        self._updates: asyncio.Queue = asyncio.Queue()
+
+    async def publish_catalog(self, catalog: Catalog) -> None:
+        """Queue a new independent catalog (starts a new group)."""
+        await self._updates.put(catalog)
+
+    async def publish_delta(self, delta: Catalog) -> None:
+        """Queue a delta update (next object in the current group)."""
+        await self._updates.put(delta)
+
+    async def finish(self) -> None:
+        await self._updates.put(None)
+
+    async def generate(self, session, track_alias: int):
+        prof = session._profile
+        header = None
+        stream_id = None
+
+        async def _emit(payload: bytes, new_group: bool):
+            nonlocal header, stream_id
+            if new_group:
+                if stream_id is not None:
+                    buf = header.end_group(object_id=header.next_object_id)
+                    session.stream_write(stream_id, buf.data,
+                                         end_stream=True)
+                stream_id = await session.open_uni_stream()
+                self._stream_count += 1
+                header = SubgroupHeader(
+                    track_alias=track_alias,
+                    group_id=0 if header is None else header.group_id + 1,
+                    subgroup_id=0, publisher_priority=self.priority,
+                    prof=prof)
+                session.stream_write(stream_id, header.serialize().data)
+            buf = header.next_object(payload=payload)
+            await session.stream_write_drain(stream_id, buf.data)
+            self._total_sent += 1
+
+        # A joining subscriber needs a complete catalog first (§11.2).
+        await _emit(self.catalog.to_json().encode(), new_group=True)
+        try:
+            while True:
+                update = await self._updates.get()
+                if update is None:
+                    break
+                await _emit(update.to_json().encode(),
+                            new_group=not update.is_delta)
+                # self.catalog tracks what has been emitted, so a group
+                # start always opens with every prior delta folded in.
+                if update.is_delta:
+                    self.catalog.apply(update)
+                else:
+                    self.catalog = update
+        finally:
+            if stream_id is not None:
+                buf = header.end_group(object_id=header.next_object_id)
+                session.stream_write(stream_id, buf.data, end_stream=True)
+        self._send_publish_done(session)
+
+
+class MediaPublisher:
+    """Publishes an MSF broadcast: catalog + LOC media tracks on one
+    session, with control demux by track name / request id."""
+
+    def __init__(self, session, namespace: str, catalog: Catalog):
+        self.session = session
+        self.namespace = namespace
+        self.catalog_track = CatalogTrackPublisher(session, namespace,
+                                                   catalog)
+        self._by_name: Dict[str, PublishedTrack] = {
+            CATALOG_TRACK_NAME: self.catalog_track}
+
+    def add_track(self, track: LocTrackPublisher) -> LocTrackPublisher:
+        self._by_name[track.trackname] = track
+        return track
+
+    async def start(self) -> None:
+        """PUBLISH every track (catalog first, §11.2), then install the
+        session-level demux over PublishedTrack's per-track handlers."""
+        for track in self._by_name.values():
+            await track.publish(publish_track=True)
+        self.session.register_handler(
+            MOQTMessageType.SUBSCRIBE, self._demux_subscribe)
+        self.session.register_handler(
+            MOQTMessageType.PUBLISH_OK, self._demux_publish_ok)
+        self.session.register_handler(
+            MOQTMessageType.SUBSCRIBE_UPDATE, self._demux_update)
+
+    def _track_for_request(self, request_id) -> Optional[PublishedTrack]:
+        for track in self._by_name.values():
+            if track.request_id == request_id:
+                return track
+        return None
+
+    async def _demux_subscribe(self, session, msg) -> None:
+        name = msg.track_name
+        name = name.decode() if isinstance(name, bytes) else name
+        track = self._by_name.get(name)
+        if track is None:
+            logger.warning(f"MediaPublisher: SUBSCRIBE for unknown "
+                           f"track {name!r}")
+            return
+        await track._on_subscribe(session, msg)
+
+    async def _demux_publish_ok(self, session, msg) -> None:
+        track = self._track_for_request(msg.request_id)
+        if track is not None:
+            await track._on_publish_ok(session, msg)
+
+    async def _demux_update(self, session, msg) -> None:
+        track = self._track_for_request(msg.request_id)
+        if track is None:
+            logger.warning(f"MediaPublisher: update for unknown "
+                           f"request_id={msg.request_id}")
+            return
+        from ..messages import RequestUpdate
+        if isinstance(msg, RequestUpdate):
+            await track._on_request_update(session, msg)
+        else:
+            await track._on_subscribe_update(session, msg)
+
+
+class MediaSubscriber:
+    """Consumes an MSF broadcast: reads the catalog track, then
+    subscribes every LOC media track it describes.
+
+    on_frame(track_name, frame, group_id, object_id) receives media;
+    on_catalog(catalog) fires on every independent catalog or applied
+    delta.
+    """
+
+    def __init__(self, session, namespace: str, *,
+                 on_frame: Optional[Callable] = None,
+                 on_catalog: Optional[Callable] = None,
+                 track_filter: Optional[Callable] = None):
+        self.session = session
+        self.namespace = namespace
+        self.on_frame = on_frame
+        self.on_catalog = on_catalog
+        self.track_filter = track_filter or (lambda t: True)
+        self.catalog: Optional[Catalog] = None
+        self.tracks: Dict[str, LocTrackSubscriber] = {}
+        self._have_catalog = asyncio.Event()
+        self._catalog_sub: Optional[SubscribedTrack] = None
+
+    async def start(self, timeout: float = 10.0) -> Catalog:
+        """Subscribe the catalog track, await the first complete
+        catalog, subscribe its media tracks. Returns the catalog."""
+        self._catalog_sub = SubscribedTrack(
+            self.session, self.namespace, CATALOG_TRACK_NAME,
+            on_object=self._on_catalog_object)
+        await self._catalog_sub.subscribe()
+        await asyncio.wait_for(self._have_catalog.wait(), timeout)
+        await self._subscribe_media()
+        return self.catalog
+
+    def _on_catalog_object(self, msg, size, ts, group_id,
+                           subgroup_id) -> None:
+        try:
+            update = Catalog.from_json(bytes(msg.payload).decode())
+        except Exception as e:
+            logger.error(f"MediaSubscriber: bad catalog object: {e}")
+            return
+        if update.is_delta:
+            if self.catalog is None:
+                logger.warning("MediaSubscriber: delta before any "
+                               "independent catalog — dropped")
+                return
+            self.catalog.apply(update)
+        else:
+            self.catalog = update
+        if self.on_catalog:
+            self.on_catalog(self.catalog)
+        self._have_catalog.set()
+
+    async def _subscribe_media(self) -> None:
+        for entry in list(self.catalog.tracks):
+            if entry.packaging != PACKAGING_LOC:
+                logger.info(f"MediaSubscriber: skipping {entry.name!r} "
+                            f"(packaging={entry.packaging!r})")
+                continue
+            if entry.name in self.tracks or not self.track_filter(entry):
+                continue
+            name = entry.name
+            sub = LocTrackSubscriber(
+                self.session,
+                entry.namespace or self.namespace, name,
+                on_frame=(lambda f, gid, oid, _n=name:
+                          self.on_frame and self.on_frame(_n, f, gid, oid)))
+            init = self.catalog.resolve_init(entry)
+            if init is not None:
+                sub.set_config(init)
+            await sub.subscribe()
+            self.tracks[name] = sub
