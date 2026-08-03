@@ -45,8 +45,9 @@ class BenchReporter:
     report_interval elapses, and the end-of-run summary.
     """
 
-    def __init__(self, report_interval: float = 5.0):
-        self.stats = TrackStats(windowed=False)
+    def __init__(self, report_interval: float = 5.0,
+                 minimal: bool = False):
+        self.stats = TrackStats(windowed=False, minimal=minimal)
         self.report_interval = report_interval
         self._last_report = 0.0
         self._header_printed = False
@@ -84,12 +85,12 @@ class BenchReporter:
         print(f"  aiomoqt-bench results  ({s['active_s']:.1f}s active "
               f"/ {s['duration_s']:.1f}s elapsed)")
         print("═" * 56)
-        grps = 'n/a' if s.get('datagram') else f"{s['groups']:,}"
+        blind = s.get('datagram') or s.get('minimal')
+        grps = 'n/a' if blind else f"{s['groups']:,}"
         print(f"  Groups:      {grps}")
         print(f"  Objects:     {s['objects']:,}")
         print(f"  Bytes:       {s['bytes']:,}")
-        grp_rate = ('n/a' if s.get('datagram')
-                    else f"{s['grp_rate']:.1f} grp/s")
+        grp_rate = 'n/a' if blind else f"{s['grp_rate']:.1f} grp/s"
         print(f"  GrpRate:     {grp_rate}")
         print(f"  ObjRate:     {s['obj_rate']:.1f} obj/s")
         print(f"  Throughput:  {s['mbps']:.2f} Mbps")
@@ -99,9 +100,13 @@ class BenchReporter:
                   f"sd={s['lat_sd']:.1f} ms")
             print(f"               p50={s['lat_p50']:.1f}  "
                   f"p95={s['lat_p95']:.1f}  p99={s['lat_p99']:.1f} ms")
-        print(f"  Jitter:      {s['jitter_ms']:.2f} ms")
-        print(f"  Lost:        {s['lost']} ({s['loss_pct']:.2f}%)")
-        print(f"  Out-of-order:   {s['ooo']}")
+        if s.get('minimal'):
+            print("  Jitter:      n/a")
+            print("  Lost:        n/a  (--no-stats: counters only)")
+        else:
+            print(f"  Jitter:      {s['jitter_ms']:.2f} ms")
+            print(f"  Lost:        {s['lost']} ({s['loss_pct']:.2f}%)")
+            print(f"  Out-of-order:   {s['ooo']}")
         print("═" * 56)
 
 
@@ -156,7 +161,8 @@ async def run(args):
 
     relay = parse_relay_url(
         args.url)
-    stats = BenchReporter(report_interval=args.interval)
+    stats = BenchReporter(report_interval=args.interval,
+                          minimal=args.no_stats)
     print_banner(relay, args)
 
     client = MOQTClient(

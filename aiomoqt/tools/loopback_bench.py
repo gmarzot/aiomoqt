@@ -67,6 +67,11 @@ def parse_args():
         '-i', '--interval', type=float, default=5.0,
         help='Report interval seconds (default: 5)')
     parser.add_argument(
+        '--no-stats', action='store_true',
+        help='Count objects and bytes only — no latency, jitter, loss '
+             'or group accounting. Measures the delivery ceiling '
+             'without the measurement in it.')
+    parser.add_argument(
         '-p', '--port', type=int, default=4434,
         help='Local port (default: 4434)')
     parser.add_argument(
@@ -266,7 +271,8 @@ async def main():
     if _trace_enabled:
         _tm.start(25)
 
-    stats = BenchReporter(report_interval=args.interval)
+    stats = BenchReporter(report_interval=args.interval,
+                          minimal=args.no_stats)
     print_banner(args)
 
     if not args.cert or not args.key:

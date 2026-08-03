@@ -164,6 +164,10 @@ def add_run(p, duration=DEFAULT_DURATION, interval=True):
                             f'(default: {DEFAULT_INTERVAL:g})')
     p.add_argument('-d', '--debug', action='store_true',
                    help='Verbose logging')
+    p.add_argument('--no-stats', action='store_true',
+                   help='Count objects and bytes only — no latency, '
+                        'jitter, loss or group accounting. Measures the '
+                        'delivery ceiling without the measurement in it.')
 
 
 def add_session(p, insecure=True, certs=False, keepalive=False,
