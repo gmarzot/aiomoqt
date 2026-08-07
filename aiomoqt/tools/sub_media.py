@@ -51,6 +51,10 @@ def parse_args():
     parser.add_argument('--show-catalog', action='store_true',
                         help='Print the full catalog JSON (and every '
                              'applied update) to stderr')
+    parser.add_argument('--inspect', type=int, default=0, metavar='N',
+                        help='Print per-frame wire detail for the first '
+                             'N frames of each track (group/object ids, '
+                             'size, key, property ids, timestamp skew)')
     _cli.add_run(parser, duration=30, interval=False)
     _cli.add_session(parser, keepalive=True)
     _cli.add_help(parser)
@@ -62,10 +66,11 @@ class _Writers:
     One track may stream raw to stdout instead (pipe_role)."""
 
     def __init__(self, out_dir: str, subscriber: MediaSubscriber,
-                 pipe_role: str = None):
+                 pipe_role: str = None, inspect: int = 0):
         self.out = out_dir
         self.sub = subscriber
         self.pipe_role = pipe_role
+        self.inspect = inspect
         self.video = None
         self.wav = None
         self.aac = None
@@ -81,6 +86,14 @@ class _Writers:
 
     def on_frame(self, name, frame, group_id, object_id):
         self.counts[name] = self.counts.get(name, 0) + 1
+        if self.counts[name] <= self.inspect:
+            import time as _t
+            skew = ((_t.time() * 1e6 - frame.timestamp) / 1000
+                    if frame.timestamp is not None else None)
+            _status(f"  [{name}] g{group_id}.o{object_id} "
+                    f"{len(frame.payload)}B key={frame.key_frame} "
+                    f"ts_skew_ms={None if skew is None else round(skew)} "
+                    f"extra_props={sorted((frame.extensions or {}))}")
         entry = self.sub.catalog.find(name) if self.sub.catalog else None
         role = entry.role if entry else None
         if role == 'video':
@@ -153,7 +166,8 @@ async def run(args):
             session, args.namespace,
             on_catalog=((lambda c: _status(c.to_json(indent=2)))
                         if args.show_catalog else None))
-        writers = _Writers(args.out, sub, pipe_role=args.pipe)
+        writers = _Writers(args.out, sub, pipe_role=args.pipe,
+                           inspect=args.inspect)
         sub.on_frame = writers.on_frame
         try:
             catalog = await sub.start(timeout=args.duration)
