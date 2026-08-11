@@ -22,9 +22,7 @@ from aiomoqt.media import (
     Catalog, CatalogTrack, InitData, LocTrackPublisher, MediaPublisher,
     StreamMapping,
 )
-from aiomoqt.media.sources import (
-    Mp4Reader, avcc_codec_string, pcm_tone_frames,
-)
+from aiomoqt.media.sources import Mp4Reader, pcm_tone_frames
 from aiomoqt.utils import cli as _cli
 from aiomoqt.utils.logger import set_log_level
 from aiomoqt.utils.url import parse_relay_url
@@ -59,6 +57,10 @@ def parse_args():
                         help='Synthesized pcm-s16 tone audio even when '
                              'the mp4 has an AAC track (default: use '
                              'the mp4\'s AAC audio when present)')
+    parser.add_argument('--target-latency', type=int, default=None,
+                        metavar='MS',
+                        help='Catalog targetLatency (msf-01 §5.2.8) — '
+                             'players size their playout buffer from it')
     parser.add_argument('--loc01-compat', action='store_true',
                         help='Also emit timestamps under loc-01\'s '
                              'property id 0x02 for players not yet on '
@@ -89,11 +91,16 @@ def _build_catalog(args, video, audio) -> Catalog:
     if video is not None:
         tracks.insert(0, CatalogTrack(
             name='video', packaging='loc', isLive=True, role='video',
-            renderGroup=1, codec=avcc_codec_string(video.avcc),
+            renderGroup=1, codec=video.codec_string,
             width=video.width, height=video.height,
             framerate=video.fps,
-            bitrate=video.avg_bitrate or 2_000_000, initRef='v0'))
-        init.append(InitData.from_bytes('v0', video.avcc))
+            bitrate=video.avg_bitrate or 2_000_000,
+            initRef='v0' if video.config else None))
+        if video.config:
+            init.append(InitData.from_bytes('v0', video.config))
+    if getattr(args, 'target_latency', None) is not None:
+        for t in tracks:
+            t.targetLatency = args.target_latency
     return Catalog(generatedAt=int(time.time() * 1000), tracks=tracks,
                    initDataList=init or None)
 
@@ -183,7 +190,7 @@ async def run(args):
         if video is not None:
             feeders.append(_feed_mp4_track(
                 pub.add_track(LocTrackPublisher(
-                    session, args.namespace, 'video', config=video.avcc,
+                    session, args.namespace, 'video', config=video.config,
                     loc01_compat=args.loc01_compat)),
                 video, args, epoch_us,
                 gap_us=int(1e6 / (video.fps or 30))))

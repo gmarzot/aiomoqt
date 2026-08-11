@@ -177,16 +177,32 @@ class _TrackReader:
 
 
 class Mp4VideoTrack(_TrackReader):
-    """H.264 (avc1/avc3) track: samples are 4-byte-length-prefixed AVC
-    = LOC canonical payloads; avcc = VIDEO_CONFIG extradata."""
+    """Video track. H.264 (avc1/avc3): samples are 4-byte-length-
+    prefixed AVC = LOC canonical payloads, avcc = decoder description.
+    AV1 (av01): samples are temporal units = WebCodecs chunk payloads
+    verbatim; config travels in-band, so no description is emitted."""
 
     def _parse_entry(self, ebody, eend):
         d = self._data
         self.width, self.height = struct.unpack_from('>HH', d, ebody + 24)
         avcc = _find(d, ebody + 78, eend, b'avcC')
-        if avcc is None:
-            raise Mp4Error("no avcC in sample entry")
-        self.avcc = d[avcc[0]:avcc[1]]
+        av1c = _find(d, ebody + 78, eend, b'av1C')
+        self.avcc = d[avcc[0]:avcc[1]] if avcc else None
+        self.av1c = d[av1c[0]:av1c[1]] if av1c else None
+        if self.avcc is None and self.av1c is None:
+            raise Mp4Error("no avcC/av1C in video sample entry")
+
+    @property
+    def codec_string(self) -> str:
+        if self.avcc is not None:
+            return avcc_codec_string(self.avcc)
+        return av1c_codec_string(self.av1c)
+
+    @property
+    def config(self) -> Optional[bytes]:
+        """Decoder description (WebCodecs): avcC for H.264; None for
+        AV1 (registry: config OBUs ride in-band, no description)."""
+        return self.avcc
 
     @property
     def fps(self) -> Optional[float]:
@@ -252,12 +268,12 @@ class Mp4Reader:
         self.video: Optional[Mp4VideoTrack] = None
         self.audio: Optional[Mp4AudioTrack] = None
         for etype, ebody, eend, trak in _traks(data):
-            if etype in (b'avc1', b'avc3') and self.video is None:
+            if etype in (b'avc1', b'avc3', b'av01') and self.video is None:
                 self.video = Mp4VideoTrack(data, (ebody, eend), trak)
             elif etype == b'mp4a' and self.audio is None:
                 self.audio = Mp4AudioTrack(data, (ebody, eend), trak)
         if self.video is None and self.audio is None:
-            raise Mp4Error("no avc1/avc3 or mp4a track")
+            raise Mp4Error("no avc1/avc3/av01 or mp4a track")
 
 
 class Mp4AvcReader(Mp4VideoTrack):
@@ -351,3 +367,36 @@ def avcc_param_sets(avcc: bytes) -> bytes:
 def avcc_codec_string(avcc: bytes) -> str:
     """WebCodecs/RFC 6381 codec string from avcC (e.g. avc1.42E01E)."""
     return f"avc1.{avcc[1]:02X}{avcc[2]:02X}{avcc[3]:02X}"
+
+
+def av1c_codec_string(av1c: bytes) -> str:
+    """WebCodecs/ISOBMFF codec string from av1C (e.g. av01.0.08M.08)."""
+    profile = av1c[1] >> 5
+    level = av1c[1] & 0x1F
+    tier = 'H' if av1c[2] & 0x80 else 'M'
+    high, twelve = av1c[2] & 0x40, av1c[2] & 0x20
+    depth = 12 if twelve else (10 if high else 8)
+    return f"av01.{profile}.{level:02d}{tier}.{depth:02d}"
+
+
+class IvfWriter:
+    """IVF container for received AV1 temporal units — the minimal
+    ffplay-playable dump format (frame count patched on close)."""
+
+    def __init__(self, fh, width: int, height: int, fps: float = 30.0):
+        self._fh = fh
+        self._n = 0
+        num, den = (int(round(fps * 1000)), 1000) if fps else (30, 1)
+        fh.write(struct.pack('<4sHH4sHHIIQ', b'DKIF', 0, 32, b'AV01',
+                             width or 0, height or 0, num, den, 0))
+
+    def add(self, payload: bytes) -> None:
+        self._fh.write(struct.pack('<IQ', len(payload), self._n))
+        self._fh.write(payload)
+        self._n += 1
+
+    def close(self) -> None:
+        if self._fh.seekable():
+            self._fh.seek(24)
+            self._fh.write(struct.pack('<I', self._n))
+        self._fh.close()

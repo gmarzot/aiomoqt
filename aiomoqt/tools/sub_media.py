@@ -29,7 +29,9 @@ import wave
 from aiomoqt.client import MOQTClient
 from aiomoqt.media import MediaSubscriber
 from aiomoqt.types import MOQTRequestError
-from aiomoqt.media.sources import adts_frame, avcc_param_sets, lp_to_annexb
+from aiomoqt.media.sources import (
+    IvfWriter, adts_frame, avcc_param_sets, lp_to_annexb,
+)
 from aiomoqt.utils import cli as _cli
 from aiomoqt.utils.logger import set_log_level
 from aiomoqt.utils.url import parse_relay_url
@@ -72,6 +74,7 @@ class _Writers:
         self.pipe_role = pipe_role
         self.inspect = inspect
         self.video = None
+        self.ivf = None
         self.wav = None
         self.aac = None
         self.counts = {}
@@ -96,7 +99,25 @@ class _Writers:
                     f"extra_props={sorted((frame.extensions or {}))}")
         entry = self.sub.catalog.find(name) if self.sub.catalog else None
         role = entry.role if entry else None
-        if role == 'video':
+        if role == 'video' and (entry.codec or '').startswith('av01'):
+            # AV1 temporal units pass through verbatim; IVF wraps them
+            # into an ffplay-playable stream (config OBUs are in-band).
+            if self.pipe_role == 'video':
+                if self.ivf is None:
+                    self.ivf = IvfWriter(sys.stdout.buffer, entry.width,
+                                         entry.height, entry.framerate)
+                try:
+                    self.ivf.add(frame.payload)
+                    sys.stdout.buffer.flush()
+                except (BrokenPipeError, ValueError):
+                    self.pipe_closed = True
+                return
+            if self.ivf is None:
+                self.ivf = IvfWriter(
+                    open(os.path.join(self.out, 'video.ivf'), 'wb'),
+                    entry.width, entry.height, entry.framerate)
+            self.ivf.add(frame.payload)
+        elif role == 'video':
             config = self.sub.tracks[name].config
             param_sets = (avcc_param_sets(config)
                           if frame.key_frame and config else b'')
@@ -136,6 +157,8 @@ class _Writers:
     def close(self):
         if self.video:
             self.video.close()
+        if self.ivf:
+            self.ivf.close()
         if self.wav:
             self.wav.close()
         if self.aac:
@@ -207,6 +230,7 @@ async def run(args):
         _status(f"  {name}: {n} frames")
     if args.pipe is None:
         files = [n for n, f in (("video.h264", writers.video),
+                                ("video.ivf", writers.ivf),
                                 ("audio.wav", writers.wav),
                                 ("audio.aac", writers.aac)) if f]
         _status(f"  wrote {args.out}/{{{', '.join(files)}}} — "

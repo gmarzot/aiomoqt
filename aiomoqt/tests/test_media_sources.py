@@ -89,6 +89,36 @@ def test_mp4_reader(tmp_path):
     assert [s.timestamp_us for s in samples] == [0, 33333, 66666]
 
 
+_AV1C = bytes([0x81, (0 << 5) | 8, 0x40])  # profile 0, level 8, 10-bit
+
+
+def test_av1_track_and_ivf(tmp_path):
+    from aiomoqt.media.sources import (
+        IvfWriter, Mp4Reader, av1c_codec_string,
+    )
+    assert av1c_codec_string(_AV1C) == "av01.0.08M.10"
+    # Same synthetic mp4 with the sample entry swapped to av01/av1C.
+    data = _mp4().replace(b'avc1', b'av01').replace(
+        _box(b'avcC', _AVCC), _box(b'av1C', _AV1C)
+        + b'\x00' * (len(_box(b'avcC', _AVCC)) - len(_box(b'av1C', _AV1C))))
+    path = tmp_path / "t-av1.mp4"
+    path.write_bytes(data)
+    r = Mp4Reader(str(path))
+    assert r.video.codec_string == "av01.0.08M.10"
+    assert r.video.config is None  # AV1: no decoder description
+    assert [s.payload for s in r.video.samples()] == _SAMPLES
+
+    out = tmp_path / "t.ivf"
+    w = IvfWriter(open(out, 'wb'), 640, 360, 24.0)
+    w.add(b'obu-frame-0')
+    w.add(b'obu-frame-1')
+    w.close()
+    d = out.read_bytes()
+    assert d[:4] == b'DKIF' and d[8:12] == b'AV01'
+    assert struct.unpack_from('<I', d, 24)[0] == 2  # patched frame count
+    assert struct.unpack_from('<I', d, 32)[0] == len(b'obu-frame-0')
+
+
 def test_mp4_reader_rejects_non_mp4(tmp_path):
     path = tmp_path / "bad.mp4"
     path.write_bytes(b'\x00' * 64)
