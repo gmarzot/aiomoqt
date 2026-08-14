@@ -109,10 +109,14 @@ class SubgroupHeader(MOQTMessage):
     _obj_cache: Optional['ObjectHeader'] = field(default=None, init=False)
     # Derived once: True when this stream uses the vi64 codec (d18).
     _vi64: bool = field(default=False, init=False)
+    # Derived once: True when KVP types are delta-coded (d16+ §1.4.2).
+    _kvp_delta: bool = field(default=False, init=False)
 
     def __post_init__(self):
         self.type = SUBGROUP_HEADER_BASE
         self._vi64 = self.prof is not None and self.prof.vi64
+        self._kvp_delta = (self.prof is not None
+                           and self.prof.params_delta_coded)
 
     def _compute_type(self) -> int:
         """Compute wire type byte from flags."""
@@ -163,6 +167,7 @@ class SubgroupHeader(MOQTMessage):
             extensions_present=self.extensions_present,
             prev_object_id=self._last_object_id,
             vi64=self._vi64,
+            kvp_delta=self._kvp_delta,
         )
         self._last_object_id = obj_id
         # Resolve subgroup_id for FIRST_OBJ mode
@@ -193,7 +198,7 @@ class SubgroupHeader(MOQTMessage):
                   else encode_object_subgroup)
         data = encode(
             delta, extensions, status_int, payload,
-            self.extensions_present)
+            self.extensions_present, self._kvp_delta)
         self._last_object_id = obj_id
         if (self.subgroup_id_mode == SUBGROUP_ID_FIRST_OBJ
                 and self.subgroup_id is None):
@@ -286,7 +291,8 @@ class ObjectHeader(MOQTMessage):
 
     def serialize(self, extensions_present: bool = True,
                   prev_object_id: Optional[int] = None,
-                  vi64: bool = False) -> Buffer:
+                  vi64: bool = False,
+                  kvp_delta: bool = False) -> Buffer:
         """Serialize for stream transmission.
 
         Args:
@@ -310,7 +316,8 @@ class ObjectHeader(MOQTMessage):
         # Extensions conditional on subgroup header flag
         # Per spec: extensions MUST NOT be present on non-NORMAL status objects
         if extensions_present and self.status == ObjectStatus.NORMAL:
-            MOQTMessage._extensions_encode(buf, self.extensions)
+            MOQTMessage._extensions_encode(buf, self.extensions,
+                                           delta=kvp_delta)
         elif extensions_present:
             MOQTMessage._extensions_encode(buf, None)  # empty extensions
 
@@ -344,7 +351,8 @@ class ObjectHeader(MOQTMessage):
     def deserialize_into(self, buf, buf_len: int,
                          extensions_present: bool = True,
                          prev_object_id: Optional[int] = None,
-                         vi64: bool = False) -> None:
+                         vi64: bool = False,
+                         kvp_delta: bool = False) -> None:
         """In-place fill — avoids per-object dataclass allocation.
 
         Caller pre-allocates one ObjectHeader and mutates it for each
@@ -366,12 +374,13 @@ class ObjectHeader(MOQTMessage):
             if fused is None:
                 raise AttributeError
             delta, exts, status, payload = fused(
-                extensions_present, MOQTMessage.EXTENSIONS_LEN_LIMIT)
+                extensions_present, MOQTMessage.EXTENSIONS_LEN_LIMIT,
+                kvp_delta)
         except AttributeError:
             pull = buf.pull_uint_vi64 if vi64 else buf.pull_uint_var
             delta = pull()
             if extensions_present:
-                exts = MOQTMessage._extensions_decode(buf)
+                exts = MOQTMessage._extensions_decode(buf, delta=kvp_delta)
             else:
                 exts = None
             payload_len = pull()
@@ -537,7 +546,8 @@ class FetchObject(MOQTMessage):
         buf.push_uint8(self.publisher_priority)
         if flags & FETCH_FLAG_EXTENSIONS_PRESENT:
             # d16 fetch object extensions: with explicit length prefix
-            MOQTMessage._extensions_encode(buf, self.extensions)
+            MOQTMessage._extensions_encode(buf, self.extensions,
+                                           delta=True)
 
         # Payload length and payload
         if self.status == ObjectStatus.NORMAL and len(self.payload) > 0:
@@ -641,7 +651,7 @@ class FetchObject(MOQTMessage):
 
         # Extensions
         if flags & FETCH_FLAG_EXTENSIONS_PRESENT:
-            extensions = MOQTMessage._extensions_decode(buf)
+            extensions = MOQTMessage._extensions_decode(buf, delta=True)
         else:
             extensions = None
 
@@ -731,7 +741,9 @@ class ObjectDatagram(MOQTMessage):
             push(self.object_id)
         buf_obj.push_uint8(self.publisher_priority)
         if has_extensions:
-            MOQTMessage._extensions_encode(buf_obj, self.extensions)
+            MOQTMessage._extensions_encode(
+                buf_obj, self.extensions,
+                delta=prof is not None and prof.params_delta_coded)
         if vi64 and is_status:
             push(int(self.status))
         elif payload_len > 0:
@@ -763,7 +775,8 @@ class ObjectDatagram(MOQTMessage):
 
         extensions = None
         if extensions_present:
-            extensions = MOQTMessage._extensions_decode(buf)
+            extensions = MOQTMessage._extensions_decode(
+                buf, delta=prof is not None and prof.params_delta_coded)
 
         if is_status:
             status = ObjectStatus(pull())
@@ -805,7 +818,7 @@ class ObjectDatagramStatus(MOQTMessage):
     def __post_init__(self):
         self.type = OBJECT_DATAGRAM_STATUS_BASE
 
-    def serialize(self) -> Buffer:
+    def serialize(self, prof: Optional[DraftProfile] = None) -> Buffer:
         has_extensions = self.extensions is not None and len(self.extensions) > 0
         type_val = OBJECT_DATAGRAM_STATUS_BASE
         if has_extensions:
@@ -818,13 +831,17 @@ class ObjectDatagramStatus(MOQTMessage):
         buf.push_uint_var(self.object_id)
         buf.push_uint8(self.publisher_priority)
         if has_extensions:
-            MOQTMessage._extensions_encode(buf, self.extensions)
+            MOQTMessage._extensions_encode(
+                buf, self.extensions,
+                delta=prof is not None and prof.params_delta_coded)
         buf.push_uint_var(self.status)
 
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer, type_val: int = 0x20) -> 'ObjectDatagramStatus':
+    def deserialize(cls, buf: Buffer, type_val: int = 0x20,
+                    prof: Optional[DraftProfile] = None
+                    ) -> 'ObjectDatagramStatus':
         """Deserialize ObjectDatagramStatus, given the already-read type byte."""
         extensions_present = bool(type_val & 0x01)
 
@@ -835,7 +852,8 @@ class ObjectDatagramStatus(MOQTMessage):
 
         extensions = None
         if extensions_present:
-            extensions = MOQTMessage._extensions_decode(buf)
+            extensions = MOQTMessage._extensions_decode(
+                buf, delta=prof is not None and prof.params_delta_coded)
 
         status = ObjectStatus(buf.pull_uint_var())
         return cls(

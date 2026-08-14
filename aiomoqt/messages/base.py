@@ -36,21 +36,31 @@ class MOQTMessage:
 
     @staticmethod
     def _extensions_encode(buf: Buffer, exts: Dict,
-                           with_length: bool = True) -> None:
+                           with_length: bool = True,
+                           delta: bool = False) -> None:
         # The KVP block SHAPE is draft-independent, but the varint
         # FLAVOR is not: d18 encodes varints as vi64. Follow the target
         # buffer's flavor via push_vint rather than hardcoding the
         # standard encoder — mixing vi64 header fields with
         # standard-varint extensions produces a frame the peer rejects
         # (moxygen closes the session with PROTOCOL_VIOLATION).
+        #
+        # delta: d16+ §1.4.2/§1.4.3 KVP Type field is a DELTA from the
+        # previous Type (0 for the first). Deltas are unsigned, so types
+        # are emitted in ascending order; even/odd (value form) is a
+        # property of the ABSOLUTE type. d14 keeps absolute types.
         if exts is None or len(exts) == 0:
             if with_length:
                 buf.push_vint(0)
             return
 
         payload = Buffer(capacity=BUF_SIZE, vi64=buf.vi64)
-        for ext_id, ext_value in exts.items():
-            payload.push_vint(ext_id)
+        prev = 0
+        for ext_id, ext_value in (sorted(exts.items()) if delta
+                                  else exts.items()):
+            payload.push_vint(ext_id - prev if delta else ext_id)
+            if delta:
+                prev = ext_id
             if ext_id % 2 == 0:  # even extension types are simple var int
                 payload.push_vint(ext_value)
             else:
@@ -94,7 +104,8 @@ class MOQTMessage:
 
     @staticmethod
     def _extensions_decode(buf: Buffer, with_length: bool = True,
-                           buf_end: Optional[int] = None) -> Optional[Dict[int, Union[int, bytes]]]:
+                           buf_end: Optional[int] = None,
+                           delta: bool = False) -> Optional[Dict[int, Union[int, bytes]]]:
         # Two framing modes:
         #   with_length=True  — Object Extensions (§10.2.1.2): the
         #     extensions block is `{ Length, Headers }`. Bound is
@@ -151,6 +162,7 @@ class MOQTMessage:
                 return None
 
         exts = {}
+        prev = 0
         while buf.tell() < exts_end:
             kvp_start = buf.tell()
             # A short read here (BufferReadError from Buffer,
@@ -167,6 +179,11 @@ class MOQTMessage:
             # already finished parsing) without a noisy traceback.
             try:
                 ext_id = buf.pull_vint()
+                if delta:
+                    # d16+ §1.4.2: Type is a delta from the previous
+                    # absolute Type; value form follows the ABSOLUTE.
+                    ext_id += prev
+                    prev = ext_id
                 if ext_id % 2 == 0:
                     # even type → varint value (self-bounded by varint prefix)
                     ext_value = buf.pull_vint()

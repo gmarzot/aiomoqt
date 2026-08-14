@@ -88,7 +88,7 @@ def test_d18_datagram_status_roundtrip():
     assert out.object_id == 300
 
 
-# -- d18 extension varint flavor -------------------------------------
+# -- d18 extension varint codec --------------------------------------
 #
 # Regression: the extension KVP block was encoded with the STANDARD
 # varint encoder while the surrounding d18 header fields used vi64.
@@ -101,6 +101,7 @@ class _Prof:
     def __init__(self, vi64):
         self.vi64 = vi64
         self.draft = 18 if vi64 else 16
+        self.params_delta_coded = True  # KVP delta types, d16+ §1.4.2
 
 
 def test_d18_extensions_use_vi64_not_standard_varint():
@@ -116,14 +117,14 @@ def test_d18_extensions_use_vi64_not_standard_varint():
     raw18 = bytes(b18.data_slice(0, b18.tell()))
     assert raw16 != raw18, (
         "d18 datagram encodes identically to d16 — the extension block "
-        "is not following the vi64 flavor")
+        "is not following the vi64 codec")
     # standard varint tags a 8-byte value 0xc0..., vi64 uses 0xfe...
     assert raw16.hex().find("c0060a24181e4000") > 0, raw16.hex()
     assert raw18.hex().find("fe060a24181e4000") > 0, raw18.hex()
 
 
-@pytest.mark.parametrize("vi64", [False, True])
-def test_datagram_extension_round_trip_both_flavors(vi64):
+@pytest.mark.parametrize("vi64", [False, True], ids=["d16", "d18"])
+def test_datagram_extension_round_trip(vi64):
     from aiomoqt.messages.track import ObjectDatagram
     from aiomoqt.utils.buffer import Buffer
     prof = _Prof(vi64)

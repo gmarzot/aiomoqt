@@ -1118,6 +1118,7 @@ class _MOQTSessionMixin:
                         extensions_present=sg_header.extensions_present,
                         prev_object_id=sg_header._last_object_id,
                         vi64=sg_header._vi64,
+                        kvp_delta=sg_header._kvp_delta,
                     )
                     msg_header = obj
                     # Update delta tracking state
@@ -1191,7 +1192,7 @@ class _MOQTSessionMixin:
             return msg
         # Draft-14: ObjectDatagramStatus types 0x20-0x21 (status datagrams)
         elif 0x20 <= dgram_type <= 0x21:
-            msg = ObjectDatagramStatus.deserialize(buf, type_val=dgram_type)
+            msg = ObjectDatagramStatus.deserialize(buf, type_val=dgram_type, prof=self._profile)
             if msg is None:
                 error = f"datagram parsing failed at: {buf.tell()}"
                 logger.error(f"MOQT error: " + error)

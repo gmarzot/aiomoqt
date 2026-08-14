@@ -74,7 +74,7 @@ class Publish(MOQTMessage):
             exts = dict(self.track_extensions or {})
             if self.group_order is not None:
                 exts[0x22] = self.group_order
-            MOQTMessage._extensions_encode(payload, exts, with_length=False)
+            MOQTMessage._extensions_encode(payload, exts, with_length=False, delta=True)
         else:
             # d14: fixed fields
             payload.push_uint8(self.group_order)
@@ -128,7 +128,7 @@ class Publish(MOQTMessage):
             else:
                 content_exists = ContentExistsCode.NO_CONTENT
             track_extensions = MOQTMessage._extensions_decode(
-                buf, with_length=False, buf_end=buf_end)
+                buf, with_length=False, buf_end=buf_end, delta=True)
             if track_extensions is not None:
                 go_val = track_extensions.pop(0x22, None)
                 if go_val is not None:
