@@ -26,7 +26,7 @@ import time
 from typing import Callable
 
 from aiomoqt.context import profile_for
-from aiomoqt.messages.track import (
+from aiomoqt.messages.data import (
     ObjectHeader, SubgroupHeader, SUBGROUP_ID_EXPLICIT,
 )
 from aiomoqt.types import (

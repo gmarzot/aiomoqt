@@ -7,7 +7,7 @@ is actually taken. d14/d16 paths are covered by the existing suite.
 """
 import pytest
 from aiomoqt.utils.buffer import Buffer
-from aiomoqt.messages.track import (
+from aiomoqt.messages.data import (
     SubgroupHeader, ObjectHeader, ObjectDatagram)
 from aiomoqt.messages import ObjectStatus
 from aiomoqt.context import profile_for
@@ -105,7 +105,7 @@ class _Prof:
 
 
 def test_d18_extensions_use_vi64_not_standard_varint():
-    from aiomoqt.messages.track import ObjectDatagram
+    from aiomoqt.messages.data import ObjectDatagram
     big = 1_700_000_000_000_000        # a value whose encodings differ
     d16 = ObjectDatagram(track_alias=1, group_id=2, object_id=3,
                          extensions={0x20: big}, payload=b"xy")
@@ -125,7 +125,7 @@ def test_d18_extensions_use_vi64_not_standard_varint():
 
 @pytest.mark.parametrize("vi64", [False, True], ids=["d16", "d18"])
 def test_datagram_extension_round_trip(vi64):
-    from aiomoqt.messages.track import ObjectDatagram
+    from aiomoqt.messages.data import ObjectDatagram
     from aiomoqt.utils.buffer import Buffer
     prof = _Prof(vi64)
     big = 1_700_000_000_000_000

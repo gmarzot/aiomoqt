@@ -25,7 +25,7 @@ from aiomoqt.types import (
     MOQT_TIMESTAMP_EXT, MOQTRequestError,
 )
 from aiomoqt.messages import Fetch, Subscribe
-from aiomoqt.messages.track import FetchHeader, FetchObject, SubgroupHeader
+from aiomoqt.messages.data import FetchHeader, FetchObject, SubgroupHeader
 from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
 from aiomoqt.messages import FetchOk, FetchCancel

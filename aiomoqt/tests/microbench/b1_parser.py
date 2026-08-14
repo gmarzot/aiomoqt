@@ -25,7 +25,7 @@ import time
 from aiomoqt.context import profile_for
 from aiomoqt.types import parse_draft_spec
 from aiomoqt.messages.base import MOQTUnderflow
-from aiomoqt.messages.track import SubgroupHeader, ObjectHeader
+from aiomoqt.messages.data import SubgroupHeader, ObjectHeader
 from aiopquic.streamchain import StreamChain
 from aiomoqt.tests.microbench._bytestream import (
     make_subgroup_stream, chunked,

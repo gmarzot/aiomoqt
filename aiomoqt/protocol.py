@@ -911,6 +911,12 @@ class _MOQTSessionMixin:
         outstanding = self._subscriptions.get(request_id)
         is_fetch = (outstanding is not None
                     and any(isinstance(m, Fetch) for m in outstanding))
+        # d18 group-delta decode direction comes from the FETCH_OK's
+        # Group Order when one has arrived (default ascending).
+        for m in (outstanding or ()):
+            order = getattr(m, 'group_order', None)
+            if type(m).__name__ == 'FetchOk' and order:
+                header._group_order = int(order)
         if not is_fetch:
             raise MOQTStreamReject(
                 SessionCloseCode.PROTOCOL_VIOLATION,
@@ -1132,7 +1138,9 @@ class _MOQTSessionMixin:
 
                 elif isinstance(parser, FetchHeader):
                     fh: FetchHeader = parser
-                    msg_header = FetchObject.deserialize(buf, prior=fh._prior_obj, prof=self._profile)
+                    msg_header = FetchObject.deserialize(
+                        buf, prior=fh._prior_obj, prof=self._profile,
+                        group_order=fh._group_order)
                     # Track prior object for d16 delta-encoded references
                     if msg_header.end_of_range is None:
                         fh._prior_obj = msg_header

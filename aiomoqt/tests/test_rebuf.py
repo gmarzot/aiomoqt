@@ -8,7 +8,7 @@ stream queue, then verifying all objects parse correctly.
 import asyncio
 import time
 from aiomoqt.utils.buffer import Buffer, BufferReadError
-from aiomoqt.messages.track import SubgroupHeader, ObjectHeader
+from aiomoqt.messages.data import SubgroupHeader, ObjectHeader
 from aiomoqt.types import MOQT_TIMESTAMP_EXT, ObjectStatus
 import aiomoqt.types as types
 
@@ -68,7 +68,7 @@ async def parse_stream_chunks(chunks: list, expect_objects: int) -> dict:
     prev_object_id = None
     data_stream = {}  # mock _data_streams
 
-    from aiomoqt.messages.track import (
+    from aiomoqt.messages.data import (
         SubgroupHeader, ObjectHeader, FetchHeader,
         SUBGROUP_HEADER_BASE, SUBGROUP_ID_EXPLICIT, SUBGROUP_ID_FIRST_OBJ,
     )

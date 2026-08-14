@@ -21,7 +21,7 @@ from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
 from aiomoqt.track import PublishedTrack, SubscribedTrack
 from aiomoqt.types import ForwardingPreference, MOQTMessageType
-from aiomoqt.messages.track import ObjectDatagram
+from aiomoqt.messages.data import ObjectDatagram
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
 

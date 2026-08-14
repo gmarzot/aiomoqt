@@ -149,6 +149,93 @@ def test_cython_subgroup_object_kvp_delta(vi64):
     assert body.startswith(pyhead)
 
 
+# -- d18 FETCH data plane (§11.4.4): vi64 + group/object deltas -------
+
+from aiomoqt.messages.data import FetchHeader, FetchObject  # noqa: E402
+
+
+def test_d18_fetch_header_exact_bytes():
+    raw = bytes(FetchHeader(request_id=5).serialize(
+        profile_for(18)).data)
+    assert raw == bytes([0x05, 0x05])
+    rb = Buffer(data=raw, vi64=True)
+    assert rb.pull_vint() == 0x05
+    assert FetchHeader.deserialize(rb).request_id == 5
+
+
+def _fetch_chain_roundtrip(objs, group_order=0x1):
+    prof = profile_for(18)
+    prior = None
+    out = []
+    for o in objs:
+        raw = bytes(o.serialize(prof=prof, prior=prior,
+                                group_order=group_order).data)
+        rb = Buffer(data=raw, vi64=True)
+        got = FetchObject.deserialize(rb, prior=prior, prof=prof,
+                                      group_order=group_order)
+        out.append((raw, got))
+        prior = got
+    return out
+
+
+def test_d18_fetch_object_exact_bytes_and_chain():
+    objs = [
+        FetchObject(group_id=2, subgroup_id=0, object_id=0,
+                    publisher_priority=128,
+                    extensions={8: 1000}, payload=b"hi"),
+        FetchObject(group_id=2, subgroup_id=0, object_id=1,
+                    publisher_priority=128, payload=b"x"),
+        FetchObject(group_id=3, subgroup_id=0, object_id=0,
+                    publisher_priority=128, payload=b"y"),
+    ]
+    chain = _fetch_chain_roundtrip(objs)
+    # First object: flags GD|OD|PRI|PROPS = 0x3C, absolute ids,
+    # delta-typed vi64 properties, then len-prefixed payload.
+    assert chain[0][0] == bytes.fromhex("3c 02 00 80 03 08 83 e8 02 6869"
+                                        .replace(" ", ""))
+    # Second: everything inherited from prior — flags 0.
+    assert chain[1][0] == bytes.fromhex("000178")
+    # Third: next group (delta 0), object absolute again.
+    assert chain[2][0] == bytes.fromhex("0c00000179")
+    for want, (_, got) in zip(objs, chain):
+        assert (got.group_id, got.object_id) == (want.group_id,
+                                                 want.object_id)
+        assert got.payload == want.payload
+    assert chain[0][1].extensions == {8: 1000}
+
+
+def test_d18_fetch_descending_group_delta():
+    objs = [
+        FetchObject(group_id=5, object_id=0, publisher_priority=1,
+                    payload=b"a"),
+        FetchObject(group_id=3, object_id=0, publisher_priority=1,
+                    payload=b"b"),
+    ]
+    chain = _fetch_chain_roundtrip(objs, group_order=0x2)
+    # 5 -> 3 descending: wire delta = 5 - 3 - 1 = 1.
+    assert chain[1][0][1] == 1
+    assert chain[1][1].group_id == 3
+
+
+def test_d18_fetch_end_of_range():
+    prof = profile_for(18)
+    marker = FetchObject(group_id=7, object_id=9, end_of_range=0x8C,
+                         payload=b"")
+    raw = bytes(marker.serialize(prof=prof).data)
+    # 0x8C needs the 2-byte vi64 form.
+    assert raw == bytes([0x80, 0x8C, 0x07, 0x09])
+    rb = Buffer(data=raw, vi64=True)
+    got = FetchObject.deserialize(rb, prof=prof)
+    assert (got.end_of_range, got.group_id, got.object_id) == (0x8C, 7, 9)
+
+
+def test_d18_fetch_first_object_must_be_absolute():
+    prof = profile_for(18)
+    rb = Buffer(data=bytes([0x00, 0x01, 0x78]), vi64=True)
+    with pytest.raises(ValueError, match="first object"):
+        FetchObject.deserialize(rb, prior=None, prof=prof)
+
+
 # -- golden capture: moq-dev SUBSCRIBE_OK (d18) -----------------------
 
 # Full control message: type=0x04, len=0x0007, body 00 01 22 02 08 83 e8.

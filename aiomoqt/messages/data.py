@@ -432,21 +432,25 @@ class FetchHeader(MOQTMessage):
     # not on the wire. Declared as a slot field so per-instance
     # assignment works under slots=True.
     _prior_obj: Optional['FetchObject'] = field(default=None, init=False)
+    # d18 group-delta arithmetic is Group-Order-dependent (§11.4.4.1);
+    # resolved from the fetch's FETCH_OK at stream admission.
+    _group_order: int = field(default=0x1, init=False)
 
     def __post_init__(self):
         pass
 
-    def serialize(self) -> bytes:
-        buf = Buffer(capacity=BUF_SIZE)
-        buf.push_uint_var(DataStreamType.FETCH_HEADER)
-
-        buf.push_uint_var(self.request_id)
-
+    def serialize(self, prof: Optional[DraftProfile] = None) -> Buffer:
+        buf = Buffer(capacity=BUF_SIZE,
+                     vi64=prof is not None and prof.vi64)
+        buf.push_vint(DataStreamType.FETCH_HEADER)
+        buf.push_vint(self.request_id)
         return buf
 
     @classmethod
     def deserialize(cls, buf: Buffer) -> 'FetchHeader':
-        request_id = buf.pull_uint_var()
+        # The caller has already set the buffer's varint codec from the
+        # negotiated profile (the stream type was read with it).
+        request_id = buf.pull_vint()
         return cls(request_id=request_id)
 
 # Draft-16 FetchObject Serialization Flag bits (spec §10.4.4)
@@ -499,10 +503,88 @@ class FetchObject(MOQTMessage):
     # d16 only: end-of-range marker flag (0x8C or 0x10C)
     end_of_range: Optional[int] = None
 
-    def serialize(self, *, prof: DraftProfile) -> Buffer:
+    def serialize(self, *, prof: DraftProfile,
+                  prior: Optional['FetchObject'] = None,
+                  group_order: int = 0x1) -> Buffer:
+        if prof.vi64:
+            return self._serialize_d18(prior, group_order)
         if is_draft16_or_later(prof.draft):
             return self._serialize_d16()
         return self._serialize_d14()
+
+    def _serialize_d18(self, prior: Optional['FetchObject'],
+                       group_order: int) -> Buffer:
+        """d18 §11.4.4: vi64 codec; Group/Object carried as DELTAS.
+        First object carries absolute values; a group change resets the
+        Object ID to absolute; the group delta direction follows the
+        fetch's Group Order."""
+        buf = Buffer(capacity=BUF_SIZE + len(self.payload), vi64=True)
+        if self.end_of_range is not None:
+            buf.push_vint(self.end_of_range)
+            buf.push_vint(self.group_id)
+            buf.push_vint(self.object_id)
+            return buf
+
+        flags = 0
+        group_field = object_field = subgroup_field = None
+        if prior is None:
+            flags |= (FETCH_FLAG_GROUP_ID_PRESENT
+                      | FETCH_FLAG_OBJECT_ID_PRESENT
+                      | FETCH_FLAG_PRIORITY_PRESENT)
+            group_field = self.group_id
+            object_field = self.object_id
+        else:
+            if self.group_id != prior.group_id:
+                delta = (prior.group_id - self.group_id - 1
+                         if group_order == 0x2
+                         else self.group_id - prior.group_id - 1)
+                if delta < 0:
+                    raise ValueError(
+                        f"FetchObject: group {self.group_id} after "
+                        f"{prior.group_id} contradicts group_order="
+                        f"{group_order}")
+                flags |= (FETCH_FLAG_GROUP_ID_PRESENT
+                          | FETCH_FLAG_OBJECT_ID_PRESENT)
+                group_field = delta
+                object_field = self.object_id  # absolute on group change
+            elif self.object_id != prior.object_id + 1:
+                delta = self.object_id - prior.object_id
+                if delta < 0:
+                    raise ValueError(
+                        f"FetchObject: object {self.object_id} after "
+                        f"{prior.object_id} not in ascending order")
+                flags |= FETCH_FLAG_OBJECT_ID_PRESENT
+                object_field = delta
+            if self.publisher_priority != prior.publisher_priority:
+                flags |= FETCH_FLAG_PRIORITY_PRESENT
+        if self.subgroup_id == 0:
+            pass  # SG mode 0b00
+        elif prior is not None and self.subgroup_id == prior.subgroup_id:
+            flags |= FETCH_FLAG_SG_PRIOR
+        elif prior is not None and self.subgroup_id == prior.subgroup_id + 1:
+            flags |= FETCH_FLAG_SG_PRIOR_PLUS
+        else:
+            flags |= FETCH_FLAG_SG_PRESENT
+            subgroup_field = self.subgroup_id
+        has_props = bool(self.extensions)
+        if has_props:
+            flags |= FETCH_FLAG_EXTENSIONS_PRESENT
+
+        buf.push_vint(flags)
+        if group_field is not None:
+            buf.push_vint(group_field)
+        if subgroup_field is not None:
+            buf.push_vint(subgroup_field)
+        if object_field is not None:
+            buf.push_vint(object_field)
+        if flags & FETCH_FLAG_PRIORITY_PRESENT:
+            buf.push_uint8(self.publisher_priority)
+        if has_props:
+            MOQTMessage._extensions_encode(buf, self.extensions,
+                                           delta=True)
+        buf.push_vint(len(self.payload))
+        buf.push_bytes(self.payload)
+        return buf
 
     def _serialize_d14(self) -> Buffer:
         buf = Buffer(capacity=BUF_SIZE + len(self.payload))
@@ -561,10 +643,95 @@ class FetchObject(MOQTMessage):
     @classmethod
     def deserialize(cls, buf: Buffer,
                     prior: Optional['FetchObject'] = None,
-                    *, prof: DraftProfile) -> 'FetchObject':
+                    *, prof: DraftProfile,
+                    group_order: int = 0x1) -> 'FetchObject':
+        if prof.vi64:
+            return cls._deserialize_d18(buf, prior, group_order)
         if is_draft16_or_later(prof.draft):
             return cls._deserialize_d16(buf, prior)
         return cls._deserialize_d14(buf)
+
+    @classmethod
+    def _deserialize_d18(cls, buf: Buffer,
+                         prior: Optional['FetchObject'],
+                         group_order: int) -> 'FetchObject':
+        """d18 §11.4.4 delta decode. The buffer's varint codec is vi64
+        (set by the stream-type read). FETCH objects carry no Status
+        (§11.2.1.1); End-of-Range markers stand in for missing ranges."""
+        flags = buf.pull_vint()
+        if flags in (FETCH_FLAGS_END_NON_EXISTENT, FETCH_FLAGS_END_UNKNOWN):
+            group_id = buf.pull_vint()
+            object_id = buf.pull_vint()
+            return cls(group_id=group_id, object_id=object_id,
+                       end_of_range=flags, payload=b'')
+        if flags >= 0x80:
+            raise ValueError(
+                f"FetchObject: invalid serialization flags 0x{flags:x}")
+        if prior is None and (
+                not flags & FETCH_FLAG_GROUP_ID_PRESENT
+                or not flags & FETCH_FLAG_OBJECT_ID_PRESENT):
+            raise ValueError(
+                "FetchObject: first object on stream must carry Group ID "
+                "Delta and Object ID Delta (absolute values)")
+
+        group_changed = bool(flags & FETCH_FLAG_GROUP_ID_PRESENT)
+        if group_changed:
+            gd = buf.pull_vint()
+            if prior is None:
+                group_id = gd
+            elif group_order == 0x2:
+                group_id = prior.group_id - gd - 1
+                if group_id < 0:
+                    raise ValueError("FetchObject: group id underflow")
+            else:
+                group_id = prior.group_id + gd + 1
+        else:
+            group_id = prior.group_id
+
+        sg_mode = flags & FETCH_FLAG_SUBGROUP_MASK
+        if flags & FETCH_FLAG_DATAGRAM:
+            subgroup_id = 0
+        elif sg_mode == FETCH_FLAG_SG_ZERO:
+            subgroup_id = 0
+        elif sg_mode == FETCH_FLAG_SG_PRIOR:
+            subgroup_id = prior.subgroup_id if prior else 0
+        elif sg_mode == FETCH_FLAG_SG_PRIOR_PLUS:
+            subgroup_id = (prior.subgroup_id + 1) if prior else 1
+        else:
+            subgroup_id = buf.pull_vint()
+
+        if flags & FETCH_FLAG_OBJECT_ID_PRESENT:
+            od = buf.pull_vint()
+            # Absolute when the group changed (or first); else prior+delta.
+            object_id = od if (prior is None or group_changed) \
+                else prior.object_id + od
+        else:
+            object_id = prior.object_id + 1
+
+        if flags & FETCH_FLAG_PRIORITY_PRESENT:
+            publisher_priority = buf.pull_uint8()
+        elif prior is not None:
+            publisher_priority = prior.publisher_priority
+        else:
+            raise ValueError(
+                "FetchObject: first object references prior Priority")
+
+        if flags & FETCH_FLAG_EXTENSIONS_PRESENT:
+            extensions = MOQTMessage._extensions_decode(buf, delta=True)
+        else:
+            extensions = None
+
+        payload_len = buf.pull_vint()
+        payload = buf.pull_bytes(payload_len) if payload_len else b''
+        return cls(
+            group_id=group_id,
+            subgroup_id=subgroup_id,
+            object_id=object_id,
+            publisher_priority=publisher_priority,
+            extensions=extensions,
+            status=ObjectStatus.NORMAL,
+            payload=payload,
+        )
 
     @classmethod
     def _deserialize_d14(cls, buf: Buffer) -> 'FetchObject':

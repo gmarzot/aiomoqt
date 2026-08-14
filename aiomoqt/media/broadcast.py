@@ -157,11 +157,13 @@ class MediaPublisher:
         if track is not self.catalog_track:
             return
         sid = await session.open_uni_stream()
+        prof = session._profile
         session.stream_write(
-            sid, FetchHeader(request_id=msg.request_id).serialize().data)
+            sid,
+            FetchHeader(request_id=msg.request_id).serialize(prof).data)
         obj = FetchObject(
             payload=self.catalog_track.catalog.to_json().encode())
-        session.stream_write(sid, obj.serialize(prof=session._profile).data,
+        session.stream_write(sid, obj.serialize(prof=prof).data,
                              end_stream=True)
 
     async def _demux_update(self, session, msg) -> None:

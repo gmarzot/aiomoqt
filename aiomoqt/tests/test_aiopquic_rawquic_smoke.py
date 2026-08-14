@@ -17,7 +17,7 @@ from aiomoqt.types import (
     MOQT_VERSION_DRAFT16,
 )
 from aiomoqt.messages import Subscribe
-from aiomoqt.messages.track import SubgroupHeader
+from aiomoqt.messages.data import SubgroupHeader
 from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
 
