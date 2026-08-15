@@ -185,6 +185,7 @@ class LocTrackPublisher(PublishedTrack):
                                              object_id=obj_id)
                     await session.stream_write_drain(stream_id, buf.data)
 
+                self._largest = (group_id, obj_id)
                 obj_id += 1
                 self._total_sent += 1
                 self._total_bytes += len(frame.payload)

@@ -129,6 +129,10 @@ class PublishedTrack(Track):
         self.auth_token = auth_token
         self._subscriber_event = asyncio.Event()
         self._generating = False
+        # (group_id, object_id) of the newest object sent; None until
+        # the first object exists. Drives ContentExists/Largest Location
+        # in SUBSCRIBE_OK.
+        self._largest = None
         # Terminal flag: set once PUBLISH_DONE has been sent. Generation
         # is then permanently refused — a late REQUEST_UPDATE / SUBSCRIBE
         # from the relay must NOT restart object production after we have
@@ -303,7 +307,14 @@ class PublishedTrack(Track):
 
     async def _on_subscribe(self, session, msg):
         """Relay forwarded a subscriber's SUBSCRIBE."""
-        ok = session.subscribe_ok(request_msg=msg)
+        # Report real content state: a subscriber that sees
+        # ContentExists=0 rightly skips its joining FETCH (mlmsub does).
+        kw = {}
+        if self._largest is not None:
+            kw = dict(content_exists=1,
+                      largest_group_id=self._largest[0],
+                      largest_object_id=self._largest[1])
+        ok = session.subscribe_ok(request_msg=msg, **kw)
         self.track_alias = ok.track_alias
         self._subscribe_request_id = msg.request_id
         await self._start_generating(session, "SUBSCRIBE")

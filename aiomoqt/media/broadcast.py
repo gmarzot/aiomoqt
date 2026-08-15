@@ -32,6 +32,10 @@ class CatalogTrackPublisher(PublishedTrack):
     def __init__(self, session, namespace: str, catalog: Catalog):
         super().__init__(session, namespace, CATALOG_TRACK_NAME)
         self.catalog = catalog
+        # The catalog track has content by construction: the current
+        # independent catalog is emitted as (0, 0) on first demand, so
+        # SUBSCRIBE_OK must say ContentExists even before generation.
+        self._largest = (0, 0)
         self._updates: asyncio.Queue = asyncio.Queue()
 
     async def publish_catalog(self, catalog: Catalog) -> None:
@@ -67,6 +71,7 @@ class CatalogTrackPublisher(PublishedTrack):
                 session.stream_write(stream_id, header.serialize().data)
             buf = header.next_object(payload=payload)
             await session.stream_write_drain(stream_id, buf.data)
+            self._largest = (header.group_id, header._last_object_id)
             self._total_sent += 1
 
         # A joining subscriber needs a complete catalog first (§11.2).
@@ -170,8 +175,11 @@ class MediaPublisher:
         from ..messages import RequestUpdate
         # d16 REQUEST_UPDATE references the original request via
         # existing_request_id (its request_id is the update's own);
-        # d14 SUBSCRIBE_UPDATE keys on request_id directly.
-        rid = (msg.existing_request_id if isinstance(msg, RequestUpdate)
+        # d18 dropped that field — its request_id IS the reference —
+        # and d14 SUBSCRIBE_UPDATE keys on request_id directly.
+        rid = (msg.existing_request_id
+               if isinstance(msg, RequestUpdate)
+               and msg.existing_request_id is not None
                else msg.request_id)
         track = self._track_for_request(rid)
         if track is None:

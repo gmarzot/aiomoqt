@@ -79,6 +79,7 @@ class _Writers:
         self.aac = None
         self.counts = {}
         self.pipe_closed = False
+        self.closed = False
 
     def _pipe(self, data: bytes) -> None:
         try:
@@ -88,6 +89,8 @@ class _Writers:
             self.pipe_closed = True
 
     def on_frame(self, name, frame, group_id, object_id):
+        if self.closed:
+            return  # late frame during teardown
         self.counts[name] = self.counts.get(name, 0) + 1
         if self.counts[name] <= self.inspect:
             import time as _t
@@ -155,6 +158,7 @@ class _Writers:
             self.wav.writeframes(frame.payload)
 
     def close(self):
+        self.closed = True
         if self.video:
             self.video.close()
         if self.ivf:
