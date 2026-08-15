@@ -236,6 +236,70 @@ def test_d18_fetch_first_object_must_be_absolute():
         FetchObject.deserialize(rb, prior=None, prof=prof)
 
 
+# -- d18 SUBSCRIPTION_FILTER internals (§5.1.2) -----------------------
+#
+# Filter values follow the negotiated varint codec (vi64 on d18 —
+# cross-checked against moxygen MoQFramer.writeSubscriptionFilter,
+# whose version-aware writeVarint uses the MoQ varint on d17+), and
+# d18 carries End Group as end - start (moxygen: error when negative;
+# parse reconstructs the absolute).
+
+from aiomoqt.messages.subscribe import Subscribe  # noqa: E402
+
+
+def test_d18_filter_absolute_start_uses_vi64():
+    # AbsoluteStart (3) with group/object >= 64: vi64 encodes 100 as
+    # one byte (0x64), RFC9000 as two (0x4064) — the wire images differ.
+    p18 = profile_for(18)
+    m = Subscribe(request_id=0, track_namespace=(b"n",), track_name=b"t",
+                  filter_type=3, start_group=100, start_object=200)
+    raw18 = bytes(m.serialize(prof=p18).data)
+    assert bytes([0x03, 0x64, 0x80, 0xC8]) in raw18  # vi64 100, 200
+    assert bytes([0x03, 0x40, 0x64]) not in raw18    # RFC9000 100
+    got = Subscribe.deserialize(
+        Buffer(data=raw18[_subscribe_body_off(raw18)::], vi64=True),
+        prof=p18, buf_end=len(raw18) - _subscribe_body_off(raw18))
+    assert (got.filter_type, got.start_group, got.start_object) == (
+        3, 100, 200)
+
+
+def test_d18_filter_absolute_range_end_group_delta():
+    p18 = profile_for(18)
+    m = Subscribe(request_id=0, track_namespace=(b"n",), track_name=b"t",
+                  filter_type=4, start_group=100, start_object=0,
+                  end_group=110)
+    raw18 = bytes(m.serialize(prof=p18).data)
+    # type 4, start 100/0, then END GROUP AS DELTA: 110-100 = 10 (0x0A)
+    assert bytes([0x04, 0x64, 0x00, 0x0A]) in raw18
+    got = Subscribe.deserialize(
+        Buffer(data=raw18[_subscribe_body_off(raw18):], vi64=True),
+        prof=p18, buf_end=len(raw18) - _subscribe_body_off(raw18))
+    assert got.end_group == 110  # absolute reconstructed
+    with pytest.raises(ValueError, match="end_group"):
+        Subscribe(request_id=0, track_namespace=(b"n",), track_name=b"t",
+                  filter_type=4, start_group=100,
+                  end_group=90).serialize(prof=p18)
+
+
+def test_d16_filter_unchanged_rfc9000_absolute():
+    p16 = profile_for(16)
+    m = Subscribe(request_id=0, track_namespace=(b"n",), track_name=b"t",
+                  filter_type=4, start_group=100, start_object=200,
+                  end_group=110)
+    raw16 = bytes(m.serialize(prof=p16).data)
+    # RFC9000 two-byte ints, end group ABSOLUTE: 0x406E = 110.
+    assert bytes([0x04, 0x40, 0x64, 0x40, 0xC8, 0x40, 0x6E]) in raw16
+    got = Subscribe.deserialize(
+        Buffer(data=raw16[_subscribe_body_off(raw16):]),
+        prof=p16, buf_end=len(raw16) - _subscribe_body_off(raw16))
+    assert (got.start_group, got.end_group) == (100, 110)
+
+
+def _subscribe_body_off(raw: bytes) -> int:
+    # Control frame: type varint (1B here) + u16 length prefix.
+    return 3
+
+
 # -- golden capture: moq-dev SUBSCRIBE_OK (d18) -----------------------
 
 # Full control message: type=0x04, len=0x0007, body 00 01 22 02 08 83 e8.

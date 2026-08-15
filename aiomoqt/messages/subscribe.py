@@ -55,13 +55,23 @@ class TrackStatus(MOQTMessage):
             if self.forward is not None:
                 params[ParamType.FORWARD] = self.forward
             if self.filter_type is not None:
-                fbuf = Buffer(capacity=64)
-                fbuf.push_uint_var(self.filter_type)
+                # Filter internals follow the negotiated varint codec
+                # (vi64 on d18); d18 carries End Group as a delta from
+                # Start Group (moxygen MoQFramer: end - start, >= 0).
+                fbuf = Buffer(capacity=64, vi64=prof.vi64)
+                fbuf.push_vint(self.filter_type)
                 if self.filter_type in (3, 4):
-                    fbuf.push_uint_var(self.start_group or 0)
-                    fbuf.push_uint_var(self.start_object or 0)
+                    fbuf.push_vint(self.start_group or 0)
+                    fbuf.push_vint(self.start_object or 0)
                 if self.filter_type == 4:
-                    fbuf.push_uint_var(self.end_group or 0)
+                    end = self.end_group or 0
+                    if prof.vi64:
+                        start = self.start_group or 0
+                        if end < start:
+                            raise ValueError(
+                                f"end_group {end} < start_group {start}")
+                        end -= start
+                    fbuf.push_vint(end)
                 params[ParamType.SUBSCRIPTION_FILTER] = fbuf.data_slice(0, fbuf.tell())
             MOQTMessage._serialize_params(payload, params, prof=prof)
         else:
@@ -107,13 +117,16 @@ class TrackStatus(MOQTMessage):
             forward = params.pop(ParamType.FORWARD, None)
             filter_raw = params.pop(ParamType.SUBSCRIPTION_FILTER, None)
             if filter_raw is not None:
-                fbuf = Buffer(data=filter_raw)
+                fbuf = Buffer(data=filter_raw, vi64=prof.vi64)
                 filter_type = fbuf.pull_vint()
                 if filter_type in (3, 4):
                     start_group = fbuf.pull_vint()
                     start_object = fbuf.pull_vint()
                 if filter_type == 4:
                     end_group = fbuf.pull_vint()
+                    if prof.vi64:
+                        # d18: End Group arrives as a delta from Start.
+                        end_group += start_group or 0
         else:
             priority = buf.pull_uint8()
             group_order = buf.pull_uint8()
@@ -298,13 +311,23 @@ class Subscribe(MOQTMessage):
             if self.filter_type is not None:
                 # SUBSCRIPTION_FILTER param (0x21) is odd → bytes value
                 # Encode: filter_type varint [+ start_group + start_obj [+ end_group]]
-                fbuf = Buffer(capacity=64)
-                fbuf.push_uint_var(self.filter_type)
+                # Filter internals follow the negotiated varint codec
+                # (vi64 on d18); d18 carries End Group as a delta from
+                # Start Group (moxygen MoQFramer: end - start, >= 0).
+                fbuf = Buffer(capacity=64, vi64=prof.vi64)
+                fbuf.push_vint(self.filter_type)
                 if self.filter_type in (3, 4):
-                    fbuf.push_uint_var(self.start_group or 0)
-                    fbuf.push_uint_var(self.start_object or 0)
+                    fbuf.push_vint(self.start_group or 0)
+                    fbuf.push_vint(self.start_object or 0)
                 if self.filter_type == 4:
-                    fbuf.push_uint_var(self.end_group or 0)
+                    end = self.end_group or 0
+                    if prof.vi64:
+                        start = self.start_group or 0
+                        if end < start:
+                            raise ValueError(
+                                f"end_group {end} < start_group {start}")
+                        end -= start
+                    fbuf.push_vint(end)
                 params[ParamType.SUBSCRIPTION_FILTER] = fbuf.data_slice(0, fbuf.tell())
             MOQTMessage._serialize_params(payload, params, prof=prof)
         else:
@@ -361,13 +384,16 @@ class Subscribe(MOQTMessage):
             forward = params.pop(ParamType.FORWARD, None)
             filter_raw = params.pop(ParamType.SUBSCRIPTION_FILTER, None)
             if filter_raw is not None:
-                fbuf = Buffer(data=filter_raw)
+                fbuf = Buffer(data=filter_raw, vi64=prof.vi64)
                 filter_type = fbuf.pull_vint()
                 if filter_type in (3, 4):
                     start_group = fbuf.pull_vint()
                     start_object = fbuf.pull_vint()
                 if filter_type == 4:
                     end_group = fbuf.pull_vint()
+                    if prof.vi64:
+                        # d18: End Group arrives as a delta from Start.
+                        end_group += start_group or 0
         else:
             # d14: fixed fields on wire
             priority = buf.pull_uint8()
