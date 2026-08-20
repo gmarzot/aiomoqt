@@ -81,3 +81,33 @@ async def test_partial_configuration_merges_alpn():
                 "moqt-18"]
     finally:
         server.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+async def test_peer_transport_parameters_and_cids(use_quic):
+    # Probe-API surface (openmoq asks #1/#2): the peer's negotiated
+    # transport parameters and the connection IDs, in-memory.
+    port = _BASE_PORT + (5 if use_quic else 6)
+    server = await _server(port, use_quic=use_quic).serve()
+    try:
+        client = MOQTClient("localhost", port, path="/",
+                            use_quic=use_quic, verify_tls=False,
+                            supported_drafts=18)
+        async with client.connect() as session:
+            await session.client_session_init()
+            tp = session.peer_transport_parameters
+            assert tp is not None
+            assert tp['max_datagram_frame_size'] == 64 * 1024
+            assert tp['initial_max_data'] > 0
+            assert tp['max_idle_timeout'] > 0
+            local = (session._quic.local_transport_parameters
+                     if use_quic else None)
+            if local is not None:
+                assert local['max_datagram_frame_size'] == 64 * 1024
+            cids = session.connection_ids
+            assert cids is not None
+            assert isinstance(cids['remote'], bytes) and cids['remote']
+            assert isinstance(cids['local'], bytes)
+    finally:
+        server.close()

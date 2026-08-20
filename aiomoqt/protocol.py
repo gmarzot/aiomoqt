@@ -2006,6 +2006,35 @@ class _MOQTSessionMixin:
         logger.debug(f"QUIC send: datagram message: {buf.capacity} bytes")
         return self._quic.send_datagram_frame(data=buf.data)
 
+    @property
+    def peer_transport_parameters(self):
+        """The peer's negotiated QUIC transport parameters as a dict
+        (None before the handshake). Probe/fingerprinting surface —
+        the values live in picoquic; no qlog round trip. Unknown/GREASE
+        ids and wire order are not preserved (struct parse)."""
+        if not self._is_wt:
+            q = self._quic
+            return (q.peer_transport_parameters
+                    if q is not None else None)
+        tr = getattr(self, '_transport', None)
+        ptr = getattr(self, 'cnx_ptr', 0)
+        if tr is not None and ptr:
+            return tr.transport_parameters(ptr)
+        return None
+
+    @property
+    def connection_ids(self):
+        """{'local', 'remote', 'initial'} connection IDs as bytes, or
+        None. QUIC-LB / routable-CID detection."""
+        if not self._is_wt:
+            q = self._quic
+            return q.connection_ids if q is not None else None
+        tr = getattr(self, '_transport', None)
+        ptr = getattr(self, 'cnx_ptr', 0)
+        if tr is not None and ptr:
+            return tr.connection_ids(ptr)
+        return None
+
     def datagram_max_payload(self) -> int:
         """Usable per-datagram payload ceiling on this session's
         transport: min(local TP, peer TP, guaranteed MTU floor). 0 =
