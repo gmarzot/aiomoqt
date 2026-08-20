@@ -98,7 +98,7 @@ async def probe_version(host, port, path, use_quic, supported_drafts,
                 # negotiated draft to its IETF version code here.
                 result["version_hex"] = f"0x{moqt_version_from_draft(draft):08x}"
                 result["draft"] = f"draft-{draft}"
-                result["alpn"] = client.configuration.alpn_protocols[0]
+                result["alpn"] = client.effective_configuration.alpn_protocols[0]
                 # Capture setup params from server
                 # Clean close
                 session.close()

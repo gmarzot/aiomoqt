@@ -34,6 +34,7 @@ class MOQTClient(MOQTPeer):
         tx_max_queued_bytes: Optional[int] = None,
         keep_alive_interval: Optional[float] = None,
         socket_buffer_size: Optional[int] = None,
+        qlog_dir: Optional[str] = None,
     ):
         super().__init__(libquicr_compat=libquicr_compat,
                          tx_max_inflight_bytes=tx_max_inflight_bytes)
@@ -63,6 +64,10 @@ class MOQTClient(MOQTPeer):
         self.supported_drafts = normalize_supported_drafts(supported_drafts)
         self.keylog_filename = keylog_filename
         self.configuration = configuration
+        self.qlog_dir = qlog_dir
+        # The config a connection actually ran with — the caller's, or
+        # the one built here — assigned at connect() on either path.
+        self.effective_configuration: Optional[QuicConfiguration] = None
         self.congestion_control_algorithm = congestion_control_algorithm
         # Aggregate TX gate budget (QuicConfiguration.tx_max_queued_bytes):
         # bounds publisher run-ahead across ALL streams; steady-state
@@ -94,6 +99,15 @@ class MOQTClient(MOQTPeer):
                 cfg = self.configuration
                 if cfg.server_name is None:
                     cfg.server_name = self.host
+                # Merge, don't trust blindly: a caller config that only
+                # sets logging fields previously lost the ALPN/draft
+                # wiring and the handshake died with an opaque code 0.
+                if cfg.alpn_protocols is None:
+                    cfg.alpn_protocols = [
+                        moqt_alpn_for_version(v)
+                        for v in self.supported_drafts]
+                if cfg.secrets_log_file is None and self.keylog_filename:
+                    cfg.secrets_log_file = self.keylog_filename
             else:
                 # Offer one ALPN per supported draft, newest first, so a
                 # d16-only peer negotiates moqt-16 and a d14 peer falls
@@ -113,6 +127,8 @@ class MOQTClient(MOQTPeer):
                     server_name=self.host,
                     secrets_log_file=self.keylog_filename,
                 )
+            if self.qlog_dir is not None and cfg.qlog_dir is None:
+                cfg.qlog_dir = self.qlog_dir
             # None defers to the aiopquic default (bbr1).
             if self.congestion_control_algorithm is not None:
                 cfg.congestion_control_algorithm = (
@@ -127,6 +143,7 @@ class MOQTClient(MOQTPeer):
             # quic_debug_log not wired on raw-QUIC path yet: aiopquic
             # 0.3.1's `connect()` helper doesn't forward debug_log to
             # TransportContext.start. Tracked for aiopquic 0.3.2.
+            self.effective_configuration = cfg
             if self.quic_debug_log is not None:
                 logger.warning(
                     "MOQT: quic_debug_log requested for raw-QUIC client; "
@@ -153,6 +170,9 @@ class MOQTClient(MOQTPeer):
                 max_data=2**24, max_stream_data=2**24,
                 max_datagram_frame_size=64 * 1024,
             )
+        if self.qlog_dir is not None and wt_cfg.qlog_dir is None:
+            wt_cfg.qlog_dir = self.qlog_dir
+        self.effective_configuration = wt_cfg
         # None defers to the aiopquic default (bbr1).
         if self.congestion_control_algorithm is not None:
             wt_cfg.congestion_control_algorithm = (
