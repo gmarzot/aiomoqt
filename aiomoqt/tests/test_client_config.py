@@ -111,3 +111,55 @@ async def test_peer_transport_parameters_and_cids(use_quic):
             assert isinstance(cids['local'], bytes)
     finally:
         server.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+async def test_handshake_info(use_quic):
+    # Probe ask #6: structured handshake result.
+    port = _BASE_PORT + (7 if use_quic else 8)
+    server = await _server(port, use_quic=use_quic).serve()
+    try:
+        client = MOQTClient("localhost", port, path="/",
+                            use_quic=use_quic, verify_tls=False,
+                            supported_drafts=18)
+        async with client.connect() as session:
+            await session.client_session_init()
+            hi = session.handshake_info
+            assert hi['draft'] == 18
+            assert hi['wire_version'].startswith('0xff00')
+            assert hi['transport'] == ('quic' if use_quic
+                                       else 'webtransport')
+            assert hi['time_to_established_ms'] > 0
+            assert hi['peer_transport_parameters'] is not None
+            assert hi['connection_ids'] is not None
+            if use_quic:
+                assert hi['alpn'] == 'moqt-18'
+            else:
+                assert hi['wt_protocol'] == 'moqt-18'
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_qlog_paths_and_loader(tmp_path):
+    # Probe ask #7: session knows its qlog files; aiopquic.qlog.load
+    # parses picoquic's real output (either JSON or JSON-SEQ form).
+    from aiopquic import qlog as aioqlog
+    port = _BASE_PORT + 9
+    server = await _server(port).serve()
+    try:
+        client = MOQTClient("localhost", port, path="/", use_quic=True,
+                            verify_tls=False, supported_drafts=18,
+                            qlog_dir=str(tmp_path))
+        async with client.connect() as session:
+            await session.client_session_init()
+            await asyncio.sleep(0.2)
+            paths = session.qlog_paths
+            assert paths, (list(tmp_path.iterdir()),
+                           session.connection_ids)
+    finally:
+        server.close()
+    events = aioqlog.load(paths[0])
+    assert events
+    assert any('parameters_set' in str(e) for e in events)

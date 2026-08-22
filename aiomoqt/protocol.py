@@ -273,6 +273,8 @@ class _MOQTSessionMixin:
         self._bidi_streams: Dict[int, int] = {}  # map request_id to bidi stream_id (d16)
         self._bidi_stream_requests: Dict[int, int] = {}  # map bidi stream_id to request_id (d16)
         self._track_aliases: Dict[int, int] = {}  # map alias to subscription_id
+        # Set when client_session_init completes (ms, monotonic delta).
+        self._established_ms: Optional[float] = None
         # Per-track object delivery keyed by track_alias; falls back to
         # the session-global on_object_received when no entry matches.
         self._object_handlers: Dict[int, Callable] = {}
@@ -1634,6 +1636,7 @@ class _MOQTSessionMixin:
         session-level auth (Token-wrapped on the wire)."""
 
         use_quic = not self._is_wt
+        _t0 = time.monotonic()
         params = {}
         if use_quic:
             # Raw QUIC flow. _wt_session_setup is pre-resolved in __init__.
@@ -1737,9 +1740,8 @@ class _MOQTSessionMixin:
             logger.error(f"MOQT error: session setup failed: {session_setup}")
             raise MOQTException(*self._close_err)
         
+        self._established_ms = (time.monotonic() - _t0) * 1000.0
         logger.info(f"MOQT session: setup complete: {session_setup}")
-
-
 
     async def open_uni_stream(self) -> int:
         """Open a unidirectional data stream. Returns the stream ID."""
@@ -2005,6 +2007,61 @@ class _MOQTSessionMixin:
                                 "QUIC not initialized")
         logger.debug(f"QUIC send: datagram message: {buf.capacity} bytes")
         return self._quic.send_datagram_frame(data=buf.data)
+
+    @property
+    def handshake_info(self):
+        """Structured handshake result (probe ask #6): negotiated
+        draft/version/ALPN, transport, time-to-established, current
+        path RTT (µs), peer transport parameters, connection IDs.
+        Fields are None until the corresponding state exists."""
+        draft = getattr(self, 'negotiated_draft', None)
+        if not self._is_wt:
+            q = self._quic
+            alpn = q._negotiated_alpn(0) if q is not None else None
+            pq = q.path_quality() if q is not None else {}
+        else:
+            alpn = "h3"
+            tr = getattr(self, '_transport', None)
+            ptr = getattr(self, 'cnx_ptr', 0)
+            pq = tr.path_quality(ptr) if tr is not None and ptr else {}
+        return {
+            'transport': 'webtransport' if self._is_wt else 'quic',
+            'draft': draft,
+            'wire_version': (f"0x{moqt_version_from_draft(draft):08x}"
+                             if draft else None),
+            'alpn': alpn,
+            'wt_protocol': (f"moqt-{draft}"
+                            if self._is_wt and draft and draft >= 15
+                            else None),
+            'time_to_established_ms': self._established_ms,
+            'rtt_us': (pq or {}).get('rtt'),
+            'peer_transport_parameters': self.peer_transport_parameters,
+            'connection_ids': self.connection_ids,
+        }
+
+    @property
+    def qlog_paths(self):
+        """qlog file(s) for this connection (probe ask #7): matches the
+        session's connection-ID hex names under the effective qlog_dir
+        (or AIOPQUIC_QLOG_DIR). Empty list when qlog is off or nothing
+        has been written yet."""
+        import os as _os
+        from pathlib import Path as _Path
+        cfg = getattr(getattr(self, '_session', None),
+                      'effective_configuration', None)
+        qdir = (getattr(cfg, 'qlog_dir', None)
+                or _os.environ.get('AIOPQUIC_QLOG_DIR'))
+        if not qdir:
+            return []
+        cids = self.connection_ids or {}
+        hexes = {v.hex() for v in cids.values()
+                 if isinstance(v, bytes) and v}
+        out = []
+        for f in _Path(qdir).glob('*.*qlog'):
+            stem = f.stem.lower()
+            if any(h and h in stem for h in hexes):
+                out.append(str(f))
+        return sorted(out)
 
     @property
     def peer_transport_parameters(self):
