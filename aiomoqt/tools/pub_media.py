@@ -265,7 +265,17 @@ async def run(args):
                 gap_us=int(1e6 / (video.fps or 30))))
         await pub.start()
         print("  publishing...")
-        await asyncio.gather(*feeders)
+        feed = asyncio.ensure_future(asyncio.gather(*feeders))
+        closed = asyncio.ensure_future(session.async_closed())
+        done, _ = await asyncio.wait({feed, closed},
+                                     return_when=asyncio.FIRST_COMPLETED)
+        if closed in done and not feed.done():
+            code, reason = getattr(session, '_close_err', None) or ('?', '')
+            print(f"  error: session closed: code={code} reason='{reason}'")
+            feed.cancel()
+            raise SystemExit(1)
+        closed.cancel()
+        await feed
         await pub.catalog_track.finish()
         await asyncio.sleep(1.0)  # drain tail before teardown
     print("  done")

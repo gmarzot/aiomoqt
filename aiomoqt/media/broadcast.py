@@ -114,9 +114,13 @@ class MediaPublisher:
 
     async def start(self) -> None:
         """PUBLISH every track (catalog first, §11.2), then install the
-        session-level demux over PublishedTrack's per-track handlers."""
+        session-level demux over PublishedTrack's per-track handlers.
+
+        forward=1: a live broadcast generates immediately — waiting for
+        a subscriber to flip the forward state leaves the session idle
+        and relays drop it."""
         for track in self._by_name.values():
-            await track.publish(publish_track=True)
+            await track.publish(publish_track=True, forward=1)
         self.session.register_handler(
             MOQTMessageType.SUBSCRIBE, self._demux_subscribe)
         self.session.register_handler(
