@@ -5,8 +5,9 @@ import struct
 import pytest
 
 from aiomoqt.media.sources import (
-    Mp4AvcReader, Mp4Error, annexb_is_keyframe, pcm_tone_frames,
-    split_annexb,
+    AnnexBAssembler, Mp4AvcReader, Mp4Error, annexb_is_keyframe,
+    avcc_codec_string, avcc_from_sps_pps, pcm_tone_frames,
+    split_annexb, sps_dimensions,
 )
 
 
@@ -137,3 +138,58 @@ def test_split_annexb_and_keyframe():
     assert annexb_is_keyframe(au_key)
     assert not annexb_is_keyframe(au_p)
     assert split_annexb(b'') == []
+
+
+# -- Annex-B live ingest ----------------------------------------------
+
+# SPS/PPS from a real 640x360 baseline encode (BBB) — exercises the
+# emulation-prevention and frame-cropping paths.
+_SPS = bytes.fromhex('6742c01eda0280bfe5c04400000300040000030000c03c58ba80')
+_PPS = bytes.fromhex('68ce05cb20')
+
+
+def test_sps_dimensions_and_avcc():
+    assert sps_dimensions(_SPS) == (640, 360)
+    avcc = avcc_from_sps_pps(_SPS, _PPS)
+    assert avcc_codec_string(avcc) == 'avc1.42C01E'
+    expected = (bytes([1, 0x42, 0xC0, 0x1E, 0xFF, 0xE1])
+                + struct.pack('>H', len(_SPS)) + _SPS
+                + b'\x01' + struct.pack('>H', len(_PPS)) + _PPS)
+    assert avcc == expected
+
+
+def test_annexb_assembler():
+    idr = b'\x65\x88\x84\x00\xff'
+    p1 = b'\x41\x9a\x02\xff'
+    p1b = b'\x41\x40\x02'  # first_mb_in_slice != 0: same access unit
+    sc = b'\x00\x00\x00\x01'
+    stream = (sc + _SPS + sc + _PPS + sc + idr + sc + p1
+              + b'\x00\x00\x01' + p1b + sc + idr)
+    asm = AnnexBAssembler()
+    frames = []
+    for i in range(0, len(stream), 7):  # partial-NAL chunking
+        frames += asm.feed(stream[i:i + 7])
+    frames += asm.close()
+    assert asm.sps == _SPS and asm.pps == _PPS
+    assert asm.config == avcc_from_sps_pps(_SPS, _PPS)
+    assert [k for _, k in frames] == [True, False, True]
+    assert frames[0][0] == struct.pack('>I', len(idr)) + idr
+    assert frames[1][0] == (struct.pack('>I', len(p1)) + p1
+                            + struct.pack('>I', len(p1b)) + p1b)
+
+
+def test_annexb_assembler_aud_and_sei():
+    idr = b'\x65\x88\x84'
+    sei = b'\x06\x05\x04'
+    aud = b'\x09\xf0'
+    sc = b'\x00\x00\x00\x01'
+    stream = (sc + _SPS + sc + _PPS
+              + sc + aud + sc + sei + sc + idr
+              + sc + aud + sc + idr)
+    asm = AnnexBAssembler()
+    frames = asm.feed(stream) + asm.close()
+    assert len(frames) == 2
+    # SEI rides with its access unit; AUDs are dropped
+    assert frames[0][0] == (struct.pack('>I', len(sei)) + sei
+                            + struct.pack('>I', len(idr)) + idr)
+    assert frames[0][1] and frames[1][1]

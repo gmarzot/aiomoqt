@@ -369,6 +369,198 @@ def avcc_codec_string(avcc: bytes) -> str:
     return f"avc1.{avcc[1]:02X}{avcc[2]:02X}{avcc[3]:02X}"
 
 
+def avcc_from_sps_pps(sps: bytes, pps: bytes) -> bytes:
+    """Build an avcC record from raw SPS/PPS NAL units."""
+    return (bytes([1, sps[1], sps[2], sps[3], 0xFF, 0xE1])
+            + struct.pack('>H', len(sps)) + sps
+            + b'\x01' + struct.pack('>H', len(pps)) + pps)
+
+
+def _rbsp(nal: bytes) -> bytes:
+    """NAL payload with emulation-prevention bytes removed."""
+    return nal.replace(b'\x00\x00\x03', b'\x00\x00')
+
+
+class _BitReader:
+    def __init__(self, data: bytes):
+        self._d = data
+        self._pos = 0
+
+    def u(self, n: int) -> int:
+        v = 0
+        for _ in range(n):
+            byte = self._d[self._pos >> 3]
+            v = (v << 1) | ((byte >> (7 - (self._pos & 7))) & 1)
+            self._pos += 1
+        return v
+
+    def ue(self) -> int:
+        zeros = 0
+        while self.u(1) == 0:
+            zeros += 1
+        return (1 << zeros) - 1 + (self.u(zeros) if zeros else 0)
+
+    def se(self) -> int:
+        k = self.ue()
+        return (k + 1) // 2 if k & 1 else -(k // 2)
+
+
+def _skip_scaling_list(r: _BitReader, size: int) -> None:
+    nxt = 8
+    for _ in range(size):
+        if nxt != 0:
+            nxt = (nxt + r.se() + 256) % 256
+
+
+_HIGH_PROFILES = {100, 110, 122, 244, 44, 83, 86, 118, 128,
+                  138, 139, 134, 135}
+
+
+def sps_dimensions(sps: bytes) -> Tuple[int, int]:
+    """Coded (width, height) from a raw SPS NAL unit."""
+    r = _BitReader(_rbsp(sps[1:]))
+    profile = r.u(8)
+    r.u(16)  # constraint flags + level
+    r.ue()   # sps id
+    chroma = 1
+    if profile in _HIGH_PROFILES:
+        chroma = r.ue()
+        if chroma == 3:
+            r.u(1)
+        r.ue()
+        r.ue()
+        r.u(1)
+        if r.u(1):
+            for i in range(8 if chroma != 3 else 12):
+                if r.u(1):
+                    _skip_scaling_list(r, 16 if i < 6 else 64)
+    r.ue()
+    poc_type = r.ue()
+    if poc_type == 0:
+        r.ue()
+    elif poc_type == 1:
+        r.u(1)
+        r.se()
+        r.se()
+        for _ in range(r.ue()):
+            r.se()
+    r.ue()
+    r.u(1)
+    width = (r.ue() + 1) * 16
+    h_units = r.ue() + 1
+    frame_mbs_only = r.u(1)
+    height = (2 - frame_mbs_only) * h_units * 16
+    if not frame_mbs_only:
+        r.u(1)
+    r.u(1)
+    if r.u(1):  # frame cropping
+        crop_l, crop_r, crop_t, crop_b = r.ue(), r.ue(), r.ue(), r.ue()
+        unit_x = 2 if chroma in (1, 2) else 1
+        unit_y = (2 if chroma == 1 else 1) * (2 - frame_mbs_only)
+        width -= (crop_l + crop_r) * unit_x
+        height -= (crop_t + crop_b) * unit_y
+    return width, height
+
+
+class AnnexBAssembler:
+    """Incremental Annex-B byte stream → access units.
+
+    feed() returns completed (payload, key_frame) pairs with payloads
+    in LOC canonical form (4-byte length prefixes). SPS/PPS are
+    captured for `config` (avcC) and excluded from payloads, matching
+    mp4-sample form; AUD NALs delimit and are dropped. close() flushes
+    the final unterminated access unit at EOF.
+    """
+
+    def __init__(self):
+        self._buf = bytearray()
+        self._au: List[bytes] = []
+        self._au_has_vcl = False
+        self.sps: Optional[bytes] = None
+        self.pps: Optional[bytes] = None
+
+    @property
+    def config(self) -> Optional[bytes]:
+        if self.sps and self.pps:
+            return avcc_from_sps_pps(self.sps, self.pps)
+        return None
+
+    def feed(self, chunk: bytes) -> List[Tuple[bytes, bool]]:
+        self._buf += chunk
+        out: List[Tuple[bytes, bool]] = []
+        for nal in self._extract_nals():
+            self._push(nal, out)
+        return out
+
+    def close(self) -> List[Tuple[bytes, bool]]:
+        out: List[Tuple[bytes, bool]] = []
+        buf = bytes(self._buf)
+        self._buf = bytearray()
+        i = buf.find(b'\x00\x00\x01')
+        if i != -1:
+            nal = buf[i + 3:].rstrip(b'\x00')
+            if nal:
+                self._push(nal, out)
+        self._flush(out)
+        return out
+
+    def _extract_nals(self) -> List[bytes]:
+        # A NAL is complete only once the next start code arrives; the
+        # trailing partial NAL stays buffered.
+        buf = self._buf
+        out: List[bytes] = []
+        i = buf.find(b'\x00\x00\x01')
+        if i == -1:
+            if len(buf) > 2:
+                del buf[:-2]
+            return out
+        while True:
+            j = buf.find(b'\x00\x00\x01', i + 3)
+            if j == -1:
+                del buf[:i]
+                return out
+            nal = bytes(buf[i + 3:j]).rstrip(b'\x00')
+            if nal:
+                out.append(nal)
+            i = j
+
+    def _flush(self, out: List[Tuple[bytes, bool]]) -> None:
+        if self._au:
+            payload = b''.join(struct.pack('>I', len(n)) + n
+                               for n in self._au)
+            key = any((n[0] & 0x1F) == 5 for n in self._au)
+            out.append((payload, key))
+        self._au = []
+        self._au_has_vcl = False
+
+    def _push(self, nal: bytes, out: List[Tuple[bytes, bool]]) -> None:
+        t = nal[0] & 0x1F
+        if t in (7, 8):  # SPS/PPS → config, start a new access unit
+            if self._au_has_vcl:
+                self._flush(out)
+            if t == 7:
+                self.sps = nal
+            else:
+                self.pps = nal
+            return
+        if t == 9:  # AUD delimits and is dropped
+            self._flush(out)
+            return
+        if t in (1, 5):
+            # first_mb_in_slice == 0 (ue(v) leading '1' bit) marks a
+            # new primary coded picture.
+            first_mb0 = len(nal) > 1 and (nal[1] & 0x80) != 0
+            if self._au_has_vcl and first_mb0:
+                self._flush(out)
+            self._au.append(nal)
+            self._au_has_vcl = True
+            return
+        # SEI and other non-VCL NALs precede their access unit's slices
+        if self._au_has_vcl:
+            self._flush(out)
+        self._au.append(nal)
+
+
 def av1c_codec_string(av1c: bytes) -> str:
     """WebCodecs/ISOBMFF codec string from av1C (e.g. av01.0.08M.08)."""
     profile = av1c[1] >> 5
