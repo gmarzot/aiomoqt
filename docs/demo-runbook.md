@@ -63,6 +63,11 @@ python -m aiomoqt.tools.sub_media $RELAY -N <ns> --draft 16 -t 30
 ffplay media-out/video.mp4        # received chunks as playable fMP4
 ```
 
+moq-playa plays the CMAF broadcast directly (same player URL with the
+cmsf namespace) — its CMAF path renders through MSE SourceBuffers
+rather than WebCodecs. A LOC tab and a CMAF tab side by side from the
+same content shows per-frame vs buffered latency in one glance.
+
 **Cross-implementation** — any independent MSF consumer against the
 same broadcast (e.g. moqlivemock's `mlmsub -addr <relay-host:port>
 -draft 16 -namespace <ns> -videoname video -audioname audio
