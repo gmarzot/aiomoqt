@@ -27,6 +27,7 @@ from aiomoqt.media import (
     Catalog, CatalogTrack, InitData, LocTrackPublisher, MediaPublisher,
     StreamMapping,
 )
+from aiomoqt.media.cmaf import CmafChunker
 from aiomoqt.media.sources import (
     AnnexBAssembler, Mp4Reader, avcc_codec_string, pcm_tone_frames,
     sps_dimensions,
@@ -55,6 +56,13 @@ def parse_args():
                         help='Publish a live H.264 Annex-B elementary '
                              'stream ("-" = stdin, e.g. an ffmpeg/OBS '
                              'pipe); frames are stamped on arrival')
+    parser.add_argument('--packaging', choices=('loc', 'cmaf'),
+                        default='loc',
+                        help='Media packaging (cmsf draft): loc = '
+                             'per-frame LOC payloads (default); cmaf = '
+                             'CMAF chunks (moof+mdat per frame, header '
+                             'in catalog initDataList). cmaf needs '
+                             '--mp4.')
     parser.add_argument('--freq', type=float, default=440.0,
                         help='Tone frequency Hz (default: 440)')
     parser.add_argument('--no-pace', action='store_true',
@@ -83,20 +91,26 @@ def parse_args():
     args = parser.parse_args()
     if args.mp4 and args.h264:
         parser.error('--mp4 and --h264 are mutually exclusive')
+    if args.packaging == 'cmaf' and not args.mp4:
+        parser.error('--packaging cmaf requires --mp4')
     return args
 
 
-def _build_catalog(args, video, audio) -> Catalog:
+def _build_catalog(args, video, audio, chunkers=None) -> Catalog:
+    packaging = args.packaging
+    chunkers = chunkers or {}
     tracks = []
     init = []
     if audio is not None:
         tracks.append(CatalogTrack(
-            name='audio', packaging='loc', isLive=True, role='audio',
+            name='audio', packaging=packaging, isLive=True, role='audio',
             renderGroup=1, codec=audio.codec_string,
             samplerate=audio.samplerate,
             channelConfig=str(audio.channels),
             bitrate=audio.avg_bitrate or 128_000, initRef='a0'))
-        init.append(InitData.from_bytes('a0', audio.asc))
+        init.append(InitData.from_bytes(
+            'a0', chunkers['audio'].init_segment()
+            if 'audio' in chunkers else audio.asc))
     elif not args.no_audio:
         tracks.append(CatalogTrack(
             name='audio', packaging='loc', isLive=True, role='audio',
@@ -104,14 +118,18 @@ def _build_catalog(args, video, audio) -> Catalog:
             channelConfig=str(_CHANNELS),
             bitrate=_SAMPLERATE * _CHANNELS * 16))
     if video is not None:
+        cmaf = 'video' in chunkers
         tracks.insert(0, CatalogTrack(
-            name='video', packaging='loc', isLive=True, role='video',
+            name='video', packaging=packaging, isLive=True, role='video',
             renderGroup=1, codec=video.codec_string,
             width=video.width, height=video.height,
             framerate=video.fps,
             bitrate=video.avg_bitrate or 2_000_000,
-            initRef='v0' if video.config else None))
-        if video.config:
+            initRef='v0' if (cmaf or video.config) else None))
+        if cmaf:
+            init.append(InitData.from_bytes(
+                'v0', chunkers['video'].init_segment()))
+        elif video.config:
             init.append(InitData.from_bytes('v0', video.config))
     if getattr(args, 'target_latency', None) is not None:
         for t in tracks:
@@ -186,11 +204,12 @@ async def _feed_tone(track, args, epoch_us: int):
 
 
 async def _feed_mp4_track(track, source, args, epoch_us: int, *,
-                          all_key=False, gap_us=33_333):
+                          all_key=False, gap_us=33_333, wrap=None):
     """Feed an mp4 track's samples, paced to their media timestamps and
     stamped as wall-clock µs (LOC default clock); --loop restarts the
     file at later timestamps (audio: every AU is a sync frame, giving
-    LOC's one-object-per-group audio mapping)."""
+    LOC's one-object-per-group audio mapping). wrap(sample) transforms
+    the payload (CMAF chunking)."""
     start = time.monotonic()
     base_us = 0
     while True:
@@ -200,7 +219,7 @@ async def _feed_mp4_track(track, source, args, epoch_us: int, *,
             if ts > args.duration * 1_000_000:
                 break
             await _pace(start, ts, not args.no_pace)
-            await track.send_frame(s.payload,
+            await track.send_frame(wrap(s) if wrap else s.payload,
                                    key_frame=all_key or s.key_frame,
                                    timestamp=epoch_us + ts)
             last = ts
@@ -220,7 +239,16 @@ async def run(args):
         video = live[3]
     mp4_audio = (reader.audio
                  if reader and not (args.tone or args.no_audio) else None)
-    catalog = _build_catalog(args, video, mp4_audio)
+    chunkers = {}
+    if args.packaging == 'cmaf':
+        chunkers['video'] = CmafChunker(video)
+        if mp4_audio is not None:
+            chunkers['audio'] = CmafChunker(mp4_audio)
+        elif not args.no_audio:
+            print("  note: cmaf packaging — tone audio skipped "
+                  "(no AAC track in the mp4)")
+            args.no_audio = True
+    catalog = _build_catalog(args, video, mp4_audio, chunkers)
 
     client = MOQTClient(
         relay.host, relay.port, path=relay.path,
@@ -244,9 +272,13 @@ async def run(args):
                          else StreamMapping.PER_GROUP),
                 loc01_compat=args.loc01_compat))
             if mp4_audio is not None:
+                a_ck = chunkers.get('audio')
                 feeders.append(_feed_mp4_track(
                     audio_track, mp4_audio, args, epoch_us, all_key=True,
-                    gap_us=1_000_000 * 1024 // mp4_audio.samplerate))
+                    gap_us=1_000_000 * 1024 // mp4_audio.samplerate,
+                    wrap=(lambda s, ck=a_ck:
+                          ck.chunk(s.payload, s.duration)) if a_ck
+                    else None))
             else:
                 feeders.append(_feed_tone(audio_track, args, epoch_us))
         if live is not None:
@@ -257,12 +289,17 @@ async def run(args):
                     loc01_compat=args.loc01_compat)),
                 fh, asm, first, args))
         elif video is not None:
+            v_ck = chunkers.get('video')
             feeders.append(_feed_mp4_track(
                 pub.add_track(LocTrackPublisher(
-                    session, args.namespace, 'video', config=video.config,
+                    session, args.namespace, 'video',
+                    config=None if v_ck else video.config,
                     loc01_compat=args.loc01_compat)),
                 video, args, epoch_us,
-                gap_us=int(1e6 / (video.fps or 30))))
+                gap_us=int(1e6 / (video.fps or 30)),
+                wrap=(lambda s, ck=v_ck:
+                      ck.chunk(s.payload, s.duration, s.key_frame))
+                if v_ck else None))
         await pub.start()
         print("  publishing...")
         feed = asyncio.ensure_future(asyncio.gather(*feeders))

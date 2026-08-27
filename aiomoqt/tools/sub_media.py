@@ -77,6 +77,7 @@ class _Writers:
         self.ivf = None
         self.wav = None
         self.aac = None
+        self.cmaf = {}
         self.counts = {}
         self.pipe_closed = False
         self.closed = False
@@ -102,6 +103,26 @@ class _Writers:
                     f"extra_props={sorted((frame.extensions or {}))}")
         entry = self.sub.catalog.find(name) if self.sub.catalog else None
         role = entry.role if entry else None
+        if entry is not None and entry.packaging == 'cmaf':
+            # CMAF chunks pass through verbatim; init segment (CMAF
+            # header) from the catalog prefixes the fMP4 sink.
+            init = self.sub.catalog.resolve_init(entry)
+            if self.pipe_role == role:
+                if name not in self.cmaf:
+                    self.cmaf[name] = sys.stdout.buffer
+                    if init:
+                        self._pipe(init)
+                self._pipe(frame.payload)
+                return
+            fh = self.cmaf.get(name)
+            if fh is None:
+                fh = open(os.path.join(self.out, f'{role or name}.mp4'),
+                          'wb')
+                self.cmaf[name] = fh
+                if init:
+                    fh.write(init)
+            fh.write(frame.payload)
+            return
         if role == 'video' and (entry.codec or '').startswith('av01'):
             # AV1 temporal units pass through verbatim; IVF wraps them
             # into an ffplay-playable stream (config OBUs are in-band).
@@ -167,6 +188,9 @@ class _Writers:
             self.wav.close()
         if self.aac:
             self.aac.close()
+        for fh in self.cmaf.values():
+            if fh is not sys.stdout.buffer:
+                fh.close()
 
 
 def _status(*parts):
@@ -237,6 +261,9 @@ async def run(args):
                                 ("video.ivf", writers.ivf),
                                 ("audio.wav", writers.wav),
                                 ("audio.aac", writers.aac)) if f]
+        files += [os.path.basename(fh.name)
+                  for fh in writers.cmaf.values()
+                  if fh is not sys.stdout.buffer]
         _status(f"  wrote {args.out}/{{{', '.join(files)}}} — "
                 f"play each with ffplay")
 

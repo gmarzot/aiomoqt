@@ -44,6 +44,7 @@ class VideoSample:
     payload: bytes      # length-prefixed AVC, LOC canonical form
     key_frame: bool
     timestamp_us: int
+    duration: int = 0   # track-timescale units (CMAF trun)
 
 
 class Mp4Error(ValueError):
@@ -92,6 +93,7 @@ class _TrackReader:
     def __init__(self, data: bytes, entry, trak):
         d = self._data = data
         body, bend = trak
+        self._entry_span = (entry[0] - 8, entry[1])
         mdhd = _find(d, body, bend, b'mdia', b'mdhd')
         version = d[mdhd[0]]
         self.timescale = struct.unpack_from(
@@ -137,6 +139,13 @@ class _TrackReader:
         raise NotImplementedError
 
     @property
+    def sample_entry_bytes(self) -> bytes:
+        """The stsd sample-entry box (avc1/av01/mp4a…) verbatim —
+        embeddable in a CMAF header's stsd."""
+        start, end = self._entry_span
+        return self._data[start:end]
+
+    @property
     def avg_bitrate(self) -> Optional[int]:
         """Mean track bitrate in bps from the sample tables."""
         dur = sum(c * delta for c, delta in self._stts)
@@ -168,12 +177,14 @@ class _TrackReader:
                    for _ in range(count))
         t = 0
         for i, (off, size) in enumerate(zip(offsets, self._sizes)):
+            dur = next(ts_iter)
             yield VideoSample(
                 payload=self._data[off:off + size],
                 key_frame=(self._sync is None or (i + 1) in self._sync),
                 timestamp_us=t * 1_000_000 // self.timescale,
+                duration=dur,
             )
-            t += next(ts_iter)
+            t += dur
 
 
 class Mp4VideoTrack(_TrackReader):

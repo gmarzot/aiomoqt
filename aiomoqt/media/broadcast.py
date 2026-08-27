@@ -19,7 +19,9 @@ from ..messages import FetchHeader, FetchObject, SubgroupHeader
 from ..track import PublishedTrack, SubscribedTrack
 from ..types import MOQTMessageType
 from ..utils.logger import get_logger
-from .catalog import Catalog, CATALOG_TRACK_NAME, PACKAGING_LOC
+from .catalog import (
+    Catalog, CATALOG_TRACK_NAME, PACKAGING_CMAF, PACKAGING_LOC,
+)
 from .loc import LocTrackPublisher, LocTrackSubscriber
 
 logger = get_logger(__name__)
@@ -272,7 +274,7 @@ class MediaSubscriber:
 
     async def _subscribe_media(self) -> None:
         for entry in list(self.catalog.tracks):
-            if entry.packaging != PACKAGING_LOC:
+            if entry.packaging not in (PACKAGING_LOC, PACKAGING_CMAF):
                 logger.info(f"MediaSubscriber: skipping {entry.name!r} "
                             f"(packaging={entry.packaging!r})")
                 continue
@@ -284,8 +286,11 @@ class MediaSubscriber:
                 entry.namespace or self.namespace, name,
                 on_frame=(lambda f, gid, oid, _n=name:
                           self.on_frame and self.on_frame(_n, f, gid, oid)))
-            init = self.catalog.resolve_init(entry)
-            if init is not None:
-                sub.set_config(init)
+            if entry.packaging == PACKAGING_LOC:
+                # cmaf init is a CMAF header consumed by the sink, not
+                # decoder extradata — leave config unset there.
+                init = self.catalog.resolve_init(entry)
+                if init is not None:
+                    sub.set_config(init)
             await sub.subscribe()
             self.tracks[name] = sub
