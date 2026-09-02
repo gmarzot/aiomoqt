@@ -2574,7 +2574,11 @@ class _MOQTSessionMixin:
         else:
             message = PublishNamespaceOk(request_id=msg.request_id)
         logger.info(f"MOQT send: {message} request_id: {msg.request_id} namespace: {msg.namespace}")
-        self.send_control_message(message)
+        # PUBLISH_NAMESPACE is "Request, First" at d18: it opens its own
+        # bidi stream and the reply returns on that stream, carrying no
+        # Request ID. Sending it on the control stream instead left the
+        # peer unable to correlate it, so the announce never resolved.
+        self._send_reply(msg.request_id, message)
         return message
 
     def publish_namespace_done(

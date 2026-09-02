@@ -1,31 +1,33 @@
 #!/usr/bin/env python3
 """EXPERIMENTAL — minimal MoQT interop relay (not a production relay).
 
-This is a CONTROL-PLANE-ONLY skeleton intended solely for exercising
-the 6 standard interop test cases at
-https://github.com/englishm/moq-interop-runner. It has:
+Forwards objects from an upstream publisher to downstream subscribers.
+Still missing, deliberately:
 
-  * NO data forwarding (objects are never relayed)
-  * NO multi-subscriber fan-out
   * NO authentication, authorization, or rate limiting
   * NO load handling, backpressure, or production hardening
-  * An in-memory namespace table that is global to the process
+  * NO group cache, so a late subscriber sees only what arrives next,
+    and joining FETCH is not served
+  * NO forward-state propagation (REQUEST_UPDATE Forward=0/1 upstream)
+  * NO PUBLISH forwarding to SUBSCRIBE_TRACKS subscribers
+  * Namespace tables are in-memory and global to the process
 
 Use moxygen, moq-rs, or another real relay for any actual workload.
-This relay exists so aiomoqt's server-side primitives (MOQTServer,
-the announce / subscribe handlers) have a working demonstrator and
-so we can run the interop conformance suite against ourselves.
+This relay exists so aiomoqt's server-side primitives have a working
+demonstrator and so we can run a conformance suite against ourselves.
 
 Routing model (cross-session, single relay instance):
-  - PUBLISH_NAMESPACE: record the namespace tuple in `_announced`,
-    respond with the protocol's default RequestOk (d16+) /
-    PublishNamespaceOk (d14).
-  - SUBSCRIBE: if the requested (namespace, track_name) namespace is in
-    `_announced`, respond with SUBSCRIBE_OK. Otherwise send
-    SUBSCRIBE_ERROR with TRACK_DOES_NOT_EXIST (d14 code 0x04,
-    d16 code 0x10) so the conformance suite's subscribe-error test sees
-    a spec-correct rejection.
-  - PUBLISH_NAMESPACE_DONE: remove the namespace from `_announced`.
+  - PUBLISH_NAMESPACE: record the announcing session under the
+    namespace tuple, respond with the protocol's default RequestOk
+    (d16+) / PublishNamespaceOk (d14).
+  - SUBSCRIBE: find publishers that announced the namespace or a prefix
+    of it (§2.4 Namespace Prefix Matching), subscribe upstream once per
+    Full Track Name, answer SUBSCRIBE_OK and fan the objects out to
+    every downstream subscriber of that track. With no match, send
+    SUBSCRIBE_ERROR / REQUEST_ERROR with TRACK_DOES_NOT_EXIST (d14 code
+    0x04, d16+ code 0x10) so a conformance suite sees a spec-correct
+    rejection.
+  - PUBLISH_NAMESPACE_DONE: drop that session's hold on the namespace.
 
 Run on UDP/4443 with the runner's /certs convention:
 
@@ -50,7 +52,9 @@ from aiomoqt.server import MOQTServer
 from aiomoqt.types import (
     MOQTMessageType, RequestErrorCode, SubscribeErrorCode, parse_draft_spec,
 )
+from aiomoqt.messages import SubgroupHeader
 from aiomoqt.messages.request import RequestError
+from aiomoqt.track import SubscribedTrack
 from aiomoqt.context import is_draft16_or_later
 from aiomoqt.utils.logger import set_log_level, get_logger
 
@@ -65,14 +69,18 @@ _RELAY_DRAFT_DEFAULT = (os.environ.get("DRAFT")
 logger = get_logger(__name__)
 
 
-# Global cross-session announcement table. Maps namespace tuple (as a
-# tuple of bytes) to a count of active publishers. Sub-tests within the
-# same suite can re-announce / un-announce; the count lets that work.
-_announced: dict[tuple, int] = {}
+# Cross-session announcement table: namespace tuple -> the publisher
+# sessions currently advertising it. A session may announce a namespace
+# more than once (sub-tests re-announce), so each session is held with a
+# refcount and drops out when it reaches zero or the session closes.
+_announced: dict[tuple, dict] = {}
+
+# Tracks being relayed upstream->downstream, keyed by (namespace, name).
+_tracks: dict[tuple, "_RelayedTrack"] = {}
 
 
-def _announced_match(ns: tuple) -> bool:
-    """True when any announced namespace covers `ns`.
+def _announced_match(ns: tuple) -> list[tuple]:
+    """Announced namespaces covering `ns`, longest (most specific) first.
 
     Namespace Prefix Matching (transport §2.4): fields are compared
     sequentially and each must match exactly; an announcement with the
@@ -80,7 +88,106 @@ def _announced_match(ns: tuple) -> bool:
     (foo) covers a SUBSCRIBE for (foo, bar), while (foobar) does not —
     which is why this compares tuple fields and never a joined string.
     """
-    return any(len(a) <= len(ns) and ns[:len(a)] == a for a in _announced)
+    hits = [a for a in _announced
+            if len(a) <= len(ns) and ns[:len(a)] == a]
+    return sorted(hits, key=len, reverse=True)
+
+
+def _publishers_for(ns: tuple) -> list:
+    """Publisher sessions that announced `ns` or a prefix of it."""
+    out, seen = [], set()
+    for a in _announced_match(ns):
+        for sess in _announced[a]:
+            if id(sess) not in seen:
+                seen.add(id(sess))
+                out.append(sess)
+    return out
+
+
+class _RelayedTrack:
+    """One upstream subscription fanned out to N downstream subscribers.
+
+    Transport §"Relays": a Full Track Name is matched exactly against
+    existing upstream subscriptions, so a second downstream subscriber
+    for the same track joins this fan-out instead of opening a second
+    upstream SUBSCRIBE.
+
+    Objects arrive on a synchronous callback but forwarding has to open
+    streams, which is async — inbound objects go through a queue drained
+    by one task per track, which also keeps them in arrival order.
+    """
+
+    def __init__(self, key):
+        self.key = key
+        self.upstream = None
+        self.downstream = []          # list of (session, track_alias)
+        self.queue = asyncio.Queue()
+        self.task = None
+        # (id(session), group, subgroup) -> (stream_id, SubgroupHeader)
+        self._streams = {}
+
+    def on_object(self, msg, size, ts, group_id, subgroup_id):
+        """Upstream delivery callback (sync) — hand off to the drain."""
+        gid = getattr(msg, "group_id", None)
+        gid = gid if gid is not None else group_id
+        self.queue.put_nowait(
+            (gid, subgroup_id or 0, msg.object_id,
+             bytes(msg.payload), msg.extensions or None))
+
+    def add_downstream(self, session, track_alias):
+        self.downstream.append((session, track_alias))
+        if self.task is None:
+            self.task = asyncio.create_task(self._forward_loop())
+
+    def drop_session(self, session):
+        self.downstream = [(s, a) for (s, a) in self.downstream
+                           if s is not session]
+        for k in [k for k in self._streams if k[0] == id(session)]:
+            self._streams.pop(k, None)
+
+    async def _forward_loop(self):
+        while True:
+            gid, sgid, oid, payload, exts = await self.queue.get()
+            for session, alias in list(self.downstream):
+                try:
+                    await self._forward_one(
+                        session, alias, gid, sgid, oid, payload, exts)
+                except Exception:
+                    logger.debug("relay: forward failed, dropping subscriber",
+                                 exc_info=True)
+                    self.drop_session(session)
+
+    async def _forward_one(self, session, alias, gid, sgid, oid,
+                           payload, exts):
+        """Write one object downstream, opening the (group, subgroup)
+        stream on first sight. Group/subgroup identity is preserved from
+        upstream so the downstream sees the publisher's structure."""
+        skey = (id(session), gid, sgid)
+        entry = self._streams.get(skey)
+        if entry is None:
+            stream_id = await session.open_uni_stream()
+            header = SubgroupHeader(
+                track_alias=alias, group_id=gid, subgroup_id=sgid,
+                publisher_priority=128, extensions_present=True,
+                prof=session._profile)
+            session.stream_write(stream_id, header.serialize().data)
+            entry = (stream_id, header)
+            self._streams[skey] = entry
+        stream_id, header = entry
+        buf = header.next_object(payload=payload, extensions=exts,
+                                 object_id=oid)
+        await session.stream_write_drain(stream_id, buf.data)
+
+
+def _forget_session(session) -> None:
+    """Drop everything a closing session owned: its announcements and
+    its downstream subscriptions."""
+    for ns in list(_announced):
+        if _announced[ns].pop(session, None) is not None and \
+                not _announced[ns]:
+            del _announced[ns]
+    for track in list(_tracks.values()):
+        track.drop_session(session)
 
 
 def _ns_tuple(namespace):
@@ -97,10 +204,11 @@ def _ns_tuple(namespace):
 
 
 async def _on_publish_namespace(session, msg):
-    """Record the namespace, ack with default OK path."""
+    """Record the announcing session, ack with default OK path."""
     ns = _ns_tuple(msg.namespace)
-    _announced[ns] = _announced.get(ns, 0) + 1
-    logger.info(f"relay: announce ns={ns} -> count={_announced[ns]}")
+    holders = _announced.setdefault(ns, {})
+    holders[session] = holders.get(session, 0) + 1
+    logger.info(f"relay: announce ns={ns} -> {len(holders)} publisher(s)")
     # Reuse the protocol's built-in OK helper. It emits RequestOk on
     # d16+ and PublishNamespaceOk on d14, matching peer expectation.
     session.publish_namepace_ok(msg)
@@ -109,24 +217,67 @@ async def _on_publish_namespace(session, msg):
 async def _on_publish_namespace_done(session, msg):
     """Drop one publisher's hold on the namespace."""
     ns = _ns_tuple(msg.namespace) if msg.namespace else None
-    if ns is None or ns not in _announced:
+    holders = _announced.get(ns) if ns is not None else None
+    if not holders or session not in holders:
         logger.info(f"relay: publish_namespace_done for unknown ns={ns}")
         return
-    _announced[ns] -= 1
-    if _announced[ns] <= 0:
+    holders[session] -= 1
+    if holders[session] <= 0:
+        del holders[session]
+    if not holders:
         del _announced[ns]
     logger.info(f"relay: namespace_done ns={ns} -> "
-                f"{_announced.get(ns, 0)} remaining")
+                f"{len(_announced.get(ns, {}))} publisher(s)")
+
+
+async def _establish_upstream(ns, track_name):
+    """Subscribe upstream once per Full Track Name and return the
+    fan-out, or None when no publisher accepts.
+
+    Transport §"Relays": with no Established upstream subscription for
+    the Track, the relay subscribes to each publisher that announced the
+    subscription's namespace or a prefix of it.
+    """
+    key = (ns, track_name)
+    track = _tracks.get(key)
+    if track is not None and track.upstream is not None:
+        return track
+    for pub in _publishers_for(ns):
+        track = _RelayedTrack(key)
+        name = (track_name.decode() if isinstance(track_name, bytes)
+                else track_name)
+        upstream = SubscribedTrack(
+            pub, "/".join(x.decode() for x in ns), name,
+            on_object=track.on_object)
+        try:
+            await upstream.subscribe(timeout=10.0)
+        except Exception as e:
+            logger.info(f"relay: upstream subscribe failed on {ns}: {e}")
+            continue
+        track.upstream = upstream
+        _tracks[key] = track
+        logger.info(f"relay: upstream established ns={ns} track={name} "
+                    f"alias={upstream.track_alias}")
+        return track
+    return None
 
 
 async def _on_subscribe(session, msg):
-    """Accept SUBSCRIBE for announced namespaces, error otherwise."""
+    """Relay a SUBSCRIBE: establish upstream, then fan out downstream."""
     ns = _ns_tuple(msg.track_namespace)
     if _announced_match(ns):
+        track = await _establish_upstream(ns, msg.track_name)
+        if track is not None:
+            ok = session.subscribe_ok(request_msg=msg)
+            track.add_downstream(session, ok.track_alias)
+            logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
+                        f"-> SUBSCRIBE_OK (fanout="
+                        f"{len(track.downstream)})")
+            return
+        # Announced but no publisher served it. Answer honestly rather
+        # than acking a track that will never deliver.
         logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
-                    f"-> SUBSCRIBE_OK")
-        session.subscribe_ok(request_msg=msg)
-        return
+                    f"-> ERROR (no upstream)")
     logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
                 f"-> ERROR (not announced)")
     # On d16+ the universal REQUEST_ERROR (0x05) carries the not-found
