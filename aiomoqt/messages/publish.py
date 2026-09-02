@@ -221,7 +221,14 @@ class PublishOk(MOQTMessage):
                 payload.push_vint(self.end_group or 0)
             MOQTMessage._serialize_params(payload, self.parameters or {}, prof=prof)
 
-        buf.push_uint_var(self.type)
+        # From d16 on, a PUBLISH is answered with the universal
+        # REQUEST_OK (0x07); "PUBLISH_OK" is only the shorthand name for
+        # a REQUEST_OK sent in response to a PUBLISH (§10.5). Only d14
+        # has a distinct PUBLISH_OK message on the wire. Emitting 0x1E
+        # to a d16+ peer is an unknown control message to it.
+        wire_type = (D16MessageType.REQUEST_OK
+                     if is_draft16_or_later(prof.draft) else self.type)
+        buf.push_uint_var(wire_type)
         buf.push_uint16(payload.tell())
         buf.push_bytes(payload.data_slice(0, payload.tell()))
         return buf

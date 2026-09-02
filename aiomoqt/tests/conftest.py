@@ -6,6 +6,8 @@ from dataclasses import fields
 import pytest
 
 from aiomoqt.messages import MOQTMessageType
+from aiomoqt.types import D16MessageType
+from aiomoqt.context import is_draft16_or_later
 from aiomoqt.context import get_major_version, profile_for
 
 
@@ -161,6 +163,12 @@ def moqt_message_serialization_versioned(cls, params, type_id=None,
         # is unchanged for d14/d16.
         buf.vi64 = profile_for(draft).vi64
         id = buf.pull_vint()
+        # PUBLISH_OK is the shorthand name for a REQUEST_OK sent in reply
+        # to a PUBLISH (§10.5): from d16 on the wire type is 0x07, and
+        # only d14 has a distinct PUBLISH_OK message.
+        if (type_id == MOQTMessageType.PUBLISH_OK
+                and is_draft16_or_later(draft)):
+            type_id = D16MessageType.REQUEST_OK
         assert id == type_id
         msg_len = buf.pull_uint16()
         buf_end = buf.tell() + msg_len
