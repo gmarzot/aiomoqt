@@ -10,7 +10,24 @@ Each endpoint URL is probed once per draft (14, 16, 18 by default; use
 Each probe does a proper CLIENT_SETUP/SERVER_SETUP handshake and clean close.
 No bare ALPN probes, no custom protocol classes, no half-open connections.
 
-Outputs relay-status.json consumed by the landing page.
+Outputs relay-status.json consumed by the landing page:
+
+  {"timestamp": iso8601,
+   "relays": {<id>: {
+       "name": <id>, "live": bool,
+       "drafts": [int, ...],              # union across endpoints
+       "endpoints": [{
+           "url", "transport": "QUIC"|"H3/WT", "host", "port",
+           "live": bool,
+           "drafts": [int, ...],          # sorted, deduped
+           "draft": int|None,             # highest; probe-order independent
+           "latency_ms": int,
+           "error": str|None,             # last error when not live
+           "probes": [{"live", "draft": int|None, "version_hex",
+                       "alpn", "error"}]}]}}}
+
+Draft numbers are ints throughout; version_hex and alpn are the only
+wire forms.
 """
 
 import asyncio
@@ -46,6 +63,10 @@ PROBE_TIMEOUT = int(os.getenv("PROBE_TIMEOUT", "8"))
 PROBE_INTERVAL = int(os.getenv("PROBE_INTERVAL", "0"))
 RELAYS_FILE = os.getenv("RELAYS_FILE", "/app/relays.json")
 OUTPUT_FILE = os.getenv("OUTPUT_FILE", "/output/relay-status.json")
+# TLS certificate verification default for every probe; -k / --insecure
+# clears it. A relay entry's own "insecure" / "verify_tls" key overrides
+# it per relay.
+VERIFY_TLS = True
 
 # Draft versions to probe, oldest first — d14 bare WT CONNECT must
 # run before d16 (which sends wt-available-protocols) to avoid
@@ -67,8 +88,18 @@ DRAFT_FILTER = None
 _URL_COL = 48
 
 
+def _relay_id(relay):
+    """Report key for a relay entry: 'id' when present, else 'name'."""
+    return relay.get("id", relay.get("name", "unknown"))
+
+
+def _relay_name(relay):
+    """Display label: 'name' when present, else the report key."""
+    return relay.get("name", _relay_id(relay))
+
+
 async def probe_version(host, port, path, use_quic, supported_drafts,
-                        verify_tls=False):
+                        verify_tls=True):
     """Single probe: connect, CLIENT_SETUP/SERVER_SETUP, return result.
 
     Returns dict with live, draft, version_hex, alpn, params, error.
@@ -78,7 +109,6 @@ async def probe_version(host, port, path, use_quic, supported_drafts,
         "draft": None,
         "version_hex": None,
         "alpn": None,
-        "params": {},
         "error": None,
     }
     try:
@@ -94,13 +124,10 @@ async def probe_version(host, port, path, use_quic, supported_drafts,
                 await session.client_session_init(timeout=PROBE_TIMEOUT - 1)
                 draft = session.negotiated_draft
                 result["live"] = True
-                # version_hex is a display-only wire form: translate the
-                # negotiated draft to its IETF version code here.
+                result["draft"] = draft
+                # Display-only wire form of the negotiated draft.
                 result["version_hex"] = f"0x{moqt_version_from_draft(draft):08x}"
-                result["draft"] = f"draft-{draft}"
                 result["alpn"] = client.effective_configuration.alpn_protocols[0]
-                # Capture setup params from server
-                # Clean close
                 session.close()
                 await asyncio.sleep(0.1)
     except asyncio.TimeoutError:
@@ -114,7 +141,7 @@ async def probe_version(host, port, path, use_quic, supported_drafts,
     return result
 
 
-async def probe_endpoint(url, verify_tls=False):
+async def probe_endpoint(url, verify_tls=True):
     """Probe one URL for all supported drafts.
 
     Tries each draft version sequentially (newest first).
@@ -134,11 +161,12 @@ async def probe_endpoint(url, verify_tls=False):
         )
         results.append(r)
         if r["live"]:
-            # For a multi-draft offer the label is the offered set; report
-            # which draft the relay actually negotiated.
-            negotiated = r["draft"] or draft_name
+            # A multi-draft offer negotiates one draft out of the offered
+            # set; a per-draft probe negotiates the one it offered.
+            negotiated = r["draft"]
             drafts.append(negotiated)
-            arrow = "" if negotiated == draft_name else f" -> {negotiated}"
+            arrow = ("" if draft_name == f"draft-{negotiated}"
+                     else f" -> draft-{negotiated}")
             logger.info(f"  {url} [{transport}] {draft_name}{arrow}: LIVE"
                         f" (alpn={r['alpn']})")
         else:
@@ -146,6 +174,7 @@ async def probe_endpoint(url, verify_tls=False):
 
     latency_ms = round((time.monotonic() - t0) * 1000)
     any_live = any(r["live"] for r in results)
+    drafts = sorted(set(drafts))
 
     return {
         "url": url,
@@ -154,7 +183,8 @@ async def probe_endpoint(url, verify_tls=False):
         "port": port,
         "live": any_live,
         "drafts": drafts,
-        "draft": drafts[0] if drafts else None,
+        # Highest draft the endpoint speaks — independent of probe order.
+        "draft": drafts[-1] if drafts else None,
         "latency_ms": latency_ms,
         "probes": results,
         "error": results[-1].get("error") if not any_live else None,
@@ -167,13 +197,23 @@ async def probe_relay(relay):
     if not endpoints and "url" in relay:
         endpoints = [{"url": relay["url"]}]
 
+    # Relay-level "insecure" (interop catalog) / "verify_tls" override the
+    # global default; an endpoint may override again.
+    relay_verify = relay.get("verify_tls", not relay.get("insecure", False)
+                             if "insecure" in relay else VERIFY_TLS)
+
     ep_results = []
     for ep in endpoints:
         url = ep if isinstance(ep, str) else ep.get("url", "")
         if not url:
             continue
-        r = await probe_endpoint(url, verify_tls=ep.get("verify_tls", False)
-                                 if isinstance(ep, dict) else False)
+        verify = relay_verify
+        if isinstance(ep, dict):
+            if "verify_tls" in ep:
+                verify = ep["verify_tls"]
+            elif "insecure" in ep:
+                verify = not ep["insecure"]
+        r = await probe_endpoint(url, verify_tls=verify)
         ep_results.append(r)
 
     any_live = any(r["live"] for r in ep_results)
@@ -182,7 +222,7 @@ async def probe_relay(relay):
         all_drafts.update(r.get("drafts", []))
 
     return {
-        "name": relay.get("name", relay.get("id", "unknown")),
+        "name": _relay_name(relay),
         "live": any_live,
         "drafts": sorted(all_drafts),
         "endpoints": ep_results,
@@ -195,7 +235,7 @@ async def probe_all(relays, last_probed, cached_results):
     to_probe = []
     skipped = []
     for relay in relays:
-        rid = relay.get("id", relay.get("name", "unknown"))
+        rid = _relay_id(relay)
         interval = relay.get("interval", PROBE_INTERVAL)
         elapsed = now - last_probed.get(rid, 0)
         if elapsed >= interval:
@@ -212,7 +252,7 @@ async def probe_all(relays, last_probed, cached_results):
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         for relay, result in zip(to_probe, results):
-            rid = relay.get("id", relay.get("name", "unknown"))
+            rid = _relay_id(relay)
             last_probed[rid] = time.monotonic()
             if isinstance(result, Exception):
                 cached_results[rid] = {
@@ -228,7 +268,7 @@ async def probe_all(relays, last_probed, cached_results):
         "relays": {},
     }
     for relay in relays:
-        rid = relay.get("id", relay.get("name", "unknown"))
+        rid = _relay_id(relay)
         if rid in cached_results:
             report["relays"][rid] = cached_results[rid]
 
@@ -329,6 +369,11 @@ def parse_args(argv=None):
              "draft to stdout; bypasses --relays-file / --output-file. "
              "Intended for quick interactive liveness checks.")
     p.add_argument(
+        "-k", "--insecure", action="store_true", default=False,
+        help="skip TLS certificate verification. Certificates are "
+             "verified by default; a relay entry's 'insecure' field "
+             "waives verification for that relay alone.")
+    p.add_argument(
         "-d", "--debug", action="store_true", default=False,
         help="verbose handshake logging (DEBUG level on aiomoqt + "
              "relay-probe loggers). Off by default in --url mode so "
@@ -362,7 +407,7 @@ def _classify_error(err: str, transport: str = "") -> str:
     return f"connection refused - {err}" if err else "connection refused"
 
 
-async def _probe_single_url(url, timeout, debug=False):
+async def _probe_single_url(url, timeout, debug=False, verify_tls=True):
     """One-shot probe: print one human-readable line per (draft, transport)
     combo. No JSON, no file I/O. Exits with code 0 if any draft was LIVE,
     else 1 — easy to wire into shell scripts."""
@@ -380,11 +425,11 @@ async def _probe_single_url(url, timeout, debug=False):
         logging.getLogger("aiopquic").setLevel(logging.CRITICAL)
     global PROBE_TIMEOUT
     PROBE_TIMEOUT = timeout
-    result = await probe_endpoint(url)
+    result = await probe_endpoint(url, verify_tls=verify_tls)
     transport = result["transport"]
     ms = result.get("latency_ms", 0)
     if result["live"]:
-        drafts = ",".join(result["drafts"])
+        drafts = ",".join(f"draft-{d}" for d in result["drafts"])
         print(f"{url:<{_URL_COL}}  {transport:<5}  ✓  {drafts}  ({ms}ms)")
         return 0
     err = result.get("error") or "unreachable"
@@ -396,8 +441,9 @@ async def _probe_single_url(url, timeout, debug=False):
 def cli():
     """Console entry point (moq-relay-probe)."""
     global DRAFT_FILTER, RELAYS_FILE, OUTPUT_FILE
-    global PROBE_TIMEOUT, PROBE_INTERVAL
+    global PROBE_TIMEOUT, PROBE_INTERVAL, VERIFY_TLS
     args = parse_args()
+    VERIFY_TLS = not args.insecure
     if args.draft is not None:
         try:
             spec = parse_draft_spec(args.draft)
@@ -414,7 +460,8 @@ def cli():
     if args.url:
         # Single-URL mode: skip the relays-file / output-file machinery.
         rc = asyncio.run(_probe_single_url(
-            args.url, args.timeout, debug=args.debug))
+            args.url, args.timeout, debug=args.debug,
+            verify_tls=VERIFY_TLS))
         raise SystemExit(rc)
     # CLI overrides env overrides hard default. Rebinding module-level
     # constants keeps existing references in probe_version / probe_all
