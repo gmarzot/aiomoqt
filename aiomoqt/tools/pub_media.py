@@ -267,7 +267,8 @@ async def run(args):
         feeders = []
         if not args.no_audio:
             audio_track = pub.add_track(LocTrackPublisher(
-                session, args.namespace, 'audio',
+                session, args.namespace, 'audio', media_kind='audio',
+                config=mp4_audio.asc if mp4_audio is not None else None,
                 mapping=(StreamMapping.DATAGRAM if args.datagram
                          else StreamMapping.PER_GROUP),
                 loc01_compat=args.loc01_compat))

@@ -7,7 +7,9 @@ from .catalog import (
 from .loc import (
     LocFrame, LocTrackPublisher, LocTrackSubscriber, StreamMapping,
     LOC_PROP_TIMESTAMP, LOC_PROP_TIMESCALE,
-    LOC_PROP_VIDEO_CONFIG, LOC_PROP_FRAME_MARKING,
+    LOC_PROP_VIDEO_CONFIG, LOC_PROP_AUDIO_CONFIG,
+    LOC_PROP_VIDEO_FRAME_MARKING, LOC_PROP_AUDIO_LEVEL,
+    LOC02_PROP_TIMESTAMP, LOC01_PROP_CAPTURE_TS,
 )
 from .broadcast import (
     CatalogTrackPublisher, MediaPublisher, MediaSubscriber,
@@ -19,6 +21,8 @@ __all__ = [
     "PACKAGING_LOC", "PACKAGING_CMAF",
     "LocFrame", "LocTrackPublisher", "LocTrackSubscriber", "StreamMapping",
     "LOC_PROP_TIMESTAMP", "LOC_PROP_TIMESCALE",
-    "LOC_PROP_VIDEO_CONFIG", "LOC_PROP_FRAME_MARKING",
+    "LOC_PROP_VIDEO_CONFIG", "LOC_PROP_AUDIO_CONFIG",
+    "LOC_PROP_VIDEO_FRAME_MARKING", "LOC_PROP_AUDIO_LEVEL",
+    "LOC02_PROP_TIMESTAMP", "LOC01_PROP_CAPTURE_TS",
     "CatalogTrackPublisher", "MediaPublisher", "MediaSubscriber",
 ]
