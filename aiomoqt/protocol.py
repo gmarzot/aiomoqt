@@ -283,6 +283,10 @@ class _MOQTSessionMixin:
         # the session-global on_object_received when no entry matches.
         self._object_handlers: Dict[int, Callable] = {}
         self._stream_end_handlers: Dict[int, Callable] = {}
+        # track_alias -> DEFAULT_PUBLISHER_PRIORITY (property 0x0E, Track
+        # scope, §12.4). A subgroup whose header sets DEFAULT_PRIORITY
+        # omits the Priority field and inherits this.
+        self._track_default_priority: Dict[int, int] = {}
         # Aliases seen on data streams before any control message bound
         # them: {alias: [first_seen_monotonic, streams_admitted]}. Data
         # legitimately races SUBSCRIBE_OK (§10.4.2), so an entry here is
@@ -506,6 +510,23 @@ class _MOQTSessionMixin:
 
     def unregister_object_handler(self, track_alias: int) -> None:
         self._object_handlers.pop(track_alias, None)
+
+    def _latch_track_priority(self, track_alias: int,
+                              track_extensions) -> None:
+        """Record DEFAULT_PUBLISHER_PRIORITY for a track.
+
+        Subgroups that set the header's DEFAULT_PRIORITY bit carry no
+        Priority field and inherit this value; without it they would be
+        reported at the library default, which is a different number the
+        publisher never chose.
+        """
+        if not track_extensions:
+            return
+        prio = track_extensions.get(ParamType.PUBLISHER_PRIORITY)
+        if prio is not None:
+            self._track_default_priority[track_alias] = int(prio)
+            logger.debug(f"track {track_alias}: default publisher "
+                         f"priority {int(prio)}")
 
     def register_stream_end_handler(self, track_alias: int,
                                     callback: Callable) -> None:
@@ -870,8 +891,14 @@ class _MOQTSessionMixin:
                 if cb:
                     now = int(time.time() * 1_000_000)
                     hdr = state.parser
-                    msg_obj.publisher_priority = getattr(
-                        hdr, 'publisher_priority', None)
+                    alias = getattr(hdr, 'track_alias', None)
+                    if getattr(hdr, 'default_priority', False):
+                        msg_obj.publisher_priority = (
+                            self._track_default_priority.get(
+                                alias, MOQT_DEFAULT_PRIORITY))
+                    else:
+                        msg_obj.publisher_priority = getattr(
+                            hdr, 'publisher_priority', None)
                     msg_obj.stream_flags = (
                         getattr(hdr, 'first_object', False),
                         getattr(hdr, 'end_of_group', False),
@@ -2963,6 +2990,8 @@ class _MOQTSessionMixin:
         if msg.track_alias is not None:
             self._track_aliases[msg.track_alias] = msg.request_id
             self._resolve_unbound_alias(msg.track_alias)
+            self._latch_track_priority(msg.track_alias,
+                                       msg.track_extensions)
         self._resolve_request(msg.request_id, msg)
 
     async def _handle_subscribe_error(self, msg: SubscribeError) -> None:
