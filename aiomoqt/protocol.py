@@ -869,8 +869,14 @@ class _MOQTSessionMixin:
                                              None))
                 if cb:
                     now = int(time.time() * 1_000_000)
+                    hdr = state.parser
                     msg_obj.publisher_priority = getattr(
-                        state.parser, 'publisher_priority', None)
+                        hdr, 'publisher_priority', None)
+                    msg_obj.stream_flags = (
+                        getattr(hdr, 'first_object', False),
+                        getattr(hdr, 'end_of_group', False),
+                        getattr(hdr, 'default_priority', False),
+                    )
                     cb(msg_obj, consumed, now,
                        state.group_id, state.subgroup_id)
                 if terminal:

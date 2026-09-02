@@ -187,7 +187,8 @@ class _RelayedTrack:
             (gid, subgroup_id or 0, msg.object_id,
              bytes(msg.payload), msg.extensions or None,
              128 if prio is None else prio,
-             getattr(msg, "status", None)))
+             getattr(msg, "status", None),
+             getattr(msg, "stream_flags", None)))
 
     def add_downstream(self, session, track_alias):
         self.downstream.append((session, track_alias))
@@ -202,20 +203,20 @@ class _RelayedTrack:
 
     async def _forward_loop(self):
         while True:
-            gid, sgid, oid, payload, exts, prio, status = \
+            gid, sgid, oid, payload, exts, prio, status, shape = \
                 await self.queue.get()
             for session, alias in list(self.downstream):
                 try:
                     await self._forward_one(
                         session, alias, gid, sgid, oid, payload, exts,
-                        prio, status)
+                        prio, status, shape)
                 except Exception:
                     logger.debug("relay: forward failed, dropping subscriber",
                                  exc_info=True)
                     self.drop_session(session)
 
     async def _forward_one(self, session, alias, gid, sgid, oid,
-                           payload, exts, prio, status=None):
+                           payload, exts, prio, status=None, shape=None):
         """Write one object downstream, opening the (group, subgroup)
         stream on first sight. Group/subgroup identity is preserved from
         upstream so the downstream sees the publisher's structure."""
@@ -225,9 +226,15 @@ class _RelayedTrack:
             return
         if entry is None:
             stream_id = await session.open_uni_stream()
+            # Mirror the upstream stream's shape: END_OF_GROUP,
+            # FIRST_OBJECT and the subgroup-id mode are part of the
+            # delivery semantics a subscriber checks, and re-encoding
+            # with our own flags loses them.
+            first_obj, eog, inherited = shape or (False, False, False)
             header = SubgroupHeader(
                 track_alias=alias, group_id=gid, subgroup_id=sgid,
                 publisher_priority=prio, extensions_present=True,
+                end_of_group=eog, first_object=first_obj,
                 prof=session._profile)
             session.stream_write(stream_id, header.serialize().data)
             entry = (stream_id, header)

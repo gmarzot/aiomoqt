@@ -91,8 +91,13 @@ class SubgroupHeader(MOQTMessage):
     end_of_group: bool = False
     subgroup_id_mode: int = SUBGROUP_ID_EXPLICIT
     # d18 FIRST_OBJECT bit (0x40): the first object on this stream is the
-    # first object published in the subgroup. Parsed, not yet emitted.
+    # first object published in the subgroup.
     first_object: bool = False
+    # d16+ DEFAULT_PRIORITY bit (0x20): the Priority field is absent and
+    # the subgroup inherits the priority from the control message that
+    # established the subscription. Set on receive so a forwarder can
+    # tell "inherited" from an explicit 128.
+    default_priority: bool = False
     # Negotiated draft profile for this stream; selects the integer codec
     # (vi64 for d18, RFC9000 otherwise) for the header and its objects.
     # None keeps the pre-d18 RFC9000 path.
@@ -124,6 +129,13 @@ class SubgroupHeader(MOQTMessage):
         type_val |= (self.subgroup_id_mode & 0x03) << 1
         if self.end_of_group:
             type_val |= 0x08
+        # d16+ DEFAULT_PRIORITY (0x20): the Priority field is omitted and
+        # the subgroup inherits the subscription's. d18 FIRST_OBJECT
+        # (0x40): this stream opens with the subgroup's first object.
+        if self.default_priority:
+            type_val |= 0x20
+        if self.first_object:
+            type_val |= 0x40
         return type_val
 
     def serialize(self) -> Buffer:
@@ -254,6 +266,10 @@ class SubgroupHeader(MOQTMessage):
             subgroup_id = None
 
         if default_priority:
+            # No Priority on the wire. Keep the library default as the
+            # value but record that it was inherited, so a relay can
+            # resolve it from the subscription rather than forward 128
+            # as though the publisher had chosen it.
             publisher_priority = MOQT_DEFAULT_PRIORITY
         else:
             publisher_priority = buf.pull_uint8()
@@ -266,6 +282,7 @@ class SubgroupHeader(MOQTMessage):
             extensions_present=extensions_present,
             end_of_group=end_of_group,
             first_object=first_object,
+            default_priority=default_priority,
             prof=prof,
             subgroup_id_mode=subgroup_id_mode,
         )
@@ -291,6 +308,11 @@ class ObjectHeader(MOQTMessage):
     # object alone does not record it. None when not delivered from a
     # subgroup stream.
     publisher_priority: Optional[int] = None
+    # (first_object, end_of_group, default_priority) snapshotted from the
+    # enclosing subgroup header on receive. A snapshot, not a reference:
+    # the header is reused across the stream's objects and a forwarder
+    # may process this one later.
+    stream_flags: Optional[tuple] = None
 
     def serialize(self, extensions_present: bool = True,
                   prev_object_id: Optional[int] = None,
