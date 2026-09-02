@@ -48,6 +48,7 @@ import logging
 import os
 import sys
 
+from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
 from aiomoqt.types import (
     FilterType, GroupOrder, MOQTMessageType, RequestErrorCode,
@@ -59,6 +60,7 @@ from aiomoqt.messages.request import RequestError
 from aiomoqt.track import SubscribedTrack
 from aiomoqt.context import is_draft16_or_later
 from aiomoqt.utils.logger import set_log_level, get_logger
+from aiomoqt.utils.url import parse_relay_url
 
 # Version confinement. The interop runner injects DRAFT (moq-interop-runner
 # PR #95) — or older MOQT_DRAFT — to pin the relay to one draft; the client
@@ -79,6 +81,37 @@ _announced: dict[tuple, dict] = {}
 
 # Tracks being relayed upstream->downstream, keyed by (namespace, name).
 _tracks: dict[tuple, "_RelayedTrack"] = {}
+
+# Sessions this relay dialled OUT to. An origin does not announce to us,
+# so it never lands in _announced; it is tried as a fallback when no
+# inbound publisher covers a namespace. Without this the relay is only
+# ever a server, and the whole client leg — SETUP, SUBSCRIBE and object
+# receive as a client, upstream disconnect — goes untested.
+_upstreams: list = []
+
+
+async def _dial_upstream(url: str, draft) -> None:
+    """Hold a session open to an upstream origin for the process's life."""
+    ep = parse_relay_url(url)
+    client = MOQTClient(ep.host, ep.port, path=ep.path,
+                        use_quic=ep.use_quic, verify_tls=False,
+                        supported_drafts=draft)
+    while True:
+        try:
+            async with client.connect() as session:
+                await session.client_session_init()
+                _upstreams.append(session)
+                logger.info(f"relay: upstream connected {url} "
+                            f"draft={session.negotiated_draft}")
+                try:
+                    await session.async_closed()
+                finally:
+                    if session in _upstreams:
+                        _upstreams.remove(session)
+        except Exception as e:
+            logger.info(f"relay: upstream {url} unavailable: {e}")
+        logger.info(f"relay: retrying upstream {url} in 5s")
+        await asyncio.sleep(5)
 
 
 def _announced_match(ns: tuple) -> list[tuple]:
@@ -103,6 +136,13 @@ def _publishers_for(ns: tuple) -> list:
             if id(sess) not in seen:
                 seen.add(id(sess))
                 out.append(sess)
+    # An origin we dialled advertises nothing to us, so ask it last:
+    # _establish_upstream tries candidates in turn and moves on when one
+    # does not serve the track.
+    for sess in _upstreams:
+        if id(sess) not in seen:
+            seen.add(id(sess))
+            out.append(sess)
     return out
 
 
@@ -327,7 +367,9 @@ async def _on_subscribe(session, msg):
                     f"{len(track.downstream)})")
         return
 
-    if _announced_match(ns):
+    # A dialled origin announces nothing, so an empty announcement table
+    # is not proof the track is unavailable.
+    if _announced_match(ns) or _upstreams:
         track = await _establish_upstream(ns, msg.track_name)
         if track is not None:
             ok = session.subscribe_ok(request_msg=msg)
@@ -418,6 +460,13 @@ def parse_args():
                         help="MoQT draft(s) to serve: a single draft confines "
                              "negotiation to it; a list offers all of them. "
                              "Default from $DRAFT / $MOQT_DRAFT, else 14,16,18.")
+    parser.add_argument("--upstream", action="append", default=[],
+                        metavar="URL",
+                        help="Origin to dial for tracks no inbound "
+                             "publisher serves, e.g. "
+                             "moqt://host:4433/ or https://host:443/moq. "
+                             "Repeat for several. Without it the relay "
+                             "only serves publishers that connect to it.")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug logging")
     return parser.parse_args()
@@ -488,10 +537,17 @@ async def main():
     handles = [await (server.serve_dual() if args.dual else server.serve())
                for server, _port, _label in listeners]
 
+    # Dial origins after the listeners are up: an origin may itself be
+    # waiting on us, and a failed dial retries rather than aborting.
+    upstream_tasks = [asyncio.create_task(_dial_upstream(url, args.draft))
+                      for url in args.upstream]
+    for url in args.upstream:
+        print(f"  upstream origin: {url}")
+
     print(
         "=" * 64
-        + "\n EXPERIMENTAL aiomoqt interop relay — control-plane only.\n"
-        " NOT a production relay: no data forwarding, no auth,\n"
+        + "\n EXPERIMENTAL aiomoqt interop relay.\n"
+        " NOT a production relay: no group cache, no auth,\n"
         " no scale handling. Use moxygen / moq-rs for real workloads.\n"
         + "=" * 64,
         file=sys.stderr,
