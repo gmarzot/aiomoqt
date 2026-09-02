@@ -101,6 +101,7 @@ class MOQTMessage:
     # parsed dict is returned so the rest of the message dispatches.
     _tolerate_trailing_extensions = False
     _trailing_extensions_truncation_count = 0
+    _inline_location_count = 0
 
     @staticmethod
     def _extensions_decode(buf: Buffer, with_length: bool = True,
@@ -485,6 +486,23 @@ class MOQTMessage:
 
 
     @staticmethod
+    def _note_inline_location(param_type: int) -> None:
+        """Record a Location parameter written without its §1.4.3 Length.
+
+        Accepted on receive so a peer that omits it still interops; we
+        always write the Length. Logged once so the peer is visible
+        rather than silently tolerated.
+        """
+        MOQTMessage._inline_location_count += 1
+        if MOQTMessage._inline_location_count == 1:
+            logger.warning(
+                f"peer writes param 0x{param_type:x} Location without the "
+                f"§1.4.3 Length field; accepting the inline form "
+                f"(further occurrences at debug)")
+        else:
+            logger.debug(f"inline Location param 0x{param_type:x}")
+
+    @staticmethod
     def _deserialize_params(buf: Buffer, *, prof: DraftProfile,
                             buf_end: Optional[int] = None,
                             delta_keys: bool = None) -> Dict[int, Any]:
@@ -523,23 +541,30 @@ class MOQTMessage:
 
             if param_type in prof.location_params:
                 # Location value (d18 LARGEST_OBJECT 0x09). The type is
-                # odd, so §1.4.3's Length field is present; the value
-                # bytes are a group + object varint pair. Stored as a
-                # (group, object) tuple.
+                # odd, so §1.4.3 puts a Length before the group + object
+                # varint pair. Deployed peers disagree: some write the
+                # pair inline with no Length. Try the spec form and fall
+                # back, since the two are distinguishable — under the
+                # spec form the pair consumes exactly the declared bytes.
+                probe = buf.tell()
+                param_value = None
                 param_len = buf.pull_vint()
                 loc_end = buf.tell() + param_len
-                if buf_end is not None and loc_end > buf_end:
-                    raise MOQTProtocolViolation(
-                        f"param 0x{param_type:x} length {param_len} "
-                        f"overruns message end ({loc_end} > {buf_end})")
-                loc_group = buf.pull_vint()
-                loc_object = buf.pull_vint()
-                if buf.tell() != loc_end:
-                    raise MOQTProtocolViolation(
-                        f"param 0x{param_type:x} Location consumed "
-                        f"{buf.tell() - (loc_end - param_len)} of "
-                        f"{param_len} declared bytes")
-                param_value = (loc_group, loc_object)
+                if param_len and (buf_end is None or loc_end <= buf_end):
+                    try:
+                        loc_group = buf.pull_vint()
+                        loc_object = buf.pull_vint()
+                        if buf.tell() == loc_end:
+                            param_value = (loc_group, loc_object)
+                    except Exception:
+                        pass
+                if param_value is None:
+                    # Inline: what we read as a Length was the group.
+                    buf.seek(probe)
+                    loc_group = buf.pull_vint()
+                    loc_object = buf.pull_vint()
+                    param_value = (loc_group, loc_object)
+                    MOQTMessage._note_inline_location(param_type)
             elif param_type % 2 == 1:  # Odd type - includes Length field
                 param_len = buf.pull_vint()
                 if param_len > 65535:  # 2^16-1 maximum
