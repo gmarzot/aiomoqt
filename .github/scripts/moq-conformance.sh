@@ -13,6 +13,9 @@ URL=${URL:-https://127.0.0.1:4443/}
 # 'quic' = raw QUIC, 'h3wt' = HTTP/3 + WebTransport. Matches how the
 # relay under test was started.
 TRANSPORT=${TRANSPORT:-quic}
+# Confine negotiation to one draft so a failure names the draft it came
+# from; empty would let the client offer everything.
+DRAFT=${DRAFT:-18}
 PASS=0
 FAIL=0
 FAILED_CASES=()
@@ -20,7 +23,7 @@ FAILED_CASES=()
 run_case() {
   local name="$1"; shift
   if timeout 60 "$CLIENT" --url="$URL" --transport="$TRANSPORT" \
-       "$@" >"/tmp/case-$$.log" 2>&1; then
+       --versions="$DRAFT" "$@" >"/tmp/case-$$.log" 2>&1; then
     echo "  PASS  $name"
     PASS=$((PASS + 1))
   else
@@ -31,7 +34,7 @@ run_case() {
   fi
 }
 
-echo "moq-test conformance — client=$CLIENT url=$URL transport=$TRANSPORT"
+echo "moq-test conformance — draft=$DRAFT url=$URL transport=$TRANSPORT"
 echo
 
 echo "Section 1 — forwarding preferences"

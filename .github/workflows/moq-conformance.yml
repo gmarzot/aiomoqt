@@ -3,11 +3,15 @@ name: MoQ conformance
 # draft-afrind-moq-test conformance, driven by moxygen's moqtest_client
 # against aiomoqt as the relay under test:
 #
-#   moqtest_client  --SUBSCRIBE(moq-test-00)-->  aiomoqt relay
-#                                                     |
-#                                                 SUBSCRIBE
-#                                                     v
-#                                              moqtest_server
+#   moqtest_server (listens)  <--SUBSCRIBE--  aiomoqt relay --upstream
+#                                                   ^
+#                                             SUBSCRIBE(moq-test-00)
+#                                                   |
+#                                             moqtest_client
+#
+# This is the arrangement the suite assumes: an origin attached to the
+# relay, with the relay reaching upstream to it. moqtest_server listens
+# and does not dial, so the relay has to be able to dial out.
 #
 # The client encodes its parameters as 16 Track Namespace tuple fields
 # and verifies the objects that come back: group and object numbering,
@@ -42,8 +46,12 @@ env:
 
 jobs:
   conformance:
-    name: moq-test conformance (relay SUT)
+    name: moq-test conformance (relay SUT, d${{ matrix.draft }})
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        draft: [16, 18]
     # Advisory until its first green run lands: this job has never run in
     # CI, and a brand-new harness failing on setup must not block a
     # release before we have seen it pass once. Flip to gating (drop this
@@ -103,30 +111,39 @@ jobs:
             -days 1 -subj "/CN=localhost"
 
       - name: Run conformance against the aiomoqt relay
+        env:
+          DRAFT: ${{ matrix.draft }}
         run: |
           set -o pipefail
-          python -m aiomoqt.tools.moq_interop_relay \
-            --bind 127.0.0.1 --port 4443 --quic --draft 18 \
-            --cert certs/cert.pem --key certs/key.pem \
-            > relay.log 2>&1 &
-          RELAY_PID=$!
+          # Origin first: the relay dials it and retries, but starting in
+          # order keeps the log readable.
           ./harness/bin/moqtest_server \
             --port 9999 --quic \
             --cert certs/cert.pem --key certs/key.pem \
             > upstream.log 2>&1 &
           UP_PID=$!
+          sleep 3
+          python -m aiomoqt.tools.moq_interop_relay \
+            --bind 127.0.0.1 --port 4443 --quic --draft "$DRAFT" \
+            --cert certs/cert.pem --key certs/key.pem \
+            --upstream "moqt://127.0.0.1:9999/" \
+            > relay.log 2>&1 &
+          RELAY_PID=$!
           trap 'kill $RELAY_PID $UP_PID 2>/dev/null || true' EXIT
           for i in $(seq 1 20); do
-            ss -uln | grep -q ':4443' && ss -uln | grep -q ':9999' && break
+            grep -q "upstream connected" relay.log && break
             sleep 1
           done
+          grep -q "upstream connected" relay.log \
+            || { echo "::error::relay never reached the origin"; \
+                 tail -20 relay.log; exit 1; }
           bash .github/scripts/moq-conformance.sh 2>&1 | tee conformance.log
 
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: moq-conformance-logs
+          name: moq-conformance-logs-d${{ matrix.draft }}
           path: |
             relay.log
             upstream.log
