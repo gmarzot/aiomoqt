@@ -27,6 +27,7 @@ from typing import Any, Callable, Dict, Optional
 from ..messages import SubgroupHeader
 from ..messages.data import ObjectDatagram
 from ..track import PublishedTrack, SubscribedTrack
+from ..types import ObjectStatus
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -254,6 +255,9 @@ class LocTrackSubscriber(SubscribedTrack):
         self.config = config
 
     def _on_object(self, msg, size, ts, group_id, subgroup_id) -> None:
+        # End-of-group / end-of-track markers carry no media.
+        if getattr(msg, "status", None) not in (None, ObjectStatus.NORMAL):
+            return
         exts = msg.extensions or {}
         for prop_id in _CONFIG_IDS:
             if prop_id in exts:

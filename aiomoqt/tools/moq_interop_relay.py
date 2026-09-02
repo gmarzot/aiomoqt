@@ -51,7 +51,7 @@ import sys
 from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
 from aiomoqt.types import (
-    FilterType, GroupOrder, MOQTMessageType, RequestErrorCode,
+    FilterType, GroupOrder, MOQTMessageType, ObjectStatus, RequestErrorCode,
     SubscribeErrorCode, parse_draft_spec,
 )
 from aiomoqt.messages import SubgroupHeader
@@ -170,6 +170,12 @@ class _RelayedTrack:
         # (id(session), group, subgroup) -> (stream_id, SubgroupHeader)
         self._streams = {}
 
+    def on_stream_end(self, group_id, subgroup_id):
+        """Upstream closed a subgroup stream: end ours the same way so
+        the subscriber sees a clean group end rather than a reset."""
+        self.queue.put_nowait(
+            (group_id, subgroup_id or 0, None, None, None, None, "END"))
+
     def on_object(self, msg, size, ts, group_id, subgroup_id):
         """Upstream delivery callback (sync) — hand off to the drain."""
         gid = getattr(msg, "group_id", None)
@@ -180,7 +186,8 @@ class _RelayedTrack:
         self.queue.put_nowait(
             (gid, subgroup_id or 0, msg.object_id,
              bytes(msg.payload), msg.extensions or None,
-             128 if prio is None else prio))
+             128 if prio is None else prio,
+             getattr(msg, "status", None)))
 
     def add_downstream(self, session, track_alias):
         self.downstream.append((session, track_alias))
@@ -195,23 +202,27 @@ class _RelayedTrack:
 
     async def _forward_loop(self):
         while True:
-            gid, sgid, oid, payload, exts, prio = await self.queue.get()
+            gid, sgid, oid, payload, exts, prio, status = \
+                await self.queue.get()
             for session, alias in list(self.downstream):
                 try:
                     await self._forward_one(
-                        session, alias, gid, sgid, oid, payload, exts, prio)
+                        session, alias, gid, sgid, oid, payload, exts,
+                        prio, status)
                 except Exception:
                     logger.debug("relay: forward failed, dropping subscriber",
                                  exc_info=True)
                     self.drop_session(session)
 
     async def _forward_one(self, session, alias, gid, sgid, oid,
-                           payload, exts, prio):
+                           payload, exts, prio, status=None):
         """Write one object downstream, opening the (group, subgroup)
         stream on first sight. Group/subgroup identity is preserved from
         upstream so the downstream sees the publisher's structure."""
         skey = (id(session), gid, sgid)
         entry = self._streams.get(skey)
+        if entry is None and status == "END":
+            return
         if entry is None:
             stream_id = await session.open_uni_stream()
             header = SubgroupHeader(
@@ -222,6 +233,20 @@ class _RelayedTrack:
             entry = (stream_id, header)
             self._streams[skey] = entry
         stream_id, header = entry
+        if status == "END":
+            # Upstream closed the subgroup stream without a marker, so
+            # the group end IS the FIN. Writing a marker here would be
+            # inventing one the publisher never sent.
+            session.stream_write(stream_id, b"", end_stream=True)
+            self._streams.pop(skey, None)
+            return
+        if status in (ObjectStatus.END_OF_GROUP, ObjectStatus.END_OF_TRACK):
+            # Upstream sent an explicit marker: forward it, then FIN.
+            buf = header.end_group(
+                object_id=header.next_object_id if oid is None else oid)
+            session.stream_write(stream_id, buf.data, end_stream=True)
+            self._streams.pop(skey, None)
+            return
         buf = header.next_object(payload=payload, extensions=exts,
                                  object_id=oid)
         await session.stream_write_drain(stream_id, buf.data)
@@ -303,6 +328,8 @@ async def _establish_upstream(ns, track_name):
             logger.info(f"relay: upstream subscribe failed on {ns}: {e}")
             continue
         track.upstream = upstream
+        pub.register_stream_end_handler(upstream.track_alias,
+                                        track.on_stream_end)
         _tracks[key] = track
         logger.info(f"relay: upstream established ns={ns} track={name} "
                     f"alias={upstream.track_alias}")
@@ -341,6 +368,7 @@ def _accept_publish(track) -> None:
     session, msg = track.pending_publish
     session._track_aliases[msg.track_alias] = msg.request_id
     session.register_object_handler(msg.track_alias, track.on_object)
+    session.register_stream_end_handler(msg.track_alias, track.on_stream_end)
     ok = PublishOk(
         request_id=msg.request_id, forward=1, priority=128,
         group_order=GroupOrder.ASCENDING,

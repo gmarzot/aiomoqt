@@ -32,6 +32,7 @@ from collections import deque
 from typing import Optional
 
 from .format import fmt_bps, fmt_ms, fmt_rate
+from ..types import ObjectStatus
 
 MOQT_TIMESTAMP_EXT = 0x20
 
@@ -246,6 +247,10 @@ class TrackStats:
 
     def on_object(self, msg, size_bytes: int, recv_time_us: int,
                   group_id: int = None, subgroup_id: int = None) -> None:
+        # Delivery markers are not objects: counting them would inflate
+        # object counts and goodput.
+        if getattr(msg, "status", None) not in (None, ObjectStatus.NORMAL):
+            return
         if self.minimal:
             # Counters only. The clock is read on the first object and
             # then 1-in-1024, which bounds the reported duration error

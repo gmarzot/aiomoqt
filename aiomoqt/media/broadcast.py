@@ -17,7 +17,7 @@ from typing import Callable, Dict, Optional
 
 from ..messages import FetchHeader, FetchObject, SubgroupHeader
 from ..track import PublishedTrack, SubscribedTrack
-from ..types import MOQTMessageType
+from ..types import MOQTMessageType, ObjectStatus
 from ..utils.logger import get_logger
 from .catalog import (
     Catalog, CATALOG_TRACK_NAME, PACKAGING_CMAF, PACKAGING_LOC,
@@ -261,6 +261,9 @@ class MediaSubscriber:
 
     def _on_catalog_object(self, msg, size, ts, group_id,
                            subgroup_id) -> None:
+        # End-of-group / end-of-track markers carry no catalog.
+        if getattr(msg, "status", None) not in (None, ObjectStatus.NORMAL):
+            return
         try:
             update = Catalog.from_json(bytes(msg.payload).decode())
         except Exception as e:

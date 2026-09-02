@@ -282,6 +282,7 @@ class _MOQTSessionMixin:
         # Per-track object delivery keyed by track_alias; falls back to
         # the session-global on_object_received when no entry matches.
         self._object_handlers: Dict[int, Callable] = {}
+        self._stream_end_handlers: Dict[int, Callable] = {}
         # Aliases seen on data streams before any control message bound
         # them: {alias: [first_seen_monotonic, streams_admitted]}. Data
         # legitimately races SUBSCRIBE_OK (§10.4.2), so an entry here is
@@ -506,6 +507,20 @@ class _MOQTSessionMixin:
     def unregister_object_handler(self, track_alias: int) -> None:
         self._object_handlers.pop(track_alias, None)
 
+    def register_stream_end_handler(self, track_alias: int,
+                                    callback: Callable) -> None:
+        """Called as callback(group_id, subgroup_id) when one of this
+        track's subgroup streams ends.
+
+        A publisher may signal end-of-group by closing the subgroup
+        stream rather than by sending an END_OF_GROUP object, so a relay
+        that only watches objects never learns the group ended and
+        leaves its downstream stream open to be reset at teardown."""
+        self._stream_end_handlers[track_alias] = callback
+
+    def unregister_stream_end_handler(self, track_alias: int) -> None:
+        self._stream_end_handlers.pop(track_alias, None)
+
     def _object_cb(self, track_alias) -> Optional[Callable]:
         """Delivery callback for a track: per-alias route, else global."""
         cb = (self._object_handlers.get(track_alias)
@@ -711,6 +726,14 @@ class _MOQTSessionMixin:
         self._uni_peek_stash.pop(stream_id, None)
         self._mark_stream_torn_down(stream_id)
         key = state.key if state is not None else None
+        if key and len(key) == 2 and key[0] == 'subgroup':
+            alias, group_id, subgroup_id = key[1]
+            cb = self._stream_end_handlers.get(alias)
+            if cb:
+                try:
+                    cb(group_id, subgroup_id)
+                except Exception:
+                    logger.debug("stream-end handler raised", exc_info=True)
         if key and len(key) == 2 and key[0] == 'fetch':
             request_id = key[1]
             fut = self._fetch_done_futures.pop(request_id, None)
@@ -834,12 +857,14 @@ class _MOQTSessionMixin:
                 assert (state.object_id is None
                         or msg_obj.object_id > state.object_id)
                 state.object_id = msg_obj.object_id
-                if msg_obj.status in (
+                # END_OF_GROUP / END_OF_TRACK are delivered, not
+                # swallowed: they are part of the track's delivery
+                # semantics and a relay has to forward them. Consumers
+                # that only want media filter on status.
+                terminal = msg_obj.status in (
                     ObjectStatus.END_OF_GROUP,
                     ObjectStatus.END_OF_TRACK,
-                ):
-                    self._cleanup_stream(stream_id)
-                    return
+                )
                 cb = self._object_cb(getattr(state.parser, 'track_alias',
                                              None))
                 if cb:
@@ -848,6 +873,9 @@ class _MOQTSessionMixin:
                         state.parser, 'publisher_priority', None)
                     cb(msg_obj, consumed, now,
                        state.group_id, state.subgroup_id)
+                if terminal:
+                    self._cleanup_stream(stream_id)
+                    return
             elif isinstance(msg_obj, SubgroupHeader):
                 assert (state.group_id is None
                         or msg_obj.group_id > state.group_id)
