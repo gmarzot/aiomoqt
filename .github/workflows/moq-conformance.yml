@@ -24,12 +24,13 @@ name: MoQ conformance
 # moxygen needs folly/proxygen via getdeps, far too slow for a gate).
 # The tag is pinned in .github/moxygen-pin.
 #
-# Runs on push to main and on demand. workflow_dispatch accepts a ref,
-# so a PR can be checked without making every PR pay for the run.
+# Runs on push to main and to a release branch, and on demand.
+# workflow_dispatch is only offered for workflows present on the default
+# branch, so until this lands on main the branch trigger is what runs it.
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'gmarzot-*']
   workflow_dispatch:
     inputs:
       ref:
