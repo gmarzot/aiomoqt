@@ -71,6 +71,18 @@ logger = get_logger(__name__)
 _announced: dict[tuple, int] = {}
 
 
+def _announced_match(ns: tuple) -> bool:
+    """True when any announced namespace covers `ns`.
+
+    Namespace Prefix Matching (transport §2.4): fields are compared
+    sequentially and each must match exactly; an announcement with the
+    same or fewer fields than the request qualifies. So announcing
+    (foo) covers a SUBSCRIBE for (foo, bar), while (foobar) does not —
+    which is why this compares tuple fields and never a joined string.
+    """
+    return any(len(a) <= len(ns) and ns[:len(a)] == a for a in _announced)
+
+
 def _ns_tuple(namespace):
     """Normalize a namespace value (str / list / tuple of bytes-or-str)
     into a tuple of bytes for use as a dict key."""
@@ -110,7 +122,7 @@ async def _on_publish_namespace_done(session, msg):
 async def _on_subscribe(session, msg):
     """Accept SUBSCRIBE for announced namespaces, error otherwise."""
     ns = _ns_tuple(msg.track_namespace)
-    if ns in _announced:
+    if _announced_match(ns):
         logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
                     f"-> SUBSCRIBE_OK")
         session.subscribe_ok(request_msg=msg)
