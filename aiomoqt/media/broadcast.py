@@ -26,13 +26,19 @@ from .loc import LocTrackPublisher, LocTrackSubscriber
 
 logger = get_logger(__name__)
 
+# §5.2: the catalog track SHOULD outrank every track it describes.
+# MoQT priority is ascending-urgency, so this sits below the
+# PublishedTrack default of 128 that the media tracks take.
+CATALOG_PUBLISHER_PRIORITY = 64
+
 
 class CatalogTrackPublisher(PublishedTrack):
     """Publishes the "catalog" track: the current independent catalog
     opens each group; queued deltas follow as Objects >= 1."""
 
     def __init__(self, session, namespace: str, catalog: Catalog):
-        super().__init__(session, namespace, CATALOG_TRACK_NAME)
+        super().__init__(session, namespace, CATALOG_TRACK_NAME,
+                         priority=CATALOG_PUBLISHER_PRIORITY)
         self.catalog = catalog
         # The catalog track has content by construction: the current
         # independent catalog is emitted as (0, 0) on first demand, so

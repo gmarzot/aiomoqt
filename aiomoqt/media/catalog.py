@@ -23,17 +23,27 @@ MSF_VERSIONS = ("1", "draft-01")
 # §5.2.3: the catalog track's Track Name, exact and case-sensitive.
 CATALOG_TRACK_NAME = "catalog"
 
-# §5.2.4 packaging values (CMSF adds "cmaf").
+# §5.2.4 packaging values (CMSF adds "cmaf"; "catalog" marks a track
+# that is itself a nested catalog, §5.2).
 PACKAGING_LOC = "loc"
 PACKAGING_CMAF = "cmaf"
+PACKAGING_CATALOG = "catalog"
 PACKAGING_MEDIA_TIMELINE = "mediatimeline"
 PACKAGING_EVENT_TIMELINE = "eventtimeline"
 PACKAGING_MOQLOG = "moqlog"
 PACKAGING_MOQMETRICS = "moqmetrics"
 _KNOWN_PACKAGING = frozenset({
-    PACKAGING_LOC, PACKAGING_CMAF, PACKAGING_MEDIA_TIMELINE,
-    PACKAGING_EVENT_TIMELINE, PACKAGING_MOQLOG, PACKAGING_MOQMETRICS,
+    PACKAGING_LOC, PACKAGING_CMAF, PACKAGING_CATALOG,
+    PACKAGING_MEDIA_TIMELINE, PACKAGING_EVENT_TIMELINE,
+    PACKAGING_MOQLOG, PACKAGING_MOQMETRICS,
 })
+
+# §5.1.7 initialization reference types.
+INIT_TYPE_INLINE = "inline"
+INIT_TYPE_TRACK_PROPERTY = "track-property"
+INIT_TYPE_OBJECT_PROPERTY = "object-property"
+_PROPERTY_INIT_TYPES = frozenset({INIT_TYPE_TRACK_PROPERTY,
+                                  INIT_TYPE_OBJECT_PROPERTY})
 
 _AV_ROLES = frozenset({"audio", "video"})
 
@@ -44,18 +54,36 @@ class CatalogError(ValueError):
 
 @dataclass
 class InitData:
-    """§5.1.7 initialization reference (type "inline" = base64 data)."""
+    """§5.1.7 initialization reference. "inline" carries base64 data;
+    "track-property" / "object-property" name a property type in hex
+    whose value carries the payload on the wire instead."""
     id: str
     data: str = ""
-    type: str = "inline"
+    type: str = INIT_TYPE_INLINE
 
     @classmethod
     def from_bytes(cls, id: str, payload: bytes) -> "InitData":
         return cls(id=id, data=base64.b64encode(payload).decode())
 
     @property
-    def payload(self) -> bytes:
+    def payload(self) -> Optional[bytes]:
+        """Init bytes, or None when they ride an MSF_INITIALIZATION
+        property rather than the catalog."""
+        if self.type != INIT_TYPE_INLINE:
+            return None
         return base64.b64decode(self.data)
+
+    @property
+    def property_type(self) -> Optional[int]:
+        """Property type id for the property-carried reference types."""
+        if self.type not in _PROPERTY_INIT_TYPES:
+            return None
+        try:
+            return int(self.data, 16)
+        except ValueError as e:
+            raise CatalogError(
+                f"initDataList {self.id!r}: {self.type} data "
+                f"{self.data!r} is not hex") from e
 
     def to_dict(self) -> Dict[str, Any]:
         return {"id": self.id, "type": self.type, "data": self.data}
@@ -130,7 +158,8 @@ _TRACK_KEYS = tuple(
 
 @dataclass
 class DeltaOp:
-    """§5.1.6 delta operation: op in {"add", "remove", "clone"}."""
+    """§5.1.6 delta operation: op in {"add", "remove", "clone",
+    "update"}."""
     op: str
     tracks: List[CatalogTrack] = field(default_factory=list)
 
@@ -148,7 +177,7 @@ class DeltaOp:
 class Catalog:
     """Root catalog (§5.1) — independent, or a delta when deltaUpdate is
     set (a delta carries no version and no tracks, §5.3)."""
-    version: Optional[str] = "1"
+    version: Optional[str] = "draft-01"
     generatedAt: Optional[int] = None
     isComplete: Optional[bool] = None
     tracks: List[CatalogTrack] = field(default_factory=list)
@@ -249,7 +278,8 @@ class Catalog:
             raise CatalogError("apply() requires a delta update catalog")
         for op in update.deltaUpdate:
             handler = {"add": self._op_add, "remove": self._op_remove,
-                       "clone": self._op_clone}.get(op.op)
+                       "clone": self._op_clone,
+                       "update": self._op_update}.get(op.op)
             if handler is None:
                 raise CatalogError(f"unknown delta op: {op.op!r}")
             for t in op.tracks:
@@ -264,10 +294,27 @@ class Catalog:
     def _op_add(self, t: CatalogTrack) -> None:
         if not t.name:
             raise CatalogError("add: track has no name")
-        # §5.3: track attributes are immutable per (namespace, name).
         if any(x.key == t.key for x in self.tracks):
             raise CatalogError(f"add: track {t.key} already declared")
         self.tracks.append(t)
+
+    def _op_update(self, t: CatalogTrack) -> None:
+        """§5.1.6 "update": override a subset of an existing track's
+        fields. The section requires Parent Name to key the target, but
+        its own example keys by Track Name — accept either."""
+        name = t.parentName or t.name
+        namespace = t.parentNamespace if t.parentName else t.namespace
+        if not name:
+            raise CatalogError("update: track has no name or parentName")
+        found = self.find(name, namespace)
+        if found is None:
+            raise CatalogError(f"update: unknown track {(namespace, name)}")
+        merged = found.to_dict()
+        overrides = t.to_dict()
+        overrides.pop("parentName", None)
+        overrides.pop("parentNamespace", None)
+        merged.update(overrides)
+        self.tracks[self.tracks.index(found)] = CatalogTrack.from_dict(merged)
 
     def _op_remove(self, t: CatalogTrack) -> None:
         found = self.find(t.name, t.namespace)

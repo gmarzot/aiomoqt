@@ -184,3 +184,57 @@ def test_find_ambiguity():
     with pytest.raises(CatalogError, match="ambiguous"):
         cat.find("video")
     assert cat.find("video", "other/ns").namespace == "other/ns"
+
+
+def test_delta_update_by_parent_name():
+    # §5.1.6 "update": Parent Name keys the target track.
+    cat = Catalog.from_dict(_AV_CATALOG)
+    cat.apply(Catalog.delta([DeltaOp("update", [
+        CatalogTrack(parentName="video", bitrate=4000000)])]))
+    video = cat.find("video")
+    assert video.bitrate == 4000000
+    assert video.width == 1280  # untouched fields survive
+    assert len(cat.tracks) == 2  # updates in place, does not append
+
+
+def test_delta_update_by_track_name():
+    # The section's own example keys by Track Name instead.
+    cat = Catalog.from_dict(_AV_CATALOG)
+    cat.apply(Catalog.delta([DeltaOp("update", [
+        CatalogTrack(name="video", bitrate=4000000)])]))
+    assert cat.find("video").bitrate == 4000000
+    assert len(cat.tracks) == 2
+
+
+def test_delta_update_unknown_track_errors():
+    cat = Catalog.from_dict(_AV_CATALOG)
+    with pytest.raises(CatalogError, match="update: unknown track"):
+        cat.apply(Catalog.delta([DeltaOp("update", [
+            CatalogTrack(parentName="nope", bitrate=1)])]))
+
+
+def test_default_version_is_the_draft_convention():
+    assert Catalog().version == "draft-01"
+    assert Catalog.from_dict(dict(_AV_CATALOG, version="draft-01")) is not None
+
+
+def test_catalog_packaging_accepted():
+    cat = Catalog.from_dict({
+        "version": "draft-01",
+        "tracks": [{"name": "premium-catalog", "packaging": "catalog",
+                    "isLive": True}],
+    })
+    assert cat.validate() == []
+
+
+def test_property_carried_init_data():
+    entry = InitData(id="v", data="0x79", type="track-property")
+    assert entry.property_type == 0x79
+    assert entry.payload is None  # rides a property, not the catalog
+    inline = InitData.from_bytes("a", b"\x12\x10")
+    assert inline.payload == b"\x12\x10" and inline.property_type is None
+
+
+def test_property_init_data_round_trips():
+    d = {"id": "v", "type": "object-property", "data": "0x0D"}
+    assert InitData.from_dict(d).to_dict() == d
