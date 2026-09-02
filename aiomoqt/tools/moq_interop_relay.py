@@ -134,9 +134,13 @@ class _RelayedTrack:
         """Upstream delivery callback (sync) — hand off to the drain."""
         gid = getattr(msg, "group_id", None)
         gid = gid if gid is not None else group_id
+        # Forward the publisher's priority, never a substitute of our
+        # own: a subscriber's scheduling depends on it.
+        prio = getattr(msg, "publisher_priority", None)
         self.queue.put_nowait(
             (gid, subgroup_id or 0, msg.object_id,
-             bytes(msg.payload), msg.extensions or None))
+             bytes(msg.payload), msg.extensions or None,
+             128 if prio is None else prio))
 
     def add_downstream(self, session, track_alias):
         self.downstream.append((session, track_alias))
@@ -151,18 +155,18 @@ class _RelayedTrack:
 
     async def _forward_loop(self):
         while True:
-            gid, sgid, oid, payload, exts = await self.queue.get()
+            gid, sgid, oid, payload, exts, prio = await self.queue.get()
             for session, alias in list(self.downstream):
                 try:
                     await self._forward_one(
-                        session, alias, gid, sgid, oid, payload, exts)
+                        session, alias, gid, sgid, oid, payload, exts, prio)
                 except Exception:
                     logger.debug("relay: forward failed, dropping subscriber",
                                  exc_info=True)
                     self.drop_session(session)
 
     async def _forward_one(self, session, alias, gid, sgid, oid,
-                           payload, exts):
+                           payload, exts, prio):
         """Write one object downstream, opening the (group, subgroup)
         stream on first sight. Group/subgroup identity is preserved from
         upstream so the downstream sees the publisher's structure."""
@@ -172,7 +176,7 @@ class _RelayedTrack:
             stream_id = await session.open_uni_stream()
             header = SubgroupHeader(
                 track_alias=alias, group_id=gid, subgroup_id=sgid,
-                publisher_priority=128, extensions_present=True,
+                publisher_priority=prio, extensions_present=True,
                 prof=session._profile)
             session.stream_write(stream_id, header.serialize().data)
             entry = (stream_id, header)

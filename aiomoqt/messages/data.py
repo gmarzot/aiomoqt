@@ -286,6 +286,11 @@ class ObjectHeader(MOQTMessage):
     extensions: Optional[Dict[int, Union[bytes, int]]] = None
     status: Optional[ObjectStatus] = ObjectStatus.NORMAL
     payload: bytes = b''
+    # Carried from the enclosing SubgroupHeader on receive, never on the
+    # wire here: a relay must forward the publisher's priority and the
+    # object alone does not record it. None when not delivered from a
+    # subgroup stream.
+    publisher_priority: Optional[int] = None
 
     def serialize(self, extensions_present: bool = True,
                   prev_object_id: Optional[int] = None,

@@ -31,7 +31,7 @@ class _Pub(PublishedTrack):
         sid = await session.open_uni_stream()
         hdr = SubgroupHeader(
             track_alias=track_alias, group_id=0, subgroup_id=0,
-            publisher_priority=128, extensions_present=True,
+            publisher_priority=200, extensions_present=True,
             prof=session._profile)
         session.stream_write(sid, hdr.serialize().data)
         for i, payload in enumerate(_FRAMES):
@@ -71,7 +71,7 @@ async def _run(port, pub_ns, sub_ns, draft=18):
                 sub = SubscribedTrack(
                     sub_session, sub_ns, "video",
                     on_object=lambda m, s, t, g, sg: got.append(
-                        bytes(m.payload)))
+                        (bytes(m.payload), m.publisher_priority)))
                 try:
                     await sub.subscribe(timeout=8.0)
                 except Exception as e:
@@ -92,7 +92,7 @@ async def test_objects_traverse_the_relay(draft):
     got, err = await _run(_BASE_PORT + 10 + draft, "relay/ns", "relay/ns",
                           draft=draft)
     assert err is None, f"d{draft} subscribe failed: {err}"
-    assert got == _FRAMES
+    assert [p for p, _ in got] == _FRAMES
 
 
 @pytest.mark.asyncio
@@ -100,10 +100,19 @@ async def test_subscribe_reaches_a_prefix_publisher():
     # §2.4: announcing (relay) must serve a SUBSCRIBE for (relay, sub).
     got, err = await _run(_BASE_PORT + 1, "relay", "relay/sub")
     assert err is None, f"prefix subscribe failed: {err}"
-    assert got == _FRAMES
+    assert [p for p, _ in got] == _FRAMES
 
 
 @pytest.mark.asyncio
 async def test_unannounced_namespace_still_errors():
     got, err = await _run(_BASE_PORT + 2, "relay/ns", "other/ns")
     assert err is not None, "subscribe to an unannounced namespace was acked"
+
+
+@pytest.mark.asyncio
+async def test_publisher_priority_survives_the_relay():
+    """A relay forwards the publisher's priority, not one of its own —
+    a subscriber's scheduling depends on it."""
+    got, err = await _run(_BASE_PORT + 30, "relay/ns", "relay/ns", draft=18)
+    assert err is None, f"subscribe failed: {err}"
+    assert [prio for _, prio in got] == [200] * len(_FRAMES), got

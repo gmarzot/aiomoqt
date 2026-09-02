@@ -132,6 +132,10 @@ class _DataStreamState:
     group_id: Optional[int] = None
     subgroup_id: Optional[int] = None
     object_id: Optional[int] = None
+    # From the subgroup header. A relay has to forward the publisher's
+    # priority rather than substitute its own, so it has to be able to
+    # see it: the object itself does not carry it.
+    publisher_priority: Optional[int] = None
 
 
 class _MOQTSessionMixin:
@@ -840,6 +844,8 @@ class _MOQTSessionMixin:
                                              None))
                 if cb:
                     now = int(time.time() * 1_000_000)
+                    msg_obj.publisher_priority = getattr(
+                        state.parser, 'publisher_priority', None)
                     cb(msg_obj, consumed, now,
                        state.group_id, state.subgroup_id)
             elif isinstance(msg_obj, SubgroupHeader):
@@ -847,6 +853,7 @@ class _MOQTSessionMixin:
                         or msg_obj.group_id > state.group_id)
                 state.group_id = msg_obj.group_id
                 state.subgroup_id = msg_obj.subgroup_id
+                state.publisher_priority = msg_obj.publisher_priority
             elif isinstance(msg_obj, FetchHeader):
                 pass
             elif isinstance(msg_obj, FetchObject):
