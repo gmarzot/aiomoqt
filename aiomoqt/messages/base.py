@@ -447,12 +447,16 @@ class MOQTMessage:
                 payload.push_vint(param_type)  # Type
 
             if param_type in prof.location_params:
-                # Inline Location value: group + object varints, no length
-                # prefix (d18 LARGEST_OBJECT 0x09). Value is a (group, object)
-                # tuple.
+                # Location value (d18 LARGEST_OBJECT 0x09). The type is
+                # odd, so §1.4.3's Length field applies; the value bytes
+                # are a group + object varint pair.
                 loc_group, loc_object = param_value
-                payload.push_vint(loc_group)
-                payload.push_vint(loc_object)
+                loc = Buffer(capacity=BUF_SIZE, vi64=prof.vi64)
+                loc.push_vint(loc_group)
+                loc.push_vint(loc_object)
+                loc_bytes = loc.data_slice(0, loc.tell())
+                payload.push_vint(len(loc_bytes))
+                payload.push_bytes(loc_bytes)
             elif param_type % 2 == 1:  # Odd type - includes Length field
                 # Value is bytes or string
                 if isinstance(param_value, str):
@@ -518,11 +522,23 @@ class MOQTMessage:
                 param_type = raw_key
 
             if param_type in prof.location_params:
-                # Inline Location value: group + object varints, no length
-                # prefix (d18 LARGEST_OBJECT 0x09). Read both regardless of
-                # the odd/even rule; stored as a (group, object) tuple.
+                # Location value (d18 LARGEST_OBJECT 0x09). The type is
+                # odd, so §1.4.3's Length field is present; the value
+                # bytes are a group + object varint pair. Stored as a
+                # (group, object) tuple.
+                param_len = buf.pull_vint()
+                loc_end = buf.tell() + param_len
+                if buf_end is not None and loc_end > buf_end:
+                    raise MOQTProtocolViolation(
+                        f"param 0x{param_type:x} length {param_len} "
+                        f"overruns message end ({loc_end} > {buf_end})")
                 loc_group = buf.pull_vint()
                 loc_object = buf.pull_vint()
+                if buf.tell() != loc_end:
+                    raise MOQTProtocolViolation(
+                        f"param 0x{param_type:x} Location consumed "
+                        f"{buf.tell() - (loc_end - param_len)} of "
+                        f"{param_len} declared bytes")
                 param_value = (loc_group, loc_object)
             elif param_type % 2 == 1:  # Odd type - includes Length field
                 param_len = buf.pull_vint()

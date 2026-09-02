@@ -1192,11 +1192,12 @@ class TestDraft18ControlMessages:
         )
 
     def test_subscribe_ok_d18_largest_is_inline_location(self):
-        # d18 LARGEST_OBJECT (0x09) is a Location value: group + object
-        # varints written INLINE with NO length prefix (moxygen
-        # paramEncodingV18). Guards the regression where the generic
-        # odd-type rule read the group as a length and overran the buffer
-        # for subscribers joining a track that already has objects.
+        # d18 LARGEST_OBJECT (0x09) is a Location value. The key is odd,
+        # so transport §1.4.3's Length field applies and the value bytes
+        # are a group + object varint pair. Cloudflare's d18 relay emits
+        # it this way and moxygen's parser requires it (MoQFramer.cpp
+        # "odd key = length-prefixed", rejecting a Location that does not
+        # consume the declared bytes).
         from aiomoqt.context import profile_for
         prof = profile_for(18)
         msg = SubscribeOk(
@@ -1212,10 +1213,11 @@ class TestDraft18ControlMessages:
         assert w.pull_vint() == 42      # track_alias (no request_id on d18 wire)
         assert w.pull_vint() == 1       # param count
         assert w.pull_vint() == 0x09    # LARGEST_OBJECT key (delta from 0)
-        # INLINE Location: the next bytes are the group and object varints,
-        # NOT a length prefix. A length-prefixed encoding would read 0x?? here.
+        value_len = w.pull_vint()       # §1.4.3 Length (odd key)
+        start = w.tell()
         assert w.pull_vint() == 5       # group
         assert w.pull_vint() == 200     # object
+        assert w.tell() - start == value_len
         rt = SubscribeOk.deserialize(Buffer(data=body, vi64=prof.vi64),
                                      prof=prof, buf_end=len(body))
         assert (rt.largest_group_id, rt.largest_object_id) == (5, 200)
