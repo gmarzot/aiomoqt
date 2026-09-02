@@ -1,0 +1,134 @@
+name: MoQ conformance
+
+# draft-afrind-moq-test conformance, driven by moxygen's moqtest_client
+# against aiomoqt as the relay under test:
+#
+#   moqtest_client  --SUBSCRIBE(moq-test-00)-->  aiomoqt relay
+#                                                     |
+#                                                 SUBSCRIBE
+#                                                     v
+#                                              moqtest_server
+#
+# The client encodes its parameters as 16 Track Namespace tuple fields
+# and verifies the objects that come back: group and object numbering,
+# payload sizes, forwarding preference, end-of-group markers and object
+# extensions. That is an independent oracle — unlike our own round-trip
+# tests, it cannot share a misconception with our encoder, and unlike a
+# lenient peer it checks rather than tolerates.
+#
+# Binaries come from an openmoq/moxygen release artifact (no build:
+# moxygen needs folly/proxygen via getdeps, far too slow for a gate).
+# The tag is pinned in .github/moxygen-pin.
+#
+# Runs on push to main and on demand. workflow_dispatch accepts a ref,
+# so a PR can be checked without making every PR pay for the run.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch or SHA to test (defaults to the current ref)'
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  conformance:
+    name: moq-test conformance (relay SUT)
+    runs-on: ubuntu-24.04
+    # Advisory until its first green run lands: this job has never run in
+    # CI, and a brand-new harness failing on setup must not block a
+    # release before we have seen it pass once. Flip to gating (drop this
+    # line) as soon as it does.
+    continue-on-error: true
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-aiomoqt
+
+      - name: Resolve the pinned moxygen harness
+        id: pin
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=$(grep -vE '^[[:space:]]*(#|$)' .github/moxygen-pin | head -n1)
+          echo "harness pinned to openmoq/moxygen@$TAG"
+          # A rolling snapshot tag holds no assets; its body names the
+          # per-rev release that does.
+          if ! gh release view "$TAG" -R openmoq/moxygen \
+                 --json assets --jq '.assets[].name' | grep -q .; then
+            TAG=$(gh release view "$TAG" -R openmoq/moxygen \
+                    --json body --jq '.body' \
+                  | grep -oE 'snapshot-[0-9a-f]{12}' | head -n1)
+            echo "rolling pointer resolved to $TAG"
+          fi
+          [ -n "$TAG" ] || { echo "::error::could not resolve harness tag"; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch moq-test binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download "${{ steps.pin.outputs.tag }}" \
+            -R openmoq/moxygen -p "moxygen-ubuntu-24.04-amd64.tar.gz" --clobber
+          mkdir -p harness
+          tar -C harness -xzf moxygen-ubuntu-24.04-amd64.tar.gz
+          # The tarball ships static .a archives, not runtime .so files, so
+          # the binaries still need the system libs their build assumed.
+          sudo apt-get update -qq
+          sudo apt-get install -y libgoogle-glog0v6t64 \
+            || sudo apt-get install -y libgoogle-glog0v6
+          ./harness/bin/moqtest_client --help >/dev/null 2>&1 \
+            || { ldd ./harness/bin/moqtest_client; \
+                 echo "::error::moqtest_client not runnable"; exit 1; }
+          echo "harness ready: $(ls harness/bin | tr '\n' ' ')"
+
+      - name: Generate certs
+        run: |
+          mkdir -p certs
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout certs/key.pem -out certs/cert.pem \
+            -days 1 -subj "/CN=localhost"
+
+      - name: Run conformance against the aiomoqt relay
+        run: |
+          set -o pipefail
+          python -m aiomoqt.tools.moq_interop_relay \
+            --bind 127.0.0.1 --port 4443 --quic --draft 18 \
+            --cert certs/cert.pem --key certs/key.pem \
+            > relay.log 2>&1 &
+          RELAY_PID=$!
+          ./harness/bin/moqtest_server \
+            --port 9999 --quic \
+            --cert certs/cert.pem --key certs/key.pem \
+            > upstream.log 2>&1 &
+          UP_PID=$!
+          trap 'kill $RELAY_PID $UP_PID 2>/dev/null || true' EXIT
+          for i in $(seq 1 20); do
+            ss -uln | grep -q ':4443' && ss -uln | grep -q ':9999' && break
+            sleep 1
+          done
+          bash .github/scripts/moq-conformance.sh 2>&1 | tee conformance.log
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: moq-conformance-logs
+          path: |
+            relay.log
+            upstream.log
+            conformance.log
+          if-no-files-found: warn

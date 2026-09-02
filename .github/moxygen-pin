@@ -1,0 +1,15 @@
+# Release tag in openmoq/moxygen supplying the moq-test conformance
+# binaries (moqtest_client, moqtest_server, moqrelayserver).
+#
+# Pinned deliberately. `snapshot-latest` moves on every push to
+# openmoq/moxygen main, and a gate that follows it goes red on upstream's
+# schedule rather than ours — which is exactly how an unpinned qh3 turned
+# the aiopquic peer-interop gate red the day qh3 2.0.0 shipped.
+#
+# Bump this line to adopt a newer harness, and expect to read the
+# conformance diff when you do.
+#
+# A rolling snapshot tag carries no assets of its own: it is a pointer
+# whose body names the per-rev release holding them. Use either a version
+# tag (v0.3.0) or a resolved per-rev tag (snapshot-<sha12>).
+snapshot-e0918d648d79
