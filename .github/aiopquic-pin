@@ -1,9 +1,0 @@
-# Build aiopquic from source at this ref instead of resolving it from PyPI.
-# One `owner/repo@ref` line; ref may be a branch, a tag, refs/pull/N/head, or
-# a full 40-char SHA. Branch and PR refs track that head.
-#
-# DELETE THIS FILE BEFORE MERGING TO MAIN — pin-guard fails the build if it
-# survives, since a pinned build means the release depends on unpublished code.
-# Deleting it also means raising the aiopquic floor in pyproject.toml: the
-# current >=0.3.11 admits a release with no aiopquic.asyncio.dispatch.
-gmarzot/aiopquic@refs/pull/25/head
