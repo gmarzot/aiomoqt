@@ -118,14 +118,10 @@ class PublishedTrack(Track):
     def _withdraw_namespace(self, session) -> None:
         """Release the namespace at teardown so the relay cleans up.
 
-        d14/d16 withdraw with PUBLISH_NAMESPACE_DONE. d18 has no such
-        message — PUBLISH_NAMESPACE owns a bidirectional stream there and
-        withdrawal is RESET_STREAM / STOP_SENDING on it, which this
-        session does not yet drive; the relay reclaims the namespace when
-        the session closes.
+        d14/d16 send PUBLISH_NAMESPACE_DONE; d18 resets the announce's
+        request stream instead. publish_namespace_done() picks the right
+        one for the negotiated draft.
         """
-        if session.negotiated_draft >= 18:
-            return
         try:
             session.publish_namespace_done(namespace=self.namespace)
         except Exception:

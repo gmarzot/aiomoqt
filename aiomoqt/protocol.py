@@ -2627,11 +2627,28 @@ class _MOQTSessionMixin:
         namespace: Tuple[bytes, ...] = None,
         request_id: int = None,
     ) -> Optional[MOQTMessage]:
-        """Withdraw track namespace announcement. (no reply expected)
+        """Withdraw a track namespace announcement.
 
-        Draft-14: takes namespace tuple.
-        Draft-16: takes request_id of the original PUBLISH_NAMESPACE.
+        Draft-14 takes the namespace tuple, draft-16 the request_id of
+        the original PUBLISH_NAMESPACE, and both send
+        PUBLISH_NAMESPACE_DONE. Draft-18 has no such message: a request
+        owns a bidirectional stream and is cancelled by abruptly
+        terminating it (§3.3.2), so the withdrawal is a RESET_STREAM on
+        the announce's own stream and no message is sent. Returns None
+        in that case.
         """
+        if self.negotiated_draft >= 18:
+            stream_id = self._bidi_streams.get(request_id)
+            if stream_id is None:
+                logger.debug(
+                    f"d18 namespace withdraw: no request stream for "
+                    f"request_id={request_id}; nothing to reset")
+                return None
+            logger.info(f"MOQT: d18 namespace withdraw: reset request "
+                        f"stream {stream_id} (request_id={request_id})")
+            self.stream_reset(stream_id, SessionCloseCode.NO_ERROR)
+            self._bidi_streams.pop(request_id, None)
+            return None
         message = PublishNamespaceDone(namespace=namespace, request_id=request_id)
         logger.info(f"MOQT send: {message}")
         self.send_control_message(message)

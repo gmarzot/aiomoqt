@@ -407,10 +407,15 @@ async def test_publish_namespace_done(host, port, path, use_quic,
                     wait_response=True,
                 )
                 ns_tuple = session._make_namespace_tuple(INTEROP_NAMESPACE)
-                session.publish_namespace_done(
+                # d14/d16 send PUBLISH_NAMESPACE_DONE; d18 has no such
+                # message and withdraws by resetting the announce's
+                # request stream (§3.3.2).
+                withdrew = session.publish_namespace_done(
                     namespace=ns_tuple,
                     request_id=response.request_id,
                 )
+                how = ("PUBLISH_NAMESPACE_DONE sent" if withdrew is not None
+                       else "announce stream reset")
                 await asyncio.sleep(0.1)
                 session.close()
 
@@ -418,7 +423,7 @@ async def test_publish_namespace_done(host, port, path, use_quic,
             name="publish-namespace-done", passed=True,
             duration_ms=(time.monotonic() - t0) * 1000,
             connection_id=cid,
-            message="PUBLISH_NAMESPACE_OK received, PUBLISH_NAMESPACE_DONE sent",
+            message=f"PUBLISH_NAMESPACE_OK received, {how}",
         )
     except Exception as e:
         return TestResult(
