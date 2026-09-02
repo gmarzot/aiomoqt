@@ -50,9 +50,11 @@ import sys
 
 from aiomoqt.server import MOQTServer
 from aiomoqt.types import (
-    MOQTMessageType, RequestErrorCode, SubscribeErrorCode, parse_draft_spec,
+    FilterType, GroupOrder, MOQTMessageType, RequestErrorCode,
+    SubscribeErrorCode, parse_draft_spec,
 )
 from aiomoqt.messages import SubgroupHeader
+from aiomoqt.messages.publish import PublishOk
 from aiomoqt.messages.request import RequestError
 from aiomoqt.track import SubscribedTrack
 from aiomoqt.context import is_draft16_or_later
@@ -120,6 +122,8 @@ class _RelayedTrack:
     def __init__(self, key):
         self.key = key
         self.upstream = None
+        # Flow B: the publisher's PUBLISH, held until someone subscribes.
+        self.pending_publish = None   # (session, Publish msg)
         self.downstream = []          # list of (session, track_alias)
         self.queue = asyncio.Queue()
         self.task = None
@@ -262,9 +266,63 @@ async def _establish_upstream(ns, track_name):
     return None
 
 
+async def _on_publish(session, msg):
+    """Flow B: a publisher offers a track with no prior
+    PUBLISH_NAMESPACE (transport 0x1D, present in d14/d16/d18 alike).
+
+    The PUBLISH_OK is held until a subscriber arrives. This relay keeps
+    no group cache, so accepting data before anyone wants it would
+    publish the track into a void and leave a later subscriber with a
+    partial track. Holding the reply keeps the publisher parked instead;
+    its transaction timeout is far longer than the wait.
+    """
+    ns = _ns_tuple(msg.track_namespace)
+    key = (ns, msg.track_name)
+    track = _tracks.get(key)
+    if track is None:
+        track = _RelayedTrack(key)
+        _tracks[key] = track
+    track.pending_publish = (session, msg)
+    logger.info(f"relay: publish ns={ns} track={msg.track_name} "
+                f"alias={msg.track_alias} — holding PUBLISH_OK for a "
+                f"subscriber")
+    if track.downstream:
+        _accept_publish(track)
+
+
+def _accept_publish(track) -> None:
+    """Answer a held PUBLISH with forward=1 and start taking objects."""
+    if track.pending_publish is None or track.upstream is not None:
+        return
+    session, msg = track.pending_publish
+    session._track_aliases[msg.track_alias] = msg.request_id
+    session.register_object_handler(msg.track_alias, track.on_object)
+    ok = PublishOk(
+        request_id=msg.request_id, forward=1, priority=128,
+        group_order=GroupOrder.ASCENDING,
+        filter_type=FilterType.LATEST_OBJECT, parameters={})
+    logger.info(f"relay: PUBLISH_OK forward=1 alias={msg.track_alias}")
+    session._send_reply(msg.request_id, ok)
+    track.upstream = session
+    track.pending_publish = None
+
+
 async def _on_subscribe(session, msg):
     """Relay a SUBSCRIBE: establish upstream, then fan out downstream."""
     ns = _ns_tuple(msg.track_namespace)
+
+    # Flow B first: a track already offered by PUBLISH is served from
+    # that offer, no upstream SUBSCRIBE needed.
+    track = _tracks.get((ns, msg.track_name))
+    if track is not None and (track.pending_publish or track.upstream):
+        ok = session.subscribe_ok(request_msg=msg)
+        track.add_downstream(session, ok.track_alias)
+        _accept_publish(track)
+        logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
+                    f"-> SUBSCRIBE_OK (published track, fanout="
+                    f"{len(track.downstream)})")
+        return
+
     if _announced_match(ns):
         track = await _establish_upstream(ns, msg.track_name)
         if track is not None:
@@ -376,6 +434,8 @@ def _build_server(bind, port, cert, key, use_quic, draft):
         MOQTMessageType.PUBLISH_NAMESPACE_DONE, _on_publish_namespace_done)
     server.register_handler(
         MOQTMessageType.SUBSCRIBE, _on_subscribe)
+    server.register_handler(
+        MOQTMessageType.PUBLISH, _on_publish)
     return server
 
 
