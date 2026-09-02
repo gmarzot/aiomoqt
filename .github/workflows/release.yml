@@ -44,8 +44,18 @@ jobs:
                "got '$VERSION'" >&2
           exit 1
         fi
+        # A publish step can fail on a transient upload error after the
+        # tag is pushed. Re-dispatching then has to be able to reuse a
+        # tag that already points at this commit; a tag pointing anywhere
+        # else is still a hard error.
         if git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null; then
-          echo "error: tag '$VERSION' already exists" >&2
+          existing=$(git rev-parse "refs/tags/$VERSION^{commit}")
+          if [ "$existing" = "$(git rev-parse HEAD)" ]; then
+            echo "tag '$VERSION' already at HEAD — reusing it (publish retry)"
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "error: tag '$VERSION' exists at $existing, not HEAD" >&2
           exit 1
         fi
         git config user.name "github-actions[bot]"
@@ -112,7 +122,15 @@ jobs:
         SETUPTOOLS_SCM_PRETEND_VERSION_FOR_AIOMOQT: ${{ needs.tag.outputs.version }}
       run: |
         python -m build
-        twine upload dist/*
+        # TestPyPI is a staging gate; retry it and skip files a previous
+        # attempt already landed. Production stays strict below.
+        for attempt in 1 2 3; do
+          twine upload --skip-existing --non-interactive dist/* && exit 0
+          echo "TestPyPI upload attempt $attempt failed; retrying in 30s" >&2
+          sleep 30
+        done
+        echo "error: TestPyPI upload failed after 3 attempts" >&2
+        exit 1
 
   publish-prod:
     needs: [tag, test, publish-test]
