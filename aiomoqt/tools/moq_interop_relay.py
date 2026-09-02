@@ -128,11 +128,46 @@ def _announced_match(ns: tuple) -> list[tuple]:
     return sorted(hits, key=len, reverse=True)
 
 
+def _track_live(track) -> bool:
+    """A track is usable while the session feeding it is still open —
+    either the publisher holding an unanswered PUBLISH, or the upstream
+    the subscription was made over."""
+    if track.pending_publish is not None:
+        return _session_live(track.pending_publish[0])
+    return _session_live(_upstream_session(track))
+
+
+def _upstream_session(track):
+    """The session objects arrive on: the publisher for a bare PUBLISH,
+    or the session the upstream subscription was made over."""
+    up = track.upstream
+    if up is None:
+        return None
+    return up if hasattr(up, "_moqt_session_closed") else getattr(
+        up, "session", None)
+
+
+def _session_live(session) -> bool:
+    """False once the session has closed. A relay outlives its sessions,
+    so anything cached against one has to be re-checked before reuse."""
+    if session is None:
+        return False
+    fut = getattr(session, "_moqt_session_closed", None)
+    return not (fut is not None and fut.done())
+
+
 def _publishers_for(ns: tuple) -> list:
     """Publisher sessions that announced `ns` or a prefix of it."""
     out, seen = [], set()
     for a in _announced_match(ns):
-        for sess in _announced[a]:
+        # Newest announcement first: a publisher that just announced is
+        # the current authority, and a predecessor that has gone away may
+        # not have been observed as closed yet. Trying it first would
+        # stall the subscriber for the whole upstream timeout.
+        for sess in reversed(list(_announced[a])):
+            if not _session_live(sess):
+                _forget_session(sess)
+                continue
             if id(sess) not in seen:
                 seen.add(id(sess))
                 out.append(sess)
@@ -169,6 +204,14 @@ class _RelayedTrack:
         self.task = None
         # (id(session), group, subgroup) -> (stream_id, SubgroupHeader)
         self._streams = {}
+
+    def close(self) -> None:
+        """Release the fan-out: stop the drain and forget its streams."""
+        if self.task is not None:
+            self.task.cancel()
+            self.task = None
+        self.downstream.clear()
+        self._streams.clear()
 
     def on_stream_end(self, group_id, subgroup_id):
         """Upstream closed a subgroup stream: end ours the same way so
@@ -259,6 +302,53 @@ class _RelayedTrack:
         await session.stream_write_drain(stream_id, buf.data)
 
 
+_watched: set = set()
+
+
+def _watch_session(session) -> None:
+    """Reap everything a session owns the moment it closes.
+
+    Liveness cannot be decided lazily at the next request: a second
+    publish/subscribe cycle can arrive before the closed session has been
+    observed as closed, and the stale track is then handed to the new
+    subscriber, which receives nothing.
+    """
+    if session in _watched:
+        return
+    _watched.add(session)
+
+    async def _reap():
+        try:
+            await session.async_closed()
+        finally:
+            _watched.discard(session)
+            _forget_session(session)
+            logger.debug("relay: session closed, state released")
+
+    asyncio.create_task(_reap())
+
+
+def _supersede_namespace(ns: tuple, session) -> None:
+    """A publisher arriving for a namespace replaces any track cached
+    against a different session.
+
+    Session close is not a usable trigger on its own: a client that
+    reconnects promptly announces again before its previous session has
+    been observed as closed, and the stale track would be handed to the
+    next subscriber, which then receives nothing. The new announcement
+    is the event that always arrives in time.
+    """
+    for key, track in list(_tracks.items()):
+        if key[0][:len(ns)] != ns and ns[:len(key[0])] != key[0]:
+            continue
+        owner = _upstream_session(track) or (
+            track.pending_publish[0] if track.pending_publish else None)
+        if owner is not None and owner is not session:
+            logger.info(f"relay: superseding track {key} for a new publisher")
+            track.close()
+            _tracks.pop(key, None)
+
+
 def _forget_session(session) -> None:
     """Drop everything a closing session owned: its announcements and
     its downstream subscriptions."""
@@ -266,8 +356,13 @@ def _forget_session(session) -> None:
         if _announced[ns].pop(session, None) is not None and \
                 not _announced[ns]:
             del _announced[ns]
-    for track in list(_tracks.values()):
+    for key, track in list(_tracks.items()):
         track.drop_session(session)
+        if _upstream_session(track) is session or (
+                track.pending_publish is not None
+                and track.pending_publish[0] is session):
+            track.close()
+            _tracks.pop(key, None)
 
 
 def _ns_tuple(namespace):
@@ -286,6 +381,8 @@ def _ns_tuple(namespace):
 async def _on_publish_namespace(session, msg):
     """Record the announcing session, ack with default OK path."""
     ns = _ns_tuple(msg.namespace)
+    _watch_session(session)
+    _supersede_namespace(ns, session)
     holders = _announced.setdefault(ns, {})
     holders[session] = holders.get(session, 0) + 1
     logger.info(f"relay: announce ns={ns} -> {len(holders)} publisher(s)")
@@ -320,8 +417,15 @@ async def _establish_upstream(ns, track_name):
     """
     key = (ns, track_name)
     track = _tracks.get(key)
-    if track is not None and track.upstream is not None:
-        return track
+    if track is not None:
+        # Reuse only a live upstream. A track cached from an earlier
+        # cycle points at a closed session, and attaching a new
+        # subscriber to it delivers nothing at all.
+        if _track_live(track):
+            return track
+        logger.info(f"relay: dropping stale track {key}")
+        track.close()
+        _tracks.pop(key, None)
     for pub in _publishers_for(ns):
         track = _RelayedTrack(key)
         name = (track_name.decode() if isinstance(track_name, bytes)
@@ -360,6 +464,7 @@ async def _on_publish(session, msg):
     if track is None:
         track = _RelayedTrack(key)
         _tracks[key] = track
+    _watch_session(session)
     track.pending_publish = (session, msg)
     logger.info(f"relay: publish ns={ns} track={msg.track_name} "
                 f"alias={msg.track_alias} — holding PUBLISH_OK for a "
@@ -393,7 +498,14 @@ async def _on_subscribe(session, msg):
     # Flow B first: a track already offered by PUBLISH is served from
     # that offer, no upstream SUBSCRIBE needed.
     track = _tracks.get((ns, msg.track_name))
+    if track is not None and not _track_live(track):
+        # Cached from an earlier cycle whose sessions have closed.
+        logger.info(f"relay: dropping stale track {(ns, msg.track_name)}")
+        track.close()
+        _tracks.pop((ns, msg.track_name), None)
+        track = None
     if track is not None and (track.pending_publish or track.upstream):
+        _watch_session(session)
         ok = session.subscribe_ok(request_msg=msg)
         track.add_downstream(session, ok.track_alias)
         _accept_publish(track)
@@ -407,6 +519,7 @@ async def _on_subscribe(session, msg):
     if _announced_match(ns) or _upstreams:
         track = await _establish_upstream(ns, msg.track_name)
         if track is not None:
+            _watch_session(session)
             ok = session.subscribe_ok(request_msg=msg)
             track.add_downstream(session, ok.track_alias)
             logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "

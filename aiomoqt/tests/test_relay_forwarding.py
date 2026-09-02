@@ -116,3 +116,50 @@ async def test_publisher_priority_survives_the_relay():
     got, err = await _run(_BASE_PORT + 30, "relay/ns", "relay/ns", draft=18)
     assert err is None, f"subscribe failed: {err}"
     assert [prio for _, prio in got] == [200] * len(_FRAMES), got
+
+
+@pytest.mark.asyncio
+async def test_relay_serves_a_second_publish_subscribe_cycle():
+    """A relay process outlives the sessions it serves. Publish,
+    subscribe, deliver, disconnect — then do it all again against the
+    same relay. The second cycle must deliver too: state bound to the
+    first cycle's sessions cannot be reused after they close.
+    """
+    port = _BASE_PORT + 40
+    _reset_relay_state()
+    server = relay._build_server("localhost", port, CERT, KEY,
+                                 use_quic=True, draft=18)
+    handle = await server.serve()
+    try:
+        for cycle in (1, 2):
+            got = []
+            pub_client = MOQTClient("localhost", port, path="/",
+                                    use_quic=True, verify_tls=False,
+                                    supported_drafts=18)
+            async with pub_client.connect() as pub_session:
+                await pub_session.client_session_init()
+                track = _Pub(pub_session, "relay/ns", "video")
+                await track.publish(announce_namespace=True,
+                                    publish_track=False)
+                await asyncio.sleep(0.1)
+                sub_client = MOQTClient("localhost", port, path="/",
+                                        use_quic=True, verify_tls=False,
+                                        supported_drafts=18)
+                async with sub_client.connect() as sub_session:
+                    await sub_session.client_session_init()
+                    sub = SubscribedTrack(
+                        sub_session, "relay/ns", "video",
+                        on_object=lambda m, s, t, g, sg: got.append(
+                            bytes(m.payload)))
+                    await sub.subscribe(timeout=8.0)
+                    for _ in range(150):
+                        if len(got) >= len(_FRAMES):
+                            break
+                        await asyncio.sleep(0.02)
+            assert got == _FRAMES, f"cycle {cycle} delivered {got}"
+            # Reconnect promptly: the previous session has not yet
+            # been observed as closed, which is the case that broke.
+            await asyncio.sleep(0.2)
+    finally:
+        handle.close()
+        _reset_relay_state()
