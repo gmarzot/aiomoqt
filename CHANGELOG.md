@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.11.0rc2
+
+Pairs with aiopquic 0.4.0rc1 (unchanged).
+
+### Wire fixes
+
+- **`LARGEST_OBJECT` (0x09), d18.** Odd type — §1.4.3 Length field is
+  mandatory. Omitted on encode and decode; the Length byte was read as
+  the group, shifting the Location and orphaning a byte, which then
+  raised a bogus "non-compliant peer" on the trailing KVP block. Found
+  against Cloudflare draft-18-interop.
+- **`PUBLISH_OK`, d16 and d18.** A PUBLISH is answered with `REQUEST_OK`
+  (0x07); PUBLISH_OK is the shorthand name (§10.5), and only d14 has a
+  distinct message. We emitted 0x1E — an unknown control message to a
+  d16+ peer, which closed the session.
+- **Cancellation messages, d18.** `PUBLISH_NAMESPACE_DONE` (0x09) was
+  sent on every publisher teardown. d18 has no cancellation messages —
+  withdrawal is RESET_STREAM / STOP_SENDING. `send_control_message` now
+  rejects any type absent from the negotiated draft's registry
+  (`CONTROL_MESSAGE_TYPES`); `UNSUBSCRIBE` (0x0A) and `FETCH_CANCEL`
+  (0x17) were equally reachable.
+- **Subgroup stream type.** `FIRST_OBJECT` (0x40) was parsed, never
+  emitted. `DEFAULT_PRIORITY` (0x20) was decoded as priority 128 rather
+  than "inherited". Objects now carry their stream's flags and priority.
+- **END_OF_GROUP / END_OF_TRACK** were consumed before delivery, so a
+  forwarder could not see them. Delivered now; consumers filter on
+  status.
+
+### Relay (`tools.moq_interop_relay`)
+
+Forwards objects, fans out, serves both publish flows, dials origins
+with `--upstream`. Namespace matching is §2.4 prefix, field-wise, not
+equality. Session state is released on close, and a new announcement
+supersedes a track cached against a prior session — close alone is too
+late for a prompt reconnect. Still no group cache, joining FETCH,
+forward-state propagation, or PUBLISH→SUBSCRIBE_TRACKS forwarding.
+
+### Tests
+
+`test_spec_registry.py` transcribes the d14/d16/d18 message-type tables
+independently of `aiomoqt.types` and checks the §1.4.3 odd/even Length
+rule against a reader that knows only the spec. `.github/workflows/
+moq-conformance.yml` runs draft-afrind-moq-test via moxygen's
+`moqtest_client` against the relay, d16 and d18, from a pinned artifact.
+
+Known: moq-test reports one inherited-priority mismatch and one stream
+reset against the relay.
+
 ## v0.11.0rc1
 
 Pre-release for MoQ community interop testing. Pairs with
