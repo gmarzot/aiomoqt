@@ -217,6 +217,37 @@ HANDLER_ALIASES: Dict[int, Tuple[int, ...]] = {
 }
 
 
+# Control message types each draft defines, transcribed from the message
+# type registry table in each specification (d14 §9.2, d16 §9.2, d18
+# §10.2). Sending a type absent from the negotiated draft's table is a
+# wire violation: the peer sees an unknown control message and closes the
+# session with PROTOCOL_VIOLATION.
+#
+# d18 removed every cancellation message — UNSUBSCRIBE (0xA),
+# PUBLISH_NAMESPACE_DONE (0x9), PUBLISH_NAMESPACE_CANCEL (0xC),
+# FETCH_CANCEL (0x17) — because requests own a bidirectional stream
+# there, and withdrawal is RESET_STREAM / STOP_SENDING on that stream.
+# It also dropped MAX_REQUEST_ID (0x15) and REQUESTS_BLOCKED (0x1A).
+# d18's NAMESPACE_DONE (0xE) is NOT the d16 message of the same name: it
+# answers a SUBSCRIBE_NAMESPACE and carries a namespace suffix.
+CONTROL_MESSAGE_TYPES: Dict[int, frozenset] = {
+    14: frozenset({
+        0x20, 0x21, 0x10, 0x15, 0x1A, 0x03, 0x04, 0x05, 0x02, 0x0A,
+        0x0B, 0x1D, 0x1E, 0x1F, 0x16, 0x18, 0x19, 0x17, 0x0D, 0x0E,
+        0x0F, 0x06, 0x07, 0x08, 0x09, 0x0C, 0x11, 0x12, 0x13, 0x14,
+    }),
+    16: frozenset({
+        0x20, 0x21, 0x10, 0x15, 0x1A, 0x07, 0x05, 0x03, 0x04, 0x02,
+        0x0A, 0x1D, 0x1E, 0x0B, 0x16, 0x18, 0x17, 0x0D, 0x06, 0x08,
+        0x09, 0x0E, 0x0C, 0x11,
+    }),
+    18: frozenset({
+        0x2F00, 0x10, 0x03, 0x04, 0x1D, 0x1E, 0x0B, 0x16, 0x18, 0x0D,
+        0x06, 0x50, 0x51, 0x08, 0x0E, 0x0F, 0x02, 0x07, 0x05,
+    }),
+}
+
+
 class ParamType(IntEnum):
     """Parameter types for MOQT messages."""
     DELIVERY_TIMEOUT = 0x02

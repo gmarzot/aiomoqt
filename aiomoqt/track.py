@@ -115,6 +115,23 @@ class PublishedTrack(Track):
     When a subscriber arrives, calls generate() which can be overridden.
     """
 
+    def _withdraw_namespace(self, session) -> None:
+        """Release the namespace at teardown so the relay cleans up.
+
+        d14/d16 withdraw with PUBLISH_NAMESPACE_DONE. d18 has no such
+        message — PUBLISH_NAMESPACE owns a bidirectional stream there and
+        withdrawal is RESET_STREAM / STOP_SENDING on it, which this
+        session does not yet drive; the relay reclaims the namespace when
+        the session closes.
+        """
+        if session.negotiated_draft >= 18:
+            return
+        try:
+            session.publish_namespace_done(namespace=self.namespace)
+        except Exception:
+            logger.debug("namespace withdraw failed at teardown",
+                         exc_info=True)
+
     def __init__(self, session, namespace: str, trackname: str = 'track',
                  object_size: int = 1024, group_size: int = 60,
                  num_subgroups: int = 1, rate: float = 0,
@@ -399,10 +416,7 @@ class PublishedTrack(Track):
             self._tasks.add(task)
             await session.async_closed()
             self._send_publish_done(session)
-            try:
-                session.publish_namespace_done(namespace=self.namespace)
-            except Exception:
-                pass
+            self._withdraw_namespace(session)
             session._close_session()
             return
 
@@ -424,11 +438,7 @@ class PublishedTrack(Track):
         # Send PUBLISH_DONE to indicate clean track completion
         self._send_publish_done(session)
         # Release the namespace so the relay cleans up
-        try:
-            session.publish_namespace_done(
-                namespace=self.namespace)
-        except Exception:
-            pass
+        self._withdraw_namespace(session)
         session._close_session()
 
     async def _generate_datagrams(self, session, track_alias: int,

@@ -1879,6 +1879,25 @@ class _MOQTSessionMixin:
 
     _PENDING_CONTROL_MAX = 128
 
+    def _assert_type_defined_by_draft(self, msg: MOQTMessage) -> None:
+        """Refuse to put a message type on the wire that the negotiated
+        draft does not define. A peer receiving an unknown control
+        message type closes the session with PROTOCOL_VIOLATION, so
+        emitting one is never recoverable and never correct — d18 in
+        particular removed every cancellation message (UNSUBSCRIBE,
+        PUBLISH_NAMESPACE_DONE, PUBLISH_NAMESPACE_CANCEL, FETCH_CANCEL)
+        in favour of resetting the request's own stream.
+        """
+        draft = self.negotiated_draft
+        legal = CONTROL_MESSAGE_TYPES.get(draft)
+        if legal is None or msg.type is None or msg.type in legal:
+            return
+        name = getattr(msg.type, 'name', None) or type(msg).__name__
+        raise MOQTException(
+            SessionCloseCode.INTERNAL_ERROR,
+            f"refusing to send {name} (type 0x{int(msg.type):02x}): "
+            f"not defined by draft-{draft}")
+
     def send_control_message(self, msg: MOQTMessage) -> None:
         """Serialize and send a MoQT control message on the control
         stream. Serialization happens here at the session's negotiated
@@ -1892,6 +1911,7 @@ class _MOQTSessionMixin:
         if self._quic is None:
             raise MOQTException(SessionCloseCode.INTERNAL_ERROR,
                                 "session not initialized")
+        self._assert_type_defined_by_draft(msg)
         if self._control_write_stream_id is None:
             # Deferral exists for one race: the d18 server opens its
             # write-uni inside the SETUP handler. Pre-d18 the control
