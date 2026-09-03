@@ -520,7 +520,7 @@ class _MOQTSessionMixin:
         reported at the library default, which is a different number the
         publisher never chose.
         """
-        if not track_extensions:
+        if track_alias is None or not track_extensions:
             return
         prio = track_extensions.get(ParamType.PUBLISHER_PRIORITY)
         if prio is not None:
@@ -648,6 +648,14 @@ class _MOQTSessionMixin:
                     not self._profile.reply_has_request_id and
                     hasattr(msg, 'request_id')):
                 msg.request_id = request_id
+            # Latch DEFAULT_PUBLISHER_PRIORITY synchronously: data
+            # streams drain in the same event batch, and the deferred
+            # handler task loses that race (group-0 objects would
+            # inherit the library default).
+            if isinstance(msg, (SubscribeOk, Publish)):
+                self._latch_track_priority(
+                    getattr(msg, 'track_alias', None),
+                    getattr(msg, 'track_extensions', None))
             msg_len += hdr_len
             if end_pos > buf.tell():
                 logger.debug(f"MOQT event: control message: seeking msg end: {end_pos}")
@@ -1217,9 +1225,15 @@ class _MOQTSessionMixin:
                     msg_header = FetchObject.deserialize(
                         buf, prior=fh._prior_obj, prof=self._profile,
                         group_order=fh._group_order)
-                    # Track prior object for d16 delta-encoded references
-                    if msg_header.end_of_range is None:
-                        fh._prior_obj = msg_header
+                    # §11.4.4.2: a marker becomes the prior for the
+                    # Group/Object deltas; its subgroup and priority
+                    # stay those of the last actual object.
+                    if (msg_header.end_of_range is not None
+                            and fh._prior_obj is not None):
+                        msg_header.subgroup_id = fh._prior_obj.subgroup_id
+                        msg_header.publisher_priority = \
+                            fh._prior_obj.publisher_priority
+                    fh._prior_obj = msg_header
 
                 if msg_header is None:
                     error = f"MOQT stream({stream_id}): ObjectHeader parse failed at: {buf.tell()}"
@@ -1245,13 +1259,13 @@ class _MOQTSessionMixin:
         prof = self._profile
         buf.vi64 = prof.vi64
         dgram_type = buf.pull_vint()
-        if prof.varint == "vi64":
+        if prof.varint == "vi64" or prof.draft >= 16:
+            # d16 already uses the merged OBJECT_DATAGRAM layout
+            # (Figure 27: STATUS 0x20, DEFAULT_PRIORITY 0x08); routing
+            # 0x24-0x2D to "unknown type" closed legal d16 sessions.
             return self._moqt_handle_data_dgram_d18(buf, pos, dgram_type)
-        # d14: ObjectDatagram types 0x00-0x07. d16 adds the
-        # DEFAULT_PRIORITY bit (0x08) — priority byte omitted on the
-        # wire — so 0x08-0x0F are legal there and must not close the
-        # session as unknown types.
-        _dgram_max = 0x0F if prof.draft >= 16 else 0x07
+        # d14: ObjectDatagram types 0x00-0x07.
+        _dgram_max = 0x07
         if 0x00 <= dgram_type <= _dgram_max:
             msg = ObjectDatagram.deserialize(buf, buf.capacity, type_val=dgram_type, prof=self._profile)
             if msg is None:
@@ -1311,9 +1325,10 @@ class _MOQTSessionMixin:
 
     def _moqt_handle_data_dgram_d18(self, buf: Buffer, pos: int,
                                     dgram_type: int) -> MOQTMessage:
-        """d18 datagram dispatch. OBJECT_DATAGRAM form 0b00X0XXXX
-        (0x00-0x0F / 0x20-0x2F); PADDING datagram 0x132B3E29 is drained."""
-        if dgram_type == PADDING_DATAGRAM_TYPE:
+        """d16+/d18 merged datagram dispatch. OBJECT_DATAGRAM form
+        0b00X0XXXX (0x00-0x0F / 0x20-0x2F minus STATUS+END_OF_GROUP);
+        PADDING datagram 0x132B3E29 (d18 only) is drained."""
+        if self._profile.vi64 and dgram_type == PADDING_DATAGRAM_TYPE:
             logger.debug("MOQT event: PADDING datagram drained")
             return
         valid_form = (dgram_type & ~0x2F) == 0 and (dgram_type & 0x10) == 0
@@ -1329,6 +1344,11 @@ class _MOQTSessionMixin:
             logger.error(f"MOQT error: " + error)
             self._close_session(SessionCloseCode.PROTOCOL_VIOLATION, error)
             return msg
+        if dgram_type & 0x08:
+            # DEFAULT_PRIORITY: inherit the latched track default, not
+            # the library constant (§11.3.1).
+            msg.publisher_priority = self._track_default_priority.get(
+                msg.track_alias, MOQT_DEFAULT_PRIORITY)
         consumed = buf.tell() - pos
         now = int(time.time() * 1_000_000)
         logger.debug(

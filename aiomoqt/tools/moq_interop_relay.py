@@ -199,11 +199,13 @@ class _RelayedTrack:
         self.upstream = None
         # Flow B: the publisher's PUBLISH, held until someone subscribes.
         self.pending_publish = None   # (session, Publish msg)
-        self.downstream = []          # list of (session, track_alias)
+        self.downstream = []          # list of (session, track_alias, request_id)
         self.queue = asyncio.Queue()
         self.task = None
         # (id(session), group, subgroup) -> (stream_id, SubgroupHeader)
         self._streams = {}
+        # id(session) -> subgroup streams opened (PUBLISH_DONE count)
+        self._sent_streams = {}
 
     def close(self) -> None:
         """Release the fan-out: stop the drain and forget its streams."""
@@ -212,6 +214,24 @@ class _RelayedTrack:
             self.task = None
         self.downstream.clear()
         self._streams.clear()
+
+    def finish(self, status_code=0x2):
+        """Terminate downstream subscriptions cleanly (§11.4.1): FIN any
+        open subgroup streams, then PUBLISH_DONE on each subscription's
+        request stream — never let session teardown reset them."""
+        for session, alias, rid in list(self.downstream):
+            try:
+                for k, (sid, _hdr) in list(self._streams.items()):
+                    if k[0] == id(session):
+                        session.stream_write(sid, b"", end_stream=True)
+                        self._streams.pop(k, None)
+                session.subscribe_done(
+                    request_id=rid, status_code=status_code,
+                    stream_count=self._sent_streams.get(id(session), 0),
+                    reason="track ended")
+            except Exception:
+                logger.debug("relay: finish failed for a subscriber",
+                             exc_info=True)
 
     def on_stream_end(self, group_id, subgroup_id):
         """Upstream closed a subgroup stream: end ours the same way so
@@ -233,22 +253,23 @@ class _RelayedTrack:
              getattr(msg, "status", None),
              getattr(msg, "stream_flags", None)))
 
-    def add_downstream(self, session, track_alias):
-        self.downstream.append((session, track_alias))
+    def add_downstream(self, session, track_alias, request_id=None):
+        self.downstream.append((session, track_alias, request_id))
         if self.task is None:
             self.task = asyncio.create_task(self._forward_loop())
 
     def drop_session(self, session):
-        self.downstream = [(s, a) for (s, a) in self.downstream
+        self.downstream = [(s, a, r) for (s, a, r) in self.downstream
                            if s is not session]
         for k in [k for k in self._streams if k[0] == id(session)]:
             self._streams.pop(k, None)
+        self._sent_streams.pop(id(session), None)
 
     async def _forward_loop(self):
         while True:
             gid, sgid, oid, payload, exts, prio, status, shape = \
                 await self.queue.get()
-            for session, alias in list(self.downstream):
+            for session, alias, _rid in list(self.downstream):
                 try:
                     await self._forward_one(
                         session, alias, gid, sgid, oid, payload, exts,
@@ -282,6 +303,8 @@ class _RelayedTrack:
             session.stream_write(stream_id, header.serialize().data)
             entry = (stream_id, header)
             self._streams[skey] = entry
+            self._sent_streams[id(session)] = \
+                self._sent_streams.get(id(session), 0) + 1
         stream_id, header = entry
         if status == "END":
             # Upstream closed the subgroup stream without a marker, so
@@ -361,6 +384,9 @@ def _forget_session(session) -> None:
         if _upstream_session(track) is session or (
                 track.pending_publish is not None
                 and track.pending_publish[0] is session):
+            # Upstream is gone: give each subscriber a clean terminal
+            # before dropping the fan-out.
+            track.finish()
             track.close()
             _tracks.pop(key, None)
 
@@ -507,7 +533,7 @@ async def _on_subscribe(session, msg):
     if track is not None and (track.pending_publish or track.upstream):
         _watch_session(session)
         ok = session.subscribe_ok(request_msg=msg)
-        track.add_downstream(session, ok.track_alias)
+        track.add_downstream(session, ok.track_alias, msg.request_id)
         _accept_publish(track)
         logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
                     f"-> SUBSCRIBE_OK (published track, fanout="
@@ -521,7 +547,7 @@ async def _on_subscribe(session, msg):
         if track is not None:
             _watch_session(session)
             ok = session.subscribe_ok(request_msg=msg)
-            track.add_downstream(session, ok.track_alias)
+            track.add_downstream(session, ok.track_alias, msg.request_id)
             logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
                         f"-> SUBSCRIBE_OK (fanout="
                         f"{len(track.downstream)})")

@@ -175,6 +175,74 @@ def test_serialized_params_obey_the_odd_even_length_rule(draft):
     assert set(seen) == set(params)
 
 
+def test_publish_done_codes_swap_on_the_d18_wire():
+    """§15.10.3 Table 19: TOO_FAR_BEHIND=0x5 and EXPIRED=0x6 at d18 —
+    the reverse of d16. Canonical enum keeps d16 values; the codec
+    swaps at the wire, both directions."""
+    from aiopquic.buffer import Buffer
+    from aiomoqt.messages.subscribe import SubscribeDone
+    from aiomoqt.types import SubscribeDoneCode
+
+    def wire_code(draft, code):
+        prof = profile_for(draft)
+        raw = bytes(SubscribeDone(request_id=1, status_code=code,
+                                  stream_count=0, reason="").serialize(
+                                      prof=prof).data)
+        r = Buffer(data=raw, vi64=prof.vi64)
+        r.pull_vint()
+        r.pull_uint16()
+        if prof.reply_has_request_id:
+            r.pull_vint()
+        return r.pull_vint()
+
+    assert wire_code(18, SubscribeDoneCode.TOO_FAR_BEHIND) == 0x5
+    assert wire_code(18, SubscribeDoneCode.EXPIRED) == 0x6
+    assert wire_code(16, SubscribeDoneCode.TOO_FAR_BEHIND) == 0x6
+    assert wire_code(16, SubscribeDoneCode.EXPIRED) == 0x5
+    assert wire_code(18, SubscribeDoneCode.TRACK_ENDED) == 0x2
+
+    prof = profile_for(18)
+    raw = bytes(SubscribeDone(
+        request_id=1, status_code=SubscribeDoneCode.TOO_FAR_BEHIND,
+        stream_count=0, reason="").serialize(prof=prof).data)
+    r = Buffer(data=raw, vi64=True)
+    r.pull_vint()
+    mlen = r.pull_uint16()
+    rt = SubscribeDone.deserialize(r, prof=prof, buf_end=r.tell() + mlen)
+    assert rt.status_code == SubscribeDoneCode.TOO_FAR_BEHIND
+
+
+def test_d16_status_datagram_types_parse():
+    """d16 Figure 27 already has the merged layout: STATUS bit 0x20 is
+    legal (types 0x24-0x2D) and must not read a payload."""
+    from aiopquic.buffer import Buffer
+    from aiomoqt.messages.data import ObjectDatagram
+    from aiomoqt.types import ObjectStatus
+    prof = profile_for(16)
+    # type 0x24 = STATUS | ZERO_OBJECT_ID: alias, group, priority, status
+    wire = bytes([7, 3, 128, int(ObjectStatus.END_OF_GROUP)])
+    buf = Buffer(data=wire)
+    msg = ObjectDatagram.deserialize(buf, len(wire), type_val=0x24,
+                                     prof=prof)
+    assert msg.status == ObjectStatus.END_OF_GROUP
+    assert (msg.track_alias, msg.group_id, msg.object_id) == (7, 3, 0)
+    assert msg.payload == b''
+
+
+def test_subgroup_header_default_priority_omits_the_byte():
+    """§11.4.2: DEFAULT_PRIORITY (0x20) means the Priority field is
+    absent; re-serializing a received header must not emit it."""
+    from aiomoqt.messages.data import SubgroupHeader
+    prof = profile_for(18)
+    hdr = SubgroupHeader(track_alias=1, group_id=0, subgroup_id=0,
+                         publisher_priority=200, default_priority=True,
+                         prof=prof)
+    raw = bytes(hdr.serialize().data)
+    assert raw[0] & 0x20
+    # type, alias, group, subgroup — and NO priority byte
+    assert len(raw) == 4
+
+
 def test_fetch_ok_d18_omits_group_order_param():
     """§10.2.8: GROUP_ORDER may appear in SUBSCRIBE, PUBLISH_OK or
     FETCH — never FETCH_OK; a receiver MUST close on a parameter in a

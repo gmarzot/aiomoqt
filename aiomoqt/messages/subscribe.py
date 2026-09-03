@@ -685,6 +685,11 @@ class SubscribeDone(MOQTMessage):
     stream_count: int = None
     reason: str = None
 
+    # d18 §15.10.3 swapped two codes relative to d16: on the d18 wire
+    # TOO_FAR_BEHIND=0x5 and EXPIRED=0x6. Canonical enum keeps the d16
+    # values; the swap (its own inverse) is applied at the wire.
+    _D18_WIRE_SWAP = {0x05: 0x06, 0x06: 0x05}
+
     def __post_init__(self):
         self.type = MOQTMessageType.PUBLISH_DONE
 
@@ -695,7 +700,10 @@ class SubscribeDone(MOQTMessage):
         # d18 replies omit the Request ID (demuxed by request stream, §10.1).
         if prof.reply_has_request_id:
             payload.push_vint(self.request_id)
-        payload.push_vint(self.status_code.value if isinstance(self.status_code, SubscribeDoneCode) else self.status_code)
+        code = int(self.status_code)
+        if prof.draft >= 18:
+            code = self._D18_WIRE_SWAP.get(code, code)
+        payload.push_vint(code)
         payload.push_vint(self.stream_count)
         
         reason_bytes = self.reason.encode()
@@ -714,6 +722,8 @@ class SubscribeDone(MOQTMessage):
         request_id = (buf.pull_vint()
                       if prof.reply_has_request_id else None)
         status_code = buf.pull_vint()
+        if prof.draft >= 18:
+            status_code = cls._D18_WIRE_SWAP.get(status_code, status_code)
         stream_count = buf.pull_vint()
         reason_len = buf.pull_vint()
         reason = buf.pull_bytes(reason_len).decode()

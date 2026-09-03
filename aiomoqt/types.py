@@ -357,7 +357,10 @@ class RequestErrorCode(IntEnum):
 
 
 class SubscribeDoneCode(IntEnum):
-    """SUBSCRIBE_DONE / PUBLISH_DONE status codes."""
+    """SUBSCRIBE_DONE / PUBLISH_DONE status codes.
+
+    Canonical values are d16's; d18 swapped EXPIRED/TOO_FAR_BEHIND on
+    the wire (§15.10.3) — the swap is applied in the codec."""
     INTERNAL_ERROR = 0x0
     UNAUTHORIZED = 0x01
     TRACK_ENDED = 0x02
@@ -365,8 +368,9 @@ class SubscribeDoneCode(IntEnum):
     GOING_AWAY = 0x04
     EXPIRED = 0x05
     TOO_FAR_BEHIND = 0x06
-    MALFORMED_TRACK = 0x07        # d14 value; d16 moves to 0x12
-    UPDATE_FAILED = 0x08          # d16 only
+    MALFORMED_TRACK = 0x12        # 0x07 at d14
+    UPDATE_FAILED = 0x08          # d16+
+    EXCESSIVE_LOAD = 0x09         # d18
 
 
 class TrackStatusCode(IntEnum):

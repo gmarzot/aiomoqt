@@ -146,7 +146,10 @@ class SubgroupHeader(MOQTMessage):
         push(self.group_id)
         if self.subgroup_id_mode == SUBGROUP_ID_EXPLICIT:
             push(self.subgroup_id or 0)
-        buf.push_uint8(self.publisher_priority)
+        # DEFAULT_PRIORITY (0x20): the Priority field is omitted; the
+        # peer parses a stray byte here as the first Object ID delta.
+        if not self.default_priority:
+            buf.push_uint8(self.publisher_priority)
         return buf
 
     def next_object(self, payload: bytes = b'',
@@ -952,7 +955,9 @@ class ObjectDatagram(MOQTMessage):
         extensions_present = bool(type_val & 0x01)
         end_of_group = bool(type_val & 0x02)
         no_object_id = bool(type_val & 0x04)
-        is_status = vi64 and bool(type_val & 0x20)
+        # STATUS bit is part of the merged d16+ layout, not d18-only.
+        is_status = bool(type_val & 0x20) and (
+            vi64 or (prof is not None and prof.draft >= 16))
         # DEFAULT_PRIORITY (0x08): priority byte omitted on the wire.
         # d16 introduced it; d18 keeps it. d14 has no such bit (types
         # cap at 0x07 in dispatch, so it can't reach here).
