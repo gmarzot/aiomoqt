@@ -543,7 +543,8 @@ async def _on_subscribe(session, msg):
             reason="track does not exist",
         )
         logger.info(f"MOQT send: {err}")
-        session.send_control_message(err)
+        # Reply returns on the SUBSCRIBE's own bidi stream at d18.
+        session._send_reply(msg.request_id, err)
     else:
         session.subscribe_error(
             request_id=msg.request_id,
