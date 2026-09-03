@@ -2512,9 +2512,8 @@ class _MOQTSessionMixin:
                 return None
             logger.info(f"MOQT: d18 unsubscribe: cancel request stream "
                         f"{stream_id} (request_id={request_id})")
-            # §15.10.4 stream reset code CANCELLED (0x1).
-            self.stream_reset(stream_id, 0x1)
-            self.stream_stop_sending(stream_id, 0x1)
+            self.stream_reset(stream_id, StreamResetCode.CANCELLED)
+            self.stream_stop_sending(stream_id, StreamResetCode.CANCELLED)
             self._bidi_streams.pop(request_id, None)
             return None
         message = Unsubscribe(request_id=request_id)
@@ -2833,7 +2832,7 @@ class _MOQTSessionMixin:
                 return None
             logger.info(f"MOQT: d18 namespace withdraw: reset request "
                         f"stream {stream_id} (request_id={request_id})")
-            self.stream_reset(stream_id, SessionCloseCode.NO_ERROR)
+            self.stream_reset(stream_id, StreamResetCode.CANCELLED)
             self._bidi_streams.pop(request_id, None)
             return None
         message = PublishNamespaceDone(namespace=namespace, request_id=request_id)
@@ -3040,9 +3039,8 @@ class _MOQTSessionMixin:
                 return None
             logger.info(f"MOQT: unsubscribe namespace: reset request "
                         f"stream {stream_id} (request_id={request_id})")
-            # §15.10.4 stream reset code CANCELLED (0x1).
-            self.stream_reset(stream_id, 0x1)
-            self.stream_stop_sending(stream_id, 0x1)
+            self.stream_reset(stream_id, StreamResetCode.CANCELLED)
+            self.stream_stop_sending(stream_id, StreamResetCode.CANCELLED)
             self._bidi_streams.pop(request_id, None)
             return None
         prefix = self._make_namespace_tuple(namespace_prefix)

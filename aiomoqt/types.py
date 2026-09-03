@@ -373,6 +373,21 @@ class SubscribeDoneCode(IntEnum):
     EXCESSIVE_LOAD = 0x09         # d18
 
 
+class StreamResetCode(IntEnum):
+    """Stream reset / STOP_SENDING error codes (§3.3.3, §15.10.4) —
+    a separate code space from SessionCloseCode."""
+    INTERNAL_ERROR = 0x0
+    CANCELLED = 0x01
+    DELIVERY_TIMEOUT = 0x02
+    SESSION_CLOSED = 0x03
+    GOING_AWAY = 0x04
+    TOO_FAR_BEHIND = 0x05
+    UNKNOWN_OBJECT_STATUS = 0x06
+    EXPIRED_AUTH_TOKEN = 0x07
+    EXCESSIVE_LOAD = 0x09
+    MALFORMED_TRACK = 0x12
+
+
 class TrackStatusCode(IntEnum):
     """TRACK_STATUS status codes."""
     IN_PROGRESS = 0x00

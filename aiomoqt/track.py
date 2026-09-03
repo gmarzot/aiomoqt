@@ -32,6 +32,7 @@ from typing import Optional, Callable
 from .types import (
     MOQTMessageType, MOQTRequestError, ParamType, FilterType,
     ForwardingPreference, GroupOrder, MOQT_TIMESTAMP_EXT, SessionCloseCode,
+    StreamResetCode,
 )
 from .messages import (
     ObjectDatagram, PublishOk, RequestUpdate,
@@ -459,7 +460,10 @@ class PublishedTrack(Track):
             return
 
         for subgroup_id in range(self.num_subgroups):
-            priority = self.priority if subgroup_id == 0 else 0
+            # §7: lower value = higher priority. Siblings ride one step
+            # BELOW subgroup 0 (0 would be the highest priority there is).
+            priority = (self.priority if subgroup_id == 0
+                        else min(self.priority + 1, 255))
             task = asyncio.create_task(
                 self._generate_subgroup(
                     session=session,
@@ -707,7 +711,7 @@ class PublishedTrack(Track):
             # if the session is already torn down — the primitive
             # short-circuits anyway, but avoid the bookkeeping noise.
             if session._close_err is None:
-                session.stream_reset(stream_id, SessionCloseCode.NO_ERROR)
+                session.stream_reset(stream_id, StreamResetCode.CANCELLED)
             dur = time.monotonic() - start_time
             if dur > 0 and report:
                 bps = (self._total_bytes * 8) / dur
