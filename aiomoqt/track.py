@@ -360,7 +360,9 @@ class PublishedTrack(Track):
         logger.info(f"Track: PUBLISH_DONE request_id={req_id} "
                     f"streams={self._stream_count}")
         try:
-            session.send_control_message(msg)
+            # d18 §10.11: PUBLISH_DONE rides the subscription's request
+            # stream; pre-d18 _send_reply routes to the control stream.
+            session._send_reply(req_id, msg)
         except Exception:
             pass  # session may already be closing
 
@@ -845,7 +847,8 @@ class SubscribedTrack(Track):
         )
         logger.info(f"Track: PUBLISH_OK {self.fqtn} "
                     f"alias={self.track_alias} forward={forward}")
-        self.session.send_control_message(ok)
+        # Reply returns on the PUBLISH's own bidi stream at d18.
+        self.session._send_reply(pub_msg.request_id, ok)
 
         self.state = TrackState.SUBSCRIBED
         logger.info(f"Track: subscribed to {self.fqtn}")
