@@ -75,9 +75,10 @@ class TestPublishedTrack:
                           auth_token=b"custom")
         assert t.auth_token == b"custom"
 
-    def _pub_session(self, track_alias=0, request_id=1):
+    def _pub_session(self, track_alias=0, request_id=1, draft=16):
         """Mock session configured for PublishedTrack.publish() calls."""
         session = MagicMock()
+        session.negotiated_draft = draft
         session.publish_namespace = AsyncMock(return_value=MagicMock())
         pub_response = MagicMock()
         pub_response.track_alias = track_alias
@@ -139,6 +140,47 @@ class TestPublishedTrack:
             session.publish_namespace.assert_called_once()
             session.publish.assert_not_called()
             assert t.state == TrackState.ANNOUNCED
+        asyncio.run(_test())
+
+    # ----- d18: PUBLISH answered by REQUEST_OK on the request stream -----
+
+    def _d18_pub_session(self, reply):
+        session = self._pub_session(track_alias=42, request_id=7, draft=18)
+        session._pending_requests = {}
+        session._await_response = AsyncMock(return_value=reply)
+        return session
+
+    def test_publish_d18_request_ok_forward_starts_generation(self):
+        """d18: the acceptance is a REQUEST_OK carrying FORWARD (0x10),
+        correlated by request id — no 0x1E type dispatch exists."""
+        from aiomoqt.messages.request import RequestOk
+        from aiomoqt.types import ParamType
+
+        async def _test():
+            reply = RequestOk(request_id=7,
+                              parameters={ParamType.FORWARD: 1})
+            session = self._d18_pub_session(reply)
+            session._loop = asyncio.get_running_loop()
+            t = PublishedTrack(session, "bench", "track")
+            t._start_generating = AsyncMock()
+            await t.publish()
+            await asyncio.sleep(0)
+            t._start_generating.assert_awaited_once()
+            assert 7 in session._pending_requests  # future pre-registered
+        asyncio.run(_test())
+
+    def test_publish_d18_request_ok_no_forward_stays_idle(self):
+        from aiomoqt.messages.request import RequestOk
+
+        async def _test():
+            reply = RequestOk(request_id=7, parameters={})
+            session = self._d18_pub_session(reply)
+            session._loop = asyncio.get_running_loop()
+            t = PublishedTrack(session, "bench", "track")
+            t._start_generating = AsyncMock()
+            await t.publish()
+            await asyncio.sleep(0)
+            t._start_generating.assert_not_awaited()
         asyncio.run(_test())
 
     # ----- Hybrid: both PUB_NS and PUBLISH -----

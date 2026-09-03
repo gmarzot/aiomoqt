@@ -30,8 +30,8 @@ from enum import IntEnum
 from typing import Optional, Callable
 
 from .types import (
-    MOQTMessageType, ParamType, FilterType, ForwardingPreference,
-    GroupOrder, MOQT_TIMESTAMP_EXT, SessionCloseCode,
+    MOQTMessageType, MOQTRequestError, ParamType, FilterType,
+    ForwardingPreference, GroupOrder, MOQT_TIMESTAMP_EXT, SessionCloseCode,
 )
 from .messages import (
     ObjectDatagram, PublishOk, RequestUpdate,
@@ -248,6 +248,15 @@ class PublishedTrack(Track):
             self.state = TrackState.PUBLISHED
             logger.info(f"Track: published {self.fqtn} "
                          f"alias={self.track_alias} forward={forward}")
+            if getattr(self.session, 'negotiated_draft', 0) >= 18:
+                # d18 answers PUBLISH with REQUEST_OK (0x07) on the
+                # request's own stream — a universal reply type, so
+                # correlate by request id, not the 0x1E type handler.
+                # Registering before any await keeps it race-free.
+                fut = self.session._loop.create_future()
+                self.session._pending_requests[pub_msg.request_id] = fut
+                asyncio.create_task(
+                    self._await_publish_reply(pub_msg.request_id))
             # Optimistic mode: don't wait for PUBLISH_OK before generating.
             # The relay may RESET our streams or downshift to forward=0;
             # both are handled by existing reset / SUBSCRIBE_UPDATE paths.
@@ -302,6 +311,22 @@ class PublishedTrack(Track):
         logger.info(f"Track: PUBLISH_OK: forward={msg.forward}")
         if msg.forward:
             await self._start_generating(session, "PUBLISH_OK")
+
+    async def _await_publish_reply(self, request_id: int):
+        """d18: the PUBLISH acceptance arrives as a REQUEST_OK carrying
+        the FORWARD (0x10) parameter."""
+        try:
+            reply = await self.session._await_response(request_id)
+        except MOQTRequestError as e:
+            logger.info(f"Track: PUBLISH rejected: {e}")
+            return
+        forward = getattr(reply, 'forward', None)
+        if forward is None:
+            forward = (reply.parameters or {}).get(ParamType.FORWARD) \
+                if hasattr(reply, 'parameters') else None
+        logger.info(f"Track: PUBLISH_OK (REQUEST_OK): forward={forward}")
+        if forward:
+            await self._start_generating(self.session, "PUBLISH_OK")
 
     async def _on_request_update(self, session, msg: RequestUpdate):
         """d16 REQUEST_UPDATE — subscriber wants data."""
