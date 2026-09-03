@@ -1980,6 +1980,15 @@ class _MOQTSessionMixin:
             raise MOQTException(SessionCloseCode.INTERNAL_ERROR,
                                 "session not initialized")
         self._assert_type_defined_by_draft(msg)
+        if (self._profile.control_uni_pair and
+                isinstance(msg, self._REPLY_CLASSES)):
+            # d18: replies ride the request's own bidi stream and carry
+            # no Request ID; on the control stream they are
+            # uncorrelatable.
+            raise MOQTException(
+                SessionCloseCode.INTERNAL_ERROR,
+                f"{type(msg).__name__} is a reply: it must ride its "
+                f"request stream — use _send_reply")
         if self._control_write_stream_id is None:
             # Deferral exists for one race: the d18 server opens its
             # write-uni inside the SETUP handler. Pre-d18 the control
@@ -2029,12 +2038,24 @@ class _MOQTSessionMixin:
         return SubgroupHeader(track_alias=track_alias, group_id=group_id,
                               prof=self._profile, **kwargs)
 
+    _REPLY_CLASSES = (RequestOk, RequestError, SubscribeOk, SubscribeDone,
+                      PublishOk, FetchOk)
+
     def _send_reply(self, request_id: int, msg: MOQTMessage) -> None:
         """Send a response to a request. In d18 responses travel on the
         request's own bidi stream (demuxed by stream, no in-band Request
         ID); pre-d18 they go on the single control stream."""
-        sid = self._bidi_streams.get(request_id)
-        if self._profile.control_uni_pair and sid is not None:
+        if self._profile.control_uni_pair:
+            sid = self._bidi_streams.get(request_id)
+            if sid is None:
+                # Both directions bind request streams (incoming at
+                # _on_control_data, outgoing at _send_request); a
+                # missing binding is a bug, and falling back to the
+                # control stream would emit an uncorrelatable reply.
+                raise MOQTException(
+                    SessionCloseCode.INTERNAL_ERROR,
+                    f"no request stream bound for request_id="
+                    f"{request_id}: cannot send {type(msg).__name__}")
             self.send_stream_message(sid, msg)
         else:
             self.send_control_message(msg)
@@ -2969,13 +2990,7 @@ class _MOQTSessionMixin:
 
     async def _handle_publish_namepace(self, msg: PublishNamespace) -> None:
         logger.info(f"MOQT receive: {msg}")
-        if is_draft16_or_later(self.negotiated_draft):
-            # d16: respond with REQUEST_OK instead of PublishNamespaceOk
-            message = RequestOk(request_id=msg.request_id)
-            logger.info(f"MOQT send: {message} request_id: {msg.request_id} namespace: {msg.namespace}")
-            self.send_control_message(message)
-        else:
-            self.publish_namepace_ok(msg)
+        self.publish_namepace_ok(msg)
 
     async def _handle_subscribe_update(self, msg: SubscribeUpdate) -> None:
         logger.info(f"MOQT event: handle {msg}")
