@@ -3433,6 +3433,16 @@ class _MOQTSessionMixin:
 
     async def _handle_request_update(self, msg: RequestUpdate) -> None:
         logger.info(f"MOQT event: handle RequestUpdate: {msg}")
+        # §10.9: MUST answer with exactly one REQUEST_OK or
+        # REQUEST_ERROR — a session with no update semantics answers
+        # honestly instead of hanging the peer; apps override.
+        err = RequestError(
+            request_id=msg.request_id,
+            error_code=int(RequestErrorCode.NOT_SUPPORTED),
+            retry_interval=0,
+            reason="request update not supported",
+        )
+        self._send_reply(msg.request_id, err)
 
     async def _handle_d18_setup(self, msg) -> None:
         """draft-18 SETUP receive (§10.3). SETUP is symmetric: each peer

@@ -35,7 +35,7 @@ from .types import (
     StreamResetCode,
 )
 from .messages import (
-    ObjectDatagram, PublishOk, RequestUpdate,
+    ObjectDatagram, PublishOk, RequestOk, RequestUpdate,
 )
 from .utils.format import fmt_bps, fmt_rate
 from .utils.logger import get_logger
@@ -332,8 +332,12 @@ class PublishedTrack(Track):
             await self._start_generating(self.session, "PUBLISH_OK")
 
     async def _on_request_update(self, session, msg: RequestUpdate):
-        """d16 REQUEST_UPDATE — subscriber wants data."""
+        """REQUEST_UPDATE — subscriber changes forward state."""
         logger.info(f"Track: REQUEST_UPDATE: {msg}")
+        # §10.9: the receiver MUST answer with exactly one REQUEST_OK
+        # or REQUEST_ERROR.
+        session._send_reply(msg.request_id,
+                            RequestOk(request_id=msg.request_id))
         forward = (msg.parameters.get(ParamType.FORWARD)
                    if msg.parameters else None)
         if not forward:

@@ -38,6 +38,19 @@ def test_default_handler_answers_request_error_on_the_request_stream():
     assert _reply_type(raw, s._profile) == 0x05  # REQUEST_ERROR
 
 
+def test_default_request_update_handler_answers():
+    """§10.9: REQUEST_UPDATE must get exactly one OK or ERROR — the
+    bare session answers NOT_SUPPORTED on the request stream."""
+    from aiomoqt.messages.request import RequestUpdate
+    s = _session(18)
+    msg = RequestUpdate(request_id=5, parameters={})
+    asyncio.run(s._handle_request_update(msg))
+    assert len(s._writes) == 1
+    sid, raw = s._writes[0]
+    assert sid == 9
+    assert _reply_type(raw, s._profile) == 0x05  # REQUEST_ERROR
+
+
 def test_relay_answers_ok_for_served_track_and_error_for_unknown():
     from aiomoqt.tools import moq_interop_relay as relay
 
