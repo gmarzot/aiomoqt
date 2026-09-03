@@ -53,11 +53,6 @@ jobs:
       fail-fast: false
       matrix:
         draft: [16, 18]
-    # Advisory until its first green run lands: this job has never run in
-    # CI, and a brand-new harness failing on setup must not block a
-    # release before we have seen it pass once. Flip to gating (drop this
-    # line) as soon as it does.
-    continue-on-error: true
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
