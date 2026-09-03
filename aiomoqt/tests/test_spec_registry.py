@@ -175,6 +175,31 @@ def test_serialized_params_obey_the_odd_even_length_rule(draft):
     assert set(seen) == set(params)
 
 
+def test_goaway_d18_wire_has_timeout_and_request_id():
+    """§10.4 Figure 7: URI Length, URI, Timeout, [Request ID (control-
+    stream form)] — all vi64. Hand-derived bytes, not a round-trip."""
+    from aiopquic.buffer import Buffer
+    from aiomoqt.messages.session_setup import GoAway
+    prof = profile_for(18)
+    msg = GoAway(new_session_uri="x", timeout=5, request_id=3)
+    assert bytes(msg.serialize(prof=prof).data) == \
+        bytes.fromhex("10000401780503")
+
+    buf = Buffer(data=bytes.fromhex("10000401780503"), vi64=True)
+    buf.pull_vint()                      # Type 0x10
+    mlen = buf.pull_uint16()
+    end = buf.tell() + mlen
+    rt = GoAway.deserialize(buf, prof=prof, buf_end=end)
+    assert (rt.new_session_uri, rt.timeout, rt.request_id) == ("x", 5, 3)
+
+
+def test_goaway_pre_d18_wire_is_uri_only():
+    from aiomoqt.messages.session_setup import GoAway
+    prof = profile_for(16)
+    msg = GoAway(new_session_uri="")
+    assert bytes(msg.serialize(prof=prof).data) == bytes.fromhex("10000100")
+
+
 def test_largest_object_accepts_cloudflare_prefixed_form():
     """Leniency golden: Cloudflare draft-18-interop SUBSCRIBE_OK,
     2026-09-02. Their LARGEST_OBJECT carries a Length prefix — a §10.2
