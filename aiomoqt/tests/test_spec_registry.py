@@ -175,6 +175,28 @@ def test_serialized_params_obey_the_odd_even_length_rule(draft):
     assert set(seen) == set(params)
 
 
+@pytest.mark.parametrize("draft", [14, 16, 18])
+def test_rx_dispatch_matches_the_spec_tables(draft):
+    """RX dispatches exactly the types the spec defines for the draft —
+    a type outside the table closes the session, never a silent skip
+    or a stale handler from an earlier draft."""
+    assert {int(k) for k in MOQTSessionQuic.CONTROL_REGISTRY[draft]} \
+        == set(SPEC[draft])
+
+
+def test_d18_receiving_a_dead_d16_type_closes_the_session():
+    """Receiving PUBLISH_NAMESPACE_DONE (0x09) at d18 used to run the
+    d16 handler — which closed the session with NO_ERROR: peer grease
+    became a silent clean shutdown."""
+    from aiomoqt.types import MOQTProtocolViolation
+    s = object.__new__(MOQTSessionQuic)
+    s.negotiated_draft = 18
+    s._control_msg_overrides = {}
+    for dead in (0x09, 0x0A, 0x0C, 0x15, 0x17, 0x1A, 0x11):
+        with pytest.raises(MOQTProtocolViolation):
+            s._get_control_entry(dead)
+
+
 def test_publish_done_codes_swap_on_the_d18_wire():
     """§15.10.3 Table 19: TOO_FAR_BEHIND=0x5 and EXPIRED=0x6 at d18 —
     the reverse of d16. Canonical enum keeps d16 values; the codec

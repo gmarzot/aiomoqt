@@ -205,10 +205,10 @@ async def test_parse_exception_contained_not_escaped():
     assert s._closed
 
 
-async def test_unknown_type_skipped_session_survives():
-    # d16 request-bidi: an unknown-but-length-delimited control type is
-    # skipped per the lenient surface; a following message still parses
-    # and the session stays up.
+async def test_unknown_type_closes_the_session():
+    # §9/§10: an unknown control message type MUST close the session —
+    # skipping it is how a renumbered code point hides for months
+    # (SUB_NS 0x11→0x50) and how peer grease gets misdispatched.
     from aiomoqt.types import MOQTMessageType
     s = _control_session(16)
     parsed = _spy_parses(s)
@@ -219,8 +219,8 @@ async def test_unknown_type_skipped_session_survives():
         prof=s._profile).data)
     s._bidi_stream_requests[5] = 7
     s._on_control_data(5, frame + good, False, is_request_bidi=True)
-    assert len(parsed) == 1                        # the good one
-    assert s._closed == []                         # session survived
+    assert parsed == []                            # nothing after it parses
+    assert s._closed                               # session closed
 
 
 # --- exception taxonomy: malformation is not fragmentation -----------------

@@ -628,11 +628,11 @@ class _MOQTSessionMixin:
                 try:
                     msg_type = MOQTMessageType(msg_type)
                 except ValueError:
-                    logger.error(f"MOQT error: unknown control message: type: {hex(msg_type)} start: {start_pos} len: {msg_len}")
-                    # Skip-unknown surface: consume the message and let
-                    # the drain loop continue (None means fatal there).
-                    buf.seek(end_pos)
-                    return self._MSG_SKIPPED
+                    # §9/§10: an unknown control message type MUST close
+                    # the session — parsing cannot continue past it.
+                    raise MOQTProtocolViolation(
+                        f"unknown control message type {hex(msg_type)} "
+                        f"for draft-{self.negotiated_draft}")
             # Look up message class (version-aware for shared code points)
             message_class, handler = self._get_control_entry(msg_type)
             logger.debug(f"MOQT event: control message: {message_class.__name__} ({msg_len} bytes)")
@@ -2963,9 +2963,29 @@ class _MOQTSessionMixin:
 
     def unsubscribe_namespace(
         self,
-        namespace_prefix: str
+        namespace_prefix: str = None,
+        request_id: int = None,
     ) -> Optional[MOQTMessage]:
-        """Unsubscribe from announcements for a namespace prefix."""        
+        """Withdraw a namespace-prefix subscription.
+
+        d14 sends UNSUBSCRIBE_NAMESPACE (0x14) with the prefix; d16+
+        removed it — the subscription is cancelled by terminating the
+        SUBSCRIBE_NAMESPACE request's own stream (§3.3.2). Returns None
+        then."""
+        if is_draft16_or_later(self.negotiated_draft):
+            stream_id = self._bidi_streams.get(request_id)
+            if stream_id is None:
+                logger.debug(
+                    f"unsubscribe_namespace: no request stream for "
+                    f"request_id={request_id}; nothing to reset")
+                return None
+            logger.info(f"MOQT: unsubscribe namespace: reset request "
+                        f"stream {stream_id} (request_id={request_id})")
+            # §15.10.4 stream reset code CANCELLED (0x1).
+            self.stream_reset(stream_id, 0x1)
+            self.stream_stop_sending(stream_id, 0x1)
+            self._bidi_streams.pop(request_id, None)
+            return None
         prefix = self._make_namespace_tuple(namespace_prefix)
         message = UnsubscribeNamespace(namespace_prefix=prefix)
         logger.info(f"MOQT send: {message}")
@@ -3439,15 +3459,8 @@ class _MOQTSessionMixin:
         0x08: (Namespace, _handle_namespace),            # was PUBLISH_NAMESPACE_ERROR
         0x0E: (NamespaceDone, _handle_namespace_done),   # was TRACK_STATUS_OK
     }
-    # d16 = d14 base + repurposed code points. The d14-only points d16
-    # dropped (0x0F/0x12/0x13/0x14/0x19/0x1F) are RETAINED here as a
-    # lenient receive surface: the high-level namespace send paths still
-    # emit some of them on d16 (SUBSCRIBE_NAMESPACE_OK 0x12,
-    # UNSUBSCRIBE_NAMESPACE 0x14). Spec-strict pruning lands together
-    # with the d16 send-side corrections (REQUEST_OK 0x07 for
-    # namespace-ok; stream-reset for unsubscribe) as a d16-interop
-    # follow-up — pruning them now would reject those frames and break
-    # d16 namespace discovery against this library.
+    # d16 = d14 base + repurposed code points; the table is pruned to
+    # CONTROL_MESSAGE_TYPES below, so d14-only points are rejected.
     _D16_REGISTRY = {**MOQT_CONTROL_MESSAGE_REGISTRY, **_D16_DELTA}
 
     # draft-18 dispatch tier (Phase 2 scaffold). Starts from the d16
@@ -3482,6 +3495,24 @@ class _MOQTSessionMixin:
         MOQTDraft.DRAFT_16: _D16_REGISTRY,
         MOQTDraft.DRAFT_18: _D18_REGISTRY,
     }
+    # One source of truth with the TX guard: dispatch exactly the types
+    # each draft defines (a type outside the table closes the session in
+    # _get_control_entry) and fail at import if the tables drift.
+    # Explicit loops: class-body comprehensions cannot see class names.
+    for _draft in list(CONTROL_REGISTRY):
+        _legal = CONTROL_MESSAGE_TYPES[int(_draft)]
+        _pruned = {}
+        for _k in CONTROL_REGISTRY[_draft]:
+            if int(_k) in _legal:
+                _pruned[_k] = CONTROL_REGISTRY[_draft][_k]
+        _missing = set(_legal)
+        for _k in _pruned:
+            _missing.discard(int(_k))
+        assert not _missing, (
+            f"draft-{int(_draft)}: no dispatch entry for "
+            f"{sorted(hex(m) for m in _missing)}")
+        CONTROL_REGISTRY[_draft] = _pruned
+    del _draft, _legal, _pruned, _missing, _k
 
     # Stream data message types (dispatch by range check, not registry lookup)
     MOQT_STREAM_DATA_REGISTRY: Dict[int, Tuple[Type[MOQTMessage], Callable]] = {
