@@ -373,6 +373,27 @@ class SubscribeDoneCode(IntEnum):
     EXCESSIVE_LOAD = 0x09         # d18
 
 
+# d18 §15.7 Message Parameters: {Type Delta, Value} with the Value
+# encoding fixed by each parameter's definition (§10.2) — NOT the
+# §1.4.3 odd/even KVP rule. Unknown ⇒ close PROTOCOL_VIOLATION
+# (count-bounded block, cannot be skipped).
+D18_PARAM_KINDS: Dict[int, str] = {
+    0x02: "varint",    # OBJECT_DELIVERY_TIMEOUT
+    0x03: "bytes",     # AUTHORIZATION_TOKEN (length-prefixed Token)
+    0x04: "varint",    # RENDEZVOUS_TIMEOUT
+    0x06: "varint",    # SUBGROUP_DELIVERY_TIMEOUT
+    0x08: "varint",    # EXPIRES
+    0x09: "location",  # LARGEST_OBJECT
+    0x0A: "varint",    # FILL_TIMEOUT
+    0x10: "uint8",     # FORWARD
+    0x20: "uint8",     # SUBSCRIBER_PRIORITY
+    0x21: "bytes",     # SUBSCRIPTION_FILTER
+    0x22: "uint8",     # GROUP_ORDER
+    0x32: "varint",    # NEW_GROUP_REQUEST
+    0x34: "tuple",     # TRACK_NAMESPACE_PREFIX (Track Namespace)
+}
+
+
 class StreamResetCode(IntEnum):
     """Stream reset / STOP_SENDING error codes (§3.3.3, §15.10.4) —
     a separate code space from SessionCloseCode."""

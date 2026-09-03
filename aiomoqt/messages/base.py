@@ -4,7 +4,7 @@ from dataclasses import dataclass, field, fields
 
 from . import ParamType, SetupParamType, AuthTokenAliasType, AuthTokenType
 from ..context import DraftProfile
-from ..types import MOQTProtocolViolation
+from ..types import D18_PARAM_KINDS, MOQTProtocolViolation
 from ..utils.buffer import Buffer, BufferReadError
 from ..utils.logger import *
 
@@ -447,10 +447,38 @@ class MOQTMessage:
             else:
                 payload.push_vint(param_type)  # Type
 
-            if param_type in prof.location_params:
-                # d18 §10.2/§10.2.11: a Location value is two bare
-                # varints (Group, Object) — no Length, despite the odd
-                # type number (§1.4.3 does not govern Message Parameters).
+            if prof.draft >= 18:
+                # d18 §10.2: the Value encoding comes from each
+                # parameter's definition (§15.7), not the §1.4.3
+                # odd/even rule. Unknown params cannot exist on TX.
+                kind = D18_PARAM_KINDS.get(param_type)
+                if kind is None:
+                    raise ValueError(
+                        f"param 0x{param_type:x} is not a d18 message "
+                        f"parameter (§15.7)")
+                if kind == "location":
+                    loc_group, loc_object = param_value
+                    payload.push_vint(loc_group)
+                    payload.push_vint(loc_object)
+                elif kind == "uint8":
+                    payload.push_uint8(int(param_value))
+                elif kind == "varint":
+                    payload.push_vint(int(param_value))
+                elif kind == "tuple":
+                    payload.push_vint(len(param_value))
+                    for fld in param_value:
+                        fld = fld.encode() if isinstance(fld, str) else fld
+                        payload.push_vint(len(fld))
+                        payload.push_bytes(bytes(fld))
+                else:  # length-prefixed bytes
+                    val = (param_value.encode()
+                           if isinstance(param_value, str) else param_value)
+                    if param_type in (ParamType.AUTH_TOKEN,
+                                      SetupParamType.AUTH_TOKEN):
+                        val = MOQTMessage._auth_token_wrap(bytes(val), prof)
+                    payload.push_vint(len(val))
+                    payload.push_bytes(bytes(val))
+            elif param_type in prof.location_params:
                 loc_group, loc_object = param_value
                 payload.push_vint(loc_group)
                 payload.push_vint(loc_object)
@@ -634,7 +662,57 @@ class MOQTMessage:
             else:
                 param_type = raw_key
 
-            if param_type in prof.location_params:
+            if prof.draft >= 18:
+                # d18 §10.2: per-definition Value encodings; an unknown
+                # parameter cannot be skipped (count-bounded block) and
+                # MUST close the session. §14 reserves no grease here.
+                kind = D18_PARAM_KINDS.get(param_type)
+                if kind is None:
+                    raise MOQTProtocolViolation(
+                        f"unknown message parameter 0x{param_type:x} "
+                        f"(§10.2: cannot be skipped)")
+                if kind == "location":
+                    param_value = MOQTMessage._pull_location_param(
+                        buf, prof=prof, buf_end=buf_end,
+                        remaining=param_count - param_index - 1,
+                        prev_key=prev_key, delta_keys=delta_keys)
+                elif kind == "uint8":
+                    param_value = buf.pull_uint8()
+                elif kind == "varint":
+                    param_value = buf.pull_vint()
+                elif kind == "tuple":
+                    nfields = buf.pull_vint()
+                    if nfields > 32:
+                        raise MOQTProtocolViolation(
+                            f"namespace prefix has {nfields} fields "
+                            f"(max 32)")
+                    fields = []
+                    for _ in range(nfields):
+                        flen = buf.pull_vint()
+                        if buf_end is not None and \
+                                buf.tell() + flen > buf_end:
+                            raise MOQTProtocolViolation(
+                                "namespace field overruns frame")
+                        fields.append(buf.pull_bytes(flen))
+                    param_value = tuple(fields)
+                else:  # length-prefixed bytes
+                    param_len = buf.pull_vint()
+                    if param_len > 65535:
+                        raise MOQTProtocolViolation(
+                            "parameter length exceeds maximum of "
+                            "65535 bytes")
+                    if buf_end is not None and \
+                            buf.tell() + param_len > buf_end:
+                        raise MOQTProtocolViolation(
+                            f"parameter length {param_len} exceeds "
+                            f"remaining {buf_end - buf.tell()}")
+                    param_value = buf.pull_bytes(param_len)
+                    if param_type in (ParamType.AUTH_TOKEN,
+                                      SetupParamType.AUTH_TOKEN) \
+                            and param_len:
+                        param_value = MOQTMessage._auth_token_unwrap(
+                            param_value, prof)
+            elif param_type in prof.location_params:
                 param_value = MOQTMessage._pull_location_param(
                     buf, prof=prof, buf_end=buf_end,
                     remaining=param_count - param_index - 1,

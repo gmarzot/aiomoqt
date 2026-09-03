@@ -175,6 +175,35 @@ def test_serialized_params_obey_the_odd_even_length_rule(draft):
     assert set(seen) == set(params)
 
 
+def test_d18_unknown_message_parameter_is_fatal():
+    """§10.2: unknown Message Parameters cannot be skipped (the block
+    is count-bounded) — the session closes. §14 reserves no grease in
+    this registry, so no carve-out exists."""
+    from aiopquic.buffer import Buffer
+    from aiomoqt.types import MOQTProtocolViolation
+    prof = profile_for(18)
+    # count=1, Δtype=0x36 (not in §15.7), then arbitrary bytes
+    buf = Buffer(data=bytes([0x01, 0x36, 0x00]), vi64=True)
+    with pytest.raises(MOQTProtocolViolation):
+        MOQTMessage._deserialize_params(buf, prof=prof, buf_end=3)
+
+
+def test_d18_namespace_prefix_param_is_a_tuple():
+    """§10.2.14: TRACK_NAMESPACE_PREFIX is Track-Namespace-encoded
+    (field count + length-prefixed fields), not odd/even KVP."""
+    from aiopquic.buffer import Buffer
+    prof = profile_for(18)
+    payload = Buffer(capacity=256, vi64=True)
+    MOQTMessage._serialize_params(
+        payload, {0x34: (b"live", b"cam")}, prof=prof)
+    raw = bytes(payload.data_slice(0, payload.tell()))
+    assert raw == bytes([0x01, 0x34, 0x02,
+                         0x04]) + b"live" + bytes([0x03]) + b"cam"
+    r = Buffer(data=raw, vi64=True)
+    out = MOQTMessage._deserialize_params(r, prof=prof, buf_end=len(raw))
+    assert out[0x34] == (b"live", b"cam")
+
+
 @pytest.mark.parametrize("draft", [14, 16, 18])
 def test_rx_dispatch_matches_the_spec_tables(draft):
     """RX dispatches exactly the types the spec defines for the draft —
