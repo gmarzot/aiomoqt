@@ -165,6 +165,20 @@ def test_ready_stream_sends_immediately():
     assert s._pending_control_msgs == []
 
 
+async def test_d18_client_rejects_path_from_server():
+    # §10.3.1: PATH is client-to-server only; a server sending it (or
+    # anyone over WT) closes the session with INVALID_PATH.
+    from aiomoqt.types import SetupParamType, SessionCloseCode
+    s = _send_session(18)
+    s.is_client = True
+    s._is_wt = False
+    s._moqt_session_setup = asyncio.get_running_loop().create_future()
+    s._d18_setup_seen = False
+    await s._handle_d18_setup(Setup(options={SetupParamType.PATH: b"/x"}))
+    assert s._closed
+    assert s._closed[0][0] == SessionCloseCode.INVALID_PATH
+
+
 def test_d18_reply_via_control_stream_is_refused():
     # Replies ride the request's own bidi stream at d18; handing one to
     # send_control_message is a bug, caught locally instead of emitted

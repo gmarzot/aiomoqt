@@ -3151,7 +3151,11 @@ class _MOQTSessionMixin:
             if version_ok:
                 self.server_setup()
                 self._moqt_session_setup.set_result(True)
-        
+            else:
+                self._close_session(
+                    SessionCloseCode.VERSION_NEGOTIATION_FAILED,
+                    "no mutually supported MOQT version")
+
     async def _handle_subscribe(self, msg: Subscribe) -> None:
         logger.info(f"MOQT receive: {msg}")
         self.subscribe_ok(
@@ -3460,6 +3464,19 @@ class _MOQTSessionMixin:
             self._close_session(SessionCloseCode.PROTOCOL_VIOLATION, error)
             return
         self._d18_setup_seen = True
+        opts = getattr(msg, 'options', None) or {}
+        # §10.3.1: PATH and AUTHORITY are client-to-server, native-QUIC
+        # only — from a server, or over WebTransport, they close the
+        # session.
+        if SetupParamType.PATH in opts and (self._is_client or self._is_wt):
+            self._close_session(SessionCloseCode.INVALID_PATH,
+                                "PATH option from server or over WT")
+            return
+        if SetupParamType.AUTHORITY in opts and (
+                self._is_client or self._is_wt):
+            self._close_session(SessionCloseCode.INVALID_AUTHORITY,
+                                "AUTHORITY option from server or over WT")
+            return
         # Server side has no separate session-init step: bring up our own
         # control write-uni and send SETUP on first receipt of the peer's
         # SETUP. The client brings its write-uni up eagerly in
