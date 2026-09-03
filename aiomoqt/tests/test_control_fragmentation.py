@@ -205,6 +205,47 @@ async def test_parse_exception_contained_not_escaped():
     assert s._closed
 
 
+async def _noop_handler(session, msg):
+    pass
+
+
+def _subscribe_frame(s, rid):
+    from aiomoqt.messages.subscribe import Subscribe
+    return bytes(Subscribe(request_id=rid, track_namespace=(b"a",),
+                           track_name=b"t", filter_type=2).serialize(
+                               prof=s._profile).data)
+
+
+async def test_wrong_parity_request_id_closes_the_session():
+    # §10.1: client request ids are even — an odd one from the peer
+    # (we are the server here) closes with INVALID_REQUEST_ID.
+    from aiomoqt.types import MOQTMessageType, SessionCloseCode
+    s = _control_session(16)
+    s.is_client = False
+    s._peer_request_max = -1
+    s._control_msg_overrides[MOQTMessageType.SUBSCRIBE] = _noop_handler
+    s._on_control_data(0, _subscribe_frame(s, 3), False)
+    await asyncio.sleep(0)
+    assert s._closed
+    assert s._closed[0][0] == SessionCloseCode.INVALID_REQUEST_ID
+
+
+async def test_reused_request_id_closes_the_session():
+    # §10.1: peer request ids strictly increase; a duplicate closes
+    # with INVALID_REQUEST_ID (the first request parses fine).
+    from aiomoqt.types import MOQTMessageType, SessionCloseCode
+    s = _control_session(16)
+    s.is_client = False
+    s._peer_request_max = -1
+    s._control_msg_overrides[MOQTMessageType.SUBSCRIBE] = _noop_handler
+    s._on_control_data(0, _subscribe_frame(s, 2), False)
+    assert s._closed == []
+    s._on_control_data(0, _subscribe_frame(s, 2), False)
+    await asyncio.sleep(0)
+    assert s._closed
+    assert s._closed[0][0] == SessionCloseCode.INVALID_REQUEST_ID
+
+
 async def test_unknown_type_closes_the_session():
     # §9/§10: an unknown control message type MUST close the session —
     # skipping it is how a renumbered code point hides for months

@@ -234,6 +234,9 @@ class _MOQTSessionMixin:
         self._moqt_session_setup: Future[bool] = self._loop.create_future()
         self._moqt_session_closed: Future[Tuple[int,str]] = self._loop.create_future()
         self._next_request_id = 0 if self._is_client else 1
+        # Largest request id received from the peer (§10.1: peer ids
+        # keep one parity and strictly increase).
+        self._peer_request_max = -1
         self._next_track_alias = 0
         # Single dict per stream — _DataStreamState consolidates queue,
         # task, parser, binding-key, and forensic counter into one
@@ -688,6 +691,26 @@ class _MOQTSessionMixin:
                 self._latch_track_priority(
                     getattr(msg, 'track_alias', None),
                     getattr(msg, 'track_extensions', None))
+            # §10.1: a peer's request ids keep one parity (client even,
+            # server odd) and strictly increase; wrong parity or a
+            # reused id MUST close the session with INVALID_REQUEST_ID.
+            # request_id is None exactly when this message is not a
+            # bound-stream reply — i.e. a fresh request opener.
+            if (request_id is None
+                    and isinstance(msg, self._REQUEST_OPENERS)
+                    and getattr(msg, 'request_id', None) is not None):
+                rid = int(msg.request_id)
+                peer_parity = 1 if self._is_client else 0
+                if (rid & 1) != peer_parity:
+                    raise MOQTException(
+                        SessionCloseCode.INVALID_REQUEST_ID,
+                        f"peer request_id {rid} has wrong parity")
+                if rid <= self._peer_request_max:
+                    raise MOQTException(
+                        SessionCloseCode.INVALID_REQUEST_ID,
+                        f"peer request_id {rid} reused or regressed "
+                        f"(max seen {self._peer_request_max})")
+                self._peer_request_max = rid
             msg_len += hdr_len
             if end_pos > buf.tell():
                 logger.debug(f"MOQT event: control message: seeking msg end: {end_pos}")
@@ -714,7 +737,9 @@ class _MOQTSessionMixin:
             logger.error(f"handle_control_message: {error}")
             self._close_session(SessionCloseCode.PROTOCOL_VIOLATION, error)
             return None
-        except MOQTProtocolViolation as e:
+        except MOQTException as e:
+            # MOQTProtocolViolation and peers like INVALID_REQUEST_ID:
+            # close with the exception's own code.
             logger.error(
                 f"handle_control_message: protocol violation: "
                 f"{e.reason_phrase}"
