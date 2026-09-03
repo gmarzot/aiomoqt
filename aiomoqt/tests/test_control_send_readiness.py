@@ -165,6 +165,39 @@ def test_ready_stream_sends_immediately():
     assert s._pending_control_msgs == []
 
 
+async def test_second_goaway_closes_the_session():
+    from aiomoqt.messages.session_setup import GoAway as _GoAway
+    from aiomoqt.types import SessionCloseCode
+    s = _send_session(18)
+    s.is_client = True
+    s._peer_goaway = False
+    await s._handle_goaway(_GoAway(new_session_uri="", timeout=0))
+    assert s._closed == []
+    await s._handle_goaway(_GoAway(new_session_uri="", timeout=0))
+    assert s._closed
+    assert s._closed[0][0] == SessionCloseCode.PROTOCOL_VIOLATION
+
+
+async def test_server_rejects_client_new_session_uri():
+    from aiomoqt.messages.session_setup import GoAway as _GoAway
+    from aiomoqt.types import SessionCloseCode
+    s = _send_session(18)
+    s.is_client = False
+    s._peer_goaway = False
+    await s._handle_goaway(_GoAway(new_session_uri="moqt://x", timeout=0))
+    assert s._closed
+    assert s._closed[0][0] == SessionCloseCode.PROTOCOL_VIOLATION
+
+
+def test_goaway_tx_client_uri_refused():
+    import pytest as _pytest
+    s = _send_session(18)
+    s.is_client = True
+    s._peer_request_max = -1
+    with _pytest.raises(ValueError):
+        s.goaway(new_session_uri="moqt://elsewhere")
+
+
 async def test_d18_client_rejects_path_from_server():
     # §10.3.1: PATH is client-to-server only; a server sending it (or
     # anyone over WT) closes the session with INVALID_PATH.

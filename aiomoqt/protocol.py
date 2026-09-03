@@ -237,6 +237,8 @@ class _MOQTSessionMixin:
         # Largest request id received from the peer (§10.1: peer ids
         # keep one parity and strictly increase).
         self._peer_request_max = -1
+        # One GOAWAY per control stream (§10.4).
+        self._peer_goaway = False
         self._next_track_alias = 0
         # Single dict per stream — _DataStreamState consolidates queue,
         # task, parser, binding-key, and forensic counter into one
@@ -3035,6 +3037,25 @@ class _MOQTSessionMixin:
                     f"'{name}' (waiting for '{trackname}')")
         return await asyncio.wait_for(_next_matching(), timeout=timeout)
 
+    def goaway(self, new_session_uri: str = "",
+               timeout: int = 0) -> GoAway:
+        """Announce imminent session close / migration (§10.4).
+
+        Servers MAY carry a New Session URI; clients MUST send an empty
+        one. At d18 the control-stream form names the smallest peer
+        request id that might not have been processed."""
+        if self._is_client and new_session_uri:
+            raise ValueError("clients MUST send an empty New Session URI")
+        msg = GoAway(new_session_uri=new_session_uri, timeout=timeout)
+        if self.negotiated_draft >= 18:
+            if self._peer_request_max < 0:
+                msg.request_id = 0 if not self._is_client else 1
+            else:
+                msg.request_id = self._peer_request_max + 2
+        logger.info(f"MOQT send: {msg}")
+        self.send_control_message(msg)
+        return msg
+
     def unsubscribe_namespace(
         self,
         namespace_prefix: str = None,
@@ -3306,7 +3327,18 @@ class _MOQTSessionMixin:
 
     async def _handle_goaway(self, msg: GoAway) -> None:
         logger.info(f"MOQT event: handle {msg}")
-        # Handle session migration request
+        # §10.4 MUSTs: one GOAWAY per control stream; only a server may
+        # carry a New Session URI.
+        if self._peer_goaway:
+            self._close_session(SessionCloseCode.PROTOCOL_VIOLATION,
+                                "second GOAWAY on the control stream")
+            return
+        self._peer_goaway = True
+        if not self._is_client and msg.new_session_uri:
+            self._close_session(
+                SessionCloseCode.PROTOCOL_VIOLATION,
+                "client sent a non-empty New Session URI")
+            return
 
     async def _handle_subscribe_namespace(self, msg: SubscribeNamespace) -> None:
         logger.info(f"MOQT event: handle {msg}")
