@@ -51,12 +51,12 @@ import sys
 from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
 from aiomoqt.types import (
-    FilterType, GroupOrder, MOQTMessageType, ObjectStatus, RequestErrorCode,
-    SubscribeErrorCode, parse_draft_spec,
+    FilterType, GroupOrder, MOQTMessageType, ObjectStatus, ParamType,
+    RequestErrorCode, SubscribeErrorCode, parse_draft_spec,
 )
 from aiomoqt.messages import SubgroupHeader
 from aiomoqt.messages.publish import PublishOk
-from aiomoqt.messages.request import RequestError
+from aiomoqt.messages.request import RequestError, RequestOk
 from aiomoqt.track import SubscribedTrack
 from aiomoqt.context import is_draft16_or_later
 from aiomoqt.utils.logger import set_log_level, get_logger
@@ -647,6 +647,33 @@ def parse_args():
     return parser.parse_args()
 
 
+async def _on_track_status(session, msg):
+    """§10.14: answer TRACK_STATUS from the relay's own table —
+    TRACK_STATUS_OK (REQUEST_OK) for a served track, DOES_NOT_EXIST
+    otherwise. The reply rides the request's stream at d18."""
+    ns = _ns_tuple(msg.track_namespace)
+    track = _tracks.get((ns, msg.track_name))
+    if track is None or not _track_live(track):
+        logger.info(f"relay: track-status ns={ns} track={msg.track_name} "
+                    f"-> DOES_NOT_EXIST")
+        err = RequestError(
+            request_id=msg.request_id,
+            error_code=int(RequestErrorCode.DOES_NOT_EXIST),
+            retry_interval=0,
+            reason="track not served here",
+        )
+        session._send_reply(msg.request_id, err)
+        return
+    params = {}
+    largest = getattr(track.upstream, "_largest", None)
+    if largest and session._profile.draft >= 18:
+        params[ParamType.LARGEST_OBJECT] = (largest[0], largest[1])
+    logger.info(f"relay: track-status ns={ns} track={msg.track_name} "
+                f"-> OK largest={largest}")
+    ok = RequestOk(request_id=msg.request_id, parameters=params)
+    session._send_reply(msg.request_id, ok)
+
+
 def _build_server(bind, port, cert, key, use_quic, draft):
     """Construct a MOQTServer with the relay's control-plane handlers."""
     server = MOQTServer(
@@ -664,6 +691,8 @@ def _build_server(bind, port, cert, key, use_quic, draft):
         MOQTMessageType.SUBSCRIBE, _on_subscribe)
     server.register_handler(
         MOQTMessageType.PUBLISH, _on_publish)
+    server.register_handler(
+        MOQTMessageType.TRACK_STATUS, _on_track_status)
     return server
 
 

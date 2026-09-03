@@ -3185,7 +3185,19 @@ class _MOQTSessionMixin:
 
     async def _handle_track_status(self, msg: TrackStatus) -> None:
         logger.info(f"MOQT event: handle {msg}")
-        # Handle track status request (same format as SUBSCRIBE)
+        if is_draft16_or_later(self.negotiated_draft):
+            # §10.14: the receiver MUST answer with exactly one
+            # TRACK_STATUS_OK or REQUEST_ERROR. A session with no track
+            # knowledge answers honestly rather than hanging the peer;
+            # apps override via register_handler(TRACK_STATUS, ...).
+            err = RequestError(
+                request_id=msg.request_id,
+                error_code=int(RequestErrorCode.NOT_SUPPORTED),
+                retry_interval=0,
+                reason="track status not supported",
+            )
+            logger.info(f"MOQT send: {err}")
+            self._send_reply(msg.request_id, err)
 
     async def _handle_track_status_ok(self, msg: TrackStatusOk) -> None:
         logger.info(f"MOQT event: handle {msg}")
