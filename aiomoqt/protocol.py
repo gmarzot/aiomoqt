@@ -1711,9 +1711,19 @@ class _MOQTSessionMixin:
         # set the async exit condition for session
         if not self._moqt_session_closed.done():
             self._moqt_session_closed.set_result((error_code, reason_phrase))
-        # close QUIC connection
-        super().close()
-        
+        # Close the QUIC connection on the next loop tick so the FINs
+        # queued above get a transmit pass first — batched with
+        # CONNECTION_CLOSE the peer sees them as RESET_STREAM.
+        parent_close = super().close
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None:
+            loop.call_soon(parent_close)
+        else:
+            parent_close()
+
     async def async_closed(self) -> bool:
         if not self._moqt_session_closed.done():
             self._close_err = await self._moqt_session_closed
