@@ -45,6 +45,27 @@ def _session(is_client=True):
     return s
 
 
+async def test_request_stream_termination_cancels_the_request():
+    # §3.3.2: resetting/stopping a request's bidi stream cancels the
+    # request — state torn down, owner notified, awaiter unblocked.
+    s = _session()
+    s._bidi_streams = {7: 9}
+    s._bidi_stream_requests = {9: 7}
+    s._subscriptions = {7: ["sub"]}
+    s._request_cancel_handlers = {}
+    fired = []
+    s.register_request_cancel_handler(7, lambda rid: fired.append(rid))
+    fut = s._loop.create_future()
+    s._pending_requests[7] = fut
+    s._on_request_stream_terminated(9)
+    assert fired == [7]
+    assert 7 not in s._bidi_streams
+    assert 9 not in s._bidi_stream_requests
+    assert 7 not in s._subscriptions
+    with pytest.raises(MOQTRequestError):
+        await fut
+
+
 @pytest.fixture
 def plog(caplog):
     """Capture aiomoqt.protocol records despite propagate=False."""

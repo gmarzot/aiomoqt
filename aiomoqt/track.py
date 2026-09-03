@@ -255,6 +255,8 @@ class PublishedTrack(Track):
                 # Registering before any await keeps it race-free.
                 fut = self.session._loop.create_future()
                 self.session._pending_requests[pub_msg.request_id] = fut
+                self.session.register_request_cancel_handler(
+                    pub_msg.request_id, self._on_request_cancelled)
                 asyncio.create_task(
                     self._await_publish_reply(pub_msg.request_id))
             # Optimistic mode: don't wait for PUBLISH_OK before generating.
@@ -355,7 +357,20 @@ class PublishedTrack(Track):
         ok = session.subscribe_ok(request_msg=msg, **kw)
         self.track_alias = ok.track_alias
         self._subscribe_request_id = msg.request_id
+        # §3.3.2: the subscriber cancels by terminating the request
+        # stream — stop generating when it does.
+        session.register_request_cancel_handler(
+            msg.request_id, self._on_request_cancelled)
         await self._start_generating(session, "SUBSCRIBE")
+
+    def _on_request_cancelled(self, request_id: int) -> None:
+        """Peer terminated the subscription's request stream (§3.3.2):
+        stop generating; per-task cancel paths RESET open subgroup
+        streams."""
+        logger.info(f"Track: request {request_id} cancelled — stopping")
+        self._done = True
+        for t in list(self._tasks):
+            t.cancel()
 
     def _send_publish_done(self, session, status_code=0x2):
         """Send PUBLISH_DONE with stream count for clean shutdown.

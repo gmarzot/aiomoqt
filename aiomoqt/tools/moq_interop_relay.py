@@ -534,6 +534,9 @@ async def _on_subscribe(session, msg):
         _watch_session(session)
         ok = session.subscribe_ok(request_msg=msg)
         track.add_downstream(session, ok.track_alias, msg.request_id)
+        session.register_request_cancel_handler(
+            msg.request_id,
+            lambda rid, t=track, s=session: t.drop_session(s))
         _accept_publish(track)
         logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
                     f"-> SUBSCRIBE_OK (published track, fanout="
@@ -548,6 +551,9 @@ async def _on_subscribe(session, msg):
             _watch_session(session)
             ok = session.subscribe_ok(request_msg=msg)
             track.add_downstream(session, ok.track_alias, msg.request_id)
+            session.register_request_cancel_handler(
+                msg.request_id,
+                lambda rid, t=track, s=session: t.drop_session(s))
             logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
                         f"-> SUBSCRIBE_OK (fanout="
                         f"{len(track.downstream)})")

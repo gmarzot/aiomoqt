@@ -276,6 +276,9 @@ class _MOQTSessionMixin:
 
         self._bidi_streams: Dict[int, int] = {}  # map request_id to bidi stream_id (d16)
         self._bidi_stream_requests: Dict[int, int] = {}  # map bidi stream_id to request_id (d16)
+        # request_id -> callback fired when the request's stream is
+        # terminated by the peer (§3.3.2 cancellation).
+        self._request_cancel_handlers: Dict[int, Callable] = {}
         self._track_aliases: Dict[int, int] = {}  # map alias to subscription_id
         # Set when client_session_init completes (ms, monotonic delta).
         self._established_ms: Optional[float] = None
@@ -527,6 +530,35 @@ class _MOQTSessionMixin:
             self._track_default_priority[track_alias] = int(prio)
             logger.debug(f"track {track_alias}: default publisher "
                          f"priority {int(prio)}")
+
+    def register_request_cancel_handler(self, request_id: int,
+                                        callback: Callable) -> None:
+        """Called as callback(request_id) when the peer terminates the
+        request's bidi stream (§3.3.2) — the d18 cancellation path for
+        SUBSCRIBE/PUBLISH/etc. Publishers stop feeding on it."""
+        self._request_cancel_handlers[request_id] = callback
+
+    def _on_request_stream_terminated(self, stream_id: int) -> None:
+        """§3.3.2: terminating a request's bidi stream cancels the
+        request. Tear down its state and notify the owner."""
+        request_id = self._bidi_stream_requests.pop(stream_id, None)
+        if request_id is None:
+            return
+        self._bidi_streams.pop(request_id, None)
+        self._subscriptions.pop(request_id, None)
+        fut = self._pending_requests.pop(request_id, None)
+        if fut is not None and not fut.done():
+            fut.set_exception(MOQTRequestError(
+                error_code=0x1, reason="request cancelled by peer",
+                retry_interval=0))
+        cb = self._request_cancel_handlers.pop(request_id, None)
+        logger.info(f"MOQT: request {request_id} cancelled by stream "
+                    f"termination (stream {stream_id})")
+        if cb is not None:
+            try:
+                cb(request_id)
+            except Exception:
+                logger.debug("request-cancel handler raised", exc_info=True)
 
     def register_stream_end_handler(self, track_alias: int,
                                     callback: Callable) -> None:
@@ -1628,11 +1660,13 @@ class _MOQTSessionMixin:
             logger.debug(f"MOQT event: StopSendingReceived: stream {event.stream_id}")
             # RFC 9000: STOP_SENDING from peer → reciprocal RESET_STREAM.
             self.stream_reset(event.stream_id, event.error_code)
+            self._on_request_stream_terminated(event.stream_id)
             self._cleanup_stream(
                 event.stream_id, QuicErrorCode.APPLICATION_ERROR)
             return
         elif isinstance(event, StreamReset):
             logger.debug(f"MOQT event: StreamReset: stream {event.stream_id}")
+            self._on_request_stream_terminated(event.stream_id)
             self._cleanup_stream(
                 event.stream_id, QuicErrorCode.APPLICATION_ERROR)
             return
