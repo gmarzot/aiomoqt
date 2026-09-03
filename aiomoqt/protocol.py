@@ -1261,8 +1261,7 @@ class _MOQTSessionMixin:
         dgram_type = buf.pull_vint()
         if prof.varint == "vi64" or prof.draft >= 16:
             # d16 already uses the merged OBJECT_DATAGRAM layout
-            # (Figure 27: STATUS 0x20, DEFAULT_PRIORITY 0x08); routing
-            # 0x24-0x2D to "unknown type" closed legal d16 sessions.
+            # (Figure 27: STATUS 0x20, DEFAULT_PRIORITY 0x08).
             return self._moqt_handle_data_dgram_d18(buf, pos, dgram_type)
         # d14: ObjectDatagram types 0x00-0x07.
         _dgram_max = 0x07

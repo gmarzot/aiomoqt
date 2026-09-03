@@ -99,9 +99,13 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y libgoogle-glog0v6t64 \
             || sudo apt-get install -y libgoogle-glog0v6
-          ./harness/bin/moqtest_client --help >/dev/null 2>&1 \
-            || { ldd ./harness/bin/moqtest_client; \
-                 echo "::error::moqtest_client not runnable"; exit 1; }
+          # gflags binaries exit 1 on --help; only 126/127 mean the
+          # binary itself cannot run (missing libs / not executable).
+          rc=0; ./harness/bin/moqtest_client --help >/dev/null 2>&1 || rc=$?
+          if [ "$rc" -ge 126 ]; then
+            ldd ./harness/bin/moqtest_client
+            echo "::error::moqtest_client not runnable (exit $rc)"; exit 1
+          fi
           echo "harness ready: $(ls harness/bin | tr '\n' ' ')"
 
       - name: Generate certs
