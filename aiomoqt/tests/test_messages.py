@@ -1382,10 +1382,10 @@ class TestDraft18ControlMessages:
         )
 
     def test_fetch_ok_d18(self):
-        # FETCH_OK is a response → d18 omits request_id; the d18 "End
-        # Location" is the same two varints as largest_group/object, and
-        # group_order rides in params — i.e. the same vi64 + request-id-gate
-        # shape as the other OK replies, not a structural rewrite.
+        # FETCH_OK is a response → d18 omits request_id, and GROUP_ORDER
+        # is not defined for FETCH_OK at d18 (§10.2.8) so it never rides
+        # the wire; End Location is the same two varints as
+        # largest_group/object.
         assert moqt_message_serialization_versioned(
             FetchOk,
             {
@@ -1399,7 +1399,7 @@ class TestDraft18ControlMessages:
             },
             type_id=MOQTMessageType.FETCH_OK,
             version=self.D18,
-            skip_fields={'request_id', 'track_extensions'},
+            skip_fields={'request_id', 'group_order', 'track_extensions'},
         )
 
 

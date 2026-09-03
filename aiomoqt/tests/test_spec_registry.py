@@ -175,6 +175,44 @@ def test_serialized_params_obey_the_odd_even_length_rule(draft):
     assert set(seen) == set(params)
 
 
+def test_fetch_ok_d18_omits_group_order_param():
+    """§10.2.8: GROUP_ORDER may appear in SUBSCRIBE, PUBLISH_OK or
+    FETCH — never FETCH_OK; a receiver MUST close on a parameter in a
+    message it isn't defined for (§10.2.1)."""
+    from aiopquic.buffer import Buffer
+    from aiomoqt.messages.fetch import FetchOk
+    prof = profile_for(18)
+    raw = bytes(FetchOk(request_id=1, group_order=2).serialize(prof=prof).data)
+    r = Buffer(data=raw, vi64=True)
+    r.pull_vint()                        # Type
+    mlen = r.pull_uint16()
+    end = r.tell() + mlen
+    r.pull_uint8()                       # End of Track (no request id at d18)
+    r.pull_vint()                        # Largest Group
+    r.pull_vint()                        # Largest Object
+    assert r.pull_vint() == 0            # parameter count: GROUP_ORDER dropped
+    assert r.tell() == end               # no track extensions either
+
+
+def test_fetch_group_delta_direction_comes_from_our_request():
+    """d18 FETCH_OK carries no GROUP_ORDER, so the group-delta decode
+    direction (§11.4.4.1) is the order requested in our own FETCH."""
+    from aiomoqt.protocol import _MOQTSessionMixin
+    from aiomoqt.messages.fetch import Fetch
+    from aiomoqt.messages.data import FetchHeader
+    from aiomoqt.types import FetchType, GroupOrder
+    s = object.__new__(_MOQTSessionMixin)
+    fetch = Fetch(request_id=5, fetch_type=FetchType.STANDALONE,
+                  group_order=GroupOrder.DESCENDING,
+                  namespace=(b"ns",), track_name=b"t")
+    s._subscriptions = {5: [fetch]}
+    s._fetch_stream_by_request = {}
+    s._data_streams = {}
+    header = FetchHeader(request_id=5)
+    s._admit_fetch_stream(9, header)
+    assert header._group_order == GroupOrder.DESCENDING
+
+
 def test_goaway_d18_wire_has_timeout_and_request_id():
     """§10.4 Figure 7: URI Length, URI, Timeout, [Request ID (control-
     stream form)] — all vi64. Hand-derived bytes, not a round-trip."""

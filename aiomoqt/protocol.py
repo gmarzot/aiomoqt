@@ -981,12 +981,18 @@ class _MOQTSessionMixin:
         outstanding = self._subscriptions.get(request_id)
         is_fetch = (outstanding is not None
                     and any(isinstance(m, Fetch) for m in outstanding))
-        # d18 group-delta decode direction comes from the FETCH_OK's
-        # Group Order when one has arrived (default ascending).
+        # Group-delta decode direction: pre-d18 the FETCH_OK carries a
+        # GROUP_ORDER param; at d18 it cannot (§10.2.8), so the
+        # direction is the one we requested in our own FETCH.
         for m in (outstanding or ()):
             order = getattr(m, 'group_order', None)
             if type(m).__name__ == 'FetchOk' and order:
                 header._group_order = int(order)
+                break
+        else:
+            for m in (outstanding or ()):
+                if isinstance(m, Fetch) and getattr(m, 'group_order', None):
+                    header._group_order = int(m.group_order)
         if not is_fetch:
             raise MOQTStreamReject(
                 SessionCloseCode.PROTOCOL_VIOLATION,
@@ -2375,26 +2381,58 @@ class _MOQTSessionMixin:
         error_code: int = SubscribeErrorCode.INTERNAL_ERROR,
         reason: str = "Internal error",
     ) -> Optional[MOQTMessage]:
-        """Create and send a SUBSCRIBE_ERROR response."""
-        message = SubscribeError(
-            request_id=request_id,
-            error_code=error_code,
-            reason=reason,
-        )
-        logger.info(f"MOQT send: {message}")
-        self.send_control_message(message)
+        """Create and send a negative response to a SUBSCRIBE.
+
+        d14: SUBSCRIBE_ERROR on the control stream. d16+: code point
+        0x05 is REQUEST_ERROR (Error Code, Retry Interval, Reason) —
+        a d14 body there desyncs the peer's parse. Callers pass the
+        draft-appropriate error code."""
+        if is_draft16_or_later(self.negotiated_draft):
+            message = RequestError(
+                request_id=request_id,
+                error_code=error_code,
+                retry_interval=0,
+                reason=reason,
+            )
+            logger.info(f"MOQT send: {message}")
+            self._send_reply(request_id, message)
+        else:
+            message = SubscribeError(
+                request_id=request_id,
+                error_code=error_code,
+                reason=reason,
+            )
+            logger.info(f"MOQT send: {message}")
+            self.send_control_message(message)
         return message
     
     def unsubscribe(
         self,
         request_id: int,
     ) -> Optional[MOQTMessage]:
-        """Unsubscribe from a track."""
+        """Unsubscribe from a track.
+
+        d14/d16 send UNSUBSCRIBE (0x0A). d18 removed it: a request is
+        cancelled by terminating its own bidi stream (§3.3.2) — reset
+        our write half, STOP_SENDING the reply half. Returns None then."""
+        if self.negotiated_draft >= 18:
+            stream_id = self._bidi_streams.get(request_id)
+            if stream_id is None:
+                logger.debug(
+                    f"d18 unsubscribe: no request stream for "
+                    f"request_id={request_id}; nothing to reset")
+                return None
+            logger.info(f"MOQT: d18 unsubscribe: cancel request stream "
+                        f"{stream_id} (request_id={request_id})")
+            # §15.10.4 stream reset code CANCELLED (0x1).
+            self.stream_reset(stream_id, 0x1)
+            self.stream_stop_sending(stream_id, 0x1)
+            self._bidi_streams.pop(request_id, None)
+            return None
         message = Unsubscribe(request_id=request_id)
         logger.info(f"MOQT send: {message}")
         self.send_control_message(message)
- 
-        return message       
+        return message
 
     async def join(
         self,
@@ -2569,14 +2607,27 @@ class _MOQTSessionMixin:
         error_code: int = 0,
         reason: str = "Internal error",
     ) -> Optional[MOQTMessage]:
-        """Create and send a FETCH_ERROR response (spec §9.16)."""
-        message = FetchError(
-            request_id=request_id,
-            error_code=error_code,
-            reason=reason,
-        )
-        logger.info(f"MOQT send: {message}")
-        self.send_control_message(message)
+        """Create and send a negative response to a FETCH.
+
+        d14 sends FETCH_ERROR (0x19); d16+ dropped it — the reject is
+        the universal REQUEST_ERROR, on the request's stream at d18."""
+        if is_draft16_or_later(self.negotiated_draft):
+            message = RequestError(
+                request_id=request_id,
+                error_code=error_code,
+                retry_interval=0,
+                reason=reason,
+            )
+            logger.info(f"MOQT send: {message}")
+            self._send_reply(request_id, message)
+        else:
+            message = FetchError(
+                request_id=request_id,
+                error_code=error_code,
+                reason=reason,
+            )
+            logger.info(f"MOQT send: {message}")
+            self.send_control_message(message)
         return message
 
     def publish_namespace(
