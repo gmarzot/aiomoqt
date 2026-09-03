@@ -51,8 +51,9 @@ import sys
 from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
 from aiomoqt.types import (
-    FilterType, GroupOrder, MOQTMessageType, ObjectStatus, ParamType,
-    RequestErrorCode, SubscribeErrorCode, parse_draft_spec,
+    D18MessageType, FilterType, GroupOrder, MOQTMessageType,
+    MOQTRequestError, ObjectStatus, ParamType, RequestErrorCode,
+    SubscribeErrorCode, parse_draft_spec,
 )
 from aiomoqt.messages import SubgroupHeader
 from aiomoqt.messages.publish import PublishOk
@@ -375,6 +376,7 @@ def _supersede_namespace(ns: tuple, session) -> None:
 def _forget_session(session) -> None:
     """Drop everything a closing session owned: its announcements and
     its downstream subscriptions."""
+    _track_subs[:] = [e for e in _track_subs if e[0] is not session]
     for ns in list(_announced):
         if _announced[ns].pop(session, None) is not None and \
                 not _announced[ns]:
@@ -495,6 +497,10 @@ async def _on_publish(session, msg):
     logger.info(f"relay: publish ns={ns} track={msg.track_name} "
                 f"alias={msg.track_alias} — holding PUBLISH_OK for a "
                 f"subscriber")
+    for sub_session, prefix, _rid in list(_track_subs):
+        if _prefix_covers(prefix, ns):
+            asyncio.create_task(
+                _offer_track(sub_session, track, key))
     if track.downstream:
         _accept_publish(track)
 
@@ -653,6 +659,72 @@ def parse_args():
     return parser.parse_args()
 
 
+# SUBSCRIBE_TRACKS subscribers: (session, prefix_tuple, request_id).
+_track_subs: list = []
+
+
+def _prefix_covers(prefix, ns) -> bool:
+    """§2.4 field-wise prefix match (empty prefix matches everything)."""
+    return ns[:len(prefix)] == prefix
+
+
+async def _offer_track(session, track, key):
+    """§9.5: send a PUBLISH for a held/served track to a
+    SUBSCRIBE_TRACKS subscriber; on PUBLISH_OK(forward=1) wire it into
+    the fan-out."""
+    ns, name = key
+    owner = (track.pending_publish[0] if track.pending_publish
+             else track.upstream)
+    if owner is session:
+        return
+    pub_msg = session.publish(
+        namespace="/".join(x.decode() for x in ns),
+        track_name=(name.decode() if isinstance(name, bytes) else name),
+        forward=1)
+    fut = session._loop.create_future()
+    session._pending_requests[pub_msg.request_id] = fut
+    try:
+        reply = await session._await_response(pub_msg.request_id)
+    except MOQTRequestError as e:
+        logger.info(f"relay: PUBLISH offer declined for {key}: {e}")
+        return
+    forward = getattr(reply, 'forward', None)
+    if forward is None:
+        forward = (getattr(reply, 'parameters', None) or {}).get(
+            ParamType.FORWARD)
+    if not forward:
+        logger.info(f"relay: PUBLISH offer for {key}: forward=0")
+        return
+    track.add_downstream(session, pub_msg.track_alias, pub_msg.request_id)
+    session.register_request_cancel_handler(
+        pub_msg.request_id,
+        lambda rid, t=track, s=session: t.drop_session(s))
+    _accept_publish(track)
+    logger.info(f"relay: PUBLISH offer accepted for {key} "
+                f"alias={pub_msg.track_alias} "
+                f"(fanout={len(track.downstream)})")
+
+
+async def _on_subscribe_tracks(session, msg):
+    """§9.5: a SUBSCRIBE_TRACKS subscriber gets a PUBLISH for every
+    matching track, present and future."""
+    prefix = _ns_tuple(msg.namespace_prefix)
+    _watch_session(session)
+    session.subscribe_tracks_ok(msg)
+
+    def _drop(rid, s=session, r=msg.request_id):
+        _track_subs[:] = [e for e in _track_subs
+                          if not (e[0] is s and e[2] == r)]
+    _track_subs.append((session, prefix, msg.request_id))
+    session.register_request_cancel_handler(msg.request_id, _drop)
+    logger.info(f"relay: subscribe-tracks prefix={prefix} "
+                f"(subs={len(_track_subs)})")
+    for key, track in list(_tracks.items()):
+        if _prefix_covers(prefix, key[0]) and (
+                track.pending_publish or track.upstream):
+            asyncio.create_task(_offer_track(session, track, key))
+
+
 async def _on_track_status(session, msg):
     """§10.14: answer TRACK_STATUS from the relay's own table —
     TRACK_STATUS_OK (REQUEST_OK) for a served track, DOES_NOT_EXIST
@@ -699,6 +771,8 @@ def _build_server(bind, port, cert, key, use_quic, draft):
         MOQTMessageType.PUBLISH, _on_publish)
     server.register_handler(
         MOQTMessageType.TRACK_STATUS, _on_track_status)
+    server.register_handler(
+        D18MessageType.SUBSCRIBE_TRACKS, _on_subscribe_tracks)
     return server
 
 
