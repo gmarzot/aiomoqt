@@ -199,13 +199,23 @@ class PublishOk(MOQTMessage):
             if self.group_order is not None:
                 params[ParamType.GROUP_ORDER] = self.group_order
             if self.filter_type is not None:
-                fbuf = Buffer(capacity=64)
-                fbuf.push_uint_var(self.filter_type)
+                # Filter internals follow the negotiated varint codec
+                # (vi64 on d18); d18 carries End Group as a delta from
+                # Start Group.
+                fbuf = Buffer(capacity=64, vi64=prof.vi64)
+                fbuf.push_vint(self.filter_type)
                 if self.filter_type in (3, 4):
-                    fbuf.push_uint_var(self.start_group or 0)
-                    fbuf.push_uint_var(self.start_object or 0)
+                    fbuf.push_vint(self.start_group or 0)
+                    fbuf.push_vint(self.start_object or 0)
                 if self.filter_type == 4:
-                    fbuf.push_uint_var(self.end_group or 0)
+                    end = self.end_group or 0
+                    if prof.vi64:
+                        start = self.start_group or 0
+                        if end < start:
+                            raise ValueError(
+                                f"end_group {end} < start_group {start}")
+                        end -= start
+                    fbuf.push_vint(end)
                 params[ParamType.SUBSCRIPTION_FILTER] = fbuf.data_slice(0, fbuf.tell())
             MOQTMessage._serialize_params(payload, params, prof=prof)
         else:
@@ -221,13 +231,12 @@ class PublishOk(MOQTMessage):
                 payload.push_vint(self.end_group or 0)
             MOQTMessage._serialize_params(payload, self.parameters or {}, prof=prof)
 
-        # From d16 on, a PUBLISH is answered with the universal
-        # REQUEST_OK (0x07); "PUBLISH_OK" is only the shorthand name for
-        # a REQUEST_OK sent in response to a PUBLISH (§10.5). Only d14
-        # has a distinct PUBLISH_OK message on the wire. Emitting 0x1E
-        # to a d16+ peer is an unknown control message to it.
+        # d14/d16 define a distinct PUBLISH_OK (0x1E, d16 §9.14). Only
+        # d18 answers a PUBLISH with the universal REQUEST_OK (0x07);
+        # "PUBLISH_OK" is then the shorthand for a REQUEST_OK sent in
+        # response to a PUBLISH (§10.5).
         wire_type = (D16MessageType.REQUEST_OK
-                     if is_draft16_or_later(prof.draft) else self.type)
+                     if prof.draft >= 18 else self.type)
         buf.push_uint_var(wire_type)
         buf.push_uint16(payload.tell())
         buf.push_bytes(payload.data_slice(0, payload.tell()))
@@ -255,13 +264,16 @@ class PublishOk(MOQTMessage):
             group_order = params.pop(ParamType.GROUP_ORDER, None)
             filter_raw = params.pop(ParamType.SUBSCRIPTION_FILTER, None)
             if filter_raw is not None:
-                fbuf = Buffer(data=filter_raw)
+                fbuf = Buffer(data=filter_raw, vi64=prof.vi64)
                 filter_type = fbuf.pull_vint()
                 if filter_type in (3, 4):
                     start_group = fbuf.pull_vint()
                     start_object = fbuf.pull_vint()
                 if filter_type == 4:
                     end_group = fbuf.pull_vint()
+                    if prof.vi64:
+                        # d18: End Group arrives as a delta from Start.
+                        end_group += start_group or 0
         else:
             forward = buf.pull_uint8()
             priority = buf.pull_uint8()

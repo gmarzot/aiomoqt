@@ -163,11 +163,10 @@ def moqt_message_serialization_versioned(cls, params, type_id=None,
         # is unchanged for d14/d16.
         buf.vi64 = profile_for(draft).vi64
         id = buf.pull_vint()
-        # PUBLISH_OK is the shorthand name for a REQUEST_OK sent in reply
-        # to a PUBLISH (§10.5): from d16 on the wire type is 0x07, and
-        # only d14 has a distinct PUBLISH_OK message.
-        if (type_id == MOQTMessageType.PUBLISH_OK
-                and is_draft16_or_later(draft)):
+        # d14/d16 define a distinct PUBLISH_OK (0x1E, d16 §9.14); only
+        # d18 replies to a PUBLISH with the universal REQUEST_OK (0x07),
+        # "PUBLISH_OK" being its shorthand name there (§10.5).
+        if type_id == MOQTMessageType.PUBLISH_OK and draft >= 18:
             type_id = D16MessageType.REQUEST_OK
         assert id == type_id
         msg_len = buf.pull_uint16()
