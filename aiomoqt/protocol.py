@@ -1478,14 +1478,30 @@ class _MOQTSessionMixin:
             chain.commit()
             if msg is self._MSG_SKIPPED:
                 continue
-            # The first request-opener on a bidi request stream binds it to
-            # its Request ID; later replies demux by the bound stream.
+            # §3.3: a request bidi stream MUST open with one of the
+            # request types; the first opener binds the stream to its
+            # Request ID and later replies demux by that binding.
             if (is_request_bidi and
-                    self._bidi_stream_requests.get(stream_id) is None and
-                    isinstance(msg, self._REQUEST_OPENERS) and
-                    getattr(msg, 'request_id', None) is not None):
+                    self._bidi_stream_requests.get(stream_id) is None):
+                if not (isinstance(msg, self._REQUEST_OPENERS) and
+                        getattr(msg, 'request_id', None) is not None):
+                    self._close_session(
+                        SessionCloseCode.PROTOCOL_VIOLATION,
+                        f"request stream {stream_id} opened with "
+                        f"{type(msg).__name__}, not a request")
+                    return
                 self._bidi_stream_requests[stream_id] = msg.request_id
                 self._bidi_streams[msg.request_id] = stream_id
+            # d18 §10 Table 5: only SETUP and GOAWAY ride the control
+            # stream; a request there cannot own a reply stream, and
+            # echoing a reply onto our control stream would mirror the
+            # peer's violation.
+            if (not is_request_bidi and self._profile.control_uni_pair
+                    and not isinstance(msg, (Setup, GoAway))):
+                self._close_session(
+                    SessionCloseCode.PROTOCOL_VIOLATION,
+                    f"{type(msg).__name__} on the d18 control stream")
+                return
         if end_stream:
             self._control_chains.pop(stream_id, None)
 

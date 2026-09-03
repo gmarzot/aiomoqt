@@ -45,6 +45,18 @@ def _control_session(draft):
     return s
 
 
+def _feed_reply(s, data, end=False):
+    """Feed bytes carrying a reply on a draft-appropriate stream:
+    pre-d18 the control stream, d18 a bound request bidi (replies are
+    illegal on the d18 control stream)."""
+    if s._profile.control_uni_pair:
+        s._bidi_stream_requests.setdefault(0, 7)
+        s._bidi_streams.setdefault(7, 0)
+        s._on_control_data(0, data, end, is_request_bidi=True)
+    else:
+        s._on_control_data(0, data, end)
+
+
 def _spy_parses(s):
     """Record every whole control message _on_control_data parses."""
     parsed = []
@@ -70,11 +82,11 @@ async def test_header_split_reassembles(draft, cut):
         prof=s._profile).data)
     assert len(wire) > cut
 
-    s._on_control_data(0, wire[:cut], False)
+    _feed_reply(s, wire[:cut])
     assert parsed == []            # partial header — nothing parsed yet
     assert s._closed == []         # and NOT treated as a protocol error
 
-    s._on_control_data(0, wire[cut:], False)
+    _feed_reply(s, wire[cut:])
     assert len(parsed) == 1        # reassembled into exactly one message
     assert s._closed == []
 
@@ -87,11 +99,11 @@ async def test_body_split_reassembles(draft):
         prof=s._profile).data)
     cut = len(wire) - 1            # header complete, body one byte short
 
-    s._on_control_data(0, wire[:cut], False)
+    _feed_reply(s, wire[:cut])
     assert parsed == []
     assert s._closed == []
 
-    s._on_control_data(0, wire[cut:], False)
+    _feed_reply(s, wire[cut:])
     assert len(parsed) == 1
     assert s._closed == []
 
@@ -102,7 +114,7 @@ async def test_whole_message_single_event(draft):
     parsed = _spy_parses(s)
     wire = bytes(RequestOk(request_id=7, parameters={}).serialize(
         prof=s._profile).data)
-    s._on_control_data(0, wire, False)
+    _feed_reply(s, wire)
     assert len(parsed) == 1
     assert s._closed == []
 
@@ -113,7 +125,7 @@ async def test_two_messages_one_event(draft):
     parsed = _spy_parses(s)
     one = bytes(RequestOk(request_id=7, parameters={}).serialize(
         prof=s._profile).data)
-    s._on_control_data(0, one + one, False)
+    _feed_reply(s, one + one)
     assert len(parsed) == 2        # both whole messages drained
     assert s._closed == []
 
@@ -214,6 +226,33 @@ def _subscribe_frame(s, rid):
     return bytes(Subscribe(request_id=rid, track_namespace=(b"a",),
                            track_name=b"t", filter_type=2).serialize(
                                prof=s._profile).data)
+
+
+async def test_d18_request_stream_must_open_with_a_request():
+    # §3.3: the first message on a request bidi must be one of the 7
+    # request types; a reply-shaped first message closes the session.
+    from aiomoqt.types import SessionCloseCode
+    s = _control_session(18)
+    frame = bytes(RequestOk(request_id=7, parameters={}).serialize(
+        prof=s._profile).data)
+    s._on_control_data(9, frame, False, is_request_bidi=True)
+    await asyncio.sleep(0)
+    assert s._closed
+    assert s._closed[0][0] == SessionCloseCode.PROTOCOL_VIOLATION
+
+
+async def test_d18_control_stream_carries_only_setup_and_goaway():
+    # d18 Table 5: a SUBSCRIBE arriving on the control uni is a
+    # violation — it cannot own a reply stream.
+    from aiomoqt.types import MOQTMessageType, SessionCloseCode
+    s = _control_session(18)
+    s.is_client = False
+    s._peer_request_max = -1
+    s._control_msg_overrides[MOQTMessageType.SUBSCRIBE] = _noop_handler
+    s._on_control_data(0, _subscribe_frame(s, 2), False)
+    await asyncio.sleep(0)
+    assert s._closed
+    assert s._closed[0][0] == SessionCloseCode.PROTOCOL_VIOLATION
 
 
 async def test_wrong_parity_request_id_closes_the_session():
@@ -338,9 +377,9 @@ async def test_message_and_a_half(draft):
     parsed = _spy_parses(s)
     one = bytes(RequestOk(request_id=7, parameters={}).serialize(
         prof=s._profile).data)
-    s._on_control_data(0, one + one[:2], False)
+    _feed_reply(s, one + one[:2])
     assert len(parsed) == 1        # only the whole one
     assert s._closed == []
-    s._on_control_data(0, one[2:], False)
+    _feed_reply(s, one[2:])
     assert len(parsed) == 2        # remainder completed
     assert s._closed == []
