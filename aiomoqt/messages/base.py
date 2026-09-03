@@ -101,7 +101,7 @@ class MOQTMessage:
     # parsed dict is returned so the rest of the message dispatches.
     _tolerate_trailing_extensions = False
     _trailing_extensions_truncation_count = 0
-    _inline_location_count = 0
+    _prefixed_location_count = 0
 
     @staticmethod
     def _extensions_decode(buf: Buffer, with_length: bool = True,
@@ -448,16 +448,12 @@ class MOQTMessage:
                 payload.push_vint(param_type)  # Type
 
             if param_type in prof.location_params:
-                # Location value (d18 LARGEST_OBJECT 0x09). The type is
-                # odd, so §1.4.3's Length field applies; the value bytes
-                # are a group + object varint pair.
+                # d18 §10.2/§10.2.11: a Location value is two bare
+                # varints (Group, Object) — no Length, despite the odd
+                # type number (§1.4.3 does not govern Message Parameters).
                 loc_group, loc_object = param_value
-                loc = Buffer(capacity=BUF_SIZE, vi64=prof.vi64)
-                loc.push_vint(loc_group)
-                loc.push_vint(loc_object)
-                loc_bytes = loc.data_slice(0, loc.tell())
-                payload.push_vint(len(loc_bytes))
-                payload.push_bytes(loc_bytes)
+                payload.push_vint(loc_group)
+                payload.push_vint(loc_object)
             elif param_type % 2 == 1:  # Odd type - includes Length field
                 # Value is bytes or string
                 if isinstance(param_value, str):
@@ -486,21 +482,120 @@ class MOQTMessage:
 
 
     @staticmethod
-    def _note_inline_location(param_type: int) -> None:
-        """Record a Location parameter written without its §1.4.3 Length.
+    def _note_prefixed_location(param_type: int) -> None:
+        """Record a Location parameter received WITH a Length prefix.
 
-        Accepted on receive so a peer that omits it still interops; we
-        always write the Length. Logged once so the peer is visible
-        rather than silently tolerated.
+        §10.2 defines Location as two bare varints; a Length prefix is a
+        peer deviation (seen from cloudflare, 2026-09). Accepted on
+        receive; logged once so the peer is visible rather than silently
+        tolerated.
         """
-        MOQTMessage._inline_location_count += 1
-        if MOQTMessage._inline_location_count == 1:
+        MOQTMessage._prefixed_location_count += 1
+        if MOQTMessage._prefixed_location_count == 1:
             logger.warning(
-                f"peer writes param 0x{param_type:x} Location without the "
-                f"§1.4.3 Length field; accepting the inline form "
-                f"(further occurrences at debug)")
+                f"peer writes param 0x{param_type:x} Location with a "
+                f"Length prefix; §10.2 defines two bare varints — "
+                f"accepting (further occurrences at debug)")
         else:
-            logger.debug(f"inline Location param 0x{param_type:x}")
+            logger.debug(f"Length-prefixed Location param 0x{param_type:x}")
+
+    @staticmethod
+    def _pull_location_param(buf: Buffer, *, prof: DraftProfile,
+                             buf_end: Optional[int], remaining: int,
+                             prev_key: int, delta_keys: bool) -> tuple:
+        """Pull a Location parameter value (d18 LARGEST_OBJECT 0x09).
+
+        Conformant form (§10.2): two bare varints. Deviant peer form:
+        Length-prefixed. The forms can collide byte-wise, so when both
+        read cleanly the winner is the one whose suffix — the remaining
+        parameters, then the trailing Properties block to buf_end —
+        still parses. Ties prefer the conformant inline form.
+        """
+        probe = buf.tell()
+        inline = prefixed = None
+        try:
+            loc_group = buf.pull_vint()
+            loc_object = buf.pull_vint()
+            if buf_end is None or buf.tell() <= buf_end:
+                inline = ((loc_group, loc_object), buf.tell())
+        except Exception:
+            pass
+        buf.seek(probe)
+        try:
+            param_len = buf.pull_vint()
+            loc_end = buf.tell() + param_len
+            if param_len and (buf_end is None or loc_end <= buf_end):
+                loc_group = buf.pull_vint()
+                loc_object = buf.pull_vint()
+                if buf.tell() == loc_end:
+                    prefixed = ((loc_group, loc_object), loc_end)
+        except Exception:
+            pass
+
+        if inline and prefixed and buf_end is not None \
+                and inline[1] != prefixed[1]:
+            args = dict(prof=prof, buf_end=buf_end, remaining=remaining,
+                        prev_key=prev_key, delta_keys=delta_keys)
+            if not MOQTMessage._suffix_parses(buf, inline[1], **args) \
+                    and MOQTMessage._suffix_parses(buf, prefixed[1], **args):
+                inline = None
+        pick = inline or prefixed
+        if pick is None:
+            raise MOQTProtocolViolation("Location parameter unreadable")
+        if pick is prefixed and inline is None:
+            MOQTMessage._note_prefixed_location(0x09)
+        value, pos = pick
+        buf.seek(pos)
+        return value
+
+    @staticmethod
+    def _suffix_parses(buf: Buffer, start: int, *, prof: DraftProfile,
+                       buf_end: int, remaining: int, prev_key: int,
+                       delta_keys: bool) -> bool:
+        """True when the bytes from `start` form a valid message suffix:
+        `remaining` more parameters, then a Key-Value-Pair run ending
+        exactly at buf_end (the d18 messages that carry a Location
+        parameter all end with a Properties block). Position-preserving."""
+        save = buf.tell()
+        try:
+            buf.seek(start)
+            pk = prev_key
+            for _ in range(remaining):
+                raw = buf.pull_vint()
+                ptype = pk + raw if delta_keys else raw
+                if delta_keys:
+                    pk = ptype
+                if ptype in prof.location_params:
+                    buf.pull_vint()
+                    buf.pull_vint()
+                elif ptype % 2 == 1:
+                    plen = buf.pull_vint()
+                    if buf.tell() + plen > buf_end:
+                        return False
+                    buf.seek(buf.tell() + plen)
+                elif ptype in prof.uint8_params:
+                    buf.pull_uint8()
+                else:
+                    buf.pull_vint()
+                if buf.tell() > buf_end:
+                    return False
+            kk = 0
+            while buf.tell() < buf_end:
+                kk = kk + buf.pull_vint()
+                if kk % 2 == 1:
+                    vlen = buf.pull_vint()
+                    if buf.tell() + vlen > buf_end:
+                        return False
+                    buf.seek(buf.tell() + vlen)
+                else:
+                    buf.pull_vint()
+                if buf.tell() > buf_end:
+                    return False
+            return buf.tell() == buf_end
+        except Exception:
+            return False
+        finally:
+            buf.seek(save)
 
     @staticmethod
     def _deserialize_params(buf: Buffer, *, prof: DraftProfile,
@@ -527,7 +622,7 @@ class MOQTMessage:
         param_count = buf.pull_vint()
         prev_key = 0
 
-        for _ in range(param_count):
+        for param_index in range(param_count):
             if buf_end is not None and buf.tell() >= buf_end:
                 raise MOQTProtocolViolation(
                     f"parameters declared {param_count} but buffer "
@@ -540,31 +635,10 @@ class MOQTMessage:
                 param_type = raw_key
 
             if param_type in prof.location_params:
-                # Location value (d18 LARGEST_OBJECT 0x09). The type is
-                # odd, so §1.4.3 puts a Length before the group + object
-                # varint pair. Deployed peers disagree: some write the
-                # pair inline with no Length. Try the spec form and fall
-                # back, since the two are distinguishable — under the
-                # spec form the pair consumes exactly the declared bytes.
-                probe = buf.tell()
-                param_value = None
-                param_len = buf.pull_vint()
-                loc_end = buf.tell() + param_len
-                if param_len and (buf_end is None or loc_end <= buf_end):
-                    try:
-                        loc_group = buf.pull_vint()
-                        loc_object = buf.pull_vint()
-                        if buf.tell() == loc_end:
-                            param_value = (loc_group, loc_object)
-                    except Exception:
-                        pass
-                if param_value is None:
-                    # Inline: what we read as a Length was the group.
-                    buf.seek(probe)
-                    loc_group = buf.pull_vint()
-                    loc_object = buf.pull_vint()
-                    param_value = (loc_group, loc_object)
-                    MOQTMessage._note_inline_location(param_type)
+                param_value = MOQTMessage._pull_location_param(
+                    buf, prof=prof, buf_end=buf_end,
+                    remaining=param_count - param_index - 1,
+                    prev_key=prev_key, delta_keys=delta_keys)
             elif param_type % 2 == 1:  # Odd type - includes Length field
                 param_len = buf.pull_vint()
                 if param_len > 65535:  # 2^16-1 maximum

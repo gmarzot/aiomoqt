@@ -138,22 +138,23 @@ def test_d18_removed_types_remain_legal_on_older_drafts():
 
 @pytest.mark.parametrize("draft", [16, 18])
 def test_serialized_params_obey_the_odd_even_length_rule(draft):
-    """§1.4.3: Length is present only when Type is odd; an even Type
-    carries a bare varint. LARGEST_OBJECT (0x09, odd) shipped without
-    its Length field and no round-trip test could see it.
+    """d16 §1.4.3: Length present only when Type is odd; even Type
+    carries a bare varint. d18 §10.2: the Value encoding comes from each
+    parameter's definition — LARGEST_OBJECT (0x09) is a Location, two
+    bare varints, NO Length despite the odd type number.
     """
     prof = profile_for(draft)
     params = {
         0x02: 5000,          # even -> bare varint
         0x08: 1000,          # even -> bare varint
-        0x09: ((7, 9) if draft == 18 else b"\x07\x09"),  # odd -> length
+        0x09: ((7, 9) if draft == 18 else b"\x07\x09"),
     }
     from aiopquic.buffer import Buffer
     payload = Buffer(capacity=4096, vi64=prof.vi64)
     MOQTMessage._serialize_params(payload, params, prof=prof)
     raw = bytes(payload.data_slice(0, payload.tell()))
 
-    # Independent reader: knows only the §1.4.3 rule, not our classes.
+    # Independent reader: knows only the spec rules, not our classes.
     r = Buffer(data=raw, vi64=prof.vi64)
     count = r.pull_vint()
     prev = 0
@@ -163,7 +164,9 @@ def test_serialized_params_obey_the_odd_even_length_rule(draft):
         if prof.params_delta_coded:
             key += prev
             prev = key
-        if key % 2 == 0:
+        if draft >= 18 and key == 0x09:
+            seen[key] = (r.pull_vint(), r.pull_vint())  # §10.2 Location
+        elif key % 2 == 0:
             seen[key] = r.pull_vint()
         else:
             n = r.pull_vint()
@@ -172,11 +175,11 @@ def test_serialized_params_obey_the_odd_even_length_rule(draft):
     assert set(seen) == set(params)
 
 
-def test_largest_object_matches_a_real_peer_frame():
-    """Golden: Cloudflare draft-18-interop SUBSCRIBE_OK, 2026-09-02.
-    LARGEST_OBJECT with its §1.4.3 Length field. 0.11.0rc1 mis-read the
-    Length as the group, orphaned a byte, and closed the session
-    blaming the peer.
+def test_largest_object_accepts_cloudflare_prefixed_form():
+    """Leniency golden: Cloudflare draft-18-interop SUBSCRIBE_OK,
+    2026-09-02. Their LARGEST_OBJECT carries a Length prefix — a §10.2
+    deviation (Location = two bare varints) we accept on receive.
+    Our re-encode is the conformant inline form, not their bytes.
     """
     from aiopquic.buffer import Buffer
     from aiomoqt.messages.subscribe import SubscribeOk
@@ -188,5 +191,27 @@ def test_largest_object_matches_a_real_peer_frame():
     end = buf.tell() + msg_len
     msg = SubscribeOk.deserialize(buf, prof=prof, buf_end=end)
     assert (msg.largest_group_id, msg.largest_object_id) == (14, 48)
+    assert buf.tell() == end, "left bytes unconsumed"
+    assert bytes(msg.serialize(prof=prof).data) == \
+        bytes.fromhex("0400050001090e30")
+
+
+def test_largest_object_matches_a_moxygen_frame():
+    """Golden: moxygen d18 SUBSCRIBE_OK, live capture 2026-09-02.
+    Conformant inline Location (§10.2.11) followed by Track Properties.
+    0.11.0rc2 read the group as a Length, ate the first Properties
+    byte, and closed the session blaming the peer.
+    """
+    from aiopquic.buffer import Buffer
+    from aiomoqt.messages.subscribe import SubscribeOk
+    wire = bytes.fromhex("04000701010902052201")
+    prof = profile_for(18)
+    buf = Buffer(data=wire, vi64=prof.vi64)
+    buf.pull_vint()                      # message Type
+    msg_len = buf.pull_uint16()          # message Length
+    end = buf.tell() + msg_len
+    msg = SubscribeOk.deserialize(buf, prof=prof, buf_end=end)
+    assert msg.track_alias == 1
+    assert (msg.largest_group_id, msg.largest_object_id) == (2, 5)
     assert buf.tell() == end, "left bytes unconsumed"
     assert bytes(msg.serialize(prof=prof).data) == wire
