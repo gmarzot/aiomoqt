@@ -311,10 +311,15 @@ async def main():
             "raw QUIC" if args.quic else "H3/WebTransport")
     print(f"moqtest-origin: {mode} on {args.bind}:{args.port}",
           file=sys.stderr)
-    if args.dual:
-        await server.serve_dual()
-    else:
-        await server.serve()
+    # serve()/serve_dual() bind and return a handle; hold the process
+    # open until cancelled so the listener stays up.
+    handle = await (server.serve_dual() if args.dual else server.serve())
+    try:
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        pass
+    finally:
+        handle.close()
 
 
 def cli():
