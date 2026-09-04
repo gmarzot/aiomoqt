@@ -175,6 +175,32 @@ def test_serialized_params_obey_the_odd_even_length_rule(draft):
     assert set(seen) == set(params)
 
 
+@pytest.mark.parametrize("draft", [14, 16, 18])
+def test_unknown_subscription_filter_type_is_fatal(draft):
+    """§5.1.2: subscription filter types are 0x1-0x4; any other value
+    MUST close the session with PROTOCOL_VIOLATION. moxygen#225: a peer
+    (moq-net) that sent LargestGroup=250 was correctly rejected — we
+    must reject it too, not silently accept it.
+    """
+    from aiopquic.buffer import Buffer
+    from aiomoqt.messages.subscribe import Subscribe
+    from aiomoqt.types import MOQTProtocolViolation
+    prof = profile_for(draft)
+    # A well-formed SUBSCRIBE with filter_type 250 in place of a legal
+    # one round-trips our encoder (which accepts the int), and MUST be
+    # rejected on decode.
+    good = Subscribe(request_id=(0 if draft >= 18 else 0),
+                     track_namespace=(b"ns",), track_name=b"t",
+                     filter_type=250,
+                     priority=128, group_order=1, forward=1)
+    raw = bytes(good.serialize(prof=prof).data)
+    buf = Buffer(data=raw, vi64=prof.vi64)
+    buf.pull_vint()
+    mlen = buf.pull_uint16()
+    with pytest.raises(MOQTProtocolViolation):
+        Subscribe.deserialize(buf, prof=prof, buf_end=buf.tell() + mlen)
+
+
 def test_d18_unknown_message_parameter_is_fatal():
     """§10.2: unknown Message Parameters cannot be skipped (the block
     is count-bounded) — the session closes. §14 reserves no grease in

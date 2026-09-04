@@ -266,6 +266,12 @@ class PublishOk(MOQTMessage):
             if filter_raw is not None:
                 fbuf = Buffer(data=filter_raw, vi64=prof.vi64)
                 filter_type = fbuf.pull_vint()
+                if filter_type not in (1, 2, 3, 4):
+                    # §5.1.2: filter types are 0x1-0x4; other values MUST
+                    # close the session with PROTOCOL_VIOLATION.
+                    raise MOQTProtocolViolation(
+                        f"unknown subscription filter type "
+                        f"0x{filter_type:x}")
                 if filter_type in (3, 4):
                     start_group = fbuf.pull_vint()
                     start_object = fbuf.pull_vint()

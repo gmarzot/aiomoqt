@@ -119,6 +119,12 @@ class TrackStatus(MOQTMessage):
             if filter_raw is not None:
                 fbuf = Buffer(data=filter_raw, vi64=prof.vi64)
                 filter_type = fbuf.pull_vint()
+                if filter_type not in (1, 2, 3, 4):
+                    # §5.1.2: filter types are 0x1-0x4; any other value
+                    # MUST close the session with PROTOCOL_VIOLATION.
+                    raise MOQTProtocolViolation(
+                        f"unknown subscription filter type "
+                        f"0x{filter_type:x}")
                 if filter_type in (3, 4):
                     start_group = fbuf.pull_vint()
                     start_object = fbuf.pull_vint()
@@ -132,6 +138,9 @@ class TrackStatus(MOQTMessage):
             group_order = buf.pull_uint8()
             forward = buf.pull_uint8()
             filter_type = buf.pull_vint()
+            if filter_type not in (1, 2, 3, 4):
+                raise MOQTProtocolViolation(
+                    f"unknown subscription filter type 0x{filter_type:x}")
             if filter_type in (3, 4):
                 start_group = buf.pull_vint()
                 start_object = buf.pull_vint()
@@ -386,6 +395,12 @@ class Subscribe(MOQTMessage):
             if filter_raw is not None:
                 fbuf = Buffer(data=filter_raw, vi64=prof.vi64)
                 filter_type = fbuf.pull_vint()
+                if filter_type not in (1, 2, 3, 4):
+                    # §5.1.2: filter types are 0x1-0x4; any other value
+                    # MUST close the session with PROTOCOL_VIOLATION.
+                    raise MOQTProtocolViolation(
+                        f"unknown subscription filter type "
+                        f"0x{filter_type:x}")
                 if filter_type in (3, 4):
                     start_group = fbuf.pull_vint()
                     start_object = fbuf.pull_vint()
@@ -400,7 +415,9 @@ class Subscribe(MOQTMessage):
             group_order = buf.pull_uint8()
             forward = buf.pull_uint8()
             filter_type = buf.pull_vint()
-
+            if filter_type not in (1, 2, 3, 4):
+                raise MOQTProtocolViolation(
+                    f"unknown subscription filter type 0x{filter_type:x}")
             if filter_type in (3, 4):
                 start_group = buf.pull_vint()
                 start_object = buf.pull_vint()
