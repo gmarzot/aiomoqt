@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
-"""EXPERIMENTAL — minimal MoQT interop relay (not a production relay).
+"""ERSATZ-RELAY — a stand-in MoQT relay, not a production relay.
 
-Forwards objects from an upstream publisher to downstream subscribers.
-Still missing, deliberately:
+It genuinely relays (moxygen's moqtest conformance suite gates our CI
+against it), but it exists for exactly two purposes:
+
+  1. exercise aiomoqt's server-role API surface end to end, and
+  2. stand as the SUT for conformance and interop harnesses.
+
+Deliberately absent, and staying absent:
 
   * NO authentication, authorization, or rate limiting
-  * NO load handling, backpressure, or production hardening
+  * NO load handling, bounded queues, or production hardening
   * NO group cache, so a late subscriber sees only what arrives next,
     and joining FETCH is not served
   * NO forward-state propagation (REQUEST_UPDATE Forward=0/1 upstream)
-  * NO PUBLISH forwarding to SUBSCRIBE_TRACKS subscribers
+  * NO delivery-timeout enforcement
   * Namespace tables are in-memory and global to the process
 
 Use moxygen, moq-rs, or another real relay for any actual workload.
-This relay exists so aiomoqt's server-side primitives have a working
-demonstrator and so we can run a conformance suite against ourselves.
 
 Routing model (cross-session, single relay instance):
   - PUBLISH_NAMESPACE: record the announcing session under the
@@ -784,6 +787,10 @@ async def main():
         level=log_level, stream=sys.stderr,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    print("aiomoqt ERSATZ-RELAY: an API demonstrator and conformance "
+          "SUT — not a production relay (no auth, no cache, no "
+          "hardening). Use moxygen/moq-rs for real workloads.",
+          file=sys.stderr)
 
     cert = args.cert or _find_default_cert()
     key = args.key or _find_default_key(cert)
