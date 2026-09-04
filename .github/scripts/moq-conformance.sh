@@ -61,12 +61,14 @@ run_case "tiny objects" --request=subscribe --forwarding_preference=0 \
 run_case "large object zero" --request=subscribe --forwarding_preference=0 \
   --last_group=1 --objects_per_group=3 --size_of_object_zero=10240
 
-echo
-echo "Section 8 — publish mode (SUBSCRIBE_TRACKS discovery)"
-for fp in 0 1 2 3; do
-  run_case "publish fp=$fp" --request=publish \
-    --forwarding_preference="$fp" --last_group=2 --objects_per_group=5
-done
+if [ "${SKIP_PUBLISH:-0}" != "1" ]; then
+  echo
+  echo "Section 8 — publish mode (SUBSCRIBE_TRACKS discovery)"
+  for fp in 0 1 2 3; do
+    run_case "publish fp=$fp" --request=publish \
+      --forwarding_preference="$fp" --last_group=2 --objects_per_group=5
+  done
+fi
 
 echo
 echo "Section 6 — extensions"

@@ -139,6 +139,21 @@ jobs:
                  tail -20 relay.log; exit 1; }
           bash .github/scripts/moq-conformance.sh 2>&1 | tee conformance.log
 
+          # Second SUT: the moqtest ORIGIN — the bare server-role API
+          # serving deterministic moq-test tracks, no relay involved.
+          # Publish mode needs a relay, so that section is skipped.
+          kill $RELAY_PID $UP_PID 2>/dev/null || true
+          sleep 2
+          python -m aiomoqt.tools.moqtest_origin \
+            --bind 127.0.0.1 --port 4443 --quic --draft "$DRAFT" \
+            --cert certs/cert.pem --key certs/key.pem \
+            > origin.log 2>&1 &
+          ORIGIN_PID=$!
+          trap 'kill $ORIGIN_PID 2>/dev/null || true' EXIT
+          sleep 3
+          SKIP_PUBLISH=1 bash .github/scripts/moq-conformance.sh 2>&1 \
+            | tee origin-conformance.log
+
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -148,4 +163,6 @@ jobs:
             relay.log
             upstream.log
             conformance.log
+            origin.log
+            origin-conformance.log
           if-no-files-found: warn
