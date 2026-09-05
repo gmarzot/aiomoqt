@@ -32,9 +32,10 @@ from dataclasses import dataclass
 
 from aiomoqt.server import MOQTServer
 from aiomoqt.messages import ObjectDatagram
+from aiomoqt.messages.data import FetchObject
 from aiomoqt.types import (
-    MOQTMessageType, ObjectStatus, RequestErrorCode, SubscribeDoneCode,
-    parse_draft_spec,
+    GroupOrder, MOQTMessageType, ObjectStatus, RequestErrorCode,
+    SubscribeDoneCode, parse_draft_spec,
 )
 from aiomoqt.tools.moq_interop_relay import (
     _find_default_cert, _find_default_key,
@@ -252,6 +253,89 @@ async def _serve_track(session, alias, request_id, p: TestParams):
         stream_count=streams, reason="track ended")
 
 
+def _fetch_subgroup(p: TestParams, oid: int) -> int:
+    if p.fp == 0:
+        return 0
+    if p.fp == 1:
+        return oid
+    if p.fp == 2:
+        return oid % 2
+    return 0                      # datagram track: subgroup field omitted
+
+
+def _fetch_window(p: TestParams, rs_g, rs_o, re_g, re_o):
+    """Intersect the requested [start..end] with the track's actual
+    range. Returns (first_g, first_o, last_g, last_o) or None if empty."""
+    fg = max(rs_g, p.start_group)
+    lg = min(re_g if re_g else p.last_group, p.last_group)
+    if fg > lg:
+        return None
+    return fg, rs_o, lg, re_o
+
+
+def _fetch_objects(p: TestParams, win):
+    """Yield FetchObjects for the window, ascending — 't'*size payloads,
+    end-of-group markers where asked (never on a datagram track:
+    FetchObject markers carry no datagram flag)."""
+    fg, fo, lg, lo = win
+    last_in_track = last_object_in_group(p)
+    markers = p.markers and p.fp != 3
+    for g in range(fg, lg + 1, p.g_inc):
+        first_o = fo if g == fg else p.start_object
+        last_o = lo if (g == lg and lo) else p.last_object
+        for oid in range(first_o, last_o + 1, p.o_inc):
+            sg = _fetch_subgroup(p, oid)
+            if markers and oid >= last_in_track:
+                yield FetchObject(group_id=g, subgroup_id=sg, object_id=oid,
+                                  publisher_priority=priority_for(g),
+                                  status=ObjectStatus.END_OF_GROUP,
+                                  payload=b"")
+            else:
+                yield FetchObject(
+                    group_id=g, subgroup_id=sg, object_id=oid,
+                    publisher_priority=priority_for(g),
+                    extensions=make_extensions(p), payload=_payload(p, oid))
+
+
+async def _on_fetch(session, msg):
+    if getattr(msg, 'group_order', None) == GroupOrder.DESCENDING:
+        session.fetch_error(
+            request_id=msg.request_id,
+            error_code=int(RequestErrorCode.NOT_SUPPORTED),
+            reason="descending group order not supported")
+        return
+    try:
+        p = parse_namespace(msg.namespace)
+    except ValueError as e:
+        session.fetch_error(request_id=msg.request_id,
+                            error_code=int(RequestErrorCode.DOES_NOT_EXIST),
+                            reason=str(e))
+        return
+    win = _fetch_window(p, msg.start_group or 0, msg.start_object or 0,
+                        msg.end_group or 0, msg.end_object or 0)
+    if win is None:
+        # §10.13: FETCH_OK's End Location must be known before it is sent.
+        session.fetch_ok(request_id=msg.request_id,
+                         largest_group_id=0, largest_object_id=0)
+        await session.serve_fetch(msg.request_id, ())
+        return
+    fg, fo, lg, lo = win
+    session.fetch_ok(request_id=msg.request_id, largest_group_id=lg,
+                     largest_object_id=last_object_in_group(p))
+    # FETCH_OK is terminal on the request stream (§3.3.2); the objects
+    # ride a separate uni stream. FIN the request stream so the peer
+    # stops waiting on it.
+    _fin = session._bidi_streams.get(msg.request_id)
+    if _fin is not None:
+        session.stream_fin(_fin)
+    logger.info(f"origin: FETCH fp={p.fp} window={fg}.{fo}..{lg}")
+    objs = list(_fetch_objects(p, win))
+    task = asyncio.create_task(session.serve_fetch(
+        msg.request_id, objs, group_order=GroupOrder.ASCENDING))
+    session.register_request_cancel_handler(
+        msg.request_id, lambda rid: task.cancel())
+
+
 async def _on_subscribe(session, msg):
     try:
         p = parse_namespace(msg.track_namespace)
@@ -277,6 +361,7 @@ def _build_server(bind, port, cert, key, use_quic, draft):
                         private_key=key, path="/", use_quic=use_quic,
                         supported_drafts=draft)
     server.register_handler(MOQTMessageType.SUBSCRIBE, _on_subscribe)
+    server.register_handler(MOQTMessageType.FETCH, _on_fetch)
     return server
 
 
