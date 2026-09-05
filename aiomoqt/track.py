@@ -143,7 +143,7 @@ class PublishedTrack(Track):
         self.auth_token = auth_token
         self._subscriber_event = asyncio.Event()
         self._generating = False
-        # (group_id, object_id) of the newest object sent; None until
+        # (group_id, object_id) max over all objects sent; None until
         # the first object exists. Drives ContentExists/Largest Location
         # in SUBSCRIBE_OK.
         self._largest = None
@@ -167,6 +167,12 @@ class PublishedTrack(Track):
         # VideoTrack inherits via super().__init__. Bounded to 16 bits to
         # avoid CPython bigint promotion in long-running processes.
         self._yield_tick = 0
+
+    def _note_largest(self, group_id: int, object_id: int) -> None:
+        """Track Largest Location as a max — group arrival/send order
+        is not guaranteed monotonic (§2.3.1)."""
+        if self._largest is None or (group_id, object_id) > self._largest:
+            self._largest = (group_id, object_id)
 
     async def publish(self, announce_namespace: bool = False,
                       publish_track: bool = True,
@@ -523,6 +529,7 @@ class PublishedTrack(Track):
                 )
                 buf = obj.serialize(prof=prof)
                 obj_bytes = buf.tell()
+                self._note_largest(group_id, cur_obj_id)
                 cur_obj_id += 1
 
                 if session._close_err is not None:
@@ -651,6 +658,7 @@ class PublishedTrack(Track):
                                                 extensions=extensions,
                                                 object_id=cur_obj_id)
                 obj_bytes = len(data)
+                self._note_largest(group_id, cur_obj_id)
                 cur_obj_id += self.num_subgroups
 
                 if session._close_err is not None:
@@ -1099,6 +1107,7 @@ class VideoTrack(PublishedTrack):
                     extensions=extensions,
                     object_id=cur_obj_id)
                 obj_bytes = len(buf.data)
+                self._note_largest(group_id, cur_obj_id)
                 cur_obj_id += self.num_subgroups
 
                 if session._close_err is not None:

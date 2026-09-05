@@ -79,7 +79,7 @@ class CatalogTrackPublisher(PublishedTrack):
                 session.stream_write(stream_id, header.serialize().data)
             buf = header.next_object(payload=payload)
             await session.stream_write_drain(stream_id, buf.data)
-            self._largest = (header.group_id, header._last_object_id)
+            self._note_largest(header.group_id, header._last_object_id)
             self._total_sent += 1
 
         # A joining subscriber needs a complete catalog first (§11.2).
