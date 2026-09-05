@@ -21,7 +21,7 @@ import time
 import pytest
 
 from aiomoqt.types import (
-    MOQTMessageType, FetchType, GroupOrder,
+    MOQTMessageType, FetchType, GroupOrder, ObjectStatus,
     MOQT_TIMESTAMP_EXT, MOQTRequestError,
 )
 from aiomoqt.messages import Fetch, Subscribe
@@ -588,5 +588,80 @@ async def test_fetch_cancel_mid_stream(use_quic):
         assert len(fetched) < total, \
             f"Got all {total} objects despite cancel"
 
+    finally:
+        server_handle.close()
+
+
+@pytest.mark.asyncio
+async def test_serve_fetch_descending_d18(use_quic):
+    """serve_fetch at d18, Descending: groups newest-first, objects
+    ascending within each group, EOG markers as zero-length status
+    objects across the wire."""
+    port = _BASE_PORT + 7 + (0 if use_quic else 100)
+    GROUPS, OBJS = 3, 4
+
+    async def _handle_fetch(session, msg):
+        order = (GroupOrder.DESCENDING
+                 if msg.group_order == GroupOrder.DESCENDING
+                 else GroupOrder.ASCENDING)
+        session.fetch_ok(request_id=msg.request_id,
+                         largest_group_id=GROUPS - 1,
+                         largest_object_id=OBJS,
+                         group_order=order)
+        objs = []
+        groups = range(GROUPS)
+        for g in (reversed(groups) if order == GroupOrder.DESCENDING
+                  else groups):
+            for o in range(OBJS):
+                objs.append(FetchObject(
+                    group_id=g, subgroup_id=0, object_id=o,
+                    publisher_priority=128,
+                    payload=f"g{g}o{o}".encode()))
+            objs.append(FetchObject(
+                group_id=g, subgroup_id=0, object_id=OBJS,
+                publisher_priority=128,
+                status=ObjectStatus.END_OF_GROUP, payload=b""))
+        await session.serve_fetch(msg.request_id, objs, group_order=order)
+
+    server = MOQTServer(
+        host="localhost", port=port,
+        certificate=CERT, private_key=KEY, path="/",
+        use_quic=use_quic, supported_drafts=18,
+    )
+    server.register_handler(MOQTMessageType.FETCH, _handle_fetch)
+    server_handle = await server.serve()
+
+    fetched = []
+
+    def on_fetch(msg, size, ts, request_id):
+        fetched.append((msg.group_id, msg.object_id, msg.status,
+                        bytes(msg.payload)))
+
+    try:
+        client = await _connect_client(port, use_quic, draft=18)
+        async with client.connect() as session:
+            await session.client_session_init()
+            session.on_fetch_object = on_fetch
+            resp = await session.fetch(
+                namespace="bench", track_name="track",
+                start_group=0, start_object=0,
+                end_group=GROUPS - 1, end_object=OBJS,
+                group_order=GroupOrder.DESCENDING,
+                wait_response=True,
+            )
+            ok = await session.await_fetch_done(resp.request_id, timeout=5)
+            assert ok, "Fetch stream did not complete cleanly"
+
+        assert [g for g, *_ in fetched] == \
+            [g for g in (2, 1, 0) for _ in range(OBJS + 1)]
+        for g in range(GROUPS):
+            seq = [(o, st) for gg, o, st, _ in fetched if gg == g]
+            assert seq == [(o, ObjectStatus.NORMAL) for o in range(OBJS)] \
+                + [(OBJS, ObjectStatus.END_OF_GROUP)]
+        for g, o, st, payload in fetched:
+            if st == ObjectStatus.NORMAL:
+                assert payload == f"g{g}o{o}".encode()
+            else:
+                assert payload == b""
     finally:
         server_handle.close()

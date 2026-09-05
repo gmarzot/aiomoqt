@@ -152,6 +152,7 @@ def test_cython_subgroup_object_kvp_delta(vi64):
 # -- d18 FETCH data plane (§11.4.4): vi64 + group/object deltas -------
 
 from aiomoqt.messages.data import FetchHeader, FetchObject  # noqa: E402
+from aiomoqt.types import ObjectStatus  # noqa: E402
 
 
 def test_d18_fetch_header_exact_bytes():
@@ -233,6 +234,56 @@ def test_d18_fetch_first_object_must_be_absolute():
     prof = profile_for(18)
     rb = Buffer(data=bytes([0x00, 0x01, 0x78]), vi64=True)
     with pytest.raises(ValueError, match="first object"):
+        FetchObject.deserialize(rb, prior=None, prof=prof)
+
+
+def test_d18_fetch_zero_length_encodes_status():
+    # Golden bytes per moxygen's writer (writeStreamObject): a zero
+    # Payload Length is followed by an explicit Status varint.
+    objs = [
+        FetchObject(group_id=1, subgroup_id=0, object_id=0,
+                    publisher_priority=200, payload=b"tt"),
+        FetchObject(group_id=1, subgroup_id=0, object_id=1,
+                    publisher_priority=200, payload=b""),
+        FetchObject(group_id=1, subgroup_id=0, object_id=2,
+                    publisher_priority=200,
+                    status=ObjectStatus.END_OF_GROUP, payload=b""),
+    ]
+    chain = _fetch_chain_roundtrip(objs)
+    # First: flags GD|OD|PRI = 0x1C, absolute ids, len 2 + payload.
+    assert chain[0][0] == bytes.fromhex("1c0100c8027474")
+    # Zero-length Normal: flags 0, len 0, explicit status 0.
+    assert chain[1][0] == bytes.fromhex("000000")
+    # End of Group: flags 0, len 0, status 3.
+    assert chain[2][0] == bytes.fromhex("000003")
+    assert [g.status for _, g in chain] == [
+        ObjectStatus.NORMAL, ObjectStatus.NORMAL, ObjectStatus.END_OF_GROUP]
+    assert [g.payload for _, g in chain] == [b"tt", b"", b""]
+
+
+def test_d18_fetch_non_normal_status_guards():
+    prof = profile_for(18)
+    with pytest.raises(ValueError, match="empty payload"):
+        FetchObject(group_id=1, object_id=0,
+                    status=ObjectStatus.END_OF_GROUP,
+                    payload=b"x").serialize(prof=prof)
+    with pytest.raises(ValueError, match="non-Normal"):
+        FetchObject(group_id=1, object_id=0,
+                    status=ObjectStatus.END_OF_GROUP,
+                    extensions={8: 1}, payload=b"").serialize(prof=prof)
+    # RX: properties on a non-Normal object close the parse.
+    raw = bytes.fromhex("3c0100c802080500 03".replace(" ", ""))
+    rb = Buffer(data=raw, vi64=True)
+    with pytest.raises(ValueError, match="non-Normal"):
+        FetchObject.deserialize(rb, prior=None, prof=prof)
+
+
+def test_d18_fetch_first_object_sg_prior_rejected():
+    prof = profile_for(18)
+    # flags GD|OD|PRI|SG=prior (0x1D): prior-Subgroup ref on first object.
+    raw = bytes.fromhex("1d0100c80000")
+    rb = Buffer(data=raw, vi64=True)
+    with pytest.raises(ValueError, match="prior Subgroup"):
         FetchObject.deserialize(rb, prior=None, prof=prof)
 
 

@@ -594,6 +594,15 @@ class FetchObject(MOQTMessage):
         else:
             flags |= FETCH_FLAG_SG_PRESENT
             subgroup_field = self.subgroup_id
+        if self.status != ObjectStatus.NORMAL:
+            if self.payload:
+                raise ValueError(
+                    "FetchObject: non-Normal status requires an empty "
+                    "payload (§11.2.1.1)")
+            if self.extensions:
+                raise ValueError(
+                    "FetchObject: properties on non-Normal status "
+                    "(§11.2.1.2)")
         has_props = bool(self.extensions)
         if has_props:
             flags |= FETCH_FLAG_EXTENSIONS_PRESENT
@@ -610,8 +619,13 @@ class FetchObject(MOQTMessage):
         if has_props:
             MOQTMessage._extensions_encode(buf, self.extensions,
                                            delta=True)
-        buf.push_vint(len(self.payload))
-        buf.push_bytes(self.payload)
+        # Zero-length objects explicitly encode Status (§11.2.1.1).
+        if len(self.payload) > 0:
+            buf.push_vint(len(self.payload))
+            buf.push_bytes(self.payload)
+        else:
+            buf.push_vint(0)
+            buf.push_vint(self.status)
         return buf
 
     def _serialize_d14(self) -> Buffer:
@@ -684,8 +698,9 @@ class FetchObject(MOQTMessage):
                          prior: Optional['FetchObject'],
                          group_order: int) -> 'FetchObject':
         """d18 §11.4.4 delta decode. The buffer's varint codec is vi64
-        (set by the stream-type read). FETCH objects carry no Status
-        (§11.2.1.1); End-of-Range markers stand in for missing ranges."""
+        (set by the stream-type read). A zero Payload Length is followed
+        by an explicit Status varint (§11.2.1.1, as moxygen implements);
+        End-of-Range markers stand in for missing ranges."""
         flags = buf.pull_vint()
         if flags in (FETCH_FLAGS_END_NON_EXISTENT, FETCH_FLAGS_END_UNKNOWN):
             group_id = buf.pull_vint()
@@ -722,9 +737,15 @@ class FetchObject(MOQTMessage):
         elif sg_mode == FETCH_FLAG_SG_ZERO:
             subgroup_id = 0
         elif sg_mode == FETCH_FLAG_SG_PRIOR:
-            subgroup_id = prior.subgroup_id if prior else 0
+            if prior is None:
+                raise ValueError(
+                    "FetchObject: first object references prior Subgroup")
+            subgroup_id = prior.subgroup_id
         elif sg_mode == FETCH_FLAG_SG_PRIOR_PLUS:
-            subgroup_id = (prior.subgroup_id + 1) if prior else 1
+            if prior is None:
+                raise ValueError(
+                    "FetchObject: first object references prior Subgroup")
+            subgroup_id = prior.subgroup_id + 1
         else:
             subgroup_id = buf.pull_vint()
 
@@ -750,14 +771,23 @@ class FetchObject(MOQTMessage):
             extensions = None
 
         payload_len = buf.pull_vint()
-        payload = buf.pull_bytes(payload_len) if payload_len else b''
+        if payload_len == 0:
+            status = ObjectStatus(buf.pull_vint())
+            payload = b''
+            if extensions and status != ObjectStatus.NORMAL:
+                raise ValueError(
+                    "FetchObject: properties on non-Normal status "
+                    "(§11.2.1.2)")
+        else:
+            status = ObjectStatus.NORMAL
+            payload = buf.pull_bytes(payload_len)
         return cls(
             group_id=group_id,
             subgroup_id=subgroup_id,
             object_id=object_id,
             publisher_priority=publisher_priority,
             extensions=extensions,
-            status=ObjectStatus.NORMAL,
+            status=status,
             payload=payload,
         )
 

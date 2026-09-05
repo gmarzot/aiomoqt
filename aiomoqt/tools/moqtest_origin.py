@@ -273,14 +273,17 @@ def _fetch_window(p: TestParams, rs_g, rs_o, re_g, re_o):
     return fg, rs_o, lg, re_o
 
 
-def _fetch_objects(p: TestParams, win):
-    """Yield FetchObjects for the window, ascending — 't'*size payloads,
+def _fetch_objects(p: TestParams, win, descending: bool = False):
+    """Yield FetchObjects for the window — 't'*size payloads,
     end-of-group markers where asked (never on a datagram track:
-    FetchObject markers carry no datagram flag)."""
+    FetchObject markers carry no datagram flag). Group order follows
+    `descending` (§10.2.8); objects within a group are always
+    ascending."""
     fg, fo, lg, lo = win
     last_in_track = last_object_in_group(p)
     markers = p.markers and p.fp != 3
-    for g in range(fg, lg + 1, p.g_inc):
+    groups = range(fg, lg + 1, p.g_inc)
+    for g in (reversed(groups) if descending else groups):
         first_o = fo if g == fg else p.start_object
         last_o = lo if (g == lg and lo) else p.last_object
         for oid in range(first_o, last_o + 1, p.o_inc):
@@ -298,12 +301,10 @@ def _fetch_objects(p: TestParams, win):
 
 
 async def _on_fetch(session, msg):
-    if getattr(msg, 'group_order', None) == GroupOrder.DESCENDING:
-        session.fetch_error(
-            request_id=msg.request_id,
-            error_code=int(RequestErrorCode.NOT_SUPPORTED),
-            reason="descending group order not supported")
-        return
+    # Requested order governs the response (omitted = Ascending, §10.2.8).
+    order = (GroupOrder.DESCENDING
+             if getattr(msg, 'group_order', None) == GroupOrder.DESCENDING
+             else GroupOrder.ASCENDING)
     try:
         p = parse_namespace(msg.namespace)
     except ValueError as e:
@@ -321,17 +322,20 @@ async def _on_fetch(session, msg):
         return
     fg, fo, lg, lo = win
     session.fetch_ok(request_id=msg.request_id, largest_group_id=lg,
-                     largest_object_id=last_object_in_group(p))
+                     largest_object_id=last_object_in_group(p),
+                     group_order=order)
     # FETCH_OK is terminal on the request stream (§3.3.2); the objects
     # ride a separate uni stream. FIN the request stream so the peer
     # stops waiting on it.
     _fin = session._bidi_streams.get(msg.request_id)
     if _fin is not None:
         session.stream_fin(_fin)
-    logger.info(f"origin: FETCH fp={p.fp} window={fg}.{fo}..{lg}")
-    objs = list(_fetch_objects(p, win))
+    logger.info(f"origin: FETCH fp={p.fp} window={fg}.{fo}..{lg} "
+                f"order={int(order)}")
+    objs = list(_fetch_objects(
+        p, win, descending=(order == GroupOrder.DESCENDING)))
     task = asyncio.create_task(session.serve_fetch(
-        msg.request_id, objs, group_order=GroupOrder.ASCENDING))
+        msg.request_id, objs, group_order=order))
     session.register_request_cancel_handler(
         msg.request_id, lambda rid: task.cancel())
 

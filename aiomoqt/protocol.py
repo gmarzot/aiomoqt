@@ -2724,6 +2724,15 @@ class _MOQTSessionMixin:
             await self.stream_write_drain(stream_id, buf.data)
             if obj.end_of_range is None:
                 prior = obj
+            else:
+                # §11.4.4.2: the marker is the prior for Group/Object
+                # deltas; Subgroup/Priority carry over only from a real
+                # object (poisoned otherwise so later refs stay explicit).
+                prior = FetchObject(
+                    group_id=obj.group_id, object_id=obj.object_id,
+                    subgroup_id=(prior.subgroup_id if prior else -1),
+                    publisher_priority=(prior.publisher_priority
+                                        if prior else -1))
         self.stream_fin(stream_id)
         return stream_id
 
