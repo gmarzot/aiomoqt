@@ -72,6 +72,7 @@ from aiomoqt.utils.workers import (
     _bridge_stop_event,
     _post,
     _setup_quiet_logging,
+    apply_compat,
     pub_worker_entry,
     MP_CTX,
     SUBSCRIBE_RETRY_WINDOW_S,
@@ -183,6 +184,7 @@ async def _slot_task(cfg, relay, slot, events_q, group, shard,
             verify_tls=not cfg.get("insecure", False),
             supported_drafts=cfg.get("draft"),
             keep_alive_interval=cfg.get("keep_alive_interval"),
+            libquicr_compat=apply_compat(cfg.get("compat")),
         )
         async with client.connect() as session:
             await session.client_session_init()
@@ -599,8 +601,8 @@ def parse_args(argv=None):
     p.add_argument("-f", "--scenario-file", dest="scenario",
                    default="default", metavar="NAME|PATH",
                    help="Scenario: a packaged name (default, rich-matrix, "
-                        "churn-storm, datagram-mix) or a path to JSON "
-                        "(default: default)")
+                        "churn-storm, datagram-mix, viewers) or a path to "
+                        "JSON (default: default)")
     p.add_argument("--example", action="store_true",
                    help="Print a demo scenario JSON and exit")
 
@@ -610,8 +612,11 @@ def parse_args(argv=None):
         "quick mode",
         "Synthesize a one-track scenario instead of loading a file — "
         "the simple 'N subscribers on one track' case.")
-    quick.add_argument("-N", "--namespace", type=str, default="aiomoqt",
-                       help="quick mode: namespace (default: aiomoqt)")
+    quick.add_argument("-N", "--namespace", type=str, default=None,
+                       help="quick mode: namespace (default: aiomoqt). "
+                            "With -f, rewrites every namespace in the "
+                            "scenario — points a packaged audience (e.g. "
+                            "'viewers') at a live broadcast.")
     quick.add_argument("-T", "--trackname", type=str, default="track",
                        help="quick mode: track name (default: track)")
     quick.add_argument("-t", "--duration", type=int, default=30,
@@ -626,6 +631,10 @@ def parse_args(argv=None):
                        help="quick mode: objects per group (default: rate)")
     quick.add_argument("--pub-both", action="store_true",
                        help="quick mode: PUB_NS + PUBLISH")
+    p.add_argument("--compat", default=None,
+                   help="comma-separated peer compat tolerances "
+                        "(lenient-extensions, libquicr, all) — same keys "
+                        "as moq_interop_client")
     p.add_argument("-k", "--insecure", action="store_true",
                    help="Skip TLS verification")
     p.add_argument("--draft", type=int, default=None,
@@ -665,16 +674,17 @@ def main():
 
     if args.subs is not None:
         fps = args.rate or 30
+        ns = args.namespace or "aiomoqt"
         scenario = {
             "publishers": [{
-                "namespace": args.namespace, "track": args.trackname,
+                "namespace": ns, "track": args.trackname,
                 "bitrate_kbps": int(args.object_size * fps * 8 / 1000),
                 "fps": fps, "object_size": args.object_size,
                 "gop_s": (args.group_size / fps) if args.group_size else 1.0,
                 "start_delay": 0, "duration": args.duration,
             }],
             "subscribers": [{
-                "namespace": args.namespace, "track": args.trackname,
+                "namespace": ns, "track": args.trackname,
                 "subs": args.subs, "join_rate": max(1, args.subs // 3),
                 "join_delay": 0, "churn_rate": 0.0,
                 "leave_early": 0, "leave_rate": 0,
@@ -683,6 +693,10 @@ def main():
         scenario_path = f"(quick: {args.subs} subs x 1 track)"
     else:
         scenario, scenario_path = _load_scenario(args.scenario)
+        if args.namespace:
+            for c in (scenario.get("publishers", [])
+                      + scenario.get("subscribers", [])):
+                c["namespace"] = args.namespace
     relay_url = args.url or scenario.get("relay")
     if not relay_url:
         p.error("no relay URL: pass one as the positional "
@@ -729,6 +743,7 @@ def main():
     common = dict(
         relay_url=relay_url, force_quic=False, insecure=args.insecure,
         draft=args.draft, debug=args.debug, logdir=args.logdir,
+        compat=args.compat,
     )
 
     pubs = {ps.key: PubRT(ps) for ps in pub_specs} \

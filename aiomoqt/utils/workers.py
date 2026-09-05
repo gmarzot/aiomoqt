@@ -29,11 +29,23 @@ from collections import deque
 from typing import Any, Dict
 
 from aiomoqt.client import MOQTClient
+from aiomoqt.messages.base import MOQTMessage
 from aiomoqt.track import SubscribedTrack, TrackState
 from aiomoqt.types import FilterType
 from aiomoqt.utils.url import parse_relay_url
 from aiomoqt.utils.logger import set_log_level
 from aiomoqt.utils.stats import TrackStats
+
+
+def apply_compat(compat) -> bool:
+    """Apply a comma-separated compat string in this worker PROCESS.
+    Sets the process-global lenient-extensions decode flag; returns
+    True when the client should be built with libquicr_compat. Mirrors
+    moq_interop_client's --compat keys."""
+    keys = {k.strip() for k in (compat or "").split(",") if k.strip()}
+    if "all" in keys or "lenient-extensions" in keys:
+        MOQTMessage._tolerate_trailing_extensions = True
+    return "all" in keys or "libquicr" in keys
 
 
 SUBSCRIBE_RETRY_WINDOW_S = 30.0
@@ -121,6 +133,7 @@ async def _subscriber_task(config: Dict[str, Any], mp_stop_event,
         supported_drafts=config.get('draft'),
         keylog_filename=config.get('keylogfile'),
         keep_alive_interval=config.get('keep_alive_interval'),
+        libquicr_compat=apply_compat(config.get('compat')),
     )
 
     stop_ev = _bridge_stop_event(mp_stop_event)
@@ -301,6 +314,7 @@ async def _slot_supervisor(config, relay, stop_ev, stats, state,
                 verify_tls=not insecure,
                 supported_drafts=config.get('draft'),
                 keep_alive_interval=config.get('keep_alive_interval'),
+                libquicr_compat=apply_compat(config.get('compat')),
             )
             async with client.connect() as session:
                 await session.client_session_init()
@@ -469,6 +483,7 @@ async def _publisher_task(config: Dict[str, Any], mp_stop_event,
         supported_drafts=config.get('draft'),
         keylog_filename=config.get('keylogfile'),
         keep_alive_interval=config.get('keep_alive_interval'),
+        libquicr_compat=apply_compat(config.get('compat')),
     )
 
     stop_ev = _bridge_stop_event(mp_stop_event)
