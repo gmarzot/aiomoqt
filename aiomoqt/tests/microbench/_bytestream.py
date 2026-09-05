@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from aiomoqt.messages import ObjectStatus
 from aiomoqt.context import profile_for
-from aiomoqt.messages.track import (
+from aiomoqt.messages.data import (
     SubgroupHeader, FetchHeader, FetchObject,
 )
 

@@ -5,8 +5,8 @@ Runs the publisher as a server that the subscriber connects to directly.
 Measures pure Python throughput on the aiopquic stack without relay overhead.
 
 Usage:
-  python -m aiomoqt.examples.loopback_bench -s 4096 -r 5000 -t 20
-  python -m aiomoqt.examples.loopback_bench -P 4 -s 16384 -r 60 -t 20
+  python -m aiomoqt.tools.loopback_bench -s 4096 -r 5000 -t 20
+  python -m aiomoqt.tools.loopback_bench -P 4 -s 16384 -r 60 -t 20
 """
 import argparse
 import asyncio
@@ -16,9 +16,10 @@ from aiomoqt.types import MOQTMessageType, parse_draft_spec
 from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
 from aiomoqt.track import PublishedTrack, SubscribedTrack
+from aiomoqt.types import ForwardingPreference
 from aiomoqt.utils import wait_cond_timeout
 from aiomoqt.utils.logger import set_log_level
-from aiomoqt.examples.sub_bench import BenchStats
+from aiomoqt.tools.sub_bench import BenchReporter
 
 
 def _find_default_cert():
@@ -49,7 +50,7 @@ def parse_args():
         '-s', '--object-size', type=int, default=4096,
         help='Object payload size bytes (default: 4096)')
     parser.add_argument(
-        '-g', '--group-size', type=int, default=10000,
+        '-g', '--group-size', type=int, default=4096,
         help='Objects per group (default: 10000)')
     parser.add_argument(
         '-P', '--streams', type=int, default=1,
@@ -66,6 +67,11 @@ def parse_args():
         '-i', '--interval', type=float, default=5.0,
         help='Report interval seconds (default: 5)')
     parser.add_argument(
+        '--no-stats', action='store_true',
+        help='Count objects and bytes only — no latency, jitter, loss '
+             'or group accounting. Measures the delivery ceiling '
+             'without the measurement in it.')
+    parser.add_argument(
         '-p', '--port', type=int, default=4434,
         help='Local port (default: 4434)')
     parser.add_argument(
@@ -75,10 +81,19 @@ def parse_args():
     parser.add_argument(
         '-d', '--debug', action='store_true')
     parser.add_argument(
-        '-q', '--quic', '--use-quic', action='store_true',
-        help='Use raw QUIC instead of WebTransport (default: WT)')
+        '-Q', '--quic', action='store_true',
+        help='Raw QUIC (default: H3/WebTransport)')
     parser.add_argument(
-        '-D', '--draft', type=parse_draft_spec, default=14,
+        '-W', '--wt', action='store_true',
+        help='H3/WebTransport (the default)')
+    parser.add_argument(
+        '-D', '--datagram', action='store_true',
+        help='ObjectDatagrams instead of subgroup streams (requires '
+             '-q; object must fit one packet, ~1150B max payload). '
+             'The stream/datagram A/B lever: run twice at the same -s '
+             'and -r, once with and once without.')
+    parser.add_argument(
+        '--draft', type=parse_draft_spec, default=14,
         help='MoQT draft version to negotiate (e.g. 14, 16, or 18, '
              'default: 14). Applied to BOTH the loopback publisher '
              '(server) and subscriber (client) so the raw-QUIC ALPN '
@@ -107,7 +122,15 @@ def parse_args():
     parser.add_argument(
         '-?', '--help', action='help',
         help='Show this help message and exit')
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.datagram and not args.quic:
+        parser.error("-D/--datagram requires -Q (raw QUIC); "
+                     "WT datagram TX is not wired yet")
+    if args.datagram and args.object_size > 1152:
+        parser.error(f"--datagram: object_size {args.object_size} can "
+                     f"never fit a DATAGRAM frame (max ~1152B payload "
+                     f"at 1200B frame ceiling; frames cannot fragment)")
+    return args
 
 
 def print_banner(args):
@@ -132,6 +155,7 @@ def print_banner(args):
     row("draft", args.draft)
     row("url", url)
     row("transport", transport_label)
+    row("delivery", "DATAGRAM" if args.datagram else "subgroup streams")
     row("cc algorithm", cc)
     row("sub-groups", args.streams)
     row("group size", f"{args.group_size} objects")
@@ -151,6 +175,8 @@ async def _on_subscribe(session, msg, args):
         group_size=args.group_size,
         num_subgroups=args.streams,
         rate=args.rate,
+        forwarding=(ForwardingPreference.DATAGRAM if args.datagram
+                    else ForwardingPreference.SUBGROUP),
     )
     # Suppress publisher periodic stats in loopback mode —
     # both sides print to the same terminal, causing interleaved output
@@ -215,6 +241,7 @@ async def run_subscriber(args, stats):
             await track.subscribe()
 
             print("  Subscriber connected, receiving...\n")
+            stats.start()
 
             if not await wait_cond_timeout(
                     track.wait_closed(), timeout=args.duration):
@@ -244,7 +271,8 @@ async def main():
     if _trace_enabled:
         _tm.start(25)
 
-    stats = BenchStats(report_interval=args.interval)
+    stats = BenchReporter(report_interval=args.interval,
+                          minimal=args.no_stats)
     print_banner(args)
 
     if not args.cert or not args.key:
@@ -308,6 +336,14 @@ async def main():
         except Exception as _e2:
             print(f"(post-shutdown counter dump failed: {_e2})",
                   file=_sys2.stderr)
+
+
+def cli():
+    """Console entry point (moq-loopback-bench)."""
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n  Interrupted.")
 
 
 if __name__ == "__main__":

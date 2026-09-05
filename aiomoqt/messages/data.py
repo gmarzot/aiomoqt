@@ -1,9 +1,7 @@
 import os
-from enum import IntEnum
 from dataclasses import dataclass, field
 from sortedcontainers import SortedDict
-from typing import Optional, Dict, List, Tuple, Union
-import time
+from typing import Optional, Dict, Tuple, Union
 
 # Set AIOMOQT_STRICT_SERIALIZE=1 to enable per-object payload-length
 # self-check in ObjectHeader.serialize (catches publisher-side
@@ -93,8 +91,13 @@ class SubgroupHeader(MOQTMessage):
     end_of_group: bool = False
     subgroup_id_mode: int = SUBGROUP_ID_EXPLICIT
     # d18 FIRST_OBJECT bit (0x40): the first object on this stream is the
-    # first object published in the subgroup. Parsed, not yet emitted.
+    # first object published in the subgroup.
     first_object: bool = False
+    # d16+ DEFAULT_PRIORITY bit (0x20): the Priority field is absent and
+    # the subgroup inherits the priority from the control message that
+    # established the subscription. Set on receive so a forwarder can
+    # tell "inherited" from an explicit 128.
+    default_priority: bool = False
     # Negotiated draft profile for this stream; selects the integer codec
     # (vi64 for d18, RFC9000 otherwise) for the header and its objects.
     # None keeps the pre-d18 RFC9000 path.
@@ -109,10 +112,14 @@ class SubgroupHeader(MOQTMessage):
     _obj_cache: Optional['ObjectHeader'] = field(default=None, init=False)
     # Derived once: True when this stream uses the vi64 codec (d18).
     _vi64: bool = field(default=False, init=False)
+    # Derived once: True when KVP types are delta-coded (d16+ §1.4.2).
+    _kvp_delta: bool = field(default=False, init=False)
 
     def __post_init__(self):
         self.type = SUBGROUP_HEADER_BASE
         self._vi64 = self.prof is not None and self.prof.vi64
+        self._kvp_delta = (self.prof is not None
+                           and self.prof.params_delta_coded)
 
     def _compute_type(self) -> int:
         """Compute wire type byte from flags."""
@@ -122,6 +129,13 @@ class SubgroupHeader(MOQTMessage):
         type_val |= (self.subgroup_id_mode & 0x03) << 1
         if self.end_of_group:
             type_val |= 0x08
+        # d16+ DEFAULT_PRIORITY (0x20): the Priority field is omitted and
+        # the subgroup inherits the subscription's. d18 FIRST_OBJECT
+        # (0x40): this stream opens with the subgroup's first object.
+        if self.default_priority:
+            type_val |= 0x20
+        if self.first_object:
+            type_val |= 0x40
         return type_val
 
     def serialize(self) -> Buffer:
@@ -132,7 +146,10 @@ class SubgroupHeader(MOQTMessage):
         push(self.group_id)
         if self.subgroup_id_mode == SUBGROUP_ID_EXPLICIT:
             push(self.subgroup_id or 0)
-        buf.push_uint8(self.publisher_priority)
+        # DEFAULT_PRIORITY (0x20): the Priority field is omitted; the
+        # peer parses a stray byte here as the first Object ID delta.
+        if not self.default_priority:
+            buf.push_uint8(self.publisher_priority)
         return buf
 
     def next_object(self, payload: bytes = b'',
@@ -163,6 +180,7 @@ class SubgroupHeader(MOQTMessage):
             extensions_present=self.extensions_present,
             prev_object_id=self._last_object_id,
             vi64=self._vi64,
+            kvp_delta=self._kvp_delta,
         )
         self._last_object_id = obj_id
         # Resolve subgroup_id for FIRST_OBJ mode
@@ -193,7 +211,7 @@ class SubgroupHeader(MOQTMessage):
                   else encode_object_subgroup)
         data = encode(
             delta, extensions, status_int, payload,
-            self.extensions_present)
+            self.extensions_present, self._kvp_delta)
         self._last_object_id = obj_id
         if (self.subgroup_id_mode == SUBGROUP_ID_FIRST_OBJ
                 and self.subgroup_id is None):
@@ -251,6 +269,10 @@ class SubgroupHeader(MOQTMessage):
             subgroup_id = None
 
         if default_priority:
+            # No Priority on the wire. Keep the library default as the
+            # value but record that it was inherited, so a relay can
+            # resolve it from the subscription rather than forward 128
+            # as though the publisher had chosen it.
             publisher_priority = MOQT_DEFAULT_PRIORITY
         else:
             publisher_priority = buf.pull_uint8()
@@ -263,6 +285,7 @@ class SubgroupHeader(MOQTMessage):
             extensions_present=extensions_present,
             end_of_group=end_of_group,
             first_object=first_object,
+            default_priority=default_priority,
             prof=prof,
             subgroup_id_mode=subgroup_id_mode,
         )
@@ -283,10 +306,21 @@ class ObjectHeader(MOQTMessage):
     extensions: Optional[Dict[int, Union[bytes, int]]] = None
     status: Optional[ObjectStatus] = ObjectStatus.NORMAL
     payload: bytes = b''
+    # Carried from the enclosing SubgroupHeader on receive, never on the
+    # wire here: a relay must forward the publisher's priority and the
+    # object alone does not record it. None when not delivered from a
+    # subgroup stream.
+    publisher_priority: Optional[int] = None
+    # (first_object, end_of_group, default_priority) snapshotted from the
+    # enclosing subgroup header on receive. A snapshot, not a reference:
+    # the header is reused across the stream's objects and a forwarder
+    # may process this one later.
+    stream_flags: Optional[tuple] = None
 
     def serialize(self, extensions_present: bool = True,
                   prev_object_id: Optional[int] = None,
-                  vi64: bool = False) -> Buffer:
+                  vi64: bool = False,
+                  kvp_delta: bool = False) -> Buffer:
         """Serialize for stream transmission.
 
         Args:
@@ -295,7 +329,9 @@ class ObjectHeader(MOQTMessage):
             vi64: use the d18 vi64 integer codec for the object fields.
         """
         payload_len = len(self.payload)
-        buf = Buffer(capacity=(BUF_SIZE + payload_len))
+        # vi64 on the buffer keeps the extension block's varints in the
+        # same flavor as the object fields (d18 frames are all-vi64).
+        buf = Buffer(capacity=(BUF_SIZE + payload_len), vi64=vi64)
         push = buf.push_uint_vi64 if vi64 else buf.push_uint_var
 
         # Delta encoding
@@ -308,7 +344,8 @@ class ObjectHeader(MOQTMessage):
         # Extensions conditional on subgroup header flag
         # Per spec: extensions MUST NOT be present on non-NORMAL status objects
         if extensions_present and self.status == ObjectStatus.NORMAL:
-            MOQTMessage._extensions_encode(buf, self.extensions)
+            MOQTMessage._extensions_encode(buf, self.extensions,
+                                           delta=kvp_delta)
         elif extensions_present:
             MOQTMessage._extensions_encode(buf, None)  # empty extensions
 
@@ -342,7 +379,8 @@ class ObjectHeader(MOQTMessage):
     def deserialize_into(self, buf, buf_len: int,
                          extensions_present: bool = True,
                          prev_object_id: Optional[int] = None,
-                         vi64: bool = False) -> None:
+                         vi64: bool = False,
+                         kvp_delta: bool = False) -> None:
         """In-place fill — avoids per-object dataclass allocation.
 
         Caller pre-allocates one ObjectHeader and mutates it for each
@@ -364,12 +402,13 @@ class ObjectHeader(MOQTMessage):
             if fused is None:
                 raise AttributeError
             delta, exts, status, payload = fused(
-                extensions_present, MOQTMessage.EXTENSIONS_LEN_LIMIT)
+                extensions_present, MOQTMessage.EXTENSIONS_LEN_LIMIT,
+                kvp_delta)
         except AttributeError:
             pull = buf.pull_uint_vi64 if vi64 else buf.pull_uint_var
             delta = pull()
             if extensions_present:
-                exts = MOQTMessage._extensions_decode(buf)
+                exts = MOQTMessage._extensions_decode(buf, delta=kvp_delta)
             else:
                 exts = None
             payload_len = pull()
@@ -421,21 +460,25 @@ class FetchHeader(MOQTMessage):
     # not on the wire. Declared as a slot field so per-instance
     # assignment works under slots=True.
     _prior_obj: Optional['FetchObject'] = field(default=None, init=False)
+    # d18 group-delta arithmetic is Group-Order-dependent (§11.4.4.1);
+    # resolved from the fetch's FETCH_OK at stream admission.
+    _group_order: int = field(default=0x1, init=False)
 
     def __post_init__(self):
         pass
 
-    def serialize(self) -> bytes:
-        buf = Buffer(capacity=BUF_SIZE)
-        buf.push_uint_var(DataStreamType.FETCH_HEADER)
-
-        buf.push_uint_var(self.request_id)
-
+    def serialize(self, prof: Optional[DraftProfile] = None) -> Buffer:
+        buf = Buffer(capacity=BUF_SIZE,
+                     vi64=prof is not None and prof.vi64)
+        buf.push_vint(DataStreamType.FETCH_HEADER)
+        buf.push_vint(self.request_id)
         return buf
 
     @classmethod
     def deserialize(cls, buf: Buffer) -> 'FetchHeader':
-        request_id = buf.pull_uint_var()
+        # The caller has already set the buffer's varint codec from the
+        # negotiated profile (the stream type was read with it).
+        request_id = buf.pull_vint()
         return cls(request_id=request_id)
 
 # Draft-16 FetchObject Serialization Flag bits (spec §10.4.4)
@@ -488,10 +531,102 @@ class FetchObject(MOQTMessage):
     # d16 only: end-of-range marker flag (0x8C or 0x10C)
     end_of_range: Optional[int] = None
 
-    def serialize(self, *, prof: DraftProfile) -> Buffer:
+    def serialize(self, *, prof: DraftProfile,
+                  prior: Optional['FetchObject'] = None,
+                  group_order: int = 0x1) -> Buffer:
+        if prof.vi64:
+            return self._serialize_d18(prior, group_order)
         if is_draft16_or_later(prof.draft):
             return self._serialize_d16()
         return self._serialize_d14()
+
+    def _serialize_d18(self, prior: Optional['FetchObject'],
+                       group_order: int) -> Buffer:
+        """d18 §11.4.4: vi64 codec; Group/Object carried as DELTAS.
+        First object carries absolute values; a group change resets the
+        Object ID to absolute; the group delta direction follows the
+        fetch's Group Order."""
+        buf = Buffer(capacity=BUF_SIZE + len(self.payload), vi64=True)
+        if self.end_of_range is not None:
+            buf.push_vint(self.end_of_range)
+            buf.push_vint(self.group_id)
+            buf.push_vint(self.object_id)
+            return buf
+
+        flags = 0
+        group_field = object_field = subgroup_field = None
+        if prior is None:
+            flags |= (FETCH_FLAG_GROUP_ID_PRESENT
+                      | FETCH_FLAG_OBJECT_ID_PRESENT
+                      | FETCH_FLAG_PRIORITY_PRESENT)
+            group_field = self.group_id
+            object_field = self.object_id
+        else:
+            if self.group_id != prior.group_id:
+                delta = (prior.group_id - self.group_id - 1
+                         if group_order == 0x2
+                         else self.group_id - prior.group_id - 1)
+                if delta < 0:
+                    raise ValueError(
+                        f"FetchObject: group {self.group_id} after "
+                        f"{prior.group_id} contradicts group_order="
+                        f"{group_order}")
+                flags |= (FETCH_FLAG_GROUP_ID_PRESENT
+                          | FETCH_FLAG_OBJECT_ID_PRESENT)
+                group_field = delta
+                object_field = self.object_id  # absolute on group change
+            elif self.object_id != prior.object_id + 1:
+                delta = self.object_id - prior.object_id
+                if delta < 0:
+                    raise ValueError(
+                        f"FetchObject: object {self.object_id} after "
+                        f"{prior.object_id} not in ascending order")
+                flags |= FETCH_FLAG_OBJECT_ID_PRESENT
+                object_field = delta
+            if self.publisher_priority != prior.publisher_priority:
+                flags |= FETCH_FLAG_PRIORITY_PRESENT
+        if self.subgroup_id == 0:
+            pass  # SG mode 0b00
+        elif prior is not None and self.subgroup_id == prior.subgroup_id:
+            flags |= FETCH_FLAG_SG_PRIOR
+        elif prior is not None and self.subgroup_id == prior.subgroup_id + 1:
+            flags |= FETCH_FLAG_SG_PRIOR_PLUS
+        else:
+            flags |= FETCH_FLAG_SG_PRESENT
+            subgroup_field = self.subgroup_id
+        if self.status != ObjectStatus.NORMAL:
+            if self.payload:
+                raise ValueError(
+                    "FetchObject: non-Normal status requires an empty "
+                    "payload (§11.2.1.1)")
+            if self.extensions:
+                raise ValueError(
+                    "FetchObject: properties on non-Normal status "
+                    "(§11.2.1.2)")
+        has_props = bool(self.extensions)
+        if has_props:
+            flags |= FETCH_FLAG_EXTENSIONS_PRESENT
+
+        buf.push_vint(flags)
+        if group_field is not None:
+            buf.push_vint(group_field)
+        if subgroup_field is not None:
+            buf.push_vint(subgroup_field)
+        if object_field is not None:
+            buf.push_vint(object_field)
+        if flags & FETCH_FLAG_PRIORITY_PRESENT:
+            buf.push_uint8(self.publisher_priority)
+        if has_props:
+            MOQTMessage._extensions_encode(buf, self.extensions,
+                                           delta=True)
+        # Zero-length objects explicitly encode Status (§11.2.1.1).
+        if len(self.payload) > 0:
+            buf.push_vint(len(self.payload))
+            buf.push_bytes(self.payload)
+        else:
+            buf.push_vint(0)
+            buf.push_vint(self.status)
+        return buf
 
     def _serialize_d14(self) -> Buffer:
         buf = Buffer(capacity=BUF_SIZE + len(self.payload))
@@ -535,7 +670,8 @@ class FetchObject(MOQTMessage):
         buf.push_uint8(self.publisher_priority)
         if flags & FETCH_FLAG_EXTENSIONS_PRESENT:
             # d16 fetch object extensions: with explicit length prefix
-            MOQTMessage._extensions_encode(buf, self.extensions)
+            MOQTMessage._extensions_encode(buf, self.extensions,
+                                           delta=True)
 
         # Payload length and payload
         if self.status == ObjectStatus.NORMAL and len(self.payload) > 0:
@@ -549,10 +685,111 @@ class FetchObject(MOQTMessage):
     @classmethod
     def deserialize(cls, buf: Buffer,
                     prior: Optional['FetchObject'] = None,
-                    *, prof: DraftProfile) -> 'FetchObject':
+                    *, prof: DraftProfile,
+                    group_order: int = 0x1) -> 'FetchObject':
+        if prof.vi64:
+            return cls._deserialize_d18(buf, prior, group_order)
         if is_draft16_or_later(prof.draft):
             return cls._deserialize_d16(buf, prior)
         return cls._deserialize_d14(buf)
+
+    @classmethod
+    def _deserialize_d18(cls, buf: Buffer,
+                         prior: Optional['FetchObject'],
+                         group_order: int) -> 'FetchObject':
+        """d18 §11.4.4 delta decode. The buffer's varint codec is vi64
+        (set by the stream-type read). A zero Payload Length is followed
+        by an explicit Status varint (§11.2.1.1, as moxygen implements);
+        End-of-Range markers stand in for missing ranges."""
+        flags = buf.pull_vint()
+        if flags in (FETCH_FLAGS_END_NON_EXISTENT, FETCH_FLAGS_END_UNKNOWN):
+            group_id = buf.pull_vint()
+            object_id = buf.pull_vint()
+            return cls(group_id=group_id, object_id=object_id,
+                       end_of_range=flags, payload=b'')
+        if flags >= 0x80:
+            raise ValueError(
+                f"FetchObject: invalid serialization flags 0x{flags:x}")
+        if prior is None and (
+                not flags & FETCH_FLAG_GROUP_ID_PRESENT
+                or not flags & FETCH_FLAG_OBJECT_ID_PRESENT):
+            raise ValueError(
+                "FetchObject: first object on stream must carry Group ID "
+                "Delta and Object ID Delta (absolute values)")
+
+        group_changed = bool(flags & FETCH_FLAG_GROUP_ID_PRESENT)
+        if group_changed:
+            gd = buf.pull_vint()
+            if prior is None:
+                group_id = gd
+            elif group_order == 0x2:
+                group_id = prior.group_id - gd - 1
+                if group_id < 0:
+                    raise ValueError("FetchObject: group id underflow")
+            else:
+                group_id = prior.group_id + gd + 1
+        else:
+            group_id = prior.group_id
+
+        sg_mode = flags & FETCH_FLAG_SUBGROUP_MASK
+        if flags & FETCH_FLAG_DATAGRAM:
+            subgroup_id = 0
+        elif sg_mode == FETCH_FLAG_SG_ZERO:
+            subgroup_id = 0
+        elif sg_mode == FETCH_FLAG_SG_PRIOR:
+            if prior is None:
+                raise ValueError(
+                    "FetchObject: first object references prior Subgroup")
+            subgroup_id = prior.subgroup_id
+        elif sg_mode == FETCH_FLAG_SG_PRIOR_PLUS:
+            if prior is None:
+                raise ValueError(
+                    "FetchObject: first object references prior Subgroup")
+            subgroup_id = prior.subgroup_id + 1
+        else:
+            subgroup_id = buf.pull_vint()
+
+        if flags & FETCH_FLAG_OBJECT_ID_PRESENT:
+            od = buf.pull_vint()
+            # Absolute when the group changed (or first); else prior+delta.
+            object_id = od if (prior is None or group_changed) \
+                else prior.object_id + od
+        else:
+            object_id = prior.object_id + 1
+
+        if flags & FETCH_FLAG_PRIORITY_PRESENT:
+            publisher_priority = buf.pull_uint8()
+        elif prior is not None:
+            publisher_priority = prior.publisher_priority
+        else:
+            raise ValueError(
+                "FetchObject: first object references prior Priority")
+
+        if flags & FETCH_FLAG_EXTENSIONS_PRESENT:
+            extensions = MOQTMessage._extensions_decode(buf, delta=True)
+        else:
+            extensions = None
+
+        payload_len = buf.pull_vint()
+        if payload_len == 0:
+            status = ObjectStatus(buf.pull_vint())
+            payload = b''
+            if extensions and status != ObjectStatus.NORMAL:
+                raise ValueError(
+                    "FetchObject: properties on non-Normal status "
+                    "(§11.2.1.2)")
+        else:
+            status = ObjectStatus.NORMAL
+            payload = buf.pull_bytes(payload_len)
+        return cls(
+            group_id=group_id,
+            subgroup_id=subgroup_id,
+            object_id=object_id,
+            publisher_priority=publisher_priority,
+            extensions=extensions,
+            status=status,
+            payload=payload,
+        )
 
     @classmethod
     def _deserialize_d14(cls, buf: Buffer) -> 'FetchObject':
@@ -639,7 +876,7 @@ class FetchObject(MOQTMessage):
 
         # Extensions
         if flags & FETCH_FLAG_EXTENSIONS_PRESENT:
-            extensions = MOQTMessage._extensions_decode(buf)
+            extensions = MOQTMessage._extensions_decode(buf, delta=True)
         else:
             extensions = None
 
@@ -721,7 +958,7 @@ class ObjectDatagram(MOQTMessage):
             push = lambda v: buf_obj.push_uint_var(v)  # noqa: E731
 
         payload_len = 0 if self.payload is None else len(self.payload)
-        buf_obj = Buffer(capacity=BUF_SIZE + payload_len)
+        buf_obj = Buffer(capacity=BUF_SIZE + payload_len, vi64=vi64)
         push(type_val)
         push(self.track_alias)
         push(self.group_id)
@@ -729,7 +966,9 @@ class ObjectDatagram(MOQTMessage):
             push(self.object_id)
         buf_obj.push_uint8(self.publisher_priority)
         if has_extensions:
-            MOQTMessage._extensions_encode(buf_obj, self.extensions)
+            MOQTMessage._extensions_encode(
+                buf_obj, self.extensions,
+                delta=prof is not None and prof.params_delta_coded)
         if vi64 and is_status:
             push(int(self.status))
         elif payload_len > 0:
@@ -746,8 +985,14 @@ class ObjectDatagram(MOQTMessage):
         extensions_present = bool(type_val & 0x01)
         end_of_group = bool(type_val & 0x02)
         no_object_id = bool(type_val & 0x04)
-        is_status = vi64 and bool(type_val & 0x20)
-        default_priority = vi64 and bool(type_val & 0x08)
+        # STATUS bit is part of the merged d16+ layout, not d18-only.
+        is_status = bool(type_val & 0x20) and (
+            vi64 or (prof is not None and prof.draft >= 16))
+        # DEFAULT_PRIORITY (0x08): priority byte omitted on the wire.
+        # d16 introduced it; d18 keeps it. d14 has no such bit (types
+        # cap at 0x07 in dispatch, so it can't reach here).
+        default_priority = bool(type_val & 0x08) and (
+            vi64 or (prof is not None and prof.draft >= 16))
 
         track_alias = pull()
         group_id = pull()
@@ -757,7 +1002,8 @@ class ObjectDatagram(MOQTMessage):
 
         extensions = None
         if extensions_present:
-            extensions = MOQTMessage._extensions_decode(buf)
+            extensions = MOQTMessage._extensions_decode(
+                buf, delta=prof is not None and prof.params_delta_coded)
 
         if is_status:
             status = ObjectStatus(pull())
@@ -799,7 +1045,7 @@ class ObjectDatagramStatus(MOQTMessage):
     def __post_init__(self):
         self.type = OBJECT_DATAGRAM_STATUS_BASE
 
-    def serialize(self) -> Buffer:
+    def serialize(self, prof: Optional[DraftProfile] = None) -> Buffer:
         has_extensions = self.extensions is not None and len(self.extensions) > 0
         type_val = OBJECT_DATAGRAM_STATUS_BASE
         if has_extensions:
@@ -812,13 +1058,17 @@ class ObjectDatagramStatus(MOQTMessage):
         buf.push_uint_var(self.object_id)
         buf.push_uint8(self.publisher_priority)
         if has_extensions:
-            MOQTMessage._extensions_encode(buf, self.extensions)
+            MOQTMessage._extensions_encode(
+                buf, self.extensions,
+                delta=prof is not None and prof.params_delta_coded)
         buf.push_uint_var(self.status)
 
         return buf
 
     @classmethod
-    def deserialize(cls, buf: Buffer, type_val: int = 0x20) -> 'ObjectDatagramStatus':
+    def deserialize(cls, buf: Buffer, type_val: int = 0x20,
+                    prof: Optional[DraftProfile] = None
+                    ) -> 'ObjectDatagramStatus':
         """Deserialize ObjectDatagramStatus, given the already-read type byte."""
         extensions_present = bool(type_val & 0x01)
 
@@ -829,7 +1079,8 @@ class ObjectDatagramStatus(MOQTMessage):
 
         extensions = None
         if extensions_present:
-            extensions = MOQTMessage._extensions_decode(buf)
+            extensions = MOQTMessage._extensions_decode(
+                buf, delta=prof is not None and prof.params_delta_coded)
 
         status = ObjectStatus(buf.pull_uint_var())
         return cls(

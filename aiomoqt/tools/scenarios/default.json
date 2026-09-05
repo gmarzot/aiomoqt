@@ -1,0 +1,63 @@
+{
+    "_comment": "load_sim default \u2014 2 namespaces, 3 tracks, ~30 peak subs, ~7 Mbps. Zero-config smoke: moq-load-sim moqt://host:4433",
+    "publishers": [
+        {
+            "namespace": "demo",
+            "track": "cam",
+            "bitrate_kbps": 250,
+            "fps": 15,
+            "start_delay": 0,
+            "duration": 120
+        },
+        {
+            "namespace": "demo",
+            "track": "audio",
+            "bitrate_kbps": 96,
+            "fps": 25,
+            "delivery": "datagram",
+            "start_delay": 0,
+            "duration": 120
+        },
+        {
+            "namespace": "demo-aux",
+            "track": "telemetry",
+            "bitrate_kbps": 32,
+            "fps": 8,
+            "delivery": "datagram",
+            "start_delay": 10,
+            "duration": 100
+        }
+    ],
+    "subscribers": [
+        {
+            "namespace": "demo",
+            "track": "cam",
+            "subs": 12,
+            "join_rate": 4,
+            "join_delay": 0,
+            "churn_rate": 0.03,
+            "leave_early": 20,
+            "leave_rate": 4
+        },
+        {
+            "namespace": "demo",
+            "track": "audio",
+            "subs": 12,
+            "join_rate": 4,
+            "join_delay": 0,
+            "churn_rate": 0.02,
+            "leave_early": 20,
+            "leave_rate": 4
+        },
+        {
+            "namespace": "demo-aux",
+            "track": "telemetry",
+            "subs": 6,
+            "join_rate": 3,
+            "join_delay": 5,
+            "churn_rate": 0.01,
+            "leave_early": 15,
+            "leave_rate": 3
+        }
+    ]
+}

@@ -24,7 +24,7 @@ from dataclasses import dataclass
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.messages.base import MOQTMessage
-from aiomoqt.track import PublishedTrack
+from aiomoqt.track import PublishedTrack, SubscribedTrack
 from aiomoqt.types import (
     ParamType, FetchType, MOQTRequestError, MOQTMessageType,
     SubscribeErrorCode, RequestErrorCode, parse_draft_spec,
@@ -407,10 +407,15 @@ async def test_publish_namespace_done(host, port, path, use_quic,
                     wait_response=True,
                 )
                 ns_tuple = session._make_namespace_tuple(INTEROP_NAMESPACE)
-                session.publish_namespace_done(
+                # d14/d16 send PUBLISH_NAMESPACE_DONE; d18 has no such
+                # message and withdraws by resetting the announce's
+                # request stream (§3.3.2).
+                withdrew = session.publish_namespace_done(
                     namespace=ns_tuple,
                     request_id=response.request_id,
                 )
+                how = ("PUBLISH_NAMESPACE_DONE sent" if withdrew is not None
+                       else "announce stream reset")
                 await asyncio.sleep(0.1)
                 session.close()
 
@@ -418,7 +423,7 @@ async def test_publish_namespace_done(host, port, path, use_quic,
             name="publish-namespace-done", passed=True,
             duration_ms=(time.monotonic() - t0) * 1000,
             connection_id=cid,
-            message="PUBLISH_NAMESPACE_OK received, PUBLISH_NAMESPACE_DONE sent",
+            message=f"PUBLISH_NAMESPACE_OK received, {how}",
         )
     except Exception as e:
         return TestResult(
@@ -649,6 +654,88 @@ async def test_announce_subscribe(host, port, path, use_quic,
             publisher_connection_id=pub_cid,
             subscriber_connection_id=sub_cid,
             message=f"Failed: {_format_exc(e)}",
+            received=_format_exc(e),
+        )
+
+
+async def test_namespace_discovery(host, port, path, use_quic,
+                                   tls_disable_verify, debug,
+                                   supported_drafts=None,
+                                   compat=frozenset(),
+                                   timeout=15.0) -> TestResult:
+    """Test 7: A subscriber knowing only the namespace learns the trackname.
+
+    d14/d16 answer SUBSCRIBE_NAMESPACE with a PUBLISH per track. d18
+    reports namespaces first (NAMESPACE) and answers a second request,
+    SUBSCRIBE_TRACKS, with the PUBLISH — and moved SUBSCRIBE_NAMESPACE
+    from 0x11 to 0x50. SubscribedTrack walks whichever shape the
+    negotiated draft requires, so this asserts the outcome, not the
+    message sequence, and holds across every draft.
+    """
+    t0 = time.monotonic()
+    pub_cid = "unknown"
+    sub_cid = "unknown"
+    try:
+        async with asyncio.timeout(timeout):
+            pub_client = _make_client(host, port, path, use_quic,
+                                      tls_disable_verify, debug,
+                                      supported_drafts=supported_drafts)
+            pub_client.register_handler(
+                MOQTMessageType.SUBSCRIBE, _serve_forwarded_subscribe)
+            sub_client = _make_client(host, port, path, use_quic,
+                                      tls_disable_verify, debug,
+                                      supported_drafts=supported_drafts)
+
+            async with pub_client.connect() as pub_session:
+                await pub_session.client_session_init()
+                pub_cid = _get_connection_id(pub_session)
+                track = PublishedTrack(
+                    pub_session,
+                    namespace=INTEROP_NAMESPACE,
+                    trackname=INTEROP_TRACK,
+                    object_size=64, group_size=10, num_subgroups=1, rate=50,
+                )
+                track._quiet = True
+                track._stats_header_printed = True
+                # Announce the namespace as well as the track: d18
+                # enumerates namespaces, and a relay learns a namespace
+                # exists from PUBLISH_NAMESPACE, not from PUBLISH.
+                # d14/d16 need the PUBLISH for the fused response.
+                await track.publish(announce_namespace=True,
+                                    publish_track=True)
+
+                async with sub_client.connect() as sub_session:
+                    await sub_session.client_session_init()
+                    sub_cid = _get_connection_id(sub_session)
+                    discovered = SubscribedTrack(
+                        sub_session, INTEROP_NAMESPACE)
+                    discovered._quiet = True
+                    await discovered.subscribe(timeout=timeout / 2)
+                    found = discovered.trackname
+                    passed = found == INTEROP_TRACK
+                    msg = (f"discovered '{found}'" if passed else
+                           f"discovered '{found}', expected "
+                           f"'{INTEROP_TRACK}'")
+                    sub_session.close()
+                pub_session.close()
+
+        return TestResult(
+            name="namespace-discovery", passed=passed,
+            duration_ms=(time.monotonic() - t0) * 1000,
+            publisher_connection_id=pub_cid,
+            subscriber_connection_id=sub_cid,
+            message=msg,
+            expected=f"PUBLISH announcing '{INTEROP_TRACK}'",
+            received=str(found),
+        )
+    except Exception as e:
+        return TestResult(
+            name="namespace-discovery", passed=False,
+            duration_ms=(time.monotonic() - t0) * 1000,
+            publisher_connection_id=pub_cid,
+            subscriber_connection_id=sub_cid,
+            message=f"Failed: {_format_exc(e)}",
+            expected=f"PUBLISH announcing '{INTEROP_TRACK}'",
             received=_format_exc(e),
         )
 
@@ -905,6 +992,7 @@ TEST_FUNCTIONS = {
     "subscribe-error": test_subscribe_error,
     "announce-subscribe": test_announce_subscribe,
     "subscribe-before-announce": test_subscribe_before_announce,
+    "namespace-discovery": test_namespace_discovery,
     "fetch": test_fetch,
     "join": test_join,
 }
@@ -1189,5 +1277,10 @@ def main():
     sys.exit(0 if all_passed else 1)
 
 
-if __name__ == "__main__":
+def cli():
+    """Console entry point (moq-interop-client)."""
     main()
+
+
+if __name__ == "__main__":
+    cli()

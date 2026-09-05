@@ -1,0 +1,367 @@
+"""Wire conformance against independently-derived bytes.
+
+Round-trip tests cannot catch codec bugs that are symmetric between our
+encoder and decoder (RFC9000-vs-vi64 varints, absolute-vs-delta KVP
+types — both shipped that way and passed loopback). Everything here is
+checked against a reference codec implemented in-test from the spec
+text, golden bytes captured from real peers, or exact hand-derived wire
+images.
+
+Golden capture: moq-dev relay SUBSCRIBE_OK (d18), 2026-08-13 — Track
+Properties TIMESCALE(0x08)=1000 in minimal vi64. 0.10.6 failed to parse
+it (RFC9000 pull on a vi64 field).
+"""
+import pytest
+
+from aiomoqt.context import profile_for
+from aiomoqt.messages import MOQTMessage
+from aiomoqt.messages.subscribe import SubscribeOk
+from aiomoqt.utils.buffer import Buffer
+from aiopquic.streamchain import StreamChain
+
+
+# -- reference vi64 (transport-18 §1.4.1), written from the spec ------
+
+def ref_vi64(v: int) -> bytes:
+    n = 1
+    while n < 9 and v >= (1 << (7 * n)):
+        n += 1
+    if n == 9:
+        return bytes([0xFF]) + v.to_bytes(8, 'big')
+    first = ((0xFF << (9 - n)) & 0xFF) | (v >> (8 * (n - 1)))
+    rest = v & ((1 << (8 * (n - 1))) - 1)
+    return bytes([first]) + rest.to_bytes(n - 1, 'big')
+
+
+def ref_rfc9000(v: int) -> bytes:
+    for bits, prefix in ((6, 0x00), (14, 0x40), (30, 0x80), (62, 0xC0)):
+        if v < (1 << bits):
+            n = (bits + 2) // 8
+            out = v.to_bytes(n, 'big')
+            return bytes([out[0] | prefix]) + out[1:]
+    raise ValueError(v)
+
+
+_BOUNDARIES = [0, 1, 63, 64, 127, 128, 16383, 16384,
+               (1 << 30) - 1, 1 << 30, (1 << 56) - 1, 1 << 56,
+               (1 << 62) - 1]
+
+
+@pytest.mark.parametrize("v", _BOUNDARIES)
+def test_vi64_matches_reference(v):
+    buf = Buffer(capacity=16)
+    buf.push_uint_vi64(v)
+    assert bytes(buf.data_slice(0, buf.tell())) == ref_vi64(v), hex(v)
+    rb = Buffer(data=ref_vi64(v))
+    assert rb.pull_uint_vi64() == v
+
+
+@pytest.mark.parametrize("v", _BOUNDARIES)
+def test_rfc9000_matches_reference(v):
+    buf = Buffer(capacity=16)
+    buf.push_uint_var(v)
+    assert bytes(buf.data_slice(0, buf.tell())) == ref_rfc9000(v), hex(v)
+
+
+# -- KVP extension blocks: hand-derived wire images -------------------
+#
+# d14 §1.4.2: absolute Type. d16/d18 §1.4.2/§1.4.3: Type is a DELTA
+# from the previous Type (unsigned → ascending emission); even/odd
+# (value form) follows the ABSOLUTE type. d18 varints are vi64.
+
+_EXTS = {6: 1000, 2: 7, 13: b"ab"}  # deliberately unsorted insertion
+
+
+def _encode(exts, *, vi64, delta):
+    buf = Buffer(capacity=64, vi64=vi64)
+    MOQTMessage._extensions_encode(buf, exts, delta=delta)
+    return bytes(buf.data_slice(0, buf.tell()))
+
+
+def _decode(raw, *, vi64, delta):
+    buf = Buffer(data=raw, vi64=vi64)
+    return MOQTMessage._extensions_decode(buf, delta=delta)
+
+
+def test_d16_delta_block_exact_bytes():
+    # sorted [2, 6, 13] → wire deltas [2, 4, 7]; values RFC9000
+    # (1000 → 0x43E8).
+    expect = bytes([0x02, 0x07,
+                    0x04, 0x43, 0xE8,
+                    0x07, 0x02]) + b"ab"
+    assert _encode(_EXTS, vi64=False, delta=True) == (
+        bytes([len(expect)]) + expect)
+    assert _decode(bytes([len(expect)]) + expect,
+                   vi64=False, delta=True) == _EXTS
+
+
+def test_d18_delta_block_exact_bytes():
+    # Same deltas, vi64 values: 1000 → 0x83E8 (matches the moq-dev
+    # capture's value bytes).
+    expect = bytes([0x02, 0x07,
+                    0x04, 0x83, 0xE8,
+                    0x07, 0x02]) + b"ab"
+    assert _encode(_EXTS, vi64=True, delta=True) == (
+        bytes([len(expect)]) + expect)
+    assert _decode(bytes([len(expect)]) + expect,
+                   vi64=True, delta=True) == _EXTS
+
+
+def test_d14_absolute_block_round_trip():
+    raw = _encode(_EXTS, vi64=False, delta=False)
+    # absolute ids appear literally on the wire, insertion order
+    assert raw[1] == 6 and raw[0] == len(raw) - 1
+    assert _decode(raw, vi64=False, delta=False) == _EXTS
+
+
+def test_delta_parity_follows_absolute_type():
+    # {2: v, 5: bytes}: wire deltas [2, 3] — the second delta is ODD
+    # while the absolute type 5 is also odd here; use {2, 8, 13} where
+    # delta parity differs from absolute parity: deltas [2, 6, 5] —
+    # 5 is odd but leads to absolute 13 (odd, bytes) via accumulation,
+    # while absolute-8 (even, varint) came from delta 6.
+    exts = {2: 1, 8: 2, 13: b"z"}
+    raw = _encode(exts, vi64=False, delta=True)
+    assert _decode(raw, vi64=False, delta=True) == exts
+
+
+# -- Cython hot-path twins agree with the python codec ----------------
+
+from aiopquic._binding._streamchain import (          # noqa: E402
+    encode_object_subgroup, encode_object_subgroup_vi64)
+
+
+@pytest.mark.parametrize("vi64", [False, True], ids=["d16", "d18"])
+def test_cython_subgroup_object_kvp_delta(vi64):
+    encode = encode_object_subgroup_vi64 if vi64 else encode_object_subgroup
+    body = encode(0, _EXTS, 0, b"pay", True, True)
+    chain = StreamChain()
+    chain.extend(body)
+    fused = (chain.parse_object_subgroup_vi64 if vi64
+             else chain.parse_object_subgroup)
+    delta, exts, status, payload = fused(True, 16 * 1024, True)
+    assert (delta, exts, status, payload) == (0, _EXTS, 0, b"pay")
+    # And the Cython encoder's ext block matches the python encoder's.
+    pybuf = Buffer(capacity=64, vi64=vi64)
+    pybuf.push_vint(0)
+    MOQTMessage._extensions_encode(pybuf, _EXTS, delta=True)
+    pyhead = bytes(pybuf.data_slice(0, pybuf.tell()))
+    assert body.startswith(pyhead)
+
+
+# -- d18 FETCH data plane (§11.4.4): vi64 + group/object deltas -------
+
+from aiomoqt.messages.data import FetchHeader, FetchObject  # noqa: E402
+from aiomoqt.types import ObjectStatus  # noqa: E402
+
+
+def test_d18_fetch_header_exact_bytes():
+    raw = bytes(FetchHeader(request_id=5).serialize(
+        profile_for(18)).data)
+    assert raw == bytes([0x05, 0x05])
+    rb = Buffer(data=raw, vi64=True)
+    assert rb.pull_vint() == 0x05
+    assert FetchHeader.deserialize(rb).request_id == 5
+
+
+def _fetch_chain_roundtrip(objs, group_order=0x1):
+    prof = profile_for(18)
+    prior = None
+    out = []
+    for o in objs:
+        raw = bytes(o.serialize(prof=prof, prior=prior,
+                                group_order=group_order).data)
+        rb = Buffer(data=raw, vi64=True)
+        got = FetchObject.deserialize(rb, prior=prior, prof=prof,
+                                      group_order=group_order)
+        out.append((raw, got))
+        prior = got
+    return out
+
+
+def test_d18_fetch_object_exact_bytes_and_chain():
+    objs = [
+        FetchObject(group_id=2, subgroup_id=0, object_id=0,
+                    publisher_priority=128,
+                    extensions={8: 1000}, payload=b"hi"),
+        FetchObject(group_id=2, subgroup_id=0, object_id=1,
+                    publisher_priority=128, payload=b"x"),
+        FetchObject(group_id=3, subgroup_id=0, object_id=0,
+                    publisher_priority=128, payload=b"y"),
+    ]
+    chain = _fetch_chain_roundtrip(objs)
+    # First object: flags GD|OD|PRI|PROPS = 0x3C, absolute ids,
+    # delta-typed vi64 properties, then len-prefixed payload.
+    assert chain[0][0] == bytes.fromhex("3c 02 00 80 03 08 83 e8 02 6869"
+                                        .replace(" ", ""))
+    # Second: everything inherited from prior — flags 0.
+    assert chain[1][0] == bytes.fromhex("000178")
+    # Third: next group (delta 0), object absolute again.
+    assert chain[2][0] == bytes.fromhex("0c00000179")
+    for want, (_, got) in zip(objs, chain):
+        assert (got.group_id, got.object_id) == (want.group_id,
+                                                 want.object_id)
+        assert got.payload == want.payload
+    assert chain[0][1].extensions == {8: 1000}
+
+
+def test_d18_fetch_descending_group_delta():
+    objs = [
+        FetchObject(group_id=5, object_id=0, publisher_priority=1,
+                    payload=b"a"),
+        FetchObject(group_id=3, object_id=0, publisher_priority=1,
+                    payload=b"b"),
+    ]
+    chain = _fetch_chain_roundtrip(objs, group_order=0x2)
+    # 5 -> 3 descending: wire delta = 5 - 3 - 1 = 1.
+    assert chain[1][0][1] == 1
+    assert chain[1][1].group_id == 3
+
+
+def test_d18_fetch_end_of_range():
+    prof = profile_for(18)
+    marker = FetchObject(group_id=7, object_id=9, end_of_range=0x8C,
+                         payload=b"")
+    raw = bytes(marker.serialize(prof=prof).data)
+    # 0x8C needs the 2-byte vi64 form.
+    assert raw == bytes([0x80, 0x8C, 0x07, 0x09])
+    rb = Buffer(data=raw, vi64=True)
+    got = FetchObject.deserialize(rb, prof=prof)
+    assert (got.end_of_range, got.group_id, got.object_id) == (0x8C, 7, 9)
+
+
+def test_d18_fetch_first_object_must_be_absolute():
+    prof = profile_for(18)
+    rb = Buffer(data=bytes([0x00, 0x01, 0x78]), vi64=True)
+    with pytest.raises(ValueError, match="first object"):
+        FetchObject.deserialize(rb, prior=None, prof=prof)
+
+
+def test_d18_fetch_zero_length_encodes_status():
+    # Golden bytes per moxygen's writer (writeStreamObject): a zero
+    # Payload Length is followed by an explicit Status varint.
+    objs = [
+        FetchObject(group_id=1, subgroup_id=0, object_id=0,
+                    publisher_priority=200, payload=b"tt"),
+        FetchObject(group_id=1, subgroup_id=0, object_id=1,
+                    publisher_priority=200, payload=b""),
+        FetchObject(group_id=1, subgroup_id=0, object_id=2,
+                    publisher_priority=200,
+                    status=ObjectStatus.END_OF_GROUP, payload=b""),
+    ]
+    chain = _fetch_chain_roundtrip(objs)
+    # First: flags GD|OD|PRI = 0x1C, absolute ids, len 2 + payload.
+    assert chain[0][0] == bytes.fromhex("1c0100c8027474")
+    # Zero-length Normal: flags 0, len 0, explicit status 0.
+    assert chain[1][0] == bytes.fromhex("000000")
+    # End of Group: flags 0, len 0, status 3.
+    assert chain[2][0] == bytes.fromhex("000003")
+    assert [g.status for _, g in chain] == [
+        ObjectStatus.NORMAL, ObjectStatus.NORMAL, ObjectStatus.END_OF_GROUP]
+    assert [g.payload for _, g in chain] == [b"tt", b"", b""]
+
+
+def test_d18_fetch_non_normal_status_guards():
+    prof = profile_for(18)
+    with pytest.raises(ValueError, match="empty payload"):
+        FetchObject(group_id=1, object_id=0,
+                    status=ObjectStatus.END_OF_GROUP,
+                    payload=b"x").serialize(prof=prof)
+    with pytest.raises(ValueError, match="non-Normal"):
+        FetchObject(group_id=1, object_id=0,
+                    status=ObjectStatus.END_OF_GROUP,
+                    extensions={8: 1}, payload=b"").serialize(prof=prof)
+    # RX: properties on a non-Normal object close the parse.
+    raw = bytes.fromhex("3c0100c802080500 03".replace(" ", ""))
+    rb = Buffer(data=raw, vi64=True)
+    with pytest.raises(ValueError, match="non-Normal"):
+        FetchObject.deserialize(rb, prior=None, prof=prof)
+
+
+def test_d18_fetch_first_object_sg_prior_rejected():
+    prof = profile_for(18)
+    # flags GD|OD|PRI|SG=prior (0x1D): prior-Subgroup ref on first object.
+    raw = bytes.fromhex("1d0100c80000")
+    rb = Buffer(data=raw, vi64=True)
+    with pytest.raises(ValueError, match="prior Subgroup"):
+        FetchObject.deserialize(rb, prior=None, prof=prof)
+
+
+# -- d18 SUBSCRIPTION_FILTER internals (§5.1.2) -----------------------
+#
+# Filter values follow the negotiated varint codec (vi64 on d18 —
+# cross-checked against moxygen MoQFramer.writeSubscriptionFilter,
+# whose version-aware writeVarint uses the MoQ varint on d17+), and
+# d18 carries End Group as end - start (moxygen: error when negative;
+# parse reconstructs the absolute).
+
+from aiomoqt.messages.subscribe import Subscribe  # noqa: E402
+
+
+def test_d18_filter_absolute_start_uses_vi64():
+    # AbsoluteStart (3) with group/object >= 64: vi64 encodes 100 as
+    # one byte (0x64), RFC9000 as two (0x4064) — the wire images differ.
+    p18 = profile_for(18)
+    m = Subscribe(request_id=0, track_namespace=(b"n",), track_name=b"t",
+                  filter_type=3, start_group=100, start_object=200)
+    raw18 = bytes(m.serialize(prof=p18).data)
+    assert bytes([0x03, 0x64, 0x80, 0xC8]) in raw18  # vi64 100, 200
+    assert bytes([0x03, 0x40, 0x64]) not in raw18    # RFC9000 100
+    got = Subscribe.deserialize(
+        Buffer(data=raw18[_subscribe_body_off(raw18)::], vi64=True),
+        prof=p18, buf_end=len(raw18) - _subscribe_body_off(raw18))
+    assert (got.filter_type, got.start_group, got.start_object) == (
+        3, 100, 200)
+
+
+def test_d18_filter_absolute_range_end_group_delta():
+    p18 = profile_for(18)
+    m = Subscribe(request_id=0, track_namespace=(b"n",), track_name=b"t",
+                  filter_type=4, start_group=100, start_object=0,
+                  end_group=110)
+    raw18 = bytes(m.serialize(prof=p18).data)
+    # type 4, start 100/0, then END GROUP AS DELTA: 110-100 = 10 (0x0A)
+    assert bytes([0x04, 0x64, 0x00, 0x0A]) in raw18
+    got = Subscribe.deserialize(
+        Buffer(data=raw18[_subscribe_body_off(raw18):], vi64=True),
+        prof=p18, buf_end=len(raw18) - _subscribe_body_off(raw18))
+    assert got.end_group == 110  # absolute reconstructed
+    with pytest.raises(ValueError, match="end_group"):
+        Subscribe(request_id=0, track_namespace=(b"n",), track_name=b"t",
+                  filter_type=4, start_group=100,
+                  end_group=90).serialize(prof=p18)
+
+
+def test_d16_filter_unchanged_rfc9000_absolute():
+    p16 = profile_for(16)
+    m = Subscribe(request_id=0, track_namespace=(b"n",), track_name=b"t",
+                  filter_type=4, start_group=100, start_object=200,
+                  end_group=110)
+    raw16 = bytes(m.serialize(prof=p16).data)
+    # RFC9000 two-byte ints, end group ABSOLUTE: 0x406E = 110.
+    assert bytes([0x04, 0x40, 0x64, 0x40, 0xC8, 0x40, 0x6E]) in raw16
+    got = Subscribe.deserialize(
+        Buffer(data=raw16[_subscribe_body_off(raw16):]),
+        prof=p16, buf_end=len(raw16) - _subscribe_body_off(raw16))
+    assert (got.start_group, got.end_group) == (100, 110)
+
+
+def _subscribe_body_off(raw: bytes) -> int:
+    # Control frame: type varint (1B here) + u16 length prefix.
+    return 3
+
+
+# -- golden capture: moq-dev SUBSCRIBE_OK (d18) -----------------------
+
+# Full control message: type=0x04, len=0x0007, body 00 01 22 02 08 83 e8.
+# Track Properties carry TIMESCALE(0x08) = 1000.
+_MOQ_DEV_SUBSCRIBE_OK_BODY = bytes.fromhex("000122020883e8")
+
+
+def test_moq_dev_subscribe_ok_golden():
+    buf = Buffer(data=_MOQ_DEV_SUBSCRIBE_OK_BODY, vi64=True)
+    msg = SubscribeOk.deserialize(
+        buf, prof=profile_for(18),
+        buf_end=len(_MOQ_DEV_SUBSCRIBE_OK_BODY))
+    assert msg.track_alias == 0
+    assert msg.track_extensions == {8: 1000}

@@ -1,0 +1,168 @@
+name: MoQ conformance
+
+# draft-afrind-moq-test conformance, driven by moxygen's moqtest_client
+# against aiomoqt as the relay under test:
+#
+#   moqtest_server (listens)  <--SUBSCRIBE--  aiomoqt relay --upstream
+#                                                   ^
+#                                             SUBSCRIBE(moq-test-00)
+#                                                   |
+#                                             moqtest_client
+#
+# This is the arrangement the suite assumes: an origin attached to the
+# relay, with the relay reaching upstream to it. moqtest_server listens
+# and does not dial, so the relay has to be able to dial out.
+#
+# The client encodes its parameters as 16 Track Namespace tuple fields
+# and verifies the objects that come back: group and object numbering,
+# payload sizes, forwarding preference, end-of-group markers and object
+# extensions. That is an independent oracle — unlike our own round-trip
+# tests, it cannot share a misconception with our encoder, and unlike a
+# lenient peer it checks rather than tolerates.
+#
+# Binaries come from an openmoq/moxygen release artifact (no build:
+# moxygen needs folly/proxygen via getdeps, far too slow for a gate).
+# The tag is pinned in .github/moxygen-pin.
+#
+# Runs on push to main and to a release branch, and on demand.
+# workflow_dispatch is only offered for workflows present on the default
+# branch, so until this lands on main the branch trigger is what runs it.
+
+on:
+  push:
+    branches: [main, 'gmarzot-*']
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch or SHA to test (defaults to the current ref)'
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  conformance:
+    name: moq-test conformance (relay SUT, d${{ matrix.draft }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        draft: [16, 18]
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-aiomoqt
+
+      - name: Resolve the pinned moxygen harness
+        id: pin
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=$(grep -vE '^[[:space:]]*(#|$)' .github/moxygen-pin | head -n1)
+          echo "harness pinned to openmoq/moxygen@$TAG"
+          # A rolling snapshot tag holds no assets; its body names the
+          # per-rev release that does.
+          if ! gh release view "$TAG" -R openmoq/moxygen \
+                 --json assets --jq '.assets[].name' | grep -q .; then
+            TAG=$(gh release view "$TAG" -R openmoq/moxygen \
+                    --json body --jq '.body' \
+                  | grep -oE 'snapshot-[0-9a-f]{12}' | head -n1)
+            echo "rolling pointer resolved to $TAG"
+          fi
+          [ -n "$TAG" ] || { echo "::error::could not resolve harness tag"; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch moq-test binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download "${{ steps.pin.outputs.tag }}" \
+            -R openmoq/moxygen -p "moxygen-ubuntu-24.04-amd64.tar.gz" --clobber
+          mkdir -p harness
+          tar -C harness -xzf moxygen-ubuntu-24.04-amd64.tar.gz
+          # The tarball ships static .a archives, not runtime .so files, so
+          # the binaries still need the system libs their build assumed.
+          sudo apt-get update -qq
+          sudo apt-get install -y libgoogle-glog0v6t64 \
+            || sudo apt-get install -y libgoogle-glog0v6
+          # gflags binaries exit 1 on --help; only 126/127 mean the
+          # binary itself cannot run (missing libs / not executable).
+          rc=0; ./harness/bin/moqtest_client --help >/dev/null 2>&1 || rc=$?
+          if [ "$rc" -ge 126 ]; then
+            ldd ./harness/bin/moqtest_client
+            echo "::error::moqtest_client not runnable (exit $rc)"; exit 1
+          fi
+          echo "harness ready: $(ls harness/bin | tr '\n' ' ')"
+
+      - name: Generate certs
+        run: |
+          mkdir -p certs
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout certs/key.pem -out certs/cert.pem \
+            -days 1 -subj "/CN=localhost"
+
+      - name: Run conformance against the aiomoqt relay
+        env:
+          DRAFT: ${{ matrix.draft }}
+        run: |
+          set -o pipefail
+          # Origin first: the relay dials it and retries, but starting in
+          # order keeps the log readable.
+          ./harness/bin/moqtest_server \
+            --port 9999 --quic \
+            --cert certs/cert.pem --key certs/key.pem \
+            > upstream.log 2>&1 &
+          UP_PID=$!
+          sleep 3
+          python -m aiomoqt.tools.moq_interop_relay \
+            --bind 127.0.0.1 --port 4443 --quic --draft "$DRAFT" \
+            --cert certs/cert.pem --key certs/key.pem \
+            --upstream "moqt://127.0.0.1:9999/" \
+            > relay.log 2>&1 &
+          RELAY_PID=$!
+          trap 'kill $RELAY_PID $UP_PID 2>/dev/null || true' EXIT
+          for i in $(seq 1 20); do
+            grep -q "upstream connected" relay.log && break
+            sleep 1
+          done
+          grep -q "upstream connected" relay.log \
+            || { echo "::error::relay never reached the origin"; \
+                 tail -20 relay.log; exit 1; }
+          bash .github/scripts/moq-conformance.sh 2>&1 | tee conformance.log
+
+          # Second SUT: the moqtest ORIGIN — the bare server-role API
+          # serving deterministic moq-test tracks, no relay involved.
+          # Publish mode needs a relay, so that section is skipped.
+          kill $RELAY_PID $UP_PID 2>/dev/null || true
+          sleep 2
+          python -m aiomoqt.tools.moqtest_origin \
+            --bind 127.0.0.1 --port 4443 --quic --draft "$DRAFT" \
+            --cert certs/cert.pem --key certs/key.pem \
+            > origin.log 2>&1 &
+          ORIGIN_PID=$!
+          trap 'kill $ORIGIN_PID 2>/dev/null || true' EXIT
+          sleep 3
+          SKIP_PUBLISH=1 bash .github/scripts/moq-conformance.sh 2>&1 \
+            | tee origin-conformance.log
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: moq-conformance-logs-d${{ matrix.draft }}
+          path: |
+            relay.log
+            upstream.log
+            conformance.log
+            origin.log
+            origin-conformance.log
+          if-no-files-found: warn

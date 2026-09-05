@@ -1192,11 +1192,10 @@ class TestDraft18ControlMessages:
         )
 
     def test_subscribe_ok_d18_largest_is_inline_location(self):
-        # d18 LARGEST_OBJECT (0x09) is a Location value: group + object
-        # varints written INLINE with NO length prefix (moxygen
-        # paramEncodingV18). Guards the regression where the generic
-        # odd-type rule read the group as a length and overran the buffer
-        # for subscribers joining a track that already has objects.
+        # d18 §10.2.11: LARGEST_OBJECT (0x09) is a Location; §10.2 defines
+        # Location as two consecutive varints (Group, Object) — no Length,
+        # despite the odd type number (§1.4.3 does not govern Message
+        # Parameters).
         from aiomoqt.context import profile_for
         prof = profile_for(18)
         msg = SubscribeOk(
@@ -1212,10 +1211,11 @@ class TestDraft18ControlMessages:
         assert w.pull_vint() == 42      # track_alias (no request_id on d18 wire)
         assert w.pull_vint() == 1       # param count
         assert w.pull_vint() == 0x09    # LARGEST_OBJECT key (delta from 0)
-        # INLINE Location: the next bytes are the group and object varints,
-        # NOT a length prefix. A length-prefixed encoding would read 0x?? here.
-        assert w.pull_vint() == 5       # group
+        assert w.pull_vint() == 5       # group (bare — no Length)
         assert w.pull_vint() == 200     # object
+        assert w.pull_vint() == 0x22    # trailing Track Properties: GROUP_ORDER
+        assert w.pull_vint() == 1       # ASCENDING
+        assert w.tell() == len(body)
         rt = SubscribeOk.deserialize(Buffer(data=body, vi64=prof.vi64),
                                      prof=prof, buf_end=len(body))
         assert (rt.largest_group_id, rt.largest_object_id) == (5, 200)
@@ -1382,10 +1382,10 @@ class TestDraft18ControlMessages:
         )
 
     def test_fetch_ok_d18(self):
-        # FETCH_OK is a response → d18 omits request_id; the d18 "End
-        # Location" is the same two varints as largest_group/object, and
-        # group_order rides in params — i.e. the same vi64 + request-id-gate
-        # shape as the other OK replies, not a structural rewrite.
+        # FETCH_OK is a response → d18 omits request_id, and GROUP_ORDER
+        # is not defined for FETCH_OK at d18 (§10.2.8) so it never rides
+        # the wire; End Location is the same two varints as
+        # largest_group/object.
         assert moqt_message_serialization_versioned(
             FetchOk,
             {
@@ -1399,7 +1399,7 @@ class TestDraft18ControlMessages:
             },
             type_id=MOQTMessageType.FETCH_OK,
             version=self.D18,
-            skip_fields={'request_id', 'track_extensions'},
+            skip_fields={'request_id', 'group_order', 'track_extensions'},
         )
 
 
@@ -1625,7 +1625,7 @@ class TestFetchD14AllTypes:
 # ========================================================================
 
 from aiomoqt.context import get_major_version, profile_for
-from aiomoqt.messages.track import (
+from aiomoqt.messages.data import (
     FETCH_FLAG_SG_ZERO, FETCH_FLAG_SG_PRIOR, FETCH_FLAG_SG_PRIOR_PLUS,
     FETCH_FLAG_SG_PRESENT, FETCH_FLAG_OBJECT_ID_PRESENT,
     FETCH_FLAG_GROUP_ID_PRESENT, FETCH_FLAG_PRIORITY_PRESENT,
@@ -1717,7 +1717,7 @@ class TestFetchObjectD16:
         prior = FetchObject(group_id=5, subgroup_id=0, object_id=10,
                             publisher_priority=128, payload=b'')
         # Manually build a delta-encoded buffer: flags without OBJECT_ID
-        from aiomoqt.messages.track import BUF_SIZE
+        from aiomoqt.messages.data import BUF_SIZE
         buf = Buffer(capacity=BUF_SIZE)
         flags = (FETCH_FLAG_SG_PRESENT
                  | FETCH_FLAG_GROUP_ID_PRESENT
@@ -1738,7 +1738,7 @@ class TestFetchObjectD16:
         """Group ID absent (flag 0x08 unset) → same as prior group."""
         prior = FetchObject(group_id=7, subgroup_id=0, object_id=3,
                             publisher_priority=128, payload=b'')
-        from aiomoqt.messages.track import BUF_SIZE
+        from aiomoqt.messages.data import BUF_SIZE
         buf = Buffer(capacity=BUF_SIZE)
         flags = (FETCH_FLAG_SG_PRESENT
                  | FETCH_FLAG_OBJECT_ID_PRESENT
@@ -1759,7 +1759,7 @@ class TestFetchObjectD16:
         """Priority absent (flag 0x10 unset) → same as prior."""
         prior = FetchObject(group_id=1, subgroup_id=0, object_id=0,
                             publisher_priority=42, payload=b'')
-        from aiomoqt.messages.track import BUF_SIZE
+        from aiomoqt.messages.data import BUF_SIZE
         buf = Buffer(capacity=BUF_SIZE)
         flags = (FETCH_FLAG_SG_PRESENT
                  | FETCH_FLAG_OBJECT_ID_PRESENT
@@ -1778,7 +1778,7 @@ class TestFetchObjectD16:
 
     def test_subgroup_mode_zero(self):
         """SG mode 0x00 → subgroup_id = 0."""
-        from aiomoqt.messages.track import BUF_SIZE
+        from aiomoqt.messages.data import BUF_SIZE
         buf = Buffer(capacity=BUF_SIZE)
         flags = (FETCH_FLAG_SG_ZERO
                  | FETCH_FLAG_OBJECT_ID_PRESENT
@@ -1799,7 +1799,7 @@ class TestFetchObjectD16:
         """SG mode 0x01 → subgroup_id = prior's subgroup_id."""
         prior = FetchObject(group_id=1, subgroup_id=7, object_id=0,
                             publisher_priority=128, payload=b'')
-        from aiomoqt.messages.track import BUF_SIZE
+        from aiomoqt.messages.data import BUF_SIZE
         buf = Buffer(capacity=BUF_SIZE)
         flags = (FETCH_FLAG_SG_PRIOR
                  | FETCH_FLAG_OBJECT_ID_PRESENT
@@ -1819,7 +1819,7 @@ class TestFetchObjectD16:
         """SG mode 0x02 → subgroup_id = prior + 1."""
         prior = FetchObject(group_id=1, subgroup_id=7, object_id=0,
                             publisher_priority=128, payload=b'')
-        from aiomoqt.messages.track import BUF_SIZE
+        from aiomoqt.messages.data import BUF_SIZE
         buf = Buffer(capacity=BUF_SIZE)
         flags = (FETCH_FLAG_SG_PRIOR_PLUS
                  | FETCH_FLAG_OBJECT_ID_PRESENT
@@ -1837,7 +1837,7 @@ class TestFetchObjectD16:
 
     def test_datagram_pref(self):
         """Datagram preference flag (0x40) → subgroup_id = 0."""
-        from aiomoqt.messages.track import BUF_SIZE
+        from aiomoqt.messages.data import BUF_SIZE
         buf = Buffer(capacity=BUF_SIZE)
         flags = (FETCH_FLAG_DATAGRAM
                  | FETCH_FLAG_OBJECT_ID_PRESENT
@@ -1891,7 +1891,7 @@ class TestFetchObjectD16:
 
     def test_first_object_missing_group_id_raises(self):
         """First object on stream missing Group ID → ValueError."""
-        from aiomoqt.messages.track import BUF_SIZE
+        from aiomoqt.messages.data import BUF_SIZE
         buf = Buffer(capacity=BUF_SIZE)
         # flags: no GROUP_ID, no OBJECT_ID
         flags = (FETCH_FLAG_SG_PRESENT | FETCH_FLAG_PRIORITY_PRESENT)
@@ -1906,7 +1906,7 @@ class TestFetchObjectD16:
 
     def test_invalid_flags_high_bit(self):
         """Flags >= 0x80 (excluding known end-of-range) → ValueError."""
-        from aiomoqt.messages.track import BUF_SIZE
+        from aiomoqt.messages.data import BUF_SIZE
         buf = Buffer(capacity=BUF_SIZE)
         buf.push_uint_var(0x80)  # invalid flags
         buf.push_uint_var(0)

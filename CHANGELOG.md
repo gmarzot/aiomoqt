@@ -1,5 +1,106 @@
 # Changelog
 
+## v0.11.0rc2
+
+Pairs with aiopquic 0.4.0rc1 (unchanged).
+
+### Wire fixes
+
+- **`LARGEST_OBJECT` (0x09), d18.** Odd type — §1.4.3 Length field is
+  mandatory. Omitted on encode and decode; the Length byte was read as
+  the group, shifting the Location and orphaning a byte, which then
+  raised a bogus "non-compliant peer" on the trailing KVP block. Found
+  against Cloudflare draft-18-interop.
+- **`PUBLISH_OK`, d16 and d18.** A PUBLISH is answered with `REQUEST_OK`
+  (0x07); PUBLISH_OK is the shorthand name (§10.5), and only d14 has a
+  distinct message. We emitted 0x1E — an unknown control message to a
+  d16+ peer, which closed the session.
+- **Cancellation messages, d18.** `PUBLISH_NAMESPACE_DONE` (0x09) was
+  sent on every publisher teardown. d18 has no cancellation messages —
+  withdrawal is RESET_STREAM / STOP_SENDING. `send_control_message` now
+  rejects any type absent from the negotiated draft's registry
+  (`CONTROL_MESSAGE_TYPES`); `UNSUBSCRIBE` (0x0A) and `FETCH_CANCEL`
+  (0x17) were equally reachable.
+- **Subgroup stream type.** `FIRST_OBJECT` (0x40) was parsed, never
+  emitted. `DEFAULT_PRIORITY` (0x20) was decoded as priority 128 rather
+  than "inherited". Objects now carry their stream's flags and priority.
+- **END_OF_GROUP / END_OF_TRACK** were consumed before delivery, so a
+  forwarder could not see them. Delivered now; consumers filter on
+  status.
+
+### Relay (`tools.moq_interop_relay`)
+
+Forwards objects, fans out, serves both publish flows, dials origins
+with `--upstream`. Namespace matching is §2.4 prefix, field-wise, not
+equality. Session state is released on close, and a new announcement
+supersedes a track cached against a prior session — close alone is too
+late for a prompt reconnect. Still no group cache, joining FETCH,
+forward-state propagation, or PUBLISH→SUBSCRIBE_TRACKS forwarding.
+
+### Tests
+
+`test_spec_registry.py` transcribes the d14/d16/d18 message-type tables
+independently of `aiomoqt.types` and checks the §1.4.3 odd/even Length
+rule against a reader that knows only the spec. `.github/workflows/
+moq-conformance.yml` runs draft-afrind-moq-test via moxygen's
+`moqtest_client` against the relay, d16 and d18, from a pinned artifact.
+
+Known: moq-test reports one inherited-priority mismatch and one stream
+reset against the relay.
+
+## v0.11.0rc1
+
+Pre-release for MoQ community interop testing. Pairs with
+**aiopquic 0.4.0rc1**. The full v0.11.0 notes land with the release.
+
+### Features
+
+- **`serve_dual()`** — one `MOQTServer` serving raw QUIC and
+  WebTransport MoQT on a single UDP port, over aiopquic's ALPN dispatch.
+  Sessions now carry their own transport identity rather than reading
+  the owning peer's, which no single flag can speak for under a dual
+  server.
+- **Playable media pipeline.** LOC packaging (push-model publisher and
+  frame subscriber), an MSF catalog model with a delta engine, MSF
+  broadcast orchestration, and CMSF/CMAF packaging per
+  draft-ietf-moq-cmsf. `pub_media` / `sub_media` tools publish and
+  consume real mp4 (H.264, AV1 passthrough, AAC), with `--h264` live
+  Annex-B ingest for an OBS/ffmpeg pipe. Catalog delivery via SUBSCRIBE
+  plus joining FETCH gives late-join through a relay.
+- **Datagram delivery**, a unified CLI grid, and `load_sim`, a
+  scenario-driven multi-namespace load generator.
+- **d18 two-step track discovery** on the client side.
+- Session properties: `handshake_info`, `qlog_paths`,
+  `peer_transport_parameters`, `connection_ids`, `effective_configuration`.
+
+### Wire fixes
+
+- **d18 control-stream reassembly.** Control messages fragmented across
+  stream-data events crashed the parser; malformation is now
+  distinguished from fragmentation, and control sends defer until the
+  control write stream is up.
+- **Track-alias registry is keyed from SUBSCRIBE_OK and never guessed.**
+  The publisher-assigned alias was previously dropped, which would have
+  become real object misrouting once per-track routing landed.
+- **d18 codecs**: FETCH data plane (vi64 + delta relayout, §11.4.4),
+  SUBSCRIPTION_FILTER internals (§5.1.2), delta-coded KVP extension
+  types (§1.4.2), and the object-header extension block varint flavor.
+- **LOC loc-04 property renumber** with draft-gated legacy ids: MOQT d18
+  gives 0x06 and 0x02 Track scope, so emitting a timestamp under either
+  as an Object Property makes the track malformed and the subscription
+  is refused. d18 emits 0x10 alone; d14/d16 keep the legacy ids for the
+  deployed loc-02 ecosystem. Known wrinkle: on an audio track below d18,
+  `--loc01-compat` still emits 0x06, which a strict loc-01 receiver
+  reads as Audio Level rather than a timestamp.
+- **MSF catalog** tracks the editors' copy: the "update" delta op,
+  property-carried init references, "catalog" packaging, a `draft-01`
+  default version, and the catalog track outranking its media tracks.
+
+### Packaging
+
+- **Requires aiopquic >= 0.4.0rc1** (was >= 0.3.11), and the CI source
+  pin is gone — this build resolves aiopquic from PyPI.
+
 ## v0.10.6
 
 Pairs with aiopquic 0.3.11.

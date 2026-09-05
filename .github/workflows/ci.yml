@@ -10,9 +10,12 @@ name: CI
 #     on (linux, macos) x (3.12, 3.13, 3.14).
 #   - multi-proc: pub_server in one process, sub_bench in another.
 #     Catches Phase-7 backpressure / control-stream parser regressions
-#     that single-process loopback masks. continue-on-error initially.
-#   - cross-impl: aiomoqt sub_bench against cloudflare/moq-rs (main/latest)
-#     relay running in a Docker container. continue-on-error initially.
+#     that single-process loopback masks.
+#   - cross-impl: hard-fail peer interop — aiomoqt pub/sub through the
+#     moqx relay (gold standard, published image; WT + raw QUIC), and
+#     aiomoqt sub against cloudflare/moq-rs (main/latest) + moq-clock.
+#     An interop failure is a red build: a missing results line means
+#     the session never established and fails loudly.
 #   - perf-gate: parser microbench short window. continue-on-error
 #     initially.
 #
@@ -37,6 +40,30 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
+  # .github/aiopquic-pin builds aiopquic from source at a given ref, which is
+  # how a PR pairs with an unreleased aiopquic change. Legitimate while paired,
+  # never on main or a release: it would ship a dependency nobody can install.
+  pin-guard:
+    name: aiopquic pin guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reject an aiopquic pin on main / release
+        shell: bash
+        run: |
+          if [ ! -f .github/aiopquic-pin ]; then
+            echo "no aiopquic pin — resolving from PyPI"
+            exit 0
+          fi
+          spec=$(grep -vE '^[[:space:]]*(#|$)' .github/aiopquic-pin | head -n1 || true)
+          gated="${{ github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'release') }}"
+          if [ "$gated" = "true" ]; then
+            echo "::error::.github/aiopquic-pin is present ($spec) — delete it and depend on a published aiopquic"
+            exit 1
+          fi
+          echo "::warning::aiopquic pinned to $spec — delete .github/aiopquic-pin before merging to main"
+          echo "aiopquic pinned to \`$spec\` — delete the pin before merging" >> "$GITHUB_STEP_SUMMARY"
+
   core:
     name: core / ${{ matrix.os }} / py${{ matrix.python-version }}
     runs-on: ${{ matrix.os }}
@@ -82,7 +109,6 @@ jobs:
   multi-proc:
     name: pub-sub test / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -108,10 +134,10 @@ jobs:
           # -u so the "ready on" banner reaches /tmp/pub-srv.log
           # before our poll grep runs (Python buffers stdout in 4KB
           # chunks when redirected to a file).
-          python -u -m aiomoqt.examples.pub_server \
+          python -u -m aiomoqt.tools.pub_server \
             --cert certs/cert.pem --key certs/key.pem \
-            -p 4434 -s 4096 -g 10000 -P 1 \
-            --draft 16 --quic > /tmp/pub-srv.log 2>&1 &
+            -p 4434 -s 4096 -g 4096 -P 1 \
+            --draft 16 -Q > /tmp/pub-srv.log 2>&1 &
           PUB_PID=$!
           # Poll up to 10s for pub_server's "ready on" line. Bare
           # `sleep 1.5` was flaky on busier Linux runners — pub_server
@@ -137,8 +163,8 @@ jobs:
           # captures sub.log before the runner SIGTERMs us — bounded
           # cleanup + visible failure mode. The underlying sub_bench
           # -t bug is tracked for 0.9.6.
-          python -u -m aiomoqt.examples.sub_bench \
-            -q --draft 16 -n aiomoqt --trackname track \
+          python -u -m aiomoqt.tools.sub_bench \
+            --draft 16 -N aiomoqt -T track \
             -t 12 -i 5 moqt://localhost:4434 \
             > /tmp/sub.log 2>&1 &
           SUB_PID=$!
@@ -158,10 +184,14 @@ jobs:
           tail -20 /tmp/pub-srv.log
           # Assertion reads the per-interval table (always emitted even
           # when watchdog kills sub_bench) instead of the "Objects:"
-          # summary block (only emitted on natural exit). Interval
-          # format: "  10-15s    65      642256    29330/s   964Mbps ..."
-          # — column 3 is the cumulative obj count.
-          LAST_OBJS=$(grep -oE '^[[:space:]]+[0-9]+-[0-9]+s[[:space:]]+[0-9]+[[:space:]]+[0-9]+' /tmp/sub.log | tail -1 | awk '{print $3}')
+          # summary block (only emitted on natural exit). The cumulative
+          # obj count is the field two before the bitrate
+          # ("... 642256  29330/s  964Mbps ..."). Anchoring on the
+          # bitrate survives a column being added to its left and the
+          # "n/a" Grps/GrpRate that datagram delivery reports.
+          LAST_OBJS=$(grep -E '^[[:space:]]+[0-9]+-[0-9]+s' /tmp/sub.log \
+            | tail -1 \
+            | awk '{for(i=1;i<=NF;i++) if($i ~ /bps$/) {print $(i-2); exit}}')
           if [ -z "$LAST_OBJS" ]; then
             echo "FAIL: no interval data in sub.log — sub_bench did not run"
             exit 1
@@ -175,7 +205,6 @@ jobs:
   peer-interop:
     name: peer interop
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
         with:
@@ -222,25 +251,83 @@ jobs:
       - name: aiomoqt sub_bench against moq-rs relay (clock track)
         timeout-minutes: 3
         run: |
-          timeout 12 python -m aiomoqt.examples.sub_bench \
-            -n clock --trackname now --draft 18,16,14 -k -t 8 \
+          timeout 12 python -m aiomoqt.tools.sub_bench \
+            -N clock -T now --draft 18,16,14 -k -t 8 \
             https://localhost:4443 \
             > /tmp/sub.log 2>&1 || true
           echo === sub.log ===
           tail -25 /tmp/sub.log
           echo === relay.log ===
           tail -10 /tmp/relay.log
-          # Require at least 5 clock objects (1 Hz publish rate).
-          grep -E "Objects: *[0-9]+" /tmp/sub.log | tail -1 \
+          # Require at least 5 clock objects (1 Hz publish rate). A
+          # missing Objects line means the session never established —
+          # that is a hard FAIL, not a vacuous pass.
+          line=$(grep -E "Objects: *[0-9]+" /tmp/sub.log | tail -1)
+          if [ -z "$line" ]; then
+            echo "FAIL: no Objects line — session never established"
+            exit 1
+          fi
+          echo "$line" \
             | awk '{n=$2+0; if (n < 5) {print "FAIL: only " n " clock objs"; exit 1} else {print "OK: " n " clock objs"}}'
       - name: Cleanup
         if: always()
         run: |
           pkill -f moq-relay-ietf 2>/dev/null || true
           pkill -f moq-clock-ietf 2>/dev/null || true
+      - name: Start moqx relay (gold standard, published image)
+        run: |
+          cp certs/key.pem certs/priv.key
+          docker run -d --name moqx -p 4453:4453/udp \
+            -e MOQX_PORT=4453 -e MOQX_BIND_ADDR=0.0.0.0 \
+            -e MOQX_CERT=/certs/cert.pem -e MOQX_KEY=/certs/priv.key \
+            -e MOQX_ENDPOINT=/ \
+            -v "$PWD/certs:/certs:ro" \
+            ghcr.io/openmoq/moqx:latest
+          # Probe /proc/net/udp for hex port 0x1165 (= 4453) — the slim
+          # image has no ss/netstat.
+          for i in $(seq 1 30); do
+            sleep 1
+            if docker exec moqx sh -c \
+                'grep -qi :1165 /proc/net/udp /proc/net/udp6 2>/dev/null'; then
+              echo "moqx up after ${i}s"; break
+            fi
+          done
+      - name: aiomoqt pub/sub through moqx (WT + raw QUIC)
+        timeout-minutes: 4
+        run: |
+          fail=0
+          for mode in wt quic; do
+            if [ "$mode" = wt ]; then url="https://localhost:4453/"
+            else url="moqt://localhost:4453"; fi
+            python -m aiomoqt.tools.pub_bench "$url" \
+              -N "ci-$mode" -T t -s 256 -t 10 -k \
+              > "/tmp/pub-$mode.log" 2>&1 &
+            pub=$!
+            sleep 2
+            timeout 15 python -m aiomoqt.tools.sub_bench "$url" \
+              -N "ci-$mode" -T t -k -t 8 \
+              > "/tmp/sub-$mode.log" 2>&1 || true
+            wait $pub || true
+            echo "=== sub-$mode.log ==="; tail -15 "/tmp/sub-$mode.log"
+            line=$(grep -E "Objects: *[0-9]+" "/tmp/sub-$mode.log" | tail -1)
+            if [ -z "$line" ]; then
+              echo "FAIL($mode): no Objects line — session never established"
+              echo "=== pub-$mode.log ==="; tail -20 "/tmp/pub-$mode.log"
+              docker logs moqx 2>&1 | tail -20
+              fail=1
+            else
+              echo "$line" | awk -v m="$mode" \
+                '{n=$2+0; if (n < 50) {print "FAIL("m"): only " n " objs"; exit 1}
+                  else {print "OK("m"): " n " objs"}}' || fail=1
+            fi
+          done
+          exit $fail
+      - name: Cleanup moqx
+        if: always()
+        run: docker rm -f moqx 2>/dev/null || true
 
-  benchmark:
-    name: benchmark
+  microbenchmark:
+    name: microbenchmark
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
@@ -248,11 +335,27 @@ jobs:
         with:
           fetch-depth: 0
       - uses: ./.github/actions/setup-aiomoqt
-      - name: Run parser microbench
-        timeout-minutes: 5
+      - name: Run codec microbenches (d14/d16/d18)
+        timeout-minutes: 10
         run: |
-          # b1_parser is parser-only, no transport; reliable on
-          # hosted runners. Floor enforcement deferred until we have
-          # a few runs to calibrate runner noise.
-          python -m aiomoqt.tests.microbench.b1_parser \
-            --duration 3 || true
+          # Codec-only, no transport — the subset that is reliable on
+          # hosted runners. Each sweeps all three drafts. Floor
+          # enforcement deferred until enough runs to calibrate noise.
+          # A draft list is the cross-draft sweep; a single value would
+          # report that draft alone.
+          {
+            python -m aiomoqt.tests.microbench.b1_parser \
+              --draft 14,16,18 --duration 3 || true
+            python -m aiomoqt.tests.microbench.b7_framer \
+              --draft 14,16,18 --duration 3 || true
+            python -m aiomoqt.tests.microbench.b8_control_roundtrip \
+              --duration 2 || true
+          } | tee /tmp/microbench.txt
+          {
+            echo "### Codec microbenches — d14/d16/d18"
+            echo "\`${GITHUB_SHA:0:8}\` on \`${RUNNER_OS}\`. Hosted-runner"
+            echo "numbers are noisy; read the ratio columns, not absolutes."
+            echo '```'
+            cat /tmp/microbench.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

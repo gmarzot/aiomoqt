@@ -206,10 +206,12 @@ class FetchOk(MOQTMessage):
             payload.push_vint(self.largest_group_id)
             payload.push_vint(self.largest_object_id)
             params = dict(self.parameters)
-            if self.group_order is not None:
+            # §10.2.8: GROUP_ORDER may appear in SUBSCRIBE, PUBLISH_OK
+            # or FETCH — not FETCH_OK; a d18 peer MUST close on it.
+            if self.group_order is not None and prof.draft < 18:
                 params[ParamType.GROUP_ORDER] = self.group_order
             MOQTMessage._serialize_params(payload, params, prof=prof)
-            MOQTMessage._extensions_encode(payload, self.track_extensions or {}, with_length=False)
+            MOQTMessage._extensions_encode(payload, self.track_extensions or {}, with_length=False, delta=True)
         else:
             # d14: group_order as fixed field
             payload.push_uint8(self.group_order)
@@ -239,7 +241,7 @@ class FetchOk(MOQTMessage):
             params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
             group_order = params.pop(ParamType.GROUP_ORDER, GroupOrder.DESCENDING)
             track_extensions = MOQTMessage._extensions_decode(
-                buf, with_length=False, buf_end=buf_end)
+                buf, with_length=False, buf_end=buf_end, delta=True)
         else:
             group_order = buf.pull_uint8()
             end_of_track = buf.pull_uint8()

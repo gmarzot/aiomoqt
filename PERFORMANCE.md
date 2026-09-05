@@ -15,25 +15,23 @@ transport-layer baselines and runtime tuning (jemalloc, GSO) in
 | `loopback_bench` | single process, no relay | canonical stack benchmark — pub and sub share one event loop |
 | `pub_server` + `sub_bench` | two processes, no relay | per-side CPU isolation; each side gets its own core(s) |
 | `pub_bench` / `sub_bench` | through a relay | end-to-end relay path; relay capacity is usually the wall |
-| `relay_bench` | one process, through a relay | combined pub+sub convenience wrapper |
-| `multi_sub_bench` | 1 pub, N subs, one process | fanout capacity |
 | `adaptive_bench` | loopback or relay | rate ramp until latency/buffer growth degrades |
 
 ```bash
 # Single-process loopback (no relay; -q = raw QUIC, default WT)
-python -m aiomoqt.examples.loopback_bench -P 8 -s 4096 -g 200 -t 30 -q
+python -m aiomoqt.tools.loopback_bench -P 8 -s 4096 -g 200 -t 30 -q
 
 # Two-process (shell 1 publisher, shell 2 subscriber). The publisher
 # serves WT at "/" (raw QUIC with -q has no path); the subscriber needs
 # -k for the self-signed loopback cert. -t goes on the subscriber here
 # (pub_server runs until Ctrl-C). Omit --trackname to exercise track-
 # name discovery; -n must match the server's namespace.
-python -m aiomoqt.examples.pub_server -P 8 -s 4096 -g 200 -r 35000 -n aiomoqt
-python -m aiomoqt.examples.sub_bench https://localhost:4434/ -n aiomoqt --draft 16 -k -t 30 -i 5
+python -m aiomoqt.tools.pub_server -P 8 -s 4096 -g 200 -r 35000 -n aiomoqt
+python -m aiomoqt.tools.sub_bench https://localhost:4434/ -n aiomoqt --draft 16 -k -t 30 -i 5
 
 # Through a relay
-python -m aiomoqt.examples.pub_bench moqt://relay.ex.com -s 4096 -P 4 -r 8000 -t 30
-python -m aiomoqt.examples.sub_bench moqt://relay.ex.com -i 5
+python -m aiomoqt.tools.pub_bench moqt://relay.ex.com -s 4096 -P 4 -r 8000 -t 30
+python -m aiomoqt.tools.sub_bench moqt://relay.ex.com -i 5
 ```
 
 Convention: set `-t` on the publisher only; the subscriber exits on the
@@ -50,7 +48,6 @@ track's natural close.
 | `-t, --duration` | Duration seconds (publisher side) | tool-specific |
 | `-i, --interval` | Report interval seconds | 5 |
 | `-q, --quic` | Raw QUIC (URL tools: override for https:// URLs) | WT |
-| `-D, --datagram` | ObjectDatagrams instead of streams | off |
 | `--cc-algo` | Congestion control (bbr1, bbr, cubic, newreno, ...) | aiopquic default |
 | `--draft` | MoQT draft version | tool-specific |
 | `--max-queued-bytes` | Aggregate publisher TX budget, all streams | aiopquic default |

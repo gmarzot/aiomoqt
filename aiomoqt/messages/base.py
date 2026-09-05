@@ -4,7 +4,7 @@ from dataclasses import dataclass, field, fields
 
 from . import ParamType, SetupParamType, AuthTokenAliasType, AuthTokenType
 from ..context import DraftProfile
-from ..types import MOQTProtocolViolation
+from ..types import D18_PARAM_KINDS, MOQTProtocolViolation
 from ..utils.buffer import Buffer, BufferReadError
 from ..utils.logger import *
 
@@ -36,26 +36,38 @@ class MOQTMessage:
 
     @staticmethod
     def _extensions_encode(buf: Buffer, exts: Dict,
-                           with_length: bool = True) -> None:
-        # The extensions/properties wire form (length-prefixed KVP
-        # block) is identical across every supported draft, so this
-        # codec is version-agnostic: no draft argument and no per-object
-        # version lookup on the hot path.
+                           with_length: bool = True,
+                           delta: bool = False) -> None:
+        # The KVP block SHAPE is draft-independent, but the varint
+        # FLAVOR is not: d18 encodes varints as vi64. Follow the target
+        # buffer's flavor via push_vint rather than hardcoding the
+        # standard encoder — mixing vi64 header fields with
+        # standard-varint extensions produces a frame the peer rejects
+        # (moxygen closes the session with PROTOCOL_VIOLATION).
+        #
+        # delta: d16+ §1.4.2/§1.4.3 KVP Type field is a DELTA from the
+        # previous Type (0 for the first). Deltas are unsigned, so types
+        # are emitted in ascending order; even/odd (value form) is a
+        # property of the ABSOLUTE type. d14 keeps absolute types.
         if exts is None or len(exts) == 0:
             if with_length:
-                buf.push_uint_var(0)
+                buf.push_vint(0)
             return
 
-        payload = Buffer(capacity=BUF_SIZE)
-        for ext_id, ext_value in exts.items():
-            payload.push_uint_var(ext_id)
+        payload = Buffer(capacity=BUF_SIZE, vi64=buf.vi64)
+        prev = 0
+        for ext_id, ext_value in (sorted(exts.items()) if delta
+                                  else exts.items()):
+            payload.push_vint(ext_id - prev if delta else ext_id)
+            if delta:
+                prev = ext_id
             if ext_id % 2 == 0:  # even extension types are simple var int
-                payload.push_uint_var(ext_value)
+                payload.push_vint(ext_value)
             else:
                 if isinstance(ext_value, str):
                     ext_value = ext_value.encode()
                 assert isinstance(ext_value, bytes)
-                payload.push_uint_var(len(ext_value))
+                payload.push_vint(len(ext_value))
                 payload.push_bytes(ext_value)
 
         exts_len = payload.tell()
@@ -66,7 +78,7 @@ class MOQTMessage:
                 f"actual payload.data bytes={len(payload.data)}"
             )
         if with_length:
-            buf.push_uint_var(exts_len)
+            buf.push_vint(exts_len)
         payload_bytes_before = buf.tell()
         buf.push_bytes(payload.data)
         actual_pushed = buf.tell() - payload_bytes_before
@@ -89,10 +101,12 @@ class MOQTMessage:
     # parsed dict is returned so the rest of the message dispatches.
     _tolerate_trailing_extensions = False
     _trailing_extensions_truncation_count = 0
+    _prefixed_location_count = 0
 
     @staticmethod
     def _extensions_decode(buf: Buffer, with_length: bool = True,
-                           buf_end: Optional[int] = None) -> Optional[Dict[int, Union[int, bytes]]]:
+                           buf_end: Optional[int] = None,
+                           delta: bool = False) -> Optional[Dict[int, Union[int, bytes]]]:
         # Two framing modes:
         #   with_length=True  — Object Extensions (§10.2.1.2): the
         #     extensions block is `{ Length, Headers }`. Bound is
@@ -106,7 +120,7 @@ class MOQTMessage:
         #     data reads uninitialized heap.
         if with_length:
             pos_before = buf.tell()
-            exts_len = buf.pull_uint_var()
+            exts_len = buf.pull_vint()
             if exts_len > MOQTMessage.EXTENSIONS_LEN_LIMIT:
                 # Framer has lost alignment: this varint is being read
                 # from a position that doesn't actually point at an
@@ -149,10 +163,12 @@ class MOQTMessage:
                 return None
 
         exts = {}
+        prev = 0
         while buf.tell() < exts_end:
             kvp_start = buf.tell()
-            # BufferReadError (aliased as MOQTUnderflow) means the
-            # underlying buffer ran out mid-pull. For data streams
+            # A short read here (BufferReadError from Buffer,
+            # StreamUnderflow/MOQTUnderflow from StreamChain — distinct
+            # classes) means the source ran out mid-pull. For data streams
             # (with_length=True) the caller's re-buffering path uses
             # this to wait for more data, so let it propagate.
             # For control messages (with_length=False) the buffer is
@@ -163,15 +179,20 @@ class MOQTMessage:
             # lets the dispatcher process the message body (which we
             # already finished parsing) without a noisy traceback.
             try:
-                ext_id = buf.pull_uint_var()
+                ext_id = buf.pull_vint()
+                if delta:
+                    # d16+ §1.4.2: Type is a delta from the previous
+                    # absolute Type; value form follows the ABSOLUTE.
+                    ext_id += prev
+                    prev = ext_id
                 if ext_id % 2 == 0:
                     # even type → varint value (self-bounded by varint prefix)
-                    ext_value = buf.pull_uint_var()
+                    ext_value = buf.pull_vint()
                 else:
                     # odd type → length-prefixed bytes value
-                    value_len = buf.pull_uint_var()
+                    value_len = buf.pull_vint()
                     ext_value = buf.pull_bytes(value_len)
-            except BufferReadError:
+            except (BufferReadError, MOQTUnderflow):
                 if with_length:
                     raise
                 # Trailing extensions block on a control message is
@@ -426,10 +447,38 @@ class MOQTMessage:
             else:
                 payload.push_vint(param_type)  # Type
 
-            if param_type in prof.location_params:
-                # Inline Location value: group + object varints, no length
-                # prefix (d18 LARGEST_OBJECT 0x09). Value is a (group, object)
-                # tuple.
+            if prof.draft >= 18:
+                # d18 §10.2: the Value encoding comes from each
+                # parameter's definition (§15.7), not the §1.4.3
+                # odd/even rule. Unknown params cannot exist on TX.
+                kind = D18_PARAM_KINDS.get(param_type)
+                if kind is None:
+                    raise ValueError(
+                        f"param 0x{param_type:x} is not a d18 message "
+                        f"parameter (§15.7)")
+                if kind == "location":
+                    loc_group, loc_object = param_value
+                    payload.push_vint(loc_group)
+                    payload.push_vint(loc_object)
+                elif kind == "uint8":
+                    payload.push_uint8(int(param_value))
+                elif kind == "varint":
+                    payload.push_vint(int(param_value))
+                elif kind == "tuple":
+                    payload.push_vint(len(param_value))
+                    for fld in param_value:
+                        fld = fld.encode() if isinstance(fld, str) else fld
+                        payload.push_vint(len(fld))
+                        payload.push_bytes(bytes(fld))
+                else:  # length-prefixed bytes
+                    val = (param_value.encode()
+                           if isinstance(param_value, str) else param_value)
+                    if param_type in (ParamType.AUTH_TOKEN,
+                                      SetupParamType.AUTH_TOKEN):
+                        val = MOQTMessage._auth_token_wrap(bytes(val), prof)
+                    payload.push_vint(len(val))
+                    payload.push_bytes(bytes(val))
+            elif param_type in prof.location_params:
                 loc_group, loc_object = param_value
                 payload.push_vint(loc_group)
                 payload.push_vint(loc_object)
@@ -447,22 +496,134 @@ class MOQTMessage:
                     token_buf.push_vint(AuthTokenType.OUT_OF_BAND)  # Token Type
                     token_buf.push_bytes(param_value)  # Token Value (rest of param)
                     param_value = token_buf.data_slice(0, token_buf.tell())
-                    logger.info(f"Serializing AUTH_TOKEN param as Token(USE_VALUE): {len(param_value)} bytes")
 
-                logger.info(f"Serializing param {param_type} length {len(param_value)}")
                 payload.push_vint(len(param_value))  # Length
                 payload.push_bytes(param_value)  # Value
             else:  # Even type - Value is varint (no Length field)
                 if not isinstance(param_value, int):
                     raise TypeError(f"Param {param_type} expects uint, got {type(param_value)}")
-                logger.info(f"Serializing param {param_type} value {param_value}")
                 if param_type in prof.uint8_params:
                     payload.push_uint8(param_value)  # d18 fixed uint8 width
                 else:
                     payload.push_vint(param_value)  # Value as varint
 
-        logger.info(f"Serialized {len(parameters)} parameters: {payload.data_slice(0,12)}")
 
+
+    @staticmethod
+    def _note_prefixed_location(param_type: int) -> None:
+        """Record a Location parameter received WITH a Length prefix.
+
+        §10.2 defines Location as two bare varints; a Length prefix is a
+        peer deviation (seen from cloudflare, 2026-09). Accepted on
+        receive; logged once so the peer is visible rather than silently
+        tolerated.
+        """
+        MOQTMessage._prefixed_location_count += 1
+        if MOQTMessage._prefixed_location_count == 1:
+            logger.warning(
+                f"peer writes param 0x{param_type:x} Location with a "
+                f"Length prefix; §10.2 defines two bare varints — "
+                f"accepting (further occurrences at debug)")
+        else:
+            logger.debug(f"Length-prefixed Location param 0x{param_type:x}")
+
+    @staticmethod
+    def _pull_location_param(buf: Buffer, *, prof: DraftProfile,
+                             buf_end: Optional[int], remaining: int,
+                             prev_key: int, delta_keys: bool) -> tuple:
+        """Pull a Location parameter value (d18 LARGEST_OBJECT 0x09).
+
+        Conformant form (§10.2): two bare varints. Deviant peer form:
+        Length-prefixed. The forms can collide byte-wise, so when both
+        read cleanly the winner is the one whose suffix — the remaining
+        parameters, then the trailing Properties block to buf_end —
+        still parses. Ties prefer the conformant inline form.
+        """
+        probe = buf.tell()
+        inline = prefixed = None
+        try:
+            loc_group = buf.pull_vint()
+            loc_object = buf.pull_vint()
+            if buf_end is None or buf.tell() <= buf_end:
+                inline = ((loc_group, loc_object), buf.tell())
+        except Exception:
+            pass
+        buf.seek(probe)
+        try:
+            param_len = buf.pull_vint()
+            loc_end = buf.tell() + param_len
+            if param_len and (buf_end is None or loc_end <= buf_end):
+                loc_group = buf.pull_vint()
+                loc_object = buf.pull_vint()
+                if buf.tell() == loc_end:
+                    prefixed = ((loc_group, loc_object), loc_end)
+        except Exception:
+            pass
+
+        if inline and prefixed and buf_end is not None \
+                and inline[1] != prefixed[1]:
+            args = dict(prof=prof, buf_end=buf_end, remaining=remaining,
+                        prev_key=prev_key, delta_keys=delta_keys)
+            if not MOQTMessage._suffix_parses(buf, inline[1], **args) \
+                    and MOQTMessage._suffix_parses(buf, prefixed[1], **args):
+                inline = None
+        pick = inline or prefixed
+        if pick is None:
+            raise MOQTProtocolViolation("Location parameter unreadable")
+        if pick is prefixed and inline is None:
+            MOQTMessage._note_prefixed_location(0x09)
+        value, pos = pick
+        buf.seek(pos)
+        return value
+
+    @staticmethod
+    def _suffix_parses(buf: Buffer, start: int, *, prof: DraftProfile,
+                       buf_end: int, remaining: int, prev_key: int,
+                       delta_keys: bool) -> bool:
+        """True when the bytes from `start` form a valid message suffix:
+        `remaining` more parameters, then a Key-Value-Pair run ending
+        exactly at buf_end (the d18 messages that carry a Location
+        parameter all end with a Properties block). Position-preserving."""
+        save = buf.tell()
+        try:
+            buf.seek(start)
+            pk = prev_key
+            for _ in range(remaining):
+                raw = buf.pull_vint()
+                ptype = pk + raw if delta_keys else raw
+                if delta_keys:
+                    pk = ptype
+                if ptype in prof.location_params:
+                    buf.pull_vint()
+                    buf.pull_vint()
+                elif ptype % 2 == 1:
+                    plen = buf.pull_vint()
+                    if buf.tell() + plen > buf_end:
+                        return False
+                    buf.seek(buf.tell() + plen)
+                elif ptype in prof.uint8_params:
+                    buf.pull_uint8()
+                else:
+                    buf.pull_vint()
+                if buf.tell() > buf_end:
+                    return False
+            kk = 0
+            while buf.tell() < buf_end:
+                kk = kk + buf.pull_vint()
+                if kk % 2 == 1:
+                    vlen = buf.pull_vint()
+                    if buf.tell() + vlen > buf_end:
+                        return False
+                    buf.seek(buf.tell() + vlen)
+                else:
+                    buf.pull_vint()
+                if buf.tell() > buf_end:
+                    return False
+            return buf.tell() == buf_end
+        except Exception:
+            return False
+        finally:
+            buf.seek(save)
 
     @staticmethod
     def _deserialize_params(buf: Buffer, *, prof: DraftProfile,
@@ -489,7 +650,7 @@ class MOQTMessage:
         param_count = buf.pull_vint()
         prev_key = 0
 
-        for _ in range(param_count):
+        for param_index in range(param_count):
             if buf_end is not None and buf.tell() >= buf_end:
                 raise MOQTProtocolViolation(
                     f"parameters declared {param_count} but buffer "
@@ -501,13 +662,61 @@ class MOQTMessage:
             else:
                 param_type = raw_key
 
-            if param_type in prof.location_params:
-                # Inline Location value: group + object varints, no length
-                # prefix (d18 LARGEST_OBJECT 0x09). Read both regardless of
-                # the odd/even rule; stored as a (group, object) tuple.
-                loc_group = buf.pull_vint()
-                loc_object = buf.pull_vint()
-                param_value = (loc_group, loc_object)
+            if prof.draft >= 18:
+                # d18 §10.2: per-definition Value encodings; an unknown
+                # parameter cannot be skipped (count-bounded block) and
+                # MUST close the session. §14 reserves no grease here.
+                kind = D18_PARAM_KINDS.get(param_type)
+                if kind is None:
+                    raise MOQTProtocolViolation(
+                        f"unknown message parameter 0x{param_type:x} "
+                        f"(§10.2: cannot be skipped)")
+                if kind == "location":
+                    param_value = MOQTMessage._pull_location_param(
+                        buf, prof=prof, buf_end=buf_end,
+                        remaining=param_count - param_index - 1,
+                        prev_key=prev_key, delta_keys=delta_keys)
+                elif kind == "uint8":
+                    param_value = buf.pull_uint8()
+                elif kind == "varint":
+                    param_value = buf.pull_vint()
+                elif kind == "tuple":
+                    nfields = buf.pull_vint()
+                    if nfields > 32:
+                        raise MOQTProtocolViolation(
+                            f"namespace prefix has {nfields} fields "
+                            f"(max 32)")
+                    fields = []
+                    for _ in range(nfields):
+                        flen = buf.pull_vint()
+                        if buf_end is not None and \
+                                buf.tell() + flen > buf_end:
+                            raise MOQTProtocolViolation(
+                                "namespace field overruns frame")
+                        fields.append(buf.pull_bytes(flen))
+                    param_value = tuple(fields)
+                else:  # length-prefixed bytes
+                    param_len = buf.pull_vint()
+                    if param_len > 65535:
+                        raise MOQTProtocolViolation(
+                            "parameter length exceeds maximum of "
+                            "65535 bytes")
+                    if buf_end is not None and \
+                            buf.tell() + param_len > buf_end:
+                        raise MOQTProtocolViolation(
+                            f"parameter length {param_len} exceeds "
+                            f"remaining {buf_end - buf.tell()}")
+                    param_value = buf.pull_bytes(param_len)
+                    if param_type in (ParamType.AUTH_TOKEN,
+                                      SetupParamType.AUTH_TOKEN) \
+                            and param_len:
+                        param_value = MOQTMessage._auth_token_unwrap(
+                            param_value, prof)
+            elif param_type in prof.location_params:
+                param_value = MOQTMessage._pull_location_param(
+                    buf, prof=prof, buf_end=buf_end,
+                    remaining=param_count - param_index - 1,
+                    prev_key=prev_key, delta_keys=delta_keys)
             elif param_type % 2 == 1:  # Odd type - includes Length field
                 param_len = buf.pull_vint()
                 if param_len > 65535:  # 2^16-1 maximum
@@ -517,7 +726,6 @@ class MOQTMessage:
                     raise MOQTProtocolViolation(
                         f"parameter length {param_len} exceeds remaining "
                         f"{buf_end - buf.tell()}")
-                logger.info(f"deserializing param {param_type} length {param_len}")
                 param_value = buf.pull_bytes(param_len)
 
                 # AUTH_TOKEN: unwrap Token structure (Section 9.2.1.1)
@@ -534,7 +742,6 @@ class MOQTMessage:
                         token_alias = token_buf.pull_vint()
                         token_type = token_buf.pull_vint()
                         param_value = token_buf.pull_bytes(param_len - token_buf.tell())
-                    logger.info(f"AUTH_TOKEN: alias_type={alias_type} value={len(param_value)} bytes")
             else:  # Even type - Value is varint
                 if param_type in prof.uint8_params:
                     param_value = buf.pull_uint8()  # d18 fixed uint8 width

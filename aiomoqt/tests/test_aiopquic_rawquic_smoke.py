@@ -17,7 +17,7 @@ from aiomoqt.types import (
     MOQT_VERSION_DRAFT16,
 )
 from aiomoqt.messages import Subscribe
-from aiomoqt.messages.track import SubgroupHeader
+from aiomoqt.messages.data import SubgroupHeader
 from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
 
@@ -126,7 +126,13 @@ async def test_aiopquic_rawquic_pubsub_one_subgroup():
                 track_name="track",
                 wait_response=True,
             )
-            await asyncio.sleep(1.0)
+            for _ in range(250):
+                if len(received) >= num_objects:
+                    break
+                await asyncio.sleep(0.02)
+            # Brief settle so a buggy publisher sending EXTRA objects
+            # still trips the exact-count assert below.
+            await asyncio.sleep(0.05)
 
         assert len(received) == num_objects, \
             f"Expected {num_objects} objects, got {len(received)}"

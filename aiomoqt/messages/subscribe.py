@@ -55,13 +55,23 @@ class TrackStatus(MOQTMessage):
             if self.forward is not None:
                 params[ParamType.FORWARD] = self.forward
             if self.filter_type is not None:
-                fbuf = Buffer(capacity=64)
-                fbuf.push_uint_var(self.filter_type)
+                # Filter internals follow the negotiated varint codec
+                # (vi64 on d18); d18 carries End Group as a delta from
+                # Start Group (moxygen MoQFramer: end - start, >= 0).
+                fbuf = Buffer(capacity=64, vi64=prof.vi64)
+                fbuf.push_vint(self.filter_type)
                 if self.filter_type in (3, 4):
-                    fbuf.push_uint_var(self.start_group or 0)
-                    fbuf.push_uint_var(self.start_object or 0)
+                    fbuf.push_vint(self.start_group or 0)
+                    fbuf.push_vint(self.start_object or 0)
                 if self.filter_type == 4:
-                    fbuf.push_uint_var(self.end_group or 0)
+                    end = self.end_group or 0
+                    if prof.vi64:
+                        start = self.start_group or 0
+                        if end < start:
+                            raise ValueError(
+                                f"end_group {end} < start_group {start}")
+                        end -= start
+                    fbuf.push_vint(end)
                 params[ParamType.SUBSCRIPTION_FILTER] = fbuf.data_slice(0, fbuf.tell())
             MOQTMessage._serialize_params(payload, params, prof=prof)
         else:
@@ -107,18 +117,30 @@ class TrackStatus(MOQTMessage):
             forward = params.pop(ParamType.FORWARD, None)
             filter_raw = params.pop(ParamType.SUBSCRIPTION_FILTER, None)
             if filter_raw is not None:
-                fbuf = Buffer(data=filter_raw)
+                fbuf = Buffer(data=filter_raw, vi64=prof.vi64)
                 filter_type = fbuf.pull_vint()
+                if filter_type not in (1, 2, 3, 4):
+                    # §5.1.2: filter types are 0x1-0x4; any other value
+                    # MUST close the session with PROTOCOL_VIOLATION.
+                    raise MOQTProtocolViolation(
+                        f"unknown subscription filter type "
+                        f"0x{filter_type:x}")
                 if filter_type in (3, 4):
                     start_group = fbuf.pull_vint()
                     start_object = fbuf.pull_vint()
                 if filter_type == 4:
                     end_group = fbuf.pull_vint()
+                    if prof.vi64:
+                        # d18: End Group arrives as a delta from Start.
+                        end_group += start_group or 0
         else:
             priority = buf.pull_uint8()
             group_order = buf.pull_uint8()
             forward = buf.pull_uint8()
             filter_type = buf.pull_vint()
+            if filter_type not in (1, 2, 3, 4):
+                raise MOQTProtocolViolation(
+                    f"unknown subscription filter type 0x{filter_type:x}")
             if filter_type in (3, 4):
                 start_group = buf.pull_vint()
                 start_object = buf.pull_vint()
@@ -298,13 +320,23 @@ class Subscribe(MOQTMessage):
             if self.filter_type is not None:
                 # SUBSCRIPTION_FILTER param (0x21) is odd → bytes value
                 # Encode: filter_type varint [+ start_group + start_obj [+ end_group]]
-                fbuf = Buffer(capacity=64)
-                fbuf.push_uint_var(self.filter_type)
+                # Filter internals follow the negotiated varint codec
+                # (vi64 on d18); d18 carries End Group as a delta from
+                # Start Group (moxygen MoQFramer: end - start, >= 0).
+                fbuf = Buffer(capacity=64, vi64=prof.vi64)
+                fbuf.push_vint(self.filter_type)
                 if self.filter_type in (3, 4):
-                    fbuf.push_uint_var(self.start_group or 0)
-                    fbuf.push_uint_var(self.start_object or 0)
+                    fbuf.push_vint(self.start_group or 0)
+                    fbuf.push_vint(self.start_object or 0)
                 if self.filter_type == 4:
-                    fbuf.push_uint_var(self.end_group or 0)
+                    end = self.end_group or 0
+                    if prof.vi64:
+                        start = self.start_group or 0
+                        if end < start:
+                            raise ValueError(
+                                f"end_group {end} < start_group {start}")
+                        end -= start
+                    fbuf.push_vint(end)
                 params[ParamType.SUBSCRIPTION_FILTER] = fbuf.data_slice(0, fbuf.tell())
             MOQTMessage._serialize_params(payload, params, prof=prof)
         else:
@@ -361,20 +393,31 @@ class Subscribe(MOQTMessage):
             forward = params.pop(ParamType.FORWARD, None)
             filter_raw = params.pop(ParamType.SUBSCRIPTION_FILTER, None)
             if filter_raw is not None:
-                fbuf = Buffer(data=filter_raw)
+                fbuf = Buffer(data=filter_raw, vi64=prof.vi64)
                 filter_type = fbuf.pull_vint()
+                if filter_type not in (1, 2, 3, 4):
+                    # §5.1.2: filter types are 0x1-0x4; any other value
+                    # MUST close the session with PROTOCOL_VIOLATION.
+                    raise MOQTProtocolViolation(
+                        f"unknown subscription filter type "
+                        f"0x{filter_type:x}")
                 if filter_type in (3, 4):
                     start_group = fbuf.pull_vint()
                     start_object = fbuf.pull_vint()
                 if filter_type == 4:
                     end_group = fbuf.pull_vint()
+                    if prof.vi64:
+                        # d18: End Group arrives as a delta from Start.
+                        end_group += start_group or 0
         else:
             # d14: fixed fields on wire
             priority = buf.pull_uint8()
             group_order = buf.pull_uint8()
             forward = buf.pull_uint8()
             filter_type = buf.pull_vint()
-
+            if filter_type not in (1, 2, 3, 4):
+                raise MOQTProtocolViolation(
+                    f"unknown subscription filter type 0x{filter_type:x}")
             if filter_type in (3, 4):
                 start_group = buf.pull_vint()
                 start_object = buf.pull_vint()
@@ -453,7 +496,7 @@ class SubscribeOk(MOQTMessage):
             exts = dict(self.track_extensions or {})
             if self.group_order is not None:
                 exts[0x22] = self.group_order  # DEFAULT_PUBLISHER_GROUP_ORDER
-            MOQTMessage._extensions_encode(payload, exts, with_length=False)
+            MOQTMessage._extensions_encode(payload, exts, with_length=False, delta=True)
         else:
             # d14: fixed fields
             payload.push_vint(self.expires)
@@ -503,7 +546,7 @@ class SubscribeOk(MOQTMessage):
             else:
                 content_exists = ContentExistsCode.NO_CONTENT
             track_extensions = MOQTMessage._extensions_decode(
-                buf, with_length=False, buf_end=buf_end)
+                buf, with_length=False, buf_end=buf_end, delta=True)
             if track_extensions is not None:
                 group_order_val = track_extensions.pop(0x22, None)
                 if group_order_val is not None:
@@ -659,6 +702,11 @@ class SubscribeDone(MOQTMessage):
     stream_count: int = None
     reason: str = None
 
+    # d18 §15.10.3 swapped two codes relative to d16: on the d18 wire
+    # TOO_FAR_BEHIND=0x5 and EXPIRED=0x6. Canonical enum keeps the d16
+    # values; the swap (its own inverse) is applied at the wire.
+    _D18_WIRE_SWAP = {0x05: 0x06, 0x06: 0x05}
+
     def __post_init__(self):
         self.type = MOQTMessageType.PUBLISH_DONE
 
@@ -669,7 +717,10 @@ class SubscribeDone(MOQTMessage):
         # d18 replies omit the Request ID (demuxed by request stream, §10.1).
         if prof.reply_has_request_id:
             payload.push_vint(self.request_id)
-        payload.push_vint(self.status_code.value if isinstance(self.status_code, SubscribeDoneCode) else self.status_code)
+        code = int(self.status_code)
+        if prof.draft >= 18:
+            code = self._D18_WIRE_SWAP.get(code, code)
+        payload.push_vint(code)
         payload.push_vint(self.stream_count)
         
         reason_bytes = self.reason.encode()
@@ -688,6 +739,8 @@ class SubscribeDone(MOQTMessage):
         request_id = (buf.pull_vint()
                       if prof.reply_has_request_id else None)
         status_code = buf.pull_vint()
+        if prof.draft >= 18:
+            status_code = cls._D18_WIRE_SWAP.get(status_code, status_code)
         stream_count = buf.pull_vint()
         reason_len = buf.pull_vint()
         reason = buf.pull_bytes(reason_len).decode()

@@ -74,7 +74,7 @@ class Publish(MOQTMessage):
             exts = dict(self.track_extensions or {})
             if self.group_order is not None:
                 exts[0x22] = self.group_order
-            MOQTMessage._extensions_encode(payload, exts, with_length=False)
+            MOQTMessage._extensions_encode(payload, exts, with_length=False, delta=True)
         else:
             # d14: fixed fields
             payload.push_uint8(self.group_order)
@@ -128,7 +128,7 @@ class Publish(MOQTMessage):
             else:
                 content_exists = ContentExistsCode.NO_CONTENT
             track_extensions = MOQTMessage._extensions_decode(
-                buf, with_length=False, buf_end=buf_end)
+                buf, with_length=False, buf_end=buf_end, delta=True)
             if track_extensions is not None:
                 go_val = track_extensions.pop(0x22, None)
                 if go_val is not None:
@@ -199,13 +199,23 @@ class PublishOk(MOQTMessage):
             if self.group_order is not None:
                 params[ParamType.GROUP_ORDER] = self.group_order
             if self.filter_type is not None:
-                fbuf = Buffer(capacity=64)
-                fbuf.push_uint_var(self.filter_type)
+                # Filter internals follow the negotiated varint codec
+                # (vi64 on d18); d18 carries End Group as a delta from
+                # Start Group.
+                fbuf = Buffer(capacity=64, vi64=prof.vi64)
+                fbuf.push_vint(self.filter_type)
                 if self.filter_type in (3, 4):
-                    fbuf.push_uint_var(self.start_group or 0)
-                    fbuf.push_uint_var(self.start_object or 0)
+                    fbuf.push_vint(self.start_group or 0)
+                    fbuf.push_vint(self.start_object or 0)
                 if self.filter_type == 4:
-                    fbuf.push_uint_var(self.end_group or 0)
+                    end = self.end_group or 0
+                    if prof.vi64:
+                        start = self.start_group or 0
+                        if end < start:
+                            raise ValueError(
+                                f"end_group {end} < start_group {start}")
+                        end -= start
+                    fbuf.push_vint(end)
                 params[ParamType.SUBSCRIPTION_FILTER] = fbuf.data_slice(0, fbuf.tell())
             MOQTMessage._serialize_params(payload, params, prof=prof)
         else:
@@ -221,7 +231,13 @@ class PublishOk(MOQTMessage):
                 payload.push_vint(self.end_group or 0)
             MOQTMessage._serialize_params(payload, self.parameters or {}, prof=prof)
 
-        buf.push_uint_var(self.type)
+        # d14/d16 define a distinct PUBLISH_OK (0x1E, d16 §9.14). Only
+        # d18 answers a PUBLISH with the universal REQUEST_OK (0x07);
+        # "PUBLISH_OK" is then the shorthand for a REQUEST_OK sent in
+        # response to a PUBLISH (§10.5).
+        wire_type = (D16MessageType.REQUEST_OK
+                     if prof.draft >= 18 else self.type)
+        buf.push_uint_var(wire_type)
         buf.push_uint16(payload.tell())
         buf.push_bytes(payload.data_slice(0, payload.tell()))
         return buf
@@ -248,13 +264,22 @@ class PublishOk(MOQTMessage):
             group_order = params.pop(ParamType.GROUP_ORDER, None)
             filter_raw = params.pop(ParamType.SUBSCRIPTION_FILTER, None)
             if filter_raw is not None:
-                fbuf = Buffer(data=filter_raw)
+                fbuf = Buffer(data=filter_raw, vi64=prof.vi64)
                 filter_type = fbuf.pull_vint()
+                if filter_type not in (1, 2, 3, 4):
+                    # §5.1.2: filter types are 0x1-0x4; other values MUST
+                    # close the session with PROTOCOL_VIOLATION.
+                    raise MOQTProtocolViolation(
+                        f"unknown subscription filter type "
+                        f"0x{filter_type:x}")
                 if filter_type in (3, 4):
                     start_group = fbuf.pull_vint()
                     start_object = fbuf.pull_vint()
                 if filter_type == 4:
                     end_group = fbuf.pull_vint()
+                    if prof.vi64:
+                        # d18: End Group arrives as a delta from Start.
+                        end_group += start_group or 0
         else:
             forward = buf.pull_uint8()
             priority = buf.pull_uint8()

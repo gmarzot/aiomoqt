@@ -1,4 +1,5 @@
 from enum import IntEnum
+from typing import Dict, Tuple
 
 MOQT_VERSION_DRAFT14 = 0xff00000e
 MOQT_VERSION_DRAFT16 = 0xff000010
@@ -205,6 +206,48 @@ class D18MessageType:
     PUBLISH_BLOCKED = 0x0F      # new in d18 (d14 TRACK_STATUS_ERROR point)
 
 
+# Code points that denote the same logical message under different
+# numbers across drafts. register_handler() expands a registration to
+# every alias, so a handler registered by one draft's name also fires on
+# the others. Safe because a draft's CONTROL_REGISTRY holds only its own
+# number: the alias key is inert on drafts that don't use it.
+HANDLER_ALIASES: Dict[int, Tuple[int, ...]] = {
+    MOQTMessageType.SUBSCRIBE_NAMESPACE: (D18MessageType.SUBSCRIBE_NAMESPACE,),
+    D18MessageType.SUBSCRIBE_NAMESPACE: (MOQTMessageType.SUBSCRIBE_NAMESPACE,),
+}
+
+
+# Control message types each draft defines, transcribed from the message
+# type registry table in each specification (d14 §9.2, d16 §9.2, d18
+# §10.2). Sending a type absent from the negotiated draft's table is a
+# wire violation: the peer sees an unknown control message and closes the
+# session with PROTOCOL_VIOLATION.
+#
+# d18 removed every cancellation message — UNSUBSCRIBE (0xA),
+# PUBLISH_NAMESPACE_DONE (0x9), PUBLISH_NAMESPACE_CANCEL (0xC),
+# FETCH_CANCEL (0x17) — because requests own a bidirectional stream
+# there, and withdrawal is RESET_STREAM / STOP_SENDING on that stream.
+# It also dropped MAX_REQUEST_ID (0x15) and REQUESTS_BLOCKED (0x1A).
+# d18's NAMESPACE_DONE (0xE) is NOT the d16 message of the same name: it
+# answers a SUBSCRIBE_NAMESPACE and carries a namespace suffix.
+CONTROL_MESSAGE_TYPES: Dict[int, frozenset] = {
+    14: frozenset({
+        0x20, 0x21, 0x10, 0x15, 0x1A, 0x03, 0x04, 0x05, 0x02, 0x0A,
+        0x0B, 0x1D, 0x1E, 0x1F, 0x16, 0x18, 0x19, 0x17, 0x0D, 0x0E,
+        0x0F, 0x06, 0x07, 0x08, 0x09, 0x0C, 0x11, 0x12, 0x13, 0x14,
+    }),
+    16: frozenset({
+        0x20, 0x21, 0x10, 0x15, 0x1A, 0x07, 0x05, 0x03, 0x04, 0x02,
+        0x0A, 0x1D, 0x1E, 0x0B, 0x16, 0x18, 0x17, 0x0D, 0x06, 0x08,
+        0x09, 0x0E, 0x0C, 0x11,
+    }),
+    18: frozenset({
+        0x2F00, 0x10, 0x03, 0x04, 0x1D, 0x1E, 0x0B, 0x16, 0x18, 0x0D,
+        0x06, 0x50, 0x51, 0x08, 0x0E, 0x0F, 0x02, 0x07, 0x05,
+    }),
+}
+
+
 class ParamType(IntEnum):
     """Parameter types for MOQT messages."""
     DELIVERY_TIMEOUT = 0x02
@@ -314,7 +357,10 @@ class RequestErrorCode(IntEnum):
 
 
 class SubscribeDoneCode(IntEnum):
-    """SUBSCRIBE_DONE / PUBLISH_DONE status codes."""
+    """SUBSCRIBE_DONE / PUBLISH_DONE status codes.
+
+    Canonical values are d16's; d18 swapped EXPIRED/TOO_FAR_BEHIND on
+    the wire (§15.10.3) — the swap is applied in the codec."""
     INTERNAL_ERROR = 0x0
     UNAUTHORIZED = 0x01
     TRACK_ENDED = 0x02
@@ -322,8 +368,45 @@ class SubscribeDoneCode(IntEnum):
     GOING_AWAY = 0x04
     EXPIRED = 0x05
     TOO_FAR_BEHIND = 0x06
-    MALFORMED_TRACK = 0x07        # d14 value; d16 moves to 0x12
-    UPDATE_FAILED = 0x08          # d16 only
+    MALFORMED_TRACK = 0x12        # 0x07 at d14
+    UPDATE_FAILED = 0x08          # d16+
+    EXCESSIVE_LOAD = 0x09         # d18
+
+
+# d18 §15.7 Message Parameters: {Type Delta, Value} with the Value
+# encoding fixed by each parameter's definition (§10.2) — NOT the
+# §1.4.3 odd/even KVP rule. Unknown ⇒ close PROTOCOL_VIOLATION
+# (count-bounded block, cannot be skipped).
+D18_PARAM_KINDS: Dict[int, str] = {
+    0x02: "varint",    # OBJECT_DELIVERY_TIMEOUT
+    0x03: "bytes",     # AUTHORIZATION_TOKEN (length-prefixed Token)
+    0x04: "varint",    # RENDEZVOUS_TIMEOUT
+    0x06: "varint",    # SUBGROUP_DELIVERY_TIMEOUT
+    0x08: "varint",    # EXPIRES
+    0x09: "location",  # LARGEST_OBJECT
+    0x0A: "varint",    # FILL_TIMEOUT
+    0x10: "uint8",     # FORWARD
+    0x20: "uint8",     # SUBSCRIBER_PRIORITY
+    0x21: "bytes",     # SUBSCRIPTION_FILTER
+    0x22: "uint8",     # GROUP_ORDER
+    0x32: "varint",    # NEW_GROUP_REQUEST
+    0x34: "tuple",     # TRACK_NAMESPACE_PREFIX (Track Namespace)
+}
+
+
+class StreamResetCode(IntEnum):
+    """Stream reset / STOP_SENDING error codes (§3.3.3, §15.10.4) —
+    a separate code space from SessionCloseCode."""
+    INTERNAL_ERROR = 0x0
+    CANCELLED = 0x01
+    DELIVERY_TIMEOUT = 0x02
+    SESSION_CLOSED = 0x03
+    GOING_AWAY = 0x04
+    TOO_FAR_BEHIND = 0x05
+    UNKNOWN_OBJECT_STATUS = 0x06
+    EXPIRED_AUTH_TOKEN = 0x07
+    EXCESSIVE_LOAD = 0x09
+    MALFORMED_TRACK = 0x12
 
 
 class TrackStatusCode(IntEnum):
