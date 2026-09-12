@@ -38,6 +38,7 @@ def _control_session(draft):
     s._control_chains = {}
     s._bidi_stream_requests = {}
     s._bidi_streams = {}
+    s._peer_request_seen = set()
     s._tx_updates = {}
     s._d18_control_read_sid = None
     s._control_stream_id = None
@@ -316,36 +317,42 @@ async def test_reused_request_id_closes_the_session():
     assert s._closed[0][0] == SessionCloseCode.INVALID_REQUEST_ID
 
 
-async def test_lenient_request_ids_tolerates_reuse_but_not_bad_parity():
-    # --compat lenient-request-ids: a reused id names a request that
-    # exists, so the message stays routable and the session survives
-    # (moxygen d18 numbers REQUEST_UPDATE with its target's id).
-    # Wrong parity is NOT routable and stays fatal under the tolerance.
+async def test_out_of_order_request_ids_are_not_a_violation():
+    # §10.1 closes on a DUPLICATE id, not on arrival order. Each request
+    # rides its own bidi stream and QUIC orders nothing across streams,
+    # so a relay forwarding one SUBSCRIBE per track can land id 5 before
+    # id 3. Treating the high-water mark as a floor killed live sessions
+    # the moment a viewer subscribed to a multi-track broadcast.
+    from aiomoqt.types import MOQTMessageType
+    s = _control_session(16)
+    s.is_client = False
+    s._peer_request_max = -1
+    s._control_msg_overrides[MOQTMessageType.SUBSCRIBE] = _noop_handler
+    for rid in (2, 6, 4, 10, 8):             # peer is the client: even ids
+        s._on_control_data(0, _subscribe_frame(s, rid), False)
+    await asyncio.sleep(0)
+    assert s._closed == []
+    assert s._peer_request_max == 10         # high-water, for GOAWAY/credit
+    assert s._peer_request_seen == {2, 4, 6, 8, 10}
+
+
+async def test_request_id_older_than_the_reorder_window_closes():
+    # Beyond the window the set can no longer vouch for an id, so it is
+    # treated as the duplicate §10.1 requires closing on.
+    from aiomoqt.protocol import PEER_REQUEST_REORDER_WINDOW
     from aiomoqt.types import MOQTMessageType, SessionCloseCode
-    from aiomoqt.utils.workers import apply_compat
-    apply_compat("lenient-request-ids")
-    try:
-        s = _control_session(16)
-        s.is_client = False
-        s._peer_request_max = -1
-        s._control_msg_overrides[MOQTMessageType.SUBSCRIBE] = _noop_handler
-        s._on_control_data(0, _subscribe_frame(s, 2), False)
-        s._on_control_data(0, _subscribe_frame(s, 2), False)
-        await asyncio.sleep(0)
-        assert s._closed == []
-        assert s._peer_request_max == 2      # not advanced by the reuse
-
-        s._on_control_data(0, _subscribe_frame(s, 3), False)
-        await asyncio.sleep(0)
-        assert s._closed
-        assert s._closed[0][0] == SessionCloseCode.INVALID_REQUEST_ID
-    finally:
-        _MOQTSessionMixin._tolerate_request_id_reuse = False
-
-
-async def test_request_id_reuse_is_fatal_by_default():
-    # The tolerance is opt-in: the flag must be off for everyone else.
-    assert _MOQTSessionMixin._tolerate_request_id_reuse is False
+    s = _control_session(16)
+    s.is_client = False
+    s._peer_request_max = -1
+    s._control_msg_overrides[MOQTMessageType.SUBSCRIBE] = _noop_handler
+    high = PEER_REQUEST_REORDER_WINDOW * 2
+    s._on_control_data(0, _subscribe_frame(s, high), False)
+    await asyncio.sleep(0)
+    assert s._closed == []
+    s._on_control_data(0, _subscribe_frame(s, 2), False)
+    await asyncio.sleep(0)
+    assert s._closed
+    assert s._closed[0][0] == SessionCloseCode.INVALID_REQUEST_ID
 
 
 async def test_unknown_type_closes_the_session():

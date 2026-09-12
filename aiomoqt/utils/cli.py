@@ -209,8 +209,6 @@ def add_session(p, insecure=True, certs=False, keepalive=False,
                        help='Comma-separated relay compat tolerances: '
                             'lenient-extensions (truncated trailing-'
                             'extensions block on control messages), '
-                            'lenient-request-ids (peer reuses a request '
-                            'id instead of taking a fresh one, §10.1), '
                             'libquicr, all')
 
 

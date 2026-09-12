@@ -71,7 +71,19 @@ class MOQTStreamReject(Exception):
         super().__init__(reason)
         self.error_code = error_code
         self.reason = reason
-    
+
+
+# How far below the largest peer request id a smaller one can still
+# arrive and be believed. Requests ride separate streams with no
+# ordering between them, so the depth is the peer's request
+# concurrency; ids step by 2, so this is 64 outstanding requests.
+PEER_REQUEST_REORDER_WINDOW = 128
+
+
+def rid_floor(peer_request_max: int) -> int:
+    """Oldest peer request id still inside the reorder window."""
+    return peer_request_max - PEER_REQUEST_REORDER_WINDOW
+
 
 # base class for client and server session objects
 class MOQTPeer:
@@ -152,11 +164,6 @@ class _MOQTSessionMixin:
     # speak for any one session). WT-based classes flip this via
     # _WTSessionMixin.
     _is_wt = False
-
-    # Process-global compat tolerance (--compat lenient-request-ids):
-    # accept a peer request id that was already used instead of closing
-    # the session. See the §10.1 check in _handle_control_message.
-    _tolerate_request_id_reuse = False
 
     @property
     def _is_client(self) -> bool:
@@ -240,9 +247,12 @@ class _MOQTSessionMixin:
         self._moqt_session_setup: Future[bool] = self._loop.create_future()
         self._moqt_session_closed: Future[Tuple[int,str]] = self._loop.create_future()
         self._next_request_id = 0 if self._is_client else 1
-        # Largest request id received from the peer (§10.1: peer ids
-        # keep one parity and strictly increase).
+        # Largest request id received from the peer (§10.1: the peer
+        # increments by 2 per request), and the ids actually seen within
+        # the reorder window — arrival order across request streams is
+        # not guaranteed, so only the set can identify a duplicate.
         self._peer_request_max = -1
+        self._peer_request_seen: set = set()
         # One GOAWAY per control stream (§10.4).
         self._peer_goaway = False
         self._next_track_alias = 0
@@ -770,30 +780,32 @@ class _MOQTSessionMixin:
                     raise MOQTException(
                         SessionCloseCode.INVALID_REQUEST_ID,
                         f"peer request_id {rid} has wrong parity")
-                if rid <= self._peer_request_max:
-                    # A reused id names a request that exists, so the
-                    # message is still routable; the tolerance keeps the
-                    # session up for a relay that numbers REQUEST_UPDATE
-                    # with its target's id instead of a fresh one. Wrong
-                    # parity above stays fatal — that is not routable.
-                    if not _MOQTSessionMixin._tolerate_request_id_reuse:
-                        raise MOQTException(
-                            SessionCloseCode.INVALID_REQUEST_ID,
-                            f"peer request_id {rid} reused or regressed "
-                            f"(max seen {self._peer_request_max})")
-                    logger.error(
-                        "MOQT wire non-compliance tolerated: %s carries "
-                        "peer request_id %d, already used (max seen %d) "
-                        "— §10.1 requires a fresh id per request; enabled "
-                        "by --compat lenient-request-ids",
-                        type(msg).__name__, rid, self._peer_request_max)
+                # §10.1 closes on a DUPLICATE id — NOT on arrival order.
+                # Each request rides its own bidi stream and QUIC gives no
+                # ordering across streams, so the ids of requests a peer
+                # issued concurrently (a relay forwarding one SUBSCRIBE per
+                # track) legitimately arrive out of order. Only a repeat,
+                # or an id so old the window can no longer vouch for it,
+                # is a violation.
+                floor = rid_floor(self._peer_request_max)
+                if rid in self._peer_request_seen or rid < floor:
+                    raise MOQTException(
+                        SessionCloseCode.INVALID_REQUEST_ID,
+                        f"duplicate peer request_id {rid} "
+                        f"(max seen {self._peer_request_max})")
                 if (self._local_request_max is not None
                         and rid >= self._local_request_max):
                     raise MOQTException(
                         SessionCloseCode.TOO_MANY_REQUESTS,
                         f"peer request_id {rid} beyond our MAX_REQUEST_ID "
                         f"{self._local_request_max}")
-                self._peer_request_max = rid
+                self._peer_request_seen.add(rid)
+                if rid > self._peer_request_max:
+                    self._peer_request_max = rid
+                    floor = rid_floor(rid)
+                    if floor > 0:
+                        self._peer_request_seen.difference_update(
+                            [i for i in self._peer_request_seen if i < floor])
                 self._extend_request_credit(rid)
             msg_len += hdr_len
             if end_pos > buf.tell():
