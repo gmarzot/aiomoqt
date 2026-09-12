@@ -153,6 +153,11 @@ class _MOQTSessionMixin:
     # _WTSessionMixin.
     _is_wt = False
 
+    # Process-global compat tolerance (--compat lenient-request-ids):
+    # accept a peer request id that was already used instead of closing
+    # the session. See the §10.1 check in _handle_control_message.
+    _tolerate_request_id_reuse = False
+
     @property
     def _is_client(self) -> bool:
         """Transport-agnostic is-client signal. Raw-QUIC bases expose
@@ -766,10 +771,22 @@ class _MOQTSessionMixin:
                         SessionCloseCode.INVALID_REQUEST_ID,
                         f"peer request_id {rid} has wrong parity")
                 if rid <= self._peer_request_max:
-                    raise MOQTException(
-                        SessionCloseCode.INVALID_REQUEST_ID,
-                        f"peer request_id {rid} reused or regressed "
-                        f"(max seen {self._peer_request_max})")
+                    # A reused id names a request that exists, so the
+                    # message is still routable; the tolerance keeps the
+                    # session up for a relay that numbers REQUEST_UPDATE
+                    # with its target's id instead of a fresh one. Wrong
+                    # parity above stays fatal — that is not routable.
+                    if not _MOQTSessionMixin._tolerate_request_id_reuse:
+                        raise MOQTException(
+                            SessionCloseCode.INVALID_REQUEST_ID,
+                            f"peer request_id {rid} reused or regressed "
+                            f"(max seen {self._peer_request_max})")
+                    logger.error(
+                        "MOQT wire non-compliance tolerated: %s carries "
+                        "peer request_id %d, already used (max seen %d) "
+                        "— §10.1 requires a fresh id per request; enabled "
+                        "by --compat lenient-request-ids",
+                        type(msg).__name__, rid, self._peer_request_max)
                 if (self._local_request_max is not None
                         and rid >= self._local_request_max):
                     raise MOQTException(

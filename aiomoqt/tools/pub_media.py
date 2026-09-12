@@ -46,6 +46,7 @@ from aiomoqt.media.sources import (
 from aiomoqt.track import TrackState
 from aiomoqt.utils import cli as _cli
 from aiomoqt.utils.logger import set_log_level
+from aiomoqt.utils.workers import apply_compat
 from aiomoqt.utils.url import parse_relay_url
 
 _SAMPLERATE = 48000
@@ -129,7 +130,7 @@ def parse_args():
                         help='Print per-track publish metrics every SECS '
                              'seconds (0 disables; default: 5)')
     _cli.add_run(parser, duration=30, interval=False)
-    _cli.add_session(parser, keepalive=True)
+    _cli.add_session(parser, keepalive=True, compat=True)
     _cli.add_help(parser)
     args = parser.parse_args()
     if sum(bool(s) for s in (args.mp4, args.h264, args.ts)) > 1:
@@ -465,6 +466,7 @@ async def _feed_mp4_track(track, source, args, stats: _TrackStats, *,
 
 async def run(args):
     set_log_level(logging.DEBUG if args.debug else logging.WARNING)
+    libquicr = apply_compat(getattr(args, 'compat', ''))
     relay = parse_relay_url(args.url)
     reader = Mp4Reader(args.mp4) if args.mp4 else None
     video = reader.video if reader else None
@@ -497,6 +499,7 @@ async def run(args):
         keylog_filename=args.keylogfile,
         congestion_control_algorithm=args.cc_algo,
         keep_alive_interval=args.keepalive,
+        libquicr_compat=libquicr,
     )
     print(f"  relay: {relay}  namespace: {args.namespace}")
     print(f"  tracks: {', '.join(t.name for t in catalog.tracks)}")

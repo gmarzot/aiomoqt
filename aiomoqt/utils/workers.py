@@ -30,6 +30,7 @@ from typing import Any, Dict
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.messages.base import MOQTMessage
+from aiomoqt.protocol import _MOQTSessionMixin
 from aiomoqt.track import SubscribedTrack, TrackState
 from aiomoqt.types import FilterType
 from aiomoqt.utils.url import parse_relay_url
@@ -39,12 +40,14 @@ from aiomoqt.utils.stats import TrackStats
 
 def apply_compat(compat) -> bool:
     """Apply a comma-separated compat string in this worker PROCESS.
-    Sets the process-global lenient-extensions decode flag; returns
+    Sets the process-global decode/session tolerance flags; returns
     True when the client should be built with libquicr_compat. Mirrors
     moq_interop_client's --compat keys."""
     keys = {k.strip() for k in (compat or "").split(",") if k.strip()}
     if "all" in keys or "lenient-extensions" in keys:
         MOQTMessage._tolerate_trailing_extensions = True
+    if "all" in keys or "lenient-request-ids" in keys:
+        _MOQTSessionMixin._tolerate_request_id_reuse = True
     return "all" in keys or "libquicr" in keys
 
 

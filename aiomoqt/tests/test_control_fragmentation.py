@@ -316,6 +316,38 @@ async def test_reused_request_id_closes_the_session():
     assert s._closed[0][0] == SessionCloseCode.INVALID_REQUEST_ID
 
 
+async def test_lenient_request_ids_tolerates_reuse_but_not_bad_parity():
+    # --compat lenient-request-ids: a reused id names a request that
+    # exists, so the message stays routable and the session survives
+    # (moxygen d18 numbers REQUEST_UPDATE with its target's id).
+    # Wrong parity is NOT routable and stays fatal under the tolerance.
+    from aiomoqt.types import MOQTMessageType, SessionCloseCode
+    from aiomoqt.utils.workers import apply_compat
+    apply_compat("lenient-request-ids")
+    try:
+        s = _control_session(16)
+        s.is_client = False
+        s._peer_request_max = -1
+        s._control_msg_overrides[MOQTMessageType.SUBSCRIBE] = _noop_handler
+        s._on_control_data(0, _subscribe_frame(s, 2), False)
+        s._on_control_data(0, _subscribe_frame(s, 2), False)
+        await asyncio.sleep(0)
+        assert s._closed == []
+        assert s._peer_request_max == 2      # not advanced by the reuse
+
+        s._on_control_data(0, _subscribe_frame(s, 3), False)
+        await asyncio.sleep(0)
+        assert s._closed
+        assert s._closed[0][0] == SessionCloseCode.INVALID_REQUEST_ID
+    finally:
+        _MOQTSessionMixin._tolerate_request_id_reuse = False
+
+
+async def test_request_id_reuse_is_fatal_by_default():
+    # The tolerance is opt-in: the flag must be off for everyone else.
+    assert _MOQTSessionMixin._tolerate_request_id_reuse is False
+
+
 async def test_unknown_type_closes_the_session():
     # §9/§10: an unknown control message type MUST close the session —
     # skipping it is how a renumbered code point hides for months
