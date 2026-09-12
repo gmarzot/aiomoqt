@@ -552,7 +552,7 @@ async def run(args):
                     session, args.namespace, 'video', config=video.config,
                     loc01_compat=args.loc01_compat)),
                 fh, asm, first, args, stats['video']))
-        elif video is not None:
+        elif video is not None and ts is None:   # --ts wired both tracks above
             v_ck = chunkers.get('video')
             stats['video'] = _TrackStats()
             feeders.append(_feed_mp4_track(
