@@ -39,7 +39,9 @@ async def _handshake_draft(port, draft):
         verify_tls=False, supported_drafts=draft,
     )
     async with client.connect() as session:
-        await session.client_session_init()
+        # Four TLS handshakes at once: the 10 s library default is not
+        # enough headroom on a loaded CI runner.
+        await session.client_session_init(timeout=45)
         assert session._moqt_session_setup.result() is True
         return session.negotiated_draft
 
@@ -53,7 +55,7 @@ async def test_concurrent_d14_d16_no_leakage():
     s14 = await _start_server(p14, 14)
     s16 = await _start_server(p16, 16)
     try:
-        async with asyncio.timeout(30):
+        async with asyncio.timeout(60):
             results = await asyncio.gather(
                 _handshake_draft(p14, 14),
                 _handshake_draft(p16, 16),
