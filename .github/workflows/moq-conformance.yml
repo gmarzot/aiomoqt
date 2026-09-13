@@ -59,7 +59,7 @@ jobs:
       fail-fast: false
       matrix:
         draft: [16, 18]
-    timeout-minutes: 25
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
         with:
@@ -130,7 +130,7 @@ jobs:
           UP_PID=$!
           sleep 3
           python -m aiomoqt.tools.moq_interop_relay \
-            --bind 127.0.0.1 --port 4443 --quic --draft "$DRAFT" \
+            --bind 127.0.0.1 --port 4443 --dual --draft "$DRAFT" \
             --cert certs/cert.pem --key certs/key.pem \
             --upstream "moqt://127.0.0.1:9999/" \
             > relay.log 2>&1 &
@@ -143,7 +143,12 @@ jobs:
           grep -q "upstream connected" relay.log \
             || { echo "::error::relay never reached the origin"; \
                  tail -20 relay.log; exit 1; }
-          bash .github/scripts/moq-conformance.sh 2>&1 | tee conformance.log
+          # Both transports on one dual-mode listener: raw QUIC selects a
+          # draft by ALPN, WebTransport by WT-Protocol.
+          for T in quic h3wt; do
+            TRANSPORT=$T bash .github/scripts/moq-conformance.sh 2>&1 \
+              | tee "conformance-$T.log"
+          done
 
           # Second SUT: the moqtest ORIGIN — the bare server-role API
           # serving deterministic moq-test tracks, no relay involved.
@@ -151,14 +156,17 @@ jobs:
           kill $RELAY_PID $UP_PID 2>/dev/null || true
           sleep 2
           python -m aiomoqt.tools.moqtest_origin \
-            --bind 127.0.0.1 --port 4443 --quic --draft "$DRAFT" \
+            --bind 127.0.0.1 --port 4443 --dual --draft "$DRAFT" \
             --cert certs/cert.pem --key certs/key.pem \
             > origin.log 2>&1 &
           ORIGIN_PID=$!
           trap 'kill $ORIGIN_PID 2>/dev/null || true' EXIT
           sleep 3
-          SKIP_PUBLISH=1 FETCH=1 bash .github/scripts/moq-conformance.sh 2>&1 \
-            | tee origin-conformance.log
+          for T in quic h3wt; do
+            SKIP_PUBLISH=1 FETCH=1 TRANSPORT=$T \
+              bash .github/scripts/moq-conformance.sh 2>&1 \
+              | tee "origin-conformance-$T.log"
+          done
 
       - name: Upload logs
         if: always()
@@ -168,7 +176,7 @@ jobs:
           path: |
             relay.log
             upstream.log
-            conformance.log
+            conformance-*.log
             origin.log
-            origin-conformance.log
+            origin-conformance-*.log
           if-no-files-found: warn
