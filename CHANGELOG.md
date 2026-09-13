@@ -7,7 +7,15 @@ Pairs with aiopquic 0.4.0rc1 (unchanged).
 ### Wire fixes
 - d18 REQUEST_UPDATE keeps its own Request ID (the stream-bound id is
   no longer injected over it); the updated request rides
-  `existing_request_id`; §10.1 parity/increase applies to updates.
+  `existing_request_id`; the §10.1 id checks apply to updates.
+- **§10.1 request ids are checked for duplicates, not arrival order**
+  (regression in rc4/rc5). Requests ride separate bidirectional streams
+  and QUIC orders nothing across them, so ids a peer issued concurrently
+  arrive in any order; the check used the largest id seen as a floor and
+  closed the session with INVALID_REQUEST_ID. A publisher lost its
+  session whenever a relay forwarded a SUBSCRIBE per track and they
+  landed out of order. Ids seen are now tracked over a reorder window
+  and only a genuine repeat closes.
 - The type-legality guard now covers request-stream sends, so a message
   a draft does not define can never leave on any stream.
 - d18 code-point renumbers (SUBSCRIBE_NAMESPACE 0x11→0x50, PUBLISH_OK
