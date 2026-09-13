@@ -372,25 +372,56 @@ async def _send(track, stats, payload: bytes, key: bool,
     if track.state != TrackState.SUBSCRIBED:
         stats.dropped += 1
         return
+    entry_us = int(time.time() * 1_000_000)
     if timestamp is None:
-        timestamp = int(time.time() * 1_000_000)
+        timestamp = entry_us
     await track.send_frame(payload, key_frame=key, timestamp=timestamp)
-    stats.count(payload)
+    # lag: how late the frame already was when we got it (source, pipe,
+    # demux). tx: what handing it to the track cost us.
+    stats.count(payload, entry_us - timestamp,
+                int(time.time() * 1_000_000) - entry_us)
 
 
 class _TrackStats:
     """Publish-side counters: objects and bytes for the interval rate and
-    bitrate, dropped for frames skipped before a subscriber arrived."""
-    __slots__ = ('objects', 'bytes', 'dropped')
+    bitrate, dropped for frames skipped before a subscriber arrived, and
+    how far behind each frame's capture stamp it left this process.
+
+    Send lag measures OUR delay — pacing error, demux and queueing — not
+    absolute capture-to-send: a live source's stamps are anchored to
+    their own arrival, so a constant upstream delay is inside the anchor
+    and reads as zero. Capture-to-parse latency belongs to the receiver
+    (sub_media's ts_skew_ms, the player's overlay)."""
+    __slots__ = ('objects', 'bytes', 'dropped',
+                 '_lag_sum', '_lag_n', '_lag_max', '_tx_sum')
 
     def __init__(self):
         self.objects = 0
         self.bytes = 0
         self.dropped = 0
+        self._lag_sum = 0
+        self._lag_n = 0
+        self._lag_max = 0
+        self._tx_sum = 0
 
-    def count(self, payload: bytes):
+    def count(self, payload: bytes, lag_us: int = 0, tx_us: int = 0):
         self.objects += 1
         self.bytes += len(payload)
+        lag_us = max(0, lag_us)
+        self._lag_sum += lag_us
+        self._lag_n += 1
+        self._lag_max = max(self._lag_max, lag_us)
+        self._tx_sum += max(0, tx_us)
+
+    def take_lag(self):
+        """(mean lag, max lag, mean tx) in ms since the last call, or
+        None when nothing was sent; resets the interval."""
+        if not self._lag_n:
+            return None
+        out = (self._lag_sum / self._lag_n / 1000, self._lag_max / 1000,
+               self._tx_sum / self._lag_n / 1000)
+        self._lag_sum = self._lag_n = self._lag_max = self._tx_sum = 0
+        return out
 
 
 async def _refresh_catalog(pub: MediaPublisher, interval: float):
@@ -420,11 +451,14 @@ async def _report_stats(stats: dict, interval: float):
             kbps = (st.bytes - prev_bytes[name]) * 8 / interval / 1000
             prev_obj[name] = st.objects
             prev_bytes[name] = st.bytes
+            lag = st.take_lag()
             parts.append(
                 f"{name}: {st.objects} obj · {ops:.0f} obj/s · {kbps:.0f} kbps"
+                + (f" · lag {lag[0]:.0f}/{lag[1]:.0f} ms" if lag else "")
+                + (f" · tx {lag[2]:.1f} ms" if lag and lag[2] >= 0.05 else "")
                 + (f" · dropped {st.dropped}" if st.dropped else ""))
-        el = int(time.monotonic() - t0)
-        print(f"  [pub {el // 60}:{el % 60:02d}] " + " · ".join(parts))
+        m, s = divmod(time.monotonic() - t0, 60)
+        print(f"  [pub {int(m)}:{s:06.3f}] " + " · ".join(parts))
 
 
 async def _feed_tone(track, args, stats: _TrackStats):
