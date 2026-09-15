@@ -79,9 +79,6 @@ SUITE_CHOICES = tuple(s for suites in TIERS.values() for s in suites)
 MULTI_SUB_ARGS_COMMON = [
     "--subs", "3", "-s", "1024", "-r", "30", "-g", "60", "-t", "30",
 ]
-# Compat keys this harness acts on itself. They are verdict policy, not
-# wire tolerances, so they are never passed to the interop client.
-HARNESS_COMPAT_KEYS = frozenset({"zero-objects-tolerated"})
 PUB_MODE_FLAGS = {
     "publish":      [],
     "publish-ns":   ["--pub-ns"],
@@ -302,8 +299,8 @@ def _relay_ctrl_msg(url: str, draft: int, insecure: bool,
 
 
 def _relay_pub_sub(url: str, draft: int, pub_mode: str, insecure: bool,
-                   compat: str, log: Path,
-                   trackname: str) -> tuple[str, str]:
+                   compat: str, log: Path, trackname: str,
+                   verdicts: set = frozenset()) -> tuple[str, str]:
     cmd = [sys.executable, "-m", "aiomoqt.tools.load_sim",
            url, *MULTI_SUB_ARGS_COMMON, "--draft", str(draft),
            "-T", trackname, *PUB_MODE_FLAGS[pub_mode]]
@@ -322,12 +319,12 @@ def _relay_pub_sub(url: str, draft: int, pub_mode: str, insecure: bool,
     status = "PASS" if got == want else "FAIL"
     detail = f"{got}/{want} ok"
     # SUBSCRIBE_OK alone is not a pass: a subscribed track that delivers
-    # no objects fails unless the relay is a known offender (compat key
+    # no objects fails unless the relay is a known offender (verdict
     # zero-objects-tolerated), which keeps the note visible instead.
     om = re.search(r"Total objects:\s+([\d,]+)", text)
     objects = int(om.group(1).replace(",", "")) if om else None
     if status == "PASS" and objects == 0:
-        if "zero-objects-tolerated" in (compat or ""):
+        if "zero-objects-tolerated" in verdicts:
             detail += " (note: subscribed but 0 objects delivered; tolerated)"
         else:
             status, detail = "FAIL", f"{got}/{want} subscribed, 0 objects delivered"
@@ -442,11 +439,10 @@ def _run_relay_matrix(relay: dict, enabled: set[str],
     # Per-relay compat tolerances forwarded to the interop client for
     # known non-spec relay behaviors (e.g. libquicr SUBSCRIBE_OK for a
     # nonexistent track). Tolerated outcomes are annotated, not hidden.
-    # Keys this harness interprets itself are not wire tolerances; the
-    # client rejects them as unknown, so they stay here.
-    compat_keys = relay.get("compat", [])
-    compat_csv = ",".join(k for k in compat_keys
-                          if k not in HARNESS_COMPAT_KEYS)
+    compat_csv = ",".join(relay.get("compat", []))
+    # Verdicts are this harness's own pass/fail policy for a relay; they
+    # never reach the wire tools.
+    verdicts = set(relay.get("verdicts", []))
     rname = relay["name"]
 
     def _dispatch(suite: str, label_suffix: str, tag: str, slug: str,
@@ -487,7 +483,7 @@ def _run_relay_matrix(relay: dict, enabled: set[str],
                 _dispatch("relay-pub-sub", f"[{pub_mode}]", tag, slug,
                           lambda u, d, log: _relay_pub_sub(
                               u, d, pub_mode, insecure, compat_csv,
-                              log, tn),
+                              log, tn, verdicts),
                           url, draft)
             if "relay-join" in enabled:
                 _dispatch("relay-join", "", tag, slug,
