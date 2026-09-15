@@ -338,6 +338,9 @@ class _MOQTSessionMixin:
         self._unbound_aliases: dict = {}
         self._unbound_escalated: set = set()
         self._subscriptions: Dict[int, List] = {}  # map subscription_id to request
+        # True once this session has subscribed to anything (subscribe,
+        # join or fetch). Publisher-only sessions never set it.
+        self._had_subscription = False
         self._pending_requests: Dict[int, Future[MOQTMessage]] = {}  # unified response futures
         # Bounded record of request ids WE issued (recorded at allocation).
         # A response for one of these with no live future is an ack we did
@@ -611,9 +614,15 @@ class _MOQTSessionMixin:
             fut.set_exception(MOQTRequestError(
                 error_code=0x1, reason="request cancelled by peer",
                 retry_interval=0))
+        self._notify_request_cancelled(
+            request_id, f"stream termination (stream {stream_id})")
+
+    def _notify_request_cancelled(self, request_id: int, why: str) -> None:
+        """Tell the request's owner it is cancelled, however the peer
+        said so: a terminated request stream at d18, UNSUBSCRIBE before
+        it. Publishers stop feeding on this."""
         cb = self._request_cancel_handlers.pop(request_id, None)
-        logger.info(f"MOQT: request {request_id} cancelled by stream "
-                    f"termination (stream {stream_id})")
+        logger.info(f"MOQT: request {request_id} cancelled by {why}")
         if cb is not None:
             try:
                 cb(request_id)
@@ -2762,6 +2771,7 @@ class _MOQTSessionMixin:
         )
         message.libquicr_compat = self._session.libquicr_compat
         self._subscriptions[request_id] = [message]
+        self._had_subscription = True
         logger.info(f"MOQT send: {message}")
         self._send_request(request_id, message)
 
@@ -3025,6 +3035,7 @@ class _MOQTSessionMixin:
             parameters=parameters,
         )
         self._subscriptions[sub_request_id] = [sub_msg]
+        self._had_subscription = True
         # Pre-register response futures before send so loopback / low-RTT
         # peers can't resolve them before our awaiter registers.
         self._pending_requests[sub_request_id] = self._loop.create_future()
@@ -3042,6 +3053,7 @@ class _MOQTSessionMixin:
             parameters=dict(parameters),
         )
         self._subscriptions[fetch_request_id] = [fetch_msg]
+        self._had_subscription = True
         self._pending_requests[fetch_request_id] = self._loop.create_future()
         # Pre-register the fetch-done future before sending so we
         # don't miss the stream FIN in fast-completion scenarios.
@@ -3098,6 +3110,7 @@ class _MOQTSessionMixin:
             parameters=parameters,
         )
         self._subscriptions[request_id] = [message]
+        self._had_subscription = True
         self._fetch_done_futures[request_id] = \
             self._loop.create_future()
         logger.info(f"MOQT send: {message}")
@@ -3736,6 +3749,9 @@ class _MOQTSessionMixin:
             self._object_handlers.pop(track_alias, None)
             self._forget_track_bounds(track_alias)
         self._subscriptions.pop(msg.request_id, None)
+        # d18 has no UNSUBSCRIBE; there the same news arrives as a
+        # terminated request stream. Both reach the owner the same way.
+        self._notify_request_cancelled(msg.request_id, "UNSUBSCRIBE")
 
     async def _handle_subscribe_done(self, msg: SubscribeDone) -> None:
         """Subscriber-side: publisher signals end-of-subscription.
@@ -3767,11 +3783,12 @@ class _MOQTSessionMixin:
         if future and not future.done():
             future.set_result(msg)
         # Per spec, every SubscribeDone is terminal for that subscribe.
-        # The session closes only when it was the LAST active subscribe
-        # (single-track bench tools keep their clean-exit signal; a
-        # multi-track media session outlives per-track completion).
+        # The session closes only when the last subscription IT MADE
+        # ends — the clean-exit signal bench tools wait on. A session
+        # that never subscribed is a publisher: its audience leaving is
+        # not its own end of life, so it stays up for the next one.
         self._subscriptions.pop(msg.request_id, None)
-        if not self._subscriptions:
+        if self._had_subscription and not self._subscriptions:
             self._close_session(SessionCloseCode.NO_ERROR,
                                 f"subscribe done: {msg.status_code}")
 

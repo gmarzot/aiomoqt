@@ -157,6 +157,15 @@ class PublishedTrack(Track):
         self._done = False
         self._stream_count = 0  # tracks streams opened for PUBLISH_DONE
         self._subscribe_request_id = None  # request_id from relay's SUBSCRIBE
+        # Request ids currently subscribed to this track. Production runs
+        # while the set is non-empty and idles when it drains, so normal
+        # subscriber churn parks the track instead of ending it.
+        self._subscribers: set = set()
+        # Payload pattern built by generate(); its presence marks the
+        # track as started, so a subscriber arriving after an idle period
+        # restarts producers without re-entering generate(). The session
+        # and alias come from that subscriber, not from the first one.
+        self._pad = None
         # Aggregate stats across all subgroup streams; subgroup 0 reports.
         self._iv_objects = 0
         self._iv_bytes = 0
@@ -257,6 +266,7 @@ class PublishedTrack(Track):
                 # Registering before any await keeps it race-free.
                 fut = self.session._loop.create_future()
                 self.session._pending_requests[pub_msg.request_id] = fut
+                self._subscribers.add(pub_msg.request_id)
                 self.session.register_request_cancel_handler(
                     pub_msg.request_id, self._on_request_cancelled)
                 asyncio.create_task(
@@ -305,6 +315,12 @@ class PublishedTrack(Track):
         self.state = TrackState.SUBSCRIBED
         self._subscriber_event.set()
         self._generating = True
+        if self._pad is not None:
+            # Restart after an idle period. generate() is still parked on
+            # session close, so only the producers need respawning — under
+            # this subscriber's alias, which is not the first one's.
+            self._spawn_producers(session, self.track_alias, self._pad)
+            return
         await self.generate(session, self.track_alias)
 
     def _set_forward(self, forward: Optional[int]) -> None:
@@ -374,6 +390,7 @@ class PublishedTrack(Track):
         ok = session.subscribe_ok(request_msg=msg, **kw)
         self.track_alias = ok.track_alias
         self._subscribe_request_id = msg.request_id
+        self._subscribers.add(msg.request_id)
         # §3.3.2: the subscriber cancels by terminating the request
         # stream — stop generating when it does.
         session.register_request_cancel_handler(
@@ -383,13 +400,25 @@ class PublishedTrack(Track):
             await self._start_generating(session, "SUBSCRIBE")
 
     def _on_request_cancelled(self, request_id: int) -> None:
-        """Peer terminated the subscription's request stream (§3.3.2):
-        stop generating; per-task cancel paths RESET open subgroup
-        streams."""
-        logger.info(f"Track: request {request_id} cancelled — stopping")
-        self._done = True
+        """A subscriber left (§3.3.2 request-stream termination, or an
+        UNSUBSCRIBE before d18). The track is not over, its audience is:
+        stop producing only once the last one goes, and stay eligible to
+        restart when the next subscriber arrives."""
+        self._subscribers.discard(request_id)
+        if self._subscribers:
+            logger.info(f"Track: subscriber {request_id} left, "
+                        f"{len(self._subscribers)} still subscribed")
+            return
+        logger.info(f"Track: last subscriber left — idling")
+        self._stop_producing()
+
+    def _stop_producing(self) -> None:
+        """Cancel the producer tasks; per-task cancel paths RESET open
+        subgroup streams. Leaves the track restartable."""
         for t in list(self._tasks):
             t.cancel()
+        self._tasks.clear()
+        self._generating = False
 
     def _send_publish_done(self, session, status_code=0x2):
         """Send PUBLISH_DONE with stream count for clean shutdown.
@@ -467,15 +496,24 @@ class PublishedTrack(Track):
                 logger.warning(
                     "Track: num_subgroups ignored for datagram delivery "
                     "(no streams to parallelize)")
+        self._pad = pad
+        self._spawn_producers(session, track_alias, pad)
+        await session.async_closed()
+        self._send_publish_done(session)
+        self._withdraw_namespace(session)
+        session._close_session()
+
+    def _spawn_producers(self, session, track_alias: int,
+                         pad: bytes) -> None:
+        """Start one producer task per subgroup, or a single task for
+        datagram delivery. Re-callable: a subscriber arriving after an
+        idle period restarts production on the same track."""
+        if self.forwarding == ForwardingPreference.DATAGRAM:
             task = asyncio.create_task(
                 self._generate_datagrams(
                     session=session, track_alias=track_alias, pad=pad))
             task.add_done_callback(lambda t: self._tasks.discard(t))
             self._tasks.add(task)
-            await session.async_closed()
-            self._send_publish_done(session)
-            self._withdraw_namespace(session)
-            session._close_session()
             return
 
         for subgroup_id in range(self.num_subgroups):
@@ -494,13 +532,6 @@ class PublishedTrack(Track):
             )
             task.add_done_callback(lambda t: self._tasks.discard(t))
             self._tasks.add(task)
-
-        await session.async_closed()
-        # Send PUBLISH_DONE to indicate clean track completion
-        self._send_publish_done(session)
-        # Release the namespace so the relay cleans up
-        self._withdraw_namespace(session)
-        session._close_session()
 
     async def _generate_datagrams(self, session, track_alias: int,
                                   pad: bytes,
