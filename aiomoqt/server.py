@@ -1,4 +1,5 @@
 import asyncio
+import ipaddress
 import socket
 from asyncio.futures import Future
 from typing import Any, List, Optional, Tuple, Union, Coroutine
@@ -16,6 +17,15 @@ from .utils.logger import *
 logger = get_logger(__name__)
 
 
+def _is_loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def _check_udp_port_free(host: str, port: int) -> None:
     """Fail before the transport thread swallows EADDRINUSE. The transport
     binds every interface (aiopquic takes no bind address), so probe
@@ -23,8 +33,11 @@ def _check_udp_port_free(host: str, port: int) -> None:
     if port == 0:
         return
     if host not in ("", "0.0.0.0"):
-        logger.warning(f"MOQT server: bind address {host} is not supported "
-                       f"by the transport; listening on 0.0.0.0:{port}")
+        # A loopback request still works, it is only also exposed; a
+        # named interface silently widening is the surprising case.
+        report = logger.info if _is_loopback(host) else logger.warning
+        report(f"MOQT server: the transport takes no bind address; "
+               f"{host} requested, listening on 0.0.0.0:{port}")
     probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         probe.bind(("0.0.0.0", port))
