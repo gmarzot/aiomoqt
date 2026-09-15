@@ -79,6 +79,9 @@ SUITE_CHOICES = tuple(s for suites in TIERS.values() for s in suites)
 MULTI_SUB_ARGS_COMMON = [
     "--subs", "3", "-s", "1024", "-r", "30", "-g", "60", "-t", "30",
 ]
+# Compat keys this harness acts on itself. They are verdict policy, not
+# wire tolerances, so they are never passed to the interop client.
+HARNESS_COMPAT_KEYS = frozenset({"zero-objects-tolerated"})
 PUB_MODE_FLAGS = {
     "publish":      [],
     "publish-ns":   ["--pub-ns"],
@@ -439,7 +442,11 @@ def _run_relay_matrix(relay: dict, enabled: set[str],
     # Per-relay compat tolerances forwarded to the interop client for
     # known non-spec relay behaviors (e.g. libquicr SUBSCRIBE_OK for a
     # nonexistent track). Tolerated outcomes are annotated, not hidden.
-    compat_csv = ",".join(relay.get("compat", []))
+    # Keys this harness interprets itself are not wire tolerances; the
+    # client rejects them as unknown, so they stay here.
+    compat_keys = relay.get("compat", [])
+    compat_csv = ",".join(k for k in compat_keys
+                          if k not in HARNESS_COMPAT_KEYS)
     rname = relay["name"]
 
     def _dispatch(suite: str, label_suffix: str, tag: str, slug: str,
