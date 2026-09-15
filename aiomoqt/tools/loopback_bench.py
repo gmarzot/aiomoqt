@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+"""aiomoqt-bench loopback - direct pub-to-sub benchmark without a relay.
+
+Runs the publisher as a server that the subscriber connects to directly.
+Measures pure Python throughput on the aiopquic stack without relay overhead.
+
+Usage:
+  python -m aiomoqt.tools.loopback_bench -s 4096 -r 5000 -t 20
+  python -m aiomoqt.tools.loopback_bench -P 4 -s 16384 -r 60 -t 20
+"""
+import argparse
+import asyncio
+import logging
+
+from aiomoqt.types import MOQTMessageType, parse_draft_spec
+from aiomoqt.client import MOQTClient
+from aiomoqt.server import MOQTServer
+from aiomoqt.track import PublishedTrack, SubscribedTrack
+from aiomoqt.types import ForwardingPreference
+from aiomoqt.utils import wait_cond_timeout
+from aiomoqt.utils.logger import set_log_level
+from aiomoqt.tools.sub_bench import BenchReporter
+
+
+def _find_default_cert():
+    """Search common locations for test certificates."""
+    import os
+    candidates = [
+        os.path.join(os.path.dirname(__file__),
+                     '..', '..', 'certs', 'cert.pem'),
+        os.path.expanduser('~/.local/share/moqt/cert.pem'),
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return os.path.realpath(c)
+    return None
+
+
+CERT = _find_default_cert()
+KEY = CERT.replace('cert.pem', 'key.pem') if CERT else None
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        add_help=False,
+        description='aiomoqt-bench loopback - direct pub/sub, no relay',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        '-s', '--object-size', type=int, default=4096,
+        help='Object payload size bytes (default: 4096)')
+    parser.add_argument(
+        '-g', '--group-size', type=int, default=4096,
+        help='Objects per group (default: 10000)')
+    parser.add_argument(
+        '-P', '--streams', type=int, default=1,
+        help='Parallel subgroup streams (default: 1)')
+    parser.add_argument(
+        '-r', '--rate', type=float, default=0,
+        help='Aggregate objects/sec across all streams (0=max, '
+             'default: max). Per-stream emit rate is rate/streams. '
+             '-P only changes parallelism, not offered load.')
+    parser.add_argument(
+        '-t', '--duration', type=int, default=20,
+        help='Duration seconds (default: 20)')
+    parser.add_argument(
+        '-i', '--interval', type=float, default=5.0,
+        help='Report interval seconds (default: 5)')
+    parser.add_argument(
+        '--no-stats', action='store_true',
+        help='Count objects and bytes only — no latency, jitter, loss '
+             'or group accounting. Measures the delivery ceiling '
+             'without the measurement in it.')
+    parser.add_argument(
+        '-p', '--port', type=int, default=4434,
+        help='Local port (default: 4434)')
+    parser.add_argument(
+        '--cert', type=str, default=CERT)
+    parser.add_argument(
+        '--key', type=str, default=KEY)
+    parser.add_argument(
+        '-d', '--debug', action='store_true')
+    parser.add_argument(
+        '-Q', '--quic', action='store_true',
+        help='Raw QUIC (default: H3/WebTransport)')
+    parser.add_argument(
+        '-W', '--wt', action='store_true',
+        help='H3/WebTransport (the default)')
+    parser.add_argument(
+        '-D', '--datagram', action='store_true',
+        help='ObjectDatagrams instead of subgroup streams (requires '
+             '-q; object must fit one packet, ~1150B max payload). '
+             'The stream/datagram A/B lever: run twice at the same -s '
+             'and -r, once with and once without.')
+    parser.add_argument(
+        '--draft', type=parse_draft_spec, default=14,
+        help='MoQT draft version to negotiate (e.g. 14, 16, or 18, '
+             'default: 14). Applied to BOTH the loopback publisher '
+             '(server) and subscriber (client) so the raw-QUIC ALPN '
+             '("moq-00" for d14, "moqt-NN" for d16+) and the WT version '
+             'match. Auto-negotiation is intentionally not used here: a '
+             'd14 server offers only "moq-00" while a d16+ client offers '
+             '"moqt-NN", so the asymmetric ALPN offer fails to connect.')
+    parser.add_argument(
+        '--cc-algo', type=str, default=None,
+        help='Congestion control algorithm '
+             '(bbr | bbr1 | newreno | cubic | dcubic | prague | fast). '
+             'Default: aiopquic default (bbr1)')
+    parser.add_argument(
+        '--max-inflight-bytes', type=int, default=None,
+        help='Per-stream TX budget (aiomoqt tx_max_inflight_bytes): '
+             'producer pauses while one stream\'s un-transmitted bytes '
+             'exceed this. Default: aiomoqt default (1 MiB). '
+             'Pass 0 to disable.')
+    parser.add_argument(
+        '--max-queued-bytes', type=int, default=None,
+        help='Aggregate publisher byte budget across ALL streams '
+             '(QuicConfiguration.tx_max_queued_bytes): producer parks '
+             'at stream rollover while total un-transmitted TX bytes '
+             'exceed this. Steady-state latency ~ value / throughput. '
+             'Default: aiopquic default (4 MiB). Pass 0 to disable.')
+    parser.add_argument(
+        '-?', '--help', action='help',
+        help='Show this help message and exit')
+    args = parser.parse_args()
+    if args.datagram and not args.quic:
+        parser.error("-D/--datagram requires -Q (raw QUIC); "
+                     "WT datagram TX is not wired yet")
+    if args.datagram and args.object_size > 1152:
+        parser.error(f"--datagram: object_size {args.object_size} can "
+                     f"never fit a DATAGRAM frame (max ~1152B payload "
+                     f"at 1200B frame ceiling; frames cannot fragment)")
+    return args
+
+
+def print_banner(args):
+    transport_label = "QUIC" if args.quic else "H3/WebTransport"
+    # url implies port + transport; raw QUIC has no path, WT uses "/"
+    url = (f"moqt://localhost:{args.port}" if args.quic
+           else f"https://localhost:{args.port}/")
+    cc = args.cc_algo or "bbr1 (default)"
+    if args.rate > 0:
+        per_stream = (args.rate / args.streams
+                      if args.streams > 1 else args.rate)
+        rate_s = f"{args.rate}/s total ({per_stream:.1f}/s per stream)"
+    else:
+        rate_s = "max"
+
+    def row(label, value):
+        print(f"  {label + ':':<14}{value}")
+
+    print("─" * 56)
+    print("  aiomoqt-bench loopback (no relay)")
+    print("─" * 56)
+    row("draft", args.draft)
+    row("url", url)
+    row("transport", transport_label)
+    row("delivery", "DATAGRAM" if args.datagram else "subgroup streams")
+    row("cc algorithm", cc)
+    row("sub-groups", args.streams)
+    row("group size", f"{args.group_size} objects")
+    row("object size", f"{args.object_size} B")
+    row("object rate", rate_s)
+    row("duration", f"{args.duration}s")
+    print("─" * 56)
+
+
+async def _on_subscribe(session, msg, args):
+    """Server-side subscribe handler using PublishedTrack."""
+    track = PublishedTrack(
+        session,
+        namespace="aiomoqt",
+        trackname="track",
+        object_size=args.object_size,
+        group_size=args.group_size,
+        num_subgroups=args.streams,
+        rate=args.rate,
+        forwarding=(ForwardingPreference.DATAGRAM if args.datagram
+                    else ForwardingPreference.SUBGROUP),
+    )
+    # Suppress publisher periodic stats in loopback mode —
+    # both sides print to the same terminal, causing interleaved output
+    track._stats_header_printed = True  # skip header
+    track._quiet = True  # checked in _generate_subgroup
+    # d14 direct connection: respond with subscribe_ok and generate
+    ok = session.subscribe_ok(request_msg=msg)
+    track.track_alias = ok.track_alias
+    track._generating = True
+    await track.generate(session, ok.track_alias)
+
+
+async def run_server(args):
+    """Run a MOQTServer that generates data when subscribers connect."""
+    from functools import partial
+
+    server = MOQTServer(
+        host="localhost", port=args.port,
+        certificate=args.cert, private_key=args.key,
+        path="/",
+        use_quic=args.quic,
+        supported_drafts=args.draft,
+        congestion_control_algorithm=args.cc_algo,
+        # None = honor protocol default (16 MB); 0 = opt out.
+        **({'tx_max_inflight_bytes':
+            (None if args.max_inflight_bytes == 0
+             else args.max_inflight_bytes)}
+           if args.max_inflight_bytes is not None else {}),
+        **({'tx_max_queued_bytes': args.max_queued_bytes}
+           if args.max_queued_bytes is not None else {}),
+    )
+    server.register_handler(
+        MOQTMessageType.SUBSCRIBE,
+        partial(_on_subscribe, args=args))
+    return await server.serve()
+
+
+async def run_subscriber(args, stats):
+    """Connect as subscriber and collect stats."""
+    client = MOQTClient(
+        "localhost", args.port,
+        path="/",
+        use_quic=args.quic,
+        supported_drafts=args.draft,
+        verify_tls=False,
+        debug=args.debug,
+        congestion_control_algorithm=args.cc_algo,
+    )
+
+    try:
+        async with client.connect() as session:
+            await session.client_session_init()
+
+            track = SubscribedTrack(
+                session,
+                namespace="aiomoqt",
+                trackname="track",
+                on_object=stats.on_object,
+            )
+            # Loopback server does not send PUBLISH; use direct SUBSCRIBE.
+            # Loopback passes explicit trackname → auto-routes to direct.
+            await track.subscribe()
+
+            print("  Subscriber connected, receiving...\n")
+            stats.start()
+
+            if not await wait_cond_timeout(
+                    track.wait_closed(), timeout=args.duration):
+                track.completed = True
+    except Exception as e:
+        print(f"  Subscriber error: {e}")
+
+
+async def main():
+    args = parse_args()
+    log_level = logging.DEBUG if args.debug else logging.WARNING
+    set_log_level(log_level)
+
+    # AIOMOQT_TASK_DUMP=1 installs SIGUSR1 (task stacks) + SIGUSR2
+    # (aiopquic counters) handlers. No-op when env not set.
+    from aiomoqt.utils.taskdump import install as _install_task_dump
+    _install_task_dump()
+
+    # AIOMOQT_TRACEMALLOC=1 enables Python-level allocation tracking.
+    # Baseline snap is taken 2s after subscriber connects; end snap is
+    # taken right before cleanup. The diff (end - baseline) localizes
+    # what GREW during steady-state operation — the sub-side retention
+    # signature is exactly this case.
+    import os as _os
+    import tracemalloc as _tm
+    _trace_enabled = _os.environ.get("AIOMOQT_TRACEMALLOC") == "1"
+    if _trace_enabled:
+        _tm.start(25)
+
+    stats = BenchReporter(report_interval=args.interval,
+                          minimal=args.no_stats)
+    print_banner(args)
+
+    if not args.cert or not args.key:
+        print("  Error: TLS certificate required. "
+              "Use --cert and --key,")
+        print("  or place cert.pem/key.pem in <project>/certs/")
+        return
+
+    print("  Starting server...")
+    quic_server = await run_server(args)
+
+    # Give server a moment
+    await asyncio.sleep(0.5)
+
+    # Baseline tracemalloc snap 2 s after subscriber connects.
+    _baseline_snap = [None]
+    if _trace_enabled:
+        async def _take_baseline():
+            await asyncio.sleep(2.0)
+            _baseline_snap[0] = _tm.take_snapshot()
+        asyncio.create_task(_take_baseline())
+
+    # Run subscriber
+    print("  Connecting subscriber...")
+    await run_subscriber(args, stats)
+
+    # End tracemalloc snap before cleanup; diff against baseline.
+    if _trace_enabled and _baseline_snap[0] is not None:
+        end_snap = _tm.take_snapshot()
+        diff = end_snap.compare_to(_baseline_snap[0], 'lineno')
+        print()
+        print("=" * 70)
+        print("  tracemalloc: top 30 growers (baseline @ +2s → end)")
+        print("=" * 70)
+        for s in diff[:30]:
+            frame = s.traceback[0] if s.traceback else None
+            loc = (f"{frame.filename.split('/')[-1]}:{frame.lineno}"
+                   if frame else "<no frame>")
+            sign = "+" if s.size_diff >= 0 else ""
+            print(f"  {sign}{s.size_diff/1024/1024:7.2f} MB  "
+                  f"{sign}{s.count_diff:7d} blocks  {loc}")
+        print("=" * 70)
+
+    # Cleanup
+    quic_server.close()
+    # Give worker thread + close walker a tick to run before we sample.
+    await asyncio.sleep(0.5)
+    stats.print_summary()
+
+    # AIOMOQT_TASK_DUMP=1 also enables a final post-shutdown counter dump
+    # so we can tell whether the close-walker swept leaked WT links
+    # (deferred-destroy pattern) or they truly leak.
+    import os as _os2
+    if _os2.environ.get("AIOMOQT_TASK_DUMP") == "1":
+        import sys as _sys2
+        try:
+            from aiopquic._binding._transport import dump_all_counters
+            print("\n=== aiopquic counter-dump (post-shutdown) ===",
+                  file=_sys2.stderr)
+            dump_all_counters(file=_sys2.stderr)
+        except Exception as _e2:
+            print(f"(post-shutdown counter dump failed: {_e2})",
+                  file=_sys2.stderr)
+
+
+def cli():
+    """Console entry point (moq-loopback-bench)."""
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n  Interrupted.")
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n  Interrupted.")

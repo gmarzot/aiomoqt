@@ -1,26 +1,38 @@
 #!/bin/sh
-# moq-interop-runner entrypoint. Default role is the client; set
-# MOQT_ROLE=relay (matching the runner's docker-compose env) to start
-# the minimal interop relay on UDP/${MOQT_PORT:-4443}.
-#
-# Draft confinement is read from the environment by BOTH roles: the runner
-# injects DRAFT (PR #95) — or older MOQT_DRAFT — and the client and relay
-# each pin to it. Unset = open-relay context: the client offers its full
-# version list and the relay advertises all supported drafts. So no --draft
-# is threaded here; the programs read $DRAFT / $MOQT_DRAFT themselves.
+# Container entrypoint. MOQT_ROLE selects the program:
+#   client (default) — moq-interop-runner client
+#   relay            — the ersatz relay on UDP/${MOQT_PORT:-4443}
+#   origin           — the moqtest origin (conformance SUT, serves
+#                      draft-afrind-moq-test tracks incl. FETCH)
+# MOQT_QUIC=1 serves raw QUIC instead of WebTransport; MOQT_DUAL=1 both
+# on one port. Draft confinement comes from the environment: the runner
+# injects DRAFT (or older MOQT_DRAFT) and each program pins to it; unset
+# = offer/advertise every supported draft.
 set -eu
 
 case "${MOQT_ROLE:-client}" in
     relay)
-        exec python -m aiomoqt.examples.moq_interop_relay \
+        exec python -m aiomoqt.tools.moq_interop_relay \
             --bind "${MOQT_BIND:-0.0.0.0}" \
             --port "${MOQT_PORT:-4443}" \
             --cert "${MOQT_CERT:-/certs/cert.pem}" \
             --key  "${MOQT_KEY:-/certs/priv.key}" \
             ${MOQT_QUIC:+--quic} \
+            ${MOQT_DUAL:+--dual} \
+            "$@"
+        ;;
+    origin)
+        exec python -m aiomoqt.tools.moqtest_origin \
+            --bind "${MOQT_BIND:-0.0.0.0}" \
+            --port "${MOQT_PORT:-4443}" \
+            --cert "${MOQT_CERT:-/certs/cert.pem}" \
+            --key  "${MOQT_KEY:-/certs/priv.key}" \
+            ${MOQT_QUIC:+--quic} \
+            ${MOQT_DUAL:+--dual} \
+            ${DRAFT:+--draft "$DRAFT"} \
             "$@"
         ;;
     client|*)
-        exec python -m aiomoqt.examples.moq_interop_client "$@"
+        exec python -m aiomoqt.tools.moq_interop_client "$@"
         ;;
 esac

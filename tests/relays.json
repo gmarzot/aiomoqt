@@ -7,6 +7,7 @@
     "insecure":         "bool; if true, pass --tls-disable-verify / -k (default false)",
     "disabled":         "bool; if true, skip this relay entirely (default false)",
     "disabled_suites":  "list of interop suite names to skip for this relay",
+    "compat":           "list of WIRE tolerance keys passed to the tools as --compat (libquicr, lenient-extensions, ...); the tools reject unknown values",
     "notes":            "freeform (optional)"
   },
   "relays": [

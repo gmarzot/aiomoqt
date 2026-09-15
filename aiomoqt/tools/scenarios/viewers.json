@@ -1,0 +1,25 @@
+{
+  "_comment": "Headless audience for a live pub_media broadcast. Run with --role sub against the broadcast's relay and namespace (-N overrides the placeholder). Publisher entries define the timeline only. A steady low-churn cohort keeps the audience above zero; a second cohort joins late and churns.",
+  "publishers": [
+    {"namespace": "demo", "track": "video", "start_delay": 0, "duration": 600},
+    {"namespace": "demo", "track": "audio", "start_delay": 0, "duration": 600},
+    {"namespace": "demo", "track": "catalog", "start_delay": 0, "duration": 600}
+  ],
+  "subscribers": [
+    {"namespace": "demo", "track": "video", "subs": 12,
+     "join_rate": 4, "join_delay": 0, "churn_rate": 0.01,
+     "leave_early": 30, "leave_rate": 4},
+    {"namespace": "demo", "track": "video", "subs": 8,
+     "join_rate": 3, "join_delay": 10, "churn_rate": 0.08,
+     "leave_early": 60, "leave_rate": 3},
+    {"namespace": "demo", "track": "audio", "subs": 12,
+     "join_rate": 4, "join_delay": 0, "churn_rate": 0.01,
+     "leave_early": 30, "leave_rate": 4},
+    {"namespace": "demo", "track": "audio", "subs": 8,
+     "join_rate": 3, "join_delay": 10, "churn_rate": 0.08,
+     "leave_early": 60, "leave_rate": 3},
+    {"namespace": "demo", "track": "catalog", "subs": 3,
+     "join_rate": 2, "join_delay": 0, "churn_rate": 0.0,
+     "leave_early": 30, "leave_rate": 1}
+  ]
+}

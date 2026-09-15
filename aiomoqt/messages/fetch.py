@@ -125,12 +125,7 @@ class Fetch(MOQTMessage):
             fetch_type = buf.pull_vint()
 
         if fetch_type == FetchType.STANDALONE:
-            ns = []
-            ns_len = buf.pull_vint()
-            for _ in range(ns_len):
-                part_len = buf.pull_vint()
-                ns.append(buf.pull_bytes(part_len))
-            namespace = tuple(ns)
+            namespace = MOQTMessage._pull_tuple(buf)
             track_name_len = buf.pull_vint()
             track_name = buf.pull_bytes(track_name_len)
             start_group = buf.pull_vint()
@@ -206,10 +201,12 @@ class FetchOk(MOQTMessage):
             payload.push_vint(self.largest_group_id)
             payload.push_vint(self.largest_object_id)
             params = dict(self.parameters)
-            if self.group_order is not None:
+            # §10.2.8: GROUP_ORDER may appear in SUBSCRIBE, PUBLISH_OK
+            # or FETCH — not FETCH_OK; a d18 peer MUST close on it.
+            if self.group_order is not None and prof.draft < 18:
                 params[ParamType.GROUP_ORDER] = self.group_order
             MOQTMessage._serialize_params(payload, params, prof=prof)
-            MOQTMessage._extensions_encode(payload, self.track_extensions or {}, with_length=False)
+            MOQTMessage._extensions_encode(payload, self.track_extensions or {}, with_length=False, delta=True)
         else:
             # d14: group_order as fixed field
             payload.push_uint8(self.group_order)
@@ -239,7 +236,7 @@ class FetchOk(MOQTMessage):
             params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
             group_order = params.pop(ParamType.GROUP_ORDER, GroupOrder.DESCENDING)
             track_extensions = MOQTMessage._extensions_decode(
-                buf, with_length=False, buf_end=buf_end)
+                buf, with_length=False, buf_end=buf_end, delta=True)
         else:
             group_order = buf.pull_uint8()
             end_of_track = buf.pull_uint8()
@@ -288,8 +285,7 @@ class FetchError(MOQTMessage):
 
         request_id = buf.pull_vint()
         error_code = buf.pull_vint()
-        reason_len = buf.pull_vint()
-        reason = buf.pull_bytes(reason_len).decode()
+        reason = MOQTMessage._pull_reason(buf)
 
         return cls(
             request_id=request_id,

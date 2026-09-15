@@ -49,6 +49,24 @@ class DraftProfile:
                                   # (group + object varints, no length prefix):
                                   # d18 LARGEST_OBJECT 0x09. Empty for d14/d16
                                   # (there LARGEST_OBJECT is length-prefixed).
+    two_level_discovery: bool = False
+                                  # d18 splits discovery: SUBSCRIBE_NAMESPACE
+                                  # reports namespaces (NAMESPACE), and
+                                  # SUBSCRIBE_TRACKS then asks one namespace
+                                  # for its tracks (PUBLISH). d14/d16 fuse
+                                  # both into SUBSCRIBE_NAMESPACE.
+    merged_datagram_layout: bool = False
+                                  # d16+ OBJECT_DATAGRAM type 0b00X0XXXX with
+                                  # DEFAULT_PRIORITY 0x08 and STATUS 0x20
+                                  # (status datagrams fold into the object
+                                  # datagram); d14 keeps OBJECT_DATAGRAM_STATUS.
+    subgroup_type_mask: int = 0x0F
+                                  # flag bits a SUBGROUP_HEADER type carries
+                                  # over 0x10: d16 adds DEFAULT_PRIORITY 0x20,
+                                  # d18 adds FIRST_OBJECT 0x40.
+    object_statuses: frozenset = frozenset({0x0, 0x3, 0x4})
+                                  # Object Status values the draft defines;
+                                  # d14 also has DOES_NOT_EXIST 0x1.
 
     @property
     def vi64(self) -> bool:
@@ -63,15 +81,19 @@ PROFILES = {
         draft=MOQTDraft.DRAFT_14, setup_carries_versions=True,
         params_delta_coded=False, varint="rfc9000",
         control_uni_pair=False, reply_has_request_id=True,
-        uint8_params=frozenset()),
+        uint8_params=frozenset(),
+        object_statuses=frozenset({0x0, 0x1, 0x3, 0x4})),
     MOQTDraft.DRAFT_16: DraftProfile(
         draft=MOQTDraft.DRAFT_16, setup_carries_versions=False,
         params_delta_coded=True, varint="rfc9000",
         control_uni_pair=False, reply_has_request_id=True,
-        uint8_params=frozenset()),
+        uint8_params=frozenset(),
+        merged_datagram_layout=True,
+        subgroup_type_mask=0x2F),
     # draft-18 negotiates out-of-band (ALPN/WT-Protocol) like d16 and uses
     # delta-coded params, but forks the wire codec to vi64, runs control over
-    # a pair of uni streams, and drops the Request ID from request replies.
+    # a pair of uni streams, drops the Request ID from request replies, and
+    # splits track discovery into two requests.
     MOQTDraft.DRAFT_18: DraftProfile(
         draft=MOQTDraft.DRAFT_18, setup_carries_versions=False,
         params_delta_coded=True, varint="vi64",
@@ -81,7 +103,10 @@ PROFILES = {
             ParamType.SUBSCRIBER_PRIORITY,
             ParamType.GROUP_ORDER,
         }),
-        location_params=frozenset({ParamType.LARGEST_OBJECT})),
+        location_params=frozenset({ParamType.LARGEST_OBJECT}),
+        two_level_discovery=True,
+        merged_datagram_layout=True,
+        subgroup_type_mask=0x6F),
 }
 
 

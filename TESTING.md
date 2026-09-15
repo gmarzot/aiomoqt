@@ -31,12 +31,12 @@ docker run --rm --network host -e RELAY_URL=$RELAY aiomoqt-test --draft 14
 
 # 5. Throughput pub/sub (d14/d16 QUIC/WebTransport)
 #    Shell A (publisher):
-python -m aiomoqt.examples.pub_bench $RELAY -s 500000 -t 60 -r 30 -g 30 -k --draft 16
+python -m aiomoqt.tools.pub_bench $RELAY -s 500000 -t 60 -r 30 -g 30 -k --draft 16
 #    Shell B (subscriber):
-python -m aiomoqt.examples.sub_bench $RELAY -k --draft 16
+python -m aiomoqt.tools.sub_bench $RELAY -k --draft 16
 
 # 6. Multi-subscriber fanout (pub + N subs in one process)
-python -m aiomoqt.examples.multi_sub_bench $RELAY -n 30 -s 1024 -r 60 -t 60 -k --draft 16
+python -m aiomoqt.tools.load_sim $RELAY --subs 30 -s 1024 -r 60 -t 60 -k --draft 16
 ```
 
 Pass criteria:
@@ -54,8 +54,8 @@ Pass criteria:
 
 | Tier | Network | CI-gated | Purpose |
 |------|---------|----------|---------|
-| `unit` | none | yes (PR) | pure-Python correctness; messages/track/buffer |
-| `integration` | localhost | yes (PR) | pub/sub + setup + join + fetch over in-process qh3 |
+| `unit` | none | yes (PR) | the entire pytest tree |
+| `integration` | localhost | yes (PR) | tools, multi-process paths, draft × transport matrix |
 | `interop` | public | manual / weekly | live relays in `tests/relays.json` |
 | `bench` | localhost or relay | manual | adaptive throughput ceiling measurement |
 
@@ -68,14 +68,13 @@ or `--test-suite <suite>` (runs a single suite, ignoring tier).
 ## Test Suites
 
 ### `unit` tier
-- **`buffer`** — `tests/test_rebuf.py`; stream reassembly (object-boundary alignment, partial-chunk handling, subgroup reconstruction). Standalone script, not pytest.
-- **`message`** — `pytest aiomoqt/tests/test_messages.py`; round-trip serialization for every MoQT control message across d14 and d16.
-- **`track`** — `pytest aiomoqt/tests/test_track.py`; `PublishedTrack` / `SubscribedTrack` unit tests.
+- **`pytest`** — the whole `aiomoqt/tests` tree in one run. Naming files individually left new test modules silently unrun, so this suite is deliberately a directory, not a list. `test_loopback_fetch.py` is excluded here and runs as its own suite so a platform can skip it.
 
 ### `integration` tier
-- **`loopback-setup`** — d14/d16 session handshake and `AUTH_TOKEN` parameter round-trip, in-process qh3.
-- **`loopback-pub-sub`** — `loopback_bench` at fixed rate; asserts throughput > 0 and zero loss.
-- **`loopback-join`** — `JOINING_SUBSCRIBE` with `ABSOLUTE` and `RELATIVE` fetch types.
+Covers what pytest cannot reach: the tools, the multi-process paths, and the draft × transport matrix.
+- **`loopback-pub-sub`** — `loopback_bench` at fixed rate; asserts throughput > 0 and zero loss. Variants: `-tiny`, `-streams`, `-paced`.
+- **`loopback-bench-d{14,16,18}-{wt,quic}`** — session-setup / framing smoke for every draft × transport.
+- **`loopback-adaptive-mp-d{14,16,18}`** — adaptive BW over the multi-process loopback path.
 - **`loopback-fetch`** — standalone `FETCH` variants: joining-relative, explicit range, invalid-range rejection, unknown request-id rejection.
 
 ### `interop` tier (per active relay × transport × draft)
@@ -83,6 +82,7 @@ or `--test-suite <suite>` (runs a single suite, ignoring tier).
 - **`relay-pub-sub`** — 3-subscriber multi-sub bench against the relay; asserts N/N subscribers receive the published objects.
 - **`relay-join`** — `SUBSCRIBE + JOINING_FETCH` probe (most relays do not implement this yet; disabled by default in the catalog).
 - **`relay-fetch`** — standalone `FETCH` probe (same).
+- **`relay-discovery`** — a subscriber knowing only the namespace learns the trackname. d14/d16 answer `SUBSCRIBE_NAMESPACE` with a `PUBLISH` per track; d18 reports namespaces first (`NAMESPACE`) and answers a second request, `SUBSCRIBE_TRACKS`. The publisher announces with both `PUBLISH_NAMESPACE` and `PUBLISH`, since a relay learns a namespace exists from the former.
 
 ### `bench` tier (manual dispatch only; not PR-gated)
 - **`loopback-adaptive-bench`** — ramps rate in steps, stops on loss / p99 latency growth / throughput shortfall, reports the last stable rate.
@@ -103,7 +103,7 @@ python tests/release_regression_test.py --test-tier unit
 python tests/release_regression_test.py --test-tier interop
 
 # Individual suite (bypasses tier grouping)
-python tests/release_regression_test.py --test-suite message
+python tests/release_regression_test.py --test-suite pytest
 python tests/release_regression_test.py --test-suite loopback-pub-sub --test-suite relay-ctrl-msg
 
 # Interop in parallel across relays
@@ -178,7 +178,7 @@ in one invocation. The sections below are for ad-hoc investigation
 against a local relay — useful during protocol work, not needed for a
 release gate.
 
-Bench tools (`pub_bench`, `sub_bench`, `relay_bench`, `multi_sub_bench`)
+Bench tools (`pub_bench`, `sub_bench`, `loopback_bench`, `load_sim`)
 auto-generate unique tracknames from test parameters to avoid
 stale-cache collisions on relays that key by (namespace, trackname).
 
@@ -186,12 +186,12 @@ stale-cache collisions on relays that key by (namespace, trackname).
 
 Shell 1 (publisher):
 ```bash
-python -m aiomoqt.examples.pub_bench moqt://moqx-local-000.marzresearch.net:4433 -s 500000 -t 120 -r 30 -g 30 -k --draft 16
+python -m aiomoqt.tools.pub_bench moqt://moqx-local-000.marzresearch.net:4433 -s 500000 -t 120 -r 30 -g 30 -k --draft 16
 ```
 
 Shell 2 (subscriber):
 ```bash
-python -m aiomoqt.examples.sub_bench moqt://moqx-local-000.marzresearch.net:4433 -k --draft 16
+python -m aiomoqt.tools.sub_bench moqt://moqx-local-000.marzresearch.net:4433 -k --draft 16
 ```
 
 Expected: ~116 Mbps, ~30 obj/s, zero loss, auto-discovered trackname.
@@ -200,12 +200,12 @@ Expected: ~116 Mbps, ~30 obj/s, zero loss, auto-discovered trackname.
 
 Shell 1:
 ```bash
-python -m aiomoqt.examples.pub_bench moqt://moqx-local-000.marzresearch.net:4433 -s 1024 -t 120 -r 120 -g 60 -P 4 -k --draft 16
+python -m aiomoqt.tools.pub_bench moqt://moqx-local-000.marzresearch.net:4433 -s 1024 -t 120 -r 120 -g 60 -P 4 -k --draft 16
 ```
 
 Shell 2:
 ```bash
-python -m aiomoqt.examples.sub_bench moqt://moqx-local-000.marzresearch.net:4433 -k --draft 16
+python -m aiomoqt.tools.sub_bench moqt://moqx-local-000.marzresearch.net:4433 -k --draft 16
 ```
 
 Expected: ~480 obj/s, ~4 Mbps, p50 latency ~1 ms.
@@ -214,12 +214,12 @@ Expected: ~480 obj/s, ~4 Mbps, p50 latency ~1 ms.
 
 Shell 1:
 ```bash
-python -m aiomoqt.examples.pub_bench moqt://moqx-local-000.marzresearch.net:4433 -s 4096 -t 120 -g 1000 -P 4 -k --draft 16
+python -m aiomoqt.tools.pub_bench moqt://moqx-local-000.marzresearch.net:4433 -s 4096 -t 120 -g 1000 -P 4 -k --draft 16
 ```
 
 Shell 2:
 ```bash
-python -m aiomoqt.examples.sub_bench moqt://moqx-local-000.marzresearch.net:4433 -k --draft 16
+python -m aiomoqt.tools.sub_bench moqt://moqx-local-000.marzresearch.net:4433 -k --draft 16
 ```
 
 Expected: sustained high throughput. Watch p99 latency and loss to
@@ -230,7 +230,7 @@ see where your local loop saturates.
 ## moq-interop-runner integration
 
 aiomoqt ships a TAP v14-emitting client at
-`aiomoqt.examples.moq_interop_client` (the same module used internally
+`aiomoqt.tools.moq_interop_client` (the same module used internally
 by `relay-ctrl-msg`). The Dockerfile at the repo root builds an image
 consumable by [englishm/moq-interop-runner](https://github.com/englishm/moq-interop-runner).
 The published image is `ghcr.io/gmarzot/aiomoqt:<version>` and

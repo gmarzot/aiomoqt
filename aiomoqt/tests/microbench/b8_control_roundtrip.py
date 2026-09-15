@@ -208,9 +208,12 @@ def _time_ns(fn, duration, warmup) -> float:
 # ---------------------------------------------------------------------------
 
 def _print_table(title: str, rows: dict) -> None:
+    ref = 16 if 16 in DRAFTS else DRAFTS[0]
+    others = [d for d in DRAFTS if d != ref]
     print(title)
     hdr = (f"  {'message':<16}"
-           + "".join(f"{('d' + str(d) + ' ns/op'):>14}" for d in DRAFTS))
+           + "".join(f"{('d' + str(d) + ' ns/op'):>14}" for d in DRAFTS)
+           + "".join(f"{f'd{d}/d{ref}':>10}" for d in others))
     print(hdr)
     print("  " + "─" * (len(hdr) - 2))
     for label, _f, _t, _r in MESSAGES:
@@ -219,23 +222,13 @@ def _print_table(title: str, rows: dict) -> None:
             v = rows[label].get(d)
             cells.append("skip".rjust(14) if v is None
                          else f"{v:>14,.0f}")
+        base = rows[label].get(ref)
+        for d in others:
+            v = rows[label].get(d)
+            cells.append("—".rjust(10) if not (v and base)
+                         else f"{v / base:>9.2f}x")
         print(f"  {label:<16}" + "".join(cells))
     print()
-
-
-def _ratios(rows: dict) -> tuple[float, float]:
-    """Mean d18/d16 and d14/d16 across messages with all three present."""
-    r18, r14 = [], []
-    for label, *_ in MESSAGES:
-        v14, v16, v18 = (rows[label].get(d) for d in (14, 16, 18))
-        if v16:
-            if v18:
-                r18.append(v18 / v16)
-            if v14:
-                r14.append(v14 / v16)
-    def mean(xs):
-        return sum(xs) / len(xs) if xs else 0.0
-    return mean(r18), mean(r14)
 
 
 def main() -> int:
@@ -270,17 +263,6 @@ def main() -> int:
 
     _print_table("ENCODE (serialize)", enc)
     _print_table("DECODE (deserialize)", dec)
-
-    enc18, enc14 = _ratios(enc)
-    dec18, dec14 = _ratios(dec)
-    print("SUMMARY  (relative to d16, mean of per-message ratios)")
-    print(f"  encode   d18/d16 {enc18:5.2f}x   d14/d16 {enc14:5.2f}x")
-    print(f"  decode   d18/d16 {dec18:5.2f}x   d14/d16 {dec14:5.2f}x")
-    enc18_pct = (enc18 - 1.0) * 100.0
-    dec18_pct = (dec18 - 1.0) * 100.0
-    net = ((enc18 + dec18) / 2.0 - 1.0) * 100.0
-    print(f"  -> d18 control encode {enc18_pct:+.0f}% / decode {dec18_pct:+.0f}% "
-          f"vs d16; vi64 bodies + delta KVP + uint8 params net {net:+.0f}%.")
 
     if skips:
         print("\nskipped (message,draft) combos:")

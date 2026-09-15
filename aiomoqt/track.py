@@ -30,11 +30,12 @@ from enum import IntEnum
 from typing import Optional, Callable
 
 from .types import (
-    MOQTMessageType, ParamType, FilterType, GroupOrder,
-    MOQT_TIMESTAMP_EXT, SessionCloseCode,
+    MOQTMessageType, MOQTRequestError, ParamType, FilterType,
+    ForwardingPreference, GroupOrder, MOQT_TIMESTAMP_EXT, SessionCloseCode,
+    StreamResetCode,
 )
 from .messages import (
-    PublishOk, RequestUpdate,
+    ObjectDatagram, PublishOk, RequestOk, RequestUpdate,
 )
 from .utils.format import fmt_bps, fmt_rate
 from .utils.logger import get_logger
@@ -102,6 +103,11 @@ class Track:
 # required near-zero yields). Power of two so the gate is a bitwise AND.
 _PACED_YIELD_EVERY = 32
 
+# Reserved wire-header margin when checking object_size against the
+# transport's datagram payload ceiling: type/alias/group/object varints
+# + priority byte + the per-object timestamp extension.
+_DGRAM_HEADER_MARGIN = 48
+
 
 class PublishedTrack(Track):
     """Publisher-side track — announces namespace/track and generates data.
@@ -110,17 +116,39 @@ class PublishedTrack(Track):
     When a subscriber arrives, calls generate() which can be overridden.
     """
 
+    def _withdraw_namespace(self, session) -> None:
+        """Release the namespace at teardown so the relay cleans up.
+
+        d14/d16 send PUBLISH_NAMESPACE_DONE; d18 resets the announce's
+        request stream instead. publish_namespace_done() picks the right
+        one for the negotiated draft.
+        """
+        try:
+            session.publish_namespace_done(namespace=self.namespace)
+        except Exception:
+            logger.debug("namespace withdraw failed at teardown",
+                         exc_info=True)
+
     def __init__(self, session, namespace: str, trackname: str = 'track',
                  object_size: int = 1024, group_size: int = 60,
                  num_subgroups: int = 1, rate: float = 0,
                  priority: int = 128,
-                 auth_token: bytes = b"bench-token"):
+                 auth_token: bytes = b"bench-token",
+                 forwarding: ForwardingPreference =
+                     ForwardingPreference.SUBGROUP):
         super().__init__(session, namespace, trackname,
                          object_size, group_size, num_subgroups, rate)
+        self.forwarding = forwarding
         self.priority = priority
         self.auth_token = auth_token
+        # Subscription Forward State (§5.1): objects are sent only while 1.
+        self.forward = True
         self._subscriber_event = asyncio.Event()
         self._generating = False
+        # (group_id, object_id) max over all objects sent; None until
+        # the first object exists. Drives ContentExists/Largest Location
+        # in SUBSCRIBE_OK.
+        self._largest = None
         # Terminal flag: set once PUBLISH_DONE has been sent. Generation
         # is then permanently refused — a late REQUEST_UPDATE / SUBSCRIBE
         # from the relay must NOT restart object production after we have
@@ -129,6 +157,15 @@ class PublishedTrack(Track):
         self._done = False
         self._stream_count = 0  # tracks streams opened for PUBLISH_DONE
         self._subscribe_request_id = None  # request_id from relay's SUBSCRIBE
+        # Request ids currently subscribed to this track. Production runs
+        # while the set is non-empty and idles when it drains, so normal
+        # subscriber churn parks the track instead of ending it.
+        self._subscribers: set = set()
+        # Payload pattern built by generate(); its presence marks the
+        # track as started, so a subscriber arriving after an idle period
+        # restarts producers without re-entering generate(). The session
+        # and alias come from that subscriber, not from the first one.
+        self._pad = None
         # Aggregate stats across all subgroup streams; subgroup 0 reports.
         self._iv_objects = 0
         self._iv_bytes = 0
@@ -141,6 +178,12 @@ class PublishedTrack(Track):
         # VideoTrack inherits via super().__init__. Bounded to 16 bits to
         # avoid CPython bigint promotion in long-running processes.
         self._yield_tick = 0
+
+    def _note_largest(self, group_id: int, object_id: int) -> None:
+        """Track Largest Location as a max — group arrival/send order
+        is not guaranteed monotonic (§2.3.1)."""
+        if self._largest is None or (group_id, object_id) > self._largest:
+            self._largest = (group_id, object_id)
 
     async def publish(self, announce_namespace: bool = False,
                       publish_track: bool = True,
@@ -161,24 +204,19 @@ class PublishedTrack(Track):
             Rare; some relays want both. Breaks on CF d14 moq-rs.
 
         Args:
-          forward: initial Forward State in PUBLISH (d16 §8.2). Default
-            0 = "I'll wait" (spec-conservative; generation starts when
-            relay's PUBLISH_OK or a SUBSCRIBE/REQUEST_UPDATE signals
-            forward=1). Pass forward=1 to declare optimistic intent —
-            generation starts immediately after sending PUBLISH, before
-            waiting for PUBLISH_OK.
-            **EXPERIMENTAL — NOT SUPPORTED BY THE SPEC.** Per Alan
-            Frindell, MoQT does not support sending objects before the
-            PUBLISH_OK handshake completes; relays will reject the
-            unsolicited uni streams (every first-object parse fails).
-            Kept in the API for future use should the spec evolve, and
-            for low-level wire experimentation. Do not rely on this in
-            production.
+          forward: initial Forward State in PUBLISH (§9.13). 0 (default):
+            generation waits for PUBLISH_OK, SUBSCRIBE or an update
+            carrying forward=1. 1: objects start immediately after
+            PUBLISH, before PUBLISH_OK; the peer's PUBLISH_OK or a later
+            update may set forward=0, which pauses emission.
         """
         if not (announce_namespace or publish_track):
             raise ValueError(
                 "publish(): need at least one of "
                 "announce_namespace or publish_track")
+
+        if self.forwarding == ForwardingPreference.DATAGRAM:
+            self._check_datagram_fit()
 
         if announce_namespace:
             await self.session.publish_namespace(
@@ -217,15 +255,48 @@ class PublishedTrack(Track):
             )
             self.track_alias = pub_msg.track_alias
             self.request_id = pub_msg.request_id
+            self.forward = bool(forward)
             self.state = TrackState.PUBLISHED
             logger.info(f"Track: published {self.fqtn} "
                          f"alias={self.track_alias} forward={forward}")
+            if getattr(self.session, 'negotiated_draft', 0) >= 18:
+                # d18 answers PUBLISH with REQUEST_OK (0x07) on the
+                # request's own stream — a universal reply type, so
+                # correlate by request id, not the 0x1E type handler.
+                # Registering before any await keeps it race-free.
+                fut = self.session._loop.create_future()
+                self.session._pending_requests[pub_msg.request_id] = fut
+                self._subscribers.add(pub_msg.request_id)
+                self.session.register_request_cancel_handler(
+                    pub_msg.request_id, self._on_request_cancelled)
+                asyncio.create_task(
+                    self._await_publish_reply(pub_msg.request_id))
             # Optimistic mode: don't wait for PUBLISH_OK before generating.
             # The relay may RESET our streams or downshift to forward=0;
             # both are handled by existing reset / SUBSCRIBE_UPDATE paths.
             if forward:
                 asyncio.create_task(
                     self._start_generating(self.session, "OPTIMISTIC"))
+
+    def _check_datagram_fit(self) -> None:
+        """Refuse datagram delivery that could never reach the wire —
+        DATAGRAM frames cannot be fragmented, so an oversize object is
+        a configuration error, not backpressure."""
+        cap = self.session.datagram_max_payload()
+        if cap == 0:
+            raise ValueError(
+                "datagram delivery unavailable on this session "
+                "(peer did not negotiate QUIC datagrams, or the "
+                "transport is WebTransport — WT datagram TX is not "
+                "wired yet)")
+        if self.object_size + _DGRAM_HEADER_MARGIN > cap:
+            raise ValueError(
+                f"object_size={self.object_size} cannot fit one "
+                f"datagram (payload ceiling {cap}B minus "
+                f"{_DGRAM_HEADER_MARGIN}B header margin = "
+                f"{cap - _DGRAM_HEADER_MARGIN}B max). DATAGRAM frames "
+                f"cannot be fragmented — use subgroup delivery for "
+                f"objects this large")
 
     async def _start_generating(self, session, trigger: str):
         """Start data generation if not already running."""
@@ -244,38 +315,110 @@ class PublishedTrack(Track):
         self.state = TrackState.SUBSCRIBED
         self._subscriber_event.set()
         self._generating = True
+        if self._pad is not None:
+            # Restart after an idle period. generate() is still parked on
+            # session close, so only the producers need respawning — under
+            # this subscriber's alias, which is not the first one's.
+            self._spawn_producers(session, self.track_alias, self._pad)
+            return
         await self.generate(session, self.track_alias)
+
+    def _set_forward(self, forward: Optional[int]) -> None:
+        """Apply a peer-signalled Forward State; None leaves it unchanged."""
+        if forward is None:
+            return
+        forward = bool(forward)
+        if forward != self.forward:
+            logger.info(f"Track: forward state -> {int(forward)}")
+        self.forward = forward
 
     async def _on_publish_ok(self, session, msg: PublishOk):
         """Relay accepted our PUBLISH. forward=1 starts generation if
         not already running (no-op if optimistic publish already kicked
-        off the generator). forward=0 is logged but does not stop a
-        running generator — relay can RESET streams to enforce."""
+        off the generator); forward=0 pauses object emission."""
         logger.info(f"Track: PUBLISH_OK: forward={msg.forward}")
-        if msg.forward:
+        self._set_forward(msg.forward)
+        if self.forward:
             await self._start_generating(session, "PUBLISH_OK")
 
+    async def _await_publish_reply(self, request_id: int):
+        """d18: the PUBLISH acceptance arrives as a REQUEST_OK carrying
+        the FORWARD (0x10) parameter."""
+        try:
+            reply = await self.session._await_response(request_id)
+        except MOQTRequestError as e:
+            logger.info(f"Track: PUBLISH rejected: {e}")
+            return
+        forward = getattr(reply, 'forward', None)
+        if forward is None:
+            forward = (reply.parameters or {}).get(ParamType.FORWARD) \
+                if hasattr(reply, 'parameters') else None
+        logger.info(f"Track: PUBLISH_OK (REQUEST_OK): forward={forward}")
+        self._set_forward(forward)
+        if self.forward:
+            await self._start_generating(self.session, "PUBLISH_OK")
+
     async def _on_request_update(self, session, msg: RequestUpdate):
-        """d16 REQUEST_UPDATE — subscriber wants data."""
+        """REQUEST_UPDATE — subscriber changes forward state."""
         logger.info(f"Track: REQUEST_UPDATE: {msg}")
+        # §10.9: the receiver MUST answer with exactly one REQUEST_OK
+        # or REQUEST_ERROR.
+        session._send_reply(msg.request_id,
+                            RequestOk(request_id=msg.request_id))
         forward = (msg.parameters.get(ParamType.FORWARD)
                    if msg.parameters else None)
-        if not forward:
-            return
-        await self._start_generating(session, "REQUEST_UPDATE")
+        self._set_forward(forward)
+        if forward:
+            await self._start_generating(session, "REQUEST_UPDATE")
 
     async def _on_subscribe_update(self, session, msg):
         """SUBSCRIBE_UPDATE — subscriber changed forward state."""
         logger.info(f"Track: SUBSCRIBE_UPDATE: forward={msg.forward}")
-        if msg.forward:
+        self._set_forward(msg.forward)
+        if self.forward:
             await self._start_generating(session, "SUBSCRIBE_UPDATE")
 
     async def _on_subscribe(self, session, msg):
         """Relay forwarded a subscriber's SUBSCRIBE."""
-        ok = session.subscribe_ok(request_msg=msg)
+        # Report real content state: a subscriber that sees
+        # ContentExists=0 rightly skips its joining FETCH (mlmsub does).
+        kw = {}
+        if self._largest is not None:
+            kw = dict(content_exists=1,
+                      largest_group_id=self._largest[0],
+                      largest_object_id=self._largest[1])
+        ok = session.subscribe_ok(request_msg=msg, **kw)
         self.track_alias = ok.track_alias
         self._subscribe_request_id = msg.request_id
-        await self._start_generating(session, "SUBSCRIBE")
+        self._subscribers.add(msg.request_id)
+        # §3.3.2: the subscriber cancels by terminating the request
+        # stream — stop generating when it does.
+        session.register_request_cancel_handler(
+            msg.request_id, self._on_request_cancelled)
+        self._set_forward(getattr(msg, 'forward', None))
+        if self.forward:
+            await self._start_generating(session, "SUBSCRIBE")
+
+    def _on_request_cancelled(self, request_id: int) -> None:
+        """A subscriber left (§3.3.2 request-stream termination, or an
+        UNSUBSCRIBE before d18). The track is not over, its audience is:
+        stop producing only once the last one goes, and stay eligible to
+        restart when the next subscriber arrives."""
+        self._subscribers.discard(request_id)
+        if self._subscribers:
+            logger.info(f"Track: subscriber {request_id} left, "
+                        f"{len(self._subscribers)} still subscribed")
+            return
+        logger.info(f"Track: last subscriber left — idling")
+        self._stop_producing()
+
+    def _stop_producing(self) -> None:
+        """Cancel the producer tasks; per-task cancel paths RESET open
+        subgroup streams. Leaves the track restartable."""
+        for t in list(self._tasks):
+            t.cancel()
+        self._tasks.clear()
+        self._generating = False
 
     def _send_publish_done(self, session, status_code=0x2):
         """Send PUBLISH_DONE with stream count for clean shutdown.
@@ -305,7 +448,10 @@ class PublishedTrack(Track):
         logger.info(f"Track: PUBLISH_DONE request_id={req_id} "
                     f"streams={self._stream_count}")
         try:
-            session.send_control_message(msg)
+            # d18 §10.11: PUBLISH_DONE rides the subscription's request
+            # stream, FIN after; pre-d18 _send_reply routes to the
+            # control stream.
+            session._send_reply(req_id, msg, fin=True)
         except Exception:
             pass  # session may already be closing
 
@@ -319,9 +465,12 @@ class PublishedTrack(Track):
         self._do_print_stats_header()
 
     def _do_print_stats_header(self):
-        print(f"\n  {'Interval':<10}{'Grps':<8}{'Objs':<10}"
-              f"{'ObjRate':<10}{'Bitrate':<10}")
-        print("  " + "─" * 48)
+        # Publisher group counts are emitted, not observed: no loss and
+        # no inference, so they stay meaningful for datagram delivery
+        # too (unlike the receiver's, which can miss a fully-lost group).
+        print(f"\n  {'Interval':<10}{'Grps':<8}{'GrpRate':<10}"
+              f"{'Objs':<10}{'ObjRate':<10}{'Bitrate':<10}")
+        print("  " + "─" * 58)
 
     async def generate(self, session, track_alias: int):
         """Generate data for subscribers. Override for custom content.
@@ -341,8 +490,37 @@ class PublishedTrack(Track):
         # from; the counted suffix shows offset-within-object.
         pad = bytes(i & 0xFF for i in range(self.object_size))
 
+        if self.forwarding == ForwardingPreference.DATAGRAM:
+            self._check_datagram_fit()
+            if self.num_subgroups > 1:
+                logger.warning(
+                    "Track: num_subgroups ignored for datagram delivery "
+                    "(no streams to parallelize)")
+        self._pad = pad
+        self._spawn_producers(session, track_alias, pad)
+        await session.async_closed()
+        self._send_publish_done(session)
+        self._withdraw_namespace(session)
+        session._close_session()
+
+    def _spawn_producers(self, session, track_alias: int,
+                         pad: bytes) -> None:
+        """Start one producer task per subgroup, or a single task for
+        datagram delivery. Re-callable: a subscriber arriving after an
+        idle period restarts production on the same track."""
+        if self.forwarding == ForwardingPreference.DATAGRAM:
+            task = asyncio.create_task(
+                self._generate_datagrams(
+                    session=session, track_alias=track_alias, pad=pad))
+            task.add_done_callback(lambda t: self._tasks.discard(t))
+            self._tasks.add(task)
+            return
+
         for subgroup_id in range(self.num_subgroups):
-            priority = self.priority if subgroup_id == 0 else 0
+            # §7: lower value = higher priority. Siblings ride one step
+            # BELOW subgroup 0 (0 would be the highest priority there is).
+            priority = (self.priority if subgroup_id == 0
+                        else min(self.priority + 1, 255))
             task = asyncio.create_task(
                 self._generate_subgroup(
                     session=session,
@@ -355,16 +533,101 @@ class PublishedTrack(Track):
             task.add_done_callback(lambda t: self._tasks.discard(t))
             self._tasks.add(task)
 
-        await session.async_closed()
-        # Send PUBLISH_DONE to indicate clean track completion
-        self._send_publish_done(session)
-        # Release the namespace so the relay cleans up
+    async def _generate_datagrams(self, session, track_alias: int,
+                                  pad: bytes,
+                                  report_interval: float = 5.0):
+        """Generate the track as OBJECT_DATAGRAMs — one datagram per
+        object, paced exactly like the subgroup path. Transport
+        backpressure is the bounded per-connection record ring
+        (dgram_write_drain parks when full); loss is expected and
+        unrepaired by design."""
+        start_time = time.monotonic()
+        last_report = start_time
+        next_frame_time = time.monotonic()
+        group_id = -1
+        cur_obj_id = self.group_size  # force group roll on first object
+        prof = session._profile
+        report = not getattr(self, '_quiet', False)
+
         try:
-            session.publish_namespace_done(
-                namespace=self.namespace)
-        except Exception:
-            pass
-        session._close_session()
+            while True:
+                if cur_obj_id >= self.group_size:
+                    group_id += 1
+                    cur_obj_id = 0
+
+                seq_info = f"{group_id}.{cur_obj_id}".encode()
+                payload = (seq_info + b'|' + pad)[:self.object_size]
+                obj = ObjectDatagram(
+                    track_alias=track_alias,
+                    group_id=group_id,
+                    object_id=cur_obj_id,
+                    publisher_priority=self.priority,
+                    extensions={
+                        MOQT_TIMESTAMP_EXT: int(time.time() * 1_000_000)},
+                    payload=payload,
+                    end_of_group=(cur_obj_id == self.group_size - 1),
+                )
+                buf = obj.serialize(prof=prof)
+                obj_bytes = buf.tell()
+                self._note_largest(group_id, cur_obj_id)
+                cur_obj_id += 1
+
+                if session._close_err is not None:
+                    raise asyncio.CancelledError
+                await session.dgram_write_drain(buf)
+                self._total_sent += 1
+                self._total_bytes += obj_bytes
+                self._iv_objects += 1
+                self._iv_bytes += obj_bytes
+
+                now = time.monotonic()
+                if report and now - last_report >= report_interval:
+                    dt = now - last_report
+                    elapsed = now - start_time
+                    obj_s = self._iv_objects / dt
+                    bps = (self._iv_bytes * 8) / dt
+                    rate_s = fmt_rate(obj_s)
+                    bps_s = fmt_bps(bps)
+                    iv = f"{elapsed - dt:.0f}-{elapsed:.0f}s"
+                    self._print_stats_header()
+                    # Datagram delivery emits no groups: there is no
+                    # stream to open or close, only a group_id field
+                    # advancing every group_size objects. Reporting a
+                    # count would invite comparison with the subgroup
+                    # table, where it means stream turnover.
+                    print(f"  {iv:<10}{'n/a':<8}"
+                          f"{'n/a':<10}{self._total_sent:<10}"
+                          f"{rate_s:<10}{bps_s:<10}")
+                    self._iv_objects = 0
+                    self._iv_bytes = 0
+                    self._iv_groups = 0
+                    last_report = now
+
+                # Same absolute-deadline pacer as the subgroup path;
+                # datagrams have a single sender so rate is undivided.
+                current_rate = self.rate
+                if current_rate > 0:
+                    next_frame_time += 1.0 / current_rate
+                    sleep_time = next_frame_time - time.monotonic()
+                    if sleep_time > 0.0005:
+                        await asyncio.sleep(sleep_time)
+                    else:
+                        self._yield_tick = (self._yield_tick + 1) & 0xFFFF
+                        if self._yield_tick & (_PACED_YIELD_EVERY - 1) == 0:
+                            await asyncio.sleep(0)
+                else:
+                    # Max-rate: dgram_write_drain only suspends when the
+                    # record ring fills, so keep a periodic cooperative
+                    # yield exactly like the paced fall-through.
+                    self._yield_tick = (self._yield_tick + 1) & 0xFFFF
+                    if self._yield_tick & (_PACED_YIELD_EVERY - 1) == 0:
+                        await asyncio.sleep(0)
+
+        except asyncio.CancelledError:
+            dur = time.monotonic() - start_time
+            logger.info(
+                f"Track: datagram generation ended: {self._total_sent} "
+                f"objects, {self._total_bytes} bytes in {dur:.1f}s")
 
     async def _generate_subgroup(self, session, subgroup_id: int,
                                   track_alias: int, priority: int,
@@ -435,6 +698,7 @@ class PublishedTrack(Track):
                                                 extensions=extensions,
                                                 object_id=cur_obj_id)
                 obj_bytes = len(data)
+                self._note_largest(group_id, cur_obj_id)
                 cur_obj_id += self.num_subgroups
 
                 if session._close_err is not None:
@@ -457,9 +721,10 @@ class PublishedTrack(Track):
                     bps_s = fmt_bps(bps)
                     iv = f"{elapsed - dt:.0f}-{elapsed:.0f}s"
                     self._print_stats_header()
+                    grp_s = fmt_rate(self._iv_groups / dt)
                     print(f"  {iv:<10}{self._total_groups:<8}"
-                          f"{self._total_sent:<10}{rate_s:<10}"
-                          f"{bps_s:<10}")
+                          f"{grp_s:<10}{self._total_sent:<10}"
+                          f"{rate_s:<10}{bps_s:<10}")
                     self._iv_objects = 0
                     self._iv_bytes = 0
                     self._iv_groups = 0
@@ -498,7 +763,7 @@ class PublishedTrack(Track):
             # if the session is already torn down — the primitive
             # short-circuits anyway, but avoid the bookkeeping noise.
             if session._close_err is None:
-                session.stream_reset(stream_id, SessionCloseCode.NO_ERROR)
+                session.stream_reset(stream_id, StreamResetCode.CANCELLED)
             dur = time.monotonic() - start_time
             if dur > 0 and report:
                 bps = (self._total_bytes * 8) / dur
@@ -570,7 +835,7 @@ class SubscribedTrack(Track):
             params = {}
             if self.auth_token is not None:
                 params[ParamType.AUTH_TOKEN] = self.auth_token
-            await self.session.subscribe(
+            ok = await self.session.subscribe(
                 namespace=self.namespace,
                 track_name=self.trackname,
                 forward=forward,
@@ -578,12 +843,28 @@ class SubscribedTrack(Track):
                 parameters=params,
                 wait_response=True,
             )
+            # Publisher's SUBSCRIBE_OK alias is authoritative (the
+            # discovery path gets it from PUBLISH instead).
+            if getattr(ok, 'track_alias', None) is not None:
+                self.track_alias = ok.track_alias
+                if self.on_object:
+                    self.session.register_object_handler(
+                        self.track_alias, self.on_object)
             self.state = TrackState.SUBSCRIBED
             logger.info(f"Track: subscribed (direct) to {self.fqtn}")
             return
 
-        # Namespace-based discovery: subscribe_namespace → relay sends
-        # PUBLISH → extract trackname → PUBLISH_OK(forward=1). If a
+        # Namespace-based discovery. Two shapes:
+        #
+        #   d14/d16 — SUBSCRIBE_NAMESPACE alone; the relay pushes a
+        #     PUBLISH for every track under the prefix.
+        #   d18     — SUBSCRIBE_NAMESPACE reports NAMESPACEs under the
+        #     prefix, then SUBSCRIBE_TRACKS asks one namespace for its
+        #     tracks and that is answered with PUBLISH. Splitting the
+        #     two keeps a broad prefix from obliging the relay to
+        #     announce every track it holds.
+        #
+        # Both converge on PUBLISH → PUBLISH_OK(forward=1). If a
         # trackname is set, only a matching PUBLISH is accepted; others
         # are dropped. No fallback — discovery failure raises.
         ns_kwargs = {}
@@ -604,11 +885,28 @@ class SubscribedTrack(Track):
         )
         self.state = TrackState.ANNOUNCED
 
-        if self.trackname is None:
-            print(f"  Waiting for publisher on "
-                  f"'{self.namespace}'...")
-        else:
-            print(f"  Waiting for track '{self.fqtn}'...")
+        if self.session._profile.two_level_discovery:
+            # d18: learn which namespaces exist under the prefix, then
+            # ask one of them for its tracks. An empty suffix means the
+            # prefix itself is the namespace.
+            ns_msg = await self.session.await_namespace(timeout=timeout)
+            suffix = tuple(
+                p.decode() if isinstance(p, bytes) else p
+                for p in (ns_msg.namespace_suffix or ())
+            )
+            full_ns = '/'.join(
+                part for part in (self.namespace, *suffix) if part)
+            logger.info(f"Track: d18 namespace discovered: {full_ns}")
+            self.namespace = full_ns
+            await self.session.subscribe_tracks(
+                namespace=full_ns, parameters=ns_params)
+
+        if not getattr(self, '_quiet', False):
+            if self.trackname is None:
+                print(f"  Waiting for publisher on "
+                      f"'{self.namespace}'...")
+            else:
+                print(f"  Waiting for track '{self.fqtn}'...")
         pub_msg = await self.session.await_publish(
             timeout=timeout, trackname=self.trackname)
 
@@ -631,6 +929,9 @@ class SubscribedTrack(Track):
             self.track_alias = pub_msg.track_alias
             self.session._track_aliases[
                 pub_msg.track_alias] = pub_msg.request_id
+            if self.on_object:
+                self.session.register_object_handler(
+                    self.track_alias, self.on_object)
 
         ok = PublishOk(
             request_id=pub_msg.request_id,
@@ -642,7 +943,8 @@ class SubscribedTrack(Track):
         )
         logger.info(f"Track: PUBLISH_OK {self.fqtn} "
                     f"alias={self.track_alias} forward={forward}")
-        self.session.send_control_message(ok)
+        # Reply returns on the PUBLISH's own bidi stream at d18.
+        self.session._send_reply(pub_msg.request_id, ok)
 
         self.state = TrackState.SUBSCRIBED
         logger.info(f"Track: subscribed to {self.fqtn}")
@@ -845,6 +1147,7 @@ class VideoTrack(PublishedTrack):
                     extensions=extensions,
                     object_id=cur_obj_id)
                 obj_bytes = len(buf.data)
+                self._note_largest(group_id, cur_obj_id)
                 cur_obj_id += self.num_subgroups
 
                 if session._close_err is not None:

@@ -62,11 +62,18 @@ class RequestError(MOQTMessage):
 
     Retry Interval: minimum ms before retrying + 1.
         0 = don't retry. 1 = retry immediately.
+
+    redirect (d18 §10.6.1, present only with Error Code REDIRECT 0x34):
+        (connect_uri, track_namespace, track_name) — an empty connect_uri
+        means "retry on this session".
     """
     request_id: int = None
     error_code: int = None
     retry_interval: int = 0  # 0 = don't retry
     reason: str = None
+    redirect: Optional[Tuple[bytes, Tuple[bytes, ...], bytes]] = None
+
+    REDIRECT = 0x34
 
     def __post_init__(self):
         self.type = D16MessageType.REQUEST_ERROR
@@ -85,6 +92,18 @@ class RequestError(MOQTMessage):
         payload.push_vint(len(reason_bytes))
         payload.push_bytes(reason_bytes)
 
+        if (self.error_code == self.REDIRECT and self.redirect is not None
+                and not prof.reply_has_request_id):
+            uri, namespace, name = self.redirect
+            payload.push_vint(len(uri))
+            payload.push_bytes(uri)
+            payload.push_vint(len(namespace))
+            for part in namespace:
+                payload.push_vint(len(part))
+                payload.push_bytes(part)
+            payload.push_vint(len(name))
+            payload.push_bytes(name)
+
         buf.push_uint_var(self.type)
         buf.push_uint16(payload.tell())
         buf.push_bytes(payload.data_slice(0, payload.tell()))
@@ -96,14 +115,22 @@ class RequestError(MOQTMessage):
                       if prof.reply_has_request_id else None)
         error_code = buf.pull_vint()
         retry_interval = buf.pull_vint()
-        reason_len = buf.pull_vint()
-        reason = buf.pull_bytes(reason_len).decode()
+        reason = MOQTMessage._pull_reason(buf)
+
+        redirect = None
+        if (error_code == cls.REDIRECT and not prof.reply_has_request_id
+                and (buf_end is None or buf.tell() < buf_end)):
+            uri = buf.pull_bytes(buf.pull_vint())
+            namespace = MOQTMessage._pull_tuple(buf)
+            name = buf.pull_bytes(buf.pull_vint())
+            redirect = (uri, namespace, name)
 
         return cls(
             request_id=request_id,
             error_code=error_code,
             retry_interval=retry_interval,
             reason=reason,
+            redirect=redirect,
         )
 
 
@@ -187,10 +214,7 @@ class Namespace(MOQTMessage):
 
     @classmethod
     def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'Namespace':
-        tuple_len = buf.pull_vint()
-        namespace_suffix = tuple(
-            buf.pull_bytes(buf.pull_vint()) for _ in range(tuple_len)
-        )
+        namespace_suffix = MOQTMessage._pull_tuple(buf)
         return cls(namespace_suffix=namespace_suffix)
 
 
@@ -224,8 +248,5 @@ class NamespaceDone(MOQTMessage):
 
     @classmethod
     def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'NamespaceDone':
-        tuple_len = buf.pull_vint()
-        namespace_suffix = tuple(
-            buf.pull_bytes(buf.pull_vint()) for _ in range(tuple_len)
-        )
+        namespace_suffix = MOQTMessage._pull_tuple(buf)
         return cls(namespace_suffix=namespace_suffix)

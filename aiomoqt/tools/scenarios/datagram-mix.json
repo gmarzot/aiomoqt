@@ -1,0 +1,24 @@
+{
+    "_comment": "Mixed delivery-mode matrix: datagram tracks (telemetry/audio-sized, all fit one packet) alongside subgroup-stream cams, so relay and dashboard see both object flows concurrently. ~330 peak subs, ~35 Mbps worst-case.",
+    "relay": "moqt://moqx-main.ci.openmoq.org:4433",
+    "publishers": [
+        {"namespace": "mix-video", "track": "cam-a", "bitrate_kbps": 250, "fps": 15, "start_delay": 0, "duration": 480},
+        {"namespace": "mix-video", "track": "cam-b", "bitrate_kbps": 250, "fps": 15, "start_delay": 20, "duration": 440},
+
+        {"namespace": "mix-audio", "track": "mix-1", "bitrate_kbps": 96, "fps": 25, "delivery": "datagram", "start_delay": 0, "duration": 480},
+        {"namespace": "mix-audio", "track": "mix-2", "bitrate_kbps": 64, "fps": 25, "delivery": "datagram", "start_delay": 10, "duration": 460},
+
+        {"namespace": "mix-telemetry", "track": "sensors", "bitrate_kbps": 32, "fps": 8, "delivery": "datagram", "start_delay": 0, "duration": 480},
+        {"namespace": "mix-telemetry", "track": "gps", "bitrate_kbps": 16, "fps": 4, "delivery": "datagram", "start_delay": 0, "duration": 480}
+    ],
+    "subscribers": [
+        {"namespace": "mix-video", "track": "cam-a", "subs": 60, "join_rate": 8, "join_delay": 0, "churn_rate": 0.02, "leave_early": 45, "leave_rate": 8},
+        {"namespace": "mix-video", "track": "cam-b", "subs": 40, "join_rate": 6, "join_delay": 5, "churn_rate": 0.03, "leave_early": 40, "leave_rate": 6},
+
+        {"namespace": "mix-audio", "track": "mix-1", "subs": 80, "join_rate": 10, "join_delay": 0, "churn_rate": 0.02, "leave_early": 40, "leave_rate": 10},
+        {"namespace": "mix-audio", "track": "mix-2", "subs": 60, "join_rate": 8, "join_delay": 5, "churn_rate": 0.03, "leave_early": 40, "leave_rate": 8},
+
+        {"namespace": "mix-telemetry", "track": "sensors", "subs": 55, "join_rate": 8, "join_delay": 0, "churn_rate": 0.01, "leave_early": 20, "leave_rate": 10},
+        {"namespace": "mix-telemetry", "track": "gps", "subs": 35, "join_rate": 6, "join_delay": 0, "churn_rate": 0.01, "leave_early": 20, "leave_rate": 8}
+    ]
+}

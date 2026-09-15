@@ -98,6 +98,10 @@ class ClientSetup(MOQTMessage):
 @dataclass(slots=True)
 class GoAway(MOQTMessage):
     new_session_uri: str = None
+    # d18 §10.4 (Figure 7): Timeout always; Request ID only in the
+    # control-stream form (smallest unprocessed peer request id).
+    timeout: int = 0
+    request_id: Optional[int] = None
 
     # New Session URI maximum length: 8 KiB.
     MAX_URI_LENGTH = 8192
@@ -107,17 +111,22 @@ class GoAway(MOQTMessage):
 
     def serialize(self, *, prof: DraftProfile) -> Buffer:
         buf = Buffer(capacity=BUF_SIZE)
-        payload = Buffer(capacity=BUF_SIZE)
+        payload = Buffer(capacity=BUF_SIZE, vi64=prof.vi64)
 
         uri_bytes = self.new_session_uri.encode()
         if len(uri_bytes) > self.MAX_URI_LENGTH:
             raise ValueError(
                 "New Session URI exceeds maximum length (8 KiB)")
 
-        payload.push_uint_var(len(uri_bytes))  # uri length
+        payload.push_vint(len(uri_bytes))  # uri length
         payload.push_bytes(uri_bytes)
+        if prof.draft >= 18:
+            payload.push_vint(self.timeout or 0)
+            if self.request_id is not None:
+                payload.push_vint(self.request_id)
 
-        buf.push_uint_var(self.type)
+        buf.vi64 = prof.vi64
+        buf.push_vint(self.type)
         buf.push_uint16(payload.tell())
         buf.push_bytes(payload.data)
 
@@ -127,11 +136,21 @@ class GoAway(MOQTMessage):
     def deserialize(cls, buf: Buffer, *, prof: DraftProfile,
                     buf_end: Optional[int] = None) -> 'GoAway':
         """Handle GOAWAY message."""
-        uri_len = buf.pull_uint_var()
+        buf.vi64 = prof.vi64
+        uri_len = buf.pull_vint()
         if uri_len > cls.MAX_URI_LENGTH:
             raise BufferReadError(
                 "New Session URI exceeds maximum length (8 KiB)")
 
         uri = buf.pull_bytes(uri_len).decode()
+        timeout = 0
+        request_id = None
+        if prof.draft >= 18:
+            timeout = buf.pull_vint()
+            # Request ID: only in the control-stream form; the message
+            # Length covers it, so remaining bytes decide presence.
+            if buf_end is not None and buf.tell() < buf_end:
+                request_id = buf.pull_vint()
 
-        return cls(new_session_uri=uri)
+        return cls(new_session_uri=uri, timeout=timeout,
+                   request_id=request_id)

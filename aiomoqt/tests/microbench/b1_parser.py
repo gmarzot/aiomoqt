@@ -23,8 +23,9 @@ import argparse
 import time
 
 from aiomoqt.context import profile_for
+from aiomoqt.types import parse_draft_spec
 from aiomoqt.messages.base import MOQTUnderflow
-from aiomoqt.messages.track import SubgroupHeader, ObjectHeader
+from aiomoqt.messages.data import SubgroupHeader, ObjectHeader
 from aiopquic.streamchain import StreamChain
 from aiomoqt.tests.microbench._bytestream import (
     make_subgroup_stream, chunked,
@@ -105,34 +106,29 @@ def _run_draft(draft, n_objects, payload_size, chunk_size,
     }
 
 
-def run_compare(n_objects, payload_size, chunk_size, duration, warmup) -> int:
+def run_compare(n_objects, payload_size, chunk_size, duration, warmup,
+                drafts=_COMPARE_DRAFTS) -> int:
     """Cross-draft RX-parse comparison: parse each draft's valid corpus and
     print an obj/s + ns/obj table with a relative-vs-d16 column + SUMMARY."""
     print(f"B1 — cross-draft RX parse comparison   "
           f"{n_objects} objs × {payload_size}B  duration={duration}s")
     print()
     res = {d: _run_draft(d, n_objects, payload_size, chunk_size,
-                         duration, warmup) for d in _COMPARE_DRAFTS}
+                         duration, warmup) for d in drafts}
 
+    ref = 16 if 16 in res else drafts[0]
     hdr = (f"  {'draft':<8}{'obj/s':>16}{'ns/obj':>12}"
-           f"{'Mbps':>12}{'ns vs d16':>12}")
+           f"{'Mbps':>12}{f'ns vs d{ref}':>12}")
     print(hdr)
     print("  " + "─" * (len(hdr) - 2))
-    base = res[16]["ns_per_obj"]
-    for d in _COMPARE_DRAFTS:
+    base = res[ref]["ns_per_obj"]
+    for d in drafts:
         r = res[d]
         rel = r["ns_per_obj"] / base if base else 0.0
         print(f"  d{d:<7}{r['obj_s']:>16,.0f}{r['ns_per_obj']:>12,.0f}"
               f"{r['mbps']:>12,.0f}{rel:>11.2f}x")
 
-    r18 = res[18]["ns_per_obj"] / base if base else 0.0
-    r14 = res[14]["ns_per_obj"] / base if base else 0.0
     print()
-    print("SUMMARY  (parse ns/obj relative to d16)")
-    print(f"  RX parse   d18/d16 {r18:5.2f}x   d14/d16 {r14:5.2f}x")
-    print(f"  -> d18 vi64 subgroup parse is within {abs(r18 - 1.0) * 100:.0f}% "
-          f"of d16's RFC9000 path; the fused per-object parser keeps the "
-          f"codec fork off the hot loop.")
     return 0
 
 
@@ -143,16 +139,18 @@ def main():
     ap.add_argument('--chunk-size', type=int, default=1500)
     ap.add_argument('--duration', type=float, default=5.0)
     ap.add_argument('--warmup', type=float, default=0.5)
-    ap.add_argument('--draft', default='16',
-                    help="draft number, or 'all' for the cross-draft "
-                         "RX-parse comparison")
+    ap.add_argument('--draft', default='16', type=parse_draft_spec,
+                    help='draft number, or a comma-separated list '
+                         '(e.g. 14,16,18) for the cross-draft '
+                         'RX-parse comparison')
     args = ap.parse_args()
 
-    if str(args.draft).lower() == 'all':
+    if isinstance(args.draft, list):
         return run_compare(args.n_objects, args.payload_size,
-                           args.chunk_size, args.duration, args.warmup)
+                           args.chunk_size, args.duration, args.warmup,
+                           drafts=args.draft)
 
-    draft = int(args.draft)
+    draft = args.draft
     prof = profile_for(draft)
     data = make_subgroup_stream(args.n_objects, args.payload_size, draft=draft)
     chunks = chunked(data, args.chunk_size) if args.chunk_size else [data]
