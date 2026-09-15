@@ -299,8 +299,8 @@ def _relay_ctrl_msg(url: str, draft: int, insecure: bool,
 
 
 def _relay_pub_sub(url: str, draft: int, pub_mode: str, insecure: bool,
-                   compat: str, log: Path, trackname: str,
-                   verdicts: set = frozenset()) -> tuple[str, str]:
+                   compat: str, log: Path,
+                   trackname: str) -> tuple[str, str]:
     cmd = [sys.executable, "-m", "aiomoqt.tools.load_sim",
            url, *MULTI_SUB_ARGS_COMMON, "--draft", str(draft),
            "-T", trackname, *PUB_MODE_FLAGS[pub_mode]]
@@ -318,16 +318,13 @@ def _relay_pub_sub(url: str, draft: int, pub_mode: str, insecure: bool,
     got, want = m.group(1), m.group(2)
     status = "PASS" if got == want else "FAIL"
     detail = f"{got}/{want} ok"
-    # SUBSCRIBE_OK alone is not a pass: a subscribed track that delivers
-    # no objects fails unless the relay is a known offender (verdict
-    # zero-objects-tolerated), which keeps the note visible instead.
+    # SUBSCRIBE_OK alone is not a pass. A subscription that carries no
+    # objects is a delivery failure whatever the relay's excuse.
     om = re.search(r"Total objects:\s+([\d,]+)", text)
     objects = int(om.group(1).replace(",", "")) if om else None
     if status == "PASS" and objects == 0:
-        if "zero-objects-tolerated" in verdicts:
-            detail += " (note: subscribed but 0 objects delivered; tolerated)"
-        else:
-            status, detail = "FAIL", f"{got}/{want} subscribed, 0 objects delivered"
+        status = "FAIL"
+        detail = f"{got}/{want} subscribed, 0 objects delivered"
     return status, detail
 
 
@@ -440,9 +437,6 @@ def _run_relay_matrix(relay: dict, enabled: set[str],
     # known non-spec relay behaviors (e.g. libquicr SUBSCRIBE_OK for a
     # nonexistent track). Tolerated outcomes are annotated, not hidden.
     compat_csv = ",".join(relay.get("compat", []))
-    # Verdicts are this harness's own pass/fail policy for a relay; they
-    # never reach the wire tools.
-    verdicts = set(relay.get("verdicts", []))
     rname = relay["name"]
 
     def _dispatch(suite: str, label_suffix: str, tag: str, slug: str,
@@ -483,7 +477,7 @@ def _run_relay_matrix(relay: dict, enabled: set[str],
                 _dispatch("relay-pub-sub", f"[{pub_mode}]", tag, slug,
                           lambda u, d, log: _relay_pub_sub(
                               u, d, pub_mode, insecure, compat_csv,
-                              log, tn, verdicts),
+                              log, tn),
                           url, draft)
             if "relay-join" in enabled:
                 _dispatch("relay-join", "", tag, slug,
