@@ -407,10 +407,12 @@ class _TrackStats:
     def count(self, payload: bytes, lag_us: int = 0, tx_us: int = 0):
         self.objects += 1
         self.bytes += len(payload)
-        lag_us = max(0, lag_us)
+        # Signed: negative means the stamp is AHEAD of the wall clock,
+        # which a receiver reads as negative end-to-end latency.
         self._lag_sum += lag_us
         self._lag_n += 1
-        self._lag_max = max(self._lag_max, lag_us)
+        if abs(lag_us) > abs(self._lag_max):
+            self._lag_max = lag_us
         self._tx_sum += max(0, tx_us)
 
     def take_lag(self):
