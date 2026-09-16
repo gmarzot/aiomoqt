@@ -99,8 +99,8 @@ WebCodecs = scheduled audio ahead, or the render cushion when video-only.
 - **The cushion must exceed the source's A/V arrival skew.** The publisher
   stats line reports it per track as `lag mean/max`; the overlay reports
   the end-to-end result as A/V skew. On the mp4 sources both are ~0 and
-  100 ms is fine. On the MPEG-TS path audio has measured ~130 ms behind
-  video, so Demo C uses `--target-latency 300`.
+  100 ms is fine. On the MPEG-TS path audio measured ~130 ms behind video
+  before the Demo C muxer flags; Demo C uses `--target-latency 200`.
 - Levers: `--target-latency` sets both the catalog target (cushion cap) and
   the printed `cushion=` (floor). A lower `cushion=` in the URL lets the
   cushion adapt between floor and target. The audio output clamps its own
@@ -117,7 +117,8 @@ Two ingest paths. `--ts -` (2026-09-10) carries video AND audio on one
 MPEG-TS pipe with the encoder's PTS, so pacing and A/V sync follow the
 source; `--h264 -` is the older video-only Annex-B pipe stamped on
 arrival. Prefer `--ts`.
-- OBS: Stream = Custom, `srt://<WSL-IP>:9000?latency=20`. Output: x264
+- OBS: Stream = Custom, `srt://<WSL-IP>:9000?latency=20000`
+  (microseconds, as in ffmpeg: `latency=20` is 20 µs = 0 ms). Output: x264
   CBR, keyint 2 s, `tune=zerolatency`, custom option `bframes=0`
   (not `bf=0`). Resolution from Settings → Video. Scene carries a ms
   clock burn-in. No media source in any scene may point at an srt://
@@ -145,7 +146,7 @@ arrival. Prefer `--ts`.
   ffmpeg is `-c copy`, so it costs nothing. A soft picture that no
   encoder setting improves was the canvas bug below — rebuild the player.
 - SHELL 1 (listener first, then start OBS streaming), A/V over TS:
-  `ffmpeg -hide_banner -loglevel warning -fflags nobuffer -flags low_delay -analyzeduration 0 -probesize 32768 -i 'srt://0.0.0.0:9000?mode=listener&latency=20' -map 0:v -map 0:a -c copy -f mpegts -flush_packets 1 - | python -m aiomoqt.tools.pub_media "$RELAY_WT" --draft 18 -k -N demo/$(date +%H%M%S) --ts - --target-latency 300 --keepalive 10 --catalog-interval 1 -t 3600`
+  `ffmpeg -hide_banner -loglevel warning -fflags nobuffer -analyzeduration 0 -probesize 32768 -i 'srt://0.0.0.0:9000?mode=listener&latency=20000' -map 0:v -map 0:a -c copy -f mpegts -pes_payload_size 0 -omit_video_pes_length 0 -muxdelay 0 -flush_packets 1 - | python -m aiomoqt.tools.pub_media "$RELAY_WT" --draft 18 -k -N demo/$(date +%H%M%S) --ts - --target-latency 200 --keepalive 10 --catalog-interval 1 -t 3600`
   pub_media waits for the PMT and both codec configs before connecting,
   then prints the namespace and a `player:` line — paste that URL.
   Video-only fallback: swap `-map 0:v -map 0:a -c copy -f mpegts` for
@@ -154,13 +155,19 @@ arrival. Prefer `--ts`.
 - No OBS at hand — synthetic A/V over the same TS path (`-pix_fmt
   yuv420p` is REQUIRED: lavfi testsrc is rgb24 and libx264 would pick
   High 4:4:4, which no browser decodes):
-  `ffmpeg -re -f lavfi -i testsrc=size=1280x720:rate=30 -f lavfi -i sine=frequency=440:sample_rate=48000 -vf "settb=1/1000000,setpts=RTCTIME,drawtext=text='%{eif\:mod(floor(t/60)\,60)\:d\:2}\:%{eif\:mod(floor(t)\,60)\:d\:2}.%{eif\:mod(floor(t*1000)\,1000)\:d\:3}':fontsize=64:fontcolor=white:box=1:boxcolor=black@0.8:boxborderw=12:x=40:y=40,settb=1/30,setpts=N" -c:v libx264 -preset veryfast -tune zerolatency -pix_fmt yuv420p -bf 0 -g 60 -c:a aac -f mpegts -flush_packets 1 - | python -m aiomoqt.tools.pub_media "$RELAY_WT" --draft 18 -k -N demo/$(date +%H%M%S) --ts - --target-latency 300 --keepalive 10 --catalog-interval 1 -t 3600`
-- BROWSER: the printed `player:` URL (`cushion=300`) — see the A/V skew
-  note in Demo B.
+  `ffmpeg -re -f lavfi -i testsrc=size=1280x720:rate=30 -f lavfi -i sine=frequency=440:sample_rate=48000 -vf "settb=1/1000000,setpts=RTCTIME,drawtext=text='%{eif\:mod(floor(t/60)\,60)\:d\:2}\:%{eif\:mod(floor(t)\,60)\:d\:2}.%{eif\:mod(floor(t*1000)\,1000)\:d\:3}':fontsize=64:fontcolor=white:box=1:boxcolor=black@0.8:boxborderw=12:x=40:y=40,settb=1/30,setpts=N" -c:v libx264 -preset veryfast -tune zerolatency -pix_fmt yuv420p -bf 0 -g 60 -c:a aac -f mpegts -pes_payload_size 0 -omit_video_pes_length 0 -muxdelay 0 -flush_packets 1 - | python -m aiomoqt.tools.pub_media "$RELAY_WT" --draft 18 -k -N demo/$(date +%H%M%S) --ts - --target-latency 200 --keepalive 10 --catalog-interval 1 -t 3600`
+- BROWSER: the printed `player:` URL (`cushion=200`), then click in the
+  page once: until a gesture the audio context stays suspended, audio does
+  not play and A/V skew grows with runtime.
+- Muxer flags: `-pes_payload_size 0` stops ffmpeg bundling AAC frames into
+  ~2930-byte PES (≈180 ms at 128 kbps, up to `muxdelay`/2 on silence);
+  `-omit_video_pes_length 0` lets pub_media emit a video frame when it
+  completes instead of when the next one starts (keyframes > 64 KB still
+  wait); `-muxdelay 0` drops the 0.7 s default bound.
 - Measure: burn-in clock vs player frame (screenshot both), overlay
-  latency P50/P95 (capture→arrival), cushion, stalls. 09-09 baseline was
-  640 ms glass, before the pub_media 64 KB read fix and the cushion knob;
-  re-measure and record here.
+  latency P50/P95 (capture→arrival), cushion, stalls. Glass: 09-09
+  640 ms (before the 64 KB read fix and the cushion knob); 09-16 1.17 s
+  without the muxer flags and 0.58 s with them (OBS 3440x1440, cushion 200).
 - On `--h264` frame pacing follows arrival stamps, so SRT/ffmpeg
   burstiness shows as uneven presentation; `--ts` stamps from the PES
   PTS and does not have this. The latency stat on `--ts` includes a
