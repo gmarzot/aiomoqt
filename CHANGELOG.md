@@ -41,6 +41,8 @@ Pairs with aiopquic 0.4.0rc1 (unchanged).
   loopback requests report at info.
 - pub_media: Ctrl-C exits quietly. A cancelled control task logs at
   debug; cancellation only happens at teardown.
+- pub_media: the printed LOC player URL sets the render cushion from
+  `--target-latency` and no longer adds `warmStart` or `catchUp`.
 - moq_interop_client: the Cloudflare draft-16 relay no longer gets
   `lenient-extensions` automatically. Its count-prefixed Track
   Extensions container fails strict; `--compat lenient-extensions`
@@ -64,6 +66,9 @@ Pairs with aiopquic 0.4.0rc1 (unchanged).
   tolerance is gone. The relay catalog keeps harness verdicts apart from
   wire tolerances, and harness-only keys no longer reach the interop
   client.
+- The interop tier gates only on curated endpoints per draft (`gating`
+  in `tests/relays.json`: moqx-main 16/18 among them). Every other relay
+  still runs, and its failures report as XFAIL.
 
 ### Docs
 - `docs/demo-runbook.md` rewritten for copy-paste use at d18.
