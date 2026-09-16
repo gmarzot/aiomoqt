@@ -181,18 +181,6 @@ def _player_url(args, relay, url: str, draft=None) -> str:
     return args.player_base + '?' + '&'.join(q)
 
 
-def _encoder_player_url(args, relay, url: str) -> str:
-    """moq-encoder-player page for this run. videoTrack/audioTrack and the
-    buffer parameters exist only in our local clone of that player."""
-    q = [f"host={_wt_url(relay, url)}", f"ns={args.namespace}",
-         "videoTrack=video", "audioTrack=audio", "packager=loc"]
-    if args.target_latency:
-        t = args.target_latency
-        q += [f"targetLatency={t}", f"playerBuffer={t}",
-              f"audioJitter={t}", f"videoJitter={t}"]
-    return 'http://localhost:8080/demo/player/?' + '&'.join(q)
-
-
 def _build_catalog(args, video, audio, chunkers=None) -> Catalog:
     packaging = args.packaging
     chunkers = chunkers or {}
@@ -610,9 +598,6 @@ async def run(args):
         for url, relay, s in zip(urls, relays, sessions):
             draft = getattr(s, 'negotiated_draft', None)
             print(f"  player: {_player_url(args, relay, url, draft)}")
-            if args.loc_codecstring:
-                print(f"  encoder-player: "
-                      f"{_encoder_player_url(args, relay, url)}")
 
         def _cs(codec):
             return codec if args.loc_codecstring else None
