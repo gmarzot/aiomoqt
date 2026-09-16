@@ -39,8 +39,19 @@ Pairs with aiopquic 0.4.0rc1 (unchanged).
   ahead of the wall clock.
 - server: the widened-bind notice warns only for a named interface;
   loopback requests report at info.
+- pub_media: Ctrl-C exits quietly. A cancelled control task logs at
+  debug; cancellation only happens at teardown.
+- moq_interop_client: the Cloudflare draft-16 relay no longer gets
+  `lenient-extensions` automatically. Its count-prefixed Track
+  Extensions container fails strict; `--compat lenient-extensions`
+  remains an explicit opt-in.
 
 ### Known issues
+- With the default `bbr1` congestion control, periodic latency spikes
+  every 10 s on paced flows. Once the minimum RTT goes stale, as it does
+  on a loaded host, BBRv1's ProbeRTT holds the window at 4 packets for
+  about 200 ms. `--cc-algo cubic` avoids it; the default is under
+  review.
 - Fan-out applies one draft, publish mode and client config to every
   relay. Relays on different drafts need a `--draft` all of them accept.
 - A relay lost during fan-out is dropped, not retried.
