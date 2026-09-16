@@ -55,10 +55,10 @@ benchmarking runbook). Copy it from the publisher's `namespace:` line.
 | `ns=` | namespace, split on `/` (`nsField=` repeatable for literal fields) | live |
 | `v=` | draft 14/16/18; a 16/18 pin never retries WT bare | 16 |
 | `catalogBootstrap=` | auto / joining-fetch / strict / subscribe | auto |
-| `warmStart=1` | joining FETCH of the current group (LOC only) | off |
-| `catchUp=` | max playback rate chasing the target (≥1, e.g. 1.1) | 1.0 = off |
-| `targetLatency=` | catch-up set point (ms); on CMAF also the seek landing | catalog value; CMAF landing 2 s |
-| `cushion=` / `cushionMax=` | LOC render-cushion floor / cap (ms) | 200 (50 if RTT<5 ms) / 750 |
+| `warmStart=1` | joining FETCH of the current group (LOC only; startup decode error at the seam) | off |
+| `catchUp=` | max playback rate chasing `targetLatency=` from the URL (not the catalog); wall-clock based | 1.0 = off |
+| `targetLatency=` | catch-up set point (ms); on CMAF also the seek landing; LOC cushion cap | catalog value; CMAF landing 2 s |
+| `cushion=` / `cushionMax=` | LOC render-cushion floor / cap (ms) | 200 (50 if RTT<5 ms) / target latency, at most 750 |
 | `debug=1` | engine debug log, MSE tracing, media-element events in the page log | off |
 
 The page log prints `Options: …` at load with exactly what reached the
@@ -89,24 +89,28 @@ WebCodecs = scheduled audio ahead, or the render cushion when video-only.
 
 ## Demo B — LOC file → glass (WebCodecs, A/V, joining fetch)
 - SHELL 1:
-  `python -m aiomoqt.tools.pub_media "$RELAY_WT" --draft 18 -k -N demo/$(date +%H%M%S) --mp4 "$ASSETS"/bbb-720p-2000k.mp4 --loop --target-latency 500 --keepalive 10 --catalog-interval 1 -t 3600`
+  `python -m aiomoqt.tools.pub_media "$RELAY_WT" --draft 18 -k -N demo/$(date +%H%M%S) --mp4 "$ASSETS"/bbb-720p-2000k.mp4 --loop --target-latency 100 --keepalive 10 --catalog-interval 1 -t 3600`
 - BROWSER: paste the `player:` URL the publisher printed. It already
   carries the relay, the namespace, `v=18`, `catalogBootstrap=subscribe`
-  and the per-packaging knobs. Add `&debug=1` for the engine log.
-- Targets: cushion tracks the floor you set and rises only on jitter
-  (cap 750); audio underruns 0; stalls 0; TTFF < 1 s with warmStart.
-- **`cushion=` must exceed the source's A/V arrival skew.** The publisher
+  and `cushion=<--target-latency>`. Add `&debug=1` for the engine log.
+- Targets: render cushion flat at the target (floor = cap =
+  `--target-latency`); audio late / snap 0; audio underruns 0; stalls 0.
+  TTFF waits for the next IDR (up to one 2 s GOP).
+- **The cushion must exceed the source's A/V arrival skew.** The publisher
   stats line reports it per track as `lag mean/max`; the overlay reports
   the end-to-end result as A/V skew. On the mp4 sources both are ~0 and
-  `cushion=50` is fine. On the MPEG-TS path audio has measured ~130 ms
-  behind video (skew 144 ms at the player, cushion pinned at 0, no
-  margin left), so use `cushion=250` or higher there until the skew
-  itself is addressed.
-- Levers: `cushion=` is the floor of the shared playout delay (video and
-  audio); `catchUp=1.1` drains latency debt; the audio output clamps its
-  own lead (5 % chase above 150 ms, drop-and-re-anchor above 750 ms) so
-  a publisher pause/restart no longer leaves audio seconds behind.
-- Late join = reload the tab: warmStart fetches the current group's head.
+  100 ms is fine. On the MPEG-TS path audio has measured ~130 ms behind
+  video, so Demo C uses `--target-latency 300`.
+- Levers: `--target-latency` sets both the catalog target (cushion cap) and
+  the printed `cushion=` (floor). A lower `cushion=` in the URL lets the
+  cushion adapt between floor and target. The audio output clamps its own
+  lead (2 % chase above 150 ms, drop-and-re-anchor above 750 ms); audio
+  that falls behind the cushion for 250 ms re-anchors (overlay "sync resets").
+- Not in the printed URL: `warmStart=1` (startup decode error at the
+  fetch/live seam, under investigation) and `catchUp=` (measures against
+  the browser wall clock, so the WSL/Windows clock offset reads as latency
+  and pitch-shifts audio).
+- Late join = reload the tab.
 
 ## Demo C — OBS → SRT → LOC live (glass-to-glass latency evidence)
 Two ingest paths. `--ts -` (2026-09-10) carries video AND audio on one
@@ -151,8 +155,8 @@ arrival. Prefer `--ts`.
   yuv420p` is REQUIRED: lavfi testsrc is rgb24 and libx264 would pick
   High 4:4:4, which no browser decodes):
   `ffmpeg -re -f lavfi -i testsrc=size=1280x720:rate=30 -f lavfi -i sine=frequency=440:sample_rate=48000 -vf "settb=1/1000000,setpts=RTCTIME,drawtext=text='%{eif\:mod(floor(t/60)\,60)\:d\:2}\:%{eif\:mod(floor(t)\,60)\:d\:2}.%{eif\:mod(floor(t*1000)\,1000)\:d\:3}':fontsize=64:fontcolor=white:box=1:boxcolor=black@0.8:boxborderw=12:x=40:y=40,settb=1/30,setpts=N" -c:v libx264 -preset veryfast -tune zerolatency -pix_fmt yuv420p -bf 0 -g 60 -c:a aac -f mpegts -flush_packets 1 - | python -m aiomoqt.tools.pub_media "$RELAY_WT" --draft 18 -k -N demo/$(date +%H%M%S) --ts - --target-latency 300 --keepalive 10 --catalog-interval 1 -t 3600`
-- BROWSER: the printed `player:` URL, but raise its `cushion=50` to
-  `cushion=250` — see the A/V skew note in Demo B.
+- BROWSER: the printed `player:` URL (`cushion=300`) — see the A/V skew
+  note in Demo B.
 - Measure: burn-in clock vs player frame (screenshot both), overlay
   latency P50/P95 (capture→arrival), cushion, stalls. 09-09 baseline was
   640 ms glass, before the pub_media 64 KB read fix and the cushion knob;
@@ -191,7 +195,7 @@ start; Eyevinn's moqlivemock endpoint is always on.
 - Player devtools, the audio path's own margin:
   `a=__player.audioOutput; [__player.stats.cushionMs, a?.scheduledAheadSec, a?.underrunCount, a?.captureLeadSec, a?.chasing, a?.liveEdgeSnapCount, __player.stats.avSkewMs]`
   A small positive `scheduledAheadSec` with 0 underruns = zero margin,
-  raise `cushion=`. Exactly 0 with 0 underruns = nothing scheduled.
+  raise `--target-latency`. Exactly 0 with 0 underruns = nothing scheduled.
 - CMAF stall, with `debug=1`: the stall line prints buffered ranges at
   start and end. A hole between ranges is delivery or packaging; a
   continuous range with a frozen playhead is the player.
@@ -238,9 +242,11 @@ start; Eyevinn's moqlivemock endpoint is always on.
 - High TTFF → keyframe wait: 2 s GOP, or CMAF startup seek not settling
   (upstream "startup seek … did not settle within 2000ms").
 - Cushion climbs after a stall on CMAF → gap-jump landing debt (Demo A
-  known state); on LOC → check `catchUp` reached the engine (Options line).
+  known state); on LOC → check `cushion=` and the Options line.
+- Audio drops out, "audio late / snap" late count rising → cushion below
+  the source's A/V skew; raise `--target-latency`.
 
-Pinned: moq-playa-v059 e8e674c (branch gmarzot-playa-dev on upstream
+Pinned: moq-playa-v059 0540d37 (branch gmarzot-playa-dev on upstream
 v0.5.9; fork PR gmarzot/moq-playa#1) ·
-aiomoqt gmarzot-0.11.0 d3f4298 + uncommitted pub_media read1 fix ·
+aiomoqt gmarzot-0.11.0 607b668 ·
 moqx-main v0.3.5 (linode-ci-000).
