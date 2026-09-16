@@ -165,19 +165,17 @@ def _wt_url(relay, url: str) -> str:
 
 def _player_url(args, relay, url: str, draft=None) -> str:
     """The moq-playa URL that plays this run from one relay: its WT URL,
-    the namespace, the draft it negotiated, and the per-packaging knobs
-    the runbook uses."""
+    the namespace, the draft it negotiated, and the playout target.
+    LOC pins the render cushion to --target-latency."""
     q = [f"url={_wt_url(relay, url)}", f"ns={args.namespace}"]
     if draft is None:
         draft = args.draft[0] if isinstance(args.draft, list) else args.draft
     if draft is not None:
         q.append(f"v={draft}")
     q.append("catalogBootstrap=subscribe")
-    if args.packaging == 'cmaf':
-        if args.target_latency:
-            q.append(f"targetLatency={args.target_latency}")
-    else:
-        q += ["warmStart=1", "catchUp=1.1", "cushion=50"]
+    if args.target_latency:
+        knob = 'targetLatency' if args.packaging == 'cmaf' else 'cushion'
+        q.append(f"{knob}={args.target_latency}")
     return args.player_base + '?' + '&'.join(q)
 
 
