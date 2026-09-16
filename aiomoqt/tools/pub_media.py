@@ -681,6 +681,10 @@ async def run(args):
             _refresh_catalog(pub, args.catalog_interval))
             if args.catalog_interval > 0 else None)
         feed = asyncio.ensure_future(asyncio.gather(*feeders))
+        # An interrupted run cancels the feeders; collect that outcome so
+        # Ctrl-C exits quietly instead of logging an unretrieved exception.
+        feed.add_done_callback(
+            lambda f: f.cancelled() or f.exception())
         closed = {asyncio.ensure_future(s.async_closed()): s
                   for s in sessions}
         # A relay lost mid-run is dropped and the rest continue; the

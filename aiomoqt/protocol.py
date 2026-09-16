@@ -656,7 +656,8 @@ class _MOQTSessionMixin:
         """Remove control task from set."""
         self._tasks.discard(task)
         if task.cancelled():
-            logger.warning("MOQT warn: control task cancelled")
+            # Cancellation is teardown: the session or the loop is closing.
+            logger.debug("MOQT: control task cancelled")
         else:
             e = task.exception()
             if e: logger.error(f"MOQT error: control task failed with exception: {e}")
