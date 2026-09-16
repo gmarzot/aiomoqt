@@ -8,6 +8,7 @@
     "disabled":         "bool; if true, skip this relay entirely (default false)",
     "disabled_suites":  "list of interop suite names to skip for this relay",
     "compat":           "list of WIRE tolerance keys passed to the tools as --compat (libquicr, lenient-extensions, ...); the tools reject unknown values",
+    "gating":           "list of draft numbers whose results gate CI (a FAIL fails the job). Absent/empty = non-gating: the relay still runs and reports, but its failures are XFAIL and never gate. Curate this to endpoints we hold ourselves to.",
     "notes":            "freeform (optional)"
   },
   "relays": [
@@ -18,6 +19,7 @@
         "h3-wt":    "https://moqx-main.ci.openmoq.org:4433/moq-relay"
       },
       "drafts": [14, 16, 18],
+      "gating": [16, 18],
       "pub_mode": "publish",
       "disabled_suites": [],
       "notes": "openmoq moqx CI relay. Covers drafts 14/16/18 over both raw-QUIC and H3/WT (/moq-relay)."
@@ -39,6 +41,7 @@
         "h3-wt":    "https://fb.mvfst.net:9448/moq-relay"
       },
       "drafts": [14, 16],
+      "gating": [16],
       "pub_mode": "publish",
       "disabled_suites": [],
       "notes": "Upstream moxygen reference relay"
@@ -72,6 +75,7 @@
         "h3-wt":    "https://us-west-2.relay.quicr.org:33437/relay"
       },
       "drafts": [16],
+      "gating": [16],
       "pub_mode": "publish",
       "insecure": true,
       "compat": ["libquicr"],
@@ -117,6 +121,7 @@
         "h3-wt":    "https://fb.mvfst.net:9448/moq-relay"
       },
       "drafts": [18],
+      "gating": [18],
       "pub_mode": "publish",
       "disabled_suites": [],
       "notes": "Upstream moxygen/mvfst reference at draft-18 — the conformant d18 reference (control 6/6 over raw-QUIC, 2026-06-22). Separate row from moxygen-fb, which stays d14/d16."
@@ -128,6 +133,7 @@
         "h3-wt":    "https://moqt.nokiaresearch.com:4443/moq"
       },
       "drafts": [18],
+      "gating": [18],
       "pub_mode": "publish",
       "disabled_suites": [],
       "notes": "Nokia Research draft-18 relay (independent impl). ~5/6: announce-subscribe fails relay-side (the reference moq-dev-rs client also fails it there), not an aiomoqt issue."

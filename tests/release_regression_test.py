@@ -389,12 +389,14 @@ def _loopback_adaptive_bench(log_dir: Path) -> tuple[str, str]:
 # Record / print helpers
 # ---------------------------------------------------------------------------
 # Result tuple: (status, test_label, detail, log_path)
-#   status ∈ {"PASS", "FAIL", "SKIP"}
+#   status ∈ {"PASS", "FAIL", "XFAIL", "SKIP"}
+#   XFAIL: a FAIL on a non-gating (relay, draft) — reported, never gates.
 Result = tuple[str, str, str, Path]
 
 
 def _marker(status: str) -> str:
-    return {"PASS": "[✓]  ", "FAIL": "[✗]  ", "SKIP": "[skip]"}[status]
+    return {"PASS": "[✓]  ", "FAIL": "[✗]  ",
+            "XFAIL": "[xfail]", "SKIP": "[skip]"}[status]
 
 
 def _print_result(res: Result) -> None:
@@ -438,9 +440,13 @@ def _run_relay_matrix(relay: dict, enabled: set[str],
     # nonexistent track). Tolerated outcomes are annotated, not hidden.
     compat_csv = ",".join(relay.get("compat", []))
     rname = relay["name"]
+    # Drafts whose results gate CI. A FAIL on a draft NOT in this set is
+    # recorded as XFAIL: reported, but never fails the job. Absent =
+    # non-gating for every draft.
+    gating_drafts = set(relay.get("gating", []))
 
     def _dispatch(suite: str, label_suffix: str, tag: str, slug: str,
-                  fn, *fn_args) -> None:
+                  fn, *fn_args, gating: bool = True) -> None:
         # Order label so the eye can scan relay-then-transport-then-suite
         label = f"{rname:<14} {tag:<14} {suite}{label_suffix}"
         if suite in disabled:
@@ -460,34 +466,42 @@ def _run_relay_matrix(relay: dict, enabled: set[str],
             return
         log = log_dir / f"{suite}_{slug}.log"
         status, detail = _with_interop_retry(fn, fn_args, log)
+        if status == "FAIL" and not gating:
+            status = "XFAIL"
         results.append((status, label, detail, log))
-        marker = "[PASS]" if status == "PASS" else "[FAIL]"
+        marker = {"PASS": "[PASS]", "FAIL": "[FAIL]",
+                  "XFAIL": "[XFAIL]"}[status]
         _progress(f"  {marker} {label}  {detail}")
 
     for transport, url in relay["urls"].items():
         for draft in relay["drafts"]:
             tag = f"{transport}/d{draft}"
             slug = f"{rname}_{transport}_d{draft}"
+            gating = draft in gating_drafts
 
             if "relay-ctrl-msg" in enabled:
                 _dispatch("relay-ctrl-msg", "", tag, slug,
-                          _relay_ctrl_msg, url, draft, insecure, compat_csv)
+                          _relay_ctrl_msg, url, draft, insecure, compat_csv,
+                          gating=gating)
             if "relay-pub-sub" in enabled:
                 tn = f"rr-{rname}-{transport}-{draft}-{_RUN_ID}"
                 _dispatch("relay-pub-sub", f"[{pub_mode}]", tag, slug,
                           lambda u, d, log: _relay_pub_sub(
                               u, d, pub_mode, insecure, compat_csv,
                               log, tn),
-                          url, draft)
+                          url, draft, gating=gating)
             if "relay-join" in enabled:
                 _dispatch("relay-join", "", tag, slug,
-                          _relay_join, url, draft, insecure, compat_csv)
+                          _relay_join, url, draft, insecure, compat_csv,
+                          gating=gating)
             if "relay-fetch" in enabled:
                 _dispatch("relay-fetch", "", tag, slug,
-                          _relay_fetch, url, draft, insecure, compat_csv)
+                          _relay_fetch, url, draft, insecure, compat_csv,
+                          gating=gating)
             if "relay-discovery" in enabled:
                 _dispatch("relay-discovery", "", tag, slug,
-                          _relay_discovery, url, draft, insecure, compat_csv)
+                          _relay_discovery, url, draft, insecure, compat_csv,
+                          gating=gating)
 
     return results
 
@@ -649,6 +663,7 @@ def main() -> int:
     # --- summary ---
     print("\n" + "═" * 72)
     fails = [r for r in results if r[0] == "FAIL"]
+    xfails = [r for r in results if r[0] == "XFAIL"]
     skips = [r for r in results if r[0] == "SKIP"]
     passes = [r for r in results if r[0] == "PASS"]
     # Hide default-disabled relay-join/relay-fetch SKIPs from the
@@ -663,12 +678,19 @@ def main() -> int:
         print(f"  {res[0]:<4}  {res[1]:<50} {res[2]}")
     print("═" * 72)
     print(f"  Logs: {log_dir}")
-    print(f"  {len(passes)} passed, {len(fails)} failed, {len(skips)} skipped")
+    print(f"  {len(passes)} passed, {len(fails)} failed, "
+          f"{len(xfails)} xfailed (non-gating), {len(skips)} skipped")
 
     # Markdown summary for GitHub Actions runners.
     gh_summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if gh_summary:
         _write_gh_summary(Path(gh_summary), results, log_dir)
+
+    if xfails:
+        print(f"  {len(xfails)} non-gating XFAIL (peer issue, does not "
+              f"gate):")
+        for _, test, detail, _ in xfails:
+            print(f"    {test}  {detail}")
 
     if fails:
         print(f"  {len(fails)} FAILED — tails follow")
@@ -686,7 +708,7 @@ def main() -> int:
 def _write_gh_summary(summary_path: Path, results: list[Result],
                       log_dir: Path) -> None:
     """Append a markdown table + totals to the GitHub Actions run summary."""
-    emoji = {"PASS": "✅", "FAIL": "❌", "SKIP": "⚪"}
+    emoji = {"PASS": "✅", "FAIL": "❌", "XFAIL": "🟡", "SKIP": "⚪"}
     lines = [
         "## aiomoqt regression",
         "",
@@ -697,11 +719,13 @@ def _write_gh_summary(summary_path: Path, results: list[Result],
         detail_safe = detail.replace("|", "\\|")
         lines.append(f"| {emoji[status]} {status} | `{test}` | {detail_safe} |")
     fails = sum(1 for r in results if r[0] == "FAIL")
+    xfails = sum(1 for r in results if r[0] == "XFAIL")
     skips = sum(1 for r in results if r[0] == "SKIP")
     passes = sum(1 for r in results if r[0] == "PASS")
     lines.extend([
         "",
-        f"**{passes} passed · {fails} failed · {skips} skipped**",
+        f"**{passes} passed · {fails} failed · "
+        f"{xfails} xfailed (non-gating) · {skips} skipped**",
         "",
         f"Logs: `{log_dir}`",
         "",
