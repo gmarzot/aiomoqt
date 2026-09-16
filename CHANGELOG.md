@@ -19,6 +19,11 @@
   start or lost mid-run is dropped and the rest continue.
 - `add_endpoints()` joins the CLI grid, for tools that dial several
   peers and do the same work to each.
+- LOC `codec_string` / pub_media `--loc-codecstring`: every object
+  carries a codec string (0x11, proposed, not in loc-04), a timescale,
+  and on video frame marking, for catalog-less receivers such as
+  moq-encoder-player. Off by default; a timescale makes LOC read
+  timestamps as media time.
 
 ## v0.11.0rc6
 

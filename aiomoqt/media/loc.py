@@ -39,6 +39,13 @@ LOC_PROP_VIDEO_CONFIG = 0x0D         # bytes: extradata (avcC/hvcC/av1C…)
 LOC_PROP_AUDIO_CONFIG = 0x0F         # bytes: codec config (AAC ASC…)
 LOC_PROP_TIMESTAMP = 0x10            # vi64: µs since epoch unless TIMESCALE
 
+# Codec string (UTF-8): proposed LOC property, not in loc-04. Catalog-less
+# receivers need it to configure a decoder.
+LOC_PROP_CODECSTRING = 0x11
+
+# RFC 9626 short-form frame marking: Start, End, Independent.
+_FM_START, _FM_END, _FM_INDEPENDENT = 0x80, 0x40, 0x20
+
 # Timestamp ids from superseded numbering, still read by deployed
 # receivers: 0x06 = loc-02/loc-03 TIMESTAMP (moqlivemock), 0x02 =
 # loc-01 Capture Timestamp (moq-playa).
@@ -51,7 +58,8 @@ LOC01_PROP_CAPTURE_TS = 0x02
 _TIMESTAMP_IDS = (LOC_PROP_TIMESTAMP, LOC01_PROP_CAPTURE_TS,
                   LOC02_PROP_TIMESTAMP)
 _CONFIG_IDS = (LOC_PROP_VIDEO_CONFIG, LOC_PROP_AUDIO_CONFIG)
-_CONSUMED_IDS = frozenset(_CONFIG_IDS + (LOC_PROP_TIMESCALE,))
+_CONSUMED_IDS = frozenset(_CONFIG_IDS + (LOC_PROP_TIMESCALE,
+                                         LOC_PROP_CODECSTRING))
 
 # MoQ Streaming Format registry (loc-02 §6.2; dropped in loc-04).
 LOC_STREAMING_FORMAT_TYPE = 0x002
@@ -76,6 +84,11 @@ class LocTrackPublisher(PublishedTrack):
     `config` (codec extradata) is emitted on Object 0 of every group so
     mid-stream joiners can configure a decoder, under VIDEO_CONFIG or
     AUDIO_CONFIG per `media_kind`.
+
+    `codec_string` makes every object self-describing for receivers
+    without a catalog: each carries CODECSTRING and TIMESCALE (µs unless
+    `timescale` is set), and video objects carry VIDEO_FRAME_MARKING. With
+    TIMESCALE present, LOC reads timestamps as media time, not wall clock.
     """
 
     def __init__(self, session, namespace: str, trackname: str, *,
@@ -86,13 +99,15 @@ class LocTrackPublisher(PublishedTrack):
                  media_kind: str = "video",
                  auth_token: bytes = b"bench-token",
                  queue_size: int = 256,
-                 loc01_compat: bool = False):
+                 loc01_compat: bool = False,
+                 codec_string: Optional[str] = None):
         super().__init__(session, namespace, trackname,
                          priority=priority, auth_token=auth_token)
         self.config = config
         self.mapping = mapping
         self.timescale = timescale
         self.media_kind = media_kind
+        self.codec_string = codec_string
         self.frames_dropped = 0  # discarded while Forward State was 0
         self._config_id = (LOC_PROP_AUDIO_CONFIG if media_kind == "audio"
                            else LOC_PROP_VIDEO_CONFIG)
@@ -136,6 +151,13 @@ class LocTrackPublisher(PublishedTrack):
               else int(time.time() * 1_000_000))
         for prop_id in self._timestamp_ids(session or self.session):
             exts[prop_id] = ts
+        if self.codec_string is not None:
+            exts[LOC_PROP_CODECSTRING] = self.codec_string.encode()
+            exts[LOC_PROP_TIMESCALE] = self.timescale or 1_000_000
+            if self.media_kind == "video":
+                exts[LOC_PROP_VIDEO_FRAME_MARKING] = bytes([
+                    _FM_START | _FM_END
+                    | (_FM_INDEPENDENT if frame.key_frame else 0)])
         if group_start:
             if self.timescale is not None:
                 exts[LOC_PROP_TIMESCALE] = self.timescale
@@ -199,6 +221,7 @@ class LocTrackSubscriber(SubscribedTrack):
         self.on_frame = on_frame
         self.config: Optional[bytes] = None
         self.timescale: Optional[int] = None
+        self.codec_string: Optional[str] = None
         self.frames_received = 0
 
     def set_config(self, config: Optional[bytes]) -> None:
@@ -215,6 +238,9 @@ class LocTrackSubscriber(SubscribedTrack):
                 self.config = bytes(exts[prop_id])
         if LOC_PROP_TIMESCALE in exts:
             self.timescale = exts[LOC_PROP_TIMESCALE]
+        if LOC_PROP_CODECSTRING in exts:
+            self.codec_string = bytes(exts[LOC_PROP_CODECSTRING]).decode(
+                'utf-8', 'replace')
         gid = getattr(msg, 'group_id', None)
         gid = gid if gid is not None else group_id
         ts = next((exts[p] for p in _TIMESTAMP_IDS if p in exts), None)

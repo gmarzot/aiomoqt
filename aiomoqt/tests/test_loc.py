@@ -5,6 +5,7 @@ tests exercise packaging (grouping, properties, ordering), not the
 PublishedTrack handshake (covered elsewhere).
 """
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,6 +14,10 @@ from aiomoqt.server import MOQTServer
 from aiomoqt.types import MOQTMessageType
 from aiomoqt.media import (
     LocTrackPublisher, LocTrackSubscriber, StreamMapping,
+)
+from aiomoqt.media.loc import (
+    LOC_PROP_CODECSTRING, LOC_PROP_TIMESCALE, LOC_PROP_VIDEO_FRAME_MARKING,
+    LocFrame,
 )
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
@@ -223,3 +228,63 @@ async def test_config_seeded_from_catalog():
         assert sub.config == b"catalog-extradata"
     finally:
         server.close()
+
+
+# -- codec_string: self-describing objects for catalog-less receivers --
+
+_D18 = SimpleNamespace(negotiated_draft=18)
+
+
+@pytest.mark.asyncio
+async def test_codec_string_off_by_default():
+    track = LocTrackPublisher(_D18, "ns", "video", config=_AVCC)
+    for key, group_start in ((True, True), (False, False)):
+        exts = track._object_extensions(LocFrame(b"x", key, 5), group_start,
+                                        _D18)
+        assert not {LOC_PROP_CODECSTRING, LOC_PROP_TIMESCALE,
+                    LOC_PROP_VIDEO_FRAME_MARKING} & exts.keys()
+
+
+@pytest.mark.asyncio
+async def test_codec_string_properties_on_every_object():
+    video = LocTrackPublisher(_D18, "ns", "video", config=_AVCC,
+                              codec_string="avc1.64001F")
+    key = video._object_extensions(LocFrame(b"i", True, 5), True, _D18)
+    delta = video._object_extensions(LocFrame(b"p", False, 6), False, _D18)
+    for exts in (key, delta):
+        assert exts[LOC_PROP_CODECSTRING] == b"avc1.64001F"
+        assert exts[LOC_PROP_TIMESCALE] == 1_000_000
+    assert key[LOC_PROP_VIDEO_FRAME_MARKING] == b"\xe0"    # S|E|I
+    assert delta[LOC_PROP_VIDEO_FRAME_MARKING] == b"\xc0"  # S|E
+
+    audio = LocTrackPublisher(_D18, "ns", "audio", media_kind="audio",
+                              config=b"\x11\x90", codec_string="mp4a.40.2")
+    exts = audio._object_extensions(LocFrame(b"a", True, 7), True, _D18)
+    assert exts[LOC_PROP_CODECSTRING] == b"mp4a.40.2"
+    assert LOC_PROP_VIDEO_FRAME_MARKING not in exts
+
+    scaled = LocTrackPublisher(_D18, "ns", "video", timescale=90000,
+                               codec_string="avc1.64001F")
+    exts = scaled._object_extensions(LocFrame(b"p", False, 8), False, _D18)
+    assert exts[LOC_PROP_TIMESCALE] == 90000
+
+
+@pytest.mark.asyncio
+async def test_codec_string_round_trip():
+    # d18 delta-codes property types: the added ids must still serialize
+    # in order and decode on the other side.
+    port = _BASE_PORT + 20
+    server = await _make_server(port, StreamMapping.PER_GROUP, _VIDEO_FRAMES,
+                                config=_AVCC,
+                                codec_string="avc1.64001F").serve()
+    try:
+        got, sub = await _subscribe_collect(port, len(_VIDEO_FRAMES))
+    finally:
+        server.close()
+    assert len(got) == len(_VIDEO_FRAMES)
+    assert sub.codec_string == "avc1.64001F"
+    assert sub.timescale == 1_000_000
+    marking = {(g, o): bytes(f.extensions[LOC_PROP_VIDEO_FRAME_MARKING])
+               for g, o, f in got}
+    assert marking[(0, 0)] == marking[(1, 0)] == b"\xe0"
+    assert marking[(0, 1)] == marking[(0, 2)] == marking[(1, 1)] == b"\xc0"

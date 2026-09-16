@@ -113,6 +113,14 @@ def parse_args():
                         help='Also emit timestamps under loc-01\'s '
                              'property id 0x02 for players not yet on '
                              'loc-02 numbering (moq-playa)')
+    parser.add_argument('--loc-codecstring', action='store_true',
+                        help='Make every LOC object self-describing for '
+                             'players without a catalog '
+                             '(moq-encoder-player): codec string (0x11, '
+                             'proposed, not in loc-04), timescale (0x08) '
+                             'and, on video, frame marking (0x09). With a '
+                             'timescale, LOC reads timestamps as media '
+                             'time rather than wall clock.')
     pub_mode = parser.add_mutually_exclusive_group()
     pub_mode.add_argument('--pub-ns', action='store_true',
                           help='PUBLISH_NAMESPACE only; the relay forwards '
@@ -143,18 +151,23 @@ def parse_args():
         parser.error('--mp4, --h264 and --ts are mutually exclusive')
     if args.packaging == 'cmaf' and not args.mp4:
         parser.error('--packaging cmaf requires --mp4')
+    if args.loc_codecstring and args.packaging != 'loc':
+        parser.error('--loc-codecstring applies to LOC packaging only')
     return args
+
+
+def _wt_url(relay, url: str) -> str:
+    """The WebTransport URL a browser uses to reach this relay."""
+    if url.startswith('https://'):
+        return url
+    return f"https://{relay.host}:{relay.port}{relay.path or '/moq-relay'}"
 
 
 def _player_url(args, relay, url: str, draft=None) -> str:
     """The moq-playa URL that plays this run from one relay: its WT URL,
     the namespace, the draft it negotiated, and the per-packaging knobs
     the runbook uses."""
-    if url.startswith('https://'):
-        wt = url
-    else:
-        wt = f"https://{relay.host}:{relay.port}{relay.path or '/moq-relay'}"
-    q = [f"url={wt}", f"ns={args.namespace}"]
+    q = [f"url={_wt_url(relay, url)}", f"ns={args.namespace}"]
     if draft is None:
         draft = args.draft[0] if isinstance(args.draft, list) else args.draft
     if draft is not None:
@@ -166,6 +179,18 @@ def _player_url(args, relay, url: str, draft=None) -> str:
     else:
         q += ["warmStart=1", "catchUp=1.1", "cushion=50"]
     return args.player_base + '?' + '&'.join(q)
+
+
+def _encoder_player_url(args, relay, url: str) -> str:
+    """moq-encoder-player page for this run. videoTrack/audioTrack and the
+    buffer parameters exist only in our local clone of that player."""
+    q = [f"host={_wt_url(relay, url)}", f"ns={args.namespace}",
+         "videoTrack=video", "audioTrack=audio", "packager=loc"]
+    if args.target_latency:
+        t = args.target_latency
+        q += [f"targetLatency={t}", f"playerBuffer={t}",
+              f"audioJitter={t}", f"videoJitter={t}"]
+    return 'http://localhost:8080/demo/player/?' + '&'.join(q)
 
 
 def _build_catalog(args, video, audio, chunkers=None) -> Catalog:
@@ -308,6 +333,8 @@ async def _apply_config_change(dmx: TsDemuxer, tracks: dict, pub):
     if video is not None and dmx.video.config != video.config:
         video.config = dmx.video.config
         view = _LiveH264(dmx.video)
+        if video.codec_string is not None:
+            video.codec_string = view.codec_string
         for t in cat.tracks:
             if t.name == 'video':
                 t.codec, t.width, t.height = (view.codec_string, view.width,
@@ -320,6 +347,8 @@ async def _apply_config_change(dmx: TsDemuxer, tracks: dict, pub):
     if audio is not None and dmx.audio_asc != audio.config:
         audio.config = dmx.audio_asc
         view = _LiveAac(dmx)
+        if audio.codec_string is not None:
+            audio.codec_string = view.codec_string
         for t in cat.tracks:
             if t.name == 'audio':
                 t.codec, t.samplerate = view.codec_string, view.samplerate
@@ -581,6 +610,12 @@ async def run(args):
         for url, relay, s in zip(urls, relays, sessions):
             draft = getattr(s, 'negotiated_draft', None)
             print(f"  player: {_player_url(args, relay, url, draft)}")
+            if args.loc_codecstring:
+                print(f"  encoder-player: "
+                      f"{_encoder_player_url(args, relay, url)}")
+
+        def _cs(codec):
+            return codec if args.loc_codecstring else None
         session = sessions[0]
         pub = FanoutPublisher(sessions, args.namespace, catalog)
         stats = {}
@@ -591,7 +626,8 @@ async def run(args):
             if video is not None:
                 tracks['video'] = pub.add_track(LocTrackPublisher(
                     session, args.namespace, 'video', config=video.config,
-                    loc01_compat=args.loc01_compat))
+                    loc01_compat=args.loc01_compat,
+                    codec_string=_cs(video.codec_string)))
                 stats['video'] = _TrackStats()
             if ts_audio is not None:
                 tracks['audio'] = pub.add_track(LocTrackPublisher(
@@ -599,7 +635,8 @@ async def run(args):
                     config=ts_audio.asc,
                     mapping=(StreamMapping.DATAGRAM if args.datagram
                              else StreamMapping.PER_GROUP),
-                    loc01_compat=args.loc01_compat))
+                    loc01_compat=args.loc01_compat,
+                    codec_string=_cs(ts_audio.codec_string)))
                 stats['audio'] = _TrackStats()
             feeders.append(_feed_ts_live(tracks, fh, dmx, first, args,
                                          stats, pub))
@@ -609,7 +646,9 @@ async def run(args):
                 config=mp4_audio.asc if mp4_audio is not None else None,
                 mapping=(StreamMapping.DATAGRAM if args.datagram
                          else StreamMapping.PER_GROUP),
-                loc01_compat=args.loc01_compat))
+                loc01_compat=args.loc01_compat,
+                codec_string=_cs(mp4_audio.codec_string
+                                 if mp4_audio is not None else 'pcm-s16')))
             stats['audio'] = _TrackStats()
             if mp4_audio is not None:
                 a_ck = chunkers.get('audio')
@@ -629,7 +668,8 @@ async def run(args):
             feeders.append(_feed_h264_live(
                 pub.add_track(LocTrackPublisher(
                     session, args.namespace, 'video', config=video.config,
-                    loc01_compat=args.loc01_compat)),
+                    loc01_compat=args.loc01_compat,
+                    codec_string=_cs(video.codec_string))),
                 fh, asm, first, args, stats['video']))
         elif video is not None and ts is None:   # --ts wired both tracks above
             v_ck = chunkers.get('video')
@@ -638,7 +678,8 @@ async def run(args):
                 pub.add_track(LocTrackPublisher(
                     session, args.namespace, 'video',
                     config=None if v_ck else video.config,
-                    loc01_compat=args.loc01_compat)),
+                    loc01_compat=args.loc01_compat,
+                    codec_string=_cs(video.codec_string))),
                 video, args, stats['video'],
                 gap_us=int(1e6 / (video.fps or 30)),
                 wrap=(lambda s, ck=v_ck:
