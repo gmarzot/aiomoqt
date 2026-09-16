@@ -1,0 +1,11 @@
+<!doctype html>
+<title>UTC ms clock</title>
+<body style="margin:0;background:#000;color:#fff;font:bold 96px monospace;display:flex;align-items:center;justify-content:center;height:100vh">
+<div id="c"></div>
+<script>
+function tick(){const d=new Date();const p=n=>String(n).padStart(2,'0');
+document.getElementById('c').textContent=p(d.getUTCMinutes())+':'+p(d.getUTCSeconds())+'.'+String(d.getUTCMilliseconds()).padStart(3,'0');
+requestAnimationFrame(tick);}
+tick();
+</script>
+</body>

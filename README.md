@@ -207,7 +207,7 @@ catalog = await sub.start()
 
 `MediaSubscriber.start()` joins the catalog track with SUBSCRIBE + joining FETCH (msf-01 §5) so a late joiner gets the relay-cached catalog, falling back to plain SUBSCRIBE when the peer cannot serve the fetch. `on_catalog` fires on the first catalog and every applied delta.
 
-End-to-end pipeline walkthroughs — file to browser, live OBS ingest, CMAF, cross-implementation consumers — are in [docs/demo-runbook.md](docs/demo-runbook.md).
+End-to-end pipeline walkthroughs — file to browser, live OBS ingest, CMAF, cross-implementation consumers — are in [docs/demo-runbook.md](docs/demo-runbook.md). Load generation, ramps to a relay ceiling and host tuning for accurate runs are in [docs/bench-runbook.md](docs/bench-runbook.md).
 
 ## Server
 
