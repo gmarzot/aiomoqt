@@ -98,18 +98,10 @@ KNOWN_COMPAT_IMPLS = frozenset({
     "all",                # enable every known compat tolerance
 })
 
-# moq-rs advertises NO implementation name in its SERVER_SETUP (it sets only
-# MAX_REQUEST_ID), so compat can't be keyed off a wire-advertised identity.
-# Instead, recognize a known moq-rs interop endpoint by host and self-enable
-# the tolerances that implementation needs. The moq-interop-runner invokes
-# the client with only RELAY_URL (no per-column COMPAT), so a single image
-# must self-select; these are the same opt-in keys as --compat, just
-# endpoint-derived.
-RELAY_COMPAT = {
-    # itzmanish/moq-rs draft-16 fork (Cloudflare interop endpoint): emits a
-    # truncated trailing-extensions KVP block on SUBSCRIBE / SUBSCRIBE_OK.
-    "draft-16-manish.cloudflare.mediaoverquic.com": frozenset({"lenient-extensions"}),
-}
+# Endpoint-derived compat tolerances (host -> keys), applied on top of
+# --compat. Empty by policy: a confirmed peer non-conformance fails the
+# test; tolerances are explicit --compat opt-ins only.
+RELAY_COMPAT = {}
 
 
 def _compat_active(compat: frozenset, key: str) -> bool:
