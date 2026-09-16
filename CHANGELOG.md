@@ -1,6 +1,8 @@
 # Changelog
 
-## v0.11.0 (unreleased)
+## v0.11.0rc7
+
+Pairs with aiopquic 0.4.0rc1 (unchanged).
 
 ### Features
 - Fan-out: one publisher, several relays. `PublishedTrack.add_session()`
@@ -24,6 +26,39 @@
   and on video frame marking, for catalog-less receivers such as
   moq-encoder-player. Off by default; a timescale makes LOC read
   timestamps as media time.
+- load_sim `viewers`: the scenario's publisher entries carry the track
+  shape `--role sub` needs, and the first failing subscribe prints its
+  reason.
+
+### Fixes
+- Subscriber churn no longer ends a publisher. A publisher-only session
+  stays up when a PUBLISH_DONE arrives; a track idles when its last
+  subscriber leaves and restarts for the next one under that
+  subscriber's alias. Before d18, UNSUBSCRIBE now reaches the track too.
+- pub_media: send lag is signed; negative means the capture stamp is
+  ahead of the wall clock.
+- server: the widened-bind notice warns only for a named interface;
+  loopback requests report at info.
+
+### Known issues
+- Fan-out applies one draft, publish mode and client config to every
+  relay. Relays on different drafts need a `--draft` all of them accept.
+- A relay lost during fan-out is dropped, not retried.
+- A peer that sends STOP_SENDING and then REQUEST_ERROR on a request
+  stream closes our session with PROTOCOL_VIOLATION instead of failing
+  that request.
+
+### Tests / CI
+- Zero objects delivered is a failure for every relay; the per-relay
+  tolerance is gone. The relay catalog keeps harness verdicts apart from
+  wire tolerances, and harness-only keys no longer reach the interop
+  client.
+
+### Docs
+- `docs/demo-runbook.md` rewritten for copy-paste use at d18.
+  `docs/bench-runbook.md` added: load and benchmark flows by role, host
+  tuning, cleanup. `docs/clock.html`: a millisecond clock for
+  glass-to-glass readings.
 
 ## v0.11.0rc6
 
