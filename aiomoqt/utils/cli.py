@@ -84,6 +84,17 @@ def add_endpoint(p, required=True):
                         'the transport.')
 
 
+def add_endpoints(p):
+    """Positional URLs for tools that dial several peers at once and do
+    the same work to each. args.url is a list, one entry minimum."""
+    p.add_argument('url', metavar='URL', nargs='+',
+                   help='Endpoint(s). moqt://host[:port][/path] = raw '
+                        'QUIC; https://host[:port][/path] = '
+                        'WebTransport; host[:port] = WebTransport. The '
+                        'scheme selects the transport, per URL. Several '
+                        'URLs: the same work to each.')
+
+
 def add_listener(p, port=4433, path=True):
     """Transport + bind address for tools that listen. -Q -W together
     serve both protocols on one port (ALPN dispatch)."""

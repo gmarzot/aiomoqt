@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.11.0 (unreleased)
+
+### Features
+- Fan-out: one publisher, several relays. `PublishedTrack.add_session()`
+  plus `publish(session=…)` serves another peer from the same track. A
+  track that implements `produce(out)` numbers its objects once and
+  every peer receives them under the same group and object ids, each
+  with its own alias, Forward State, subscriber churn and PUBLISH_DONE.
+  The packager does not know how many peers there are; LOC is one.
+- Object delivery is its own layer (`aiomoqt.delivery`):
+  `SubgroupDelivery` writes to one session and `FanoutDelivery` to
+  several. A peer that falls behind loses whole groups rather than
+  holding up the others. Object properties can be built per peer, so
+  LOC timestamp ids follow each relay's negotiated draft.
+- pub_media: several URLs publish the same broadcast to each relay from
+  one process and print a player URL per relay. A relay unreachable at
+  start or lost mid-run is dropped and the rest continue.
+- `add_endpoints()` joins the CLI grid, for tools that dial several
+  peers and do the same work to each.
+
 ## v0.11.0rc6
 
 Pairs with aiopquic 0.4.0rc1 (unchanged).

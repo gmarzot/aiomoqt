@@ -11,6 +11,9 @@ audio, plus video from an mp4) to a relay.
   # relays that ignore bare PUBLISH: announce the namespace instead
   %(prog)s https://relay.example/ -N demo/live --mp4 clip.mp4 --pub-ns
 
+  # the same broadcast to two relays: one process, one set of timestamps
+  %(prog)s moqt://relay-a:4433/ moqt://relay-b:4433/ -N demo/live --mp4 clip.mp4
+
 The video track sends the mp4's samples byte-for-byte as LOC canonical
 payloads (loc-02 §2.1.3); the avcC extradata rides the catalog
 initDataList and VIDEO_CONFIG group-start properties. Frames pace to
@@ -24,18 +27,21 @@ their timestamps (--no-pace to blast).
   ffmpeg -fflags nobuffer -i srt://0.0.0.0:9000?mode=listener -map 0:v -map 0:a \\
     -c copy -f mpegts -flush_packets 1 - | %(prog)s https://relay.example/moq-relay -N obs --ts -
 
-Each run prints a ready-to-paste player URL (see --player-base).
+Each run prints a ready-to-paste player URL per relay (see
+--player-base). Relays on different drafts need a --draft all of
+them accept.
 """
 import asyncio
+import contextlib
 import logging
 import sys
 import time
 from typing import Optional
 
 from aiomoqt.client import MOQTClient
+from aiomoqt.fanout import FanoutPublisher
 from aiomoqt.media import (
-    Catalog, CatalogTrack, InitData, LocTrackPublisher, MediaPublisher,
-    StreamMapping,
+    Catalog, CatalogTrack, InitData, LocTrackPublisher, StreamMapping,
 )
 from aiomoqt.media.cmaf import CmafChunker
 from aiomoqt.media.mpegts import TsDemuxer
@@ -58,7 +64,7 @@ def parse_args():
     parser = _cli.make_parser(
         'LOC/MSF media publisher (catalog + pcm tone + optional mp4 '
         'video)', epilog=__doc__)
-    _cli.add_endpoint(parser)
+    _cli.add_endpoints(parser)
     _cli.add_identity(parser, namespace='demo/live')
     parser.add_argument('--mp4', type=str, default=None, metavar='FILE',
                         help='Publish this mp4\'s H.264 track as LOC '
@@ -140,15 +146,17 @@ def parse_args():
     return args
 
 
-def _player_url(args, relay) -> str:
-    """The moq-playa URL that plays this run: WT relay URL, namespace,
-    draft, and the per-packaging knobs the runbook uses."""
-    if args.url.startswith('https://'):
-        wt = args.url
+def _player_url(args, relay, url: str, draft=None) -> str:
+    """The moq-playa URL that plays this run from one relay: its WT URL,
+    the namespace, the draft it negotiated, and the per-packaging knobs
+    the runbook uses."""
+    if url.startswith('https://'):
+        wt = url
     else:
         wt = f"https://{relay.host}:{relay.port}{relay.path or '/moq-relay'}"
     q = [f"url={wt}", f"ns={args.namespace}"]
-    draft = args.draft[0] if isinstance(args.draft, list) else args.draft
+    if draft is None:
+        draft = args.draft[0] if isinstance(args.draft, list) else args.draft
     if draft is not None:
         q.append(f"v={draft}")
     q.append("catalogBootstrap=subscribe")
@@ -369,7 +377,7 @@ async def _send(track, stats, payload: bytes, key: bool,
     LOC timestamps without a TIMESCALE property are µs since the Unix
     epoch — players schedule against the wall clock. Sources without
     their own presentation clock are stamped at send time."""
-    if track.state != TrackState.SUBSCRIBED:
+    if track.demand[0] == 0:
         stats.dropped += 1
         return
     entry_us = int(time.time() * 1_000_000)
@@ -426,7 +434,7 @@ class _TrackStats:
         return out
 
 
-async def _refresh_catalog(pub: MediaPublisher, interval: float):
+async def _refresh_catalog(pub: FanoutPublisher, interval: float):
     """Periodically re-emit the current catalog as a new group, once a
     subscriber has started the catalog generator."""
     track = pub.catalog_track
@@ -438,10 +446,11 @@ async def _refresh_catalog(pub: MediaPublisher, interval: float):
         await track.publish_catalog(track.catalog)
 
 
-async def _report_stats(stats: dict, interval: float):
+async def _report_stats(stats: dict, interval: float, pub: FanoutPublisher):
     """One line per interval: per-track object total, object rate and
-    bitrate over the interval, plus frames dropped before a subscriber
-    arrived."""
+    bitrate over the interval, frames dropped before a subscriber
+    arrived, and with several relays the demand count and frames shed
+    per relay (index = URL position)."""
     t0 = time.monotonic()
     prev_obj = {name: 0 for name in stats}
     prev_bytes = {name: 0 for name in stats}
@@ -454,11 +463,19 @@ async def _report_stats(stats: dict, interval: float):
             prev_obj[name] = st.objects
             prev_bytes[name] = st.bytes
             lag = st.take_lag()
-            parts.append(
-                f"{name}: {st.objects} obj · {ops:.0f} obj/s · {kbps:.0f} kbps"
-                + (f" · lag {lag[0]:.0f}/{lag[1]:.0f} ms" if lag else "")
-                + (f" · tx {lag[2]:.1f} ms" if lag and lag[2] >= 0.05 else "")
-                + (f" · dropped {st.dropped}" if st.dropped else ""))
+            line = (f"{name}: {st.objects} obj · {ops:.0f} obj/s · {kbps:.0f} kbps"
+                    + (f" · lag {lag[0]:.0f}/{lag[1]:.0f} ms" if lag else "")
+                    + (f" · tx {lag[2]:.1f} ms" if lag and lag[2] >= 0.05 else "")
+                    + (f" · dropped {st.dropped}" if st.dropped else ""))
+            track = pub.tracks.get(name)
+            if track is not None and len(pub.sessions) > 1:
+                have, total = track.demand
+                line += f" · demand {have}/{total}"
+                shed = getattr(track, 'shed', {})
+                if shed:
+                    line += " · shed " + ",".join(
+                        f"{i}:{n}" for i, n in sorted(shed.items()))
+            parts.append(line)
         m, s = divmod(time.monotonic() - t0, 60)
         print(f"  [pub {int(m)}:{s:06.3f}] " + " · ".join(parts))
 
@@ -503,7 +520,8 @@ async def _feed_mp4_track(track, source, args, stats: _TrackStats, *,
 async def run(args):
     set_log_level(logging.DEBUG if args.debug else logging.WARNING)
     libquicr = apply_compat(getattr(args, 'compat', ''))
-    relay = parse_relay_url(args.url)
+    urls = args.url if isinstance(args.url, list) else [args.url]
+    relays = [parse_relay_url(u) for u in urls]
     reader = Mp4Reader(args.mp4) if args.mp4 else None
     video = reader.video if reader else None
     live = _open_live_h264(args) if args.h264 else None
@@ -528,7 +546,7 @@ async def run(args):
             args.no_audio = True
     catalog = _build_catalog(args, video, mp4_audio or ts_audio, chunkers)
 
-    client = MOQTClient(
+    clients = [MOQTClient(
         relay.host, relay.port, path=relay.path,
         use_quic=relay.use_quic, verify_tls=not args.insecure,
         supported_drafts=args.draft, debug=args.debug,
@@ -536,13 +554,35 @@ async def run(args):
         congestion_control_algorithm=args.cc_algo,
         keep_alive_interval=args.keepalive,
         libquicr_compat=libquicr,
-    )
-    print(f"  relay: {relay}  namespace: {args.namespace}")
+    ) for relay in relays]
+    print(f"  relay: {', '.join(str(r) for r in relays)}  "
+          f"namespace: {args.namespace}")
     print(f"  tracks: {', '.join(t.name for t in catalog.tracks)}")
-    print(f"  player: {_player_url(args, relay)}")
-    async with client.connect() as session:
-        await session.client_session_init()
-        pub = MediaPublisher(session, args.namespace, catalog)
+    async with contextlib.AsyncExitStack() as stack:
+        async def _open(url, client):
+            try:
+                s = await stack.enter_async_context(client.connect())
+                await s.client_session_init()
+                return s
+            except Exception as e:
+                print(f"  error: {url}: {e}")
+                return None
+
+        # A relay that cannot be reached is left out; the run fails only
+        # when none can.
+        opened = await asyncio.gather(*(_open(u, c)
+                                        for u, c in zip(urls, clients)))
+        up = [i for i, s in enumerate(opened) if s is not None]
+        if not up:
+            raise SystemExit(1)
+        urls = [urls[i] for i in up]
+        relays = [relays[i] for i in up]
+        sessions = [opened[i] for i in up]
+        for url, relay, s in zip(urls, relays, sessions):
+            draft = getattr(s, 'negotiated_draft', None)
+            print(f"  player: {_player_url(args, relay, url, draft)}")
+        session = sessions[0]
+        pub = FanoutPublisher(sessions, args.namespace, catalog)
         stats = {}
         feeders = []
         if ts is not None:
@@ -608,25 +648,45 @@ async def run(args):
                         publish_track=(not args.pub_ns or args.pub_both),
                         forward=args.forward)
         print("  publishing...")
-        reporter = (asyncio.ensure_future(_report_stats(stats, args.stats))
-                    if args.stats > 0 and stats else None)
+        reporter = (asyncio.ensure_future(
+            _report_stats(stats, args.stats, pub))
+            if args.stats > 0 and stats else None)
         refresher = (asyncio.ensure_future(
             _refresh_catalog(pub, args.catalog_interval))
             if args.catalog_interval > 0 else None)
         feed = asyncio.ensure_future(asyncio.gather(*feeders))
-        closed = asyncio.ensure_future(session.async_closed())
-        done, _ = await asyncio.wait({feed, closed},
-                                     return_when=asyncio.FIRST_COMPLETED)
+        closed = {asyncio.ensure_future(s.async_closed()): s
+                  for s in sessions}
+        # A relay lost mid-run is dropped and the rest continue; the
+        # run fails only when no relay is left.
+        while True:
+            done, _ = await asyncio.wait({feed, *closed},
+                                         return_when=asyncio.FIRST_COMPLETED)
+            if feed in done:
+                break
+            for fut in done:
+                s = closed.pop(fut)
+                code, reason = getattr(s, '_close_err', None) or ('?', '')
+                url = urls[sessions.index(s)]
+                if closed:
+                    print(f"  error: {url} closed: code={code} "
+                          f"reason='{reason}' — continuing on {len(closed)}")
+                    pub.drop(s)
+                    continue
+                if reporter is not None:
+                    reporter.cancel()
+                if refresher is not None:
+                    refresher.cancel()
+                print(f"  error: session closed: code={code} "
+                      f"reason='{reason}'")
+                feed.cancel()
+                raise SystemExit(1)
         if reporter is not None:
             reporter.cancel()
         if refresher is not None:
             refresher.cancel()
-        if closed in done and not feed.done():
-            code, reason = getattr(session, '_close_err', None) or ('?', '')
-            print(f"  error: session closed: code={code} reason='{reason}'")
-            feed.cancel()
-            raise SystemExit(1)
-        closed.cancel()
+        for fut in closed:
+            fut.cancel()
         await feed
         await pub.catalog_track.finish()
         await asyncio.sleep(1.0)  # drain tail before teardown

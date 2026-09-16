@@ -19,13 +19,12 @@ properties, so emitting them as Object Properties there is refused.
 from __future__ import annotations
 
 import asyncio
+import functools
 import time
 from dataclasses import dataclass
-from enum import Enum
 from typing import Any, Callable, Dict, Optional
 
-from ..messages import SubgroupHeader
-from ..messages.data import ObjectDatagram
+from ..delivery import StreamMapping
 from ..track import PublishedTrack, SubscribedTrack
 from ..types import ObjectStatus
 from ..utils.logger import get_logger
@@ -58,12 +57,6 @@ _CONSUMED_IDS = frozenset(_CONFIG_IDS + (LOC_PROP_TIMESCALE,))
 LOC_STREAMING_FORMAT_TYPE = 0x002
 
 
-class StreamMapping(Enum):
-    PER_GROUP = "per_group"    # loc-02 §4.2: one uni stream per group
-    PER_OBJECT = "per_object"  # msf-01 §6: one uni stream per object
-    DATAGRAM = "datagram"      # loc-02 §4.1: one datagram per object
-
-
 @dataclass
 class LocFrame:
     """One encoded media chunk. `timestamp` is in track timescale units
@@ -77,9 +70,8 @@ class LocFrame:
 class LocTrackPublisher(PublishedTrack):
     """Push-model LOC publisher: the app feeds frames via send_frame();
     groups rotate on key frames. Announce/subscribe handshake, relay
-    forward-state handling, and PUBLISH_DONE come from PublishedTrack;
-    generation consumes the frame queue instead of synthesizing
-    payloads.
+    forward-state handling, delivery to each peer, and PUBLISH_DONE come
+    from PublishedTrack; produce() consumes the frame queue.
 
     `config` (codec extradata) is emitted on Object 0 of every group so
     mid-stream joiners can configure a decoder, under VIDEO_CONFIG or
@@ -151,97 +143,43 @@ class LocTrackPublisher(PublishedTrack):
                 exts[self._config_id] = self.config
         return exts
 
-    async def generate(self, session, track_alias: int):
-        """Consume the frame queue until finish(); replaces the bench
-        generator that PublishedTrack's forward-state handling starts."""
+    async def produce(self, out) -> None:
+        """Consume the frame queue until finish(), numbering each object
+        once; groups rotate on key frames. Properties are built per peer,
+        since the timestamp ids a peer accepts depend on its draft."""
         group_id = -1
         obj_id = 0
-        header: Optional[SubgroupHeader] = None  # PER_GROUP open stream
-        stream_id: Optional[int] = None
-        prof = session._profile
-
-        def _close_group_stream():
-            nonlocal stream_id, header
-            if stream_id is not None:
-                buf = header.end_group(object_id=header.next_object_id)
-                session.stream_write(stream_id, buf.data, end_stream=True)
-            stream_id = None
-            header = None
-
         resume_on_key = True  # first group opens on a key frame
-        try:
-            while True:
-                frame = await self._frames.get()
-                if frame is None:
-                    break
-                if not self.forward:
-                    # Forward State 0: discard live frames, end the open
-                    # group; resume only at a key frame in a new group.
-                    _close_group_stream()
-                    resume_on_key = True
-                    self.frames_dropped += 1
-                    continue
-                if resume_on_key and not frame.key_frame:
-                    self.frames_dropped += 1
-                    continue
-                resume_on_key = False
-                if frame.key_frame or group_id < 0:
-                    _close_group_stream()
-                    group_id += 1
-                    obj_id = 0
-                group_start = obj_id == 0
-                exts = self._object_extensions(frame, group_start, session)
-
-                if self.mapping is StreamMapping.DATAGRAM:
-                    dgram = ObjectDatagram(
-                        track_alias=track_alias, group_id=group_id,
-                        object_id=obj_id,
-                        publisher_priority=self.priority,
-                        extensions=exts, payload=frame.payload)
-                    await session.dgram_write_drain(
-                        dgram.serialize(prof=prof))
-                elif self.mapping is StreamMapping.PER_OBJECT:
-                    # One stream per object ⇒ one subgroup per object
-                    # (a subgroup owns exactly one stream); the object
-                    # keeps its decode-order id via subgroup_id.
-                    sid = await session.open_uni_stream()
-                    self._stream_count += 1
-                    hdr = SubgroupHeader(
-                        track_alias=track_alias, group_id=group_id,
-                        subgroup_id=obj_id,
-                        publisher_priority=self.priority,
-                        extensions_present=True, prof=prof)
-                    session.stream_write(sid, hdr.serialize().data)
-                    buf = hdr.next_object(payload=frame.payload,
-                                          extensions=exts,
-                                          object_id=obj_id)
-                    await session.stream_write_drain(sid, buf.data)
-                    session.stream_write(sid, b"", end_stream=True)
-                else:  # PER_GROUP
-                    if group_start:
-                        stream_id = await session.open_uni_stream()
-                        self._stream_count += 1
-                        header = SubgroupHeader(
-                            track_alias=track_alias, group_id=group_id,
-                            subgroup_id=0,
-                            publisher_priority=self.priority,
-                            extensions_present=True, prof=prof)
-                        session.stream_write(stream_id,
-                                             header.serialize().data)
-                    buf = header.next_object(payload=frame.payload,
-                                             extensions=exts,
-                                             object_id=obj_id)
-                    await session.stream_write_drain(stream_id, buf.data)
-
-                self._note_largest(group_id, obj_id)
-                obj_id += 1
-                self._total_sent += 1
-                self._total_bytes += len(frame.payload)
-        except asyncio.CancelledError:
-            raise
-        finally:
-            _close_group_stream()
-        self._send_publish_done(session)
+        while True:
+            frame = await self._frames.get()
+            if frame is None:
+                break
+            if not self.producing:
+                # Forward State 0: drop the frame unnumbered, end the open
+                # group, resume only at a key frame in a new group.
+                out.end_group()
+                resume_on_key = True
+                self.frames_dropped += 1
+                continue
+            if resume_on_key and not frame.key_frame:
+                self.frames_dropped += 1
+                continue
+            resume_on_key = False
+            if frame.key_frame or group_id < 0:
+                group_id += 1
+                obj_id = 0
+            group_start = obj_id == 0
+            if frame.timestamp is None:
+                frame.timestamp = int(time.time() * 1_000_000)
+            await out.write(
+                group_id, obj_id, frame.payload,
+                extensions=functools.partial(
+                    self._object_extensions, frame, group_start),
+                group_start=group_start)
+            self._note_largest(group_id, obj_id)
+            obj_id += 1
+            self._total_sent += 1
+            self._total_bytes += len(frame.payload)
 
 
 class LocTrackSubscriber(SubscribedTrack):

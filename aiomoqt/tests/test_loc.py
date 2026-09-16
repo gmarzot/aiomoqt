@@ -146,6 +146,59 @@ async def test_forward_state_zero_drops_until_key_frame():
 
 
 @pytest.mark.asyncio
+async def test_two_peers_share_one_track_over_the_wire():
+    # One track, two sessions: both peers get every object under the
+    # same group and object ids, off one pass of the frame queue.
+    port = _BASE_PORT + 12
+    state = {}
+    server = MOQTServer(
+        host="localhost", port=port, certificate=CERT, private_key=KEY,
+        path="/", use_quic=True, supported_drafts=18,
+    )
+
+    async def _on_subscribe(session, msg):
+        ok = session.subscribe_ok(request_msg=msg, content_exists=0)
+        track = state.get("track")
+        if track is None:
+            track = LocTrackPublisher(session, "loc/ns", "track",
+                                      mapping=StreamMapping.PER_GROUP)
+            state["track"] = track
+            state["gen"] = [asyncio.ensure_future(
+                track.generate(session, ok.track_alias))]
+            return
+        track.add_session(session)
+        state["gen"].append(asyncio.ensure_future(
+            track.generate(session, ok.track_alias)))
+        await asyncio.sleep(0.05)          # both lanes attached
+        for i, (payload, key) in enumerate(_VIDEO_FRAMES):
+            await track.send_frame(payload, key_frame=key,
+                                   timestamp=1000 + i)
+        await track.finish()
+        await asyncio.gather(*state["gen"])
+
+    server.register_handler(MOQTMessageType.SUBSCRIBE, _on_subscribe)
+    server = await server.serve()
+    try:
+        (got_a, _), (got_b, _) = await asyncio.gather(
+            _subscribe_collect(port, len(_VIDEO_FRAMES)),
+            _subscribe_collect(port, len(_VIDEO_FRAMES)))
+    finally:
+        server.close()
+
+    seen_a = sorted((g, o, f.payload) for g, o, f in got_a)
+    seen_b = sorted((g, o, f.payload) for g, o, f in got_b)
+    assert seen_a == seen_b
+    assert seen_a == [(0, 0, b"idr-0"), (0, 1, b"p-1"), (0, 2, b"p-2"),
+                      (1, 0, b"idr-1"), (1, 1, b"p-4")]
+    # Both peers were served from one pass of the queue. (The harness
+    # drives generate() under the SUBSCRIBE_OK alias, so the handshake
+    # never marks the subscriptions SUBSCRIBED — hence the count, not
+    # `demand`.)
+    assert state["track"]._total_sent == len(_VIDEO_FRAMES)
+    assert len(state["track"].subscriptions) == 2
+
+
+@pytest.mark.asyncio
 async def test_config_seeded_from_catalog():
     # No VIDEO_CONFIG on the wire — set_config (catalog initRef path)
     # provides it and the wire never overwrites it with absence.

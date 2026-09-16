@@ -141,9 +141,11 @@ class MediaPublisher:
             logger.info(f"MediaPublisher: announced '{self.namespace}'")
         for track in self._by_name.values():
             if publish_track:
-                await track.publish(publish_track=True, forward=forward)
+                # The track may also serve other sessions; this is ours.
+                await track.publish(publish_track=True, forward=forward,
+                                    session=self.session)
             else:
-                track.state = TrackState.ANNOUNCED
+                track._sub_for(self.session).state = TrackState.ANNOUNCED
         self.session.register_handler(
             MOQTMessageType.SUBSCRIBE, self._demux_subscribe)
         self.session.register_handler(
