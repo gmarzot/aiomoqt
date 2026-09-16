@@ -191,6 +191,7 @@ async def _slot_task(cfg, relay, slot, events_q, group, shard,
             deadline = time.monotonic() + SUBSCRIBE_RETRY_WINDOW_S
             subscribed = False
             track = None
+            last_err = None
             while time.monotonic() < deadline and not stop_ev.is_set():
                 track = SubscribedTrack(
                     session, cfg["namespace"], trackname=cfg["trackname"],
@@ -206,14 +207,20 @@ async def _slot_task(cfg, relay, slot, events_q, group, shard,
                     break
                 except Exception as e:
                     m = str(e)
+                    last_err = m
+                    # Transient: the track is not up yet, or two joins
+                    # raced the relay's forwarder setup. Both clear on a
+                    # retry inside the window.
                     if ("code=4" in m or "does not exist" in m
-                            or "no such namespace" in m):
+                            or "no such namespace" in m
+                            or "forwarder" in m):
                         await asyncio.sleep(0.3)
                         continue
                     break
             if not subscribed:
                 _post(events_q, {"kind": "evt", "ev": "join_failed",
-                                 "group": group, "shard": shard})
+                                 "group": group, "shard": shard,
+                                 "why": last_err})
                 outcome = "reported"   # finally must not post again
                 session.close()
                 return
@@ -544,7 +551,12 @@ def _tick_group(g: GroupRT, t: float, rng: random.Random):
             g.exodus += n
 
 
+# The first subscribe failure prints its reason; later ones are counted.
+_fail_noted = False
+
+
 def _drain_sub_events(events_q, groups: Dict[int, GroupRT]):
+    global _fail_noted
     while True:
         try:
             msg = events_q.get_nowait()
@@ -571,6 +583,19 @@ def _drain_sub_events(events_q, groups: Dict[int, GroupRT]):
                     shard.pending.popleft()
                 g.fails += 1
                 g.iv["fail"] += 1
+                why = msg.get("why")
+                if why and not _fail_noted:
+                    _fail_noted = True
+                    print(f"  note: subscribe failing — {why}")
+                    if any(k in why for k in (
+                            "does not exist", "no such namespace",
+                            "non-matching namespace",
+                            # moxygen's wording for "no upstream publisher"
+                            "local forwarder setup failed",
+                            "upstream subscribe failed")):
+                        print("        nothing is publishing that "
+                              "namespace — an audience scenario rides a "
+                              "live broadcast")
             elif ev in ("left", "ended", "died"):
                 shard.live = max(0, shard.live - 1)
                 g.iv["leave"] += 1
