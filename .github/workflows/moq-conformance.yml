@@ -180,3 +180,113 @@ jobs:
             origin.log
             origin-conformance-*.log
           if-no-files-found: warn
+
+  score:
+    name: moq-test score (full suite, d${{ matrix.draft }})
+    runs-on: ubuntu-24.04
+    # A score, not a gate: the curated `conformance` job above owns
+    # pass/fail. This runs every case moxygen's suite has so the number
+    # moves as the relay grows.
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        draft: [16, 18]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-aiomoqt
+
+      - name: Resolve the pinned moxygen harness
+        id: pin
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=$(grep -vE '^[[:space:]]*(#|$)' .github/moxygen-pin | head -n1)
+          if ! gh release view "$TAG" -R openmoq/moxygen \
+                 --json assets --jq '.assets[].name' | grep -q .; then
+            TAG=$(gh release view "$TAG" -R openmoq/moxygen \
+                    --json body --jq '.body' \
+                  | grep -oE 'snapshot-[0-9a-f]{12}' | head -n1)
+          fi
+          [ -n "$TAG" ] || { echo "::error::could not resolve harness tag"; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch harness and the conformance suite
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.pin.outputs.tag }}
+        run: |
+          gh release download "$TAG" -R openmoq/moxygen \
+            -p "moxygen-ubuntu-24.04-amd64.tar.gz" --clobber
+          mkdir -p harness
+          tar -C harness -xzf moxygen-ubuntu-24.04-amd64.tar.gz
+          sudo apt-get update -qq
+          sudo apt-get install -y libgoogle-glog0v6t64 \
+            || sudo apt-get install -y libgoogle-glog0v6
+          # The suite resolves its client as $MOXYGEN_DIR/moxygen/moqtest/.
+          mkdir -p harness/moxygen/moqtest
+          cp harness/bin/moqtest_client harness/moxygen/moqtest/
+          # The suite itself comes from the same pinned commit as the
+          # binaries, so a score only moves when the pin does.
+          SHA=$(gh release view "$TAG" -R openmoq/moxygen \
+                  --json targetCommitish --jq '.targetCommitish')
+          gh api -H "Accept: application/vnd.github.raw" \
+            "repos/openmoq/moxygen/contents/moxygen/moqtest/conformance_test.sh?ref=${SHA:-$TAG}" \
+            > harness/conformance_test.sh
+          grep -q "MoQTest Conformance Test Suite" harness/conformance_test.sh \
+            || { echo "::error::conformance suite not fetched"; exit 1; }
+          echo "suite: $(grep -c '^run_test' harness/conformance_test.sh) cases"
+
+      - name: Generate certs
+        run: |
+          mkdir -p certs
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout certs/key.pem -out certs/cert.pem \
+            -days 1 -subj "/CN=localhost"
+
+      - name: Score the relay
+        env:
+          DRAFT: ${{ matrix.draft }}
+        run: |
+          ./harness/bin/moqtest_server \
+            --port 9999 --quic \
+            --cert certs/cert.pem --key certs/key.pem \
+            > upstream.log 2>&1 &
+          UP_PID=$!
+          sleep 3
+          python -m aiomoqt.tools.moq_interop_relay \
+            --bind 127.0.0.1 --port 4443 --dual --draft "$DRAFT" \
+            --cert certs/cert.pem --key certs/key.pem \
+            --upstream "moqt://127.0.0.1:9999/" \
+            > relay.log 2>&1 &
+          RELAY_PID=$!
+          trap 'kill $RELAY_PID $UP_PID 2>/dev/null || true' EXIT
+          for i in $(seq 1 20); do
+            grep -q "upstream connected" relay.log && break
+            sleep 1
+          done
+          for T in quic h3wt; do
+            SUITE=$PWD/harness/conformance_test.sh MOXDIR=$PWD/harness \
+            DRAFT="$DRAFT" TRANSPORT=$T \
+              bash .github/scripts/conformance-score.sh 2>&1 \
+              | tail -40
+          done
+          python .github/scripts/conformance_report.py reports/*.txt \
+            >> "$GITHUB_STEP_SUMMARY"
+          python .github/scripts/conformance_report.py reports/*.txt | head -12
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: moq-test-score-d${{ matrix.draft }}
+          path: |
+            reports/
+            relay.log
+            upstream.log
+          if-no-files-found: warn
