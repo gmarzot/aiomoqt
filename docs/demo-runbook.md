@@ -223,14 +223,15 @@ start; Eyevinn's moqlivemock endpoint is always on.
 ## Troubleshooting
 - "no such namespace" → publisher down / wrong -N / reused namespace. Blank page → vite down.
 - Publisher dies ~30 s after start with `session closed: code=0
-  reason='ConnectionTerminated'` and 0 objects sent → **missing
-  `--keepalive`**. While Forward State is 0 the publisher correctly sends
-  nothing, so the QUIC connection is silent and moxygen's 30 s idle
-  timeout closes it. Any gap between starting a publisher and opening a
-  viewer longer than 30 s hits this. `--keepalive 10` fixes it.
+  reason='ConnectionTerminated'` and 0 objects sent → **keepalive off**
+  (`--keepalive 0`, or aiomoqt before 0.11.0). While Forward State is 0
+  the publisher correctly sends nothing, so the QUIC connection is silent
+  and moxygen's 30 s idle timeout closes it. Any gap between starting a
+  publisher and opening a viewer longer than 30 s hits this.
+  `--keepalive 10` (the default) fixes it.
 - Second and later viewers hang without playing → the publisher's
-  `--catalog-interval`; at the default the catalog is emitted once and
-  only the first viewer ever gets it.
+  `--catalog-interval` is 0 (or aiomoqt before 0.11.0): the catalog is
+  emitted once and only the first viewer ever gets it.
 - Publisher exits with `peer request_id N reused or regressed` → OUR
   bug, fixed a5bc731: the §10.1 duplicate check used the high-water mark
   as a floor, so request ids arriving out of order across concurrent

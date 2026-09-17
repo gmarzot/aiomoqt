@@ -201,11 +201,15 @@ def add_session(p, insecure=True, certs=False, keepalive=False,
                         'cubic | dcubic | prague | fast). Default: '
                         'aiopquic default (bbr1)')
     if keepalive:
-        p.add_argument('--keepalive', type=float, default=None,
+        # keepalive=True: flag, default off; a number: default seconds.
+        ka_default = None if keepalive is True else float(keepalive)
+        p.add_argument('--keepalive', type=float, default=ka_default,
                        metavar='SEC',
                        help='QUIC keep-alive interval seconds (PING), so '
                             'a flow-controlled quiet connection is not '
-                            'dropped on idle timeout. Default: off')
+                            'dropped on idle timeout. 0 disables. '
+                            'Default: ' + ('off' if ka_default is None
+                                           else f'{ka_default:g}'))
     p.add_argument('--max-queued-bytes', type=int, default=None,
                    help='Aggregate publisher TX budget across ALL '
                         'streams. Default: aiopquic default (4 MiB). '

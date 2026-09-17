@@ -135,16 +135,16 @@ def parse_args():
                              '0 (default): send nothing until PUBLISH_OK, '
                              'SUBSCRIBE or an update carries forward=1. '
                              '1: start right after PUBLISH.')
-    parser.add_argument('--catalog-interval', type=float, default=0,
+    parser.add_argument('--catalog-interval', type=float, default=1.0,
                         metavar='SECS',
                         help='Re-emit the full catalog as a new group every '
-                             'SECS seconds so the track stays live (0 = '
-                             'once at start; default)')
+                             'SECS seconds so later viewers can join (0 = '
+                             'once at start; default: 1)')
     parser.add_argument('--stats', type=float, default=5.0, metavar='SECS',
                         help='Print per-track publish metrics every SECS '
                              'seconds (0 disables; default: 5)')
     _cli.add_run(parser, duration=30, interval=False)
-    _cli.add_session(parser, keepalive=True, compat=True)
+    _cli.add_session(parser, keepalive=10, compat=True)
     _cli.add_help(parser)
     args = parser.parse_args()
     if sum(bool(s) for s in (args.mp4, args.h264, args.ts)) > 1:
