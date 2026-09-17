@@ -432,4 +432,7 @@ def test_largest_object_matches_a_moxygen_frame():
     assert msg.track_alias == 1
     assert (msg.largest_group_id, msg.largest_object_id) == (2, 5)
     assert buf.tell() == end, "left bytes unconsumed"
-    assert bytes(msg.serialize(prof=prof).data) == wire
+    assert msg.group_order == 1
+    # Re-encoded without the default GROUP_ORDER=Ascending property.
+    assert bytes(msg.serialize(prof=prof).data) == bytes.fromhex(
+        "0400050101090205")

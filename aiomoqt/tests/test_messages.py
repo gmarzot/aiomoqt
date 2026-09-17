@@ -1213,13 +1213,44 @@ class TestDraft18ControlMessages:
         assert w.pull_vint() == 0x09    # LARGEST_OBJECT key (delta from 0)
         assert w.pull_vint() == 5       # group (bare — no Length)
         assert w.pull_vint() == 200     # object
-        assert w.pull_vint() == 0x22    # trailing Track Properties: GROUP_ORDER
-        assert w.pull_vint() == 1       # ASCENDING
-        assert w.tell() == len(body)
+        assert w.tell() == len(body)    # Ascending is the default: no properties
         rt = SubscribeOk.deserialize(Buffer(data=body, vi64=prof.vi64),
                                      prof=prof, buf_end=len(body))
         assert (rt.largest_group_id, rt.largest_object_id) == (5, 200)
         assert rt.content_exists == ContentExistsCode.EXISTS
+        assert rt.group_order == GroupOrder.ASCENDING
+
+    @pytest.mark.parametrize("draft", [16, 18])
+    @pytest.mark.parametrize("cls,fields", [
+        (Publish, dict(request_id=0, track_namespace=(b"ns",),
+                       track_name=b"t", track_alias=1)),
+        (SubscribeOk, dict(request_id=0, track_alias=1,
+                           content_exists=ContentExistsCode.NO_CONTENT)),
+    ])
+    def test_default_group_order_property_omitted(self, draft, cls, fields):
+        # DEFAULT_PUBLISHER_GROUP_ORDER (0x22): omitted means Ascending,
+        # so only Descending reaches the wire.
+        from aiomoqt.context import profile_for
+        prof = profile_for(draft)
+
+        def body(order):
+            raw = bytes(cls(group_order=order, **fields).serialize(
+                prof=prof).data)
+            hdr = Buffer(data=raw, vi64=prof.vi64)
+            hdr.pull_vint()
+            hdr.pull_uint16()
+            return raw[hdr.tell():]
+
+        bare = body(None)
+        assert body(GroupOrder.ASCENDING) == bare
+        desc = body(GroupOrder.DESCENDING)
+        assert desc == bare + b"\x22\x02"
+        for wire, order in ((bare, GroupOrder.ASCENDING),
+                            (desc, GroupOrder.DESCENDING)):
+            rt = cls.deserialize(Buffer(data=wire, vi64=prof.vi64),
+                                 prof=prof, buf_end=len(wire))
+            assert rt.group_order == order
+            assert not rt.track_extensions
 
     # ---- PUBLISH (request) / PUBLISH_OK (reply) ----
     def test_publish_d18(self):

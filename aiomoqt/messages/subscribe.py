@@ -489,10 +489,11 @@ class SubscribeOk(MOQTMessage):
                     lbuf.push_uint_var(self.largest_object_id or 0)
                     params[ParamType.LARGEST_OBJECT] = lbuf.data_slice(0, lbuf.tell())
             MOQTMessage._serialize_params(payload, params, prof=prof)
-            # Track Extensions (group_order goes here as extension 0x22)
+            # Track Extensions; DEFAULT_PUBLISHER_GROUP_ORDER (0x22)
+            # omitted means Ascending.
             exts = dict(self.track_extensions or {})
-            if self.group_order is not None:
-                exts[0x22] = self.group_order  # DEFAULT_PUBLISHER_GROUP_ORDER
+            if self.group_order == GroupOrder.DESCENDING:
+                exts[0x22] = self.group_order
             MOQTMessage._extensions_encode(payload, exts, with_length=False, delta=True)
         else:
             # d14: fixed fields
@@ -544,6 +545,7 @@ class SubscribeOk(MOQTMessage):
                 content_exists = ContentExistsCode.NO_CONTENT
             track_extensions = MOQTMessage._extensions_decode(
                 buf, with_length=False, buf_end=buf_end, delta=True)
+            group_order = GroupOrder.ASCENDING
             if track_extensions is not None:
                 group_order_val = track_extensions.pop(0x22, None)
                 if group_order_val is not None:
