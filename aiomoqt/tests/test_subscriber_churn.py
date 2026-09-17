@@ -28,6 +28,7 @@ def _session(draft=18):
     s._object_handlers = {}
     s._pending_requests = {}
     s._request_cancel_handlers = {}
+    s._publish_done_handlers = {}
     s._subgroup_stream_by_key = {}
     s._data_streams = {}
     s._control_chains = {}
@@ -72,6 +73,30 @@ async def test_subscriber_session_still_closes_on_its_last_subscription():
     assert s.closed == []                       # one left
     await s._handle_subscribe_done(_done(4))
     assert s.closed and "subscribe done" in s.closed[0]
+
+
+@pytest.mark.asyncio
+async def test_publish_done_handler_fires_once_before_close_policy():
+    s = _session()
+    s._had_subscription = True
+    s._subscriptions = {2: ["sub"]}
+    seen = []
+    s.register_publish_done_handler(
+        2, lambda msg: seen.append((msg.status_code, list(s.closed))))
+    await s._handle_subscribe_done(_done(2))
+    assert seen == [(0x2, [])]                  # ran before the close
+    await s._handle_subscribe_done(_done(2))
+    assert len(seen) == 1
+
+
+@pytest.mark.asyncio
+async def test_session_outlives_its_subscriptions_when_configured():
+    s = _session()
+    s.close_on_last_publish_done = False
+    s._had_subscription = True
+    s._subscriptions = {2: ["sub"]}
+    await s._handle_subscribe_done(_done(2))
+    assert s.closed == []
 
 
 @pytest.mark.asyncio

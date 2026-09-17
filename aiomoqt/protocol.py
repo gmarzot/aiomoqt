@@ -165,6 +165,11 @@ class _MOQTSessionMixin:
     # _WTSessionMixin.
     _is_wt = False
 
+    # Close the session when the last subscription it made receives
+    # PUBLISH_DONE. Sessions that outlive their subscriptions (relays,
+    # long-lived clients) set this False.
+    close_on_last_publish_done = True
+
     @property
     def _is_client(self) -> bool:
         """Transport-agnostic is-client signal. Raw-QUIC bases expose
@@ -320,6 +325,8 @@ class _MOQTSessionMixin:
         # request_id -> callback fired when the request's stream is
         # terminated by the peer (§3.3.2 cancellation).
         self._request_cancel_handlers: Dict[int, Callable] = {}
+        # request_id -> callback fired on PUBLISH_DONE for that request.
+        self._publish_done_handlers: Dict[int, Callable] = {}
         self._track_aliases: Dict[int, int] = {}  # map alias to subscription_id
         # Set when client_session_init completes (ms, monotonic delta).
         self._established_ms: Optional[float] = None
@@ -600,6 +607,13 @@ class _MOQTSessionMixin:
         SUBSCRIBE/PUBLISH/etc. Publishers stop feeding on it."""
         self._request_cancel_handlers[request_id] = callback
 
+    def register_publish_done_handler(self, request_id: int,
+                                      callback: Callable) -> None:
+        """Called as callback(msg) when PUBLISH_DONE ends the subscription
+        `request_id`, before the session applies
+        `close_on_last_publish_done`. Once per request."""
+        self._publish_done_handlers[request_id] = callback
+
     def _on_request_stream_terminated(
             self, stream_id: int, *,
             stop_sending_code: Optional[int] = None) -> None:
@@ -645,6 +659,7 @@ class _MOQTSessionMixin:
         said so: a terminated request stream at d18, UNSUBSCRIBE before
         it. Publishers stop feeding on this."""
         cb = self._request_cancel_handlers.pop(request_id, None)
+        self._publish_done_handlers.pop(request_id, None)
         logger.info(f"MOQT: request {request_id} cancelled by {why}")
         if cb is not None:
             try:
@@ -3821,13 +3836,20 @@ class _MOQTSessionMixin:
         future = self._pending_requests.get(msg.request_id)
         if future and not future.done():
             future.set_result(msg)
+        cb = self._publish_done_handlers.pop(msg.request_id, None)
+        if cb is not None:
+            try:
+                cb(msg)
+            except Exception:
+                logger.debug("publish-done handler raised", exc_info=True)
         # Per spec, every SubscribeDone is terminal for that subscribe.
         # The session closes only when the last subscription IT MADE
         # ends — the clean-exit signal bench tools wait on. A session
         # that never subscribed is a publisher: its audience leaving is
         # not its own end of life, so it stays up for the next one.
         self._subscriptions.pop(msg.request_id, None)
-        if self._had_subscription and not self._subscriptions:
+        if (self.close_on_last_publish_done and self._had_subscription
+                and not self._subscriptions):
             self._close_session(SessionCloseCode.NO_ERROR,
                                 f"subscribe done: {msg.status_code}")
 
