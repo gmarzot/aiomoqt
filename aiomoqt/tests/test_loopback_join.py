@@ -48,7 +48,7 @@ async def test_absolute_join(use_quic):
             await session.client_session_init()
             session.on_fetch_object = on_fetch
 
-            await session.join(
+            _, fetch_response = await session.join(
                 namespace="bench",
                 track_name="track",
                 joining_start=1,
@@ -56,7 +56,9 @@ async def test_absolute_join(use_quic):
                 wait_response=True,
             )
 
-            await asyncio.sleep(0.5)
+            ok = await session.await_fetch_done(
+                fetch_response.request_id, timeout=5)
+            assert ok, "Fetch stream did not complete cleanly"
 
         fetch_groups = sorted(set(g for g, _ in fetched_objects))
         assert fetch_groups == [1, 2, 3], \
@@ -84,7 +86,7 @@ async def test_relative_join_zero(use_quic):
             await session.client_session_init()
             session.on_fetch_object = on_fetch
 
-            await session.join(
+            _, fetch_response = await session.join(
                 namespace="bench",
                 track_name="track",
                 joining_start=0,
@@ -92,7 +94,9 @@ async def test_relative_join_zero(use_quic):
                 wait_response=True,
             )
 
-            await asyncio.sleep(0.5)
+            ok = await session.await_fetch_done(
+                fetch_response.request_id, timeout=5)
+            assert ok, "Fetch stream did not complete cleanly"
 
         fetch_groups = sorted(set(g for g, _ in fetched_objects))
         assert fetch_groups == [3], \

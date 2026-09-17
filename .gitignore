@@ -25,3 +25,8 @@ wheels/
 *.bin
 .claude/
 .vscode/
+
+# Test/tool output
+media-out/
+*.log
+qlog/

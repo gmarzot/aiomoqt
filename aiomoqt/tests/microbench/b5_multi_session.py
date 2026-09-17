@@ -66,7 +66,7 @@ async def _run_for_n(n_sessions, args):
         certificate=cert, private_key=key,
         path="/",
         use_quic=True,
-        supported_drafts=16,
+        supported_drafts=args.draft,
     )
     server.register_handler(MOQTMessageType.SUBSCRIBE, on_subscribe)
     server_handle = await server.serve()
@@ -89,7 +89,7 @@ async def _run_for_n(n_sessions, args):
             '127.0.0.1', args.port, path='moq',
             use_quic=True,
             verify_tls=False, debug=False,
-            supported_drafts=16,
+            supported_drafts=args.draft,
         )
         try:
             async with client.connect() as session:
@@ -140,6 +140,8 @@ def main():
     ap.add_argument('--rate', type=float, default=100.0)
     ap.add_argument('--object-size', type=int, default=4096)
     ap.add_argument('--duration', type=float, default=20.0)
+    ap.add_argument('--draft', type=int, default=16, choices=(14, 16, 18),
+                    help='MoQT draft to negotiate')
     ap.add_argument('--port', type=int, default=47500)
     args = ap.parse_args()
 

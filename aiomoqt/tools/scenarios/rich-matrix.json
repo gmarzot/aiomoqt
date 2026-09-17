@@ -1,0 +1,61 @@
+{
+    "_comment": "Rich ns/track/subscriber matrix at low aggregate rate: 8 namespaces, 19 tracks, ~600 peak subs, ~100 Mbps worst-case egress. 10 min timeline with staggered track lifetimes so the dashboard sees tracks appear and drain.",
+    "relay": "moqt://moqx-main.ci.openmoq.org:4433",
+    "publishers": [
+        {"namespace": "arena-main", "track": "cam-a", "bitrate_kbps": 250, "fps": 15, "start_delay": 0, "duration": 600},
+        {"namespace": "arena-main", "track": "cam-b", "bitrate_kbps": 250, "fps": 15, "start_delay": 20, "duration": 540},
+        {"namespace": "arena-main", "track": "audio-mix", "bitrate_kbps": 96, "fps": 25, "start_delay": 0, "duration": 600},
+
+        {"namespace": "arena-side", "track": "cam-c", "bitrate_kbps": 250, "fps": 15, "start_delay": 40, "duration": 420},
+        {"namespace": "arena-side", "track": "audio", "bitrate_kbps": 64, "fps": 25, "start_delay": 40, "duration": 420},
+
+        {"namespace": "studio-1", "track": "program", "bitrate_kbps": 250, "fps": 15, "start_delay": 10, "duration": 560},
+        {"namespace": "studio-1", "track": "preview", "bitrate_kbps": 150, "fps": 10, "start_delay": 10, "duration": 560},
+        {"namespace": "studio-1", "track": "audio", "bitrate_kbps": 96, "fps": 25, "start_delay": 10, "duration": 560},
+
+        {"namespace": "studio-2", "track": "program", "bitrate_kbps": 250, "fps": 15, "start_delay": 120, "duration": 360},
+        {"namespace": "studio-2", "track": "audio", "bitrate_kbps": 64, "fps": 25, "start_delay": 120, "duration": 360},
+
+        {"namespace": "telemetry", "track": "sensors", "bitrate_kbps": 32, "fps": 8, "start_delay": 0, "duration": 600},
+        {"namespace": "telemetry", "track": "gps", "bitrate_kbps": 16, "fps": 4, "start_delay": 0, "duration": 600},
+        {"namespace": "telemetry", "track": "health", "bitrate_kbps": 8, "fps": 2, "start_delay": 0, "duration": 600},
+
+        {"namespace": "chat-relay", "track": "events", "bitrate_kbps": 24, "fps": 10, "start_delay": 5, "duration": 590},
+
+        {"namespace": "lobby", "track": "cam", "bitrate_kbps": 250, "fps": 15, "start_delay": 30, "duration": 300},
+        {"namespace": "lobby", "track": "music", "bitrate_kbps": 128, "fps": 30, "start_delay": 30, "duration": 500},
+
+        {"namespace": "backstage", "track": "cam-1", "bitrate_kbps": 250, "fps": 15, "start_delay": 60, "duration": 180},
+        {"namespace": "backstage", "track": "cam-2", "bitrate_kbps": 250, "fps": 15, "start_delay": 260, "duration": 180},
+        {"namespace": "backstage", "track": "cam-3", "bitrate_kbps": 250, "fps": 15, "start_delay": 420, "duration": 150}
+    ],
+    "subscribers": [
+        {"namespace": "arena-main", "track": "cam-a", "subs": 60, "join_rate": 8, "join_delay": 0, "churn_rate": 0.02, "leave_early": 60, "leave_rate": 8},
+        {"namespace": "arena-main", "track": "cam-a", "subs": 30, "join_rate": 4, "join_delay": 30, "churn_rate": 0.06, "leave_early": 90, "leave_rate": 5},
+        {"namespace": "arena-main", "track": "cam-b", "subs": 40, "join_rate": 6, "join_delay": 5, "churn_rate": 0.02, "leave_early": 45, "leave_rate": 6},
+        {"namespace": "arena-main", "track": "audio-mix", "subs": 60, "join_rate": 10, "join_delay": 0, "churn_rate": 0.01, "leave_early": 30, "leave_rate": 10},
+
+        {"namespace": "arena-side", "track": "cam-c", "subs": 30, "join_rate": 5, "join_delay": 5, "churn_rate": 0.03, "leave_early": 40, "leave_rate": 5},
+        {"namespace": "arena-side", "track": "audio", "subs": 25, "join_rate": 5, "join_delay": 5, "churn_rate": 0.02, "leave_early": 40, "leave_rate": 5},
+
+        {"namespace": "studio-1", "track": "program", "subs": 50, "join_rate": 7, "join_delay": 0, "churn_rate": 0.02, "leave_early": 50, "leave_rate": 7},
+        {"namespace": "studio-1", "track": "preview", "subs": 15, "join_rate": 3, "join_delay": 10, "churn_rate": 0.04, "leave_early": 30, "leave_rate": 3},
+        {"namespace": "studio-1", "track": "audio", "subs": 30, "join_rate": 6, "join_delay": 0, "churn_rate": 0.01, "leave_early": 40, "leave_rate": 6},
+
+        {"namespace": "studio-2", "track": "program", "subs": 35, "join_rate": 6, "join_delay": 0, "churn_rate": 0.03, "leave_early": 45, "leave_rate": 6},
+        {"namespace": "studio-2", "track": "audio", "subs": 20, "join_rate": 4, "join_delay": 0, "churn_rate": 0.02, "leave_early": 45, "leave_rate": 4},
+
+        {"namespace": "telemetry", "track": "sensors", "subs": 25, "join_rate": 6, "join_delay": 0, "churn_rate": 0.005, "leave_early": 15, "leave_rate": 10},
+        {"namespace": "telemetry", "track": "gps", "subs": 15, "join_rate": 4, "join_delay": 0, "churn_rate": 0.005, "leave_early": 15, "leave_rate": 8},
+        {"namespace": "telemetry", "track": "health", "subs": 10, "join_rate": 3, "join_delay": 0, "churn_rate": 0.005, "leave_early": 15, "leave_rate": 5},
+
+        {"namespace": "chat-relay", "track": "events", "subs": 40, "join_rate": 8, "join_delay": 0, "churn_rate": 0.04, "leave_early": 20, "leave_rate": 10},
+
+        {"namespace": "lobby", "track": "cam", "subs": 30, "join_rate": 5, "join_delay": 5, "churn_rate": 0.05, "leave_early": 40, "leave_rate": 5},
+        {"namespace": "lobby", "track": "music", "subs": 25, "join_rate": 5, "join_delay": 5, "churn_rate": 0.02, "leave_early": 40, "leave_rate": 5},
+
+        {"namespace": "backstage", "track": "cam-1", "subs": 15, "join_rate": 4, "join_delay": 0, "churn_rate": 0.03, "leave_early": 25, "leave_rate": 4},
+        {"namespace": "backstage", "track": "cam-2", "subs": 15, "join_rate": 4, "join_delay": 0, "churn_rate": 0.03, "leave_early": 25, "leave_rate": 4},
+        {"namespace": "backstage", "track": "cam-3", "subs": 15, "join_rate": 4, "join_delay": 0, "churn_rate": 0.03, "leave_early": 25, "leave_rate": 4}
+    ]
+}

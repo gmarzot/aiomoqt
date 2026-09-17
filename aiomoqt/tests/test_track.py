@@ -75,9 +75,10 @@ class TestPublishedTrack:
                           auth_token=b"custom")
         assert t.auth_token == b"custom"
 
-    def _pub_session(self, track_alias=0, request_id=1):
+    def _pub_session(self, track_alias=0, request_id=1, draft=16):
         """Mock session configured for PublishedTrack.publish() calls."""
         session = MagicMock()
+        session.negotiated_draft = draft
         session.publish_namespace = AsyncMock(return_value=MagicMock())
         pub_response = MagicMock()
         pub_response.track_alias = track_alias
@@ -139,6 +140,47 @@ class TestPublishedTrack:
             session.publish_namespace.assert_called_once()
             session.publish.assert_not_called()
             assert t.state == TrackState.ANNOUNCED
+        asyncio.run(_test())
+
+    # ----- d18: PUBLISH answered by REQUEST_OK on the request stream -----
+
+    def _d18_pub_session(self, reply):
+        session = self._pub_session(track_alias=42, request_id=7, draft=18)
+        session._pending_requests = {}
+        session._await_response = AsyncMock(return_value=reply)
+        return session
+
+    def test_publish_d18_request_ok_forward_starts_generation(self):
+        """d18: the acceptance is a REQUEST_OK carrying FORWARD (0x10),
+        correlated by request id — no 0x1E type dispatch exists."""
+        from aiomoqt.messages.request import RequestOk
+        from aiomoqt.types import ParamType
+
+        async def _test():
+            reply = RequestOk(request_id=7,
+                              parameters={ParamType.FORWARD: 1})
+            session = self._d18_pub_session(reply)
+            session._loop = asyncio.get_running_loop()
+            t = PublishedTrack(session, "bench", "track")
+            t._start_generating = AsyncMock()
+            await t.publish()
+            await asyncio.sleep(0)
+            t._start_generating.assert_awaited_once()
+            assert 7 in session._pending_requests  # future pre-registered
+        asyncio.run(_test())
+
+    def test_publish_d18_request_ok_no_forward_stays_idle(self):
+        from aiomoqt.messages.request import RequestOk
+
+        async def _test():
+            reply = RequestOk(request_id=7, parameters={})
+            session = self._d18_pub_session(reply)
+            session._loop = asyncio.get_running_loop()
+            t = PublishedTrack(session, "bench", "track")
+            t._start_generating = AsyncMock()
+            await t.publish()
+            await asyncio.sleep(0)
+            t._start_generating.assert_not_awaited()
         asyncio.run(_test())
 
     # ----- Hybrid: both PUB_NS and PUBLISH -----
@@ -267,6 +309,7 @@ class TestSubscribedTrack:
             session.send_control_message = MagicMock()
             session.on_object_received = None
 
+            session._profile.two_level_discovery = False
             session.negotiated_draft = 14  # exercise real PublishOk.serialize at d14
             t = SubscribedTrack(session, "bench")
             assert t.trackname is None
@@ -294,6 +337,7 @@ class TestSubscribedTrack:
             session.send_control_message = MagicMock()
             session.on_object_received = None
 
+            session._profile.two_level_discovery = False
             session.negotiated_draft = 16  # exercise real PublishOk.serialize at d16
             t = SubscribedTrack(session, "bench")
             assert t.trackname is None
@@ -314,6 +358,7 @@ class TestSubscribedTrack:
                 return_value=MagicMock())
             session.await_publish = AsyncMock(
                 side_effect=asyncio.TimeoutError())
+            session._profile.two_level_discovery = False
             session.subscribe = AsyncMock(return_value=MagicMock())
             session.on_object_received = None
 
@@ -356,4 +401,73 @@ class TestSubscribedTrack:
 
             assert session.on_object_received is cb
 
+        asyncio.run(_test())
+
+
+class TestD18Discovery:
+    """d18 splits discovery: SUBSCRIBE_NAMESPACE reports NAMESPACEs under
+    a prefix, then SUBSCRIBE_TRACKS asks one namespace for its tracks.
+    Pre-d18 the first request did both, so a broad prefix obliged the
+    relay to announce every track it held."""
+
+    def _d18_session(self, suffix=(), trackname=b"found-d18"):
+        session = MagicMock()
+        session._profile.two_level_discovery = True
+        session.negotiated_draft = 18
+        ns_msg = MagicMock(spec=[])
+        ns_msg.namespace_suffix = suffix
+        pub_msg = MagicMock(spec=[])
+        pub_msg.track_namespace = (b"bench",)
+        pub_msg.track_name = trackname
+        pub_msg.request_id = 11
+        pub_msg.forward = 0
+        session.subscribe_namespace = AsyncMock(return_value=MagicMock())
+        session.await_namespace = AsyncMock(return_value=ns_msg)
+        session.subscribe_tracks = AsyncMock(return_value=MagicMock())
+        session.await_publish = AsyncMock(return_value=pub_msg)
+        session.send_control_message = MagicMock()
+        session.on_object_received = None
+        return session
+
+    def test_d18_walks_namespace_then_tracks(self):
+        async def _test():
+            session = self._d18_session()
+            t = SubscribedTrack(session, "bench")
+            await t.subscribe()
+            session.subscribe_namespace.assert_called_once()
+            session.await_namespace.assert_called_once()
+            # the second, d18-only step
+            session.subscribe_tracks.assert_called_once()
+            assert t.trackname == "found-d18"
+        asyncio.run(_test())
+
+    def test_d18_empty_suffix_means_prefix_is_the_namespace(self):
+        async def _test():
+            session = self._d18_session(suffix=())
+            t = SubscribedTrack(session, "bench")
+            await t.subscribe()
+            assert session.subscribe_tracks.call_args.kwargs[
+                "namespace"] == "bench"
+        asyncio.run(_test())
+
+    def test_d18_suffix_extends_the_prefix(self):
+        async def _test():
+            session = self._d18_session(suffix=(b"live",))
+            t = SubscribedTrack(session, "bench")
+            await t.subscribe()
+            assert session.subscribe_tracks.call_args.kwargs[
+                "namespace"] == "bench/live"
+        asyncio.run(_test())
+
+    def test_pre_d18_does_not_subscribe_tracks(self):
+        """d14/d16 must keep the single-request flow."""
+        async def _test():
+            session = self._d18_session()
+            session._profile.two_level_discovery = False
+            session.negotiated_draft = 16
+            t = SubscribedTrack(session, "bench")
+            await t.subscribe()
+            session.await_namespace.assert_not_called()
+            session.subscribe_tracks.assert_not_called()
+            assert t.trackname == "found-d18"
         asyncio.run(_test())

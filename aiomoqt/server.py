@@ -1,8 +1,11 @@
 import asyncio
+import ipaddress
+import socket
 from asyncio.futures import Future
 from typing import Any, List, Optional, Tuple, Union, Coroutine
 
 from aiopquic.asyncio.server import serve as aiopquic_serve
+from aiopquic.asyncio.dispatch import serve_dispatch
 from aiopquic.asyncio.webtransport import serve_webtransport
 from aiopquic.quic.configuration import QuicConfiguration
 
@@ -12,6 +15,36 @@ from .types import moqt_alpn_for_version, normalize_supported_drafts
 from .utils.logger import *
 
 logger = get_logger(__name__)
+
+
+def _is_loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _check_udp_port_free(host: str, port: int) -> None:
+    """Fail before the transport thread swallows EADDRINUSE. The transport
+    binds every interface (aiopquic takes no bind address), so probe
+    0.0.0.0 and say so when a narrower host was requested."""
+    if port == 0:
+        return
+    if host not in ("", "0.0.0.0"):
+        # A loopback request still works, it is only also exposed; a
+        # named interface silently widening is the surprising case.
+        report = logger.info if _is_loopback(host) else logger.warning
+        report(f"MOQT server: the transport takes no bind address; "
+               f"{host} requested, listening on 0.0.0.0:{port}")
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.bind(("0.0.0.0", port))
+    except OSError as e:
+        raise OSError(f"UDP port {port} unavailable: {e.strerror}") from e
+    finally:
+        probe.close()
 
 
 class MOQTServer(MOQTPeer):
@@ -67,6 +100,7 @@ class MOQTServer(MOQTPeer):
     def serve(self) -> Coroutine[Any, Any, Any]:
         """Start the MOQT server."""
         logger.info(f"Starting MOQT server on {self.host}:{self.port}")
+        _check_udp_port_free(self.host, self.port)
 
         if self.use_quic:
             # Accept one ALPN per supported draft, newest first. A single
@@ -143,6 +177,53 @@ class MOQTServer(MOQTPeer):
             cert_file=self.certificate, key_file=self.private_key,
             session_factory=factory,
             configuration=wt_cfg,
+            wt_supported_protocols=wt_supported,
+        )
+
+    def serve_dual(self) -> Coroutine[Any, Any, Any]:
+        """Serve raw QUIC and H3/WebTransport MoQT on ONE UDP port,
+        routed per connection by negotiated ALPN (aiopquic
+        serve_dispatch). Raw connections negotiate their draft via the
+        per-draft MoQT ALPNs; WT connections via WT-Protocol. Replaces
+        the two-listener --quic-port arrangement."""
+        logger.info(
+            f"Starting dual-stack MOQT server on {self.host}:{self.port}")
+        _check_udp_port_free(self.host, self.port)
+        cfg = QuicConfiguration(
+            alpn_protocols=[moqt_alpn_for_version(d)
+                            for d in self.supported_drafts],
+            is_client=False,
+            max_data=2**24, max_stream_data=2**24,
+            max_datagram_frame_size=64 * 1024,
+            certificate_file=self.certificate,
+            private_key_file=self.private_key,
+        )
+        if self.congestion_control_algorithm is not None:
+            cfg.congestion_control_algorithm = (
+                self.congestion_control_algorithm)
+        if self.tx_max_queued_bytes is not None:
+            cfg.tx_max_queued_bytes = self.tx_max_queued_bytes
+        if self.keep_alive_interval is not None:
+            cfg.keep_alive_interval = self.keep_alive_interval
+        if self.socket_buffer_size is not None:
+            cfg.socket_buffer_size = self.socket_buffer_size
+
+        def wt_factory(transport, state):
+            return MOQTSessionWTServer(transport, state, session=self)
+
+        async def wt_handler(_session):
+            pass  # session lifetime owned by the dispatcher
+
+        wt_supported = [f"moqt-{d}" for d in self.supported_drafts
+                        if d >= 15] or None
+        return serve_dispatch(
+            self.host, self.port,
+            configuration=cfg,
+            create_protocol=lambda *a, **kw: MOQTSessionQuic(
+                *a, **kw, session=self),
+            wt_path=self.path or "",
+            wt_handler=wt_handler,
+            wt_session_factory=wt_factory,
             wt_supported_protocols=wt_supported,
         )
 

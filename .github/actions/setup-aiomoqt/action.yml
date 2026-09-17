@@ -4,6 +4,13 @@ description: >
   with the requested extras. Centralizes the env-setup dance that
   every CI job in this repo would otherwise repeat.
 
+  If .github/aiopquic-pin exists, aiopquic is built from that source ref
+  instead of being resolved from PyPI. The pin file holds one
+  `owner/repo@ref` line; ref may be a branch, tag, refs/pull/N/head, or a
+  full SHA. A branch or PR ref tracks that head — the ref is resolved to a
+  concrete SHA on every run and the built wheel is cached under it, so a
+  new upstream commit rebuilds and everything else is a cache hit.
+
 inputs:
   python-version:
     description: 'Python version to install (e.g. "3.14", "3.13", "3.12")'
@@ -24,7 +31,110 @@ runs:
       with:
         python-version: ${{ inputs.python-version }}
         cache: 'pip'
-        cache-dependency-path: 'pyproject.toml'
+        cache-dependency-path: |
+          pyproject.toml
+          .github/aiopquic-pin
+
+    - name: Resolve aiopquic pin
+      id: pin
+      shell: bash
+      run: |
+        pin_file=.github/aiopquic-pin
+        if [ ! -f "$pin_file" ]; then
+          echo "pinned=false" >> "$GITHUB_OUTPUT"
+          echo "aiopquic: no pin file, resolving from PyPI"
+          exit 0
+        fi
+        spec=$(grep -vE '^[[:space:]]*(#|$)' "$pin_file" | head -n1 | tr -d '[:space:]' || true)
+        if [ -z "$spec" ]; then
+          echo "::error::$pin_file exists but holds no owner/repo@ref line"
+          exit 1
+        fi
+        case "$spec" in
+          */*@*) ;;
+          *) echo "::error::malformed aiopquic pin '$spec' — expected owner/repo@ref"; exit 1 ;;
+        esac
+        repo=${spec%@*}
+        ref=${spec#*@}
+        if [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+          sha=$ref
+        else
+          refs=$(git ls-remote "https://github.com/$repo" "$ref")
+          # Prefer the peeled ^{} line so annotated tags resolve to their commit.
+          sha=$(printf '%s\n' "$refs" | awk '/\^\{\}$/ {print $1; exit}' || true)
+          [ -n "$sha" ] || sha=$(printf '%s\n' "$refs" | head -n1 | cut -f1)
+        fi
+        if [ -z "$sha" ]; then
+          echo "::error::could not resolve $repo@$ref — use a branch, tag, refs/pull/N/head, or a full 40-char SHA"
+          exit 1
+        fi
+        echo "pinned=true" >> "$GITHUB_OUTPUT"
+        echo "repo=$repo" >> "$GITHUB_OUTPUT"
+        echo "sha=$sha" >> "$GITHUB_OUTPUT"
+        # Log only — the pin-guard job owns the run-level summary note,
+        # so writing one here would repeat it once per job.
+        echo "aiopquic: pinned to $repo@$ref -> $sha"
+
+    - name: Restore cached aiopquic wheel
+      id: wheel-cache
+      if: steps.pin.outputs.pinned == 'true'
+      uses: actions/cache@v4
+      with:
+        path: .aiopquic-wheel
+        key: aiopquic-wheel-${{ runner.os }}-py${{ inputs.python-version }}-${{ steps.pin.outputs.sha }}
+
+    - name: Check out pinned aiopquic
+      if: steps.pin.outputs.pinned == 'true' && steps.wheel-cache.outputs.cache-hit != 'true'
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ steps.pin.outputs.repo }}
+        ref: ${{ steps.pin.outputs.sha }}
+        path: .aiopquic-src
+        submodules: recursive
+        # setuptools_scm derives the version from tags.
+        fetch-depth: 0
+
+    # Unconditional, not gated on a cache miss: the wheel links openssl by
+    # absolute path (no delocate), so a restored wheel still needs it present.
+    - name: Install picoquic build dependencies
+      if: steps.pin.outputs.pinned == 'true'
+      shell: bash
+      run: |
+        if [ "${{ runner.os }}" = "Linux" ]; then
+          sudo apt-get update
+          sudo apt-get install -y cmake libssl-dev
+        else
+          brew list cmake >/dev/null 2>&1 || brew install cmake
+          brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+        fi
+
+    - name: Build aiopquic wheel from source
+      if: steps.pin.outputs.pinned == 'true' && steps.wheel-cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        # Suppress host-tuned flags: hosted runners rotate between CPU
+        # generations and the wheel is cached across runs.
+        AIOPQUIC_WHEEL_BUILD: "1"
+        # Pin the wheel's platform tag so a cached wheel stays installable
+        # when the macos-latest image rolls forward. Ignored on Linux.
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+      run: |
+        python -m pip install --upgrade pip
+        cd "$GITHUB_WORKSPACE/.aiopquic-src"
+        ./build.sh --native
+        python -m pip wheel . --no-deps -w "$GITHUB_WORKSPACE/.aiopquic-wheel"
+        # Drop the source tree so it stays out of test collection.
+        cd "$GITHUB_WORKSPACE"
+        rm -rf .aiopquic-src
+
+    - name: Install pinned aiopquic
+      if: steps.pin.outputs.pinned == 'true'
+      shell: bash
+      run: |
+        python -m pip install --upgrade pip
+        pip install "$GITHUB_WORKSPACE"/.aiopquic-wheel/aiopquic-*.whl
+        python -c "import aiopquic; print('aiopquic', aiopquic.__version__)"
+
     - name: Install aiomoqt (editable)
       shell: bash
       run: |

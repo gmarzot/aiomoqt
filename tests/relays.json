@@ -7,6 +7,8 @@
     "insecure":         "bool; if true, pass --tls-disable-verify / -k (default false)",
     "disabled":         "bool; if true, skip this relay entirely (default false)",
     "disabled_suites":  "list of interop suite names to skip for this relay",
+    "compat":           "list of WIRE tolerance keys passed to the tools as --compat (libquicr, lenient-extensions, ...); the tools reject unknown values",
+    "gating":           "list of draft numbers whose results gate CI (a FAIL fails the job). Absent/empty = non-gating: the relay still runs and reports, but its failures are XFAIL and never gate. Curate this to endpoints we hold ourselves to.",
     "notes":            "freeform (optional)"
   },
   "relays": [
@@ -17,6 +19,7 @@
         "h3-wt":    "https://moqx-main.ci.openmoq.org:4433/moq-relay"
       },
       "drafts": [14, 16, 18],
+      "gating": [16, 18],
       "pub_mode": "publish",
       "disabled_suites": [],
       "notes": "openmoq moqx CI relay. Covers drafts 14/16/18 over both raw-QUIC and H3/WT (/moq-relay)."
@@ -38,6 +41,7 @@
         "h3-wt":    "https://fb.mvfst.net:9448/moq-relay"
       },
       "drafts": [14, 16],
+      "gating": [16],
       "pub_mode": "publish",
       "disabled_suites": [],
       "notes": "Upstream moxygen reference relay"
@@ -71,6 +75,7 @@
         "h3-wt":    "https://us-west-2.relay.quicr.org:33437/relay"
       },
       "drafts": [16],
+      "gating": [16],
       "pub_mode": "publish",
       "insecure": true,
       "compat": ["libquicr"],
@@ -106,9 +111,8 @@
       },
       "drafts": [16],
       "pub_mode": "publish-both",
-      "compat": ["lenient-extensions"],
       "disabled_suites": ["relay-join", "relay-fetch"],
-      "notes": "Cloudflare moq-rs draft-16 interop branch. compat=lenient-extensions: this fork emits a truncated trailing-extensions KVP block on SubscribeOk (kvp_start=6 tell=7 exts_end=7) which our strict parser rejects as non-compliant; tolerated + annotated, recovering ctrl-msg to 6/6. relay-join + relay-fetch disabled (#24): verified unsupported — itzmanish/moq-rs README also lists FETCH 'Not Soon', and the relay never answers JOIN/FETCH (TimeoutError; join is a joining-fetch). pub-sub[publish] kept as a genuine fail; root-caused 2026-06-21 to two layers: (A) [our side, FIXED] with pub_mode=publish-both the namespace resolves, but the relay's SubscribeOk carries the same truncated trailing-extensions block as its ctrl-msg path, which crashed the multi_sub_bench subscriber (the lenient-extensions tolerance lived only in moq_interop_client, not the bench) — now plumbed via `multi_sub_bench --compat lenient-extensions`; (B) [relay side, confirmed] even with control fully working and the publisher sending 300+ objects, the relay forwards ZERO to subscribers. Ruled out on our side via live tests + spec §10.1: forward=0 and forward=1, alias-matched and alias-diverged all give 0 objects, and the relay never RESETs our data streams (track_alias has no parity rule, only session-uniqueness, which we satisfy). With bare pub_mode=publish the surface symptom is code=4 'Track not found' (relay never got PUB_NS). The same flow delivers objects vs moxygen/imquic/cloudflare-d14, so (B) is a moq-rs d16-fork forwarding bug. Upstream also advertises an H3/WT endpoint at https://.../moq but our client hits a SETUP parse error (\"Read out of bounds\") — QUIC only here until that's resolved."
+      "notes": "Cloudflare moq-rs draft-16 interop branch. Emits a truncated trailing-extensions KVP block on SubscribeOk (kvp_start=6 tell=7 exts_end=7): a count-prefixed Track Extensions container (their kvp.rs), where d16 defines a bare KVP sequence to end-of-message. Confirmed peer non-conformance, so no tolerance: the strict parser rejects it and ctrl-msg fails. Re-verified on the wire 2026-09-16; `--compat lenient-extensions` remains available as an explicit opt-in for ad-hoc runs. relay-join + relay-fetch disabled (#24): verified unsupported — itzmanish/moq-rs README also lists FETCH 'Not Soon', and the relay never answers JOIN/FETCH (TimeoutError; join is a joining-fetch). pub-sub[publish] kept as a genuine fail; root-caused 2026-06-21 to two layers: (A) [our side, FIXED] with pub_mode=publish-both the namespace resolves, but the relay's SubscribeOk carries the same truncated trailing-extensions block as its ctrl-msg path, which crashed the multi_sub_bench subscriber (the lenient-extensions tolerance lived only in moq_interop_client, not the bench) — now plumbed via `multi_sub_bench --compat lenient-extensions`; (B) [relay side, confirmed] even with control fully working and the publisher sending 300+ objects, the relay forwards ZERO to subscribers. Ruled out on our side via live tests + spec §10.1: forward=0 and forward=1, alias-matched and alias-diverged all give 0 objects, and the relay never RESETs our data streams (track_alias has no parity rule, only session-uniqueness, which we satisfy). With bare pub_mode=publish the surface symptom is code=4 'Track not found' (relay never got PUB_NS). The same flow delivers objects vs moxygen/imquic/cloudflare-d14, so (B) is a moq-rs d16-fork forwarding bug. Upstream also advertises an H3/WT endpoint at https://.../moq but our client hits a SETUP parse error (\"Read out of bounds\") — QUIC only here until that's resolved."
     },
     {
       "name": "fb-mvfst-d18",
@@ -117,6 +121,7 @@
         "h3-wt":    "https://fb.mvfst.net:9448/moq-relay"
       },
       "drafts": [18],
+      "gating": [18],
       "pub_mode": "publish",
       "disabled_suites": [],
       "notes": "Upstream moxygen/mvfst reference at draft-18 — the conformant d18 reference (control 6/6 over raw-QUIC, 2026-06-22). Separate row from moxygen-fb, which stays d14/d16."
@@ -128,6 +133,7 @@
         "h3-wt":    "https://moqt.nokiaresearch.com:4443/moq"
       },
       "drafts": [18],
+      "gating": [18],
       "pub_mode": "publish",
       "disabled_suites": [],
       "notes": "Nokia Research draft-18 relay (independent impl). ~5/6: announce-subscribe fails relay-side (the reference moq-dev-rs client also fails it there), not an aiomoqt issue."

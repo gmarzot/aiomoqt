@@ -1,5 +1,303 @@
 # Changelog
 
+## v0.11.0
+
+Pairs with aiopquic 0.4.0. The rc sections below carry detail.
+
+- draft-18 conformance: wire, control- and data-plane fixes; receive-side
+  MUST-close rules.
+- Fix: STOP_SENDING then REQUEST_ERROR on a request stream no longer
+  closes the session.
+- Fix: GOAWAY on several request streams no longer closes the session.
+- DEFAULT_PUBLISHER_GROUP_ORDER omitted when Ascending (PUBLISH,
+  SUBSCRIBE_OK).
+- Fix: subscriber churn no longer ends a publisher.
+- Fan-out: one publisher, several relays (`PublishedTrack.add_session()`,
+  `aiomoqt.delivery`).
+- Media: LOC, MSF catalog, CMSF/CMAF; pub_media / sub_media with mp4,
+  live H.264 and MPEG-TS ingest.
+- LOC `codec_string` for catalog-less receivers (`--loc-codecstring`).
+- `serve_dual()`: raw QUIC and WebTransport on one UDP port.
+- Datagram delivery; `load_sim` load generator.
+- pub_media: `--keepalive 10` and `--catalog-interval 1` by default;
+  player URL cushion from `--target-latency`.
+- Interop CI gates on curated endpoints; zero objects delivered is a
+  failure.
+- Docs: demo and bench runbooks.
+- Requires aiopquic >= 0.4.0.
+
+### Known issues
+- Default `bbr1` congestion control: periodic latency spikes on paced
+  flows; `--cc-algo cubic` avoids them.
+- Fan-out applies one draft and config to every relay; a lost relay is
+  dropped, not retried.
+
+## v0.11.0rc6
+
+Pairs with aiopquic 0.4.0rc1 (unchanged).
+
+### Wire fixes
+- d18 REQUEST_UPDATE keeps its own Request ID (the stream-bound id is
+  no longer injected over it); the updated request rides
+  `existing_request_id`; the §10.1 id checks apply to updates.
+- **§10.1 request ids are checked for duplicates, not arrival order**
+  (regression in rc4/rc5). Requests ride separate bidirectional streams
+  and QUIC orders nothing across them, so ids a peer issued concurrently
+  arrive in any order; the check used the largest id seen as a floor and
+  closed the session with INVALID_REQUEST_ID. A publisher lost its
+  session whenever a relay forwarded a SUBSCRIBE per track and they
+  landed out of order. Ids seen are now tracked over a reorder window
+  and only a genuine repeat closes.
+- The type-legality guard now covers request-stream sends, so a message
+  a draft does not define can never leave on any stream.
+- d18 code-point renumbers (SUBSCRIBE_NAMESPACE 0x11→0x50, PUBLISH_OK
+  0x1E→REQUEST_OK 0x07) live in one table used by serializers and guard.
+- SUBSCRIBE_NAMESPACE/SUBSCRIBE_TRACKS acks and NAMESPACE answer on the
+  request's own stream (d16 and d18); no control-stream fallback.
+- Largest Location is a max, and base tracks report it (ContentExists).
+- d18 FetchObject encodes an explicit Status on zero-length payloads.
+- Forward State (§5.1) is honored: no objects while a peer signals
+  forward=0; LOC tracks resume at a key frame in a new group.
+- Raw-QUIC sessions offering several drafts hold stream bytes that
+  arrive before ProtocolNegotiated and replay them under the settled
+  draft (a d18 peer's control uni was classified with the d14 codec and
+  reset).
+- d16 status datagrams use the merged OBJECT_DATAGRAM layout (STATUS
+  0x20 / DEFAULT_PRIORITY 0x08, RFC 9000 varints); they were emitted in
+  the d14 shape. `DraftProfile.merged_datagram_layout` gates TX and RX.
+- Status datagrams (END_OF_GROUP / END_OF_TRACK) are delivered to the
+  object consumer on every draft; they were parsed and dropped.
+- Malformed tracks (§2.4.2): an object at or past a known end of group
+  (END_OF_GROUP status, or FIN on an END_OF_GROUP-bit stream) or end of
+  track resets that track's streams with MALFORMED_TRACK, cancels the
+  subscription, and refuses the track's later streams; the session
+  stays up. Subgroup-stream ordering faults that used to trip an
+  `assert` (session-fatal, stripped under -O) take the same path. The
+  interop relay answers an upstream MALFORMED_TRACK reset with
+  PUBLISH_DONE MALFORMED_TRACK downstream and stops forwarding.
+- Receive-side MUST-close rules now close the session with
+  PROTOCOL_VIOLATION: an unknown uni stream type (was a per-stream
+  STOP_SENDING, and the subgroup-type test only masked bit 7, so
+  0x110 parsed as a subgroup header); an Object Status the draft does
+  not define (d14's DOES_NOT_EXIST at d16/d18, any unassigned value);
+  properties on a status object, on streams and datagrams; a datagram
+  PROPERTIES bit with an empty properties block; a Reason Phrase over
+  1024 bytes; a Track Namespace over 32 fields (every control message
+  that carries one). `DraftProfile` gains `subgroup_type_mask` and
+  `object_statuses`.
+- d18 terminal replies FIN our half of the request stream: REQUEST_ERROR
+  from subscribe_error / fetch_error / the TRACK_STATUS fallback,
+  PUBLISH_DONE from subscribe_done and PublishedTrack, and the interop
+  relay's TRACK_STATUS_OK / errors (§3.3.2, §10.11, §10.14). Request
+  streams no longer accumulate for the session's life.
+  `_send_reply(..., fin=True)` for application handlers.
+- d14/d16 MAX_REQUEST_ID is enforced (§9.5): a peer request id at or
+  past our advertised ceiling closes the session with
+  TOO_MANY_REQUESTS; the ceiling is raised (MAX_REQUEST_ID) before a
+  well-behaved peer reaches it; our own requests stop at the peer's
+  ceiling (REQUESTS_BLOCKED once, then `MOQTRequestError`) until a
+  MAX_REQUEST_ID raises it, and a non-increasing MAX_REQUEST_ID is a
+  protocol violation. Servers now advertise MAX_REQUEST_ID in
+  SERVER_SETUP (they never did). A peer that omits the Setup parameter
+  leaves us unlimited rather than the spec's zero.
+- A FIN in the middle of a serialized Object closes the session with
+  PROTOCOL_VIOLATION (§11.4); the partial object used to be discarded
+  silently. A FIN inside the stream header stays a stream-level fault.
+- Orphan data streams are reaped: a uni stream whose header has not
+  parsed within 5 s (`STREAM_BIND_DEADLINE_S`) gets STOP_SENDING
+  DELIVERY_TIMEOUT instead of pinning its bytes and stream credit for
+  the session's life. The reaper runs once a second only while data
+  streams are open.
+- RequestErrorCode gains the d18 codes (GOING_AWAY, EXCESSIVE_LOAD,
+  NAMESPACE_TOO_LARGE, UNSUPPORTED_EXTENSION, REDIRECT) and REQUEST_ERROR
+  carries the §10.6.1 Redirect structure with REDIRECT at d18.
+
+### Features
+- Verb surface complete: `track_status()`, `request_update()` (d18 on
+  the updated request's stream, its reply attributed to the update) and
+  `publish_ok()` as first-class sends; the verb-matrix GAPS list is empty.
+- `serve_fetch()`: general publisher FETCH-serving API (delta-coded d18
+  fetch objects, group order, `fin=` control).
+- moqtest origin serves standalone FETCH (fp 0-2, markers on/off,
+  partial ranges, single object) green against moxygen's moqtest_client
+  at d16 and d18; End Location exclusive per §10.13.
+- pub_media: `--pub-ns`/`--pub-both`, `--forward {0,1}`,
+  `--catalog-interval`; short pipe reads on the live H.264 path.
+- pub_media `--ts`: live MPEG-TS ingest (`aiomoqt.media.mpegts`) — H.264
+  and AAC on one pipe, stamped from the PES PTS, catalog republished on
+  a codec-config change; every run prints its player URL (`--player-base`).
+- load_sim: `viewers` scenario (headless audience against a live
+  broadcast).
+
+### Relay (`tools.moq_interop_relay`)
+- Subgroup-END queue entry arity fixed (a forward loop died on the first
+  upstream subgroup close).
+- Stream-end handlers receive `clean` and `reset_code`; an upstream reset
+  is relayed as a downstream reset with the same code, never as a FIN
+  (§11.4.2: end-of-group is inferable from a FIN only).
+- WT teardown grace: CONNECTION_CLOSE reaches the wire.
+
+### Tests / CI
+- Conformance: standalone fetch section (origin SUT), single-object
+  multi-group case; release workflow gates on the conformance job;
+  `moq-conformance-matrix.sh` runs relay and origin over raw QUIC and
+  WebTransport at d16 and d18 locally.
+- Servers fail at `serve()` when the UDP port is taken (the transport
+  thread used to swallow EADDRINUSE behind a "Listening" line) and warn
+  that a bind address other than 0.0.0.0 is not honored by the transport.
+- Regression tests for the relay forward loop, REQUEST_UPDATE ids, and
+  the d18 renumber table.
+- A pub-sub leg that subscribes but delivers zero objects now FAILS
+  unless the relay carries the compat key `zero-objects-tolerated`
+  (cf-d16-interop, a known non-forwarder); `tests/relays.json`
+  documents the compat keys.
+- New suites for malformed tracks, the receive-side MUST-close rules,
+  terminal-reply FINs, request-id credit, and the stream reaper.
+
+## v0.11.0rc5
+
+Pairs with aiopquic 0.4.0rc1 (unchanged).
+
+- Reject unknown subscription filter types (§5.1.2).
+- moqtest origin: the bare server-role API as a second conformance SUT
+  (subscribe modes 12/12 against moxygen, gating).
+- Verb-surface matrix oracle (`test_verb_matrix.py`) with a ratcheted
+  GAPS list.
+- load_sim accepts `--compat`.
+
+## v0.11.0rc4
+
+Pairs with aiopquic 0.4.0rc1 (unchanged). Strict-peer conformance sweep:
+
+- RX dispatches exactly the control types each draft defines; unknown
+  types close the session (import-time table assertion).
+- Terminating a request stream cancels the request (§3.3.2).
+- Peer request ids validated for parity and strict increase (§10.1).
+- Stream-placement rules for control messages enforced (§3.3, §10).
+- d18 Message Parameters decoded by definition; unknown is fatal.
+- REQUEST_UPDATE and TRACK_STATUS answered instead of hanging the peer.
+- SETUP validation (§10.3.1); GOAWAY send API and receive MUSTs (§10.4).
+- §15.10.4 stream-reset code space; sibling subgroup priority.
+- Relay: SUBSCRIBE_TRACKS → PUBLISH fan-out (§9.5); charter documented.
+
+## v0.11.0rc3
+
+Pairs with aiopquic 0.4.0rc1 (unchanged). Wire/flow sweep (rc1/rc2 are
+broken against moxygen d18; do not use):
+
+- Location parameters encoded as two bare varints (d18 §10.2).
+- PUBLISH_OK / PUBLISH_DONE / relay REQUEST_ERROR ride the request
+  stream; reply-class messages refused on the d18 control stream.
+- PUBLISH_OK is 0x1E through d16; d18 replies with REQUEST_OK, and the
+  d18 PUBLISH acceptance is correlated by request id.
+- d18 GOAWAY carries Timeout and Request ID (§10.4).
+- Draft-correct error replies, d18 cancellation, FETCH group order.
+- d16 merged datagrams, PUBLISH_DONE code renumber, priority latch,
+  FETCH prior.
+- FINs are transmitted before CONNECTION_CLOSE on session close.
+- CI: moq-test conformance job (d16 + d18) gating.
+
+## v0.11.0rc2
+
+Pairs with aiopquic 0.4.0rc1 (unchanged).
+
+### Wire fixes
+
+- **`LARGEST_OBJECT` (0x09), d18.** Odd type — §1.4.3 Length field is
+  mandatory. Omitted on encode and decode; the Length byte was read as
+  the group, shifting the Location and orphaning a byte, which then
+  raised a bogus "non-compliant peer" on the trailing KVP block. Found
+  against Cloudflare draft-18-interop.
+- **`PUBLISH_OK`, d16 and d18.** A PUBLISH is answered with `REQUEST_OK`
+  (0x07); PUBLISH_OK is the shorthand name (§10.5), and only d14 has a
+  distinct message. We emitted 0x1E — an unknown control message to a
+  d16+ peer, which closed the session.
+- **Cancellation messages, d18.** `PUBLISH_NAMESPACE_DONE` (0x09) was
+  sent on every publisher teardown. d18 has no cancellation messages —
+  withdrawal is RESET_STREAM / STOP_SENDING. `send_control_message` now
+  rejects any type absent from the negotiated draft's registry
+  (`CONTROL_MESSAGE_TYPES`); `UNSUBSCRIBE` (0x0A) and `FETCH_CANCEL`
+  (0x17) were equally reachable.
+- **Subgroup stream type.** `FIRST_OBJECT` (0x40) was parsed, never
+  emitted. `DEFAULT_PRIORITY` (0x20) was decoded as priority 128 rather
+  than "inherited". Objects now carry their stream's flags and priority.
+- **END_OF_GROUP / END_OF_TRACK** were consumed before delivery, so a
+  forwarder could not see them. Delivered now; consumers filter on
+  status.
+
+### Relay (`tools.moq_interop_relay`)
+
+Forwards objects, fans out, serves both publish flows, dials origins
+with `--upstream`. Namespace matching is §2.4 prefix, field-wise, not
+equality. Session state is released on close, and a new announcement
+supersedes a track cached against a prior session — close alone is too
+late for a prompt reconnect. Still no group cache, joining FETCH,
+forward-state propagation, or PUBLISH→SUBSCRIBE_TRACKS forwarding.
+
+### Tests
+
+`test_spec_registry.py` transcribes the d14/d16/d18 message-type tables
+independently of `aiomoqt.types` and checks the §1.4.3 odd/even Length
+rule against a reader that knows only the spec. `.github/workflows/
+moq-conformance.yml` runs draft-afrind-moq-test via moxygen's
+`moqtest_client` against the relay, d16 and d18, from a pinned artifact.
+
+Known: moq-test reports one inherited-priority mismatch and one stream
+reset against the relay.
+
+## v0.11.0rc1
+
+Pre-release for MoQ community interop testing. Pairs with
+**aiopquic 0.4.0rc1**. The full v0.11.0 notes land with the release.
+
+### Features
+
+- **`serve_dual()`** — one `MOQTServer` serving raw QUIC and
+  WebTransport MoQT on a single UDP port, over aiopquic's ALPN dispatch.
+  Sessions now carry their own transport identity rather than reading
+  the owning peer's, which no single flag can speak for under a dual
+  server.
+- **Playable media pipeline.** LOC packaging (push-model publisher and
+  frame subscriber), an MSF catalog model with a delta engine, MSF
+  broadcast orchestration, and CMSF/CMAF packaging per
+  draft-ietf-moq-cmsf. `pub_media` / `sub_media` tools publish and
+  consume real mp4 (H.264, AV1 passthrough, AAC), with `--h264` live
+  Annex-B ingest for an OBS/ffmpeg pipe. Catalog delivery via SUBSCRIBE
+  plus joining FETCH gives late-join through a relay.
+- **Datagram delivery**, a unified CLI grid, and `load_sim`, a
+  scenario-driven multi-namespace load generator.
+- **d18 two-step track discovery** on the client side.
+- Session properties: `handshake_info`, `qlog_paths`,
+  `peer_transport_parameters`, `connection_ids`, `effective_configuration`.
+
+### Wire fixes
+
+- **d18 control-stream reassembly.** Control messages fragmented across
+  stream-data events crashed the parser; malformation is now
+  distinguished from fragmentation, and control sends defer until the
+  control write stream is up.
+- **Track-alias registry is keyed from SUBSCRIBE_OK and never guessed.**
+  The publisher-assigned alias was previously dropped, which would have
+  become real object misrouting once per-track routing landed.
+- **d18 codecs**: FETCH data plane (vi64 + delta relayout, §11.4.4),
+  SUBSCRIPTION_FILTER internals (§5.1.2), delta-coded KVP extension
+  types (§1.4.2), and the object-header extension block varint flavor.
+- **LOC loc-04 property renumber** with draft-gated legacy ids: MOQT d18
+  gives 0x06 and 0x02 Track scope, so emitting a timestamp under either
+  as an Object Property makes the track malformed and the subscription
+  is refused. d18 emits 0x10 alone; d14/d16 keep the legacy ids for the
+  deployed loc-02 ecosystem. Known wrinkle: on an audio track below d18,
+  `--loc01-compat` still emits 0x06, which a strict loc-01 receiver
+  reads as Audio Level rather than a timestamp.
+- **MSF catalog** tracks the editors' copy: the "update" delta op,
+  property-carried init references, "catalog" packaging, a `draft-01`
+  default version, and the catalog track outranking its media tracks.
+
+### Packaging
+
+- **Requires aiopquic >= 0.4.0rc1** (was >= 0.3.11), and the CI source
+  pin is gone — this build resolves aiopquic from PyPI.
+
 ## v0.10.6
 
 Pairs with aiopquic 0.3.11.

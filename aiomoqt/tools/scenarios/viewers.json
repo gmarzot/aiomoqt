@@ -1,0 +1,28 @@
+{
+  "_comment": "Headless audience for a live pub_media broadcast. Run with --role sub against the broadcast's relay and namespace (-N overrides the placeholder). The publisher entries are NOT run under --role sub; they describe the track being watched, which is what the subscriber groups and the egress prediction resolve against, so each needs a shape. Defaults here match the demo broadcast: 720p video, AAC audio, a catalog re-emitted every second. A steady low-churn cohort keeps the audience above zero; a second cohort joins late and churns.",
+  "publishers": [
+    {"namespace": "demo", "track": "video", "profile": "720p",
+     "start_delay": 0, "duration": 600},
+    {"namespace": "demo", "track": "audio", "bitrate_kbps": 128, "fps": 47,
+     "start_delay": 0, "duration": 600},
+    {"namespace": "demo", "track": "catalog", "bitrate_kbps": 4, "fps": 1,
+     "gop_s": 1.0, "start_delay": 0, "duration": 600}
+  ],
+  "subscribers": [
+    {"namespace": "demo", "track": "video", "subs": 12,
+     "join_rate": 4, "join_delay": 0, "churn_rate": 0.01,
+     "leave_early": 30, "leave_rate": 4},
+    {"namespace": "demo", "track": "video", "subs": 8,
+     "join_rate": 3, "join_delay": 10, "churn_rate": 0.08,
+     "leave_early": 60, "leave_rate": 3},
+    {"namespace": "demo", "track": "audio", "subs": 12,
+     "join_rate": 4, "join_delay": 0, "churn_rate": 0.01,
+     "leave_early": 30, "leave_rate": 4},
+    {"namespace": "demo", "track": "audio", "subs": 8,
+     "join_rate": 3, "join_delay": 10, "churn_rate": 0.08,
+     "leave_early": 60, "leave_rate": 3},
+    {"namespace": "demo", "track": "catalog", "subs": 3,
+     "join_rate": 2, "join_delay": 0, "churn_rate": 0.0,
+     "leave_early": 30, "leave_rate": 1}
+  ]
+}
