@@ -1,80 +1,36 @@
 # Changelog
 
-## v0.11.0rc7
+## v0.11.0
 
-Pairs with aiopquic 0.4.0rc1 (unchanged).
+Pairs with aiopquic 0.4.0. The rc sections below carry detail.
 
-### Features
-- Fan-out: one publisher, several relays. `PublishedTrack.add_session()`
-  plus `publish(session=…)` serves another peer from the same track. A
-  track that implements `produce(out)` numbers its objects once and
-  every peer receives them under the same group and object ids, each
-  with its own alias, Forward State, subscriber churn and PUBLISH_DONE.
-  The packager does not know how many peers there are; LOC is one.
-- Object delivery is its own layer (`aiomoqt.delivery`):
-  `SubgroupDelivery` writes to one session and `FanoutDelivery` to
-  several. A peer that falls behind loses whole groups rather than
-  holding up the others. Object properties can be built per peer, so
-  LOC timestamp ids follow each relay's negotiated draft.
-- pub_media: several URLs publish the same broadcast to each relay from
-  one process and print a player URL per relay. A relay unreachable at
-  start or lost mid-run is dropped and the rest continue.
-- `add_endpoints()` joins the CLI grid, for tools that dial several
-  peers and do the same work to each.
-- LOC `codec_string` / pub_media `--loc-codecstring`: every object
-  carries a codec string (0x11, proposed, not in loc-04), a timescale,
-  and on video frame marking, for catalog-less receivers such as
-  moq-encoder-player. Off by default; a timescale makes LOC read
-  timestamps as media time.
-- load_sim `viewers`: the scenario's publisher entries carry the track
-  shape `--role sub` needs, and the first failing subscribe prints its
-  reason.
-
-### Fixes
-- Subscriber churn no longer ends a publisher. A publisher-only session
-  stays up when a PUBLISH_DONE arrives; a track idles when its last
-  subscriber leaves and restarts for the next one under that
-  subscriber's alias. Before d18, UNSUBSCRIBE now reaches the track too.
-- pub_media: send lag is signed; negative means the capture stamp is
-  ahead of the wall clock.
-- server: the widened-bind notice warns only for a named interface;
-  loopback requests report at info.
-- pub_media: Ctrl-C exits quietly. A cancelled control task logs at
-  debug; cancellation only happens at teardown.
-- pub_media: the printed LOC player URL sets the render cushion from
-  `--target-latency` and no longer adds `warmStart` or `catchUp`.
-- moq_interop_client: the Cloudflare draft-16 relay no longer gets
-  `lenient-extensions` automatically. Its count-prefixed Track
-  Extensions container fails strict; `--compat lenient-extensions`
-  remains an explicit opt-in.
+- draft-18 conformance: wire, control- and data-plane fixes; receive-side
+  MUST-close rules.
+- Fix: STOP_SENDING then REQUEST_ERROR on a request stream no longer
+  closes the session.
+- Fix: GOAWAY on several request streams no longer closes the session.
+- DEFAULT_PUBLISHER_GROUP_ORDER omitted when Ascending (PUBLISH,
+  SUBSCRIBE_OK).
+- Fix: subscriber churn no longer ends a publisher.
+- Fan-out: one publisher, several relays (`PublishedTrack.add_session()`,
+  `aiomoqt.delivery`).
+- Media: LOC, MSF catalog, CMSF/CMAF; pub_media / sub_media with mp4,
+  live H.264 and MPEG-TS ingest.
+- LOC `codec_string` for catalog-less receivers (`--loc-codecstring`).
+- `serve_dual()`: raw QUIC and WebTransport on one UDP port.
+- Datagram delivery; `load_sim` load generator.
+- pub_media: `--keepalive 10` and `--catalog-interval 1` by default;
+  player URL cushion from `--target-latency`.
+- Interop CI gates on curated endpoints; zero objects delivered is a
+  failure.
+- Docs: demo and bench runbooks.
+- Requires aiopquic >= 0.4.0.
 
 ### Known issues
-- With the default `bbr1` congestion control, periodic latency spikes
-  every 10 s on paced flows. Once the minimum RTT goes stale, as it does
-  on a loaded host, BBRv1's ProbeRTT holds the window at 4 packets for
-  about 200 ms. `--cc-algo cubic` avoids it; the default is under
-  review.
-- Fan-out applies one draft, publish mode and client config to every
-  relay. Relays on different drafts need a `--draft` all of them accept.
-- A relay lost during fan-out is dropped, not retried.
-- A peer that sends STOP_SENDING and then REQUEST_ERROR on a request
-  stream closes our session with PROTOCOL_VIOLATION instead of failing
-  that request.
-
-### Tests / CI
-- Zero objects delivered is a failure for every relay; the per-relay
-  tolerance is gone. The relay catalog keeps harness verdicts apart from
-  wire tolerances, and harness-only keys no longer reach the interop
-  client.
-- The interop tier gates only on curated endpoints per draft (`gating`
-  in `tests/relays.json`: moqx-main 16/18 among them). Every other relay
-  still runs, and its failures report as XFAIL.
-
-### Docs
-- `docs/demo-runbook.md` rewritten for copy-paste use at d18.
-  `docs/bench-runbook.md` added: load and benchmark flows by role, host
-  tuning, cleanup. `docs/clock.html`: a millisecond clock for
-  glass-to-glass readings.
+- Default `bbr1` congestion control: periodic latency spikes on paced
+  flows; `--cc-algo cubic` avoids them.
+- Fan-out applies one draft and config to every relay; a lost relay is
+  dropped, not retried.
 
 ## v0.11.0rc6
 
