@@ -32,7 +32,7 @@ from typing import Callable, Dict, Optional
 from .types import (
     MOQTMessageType, MOQTRequestError, ParamType, FilterType,
     ForwardingPreference, GroupOrder, LOC_TIMESTAMP, SessionCloseCode,
-    StreamResetCode,
+    StreamResetCode, SubscribeDoneCode,
 )
 from .delivery import FanoutDelivery, StreamMapping, SubgroupDelivery
 from .messages import (
@@ -1047,6 +1047,7 @@ class SubscribedTrack(Track):
         self.auth_token = auth_token
         self.publish_done: Optional[object] = None  # received PUBLISH_DONE
         self.completed = False  # True if track ended cleanly
+        self._done_event = asyncio.Event()
 
     async def subscribe(self, timeout: float = 30.0,
                         forward: int = 1,
@@ -1090,6 +1091,7 @@ class SubscribedTrack(Track):
                 if self.on_object:
                     self.session.register_object_handler(
                         self.track_alias, self.on_object)
+            self._watch_done(getattr(ok, 'request_id', None))
             self.state = TrackState.SUBSCRIBED
             logger.info(f"Track: subscribed (direct) to {self.fqtn}")
             return
@@ -1186,16 +1188,44 @@ class SubscribedTrack(Track):
         # Reply returns on the PUBLISH's own bidi stream at d18.
         self.session._send_reply(pub_msg.request_id, ok)
 
+        self._watch_done(pub_msg.request_id)
         self.state = TrackState.SUBSCRIBED
         logger.info(f"Track: subscribed to {self.fqtn}")
 
-    async def wait_closed(self):
-        """Wait for session to close.
+    def _watch_done(self, request_id) -> None:
+        """Record this subscription's PUBLISH_DONE (§10.11) and release
+        wait_closed(); the session stays up for other work."""
+        if request_id is None:
+            return
+        self.request_id = request_id
 
-        Sets self.completed if track ended cleanly (no StreamReset).
+        def _done(msg):
+            self.publish_done = msg
+            self._done_event.set()
+
+        self.session.register_publish_done_handler(request_id, _done)
+
+    async def wait_closed(self):
+        """Wait for this track to end: its PUBLISH_DONE, or the session
+        closing under it.
+
+        Sets self.completed if the track ended cleanly (no StreamReset).
         """
-        await self.session.async_closed()
+        closed = asyncio.ensure_future(self.session.async_closed())
+        done_wait = asyncio.ensure_future(self._done_event.wait())
+        try:
+            await asyncio.wait({closed, done_wait},
+                               return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for fut in (closed, done_wait):
+                if not fut.done():
+                    fut.cancel()
         self.state = TrackState.CLOSED
+        if self.publish_done is not None:
+            code = getattr(self.publish_done, 'status_code', 0)
+            self.completed = code in (SubscribeDoneCode.TRACK_ENDED,
+                                      SubscribeDoneCode.SUBSCRIPTION_ENDED)
+            return
 
         if hasattr(self.session, '_close_err') and self.session._close_err:
             code, reason = self.session._close_err
