@@ -37,6 +37,8 @@ def _control_session(draft):
     s._tasks = set()
     s._control_chains = {}
     s._bidi_stream_requests = {}
+    s._cancelled_request_streams = set()
+    s._peer_goaway_streams = set()
     s._bidi_streams = {}
     s._peer_request_seen = set()
     s._tx_updates = {}
@@ -241,6 +243,103 @@ async def test_d18_request_stream_must_open_with_a_request():
     await asyncio.sleep(0)
     assert s._closed
     assert s._closed[0][0] == SessionCloseCode.PROTOCOL_VIOLATION
+
+
+@pytest.mark.parametrize("draft", [16, 18])
+async def test_stop_sending_then_request_error_keeps_the_session(draft):
+    # §3.3.2: STOP_SENDING cancels the request but ends only our send
+    # half; a REQUEST_ERROR the peer still sends on its half is a late
+    # reply to the cancelled request, not a new request stream.
+    from aiomoqt.messages.request import RequestError
+    from aiomoqt.types import MOQTRequestError
+    s = _control_session(draft)
+    s._subscriptions = {}
+    s._request_cancel_handlers = {}
+    rid = s._allocate_request_id()
+    s._bidi_stream_requests[4] = rid
+    s._bidi_streams[rid] = 4
+    fut = s._loop.create_future()
+    s._pending_requests[rid] = fut
+    fired = []
+    s.register_request_cancel_handler(rid, fired.append)
+
+    s._on_request_stream_terminated(4, stop_sending_code=3)
+    assert fired == [rid]
+    with pytest.raises(MOQTRequestError, match="STOP_SENDING code 3"):
+        await fut
+    assert s._bidi_stream_requests[4] == rid
+
+    frame = bytes(RequestError(
+        request_id=rid, error_code=3, retry_interval=0,
+        reason="track extensions not supported").serialize(
+            prof=s._profile).data)
+    s._on_control_data(4, frame, True, is_request_bidi=True)
+    await asyncio.sleep(0)
+    assert s._closed == []
+    assert 4 not in s._bidi_stream_requests
+    assert 4 not in s._cancelled_request_streams
+
+    s._on_request_stream_terminated(4)       # later RESET of the peer half
+    assert fired == [rid]
+
+
+def _goaway_frame(s, request_id=None):
+    from aiomoqt.messages.session_setup import GoAway
+    return bytes(GoAway(new_session_uri="", timeout=0,
+                        request_id=request_id).serialize(
+                            prof=s._profile).data)
+
+
+async def test_d18_goaway_once_per_stream():
+    # §10.4: one GOAWAY on the control stream and one per request stream
+    # are legal together; a second on any one stream closes.
+    from aiomoqt.types import SessionCloseCode
+    s = _control_session(18)
+    s.is_client = True
+    s._peer_request_max = -1
+    for sid, rid in ((4, 0), (8, 2)):
+        s._bidi_stream_requests[sid] = rid
+        s._bidi_streams[rid] = sid
+    s._on_control_data(3, _goaway_frame(s, request_id=1), False)
+    s._on_control_data(4, _goaway_frame(s), False, is_request_bidi=True)
+    s._on_control_data(8, _goaway_frame(s), False, is_request_bidi=True)
+    await asyncio.sleep(0)
+    assert s._closed == []
+    s._on_control_data(4, _goaway_frame(s), False, is_request_bidi=True)
+    await asyncio.sleep(0)
+    assert s._closed
+    assert s._closed[0][0] == SessionCloseCode.PROTOCOL_VIOLATION
+
+
+@pytest.mark.parametrize("draft", [14, 16, 18])
+async def test_second_goaway_on_control_stream_closes(draft):
+    from aiomoqt.types import SessionCloseCode
+    s = _control_session(draft)
+    s.is_client = True
+    rid = 1 if draft >= 18 else None
+    s._on_control_data(3, _goaway_frame(s, request_id=rid), False)
+    await asyncio.sleep(0)
+    assert s._closed == []
+    s._on_control_data(3, _goaway_frame(s, request_id=rid), False)
+    await asyncio.sleep(0)
+    assert s._closed
+    assert s._closed[0][0] == SessionCloseCode.PROTOCOL_VIOLATION
+
+
+async def test_reset_after_stop_sending_releases_without_renotifying():
+    s = _control_session(18)
+    s._subscriptions = {}
+    s._request_cancel_handlers = {}
+    s._bidi_stream_requests[4] = 2
+    s._bidi_streams[2] = 4
+    fired = []
+    s.register_request_cancel_handler(2, fired.append)
+    s._on_request_stream_terminated(4, stop_sending_code=0)
+    s._on_request_stream_terminated(4, stop_sending_code=0)
+    s._on_request_stream_terminated(4)
+    assert fired == [2]
+    assert 4 not in s._bidi_stream_requests
+    assert s._cancelled_request_streams == set()
 
 
 async def test_d18_request_update_keeps_its_own_id_and_binds_the_stream():

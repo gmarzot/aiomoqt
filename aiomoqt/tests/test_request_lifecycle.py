@@ -51,6 +51,7 @@ async def test_request_stream_termination_cancels_the_request():
     s = _session()
     s._bidi_streams = {7: 9}
     s._bidi_stream_requests = {9: 7}
+    s._cancelled_request_streams = set()
     s._tx_updates = {}
     s._subscriptions = {7: ["sub"]}
     s._request_cancel_handlers = {}

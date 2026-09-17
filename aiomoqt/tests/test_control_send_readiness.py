@@ -165,25 +165,11 @@ def test_ready_stream_sends_immediately():
     assert s._pending_control_msgs == []
 
 
-async def test_second_goaway_closes_the_session():
-    from aiomoqt.messages.session_setup import GoAway as _GoAway
-    from aiomoqt.types import SessionCloseCode
-    s = _send_session(18)
-    s.is_client = True
-    s._peer_goaway = False
-    await s._handle_goaway(_GoAway(new_session_uri="", timeout=0))
-    assert s._closed == []
-    await s._handle_goaway(_GoAway(new_session_uri="", timeout=0))
-    assert s._closed
-    assert s._closed[0][0] == SessionCloseCode.PROTOCOL_VIOLATION
-
-
 async def test_server_rejects_client_new_session_uri():
     from aiomoqt.messages.session_setup import GoAway as _GoAway
     from aiomoqt.types import SessionCloseCode
     s = _send_session(18)
     s.is_client = False
-    s._peer_goaway = False
     await s._handle_goaway(_GoAway(new_session_uri="moqt://x", timeout=0))
     assert s._closed
     assert s._closed[0][0] == SessionCloseCode.PROTOCOL_VIOLATION

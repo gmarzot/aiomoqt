@@ -26,7 +26,6 @@ def _stub(draft):
     s._pending_requests = {}
     s._peer_request_max = -1
     s._peer_request_seen = set()
-    s._peer_goaway = False
     s._track_aliases = {}
     s._subscriptions = {}
     s._request_cancel_handlers = {}

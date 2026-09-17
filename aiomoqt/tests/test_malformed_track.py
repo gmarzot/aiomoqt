@@ -75,6 +75,7 @@ def test_fin_on_end_of_group_bit_stream_bounds_the_group():
 def test_cancelling_a_request_stream_frees_the_track_bounds():
     s = _stub()
     s._bidi_stream_requests = {40: 5}
+    s._cancelled_request_streams = set()
     s._bidi_streams = {5: 40}
     s._subscriptions = {5: ["sub"]}
     s._pending_requests = {}

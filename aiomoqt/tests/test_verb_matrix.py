@@ -52,7 +52,6 @@ def _session(draft, is_client=True):
     s._tx_updates = {}
     s._request_cancel_handlers = {}
     s._peer_request_max = -1
-    s._peer_goaway = False
     s.frames = []          # (channel, wire bytes)
     s.resets = []
     s.send_control_message = lambda m: s.frames.append(

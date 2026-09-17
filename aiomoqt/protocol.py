@@ -253,8 +253,9 @@ class _MOQTSessionMixin:
         # not guaranteed, so only the set can identify a duplicate.
         self._peer_request_max = -1
         self._peer_request_seen: set = set()
-        # One GOAWAY per control stream (§10.4).
-        self._peer_goaway = False
+        # Streams that carried a peer GOAWAY: one per control or request
+        # stream (§10.4).
+        self._peer_goaway_streams: Set[int] = set()
         self._next_track_alias = 0
         # Single dict per stream — _DataStreamState consolidates queue,
         # task, parser, binding-key, and forensic counter into one
@@ -314,6 +315,8 @@ class _MOQTSessionMixin:
 
         self._bidi_streams: Dict[int, int] = {}  # map request_id to bidi stream_id (d16)
         self._bidi_stream_requests: Dict[int, int] = {}  # map bidi stream_id to request_id (d16)
+        # Request streams cancelled by STOP_SENDING whose peer half is still open.
+        self._cancelled_request_streams: Set[int] = set()
         # request_id -> callback fired when the request's stream is
         # terminated by the peer (§3.3.2 cancellation).
         self._request_cancel_handlers: Dict[int, Callable] = {}
@@ -597,10 +600,26 @@ class _MOQTSessionMixin:
         SUBSCRIBE/PUBLISH/etc. Publishers stop feeding on it."""
         self._request_cancel_handlers[request_id] = callback
 
-    def _on_request_stream_terminated(self, stream_id: int) -> None:
+    def _on_request_stream_terminated(
+            self, stream_id: int, *,
+            stop_sending_code: Optional[int] = None) -> None:
         """§3.3.2: terminating a request's bidi stream cancels the
-        request. Tear down its state and notify the owner."""
-        request_id = self._bidi_stream_requests.pop(stream_id, None)
+        request. Tear down its state and notify the owner.
+
+        STOP_SENDING ends only our send half: the binding stays until the
+        peer's half ends (FIN or reset), so a REQUEST_ERROR still in
+        flight demuxes to the cancelled request."""
+        if stop_sending_code is None:
+            request_id = self._bidi_stream_requests.pop(stream_id, None)
+            if stream_id in self._cancelled_request_streams:
+                self._cancelled_request_streams.discard(stream_id)
+                return
+        else:
+            if stream_id in self._cancelled_request_streams:
+                return
+            request_id = self._bidi_stream_requests.get(stream_id)
+            if request_id is not None:
+                self._cancelled_request_streams.add(stream_id)
         if request_id is None:
             return
         self._bidi_streams.pop(request_id, None)
@@ -611,11 +630,15 @@ class _MOQTSessionMixin:
             self._forget_track_bounds(alias)
         fut = self._pending_requests.pop(request_id, None)
         if fut is not None and not fut.done():
+            reason = "request cancelled by peer"
+            if stop_sending_code is not None:
+                reason += f" (STOP_SENDING code {stop_sending_code})"
             fut.set_exception(MOQTRequestError(
-                error_code=0x1, reason="request cancelled by peer",
-                retry_interval=0))
+                error_code=0x1, reason=reason, retry_interval=0))
+        how = ("STOP_SENDING" if stop_sending_code is not None
+               else "stream termination")
         self._notify_request_cancelled(
-            request_id, f"stream termination (stream {stream_id})")
+            request_id, f"{how} (stream {stream_id})")
 
     def _notify_request_cancelled(self, request_id: int, why: str) -> None:
         """Tell the request's owner it is cancelled, however the peer
@@ -1799,8 +1822,18 @@ class _MOQTSessionMixin:
                     SessionCloseCode.PROTOCOL_VIOLATION,
                     f"{type(msg).__name__} on the d18 control stream")
                 return
+            if isinstance(msg, GoAway):
+                if stream_id in self._peer_goaway_streams:
+                    self._close_session(
+                        SessionCloseCode.PROTOCOL_VIOLATION,
+                        f"second GOAWAY on stream {stream_id}")
+                    return
+                self._peer_goaway_streams.add(stream_id)
         if end_stream:
             self._control_chains.pop(stream_id, None)
+            if stream_id in self._cancelled_request_streams:
+                self._cancelled_request_streams.discard(stream_id)
+                self._bidi_stream_requests.pop(stream_id, None)
 
     def _ingest_stream_data(self, stream_id: int, data, end_stream: bool) -> None:
         """Route stream bytes, or hold them while a raw-QUIC session's
@@ -2021,9 +2054,14 @@ class _MOQTSessionMixin:
             logger.debug(f"MOQT event: StopSendingReceived: stream {event.stream_id}")
             # RFC 9000: STOP_SENDING from peer → reciprocal RESET_STREAM.
             self.stream_reset(event.stream_id, event.error_code)
-            self._on_request_stream_terminated(event.stream_id)
-            self._cleanup_stream(
-                event.stream_id, QuicErrorCode.APPLICATION_ERROR)
+            # A request stream keeps its read chain: the peer may still send.
+            bound = event.stream_id in self._bidi_stream_requests
+            self._on_request_stream_terminated(
+                event.stream_id,
+                stop_sending_code=int(event.error_code or 0))
+            if not bound:
+                self._cleanup_stream(
+                    event.stream_id, QuicErrorCode.APPLICATION_ERROR)
             return
         elif isinstance(event, StreamReset):
             logger.debug(f"MOQT event: StreamReset: stream {event.stream_id}")
@@ -3854,13 +3892,8 @@ class _MOQTSessionMixin:
 
     async def _handle_goaway(self, msg: GoAway) -> None:
         logger.info(f"MOQT event: handle {msg}")
-        # §10.4 MUSTs: one GOAWAY per control stream; only a server may
-        # carry a New Session URI.
-        if self._peer_goaway:
-            self._close_session(SessionCloseCode.PROTOCOL_VIOLATION,
-                                "second GOAWAY on the control stream")
-            return
-        self._peer_goaway = True
+        # §10.4: only a server may carry a New Session URI. One GOAWAY per
+        # stream is enforced in _on_control_data.
         if not self._is_client and msg.new_session_uri:
             self._close_session(
                 SessionCloseCode.PROTOCOL_VIOLATION,
