@@ -411,6 +411,7 @@ def _forget_session(session) -> None:
     """Drop everything a closing session owned: its announcements and
     its downstream subscriptions."""
     _track_subs[:] = [e for e in _track_subs if e[0] is not session]
+    _ns_subs[:] = [e for e in _ns_subs if e[0] is not session]
     for ns in list(_announced):
         if _announced[ns].pop(session, None) is not None and \
                 not _announced[ns]:
@@ -448,6 +449,7 @@ async def _on_publish_namespace(session, msg):
     holders = _announced.setdefault(ns, {})
     holders[session] = holders.get(session, 0) + 1
     logger.info(f"relay: announce ns={ns} -> {len(holders)} publisher(s)")
+    _announce_namespace(ns)
     # Reuse the protocol's built-in OK helper. It emits RequestOk on
     # d16+ and PublishNamespaceOk on d14, matching peer expectation.
     session.publish_namepace_ok(msg)
@@ -695,6 +697,8 @@ def parse_args():
 
 # SUBSCRIBE_TRACKS subscribers: (session, prefix_tuple, request_id).
 _track_subs: list = []
+# (session, prefix, request_id) for d18 SUBSCRIBE_NAMESPACE subscribers.
+_ns_subs: list = []
 
 
 def _prefix_covers(prefix, ns) -> bool:
@@ -737,6 +741,69 @@ async def _offer_track(session, track, key):
     logger.info(f"relay: PUBLISH offer accepted for {key} "
                 f"alias={pub_msg.track_alias} "
                 f"(fanout={len(track.downstream)})")
+
+
+async def _on_subscribe_namespace(session, msg):
+    """Namespace discovery (§9.4). d18 answers NAMESPACE per namespace
+    under the prefix — the subscriber then asks each one for its tracks
+    with SUBSCRIBE_TRACKS. d14/d16 have no NAMESPACE message: the same
+    prefix subscription is answered with a PUBLISH per matching track,
+    present and future, which is what those drafts expect."""
+    prefix = _ns_tuple(msg.namespace_prefix)
+    _watch_session(session)
+    session.subscribe_namespace_ok(
+        msg, stream_id=session._bidi_streams.get(msg.request_id))
+
+    def _drop(rid, s=session, r=msg.request_id):
+        _ns_subs[:] = [e for e in _ns_subs
+                       if not (e[0] is s and e[2] == r)]
+        _track_subs[:] = [e for e in _track_subs
+                          if not (e[0] is s and e[2] == r)]
+    session.register_request_cancel_handler(msg.request_id, _drop)
+
+    if session._profile.two_level_discovery:
+        _ns_subs.append((session, prefix, msg.request_id))
+        for ns in _known_namespaces(prefix):
+            _offer_namespace(session, msg.request_id, prefix, ns)
+        logger.info(f"relay: subscribe-namespace prefix={prefix} "
+                    f"(d18 discovery, subs={len(_ns_subs)})")
+        return
+
+    _track_subs.append((session, prefix, msg.request_id))
+    logger.info(f"relay: subscribe-namespace prefix={prefix} "
+                f"(publish fan-out, subs={len(_track_subs)})")
+    for key, track in list(_tracks.items()):
+        if _prefix_covers(prefix, key[0]) and (
+                track.pending_publish or track.upstream):
+            asyncio.create_task(_offer_track(session, track, key))
+
+
+def _known_namespaces(prefix) -> list:
+    """Namespaces the relay can serve under `prefix`: announced ones
+    plus any track it already relays."""
+    out, seen = [], set()
+    for ns in list(_announced) + [key[0] for key in _tracks]:
+        if ns in seen or not _prefix_covers(prefix, ns):
+            continue
+        seen.add(ns)
+        out.append(ns)
+    return out
+
+
+def _offer_namespace(session, request_id, prefix, ns) -> None:
+    """One NAMESPACE reply on the SUBSCRIBE_NAMESPACE request stream:
+    the suffix under the subscribed prefix (§10.8)."""
+    try:
+        session.namespace(ns[len(prefix):], request_id=request_id)
+    except Exception:
+        logger.debug("relay: NAMESPACE offer failed", exc_info=True)
+
+
+def _announce_namespace(ns) -> None:
+    """Tell d18 prefix subscribers about a namespace that just appeared."""
+    for session, prefix, rid in list(_ns_subs):
+        if _prefix_covers(prefix, ns) and _session_live(session):
+            _offer_namespace(session, rid, prefix, ns)
 
 
 async def _on_subscribe_tracks(session, msg):
@@ -805,6 +872,8 @@ def _build_server(bind, port, cert, key, use_quic, draft):
         MOQTMessageType.PUBLISH, _on_publish)
     server.register_handler(
         MOQTMessageType.TRACK_STATUS, _on_track_status)
+    server.register_handler(
+        MOQTMessageType.SUBSCRIBE_NAMESPACE, _on_subscribe_namespace)
     server.register_handler(
         D18MessageType.SUBSCRIBE_TRACKS, _on_subscribe_tracks)
     return server
