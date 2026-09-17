@@ -3,9 +3,9 @@
 # cases against a running relay, and report per-case pass/fail.
 #
 # Deliberately a subset of moxygen's own 56-case conformance_test.sh: the
-# cases here are the ones a relay can satisfy without a group cache or
-# joining FETCH, which our relay does not have yet. Widen it as the relay
-# grows, and prefer adding a case over loosening one.
+# cases here are the ones a relay can satisfy without the group history a
+# joining FETCH needs. Widen it as the relay grows, and prefer adding a
+# case over loosening one.
 set -u
 
 CLIENT=${CLIENT:-./harness/bin/moqtest_client}
@@ -84,7 +84,8 @@ run_case "both extensions" --request=subscribe --forwarding_preference=0 \
   --last_group=1 --objects_per_group=5 --test_integer_extension=1 \
   --test_variable_extension=2
 
-# Standalone FETCH: served by the origin SUT only (the relay has no cache).
+# Standalone FETCH: the origin serves it directly, the relay from its
+# recent-object cache or by fetching upstream.
 # fp=3 is not a fetch case (the client refuses datagram preference for FETCH).
 if [ "${FETCH:-0}" = "1" ]; then
   echo

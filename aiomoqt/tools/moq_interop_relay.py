@@ -11,8 +11,9 @@ Deliberately absent, and staying absent:
 
   * NO authentication, authorization, or rate limiting
   * NO load handling, bounded queues, or production hardening
-  * NO group cache, so a late subscriber sees only what arrives next,
-    and joining FETCH is not served
+  * A bounded recent-object cache only (CACHE_GROUPS / CACHE_BYTES,
+    oldest dropped) — enough to answer a standalone FETCH, not a
+    joining FETCH, and a late subscriber still starts at the live edge
   * NO forward-state propagation (REQUEST_UPDATE Forward=0/1 upstream)
   * NO delivery-timeout enforcement
   * Namespace tables are in-memory and global to the process
@@ -45,6 +46,7 @@ table) for runners that expect distinct endpoints.
 
 import argparse
 import asyncio
+from collections import deque
 import logging
 import os
 import sys
@@ -57,6 +59,7 @@ from aiomoqt.types import (
     StreamResetCode, SubscribeDoneCode, SubscribeErrorCode, parse_draft_spec,
 )
 from aiomoqt.messages import SubgroupHeader
+from aiomoqt.messages.data import FetchObject
 from aiomoqt.messages.publish import PublishOk
 from aiomoqt.messages.request import RequestError, RequestOk
 from aiomoqt.track import SubscribedTrack
@@ -183,6 +186,11 @@ def _publishers_for(ns: tuple) -> list:
     return out
 
 
+# Recent-object cache bounds, per track: whichever is hit first.
+CACHE_GROUPS = 8
+CACHE_BYTES = 32 * 1024 * 1024
+
+
 class _RelayedTrack:
     """One upstream subscription fanned out to N downstream subscribers.
 
@@ -209,6 +217,11 @@ class _RelayedTrack:
         # id(session) -> subgroup streams opened (PUBLISH_DONE count)
         self._sent_streams = {}
         self._finished = False
+        # Recent objects, oldest first, for standalone FETCH. Bounded by
+        # groups and bytes; a relay with no cache can serve no fetch at
+        # all, and an unbounded one is a leak.
+        self._cache = deque()
+        self._cache_bytes = 0
 
     def close(self) -> None:
         """Release the fan-out: stop the drain and forget its streams."""
@@ -295,6 +308,8 @@ class _RelayedTrack:
                 await self.queue.get()
             if self._finished:
                 continue
+            if oid is not None:
+                self._remember(gid, sgid, oid, payload, exts, prio, status)
             for session, alias, _rid in list(self.downstream):
                 try:
                     await self._forward_one(
@@ -304,6 +319,29 @@ class _RelayedTrack:
                     logger.debug("relay: forward failed, dropping subscriber",
                                  exc_info=True)
                     self.drop_session(session)
+
+    def _remember(self, gid, sgid, oid, payload, exts, prio, status) -> None:
+        """Keep one object for a later FETCH, dropping oldest past the
+        bound."""
+        self._cache.append((gid, sgid, oid, payload, exts, prio, status))
+        self._cache_bytes += len(payload or b"")
+        oldest_kept = gid - CACHE_GROUPS + 1
+        while self._cache and (self._cache[0][0] < oldest_kept
+                               or self._cache_bytes > CACHE_BYTES):
+            dropped = self._cache.popleft()
+            self._cache_bytes -= len(dropped[3] or b"")
+
+    def cached_range(self, start, end):
+        """Cached objects within [start, end], each (group, object)
+        inclusive; `end` None means to the live edge. Ascending."""
+        out = []
+        for gid, sgid, oid, payload, exts, prio, status in self._cache:
+            if (gid, oid) < start:
+                continue
+            if end is not None and (gid, oid) > end:
+                continue
+            out.append((gid, sgid, oid, payload, exts, prio, status))
+        return out
 
     async def _forward_one(self, session, alias, gid, sgid, oid,
                            payload, exts, prio, status=None, shape=None):
@@ -743,6 +781,120 @@ async def _offer_track(session, track, key):
                 f"(fanout={len(track.downstream)})")
 
 
+# (id(session), request_id) -> objects collected from an upstream FETCH.
+_fetch_sinks: dict = {}
+
+
+def _install_fetch_sink(pub) -> None:
+    """One per-session fetch-object callback, demultiplexed by request
+    id, so several upstream fetches can run at once."""
+    if getattr(pub, "_relay_fetch_sink", False):
+        return
+    pub._relay_fetch_sink = True
+
+    def _on(obj, size, ts, request_id):
+        sink = _fetch_sinks.get((id(pub), request_id))
+        if sink is not None:
+            sink.append(obj)
+
+    pub.on_fetch_object = _on
+
+
+async def _fetch_upstream(ns, track_name, msg):
+    """Ask each publisher of `ns` for the requested range. Returns the
+    objects, or None when nobody serves it — the relay keeps only recent
+    objects, so a historical range has to come from the origin."""
+    name = (track_name.decode() if isinstance(track_name, bytes)
+            else track_name)
+    for pub in _publishers_for(ns):
+        _install_fetch_sink(pub)
+        req = pub.fetch(
+            namespace="/".join(x.decode() for x in ns),
+            track_name=name,
+            group_order=msg.group_order or GroupOrder.ASCENDING,
+            start_group=msg.start_group or 0,
+            start_object=msg.start_object or 0,
+            end_group=msg.end_group or 0,
+            end_object=msg.end_object or 0,
+        )
+        key = (id(pub), req.request_id)
+        _fetch_sinks[key] = []
+        try:
+            await pub._await_response(req.request_id, timeout=10.0)
+            await pub.await_fetch_done(req.request_id, timeout=10.0)
+        except (MOQTRequestError, asyncio.TimeoutError) as e:
+            logger.info(f"relay: upstream FETCH declined on {ns}: {e}")
+            _fetch_sinks.pop(key, None)
+            continue
+        objs = _fetch_sinks.pop(key, [])
+        logger.info(f"relay: upstream FETCH {ns}/{name} -> "
+                    f"{len(objs)} object(s)")
+        return objs
+    return None
+
+
+async def _on_fetch(session, msg):
+    """Standalone FETCH (§10.13) served from the track's recent-object
+    cache. A joining FETCH needs history this relay does not keep."""
+    from aiomoqt.messages.fetch import _is_joining
+
+    if _is_joining(msg.fetch_type):
+        logger.info("relay: joining FETCH -> NOT_SUPPORTED")
+        session.fetch_error(
+            request_id=msg.request_id,
+            error_code=int(RequestErrorCode.NOT_SUPPORTED),
+            reason="joining fetch not supported")
+        return
+    ns = _ns_tuple(msg.namespace)
+    track = _tracks.get((ns, msg.track_name))
+    start = (msg.start_group or 0, msg.start_object or 0)
+    end = (None if msg.end_group is None
+           else (msg.end_group, msg.end_object
+                 if msg.end_object is not None else (1 << 62)))
+    objs = (track.cached_range(start, end)
+            if track is not None and _track_live(track) else [])
+    if not objs:
+        # Only recent objects are held, so a historical range comes from
+        # the publisher — which is also the only path for a track this
+        # relay has never subscribed to.
+        upstream = await _fetch_upstream(ns, msg.track_name, msg)
+        if upstream is None:
+            logger.info(f"relay: FETCH ns={ns} track={msg.track_name} "
+                        f"-> DOES_NOT_EXIST")
+            session.fetch_error(
+                request_id=msg.request_id,
+                error_code=int(RequestErrorCode.DOES_NOT_EXIST),
+                reason="track does not exist")
+            return
+        if not upstream:
+            session.fetch_error(
+                request_id=msg.request_id,
+                error_code=int(RequestErrorCode.INVALID_RANGE),
+                reason="requested range unavailable")
+            return
+        objs = [(o.group_id, o.subgroup_id, o.object_id, o.payload,
+                 o.extensions, o.publisher_priority, o.status)
+                for o in upstream]
+    order = msg.group_order or GroupOrder.ASCENDING
+    last_g, last_o = objs[-1][0], objs[-1][2]
+    # §10.13: FETCH_OK End Location is the last Object PLUS 1.
+    session.fetch_ok(request_id=msg.request_id,
+                     largest_group_id=last_g, largest_object_id=last_o + 1,
+                     group_order=int(order))
+    if int(order) == int(GroupOrder.DESCENDING):
+        objs = sorted(objs, key=lambda o: (-o[0], o[2]))
+    await session.serve_fetch(
+        msg.request_id,
+        (FetchObject(group_id=gid, subgroup_id=sgid, object_id=oid,
+                     publisher_priority=prio,
+                     extensions=exts, payload=payload or b"",
+                     status=status)
+         for gid, sgid, oid, payload, exts, prio, status in objs),
+        group_order=int(order))
+    logger.info(f"relay: FETCH ns={ns} track={msg.track_name} served "
+                f"{len(objs)} object(s) {start}..({last_g}.{last_o})")
+
+
 async def _on_subscribe_namespace(session, msg):
     """Namespace discovery (§9.4). d18 answers NAMESPACE per namespace
     under the prefix — the subscriber then asks each one for its tracks
@@ -874,6 +1026,8 @@ def _build_server(bind, port, cert, key, use_quic, draft):
         MOQTMessageType.TRACK_STATUS, _on_track_status)
     server.register_handler(
         MOQTMessageType.SUBSCRIBE_NAMESPACE, _on_subscribe_namespace)
+    server.register_handler(
+        MOQTMessageType.FETCH, _on_fetch)
     server.register_handler(
         D18MessageType.SUBSCRIBE_TRACKS, _on_subscribe_tracks)
     return server

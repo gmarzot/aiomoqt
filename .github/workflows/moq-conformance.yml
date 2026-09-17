@@ -146,7 +146,7 @@ jobs:
           # Both transports on one dual-mode listener: raw QUIC selects a
           # draft by ALPN, WebTransport by WT-Protocol.
           for T in quic h3wt; do
-            TRANSPORT=$T bash .github/scripts/moq-conformance.sh 2>&1 \
+            FETCH=1 TRANSPORT=$T bash .github/scripts/moq-conformance.sh 2>&1 \
               | tee "conformance-$T.log"
           done
 

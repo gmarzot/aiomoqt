@@ -1,0 +1,152 @@
+"""Ersatz-relay standalone FETCH, served from its recent-object cache.
+
+The relay registered no FETCH handler, so the session default accepted
+with FETCH_OK and never opened the data stream — a peer waited forever.
+It now answers from a bounded cache of objects it has forwarded, and
+rejects what it cannot serve: joining FETCH (no history), an unknown
+track, a range it no longer holds.
+"""
+import asyncio
+
+import pytest
+
+from aiomoqt.context import profile_for
+from aiomoqt.messages.data import FetchObject
+from aiomoqt.messages.fetch import Fetch
+from aiomoqt.protocol import _MOQTSessionMixin
+from aiomoqt.tools import moq_interop_relay as relay
+from aiomoqt.types import GroupOrder, RequestErrorCode
+
+STANDALONE, RELATIVE_JOINING = 0x1, 0x2
+
+
+def _session(draft=18):
+    s = object.__new__(_MOQTSessionMixin)
+    s.negotiated_draft = draft
+    s._profile = profile_for(draft)
+    s._errors = []
+    s._oks = []
+    s._served = []
+    s.fetch_error = lambda request_id, error_code, reason: (
+        s._errors.append((error_code, reason)))
+    s.fetch_ok = lambda **kw: s._oks.append(kw)
+
+    async def _serve(request_id, objects, group_order=None, fin=True):
+        s._served.append((list(objects), group_order))
+        return 0
+    s.serve_fetch = _serve
+    return s
+
+
+def _track(objects=(), live=True):
+    t = relay._RelayedTrack(((b"live",), b"cam"))
+    t.upstream = object() if live else None
+    for gid, oid in objects:
+        t._remember(gid, 0, oid, b"x" * 10, None, 128, None)
+    return t
+
+
+def _fetch(**kw):
+    kw.setdefault("fetch_type", STANDALONE)
+    kw.setdefault("group_order", None)     # omitted on the wire = Ascending
+    kw.setdefault("request_id", 5)
+    kw.setdefault("namespace", (b"live",))
+    kw.setdefault("track_name", b"cam")
+    return Fetch(**kw)
+
+
+@pytest.fixture(autouse=True)
+def _tables():
+    saved = dict(relay._tracks)
+    relay._tracks.clear()
+    live = relay._track_live
+    relay._track_live = lambda t: t.upstream is not None
+    yield
+    relay._track_live = live
+    relay._tracks.clear()
+    relay._tracks.update(saved)
+
+
+def test_joining_fetch_is_refused():
+    s = _session()
+    relay._tracks[((b"live",), b"cam")] = _track([(0, 0)])
+    asyncio.run(relay._on_fetch(s, _fetch(fetch_type=RELATIVE_JOINING,
+                                          joining_request_id=1,
+                                          joining_start=2)))
+    assert s._errors == [(int(RequestErrorCode.NOT_SUPPORTED),
+                          "joining fetch not supported")]
+    assert s._oks == []
+
+
+def test_unknown_track_is_refused():
+    s = _session()
+    asyncio.run(relay._on_fetch(s, _fetch(start_group=0, start_object=0)))
+    assert s._errors[0][0] == int(RequestErrorCode.DOES_NOT_EXIST)
+
+
+def test_range_outside_the_cache_with_no_publisher_is_refused():
+    s = _session()
+    relay._tracks[((b"live",), b"cam")] = _track([(5, 0), (5, 1)])
+    asyncio.run(relay._on_fetch(s, _fetch(start_group=0, start_object=0,
+                                          end_group=1, end_object=0)))
+    assert s._errors[0][0] == int(RequestErrorCode.DOES_NOT_EXIST)
+
+
+def test_range_outside_the_cache_falls_back_to_upstream(monkeypatch):
+    # Only recent objects are cached, so a historical range — or a track
+    # the relay never subscribed to — is fetched from the publisher.
+    s = _session()
+    asked = []
+
+    async def _upstream(ns, track_name, msg):
+        asked.append((ns, track_name, msg.start_group, msg.end_group))
+        return [FetchObject(group_id=0, subgroup_id=0, object_id=i,
+                            publisher_priority=128, payload=b"z")
+                for i in range(3)]
+    monkeypatch.setattr(relay, "_fetch_upstream", _upstream)
+    asyncio.run(relay._on_fetch(s, _fetch(start_group=0, start_object=0,
+                                          end_group=1, end_object=0)))
+    assert asked == [((b"live",), b"cam", 0, 1)]
+    assert s._errors == []
+    served, _ = s._served[0]
+    assert [o.object_id for o in served] == [0, 1, 2]
+
+
+def test_cached_window_is_served_with_exclusive_end_location():
+    s = _session()
+    relay._tracks[((b"live",), b"cam")] = _track(
+        [(1, 0), (1, 1), (2, 0), (2, 1)])
+    asyncio.run(relay._on_fetch(s, _fetch(start_group=1, start_object=1,
+                                          end_group=2, end_object=0)))
+    assert s._errors == []
+    ok = s._oks[0]
+    # §10.13: End Location is the last object PLUS 1.
+    assert (ok['largest_group_id'], ok['largest_object_id']) == (2, 1)
+    served, _order = s._served[0]
+    assert [(o.group_id, o.object_id) for o in served] == [(1, 1), (2, 0)]
+
+
+def test_descending_request_serves_groups_in_reverse():
+    s = _session()
+    relay._tracks[((b"live",), b"cam")] = _track([(1, 0), (2, 0), (3, 0)])
+    asyncio.run(relay._on_fetch(s, _fetch(start_group=1, start_object=0,
+                                          group_order=GroupOrder.DESCENDING)))
+    served, order = s._served[0]
+    assert [o.group_id for o in served] == [3, 2, 1]
+    assert order == int(GroupOrder.DESCENDING)
+
+
+def test_cache_drops_oldest_groups():
+    t = _track([(g, 0) for g in range(relay.CACHE_GROUPS + 4)])
+    groups = {entry[0] for entry in t._cache}
+    assert len(groups) == relay.CACHE_GROUPS
+    assert min(groups) == 4                      # oldest four evicted
+
+
+def test_cache_drops_on_the_byte_bound(monkeypatch):
+    monkeypatch.setattr(relay, "CACHE_BYTES", 100)
+    t = relay._RelayedTrack(((b"live",), b"cam"))
+    for oid in range(20):
+        t._remember(0, 0, oid, b"x" * 10, None, 128, None)
+    assert t._cache_bytes <= 100
+    assert [e[2] for e in t._cache] == list(range(10, 20))
