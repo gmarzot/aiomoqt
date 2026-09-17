@@ -146,6 +146,20 @@ def test_latency_from_timestamp_extension():
     assert 4.5 <= summ['lat_p50'] <= 5.5
 
 
+def test_latency_from_loc_timestamp_unless_timescaled():
+    # loc-04: TIMESTAMP (0x10) is wall-clock µs only without TIMESCALE (0x08).
+    s = TrackStats()
+    us = _now_us()
+    o = Obj(0, 0)
+    o.extensions = {0x10: us - 7000}
+    s.on_object(o, 10, us)
+    o = Obj(0, 1)
+    o.extensions = {0x10: 90_000, 0x08: 90_000}
+    s.on_object(o, 10, us)
+    assert s.lat_count == 1
+    assert 6.5 <= s.summary()['lat_mean'] <= 7.5
+
+
 def test_absurd_timestamps_rejected():
     """Clock skew / deframer garbage must not poison the stats."""
     s = TrackStats()

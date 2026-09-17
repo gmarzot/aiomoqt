@@ -135,6 +135,12 @@ def normalize_supported_drafts(supported_drafts) -> list:
 
 MOQT_DEFAULT_PRIORITY = 128
 
+# loc-04 TIMESTAMP (Object): wall-clock µs since the epoch unless a
+# TIMESCALE property makes it media time. What publishers stamp.
+LOC_TIMESTAMP = 0x10
+
+# Legacy private id, read-only from 0.11.1: unregistered, and nothing
+# outside aiomoqt ever read it.
 MOQT_TIMESTAMP_EXT = 0x20
 
 

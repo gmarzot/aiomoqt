@@ -3,7 +3,7 @@ import argparse
 import asyncio
 import uuid
 
-from aiomoqt.types import (ForwardingPreference, MOQT_TIMESTAMP_EXT, parse_draft_spec)
+from aiomoqt.types import (ForwardingPreference, LOC_TIMESTAMP, parse_draft_spec)
 from aiomoqt.messages import (
     Subscribe,
     SubgroupHeader,
@@ -74,7 +74,7 @@ async def generate_subgroup_stream(session, subgroup_id: int,
 
                 # End the previous group
                 if header is not None:
-                    extensions = {MOQT_TIMESTAMP_EXT: int(time.time() * 1_000_000)} if use_extensions else None
+                    extensions = {LOC_TIMESTAMP: int(time.time() * 1_000_000)} if use_extensions else None
                     buf = header.end_group(extensions=extensions)
                     if session._close_err:
                         raise asyncio.CancelledError
@@ -118,7 +118,7 @@ async def generate_subgroup_stream(session, subgroup_id: int,
                 payload = (info + P_FRAME_PAD)[:object_size]
 
             # Send next object — delta encoding handled automatically
-            extensions = {MOQT_TIMESTAMP_EXT: int(time.time() * 1_000_000)} if use_extensions else None
+            extensions = {LOC_TIMESTAMP: int(time.time() * 1_000_000)} if use_extensions else None
             buf = header.next_object(payload=payload, extensions=extensions)
 
             if session._close_err is not None:

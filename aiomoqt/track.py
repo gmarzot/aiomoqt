@@ -31,7 +31,7 @@ from typing import Callable, Dict, Optional
 
 from .types import (
     MOQTMessageType, MOQTRequestError, ParamType, FilterType,
-    ForwardingPreference, GroupOrder, MOQT_TIMESTAMP_EXT, SessionCloseCode,
+    ForwardingPreference, GroupOrder, LOC_TIMESTAMP, SessionCloseCode,
     StreamResetCode,
 )
 from .delivery import FanoutDelivery, StreamMapping, SubgroupDelivery
@@ -803,7 +803,7 @@ class PublishedTrack(Track):
                     object_id=cur_obj_id,
                     publisher_priority=self.priority,
                     extensions={
-                        MOQT_TIMESTAMP_EXT: int(time.time() * 1_000_000)},
+                        LOC_TIMESTAMP: int(time.time() * 1_000_000)},
                     payload=payload,
                     end_of_group=(cur_obj_id == self.group_size - 1),
                 )
@@ -933,7 +933,7 @@ class PublishedTrack(Track):
                 seq_info = f"{group_id}.{cur_obj_id}".encode()
                 payload = (seq_info + b'|' + pad)[:self.object_size]
 
-                extensions = {MOQT_TIMESTAMP_EXT: int(time.time() * 1_000_000)}
+                extensions = {LOC_TIMESTAMP: int(time.time() * 1_000_000)}
                 data = header.next_object_bytes(payload=payload,
                                                 extensions=extensions,
                                                 object_id=cur_obj_id)
@@ -1381,7 +1381,7 @@ class VideoTrack(PublishedTrack):
                            + frame_pad)[:frame_size]
 
                 extensions = {
-                    MOQT_TIMESTAMP_EXT: int(time.time() * 1_000_000)}
+                    LOC_TIMESTAMP: int(time.time() * 1_000_000)}
                 buf = header.next_object(
                     payload=payload,
                     extensions=extensions,

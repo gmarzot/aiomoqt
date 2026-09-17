@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Object timestamps use loc-04 TIMESTAMP (0x10, wall-clock µs) instead of
+  the private 0x20; receivers still read 0x20. load_sim and sub_bench now
+  measure latency against pub_media broadcasts.
+- `register_publish_done_handler()` and `close_on_last_publish_done` for
+  sessions that outlive their subscriptions.
+
 ## v0.11.0
 
 Pairs with aiopquic 0.4.0. The rc sections below carry detail.

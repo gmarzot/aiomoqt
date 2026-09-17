@@ -13,7 +13,7 @@ Both views come from the same counters, so identical traffic reports
 identical numbers regardless of which tool observed it.
 
 Receivers get latency and jitter (they need the peer's send timestamp
-from the MOQT_TIMESTAMP_EXT extension and a local receive clock).
+from the LOC TIMESTAMP or bench 0x20 property and a local receive clock).
 Publishers use `SenderStats`, which shares the rate/group accounting but
 has no latency view — there is no round trip to measure.
 
@@ -35,6 +35,22 @@ from .format import fmt_bps, fmt_ms, fmt_rate
 from ..types import ObjectStatus
 
 MOQT_TIMESTAMP_EXT = 0x20
+# loc-04 TIMESTAMP: wall-clock µs since the epoch unless TIMESCALE is
+# present, which makes it media time.
+LOC_TIMESTAMP = 0x10
+LOC_TIMESCALE = 0x08
+
+
+def send_time_us(exts) -> Optional[int]:
+    """Sender wall-clock µs from object properties: LOC TIMESTAMP when no
+    TIMESCALE rides with it, else the legacy bench property 0x20."""
+    if not exts:
+        return None
+    if LOC_TIMESCALE not in exts:
+        ts = exts.get(LOC_TIMESTAMP)
+        if ts is not None:
+            return ts
+    return exts.get(MOQT_TIMESTAMP_EXT)
 
 # Latency sanity window: reject clock-skew / deframer garbage. Real
 # under-load latency can be seconds, so the ceiling is generous; the
@@ -284,11 +300,9 @@ class TrackStats:
                 send_us = None
             else:
                 self._lat_tick = 0
-                exts = getattr(msg, 'extensions', None)
-                send_us = exts.get(MOQT_TIMESTAMP_EXT) if exts else None
+                send_us = send_time_us(getattr(msg, 'extensions', None))
         else:
-            exts = getattr(msg, 'extensions', None)
-            send_us = exts.get(MOQT_TIMESTAMP_EXT) if exts else None
+            send_us = send_time_us(getattr(msg, 'extensions', None))
         if send_us is not None and recv_time_us is not None:
             raw = recv_time_us - send_us
             if _LAT_MIN_US <= raw <= _LAT_MAX_US:
