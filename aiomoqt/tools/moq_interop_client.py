@@ -1020,7 +1020,7 @@ def parse_args():
         description="MoQ Interop Test Client (aiomoqt)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "Environment variables: RELAY_URL, TESTCASE, "
+            "Environment variables: RELAY_URL, TESTCASE, MOQT_DRAFT, "
             "TLS_DISABLE_VERIFY, VERBOSE, COMPAT, "
             "NAMESPACE_PREFIX, AUTH_TOKEN"
         ),
@@ -1041,14 +1041,17 @@ def parse_args():
                         help="Skip TLS certificate verification")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug logging to stderr")
+    # DRAFT is what the interop runner injects; MOQT_DRAFT is accepted
+    # too so a harness setting it does not silently fall back to probing.
+    draft_env = next((os.environ[k] for k in ("DRAFT", "MOQT_DRAFT")
+                      if os.environ.get(k, "").strip()), None)
     parser.add_argument(
         "--draft", type=parse_draft_spec,
-        default=(parse_draft_spec(os.environ["DRAFT"])
-                 if os.environ.get("DRAFT", "").strip() else None),
-        help="MoQT draft, e.g. 16 (single = strict pin) or a comma list "
-             "16,14,18 (preference-ordered probe: pin the first whose SETUP "
-             "completes) (env: DRAFT). Default: auto multi-version ALPN with "
-             "a draft-14 handshake fallback")
+        default=parse_draft_spec(draft_env) if draft_env else None,
+        help="MoQT draft, e.g. 16 or draft-16 (single = strict pin) or a "
+             "comma list 16,14,18 (preference-ordered probe: pin the first "
+             "whose SETUP completes) (env: DRAFT, MOQT_DRAFT). Default: "
+             "auto multi-version ALPN with a draft-14 handshake fallback")
     parser.add_argument(
         "--compat", type=str, default=os.environ.get("COMPAT", ""),
         help=(

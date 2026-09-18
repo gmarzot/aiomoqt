@@ -1,3 +1,4 @@
+import re
 from enum import IntEnum
 from typing import Dict, Tuple
 
@@ -79,10 +80,17 @@ def moqt_version_from_draft(draft: int) -> int:
     return 0xff000000 | (draft & 0xff)
 
 
+# Draft spellings: the bare number, and the "draft-NN" form interop
+# registries and harnesses use (moqt-NN is the ALPN spelling).
+_DRAFT_TOKEN = re.compile(r"^(?:(?:draft|moqt|d)[-_]?)?(\d{1,3})$",
+                          re.IGNORECASE)
+
+
 def parse_draft_spec(s: str):
     """Parse a ``--draft`` CLI value into a pin or an ordered offer set.
 
         '16'        -> 16            (pin: offer only that ALPN)
+        'draft-16'  -> 16            (the interop registry spelling)
         '18,16,14'  -> [18, 16, 14]  (offer the set, in preference order)
 
     The result is passed straight to ``MOQTClient`` / ``MOQTServer``'s
@@ -90,7 +98,17 @@ def parse_draft_spec(s: str):
     is preserved so a caller can put a relay's preferred draft first (some
     relays select the first offered ALPN rather than the highest mutual).
     """
-    parts = [int(p) for p in str(s).split(",") if p.strip()]
+    parts = []
+    for token in str(s).split(","):
+        token = token.strip()
+        if not token:
+            continue
+        m = _DRAFT_TOKEN.match(token)
+        if m is None:
+            raise ValueError(
+                f"invalid draft {token!r}: want 18, draft-18 or a "
+                f"comma list such as 18,16")
+        parts.append(int(m.group(1)))
     if not parts:
         raise ValueError(f"empty --draft value: {s!r}")
     return parts[0] if len(parts) == 1 else parts
