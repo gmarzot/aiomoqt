@@ -671,18 +671,9 @@ async def _on_publish(session, msg):
         _tracks[key] = track
     _watch_session(session)
     track.pending_publish = (session, msg)
-    # §5.1: accept now with Forward State 0 and ask for objects when a
-    # subscriber arrives. Holding the reply instead leaves the publisher
-    # waiting on a transaction that only a subscriber can complete.
-    session._track_aliases[msg.track_alias] = msg.request_id
-    session.register_object_handler(msg.track_alias, track.on_object)
-    session.register_stream_end_handler(msg.track_alias, track.on_stream_end)
-    session._send_reply(msg.request_id, PublishOk(
-        request_id=msg.request_id, forward=0, priority=128,
-        group_order=GroupOrder.ASCENDING,
-        filter_type=FilterType.LATEST_OBJECT, parameters={}))
     logger.info(f"relay: publish ns={ns} track={msg.track_name} "
-                f"alias={msg.track_alias} -> PUBLISH_OK forward=0")
+                f"alias={msg.track_alias} — holding PUBLISH_OK for a "
+                f"subscriber")
     for sub_session, prefix, _rid in list(_track_subs):
         if _prefix_covers(prefix, ns):
             asyncio.create_task(
@@ -692,17 +683,19 @@ async def _on_publish(session, msg):
 
 
 def _accept_publish(track) -> None:
-    """A subscriber arrived for a held PUBLISH: raise its Forward State
-    so the publisher starts sending (§10.9)."""
+    """Answer a held PUBLISH with forward=1 and start taking objects."""
     if track.pending_publish is None or track.upstream is not None:
         return
     session, msg = track.pending_publish
-    try:
-        session.request_update(existing_request_id=msg.request_id, forward=1)
-    except Exception:
-        logger.debug("relay: forward-state update failed", exc_info=True)
-        return
-    logger.info(f"relay: REQUEST_UPDATE forward=1 alias={msg.track_alias}")
+    session._track_aliases[msg.track_alias] = msg.request_id
+    session.register_object_handler(msg.track_alias, track.on_object)
+    session.register_stream_end_handler(msg.track_alias, track.on_stream_end)
+    ok = PublishOk(
+        request_id=msg.request_id, forward=1, priority=128,
+        group_order=GroupOrder.ASCENDING,
+        filter_type=FilterType.LATEST_OBJECT, parameters={})
+    logger.info(f"relay: PUBLISH_OK forward=1 alias={msg.track_alias}")
+    session._send_reply(msg.request_id, ok)
     track.upstream = session
     track.pending_publish = None
 
