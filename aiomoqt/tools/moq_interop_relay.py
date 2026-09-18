@@ -253,6 +253,10 @@ class _RelayedTrack:
         # all, and an unbounded one is a leak.
         self._cache = deque()
         self._cache_bytes = 0
+        # Alias the upstream gave this track. A publisher may reuse one
+        # across successive subscriptions on a session it keeps open, so
+        # the registrations under it are released when the track ends.
+        self.upstream_alias = None
         # Largest (group, object) forwarded: the Largest Location a
         # SUBSCRIBE_OK reports, and what a joining FETCH anchors to.
         self.largest = None
@@ -264,8 +268,23 @@ class _RelayedTrack:
         self._pending_done = None
         self._done_timer = None
 
+    def release_upstream(self) -> None:
+        """Drop this track's handlers on the upstream session, so a later
+        subscription reusing the alias is not answered by a dead track."""
+        session = _upstream_session(self)
+        if session is None or self.upstream_alias is None:
+            return
+        try:
+            session.unregister_object_handler(self.upstream_alias)
+            session.unregister_stream_end_handler(self.upstream_alias)
+        except Exception:
+            logger.debug("relay: releasing upstream handlers failed",
+                         exc_info=True)
+        self.upstream_alias = None
+
     def close(self) -> None:
         """Release the fan-out: stop the drain and forget its streams."""
+        self.release_upstream()
         if self.task is not None:
             self.task.cancel()
             self.task = None
@@ -403,6 +422,7 @@ class _RelayedTrack:
                 # been written downstream before PUBLISH_DONE goes out.
                 code, reason, key = shape
                 self.finish(status_code=code, reason=reason)
+                self.release_upstream()
                 self.downstream.clear()
                 self._streams.clear()
                 self.task = None
@@ -682,6 +702,7 @@ async def _establish_upstream(ns, track_name):
             logger.info(f"relay: upstream subscribe failed on {ns}: {e}")
             continue
         track.upstream = upstream
+        track.upstream_alias = upstream.track_alias
         pub.register_stream_end_handler(upstream.track_alias,
                                         track.on_stream_end)
         _tracks[key] = track
