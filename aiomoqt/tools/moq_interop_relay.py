@@ -832,10 +832,9 @@ async def _offer_track(session, track, key):
     SUBSCRIBE_TRACKS subscriber; on PUBLISH_OK(forward=1) wire it into
     the fan-out."""
     ns, name = key
-    owner = (track.pending_publish[0] if track.pending_publish
-             else track.upstream)
-    if owner is session:
-        return
+    # A session that subscribed to a prefix gets every track under it,
+    # including one it publishes itself: the subscription is explicit,
+    # and moq-test's publish cases use one session for both roles.
     pub_msg = session.publish(
         namespace="/".join(x.decode() for x in ns),
         track_name=(name.decode() if isinstance(name, bytes) else name),
