@@ -19,9 +19,14 @@ args=("$URL" "$DRAFT")
 # The suite writes its report into the working directory, named by
 # timestamp; run it somewhere disposable and rename the result.
 work=$(mktemp -d)
+echo "=== full suite: draft $DRAFT over $TRANSPORT ==="
+# Per-case lines as they land: the suite takes minutes, and a silent
+# step is indistinguishable from a hung one.
 (cd "$work" && MOXYGEN_DIR="$MOXDIR" SKIP_FETCH="${SKIP_FETCH:-0}" \
-    bash "$SUITE" "${args[@]}")
-rc=$?
+    bash "$SUITE" "${args[@]}") 2>&1 \
+    | stdbuf -oL grep -E --line-buffered \
+        "Test [0-9]+\]|PASSED|FAILED|SECTION [0-9]|Success Rate|Total Tests"
+rc=${PIPESTATUS[0]}
 report=$(ls -t "$work"/moqtest_conformance_report_*.txt 2>/dev/null | head -1)
 if [ -z "$report" ]; then
     echo "::warning::no conformance report produced for $DRAFT/$TRANSPORT"
