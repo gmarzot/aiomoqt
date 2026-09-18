@@ -435,6 +435,16 @@ class _RelayedTrack:
             dropped = self._cache.popleft()
             self._cache_bytes -= len(dropped[3] or b"")
 
+    def cache_covers(self, start) -> bool:
+        """True when the cache still holds the start of the range. The
+        oldest object is the boundary: anything before it was evicted
+        and has to come from the publisher, or the subscriber gets a
+        short answer with no way to tell."""
+        if not self._cache:
+            return False
+        first = (self._cache[0][0], self._cache[0][2])
+        return start >= first
+
     def cached_range(self, start, end):
         """Cached objects within [start, end], each (group, object)
         inclusive; `end` None means to the live edge. Ascending."""
@@ -1059,8 +1069,9 @@ async def _on_fetch(session, msg):
     end = (None if msg.end_group is None
            else (msg.end_group, msg.end_object
                  if msg.end_object is not None else (1 << 62)))
-    objs = (track.cached_range(start, end)
-            if track is not None and _track_live(track) else [])
+    have_cache = (track is not None and _track_live(track)
+                  and track.cache_covers(start))
+    objs = track.cached_range(start, end) if have_cache else []
     end_of_track = 0
     if objs and objs[-1][6] == ObjectStatus.END_OF_TRACK:
         end_of_track = 1

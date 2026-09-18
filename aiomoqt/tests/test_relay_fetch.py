@@ -230,3 +230,39 @@ def test_terminal_waits_for_the_streams_publish_done_counts():
         t._check_pending_done()
         assert t.queue.get_nowait()[6] == "DONE"
     asyncio.run(_run())
+
+
+def test_range_older_than_the_cache_goes_upstream(monkeypatch):
+    # A partly-held range is not a cache hit: the evicted head has to
+    # come from the publisher, or the subscriber gets a short answer
+    # with no way to tell it was short.
+    s = _session()
+    t = _track([(g, 0) for g in range(3, 6)])     # groups 0-2 evicted
+    relay._tracks[((b"live",), b"cam")] = t
+    asked = []
+
+    async def _upstream(ns, track_name, msg):
+        asked.append((msg.start_group, msg.end_group))
+        return SimpleNamespace(end_of_track=0), [
+            FetchObject(group_id=g, subgroup_id=0, object_id=0,
+                        publisher_priority=128, payload=b"z")
+            for g in range(0, 6)]
+    monkeypatch.setattr(relay, "_fetch_upstream", _upstream)
+    asyncio.run(relay._on_fetch(s, _fetch(start_group=0, start_object=0,
+                                          end_group=5, end_object=0)))
+    assert asked == [(0, 5)]                      # went upstream
+    served, _ = s._served[0]
+    assert [o.group_id for o in served] == [0, 1, 2, 3, 4, 5]
+
+
+def test_range_inside_the_cache_is_served_from_it(monkeypatch):
+    s = _session()
+    t = _track([(g, 0) for g in range(3, 6)])
+    relay._tracks[((b"live",), b"cam")] = t
+
+    async def _never(ns, track_name, msg):
+        raise AssertionError("should not ask upstream")
+    monkeypatch.setattr(relay, "_fetch_upstream", _never)
+    asyncio.run(relay._on_fetch(s, _fetch(start_group=4, start_object=0)))
+    served, _ = s._served[0]
+    assert [o.group_id for o in served] == [4, 5]
