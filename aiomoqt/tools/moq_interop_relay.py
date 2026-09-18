@@ -59,7 +59,8 @@ from aiomoqt.types import (
     StreamResetCode, SubscribeDoneCode, SubscribeErrorCode, parse_draft_spec,
 )
 from aiomoqt.messages import SubgroupHeader
-from aiomoqt.messages.data import FetchObject
+from aiomoqt.messages.data import (FetchObject, ObjectDatagram,
+                                   ObjectDatagramStatus)
 from aiomoqt.messages.publish import PublishOk
 from aiomoqt.messages.request import RequestError, RequestOk
 from aiomoqt.track import SubscribedTrack
@@ -309,12 +310,18 @@ class _RelayedTrack:
         # Forward the publisher's priority, never a substitute of our
         # own: a subscriber's scheduling depends on it.
         prio = getattr(msg, "publisher_priority", None)
+        # Delivery mode is part of what a subscriber checks: an object
+        # the publisher sent as a datagram goes out as one, with its
+        # end-of-group bit, not re-framed onto a subgroup stream.
+        shape = getattr(msg, "stream_flags", None)
+        if isinstance(msg, (ObjectDatagram, ObjectDatagramStatus)):
+            shape = ("DGRAM", bool(getattr(msg, "end_of_group", False)))
         self.queue.put_nowait(
             (gid, subgroup_id or 0, msg.object_id,
              bytes(msg.payload), msg.extensions or None,
              128 if prio is None else prio,
              getattr(msg, "status", None),
-             getattr(msg, "stream_flags", None)))
+             shape))
 
     def add_downstream(self, session, track_alias, request_id=None):
         self.downstream.append((session, track_alias, request_id))
@@ -384,6 +391,23 @@ class _RelayedTrack:
         """Write one object downstream, opening the (group, subgroup)
         stream on first sight. Group/subgroup identity is preserved from
         upstream so the downstream sees the publisher's structure."""
+        if isinstance(shape, tuple) and shape and shape[0] == "DGRAM":
+            prof = session._profile
+            is_status = (status or ObjectStatus.NORMAL) != ObjectStatus.NORMAL
+            if is_status and not prof.merged_datagram_layout:
+                # d14 keeps status datagrams in their own message family.
+                dgram = ObjectDatagramStatus(
+                    track_alias=alias, group_id=gid, object_id=oid,
+                    publisher_priority=prio, extensions=exts, status=status)
+            else:
+                dgram = ObjectDatagram(
+                    track_alias=alias, group_id=gid, object_id=oid,
+                    publisher_priority=prio, extensions=exts,
+                    payload=payload or b"",
+                    end_of_group=bool(shape[1]),
+                    status=status or ObjectStatus.NORMAL)
+            session.send_dgram_message(dgram.serialize(prof=prof))
+            return
         skey = (id(session), gid, sgid)
         entry = self._streams.get(skey)
         if entry is None and status in ("END", "RESET"):

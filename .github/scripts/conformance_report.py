@@ -41,31 +41,37 @@ def parse(path):
 
 
 def row(sections):
-    boxes = []
+    """Boxes per section: all passed, some passed, none passed, skipped."""
+    boxes, partial = [], []
     for n in range(1, MAX_SECTION + 1):
         passed, total = sections.get(n, (0, 0))
         if total == 0:
             boxes.append("⬜")
         elif passed == total:
             boxes.append("✅")
+        elif passed:
+            boxes.append("🟡")
+            partial.append(f"§{n} {passed}/{total}")
         else:
             boxes.append("❌")
+            partial.append(f"§{n} 0/{total}")
     passed = sum(p for p, _ in sections.values())
     total = sum(t for _, t in sections.values())
-    return " ".join(boxes), passed, total
+    return " ".join(boxes), passed, total, partial
 
 
 def main(paths):
     out = ["## moq-test conformance score", "",
-           "Sections 1–10; a blank box is a section the suite skipped "
-           "(its cases are out of the totals).", "",
-           "| run | 1 2 3 4 5 6 7 8 9 10 | score |",
-           "|---|---|---|"]
+           "Sections 1–10: ✅ all passed, 🟡 some passed, ❌ none passed, "
+           "⬜ skipped by the suite (out of the totals).", "",
+           "| run | 1 2 3 4 5 6 7 8 9 10 | score | not green |",
+           "|---|---|---|---|"]
     details = []
     for path in paths:
         sections, cases, reason_for = parse(path)
-        boxes, passed, total = row(sections)
-        out.append(f"| {path.stem} | {boxes} | {passed}/{total} |")
+        boxes, passed, total, partial = row(sections)
+        out.append(f"| {path.stem} | {boxes} | {passed}/{total} | "
+                   f"{', '.join(partial) or '—'} |")
         fails = [n for s, n in cases if s == "FAIL"]
         body = [f"<details><summary>{path.stem} — "
                 f"{len(fails)} failing of {len(cases)}</summary>", ""]
