@@ -93,14 +93,39 @@ _tracks: dict[tuple, "_RelayedTrack"] = {}
 # ever a server, and the whole client leg — SETUP, SUBSCRIBE and object
 # receive as a client, upstream disconnect — goes untested.
 _upstreams: list = []
+# Upstream URLs the relay was asked to dial; an empty list means there is
+# nothing to wait for.
+_upstream_urls: list = []
+
+# Redial delay for a lost upstream. Short: a subscriber arriving while
+# the relay has no upstream is answered with an error, so the window
+# matters more than the reconnect cost.
+UPSTREAM_REDIAL_S = 0.5
+# How long a SUBSCRIBE waits for an upstream to (re)appear before the
+# relay answers "track does not exist".
+UPSTREAM_WAIT_S = 3.0
+
+
+async def _await_upstream(timeout: float = None) -> bool:
+    """Wait for a dialled upstream to (re)connect."""
+    deadline = asyncio.get_running_loop().time() + (
+        UPSTREAM_WAIT_S if timeout is None else timeout)
+    while not _upstreams:
+        if asyncio.get_running_loop().time() >= deadline:
+            return False
+        await asyncio.sleep(0.05)
+    return True
 
 
 async def _dial_upstream(url: str, draft) -> None:
     """Hold a session open to an upstream origin for the process's life."""
+    _upstream_urls.append(url)
     ep = parse_relay_url(url)
+    # An upstream with no subscribers sends nothing, and an origin will
+    # close a silent connection on its idle timeout: PING keeps it.
     client = MOQTClient(ep.host, ep.port, path=ep.path,
                         use_quic=ep.use_quic, verify_tls=False,
-                        supported_drafts=draft)
+                        supported_drafts=draft, keep_alive_interval=10)
     while True:
         try:
             async with client.connect() as session:
@@ -115,8 +140,9 @@ async def _dial_upstream(url: str, draft) -> None:
                         _upstreams.remove(session)
         except Exception as e:
             logger.info(f"relay: upstream {url} unavailable: {e}")
-        logger.info(f"relay: retrying upstream {url} in 5s")
-        await asyncio.sleep(5)
+        logger.info(f"relay: retrying upstream {url} in "
+                    f"{UPSTREAM_REDIAL_S}s")
+        await asyncio.sleep(UPSTREAM_REDIAL_S)
 
 
 def _announced_match(ns: tuple) -> list[tuple]:
@@ -534,7 +560,8 @@ async def _establish_upstream(ns, track_name):
                 else track_name)
         upstream = SubscribedTrack(
             pub, "/".join(x.decode() for x in ns), name,
-            on_object=track.on_object)
+            on_object=track.on_object,
+            on_done=lambda done, t=track, k=key: _upstream_done(t, k, done))
         try:
             await upstream.subscribe(timeout=10.0)
         except Exception as e:
@@ -548,6 +575,19 @@ async def _establish_upstream(ns, track_name):
                     f"alias={upstream.track_alias}")
         return track
     return None
+
+
+def _upstream_done(track, key, done) -> None:
+    """Upstream ended the track: FIN downstream streams, PUBLISH_DONE
+    each subscriber, and drop the fan-out so a later SUBSCRIBE starts a
+    fresh upstream subscription."""
+    status = getattr(done, "status_code", SubscribeDoneCode.TRACK_ENDED)
+    reason = getattr(done, "reason", "") or "track ended"
+    logger.info(f"relay: upstream PUBLISH_DONE {key} status={status} "
+                f"-> {len(track.downstream)} subscriber(s)")
+    track.finish(status_code=status, reason=reason)
+    track.close()
+    _tracks.pop(key, None)
 
 
 async def _on_publish(session, msg):
@@ -624,7 +664,11 @@ async def _on_subscribe(session, msg):
         return
 
     # A dialled origin announces nothing, so an empty announcement table
-    # is not proof the track is unavailable.
+    # is not proof the track is unavailable. An upstream that has just
+    # dropped is redialing, and answering DOES_NOT_EXIST in that window
+    # fails every request a back-to-back test suite makes.
+    if not _announced_match(ns) and not _upstreams and _upstream_urls:
+        await _await_upstream()
     if _announced_match(ns) or _upstreams:
         track = await _establish_upstream(ns, msg.track_name)
         if track is not None:

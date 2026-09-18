@@ -1040,9 +1040,12 @@ class SubscribedTrack(Track):
     def __init__(self, session, namespace: str, trackname: str = None,
                  on_object: Optional[Callable] = None,
                  report_interval: float = 5.0,
-                 auth_token: Optional[bytes] = None):
+                 auth_token: Optional[bytes] = None,
+                 on_done: Optional[Callable] = None):
         super().__init__(session, namespace, trackname)
         self.on_object = on_object
+        # Called with the PUBLISH_DONE that ends this subscription.
+        self.on_done = on_done
         self.report_interval = report_interval
         self.auth_token = auth_token
         self.publish_done: Optional[object] = None  # received PUBLISH_DONE
@@ -1202,6 +1205,8 @@ class SubscribedTrack(Track):
         def _done(msg):
             self.publish_done = msg
             self._done_event.set()
+            if self.on_done is not None:
+                self.on_done(msg)
 
         self.session.register_publish_done_handler(request_id, _done)
 
