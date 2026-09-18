@@ -267,6 +267,11 @@ class _RelayedTrack:
         self._upstream_ended = 0
         self._pending_done = None
         self._done_timer = None
+        # Objects taken from upstream / written downstream, reported at
+        # the terminal: a subscriber short of objects is either a relay
+        # that never received them or one that never forwarded them.
+        self._objects_in = 0
+        self._objects_out = 0
 
     def release_upstream(self) -> None:
         """Drop this track's handlers on the upstream session, so a later
@@ -380,6 +385,7 @@ class _RelayedTrack:
 
     def on_object(self, msg, size, ts, group_id, subgroup_id):
         """Upstream delivery callback (sync) — hand off to the drain."""
+        self._objects_in += 1
         gid = getattr(msg, "group_id", None)
         gid = gid if gid is not None else group_id
         # Forward the publisher's priority, never a substitute of our
@@ -434,6 +440,7 @@ class _RelayedTrack:
                 self._remember(gid, sgid, oid, payload, exts, prio, status)
             for session, alias, _rid in list(self.downstream):
                 try:
+                    self._objects_out += 1
                     await self._forward_one(
                         session, alias, gid, sgid, oid, payload, exts,
                         prio, status, shape)
@@ -731,7 +738,10 @@ def _upstream_done(track, key, done) -> None:
     status = getattr(done, "status_code", SubscribeDoneCode.TRACK_ENDED)
     reason = getattr(done, "reason", "") or "track ended"
     logger.info(f"relay: upstream PUBLISH_DONE {key} status={status} "
-                f"-> {len(track.downstream)} subscriber(s)")
+                f"streams={getattr(done, 'stream_count', 0)} "
+                f"-> {len(track.downstream)} subscriber(s), objects "
+                f"in={track._objects_in} out={track._objects_out}, "
+                f"upstream streams ended={track._upstream_ended}")
     if track.task is None:
         # Nothing draining the queue: no subscriber ever attached.
         track.finish(status_code=status, reason=reason)
