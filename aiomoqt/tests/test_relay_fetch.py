@@ -47,6 +47,12 @@ def _track(objects=(), live=True):
     return t
 
 
+def _join(track, session, request_id):
+    """Attach a subscriber without starting the forward task (no loop)."""
+    track.downstream.append((session, 1, request_id))
+    track.joined_at[request_id] = track.largest
+
+
 def _fetch(**kw):
     kw.setdefault("fetch_type", STANDALONE)
     kw.setdefault("group_order", None)     # omitted on the wire = Ascending
@@ -68,15 +74,45 @@ def _tables():
     relay._tracks.update(saved)
 
 
-def test_joining_fetch_is_refused():
+def test_joining_fetch_for_unknown_subscription_is_refused():
     s = _session()
     relay._tracks[((b"live",), b"cam")] = _track([(0, 0)])
     asyncio.run(relay._on_fetch(s, _fetch(fetch_type=RELATIVE_JOINING,
-                                          joining_request_id=1,
+                                          joining_request_id=99,
                                           joining_start=2)))
-    assert s._errors == [(int(RequestErrorCode.NOT_SUPPORTED),
-                          "joining fetch not supported")]
+    assert s._errors[0][0] == int(
+        RequestErrorCode.INVALID_JOINING_REQUEST_ID)
     assert s._oks == []
+
+
+def test_joining_fetch_backfills_to_the_subscription_anchor():
+    # §10.12.2: the range ends where the subscription started, so the
+    # backfill is contiguous with it; joining_start counts groups back.
+    s = _session()
+    t = _track([(g, o) for g in range(5) for o in range(2)])
+    relay._tracks[((b"live",), b"cam")] = t
+    _join(t, s, 7)                               # anchor: largest so far
+    asyncio.run(relay._on_fetch(s, _fetch(fetch_type=RELATIVE_JOINING,
+                                          joining_request_id=7,
+                                          joining_start=2)))
+    assert s._errors == []
+    served, _ = s._served[0]
+    assert {o.group_id for o in served} == {2, 3, 4}
+    ok = s._oks[0]
+    assert (ok['largest_group_id'], ok['largest_object_id']) == (4, 2)
+
+
+def test_joining_fetch_without_an_anchor_is_refused():
+    # Nothing served yet: the subscription covers the track from its
+    # start, so there is no backfill to give.
+    s = _session()
+    t = _track()
+    relay._tracks[((b"live",), b"cam")] = t
+    _join(t, s, 7)
+    asyncio.run(relay._on_fetch(s, _fetch(fetch_type=RELATIVE_JOINING,
+                                          joining_request_id=7,
+                                          joining_start=2)))
+    assert s._errors[0][0] == int(RequestErrorCode.INVALID_RANGE)
 
 
 def test_unknown_track_is_refused():

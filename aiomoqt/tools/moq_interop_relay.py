@@ -12,8 +12,8 @@ Deliberately absent, and staying absent:
   * NO authentication, authorization, or rate limiting
   * NO load handling, bounded queues, or production hardening
   * A bounded recent-object cache only (CACHE_GROUPS / CACHE_BYTES,
-    oldest dropped) — enough to answer a standalone FETCH, not a
-    joining FETCH, and a late subscriber still starts at the live edge
+    oldest dropped) — enough to answer a FETCH, standalone or joining,
+    over what it still holds; a late subscriber starts at the live edge
   * NO forward-state propagation (REQUEST_UPDATE Forward=0/1 upstream)
   * NO delivery-timeout enforcement
   * Namespace tables are in-memory and global to the process
@@ -61,6 +61,7 @@ from aiomoqt.types import (
 from aiomoqt.messages import SubgroupHeader
 from aiomoqt.messages.data import (FetchObject, ObjectDatagram,
                                    ObjectDatagramStatus)
+from aiomoqt.messages.fetch import _is_joining
 from aiomoqt.messages.publish import PublishOk
 from aiomoqt.messages.request import RequestError, RequestOk
 from aiomoqt.track import SubscribedTrack
@@ -101,6 +102,7 @@ _upstream_urls: list = []
 # Redial delay for a lost upstream. Short: a subscriber arriving while
 # the relay has no upstream is answered with an error, so the window
 # matters more than the reconnect cost.
+FETCH_RELATIVE_JOINING = 0x2
 UPSTREAM_REDIAL_S = 0.5
 # How long a SUBSCRIBE waits for an upstream to (re)appear before the
 # relay answers "track does not exist".
@@ -249,6 +251,11 @@ class _RelayedTrack:
         # all, and an unbounded one is a leak.
         self._cache = deque()
         self._cache_bytes = 0
+        # Largest (group, object) forwarded: the Largest Location a
+        # SUBSCRIBE_OK reports, and what a joining FETCH anchors to.
+        self.largest = None
+        # request_id -> Largest reported when that subscriber joined.
+        self.joined_at = {}
 
     def close(self) -> None:
         """Release the fan-out: stop the drain and forget its streams."""
@@ -325,6 +332,9 @@ class _RelayedTrack:
 
     def add_downstream(self, session, track_alias, request_id=None):
         self.downstream.append((session, track_alias, request_id))
+        # The Largest reported to this subscriber: a joining FETCH from
+        # it backfills up to exactly that point.
+        self.joined_at[request_id] = self.largest
         if self.task is None:
             self.task = asyncio.create_task(self._forward_loop())
 
@@ -368,6 +378,8 @@ class _RelayedTrack:
         bound."""
         self._cache.append((gid, sgid, oid, payload, exts, prio, status))
         self._cache_bytes += len(payload or b"")
+        if self.largest is None or (gid, oid) > self.largest:
+            self.largest = (gid, oid)
         oldest_kept = gid - CACHE_GROUPS + 1
         while self._cache and (self._cache[0][0] < oldest_kept
                                or self._cache_bytes > CACHE_BYTES):
@@ -611,6 +623,18 @@ async def _establish_upstream(ns, track_name):
     return None
 
 
+def _joined_subscription(session, request_id):
+    """(key, track, anchor) for this session's subscription `request_id`,
+    where anchor is the Largest Location its SUBSCRIBE_OK reported."""
+    if request_id is None:
+        return None
+    for key, track in _tracks.items():
+        for sess, _alias, rid in track.downstream:
+            if sess is session and rid == request_id:
+                return key, track, track.joined_at.get(request_id)
+    return None
+
+
 def _upstream_done(track, key, done) -> None:
     """Upstream ended the track: FIN downstream streams, PUBLISH_DONE
     each subscriber, and drop the fan-out so a later SUBSCRIBE starts a
@@ -676,6 +700,17 @@ def _accept_publish(track) -> None:
     track.pending_publish = None
 
 
+def _largest_kwargs(track) -> dict:
+    """SUBSCRIBE_OK Largest Location: what the relay has actually served
+    for this track. A joining FETCH anchors its backfill to it, so a
+    track we hold nothing for reports no content."""
+    if track.largest is None:
+        return {}
+    return {"content_exists": 1,
+            "largest_group_id": track.largest[0],
+            "largest_object_id": track.largest[1]}
+
+
 async def _on_subscribe(session, msg):
     """Relay a SUBSCRIBE: establish upstream, then fan out downstream."""
     ns = _ns_tuple(msg.track_namespace)
@@ -691,7 +726,7 @@ async def _on_subscribe(session, msg):
         track = None
     if track is not None and (track.pending_publish or track.upstream):
         _watch_session(session)
-        ok = session.subscribe_ok(request_msg=msg)
+        ok = session.subscribe_ok(request_msg=msg, **_largest_kwargs(track))
         track.add_downstream(session, ok.track_alias, msg.request_id)
         session.register_request_cancel_handler(
             msg.request_id,
@@ -712,7 +747,8 @@ async def _on_subscribe(session, msg):
         track = await _establish_upstream(ns, msg.track_name)
         if track is not None:
             _watch_session(session)
-            ok = session.subscribe_ok(request_msg=msg)
+            ok = session.subscribe_ok(request_msg=msg,
+                                      **_largest_kwargs(track))
             track.add_downstream(session, ok.track_alias, msg.request_id)
             session.register_request_cancel_handler(
                 msg.request_id,
@@ -918,17 +954,38 @@ async def _fetch_upstream(ns, track_name, msg):
 
 
 async def _on_fetch(session, msg):
-    """Standalone FETCH (§10.13) served from the track's recent-object
-    cache. A joining FETCH needs history this relay does not keep."""
-    from aiomoqt.messages.fetch import _is_joining
-
+    """FETCH (§10.12) served from the track's recent-object cache, or
+    from the publisher when the range predates it. A joining FETCH is
+    resolved against its subscription and served the same way."""
     if _is_joining(msg.fetch_type):
-        logger.info("relay: joining FETCH -> NOT_SUPPORTED")
-        session.fetch_error(
-            request_id=msg.request_id,
-            error_code=int(RequestErrorCode.NOT_SUPPORTED),
-            reason="joining fetch not supported")
-        return
+        # §10.12.2: namespace, track and End Location come from the
+        # associated subscription, so the backfill is contiguous with it.
+        found = _joined_subscription(session, msg.joining_request_id)
+        if found is None:
+            logger.info(f"relay: joining FETCH for unknown subscription "
+                        f"{msg.joining_request_id}")
+            session.fetch_error(
+                request_id=msg.request_id,
+                error_code=int(RequestErrorCode.INVALID_JOINING_REQUEST_ID),
+                reason="no such subscription")
+            return
+        key, track, anchor = found
+        if anchor is None:
+            # Nothing served yet: the subscription itself covers the
+            # track from its start, so there is nothing to backfill.
+            logger.info(f"relay: joining FETCH {key} has no anchor")
+            session.fetch_error(
+                request_id=msg.request_id,
+                error_code=int(RequestErrorCode.INVALID_RANGE),
+                reason="subscription has no largest object")
+            return
+        start_group = int(msg.joining_start or 0)
+        if int(msg.fetch_type) == FETCH_RELATIVE_JOINING:
+            start_group = max(0, anchor[0] - start_group)
+        msg.start_group, msg.start_object = start_group, 0
+        msg.end_group, msg.end_object = anchor[0], anchor[1] + 1
+        logger.info(f"relay: joining FETCH {key} groups {start_group}.."
+                    f"{anchor[0]} (anchor {anchor})")
     ns = _ns_tuple(msg.namespace)
     track = _tracks.get((ns, msg.track_name))
     start = (msg.start_group or 0, msg.start_object or 0)
