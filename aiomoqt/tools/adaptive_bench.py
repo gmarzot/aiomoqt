@@ -34,9 +34,10 @@ from typing import Optional
 from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
 from aiomoqt.track import PublishedTrack, SubscribedTrack
-from aiomoqt.types import (MOQT_TIMESTAMP_EXT, FilterType, MOQTMessageType,
-                           ObjectStatus, parse_draft_spec)
+from aiomoqt.types import (FilterType, MOQTMessageType, ObjectStatus,
+                           parse_draft_spec)
 from aiomoqt.utils.format import fmt_bps, fmt_ms
+from aiomoqt.utils.stats import send_time_us
 from aiomoqt.utils.logger import set_log_level
 
 
@@ -166,9 +167,7 @@ class LiveStats:
                      and getattr(msg, 'status', ObjectStatus.NORMAL)
                      != ObjectStatus.NORMAL)
 
-        send_us = None
-        if getattr(msg, 'extensions', None):
-            send_us = msg.extensions.get(MOQT_TIMESTAMP_EXT)
+        send_us = send_time_us(getattr(msg, 'extensions', None))
         latency = None
         if send_us is not None:
             raw_us = recv_time_us - send_us

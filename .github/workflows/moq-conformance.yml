@@ -44,9 +44,12 @@ on:
         required: false
         type: string
 
+# Per commit, not per branch: a conformance run is a measurement of one
+# commit and takes ~15 minutes, so a later push starts its own run
+# instead of cancelling the score still being collected.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.sha }}
+  cancel-in-progress: false
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -108,6 +111,18 @@ jobs:
             echo "::error::moqtest_client not runnable (exit $rc)"; exit 1
           fi
           echo "harness ready: $(ls harness/bin | tr '\n' ' ')"
+          # The full suite, from the same pinned commit as the binaries,
+          # so a score only moves when the pin does.
+          mkdir -p harness/moxygen/moqtest
+          cp harness/bin/moqtest_client harness/moxygen/moqtest/
+          SHA=$(gh release view "${{ steps.pin.outputs.tag }}" \
+                  -R openmoq/moxygen --json targetCommitish \
+                  --jq '.targetCommitish')
+          gh api -H "Accept: application/vnd.github.raw" \
+            "repos/openmoq/moxygen/contents/moxygen/moqtest/conformance_test.sh?ref=${SHA:-${{ steps.pin.outputs.tag }}}" \
+            > harness/conformance_test.sh
+          grep -q "MoQTest Conformance Test Suite" harness/conformance_test.sh \
+            || { echo "::error::conformance suite not fetched"; exit 1; }
 
       - name: Generate certs
         run: |
@@ -146,8 +161,16 @@ jobs:
           # Both transports on one dual-mode listener: raw QUIC selects a
           # draft by ALPN, WebTransport by WT-Protocol.
           for T in quic h3wt; do
-            TRANSPORT=$T bash .github/scripts/moq-conformance.sh 2>&1 \
+            FETCH=1 TRANSPORT=$T bash .github/scripts/moq-conformance.sh 2>&1 \
               | tee "conformance-$T.log"
+          done
+
+          # Same relay, full suite: the score, which does not gate.
+          # Output streams so a long run is visibly alive.
+          for T in quic h3wt; do
+            SUITE=$PWD/harness/conformance_test.sh MOXDIR=$PWD/harness \
+            DRAFT="$DRAFT" TRANSPORT=$T \
+              bash .github/scripts/conformance-score.sh || true
           done
 
           # Second SUT: the moqtest ORIGIN — the bare server-role API
@@ -168,6 +191,13 @@ jobs:
               | tee "origin-conformance-$T.log"
           done
 
+      - name: Report the score
+        if: always()
+        run: |
+          [ -d reports ] || exit 0
+          python .github/scripts/conformance_report.py reports/*.txt \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -179,4 +209,6 @@ jobs:
             conformance-*.log
             origin.log
             origin-conformance-*.log
+            reports/
           if-no-files-found: warn
+

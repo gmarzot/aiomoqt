@@ -244,15 +244,16 @@ async def run(args):
         elif args.pipe == 'video':
             _status("  piping h264 — play with: ffplay -fflags nobuffer "
                     "-flags low_delay -probesize 32 -f h264 -i -")
+        closed = asyncio.ensure_future(session.async_closed())
         try:
             async with asyncio.timeout(args.duration + 5):
-                while not writers.pipe_closed:
-                    if session._moqt_session_closed.done():
-                        break
+                while not writers.pipe_closed and not closed.done():
                     await asyncio.sleep(0.1)
         except asyncio.TimeoutError:
             pass
         finally:
+            if not closed.done():
+                closed.cancel()
             writers.close()
     for name, n in sorted(writers.counts.items()):
         _status(f"  {name}: {n} frames")

@@ -40,6 +40,7 @@ async def _run_for_n(n_sessions, args):
     from aiomoqt.server import MOQTServer
     from aiomoqt.track import PublishedTrack, SubscribedTrack
     from aiomoqt.types import MOQTMessageType
+    from aiomoqt.utils.stats import send_time_us
     from aiomoqt.utils import wait_cond_timeout
 
     cert = _find_cert()
@@ -73,12 +74,10 @@ async def _run_for_n(n_sessions, args):
 
     stats = Stats(name=f"n={n_sessions}")
     counters = {'objs': 0, 'bytes': 0}
-    TIMESTAMP_EXT = 0x20
 
     def on_object(msg, size_bytes, recv_time_ms,
                   group_id=None, subgroup_id=None):
-        send_ms = (msg.extensions.get(TIMESTAMP_EXT)
-                   if msg.extensions else None)
+        send_ms = send_time_us(msg.extensions)
         if send_ms is not None:
             stats.record(recv_time_ms - send_ms)
         counters['objs'] += 1

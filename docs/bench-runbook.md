@@ -319,6 +319,12 @@ Ramp knobs:
 | `-S` / `--stagger` | seconds between individual joins inside a group (default 0.1). Spaces the QUIC Initials so a group does not burst the relay; 0 opens the batch at once |
 | `--sub-filter` | `next-group-start` skips the current-group replay some relays do on `latest-object`, the default |
 
+**Latency comes from the object's LOC timestamp** (property 0x10,
+wall-clock µs): pub_bench and pub_media both stamp it, so an audience run
+against a live broadcast reports real delivery latency. pub_media
+`--loc-codecstring` adds a TIMESCALE, which makes the timestamp media
+time — latency then reads 0.
+
 **Absolute latency is not trustworthy across hosts.** It is the
 receiver's clock minus the sender's timestamp, so a split run carries the
 hosts' clock offset straight into the back-off signal. adaptive_bench

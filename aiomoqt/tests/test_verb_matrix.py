@@ -51,6 +51,7 @@ def _session(draft, is_client=True):
     s._bidi_stream_requests = {9: 7}
     s._tx_updates = {}
     s._request_cancel_handlers = {}
+    s._publish_done_handlers = {}
     s._peer_request_max = -1
     s.frames = []          # (channel, wire bytes)
     s.resets = []

@@ -255,6 +255,7 @@ async def test_stop_sending_then_request_error_keeps_the_session(draft):
     s = _control_session(draft)
     s._subscriptions = {}
     s._request_cancel_handlers = {}
+    s._publish_done_handlers = {}
     rid = s._allocate_request_id()
     s._bidi_stream_requests[4] = rid
     s._bidi_streams[rid] = 4
@@ -330,6 +331,7 @@ async def test_reset_after_stop_sending_releases_without_renotifying():
     s = _control_session(18)
     s._subscriptions = {}
     s._request_cancel_handlers = {}
+    s._publish_done_handlers = {}
     s._bidi_stream_requests[4] = 2
     s._bidi_streams[2] = 4
     fired = []

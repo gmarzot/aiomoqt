@@ -80,6 +80,7 @@ def test_cancelling_a_request_stream_frees_the_track_bounds():
     s._subscriptions = {5: ["sub"]}
     s._pending_requests = {}
     s._request_cancel_handlers = {}
+    s._publish_done_handlers = {}
     s._track_aliases = {7: 5}
     s._note_object_bound(7, 0, 3, EOG)
     s._malformed_aliases.add(7)

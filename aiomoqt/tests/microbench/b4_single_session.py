@@ -42,6 +42,7 @@ async def _run(args):
     from aiomoqt.server import MOQTServer
     from aiomoqt.track import PublishedTrack, SubscribedTrack
     from aiomoqt.types import MOQTMessageType
+    from aiomoqt.utils.stats import send_time_us
     from aiomoqt.utils import wait_cond_timeout
 
     cert = _find_cert()
@@ -78,13 +79,11 @@ async def _run(args):
     stats = Stats(name='e2e-latency')
     n_objects = 0
     bytes_done = 0
-    TIMESTAMP_EXT = 0x20
 
     def on_object(msg, size_bytes, recv_time_ms,
                    group_id=None, subgroup_id=None):
         nonlocal n_objects, bytes_done
-        send_ms = (msg.extensions.get(TIMESTAMP_EXT)
-                   if msg.extensions else None)
+        send_ms = send_time_us(msg.extensions)
         if send_ms is not None:
             stats.record(recv_time_ms - send_ms)
         n_objects += 1

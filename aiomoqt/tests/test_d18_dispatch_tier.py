@@ -118,6 +118,17 @@ def test_supported_drafts_accepts_int_or_list():
     assert parse_draft_spec("18,16,14") == [18, 16, 14]
 
 
+def test_draft_spec_accepts_registry_spellings():
+    # Interop registries and harnesses name versions "draft-NN"; that
+    # spelling used to exit the interop client with an argparse error.
+    import pytest
+    for spec in ("draft-18", "Draft-18", "draft18", "d18", "moqt-18", " 18 "):
+        assert parse_draft_spec(spec) == 18
+    assert parse_draft_spec("draft-18,draft-16") == [18, 16]
+    with pytest.raises(ValueError, match="want 18, draft-18"):
+        parse_draft_spec("eighteen")
+
+
 def test_d18_setup_options_kvp_roundtrip():
     # d18 Setup Options are count-less delta-coded KVPs (Figure 2) to the
     # message Length: even Type -> varint value, odd Type -> length+bytes.

@@ -55,6 +55,7 @@ async def test_request_stream_termination_cancels_the_request():
     s._tx_updates = {}
     s._subscriptions = {7: ["sub"]}
     s._request_cancel_handlers = {}
+    s._publish_done_handlers = {}
     fired = []
     s.register_request_cancel_handler(7, lambda rid: fired.append(rid))
     fut = s._loop.create_future()

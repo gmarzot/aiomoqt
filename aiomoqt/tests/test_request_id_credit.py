@@ -29,6 +29,7 @@ def _stub(draft):
     s._track_aliases = {}
     s._subscriptions = {}
     s._request_cancel_handlers = {}
+    s._publish_done_handlers = {}
     s._control_msg_overrides = {}
     s._tasks = set()
     s._loop = asyncio.get_running_loop()
