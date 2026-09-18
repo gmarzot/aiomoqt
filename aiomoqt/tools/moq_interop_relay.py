@@ -671,9 +671,18 @@ async def _on_publish(session, msg):
         _tracks[key] = track
     _watch_session(session)
     track.pending_publish = (session, msg)
+    # §5.1: accept now with Forward State 0 and ask for objects when a
+    # subscriber arrives. Holding the reply instead leaves the publisher
+    # waiting on a transaction that only a subscriber can complete.
+    session._track_aliases[msg.track_alias] = msg.request_id
+    session.register_object_handler(msg.track_alias, track.on_object)
+    session.register_stream_end_handler(msg.track_alias, track.on_stream_end)
+    session._send_reply(msg.request_id, PublishOk(
+        request_id=msg.request_id, forward=0, priority=128,
+        group_order=GroupOrder.ASCENDING,
+        filter_type=FilterType.LATEST_OBJECT, parameters={}))
     logger.info(f"relay: publish ns={ns} track={msg.track_name} "
-                f"alias={msg.track_alias} — holding PUBLISH_OK for a "
-                f"subscriber")
+                f"alias={msg.track_alias} -> PUBLISH_OK forward=0")
     for sub_session, prefix, _rid in list(_track_subs):
         if _prefix_covers(prefix, ns):
             asyncio.create_task(
@@ -683,19 +692,17 @@ async def _on_publish(session, msg):
 
 
 def _accept_publish(track) -> None:
-    """Answer a held PUBLISH with forward=1 and start taking objects."""
+    """A subscriber arrived for a held PUBLISH: raise its Forward State
+    so the publisher starts sending (§10.9)."""
     if track.pending_publish is None or track.upstream is not None:
         return
     session, msg = track.pending_publish
-    session._track_aliases[msg.track_alias] = msg.request_id
-    session.register_object_handler(msg.track_alias, track.on_object)
-    session.register_stream_end_handler(msg.track_alias, track.on_stream_end)
-    ok = PublishOk(
-        request_id=msg.request_id, forward=1, priority=128,
-        group_order=GroupOrder.ASCENDING,
-        filter_type=FilterType.LATEST_OBJECT, parameters={})
-    logger.info(f"relay: PUBLISH_OK forward=1 alias={msg.track_alias}")
-    session._send_reply(msg.request_id, ok)
+    try:
+        session.request_update(existing_request_id=msg.request_id, forward=1)
+    except Exception:
+        logger.debug("relay: forward-state update failed", exc_info=True)
+        return
+    logger.info(f"relay: REQUEST_UPDATE forward=1 alias={msg.track_alias}")
     track.upstream = session
     track.pending_publish = None
 
@@ -867,6 +874,9 @@ async def _offer_track(session, track, key):
     """§9.5: send a PUBLISH for a held/served track to a
     SUBSCRIBE_TRACKS subscriber; on PUBLISH_OK(forward=1) wire it into
     the fan-out."""
+    if not _session_live(session):
+        _forget_session(session)
+        return
     ns, name = key
     # A session that subscribed to a prefix gets every track under it,
     # including one it publishes itself: the subscription is explicit,
@@ -958,6 +968,8 @@ async def _on_fetch(session, msg):
     """FETCH (§10.12) served from the track's recent-object cache, or
     from the publisher when the range predates it. A joining FETCH is
     resolved against its subscription and served the same way."""
+    # A joining FETCH names no track: both come from its subscription.
+    ns, track_name = _ns_tuple(msg.namespace), msg.track_name
     if _is_joining(msg.fetch_type):
         # §10.12.2: namespace, track and End Location come from the
         # associated subscription, so the backfill is contiguous with it.
@@ -985,10 +997,10 @@ async def _on_fetch(session, msg):
             start_group = max(0, anchor[0] - start_group)
         msg.start_group, msg.start_object = start_group, 0
         msg.end_group, msg.end_object = anchor[0], anchor[1] + 1
+        ns, track_name = key
         logger.info(f"relay: joining FETCH {key} groups {start_group}.."
                     f"{anchor[0]} (anchor {anchor})")
-    ns = _ns_tuple(msg.namespace)
-    track = _tracks.get((ns, msg.track_name))
+    track = _tracks.get((ns, track_name))
     start = (msg.start_group or 0, msg.start_object or 0)
     end = (None if msg.end_group is None
            else (msg.end_group, msg.end_object
@@ -1002,9 +1014,9 @@ async def _on_fetch(session, msg):
         # Only recent objects are held, so a historical range comes from
         # the publisher — which is also the only path for a track this
         # relay has never subscribed to.
-        up_ok, upstream = await _fetch_upstream(ns, msg.track_name, msg)
+        up_ok, upstream = await _fetch_upstream(ns, track_name, msg)
         if upstream is None:
-            logger.info(f"relay: FETCH ns={ns} track={msg.track_name} "
+            logger.info(f"relay: FETCH ns={ns} track={track_name} "
                         f"-> DOES_NOT_EXIST")
             session.fetch_error(
                 request_id=msg.request_id,
@@ -1040,7 +1052,7 @@ async def _on_fetch(session, msg):
                      status=status)
          for gid, sgid, oid, payload, exts, prio, status in objs),
         group_order=int(order))
-    logger.info(f"relay: FETCH ns={ns} track={msg.track_name} served "
+    logger.info(f"relay: FETCH ns={ns} track={track_name} served "
                 f"{len(objs)} object(s) {start}..({last_g}.{last_o})")
 
 

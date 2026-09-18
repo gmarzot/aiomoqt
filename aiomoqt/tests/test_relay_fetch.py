@@ -92,7 +92,10 @@ def test_joining_fetch_backfills_to_the_subscription_anchor():
     t = _track([(g, o) for g in range(5) for o in range(2)])
     relay._tracks[((b"live",), b"cam")] = t
     _join(t, s, 7)                               # anchor: largest so far
+    # A joining FETCH names no track on the wire: both come from the
+    # subscription it joins.
     asyncio.run(relay._on_fetch(s, _fetch(fetch_type=RELATIVE_JOINING,
+                                          namespace=None, track_name=None,
                                           joining_request_id=7,
                                           joining_start=2)))
     assert s._errors == []
