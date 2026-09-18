@@ -44,9 +44,12 @@ on:
         required: false
         type: string
 
+# Per commit, not per branch: a conformance run is a measurement of one
+# commit and takes ~15 minutes, so a later push starts its own run
+# instead of cancelling the score still being collected.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.sha }}
+  cancel-in-progress: false
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
