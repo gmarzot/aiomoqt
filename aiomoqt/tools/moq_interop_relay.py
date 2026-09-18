@@ -884,8 +884,9 @@ async def _offer_track(session, track, key):
         return
     forward = getattr(reply, 'forward', None)
     if forward is None:
+        # §10.2.12: FORWARD omitted from PUBLISH_OK means 1.
         forward = (getattr(reply, 'parameters', None) or {}).get(
-            ParamType.FORWARD)
+            ParamType.FORWARD, 1)
     if not forward:
         logger.info(f"relay: PUBLISH offer for {key}: forward=0")
         return
