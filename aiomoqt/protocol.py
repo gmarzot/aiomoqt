@@ -1183,6 +1183,13 @@ class _MOQTSessionMixin:
                         getattr(hdr, 'end_of_group', False),
                         getattr(hdr, 'default_priority', False),
                     )
+                    if state.subgroup_id is None:
+                        # SUBGROUP_ID_FIRST_OBJ: the header carries no
+                        # subgroup field and the parser resolves it from
+                        # the first object, so the stream's id is known
+                        # only now.
+                        state.subgroup_id = getattr(
+                            state.parser, 'subgroup_id', None)
                     cb(msg_obj, consumed, now,
                        state.group_id, state.subgroup_id)
                 if terminal:

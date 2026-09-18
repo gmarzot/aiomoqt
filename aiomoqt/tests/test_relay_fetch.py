@@ -7,6 +7,7 @@ rejects what it cannot serve: joining FETCH (no history), an unknown
 track, a range it no longer holds.
 """
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -100,9 +101,10 @@ def test_range_outside_the_cache_falls_back_to_upstream(monkeypatch):
 
     async def _upstream(ns, track_name, msg):
         asked.append((ns, track_name, msg.start_group, msg.end_group))
-        return [FetchObject(group_id=0, subgroup_id=0, object_id=i,
-                            publisher_priority=128, payload=b"z")
-                for i in range(3)]
+        ok = SimpleNamespace(end_of_track=1)
+        return ok, [FetchObject(group_id=0, subgroup_id=0, object_id=i,
+                                publisher_priority=128, payload=b"z")
+                    for i in range(3)]
     monkeypatch.setattr(relay, "_fetch_upstream", _upstream)
     asyncio.run(relay._on_fetch(s, _fetch(start_group=0, start_object=0,
                                           end_group=1, end_object=0)))
@@ -110,6 +112,8 @@ def test_range_outside_the_cache_falls_back_to_upstream(monkeypatch):
     assert s._errors == []
     served, _ = s._served[0]
     assert [o.object_id for o in served] == [0, 1, 2]
+    # End Of Track is the publisher's answer, carried over verbatim.
+    assert s._oks[0]['end_of_track'] == 1
 
 
 def test_cached_window_is_served_with_exclusive_end_location():

@@ -332,6 +332,16 @@ class _RelayedTrack:
         while True:
             gid, sgid, oid, payload, exts, prio, status, shape = \
                 await self.queue.get()
+            if status == "DONE":
+                # Terminal, in queue order: everything already queued has
+                # been written downstream before PUBLISH_DONE goes out.
+                code, reason, key = shape
+                self.finish(status_code=code, reason=reason)
+                self.downstream.clear()
+                self._streams.clear()
+                self.task = None
+                _tracks.pop(key, None)
+                return
             if self._finished:
                 continue
             if oid is not None:
@@ -585,9 +595,14 @@ def _upstream_done(track, key, done) -> None:
     reason = getattr(done, "reason", "") or "track ended"
     logger.info(f"relay: upstream PUBLISH_DONE {key} status={status} "
                 f"-> {len(track.downstream)} subscriber(s)")
-    track.finish(status_code=status, reason=reason)
-    track.close()
-    _tracks.pop(key, None)
+    if track.task is None:
+        # Nothing draining the queue: no subscriber ever attached.
+        track.finish(status_code=status, reason=reason)
+        track.close()
+        _tracks.pop(key, None)
+        return
+    track.queue.put_nowait((None, None, None, None, None, None,
+                            "DONE", (status, reason, key)))
 
 
 async def _on_publish(session, msg):
@@ -845,9 +860,10 @@ def _install_fetch_sink(pub) -> None:
 
 
 async def _fetch_upstream(ns, track_name, msg):
-    """Ask each publisher of `ns` for the requested range. Returns the
-    objects, or None when nobody serves it — the relay keeps only recent
-    objects, so a historical range has to come from the origin."""
+    """Ask each publisher of `ns` for the requested range. Returns its
+    FETCH_OK and the objects, or (None, None) when nobody serves it —
+    the relay keeps only recent objects, so a historical range has to
+    come from the origin."""
     name = (track_name.decode() if isinstance(track_name, bytes)
             else track_name)
     for pub in _publishers_for(ns):
@@ -864,7 +880,7 @@ async def _fetch_upstream(ns, track_name, msg):
         key = (id(pub), req.request_id)
         _fetch_sinks[key] = []
         try:
-            await pub._await_response(req.request_id, timeout=10.0)
+            ok = await pub._await_response(req.request_id, timeout=10.0)
             await pub.await_fetch_done(req.request_id, timeout=10.0)
         except (MOQTRequestError, asyncio.TimeoutError) as e:
             logger.info(f"relay: upstream FETCH declined on {ns}: {e}")
@@ -872,9 +888,10 @@ async def _fetch_upstream(ns, track_name, msg):
             continue
         objs = _fetch_sinks.pop(key, [])
         logger.info(f"relay: upstream FETCH {ns}/{name} -> "
-                    f"{len(objs)} object(s)")
-        return objs
-    return None
+                    f"{len(objs)} object(s) end_of_track="
+                    f"{getattr(ok, 'end_of_track', 0)}")
+        return ok, objs
+    return None, None
 
 
 async def _on_fetch(session, msg):
@@ -897,11 +914,14 @@ async def _on_fetch(session, msg):
                  if msg.end_object is not None else (1 << 62)))
     objs = (track.cached_range(start, end)
             if track is not None and _track_live(track) else [])
+    end_of_track = 0
+    if objs and objs[-1][6] == ObjectStatus.END_OF_TRACK:
+        end_of_track = 1
     if not objs:
         # Only recent objects are held, so a historical range comes from
         # the publisher — which is also the only path for a track this
         # relay has never subscribed to.
-        upstream = await _fetch_upstream(ns, msg.track_name, msg)
+        up_ok, upstream = await _fetch_upstream(ns, msg.track_name, msg)
         if upstream is None:
             logger.info(f"relay: FETCH ns={ns} track={msg.track_name} "
                         f"-> DOES_NOT_EXIST")
@@ -919,10 +939,14 @@ async def _on_fetch(session, msg):
         objs = [(o.group_id, o.subgroup_id, o.object_id, o.payload,
                  o.extensions, o.publisher_priority, o.status)
                 for o in upstream]
+        end_of_track = int(getattr(up_ok, 'end_of_track', 0) or 0)
     order = msg.group_order or GroupOrder.ASCENDING
     last_g, last_o = objs[-1][0], objs[-1][2]
-    # §10.13: FETCH_OK End Location is the last Object PLUS 1.
+    # §10.13: FETCH_OK End Location is the last Object PLUS 1, and End Of
+    # Track says the range reached the track's end — which only the
+    # publisher knows, so it is carried over from its FETCH_OK.
     session.fetch_ok(request_id=msg.request_id,
+                     end_of_track=end_of_track,
                      largest_group_id=last_g, largest_object_id=last_o + 1,
                      group_order=int(order))
     if int(order) == int(GroupOrder.DESCENDING):
