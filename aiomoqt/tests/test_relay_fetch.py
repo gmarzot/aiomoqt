@@ -193,3 +193,21 @@ def test_cache_drops_on_the_byte_bound(monkeypatch):
         t._remember(0, 0, oid, b"x" * 10, None, 128, None)
     assert t._cache_bytes <= 100
     assert [e[2] for e in t._cache] == list(range(10, 20))
+
+
+def test_a_raising_handler_still_answers_the_request():
+    # The failure shape behind most conformance losses: a handler that
+    # raises leaves the request stream open with no reply and the peer
+    # waits out its timeout. Every request gets a terminal answer.
+    s = _session()
+    sent = []
+    s._send_reply = lambda rid, m, fin=False: sent.append((rid, m, fin))
+
+    async def _boom(session, msg):
+        raise RuntimeError("kaboom")
+
+    asyncio.run(relay._answered(_boom)(s, _fetch(request_id=11)))
+    assert len(sent) == 1
+    rid, msg, fin = sent[0]
+    assert rid == 11 and fin is True
+    assert msg.error_code == int(RequestErrorCode.INTERNAL_ERROR)

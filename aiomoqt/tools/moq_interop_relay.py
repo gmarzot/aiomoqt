@@ -1159,6 +1159,31 @@ async def _on_track_status(session, msg):
     session._send_reply(msg.request_id, ok, fin=True)
 
 
+def _answered(handler):
+    """Every request gets a terminal reply. A handler that raises would
+    otherwise kill the control task and leave the request stream open
+    with no answer, and the peer waits out its whole timeout — the shape
+    of most conformance failures this relay has had."""
+    async def _wrapped(session, msg):
+        try:
+            await handler(session, msg)
+        except Exception:
+            logger.exception(f"relay: {type(msg).__name__} handler failed")
+            request_id = getattr(msg, "request_id", None)
+            if request_id is None:
+                return
+            try:
+                session._send_reply(request_id, RequestError(
+                    request_id=request_id,
+                    error_code=int(RequestErrorCode.INTERNAL_ERROR),
+                    retry_interval=0,
+                    reason="relay error"), fin=True)
+            except Exception:
+                logger.debug("relay: error reply failed", exc_info=True)
+    _wrapped.__name__ = getattr(handler, "__name__", "handler")
+    return _wrapped
+
+
 def _build_server(bind, port, cert, key, use_quic, draft):
     """Construct a MOQTServer with the relay's control-plane handlers."""
     server = MOQTServer(
@@ -1169,21 +1194,21 @@ def _build_server(bind, port, cert, key, use_quic, draft):
         supported_drafts=draft,
     )
     server.register_handler(
-        MOQTMessageType.PUBLISH_NAMESPACE, _on_publish_namespace)
+        MOQTMessageType.PUBLISH_NAMESPACE, _answered(_on_publish_namespace))
     server.register_handler(
         MOQTMessageType.PUBLISH_NAMESPACE_DONE, _on_publish_namespace_done)
     server.register_handler(
-        MOQTMessageType.SUBSCRIBE, _on_subscribe)
+        MOQTMessageType.SUBSCRIBE, _answered(_on_subscribe))
     server.register_handler(
-        MOQTMessageType.PUBLISH, _on_publish)
+        MOQTMessageType.PUBLISH, _answered(_on_publish))
     server.register_handler(
-        MOQTMessageType.TRACK_STATUS, _on_track_status)
+        MOQTMessageType.TRACK_STATUS, _answered(_on_track_status))
     server.register_handler(
-        MOQTMessageType.SUBSCRIBE_NAMESPACE, _on_subscribe_namespace)
+        MOQTMessageType.SUBSCRIBE_NAMESPACE, _answered(_on_subscribe_namespace))
     server.register_handler(
-        MOQTMessageType.FETCH, _on_fetch)
+        MOQTMessageType.FETCH, _answered(_on_fetch))
     server.register_handler(
-        D18MessageType.SUBSCRIBE_TRACKS, _on_subscribe_tracks)
+        D18MessageType.SUBSCRIBE_TRACKS, _answered(_on_subscribe_tracks))
     return server
 
 
