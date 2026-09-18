@@ -50,7 +50,7 @@ def row(sections):
         elif passed == total:
             boxes.append("✅")
         elif passed:
-            boxes.append("🟡")
+            boxes.append("⚠️")
             partial.append(f"§{n} {passed}/{total}")
         else:
             boxes.append("❌")
@@ -62,7 +62,7 @@ def row(sections):
 
 def main(paths):
     out = ["## moq-test conformance score", "",
-           "Sections 1–10: ✅ all passed, 🟡 some passed, ❌ none passed, "
+           "Sections 1–10: ✅ all passed, ⚠️ some passed, ❌ none passed, "
            "⬜ skipped by the suite (out of the totals).", "",
            "| run | 1 2 3 4 5 6 7 8 9 10 | score | not green |",
            "|---|---|---|---|"]

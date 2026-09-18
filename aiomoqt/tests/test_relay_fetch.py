@@ -211,3 +211,22 @@ def test_a_raising_handler_still_answers_the_request():
     rid, msg, fin = sent[0]
     assert rid == 11 and fin is True
     assert msg.error_code == int(RequestErrorCode.INTERNAL_ERROR)
+
+
+def test_terminal_waits_for_the_streams_publish_done_counts():
+    # §10.11: PUBLISH_DONE follows every stream the publisher opened, but
+    # the control message races those streams on the wire. Cutting the
+    # subscriber off early loses objects it was still owed.
+    async def _run():
+        t = _track()
+        t.task = object()                   # a drain exists
+        t.note_upstream_done(0x2, "done", ((b"live",), b"cam"),
+                             stream_count=2)
+        assert t.queue.qsize() == 0         # held: no streams ended yet
+        t._upstream_ended = 1
+        t._check_pending_done()
+        assert t.queue.qsize() == 0         # still one short
+        t._upstream_ended = 2
+        t._check_pending_done()
+        assert t.queue.get_nowait()[6] == "DONE"
+    asyncio.run(_run())

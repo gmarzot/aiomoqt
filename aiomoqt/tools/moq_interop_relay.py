@@ -104,6 +104,8 @@ _upstream_urls: list = []
 # matters more than the reconnect cost.
 FETCH_RELATIVE_JOINING = 0x2
 UPSTREAM_REDIAL_S = 0.5
+# Longest a terminal waits for upstream streams the PUBLISH_DONE counts.
+TERMINAL_GRACE_S = 3.0
 # How long a SUBSCRIBE waits for an upstream to (re)appear before the
 # relay answers "track does not exist".
 UPSTREAM_WAIT_S = 3.0
@@ -256,6 +258,11 @@ class _RelayedTrack:
         self.largest = None
         # request_id -> Largest reported when that subscriber joined.
         self.joined_at = {}
+        # Upstream subgroup streams ended, against the Stream Count its
+        # PUBLISH_DONE reports: the terminal waits for the objects.
+        self._upstream_ended = 0
+        self._pending_done = None
+        self._done_timer = None
 
     def close(self) -> None:
         """Release the fan-out: stop the drain and forget its streams."""
@@ -290,6 +297,46 @@ class _RelayedTrack:
                 logger.debug("relay: finish failed for a subscriber",
                              exc_info=True)
 
+    def _enqueue_terminal(self, status, reason, key) -> None:
+        """Terminal behind everything already queued."""
+        if self._done_timer is not None:
+            self._done_timer.cancel()
+            self._done_timer = None
+        self._pending_done = None
+        self.queue.put_nowait((None, None, None, None, None, None,
+                               "DONE", (status, reason, key)))
+
+    def note_upstream_done(self, status, reason, key, stream_count) -> None:
+        """§10.11: PUBLISH_DONE follows every stream the publisher opened,
+        but those streams and the control message race each other on the
+        wire. Hold the terminal until this track has seen Stream Count
+        streams end, so a subscriber is not cut off mid-track."""
+        need = int(stream_count or 0)
+        if self._upstream_ended >= need:
+            self._enqueue_terminal(status, reason, key)
+            return
+        self._pending_done = (status, reason, key, need)
+        logger.info(f"relay: PUBLISH_DONE {key} held for "
+                    f"{need - self._upstream_ended} more stream(s)")
+        loop = asyncio.get_running_loop()
+        self._done_timer = loop.call_later(
+            TERMINAL_GRACE_S, self._force_terminal)
+
+    def _force_terminal(self) -> None:
+        if self._pending_done is None:
+            return
+        status, reason, key, need = self._pending_done
+        logger.info(f"relay: PUBLISH_DONE {key} released on grace "
+                    f"({self._upstream_ended}/{need} streams)")
+        self._enqueue_terminal(status, reason, key)
+
+    def _check_pending_done(self) -> None:
+        if self._pending_done is None:
+            return
+        status, reason, key, need = self._pending_done
+        if self._upstream_ended >= need:
+            self._enqueue_terminal(status, reason, key)
+
     def on_stream_end(self, group_id, subgroup_id, clean=True, reset_code=0):
         """Upstream ended a subgroup stream: mirror it. A FIN becomes our
         FIN (the subscriber may infer end-of-group, §11.4.2); a reset
@@ -309,6 +356,8 @@ class _RelayedTrack:
         self.queue.put_nowait(
             (group_id, subgroup_id or 0, None, None, None, None,
              "END" if clean else "RESET", reset_code))
+        self._upstream_ended += 1
+        self._check_pending_done()
 
     def on_object(self, msg, size, ts, group_id, subgroup_id):
         """Upstream delivery callback (sync) — hand off to the drain."""
@@ -403,7 +452,8 @@ class _RelayedTrack:
         """Write one object downstream, opening the (group, subgroup)
         stream on first sight. Group/subgroup identity is preserved from
         upstream so the downstream sees the publisher's structure."""
-        if isinstance(shape, tuple) and shape and shape[0] == "DGRAM":
+        if (isinstance(shape, tuple) and shape and shape[0] == "DGRAM"
+                and not _no_datagrams.get(id(session))):
             prof = session._profile
             is_status = (status or ObjectStatus.NORMAL) != ObjectStatus.NORMAL
             if is_status and not prof.merged_datagram_layout:
@@ -418,8 +468,15 @@ class _RelayedTrack:
                     payload=payload or b"",
                     end_of_group=bool(shape[1]),
                     status=status or ObjectStatus.NORMAL)
-            session.send_dgram_message(dgram.serialize(prof=prof))
-            return
+            try:
+                session.send_dgram_message(dgram.serialize(prof=prof))
+                return
+            except NotImplementedError:
+                # WebTransport datagram TX is not wired in aiopquic yet;
+                # deliver on a subgroup stream rather than drop objects.
+                _no_datagrams[id(session)] = True
+                logger.warning("relay: no datagram TX on this session, "
+                               "forwarding objects on streams")
         skey = (id(session), gid, sgid)
         entry = self._streams.get(skey)
         if entry is None and status in ("END", "RESET"):
@@ -522,6 +579,7 @@ def _forget_session(session) -> None:
     its downstream subscriptions."""
     _track_subs[:] = [e for e in _track_subs if e[0] is not session]
     _ns_subs[:] = [e for e in _ns_subs if e[0] is not session]
+    _no_datagrams.pop(id(session), None)
     for ns in list(_announced):
         if _announced[ns].pop(session, None) is not None and \
                 not _announced[ns]:
@@ -649,8 +707,8 @@ def _upstream_done(track, key, done) -> None:
         track.close()
         _tracks.pop(key, None)
         return
-    track.queue.put_nowait((None, None, None, None, None, None,
-                            "DONE", (status, reason, key)))
+    track.note_upstream_done(status, reason, key,
+                             getattr(done, "stream_count", 0))
 
 
 async def _on_publish(session, msg):
@@ -902,6 +960,9 @@ async def _offer_track(session, track, key):
                 f"alias={pub_msg.track_alias} "
                 f"(fanout={len(track.downstream)})")
 
+
+# id(session) -> True once a datagram send proved unsupported there.
+_no_datagrams: dict = {}
 
 # (id(session), request_id) -> objects collected from an upstream FETCH.
 _fetch_sinks: dict = {}
