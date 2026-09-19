@@ -247,6 +247,9 @@ class _RelayedTrack:
         self.upstream = None
         # Flow B: the publisher's PUBLISH, held until someone subscribes.
         self.pending_publish = None   # (session, Publish msg)
+        # Answered with Forward State 0 because nobody could be offered
+        # the track yet; raised with REQUEST_UPDATE when one arrives.
+        self.parked = None            # (session, Publish msg)
         self.downstream = []          # list of (session, track_alias, request_id)
         self.queue = asyncio.Queue()
         self.task = None
@@ -842,14 +845,60 @@ async def _on_publish(session, msg):
     # that this namespace exists.
     _announce_namespace(ns)
     logger.info(f"relay: publish ns={ns} track={msg.track_name} "
-                f"alias={msg.track_alias} — holding PUBLISH_OK for a "
-                f"subscriber")
+                f"alias={msg.track_alias}")
+    offered = False
     for sub_session, prefix, _rid in list(_track_subs):
         if _prefix_covers(prefix, ns):
+            offered = True
             asyncio.create_task(
                 _offer_track(sub_session, track, key))
     if track.downstream:
         _accept_publish(track)
+    elif not offered:
+        # Nobody to offer this track to, so no reply is coming from
+        # anywhere: answer now rather than hold. A publisher that
+        # blocks on PUBLISH_OK before subscribing (§9.5 publish-first)
+        # would otherwise deadlock — it cannot subscribe until we
+        # answer, and we would not answer until it subscribed.
+        _park_publish(track)
+
+
+def _park_publish(track) -> None:
+    """Answer a PUBLISH with Forward State 0 and start taking the
+    publisher's registrations, leaving forwarding off until a
+    subscriber arrives (§10.2.12)."""
+    if track.pending_publish is None or track.upstream is not None:
+        return
+    session, msg = track.pending_publish
+    session._track_aliases[msg.track_alias] = msg.request_id
+    session.register_object_handler(msg.track_alias, track.on_object)
+    session.register_stream_end_handler(msg.track_alias, track.on_stream_end)
+    ok = PublishOk(
+        request_id=msg.request_id, forward=0, priority=128,
+        group_order=GroupOrder.ASCENDING,
+        filter_type=FilterType.LATEST_OBJECT, parameters={})
+    logger.info(f"relay: PUBLISH_OK forward=0 alias={msg.track_alias} "
+                f"— parked until a subscriber arrives")
+    session._send_reply(msg.request_id, ok)
+    track.upstream = session
+    track.upstream_request_id = msg.request_id
+    track.parked = (session, msg)
+    track.pending_publish = None
+
+
+def _resume_parked_publish(track) -> None:
+    """Raise a parked publisher's Forward State once someone subscribes."""
+    if track.parked is None:
+        return
+    session, msg = track.parked
+    track.parked = None
+    try:
+        session.request_update(msg.request_id, forward=1)
+        logger.info(f"relay: REQUEST_UPDATE forward=1 "
+                    f"alias={msg.track_alias}")
+    except Exception:
+        logger.debug("relay: raising the parked forward state failed",
+                     exc_info=True)
 
 
 def _accept_publish(track) -> None:
@@ -903,6 +952,7 @@ async def _on_subscribe(session, msg):
             msg.request_id,
             lambda rid, t=track, s=session: t.drop_session(s))
         _accept_publish(track)
+        _resume_parked_publish(track)
         logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
                     f"-> SUBSCRIBE_OK (published track, fanout="
                     f"{len(track.downstream)})")
@@ -1069,6 +1119,7 @@ async def _offer_track(session, track, key):
         pub_msg.request_id,
         lambda rid, t=track, s=session: t.drop_session(s))
     _accept_publish(track)
+    _resume_parked_publish(track)
     logger.info(f"relay: PUBLISH offer accepted for {key} "
                 f"alias={pub_msg.track_alias} "
                 f"(fanout={len(track.downstream)})")

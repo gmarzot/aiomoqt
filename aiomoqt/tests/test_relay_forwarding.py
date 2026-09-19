@@ -161,6 +161,123 @@ def _end_track(pub_session, track):
         stream_count=sub.stream_count, reason="track ended")
 
 
+def _track_for(namespace):
+    keys = _keys_for(namespace)
+    return relay._tracks[keys[0]] if keys else None
+
+
+@pytest.mark.asyncio
+async def test_publish_first_is_answered_then_raised():
+    """§9.5 publish-first: a publisher that blocks on PUBLISH_OK before
+    it subscribes must be answered.
+
+    Holding the reply until a subscriber arrives deadlocks — it cannot
+    subscribe until we answer, and we would not answer until it
+    subscribed. Answer with Forward State 0 and raise it instead.
+    """
+    port = _BASE_PORT + 52
+    _reset_relay_state()
+    relay._track_subs.clear()
+    server = relay._build_server("localhost", port, CERT, KEY,
+                                 use_quic=True, draft=18)
+    handle = await server.serve()
+    try:
+        pub_client = MOQTClient("localhost", port, path="/", use_quic=True,
+                                verify_tls=False, supported_drafts=18)
+        async with pub_client.connect() as pub_session:
+            await pub_session.client_session_init()
+            track = _Pub(pub_session, "relay/pf", "video")
+            await track.publish(announce_namespace=False,
+                                publish_track=True)
+            for _ in range(100):
+                t = _track_for("relay/pf")
+                if t is not None and t.parked is not None:
+                    break
+                await asyncio.sleep(0.02)
+            t = _track_for("relay/pf")
+            assert t is not None and t.parked is not None, (
+                "PUBLISH was held with no subscriber to wait for")
+
+            got = []
+            sub_client = MOQTClient("localhost", port, path="/",
+                                    use_quic=True, verify_tls=False,
+                                    supported_drafts=18)
+            async with sub_client.connect() as sub_session:
+                await sub_session.client_session_init()
+                await sub_session.subscribe_tracks(namespace="relay/pf")
+                msg = await sub_session.await_publish(timeout=8.0)
+                sub_session._track_aliases[msg.track_alias] = msg.request_id
+                sub_session.register_object_handler(
+                    msg.track_alias,
+                    lambda m, s, tr, g, sg: got.append(bytes(m.payload)))
+                sub_session.publish_ok(msg, forward=1)
+                for _ in range(200):
+                    if len(got) >= len(_FRAMES):
+                        break
+                    await asyncio.sleep(0.02)
+            assert got == _FRAMES, f"publish-first delivered {got}"
+            assert _track_for("relay/pf").parked is None, (
+                "forward state was never raised")
+    finally:
+        handle.close()
+        _reset_relay_state()
+        relay._track_subs.clear()
+
+
+@pytest.mark.asyncio
+async def test_a_waiting_prefix_subscriber_still_holds_the_reply():
+    """With a prefix subscriber already registered the offer's
+    PUBLISH_OK is the reply the publisher gets, so the PUBLISH stays
+    held. Answering it early instead broke this path once.
+
+    Delivery is deliberately not asserted: at d16 the offer's
+    PUBLISH_OK does not resolve in `_offer_track`, so nothing is
+    forwarded. That is a separate, pre-existing defect — it reproduces
+    with this fix reverted — and coupling the two would hide whichever
+    is fixed second.
+    """
+    port = _BASE_PORT + 53
+    _reset_relay_state()
+    relay._track_subs.clear()
+    server = relay._build_server("localhost", port, CERT, KEY,
+                                 use_quic=True, draft=16)
+    handle = await server.serve()
+    try:
+        got = []
+        sub_client = MOQTClient("localhost", port, path="/", use_quic=True,
+                                verify_tls=False, supported_drafts=16)
+        async with sub_client.connect() as sub_session:
+            await sub_session.client_session_init()
+            sub = SubscribedTrack(
+                sub_session, "relay/sf", None,
+                on_object=lambda m, s, t, g, sg: got.append(bytes(m.payload)))
+            sub_task = asyncio.create_task(sub.subscribe(timeout=8.0))
+            for _ in range(100):
+                if relay._track_subs:
+                    break
+                await asyncio.sleep(0.02)
+            assert relay._track_subs, "prefix subscriber never registered"
+
+            pub_client = MOQTClient("localhost", port, path="/",
+                                    use_quic=True, verify_tls=False,
+                                    supported_drafts=16)
+            async with pub_client.connect() as pub_session:
+                await pub_session.client_session_init()
+                track = _Pub(pub_session, "relay/sf", "video")
+                await track.publish(announce_namespace=False,
+                                    publish_track=True)
+                await asyncio.sleep(0.3)
+                t = _track_for("relay/sf")
+                assert t is not None, "no track registered"
+                assert t.parked is None, (
+                    "the reply was answered early instead of held")
+                sub_task.cancel()
+    finally:
+        handle.close()
+        _reset_relay_state()
+        relay._track_subs.clear()
+
+
 @pytest.mark.asyncio
 async def test_publish_done_retires_the_track_with_the_session_open():
     """A publisher's PUBLISH_DONE ends the track even though its
