@@ -1024,7 +1024,7 @@ class PublishedTrack(Track):
         else:
             await self._subscriber_event.wait()
 
-    async def wait_closed(self):
+    async def wait_closed(self) -> None:
         """Wait for session to close."""
         await self.session.async_closed()
         self.state = TrackState.CLOSED
@@ -1210,7 +1210,7 @@ class SubscribedTrack(Track):
 
         self.session.register_publish_done_handler(request_id, _done)
 
-    async def wait_closed(self):
+    async def wait_closed(self) -> None:
         """Wait for this track to end: its PUBLISH_DONE, or the session
         closing under it.
 

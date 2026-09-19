@@ -4,8 +4,8 @@ import time
 from asyncio import Future
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from typing import (Callable, DefaultDict, Dict, List, Optional, Set, Tuple,
-                    Type, Union)
+from typing import (Any, Callable, DefaultDict, Dict, List, Optional, Set,
+                    Tuple, Type, Union)
 
 from aiopquic.quic.connection import QuicErrorCode, stream_is_unidirectional
 from aiopquic.quic.events import (
@@ -365,10 +365,10 @@ class _MOQTSessionMixin:
         self._stream_data_registry = dict(_MOQTSessionMixin.MOQT_STREAM_DATA_REGISTRY)
 
         # Optional callback for received data objects:
-        #   fn(msg, size_bytes, recv_time_ms, group_id, subgroup_id)
+        #   fn(msg, size_bytes, recv_time_us, group_id, subgroup_id)
         self.on_object_received: Optional[Callable] = None
         # Optional callback for received FetchObjects (fetch uni stream):
-        #   fn(msg, size_bytes, recv_time_ms, request_id)
+        #   fn(msg, size_bytes, recv_time_us, request_id)
         # Fires for normal objects only (end-of-range markers are logged
         # and the stream is expected to FIN shortly after).
         self.on_fetch_object: Optional[Callable] = None
@@ -2624,7 +2624,7 @@ class _MOQTSessionMixin:
         return self._quic.send_datagram_frame(data=buf.data)
 
     @property
-    def handshake_info(self):
+    def handshake_info(self) -> Dict[str, Any]:
         """Structured handshake result (probe ask #6): negotiated
         draft/version/ALPN, transport, time-to-established, current
         path RTT (µs), peer transport parameters, connection IDs.
@@ -2655,7 +2655,7 @@ class _MOQTSessionMixin:
         }
 
     @property
-    def qlog_paths(self):
+    def qlog_paths(self) -> List[str]:
         """qlog file(s) for this connection (probe ask #7): matches the
         session's connection-ID hex names under the effective qlog_dir
         (or AIOPQUIC_QLOG_DIR). Empty list when qlog is off or nothing
@@ -2679,7 +2679,7 @@ class _MOQTSessionMixin:
         return sorted(out)
 
     @property
-    def peer_transport_parameters(self):
+    def peer_transport_parameters(self) -> Optional[Dict[str, Any]]:
         """The peer's negotiated QUIC transport parameters as a dict
         (None before the handshake). Probe/fingerprinting surface —
         the values live in picoquic; no qlog round trip. Unknown/GREASE
@@ -2695,7 +2695,7 @@ class _MOQTSessionMixin:
         return None
 
     @property
-    def connection_ids(self):
+    def connection_ids(self) -> Optional[Dict[str, bytes]]:
         """{'local', 'remote', 'initial'} connection IDs as bytes, or
         None. QUIC-LB / routable-CID detection."""
         if not self._is_wt:

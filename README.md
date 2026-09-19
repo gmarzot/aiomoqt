@@ -61,7 +61,7 @@ The probe exits 0 if any draft handshakes, so it drops straight into a shell con
 import asyncio
 from aiomoqt.client import MOQTClient
 
-def on_object(msg, size, recv_time_ms, group_id=None, subgroup_id=None):
+def on_object(msg, size, recv_time_us, group_id=None, subgroup_id=None):
     print(f"g={group_id} obj={msg.object_id} {size}B payload={msg.payload}")
 
 async def main():
@@ -81,30 +81,28 @@ asyncio.run(main())
 ```python
 import asyncio
 from aiomoqt.client import MOQTClient
-from aiomoqt.types import MOQTMessageType
-from aiomoqt.messages import SubgroupHeader
+from aiomoqt.track import PublishedTrack
 
-async def on_subscribe(session, msg):
-    ok = session.subscribe_ok(request_msg=msg)
-    stream_id = session.open_uni_stream()
-    hdr = SubgroupHeader(track_alias=ok.track_alias, group_id=0,
-                         subgroup_id=0, publisher_priority=0)
-    session.stream_write(stream_id, hdr.serialize().data)
-    session.stream_write(stream_id, hdr.next_object(payload=b"hello").data)
+class HelloTrack(PublishedTrack):
+    async def produce(self, out):
+        for group_id in range(60):
+            await out.write(group_id, 0, b"hello", group_start=True)
+            await asyncio.sleep(1)
 
 async def main():
     client = MOQTClient('relay.example.com', 443, path='moq',
                         use_quic=True, supported_drafts=16)
-    client.register_handler(MOQTMessageType.SUBSCRIBE, on_subscribe)
     async with client.connect() as session:
         await session.client_session_init()
-        await session.publish_namespace('ns', wait_response=True)
-        await session.async_closed()
+        track = HelloTrack(session, 'ns', 'track')
+        # bare PUBLISH; produce() starts when a subscriber arrives
+        await track.publish()
+        await track.wait_closed()
 
 asyncio.run(main())
 ```
 
-`PublishedTrack` / `SubscribedTrack` in [`aiomoqt/track.py`](aiomoqt/track.py) wrap the stream setup, header serialization, and object writing shown above; use them instead of hand-rolling `on_subscribe` unless you need the low-level surface.
+`PublishedTrack` owns stream setup, subgroup headers, object numbering, pacing, and fan-out: `produce()` numbers the sequence once however many subscribers there are. `SubscribedTrack` is the receive side. Both are in [`aiomoqt/track.py`](aiomoqt/track.py); the raw stream API underneath — `open_uni_stream()`, `SubgroupHeader`, `stream_write()` — is in [`aiomoqt/delivery.py`](aiomoqt/delivery.py).
 
 ## API guide
 
@@ -120,7 +118,7 @@ req  = await session.subscribe('ns', 'track')                       # response v
 Register handlers for peer-initiated messages:
 
 ```python
-client.register_handler(MOQTMessageType.SUBSCRIBE, on_subscribe)
+client.register_handler(MOQTMessageType.SUBSCRIBE, my_subscribe_handler)
 ```
 
 Request failures raise `MOQTRequestError` regardless of negotiated draft.
@@ -254,7 +252,7 @@ Examples under `aiomoqt.examples` are minimal, readable clients rather than inst
 
 | Module | Purpose |
 |---|---|
-| `examples.pub_example` | publisher over SubgroupHeader streams |
+| `examples.pub_example` | publisher over PublishedTrack / VideoTrack |
 | `examples.sub_example` | subscriber |
 | `examples.join_example` | SUBSCRIBE + FETCH (join mid-stream) |
 | `examples.server_example` | WebTransport origin |
