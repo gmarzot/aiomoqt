@@ -149,6 +149,63 @@ def test_cython_subgroup_object_kvp_delta(vi64):
     assert body.startswith(pyhead)
 
 
+# -- the two codecs agree on MALFORMED input too ----------------------
+#
+# §1.4.3: "Key-Value-Pairs are always parsed with a known byte length,
+# which bounds the sequence." A KVP declaring a value longer than its
+# block must be refused, not read into the payload behind it. Agreement
+# on well-formed blocks (above) does not imply agreement on malformed
+# ones, and only the malformed case can desync a stream.
+
+
+def _vint(vi64):
+    return ref_vi64 if vi64 else ref_rfc9000
+
+
+def _kvp_block(vi64, declared_len, value):
+    """Type 1 (odd → length-prefixed) carrying `value`, in a block
+    whose declared length is `declared_len`."""
+    v = _vint(vi64)
+    return v(declared_len) + v(1) + v(len(value)) + value
+
+
+@pytest.mark.parametrize("vi64", [False, True], ids=["d16", "d18"])
+def test_kvp_overrunning_its_block_is_refused_by_both_codecs(vi64):
+    v = _vint(vi64)
+    # Declared block length 4; the single KVP actually spans 12 bytes.
+    block = _kvp_block(vi64, 4, b"\xaa" * 10)
+
+    buf = Buffer(data=block + v(3) + b"pay", vi64=vi64)
+    with pytest.raises(RuntimeError, match="overrun"):
+        MOQTMessage._extensions_decode(buf, delta=True)
+
+    chain = StreamChain()
+    chain.extend(v(0) + block + v(3) + b"pay")
+    fused = (chain.parse_object_subgroup_vi64 if vi64
+             else chain.parse_object_subgroup)
+    with pytest.raises(RuntimeError, match="overrun"):
+        fused(True, 16 * 1024, True)
+
+
+@pytest.mark.parametrize("vi64", [False, True], ids=["d16", "d18"])
+def test_kvp_exactly_filling_its_block_is_accepted(vi64):
+    """Off-by-one guard: a KVP ending exactly at the block end is
+    legal, so the overrun check must use > and not >=."""
+    v = _vint(vi64)
+    # type(1) + len(1) + 2 value bytes == 4 == the declared length.
+    block = _kvp_block(vi64, 4, b"ab")
+    assert len(block) - len(v(4)) == 4
+
+    buf = Buffer(data=block, vi64=vi64)
+    assert MOQTMessage._extensions_decode(buf, delta=True) == {1: b"ab"}
+
+    chain = StreamChain()
+    chain.extend(v(0) + block + v(3) + b"pay")
+    fused = (chain.parse_object_subgroup_vi64 if vi64
+             else chain.parse_object_subgroup)
+    assert fused(True, 16 * 1024, True) == (0, {1: b"ab"}, 0, b"pay")
+
+
 # -- d18 FETCH data plane (§11.4.4): vi64 + group/object deltas -------
 
 from aiomoqt.messages.data import FetchHeader, FetchObject  # noqa: E402
