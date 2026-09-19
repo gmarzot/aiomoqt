@@ -165,9 +165,16 @@ def _announced_match(ns: tuple) -> list[tuple]:
 
 
 def _track_live(track) -> bool:
-    """A track is usable while the session feeding it is still open —
-    either the publisher holding an unanswered PUBLISH, or the upstream
-    the subscription was made over."""
+    """A track is usable while it is still producing and the session
+    feeding it is still open.
+
+    Liveness is not session-scoped alone: a track ends while its session
+    stays open, and a peer's connection can linger for its whole idle
+    timeout after it is done. Acking a finished track to a new
+    subscriber delivers nothing.
+    """
+    if track.finished:
+        return False
     if track.pending_publish is not None:
         return _session_live(track.pending_publish[0])
     return _session_live(_upstream_session(track))
@@ -257,6 +264,10 @@ class _RelayedTrack:
         # across successive subscriptions on a session it keeps open, so
         # the registrations under it are released when the track ends.
         self.upstream_alias = None
+        # Request id of the PUBLISH feeding this track, so its
+        # PUBLISH_DONE is matched to the right track on a session
+        # publishing more than one.
+        self.upstream_request_id = None
         # Largest (group, object) forwarded: the Largest Location a
         # SUBSCRIBE_OK reports, and what a joining FETCH anchors to.
         self.largest = None
@@ -272,6 +283,11 @@ class _RelayedTrack:
         # that never received them or one that never forwarded them.
         self._objects_in = 0
         self._objects_out = 0
+
+    @property
+    def finished(self) -> bool:
+        """True once the track has reached its terminal."""
+        return self._finished
 
     def release_upstream(self) -> None:
         """Drop this track's handlers on the upstream session, so a later
@@ -752,6 +768,46 @@ def _upstream_done(track, key, done) -> None:
                              getattr(done, "stream_count", 0))
 
 
+def _published_track(session, request_id):
+    """(key, track) for the PUBLISH `request_id` on `session`."""
+    for key, track in list(_tracks.items()):
+        pending = track.pending_publish
+        if pending is not None and pending[0] is session and \
+                getattr(pending[1], "request_id", None) == request_id:
+            return key, track
+        if _upstream_session(track) is session and \
+                track.upstream_request_id == request_id:
+            return key, track
+    return None, None
+
+
+async def _on_publish_done(session, msg):
+    """§10.11: a publisher ends a track it PUBLISHed.
+
+    The terminal keys off this rather than off session close, which can
+    lag by the peer's whole idle timeout — a track still registered in
+    that window is handed to the next subscriber, which gets nothing.
+    """
+    key, track = _published_track(session, msg.request_id)
+    if track is not None:
+        status = getattr(msg, "status_code", SubscribeDoneCode.TRACK_ENDED)
+        reason = getattr(msg, "reason", "") or "track ended"
+        logger.info(f"relay: publisher PUBLISH_DONE {key} status={status} "
+                    f"streams={getattr(msg, 'stream_count', 0)} -> "
+                    f"{len(track.downstream)} subscriber(s), objects "
+                    f"in={track._objects_in} out={track._objects_out}")
+        if track.task is None:
+            # Nothing draining the queue: no subscriber ever attached.
+            track.finish(status_code=status, reason=reason)
+            track.close()
+            _tracks.pop(key, None)
+        else:
+            track.note_upstream_done(status, reason, key,
+                                     getattr(msg, "stream_count", 0))
+    # The default handler releases the publisher's subgroup streams.
+    await session._handle_subscribe_done(msg)
+
+
 async def _on_publish(session, msg):
     """Flow B: a publisher offers a track with no prior
     PUBLISH_NAMESPACE (transport 0x1D, present in d14/d16/d18 alike).
@@ -765,11 +821,26 @@ async def _on_publish(session, msg):
     ns = _ns_tuple(msg.track_namespace)
     key = (ns, msg.track_name)
     track = _tracks.get(key)
+    if track is not None:
+        owner = _upstream_session(track) or (
+            track.pending_publish[0] if track.pending_publish else None)
+        if track.finished or owner is not session:
+            # One publisher per Full Track Name. The predecessor's
+            # close may not have been observed yet, and reusing its
+            # track would drop everything this publisher sends.
+            logger.info(f"relay: retiring the track registered for {key}")
+            track.finish(reason="superseded by a new publisher")
+            track.close()
+            _tracks.pop(key, None)
+            track = None
     if track is None:
         track = _RelayedTrack(key)
         _tracks[key] = track
     _watch_session(session)
     track.pending_publish = (session, msg)
+    # §9.4: a bare PUBLISH is the only notice d18 prefix subscribers get
+    # that this namespace exists.
+    _announce_namespace(ns)
     logger.info(f"relay: publish ns={ns} track={msg.track_name} "
                 f"alias={msg.track_alias} — holding PUBLISH_OK for a "
                 f"subscriber")
@@ -796,6 +867,7 @@ def _accept_publish(track) -> None:
     logger.info(f"relay: PUBLISH_OK forward=1 alias={msg.track_alias}")
     session._send_reply(msg.request_id, ok)
     track.upstream = session
+    track.upstream_request_id = msg.request_id
     track.pending_publish = None
 
 
@@ -1304,6 +1376,8 @@ def _build_server(bind, port, cert, key, use_quic, draft):
         MOQTMessageType.SUBSCRIBE, _answered(_on_subscribe))
     server.register_handler(
         MOQTMessageType.PUBLISH, _answered(_on_publish))
+    server.register_handler(
+        MOQTMessageType.PUBLISH_DONE, _on_publish_done)
     server.register_handler(
         MOQTMessageType.TRACK_STATUS, _answered(_on_track_status))
     server.register_handler(

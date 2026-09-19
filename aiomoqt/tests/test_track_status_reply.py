@@ -75,6 +75,7 @@ def test_relay_answers_ok_for_served_track_and_error_for_unknown():
     from aiomoqt.tools import moq_interop_relay as relay
 
     class _Track:
+        finished = False
         pending_publish = ("sess", "msg")
         upstream = type("U", (), {"_largest": (7, 42)})()
 
