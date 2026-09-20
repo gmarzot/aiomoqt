@@ -24,6 +24,7 @@ echo "=== full suite: draft $DRAFT over $TRANSPORT ==="
 # step is indistinguishable from a hung one.
 (cd "$work" && MOXYGEN_DIR="$MOXDIR" SKIP_FETCH="${SKIP_FETCH:-0}" \
     bash "$SUITE" "${args[@]}") 2>&1 \
+    | tee "$OUT/$DRAFT-$TRANSPORT-full.log" \
     | stdbuf -oL grep -E --line-buffered \
         "Test [0-9]+\]|PASSED|FAILED|SECTION [0-9]|Success Rate|Total Tests"
 rc=${PIPESTATUS[0]}
