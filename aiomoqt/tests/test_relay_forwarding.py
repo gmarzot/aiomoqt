@@ -225,12 +225,13 @@ async def test_publish_first_is_answered_then_raised():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("draft", [14, 16])
-async def test_pre_d18_holds_the_reply_with_no_subscriber(draft):
-    """Publish-first needs SUBSCRIBE_TRACKS, which arrives only with
-    two-level discovery. Before d18 a publisher cannot subscribe after
-    publishing, so answering early buys nothing and costs a publisher
-    that sits waiting for a forward state that never rises."""
+@pytest.mark.parametrize("draft", [14, 16, 18])
+async def test_no_subscriber_to_offer_means_the_reply_is_answered(draft):
+    """With nobody the track can be offered to, no reply is coming from
+    anywhere, so the PUBLISH is answered with Forward State 0 rather
+    than held. Holding it deadlocks a publisher that waits for
+    PUBLISH_OK before it subscribes, at every draft that has a forward
+    state to answer with."""
     port = _BASE_PORT + 54 + draft
     _reset_relay_state()
     relay._track_subs.clear()
@@ -248,9 +249,10 @@ async def test_pre_d18_holds_the_reply_with_no_subscriber(draft):
             await asyncio.sleep(0.3)
             t = _track_for("relay/pre18")
             assert t is not None, "no track registered"
-            assert t.parked is None, (
-                f"d{draft} answered the PUBLISH early; publish-first is "
-                f"not expressible before two-level discovery")
+            assert t.parked is not None, (
+                f"d{draft} held the PUBLISH with nobody to offer it to; "
+                f"a publisher waiting on PUBLISH_OK before it subscribes "
+                f"deadlocks")
     finally:
         handle.close()
         _reset_relay_state()
