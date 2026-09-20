@@ -225,6 +225,39 @@ async def test_publish_first_is_answered_then_raised():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("draft", [14, 16])
+async def test_pre_d18_holds_the_reply_with_no_subscriber(draft):
+    """Publish-first needs SUBSCRIBE_TRACKS, which arrives only with
+    two-level discovery. Before d18 a publisher cannot subscribe after
+    publishing, so answering early buys nothing and costs a publisher
+    that sits waiting for a forward state that never rises."""
+    port = _BASE_PORT + 54 + draft
+    _reset_relay_state()
+    relay._track_subs.clear()
+    server = relay._build_server("localhost", port, CERT, KEY,
+                                 use_quic=True, draft=draft)
+    handle = await server.serve()
+    try:
+        pub_client = MOQTClient("localhost", port, path="/", use_quic=True,
+                                verify_tls=False, supported_drafts=draft)
+        async with pub_client.connect() as pub_session:
+            await pub_session.client_session_init()
+            track = _Pub(pub_session, "relay/pre18", "video")
+            await track.publish(announce_namespace=False,
+                                publish_track=True)
+            await asyncio.sleep(0.3)
+            t = _track_for("relay/pre18")
+            assert t is not None, "no track registered"
+            assert t.parked is None, (
+                f"d{draft} answered the PUBLISH early; publish-first is "
+                f"not expressible before two-level discovery")
+    finally:
+        handle.close()
+        _reset_relay_state()
+        relay._track_subs.clear()
+
+
+@pytest.mark.asyncio
 async def test_a_waiting_prefix_subscriber_still_holds_the_reply():
     """With a prefix subscriber already registered the offer's
     PUBLISH_OK is the reply the publisher gets, so the PUBLISH stays

@@ -854,12 +854,16 @@ async def _on_publish(session, msg):
                 _offer_track(sub_session, track, key))
     if track.downstream:
         _accept_publish(track)
-    elif not offered:
+    elif not offered and session._profile.two_level_discovery:
         # Nobody to offer this track to, so no reply is coming from
         # anywhere: answer now rather than hold. A publisher that
         # blocks on PUBLISH_OK before subscribing (§9.5 publish-first)
         # would otherwise deadlock — it cannot subscribe until we
         # answer, and we would not answer until it subscribed.
+        #
+        # Only where discovery is two-level: publish-first needs
+        # SUBSCRIBE_TRACKS, so before d18 a publisher cannot subscribe
+        # after publishing and holding the reply is what it expects.
         _park_publish(track)
 
 
