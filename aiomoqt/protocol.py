@@ -3947,12 +3947,19 @@ class _MOQTSessionMixin:
         self._publish_announcements.put_nowait(msg)
 
     async def _handle_publish_ok(self, msg: PublishOk) -> None:
+        """Subscriber accepted our PUBLISH.
+
+        Pre-d18 this arrives as its own control message rather than a
+        REQUEST_OK on the request's stream, so nothing else resolves
+        the sender's future — without this an awaited publish() waits
+        out its whole timeout on an offer that was accepted."""
         logger.info(f"MOQT event: handle {msg}")
-        # Subscriber accepted our PUBLISH
+        self._resolve_request(msg.request_id, msg)
 
     async def _handle_publish_error(self, msg: PublishError) -> None:
+        """Subscriber rejected our PUBLISH; the awaiter raises."""
         logger.info(f"MOQT event: handle {msg}")
-        # Subscriber rejected our PUBLISH
+        self._resolve_request(msg.request_id, msg)
 
     async def _handle_fetch(self, msg: Fetch) -> None:
         """Default handler for incoming FETCH.

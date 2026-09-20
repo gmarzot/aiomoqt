@@ -261,14 +261,7 @@ async def test_pre_d18_holds_the_reply_with_no_subscriber(draft):
 async def test_a_waiting_prefix_subscriber_still_holds_the_reply():
     """With a prefix subscriber already registered the offer's
     PUBLISH_OK is the reply the publisher gets, so the PUBLISH stays
-    held. Answering it early instead broke this path once.
-
-    Delivery is deliberately not asserted: at d16 the offer's
-    PUBLISH_OK does not resolve in `_offer_track`, so nothing is
-    forwarded. That is a separate, pre-existing defect — it reproduces
-    with this fix reverted — and coupling the two would hide whichever
-    is fixed second.
-    """
+    held. Answering it early instead broke this path once."""
     port = _BASE_PORT + 53
     _reset_relay_state()
     relay._track_subs.clear()
@@ -299,12 +292,16 @@ async def test_a_waiting_prefix_subscriber_still_holds_the_reply():
                 track = _Pub(pub_session, "relay/sf", "video")
                 await track.publish(announce_namespace=False,
                                     publish_track=True)
-                await asyncio.sleep(0.3)
+                await asyncio.wait_for(sub_task, timeout=10)
+                for _ in range(250):
+                    if len(got) >= len(_FRAMES):
+                        break
+                    await asyncio.sleep(0.02)
                 t = _track_for("relay/sf")
                 assert t is not None, "no track registered"
                 assert t.parked is None, (
                     "the reply was answered early instead of held")
-                sub_task.cancel()
+            assert got == _FRAMES, f"subscribe-first delivered {got}"
     finally:
         handle.close()
         _reset_relay_state()
