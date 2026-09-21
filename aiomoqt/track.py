@@ -31,7 +31,7 @@ from typing import Callable, Dict, Optional
 
 from .types import (
     MOQTMessageType, MOQTRequestError, ParamType, FilterType,
-    ForwardingPreference, GroupOrder, LOC_TIMESTAMP, SessionCloseCode,
+    ForwardingPreference, GroupOrder, LOC_TIMESTAMP,
     StreamResetCode, SubscribeDoneCode,
 )
 from .delivery import FanoutDelivery, StreamMapping, SubgroupDelivery
