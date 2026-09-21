@@ -8,8 +8,8 @@ low latency with the overlay numbers to prove it.
 Synthetic load, ramps and churn are in
 [bench-runbook.md](bench-runbook.md).
 
-Actors: SHELL = a shell with the venv active in this repo · OBS =
-OBS Studio · BROWSER = Chrome. RELAY =
+Actors: SHELL = a shell set up as in the next section (repo, venv,
+exports) · OBS = OBS Studio · BROWSER = Chrome. RELAY =
 https://moqx-main.ci.openmoq.org:4433/moq-relay (deployed; never
 restart it). Draft 18 everywhere (`--draft 18` / `v=18`).
 
@@ -25,10 +25,16 @@ be right:
 ## Before anything: paste this in every shell
 
 ```
+cd $HOME/Projects/moq/aiomoqt
+source .venv/bin/activate
 export RELAY_WT=https://moqx-main.ci.openmoq.org:4433/moq-relay
 export ASSETS=$HOME/Projects/moq/media-assets
 export PLAYA=$HOME/Projects/moq/moq-playa-v059
 ```
+
+Every `python -m aiomoqt.tools.…` line below needs that venv. The one
+exception is the vite shell in Prep, which runs from `$PLAYA` and needs
+only the exports.
 
 That is the whole setup. **No namespace has to be handled by hand**:
 `pub_media` mints `aiomoqt/demo-<rand4>` itself and prints both the
@@ -48,11 +54,17 @@ and finds whichever run is publishing under it. Copy the publisher's
 `namespace:` line only when pinning a specific one.
 
 ## Prep (once)
-- SHELL: `cd "$PLAYA" && pnpm build && pnpm --filter @moqt/examples dev`
-  → :5173. Leave running. After player edits: `pnpm -r --filter "./packages/**" build`
+
+Two shells, in this order. The first one blocks — it is the dev server —
+so it cannot share a shell with anything below it.
+
+- SHELL 1, and leave it running: `cd "$PLAYA" && pnpm build && pnpm --filter @moqt/examples dev`
+  → :5173. After player edits: `pnpm -r --filter "./packages/**" build`
   and restart vite (the examples import the packages' dist).
-- SHELL: `python -m aiomoqt.tools.relay_probe --url https://moqx-main.ci.openmoq.org:4433/moq-relay --draft 18` → expect ✓
-- SHELL: `hostname -I` → WSL IP for the OBS SRT URL (changes across reboots)
+- SHELL 2, the venv shell, and the one every demo below uses:
+  `python -m aiomoqt.tools.relay_probe --url "$RELAY_WT" --draft 18` → expect ✓
+- SHELL 2: `hostname -I` → WSL IP for the OBS SRT URL (changes across
+  reboots). Only demo C needs it.
 - Assets: `$ASSETS/` — tos-720p-2000k.mp4 (1280x534@24, 1.9 Mbps),
   tos-1080p-4000k.mp4 (1920x800@24, 3.9 Mbps),
   tian-nature-1080p-8000k.mp4 (1920x1080@30, 7.9 Mbps),
