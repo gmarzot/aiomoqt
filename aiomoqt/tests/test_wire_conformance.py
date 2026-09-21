@@ -206,6 +206,32 @@ def test_kvp_exactly_filling_its_block_is_accepted(vi64):
     assert fused(True, 16 * 1024, True) == (0, {1: b"ab"}, 0, b"pay")
 
 
+def test_kvp_delta_type_overflow_is_a_protocol_violation():
+    """§1.4.3: the previous Type plus the Delta Type MUST NOT exceed
+    2^64-1, and a receiver MUST close the session with a
+    PROTOCOL_VIOLATION. Python ints do not overflow, so without an
+    explicit guard the key simply grows and a nonsense Type is
+    accepted. vi64 reaches 2^64-1 in one delta, so two KVPs suffice."""
+    from aiomoqt.types import MOQTProtocolViolation
+    v = ref_vi64
+    # type 1 (odd, empty value), then a delta that lands past the space
+    kvps = v(1) + v(0) + v((1 << 64) - 1) + v(0)
+    block = v(len(kvps)) + kvps
+
+    buf = Buffer(data=block, vi64=True)
+    with pytest.raises(MOQTProtocolViolation, match="Delta Type"):
+        MOQTMessage._extensions_decode(buf, delta=True)
+
+    from aiomoqt.messages.data import ObjectHeader
+    body = v(0) + block + v(3) + b"pay"
+    chain = StreamChain()
+    chain.extend(body)
+    with pytest.raises(MOQTProtocolViolation, match="overflow"):
+        ObjectHeader(object_id=0).deserialize_into(
+            chain, buf_len=len(body), extensions_present=True,
+            vi64=True, kvp_delta=True)
+
+
 # -- d18 FETCH data plane (§11.4.4): vi64 + group/object deltas -------
 
 from aiomoqt.messages.data import FetchHeader, FetchObject  # noqa: E402
