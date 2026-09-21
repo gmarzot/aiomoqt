@@ -25,6 +25,7 @@ from ..types import FilterType, GroupOrder
 from .errors import AgentError
 from .reader import Reader
 from .spec import PublishSpec, SubscribeSpec
+from .writer import Writer, build_writer
 
 _FILTERS = {
     "latest": FilterType.LATEST_OBJECT,
@@ -63,6 +64,7 @@ class AgentSession:
         self._session = session
         self._readers: Dict[str, Reader] = {}
         self._publishes: Dict[str, PublishSpec] = {}
+        self._writers: Dict[str, Writer] = {}
         self._closed = False
 
     @property
@@ -107,14 +109,25 @@ class AgentSession:
         self._readers[name] = rdr
         return rdr
 
-    def declare_publish(self, spec: PublishSpec) -> None:
-        """Record a publication and its priority on this connection.
+    def writer(self, spec: PublishSpec) -> Writer:
+        """Register a publication on this connection.
 
-        Separate from opening a writer so the relative priorities of an
-        agent's tracks can be stated before any of them produce.
+        Builds and registers without going live: an agent usually wants
+        every track and their relative priorities declared before any of
+        them produces. Call `Writer.start()` to publish.
         """
         self._guard()
-        self._publishes[str(spec.track)] = spec
+        name = str(spec.track)
+        if name in self._writers:
+            raise AgentError(f"writer: already publishing {name}")
+        wtr, _track = build_writer(self._session, spec)
+        self._writers[name] = wtr
+        self._publishes[name] = spec
+        return wtr
+
+    @property
+    def writers(self) -> Dict[str, Writer]:
+        return dict(self._writers)
 
     def priority_plan(self) -> Dict[str, Any]:
         """What this connection has been asked to schedule, and whether
@@ -148,6 +161,9 @@ class AgentSession:
     async def close(self) -> None:
         for name in list(self._readers):
             self.close_reader(name)
+        for wtr in self._writers.values():
+            await wtr.close()
+        self._writers.clear()
         self._publishes.clear()
         self._closed = True
 

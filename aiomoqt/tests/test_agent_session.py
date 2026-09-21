@@ -8,7 +8,7 @@ import asyncio
 
 import pytest
 
-from aiomoqt.agent import Priority, PublishSpec, StartAt, SubscribeSpec, TrackRef
+from aiomoqt.agent import Priority, StartAt, SubscribeSpec, TrackRef
 from aiomoqt.agent.errors import AgentError
 from aiomoqt.agent.reader import Obj, ReadTimeout
 from aiomoqt.agent.session import AgentSession, start_at_to_wire
@@ -256,20 +256,17 @@ def test_payload_helpers():
 # -- the publication relationship ------------------------------------
 
 async def test_priority_plan_reports_what_it_cannot_yet_enforce():
-    """The relationship is expressible now; enforcement is 0.5.0."""
-    agent = AgentSession(_StubSession())
-    agent.declare_publish(PublishSpec(
-        track=TrackRef("agent", "decisions"), priority=Priority(publisher=0)))
-    agent.declare_publish(PublishSpec(
-        track=TrackRef("agent", "reasoning"), priority=Priority(publisher=200)))
-    await agent.reader(_spec(priority=Priority(subscriber=8)))
+    """The relationship is expressible now; enforcement is 0.5.0.
 
+    Readers-only here; the reader+writer span is covered where writers
+    exist, in test_agent_writer.py.
+    """
+    agent = AgentSession(_StubSession())
+    await agent.reader(_spec(priority=Priority(subscriber=8)))
     plan = agent.priority_plan()
     assert plan["enforced"] is False
-    by_track = {t["track"]: t for t in plan["tracks"]}
-    assert by_track["agent/decisions"]["publisher"] == 0
-    assert by_track["agent/reasoning"]["publisher"] == 200
-    assert by_track["live/cam-1/video"]["subscriber"] == 8
+    assert plan["tracks"] == [
+        {"track": "live/cam-1/video", "publisher": None, "subscriber": 8}]
 
 
 async def test_session_closes_its_readers():
