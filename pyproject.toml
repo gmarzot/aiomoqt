@@ -34,7 +34,7 @@ classifiers = [
 ]
 dependencies = [
     "certifi",
-    "aiopquic>=0.4.0",
+    "aiopquic>=0.4.1",
     "sortedcontainers>=2.4.0",
 ]
 
