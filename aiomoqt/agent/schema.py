@@ -120,6 +120,9 @@ def _collect(cls: type, defs: Dict[str, Any]) -> None:
     doc = (cls.__doc__ or "").strip().split("\n\n")[0].replace("\n", " ")
     if doc:
         schema["description"] = doc
+    constraints = getattr(cls, "schema_constraints", None)
+    if callable(constraints):
+        schema.update(constraints())
     defs[cls.__name__] = schema
 
 
@@ -150,12 +153,18 @@ def tool_schema(cls: type,
     a model supplies `namespace` rather than `{"track": {...}}`. A lifted
     name that collides is prefixed with its parent.
     """
+    if flatten is not None and not isinstance(flatten, dict):
+        raise SpecError(f"tool_schema: flatten must be a mapping, got {flatten!r}")
     nested = json_schema(cls)
     defs = nested.get("$defs", {})
     props = dict(nested.get("properties", {}))
     required = list(nested.get("required", []))
 
     for parent, children in (flatten or {}).items():
+        if not isinstance(children, (list, tuple)) or not children:
+            raise SpecError(
+                f"tool_schema: flatten[{parent!r}] must name at least one "
+                f"field, got {children!r}")
         node = props.pop(parent, None)
         if node is None:
             raise SpecError(f"tool_schema: {cls.__name__} has no field {parent!r}")
@@ -225,8 +234,18 @@ def from_flat(cls: type, args: Dict[str, Any],
     The inverse of `tool_schema`'s flattening, so an MCP handler can hand
     the result straight to `from_dict`.
     """
+    if not isinstance(args, dict):
+        raise SpecError(f"from_flat: expected an object, got {args!r}")
+    if flatten is not None and not isinstance(flatten, dict):
+        raise SpecError(f"from_flat: flatten must be a mapping, got {flatten!r}")
     out = dict(args)
     for parent, children in (flatten or {}).items():
+        if parent not in spec_keys(cls):
+            raise SpecError(f"from_flat: {cls.__name__} has no field {parent!r}")
+        if not isinstance(children, (list, tuple)) or not children:
+            raise SpecError(
+                f"from_flat: flatten[{parent!r}] must name at least one "
+                f"field, got {children!r}")
         collected: Dict[str, Any] = {}
         for child in children:
             for candidate in (child, f"{parent}_{child}"):

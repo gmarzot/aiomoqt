@@ -132,6 +132,8 @@ def _coerce(value: Any, target: Any, where: str) -> Any:
             raise SpecError(f"{where}: expected an integer, got a boolean")
         if isinstance(value, int):
             return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)  # JSON has one number type; 512.0 is an integer
         if isinstance(value, str):
             try:
                 return int(value, 10)
@@ -173,6 +175,69 @@ def _validate(cls: type, name: str, value: Any, lenient: bool) -> Any:
     return value
 
 
+def check_instance(obj: Any) -> None:
+    """Enforce the field contract on a constructed spec.
+
+    Coercion is a JSON-boundary concession, not a constructor one: a spec
+    built in Python must already hold the declared types, so `to_dict` on
+    any constructed instance is schema-valid.
+    """
+    cls = type(obj)
+    hints = get_type_hints(cls, include_extras=True)
+    for name in spec_keys(cls):
+        value = getattr(obj, name)
+        if value is None:
+            continue
+        target = _unwrap(hints.get(name, Any))
+        _check_type(value, target, f"{cls.__name__}.{name}")
+        _validate(cls, name, value, lenient=False)
+    extra = getattr(obj, "extra", None)
+    if extra:
+        clash = sorted(set(extra) & set(spec_keys(cls)))
+        if clash:
+            raise SpecError(
+                f"{cls.__name__}.extra may not shadow declared field"
+                f"{'s' if len(clash) > 1 else ''} "
+                f"{', '.join(repr(k) for k in clash)}")
+
+
+def _check_type(value: Any, target: Any, where: str) -> None:
+    origin = get_origin(target)
+    if is_dataclass(target):
+        if not isinstance(value, target):
+            raise SpecError(
+                f"{where}: expected {target.__name__}, "
+                f"got {type(value).__name__}")
+        return
+    if origin in (list, List):
+        if not isinstance(value, list):
+            raise SpecError(f"{where}: expected a list, "
+                            f"got {type(value).__name__}")
+        inner = (get_args(target) or (Any,))[0]
+        for item in value:
+            _check_type(item, _unwrap(inner), where)
+        return
+    if origin in (dict, Dict):
+        if not isinstance(value, dict):
+            raise SpecError(f"{where}: expected an object, "
+                            f"got {type(value).__name__}")
+        return
+    if target is bool:
+        ok = isinstance(value, bool)
+    elif target is int:
+        ok = isinstance(value, int) and not isinstance(value, bool)
+    elif target is float:
+        ok = isinstance(value, (int, float)) and not isinstance(value, bool)
+    elif target is str:
+        ok = isinstance(value, str)
+    else:
+        return
+    if not ok:
+        raise SpecError(
+            f"{where}: expected {target.__name__}, "
+            f"got {type(value).__name__} {value!r}")
+
+
 def to_dict(obj: Any) -> Dict[str, Any]:
     """Field-driven serialization. None is omitted; `extra` merges last."""
     out: Dict[str, Any] = {}
@@ -204,6 +269,11 @@ def from_dict(cls: type, data: Dict[str, Any], *, lenient: bool = False) -> Any:
     """
     if not isinstance(data, dict):
         raise SpecError(f"{cls.__name__}: expected an object, got {data!r}")
+    bad_keys = [k for k in data if not isinstance(k, str)]
+    if bad_keys:
+        raise SpecError(
+            f"{cls.__name__}: field names must be strings, got "
+            f"{', '.join(repr(k) for k in bad_keys)}")
 
     keys = spec_keys(cls)
     hints = get_type_hints(cls, include_extras=True)
@@ -224,16 +294,22 @@ def from_dict(cls: type, data: Dict[str, Any], *, lenient: bool = False) -> Any:
             continue
         target = _unwrap(hints.get(name, Any))
         value = data[name]
-        if is_dataclass(target) and isinstance(value, dict):
+        where = f"{cls.__name__}.{name}"
+        if is_dataclass(target):
+            if not isinstance(value, dict):
+                raise SpecError(
+                    f"{where}: expected an object, got {value!r}")
             value = from_dict(target, value, lenient=lenient)
         elif get_origin(target) in (list, List):
-            inner = (get_args(target) or (Any,))[0]
-            inner_bare = _unwrap(inner)
+            inner_bare = _unwrap((get_args(target) or (Any,))[0])
             if is_dataclass(inner_bare):
+                if not isinstance(value, list):
+                    raise SpecError(
+                        f"{where}: expected a list, got {value!r}")
                 value = [from_dict(inner_bare, v, lenient=lenient)
-                         if isinstance(v, dict) else v for v in value]
+                         for v in value]
             else:
-                value = _coerce(value, target, f"{cls.__name__}.{name}")
+                value = _coerce(value, target, where)
         else:
             value = _coerce(value, target, f"{cls.__name__}.{name}")
         kwargs[name] = _validate(cls, name, value, lenient)
@@ -248,7 +324,10 @@ def from_dict(cls: type, data: Dict[str, Any], *, lenient: bool = False) -> Any:
             f"{', '.join(repr(k) for k in missing)}")
 
     if lenient and unknown:
-        kwargs["extra"] = {k: data[k] for k in unknown}
+        if any(f.name == "extra" for f in _dc_fields(cls)):
+            kwargs["extra"] = {k: data[k] for k in unknown}
+        # Specs without an `extra` bucket drop unknowns rather than fail:
+        # lenient exists so a newer document still parses.
     return cls(**kwargs)
 
 
@@ -264,6 +343,9 @@ class TrackRef:
     relay: Annotated[Optional[str], Doc(
         "moqt:// (raw QUIC) or https:// (WebTransport) URL. Omit to use "
         "the session already open")] = None
+
+    def __post_init__(self) -> None:
+        check_instance(self)
 
     def __str__(self) -> str:
         return f"{self.namespace}/{self.name}" if self.name else self.namespace
@@ -314,7 +396,27 @@ class StartAt:
     end_group: Annotated[Optional[int], Range(0, None), Doc(
         "Last group, for mode 'range'")] = None
 
+    @staticmethod
+    def schema_constraints() -> Dict[str, Any]:
+        """The mode/field invariants below, as publishable JSON Schema.
+
+        Kept beside __post_init__ so the two cannot be changed apart.
+        """
+        unused = {u: {"type": "null"} for u in ("group", "object", "end_group")}
+        return {"allOf": [
+            {"if": {"properties": {"mode": {"const": "group"}},
+                    "required": ["mode"]},
+             "then": {"required": ["mode", "group"]}},
+            {"if": {"properties": {"mode": {"const": "range"}},
+                    "required": ["mode"]},
+             "then": {"required": ["mode", "group", "end_group"]}},
+            {"if": {"properties": {"mode": {"enum": ["latest", "next_group"]}},
+                    "required": ["mode"]},
+             "then": {"properties": unused}},
+        ]}
+
     def __post_init__(self) -> None:
+        check_instance(self)
         if self.mode == "group" and self.group is None:
             raise SpecError("StartAt: mode 'group' needs `group`")
         if self.mode == "range":
@@ -372,6 +474,9 @@ class Priority:
         "Staleness budget in ms. ADVISORY: optional in the spec, 0 means "
         "unset, and relays differ in whether they act on it")] = None
 
+    def __post_init__(self) -> None:
+        check_instance(self)
+
     def to_dict(self) -> Dict[str, Any]:
         return to_dict(self)
 
@@ -398,6 +503,9 @@ class SubscribeSpec:
         "Default deadline for operations on this subscription")] = DEFAULT_TIMEOUT_S
     extra: Dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        check_instance(self)
+
     def to_dict(self) -> Dict[str, Any]:
         return to_dict(self)
 
@@ -423,6 +531,9 @@ class PublishSpec:
     on_full: Annotated[str, Choices(*ON_FULL), Doc(
         "What happens when the writer ring fills")] = "block"
     extra: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        check_instance(self)
 
     def to_dict(self) -> Dict[str, Any]:
         return to_dict(self)
