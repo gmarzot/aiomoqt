@@ -215,14 +215,19 @@ arrival. Prefer `--ts`.
 The only flow that tests the receive path against an independent
 implementation, and the only one carrying HEVC, AV1 and Opus. Nothing to
 start; Eyevinn's moqlivemock endpoint is always on.
-- SHELL: `python -m aiomoqt.tools.sub_media "moqt://moqlivemock.demo.osaas.io:443" -N 'msf\/clear' -t 12 --inspect 2 --draft 18`
-- **Escaped slash is required.** Their namespace is a ONE-element tuple
-  containing a literal slash, not two elements, so plain `msf/clear` is
-  rejected as "non-matching namespace".
+- SHELL: `python -m aiomoqt.tools.sub_media "moqt://moqlivemock.demo.osaas.io:443" -N 'mlm/msf/clear' -t 12 --inspect 2 --draft 18`
+- Plain slashes, no escaping. They re-rooted their namespaces under
+  `mlm` some time after 09-13: it is now the ordinary 3-element tuple
+  `mlm/msf/clear`, not the old 1-element `msf/clear` that needed `\/`.
+  The old form now fails with `code=16 non-matching namespace`.
+- If it fails again, ask them rather than guessing — they announce, so
+  `subscribe_namespace` with an empty prefix lists everything. Live at
+  2026-09-21: `mlm/msf/clear` (LOC), `mlm/moq-mi/clear`,
+  `mlm/cmsf/{clear,drm-cbcs,eccp-cbcs}`, `moq-test/interop`.
 - Expect 13 tracks (AVC/HEVC/AV1 × 400/600/900 kbps, AAC + Opus),
   `ts_skew_ms` in the tens of ms (the loc-04 0x10 timestamp path),
   `extra_props=[]`, and playable `video.h264` + `video.ivf` written.
-  Verified 2026-09-13.
+  Verified 2026-09-21.
 - Reverse direction unavailable: the pinned `mlmsub` is a d16-era build
   and dies on ALPN at draft 18; no Go toolchain here to build a current
   one. They also host a warp-player and an MSF/CMSF validator.
