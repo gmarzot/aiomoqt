@@ -640,6 +640,9 @@ def _forget_session(session) -> None:
         if _announced[ns].pop(session, None) is not None and \
                 not _announced[ns]:
             del _announced[ns]
+            # This session's own prefix subscriptions were dropped just
+            # above, so this reaches the observers that remain.
+            _retract_namespace(ns)
     for key, track in list(_tracks.items()):
         track.drop_session(session)
         if _upstream_session(track) is session or (
@@ -691,6 +694,7 @@ async def _on_publish_namespace_done(session, msg):
         del holders[session]
     if not holders:
         del _announced[ns]
+        _retract_namespace(ns)
     logger.info(f"relay: namespace_done ns={ns} -> "
                 f"{len(_announced.get(ns, {}))} publisher(s)")
 
@@ -1336,6 +1340,21 @@ def _announce_namespace(ns) -> None:
     for session, prefix, rid in list(_ns_subs):
         if _prefix_covers(prefix, ns) and _session_live(session):
             _offer_namespace(session, rid, prefix, ns)
+
+
+def _retract_namespace(ns) -> None:
+    """Tell d18 prefix subscribers a namespace has gone (§10.8).
+
+    The counterpart to _announce_namespace: an observer that was told a
+    namespace exists otherwise goes on believing it after the last
+    publisher withdraws or its session closes.
+    """
+    for session, prefix, rid in list(_ns_subs):
+        if _prefix_covers(prefix, ns) and _session_live(session):
+            try:
+                session.namespace_done(ns[len(prefix):], request_id=rid)
+            except Exception:
+                logger.debug("relay: NAMESPACE_DONE failed", exc_info=True)
 
 
 async def _on_subscribe_tracks(session, msg):

@@ -1535,14 +1535,9 @@ class _MOQTSessionMixin:
                         f"unknown data stream type 0x{stream_type:x}")
 
                 if msg_header is None:
-                    # Stream-level parse failure on the data stream type
-                    # byte. Caused by data-corruption races at high
-                    # stream-churn rates (see issue: known framer desync
-                    # under load). Reject this stream and let the session
-                    # keep running rather than tearing the whole session
-                    # down for one corrupt stream — the publisher will
-                    # see STOP_SENDING and abandon, the rest of the
-                    # session continues. Forensic anchor logged below.
+                    # Parse failure on the data stream type byte. Reject
+                    # this one stream instead of the session: the publisher
+                    # sees STOP_SENDING and abandons, other streams continue.
                     try:
                         anchor = buf.data_slice(0, min(64, buf.capacity)).hex()
                     except Exception:
@@ -3505,6 +3500,41 @@ class _MOQTSessionMixin:
             raise ValueError(
                 "namespace() needs the SUBSCRIBE_NAMESPACE request_id "
                 "or stream_id: NAMESPACE is not a control-stream message")
+        return message
+
+    def namespace_done(
+        self,
+        namespace_suffix: Union[str, Tuple[bytes, ...]] = (),
+        stream_id: int = None,
+        request_id: int = None,
+    ) -> Optional[MOQTMessage]:
+        """Withdraw a namespace previously reported with namespace().
+
+        The counterpart to NAMESPACE, on the same SUBSCRIBE_NAMESPACE
+        request stream and carrying the same suffix. Without it a peer
+        that learned of a namespace keeps believing in it after the
+        publisher withdraws or its session ends.
+        """
+        if isinstance(namespace_suffix, str):
+            suffix = (self._make_namespace_tuple(namespace_suffix)
+                      if namespace_suffix else ())
+        else:
+            suffix = tuple(namespace_suffix)
+        if not is_draft16_or_later(self.negotiated_draft):
+            raise MOQTException(
+                SessionCloseCode.INTERNAL_ERROR,
+                f"NAMESPACE_DONE is not defined by "
+                f"draft-{self.negotiated_draft}")
+        message = NamespaceDone(namespace_suffix=suffix)
+        logger.info(f"MOQT send: {message}")
+        if stream_id is not None:
+            self.send_stream_message(stream_id, message)
+        elif request_id is not None:
+            self._send_on_request_stream(request_id, message)
+        else:
+            raise ValueError(
+                "namespace_done() needs the SUBSCRIBE_NAMESPACE "
+                "request_id or stream_id")
         return message
 
     async def subscribe_tracks(
