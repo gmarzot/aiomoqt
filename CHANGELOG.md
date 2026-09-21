@@ -2,11 +2,39 @@
 
 ## Unreleased
 
+Pairs with aiopquic 0.4.1. moq-test conformance: 76/76 on d16 and d18,
+both transports.
+
 - Object timestamps use loc-04 TIMESTAMP (0x10, wall-clock µs) instead of
   the private 0x20; receivers still read 0x20. load_sim and sub_bench now
   measure latency against pub_media broadcasts.
 - `register_publish_done_handler()` and `close_on_last_publish_done` for
   sessions that outlive their subscriptions.
+- Fix: PUBLISH_OK and PUBLISH_ERROR resolve the sender's request. Before
+  d18 an awaited publish waited out its whole timeout on a reply that had
+  already arrived.
+- Fix: PUBLISH_DONE ends a subscription, not the session; the default
+  FETCH handler rejects rather than promising objects it never sends.
+- Fix: a KVP delta type past 2^64-1 closes the session (§1.4.3).
+- `py.typed`, with the externally-callable surface annotated.
+- Package keywords and classifiers; `setuptools>=77` build floor, which
+  the PEP 639 licence form requires to build at all.
+- `AGENTS.md`: layout, test tiers, conventions and known traps.
+- README: the publish example was missing an `await` and could not run;
+  `recv_time_us` is named for the microseconds it carries.
+- examples: the unreachable subgroup-stream generator is gone and imports
+  are explicit.
+- Relay: SUBSCRIBE_NAMESPACE answered (d18 NAMESPACE, pre-d18 PUBLISH
+  fan-out); standalone and joining FETCH served from a bounded cache or
+  the publisher; Largest Location reported; datagrams forwarded as
+  datagrams; FORWARD omitted from PUBLISH_OK means 1 (§10.2.12); every
+  request gets a terminal reply.
+- Relay: a track that has ended is never handed to a new subscriber; a
+  publisher's PUBLISH_DONE ends the track it names; a PUBLISH nobody can
+  be offered is answered with Forward State 0 and raised with
+  REQUEST_UPDATE once a subscriber arrives.
+- CI: conformance scored against moxygen's moq-test suite per draft, with
+  the full run retained so a score can be audited afterwards.
 
 ## v0.11.0
 
