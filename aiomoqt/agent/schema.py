@@ -144,6 +144,45 @@ def _flat_name(parent: str, child: str, taken: Dict[str, Any]) -> str:
     return f"{parent}_{child}" if child in taken else child
 
 
+def check_flatten(cls: type,
+                  flatten: Optional[Dict[str, Tuple[str, ...]]],
+                  where: str) -> Dict[str, Tuple[str, ...]]:
+    """Validate a flatten mapping against `cls`.
+
+    Shared by tool_schema and from_flat so the schema and the argument
+    reader cannot disagree about what a given flatten means.
+    """
+    if flatten is None:
+        return {}
+    if not isinstance(flatten, dict):
+        raise SpecError(f"{where}: flatten must be a mapping, got {flatten!r}")
+    hints = get_type_hints(cls, include_extras=True)
+    checked: Dict[str, Tuple[str, ...]] = {}
+    for parent, children in flatten.items():
+        if parent not in spec_keys(cls):
+            raise SpecError(f"{where}: {cls.__name__} has no field {parent!r}")
+        target = _non_none(hints.get(parent, Any))
+        if not is_dataclass(target):
+            raise SpecError(
+                f"{where}: {parent!r} is not a nested spec, so it cannot "
+                f"be flattened")
+        if not isinstance(children, (list, tuple)) or not children:
+            raise SpecError(
+                f"{where}: flatten[{parent!r}] must name at least one "
+                f"field, got {children!r}")
+        seen: List[str] = []
+        for child in children:
+            if child in seen:
+                raise SpecError(
+                    f"{where}: flatten[{parent!r}] names {child!r} twice")
+            if child not in spec_keys(target):
+                raise SpecError(
+                    f"{where}: {target.__name__} has no field {child!r}")
+            seen.append(child)
+        checked[parent] = tuple(children)
+    return checked
+
+
 def tool_schema(cls: type,
                 flatten: Optional[Dict[str, Tuple[str, ...]]] = None,
                 ) -> Dict[str, Any]:
@@ -153,25 +192,15 @@ def tool_schema(cls: type,
     a model supplies `namespace` rather than `{"track": {...}}`. A lifted
     name that collides is prefixed with its parent.
     """
-    if flatten is not None and not isinstance(flatten, dict):
-        raise SpecError(f"tool_schema: flatten must be a mapping, got {flatten!r}")
+    checked = check_flatten(cls, flatten, "tool_schema")
     nested = json_schema(cls)
     defs = nested.get("$defs", {})
     props = dict(nested.get("properties", {}))
     required = list(nested.get("required", []))
 
-    for parent, children in (flatten or {}).items():
-        if not isinstance(children, (list, tuple)) or not children:
-            raise SpecError(
-                f"tool_schema: flatten[{parent!r}] must name at least one "
-                f"field, got {children!r}")
-        node = props.pop(parent, None)
-        if node is None:
-            raise SpecError(f"tool_schema: {cls.__name__} has no field {parent!r}")
-        ref = node.get("$ref", "")
-        target = defs.get(ref.rsplit("/", 1)[-1])
-        if target is None:
-            raise SpecError(f"tool_schema: {parent!r} is not a nested spec")
+    for parent, children in checked.items():
+        node = props.pop(parent)
+        target = defs[node["$ref"].rsplit("/", 1)[-1]]
         parent_required = set(target.get("required", []))
         was_required = parent in required
         if was_required:
@@ -236,16 +265,9 @@ def from_flat(cls: type, args: Dict[str, Any],
     """
     if not isinstance(args, dict):
         raise SpecError(f"from_flat: expected an object, got {args!r}")
-    if flatten is not None and not isinstance(flatten, dict):
-        raise SpecError(f"from_flat: flatten must be a mapping, got {flatten!r}")
+    checked = check_flatten(cls, flatten, "from_flat")
     out = dict(args)
-    for parent, children in (flatten or {}).items():
-        if parent not in spec_keys(cls):
-            raise SpecError(f"from_flat: {cls.__name__} has no field {parent!r}")
-        if not isinstance(children, (list, tuple)) or not children:
-            raise SpecError(
-                f"from_flat: flatten[{parent!r}] must name at least one "
-                f"field, got {children!r}")
+    for parent, children in checked.items():
         collected: Dict[str, Any] = {}
         for child in children:
             for candidate in (child, f"{parent}_{child}"):

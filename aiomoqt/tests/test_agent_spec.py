@@ -240,6 +240,36 @@ def test_entry_points_raise_specerror_not_raw_exceptions(call):
         call()
 
 
+_FLATTENS = (
+    None,
+    {"track": ("namespace",)},
+    {"track": ("namespace", "name", "relay")},
+    {"track": ()},                          # names nothing
+    {"track": ("nope",)},                   # no such subfield
+    {"track": ("namespace", "namespace")},  # duplicate child
+    {"buffer": ("x",)},                     # not a nested spec
+    {"nope": ("a",)},                       # no such field
+)
+
+
+@pytest.mark.parametrize("flatten", _FLATTENS)
+def test_flatten_is_judged_identically_by_both_entry_points(flatten):
+    """tool_schema and from_flat share one checker, so they cannot drift.
+
+    An asymmetry here means a flatten that produces a tool schema whose
+    arguments the reader then refuses, or vice versa.
+    """
+    def verdict(call):
+        try:
+            call()
+            return "accepted"
+        except SpecError:
+            return "rejected"
+
+    assert (verdict(lambda: tool_schema(SubscribeSpec, flatten))
+            == verdict(lambda: from_flat(SubscribeSpec, {}, flatten)))
+
+
 def test_startat_constructors():
     assert StartAt.latest().mode == "latest"
     assert StartAt.next_group().mode == "next_group"
