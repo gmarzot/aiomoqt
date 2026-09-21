@@ -80,7 +80,7 @@ def parse_args():
                              'H.264 video and AAC audio, stamped from '
                              'the PES timestamps')
     parser.add_argument('--player-base', type=str,
-                        default='http://localhost:5173/simple/',
+                        default='http://localhost:5173/g5-player/',
                         metavar='URL',
                         help='Base of the player URL printed at start '
                              '(default: the moq-playa simple example)')
