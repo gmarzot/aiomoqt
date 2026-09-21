@@ -1055,7 +1055,12 @@ class SubscribedTrack(Track):
     async def subscribe(self, timeout: float = 30.0,
                         forward: int = 1,
                         subscribe_options: int = None,
-                        filter_type: FilterType = FilterType.LATEST_OBJECT):
+                        filter_type: FilterType = FilterType.LATEST_OBJECT,
+                        start_group: int = 0,
+                        start_object: int = 0,
+                        end_group: int = 0,
+                        priority: Optional[int] = None,
+                        group_order: Optional[GroupOrder] = None):
         """Subscribe to the track.
 
         Auto-routed on trackname presence:
@@ -1069,8 +1074,13 @@ class SubscribedTrack(Track):
             subscribe_options: d16 only — 0=PUBLISH, 1=NAMESPACE, 2=both
             filter_type: d14/d16 §9.7 — LATEST_OBJECT (live forward),
                 NEXT_GROUP_START (skip current group), ABSOLUTE_START,
-                ABSOLUTE_RANGE. ABSOLUTE_START/RANGE not currently
-                plumbed through (no Start Location parameter).
+                ABSOLUTE_RANGE.
+            start_group, start_object: Start Location for ABSOLUTE_START
+                and ABSOLUTE_RANGE. Ignored by the other filters.
+            end_group: end of an ABSOLUTE_RANGE.
+            priority: subscriber priority 0-255, lower = more urgent
+                (§7.1). None omits the parameter and takes the default.
+            group_order: delivery order across groups. None omits it.
         """
         if self.on_object:
             self.session.on_object_received = self.on_object
@@ -1084,6 +1094,11 @@ class SubscribedTrack(Track):
                 track_name=self.trackname,
                 forward=forward,
                 filter_type=filter_type,
+                start_group=start_group,
+                start_object=start_object,
+                end_group=end_group,
+                priority=priority,
+                group_order=group_order,
                 parameters=params,
                 wait_response=True,
             )
