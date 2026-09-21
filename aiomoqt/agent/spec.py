@@ -492,7 +492,9 @@ class SubscribeSpec:
     start_at: StartAt = field(default_factory=StartAt)
     priority: Priority = field(default_factory=Priority)
     forward: Annotated[bool, Doc(
-        "Ask the publisher to forward live objects")] = True
+        "Request live forwarding. false asks the publisher not to forward "
+        "live objects; it does NOT turn this into a FETCH — use FetchSpec "
+        "for a finite range")] = True
     buffer: Annotated[int, Range(1, 65536), Doc(
         "Reader ring depth in objects")] = DEFAULT_BUFFER
     on_full: Annotated[str, Choices(*ON_FULL), Doc(
@@ -512,6 +514,47 @@ class SubscribeSpec:
     @classmethod
     def from_dict(cls, d: Dict[str, Any], *,
                   lenient: bool = False) -> "SubscribeSpec":
+        return from_dict(cls, d, lenient=lenient)
+
+
+@dataclass
+class FetchSpec:
+    """A finite FETCH over a bounded, immutable range.
+
+    Distinct from SubscribeSpec because the operations differ in kind: a
+    subscription is open-ended and a fetch completes. `forward: false` on
+    a subscription is a wire-level control, not a way to spell this.
+    """
+    track: TrackRef
+    start_at: Annotated[StartAt, Doc(
+        "The range to fetch. Must use mode 'range' — a fetch is bounded")]
+    priority: Priority = field(default_factory=Priority)
+    decode: Annotated[str, Choices(*DECODES), Doc(
+        "How object payloads are surfaced")] = "bytes"
+    timeout_s: Annotated[float, Range(0, None), Doc(
+        "Deadline for the whole fetch")] = DEFAULT_TIMEOUT_S
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+    @staticmethod
+    def schema_constraints() -> Dict[str, Any]:
+        """Publish the bounded-range rule enforced in __post_init__."""
+        return {"allOf": [{"properties": {
+            "start_at": {"properties": {"mode": {"const": "range"}},
+                         "required": ["mode", "group", "end_group"]}}}]}
+
+    def __post_init__(self) -> None:
+        check_instance(self)
+        if self.start_at.mode != "range":
+            raise SpecError(
+                f"FetchSpec: start_at.mode must be 'range', got "
+                f"{self.start_at.mode!r} — a fetch covers a bounded range")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return to_dict(self)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any], *,
+                  lenient: bool = False) -> "FetchSpec":
         return from_dict(cls, d, lenient=lenient)
 
 

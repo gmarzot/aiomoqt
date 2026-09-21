@@ -9,7 +9,7 @@ library actually accepts.
 import pytest
 
 from aiomoqt.agent import (
-    MAPPINGS, ON_FULL, Priority, PublishSpec, SpecError, StartAt,
+    MAPPINGS, ON_FULL, FetchSpec, Priority, PublishSpec, SpecError, StartAt,
     SubscribeSpec, TrackRef,
 )
 from aiomoqt.agent.schema import (
@@ -18,8 +18,11 @@ from aiomoqt.agent.schema import (
 
 jsonschema = pytest.importorskip("jsonschema")
 
-SPECS = (TrackRef, StartAt, Priority, SubscribeSpec, PublishSpec)
+SPECS = (TrackRef, StartAt, Priority, SubscribeSpec, PublishSpec, FetchSpec)
 FLAT = {"track": ("namespace", "name", "relay")}
+_RANGE = {"mode": "range", "group": 100, "end_group": 200}
+_FETCH = {"track": {"namespace": "audit/s7", "name": "decisions"},
+          "start_at": _RANGE}
 
 # (payload, accepted) — every entry must get the same verdict from the
 # emitted schema and from from_dict.
@@ -324,3 +327,54 @@ def test_agent_package_does_not_import_the_mcp_extra():
 
     import aiomoqt.agent  # noqa: F401
     assert not [m for m in sys.modules if m == "mcp" or m.startswith("mcp.")]
+
+
+# -- FetchSpec: a bounded operation, distinct from a subscription -----
+
+@pytest.mark.parametrize("start_at,accepted", (
+    (_RANGE, True),
+    ({"mode": "latest"}, False),
+    ({"mode": "next_group"}, False),
+    ({"mode": "group", "group": 5}, False),
+    ({"mode": "range", "group": 5}, False),          # unbounded
+))
+def test_fetch_requires_a_bounded_range(start_at, accepted):
+    """A fetch completes, so its range must be bounded at both ends."""
+    payload = {"track": {"namespace": "a"}, "start_at": start_at}
+    schema_ok = jsonschema.validators.Draft202012Validator(
+        json_schema(FetchSpec)).is_valid(payload)
+    assert _accepts(FetchSpec, payload) is accepted
+    assert schema_ok is accepted
+
+
+def test_fetch_start_at_is_required():
+    assert json_schema(FetchSpec)["required"] == ["track", "start_at"]
+    with pytest.raises(SpecError, match="start_at"):
+        FetchSpec.from_dict({"track": {"namespace": "a"}})
+
+
+def test_fetch_constructor_enforces_the_range():
+    with pytest.raises(SpecError, match="bounded range"):
+        FetchSpec(track=TrackRef("a"), start_at=StartAt.latest())
+
+
+def test_fetch_round_trips():
+    spec = FetchSpec.from_dict(_FETCH)
+    assert FetchSpec.from_dict(spec.to_dict()).to_dict() == spec.to_dict()
+
+
+def test_fetch_flattens_like_the_others():
+    flat = tool_schema(FetchSpec, flatten=FLAT)
+    jsonschema.validators.Draft202012Validator.check_schema(flat)
+    args = {"namespace": "audit/s7", "name": "decisions", "start_at": _RANGE}
+    spec = FetchSpec.from_dict(from_flat(FetchSpec, args, flatten=FLAT))
+    assert spec.track == TrackRef("audit/s7", "decisions")
+
+
+def test_forward_false_is_not_a_fetch():
+    """The wire flag stays a wire flag; the schema says so explicitly."""
+    sub = SubscribeSpec.from_dict({"track": {"namespace": "a"},
+                                   "forward": False})
+    assert sub.forward is False
+    doc = json_schema(SubscribeSpec)["properties"]["forward"]["description"]
+    assert "does NOT turn this into a FETCH" in doc
