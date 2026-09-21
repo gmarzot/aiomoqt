@@ -19,7 +19,7 @@ be right:
 | Setting | Value | What it is for |
 |---|---|---|
 | catalog refresh | `--catalog-interval 1` | a viewer joining after the first waits for the next catalog object; at 10 that is 0–10 s of TTFF per tab (loopback 09-12: ~5 s at 10, ~1 s at 1) |
-| source asset | no B-frames | pub_media stamps decode order with no composition offsets, so B-frame sources judder. bbb-720p-2000k.mp4 and sintel-1280-demo.mp4 are fine; sintel-1280-surround.mp4 is bf=2 |
+| source asset | no B-frames | pub_media stamps decode order with no composition offsets, so B-frame sources judder. tos-*, tian-nature-*, bbb-720p-2000k.mp4 and sintel-1280-demo.mp4 are fine; sintel-1280-surround.mp4 is bf=2 |
 | start order | publisher, then viewer | pub_media sends nothing until a viewer subscribes; its `dropped` counter is the frames skipped until then |
 
 ## Before anything: paste this in every shell
@@ -53,8 +53,11 @@ and finds whichever run is publishing under it. Copy the publisher's
   and restart vite (the examples import the packages' dist).
 - SHELL: `python -m aiomoqt.tools.relay_probe --url https://moqx-main.ci.openmoq.org:4433/moq-relay --draft 18` → expect ✓
 - SHELL: `hostname -I` → WSL IP for the OBS SRT URL (changes across reboots)
-- Assets: `$ASSETS/` (bbb-720p-2000k.mp4, sintel-1280-demo.mp4,
-  sintel-1280-surround.mp4, bbb-1080p*.mp4, bbb-av1-60s.mp4).
+- Assets: `$ASSETS/` — tos-720p-2000k.mp4 (1280x534@24, 1.9 Mbps),
+  tos-1080p-4000k.mp4 (1920x800@24, 3.9 Mbps),
+  tian-nature-1080p-8000k.mp4 (1920x1080@30, 7.9 Mbps),
+  bbb-720p-2000k.mp4, sintel-1280-demo.mp4, sintel-1280-surround.mp4,
+  bbb-1080p*.mp4, bbb-av1-60s.mp4.
 
 ## Player URL parameters (/simple/)
 | Param | Meaning | Default |
@@ -74,15 +77,15 @@ engine. Overlay "cushion ms": MSE = buffered ahead of the playhead;
 WebCodecs = scheduled audio ahead, or the render cushion when video-only.
 
 ## Demo A — CMAF file → glass (MSE playback)
-- SHELL 1 (BBB 720p30, 2 s GOP):
-  `python -m aiomoqt.tools.pub_media "$RELAY_WT" --draft 18 -k --mp4 "$ASSETS"/bbb-720p-2000k.mp4 --packaging cmaf --loop --target-latency 500 --keepalive 10 --catalog-interval 1 -t 3600`
-  Sintel variant: same line with
-  `--mp4 "$ASSETS"/sintel-1280-demo.mp4` (same command, different asset)
+- SHELL 1 (Tears of Steel, 1280x534@24):
+  `python -m aiomoqt.tools.pub_media "$RELAY_WT" --draft 18 -k --pub-both --mp4 "$ASSETS"/tos-720p-2000k.mp4 --packaging cmaf --loop --target-latency 200 --keepalive 10 --catalog-interval 1 -t 3600`
+  Other assets: same line with `--mp4 "$ASSETS"/bbb-720p-2000k.mp4` or
+  `--mp4 "$ASSETS"/sintel-1280-demo.mp4`
   (24 fps on a 60 Hz display shows a mild 3:2 cadence on pans; inherent).
 - BROWSER: paste the `player:` URL the publisher printed. It already
   carries the relay, the namespace, `v=18`, `catalogBootstrap=subscribe`
   and the per-packaging knobs. Add `&debug=1` for the engine log.
-- Targets: cushion ≈ 500 ms and flat; latency P50 < 50 ms, jitter < 5 ms
+- Targets: cushion ≈ 200 ms and flat; latency P50 < 50 ms, jitter < 5 ms
   (wire numbers, 09-10: 37 / 3.3); stalls 0; gaps 0.
 - Levers: `--target-latency` on the publisher is what the catalog
   advertises and what the player's cushion target follows (seek landing
@@ -96,8 +99,11 @@ WebCodecs = scheduled audio ahead, or the render cushion when video-only.
   `[a–b][b+0.04–c]` ranges after the port would be a regression.
 
 ## Demo B — LOC file → glass (WebCodecs, A/V, joining fetch)
-- SHELL 1:
-  `python -m aiomoqt.tools.pub_media "$RELAY_WT" --draft 18 -k --mp4 "$ASSETS"/bbb-720p-2000k.mp4 --loop --target-latency 100 --keepalive 10 --catalog-interval 1 -t 3600`
+- SHELL 1 (TianNature, 1920x1080@30 at 7.9 Mbps — the highest-rate asset):
+  `python -m aiomoqt.tools.pub_media "$RELAY_WT" --draft 18 -k --pub-both --mp4 "$ASSETS"/tian-nature-1080p-8000k.mp4 --loop --target-latency 100 --keepalive 10 --catalog-interval 1 -t 3600`
+  If this breaks up where other assets do not, drop to
+  `--mp4 "$ASSETS"/tos-1080p-4000k.mp4` (same resolution class, half the
+  rate) to separate bitrate from everything else.
 - BROWSER: paste the `player:` URL the publisher printed. It already
   carries the relay, the namespace, `v=18`, `catalogBootstrap=subscribe`
   and `cushion=<--target-latency>`. Add `&debug=1` for the engine log.
@@ -154,7 +160,7 @@ arrival. Prefer `--ts`.
   ffmpeg is `-c copy`, so it costs nothing. A soft picture that no
   encoder setting improves was the canvas bug below — rebuild the player.
 - SHELL 1 (listener first, then start OBS streaming), A/V over TS:
-  `ffmpeg -hide_banner -loglevel warning -fflags nobuffer -analyzeduration 0 -probesize 32768 -i 'srt://0.0.0.0:9000?mode=listener&latency=20000' -map 0:v -map 0:a -c copy -f mpegts -pes_payload_size 0 -omit_video_pes_length 0 -muxdelay 0 -flush_packets 1 - | python -m aiomoqt.tools.pub_media "$RELAY_WT" --draft 18 -k --ts - --target-latency 200 --keepalive 10 --catalog-interval 1 -t 3600`
+  `ffmpeg -hide_banner -loglevel warning -fflags nobuffer -analyzeduration 0 -probesize 32768 -i 'srt://0.0.0.0:9000?mode=listener&latency=20000' -map 0:v -map 0:a -c copy -f mpegts -pes_payload_size 0 -omit_video_pes_length 0 -muxdelay 0 -flush_packets 1 - | python -m aiomoqt.tools.pub_media "$RELAY_WT" --draft 18 -k --pub-both --ts - --target-latency 200 --keepalive 10 --catalog-interval 1 -t 3600`
   pub_media waits for the PMT and both codec configs before connecting,
   then prints the namespace and a `player:` line — paste that URL.
   Video-only fallback: swap `-map 0:v -map 0:a -c copy -f mpegts` for
@@ -163,7 +169,7 @@ arrival. Prefer `--ts`.
 - No OBS at hand — synthetic A/V over the same TS path (`-pix_fmt
   yuv420p` is REQUIRED: lavfi testsrc is rgb24 and libx264 would pick
   High 4:4:4, which no browser decodes):
-  `ffmpeg -re -f lavfi -i testsrc=size=1280x720:rate=30 -f lavfi -i sine=frequency=440:sample_rate=48000 -vf "settb=1/1000000,setpts=RTCTIME,drawtext=text='%{eif\:mod(floor(t/60)\,60)\:d\:2}\:%{eif\:mod(floor(t)\,60)\:d\:2}.%{eif\:mod(floor(t*1000)\,1000)\:d\:3}':fontsize=64:fontcolor=white:box=1:boxcolor=black@0.8:boxborderw=12:x=40:y=40,settb=1/30,setpts=N" -c:v libx264 -preset veryfast -tune zerolatency -pix_fmt yuv420p -bf 0 -g 60 -c:a aac -f mpegts -pes_payload_size 0 -omit_video_pes_length 0 -muxdelay 0 -flush_packets 1 - | python -m aiomoqt.tools.pub_media "$RELAY_WT" --draft 18 -k --ts - --target-latency 200 --keepalive 10 --catalog-interval 1 -t 3600`
+  `ffmpeg -re -f lavfi -i testsrc=size=1280x720:rate=30 -f lavfi -i sine=frequency=440:sample_rate=48000 -vf "settb=1/1000000,setpts=RTCTIME,drawtext=text='%{eif\:mod(floor(t/60)\,60)\:d\:2}\:%{eif\:mod(floor(t)\,60)\:d\:2}.%{eif\:mod(floor(t*1000)\,1000)\:d\:3}':fontsize=64:fontcolor=white:box=1:boxcolor=black@0.8:boxborderw=12:x=40:y=40,settb=1/30,setpts=N" -c:v libx264 -preset veryfast -tune zerolatency -pix_fmt yuv420p -bf 0 -g 60 -c:a aac -f mpegts -pes_payload_size 0 -omit_video_pes_length 0 -muxdelay 0 -flush_packets 1 - | python -m aiomoqt.tools.pub_media "$RELAY_WT" --draft 18 -k --pub-both --ts - --target-latency 200 --keepalive 10 --catalog-interval 1 -t 3600`
 - BROWSER: the printed `player:` URL (`cushion=200`), then click in the
   page once: until a gesture the audio context stays suspended, audio does
   not play and A/V skew grows with runtime.
@@ -232,6 +238,16 @@ start; Eyevinn's moqlivemock endpoint is always on.
 
 ## Troubleshooting
 - "no such namespace" → publisher down / wrong -N / reused namespace. Blank page → vite down.
+- "no such namespace" that never resolves even with the publisher up →
+  missing `--pub-both`. A bare PUBLISH leaves no route back to an idling
+  publisher once the last subscriber leaves; every publish command here
+  carries it.
+- SRT listener writes zero bytes while the sender reports frames sent →
+  drop `-fflags nobuffer` from the listener. Reproducible with an
+  ffmpeg `ddagrab` source: `-flags low_delay` alone is fine and
+  `-analyzeduration 0 -probesize 32768` is fine, but `nobuffer` alone
+  yields an empty file. Not retested against an OBS source, which is why
+  the flag is still in the demo C command above.
 - Publisher dies ~30 s after start with `session closed: code=0
   reason='ConnectionTerminated'` and 0 objects sent → **keepalive off**
   (`--keepalive 0`, or aiomoqt before 0.11.0). While Forward State is 0
