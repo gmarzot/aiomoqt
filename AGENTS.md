@@ -130,8 +130,13 @@ subgroup writing, pacing and the TX budget; `SubscribedTrack` owns reassembly an
 
 ## Known traps
 
-- Default CC is `bbr1`, which spikes latency on paced flows. Use `--cc-algo cubic` (or
-  `newreno`) for clean timing measurements.
+- Default CC is `bbr1`, which spikes latency on paced flows (BBRv1 ProbeRTT, ~200 ms every
+  10 s under CPU jitter). `--cc-algo` also takes `bbr` (v3), `cubic`, `newreno`, `dcubic`,
+  `prague` (L4S/ECN) and `fast`. `bbr` is the likely future default and what moqx runs, but
+  picoquic's v3 freezes cwnd below 128 µs RTT (upstream #2118) — that is loopback, so it is
+  the one place not to use it. For clean timing measurements on loopback use `cubic` or
+  `newreno`; loss-based CCs do collapse on the GIL-induced loss blips of a loaded host, so
+  prefer them for timing, not for throughput.
 - WebTransport datagram TX needs `aiopquic >= 0.4.1`. Against 0.4.0 — what PyPI serves, and
   what this tree floors to until 0.4.1 ships — `StreamMapping.DATAGRAM` fails over
   WebTransport; use `PER_GROUP`. Datagram RX works on both transports either way.
