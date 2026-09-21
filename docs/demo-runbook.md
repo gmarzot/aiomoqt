@@ -65,11 +65,20 @@ so it cannot share a shell with anything below it.
   `python -m aiomoqt.tools.relay_probe --url "$RELAY_WT" --draft 18` → expect ✓
 - SHELL 2: `hostname -I` → WSL IP for the OBS SRT URL (changes across
   reboots). Only demo C needs it.
-- Assets: `$ASSETS/` — tos-720p-2000k.mp4 (1280x534@24, 1.9 Mbps),
-  tos-1080p-4000k.mp4 (1920x800@24, 3.9 Mbps),
-  tian-nature-1080p-8000k.mp4 (1920x1080@30, 7.9 Mbps),
-  bbb-720p-2000k.mp4, sintel-1280-demo.mp4, sintel-1280-surround.mp4,
-  bbb-1080p*.mp4, bbb-av1-60s.mp4.
+- Assets in `$ASSETS/`, all H.264 High / yuv420p / bf=0 with AAC stereo:
+
+  | asset | shape | rate | used by |
+  |---|---|---|---|
+  | bbb-1080p-2500k.mp4 | 1920x1080@30 | 2.3 Mbps | demo A |
+  | tos-1080p-4000k.mp4 | 1920x800@24 | 3.9 Mbps | demo A, 2nd |
+  | tian-nature-1080p-8000k.mp4 | 1920x1080@30 | 7.9 Mbps | demo B |
+  | tos-720p-2000k.mp4 | 1280x534@24 | 1.9 Mbps | demo B, 2nd |
+  | bbb-720p-2000k.mp4 | 1280x720@30 | 1.7 Mbps | spare |
+  | bbb-av1-60s.mp4 | AV1 | | AV1 path |
+
+  **Not usable**: `bbb-1080p.mp4` and `bbb_sunflower_1080p_30fps_normal.mp4`
+  are bf=2, as is `sintel-1280-surround.mp4`. The names are close to the
+  safe ones — check `has_b_frames` before substituting.
 
 ## Player URL parameters (/simple/)
 | Param | Meaning | Default |
@@ -89,11 +98,12 @@ engine. Overlay "cushion ms": MSE = buffered ahead of the playhead;
 WebCodecs = scheduled audio ahead, or the render cushion when video-only.
 
 ## Demo A — CMAF file → glass (MSE playback)
-- SHELL 1 (Tears of Steel, 1280x534@24):
-  `python -m aiomoqt.tools.pub_media "$RELAY_WT" --draft 18 -k --pub-both --mp4 "$ASSETS"/tos-720p-2000k.mp4 --packaging cmaf --loop --target-latency 200 --keepalive 10 --catalog-interval 1 -t 3600`
-  Other assets: same line with `--mp4 "$ASSETS"/bbb-720p-2000k.mp4` or
-  `--mp4 "$ASSETS"/sintel-1280-demo.mp4`
-  (24 fps on a 60 Hz display shows a mild 3:2 cadence on pans; inherent).
+- SHELL 1 — Big Buck Bunny, 1920x1080@30, 2.3 Mbps:
+  `python -m aiomoqt.tools.pub_media "$RELAY_WT" --draft 18 -k --pub-both --mp4 "$ASSETS"/bbb-1080p-2500k.mp4 --packaging cmaf --loop --target-latency 200 --keepalive 10 --catalog-interval 1 -t 3600`
+- Second input — Tears of Steel, 1920x800@24, 3.9 Mbps: same line with
+  `--mp4 "$ASSETS"/tos-1080p-4000k.mp4`. Different frame rate and aspect
+  as well as different content (24 fps on a 60 Hz display shows a mild
+  3:2 cadence on pans; inherent, not a fault).
 - BROWSER: paste the `player:` URL the publisher printed. It already
   carries the relay, the namespace, `v=18`, `catalogBootstrap=subscribe`
   and the per-packaging knobs. Add `&debug=1` for the engine log.
@@ -111,11 +121,12 @@ WebCodecs = scheduled audio ahead, or the render cushion when video-only.
   `[a–b][b+0.04–c]` ranges after the port would be a regression.
 
 ## Demo B — LOC file → glass (WebCodecs, A/V, joining fetch)
-- SHELL 1 (TianNature, 1920x1080@30 at 7.9 Mbps — the highest-rate asset):
+- SHELL 1 — TianNature, 1920x1080@30, 7.9 Mbps, the highest-rate asset:
   `python -m aiomoqt.tools.pub_media "$RELAY_WT" --draft 18 -k --pub-both --mp4 "$ASSETS"/tian-nature-1080p-8000k.mp4 --loop --target-latency 100 --keepalive 10 --catalog-interval 1 -t 3600`
-  If this breaks up where other assets do not, drop to
-  `--mp4 "$ASSETS"/tos-1080p-4000k.mp4` (same resolution class, half the
-  rate) to separate bitrate from everything else.
+- Second input — Tears of Steel, 1280x534@24, 1.9 Mbps: same line with
+  `--mp4 "$ASSETS"/tos-720p-2000k.mp4`. Four times less bitrate, so if
+  the 8 Mbps run breaks up and this one does not, the problem is rate
+  and not the path.
 - BROWSER: paste the `player:` URL the publisher printed. It already
   carries the relay, the namespace, `v=18`, `catalogBootstrap=subscribe`
   and `cushion=<--target-latency>`. Add `&debug=1` for the engine log.
