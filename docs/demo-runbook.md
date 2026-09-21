@@ -41,9 +41,11 @@ The random half sits under a fixed `aiomoqt` prefix on purpose: a
 subscriber given that prefix finds the run by namespace discovery
 (§9.4) without being told which one it is.
 
-The only step that needs the namespace typed anywhere is a second tool
-pointed at a running broadcast (a wire check, or the audience in the
-benchmarking runbook). Copy it from the publisher's `namespace:` line.
+A second tool pointed at a running broadcast — a wire check, or the
+audience in the benchmarking runbook — does not need the namespace
+typed either: `sub_media -N aiomoqt --discover` treats `-N` as a prefix
+and finds whichever run is publishing under it. Copy the publisher's
+`namespace:` line only when pinning a specific one.
 
 ## Prep (once)
 - SHELL: `cd "$PLAYA" && pnpm build && pnpm --filter @moqt/examples dev`
@@ -223,7 +225,9 @@ start; Eyevinn's moqlivemock endpoint is always on.
   audioUnderruns, avSkewMs, stallDurationMs, gapCount).
 - `debug=1`: `[video] waiting/seeking/ratechange …` lines with
   `t= rs= rate= buffered=` sit next to the stall lines for correlation.
-- Wire: `python -m aiomoqt.tools.sub_media <RELAY> -N <ns> --draft 18 --inspect 5 --show-catalog`
+- Wire: `python -m aiomoqt.tools.sub_media "$RELAY_WT" -N aiomoqt --discover --draft 18 --inspect 5 --show-catalog`
+  (`--discover` treats `-N` as a prefix and finds the run's
+  `aiomoqt/demo-<rand4>`, so nothing is typed or pasted)
   (ts_skew_ms = wire latency). QUIC: `AIOPQUIC_QLOG_DIR=/tmp/qlog` on the publisher.
 
 ## Troubleshooting

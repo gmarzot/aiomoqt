@@ -43,6 +43,12 @@ def parse_args():
         'files)', epilog=__doc__)
     _cli.add_endpoint(parser)
     _cli.add_identity(parser, namespace='demo/live')
+    parser.add_argument('--discover', action='store_true',
+                        help='Treat -N as a namespace prefix and find the '
+                             'broadcast published under it (d18). Lets a '
+                             'subscriber attach to a per-run namespace '
+                             'like aiomoqt/demo-<rand4> without being told '
+                             'which one.')
     parser.add_argument('--out', type=str, default='./media-out',
                         help='Output directory (default: ./media-out)')
     parser.add_argument('--pipe', choices=('video', 'audio'), default=None,
@@ -214,7 +220,7 @@ async def run(args):
     async with client.connect() as session:
         await session.client_session_init()
         sub = MediaSubscriber(
-            session, args.namespace,
+            session, args.namespace, discover=args.discover,
             on_catalog=((lambda c: _status(c.to_json(indent=2)))
                         if args.show_catalog else None))
         writers = _Writers(args.out, sub, pipe_role=args.pipe,
