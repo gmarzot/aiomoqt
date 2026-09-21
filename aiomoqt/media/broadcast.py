@@ -262,8 +262,12 @@ class MediaSubscriber:
                 self.session.register_object_handler(
                     alias, self._on_catalog_object)
         except Exception as e:
-            logger.info(f"MediaSubscriber: catalog join failed ({e}); "
-                        f"falling back to plain subscribe")
+            logger.warning(
+                f"MediaSubscriber: catalog joining FETCH refused ({e}); "
+                f"falling back to plain subscribe. msf-01 §5 requires the "
+                f"fetch, and without it only a catalog still being "
+                f"republished will arrive — a late joiner to a settled "
+                f"broadcast gets nothing")
             self._catalog_sub = SubscribedTrack(
                 self.session, self.namespace, CATALOG_TRACK_NAME,
                 on_object=self._on_catalog_object)
