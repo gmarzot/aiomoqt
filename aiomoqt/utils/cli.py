@@ -123,9 +123,11 @@ def resolve_listener(args):
 
 # -- identity --------------------------------------------------------
 
-def add_identity(p, namespace='aiomoqt', trackname=None):
+def add_identity(p, namespace='aiomoqt', trackname=None,
+                 namespace_help=None):
     p.add_argument('-N', '--namespace', type=str, default=namespace,
-                   help=f'MoQT namespace (default: {namespace})')
+                   help=namespace_help
+                   or f'MoQT namespace (default: {namespace})')
     p.add_argument('-T', '--trackname', type=str, default=trackname,
                    help='MoQT track name'
                         + (f' (default: {trackname})' if trackname

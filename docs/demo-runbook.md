@@ -30,10 +30,16 @@ export ASSETS=$HOME/Projects/moq/media-assets
 export PLAYA=$HOME/Projects/moq/moq-playa-v059
 ```
 
-That is the whole setup. **No namespace has to be handled by hand**: each
-publisher mints its own with `demo/$(date +%H%M%S)` and prints both the
+That is the whole setup. **No namespace has to be handled by hand**:
+`pub_media` mints `aiomoqt/demo-<rand4>` itself and prints both the
 namespace and a ready-to-paste player URL. A fresh namespace per run
-matters because a reused one leaves stale objects in moxygen's cache.
+matters because a reused one leaves stale objects in moxygen's cache,
+and a clock-derived one still collides between two demos started in the
+same second. Pass `-N` only to pin a namespace deliberately.
+
+The random half sits under a fixed `aiomoqt` prefix on purpose: a
+subscriber given that prefix finds the run by namespace discovery
+(§9.4) without being told which one it is.
 
 The only step that needs the namespace typed anywhere is a second tool
 pointed at a running broadcast (a wire check, or the audience in the
@@ -67,7 +73,7 @@ WebCodecs = scheduled audio ahead, or the render cushion when video-only.
 
 ## Demo A — CMAF file → glass (MSE playback)
 - SHELL 1 (BBB 720p30, 2 s GOP):
-  `python -m aiomoqt.tools.pub_media "$RELAY_WT" --draft 18 -k -N demo/$(date +%H%M%S) --mp4 "$ASSETS"/bbb-720p-2000k.mp4 --packaging cmaf --loop --target-latency 500 --keepalive 10 --catalog-interval 1 -t 3600`
+  `python -m aiomoqt.tools.pub_media "$RELAY_WT" --draft 18 -k --mp4 "$ASSETS"/bbb-720p-2000k.mp4 --packaging cmaf --loop --target-latency 500 --keepalive 10 --catalog-interval 1 -t 3600`
   Sintel variant: same line with
   `--mp4 "$ASSETS"/sintel-1280-demo.mp4` (same command, different asset)
   (24 fps on a 60 Hz display shows a mild 3:2 cadence on pans; inherent).
@@ -89,7 +95,7 @@ WebCodecs = scheduled audio ahead, or the render cushion when video-only.
 
 ## Demo B — LOC file → glass (WebCodecs, A/V, joining fetch)
 - SHELL 1:
-  `python -m aiomoqt.tools.pub_media "$RELAY_WT" --draft 18 -k -N demo/$(date +%H%M%S) --mp4 "$ASSETS"/bbb-720p-2000k.mp4 --loop --target-latency 100 --keepalive 10 --catalog-interval 1 -t 3600`
+  `python -m aiomoqt.tools.pub_media "$RELAY_WT" --draft 18 -k --mp4 "$ASSETS"/bbb-720p-2000k.mp4 --loop --target-latency 100 --keepalive 10 --catalog-interval 1 -t 3600`
 - BROWSER: paste the `player:` URL the publisher printed. It already
   carries the relay, the namespace, `v=18`, `catalogBootstrap=subscribe`
   and `cushion=<--target-latency>`. Add `&debug=1` for the engine log.
@@ -146,7 +152,7 @@ arrival. Prefer `--ts`.
   ffmpeg is `-c copy`, so it costs nothing. A soft picture that no
   encoder setting improves was the canvas bug below — rebuild the player.
 - SHELL 1 (listener first, then start OBS streaming), A/V over TS:
-  `ffmpeg -hide_banner -loglevel warning -fflags nobuffer -analyzeduration 0 -probesize 32768 -i 'srt://0.0.0.0:9000?mode=listener&latency=20000' -map 0:v -map 0:a -c copy -f mpegts -pes_payload_size 0 -omit_video_pes_length 0 -muxdelay 0 -flush_packets 1 - | python -m aiomoqt.tools.pub_media "$RELAY_WT" --draft 18 -k -N demo/$(date +%H%M%S) --ts - --target-latency 200 --keepalive 10 --catalog-interval 1 -t 3600`
+  `ffmpeg -hide_banner -loglevel warning -fflags nobuffer -analyzeduration 0 -probesize 32768 -i 'srt://0.0.0.0:9000?mode=listener&latency=20000' -map 0:v -map 0:a -c copy -f mpegts -pes_payload_size 0 -omit_video_pes_length 0 -muxdelay 0 -flush_packets 1 - | python -m aiomoqt.tools.pub_media "$RELAY_WT" --draft 18 -k --ts - --target-latency 200 --keepalive 10 --catalog-interval 1 -t 3600`
   pub_media waits for the PMT and both codec configs before connecting,
   then prints the namespace and a `player:` line — paste that URL.
   Video-only fallback: swap `-map 0:v -map 0:a -c copy -f mpegts` for
@@ -155,7 +161,7 @@ arrival. Prefer `--ts`.
 - No OBS at hand — synthetic A/V over the same TS path (`-pix_fmt
   yuv420p` is REQUIRED: lavfi testsrc is rgb24 and libx264 would pick
   High 4:4:4, which no browser decodes):
-  `ffmpeg -re -f lavfi -i testsrc=size=1280x720:rate=30 -f lavfi -i sine=frequency=440:sample_rate=48000 -vf "settb=1/1000000,setpts=RTCTIME,drawtext=text='%{eif\:mod(floor(t/60)\,60)\:d\:2}\:%{eif\:mod(floor(t)\,60)\:d\:2}.%{eif\:mod(floor(t*1000)\,1000)\:d\:3}':fontsize=64:fontcolor=white:box=1:boxcolor=black@0.8:boxborderw=12:x=40:y=40,settb=1/30,setpts=N" -c:v libx264 -preset veryfast -tune zerolatency -pix_fmt yuv420p -bf 0 -g 60 -c:a aac -f mpegts -pes_payload_size 0 -omit_video_pes_length 0 -muxdelay 0 -flush_packets 1 - | python -m aiomoqt.tools.pub_media "$RELAY_WT" --draft 18 -k -N demo/$(date +%H%M%S) --ts - --target-latency 200 --keepalive 10 --catalog-interval 1 -t 3600`
+  `ffmpeg -re -f lavfi -i testsrc=size=1280x720:rate=30 -f lavfi -i sine=frequency=440:sample_rate=48000 -vf "settb=1/1000000,setpts=RTCTIME,drawtext=text='%{eif\:mod(floor(t/60)\,60)\:d\:2}\:%{eif\:mod(floor(t)\,60)\:d\:2}.%{eif\:mod(floor(t*1000)\,1000)\:d\:3}':fontsize=64:fontcolor=white:box=1:boxcolor=black@0.8:boxborderw=12:x=40:y=40,settb=1/30,setpts=N" -c:v libx264 -preset veryfast -tune zerolatency -pix_fmt yuv420p -bf 0 -g 60 -c:a aac -f mpegts -pes_payload_size 0 -omit_video_pes_length 0 -muxdelay 0 -flush_packets 1 - | python -m aiomoqt.tools.pub_media "$RELAY_WT" --draft 18 -k --ts - --target-latency 200 --keepalive 10 --catalog-interval 1 -t 3600`
 - BROWSER: the printed `player:` URL (`cushion=200`), then click in the
   page once: until a gesture the audio context stays suspended, audio does
   not play and A/V skew grows with runtime.
