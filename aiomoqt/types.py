@@ -137,8 +137,10 @@ def normalize_supported_drafts(supported_drafts) -> list:
     order ALPN / CLIENT_SETUP / WT-Available-Protocols offer versions in.
     """
     if supported_drafts is None:
-        # auto: every supported draft, newest first
-        return sorted((v & 0xff for v in MOQT_VERSIONS), reverse=True)
+        # auto: every draft we can speak, newest first. MOQTDraft, not
+        # MOQT_VERSIONS — the latter is only the d14 in-band CLIENT_SETUP
+        # list and omits the out-of-band d16+ drafts.
+        return sorted((int(d) for d in MOQTDraft), reverse=True)
     if isinstance(supported_drafts, int):
         supported_drafts = [supported_drafts]
     drafts = []
@@ -311,7 +313,7 @@ class SetupParamType(IntEnum):
     """Setup Parameter type constants"""
     PATH = 0x01  # only relevant to raw QUIC connection
     MAX_REQUEST_ID = 0x02
-    AUTH_TOKEN = 0x03 
+    AUTH_TOKEN = 0x03
     MAX_AUTH_TOKEN_CACHE_SIZE = 0x04
     AUTHORITY = 0x05
     IMPLEMENTATION = 0x07  # Wrong in draft 14, draft-15 fixed it to this value
@@ -346,7 +348,7 @@ class ContentExistsCode(IntEnum):
     """Content Exists Code"""
     NO_CONTENT = 0x0
     EXISTS = 0x01
-    
+
 class AuthTokenAliasType(IntEnum):
     """Authorization Token Alias Types (Section 9.2.1.1)."""
     DELETE = 0x0      # Alias only — retire the alias and its token

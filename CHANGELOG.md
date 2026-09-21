@@ -5,6 +5,10 @@
 Pairs with aiopquic 0.4.1. moq-test conformance: 76/76 on d16 and d18,
 both transports.
 
+- The default draft offer is now `[18, 16, 14]`, so an unpinned client or
+  server negotiates d18 where the peer supports it. It was `[16, 14]`:
+  derived from the d14 in-band list, which has no d18. Pin
+  `supported_drafts` to keep a session off d18.
 - Object timestamps use loc-04 TIMESTAMP (0x10, wall-clock µs) instead of
   the private 0x20; receivers still read 0x20. load_sim and sub_bench now
   measure latency against pub_media broadcasts.
