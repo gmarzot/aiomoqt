@@ -148,19 +148,96 @@ def test_trackref_parse_rejects(text):
     lambda: StartAt.range(9, 2),                    # inverted bounds
     lambda: StartAt(mode="latest", group=3),        # unused field set
     lambda: StartAt(mode="next_group", object=0),
+    lambda: StartAt(mode="sideways"),               # not a mode
 ))
 def test_startat_invariants(build):
     with pytest.raises(SpecError):
         build()
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "Choices is enforced in from_dict, not in __post_init__, so direct "
-    "construction accepts an invalid enum and then serializes to JSON the "
-    "published schema rejects"))
-def test_direct_construction_validates_enums():
+# -- the published contract ------------------------------------------
+# schema-valid implies parser-accepts. The parser additionally tolerates
+# listed string forms a model may emit; the schema does not bless those.
+
+_START_SHAPES = tuple(
+    {"mode": mode, **extra}
+    for mode in ("latest", "next_group", "group", "range", "sideways")
+    for extra in ({}, {"group": 1}, {"group": 1, "end_group": 9},
+                  {"object": 0}, {"group": 1, "object": 2}))
+
+
+@pytest.mark.parametrize("start_at", _START_SHAPES)
+def test_schema_valid_implies_parser_accepts(start_at):
+    """Conditional StartAt rules must be published, not just enforced."""
+    payload = {"track": {"namespace": "a"}, "start_at": start_at}
+    schema_ok = jsonschema.validators.Draft202012Validator(
+        json_schema(SubscribeSpec)).is_valid(payload)
+    if schema_ok:
+        assert _accepts(SubscribeSpec, payload), (
+            "the published schema accepts what from_dict rejects")
+
+
+@pytest.mark.parametrize("payload", (
+    {"track": None},
+    {"track": []},
+    {"track": {"namespace": "a"}, "start_at": []},
+    {"track": {"namespace": "a"}, "priority": "urgent"},
+))
+def test_nested_values_must_be_objects(payload):
     with pytest.raises(SpecError):
-        StartAt(mode="sideways")
+        SubscribeSpec.from_dict(payload)
+
+
+def test_non_string_keys_rejected():
+    with pytest.raises(SpecError, match="must be strings"):
+        SubscribeSpec.from_dict({1: 2})
+
+
+def test_integer_valued_float_accepted():
+    """JSON has one number type; 512.0 is an integer, 512.5 is not."""
+    payload = {"track": {"namespace": "a"}, "buffer": 512.0}
+    assert SubscribeSpec.from_dict(payload).buffer == 512
+    with pytest.raises(SpecError):
+        SubscribeSpec.from_dict({"track": {"namespace": "a"},
+                                 "buffer": 512.5})
+
+
+@pytest.mark.parametrize("build", (
+    lambda: SubscribeSpec(track=TrackRef("a"), buffer="512"),
+    lambda: SubscribeSpec(track=TrackRef("a"), on_full="explode"),
+    lambda: SubscribeSpec(track=TrackRef("a"), priority=Priority(subscriber=999)),
+    lambda: SubscribeSpec(track="a"),
+    lambda: Priority(subscriber="0"),
+))
+def test_constructor_enforces_the_contract(build):
+    """Coercion is a JSON concession; the Python constructor is strict."""
+    with pytest.raises(SpecError):
+        build()
+
+
+def test_extra_may_not_shadow_a_declared_field():
+    with pytest.raises(SpecError, match="shadow"):
+        SubscribeSpec(track=TrackRef("a"), extra={"buffer": 0})
+
+
+@pytest.mark.parametrize("cls", (TrackRef, StartAt, Priority))
+def test_lenient_on_specs_without_an_extra_bucket(cls):
+    """These carry no `extra`; lenient drops unknowns instead of raising."""
+    payload = {"namespace": "a"} if cls is TrackRef else {}
+    assert cls.from_dict({**payload, "future_key": 1}, lenient=True)
+
+
+@pytest.mark.parametrize("call", (
+    lambda: tool_schema(SubscribeSpec, {"track": None}),
+    lambda: tool_schema(SubscribeSpec, {"track": ()}),
+    lambda: tool_schema(SubscribeSpec, "nonsense"),
+    lambda: from_flat(SubscribeSpec, None, {"track": ("namespace",)}),
+    lambda: from_flat(SubscribeSpec, {}, {"nope": ()}),
+    lambda: from_flat(SubscribeSpec, {}, {"nope": ("a",)}),
+))
+def test_entry_points_raise_specerror_not_raw_exceptions(call):
+    with pytest.raises(SpecError):
+        call()
 
 
 def test_startat_constructors():
