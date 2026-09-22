@@ -226,8 +226,27 @@ start; Eyevinn's moqlivemock endpoint is always on.
   `mlm/cmsf/{clear,drm-cbcs,eccp-cbcs}`, `moq-test/interop`.
 - Expect 13 tracks (AVC/HEVC/AV1 × 400/600/900 kbps, AAC + Opus),
   `ts_skew_ms` in the tens of ms (the loc-04 0x10 timestamp path),
-  `extra_props=[]`, and playable `video.h264` + `video.ivf` written.
-  Verified 2026-09-21.
+  `extra_props=[]`. Verified 2026-09-21.
+- **The verdict is the per-track frame table the tool prints**, not the
+  files. ~440 video and ~800 audio frames per track over 12 s, with no
+  track at 0, means every one of the 13 arrived and decoded.
+- Checking what came over:
+
+  ```
+  ffprobe -v error -show_entries stream=codec_name,width,height -of csv=p=0 media-out/video.ivf
+  ffmpeg -v error -i media-out/video.ivf -f null -
+  ffplay -autoexit media-out/video.ivf
+  ```
+
+  Silence from the `ffmpeg … -f null -` line means a clean decode; it is
+  the better check here because it needs no display.
+- **`video.h264` will throw decode errors on this source, and that is
+  the tool, not the wire.** `sub_media` opens one `video.h264` for every
+  non-AV1 video track, so all six AVC and HEVC tracks land in one file
+  interleaved — `PPS changed between slices`, `Could not find ref with
+  POC 1`. `-T` does not narrow a catalog-driven broadcast. `video.ivf`
+  survives because IVF frames its samples. On a single-video-track
+  broadcast (demos A and B) both files are clean.
 - Reverse direction unavailable: the pinned `mlmsub` is a d16-era build
   and dies on ALPN at draft 18; no Go toolchain here to build a current
   one. They also host a warp-player and an MSF/CMSF validator.
