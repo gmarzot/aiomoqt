@@ -41,6 +41,22 @@ def test_default_handler_answers_request_error_on_the_request_stream():
     assert s._fins == [9]                # terminal: FIN follows (§10.14)
 
 
+def test_default_fetch_handler_rejects_instead_of_accepting():
+    """§10.13: FETCH_OK obliges the publisher to open the fetch data
+    stream. A session with no fetch semantics must reject, not accept
+    and leave the peer waiting for objects."""
+    from aiomoqt.messages.fetch import Fetch
+    s = _session(18)
+    msg = Fetch(fetch_type=1, request_id=5, namespace=(b"ns",),
+                track_name=b"t")
+    asyncio.run(s._handle_fetch(msg))
+    assert len(s._writes) == 1
+    sid, raw = s._writes[0]
+    assert sid == 9
+    assert _reply_type(raw, s._profile) == 0x05  # REQUEST_ERROR
+    assert s._fins == [9]
+
+
 def test_default_request_update_handler_answers():
     """§10.9: REQUEST_UPDATE must get exactly one OK or ERROR — the
     bare session answers NOT_SUPPORTED on the request stream."""
@@ -59,6 +75,7 @@ def test_relay_answers_ok_for_served_track_and_error_for_unknown():
     from aiomoqt.tools import moq_interop_relay as relay
 
     class _Track:
+        finished = False
         pending_publish = ("sess", "msg")
         upstream = type("U", (), {"_largest": (7, 42)})()
 

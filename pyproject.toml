@@ -1,16 +1,40 @@
 [project]
 name = "aiomoqt"
 dynamic = ["version"]
-description = "Python asyncio implementation of the MoQT protocol"
+description = "Media over QUIC (MoQT) for Python: general-purpose asyncio library for media, agentic and other non-media workflows, with utilities and examples"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
 authors = [
     { name = "Giovanni Marzot", email = "gmarzot@marzresearch.net" }
 ]
+keywords = [
+    "moq", "moqt", "media-over-quic", "quic", "webtransport",
+    "streaming", "live-streaming", "low-latency", "sub-second-latency",
+    "video", "audio", "cmaf", "loc", "relay", "pubsub",
+    "asyncio", "ietf", "moq-transport",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Telecommunications Industry",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Internet",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Multimedia :: Sound/Audio",
+    "Topic :: System :: Networking",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
 dependencies = [
     "certifi",
-    "aiopquic>=0.4.0",
+    "aiopquic>=0.4.1",
     "sortedcontainers>=2.4.0",
 ]
 
@@ -53,7 +77,7 @@ select = ["E", "F", "W"]
 ignore = ["E501"]  # line length handled by formatter
 
 [build-system]
-requires = ["setuptools>=45", "setuptools_scm[toml]>=6.2"]
+requires = ["setuptools>=77", "setuptools_scm[toml]>=6.2"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
@@ -61,6 +85,7 @@ include = ["aiomoqt*"]
 exclude = ["aiomoqt.tests*"]
 
 [tool.setuptools.package-data]
+"aiomoqt" = ["py.typed"]
 "aiomoqt.tools" = ["scenarios/*.json"]
 
 [tool.setuptools_scm]

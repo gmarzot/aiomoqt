@@ -97,13 +97,11 @@ async def test_non_intersecting_alpn_fails():
 
 
 @pytest.mark.asyncio
-async def test_wt_default_server_and_client_settle_d16():
-    """Unpinned WT server + unpinned WT client both default to the STABLE
-    set (16, 14) — d18 is beta and opt-in, so an auto session settles on
-    d16, NOT d18. The default WT client offers moqt-16; the server, lacking
-    in-band WT selection, defaults to max(supported_drafts) = 16. Guards
-    that a no-args session never negotiates onto the beta d18 wire (d18
-    requires an explicit supported_drafts=18 / supported_drafts opt-in).
+async def test_wt_default_server_and_client_settle_d18():
+    """Unpinned WT server + unpinned WT client both default to every draft
+    we speak (18, 16, 14), so an auto session settles on d18. The default
+    WT client offers moqt-18; the server, lacking in-band WT selection,
+    defaults to max(supported_drafts) = 18.
     """
     port = _BASE_PORT + 60
     server = MOQTServer(
@@ -120,7 +118,7 @@ async def test_wt_default_server_and_client_settle_d16():
         async with client.connect() as session:
             await session.client_session_init()
             assert session._moqt_session_setup.result() is True
-            assert session.negotiated_draft == 16
+            assert session.negotiated_draft == 18
     finally:
         handle.close()
 

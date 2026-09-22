@@ -11,8 +11,9 @@ Deliberately absent, and staying absent:
 
   * NO authentication, authorization, or rate limiting
   * NO load handling, bounded queues, or production hardening
-  * NO group cache, so a late subscriber sees only what arrives next,
-    and joining FETCH is not served
+  * A bounded recent-object cache only (CACHE_GROUPS / CACHE_BYTES,
+    oldest dropped) — enough to answer a FETCH, standalone or joining,
+    over what it still holds; a late subscriber starts at the live edge
   * NO forward-state propagation (REQUEST_UPDATE Forward=0/1 upstream)
   * NO delivery-timeout enforcement
   * Namespace tables are in-memory and global to the process
@@ -45,6 +46,7 @@ table) for runners that expect distinct endpoints.
 
 import argparse
 import asyncio
+from collections import deque
 import logging
 import os
 import sys
@@ -57,6 +59,9 @@ from aiomoqt.types import (
     StreamResetCode, SubscribeDoneCode, SubscribeErrorCode, parse_draft_spec,
 )
 from aiomoqt.messages import SubgroupHeader
+from aiomoqt.messages.data import (FetchObject, ObjectDatagram,
+                                   ObjectDatagramStatus)
+from aiomoqt.messages.fetch import _is_joining
 from aiomoqt.messages.publish import PublishOk
 from aiomoqt.messages.request import RequestError, RequestOk
 from aiomoqt.track import SubscribedTrack
@@ -90,14 +95,42 @@ _tracks: dict[tuple, "_RelayedTrack"] = {}
 # ever a server, and the whole client leg — SETUP, SUBSCRIBE and object
 # receive as a client, upstream disconnect — goes untested.
 _upstreams: list = []
+# Upstream URLs the relay was asked to dial; an empty list means there is
+# nothing to wait for.
+_upstream_urls: list = []
+
+# Redial delay for a lost upstream. Short: a subscriber arriving while
+# the relay has no upstream is answered with an error, so the window
+# matters more than the reconnect cost.
+FETCH_RELATIVE_JOINING = 0x2
+UPSTREAM_REDIAL_S = 0.5
+# Longest a terminal waits for upstream streams the PUBLISH_DONE counts.
+TERMINAL_GRACE_S = 3.0
+# How long a SUBSCRIBE waits for an upstream to (re)appear before the
+# relay answers "track does not exist".
+UPSTREAM_WAIT_S = 3.0
+
+
+async def _await_upstream(timeout: float = None) -> bool:
+    """Wait for a dialled upstream to (re)connect."""
+    deadline = asyncio.get_running_loop().time() + (
+        UPSTREAM_WAIT_S if timeout is None else timeout)
+    while not _upstreams:
+        if asyncio.get_running_loop().time() >= deadline:
+            return False
+        await asyncio.sleep(0.05)
+    return True
 
 
 async def _dial_upstream(url: str, draft) -> None:
     """Hold a session open to an upstream origin for the process's life."""
+    _upstream_urls.append(url)
     ep = parse_relay_url(url)
+    # An upstream with no subscribers sends nothing, and an origin will
+    # close a silent connection on its idle timeout: PING keeps it.
     client = MOQTClient(ep.host, ep.port, path=ep.path,
                         use_quic=ep.use_quic, verify_tls=False,
-                        supported_drafts=draft)
+                        supported_drafts=draft, keep_alive_interval=10)
     while True:
         try:
             async with client.connect() as session:
@@ -112,8 +145,9 @@ async def _dial_upstream(url: str, draft) -> None:
                         _upstreams.remove(session)
         except Exception as e:
             logger.info(f"relay: upstream {url} unavailable: {e}")
-        logger.info(f"relay: retrying upstream {url} in 5s")
-        await asyncio.sleep(5)
+        logger.info(f"relay: retrying upstream {url} in "
+                    f"{UPSTREAM_REDIAL_S}s")
+        await asyncio.sleep(UPSTREAM_REDIAL_S)
 
 
 def _announced_match(ns: tuple) -> list[tuple]:
@@ -131,9 +165,16 @@ def _announced_match(ns: tuple) -> list[tuple]:
 
 
 def _track_live(track) -> bool:
-    """A track is usable while the session feeding it is still open —
-    either the publisher holding an unanswered PUBLISH, or the upstream
-    the subscription was made over."""
+    """A track is usable while it is still producing and the session
+    feeding it is still open.
+
+    Liveness is not session-scoped alone: a track ends while its session
+    stays open, and a peer's connection can linger for its whole idle
+    timeout after it is done. Acking a finished track to a new
+    subscriber delivers nothing.
+    """
+    if track.finished:
+        return False
     if track.pending_publish is not None:
         return _session_live(track.pending_publish[0])
     return _session_live(_upstream_session(track))
@@ -183,6 +224,11 @@ def _publishers_for(ns: tuple) -> list:
     return out
 
 
+# Recent-object cache bounds, per track: whichever is hit first.
+CACHE_GROUPS = 8
+CACHE_BYTES = 32 * 1024 * 1024
+
+
 class _RelayedTrack:
     """One upstream subscription fanned out to N downstream subscribers.
 
@@ -201,6 +247,9 @@ class _RelayedTrack:
         self.upstream = None
         # Flow B: the publisher's PUBLISH, held until someone subscribes.
         self.pending_publish = None   # (session, Publish msg)
+        # Answered with Forward State 0 because nobody could be offered
+        # the track yet; raised with REQUEST_UPDATE when one arrives.
+        self.parked = None            # (session, Publish msg)
         self.downstream = []          # list of (session, track_alias, request_id)
         self.queue = asyncio.Queue()
         self.task = None
@@ -209,9 +258,57 @@ class _RelayedTrack:
         # id(session) -> subgroup streams opened (PUBLISH_DONE count)
         self._sent_streams = {}
         self._finished = False
+        # Recent objects, oldest first, for standalone FETCH. Bounded by
+        # groups and bytes; a relay with no cache can serve no fetch at
+        # all, and an unbounded one is a leak.
+        self._cache = deque()
+        self._cache_bytes = 0
+        # Alias the upstream gave this track. A publisher may reuse one
+        # across successive subscriptions on a session it keeps open, so
+        # the registrations under it are released when the track ends.
+        self.upstream_alias = None
+        # Request id of the PUBLISH feeding this track, so its
+        # PUBLISH_DONE is matched to the right track on a session
+        # publishing more than one.
+        self.upstream_request_id = None
+        # Largest (group, object) forwarded: the Largest Location a
+        # SUBSCRIBE_OK reports, and what a joining FETCH anchors to.
+        self.largest = None
+        # request_id -> Largest reported when that subscriber joined.
+        self.joined_at = {}
+        # Upstream subgroup streams ended, against the Stream Count its
+        # PUBLISH_DONE reports: the terminal waits for the objects.
+        self._upstream_ended = 0
+        self._pending_done = None
+        self._done_timer = None
+        # Objects taken from upstream / written downstream, reported at
+        # the terminal: a subscriber short of objects is either a relay
+        # that never received them or one that never forwarded them.
+        self._objects_in = 0
+        self._objects_out = 0
+
+    @property
+    def finished(self) -> bool:
+        """True once the track has reached its terminal."""
+        return self._finished
+
+    def release_upstream(self) -> None:
+        """Drop this track's handlers on the upstream session, so a later
+        subscription reusing the alias is not answered by a dead track."""
+        session = _upstream_session(self)
+        if session is None or self.upstream_alias is None:
+            return
+        try:
+            session.unregister_object_handler(self.upstream_alias)
+            session.unregister_stream_end_handler(self.upstream_alias)
+        except Exception:
+            logger.debug("relay: releasing upstream handlers failed",
+                         exc_info=True)
+        self.upstream_alias = None
 
     def close(self) -> None:
         """Release the fan-out: stop the drain and forget its streams."""
+        self.release_upstream()
         if self.task is not None:
             self.task.cancel()
             self.task = None
@@ -243,6 +340,46 @@ class _RelayedTrack:
                 logger.debug("relay: finish failed for a subscriber",
                              exc_info=True)
 
+    def _enqueue_terminal(self, status, reason, key) -> None:
+        """Terminal behind everything already queued."""
+        if self._done_timer is not None:
+            self._done_timer.cancel()
+            self._done_timer = None
+        self._pending_done = None
+        self.queue.put_nowait((None, None, None, None, None, None,
+                               "DONE", (status, reason, key)))
+
+    def note_upstream_done(self, status, reason, key, stream_count) -> None:
+        """§10.11: PUBLISH_DONE follows every stream the publisher opened,
+        but those streams and the control message race each other on the
+        wire. Hold the terminal until this track has seen Stream Count
+        streams end, so a subscriber is not cut off mid-track."""
+        need = int(stream_count or 0)
+        if self._upstream_ended >= need:
+            self._enqueue_terminal(status, reason, key)
+            return
+        self._pending_done = (status, reason, key, need)
+        logger.info(f"relay: PUBLISH_DONE {key} held for "
+                    f"{need - self._upstream_ended} more stream(s)")
+        loop = asyncio.get_running_loop()
+        self._done_timer = loop.call_later(
+            TERMINAL_GRACE_S, self._force_terminal)
+
+    def _force_terminal(self) -> None:
+        if self._pending_done is None:
+            return
+        status, reason, key, need = self._pending_done
+        logger.info(f"relay: PUBLISH_DONE {key} released on grace "
+                    f"({self._upstream_ended}/{need} streams)")
+        self._enqueue_terminal(status, reason, key)
+
+    def _check_pending_done(self) -> None:
+        if self._pending_done is None:
+            return
+        status, reason, key, need = self._pending_done
+        if self._upstream_ended >= need:
+            self._enqueue_terminal(status, reason, key)
+
     def on_stream_end(self, group_id, subgroup_id, clean=True, reset_code=0):
         """Upstream ended a subgroup stream: mirror it. A FIN becomes our
         FIN (the subscriber may infer end-of-group, §11.4.2); a reset
@@ -262,23 +399,35 @@ class _RelayedTrack:
         self.queue.put_nowait(
             (group_id, subgroup_id or 0, None, None, None, None,
              "END" if clean else "RESET", reset_code))
+        self._upstream_ended += 1
+        self._check_pending_done()
 
     def on_object(self, msg, size, ts, group_id, subgroup_id):
         """Upstream delivery callback (sync) — hand off to the drain."""
+        self._objects_in += 1
         gid = getattr(msg, "group_id", None)
         gid = gid if gid is not None else group_id
         # Forward the publisher's priority, never a substitute of our
         # own: a subscriber's scheduling depends on it.
         prio = getattr(msg, "publisher_priority", None)
+        # Delivery mode is part of what a subscriber checks: an object
+        # the publisher sent as a datagram goes out as one, with its
+        # end-of-group bit, not re-framed onto a subgroup stream.
+        shape = getattr(msg, "stream_flags", None)
+        if isinstance(msg, (ObjectDatagram, ObjectDatagramStatus)):
+            shape = ("DGRAM", bool(getattr(msg, "end_of_group", False)))
         self.queue.put_nowait(
             (gid, subgroup_id or 0, msg.object_id,
              bytes(msg.payload), msg.extensions or None,
              128 if prio is None else prio,
              getattr(msg, "status", None),
-             getattr(msg, "stream_flags", None)))
+             shape))
 
     def add_downstream(self, session, track_alias, request_id=None):
         self.downstream.append((session, track_alias, request_id))
+        # The Largest reported to this subscriber: a joining FETCH from
+        # it backfills up to exactly that point.
+        self.joined_at[request_id] = self.largest
         if self.task is None:
             self.task = asyncio.create_task(self._forward_loop())
 
@@ -293,10 +442,24 @@ class _RelayedTrack:
         while True:
             gid, sgid, oid, payload, exts, prio, status, shape = \
                 await self.queue.get()
+            if status == "DONE":
+                # Terminal, in queue order: everything already queued has
+                # been written downstream before PUBLISH_DONE goes out.
+                code, reason, key = shape
+                self.finish(status_code=code, reason=reason)
+                self.release_upstream()
+                self.downstream.clear()
+                self._streams.clear()
+                self.task = None
+                _tracks.pop(key, None)
+                return
             if self._finished:
                 continue
+            if oid is not None:
+                self._remember(gid, sgid, oid, payload, exts, prio, status)
             for session, alias, _rid in list(self.downstream):
                 try:
+                    self._objects_out += 1
                     await self._forward_one(
                         session, alias, gid, sgid, oid, payload, exts,
                         prio, status, shape)
@@ -305,11 +468,71 @@ class _RelayedTrack:
                                  exc_info=True)
                     self.drop_session(session)
 
+    def _remember(self, gid, sgid, oid, payload, exts, prio, status) -> None:
+        """Keep one object for a later FETCH, dropping oldest past the
+        bound."""
+        self._cache.append((gid, sgid, oid, payload, exts, prio, status))
+        self._cache_bytes += len(payload or b"")
+        if self.largest is None or (gid, oid) > self.largest:
+            self.largest = (gid, oid)
+        oldest_kept = gid - CACHE_GROUPS + 1
+        while self._cache and (self._cache[0][0] < oldest_kept
+                               or self._cache_bytes > CACHE_BYTES):
+            dropped = self._cache.popleft()
+            self._cache_bytes -= len(dropped[3] or b"")
+
+    def cache_covers(self, start) -> bool:
+        """True when the cache still holds the start of the range. The
+        oldest object is the boundary: anything before it was evicted
+        and has to come from the publisher, or the subscriber gets a
+        short answer with no way to tell."""
+        if not self._cache:
+            return False
+        first = (self._cache[0][0], self._cache[0][2])
+        return start >= first
+
+    def cached_range(self, start, end):
+        """Cached objects within [start, end], each (group, object)
+        inclusive; `end` None means to the live edge. Ascending."""
+        out = []
+        for gid, sgid, oid, payload, exts, prio, status in self._cache:
+            if (gid, oid) < start:
+                continue
+            if end is not None and (gid, oid) > end:
+                continue
+            out.append((gid, sgid, oid, payload, exts, prio, status))
+        return out
+
     async def _forward_one(self, session, alias, gid, sgid, oid,
                            payload, exts, prio, status=None, shape=None):
         """Write one object downstream, opening the (group, subgroup)
         stream on first sight. Group/subgroup identity is preserved from
         upstream so the downstream sees the publisher's structure."""
+        if (isinstance(shape, tuple) and shape and shape[0] == "DGRAM"
+                and not _no_datagrams.get(id(session))):
+            prof = session._profile
+            is_status = (status or ObjectStatus.NORMAL) != ObjectStatus.NORMAL
+            if is_status and not prof.merged_datagram_layout:
+                # d14 keeps status datagrams in their own message family.
+                dgram = ObjectDatagramStatus(
+                    track_alias=alias, group_id=gid, object_id=oid,
+                    publisher_priority=prio, extensions=exts, status=status)
+            else:
+                dgram = ObjectDatagram(
+                    track_alias=alias, group_id=gid, object_id=oid,
+                    publisher_priority=prio, extensions=exts,
+                    payload=payload or b"",
+                    end_of_group=bool(shape[1]),
+                    status=status or ObjectStatus.NORMAL)
+            try:
+                session.send_dgram_message(dgram.serialize(prof=prof))
+                return
+            except NotImplementedError:
+                # WebTransport datagram TX is not wired in aiopquic yet;
+                # deliver on a subgroup stream rather than drop objects.
+                _no_datagrams[id(session)] = True
+                logger.warning("relay: no datagram TX on this session, "
+                               "forwarding objects on streams")
         skey = (id(session), gid, sgid)
         entry = self._streams.get(skey)
         if entry is None and status in ("END", "RESET"):
@@ -411,10 +634,15 @@ def _forget_session(session) -> None:
     """Drop everything a closing session owned: its announcements and
     its downstream subscriptions."""
     _track_subs[:] = [e for e in _track_subs if e[0] is not session]
+    _ns_subs[:] = [e for e in _ns_subs if e[0] is not session]
+    _no_datagrams.pop(id(session), None)
     for ns in list(_announced):
         if _announced[ns].pop(session, None) is not None and \
                 not _announced[ns]:
             del _announced[ns]
+            # This session's own prefix subscriptions were dropped just
+            # above, so this reaches the observers that remain.
+            _retract_namespace(ns)
     for key, track in list(_tracks.items()):
         track.drop_session(session)
         if _upstream_session(track) is session or (
@@ -448,6 +676,7 @@ async def _on_publish_namespace(session, msg):
     holders = _announced.setdefault(ns, {})
     holders[session] = holders.get(session, 0) + 1
     logger.info(f"relay: announce ns={ns} -> {len(holders)} publisher(s)")
+    _announce_namespace(ns)
     # Reuse the protocol's built-in OK helper. It emits RequestOk on
     # d16+ and PublishNamespaceOk on d14, matching peer expectation.
     session.publish_namepace_ok(msg)
@@ -465,6 +694,7 @@ async def _on_publish_namespace_done(session, msg):
         del holders[session]
     if not holders:
         del _announced[ns]
+        _retract_namespace(ns)
     logger.info(f"relay: namespace_done ns={ns} -> "
                 f"{len(_announced.get(ns, {}))} publisher(s)")
 
@@ -494,13 +724,15 @@ async def _establish_upstream(ns, track_name):
                 else track_name)
         upstream = SubscribedTrack(
             pub, "/".join(x.decode() for x in ns), name,
-            on_object=track.on_object)
+            on_object=track.on_object,
+            on_done=lambda done, t=track, k=key: _upstream_done(t, k, done))
         try:
             await upstream.subscribe(timeout=10.0)
         except Exception as e:
             logger.info(f"relay: upstream subscribe failed on {ns}: {e}")
             continue
         track.upstream = upstream
+        track.upstream_alias = upstream.track_alias
         pub.register_stream_end_handler(upstream.track_alias,
                                         track.on_stream_end)
         _tracks[key] = track
@@ -508,6 +740,79 @@ async def _establish_upstream(ns, track_name):
                     f"alias={upstream.track_alias}")
         return track
     return None
+
+
+def _joined_subscription(session, request_id):
+    """(key, track, anchor) for this session's subscription `request_id`,
+    where anchor is the Largest Location its SUBSCRIBE_OK reported."""
+    if request_id is None:
+        return None
+    for key, track in _tracks.items():
+        for sess, _alias, rid in track.downstream:
+            if sess is session and rid == request_id:
+                return key, track, track.joined_at.get(request_id)
+    return None
+
+
+def _upstream_done(track, key, done) -> None:
+    """Upstream ended the track: FIN downstream streams, PUBLISH_DONE
+    each subscriber, and drop the fan-out so a later SUBSCRIBE starts a
+    fresh upstream subscription."""
+    status = getattr(done, "status_code", SubscribeDoneCode.TRACK_ENDED)
+    reason = getattr(done, "reason", "") or "track ended"
+    logger.info(f"relay: upstream PUBLISH_DONE {key} status={status} "
+                f"streams={getattr(done, 'stream_count', 0)} "
+                f"-> {len(track.downstream)} subscriber(s), objects "
+                f"in={track._objects_in} out={track._objects_out}, "
+                f"upstream streams ended={track._upstream_ended}")
+    if track.task is None:
+        # Nothing draining the queue: no subscriber ever attached.
+        track.finish(status_code=status, reason=reason)
+        track.close()
+        _tracks.pop(key, None)
+        return
+    track.note_upstream_done(status, reason, key,
+                             getattr(done, "stream_count", 0))
+
+
+def _published_track(session, request_id):
+    """(key, track) for the PUBLISH `request_id` on `session`."""
+    for key, track in list(_tracks.items()):
+        pending = track.pending_publish
+        if pending is not None and pending[0] is session and \
+                getattr(pending[1], "request_id", None) == request_id:
+            return key, track
+        if _upstream_session(track) is session and \
+                track.upstream_request_id == request_id:
+            return key, track
+    return None, None
+
+
+async def _on_publish_done(session, msg):
+    """§10.11: a publisher ends a track it PUBLISHed.
+
+    The terminal keys off this rather than off session close, which can
+    lag by the peer's whole idle timeout — a track still registered in
+    that window is handed to the next subscriber, which gets nothing.
+    """
+    key, track = _published_track(session, msg.request_id)
+    if track is not None:
+        status = getattr(msg, "status_code", SubscribeDoneCode.TRACK_ENDED)
+        reason = getattr(msg, "reason", "") or "track ended"
+        logger.info(f"relay: publisher PUBLISH_DONE {key} status={status} "
+                    f"streams={getattr(msg, 'stream_count', 0)} -> "
+                    f"{len(track.downstream)} subscriber(s), objects "
+                    f"in={track._objects_in} out={track._objects_out}")
+        if track.task is None:
+            # Nothing draining the queue: no subscriber ever attached.
+            track.finish(status_code=status, reason=reason)
+            track.close()
+            _tracks.pop(key, None)
+        else:
+            track.note_upstream_done(status, reason, key,
+                                     getattr(msg, "stream_count", 0))
+    # The default handler releases the publisher's subgroup streams.
+    await session._handle_subscribe_done(msg)
 
 
 async def _on_publish(session, msg):
@@ -523,20 +828,81 @@ async def _on_publish(session, msg):
     ns = _ns_tuple(msg.track_namespace)
     key = (ns, msg.track_name)
     track = _tracks.get(key)
+    if track is not None:
+        owner = _upstream_session(track) or (
+            track.pending_publish[0] if track.pending_publish else None)
+        if track.finished or owner is not session:
+            # One publisher per Full Track Name. The predecessor's
+            # close may not have been observed yet, and reusing its
+            # track would drop everything this publisher sends.
+            logger.info(f"relay: retiring the track registered for {key}")
+            track.finish(reason="superseded by a new publisher")
+            track.close()
+            _tracks.pop(key, None)
+            track = None
     if track is None:
         track = _RelayedTrack(key)
         _tracks[key] = track
     _watch_session(session)
     track.pending_publish = (session, msg)
+    # §9.4: a bare PUBLISH is the only notice d18 prefix subscribers get
+    # that this namespace exists.
+    _announce_namespace(ns)
     logger.info(f"relay: publish ns={ns} track={msg.track_name} "
-                f"alias={msg.track_alias} — holding PUBLISH_OK for a "
-                f"subscriber")
+                f"alias={msg.track_alias}")
+    offered = False
     for sub_session, prefix, _rid in list(_track_subs):
         if _prefix_covers(prefix, ns):
+            offered = True
             asyncio.create_task(
                 _offer_track(sub_session, track, key))
     if track.downstream:
         _accept_publish(track)
+    elif not offered:
+        # Nobody to offer this track to, so no reply is coming from
+        # anywhere: answer now rather than hold. A publisher that
+        # blocks on PUBLISH_OK before subscribing (§9.5 publish-first)
+        # would otherwise deadlock — it cannot subscribe until we
+        # answer, and we would not answer until it subscribed.
+        _park_publish(track)
+
+
+def _park_publish(track) -> None:
+    """Answer a PUBLISH with Forward State 0 and start taking the
+    publisher's registrations, leaving forwarding off until a
+    subscriber arrives (§10.2.12)."""
+    if track.pending_publish is None or track.upstream is not None:
+        return
+    session, msg = track.pending_publish
+    session._track_aliases[msg.track_alias] = msg.request_id
+    session.register_object_handler(msg.track_alias, track.on_object)
+    session.register_stream_end_handler(msg.track_alias, track.on_stream_end)
+    ok = PublishOk(
+        request_id=msg.request_id, forward=0, priority=128,
+        group_order=GroupOrder.ASCENDING,
+        filter_type=FilterType.LATEST_OBJECT, parameters={})
+    logger.info(f"relay: PUBLISH_OK forward=0 alias={msg.track_alias} "
+                f"— parked until a subscriber arrives")
+    session._send_reply(msg.request_id, ok)
+    track.upstream = session
+    track.upstream_request_id = msg.request_id
+    track.parked = (session, msg)
+    track.pending_publish = None
+
+
+def _resume_parked_publish(track) -> None:
+    """Raise a parked publisher's Forward State once someone subscribes."""
+    if track.parked is None:
+        return
+    session, msg = track.parked
+    track.parked = None
+    try:
+        session.request_update(msg.request_id, forward=1)
+        logger.info(f"relay: REQUEST_UPDATE forward=1 "
+                    f"alias={msg.track_alias}")
+    except Exception:
+        logger.debug("relay: raising the parked forward state failed",
+                     exc_info=True)
 
 
 def _accept_publish(track) -> None:
@@ -554,7 +920,19 @@ def _accept_publish(track) -> None:
     logger.info(f"relay: PUBLISH_OK forward=1 alias={msg.track_alias}")
     session._send_reply(msg.request_id, ok)
     track.upstream = session
+    track.upstream_request_id = msg.request_id
     track.pending_publish = None
+
+
+def _largest_kwargs(track) -> dict:
+    """SUBSCRIBE_OK Largest Location: what the relay has actually served
+    for this track. A joining FETCH anchors its backfill to it, so a
+    track we hold nothing for reports no content."""
+    if track.largest is None:
+        return {}
+    return {"content_exists": 1,
+            "largest_group_id": track.largest[0],
+            "largest_object_id": track.largest[1]}
 
 
 async def _on_subscribe(session, msg):
@@ -572,24 +950,30 @@ async def _on_subscribe(session, msg):
         track = None
     if track is not None and (track.pending_publish or track.upstream):
         _watch_session(session)
-        ok = session.subscribe_ok(request_msg=msg)
+        ok = session.subscribe_ok(request_msg=msg, **_largest_kwargs(track))
         track.add_downstream(session, ok.track_alias, msg.request_id)
         session.register_request_cancel_handler(
             msg.request_id,
             lambda rid, t=track, s=session: t.drop_session(s))
         _accept_publish(track)
+        _resume_parked_publish(track)
         logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
                     f"-> SUBSCRIBE_OK (published track, fanout="
                     f"{len(track.downstream)})")
         return
 
     # A dialled origin announces nothing, so an empty announcement table
-    # is not proof the track is unavailable.
+    # is not proof the track is unavailable. An upstream that has just
+    # dropped is redialing, and answering DOES_NOT_EXIST in that window
+    # fails every request a back-to-back test suite makes.
+    if not _announced_match(ns) and not _upstreams and _upstream_urls:
+        await _await_upstream()
     if _announced_match(ns) or _upstreams:
         track = await _establish_upstream(ns, msg.track_name)
         if track is not None:
             _watch_session(session)
-            ok = session.subscribe_ok(request_msg=msg)
+            ok = session.subscribe_ok(request_msg=msg,
+                                      **_largest_kwargs(track))
             track.add_downstream(session, ok.track_alias, msg.request_id)
             session.register_request_cancel_handler(
                 msg.request_id,
@@ -695,6 +1079,8 @@ def parse_args():
 
 # SUBSCRIBE_TRACKS subscribers: (session, prefix_tuple, request_id).
 _track_subs: list = []
+# (session, prefix, request_id) for d18 SUBSCRIBE_NAMESPACE subscribers.
+_ns_subs: list = []
 
 
 def _prefix_covers(prefix, ns) -> bool:
@@ -706,11 +1092,13 @@ async def _offer_track(session, track, key):
     """§9.5: send a PUBLISH for a held/served track to a
     SUBSCRIBE_TRACKS subscriber; on PUBLISH_OK(forward=1) wire it into
     the fan-out."""
-    ns, name = key
-    owner = (track.pending_publish[0] if track.pending_publish
-             else track.upstream)
-    if owner is session:
+    if not _session_live(session):
+        _forget_session(session)
         return
+    ns, name = key
+    # A session that subscribed to a prefix gets every track under it,
+    # including one it publishes itself: the subscription is explicit,
+    # and moq-test's publish cases use one session for both roles.
     pub_msg = session.publish(
         namespace="/".join(x.decode() for x in ns),
         track_name=(name.decode() if isinstance(name, bytes) else name),
@@ -724,8 +1112,9 @@ async def _offer_track(session, track, key):
         return
     forward = getattr(reply, 'forward', None)
     if forward is None:
+        # §10.2.12: FORWARD omitted from PUBLISH_OK means 1.
         forward = (getattr(reply, 'parameters', None) or {}).get(
-            ParamType.FORWARD)
+            ParamType.FORWARD, 1)
     if not forward:
         logger.info(f"relay: PUBLISH offer for {key}: forward=0")
         return
@@ -734,9 +1123,238 @@ async def _offer_track(session, track, key):
         pub_msg.request_id,
         lambda rid, t=track, s=session: t.drop_session(s))
     _accept_publish(track)
+    _resume_parked_publish(track)
     logger.info(f"relay: PUBLISH offer accepted for {key} "
                 f"alias={pub_msg.track_alias} "
                 f"(fanout={len(track.downstream)})")
+
+
+# id(session) -> True once a datagram send proved unsupported there.
+_no_datagrams: dict = {}
+
+# (id(session), request_id) -> objects collected from an upstream FETCH.
+_fetch_sinks: dict = {}
+
+
+def _install_fetch_sink(pub) -> None:
+    """One per-session fetch-object callback, demultiplexed by request
+    id, so several upstream fetches can run at once."""
+    if getattr(pub, "_relay_fetch_sink", False):
+        return
+    pub._relay_fetch_sink = True
+
+    def _on(obj, size, ts, request_id):
+        sink = _fetch_sinks.get((id(pub), request_id))
+        if sink is not None:
+            sink.append(obj)
+
+    pub.on_fetch_object = _on
+
+
+async def _fetch_upstream(ns, track_name, msg):
+    """Ask each publisher of `ns` for the requested range. Returns its
+    FETCH_OK and the objects, or (None, None) when nobody serves it —
+    the relay keeps only recent objects, so a historical range has to
+    come from the origin."""
+    name = (track_name.decode() if isinstance(track_name, bytes)
+            else track_name)
+    for pub in _publishers_for(ns):
+        _install_fetch_sink(pub)
+        req = pub.fetch(
+            namespace="/".join(x.decode() for x in ns),
+            track_name=name,
+            group_order=msg.group_order or GroupOrder.ASCENDING,
+            start_group=msg.start_group or 0,
+            start_object=msg.start_object or 0,
+            end_group=msg.end_group or 0,
+            end_object=msg.end_object or 0,
+        )
+        key = (id(pub), req.request_id)
+        _fetch_sinks[key] = []
+        try:
+            ok = await pub._await_response(req.request_id, timeout=10.0)
+            await pub.await_fetch_done(req.request_id, timeout=10.0)
+        except (MOQTRequestError, asyncio.TimeoutError) as e:
+            logger.info(f"relay: upstream FETCH declined on {ns}: {e}")
+            _fetch_sinks.pop(key, None)
+            continue
+        objs = _fetch_sinks.pop(key, [])
+        logger.info(f"relay: upstream FETCH {ns}/{name} -> "
+                    f"{len(objs)} object(s) end_of_track="
+                    f"{getattr(ok, 'end_of_track', 0)}")
+        return ok, objs
+    return None, None
+
+
+async def _on_fetch(session, msg):
+    """FETCH (§10.12) served from the track's recent-object cache, or
+    from the publisher when the range predates it. A joining FETCH is
+    resolved against its subscription and served the same way."""
+    # A joining FETCH names no track: both come from its subscription.
+    ns, track_name = _ns_tuple(msg.namespace), msg.track_name
+    if _is_joining(msg.fetch_type):
+        # §10.12.2: namespace, track and End Location come from the
+        # associated subscription, so the backfill is contiguous with it.
+        found = _joined_subscription(session, msg.joining_request_id)
+        if found is None:
+            logger.info(f"relay: joining FETCH for unknown subscription "
+                        f"{msg.joining_request_id}")
+            session.fetch_error(
+                request_id=msg.request_id,
+                error_code=int(RequestErrorCode.INVALID_JOINING_REQUEST_ID),
+                reason="no such subscription")
+            return
+        key, track, anchor = found
+        if anchor is None:
+            # Nothing served yet: the subscription itself covers the
+            # track from its start, so there is nothing to backfill.
+            logger.info(f"relay: joining FETCH {key} has no anchor")
+            session.fetch_error(
+                request_id=msg.request_id,
+                error_code=int(RequestErrorCode.INVALID_RANGE),
+                reason="subscription has no largest object")
+            return
+        start_group = int(msg.joining_start or 0)
+        if int(msg.fetch_type) == FETCH_RELATIVE_JOINING:
+            start_group = max(0, anchor[0] - start_group)
+        msg.start_group, msg.start_object = start_group, 0
+        msg.end_group, msg.end_object = anchor[0], anchor[1] + 1
+        ns, track_name = key
+        logger.info(f"relay: joining FETCH {key} groups {start_group}.."
+                    f"{anchor[0]} (anchor {anchor})")
+    track = _tracks.get((ns, track_name))
+    start = (msg.start_group or 0, msg.start_object or 0)
+    end = (None if msg.end_group is None
+           else (msg.end_group, msg.end_object
+                 if msg.end_object is not None else (1 << 62)))
+    have_cache = (track is not None and _track_live(track)
+                  and track.cache_covers(start))
+    objs = track.cached_range(start, end) if have_cache else []
+    end_of_track = 0
+    if objs and objs[-1][6] == ObjectStatus.END_OF_TRACK:
+        end_of_track = 1
+    if not objs:
+        # Only recent objects are held, so a historical range comes from
+        # the publisher — which is also the only path for a track this
+        # relay has never subscribed to.
+        up_ok, upstream = await _fetch_upstream(ns, track_name, msg)
+        if upstream is None:
+            logger.info(f"relay: FETCH ns={ns} track={track_name} "
+                        f"-> DOES_NOT_EXIST")
+            session.fetch_error(
+                request_id=msg.request_id,
+                error_code=int(RequestErrorCode.DOES_NOT_EXIST),
+                reason="track does not exist")
+            return
+        if not upstream:
+            session.fetch_error(
+                request_id=msg.request_id,
+                error_code=int(RequestErrorCode.INVALID_RANGE),
+                reason="requested range unavailable")
+            return
+        objs = [(o.group_id, o.subgroup_id, o.object_id, o.payload,
+                 o.extensions, o.publisher_priority, o.status)
+                for o in upstream]
+        end_of_track = int(getattr(up_ok, 'end_of_track', 0) or 0)
+    order = msg.group_order or GroupOrder.ASCENDING
+    last_g, last_o = objs[-1][0], objs[-1][2]
+    # §10.13: FETCH_OK End Location is the last Object PLUS 1, and End Of
+    # Track says the range reached the track's end — which only the
+    # publisher knows, so it is carried over from its FETCH_OK.
+    session.fetch_ok(request_id=msg.request_id,
+                     end_of_track=end_of_track,
+                     largest_group_id=last_g, largest_object_id=last_o + 1,
+                     group_order=int(order))
+    if int(order) == int(GroupOrder.DESCENDING):
+        objs = sorted(objs, key=lambda o: (-o[0], o[2]))
+    await session.serve_fetch(
+        msg.request_id,
+        (FetchObject(group_id=gid, subgroup_id=sgid, object_id=oid,
+                     publisher_priority=prio,
+                     extensions=exts, payload=payload or b"",
+                     status=status)
+         for gid, sgid, oid, payload, exts, prio, status in objs),
+        group_order=int(order))
+    logger.info(f"relay: FETCH ns={ns} track={track_name} served "
+                f"{len(objs)} object(s) {start}..({last_g}.{last_o})")
+
+
+async def _on_subscribe_namespace(session, msg):
+    """Namespace discovery (§9.4). d18 answers NAMESPACE per namespace
+    under the prefix — the subscriber then asks each one for its tracks
+    with SUBSCRIBE_TRACKS. d14/d16 have no NAMESPACE message: the same
+    prefix subscription is answered with a PUBLISH per matching track,
+    present and future, which is what those drafts expect."""
+    prefix = _ns_tuple(msg.namespace_prefix)
+    _watch_session(session)
+    session.subscribe_namespace_ok(
+        msg, stream_id=session._bidi_streams.get(msg.request_id))
+
+    def _drop(rid, s=session, r=msg.request_id):
+        _ns_subs[:] = [e for e in _ns_subs
+                       if not (e[0] is s and e[2] == r)]
+        _track_subs[:] = [e for e in _track_subs
+                          if not (e[0] is s and e[2] == r)]
+    session.register_request_cancel_handler(msg.request_id, _drop)
+
+    if session._profile.two_level_discovery:
+        _ns_subs.append((session, prefix, msg.request_id))
+        for ns in _known_namespaces(prefix):
+            _offer_namespace(session, msg.request_id, prefix, ns)
+        logger.info(f"relay: subscribe-namespace prefix={prefix} "
+                    f"(d18 discovery, subs={len(_ns_subs)})")
+        return
+
+    _track_subs.append((session, prefix, msg.request_id))
+    logger.info(f"relay: subscribe-namespace prefix={prefix} "
+                f"(publish fan-out, subs={len(_track_subs)})")
+    for key, track in list(_tracks.items()):
+        if _prefix_covers(prefix, key[0]) and (
+                track.pending_publish or track.upstream):
+            asyncio.create_task(_offer_track(session, track, key))
+
+
+def _known_namespaces(prefix) -> list:
+    """Namespaces the relay can serve under `prefix`: announced ones
+    plus any track it already relays."""
+    out, seen = [], set()
+    for ns in list(_announced) + [key[0] for key in _tracks]:
+        if ns in seen or not _prefix_covers(prefix, ns):
+            continue
+        seen.add(ns)
+        out.append(ns)
+    return out
+
+
+def _offer_namespace(session, request_id, prefix, ns) -> None:
+    """One NAMESPACE reply on the SUBSCRIBE_NAMESPACE request stream:
+    the suffix under the subscribed prefix (§10.8)."""
+    try:
+        session.namespace(ns[len(prefix):], request_id=request_id)
+    except Exception:
+        logger.debug("relay: NAMESPACE offer failed", exc_info=True)
+
+
+def _announce_namespace(ns) -> None:
+    """Tell d18 prefix subscribers about a namespace that just appeared."""
+    for session, prefix, rid in list(_ns_subs):
+        if _prefix_covers(prefix, ns) and _session_live(session):
+            _offer_namespace(session, rid, prefix, ns)
+
+
+def _retract_namespace(ns) -> None:
+    """Tell d18 prefix subscribers a namespace has gone (§10.8).
+
+    The counterpart to _announce_namespace: an observer that was told a
+    namespace exists otherwise goes on believing it after the last
+    publisher withdraws or its session closes.
+    """
+    for session, prefix, rid in list(_ns_subs):
+        if _prefix_covers(prefix, ns) and _session_live(session):
+            try:
+                session.namespace_done(ns[len(prefix):], request_id=rid)
+            except Exception:
+                logger.debug("relay: NAMESPACE_DONE failed", exc_info=True)
 
 
 async def _on_subscribe_tracks(session, msg):
@@ -786,6 +1404,31 @@ async def _on_track_status(session, msg):
     session._send_reply(msg.request_id, ok, fin=True)
 
 
+def _answered(handler):
+    """Every request gets a terminal reply. A handler that raises would
+    otherwise kill the control task and leave the request stream open
+    with no answer, and the peer waits out its whole timeout — the shape
+    of most conformance failures this relay has had."""
+    async def _wrapped(session, msg):
+        try:
+            await handler(session, msg)
+        except Exception:
+            logger.exception(f"relay: {type(msg).__name__} handler failed")
+            request_id = getattr(msg, "request_id", None)
+            if request_id is None:
+                return
+            try:
+                session._send_reply(request_id, RequestError(
+                    request_id=request_id,
+                    error_code=int(RequestErrorCode.INTERNAL_ERROR),
+                    retry_interval=0,
+                    reason="relay error"), fin=True)
+            except Exception:
+                logger.debug("relay: error reply failed", exc_info=True)
+    _wrapped.__name__ = getattr(handler, "__name__", "handler")
+    return _wrapped
+
+
 def _build_server(bind, port, cert, key, use_quic, draft):
     """Construct a MOQTServer with the relay's control-plane handlers."""
     server = MOQTServer(
@@ -796,17 +1439,23 @@ def _build_server(bind, port, cert, key, use_quic, draft):
         supported_drafts=draft,
     )
     server.register_handler(
-        MOQTMessageType.PUBLISH_NAMESPACE, _on_publish_namespace)
+        MOQTMessageType.PUBLISH_NAMESPACE, _answered(_on_publish_namespace))
     server.register_handler(
         MOQTMessageType.PUBLISH_NAMESPACE_DONE, _on_publish_namespace_done)
     server.register_handler(
-        MOQTMessageType.SUBSCRIBE, _on_subscribe)
+        MOQTMessageType.SUBSCRIBE, _answered(_on_subscribe))
     server.register_handler(
-        MOQTMessageType.PUBLISH, _on_publish)
+        MOQTMessageType.PUBLISH, _answered(_on_publish))
     server.register_handler(
-        MOQTMessageType.TRACK_STATUS, _on_track_status)
+        MOQTMessageType.PUBLISH_DONE, _on_publish_done)
     server.register_handler(
-        D18MessageType.SUBSCRIBE_TRACKS, _on_subscribe_tracks)
+        MOQTMessageType.TRACK_STATUS, _answered(_on_track_status))
+    server.register_handler(
+        MOQTMessageType.SUBSCRIBE_NAMESPACE, _answered(_on_subscribe_namespace))
+    server.register_handler(
+        MOQTMessageType.FETCH, _answered(_on_fetch))
+    server.register_handler(
+        D18MessageType.SUBSCRIBE_TRACKS, _answered(_on_subscribe_tracks))
     return server
 
 

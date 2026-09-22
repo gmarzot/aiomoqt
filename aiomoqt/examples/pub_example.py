@@ -1,140 +1,16 @@
 #!/usr/bin/env python3
 import argparse
 import asyncio
+import logging
 import uuid
 
-from aiomoqt.types import (ForwardingPreference, MOQT_TIMESTAMP_EXT, parse_draft_spec)
-from aiomoqt.messages import (
-    Subscribe,
-    SubgroupHeader,
-)
-from aiomoqt.client import *
-from aiomoqt.utils.url import parse_relay_url
+from aiomoqt.types import ForwardingPreference, parse_draft_spec
+from aiomoqt.client import MOQTClient
 from aiomoqt.track import PublishedTrack, VideoTrack
-from aiomoqt.utils import *
+from aiomoqt.utils import class_name, get_logger, set_log_level, wait_cond_timeout
+from aiomoqt.utils.url import parse_relay_url
 
-# Defaults
-NUM_SUBGROUP_TASKS = 1
-DEFAULT_OBJECT_SIZE = 1024
-
-FRAME_INTERVAL = 1/30
 GROUP_SIZE = 30
-
-
-async def subscribe_data_generator(session, msg: Subscribe,
-                                   num_tasks: int = NUM_SUBGROUP_TASKS,
-                                   object_size: int = DEFAULT_OBJECT_SIZE) -> None:
-    """Subscribe handler that spawns subgroup stream data generation."""
-    ok = session.subscribe_ok(request_msg=msg)
-
-    for subgroup_id in range(num_tasks):
-        priority = 255 if subgroup_id == 0 else 0
-        task = asyncio.create_task(
-            generate_subgroup_stream(
-                session=session,
-                subgroup_id=subgroup_id,
-                track_alias=ok.track_alias,
-                priority=priority,
-                object_size=object_size,
-            )
-        )
-        task.add_done_callback(lambda t: session._tasks.discard(t))
-        session._tasks.add(task)
-        # Stagger stream starts so relay processes each header before the next
-        await asyncio.sleep(0.1)
-
-    await session.async_closed()
-    session._close_session()
-
-
-async def generate_subgroup_stream(session, subgroup_id: int,
-                                   track_alias: int, priority: int,
-                                   object_size: int = DEFAULT_OBJECT_SIZE):
-    """Generate subgroup stream objects simulating video frames.
-
-    Uses SubgroupHeader.next_object() for automatic delta encoding
-    and object_id tracking.
-    """
-    logger = get_logger(__name__)
-    I_FRAME_PAD = b'I' * object_size
-    P_FRAME_PAD = b'P' * object_size
-    stream_id = await session.open_uni_stream()
-    logger.info(f"MOQT app: created data stream({stream_id}): subgroup: {subgroup_id}")
-
-    next_frame_time = time.monotonic()
-    group_id = -1
-    use_extensions = True
-    header = None
-
-    try:
-        while True:
-            # Check if we need a new group
-            if header is None or header.next_object_id >= GROUP_SIZE:
-                group_id += 1
-
-                # End the previous group
-                if header is not None:
-                    extensions = {MOQT_TIMESTAMP_EXT: int(time.time() * 1_000_000)} if use_extensions else None
-                    buf = header.end_group(extensions=extensions)
-                    if session._close_err:
-                        raise asyncio.CancelledError
-                    logger.info(f"MOQT app: sending END_OF_GROUP: "
-                                f"{group_id-1}.{subgroup_id}.{header._last_object_id} "
-                                f"{buf.tell()} bytes")
-                    session.stream_write(stream_id, buf.data, end_stream=True)
-
-                    # Clean up old stream
-                    if stream_id in session._data_streams:
-                        del session._data_streams[stream_id]
-                    if stream_id in session._stream_tasks:
-                        session._stream_tasks[stream_id].cancel()
-                        del session._stream_tasks[stream_id]
-
-                    # Create new stream for next group
-                    stream_id = await session.open_uni_stream()
-
-                # Start new subgroup header — tracks object_id and delta state
-                header = SubgroupHeader(
-                    track_alias=track_alias,
-                    group_id=group_id,
-                    subgroup_id=subgroup_id,
-                    publisher_priority=priority,
-                    extensions_present=use_extensions,
-                )
-                msg = header.serialize()
-                if session._close_err is not None:
-                    raise asyncio.CancelledError
-                logger.info(f"MOQT app: sending {header} {msg.tell()} bytes")
-                session.stream_write(stream_id, msg.data)
-
-                # I-frame for first object in group
-                obj_id = 0
-                info = f"| {group_id}.{obj_id} |".encode()
-                payload = (info + I_FRAME_PAD)[:object_size]
-            else:
-                # P-frame for subsequent objects
-                obj_id = header.next_object_id
-                info = f"| {group_id}.{obj_id} |".encode()
-                payload = (info + P_FRAME_PAD)[:object_size]
-
-            # Send next object — delta encoding handled automatically
-            extensions = {MOQT_TIMESTAMP_EXT: int(time.time() * 1_000_000)} if use_extensions else None
-            buf = header.next_object(payload=payload, extensions=extensions)
-
-            if session._close_err is not None:
-                raise asyncio.CancelledError
-            logger.info(f"MOQT app: sending ObjectHeader: "
-                        f"{group_id}.{subgroup_id}.{header._last_object_id} "
-                        f"{buf.tell()} bytes")
-            session.stream_write(stream_id, buf.data)
-
-            next_frame_time += FRAME_INTERVAL
-            sleep_time = max(0, next_frame_time - time.monotonic())
-            await asyncio.sleep(sleep_time)
-
-    except asyncio.CancelledError:
-        logger.warning(f"MOQT app: stream generation cancelled")
-        raise
 
 
 def parse_args():

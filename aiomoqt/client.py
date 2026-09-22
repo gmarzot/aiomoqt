@@ -1,5 +1,5 @@
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import List, Optional, Union
 
 from aiopquic.asyncio.client import connect as aiopquic_connect
@@ -86,7 +86,8 @@ class MOQTClient(MOQTPeer):
         logger.debug(
             f"MOQT: client session: {self} use_quic={use_quic} path={path}")
 
-    def connect(self):
+    def connect(self) -> AbstractAsyncContextManager[
+            Union[MOQTSessionQuic, MOQTSessionWTClient]]:
         """Return an async context manager that yields a MOQT session.
 
         Raw QUIC mode (use_quic=True) uses aiopquic.connect.

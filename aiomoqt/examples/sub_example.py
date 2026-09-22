@@ -50,10 +50,11 @@ def parse_args():
 
 import time
 
+from aiomoqt.utils.stats import send_time_us
+
 
 class SimpleStats:
     """Lightweight stats for sub_example with latency tracking."""
-    TIMESTAMP_EXT = 0x20  # MOQT_TIMESTAMP_EXT
 
     def __init__(self, interval: float = 5.0):
         self.interval = interval
@@ -92,12 +93,10 @@ class SimpleStats:
         self.total_objects += 1
         self.total_bytes += size_bytes
 
-        # Latency from MOQT_TIMESTAMP_EXT. Both ends store microseconds
-        # since epoch (int(time.time() * 1_000_000)). Convert the diff
-        # to ms for the display. Filter out absurd values (>10 min of
-        # one-way latency = clock skew or stale objects).
-        send_us = (msg.extensions.get(self.TIMESTAMP_EXT)
-                   if msg.extensions else None)
+        # Latency from the sender's wall-clock µs (LOC TIMESTAMP, or the
+        # legacy 0x20). Absurd values (>10 min one-way) are clock skew or
+        # stale objects.
+        send_us = send_time_us(msg.extensions)
         if send_us is not None:
             latency_ms = (recv_time_us - send_us) / 1000.0
             if -1000.0 <= latency_ms <= 600_000.0:

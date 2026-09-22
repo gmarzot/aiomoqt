@@ -36,6 +36,7 @@ import contextlib
 import logging
 import sys
 import time
+import uuid
 from typing import Optional
 
 from aiomoqt.client import MOQTClient
@@ -65,7 +66,15 @@ def parse_args():
         'LOC/MSF media publisher (catalog + pcm tone + optional mp4 '
         'video)', epilog=__doc__)
     _cli.add_endpoints(parser)
-    _cli.add_identity(parser, namespace='demo/live')
+    # Fresh per run: a relay caches objects under a namespace, so
+    # reusing one serves a later subscriber stale groups from the
+    # previous broadcast. The suffix sits under a fixed prefix so a
+    # subscriber can still find it by namespace discovery (§9.4)
+    # without being told, and the player URL carries it verbatim.
+    _cli.add_identity(
+        parser, namespace=f'aiomoqt/demo-{uuid.uuid4().hex[:4]}',
+        namespace_help='MoQT namespace (default: aiomoqt/demo-<rand4>, '
+                       'fresh per run; pass one explicitly to pin it)')
     parser.add_argument('--mp4', type=str, default=None, metavar='FILE',
                         help='Publish this mp4\'s H.264 track as LOC '
                              'video (samples pass through, no decode)')
@@ -80,7 +89,7 @@ def parse_args():
                              'H.264 video and AAC audio, stamped from '
                              'the PES timestamps')
     parser.add_argument('--player-base', type=str,
-                        default='http://localhost:5173/simple/',
+                        default='http://localhost:5173/g5-player/',
                         metavar='URL',
                         help='Base of the player URL printed at start '
                              '(default: the moq-playa simple example)')

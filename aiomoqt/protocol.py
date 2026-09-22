@@ -4,8 +4,8 @@ import time
 from asyncio import Future
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from typing import (Callable, DefaultDict, Dict, List, Optional, Set, Tuple,
-                    Type, Union)
+from typing import (Any, Callable, DefaultDict, Dict, List, Optional, Set,
+                    Tuple, Type, Union)
 
 from aiopquic.quic.connection import QuicErrorCode, stream_is_unidirectional
 from aiopquic.quic.events import (
@@ -320,6 +320,8 @@ class _MOQTSessionMixin:
         # request_id -> callback fired when the request's stream is
         # terminated by the peer (§3.3.2 cancellation).
         self._request_cancel_handlers: Dict[int, Callable] = {}
+        # request_id -> callback fired on PUBLISH_DONE for that request.
+        self._publish_done_handlers: Dict[int, Callable] = {}
         self._track_aliases: Dict[int, int] = {}  # map alias to subscription_id
         # Set when client_session_init completes (ms, monotonic delta).
         self._established_ms: Optional[float] = None
@@ -341,9 +343,6 @@ class _MOQTSessionMixin:
         self._unbound_aliases: dict = {}
         self._unbound_escalated: set = set()
         self._subscriptions: Dict[int, List] = {}  # map subscription_id to request
-        # True once this session has subscribed to anything (subscribe,
-        # join or fetch). Publisher-only sessions never set it.
-        self._had_subscription = False
         self._pending_requests: Dict[int, Future[MOQTMessage]] = {}  # unified response futures
         # Bounded record of request ids WE issued (recorded at allocation).
         # A response for one of these with no live future is an ack we did
@@ -366,10 +365,10 @@ class _MOQTSessionMixin:
         self._stream_data_registry = dict(_MOQTSessionMixin.MOQT_STREAM_DATA_REGISTRY)
 
         # Optional callback for received data objects:
-        #   fn(msg, size_bytes, recv_time_ms, group_id, subgroup_id)
+        #   fn(msg, size_bytes, recv_time_us, group_id, subgroup_id)
         self.on_object_received: Optional[Callable] = None
         # Optional callback for received FetchObjects (fetch uni stream):
-        #   fn(msg, size_bytes, recv_time_ms, request_id)
+        #   fn(msg, size_bytes, recv_time_us, request_id)
         # Fires for normal objects only (end-of-range markers are logged
         # and the stream is expected to FIN shortly after).
         self.on_fetch_object: Optional[Callable] = None
@@ -600,6 +599,13 @@ class _MOQTSessionMixin:
         SUBSCRIBE/PUBLISH/etc. Publishers stop feeding on it."""
         self._request_cancel_handlers[request_id] = callback
 
+    def register_publish_done_handler(self, request_id: int,
+                                      callback: Callable) -> None:
+        """Called as callback(msg) when PUBLISH_DONE ends the
+        subscription `request_id` (§10.11). Once per request; the
+        session stays up."""
+        self._publish_done_handlers[request_id] = callback
+
     def _on_request_stream_terminated(
             self, stream_id: int, *,
             stop_sending_code: Optional[int] = None) -> None:
@@ -645,6 +651,7 @@ class _MOQTSessionMixin:
         said so: a terminated request stream at d18, UNSUBSCRIBE before
         it. Publishers stop feeding on this."""
         cb = self._request_cancel_handlers.pop(request_id, None)
+        self._publish_done_handlers.pop(request_id, None)
         logger.info(f"MOQT: request {request_id} cancelled by {why}")
         if cb is not None:
             try:
@@ -1176,6 +1183,13 @@ class _MOQTSessionMixin:
                         getattr(hdr, 'end_of_group', False),
                         getattr(hdr, 'default_priority', False),
                     )
+                    if state.subgroup_id is None:
+                        # SUBGROUP_ID_FIRST_OBJ: the header carries no
+                        # subgroup field and the parser resolves it from
+                        # the first object, so the stream's id is known
+                        # only now.
+                        state.subgroup_id = getattr(
+                            state.parser, 'subgroup_id', None)
                     cb(msg_obj, consumed, now,
                        state.group_id, state.subgroup_id)
                 if terminal:
@@ -1521,14 +1535,9 @@ class _MOQTSessionMixin:
                         f"unknown data stream type 0x{stream_type:x}")
 
                 if msg_header is None:
-                    # Stream-level parse failure on the data stream type
-                    # byte. Caused by data-corruption races at high
-                    # stream-churn rates (see issue: known framer desync
-                    # under load). Reject this stream and let the session
-                    # keep running rather than tearing the whole session
-                    # down for one corrupt stream — the publisher will
-                    # see STOP_SENDING and abandon, the rest of the
-                    # session continues. Forensic anchor logged below.
+                    # Parse failure on the data stream type byte. Reject
+                    # this one stream instead of the session: the publisher
+                    # sees STOP_SENDING and abandons, other streams continue.
                     try:
                         anchor = buf.data_slice(0, min(64, buf.capacity)).hex()
                     except Exception:
@@ -2610,7 +2619,7 @@ class _MOQTSessionMixin:
         return self._quic.send_datagram_frame(data=buf.data)
 
     @property
-    def handshake_info(self):
+    def handshake_info(self) -> Dict[str, Any]:
         """Structured handshake result (probe ask #6): negotiated
         draft/version/ALPN, transport, time-to-established, current
         path RTT (µs), peer transport parameters, connection IDs.
@@ -2641,7 +2650,7 @@ class _MOQTSessionMixin:
         }
 
     @property
-    def qlog_paths(self):
+    def qlog_paths(self) -> List[str]:
         """qlog file(s) for this connection (probe ask #7): matches the
         session's connection-ID hex names under the effective qlog_dir
         (or AIOPQUIC_QLOG_DIR). Empty list when qlog is off or nothing
@@ -2665,7 +2674,7 @@ class _MOQTSessionMixin:
         return sorted(out)
 
     @property
-    def peer_transport_parameters(self):
+    def peer_transport_parameters(self) -> Optional[Dict[str, Any]]:
         """The peer's negotiated QUIC transport parameters as a dict
         (None before the handshake). Probe/fingerprinting surface —
         the values live in picoquic; no qlog round trip. Unknown/GREASE
@@ -2681,7 +2690,7 @@ class _MOQTSessionMixin:
         return None
 
     @property
-    def connection_ids(self):
+    def connection_ids(self) -> Optional[Dict[str, bytes]]:
         """{'local', 'remote', 'initial'} connection IDs as bytes, or
         None. QUIC-LB / routable-CID detection."""
         if not self._is_wt:
@@ -2810,7 +2819,6 @@ class _MOQTSessionMixin:
         )
         message.libquicr_compat = self._session.libquicr_compat
         self._subscriptions[request_id] = [message]
-        self._had_subscription = True
         logger.info(f"MOQT send: {message}")
         self._send_request(request_id, message)
 
@@ -3074,7 +3082,6 @@ class _MOQTSessionMixin:
             parameters=parameters,
         )
         self._subscriptions[sub_request_id] = [sub_msg]
-        self._had_subscription = True
         # Pre-register response futures before send so loopback / low-RTT
         # peers can't resolve them before our awaiter registers.
         self._pending_requests[sub_request_id] = self._loop.create_future()
@@ -3092,7 +3099,6 @@ class _MOQTSessionMixin:
             parameters=dict(parameters),
         )
         self._subscriptions[fetch_request_id] = [fetch_msg]
-        self._had_subscription = True
         self._pending_requests[fetch_request_id] = self._loop.create_future()
         # Pre-register the fetch-done future before sending so we
         # don't miss the stream FIN in fast-completion scenarios.
@@ -3149,7 +3155,6 @@ class _MOQTSessionMixin:
             parameters=parameters,
         )
         self._subscriptions[request_id] = [message]
-        self._had_subscription = True
         self._fetch_done_futures[request_id] = \
             self._loop.create_future()
         logger.info(f"MOQT send: {message}")
@@ -3497,6 +3502,41 @@ class _MOQTSessionMixin:
                 "or stream_id: NAMESPACE is not a control-stream message")
         return message
 
+    def namespace_done(
+        self,
+        namespace_suffix: Union[str, Tuple[bytes, ...]] = (),
+        stream_id: int = None,
+        request_id: int = None,
+    ) -> Optional[MOQTMessage]:
+        """Withdraw a namespace previously reported with namespace().
+
+        The counterpart to NAMESPACE, on the same SUBSCRIBE_NAMESPACE
+        request stream and carrying the same suffix. Without it a peer
+        that learned of a namespace keeps believing in it after the
+        publisher withdraws or its session ends.
+        """
+        if isinstance(namespace_suffix, str):
+            suffix = (self._make_namespace_tuple(namespace_suffix)
+                      if namespace_suffix else ())
+        else:
+            suffix = tuple(namespace_suffix)
+        if not is_draft16_or_later(self.negotiated_draft):
+            raise MOQTException(
+                SessionCloseCode.INTERNAL_ERROR,
+                f"NAMESPACE_DONE is not defined by "
+                f"draft-{self.negotiated_draft}")
+        message = NamespaceDone(namespace_suffix=suffix)
+        logger.info(f"MOQT send: {message}")
+        if stream_id is not None:
+            self.send_stream_message(stream_id, message)
+        elif request_id is not None:
+            self._send_on_request_stream(request_id, message)
+        else:
+            raise ValueError(
+                "namespace_done() needs the SUBSCRIBE_NAMESPACE "
+                "request_id or stream_id")
+        return message
+
     async def subscribe_tracks(
         self,
         namespace: Union[str, Tuple[bytes, ...]],
@@ -3821,15 +3861,15 @@ class _MOQTSessionMixin:
         future = self._pending_requests.get(msg.request_id)
         if future and not future.done():
             future.set_result(msg)
-        # Per spec, every SubscribeDone is terminal for that subscribe.
-        # The session closes only when the last subscription IT MADE
-        # ends — the clean-exit signal bench tools wait on. A session
-        # that never subscribed is a publisher: its audience leaving is
-        # not its own end of life, so it stays up for the next one.
+        cb = self._publish_done_handlers.pop(msg.request_id, None)
+        if cb is not None:
+            try:
+                cb(msg)
+            except Exception:
+                logger.debug("publish-done handler raised", exc_info=True)
+        # Terminal for that subscription only: the session stays up.
+        # Owners learn of it through register_publish_done_handler().
         self._subscriptions.pop(msg.request_id, None)
-        if self._had_subscription and not self._subscriptions:
-            self._close_session(SessionCloseCode.NO_ERROR,
-                                f"subscribe done: {msg.status_code}")
 
     def _extend_request_credit(self, rid: int) -> None:
         """Raise our MAX_REQUEST_ID before the peer reaches it (§9.5)."""
@@ -3937,21 +3977,32 @@ class _MOQTSessionMixin:
         self._publish_announcements.put_nowait(msg)
 
     async def _handle_publish_ok(self, msg: PublishOk) -> None:
+        """Subscriber accepted our PUBLISH.
+
+        Pre-d18 this arrives as its own control message rather than a
+        REQUEST_OK on the request's stream, so nothing else resolves
+        the sender's future — without this an awaited publish() waits
+        out its whole timeout on an offer that was accepted."""
         logger.info(f"MOQT event: handle {msg}")
-        # Subscriber accepted our PUBLISH
+        self._resolve_request(msg.request_id, msg)
 
     async def _handle_publish_error(self, msg: PublishError) -> None:
+        """Subscriber rejected our PUBLISH; the awaiter raises."""
         logger.info(f"MOQT event: handle {msg}")
-        # Subscriber rejected our PUBLISH
+        self._resolve_request(msg.request_id, msg)
 
     async def _handle_fetch(self, msg: Fetch) -> None:
         """Default handler for incoming FETCH.
 
-        Auto-accepts with FETCH_OK. Override via register_handler(FETCH, ...)
-        for custom fetch handling (e.g. open uni stream and send objects).
-        """
+        Rejects: a FETCH_OK obliges us to open the fetch data stream
+        (§10.13), and a session with no fetch semantics would leave the
+        peer waiting on objects that never come. Override via
+        register_handler(FETCH, ...) to serve one (see serve_fetch())."""
         logger.info(f"MOQT event: handle {msg}")
-        self.fetch_ok(request_id=msg.request_id)
+        self.fetch_error(
+            request_id=msg.request_id,
+            error_code=int(RequestErrorCode.NOT_SUPPORTED),
+            reason="fetch not supported")
 
     async def _handle_fetch_cancel(self, msg: FetchCancel) -> None:
         """Publisher-side: FETCH_CANCEL received for a fetch we are

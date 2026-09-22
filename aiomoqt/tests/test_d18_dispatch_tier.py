@@ -94,15 +94,14 @@ def test_d18_selectable_without_env_var(monkeypatch):
     assert c2.supported_drafts == [18]
 
 
-def test_default_client_omits_d18_beta(monkeypatch):
-    # d18 ships beta: the no-args default offers the STABLE set (16, 14)
-    # only — an auto session never negotiates onto the beta d18 wire, and
-    # d14 stays in the offer for d14-only peers. d18 is one explicit opt-in
-    # away (supported_drafts=18 or supported_drafts=[18, 16, 14]).
+def test_default_client_offers_every_draft(monkeypatch):
+    # The no-args default offers every draft we can speak, newest first,
+    # so an auto session negotiates d18 with a d18 peer and still falls
+    # back to d16 / d14 for older ones. Derived from MOQTDraft, not
+    # MOQT_VERSIONS (the d14 in-band list, which has no d18).
     monkeypatch.delenv("AIOMOQT_ENABLE_D18", raising=False)
     c = MOQTClient("localhost", 4433)
-    assert c.supported_drafts == [16, 14]
-    assert 18 not in c.supported_drafts
+    assert c.supported_drafts == [18, 16, 14]
 
 
 def test_supported_drafts_accepts_int_or_list():
@@ -116,6 +115,16 @@ def test_supported_drafts_accepts_int_or_list():
     # parse_draft_spec maps the --draft CLI value to the same int|list form.
     assert parse_draft_spec("16") == 16
     assert parse_draft_spec("18,16,14") == [18, 16, 14]
+
+
+def test_draft_spec_accepts_registry_spellings():
+    # Interop registries and harnesses name versions "draft-NN"; that
+    # spelling used to exit the interop client with an argparse error.
+    for spec in ("draft-18", "Draft-18", "draft18", "d18", "moqt-18", " 18 "):
+        assert parse_draft_spec(spec) == 18
+    assert parse_draft_spec("draft-18,draft-16") == [18, 16]
+    with pytest.raises(ValueError, match="want 18, draft-18"):
+        parse_draft_spec("eighteen")
 
 
 def test_d18_setup_options_kvp_roundtrip():

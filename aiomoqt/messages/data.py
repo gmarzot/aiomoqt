@@ -402,9 +402,15 @@ class ObjectHeader(MOQTMessage):
         try:
             if fused is None:
                 raise AttributeError
-            delta, exts, status, payload = fused(
-                extensions_present, MOQTMessage.EXTENSIONS_LEN_LIMIT,
-                kvp_delta)
+            try:
+                delta, exts, status, payload = fused(
+                    extensions_present, MOQTMessage.EXTENSIONS_LEN_LIMIT,
+                    kvp_delta)
+            except OverflowError as e:
+                # The fused codec is MoQT-agnostic and cannot raise our
+                # violation type; §1.4.3 makes a Type-space overflow a
+                # session close.
+                raise MOQTProtocolViolation(str(e)) from None
         except AttributeError:
             pull = buf.pull_uint_vi64 if vi64 else buf.pull_uint_var
             delta = pull()

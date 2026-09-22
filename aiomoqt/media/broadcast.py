@@ -233,9 +233,14 @@ class MediaSubscriber:
     def __init__(self, session, namespace: str, *,
                  on_frame: Optional[Callable] = None,
                  on_catalog: Optional[Callable] = None,
-                 track_filter: Optional[Callable] = None):
+                 track_filter: Optional[Callable] = None,
+                 discover: bool = False):
         self.session = session
         self.namespace = namespace
+        # Treat `namespace` as a prefix and resolve it to the namespace
+        # actually being published under it (§9.4), so a subscriber can
+        # find a broadcast whose name it was never told.
+        self.discover = discover
         self.on_frame = on_frame
         self.on_catalog = on_catalog
         self.track_filter = track_filter or (lambda t: True)
@@ -249,6 +254,8 @@ class MediaSubscriber:
         — a late joiner needs the relay-cached complete catalog), await
         the first one, subscribe its media tracks. Falls back to plain
         SUBSCRIBE when the peer can't serve the fetch."""
+        if self.discover:
+            await self._resolve_namespace(timeout)
         self.session.on_fetch_object = self._on_catalog_fetch_object
         # Global fallback catches catalog objects that arrive before the
         # per-alias registration (§10.4.2 data-before-OK race).
@@ -262,8 +269,12 @@ class MediaSubscriber:
                 self.session.register_object_handler(
                     alias, self._on_catalog_object)
         except Exception as e:
-            logger.info(f"MediaSubscriber: catalog join failed ({e}); "
-                        f"falling back to plain subscribe")
+            logger.warning(
+                f"MediaSubscriber: catalog joining FETCH refused ({e}); "
+                f"falling back to plain subscribe. msf-01 §5 requires the "
+                f"fetch, and without it only a catalog still being "
+                f"republished will arrive — a late joiner to a settled "
+                f"broadcast gets nothing")
             self._catalog_sub = SubscribedTrack(
                 self.session, self.namespace, CATALOG_TRACK_NAME,
                 on_object=self._on_catalog_object)
@@ -271,6 +282,31 @@ class MediaSubscriber:
         await asyncio.wait_for(self._have_catalog.wait(), timeout)
         await self._subscribe_media()
         return self.catalog
+
+    async def _resolve_namespace(self, timeout: float) -> None:
+        """Resolve `self.namespace` from a prefix to the namespace being
+        published under it.
+
+        Two-level discovery only (d18): SUBSCRIBE_NAMESPACE reports the
+        NAMESPACEs under a prefix. Before that a prefix subscription is
+        answered with a PUBLISH per track instead, which names no
+        namespace, so the prefix is left as given.
+        """
+        if not self.session._profile.two_level_discovery:
+            logger.info(f"MediaSubscriber: draft "
+                        f"{self.session.negotiated_draft} has no namespace "
+                        f"discovery; using '{self.namespace}' as given")
+            return
+        await self.session.subscribe_namespace(
+            namespace_prefix=self.namespace, wait_response=True)
+        ns_msg = await self.session.await_namespace(timeout=timeout)
+        suffix = tuple(p.decode() if isinstance(p, bytes) else p
+                       for p in (ns_msg.namespace_suffix or ()))
+        full = '/'.join(p for p in (self.namespace, *suffix) if p)
+        if full != self.namespace:
+            logger.info(f"MediaSubscriber: discovered '{full}' under "
+                        f"prefix '{self.namespace}'")
+        self.namespace = full
 
     def _on_catalog_fetch_object(self, msg, size, ts,
                                  request_id) -> None:

@@ -105,6 +105,7 @@ class MOQTMessage:
 
     REASON_PHRASE_MAX = 1024      # §3.5
     NAMESPACE_MAX_FIELDS = 32     # §2.4.1
+    KVP_TYPE_MAX = (1 << 64) - 1  # §1.4.3
 
     @staticmethod
     def _pull_reason(buf: Buffer) -> str:
@@ -209,6 +210,10 @@ class MOQTMessage:
                     # d16+ §1.4.2: Type is a delta from the previous
                     # absolute Type; value form follows the ABSOLUTE.
                     ext_id += prev
+                    if ext_id > MOQTMessage.KVP_TYPE_MAX:
+                        raise MOQTProtocolViolation(
+                            f"KVP Delta Type overflows the Type space: "
+                            f"{ext_id} > 2^64-1")
                     prev = ext_id
                 if ext_id % 2 == 0:
                     # even type → varint value (self-bounded by varint prefix)
@@ -823,6 +828,10 @@ class MOQTMessage:
         prev_key = 0
         while buf.tell() < buf_end:
             key = prev_key + buf.pull_vint()
+            if key > MOQTMessage.KVP_TYPE_MAX:
+                raise MOQTProtocolViolation(
+                    f"KVP Delta Type overflows the Type space: "
+                    f"{key} > 2^64-1")
             prev_key = key
             if key % 2 == 1:  # odd Type → Length + bytes
                 vlen = buf.pull_vint()

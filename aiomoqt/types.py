@@ -1,3 +1,4 @@
+import re
 from enum import IntEnum
 from typing import Dict, Tuple
 
@@ -79,10 +80,17 @@ def moqt_version_from_draft(draft: int) -> int:
     return 0xff000000 | (draft & 0xff)
 
 
+# Draft spellings: the bare number, and the "draft-NN" form interop
+# registries and harnesses use (moqt-NN is the ALPN spelling).
+_DRAFT_TOKEN = re.compile(r"^(?:(?:draft|moqt|d)[-_]?)?(\d{1,3})$",
+                          re.IGNORECASE)
+
+
 def parse_draft_spec(s: str):
     """Parse a ``--draft`` CLI value into a pin or an ordered offer set.
 
         '16'        -> 16            (pin: offer only that ALPN)
+        'draft-16'  -> 16            (the interop registry spelling)
         '18,16,14'  -> [18, 16, 14]  (offer the set, in preference order)
 
     The result is passed straight to ``MOQTClient`` / ``MOQTServer``'s
@@ -90,7 +98,17 @@ def parse_draft_spec(s: str):
     is preserved so a caller can put a relay's preferred draft first (some
     relays select the first offered ALPN rather than the highest mutual).
     """
-    parts = [int(p) for p in str(s).split(",") if p.strip()]
+    parts = []
+    for token in str(s).split(","):
+        token = token.strip()
+        if not token:
+            continue
+        m = _DRAFT_TOKEN.match(token)
+        if m is None:
+            raise ValueError(
+                f"invalid draft {token!r}: want 18, draft-18 or a "
+                f"comma list such as 18,16")
+        parts.append(int(m.group(1)))
     if not parts:
         raise ValueError(f"empty --draft value: {s!r}")
     return parts[0] if len(parts) == 1 else parts
@@ -119,8 +137,10 @@ def normalize_supported_drafts(supported_drafts) -> list:
     order ALPN / CLIENT_SETUP / WT-Available-Protocols offer versions in.
     """
     if supported_drafts is None:
-        # auto: every supported draft, newest first
-        return sorted((v & 0xff for v in MOQT_VERSIONS), reverse=True)
+        # auto: every draft we can speak, newest first. MOQTDraft, not
+        # MOQT_VERSIONS — the latter is only the d14 in-band CLIENT_SETUP
+        # list and omits the out-of-band d16+ drafts.
+        return sorted((int(d) for d in MOQTDraft), reverse=True)
     if isinstance(supported_drafts, int):
         supported_drafts = [supported_drafts]
     drafts = []
@@ -135,6 +155,12 @@ def normalize_supported_drafts(supported_drafts) -> list:
 
 MOQT_DEFAULT_PRIORITY = 128
 
+# loc-04 TIMESTAMP (Object): wall-clock µs since the epoch unless a
+# TIMESCALE property makes it media time. What publishers stamp.
+LOC_TIMESTAMP = 0x10
+
+# Legacy private id, read-only from 0.11.1: unregistered, and nothing
+# outside aiomoqt ever read it.
 MOQT_TIMESTAMP_EXT = 0x20
 
 
@@ -287,7 +313,7 @@ class SetupParamType(IntEnum):
     """Setup Parameter type constants"""
     PATH = 0x01  # only relevant to raw QUIC connection
     MAX_REQUEST_ID = 0x02
-    AUTH_TOKEN = 0x03 
+    AUTH_TOKEN = 0x03
     MAX_AUTH_TOKEN_CACHE_SIZE = 0x04
     AUTHORITY = 0x05
     IMPLEMENTATION = 0x07  # Wrong in draft 14, draft-15 fixed it to this value
@@ -322,7 +348,7 @@ class ContentExistsCode(IntEnum):
     """Content Exists Code"""
     NO_CONTENT = 0x0
     EXISTS = 0x01
-    
+
 class AuthTokenAliasType(IntEnum):
     """Authorization Token Alias Types (Section 9.2.1.1)."""
     DELETE = 0x0      # Alias only — retire the alias and its token

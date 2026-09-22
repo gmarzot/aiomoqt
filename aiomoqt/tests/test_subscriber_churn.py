@@ -23,11 +23,11 @@ def _session(draft=18):
     s.negotiated_draft = draft
     s._profile = profile_for(draft)
     s._subscriptions = {}
-    s._had_subscription = False
     s._track_aliases = {}
     s._object_handlers = {}
     s._pending_requests = {}
     s._request_cancel_handlers = {}
+    s._publish_done_handlers = {}
     s._subgroup_stream_by_key = {}
     s._data_streams = {}
     s._control_chains = {}
@@ -63,15 +63,30 @@ async def test_publisher_session_survives_a_publish_done():
 
 
 @pytest.mark.asyncio
-async def test_subscriber_session_still_closes_on_its_last_subscription():
-    # The clean-exit signal the bench tools wait on is unchanged.
+async def test_last_subscription_ending_does_not_close_the_session():
+    # PUBLISH_DONE is terminal for one subscription, not for the
+    # connection: nothing in the spec closes a session on it. Owners
+    # learn of it through register_publish_done_handler().
     s = _session()
-    s._had_subscription = True
     s._subscriptions = {2: ["sub"], 4: ["sub"]}
     await s._handle_subscribe_done(_done(2))
-    assert s.closed == []                       # one left
     await s._handle_subscribe_done(_done(4))
-    assert s.closed and "subscribe done" in s.closed[0]
+    assert s.closed == []
+    assert s._subscriptions == {}
+
+
+@pytest.mark.asyncio
+async def test_publish_done_handler_fires_once():
+    s = _session()
+    s._subscriptions = {2: ["sub"]}
+    seen = []
+    s.register_publish_done_handler(2, lambda msg: seen.append(msg.status_code))
+    await s._handle_subscribe_done(_done(2))
+    assert seen == [0x2]
+    await s._handle_subscribe_done(_done(2))
+    assert len(seen) == 1
+
+
 
 
 @pytest.mark.asyncio
