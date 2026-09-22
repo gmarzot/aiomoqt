@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.11.1
 
 Pairs with aiopquic 0.4.1. moq-test conformance: 76/76 on d16 and d18,
 both transports.
