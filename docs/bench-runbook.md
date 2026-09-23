@@ -11,23 +11,29 @@ through the same stack.
 ## Before anything: paste this in every shell
 
 ```
+cd $HOME/Projects/moq/aiomoqt
+source .venv/bin/activate
 export RELAY_WT=https://moqx-main.ci.openmoq.org:4433/moq-relay
 export RELAY_QUIC=moqt://moqx-main.ci.openmoq.org:4433/moq-relay
 export ASSETS=$HOME/Projects/moq/media-assets
 ```
 
-Publishers mint their own namespace and print it. Where two tools must
-meet on the same namespace — flow B's pair and flow E's audience — set
-it once in the shell and reuse it, rather than copying a timestamp
-around:
+Every `python -m aiomoqt.tools.…` line below needs that venv.
 
-```
-export NS=demo/$(date +%H%M%S)
-```
+**No namespace is set by hand, and there is no `NS` to export.** Two
+flows need a pair to agree, and each handles it without one:
 
-Paste that same line into the second shell only if it needs to agree;
-otherwise ignore it. A fresh namespace per run keeps moxygen's cache
-from serving stale objects.
+- **Flow B** — `pub_bench` and `sub_bench` both default `-N` to
+  `aiomoqt`, so omitting it on both makes them meet. `-T v1080p` on both
+  is what actually picks the track out.
+- **Flow E** — `pub_media` mints `aiomoqt/demo-<rand4>` and prints it.
+  Paste that one printed namespace into the audience. `load_sim`
+  rewrites the scenario to whatever `-N` it is given; it has no prefix
+  discovery, so this is the one copy in the whole runbook.
+
+moqx-main is shared. If someone else is benching, give flow B's pair a
+namespace of your own — the same `-N aiomoqt/<something>` on both lines
+— rather than sharing the default.
 
 ## Hosts, by role
 
@@ -230,14 +236,15 @@ measuring it. This is the controlled point measurement to compare across
 builds.
 
 ```
-python -m aiomoqt.tools.pub_bench "$RELAY_QUIC" -N "$NS" -T v1080p --video 1080p --draft 18 -k -t 120
+python -m aiomoqt.tools.pub_bench "$RELAY_QUIC" -T v1080p --video 1080p --draft 18 -k -t 120
 ```
 
 ```
-python -m aiomoqt.tools.sub_bench "$RELAY_QUIC" -N "$NS" -T v1080p --draft 18 -t 120 -i 5
+python -m aiomoqt.tools.sub_bench "$RELAY_QUIC" -T v1080p --draft 18 -t 120 -i 5
 ```
 
-Both shells export the same `$NS`, so they agree.
+Nothing to set: both tools default to namespace `aiomoqt`, so they meet
+there, and `-T v1080p` on both is what selects the track.
 
 
 - `--video` sets object size, rate and GOP together, overriding `-s`,
@@ -355,16 +362,17 @@ The one-track case needs no scenario file at all:
 scenario's own publishers, so **it needs a broadcast already running or
 every subscribe fails**. Two shells.
 
-Shell 1 — the broadcast. It prints the namespace it chose:
+Shell 1 — the broadcast. It mints its own namespace and prints it as
+`namespace: aiomoqt/demo-<rand4>`:
 
 ```
-python -m aiomoqt.tools.pub_media "$RELAY_WT" --draft 18 -k -N "$NS" --mp4 "$ASSETS/bbb-720p-2000k.mp4" --loop --keepalive 10 --catalog-interval 1 --target-latency 500 -t 600
+python -m aiomoqt.tools.pub_media "$RELAY_WT" --draft 18 -k --pub-both --mp4 "$ASSETS/bbb-1080p-2500k.mp4" --loop --keepalive 10 --catalog-interval 1 --target-latency 200 -t 600
 ```
 
-Shell 2 — the audience, with the same `$NS` exported:
+Shell 2 — the audience. Paste the namespace Shell 1 printed:
 
 ```
-python -m aiomoqt.tools.load_sim "$RELAY_WT" -f viewers --role sub -N "$NS" --draft 18 -k -i 5
+python -m aiomoqt.tools.load_sim "$RELAY_WT" -f viewers --role sub -N aiomoqt/demo-XXXX --draft 18 -k -i 5
 ```
 
 Observed on 2026-09-15: subscribers climb to 42–43 of the 43 target,
