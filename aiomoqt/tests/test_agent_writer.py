@@ -282,3 +282,73 @@ async def test_closing_the_session_closes_writers():
     assert agent.writers == {}
     with pytest.raises(AgentError, match="closed"):
         await wtr.write(b"a")
+
+
+# -- transport scheduling --------------------------------------------
+
+@pytest.mark.parametrize("moqt,discipline,expected", (
+    (0, "round_robin", 0),
+    (1, "round_robin", 0),      # one bit of resolution is the cost
+    (128, "round_robin", 128),
+    (129, "round_robin", 128),
+    (255, "round_robin", 254),
+    (0, "fifo", 1),
+    (128, "fifo", 129),
+    (255, "fifo", 255),
+))
+def test_to_stream_priority_keeps_discipline_out_of_the_value(
+        moqt, discipline, expected):
+    """The low bit is picoquic's discipline selector, not a priority bit."""
+    from aiomoqt.agent.session import to_stream_priority
+    assert to_stream_priority(moqt, discipline=discipline) == expected
+
+
+def test_mapping_is_monotonic_and_uniform_in_discipline():
+    """Order is preserved and every level shares one discipline.
+
+    A naive copy would make 128 round-robin and 129 FIFO — adjacent
+    MoQT priorities differing in kind, which §7.1 never says.
+    """
+    from aiomoqt.agent.session import to_stream_priority
+    for discipline, bit in (("round_robin", 0), ("fifo", 1)):
+        mapped = [to_stream_priority(p, discipline=discipline)
+                  for p in range(256)]
+        assert mapped == sorted(mapped)
+        assert {m & 1 for m in mapped} == {bit}
+
+
+def test_unknown_discipline_rejected():
+    from aiomoqt.agent.session import to_stream_priority
+    with pytest.raises(AgentError):
+        to_stream_priority(0, discipline="lifo")
+
+
+def test_declared_priority_reaches_the_track_as_a_transport_byte():
+    _wtr, track = _writer(_pub(priority=Priority(publisher=9)))
+    assert track.stream_priority == 8        # LSB cleared for round robin
+    assert track.priority == 9               # the MoQT wire value is untouched
+
+
+def test_undeclared_priority_leaves_the_transport_default():
+    """Opt-in: no declaration, no scheduling call, no behaviour change."""
+    _wtr, track = _writer()
+    assert track.stream_priority is None
+
+
+def test_session_scheduling_selects_the_discipline():
+    agent = AgentSession(_StubSession(), scheduling="fifo")
+    wtr = agent.writer(_pub(priority=Priority(publisher=8)))
+    assert wtr._track.stream_priority == 9   # 8 | fifo bit
+    assert agent.priority_plan()["scheduling"] == "fifo"
+
+
+def test_bad_session_scheduling_rejected():
+    with pytest.raises(AgentError, match="scheduling must be"):
+        AgentSession(_StubSession(), scheduling="sideways")
+
+
+def test_enforced_is_false_without_a_transport_priority_api():
+    """Never claim a relationship is applied when it is not."""
+    agent = AgentSession(_StubSession())
+    assert agent.scheduling_enforced is False
+    assert agent.priority_plan()["enforced"] is False

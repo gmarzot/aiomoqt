@@ -13,9 +13,11 @@ Async only. A loop-owning runtime with a blocking facade wraps this
 later; nothing here assumes it is driven from the loop thread beyond
 ordinary asyncio rules.
 
-The declared relationship is carried, not yet enforced: applying it needs
-per-stream priority plumbed through aiopquic (0.5.0). Until then
-`priority_plan()` reports what was asked for, and `enforced` is False.
+A declared publisher priority reaches the transport scheduler where one
+exists (aiopquic >= 0.4.1); `priority_plan()` reports whether it actually
+did rather than assuming. Scheduling among equal priorities is a local
+policy, not MoQT semantics (§7.2 leaves it implementation-defined), so it
+is configured per connection and never carried in a spec.
 """
 from __future__ import annotations
 
@@ -41,6 +43,31 @@ _GROUP_ORDERS = {
 }
 
 
+SCHEDULING = ("round_robin", "fifo")
+
+
+def to_stream_priority(moqt_priority: int, *,
+                       discipline: str = "round_robin") -> int:
+    """MoQT priority (§7.1: 0-255, lower = more urgent) to a transport byte.
+
+    picoquic reads the low bit as a scheduling-discipline selector among
+    streams of equal priority — even round robin, odd FIFO by stream id.
+    That is its model, not MoQT's: §7.2 defines an ordering and leaves
+    ordering among equals implementation-defined. So the bit is set
+    uniformly from configuration and never inherited from the MoQT
+    value, or two adjacent priorities would differ in discipline as well
+    as in order.
+
+    Costs one bit: 128 ordered levels. Still more resolution than peers
+    read — moxygen maps the top three bits only.
+    """
+    if discipline not in SCHEDULING:
+        raise AgentError(
+            f"scheduling must be one of {', '.join(SCHEDULING)}, "
+            f"got {discipline!r}")
+    return (moqt_priority & 0xFE) | (1 if discipline == "fifo" else 0)
+
+
 def start_at_to_wire(spec_start) -> Tuple[FilterType, int, int, int]:
     """Map a StartAt onto (filter_type, start_group, start_object, end_group).
 
@@ -60,8 +87,13 @@ def start_at_to_wire(spec_start) -> Tuple[FilterType, int, int, int]:
 class AgentSession:
     """One connection, its readers, and its writers."""
 
-    def __init__(self, session: Any):
+    def __init__(self, session: Any, *, scheduling: str = "round_robin"):
+        if scheduling not in SCHEDULING:
+            raise AgentError(
+                f"scheduling must be one of {', '.join(SCHEDULING)}, "
+                f"got {scheduling!r}")
         self._session = session
+        self.scheduling = scheduling
         self._readers: Dict[str, Reader] = {}
         self._publishes: Dict[str, PublishSpec] = {}
         self._writers: Dict[str, Writer] = {}
@@ -120,7 +152,8 @@ class AgentSession:
         name = str(spec.track)
         if name in self._writers:
             raise AgentError(f"writer: already publishing {name}")
-        wtr, _track = build_writer(self._session, spec)
+        wtr, _track = build_writer(self._session, spec,
+                                   scheduling=self.scheduling)
         self._writers[name] = wtr
         self._publishes[name] = spec
         return wtr
@@ -147,7 +180,18 @@ class AgentSession:
              "publisher": None,
              "subscriber": rdr.spec.priority.subscriber}
             for name, rdr in self._readers.items())
-        return {"enforced": False, "tracks": tracks}
+        return {"enforced": self.scheduling_enforced,
+                "scheduling": self.scheduling, "tracks": tracks}
+
+    @property
+    def scheduling_enforced(self) -> bool:
+        """Whether a declared priority actually reaches the scheduler.
+
+        False on a transport with no priority API (aiopquic < 0.4.1), so
+        a caller is never told a relationship is applied when it is not.
+        """
+        return hasattr(getattr(self._session, "_quic", None),
+                       "set_stream_priority")
 
     def close_reader(self, name: str) -> None:
         rdr = self._readers.pop(name, None)

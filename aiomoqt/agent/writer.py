@@ -204,8 +204,15 @@ def _as_bytes(payload: Any) -> bytes:
     return json.dumps(payload, separators=(",", ":")).encode()
 
 
-def build_writer(session: Any, spec: PublishSpec) -> Tuple[Writer, _PushTrack]:
-    """Construct the track and its writer without publishing yet."""
+def build_writer(session: Any, spec: PublishSpec, *,
+                 scheduling: str = "round_robin",
+                 ) -> Tuple[Writer, _PushTrack]:
+    """Construct the track and its writer without publishing yet.
+
+    A declared publisher priority is mapped to a transport byte once,
+    here — constant for the track's life, so it never costs work in the
+    send loop. Undeclared leaves streams at the transport default.
+    """
     mapping = _MAPPINGS.get(spec.mapping)
     if mapping is None:
         raise AgentError(f"publish mapping {spec.mapping!r} has no wire form")
@@ -218,6 +225,10 @@ def build_writer(session: Any, spec: PublishSpec) -> Tuple[Writer, _PushTrack]:
         priority=(spec.priority.publisher
                   if spec.priority.publisher is not None else 128),
         queue=queue, stats=stats, mapping=mapping)
+    if spec.priority.publisher is not None:
+        from .session import to_stream_priority
+        track.stream_priority = to_stream_priority(
+            spec.priority.publisher, discipline=scheduling)
     return Writer(spec, track, queue, stats), track
 
 

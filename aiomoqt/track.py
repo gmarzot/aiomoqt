@@ -188,6 +188,10 @@ class PublishedTrack(Track):
                          object_size, group_size, num_subgroups, rate)
         self.forwarding = forwarding
         self.priority = priority
+        # Transport send priority for this track's streams; None leaves
+        # them at the transport default. Opt-in, so a track that never
+        # asks for scheduling behaves exactly as before.
+        self.stream_priority = None
         self.auth_token = auth_token
         self._subscriber_event = asyncio.Event()
         # (group_id, object_id) max over all objects sent; None until
@@ -289,7 +293,8 @@ class PublishedTrack(Track):
         self._out.drop_session(sub.session)
         sub.delivery = SubgroupDelivery(sub.session, sub.track_alias,
                                         priority=self.priority,
-                                        mapping=self.mapping)
+                                        mapping=self.mapping,
+                                        stream_priority=self.stream_priority)
         self._out.add(sub.delivery,
                       gate=lambda: sub.forward and sub.generating)
 
