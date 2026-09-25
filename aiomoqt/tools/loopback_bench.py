@@ -72,6 +72,10 @@ def parse_args():
              'or group accounting. Measures the delivery ceiling '
              'without the measurement in it.')
     parser.add_argument(
+        '--bind', type=str, default='localhost',
+        help='Address the subscriber dials; the publisher listens on '
+             'all interfaces (default: localhost)')
+    parser.add_argument(
         '-p', '--port', type=int, default=4434,
         help='Local port (default: 4434)')
     parser.add_argument(
@@ -136,8 +140,9 @@ def parse_args():
 def print_banner(args):
     transport_label = "QUIC" if args.quic else "H3/WebTransport"
     # url implies port + transport; raw QUIC has no path, WT uses "/"
-    url = (f"moqt://localhost:{args.port}" if args.quic
-           else f"https://localhost:{args.port}/")
+    host = f"[{args.bind}]" if ':' in args.bind else args.bind
+    url = (f"moqt://{host}:{args.port}" if args.quic
+           else f"https://{host}:{args.port}/")
     cc = args.cc_algo or "bbr1 (default)"
     if args.rate > 0:
         per_stream = (args.rate / args.streams
@@ -194,7 +199,7 @@ async def run_server(args):
     from functools import partial
 
     server = MOQTServer(
-        host="localhost", port=args.port,
+        host=args.bind, port=args.port,
         certificate=args.cert, private_key=args.key,
         path="/",
         use_quic=args.quic,
@@ -217,7 +222,7 @@ async def run_server(args):
 async def run_subscriber(args, stats):
     """Connect as subscriber and collect stats."""
     client = MOQTClient(
-        "localhost", args.port,
+        args.bind, args.port,
         path="/",
         use_quic=args.quic,
         supported_drafts=args.draft,

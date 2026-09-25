@@ -2338,6 +2338,27 @@ class _MOQTSessionMixin:
                 WebTransportError) as e:
             logger.debug(f"stream({stream_id}): write race: {e}")
 
+    def set_stream_priority(self, stream_id: int, priority: int) -> bool:
+        """Set the transport send priority for one stream.
+
+        Advisory, and deliberately so: RFC 9000 §2.3 gives QUIC no wire
+        mechanism for priority and asks only that an implementation offer
+        an API. A transport without one, or a full TX event ring, leaves
+        the stream at the default rather than failing the write.
+
+        Posts without waking the worker — the header write that follows
+        an open carries it — so the cost is one ring entry per stream.
+        """
+        setter = getattr(self._quic, 'set_stream_priority', None)
+        if setter is None:  # aiopquic < 0.4.1
+            return False
+        try:
+            setter(stream_id, priority)
+        except Exception as e:
+            logger.debug(f"stream({stream_id}): priority not applied: {e}")
+            return False
+        return True
+
     async def stream_write_drain(self, stream_id: int, data: bytes,
                                   end_stream: bool = False) -> None:
         """Write bytes with backpressure.
