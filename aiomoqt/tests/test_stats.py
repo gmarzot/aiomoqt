@@ -134,6 +134,54 @@ def test_out_of_order_counted_not_lost():
     assert s.summary()['ooo'] >= 1
 
 
+def test_reorder_that_fills_a_gap_is_not_lost():
+    s = TrackStats()
+    us = _now_us()
+    for o in (0, 1, 3, 2, 4):
+        s.on_object(Obj(0, o), 10, us)
+    summ = s.summary()
+    assert (summ['lost'], summ['ooo'], summ['objects']) == (0, 1, 5)
+
+
+def test_repeat_of_a_received_object_does_not_reverse_loss():
+    s = TrackStats()
+    us = _now_us()
+    for o in (0, 1, 3, 1):
+        s.on_object(Obj(0, o), 10, us)
+    assert (s.summary()['lost'], s.summary()['ooo']) == (1, 1)
+
+
+def test_filled_gap_reverses_loss_in_snapshot_deltas():
+    s = TrackStats()
+    us = _now_us()
+    for o in (0, 1, 3):
+        s.on_object(Obj(0, o), 10, us)
+    assert s.snapshot()['iv_lost'] == 1
+    s.on_object(Obj(0, 2), 10, us)
+    snap = s.snapshot()
+    assert (snap['iv_lost'], snap['loss']) == (-1, 0)
+
+
+def test_gap_across_a_snapshot_is_detected():
+    s = TrackStats()
+    us = _now_us()
+    for o in (0, 1):
+        s.on_object(Obj(0, o), 10, us)
+    s.snapshot()
+    s.on_object(Obj(0, 3), 10, us)
+    assert s.summary()['lost'] == 1
+
+
+def test_filled_gap_across_subgroup_switch():
+    s = TrackStats()
+    us = _now_us()
+    for o in (0, 1, 3):
+        s.on_object(Obj(0, o, subgroup_id=0), 10, us)
+    s.on_object(Obj(0, 0, subgroup_id=1), 10, us)
+    s.on_object(Obj(0, 2, subgroup_id=0), 10, us)
+    assert s.summary()['lost'] == 0
+
+
 # -- latency / jitter ------------------------------------------------
 
 def test_latency_from_timestamp_extension():

@@ -10,6 +10,8 @@
 - media: `on_arrival` on `LocTrackSubscriber` and `MediaSubscriber` sees every object,
   END_OF_GROUP included, with its receive time.
 - media: `chunk_decode_time()` and `init_timescale()` read CMAF tfdt and mdhd.
+- Fix: TrackStats counted a reorder that filled a gap as lost, and missed a gap spanning a
+  `snapshot()`.
 
 ## v0.11.1
 
