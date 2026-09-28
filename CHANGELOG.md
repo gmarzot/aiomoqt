@@ -3,6 +3,10 @@
 ## Unreleased
 
 - loopback_bench: `--bind` sets the address the subscriber dials (default `localhost`).
+- sub_media: `--analyze` measures delivery without decoding — latency, jitter, loss and
+  reorder, group integrity, keyframe cost, bitrate, and a playout model; `--report PATH`
+  writes CSV (`-` = stdout).
+- sub_media: `-i` sets the report interval; `-T` limits it to one catalog track.
 - media: `on_arrival` on `LocTrackSubscriber` and `MediaSubscriber` sees every object,
   END_OF_GROUP included, with its receive time.
 - media: `chunk_decode_time()` and `init_timescale()` read CMAF tfdt and mdhd.
