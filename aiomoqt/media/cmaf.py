@@ -12,6 +12,8 @@ from __future__ import annotations
 import struct
 from typing import Optional
 
+from .sources import Mp4Error, _find
+
 
 def _box(btype: bytes, *payload: bytes) -> bytes:
     data = b''.join(payload)
@@ -137,3 +139,34 @@ class CmafChunker:
         assert len(moof) == 100
         self._dts += duration
         return moof + _box(b'mdat', payload)
+
+
+# -- readers ---------------------------------------------------------
+
+def _full_box_field(data: bytes, path: tuple, v0: tuple, v1: tuple):
+    """One field of the full box at `path`: v0/v1 are (offset, format)
+    after version+flags for box version 0 / 1. None if absent or short."""
+    try:
+        span = _find(data, 0, len(data), *path)
+    except Mp4Error:
+        return None
+    if span is None or span[1] - span[0] < 4:
+        return None
+    off, fmt = v1 if data[span[0]] == 1 else v0
+    pos = span[0] + 4 + off
+    if pos + struct.calcsize(fmt) > span[1]:
+        return None
+    return struct.unpack_from(fmt, data, pos)[0]
+
+
+def chunk_decode_time(chunk: bytes) -> Optional[int]:
+    """Decode time of a CMAF chunk's first sample (moof tfdt), in track
+    timescale units; None if the chunk has no tfdt."""
+    return _full_box_field(chunk, (b'moof', b'traf', b'tfdt'),
+                           (0, '>I'), (0, '>Q'))
+
+
+def init_timescale(init: bytes) -> Optional[int]:
+    """Track timescale from a CMAF header's mdhd; None if absent."""
+    return _full_box_field(init, (b'moov', b'trak', b'mdia', b'mdhd'),
+                           (8, '>I'), (16, '>I'))

@@ -226,6 +226,8 @@ class MediaSubscriber:
     subscribes every LOC media track it describes.
 
     on_frame(track_name, frame, group_id, object_id) receives media;
+    on_arrival(track_name, msg, recv_us, group_id, subgroup_id, frame)
+    sees every media-track object first (see LocTrackSubscriber);
     on_catalog(catalog) fires on every independent catalog or applied
     delta.
     """
@@ -234,7 +236,8 @@ class MediaSubscriber:
                  on_frame: Optional[Callable] = None,
                  on_catalog: Optional[Callable] = None,
                  track_filter: Optional[Callable] = None,
-                 discover: bool = False):
+                 discover: bool = False,
+                 on_arrival: Optional[Callable] = None):
         self.session = session
         self.namespace = namespace
         # Treat `namespace` as a prefix and resolve it to the namespace
@@ -242,6 +245,7 @@ class MediaSubscriber:
         # find a broadcast whose name it was never told.
         self.discover = discover
         self.on_frame = on_frame
+        self.on_arrival = on_arrival
         self.on_catalog = on_catalog
         self.track_filter = track_filter or (lambda t: True)
         self.catalog: Optional[Catalog] = None
@@ -347,7 +351,10 @@ class MediaSubscriber:
                 self.session,
                 entry.namespace or self.namespace, name,
                 on_frame=(lambda f, gid, oid, _n=name:
-                          self.on_frame and self.on_frame(_n, f, gid, oid)))
+                          self.on_frame and self.on_frame(_n, f, gid, oid)),
+                on_arrival=(lambda m, rx, gid, sg, f, _n=name:
+                            self.on_arrival
+                            and self.on_arrival(_n, m, rx, gid, sg, f)))
             if entry.packaging == PACKAGING_LOC:
                 # cmaf init is a CMAF header consumed by the sink, not
                 # decoder extradata — leave config unset there.

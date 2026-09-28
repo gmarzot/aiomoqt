@@ -3,6 +3,9 @@
 ## Unreleased
 
 - loopback_bench: `--bind` sets the address the subscriber dials (default `localhost`).
+- media: `on_arrival` on `LocTrackSubscriber` and `MediaSubscriber` sees every object,
+  END_OF_GROUP included, with its receive time.
+- media: `chunk_decode_time()` and `init_timescale()` read CMAF tfdt and mdhd.
 
 ## v0.11.1
 
