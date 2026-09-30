@@ -1905,6 +1905,7 @@ class _MOQTSessionMixin:
 
         if self._control_stream_id is None:
             self._control_stream_id = stream_id
+            self._prioritise_control_stream(stream_id)
             logger.debug(f"QUIC event: detecting control stream: {stream_id}")
         elif stream_id != self._control_stream_id:
             if is_draft16_or_later(self.negotiated_draft):
@@ -2197,6 +2198,8 @@ class _MOQTSessionMixin:
                 self._d18_control_write_sid = (
                     self._quic.get_next_available_stream_id(
                         is_unidirectional=True))
+                self._prioritise_control_stream(
+                    self._d18_control_write_sid)
                 logger.info(
                     f"MOQT: d18 control write-uni: "
                     f"{self._d18_control_write_sid}")
@@ -2204,6 +2207,7 @@ class _MOQTSessionMixin:
                 self._control_stream_id = (
                     self._quic.get_next_available_stream_id(
                         is_unidirectional=False))
+                self._prioritise_control_stream(self._control_stream_id)
                 logger.info(
                     f"MOQT: QUIC control stream created stream id: "
                     f"{self._control_stream_id}")
@@ -2238,11 +2242,14 @@ class _MOQTSessionMixin:
                 # sends (the demux in quic_event_received is transport-
                 # agnostic). The data plane already proves WT uni streams.
                 self._d18_control_write_sid = await self.open_uni_stream()
+                self._prioritise_control_stream(
+                    self._d18_control_write_sid)
                 logger.info(
                     f"MOQT: d18 WT control write-uni: "
                     f"{self._d18_control_write_sid}")
             else:
                 self._control_stream_id = await self.open_bidi_stream()
+                self._prioritise_control_stream(self._control_stream_id)
                 logger.info(
                     f"MOQT: WT control stream created stream id: "
                     f"{self._control_stream_id}")
@@ -2337,6 +2344,18 @@ class _MOQTSessionMixin:
         except (AssertionError, AttributeError, BufferError,
                 WebTransportError) as e:
             logger.debug(f"stream({stream_id}): write race: {e}")
+
+    def _prioritise_control_stream(self, stream_id: Optional[int]) -> None:
+        """Put a control stream in its own band, above subscription data.
+
+        Scheduling is strict, so a greedy data track sharing or undercutting
+        the control band starves it: no SUBSCRIBE_OK, no PUBLISH_DONE, the
+        session wedges under load. to_stream_priority() floors declared data
+        above this band so that cannot happen.
+        """
+        if stream_id is None:
+            return
+        self.set_stream_priority(stream_id, STREAM_BAND_CONTROL)
 
     def _transport_priority_setter(self):
         """The transport's set_stream_priority, or None.
@@ -4189,6 +4208,7 @@ class _MOQTSessionMixin:
             # Transport-aware: raw QUIC allocates a uni id synchronously,
             # WT round-trips via create_stream. open_uni_stream handles both.
             self._d18_control_write_sid = await self.open_uni_stream()
+            self._prioritise_control_stream(self._d18_control_write_sid)
             logger.info(
                 f"MOQT: d18 server control write-uni: "
                 f"{self._d18_control_write_sid}")

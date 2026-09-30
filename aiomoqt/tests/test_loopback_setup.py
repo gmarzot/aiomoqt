@@ -170,3 +170,38 @@ async def test_stream_priority_reaches_the_scheduler(use_quic):
                 f"{'raw QUIC' if use_quic else 'WebTransport'}")
     finally:
         server.close()
+
+
+@pytest.mark.parametrize("draft", (16, 18))
+@pytest.mark.asyncio
+async def test_control_stream_gets_its_own_band(use_quic, draft):
+    """The control stream is prioritised on every transport and draft.
+
+    Scheduling is strict, so a greedy data track sharing or undercutting
+    the control band starves it — no SUBSCRIBE_OK, no PUBLISH_DONE, the
+    session wedges under load. There are five places a control stream id is
+    established (raw QUIC bidi, raw QUIC d18 write-uni, WT bidi, WT d18
+    write-uni, and the server accepting inbound); the raw-QUIC d18 one was
+    missed on the first pass and only the counter caught it.
+    """
+    port = _BASE_PORT + (41 if use_quic else 44) + draft
+    server = await _start_server(
+        port, supported_drafts=draft, use_quic=use_quic)
+    try:
+        client = MOQTClient(
+            "localhost", port, path="/",
+            use_quic=use_quic,
+            verify_tls=False, supported_drafts=draft,
+        )
+        async with client.connect() as session:
+            await session.client_session_init()
+            if _applied(session) < 0:
+                pytest.skip("aiopquic without priority counters")
+            counters = session._transport.counters
+            assert counters["set_priority_applied"] >= 1, (
+                "control stream was never prioritised")
+            assert counters["set_priority_rejected"] == 0, (
+                f"picoquic refused it, last_err="
+                f"{counters['set_priority_last_err']}")
+    finally:
+        server.close()

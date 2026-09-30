@@ -205,7 +205,7 @@ def _as_bytes(payload: Any) -> bytes:
 
 
 def build_writer(session: Any, spec: PublishSpec, *,
-                 scheduling: str = "fifo",
+                 scheduling: str = "round_robin",
                  ) -> Tuple[Writer, _PushTrack]:
     """Construct the track and its writer without publishing yet.
 
@@ -226,7 +226,7 @@ def build_writer(session: Any, spec: PublishSpec, *,
                   if spec.priority.publisher is not None else 128),
         queue=queue, stats=stats, mapping=mapping)
     if spec.priority.publisher is not None:
-        from .session import to_stream_priority
+        from ..types import to_stream_priority
         track.stream_priority = to_stream_priority(
             spec.priority.publisher, discipline=scheduling)
     return Writer(spec, track, queue, stats), track

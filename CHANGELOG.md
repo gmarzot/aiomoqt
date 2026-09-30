@@ -2,14 +2,15 @@
 
 ## Unreleased
 
-- Transport priority mapping is centred on picoquic's default, so a track
-  declaring MoQT's neutral priority (128, transport §12.4) lands on picoquic's
-  own default (9) instead of below every undeclared stream. Eight bands, MoQT's
-  top three bits — what peers actually read. The wire value is unchanged; only
-  the local mapping is banded.
-- Default scheduling discipline among equal priorities is now `fifo`, matching
-  picoquic's own default, where it was `round_robin`. `round_robin` shifts the
-  band to even and remains selectable per session.
+- Transport stream scheduling now has a defined band layout, in `aiomoqt.types`:
+  0 disallowed, 2/4/6 reserved above control, 8 control streams, 9 datagrams
+  (picoquic's default, untouched), 10-254 subscription data. Control streams are
+  prioritised on every transport and draft; declared data is floored above the
+  control band, since scheduling is strict and a greedy track below it would
+  starve the session's own control stream. The wire always carries the declared
+  8-bit MoQT priority unchanged — only the local mapping is banded.
+- `to_stream_priority()` moved from `aiomoqt.agent.session` to `aiomoqt.types`,
+  now that both the agent layer and the session need it.
 - Fix: `priority_plan()["enforced"]` probes the setter the session would really
   dispatch to. On WebTransport it reported enforcement because the session
   carried the method it was being asked about.

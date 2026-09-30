@@ -286,77 +286,64 @@ async def test_closing_the_session_closes_writers():
 
 # -- transport scheduling --------------------------------------------
 
-@pytest.mark.parametrize("moqt,discipline,expected", (
-    (0, "fifo", 1),
-    (96, "fifo", 7),
-    (128, "fifo", 9),           # neutral lands on picoquic's own default
-    (160, "fifo", 11),
-    (255, "fifo", 15),
-    (0, "round_robin", 0),
-    (128, "round_robin", 8),
-    (255, "round_robin", 14),
+@pytest.mark.parametrize("moqt,expected", (
+    (0, 10),        # below the floor: collapses onto it
+    (8, 10),        # would land in the control band
+    (10, 10),
+    (12, 12),
+    (128, 128),
+    (254, 254),
+    (255, 254),     # low bit is the discipline selector, not resolution
 ))
-def test_to_stream_priority_bands(moqt, discipline, expected):
-    """Eight bands centred on picoquic's default.
-
-    MoQT's top three bits, which is what peers consume — moxygen reads
-    three, Cloudflare ignores priority entirely.
-    """
-    from aiomoqt.agent.session import to_stream_priority
-    assert to_stream_priority(moqt, discipline=discipline) == expected
+def test_to_stream_priority_bands(moqt, expected):
+    from aiomoqt.types import to_stream_priority
+    assert to_stream_priority(moqt) == expected
 
 
-def test_neutral_priority_equals_the_transport_default():
-    """The load-bearing property: declaring MoQT's neutral value must not
-    demote a track below undeclared traffic.
-
-    The two scales have different neutral points — MoQT omitted means 128
-    (transport §12.4), picoquic's default is 9 — so an identity map put
-    every declared-neutral track *below* every undeclared stream.
-    """
-    from aiomoqt.agent.session import (
-        to_stream_priority, MOQT_NEUTRAL_PRIORITY, PICOQUIC_DEFAULT_PRIORITY)
-    assert to_stream_priority(
-        MOQT_NEUTRAL_PRIORITY, discipline="fifo") == PICOQUIC_DEFAULT_PRIORITY
-
-
-def test_mapped_values_stay_in_range():
-    from aiomoqt.agent.session import to_stream_priority
-    for discipline in ("fifo", "round_robin"):
-        for p in range(256):
-            assert 0 <= to_stream_priority(p, discipline=discipline) <= 255
-
-
-@pytest.mark.parametrize("bad", (-1, 256))
-def test_out_of_range_moqt_priority_rejected(bad):
-    from aiomoqt.agent.session import to_stream_priority
-    with pytest.raises(AgentError):
-        to_stream_priority(bad)
+def test_declared_data_never_reaches_the_control_band():
+    """The load-bearing property. Scheduling is strict, so a greedy track
+    in a band at or below control would starve the session's own control
+    stream — an app writing Priority(publisher=0) would wedge itself."""
+    from aiomoqt.types import (
+        to_stream_priority, STREAM_BAND_CONTROL, STREAM_BAND_DATA_FLOOR)
+    for p in range(256):
+        for d in ("round_robin", "fifo"):
+            assert to_stream_priority(p, discipline=d) > STREAM_BAND_CONTROL
+            assert to_stream_priority(p, discipline=d) >= STREAM_BAND_DATA_FLOOR
 
 
 def test_mapping_is_monotonic_and_uniform_in_discipline():
-    """Order is preserved and every level shares one discipline.
+    """Order is preserved and every band shares one discipline.
 
-    A naive copy would make 128 round-robin and 129 FIFO — adjacent
-    MoQT priorities differing in kind, which §7.1 never says.
+    Inheriting the low bit would make adjacent MoQT priorities differ in
+    kind — one band sharing fairly, the next handing everything to its
+    lowest stream id.
     """
-    from aiomoqt.agent.session import to_stream_priority
+    from aiomoqt.types import to_stream_priority
     for discipline, bit in (("round_robin", 0), ("fifo", 1)):
         mapped = [to_stream_priority(p, discipline=discipline)
                   for p in range(256)]
         assert mapped == sorted(mapped)
         assert {m & 1 for m in mapped} == {bit}
+        assert all(0 <= m <= 255 for m in mapped)
 
 
 def test_unknown_discipline_rejected():
-    from aiomoqt.agent.session import to_stream_priority
-    with pytest.raises(AgentError):
+    from aiomoqt.types import to_stream_priority
+    with pytest.raises(ValueError):
         to_stream_priority(0, discipline="lifo")
+
+
+@pytest.mark.parametrize("bad", (-1, 256))
+def test_out_of_range_moqt_priority_rejected(bad):
+    from aiomoqt.types import to_stream_priority
+    with pytest.raises(ValueError):
+        to_stream_priority(bad)
 
 
 def test_declared_priority_reaches_the_track_as_a_transport_byte():
     _wtr, track = _writer(_pub(priority=Priority(publisher=9)))
-    assert track.stream_priority == 1        # urgent band, fifo discipline
+    assert track.stream_priority == 10       # clamped to the data floor
     assert track.priority == 9               # the MoQT wire value is untouched
 
 
@@ -367,12 +354,12 @@ def test_undeclared_priority_leaves_the_transport_default():
 
 
 def test_session_scheduling_selects_the_discipline():
-    """round_robin shifts the whole band to even; fifo keeps it odd."""
+    """round_robin shares a band fairly; fifo hands it to one stream."""
     fifo = AgentSession(_StubSession(), scheduling="fifo")
     rr = AgentSession(_StubSession(), scheduling="round_robin")
     p = _pub(priority=Priority(publisher=128))
-    assert fifo.writer(p)._track.stream_priority == 9
-    assert rr.writer(p)._track.stream_priority == 8
+    assert rr.writer(p)._track.stream_priority == 128
+    assert fifo.writer(p)._track.stream_priority == 129
     assert fifo.priority_plan()["scheduling"] == "fifo"
 
 
