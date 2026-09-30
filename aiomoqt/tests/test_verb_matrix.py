@@ -45,6 +45,7 @@ def _session(draft, is_client=True):
     s._pending_requests = {}
     s._next_track_alias = 0
     s._track_aliases = {}
+    s._published_aliases = {}
     s._subscriptions = {}
     s._fetch_done_futures = {}
     s._bidi_streams = {7: 9}

@@ -24,6 +24,7 @@ def _session(draft=18):
     s._profile = profile_for(draft)
     s._subscriptions = {}
     s._track_aliases = {}
+    s._published_aliases = {}
     s._object_handlers = {}
     s._pending_requests = {}
     s._request_cancel_handlers = {}
@@ -99,6 +100,34 @@ async def test_unsubscribe_reaches_the_owner_before_d18(draft):
     s.register_request_cancel_handler(7, cancelled.append)
     await s._handle_unsubscribe(Unsubscribe(request_id=7))
     assert cancelled == [7]
+
+
+@pytest.mark.asyncio
+async def test_unsubscribe_leaves_a_received_track_with_the_same_alias():
+    # Both ends number aliases from 0, so a session that publishes and
+    # subscribes holds alias 0 twice. The peer leaving the track we
+    # publish must not touch the track we receive under that number.
+    s = _session(16)
+    s._next_track_alias = 0
+    s._send_reply = lambda rid, msg, fin=False: None
+    resets = []
+    s.stream_reset = lambda sid, code: resets.append(sid)
+
+    def on_object(*a, **k):
+        pass
+    s._track_aliases[0] = 2
+    s.register_object_handler(0, on_object)
+    s._subgroup_stream_by_key[(0, 5, 0)] = 11
+
+    ok = s.subscribe_ok(request_msg=SimpleNamespace(request_id=7))
+    assert ok.track_alias == 0
+    await s._handle_unsubscribe(Unsubscribe(request_id=7))
+
+    assert s._published_aliases == {}
+    assert s._track_aliases == {0: 2}
+    assert s._object_handlers == {0: on_object}
+    assert s._subgroup_stream_by_key == {(0, 5, 0): 11}
+    assert resets == []
 
 
 def _track(session, subgroups=2):

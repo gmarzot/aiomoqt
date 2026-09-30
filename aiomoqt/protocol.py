@@ -322,7 +322,12 @@ class _MOQTSessionMixin:
         self._request_cancel_handlers: Dict[int, Callable] = {}
         # request_id -> callback fired on PUBLISH_DONE for that request.
         self._publish_done_handlers: Dict[int, Callable] = {}
-        self._track_aliases: Dict[int, int] = {}  # map alias to subscription_id
+        # Aliases the peer assigned (SUBSCRIBE_OK / PUBLISH) -> our
+        # request id: the receive-side registry.
+        self._track_aliases: Dict[int, int] = {}
+        # Aliases we assigned as publisher -> the peer's request id. A
+        # separate number space: both ends count from 0.
+        self._published_aliases: Dict[int, int] = {}
         # Set when client_session_init completes (ms, monotonic delta).
         self._established_ms: Optional[float] = None
         # Per-track object delivery keyed by track_alias; falls back to
@@ -559,10 +564,11 @@ class _MOQTSessionMixin:
         return request_id
 
     def _allocate_track_alias(self, request_id: int = 1) -> int:
-        """Get next available track alias."""
+        """Next alias for a track we publish, bound to the peer's
+        request."""
         track_alias = self._next_track_alias
         self._next_track_alias += 1
-        self._track_aliases[track_alias] = request_id
+        self._published_aliases[track_alias] = request_id
         return track_alias
 
     def register_object_handler(self, track_alias: int,
@@ -3887,26 +3893,14 @@ class _MOQTSessionMixin:
         # Handle announcement cancellation
 
     async def _handle_unsubscribe(self, msg: Unsubscribe) -> None:
-        """Publisher-side: subscriber wants out. RESET every subgroup uni
-        stream we still have open for this subscription's track_alias,
-        then drop the subscription state. The subscriber's matching
-        STOP_SENDING (if it raced) is reciprocated separately by the
-        StopSendingReceived handler."""
+        """Publisher-side: subscriber wants out. Retire the alias we
+        issued and notify the owner, which owns the data streams.
+        Receive-side state is keyed by the peer's aliases, a different
+        number space, and is left alone."""
         logger.info(f"MOQT event: handle {msg}")
-        # Map request_id back to the track_alias we issued in subscribe_ok.
-        track_alias = next(
-            (ta for ta, rid in self._track_aliases.items()
-             if rid == msg.request_id),
-            None)
-        if track_alias is not None:
-            for key, sid in list(self._subgroup_stream_by_key.items()):
-                if key[0] == track_alias:
-                    self.stream_reset(sid, SessionCloseCode.NO_ERROR)
-                    self._cleanup_stream(
-                        sid, QuicErrorCode.APPLICATION_ERROR)
-            self._track_aliases.pop(track_alias, None)
-            self._object_handlers.pop(track_alias, None)
-            self._forget_track_bounds(track_alias)
+        for alias, rid in list(self._published_aliases.items()):
+            if rid == msg.request_id:
+                del self._published_aliases[alias]
         self._subscriptions.pop(msg.request_id, None)
         # d18 has no UNSUBSCRIBE; there the same news arrives as a
         # terminated request stream. Both reach the owner the same way.
