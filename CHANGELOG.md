@@ -22,6 +22,8 @@
 - media: `chunk_decode_time()` and `init_timescale()` read CMAF tfdt and mdhd.
 - Fix: TrackStats counted a reorder that filled a gap as lost, and missed a gap spanning a
   `snapshot()`.
+- Fix: VideoTrack counts its first stream in PUBLISH_DONE, resets the open stream when
+  cancelled, honours `_quiet`, and encodes each frame once instead of copying it twice.
 
 ## v0.11.1
 

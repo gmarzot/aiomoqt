@@ -1374,10 +1374,12 @@ class VideoTrack(PublishedTrack):
         group_id = -1
         header = None
 
-        report = (subgroup_id == 0)
+        report = (subgroup_id == 0
+                  and not getattr(self, '_quiet', False))
 
         cur_obj_id = subgroup_id
         stream_id = await session.open_uni_stream()
+        self._stream_count += 1
         local_sent = 0
 
         # Pre-generate padding per frame type
@@ -1437,18 +1439,17 @@ class VideoTrack(PublishedTrack):
 
                 extensions = {
                     LOC_TIMESTAMP: int(time.time() * 1_000_000)}
-                buf = header.next_object(
+                data = header.next_object_bytes(
                     payload=payload,
                     extensions=extensions,
                     object_id=cur_obj_id)
-                obj_bytes = len(buf.data)
+                obj_bytes = len(data)
                 self._note_largest(group_id, cur_obj_id)
                 cur_obj_id += self.num_subgroups
 
                 if session._close_err is not None:
                     raise asyncio.CancelledError
-                await session.stream_write_drain(
-                    stream_id, buf.data)
+                await session.stream_write_drain(stream_id, data)
                 local_sent += 1
                 self._total_sent += 1
                 self._total_bytes += obj_bytes
@@ -1494,6 +1495,9 @@ class VideoTrack(PublishedTrack):
                 # handles pressure-based GIL release internally.
 
         except asyncio.CancelledError:
+            # A RESET tells the subscriber the group is cut short.
+            if session._close_err is None:
+                session.stream_reset(stream_id, StreamResetCode.CANCELLED)
             dur = time.monotonic() - start_time
             if dur > 0 and report:
                 bps = (self._total_bytes * 8) / dur
