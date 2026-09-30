@@ -2338,6 +2338,19 @@ class _MOQTSessionMixin:
                 WebTransportError) as e:
             logger.debug(f"stream({stream_id}): write race: {e}")
 
+    def _transport_priority_setter(self):
+        """The transport's set_stream_priority, or None.
+
+        On WebTransport `self._quic` is the session itself, so looking the
+        name up there finds this method and recurses. The transport API
+        lives further along the MRO, past this mixin, on aiopquic's
+        WebTransportSession. Raw QUIC keeps a real connection in _quic and
+        is looked up there.
+        """
+        if self._quic is not self:
+            return getattr(self._quic, 'set_stream_priority', None)
+        return getattr(super(), 'set_stream_priority', None)
+
     def set_stream_priority(self, stream_id: int, priority: int) -> bool:
         """Set the transport send priority for one stream.
 
@@ -2348,14 +2361,41 @@ class _MOQTSessionMixin:
 
         Posts without waking the worker — the header write that follows
         an open carries it — so the cost is one ring entry per stream.
+
+        True only when the transport accepted the post. A full event ring
+        returns 1, meaning the stream keeps its current priority, and is
+        reported as False.
         """
-        setter = getattr(self._quic, 'set_stream_priority', None)
-        if setter is None:  # aiopquic < 0.4.1
+        setter = self._transport_priority_setter()
+        if setter is None:  # transport offers no priority API
             return False
         try:
-            setter(stream_id, priority)
+            return setter(stream_id, priority) == 0
         except Exception as e:
             logger.debug(f"stream({stream_id}): priority not applied: {e}")
+            return False
+
+    def set_default_stream_priority(self, priority: int) -> bool:
+        """Priority that newly created streams start at.
+
+        Writes the QUIC **context** default, shared by every connection on
+        this transport, and applies only to streams created after the
+        call — it is reached through a session but is not scoped to one.
+        Needed because picoquic's default (9) and MoQT's neutral publisher
+        priority (128) are different points on the same scale, so an
+        undeclared stream would otherwise outrank a track that declared
+        the neutral value.
+        """
+        target = self if self._quic is self else self._quic
+        setter = getattr(target, 'set_default_stream_priority', None)
+        if setter is None and target is self:
+            setter = getattr(super(), 'set_default_stream_priority', None)
+        if setter is None:
+            return False
+        try:
+            setter(priority)
+        except Exception as e:
+            logger.debug(f"default priority not applied: {e}")
             return False
         return True
 

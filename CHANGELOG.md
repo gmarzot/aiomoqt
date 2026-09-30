@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Fix: a declared stream priority now reaches the scheduler over WebTransport. The
+  lookup went through `self._quic`, which on WebTransport is the session itself, so
+  it found this method and recursed; `RecursionError` was caught only in the deepest
+  frame, leaving every frame above to report success for a priority that never left
+  the process. Raw QUIC was unaffected.
+- `set_stream_priority()` reports False when the transport's event ring is full, where
+  it previously returned True for a priority that was not applied.
+- `set_default_stream_priority()` passthrough, for aligning the transport default with
+  MoQT's neutral publisher priority. Writes the QUIC context default, shared by every
+  connection on the transport.
 - loopback_bench: `--bind` sets the address the subscriber dials (default `localhost`).
 - sub_media: `--analyze` measures delivery without decoding — latency, jitter, loss and
   reorder, group integrity, keyframe cost, bitrate, and a playout model; `--report PATH`
