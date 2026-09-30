@@ -17,6 +17,8 @@
   reorder, group integrity, keyframe cost, bitrate, and a playout model; `--report PATH`
   writes CSV (`-` = stdout).
 - sub_media: `-i` sets the report interval; `-T` limits it to one catalog track.
+- Datagram receive no longer formats debug strings (payload hex, per-object text) when
+  debug logging is off; neither does the per-stream header log.
 - media: `on_arrival` on `LocTrackSubscriber` and `MediaSubscriber` sees every object,
   END_OF_GROUP included, with its receive time.
 - media: `chunk_decode_time()` and `init_timescale()` read CMAF tfdt and mdhd.
