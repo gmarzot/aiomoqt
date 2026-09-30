@@ -16,6 +16,8 @@
 - sub_media: `--analyze` measures delivery without decoding — latency, jitter, loss and
   reorder, group integrity, keyframe cost, bitrate, and a playout model; `--report PATH`
   writes CSV (`-` = stdout).
+- Fix: a control message whose body parses past its Length closes the session with
+  PROTOCOL_VIOLATION instead of consuming the next message's bytes.
 - sub_media: `-i` sets the report interval; `-T` limits it to one catalog track.
 - media: `on_arrival` on `LocTrackSubscriber` and `MediaSubscriber` sees every object,
   END_OF_GROUP included, with its receive time.
