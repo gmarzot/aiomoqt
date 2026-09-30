@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Transport priority mapping is centred on picoquic's default, so a track
+  declaring MoQT's neutral priority (128, transport §12.4) lands on picoquic's
+  own default (9) instead of below every undeclared stream. Eight bands, MoQT's
+  top three bits — what peers actually read. The wire value is unchanged; only
+  the local mapping is banded.
+- Default scheduling discipline among equal priorities is now `fifo`, matching
+  picoquic's own default, where it was `round_robin`. `round_robin` shifts the
+  band to even and remains selectable per session.
+- Fix: `priority_plan()["enforced"]` probes the setter the session would really
+  dispatch to. On WebTransport it reported enforcement because the session
+  carried the method it was being asked about.
 - Fix: a declared stream priority now reaches the scheduler over WebTransport. The
   lookup went through `self._quic`, which on WebTransport is the session itself, so
   it found this method and recursed; `RecursionError` was caught only in the deepest

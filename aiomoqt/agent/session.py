@@ -43,29 +43,66 @@ _GROUP_ORDERS = {
 }
 
 
-SCHEDULING = ("round_robin", "fifo")
+SCHEDULING = ("fifo", "round_robin")
+
+# MoQT's neutral publisher priority (transport §12.4: omitted means 128).
+MOQT_NEUTRAL_PRIORITY = 128
+# picoquic's own default stream priority (PICOQUIC_DEFAULT_STREAM_PRIORITY).
+# Odd, so picoquic's chosen discipline among equals is FIFO.
+PICOQUIC_DEFAULT_PRIORITY = 9
 
 
 def to_stream_priority(moqt_priority: int, *,
-                       discipline: str = "round_robin") -> int:
+                       discipline: str = "fifo") -> int:
     """MoQT priority (§7.1: 0-255, lower = more urgent) to a transport byte.
 
-    picoquic reads the low bit as a scheduling-discipline selector among
-    streams of equal priority — even round robin, odd FIFO by stream id.
-    That is its model, not MoQT's: §7.2 defines an ordering and leaves
-    ordering among equals implementation-defined. So the bit is set
-    uniformly from configuration and never inherited from the MoQT
-    value, or two adjacent priorities would differ in discipline as well
-    as in order.
+    Local only. RFC 9000 §2.3 gives QUIC no wire mechanism for priority
+    and asks only that an implementation offer an API, and MoQT does not
+    say how its priority maps onto a scheduler — §7.2 defines an ordering
+    and leaves ordering among equals implementation-defined. The wire
+    still carries the full 8-bit MoQT value; only this mapping is banded.
 
-    Costs one bit: 128 ordered levels. Still more resolution than peers
-    read — moxygen maps the top three bits only.
+    picoquic reads the low bit as a discipline selector among streams of
+    *equal* priority — even orders by least-recently-sent (round robin),
+    odd by lowest stream id (FIFO). That costs a bit of resolution and
+    makes adjacent values differ in kind, so the bit is set uniformly
+    from configuration and never inherited from the MoQT value.
+
+    The map is centred on picoquic's default so a track declaring MoQT's
+    neutral 128 lands exactly on 9 under the default FIFO discipline,
+    which is picoquic's own. An undeclared stream, left at 9, therefore
+    ranks equal to a declared-neutral one instead of outranking it — the
+    two scales have different neutral points, and an identity map would
+    demote every track that declared the neutral value.
+
+    0 is only nine levels below picoquic's default, so centring costs
+    resolution: eight bands, MoQT's top three bits. That is what peers
+    consume anyway (moxygen reads three bits; Cloudflare ignores priority
+    entirely) and more than any realistic tier count.
+
+    round_robin cannot sit exactly on 9, which is odd, so it centres on 8
+    — a declared-neutral track then outranks undeclared traffic by one
+    band rather than being demoted by it.
+
+    Follow-up worth doing: §7.1 makes priority a relation over the
+    schedulable objects of one connection, so the absolute value is
+    meaningless locally and only the ordering is real. Ranking the
+    declared tracks and handing them consecutive bands around picoquic's
+    default would give exactly as much resolution as there are distinct
+    tracks. It needs re-prioritising open streams when a new declaration
+    reorders the set, so it is a design step rather than an edit here.
     """
     if discipline not in SCHEDULING:
         raise AgentError(
             f"scheduling must be one of {', '.join(SCHEDULING)}, "
             f"got {discipline!r}")
-    return (moqt_priority & 0xFE) | (1 if discipline == "fifo" else 0)
+    if not 0 <= moqt_priority <= 255:
+        raise AgentError(
+            f"MoQT priority must be 0-255, got {moqt_priority}")
+    base = (PICOQUIC_DEFAULT_PRIORITY if discipline == "fifo"
+            else PICOQUIC_DEFAULT_PRIORITY - 1)
+    band = (moqt_priority - MOQT_NEUTRAL_PRIORITY) >> 5
+    return base + 2 * band
 
 
 def start_at_to_wire(spec_start) -> Tuple[FilterType, int, int, int]:
@@ -87,7 +124,7 @@ def start_at_to_wire(spec_start) -> Tuple[FilterType, int, int, int]:
 class AgentSession:
     """One connection, its readers, and its writers."""
 
-    def __init__(self, session: Any, *, scheduling: str = "round_robin"):
+    def __init__(self, session: Any, *, scheduling: str = "fifo"):
         if scheduling not in SCHEDULING:
             raise AgentError(
                 f"scheduling must be one of {', '.join(SCHEDULING)}, "
@@ -187,9 +224,17 @@ class AgentSession:
     def scheduling_enforced(self) -> bool:
         """Whether a declared priority actually reaches the scheduler.
 
-        False on a transport with no priority API (aiopquic < 0.4.1), so
-        a caller is never told a relationship is applied when it is not.
+        Probes the setter the session would really dispatch to, not the
+        session's own attribute: on WebTransport `_quic` is the session
+        itself, so a hasattr() there answers True for the method being
+        asked about and reports enforcement on a transport that has none.
         """
+        probe = getattr(self._session, "_transport_priority_setter", None)
+        if probe is not None:
+            try:
+                return probe() is not None
+            except Exception:
+                return False
         return hasattr(getattr(self._session, "_quic", None),
                        "set_stream_priority")
 

@@ -205,7 +205,7 @@ def _as_bytes(payload: Any) -> bytes:
 
 
 def build_writer(session: Any, spec: PublishSpec, *,
-                 scheduling: str = "round_robin",
+                 scheduling: str = "fifo",
                  ) -> Tuple[Writer, _PushTrack]:
     """Construct the track and its writer without publishing yet.
 
