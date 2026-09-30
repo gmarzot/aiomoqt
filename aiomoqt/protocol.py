@@ -1566,7 +1566,10 @@ class _MOQTSessionMixin:
                     # callback contract is "msg valid until next call".
                     obj = sg_header._obj_cache
                     if obj is None:
-                        obj = ObjectHeader.__new__(ObjectHeader)
+                        # Constructed, not __new__: a slots dataclass
+                        # leaves unset fields unreadable, and callbacks
+                        # may print or forward the object.
+                        obj = ObjectHeader(object_id=0)
                         sg_header._obj_cache = obj
                     obj.deserialize_into(
                         buf, len,

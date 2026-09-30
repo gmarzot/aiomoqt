@@ -452,7 +452,7 @@ class ObjectHeader(MOQTMessage):
             extensions_present: Whether subgroup header has extensions flag set.
             prev_object_id: Previous object's ID for delta decoding (None = first object).
         """
-        obj = cls.__new__(cls)
+        obj = cls(object_id=0)
         obj.deserialize_into(buf, buf_len, extensions_present, prev_object_id)
         return obj
 
