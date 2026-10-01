@@ -783,6 +783,12 @@ class _MOQTSessionMixin:
             # instead of reading past the payload. Other message types
             # accept and ignore it for signature uniformity.
             msg = message_class.deserialize(buf, prof=self._profile, buf_end=end_pos)
+            # Length is the message extent: a body that parsed past it
+            # consumed the next message's bytes.
+            if buf.tell() > end_pos:
+                raise MOQTProtocolViolation(
+                    f"{message_class.__name__} body runs "
+                    f"{buf.tell() - end_pos} bytes past its Length")
             # d18 replies omit the Request ID (demuxed by request stream);
             # inject the stream-bound id so handlers key on it unchanged.
             # A message that carries its own id (REQUEST_UPDATE) keeps it.
@@ -857,7 +863,6 @@ class _MOQTSessionMixin:
             if end_pos > buf.tell():
                 logger.debug(f"MOQT event: control message: seeking msg end: {end_pos}")
                 buf.seek(end_pos)
-            # assert start_pos + msg_len == (buf.tell())
             logger.info(f"MOQT event: control message parsed: {msg})")
 
             # Schedule handler if one exists
