@@ -30,6 +30,8 @@
   MoQT's neutral publisher priority. Writes the QUIC context default, shared by every
   connection on the transport.
 - loopback_bench: `--bind` sets the address the subscriber dials (default `localhost`).
+- Fix: adaptive_bench (relay, `--mp`), load_sim and the worker subscribers count loss and
+  groups on stream delivery; their object callback dropped the group and subgroup ids.
 - sub_media: `--analyze` measures delivery without decoding — latency, jitter, loss and
   reorder, group integrity, keyframe cost, bitrate, and a playout model; `--report PATH`
   writes CSV (`-` = stdout).
