@@ -1559,8 +1559,9 @@ class _MOQTSessionMixin:
                     )
 
                 # record that the data stream header has been processed
-                consumed = buf.tell() - pos
-                logger.debug(f"MOQT stream({stream_id}): {msg_header} consumed: {consumed} bytes")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"MOQT stream({stream_id}): {msg_header} consumed: "
+                                 f"{buf.tell() - pos} bytes")
                 if stream_state is not None:
                     stream_state.parser = msg_header
             else:
@@ -1622,12 +1623,21 @@ class _MOQTSessionMixin:
         except Exception:
             raise
 
+    @staticmethod
+    def _dgram_logstr(msg, consumed: int, now: int) -> str:
+        msg_ts = (msg.extensions.get(MOQT_TIMESTAMP_EXT)
+                  if msg.extensions else None)
+        delay = f"delay: {now - msg_ts} ms" if msg_ts else ""
+        return f"{msg.group_id}.{msg.object_id} size: {consumed} bytes {delay}"
+
     def _moqt_handle_data_dgram(self, buf: Buffer) -> MOQTMessageType:
         """Process incoming datagram messages."""
         if buf.capacity == 0 or buf.tell() >= buf.capacity:
             logger.error(f"MOQT datagram: no data {buf.tell()}")
             return
-        logger.debug(f"MOQT handle datagram: 0x{buf.data_slice(0,min(buf.capacity,12))}")
+        debug = logger.isEnabledFor(logging.DEBUG)
+        if debug:
+            logger.debug(f"MOQT handle datagram: 0x{buf.data_slice(0,min(buf.capacity,12))}")
         # Get datagram type from first varint (vi64 for d18).
         pos = buf.tell()
         prof = self._profile
@@ -1646,15 +1656,10 @@ class _MOQTSessionMixin:
                 return msg
 
             consumed = buf.tell() - pos
-            group_id = msg.group_id
-            object_id = msg.object_id
-            id = f"{group_id}.{object_id}"
             now = int(time.time() * 1_000_000)
-            msg_ts = msg.extensions.get(MOQT_TIMESTAMP_EXT) if msg.extensions else None
-            delay = f"delay: {now - msg_ts} ms" if msg_ts else ""
-            logstr = f"{id} size: {consumed} bytes {delay}"
-
-            logger.debug(f"MOQT event: ObjectDatagram: {logstr}")
+            if debug:
+                logger.debug(f"MOQT event: ObjectDatagram: "
+                             f"{self._dgram_logstr(msg, consumed, now)}")
             self._deliver_datagram(msg, consumed, now)
             return msg
         # Draft-14: ObjectDatagramStatus types 0x20-0x21 (status datagrams)
@@ -1667,15 +1672,10 @@ class _MOQTSessionMixin:
                 return msg
 
             consumed = buf.tell() - pos
-            group_id = msg.group_id
-            object_id = msg.object_id
-            id = f"{group_id}.{object_id}"
             now = int(time.time() * 1_000_000)
-            msg_ts = msg.extensions.get(MOQT_TIMESTAMP_EXT) if msg.extensions else None
-            delay = f"delay: {now - msg_ts} ms" if msg_ts else ""
-            logstr = f"{id} size: {consumed} bytes {delay}"
-
-            logger.debug(f"MOQT event: ObjectDatagramStatus: {logstr}")
+            if debug:
+                logger.debug(f"MOQT event: ObjectDatagramStatus: "
+                             f"{self._dgram_logstr(msg, consumed, now)}")
             self._deliver_datagram(msg, consumed, now)
             return msg
         else:
@@ -1726,9 +1726,10 @@ class _MOQTSessionMixin:
                 msg.track_alias, MOQT_DEFAULT_PRIORITY)
         consumed = buf.tell() - pos
         now = int(time.time() * 1_000_000)
-        logger.debug(
-            f"MOQT event: d18 ObjectDatagram: {msg.group_id}.{msg.object_id} "
-            f"size: {consumed} bytes status: {msg.status}")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"MOQT event: d18 ObjectDatagram: {msg.group_id}.{msg.object_id} "
+                f"size: {consumed} bytes status: {msg.status}")
         self._deliver_datagram(msg, consumed, now)
         return msg
 
@@ -2047,7 +2048,8 @@ class _MOQTSessionMixin:
 
         elif isinstance(event, DatagramFrameReceived) and self._wt_session_setup.done():
             msg_buf = Buffer(data=event.data)
-            logger.debug(f"MOQT event: DatagramFrameReceived: 0x{msg_buf.data_slice(0,min(msg_buf.capacity,16)).hex()}")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"MOQT event: DatagramFrameReceived: 0x{msg_buf.data_slice(0,min(msg_buf.capacity,16)).hex()}")
             # A datagram is a self-contained, unreliable message: one we
             # cannot parse is a dropped object, never a dead session.
             # Letting the parse raise here propagated out of the asyncio
