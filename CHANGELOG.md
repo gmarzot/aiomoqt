@@ -24,6 +24,8 @@
   the process. Raw QUIC was unaffected.
 - `set_stream_priority()` reports False when the transport's event ring is full, where
   it previously returned True for a priority that was not applied.
+- Fix: a received subgroup object can be printed or logged; the per-stream cached
+  `ObjectHeader` was built with `__new__`, leaving `type` unset and `str()` raising.
 - `set_default_stream_priority()` passthrough, for aligning the transport default with
   MoQT's neutral publisher priority. Writes the QUIC context default, shared by every
   connection on the transport.
