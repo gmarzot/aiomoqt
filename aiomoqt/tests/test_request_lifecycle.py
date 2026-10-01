@@ -39,6 +39,7 @@ def _session(is_client=True):
     s._pending_requests = {}
     s._next_track_alias = 0
     s._track_aliases = {}
+    s._published_aliases = {}
     s._loop = asyncio.get_running_loop()
     s._sent = []
     s._send_request = lambda rid, msg: s._sent.append((rid, msg))

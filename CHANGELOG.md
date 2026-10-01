@@ -14,6 +14,9 @@
 - Fix: `priority_plan()["enforced"]` probes the setter the session would really
   dispatch to. On WebTransport it reported enforcement because the session
   carried the method it was being asked about.
+- Fix: aliases we assign as publisher are kept apart from the peer's; an UNSUBSCRIBE no
+  longer resets the streams and drops the object handler of a received track that
+  shares the alias number.
 - Fix: a declared stream priority now reaches the scheduler over WebTransport. The
   lookup went through `self._quic`, which on WebTransport is the session itself, so
   it found this method and recursed; `RecursionError` was caught only in the deepest
