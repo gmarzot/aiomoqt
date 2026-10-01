@@ -152,6 +152,35 @@ async def test_error_policy_raises():
         await wtr.write(b"b")
 
 
+async def test_block_waits_for_room():
+    # The default policy: a full ring parks the writer, nothing is lost.
+    wtr, track = _writer(_pub(buffer=1, on_full="block"))
+    await wtr.write(b"a")
+    pending = asyncio.ensure_future(wtr.write(b"b"))
+    await asyncio.sleep(0)
+    assert not pending.done()
+    out = _RecordingOut()
+    await _drain(track, out, 2)
+    await asyncio.wait_for(pending, 1.0)
+    assert [(o, p) for _g, o, p, _s in out.written] == [(0, b"a"), (1, b"b")]
+    assert wtr.stats.dropped == 0
+
+
+async def test_flush_returns_once_produce_has_taken_everything():
+    wtr, track = _writer()
+    await wtr.write(b"a")
+    await wtr.write(b"b")
+    out = _RecordingOut()
+    task = asyncio.ensure_future(track.produce(out))
+    await wtr.flush(timeout=1.0)
+    assert len(out.written) == 2
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
 async def test_stats_track_bytes_and_groups():
     wtr, _track = _writer()
     await wtr.snapshot(b"abc")

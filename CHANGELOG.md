@@ -40,6 +40,8 @@
   debug logging is off; neither does the per-stream header log.
 - media: `on_arrival` on `LocTrackSubscriber` and `MediaSubscriber` sees every object,
   END_OF_GROUP included, with its receive time.
+- Fix: agent Writer's default `on_full="block"` waits for room instead of raising
+  `QueueFull`, and `flush()` returns once `produce()` has taken every object.
 - media: `chunk_decode_time()` and `init_timescale()` read CMAF tfdt and mdhd.
 - Fix: TrackStats counted a reorder that filled a gap as lost, and missed a gap spanning a
   `snapshot()`.
