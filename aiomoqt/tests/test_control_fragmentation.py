@@ -14,8 +14,10 @@ from collections import deque
 import pytest
 
 from aiomoqt.protocol import _MOQTSessionMixin
-from aiomoqt.messages.request import RequestOk
+from aiomoqt.messages.request import RequestError, RequestOk
+from aiomoqt.messages.subscribe import SubscribeError
 from aiomoqt.context import profile_for
+from aiomoqt.types import SessionCloseCode
 
 
 def _control_session(draft):
@@ -121,6 +123,28 @@ async def test_whole_message_single_event(draft):
     _feed_reply(s, wire)
     assert len(parsed) == 1
     assert s._closed == []
+
+
+@pytest.mark.parametrize("draft", [14, 16, 18])
+async def test_a_body_past_its_length_closes_the_session(draft):
+    # Length is the message extent. Declare 2 bytes fewer than the body
+    # holds: parsing the body would run into the next message.
+    s = _control_session(draft)
+    parsed = _spy_parses(s)
+    if draft == 14:
+        err = SubscribeError(request_id=7, error_code=4, reason="gone")
+    else:
+        err = RequestError(request_id=7, error_code=0x10, retry_interval=0,
+                           reason="gone")
+    wire = bytearray(err.serialize(prof=s._profile).data)
+    declared = int.from_bytes(wire[1:3], "big")
+    wire[1:3] = (declared - 2).to_bytes(2, "big")
+    ok = bytes(RequestOk(request_id=7, parameters={}).serialize(
+        prof=s._profile).data)
+    _feed_reply(s, bytes(wire) + ok)
+    assert parsed == []
+    assert s._closed[0][0] == SessionCloseCode.PROTOCOL_VIOLATION
+    assert "past its Length" in s._closed[0][1]
 
 
 @pytest.mark.parametrize("draft", [14, 16, 18])

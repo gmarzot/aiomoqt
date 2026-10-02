@@ -44,10 +44,17 @@ class SubgroupDelivery:
     """
 
     def __init__(self, session, track_alias: int, *, priority: int = 128,
-                 mapping: StreamMapping = StreamMapping.PER_GROUP):
+                 mapping: StreamMapping = StreamMapping.PER_GROUP,
+                 stream_priority: Optional[int] = None):
         self.session = session
         self.track_alias = track_alias
         self.priority = priority
+        # Transport send priority for this track's streams. None leaves
+        # every stream at the transport default, which is what callers
+        # that never ask for scheduling get. Precomputed by the caller:
+        # the wire byte is constant per track, so it never costs work in
+        # the send loop.
+        self.stream_priority = stream_priority
         self.mapping = mapping
         self.stream_count = 0
         self.largest: Optional[tuple] = None
@@ -96,6 +103,8 @@ class SubgroupDelivery:
             # id via subgroup_id.
             sid = await self.session.open_uni_stream()
             self.stream_count += 1
+            if self.stream_priority is not None:
+                self.session.set_stream_priority(sid, self.stream_priority)
             hdr = SubgroupHeader(
                 track_alias=self.track_alias, group_id=group_id,
                 subgroup_id=object_id, publisher_priority=self.priority,
@@ -110,6 +119,9 @@ class SubgroupDelivery:
                 self.end_group()
                 self._stream_id = await self.session.open_uni_stream()
                 self.stream_count += 1
+                if self.stream_priority is not None:
+                    self.session.set_stream_priority(
+                        self._stream_id, self.stream_priority)
                 self._header = SubgroupHeader(
                     track_alias=self.track_alias, group_id=group_id,
                     subgroup_id=0, publisher_priority=self.priority,

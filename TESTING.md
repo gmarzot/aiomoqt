@@ -83,6 +83,7 @@ Covers what pytest cannot reach: the tools, the multi-process paths, and the dra
 - **`relay-join`** — `SUBSCRIBE + JOINING_FETCH` probe (most relays do not implement this yet; disabled by default in the catalog).
 - **`relay-fetch`** — standalone `FETCH` probe (same).
 - **`relay-discovery`** — a subscriber knowing only the namespace learns the trackname. d14/d16 answer `SUBSCRIBE_NAMESPACE` with a `PUBLISH` per track; d18 reports namespaces first (`NAMESPACE`) and answers a second request, `SUBSCRIBE_TRACKS`. The publisher announces with both `PUBLISH_NAMESPACE` and `PUBLISH`, since a relay learns a namespace exists from the former.
+- **`relay-data`** — moq-interop-runner `data-subgroup-basic`: 3 groups × 5 objects through the relay on one subgroup stream per group; every object is checked for presence, subgroup, priority and payload bytes, and the downstream `PUBLISH_DONE` for `TRACK_ENDED` and its Stream Count.
 
 ### `bench` tier (manual dispatch only; not PR-gated)
 - **`loopback-adaptive-bench`** — ramps rate in steps, stops on loss / p99 latency growth / throughput shortfall, reports the last stable rate.

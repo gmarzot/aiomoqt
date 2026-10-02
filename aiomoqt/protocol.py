@@ -322,7 +322,12 @@ class _MOQTSessionMixin:
         self._request_cancel_handlers: Dict[int, Callable] = {}
         # request_id -> callback fired on PUBLISH_DONE for that request.
         self._publish_done_handlers: Dict[int, Callable] = {}
-        self._track_aliases: Dict[int, int] = {}  # map alias to subscription_id
+        # Aliases the peer assigned (SUBSCRIBE_OK / PUBLISH) -> our
+        # request id: the receive-side registry.
+        self._track_aliases: Dict[int, int] = {}
+        # Aliases we assigned as publisher -> the peer's request id. A
+        # separate number space: both ends count from 0.
+        self._published_aliases: Dict[int, int] = {}
         # Set when client_session_init completes (ms, monotonic delta).
         self._established_ms: Optional[float] = None
         # Per-track object delivery keyed by track_alias; falls back to
@@ -559,10 +564,11 @@ class _MOQTSessionMixin:
         return request_id
 
     def _allocate_track_alias(self, request_id: int = 1) -> int:
-        """Get next available track alias."""
+        """Next alias for a track we publish, bound to the peer's
+        request."""
         track_alias = self._next_track_alias
         self._next_track_alias += 1
-        self._track_aliases[track_alias] = request_id
+        self._published_aliases[track_alias] = request_id
         return track_alias
 
     def register_object_handler(self, track_alias: int,
@@ -777,6 +783,12 @@ class _MOQTSessionMixin:
             # instead of reading past the payload. Other message types
             # accept and ignore it for signature uniformity.
             msg = message_class.deserialize(buf, prof=self._profile, buf_end=end_pos)
+            # Length is the message extent: a body that parsed past it
+            # consumed the next message's bytes.
+            if buf.tell() > end_pos:
+                raise MOQTProtocolViolation(
+                    f"{message_class.__name__} body runs "
+                    f"{buf.tell() - end_pos} bytes past its Length")
             # d18 replies omit the Request ID (demuxed by request stream);
             # inject the stream-bound id so handlers key on it unchanged.
             # A message that carries its own id (REQUEST_UPDATE) keeps it.
@@ -851,7 +863,6 @@ class _MOQTSessionMixin:
             if end_pos > buf.tell():
                 logger.debug(f"MOQT event: control message: seeking msg end: {end_pos}")
                 buf.seek(end_pos)
-            # assert start_pos + msg_len == (buf.tell())
             logger.info(f"MOQT event: control message parsed: {msg})")
 
             # Schedule handler if one exists
@@ -1553,8 +1564,9 @@ class _MOQTSessionMixin:
                     )
 
                 # record that the data stream header has been processed
-                consumed = buf.tell() - pos
-                logger.debug(f"MOQT stream({stream_id}): {msg_header} consumed: {consumed} bytes")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"MOQT stream({stream_id}): {msg_header} consumed: "
+                                 f"{buf.tell() - pos} bytes")
                 if stream_state is not None:
                     stream_state.parser = msg_header
             else:
@@ -1566,7 +1578,10 @@ class _MOQTSessionMixin:
                     # callback contract is "msg valid until next call".
                     obj = sg_header._obj_cache
                     if obj is None:
-                        obj = ObjectHeader.__new__(ObjectHeader)
+                        # Constructed, not __new__: a slots dataclass
+                        # leaves unset fields unreadable, and callbacks
+                        # may print or forward the object.
+                        obj = ObjectHeader(object_id=0)
                         sg_header._obj_cache = obj
                     obj.deserialize_into(
                         buf, len,
@@ -1613,12 +1628,21 @@ class _MOQTSessionMixin:
         except Exception:
             raise
 
+    @staticmethod
+    def _dgram_logstr(msg, consumed: int, now: int) -> str:
+        msg_ts = (msg.extensions.get(MOQT_TIMESTAMP_EXT)
+                  if msg.extensions else None)
+        delay = f"delay: {now - msg_ts} ms" if msg_ts else ""
+        return f"{msg.group_id}.{msg.object_id} size: {consumed} bytes {delay}"
+
     def _moqt_handle_data_dgram(self, buf: Buffer) -> MOQTMessageType:
         """Process incoming datagram messages."""
         if buf.capacity == 0 or buf.tell() >= buf.capacity:
             logger.error(f"MOQT datagram: no data {buf.tell()}")
             return
-        logger.debug(f"MOQT handle datagram: 0x{buf.data_slice(0,min(buf.capacity,12))}")
+        debug = logger.isEnabledFor(logging.DEBUG)
+        if debug:
+            logger.debug(f"MOQT handle datagram: 0x{buf.data_slice(0,min(buf.capacity,12))}")
         # Get datagram type from first varint (vi64 for d18).
         pos = buf.tell()
         prof = self._profile
@@ -1637,15 +1661,10 @@ class _MOQTSessionMixin:
                 return msg
 
             consumed = buf.tell() - pos
-            group_id = msg.group_id
-            object_id = msg.object_id
-            id = f"{group_id}.{object_id}"
             now = int(time.time() * 1_000_000)
-            msg_ts = msg.extensions.get(MOQT_TIMESTAMP_EXT) if msg.extensions else None
-            delay = f"delay: {now - msg_ts} ms" if msg_ts else ""
-            logstr = f"{id} size: {consumed} bytes {delay}"
-
-            logger.debug(f"MOQT event: ObjectDatagram: {logstr}")
+            if debug:
+                logger.debug(f"MOQT event: ObjectDatagram: "
+                             f"{self._dgram_logstr(msg, consumed, now)}")
             self._deliver_datagram(msg, consumed, now)
             return msg
         # Draft-14: ObjectDatagramStatus types 0x20-0x21 (status datagrams)
@@ -1658,15 +1677,10 @@ class _MOQTSessionMixin:
                 return msg
 
             consumed = buf.tell() - pos
-            group_id = msg.group_id
-            object_id = msg.object_id
-            id = f"{group_id}.{object_id}"
             now = int(time.time() * 1_000_000)
-            msg_ts = msg.extensions.get(MOQT_TIMESTAMP_EXT) if msg.extensions else None
-            delay = f"delay: {now - msg_ts} ms" if msg_ts else ""
-            logstr = f"{id} size: {consumed} bytes {delay}"
-
-            logger.debug(f"MOQT event: ObjectDatagramStatus: {logstr}")
+            if debug:
+                logger.debug(f"MOQT event: ObjectDatagramStatus: "
+                             f"{self._dgram_logstr(msg, consumed, now)}")
             self._deliver_datagram(msg, consumed, now)
             return msg
         else:
@@ -1717,9 +1731,10 @@ class _MOQTSessionMixin:
                 msg.track_alias, MOQT_DEFAULT_PRIORITY)
         consumed = buf.tell() - pos
         now = int(time.time() * 1_000_000)
-        logger.debug(
-            f"MOQT event: d18 ObjectDatagram: {msg.group_id}.{msg.object_id} "
-            f"size: {consumed} bytes status: {msg.status}")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"MOQT event: d18 ObjectDatagram: {msg.group_id}.{msg.object_id} "
+                f"size: {consumed} bytes status: {msg.status}")
         self._deliver_datagram(msg, consumed, now)
         return msg
 
@@ -1905,6 +1920,7 @@ class _MOQTSessionMixin:
 
         if self._control_stream_id is None:
             self._control_stream_id = stream_id
+            self._prioritise_control_stream(stream_id)
             logger.debug(f"QUIC event: detecting control stream: {stream_id}")
         elif stream_id != self._control_stream_id:
             if is_draft16_or_later(self.negotiated_draft):
@@ -2037,7 +2053,8 @@ class _MOQTSessionMixin:
 
         elif isinstance(event, DatagramFrameReceived) and self._wt_session_setup.done():
             msg_buf = Buffer(data=event.data)
-            logger.debug(f"MOQT event: DatagramFrameReceived: 0x{msg_buf.data_slice(0,min(msg_buf.capacity,16)).hex()}")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"MOQT event: DatagramFrameReceived: 0x{msg_buf.data_slice(0,min(msg_buf.capacity,16)).hex()}")
             # A datagram is a self-contained, unreliable message: one we
             # cannot parse is a dropped object, never a dead session.
             # Letting the parse raise here propagated out of the asyncio
@@ -2197,6 +2214,8 @@ class _MOQTSessionMixin:
                 self._d18_control_write_sid = (
                     self._quic.get_next_available_stream_id(
                         is_unidirectional=True))
+                self._prioritise_control_stream(
+                    self._d18_control_write_sid)
                 logger.info(
                     f"MOQT: d18 control write-uni: "
                     f"{self._d18_control_write_sid}")
@@ -2204,6 +2223,7 @@ class _MOQTSessionMixin:
                 self._control_stream_id = (
                     self._quic.get_next_available_stream_id(
                         is_unidirectional=False))
+                self._prioritise_control_stream(self._control_stream_id)
                 logger.info(
                     f"MOQT: QUIC control stream created stream id: "
                     f"{self._control_stream_id}")
@@ -2238,11 +2258,14 @@ class _MOQTSessionMixin:
                 # sends (the demux in quic_event_received is transport-
                 # agnostic). The data plane already proves WT uni streams.
                 self._d18_control_write_sid = await self.open_uni_stream()
+                self._prioritise_control_stream(
+                    self._d18_control_write_sid)
                 logger.info(
                     f"MOQT: d18 WT control write-uni: "
                     f"{self._d18_control_write_sid}")
             else:
                 self._control_stream_id = await self.open_bidi_stream()
+                self._prioritise_control_stream(self._control_stream_id)
                 logger.info(
                     f"MOQT: WT control stream created stream id: "
                     f"{self._control_stream_id}")
@@ -2337,6 +2360,79 @@ class _MOQTSessionMixin:
         except (AssertionError, AttributeError, BufferError,
                 WebTransportError) as e:
             logger.debug(f"stream({stream_id}): write race: {e}")
+
+    def _prioritise_control_stream(self, stream_id: Optional[int]) -> None:
+        """Put a control stream in its own band, above subscription data.
+
+        Scheduling is strict, so a greedy data track sharing or undercutting
+        the control band starves it: no SUBSCRIBE_OK, no PUBLISH_DONE, the
+        session wedges under load. to_stream_priority() floors declared data
+        above this band so that cannot happen.
+        """
+        if stream_id is None:
+            return
+        self.set_stream_priority(stream_id, STREAM_BAND_CONTROL)
+
+    def _transport_priority_setter(self):
+        """The transport's set_stream_priority, or None.
+
+        On WebTransport `self._quic` is the session itself, so looking the
+        name up there finds this method and recurses. The transport API
+        lives further along the MRO, past this mixin, on aiopquic's
+        WebTransportSession. Raw QUIC keeps a real connection in _quic and
+        is looked up there.
+        """
+        if self._quic is not self:
+            return getattr(self._quic, 'set_stream_priority', None)
+        return getattr(super(), 'set_stream_priority', None)
+
+    def set_stream_priority(self, stream_id: int, priority: int) -> bool:
+        """Set the transport send priority for one stream.
+
+        Advisory, and deliberately so: RFC 9000 §2.3 gives QUIC no wire
+        mechanism for priority and asks only that an implementation offer
+        an API. A transport without one, or a full TX event ring, leaves
+        the stream at the default rather than failing the write.
+
+        Posts without waking the worker — the header write that follows
+        an open carries it — so the cost is one ring entry per stream.
+
+        True only when the transport accepted the post. A full event ring
+        returns 1, meaning the stream keeps its current priority, and is
+        reported as False.
+        """
+        setter = self._transport_priority_setter()
+        if setter is None:  # transport offers no priority API
+            return False
+        try:
+            return setter(stream_id, priority) == 0
+        except Exception as e:
+            logger.debug(f"stream({stream_id}): priority not applied: {e}")
+            return False
+
+    def set_default_stream_priority(self, priority: int) -> bool:
+        """Priority that newly created streams start at.
+
+        Writes the QUIC **context** default, shared by every connection on
+        this transport, and applies only to streams created after the
+        call — it is reached through a session but is not scoped to one.
+        Needed because picoquic's default (9) and MoQT's neutral publisher
+        priority (128) are different points on the same scale, so an
+        undeclared stream would otherwise outrank a track that declared
+        the neutral value.
+        """
+        target = self if self._quic is self else self._quic
+        setter = getattr(target, 'set_default_stream_priority', None)
+        if setter is None and target is self:
+            setter = getattr(super(), 'set_default_stream_priority', None)
+        if setter is None:
+            return False
+        try:
+            setter(priority)
+        except Exception as e:
+            logger.debug(f"default priority not applied: {e}")
+            return False
+        return True
 
     async def stream_write_drain(self, stream_id: int, data: bytes,
                                   end_stream: bool = False) -> None:
@@ -3807,26 +3903,14 @@ class _MOQTSessionMixin:
         # Handle announcement cancellation
 
     async def _handle_unsubscribe(self, msg: Unsubscribe) -> None:
-        """Publisher-side: subscriber wants out. RESET every subgroup uni
-        stream we still have open for this subscription's track_alias,
-        then drop the subscription state. The subscriber's matching
-        STOP_SENDING (if it raced) is reciprocated separately by the
-        StopSendingReceived handler."""
+        """Publisher-side: subscriber wants out. Retire the alias we
+        issued and notify the owner, which owns the data streams.
+        Receive-side state is keyed by the peer's aliases, a different
+        number space, and is left alone."""
         logger.info(f"MOQT event: handle {msg}")
-        # Map request_id back to the track_alias we issued in subscribe_ok.
-        track_alias = next(
-            (ta for ta, rid in self._track_aliases.items()
-             if rid == msg.request_id),
-            None)
-        if track_alias is not None:
-            for key, sid in list(self._subgroup_stream_by_key.items()):
-                if key[0] == track_alias:
-                    self.stream_reset(sid, SessionCloseCode.NO_ERROR)
-                    self._cleanup_stream(
-                        sid, QuicErrorCode.APPLICATION_ERROR)
-            self._track_aliases.pop(track_alias, None)
-            self._object_handlers.pop(track_alias, None)
-            self._forget_track_bounds(track_alias)
+        for alias, rid in list(self._published_aliases.items()):
+            if rid == msg.request_id:
+                del self._published_aliases[alias]
         self._subscriptions.pop(msg.request_id, None)
         # d18 has no UNSUBSCRIBE; there the same news arrives as a
         # terminated request stream. Both reach the owner the same way.
@@ -4128,6 +4212,7 @@ class _MOQTSessionMixin:
             # Transport-aware: raw QUIC allocates a uni id synchronously,
             # WT round-trips via create_stream. open_uni_stream handles both.
             self._d18_control_write_sid = await self.open_uni_stream()
+            self._prioritise_control_stream(self._d18_control_write_sid)
             logger.info(
                 f"MOQT: d18 server control write-uni: "
                 f"{self._d18_control_write_sid}")

@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 from importlib import metadata as _md
@@ -152,6 +153,61 @@ def _version(v: str) -> str:
     return re.sub(r"\.d\d{8}", "", v)
 
 
+def _git(root: str, *args: str) -> str | None:
+    """One `git -C root` invocation, or None on any failure."""
+    try:
+        out = subprocess.run(("git", "-C", root, *args),
+                             capture_output=True, text=True, timeout=2.0)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.strip() or None
+
+
+def _own_source_tree(root: str, pkg: str) -> bool:
+    """True iff `root` sits in a git tree that is `pkg`'s own source.
+
+    Guards against reporting an unrelated enclosing repo: a wheel
+    installed into a venv inside someone else's git project would
+    otherwise have that project's revision attributed to it. Matching
+    pyproject's `name` works for flat and src layouts alike."""
+    top = _git(root, "rev-parse", "--show-toplevel")
+    if top is None:
+        return False
+    try:
+        text = (Path(top) / "pyproject.toml").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return re.search(rf'(?m)^\s*name\s*=\s*["\']{re.escape(pkg)}["\']',
+                     text) is not None
+
+
+def _git_state(root: str, ver: str, pkg: str) -> str | None:
+    """Working-tree identity for a from-source install: ' git:REV BRANCH'.
+
+    A from-source install imports from the tree, but its dist metadata
+    version is written once at install time — it cannot track a branch
+    switch or an uncommitted edit, so it is the wrong answer to "what am
+    I running". `--dirty` is what surfaces uncommitted changes, and the
+    version is marked stale when it names a commit that is not HEAD.
+    Returns None for a wheel install, outside a repo, or without git."""
+    if not _own_source_tree(root, pkg):
+        return None
+    desc = _git(root, "describe", "--tags", "--dirty", "--always")
+    if desc is None:
+        return None
+    out = f" git:{desc}"
+    branch = _git(root, "rev-parse", "--abbrev-ref", "HEAD")
+    if branch and branch != "HEAD":
+        out += f" {branch}"
+    m = re.search(r"\+g([0-9a-f]{7,})", ver)
+    head = _git(root, "rev-parse", "HEAD")
+    if m and head and not head.startswith(m.group(1)):
+        out += " (metadata version STALE)"
+    return out
+
+
 def _meta(module, name: str | None = None) -> str:
     """Suffix after the version: ' (PATH) [BUILD]'. PATH is the
     abbreviated install dir (module.__file__'s parent — the actually-
@@ -173,7 +229,11 @@ def print_versions(file=sys.stdout) -> None:
     import aiomoqt
     dist = _dist("aiomoqt")
     ver = dist.version if dist is not None else __version__
-    print(f"{'aiomoqt:':<{_LABEL_W}}{_version(ver)}{_meta(aiomoqt, 'aiomoqt')}", file=file)
+    line = f"{'aiomoqt:':<{_LABEL_W}}{_version(ver)}{_meta(aiomoqt, 'aiomoqt')}"
+    if dist is None or _is_editable(dist):
+        line += _git_state(os.path.dirname(os.path.abspath(aiomoqt.__file__)),
+                           ver, "aiomoqt") or ""
+    print(line, file=file)
     try:
         from aiopquic import versions as _aiopquic_versions
         _aiopquic_versions.print_versions(file=file)

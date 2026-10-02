@@ -139,8 +139,10 @@ async def _subscriber_task(config: Dict[str, Any], mp_stop_event,
     stop_ev = _bridge_stop_event(mp_stop_event)
     stats = TrackStats()
 
-    def _on_object(msg, size_bytes, recv_time_ms, *_args, **_kw):
-        stats.on_object(msg, size_bytes, recv_time_ms)
+    def _on_object(msg, size_bytes, recv_time_us, group_id=None,
+                   subgroup_id=None, *_args, **_kw):
+        stats.on_object(msg, size_bytes, recv_time_us, group_id,
+                        subgroup_id)
 
     try:
         async with client.connect() as session:
@@ -300,8 +302,10 @@ async def _slot_supervisor(config, relay, stop_ev, stats, state,
         except asyncio.TimeoutError:
             pass
 
-    def _on_object(msg, size_bytes, recv_time_ms, *_args, **_kw):
-        stats.on_object(msg, size_bytes, recv_time_ms)
+    def _on_object(msg, size_bytes, recv_time_us, group_id=None,
+                   subgroup_id=None, *_args, **_kw):
+        stats.on_object(msg, size_bytes, recv_time_us, group_id,
+                        subgroup_id)
 
     insecure = config.get('insecure', False)
     while not stop_ev.is_set():

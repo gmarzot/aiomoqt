@@ -1,5 +1,62 @@
 # Changelog
 
+## Unreleased
+
+- `moq_interop_client`: `data-subgroup-basic` data-plane test, in the standard set.
+- `moq_interop_client`: `rendezvous-timeout` test, in the standard set; SKIP below d18.
+- `moq_interop_client`: with no `--draft`/`DRAFT`, probes `18,16,14` (newest first) instead
+  of `16,14,18`.
+- `moq_interop_client`: TAP YAML reports per-role `sessions` (negotiated version,
+  transport, ALPN, initial DCID), `implementation_version` and `test_spec_revision`;
+  `duration_ms` is an integer and string values are quoted.
+- `moq_interop_relay`: d18 `RENDEZVOUS_TIMEOUT` holds a SUBSCRIBE for a publisher (capped
+  at 30 s), then answers `REQUEST_ERROR` `TIMEOUT`.
+- Transport stream scheduling now has a defined band layout, in `aiomoqt.types`:
+  0 disallowed, 2/4/6 reserved above control, 8 control streams, 9 datagrams
+  (picoquic's default, untouched), 10-254 subscription data. Control streams are
+  prioritised on every transport and draft; declared data is floored above the
+  control band, since scheduling is strict and a greedy track below it would
+  starve the session's own control stream. The wire always carries the declared
+  8-bit MoQT priority unchanged — only the local mapping is banded.
+- `to_stream_priority()` moved from `aiomoqt.agent.session` to `aiomoqt.types`,
+  now that both the agent layer and the session need it.
+- Fix: `priority_plan()["enforced"]` probes the setter the session would really
+  dispatch to. On WebTransport it reported enforcement because the session
+  carried the method it was being asked about.
+- Fix: aliases we assign as publisher are kept apart from the peer's; an UNSUBSCRIBE no
+  longer resets the streams and drops the object handler of a received track that
+  shares the alias number.
+- Fix: a declared stream priority now reaches the scheduler over WebTransport. The
+  lookup went through `self._quic`, which on WebTransport is the session itself, so
+  it found this method and recursed; `RecursionError` was caught only in the deepest
+  frame, leaving every frame above to report success for a priority that never left
+  the process. Raw QUIC was unaffected.
+- `set_stream_priority()` reports False when the transport's event ring is full, where
+  it previously returned True for a priority that was not applied.
+- Fix: a received subgroup object can be printed or logged; the per-stream cached
+  `ObjectHeader` was built with `__new__`, leaving `type` unset and `str()` raising.
+- `set_default_stream_priority()` passthrough, for aligning the transport default with
+  MoQT's neutral publisher priority. Writes the QUIC context default, shared by every
+  connection on the transport.
+- loopback_bench: `--bind` sets the address the subscriber dials (default `localhost`).
+- Fix: adaptive_bench (relay, `--mp`), load_sim and the worker subscribers count loss and
+  groups on stream delivery; their object callback dropped the group and subgroup ids.
+- sub_media: `--analyze` measures delivery without decoding — latency, jitter, loss and
+  reorder, group integrity, keyframe cost, bitrate, and a playout model; `--report PATH`
+  writes CSV (`-` = stdout).
+- Fix: a control message whose body parses past its Length closes the session with
+  PROTOCOL_VIOLATION instead of consuming the next message's bytes.
+- sub_media: `-i` sets the report interval; `-T` limits it to one catalog track.
+- Datagram receive no longer formats debug strings (payload hex, per-object text) when
+  debug logging is off; neither does the per-stream header log.
+- media: `on_arrival` on `LocTrackSubscriber` and `MediaSubscriber` sees every object,
+  END_OF_GROUP included, with its receive time.
+- media: `chunk_decode_time()` and `init_timescale()` read CMAF tfdt and mdhd.
+- Fix: TrackStats counted a reorder that filled a gap as lost, and missed a gap spanning a
+  `snapshot()`.
+- Fix: VideoTrack counts its first stream in PUBLISH_DONE, resets the open stream when
+  cancelled, honours `_quiet`, and encodes each frame once instead of copying it twice.
+
 ## v0.11.1
 
 Pairs with aiopquic 0.4.1. moq-test conformance: 76/76 on d16 and d18,

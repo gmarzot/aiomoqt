@@ -174,6 +174,9 @@ ffmpeg -i 'srt://0.0.0.0:9000?mode=listener' -map 0:v -c:v copy -f h264 - \
 python -m aiomoqt.tools.sub_media $RELAY -N demo/live --inspect 5 --show-catalog
 ffplay media-out/video.h264      # LOC → elementary stream
 ffplay media-out/video.mp4       # CMAF → fMP4
+
+# Measure delivery instead: latency, jitter, loss, playout model; no decode, no files
+python -m aiomoqt.tools.sub_media $RELAY -N demo/live --analyze -t 60 -i 5 --report run.csv
 ```
 
 Source material should use short GOPs and no B-frames (`-g 2×fps -sc_threshold 0 -bf 0`) for low join latency. CMAF chunks carry one sample each with no composition-time offsets, so B-frame sources will not present correctly.
@@ -237,7 +240,7 @@ Each tool runs as a module (`python -m aiomoqt.tools.NAME`) and most also instal
 |---|---|---|
 | `aiomoqt.versions` | `aiomoqt-versions` | version report (aiomoqt, aiopquic, picoquic/picotls SHAs) |
 | `tools.pub_media` | — | MSF/LOC/CMAF media publisher (mp4, live H.264, tone) |
-| `tools.sub_media` | — | catalog-driven media subscriber; writes playable files |
+| `tools.sub_media` | — | catalog-driven media subscriber; writes playable files or measures delivery (`--analyze`) |
 | `tools.pub_bench` | `moq-pub-bench` | publisher benchmark |
 | `tools.sub_bench` | `moq-sub-bench` | subscriber benchmark — latency, jitter, loss |
 | `tools.loopback_bench` | `moq-loopback-bench` | in-process publisher + subscriber, no relay |
