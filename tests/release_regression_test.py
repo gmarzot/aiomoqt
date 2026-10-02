@@ -69,7 +69,7 @@ TIERS = {
                     "loopback-adaptive-mp-d18",
                     "loopback-fetch"],
     "interop":     ["relay-ctrl-msg", "relay-pub-sub", "relay-discovery",
-                    "relay-join", "relay-fetch"],
+                    "relay-join", "relay-fetch", "relay-data"],
     "bench":       ["loopback-adaptive-bench"],
 }
 TIER_CHOICES = tuple(TIERS.keys())
@@ -282,6 +282,14 @@ def _loopback_adaptive_mp(log_dir: Path, draft: int) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 # Interop-tier runners (per relay × transport × draft)
 # ---------------------------------------------------------------------------
+# The control-plane cases relay-ctrl-msg gates on. The client's standard run
+# also carries data-plane cases; relay-data reports those.
+CTRL_CASES = frozenset({
+    "setup-only", "announce-only", "publish-namespace-done",
+    "subscribe-error", "announce-subscribe", "subscribe-before-announce",
+})
+
+
 def _relay_ctrl_msg(url: str, draft: int, insecure: bool,
                     compat: str, log: Path) -> tuple[str, str]:
     cmd = [sys.executable, "-m", "aiomoqt.tools.moq_interop_client",
@@ -294,8 +302,10 @@ def _relay_ctrl_msg(url: str, draft: int, insecure: bool,
     if not ok:
         return "FAIL", "timeout"
     text = log.read_text()
-    ok_count = len(re.findall(r"^ok \d", text, re.MULTILINE))
-    return ("PASS" if ok_count == 6 else "FAIL"), f"{ok_count}/6"
+    passed = set(re.findall(r"^ok \d+ - (\S+)", text, re.MULTILINE))
+    ok_count = len(passed & CTRL_CASES)
+    n = len(CTRL_CASES)
+    return ("PASS" if ok_count == n else "FAIL"), f"{ok_count}/{n}"
 
 
 def _relay_pub_sub(url: str, draft: int, pub_mode: str, insecure: bool,
@@ -343,6 +353,9 @@ def _relay_tap_case(url: str, draft: int, case: str, insecure: bool,
     # TAP line for a single-case run: "ok 1 - <case>" or "not ok 1 - ..."
     if re.search(rf"^ok 1 - {re.escape(case)}", text, re.MULTILINE):
         return "PASS", "ok"
+    m = re.search(r"^  message: (.*)$", text, re.MULTILINE)
+    if m:
+        return "FAIL", m.group(1).strip('"')
     last = text.splitlines()[-1] if text else "no output"
     return "FAIL", last
 
@@ -360,6 +373,12 @@ def _relay_fetch(url: str, draft: int, insecure: bool,
 def _relay_discovery(url: str, draft: int, insecure: bool,
                      compat: str, log: Path) -> tuple[str, str]:
     return _relay_tap_case(url, draft, "namespace-discovery",
+                           insecure, compat, log)
+
+
+def _relay_data(url: str, draft: int, insecure: bool,
+                compat: str, log: Path) -> tuple[str, str]:
+    return _relay_tap_case(url, draft, "data-subgroup-basic",
                            insecure, compat, log)
 
 
@@ -501,6 +520,10 @@ def _run_relay_matrix(relay: dict, enabled: set[str],
             if "relay-discovery" in enabled:
                 _dispatch("relay-discovery", "", tag, slug,
                           _relay_discovery, url, draft, insecure, compat_csv,
+                          gating=gating)
+            if "relay-data" in enabled:
+                _dispatch("relay-data", "", tag, slug,
+                          _relay_data, url, draft, insecure, compat_csv,
                           gating=gating)
 
     return results
