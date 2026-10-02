@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-MoQ Interop Test Client — implements the 6 standard test cases from
-https://github.com/englishm/moq-interop-runner
+MoQ Interop Test Client — implements the control-plane test cases and the
+data-plane scenarios from https://github.com/englishm/moq-interop-runner
 
 Output: TAP version 14 with YAML diagnostics, with an ISO-8601 `# date:`
 header so published log files self-identify when they ran.
@@ -16,18 +16,23 @@ intentional deviations, not silent passes.
 import argparse
 import asyncio
 import datetime
+import json
 import logging
 import os
+import secrets
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from aiomoqt.client import MOQTClient
+from aiomoqt.context import is_draft16_or_later, profile_for
+from aiomoqt.messages import SubgroupHeader
 from aiomoqt.messages.base import MOQTMessage
 from aiomoqt.track import PublishedTrack, SubscribedTrack
 from aiomoqt.types import (
     ParamType, FetchType, MOQTRequestError, MOQTMessageType,
-    SubscribeErrorCode, RequestErrorCode, parse_draft_spec,
+    SubscribeErrorCode, RequestErrorCode, SubscribeDoneCode,
+    FilterType, GroupOrder, ObjectStatus, parse_draft_spec,
 )
 from aiomoqt.utils.logger import set_log_level
 
@@ -192,9 +197,14 @@ STANDARD_TESTS = [
     "announce-only",
     "publish-namespace-done",
     "subscribe-error",
+    "rendezvous-timeout",
     "announce-subscribe",
     "subscribe-before-announce",
+    "data-subgroup-basic",
 ]
+
+# Leading Track Namespace fields from --namespace-prefix.
+_NS_PREFIX: tuple = ()
 
 
 @dataclass
@@ -203,9 +213,10 @@ class TestResult:
     passed: bool
     duration_ms: float = 0.0
     message: str = ""
-    connection_id: str = ""
-    publisher_connection_id: str = ""
-    subscriber_connection_id: str = ""
+    # Role from the test specification -> _session_meta() of that session.
+    sessions: dict = field(default_factory=dict)
+    # Revision of the prose specification implemented; 0 = unrecorded.
+    spec_revision: int = 0
     expected: str = ""
     received: str = ""
     skipped: bool = False
@@ -256,23 +267,29 @@ class TAPReporter:
             tag = " # COMPAT" if r.compat and not r.skipped else ""
             lines.append(f"{status} {i} - {r.name}{skip}{tag}")
             lines.append("  ---")
-            lines.append(f"  duration_ms: {r.duration_ms:.1f}")
-            if r.connection_id:
-                lines.append(f"  connection_id: {r.connection_id}")
-            if r.publisher_connection_id:
-                lines.append(f"  publisher_connection_id: {r.publisher_connection_id}")
-            if r.subscriber_connection_id:
-                lines.append(f"  subscriber_connection_id: {r.subscriber_connection_id}")
+            lines.append(f"  duration_ms: {round(r.duration_ms)}")
+            if self.aiomoqt_version:
+                lines.append(
+                    f"  implementation_version: {_yaml_str(self.aiomoqt_version)}")
+            if r.spec_revision:
+                lines.append(f"  test_spec_revision: {r.spec_revision}")
+            roles = {k: v for k, v in r.sessions.items() if v}
+            if roles:
+                lines.append("  sessions:")
+                for role, meta in roles.items():
+                    lines.append(f"    {role}:")
+                    for k, v in meta.items():
+                        lines.append(f"      {k}: {_yaml_str(v)}")
             if r.message:
-                lines.append(f"  message: {r.message}")
+                lines.append(f"  message: {_yaml_str(r.message)}")
             if r.expected:
-                lines.append(f"  expected: {r.expected}")
+                lines.append(f"  expected: {_yaml_str(r.expected)}")
             if r.received:
-                lines.append(f"  received: {r.received}")
+                lines.append(f"  received: {_yaml_str(r.received)}")
             if r.compat:
                 lines.append("  compat: true")
                 if r.compat_note:
-                    lines.append(f"  compat_note: {r.compat_note}")
+                    lines.append(f"  compat_note: {_yaml_str(r.compat_note)}")
             if r.wire_noncompliance_count:
                 lines.append(
                     f"  wire_noncompliance: {r.wire_noncompliance_count}"
@@ -289,14 +306,29 @@ class TAPReporter:
         return "\n".join(lines)
 
 
-def _get_connection_id(session) -> str:
-    """Extract QUIC connection ID from session for diagnostics."""
+def _yaml_str(value) -> str:
+    """A YAML double-quoted scalar (JSON string syntax is valid YAML)."""
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def _session_meta(session) -> dict:
+    """TAP `sessions` fields for what this session actually negotiated."""
     try:
-        quic = session._quic
-        cid = quic._host_cids[0].cid if quic._host_cids else b""
-        return cid.hex() if cid else "unknown"
+        hi = session.handshake_info
     except Exception:
-        return "unknown"
+        return {}
+    wt = hi.get("transport") == "webtransport"
+    meta = {"transport": "webtransport-h3" if wt else "quic"}
+    if hi.get("draft"):
+        meta["moqt_version"] = f"moqt-{hi['draft']}"
+    if hi.get("alpn"):
+        meta["alpn"] = hi["alpn"]
+    if wt and hi.get("wt_protocol"):
+        meta["webtransport_protocol"] = hi["wt_protocol"]
+    initial = (hi.get("connection_ids") or {}).get("initial")
+    if initial:
+        meta["quic_initial_destination_connection_id"] = initial.hex()
+    return meta
 
 
 def _make_client(host: str, port: int, path: str, use_quic: bool,
@@ -322,23 +354,25 @@ async def test_setup_only(host, port, path, use_quic, tls_disable_verify,
                           timeout=5.0) -> TestResult:
     """Test 1: Connect, exchange SETUP, graceful close."""
     t0 = time.monotonic()
+    sessions = {}
     client = _make_client(host, port, path, use_quic, tls_disable_verify, debug, supported_drafts=supported_drafts)
     try:
         async with asyncio.timeout(timeout):
             async with client.connect() as session:
                 await session.client_session_init()
-                cid = _get_connection_id(session)
+                sessions["client"] = _session_meta(session)
                 session.close()
         return TestResult(
             name="setup-only", passed=True,
             duration_ms=(time.monotonic() - t0) * 1000,
-            connection_id=cid,
+            sessions=sessions,
             message="SERVER_SETUP received with compatible version",
         )
     except Exception as e:
         return TestResult(
             name="setup-only", passed=False,
             duration_ms=(time.monotonic() - t0) * 1000,
+            sessions=sessions,
             message=f"Failed: {_format_exc(e)}",
             expected="SERVER_SETUP received",
             received=_format_exc(e),
@@ -350,12 +384,13 @@ async def test_announce_only(host, port, path, use_quic, tls_disable_verify,
                              timeout=5.0) -> TestResult:
     """Test 2: SETUP + PUBLISH_NAMESPACE + receive OK."""
     t0 = time.monotonic()
+    sessions = {}
     client = _make_client(host, port, path, use_quic, tls_disable_verify, debug, supported_drafts=supported_drafts)
     try:
         async with asyncio.timeout(timeout):
             async with client.connect() as session:
                 await session.client_session_init()
-                cid = _get_connection_id(session)
+                sessions["publisher"] = _session_meta(session)
 
                 await session.publish_namespace(
                     namespace=INTEROP_NAMESPACE,
@@ -366,13 +401,14 @@ async def test_announce_only(host, port, path, use_quic, tls_disable_verify,
         return TestResult(
             name="announce-only", passed=True,
             duration_ms=(time.monotonic() - t0) * 1000,
-            connection_id=cid,
+            sessions=sessions,
             message="PUBLISH_NAMESPACE_OK received",
         )
     except Exception as e:
         return TestResult(
             name="announce-only", passed=False,
             duration_ms=(time.monotonic() - t0) * 1000,
+            sessions=sessions,
             message=f"Failed: {_format_exc(e)}",
             expected="PUBLISH_NAMESPACE_OK",
             received=_format_exc(e),
@@ -386,12 +422,13 @@ async def test_publish_namespace_done(host, port, path, use_quic,
                                       timeout=5.0) -> TestResult:
     """Test 3: SETUP + PUBLISH_NAMESPACE + OK + PUBLISH_NAMESPACE_DONE + close."""
     t0 = time.monotonic()
+    sessions = {}
     client = _make_client(host, port, path, use_quic, tls_disable_verify, debug, supported_drafts=supported_drafts)
     try:
         async with asyncio.timeout(timeout):
             async with client.connect() as session:
                 await session.client_session_init()
-                cid = _get_connection_id(session)
+                sessions["publisher"] = _session_meta(session)
 
                 response = await session.publish_namespace(
                     namespace=INTEROP_NAMESPACE,
@@ -414,13 +451,14 @@ async def test_publish_namespace_done(host, port, path, use_quic,
         return TestResult(
             name="publish-namespace-done", passed=True,
             duration_ms=(time.monotonic() - t0) * 1000,
-            connection_id=cid,
+            sessions=sessions,
             message=f"PUBLISH_NAMESPACE_OK received, {how}",
         )
     except Exception as e:
         return TestResult(
             name="publish-namespace-done", passed=False,
             duration_ms=(time.monotonic() - t0) * 1000,
+            sessions=sessions,
             message=f"Failed: {_format_exc(e)}",
             expected="PUBLISH_NAMESPACE_OK + PUBLISH_NAMESPACE_DONE",
             received=_format_exc(e),
@@ -448,13 +486,13 @@ async def test_subscribe_error(host, port, path, use_quic,
     # timeout / transport error still fails.
     accept_any_error = True
     t0 = time.monotonic()
-    cid = "unknown"
+    sessions = {}
     client = _make_client(host, port, path, use_quic, tls_disable_verify, debug, supported_drafts=supported_drafts)
     try:
         async with asyncio.timeout(timeout):
             async with client.connect() as session:
                 await session.client_session_init()
-                cid = _get_connection_id(session)
+                sessions["subscriber"] = _session_meta(session)
                 try:
                     await session.subscribe(
                         namespace="nonexistent/namespace",
@@ -467,7 +505,7 @@ async def test_subscribe_error(host, port, path, use_quic,
                         return TestResult(
                             name="subscribe-error", passed=True,
                             duration_ms=(time.monotonic() - t0) * 1000,
-                            connection_id=cid,
+                            sessions=sessions,
                             message=(
                                 "SUBSCRIBE_OK for non-existent track accepted "
                                 "(libquicr deferred-delivery policy)"
@@ -484,7 +522,7 @@ async def test_subscribe_error(host, port, path, use_quic,
                     return TestResult(
                         name="subscribe-error", passed=False,
                         duration_ms=(time.monotonic() - t0) * 1000,
-                        connection_id=cid,
+                        sessions=sessions,
                         message="Unexpected SUBSCRIBE_OK for non-existent track",
                         expected="error response",
                         received="SUBSCRIBE_OK",
@@ -497,7 +535,7 @@ async def test_subscribe_error(host, port, path, use_quic,
                         return TestResult(
                             name="subscribe-error", passed=True,
                             duration_ms=(time.monotonic() - t0) * 1000,
-                            connection_id=cid,
+                            sessions=sessions,
                             message=f"Error received (expected): code={e.error_code}",
                             expected="SUBSCRIBE_ERROR code=TRACK_DOES_NOT_EXIST",
                         )
@@ -506,7 +544,7 @@ async def test_subscribe_error(host, port, path, use_quic,
                         return TestResult(
                             name="subscribe-error", passed=True,
                             duration_ms=(time.monotonic() - t0) * 1000,
-                            connection_id=cid,
+                            sessions=sessions,
                             message=(
                                 f"Non-spec error code={e.error_code} accepted "
                                 f"as 'track not found'"
@@ -523,7 +561,7 @@ async def test_subscribe_error(host, port, path, use_quic,
                     return TestResult(
                         name="subscribe-error", passed=False,
                         duration_ms=(time.monotonic() - t0) * 1000,
-                        connection_id=cid,
+                        sessions=sessions,
                         message=(
                             f"Non-conformant: expected TRACK_DOES_NOT_EXIST "
                             f"(d14=0x04 / d16=0x10), got code={e.error_code}"
@@ -535,10 +573,71 @@ async def test_subscribe_error(host, port, path, use_quic,
         return TestResult(
             name="subscribe-error", passed=False,
             duration_ms=(time.monotonic() - t0) * 1000,
+            sessions=sessions,
             message=f"Failed: {_format_exc(e)}",
             expected="error response",
             received=_format_exc(e),
         )
+
+
+# d18 SUBSCRIBE parameter (§10.2.6).
+_RENDEZVOUS_TIMEOUT = 0x04
+
+
+async def test_rendezvous_timeout(host, port, path, use_quic,
+                                  tls_disable_verify, debug,
+                                  supported_drafts=None, compat=frozenset(),
+                                  timeout=5.0) -> TestResult:
+    """SUBSCRIBE with RENDEZVOUS_TIMEOUT 500 ms for a track nobody
+    publishes; expect REQUEST_ERROR TIMEOUT within 2 s."""
+    name = "rendezvous-timeout"
+    t0 = time.monotonic()
+    sessions = {}
+    client = _make_client(host, port, path, use_quic, tls_disable_verify,
+                          debug, supported_drafts=supported_drafts)
+    try:
+        async with asyncio.timeout(timeout):
+            async with client.connect() as session:
+                await session.client_session_init()
+                sessions["subscriber"] = _session_meta(session)
+                draft = session.negotiated_draft
+                if draft < 18:
+                    session.close()
+                    return TestResult(
+                        name=name, passed=True, skipped=True,
+                        skip_reason=f"RENDEZVOUS_TIMEOUT is draft-18; "
+                                    f"negotiated draft-{draft}",
+                        duration_ms=(time.monotonic() - t0) * 1000,
+                        sessions=sessions)
+                try:
+                    async with asyncio.timeout(2.0):
+                        await session.subscribe(
+                            namespace="nonexistent/rendezvous",
+                            track_name="test-track",
+                            parameters={_RENDEZVOUS_TIMEOUT: 500},
+                            wait_response=True)
+                    code = None
+                except MOQTRequestError as e:
+                    code = int(e.error_code)
+                session.close()
+    except Exception as e:
+        return TestResult(
+            name=name, passed=False,
+            duration_ms=(time.monotonic() - t0) * 1000,
+            sessions=sessions,
+            message=f"Failed: {_format_exc(e)}",
+            expected="REQUEST_ERROR TIMEOUT", received=_format_exc(e))
+    if code == RequestErrorCode.TIMEOUT:
+        passed, msg = True, "REQUEST_ERROR TIMEOUT received"
+    elif code is None:
+        passed, msg = False, "SUBSCRIBE_OK for a track nobody publishes"
+    else:
+        passed, msg = False, f"REQUEST_ERROR code={code:#x}, expected TIMEOUT"
+    return TestResult(
+        name=name, passed=passed,
+        duration_ms=(time.monotonic() - t0) * 1000,
+        sessions=sessions, message=msg,
+        expected="REQUEST_ERROR TIMEOUT")
 
 
 async def _serve_forwarded_subscribe(session, msg):
@@ -568,8 +667,7 @@ async def test_announce_subscribe(host, port, path, use_quic,
                                   timeout=10.0) -> TestResult:
     """Test 5: Two connections — publisher announces, subscriber subscribes."""
     t0 = time.monotonic()
-    pub_cid = "unknown"
-    sub_cid = "unknown"
+    sessions = {}
 
     try:
         async with asyncio.timeout(timeout):
@@ -584,7 +682,7 @@ async def test_announce_subscribe(host, port, path, use_quic,
 
             async with pub_client.connect() as pub_session:
                 await pub_session.client_session_init()
-                pub_cid = _get_connection_id(pub_session)
+                sessions["publisher"] = _session_meta(pub_session)
 
                 await pub_session.publish_namespace(
                     namespace=INTEROP_NAMESPACE,
@@ -595,7 +693,7 @@ async def test_announce_subscribe(host, port, path, use_quic,
                 # Subscriber connection
                 async with sub_client.connect() as sub_session:
                     await sub_session.client_session_init()
-                    sub_cid = _get_connection_id(sub_session)
+                    sessions["subscriber"] = _session_meta(sub_session)
 
                     pending_hold = False
                     try:
@@ -630,8 +728,7 @@ async def test_announce_subscribe(host, port, path, use_quic,
         return TestResult(
             name="announce-subscribe", passed=passed,
             duration_ms=(time.monotonic() - t0) * 1000,
-            publisher_connection_id=pub_cid,
-            subscriber_connection_id=sub_cid,
+            sessions=sessions,
             message=msg,
             compat=pending_hold,
             compat_note=(
@@ -643,8 +740,7 @@ async def test_announce_subscribe(host, port, path, use_quic,
         return TestResult(
             name="announce-subscribe", passed=False,
             duration_ms=(time.monotonic() - t0) * 1000,
-            publisher_connection_id=pub_cid,
-            subscriber_connection_id=sub_cid,
+            sessions=sessions,
             message=f"Failed: {_format_exc(e)}",
             received=_format_exc(e),
         )
@@ -665,8 +761,7 @@ async def test_namespace_discovery(host, port, path, use_quic,
     message sequence, and holds across every draft.
     """
     t0 = time.monotonic()
-    pub_cid = "unknown"
-    sub_cid = "unknown"
+    sessions = {}
     try:
         async with asyncio.timeout(timeout):
             pub_client = _make_client(host, port, path, use_quic,
@@ -680,7 +775,7 @@ async def test_namespace_discovery(host, port, path, use_quic,
 
             async with pub_client.connect() as pub_session:
                 await pub_session.client_session_init()
-                pub_cid = _get_connection_id(pub_session)
+                sessions["publisher"] = _session_meta(pub_session)
                 track = PublishedTrack(
                     pub_session,
                     namespace=INTEROP_NAMESPACE,
@@ -698,7 +793,7 @@ async def test_namespace_discovery(host, port, path, use_quic,
 
                 async with sub_client.connect() as sub_session:
                     await sub_session.client_session_init()
-                    sub_cid = _get_connection_id(sub_session)
+                    sessions["subscriber"] = _session_meta(sub_session)
                     discovered = SubscribedTrack(
                         sub_session, INTEROP_NAMESPACE)
                     discovered._quiet = True
@@ -714,8 +809,7 @@ async def test_namespace_discovery(host, port, path, use_quic,
         return TestResult(
             name="namespace-discovery", passed=passed,
             duration_ms=(time.monotonic() - t0) * 1000,
-            publisher_connection_id=pub_cid,
-            subscriber_connection_id=sub_cid,
+            sessions=sessions,
             message=msg,
             expected=f"PUBLISH announcing '{INTEROP_TRACK}'",
             received=str(found),
@@ -724,8 +818,7 @@ async def test_namespace_discovery(host, port, path, use_quic,
         return TestResult(
             name="namespace-discovery", passed=False,
             duration_ms=(time.monotonic() - t0) * 1000,
-            publisher_connection_id=pub_cid,
-            subscriber_connection_id=sub_cid,
+            sessions=sessions,
             message=f"Failed: {_format_exc(e)}",
             expected=f"PUBLISH announcing '{INTEROP_TRACK}'",
             received=_format_exc(e),
@@ -746,8 +839,7 @@ async def test_subscribe_before_announce(host, port, path, use_quic,
     # timeout / transport error still fails.
     accept_any_error = True
     t0 = time.monotonic()
-    pub_cid = "unknown"
-    sub_cid = "unknown"
+    sessions = {}
     sub_response = None
 
     try:
@@ -759,7 +851,7 @@ async def test_subscribe_before_announce(host, port, path, use_quic,
 
             async with sub_client.connect() as sub_session:
                 await sub_session.client_session_init()
-                sub_cid = _get_connection_id(sub_session)
+                sessions["subscriber"] = _session_meta(sub_session)
 
                 # Subscriber sends SUBSCRIBE before publisher announces
                 sub_task = asyncio.create_task(
@@ -775,7 +867,7 @@ async def test_subscribe_before_announce(host, port, path, use_quic,
 
                 async with pub_client.connect() as pub_session:
                     await pub_session.client_session_init()
-                    pub_cid = _get_connection_id(pub_session)
+                    sessions["publisher"] = _session_meta(pub_session)
 
                     await pub_session.publish_namespace(
                         namespace=INTEROP_NAMESPACE,
@@ -840,8 +932,7 @@ async def test_subscribe_before_announce(host, port, path, use_quic,
         return TestResult(
             name="subscribe-before-announce", passed=passed,
             duration_ms=(time.monotonic() - t0) * 1000,
-            publisher_connection_id=pub_cid,
-            subscriber_connection_id=sub_cid,
+            sessions=sessions,
             message=msg,
             compat=compat_used,
             compat_note=compat_reason,
@@ -850,11 +941,292 @@ async def test_subscribe_before_announce(host, port, path, use_quic,
         return TestResult(
             name="subscribe-before-announce", passed=False,
             duration_ms=(time.monotonic() - t0) * 1000,
-            publisher_connection_id=pub_cid,
-            subscriber_connection_id=sub_cid,
+            sessions=sessions,
             message=f"Failed: {_format_exc(e)}",
             received=_format_exc(e),
         )
+
+
+# ---------------------------------------------------------------------------
+# Data plane (docs/tests/data-plane/)
+# ---------------------------------------------------------------------------
+
+# data-subgroup-basic canonical case: one subgroup per group.
+DATA_SUBGROUP_BASIC_REVISION = 1
+_DATA_GROUPS = 3
+_DATA_OBJECTS = 5
+_DATA_PRIORITY = 128
+_DATA_FILL = b"t"
+_DATA_GAP_S = 0.002
+_DATA_PHASE_S = 5.0
+_DATA_DELIVERY_S = 10.0
+# PUBLISH_DONE Stream Count from a publisher that cannot count its streams.
+_UNKNOWN_STREAM_COUNT = (1 << 62) - 1
+
+
+def _run_id() -> str:
+    """Run-unique namespace field: 128 random bits, lowercase hex."""
+    return secrets.token_hex(16)
+
+
+def _data_object_size(object_id: int) -> int:
+    return 64 if object_id == 0 else 32
+
+
+def _as_bytes(value) -> bytes:
+    return value.encode() if isinstance(value, str) else bytes(value)
+
+
+def _is_normal(status) -> bool:
+    return status is None or status == ObjectStatus.NORMAL
+
+
+class _DataPublisher:
+    """Publisher role: accepts the relay's SUBSCRIBE for one Full Track
+    Name and sends the canonical case on it."""
+
+    def __init__(self, namespace: tuple, track_name: bytes):
+        self.namespace = namespace
+        self.track_name = track_name
+        self.request = None
+        self.track_alias = None
+        self.forward = None
+        self.subscribed = asyncio.Event()
+
+    async def on_subscribe(self, session, msg):
+        matches = (tuple(_as_bytes(f) for f in msg.track_namespace) == self.namespace
+                   and _as_bytes(msg.track_name) == self.track_name)
+        if not matches or self.request is not None:
+            code = (RequestErrorCode.DOES_NOT_EXIST
+                    if is_draft16_or_later(session.negotiated_draft)
+                    else SubscribeErrorCode.TRACK_DOES_NOT_EXIST)
+            session.subscribe_error(request_id=msg.request_id,
+                                    error_code=int(code),
+                                    reason="track does not exist")
+            return
+        ok = session.subscribe_ok(request_msg=msg)
+        self.request = msg
+        self.track_alias = ok.track_alias
+        self.forward = getattr(msg, "forward", None)
+        self.subscribed.set()
+
+    async def send(self, session) -> int:
+        """One subgroup stream per group, ended by FIN with no end-of-group
+        signal, then PUBLISH_DONE. Returns the number of streams opened."""
+        prof = profile_for(session.negotiated_draft)
+        streams = 0
+        for group_id in range(_DATA_GROUPS):
+            stream_id = await session.open_uni_stream()
+            streams += 1
+            header = SubgroupHeader(
+                track_alias=self.track_alias, group_id=group_id,
+                subgroup_id=0, publisher_priority=_DATA_PRIORITY, prof=prof)
+            session.stream_write(stream_id, header.serialize().data)
+            for object_id in range(_DATA_OBJECTS):
+                if group_id or object_id:
+                    await asyncio.sleep(_DATA_GAP_S)
+                buf = header.next_object(
+                    payload=_DATA_FILL * _data_object_size(object_id),
+                    object_id=object_id)
+                await session.stream_write_drain(stream_id, buf.data)
+            session.stream_write(stream_id, b"", end_stream=True)
+        session.subscribe_done(
+            request_id=self.request.request_id,
+            status_code=SubscribeDoneCode.TRACK_ENDED,
+            stream_count=streams, reason="track ended")
+        return streams
+
+
+class _DataSubscriber:
+    """Subscriber role: records every object, every stream end and the
+    PUBLISH_DONE."""
+
+    def __init__(self):
+        # (group, subgroup, object, priority, status, payload)
+        self.objects = []
+        self.streams_ended = 0
+        self.streams_reset = 0
+        self.done = None
+        self._changed = asyncio.Event()
+
+    def on_object(self, msg, size, ts, group_id, subgroup_id):
+        # The object header is reused across a stream: copy what is checked.
+        gid = getattr(msg, "group_id", None)
+        self.objects.append((
+            group_id if gid is None else gid, subgroup_id, msg.object_id,
+            getattr(msg, "publisher_priority", None),
+            getattr(msg, "status", None), bytes(msg.payload or b"")))
+
+    def on_stream_end(self, group_id, subgroup_id, clean=True, reset_code=0):
+        self.streams_ended += 1
+        if not clean:
+            self.streams_reset += 1
+        self._changed.set()
+
+    def on_done(self, msg):
+        self.done = msg
+        self._changed.set()
+
+    def _drained(self) -> bool:
+        if self.done is None:
+            return False
+        count = self.done.stream_count
+        return (count != _UNKNOWN_STREAM_COUNT
+                and self.streams_ended >= (count or 0))
+
+    async def drain(self, deadline: float) -> None:
+        """Until PUBLISH_DONE has arrived and Stream Count streams have
+        ended; with the unknown-count sentinel, until the deadline."""
+        loop = asyncio.get_running_loop()
+        while not self._drained():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return
+            self._changed.clear()
+            try:
+                async with asyncio.timeout(remaining):
+                    await self._changed.wait()
+            except TimeoutError:
+                return
+
+
+def _data_problems(objects) -> list:
+    """Deviations from the canonical object set: bad objects in arrival
+    order, then missing objects in location order."""
+    problems, seen = [], set()
+    for gid, sgid, oid, prio, status, payload in objects:
+        if not _is_normal(status):
+            continue
+        loc = f"{gid}.{oid}"
+        if (gid, oid) in seen:
+            problems.append(f"duplicate object {loc}")
+            continue
+        seen.add((gid, oid))
+        if gid not in range(_DATA_GROUPS) or oid not in range(_DATA_OBJECTS):
+            problems.append(f"unexpected object {loc}")
+            continue
+        if sgid != 0:
+            problems.append(f"object {loc} on subgroup {sgid}, expected 0")
+        if prio != _DATA_PRIORITY:
+            problems.append(
+                f"object {loc} priority {prio}, expected {_DATA_PRIORITY}")
+        size = _data_object_size(oid)
+        if len(payload) != size:
+            problems.append(f"object {loc} payload {len(payload)} bytes, "
+                            f"expected {size}")
+        elif payload != _DATA_FILL * size:
+            problems.append(f"object {loc} payload bytes are not all 0x74")
+    for gid in range(_DATA_GROUPS):
+        for oid in range(_DATA_OBJECTS):
+            if (gid, oid) not in seen:
+                problems.append(f"missing object {gid}.{oid}")
+    return problems
+
+
+async def test_data_subgroup_basic(host, port, path, use_quic,
+                                   tls_disable_verify, debug,
+                                   supported_drafts=None,
+                                   compat=frozenset()) -> TestResult:
+    """data-subgroup-basic: three groups of five objects, one subgroup
+    stream per group, relayed from publisher to subscriber and checked
+    object by object."""
+    name = "data-subgroup-basic"
+    t0 = time.monotonic()
+    loop = asyncio.get_running_loop()
+    sessions = {}
+    fields = (*_NS_PREFIX, "moq-interop", name, _run_id())
+    namespace = "/".join(fields)
+    pub = _DataPublisher(tuple(f.encode() for f in fields), b"track")
+    sub = _DataSubscriber()
+    pub_client = _make_client(host, port, path, use_quic, tls_disable_verify,
+                              debug, supported_drafts=supported_drafts)
+    pub_client.register_handler(MOQTMessageType.SUBSCRIBE, pub.on_subscribe)
+    sub_client = _make_client(host, port, path, use_quic, tls_disable_verify,
+                              debug, supported_drafts=supported_drafts)
+
+    def result(passed: bool, message: str) -> TestResult:
+        return TestResult(
+            name=name, passed=passed,
+            duration_ms=(time.monotonic() - t0) * 1000,
+            sessions=sessions, spec_revision=DATA_SUBGROUP_BASIC_REVISION,
+            message=message)
+
+    step = "publisher SETUP"
+    try:
+        async with asyncio.timeout(_DATA_PHASE_S) as phase:
+            async with pub_client.connect() as pub_session:
+                await pub_session.client_session_init()
+                sessions["publisher"] = _session_meta(pub_session)
+
+                step = "PUBLISH_NAMESPACE"
+                phase.reschedule(loop.time() + _DATA_PHASE_S)
+                await pub_session.publish_namespace(
+                    namespace=namespace, parameters=_PUB_NS_PARAMS,
+                    wait_response=True)
+
+                step = "subscriber SETUP"
+                phase.reschedule(loop.time() + _DATA_PHASE_S)
+                async with sub_client.connect() as sub_session:
+                    await sub_session.client_session_init()
+                    sessions["subscriber"] = _session_meta(sub_session)
+
+                    # FORWARD, SUBSCRIBER_PRIORITY and SUBSCRIPTION_FILTER
+                    # are omitted; d14 carries them as fixed fields.
+                    step = "SUBSCRIBE"
+                    phase.reschedule(loop.time() + _DATA_PHASE_S)
+                    d16 = is_draft16_or_later(sub_session.negotiated_draft)
+                    track = SubscribedTrack(
+                        sub_session, namespace, "track",
+                        on_object=sub.on_object, on_done=sub.on_done)
+                    await track.subscribe(
+                        forward=None, group_order=GroupOrder.ASCENDING,
+                        filter_type=None if d16 else FilterType.LATEST_OBJECT)
+                    sub_session.register_stream_end_handler(
+                        track.track_alias, sub.on_stream_end)
+
+                    step = "upstream SUBSCRIBE"
+                    await pub.subscribed.wait()
+                    if pub.forward == 0:
+                        return result(False, "relay subscribed upstream "
+                                             "with Forward State 0")
+
+                    step = "object delivery"
+                    deadline = loop.time() + _DATA_DELIVERY_S
+                    phase.reschedule(deadline + 1.0)
+                    sent = await pub.send(pub_session)
+                    await sub.drain(deadline)
+                    sub_session.close()
+                pub_session.close()
+    except TimeoutError:
+        return result(False, f"timed out waiting for {step}")
+    except MOQTRequestError as e:
+        return result(False, f"{step} refused: code={e.error_code} {e.reason}")
+    except Exception as e:
+        return result(False, f"{step} failed: {_format_exc(e)}")
+
+    problems = _data_problems(sub.objects)
+    done = sub.done
+    if done is None:
+        problems.insert(0, "no downstream PUBLISH_DONE")
+        count = "none"
+    else:
+        count = ("unknown" if done.stream_count == _UNKNOWN_STREAM_COUNT
+                 else done.stream_count)
+        if done.status_code != SubscribeDoneCode.TRACK_ENDED:
+            problems.insert(0, f"downstream PUBLISH_DONE status "
+                               f"{done.status_code}, expected TRACK_ENDED")
+        if count != "unknown" and sub.streams_ended < (count or 0):
+            problems.append(f"{sub.streams_ended} of {count} downstream "
+                            f"streams ended")
+    received = sum(1 for o in sub.objects if _is_normal(o[4]))
+    summary = (f"{received} objects received; Stream Count upstream {sent}, "
+               f"downstream {count}")
+    if sub.streams_reset:
+        summary += f"; {sub.streams_reset} downstream stream(s) reset"
+    if problems:
+        return result(False, f"{problems[0]} ({len(problems)} problem(s)); "
+                             f"{summary}")
+    return result(True, summary)
 
 
 async def test_fetch(host, port, path, use_quic, tls_disable_verify,
@@ -863,6 +1235,7 @@ async def test_fetch(host, port, path, use_quic, tls_disable_verify,
     """FETCH probe: send a standalone FETCH; relay handles if it responds
     with FETCH_OK or structured FETCH_ERROR. Timeout/close = fail."""
     t0 = time.monotonic()
+    sessions = {}
     client = _make_client(host, port, path, use_quic,
                           tls_disable_verify, debug,
                           supported_drafts=supported_drafts)
@@ -870,7 +1243,7 @@ async def test_fetch(host, port, path, use_quic, tls_disable_verify,
         async with asyncio.timeout(timeout):
             async with client.connect() as session:
                 await session.client_session_init()
-                cid = _get_connection_id(session)
+                sessions["subscriber"] = _session_meta(session)
                 spec_ok = True
                 try:
                     await session.fetch(
@@ -908,12 +1281,13 @@ async def test_fetch(host, port, path, use_quic, tls_disable_verify,
         return TestResult(
             name="fetch", passed=spec_ok,
             duration_ms=(time.monotonic() - t0) * 1000,
-            connection_id=cid, message=msg,
+            sessions=sessions, message=msg,
         )
     except Exception as e:
         return TestResult(
             name="fetch", passed=False,
             duration_ms=(time.monotonic() - t0) * 1000,
+            sessions=sessions,
             message=f"Failed: {_format_exc(e)}",
             expected="FETCH_OK or FETCH_ERROR",
             received=_format_exc(e),
@@ -926,6 +1300,7 @@ async def test_join(host, port, path, use_quic, tls_disable_verify,
     """JOIN probe: send SUBSCRIBE + JOINING_FETCH(RELATIVE, start=0).
     Relay handles if it responds (OK or structured error). Timeout = fail."""
     t0 = time.monotonic()
+    sessions = {}
     client = _make_client(host, port, path, use_quic,
                           tls_disable_verify, debug,
                           supported_drafts=supported_drafts)
@@ -933,7 +1308,7 @@ async def test_join(host, port, path, use_quic, tls_disable_verify,
         async with asyncio.timeout(timeout):
             async with client.connect() as session:
                 await session.client_session_init()
-                cid = _get_connection_id(session)
+                sessions["subscriber"] = _session_meta(session)
                 spec_ok = True
                 try:
                     await session.join(
@@ -961,12 +1336,13 @@ async def test_join(host, port, path, use_quic, tls_disable_verify,
         return TestResult(
             name="join", passed=spec_ok,
             duration_ms=(time.monotonic() - t0) * 1000,
-            connection_id=cid, message=msg,
+            sessions=sessions, message=msg,
         )
     except Exception as e:
         return TestResult(
             name="join", passed=False,
             duration_ms=(time.monotonic() - t0) * 1000,
+            sessions=sessions,
             message=f"Failed: {_format_exc(e)}",
             expected="SUBSCRIBE_OK + FETCH_OK or structured error",
             received=_format_exc(e),
@@ -982,8 +1358,10 @@ TEST_FUNCTIONS = {
     "announce-only": test_announce_only,
     "publish-namespace-done": test_publish_namespace_done,
     "subscribe-error": test_subscribe_error,
+    "rendezvous-timeout": test_rendezvous_timeout,
     "announce-subscribe": test_announce_subscribe,
     "subscribe-before-announce": test_subscribe_before_announce,
+    "data-subgroup-basic": test_data_subgroup_basic,
     "namespace-discovery": test_namespace_discovery,
     "fetch": test_fetch,
     "join": test_join,
@@ -1048,10 +1426,10 @@ def parse_args():
     parser.add_argument(
         "--draft", type=parse_draft_spec,
         default=parse_draft_spec(draft_env) if draft_env else None,
-        help="MoQT draft, e.g. 16 or draft-16 (single = strict pin) or a "
-             "comma list 16,14,18 (preference-ordered probe: pin the first "
+        help="MoQT draft, e.g. 18 or draft-18 (single = strict pin) or a "
+             "comma list 18,16,14 (preference-ordered probe: pin the first "
              "whose SETUP completes) (env: DRAFT, MOQT_DRAFT). Default: "
-             "auto multi-version ALPN with a draft-14 handshake fallback")
+             "probe 18,16,14")
     parser.add_argument(
         "--compat", type=str, default=os.environ.get("COMPAT", ""),
         help=(
@@ -1107,14 +1485,10 @@ async def run_tests(tests: list[str], host: str, port: int, path: str,
     # auto cleanly (it just adds one connect).
     effective_draft = supported_drafts
     if isinstance(supported_drafts, (list, tuple)):
-        # Preference-ordered probe (e.g. --draft 16,14,18 / DRAFT=16,14,18):
-        # pin the FIRST draft whose single-ALPN SETUP completes. A
-        # d16-capable relay keeps d16 (preferred, stable); a d18-only relay
-        # falls through 16 -> 14 -> 18. Each attempt is a deterministic
-        # single-ALPN offer (no multi-offer server-choice vagary), so one
-        # manifest entry can prefer d16 everywhere yet still succeed at d18
-        # against d18-only relays — with no d16->d18 regression on relays
-        # whose d18 diverges (e.g. moq-dev).
+        # Preference-ordered probe (e.g. --draft 18,16,14 / DRAFT=18,16,14):
+        # pin the FIRST draft whose single-ALPN SETUP completes. Each attempt
+        # is a deterministic single-ALPN offer, with no multi-offer
+        # server-choice vagary.
         effective_draft = None
         for d in supported_drafts:
             if await _probe_setup_ok(host, port, path, use_quic,
@@ -1209,10 +1583,11 @@ def main():
     # Apply namespace prefix and auth-token, if set, before the
     # tests capture INTEROP_NAMESPACE / _PUB_NS_PARAMS from module
     # scope. Both flags default off so anonymous tests look anonymous.
-    global INTEROP_NAMESPACE, _PUB_NS_PARAMS
+    global INTEROP_NAMESPACE, _PUB_NS_PARAMS, _NS_PREFIX
     prefix = args.namespace_prefix.strip("/")
     if prefix:
         INTEROP_NAMESPACE = f"{prefix}/{INTEROP_NAMESPACE}"
+        _NS_PREFIX = tuple(prefix.split("/"))
     if args.auth_token:
         _PUB_NS_PARAMS = {
             ParamType.AUTH_TOKEN: args.auth_token.encode(),
@@ -1221,13 +1596,10 @@ def main():
     # Public API takes the draft NUMBER (14, 16, ...). MOQTClient
     # normalizes to the wire form internally; pass args.draft through.
     # No explicit draft (the moq-interop-runner invokes us with RELAY_URL
-    # but no DRAFT) defaults to the preference-ordered probe 16->14->18:
-    # pin d16 for d16-capable relays, fall through to d14, and reach d18
-    # only for d18-only relays. Deterministic single-ALPN per probe — one
-    # client image negotiates the best draft per relay with no manifest
-    # per-column config. An explicit --draft/DRAFT single int still pins
-    # strictly; an explicit list sets a custom probe order.
-    supported_drafts = args.draft if args.draft is not None else [16, 14, 18]
+    # but no DRAFT): probe newest first and pin the first draft whose SETUP
+    # completes. An explicit --draft/DRAFT single int pins strictly; an
+    # explicit list sets a custom probe order.
+    supported_drafts = args.draft if args.draft is not None else [18, 16, 14]
 
     if args.verbose:
         transport = "QUIC" if use_quic else "WebTransport"
