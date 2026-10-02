@@ -9,6 +9,8 @@
 - `moq_interop_client`: TAP YAML reports per-role `sessions` (negotiated version,
   transport, ALPN, initial DCID), `implementation_version` and `test_spec_revision`;
   `duration_ms` is an integer and string values are quoted.
+- `moq_interop_relay`: d18 `RENDEZVOUS_TIMEOUT` holds a SUBSCRIBE for a publisher (capped
+  at 30 s), then answers `REQUEST_ERROR` `TIMEOUT`.
 - Transport stream scheduling now has a defined band layout, in `aiomoqt.types`:
   0 disallowed, 2/4/6 reserved above control, 8 control streams, 9 datagrams
   (picoquic's default, untouched), 10-254 subscription data. Control streams are

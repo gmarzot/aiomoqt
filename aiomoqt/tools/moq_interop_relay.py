@@ -109,6 +109,10 @@ TERMINAL_GRACE_S = 3.0
 # How long a SUBSCRIBE waits for an upstream to (re)appear before the
 # relay answers "track does not exist".
 UPSTREAM_WAIT_S = 3.0
+# d18 SUBSCRIBE parameter (§10.2.6); 0x04 is MAX_CACHE_DURATION before d18.
+RENDEZVOUS_TIMEOUT = 0x04
+# Longest a SUBSCRIBE is held for a publisher, whatever it asks for.
+RENDEZVOUS_MAX_S = 30.0
 
 
 async def _await_upstream(timeout: float = None) -> bool:
@@ -935,9 +939,61 @@ def _largest_kwargs(track) -> dict:
             "largest_object_id": track.largest[1]}
 
 
+def _publisher_known(ns: tuple, track_name) -> bool:
+    """A publisher could serve this track now: it PUBLISHed the track,
+    announced a covering namespace, or the relay dials an origin."""
+    track = _tracks.get((ns, track_name))
+    if (track is not None and _track_live(track)
+            and (track.pending_publish or track.upstream)):
+        return True
+    return bool(_publishers_for(ns) or _upstream_urls)
+
+
+def _rendezvous_s(session, msg) -> float:
+    """How long to hold this SUBSCRIBE for a publisher; 0 = answer now."""
+    if (session.negotiated_draft or 0) < 18:
+        return 0.0
+    ms = (msg.parameters or {}).get(RENDEZVOUS_TIMEOUT)
+    return min(int(ms) / 1000, RENDEZVOUS_MAX_S) if ms else 0.0
+
+
+async def _await_publisher(session, ns: tuple, track_name,
+                           wait_s: float) -> bool:
+    """Hold until a publisher for the track appears. False on expiry or
+    once the subscriber's session has closed."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + wait_s
+    while not _publisher_known(ns, track_name):
+        if loop.time() >= deadline or not _session_live(session):
+            return False
+        await asyncio.sleep(0.05)
+    return True
+
+
 async def _on_subscribe(session, msg):
     """Relay a SUBSCRIBE: establish upstream, then fan out downstream."""
     ns = _ns_tuple(msg.track_namespace)
+
+    # §10.2.6: hold for a publisher up to RENDEZVOUS_TIMEOUT, then TIMEOUT.
+    # Once one appears the SUBSCRIBE proceeds as if it had just arrived.
+    wait_s = _rendezvous_s(session, msg)
+    if wait_s and not _publisher_known(ns, msg.track_name):
+        logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
+                    f"held up to {wait_s:.3f}s for a publisher")
+        if not await _await_publisher(session, ns, msg.track_name, wait_s):
+            if not _session_live(session):
+                return
+            logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
+                        f"-> ERROR (rendezvous timeout)")
+            err = RequestError(
+                request_id=msg.request_id,
+                error_code=int(RequestErrorCode.TIMEOUT),
+                retry_interval=0,
+                reason="no publisher within the rendezvous timeout",
+            )
+            logger.info(f"MOQT send: {err}")
+            session._send_reply(msg.request_id, err, fin=True)
+            return
 
     # Flow B first: a track already offered by PUBLISH is served from
     # that offer, no upstream SUBSCRIBE needed.
