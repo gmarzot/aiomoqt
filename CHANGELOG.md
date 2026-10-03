@@ -23,6 +23,9 @@
 - Fix: `priority_plan()["enforced"]` probes the setter the session would really
   dispatch to. On WebTransport it reported enforcement because the session
   carried the method it was being asked about.
+- Fix: the MSF catalog track sends nothing at Forward State 0 and the current catalog on
+  resume, resets its stream when its subscription ends, and keeps group IDs increasing
+  across subscriptions.
 - Fix: aliases we assign as publisher are kept apart from the peer's; an UNSUBSCRIBE no
   longer resets the streams and drops the object handler of a received track that
   shares the alias number.

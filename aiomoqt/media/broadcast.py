@@ -17,7 +17,7 @@ from typing import Callable, Dict, Optional
 
 from ..messages import FetchHeader, FetchObject, SubgroupHeader
 from ..track import PublishedTrack, SubscribedTrack, TrackState
-from ..types import MOQTMessageType, ObjectStatus
+from ..types import MOQTMessageType, ObjectStatus, StreamResetCode
 from ..utils.logger import get_logger
 from .catalog import (
     Catalog, CATALOG_TRACK_NAME, PACKAGING_CMAF, PACKAGING_LOC,
@@ -34,7 +34,17 @@ CATALOG_PUBLISHER_PRIORITY = 64
 
 class CatalogTrackPublisher(PublishedTrack):
     """Publishes the "catalog" track: the current independent catalog
-    opens each group; queued deltas follow as Objects >= 1."""
+    opens each group; queued deltas follow as Objects >= 1.
+
+    One emitter serves the current subscription. It sends nothing at
+    Forward State 0 (§5.1), opens a new group with the current catalog
+    when forwarding resumes, and is cancelled with its open stream reset
+    when the subscription ends (§5.1.1); the next SUBSCRIBE starts a new
+    one. Group IDs continue across subscriptions.
+    """
+
+    # Queued when forwarding resumes: send the current catalog.
+    _RESUME = object()
 
     def __init__(self, session, namespace: str, catalog: Catalog):
         super().__init__(session, namespace, CATALOG_TRACK_NAME,
@@ -45,10 +55,33 @@ class CatalogTrackPublisher(PublishedTrack):
         # SUBSCRIBE_OK must say ContentExists even before generation.
         self._largest = (0, 0)
         self._updates: asyncio.Queue = asyncio.Queue()
+        # A relay holding later groups would read a restarted 0 as stale.
+        self._next_group = 0
+        self._emitter: Optional[asyncio.Task] = None
+
+    def _serving(self) -> bool:
+        return self._emitter is not None and not self._emitter.done()
+
+    def _fold(self, update: Catalog) -> None:
+        """Make `update` part of the current catalog without sending it."""
+        if update.is_delta:
+            self.catalog.apply(update)
+        else:
+            self.catalog = update
 
     async def publish_catalog(self, catalog: Catalog) -> None:
-        """Queue a new independent catalog (starts a new group)."""
-        await self._updates.put(catalog)
+        """Queue a new independent catalog (starts a new group). While no
+        subscription is served it supersedes everything queued, so a
+        periodic refresh cannot grow the queue."""
+        if self._serving():
+            await self._updates.put(catalog)
+            return
+        finished = False
+        while not self._updates.empty():
+            finished |= self._updates.get_nowait() is None
+        self.catalog = catalog
+        if finished:
+            self._updates.put_nowait(None)
 
     async def publish_delta(self, delta: Catalog) -> None:
         """Queue a delta update (next object in the current group)."""
@@ -57,10 +90,30 @@ class CatalogTrackPublisher(PublishedTrack):
     async def finish(self) -> None:
         await self._updates.put(None)
 
+    def _set_forward(self, sub, forward: Optional[int]) -> None:
+        resumed = forward is not None and bool(forward) and not sub.forward
+        super()._set_forward(sub, forward)
+        if resumed and self._serving():
+            self._updates.put_nowait(self._RESUME)
+
     async def generate(self, session, track_alias: int):
+        """Serve the catalog to the subscription under `track_alias`,
+        replacing any earlier emitter."""
+        if self._emitter is not None:
+            self._emitter.cancel()
+        task = asyncio.ensure_future(self._emit_loop(session, track_alias))
+        self._emitter = task
+        # Owned like a producer: the last subscriber leaving cancels it.
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _emit_loop(self, session, track_alias: int):
+        sub = self._sub_for(session)
         prof = session._profile
         header = None
         stream_id = None
+        # Deltas may follow only in a group that has seen every update.
+        can_append = False
 
         async def _emit(payload: bytes, new_group: bool):
             nonlocal header, stream_id
@@ -69,38 +122,60 @@ class CatalogTrackPublisher(PublishedTrack):
                     buf = header.end_group(object_id=header.next_object_id)
                     session.stream_write(stream_id, buf.data,
                                          end_stream=True)
+                    stream_id = None
                 stream_id = await session.open_uni_stream()
                 self._stream_count += 1
                 header = SubgroupHeader(
-                    track_alias=track_alias,
-                    group_id=0 if header is None else header.group_id + 1,
+                    track_alias=track_alias, group_id=self._next_group,
                     subgroup_id=0, publisher_priority=self.priority,
                     prof=prof)
+                self._next_group += 1
                 session.stream_write(stream_id, header.serialize().data)
             buf = header.next_object(payload=payload)
             await session.stream_write_drain(stream_id, buf.data)
             self._note_largest(header.group_id, header._last_object_id)
             self._total_sent += 1
 
-        # A joining subscriber needs a complete catalog first (§11.2).
-        await _emit(self.catalog.to_json().encode(), new_group=True)
+        async def _emit_catalog():
+            nonlocal can_append
+            # A joining subscriber needs a complete catalog first (§11.2).
+            await _emit(self.catalog.to_json().encode(), new_group=True)
+            can_append = True
+
         try:
+            if sub.forward:
+                await _emit_catalog()
             while True:
                 update = await self._updates.get()
                 if update is None:
                     break
-                await _emit(update.to_json().encode(),
-                            new_group=not update.is_delta)
-                # self.catalog tracks what has been emitted, so a group
-                # start always opens with every prior delta folded in.
-                if update.is_delta:
-                    self.catalog.apply(update)
+                if update is self._RESUME:
+                    if sub.forward:
+                        await _emit_catalog()
+                    continue
+                if not sub.forward:
+                    # §5.1: no Objects at Forward State 0.
+                    self._fold(update)
+                    can_append = False
+                    continue
+                if update.is_delta and can_append:
+                    await _emit(update.to_json().encode(), new_group=False)
+                    self._fold(update)
                 else:
-                    self.catalog = update
-        finally:
-            if stream_id is not None:
-                buf = header.end_group(object_id=header.next_object_id)
-                session.stream_write(stream_id, buf.data, end_stream=True)
+                    self._fold(update)
+                    await _emit_catalog()
+        except asyncio.CancelledError:
+            # §5.1.1: the subscription ended; reset its open stream.
+            if stream_id is not None and session._close_err is None:
+                session.stream_reset(stream_id, StreamResetCode.CANCELLED)
+            raise
+        except Exception as e:
+            if session._close_err is None:
+                logger.warning(f"Catalog: emitter stopped: {e}")
+            return
+        if stream_id is not None:
+            buf = header.end_group(object_id=header.next_object_id)
+            session.stream_write(stream_id, buf.data, end_stream=True)
         self._send_publish_done(session)
 
 
