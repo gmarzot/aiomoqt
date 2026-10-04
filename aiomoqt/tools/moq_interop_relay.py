@@ -54,7 +54,7 @@ import sys
 from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
 from aiomoqt.types import (
-    D18MessageType, FilterType, GroupOrder, MOQTMessageType,
+    D18MessageType, FilterType, GroupOrder, MOQTDraft, MOQTMessageType,
     MOQTRequestError, ObjectStatus, ParamType, RequestErrorCode,
     StreamResetCode, SubscribeDoneCode, SubscribeErrorCode, parse_draft_spec,
 )
@@ -1517,6 +1517,11 @@ def _build_server(bind, port, cert, key, use_quic, draft):
 
 async def main():
     args = parse_args()
+    speaks = sorted(int(d) for d in MOQTDraft)
+    wanted = args.draft if isinstance(args.draft, list) else [args.draft]
+    if any(d not in speaks for d in wanted):
+        sys.exit(f"error: draft {','.join(map(str, wanted))} not supported; "
+                 f"aiomoqt speaks {speaks}")
     log_level = logging.DEBUG if args.debug else logging.INFO
     set_log_level(log_level)
     logging.basicConfig(

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `moq_interop_client` / `moq_interop_relay`: a pinned `DRAFT` aiomoqt cannot speak is
+  reported (TAP skip-all, exit 127) or refused at start, instead of a traceback.
 - Fix: STOP_SENDING on a d18 request stream no longer discards the REQUEST_ERROR or
   PUBLISH_DONE the peer sends after it; the request settles when the peer's half ends.
 - Fix: after PUBLISH_DONE a subscription keeps receiving late objects and streams for

@@ -32,7 +32,7 @@ from aiomoqt.track import PublishedTrack, SubscribedTrack
 from aiomoqt.types import (
     ParamType, FetchType, MOQTRequestError, MOQTMessageType,
     SubscribeErrorCode, RequestErrorCode, SubscribeDoneCode,
-    FilterType, GroupOrder, ObjectStatus, parse_draft_spec,
+    FilterType, GroupOrder, MOQTDraft, ObjectStatus, parse_draft_spec,
 )
 from aiomoqt.utils.logger import set_log_level
 
@@ -1552,6 +1552,20 @@ def main():
         for name in TEST_FUNCTIONS:
             print(name)
         sys.exit(0)
+
+    # A pinned draft we cannot speak is "not supported" (exit 127), not a
+    # failure of every case; drafts we cannot speak drop out of a probe list.
+    if args.draft is not None:
+        speaks = sorted(int(d) for d in MOQTDraft)
+        wanted = args.draft if isinstance(args.draft, list) else [args.draft]
+        usable = [d for d in wanted if d in speaks]
+        if not usable:
+            print("TAP version 14")
+            print(f"1..0 # SKIP draft {','.join(map(str, wanted))} not "
+                  f"supported; aiomoqt speaks {speaks}")
+            sys.exit(127)
+        if isinstance(args.draft, list):
+            args.draft = usable
 
     # Configure logging
     log_level = logging.DEBUG if args.debug else logging.WARNING
