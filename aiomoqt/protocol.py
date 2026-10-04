@@ -3928,11 +3928,14 @@ class _MOQTSessionMixin:
         # terminated request stream. Both reach the owner the same way.
         self._notify_request_cancelled(msg.request_id, "UNSUBSCRIBE")
 
+    # §10.11: objects and late-opening streams can follow PUBLISH_DONE.
+    # How long a finished subscription's track keeps receiving them.
+    PUBLISH_DONE_GRACE_S = 5.0
+
     async def _handle_subscribe_done(self, msg: SubscribeDone) -> None:
-        """Subscriber-side: publisher signals end-of-subscription.
-        STOP_SENDING any subgroup stream still receiving for this
-        subscribe's track_alias so the publisher's write side can
-        release cleanly."""
+        """Subscriber-side: publisher signals end-of-subscription. The
+        track keeps receiving for PUBLISH_DONE_GRACE_S, then whatever is
+        still open is released."""
         logger.info(f"MOQT event: handle SubscribeDone "
                      f"request_id={msg.request_id} "
                      f"status={msg.status_code} "
@@ -3942,18 +3945,9 @@ class _MOQTSessionMixin:
              if rid == msg.request_id),
             None)
         if track_alias is not None:
-            for key, sid in list(self._subgroup_stream_by_key.items()):
-                if key[0] == track_alias:
-                    self.stream_stop_sending(sid, SessionCloseCode.NO_ERROR)
-                    # Tombstone here too: the publisher's RESET that
-                    # results from our STOP_SENDING will arrive after
-                    # any in-flight bytes are already at our doorstep.
-                    # Without this mark, those bytes recreate state
-                    # with parser=None and parse-fail.
-                    self._mark_stream_torn_down(sid)
-            self._track_aliases.pop(track_alias, None)
-            self._object_handlers.pop(track_alias, None)
-            self._forget_track_bounds(track_alias)
+            self._loop.call_later(self.PUBLISH_DONE_GRACE_S,
+                                  self._release_finished_track,
+                                  track_alias, msg.request_id)
         future = self._pending_requests.get(msg.request_id)
         if future and not future.done():
             future.set_result(msg)
@@ -3966,6 +3960,25 @@ class _MOQTSessionMixin:
         # Terminal for that subscription only: the session stays up.
         # Owners learn of it through register_publish_done_handler().
         self._subscriptions.pop(msg.request_id, None)
+
+    def _release_finished_track(self, track_alias: int,
+                                request_id: int) -> None:
+        """Release a finished subscription's receive state: STOP_SENDING
+        any subgroup stream still open so the publisher's write side can
+        release cleanly. Skipped once the alias belongs to a newer
+        subscription."""
+        if self._track_aliases.get(track_alias) != request_id:
+            return
+        for key, sid in list(self._subgroup_stream_by_key.items()):
+            if key[0] == track_alias:
+                self.stream_stop_sending(sid, SessionCloseCode.NO_ERROR)
+                # Tombstone: bytes already in flight ahead of the
+                # publisher's RESET would otherwise recreate the stream's
+                # state with no parser and fail to parse.
+                self._mark_stream_torn_down(sid)
+        self._track_aliases.pop(track_alias, None)
+        self._object_handlers.pop(track_alias, None)
+        self._forget_track_bounds(track_alias)
 
     def _extend_request_credit(self, rid: int) -> None:
         """Raise our MAX_REQUEST_ID before the peer reaches it (§9.5)."""

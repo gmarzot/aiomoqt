@@ -76,6 +76,39 @@ async def test_last_subscription_ending_does_not_close_the_session():
     assert s._subscriptions == {}
 
 
+def _finished_track(s):
+    """Alias 3 for subscription 2, with one subgroup stream still open."""
+    s._loop = asyncio.get_running_loop()
+    s.PUBLISH_DONE_GRACE_S = 0.01
+    s._subscriptions = {2: ["sub"]}
+    s._track_aliases = {3: 2}
+    s._object_handlers = {3: lambda *a: None}
+    s._subgroup_stream_by_key = {(3, 0, 0): 11}
+    s.stopped = []
+    s.stream_stop_sending = lambda sid, code: s.stopped.append(sid)
+
+
+@pytest.mark.asyncio
+async def test_publish_done_keeps_receiving_until_the_grace_ends():
+    # §10.11: objects can still arrive after PUBLISH_DONE.
+    s = _session()
+    _finished_track(s)
+    await s._handle_subscribe_done(_done(2))
+    assert 3 in s._object_handlers and s.stopped == []
+    await asyncio.sleep(0.05)
+    assert 3 not in s._object_handlers and s.stopped == [11]
+
+
+@pytest.mark.asyncio
+async def test_grace_release_leaves_an_alias_a_newer_subscription_took():
+    s = _session()
+    _finished_track(s)
+    await s._handle_subscribe_done(_done(2))
+    s._track_aliases[3] = 4
+    await asyncio.sleep(0.05)
+    assert 3 in s._object_handlers and s.stopped == []
+
+
 @pytest.mark.asyncio
 async def test_publish_done_handler_fires_once():
     s = _session()
