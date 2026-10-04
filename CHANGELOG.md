@@ -8,6 +8,7 @@
   5 s instead of stopping its open streams at once (§10.11).
 - Fix: `moqt://` URLs keep their path, and native-QUIC SETUP PATH is the URI's
   path-abempty plus query (`moqt://host/anon` sent `/`; a `/` path sent `//`).
+- Fix: an original publisher's d18 subgroup header sets FIRST_OBJECT (§2.2 MUST).
 - `moq_interop_client`: `data-subgroup-basic` data-plane test, in the standard set.
 - `moq_interop_client`: `rendezvous-timeout` test, in the standard set; SKIP below d18.
 - `moq_interop_client`: with no `--draft`/`DRAFT`, probes `18,16,14` (newest first) instead

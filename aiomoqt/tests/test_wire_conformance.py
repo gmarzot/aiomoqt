@@ -448,3 +448,40 @@ def test_moq_dev_subscribe_ok_golden():
         buf_end=len(_MOQ_DEV_SUBSCRIBE_OK_BODY))
     assert msg.track_alias == 0
     assert msg.track_extensions == {8: 1000}
+
+
+# -- subgroup header FIRST_OBJECT (d18 §2.2, §11.4.2) -----------------
+
+from aiomoqt.messages.data import SubgroupHeader  # noqa: E402
+
+
+def _subgroup_type(draft, **kw):
+    hdr = SubgroupHeader(track_alias=1, group_id=0, subgroup_id=0,
+                         prof=profile_for(draft), **kw)
+    buf = Buffer(data=hdr.serialize().data, vi64=profile_for(draft).vi64)
+    return buf.pull_uint_vi64() if profile_for(draft).vi64 \
+        else buf.pull_uint_var()
+
+
+def test_d18_new_subgroup_sets_first_object():
+    # An original publisher's new subgroup MUST set FIRST_OBJECT.
+    assert _subgroup_type(18) & 0x40
+
+
+@pytest.mark.parametrize("draft", [14, 16])
+def test_first_object_is_never_written_before_d18(draft):
+    # 0x40 is not a subgroup type bit before d18.
+    assert not _subgroup_type(draft) & 0x40
+
+
+def test_relay_forwarding_mid_subgroup_clears_first_object():
+    assert not _subgroup_type(18, first_object=False) & 0x40
+
+
+def test_d18_first_object_round_trips():
+    prof = profile_for(18)
+    hdr = SubgroupHeader(track_alias=1, group_id=0, subgroup_id=0,
+                         prof=prof)
+    buf = Buffer(data=hdr.serialize().data, vi64=True)
+    type_val = buf.pull_uint_vi64()
+    assert SubgroupHeader.deserialize(buf, type_val, prof=prof).first_object

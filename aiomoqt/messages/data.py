@@ -92,8 +92,9 @@ class SubgroupHeader(MOQTMessage):
     end_of_group: bool = False
     subgroup_id_mode: int = SUBGROUP_ID_EXPLICIT
     # d18 FIRST_OBJECT bit (0x40): the first object on this stream is the
-    # first object published in the subgroup.
-    first_object: bool = False
+    # first object published in the subgroup. An original publisher's new
+    # subgroup MUST set it (§2.2); a relay passes what it received.
+    first_object: bool = True
     # d16+ DEFAULT_PRIORITY bit (0x20): the Priority field is absent and
     # the subgroup inherits the priority from the control message that
     # established the subscription. Set on receive so a forwarder can
@@ -132,10 +133,12 @@ class SubgroupHeader(MOQTMessage):
             type_val |= 0x08
         # d16+ DEFAULT_PRIORITY (0x20): the Priority field is omitted and
         # the subgroup inherits the subscription's. d18 FIRST_OBJECT
-        # (0x40): this stream opens with the subgroup's first object.
+        # (0x40): this stream opens with the subgroup's first object; the
+        # bit exists only in profiles whose type mask has it.
         if self.default_priority:
             type_val |= 0x20
-        if self.first_object:
+        if (self.first_object and self.prof is not None
+                and self.prof.subgroup_type_mask & 0x40):
             type_val |= 0x40
         return type_val
 
