@@ -991,6 +991,10 @@ class _DataPublisher:
         self.request = None
         self.track_alias = None
         self.forward = None
+        # The relay ended the upstream subscription (STOP_SENDING, reset
+        # or UNSUBSCRIBE): there is no request stream left for PUBLISH_DONE.
+        self.cancelled = False
+        self.done_sent = False
         self.subscribed = asyncio.Event()
 
     async def on_subscribe(self, session, msg):
@@ -1008,6 +1012,8 @@ class _DataPublisher:
         self.request = msg
         self.track_alias = ok.track_alias
         self.forward = getattr(msg, "forward", None)
+        session.register_request_cancel_handler(
+            msg.request_id, lambda _rid: setattr(self, "cancelled", True))
         self.subscribed.set()
 
     async def send(self, session) -> int:
@@ -1030,10 +1036,12 @@ class _DataPublisher:
                     object_id=object_id)
                 await session.stream_write_drain(stream_id, buf.data)
             session.stream_write(stream_id, b"", end_stream=True)
-        session.subscribe_done(
-            request_id=self.request.request_id,
-            status_code=SubscribeDoneCode.TRACK_ENDED,
-            stream_count=streams, reason="track ended")
+        if not self.cancelled:
+            session.subscribe_done(
+                request_id=self.request.request_id,
+                status_code=SubscribeDoneCode.TRACK_ENDED,
+                stream_count=streams, reason="track ended")
+            self.done_sent = True
         return streams
 
 
@@ -1208,6 +1216,9 @@ async def test_data_subgroup_basic(host, port, path, use_quic,
     done = sub.done
     if done is None:
         problems.insert(0, "no downstream PUBLISH_DONE")
+    if not pub.done_sent:
+        problems.insert(0, "relay cancelled the upstream subscription "
+                           "before PUBLISH_DONE")
         count = "none"
     else:
         count = ("unknown" if done.stream_count == _UNKNOWN_STREAM_COUNT

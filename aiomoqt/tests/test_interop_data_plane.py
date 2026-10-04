@@ -1,5 +1,7 @@
 """moq-interop-runner data-plane scenarios: our interop client against our
 interop relay, in one process."""
+from types import SimpleNamespace
+
 import pytest
 
 from aiomoqt.tools import moq_interop_client as client
@@ -113,3 +115,64 @@ def test_tap_yaml_block():
         '  message: "missing object 1.3: \\"x\\""',
         "  ...",
     ]
+
+
+class _FakeSession:
+    """Just enough of a session for _DataPublisher."""
+    negotiated_draft = 18
+
+    def __init__(self):
+        self.cancel, self.done, self._sid = {}, [], 3
+
+    def subscribe_ok(self, request_msg):
+        return SimpleNamespace(track_alias=0)
+
+    def register_request_cancel_handler(self, request_id, callback):
+        self.cancel[request_id] = callback
+
+    async def open_uni_stream(self):
+        self._sid += 4
+        return self._sid
+
+    def stream_write(self, sid, data, end_stream=False):
+        pass
+
+    async def stream_write_drain(self, sid, data):
+        pass
+
+    def subscribe_done(self, **kw):
+        self.done.append(kw)
+
+
+async def _publish(cancel_first):
+    pub = client._DataPublisher((b"ns",), b"track")
+    s = _FakeSession()
+    await pub.on_subscribe(s, SimpleNamespace(
+        track_namespace=(b"ns",), track_name=b"track", request_id=7,
+        forward=None))
+    if cancel_first:
+        s.cancel[7](7)
+    return pub, s, await pub.send(s)
+
+
+@pytest.mark.asyncio
+async def test_publisher_sends_publish_done_with_its_stream_count():
+    pub, s, streams = await _publish(cancel_first=False)
+    assert streams == 3 and pub.done_sent
+    assert [d["stream_count"] for d in s.done] == [3]
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_after_publish_done_is_not_a_failure():
+    # Ending the request stream once PUBLISH_DONE is out is cleanup.
+    pub, s, _ = await _publish(cancel_first=False)
+    s.cancel[7](7)
+    assert pub.done_sent
+
+
+@pytest.mark.asyncio
+async def test_publisher_skips_publish_done_once_the_relay_cancels():
+    # A relay that ends the upstream subscription leaves no request
+    # stream for PUBLISH_DONE; the case reports that instead of crashing.
+    pub, s, streams = await _publish(cancel_first=True)
+    assert streams == 3 and not pub.done_sent and s.done == []
