@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fix: STOP_SENDING on a d18 request stream no longer discards the REQUEST_ERROR or
+  PUBLISH_DONE the peer sends after it; the request settles when the peer's half ends.
 - `moq_interop_client`: `data-subgroup-basic` data-plane test, in the standard set.
 - `moq_interop_client`: `rendezvous-timeout` test, in the standard set; SKIP below d18.
 - `moq_interop_client`: with no `--draft`/`DRAFT`, probes `18,16,14` (newest first) instead

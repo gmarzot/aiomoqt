@@ -271,11 +271,10 @@ async def test_d18_request_stream_must_open_with_a_request():
 
 @pytest.mark.parametrize("draft", [16, 18])
 async def test_stop_sending_then_request_error_keeps_the_session(draft):
-    # §3.3.2: STOP_SENDING cancels the request but ends only our send
-    # half; a REQUEST_ERROR the peer still sends on its half is a late
-    # reply to the cancelled request, not a new request stream.
+    # §3.3.2: STOP_SENDING ends only our send half. The owner is told at
+    # once; a REQUEST_ERROR the peer then sends on its half answers the
+    # request, and is not a new request stream.
     from aiomoqt.messages.request import RequestError
-    from aiomoqt.types import MOQTRequestError
     s = _control_session(draft)
     s._subscriptions = {}
     s._request_cancel_handlers = {}
@@ -290,8 +289,7 @@ async def test_stop_sending_then_request_error_keeps_the_session(draft):
 
     s._on_request_stream_terminated(4, stop_sending_code=3)
     assert fired == [rid]
-    with pytest.raises(MOQTRequestError, match="STOP_SENDING code 3"):
-        await fut
+    assert not fut.done()
     assert s._bidi_stream_requests[4] == rid
 
     frame = bytes(RequestError(
@@ -301,6 +299,7 @@ async def test_stop_sending_then_request_error_keeps_the_session(draft):
     s._on_control_data(4, frame, True, is_request_bidi=True)
     await asyncio.sleep(0)
     assert s._closed == []
+    assert fut.result().error_code == 3
     assert 4 not in s._bidi_stream_requests
     assert 4 not in s._cancelled_request_streams
 

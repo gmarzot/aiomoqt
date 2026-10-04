@@ -72,8 +72,9 @@ def test_fin_on_end_of_group_bit_stream_bounds_the_group():
     assert s._object_out_of_bounds(7, 3, 5, NORMAL)
 
 
-def test_cancelling_a_request_stream_frees_the_track_bounds():
+async def test_cancelling_a_request_stream_frees_the_track_bounds():
     s = _stub()
+    s._loop = asyncio.get_running_loop()
     s._bidi_stream_requests = {40: 5}
     s._cancelled_request_streams = set()
     s._bidi_streams = {5: 40}
@@ -85,6 +86,7 @@ def test_cancelling_a_request_stream_frees_the_track_bounds():
     s._note_object_bound(7, 0, 3, EOG)
     s._malformed_aliases.add(7)
     s._on_request_stream_terminated(40)
+    await asyncio.sleep(0)
     assert s._group_bound == {} and s._malformed_aliases == set()
 
 

@@ -618,22 +618,32 @@ class _MOQTSessionMixin:
         """§3.3.2: terminating a request's bidi stream cancels the
         request. Tear down its state and notify the owner.
 
-        STOP_SENDING ends only our send half: the binding stays until the
-        peer's half ends (FIN or reset), so a REQUEST_ERROR still in
-        flight demuxes to the cancelled request."""
-        if stop_sending_code is None:
-            request_id = self._bidi_stream_requests.pop(stream_id, None)
-            if stream_id in self._cancelled_request_streams:
-                self._cancelled_request_streams.discard(stream_id)
-                return
-        else:
+        STOP_SENDING ends only our send half. The owner is told at once,
+        but a REQUEST_ERROR or PUBLISH_DONE the peer sends after it still
+        answers the request, so the binding, awaiter and PUBLISH_DONE
+        handler stay until the peer's half ends (FIN or reset)."""
+        if stop_sending_code is not None:
             if stream_id in self._cancelled_request_streams:
                 return
             request_id = self._bidi_stream_requests.get(stream_id)
-            if request_id is not None:
-                self._cancelled_request_streams.add(stream_id)
-        if request_id is None:
+            if request_id is None:
+                return
+            self._cancelled_request_streams.add(stream_id)
+            self._bidi_streams.pop(request_id, None)
+            self._notify_request_cancelled(
+                request_id, f"STOP_SENDING (stream {stream_id})",
+                replies_pending=True)
             return
+        request_id = self._bidi_stream_requests.pop(stream_id, None)
+        self._cancelled_request_streams.discard(stream_id)
+        if request_id is not None:
+            self._loop.call_soon(self._settle_cancelled_request, request_id,
+                                 f"stream termination (stream {stream_id})")
+
+    def _settle_cancelled_request(self, request_id: int, why: str) -> None:
+        """Tear down a request whose stream the peer has ended. Runs a
+        loop turn later, so a reply parsed from that stream resolves the
+        awaiter first; an awaiter nothing answered fails."""
         self._bidi_streams.pop(request_id, None)
         self._subscriptions.pop(request_id, None)
         alias = next((ta for ta, rid in self._track_aliases.items()
@@ -642,22 +652,20 @@ class _MOQTSessionMixin:
             self._forget_track_bounds(alias)
         fut = self._pending_requests.pop(request_id, None)
         if fut is not None and not fut.done():
-            reason = "request cancelled by peer"
-            if stop_sending_code is not None:
-                reason += f" (STOP_SENDING code {stop_sending_code})"
             fut.set_exception(MOQTRequestError(
-                error_code=0x1, reason=reason, retry_interval=0))
-        how = ("STOP_SENDING" if stop_sending_code is not None
-               else "stream termination")
-        self._notify_request_cancelled(
-            request_id, f"{how} (stream {stream_id})")
+                error_code=0x1, reason=f"request cancelled by peer ({why})",
+                retry_interval=0))
+        self._notify_request_cancelled(request_id, why)
 
-    def _notify_request_cancelled(self, request_id: int, why: str) -> None:
+    def _notify_request_cancelled(self, request_id: int, why: str,
+                                  replies_pending: bool = False) -> None:
         """Tell the request's owner it is cancelled, however the peer
         said so: a terminated request stream at d18, UNSUBSCRIBE before
-        it. Publishers stop feeding on this."""
+        it. Publishers stop feeding on this. With replies_pending the
+        PUBLISH_DONE handler stays for a PUBLISH_DONE still inbound."""
         cb = self._request_cancel_handlers.pop(request_id, None)
-        self._publish_done_handlers.pop(request_id, None)
+        if not replies_pending:
+            self._publish_done_handlers.pop(request_id, None)
         logger.info(f"MOQT: request {request_id} cancelled by {why}")
         if cb is not None:
             try:
@@ -1857,7 +1865,11 @@ class _MOQTSessionMixin:
             self._control_chains.pop(stream_id, None)
             if stream_id in self._cancelled_request_streams:
                 self._cancelled_request_streams.discard(stream_id)
-                self._bidi_stream_requests.pop(stream_id, None)
+                request_id = self._bidi_stream_requests.pop(stream_id, None)
+                if request_id is not None:
+                    self._loop.call_soon(
+                        self._settle_cancelled_request, request_id,
+                        f"FIN after STOP_SENDING (stream {stream_id})")
 
     def _ingest_stream_data(self, stream_id: int, data, end_stream: bool) -> None:
         """Route stream bytes, or hold them while a raw-QUIC session's
