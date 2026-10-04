@@ -21,6 +21,7 @@ from .messages.d18 import Setup
 from .types import *
 from .utils.buffer import Buffer, BufferReadError
 from .utils.logger import *
+from .utils.url import moqt_setup_path
 from aiopquic.streamchain import StreamChain
 from aiopquic.asyncio.webtransport import WebTransportError
 
@@ -2239,8 +2240,7 @@ class _MOQTSessionMixin:
                 logger.info(
                     f"MOQT: QUIC control stream created stream id: "
                     f"{self._control_stream_id}")
-            req_path = self._session.path or ""
-            params[SetupParamType.PATH] = f"/{req_path}"
+            params[SetupParamType.PATH] = moqt_setup_path(self._session.path)
             params[SetupParamType.AUTHORITY] = (
                 f"{self._session.host}:{self._session.port}")
         else:

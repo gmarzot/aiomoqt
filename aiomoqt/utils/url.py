@@ -23,18 +23,28 @@ def normalize_wt_path(path: Optional[str]) -> Optional[str]:
     return path if path.startswith("/") else "/" + path
 
 
+def moqt_setup_path(path: Optional[str]) -> str:
+    """SETUP PATH for native QUIC (§10.3.1.2): the URI's path-abempty,
+    plus "?query" if any. A bare segment gains its leading '/'."""
+    path = path or ""
+    if path and path[0] not in "/?":
+        path = "/" + path
+    return path
+
+
 @dataclass
 class MOQTRelay:
     """Parsed MoQT relay connection parameters."""
     host: str
     port: int
     use_quic: bool  # True = raw QUIC, False = H3/WebTransport
-    path: Optional[str]  # MoQT path (URL :path component; None for raw QUIC)
+    # URL path: SETUP PATH on raw QUIC (path and query), :path on WT.
+    path: Optional[str]
 
     def __str__(self):
         if self.use_quic:
             port_s = "" if self.port == MOQT_DEFAULT_PORT else f":{self.port}"
-            return f"moqt://{self.host}{port_s}"
+            return f"moqt://{self.host}{port_s}{self.path or ''}"
         # self.path already starts with "/" when present; don't double-add
         ep = self.path if self.path else ""
         port_s = "" if self.port == HTTPS_DEFAULT_PORT else f":{self.port}"
@@ -90,11 +100,12 @@ def parse_relay_url(url: str, force_quic: bool = False,
     scheme = parsed.scheme.lower()
 
     if scheme == "moqt":
+        query = f"?{parsed.query}" if parsed.query else ""
         return MOQTRelay(
             host=parsed.hostname or "localhost",
             port=parsed.port or MOQT_DEFAULT_PORT,
             use_quic=True,
-            path=None,
+            path=parsed.path + query,
         )
     elif scheme == "https":
         path = normalize_wt_path(parsed.path or default_path)

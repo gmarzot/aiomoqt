@@ -6,6 +6,8 @@
   PUBLISH_DONE the peer sends after it; the request settles when the peer's half ends.
 - Fix: after PUBLISH_DONE a subscription keeps receiving late objects and streams for
   5 s instead of stopping its open streams at once (§10.11).
+- Fix: `moqt://` URLs keep their path, and native-QUIC SETUP PATH is the URI's
+  path-abempty plus query (`moqt://host/anon` sent `/`; a `/` path sent `//`).
 - `moq_interop_client`: `data-subgroup-basic` data-plane test, in the standard set.
 - `moq_interop_client`: `rendezvous-timeout` test, in the standard set; SKIP below d18.
 - `moq_interop_client`: with no `--draft`/`DRAFT`, probes `18,16,14` (newest first) instead

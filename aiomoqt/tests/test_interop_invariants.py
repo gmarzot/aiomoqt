@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-from aiomoqt.utils.url import parse_relay_url
+from aiomoqt.utils.url import moqt_setup_path, parse_relay_url
 from aiomoqt.types import (
     MOQT_VERSION_DRAFT14, MOQT_VERSION_DRAFT16, MOQT_VERSIONS,
     moqt_version_from_draft, moqt_alpn_for_version,
@@ -57,6 +57,28 @@ class TestUrlPathLeadingSlash:
         r = parse_relay_url("https://host.example.net",
                             default_path="moq-relay")
         assert r.path == "/moq-relay"
+
+
+class TestMoqtSetupPath:
+    """§10.3.1.2: over native QUIC the URI's path-abempty (and query) is
+    the SETUP PATH, the only place a moqt:// path reaches the relay."""
+
+    def test_moqt_url_keeps_its_path(self):
+        assert parse_relay_url("moqt://cdn.moq.dev:443/anon").path == "/anon"
+
+    def test_moqt_url_keeps_its_query(self):
+        r = parse_relay_url("moqt://relay.example:4443/moq?jwt=abc")
+        assert r.path == "/moq?jwt=abc"
+
+    def test_moqt_url_without_path_is_empty(self):
+        assert parse_relay_url("moqt://relay.example:4443").path == ""
+
+    @pytest.mark.parametrize("path, sent", [
+        (None, ""), ("", ""), ("/", "/"), ("/anon", "/anon"),
+        ("anon", "/anon"), ("?q=1", "?q=1"),
+    ])
+    def test_setup_path_is_path_abempty(self, path, sent):
+        assert moqt_setup_path(path) == sent
 
 
 # =====================================================================
