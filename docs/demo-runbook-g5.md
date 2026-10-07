@@ -141,14 +141,15 @@ Windows browser on both ends shares one clock; WSL tools use the WSL VM's.
 Before trusting a cross-host latency, or when a WSL-side stream shows a
 periodic sawtooth:
 - `cat /sys/devices/system/clocksource/clocksource0/current_clocksource`
-- Kernel tick and frequency (`sudo apt install adjtimex`): `adjtimex --print | grep -E 'tick|frequency'`.
-  tick must be 10000 (µs per 100 Hz tick); about 9880 runs the clock 1.2 %
-  slow whatever the clocksource, and the host time sync then steps it forward
-  every 25–30 s. Reset: `sudo adjtimex --tick 10000 --frequency 0`, then
-  re-measure; if it drifts back, something keeps steering it (`wsl --shutdown`
-  restarts the VM — and every WSL session).
-- WSL clock against NTP, every 3 s (offset in ms, ±RTT/2):
-  `for i in $(seq 30); do python -c "import socket,struct,time;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.settimeout(2);s.sendto(b'\x1b'+47*b'\0',('time.google.com',123));w=struct.unpack('!12I',s.recv(48));print(round((w[10]-2208988800+w[11]/2**32-time.time())*1000,1))"; sleep 3; done`
+- WSL clock against NTP, every 3 s (offset in ms, ±RTT/2) — the verdict:
+  `for i in $(seq 30); do python -c 'import socket,struct,time;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.settimeout(2);s.sendto(b"\x1b"+47*b"\0",("time.google.com",123));w=struct.unpack("!12I",s.recv(48));print(round((w[10]-2208988800+w[11]/2**32-time.time())*1000,1))'; sleep 3; done`
+  Healthy: the offset holds within a few tens of ms. Broken (2026-10-07): it
+  climbs about 12 ms per second and drops about 350 ms every 25–30 s, as the
+  host time sync steps the clock forward.
+- Kernel tick and frequency, read-only:
+  `python3 -c "import ctypes,ctypes.util,struct;b=ctypes.create_string_buffer(512);ctypes.CDLL(ctypes.util.find_library('c')).adjtimex(b);print('tick',struct.unpack_from('<q',b,88)[0],'freq_ppm',round(struct.unpack_from('<q',b,16)[0]/65536,1))"`
+  The nominal tick is 10000 µs per 100 Hz tick; WSL has shown other values
+  after a fresh boot, so read it next to the NTP trend, not on its own.
 - Scheduling gaps in the WSL VM over 2 min (gaps over 50 ms, with their time):
   `python -c "import time;s=p=time.monotonic();exec('while p-s<120:\n time.sleep(0.001);n=time.monotonic()\n if n-p>0.05: print(round(n-s,1),round((n-p)*1000))\n p=n')"`
 - A steady offset is a constant and reads as latency; a ramp with steps is a
