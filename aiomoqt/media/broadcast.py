@@ -16,8 +16,12 @@ import asyncio
 from typing import Callable, Dict, Optional
 
 from ..messages import FetchHeader, FetchObject, SubgroupHeader
-from ..track import PublishedTrack, SubscribedTrack, TrackState
-from ..types import MOQTMessageType, ObjectStatus, StreamResetCode
+from ..context import is_draft16_or_later
+from ..track import PublishedTrack, TrackState
+from ..types import (
+    MOQTMessageType, MOQTRequestError, ObjectStatus, RequestErrorCode,
+    StreamResetCode, SubscribeErrorCode,
+)
 from ..utils.logger import get_logger
 from .catalog import (
     Catalog, CATALOG_TRACK_NAME, PACKAGING_CMAF, PACKAGING_LOC,
@@ -243,6 +247,12 @@ class MediaPublisher:
         if track is None:
             logger.warning(f"MediaPublisher: SUBSCRIBE for unknown "
                            f"track {name!r}")
+            session.subscribe_error(
+                msg.request_id,
+                RequestErrorCode.DOES_NOT_EXIST
+                if is_draft16_or_later(session.negotiated_draft)
+                else SubscribeErrorCode.TRACK_DOES_NOT_EXIST,
+                "track not published here")
             return
         await track._on_subscribe(session, msg)
 
@@ -326,38 +336,35 @@ class MediaSubscriber:
         self.catalog: Optional[Catalog] = None
         self.tracks: Dict[str, LocTrackSubscriber] = {}
         self._have_catalog = asyncio.Event()
-        self._catalog_sub: Optional[SubscribedTrack] = None
 
     async def start(self, timeout: float = 10.0) -> Catalog:
         """Join the catalog track (SUBSCRIBE + joining FETCH, msf-01 §5
         — a late joiner needs the relay-cached complete catalog), await
-        the first one, subscribe its media tracks. Falls back to plain
-        SUBSCRIBE when the peer can't serve the fetch."""
+        the first one, subscribe its media tracks. When the peer can't
+        serve the fetch the subscription alone carries the catalog."""
         if self.discover:
             await self._resolve_namespace(timeout)
         self.session.on_fetch_object = self._on_catalog_fetch_object
         # Global fallback catches catalog objects that arrive before the
         # per-alias registration (§10.4.2 data-before-OK race).
         self.session.on_object_received = self._on_catalog_object
+        sub_msg, fetch_msg = await self.session.join(
+            self.namespace, CATALOG_TRACK_NAME, joining_start=0)
+        sub_ok = await self.session._await_response(sub_msg.request_id)
+        alias = getattr(sub_ok, 'track_alias', None)
+        if alias is not None:
+            self.session.register_object_handler(
+                alias, self._on_catalog_object)
         try:
-            sub_ok, _fetch_ok = await self.session.join(
-                self.namespace, CATALOG_TRACK_NAME, joining_start=0,
-                wait_response=True)
-            alias = getattr(sub_ok, 'track_alias', None)
-            if alias is not None:
-                self.session.register_object_handler(
-                    alias, self._on_catalog_object)
-        except Exception as e:
+            await self.session._await_response(fetch_msg.request_id)
+        except MOQTRequestError as e:
+            # Resubscribing would be a duplicate subscription (§5.1).
             logger.warning(
                 f"MediaSubscriber: catalog joining FETCH refused ({e}); "
-                f"falling back to plain subscribe. msf-01 §5 requires the "
-                f"fetch, and without it only a catalog still being "
-                f"republished will arrive — a late joiner to a settled "
-                f"broadcast gets nothing")
-            self._catalog_sub = SubscribedTrack(
-                self.session, self.namespace, CATALOG_TRACK_NAME,
-                on_object=self._on_catalog_object)
-            await self._catalog_sub.subscribe()
+                f"keeping the subscription. msf-01 §5 requires the fetch, "
+                f"and without it only a catalog still being republished "
+                f"will arrive — a late joiner to a settled broadcast gets "
+                f"nothing")
         await asyncio.wait_for(self._have_catalog.wait(), timeout)
         await self._subscribe_media()
         return self.catalog

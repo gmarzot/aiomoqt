@@ -32,6 +32,7 @@ class _Cfg:
 
 def _session(draft, is_client=True):
     s = object.__new__(_MOQTSessionMixin)
+    s._peer_requests = {}
     s._session = _Cfg()
     try:
         s._loop = asyncio.get_running_loop()

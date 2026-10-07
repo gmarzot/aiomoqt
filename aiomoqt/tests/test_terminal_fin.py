@@ -21,6 +21,7 @@ _PORT = 14795
 
 def _stub(draft):
     s = object.__new__(_MOQTSessionMixin)
+    s._peer_requests = {}
     s.negotiated_draft = draft
     s._profile = profile_for(draft)
     s._bidi_streams = {5: 40}

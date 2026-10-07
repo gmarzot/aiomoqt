@@ -26,6 +26,7 @@ def _control_session(draft):
     plus the control-chain map, bidi-binding maps, and a recording
     _close_session (bypasses __init__ / QUIC)."""
     s = object.__new__(_MOQTSessionMixin)
+    s._peer_requests = {}
     s._next_request_id = 0
     s._sent_requests = deque(maxlen=1024)
     s._pending_requests = {}
@@ -272,8 +273,9 @@ async def _noop_handler(session, msg):
 
 def _subscribe_frame(s, rid):
     from aiomoqt.messages.subscribe import Subscribe
+    # One track per request: a repeated track is a duplicate subscription.
     return bytes(Subscribe(request_id=rid, track_namespace=(b"a",),
-                           track_name=b"t", filter_type=2).serialize(
+                           track_name=b"t%d" % rid, filter_type=2).serialize(
                                prof=s._profile).data)
 
 

@@ -35,6 +35,7 @@ def _session(is_client=True):
     only the attributes the tested methods touch and stubs _send_request
     to record (request_id, msg) rather than hit the wire."""
     s = object.__new__(_MOQTSessionMixin)
+    s._peer_requests = {}
     s._next_request_id = 0 if is_client else 1
     s._sent_requests = deque(maxlen=1024)
     s._pending_requests = {}

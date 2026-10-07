@@ -341,6 +341,9 @@ class _MOQTSessionMixin:
         # Request ids, ours and the peer's, to the entry that owns them.
         # Client ids are even and server ids odd, so they cannot collide.
         self._requests: Dict[int, _RequestEntry] = {}
+        # Admitted peer SUBSCRIBE / SUBSCRIBE_NAMESPACE / SUBSCRIBE_TRACKS:
+        # request_id -> (message class, full track name or prefix).
+        self._peer_requests: Dict[int, Tuple[type, tuple]] = {}
         # Aliases the peer assigned (SUBSCRIBE_OK / PUBLISH) -> our
         # request id: the receive-side registry.
         self._track_aliases: Dict[int, int] = {}
@@ -720,6 +723,7 @@ class _MOQTSessionMixin:
         PUBLISH_DONE handler stays for a PUBLISH_DONE still inbound."""
         cb = self._request_cancel_handlers.pop(request_id, None)
         self._requests.pop(request_id, None)
+        self._peer_requests.pop(request_id, None)
         if not replies_pending:
             self._publish_done_handlers.pop(request_id, None)
         logger.info(f"MOQT: request {request_id} cancelled by {why}")
@@ -929,8 +933,8 @@ class _MOQTSessionMixin:
                     f"{message_class.__name__} body ends "
                     f"{end_pos - buf.tell()} bytes short of its Length")
             logger.info(f"MOQT event: control message parsed: {msg})")
-
-            routed = self._track_handler(msg)
+            refusal = self._refuse_request(msg)
+            routed = refusal or self._track_handler(msg)
             if routed is not None:
                 handler = routed
 
@@ -2717,6 +2721,54 @@ class _MOQTSessionMixin:
     _REPLY_CLASSES = (RequestOk, RequestError, SubscribeOk, SubscribeDone,
                       PublishOk, FetchOk)
 
+    def _refuse_request(self, msg: MOQTMessage) -> Optional[Callable]:
+        """Session-level request rules, applied before the application
+        sees the request (d16+): a reserved namespace (d18 §3.2.1-2), a
+        duplicate subscription (§5.1), an overlapping namespace prefix
+        (§10.18-19). Returns the handler that answers a refused request
+        with REQUEST_ERROR, else None; records an admitted subscription
+        until it ends."""
+        if (not is_draft16_or_later(self.negotiated_draft)
+                or not isinstance(msg, self._REQUEST_OPENERS)
+                or getattr(msg, 'request_id', None) is None):
+            return None
+        rid = int(msg.request_id)
+        ns = tuple(getattr(msg, 'track_namespace', None)
+                   or getattr(msg, 'namespace', None)
+                   or getattr(msg, 'namespace_prefix', None) or ())
+        kind = type(msg)
+        key = None
+        code = None
+        if self.negotiated_draft >= 18 and ns and ns[0] in (b".", b".session"):
+            # No session-level tracks are defined, so none is recognized.
+            code = RequestErrorCode.DOES_NOT_EXIST
+            reason = f"reserved namespace {ns[0].decode()}"
+        elif kind is Subscribe:
+            key = (ns, bytes(msg.track_name or b""))
+            if (kind, key) in self._peer_requests.values():
+                code = RequestErrorCode.DUPLICATE_SUBSCRIPTION
+                reason = "track already subscribed in this session"
+        elif kind in (SubscribeNamespace, SubscribeTracks):
+            key = ns
+            for k, prefix in self._peer_requests.values():
+                if k is kind and (prefix[:len(ns)] == ns
+                                  or ns[:len(prefix)] == prefix):
+                    code = RequestErrorCode.PREFIX_OVERLAP
+                    reason = "prefix overlaps an active subscription"
+                    break
+        if code is None:
+            if key is not None:
+                self._peer_requests[rid] = (kind, key)
+            return None
+        logger.info(f"MOQT: refusing {kind.__name__} {rid}: {reason}")
+        err = RequestError(request_id=rid, error_code=int(code),
+                           retry_interval=0, reason=reason)
+
+        # A handler task runs after the request's stream is bound.
+        async def refuse(session, _msg):
+            session._send_on_request_stream(rid, err, fin=True)
+        return refuse
+
     def _send_reply(self, request_id: int, msg: MOQTMessage,
                     fin: bool = False) -> None:
         """Send a response to a request. In d18 responses travel on the
@@ -2725,6 +2777,8 @@ class _MOQTSessionMixin:
         our half of the request stream after a terminal reply
         (REQUEST_ERROR, PUBLISH_DONE, TRACK_STATUS_OK: §3.3.2, §10.11,
         §10.14); it has no meaning on the control stream."""
+        if fin:
+            self._peer_requests.pop(request_id, None)
         if self._profile.control_uni_pair:
             self._send_on_request_stream(request_id, msg, fin=fin)
         else:
@@ -4165,6 +4219,10 @@ class _MOQTSessionMixin:
     async def _handle_unsubscribe_namespace(self, msg: UnsubscribeNamespace) -> None:
         logger.info(f"MOQT event: handle {msg}")
         # No response required per draft-14
+        prefix = tuple(msg.namespace_prefix or ())
+        for rid, (kind, key) in list(self._peer_requests.items()):
+            if kind is SubscribeNamespace and key == prefix:
+                del self._peer_requests[rid]
 
     async def _handle_publish(self, msg: Publish) -> None:
         logger.info(f"MOQT event: handle {msg}")

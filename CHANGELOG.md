@@ -32,6 +32,15 @@
   (CONNECTION_CLOSE application error, or the WebTransport session close code); it sent
   nothing until the application exited, and then code 0.
 - Fix: a peer's WebTransport session close ends the MoQT session.
+- Fix: a second SUBSCRIBE to a track already subscribed in the session is refused with
+  DUPLICATE_SUBSCRIPTION (§5.1).
+- Fix: a SUBSCRIBE_NAMESPACE or SUBSCRIBE_TRACKS prefix overlapping an active one of the same
+  type is refused with PREFIX_OVERLAP (§10.18, §10.19).
+- Fix: at d18 a request in the `.` or `.session` namespace is refused with DOES_NOT_EXIST before
+  any application handler sees it (§3.2.1, §3.2.2).
+- Fix: `MediaPublisher` answers a SUBSCRIBE for an unknown track with DOES_NOT_EXIST instead of
+  no reply; `MediaSubscriber` keeps its catalog subscription when the joining FETCH is refused
+  instead of subscribing twice.
 - `moq_interop_client`: `data-subgroup-basic` data-plane test, in the standard set.
 - `moq_interop_client`: `rendezvous-timeout` test, in the standard set; SKIP below d18.
 - `moq_interop_client`: with no `--draft`/`DRAFT`, probes `18,16,14` (newest first) instead

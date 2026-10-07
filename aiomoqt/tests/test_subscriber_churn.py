@@ -20,6 +20,7 @@ from aiomoqt.types import ForwardingPreference
 
 def _session(draft=18):
     s = object.__new__(_MOQTSessionMixin)
+    s._peer_requests = {}
     s.negotiated_draft = draft
     s._profile = profile_for(draft)
     s._subscriptions = {}
