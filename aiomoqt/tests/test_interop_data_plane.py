@@ -176,3 +176,32 @@ async def test_publisher_skips_publish_done_once_the_relay_cancels():
     # stream for PUBLISH_DONE; the case reports that instead of crashing.
     pub, s, streams = await _publish(cancel_first=True)
     assert streams == 3 and not pub.done_sent and s.done == []
+
+
+@requires_certs
+@pytest.mark.asyncio
+async def test_a_relay_that_withholds_publish_done_fails_the_case(monkeypatch):
+    # libquicr never forwards PUBLISH_DONE downstream.
+    monkeypatch.setattr(relay._RelayedTrack, "_enqueue_terminal",
+                        lambda self, *args: None)
+    monkeypatch.setattr(client, "_DATA_DELIVERY_S", 1.0)
+    r = await _run(_BASE_PORT + 3, 18, True)
+    assert not r.passed
+    assert r.message.startswith("no downstream PUBLISH_DONE"), r.message
+
+
+@pytest.mark.asyncio
+async def test_a_test_that_raises_fails_and_the_run_continues(monkeypatch):
+    async def _raises(*args, **kw):
+        raise AttributeError("boom")
+
+    async def _passes(*args, **kw):
+        return client.TestResult(name="passes", passed=True)
+
+    monkeypatch.setattr(client, "TEST_FUNCTIONS",
+                        {"raises": _raises, "passes": _passes})
+    rep = await client.run_tests(["raises", "passes"], "localhost", 1, "/",
+                                 True, True, False, supported_drafts=18)
+    assert [(r.name, r.passed) for r in rep.results] == [
+        ("raises", False), ("passes", True)]
+    assert "AttributeError" in rep.results[0].message

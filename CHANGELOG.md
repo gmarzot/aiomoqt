@@ -12,6 +12,8 @@
   acknowledged with SUBSCRIBE_OK.
 - Fix: a SUBSCRIBE for a finished track gets SUBSCRIBE_OK then PUBLISH_DONE (TRACK_ENDED)
   instead of no further reply.
+- Fix: `moq_interop_client`: a relay that never forwards PUBLISH_DONE fails
+  `data-subgroup-basic` instead of crashing the run; a test that raises is reported as FAIL.
 - `moq_interop_client` / `moq_interop_relay`: a pinned `DRAFT` aiomoqt cannot speak is
   reported (TAP skip-all, exit 127) or refused at start, instead of a traceback.
 - Fix: STOP_SENDING on a d18 request stream no longer discards the REQUEST_ERROR or
