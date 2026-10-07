@@ -58,9 +58,11 @@ and finds whichever run is publishing under it. Copy the publisher's
 Two shells, in this order. The first one blocks — it is the dev server —
 so it cannot share a shell with anything below it.
 
-- SHELL 1, and leave it running: `cd "$PLAYA" && pnpm build && pnpm --filter @moqt/examples dev`
-  → :5173. After player edits: `pnpm -r --filter "./packages/**" build`
-  and restart vite (the examples import the packages' dist).
+- SHELL 1, and leave it running: `cd "$PLAYA" && pnpm install && pnpm --filter @moqt/examples dev`
+  → :5173. Vite serves the player packages from source and hot-reloads, so
+  player edits need no rebuild or restart; `pnpm -r build` only refreshes
+  the dist types the example pages type-check against. Run `pnpm install`
+  again after a pull that adds packages.
 - SHELL 2, the venv shell, and the one every demo below uses:
   `python -m aiomoqt.tools.relay_probe --url "$RELAY_WT" --draft 18` → expect ✓
 - SHELL 2: `hostname -I` → WSL IP for the OBS SRT URL (changes across
@@ -80,22 +82,34 @@ so it cannot share a shell with anything below it.
   are bf=2, as is `sintel-1280-surround.mp4`. The names are close to the
   safe ones — check `has_b_frames` before substituting.
 
-## Player URL parameters (/simple/)
+## Player URL parameters (/g5-player/)
+The publisher's `player:` line opens `/g5-player/` (`--player-base`). The
+page's settings dialog edits the same parameters.
+
 | Param | Meaning | Default |
 |---|---|---|
 | `url=` | relay WT URL | probe page host |
 | `ns=` | namespace, split on `/` (`nsField=` repeatable for literal fields) | live |
 | `v=` | draft 14/16/18; a 16/18 pin never retries WT bare | 16 |
 | `catalogBootstrap=` | auto / joining-fetch / strict / subscribe | auto |
+| `targetLatency=` | overrides the catalog target (ms): LOC cushion cap and catch-up set point; CMAF buffer held ahead, soft-chase set point, live-edge and gap-jump landing | catalog value |
+| `cushion=` / `cushionMax=` | LOC render-cushion floor / cap (ms) | 200 (50 if RTT < 5 ms) / 750 |
+| `catchUp=` | LOC max playback rate chasing the target; wall-clock based | 1.0 = off |
 | `warmStart=1` | joining FETCH of the current group (LOC only; startup decode error at the seam) | off |
-| `catchUp=` | max playback rate chasing `targetLatency=` from the URL (not the catalog); wall-clock based | 1.0 = off |
-| `targetLatency=` | catch-up set point (ms); on CMAF also the seek landing; LOC cushion cap | catalog value; CMAF landing 2 s |
-| `cushion=` / `cushionMax=` | LOC render-cushion floor / cap (ms) | 200 (50 if RTT<5 ms) / target latency, at most 750 |
+| `congestionControl=` | `low-latency` / `throughput` hint to the browser's QUIC | browser default |
+| `compat=` | `request-credit`, `empty-objects`: opt-in leniency for non-conformant relays | none |
+| `authority=` | CLIENT_SETUP AUTHORITY for tenant-routed relays | none |
+| `hash=` | relay certificate hash (hex) | none |
 | `debug=1` | engine debug log, MSE tracing, media-element events in the page log | off |
+| `status=1` | playback state over the picture | off |
 
-The page log prints `Options: …` at load with exactly what reached the
-engine. Overlay "cushion ms": MSE = buffered ahead of the playhead;
-WebCodecs = scheduled audio ahead, or the render cushion when video-only.
+On draft 18 the page follows the namespace with SUBSCRIBE_NAMESPACE (SUB_NS
+badge; grey on draft 16, where it is not sent): a publisher that goes away
+and returns is re-joined without a reload. The page log prints `Options: …`
+at load with exactly what reached the engine. Readouts: LATENCY p50/p95/max
+is capture → arrival; `E2E` is capture → drawn frame (`≈` on CMAF, where it
+is arrival plus the buffer ahead); QUEUED is what each track has ahead of
+the playhead against TARGET.
 
 ## Demo A — CMAF file → glass (MSE playback)
 - SHELL 1 — Big Buck Bunny, 1920x1080@30, 2.3 Mbps:
@@ -112,13 +126,21 @@ WebCodecs = scheduled audio ahead, or the render cushion when video-only.
 - Levers: `--target-latency` on the publisher is what the catalog
   advertises and what the player's cushion target follows (seek landing
   and soft-chase set point); `targetLatency=` on the player overrides it.
-- Adapter behavior (fork, from 92e420d onward): late previous-group objects
-  are kept (no one-frame holes); a buffered hole is jumped after a wait
-  scaled to its width (300 ms floor), landing near the live edge; a
-  cushion above target + 0.5 s is drained at 1.05x until within 0.1 s.
-  Before the port (upstream v0.5.9 adapter) the same run showed 40 ms
-  holes, a 2 s wait and a 2 s → 4.3 s cushion climb; a stall line with
-  `[a–b][b+0.04–c]` ranges after the port would be a regression.
+- Player behavior on CMAF: the buffer is held at the target. A cushion
+  more than two-thirds of the target above it is shed at 1.05x, released at
+  the target as measured just before new media lands; a stall that begins
+  inside that band raises the release point
+  (`[MSE] stalled with N ms buffered while catching up; catch-up now stops
+  at M ms`). Audio and video are appended in decode order across group
+  boundaries (`audio/video order restored/missing/late` in the log); video
+  that would land behind what is already appended is dropped, since MSE
+  would otherwise drop video until the next keyframe. Resume after a pause
+  starts at the first media after it. A buffered hole is jumped after a
+  wait scaled to its width (300 ms floor), landing near the live edge.
+- CMAF floor: at 24 fps MSE stalls with about 100–150 ms buffered, so a
+  target below about 150 ms cycles stall → refill → catch-up. A video-only
+  hole that ends at a keyframe is a decode-order race or a lost object;
+  `Stale video dropped before MSE` lines name the drops the player made.
 
 ## Demo B — LOC file → glass (WebCodecs, A/V, joining fetch)
 - SHELL 1 — TianNature, 1920x1080@30, 7.9 Mbps, the highest-rate asset:
@@ -285,6 +307,15 @@ start; Eyevinn's moqlivemock endpoint is always on.
 
 ## Troubleshooting
 - "no such namespace" → publisher down / wrong -N / reused namespace. Blank page → vite down.
+- Periodic trouble on WSL-published streams only (a ~30 s latency sawtooth,
+  sync re-anchors, stalls every few seconds) while a browser-published
+  g5-broadcast on the same relay plays clean → look at the WSL host before
+  the code: compare its clock with Windows for 60–90 s and log scheduling
+  gaps (see the clock note in [demo-runbook-g5.md](demo-runbook-g5.md)).
+  A WSL publisher's timestamps and pacing inherit both.
+- A viewer of a namespace restarted under the same name gets no catalog →
+  moqx answers its FETCH from the earlier run's cache (openmoq/moqx#795).
+  pub_media mints a fresh namespace per run; this only bites with `-N`.
 - "no such namespace" that never resolves even with the publisher up →
   missing `--pub-both`. A bare PUBLISH leaves no route back to an idling
   publisher once the last subscriber leaves; every publish command here
@@ -327,7 +358,7 @@ start; Eyevinn's moqlivemock endpoint is always on.
 - Audio drops out, "audio late / snap" late count rising → cushion below
   the source's A/V skew; raise `--target-latency`.
 
-Pinned: moq-playa-v059 0540d37 (branch gmarzot-playa-dev on upstream
-v0.5.9; fork PR gmarzot/moq-playa#1) ·
+Pinned: moq-playa-v059 2cf770f (branch gmarzot-playa-dev, merged with
+upstream openmoq/moq-playa main 872f415) ·
 aiomoqt gmarzot-0.11.0 607b668 ·
 moqx-main v0.3.5 (linode-ci-000).

@@ -459,6 +459,9 @@ def _run_relay_matrix(relay: dict, enabled: set[str],
     # recorded as XFAIL: reported, but never fails the job. Absent =
     # non-gating for every draft.
     gating_drafts = set(relay.get("gating", []))
+    # Suites that run and report but never gate: a documented peer
+    # non-conformance the case fails on correctly.
+    xfail_suites = set(relay.get("xfail_suites", []))
 
     def _dispatch(suite: str, label_suffix: str, tag: str, slug: str,
                   fn, *fn_args, gating: bool = True) -> None:
@@ -481,7 +484,7 @@ def _run_relay_matrix(relay: dict, enabled: set[str],
             return
         log = log_dir / f"{suite}_{slug}.log"
         status, detail = _with_interop_retry(fn, fn_args, log)
-        if status == "FAIL" and not gating:
+        if status == "FAIL" and (not gating or suite in xfail_suites):
             status = "XFAIL"
         results.append((status, label, detail, log))
         marker = {"PASS": "[PASS]", "FAIL": "[FAIL]",

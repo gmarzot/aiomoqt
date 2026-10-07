@@ -3,7 +3,7 @@ import functools
 import logging
 import time
 from asyncio import Future
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field
 from typing import (Any, Callable, DefaultDict, Dict, List, Optional, Set,
                     Tuple, Type, Union)
@@ -356,6 +356,9 @@ class _MOQTSessionMixin:
         # the session-global on_object_received when no entry matches.
         self._object_handlers: Dict[int, Callable] = {}
         self._stream_end_handlers: Dict[int, Callable] = {}
+        # Stream ends for an alias with no handler yet: a short stream can
+        # end before its subscriber registers one. Replayed on registration.
+        self._early_stream_ends: "OrderedDict[int, deque]" = OrderedDict()
         # track_alias -> DEFAULT_PUBLISHER_PRIORITY (property 0x0E, Track
         # scope, §12.4). A subgroup whose header sets DEFAULT_PRIORITY
         # omits the Priority field and inherits this.
@@ -744,11 +747,44 @@ class _MOQTSessionMixin:
         stream rather than by sending an END_OF_GROUP object (§11.4.2:
         inferable from a FIN, never from a reset), so a relay that only
         watches objects never learns the group ended and leaves its
-        downstream stream open to be reset at teardown."""
+        downstream stream open to be reset at teardown.
+
+        Streams of this track that ended in the last
+        EARLY_STREAM_END_HOLD_S, before the handler existed, are
+        reported at once."""
         self._stream_end_handlers[track_alias] = callback
+        early = self._early_stream_ends.pop(track_alias, None)
+        if not early:
+            return
+        horizon = time.monotonic() - self.EARLY_STREAM_END_HOLD_S
+        for ended_at, group_id, subgroup_id, clean, reset_code in early:
+            if ended_at < horizon:
+                continue
+            try:
+                callback(group_id, subgroup_id, clean=clean,
+                         reset_code=reset_code)
+            except Exception:
+                logger.debug("stream-end handler raised", exc_info=True)
 
     def unregister_stream_end_handler(self, track_alias: int) -> None:
         self._stream_end_handlers.pop(track_alias, None)
+        self._early_stream_ends.pop(track_alias, None)
+
+    # Early stream ends are kept this long, for at most this many
+    # aliases and this many ends per alias.
+    EARLY_STREAM_END_HOLD_S = 5.0
+    EARLY_STREAM_END_MAX = 64
+
+    def _note_early_stream_end(self, alias: int, group_id, subgroup_id,
+                               clean: bool, reset_code: int) -> None:
+        ends = self._early_stream_ends.get(alias)
+        if ends is None:
+            if len(self._early_stream_ends) >= self.EARLY_STREAM_END_MAX:
+                self._early_stream_ends.popitem(last=False)
+            ends = self._early_stream_ends[alias] = deque(
+                maxlen=self.EARLY_STREAM_END_MAX)
+        ends.append((time.monotonic(), group_id, subgroup_id, clean,
+                     reset_code))
 
     def _object_cb(self, track_alias) -> Optional[Callable]:
         """Delivery callback for a track: per-alias route, else global."""
@@ -1042,13 +1078,16 @@ class _MOQTSessionMixin:
                     and getattr(state.parser, 'end_of_group', False)):
                 self._set_group_bound(alias, group_id, state.object_id + 1)
             cb = self._stream_end_handlers.get(alias)
+            clean = error_code == QuicErrorCode.NO_ERROR
             if cb:
                 try:
-                    cb(group_id, subgroup_id,
-                       clean=(error_code == QuicErrorCode.NO_ERROR),
+                    cb(group_id, subgroup_id, clean=clean,
                        reset_code=reset_code)
                 except Exception:
                     logger.debug("stream-end handler raised", exc_info=True)
+            else:
+                self._note_early_stream_end(alias, group_id, subgroup_id,
+                                            clean, reset_code)
         if key and len(key) == 2 and key[0] == 'fetch':
             request_id = key[1]
             fut = self._fetch_done_futures.pop(request_id, None)
@@ -2209,6 +2248,7 @@ class _MOQTSessionMixin:
         self._uni_peek_stash.clear()
         self._published_tracks.clear()
         self._requests.clear()
+        self._early_stream_ends.clear()
 
         if not self._wt_session_setup.done():
             self._wt_session_setup.set_result(False)
@@ -4117,6 +4157,7 @@ class _MOQTSessionMixin:
                 self._mark_stream_torn_down(sid)
         self._track_aliases.pop(track_alias, None)
         self._object_handlers.pop(track_alias, None)
+        self._early_stream_ends.pop(track_alias, None)
         self._forget_track_bounds(track_alias)
 
     def _extend_request_credit(self, rid: int) -> None:

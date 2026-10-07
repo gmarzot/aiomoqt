@@ -4,6 +4,7 @@ datagram PROPERTIES bit with no properties, an over-long reason phrase,
 and a namespace with more than 32 fields all close the session with
 PROTOCOL_VIOLATION."""
 import time
+from collections import OrderedDict
 from types import SimpleNamespace
 
 import pytest
@@ -30,6 +31,7 @@ def _stub(draft):
     s._stream_torn_down_last_sweep = time.monotonic()
     s._stream_torn_down_evict_after = 30.0
     s._stream_end_handlers = {}
+    s._early_stream_ends = OrderedDict()
     s._fetch_done_futures = {}
     s._subgroup_stream_by_key = {}
     s._fetch_stream_by_request = {}

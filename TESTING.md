@@ -159,6 +159,9 @@ Entries live in `tests/relays.json`. Full schema:
 | `insecure` | no (default `false`) | if `true`, pass `--tls-disable-verify` / `-k` to subprocess tools |
 | `disabled` | no (default `false`) | if `true`, skip this relay entirely unless `--only` names it |
 | `disabled_suites` | no | list of suite names to skip for this relay (e.g. `["relay-join", "relay-fetch"]`) |
+| `gating` | no (default none) | drafts whose failures fail the job; a FAIL on any other draft is reported as XFAIL |
+| `xfail_suites` | no | suites that run and report but never gate: a documented peer non-conformance the case correctly fails on |
+| `compat` | no | wire tolerances passed to the tools as `--compat` (e.g. `libquicr`, `lenient-extensions`) |
 | `notes` | no | freeform comment (not printed on skip lines) |
 
 Adding a new relay — minimal recipe:

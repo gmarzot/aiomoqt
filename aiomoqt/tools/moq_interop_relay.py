@@ -257,6 +257,9 @@ class _RelayedTrack:
         self.downstream = []          # list of (session, track_alias, request_id)
         self.queue = asyncio.Queue()
         self.task = None
+        # A downstream SUBSCRIBE is establishing this track: an upstream
+        # terminal that lands first waits in the queue for it.
+        self.attaching = False
         # (id(session), group, subgroup) -> (stream_id, SubgroupHeader)
         self._streams = {}
         # id(session) -> subgroup streams opened (PUBLISH_DONE count)
@@ -428,6 +431,7 @@ class _RelayedTrack:
              shape))
 
     def add_downstream(self, session, track_alias, request_id=None):
+        self.attaching = False
         self.downstream.append((session, track_alias, request_id))
         # The Largest reported to this subscriber: a joining FETCH from
         # it backfills up to exactly that point.
@@ -724,6 +728,7 @@ async def _establish_upstream(ns, track_name):
         _tracks.pop(key, None)
     for pub in _publishers_for(ns):
         track = _RelayedTrack(key)
+        track.attaching = True
         name = (track_name.decode() if isinstance(track_name, bytes)
                 else track_name)
         upstream = SubscribedTrack(
@@ -769,7 +774,7 @@ def _upstream_done(track, key, done) -> None:
                 f"-> {len(track.downstream)} subscriber(s), objects "
                 f"in={track._objects_in} out={track._objects_out}, "
                 f"upstream streams ended={track._upstream_ended}")
-    if track.task is None:
+    if track.task is None and not track.attaching:
         # Nothing draining the queue: no subscriber ever attached.
         track.finish(status_code=status, reason=reason)
         track.close()

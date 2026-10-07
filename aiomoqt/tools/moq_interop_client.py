@@ -1220,6 +1220,8 @@ async def test_data_subgroup_basic(host, port, path, use_quic,
         problems.insert(0, "relay cancelled the upstream subscription "
                            "before PUBLISH_DONE")
         count = "none"
+    elif done is None:
+        count = "none"
     else:
         count = ("unknown" if done.stream_count == _UNKNOWN_STREAM_COUNT
                  else done.stream_count)
@@ -1527,8 +1529,13 @@ async def run_tests(tests: list[str], host: str, port: int, path: str,
             continue
         INTEROP_NAMESPACE = f"{base_namespace}/{test_name}"
         nc_before = MOQTMessage._trailing_extensions_truncation_count
-        result = await fn(host, port, path, use_quic, tls_disable_verify,
-                          debug, supported_drafts=effective_draft, compat=compat)
+        try:
+            result = await fn(host, port, path, use_quic, tls_disable_verify,
+                              debug, supported_drafts=effective_draft,
+                              compat=compat)
+        except Exception as e:
+            result = TestResult(name=test_name, passed=False,
+                                message=f"test raised {_format_exc(e)}")
         nc_delta = (
             MOQTMessage._trailing_extensions_truncation_count - nc_before
         )
