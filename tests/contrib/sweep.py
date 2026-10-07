@@ -95,6 +95,7 @@ def _start_runner(args, out):
         if _healthy(base):
             return base, proc
         time.sleep(0.5)
+    _stop(proc)
     raise SweepError("runner never became healthy")
 
 
@@ -135,7 +136,10 @@ def _run(base, args, out, scenarios):
 
 
 def sweep(base, args, out):
-    (out / "results").mkdir(exist_ok=True)
+    results = out / "results"
+    results.mkdir(exist_ok=True)
+    for stale in results.iterdir():
+        stale.unlink()
     _, health = _call(base, "GET", "/healthz")
     todo = sorted({p["scenario"] for p in health["executable_profiles"]
                    if p["draft"] == 18 and p["transport"] == args.transport
@@ -265,9 +269,19 @@ def main():
                            if r["outcome"] == "pass")}, indent=1) + "\n")
         print(f"baseline written: {args.baseline}")
         return 0
-    baseline = (json.loads(args.baseline.read_text())["pass"]
-                if args.baseline.exists() else [])
-    text, regressed = report(rows, baseline, runner_id, args.transport)
+    try:
+        base_doc = json.loads(args.baseline.read_text())
+    except (OSError, ValueError) as e:
+        print(f"no usable baseline {args.baseline}: {e}", file=sys.stderr)
+        return 2
+    want = {"runner": runner_id, "draft": 18, "transport": args.transport}
+    got = {k: base_doc.get(k) for k in want}
+    if got != want:
+        print(f"baseline {args.baseline} is for {got}, this sweep is "
+              f"{want}; refresh it with --write-baseline", file=sys.stderr)
+        return 2
+    text, regressed = report(rows, base_doc["pass"], runner_id,
+                             args.transport)
     (args.out / "summary.md").write_text(text)
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
