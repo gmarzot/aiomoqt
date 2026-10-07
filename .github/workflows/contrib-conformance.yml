@@ -70,10 +70,11 @@ jobs:
             "https://github.com/${{ steps.pin.outputs.repo }}" runner-src
           git -C runner-src checkout --detach "${{ steps.pin.outputs.sha }}"
           cmake -S runner-src -B runner-build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PWD/runner-install" \
             -DMOQ_INTEROP_BUILD_TESTS=OFF \
             -DMOQ_INTEROP_SOURCE_REVISION="${{ steps.pin.outputs.sha }}"
           cmake --build runner-build --parallel 4
-          cmake --install runner-build --prefix "$PWD/runner-install"
+          cmake --install runner-build
 
       - name: Sweep
         run: |
