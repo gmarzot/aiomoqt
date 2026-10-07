@@ -14,6 +14,9 @@
   instead of no further reply.
 - Fix: a subgroup stream that ends before its track registers a stream-end handler is
   reported when the handler registers (within 5 s), instead of never.
+- Fix: `moq_interop_relay`: PUBLISH_DONE follows the last object instead of waiting 3 s when
+  upstream streams end before the relay counts them; a track that ends while its first
+  subscriber attaches still reaches it.
 - Fix: `moq_interop_client`: a relay that never forwards PUBLISH_DONE fails
   `data-subgroup-basic` instead of crashing the run; a test that raises is reported as FAIL.
 - `moq_interop_client` / `moq_interop_relay`: a pinned `DRAFT` aiomoqt cannot speak is
