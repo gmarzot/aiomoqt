@@ -43,7 +43,7 @@ def _parse_subgroup_stream(chain: StreamChain, prof=None) -> int:
     chain.vi64 = vi64
 
     # Stream type (varint flavor per draft) + SubgroupHeader
-    stream_type = chain.pull_uint_var()
+    stream_type = chain.pull_vint()
     sg = SubgroupHeader.deserialize(chain, type_val=stream_type, prof=prof)
 
     n_objects = 0
