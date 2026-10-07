@@ -30,7 +30,7 @@ from enum import IntEnum
 from typing import Callable, Dict, Optional
 
 from .types import (
-    MOQTMessageType, MOQTRequestError, ParamType, FilterType,
+    MOQTRequestError, ParamType, FilterType,
     ForwardingPreference, GroupOrder, LOC_TIMESTAMP,
     StreamResetCode, SubscribeDoneCode,
 )
@@ -284,7 +284,7 @@ class PublishedTrack(Track):
     def _produces(self) -> bool:
         return type(self).produce is not PublishedTrack.produce
 
-    def _attach(self, sub) -> None:
+    def _add_delivery(self, sub) -> None:
         """Give a peer its delivery of the object sequence under its
         current alias, replacing any it had. It joins at the next group
         boundary."""
@@ -398,6 +398,13 @@ class PublishedTrack(Track):
         if self._largest is None or (group_id, object_id) > self._largest:
             self._largest = (group_id, object_id)
 
+    def attach(self, session=None) -> None:
+        """Serve this track on a session without announcing it:
+        SUBSCRIBEs for its full name, and replies and updates for its
+        requests, reach the track. Sends nothing; publish() attaches
+        first."""
+        (self.session if session is None else session)._attach_track(self)
+
     async def publish(self, announce_namespace: bool = False,
                       publish_track: bool = True,
                       forward: int = 0, session=None):
@@ -434,6 +441,9 @@ class PublishedTrack(Track):
         if self.forwarding == ForwardingPreference.DATAGRAM:
             self._check_datagram_fit()
 
+        # Before any announcement: a SUBSCRIBE may overtake its reply.
+        self.attach(sess)
+
         if announce_namespace:
             await sess.publish_namespace(
                 namespace=self.namespace,
@@ -443,26 +453,6 @@ class PublishedTrack(Track):
             sub.state = TrackState.ANNOUNCED
             logger.info(f"Track: announced namespace '{self.namespace}'")
 
-        # Register handlers BEFORE sending PUBLISH (or waiting for
-        # SUBSCRIBE) so a fast relay response isn't missed.
-        sess.register_handler(
-            MOQTMessageType.SUBSCRIBE, self._on_subscribe)
-        sess.register_handler(
-            MOQTMessageType.PUBLISH_OK, self._on_publish_ok)
-        # Code point 0x02 is SUBSCRIBE_UPDATE (d14) or REQUEST_UPDATE
-        # (d16); the negotiated draft selects the class via the per-draft
-        # CONTROL_REGISTRY, so a single handler dispatches on the parsed
-        # message type — no version branch, works whenever the handshake
-        # settles.
-        track = self
-        async def _update_handler(session, msg):
-            if isinstance(msg, RequestUpdate):
-                await track._on_request_update(session, msg)
-            else:
-                await track._on_subscribe_update(session, msg)
-        sess.register_handler(
-            MOQTMessageType.SUBSCRIBE_UPDATE, _update_handler)
-
         if publish_track:
             pub_msg = sess.publish(
                 namespace=self.namespace,
@@ -471,6 +461,8 @@ class PublishedTrack(Track):
             )
             sub.track_alias = pub_msg.track_alias
             sub.request_id = pub_msg.request_id
+            sess._bind_request(pub_msg.request_id, self, sub,
+                               alias=sub.track_alias)
             sub.forward = bool(forward)
             sub.state = TrackState.PUBLISHED
             logger.info(f"Track: published {self.fqtn} "
@@ -534,7 +526,7 @@ class PublishedTrack(Track):
         self._subscriber_event.set()
         sub.generating = True
         if self._produces():
-            self._attach(sub)
+            self._add_delivery(sub)
             self._ensure_production()
             return
         if self._pad is not None:
@@ -615,6 +607,13 @@ class PublishedTrack(Track):
                       largest_group_id=self._largest[0],
                       largest_object_id=self._largest[1])
         ok = session.subscribe_ok(request_msg=msg, **kw)
+        if sub.done:
+            session.subscribe_done(msg.request_id,
+                                   status_code=SubscribeDoneCode.TRACK_ENDED,
+                                   reason="track ended")
+            return
+        session._bind_request(msg.request_id, self, sub,
+                              alias=ok.track_alias)
         sub.track_alias = ok.track_alias
         sub.subscribe_request_id = msg.request_id
         sub.subscribers.add(msg.request_id)
@@ -670,6 +669,9 @@ class PublishedTrack(Track):
         # Mark terminal regardless: we are ending the track, so refuse
         # any later restart even if there is no valid id to send on.
         sub.done = True
+        for rid in (*sub.subscribers, sub.request_id,
+                    sub.subscribe_request_id):
+            session._unbind_request(rid)
         if not req_id:
             return
         # Streams this peer was actually sent, which is the delivery's
@@ -722,7 +724,7 @@ class PublishedTrack(Track):
             sub = self._sub_for(session)
             sub.track_alias = track_alias
             sub.generating = True
-            self._attach(sub)
+            self._add_delivery(sub)
             await asyncio.shield(self._ensure_production())
             return
 

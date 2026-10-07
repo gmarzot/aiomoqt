@@ -1,0 +1,44 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: en-US
+reviews:
+  profile: chill
+  poem: false
+  auto_review:
+    enabled: true
+    drafts: true
+  path_filters:
+    - "!perf/baselines/**"
+  path_instructions:
+    - path: "aiomoqt/**/*.py"
+      instructions: >-
+        MoQT drafts 14, 16 and 18 are live. Draft numbers are plain ints; the IETF
+        code 0xff0000NN and the ALPN strings appear only at the wire boundary.
+        Behaviour differences go through profile_for(draft) / DraftProfile, not
+        scattered version checks. A new wire shape needs a case in
+        test_wire_conformance.py, including malformed input. No synchronous waits
+        or polling sleeps in product code; every wait is bounded.
+    - path: "aiomoqt/media/**"
+      instructions: >-
+        Packagers only package and number objects. Peer mechanics
+        (FanoutDelivery, add_session, subscriber sets) belong in PublishedTrack and
+        aiomoqt/delivery.py; broadcast.py is the one exempt composer.
+    - path: "aiomoqt/{tools/**,utils/cli.py}"
+      instructions: >-
+        One CLI flag letter has one meaning across every tool (-N namespace,
+        -T trackname, -s size, -g group size, -P streams, -r rate, -t duration,
+        -i interval, -k insecure, -d debug, -D datagram, -p port, -Q raw QUIC,
+        -W WebTransport; -h is not help, -? is). No feature toggles on the shared
+        grid helpers.
+    - path: "aiomoqt/tests/**"
+      instructions: >-
+        Every fix needs a test that fails without it. Zero objects delivered is a
+        failure, never a pass. Flag tests that can pass vacuously, fixed sleeps
+        that race on slow CI runners, and assertions that cannot find their
+        results and pass anyway.
+    - path: "**/*"
+      instructions: >-
+        Comments say what the code does or why a non-obvious choice is needed, in
+        few words. Flag process narration, issue or PR references, and history in
+        comments. CHANGELOG.md: one short line per change under Unreleased.
+chat:
+  auto_reply: true
