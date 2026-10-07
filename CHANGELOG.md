@@ -18,6 +18,10 @@
   SUBSCRIBER_PRIORITY or DEFAULT_PUBLISHER_GROUP_ORDER outside their ranges (§2.4.1, §10.2).
 - Fix: a d18 AbsoluteRange whose End Group passes 2^64-1 closes the session (§5.1.2).
 - Fix: GROUP_ORDER `PUBLISHER_DEFAULT` (0) is omitted at d16+ instead of sent.
+- Fix: a session closed for an error puts the MoQT error code on the wire at once
+  (CONNECTION_CLOSE application error, or the WebTransport session close code); it sent
+  nothing until the application exited, and then code 0.
+- Fix: a peer's WebTransport session close ends the MoQT session.
 - `moq_interop_client`: `data-subgroup-basic` data-plane test, in the standard set.
 - `moq_interop_client`: `rendezvous-timeout` test, in the standard set; SKIP below d18.
 - `moq_interop_client`: with no `--draft`/`DRAFT`, probes `18,16,14` (newest first) instead

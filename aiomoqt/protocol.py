@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import logging
 import time
 from asyncio import Future
@@ -312,7 +313,7 @@ class _MOQTSessionMixin:
         self._stream_torn_down_evict_after: float = 30.0
         self._stream_torn_down_last_sweep: float = 0.0
         self._tasks: Set[asyncio.Task] = set()
-        self._close_err = None  # tuple holding latest (error_code, Reason_phrase)
+        self._close_err = None  # first (error_code, reason_phrase) closed with
 
         self._bidi_streams: Dict[int, int] = {}  # map request_id to bidi stream_id (d16)
         self._bidi_stream_requests: Dict[int, int] = {}  # map bidi stream_id to request_id (d16)
@@ -2004,7 +2005,7 @@ class _MOQTSessionMixin:
                 logger.info(f"QUIC: connection closed: code: {error}")
             else:
                 logger.error(f"QUIC error: code: {error} reason: {reason}")
-            self._close_session(error, reason)
+            self._close_session(error, reason, transmit=False)
             return
 
         if isinstance(event, ProtocolNegotiated):
@@ -2114,15 +2115,24 @@ class _MOQTSessionMixin:
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(f"QUIC event: event not handled({class_name(event)})")
 
-    def _close_session(self, 
-              error_code: SessionCloseCode = SessionCloseCode.NO_ERROR, 
-              reason_phrase: str = "no error") -> None:
-        """Close the MoQT session."""
+    def _close_session(self,
+              error_code: SessionCloseCode = SessionCloseCode.NO_ERROR,
+              reason_phrase: str = "no error", *,
+              transmit: bool = True) -> None:
+        """Close the MoQT session. The first close's code is the one sent;
+        transmit=False when the peer already closed the connection."""
         if error_code == SessionCloseCode.NO_ERROR:
             logger.info(f"MOQT: closing: {reason_phrase} ({error_code})")
         else:
             logger.error(f"MOQT error: closing: {reason_phrase} ({error_code})")
-        self._close_err = (error_code, reason_phrase)
+        first = self._close_err is None
+        if first:
+            self._close_err = (error_code, reason_phrase)
+            if transmit:
+                try:
+                    self._loop.call_soon(self.close)
+                except RuntimeError:  # loop already closed
+                    pass
         if self._reaper_handle is not None:
             self._reaper_handle.cancel()
             self._reaper_handle = None
@@ -2157,15 +2167,19 @@ class _MOQTSessionMixin:
         # CONNECTION_CLOSE (which causes reset_stream on the peer).
         # Only FIN streams we own the write side of — sending
         # end_stream on peer-initiated uni streams produces
-        # RESET_STREAM which confuses relays.
+        # RESET_STREAM which confuses relays. An error close skips them:
+        # a FIN on the control stream reaches the peer first and reads
+        # as a critical-stream close, masking the error code.
         is_client = self._is_client
+        graceful = int(error_code) == SessionCloseCode.NO_ERROR
         try:
             if self._control_write_stream_id is not None:
-                self._quic.send_stream_data(
-                    self._control_write_stream_id, b"", end_stream=True)
+                if graceful:
+                    self._quic.send_stream_data(
+                        self._control_write_stream_id, b"", end_stream=True)
                 self._control_stream_id = None
                 self._d18_control_write_sid = None
-            for stream_id in list(self._data_streams.keys()):
+            for stream_id in list(self._data_streams.keys() if graceful else ()):
                 # We own the write side if we initiated the stream.
                 # QUIC stream ID bits 0-1: 0=client-bidi, 1=server-bidi,
                 # 2=client-uni, 3=server-uni
@@ -2190,7 +2204,16 @@ class _MOQTSessionMixin:
         # Close the QUIC connection on the next loop tick so the FINs
         # queued above get a transmit pass first — batched with
         # CONNECTION_CLOSE the peer sees them as RESET_STREAM.
-        parent_close = super().close
+        # The MoQT error code is the CONNECTION_CLOSE application error
+        # (raw QUIC) or the WebTransport session close code.
+        if self._is_wt:
+            reason = (reason_phrase if isinstance(reason_phrase, bytes)
+                      else str(reason_phrase).encode())
+            parent_close = functools.partial(
+                super().close, int(error_code), reason)
+        else:
+            parent_close = functools.partial(
+                self._quic.close, error_code=int(error_code))
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -4383,7 +4406,7 @@ from aiopquic.asyncio.webtransport import (
     WebTransportServerSession as _AioPWTServerSession,
     _EVT_WT_STREAM_DATA, _EVT_WT_STREAM_FIN,
     _EVT_WT_STREAM_RESET, _EVT_WT_STOP_SENDING,
-    _EVT_WT_DATAGRAM,
+    _EVT_WT_DATAGRAM, _EVT_WT_SESSION_CLOSED,
 )
 
 
@@ -4438,6 +4461,11 @@ class _WTSessionMixin:
                 stream_id=sid, error_code=error_code))
         elif evt_type == _EVT_WT_DATAGRAM:
             self.quic_event_received(DatagramFrameReceived(data=data))
+        elif evt_type == _EVT_WT_SESSION_CLOSED:
+            super()._on_event(ev_tuple)
+            reason = bytes(data).decode(errors="replace") if data else ""
+            self._close_session(error_code, reason or "WebTransport session closed",
+                                transmit=False)
         else:
             super()._on_event(ev_tuple)
 
