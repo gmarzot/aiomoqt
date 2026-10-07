@@ -870,8 +870,9 @@ class _MOQTSessionMixin:
                 self._extend_request_credit(rid)
             msg_len += hdr_len
             if end_pos > buf.tell():
-                logger.debug(f"MOQT event: control message: seeking msg end: {end_pos}")
-                buf.seek(end_pos)
+                raise MOQTProtocolViolation(
+                    f"{message_class.__name__} body ends "
+                    f"{end_pos - buf.tell()} bytes short of its Length")
             logger.info(f"MOQT event: control message parsed: {msg})")
 
             # Schedule handler if one exists

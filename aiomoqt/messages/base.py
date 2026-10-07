@@ -105,7 +105,20 @@ class MOQTMessage:
 
     REASON_PHRASE_MAX = 1024      # §3.5
     NAMESPACE_MAX_FIELDS = 32     # §2.4.1
+    FULL_TRACK_NAME_MAX = 4096    # §2.4.1
     KVP_TYPE_MAX = (1 << 64) - 1  # §1.4.3
+    # d16+ message parameters with a restricted value range (inclusive).
+    PARAM_VALUE_RANGES = {
+        ParamType.FORWARD: (0, 1),
+        ParamType.GROUP_ORDER: (1, 2),
+        ParamType.SUBSCRIBER_PRIORITY: (0, 255),
+    }
+
+    @staticmethod
+    def _check_range(name: str, value: int, lo: int, hi: int) -> None:
+        if not lo <= value <= hi:
+            raise MOQTProtocolViolation(
+                f"{name} {value} outside {lo}..{hi}")
 
     @staticmethod
     def _pull_reason(buf: Buffer) -> str:
@@ -119,15 +132,39 @@ class MOQTMessage:
         return buf.pull_bytes(n).decode()
 
     @staticmethod
-    def _pull_tuple(buf: Buffer) -> tuple:
+    def _pull_tuple(buf: Buffer, *, prof: DraftProfile) -> tuple:
         """Track Namespace tuple; over the maximum field count is a
-        protocol violation."""
+        protocol violation, and at d16+ so is an empty field or a
+        namespace over FULL_TRACK_NAME_MAX bytes."""
         n = buf.pull_vint()
         if n > MOQTMessage.NAMESPACE_MAX_FIELDS:
             raise MOQTProtocolViolation(
                 f"namespace has {n} fields "
                 f"(max {MOQTMessage.NAMESPACE_MAX_FIELDS})")
-        return tuple(buf.pull_bytes(buf.pull_vint()) for _ in range(n))
+        parts = tuple(buf.pull_bytes(buf.pull_vint()) for _ in range(n))
+        if prof.draft >= 16:
+            if not all(parts):
+                raise MOQTProtocolViolation("empty namespace field")
+            size = sum(len(p) for p in parts)
+            if size > MOQTMessage.FULL_TRACK_NAME_MAX:
+                raise MOQTProtocolViolation(
+                    f"namespace is {size} bytes "
+                    f"(max {MOQTMessage.FULL_TRACK_NAME_MAX})")
+        return parts
+
+    @staticmethod
+    def _pull_full_track_name(buf: Buffer, *,
+                              prof: DraftProfile) -> tuple:
+        """Track Namespace + Track Name; over FULL_TRACK_NAME_MAX bytes
+        in total is a protocol violation."""
+        namespace = MOQTMessage._pull_tuple(buf, prof=prof)
+        name = buf.pull_bytes(buf.pull_vint())
+        size = sum(len(f) for f in namespace) + len(name)
+        if size > MOQTMessage.FULL_TRACK_NAME_MAX:
+            raise MOQTProtocolViolation(
+                f"full track name is {size} bytes "
+                f"(max {MOQTMessage.FULL_TRACK_NAME_MAX})")
+        return namespace, name
 
     @staticmethod
     def _extensions_decode(buf: Buffer, with_length: bool = True,
@@ -711,20 +748,7 @@ class MOQTMessage:
                 elif kind == "varint":
                     param_value = buf.pull_vint()
                 elif kind == "tuple":
-                    nfields = buf.pull_vint()
-                    if nfields > 32:
-                        raise MOQTProtocolViolation(
-                            f"namespace prefix has {nfields} fields "
-                            f"(max 32)")
-                    fields = []
-                    for _ in range(nfields):
-                        flen = buf.pull_vint()
-                        if buf_end is not None and \
-                                buf.tell() + flen > buf_end:
-                            raise MOQTProtocolViolation(
-                                "namespace field overruns frame")
-                        fields.append(buf.pull_bytes(flen))
-                    param_value = tuple(fields)
+                    param_value = MOQTMessage._pull_tuple(buf, prof=prof)
                 else:  # length-prefixed bytes
                     param_len = buf.pull_vint()
                     if param_len > 65535:
@@ -784,6 +808,10 @@ class MOQTMessage:
                 raise MOQTProtocolViolation(
                     f"parameter overran frame extent: "
                     f"{buf.tell()}/{buf_end}")
+            bounds = MOQTMessage.PARAM_VALUE_RANGES.get(param_type)
+            if bounds is not None and prof.draft >= 16:
+                MOQTMessage._check_range(
+                    f"parameter 0x{param_type:x}", param_value, *bounds)
             params[param_type] = param_value
 
         return params

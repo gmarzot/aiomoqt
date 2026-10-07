@@ -14,6 +14,7 @@ from collections import deque
 import pytest
 
 from aiomoqt.protocol import _MOQTSessionMixin
+from aiomoqt.messages.namespace import PublishNamespaceOk
 from aiomoqt.messages.request import RequestError, RequestOk
 from aiomoqt.messages.subscribe import SubscribeError
 from aiomoqt.context import profile_for
@@ -63,6 +64,16 @@ def _feed_reply(s, data, end=False):
         s._on_control_data(0, data, end)
 
 
+def _ok_wire(s, rid=7):
+    """A reply that exists at the session's draft: REQUEST_OK is d16+,
+    and its code point is PUBLISH_NAMESPACE_OK at d14."""
+    if s._profile.draft < 16:
+        msg = PublishNamespaceOk(request_id=rid)
+    else:
+        msg = RequestOk(request_id=rid, parameters={})
+    return bytes(msg.serialize(prof=s._profile).data)
+
+
 def _spy_parses(s):
     """Record every whole control message _on_control_data parses."""
     parsed = []
@@ -84,8 +95,7 @@ async def test_header_split_reassembles(draft, cut):
     # Split inside the type+length header — the exact d18 crash shape.
     s = _control_session(draft)
     parsed = _spy_parses(s)
-    wire = bytes(RequestOk(request_id=7, parameters={}).serialize(
-        prof=s._profile).data)
+    wire = _ok_wire(s)
     assert len(wire) > cut
 
     _feed_reply(s, wire[:cut])
@@ -101,8 +111,7 @@ async def test_header_split_reassembles(draft, cut):
 async def test_body_split_reassembles(draft):
     s = _control_session(draft)
     parsed = _spy_parses(s)
-    wire = bytes(RequestOk(request_id=7, parameters={}).serialize(
-        prof=s._profile).data)
+    wire = _ok_wire(s)
     cut = len(wire) - 1            # header complete, body one byte short
 
     _feed_reply(s, wire[:cut])
@@ -118,8 +127,7 @@ async def test_body_split_reassembles(draft):
 async def test_whole_message_single_event(draft):
     s = _control_session(draft)
     parsed = _spy_parses(s)
-    wire = bytes(RequestOk(request_id=7, parameters={}).serialize(
-        prof=s._profile).data)
+    wire = _ok_wire(s)
     _feed_reply(s, wire)
     assert len(parsed) == 1
     assert s._closed == []
@@ -139,8 +147,7 @@ async def test_a_body_past_its_length_closes_the_session(draft):
     wire = bytearray(err.serialize(prof=s._profile).data)
     declared = int.from_bytes(wire[1:3], "big")
     wire[1:3] = (declared - 2).to_bytes(2, "big")
-    ok = bytes(RequestOk(request_id=7, parameters={}).serialize(
-        prof=s._profile).data)
+    ok = _ok_wire(s)
     _feed_reply(s, bytes(wire) + ok)
     assert parsed == []
     assert s._closed[0][0] == SessionCloseCode.PROTOCOL_VIOLATION
@@ -148,11 +155,25 @@ async def test_a_body_past_its_length_closes_the_session(draft):
 
 
 @pytest.mark.parametrize("draft", [14, 16, 18])
+async def test_a_body_short_of_its_length_closes_the_session(draft):
+    # Declare one byte more than the body holds and supply it: the
+    # decoder stops short of the Length.
+    s = _control_session(draft)
+    parsed = _spy_parses(s)
+    wire = bytearray(_ok_wire(s))
+    declared = int.from_bytes(wire[1:3], "big")
+    wire[1:3] = (declared + 1).to_bytes(2, "big")
+    _feed_reply(s, bytes(wire) + b"\x00")
+    assert parsed == []
+    assert s._closed[0][0] == SessionCloseCode.PROTOCOL_VIOLATION
+    assert "short of its Length" in s._closed[0][1]
+
+
+@pytest.mark.parametrize("draft", [14, 16, 18])
 async def test_two_messages_one_event(draft):
     s = _control_session(draft)
     parsed = _spy_parses(s)
-    one = bytes(RequestOk(request_id=7, parameters={}).serialize(
-        prof=s._profile).data)
+    one = _ok_wire(s)
     _feed_reply(s, one + one)
     assert len(parsed) == 2        # both whole messages drained
     assert s._closed == []
@@ -165,8 +186,7 @@ async def test_request_bidi_split_reassembles(draft):
     s = _control_session(draft)
     parsed = _spy_parses(s)
     s._bidi_stream_requests[5] = 7   # stream bound to request 7
-    wire = bytes(RequestOk(request_id=7, parameters={}).serialize(
-        prof=s._profile).data)
+    wire = _ok_wire(s)
     s._on_control_data(5, wire[:2], False, is_request_bidi=True)
     assert parsed == []
     assert s._closed == []
@@ -226,8 +246,7 @@ async def test_fin_with_truncated_message_pops_chain():
     # released (not pinned until session close), and the control stream
     # case is a protocol violation.
     s = _control_session(18)
-    wire = bytes(RequestOk(request_id=7, parameters={}).serialize(
-        prof=s._profile).data)
+    wire = _ok_wire(s)
     s._on_control_data(5, wire[:2], True)          # header only + FIN
     assert 5 not in s._control_chains              # released, not pinned
 
@@ -511,8 +530,7 @@ async def test_malformed_body_closes_not_stalls(draft):
     from aiomoqt.utils.buffer import Buffer
     s = _control_session(draft)
     parsed = _spy_parses(s)
-    wire = bytes(RequestOk(request_id=7, parameters={}).serialize(
-        prof=s._profile).data)
+    wire = _ok_wire(s)
     hdr = Buffer(data=wire)
     hdr.vi64 = s._profile.vi64
     hdr.pull_vint()
@@ -569,11 +587,51 @@ async def test_message_and_a_half(draft):
     # One whole message plus a partial: parse the first, retain the rest.
     s = _control_session(draft)
     parsed = _spy_parses(s)
-    one = bytes(RequestOk(request_id=7, parameters={}).serialize(
-        prof=s._profile).data)
+    one = _ok_wire(s)
     _feed_reply(s, one + one[:2])
     assert len(parsed) == 1        # only the whole one
     assert s._closed == []
     _feed_reply(s, one[2:])
     assert len(parsed) == 2        # remainder completed
     assert s._closed == []
+
+
+# moq-contribution-interop-runner d18 SUBSCRIBE stimuli (server side, odd
+# Request ID 1, namespace "n", track "x").
+_RUNNER_WELL_FORMED = "0300070101016e017800"
+_RUNNER_MALFORMED = {
+    "forward-2": "0300090101016e0178011002",
+    "group-order-0": "0300090101016e0178012200",
+    "length-mismatch": "0300080101016e01780000",
+    "empty-namespace-field": "030006010100017800",
+    "range-overflow": "0300150101016e017801210c04" + "ff" * 9 + "0001",
+    "namespace-4097": "0310080101" + "9001" + "6e" * 4097 + "017800",
+    "full-track-name-4097": "0310070101016e" + "9000" + "78" * 4096 + "00",
+}
+
+
+def _runner_session():
+    from aiomoqt.types import MOQTMessageType
+    s = _control_session(18)
+    s.is_client = True
+    s._peer_request_max = -1
+    s._control_msg_overrides[MOQTMessageType.SUBSCRIBE] = _noop_handler
+    return s
+
+
+async def test_runner_well_formed_subscribe_keeps_the_session():
+    s = _runner_session()
+    s._on_control_data(1, bytes.fromhex(_RUNNER_WELL_FORMED), False,
+                       is_request_bidi=True)
+    await asyncio.sleep(0)
+    assert s._closed == []
+
+
+@pytest.mark.parametrize("case", sorted(_RUNNER_MALFORMED))
+async def test_runner_malformed_subscribe_closes_the_session(case):
+    s = _runner_session()
+    s._on_control_data(1, bytes.fromhex(_RUNNER_MALFORMED[case]), False,
+                       is_request_bidi=True)
+    await asyncio.sleep(0)
+    assert s._closed
+    assert s._closed[0][0] == SessionCloseCode.PROTOCOL_VIOLATION

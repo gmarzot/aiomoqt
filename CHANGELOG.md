@@ -11,6 +11,13 @@
 - Fix: `moqt://` URLs keep their path, and native-QUIC SETUP PATH is the URI's
   path-abempty plus query (`moqt://host/anon` sent `/`; a `/` path sent `//`).
 - Fix: an original publisher's d18 subgroup header sets FIRST_OBJECT (§2.2 MUST).
+- Fix: a control message whose body ends short of its Length closes the session with
+  PROTOCOL_VIOLATION instead of being skipped.
+- Fix: a Full Track Name over 4096 bytes closes the session; at d16+ so do an empty
+  namespace field, a namespace over 4096 bytes, and FORWARD, GROUP_ORDER,
+  SUBSCRIBER_PRIORITY or DEFAULT_PUBLISHER_GROUP_ORDER outside their ranges (§2.4.1, §10.2).
+- Fix: a d18 AbsoluteRange whose End Group passes 2^64-1 closes the session (§5.1.2).
+- Fix: GROUP_ORDER `PUBLISHER_DEFAULT` (0) is omitted at d16+ instead of sent.
 - `moq_interop_client`: `data-subgroup-basic` data-plane test, in the standard set.
 - `moq_interop_client`: `rendezvous-timeout` test, in the standard set; SKIP below d18.
 - `moq_interop_client`: with no `--draft`/`DRAFT`, probes `18,16,14` (newest first) instead

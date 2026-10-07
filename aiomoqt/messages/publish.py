@@ -97,10 +97,8 @@ class Publish(MOQTMessage):
         # have no length prefix; sequence runs to end of message).
         request_id = buf.pull_vint()
 
-        namespace = MOQTMessage._pull_tuple(buf)
-
-        track_name_len = buf.pull_vint()
-        track_name = buf.pull_bytes(track_name_len)
+        namespace, track_name = MOQTMessage._pull_full_track_name(
+            buf, prof=prof)
         track_alias = buf.pull_vint()
 
         group_order = None
@@ -132,6 +130,8 @@ class Publish(MOQTMessage):
             if track_extensions is not None:
                 go_val = track_extensions.pop(0x22, None)
                 if go_val is not None:
+                    MOQTMessage._check_range(
+                        "default publisher group order", go_val, 1, 2)
                     group_order = go_val
         else:
             group_order = buf.pull_uint8()
@@ -196,7 +196,8 @@ class PublishOk(MOQTMessage):
                 params[ParamType.FORWARD] = self.forward
             if self.priority is not None:
                 params[ParamType.SUBSCRIBER_PRIORITY] = self.priority
-            if self.group_order is not None:
+            # d16+ has no 0 value; omission means the publisher's order.
+            if self.group_order not in (None, GroupOrder.PUBLISHER_DEFAULT):
                 params[ParamType.GROUP_ORDER] = self.group_order
             if self.filter_type is not None:
                 # Filter internals follow the negotiated varint codec
@@ -278,6 +279,9 @@ class PublishOk(MOQTMessage):
                     if prof.vi64:
                         # d18: End Group arrives as a delta from Start.
                         end_group += start_group or 0
+                        if end_group > (1 << 64) - 1:
+                            raise MOQTProtocolViolation(
+                                f"end group {end_group} exceeds 2^64-1")
         else:
             forward = buf.pull_uint8()
             priority = buf.pull_uint8()

@@ -91,7 +91,8 @@ class Fetch(MOQTMessage):
             params = dict(self.parameters)
             if self.subscriber_priority is not None:
                 params[ParamType.SUBSCRIBER_PRIORITY] = self.subscriber_priority
-            if self.group_order is not None:
+            # d16+ has no 0 value; omission means Ascending.
+            if self.group_order not in (None, GroupOrder.PUBLISHER_DEFAULT):
                 params[ParamType.GROUP_ORDER] = self.group_order
             MOQTMessage._serialize_params(payload, params, prof=prof)
         else:
@@ -125,9 +126,8 @@ class Fetch(MOQTMessage):
             fetch_type = buf.pull_vint()
 
         if fetch_type == FetchType.STANDALONE:
-            namespace = MOQTMessage._pull_tuple(buf)
-            track_name_len = buf.pull_vint()
-            track_name = buf.pull_bytes(track_name_len)
+            namespace, track_name = MOQTMessage._pull_full_track_name(
+                buf, prof=prof)
             start_group = buf.pull_vint()
             start_object = buf.pull_vint()
             end_group = buf.pull_vint()
@@ -203,7 +203,7 @@ class FetchOk(MOQTMessage):
             params = dict(self.parameters)
             # §10.2.8: GROUP_ORDER may appear in SUBSCRIBE, PUBLISH_OK
             # or FETCH — not FETCH_OK; a d18 peer MUST close on it.
-            if self.group_order is not None and prof.draft < 18:
+            if self.group_order and prof.draft < 18:
                 params[ParamType.GROUP_ORDER] = self.group_order
             MOQTMessage._serialize_params(payload, params, prof=prof)
             MOQTMessage._extensions_encode(payload, self.track_extensions or {}, with_length=False, delta=True)
