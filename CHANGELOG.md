@@ -47,6 +47,11 @@
   subscriber attaches still reaches it.
 - Fix: `moq_interop_client`: a relay that never forwards PUBLISH_DONE fails
   `data-subgroup-basic` instead of crashing the run; a test that raises is reported as FAIL.
+- pub_media: `--input URL` publishes HLS, DASH or anything FFmpeg opens as CMAF tracks;
+  `--rendition best|all`. Needs the `media` extra (PyAV).
+- media: `send_frame(group_id=)` opens the named group at a key frame.
+- media: `set_chunk_timing()`, `strip_edit_lists()`, `init_codec_string()`,
+  `hvcc_codec_string()`.
 - `moq_interop_client` / `moq_interop_relay`: a pinned `DRAFT` aiomoqt cannot speak is
   reported (TAP skip-all, exit 127) or refused at start, instead of a traceback.
 - Fix: STOP_SENDING on a d18 request stream no longer discards the REQUEST_ERROR or

@@ -65,6 +65,9 @@ dev = [
     "ruff",
     "ty",
 ]
+media = [
+    "av>=19",
+]
 examples = [
     "argparse",
 ]

@@ -29,6 +29,9 @@ Pure Python. `aiopquic` (the QUIC transport) installs as a binary wheel automati
 
 For a clean, uv-managed `.venv`, run `./bootstrap_python.sh`.
 
+HLS/DASH ingest (`pub_media --input`) needs PyAV, an optional extra:
+`uv pip install 'aiomoqt[media]'`. Without it, `--input` exits with that hint.
+
 ## Quick start
 
 ### 1. Verify the install and reach a relay
@@ -181,6 +184,10 @@ python -m aiomoqt.tools.pub_media $RELAY -N demo/live --mp4 clip.mp4 --loop \
 # Same content, CMAF packaging (requires --mp4)
 python -m aiomoqt.tools.pub_media $RELAY -N cmsf/live --mp4 clip.mp4 --packaging cmaf --loop
 
+# HLS or DASH (anything FFmpeg opens) as CMAF; --rendition all = every video
+# rendition as one alternate group (needs aiomoqt[media])
+python -m aiomoqt.tools.pub_media $RELAY -N vod --input https://cdn.example/master.m3u8 -t 3600
+
 # Live H.264 Annex-B ingest (OBS / ffmpeg pipe); frames stamped on arrival
 ffmpeg -i 'srt://0.0.0.0:9000?mode=listener' -map 0:v -c:v copy -f h264 - \
   | python -m aiomoqt.tools.pub_media $RELAY -N obs --h264 - --no-audio
@@ -254,7 +261,7 @@ Each tool runs as a module (`python -m aiomoqt.tools.NAME`) and most also instal
 | Module | Console script | Purpose |
 |---|---|---|
 | `aiomoqt.versions` | `aiomoqt-versions` | version report (aiomoqt, aiopquic, picoquic/picotls SHAs) |
-| `tools.pub_media` | — | MSF/LOC/CMAF media publisher (mp4, live H.264, tone) |
+| `tools.pub_media` | — | MSF/LOC/CMAF media publisher (mp4, live H.264, MPEG-TS, HLS/DASH, tone) |
 | `tools.sub_media` | — | catalog-driven media subscriber; writes playable files or measures delivery (`--analyze`) |
 | `tools.pub_bench` | `moq-pub-bench` | publisher benchmark |
 | `tools.sub_bench` | `moq-sub-bench` | subscriber benchmark — latency, jitter, loss |
