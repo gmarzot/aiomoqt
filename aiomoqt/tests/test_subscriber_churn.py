@@ -7,13 +7,14 @@ stays up throughout.
 """
 import asyncio
 import time
+from collections import OrderedDict
 from types import SimpleNamespace
 
 import pytest
 
 from aiomoqt.context import profile_for
 from aiomoqt.messages.subscribe import SubscribeDone, Unsubscribe
-from aiomoqt.protocol import _MOQTSessionMixin
+from aiomoqt.protocol import _DataStreamState, _MOQTSessionMixin
 from aiomoqt.track import PublishedTrack
 from aiomoqt.types import ForwardingPreference
 
@@ -39,6 +40,7 @@ def _session(draft=18):
     s._stream_torn_down_last_sweep = time.monotonic()
     s._stream_torn_down_evict_after = 30.0
     s._stream_end_handlers = {}
+    s._early_stream_ends = OrderedDict()
     s._fetch_done_futures = {}
     s._fetch_stream_by_request = {}
     s._group_bound = {}
@@ -300,3 +302,38 @@ async def test_a_returning_subscriber_gets_objects_again():
             assert session._close_err is None
     finally:
         server.close()
+
+
+def _end_stream(s, sid, alias, group_id=0, subgroup_id=0):
+    s._data_streams[sid] = _DataStreamState(
+        chain=None, key=("subgroup", (alias, group_id, subgroup_id)))
+    s._cleanup_stream(sid)
+
+
+def test_a_stream_that_ends_before_its_handler_is_reported_on_registration():
+    # A one-object stream can FIN before the subscriber registers.
+    s = _session()
+    _end_stream(s, 3, alias=7, group_id=0, subgroup_id=0)
+    got = []
+    s.register_stream_end_handler(7, lambda g, sg, clean, reset_code:
+                                  got.append((g, sg, clean)))
+    assert got == [(0, 0, True)]
+    s.register_stream_end_handler(7, lambda *a, **kw: got.append(a))
+    assert got == [(0, 0, True)]          # reported once
+
+
+def test_an_early_stream_end_past_the_hold_is_dropped():
+    s = _session()
+    s.EARLY_STREAM_END_HOLD_S = 0.0
+    _end_stream(s, 3, alias=7)
+    got = []
+    s.register_stream_end_handler(7, lambda *a, **kw: got.append(a))
+    assert got == []
+
+
+def test_early_stream_ends_are_bounded():
+    s = _session()
+    s.EARLY_STREAM_END_MAX = 2
+    for sid, alias in ((3, 1), (7, 2), (11, 3)):
+        _end_stream(s, sid, alias=alias)
+    assert list(s._early_stream_ends) == [2, 3]

@@ -5,6 +5,7 @@ streams, and keep the session up. Stream-end handlers see the reset
 code (a relay terminates downstream from it)."""
 import asyncio
 import time
+from collections import OrderedDict
 
 import pytest
 
@@ -30,6 +31,7 @@ def _stub():
     s._stream_torn_down_last_sweep = time.monotonic()
     s._stream_torn_down_evict_after = 30.0
     s._stream_end_handlers = {}
+    s._early_stream_ends = OrderedDict()
     s._fetch_done_futures = {}
     s._subgroup_stream_by_key = {}
     s._fetch_stream_by_request = {}
