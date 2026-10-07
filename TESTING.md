@@ -239,6 +239,25 @@ The published image is `ghcr.io/gmarzot/aiomoqt:<version>` and
 PR. No local action is required to keep this path green — the release
 workflow pushes a fresh image on every tag.
 
+## Contribution conformance (publisher)
+
+`tests/contrib/sweep.py` scores aiomoqt's publisher under
+[moq-contribution-interop-runner](https://github.com/mondain/moq-contribution-interop-runner).
+The runner drives `pub_bench` through `tests/contrib/aiomoqt-adapter.sh` in every d18
+native-QUIC scenario that needs no FETCH; the script compares the scored requirements with
+`tests/contrib/baseline.json`. CI runs it in `contrib-conformance.yml` on pushes to `main` and
+`gmarzot-0.12.0` and on PRs labelled `ci:run-conformance`, report-only for now.
+
+Build the runner at the commit in `.github/contrib-runner-pin`, then:
+
+```bash
+python tests/contrib/sweep.py --runner ../moq-contribution-interop-runner/build/moq-interop-runner --out /tmp/contrib
+```
+
+`--gate` exits 1 when a baseline row no longer passes. A fix that adds passes refreshes the
+baseline with `--write-baseline` in the same commit. The adapter needs `jq`; a sweep takes
+about 13 minutes.
+
 ---
 
 ## Known Issues

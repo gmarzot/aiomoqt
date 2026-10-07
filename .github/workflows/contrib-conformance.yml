@@ -1,0 +1,97 @@
+name: Contribution conformance
+
+# Publisher conformance under moq-contribution-interop-runner: the runner
+# drives aiomoqt's publisher (pub_bench, via tests/contrib/aiomoqt-adapter.sh)
+# through every d18 native-QUIC scenario that needs no FETCH and scores each
+# draft requirement. tests/contrib/sweep.py compares the outcomes with
+# tests/contrib/baseline.json and writes the job summary.
+#
+# Report-only: a regression is listed, not failed. Add --gate to the sweep
+# step to fail on one.
+#
+# The runner commit is pinned in .github/contrib-runner-pin. PR opt-in is
+# the `ci:run-conformance` label (label event only; toggle it to re-run).
+
+on:
+  push:
+    branches: [main, gmarzot-0.12.0]
+  pull_request:
+    types: [labeled]
+  workflow_dispatch:
+
+# Per commit: a sweep measures one commit and takes ~15 minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.sha }}
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  sweep:
+    name: contribution runner (d18, native QUIC)
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.label.name == 'ci:run-conformance'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-aiomoqt
+
+      - name: Resolve the pinned runner
+        id: pin
+        run: |
+          PIN=$(grep -vE '^[[:space:]]*(#|$)' .github/contrib-runner-pin | head -n1)
+          echo "repo=${PIN%@*}" >> "$GITHUB_OUTPUT"
+          echo "sha=${PIN#*@}" >> "$GITHUB_OUTPUT"
+
+      - name: Install runner build and runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake g++ libsqlite3-dev libssl-dev jq
+
+      - name: Cache the runner install
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: runner-install
+          key: contrib-runner-${{ steps.pin.outputs.sha }}-ubuntu-24.04
+
+      # Same configuration as the runner's Dockerfile.
+      - name: Build the runner
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --filter=blob:none \
+            "https://github.com/${{ steps.pin.outputs.repo }}" runner-src
+          git -C runner-src checkout --detach "${{ steps.pin.outputs.sha }}"
+          cmake -S runner-src -B runner-build -DCMAKE_BUILD_TYPE=Release \
+            -DMOQ_INTEROP_BUILD_TESTS=OFF \
+            -DMOQ_INTEROP_SOURCE_REVISION="${{ steps.pin.outputs.sha }}"
+          cmake --build runner-build --parallel 4
+          cmake --install runner-build --prefix "$PWD/runner-install"
+
+      - name: Sweep
+        run: |
+          python tests/contrib/sweep.py \
+            --runner runner-install/bin/moq-interop-runner \
+            --runner-data runner-install/share/moq-interop \
+            --out contrib-out
+
+      - name: Upload results and publisher logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: contrib-conformance-${{ github.sha }}
+          path: |
+            contrib-out/summary.md
+            contrib-out/outcomes.json
+            contrib-out/runner.log
+            contrib-out/results/
+            contrib-out/driver-logs/
+          if-no-files-found: warn
+          retention-days: 14
