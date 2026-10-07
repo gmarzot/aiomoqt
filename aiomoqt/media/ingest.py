@@ -15,11 +15,18 @@ from __future__ import annotations
 import asyncio
 import collections
 import concurrent.futures
+import os
+import ssl
 import struct
 import threading
+import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from fractions import Fraction
 from typing import AsyncIterator, Deque, Dict, List, Optional, Tuple
+
+import certifi
 
 from ..utils.logger import get_logger
 from .cmaf import (
@@ -42,6 +49,8 @@ _VIDEO_CODECS = frozenset(('h264', 'hevc', 'av1'))
 _AUDIO_CODECS = frozenset(('aac', 'opus'))
 _PRIME_LIMIT = Fraction(10)  # media seconds to wait for every track's header
 _QUEUE_SIZE = 256
+_HTTP_TIMEOUT = 30.0
+_HTTP_ATTEMPTS = 3
 
 
 class IngestError(RuntimeError):
@@ -55,6 +64,75 @@ def load_av():
     except ImportError as e:
         raise ImportError(f"media ingest needs PyAV: {INSTALL_HINT}") from e
     return av
+
+
+def tls_context() -> ssl.SSLContext:
+    """Verifying client context: SSL_CERT_FILE when set, else certifi."""
+    return ssl.create_default_context(
+        cafile=os.environ.get('SSL_CERT_FILE') or certifi.where())
+
+
+def http_get(url: str, ctx: ssl.SSLContext, headers: Optional[dict] = None):
+    """urlopen() retried on timeouts, connection errors and 5xx; 4xx and
+    certificate failures raise at once."""
+    request = urllib.request.Request(url, headers=headers or {})
+    for attempt in range(1, _HTTP_ATTEMPTS + 1):
+        try:
+            return urllib.request.urlopen(request, context=ctx,
+                                          timeout=_HTTP_TIMEOUT)
+        except urllib.error.HTTPError as e:
+            if e.code < 500 or attempt == _HTTP_ATTEMPTS:
+                raise
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            if (attempt == _HTTP_ATTEMPTS
+                    or isinstance(getattr(e, 'reason', None), ssl.SSLError)):
+                raise
+        time.sleep(0.5 * attempt)
+
+
+class _HttpReader:
+    """One HTTP(S) response as a read-only file for FFmpeg, limited to the
+    byte range FFmpeg asks for (also when the server ignores Range)."""
+
+    def __init__(self, url: str, options: dict, ctx: ssl.SSLContext):
+        start = int(options.get('offset') or 0)
+        end = int(options.get('end_offset') or 0)
+        headers = {}
+        if start or end:
+            headers['Range'] = f"bytes={start}-{end - 1 if end else ''}"
+        self._resp = http_get(url, ctx, headers)
+        ranged = self._resp.status == 206
+        self._skip = 0 if ranged else start
+        self._left = (end - start) if end else None
+
+    def read(self, n: int) -> bytes:
+        while self._skip:
+            dropped = self._resp.read(min(self._skip, 1 << 16))
+            if not dropped:
+                return b''
+            self._skip -= len(dropped)
+        if self._left is not None:
+            n = min(n, self._left)
+        data = self._resp.read(n) if n else b''
+        if self._left is not None:
+            self._left -= len(data)
+        return data
+
+    def close(self) -> None:
+        self._resp.close()
+
+
+def _io_open(ctx: ssl.SSLContext):
+    """PyAV io_open hook: every FFmpeg request (playlists, segments, live
+    reloads) goes through _HttpReader, since the TLS library in PyAV's
+    wheels does not find the system CA store on every platform."""
+    def io_open(url, flags, options):
+        if url.startswith('crypto'):
+            raise OSError("encrypted HLS segments are not supported")
+        if not url.startswith(('http://', 'https://')):
+            raise OSError(f"unsupported URL: {url[:80]}")
+        return _HttpReader(url, options, ctx)
+    return io_open
 
 
 @dataclass
@@ -255,12 +333,16 @@ class Ingest:
     track has its CMAF header): run it in an executor."""
 
     def __init__(self, url: str, rendition: str = 'best', audio: bool = True,
-                 timeout: Optional[Tuple[float, float]] = (15.0, 30.0)):
+                 timeout: Optional[Tuple[float, float]] = (15.0, 30.0),
+                 ssl_context: Optional[ssl.SSLContext] = None):
         if rendition not in RENDITIONS:
             raise ValueError(f"rendition must be one of {RENDITIONS}")
         av = load_av()
         self.url = url
-        self._container = av.open(url, timeout=timeout)
+        kwargs = {}
+        if url.startswith(('http://', 'https://')):
+            kwargs['io_open'] = _io_open(ssl_context or tls_context())
+        self._container = av.open(url, timeout=timeout, **kwargs)
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._shift = Fraction(0)

@@ -7,6 +7,7 @@ import functools
 import http.server
 import io
 import os
+import ssl
 import sys
 import threading
 from fractions import Fraction
@@ -66,9 +67,10 @@ async def test_input_without_pyav_exits_with_the_install_hint(monkeypatch):
 
 # -- fixtures -----------------------------------------------------------
 
-def _write_ladder(root: str, segment_type: str) -> None:
+def _write_ladder(root: str, segment_type: str, single_file=False) -> None:
     """A two-rendition HLS ladder (H.264 + AAC muxed per variant, 1 s
-    segments, B-frames) plus its master playlist."""
+    segments, B-frames) plus its master playlist; single_file addresses
+    segments by byte range."""
     av = load_av()
     variants = []
     for idx, (w, h, bitrate) in enumerate(_RUNGS):
@@ -77,6 +79,9 @@ def _write_ladder(root: str, segment_type: str) -> None:
         opts = {'hls_time': '1', 'hls_playlist_type': 'vod',
                 'hls_segment_type': segment_type,
                 'hls_segment_filename': os.path.join(root, f"{name}_%03d.{ext}")}
+        if single_file:
+            opts['hls_flags'] = 'single_file'
+            opts['hls_segment_filename'] = os.path.join(root, f"{name}.{ext}")
         if segment_type == 'fmp4':
             opts['hls_fmp4_init_filename'] = f"{name}_init.mp4"
         out = av.open(os.path.join(root, f"{name}.m3u8"), 'w', format='hls',
@@ -117,27 +122,55 @@ def ladders(tmp_path_factory):
         root = tmp_path_factory.mktemp(segment_type)
         _write_ladder(str(root), segment_type)
         out[segment_type] = root
+    root = tmp_path_factory.mktemp('fmp4-single')
+    _write_ladder(str(root), 'fmp4', single_file=True)
+    out['fmp4-single'] = root
     return out
 
 
 class _Origin:
-    """Static HTTP origin over a ladder; logs request paths."""
+    """Static HTTP(S) origin over a ladder; logs request paths and Range
+    headers, and answers Range requests unless honor_range is False."""
 
-    def __init__(self, root):
+    def __init__(self, root, tls=False, honor_range=True):
         hits = self.hits = []
+        ranges = self.ranges = []
 
         class Handler(http.server.SimpleHTTPRequestHandler):
             def do_GET(self):
                 hits.append(self.path)
-                super().do_GET()
+                spec = self.headers.get('Range')
+                if spec:
+                    ranges.append(spec)
+                if not (spec and honor_range):
+                    return super().do_GET()
+                with open(self.translate_path(self.path), 'rb') as f:
+                    data = f.read()
+                first, _, last = spec.split('=', 1)[1].partition('-')
+                first, last = int(first), int(last) if last else len(data) - 1
+                body = data[first:last + 1]
+                self.send_response(206)
+                self.send_header('Content-Range',
+                                 f"bytes {first}-{last}/{len(data)}")
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
 
             def log_message(self, *args):
                 pass
 
         self._srv = http.server.ThreadingHTTPServer(
             ('127.0.0.1', 0), functools.partial(Handler, directory=str(root)))
+        scheme = 'http'
+        if tls:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(CERT, KEY)
+            self._srv.socket = ctx.wrap_socket(self._srv.socket,
+                                               server_side=True)
+            scheme = 'https'
         threading.Thread(target=self._srv.serve_forever, daemon=True).start()
-        self.url = f"http://127.0.0.1:{self._srv.server_address[1]}/master.m3u8"
+        port = self._srv.server_address[1]
+        self.url = f"{scheme}://127.0.0.1:{port}/master.m3u8"
 
     def close(self):
         self._srv.shutdown()
@@ -151,9 +184,9 @@ def origin(request, ladders):
     o.close()
 
 
-async def _open(url, rendition):
+async def _open(url, rendition, **kwargs):
     return await asyncio.get_running_loop().run_in_executor(
-        None, functools.partial(Ingest, url, rendition))
+        None, functools.partial(Ingest, url, rendition, **kwargs))
 
 
 async def _drain(ingest):
@@ -224,6 +257,42 @@ async def test_chunks_carry_the_source_timeline(origin):
             decoded = sum(1 for _ in c.decode(c.streams[0]))
         assert pts == expected[track.name], track.name
         assert decoded >= len(pts) - 2, track.name  # decoder may hold priming
+
+
+@requires_certs
+async def test_https_input_verifies_the_origin(ladders):
+    origin = _Origin(ladders['fmp4'], tls=True)
+    try:
+        with pytest.raises(Exception, match='CERTIFICATE_VERIFY_FAILED'):
+            await _open(origin.url, 'best')
+        ctx = ssl.create_default_context(cafile=CERT)
+        ctx.check_hostname = False  # CI's cert names no IP address
+        ingest = await _open(origin.url, 'best', ssl_context=ctx)
+        chunks = await _drain(ingest)
+    finally:
+        origin.close()
+    assert len(chunks['video']) == _SECONDS * _FPS and chunks['audio']
+
+
+@pytest.mark.parametrize('honor_range', [True, False],
+                         ids=['206', 'ignores-range'])
+async def test_byte_range_segments(ladders, honor_range):
+    av = load_av()
+    origin = _Origin(ladders['fmp4-single'], honor_range=honor_range)
+    try:
+        ingest = await _open(origin.url, 'best')
+        expected = _source_pts(str(ladders['fmp4-single'] / 'master.m3u8'),
+                               ingest)
+        chunks = await _drain(ingest)
+    finally:
+        origin.close()
+    assert origin.ranges
+    video = ingest.tracks[0]
+    data = video.init + b''.join(c.payload for c in chunks['video'])
+    with av.open(io.BytesIO(data)) as c:
+        pts = [p.pts * Fraction(p.time_base) for p in c.demux(c.streams[0])
+               if p.dts is not None]
+    assert pts == expected['video']
 
 
 async def test_ingest_catalog_alternate_group(origin):
