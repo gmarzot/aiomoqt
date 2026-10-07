@@ -7,6 +7,7 @@
     "insecure":         "bool; if true, pass --tls-disable-verify / -k (default false)",
     "disabled":         "bool; if true, skip this relay entirely (default false)",
     "disabled_suites":  "list of interop suite names to skip for this relay",
+    "xfail_suites":     "list of interop suites that run and report but never gate for this relay: a documented peer non-conformance the case correctly fails on",
     "compat":           "list of WIRE tolerance keys passed to the tools as --compat (libquicr, lenient-extensions, ...); the tools reject unknown values",
     "gating":           "list of draft numbers whose results gate CI (a FAIL fails the job). Absent/empty = non-gating: the relay still runs and reports, but its failures are XFAIL and never gate. Curate this to endpoints we hold ourselves to.",
     "notes":            "freeform (optional)"
@@ -80,7 +81,8 @@
       "insecure": true,
       "compat": ["libquicr"],
       "disabled_suites": [],
-      "notes": "Cisco libquicr (server cert unacceptable → insecure). d14 dropped (raw + WT now unresponsive — relay appears d16-only). compat=libquicr covers two non-spec behaviors, tolerated + annotated: (1) relay returns SUBSCRIBE_OK for a nonexistent track (deferred-delivery policy); (2) relay returns FETCH_ERROR code=0 (INTERNAL_ERROR) for a nonexistent-track FETCH — the fetch probe honors libquicr code=0 as a deliberate refusal (the relay answered structurally in ~85ms; it just uses a poor code), matching how the join probe already accepted its non-spec code=17. Without --compat the fetch probe still fails code=0 by default (0.9.12 stance: 0x0 is not a refusal)."
+      "xfail_suites": ["relay-data"],
+      "notes": "Cisco libquicr (server cert unacceptable → insecure). d14 dropped (raw + WT now unresponsive — relay appears d16-only). compat=libquicr covers two non-spec behaviors, tolerated + annotated: (1) relay returns SUBSCRIBE_OK for a nonexistent track (deferred-delivery policy); (2) relay returns FETCH_ERROR code=0 (INTERNAL_ERROR) for a nonexistent-track FETCH — the fetch probe honors libquicr code=0 as a deliberate refusal (the relay answered structurally in ~85ms; it just uses a poor code), matching how the join probe already accepted its non-spec code=17. Without --compat the fetch probe still fails code=0 by default (0.9.12 stance: 0x0 is not a refusal). relay-data XFAIL: libquicr never forwards PUBLISH_DONE downstream (§10.11), so data-subgroup-basic fails with \"no downstream PUBLISH_DONE\"."
     },
     {
       "name": "moqtail",
