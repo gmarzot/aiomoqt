@@ -319,8 +319,8 @@ class PublishBlocked(MOQTMessage):
 
     @classmethod
     def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'PublishBlocked':
-        namespace_suffix = MOQTMessage._pull_tuple(buf, prof=prof)
-        track_name = buf.pull_bytes(buf.pull_vint())
+        namespace_suffix, track_name = MOQTMessage._pull_full_track_name(
+            buf, prof=prof)
         return cls(namespace_suffix=namespace_suffix, track_name=track_name)
 
 

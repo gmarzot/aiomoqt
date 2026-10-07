@@ -132,16 +132,24 @@ class MOQTMessage:
         return buf.pull_bytes(n).decode()
 
     @staticmethod
-    def _pull_tuple(buf: Buffer, *, prof: DraftProfile) -> tuple:
+    def _pull_tuple(buf: Buffer, *, prof: DraftProfile,
+                    buf_end: Optional[int] = None) -> tuple:
         """Track Namespace tuple; over the maximum field count is a
         protocol violation, and at d16+ so is an empty field or a
-        namespace over FULL_TRACK_NAME_MAX bytes."""
+        namespace over FULL_TRACK_NAME_MAX bytes. With buf_end, a field
+        that would run past it is refused before it is read."""
         n = buf.pull_vint()
         if n > MOQTMessage.NAMESPACE_MAX_FIELDS:
             raise MOQTProtocolViolation(
                 f"namespace has {n} fields "
                 f"(max {MOQTMessage.NAMESPACE_MAX_FIELDS})")
-        parts = tuple(buf.pull_bytes(buf.pull_vint()) for _ in range(n))
+        fields = []
+        for _ in range(n):
+            flen = buf.pull_vint()
+            if buf_end is not None and buf.tell() + flen > buf_end:
+                raise MOQTProtocolViolation("namespace field overruns frame")
+            fields.append(buf.pull_bytes(flen))
+        parts = tuple(fields)
         if prof.draft >= 16:
             if not all(parts):
                 raise MOQTProtocolViolation("empty namespace field")
@@ -748,7 +756,8 @@ class MOQTMessage:
                 elif kind == "varint":
                     param_value = buf.pull_vint()
                 elif kind == "tuple":
-                    param_value = MOQTMessage._pull_tuple(buf, prof=prof)
+                    param_value = MOQTMessage._pull_tuple(
+                        buf, prof=prof, buf_end=buf_end)
                 else:  # length-prefixed bytes
                     param_len = buf.pull_vint()
                     if param_len > 65535:

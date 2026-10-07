@@ -145,8 +145,9 @@ class Fetch(MOQTMessage):
         if is_draft16_or_later(prof.draft):
             subscriber_priority = params.pop(
                 ParamType.SUBSCRIBER_PRIORITY, 128)
+            # Omitted: the receiver uses Ascending (§10.2.8).
             group_order = params.pop(
-                ParamType.GROUP_ORDER, GroupOrder.DESCENDING)
+                ParamType.GROUP_ORDER, GroupOrder.ASCENDING)
 
         return cls(
             fetch_type=fetch_type,
@@ -234,7 +235,8 @@ class FetchOk(MOQTMessage):
             largest_group_id = buf.pull_vint()
             largest_object_id = buf.pull_vint()
             params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
-            group_order = params.pop(ParamType.GROUP_ORDER, GroupOrder.DESCENDING)
+            # Omitted: the order the FETCH asked for applies.
+            group_order = params.pop(ParamType.GROUP_ORDER, None)
             track_extensions = MOQTMessage._extensions_decode(
                 buf, with_length=False, buf_end=buf_end, delta=True)
         else:

@@ -591,12 +591,78 @@ def test_default_publisher_group_order_out_of_range(draft, value):
 @pytest.mark.parametrize("draft", [16, 18])
 def test_publisher_default_group_order_is_omitted(draft):
     # d16+ GROUP_ORDER has no 0 value; omission means the publisher's.
+    # Request ID 128 encodes differently per draft (40 80 / 80 80).
     prof = profile_for(draft)
-    raw = bytes(Subscribe(request_id=0, track_namespace=(b"n",),
+    raw = bytes(Subscribe(request_id=128, track_namespace=(b"n",),
                           track_name=b"t", filter_type=2,
                           group_order=GroupOrder.PUBLISHER_DEFAULT,
                           ).serialize(prof=prof).data)
+    # Request ID, namespace (n), name (t), then one parameter:
+    # SUBSCRIPTION_FILTER (0x21) holding LatestObject (2). No 0x22.
+    body = (_ref_vint(draft, 128) + b"\x01\x01n\x01t"
+            + b"\x01\x21\x01\x02")
+    assert raw == b"\x03" + len(body).to_bytes(2, "big") + body
     off = _subscribe_body_off(raw)
     got = Subscribe.deserialize(Buffer(data=raw[off:], vi64=prof.vi64),
                                 prof=prof, buf_end=len(raw) - off)
     assert got.group_order is None
+
+
+from aiomoqt.messages.fetch import Fetch, FetchOk  # noqa: E402
+from aiomoqt.messages.namespace import PublishBlocked  # noqa: E402
+from aiomoqt.messages.request import RequestError  # noqa: E402
+
+
+@pytest.mark.parametrize("draft", [16, 18])
+def test_fetch_without_group_order_is_ascending(draft):
+    # §10.2.8: omitted from FETCH, the receiver uses Ascending.
+    # Standalone FETCH of n/t, locations 0/0..0/0, no parameters.
+    prof = profile_for(draft)
+    body = (_ref_vint(draft, 2) + b"\x01" + b"\x01\x01n\x01t"
+            + b"\x00\x00\x00\x00" + b"\x00")
+    got = Fetch.deserialize(Buffer(data=body, vi64=prof.vi64), prof=prof,
+                            buf_end=len(body))
+    assert got.group_order == GroupOrder.ASCENDING
+
+
+@pytest.mark.parametrize("draft", [16, 18])
+def test_fetch_ok_without_group_order_leaves_the_requested_order(draft):
+    # [Request ID], End Of Track 0, Largest Location 5/3, no parameters.
+    prof = profile_for(draft)
+    head = b"" if draft >= 18 else _ref_vint(draft, 7)
+    body = head + b"\x00\x05\x03\x00"
+    got = FetchOk.deserialize(Buffer(data=body, vi64=prof.vi64), prof=prof,
+                              buf_end=len(body))
+    assert got.group_order is None
+
+
+def test_d18_publish_blocked_full_track_name_is_at_most_4096_bytes():
+    prof = profile_for(18)
+    ok = (b"\x01" + ref_vi64(4095) + b"n" * 4095 + b"\x01t")
+    assert PublishBlocked.deserialize(
+        Buffer(data=ok, vi64=True), prof=prof).track_name == b"t"
+    past = b"\x01\x01n" + ref_vi64(4096) + b"t" * 4096
+    with pytest.raises(MOQTProtocolViolation, match="full track name"):
+        PublishBlocked.deserialize(Buffer(data=past, vi64=True), prof=prof)
+
+
+def test_d18_redirect_full_track_name_is_at_most_4096_bytes():
+    # REQUEST_ERROR REDIRECT (0x34): retry 0, empty reason, empty URI,
+    # then namespace n and a 4096-byte name.
+    prof = profile_for(18)
+    body = (ref_vi64(0x34) + b"\x00\x00\x00" + b"\x01\x01n"
+            + ref_vi64(4096) + b"t" * 4096)
+    with pytest.raises(MOQTProtocolViolation, match="full track name"):
+        RequestError.deserialize(Buffer(data=body, vi64=True), prof=prof,
+                                 buf_end=len(body))
+
+
+def test_d18_namespace_parameter_field_past_the_frame_is_refused():
+    # One TRACK_NAMESPACE_PREFIX (0x34) parameter whose field claims
+    # 5 bytes where the frame holds 2.
+    prof = profile_for(18)
+    block = b"\x01" + ref_vi64(0x34) + b"\x01\x05ab"
+    with pytest.raises(MOQTProtocolViolation, match="overruns frame"):
+        MOQTMessage._deserialize_params(
+            Buffer(data=block + b"xyz", vi64=True), prof=prof,
+            buf_end=len(block))

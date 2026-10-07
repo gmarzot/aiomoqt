@@ -28,6 +28,10 @@
   SUBSCRIBER_PRIORITY or DEFAULT_PUBLISHER_GROUP_ORDER outside their ranges (§2.4.1, §10.2).
 - Fix: a d18 AbsoluteRange whose End Group passes 2^64-1 closes the session (§5.1.2).
 - Fix: GROUP_ORDER `PUBLISHER_DEFAULT` (0) is omitted at d16+ instead of sent.
+- Fix: a FETCH without GROUP_ORDER is served ascending, and a FETCH_OK without it keeps the
+  order the FETCH asked for; both were decoded as descending (§10.2.8).
+- Fix: PUBLISH_BLOCKED and a REDIRECT's track name are held to the 4096-byte Full Track Name
+  limit.
 - Fix: a session closed for an error puts the MoQT error code on the wire at once
   (CONNECTION_CLOSE application error, or the WebTransport session close code); it sent
   nothing until the application exited, and then code 0.

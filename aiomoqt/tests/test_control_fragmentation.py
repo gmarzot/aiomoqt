@@ -624,11 +624,19 @@ def _runner_session():
 
 
 async def test_runner_well_formed_subscribe_keeps_the_session():
+    from aiomoqt.types import MOQTMessageType
     s = _runner_session()
+    seen = []
+
+    async def _record(session, msg):
+        seen.append((type(msg).__name__, msg.request_id))
+
+    s._control_msg_overrides[MOQTMessageType.SUBSCRIBE] = _record
     s._on_control_data(1, bytes.fromhex(_RUNNER_WELL_FORMED), False,
                        is_request_bidi=True)
     await asyncio.sleep(0)
     assert s._closed == []
+    assert seen == [("Subscribe", 1)]
 
 
 @pytest.mark.parametrize("case", sorted(_RUNNER_MALFORMED))
