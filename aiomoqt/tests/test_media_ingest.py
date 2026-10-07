@@ -114,6 +114,55 @@ def _write_ladder(root: str, segment_type: str, single_file=False) -> None:
         fh.write("#EXTM3U\n#EXT-X-VERSION:7\n" + "\n".join(variants) + "\n")
 
 
+def _write_dash(root: str, timeline: bool) -> None:
+    """A static DASH ladder: the two video rungs and AAC audio, 1 s
+    segments ($Time$ with SegmentTimeline, else $Number$). IDRs are forced
+    at every segment start, and rung 0 gets one more mid-segment, as a
+    scene cut would."""
+    av = load_av()
+    from av.video.frame import PictureType
+    opts = {'seg_duration': '1', 'use_template': '1',
+            'adaptation_sets': 'id=0,streams=v id=1,streams=a',
+            'use_timeline': '1' if timeline else '0'}
+    if timeline:
+        opts['media_seg_name'] = 'chunk-$RepresentationID$-$Time$.$ext$'
+    out = av.open(os.path.join(root, 'm.mpd'), 'w', format='dash', options=opts)
+    videos = []
+    for w, h, bitrate in _RUNGS:
+        v = out.add_stream('libx264', rate=_FPS, options={
+            'g': '1000', 'sc_threshold': '0', 'bf': '2', 'forced-idr': '1',
+            'preset': 'ultrafast'})
+        v.width, v.height, v.pix_fmt, v.bit_rate = w, h, 'yuv420p', bitrate
+        videos.append(v)
+    a = out.add_stream('aac', rate=48000, layout='mono')
+    for i in range(_SECONDS * _FPS):
+        for rung, v in enumerate(videos):
+            f = av.VideoFrame(v.width, v.height, 'yuv420p')
+            for plane in f.planes:
+                plane.update(bytes([16 + (i * 7) % 200]) * plane.buffer_size)
+            f.pts, f.time_base = i, Fraction(1, _FPS)
+            if i % _FPS == 0 or (rung == 0 and i == _FPS + _FPS // 2):
+                f.pict_type = PictureType.I
+            for pkt in v.encode(f):
+                out.mux(pkt)
+    for i in range(_SECONDS * 48000 // 1024):
+        f = av.AudioFrame(format='fltp', layout='mono', samples=1024)
+        f.planes[0].update(b'\x00' * f.planes[0].buffer_size)
+        f.sample_rate, f.pts, f.time_base = 48000, i * 1024, Fraction(1, 48000)
+        for pkt in a.encode(f):
+            out.mux(pkt)
+    for stream in (*videos, a):
+        for pkt in stream.encode():
+            out.mux(pkt)
+    out.close()
+    # FFmpeg names the first audio segment by its encoder-delay time (a
+    # negative $Time$) while its MPD timeline starts at 0.
+    for name in os.listdir(root):
+        if '--' in name:
+            os.rename(os.path.join(root, name),
+                      os.path.join(root, name.split('--')[0] + '-0.m4s'))
+
+
 @pytest.fixture(scope='module')
 def ladders(tmp_path_factory):
     pytest.importorskip('av')
@@ -125,6 +174,10 @@ def ladders(tmp_path_factory):
     root = tmp_path_factory.mktemp('fmp4-single')
     _write_ladder(str(root), 'fmp4', single_file=True)
     out['fmp4-single'] = root
+    for name, timeline in (('dash-number', False), ('dash-timeline', True)):
+        root = tmp_path_factory.mktemp(name)
+        _write_dash(str(root), timeline)
+        out[name] = root
     return out
 
 
@@ -132,7 +185,7 @@ class _Origin:
     """Static HTTP(S) origin over a ladder; logs request paths and Range
     headers, and answers Range requests unless honor_range is False."""
 
-    def __init__(self, root, tls=False, honor_range=True):
+    def __init__(self, root, tls=False, honor_range=True, entry='master.m3u8'):
         hits = self.hits = []
         ranges = self.ranges = []
 
@@ -170,7 +223,7 @@ class _Origin:
             scheme = 'https'
         threading.Thread(target=self._srv.serve_forever, daemon=True).start()
         port = self._srv.server_address[1]
-        self.url = f"{scheme}://127.0.0.1:{port}/master.m3u8"
+        self.url = f"{scheme}://127.0.0.1:{port}/{entry}"
 
     def close(self):
         self._srv.shutdown()
@@ -180,6 +233,14 @@ class _Origin:
 @pytest.fixture(params=['fmp4', 'mpegts'])
 def origin(request, ladders):
     o = _Origin(ladders[request.param])
+    yield o
+    o.close()
+
+
+@pytest.fixture(params=['dash-number', 'dash-timeline'])
+def dash_origin(request, ladders):
+    o = _Origin(ladders[request.param], entry='m.mpd')
+    o.root = ladders[request.param]
     yield o
     o.close()
 
@@ -295,6 +356,50 @@ async def test_byte_range_segments(ladders, honor_range):
     assert pts == expected['video']
 
 
+async def test_dash_groups_follow_source_segments(dash_origin):
+    """Equally numbered groups start together on every rendition, the
+    mid-segment IDR of rung 0 included; audio is one group per segment."""
+    ingest = await _open(dash_origin.url, 'all')
+    chunks = await _drain(ingest)
+    assert [t.name for t in ingest.tracks] == ['video-180p', 'video-90p', 'audio']
+    assert [t.codec.split('.')[0] for t in ingest.tracks] == ['avc1', 'avc1', 'mp4a']
+    starts = [[(c.group_id, c.time_us) for c in chunks[n] if c.key]
+              for n in ('video-180p', 'video-90p')]
+    assert starts[0] == starts[1]
+    assert [g for g, _ in starts[0]] == list(range(1, _SECONDS + 1))
+    assert len(chunks['video-180p']) == len(chunks['video-90p']) == _SECONDS * _FPS
+    rung0 = ingest.tracks[0]
+    data = rung0.init + b''.join(c.payload for c in chunks[rung0.name])
+    with load_av().open(io.BytesIO(data)) as c:
+        keys = sum(p.is_keyframe for p in c.demux(c.streams[0]) if p.dts is not None)
+    assert keys == _SECONDS + 1  # the extra IDR is there, but opens no group
+    audio_groups = [c.group_id for c in chunks['audio'] if c.key]
+    assert audio_groups == list(range(1, len(audio_groups) + 1))
+    assert len(audio_groups) <= _SECONDS + 1 < len(chunks['audio'])
+
+
+async def test_dash_chunks_carry_the_source_timeline(dash_origin):
+    av = load_av()
+    from aiomoqt.media.dash import parse_mpd
+    ingest = await _open(dash_origin.url, 'best')
+    chunks = await _drain(ingest)
+    mpd = parse_mpd((dash_origin.root / 'm.mpd').read_bytes(), dash_origin.url)
+    for track, rep_id in zip(ingest.tracks, ('0', '2')):
+        rep = next(r for r in mpd.representations if r.id == rep_id)
+        names = [rep.init_url] + [rep.locate(s).url for s in rep.segments()]
+        source = b''.join((dash_origin.root / n.rsplit('/', 1)[-1]).read_bytes()
+                          for n in names)
+        with av.open(io.BytesIO(source), format='mov',
+                     options={'ignore_editlist': '1'}) as c:
+            expected = [p.pts * Fraction(p.time_base) for p in c.demux(c.streams[0])
+                        if p.dts is not None]
+        data = track.init + b''.join(c.payload for c in chunks[track.name])
+        with av.open(io.BytesIO(data)) as c:
+            pts = [p.pts * Fraction(p.time_base) for p in c.demux(c.streams[0])
+                   if p.dts is not None]
+        assert pts == expected, track.name
+
+
 async def test_ingest_catalog_alternate_group(origin):
     args = SimpleNamespace(target_latency=None)
     for rendition, alt in (('best', None), ('all', 1)):
@@ -312,11 +417,15 @@ async def test_ingest_catalog_alternate_group(origin):
 # -- end to end ---------------------------------------------------------
 
 @requires_certs
-async def test_pub_media_input_through_a_relay(ladders, monkeypatch):
+@pytest.mark.parametrize('source, entry, port', [
+    ('fmp4', 'master.m3u8', _BASE_PORT + 1),
+    ('dash-number', 'm.mpd', _BASE_PORT + 2),
+], ids=['hls', 'dash'])
+async def test_pub_media_input_through_a_relay(ladders, monkeypatch, source,
+                                               entry, port):
     av = load_av()
-    port = _BASE_PORT + 1
     ns = 'ingest/e2e'
-    origin = _Origin(ladders['fmp4'])
+    origin = _Origin(ladders[source], entry=entry)
     relay._announced.clear()
     relay._tracks.clear()
     handle = await relay._build_server('localhost', port, CERT, KEY,

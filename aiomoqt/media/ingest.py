@@ -1,12 +1,15 @@
-"""Media ingest via PyAV: anything FFmpeg opens (HLS, DASH, files, ...)
+"""Media ingest via PyAV: HLS, DASH, files and anything else FFmpeg opens,
 re-fragmented per track into CMAF chunks for CMSF publishing.
 
 Each selected input stream gets its own mp4 muxer writing one sample per
 moof+mdat (cmsf §3.3) into memory. Every chunk's tfdt and composition
 offset are then set from the source packet, so all tracks share the
-input's timeline exactly. Groups open at key frames, numbered by key
-frames since the track's first one, so renditions with aligned GOPs keep
-equally numbered groups time-aligned (msf §4.2).
+input's timeline exactly.
+
+Groups: for DASH, one per source segment, numbered by it, so equally
+numbered groups of the renditions are time-aligned (msf §4.2). Otherwise
+one per video key frame (per audio frame), counted from the track's
+first, which keeps renditions aligned only when their key frames are.
 
 Needs the `media` extra (PyAV); load_av() raises ImportError naming it.
 """
@@ -15,16 +18,22 @@ from __future__ import annotations
 import asyncio
 import collections
 import concurrent.futures
+import functools
+import heapq
+import itertools
 import os
 import ssl
 import struct
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from fractions import Fraction
-from typing import AsyncIterator, Deque, Dict, List, Optional, Tuple
+from typing import (
+    AsyncIterator, Callable, Deque, Dict, Iterator, List, Optional, Tuple,
+)
 
 import certifi
 
@@ -32,6 +41,7 @@ from ..utils.logger import get_logger
 from .cmaf import (
     init_codec_string, init_timescale, set_chunk_timing, strip_edit_lists,
 )
+from .dash import Presentation, SegmentFeed
 
 logger = get_logger(__name__)
 
@@ -186,16 +196,26 @@ def _variant(stream) -> Optional[str]:
 class IngestTrack:
     """One selected input stream and its CMAF fragmenter. `init` (the
     CMAF header), `codec` and `timescale` are set once the first packet
-    is muxed."""
+    is muxed.
 
-    def __init__(self, av, stream, name: str, kind: str):
+    `offset` (seconds) is added to every source time. With `segment_of`
+    (media seconds -> source segment number) a group opens at the first
+    sync sample of each new source segment, numbered by it; otherwise
+    at every video key frame (every audio frame), counted."""
+
+    def __init__(self, av, stream, name: str, kind: str, *,
+                 bitrate: Optional[int] = None, offset: Fraction = Fraction(0),
+                 segment_of: Optional[Callable[[Fraction], Optional[int]]] = None):
         self.stream = stream
         self.name = name
         self.kind = kind
         ctx = stream.codec_context
         # variant bandwidth spans the whole variant; audio has its own rate
-        self.bitrate: Optional[int] = (
+        self.bitrate: Optional[int] = bitrate or (
             _rank(stream)[0] if kind == 'video' else ctx.bit_rate) or None
+        self.offset = offset
+        self._segment_of = segment_of
+        self._segment = None
         self.width = self.height = self.fps = None
         self.samplerate = self.channels = None
         if kind == 'video':
@@ -217,7 +237,8 @@ class IngestTrack:
         if ctx.name == 'aac' and not ctx.extradata:  # ADTS (e.g. TS segments)
             from av.bitstream import BitStreamFilterContext
             self._bsf = BitStreamFilterContext('aac_adtstoasc', stream)
-        self._pending: Deque[Tuple[bool, Fraction, Fraction]] = collections.deque()
+        self._pending: Deque[Tuple[bool, Optional[int], Fraction, Fraction]] = (
+            collections.deque())
         self._group = -1
         self._started = kind != 'video'  # video opens on a key frame
         self._closed = False
@@ -233,11 +254,19 @@ class IngestTrack:
             if pkt.dts is None:
                 continue
             tb = Fraction(pkt.time_base)
-            dts = pkt.dts * tb
             cto = (pkt.pts - pkt.dts) * tb if pkt.pts is not None else Fraction(0)
+            sync = self.kind != 'video' or pkt.is_keyframe
+            start, group = sync, None
+            if self._segment_of is not None:
+                group = self._segment_of(pkt.dts * tb + cto) if sync else None
+                start = group is not None and (self._segment is None
+                                               or group > self._segment)
+                if start:
+                    self._segment = group
+            dts = pkt.dts * tb + self.offset
             if self.first_dts is None:
                 self.first_dts = dts
-            self._pending.append((self.kind != 'video' or pkt.is_keyframe, dts, cto))
+            self._pending.append((start, group if start else None, dts, cto))
             pkt.stream = self._ostream
             self._out.mux(pkt)
         return self._drain()
@@ -267,9 +296,9 @@ class IngestTrack:
                 mdat = struct.unpack_from('>I', data, end)[0]
                 if end + mdat > len(data):
                     break
-                key, dts, cto = self._pending.popleft()
+                key, group, dts, cto = self._pending.popleft()
                 if key:
-                    self._group += 1
+                    self._group = group if group is not None else self._group + 1
                 chunks.append(_RawChunk(self, bytearray(data[pos:end + mdat]),
                                         key, self._group, dts, cto))
                 pos = end + mdat
@@ -311,23 +340,99 @@ def _select(container, rendition: str, audio: bool):
     return videos, chosen
 
 
-def _video_names(streams) -> List[str]:
-    if len(streams) == 1:
+def _video_names(renditions: List[Tuple[int, int]]) -> List[str]:
+    """'video' for one rendition, else video-<height>p, disambiguated by
+    bitrate; `renditions` holds (height, bitrate) pairs."""
+    if len(renditions) == 1:
         return ['video']
     names: List[str] = []
-    for s in streams:
-        name = f"video-{s.codec_context.height}p"
+    for height, bitrate in renditions:
+        name = f"video-{height}p"
         if name in names:
-            name = f"{name}-{_rank(s)[0] // 1000}k"
+            name = f"{name}-{bitrate // 1000}k"
         while name in names:
             name += '+'
         names.append(name)
     return names
 
 
+def _fetch(url: str, byte_range: Optional[str] = None, *,
+           ctx: ssl.SSLContext) -> bytes:
+    """A resource, or its `first-last` byte range, over HTTP(S) or from a
+    local path."""
+    first = last = None
+    if byte_range:
+        a, _, b = byte_range.partition('-')
+        first, last = int(a), (int(b) if b else None)
+    if url.startswith(('http://', 'https://')):
+        headers = {'Range': f"bytes={byte_range}"} if byte_range else None
+        with http_get(url, ctx, headers) as resp:
+            data = resp.read()
+            if byte_range and resp.status != 206:
+                data = data[first:None if last is None else last + 1]
+            return data
+    path = urllib.parse.urlparse(url).path if url.startswith('file:') else url
+    with open(path, 'rb') as f:
+        if first is None:
+            return f.read()
+        f.seek(first)
+        return f.read(-1 if last is None else last - first + 1)
+
+
+def _is_dash(url: str, ctx: ssl.SSLContext) -> bool:
+    """An .mpd URL, or one whose content is an MPD; .m3u8 never is."""
+    path = urllib.parse.urlparse(url).path.lower()
+    if path.endswith('.mpd'):
+        return True
+    if path.endswith('.m3u8'):
+        return False
+    try:
+        if url.startswith(('http://', 'https://')):
+            with http_get(url, ctx) as resp:
+                head = resp.read(4096)
+        else:
+            with open(url, 'rb') as f:
+                head = f.read(4096)
+    except OSError:
+        return False
+    return b'<MPD' in head
+
+
+_Source = Tuple[Iterator, Dict[int, 'IngestTrack']]
+
+
+def _merge(sources: List[_Source]) -> Iterator[Tuple['IngestTrack', object]]:
+    """(track, packet) from several demuxers, earliest decode time first,
+    one packet of lookahead each. A source whose track map empties is no
+    longer read."""
+    heap: list = []
+    order = itertools.count()
+
+    def pull(i):
+        packets, tracks = sources[i]
+        for p in packets:
+            if not tracks:
+                return
+            track = tracks.get(p.stream.index)
+            if track is None or p.dts is None:
+                continue
+            key = p.dts * Fraction(p.time_base) + track.offset
+            heapq.heappush(heap, (key, next(order), i, track, p))
+            return
+
+    for i in range(len(sources)):
+        pull(i)
+    while heap:
+        _, _, i, track, packet = heapq.heappop(heap)
+        yield track, packet
+        pull(i)
+
+
 class Ingest:
     """An opened input, its selected tracks, and the demux thread that
-    feeds their CMAF chunks to the event loop.
+    feeds their CMAF chunks to the event loop. DASH (an .mpd URL, or an
+    MPD by content) is read through aiomoqt.media.dash, one mp4 reader
+    per representation; anything else through FFmpeg's own demuxers.
 
     The constructor blocks on network I/O (open, then demux until every
     track has its CMAF header): run it in an executor."""
@@ -337,68 +442,99 @@ class Ingest:
                  ssl_context: Optional[ssl.SSLContext] = None):
         if rendition not in RENDITIONS:
             raise ValueError(f"rendition must be one of {RENDITIONS}")
-        av = load_av()
+        self._av = load_av()
         self.url = url
-        kwargs = {}
-        if url.startswith(('http://', 'https://')):
-            kwargs['io_open'] = _io_open(ssl_context or tls_context())
-        self._container = av.open(url, timeout=timeout, **kwargs)
+        self.tracks: List[IngestTrack] = []
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._shift = Fraction(0)
+        self._containers: list = []
+        ctx = ssl_context or tls_context()
         try:
-            videos, aud = _select(self._container, rendition, audio)
-            if not videos and aud is None:
-                raise IngestError("no h264/hevc/av1 video or aac/opus audio stream")
-            self.tracks: List[IngestTrack] = [
-                IngestTrack(av, s, name, 'video')
-                for s, name in zip(videos, _video_names(videos))]
-            if aud is not None:
-                self.tracks.append(IngestTrack(av, aud, 'audio', 'audio'))
-            self._discard_unselected(av)
-            self._demux = self._container.demux(*[t.stream for t in self.tracks])
-            self._backlog = self._prime(av)
+            if _is_dash(url, ctx):
+                self._sources = self._open_dash(url, rendition, audio, ctx)
+            else:
+                self._sources = self._open_ffmpeg(url, rendition, audio,
+                                                  timeout, ctx)
+            self._demux = _merge(self._sources)
+            self._backlog = self._prime()
         except BaseException:
-            self._container.close()
+            self._close_containers()
             raise
 
-    def _by_index(self) -> Dict[int, IngestTrack]:
-        return {t.stream.index: t for t in self.tracks}
-
-    def _discard_unselected(self, av) -> None:
-        """Unselected HLS/DASH renditions are then never fetched."""
+    def _open_ffmpeg(self, url, rendition, audio, timeout, ctx) -> List[_Source]:
+        kwargs = {}
+        if url.startswith(('http://', 'https://')):
+            kwargs['io_open'] = _io_open(ctx)
+        container = self._av.open(url, timeout=timeout, **kwargs)
+        self._containers.append(container)
+        videos, aud = _select(container, rendition, audio)
+        if not videos and aud is None:
+            raise IngestError("no h264/hevc/av1 video or aac/opus audio stream")
+        names = _video_names([(s.codec_context.height, _rank(s)[0])
+                              for s in videos])
+        self.tracks = [IngestTrack(self._av, s, name, 'video')
+                       for s, name in zip(videos, names)]
+        if aud is not None:
+            self.tracks.append(IngestTrack(self._av, aud, 'audio', 'audio'))
         keep = {t.stream.index for t in self.tracks}
-        for s in self._container.streams:
+        for s in container.streams:  # unselected renditions are never fetched
             if s.index not in keep:
-                s.discard = av.stream.Discard.all
+                s.discard = self._av.stream.Discard.all
+        return [(container.demux(*[t.stream for t in self.tracks]),
+                 {t.stream.index: t for t in self.tracks})]
 
-    def _prime(self, av) -> List[IngestChunk]:
+    def _open_dash(self, url, rendition, audio, ctx) -> List[_Source]:
+        pres = Presentation(url, functools.partial(_fetch, ctx=ctx))
+        videos, aud = pres.select(rendition, audio)
+        reps = videos + ([aud] if aud is not None else [])
+        names = _video_names([(r.height or 0, r.bandwidth) for r in videos])
+        start = pres.start_time(reps)
+        sources = []
+        for rep, name in zip(reps, names + ['audio']):
+            feed = SegmentFeed(pres, rep, start, self._stop)
+            container = self._av.open(feed, format='mov',
+                                      options={'ignore_editlist': '1'})
+            self._containers.append(container)
+            streams = (container.streams.video if rep.kind == 'video'
+                       else container.streams.audio)
+            if not streams:
+                raise IngestError(f"DASH representation {rep.id}: no {rep.kind}")
+            track = IngestTrack(self._av, streams[0], name, rep.kind,
+                                bitrate=rep.bandwidth,
+                                offset=-Fraction(rep.pto, rep.timescale),
+                                segment_of=feed.segment_of)
+            self.tracks.append(track)
+            sources.append((container.demux(streams[0]),
+                            {streams[0].index: track}))
+        return sources
+
+    def _prime(self) -> List[IngestChunk]:
         """Demux until every track has its CMAF header, returning the
         chunks read on the way. A track still without one after
         _PRIME_LIMIT of media is dropped. Fixes the timeline shift that
         keeps every decode time non-negative."""
-        tracks = self._by_index()
         raw: List[_RawChunk] = []
         first = None
-        for packet in self._demux:
-            track = tracks.get(packet.stream.index)
-            if track is None or packet.dts is None:
-                continue
-            dts = packet.dts * Fraction(packet.time_base)
-            first = dts if first is None else first
+        for track, packet in self._demux:
+            t = packet.dts * Fraction(packet.time_base) + track.offset
+            first = t if first is None else first
             raw += track.push(packet)
-            if all(t.init is not None for t in self.tracks):
+            if all(x.init is not None for x in self.tracks):
                 break
-            if dts - first > _PRIME_LIMIT:
+            if t - first > _PRIME_LIMIT:
                 break
-        for t in [t for t in self.tracks if t.init is None]:
+        for track in [x for x in self.tracks if x.init is None]:
             logger.warning("ingest: no %s data from %s; track dropped",
-                           t.name, self.url)
-            self.tracks.remove(t)
+                           track.name, self.url)
+            self.tracks.remove(track)
+            track.stream.discard = self._av.stream.Discard.all
+            for _, tracks in self._sources:
+                if tracks.get(track.stream.index) is track:
+                    del tracks[track.stream.index]
         if not self.tracks:
             raise IngestError(f"no media read from {self.url}")
-        self._discard_unselected(av)
-        starts = [t.first_dts for t in self.tracks if t.first_dts is not None]
+        starts = [x.first_dts for x in self.tracks if x.first_dts is not None]
         self._shift = max(Fraction(0), -min(starts)) if starts else Fraction(0)
         return [self._finish(c) for c in raw if c.track in self.tracks]
 
@@ -439,7 +575,11 @@ class Ingest:
         if chunks() never started one."""
         self._stop.set()
         if self._thread is None:
-            self._container.close()
+            self._close_containers()
+
+    def _close_containers(self) -> None:
+        for container in self._containers:
+            container.close()
 
     def _put(self, loop, queue, item) -> bool:
         try:
@@ -456,14 +596,10 @@ class Ingest:
                     return False
 
     def _run(self, loop, queue) -> None:
-        tracks = self._by_index()
         try:
-            for packet in self._demux:
+            for track, packet in self._demux:
                 if self._stop.is_set():
                     return
-                track = tracks.get(packet.stream.index)
-                if track is None or packet.dts is None:
-                    continue
                 for c in track.push(packet):
                     if not self._put(loop, queue, self._finish(c)):
                         return
@@ -475,8 +611,8 @@ class Ingest:
         except Exception as e:
             self._put(loop, queue, e)
         finally:
-            self._container.close()
+            self._close_containers()
 
 
 __all__ = ['Ingest', 'IngestChunk', 'IngestError', 'IngestTrack',
-           'INSTALL_HINT', 'RENDITIONS', 'load_av']
+           'INSTALL_HINT', 'RENDITIONS', 'http_get', 'load_av', 'tls_context']
