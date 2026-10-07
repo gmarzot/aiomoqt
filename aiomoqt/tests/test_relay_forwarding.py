@@ -58,9 +58,11 @@ async def _run(port, pub_ns, sub_ns, draft=18):
                                 verify_tls=False, supported_drafts=draft)
         async with pub_client.connect() as pub_session:
             await pub_session.client_session_init()
-            track = _Pub(pub_session, pub_ns, "video")
-            await track.publish(announce_namespace=True,
-                                publish_track=False)
+            # The track the subscriber names, under the announced prefix.
+            track = _Pub(pub_session, sub_ns, "video")
+            track.attach()
+            await pub_session.publish_namespace(namespace=pub_ns,
+                                                wait_response=True)
             await asyncio.sleep(0.1)
 
             sub_client = MOQTClient("localhost", port, path="/",
@@ -97,7 +99,7 @@ async def test_objects_traverse_the_relay(draft):
 
 @pytest.mark.asyncio
 async def test_subscribe_reaches_a_prefix_publisher():
-    # §2.4: announcing (relay) must serve a SUBSCRIBE for (relay, sub).
+    # §2.4: a SUBSCRIBE under an announced prefix reaches its publisher.
     got, err = await _run(_BASE_PORT + 1, "relay", "relay/sub")
     assert err is None, f"prefix subscribe failed: {err}"
     assert [p for p, _ in got] == _FRAMES

@@ -36,6 +36,8 @@ def _control_session(draft):
     s.negotiated_draft = draft
     s._profile = profile_for(draft)
     s._control_msg_overrides = {}
+    s._published_tracks = {}
+    s._requests = {}
     s._tasks = set()
     s._control_chains = {}
     s._bidi_stream_requests = {}

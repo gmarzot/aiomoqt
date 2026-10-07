@@ -111,7 +111,8 @@ class MOQTPeer:
     def register_handler(self, msg_type: int, handler: Callable) -> None:
         """Register a custom handler that overrides the default handler
         for this message type. The message class is taken from the
-        session's negotiated draft at dispatch time.
+        session's negotiated draft at dispatch time. A message addressed
+        to a track the session publishes goes to that track instead.
 
         Registration is expanded over HANDLER_ALIASES so a type that is
         renumbered between drafts stays registered under every number.
@@ -150,6 +151,16 @@ class _DataStreamState:
     # priority rather than substitute its own, so it has to be able to
     # see it: the object itself does not carry it.
     publisher_priority: Optional[int] = None
+
+
+@dataclass(slots=True)
+class _RequestEntry:
+    """A request routed to the track that owns it. `sub` is the track's
+    state for this peer; `alias` the track alias the request carries."""
+    role: str
+    track: Any
+    sub: Any = None
+    alias: Optional[int] = None
 
 
 class _MOQTSessionMixin:
@@ -323,6 +334,12 @@ class _MOQTSessionMixin:
         self._request_cancel_handlers: Dict[int, Callable] = {}
         # request_id -> callback fired on PUBLISH_DONE for that request.
         self._publish_done_handlers: Dict[int, Callable] = {}
+        # Tracks this session serves, by full track name; control
+        # messages addressed to one are routed to it.
+        self._published_tracks: Dict[Tuple[Tuple[bytes, ...], bytes], Any] = {}
+        # Request ids, ours and the peer's, to the entry that owns them.
+        # Client ids are even and server ids odd, so they cannot collide.
+        self._requests: Dict[int, _RequestEntry] = {}
         # Aliases the peer assigned (SUBSCRIBE_OK / PUBLISH) -> our
         # request id: the receive-side registry.
         self._track_aliases: Dict[int, int] = {}
@@ -599,6 +616,42 @@ class _MOQTSessionMixin:
             logger.debug(f"track {track_alias}: default publisher "
                          f"priority {int(prio)}")
 
+    def _track_key(self, namespace, trackname) -> Tuple[Tuple[bytes, ...], bytes]:
+        name = trackname.encode() if isinstance(trackname, str) else trackname
+        return (self._make_namespace_tuple(namespace), name)
+
+    def _attach_track(self, track) -> None:
+        """Route SUBSCRIBEs for the track's full name to the track."""
+        key = self._track_key(track.namespace, track.trackname)
+        self._published_tracks[key] = track
+
+    def _bind_request(self, request_id: int, track, sub=None,
+                      alias: Optional[int] = None) -> None:
+        """Route PUBLISH_OK and updates for this request to the track."""
+        self._requests[request_id] = _RequestEntry(
+            role="publisher", track=track, sub=sub, alias=alias)
+
+    def _unbind_request(self, request_id: int) -> None:
+        self._requests.pop(request_id, None)
+
+    def _track_handler(self, msg) -> Optional[Callable]:
+        """The published track's handler for a message addressed to it,
+        else None."""
+        if isinstance(msg, Subscribe):
+            track = self._published_tracks.get(
+                (tuple(msg.track_namespace), msg.track_name))
+            return None if track is None else track._on_subscribe
+        if isinstance(msg, PublishOk):
+            rid, name = msg.request_id, '_on_publish_ok'
+        elif isinstance(msg, RequestUpdate):
+            rid, name = msg.existing_request_id, '_on_request_update'
+        elif isinstance(msg, SubscribeUpdate):
+            rid, name = msg.subscription_request_id, '_on_subscribe_update'
+        else:
+            return None
+        entry = self._requests.get(rid)
+        return None if entry is None else getattr(entry.track, name)
+
     def register_request_cancel_handler(self, request_id: int,
                                         callback: Callable) -> None:
         """Called as callback(request_id) when the peer terminates the
@@ -665,6 +718,7 @@ class _MOQTSessionMixin:
         it. Publishers stop feeding on this. With replies_pending the
         PUBLISH_DONE handler stays for a PUBLISH_DONE still inbound."""
         cb = self._request_cancel_handlers.pop(request_id, None)
+        self._requests.pop(request_id, None)
         if not replies_pending:
             self._publish_done_handlers.pop(request_id, None)
         logger.info(f"MOQT: request {request_id} cancelled by {why}")
@@ -873,6 +927,10 @@ class _MOQTSessionMixin:
                 logger.debug(f"MOQT event: control message: seeking msg end: {end_pos}")
                 buf.seek(end_pos)
             logger.info(f"MOQT event: control message parsed: {msg})")
+
+            routed = self._track_handler(msg)
+            if routed is not None:
+                handler = routed
 
             # Schedule handler if one exists
             if handler is not None:
@@ -2134,6 +2192,8 @@ class _MOQTSessionMixin:
         self._control_chains.clear()
         self._pending_control_msgs.clear()
         self._uni_peek_stash.clear()
+        self._published_tracks.clear()
+        self._requests.clear()
 
         if not self._wt_session_setup.done():
             self._wt_session_setup.set_result(False)
@@ -3771,7 +3831,8 @@ class _MOQTSessionMixin:
     
     def register_handler(self, msg_type: int, handler: Callable) -> None:
         """Register a custom handler, overriding the default handler for
-        this message type on this session.
+        this message type on this session. A message addressed to a
+        track the session publishes goes to that track instead.
 
         Registration is expanded over HANDLER_ALIASES so a type that is
         renumbered between drafts stays registered under every number.
@@ -3858,13 +3919,13 @@ class _MOQTSessionMixin:
                     "no mutually supported MOQT version")
 
     async def _handle_subscribe(self, msg: Subscribe) -> None:
+        """Refuse a SUBSCRIBE no published track or app handler took."""
         logger.info(f"MOQT receive: {msg}")
-        self.subscribe_ok(
-            request_msg=msg,
-            expires=0,
-            group_order=GroupOrder.ASCENDING,
-            content_exists=ContentExistsCode.NO_CONTENT,
-        )
+        code = (RequestErrorCode.DOES_NOT_EXIST
+                if is_draft16_or_later(self.negotiated_draft)
+                else SubscribeErrorCode.TRACK_DOES_NOT_EXIST)
+        self.subscribe_error(msg.request_id, error_code=int(code),
+                             reason="track does not exist")
 
     async def _handle_publish_namepace(self, msg: PublishNamespace) -> None:
         logger.info(f"MOQT receive: {msg}")

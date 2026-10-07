@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Fix: several `PublishedTrack`s on one session each get their own PUBLISH_OK, SUBSCRIBE and
+  updates; before, the last track published took them all.
+- `PublishedTrack.attach()` serves a track on a session without announcing it; `publish()`
+  attaches before PUBLISH_NAMESPACE, so a SUBSCRIBE that overtakes the reply is served.
+- Behaviour change: a SUBSCRIBE for a track the session publishes goes to that track ahead of a
+  `register_handler(SUBSCRIBE)` handler, which now sees only names no track serves.
+- Fix: a SUBSCRIBE for a name nothing serves is refused with DOES_NOT_EXIST instead of
+  acknowledged with SUBSCRIBE_OK.
+- Fix: a SUBSCRIBE for a finished track gets SUBSCRIBE_OK then PUBLISH_DONE (TRACK_ENDED)
+  instead of no further reply.
 - `moq_interop_client` / `moq_interop_relay`: a pinned `DRAFT` aiomoqt cannot speak is
   reported (TAP skip-all, exit 127) or refused at start, instead of a traceback.
 - Fix: STOP_SENDING on a d18 request stream no longer discards the REQUEST_ERROR or
