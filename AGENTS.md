@@ -61,6 +61,10 @@ fetch stream); `multi-proc` = `pub_server` against `sub_bench`; `peer-interop` =
 `.github/moxygen-pin`. Zero objects delivered is a failure, never a pass — an assertion that
 cannot find its results line fails loudly rather than vacuously.
 
+Anything with per-track or per-request state gets a test with at least two tracks on one session,
+over raw QUIC and WebTransport: one track per session cannot show a message reaching the wrong
+track (`test_multi_track_publish.py`, and through the relay in `test_relay_forwarding.py`).
+
 ## Lint and types
 
 `[tool.ruff]` in `pyproject.toml`: `line-length = 100`, `select = ["E","F","W"]`,
@@ -97,6 +101,12 @@ port via per-connection ALPN dispatch.
 Packagers under `aiomoqt/media/` only package and number objects; `broadcast.py` is the single
 exempt composer. `test_packaging_does_not_know_about_peers` greps the media tree for
 `FanoutDelivery`, `add_session`, `_subs` and friends and fails if one appears.
+
+**Per-track routing.** `register_handler` holds one handler per message type for the whole
+session, so a track that registers one takes it from every other track. Messages addressed to a
+track or a request (SUBSCRIBE, PUBLISH_OK, updates) route through the session's track and
+request tables (`PublishedTrack.attach()`, `_bind_request()`), which take precedence over app
+handlers. `test_published_tracks_take_no_session_handler_slot` enforces this for `track.py`.
 
 **Drafts.** 14, 16 and 18 are all live. Draft numbers are plain ints everywhere
 (`MOQTDraft`, the `draft=` kwarg, `supported_drafts`); the IETF code `0xff0000NN` and the ALPN

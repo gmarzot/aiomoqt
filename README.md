@@ -121,6 +121,8 @@ Register handlers for peer-initiated messages:
 client.register_handler(MOQTMessageType.SUBSCRIBE, my_subscribe_handler)
 ```
 
+A SUBSCRIBE, PUBLISH_OK or subscription update addressed to a track the session publishes goes to that track; the handler sees the rest. With no SUBSCRIBE handler, a SUBSCRIBE for a track the session does not publish is refused with DOES_NOT_EXIST.
+
 Request failures raise `MOQTRequestError` regardless of negotiated draft.
 
 ### Tracks
@@ -129,6 +131,16 @@ Request failures raise `MOQTRequestError` regardless of negotiated draft.
 |---|---|
 | `PublishedTrack` | stream setup, subgroup writing, pacing, TX budget |
 | `SubscribedTrack` | object reassembly, FETCH / JOIN handling |
+
+Several tracks can share a session; each gets the control messages that name it or its requests. `publish()` announces a track (PUBLISH, PUBLISH_NAMESPACE, or both). `attach()` serves it without announcing, for tracks announced together under one namespace:
+
+```python
+for name in ('video', 'audio'):
+    MyTrack(session, 'ns', name).attach()
+await session.publish_namespace(namespace='ns', wait_response=True)
+```
+
+A full track name (namespace + name) serves one track per session.
 
 `StreamMapping` selects the data-plane shape: `PER_GROUP` (subgroup stream per group) or `DATAGRAM` (one object per datagram; raw QUIC only — see Limitations).
 
