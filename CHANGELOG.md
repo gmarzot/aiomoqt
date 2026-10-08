@@ -21,6 +21,9 @@
 - Fix: the control stream is never closed while the session lives (§3.3): a graceful close no
   longer FINs it first, and a peer's control-stream FIN closes the session with
   PROTOCOL_VIOLATION (it was INTERNAL_ERROR, or ignored when the FIN carried data).
+- Fix: `verify_tls` / `-k` reach the transport. Clients verify the server's
+  certificate by default (aiopquic 0.5.0a1); `verify_tls=False` / `-k` accepts any
+  certificate; `MOQTClient(ca_file=...)` trusts a private CA.
 - Fix: several `PublishedTrack`s on one session each get their own PUBLISH_OK, SUBSCRIBE and
   updates; before, the last track published took them all.
 - `PublishedTrack.attach()` serves a track on a session without announcing it; `publish()`

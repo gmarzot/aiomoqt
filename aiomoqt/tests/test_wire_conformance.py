@@ -179,11 +179,12 @@ def test_kvp_overrunning_its_block_is_refused_by_both_codecs(vi64):
     with pytest.raises(RuntimeError, match="overrun"):
         MOQTMessage._extensions_decode(buf, delta=True)
 
+    # The fused parser refuses the declared length before pulling it.
     chain = StreamChain()
     chain.extend(v(0) + block + v(3) + b"pay")
     fused = (chain.parse_object_subgroup_vi64 if vi64
              else chain.parse_object_subgroup)
-    with pytest.raises(RuntimeError, match="overrun"):
+    with pytest.raises(OverflowError, match="exceeds its block"):
         fused(True, 16 * 1024, True)
 
 
