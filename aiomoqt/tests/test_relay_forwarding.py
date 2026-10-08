@@ -24,7 +24,9 @@ _FRAMES = [b"o0", b"o1", b"o2"]
 
 
 class _Pub(PublishedTrack):
-    """Emits _FRAMES as one group on a single subgroup, then stops."""
+    """Emits its frames as one group on a single subgroup, then stops."""
+
+    frames = _FRAMES
 
     async def generate(self, session, track_alias):
         from aiomoqt.messages import SubgroupHeader
@@ -34,11 +36,11 @@ class _Pub(PublishedTrack):
             publisher_priority=200, extensions_present=True,
             prof=session._profile)
         session.stream_write(sid, hdr.serialize().data)
-        for i, payload in enumerate(_FRAMES):
+        for i, payload in enumerate(self.frames):
             buf = hdr.next_object(payload=payload, extensions=None,
                                   object_id=i)
             await session.stream_write_drain(sid, buf.data)
-        self._largest = (0, len(_FRAMES) - 1)
+        self._largest = (0, len(self.frames) - 1)
 
 
 def _reset_relay_state():
@@ -418,3 +420,50 @@ async def test_relay_serves_a_second_publish_subscribe_cycle():
     finally:
         handle.close()
         _reset_relay_state()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("draft", [16, 18])
+async def test_tracks_published_on_one_session_each_reach_a_subscriber(draft):
+    """Three PUBLISHes on one session, held by the relay: the reply to
+    each must start that track, not the last one published."""
+    port = _BASE_PORT + 80 + draft
+    names = ("a", "b", "c")
+    got = {name: [] for name in names}
+    _reset_relay_state()
+    server = relay._build_server("localhost", port, CERT, KEY,
+                                 use_quic=True, draft=draft)
+    handle = await server.serve()
+    try:
+        pub_client = MOQTClient("localhost", port, path="/", use_quic=True,
+                                verify_tls=False, supported_drafts=draft)
+        async with pub_client.connect() as pub_session:
+            await pub_session.client_session_init()
+            for name in names:
+                track = _Pub(pub_session, "relay/multi", name)
+                track.frames = [name.encode() + f for f in _FRAMES]
+                await track.publish(announce_namespace=False,
+                                    publish_track=True)
+            await asyncio.sleep(0.1)
+            sub_client = MOQTClient("localhost", port, path="/",
+                                    use_quic=True, verify_tls=False,
+                                    supported_drafts=draft)
+            async with sub_client.connect() as sub_session:
+                await sub_session.client_session_init()
+                # One at a time: each subscription's frames arrive before
+                # the next SUBSCRIBE.
+                for name in names:
+                    sub = SubscribedTrack(
+                        sub_session, "relay/multi", name,
+                        on_object=lambda m, s, t, g, sg, n=name:
+                            got[n].append(bytes(m.payload)))
+                    await sub.subscribe(timeout=8.0)
+                    for _ in range(150):
+                        if len(got[name]) >= len(_FRAMES):
+                            break
+                        await asyncio.sleep(0.02)
+    finally:
+        handle.close()
+        _reset_relay_state()
+    assert got == {name: [name.encode() + f for f in _FRAMES]
+                   for name in names}, got

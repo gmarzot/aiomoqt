@@ -4,11 +4,14 @@ terminal reply.
 """
 import asyncio
 import contextlib
+from pathlib import Path
 
 import pytest
 
+import aiomoqt.track as track_module
 from aiomoqt.client import MOQTClient
 from aiomoqt.messages import SubscribeUpdate
+from aiomoqt.protocol import _MOQTSessionMixin
 from aiomoqt.server import MOQTServer
 from aiomoqt.track import PublishedTrack
 from aiomoqt.types import (
@@ -21,6 +24,8 @@ pytestmark = requires_certs
 
 _BASE_PORT = 15900
 _DRAFTS = [14, 16, 18]
+_TRANSPORTS = pytest.mark.parametrize("use_quic", [True, False],
+                                      ids=["quic", "wt"])
 _NS = "multi/track"
 _NAMES = ("catalog", "audio", "video")
 # Distinct per track so the receiver can tell whose objects it got.
@@ -28,8 +33,9 @@ _SIZES = (100, 200, 300)
 _MIN_OBJECTS = 5
 
 
-def _port(case: int, draft: int) -> int:
-    return _BASE_PORT + 3 * case + _DRAFTS.index(draft)
+def _port(case: int, draft: int, use_quic: bool = True) -> int:
+    return (_BASE_PORT + 3 * case + _DRAFTS.index(draft)
+            + (0 if use_quic else 40))
 
 
 def _does_not_exist(draft: int) -> int:
@@ -83,15 +89,15 @@ class _Receiver:
 
 
 @contextlib.asynccontextmanager
-async def _loopback(port, draft, rx, subscribe_handler=None):
+async def _loopback(port, draft, rx, subscribe_handler=None, use_quic=True):
     server = MOQTServer(host="localhost", port=port, certificate=CERT,
-                        private_key=KEY, path="/", use_quic=True,
+                        private_key=KEY, path="/", use_quic=use_quic,
                         supported_drafts=draft)
     server.register_handler(MOQTMessageType.PUBLISH, rx.on_publish)
     server.register_handler(MOQTMessageType.PUBLISH_NAMESPACE,
                             rx.on_publish_namespace)
     quic_server = await server.serve()
-    client = MOQTClient("localhost", port, path="/", use_quic=True,
+    client = MOQTClient("localhost", port, path="/", use_quic=use_quic,
                         verify_tls=False, supported_drafts=draft)
     if subscribe_handler is not None:
         client.register_handler(MOQTMessageType.SUBSCRIBE, subscribe_handler)
@@ -129,10 +135,12 @@ async def _publish_all(session, rx):
 
 
 @pytest.mark.asyncio
+@_TRANSPORTS
 @pytest.mark.parametrize("draft", _DRAFTS)
-async def test_publish_ok_starts_every_track(draft):
+async def test_publish_ok_starts_every_track(draft, use_quic):
     rx = _Receiver()
-    async with _loopback(_port(0, draft), draft, rx) as session:
+    async with _loopback(_port(0, draft, use_quic), draft, rx,
+                         use_quic=use_quic) as session:
         _, msgs = await _publish_all(session, rx)
         flowing = await _until(lambda: all(
             rx.count(m.track_alias) >= _MIN_OBJECTS for m in msgs))
@@ -145,11 +153,13 @@ async def test_publish_ok_starts_every_track(draft):
 
 
 @pytest.mark.asyncio
+@_TRANSPORTS
 @pytest.mark.parametrize("draft", _DRAFTS)
-async def test_subscribe_reaches_its_own_track(draft):
+async def test_subscribe_reaches_its_own_track(draft, use_quic):
     # One trackname in three namespaces: routing keys on the full name.
     rx = _Receiver()
-    async with _loopback(_port(1, draft), draft, rx) as session:
+    async with _loopback(_port(1, draft, use_quic), draft, rx,
+                         use_quic=use_quic) as session:
         tracks = [_track(session, f"{_NS}/{i}", "video", size)
                   for i, size in enumerate(_SIZES)]
         for track in tracks:
@@ -167,6 +177,51 @@ async def test_subscribe_reaches_its_own_track(draft):
             f"{[rx.count(ok.track_alias) for ok in oks]}")
         for ok, size in zip(oks, _SIZES):
             assert set(rx.sizes[ok.track_alias]) == {size}
+
+
+@pytest.mark.asyncio
+@_TRANSPORTS
+@pytest.mark.parametrize("draft", _DRAFTS)
+async def test_attached_tracks_share_one_namespace(draft, use_quic):
+    # One PUBLISH_NAMESPACE; each SUBSCRIBE reaches the track it names.
+    rx = _Receiver()
+    async with _loopback(_port(7, draft, use_quic), draft, rx,
+                         use_quic=use_quic) as session:
+        for name, size in zip(_NAMES, _SIZES):
+            _track(session, _NS, name, size).attach()
+        await session.publish_namespace(namespace=_NS, wait_response=True)
+        oks = []
+        for name in _NAMES:
+            ok = await rx.session.subscribe(_NS, name, forward=1,
+                                            wait_response=True)
+            rx.watch(rx.session, ok.track_alias)
+            oks.append(ok)
+        flowing = await _until(lambda: all(
+            rx.count(ok.track_alias) >= _MIN_OBJECTS for ok in oks))
+        assert flowing, (
+            f"objects per subscription: "
+            f"{[rx.count(ok.track_alias) for ok in oks]}")
+        for ok, size in zip(oks, _SIZES):
+            assert set(rx.sizes[ok.track_alias]) == {size}
+
+
+def test_a_full_name_serves_one_track_per_session():
+    session = object.__new__(_MOQTSessionMixin)
+    session._published_tracks = {}
+    video = PublishedTrack(session, namespace=_NS, trackname="video")
+    video.attach(session)
+    video.attach(session)
+    PublishedTrack(session, namespace=_NS, trackname="audio").attach(session)
+    with pytest.raises(ValueError):
+        PublishedTrack(session, namespace=_NS,
+                       trackname="video").attach(session)
+
+
+def test_published_tracks_take_no_session_handler_slot():
+    # register_handler holds one handler per message type, so a track
+    # that registers one takes it from every other track on the session.
+    source = Path(track_module.__file__).read_text()
+    assert "register_handler(" not in source
 
 
 @pytest.mark.asyncio
