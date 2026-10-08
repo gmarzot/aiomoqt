@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fix: a d18 control GOAWAY whose Request ID has the wrong parity closes the session with
+  INVALID_REQUEST_ID (§10.4).
 - Fix: several `PublishedTrack`s on one session each get their own PUBLISH_OK, SUBSCRIBE and
   updates; before, the last track published took them all.
 - `PublishedTrack.attach()` serves a track on a session without announcing it; `publish()`

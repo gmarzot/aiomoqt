@@ -347,7 +347,7 @@ async def test_d18_goaway_once_per_stream():
     for sid, rid in ((4, 0), (8, 2)):
         s._bidi_stream_requests[sid] = rid
         s._bidi_streams[rid] = sid
-    s._on_control_data(3, _goaway_frame(s, request_id=1), False)
+    s._on_control_data(3, _goaway_frame(s, request_id=0), False)
     s._on_control_data(4, _goaway_frame(s), False, is_request_bidi=True)
     s._on_control_data(8, _goaway_frame(s), False, is_request_bidi=True)
     await asyncio.sleep(0)
@@ -363,7 +363,7 @@ async def test_second_goaway_on_control_stream_closes(draft):
     from aiomoqt.types import SessionCloseCode
     s = _control_session(draft)
     s.is_client = True
-    rid = 1 if draft >= 18 else None
+    rid = 0 if draft >= 18 else None
     s._on_control_data(3, _goaway_frame(s, request_id=rid), False)
     await asyncio.sleep(0)
     assert s._closed == []
@@ -371,6 +371,23 @@ async def test_second_goaway_on_control_stream_closes(draft):
     await asyncio.sleep(0)
     assert s._closed
     assert s._closed[0][0] == SessionCloseCode.PROTOCOL_VIOLATION
+
+
+@pytest.mark.parametrize("is_client, request_id, closes", [
+    (True, 0, False), (True, 1, True), (False, 1, False), (False, 4, True),
+])
+async def test_d18_control_goaway_request_id_has_the_receivers_parity(
+        is_client, request_id, closes):
+    # §10.4: it names the receiver's own requests: even at a client.
+    from aiomoqt.types import SessionCloseCode
+    s = _control_session(18)
+    s.is_client = is_client
+    s._on_control_data(3, _goaway_frame(s, request_id=request_id), False)
+    await asyncio.sleep(0)
+    if closes:
+        assert s._closed[0][0] == SessionCloseCode.INVALID_REQUEST_ID
+    else:
+        assert s._closed == []
 
 
 async def test_reset_after_stop_sending_releases_without_renotifying():

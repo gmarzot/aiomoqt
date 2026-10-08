@@ -1971,6 +1971,16 @@ class _MOQTSessionMixin:
                         f"second GOAWAY on stream {stream_id}")
                     return
                 self._peer_goaway_streams.add(stream_id)
+                # §10.4: the control GOAWAY names one of the receiver's
+                # own Request IDs, so it carries the receiver's parity.
+                own_parity = 0 if self._is_client else 1
+                if (not is_request_bidi and msg.request_id is not None
+                        and int(msg.request_id) & 1 != own_parity):
+                    self._close_session(
+                        SessionCloseCode.INVALID_REQUEST_ID,
+                        f"GOAWAY Request ID {msg.request_id} has the "
+                        f"wrong parity")
+                    return
         if end_stream:
             self._control_chains.pop(stream_id, None)
             if stream_id in self._cancelled_request_streams:
