@@ -6,6 +6,8 @@
   updates; before, the last track published took them all.
 - `PublishedTrack.attach()` serves a track on a session without announcing it; `publish()`
   attaches before PUBLISH_NAMESPACE, so a SUBSCRIBE that overtakes the reply is served.
+- A second track under a full name already published on the session is refused with
+  `ValueError` instead of silently taking the first one's SUBSCRIBEs.
 - Behaviour change: a SUBSCRIBE for a track the session publishes goes to that track ahead of a
   `register_handler(SUBSCRIBE)` handler, which now sees only names no track serves.
 - Fix: a SUBSCRIBE for a name nothing serves is refused with DOES_NOT_EXIST instead of

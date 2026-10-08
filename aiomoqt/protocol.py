@@ -624,8 +624,14 @@ class _MOQTSessionMixin:
         return (self._make_namespace_tuple(namespace), name)
 
     def _attach_track(self, track) -> None:
-        """Route SUBSCRIBEs for the track's full name to the track."""
+        """Route SUBSCRIBEs for the track's full name to the track. A
+        full name serves one track per session."""
         key = self._track_key(track.namespace, track.trackname)
+        held = self._published_tracks.get(key)
+        if held is not None and held is not track:
+            raise ValueError(
+                f"track {track.namespace}/{track.trackname} is already "
+                f"published on this session by another track")
         self._published_tracks[key] = track
 
     def _bind_request(self, request_id: int, track, sub=None,
