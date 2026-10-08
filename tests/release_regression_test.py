@@ -131,25 +131,21 @@ def _pytest_file(test_file: str, log: Path,
     # output, not just the last line. Stray output from atexit /
     # connection-cleanup ("Received a connection close request") often
     # follows the summary on stderr and would otherwise mask a passing
-    # run. Match the canonical pytest format: "N passed[, M failed]
-    # [, K skipped] in T.TTs".
+    # run. The line is "N word[, N word ...] in T.TTs" in pytest's own
+    # order, e.g. "1 failed, 1063 passed, 9 skipped, 1 xfailed in 18.7s".
     text = log.read_text()
-    summary_re = re.compile(
-        r"^(\d+) passed(?:,\s*(\d+) failed)?(?:,\s*\d+ skipped)?\s+in\s+",
-        re.MULTILINE,
-    )
-    m = summary_re.search(text)
-    if m is None:
+    summary_re = re.compile(r"^\d+ \w+(?:, \d+ \w+)* in [\d.]+s",
+                            re.MULTILINE)
+    lines = summary_re.findall(text)
+    if not lines:
         return "FAIL", "(no pytest summary)"
-    failed_count = int(m.group(2) or 0)
-    summary_line = m.group(0).rstrip()
-    # Strip trailing "in" — that's the start of "in T.TTs" but the
-    # match captured up to the literal " in ". Recover the full line:
-    # find the matched start and read through to end-of-line.
-    start = m.start()
-    end = text.find("\n", start)
-    summary_line = text[start:end if end != -1 else None].strip()
-    return ("PASS" if failed_count == 0 else "FAIL"), summary_line
+    summary_line = lines[-1]
+    counts = {word: int(n) for n, word in
+              re.findall(r"(\d+) (\w+)", summary_line.rsplit(" in ", 1)[0])}
+    bad = counts.get("failed", 0) + counts.get("error", 0) \
+        + counts.get("errors", 0)
+    ok = bad == 0 and counts.get("passed", 0) > 0
+    return ("PASS" if ok else "FAIL"), summary_line
 
 
 # Kept out of the whole-tree run so a platform can skip it: on macOS the

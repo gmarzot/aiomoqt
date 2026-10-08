@@ -30,6 +30,30 @@
 - Fix: `moqt://` URLs keep their path, and native-QUIC SETUP PATH is the URI's
   path-abempty plus query (`moqt://host/anon` sent `/`; a `/` path sent `//`).
 - Fix: an original publisher's d18 subgroup header sets FIRST_OBJECT (§2.2 MUST).
+- Fix: a control message whose body ends short of its Length closes the session with
+  PROTOCOL_VIOLATION instead of being skipped.
+- Fix: a Full Track Name over 4096 bytes closes the session; at d16+ so do an empty
+  namespace field, a namespace over 4096 bytes, and FORWARD, GROUP_ORDER,
+  SUBSCRIBER_PRIORITY or DEFAULT_PUBLISHER_GROUP_ORDER outside their ranges (§2.4.1, §10.2).
+- Fix: a d18 AbsoluteRange whose End Group passes 2^64-1 closes the session (§5.1.2).
+- Fix: GROUP_ORDER `PUBLISHER_DEFAULT` (0) is omitted at d16+ instead of sent.
+- Fix: a FETCH without GROUP_ORDER is served ascending, and a FETCH_OK without it keeps the
+  order the FETCH asked for; both were decoded as descending (§10.2.8).
+- Fix: PUBLISH_BLOCKED and a REDIRECT's track name are held to the 4096-byte Full Track Name
+  limit.
+- Fix: a session closed for an error puts the MoQT error code on the wire at once
+  (CONNECTION_CLOSE application error, or the WebTransport session close code); it sent
+  nothing until the application exited, and then code 0.
+- Fix: a peer's WebTransport session close ends the MoQT session.
+- Fix: a second SUBSCRIBE to a track already subscribed in the session is refused with
+  DUPLICATE_SUBSCRIPTION (§5.1).
+- Fix: a SUBSCRIBE_NAMESPACE or SUBSCRIBE_TRACKS prefix overlapping an active one of the same
+  type is refused with PREFIX_OVERLAP (§10.18, §10.19).
+- Fix: at d18 a request in the `.` or `.session` namespace is refused with DOES_NOT_EXIST before
+  any application handler sees it (§3.2.1, §3.2.2).
+- Fix: `MediaPublisher` answers a SUBSCRIBE for an unknown track with DOES_NOT_EXIST instead of
+  no reply; `MediaSubscriber` keeps its catalog subscription when the joining FETCH is refused
+  instead of subscribing twice.
 - `moq_interop_client`: `data-subgroup-basic` data-plane test, in the standard set.
 - `moq_interop_client`: `rendezvous-timeout` test, in the standard set; SKIP below d18.
 - `moq_interop_client`: with no `--draft`/`DRAFT`, probes `18,16,14` (newest first) instead

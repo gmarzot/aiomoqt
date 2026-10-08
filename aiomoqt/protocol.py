@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import logging
 import time
 from asyncio import Future
@@ -323,7 +324,7 @@ class _MOQTSessionMixin:
         self._stream_torn_down_evict_after: float = 30.0
         self._stream_torn_down_last_sweep: float = 0.0
         self._tasks: Set[asyncio.Task] = set()
-        self._close_err = None  # tuple holding latest (error_code, Reason_phrase)
+        self._close_err = None  # first (error_code, reason_phrase) closed with
 
         self._bidi_streams: Dict[int, int] = {}  # map request_id to bidi stream_id (d16)
         self._bidi_stream_requests: Dict[int, int] = {}  # map bidi stream_id to request_id (d16)
@@ -340,6 +341,9 @@ class _MOQTSessionMixin:
         # Request ids, ours and the peer's, to the entry that owns them.
         # Client ids are even and server ids odd, so they cannot collide.
         self._requests: Dict[int, _RequestEntry] = {}
+        # Admitted peer SUBSCRIBE / SUBSCRIBE_NAMESPACE / SUBSCRIBE_TRACKS:
+        # request_id -> (message class, full track name or prefix).
+        self._peer_requests: Dict[int, Tuple[type, tuple]] = {}
         # Aliases the peer assigned (SUBSCRIBE_OK / PUBLISH) -> our
         # request id: the receive-side registry.
         self._track_aliases: Dict[int, int] = {}
@@ -728,6 +732,7 @@ class _MOQTSessionMixin:
         PUBLISH_DONE handler stays for a PUBLISH_DONE still inbound."""
         cb = self._request_cancel_handlers.pop(request_id, None)
         self._requests.pop(request_id, None)
+        self._peer_requests.pop(request_id, None)
         if not replies_pending:
             self._publish_done_handlers.pop(request_id, None)
         logger.info(f"MOQT: request {request_id} cancelled by {why}")
@@ -966,11 +971,12 @@ class _MOQTSessionMixin:
                 self._extend_request_credit(rid)
             msg_len += hdr_len
             if end_pos > buf.tell():
-                logger.debug(f"MOQT event: control message: seeking msg end: {end_pos}")
-                buf.seek(end_pos)
+                raise MOQTProtocolViolation(
+                    f"{message_class.__name__} body ends "
+                    f"{end_pos - buf.tell()} bytes short of its Length")
             logger.info(f"MOQT event: control message parsed: {msg})")
-
-            routed = self._track_handler(msg)
+            refusal = self._refuse_request(msg)
+            routed = refusal or self._track_handler(msg)
             if routed is not None:
                 handler = routed
 
@@ -2106,7 +2112,7 @@ class _MOQTSessionMixin:
                 logger.info(f"QUIC: connection closed: code: {error}")
             else:
                 logger.error(f"QUIC error: code: {error} reason: {reason}")
-            self._close_session(error, reason)
+            self._close_session(error, reason, transmit=False)
             return
 
         if isinstance(event, ProtocolNegotiated):
@@ -2216,15 +2222,24 @@ class _MOQTSessionMixin:
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(f"QUIC event: event not handled({class_name(event)})")
 
-    def _close_session(self, 
-              error_code: SessionCloseCode = SessionCloseCode.NO_ERROR, 
-              reason_phrase: str = "no error") -> None:
-        """Close the MoQT session."""
+    def _close_session(self,
+              error_code: SessionCloseCode = SessionCloseCode.NO_ERROR,
+              reason_phrase: str = "no error", *,
+              transmit: bool = True) -> None:
+        """Close the MoQT session. The first close's code is the one sent;
+        transmit=False when the peer already closed the connection."""
         if error_code == SessionCloseCode.NO_ERROR:
             logger.info(f"MOQT: closing: {reason_phrase} ({error_code})")
         else:
             logger.error(f"MOQT error: closing: {reason_phrase} ({error_code})")
-        self._close_err = (error_code, reason_phrase)
+        first = self._close_err is None
+        if first:
+            self._close_err = (error_code, reason_phrase)
+            if transmit:
+                try:
+                    self._loop.call_soon(self.close)
+                except RuntimeError:  # loop already closed
+                    pass
         if self._reaper_handle is not None:
             self._reaper_handle.cancel()
             self._reaper_handle = None
@@ -2262,15 +2277,19 @@ class _MOQTSessionMixin:
         # CONNECTION_CLOSE (which causes reset_stream on the peer).
         # Only FIN streams we own the write side of — sending
         # end_stream on peer-initiated uni streams produces
-        # RESET_STREAM which confuses relays.
+        # RESET_STREAM which confuses relays. An error close skips them:
+        # a FIN on the control stream reaches the peer first and reads
+        # as a critical-stream close, masking the error code.
         is_client = self._is_client
+        graceful = int(error_code) == SessionCloseCode.NO_ERROR
         try:
             if self._control_write_stream_id is not None:
-                self._quic.send_stream_data(
-                    self._control_write_stream_id, b"", end_stream=True)
+                if graceful:
+                    self._quic.send_stream_data(
+                        self._control_write_stream_id, b"", end_stream=True)
                 self._control_stream_id = None
                 self._d18_control_write_sid = None
-            for stream_id in list(self._data_streams.keys()):
+            for stream_id in list(self._data_streams.keys() if graceful else ()):
                 # We own the write side if we initiated the stream.
                 # QUIC stream ID bits 0-1: 0=client-bidi, 1=server-bidi,
                 # 2=client-uni, 3=server-uni
@@ -2295,7 +2314,16 @@ class _MOQTSessionMixin:
         # Close the QUIC connection on the next loop tick so the FINs
         # queued above get a transmit pass first — batched with
         # CONNECTION_CLOSE the peer sees them as RESET_STREAM.
-        parent_close = super().close
+        # The MoQT error code is the CONNECTION_CLOSE application error
+        # (raw QUIC) or the WebTransport session close code.
+        if self._is_wt:
+            reason = (reason_phrase if isinstance(reason_phrase, bytes)
+                      else str(reason_phrase).encode())
+            parent_close = functools.partial(
+                super().close, int(error_code), reason)
+        else:
+            parent_close = functools.partial(
+                self._quic.close, error_code=int(error_code))
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -2739,6 +2767,54 @@ class _MOQTSessionMixin:
     _REPLY_CLASSES = (RequestOk, RequestError, SubscribeOk, SubscribeDone,
                       PublishOk, FetchOk)
 
+    def _refuse_request(self, msg: MOQTMessage) -> Optional[Callable]:
+        """Session-level request rules, applied before the application
+        sees the request (d16+): a reserved namespace (d18 §3.2.1-2), a
+        duplicate subscription (§5.1), an overlapping namespace prefix
+        (§10.18-19). Returns the handler that answers a refused request
+        with REQUEST_ERROR, else None; records an admitted subscription
+        until it ends."""
+        if (not is_draft16_or_later(self.negotiated_draft)
+                or not isinstance(msg, self._REQUEST_OPENERS)
+                or getattr(msg, 'request_id', None) is None):
+            return None
+        rid = int(msg.request_id)
+        ns = tuple(getattr(msg, 'track_namespace', None)
+                   or getattr(msg, 'namespace', None)
+                   or getattr(msg, 'namespace_prefix', None) or ())
+        kind = type(msg)
+        key = None
+        code = None
+        if self.negotiated_draft >= 18 and ns and ns[0] in (b".", b".session"):
+            # No session-level tracks are defined, so none is recognized.
+            code = RequestErrorCode.DOES_NOT_EXIST
+            reason = f"reserved namespace {ns[0].decode()}"
+        elif kind is Subscribe:
+            key = (ns, bytes(msg.track_name or b""))
+            if (kind, key) in self._peer_requests.values():
+                code = RequestErrorCode.DUPLICATE_SUBSCRIPTION
+                reason = "track already subscribed in this session"
+        elif kind in (SubscribeNamespace, SubscribeTracks):
+            key = ns
+            for k, prefix in self._peer_requests.values():
+                if k is kind and (prefix[:len(ns)] == ns
+                                  or ns[:len(prefix)] == prefix):
+                    code = RequestErrorCode.PREFIX_OVERLAP
+                    reason = "prefix overlaps an active subscription"
+                    break
+        if code is None:
+            if key is not None:
+                self._peer_requests[rid] = (kind, key)
+            return None
+        logger.info(f"MOQT: refusing {kind.__name__} {rid}: {reason}")
+        err = RequestError(request_id=rid, error_code=int(code),
+                           retry_interval=0, reason=reason)
+
+        # A handler task runs after the request's stream is bound.
+        async def refuse(session, _msg):
+            session._send_on_request_stream(rid, err, fin=True)
+        return refuse
+
     def _send_reply(self, request_id: int, msg: MOQTMessage,
                     fin: bool = False) -> None:
         """Send a response to a request. In d18 responses travel on the
@@ -2747,6 +2823,8 @@ class _MOQTSessionMixin:
         our half of the request stream after a terminal reply
         (REQUEST_ERROR, PUBLISH_DONE, TRACK_STATUS_OK: §3.3.2, §10.11,
         §10.14); it has no meaning on the control stream."""
+        if fin:
+            self._peer_requests.pop(request_id, None)
         if self._profile.control_uni_pair:
             self._send_on_request_stream(request_id, msg, fin=fin)
         else:
@@ -4188,6 +4266,10 @@ class _MOQTSessionMixin:
     async def _handle_unsubscribe_namespace(self, msg: UnsubscribeNamespace) -> None:
         logger.info(f"MOQT event: handle {msg}")
         # No response required per draft-14
+        prefix = tuple(msg.namespace_prefix or ())
+        for rid, (kind, key) in list(self._peer_requests.items()):
+            if kind is SubscribeNamespace and key == prefix:
+                del self._peer_requests[rid]
 
     async def _handle_publish(self, msg: Publish) -> None:
         logger.info(f"MOQT event: handle {msg}")
@@ -4490,7 +4572,7 @@ from aiopquic.asyncio.webtransport import (
     WebTransportServerSession as _AioPWTServerSession,
     _EVT_WT_STREAM_DATA, _EVT_WT_STREAM_FIN,
     _EVT_WT_STREAM_RESET, _EVT_WT_STOP_SENDING,
-    _EVT_WT_DATAGRAM,
+    _EVT_WT_DATAGRAM, _EVT_WT_SESSION_CLOSED,
 )
 
 
@@ -4545,6 +4627,11 @@ class _WTSessionMixin:
                 stream_id=sid, error_code=error_code))
         elif evt_type == _EVT_WT_DATAGRAM:
             self.quic_event_received(DatagramFrameReceived(data=data))
+        elif evt_type == _EVT_WT_SESSION_CLOSED:
+            super()._on_event(ev_tuple)
+            reason = bytes(data).decode(errors="replace") if data else ""
+            self._close_session(error_code, reason or "WebTransport session closed",
+                                transmit=False)
         else:
             super()._on_event(ev_tuple)
 

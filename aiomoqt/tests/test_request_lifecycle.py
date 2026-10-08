@@ -20,6 +20,7 @@ from collections import deque
 import pytest
 
 from aiomoqt.protocol import _MOQTSessionMixin
+from aiomoqt.messages.namespace import PublishNamespaceOk
 from aiomoqt.messages.request import RequestOk, RequestError
 from aiomoqt.types import MOQTRequestError
 from aiomoqt.context import profile_for
@@ -34,6 +35,7 @@ def _session(is_client=True):
     only the attributes the tested methods touch and stubs _send_request
     to record (request_id, msg) rather than hit the wire."""
     s = object.__new__(_MOQTSessionMixin)
+    s._peer_requests = {}
     s._next_request_id = 0 if is_client else 1
     s._sent_requests = deque(maxlen=1024)
     s._pending_requests = {}
@@ -330,15 +332,17 @@ def test_request_ok_request_id_on_wire_per_draft(draft):
 
 @pytest.mark.parametrize("draft", [14, 16, 18])
 async def test_response_resolves_correct_future_per_draft(draft):
-    # End-to-end through the real dispatch path: a peer RequestOk resolves
-    # the matching pending future via the in-band id (d14/d16) or the
-    # stream-injected id (d18).
+    # End-to-end through the real dispatch path: a peer OK resolves the
+    # matching pending future via the in-band id (d14/d16) or the
+    # stream-injected id (d18). REQUEST_OK is d16+; d14 uses its code
+    # point's PUBLISH_NAMESPACE_OK.
     s = _drive_session(draft)
     rid = s._allocate_request_id()
     fut = s._loop.create_future()
     s._pending_requests[rid] = fut
-    wire = bytes(RequestOk(request_id=rid, parameters={}).serialize(
-        prof=s._profile).data)
+    ok = (PublishNamespaceOk(request_id=rid) if draft < 16
+          else RequestOk(request_id=rid, parameters={}))
+    wire = bytes(ok.serialize(prof=s._profile).data)
     stream_rid = None if s._profile.reply_has_request_id else rid
     s._moqt_handle_control_message(Buffer(data=wire), request_id=stream_rid)
     await asyncio.sleep(0)  # let the scheduled handler task run

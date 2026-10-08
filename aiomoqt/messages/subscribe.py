@@ -50,7 +50,8 @@ class TrackStatus(MOQTMessage):
             params = dict(self.parameters or {})
             if self.priority is not None:
                 params[ParamType.SUBSCRIBER_PRIORITY] = self.priority
-            if self.group_order is not None:
+            # d16+ has no 0 value; omission means the publisher's order.
+            if self.group_order not in (None, GroupOrder.PUBLISHER_DEFAULT):
                 params[ParamType.GROUP_ORDER] = self.group_order
             if self.forward is not None:
                 params[ParamType.FORWARD] = self.forward
@@ -96,10 +97,8 @@ class TrackStatus(MOQTMessage):
 
         request_id = buf.pull_vint()
 
-        namespace = MOQTMessage._pull_tuple(buf)
-
-        track_name_len = buf.pull_vint()
-        track_name = buf.pull_bytes(track_name_len)
+        namespace, track_name = MOQTMessage._pull_full_track_name(
+            buf, prof=prof)
 
         priority = None
         group_order = None
@@ -132,10 +131,15 @@ class TrackStatus(MOQTMessage):
                     if prof.vi64:
                         # d18: End Group arrives as a delta from Start.
                         end_group += start_group or 0
+                        if end_group > (1 << 64) - 1:
+                            raise MOQTProtocolViolation(
+                                f"end group {end_group} exceeds 2^64-1")
         else:
             priority = buf.pull_uint8()
             group_order = buf.pull_uint8()
+            MOQTMessage._check_range("group order", group_order, 0, 2)
             forward = buf.pull_uint8()
+            MOQTMessage._check_range("forward", forward, 0, 1)
             filter_type = buf.pull_vint()
             if filter_type not in (1, 2, 3, 4):
                 raise MOQTProtocolViolation(
@@ -311,7 +315,8 @@ class Subscribe(MOQTMessage):
             params = dict(self.parameters or {})
             if self.priority is not None:
                 params[ParamType.SUBSCRIBER_PRIORITY] = self.priority
-            if self.group_order is not None:
+            # d16+ has no 0 value; omission means the publisher's order.
+            if self.group_order not in (None, GroupOrder.PUBLISHER_DEFAULT):
                 params[ParamType.GROUP_ORDER] = self.group_order
             if self.forward is not None:
                 params[ParamType.FORWARD] = self.forward
@@ -369,10 +374,8 @@ class Subscribe(MOQTMessage):
 
         request_id = buf.pull_vint()
 
-        namespace = MOQTMessage._pull_tuple(buf)
-
-        track_name_len = buf.pull_vint()
-        track_name = buf.pull_bytes(track_name_len)
+        namespace, track_name = MOQTMessage._pull_full_track_name(
+            buf, prof=prof)
 
         priority = None
         group_order = None
@@ -406,11 +409,16 @@ class Subscribe(MOQTMessage):
                     if prof.vi64:
                         # d18: End Group arrives as a delta from Start.
                         end_group += start_group or 0
+                        if end_group > (1 << 64) - 1:
+                            raise MOQTProtocolViolation(
+                                f"end group {end_group} exceeds 2^64-1")
         else:
             # d14: fixed fields on wire
             priority = buf.pull_uint8()
             group_order = buf.pull_uint8()
+            MOQTMessage._check_range("group order", group_order, 0, 2)
             forward = buf.pull_uint8()
+            MOQTMessage._check_range("forward", forward, 0, 1)
             filter_type = buf.pull_vint()
             if filter_type not in (1, 2, 3, 4):
                 raise MOQTProtocolViolation(
@@ -549,10 +557,15 @@ class SubscribeOk(MOQTMessage):
             if track_extensions is not None:
                 group_order_val = track_extensions.pop(0x22, None)
                 if group_order_val is not None:
+                    MOQTMessage._check_range(
+                        "default publisher group order",
+                        group_order_val, 1, 2)
                     group_order = GroupOrder(group_order_val)
         else:
             expires = buf.pull_vint()
-            group_order = GroupOrder(buf.pull_uint8())
+            group_order = buf.pull_uint8()
+            MOQTMessage._check_range("group order", group_order, 1, 2)
+            group_order = GroupOrder(group_order)
             content_exists = buf.pull_uint8()
             if content_exists == ContentExistsCode.EXISTS:
                 largest_group_id = buf.pull_vint()
@@ -654,6 +667,7 @@ class SubscribeUpdate(MOQTMessage):
         end_group = buf.pull_vint()
         priority = buf.pull_uint8()
         forward = buf.pull_uint8()
+        MOQTMessage._check_range("forward", forward, 0, 1)
         params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
 
         return cls(

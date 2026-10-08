@@ -121,8 +121,8 @@ class RequestError(MOQTMessage):
         if (error_code == cls.REDIRECT and not prof.reply_has_request_id
                 and (buf_end is None or buf.tell() < buf_end)):
             uri = buf.pull_bytes(buf.pull_vint())
-            namespace = MOQTMessage._pull_tuple(buf)
-            name = buf.pull_bytes(buf.pull_vint())
+            namespace, name = MOQTMessage._pull_full_track_name(
+                buf, prof=prof)
             redirect = (uri, namespace, name)
 
         return cls(
@@ -214,7 +214,7 @@ class Namespace(MOQTMessage):
 
     @classmethod
     def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'Namespace':
-        namespace_suffix = MOQTMessage._pull_tuple(buf)
+        namespace_suffix = MOQTMessage._pull_tuple(buf, prof=prof)
         return cls(namespace_suffix=namespace_suffix)
 
 
@@ -248,5 +248,5 @@ class NamespaceDone(MOQTMessage):
 
     @classmethod
     def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'NamespaceDone':
-        namespace_suffix = MOQTMessage._pull_tuple(buf)
+        namespace_suffix = MOQTMessage._pull_tuple(buf, prof=prof)
         return cls(namespace_suffix=namespace_suffix)

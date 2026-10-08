@@ -16,7 +16,7 @@
 | `aiomoqt/media/` | MSF catalog, LOC, CMSF/CMAF packaging |
 | `aiomoqt/tools/` | CLI tools — bench, pub/sub media, interop relay, relay probe |
 | `aiomoqt/tests/` | the pytest tree — **inside** the package |
-| `tests/` | `release_regression_test.py` (tier runner) + `relays.json`. No pytest files |
+| `tests/` | `release_regression_test.py` (tier runner) + `relays.json`; `contrib/` = contribution-runner sweep. No pytest files |
 
 ## Setup
 
@@ -58,7 +58,9 @@ CI (`.github/workflows/ci.yml`): `core` = unit + integration on the full matrix,
 fetch stream); `multi-proc` = `pub_server` against `sub_bench`; `peer-interop` = cloudflare
 `moq-rs` plus the `ghcr.io/openmoq/moqx` image; `microbenchmark` is continue-on-error.
 `moq-conformance.yml` scores us against moxygen's moq-test client, pinned in
-`.github/moxygen-pin`. Zero objects delivered is a failure, never a pass — an assertion that
+`.github/moxygen-pin`. `contrib-conformance.yml` sweeps our publisher under mondain's
+contribution runner (pinned in `.github/contrib-runner-pin`) against
+`tests/contrib/baseline.json`; report-only for now. Zero objects delivered is a failure, never a pass — an assertion that
 cannot find its results line fails loudly rather than vacuously.
 
 Anything with per-track or per-request state gets a test with at least two tracks on one session,
