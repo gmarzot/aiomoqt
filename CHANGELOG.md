@@ -9,6 +9,12 @@
 - Fix: when the session closes, awaited requests fail with "session closed" and awaited fetches
   end unclean, instead of waiting out their timeout; a request awaited after the close fails
   at once.
+- Fix: authorization tokens follow the token cache rules (§10.2.2, §10.3.1.4): an undecodable
+  Token closes the session with KEY_VALUE_FORMATTING_ERROR, a registration beyond our advertised
+  MAX_AUTH_TOKEN_CACHE_SIZE with AUTH_TOKEN_CACHE_OVERFLOW (in SETUP it is used as a value), a
+  repeated alias with DUPLICATE_AUTH_TOKEN_ALIAS, and an unregistered alias refuses its request.
+  Registered aliases resolve to their value; REGISTER, USE_ALIAS and DELETE decode to the new
+  `AuthTokenRef`.
 - Fix: several `PublishedTrack`s on one session each get their own PUBLISH_OK, SUBSCRIBE and
   updates; before, the last track published took them all.
 - `PublishedTrack.attach()` serves a track on a session without announcing it; `publish()`
