@@ -15,6 +15,9 @@
   repeated alias with DUPLICATE_AUTH_TOKEN_ALIAS, and an unregistered alias refuses its request.
   Registered aliases resolve to their value; REGISTER, USE_ALIAS and DELETE decode to the new
   `AuthTokenRef`.
+- Fix: a raw-QUIC client's CONNECTION_CLOSE is sent before the transport stops: leaving
+  `MOQTClient.connect()` gives it up to 0.3 s, an error close is sent at once, and a closing
+  session sends it before failing its waiters. It was dropped whenever the app exited promptly.
 - Fix: several `PublishedTrack`s on one session each get their own PUBLISH_OK, SUBSCRIBE and
   updates; before, the last track published took them all.
 - `PublishedTrack.attach()` serves a track on a session without announcing it; `publish()`

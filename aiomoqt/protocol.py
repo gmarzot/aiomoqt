@@ -2271,12 +2271,14 @@ class _MOQTSessionMixin:
         first = self._close_err is None
         if first:
             self._close_err = (error_code, reason_phrase)
-            self._fail_pending(reason_phrase)
+            # Close before failing waiters: an app that exits on the
+            # failure stops the transport.
             if transmit:
                 try:
-                    self._loop.call_soon(self.close)
-                except RuntimeError:  # loop already closed
-                    pass
+                    self.close()
+                except Exception:
+                    logger.debug("MOQT: close failed", exc_info=True)
+            self._fail_pending(reason_phrase)
         if self._reaper_handle is not None:
             self._reaper_handle.cancel()
             self._reaper_handle = None
@@ -2348,11 +2350,11 @@ class _MOQTSessionMixin:
         # set the async exit condition for session
         if not self._moqt_session_closed.done():
             self._moqt_session_closed.set_result((error_code, reason_phrase))
-        # Close the QUIC connection on the next loop tick so the FINs
-        # queued above get a transmit pass first — batched with
-        # CONNECTION_CLOSE the peer sees them as RESET_STREAM.
         # The MoQT error code is the CONNECTION_CLOSE application error
-        # (raw QUIC) or the WebTransport session close code.
+        # (raw QUIC) or the WebTransport session close code. A graceful
+        # close goes out a loop tick later so the FINs queued above get a
+        # transmit pass first (batched with CONNECTION_CLOSE the peer sees
+        # them as RESET_STREAM); an error close has none and goes now.
         if self._is_wt:
             reason = (reason_phrase if isinstance(reason_phrase, bytes)
                       else str(reason_phrase).encode())
@@ -2365,7 +2367,7 @@ class _MOQTSessionMixin:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             loop = None
-        if loop is not None:
+        if loop is not None and graceful:
             loop.call_soon(parent_close)
         else:
             parent_close()

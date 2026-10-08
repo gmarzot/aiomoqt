@@ -73,3 +73,36 @@ async def test_a_request_pending_at_close_fails_promptly():
             assert loop.time() - t0 < 1.0
     finally:
         quic_server.close()
+
+
+@requires_certs
+async def test_a_client_that_exits_on_the_failure_still_sends_its_close():
+    # The client closes on a wrong-parity GOAWAY while its SUBSCRIBE is
+    # pending; the app exits on the failed request at once, and the
+    # server must still receive the close with its code.
+    from aiomoqt.messages.session_setup import GoAway
+    port = _PORT + 3
+    server_session = asyncio.get_running_loop().create_future()
+
+    async def _bad_goaway(session, msg):
+        session.send_control_message(
+            GoAway(new_session_uri="", timeout=0, request_id=1))
+        server_session.set_result(session)
+
+    server = MOQTServer(host="localhost", port=port, certificate=CERT,
+                        private_key=KEY, path="/", use_quic=True,
+                        supported_drafts=18)
+    server.register_handler(MOQTMessageType.SUBSCRIBE, _bad_goaway)
+    quic_server = await server.serve()
+    try:
+        client = MOQTClient("localhost", port, path="/", use_quic=True,
+                            verify_tls=False, supported_drafts=18)
+        async with client.connect() as session:
+            await session.client_session_init()
+            with pytest.raises(MOQTRequestError, match="session closed"):
+                await session.subscribe("n", "t", wait_response=True)
+        peer = await asyncio.wait_for(server_session, 5)
+        code, _ = await asyncio.wait_for(peer._moqt_session_closed, 5)
+        assert code == SessionCloseCode.INVALID_REQUEST_ID
+    finally:
+        quic_server.close()
