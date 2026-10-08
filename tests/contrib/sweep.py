@@ -62,7 +62,7 @@ def _cert(out):
          "-keyout", str(key), "-out", str(cert), "-days", "2",
          "-subj", "/CN=localhost",
          "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1"],
-        check=True, capture_output=True)
+        check=True, capture_output=True, timeout=30)
     return cert, key
 
 
@@ -128,8 +128,12 @@ def _run(base, args, out, scenarios):
     else:
         raise SweepError(f"{rid} not finalized before its deadline")
     for ext in ("json", "tap"):
-        with urllib.request.urlopen(f"{base}/results/{rid}.{ext}") as r:
-            (out / "results" / f"{rid}.{ext}").write_bytes(r.read())
+        try:
+            with urllib.request.urlopen(f"{base}/results/{rid}.{ext}",
+                                        timeout=30) as r:
+                (out / "results" / f"{rid}.{ext}").write_bytes(r.read())
+        except OSError as e:
+            raise SweepError(f"fetching {rid}.{ext}: {e}") from e
     print(f"{rid}: {len(scenarios)} scenario(s) -> {cur['run']['verdict']}",
           flush=True)
     return status, body
@@ -258,7 +262,7 @@ def main():
         finally:
             _stop(proc)
         rows = outcomes(args.out / "results")
-    except (SweepError, OSError, subprocess.CalledProcessError) as e:
+    except (SweepError, OSError, subprocess.SubprocessError) as e:
         print(f"sweep failed: {e}", file=sys.stderr)
         return 2
     (args.out / "outcomes.json").write_text(json.dumps(rows, indent=1))
