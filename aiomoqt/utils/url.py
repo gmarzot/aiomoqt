@@ -98,11 +98,14 @@ def parse_relay_url(url: str, force_quic: bool = False,
 
     parsed = urlparse(url)
     scheme = parsed.scheme.lower()
+    if scheme in ("moqt", "https") and not parsed.hostname:
+        # MoQT §3.1.1 and RFC 9110 §4.2.2: the host MUST NOT be empty.
+        raise ValueError(f"{url}: empty host")
 
     if scheme == "moqt":
         query = f"?{parsed.query}" if parsed.query else ""
         return MOQTRelay(
-            host=parsed.hostname or "localhost",
+            host=parsed.hostname,
             port=parsed.port or MOQT_DEFAULT_PORT,
             use_quic=True,
             path=parsed.path + query,
@@ -110,7 +113,7 @@ def parse_relay_url(url: str, force_quic: bool = False,
     elif scheme == "https":
         path = normalize_wt_path(parsed.path or default_path)
         return MOQTRelay(
-            host=parsed.hostname or "localhost",
+            host=parsed.hostname,
             port=parsed.port or HTTPS_DEFAULT_PORT,
             use_quic=force_quic,
             path=None if force_quic else path,
