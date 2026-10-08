@@ -453,6 +453,12 @@ class _MOQTSessionMixin:
         if fut is None:
             fut = self._loop.create_future()
             self._pending_requests[request_id] = fut
+        if self._close_err is not None and not fut.done():
+            self._pending_requests.pop(request_id, None)
+            raise MOQTRequestError(
+                error_code=int(RequestErrorCode.INTERNAL_ERROR),
+                reason=f"session closed: {self._close_err[1]}",
+                retry_interval=0)
         try:
             async with asyncio.timeout(timeout):
                 response = await fut
@@ -2232,6 +2238,19 @@ class _MOQTSessionMixin:
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(f"QUIC event: event not handled({class_name(event)})")
 
+    def _fail_pending(self, reason: str) -> None:
+        """A closed session answers nothing more: fail every awaited
+        request and end every awaited fetch as unclean."""
+        for fut in self._pending_requests.values():
+            if not fut.done():
+                fut.set_exception(MOQTRequestError(
+                    error_code=int(RequestErrorCode.INTERNAL_ERROR),
+                    reason=f"session closed: {reason}", retry_interval=0))
+                fut.exception()  # retrieved, even if nothing awaits it
+        for fut in self._fetch_done_futures.values():
+            if not fut.done():
+                fut.set_result(False)
+
     def _close_session(self,
               error_code: SessionCloseCode = SessionCloseCode.NO_ERROR,
               reason_phrase: str = "no error", *,
@@ -2245,6 +2264,7 @@ class _MOQTSessionMixin:
         first = self._close_err is None
         if first:
             self._close_err = (error_code, reason_phrase)
+            self._fail_pending(reason_phrase)
             if transmit:
                 try:
                     self._loop.call_soon(self.close)

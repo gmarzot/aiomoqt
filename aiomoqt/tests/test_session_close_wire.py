@@ -8,7 +8,7 @@ import pytest
 from aiomoqt.client import MOQTClient
 from aiomoqt.messages.subscribe import Subscribe
 from aiomoqt.server import MOQTServer
-from aiomoqt.types import SessionCloseCode
+from aiomoqt.types import MOQTMessageType, MOQTRequestError, SessionCloseCode
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
 
@@ -41,3 +41,35 @@ async def test_violation_close_reaches_the_peer_with_its_code(use_quic, port):
             assert code == SessionCloseCode.PROTOCOL_VIOLATION
     finally:
         server.close()
+
+
+@requires_certs
+async def test_a_request_pending_at_close_fails_promptly():
+    # The server closes instead of answering: the client's SUBSCRIBE fails
+    # with the session, not after its timeout, and so does a later one.
+    port = _PORT + 2
+
+    async def _close_instead(session, msg):
+        session._close_session(SessionCloseCode.PROTOCOL_VIOLATION, "bye")
+
+    server = MOQTServer(host="localhost", port=port, certificate=CERT,
+                        private_key=KEY, path="/", use_quic=True,
+                        supported_drafts=18)
+    server.register_handler(MOQTMessageType.SUBSCRIBE, _close_instead)
+    quic_server = await server.serve()
+    try:
+        client = MOQTClient("localhost", port, path="/", use_quic=True,
+                            verify_tls=False, supported_drafts=18)
+        async with client.connect() as session:
+            await session.client_session_init()
+            loop = asyncio.get_running_loop()
+            t0 = loop.time()
+            with pytest.raises(MOQTRequestError, match="session closed"):
+                await session.subscribe("n", "t", wait_response=True)
+            assert loop.time() - t0 < 5.0
+            t0 = loop.time()
+            with pytest.raises(MOQTRequestError, match="session closed"):
+                await session.subscribe("n", "u", wait_response=True)
+            assert loop.time() - t0 < 1.0
+    finally:
+        quic_server.close()

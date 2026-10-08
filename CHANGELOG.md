@@ -6,6 +6,9 @@
   INVALID_REQUEST_ID (§10.4).
 - Fix: a `moqt://` or `https://` URL with an empty host is refused instead of dialling
   localhost (§3.1.1); the tools reject it as a usage error.
+- Fix: when the session closes, awaited requests fail with "session closed" and awaited fetches
+  end unclean, instead of waiting out their timeout; a request awaited after the close fails
+  at once.
 - Fix: several `PublishedTrack`s on one session each get their own PUBLISH_OK, SUBSCRIBE and
   updates; before, the last track published took them all.
 - `PublishedTrack.attach()` serves a track on a session without announcing it; `publish()`
