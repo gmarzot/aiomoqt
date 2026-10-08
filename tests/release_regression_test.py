@@ -266,7 +266,7 @@ def _loopback_adaptive_mp(log_dir: Path, draft: int) -> tuple[str, str]:
            "--mp", "--draft", str(draft),
            "-P", "1", "-s", "4096", "--start-mbps", "20",
            "--step-mbps", "10", "--max-mbps", "60", "--interval", "2",
-           "-t", "8"]
+           "-t", "8", "-k"]
     _run(cmd, log, 30)
     text = log.read_text()
     m = re.search(r"High-water:\s+([\d.]+)\s*([KMGT]?bps)", text)
@@ -389,7 +389,7 @@ def _loopback_adaptive_bench(log_dir: Path) -> tuple[str, str]:
            sys.executable, "-m", "aiomoqt.tools.adaptive_bench",
            "--start-mbps", "10", "--step-mbps", "10",
            "--max-mbps", "500", "--interval", "3",
-           "-l", "100"]
+           "-l", "100", "-k"]
     _run(cmd, log, 45)
     text = log.read_text()
     # fmt_bps emits e.g. "80Mbps" or "1.2Gbps" (no space) — match both

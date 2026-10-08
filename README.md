@@ -55,6 +55,9 @@ python -m aiomoqt.tools.relay_probe --url https://moqx-main.ci.openmoq.org:4433/
 
 The probe exits 0 if any draft handshakes, so it drops straight into a shell conditional.
 
+Clients verify the relay's certificate against certifi's roots; pass `-k` to accept a
+self-signed one (the loopback tools do), or `MOQTClient(ca_file=...)` to trust a private CA.
+
 ### 2. Subscribe
 
 ```python

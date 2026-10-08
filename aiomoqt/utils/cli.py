@@ -189,7 +189,7 @@ def add_session(p, insecure=True, certs=False, keepalive=False,
                    help='MoQT draft version: 14, 16, or 18')
     if insecure:
         p.add_argument('-k', '--insecure', action='store_true',
-                       help='Skip TLS certificate verification')
+                       help='Accept any server certificate (self-signed relays)')
     if certs:
         p.add_argument('--cert', type=str, default=None,
                        help='TLS certificate file')
