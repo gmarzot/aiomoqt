@@ -1996,6 +1996,13 @@ class _MOQTSessionMixin:
                     return
         if end_stream:
             self._control_chains.pop(stream_id, None)
+            # §3.3: the control stream is never closed while the session
+            # lives.
+            if not is_request_bidi and stream_id == self._control_read_stream_id:
+                self._close_session(
+                    SessionCloseCode.PROTOCOL_VIOLATION,
+                    f"peer closed its control stream {stream_id}")
+                return
             if stream_id in self._cancelled_request_streams:
                 self._cancelled_request_streams.discard(stream_id)
                 request_id = self._bidi_stream_requests.pop(stream_id, None)
@@ -2187,7 +2194,7 @@ class _MOQTSessionMixin:
 
             # Abrupt close of a critical stream
             if (event.end_stream and len(data) == 0 and
-                    stream_id in (self._control_read_stream_id, self._session_id)):
+                    stream_id == self._session_id):
                 self._close_session(
                     SessionCloseCode.INTERNAL_ERROR,
                     f"critical stream closed by remote peer: {stream_id}"
@@ -2311,21 +2318,16 @@ class _MOQTSessionMixin:
             error_code, reason_phrase = self._close_err
         logger.info(f"MOQT session: closing: {reason_phrase} ({error_code})")
 
-        # Gracefully FIN open streams before closing the connection.
-        # Transmit FINs separately so they don't get batched with
-        # CONNECTION_CLOSE (which causes reset_stream on the peer).
-        # Only FIN streams we own the write side of — sending
-        # end_stream on peer-initiated uni streams produces
-        # RESET_STREAM which confuses relays. An error close skips them:
-        # a FIN on the control stream reaches the peer first and reads
-        # as a critical-stream close, masking the error code.
+        # Gracefully FIN our open data streams before closing the
+        # connection, separately so they are not batched with
+        # CONNECTION_CLOSE (which resets them at the peer). Only streams we
+        # own the write side of: end_stream on a peer-initiated uni stream
+        # produces RESET_STREAM. The control stream is never closed while
+        # the session lives (§3.3), and an error close skips the FINs.
         is_client = self._is_client
         graceful = int(error_code) == SessionCloseCode.NO_ERROR
         try:
             if self._control_write_stream_id is not None:
-                if graceful:
-                    self._quic.send_stream_data(
-                        self._control_write_stream_id, b"", end_stream=True)
                 self._control_stream_id = None
                 self._d18_control_write_sid = None
             for stream_id in list(self._data_streams.keys() if graceful else ()):

@@ -106,3 +106,61 @@ async def test_a_client_that_exits_on_the_failure_still_sends_its_close():
         assert code == SessionCloseCode.INVALID_REQUEST_ID
     finally:
         quic_server.close()
+
+
+async def _capture_and_refuse(holder, session, msg):
+    session.subscribe_error(msg.request_id, 0x10, "no such track")
+    if not holder.done():
+        holder.set_result(session)
+
+
+@requires_certs
+async def test_a_graceful_close_reaches_the_peer_as_no_error():
+    # §3.3: the control stream is never closed while the session lives,
+    # so a graceful close is the CONNECTION_CLOSE alone.
+    port = _PORT + 4
+    server_session = asyncio.get_running_loop().create_future()
+    server = MOQTServer(host="localhost", port=port, certificate=CERT,
+                        private_key=KEY, path="/", use_quic=True,
+                        supported_drafts=18)
+    server.register_handler(
+        MOQTMessageType.SUBSCRIBE,
+        lambda s, m: _capture_and_refuse(server_session, s, m))
+    quic_server = await server.serve()
+    try:
+        client = MOQTClient("localhost", port, path="/", use_quic=True,
+                            verify_tls=False, supported_drafts=18)
+        async with client.connect() as session:
+            await session.client_session_init()
+            with pytest.raises(MOQTRequestError):
+                await session.subscribe("n", "t", wait_response=True)
+        peer = await asyncio.wait_for(server_session, 5)
+        code, _ = await asyncio.wait_for(peer._moqt_session_closed, 5)
+        assert code == SessionCloseCode.NO_ERROR
+    finally:
+        quic_server.close()
+
+
+@requires_certs
+async def test_a_peer_that_closes_its_control_stream_is_a_violation():
+    port = _PORT + 5
+
+    async def _close_control(session, msg):
+        session._quic.send_stream_data(
+            session._control_write_stream_id, b"", end_stream=True)
+
+    server = MOQTServer(host="localhost", port=port, certificate=CERT,
+                        private_key=KEY, path="/", use_quic=True,
+                        supported_drafts=18)
+    server.register_handler(MOQTMessageType.SUBSCRIBE, _close_control)
+    quic_server = await server.serve()
+    try:
+        client = MOQTClient("localhost", port, path="/", use_quic=True,
+                            verify_tls=False, supported_drafts=18)
+        async with client.connect() as session:
+            await session.client_session_init()
+            session.subscribe("n", "t", wait_response=False)
+            code, _ = await asyncio.wait_for(session._moqt_session_closed, 5)
+            assert code == SessionCloseCode.PROTOCOL_VIOLATION
+    finally:
+        quic_server.close()
