@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import ssl
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import List, Optional, Union
@@ -158,13 +159,24 @@ class MOQTClient(MOQTPeer):
                     "MOQT: quic_debug_log requested for raw-QUIC client; "
                     "not yet plumbed in aiopquic.connect (use WT or wait "
                     "for aiopquic 0.3.2)")
-            return aiopquic_connect(
-                self.host, self.port,
-                configuration=cfg,
-                create_protocol=protocol,
-            )
+            return self._connect_quic(cfg, protocol)
 
         return self._connect_wt()
+
+    @asynccontextmanager
+    async def _connect_quic(self, cfg, protocol):
+        async with aiopquic_connect(self.host, self.port, configuration=cfg,
+                                    create_protocol=protocol) as session:
+            try:
+                yield session
+            finally:
+                # aiopquic stops the transport as this block exits; give the
+                # CONNECTION_CLOSE time to leave first.
+                if not session._moqt_session_closed.done():
+                    session.close()
+                await asyncio.sleep(0)
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(session.wait_closed(), 0.3)
 
     @asynccontextmanager
     async def _connect_wt(self):

@@ -59,6 +59,24 @@ class TestUrlPathLeadingSlash:
         assert r.path == "/moq-relay"
 
 
+@pytest.mark.parametrize("url", ["moqt://:4433/moq", "moqt:///moq",
+                                 "https://:443/moq-relay"])
+def test_an_empty_host_is_refused(url):
+    # MoQT §3.1.1 (moqt) and RFC 9110 §4.2.2 (https).
+    with pytest.raises(ValueError, match="empty host"):
+        parse_relay_url(url)
+
+
+def test_a_tool_refuses_an_empty_host_url():
+    from aiomoqt.utils import cli
+    parser = cli.make_parser("t")
+    cli.add_endpoint(parser)
+    with pytest.raises(SystemExit) as exit_:
+        parser.parse_args(["moqt://:4433/moq"])
+    assert exit_.value.code == 2
+    assert parser.parse_args(["moqt://h:4433/moq"]).url == "moqt://h:4433/moq"
+
+
 class TestMoqtSetupPath:
     """§10.3.1.2: over native QUIC the URI's path-abempty (and query) is
     the SETUP PATH, the only place a moqt:// path reaches the relay."""

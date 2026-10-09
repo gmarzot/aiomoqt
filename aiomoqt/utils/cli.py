@@ -44,6 +44,7 @@ split execution (tools that can run one end or both)
 import argparse
 
 from aiomoqt.types import parse_draft_spec
+from aiomoqt.utils.url import parse_relay_url
 
 # Defaults, one place. Powers of two, same on every tool.
 DEFAULT_OBJECT_SIZE = 4096
@@ -74,10 +75,19 @@ def add_help(p):
 
 # -- addressing ------------------------------------------------------
 
+def _endpoint(value):
+    """argparse type for a dialled URL: refuse one the dialler would."""
+    try:
+        parse_relay_url(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e))
+    return value
+
+
 def add_endpoint(p, required=True):
     """Positional URL for tools that dial. Scheme picks the transport."""
     kw = {} if required else {'nargs': '?', 'default': None}
-    p.add_argument('url', metavar='URL', **kw,
+    p.add_argument('url', metavar='URL', type=_endpoint, **kw,
                    help='Endpoint. moqt://host[:port][/path] = raw QUIC; '
                         'https://host[:port][/path] = WebTransport; '
                         'host[:port] = WebTransport. The scheme selects '
@@ -87,7 +97,7 @@ def add_endpoint(p, required=True):
 def add_endpoints(p):
     """Positional URLs for tools that dial several peers at once and do
     the same work to each. args.url is a list, one entry minimum."""
-    p.add_argument('url', metavar='URL', nargs='+',
+    p.add_argument('url', metavar='URL', nargs='+', type=_endpoint,
                    help='Endpoint(s). moqt://host[:port][/path] = raw '
                         'QUIC; https://host[:port][/path] = '
                         'WebTransport; host[:port] = WebTransport. The '

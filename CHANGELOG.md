@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- Fix: a d18 control GOAWAY whose Request ID has the wrong parity closes the session with
+  INVALID_REQUEST_ID (§10.4).
+- Fix: a `moqt://` or `https://` URL with an empty host is refused instead of dialling
+  localhost (§3.1.1); the tools reject it as a usage error.
+- Fix: when the session closes, awaited requests fail with "session closed" and awaited fetches
+  end unclean, instead of waiting out their timeout; a request awaited after the close fails
+  at once.
+- Fix: authorization tokens follow the token cache rules (§10.2.2, §10.3.1.4): an undecodable
+  Token closes the session with KEY_VALUE_FORMATTING_ERROR, a registration beyond our advertised
+  MAX_AUTH_TOKEN_CACHE_SIZE with AUTH_TOKEN_CACHE_OVERFLOW (in SETUP it is used as a value), a
+  repeated alias with DUPLICATE_AUTH_TOKEN_ALIAS, and an unregistered alias refuses its request.
+  Registered aliases resolve to their value; REGISTER, USE_ALIAS and DELETE decode to the new
+  `AuthTokenRef`.
+- Fix: a raw-QUIC client's CONNECTION_CLOSE is sent before the transport stops: leaving
+  `MOQTClient.connect()` gives it up to 0.3 s, an error close is sent at once, and a closing
+  session sends it before failing its waiters. It was dropped whenever the app exited promptly.
+- Fix: the control stream is never closed while the session lives (§3.3): a graceful close no
+  longer FINs it first, and a peer's control-stream FIN closes the session with
+  PROTOCOL_VIOLATION (it was INTERNAL_ERROR, or ignored when the FIN carried data).
 - deps: `aiopquic>=0.5.0a1`; the CI source pin is removed.
 - Fix: `verify_tls` / `-k` reach the transport. Clients verify the server's
   certificate by default (aiopquic 0.5.0a1); `verify_tls=False` / `-k` accepts any

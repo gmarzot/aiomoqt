@@ -344,6 +344,12 @@ class _MOQTSessionMixin:
         # Admitted peer SUBSCRIBE / SUBSCRIBE_NAMESPACE / SUBSCRIBE_TRACKS:
         # request_id -> (message class, full track name or prefix).
         self._peer_requests: Dict[int, Tuple[type, tuple]] = {}
+        # The peer's registered tokens (§10.2.2): alias -> (type, value),
+        # held within the MAX_AUTH_TOKEN_CACHE_SIZE we advertised (0 =
+        # aliases not accepted).
+        self._auth_tokens: Dict[int, Tuple[int, bytes]] = {}
+        self._auth_token_cache_used = 0
+        self._auth_token_cache_max = 0
         # Aliases the peer assigned (SUBSCRIBE_OK / PUBLISH) -> our
         # request id: the receive-side registry.
         self._track_aliases: Dict[int, int] = {}
@@ -453,6 +459,12 @@ class _MOQTSessionMixin:
         if fut is None:
             fut = self._loop.create_future()
             self._pending_requests[request_id] = fut
+        if self._close_err is not None and not fut.done():
+            self._pending_requests.pop(request_id, None)
+            raise MOQTRequestError(
+                error_code=int(RequestErrorCode.INTERNAL_ERROR),
+                reason=f"session closed: {self._close_err[1]}",
+                retry_interval=0)
         try:
             async with asyncio.timeout(timeout):
                 response = await fut
@@ -975,7 +987,8 @@ class _MOQTSessionMixin:
                     f"{message_class.__name__} body ends "
                     f"{end_pos - buf.tell()} bytes short of its Length")
             logger.info(f"MOQT event: control message parsed: {msg})")
-            refusal = self._refuse_request(msg)
+            refusal = (self._resolve_auth_token(msg)
+                       or self._refuse_request(msg))
             routed = refusal or self._track_handler(msg)
             if routed is not None:
                 handler = routed
@@ -1971,8 +1984,25 @@ class _MOQTSessionMixin:
                         f"second GOAWAY on stream {stream_id}")
                     return
                 self._peer_goaway_streams.add(stream_id)
+                # §10.4: the control GOAWAY names one of the receiver's
+                # own Request IDs, so it carries the receiver's parity.
+                own_parity = 0 if self._is_client else 1
+                if (not is_request_bidi and msg.request_id is not None
+                        and int(msg.request_id) & 1 != own_parity):
+                    self._close_session(
+                        SessionCloseCode.INVALID_REQUEST_ID,
+                        f"GOAWAY Request ID {msg.request_id} has the "
+                        f"wrong parity")
+                    return
         if end_stream:
             self._control_chains.pop(stream_id, None)
+            # §3.3: the control stream is never closed while the session
+            # lives.
+            if not is_request_bidi and stream_id == self._control_read_stream_id:
+                self._close_session(
+                    SessionCloseCode.PROTOCOL_VIOLATION,
+                    f"peer closed its control stream {stream_id}")
+                return
             if stream_id in self._cancelled_request_streams:
                 self._cancelled_request_streams.discard(stream_id)
                 request_id = self._bidi_stream_requests.pop(stream_id, None)
@@ -2164,7 +2194,7 @@ class _MOQTSessionMixin:
 
             # Abrupt close of a critical stream
             if (event.end_stream and len(data) == 0 and
-                    stream_id in (self._control_read_stream_id, self._session_id)):
+                    stream_id == self._session_id):
                 self._close_session(
                     SessionCloseCode.INTERNAL_ERROR,
                     f"critical stream closed by remote peer: {stream_id}"
@@ -2222,6 +2252,19 @@ class _MOQTSessionMixin:
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(f"QUIC event: event not handled({class_name(event)})")
 
+    def _fail_pending(self, reason: str) -> None:
+        """A closed session answers nothing more: fail every awaited
+        request and end every awaited fetch as unclean."""
+        for fut in self._pending_requests.values():
+            if not fut.done():
+                fut.set_exception(MOQTRequestError(
+                    error_code=int(RequestErrorCode.INTERNAL_ERROR),
+                    reason=f"session closed: {reason}", retry_interval=0))
+                fut.exception()  # marks it retrieved if nothing awaits it
+        for fut in self._fetch_done_futures.values():
+            if not fut.done():
+                fut.set_result(False)
+
     def _close_session(self,
               error_code: SessionCloseCode = SessionCloseCode.NO_ERROR,
               reason_phrase: str = "no error", *,
@@ -2235,11 +2278,14 @@ class _MOQTSessionMixin:
         first = self._close_err is None
         if first:
             self._close_err = (error_code, reason_phrase)
+            # Close before failing waiters: an app that exits on the
+            # failure stops the transport.
             if transmit:
                 try:
-                    self._loop.call_soon(self.close)
-                except RuntimeError:  # loop already closed
-                    pass
+                    self.close()
+                except Exception:
+                    logger.debug("MOQT: close failed", exc_info=True)
+            self._fail_pending(reason_phrase)
         if self._reaper_handle is not None:
             self._reaper_handle.cancel()
             self._reaper_handle = None
@@ -2272,21 +2318,13 @@ class _MOQTSessionMixin:
             error_code, reason_phrase = self._close_err
         logger.info(f"MOQT session: closing: {reason_phrase} ({error_code})")
 
-        # Gracefully FIN open streams before closing the connection.
-        # Transmit FINs separately so they don't get batched with
-        # CONNECTION_CLOSE (which causes reset_stream on the peer).
-        # Only FIN streams we own the write side of — sending
-        # end_stream on peer-initiated uni streams produces
-        # RESET_STREAM which confuses relays. An error close skips them:
-        # a FIN on the control stream reaches the peer first and reads
-        # as a critical-stream close, masking the error code.
+        # A graceful close FINs the data streams we write (end_stream on a
+        # peer-initiated stream is a RESET_STREAM), never the control stream
+        # (§3.3). An error close sends no FINs.
         is_client = self._is_client
         graceful = int(error_code) == SessionCloseCode.NO_ERROR
         try:
             if self._control_write_stream_id is not None:
-                if graceful:
-                    self._quic.send_stream_data(
-                        self._control_write_stream_id, b"", end_stream=True)
                 self._control_stream_id = None
                 self._d18_control_write_sid = None
             for stream_id in list(self._data_streams.keys() if graceful else ()):
@@ -2311,11 +2349,9 @@ class _MOQTSessionMixin:
         # set the async exit condition for session
         if not self._moqt_session_closed.done():
             self._moqt_session_closed.set_result((error_code, reason_phrase))
-        # Close the QUIC connection on the next loop tick so the FINs
-        # queued above get a transmit pass first — batched with
-        # CONNECTION_CLOSE the peer sees them as RESET_STREAM.
-        # The MoQT error code is the CONNECTION_CLOSE application error
-        # (raw QUIC) or the WebTransport session close code.
+        # The MoQT code rides CONNECTION_CLOSE (raw QUIC) or the WebTransport
+        # session close. A graceful close waits a tick so its FINs leave
+        # first (batched, the peer resets them); an error close goes at once.
         if self._is_wt:
             reason = (reason_phrase if isinstance(reason_phrase, bytes)
                       else str(reason_phrase).encode())
@@ -2328,7 +2364,7 @@ class _MOQTSessionMixin:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             loop = None
-        if loop is not None:
+        if loop is not None and graceful:
             loop.call_soon(parent_close)
         else:
             parent_close()
@@ -2423,6 +2459,8 @@ class _MOQTSessionMixin:
         params[SetupParamType.IMPLEMENTATION] = USER_AGENT.encode()
         if parameters:
             params.update(parameters)  # caller SETUP options (e.g. AUTH_TOKEN)
+        self._auth_token_cache_max = int(
+            params.get(SetupParamType.MAX_AUTH_TOKEN_CACHE_SIZE, 0))
         if self._profile.control_uni_pair:
             self.send_control_message(Setup(options=params))
         else:
@@ -2767,6 +2805,68 @@ class _MOQTSessionMixin:
     _REPLY_CLASSES = (RequestOk, RequestError, SubscribeOk, SubscribeDone,
                       PublishOk, FetchOk)
 
+    def _resolve_auth_token(self, msg: MOQTMessage) -> Optional[Callable]:
+        """Apply a token-cache operation the peer sent (§10.2.2, §10.3.1.4)
+        and leave the token's Value in its place. Raises on the session
+        errors; returns the handler that refuses a request naming an alias
+        that is not registered."""
+        in_setup = isinstance(msg, (Setup, ClientSetup, ServerSetup))
+        params = (msg.options if isinstance(msg, Setup)
+                  else getattr(msg, 'parameters', None))
+        key = SetupParamType.AUTH_TOKEN if in_setup else ParamType.AUTH_TOKEN
+        ref = params.get(key) if params else None
+        if not isinstance(ref, AuthTokenRef):
+            return None
+        if ref.alias_type == AuthTokenAliasType.REGISTER:
+            if ref.alias in self._auth_tokens:
+                raise MOQTException(
+                    SessionCloseCode.DUPLICATE_AUTH_TOKEN_ALIAS,
+                    f"token alias {ref.alias} is already registered")
+            size = 16 + len(ref.value)
+            if self._auth_token_cache_used + size <= self._auth_token_cache_max:
+                self._auth_tokens[ref.alias] = (ref.token_type, ref.value)
+                self._auth_token_cache_used += size
+            elif not in_setup:
+                raise MOQTException(
+                    SessionCloseCode.AUTH_TOKEN_CACHE_OVERFLOW,
+                    f"token alias {ref.alias} ({size} bytes) exceeds the "
+                    f"cache ({self._auth_token_cache_max} bytes)")
+            # A SETUP registration that does not fit is used as a value.
+            params[key] = ref.value
+            return None
+        if in_setup:
+            if not self._is_client:
+                raise MOQTException(
+                    SessionCloseCode.PROTOCOL_VIOLATION,
+                    "DELETE or USE_ALIAS token in SETUP")
+            del params[key]
+            return None
+        known = self._auth_tokens.get(ref.alias)
+        if known is not None:
+            if ref.alias_type == AuthTokenAliasType.DELETE:
+                del self._auth_tokens[ref.alias]
+                self._auth_token_cache_used -= 16 + len(known[1])
+                del params[key]
+            else:
+                params[key] = known[1]
+            return None
+        rid = getattr(msg, 'request_id', None)
+        if rid is None or not is_draft16_or_later(self.negotiated_draft):
+            return None
+        rid = int(rid)
+        # d18 defines UNKNOWN_AUTH_TOKEN_ALIAS (0x17) only as a session code
+        # but asks for the request to be rejected with it; we send 0x17.
+        err = RequestError(
+            request_id=rid,
+            error_code=int(SessionCloseCode.UNKNOWN_AUTH_TOKEN_ALIAS),
+            retry_interval=0, reason=f"token alias {ref.alias} not registered")
+        logger.info(f"MOQT: refusing {type(msg).__name__} {rid}: "
+                    f"unknown token alias {ref.alias}")
+
+        async def refuse(session, _msg):
+            session._send_on_request_stream(rid, err, fin=True)
+        return refuse
+
     def _refuse_request(self, msg: MOQTMessage) -> Optional[Callable]:
         """Session-level request rules, applied before the application
         sees the request (d16+): a reserved namespace (d18 §3.2.1-2), a
@@ -3059,6 +3159,8 @@ class _MOQTSessionMixin:
             self._local_request_max = self.REQUEST_ID_WINDOW
             parameters.setdefault(SetupParamType.MAX_REQUEST_ID,
                                   self._local_request_max)
+        self._auth_token_cache_max = int(
+            parameters.get(SetupParamType.MAX_AUTH_TOKEN_CACHE_SIZE, 0))
 
         message = ServerSetup(
             selected_version=selected_version,

@@ -36,6 +36,8 @@ def _session(is_client=True):
     to record (request_id, msg) rather than hit the wire."""
     s = object.__new__(_MOQTSessionMixin)
     s._peer_requests = {}
+    s._close_err = None
+    s._fetch_done_futures = {}
     s._next_request_id = 0 if is_client else 1
     s._sent_requests = deque(maxlen=1024)
     s._pending_requests = {}
@@ -362,3 +364,29 @@ async def test_d18_reply_without_stream_binding_cannot_correlate(plog):
     s._moqt_handle_control_message(Buffer(data=wire), request_id=None)
     await asyncio.sleep(0)
     assert not fut.done()   # unresolved — correlation impossible
+
+
+async def test_close_fails_every_awaited_request_and_fetch():
+    s = _session()
+    req = s._loop.create_future()
+    fetch = s._loop.create_future()
+    s._pending_requests[2] = req
+    s._fetch_done_futures[4] = fetch
+    s._fail_pending("peer went away")
+    err = req.exception()
+    assert isinstance(err, MOQTRequestError) and err.response is None
+    assert "session closed: peer went away" in err.reason
+    assert fetch.result() is False
+
+
+async def test_awaiting_after_close_fails_at_once():
+    # subscribe() registers its future before sending; a closed session
+    # must not leave it to the timeout.
+    s = _session()
+    s._pending_requests[2] = s._loop.create_future()
+    s._close_err = (3, "gone")
+    t0 = asyncio.get_running_loop().time()
+    with pytest.raises(MOQTRequestError, match="session closed: gone"):
+        await s._await_response(2, timeout=5.0)
+    assert asyncio.get_running_loop().time() - t0 < 1.0
+    assert 2 not in s._pending_requests

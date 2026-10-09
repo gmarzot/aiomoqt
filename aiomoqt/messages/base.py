@@ -4,7 +4,9 @@ from dataclasses import dataclass, field, fields
 
 from . import ParamType, SetupParamType, AuthTokenAliasType, AuthTokenType
 from ..context import DraftProfile
-from ..types import D18_PARAM_KINDS, MOQTProtocolViolation
+from ..types import (
+    D18_PARAM_KINDS, MOQTException, MOQTProtocolViolation, SessionCloseCode,
+)
 from ..utils.buffer import Buffer, BufferReadError
 from ..utils.logger import *
 
@@ -22,6 +24,17 @@ BUF_SIZE = 4 * 1024  # 4KB buffer size for messages
 # catchable as MOQTUnderflow in aiomoqt without introducing an upward
 # dependency (aiopquic must not import aiomoqt).
 from aiopquic.exceptions import StreamUnderflow as MOQTUnderflow  # noqa: E402
+
+
+@dataclass(frozen=True, slots=True)
+class AuthTokenRef:
+    """An AUTHORIZATION TOKEN that operates on the receiver's token cache
+    (§10.2.2): REGISTER (alias, type, value), USE_ALIAS or DELETE (alias
+    only). USE_VALUE tokens decode to their bare Value instead."""
+    alias_type: int
+    alias: int
+    token_type: Optional[int] = None
+    value: Optional[bytes] = None
 
 
 @dataclass(slots=True)
@@ -336,27 +349,52 @@ class MOQTMessage:
         return buf.pull_uint_var()
 
     @staticmethod
-    def _auth_token_wrap(value: bytes, prof: 'DraftProfile') -> bytes:
-        """Wrap an AUTH_TOKEN value in the spec Token structure (§9.2.1.1):
-        Alias Type USE_VALUE + Token Type OUT_OF_BAND + Value."""
+    def _auth_token_wrap(value: Union[bytes, str, AuthTokenRef],
+                         prof: 'DraftProfile') -> bytes:
+        """Serialize a Token structure (§10.2.2). A bare value is sent as
+        USE_VALUE with Token Type OUT_OF_BAND; an AuthTokenRef as its
+        cache operation."""
         tb = Buffer(capacity=BUF_SIZE, vi64=prof.vi64)
-        tb.push_vint(AuthTokenAliasType.USE_VALUE)
-        tb.push_vint(AuthTokenType.OUT_OF_BAND)
-        tb.push_bytes(bytes(value))
+        if isinstance(value, AuthTokenRef):
+            tb.push_vint(value.alias_type)
+            tb.push_vint(value.alias)
+            if value.alias_type == AuthTokenAliasType.REGISTER:
+                tb.push_vint(value.token_type or AuthTokenType.OUT_OF_BAND)
+                tb.push_bytes(bytes(value.value or b""))
+        else:
+            if isinstance(value, str):
+                value = value.encode()
+            tb.push_vint(AuthTokenAliasType.USE_VALUE)
+            tb.push_vint(AuthTokenType.OUT_OF_BAND)
+            tb.push_bytes(bytes(value))
         return tb.data_slice(0, tb.tell())
 
     @staticmethod
-    def _auth_token_unwrap(raw: bytes, prof: 'DraftProfile') -> bytes:
-        """Best-effort unwrap of a Token structure to its Value. Only the
-        USE_VALUE form is unwrapped; aliased/registered forms are returned
-        as-is (the caller keeps the raw token)."""
-        if not raw:
-            return raw
+    def _auth_token_unwrap(raw: bytes, prof: 'DraftProfile'
+                           ) -> Union[bytes, AuthTokenRef]:
+        """Decode a Token structure (§10.2.2): USE_VALUE yields its Value,
+        the cache operations an AuthTokenRef. One that cannot be decoded
+        is a KEY_VALUE_FORMATTING_ERROR."""
         tb = Buffer(data=raw, vi64=prof.vi64)
-        if tb.pull_vint() == AuthTokenAliasType.USE_VALUE:
-            tb.pull_vint()  # Token Type
-            return tb.pull_bytes(len(raw) - tb.tell())
-        return raw
+        try:
+            alias_type = tb.pull_vint()
+            if alias_type == AuthTokenAliasType.USE_VALUE:
+                tb.pull_vint()  # Token Type
+                return tb.pull_bytes(len(raw) - tb.tell())
+            if alias_type == AuthTokenAliasType.REGISTER:
+                alias = tb.pull_vint()
+                token_type = tb.pull_vint()
+                return AuthTokenRef(alias_type, alias, token_type,
+                                    tb.pull_bytes(len(raw) - tb.tell()))
+            if alias_type in (AuthTokenAliasType.DELETE,
+                              AuthTokenAliasType.USE_ALIAS):
+                alias = tb.pull_vint()
+                if tb.tell() == len(raw):
+                    return AuthTokenRef(alias_type, alias)
+        except (BufferReadError, MOQTUnderflow):
+            pass
+        raise MOQTException(SessionCloseCode.KEY_VALUE_FORMATTING_ERROR,
+                            "undecodable authorization token")
 
     @classmethod
     def deserialize(cls, buf: Buffer,
@@ -546,11 +584,13 @@ class MOQTMessage:
                         payload.push_vint(len(fld))
                         payload.push_bytes(bytes(fld))
                 else:  # length-prefixed bytes
-                    val = (param_value.encode()
-                           if isinstance(param_value, str) else param_value)
                     if param_type in (ParamType.AUTH_TOKEN,
                                       SetupParamType.AUTH_TOKEN):
-                        val = MOQTMessage._auth_token_wrap(bytes(val), prof)
+                        val = MOQTMessage._auth_token_wrap(param_value, prof)
+                    else:
+                        val = (param_value.encode()
+                               if isinstance(param_value, str)
+                               else param_value)
                     payload.push_vint(len(val))
                     payload.push_bytes(bytes(val))
             elif param_type in prof.location_params:
@@ -558,19 +598,14 @@ class MOQTMessage:
                 payload.push_vint(loc_group)
                 payload.push_vint(loc_object)
             elif param_type % 2 == 1:  # Odd type - includes Length field
+                # AUTH_TOKEN requires Token structure wrapping (§10.2.2)
+                if param_type in (ParamType.AUTH_TOKEN, SetupParamType.AUTH_TOKEN):
+                    param_value = MOQTMessage._auth_token_wrap(param_value, prof)
                 # Value is bytes or string
                 if isinstance(param_value, str):
                     param_value = param_value.encode()
                 if not isinstance(param_value, bytes):
                     raise TypeError(f"Param {param_type} expects bytes, got {type(param_value)}")
-
-                # AUTH_TOKEN requires Token structure wrapping (Section 9.2.1.1)
-                if param_type in (ParamType.AUTH_TOKEN, SetupParamType.AUTH_TOKEN):
-                    token_buf = Buffer(capacity=BUF_SIZE, vi64=prof.vi64)
-                    token_buf.push_vint(AuthTokenAliasType.USE_VALUE)  # Alias Type
-                    token_buf.push_vint(AuthTokenType.OUT_OF_BAND)  # Token Type
-                    token_buf.push_bytes(param_value)  # Token Value (rest of param)
-                    param_value = token_buf.data_slice(0, token_buf.tell())
 
                 payload.push_vint(len(param_value))  # Length
                 payload.push_bytes(param_value)  # Value
@@ -771,8 +806,7 @@ class MOQTMessage:
                             f"remaining {buf_end - buf.tell()}")
                     param_value = buf.pull_bytes(param_len)
                     if param_type in (ParamType.AUTH_TOKEN,
-                                      SetupParamType.AUTH_TOKEN) \
-                            and param_len:
+                                      SetupParamType.AUTH_TOKEN):
                         param_value = MOQTMessage._auth_token_unwrap(
                             param_value, prof)
             elif param_type in prof.location_params:
@@ -791,20 +825,9 @@ class MOQTMessage:
                         f"{buf_end - buf.tell()}")
                 param_value = buf.pull_bytes(param_len)
 
-                # AUTH_TOKEN: unwrap Token structure (Section 9.2.1.1)
-                if param_type in (ParamType.AUTH_TOKEN, SetupParamType.AUTH_TOKEN) and param_len > 0:
-                    token_buf = Buffer(data=param_value, vi64=prof.vi64)
-                    alias_type = token_buf.pull_vint()
-                    if alias_type == AuthTokenAliasType.USE_VALUE:
-                        token_type = token_buf.pull_vint()
-                        param_value = token_buf.pull_bytes(param_len - token_buf.tell())
-                    elif alias_type == AuthTokenAliasType.USE_ALIAS:
-                        token_alias = token_buf.pull_vint()
-                        param_value = param_value  # keep raw for now
-                    elif alias_type == AuthTokenAliasType.REGISTER:
-                        token_alias = token_buf.pull_vint()
-                        token_type = token_buf.pull_vint()
-                        param_value = token_buf.pull_bytes(param_len - token_buf.tell())
+                if param_type in (ParamType.AUTH_TOKEN, SetupParamType.AUTH_TOKEN):
+                    param_value = MOQTMessage._auth_token_unwrap(
+                        param_value, prof)
             else:  # Even type - Value is varint
                 if param_type in prof.uint8_params:
                     param_value = buf.pull_uint8()  # d18 fixed uint8 width
@@ -839,13 +862,13 @@ class MOQTMessage:
             payload.push_vint(key - prev_key)
             prev_key = key
             if key % 2 == 1:  # odd Type → Length-prefixed bytes
+                if key in (ParamType.AUTH_TOKEN, SetupParamType.AUTH_TOKEN):
+                    value = MOQTMessage._auth_token_wrap(value, prof)
                 if isinstance(value, str):
                     value = value.encode()
                 if not isinstance(value, (bytes, bytearray)):
                     raise TypeError(
                         f"KVP {key} expects bytes, got {type(value)}")
-                if key in (ParamType.AUTH_TOKEN, SetupParamType.AUTH_TOKEN):
-                    value = MOQTMessage._auth_token_wrap(bytes(value), prof)
                 payload.push_vint(len(value))
                 payload.push_bytes(bytes(value))
             else:  # even Type → varint Value

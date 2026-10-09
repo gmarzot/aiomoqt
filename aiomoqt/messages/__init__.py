@@ -10,6 +10,7 @@ from .request import *
 
 __all__ = [
     'MOQTMessage', 'MOQTMessageType', 'MOQTUnderflow', 'BUF_SIZE',
+    'AuthTokenRef',
     'ClientSetup', 'ServerSetup', 'GoAway',
     'Subscribe', 'SubscribeOk', 'SubscribeError', 'SubscribeUpdate',
     'Unsubscribe', 'SubscribeDone', 'MaxSubscribeId', 'SubscribesBlocked',
