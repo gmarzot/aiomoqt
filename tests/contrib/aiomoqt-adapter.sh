@@ -99,17 +99,22 @@ case "$scenario_id" in
         content=(-D) ;;
 esac
 
+# A 64-byte token cache holds the runner's 20-byte alias entries and stays
+# below its 80-byte oversize-registration probe; the overflow probe needs
+# one under 17 bytes, so none is advertised.
+token_cache=64
+[[ "$scenario_id" != register-request-token-exceeding-advertised-cache-size ]] ||
+    token_cache=0
+
 timeout_seconds=$(((timeout_ms + 999) / 1000))
 # The runner's certificate is self-signed for the test; pub_bench has no
-# trust-file option, so verification is skipped (-k). A 64-byte token cache
-# holds the runner's 20-byte alias entries and stays below its 80-byte
-# oversize-registration probe. The refused tokens are the credentials
-# sweep.py gives the runner: invalid (MALFORMED_AUTH_TOKEN), expired
-# (EXPIRED_AUTH_TOKEN) and denied (UNAUTHORIZED).
+# trust-file option, so verification is skipped (-k). The refused tokens are
+# the credentials sweep.py gives the runner: invalid (MALFORMED_AUTH_TOKEN),
+# expired (EXPIRED_AUTH_TOKEN) and denied (UNAUTHORIZED).
 exec "$python" -m aiomoqt.tools.pub_bench "$endpoint" \
     -N "$namespace" -T "$track" --draft 18 -k "$flow" \
     -s 64 -g 10 -r 50 -t "$timeout_seconds" --no-stats "${content[@]}" \
-    --token-cache 64 \
+    --token-cache "$token_cache" \
     --token-reject 1:696e76616c6964:0x4 \
     --token-reject 1:65787069726564:0x5 \
     --token-reject 0:64656e696564:0x1
