@@ -48,7 +48,7 @@
 - Fix: `moq_interop_client`: a relay that never forwards PUBLISH_DONE fails
   `data-subgroup-basic` instead of crashing the run; a test that raises is reported as FAIL.
 - pub_media: `--input URL` publishes HLS, DASH or anything FFmpeg opens as CMAF tracks;
-  `--rendition best|all`. Needs the `media` extra (PyAV).
+  `--rendition best|all` (`all` experimental). Needs the `media` extra (PyAV).
 - media: `aiomoqt.media.dash` reads DASH (PyAV ships no DASH demuxer); ingest groups follow
   its segments.
 - media: `send_frame(group_id=)` opens the named group at a key frame.

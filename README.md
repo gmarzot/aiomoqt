@@ -184,8 +184,9 @@ python -m aiomoqt.tools.pub_media $RELAY -N demo/live --mp4 clip.mp4 --loop \
 # Same content, CMAF packaging (requires --mp4)
 python -m aiomoqt.tools.pub_media $RELAY -N cmsf/live --mp4 clip.mp4 --packaging cmaf --loop
 
-# HLS or DASH (anything FFmpeg opens) as CMAF; --rendition all = every video
-# rendition as one alternate group (needs aiomoqt[media])
+# HLS or DASH (anything FFmpeg opens) as CMAF (needs aiomoqt[media]); --rendition all
+# (experimental) = every video rendition as one alternate group, fetched in turn, so
+# large ladders fall behind real time
 python -m aiomoqt.tools.pub_media $RELAY -N vod --input https://cdn.example/master.m3u8 -t 3600
 
 # Live H.264 Annex-B ingest (OBS / ffmpeg pipe); frames stamped on arrival

@@ -30,7 +30,7 @@ their timestamps (--no-pace to blast).
     -flush_packets 1 - | %(prog)s https://relay.example/moq-relay -N obs --ts -
 
   # HLS/DASH (anything FFmpeg opens) as CMAF tracks; needs the media
-  # extra: pip install 'aiomoqt[media]'
+  # extra: pip install 'aiomoqt[media]'. --rendition all is experimental.
   %(prog)s https://relay.example/moq-relay -N vod --input https://cdn.example/master.m3u8
   %(prog)s https://relay.example/moq-relay -N abr --input https://cdn.example/live.mpd --rendition all
 
@@ -105,7 +105,10 @@ def parse_args():
     parser.add_argument('--rendition', choices=RENDITIONS, default=None,
                         help='With --input: best = the top video '
                              'rendition (default); all = every video '
-                             'rendition, as one catalog alternate group')
+                             'rendition, as one catalog alternate group '
+                             '(experimental: renditions are fetched in '
+                             'turn, so large ladders fall behind real '
+                             'time)')
     parser.add_argument('--player-base', type=str,
                         default='http://localhost:5173/g5-player/',
                         metavar='URL',
