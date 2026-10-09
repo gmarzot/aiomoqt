@@ -1006,6 +1006,13 @@ class PublishedTrack(Track):
         sub.open_streams -= 1
         self._finish_range(sub)
 
+    def end(self) -> None:
+        """End the track: each peer's open streams close, then its
+        subscription gets PUBLISH_DONE TRACK_ENDED (§10.11), and nothing
+        restarts production."""
+        for sub in list(self._subs):
+            self._end_subscription(sub, SubscribeDoneCode.TRACK_ENDED)
+
     def _range_ended(self, sub) -> None:
         """Production passed the subscription's End Group."""
         self._end_subscription(sub, SubscribeDoneCode.SUBSCRIPTION_ENDED)
@@ -1033,7 +1040,9 @@ class PublishedTrack(Track):
         if sub.window != _ENDED or sub.open_streams > 0:
             return
         sub.window = _DONE
-        self._send_publish_done(sub.session, sub.end_status, final=False)
+        self._send_publish_done(
+            sub.session, sub.end_status,
+            final=sub.end_status == SubscribeDoneCode.TRACK_ENDED)
         sub.subscribers.clear()
 
     def _send_publish_done(self, session, status_code=0x2,
@@ -1128,7 +1137,8 @@ class PublishedTrack(Track):
         self._pad = pad
         self._spawn_producers(session, track_alias, pad)
         await session.async_closed()
-        self._send_publish_done(session)
+        if not self._sub_for(session).done:
+            self._send_publish_done(session)
         self._withdraw_namespace(session)
         session._close_session()
 
