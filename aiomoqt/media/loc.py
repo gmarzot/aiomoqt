@@ -68,11 +68,13 @@ LOC_STREAMING_FORMAT_TYPE = 0x002
 @dataclass
 class LocFrame:
     """One encoded media chunk. `timestamp` is in track timescale units
-    (µs since Unix epoch when the track carries no TIMESCALE)."""
+    (µs since Unix epoch when the track carries no TIMESCALE).
+    `group_id` numbers the group a key frame opens (None: next)."""
     payload: bytes
     key_frame: bool = False
     timestamp: Optional[int] = None
     extensions: Optional[Dict[int, Any]] = None
+    group_id: Optional[int] = None
 
 
 class LocTrackPublisher(PublishedTrack):
@@ -135,10 +137,15 @@ class LocTrackPublisher(PublishedTrack):
 
     async def send_frame(self, payload: bytes, *, key_frame: bool = False,
                          timestamp: Optional[int] = None,
-                         extensions: Optional[Dict[int, Any]] = None) -> None:
-        """Queue one frame (awaits when the queue is full)."""
+                         extensions: Optional[Dict[int, Any]] = None,
+                         group_id: Optional[int] = None) -> None:
+        """Queue one frame (awaits when the queue is full).
+
+        `group_id` sets the group a key frame opens, so tracks fed from
+        one source can keep equally numbered groups time-aligned (msf
+        §4.2); ignored unless above the current group."""
         await self._frames.put(LocFrame(payload, key_frame, timestamp,
-                                        extensions))
+                                        extensions, group_id))
 
     async def finish(self) -> None:
         """Signal end of track; generation drains the queue then stops."""
@@ -188,7 +195,10 @@ class LocTrackPublisher(PublishedTrack):
                 continue
             resume_on_key = False
             if frame.key_frame or group_id < 0:
-                group_id += 1
+                if frame.group_id is not None and frame.group_id > group_id:
+                    group_id = frame.group_id
+                else:
+                    group_id += 1
                 obj_id = 0
             group_start = obj_id == 0
             if frame.timestamp is None:
