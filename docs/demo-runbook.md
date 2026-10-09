@@ -224,14 +224,17 @@ arrival. Prefer `--ts`.
   completes instead of when the next one starts (keyframes > 64 KB still
   wait); `-muxdelay 0` drops the 0.7 s default bound.
 - Measure: burn-in clock vs player frame (screenshot both), overlay
-  latency P50/P95 (capture→arrival), cushion, stalls. Glass: 09-09
+  latency P50/P95 (pub_media→arrival, see below), cushion, stalls. Glass: 09-09
   640 ms (before the 64 KB read fix and the cushion knob); 09-16 1.17 s
   without the muxer flags and 0.58 s with them (OBS 3440x1440, cushion 200).
 - On `--h264` frame pacing follows arrival stamps, so SRT/ffmpeg
   burstiness shows as uneven presentation; `--ts` stamps from the PES
-  PTS and does not have this. The latency stat on `--ts` includes a
-  constant offset equal to the encoder-to-first-arrival delay (the clock
-  anchors on the first demuxed unit).
+  PTS and does not have this. `--ts` anchors the PTS to the wall clock
+  at the least-delayed unit seen, so stamps never run ahead of arrival
+  (a late first unit or a fast `-re` clock cannot make latency
+  negative). The latency stat is therefore transport delay from
+  pub_media onward; encoder and SRT delay sit inside the anchor, and
+  only the burn-in clock shows them.
 
 ## Demo D — someone else's publisher → our subscriber (interop)
 The only flow that tests the receive path against an independent
@@ -276,9 +279,8 @@ start; Eyevinn's moqlivemock endpoint is always on.
 ## Reading a stall or a pinned cushion
 - Publisher `lag mean/max ms` per track = how late a frame was against
   its own capture stamp when the feeder sent it (source, pipe, demux).
-  Signed: NEGATIVE means the stamp is ahead of the wall clock, which a
-  receiver reads as negative end-to-end latency (the player labels it
-  "clock skew"). `tx` appears only when handing to the track costs
+  On `--ts` it is never negative: it is delay beyond the least-delayed
+  unit seen, i.e. pipe jitter. `tx` appears only when handing to the track costs
   ≥ 0.05 ms, so it showing at all means backpressure here. Neither is
   end-to-end latency: a live source's stamps anchor to their own
   arrival, so constant upstream delay reads as zero.
