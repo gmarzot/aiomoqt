@@ -65,9 +65,7 @@ track=$(hex_to_text "$(jq -r '.track_name_hex' "$request_file")")
 flow=(--pub-ns)
 case "$scenario_id" in
     publish-track-under-single-period-namespace|\
-    application-publish-track-in-session-namespace|\
-    publish-distinct-content-tracks-in-same-scope|\
-    publish-two-simultaneous-tracks)
+    application-publish-track-in-session-namespace)
         flow=(--pub-both) ;;
     initiate-track-publication|\
     publish-track-namespace-fields|\
@@ -132,6 +130,10 @@ case "$scenario_id" in
         control=(--publish-update) ;;
     publish-and-withdraw-namespace-during-discovery)
         control=(--withdraw-after 1) ;;
+    publish-two-simultaneous-tracks)
+        control=(--second-track) ;;
+    publish-distinct-content-tracks-in-same-scope)
+        control=(--second-track --forward 1) ;;
 esac
 
 # A 64-byte token cache holds the runner's 20-byte alias entries and stays
