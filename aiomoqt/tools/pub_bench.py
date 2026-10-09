@@ -90,6 +90,13 @@ The URL scheme selects the transport:
     parser.add_argument('--track-status', action='store_true',
                         help='Ask the peer for the track\'s status '
                              '(TRACK_STATUS) before publishing')
+    parser.add_argument('--publish-update', action='store_true',
+                        help='Send one parameter-free REQUEST_UPDATE for '
+                             'the PUBLISH, half a second after it')
+    parser.add_argument('--end-after', type=float, default=None,
+                        metavar='SECONDS',
+                        help='End the track this long after publishing: '
+                             'PUBLISH_DONE once its streams have closed')
     parser.add_argument('--goaway-after', type=float, default=None,
                         metavar='SECONDS',
                         help='Send GOAWAY this long after publishing; '
@@ -223,9 +230,14 @@ async def run(args):
                 forward=args.forward,
             )
             print(f"  Published '{track.fqtn}', waiting for subscriber...")
+            loop = asyncio.get_running_loop()
             if args.goaway_after is not None:
-                asyncio.get_running_loop().call_later(args.goaway_after,
-                                                      session.goaway)
+                loop.call_later(args.goaway_after, session.goaway)
+            if args.end_after is not None:
+                loop.call_later(args.end_after, track.end)
+            if args.publish_update and not args.pub_ns:
+                loop.call_later(0.5, session.request_update,
+                                track.request_id)
 
             if not await wait_cond_timeout(
                     track.wait_closed(), timeout=args.duration):
