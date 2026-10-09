@@ -3770,6 +3770,7 @@ class _MOQTSessionMixin:
         content_exists: int = 0,
         parameters: Optional[Dict[int, Any]] = None,
         wait_response: Optional[bool] = False,
+        largest: Optional[Tuple[int, int]] = None,
     ) -> Optional[MOQTMessage]:
         """PUBLISH — announce a specific track to the relay/subscriber.
 
@@ -3777,6 +3778,9 @@ class _MOQTSessionMixin:
             forward: 0 = announce availability only, 1 = start data.
                      Subscriber responds with PUBLISH_OK(forward=1)
                      to request data flow.
+            largest: the track's Largest Location (group, object), sent
+                     as LARGEST_OBJECT; required once objects have been
+                     published (§10.2.11).
         """
         namespace_tuple = self._make_namespace_tuple(namespace)
         request_id = self._allocate_request_id()
@@ -3789,7 +3793,9 @@ class _MOQTSessionMixin:
             track_alias=track_alias,
             group_order=GroupOrder.ASCENDING,
             forward=forward,
-            content_exists=content_exists,
+            content_exists=1 if largest is not None else content_exists,
+            largest_group_id=None if largest is None else largest[0],
+            largest_object_id=None if largest is None else largest[1],
             parameters=parameters or {},
         )
         logger.info(f"MOQT send: {message}")

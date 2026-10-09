@@ -281,3 +281,58 @@ async def test_a_cancelled_fetch_resets_its_data_stream(use_quic):
         assert await rx.await_fetch_done(ok.request_id, timeout=5) is False
         assert StreamResetCode.CANCELLED in resets
         assert pub._close_err is None and rx._close_err is None
+
+
+@requires_certs
+@_TRANSPORTS
+async def test_publish_carries_the_largest_object_and_joining_location(use_quic):
+    # §10.2.11: PUBLISH carries LARGEST_OBJECT once objects exist, and
+    # §5.1: it is the Joining Location of that subscription.
+    port = _port(7, use_quic)
+    publishes: asyncio.Queue = asyncio.Queue()
+    fetched: dict = {}
+
+    async def _on_publish(session, msg):
+        session.on_fetch_object = (
+            lambda obj, _n, _ts, rid: fetched.setdefault(rid, []).append(obj))
+        await publishes.put((session, msg))
+
+    server = MOQTServer(host="localhost", port=port, certificate=CERT,
+                        private_key=KEY, path="/", use_quic=use_quic,
+                        supported_drafts=18)
+    server.register_handler(MOQTMessageType.PUBLISH, _on_publish)
+    quic_server = await server.serve()
+    try:
+        client = MOQTClient("localhost", port, path="/", use_quic=use_quic,
+                            verify_tls=False, supported_drafts=18)
+        async with client.connect() as pub:
+            await pub.client_session_init()
+            tracks = {}
+            for name, groups in (("video", 3), ("audio", 1)):
+                track = PublishedTrack(pub, namespace=_NS, trackname=name,
+                                       object_size=_SIZES[name],
+                                       group_size=_GROUP, rate=200)
+                track.prefill(groups)
+                await track.publish()
+                tracks[name] = track
+            got = {}
+            for _ in tracks:
+                rx, msg = await asyncio.wait_for(publishes.get(), 5.0)
+                got[msg.track_name] = (rx, msg)
+            for name, largest in ((b"video", (2, 4)), (b"audio", (0, 4))):
+                msg = got[name][1]
+                assert (msg.largest_group_id, msg.largest_object_id) == largest
+            rx, msg = got[b"video"]
+            rx.publish_ok(msg, forward=1)
+            for _ in range(100):
+                if tracks["video"].forward:
+                    break
+                await asyncio.sleep(0.01)
+            ok = await rx.joining_fetch(msg.request_id, joining_start=0,
+                                        wait_response=True)
+            assert (ok.largest_group_id, ok.largest_object_id) == (2, _GROUP)
+            assert await rx.await_fetch_done(ok.request_id, timeout=5)
+            assert _locations(fetched[ok.request_id]) == [
+                (2, o) for o in range(_GROUP)]
+    finally:
+        quic_server.close()

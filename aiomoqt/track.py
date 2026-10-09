@@ -545,9 +545,13 @@ class PublishedTrack(Track):
                 namespace=self.namespace,
                 track_name=self.trackname,
                 forward=forward,
+                largest=self._largest,
             )
             sub.track_alias = pub_msg.track_alias
             sub.request_id = pub_msg.request_id
+            # §5.1: the Largest Location PUBLISH carried is its Joining
+            # Location.
+            sub.joining[pub_msg.request_id] = self._largest
             sess._bind_request(pub_msg.request_id, self, sub,
                                alias=sub.track_alias)
             sub.forward = bool(forward)

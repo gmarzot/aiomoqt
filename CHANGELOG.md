@@ -36,6 +36,8 @@
 - Fix: d18 Track Properties are checked in SUBSCRIBE_OK, PUBLISH, FETCH_OK and TRACK_STATUS_OK:
   DEFAULT_PUBLISHER_GROUP_ORDER 1-2 and DYNAMIC_GROUPS 0-1, also inside Immutable Properties,
   which must parse (§12.5-12.7).
+- Fix: PUBLISH carries LARGEST_OBJECT once the track has objects (§10.2.11), and that Location
+  is the subscription's Joining Location; `session.publish(largest=...)` sets it.
 - Fix: `pub_media --ts` stamps never run ahead of arrival; the PTS anchor follows the
   least-delayed unit, so a late first unit or a fast source clock no longer reads as negative
   latency.
