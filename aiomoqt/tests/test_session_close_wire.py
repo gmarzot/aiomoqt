@@ -3,7 +3,9 @@ wire: the CONNECTION_CLOSE application error (raw QUIC) or the
 WebTransport session close code, so the peer sees why."""
 import asyncio
 
+import aiopquic
 import pytest
+from packaging.version import Version
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.messages.subscribe import Subscribe
@@ -15,12 +17,17 @@ from aiomoqt.tests._certs import CERT, KEY, requires_certs
 _PORT = 14850
 
 
+# aiopquic before 0.5.0a2 reports a CLOSE_WEBTRANSPORT_SESSION capsule that
+# arrives with its FIN as code 0.
+_WT_CLOSE_CODE_LOST = Version(aiopquic.__version__) < Version("0.5.0a2")
+
+
 @requires_certs
 @pytest.mark.parametrize("use_quic, port", [
     pytest.param(True, _PORT, id="quic"),
     pytest.param(False, _PORT + 1, id="wt", marks=pytest.mark.xfail(
-        strict=True, reason="aiopquic reports a CLOSE_WEBTRANSPORT_SESSION "
-                            "capsule that arrives with its FIN as code 0")),
+        _WT_CLOSE_CODE_LOST, strict=True,
+        reason="aiopquic < 0.5.0a2 loses the WT close code")),
 ])
 async def test_violation_close_reaches_the_peer_with_its_code(use_quic, port):
     server = await MOQTServer(
