@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- A session's `auth_token_validator(token, msg)` refuses a d16+ peer request with the
+  REQUEST_ERROR code it returns (§10.2.2); a refused REGISTER stays registered.
+- USE_VALUE tokens decode to `AuthToken`, bytes carrying its Token Type, and an `AuthToken`
+  is sent with its type; plain bytes are still sent as OUT_OF_BAND.
+- `pub_bench`: `--token-cache BYTES` advertises MAX_AUTH_TOKEN_CACHE_SIZE, and
+  `--token-reject TYPE:HEX:CODE` refuses requests carrying that token.
+- CI: the adaptive-mp suites run 20 s and name their failure.
 - Fix: a d18 control GOAWAY whose Request ID has the wrong parity closes the session with
   INVALID_REQUEST_ID (§10.4).
 - Fix: a `moqt://` or `https://` URL with an empty host is refused instead of dialling
