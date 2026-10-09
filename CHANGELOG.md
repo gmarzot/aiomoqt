@@ -58,6 +58,10 @@
   moxygen does; it was sent and read inline, so neither side could parse the other's.
 - Fix: a d18 request carrying a Message Parameter its type does not allow closes the session
   with PROTOCOL_VIOLATION (§10.2.1); replies are not checked.
+- Fix: after we send a d18 GOAWAY, every new peer request is refused with GOING_AWAY (§10.4).
+- `PublishedTrack(auth_token=None)` announces without an AUTH_TOKEN.
+- `pub_bench`: `--goaway-after SECONDS`, and `--auth-token` for the PUBLISH_NAMESPACE token (empty
+  sends none).
 - aiopquic floor `>=0.5.0a2`: a WebTransport close carries its code to the peer, and a
   refused or closed WebTransport session raises a `ConnectionError` like raw QUIC.
 - Fix: `pub_media --ts` stamps never run ahead of arrival; the PTS anchor follows the

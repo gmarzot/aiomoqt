@@ -178,6 +178,8 @@ class _MOQTSessionMixin:
     # speak for any one session). WT-based classes flip this via
     # _WTSessionMixin.
     _is_wt = False
+    # We sent a GOAWAY: every later peer request is refused (§10.4).
+    _goaway_sent = False
 
     @property
     def _is_client(self) -> bool:
@@ -2970,6 +2972,9 @@ class _MOQTSessionMixin:
                 or getattr(msg, 'request_id', None) is None):
             return None
         rid = int(msg.request_id)
+        if self._goaway_sent and self.negotiated_draft >= 18:
+            return self._refusal(msg, rid, RequestErrorCode.GOING_AWAY,
+                                 "the session is going away")
         ns = tuple(getattr(msg, 'track_namespace', None)
                    or getattr(msg, 'namespace', None)
                    or getattr(msg, 'namespace_prefix', None) or ())
@@ -4189,6 +4194,7 @@ class _MOQTSessionMixin:
                 msg.request_id = self._peer_request_max + 2
         logger.info(f"MOQT send: {msg}")
         self.send_control_message(msg)
+        self._goaway_sent = True
         return msg
 
     def unsubscribe_namespace(

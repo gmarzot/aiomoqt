@@ -156,6 +156,14 @@ async def test_an_update_into_an_overlapping_prefix_ends_its_subscription():
     assert s._peer_requests[1] == (SubscribeNamespace, (b"c",))
 
 
+@pytest.mark.parametrize("draft, refused", [(18, True), (16, False)])
+async def test_requests_after_our_goaway_are_refused(draft, refused):
+    s = _session(draft)
+    s._goaway_sent = True
+    got = await _refused(s, _sub(1))
+    assert got == (RequestErrorCode.GOING_AWAY if refused else None)
+
+
 async def test_d14_requests_are_not_checked():
     s = _session(14)
     assert await _refused(s, _sub(1)) is None
@@ -301,4 +309,27 @@ async def test_an_overlapping_prefix_update_is_refused_on_the_wire(use_quic):
             other.request_id,
             parameters={ParamType.TRACK_NAMESPACE_PREFIX: (b"admit", b"x")},
             wait_response=True)) == RequestErrorCode.PREFIX_OVERLAP
+        assert pub._close_err is None and rx._close_err is None
+
+
+@requires_certs
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+async def test_after_our_goaway_new_requests_are_refused(use_quic):
+    # §10.4: a subscription made before the GOAWAY carries on; one asked
+    # for after it is refused GOING_AWAY.
+    port = _BASE_PORT + 44 + (not use_quic)
+    async with _loopback(port, 18, use_quic=use_quic) as (pub, rx):
+        PublishedTrack(pub, namespace=_NS, trackname="audio", object_size=64,
+                       group_size=10, rate=50).attach()
+        objects = []
+        rx.on_object_received = lambda *a: objects.append(a)
+        await rx.subscribe(_NS, "audio", forward=1, wait_response=True)
+        pub.goaway()
+        await asyncio.sleep(0.05)
+        assert await _error_code(rx.subscribe(
+            _NS, "video", forward=1, wait_response=True)) \
+            == RequestErrorCode.GOING_AWAY
+        seen = len(objects)
+        await asyncio.sleep(0.2)
+        assert len(objects) > seen
         assert pub._close_err is None and rx._close_err is None
