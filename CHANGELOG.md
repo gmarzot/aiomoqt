@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Fix: `pub_media --ts` stamps never run ahead of arrival; the PTS anchor follows the
+  least-delayed unit, so a late first unit or a fast source clock no longer reads as negative
+  latency.
 - Fix: a d18 control GOAWAY whose Request ID has the wrong parity closes the session with
   INVALID_REQUEST_ID (§10.4).
 - Fix: a `moqt://` or `https://` URL with an empty host is refused instead of dialling

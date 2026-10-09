@@ -36,8 +36,10 @@ class TsClock:
 
     Anchored on the first PTS at the wall clock of its arrival, so the
     stamps carry the source's spacing with the pipe's delay folded into a
-    constant offset. A backward jump beyond `restart_s` is an encoder
-    restart and re-anchors."""
+    constant offset. A unit arriving before its predicted stamp moves the
+    anchor earlier: no stamp is ever later than its unit's arrival, and
+    the offset settles on the least-delayed unit seen. A backward jump
+    beyond `restart_s` is an encoder restart and re-anchors."""
 
     def __init__(self, restart_s: float = 5.0,
                  now: Callable[[], float] = time.time):
@@ -48,13 +50,19 @@ class TsClock:
         self._wall0_us = 0
 
     def to_us(self, pts: int) -> int:
+        now_us = int(self._now() * 1_000_000)
         if self._pts0 is None or pts < self._last - self._restart:
             self._pts0 = pts
             self._last = pts
-            self._wall0_us = int(self._now() * 1_000_000)
-        elif pts > self._last:
+            self._wall0_us = now_us
+            return now_us
+        if pts > self._last:
             self._last = pts
-        return self._wall0_us + (pts - self._pts0) * 1000 // 90
+        stamp = self._wall0_us + (pts - self._pts0) * 1000 // 90
+        if stamp > now_us:
+            self._wall0_us -= stamp - now_us
+            stamp = now_us
+        return stamp
 
 
 def adts_split(data: bytes) -> List[Tuple[bytes, int, int, bytes]]:
