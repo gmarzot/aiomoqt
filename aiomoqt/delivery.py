@@ -14,6 +14,7 @@ from enum import Enum
 from typing import Any, Callable, Dict, Optional
 
 from .messages import SubgroupHeader
+from .types import StreamResetCode
 from .messages.data import (
     FETCH_FLAGS_END_UNKNOWN, FetchObject, ObjectDatagram,
 )
@@ -228,6 +229,15 @@ class SubgroupDelivery:
         """Give up now, closing the open group if the session still
         takes writes."""
         self.end_group()
+
+    def cancel(self) -> None:
+        """Reset the open stream: the peer's subscription ended part-way
+        through a group."""
+        if self._stream_id is None:
+            return
+        self.session.stream_reset(self._stream_id, StreamResetCode.CANCELLED)
+        self._stream_id = None
+        self._header = None
 
     async def close(self) -> None:
         """Finish cleanly: close the open group."""

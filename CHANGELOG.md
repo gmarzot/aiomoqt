@@ -44,6 +44,11 @@
   streams have closed. A REQUEST_UPDATE filter replaces the window.
 - Fix: a SUBSCRIBE whose AbsoluteRange End Group is already published is refused with
   INVALID_RANGE.
+- Fix: a failed REQUEST_UPDATE ends what it updated (§10.9.1): a track's subscription gets
+  REQUEST_ERROR then PUBLISH_DONE UPDATE_FAILED (the REQUEST_ERROR used to FIN the stream), a
+  FETCH being served has its data stream reset. A FETCH accepts only a priority update.
+- Fix: `await_fetch_done()` called after a fetch stream ended reports how it ended; a reset
+  stream read as clean.
 - Fix: `pub_media --ts` stamps never run ahead of arrival; the PTS anchor follows the
   least-delayed unit, so a late first unit or a fast source clock no longer reads as negative
   latency.

@@ -423,6 +423,9 @@ class _MOQTSessionMixin:
         # JoinedTrack registers a future here to get notified when
         # the fetch buffer fill is done.
         self._fetch_done_futures: Dict[int, Future] = {}  # request_id → Future
+        # Outcome of fetch streams that ended before anyone awaited them:
+        # request_id -> clean. Bounded; the oldest are forgotten.
+        self._fetch_done_results: "OrderedDict[int, bool]" = OrderedDict()
 
         # Queue for namespace announcements (populated by _handle_namespace)
         self._namespace_announcements: asyncio.Queue = asyncio.Queue()
@@ -511,7 +514,9 @@ class _MOQTSessionMixin:
         """
         fut = self._fetch_done_futures.get(request_id)
         if fut is None:
-            # No future registered — check if stream already gone
+            # The stream already ended, or never opened.
+            if request_id in self._fetch_done_results:
+                return self._fetch_done_results.pop(request_id)
             if request_id not in self._fetch_stream_by_request:
                 return True
             fut = self._loop.create_future()
@@ -665,6 +670,10 @@ class _MOQTSessionMixin:
         self._requests[request_id] = _RequestEntry(
             role="publisher", track=track, sub=sub, alias=alias)
 
+    def _bind_fetch(self, request_id: int, track) -> None:
+        """Route updates for a FETCH the track is serving to it."""
+        self._requests[request_id] = _RequestEntry(role="fetch", track=track)
+
     def _unbind_request(self, request_id: int) -> None:
         self._requests.pop(request_id, None)
 
@@ -701,6 +710,9 @@ class _MOQTSessionMixin:
             rid, name = msg.request_id, '_on_publish_ok'
         elif isinstance(msg, RequestUpdate):
             rid, name = msg.existing_request_id, '_on_request_update'
+            entry = self._requests.get(rid)
+            if entry is not None and entry.role == "fetch":
+                name = '_on_fetch_update'
         elif isinstance(msg, SubscribeUpdate):
             rid, name = msg.subscription_request_id, '_on_subscribe_update'
         else:
@@ -1140,10 +1152,16 @@ class _MOQTSessionMixin:
                                             clean, reset_code)
         if key and len(key) == 2 and key[0] == 'fetch':
             request_id = key[1]
+            clean = error_code == QuicErrorCode.NO_ERROR
             fut = self._fetch_done_futures.pop(request_id, None)
             if fut and not fut.done():
-                fut.set_result(error_code == QuicErrorCode.NO_ERROR)
+                fut.set_result(clean)
+            self._fetch_done_results[request_id] = clean
+            while len(self._fetch_done_results) > self.FETCH_RESULTS_KEPT:
+                self._fetch_done_results.popitem(last=False)
         self._unbind_key(key)
+
+    FETCH_RESULTS_KEPT = 256
 
     # A uni data stream whose header has not parsed within the deadline
     # is abandoned (STOP_SENDING): its bytes and stream credit would
@@ -2913,8 +2931,28 @@ class _MOQTSessionMixin:
                            retry_interval=0, reason=reason)
 
         async def refuse(session, _msg):
-            session._send_on_request_stream(rid, err, fin=True)
+            if isinstance(msg, RequestUpdate):
+                session._send_on_request_stream(rid, err)
+                session._update_failed(msg)
+            else:
+                session._send_on_request_stream(rid, err, fin=True)
         return refuse
+
+    def _update_failed(self, msg: RequestUpdate) -> None:
+        """§10.9.1: a failed REQUEST_UPDATE ends the request it updated —
+        a track's subscription with PUBLISH_DONE UPDATE_FAILED, a FETCH by
+        resetting its data stream; any other has its stream closed."""
+        existing = msg.existing_request_id
+        entry = self._requests.get(existing)
+        if entry is not None and entry.role == "fetch":
+            entry.track._end_fetch(self, existing)
+        elif entry is not None and entry.sub is not None:
+            entry.track._end_subscription(entry.sub,
+                                          SubscribeDoneCode.UPDATE_FAILED)
+        else:
+            sid = self._bidi_streams.get(existing)
+            if sid is not None:
+                self.stream_fin(sid)
 
     def _refuse_request(self, msg: MOQTMessage) -> Optional[Callable]:
         """Session-level request rules, applied before the application

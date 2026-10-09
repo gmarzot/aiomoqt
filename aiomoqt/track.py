@@ -38,7 +38,8 @@ from .delivery import (
     FanoutDelivery, ObjectHistory, StreamMapping, SubgroupDelivery,
 )
 from .messages import (
-    MOQTMessage, ObjectDatagram, PublishOk, RequestOk, RequestUpdate,
+    MOQTMessage, ObjectDatagram, PublishOk, RequestError, RequestOk,
+    RequestUpdate,
 )
 from .context import is_draft16_or_later
 from .messages.fetch import _is_joining
@@ -245,7 +246,7 @@ class _Subscription:
     __slots__ = ('session', 'track_alias', 'request_id',
                  'subscribe_request_id', 'subscribers', 'state', 'forward',
                  'done', 'stream_count', 'generating', 'delivery', 'joining',
-                 'window', 'open_streams')
+                 'window', 'open_streams', 'end_status')
 
     def __init__(self, session):
         self.session = session
@@ -271,6 +272,8 @@ class _Subscription:
         # Filter window (§5.1.2) and the streams open under it.
         self.window = _UNFILTERED
         self.open_streams = 0
+        # PUBLISH_DONE status for a subscription ended under the track.
+        self.end_status = SubscribeDoneCode.SUBSCRIPTION_ENDED
 
     def passes(self, group_id: int, object_id: int) -> bool:
         """True when the subscription filter admits this Location."""
@@ -864,6 +867,31 @@ class PublishedTrack(Track):
             sub.joining[msg.request_id] = reported
             await self._start_generating(session, "SUBSCRIBE")
 
+    async def _on_fetch_update(self, session, msg) -> None:
+        """REQUEST_UPDATE for a FETCH being served: a priority change is
+        accepted, though not applied; anything else fails, which ends
+        the FETCH (§10.9.1)."""
+        if set(msg.parameters or {}) <= {ParamType.SUBSCRIBER_PRIORITY,
+                                         ParamType.AUTH_TOKEN}:
+            session._send_reply(msg.request_id,
+                                RequestOk(request_id=msg.request_id))
+            return
+        session._send_reply(msg.request_id, RequestError(
+            request_id=msg.request_id,
+            error_code=int(RequestErrorCode.NOT_SUPPORTED),
+            retry_interval=0, reason="a FETCH takes only a priority update"))
+        self._end_fetch(session, msg.existing_request_id)
+
+    def _end_fetch(self, session, request_id: int) -> None:
+        """End a FETCH being served: its data stream is reset and its
+        request stream closed."""
+        cancel = session._request_cancel_handlers.pop(request_id, None)
+        if cancel is not None:
+            cancel(request_id)
+        sid = session._bidi_streams.get(request_id)
+        if sid is not None:
+            session.stream_fin(sid)
+
     async def _on_track_status(self, session, msg) -> None:
         """TRACK_STATUS (§10.14): the SUBSCRIBE_OK this track would send,
         as a REQUEST_OK that ends the request."""
@@ -936,10 +964,12 @@ class PublishedTrack(Track):
         # §5.2: a cancelled FETCH resets its data stream.
         task = asyncio.current_task()
         session.register_request_cancel_handler(rid, lambda _: task.cancel())
+        session._bind_fetch(rid, self)
         try:
             await session.serve_fetch(rid, objects, group_order=int(order))
         finally:
             session._request_cancel_handlers.pop(rid, None)
+            session._unbind_request(rid)
         logger.info(f"Track: FETCH {rid} served {len(objects)} object(s) "
                     f"{start}..{last}")
 
@@ -976,23 +1006,33 @@ class PublishedTrack(Track):
         self._finish_range(sub)
 
     def _range_ended(self, sub) -> None:
-        """Production passed the subscription's End Group: it takes no
-        more objects, and ends once its streams have closed."""
+        """Production passed the subscription's End Group."""
+        self._end_subscription(sub, SubscribeDoneCode.SUBSCRIPTION_ENDED)
+
+    def _end_subscription(self, sub, status: int) -> None:
+        """End one peer's subscription while the track goes on: it takes
+        no more objects, and PUBLISH_DONE `status` follows once its
+        streams have closed. At its End Group the last group closes in
+        order; otherwise open streams are reset at once."""
         if isinstance(sub.window, str):
             return
         sub.window = _ENDED
-        sub.generating = False
+        sub.end_status = status
+        if status == SubscribeDoneCode.SUBSCRIPTION_ENDED:
+            sub.generating = False
+        else:
+            if sub.delivery is not None:
+                sub.delivery.cancel()
+            self._stop_producing(sub)
         self._finish_range(sub)
 
     def _finish_range(self, sub) -> None:
-        """PUBLISH_DONE SUBSCRIPTION_ENDED after the last stream of an
-        ended subscription closes (§5.1.1, §10.11)."""
+        """PUBLISH_DONE after the last stream of an ended subscription
+        closes (§5.1.1, §10.11)."""
         if sub.window != _ENDED or sub.open_streams > 0:
             return
         sub.window = _DONE
-        self._send_publish_done(sub.session,
-                                SubscribeDoneCode.SUBSCRIPTION_ENDED,
-                                final=False)
+        self._send_publish_done(sub.session, sub.end_status, final=False)
         sub.subscribers.clear()
 
     def _send_publish_done(self, session, status_code=0x2,
