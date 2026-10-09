@@ -64,12 +64,15 @@ class _PushTrack(PublishedTrack):
     async def produce(self, out) -> None:
         while True:
             item = await self._queue.get()
-            if item is None:  # close sentinel
-                return
-            group_id, object_id, payload, group_start = item
-            await out.write(group_id, object_id, payload,
-                            group_start=group_start)
-            self._stats.sent += 1
+            try:
+                if item is None:  # close sentinel
+                    return
+                group_id, object_id, payload, group_start = item
+                await out.write(group_id, object_id, payload,
+                                group_start=group_start)
+                self._stats.sent += 1
+            finally:
+                self._queue.task_done()
 
 
 class Writer:
@@ -133,7 +136,8 @@ class Writer:
         self._force_new = True
 
     async def flush(self, *, timeout: Optional[float] = None) -> None:
-        """Wait until every queued object has been written to the wire."""
+        """Wait until produce() has handed every queued object to the
+        track's delivery."""
         deadline = timeout if timeout is not None else self.spec.timeout_s
         try:
             await asyncio.wait_for(self._queue.join(), deadline)
@@ -162,10 +166,15 @@ class Writer:
             raise AgentError(f"writer {self.name} is closed")
         data = _as_bytes(payload)
         item: _Item = (self._group, self._object, data, group_start)
-        if not self._admit(item):
+        block = self._queue.full() and self.spec.on_full == "block"
+        if not block and not self._admit(item):
             return
+        # Numbered before any wait, so a write issued meanwhile cannot
+        # reuse the id.
         self._object += 1
         self._in_group += 1
+        if block:
+            await self._queue.put(item)
         self.stats.queued += 1
         self.stats.bytes += len(data)
 

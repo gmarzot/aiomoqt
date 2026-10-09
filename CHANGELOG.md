@@ -21,6 +21,7 @@
 - Fix: the control stream is never closed while the session lives (§3.3): a graceful close no
   longer FINs it first, and a peer's control-stream FIN closes the session with
   PROTOCOL_VIOLATION (it was INTERNAL_ERROR, or ignored when the FIN carried data).
+- deps: `aiopquic>=0.5.0a1`; the CI source pin is removed.
 - Fix: `verify_tls` / `-k` reach the transport. Clients verify the server's
   certificate by default (aiopquic 0.5.0a1); `verify_tls=False` / `-k` accepts any
   certificate; `MOQTClient(ca_file=...)` trusts a private CA.
@@ -128,6 +129,8 @@
   debug logging is off; neither does the per-stream header log.
 - media: `on_arrival` on `LocTrackSubscriber` and `MediaSubscriber` sees every object,
   END_OF_GROUP included, with its receive time.
+- Fix: agent Writer's default `on_full="block"` waits for room instead of raising
+  `QueueFull`, and `flush()` returns once `produce()` has taken every object.
 - media: `chunk_decode_time()` and `init_timescale()` read CMAF tfdt and mdhd.
 - Fix: TrackStats counted a reorder that filled a gap as lost, and missed a gap spanning a
   `snapshot()`.

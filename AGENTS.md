@@ -149,9 +149,9 @@ subgroup writing, pacing and the TX budget; `SubscribedTrack` owns reassembly an
   the one place not to use it. For clean timing measurements on loopback use `cubic` or
   `newreno`; loss-based CCs do collapse on the GIL-induced loss blips of a loaded host, so
   prefer them for timing, not for throughput.
-- WebTransport datagram TX needs `aiopquic >= 0.4.1`. Against 0.4.0 — what PyPI serves, and
-  what this tree floors to until 0.4.1 ships — `StreamMapping.DATAGRAM` fails over
-  WebTransport; use `PER_GROUP`. Datagram RX works on both transports either way.
+- Clients verify the relay's certificate by default (`aiopquic >= 0.5.0a1`): a self-signed
+  relay needs `-k` / `verify_tls=False`, a private CA goes in `ca_file=`. Every local test
+  server is self-signed.
 - `.github/aiopquic-pin` (`owner/repo@ref`) builds aiopquic from source so a PR can pair with
   an unreleased aiopquic change. Fine while paired — the `pin-guard` job hard-fails it on main
   or a release-labeled PR, because it would ship a dependency nobody can install.
