@@ -130,6 +130,8 @@ case "$scenario_id" in
         control=(--end-after 1) ;;
     receive-request-update-ok-with-track-properties)
         control=(--publish-update) ;;
+    publish-and-withdraw-namespace-during-discovery)
+        control=(--withdraw-after 1) ;;
 esac
 
 # A 64-byte token cache holds the runner's 20-byte alias entries and stays
