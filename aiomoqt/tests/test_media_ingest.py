@@ -22,7 +22,7 @@ from aiomoqt.tests._certs import CERT, KEY, requires_certs
 from aiomoqt.tools import moq_interop_relay as relay
 from aiomoqt.tools import pub_media
 
-_BASE_PORT = 15950
+_BASE_PORT = 15970
 _RUNGS = ((320, 180, 400_000), (160, 90, 150_000))
 _SECONDS = 4
 _FPS = 30
@@ -417,23 +417,26 @@ async def test_ingest_catalog_alternate_group(origin):
 # -- end to end ---------------------------------------------------------
 
 @requires_certs
-@pytest.mark.parametrize('source, entry, port', [
-    ('fmp4', 'master.m3u8', _BASE_PORT + 1),
-    ('dash-number', 'm.mpd', _BASE_PORT + 2),
+@pytest.mark.parametrize('use_quic', [True, False], ids=['quic', 'wt'])
+@pytest.mark.parametrize('source, entry', [
+    ('fmp4', 'master.m3u8'), ('dash-number', 'm.mpd'),
 ], ids=['hls', 'dash'])
 async def test_pub_media_input_through_a_relay(ladders, monkeypatch, source,
-                                               entry, port):
+                                               entry, use_quic):
+    """Catalog, two renditions and audio on one session each way."""
     av = load_av()
     ns = 'ingest/e2e'
+    port = _BASE_PORT + 1 + (source != 'fmp4') + (0 if use_quic else 10)
     origin = _Origin(ladders[source], entry=entry)
     relay._announced.clear()
     relay._tracks.clear()
     handle = await relay._build_server('localhost', port, CERT, KEY,
-                                       use_quic=True, draft=18).serve()
+                                       use_quic=use_quic, draft=18).serve()
+    scheme = 'moqt' if use_quic else 'https'
     args = _parse(monkeypatch, '-N', ns, '--input', origin.url,
                   '--rendition', 'all', '--pub-ns', '-k', '-t', str(_SECONDS),
                   '--stats', '0', '--catalog-interval', '0.5',
-                  url=f'moqt://localhost:{port}/')
+                  url=f'{scheme}://localhost:{port}/')
     got = {}
     pub = asyncio.create_task(pub_media.run(args))
     try:
@@ -442,7 +445,7 @@ async def test_pub_media_input_through_a_relay(ladders, monkeypatch, source,
                 break
             await asyncio.sleep(0.05)
         assert relay._announced, "publisher never announced"
-        client = MOQTClient('localhost', port, path='/', use_quic=True,
+        client = MOQTClient('localhost', port, path='/', use_quic=use_quic,
                             verify_tls=False, supported_drafts=18)
         async with client.connect() as session:
             await session.client_session_init()
