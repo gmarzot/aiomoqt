@@ -44,6 +44,9 @@
   streams have closed. A REQUEST_UPDATE filter replaces the window.
 - Fix: a SUBSCRIBE whose AbsoluteRange End Group is already published is refused with
   INVALID_RANGE.
+- Fix: a `PublishedTrack` stops sending to a subscription whose Forward State drops to 0 (§5.1),
+  and resets a subgroup stream it cuts short — on a pause or a filter update past it — instead
+  of finishing it (§11.4.3).
 - Fix: a failed REQUEST_UPDATE ends what it updated (§10.9.1): a track's subscription gets
   REQUEST_ERROR then PUBLISH_DONE UPDATE_FAILED (the REQUEST_ERROR used to FIN the stream), a
   FETCH being served has its data stream reset. A FETCH accepts only a priority update.

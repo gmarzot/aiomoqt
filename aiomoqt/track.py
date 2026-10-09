@@ -193,6 +193,7 @@ class _SubgroupSender:
         else:
             self.session.stream_fin(self.stream_id)
         self.stream_id = None
+        self.sub.senders.discard(self)
         self.track._stream_closed(self.sub)
 
     async def send(self, object_id: int, payload: bytes,
@@ -206,6 +207,7 @@ class _SubgroupSender:
             self.stream_id = await session.open_uni_stream()
             self.track._stream_count += 1
             self.track._stream_opened(self.sub)
+            self.sub.senders.add(self)
             self.header.first_object = object_id == self.subgroup_id
             if session._close_err is not None:
                 raise asyncio.CancelledError
@@ -227,6 +229,7 @@ class _SubgroupSender:
             self.session.stream_reset(self.stream_id,
                                       StreamResetCode.CANCELLED)
         self.stream_id = None
+        self.sub.senders.discard(self)
         self.track._stream_closed(self.sub)
 
 
@@ -246,7 +249,7 @@ class _Subscription:
     __slots__ = ('session', 'track_alias', 'request_id',
                  'subscribe_request_id', 'subscribers', 'state', 'forward',
                  'done', 'stream_count', 'generating', 'delivery', 'joining',
-                 'window', 'open_streams', 'end_status')
+                 'window', 'open_streams', 'end_status', 'senders')
 
     def __init__(self, session):
         self.session = session
@@ -274,11 +277,14 @@ class _Subscription:
         self.open_streams = 0
         # PUBLISH_DONE status for a subscription ended under the track.
         self.end_status = SubscribeDoneCode.SUBSCRIPTION_ENDED
+        # _SubgroupSenders with a stream open for this peer.
+        self.senders: set = set()
 
     def passes(self, group_id: int, object_id: int) -> bool:
-        """True when the subscription filter admits this Location."""
+        """True when the subscription takes this Location: Forward State 1
+        (§5.1) and inside its filter (§5.1.2)."""
         window = self.window
-        if isinstance(window, str):
+        if not self.forward or isinstance(window, str):
             return False
         start, end_group = window
         return ((group_id, object_id) >= start
@@ -760,6 +766,18 @@ class PublishedTrack(Track):
         if forward != sub.forward:
             logger.info(f"Track: forward state -> {int(forward)}")
         sub.forward = forward
+        self._cut_streams(sub)
+
+    def _cut_streams(self, sub) -> None:
+        """Reset the streams whose next object the subscription no longer
+        takes: a FIN would claim the rest of the group was delivered
+        (§11.4.3)."""
+        for sender in list(sub.senders):
+            header = sender.header
+            if not sub.passes(header.group_id, header.next_object_id):
+                sender.reset()
+        if not sub.forward and sub.delivery is not None:
+            sub.delivery.cancel()
 
     async def _on_publish_ok(self, session, msg: PublishOk):
         """Relay accepted our PUBLISH. forward=1 starts generation if
@@ -801,6 +819,7 @@ class PublishedTrack(Track):
             sub.window = _filter_window(
                 *MOQTMessage._decode_filter(raw_filter, prof=session._profile),
                 self._largest)
+            self._cut_streams(sub)
         if forward and not sub.forward:
             sub.joining[msg.existing_request_id] = self._largest
         # §10.9: exactly one REQUEST_OK or REQUEST_ERROR; LARGEST_OBJECT

@@ -163,3 +163,26 @@ async def test_a_range_already_published_is_refused(use_quic):
                 start_object=0, end_group=0, wait_response=True)
         assert err.value.error_code == RequestErrorCode.INVALID_RANGE
         assert rx._close_err is None
+
+
+@requires_certs
+@_TRANSPORTS
+async def test_forward_zero_pauses_only_its_subscription(use_quic):
+    # §5.1: no objects while the Forward State is 0; the other track goes on.
+    async with _loopback(_port(2, use_quic), use_quic) as (tracks, rx, objects):
+        await rx.subscribe(_NS, "audio", forward=1, wait_response=True)
+        video = await rx.subscribe(_NS, "video", forward=1, wait_response=True)
+        await asyncio.sleep(0.1)
+        await rx.request_update(video.request_id, forward=0,
+                                wait_response=True)
+        await asyncio.sleep(0.05)
+        assert tracks["video"]._subs[0].senders == set()
+        video_seen, audio_seen = len(objects["video"]), len(objects["audio"])
+        await asyncio.sleep(0.15)
+        assert len(objects["video"]) == video_seen
+        assert len(objects["audio"]) > audio_seen
+        await rx.request_update(video.request_id, forward=1,
+                                wait_response=True)
+        await asyncio.sleep(0.15)
+        assert len(objects["video"]) > video_seen
+        assert rx._close_err is None
