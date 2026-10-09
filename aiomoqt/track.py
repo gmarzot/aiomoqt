@@ -789,7 +789,13 @@ class PublishedTrack(Track):
         session.fetch_ok(request_id=rid, end_of_track=int(ended),
                          largest_group_id=end[0], largest_object_id=end[1],
                          group_order=int(order))
-        await session.serve_fetch(rid, objects, group_order=int(order))
+        # §5.2: a cancelled FETCH resets its data stream.
+        task = asyncio.current_task()
+        session.register_request_cancel_handler(rid, lambda _: task.cancel())
+        try:
+            await session.serve_fetch(rid, objects, group_order=int(order))
+        finally:
+            session._request_cancel_handlers.pop(rid, None)
         logger.info(f"Track: FETCH {rid} served {len(objects)} object(s) "
                     f"{start}..{last}")
 

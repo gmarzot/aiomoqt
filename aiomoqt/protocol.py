@@ -3671,26 +3671,32 @@ class _MOQTSessionMixin:
         FetchObject in ascending order as a delta-coded object, then
         FINs unless `fin=False` (the caller then owns the FIN).
         `objects` is any iterable of FetchObject. Call fetch_ok() first
-        (its End Location must be known). Returns the stream id."""
+        (its End Location must be known). Returns the stream id. Cancelled
+        mid-way, it resets the stream (§5.2)."""
         stream_id = await self.open_uni_stream()
         header = FetchHeader(request_id=request_id)
         self.stream_write(stream_id, header.serialize(prof=self._profile).data)
         prior = None
-        for obj in objects:
-            buf = obj.serialize(prof=self._profile, prior=prior,
-                                group_order=int(group_order))
-            await self.stream_write_drain(stream_id, buf.data)
-            if obj.end_of_range is None:
-                prior = obj
-            else:
-                # §11.4.4.2: the marker is the prior for Group/Object
-                # deltas; Subgroup/Priority carry over only from a real
-                # object (poisoned otherwise so later refs stay explicit).
-                prior = FetchObject(
-                    group_id=obj.group_id, object_id=obj.object_id,
-                    subgroup_id=(prior.subgroup_id if prior else -1),
-                    publisher_priority=(prior.publisher_priority
-                                        if prior else -1))
+        try:
+            for obj in objects:
+                buf = obj.serialize(prof=self._profile, prior=prior,
+                                    group_order=int(group_order))
+                await self.stream_write_drain(stream_id, buf.data)
+                if obj.end_of_range is None:
+                    prior = obj
+                else:
+                    # §11.4.4.2: the marker is the prior for Group/Object
+                    # deltas; Subgroup/Priority carry over only from a real
+                    # object (poisoned otherwise so later refs stay
+                    # explicit).
+                    prior = FetchObject(
+                        group_id=obj.group_id, object_id=obj.object_id,
+                        subgroup_id=(prior.subgroup_id if prior else -1),
+                        publisher_priority=(prior.publisher_priority
+                                            if prior else -1))
+        except asyncio.CancelledError:
+            self.stream_reset(stream_id, StreamResetCode.CANCELLED)
+            raise
         if fin:
             self.stream_fin(stream_id)
         return stream_id

@@ -14,7 +14,7 @@ from aiomoqt.server import MOQTServer
 from aiomoqt.track import PublishedTrack
 from aiomoqt.types import (
     FetchType, GroupOrder, MOQTMessageType, MOQTRequestError, ParamType,
-    RequestErrorCode,
+    RequestErrorCode, StreamResetCode,
 )
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
@@ -221,3 +221,63 @@ async def test_replies_carry_the_largest_object(use_quic):
         ok = await rx.joining_fetch(sub.request_id, joining_start=0,
                                     wait_response=True)
         assert (ok.largest_group_id, ok.largest_object_id) == (2, 5)
+
+
+async def test_serve_fetch_resets_its_stream_when_cancelled():
+    from aiomoqt.context import profile_for
+    from aiomoqt.messages.data import FetchObject
+    from aiomoqt.protocol import _MOQTSessionMixin
+
+    class _Stub:
+        _profile = profile_for(18)
+        written, resets, fins = [], [], []
+
+        async def open_uni_stream(self):
+            return 9
+
+        def stream_write(self, sid, data, end_stream=False):
+            self.written.append(sid)
+
+        async def stream_write_drain(self, sid, data, end_stream=False):
+            await asyncio.Event().wait()
+
+        def stream_reset(self, sid, code):
+            self.resets.append((sid, code))
+
+        def stream_fin(self, sid):
+            self.fins.append(sid)
+
+    stub = _Stub()
+    serve = asyncio.ensure_future(_MOQTSessionMixin.serve_fetch(
+        stub, 1, [FetchObject(group_id=0, object_id=0, payload=b"x")]))
+    await asyncio.sleep(0)
+    serve.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await serve
+    assert stub.resets == [(9, StreamResetCode.CANCELLED)] and stub.fins == []
+
+
+@requires_certs
+@_TRANSPORTS
+async def test_a_cancelled_fetch_resets_its_data_stream(use_quic):
+    # §5.2: STOP_SENDING on the request stream; the publisher resets both
+    # streams. Writes are stalled so the data stream is still open.
+    async with _loopback(_port(6, use_quic), use_quic) as (tracks, rx, _):
+        pub = tracks["video"].session
+        stalled = asyncio.Event()
+
+        async def _stall(stream_id, data, end_stream=False):
+            stalled.set()
+            await asyncio.Event().wait()
+        pub.stream_write_drain = _stall
+        resets = []
+        reset = pub.stream_reset
+        pub.stream_reset = lambda sid, code=0: (resets.append(int(code)),
+                                                reset(sid, code))
+        ok = await rx.fetch(_NS, "video", start_group=0, start_object=0,
+                            end_group=2, end_object=0, wait_response=True)
+        await asyncio.wait_for(stalled.wait(), 5)
+        rx.stream_stop_sending(rx._bidi_streams[ok.request_id], 1)
+        assert await rx.await_fetch_done(ok.request_id, timeout=5) is False
+        assert StreamResetCode.CANCELLED in resets
+        assert pub._close_err is None and rx._close_err is None
