@@ -73,7 +73,10 @@ case "$scenario_id" in
     publish-track-namespace-fields|\
     receive-reason-phrase-length-over-1024|\
     receive-publish-request-ok-with-track-properties|\
-    receive-subscribe-before-outstanding-publish-response)
+    receive-subscribe-before-outstanding-publish-response|\
+    publish-with-multiple-message-parameter-types|\
+    publish-with-multiple-configured-parameters|\
+    publish-existing-track-after-observed-object-publication)
         flow=() ;;
 esac
 
@@ -97,7 +100,9 @@ case "$scenario_id" in
     joining-fetch-after-forward-enabled-and-track-advanced|\
     cancel-fetch-request-with-open-data-stream|\
     reject-request-update-for-open-fetch|\
-    publish-objects-before-within-and-after-subscription-range)
+    publish-objects-before-within-and-after-subscription-range|\
+    publish-with-multiple-message-parameter-types|\
+    publish-with-multiple-configured-parameters)
         content=(--prefill 10) ;;
     receive-joining-fetch-for-track-with-no-published-objects|\
     receive-standalone-fetch-for-track-with-no-published-objects)
