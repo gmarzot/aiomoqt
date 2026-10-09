@@ -8,6 +8,7 @@
 """
 import argparse
 import asyncio
+import functools
 import logging
 
 from aiomoqt.client import MOQTClient
@@ -97,6 +98,10 @@ The URL scheme selects the transport:
                         metavar='SECONDS',
                         help='End the track this long after publishing: '
                              'PUBLISH_DONE once its streams have closed')
+    parser.add_argument('--withdraw-after', type=float, default=None,
+                        metavar='SECONDS',
+                        help='Withdraw the announced namespace this long '
+                             'after publishing')
     parser.add_argument('--goaway-after', type=float, default=None,
                         metavar='SECONDS',
                         help='Send GOAWAY this long after publishing; '
@@ -235,6 +240,9 @@ async def run(args):
                 loop.call_later(args.goaway_after, session.goaway)
             if args.end_after is not None:
                 loop.call_later(args.end_after, track.end)
+            if args.withdraw_after is not None:
+                loop.call_later(args.withdraw_after, functools.partial(
+                    session.publish_namespace_done, namespace=args.namespace))
             if args.publish_update and not args.pub_ns:
                 loop.call_later(0.5, session.request_update,
                                 track.request_id)
