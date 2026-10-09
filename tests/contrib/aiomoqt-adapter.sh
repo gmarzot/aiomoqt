@@ -121,6 +121,9 @@ case "$scenario_id" in
     send-new-request-after-publisher-control-goaway|\
     publisher-control-goaway-with-pending-request-at-cutoff)
         control=(--goaway-after 1) ;;
+    publisher-queries-track-status-before-resuming-publication|\
+    publisher-recovery-track-status-*)
+        control=(--track-status) ;;
 esac
 
 # A 64-byte token cache holds the runner's 20-byte alias entries and stays
