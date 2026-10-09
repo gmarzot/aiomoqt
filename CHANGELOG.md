@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- deps: `aiopquic>=0.5.0a1`; the CI source pin is removed.
 - Fix: `verify_tls` / `-k` reach the transport. Clients verify the server's
   certificate by default (aiopquic 0.5.0a1); `verify_tls=False` / `-k` accepts any
   certificate; `MOQTClient(ca_file=...)` trusts a private CA.
