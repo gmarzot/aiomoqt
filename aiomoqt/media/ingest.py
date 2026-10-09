@@ -379,6 +379,15 @@ def _fetch(url: str, byte_range: Optional[str] = None, *,
         return f.read(-1 if last is None else last - first + 1)
 
 
+def _fetch_remote(url: str, byte_range: Optional[str] = None, *,
+                  ctx: ssl.SSLContext) -> bytes:
+    """_fetch for resources a remote MPD names: HTTP(S) only, so a
+    manifest cannot make the ingest read local files."""
+    if urllib.parse.urlsplit(url).scheme.lower() not in ('http', 'https'):
+        raise OSError(f"unsupported DASH URL: {url[:80]}")
+    return _fetch(url, byte_range, ctx=ctx)
+
+
 def _is_dash(url: str, ctx: ssl.SSLContext) -> bool:
     """An .mpd URL, or one whose content is an MPD; .m3u8 never is."""
     path = urllib.parse.urlparse(url).path.lower()
@@ -485,7 +494,9 @@ class Ingest:
                  {t.stream.index: t for t in self.tracks})]
 
     def _open_dash(self, url, rendition, audio, ctx) -> List[_Source]:
-        pres = Presentation(url, functools.partial(_fetch, ctx=ctx))
+        remote = url.startswith(('http://', 'https://'))
+        pres = Presentation(url, functools.partial(
+            _fetch_remote if remote else _fetch, ctx=ctx))
         videos, aud = pres.select(rendition, audio)
         reps = videos + ([aud] if aud is not None else [])
         names = _video_names([(r.height or 0, r.bandwidth) for r in videos])

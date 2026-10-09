@@ -378,6 +378,23 @@ async def test_dash_groups_follow_source_segments(dash_origin):
     assert len(audio_groups) <= _SECONDS + 1 < len(chunks['audio'])
 
 
+async def test_remote_mpd_cannot_name_local_files(ladders, tmp_path):
+    """A remote MPD whose BaseURL points at a playable local ladder is
+    refused instead of read and published."""
+    root = ladders['dash-number']
+    mpd = (root / 'm.mpd').read_text()
+    head, sep, rest = mpd.partition('<Period')
+    (tmp_path / 'm.mpd').write_text(
+        f"{head}<BaseURL>file://{root}/</BaseURL>{sep}{rest}")
+    origin = _Origin(tmp_path, entry='m.mpd')
+    try:
+        with pytest.raises(Exception, match='unsupported DASH URL'):
+            await _open(origin.url, 'best')
+    finally:
+        origin.close()
+    assert origin.hits == ['/m.mpd']
+
+
 async def test_dash_chunks_carry_the_source_timeline(dash_origin):
     av = load_av()
     from aiomoqt.media.dash import parse_mpd
