@@ -1,8 +1,8 @@
 """Publisher conformance sweep against moq-contribution-interop-runner.
 
 Starts the runner in driven mode with the aiomoqt adapter, runs every d18
-scenario on one transport that needs no FETCH, merges the requirement
-outcomes and compares them with a baseline of passing rows.
+scenario on one transport, merges the requirement outcomes and compares
+them with a baseline of passing rows.
 
     python tests/contrib/sweep.py --runner build/moq-interop-runner --out out
 
@@ -80,7 +80,6 @@ def _start_runner(args, out):
            "--tls-cert", str(cert), "--tls-key", str(key),
            "--driver-executable", str(args.adapter),
            "--driver-log-root", str(out / "driver-logs"),
-           "--publisher-no-fetch",
            # d18 gives an unknown token alias no REQUEST_ERROR code; the
            # session sends UNKNOWN_AUTH_TOKEN_ALIAS's session code, 0x17.
            "--unknown-auth-token-alias-compat-code", "0x17",
@@ -154,7 +153,7 @@ def sweep(base, args, out):
     _, health = _call(base, "GET", "/healthz")
     todo = sorted({p["scenario"] for p in health["executable_profiles"]
                    if p["draft"] == 18 and p["transport"] == args.transport
-                   and p["mode"] == "driven" and not p["requires_fetch"]})
+                   and p["mode"] == "driven"})
     if not todo:
         raise SweepError(f"runner offers no driven d18 {args.transport} "
                          f"scenarios")

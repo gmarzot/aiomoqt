@@ -71,6 +71,34 @@ case "$scenario_id" in
         flow=--pub-both ;;
 esac
 
+# Track contents the scenario's fixture contract asks for: Group 7 with
+# Object 9 already published, a track with nothing published, or objects
+# sent as datagrams.
+content=()
+case "$scenario_id" in
+    fetch-known-first-object-with-nonzero-group-and-object-ids|\
+    fetch-multiple-published-groups-in-each-explicit-order|\
+    retrieve-same-object-at-distinct-times|\
+    retrieve-same-object-with-different-subscribe-publish-ok-and-fetch-parameters|\
+    subscribe-to-track-after-observed-object-publication|\
+    publish-existing-track-after-observed-object-publication|\
+    accepted-subscription-update-after-observed-object-publication|\
+    accepted-track-status-after-observed-object-publication|\
+    publish-and-retrieve-same-object-and-track-immutable-properties|\
+    repeat-immutable-property-with-alternative-varint-encodings-available|\
+    publish-object-with-immutable-properties|\
+    receive-fetch-start-beyond-largest-published-object|\
+    joining-fetch-after-forward-enabled-and-track-advanced|\
+    cancel-fetch-request-with-open-data-stream|\
+    reject-request-update-for-open-fetch)
+        content=(--prefill 10) ;;
+    receive-joining-fetch-for-track-with-no-published-objects|\
+    receive-standalone-fetch-for-track-with-no-published-objects)
+        content=(--no-objects) ;;
+    fetch-object-previously-observed-as-datagram)
+        content=(-D) ;;
+esac
+
 timeout_seconds=$(((timeout_ms + 999) / 1000))
 # The runner's certificate is self-signed for the test; pub_bench has no
 # trust-file option, so verification is skipped (-k). A 64-byte token cache
@@ -80,7 +108,7 @@ timeout_seconds=$(((timeout_ms + 999) / 1000))
 # (EXPIRED_AUTH_TOKEN) and denied (UNAUTHORIZED).
 exec "$python" -m aiomoqt.tools.pub_bench "$endpoint" \
     -N "$namespace" -T "$track" --draft 18 -k "$flow" \
-    -s 64 -g 10 -r 50 -t "$timeout_seconds" --no-stats \
+    -s 64 -g 10 -r 50 -t "$timeout_seconds" --no-stats "${content[@]}" \
     --token-cache 64 \
     --token-reject 1:696e76616c6964:0x4 \
     --token-reject 1:65787069726564:0x5 \

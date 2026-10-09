@@ -9,6 +9,25 @@
 - `pub_bench`: `--token-cache BYTES` advertises MAX_AUTH_TOKEN_CACHE_SIZE, and
   `--token-reject TYPE:HEX:CODE` refuses requests carrying that token.
 - CI: the adaptive-mp suites run 20 s and name their failure.
+- `PublishedTrack` answers FETCH from a bounded object history (`fetch_history_bytes`,
+  default 1 MiB; 0 refuses FETCH as NOT_SUPPORTED): standalone by name, joining against the
+  peer's subscription, objects already dropped reported as an End of Unknown Range (§10.12).
+- A FETCH on a track with no objects, starting past the Largest Object, or joining a
+  subscription with Forward State 0 is refused with INVALID_RANGE (§10.12.2-3).
+- `PublishedTrack.prefill(groups)` records groups as already published, for FETCH before any
+  subscriber.
+- Fix: production numbers groups on from the Largest group, also after an idle restart; it
+  restarted at group 0, publishing a Location twice.
+- Fix: a `produce()` track's SUBSCRIBE_OK reports its Largest Location; it reported none.
+- Fix: REQUEST_OK to a REQUEST_UPDATE carries LARGEST_OBJECT once objects exist, and a
+  `PublishedTrack` answers TRACK_STATUS with it (§10.2.11); TRACK_STATUS was NOT_SUPPORTED.
+- Fix: a joining FETCH naming no subscription is refused with INVALID_JOINING_REQUEST_ID
+  (it was NOT_SUPPORTED); one sent with its SUBSCRIBE is served (§10.12.2).
+- Fix: an unknown FETCH type closes the session with PROTOCOL_VIOLATION (§10.12).
+- `FetchObject.datagram`: the d16+ Datagram flag (0x40) is encoded and decoded.
+- `session.joining_fetch(subscription_request_id, ...)` sends a joining FETCH for an
+  existing subscription.
+- `pub_bench`: `--prefill GROUPS` and `--no-objects`.
 - Fix: a d18 control GOAWAY whose Request ID has the wrong parity closes the session with
   INVALID_REQUEST_ID (§10.4).
 - Fix: a `moqt://` or `https://` URL with an empty host is refused instead of dialling
