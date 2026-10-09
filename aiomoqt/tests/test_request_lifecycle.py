@@ -40,6 +40,7 @@ def _session(is_client=True):
     s._fetch_done_futures = {}
     s._next_request_id = 0 if is_client else 1
     s._sent_requests = deque(maxlen=1024)
+    s._track_status_requests = set()
     s._pending_requests = {}
     s._next_track_alias = 0
     s._track_aliases = {}

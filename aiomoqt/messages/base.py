@@ -149,6 +149,48 @@ class MOQTMessage:
             raise MOQTProtocolViolation(
                 f"{name} {value} outside {lo}..{hi}")
 
+    # Track Properties with a restricted value (§12.5, §12.6).
+    TRACK_PROPERTY_RANGES = {
+        0x22: ("default publisher group order", 1, 2),
+        0x30: ("dynamic groups", 0, 1),
+    }
+    IMMUTABLE_PROPERTIES = 0x0B   # §12.7
+
+    @staticmethod
+    def _check_track_properties(props: Optional[Dict[int, Any]], *,
+                                prof: 'DraftProfile') -> None:
+        """d18 Track Properties (§12.5-12.7): the restricted values, also
+        inside Immutable Properties, whose Key-Value-Pairs must parse and
+        hold no Immutable Properties of their own. Unknown types pass."""
+        if not props:
+            return
+        MOQTMessage._check_property_ranges(props)
+        inner = props.get(MOQTMessage.IMMUTABLE_PROPERTIES)
+        if inner is None:
+            return
+        if not isinstance(inner, (bytes, bytearray, memoryview)):
+            raise MOQTProtocolViolation("Immutable Properties is not a byte value")
+        raw = bytes(inner)
+        try:
+            nested = MOQTMessage._extensions_decode(
+                Buffer(data=raw, vi64=prof.vi64), with_length=False,
+                buf_end=len(raw), delta=True) or {}
+        except (BufferReadError, MOQTUnderflow, RuntimeError,
+                ValueError) as e:
+            raise MOQTProtocolViolation(
+                f"Immutable Properties do not parse: {e}") from None
+        if MOQTMessage.IMMUTABLE_PROPERTIES in nested:
+            raise MOQTProtocolViolation(
+                "Immutable Properties inside Immutable Properties")
+        MOQTMessage._check_property_ranges(nested)
+
+    @staticmethod
+    def _check_property_ranges(props: Dict[int, Any]) -> None:
+        for ptype, (name, lo, hi) in MOQTMessage.TRACK_PROPERTY_RANGES.items():
+            value = props.get(ptype)
+            if value is not None:
+                MOQTMessage._check_range(name, value, lo, hi)
+
     @staticmethod
     def _pull_reason(buf: Buffer) -> str:
         """Reason Phrase: length-prefixed UTF-8; over the maximum is a

@@ -24,9 +24,12 @@ class RequestOk(MOQTMessage):
     """REQUEST_OK (0x07) — draft-16 universal OK response.
 
     Wire format: Request ID (i), Num Parameters (i), Parameters (..) ...
+    d18 drops the Request ID and ends with Track Properties, which only a
+    TRACK_STATUS reply may carry (§10.5).
     """
     request_id: int = 0
     parameters: Optional[Dict[int, Any]] = None
+    track_properties: Optional[Dict[int, Any]] = None
 
     def __post_init__(self):
         self.type = D16MessageType.REQUEST_OK
@@ -39,6 +42,9 @@ class RequestOk(MOQTMessage):
         if prof.reply_has_request_id:
             payload.push_vint(self.request_id)
         MOQTMessage._serialize_params(payload, self.parameters or {}, prof=prof)
+        if prof.draft >= 18 and self.track_properties:
+            MOQTMessage._extensions_encode(payload, self.track_properties,
+                                           with_length=False, delta=True)
 
         buf.push_uint_var(self.type)
         buf.push_uint16(payload.tell())
@@ -50,7 +56,13 @@ class RequestOk(MOQTMessage):
         request_id = (buf.pull_vint()
                       if prof.reply_has_request_id else None)
         params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
-        return cls(request_id=request_id, parameters=params)
+        props = None
+        if prof.draft >= 18 and buf_end is not None and buf.tell() < buf_end:
+            props = MOQTMessage._extensions_decode(
+                buf, with_length=False, buf_end=buf_end, delta=True)
+            MOQTMessage._check_track_properties(props, prof=prof)
+        return cls(request_id=request_id, parameters=params,
+                   track_properties=props)
 
 
 @dataclass(slots=True)

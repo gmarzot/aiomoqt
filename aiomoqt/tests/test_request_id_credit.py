@@ -23,6 +23,7 @@ def _stub(draft):
     s.is_client = True
     s._next_request_id = 0
     s._sent_requests = deque(maxlen=64)
+    s._track_status_requests = set()
     s._pending_requests = {}
     s._peer_request_max = -1
     s._peer_request_seen = set()

@@ -29,6 +29,7 @@ def _control_session(draft):
     s._peer_requests = {}
     s._next_request_id = 0
     s._sent_requests = deque(maxlen=1024)
+    s._track_status_requests = set()
     s._pending_requests = {}
     s._next_track_alias = 0
     s._track_aliases = {}
@@ -160,10 +161,16 @@ async def test_a_body_past_its_length_closes_the_session(draft):
 @pytest.mark.parametrize("draft", [14, 16, 18])
 async def test_a_body_short_of_its_length_closes_the_session(draft):
     # Declare one byte more than the body holds and supply it: the
-    # decoder stops short of the Length.
+    # decoder stops short of the Length. REQUEST_ERROR ends at its Reason
+    # Phrase; a d18 REQUEST_OK would read the byte as Track Properties.
     s = _control_session(draft)
     parsed = _spy_parses(s)
-    wire = bytearray(_ok_wire(s))
+    if draft == 14:
+        wire = bytearray(_ok_wire(s))
+    else:
+        wire = bytearray(RequestError(
+            request_id=7, error_code=0x10, retry_interval=0,
+            reason="gone").serialize(prof=s._profile).data)
     declared = int.from_bytes(wire[1:3], "big")
     wire[1:3] = (declared + 1).to_bytes(2, "big")
     _feed_reply(s, bytes(wire) + b"\x00")

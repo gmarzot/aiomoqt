@@ -43,6 +43,7 @@ def _session(draft, is_client=True):
     s.is_client = is_client
     s._next_request_id = 0 if is_client else 1
     s._sent_requests = deque(maxlen=64)
+    s._track_status_requests = set()
     s._pending_requests = {}
     s._next_track_alias = 0
     s._track_aliases = {}

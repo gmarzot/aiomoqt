@@ -31,6 +31,11 @@
 - Fix: a FETCH cancelled while its objects are being sent resets its data stream (§5.2).
 - Fix: TRACK_STATUS at d16+ carries no delivery parameters (priority, group order, forward,
   filter), which §10.14 leaves out; one received from a peer still decodes.
+- Fix: a d18 REQUEST_OK's Track Properties are read: a TRACK_STATUS_OK carrying them closed
+  the session, and on any other reply they now close it with PROTOCOL_VIOLATION (§10.5).
+- Fix: d18 Track Properties are checked in SUBSCRIBE_OK, PUBLISH, FETCH_OK and TRACK_STATUS_OK:
+  DEFAULT_PUBLISHER_GROUP_ORDER 1-2 and DYNAMIC_GROUPS 0-1, also inside Immutable Properties,
+  which must parse (§12.5-12.7).
 - Fix: `pub_media --ts` stamps never run ahead of arrival; the PTS anchor follows the
   least-delayed unit, so a late first unit or a fast source clock no longer reads as negative
   latency.

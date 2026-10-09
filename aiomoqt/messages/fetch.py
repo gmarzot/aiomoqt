@@ -238,6 +238,9 @@ class FetchOk(MOQTMessage):
             group_order = params.pop(ParamType.GROUP_ORDER, None)
             track_extensions = MOQTMessage._extensions_decode(
                 buf, with_length=False, buf_end=buf_end, delta=True)
+            if prof.draft >= 18:
+                MOQTMessage._check_track_properties(track_extensions,
+                                                    prof=prof)
         else:
             group_order = buf.pull_uint8()
             end_of_track = buf.pull_uint8()

@@ -392,6 +392,9 @@ class _MOQTSessionMixin:
         # (wait_response=False), or a late / duplicate reply — logged at
         # DEBUG. A response for an id we never issued stays WARNING.
         self._sent_requests: deque = deque(maxlen=1024)
+        # Our TRACK_STATUS request ids awaiting a reply: the only REQUEST_OK
+        # that may carry Track Properties (§10.5).
+        self._track_status_requests: set = set()
 
         # Reverse maps for binding lookups. The forward direction is
         # _streams[sid].key = ('fetch', request_id) or
@@ -3276,6 +3279,7 @@ class _MOQTSessionMixin:
         priority, group_order, forward and filter_type are d14 fields;
         d16+ sends none of them."""
         request_id = self._allocate_request_id()
+        self._track_status_requests.add(request_id)
         message = TrackStatus(
             request_id=request_id,
             track_namespace=self._make_namespace_tuple(namespace),
@@ -4553,10 +4557,19 @@ class _MOQTSessionMixin:
 
     async def _handle_request_ok(self, msg: RequestOk) -> None:
         logger.info(f"MOQT event: handle {msg}")
+        status = msg.request_id in self._track_status_requests
+        self._track_status_requests.discard(msg.request_id)
+        if msg.track_properties and not status:
+            # §10.5: Track Properties belong to TRACK_STATUS_OK only.
+            self._close_session(
+                SessionCloseCode.PROTOCOL_VIOLATION,
+                "Track Properties in a REQUEST_OK that is not TRACK_STATUS_OK")
+            return
         self._resolve_request(msg.request_id, msg)
 
     async def _handle_request_error(self, msg: RequestError) -> None:
         logger.info(f"MOQT event: handle {msg}")
+        self._track_status_requests.discard(msg.request_id)
         self._resolve_request(msg.request_id, msg)
 
     async def _handle_namespace(self, msg) -> None:
