@@ -23,9 +23,11 @@ their timestamps (--no-pace to blast).
   ffmpeg -i srt://0.0.0.0:9000?mode=listener -c:v copy -bsf:v h264_mp4toannexb \\
     -f h264 - | %(prog)s https://relay.example/moq-relay -N obs --h264 -
 
-  # live MPEG-TS ingest: H.264 + AAC on one pipe, stamped from the PES PTS
+  # live MPEG-TS ingest: H.264 + AAC on one pipe, stamped from the PES PTS;
+  # the muxer flags stop ffmpeg batching ~300 ms of audio into one PES
   ffmpeg -fflags nobuffer -i srt://0.0.0.0:9000?mode=listener -map 0:v -map 0:a \\
-    -c copy -f mpegts -flush_packets 1 - | %(prog)s https://relay.example/moq-relay -N obs --ts -
+    -c copy -f mpegts -pes_payload_size 0 -omit_video_pes_length 0 -muxdelay 0 \\
+    -flush_packets 1 - | %(prog)s https://relay.example/moq-relay -N obs --ts -
 
 Each run prints a ready-to-paste player URL per relay (see
 --player-base). Relays on different drafts need a --draft all of

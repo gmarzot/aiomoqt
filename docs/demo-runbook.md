@@ -357,6 +357,11 @@ start; Eyevinn's moqlivemock endpoint is always on.
   known state); on LOC → check `cushion=` and the Options line.
 - Audio drops out, "audio late / snap" late count rising → cushion below
   the source's A/V skew; raise `--target-latency`.
+- `--ts` audio underruns with the page log full of `arrival gap
+  250–400ms before group N/0` → the ffmpeg muxer flags are missing
+  (Demo C). Without `-pes_payload_size 0` ffmpeg packs ~15 AAC frames
+  per PES, so audio lands in ~300 ms bursts, longer than a 200 ms
+  cushion.
 
 Pinned: moq-playa-v059 2cf770f (branch gmarzot-playa-dev, merged with
 upstream openmoq/moq-playa main 872f415) ·
