@@ -2260,7 +2260,7 @@ class _MOQTSessionMixin:
                 fut.set_exception(MOQTRequestError(
                     error_code=int(RequestErrorCode.INTERNAL_ERROR),
                     reason=f"session closed: {reason}", retry_interval=0))
-                fut.exception()  # retrieved, even if nothing awaits it
+                fut.exception()  # marks it retrieved if nothing awaits it
         for fut in self._fetch_done_futures.values():
             if not fut.done():
                 fut.set_result(False)
@@ -2318,12 +2318,9 @@ class _MOQTSessionMixin:
             error_code, reason_phrase = self._close_err
         logger.info(f"MOQT session: closing: {reason_phrase} ({error_code})")
 
-        # Gracefully FIN our open data streams before closing the
-        # connection, separately so they are not batched with
-        # CONNECTION_CLOSE (which resets them at the peer). Only streams we
-        # own the write side of: end_stream on a peer-initiated uni stream
-        # produces RESET_STREAM. The control stream is never closed while
-        # the session lives (§3.3), and an error close skips the FINs.
+        # A graceful close FINs the data streams we write (end_stream on a
+        # peer-initiated stream is a RESET_STREAM), never the control stream
+        # (§3.3). An error close sends no FINs.
         is_client = self._is_client
         graceful = int(error_code) == SessionCloseCode.NO_ERROR
         try:
@@ -2352,11 +2349,9 @@ class _MOQTSessionMixin:
         # set the async exit condition for session
         if not self._moqt_session_closed.done():
             self._moqt_session_closed.set_result((error_code, reason_phrase))
-        # The MoQT error code is the CONNECTION_CLOSE application error
-        # (raw QUIC) or the WebTransport session close code. A graceful
-        # close goes out a loop tick later so the FINs queued above get a
-        # transmit pass first (batched with CONNECTION_CLOSE the peer sees
-        # them as RESET_STREAM); an error close has none and goes now.
+        # The MoQT code rides CONNECTION_CLOSE (raw QUIC) or the WebTransport
+        # session close. A graceful close waits a tick so its FINs leave
+        # first (batched, the peer resets them); an error close goes at once.
         if self._is_wt:
             reason = (reason_phrase if isinstance(reason_phrase, bytes)
                       else str(reason_phrase).encode())
@@ -2858,8 +2853,8 @@ class _MOQTSessionMixin:
         if rid is None or not is_draft16_or_later(self.negotiated_draft):
             return None
         rid = int(rid)
-        # d18 assigns UNKNOWN_AUTH_TOKEN_ALIAS (0x17) only as a session
-        # code, yet asks for the request to be rejected with it.
+        # d18 defines UNKNOWN_AUTH_TOKEN_ALIAS (0x17) only as a session code
+        # but asks for the request to be rejected with it; we send 0x17.
         err = RequestError(
             request_id=rid,
             error_code=int(SessionCloseCode.UNKNOWN_AUTH_TOKEN_ALIAS),
