@@ -139,7 +139,8 @@ class Fetch(MOQTMessage):
             raise MOQTProtocolViolation(
                 f"FETCH type {fetch_type} is not 0x1, 0x2 or 0x3")
 
-        params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
+        params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
 
         if is_draft16_or_later(prof.draft):
             subscriber_priority = params.pop(
@@ -233,7 +234,8 @@ class FetchOk(MOQTMessage):
             end_of_track = buf.pull_uint8()
             largest_group_id = buf.pull_vint()
             largest_object_id = buf.pull_vint()
-            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
+            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
             # Omitted: the order the FETCH asked for applies.
             group_order = params.pop(ParamType.GROUP_ORDER, None)
             track_extensions = MOQTMessage._extensions_decode(
@@ -246,7 +248,8 @@ class FetchOk(MOQTMessage):
             end_of_track = buf.pull_uint8()
             largest_group_id = buf.pull_vint()
             largest_object_id = buf.pull_vint()
-            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
+            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
 
         return cls(
             request_id=request_id,

@@ -746,3 +746,38 @@ def test_track_status_carries_no_delivery_parameters(draft):
     raw = bytes(msg.serialize(prof=profile_for(draft)).data)
     # Type 0x0D, Length 7, Request ID, namespace "n", name "t", no params.
     assert raw == bytes.fromhex("0d0007" "01" "01016e" "0174" "00")
+
+
+def _params_body(params) -> bytes:
+    buf = Buffer(capacity=64, vi64=True)
+    MOQTMessage._serialize_params(buf, params, prof=profile_for(18))
+    return bytes(buf.data_slice(0, buf.tell()))
+
+
+@pytest.mark.parametrize("scope, params", [
+    ("Subscribe", {0x08: 5}),              # EXPIRES
+    ("TrackStatus", {0x20: 7}),            # SUBSCRIBER_PRIORITY
+    ("Fetch", {0x10: 1}),                  # FORWARD
+    ("SubscribeNamespace", {0x10: 1}),
+    ("RequestUpdate", {0x09: (1, 2)}),     # LARGEST_OBJECT
+], ids=["subscribe-expires", "track-status-priority", "fetch-forward",
+        "subscribe-namespace-forward", "update-largest"])
+def test_d18_a_parameter_outside_its_requests_is_refused(scope, params):
+    # §10.2.1: a Message Parameter on a message it is not defined for.
+    body = _params_body(params)
+    with pytest.raises(MOQTProtocolViolation, match="not allowed"):
+        MOQTMessage._deserialize_params(
+            Buffer(data=body, vi64=True), prof=profile_for(18),
+            buf_end=len(body), scope=scope)
+
+
+def test_d18_parameters_in_scope_pass_and_d16_is_not_checked():
+    body = _params_body({0x03: b"t", 0x10: 1, 0x20: 7, 0x21: b"\x02"})
+    MOQTMessage._deserialize_params(Buffer(data=body, vi64=True),
+                                    prof=profile_for(18), buf_end=len(body),
+                                    scope="Subscribe")
+    d16 = Buffer(capacity=64)
+    MOQTMessage._serialize_params(d16, {0x08: 5}, prof=profile_for(16))
+    raw = bytes(d16.data_slice(0, d16.tell()))
+    MOQTMessage._deserialize_params(Buffer(data=raw), prof=profile_for(16),
+                                    buf_end=len(raw), scope="Subscribe")

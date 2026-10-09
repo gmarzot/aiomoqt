@@ -85,7 +85,8 @@ class TrackStatus(MOQTMessage):
         end_group = None
 
         if is_draft16_or_later(prof.draft):
-            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
+            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
             priority = params.pop(ParamType.SUBSCRIBER_PRIORITY, None)
             group_order = params.pop(ParamType.GROUP_ORDER, None)
             forward = params.pop(ParamType.FORWARD, None)
@@ -108,7 +109,8 @@ class TrackStatus(MOQTMessage):
                 start_object = buf.pull_vint()
             if filter_type == 4:
                 end_group = buf.pull_vint()
-            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
+            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
 
         return cls(
             request_id=request_id,
@@ -175,7 +177,8 @@ class TrackStatusOk(MOQTMessage):
             largest_group_id = buf.pull_vint()
             largest_object_id = buf.pull_vint()
 
-        params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
+        params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
 
         return cls(
             request_id=request_id,
@@ -346,7 +349,8 @@ class Subscribe(MOQTMessage):
 
         if is_draft16_or_later(prof.draft):
             # d16: all fields are in parameters
-            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
+            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
             priority = params.pop(ParamType.SUBSCRIBER_PRIORITY, None)
             group_order = params.pop(ParamType.GROUP_ORDER, None)
             forward = params.pop(ParamType.FORWARD, None)
@@ -371,7 +375,8 @@ class Subscribe(MOQTMessage):
             if filter_type == 4:
                 end_group = buf.pull_vint()
 
-            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
+            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
 
         return cls(
             request_id=request_id,
@@ -478,7 +483,8 @@ class SubscribeOk(MOQTMessage):
         track_extensions = None
 
         if is_draft16_or_later(prof.draft):
-            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
+            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
             expires = params.pop(ParamType.EXPIRES, None)
             largest = params.pop(ParamType.LARGEST_OBJECT, None)
             if largest is not None:
@@ -515,7 +521,8 @@ class SubscribeOk(MOQTMessage):
             if content_exists == ContentExistsCode.EXISTS:
                 largest_group_id = buf.pull_vint()
                 largest_object_id = buf.pull_vint()
-            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
+            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
 
         return cls(
             request_id=request_id,
@@ -613,7 +620,8 @@ class SubscribeUpdate(MOQTMessage):
         priority = buf.pull_uint8()
         forward = buf.pull_uint8()
         MOQTMessage._check_range("forward", forward, 0, 1)
-        params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
+        params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
 
         return cls(
             request_id=request_id,

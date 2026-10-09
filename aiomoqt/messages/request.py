@@ -55,7 +55,8 @@ class RequestOk(MOQTMessage):
     def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'RequestOk':
         request_id = (buf.pull_vint()
                       if prof.reply_has_request_id else None)
-        params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
+        params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
         props = None
         if prof.draft >= 18 and buf_end is not None and buf.tell() < buf_end:
             props = MOQTMessage._extensions_decode(
@@ -187,7 +188,8 @@ class RequestUpdate(MOQTMessage):
     def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'RequestUpdate':
         request_id = buf.pull_vint()
         existing_request_id = (buf.pull_vint() if prof.draft < 18 else None)
-        params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
+        params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
 
         return cls(
             request_id=request_id,

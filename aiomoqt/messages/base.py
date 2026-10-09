@@ -5,7 +5,8 @@ from dataclasses import dataclass, field, fields
 from . import ParamType, SetupParamType, AuthTokenAliasType, AuthTokenType
 from ..context import DraftProfile
 from ..types import (
-    D18_PARAM_KINDS, MOQTException, MOQTProtocolViolation, SessionCloseCode,
+    D18_PARAM_KINDS, D18_PARAM_SCOPE, MOQTException, MOQTProtocolViolation,
+    SessionCloseCode,
 )
 from ..utils.buffer import Buffer, BufferReadError
 from ..utils.logger import *
@@ -827,7 +828,8 @@ class MOQTMessage:
     @staticmethod
     def _deserialize_params(buf: Buffer, *, prof: DraftProfile,
                             buf_end: Optional[int] = None,
-                            delta_keys: bool = None) -> Dict[int, Any]:
+                            delta_keys: bool = None,
+                            scope: Optional[str] = None) -> Dict[int, Any]:
         """
         Deserialize parameters using Key-Value-Pair structure.
 
@@ -944,6 +946,14 @@ class MOQTMessage:
                     f"parameter 0x{param_type:x}", param_value, *bounds)
             params[param_type] = param_value
 
+        allowed = D18_PARAM_SCOPE.get(scope) if prof.draft >= 18 else None
+        if allowed is not None:
+            for param_type in params:
+                if param_type not in allowed:
+                    # §10.2.1: a parameter outside its message types MUST
+                    # close the connection.
+                    raise MOQTProtocolViolation(
+                        f"parameter 0x{param_type:x} not allowed in {scope}")
         return params
 
     @staticmethod

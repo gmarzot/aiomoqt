@@ -109,7 +109,8 @@ class Publish(MOQTMessage):
         track_extensions = None
 
         if is_draft16_or_later(prof.draft):
-            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
+            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
             forward = params.pop(ParamType.FORWARD, None)
             largest = params.pop(ParamType.LARGEST_OBJECT, None)
             if largest is not None:
@@ -143,7 +144,8 @@ class Publish(MOQTMessage):
                 largest_group_id = buf.pull_vint()
                 largest_object_id = buf.pull_vint()
             forward = buf.pull_uint8()
-            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
+            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
 
         return cls(
             request_id=request_id,
@@ -260,7 +262,8 @@ class PublishOk(MOQTMessage):
         end_group = None
 
         if is_draft16_or_later(prof.draft):
-            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
+            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
             forward = params.pop(ParamType.FORWARD, None)
             priority = params.pop(ParamType.SUBSCRIBER_PRIORITY, None)
             group_order = params.pop(ParamType.GROUP_ORDER, None)
@@ -295,7 +298,8 @@ class PublishOk(MOQTMessage):
                 start_object = buf.pull_vint()
             if filter_type == 4:
                 end_group = buf.pull_vint()
-            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
+            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
 
         return cls(
             request_id=request_id,
