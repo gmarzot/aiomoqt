@@ -34,6 +34,7 @@ _POLL = 0.1                 # seconds between live availability checks
 _REFRESH_MIN = 1.0          # seconds between MPD reloads
 _LIVE_RETRIES = 3           # attempts for a live segment not there yet
 _SLACK = Fraction(1, 10)    # seconds a key frame may precede its segment
+_STALL_SEGMENTS = 4         # segment durations a live feed waits for the next
 
 
 class DashError(ValueError):
@@ -370,11 +371,11 @@ class Presentation:
 
     def __init__(self, url: str, fetch: Callable[..., bytes],
                  clock: Callable[[], float] = time.time,
-                 sleep: Callable[[float], None] = time.sleep):
+                 sleep: Optional[Callable[[float], None]] = None):
         self.url = url
         self._fetch = fetch
         self._clock = clock
-        self.sleep = sleep
+        self._sleep = sleep
         self._offset = 0.0
         self.mpd = parse_mpd(fetch(url, None), url, now=clock())
         self._loaded = clock()
@@ -383,6 +384,14 @@ class Presentation:
 
     def fetch(self, url: str, byte_range: Optional[str] = None) -> bytes:
         return self._fetch(url, byte_range)
+
+    def wait(self, stop, seconds: float) -> None:
+        """Pause up to `seconds`, cut short when `stop` is set; an injected
+        `sleep` replaces both."""
+        if self._sleep is not None:
+            self._sleep(seconds)
+        else:
+            stop.wait(seconds)
 
     def now(self) -> float:
         return self._clock() + self._offset
@@ -530,10 +539,14 @@ class SegmentFeed:
                     logger.warning("DASH: skipping segment %d (%s): %s",
                                    seg.number, seg.url, e)
                     return None
-                self._pres.sleep(0.5 * attempt)
+                self._pres.wait(self._stop, 0.5 * attempt)
         return None
 
     def _next_segment(self) -> Optional[Segment]:
+        """The next segment, waiting for a live one; None at the end of a
+        static presentation, on stop, or when a live one has not appeared
+        within _stall_limit()."""
+        deadline = None
         while not self._stop.is_set():
             rep = self._pres.representation(self._rep_id)
             if rep is None:
@@ -551,10 +564,23 @@ class SegmentFeed:
                 return self._advance(rep, seg)
             if not dynamic:
                 return None
+            limit = self._stall_limit(rep)
+            now = self._pres.now()
+            deadline = now + limit if deadline is None else deadline
+            if now > deadline:
+                logger.warning("DASH: no new segment of %s in %.0f s; ending",
+                               self._rep_id, limit)
+                return None
             if rep.timeline is not None:
                 self._pres.refresh()
-            self._pres.sleep(_POLL)
+            self._pres.wait(self._stop, _POLL)
         return None
+
+    def _stall_limit(self, rep: Representation) -> float:
+        """Seconds a live feed waits for its next segment before ending."""
+        seg = float(rep.nominal_duration() or 2)
+        mup = float(self._pres.mpd.minimum_update_period or 0)
+        return max(_STALL_SEGMENTS * seg, mup)
 
     def _pick(self, rep: Representation, segs: List[Segment]) -> Optional[Segment]:
         """The first segment, ending after the start time; then the first

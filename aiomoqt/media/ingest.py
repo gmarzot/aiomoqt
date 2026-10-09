@@ -448,13 +448,16 @@ class Ingest:
 
     def __init__(self, url: str, rendition: str = 'best', audio: bool = True,
                  timeout: Optional[Tuple[float, float]] = (15.0, 30.0),
-                 ssl_context: Optional[ssl.SSLContext] = None):
+                 ssl_context: Optional[ssl.SSLContext] = None,
+                 stop: Optional[threading.Event] = None):
+        """`stop`, when set, abandons opening (between packets; DASH
+        segment waits at once) and later stops demuxing."""
         if rendition not in RENDITIONS:
             raise ValueError(f"rendition must be one of {RENDITIONS}")
         self._av = load_av()
         self.url = url
         self.tracks: List[IngestTrack] = []
-        self._stop = threading.Event()
+        self._stop = stop or threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._shift = Fraction(0)
         self._containers: list = []
@@ -528,6 +531,8 @@ class Ingest:
         raw: List[_RawChunk] = []
         first = None
         for track, packet in self._demux:
+            if self._stop.is_set():
+                raise IngestError(f"opening {self.url} stopped")
             t = packet.dts * Fraction(packet.time_base) + track.offset
             first = t if first is None else first
             raw += track.push(packet)

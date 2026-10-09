@@ -43,6 +43,7 @@ import contextlib
 import functools
 import logging
 import sys
+import threading
 import time
 import uuid
 from typing import Optional
@@ -292,11 +293,16 @@ def _build_ingest_catalog(args, ingest: Ingest) -> Catalog:
 
 
 async def _open_ingest(args) -> Ingest:
-    """Open --input and read until every track has its CMAF header."""
+    """Open --input and read until every track has its CMAF header. A
+    cancelled open (Ctrl-C) stops the executor thread too."""
+    stop = threading.Event()
     open_ = functools.partial(Ingest, args.input, rendition=args.rendition,
-                              audio=not args.no_audio)
+                              audio=not args.no_audio, stop=stop)
     try:
         ingest = await asyncio.get_running_loop().run_in_executor(None, open_)
+    except asyncio.CancelledError:
+        stop.set()
+        raise
     except ImportError as e:
         raise SystemExit(f"  error: {e}")
     except Exception as e:

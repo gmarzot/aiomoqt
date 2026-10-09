@@ -2,6 +2,7 @@
 and the segment feed's live timing, against in-test MPDs with a fake
 fetch and clock (no network, no PyAV)."""
 import threading
+import time
 from fractions import Fraction
 
 import pytest
@@ -223,6 +224,43 @@ def test_live_timeline_refresh_keeps_numbers_monotonic():
         feed.read(1)
     assert fetched == ['init.mp4', '102000.m4s', '104000.m4s', '106000.m4s']
     assert [n for *_, n in feed._history] == [2, 3, 4]
+
+
+def test_live_feed_ends_when_the_mpd_stops_advancing():
+    # Four segment durations (8 s) with no new segment end the feed.
+    clock = _Clock(106.0)
+    xml = _timeline_mpd(1, [100000, 102000, 104000])
+    fetched = []
+
+    def fetch(url, rng=None):
+        if url.endswith('.mpd'):
+            return xml
+        fetched.append(url.rsplit('/', 1)[-1])
+        return b'x'
+
+    pres = Presentation('http://live/m.mpd', fetch, clock=clock, sleep=clock.sleep)
+    feed = _feed(pres, 'v', threading.Event(), start=Fraction(102))
+    while feed.read(1):
+        pass
+    assert fetched == ['init.mp4', '102000.m4s', '104000.m4s']
+    assert 8.0 <= clock.t - 106.0 <= 8.5
+
+
+def test_stop_interrupts_a_live_wait():
+    xml = _timeline_mpd(1, [100000])
+    pres = Presentation('http://live/m.mpd',
+                        lambda url, rng=None: xml if url.endswith('.mpd') else b'x')
+    stop = threading.Event()
+    feed = _feed(pres, 'v', stop, start=Fraction(10 ** 9))  # beyond the timeline
+    assert feed.read(1) == b'x'  # init
+    out = []
+    reader = threading.Thread(target=lambda: out.append(feed.read(1)))
+    t0 = time.monotonic()
+    reader.start()
+    time.sleep(0.2)
+    stop.set()
+    reader.join(2)
+    assert out == [b''] and time.monotonic() - t0 < 1.0
 
 
 def test_static_feed_takes_each_segment_once():

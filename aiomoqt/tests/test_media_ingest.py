@@ -65,6 +65,27 @@ async def test_input_without_pyav_exits_with_the_install_hint(monkeypatch):
     assert INSTALL_HINT in str(e.value)
 
 
+async def test_cancelled_open_stops_the_ingest_thread(monkeypatch):
+    seen = {}
+
+    def ingest(url, rendition, audio, stop):
+        seen['stop'] = stop
+        stop.wait(5)
+        raise RuntimeError('stopped')
+
+    args = _parse(monkeypatch, '--input', 'http://127.0.0.1:9/x.m3u8')
+    monkeypatch.setattr(pub_media, 'Ingest', ingest)
+    task = asyncio.ensure_future(pub_media._open_ingest(args))
+    for _ in range(100):
+        if 'stop' in seen:
+            break
+        await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert seen['stop'].is_set()
+
+
 # -- fixtures -----------------------------------------------------------
 
 def _write_ladder(root: str, segment_type: str, single_file=False) -> None:
