@@ -331,7 +331,7 @@ class PublishedTrack(Track):
                  object_size: int = 1024, group_size: int = 60,
                  num_subgroups: int = 1, rate: float = 0,
                  priority: int = 128,
-                 auth_token: bytes = b"bench-token",
+                 auth_token: Optional[bytes] = b"bench-token",
                  forwarding: ForwardingPreference =
                      ForwardingPreference.SUBGROUP,
                  fetch_history_bytes: int = FETCH_HISTORY_DEFAULT):
@@ -657,7 +657,8 @@ class PublishedTrack(Track):
         if announce_namespace:
             await sess.publish_namespace(
                 namespace=self.namespace,
-                parameters={ParamType.AUTH_TOKEN: self.auth_token},
+                parameters=({ParamType.AUTH_TOKEN: self.auth_token}
+                            if self.auth_token else {}),
                 wait_response=True,
             )
             sub.state = TrackState.ANNOUNCED

@@ -84,6 +84,13 @@ The URL scheme selects the transport:
                         help='Refuse a request carrying this token (Token '
                              'Type, hex Value) with REQUEST_ERROR CODE; '
                              'repeatable')
+    parser.add_argument('--auth-token', type=str, default='bench-token',
+                        help='AUTH_TOKEN sent on PUBLISH_NAMESPACE; empty '
+                             'sends none (default %(default)s)')
+    parser.add_argument('--goaway-after', type=float, default=None,
+                        metavar='SECONDS',
+                        help='Send GOAWAY this long after publishing; '
+                             'later requests are refused GOING_AWAY')
     content = parser.add_mutually_exclusive_group()
     content.add_argument('--prefill', type=int, default=0, metavar='GROUPS',
                          help='Hold GROUPS groups as already published, '
@@ -186,6 +193,7 @@ async def run(args):
                     trackname=args.trackname,
                     resolution=args.video,
                     fps=args.rate or 30,
+                    auth_token=args.auth_token.encode() or None,
                 )
             else:
                 track_class = _EmptyTrack if args.no_objects else PublishedTrack
@@ -200,6 +208,7 @@ async def run(args):
                     forwarding=(ForwardingPreference.DATAGRAM
                                 if args.datagram
                                 else ForwardingPreference.SUBGROUP),
+                    auth_token=args.auth_token.encode() or None,
                 )
             if args.prefill:
                 track.prefill(args.prefill)
@@ -209,6 +218,9 @@ async def run(args):
                 forward=args.forward,
             )
             print(f"  Published '{track.fqtn}', waiting for subscriber...")
+            if args.goaway_after is not None:
+                asyncio.get_running_loop().call_later(args.goaway_after,
+                                                      session.goaway)
 
             if not await wait_cond_timeout(
                     track.wait_closed(), timeout=args.duration):
