@@ -72,7 +72,8 @@ case "$scenario_id" in
     initiate-track-publication|\
     publish-track-namespace-fields|\
     receive-reason-phrase-length-over-1024|\
-    receive-publish-request-ok-with-track-properties)
+    receive-publish-request-ok-with-track-properties|\
+    receive-subscribe-before-outstanding-publish-response)
         flow=() ;;
 esac
 
