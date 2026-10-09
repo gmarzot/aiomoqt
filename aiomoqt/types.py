@@ -434,7 +434,7 @@ D18_PARAM_KINDS: Dict[int, str] = {
     0x21: "bytes",     # SUBSCRIPTION_FILTER
     0x22: "uint8",     # GROUP_ORDER
     0x32: "varint",    # NEW_GROUP_REQUEST
-    0x34: "tuple",     # TRACK_NAMESPACE_PREFIX (Track Namespace)
+    0x34: "tuple",     # TRACK_NAMESPACE_PREFIX: length-prefixed Track Namespace
 }
 
 

@@ -705,15 +705,36 @@ def test_d18_redirect_full_track_name_is_at_most_4096_bytes():
                                  buf_end=len(body))
 
 
-def test_d18_namespace_parameter_field_past_the_frame_is_refused():
-    # One TRACK_NAMESPACE_PREFIX (0x34) parameter whose field claims
-    # 5 bytes where the frame holds 2.
+def test_d18_namespace_parameter_field_past_its_value_is_refused():
+    # One TRACK_NAMESPACE_PREFIX (0x34) parameter, length 4, whose field
+    # claims 5 bytes where the value holds 2.
     prof = profile_for(18)
-    block = b"\x01" + ref_vi64(0x34) + b"\x01\x05ab"
+    block = b"\x01" + ref_vi64(0x34) + b"\x04\x01\x05ab"
     with pytest.raises(MOQTProtocolViolation, match="overruns frame"):
         MOQTMessage._deserialize_params(
             Buffer(data=block + b"xyz", vi64=True), prof=prof,
             buf_end=len(block))
+
+
+def test_d18_namespace_parameter_is_length_prefixed():
+    # §10.2.14 / §10.2: the Track Namespace rides a length prefix (moxygen
+    # and mondain's runner agree): length 6, 2 fields "a" and "bc".
+    prof = profile_for(18)
+    block = b"\x01" + ref_vi64(0x34) + b"\x06\x02\x01a\x02bc"
+    buf = Buffer(capacity=64, vi64=True)
+    MOQTMessage._serialize_params(buf, {0x34: (b"a", b"bc")}, prof=prof)
+    assert bytes(buf.data_slice(0, buf.tell())) == block
+    got = MOQTMessage._deserialize_params(
+        Buffer(data=block, vi64=True), prof=prof, buf_end=len(block))
+    assert got == {0x34: (b"a", b"bc")}
+
+
+def test_d18_namespace_parameter_short_of_its_length_is_refused():
+    prof = profile_for(18)
+    block = b"\x01" + ref_vi64(0x34) + b"\x07\x02\x01a\x02bcz"
+    with pytest.raises(MOQTProtocolViolation, match="fill its length"):
+        MOQTMessage._deserialize_params(
+            Buffer(data=block, vi64=True), prof=prof, buf_end=len(block))
 
 
 @pytest.mark.parametrize("draft", [16, 18])

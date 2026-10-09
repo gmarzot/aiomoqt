@@ -662,11 +662,16 @@ class MOQTMessage:
                 elif kind == "varint":
                     payload.push_vint(int(param_value))
                 elif kind == "tuple":
-                    payload.push_vint(len(param_value))
+                    # A Track Namespace, length-prefixed like any value
+                    # that is not uint8, varint or Location.
+                    tbuf = Buffer(capacity=BUF_SIZE, vi64=prof.vi64)
+                    tbuf.push_vint(len(param_value))
                     for fld in param_value:
                         fld = fld.encode() if isinstance(fld, str) else fld
-                        payload.push_vint(len(fld))
-                        payload.push_bytes(bytes(fld))
+                        tbuf.push_vint(len(fld))
+                        tbuf.push_bytes(bytes(fld))
+                    payload.push_vint(tbuf.tell())
+                    payload.push_bytes(tbuf.data_slice(0, tbuf.tell()))
                 else:  # length-prefixed bytes
                     if param_type in (ParamType.AUTH_TOKEN,
                                       SetupParamType.AUTH_TOKEN):
@@ -875,8 +880,17 @@ class MOQTMessage:
                 elif kind == "varint":
                     param_value = buf.pull_vint()
                 elif kind == "tuple":
+                    param_len = buf.pull_vint()
+                    value_end = buf.tell() + param_len
+                    if buf_end is not None and value_end > buf_end:
+                        raise MOQTProtocolViolation(
+                            f"parameter length {param_len} exceeds "
+                            f"remaining {buf_end - buf.tell()}")
                     param_value = MOQTMessage._pull_tuple(
-                        buf, prof=prof, buf_end=buf_end)
+                        buf, prof=prof, buf_end=value_end)
+                    if buf.tell() != value_end:
+                        raise MOQTProtocolViolation(
+                            "namespace parameter does not fill its length")
                 else:  # length-prefixed bytes
                     param_len = buf.pull_vint()
                     if param_len > 65535:
