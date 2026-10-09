@@ -61,19 +61,24 @@ track=$(hex_to_text "$(jq -r '.track_name_hex' "$request_file")")
 
 # --pub-ns announces the namespace and serves the runner's SUBSCRIBE. The
 # scenarios below observe a publisher-originated PUBLISH, so the publisher is
-# also told to send one. This only selects messages to emit.
-flow=--pub-ns
+# also told to send one, or only that. This only selects messages to emit.
+flow=(--pub-ns)
 case "$scenario_id" in
     publish-track-under-single-period-namespace|\
     application-publish-track-in-session-namespace|\
     publish-distinct-content-tracks-in-same-scope|\
     publish-two-simultaneous-tracks)
-        flow=--pub-both ;;
+        flow=(--pub-both) ;;
+    initiate-track-publication|\
+    publish-track-namespace-fields|\
+    receive-reason-phrase-length-over-1024|\
+    receive-publish-request-ok-with-track-properties)
+        flow=() ;;
 esac
 
 # Track contents the scenario's fixture contract asks for: Group 7 with
-# Object 9 already published, a track with nothing published, or objects
-# sent as datagrams.
+# Object 9 already published, a track with nothing published, objects sent
+# as datagrams, or two subgroup streams open at once.
 content=()
 case "$scenario_id" in
     fetch-known-first-object-with-nonzero-group-and-object-ids|\
@@ -90,13 +95,16 @@ case "$scenario_id" in
     receive-fetch-start-beyond-largest-published-object|\
     joining-fetch-after-forward-enabled-and-track-advanced|\
     cancel-fetch-request-with-open-data-stream|\
-    reject-request-update-for-open-fetch)
+    reject-request-update-for-open-fetch|\
+    publish-objects-before-within-and-after-subscription-range)
         content=(--prefill 10) ;;
     receive-joining-fetch-for-track-with-no-published-objects|\
     receive-standalone-fetch-for-track-with-no-published-objects)
         content=(--no-objects) ;;
     fetch-object-previously-observed-as-datagram)
         content=(-D) ;;
+    cancel-subscribe-with-multiple-open-subgroups)
+        content=(-P 2) ;;
 esac
 
 # A 64-byte token cache holds the runner's 20-byte alias entries and stays
@@ -112,7 +120,7 @@ timeout_seconds=$(((timeout_ms + 999) / 1000))
 # the credentials sweep.py gives the runner: invalid (MALFORMED_AUTH_TOKEN),
 # expired (EXPIRED_AUTH_TOKEN) and denied (UNAUTHORIZED).
 exec "$python" -m aiomoqt.tools.pub_bench "$endpoint" \
-    -N "$namespace" -T "$track" --draft 18 -k "$flow" \
+    -N "$namespace" -T "$track" --draft 18 -k "${flow[@]}" \
     -s 64 -g 10 -r 50 -t "$timeout_seconds" --no-stats "${content[@]}" \
     --token-cache "$token_cache" \
     --token-reject 1:696e76616c6964:0x4 \
