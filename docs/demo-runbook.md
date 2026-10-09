@@ -1,9 +1,10 @@
 # aiomoqt media pipeline demos
 
-Four flows. Three publish through a deployed relay into the browser
-player — CMAF from a file, LOC from a file, and OBS over SRT as live
-MPEG-TS — and one consumes an outside publisher. Goal for each: stable
-low latency with the overlay numbers to prove it.
+Five flows. Four publish through a deployed relay into the browser
+player — CMAF from a file, LOC from a file, OBS over SRT as live
+MPEG-TS, and HLS or DASH from the web — and one consumes an outside
+publisher. Goal for each: stable low latency with the overlay numbers to
+prove it.
 
 Synthetic load, ramps and churn are in
 [bench-runbook.md](bench-runbook.md).
@@ -19,7 +20,7 @@ be right:
 | Setting | Value | What it is for |
 |---|---|---|
 | catalog refresh | `--catalog-interval 1` | a viewer joining after the first waits for the next catalog object; at 10 that is 0–10 s of TTFF per tab (loopback 09-12: ~5 s at 10, ~1 s at 1) |
-| source asset | no B-frames | pub_media stamps decode order with no composition offsets, so B-frame sources judder. tos-*, tian-nature-*, bbb-720p-2000k.mp4 and sintel-1280-demo.mp4 are fine; sintel-1280-surround.mp4 is bf=2 |
+| source asset | no B-frames (`--mp4`, `--ts`) | pub_media stamps decode order with no composition offsets, so B-frame sources judder. tos-*, tian-nature-*, bbb-720p-2000k.mp4 and sintel-1280-demo.mp4 are fine; sintel-1280-surround.mp4 is bf=2. `--input` (demo E) keeps the source's offsets, so B-frames are fine there |
 | start order | publisher, then viewer | pub_media sends nothing until a viewer subscribes; its `dropped` counter is the frames skipped until then |
 
 ## Before anything: paste this in every shell
@@ -67,6 +68,8 @@ so it cannot share a shell with anything below it.
   `python -m aiomoqt.tools.relay_probe --url "$RELAY_WT" --draft 18` → expect ✓
 - SHELL 2: `hostname -I` → WSL IP for the OBS SRT URL (changes across
   reboots). Only demo C needs it.
+- SHELL 2: `uv pip install -e ".[media]"` → PyAV, for demo E only;
+  without it `--input` exits with that install hint.
 - Assets in `$ASSETS/`, all H.264 High / yuv420p / bf=0 with AAC stereo:
 
   | asset | shape | rate | used by |
@@ -276,6 +279,46 @@ start; Eyevinn's moqlivemock endpoint is always on.
   and dies on ALPN at draft 18; no Go toolchain here to build a current
   one. They also host a warp-player and an MSF/CMSF validator.
 
+## Demo E — HLS / DASH from the web → glass (`--input`, CMAF)
+`pub_media --input URL` republishes an HLS playlist, a DASH MPD or anything
+else FFmpeg opens as CMAF tracks, played through MSE as in demo A. HLS goes
+through FFmpeg's reader (PyAV); DASH through `aiomoqt.media.dash`, since
+PyAV ships no DASH demuxer. Chunks keep the source's decode times and
+composition offsets. Needs the `media` extra (Prep).
+- SHELL 1 — live HLS, fMP4, 2 s segments, 1080p/720p/480p/360p@24 with a
+  separate AAC group (plain http):
+  `python -m aiomoqt.tools.pub_media "$RELAY_WT" --draft 18 -k --pub-both --input http://161.153.77.254:8888/tears-of-steel/index.m3u8 --keepalive 10 --catalog-interval 1 -t 3600`
+  Startup prints one `input <track>: <codec> <size>` line per track. The
+  default `--rendition best` publishes the top video rendition and audio.
+- Live DASH, 640x360@30 with AAC, 2 s segments (DASH-IF livesim2): same line
+  with `--input https://livesim2.dashif.org/livesim2/testpic_2s/Manifest.mpd`.
+- HLS over https, MPEG-TS segments (10 s), VOD (Mux): same line with
+  `--input https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`. VOD is
+  paced in real time and ends with the stream or `-t`; `--loop` does not
+  apply to `--input`.
+- BROWSER: paste the `player:` URL. Add `&debug=1` for the engine log.
+- HLS against DASH, in the page log: `audio order restored` climbs on HLS
+  (one group, so one QUIC stream, per AAC frame) and stays near 0 on DASH
+  (one group per source segment).
+- `--rendition all` (experimental): every video rendition as one catalog
+  alternate group. Renditions are fetched one after another, so larger
+  ladders fall behind real time (the 4-rendition Kitsune ladder, ~13 Mbps
+  in total, ran ~10 objects/s per track instead of 24), and the player
+  does not switch renditions yet. On HLS, renditions whose scene-cut key
+  frames differ number their groups differently; DASH groups follow the
+  source segments and stay aligned.
+- Targets: not yet measured on a corrected WSL clock. Expect to sit a few
+  segments behind the source's live edge — HLS starts three segments
+  back, DASH two segments (or `suggestedPresentationDelay`) back — plus
+  the usual relay path.
+- Wire: `python -m aiomoqt.tools.sub_media "$RELAY_WT" -N aiomoqt --discover --draft 18 --analyze -t 60`
+- Known: rough playback from `--input` publishes is under investigation.
+  No reconnect: an input error ends the run (HTTP requests retry; a
+  missing live DASH segment is skipped; a live DASH feed with no new
+  segment for four segment durations ends). Encrypted, SegmentBase and
+  multi-period DASH and AES-128 HLS are refused; SCTE-35 / `emsg` do not
+  pass through.
+
 ## Reading a stall or a pinned cushion
 - Publisher `lag mean/max ms` per track = how late a frame was against
   its own capture stamp when the feeder sent it (source, pipe, demux).
@@ -343,7 +386,10 @@ start; Eyevinn's moqlivemock endpoint is always on.
   as a floor, so request ids arriving out of order across concurrent
   request streams (one SUBSCRIBE per track) read as a reuse. Update
   aiomoqt. The relay was correct.
-- Two-frame judder, steady flow → B-frame source. Use a `-bf 0` asset.
+- Two-frame judder, steady flow → B-frame source on `--mp4` or `--ts`.
+  Use a `-bf 0` asset (`--input` keeps composition offsets).
+- `--input` exits with `media ingest needs PyAV: pip install
+  'aiomoqt[media]'` → the demo E Prep step was skipped.
 - Soft/blurry picture on LOC or SRT, unchanged by encoder settings →
   the canvas backing store was never sized, so frames were drawn at the
   300x150 HTML default and stretched back by CSS (fixed e8e674c; CMAF
