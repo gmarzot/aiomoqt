@@ -394,6 +394,12 @@ class _MOQTSessionMixin:
         # (wait_response=False), or a late / duplicate reply — logged at
         # DEBUG. A response for an id we never issued stays WARNING.
         self._sent_requests: deque = deque(maxlen=1024)
+        # Our PUBLISH_NAMESPACE requests: request id -> namespace.
+        self._announced: Dict[int, tuple] = {}
+        # SUBSCRIBE_NAMESPACE requests the default handler answered: request
+        # id -> prefix. They hear NAMESPACE and NAMESPACE_DONE for what this
+        # session announces (d18 §6.1).
+        self._discovery_subs: Dict[int, tuple] = {}
         # Our TRACK_STATUS request ids awaiting a reply: the only REQUEST_OK
         # that may carry Track Properties (§10.5).
         self._track_status_requests: set = set()
@@ -3839,11 +3845,33 @@ class _MOQTSessionMixin:
             self._pending_requests[request_id] = self._loop.create_future()
         logger.info(f"MOQT send: {message}")
         self._send_request(request_id, message)
+        self._announced[request_id] = namespace_tuple
+        self._report_namespace(namespace_tuple, withdrawn=False)
 
         if not wait_response:
             return message
 
         return self._await_response(request_id)
+
+    def _our_namespaces(self) -> set:
+        """Namespaces this session announces or serves tracks under."""
+        return (set(self._announced.values())
+                | {key[0] for key in self._published_tracks})
+
+    def _report_namespace(self, namespace: tuple, withdrawn: bool) -> None:
+        """NAMESPACE (or NAMESPACE_DONE) to each discovery subscriber whose
+        prefix covers `namespace`."""
+        for rid, prefix in list(self._discovery_subs.items()):
+            if namespace[:len(prefix)] != prefix:
+                continue
+            suffix = namespace[len(prefix):]
+            try:
+                if withdrawn:
+                    self.namespace_done(suffix, request_id=rid)
+                else:
+                    self.namespace(suffix, request_id=rid)
+            except Exception:
+                logger.debug("namespace report failed", exc_info=True)
 
     def publish(
         self,
@@ -3931,6 +3959,13 @@ class _MOQTSessionMixin:
         the announce's own stream and no message is sent. Returns None
         in that case.
         """
+        if request_id is None and namespace is not None:
+            wanted = self._make_namespace_tuple(namespace)
+            request_id = next((rid for rid, ns in self._announced.items()
+                               if ns == wanted), None)
+        withdrawn = self._announced.pop(request_id, None)
+        if withdrawn is not None:
+            self._report_namespace(withdrawn, withdrawn=True)
         if self.negotiated_draft >= 18:
             stream_id = self._bidi_streams.get(request_id)
             if stream_id is None:
@@ -4519,6 +4554,18 @@ class _MOQTSessionMixin:
         stream_id = self._bidi_streams.get(msg.request_id)
         logger.debug(f"MOQT event: subscribe_namespace bidi_stream={stream_id} request_id={msg.request_id} bidi_streams={self._bidi_streams}")
         self.subscribe_namespace_ok(msg, stream_id=stream_id)
+        if not self._profile.two_level_discovery:
+            return
+        # §6.1: the namespaces we publish under the prefix, then any we
+        # announce or withdraw while it stays open.
+        prefix = tuple(msg.namespace_prefix or ())
+        rid = msg.request_id
+        self._discovery_subs[rid] = prefix
+        self.register_request_cancel_handler(
+            rid, lambda r: self._discovery_subs.pop(r, None))
+        for ns in sorted(self._our_namespaces()):
+            if ns[:len(prefix)] == prefix:
+                self.namespace(ns[len(prefix):], request_id=rid)
 
     async def _handle_subscribe_tracks(self, msg: SubscribeTracks) -> None:
         """d18 SUBSCRIBE_TRACKS (0x51) — a subscriber asking one

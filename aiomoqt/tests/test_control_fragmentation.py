@@ -30,6 +30,8 @@ def _control_session(draft):
     s._next_request_id = 0
     s._sent_requests = deque(maxlen=1024)
     s._track_status_requests = set()
+    s._announced = {}
+    s._discovery_subs = {}
     s._pending_requests = {}
     s._next_track_alias = 0
     s._track_aliases = {}

@@ -64,6 +64,12 @@
   sends none), `--track-status` to ask for the track's status before publishing,
   `--publish-update` and `--end-after SECONDS`.
 - `PublishedTrack.end()`: each subscription's streams close, then PUBLISH_DONE TRACK_ENDED.
+- A d18 session answers SUBSCRIBE_NAMESPACE with NAMESPACE for each namespace it announces or
+  serves tracks under the prefix, and reports later announcements and withdrawals (NAMESPACE_DONE)
+  to it (§6.1).
+- Fix: `publish_namespace_done(namespace=...)` at d18 finds the announcement's request; it
+  withdrew nothing without a request id.
+- `pub_bench`: `--withdraw-after SECONDS`.
 - aiopquic floor `>=0.5.0a2`: a WebTransport close carries its code to the peer, and a
   refused or closed WebTransport session raises a `ConnectionError` like raw QUIC.
 - Fix: `pub_media --ts` stamps never run ahead of arrival; the PTS anchor follows the
