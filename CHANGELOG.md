@@ -28,6 +28,7 @@
 - `session.joining_fetch(subscription_request_id, ...)` sends a joining FETCH for an
   existing subscription.
 - `pub_bench`: `--prefill GROUPS` and `--no-objects`.
+- Fix: a FETCH cancelled while its objects are being sent resets its data stream (§5.2).
 - Fix: a d18 control GOAWAY whose Request ID has the wrong parity closes the session with
   INVALID_REQUEST_ID (§10.4).
 - Fix: a `moqt://` or `https://` URL with an empty host is refused instead of dialling
