@@ -6,16 +6,36 @@
   moq-pub-bench moqt://relay:4433 -D -s 1100 -r 500      # datagrams
   moq-pub-bench moqt://relay:4433 --video 1080p          # media profile
 """
+import argparse
 import asyncio
 import logging
 
 from aiomoqt.client import MOQTClient
-from aiomoqt.types import ForwardingPreference
+from aiomoqt.types import ForwardingPreference, SetupParamType
 from aiomoqt.track import PublishedTrack, VideoTrack
 from aiomoqt.utils import wait_cond_timeout
 from aiomoqt.utils import cli as _cli
 from aiomoqt.utils.logger import set_log_level
 from aiomoqt.utils.url import parse_relay_url
+
+
+def _token_rule(value: str):
+    """TYPE:HEX:CODE -> ((type, value bytes), code)."""
+    try:
+        token_type, hex_value, code = value.split(':')
+        return (int(token_type, 0), bytes.fromhex(hex_value)), int(code, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{value!r}: expected TYPE:HEX:CODE, e.g. 0:6465:0x1") from None
+
+
+def _token_validator(rules):
+    """A session auth_token_validator refusing the listed tokens."""
+    verdicts = dict(rules)
+
+    def _validate(token, _msg):
+        return verdicts.get((token.token_type, bytes(token)))
+    return _validate
 
 
 def parse_args():
@@ -47,6 +67,16 @@ The URL scheme selects the transport:
                              'spec-conservative. NOT supported by the '
                              'spec: relays reject the unsolicited uni '
                              'streams. Retained for wire experiments.')
+    parser.add_argument('--token-cache', type=int, default=0,
+                        metavar='BYTES',
+                        help='MAX_AUTH_TOKEN_CACHE_SIZE to advertise in '
+                             'SETUP, so the peer may register token '
+                             'aliases (default 0: none)')
+    parser.add_argument('--token-reject', type=_token_rule, action='append',
+                        default=[], metavar='TYPE:HEX:CODE',
+                        help='Refuse a request carrying this token (Token '
+                             'Type, hex Value) with REQUEST_ERROR CODE; '
+                             'repeatable')
     _cli.add_help(parser)
     args = parser.parse_args()
     if args.video and args.datagram:
@@ -125,7 +155,13 @@ async def run(args):
     print("  Connecting...")
     async with client.connect() as session:
         try:
-            await session.client_session_init()
+            if args.token_reject:
+                session.auth_token_validator = _token_validator(
+                    args.token_reject)
+            setup = {}
+            if args.token_cache > 0:
+                setup[SetupParamType.MAX_AUTH_TOKEN_CACHE_SIZE] = args.token_cache
+            await session.client_session_init(parameters=setup)
 
             if args.video:
                 # Profile drives object size, GOP and fps; -r is fps.
