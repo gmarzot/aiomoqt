@@ -113,6 +113,16 @@ case "$scenario_id" in
         content=(-P 2) ;;
 esac
 
+# Control messages the publisher originates for the scenarios that wait
+# for them.
+control=()
+case "$scenario_id" in
+    observe-publisher-client-goaway|\
+    send-new-request-after-publisher-control-goaway|\
+    publisher-control-goaway-with-pending-request-at-cutoff)
+        control=(--goaway-after 1) ;;
+esac
+
 # A 64-byte token cache holds the runner's 20-byte alias entries and stays
 # below its 80-byte oversize-registration probe; the overflow probe needs
 # one under 17 bytes, so none is advertised.
@@ -122,12 +132,15 @@ token_cache=64
 
 timeout_seconds=$(((timeout_ms + 999) / 1000))
 # The runner's certificate is self-signed for the test; pub_bench has no
-# trust-file option, so verification is skipped (-k). The refused tokens are
-# the credentials sweep.py gives the runner: invalid (MALFORMED_AUTH_TOKEN),
-# expired (EXPIRED_AUTH_TOKEN) and denied (UNAUTHORIZED).
+# trust-file option, so verification is skipped (-k). The runner answers only
+# a PUBLISH_NAMESPACE without parameters, so it carries no token. The refused
+# tokens are the credentials sweep.py gives the runner: invalid
+# (MALFORMED_AUTH_TOKEN), expired (EXPIRED_AUTH_TOKEN) and denied
+# (UNAUTHORIZED).
 exec "$python" -m aiomoqt.tools.pub_bench "$endpoint" \
-    -N "$namespace" -T "$track" --draft 18 -k "${flow[@]}" \
+    -N "$namespace" -T "$track" --draft 18 -k "${flow[@]}" --auth-token '' \
     -s 64 -g 10 -r 50 -t "$timeout_seconds" --no-stats "${content[@]}" \
+    "${control[@]}" \
     --token-cache "$token_cache" \
     --token-reject 1:696e76616c6964:0x4 \
     --token-reject 1:65787069726564:0x5 \
