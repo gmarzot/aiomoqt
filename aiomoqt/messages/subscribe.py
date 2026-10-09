@@ -91,25 +91,8 @@ class TrackStatus(MOQTMessage):
             forward = params.pop(ParamType.FORWARD, None)
             filter_raw = params.pop(ParamType.SUBSCRIPTION_FILTER, None)
             if filter_raw is not None:
-                fbuf = Buffer(data=filter_raw, vi64=prof.vi64)
-                filter_type = fbuf.pull_vint()
-                if filter_type not in (1, 2, 3, 4):
-                    # §5.1.2: filter types are 0x1-0x4; any other value
-                    # MUST close the session with PROTOCOL_VIOLATION.
-                    raise MOQTProtocolViolation(
-                        f"unknown subscription filter type "
-                        f"0x{filter_type:x}")
-                if filter_type in (3, 4):
-                    start_group = fbuf.pull_vint()
-                    start_object = fbuf.pull_vint()
-                if filter_type == 4:
-                    end_group = fbuf.pull_vint()
-                    if prof.vi64:
-                        # d18: End Group arrives as a delta from Start.
-                        end_group += start_group or 0
-                        if end_group > (1 << 64) - 1:
-                            raise MOQTProtocolViolation(
-                                f"end group {end_group} exceeds 2^64-1")
+                (filter_type, start_group, start_object,
+                 end_group) = MOQTMessage._decode_filter(filter_raw, prof=prof)
         else:
             priority = buf.pull_uint8()
             group_order = buf.pull_uint8()
@@ -369,25 +352,8 @@ class Subscribe(MOQTMessage):
             forward = params.pop(ParamType.FORWARD, None)
             filter_raw = params.pop(ParamType.SUBSCRIPTION_FILTER, None)
             if filter_raw is not None:
-                fbuf = Buffer(data=filter_raw, vi64=prof.vi64)
-                filter_type = fbuf.pull_vint()
-                if filter_type not in (1, 2, 3, 4):
-                    # §5.1.2: filter types are 0x1-0x4; any other value
-                    # MUST close the session with PROTOCOL_VIOLATION.
-                    raise MOQTProtocolViolation(
-                        f"unknown subscription filter type "
-                        f"0x{filter_type:x}")
-                if filter_type in (3, 4):
-                    start_group = fbuf.pull_vint()
-                    start_object = fbuf.pull_vint()
-                if filter_type == 4:
-                    end_group = fbuf.pull_vint()
-                    if prof.vi64:
-                        # d18: End Group arrives as a delta from Start.
-                        end_group += start_group or 0
-                        if end_group > (1 << 64) - 1:
-                            raise MOQTProtocolViolation(
-                                f"end group {end_group} exceeds 2^64-1")
+                (filter_type, start_group, start_object,
+                 end_group) = MOQTMessage._decode_filter(filter_raw, prof=prof)
         else:
             # d14: fixed fields on wire
             priority = buf.pull_uint8()

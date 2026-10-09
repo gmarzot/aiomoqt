@@ -137,6 +137,9 @@ class SubgroupDelivery:
         self.largest: Optional[tuple] = None
         self.objects_sent = 0
         self.bytes_sent = 0
+        # passes(group_id, object_id): the peer's subscription filter
+        # (§5.1.2); objects it excludes are not sent. None admits all.
+        self.passes: Optional[Callable[[int, int], bool]] = None
         self._stream_id: Optional[int] = None
         self._header: Optional[SubgroupHeader] = None
 
@@ -165,6 +168,10 @@ class SubgroupDelivery:
                     group_start: bool = False) -> None:
         """Place one object. `group_start` rotates the PER_GROUP stream.
         A callable `extensions` is resolved against this session."""
+        if self.passes is not None and not self.passes(group_id, object_id):
+            if group_start:
+                self.end_group()
+            return
         if callable(extensions):
             extensions = extensions(self.session)
         if self.mapping is StreamMapping.DATAGRAM:
@@ -192,7 +199,9 @@ class SubgroupDelivery:
             await self.session.stream_write_drain(sid, buf.data)
             self.session.stream_write(sid, b"", end_stream=True)
         else:  # PER_GROUP
-            if group_start:
+            if group_start or self._stream_id is None:
+                # A filter can admit a group part-way through: the stream
+                # then opens on a later object, not the group's first.
                 self.end_group()
                 self._stream_id = await self.session.open_uni_stream()
                 self.stream_count += 1
@@ -202,7 +211,8 @@ class SubgroupDelivery:
                 self._header = SubgroupHeader(
                     track_alias=self.track_alias, group_id=group_id,
                     subgroup_id=0, publisher_priority=self.priority,
-                    extensions_present=True, prof=self._prof)
+                    extensions_present=True, prof=self._prof,
+                    first_object=group_start)
                 self.session.stream_write(self._stream_id,
                                           self._header.serialize().data)
             buf = self._header.next_object(payload=payload,

@@ -1,5 +1,5 @@
 import os
-from typing import Any, Optional, Union, Dict
+from typing import Any, Optional, Union, Dict, Tuple
 from dataclasses import dataclass, field, fields
 
 from . import ParamType, SetupParamType, AuthTokenAliasType, AuthTokenType
@@ -148,6 +148,31 @@ class MOQTMessage:
         if not lo <= value <= hi:
             raise MOQTProtocolViolation(
                 f"{name} {value} outside {lo}..{hi}")
+
+    @staticmethod
+    def _decode_filter(raw: bytes, *, prof: 'DraftProfile'
+                       ) -> Tuple[int, Optional[int], Optional[int],
+                                  Optional[int]]:
+        """A SUBSCRIPTION_FILTER value (§5.1.2): (type, start group, start
+        object, end group). d18 carries End Group as a delta from Start."""
+        fbuf = Buffer(data=raw, vi64=prof.vi64)
+        filter_type = fbuf.pull_vint()
+        if filter_type not in (1, 2, 3, 4):
+            # Any other filter type MUST close the session.
+            raise MOQTProtocolViolation(
+                f"unknown subscription filter type 0x{filter_type:x}")
+        start_group = start_object = end_group = None
+        if filter_type in (3, 4):
+            start_group = fbuf.pull_vint()
+            start_object = fbuf.pull_vint()
+        if filter_type == 4:
+            end_group = fbuf.pull_vint()
+            if prof.vi64:
+                end_group += start_group
+                if end_group > (1 << 64) - 1:
+                    raise MOQTProtocolViolation(
+                        f"end group {end_group} exceeds 2^64-1")
+        return filter_type, start_group, start_object, end_group
 
     # Track Properties with a restricted value (§12.5, §12.6).
     TRACK_PROPERTY_RANGES = {

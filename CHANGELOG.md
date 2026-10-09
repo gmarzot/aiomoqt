@@ -38,6 +38,12 @@
   which must parse (§12.5-12.7).
 - Fix: PUBLISH carries LARGEST_OBJECT once the track has objects (§10.2.11), and that Location
   is the subscription's Joining Location; `session.publish(largest=...)` sets it.
+- Fix: a `PublishedTrack` sends only the objects a subscription's filter admits (§5.1.2): none
+  before its start or past an AbsoluteRange's End Group, a group admitted part-way opens its
+  stream without FIRST_OBJECT, and the range ends with PUBLISH_DONE SUBSCRIPTION_ENDED once its
+  streams have closed. A REQUEST_UPDATE filter replaces the window.
+- Fix: a SUBSCRIBE whose AbsoluteRange End Group is already published is refused with
+  INVALID_RANGE.
 - Fix: `pub_media --ts` stamps never run ahead of arrival; the PTS anchor follows the
   least-delayed unit, so a late first unit or a fast source clock no longer reads as negative
   latency.
