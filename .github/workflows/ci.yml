@@ -79,6 +79,7 @@ jobs:
       - uses: ./.github/actions/setup-aiomoqt
         with:
           python-version: ${{ matrix.python-version }}
+          extras: test,media
       - name: Generate self-signed cert for loopback
         run: |
           mkdir -p certs

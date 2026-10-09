@@ -29,6 +29,9 @@
   existing subscription.
 - `pub_bench`: `--prefill GROUPS` and `--no-objects`.
 - Fix: a FETCH cancelled while its objects are being sent resets its data stream (§5.2).
+- Fix: `pub_media --ts` stamps never run ahead of arrival; the PTS anchor follows the
+  least-delayed unit, so a late first unit or a fast source clock no longer reads as negative
+  latency.
 - Fix: a d18 control GOAWAY whose Request ID has the wrong parity closes the session with
   INVALID_REQUEST_ID (§10.4).
 - Fix: a `moqt://` or `https://` URL with an empty host is refused instead of dialling
@@ -71,6 +74,13 @@
   subscriber attaches still reaches it.
 - Fix: `moq_interop_client`: a relay that never forwards PUBLISH_DONE fails
   `data-subgroup-basic` instead of crashing the run; a test that raises is reported as FAIL.
+- pub_media: `--input URL` publishes HLS, DASH or anything FFmpeg opens as CMAF tracks;
+  `--rendition best|all` (`all` experimental). Needs the `media` extra (PyAV).
+- media: `aiomoqt.media.dash` reads DASH (PyAV ships no DASH demuxer); ingest groups follow
+  its segments.
+- media: `send_frame(group_id=)` opens the named group at a key frame.
+- media: `set_chunk_timing()`, `strip_edit_lists()`, `init_codec_string()`,
+  `hvcc_codec_string()`.
 - `moq_interop_client` / `moq_interop_relay`: a pinned `DRAFT` aiomoqt cannot speak is
   reported (TAP skip-all, exit 127) or refused at start, instead of a traceback.
 - Fix: STOP_SENDING on a d18 request stream no longer discards the REQUEST_ERROR or

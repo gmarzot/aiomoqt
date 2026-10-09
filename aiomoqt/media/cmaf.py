@@ -12,7 +12,10 @@ from __future__ import annotations
 import struct
 from typing import Optional
 
-from .sources import Mp4Error, _find
+from .sources import (
+    Mp4Error, _boxes, _find, av1c_codec_string, avcc_codec_string, esds_asc,
+    hvcc_codec_string,
+)
 
 
 def _box(btype: bytes, *payload: bytes) -> bytes:
@@ -166,7 +169,99 @@ def chunk_decode_time(chunk: bytes) -> Optional[int]:
                            (0, '>I'), (0, '>Q'))
 
 
+def set_chunk_timing(chunk: bytearray, decode_time: int,
+                     cto: Optional[int] = None) -> None:
+    """Rewrite a CMAF chunk's tfdt and, when given, its first sample's
+    composition offset in place (track timescale units)."""
+    traf = _find(chunk, 0, len(chunk), b'moof', b'traf')
+    tfdt = _find(chunk, *traf, b'tfdt') if traf else None
+    if tfdt is None:
+        raise Mp4Error("chunk has no tfdt")
+    if chunk[tfdt[0]] == 1:
+        struct.pack_into('>Q', chunk, tfdt[0] + 4, decode_time)
+    elif decode_time < 1 << 32:
+        struct.pack_into('>I', chunk, tfdt[0] + 4, decode_time)
+    else:
+        raise Mp4Error("decode time does not fit a version 0 tfdt")
+    if cto is None:
+        return
+    trun = _find(chunk, *traf, b'trun')
+    if trun is None:
+        raise Mp4Error("chunk has no trun")
+    version = chunk[trun[0]]
+    flags = int.from_bytes(chunk[trun[0] + 1:trun[0] + 4], 'big')
+    if not flags & 0x800:
+        if cto:
+            raise Mp4Error("trun carries no composition offsets")
+        return
+    if cto < 0 and version == 0:
+        raise Mp4Error("negative composition offset in a version 0 trun")
+    # sample_count, then data_offset / first_sample_flags if present, then
+    # the first sample's duration / size / flags fields that precede cto
+    pos = trun[0] + 8 + 4 * bin(flags & 0x5).count('1')
+    pos += 4 * bin(flags & 0x700).count('1')
+    struct.pack_into('>i' if version else '>I', chunk, pos, cto)
+
+
+def strip_edit_lists(init: bytes) -> bytes:
+    """The CMAF header without any trak's edts, so chunk timing alone
+    defines presentation time."""
+    out = bytearray()
+    for btype, body, end in _boxes(init, 0, len(init)):
+        if btype != b'moov':
+            out += init[body - 8:end]
+            continue
+        moov = bytearray()
+        for ctype, cbody, cend in _boxes(init, body, end):
+            if ctype == b'trak':
+                moov += _box(b'trak', *(init[tb - 8:te] for tt, tb, te
+                                        in _boxes(init, cbody, cend)
+                                        if tt != b'edts'))
+            else:
+                moov += init[cbody - 8:cend]
+        out += _box(b'moov', bytes(moov))
+    return bytes(out)
+
+
 def init_timescale(init: bytes) -> Optional[int]:
     """Track timescale from a CMAF header's mdhd; None if absent."""
     return _full_box_field(init, (b'moov', b'trak', b'mdia', b'mdhd'),
                            (8, '>I'), (16, '>I'))
+
+
+def init_codec_string(init: bytes) -> Optional[str]:
+    """RFC 6381 codec string of a CMAF header's sample entry (avc1/avc3,
+    hvc1/hev1, av01, mp4a, Opus); None if absent or unrecognized."""
+    try:
+        stsd = _find(init, 0, len(init), b'moov', b'trak', b'mdia', b'minf',
+                     b'stbl', b'stsd')
+        if stsd is None:
+            return None
+        entry = next(_boxes(init, stsd[0] + 8, stsd[1]), None)
+        if entry is None:
+            return None
+        etype, body, end = entry
+        kind = etype.decode('latin-1')
+        if etype in (b'avc1', b'avc3', b'hvc1', b'hev1', b'av01'):
+            for ctype, cbody, cend in _boxes(init, body + 78, end):
+                cfg = init[cbody:cend]
+                if ctype == b'avcC':
+                    return kind + avcc_codec_string(cfg)[4:]
+                if ctype == b'hvcC':
+                    return hvcc_codec_string(cfg, kind)
+                if ctype == b'av1C':
+                    return av1c_codec_string(cfg)
+        elif etype == b'mp4a':
+            esds = _find(init, body + 28, end, b'esds')
+            if esds is not None:
+                oti, asc = esds_asc(init, esds[0])
+                if oti == 0x40 and asc:
+                    aot = asc[0] >> 3
+                    if aot == 31 and len(asc) > 1:  # escape: 6 more bits
+                        aot = 32 + (((asc[0] & 7) << 3) | (asc[1] >> 5))
+                    return f"mp4a.40.{aot}"
+        elif etype == b'Opus':
+            return 'opus'
+    except (Mp4Error, IndexError, struct.error):
+        return None
+    return None

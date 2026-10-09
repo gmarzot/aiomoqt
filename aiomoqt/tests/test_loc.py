@@ -288,3 +288,36 @@ async def test_codec_string_round_trip():
                for g, o, f in got}
     assert marking[(0, 0)] == marking[(1, 0)] == b"\xe0"
     assert marking[(0, 1)] == marking[(0, 2)] == marking[(1, 1)] == b"\xc0"
+
+
+@pytest.mark.asyncio
+async def test_key_frame_opens_the_group_it_names():
+    # A stale or missing id falls back to the next group.
+    port = _BASE_PORT + 13
+    frames = [(b"k5", True, 5), (b"p", False, 7), (b"k9", True, 9),
+              (b"k2", True, 2), (b"k", True, None)]
+    server = MOQTServer(
+        host="localhost", port=port, certificate=CERT, private_key=KEY,
+        path="/", use_quic=True, supported_drafts=18,
+    )
+
+    async def _on_subscribe(session, msg):
+        ok = session.subscribe_ok(request_msg=msg, content_exists=0)
+        await asyncio.sleep(0.05)
+        pub = LocTrackPublisher(session, "loc/ns", "track",
+                                mapping=StreamMapping.PER_GROUP)
+        for i, (payload, key, gid) in enumerate(frames):
+            await pub.send_frame(payload, key_frame=key, timestamp=1000 + i,
+                                 group_id=gid)
+        await pub.finish()
+        await pub.generate(session, ok.track_alias)
+
+    server.register_handler(MOQTMessageType.SUBSCRIBE, _on_subscribe)
+    server = await server.serve()
+    try:
+        got, _ = await _subscribe_collect(port, len(frames))
+    finally:
+        server.close()
+    assert sorted((g, o, f.payload) for g, o, f in got) == [
+        (5, 0, b"k5"), (5, 1, b"p"), (9, 0, b"k9"), (10, 0, b"k2"),
+        (11, 0, b"k")]
