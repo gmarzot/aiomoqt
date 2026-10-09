@@ -30,11 +30,27 @@ from aiopquic.exceptions import StreamUnderflow as MOQTUnderflow  # noqa: E402
 class AuthTokenRef:
     """An AUTHORIZATION TOKEN that operates on the receiver's token cache
     (§10.2.2): REGISTER (alias, type, value), USE_ALIAS or DELETE (alias
-    only). USE_VALUE tokens decode to their bare Value instead."""
+    only). USE_VALUE tokens decode to an AuthToken instead."""
     alias_type: int
     alias: int
     token_type: Optional[int] = None
     value: Optional[bytes] = None
+
+
+class AuthToken(bytes):
+    """A token's Value carrying its Token Type (§10.2.2). Equal to the bare
+    Value, so code that handles tokens as bytes keeps working; a plain
+    bytes token is sent as Type OUT_OF_BAND."""
+    token_type: int
+
+    def __new__(cls, value: bytes = b"",
+                token_type: int = AuthTokenType.OUT_OF_BAND) -> 'AuthToken':
+        token = super().__new__(cls, value)
+        token.token_type = int(token_type)
+        return token
+
+    def __repr__(self) -> str:
+        return f"AuthToken({bytes(self)!r}, token_type={self.token_type})"
 
 
 @dataclass(slots=True)
@@ -351,9 +367,9 @@ class MOQTMessage:
     @staticmethod
     def _auth_token_wrap(value: Union[bytes, str, AuthTokenRef],
                          prof: 'DraftProfile') -> bytes:
-        """Serialize a Token structure (§10.2.2). A bare value is sent as
-        USE_VALUE with Token Type OUT_OF_BAND; an AuthTokenRef as its
-        cache operation."""
+        """Serialize a Token structure (§10.2.2). A value is sent as
+        USE_VALUE with its AuthToken type, else OUT_OF_BAND; an AuthTokenRef
+        as its cache operation."""
         tb = Buffer(capacity=BUF_SIZE, vi64=prof.vi64)
         if isinstance(value, AuthTokenRef):
             tb.push_vint(value.alias_type)
@@ -362,25 +378,26 @@ class MOQTMessage:
                 tb.push_vint(value.token_type or AuthTokenType.OUT_OF_BAND)
                 tb.push_bytes(bytes(value.value or b""))
         else:
+            token_type = getattr(value, 'token_type', AuthTokenType.OUT_OF_BAND)
             if isinstance(value, str):
                 value = value.encode()
             tb.push_vint(AuthTokenAliasType.USE_VALUE)
-            tb.push_vint(AuthTokenType.OUT_OF_BAND)
+            tb.push_vint(token_type)
             tb.push_bytes(bytes(value))
         return tb.data_slice(0, tb.tell())
 
     @staticmethod
     def _auth_token_unwrap(raw: bytes, prof: 'DraftProfile'
-                           ) -> Union[bytes, AuthTokenRef]:
-        """Decode a Token structure (§10.2.2): USE_VALUE yields its Value,
-        the cache operations an AuthTokenRef. One that cannot be decoded
-        is a KEY_VALUE_FORMATTING_ERROR."""
+                           ) -> Union[AuthToken, AuthTokenRef]:
+        """Decode a Token structure (§10.2.2): USE_VALUE yields an
+        AuthToken, the cache operations an AuthTokenRef. One that cannot be
+        decoded is a KEY_VALUE_FORMATTING_ERROR."""
         tb = Buffer(data=raw, vi64=prof.vi64)
         try:
             alias_type = tb.pull_vint()
             if alias_type == AuthTokenAliasType.USE_VALUE:
-                tb.pull_vint()  # Token Type
-                return tb.pull_bytes(len(raw) - tb.tell())
+                token_type = tb.pull_vint()
+                return AuthToken(tb.pull_bytes(len(raw) - tb.tell()), token_type)
             if alias_type == AuthTokenAliasType.REGISTER:
                 alias = tb.pull_vint()
                 token_type = tb.pull_vint()

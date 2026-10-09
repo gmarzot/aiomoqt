@@ -344,10 +344,15 @@ class _MOQTSessionMixin:
         # Admitted peer SUBSCRIBE / SUBSCRIBE_NAMESPACE / SUBSCRIBE_TRACKS:
         # request_id -> (message class, full track name or prefix).
         self._peer_requests: Dict[int, Tuple[type, tuple]] = {}
-        # The peer's registered tokens (§10.2.2): alias -> (type, value),
-        # held within the MAX_AUTH_TOKEN_CACHE_SIZE we advertised (0 =
-        # aliases not accepted).
-        self._auth_tokens: Dict[int, Tuple[int, bytes]] = {}
+        # The peer's registered tokens (§10.2.2): alias -> token, held
+        # within the MAX_AUTH_TOKEN_CACHE_SIZE we advertised (0 = aliases
+        # not accepted).
+        self._auth_tokens: Dict[int, AuthToken] = {}
+        # Called as auth_token_validator(token, msg) for the token a d16+
+        # peer request carries, after alias resolution; a returned
+        # RequestErrorCode refuses the request (§10.2.2).
+        self.auth_token_validator: Optional[
+            Callable[[AuthToken, MOQTMessage], Optional[int]]] = None
         self._auth_token_cache_used = 0
         self._auth_token_cache_max = 0
         # Aliases the peer assigned (SUBSCRIBE_OK / PUBLISH) -> our
@@ -2806,62 +2811,80 @@ class _MOQTSessionMixin:
                       PublishOk, FetchOk)
 
     def _resolve_auth_token(self, msg: MOQTMessage) -> Optional[Callable]:
-        """Apply a token-cache operation the peer sent (§10.2.2, §10.3.1.4)
-        and leave the token's Value in its place. Raises on the session
-        errors; returns the handler that refuses a request naming an alias
-        that is not registered."""
+        """Apply a token-cache operation the peer sent (§10.2.2, §10.3.1.4),
+        leave the resolved AuthToken in its place, and put a request's
+        token to auth_token_validator. Raises on the session errors;
+        returns the handler that refuses a request naming an unregistered
+        alias or carrying a token the validator rejects."""
         in_setup = isinstance(msg, (Setup, ClientSetup, ServerSetup))
         params = (msg.options if isinstance(msg, Setup)
                   else getattr(msg, 'parameters', None))
+        if not params:
+            return None
         key = SetupParamType.AUTH_TOKEN if in_setup else ParamType.AUTH_TOKEN
-        ref = params.get(key) if params else None
-        if not isinstance(ref, AuthTokenRef):
-            return None
-        if ref.alias_type == AuthTokenAliasType.REGISTER:
-            if ref.alias in self._auth_tokens:
-                raise MOQTException(
-                    SessionCloseCode.DUPLICATE_AUTH_TOKEN_ALIAS,
-                    f"token alias {ref.alias} is already registered")
-            size = 16 + len(ref.value)
-            if self._auth_token_cache_used + size <= self._auth_token_cache_max:
-                self._auth_tokens[ref.alias] = (ref.token_type, ref.value)
-                self._auth_token_cache_used += size
-            elif not in_setup:
-                raise MOQTException(
-                    SessionCloseCode.AUTH_TOKEN_CACHE_OVERFLOW,
-                    f"token alias {ref.alias} ({size} bytes) exceeds the "
-                    f"cache ({self._auth_token_cache_max} bytes)")
-            # A SETUP registration that does not fit is used as a value.
-            params[key] = ref.value
-            return None
-        if in_setup:
-            if not self._is_client:
-                raise MOQTException(
-                    SessionCloseCode.PROTOCOL_VIOLATION,
-                    "DELETE or USE_ALIAS token in SETUP")
-            del params[key]
-            return None
-        known = self._auth_tokens.get(ref.alias)
-        if known is not None:
-            if ref.alias_type == AuthTokenAliasType.DELETE:
-                del self._auth_tokens[ref.alias]
-                self._auth_token_cache_used -= 16 + len(known[1])
+        rid = getattr(msg, 'request_id', None)
+        refusable = (not in_setup and rid is not None
+                     and is_draft16_or_later(self.negotiated_draft))
+        ref = params.get(key)
+        if isinstance(ref, AuthTokenRef):
+            if ref.alias_type == AuthTokenAliasType.REGISTER:
+                if ref.alias in self._auth_tokens:
+                    raise MOQTException(
+                        SessionCloseCode.DUPLICATE_AUTH_TOKEN_ALIAS,
+                        f"token alias {ref.alias} is already registered")
+                token = AuthToken(ref.value or b"", ref.token_type or 0)
+                size = 16 + len(token)
+                if self._auth_token_cache_used + size <= self._auth_token_cache_max:
+                    # Registered even if the request then fails (§10.2.2).
+                    self._auth_tokens[ref.alias] = token
+                    self._auth_token_cache_used += size
+                elif not in_setup:
+                    raise MOQTException(
+                        SessionCloseCode.AUTH_TOKEN_CACHE_OVERFLOW,
+                        f"token alias {ref.alias} ({size} bytes) exceeds the "
+                        f"cache ({self._auth_token_cache_max} bytes)")
+                # A SETUP registration that does not fit is used as a value.
+                params[key] = token
+            elif in_setup:
+                if not self._is_client:
+                    raise MOQTException(
+                        SessionCloseCode.PROTOCOL_VIOLATION,
+                        "DELETE or USE_ALIAS token in SETUP")
+                del params[key]
+            elif ref.alias not in self._auth_tokens:
+                if not refusable:
+                    return None
+                # d18 defines UNKNOWN_AUTH_TOKEN_ALIAS (0x17) only as a session
+                # code but asks for the request to be rejected with it.
+                return self._refusal(
+                    msg, int(rid), SessionCloseCode.UNKNOWN_AUTH_TOKEN_ALIAS,
+                    f"token alias {ref.alias} not registered")
+            elif ref.alias_type == AuthTokenAliasType.DELETE:
+                known = self._auth_tokens.pop(ref.alias)
+                self._auth_token_cache_used -= 16 + len(known)
                 del params[key]
             else:
-                params[key] = known[1]
+                params[key] = self._auth_tokens[ref.alias]
+        token = params.get(key)
+        if (not refusable or self.auth_token_validator is None
+                or not isinstance(token, bytes)):
             return None
-        rid = getattr(msg, 'request_id', None)
-        if rid is None or not is_draft16_or_later(self.negotiated_draft):
+        if not isinstance(token, AuthToken):
+            token = AuthToken(token)
+        code = self.auth_token_validator(token, msg)
+        if code is None:
             return None
-        rid = int(rid)
-        # d18 defines UNKNOWN_AUTH_TOKEN_ALIAS (0x17) only as a session code
-        # but asks for the request to be rejected with it; we send 0x17.
-        err = RequestError(
-            request_id=rid,
-            error_code=int(SessionCloseCode.UNKNOWN_AUTH_TOKEN_ALIAS),
-            retry_interval=0, reason=f"token alias {ref.alias} not registered")
-        logger.info(f"MOQT: refusing {type(msg).__name__} {rid}: "
-                    f"unknown token alias {ref.alias}")
+        return self._refusal(msg, int(rid), code,
+                             "authorization token refused")
+
+    @staticmethod
+    def _refusal(msg: MOQTMessage, rid: int, code: int,
+                 reason: str) -> Callable:
+        """The handler that answers request `rid` with REQUEST_ERROR. It runs
+        as a task, after the request's stream is bound."""
+        logger.info(f"MOQT: refusing {type(msg).__name__} {rid}: {reason}")
+        err = RequestError(request_id=rid, error_code=int(code),
+                           retry_interval=0, reason=reason)
 
         async def refuse(session, _msg):
             session._send_on_request_stream(rid, err, fin=True)
@@ -2906,14 +2929,7 @@ class _MOQTSessionMixin:
             if key is not None:
                 self._peer_requests[rid] = (kind, key)
             return None
-        logger.info(f"MOQT: refusing {kind.__name__} {rid}: {reason}")
-        err = RequestError(request_id=rid, error_code=int(code),
-                           retry_interval=0, reason=reason)
-
-        # A handler task runs after the request's stream is bound.
-        async def refuse(session, _msg):
-            session._send_on_request_stream(rid, err, fin=True)
-        return refuse
+        return self._refusal(msg, rid, code, reason)
 
     def _send_reply(self, request_id: int, msg: MOQTMessage,
                     fin: bool = False) -> None:
