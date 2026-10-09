@@ -3,7 +3,7 @@ from typing import Any, Optional, Dict, Tuple
 
 from .base import MOQTMessage, BUF_SIZE
 from ..types import (
-    MOQTMessageType, FetchType, GroupOrder, ParamType,
+    MOQTMessageType, FetchType, GroupOrder, MOQTProtocolViolation, ParamType,
     SessionCloseCode,
 )
 from ..context import is_draft16_or_later, DraftProfile
@@ -136,9 +136,8 @@ class Fetch(MOQTMessage):
             joining_request_id = buf.pull_vint()
             joining_start = buf.pull_vint()
         else:
-            raise ValueError(
-                f"Invalid fetch_type: {fetch_type} "
-                f"(spec §9.16: must be 0x1, 0x2, or 0x3)")
+            raise MOQTProtocolViolation(
+                f"FETCH type {fetch_type} is not 0x1, 0x2 or 0x3")
 
         params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
 

@@ -371,6 +371,53 @@ def test_d18_fetch_first_object_sg_prior_rejected():
         FetchObject.deserialize(rb, prior=None, prof=prof)
 
 
+def test_d18_fetch_datagram_object_flag():
+    # §11.4.4.1: a Datagram object sets 0x40 and has no Subgroup ID; the
+    # next object's Subgroup counts on from 0.
+    objs = [
+        FetchObject(group_id=7, object_id=9, publisher_priority=128,
+                    payload=b"d", datagram=True),
+        FetchObject(group_id=7, subgroup_id=1, object_id=10,
+                    publisher_priority=128, payload=b"s"),
+    ]
+    chain = _fetch_chain_roundtrip(objs)
+    # DGRAM|PRI|GD|OD = 0x5C, group, object, priority, payload.
+    assert chain[0][0] == bytes.fromhex("5c0709800164")
+    # Subgroup prior + 1 (0x02); object and priority inherited.
+    assert chain[1][0] == bytes.fromhex("020173")
+    assert chain[0][1].datagram and not chain[1][1].datagram
+    assert chain[1][1].subgroup_id == 1
+
+
+def test_d18_fetch_datagram_flag_ignores_subgroup_bits():
+    # 0x40 with Subgroup bits 0b11: the bits are ignored, no field is read.
+    rb = Buffer(data=bytes.fromhex("5f0709800164"), vi64=True)
+    got = FetchObject.deserialize(rb, prof=profile_for(18))
+    assert got.datagram and got.subgroup_id == 0
+    assert (got.group_id, got.object_id, got.payload) == (7, 9, b"d")
+
+
+def test_d16_fetch_datagram_object_flag():
+    prof = profile_for(16)
+    raw = bytes(FetchObject(group_id=7, object_id=9, publisher_priority=128,
+                            payload=b"d", datagram=True)
+                .serialize(prof=prof).data)
+    # Flags 0x5C as a 2-byte RFC 9000 varint; no Subgroup ID field.
+    assert raw == bytes.fromhex("405c0709800164")
+    got = FetchObject.deserialize(Buffer(data=raw), prof=prof)
+    assert got.datagram and (got.group_id, got.object_id) == (7, 9)
+
+
+def test_d18_fetch_unknown_type_is_a_protocol_violation():
+    # §10.12: Request ID 1, Fetch Type 0, no parameters.
+    from aiomoqt.messages.fetch import Fetch
+    from aiomoqt.types import MOQTProtocolViolation
+    body = bytes([0x01, 0x00, 0x00])
+    with pytest.raises(MOQTProtocolViolation):
+        Fetch.deserialize(Buffer(data=body, vi64=True), prof=profile_for(18),
+                          buf_end=len(body))
+
+
 # -- d18 SUBSCRIPTION_FILTER internals (§5.1.2) -----------------------
 #
 # Filter values follow the negotiated varint codec (vi64 on d18 —

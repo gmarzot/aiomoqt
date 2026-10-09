@@ -543,6 +543,8 @@ class FetchObject(MOQTMessage):
     payload: bytes = b''
     # d16 only: end-of-range marker flag (0x8C or 0x10C)
     end_of_range: Optional[int] = None
+    # Forwarding Preference Datagram: no Subgroup ID (flag 0x40).
+    datagram: bool = False
 
     def serialize(self, *, prof: DraftProfile,
                   prior: Optional['FetchObject'] = None,
@@ -598,11 +600,16 @@ class FetchObject(MOQTMessage):
                 object_field = delta
             if self.publisher_priority != prior.publisher_priority:
                 flags |= FETCH_FLAG_PRIORITY_PRESENT
-        if self.subgroup_id == 0:
+        # A datagram's Subgroup ID reads as 0 when it is the prior.
+        prior_sg = (None if prior is None
+                    else 0 if prior.datagram else prior.subgroup_id)
+        if self.datagram:
+            flags |= FETCH_FLAG_DATAGRAM
+        elif self.subgroup_id == 0:
             pass  # SG mode 0b00
-        elif prior is not None and self.subgroup_id == prior.subgroup_id:
+        elif prior_sg is not None and self.subgroup_id == prior_sg:
             flags |= FETCH_FLAG_SG_PRIOR
-        elif prior is not None and self.subgroup_id == prior.subgroup_id + 1:
+        elif prior_sg is not None and self.subgroup_id == prior_sg + 1:
             flags |= FETCH_FLAG_SG_PRIOR_PLUS
         else:
             flags |= FETCH_FLAG_SG_PRESENT
@@ -668,17 +675,19 @@ class FetchObject(MOQTMessage):
             return buf
 
         # Default: emit fully-explicit object (no delta refs).
-        # Subgroup mode = 0x03 (present), object/group/priority present.
-        flags = (FETCH_FLAG_SG_PRESENT
-                 | FETCH_FLAG_OBJECT_ID_PRESENT
+        # Subgroup mode = 0x03 (present), object/group/priority present;
+        # a datagram carries no Subgroup ID.
+        flags = (FETCH_FLAG_OBJECT_ID_PRESENT
                  | FETCH_FLAG_GROUP_ID_PRESENT
                  | FETCH_FLAG_PRIORITY_PRESENT)
+        flags |= FETCH_FLAG_DATAGRAM if self.datagram else FETCH_FLAG_SG_PRESENT
         if self.extensions:
             flags |= FETCH_FLAG_EXTENSIONS_PRESENT
 
         buf.push_uint_var(flags)
         buf.push_uint_var(self.group_id)
-        buf.push_uint_var(self.subgroup_id)
+        if not self.datagram:
+            buf.push_uint_var(self.subgroup_id)
         buf.push_uint_var(self.object_id)
         buf.push_uint8(self.publisher_priority)
         if flags & FETCH_FLAG_EXTENSIONS_PRESENT:
@@ -802,6 +811,7 @@ class FetchObject(MOQTMessage):
             extensions=extensions,
             status=status,
             payload=payload,
+            datagram=bool(flags & FETCH_FLAG_DATAGRAM),
         )
 
     @classmethod
@@ -910,6 +920,7 @@ class FetchObject(MOQTMessage):
             extensions=extensions,
             status=status,
             payload=payload,
+            datagram=bool(flags & FETCH_FLAG_DATAGRAM),
         )
 
 
