@@ -38,6 +38,13 @@ def _token_validator(rules):
     return _validate
 
 
+class _EmptyTrack(PublishedTrack):
+    """Accepts subscriptions and never publishes an object."""
+
+    async def produce(self, out) -> None:
+        await asyncio.Event().wait()
+
+
 def parse_args():
     parser = _cli.make_parser(
         'aiomoqt publisher bench — MoQT benchmark sender',
@@ -77,6 +84,14 @@ The URL scheme selects the transport:
                         help='Refuse a request carrying this token (Token '
                              'Type, hex Value) with REQUEST_ERROR CODE; '
                              'repeatable')
+    content = parser.add_mutually_exclusive_group()
+    content.add_argument('--prefill', type=int, default=0, metavar='GROUPS',
+                         help='Hold GROUPS groups as already published, '
+                              'ready for FETCH before any subscriber; '
+                              'live objects follow them')
+    content.add_argument('--no-objects', action='store_true',
+                         help='Serve subscriptions but publish no '
+                              'objects: a track with nothing published')
     _cli.add_help(parser)
     args = parser.parse_args()
     if args.video and args.datagram:
@@ -173,7 +188,8 @@ async def run(args):
                     fps=args.rate or 30,
                 )
             else:
-                track = PublishedTrack(
+                track_class = _EmptyTrack if args.no_objects else PublishedTrack
+                track = track_class(
                     session,
                     namespace=args.namespace,
                     trackname=args.trackname,
@@ -185,6 +201,8 @@ async def run(args):
                                 if args.datagram
                                 else ForwardingPreference.SUBGROUP),
                 )
+            if args.prefill:
+                track.prefill(args.prefill)
             await track.publish(
                 announce_namespace=(args.pub_ns or args.pub_both),
                 publish_track=(not args.pub_ns or args.pub_both),
