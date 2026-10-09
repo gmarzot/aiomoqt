@@ -2813,7 +2813,8 @@ class _MOQTSessionMixin:
         in_setup = isinstance(msg, (Setup, ClientSetup, ServerSetup))
         params = (msg.options if isinstance(msg, Setup)
                   else getattr(msg, 'parameters', None))
-        ref = params.get(ParamType.AUTH_TOKEN) if params else None
+        key = SetupParamType.AUTH_TOKEN if in_setup else ParamType.AUTH_TOKEN
+        ref = params.get(key) if params else None
         if not isinstance(ref, AuthTokenRef):
             return None
         if ref.alias_type == AuthTokenAliasType.REGISTER:
@@ -2831,23 +2832,23 @@ class _MOQTSessionMixin:
                     f"token alias {ref.alias} ({size} bytes) exceeds the "
                     f"cache ({self._auth_token_cache_max} bytes)")
             # A SETUP registration that does not fit is used as a value.
-            params[ParamType.AUTH_TOKEN] = ref.value
+            params[key] = ref.value
             return None
         if in_setup:
             if not self._is_client:
                 raise MOQTException(
                     SessionCloseCode.PROTOCOL_VIOLATION,
                     "DELETE or USE_ALIAS token in SETUP")
-            del params[ParamType.AUTH_TOKEN]
+            del params[key]
             return None
         known = self._auth_tokens.get(ref.alias)
         if known is not None:
             if ref.alias_type == AuthTokenAliasType.DELETE:
                 del self._auth_tokens[ref.alias]
                 self._auth_token_cache_used -= 16 + len(known[1])
-                del params[ParamType.AUTH_TOKEN]
+                del params[key]
             else:
-                params[ParamType.AUTH_TOKEN] = known[1]
+                params[key] = known[1]
             return None
         rid = getattr(msg, 'request_id', None)
         if rid is None or not is_draft16_or_later(self.negotiated_draft):
