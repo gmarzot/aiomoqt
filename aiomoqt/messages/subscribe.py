@@ -12,10 +12,10 @@ logger = get_logger(__name__)
 
 @dataclass(slots=True)
 class TrackStatus(MOQTMessage):
-    """TRACK_STATUS (0x0D) — identical format to SUBSCRIBE.
-
-    Version branching same as Subscribe.
-    Draft-16 response is REQUEST_OK/REQUEST_ERROR (no Track Alias).
+    """TRACK_STATUS (0x0D) — SUBSCRIBE's format. d14 carries priority,
+    group order, forward and filter as fields; d16+ sends none of them
+    (§10.14). The d16+ response is REQUEST_OK/REQUEST_ERROR (no Track
+    Alias).
     """
     request_id: int = 0
     track_namespace: Tuple[bytes, ...] = None
@@ -47,34 +47,10 @@ class TrackStatus(MOQTMessage):
         payload.push_bytes(self.track_name)
 
         if is_draft16_or_later(prof.draft):
-            params = dict(self.parameters or {})
-            if self.priority is not None:
-                params[ParamType.SUBSCRIBER_PRIORITY] = self.priority
-            # d16+ has no 0 value; omission means the publisher's order.
-            if self.group_order not in (None, GroupOrder.PUBLISHER_DEFAULT):
-                params[ParamType.GROUP_ORDER] = self.group_order
-            if self.forward is not None:
-                params[ParamType.FORWARD] = self.forward
-            if self.filter_type is not None:
-                # Filter internals follow the negotiated varint codec
-                # (vi64 on d18); d18 carries End Group as a delta from
-                # Start Group (moxygen MoQFramer: end - start, >= 0).
-                fbuf = Buffer(capacity=64, vi64=prof.vi64)
-                fbuf.push_vint(self.filter_type)
-                if self.filter_type in (3, 4):
-                    fbuf.push_vint(self.start_group or 0)
-                    fbuf.push_vint(self.start_object or 0)
-                if self.filter_type == 4:
-                    end = self.end_group or 0
-                    if prof.vi64:
-                        start = self.start_group or 0
-                        if end < start:
-                            raise ValueError(
-                                f"end_group {end} < start_group {start}")
-                        end -= start
-                    fbuf.push_vint(end)
-                params[ParamType.SUBSCRIPTION_FILTER] = fbuf.data_slice(0, fbuf.tell())
-            MOQTMessage._serialize_params(payload, params, prof=prof)
+            # §10.14: delivery parameters (priority, group order, forward,
+            # filter) are not included; only the caller's, e.g. AUTH_TOKEN.
+            MOQTMessage._serialize_params(payload, self.parameters or {},
+                                          prof=prof)
         else:
             payload.push_uint8(self.priority)
             payload.push_uint8(self.group_order)

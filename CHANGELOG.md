@@ -29,6 +29,8 @@
   existing subscription.
 - `pub_bench`: `--prefill GROUPS` and `--no-objects`.
 - Fix: a FETCH cancelled while its objects are being sent resets its data stream (§5.2).
+- Fix: TRACK_STATUS at d16+ carries no delivery parameters (priority, group order, forward,
+  filter), which §10.14 leaves out; one received from a peer still decodes.
 - Fix: `pub_media --ts` stamps never run ahead of arrival; the PTS anchor follows the
   least-delayed unit, so a late first unit or a fast source clock no longer reads as negative
   latency.

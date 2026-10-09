@@ -2119,48 +2119,44 @@ class TestTrackStatusD14:
 
 
 class TestTrackStatusD16:
-    """TrackStatus round-trips in draft-16 (params encoding)."""
+    """d16 TRACK_STATUS sends no delivery parameters (§10.14); one sent by
+    an older peer still decodes."""
 
-    def test_latest_object(self):
+    def test_round_trip(self):
         assert moqt_message_serialization_versioned(
             TrackStatus,
-            {**_TRACKSTATUS_BASE,
-             'filter_type': FilterType.LATEST_OBJECT},
+            {k: v for k, v in _TRACKSTATUS_BASE.items()
+             if k not in ('priority', 'group_order', 'forward')},
             type_id=MOQTMessageType.TRACK_STATUS,
             version=MOQT_VERSION_DRAFT16,
         )
 
-    def test_next_group_start(self):
-        assert moqt_message_serialization_versioned(
-            TrackStatus,
-            {**_TRACKSTATUS_BASE,
-             'filter_type': FilterType.NEXT_GROUP_START},
-            type_id=MOQTMessageType.TRACK_STATUS,
-            version=MOQT_VERSION_DRAFT16,
-        )
-
-    def test_absolute_start(self):
-        assert moqt_message_serialization_versioned(
-            TrackStatus,
-            {**_TRACKSTATUS_BASE,
-             'filter_type': FilterType.ABSOLUTE_START,
-             'start_group': 5,
-             'start_object': 3},
-            type_id=MOQTMessageType.TRACK_STATUS,
-            version=MOQT_VERSION_DRAFT16,
-        )
-
-    def test_absolute_range(self):
-        assert moqt_message_serialization_versioned(
-            TrackStatus,
-            {**_TRACKSTATUS_BASE,
-             'filter_type': FilterType.ABSOLUTE_RANGE,
-             'start_group': 10,
-             'start_object': 0,
-             'end_group': 50},
-            type_id=MOQTMessageType.TRACK_STATUS,
-            version=MOQT_VERSION_DRAFT16,
-        )
+    @pytest.mark.parametrize("fields", [
+        {'filter_type': FilterType.LATEST_OBJECT},
+        {'filter_type': FilterType.NEXT_GROUP_START},
+        {'filter_type': FilterType.ABSOLUTE_START,
+         'start_group': 5, 'start_object': 3},
+        {'filter_type': FilterType.ABSOLUTE_RANGE,
+         'start_group': 10, 'start_object': 0, 'end_group': 50},
+        {'forward': 0, 'filter_type': FilterType.LATEST_OBJECT},
+    ], ids=["latest", "next-group", "absolute-start", "absolute-range",
+            "forward-0"])
+    def test_delivery_parameters_are_not_sent_but_decode(self, fields):
+        from aiomoqt.context import profile_for
+        prof = profile_for(16)
+        status = TrackStatus(**{**_TRACKSTATUS_BASE, **fields})
+        plain = TrackStatus(request_id=7, track_namespace=(b'live', b'sports'),
+                            track_name=b'video')
+        assert (bytes(status.serialize(prof=prof).data)
+                == bytes(plain.serialize(prof=prof).data))
+        # A d16 SUBSCRIBE body is a TRACK_STATUS body with those parameters.
+        raw = bytes(Subscribe(**{**_SUBSCRIBE_BASE, 'request_id': 7, **fields})
+                    .serialize(prof=prof).data)
+        buf = Buffer(data=raw)
+        buf.pull_uint_var()
+        length = buf.pull_uint16()
+        got = TrackStatus.deserialize(buf, prof=prof, buf_end=buf.tell() + length)
+        assert {k: getattr(got, k) for k in fields} == fields
 
 
 # ========================================================================
@@ -2251,11 +2247,3 @@ class TestForwardZero:
             version=MOQT_VERSION_DRAFT14,
         )
 
-    def test_track_status_forward_0_d16(self):
-        assert moqt_message_serialization_versioned(
-            TrackStatus,
-            {**_TRACKSTATUS_BASE, 'forward': 0,
-             'filter_type': FilterType.LATEST_OBJECT},
-            type_id=MOQTMessageType.TRACK_STATUS,
-            version=MOQT_VERSION_DRAFT16,
-        )

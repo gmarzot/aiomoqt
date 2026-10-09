@@ -3272,7 +3272,9 @@ class _MOQTSessionMixin:
         wait_response: bool = False,
     ):
         """TRACK_STATUS (§10.14): ask about a track without subscribing.
-        Answered by TRACK_STATUS_OK/ERROR (REQUEST_OK/ERROR at d18)."""
+        Answered by TRACK_STATUS_OK/ERROR (REQUEST_OK/ERROR at d16+).
+        priority, group_order, forward and filter_type are d14 fields;
+        d16+ sends none of them."""
         request_id = self._allocate_request_id()
         message = TrackStatus(
             request_id=request_id,

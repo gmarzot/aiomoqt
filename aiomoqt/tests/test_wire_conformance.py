@@ -714,3 +714,14 @@ def test_d18_namespace_parameter_field_past_the_frame_is_refused():
         MOQTMessage._deserialize_params(
             Buffer(data=block + b"xyz", vi64=True), prof=prof,
             buf_end=len(block))
+
+
+@pytest.mark.parametrize("draft", [16, 18])
+def test_track_status_carries_no_delivery_parameters(draft):
+    # §10.14: priority, group order, forward and filter are not included.
+    from aiomoqt.messages.subscribe import TrackStatus
+    msg = TrackStatus(request_id=1, track_namespace=(b"n",), track_name=b"t",
+                      priority=128, group_order=1, forward=1, filter_type=2)
+    raw = bytes(msg.serialize(prof=profile_for(draft)).data)
+    # Type 0x0D, Length 7, Request ID, namespace "n", name "t", no params.
+    assert raw == bytes.fromhex("0d0007" "01" "01016e" "0174" "00")
