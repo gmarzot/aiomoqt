@@ -49,6 +49,8 @@
   FETCH being served has its data stream reset. A FETCH accepts only a priority update.
 - Fix: `await_fetch_done()` called after a fetch stream ended reports how it ended; a reset
   stream read as clean.
+- aiopquic floor `>=0.5.0a2`: a WebTransport close carries its code to the peer, and a
+  refused or closed WebTransport session raises a `ConnectionError` like raw QUIC.
 - Fix: `pub_media --ts` stamps never run ahead of arrival; the PTS anchor follows the
   least-delayed unit, so a late first unit or a fast source clock no longer reads as negative
   latency.
