@@ -87,6 +87,9 @@ The URL scheme selects the transport:
     parser.add_argument('--auth-token', type=str, default='bench-token',
                         help='AUTH_TOKEN sent on PUBLISH_NAMESPACE; empty '
                              'sends none (default %(default)s)')
+    parser.add_argument('--track-status', action='store_true',
+                        help='Ask the peer for the track\'s status '
+                             '(TRACK_STATUS) before publishing')
     parser.add_argument('--goaway-after', type=float, default=None,
                         metavar='SECONDS',
                         help='Send GOAWAY this long after publishing; '
@@ -184,6 +187,8 @@ async def run(args):
             if args.token_cache > 0:
                 setup[SetupParamType.MAX_AUTH_TOKEN_CACHE_SIZE] = args.token_cache
             await session.client_session_init(parameters=setup)
+            if args.track_status:
+                session.track_status(args.namespace, args.trackname)
 
             if args.video:
                 # Profile drives object size, GOP and fps; -r is fps.
