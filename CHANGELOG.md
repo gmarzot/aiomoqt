@@ -69,7 +69,7 @@
   to it (§6.1).
 - Fix: `publish_namespace_done(namespace=...)` at d18 finds the announcement's request; it
   withdrew nothing without a request id.
-- `pub_bench`: `--withdraw-after SECONDS`.
+- `pub_bench`: `--withdraw-after SECONDS`, and `--second-track` to also PUBLISH `<trackname>-2`.
 - aiopquic floor `>=0.5.0a2`: a WebTransport close carries its code to the peer, and a
   refused or closed WebTransport session raises a `ConnectionError` like raw QUIC.
 - Fix: `pub_media --ts` stamps never run ahead of arrival; the PTS anchor follows the

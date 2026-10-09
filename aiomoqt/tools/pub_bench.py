@@ -102,6 +102,9 @@ The URL scheme selects the transport:
                         metavar='SECONDS',
                         help='Withdraw the announced namespace this long '
                              'after publishing')
+    parser.add_argument('--second-track', action='store_true',
+                        help='Also PUBLISH <trackname>-2, whose objects '
+                             'differ, with the --forward state')
     parser.add_argument('--goaway-after', type=float, default=None,
                         metavar='SECONDS',
                         help='Send GOAWAY this long after publishing; '
@@ -235,6 +238,18 @@ async def run(args):
                 forward=args.forward,
             )
             print(f"  Published '{track.fqtn}', waiting for subscriber...")
+            if args.second_track:
+                second = PublishedTrack(
+                    session,
+                    namespace=args.namespace,
+                    trackname=f"{args.trackname}-2",
+                    object_size=args.object_size + 16,
+                    group_size=args.group_size,
+                    num_subgroups=args.streams,
+                    rate=args.rate,
+                    auth_token=args.auth_token.encode() or None,
+                )
+                await second.publish(forward=args.forward)
             loop = asyncio.get_running_loop()
             if args.goaway_after is not None:
                 loop.call_later(args.goaway_after, session.goaway)
