@@ -49,6 +49,11 @@
   FETCH being served has its data stream reset. A FETCH accepts only a priority update.
 - Fix: `await_fetch_done()` called after a fetch stream ended reports how it ended; a reset
   stream read as clean.
+- Fix: a SUBSCRIBE for a track whose PUBLISH from us awaits its reply is refused with
+  DUPLICATE_SUBSCRIPTION (§5.1).
+- Fix: a REQUEST_UPDATE moving a SUBSCRIBE_NAMESPACE or SUBSCRIBE_TRACKS prefix onto another of its
+  type is refused with PREFIX_OVERLAP and ends that subscription (§10.9.1-2); an accepted move is
+  recorded. `ParamType.TRACK_NAMESPACE_PREFIX` (0x34).
 - aiopquic floor `>=0.5.0a2`: a WebTransport close carries its code to the peer, and a
   refused or closed WebTransport session raises a `ConnectionError` like raw QUIC.
 - Fix: `pub_media --ts` stamps never run ahead of arrival; the PTS anchor follows the

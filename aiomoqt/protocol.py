@@ -2951,6 +2951,7 @@ class _MOQTSessionMixin:
                                           SubscribeDoneCode.UPDATE_FAILED)
         else:
             sid = self._bidi_streams.get(existing)
+            self._notify_request_cancelled(existing, "a failed update")
             if sid is not None:
                 self.stream_fin(sid)
 
@@ -2961,6 +2962,9 @@ class _MOQTSessionMixin:
         (§10.18-19). Returns the handler that answers a refused request
         with REQUEST_ERROR, else None; records an admitted subscription
         until it ends."""
+        if (isinstance(msg, RequestUpdate)
+                and is_draft16_or_later(self.negotiated_draft)):
+            return self._refuse_prefix_update(msg)
         if (not is_draft16_or_later(self.negotiated_draft)
                 or not isinstance(msg, self._REQUEST_OPENERS)
                 or getattr(msg, 'request_id', None) is None):
@@ -2981,6 +2985,9 @@ class _MOQTSessionMixin:
             if (kind, key) in self._peer_requests.values():
                 code = RequestErrorCode.DUPLICATE_SUBSCRIPTION
                 reason = "track already subscribed in this session"
+            elif self._publish_pending(key):
+                code = RequestErrorCode.DUPLICATE_SUBSCRIPTION
+                reason = "our PUBLISH of the track awaits its reply"
         elif kind in (SubscribeNamespace, SubscribeTracks):
             key = ns
             for k, prefix in self._peer_requests.values():
@@ -2994,6 +3001,39 @@ class _MOQTSessionMixin:
                 self._peer_requests[rid] = (kind, key)
             return None
         return self._refusal(msg, rid, code, reason)
+
+    def _publish_pending(self, key) -> bool:
+        """True while our PUBLISH of this Full Track Name awaits its reply:
+        the subscription is Pending (publisher), §5.1."""
+        track = self._published_tracks.get(key)
+        if track is None:
+            return False
+        for rid, entry in self._requests.items():
+            fut = self._pending_requests.get(rid)
+            if entry.track is track and fut is not None and not fut.done():
+                return True
+        return False
+
+    def _refuse_prefix_update(self, msg: RequestUpdate) -> Optional[Callable]:
+        """§10.9.2: a REQUEST_UPDATE that moves a SUBSCRIBE_NAMESPACE or
+        SUBSCRIBE_TRACKS prefix onto another of its type is refused with
+        PREFIX_OVERLAP; an accepted one moves the recorded prefix."""
+        prefix = (msg.parameters or {}).get(ParamType.TRACK_NAMESPACE_PREFIX)
+        existing = msg.existing_request_id
+        held = self._peer_requests.get(existing)
+        if (prefix is None or held is None or msg.request_id is None
+                or held[0] not in (SubscribeNamespace, SubscribeTracks)):
+            return None
+        kind, prefix = held[0], tuple(prefix)
+        for rid, (k, other) in self._peer_requests.items():
+            if rid != existing and k is kind and (
+                    other[:len(prefix)] == prefix
+                    or prefix[:len(other)] == other):
+                return self._refusal(msg, int(msg.request_id),
+                                     RequestErrorCode.PREFIX_OVERLAP,
+                                     "prefix overlaps an active subscription")
+        self._peer_requests[existing] = (kind, prefix)
+        return None
 
     def _send_reply(self, request_id: int, msg: MOQTMessage,
                     fin: bool = False) -> None:

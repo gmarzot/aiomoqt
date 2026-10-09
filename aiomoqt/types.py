@@ -305,6 +305,7 @@ class ParamType(IntEnum):
     OBJECT_FILTER = 0x27
     DYNAMIC_GROUPS = 0x30
     NEW_GROUP_REQUEST = 0x32
+    TRACK_NAMESPACE_PREFIX = 0x34   # d18: REQUEST_UPDATE of a namespace subscription
     GREASE_1_PARAM = 0x55
     GREASE_2_PARAM = 0x8A
 
