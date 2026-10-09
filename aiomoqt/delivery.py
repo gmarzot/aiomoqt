@@ -9,11 +9,14 @@ ids.
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from .messages import SubgroupHeader
-from .messages.data import ObjectDatagram
+from .messages.data import (
+    FETCH_FLAGS_END_UNKNOWN, FetchObject, ObjectDatagram,
+)
 from .utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -32,6 +35,80 @@ class StreamMapping(Enum):
     PER_GROUP = "per_group"    # loc-02 §4.2: one uni stream per group
     PER_OBJECT = "per_object"  # msf-01 §6: one uni stream per object
     DATAGRAM = "datagram"      # loc-02 §4.1: one datagram per object
+
+
+# Bookkeeping charged per object on top of its payload, so a run of empty
+# objects is bounded too.
+_HISTORY_ENTRY_BYTES = 64
+
+
+class ObjectHistory:
+    """Recently published objects, for answering FETCH (§10.12).
+
+    Keyed by (group, object); the first record of a Location wins, since
+    a published object never changes (§2.1). Bounded by `max_bytes`, the
+    oldest dropped first.
+    """
+
+    def __init__(self, max_bytes: int):
+        self.max_bytes = max_bytes
+        self._objects: OrderedDict = OrderedDict()
+        self._bytes = 0
+        # Largest Location dropped: below it, status is unknown.
+        self.evicted_through: Optional[tuple] = None
+
+    def __len__(self) -> int:
+        return len(self._objects)
+
+    def add(self, group_id: int, object_id: int, payload: bytes, *,
+            subgroup_id: Optional[int] = 0, extensions: Any = None,
+            priority: int = 128) -> None:
+        """Record one object. `subgroup_id` None marks one sent as a
+        datagram; `extensions` may be a callable taking the session that
+        fetches it."""
+        key = (group_id, object_id)
+        if key in self._objects:
+            return
+        self._objects[key] = (subgroup_id, payload, extensions, priority)
+        self._bytes += len(payload) + _HISTORY_ENTRY_BYTES
+        while self._bytes > self.max_bytes and self._objects:
+            gone, old = self._objects.popitem(last=False)
+            self._bytes -= len(old[1]) + _HISTORY_ENTRY_BYTES
+            if self.evicted_through is None or gone > self.evicted_through:
+                self.evicted_through = gone
+
+    def fetch(self, start: tuple, end: tuple, session=None, *,
+              descending: bool = False) -> list:
+        """FetchObjects from `start` to `end`, both (group, object) and
+        inclusive. Groups ascend, or descend; objects ascend within a
+        group (§10.12.3). A part of the range already dropped is one End
+        of Unknown Range marker (§11.4.4.2), at the low end of the range."""
+        lost = None
+        if self.evicted_through is not None and start <= self.evicted_through:
+            lost = min(self.evicted_through, end)
+            start = max(start, (lost[0], lost[1] + 1))
+        keys = sorted(k for k in self._objects if start <= k <= end)
+        if descending:
+            keys.sort(key=lambda k: (-k[0], k[1]))
+        out = []
+        for group_id, object_id in keys:
+            subgroup_id, payload, exts, priority = self._objects[
+                (group_id, object_id)]
+            if callable(exts):
+                exts = exts(session)
+            out.append(FetchObject(
+                group_id=group_id, subgroup_id=subgroup_id or 0,
+                object_id=object_id, publisher_priority=priority,
+                extensions=exts or None, payload=payload,
+                datagram=subgroup_id is None))
+        if lost is not None:
+            marker = FetchObject(group_id=lost[0], object_id=lost[1],
+                                 end_of_range=FETCH_FLAGS_END_UNKNOWN)
+            if descending:
+                out.append(marker)
+            else:
+                out.insert(0, marker)
+        return out
 
 
 class SubgroupDelivery:
@@ -256,6 +333,9 @@ class FanoutDelivery:
                  queue_size: int = LANE_QUEUE_DEFAULT):
         self.queue_size = queue_size
         self.lanes: list = []
+        # Called as on_write(group_id, object_id, payload, extensions) for
+        # each object, once, however many lanes there are.
+        self.on_write: Optional[Callable] = None
         for delivery in deliveries:
             self.add(delivery, joining=False)
 
@@ -296,6 +376,8 @@ class FanoutDelivery:
     async def write(self, group_id: int, object_id: int, payload: bytes, *,
                     extensions: Optional[Dict[int, Any]] = None,
                     group_start: bool = False) -> None:
+        if self.on_write is not None:
+            self.on_write(group_id, object_id, payload, extensions)
         item = (group_id, object_id, payload, extensions, group_start)
         for lane in list(self.lanes):
             lane.offer(item)

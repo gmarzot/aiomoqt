@@ -27,6 +27,7 @@ def _stub(draft):
     s._peer_request_max = -1
     s._peer_request_seen = set()
     s._track_aliases = {}
+    s._published_tracks = {}
     s._subscriptions = {}
     s._request_cancel_handlers = {}
     s._publish_done_handlers = {}

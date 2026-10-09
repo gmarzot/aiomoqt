@@ -19,6 +19,7 @@ from importlib.metadata import version
 from .context import *
 from .messages import *
 from .messages.d18 import Setup
+from .messages.fetch import _is_joining
 from .types import *
 from .utils.buffer import Buffer, BufferReadError
 from .utils.logger import *
@@ -671,6 +672,28 @@ class _MOQTSessionMixin:
             track = self._published_tracks.get(
                 (tuple(msg.track_namespace), msg.track_name))
             return None if track is None else track._on_subscribe
+        if isinstance(msg, TrackStatus):
+            track = (self._published_tracks.get(
+                (tuple(msg.track_namespace), msg.track_name))
+                if is_draft16_or_later(self.negotiated_draft) else None)
+            return None if track is None else track._on_track_status
+        if isinstance(msg, Fetch):
+            if _is_joining(msg.fetch_type):
+                # §10.12.2: joins a subscription this session serves. One
+                # admitted in the same read is not bound yet; its handler
+                # task runs first, so the FETCH follows it to the track.
+                entry = self._requests.get(msg.joining_request_id)
+                peer = self._peer_requests.get(msg.joining_request_id)
+                if entry is not None and entry.sub is not None:
+                    track = entry.track
+                elif peer is not None and peer[0] is Subscribe:
+                    track = self._published_tracks.get(peer[1])
+                else:
+                    track = None
+            else:
+                track = self._published_tracks.get(
+                    (tuple(msg.namespace or ()), msg.track_name))
+            return None if track is None else track._on_fetch
         if isinstance(msg, PublishOk):
             rid, name = msg.request_id, '_on_publish_ok'
         elif isinstance(msg, RequestUpdate):
@@ -3524,6 +3547,42 @@ class _MOQTSessionMixin:
         fetch_response = await self._await_response(fetch_request_id)
         return (sub_response, fetch_response)
 
+    def joining_fetch(
+        self,
+        subscription_request_id: int,
+        joining_start: int = 0,
+        fetch_type: FetchType = FetchType.RELATIVE_JOINING,
+        subscriber_priority: Optional[int] = None,
+        group_order: Optional[GroupOrder] = None,
+        parameters: Optional[Dict[int, bytes]] = None,
+        wait_response: Optional[bool] = False,
+    ) -> Optional[MOQTMessage]:
+        """Joining FETCH (§10.12.2) against a subscription already made:
+        the objects up to its Joining Location, from `joining_start`
+        groups back (relative) or from that group (absolute)."""
+        if fetch_type not in (FetchType.RELATIVE_JOINING,
+                              FetchType.ABSOLUTE_JOINING):
+            raise ValueError(
+                f"joining_fetch() requires a joining fetch_type, "
+                f"got {fetch_type}")
+        request_id = self._allocate_request_id()
+        message = Fetch(
+            request_id=request_id,
+            fetch_type=fetch_type,
+            subscriber_priority=subscriber_priority,
+            group_order=group_order,
+            joining_request_id=subscription_request_id,
+            joining_start=joining_start,
+            parameters=dict(parameters or {}),
+        )
+        self._subscriptions[request_id] = [message]
+        self._fetch_done_futures[request_id] = self._loop.create_future()
+        logger.info(f"MOQT send: {message}")
+        self._send_request(request_id, message)
+        if not wait_response:
+            return message
+        return self._await_response(request_id)
+
     def fetch(
         self,
         namespace: Union[Tuple[bytes, ...], List[Union[bytes, str]], str],
@@ -4409,17 +4468,21 @@ class _MOQTSessionMixin:
         self._resolve_request(msg.request_id, msg)
 
     async def _handle_fetch(self, msg: Fetch) -> None:
-        """Default handler for incoming FETCH.
+        """Default handler for a FETCH no published track serves.
 
-        Rejects: a FETCH_OK obliges us to open the fetch data stream
-        (§10.13), and a session with no fetch semantics would leave the
-        peer waiting on objects that never come. Override via
-        register_handler(FETCH, ...) to serve one (see serve_fetch())."""
+        A joining FETCH names no subscription of ours
+        (INVALID_JOINING_REQUEST_ID, §10.12.2); a standalone one is
+        refused NOT_SUPPORTED. Override via register_handler(FETCH, ...)
+        to serve others (see serve_fetch())."""
         logger.info(f"MOQT event: handle {msg}")
-        self.fetch_error(
-            request_id=msg.request_id,
-            error_code=int(RequestErrorCode.NOT_SUPPORTED),
-            reason="fetch not supported")
+        if _is_joining(msg.fetch_type):
+            code, reason = (RequestErrorCode.INVALID_JOINING_REQUEST_ID,
+                            "no such subscription")
+        else:
+            code, reason = (RequestErrorCode.NOT_SUPPORTED,
+                            "fetch not supported")
+        self.fetch_error(request_id=msg.request_id, error_code=int(code),
+                         reason=reason)
 
     async def _handle_fetch_cancel(self, msg: FetchCancel) -> None:
         """Publisher-side: FETCH_CANCEL received for a fetch we are

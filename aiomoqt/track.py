@@ -30,18 +30,37 @@ from enum import IntEnum
 from typing import Callable, Dict, Optional
 
 from .types import (
-    MOQTRequestError, ParamType, FilterType,
-    ForwardingPreference, GroupOrder, LOC_TIMESTAMP,
+    FetchType, MOQTRequestError, ParamType, FilterType,
+    ForwardingPreference, GroupOrder, LOC_TIMESTAMP, RequestErrorCode,
     StreamResetCode, SubscribeDoneCode,
 )
-from .delivery import FanoutDelivery, StreamMapping, SubgroupDelivery
+from .delivery import (
+    FanoutDelivery, ObjectHistory, StreamMapping, SubgroupDelivery,
+)
 from .messages import (
     ObjectDatagram, PublishOk, RequestOk, RequestUpdate,
 )
+from .context import is_draft16_or_later
+from .messages.fetch import _is_joining
+from .utils.buffer import Buffer
 from .utils.format import fmt_bps, fmt_rate
 from .utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# Bytes of recent objects a PublishedTrack keeps to answer FETCH.
+FETCH_HISTORY_DEFAULT = 1 << 20
+
+
+def _largest_object_param(session, largest: tuple) -> dict:
+    """LARGEST_OBJECT for a reply: an inline Location at d18, a
+    length-prefixed pair of varints at d16."""
+    if ParamType.LARGEST_OBJECT in session._profile.location_params:
+        return {ParamType.LARGEST_OBJECT: largest}
+    buf = Buffer(capacity=16)
+    buf.push_uint_var(largest[0])
+    buf.push_uint_var(largest[1])
+    return {ParamType.LARGEST_OBJECT: buf.data_slice(0, buf.tell())}
 
 
 class TrackState(IntEnum):
@@ -110,13 +129,22 @@ _PACED_YIELD_EVERY = 32
 _DGRAM_HEADER_MARGIN = 48
 
 
+class _FetchRefused(Exception):
+    """A FETCH this track answers with REQUEST_ERROR."""
+
+    def __init__(self, code: int, reason: str):
+        super().__init__(reason)
+        self.code = code
+        self.reason = reason
+
+
 class _Subscription:
     """One peer's handshake state for a published track: its alias,
     request, Forward State, subscribers and what PUBLISH_DONE owes it."""
 
     __slots__ = ('session', 'track_alias', 'request_id',
                  'subscribe_request_id', 'subscribers', 'state', 'forward',
-                 'done', 'stream_count', 'generating', 'delivery')
+                 'done', 'stream_count', 'generating', 'delivery', 'joining')
 
     def __init__(self, session):
         self.session = session
@@ -136,6 +164,9 @@ class _Subscription:
         self.stream_count = 0
         self.generating = False
         self.delivery = None
+        # Request id -> Joining Location (§5.1): the Largest Location
+        # reported as its Forward State became 1, None if nothing existed.
+        self.joining: Dict[int, Optional[tuple]] = {}
 
     def __repr__(self):
         return (f"_Subscription(alias={self.track_alias}, "
@@ -180,7 +211,8 @@ class PublishedTrack(Track):
                  priority: int = 128,
                  auth_token: bytes = b"bench-token",
                  forwarding: ForwardingPreference =
-                     ForwardingPreference.SUBGROUP):
+                     ForwardingPreference.SUBGROUP,
+                 fetch_history_bytes: int = FETCH_HISTORY_DEFAULT):
         # Before super(): Track.__init__ assigns track_alias/request_id/
         # state, which are properties over this list.
         self._subs = [_Subscription(session)]
@@ -198,6 +230,9 @@ class PublishedTrack(Track):
         # the first object exists. Drives ContentExists/Largest Location
         # in SUBSCRIBE_OK. A property of the content, so track-level.
         self._largest = None
+        # Recent objects for FETCH; None refuses FETCH as NOT_SUPPORTED.
+        self._history = (ObjectHistory(fetch_history_bytes)
+                         if fetch_history_bytes > 0 else None)
         # Payload pattern built by generate(); set means production has
         # started, so a subscriber arriving after an idle period restarts
         # the producers instead of re-entering generate().
@@ -290,6 +325,7 @@ class PublishedTrack(Track):
         boundary."""
         if self._out is None:
             self._out = FanoutDelivery()
+            self._out.on_write = self._on_produced
         self._out.drop_session(sub.session)
         sub.delivery = SubgroupDelivery(sub.session, sub.track_alias,
                                         priority=self.priority,
@@ -397,6 +433,57 @@ class PublishedTrack(Track):
         is not guaranteed monotonic (§2.3.1)."""
         if self._largest is None or (group_id, object_id) > self._largest:
             self._largest = (group_id, object_id)
+
+    def _counted_pad(self) -> bytes:
+        """The default generator's byte pattern (0..255 repeating). With
+        the per-object f"{group}.{obj}|" prefix every byte of every object
+        is predictable — easy to spot duplicates, skips and corruption in
+        a decrypted pcap. The prefix says which object; the count, the
+        offset within it."""
+        return bytes(i & 0xFF for i in range(self.object_size))
+
+    def prefill(self, groups: int) -> None:
+        """Record `groups` groups of the default generator's objects as
+        already published — in the FETCH history and the Largest Location,
+        as for a track live for a while. Production continues from the
+        next group."""
+        if self._history is None:
+            raise ValueError("prefill() needs a FETCH history")
+        pad = self._counted_pad()
+        first = 0 if self._largest is None else self._largest[0] + 1
+        datagram = self.forwarding == ForwardingPreference.DATAGRAM
+        extensions = {LOC_TIMESTAMP: int(time.time() * 1_000_000)}
+        for group_id in range(first, first + groups):
+            for object_id in range(self.group_size):
+                payload = (f"{group_id}.{object_id}".encode() + b'|'
+                           + pad)[:self.object_size]
+                self._remember(
+                    group_id, object_id, payload,
+                    subgroup_id=(None if datagram
+                                 else object_id % self.num_subgroups),
+                    extensions=extensions)
+
+    def _remember(self, group_id: int, object_id: int, payload: bytes, *,
+                  subgroup_id: Optional[int] = 0, extensions=None) -> None:
+        """One object published: Largest Location and the FETCH history.
+        `subgroup_id` None marks a datagram."""
+        self._note_largest(group_id, object_id)
+        if self._history is not None:
+            self._history.add(group_id, object_id, payload,
+                              subgroup_id=subgroup_id, extensions=extensions,
+                              priority=self.priority)
+
+    def _on_produced(self, group_id: int, object_id: int, payload: bytes,
+                     extensions) -> None:
+        """FanoutDelivery.on_write: a produce() object, numbered once."""
+        if self.mapping is StreamMapping.DATAGRAM:
+            subgroup_id = None
+        elif self.mapping is StreamMapping.PER_OBJECT:
+            subgroup_id = object_id
+        else:
+            subgroup_id = 0
+        self._remember(group_id, object_id, payload,
+                       subgroup_id=subgroup_id, extensions=extensions)
 
     def attach(self, session=None) -> None:
         """Serve this track on a session without announcing it:
@@ -578,12 +665,17 @@ class PublishedTrack(Track):
         """REQUEST_UPDATE — subscriber changes forward state."""
         sub = self._sub_for(session)
         logger.info(f"Track: REQUEST_UPDATE: {msg}")
-        # §10.9: the receiver MUST answer with exactly one REQUEST_OK
-        # or REQUEST_ERROR.
-        session._send_reply(msg.request_id,
-                            RequestOk(request_id=msg.request_id))
         forward = (msg.parameters.get(ParamType.FORWARD)
                    if msg.parameters else None)
+        if forward and not sub.forward:
+            sub.joining[msg.existing_request_id] = self._largest
+        # §10.9: exactly one REQUEST_OK or REQUEST_ERROR; LARGEST_OBJECT
+        # once objects exist (§10.2.11).
+        params = ({} if self._largest is None
+                  else _largest_object_param(session, self._largest))
+        session._send_reply(msg.request_id,
+                            RequestOk(request_id=msg.request_id,
+                                      parameters=params))
         self._set_forward(sub, forward)
         if forward:
             await self._start_generating(session, "REQUEST_UPDATE")
@@ -602,10 +694,11 @@ class PublishedTrack(Track):
         # Report real content state: a subscriber that sees
         # ContentExists=0 rightly skips its joining FETCH (mlmsub does).
         kw = {}
-        if self._largest is not None:
+        reported = self._largest
+        if reported is not None:
             kw = dict(content_exists=1,
-                      largest_group_id=self._largest[0],
-                      largest_object_id=self._largest[1])
+                      largest_group_id=reported[0],
+                      largest_object_id=reported[1])
         ok = session.subscribe_ok(request_msg=msg, **kw)
         if sub.done:
             session.subscribe_done(msg.request_id,
@@ -624,7 +717,81 @@ class PublishedTrack(Track):
             lambda rid, s=sub: self._on_request_cancelled(rid, s))
         self._set_forward(sub, getattr(msg, 'forward', None))
         if sub.forward:
+            sub.joining[msg.request_id] = reported
             await self._start_generating(session, "SUBSCRIBE")
+
+    async def _on_track_status(self, session, msg) -> None:
+        """TRACK_STATUS (§10.14): the SUBSCRIBE_OK this track would send,
+        as a REQUEST_OK that ends the request."""
+        params = ({} if self._largest is None
+                  else _largest_object_param(session, self._largest))
+        session._send_reply(msg.request_id,
+                            RequestOk(request_id=msg.request_id,
+                                      parameters=params), fin=True)
+
+    def _fetch_range(self, session, msg):
+        """Resolve a FETCH to (start, last, end): the first and last
+        Locations served, inclusive, and the End Location FETCH_OK
+        reports. Raises _FetchRefused."""
+        largest = self._largest
+        if _is_joining(msg.fetch_type):
+            # §10.12.2: Forward State 1, against the Joining Location.
+            sub = self._sub_for(session)
+            anchor = sub.joining.get(msg.joining_request_id)
+            if not sub.forward or anchor is None:
+                raise _FetchRefused(
+                    RequestErrorCode.INVALID_RANGE,
+                    "subscription has no Joining Location")
+            if msg.fetch_type == FetchType.RELATIVE_JOINING:
+                start = (max(0, anchor[0] - (msg.joining_start or 0)), 0)
+            else:
+                start = (msg.joining_start or 0, 0)
+            return start, anchor, (anchor[0], anchor[1] + 1)
+        start = (msg.start_group or 0, msg.start_object or 0)
+        if largest is None or start > largest:
+            raise _FetchRefused(RequestErrorCode.INVALID_RANGE,
+                                "no object at or after the start")
+        end = (msg.end_group or 0, msg.end_object or 0)
+        # End Location is the last object plus one; object 0 = whole group.
+        last = (end[0], 1 << 62) if end[1] == 0 else (end[0], end[1] - 1)
+        if last < start:
+            raise _FetchRefused(RequestErrorCode.INVALID_RANGE,
+                                "end before start")
+        if last >= largest:
+            last, end = largest, (largest[0], largest[1] + 1)
+        return start, last, end
+
+    async def _on_fetch(self, session, msg) -> None:
+        """FETCH (§10.12) answered from the object history."""
+        rid = msg.request_id
+        try:
+            if self._history is None:
+                raise _FetchRefused(RequestErrorCode.NOT_SUPPORTED,
+                                    "track keeps no object history")
+            start, last, end = self._fetch_range(session, msg)
+            if start > last:
+                raise _FetchRefused(RequestErrorCode.INVALID_RANGE,
+                                    "start after the joining location")
+        except _FetchRefused as e:
+            logger.info(f"Track: FETCH {rid} refused: {e.reason}")
+            session.fetch_error(request_id=rid, error_code=int(e.code),
+                                reason=e.reason)
+            return
+        order = (GroupOrder.DESCENDING
+                 if msg.group_order == GroupOrder.DESCENDING
+                 else GroupOrder.ASCENDING)
+        objects = self._history.fetch(
+            start, last, session,
+            descending=order == GroupOrder.DESCENDING)
+        if not is_draft16_or_later(session.negotiated_draft):
+            objects = [o for o in objects if o.end_of_range is None]
+        ended = self._done and last == self._largest
+        session.fetch_ok(request_id=rid, end_of_track=int(ended),
+                         largest_group_id=end[0], largest_object_id=end[1],
+                         group_order=int(order))
+        await session.serve_fetch(rid, objects, group_order=int(order))
+        logger.info(f"Track: FETCH {rid} served {len(objects)} object(s) "
+                    f"{start}..{last}")
 
     def _on_request_cancelled(self, request_id: int, sub=None) -> None:
         """A subscriber left (§3.3.2 request-stream termination, or an
@@ -728,14 +895,7 @@ class PublishedTrack(Track):
             await asyncio.shield(self._ensure_production())
             return
 
-        # Counted byte pattern (0..255 repeating). Pre-allocated once
-        # per generate() call. Combined with the per-object f"{group}.
-        # {obj}|" prefix in payload, every byte at every offset of every
-        # object has a deterministic, predictable value — visible in
-        # decrypted pcap and easy to spot duplicates / skips / random
-        # corruption. The prefix identifies WHICH object the bytes came
-        # from; the counted suffix shows offset-within-object.
-        pad = bytes(i & 0xFF for i in range(self.object_size))
+        pad = self._counted_pad()
 
         if self.forwarding == ForwardingPreference.DATAGRAM:
             self._check_datagram_fit()
@@ -754,11 +914,14 @@ class PublishedTrack(Track):
                          pad: bytes) -> None:
         """Start one producer task per subgroup, or a single task for
         datagram delivery. Re-callable: a subscriber arriving after an
-        idle period restarts production on the same track."""
+        idle period restarts production on the same track, numbering on
+        from the Largest group so no Location is published twice."""
+        first_group = 0 if self._largest is None else self._largest[0] + 1
         if self.forwarding == ForwardingPreference.DATAGRAM:
             task = asyncio.create_task(
                 self._generate_datagrams(
-                    session=session, track_alias=track_alias, pad=pad))
+                    session=session, track_alias=track_alias, pad=pad,
+                    first_group=first_group))
             task.add_done_callback(lambda t: self._tasks.discard(t))
             self._tasks.add(task)
             return
@@ -775,13 +938,14 @@ class PublishedTrack(Track):
                     track_alias=track_alias,
                     priority=priority,
                     pad=pad,
+                    first_group=first_group,
                 )
             )
             task.add_done_callback(lambda t: self._tasks.discard(t))
             self._tasks.add(task)
 
     async def _generate_datagrams(self, session, track_alias: int,
-                                  pad: bytes,
+                                  pad: bytes, first_group: int = 0,
                                   report_interval: float = 5.0):
         """Generate the track as OBJECT_DATAGRAMs — one datagram per
         object, paced exactly like the subgroup path. Transport
@@ -791,7 +955,7 @@ class PublishedTrack(Track):
         start_time = time.monotonic()
         last_report = start_time
         next_frame_time = time.monotonic()
-        group_id = -1
+        group_id = first_group - 1
         cur_obj_id = self.group_size  # force group roll on first object
         prof = session._profile
         report = not getattr(self, '_quiet', False)
@@ -816,7 +980,8 @@ class PublishedTrack(Track):
                 )
                 buf = obj.serialize(prof=prof)
                 obj_bytes = buf.tell()
-                self._note_largest(group_id, cur_obj_id)
+                self._remember(group_id, cur_obj_id, payload,
+                               subgroup_id=None, extensions=obj.extensions)
                 cur_obj_id += 1
 
                 if session._close_err is not None:
@@ -878,13 +1043,13 @@ class PublishedTrack(Track):
 
     async def _generate_subgroup(self, session, subgroup_id: int,
                                   track_alias: int, priority: int,
-                                  pad: bytes,
+                                  pad: bytes, first_group: int = 0,
                                   report_interval: float = 5.0):
         """Generate a single subgroup stream."""
         start_time = time.monotonic()
         last_report = start_time
         next_frame_time = time.monotonic()
-        group_id = -1
+        group_id = first_group - 1
         header = None
 
         # Only subgroup 0 prints stats (unless _quiet is set)
@@ -945,7 +1110,8 @@ class PublishedTrack(Track):
                                                 extensions=extensions,
                                                 object_id=cur_obj_id)
                 obj_bytes = len(data)
-                self._note_largest(group_id, cur_obj_id)
+                self._remember(group_id, cur_obj_id, payload,
+                               subgroup_id=subgroup_id, extensions=extensions)
                 cur_obj_id += self.num_subgroups
 
                 if session._close_err is not None:
@@ -1367,13 +1533,13 @@ class VideoTrack(PublishedTrack):
 
     async def _generate_subgroup(self, session, subgroup_id: int,
                                   track_alias: int, priority: int,
-                                  pad: bytes,
+                                  pad: bytes, first_group: int = 0,
                                   report_interval: float = 5.0):
         """Generate video frames with variable I/B/P sizes."""
         start_time = time.monotonic()
         last_report = start_time
         next_frame_time = time.monotonic()
-        group_id = -1
+        group_id = first_group - 1
         header = None
 
         report = (subgroup_id == 0
@@ -1446,7 +1612,8 @@ class VideoTrack(PublishedTrack):
                     extensions=extensions,
                     object_id=cur_obj_id)
                 obj_bytes = len(data)
-                self._note_largest(group_id, cur_obj_id)
+                self._remember(group_id, cur_obj_id, payload,
+                               subgroup_id=subgroup_id, extensions=extensions)
                 cur_obj_id += self.num_subgroups
 
                 if session._close_err is not None:
