@@ -76,7 +76,8 @@ case "$scenario_id" in
     receive-subscribe-before-outstanding-publish-response|\
     publish-with-multiple-message-parameter-types|\
     publish-with-multiple-configured-parameters|\
-    publish-existing-track-after-observed-object-publication)
+    publish-existing-track-after-observed-object-publication|\
+    receive-request-update-ok-with-track-properties)
         flow=() ;;
 esac
 
@@ -124,6 +125,11 @@ case "$scenario_id" in
     publisher-queries-track-status-before-resuming-publication|\
     publisher-recovery-track-status-*)
         control=(--track-status) ;;
+    publisher-ends-subscription-with-no-data-streams|\
+    finish-subscription-with-open-object-streams)
+        control=(--end-after 1) ;;
+    receive-request-update-ok-with-track-properties)
+        control=(--publish-update) ;;
 esac
 
 # A 64-byte token cache holds the runner's 20-byte alias entries and stays
