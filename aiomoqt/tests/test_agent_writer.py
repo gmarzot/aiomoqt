@@ -166,6 +166,20 @@ async def test_block_waits_for_room():
     assert wtr.stats.dropped == 0
 
 
+async def test_block_is_the_default_policy():
+    spec = _pub(buffer=1)
+    assert spec.on_full == "block"
+    wtr, track = _writer(spec)
+    await wtr.write(b"a")
+    pending = asyncio.ensure_future(wtr.write(b"b"))
+    await asyncio.sleep(0)
+    assert not pending.done()
+    out = _RecordingOut()
+    await _drain(track, out, 2)
+    await asyncio.wait_for(pending, 1.0)
+    assert wtr.stats.dropped == 0
+
+
 async def test_flush_returns_once_produce_has_taken_everything():
     wtr, track = _writer()
     await wtr.write(b"a")
