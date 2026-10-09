@@ -18,9 +18,7 @@ _PORT = 14850
 @requires_certs
 @pytest.mark.parametrize("use_quic, port", [
     pytest.param(True, _PORT, id="quic"),
-    pytest.param(False, _PORT + 1, id="wt", marks=pytest.mark.xfail(
-        strict=True, reason="aiopquic reports a CLOSE_WEBTRANSPORT_SESSION "
-                            "capsule that arrives with its FIN as code 0")),
+    pytest.param(False, _PORT + 1, id="wt"),
 ])
 async def test_violation_close_reaches_the_peer_with_its_code(use_quic, port):
     server = await MOQTServer(

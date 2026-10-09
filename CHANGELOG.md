@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- aiopquic floor `>=0.5.0a2`: a WebTransport close carries its code to the peer, and a
+  refused or closed WebTransport session raises a `ConnectionError` like raw QUIC.
 - Fix: `pub_media --ts` stamps never run ahead of arrival; the PTS anchor follows the
   least-delayed unit, so a late first unit or a fast source clock no longer reads as negative
   latency.
