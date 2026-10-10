@@ -97,7 +97,8 @@ class TestPublishedTrack:
             await t.publish()
             session.publish_namespace.assert_not_called()
             session.publish.assert_called_once_with(
-                namespace="bench", track_name="track", forward=0)
+                namespace="bench", track_name="track", forward=0,
+                largest=None)
             assert t.state == TrackState.PUBLISHED
         asyncio.run(_test())
 

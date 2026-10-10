@@ -2,6 +2,77 @@
 
 ## Unreleased
 
+- A session's `auth_token_validator(token, msg)` refuses a d16+ peer request with the
+  REQUEST_ERROR code it returns (§10.2.2); a refused REGISTER stays registered.
+- USE_VALUE tokens decode to `AuthToken`, bytes carrying its Token Type, and an `AuthToken`
+  is sent with its type; plain bytes are still sent as OUT_OF_BAND.
+- `pub_bench`: `--token-cache BYTES` advertises MAX_AUTH_TOKEN_CACHE_SIZE, and
+  `--token-reject TYPE:HEX:CODE` refuses requests carrying that token.
+- CI: the adaptive-mp suites run 20 s and name their failure.
+- `PublishedTrack` answers FETCH from a bounded object history (`fetch_history_bytes`,
+  default 1 MiB; 0 refuses FETCH as NOT_SUPPORTED): standalone by name, joining against the
+  peer's subscription, objects already dropped reported as an End of Unknown Range (§10.12).
+- A FETCH on a track with no objects, starting past the Largest Object, or joining a
+  subscription with Forward State 0 is refused with INVALID_RANGE (§10.12.2-3).
+- `PublishedTrack.prefill(groups)` records groups as already published, for FETCH before any
+  subscriber.
+- Fix: production numbers groups on from the Largest group, also after an idle restart; it
+  restarted at group 0, publishing a Location twice.
+- Fix: a `produce()` track's SUBSCRIBE_OK reports its Largest Location; it reported none.
+- Fix: REQUEST_OK to a REQUEST_UPDATE carries LARGEST_OBJECT once objects exist, and a
+  `PublishedTrack` answers TRACK_STATUS with it (§10.2.11); TRACK_STATUS was NOT_SUPPORTED.
+- Fix: a joining FETCH naming no subscription is refused with INVALID_JOINING_REQUEST_ID
+  (it was NOT_SUPPORTED); one sent with its SUBSCRIBE is served (§10.12.2).
+- Fix: an unknown FETCH type closes the session with PROTOCOL_VIOLATION (§10.12).
+- `FetchObject.datagram`: the d16+ Datagram flag (0x40) is encoded and decoded.
+- `session.joining_fetch(subscription_request_id, ...)` sends a joining FETCH for an
+  existing subscription.
+- `pub_bench`: `--prefill GROUPS` and `--no-objects`.
+- Fix: a FETCH cancelled while its objects are being sent resets its data stream (§5.2).
+- Fix: TRACK_STATUS at d16+ carries no delivery parameters (priority, group order, forward,
+  filter), which §10.14 leaves out; one received from a peer still decodes.
+- Fix: a d18 REQUEST_OK's Track Properties are read: a TRACK_STATUS_OK carrying them closed
+  the session, and on any other reply they now close it with PROTOCOL_VIOLATION (§10.5).
+- Fix: d18 Track Properties are checked in SUBSCRIBE_OK, PUBLISH, FETCH_OK and TRACK_STATUS_OK:
+  DEFAULT_PUBLISHER_GROUP_ORDER 1-2 and DYNAMIC_GROUPS 0-1, also inside Immutable Properties,
+  which must parse (§12.5-12.7).
+- Fix: PUBLISH carries LARGEST_OBJECT once the track has objects (§10.2.11), and that Location
+  is the subscription's Joining Location; `session.publish(largest=...)` sets it.
+- Fix: a `PublishedTrack` sends only the objects a subscription's filter admits (§5.1.2): none
+  before its start or past an AbsoluteRange's End Group, a group admitted part-way opens its
+  stream without FIRST_OBJECT, and the range ends with PUBLISH_DONE SUBSCRIPTION_ENDED once its
+  streams have closed. A REQUEST_UPDATE filter replaces the window.
+- Fix: a SUBSCRIBE whose AbsoluteRange End Group is already published is refused with
+  INVALID_RANGE.
+- Fix: a `PublishedTrack` stops sending to a subscription whose Forward State drops to 0 (§5.1),
+  and resets a subgroup stream it cuts short — on a pause or a filter update past it — instead
+  of finishing it (§11.4.3).
+- Fix: a failed REQUEST_UPDATE ends what it updated (§10.9.1): a track's subscription gets
+  REQUEST_ERROR then PUBLISH_DONE UPDATE_FAILED (the REQUEST_ERROR used to FIN the stream), a
+  FETCH being served has its data stream reset. A FETCH accepts only a priority update.
+- Fix: `await_fetch_done()` called after a fetch stream ended reports how it ended; a reset
+  stream read as clean.
+- Fix: a SUBSCRIBE for a track whose PUBLISH from us awaits its reply is refused with
+  DUPLICATE_SUBSCRIPTION (§5.1).
+- Fix: a REQUEST_UPDATE moving a SUBSCRIBE_NAMESPACE or SUBSCRIBE_TRACKS prefix onto another of its
+  type is refused with PREFIX_OVERLAP and ends that subscription (§10.9.1-2); an accepted move is
+  recorded. `ParamType.TRACK_NAMESPACE_PREFIX` (0x34).
+- Fix: d18 TRACK_NAMESPACE_PREFIX carries its Track Namespace as a length-prefixed value, as
+  moxygen does; it was sent and read inline, so neither side could parse the other's.
+- Fix: a d18 request carrying a Message Parameter its type does not allow closes the session
+  with PROTOCOL_VIOLATION (§10.2.1); replies are not checked.
+- Fix: after we send a d18 GOAWAY, every new peer request is refused with GOING_AWAY (§10.4).
+- `PublishedTrack(auth_token=None)` announces without an AUTH_TOKEN.
+- `pub_bench`: `--goaway-after SECONDS`, and `--auth-token` for the PUBLISH_NAMESPACE token (empty
+  sends none), `--track-status` to ask for the track's status before publishing,
+  `--publish-update` and `--end-after SECONDS`.
+- `PublishedTrack.end()`: each subscription's streams close, then PUBLISH_DONE TRACK_ENDED.
+- A d18 session answers SUBSCRIBE_NAMESPACE with NAMESPACE for each namespace it announces or
+  serves tracks under the prefix, and reports later announcements and withdrawals (NAMESPACE_DONE)
+  to it (§6.1).
+- Fix: `publish_namespace_done(namespace=...)` at d18 finds the announcement's request; it
+  withdrew nothing without a request id.
+- `pub_bench`: `--withdraw-after SECONDS`, and `--second-track` to also PUBLISH `<trackname>-2`.
 - aiopquic floor `>=0.5.0a2`: a WebTransport close carries its code to the peer, and a
   refused or closed WebTransport session raises a `ConnectionError` like raw QUIC.
 - Fix: `pub_media --ts` stamps never run ahead of arrival; the PTS anchor follows the

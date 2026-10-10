@@ -371,6 +371,53 @@ def test_d18_fetch_first_object_sg_prior_rejected():
         FetchObject.deserialize(rb, prior=None, prof=prof)
 
 
+def test_d18_fetch_datagram_object_flag():
+    # §11.4.4.1: a Datagram object sets 0x40 and has no Subgroup ID; the
+    # next object's Subgroup counts on from 0.
+    objs = [
+        FetchObject(group_id=7, object_id=9, publisher_priority=128,
+                    payload=b"d", datagram=True),
+        FetchObject(group_id=7, subgroup_id=1, object_id=10,
+                    publisher_priority=128, payload=b"s"),
+    ]
+    chain = _fetch_chain_roundtrip(objs)
+    # DGRAM|PRI|GD|OD = 0x5C, group, object, priority, payload.
+    assert chain[0][0] == bytes.fromhex("5c0709800164")
+    # Subgroup prior + 1 (0x02); object and priority inherited.
+    assert chain[1][0] == bytes.fromhex("020173")
+    assert chain[0][1].datagram and not chain[1][1].datagram
+    assert chain[1][1].subgroup_id == 1
+
+
+def test_d18_fetch_datagram_flag_ignores_subgroup_bits():
+    # 0x40 with Subgroup bits 0b11: the bits are ignored, no field is read.
+    rb = Buffer(data=bytes.fromhex("5f0709800164"), vi64=True)
+    got = FetchObject.deserialize(rb, prof=profile_for(18))
+    assert got.datagram and got.subgroup_id == 0
+    assert (got.group_id, got.object_id, got.payload) == (7, 9, b"d")
+
+
+def test_d16_fetch_datagram_object_flag():
+    prof = profile_for(16)
+    raw = bytes(FetchObject(group_id=7, object_id=9, publisher_priority=128,
+                            payload=b"d", datagram=True)
+                .serialize(prof=prof).data)
+    # Flags 0x5C as a 2-byte RFC 9000 varint; no Subgroup ID field.
+    assert raw == bytes.fromhex("405c0709800164")
+    got = FetchObject.deserialize(Buffer(data=raw), prof=prof)
+    assert got.datagram and (got.group_id, got.object_id) == (7, 9)
+
+
+def test_d18_fetch_unknown_type_is_a_protocol_violation():
+    # §10.12: Request ID 1, Fetch Type 0, no parameters.
+    from aiomoqt.messages.fetch import Fetch
+    from aiomoqt.types import MOQTProtocolViolation
+    body = bytes([0x01, 0x00, 0x00])
+    with pytest.raises(MOQTProtocolViolation):
+        Fetch.deserialize(Buffer(data=body, vi64=True), prof=profile_for(18),
+                          buf_end=len(body))
+
+
 # -- d18 SUBSCRIPTION_FILTER internals (§5.1.2) -----------------------
 #
 # Filter values follow the negotiated varint codec (vi64 on d18 —
@@ -658,12 +705,79 @@ def test_d18_redirect_full_track_name_is_at_most_4096_bytes():
                                  buf_end=len(body))
 
 
-def test_d18_namespace_parameter_field_past_the_frame_is_refused():
-    # One TRACK_NAMESPACE_PREFIX (0x34) parameter whose field claims
-    # 5 bytes where the frame holds 2.
+def test_d18_namespace_parameter_field_past_its_value_is_refused():
+    # One TRACK_NAMESPACE_PREFIX (0x34) parameter, length 4, whose field
+    # claims 5 bytes where the value holds 2.
     prof = profile_for(18)
-    block = b"\x01" + ref_vi64(0x34) + b"\x01\x05ab"
+    block = b"\x01" + ref_vi64(0x34) + b"\x04\x01\x05ab"
     with pytest.raises(MOQTProtocolViolation, match="overruns frame"):
         MOQTMessage._deserialize_params(
             Buffer(data=block + b"xyz", vi64=True), prof=prof,
             buf_end=len(block))
+
+
+def test_d18_namespace_parameter_is_length_prefixed():
+    # §10.2.14 / §10.2: the Track Namespace rides a length prefix (moxygen
+    # and mondain's runner agree): length 6, 2 fields "a" and "bc".
+    prof = profile_for(18)
+    block = b"\x01" + ref_vi64(0x34) + b"\x06\x02\x01a\x02bc"
+    buf = Buffer(capacity=64, vi64=True)
+    MOQTMessage._serialize_params(buf, {0x34: (b"a", b"bc")}, prof=prof)
+    assert bytes(buf.data_slice(0, buf.tell())) == block
+    got = MOQTMessage._deserialize_params(
+        Buffer(data=block, vi64=True), prof=prof, buf_end=len(block))
+    assert got == {0x34: (b"a", b"bc")}
+
+
+def test_d18_namespace_parameter_short_of_its_length_is_refused():
+    prof = profile_for(18)
+    block = b"\x01" + ref_vi64(0x34) + b"\x07\x02\x01a\x02bcz"
+    with pytest.raises(MOQTProtocolViolation, match="fill its length"):
+        MOQTMessage._deserialize_params(
+            Buffer(data=block, vi64=True), prof=prof, buf_end=len(block))
+
+
+@pytest.mark.parametrize("draft", [16, 18])
+def test_track_status_carries_no_delivery_parameters(draft):
+    # §10.14: priority, group order, forward and filter are not included.
+    from aiomoqt.messages.subscribe import TrackStatus
+    msg = TrackStatus(request_id=1, track_namespace=(b"n",), track_name=b"t",
+                      priority=128, group_order=1, forward=1, filter_type=2)
+    raw = bytes(msg.serialize(prof=profile_for(draft)).data)
+    # Type 0x0D, Length 7, Request ID, namespace "n", name "t", no params.
+    assert raw == bytes.fromhex("0d0007" "01" "01016e" "0174" "00")
+
+
+def _params_body(params) -> bytes:
+    buf = Buffer(capacity=64, vi64=True)
+    MOQTMessage._serialize_params(buf, params, prof=profile_for(18))
+    return bytes(buf.data_slice(0, buf.tell()))
+
+
+@pytest.mark.parametrize("scope, params", [
+    ("Subscribe", {0x08: 5}),              # EXPIRES
+    ("TrackStatus", {0x20: 7}),            # SUBSCRIBER_PRIORITY
+    ("Fetch", {0x10: 1}),                  # FORWARD
+    ("SubscribeNamespace", {0x10: 1}),
+    ("RequestUpdate", {0x09: (1, 2)}),     # LARGEST_OBJECT
+], ids=["subscribe-expires", "track-status-priority", "fetch-forward",
+        "subscribe-namespace-forward", "update-largest"])
+def test_d18_a_parameter_outside_its_requests_is_refused(scope, params):
+    # §10.2.1: a Message Parameter on a message it is not defined for.
+    body = _params_body(params)
+    with pytest.raises(MOQTProtocolViolation, match="not allowed"):
+        MOQTMessage._deserialize_params(
+            Buffer(data=body, vi64=True), prof=profile_for(18),
+            buf_end=len(body), scope=scope)
+
+
+def test_d18_parameters_in_scope_pass_and_d16_is_not_checked():
+    body = _params_body({0x03: b"t", 0x10: 1, 0x20: 7, 0x21: b"\x02"})
+    MOQTMessage._deserialize_params(Buffer(data=body, vi64=True),
+                                    prof=profile_for(18), buf_end=len(body),
+                                    scope="Subscribe")
+    d16 = Buffer(capacity=64)
+    MOQTMessage._serialize_params(d16, {0x08: 5}, prof=profile_for(16))
+    raw = bytes(d16.data_slice(0, d16.tell()))
+    MOQTMessage._deserialize_params(Buffer(data=raw), prof=profile_for(16),
+                                    buf_end=len(raw), scope="Subscribe")

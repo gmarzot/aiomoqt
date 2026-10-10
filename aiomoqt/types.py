@@ -305,6 +305,7 @@ class ParamType(IntEnum):
     OBJECT_FILTER = 0x27
     DYNAMIC_GROUPS = 0x30
     NEW_GROUP_REQUEST = 0x32
+    TRACK_NAMESPACE_PREFIX = 0x34   # d18: REQUEST_UPDATE of a namespace subscription
     GREASE_1_PARAM = 0x55
     GREASE_2_PARAM = 0x8A
 
@@ -433,7 +434,24 @@ D18_PARAM_KINDS: Dict[int, str] = {
     0x21: "bytes",     # SUBSCRIPTION_FILTER
     0x22: "uint8",     # GROUP_ORDER
     0x32: "varint",    # NEW_GROUP_REQUEST
-    0x34: "tuple",     # TRACK_NAMESPACE_PREFIX (Track Namespace)
+    0x34: "tuple",     # TRACK_NAMESPACE_PREFIX: length-prefixed Track Namespace
+}
+
+# d18 §10.2.x: the requests each Message Parameter may appear in, keyed by
+# message class (§10.2.1). Replies are not checked: moq-dev's SUBSCRIBE_OK
+# carries GROUP_ORDER, and what REQUEST_OK may carry depends on the
+# request it answers.
+D18_PARAM_SCOPE: Dict[str, frozenset] = {
+    "Subscribe": frozenset({0x02, 0x03, 0x04, 0x06, 0x10, 0x20, 0x21, 0x22,
+                            0x32}),
+    "Publish": frozenset({0x03, 0x08, 0x09, 0x10}),
+    "Fetch": frozenset({0x03, 0x0A, 0x20, 0x22}),
+    "TrackStatus": frozenset({0x03}),
+    "PublishNamespace": frozenset({0x03}),
+    "SubscribeNamespace": frozenset({0x03}),
+    "SubscribeTracks": frozenset({0x03, 0x10}),
+    "RequestUpdate": frozenset({0x02, 0x03, 0x06, 0x10, 0x20, 0x21, 0x32,
+                                0x34}),
 }
 
 

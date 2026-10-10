@@ -26,6 +26,10 @@ def _stub(draft):
     s._profile = profile_for(draft)
     s._bidi_streams = {5: 40}
     s._sent_requests = deque(maxlen=8)
+    s._track_status_requests = set()
+    s._announced = {}
+    s._discovery_subs = {}
+    s._published_tracks = {}
     s._pending_requests = {}
     s._track_aliases = {}
     s._tx_updates = {}

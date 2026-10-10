@@ -6,16 +6,44 @@
   moq-pub-bench moqt://relay:4433 -D -s 1100 -r 500      # datagrams
   moq-pub-bench moqt://relay:4433 --video 1080p          # media profile
 """
+import argparse
 import asyncio
+import functools
 import logging
 
 from aiomoqt.client import MOQTClient
-from aiomoqt.types import ForwardingPreference
+from aiomoqt.types import ForwardingPreference, SetupParamType
 from aiomoqt.track import PublishedTrack, VideoTrack
 from aiomoqt.utils import wait_cond_timeout
 from aiomoqt.utils import cli as _cli
 from aiomoqt.utils.logger import set_log_level
 from aiomoqt.utils.url import parse_relay_url
+
+
+def _token_rule(value: str):
+    """TYPE:HEX:CODE -> ((type, value bytes), code)."""
+    try:
+        token_type, hex_value, code = value.split(':')
+        return (int(token_type, 0), bytes.fromhex(hex_value)), int(code, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{value!r}: expected TYPE:HEX:CODE, e.g. 0:6465:0x1") from None
+
+
+def _token_validator(rules):
+    """A session auth_token_validator refusing the listed tokens."""
+    verdicts = dict(rules)
+
+    def _validate(token, _msg):
+        return verdicts.get((token.token_type, bytes(token)))
+    return _validate
+
+
+class _EmptyTrack(PublishedTrack):
+    """Accepts subscriptions and never publishes an object."""
+
+    async def produce(self, out) -> None:
+        await asyncio.Event().wait()
 
 
 def parse_args():
@@ -47,6 +75,48 @@ The URL scheme selects the transport:
                              'spec-conservative. NOT supported by the '
                              'spec: relays reject the unsolicited uni '
                              'streams. Retained for wire experiments.')
+    parser.add_argument('--token-cache', type=int, default=0,
+                        metavar='BYTES',
+                        help='MAX_AUTH_TOKEN_CACHE_SIZE to advertise in '
+                             'SETUP, so the peer may register token '
+                             'aliases (default 0: none)')
+    parser.add_argument('--token-reject', type=_token_rule, action='append',
+                        default=[], metavar='TYPE:HEX:CODE',
+                        help='Refuse a request carrying this token (Token '
+                             'Type, hex Value) with REQUEST_ERROR CODE; '
+                             'repeatable')
+    parser.add_argument('--auth-token', type=str, default='bench-token',
+                        help='AUTH_TOKEN sent on PUBLISH_NAMESPACE; empty '
+                             'sends none (default %(default)s)')
+    parser.add_argument('--track-status', action='store_true',
+                        help='Ask the peer for the track\'s status '
+                             '(TRACK_STATUS) before publishing')
+    parser.add_argument('--publish-update', action='store_true',
+                        help='Send one parameter-free REQUEST_UPDATE for '
+                             'the PUBLISH, half a second after it')
+    parser.add_argument('--end-after', type=float, default=None,
+                        metavar='SECONDS',
+                        help='End the track this long after publishing: '
+                             'PUBLISH_DONE once its streams have closed')
+    parser.add_argument('--withdraw-after', type=float, default=None,
+                        metavar='SECONDS',
+                        help='Withdraw the announced namespace this long '
+                             'after publishing')
+    parser.add_argument('--second-track', action='store_true',
+                        help='Also PUBLISH <trackname>-2, whose objects '
+                             'differ, with the --forward state')
+    parser.add_argument('--goaway-after', type=float, default=None,
+                        metavar='SECONDS',
+                        help='Send GOAWAY this long after publishing; '
+                             'later requests are refused GOING_AWAY')
+    content = parser.add_mutually_exclusive_group()
+    content.add_argument('--prefill', type=int, default=0, metavar='GROUPS',
+                         help='Hold GROUPS groups as already published, '
+                              'ready for FETCH before any subscriber; '
+                              'live objects follow them')
+    content.add_argument('--no-objects', action='store_true',
+                         help='Serve subscriptions but publish no '
+                              'objects: a track with nothing published')
     _cli.add_help(parser)
     args = parser.parse_args()
     if args.video and args.datagram:
@@ -125,7 +195,15 @@ async def run(args):
     print("  Connecting...")
     async with client.connect() as session:
         try:
-            await session.client_session_init()
+            if args.token_reject:
+                session.auth_token_validator = _token_validator(
+                    args.token_reject)
+            setup = {}
+            if args.token_cache > 0:
+                setup[SetupParamType.MAX_AUTH_TOKEN_CACHE_SIZE] = args.token_cache
+            await session.client_session_init(parameters=setup)
+            if args.track_status:
+                session.track_status(args.namespace, args.trackname)
 
             if args.video:
                 # Profile drives object size, GOP and fps; -r is fps.
@@ -135,9 +213,11 @@ async def run(args):
                     trackname=args.trackname,
                     resolution=args.video,
                     fps=args.rate or 30,
+                    auth_token=args.auth_token.encode() or None,
                 )
             else:
-                track = PublishedTrack(
+                track_class = _EmptyTrack if args.no_objects else PublishedTrack
+                track = track_class(
                     session,
                     namespace=args.namespace,
                     trackname=args.trackname,
@@ -148,13 +228,39 @@ async def run(args):
                     forwarding=(ForwardingPreference.DATAGRAM
                                 if args.datagram
                                 else ForwardingPreference.SUBGROUP),
+                    auth_token=args.auth_token.encode() or None,
                 )
+            if args.prefill:
+                track.prefill(args.prefill)
             await track.publish(
                 announce_namespace=(args.pub_ns or args.pub_both),
                 publish_track=(not args.pub_ns or args.pub_both),
                 forward=args.forward,
             )
             print(f"  Published '{track.fqtn}', waiting for subscriber...")
+            if args.second_track:
+                second = PublishedTrack(
+                    session,
+                    namespace=args.namespace,
+                    trackname=f"{args.trackname}-2",
+                    object_size=args.object_size + 16,
+                    group_size=args.group_size,
+                    num_subgroups=args.streams,
+                    rate=args.rate,
+                    auth_token=args.auth_token.encode() or None,
+                )
+                await second.publish(forward=args.forward)
+            loop = asyncio.get_running_loop()
+            if args.goaway_after is not None:
+                loop.call_later(args.goaway_after, session.goaway)
+            if args.end_after is not None:
+                loop.call_later(args.end_after, track.end)
+            if args.withdraw_after is not None:
+                loop.call_later(args.withdraw_after, functools.partial(
+                    session.publish_namespace_done, namespace=args.namespace))
+            if args.publish_update and not args.pub_ns:
+                loop.call_later(0.5, session.request_update,
+                                track.request_id)
 
             if not await wait_cond_timeout(
                     track.wait_closed(), timeout=args.duration):

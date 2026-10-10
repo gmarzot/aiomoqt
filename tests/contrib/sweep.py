@@ -1,8 +1,8 @@
 """Publisher conformance sweep against moq-contribution-interop-runner.
 
 Starts the runner in driven mode with the aiomoqt adapter, runs every d18
-scenario on one transport that needs no FETCH, merges the requirement
-outcomes and compares them with a baseline of passing rows.
+scenario on one transport, merges the requirement outcomes and compares
+them with a baseline of passing rows.
 
     python tests/contrib/sweep.py --runner build/moq-interop-runner --out out
 
@@ -80,7 +80,13 @@ def _start_runner(args, out):
            "--tls-cert", str(cert), "--tls-key", str(key),
            "--driver-executable", str(args.adapter),
            "--driver-log-root", str(out / "driver-logs"),
-           "--publisher-no-fetch"]
+           # d18 gives an unknown token alias no REQUEST_ERROR code; the
+           # session sends UNKNOWN_AUTH_TOKEN_ALIAS's session code, 0x17.
+           "--unknown-auth-token-alias-compat-code", "0x17",
+           # Credentials the adapter's --token-reject policy refuses.
+           "--invalid-auth-token", "1:696e76616c6964",
+           "--expired-auth-token", "1:65787069726564",
+           "--denied-authorization-token", "denied"]
     if args.runner_data:
         cmd += ["--docs", str(args.runner_data / "docs"),
                 "--requirements", str(args.runner_data / "requirements")]
@@ -147,13 +153,15 @@ def sweep(base, args, out):
     _, health = _call(base, "GET", "/healthz")
     todo = sorted({p["scenario"] for p in health["executable_profiles"]
                    if p["draft"] == 18 and p["transport"] == args.transport
-                   and p["mode"] == "driven" and not p["requires_fetch"]})
+                   and p["mode"] == "driven"})
     if not todo:
         raise SweepError(f"runner offers no driven d18 {args.transport} "
                          f"scenarios")
     typed = set(TYPED)
     batch = [s for s in todo if s not in typed]
     print(f"{len(todo)} scenarios", flush=True)
+    ran_in = {}                 # raw probe -> the batch it ran in
+    batches = 0
     while batch:
         chunk = batch[:BATCH]
         status, body = _run(base, args, out, chunk)
@@ -167,11 +175,34 @@ def sweep(base, args, out):
             continue
         if status != 201:
             raise SweepError(f"HTTP {status}: {body}")
+        for s in chunk:
+            ran_in[s] = batches
+        batches += 1
         batch = batch[BATCH:]
+    # A row is scored only when every scenario it names ran in one run:
+    # run together the raw probes that batching split.
+    for group in _split_rows(results, ran_in):
+        status, body = _run(base, args, out, list(group))
+        if status != 201:
+            raise SweepError(f"{group}: HTTP {status}: {body}")
     for s in sorted(typed & set(todo)):
         status, body = _run(base, args, out, [s])
         if status != 201:
             raise SweepError(f"{s}: HTTP {status}: {body}")
+
+
+def _split_rows(results, ran_in):
+    """Scenario sets of not_run rows whose raw probes ran in different
+    batches."""
+    groups = set()
+    for f in results.glob("*.json"):
+        for r in json.loads(f.read_text())["requirements"]:
+            names = tuple(sorted(r.get("scenarios") or ()))
+            if (r["outcome"] == "not_run" and 1 < len(names) <= BATCH
+                    and all(n in ran_in for n in names)
+                    and len({ran_in[n] for n in names}) > 1):
+                groups.add(names)
+    return sorted(groups)
 
 
 def outcomes(results):

@@ -1,11 +1,12 @@
 import os
-from typing import Any, Optional, Union, Dict
+from typing import Any, Optional, Union, Dict, Tuple
 from dataclasses import dataclass, field, fields
 
 from . import ParamType, SetupParamType, AuthTokenAliasType, AuthTokenType
 from ..context import DraftProfile
 from ..types import (
-    D18_PARAM_KINDS, MOQTException, MOQTProtocolViolation, SessionCloseCode,
+    D18_PARAM_KINDS, D18_PARAM_SCOPE, MOQTException, MOQTProtocolViolation,
+    SessionCloseCode,
 )
 from ..utils.buffer import Buffer, BufferReadError
 from ..utils.logger import *
@@ -30,11 +31,27 @@ from aiopquic.exceptions import StreamUnderflow as MOQTUnderflow  # noqa: E402
 class AuthTokenRef:
     """An AUTHORIZATION TOKEN that operates on the receiver's token cache
     (§10.2.2): REGISTER (alias, type, value), USE_ALIAS or DELETE (alias
-    only). USE_VALUE tokens decode to their bare Value instead."""
+    only). USE_VALUE tokens decode to an AuthToken instead."""
     alias_type: int
     alias: int
     token_type: Optional[int] = None
     value: Optional[bytes] = None
+
+
+class AuthToken(bytes):
+    """A token's Value carrying its Token Type (§10.2.2). Equal to the bare
+    Value, so code that handles tokens as bytes keeps working; a plain
+    bytes token is sent as Type OUT_OF_BAND."""
+    token_type: int
+
+    def __new__(cls, value: bytes = b"",
+                token_type: int = AuthTokenType.OUT_OF_BAND) -> 'AuthToken':
+        token = super().__new__(cls, value)
+        token.token_type = int(token_type)
+        return token
+
+    def __repr__(self) -> str:
+        return f"AuthToken({bytes(self)!r}, token_type={self.token_type})"
 
 
 @dataclass(slots=True)
@@ -132,6 +149,73 @@ class MOQTMessage:
         if not lo <= value <= hi:
             raise MOQTProtocolViolation(
                 f"{name} {value} outside {lo}..{hi}")
+
+    @staticmethod
+    def _decode_filter(raw: bytes, *, prof: 'DraftProfile'
+                       ) -> Tuple[int, Optional[int], Optional[int],
+                                  Optional[int]]:
+        """A SUBSCRIPTION_FILTER value (§5.1.2): (type, start group, start
+        object, end group). d18 carries End Group as a delta from Start."""
+        fbuf = Buffer(data=raw, vi64=prof.vi64)
+        filter_type = fbuf.pull_vint()
+        if filter_type not in (1, 2, 3, 4):
+            # Any other filter type MUST close the session.
+            raise MOQTProtocolViolation(
+                f"unknown subscription filter type 0x{filter_type:x}")
+        start_group = start_object = end_group = None
+        if filter_type in (3, 4):
+            start_group = fbuf.pull_vint()
+            start_object = fbuf.pull_vint()
+        if filter_type == 4:
+            end_group = fbuf.pull_vint()
+            if prof.vi64:
+                end_group += start_group
+                if end_group > (1 << 64) - 1:
+                    raise MOQTProtocolViolation(
+                        f"end group {end_group} exceeds 2^64-1")
+        return filter_type, start_group, start_object, end_group
+
+    # Track Properties with a restricted value (§12.5, §12.6).
+    TRACK_PROPERTY_RANGES = {
+        0x22: ("default publisher group order", 1, 2),
+        0x30: ("dynamic groups", 0, 1),
+    }
+    IMMUTABLE_PROPERTIES = 0x0B   # §12.7
+
+    @staticmethod
+    def _check_track_properties(props: Optional[Dict[int, Any]], *,
+                                prof: 'DraftProfile') -> None:
+        """d18 Track Properties (§12.5-12.7): the restricted values, also
+        inside Immutable Properties, whose Key-Value-Pairs must parse and
+        hold no Immutable Properties of their own. Unknown types pass."""
+        if not props:
+            return
+        MOQTMessage._check_property_ranges(props)
+        inner = props.get(MOQTMessage.IMMUTABLE_PROPERTIES)
+        if inner is None:
+            return
+        if not isinstance(inner, (bytes, bytearray, memoryview)):
+            raise MOQTProtocolViolation("Immutable Properties is not a byte value")
+        raw = bytes(inner)
+        try:
+            nested = MOQTMessage._extensions_decode(
+                Buffer(data=raw, vi64=prof.vi64), with_length=False,
+                buf_end=len(raw), delta=True) or {}
+        except (BufferReadError, MOQTUnderflow, RuntimeError,
+                ValueError) as e:
+            raise MOQTProtocolViolation(
+                f"Immutable Properties do not parse: {e}") from None
+        if MOQTMessage.IMMUTABLE_PROPERTIES in nested:
+            raise MOQTProtocolViolation(
+                "Immutable Properties inside Immutable Properties")
+        MOQTMessage._check_property_ranges(nested)
+
+    @staticmethod
+    def _check_property_ranges(props: Dict[int, Any]) -> None:
+        for ptype, (name, lo, hi) in MOQTMessage.TRACK_PROPERTY_RANGES.items():
+            value = props.get(ptype)
+            if value is not None:
+                MOQTMessage._check_range(name, value, lo, hi)
 
     @staticmethod
     def _pull_reason(buf: Buffer) -> str:
@@ -351,9 +435,9 @@ class MOQTMessage:
     @staticmethod
     def _auth_token_wrap(value: Union[bytes, str, AuthTokenRef],
                          prof: 'DraftProfile') -> bytes:
-        """Serialize a Token structure (§10.2.2). A bare value is sent as
-        USE_VALUE with Token Type OUT_OF_BAND; an AuthTokenRef as its
-        cache operation."""
+        """Serialize a Token structure (§10.2.2). A value is sent as
+        USE_VALUE with its AuthToken type, else OUT_OF_BAND; an AuthTokenRef
+        as its cache operation."""
         tb = Buffer(capacity=BUF_SIZE, vi64=prof.vi64)
         if isinstance(value, AuthTokenRef):
             tb.push_vint(value.alias_type)
@@ -362,25 +446,26 @@ class MOQTMessage:
                 tb.push_vint(value.token_type or AuthTokenType.OUT_OF_BAND)
                 tb.push_bytes(bytes(value.value or b""))
         else:
+            token_type = getattr(value, 'token_type', AuthTokenType.OUT_OF_BAND)
             if isinstance(value, str):
                 value = value.encode()
             tb.push_vint(AuthTokenAliasType.USE_VALUE)
-            tb.push_vint(AuthTokenType.OUT_OF_BAND)
+            tb.push_vint(token_type)
             tb.push_bytes(bytes(value))
         return tb.data_slice(0, tb.tell())
 
     @staticmethod
     def _auth_token_unwrap(raw: bytes, prof: 'DraftProfile'
-                           ) -> Union[bytes, AuthTokenRef]:
-        """Decode a Token structure (§10.2.2): USE_VALUE yields its Value,
-        the cache operations an AuthTokenRef. One that cannot be decoded
-        is a KEY_VALUE_FORMATTING_ERROR."""
+                           ) -> Union[AuthToken, AuthTokenRef]:
+        """Decode a Token structure (§10.2.2): USE_VALUE yields an
+        AuthToken, the cache operations an AuthTokenRef. One that cannot be
+        decoded is a KEY_VALUE_FORMATTING_ERROR."""
         tb = Buffer(data=raw, vi64=prof.vi64)
         try:
             alias_type = tb.pull_vint()
             if alias_type == AuthTokenAliasType.USE_VALUE:
-                tb.pull_vint()  # Token Type
-                return tb.pull_bytes(len(raw) - tb.tell())
+                token_type = tb.pull_vint()
+                return AuthToken(tb.pull_bytes(len(raw) - tb.tell()), token_type)
             if alias_type == AuthTokenAliasType.REGISTER:
                 alias = tb.pull_vint()
                 token_type = tb.pull_vint()
@@ -578,11 +663,16 @@ class MOQTMessage:
                 elif kind == "varint":
                     payload.push_vint(int(param_value))
                 elif kind == "tuple":
-                    payload.push_vint(len(param_value))
+                    # A Track Namespace, length-prefixed like any value
+                    # that is not uint8, varint or Location.
+                    tbuf = Buffer(capacity=BUF_SIZE, vi64=prof.vi64)
+                    tbuf.push_vint(len(param_value))
                     for fld in param_value:
                         fld = fld.encode() if isinstance(fld, str) else fld
-                        payload.push_vint(len(fld))
-                        payload.push_bytes(bytes(fld))
+                        tbuf.push_vint(len(fld))
+                        tbuf.push_bytes(bytes(fld))
+                    payload.push_vint(tbuf.tell())
+                    payload.push_bytes(tbuf.data_slice(0, tbuf.tell()))
                 else:  # length-prefixed bytes
                     if param_type in (ParamType.AUTH_TOKEN,
                                       SetupParamType.AUTH_TOKEN):
@@ -738,7 +828,8 @@ class MOQTMessage:
     @staticmethod
     def _deserialize_params(buf: Buffer, *, prof: DraftProfile,
                             buf_end: Optional[int] = None,
-                            delta_keys: bool = None) -> Dict[int, Any]:
+                            delta_keys: bool = None,
+                            scope: Optional[str] = None) -> Dict[int, Any]:
         """
         Deserialize parameters using Key-Value-Pair structure.
 
@@ -791,8 +882,17 @@ class MOQTMessage:
                 elif kind == "varint":
                     param_value = buf.pull_vint()
                 elif kind == "tuple":
+                    param_len = buf.pull_vint()
+                    value_end = buf.tell() + param_len
+                    if buf_end is not None and value_end > buf_end:
+                        raise MOQTProtocolViolation(
+                            f"parameter length {param_len} exceeds "
+                            f"remaining {buf_end - buf.tell()}")
                     param_value = MOQTMessage._pull_tuple(
-                        buf, prof=prof, buf_end=buf_end)
+                        buf, prof=prof, buf_end=value_end)
+                    if buf.tell() != value_end:
+                        raise MOQTProtocolViolation(
+                            "namespace parameter does not fill its length")
                 else:  # length-prefixed bytes
                     param_len = buf.pull_vint()
                     if param_len > 65535:
@@ -846,6 +946,14 @@ class MOQTMessage:
                     f"parameter 0x{param_type:x}", param_value, *bounds)
             params[param_type] = param_value
 
+        allowed = D18_PARAM_SCOPE.get(scope) if prof.draft >= 18 else None
+        if allowed is not None:
+            for param_type in params:
+                if param_type not in allowed:
+                    # §10.2.1: a parameter outside its message types MUST
+                    # close the connection.
+                    raise MOQTProtocolViolation(
+                        f"parameter 0x{param_type:x} not allowed in {scope}")
         return params
 
     @staticmethod

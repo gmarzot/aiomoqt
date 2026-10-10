@@ -225,15 +225,16 @@ def test_d18_unknown_message_parameter_is_fatal():
 
 
 def test_d18_namespace_prefix_param_is_a_tuple():
-    """§10.2.14: TRACK_NAMESPACE_PREFIX is Track-Namespace-encoded
-    (field count + length-prefixed fields), not odd/even KVP."""
+    """§10.2.14: TRACK_NAMESPACE_PREFIX is a Track Namespace (field count +
+    length-prefixed fields) carried as a §10.2 Length-prefixed value, as
+    moxygen encodes it; not odd/even KVP."""
     from aiopquic.buffer import Buffer
     prof = profile_for(18)
     payload = Buffer(capacity=256, vi64=True)
     MOQTMessage._serialize_params(
         payload, {0x34: (b"live", b"cam")}, prof=prof)
     raw = bytes(payload.data_slice(0, payload.tell()))
-    assert raw == bytes([0x01, 0x34, 0x02,
+    assert raw == bytes([0x01, 0x34, 0x0A, 0x02,
                          0x04]) + b"live" + bytes([0x03]) + b"cam"
     r = Buffer(data=raw, vi64=True)
     out = MOQTMessage._deserialize_params(r, prof=prof, buf_end=len(raw))

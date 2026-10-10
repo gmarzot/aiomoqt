@@ -259,20 +259,25 @@ def _loopback_adaptive_mp(log_dir: Path, draft: int) -> tuple[str, str]:
     fixed in 0.9.10)."""
     slug = f"loopback-adaptive-mp-d{draft}"
     log = log_dir / f"{slug}.log"
-    # -t 8 self-terminates with a clean High-water summary; _run's
-    # Python-level timeout is the backstop. No external `timeout` binary
-    # (absent on macOS runners — it's `gtimeout` there, if installed).
+    # High-water counts only intervals past warm-up with no shortfall, so
+    # -t 20 leaves several chances; one slow sample on a loaded runner must
+    # not fail the suite. _run's timeout is the backstop. No external
+    # `timeout` binary (absent on macOS runners — it's `gtimeout` there).
     cmd = [sys.executable, "-m", "aiomoqt.tools.adaptive_bench",
            "--mp", "--draft", str(draft),
            "-P", "1", "-s", "4096", "--start-mbps", "20",
            "--step-mbps", "10", "--max-mbps", "60", "--interval", "2",
-           "-t", "8", "-k"]
-    _run(cmd, log, 30)
+           "-t", "20", "-k"]
+    _run(cmd, log, 45)
     text = log.read_text()
+    if "Traceback" in text:
+        return "FAIL", "traceback"
     m = re.search(r"High-water:\s+([\d.]+)\s*([KMGT]?bps)", text)
-    if m and float(m.group(1)) > 0 and "Traceback" not in text:
+    if m is None:
+        return "FAIL", "no High-water summary (crash or timeout)"
+    if float(m.group(1)) > 0:
         return "PASS", f"high-water {m.group(1)} {m.group(2)}"
-    return "FAIL", "no data (rx=0 / crash)"
+    return "FAIL", "no interval without shortfall (high-water 0)"
 
 
 # ---------------------------------------------------------------------------

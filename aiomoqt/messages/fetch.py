@@ -3,7 +3,7 @@ from typing import Any, Optional, Dict, Tuple
 
 from .base import MOQTMessage, BUF_SIZE
 from ..types import (
-    MOQTMessageType, FetchType, GroupOrder, ParamType,
+    MOQTMessageType, FetchType, GroupOrder, MOQTProtocolViolation, ParamType,
     SessionCloseCode,
 )
 from ..context import is_draft16_or_later, DraftProfile
@@ -136,11 +136,11 @@ class Fetch(MOQTMessage):
             joining_request_id = buf.pull_vint()
             joining_start = buf.pull_vint()
         else:
-            raise ValueError(
-                f"Invalid fetch_type: {fetch_type} "
-                f"(spec §9.16: must be 0x1, 0x2, or 0x3)")
+            raise MOQTProtocolViolation(
+                f"FETCH type {fetch_type} is not 0x1, 0x2 or 0x3")
 
-        params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
+        params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
 
         if is_draft16_or_later(prof.draft):
             subscriber_priority = params.pop(
@@ -234,17 +234,22 @@ class FetchOk(MOQTMessage):
             end_of_track = buf.pull_uint8()
             largest_group_id = buf.pull_vint()
             largest_object_id = buf.pull_vint()
-            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
+            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
             # Omitted: the order the FETCH asked for applies.
             group_order = params.pop(ParamType.GROUP_ORDER, None)
             track_extensions = MOQTMessage._extensions_decode(
                 buf, with_length=False, buf_end=buf_end, delta=True)
+            if prof.draft >= 18:
+                MOQTMessage._check_track_properties(track_extensions,
+                                                    prof=prof)
         else:
             group_order = buf.pull_uint8()
             end_of_track = buf.pull_uint8()
             largest_group_id = buf.pull_vint()
             largest_object_id = buf.pull_vint()
-            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
+            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
 
         return cls(
             request_id=request_id,
