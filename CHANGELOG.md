@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fix: a publisher writing as its WebTransport stream or session is torn down ends through
+  cancellation; it died with an unretrieved `ConnectionError`.
 - A session's `auth_token_validator(token, msg)` refuses a d16+ peer request with the
   REQUEST_ERROR code it returns (§10.2.2); a refused REGISTER stays registered.
 - USE_VALUE tokens decode to `AuthToken`, bytes carrying its Token Type, and an `AuthToken`
