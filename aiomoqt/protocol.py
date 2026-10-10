@@ -2722,6 +2722,11 @@ class _MOQTSessionMixin:
                 stream_id, data, end_stream=end_stream)
         except (AssertionError, AttributeError) as e:
             logger.debug(f"stream({stream_id}): write race: {e}")
+        except ConnectionError as e:
+            # Stream or session torn down under the write: end the
+            # producer as the pre-check does, never return silently.
+            logger.debug(f"stream({stream_id}): write after teardown: {e}")
+            raise asyncio.CancelledError() from e
 
     def stream_fin(self, stream_id: int) -> None:
         """End-of-data on a sender-owned stream. Subgroup last object,
