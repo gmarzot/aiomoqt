@@ -2067,6 +2067,24 @@ class _MOQTSessionMixin:
                     self._loop.call_soon(
                         self._settle_cancelled_request, request_id,
                         f"FIN after STOP_SENDING (stream {stream_id})")
+            held = self._peer_requests.get(
+                self._bidi_stream_requests.get(stream_id))
+            if held is not None and held[0] in (SubscribeNamespace,
+                                                 SubscribeTracks):
+                # §6.1: a FIN cancels these. Free the prefix now; close the
+                # stream a loop turn later, after replies already due.
+                request_id = self._bidi_stream_requests.pop(stream_id)
+                del self._peer_requests[request_id]
+                self._loop.call_soon(self._end_cancelled_request,
+                                     request_id, stream_id)
+
+    def _end_cancelled_request(self, request_id: int, stream_id: int) -> None:
+        """Tear down a request the peer cancelled with FIN and FIN our
+        side, unless a reply has already closed it."""
+        if self._bidi_streams.get(request_id) != stream_id:
+            return
+        self._settle_cancelled_request(request_id, f"FIN (stream {stream_id})")
+        self.stream_fin(stream_id)
 
     def _ingest_stream_data(self, stream_id: int, data, end_stream: bool) -> None:
         """Route stream bytes, or hold them while a raw-QUIC session's
@@ -2963,7 +2981,7 @@ class _MOQTSessionMixin:
             entry.track._end_subscription(entry.sub,
                                           SubscribeDoneCode.UPDATE_FAILED)
         else:
-            sid = self._bidi_streams.get(existing)
+            sid = self._bidi_streams.pop(existing, None)
             self._notify_request_cancelled(existing, "a failed update")
             if sid is not None:
                 self.stream_fin(sid)
@@ -4554,8 +4572,16 @@ class _MOQTSessionMixin:
                 "client sent a non-empty New Session URI")
             return
 
+    def _cancelled_unhandled(self, msg: MOQTMessage) -> bool:
+        """True when the peer cancelled this d16+ request before its
+        handler ran."""
+        return (is_draft16_or_later(self.negotiated_draft)
+                and msg.request_id not in self._peer_requests)
+
     async def _handle_subscribe_namespace(self, msg: SubscribeNamespace) -> None:
         logger.info(f"MOQT event: handle {msg}")
+        if self._cancelled_unhandled(msg):
+            return
         stream_id = self._bidi_streams.get(msg.request_id)
         logger.debug(f"MOQT event: subscribe_namespace bidi_stream={stream_id} request_id={msg.request_id} bidi_streams={self._bidi_streams}")
         self.subscribe_namespace_ok(msg, stream_id=stream_id)
@@ -4579,6 +4605,8 @@ class _MOQTSessionMixin:
         unprompted from SUBSCRIBE_NAMESPACE). An app that registers its
         own handler for this type overrides the default ack."""
         logger.info(f"MOQT event: handle {msg}")
+        if self._cancelled_unhandled(msg):
+            return
         self.subscribe_tracks_ok(msg)
 
     async def _handle_publish_blocked(self, msg: PublishBlocked) -> None:
