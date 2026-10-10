@@ -91,5 +91,9 @@ exclude = ["aiomoqt.tests*"]
 "aiomoqt" = ["py.typed"]
 "aiomoqt.tools" = ["scenarios/*.json"]
 
+# Tracked files under a package ship as data; the test corpus must not.
+[tool.setuptools.exclude-package-data]
+"aiomoqt" = ["tests/vectors/*"]
+
 [tool.setuptools_scm]
 
