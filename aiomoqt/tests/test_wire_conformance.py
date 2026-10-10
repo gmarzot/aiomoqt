@@ -179,11 +179,12 @@ def test_kvp_overrunning_its_block_is_refused_by_both_codecs(vi64):
     with pytest.raises(RuntimeError, match="overrun"):
         MOQTMessage._extensions_decode(buf, delta=True)
 
+    # The fused parser refuses the declared length before pulling it.
     chain = StreamChain()
     chain.extend(v(0) + block + v(3) + b"pay")
     fused = (chain.parse_object_subgroup_vi64 if vi64
              else chain.parse_object_subgroup)
-    with pytest.raises(RuntimeError, match="overrun"):
+    with pytest.raises(OverflowError, match="exceeds its block"):
         fused(True, 16 * 1024, True)
 
 
@@ -370,6 +371,53 @@ def test_d18_fetch_first_object_sg_prior_rejected():
         FetchObject.deserialize(rb, prior=None, prof=prof)
 
 
+def test_d18_fetch_datagram_object_flag():
+    # §11.4.4.1: a Datagram object sets 0x40 and has no Subgroup ID; the
+    # next object's Subgroup counts on from 0.
+    objs = [
+        FetchObject(group_id=7, object_id=9, publisher_priority=128,
+                    payload=b"d", datagram=True),
+        FetchObject(group_id=7, subgroup_id=1, object_id=10,
+                    publisher_priority=128, payload=b"s"),
+    ]
+    chain = _fetch_chain_roundtrip(objs)
+    # DGRAM|PRI|GD|OD = 0x5C, group, object, priority, payload.
+    assert chain[0][0] == bytes.fromhex("5c0709800164")
+    # Subgroup prior + 1 (0x02); object and priority inherited.
+    assert chain[1][0] == bytes.fromhex("020173")
+    assert chain[0][1].datagram and not chain[1][1].datagram
+    assert chain[1][1].subgroup_id == 1
+
+
+def test_d18_fetch_datagram_flag_ignores_subgroup_bits():
+    # 0x40 with Subgroup bits 0b11: the bits are ignored, no field is read.
+    rb = Buffer(data=bytes.fromhex("5f0709800164"), vi64=True)
+    got = FetchObject.deserialize(rb, prof=profile_for(18))
+    assert got.datagram and got.subgroup_id == 0
+    assert (got.group_id, got.object_id, got.payload) == (7, 9, b"d")
+
+
+def test_d16_fetch_datagram_object_flag():
+    prof = profile_for(16)
+    raw = bytes(FetchObject(group_id=7, object_id=9, publisher_priority=128,
+                            payload=b"d", datagram=True)
+                .serialize(prof=prof).data)
+    # Flags 0x5C as a 2-byte RFC 9000 varint; no Subgroup ID field.
+    assert raw == bytes.fromhex("405c0709800164")
+    got = FetchObject.deserialize(Buffer(data=raw), prof=prof)
+    assert got.datagram and (got.group_id, got.object_id) == (7, 9)
+
+
+def test_d18_fetch_unknown_type_is_a_protocol_violation():
+    # §10.12: Request ID 1, Fetch Type 0, no parameters.
+    from aiomoqt.messages.fetch import Fetch
+    from aiomoqt.types import MOQTProtocolViolation
+    body = bytes([0x01, 0x00, 0x00])
+    with pytest.raises(MOQTProtocolViolation):
+        Fetch.deserialize(Buffer(data=body, vi64=True), prof=profile_for(18),
+                          buf_end=len(body))
+
+
 # -- d18 SUBSCRIPTION_FILTER internals (§5.1.2) -----------------------
 #
 # Filter values follow the negotiated varint codec (vi64 on d18 —
@@ -448,3 +496,288 @@ def test_moq_dev_subscribe_ok_golden():
         buf_end=len(_MOQ_DEV_SUBSCRIBE_OK_BODY))
     assert msg.track_alias == 0
     assert msg.track_extensions == {8: 1000}
+
+
+# -- subgroup header FIRST_OBJECT (d18 §2.2, §11.4.2) -----------------
+
+from aiomoqt.messages.data import SubgroupHeader  # noqa: E402
+
+
+def _subgroup_type(draft, **kw):
+    hdr = SubgroupHeader(track_alias=1, group_id=0, subgroup_id=0,
+                         prof=profile_for(draft), **kw)
+    buf = Buffer(data=hdr.serialize().data, vi64=profile_for(draft).vi64)
+    return buf.pull_uint_vi64() if profile_for(draft).vi64 \
+        else buf.pull_uint_var()
+
+
+def test_d18_new_subgroup_sets_first_object():
+    # An original publisher's new subgroup MUST set FIRST_OBJECT.
+    assert _subgroup_type(18) & 0x40
+
+
+@pytest.mark.parametrize("draft", [14, 16])
+def test_first_object_is_never_written_before_d18(draft):
+    # 0x40 is not a subgroup type bit before d18.
+    assert not _subgroup_type(draft) & 0x40
+
+
+def test_relay_forwarding_mid_subgroup_clears_first_object():
+    assert not _subgroup_type(18, first_object=False) & 0x40
+
+
+def test_d18_first_object_round_trips():
+    prof = profile_for(18)
+    hdr = SubgroupHeader(track_alias=1, group_id=0, subgroup_id=0,
+                         prof=prof)
+    buf = Buffer(data=hdr.serialize().data, vi64=True)
+    type_val = buf.pull_uint_vi64()
+    assert SubgroupHeader.deserialize(buf, type_val, prof=prof).first_object
+
+
+# -- malformed requests the session MUST close on (§2.4.1, §5.1.2, §10.2) --
+
+from aiomoqt.types import GroupOrder, MOQTProtocolViolation  # noqa: E402
+
+
+def _ref_vint(draft, v):
+    return ref_vi64(v) if draft >= 18 else ref_rfc9000(v)
+
+
+def _subscribe_body(draft, *, ns=(b"n",), name=b"x", params=b"\x00"):
+    # Request ID 1, Track Namespace, Track Name, then the parameter block.
+    out = _ref_vint(draft, 1) + _ref_vint(draft, len(ns))
+    for f in ns:
+        out += _ref_vint(draft, len(f)) + f
+    return out + _ref_vint(draft, len(name)) + name + params
+
+
+def _filter_param(draft, *fields):
+    # One SUBSCRIPTION_FILTER (0x21) parameter, length-prefixed.
+    inner = b"".join(_ref_vint(draft, f) for f in fields)
+    return (_ref_vint(draft, 1) + _ref_vint(draft, 0x21)
+            + _ref_vint(draft, len(inner)) + inner)
+
+
+def _decode_subscribe(draft, body):
+    prof = profile_for(draft)
+    return Subscribe.deserialize(Buffer(data=body, vi64=prof.vi64),
+                                 prof=prof, buf_end=len(body))
+
+
+@pytest.mark.parametrize("draft", [16, 18])
+@pytest.mark.parametrize("params", [
+    b"\x01\x10\x02",   # FORWARD 2
+    b"\x01\x22\x00",   # GROUP_ORDER 0
+    b"\x01\x22\x03",   # GROUP_ORDER 3
+], ids=["forward-2", "group-order-0", "group-order-3"])
+def test_out_of_range_parameter_is_a_protocol_violation(draft, params):
+    with pytest.raises(MOQTProtocolViolation, match="outside"):
+        _decode_subscribe(draft, _subscribe_body(draft, params=params))
+
+
+@pytest.mark.parametrize("draft", [16, 18])
+def test_in_range_parameters_are_accepted(draft):
+    params = b"\x03\x10\x01\x10\xff\x02\x02"  # FORWARD 1, PRIORITY 255, ORDER 2
+    if draft < 18:
+        params = b"\x03\x10\x01\x10\x40\xff\x02\x02"  # 255 as a varint
+    got = _decode_subscribe(draft, _subscribe_body(draft, params=params))
+    assert (got.forward, got.priority, got.group_order) == (1, 255, 2)
+
+
+def test_d16_subscriber_priority_over_255_is_a_protocol_violation():
+    params = b"\x01\x20\x41\x00"  # SUBSCRIBER_PRIORITY 256
+    with pytest.raises(MOQTProtocolViolation, match="outside"):
+        _decode_subscribe(16, _subscribe_body(16, params=params))
+
+
+@pytest.mark.parametrize("draft", [16, 18])
+def test_empty_namespace_field_is_a_protocol_violation(draft):
+    with pytest.raises(MOQTProtocolViolation, match="empty namespace field"):
+        _decode_subscribe(draft, _subscribe_body(draft, ns=(b"n", b"")))
+
+
+def test_empty_namespace_field_is_legal_at_d14():
+    got = MOQTMessage._pull_tuple(Buffer(data=b"\x01\x00"),
+                                  prof=profile_for(14))
+    assert got == (b"",)
+
+
+@pytest.mark.parametrize("draft", [16, 18])
+def test_full_track_name_is_at_most_4096_bytes(draft):
+    at_limit = _subscribe_body(draft, ns=(b"n" * 4095,), name=b"x")
+    assert _decode_subscribe(draft, at_limit).track_name == b"x"
+    with pytest.raises(MOQTProtocolViolation, match="namespace is 4097"):
+        _decode_subscribe(draft, _subscribe_body(draft, ns=(b"n" * 4097,)))
+    with pytest.raises(MOQTProtocolViolation, match="full track name is 4097"):
+        _decode_subscribe(draft, _subscribe_body(draft, name=b"x" * 4096))
+
+
+def test_d18_absolute_range_end_past_2_64_is_a_protocol_violation():
+    top = (1 << 64) - 1
+    at_limit = _subscribe_body(18, params=_filter_param(18, 4, top - 1, 0, 1))
+    assert _decode_subscribe(18, at_limit).end_group == top
+    past = _subscribe_body(18, params=_filter_param(18, 4, top, 0, 1))
+    with pytest.raises(MOQTProtocolViolation, match="2\\^64-1"):
+        _decode_subscribe(18, past)
+
+
+@pytest.mark.parametrize("draft", [16, 18])
+@pytest.mark.parametrize("value", [0, 3])
+def test_default_publisher_group_order_out_of_range(draft, value):
+    # SUBSCRIBE_OK: [Request ID], Track Alias, no parameters, then Track
+    # Properties carrying DEFAULT_PUBLISHER_GROUP_ORDER (0x22).
+    prof = profile_for(draft)
+    head = b"" if draft >= 18 else _ref_vint(draft, 1)
+    body = (head + _ref_vint(draft, 0) + _ref_vint(draft, 0)
+            + _ref_vint(draft, 0x22) + _ref_vint(draft, value))
+    with pytest.raises(MOQTProtocolViolation, match="outside"):
+        SubscribeOk.deserialize(Buffer(data=body, vi64=prof.vi64),
+                                prof=prof, buf_end=len(body))
+
+
+@pytest.mark.parametrize("draft", [16, 18])
+def test_publisher_default_group_order_is_omitted(draft):
+    # d16+ GROUP_ORDER has no 0 value; omission means the publisher's.
+    # Request ID 128 encodes differently per draft (40 80 / 80 80).
+    prof = profile_for(draft)
+    raw = bytes(Subscribe(request_id=128, track_namespace=(b"n",),
+                          track_name=b"t", filter_type=2,
+                          group_order=GroupOrder.PUBLISHER_DEFAULT,
+                          ).serialize(prof=prof).data)
+    # Request ID, namespace (n), name (t), then one parameter:
+    # SUBSCRIPTION_FILTER (0x21) holding LatestObject (2). No 0x22.
+    body = (_ref_vint(draft, 128) + b"\x01\x01n\x01t"
+            + b"\x01\x21\x01\x02")
+    assert raw == b"\x03" + len(body).to_bytes(2, "big") + body
+    off = _subscribe_body_off(raw)
+    got = Subscribe.deserialize(Buffer(data=raw[off:], vi64=prof.vi64),
+                                prof=prof, buf_end=len(raw) - off)
+    assert got.group_order is None
+
+
+from aiomoqt.messages.fetch import Fetch, FetchOk  # noqa: E402
+from aiomoqt.messages.namespace import PublishBlocked  # noqa: E402
+from aiomoqt.messages.request import RequestError  # noqa: E402
+
+
+@pytest.mark.parametrize("draft", [16, 18])
+def test_fetch_without_group_order_is_ascending(draft):
+    # §10.2.8: omitted from FETCH, the receiver uses Ascending.
+    # Standalone FETCH of n/t, locations 0/0..0/0, no parameters.
+    prof = profile_for(draft)
+    body = (_ref_vint(draft, 2) + b"\x01" + b"\x01\x01n\x01t"
+            + b"\x00\x00\x00\x00" + b"\x00")
+    got = Fetch.deserialize(Buffer(data=body, vi64=prof.vi64), prof=prof,
+                            buf_end=len(body))
+    assert got.group_order == GroupOrder.ASCENDING
+
+
+@pytest.mark.parametrize("draft", [16, 18])
+def test_fetch_ok_without_group_order_leaves_the_requested_order(draft):
+    # [Request ID], End Of Track 0, Largest Location 5/3, no parameters.
+    prof = profile_for(draft)
+    head = b"" if draft >= 18 else _ref_vint(draft, 7)
+    body = head + b"\x00\x05\x03\x00"
+    got = FetchOk.deserialize(Buffer(data=body, vi64=prof.vi64), prof=prof,
+                              buf_end=len(body))
+    assert got.group_order is None
+
+
+def test_d18_publish_blocked_full_track_name_is_at_most_4096_bytes():
+    prof = profile_for(18)
+    ok = (b"\x01" + ref_vi64(4095) + b"n" * 4095 + b"\x01t")
+    assert PublishBlocked.deserialize(
+        Buffer(data=ok, vi64=True), prof=prof).track_name == b"t"
+    past = b"\x01\x01n" + ref_vi64(4096) + b"t" * 4096
+    with pytest.raises(MOQTProtocolViolation, match="full track name"):
+        PublishBlocked.deserialize(Buffer(data=past, vi64=True), prof=prof)
+
+
+def test_d18_redirect_full_track_name_is_at_most_4096_bytes():
+    # REQUEST_ERROR REDIRECT (0x34): retry 0, empty reason, empty URI,
+    # then namespace n and a 4096-byte name.
+    prof = profile_for(18)
+    body = (ref_vi64(0x34) + b"\x00\x00\x00" + b"\x01\x01n"
+            + ref_vi64(4096) + b"t" * 4096)
+    with pytest.raises(MOQTProtocolViolation, match="full track name"):
+        RequestError.deserialize(Buffer(data=body, vi64=True), prof=prof,
+                                 buf_end=len(body))
+
+
+def test_d18_namespace_parameter_field_past_its_value_is_refused():
+    # One TRACK_NAMESPACE_PREFIX (0x34) parameter, length 4, whose field
+    # claims 5 bytes where the value holds 2.
+    prof = profile_for(18)
+    block = b"\x01" + ref_vi64(0x34) + b"\x04\x01\x05ab"
+    with pytest.raises(MOQTProtocolViolation, match="overruns frame"):
+        MOQTMessage._deserialize_params(
+            Buffer(data=block + b"xyz", vi64=True), prof=prof,
+            buf_end=len(block))
+
+
+def test_d18_namespace_parameter_is_length_prefixed():
+    # §10.2.14 / §10.2: the Track Namespace rides a length prefix (moxygen
+    # and mondain's runner agree): length 6, 2 fields "a" and "bc".
+    prof = profile_for(18)
+    block = b"\x01" + ref_vi64(0x34) + b"\x06\x02\x01a\x02bc"
+    buf = Buffer(capacity=64, vi64=True)
+    MOQTMessage._serialize_params(buf, {0x34: (b"a", b"bc")}, prof=prof)
+    assert bytes(buf.data_slice(0, buf.tell())) == block
+    got = MOQTMessage._deserialize_params(
+        Buffer(data=block, vi64=True), prof=prof, buf_end=len(block))
+    assert got == {0x34: (b"a", b"bc")}
+
+
+def test_d18_namespace_parameter_short_of_its_length_is_refused():
+    prof = profile_for(18)
+    block = b"\x01" + ref_vi64(0x34) + b"\x07\x02\x01a\x02bcz"
+    with pytest.raises(MOQTProtocolViolation, match="fill its length"):
+        MOQTMessage._deserialize_params(
+            Buffer(data=block, vi64=True), prof=prof, buf_end=len(block))
+
+
+@pytest.mark.parametrize("draft", [16, 18])
+def test_track_status_carries_no_delivery_parameters(draft):
+    # §10.14: priority, group order, forward and filter are not included.
+    from aiomoqt.messages.subscribe import TrackStatus
+    msg = TrackStatus(request_id=1, track_namespace=(b"n",), track_name=b"t",
+                      priority=128, group_order=1, forward=1, filter_type=2)
+    raw = bytes(msg.serialize(prof=profile_for(draft)).data)
+    # Type 0x0D, Length 7, Request ID, namespace "n", name "t", no params.
+    assert raw == bytes.fromhex("0d0007" "01" "01016e" "0174" "00")
+
+
+def _params_body(params) -> bytes:
+    buf = Buffer(capacity=64, vi64=True)
+    MOQTMessage._serialize_params(buf, params, prof=profile_for(18))
+    return bytes(buf.data_slice(0, buf.tell()))
+
+
+@pytest.mark.parametrize("scope, params", [
+    ("Subscribe", {0x08: 5}),              # EXPIRES
+    ("TrackStatus", {0x20: 7}),            # SUBSCRIBER_PRIORITY
+    ("Fetch", {0x10: 1}),                  # FORWARD
+    ("SubscribeNamespace", {0x10: 1}),
+    ("RequestUpdate", {0x09: (1, 2)}),     # LARGEST_OBJECT
+], ids=["subscribe-expires", "track-status-priority", "fetch-forward",
+        "subscribe-namespace-forward", "update-largest"])
+def test_d18_a_parameter_outside_its_requests_is_refused(scope, params):
+    # §10.2.1: a Message Parameter on a message it is not defined for.
+    body = _params_body(params)
+    with pytest.raises(MOQTProtocolViolation, match="not allowed"):
+        MOQTMessage._deserialize_params(
+            Buffer(data=body, vi64=True), prof=profile_for(18),
+            buf_end=len(body), scope=scope)
+
+
+def test_d18_parameters_in_scope_pass_and_d16_is_not_checked():
+    body = _params_body({0x03: b"t", 0x10: 1, 0x20: 7, 0x21: b"\x02"})
+    MOQTMessage._deserialize_params(Buffer(data=body, vi64=True),
+                                    prof=profile_for(18), buf_end=len(body),
+                                    scope="Subscribe")
+    d16 = Buffer(capacity=64)
+    MOQTMessage._serialize_params(d16, {0x08: 5}, prof=profile_for(16))
+    raw = bytes(d16.data_slice(0, d16.tell()))
+    MOQTMessage._deserialize_params(Buffer(data=raw), prof=profile_for(16),
+                                    buf_end=len(raw), scope="Subscribe")

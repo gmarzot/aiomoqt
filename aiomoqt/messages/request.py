@@ -24,9 +24,12 @@ class RequestOk(MOQTMessage):
     """REQUEST_OK (0x07) — draft-16 universal OK response.
 
     Wire format: Request ID (i), Num Parameters (i), Parameters (..) ...
+    d18 drops the Request ID and ends with Track Properties, which only a
+    TRACK_STATUS reply may carry (§10.5).
     """
     request_id: int = 0
     parameters: Optional[Dict[int, Any]] = None
+    track_properties: Optional[Dict[int, Any]] = None
 
     def __post_init__(self):
         self.type = D16MessageType.REQUEST_OK
@@ -39,6 +42,9 @@ class RequestOk(MOQTMessage):
         if prof.reply_has_request_id:
             payload.push_vint(self.request_id)
         MOQTMessage._serialize_params(payload, self.parameters or {}, prof=prof)
+        if prof.draft >= 18 and self.track_properties:
+            MOQTMessage._extensions_encode(payload, self.track_properties,
+                                           with_length=False, delta=True)
 
         buf.push_uint_var(self.type)
         buf.push_uint16(payload.tell())
@@ -49,8 +55,15 @@ class RequestOk(MOQTMessage):
     def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'RequestOk':
         request_id = (buf.pull_vint()
                       if prof.reply_has_request_id else None)
-        params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
-        return cls(request_id=request_id, parameters=params)
+        params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
+        props = None
+        if prof.draft >= 18 and buf_end is not None and buf.tell() < buf_end:
+            props = MOQTMessage._extensions_decode(
+                buf, with_length=False, buf_end=buf_end, delta=True)
+            MOQTMessage._check_track_properties(props, prof=prof)
+        return cls(request_id=request_id, parameters=params,
+                   track_properties=props)
 
 
 @dataclass(slots=True)
@@ -121,8 +134,8 @@ class RequestError(MOQTMessage):
         if (error_code == cls.REDIRECT and not prof.reply_has_request_id
                 and (buf_end is None or buf.tell() < buf_end)):
             uri = buf.pull_bytes(buf.pull_vint())
-            namespace = MOQTMessage._pull_tuple(buf)
-            name = buf.pull_bytes(buf.pull_vint())
+            namespace, name = MOQTMessage._pull_full_track_name(
+                buf, prof=prof)
             redirect = (uri, namespace, name)
 
         return cls(
@@ -175,7 +188,8 @@ class RequestUpdate(MOQTMessage):
     def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'RequestUpdate':
         request_id = buf.pull_vint()
         existing_request_id = (buf.pull_vint() if prof.draft < 18 else None)
-        params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
+        params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
 
         return cls(
             request_id=request_id,
@@ -214,7 +228,7 @@ class Namespace(MOQTMessage):
 
     @classmethod
     def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'Namespace':
-        namespace_suffix = MOQTMessage._pull_tuple(buf)
+        namespace_suffix = MOQTMessage._pull_tuple(buf, prof=prof)
         return cls(namespace_suffix=namespace_suffix)
 
 
@@ -248,5 +262,5 @@ class NamespaceDone(MOQTMessage):
 
     @classmethod
     def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'NamespaceDone':
-        namespace_suffix = MOQTMessage._pull_tuple(buf)
+        namespace_suffix = MOQTMessage._pull_tuple(buf, prof=prof)
         return cls(namespace_suffix=namespace_suffix)

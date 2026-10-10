@@ -69,7 +69,7 @@ TIERS = {
                     "loopback-adaptive-mp-d18",
                     "loopback-fetch"],
     "interop":     ["relay-ctrl-msg", "relay-pub-sub", "relay-discovery",
-                    "relay-join", "relay-fetch"],
+                    "relay-join", "relay-fetch", "relay-data"],
     "bench":       ["loopback-adaptive-bench"],
 }
 TIER_CHOICES = tuple(TIERS.keys())
@@ -131,25 +131,21 @@ def _pytest_file(test_file: str, log: Path,
     # output, not just the last line. Stray output from atexit /
     # connection-cleanup ("Received a connection close request") often
     # follows the summary on stderr and would otherwise mask a passing
-    # run. Match the canonical pytest format: "N passed[, M failed]
-    # [, K skipped] in T.TTs".
+    # run. The line is "N word[, N word ...] in T.TTs" in pytest's own
+    # order, e.g. "1 failed, 1063 passed, 9 skipped, 1 xfailed in 18.7s".
     text = log.read_text()
-    summary_re = re.compile(
-        r"^(\d+) passed(?:,\s*(\d+) failed)?(?:,\s*\d+ skipped)?\s+in\s+",
-        re.MULTILINE,
-    )
-    m = summary_re.search(text)
-    if m is None:
+    summary_re = re.compile(r"^\d+ \w+(?:, \d+ \w+)* in [\d.]+s",
+                            re.MULTILINE)
+    lines = summary_re.findall(text)
+    if not lines:
         return "FAIL", "(no pytest summary)"
-    failed_count = int(m.group(2) or 0)
-    summary_line = m.group(0).rstrip()
-    # Strip trailing "in" — that's the start of "in T.TTs" but the
-    # match captured up to the literal " in ". Recover the full line:
-    # find the matched start and read through to end-of-line.
-    start = m.start()
-    end = text.find("\n", start)
-    summary_line = text[start:end if end != -1 else None].strip()
-    return ("PASS" if failed_count == 0 else "FAIL"), summary_line
+    summary_line = lines[-1]
+    counts = {word: int(n) for n, word in
+              re.findall(r"(\d+) (\w+)", summary_line.rsplit(" in ", 1)[0])}
+    bad = counts.get("failed", 0) + counts.get("error", 0) \
+        + counts.get("errors", 0)
+    ok = bad == 0 and counts.get("passed", 0) > 0
+    return ("PASS" if ok else "FAIL"), summary_line
 
 
 # Kept out of the whole-tree run so a platform can skip it: on macOS the
@@ -263,25 +259,38 @@ def _loopback_adaptive_mp(log_dir: Path, draft: int) -> tuple[str, str]:
     fixed in 0.9.10)."""
     slug = f"loopback-adaptive-mp-d{draft}"
     log = log_dir / f"{slug}.log"
-    # -t 8 self-terminates with a clean High-water summary; _run's
-    # Python-level timeout is the backstop. No external `timeout` binary
-    # (absent on macOS runners — it's `gtimeout` there, if installed).
+    # High-water counts only intervals past warm-up with no shortfall, so
+    # -t 20 leaves several chances; one slow sample on a loaded runner must
+    # not fail the suite. _run's timeout is the backstop. No external
+    # `timeout` binary (absent on macOS runners — it's `gtimeout` there).
     cmd = [sys.executable, "-m", "aiomoqt.tools.adaptive_bench",
            "--mp", "--draft", str(draft),
            "-P", "1", "-s", "4096", "--start-mbps", "20",
            "--step-mbps", "10", "--max-mbps", "60", "--interval", "2",
-           "-t", "8"]
-    _run(cmd, log, 30)
+           "-t", "20", "-k"]
+    _run(cmd, log, 45)
     text = log.read_text()
+    if "Traceback" in text:
+        return "FAIL", "traceback"
     m = re.search(r"High-water:\s+([\d.]+)\s*([KMGT]?bps)", text)
-    if m and float(m.group(1)) > 0 and "Traceback" not in text:
+    if m is None:
+        return "FAIL", "no High-water summary (crash or timeout)"
+    if float(m.group(1)) > 0:
         return "PASS", f"high-water {m.group(1)} {m.group(2)}"
-    return "FAIL", "no data (rx=0 / crash)"
+    return "FAIL", "no interval without shortfall (high-water 0)"
 
 
 # ---------------------------------------------------------------------------
 # Interop-tier runners (per relay × transport × draft)
 # ---------------------------------------------------------------------------
+# The control-plane cases relay-ctrl-msg gates on. The client's standard run
+# also carries data-plane cases; relay-data reports those.
+CTRL_CASES = frozenset({
+    "setup-only", "announce-only", "publish-namespace-done",
+    "subscribe-error", "announce-subscribe", "subscribe-before-announce",
+})
+
+
 def _relay_ctrl_msg(url: str, draft: int, insecure: bool,
                     compat: str, log: Path) -> tuple[str, str]:
     cmd = [sys.executable, "-m", "aiomoqt.tools.moq_interop_client",
@@ -294,8 +303,10 @@ def _relay_ctrl_msg(url: str, draft: int, insecure: bool,
     if not ok:
         return "FAIL", "timeout"
     text = log.read_text()
-    ok_count = len(re.findall(r"^ok \d", text, re.MULTILINE))
-    return ("PASS" if ok_count == 6 else "FAIL"), f"{ok_count}/6"
+    passed = set(re.findall(r"^ok \d+ - (\S+)", text, re.MULTILINE))
+    ok_count = len(passed & CTRL_CASES)
+    n = len(CTRL_CASES)
+    return ("PASS" if ok_count == n else "FAIL"), f"{ok_count}/{n}"
 
 
 def _relay_pub_sub(url: str, draft: int, pub_mode: str, insecure: bool,
@@ -343,6 +354,9 @@ def _relay_tap_case(url: str, draft: int, case: str, insecure: bool,
     # TAP line for a single-case run: "ok 1 - <case>" or "not ok 1 - ..."
     if re.search(rf"^ok 1 - {re.escape(case)}", text, re.MULTILINE):
         return "PASS", "ok"
+    m = re.search(r"^  message: (.*)$", text, re.MULTILINE)
+    if m:
+        return "FAIL", m.group(1).strip('"')
     last = text.splitlines()[-1] if text else "no output"
     return "FAIL", last
 
@@ -363,6 +377,12 @@ def _relay_discovery(url: str, draft: int, insecure: bool,
                            insecure, compat, log)
 
 
+def _relay_data(url: str, draft: int, insecure: bool,
+                compat: str, log: Path) -> tuple[str, str]:
+    return _relay_tap_case(url, draft, "data-subgroup-basic",
+                           insecure, compat, log)
+
+
 # ---------------------------------------------------------------------------
 # Bench-tier runners
 # ---------------------------------------------------------------------------
@@ -374,7 +394,7 @@ def _loopback_adaptive_bench(log_dir: Path) -> tuple[str, str]:
            sys.executable, "-m", "aiomoqt.tools.adaptive_bench",
            "--start-mbps", "10", "--step-mbps", "10",
            "--max-mbps", "500", "--interval", "3",
-           "-l", "100"]
+           "-l", "100", "-k"]
     _run(cmd, log, 45)
     text = log.read_text()
     # fmt_bps emits e.g. "80Mbps" or "1.2Gbps" (no space) — match both
@@ -444,6 +464,9 @@ def _run_relay_matrix(relay: dict, enabled: set[str],
     # recorded as XFAIL: reported, but never fails the job. Absent =
     # non-gating for every draft.
     gating_drafts = set(relay.get("gating", []))
+    # Suites that run and report but never gate: a documented peer
+    # non-conformance the case fails on correctly.
+    xfail_suites = set(relay.get("xfail_suites", []))
 
     def _dispatch(suite: str, label_suffix: str, tag: str, slug: str,
                   fn, *fn_args, gating: bool = True) -> None:
@@ -466,7 +489,7 @@ def _run_relay_matrix(relay: dict, enabled: set[str],
             return
         log = log_dir / f"{suite}_{slug}.log"
         status, detail = _with_interop_retry(fn, fn_args, log)
-        if status == "FAIL" and not gating:
+        if status == "FAIL" and (not gating or suite in xfail_suites):
             status = "XFAIL"
         results.append((status, label, detail, log))
         marker = {"PASS": "[PASS]", "FAIL": "[FAIL]",
@@ -501,6 +524,10 @@ def _run_relay_matrix(relay: dict, enabled: set[str],
             if "relay-discovery" in enabled:
                 _dispatch("relay-discovery", "", tag, slug,
                           _relay_discovery, url, draft, insecure, compat_csv,
+                          gating=gating)
+            if "relay-data" in enabled:
+                _dispatch("relay-data", "", tag, slug,
+                          _relay_data, url, draft, insecure, compat_csv,
                           gating=gating)
 
     return results

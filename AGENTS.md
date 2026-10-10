@@ -16,7 +16,7 @@
 | `aiomoqt/media/` | MSF catalog, LOC, CMSF/CMAF packaging |
 | `aiomoqt/tools/` | CLI tools — bench, pub/sub media, interop relay, relay probe |
 | `aiomoqt/tests/` | the pytest tree — **inside** the package |
-| `tests/` | `release_regression_test.py` (tier runner) + `relays.json`. No pytest files |
+| `tests/` | `release_regression_test.py` (tier runner) + `relays.json`; `contrib/` = contribution-runner sweep. No pytest files |
 
 ## Setup
 
@@ -58,8 +58,14 @@ CI (`.github/workflows/ci.yml`): `core` = unit + integration on the full matrix,
 fetch stream); `multi-proc` = `pub_server` against `sub_bench`; `peer-interop` = cloudflare
 `moq-rs` plus the `ghcr.io/openmoq/moqx` image; `microbenchmark` is continue-on-error.
 `moq-conformance.yml` scores us against moxygen's moq-test client, pinned in
-`.github/moxygen-pin`. Zero objects delivered is a failure, never a pass — an assertion that
+`.github/moxygen-pin`. `contrib-conformance.yml` sweeps our publisher under mondain's
+contribution runner (pinned in `.github/contrib-runner-pin`) against
+`tests/contrib/baseline.json`; report-only for now. Zero objects delivered is a failure, never a pass — an assertion that
 cannot find its results line fails loudly rather than vacuously.
+
+Anything with per-track or per-request state gets a test with at least two tracks on one session,
+over raw QUIC and WebTransport: one track per session cannot show a message reaching the wrong
+track (`test_multi_track_publish.py`, and through the relay in `test_relay_forwarding.py`).
 
 ## Lint and types
 
@@ -97,6 +103,12 @@ port via per-connection ALPN dispatch.
 Packagers under `aiomoqt/media/` only package and number objects; `broadcast.py` is the single
 exempt composer. `test_packaging_does_not_know_about_peers` greps the media tree for
 `FanoutDelivery`, `add_session`, `_subs` and friends and fails if one appears.
+
+**Per-track routing.** `register_handler` holds one handler per message type for the whole
+session, so a track that registers one takes it from every other track. Messages addressed to a
+track or a request (SUBSCRIBE, PUBLISH_OK, updates) route through the session's track and
+request tables (`PublishedTrack.attach()`, `_bind_request()`), which take precedence over app
+handlers. `test_published_tracks_take_no_session_handler_slot` enforces this for `track.py`.
 
 **Drafts.** 14, 16 and 18 are all live. Draft numbers are plain ints everywhere
 (`MOQTDraft`, the `draft=` kwarg, `supported_drafts`); the IETF code `0xff0000NN` and the ALPN
@@ -137,9 +149,9 @@ subgroup writing, pacing and the TX budget; `SubscribedTrack` owns reassembly an
   the one place not to use it. For clean timing measurements on loopback use `cubic` or
   `newreno`; loss-based CCs do collapse on the GIL-induced loss blips of a loaded host, so
   prefer them for timing, not for throughput.
-- WebTransport datagram TX needs `aiopquic >= 0.4.1`. Against 0.4.0 — what PyPI serves, and
-  what this tree floors to until 0.4.1 ships — `StreamMapping.DATAGRAM` fails over
-  WebTransport; use `PER_GROUP`. Datagram RX works on both transports either way.
+- Clients verify the relay's certificate by default (`aiopquic >= 0.5.0a1`): a self-signed
+  relay needs `-k` / `verify_tls=False`, a private CA goes in `ca_file=`. Every local test
+  server is self-signed.
 - `.github/aiopquic-pin` (`owner/repo@ref`) builds aiopquic from source so a PR can pair with
   an unreleased aiopquic change. Fine while paired — the `pin-guard` job hard-fails it on main
   or a release-labeled PR, because it would ship a dependency nobody can install.

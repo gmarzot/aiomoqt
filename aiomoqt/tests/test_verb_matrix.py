@@ -32,6 +32,7 @@ class _Cfg:
 
 def _session(draft, is_client=True):
     s = object.__new__(_MOQTSessionMixin)
+    s._peer_requests = {}
     s._session = _Cfg()
     try:
         s._loop = asyncio.get_running_loop()
@@ -42,9 +43,14 @@ def _session(draft, is_client=True):
     s.is_client = is_client
     s._next_request_id = 0 if is_client else 1
     s._sent_requests = deque(maxlen=64)
+    s._track_status_requests = set()
+    s._announced = {}
+    s._discovery_subs = {}
+    s._published_tracks = {}
     s._pending_requests = {}
     s._next_track_alias = 0
     s._track_aliases = {}
+    s._published_aliases = {}
     s._subscriptions = {}
     s._fetch_done_futures = {}
     s._bidi_streams = {7: 9}

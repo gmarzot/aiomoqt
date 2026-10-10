@@ -11,7 +11,7 @@ from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
 from aiomoqt.types import MOQTMessageType
 from aiomoqt.media import (
-    Catalog, CatalogTrack, DeltaOp, InitData,
+    Catalog, CatalogTrack, CatalogTrackPublisher, DeltaOp, InitData,
     LocTrackPublisher, MediaPublisher, MediaSubscriber, StreamMapping,
 )
 
@@ -195,3 +195,128 @@ async def test_broadcast_delta_update():
     assert sub.catalog.find("video-2").bitrate == 500_000
     # track_filter honored: only audio was subscribed.
     assert set(sub.tracks) == {"audio"}
+
+
+# -- catalog track against relay-driven subscription changes ------------
+
+def _recording_session():
+    """A session that records what the catalog emitter writes."""
+    from types import SimpleNamespace
+    from aiomoqt.context import profile_for
+
+    writes = []
+    next_sid = iter(range(100, 1000))
+
+    async def _open_uni():
+        sid = next(next_sid)
+        writes.append(('open', sid))
+        return sid
+
+    async def _write_drain(sid, data):
+        writes.append(('w', sid, bytes(data), False))
+
+    return SimpleNamespace(
+        writes=writes,
+        _profile=profile_for(18),
+        _close_err=None,
+        open_uni_stream=_open_uni,
+        stream_write=lambda sid, data, end_stream=False:
+            writes.append(('w', sid, bytes(data), end_stream)),
+        stream_write_drain=_write_drain,
+        stream_reset=lambda sid, code: writes.append(('reset', sid, int(code))),
+        _send_reply=lambda rid, msg, fin=False: writes.append(('done', rid)),
+    )
+
+
+def _opened(session):
+    return [w[1] for w in session.writes if w[0] == 'open']
+
+
+def _clone(name):
+    return Catalog.delta([DeltaOp("clone", [CatalogTrack(
+        parentName="video", name=name, bitrate=500_000)])])
+
+
+async def _settle():
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_catalog_sends_nothing_at_forward_0_and_the_catalog_on_resume():
+    session = _recording_session()
+    track = CatalogTrackPublisher(session, _NS, _catalog())
+    sub = track._sub_for(session)
+    await track.generate(session, 5)
+    await _settle()
+    assert len(_opened(session)) == 1                    # group 0
+
+    track._set_forward(sub, 0)
+    await track.publish_catalog(_catalog())              # a refresh while paused
+    await track.publish_delta(_clone("video-2"))
+    await _settle()
+    assert len(_opened(session)) == 1                    # §5.1: no Objects
+    assert track.catalog.find("video-2") is not None     # folded in
+
+    track._set_forward(sub, 1)
+    await _settle()
+    assert len(_opened(session)) == 2                    # one catalog on resume
+    assert track._largest == (1, 0)
+    assert b'"video-2"' in session.writes[-1][2]
+
+
+@pytest.mark.asyncio
+async def test_catalog_subscription_end_resets_and_the_next_continues_group_ids():
+    from aiomoqt.types import StreamResetCode
+    session = _recording_session()
+    track = CatalogTrackPublisher(session, _NS, _catalog())
+    sub = track._sub_for(session)
+    sub.generating = True
+    sub.subscribers.add(9)
+    await track.generate(session, 5)
+    await _settle()
+    first = _opened(session)[0]
+
+    track._on_request_cancelled(9, sub)                  # the relay ended it
+    await _settle()
+    assert ('reset', first, int(StreamResetCode.CANCELLED)) in session.writes
+    assert not track._serving()
+
+    sub.generating = True
+    await track.generate(session, 6)                     # the next SUBSCRIBE
+    await _settle()
+    assert len(_opened(session)) == 2
+    assert track._largest == (1, 0)                      # not a restarted 0
+
+
+@pytest.mark.asyncio
+async def test_catalog_refresh_while_unserved_does_not_queue():
+    session = _recording_session()
+    track = CatalogTrackPublisher(session, _NS, _catalog())
+    for _ in range(50):
+        await track.publish_catalog(_catalog())
+    assert track._updates.qsize() == 0
+    await track.finish()
+    await track.publish_catalog(_catalog())
+    assert track._updates.qsize() == 1                   # the finish survives
+
+
+@pytest.mark.asyncio
+async def test_catalog_delta_after_a_skipped_update_opens_a_full_group():
+    session = _recording_session()
+    track = CatalogTrackPublisher(session, _NS, _catalog())
+    sub = track._sub_for(session)
+    await track.generate(session, 5)
+    await _settle()
+
+    track._set_forward(sub, 0)
+    await track.publish_delta(_clone("video-2"))         # folded, not sent
+    await _settle()
+    # Forwarding back before the resume marker is handled: the group still
+    # open lacks video-2, so the next delta cannot extend it.
+    sub.forward = True
+    await track.publish_delta(_clone("video-3"))
+    await _settle()
+    assert track._largest == (1, 0)
+    last = session.writes[-1][2]
+    assert b'"video-2"' in last and b'"video-3"' in last

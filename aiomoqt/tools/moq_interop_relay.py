@@ -54,7 +54,7 @@ import sys
 from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
 from aiomoqt.types import (
-    D18MessageType, FilterType, GroupOrder, MOQTMessageType,
+    D18MessageType, FilterType, GroupOrder, MOQTDraft, MOQTMessageType,
     MOQTRequestError, ObjectStatus, ParamType, RequestErrorCode,
     StreamResetCode, SubscribeDoneCode, SubscribeErrorCode, parse_draft_spec,
 )
@@ -109,6 +109,10 @@ TERMINAL_GRACE_S = 3.0
 # How long a SUBSCRIBE waits for an upstream to (re)appear before the
 # relay answers "track does not exist".
 UPSTREAM_WAIT_S = 3.0
+# d18 SUBSCRIBE parameter (§10.2.6); 0x04 is MAX_CACHE_DURATION before d18.
+RENDEZVOUS_TIMEOUT = 0x04
+# Longest a SUBSCRIBE is held for a publisher, whatever it asks for.
+RENDEZVOUS_MAX_S = 30.0
 
 
 async def _await_upstream(timeout: float = None) -> bool:
@@ -253,6 +257,9 @@ class _RelayedTrack:
         self.downstream = []          # list of (session, track_alias, request_id)
         self.queue = asyncio.Queue()
         self.task = None
+        # A downstream SUBSCRIBE is establishing this track: an upstream
+        # terminal that lands first waits in the queue for it.
+        self.attaching = False
         # (id(session), group, subgroup) -> (stream_id, SubgroupHeader)
         self._streams = {}
         # id(session) -> subgroup streams opened (PUBLISH_DONE count)
@@ -424,6 +431,7 @@ class _RelayedTrack:
              shape))
 
     def add_downstream(self, session, track_alias, request_id=None):
+        self.attaching = False
         self.downstream.append((session, track_alias, request_id))
         # The Largest reported to this subscriber: a joining FETCH from
         # it backfills up to exactly that point.
@@ -720,6 +728,7 @@ async def _establish_upstream(ns, track_name):
         _tracks.pop(key, None)
     for pub in _publishers_for(ns):
         track = _RelayedTrack(key)
+        track.attaching = True
         name = (track_name.decode() if isinstance(track_name, bytes)
                 else track_name)
         upstream = SubscribedTrack(
@@ -765,7 +774,7 @@ def _upstream_done(track, key, done) -> None:
                 f"-> {len(track.downstream)} subscriber(s), objects "
                 f"in={track._objects_in} out={track._objects_out}, "
                 f"upstream streams ended={track._upstream_ended}")
-    if track.task is None:
+    if track.task is None and not track.attaching:
         # Nothing draining the queue: no subscriber ever attached.
         track.finish(status_code=status, reason=reason)
         track.close()
@@ -935,9 +944,61 @@ def _largest_kwargs(track) -> dict:
             "largest_object_id": track.largest[1]}
 
 
+def _publisher_known(ns: tuple, track_name) -> bool:
+    """A publisher could serve this track now: it PUBLISHed the track,
+    announced a covering namespace, or the relay dials an origin."""
+    track = _tracks.get((ns, track_name))
+    if (track is not None and _track_live(track)
+            and (track.pending_publish or track.upstream)):
+        return True
+    return bool(_publishers_for(ns) or _upstream_urls)
+
+
+def _rendezvous_s(session, msg) -> float:
+    """How long to hold this SUBSCRIBE for a publisher; 0 = answer now."""
+    if (session.negotiated_draft or 0) < 18:
+        return 0.0
+    ms = (msg.parameters or {}).get(RENDEZVOUS_TIMEOUT)
+    return min(int(ms) / 1000, RENDEZVOUS_MAX_S) if ms else 0.0
+
+
+async def _await_publisher(session, ns: tuple, track_name,
+                           wait_s: float) -> bool:
+    """Hold until a publisher for the track appears. False on expiry or
+    once the subscriber's session has closed."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + wait_s
+    while not _publisher_known(ns, track_name):
+        if loop.time() >= deadline or not _session_live(session):
+            return False
+        await asyncio.sleep(0.05)
+    return True
+
+
 async def _on_subscribe(session, msg):
     """Relay a SUBSCRIBE: establish upstream, then fan out downstream."""
     ns = _ns_tuple(msg.track_namespace)
+
+    # §10.2.6: hold for a publisher up to RENDEZVOUS_TIMEOUT, then TIMEOUT.
+    # Once one appears the SUBSCRIBE proceeds as if it had just arrived.
+    wait_s = _rendezvous_s(session, msg)
+    if wait_s and not _publisher_known(ns, msg.track_name):
+        logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
+                    f"held up to {wait_s:.3f}s for a publisher")
+        if not await _await_publisher(session, ns, msg.track_name, wait_s):
+            if not _session_live(session):
+                return
+            logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
+                        f"-> ERROR (rendezvous timeout)")
+            err = RequestError(
+                request_id=msg.request_id,
+                error_code=int(RequestErrorCode.TIMEOUT),
+                retry_interval=0,
+                reason="no publisher within the rendezvous timeout",
+            )
+            logger.info(f"MOQT send: {err}")
+            session._send_reply(msg.request_id, err, fin=True)
+            return
 
     # Flow B first: a track already offered by PUBLISH is served from
     # that offer, no upstream SUBSCRIBE needed.
@@ -1461,6 +1522,11 @@ def _build_server(bind, port, cert, key, use_quic, draft):
 
 async def main():
     args = parse_args()
+    speaks = sorted(int(d) for d in MOQTDraft)
+    wanted = args.draft if isinstance(args.draft, list) else [args.draft]
+    if any(d not in speaks for d in wanted):
+        sys.exit(f"error: draft {','.join(map(str, wanted))} not supported; "
+                 f"aiomoqt speaks {speaks}")
     log_level = logging.DEBUG if args.debug else logging.INFO
     set_log_level(log_level)
     logging.basicConfig(

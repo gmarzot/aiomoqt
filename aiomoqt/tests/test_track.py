@@ -97,13 +97,14 @@ class TestPublishedTrack:
             await t.publish()
             session.publish_namespace.assert_not_called()
             session.publish.assert_called_once_with(
-                namespace="bench", track_name="track", forward=0)
+                namespace="bench", track_name="track", forward=0,
+                largest=None)
             assert t.state == TrackState.PUBLISHED
         asyncio.run(_test())
 
     def test_publish_flow_b_default_d16(self):
-        """d16 default: Flow B — bare PUBLISH, no PUB_NS; REQUEST_UPDATE
-        handler registered."""
+        """d16 default: Flow B — bare PUBLISH, no PUB_NS; the session
+        routes the track's name and PUBLISH request to it."""
         async def _test():
             session = self._pub_session(track_alias=42, request_id=7)
             t = PublishedTrack(session, "bench", "track")
@@ -113,7 +114,10 @@ class TestPublishedTrack:
             assert t.track_alias == 42
             assert t.request_id == 7
             assert t.state == TrackState.PUBLISHED
-            assert any(c.args[0] == 0x02 for c in session.register_handler.call_args_list)
+            session._attach_track.assert_called_once_with(t)
+            session._bind_request.assert_called_once_with(
+                7, t, t.subscriptions[0], alias=42)
+            session.register_handler.assert_not_called()
         asyncio.run(_test())
 
     # ----- Flow A: PUB_NS only -----

@@ -172,10 +172,40 @@ def test_clock_maps_pts_to_epoch_and_reanchors_on_restart():
     wall = [1_000.0]
     clk = TsClock(restart_s=5.0, now=lambda: wall[0])
     assert clk.to_us(90_000) == 1_000_000_000
+    wall[0] = 1_000.05
     assert clk.to_us(90_000 + 3000) == 1_000_000_000 + 33_333
     wall[0] = 1_010.0
     assert clk.to_us(90_000 + 90_000 * 9) == 1_000_000_000 + 9_000_000   # anchor kept
     assert clk.to_us(0) == 1_010_000_000                                 # restart: re-anchored
+
+
+def test_clock_never_stamps_ahead_of_arrival():
+    """A late first unit must not future-date the rest of the stream."""
+    wall = [1_000.2]                       # unit 0, captured at 1000.0, arrives 200 ms late
+    clk = TsClock(now=lambda: wall[0])
+    assert clk.to_us(0) == 1_000_200_000
+    wall[0] = 1_001.01                     # unit at +1 s arrives 10 ms after capture
+    assert clk.to_us(90_000) == 1_001_010_000                            # anchor pulled back
+    wall[0] = 1_002.05                     # +2 s arrives 50 ms late: anchor stays
+    assert clk.to_us(180_000) == 1_002_010_000
+    for i in range(3, 50):
+        wall[0] = 1_000.0 + i + 0.01 + (i % 4) * 0.005
+        assert clk.to_us(90_000 * i) == 1_000_010_000 + i * 1_000_000
+
+
+def test_clock_tracks_a_fast_source():
+    """PTS outrunning the wall clock (ffmpeg -re pacing on a fast monotonic
+    clock) must not drift the stamps into the future."""
+    wall = [1_000.0]
+    clk = TsClock(now=lambda: wall[0])
+    fast = 1e-3                            # 1000 ppm: 60 ms/min
+    for i in range(30 * 120):              # 2 min at 30 fps
+        media_s = i / 30
+        wall[0] = 1_000.0 + 0.02 + media_s * (1 - fast)
+        arrival = int(wall[0] * 1_000_000)
+        stamp = clk.to_us(i * 3000)
+        assert stamp <= arrival
+        assert arrival - stamp < 1_000 or i == 0
 
 
 def test_continuity_gap_discards_the_pes_and_recovers():

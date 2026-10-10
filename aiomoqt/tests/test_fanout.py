@@ -49,6 +49,9 @@ class _Session:
         await self._gate.wait()
         self.writes.append((sid, len(data), False))
 
+    def _unbind_request(self, request_id):
+        pass
+
 
 async def _settle(times=12):
     for _ in range(times):

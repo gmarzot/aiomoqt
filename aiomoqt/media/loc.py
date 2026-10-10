@@ -68,11 +68,13 @@ LOC_STREAMING_FORMAT_TYPE = 0x002
 @dataclass
 class LocFrame:
     """One encoded media chunk. `timestamp` is in track timescale units
-    (µs since Unix epoch when the track carries no TIMESCALE)."""
+    (µs since Unix epoch when the track carries no TIMESCALE).
+    `group_id` numbers the group a key frame opens (None: next)."""
     payload: bytes
     key_frame: bool = False
     timestamp: Optional[int] = None
     extensions: Optional[Dict[int, Any]] = None
+    group_id: Optional[int] = None
 
 
 class LocTrackPublisher(PublishedTrack):
@@ -135,10 +137,15 @@ class LocTrackPublisher(PublishedTrack):
 
     async def send_frame(self, payload: bytes, *, key_frame: bool = False,
                          timestamp: Optional[int] = None,
-                         extensions: Optional[Dict[int, Any]] = None) -> None:
-        """Queue one frame (awaits when the queue is full)."""
+                         extensions: Optional[Dict[int, Any]] = None,
+                         group_id: Optional[int] = None) -> None:
+        """Queue one frame (awaits when the queue is full).
+
+        `group_id` sets the group a key frame opens, so tracks fed from
+        one source can keep equally numbered groups time-aligned (msf
+        §4.2); ignored unless above the current group."""
         await self._frames.put(LocFrame(payload, key_frame, timestamp,
-                                        extensions))
+                                        extensions, group_id))
 
     async def finish(self) -> None:
         """Signal end of track; generation drains the queue then stops."""
@@ -188,7 +195,10 @@ class LocTrackPublisher(PublishedTrack):
                 continue
             resume_on_key = False
             if frame.key_frame or group_id < 0:
-                group_id += 1
+                if frame.group_id is not None and frame.group_id > group_id:
+                    group_id = frame.group_id
+                else:
+                    group_id += 1
                 obj_id = 0
             group_start = obj_id == 0
             if frame.timestamp is None:
@@ -211,14 +221,20 @@ class LocTrackSubscriber(SubscribedTrack):
     seeds it from a catalog initRef instead); timestamps are read under
     any LOC numbering, newest first. Arrival order == decode order for
     single-subgroup tracks; temporal-layer merge is not implemented.
+
+    on_arrival(msg, recv_us, group_id, subgroup_id, frame) sees every
+    object first, status markers included (frame=None), with its receive
+    wall-clock µs.
     """
 
     def __init__(self, session, namespace: str, trackname: str = None,
                  on_frame: Optional[Callable] = None,
-                 auth_token: Optional[bytes] = None):
+                 auth_token: Optional[bytes] = None,
+                 on_arrival: Optional[Callable] = None):
         super().__init__(session, namespace, trackname,
                          on_object=self._on_object, auth_token=auth_token)
         self.on_frame = on_frame
+        self.on_arrival = on_arrival
         self.config: Optional[bytes] = None
         self.timescale: Optional[int] = None
         self.codec_string: Optional[str] = None
@@ -228,9 +244,13 @@ class LocTrackSubscriber(SubscribedTrack):
         """Seed decoder config out-of-band (catalog initRef, §5.2.13)."""
         self.config = config
 
-    def _on_object(self, msg, size, ts, group_id, subgroup_id) -> None:
+    def _on_object(self, msg, size, recv_us, group_id, subgroup_id) -> None:
+        gid = getattr(msg, 'group_id', None)
+        gid = gid if gid is not None else group_id
         # End-of-group / end-of-track markers carry no media.
         if getattr(msg, "status", None) not in (None, ObjectStatus.NORMAL):
+            if self.on_arrival:
+                self.on_arrival(msg, recv_us, gid, subgroup_id, None)
             return
         exts = msg.extensions or {}
         for prop_id in _CONFIG_IDS:
@@ -241,8 +261,6 @@ class LocTrackSubscriber(SubscribedTrack):
         if LOC_PROP_CODECSTRING in exts:
             self.codec_string = bytes(exts[LOC_PROP_CODECSTRING]).decode(
                 'utf-8', 'replace')
-        gid = getattr(msg, 'group_id', None)
-        gid = gid if gid is not None else group_id
         ts = next((exts[p] for p in _TIMESTAMP_IDS if p in exts), None)
         # Redundant copies of the chosen timestamp are noise; an id
         # holding a different value carries something else (loc-01
@@ -257,5 +275,7 @@ class LocTrackSubscriber(SubscribedTrack):
                         if k not in consumed} or None,
         )
         self.frames_received += 1
+        if self.on_arrival:
+            self.on_arrival(msg, recv_us, gid, subgroup_id, frame)
         if self.on_frame:
             self.on_frame(frame, gid, msg.object_id)

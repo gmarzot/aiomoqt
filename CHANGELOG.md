@@ -1,5 +1,229 @@
 # Changelog
 
+## Unreleased
+
+- Fix: a publisher writing as its WebTransport stream or session is torn down ends through
+  cancellation; it died with an unretrieved `ConnectionError`.
+- A session's `auth_token_validator(token, msg)` refuses a d16+ peer request with the
+  REQUEST_ERROR code it returns (§10.2.2); a refused REGISTER stays registered.
+- USE_VALUE tokens decode to `AuthToken`, bytes carrying its Token Type, and an `AuthToken`
+  is sent with its type; plain bytes are still sent as OUT_OF_BAND.
+- `pub_bench`: `--token-cache BYTES` advertises MAX_AUTH_TOKEN_CACHE_SIZE, and
+  `--token-reject TYPE:HEX:CODE` refuses requests carrying that token.
+- CI: the adaptive-mp suites run 20 s and name their failure.
+- `PublishedTrack` answers FETCH from a bounded object history (`fetch_history_bytes`,
+  default 1 MiB; 0 refuses FETCH as NOT_SUPPORTED): standalone by name, joining against the
+  peer's subscription, objects already dropped reported as an End of Unknown Range (§10.12).
+- A FETCH on a track with no objects, starting past the Largest Object, or joining a
+  subscription with Forward State 0 is refused with INVALID_RANGE (§10.12.2-3).
+- `PublishedTrack.prefill(groups)` records groups as already published, for FETCH before any
+  subscriber.
+- Fix: production numbers groups on from the Largest group, also after an idle restart; it
+  restarted at group 0, publishing a Location twice.
+- Fix: a `produce()` track's SUBSCRIBE_OK reports its Largest Location; it reported none.
+- Fix: REQUEST_OK to a REQUEST_UPDATE carries LARGEST_OBJECT once objects exist, and a
+  `PublishedTrack` answers TRACK_STATUS with it (§10.2.11); TRACK_STATUS was NOT_SUPPORTED.
+- Fix: a joining FETCH naming no subscription is refused with INVALID_JOINING_REQUEST_ID
+  (it was NOT_SUPPORTED); one sent with its SUBSCRIBE is served (§10.12.2).
+- Fix: an unknown FETCH type closes the session with PROTOCOL_VIOLATION (§10.12).
+- `FetchObject.datagram`: the d16+ Datagram flag (0x40) is encoded and decoded.
+- `session.joining_fetch(subscription_request_id, ...)` sends a joining FETCH for an
+  existing subscription.
+- `pub_bench`: `--prefill GROUPS` and `--no-objects`.
+- Fix: a FETCH cancelled while its objects are being sent resets its data stream (§5.2).
+- Fix: TRACK_STATUS at d16+ carries no delivery parameters (priority, group order, forward,
+  filter), which §10.14 leaves out; one received from a peer still decodes.
+- Fix: a d18 REQUEST_OK's Track Properties are read: a TRACK_STATUS_OK carrying them closed
+  the session, and on any other reply they now close it with PROTOCOL_VIOLATION (§10.5).
+- Fix: d18 Track Properties are checked in SUBSCRIBE_OK, PUBLISH, FETCH_OK and TRACK_STATUS_OK:
+  DEFAULT_PUBLISHER_GROUP_ORDER 1-2 and DYNAMIC_GROUPS 0-1, also inside Immutable Properties,
+  which must parse (§12.5-12.7).
+- Fix: PUBLISH carries LARGEST_OBJECT once the track has objects (§10.2.11), and that Location
+  is the subscription's Joining Location; `session.publish(largest=...)` sets it.
+- Fix: a `PublishedTrack` sends only the objects a subscription's filter admits (§5.1.2): none
+  before its start or past an AbsoluteRange's End Group, a group admitted part-way opens its
+  stream without FIRST_OBJECT, and the range ends with PUBLISH_DONE SUBSCRIPTION_ENDED once its
+  streams have closed. A REQUEST_UPDATE filter replaces the window.
+- Fix: a SUBSCRIBE whose AbsoluteRange End Group is already published is refused with
+  INVALID_RANGE.
+- Fix: a `PublishedTrack` stops sending to a subscription whose Forward State drops to 0 (§5.1),
+  and resets a subgroup stream it cuts short — on a pause or a filter update past it — instead
+  of finishing it (§11.4.3).
+- Fix: a failed REQUEST_UPDATE ends what it updated (§10.9.1): a track's subscription gets
+  REQUEST_ERROR then PUBLISH_DONE UPDATE_FAILED (the REQUEST_ERROR used to FIN the stream), a
+  FETCH being served has its data stream reset. A FETCH accepts only a priority update.
+- Fix: `await_fetch_done()` called after a fetch stream ended reports how it ended; a reset
+  stream read as clean.
+- Fix: a SUBSCRIBE for a track whose PUBLISH from us awaits its reply is refused with
+  DUPLICATE_SUBSCRIPTION (§5.1).
+- Fix: a REQUEST_UPDATE moving a SUBSCRIBE_NAMESPACE or SUBSCRIBE_TRACKS prefix onto another of its
+  type is refused with PREFIX_OVERLAP and ends that subscription (§10.9.1-2); an accepted move is
+  recorded. `ParamType.TRACK_NAMESPACE_PREFIX` (0x34).
+- Fix: d18 TRACK_NAMESPACE_PREFIX carries its Track Namespace as a length-prefixed value, as
+  moxygen does; it was sent and read inline, so neither side could parse the other's.
+- Fix: a d18 request carrying a Message Parameter its type does not allow closes the session
+  with PROTOCOL_VIOLATION (§10.2.1); replies are not checked.
+- Fix: after we send a d18 GOAWAY, every new peer request is refused with GOING_AWAY (§10.4).
+- `PublishedTrack(auth_token=None)` announces without an AUTH_TOKEN.
+- `pub_bench`: `--goaway-after SECONDS`, and `--auth-token` for the PUBLISH_NAMESPACE token (empty
+  sends none), `--track-status` to ask for the track's status before publishing,
+  `--publish-update` and `--end-after SECONDS`.
+- `PublishedTrack.end()`: each subscription's streams close, then PUBLISH_DONE TRACK_ENDED.
+- A d18 session answers SUBSCRIBE_NAMESPACE with NAMESPACE for each namespace it announces or
+  serves tracks under the prefix, and reports later announcements and withdrawals (NAMESPACE_DONE)
+  to it (§6.1).
+- Fix: `publish_namespace_done(namespace=...)` at d18 finds the announcement's request; it
+  withdrew nothing without a request id.
+- Fix: a requester's FIN cancels its SUBSCRIBE_NAMESPACE or SUBSCRIBE_TRACKS and frees the prefix
+  (§6.1); we FIN our side.
+- `pub_bench`: `--withdraw-after SECONDS`, and `--second-track` to also PUBLISH `<trackname>-2`.
+- aiopquic floor `>=0.5.0a2`: a WebTransport close carries its code to the peer, and a
+  refused or closed WebTransport session raises a `ConnectionError` like raw QUIC.
+- Fix: `pub_media --ts` stamps never run ahead of arrival; the PTS anchor follows the
+  least-delayed unit, so a late first unit or a fast source clock no longer reads as negative
+  latency.
+- Fix: a d18 control GOAWAY whose Request ID has the wrong parity closes the session with
+  INVALID_REQUEST_ID (§10.4).
+- Fix: a `moqt://` or `https://` URL with an empty host is refused instead of dialling
+  localhost (§3.1.1); the tools reject it as a usage error.
+- Fix: when the session closes, awaited requests fail with "session closed" and awaited fetches
+  end unclean, instead of waiting out their timeout; a request awaited after the close fails
+  at once.
+- Fix: authorization tokens follow the token cache rules (§10.2.2, §10.3.1.4): an undecodable
+  Token closes the session with KEY_VALUE_FORMATTING_ERROR, a registration beyond our advertised
+  MAX_AUTH_TOKEN_CACHE_SIZE with AUTH_TOKEN_CACHE_OVERFLOW (in SETUP it is used as a value), a
+  repeated alias with DUPLICATE_AUTH_TOKEN_ALIAS, and an unregistered alias refuses its request.
+  Registered aliases resolve to their value; REGISTER, USE_ALIAS and DELETE decode to the new
+  `AuthTokenRef`.
+- Fix: a raw-QUIC client's CONNECTION_CLOSE is sent before the transport stops: leaving
+  `MOQTClient.connect()` gives it up to 0.3 s, an error close is sent at once, and a closing
+  session sends it before failing its waiters. It was dropped whenever the app exited promptly.
+- Fix: the control stream is never closed while the session lives (§3.3): a graceful close no
+  longer FINs it first, and a peer's control-stream FIN closes the session with
+  PROTOCOL_VIOLATION (it was INTERNAL_ERROR, or ignored when the FIN carried data).
+- deps: `aiopquic>=0.5.0a1`; the CI source pin is removed.
+- Fix: `verify_tls` / `-k` reach the transport. Clients verify the server's
+  certificate by default (aiopquic 0.5.0a1); `verify_tls=False` / `-k` accepts any
+  certificate; `MOQTClient(ca_file=...)` trusts a private CA.
+- Fix: several `PublishedTrack`s on one session each get their own PUBLISH_OK, SUBSCRIBE and
+  updates; before, the last track published took them all.
+- `PublishedTrack.attach()` serves a track on a session without announcing it; `publish()`
+  attaches before PUBLISH_NAMESPACE, so a SUBSCRIBE that overtakes the reply is served.
+- A second track under a full name already published on the session is refused with
+  `ValueError` instead of silently taking the first one's SUBSCRIBEs.
+- Behaviour change: a SUBSCRIBE for a track the session publishes goes to that track ahead of a
+  `register_handler(SUBSCRIBE)` handler, which now sees only names no track serves.
+- Fix: a SUBSCRIBE for a name nothing serves is refused with DOES_NOT_EXIST instead of
+  acknowledged with SUBSCRIBE_OK.
+- Fix: a SUBSCRIBE for a finished track gets SUBSCRIBE_OK then PUBLISH_DONE (TRACK_ENDED)
+  instead of no further reply.
+- Fix: a subgroup stream that ends before its track registers a stream-end handler is
+  reported when the handler registers (within 5 s), instead of never.
+- Fix: `moq_interop_relay`: PUBLISH_DONE follows the last object instead of waiting 3 s when
+  upstream streams end before the relay counts them; a track that ends while its first
+  subscriber attaches still reaches it.
+- Fix: `moq_interop_client`: a relay that never forwards PUBLISH_DONE fails
+  `data-subgroup-basic` instead of crashing the run; a test that raises is reported as FAIL.
+- pub_media: `--input URL` publishes HLS, DASH or anything FFmpeg opens as CMAF tracks;
+  `--rendition best|all` (`all` experimental). Needs the `media` extra (PyAV).
+- media: `aiomoqt.media.dash` reads DASH (PyAV ships no DASH demuxer); ingest groups follow
+  its segments.
+- media: `send_frame(group_id=)` opens the named group at a key frame.
+- media: `set_chunk_timing()`, `strip_edit_lists()`, `init_codec_string()`,
+  `hvcc_codec_string()`.
+- `moq_interop_client` / `moq_interop_relay`: a pinned `DRAFT` aiomoqt cannot speak is
+  reported (TAP skip-all, exit 127) or refused at start, instead of a traceback.
+- Fix: STOP_SENDING on a d18 request stream no longer discards the REQUEST_ERROR or
+  PUBLISH_DONE the peer sends after it; the request settles when the peer's half ends.
+- Fix: after PUBLISH_DONE a subscription keeps receiving late objects and streams for
+  5 s instead of stopping its open streams at once (§10.11).
+- Fix: `moqt://` URLs keep their path, and native-QUIC SETUP PATH is the URI's
+  path-abempty plus query (`moqt://host/anon` sent `/`; a `/` path sent `//`).
+- Fix: an original publisher's d18 subgroup header sets FIRST_OBJECT (§2.2 MUST).
+- Fix: a control message whose body ends short of its Length closes the session with
+  PROTOCOL_VIOLATION instead of being skipped.
+- Fix: a Full Track Name over 4096 bytes closes the session; at d16+ so do an empty
+  namespace field, a namespace over 4096 bytes, and FORWARD, GROUP_ORDER,
+  SUBSCRIBER_PRIORITY or DEFAULT_PUBLISHER_GROUP_ORDER outside their ranges (§2.4.1, §10.2).
+- Fix: a d18 AbsoluteRange whose End Group passes 2^64-1 closes the session (§5.1.2).
+- Fix: GROUP_ORDER `PUBLISHER_DEFAULT` (0) is omitted at d16+ instead of sent.
+- Fix: a FETCH without GROUP_ORDER is served ascending, and a FETCH_OK without it keeps the
+  order the FETCH asked for; both were decoded as descending (§10.2.8).
+- Fix: PUBLISH_BLOCKED and a REDIRECT's track name are held to the 4096-byte Full Track Name
+  limit.
+- Fix: a session closed for an error puts the MoQT error code on the wire at once
+  (CONNECTION_CLOSE application error, or the WebTransport session close code); it sent
+  nothing until the application exited, and then code 0.
+- Fix: a peer's WebTransport session close ends the MoQT session.
+- Fix: a second SUBSCRIBE to a track already subscribed in the session is refused with
+  DUPLICATE_SUBSCRIPTION (§5.1).
+- Fix: a SUBSCRIBE_NAMESPACE or SUBSCRIBE_TRACKS prefix overlapping an active one of the same
+  type is refused with PREFIX_OVERLAP (§10.18, §10.19).
+- Fix: at d18 a request in the `.` or `.session` namespace is refused with DOES_NOT_EXIST before
+  any application handler sees it (§3.2.1, §3.2.2).
+- Fix: `MediaPublisher` answers a SUBSCRIBE for an unknown track with DOES_NOT_EXIST instead of
+  no reply; `MediaSubscriber` keeps its catalog subscription when the joining FETCH is refused
+  instead of subscribing twice.
+- `moq_interop_client`: `data-subgroup-basic` data-plane test, in the standard set.
+- `moq_interop_client`: `rendezvous-timeout` test, in the standard set; SKIP below d18.
+- `moq_interop_client`: with no `--draft`/`DRAFT`, probes `18,16,14` (newest first) instead
+  of `16,14,18`.
+- `moq_interop_client`: TAP YAML reports per-role `sessions` (negotiated version,
+  transport, ALPN, initial DCID), `implementation_version` and `test_spec_revision`;
+  `duration_ms` is an integer and string values are quoted.
+- `moq_interop_relay`: d18 `RENDEZVOUS_TIMEOUT` holds a SUBSCRIBE for a publisher (capped
+  at 30 s), then answers `REQUEST_ERROR` `TIMEOUT`.
+- Transport stream scheduling now has a defined band layout, in `aiomoqt.types`:
+  0 disallowed, 2/4/6 reserved above control, 8 control streams, 9 datagrams
+  (picoquic's default, untouched), 10-254 subscription data. Control streams are
+  prioritised on every transport and draft; declared data is floored above the
+  control band, since scheduling is strict and a greedy track below it would
+  starve the session's own control stream. The wire always carries the declared
+  8-bit MoQT priority unchanged — only the local mapping is banded.
+- `to_stream_priority()` moved from `aiomoqt.agent.session` to `aiomoqt.types`,
+  now that both the agent layer and the session need it.
+- Fix: `priority_plan()["enforced"]` probes the setter the session would really
+  dispatch to. On WebTransport it reported enforcement because the session
+  carried the method it was being asked about.
+- Fix: the MSF catalog track sends nothing at Forward State 0 and the current catalog on
+  resume, resets its stream when its subscription ends, and keeps group IDs increasing
+  across subscriptions.
+- Fix: aliases we assign as publisher are kept apart from the peer's; an UNSUBSCRIBE no
+  longer resets the streams and drops the object handler of a received track that
+  shares the alias number.
+- Fix: a declared stream priority now reaches the scheduler over WebTransport. The
+  lookup went through `self._quic`, which on WebTransport is the session itself, so
+  it found this method and recursed; `RecursionError` was caught only in the deepest
+  frame, leaving every frame above to report success for a priority that never left
+  the process. Raw QUIC was unaffected.
+- `set_stream_priority()` reports False when the transport's event ring is full, where
+  it previously returned True for a priority that was not applied.
+- Fix: a received subgroup object can be printed or logged; the per-stream cached
+  `ObjectHeader` was built with `__new__`, leaving `type` unset and `str()` raising.
+- `set_default_stream_priority()` passthrough, for aligning the transport default with
+  MoQT's neutral publisher priority. Writes the QUIC context default, shared by every
+  connection on the transport.
+- loopback_bench: `--bind` sets the address the subscriber dials (default `localhost`).
+- Fix: adaptive_bench (relay, `--mp`), load_sim and the worker subscribers count loss and
+  groups on stream delivery; their object callback dropped the group and subgroup ids.
+- sub_media: `--analyze` measures delivery without decoding — latency, jitter, loss and
+  reorder, group integrity, keyframe cost, bitrate, and a playout model; `--report PATH`
+  writes CSV (`-` = stdout).
+- Fix: a control message whose body parses past its Length closes the session with
+  PROTOCOL_VIOLATION instead of consuming the next message's bytes.
+- sub_media: `-i` sets the report interval; `-T` limits it to one catalog track.
+- Datagram receive no longer formats debug strings (payload hex, per-object text) when
+  debug logging is off; neither does the per-stream header log.
+- media: `on_arrival` on `LocTrackSubscriber` and `MediaSubscriber` sees every object,
+  END_OF_GROUP included, with its receive time.
+- Fix: agent Writer's default `on_full="block"` waits for room instead of raising
+  `QueueFull`, and `flush()` returns once `produce()` has taken every object.
+- media: `chunk_decode_time()` and `init_timescale()` read CMAF tfdt and mdhd.
+- Fix: TrackStats counted a reorder that filled a gap as lost, and missed a gap spanning a
+  `snapshot()`.
+- Fix: VideoTrack counts its first stream in PUBLISH_DONE, resets the open stream when
+  cancelled, honours `_quiet`, and encodes each frame once instead of copying it twice.
+
 ## v0.11.1
 
 Pairs with aiopquic 0.4.1. moq-test conformance: 76/76 on d16 and d18,

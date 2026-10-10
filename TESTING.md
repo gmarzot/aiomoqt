@@ -83,6 +83,7 @@ Covers what pytest cannot reach: the tools, the multi-process paths, and the dra
 - **`relay-join`** — `SUBSCRIBE + JOINING_FETCH` probe (most relays do not implement this yet; disabled by default in the catalog).
 - **`relay-fetch`** — standalone `FETCH` probe (same).
 - **`relay-discovery`** — a subscriber knowing only the namespace learns the trackname. d14/d16 answer `SUBSCRIBE_NAMESPACE` with a `PUBLISH` per track; d18 reports namespaces first (`NAMESPACE`) and answers a second request, `SUBSCRIBE_TRACKS`. The publisher announces with both `PUBLISH_NAMESPACE` and `PUBLISH`, since a relay learns a namespace exists from the former.
+- **`relay-data`** — moq-interop-runner `data-subgroup-basic`: 3 groups × 5 objects through the relay on one subgroup stream per group; every object is checked for presence, subgroup, priority and payload bytes, and the downstream `PUBLISH_DONE` for `TRACK_ENDED` and its Stream Count.
 
 ### `bench` tier (manual dispatch only; not PR-gated)
 - **`loopback-adaptive-bench`** — ramps rate in steps, stops on loss / p99 latency growth / throughput shortfall, reports the last stable rate.
@@ -158,6 +159,9 @@ Entries live in `tests/relays.json`. Full schema:
 | `insecure` | no (default `false`) | if `true`, pass `--tls-disable-verify` / `-k` to subprocess tools |
 | `disabled` | no (default `false`) | if `true`, skip this relay entirely unless `--only` names it |
 | `disabled_suites` | no | list of suite names to skip for this relay (e.g. `["relay-join", "relay-fetch"]`) |
+| `gating` | no (default none) | drafts whose failures fail the job; a FAIL on any other draft is reported as XFAIL |
+| `xfail_suites` | no | suites that run and report but never gate: a documented peer non-conformance the case correctly fails on |
+| `compat` | no | wire tolerances passed to the tools as `--compat` (e.g. `libquicr`, `lenient-extensions`) |
 | `notes` | no | freeform comment (not printed on skip lines) |
 
 Adding a new relay — minimal recipe:
@@ -237,6 +241,25 @@ The published image is `ghcr.io/gmarzot/aiomoqt:<version>` and
 `:latest`; our `implementations.json` entry is wired up in an upstream
 PR. No local action is required to keep this path green — the release
 workflow pushes a fresh image on every tag.
+
+## Contribution conformance (publisher)
+
+`tests/contrib/sweep.py` scores aiomoqt's publisher under
+[moq-contribution-interop-runner](https://github.com/mondain/moq-contribution-interop-runner).
+The runner drives `pub_bench` through `tests/contrib/aiomoqt-adapter.sh` in every d18
+native-QUIC scenario that needs no FETCH; the script compares the scored requirements with
+`tests/contrib/baseline.json`. CI runs it in `contrib-conformance.yml` on pushes to `main` and
+`gmarzot-0.12.0` and on PRs labelled `ci:run-conformance`, report-only for now.
+
+Build the runner at the commit in `.github/contrib-runner-pin`, then:
+
+```bash
+python tests/contrib/sweep.py --runner ../moq-contribution-interop-runner/build/moq-interop-runner --out /tmp/contrib
+```
+
+`--gate` exits 1 when a baseline row no longer passes. A fix that adds passes refreshes the
+baseline with `--write-baseline` in the same commit. The adapter needs `jq`; a sweep takes
+about 13 minutes.
 
 ---
 

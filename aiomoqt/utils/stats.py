@@ -239,6 +239,10 @@ class TrackStats:
         # Loss bookkeeping, keyed by (group, subgroup).
         self._expected: dict = {}
         self._stride: dict = {}
+        # Ids counted lost, per key, so a late arrival reverses the
+        # loss. Oldest keys are dropped past _MISSING_CAP ids.
+        self._missing: dict = {}
+        self._missing_n = 0
         # Consecutive objects almost always continue the same subgroup
         # stream, so the live key's state is held in slots and only
         # written back to the dicts when the key changes. The group and
@@ -367,9 +371,37 @@ class TrackStats:
         if stride and stride > 0:
             if oid > prev + stride:
                 self.total_lost += (oid - prev - stride) // stride
+                self._note_missing(prev + stride, oid, stride)
             elif oid < prev:
                 self.total_ooo += 1
+                self._recover(oid)
         self._lk_prev = oid if oid > prev else prev
+
+    _MISSING_CAP = 65536
+
+    def _live_key(self) -> tuple:
+        return (self._lk_g, self._lk_s if self._lk_s is not None else 0)
+
+    def _note_missing(self, lo: int, hi: int, stride: int) -> None:
+        ids = range(lo, hi, stride)
+        if len(ids) > self._MISSING_CAP:
+            return                  # too large to track: stays lost
+        ms = self._missing.setdefault(self._live_key(), set())
+        before = len(ms)
+        ms.update(ids)
+        self._missing_n += len(ms) - before
+        while self._missing_n > self._MISSING_CAP:
+            self._missing_n -= len(self._missing.pop(next(iter(
+                self._missing))))
+
+    def _recover(self, oid: int) -> None:
+        """A late object that fills a counted gap is a reorder, not a
+        loss."""
+        ms = self._missing.get(self._live_key())
+        if ms is not None and oid in ms:
+            ms.discard(oid)
+            self._missing_n -= 1
+            self.total_lost -= 1
 
     def _flush_key(self) -> None:
         """Write the cached subgroup state back to the dicts."""
@@ -378,6 +410,9 @@ class TrackStats:
             self._expected[key] = self._lk_prev
             if self._lk_stride is not None:
                 self._stride[key] = self._lk_stride
+        # Empty the cache so the next object reloads its key's state.
+        self._lk_g = -1
+        self._lk_s = None
         self._lk_prev = None
         self._lk_stride = None
 

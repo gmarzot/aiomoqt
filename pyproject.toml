@@ -34,7 +34,7 @@ classifiers = [
 ]
 dependencies = [
     "certifi",
-    "aiopquic>=0.4.1",
+    "aiopquic>=0.5.0a2",
     "sortedcontainers>=2.4.0",
 ]
 
@@ -64,6 +64,9 @@ dev = [
     "pytest-asyncio",
     "ruff",
     "ty",
+]
+media = [
+    "av>=19",
 ]
 examples = [
     "argparse",

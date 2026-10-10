@@ -305,6 +305,7 @@ class ParamType(IntEnum):
     OBJECT_FILTER = 0x27
     DYNAMIC_GROUPS = 0x30
     NEW_GROUP_REQUEST = 0x32
+    TRACK_NAMESPACE_PREFIX = 0x34   # d18: REQUEST_UPDATE of a namespace subscription
     GREASE_1_PARAM = 0x55
     GREASE_2_PARAM = 0x8A
 
@@ -433,7 +434,24 @@ D18_PARAM_KINDS: Dict[int, str] = {
     0x21: "bytes",     # SUBSCRIPTION_FILTER
     0x22: "uint8",     # GROUP_ORDER
     0x32: "varint",    # NEW_GROUP_REQUEST
-    0x34: "tuple",     # TRACK_NAMESPACE_PREFIX (Track Namespace)
+    0x34: "tuple",     # TRACK_NAMESPACE_PREFIX: length-prefixed Track Namespace
+}
+
+# d18 §10.2.x: the requests each Message Parameter may appear in, keyed by
+# message class (§10.2.1). Replies are not checked: moq-dev's SUBSCRIBE_OK
+# carries GROUP_ORDER, and what REQUEST_OK may carry depends on the
+# request it answers.
+D18_PARAM_SCOPE: Dict[str, frozenset] = {
+    "Subscribe": frozenset({0x02, 0x03, 0x04, 0x06, 0x10, 0x20, 0x21, 0x22,
+                            0x32}),
+    "Publish": frozenset({0x03, 0x08, 0x09, 0x10}),
+    "Fetch": frozenset({0x03, 0x0A, 0x20, 0x22}),
+    "TrackStatus": frozenset({0x03}),
+    "PublishNamespace": frozenset({0x03}),
+    "SubscribeNamespace": frozenset({0x03}),
+    "SubscribeTracks": frozenset({0x03, 0x10}),
+    "RequestUpdate": frozenset({0x02, 0x03, 0x06, 0x10, 0x20, 0x21, 0x32,
+                                0x34}),
 }
 
 
@@ -577,3 +595,67 @@ class MOQTRequestError(Exception):
         self.retry_interval = retry_interval  # d16: ms before retry+1; 0=don't retry
         self.response = response              # original message object
         super().__init__(f"request error: code={error_code} reason={reason}")
+
+
+# --- transport stream scheduling ------------------------------------------
+#
+# picoquic's stream priority is local only: RFC 9000 §2.3 gives QUIC no wire
+# mechanism for priority and asks only that an implementation offer an API.
+# MoQT does not say how its priority maps onto a scheduler either — §7.2
+# defines an ordering and leaves ordering among equals implementation-defined
+# — so the band layout below is ours to choose. The wire always carries the
+# declared 8-bit MoQT value unchanged; this is the local mapping.
+#
+# Two picoquic behaviours shape it, both measured (tests/bench/sim_link):
+#
+#   - Scheduling is STRICT, not weighted. A lower band takes everything it
+#     has ready before a higher one is served, so there is no way to express
+#     a weighted split. A band that does not saturate leaves the surplus to
+#     the bands below it; only a greedy sender starves them.
+#   - The low bit selects the discipline among streams of EQUAL priority:
+#     even orders by least-recently-sent (fair, ~equal shares), odd by lowest
+#     stream id (one stream takes everything). Every band here is even.
+#
+# Layout, lower = more urgent:
+#
+#     0            disallowed; means "no priority given" on the wire between
+#                  aiomoqt and the transport
+#     2, 4, 6      reserved above control, for a use case not yet defined.
+#                  Anything placed here outranks the control stream and can
+#                  starve it under a greedy sender — deliberate escape hatch
+#     8            control streams
+#     9            datagrams (picoquic's own default, left alone), so
+#                  datagrams beat bulk stream data but yield to control
+#     10 .. 254    subscription data
+STREAM_BAND_UNSET = 0
+STREAM_BAND_RESERVED = (2, 4, 6)
+STREAM_BAND_CONTROL = 8
+STREAM_BAND_DATA_FLOOR = 10
+
+SCHEDULING = ("round_robin", "fifo")
+
+
+def to_stream_priority(moqt_priority: int, *,
+                       discipline: str = "round_robin") -> int:
+    """Map a MoQT publisher priority (0-255, lower = more urgent) to a band.
+
+    The low bit is cleared and re-set from `discipline`, never inherited from
+    the MoQT value: it selects picoquic's tiebreak among equals rather than
+    adding resolution, so carrying it through would make adjacent priorities
+    differ in kind. round_robin shares a band fairly; fifo hands the whole
+    band to its lowest stream id, which no caller can steer.
+
+    Clamped to STREAM_BAND_DATA_FLOOR so declared data can never rise above
+    the control band — a greedy track at a lower band would starve the
+    session's own control stream. The cost is that MoQT 0-10 collapse into
+    one band, leaving 123 distinct bands above it.
+    """
+    if discipline not in SCHEDULING:
+        raise ValueError(
+            f"discipline must be one of {', '.join(SCHEDULING)}, "
+            f"got {discipline!r}")
+    if not 0 <= moqt_priority <= 255:
+        raise ValueError(
+            f"MoQT priority must be 0-255, got {moqt_priority}")
+    band = max(STREAM_BAND_DATA_FLOOR, moqt_priority & 0xFE)
+    return band | (1 if discipline == "fifo" else 0)

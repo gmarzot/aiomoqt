@@ -9,11 +9,15 @@ ids.
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from .messages import SubgroupHeader
-from .messages.data import ObjectDatagram
+from .types import StreamResetCode
+from .messages.data import (
+    FETCH_FLAGS_END_UNKNOWN, FetchObject, ObjectDatagram,
+)
 from .utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -34,6 +38,80 @@ class StreamMapping(Enum):
     DATAGRAM = "datagram"      # loc-02 §4.1: one datagram per object
 
 
+# Bookkeeping charged per object on top of its payload, so a run of empty
+# objects is bounded too.
+_HISTORY_ENTRY_BYTES = 64
+
+
+class ObjectHistory:
+    """Recently published objects, for answering FETCH (§10.12).
+
+    Keyed by (group, object); the first record of a Location wins, since
+    a published object never changes (§2.1). Bounded by `max_bytes`, the
+    oldest dropped first.
+    """
+
+    def __init__(self, max_bytes: int):
+        self.max_bytes = max_bytes
+        self._objects: OrderedDict = OrderedDict()
+        self._bytes = 0
+        # Largest Location dropped: below it, status is unknown.
+        self.evicted_through: Optional[tuple] = None
+
+    def __len__(self) -> int:
+        return len(self._objects)
+
+    def add(self, group_id: int, object_id: int, payload: bytes, *,
+            subgroup_id: Optional[int] = 0, extensions: Any = None,
+            priority: int = 128) -> None:
+        """Record one object. `subgroup_id` None marks one sent as a
+        datagram; `extensions` may be a callable taking the session that
+        fetches it."""
+        key = (group_id, object_id)
+        if key in self._objects:
+            return
+        self._objects[key] = (subgroup_id, payload, extensions, priority)
+        self._bytes += len(payload) + _HISTORY_ENTRY_BYTES
+        while self._bytes > self.max_bytes and self._objects:
+            gone, old = self._objects.popitem(last=False)
+            self._bytes -= len(old[1]) + _HISTORY_ENTRY_BYTES
+            if self.evicted_through is None or gone > self.evicted_through:
+                self.evicted_through = gone
+
+    def fetch(self, start: tuple, end: tuple, session=None, *,
+              descending: bool = False) -> list:
+        """FetchObjects from `start` to `end`, both (group, object) and
+        inclusive. Groups ascend, or descend; objects ascend within a
+        group (§10.12.3). A part of the range already dropped is one End
+        of Unknown Range marker (§11.4.4.2), at the low end of the range."""
+        lost = None
+        if self.evicted_through is not None and start <= self.evicted_through:
+            lost = min(self.evicted_through, end)
+            start = max(start, (lost[0], lost[1] + 1))
+        keys = sorted(k for k in self._objects if start <= k <= end)
+        if descending:
+            keys.sort(key=lambda k: (-k[0], k[1]))
+        out = []
+        for group_id, object_id in keys:
+            subgroup_id, payload, exts, priority = self._objects[
+                (group_id, object_id)]
+            if callable(exts):
+                exts = exts(session)
+            out.append(FetchObject(
+                group_id=group_id, subgroup_id=subgroup_id or 0,
+                object_id=object_id, publisher_priority=priority,
+                extensions=exts or None, payload=payload,
+                datagram=subgroup_id is None))
+        if lost is not None:
+            marker = FetchObject(group_id=lost[0], object_id=lost[1],
+                                 end_of_range=FETCH_FLAGS_END_UNKNOWN)
+            if descending:
+                out.append(marker)
+            else:
+                out.insert(0, marker)
+        return out
+
+
 class SubgroupDelivery:
     """One session's copy of an object sequence.
 
@@ -44,15 +122,25 @@ class SubgroupDelivery:
     """
 
     def __init__(self, session, track_alias: int, *, priority: int = 128,
-                 mapping: StreamMapping = StreamMapping.PER_GROUP):
+                 mapping: StreamMapping = StreamMapping.PER_GROUP,
+                 stream_priority: Optional[int] = None):
         self.session = session
         self.track_alias = track_alias
         self.priority = priority
+        # Transport send priority for this track's streams. None leaves
+        # every stream at the transport default, which is what callers
+        # that never ask for scheduling get. Precomputed by the caller:
+        # the wire byte is constant per track, so it never costs work in
+        # the send loop.
+        self.stream_priority = stream_priority
         self.mapping = mapping
         self.stream_count = 0
         self.largest: Optional[tuple] = None
         self.objects_sent = 0
         self.bytes_sent = 0
+        # passes(group_id, object_id): the peer's subscription filter
+        # (§5.1.2); objects it excludes are not sent. None admits all.
+        self.passes: Optional[Callable[[int, int], bool]] = None
         self._stream_id: Optional[int] = None
         self._header: Optional[SubgroupHeader] = None
 
@@ -81,6 +169,10 @@ class SubgroupDelivery:
                     group_start: bool = False) -> None:
         """Place one object. `group_start` rotates the PER_GROUP stream.
         A callable `extensions` is resolved against this session."""
+        if self.passes is not None and not self.passes(group_id, object_id):
+            if group_start:
+                self.end_group()
+            return
         if callable(extensions):
             extensions = extensions(self.session)
         if self.mapping is StreamMapping.DATAGRAM:
@@ -96,6 +188,8 @@ class SubgroupDelivery:
             # id via subgroup_id.
             sid = await self.session.open_uni_stream()
             self.stream_count += 1
+            if self.stream_priority is not None:
+                self.session.set_stream_priority(sid, self.stream_priority)
             hdr = SubgroupHeader(
                 track_alias=self.track_alias, group_id=group_id,
                 subgroup_id=object_id, publisher_priority=self.priority,
@@ -106,14 +200,20 @@ class SubgroupDelivery:
             await self.session.stream_write_drain(sid, buf.data)
             self.session.stream_write(sid, b"", end_stream=True)
         else:  # PER_GROUP
-            if group_start:
+            if group_start or self._stream_id is None:
+                # A filter can admit a group part-way through: the stream
+                # then opens on a later object, not the group's first.
                 self.end_group()
                 self._stream_id = await self.session.open_uni_stream()
                 self.stream_count += 1
+                if self.stream_priority is not None:
+                    self.session.set_stream_priority(
+                        self._stream_id, self.stream_priority)
                 self._header = SubgroupHeader(
                     track_alias=self.track_alias, group_id=group_id,
                     subgroup_id=0, publisher_priority=self.priority,
-                    extensions_present=True, prof=self._prof)
+                    extensions_present=True, prof=self._prof,
+                    first_object=group_start)
                 self.session.stream_write(self._stream_id,
                                           self._header.serialize().data)
             buf = self._header.next_object(payload=payload,
@@ -129,6 +229,15 @@ class SubgroupDelivery:
         """Give up now, closing the open group if the session still
         takes writes."""
         self.end_group()
+
+    def cancel(self) -> None:
+        """Reset the open stream: the peer's subscription ended part-way
+        through a group."""
+        if self._stream_id is None:
+            return
+        self.session.stream_reset(self._stream_id, StreamResetCode.CANCELLED)
+        self._stream_id = None
+        self._header = None
 
     async def close(self) -> None:
         """Finish cleanly: close the open group."""
@@ -244,6 +353,9 @@ class FanoutDelivery:
                  queue_size: int = LANE_QUEUE_DEFAULT):
         self.queue_size = queue_size
         self.lanes: list = []
+        # Called as on_write(group_id, object_id, payload, extensions) for
+        # each object, once, however many lanes there are.
+        self.on_write: Optional[Callable] = None
         for delivery in deliveries:
             self.add(delivery, joining=False)
 
@@ -284,6 +396,8 @@ class FanoutDelivery:
     async def write(self, group_id: int, object_id: int, payload: bytes, *,
                     extensions: Optional[Dict[int, Any]] = None,
                     group_start: bool = False) -> None:
+        if self.on_write is not None:
+            self.on_write(group_id, object_id, payload, extensions)
         item = (group_id, object_id, payload, extensions, group_start)
         for lane in list(self.lanes):
             lane.offer(item)

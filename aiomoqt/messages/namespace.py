@@ -44,9 +44,10 @@ class PublishNamespace(MOQTMessage):
     def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'PublishNamespace':
         request_id = buf.pull_vint()
         
-        namespace = MOQTMessage._pull_tuple(buf)
+        namespace = MOQTMessage._pull_tuple(buf, prof=prof)
         
-        params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
+        params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
         return cls(request_id=request_id, namespace=namespace, parameters=params)
 
 
@@ -145,7 +146,7 @@ class PublishNamespaceDone(MOQTMessage):
             request_id = buf.pull_vint()
             return cls(request_id=request_id)
         else:
-            namespace = MOQTMessage._pull_tuple(buf)
+            namespace = MOQTMessage._pull_tuple(buf, prof=prof)
             return cls(namespace=namespace)
 
 
@@ -194,7 +195,7 @@ class PublishNamespaceCancel(MOQTMessage):
         if is_draft16_or_later(prof.draft):
             request_id = buf.pull_vint()
         else:
-            namespace = MOQTMessage._pull_tuple(buf)
+            namespace = MOQTMessage._pull_tuple(buf, prof=prof)
         error_code = buf.pull_vint()
         reason = MOQTMessage._pull_reason(buf)
         return cls(namespace=namespace, error_code=error_code, reason=reason, request_id=request_id)
@@ -239,11 +240,12 @@ class SubscribeNamespace(MOQTMessage):
     @classmethod
     def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'SubscribeNamespace':
         request_id = buf.pull_vint()
-        namespace_prefix = MOQTMessage._pull_tuple(buf)
+        namespace_prefix = MOQTMessage._pull_tuple(buf, prof=prof)
         subscribe_options = 0
         if is_draft16_or_later(prof.draft) and not prof.vi64:
             subscribe_options = buf.pull_vint()
-        params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
+        params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
         return cls(request_id=request_id, namespace_prefix=namespace_prefix,
                    subscribe_options=subscribe_options, parameters=params)
 
@@ -281,8 +283,9 @@ class SubscribeTracks(MOQTMessage):
     @classmethod
     def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'SubscribeTracks':
         request_id = buf.pull_vint()
-        namespace_prefix = MOQTMessage._pull_tuple(buf)
-        params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
+        namespace_prefix = MOQTMessage._pull_tuple(buf, prof=prof)
+        params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
         return cls(request_id=request_id, namespace_prefix=namespace_prefix,
                    parameters=params)
 
@@ -319,8 +322,8 @@ class PublishBlocked(MOQTMessage):
 
     @classmethod
     def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'PublishBlocked':
-        namespace_suffix = MOQTMessage._pull_tuple(buf)
-        track_name = buf.pull_bytes(buf.pull_vint())
+        namespace_suffix, track_name = MOQTMessage._pull_full_track_name(
+            buf, prof=prof)
         return cls(namespace_suffix=namespace_suffix, track_name=track_name)
 
 
@@ -407,5 +410,5 @@ class UnsubscribeNamespace(MOQTMessage):
 
     @classmethod
     def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'UnsubscribeNamespace':
-        namespace_prefix = MOQTMessage._pull_tuple(buf)
+        namespace_prefix = MOQTMessage._pull_tuple(buf, prof=prof)
         return cls(namespace_prefix=namespace_prefix)

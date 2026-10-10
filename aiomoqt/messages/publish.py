@@ -97,10 +97,8 @@ class Publish(MOQTMessage):
         # have no length prefix; sequence runs to end of message).
         request_id = buf.pull_vint()
 
-        namespace = MOQTMessage._pull_tuple(buf)
-
-        track_name_len = buf.pull_vint()
-        track_name = buf.pull_bytes(track_name_len)
+        namespace, track_name = MOQTMessage._pull_full_track_name(
+            buf, prof=prof)
         track_alias = buf.pull_vint()
 
         group_order = None
@@ -111,7 +109,8 @@ class Publish(MOQTMessage):
         track_extensions = None
 
         if is_draft16_or_later(prof.draft):
-            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
+            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
             forward = params.pop(ParamType.FORWARD, None)
             largest = params.pop(ParamType.LARGEST_OBJECT, None)
             if largest is not None:
@@ -128,10 +127,15 @@ class Publish(MOQTMessage):
                 content_exists = ContentExistsCode.NO_CONTENT
             track_extensions = MOQTMessage._extensions_decode(
                 buf, with_length=False, buf_end=buf_end, delta=True)
+            if prof.draft >= 18:
+                MOQTMessage._check_track_properties(track_extensions,
+                                                    prof=prof)
             group_order = GroupOrder.ASCENDING
             if track_extensions is not None:
                 go_val = track_extensions.pop(0x22, None)
                 if go_val is not None:
+                    MOQTMessage._check_range(
+                        "default publisher group order", go_val, 1, 2)
                     group_order = go_val
         else:
             group_order = buf.pull_uint8()
@@ -140,7 +144,8 @@ class Publish(MOQTMessage):
                 largest_group_id = buf.pull_vint()
                 largest_object_id = buf.pull_vint()
             forward = buf.pull_uint8()
-            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
+            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
 
         return cls(
             request_id=request_id,
@@ -196,7 +201,8 @@ class PublishOk(MOQTMessage):
                 params[ParamType.FORWARD] = self.forward
             if self.priority is not None:
                 params[ParamType.SUBSCRIBER_PRIORITY] = self.priority
-            if self.group_order is not None:
+            # d16+ has no 0 value; omission means the publisher's order.
+            if self.group_order not in (None, GroupOrder.PUBLISHER_DEFAULT):
                 params[ParamType.GROUP_ORDER] = self.group_order
             if self.filter_type is not None:
                 # Filter internals follow the negotiated varint codec
@@ -256,7 +262,8 @@ class PublishOk(MOQTMessage):
         end_group = None
 
         if is_draft16_or_later(prof.draft):
-            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
+            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
             forward = params.pop(ParamType.FORWARD, None)
             priority = params.pop(ParamType.SUBSCRIBER_PRIORITY, None)
             group_order = params.pop(ParamType.GROUP_ORDER, None)
@@ -278,6 +285,9 @@ class PublishOk(MOQTMessage):
                     if prof.vi64:
                         # d18: End Group arrives as a delta from Start.
                         end_group += start_group or 0
+                        if end_group > (1 << 64) - 1:
+                            raise MOQTProtocolViolation(
+                                f"end group {end_group} exceeds 2^64-1")
         else:
             forward = buf.pull_uint8()
             priority = buf.pull_uint8()
@@ -288,7 +298,8 @@ class PublishOk(MOQTMessage):
                 start_object = buf.pull_vint()
             if filter_type == 4:
                 end_group = buf.pull_vint()
-            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
+            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
 
         return cls(
             request_id=request_id,

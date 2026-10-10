@@ -7,27 +7,32 @@ stays up throughout.
 """
 import asyncio
 import time
+from collections import OrderedDict
 from types import SimpleNamespace
 
 import pytest
 
 from aiomoqt.context import profile_for
 from aiomoqt.messages.subscribe import SubscribeDone, Unsubscribe
-from aiomoqt.protocol import _MOQTSessionMixin
+from aiomoqt.protocol import _DataStreamState, _MOQTSessionMixin
 from aiomoqt.track import PublishedTrack
 from aiomoqt.types import ForwardingPreference
 
 
 def _session(draft=18):
     s = object.__new__(_MOQTSessionMixin)
+    s._peer_requests = {}
     s.negotiated_draft = draft
     s._profile = profile_for(draft)
     s._subscriptions = {}
     s._track_aliases = {}
+    s._published_aliases = {}
     s._object_handlers = {}
     s._pending_requests = {}
     s._request_cancel_handlers = {}
     s._publish_done_handlers = {}
+    s._published_tracks = {}
+    s._requests = {}
     s._subgroup_stream_by_key = {}
     s._data_streams = {}
     s._control_chains = {}
@@ -36,6 +41,7 @@ def _session(draft=18):
     s._stream_torn_down_last_sweep = time.monotonic()
     s._stream_torn_down_evict_after = 30.0
     s._stream_end_handlers = {}
+    s._early_stream_ends = OrderedDict()
     s._fetch_done_futures = {}
     s._fetch_stream_by_request = {}
     s._group_bound = {}
@@ -75,6 +81,39 @@ async def test_last_subscription_ending_does_not_close_the_session():
     assert s._subscriptions == {}
 
 
+def _finished_track(s):
+    """Alias 3 for subscription 2, with one subgroup stream still open."""
+    s._loop = asyncio.get_running_loop()
+    s.PUBLISH_DONE_GRACE_S = 0.01
+    s._subscriptions = {2: ["sub"]}
+    s._track_aliases = {3: 2}
+    s._object_handlers = {3: lambda *a: None}
+    s._subgroup_stream_by_key = {(3, 0, 0): 11}
+    s.stopped = []
+    s.stream_stop_sending = lambda sid, code: s.stopped.append(sid)
+
+
+@pytest.mark.asyncio
+async def test_publish_done_keeps_receiving_until_the_grace_ends():
+    # §10.11: objects can still arrive after PUBLISH_DONE.
+    s = _session()
+    _finished_track(s)
+    await s._handle_subscribe_done(_done(2))
+    assert 3 in s._object_handlers and s.stopped == []
+    await asyncio.sleep(0.05)
+    assert 3 not in s._object_handlers and s.stopped == [11]
+
+
+@pytest.mark.asyncio
+async def test_grace_release_leaves_an_alias_a_newer_subscription_took():
+    s = _session()
+    _finished_track(s)
+    await s._handle_subscribe_done(_done(2))
+    s._track_aliases[3] = 4
+    await asyncio.sleep(0.05)
+    assert 3 in s._object_handlers and s.stopped == []
+
+
 @pytest.mark.asyncio
 async def test_publish_done_handler_fires_once():
     s = _session()
@@ -99,6 +138,34 @@ async def test_unsubscribe_reaches_the_owner_before_d18(draft):
     s.register_request_cancel_handler(7, cancelled.append)
     await s._handle_unsubscribe(Unsubscribe(request_id=7))
     assert cancelled == [7]
+
+
+@pytest.mark.asyncio
+async def test_unsubscribe_leaves_a_received_track_with_the_same_alias():
+    # Both ends number aliases from 0, so a session that publishes and
+    # subscribes holds alias 0 twice. The peer leaving the track we
+    # publish must not touch the track we receive under that number.
+    s = _session(16)
+    s._next_track_alias = 0
+    s._send_reply = lambda rid, msg, fin=False: None
+    resets = []
+    s.stream_reset = lambda sid, code: resets.append(sid)
+
+    def on_object(*a, **k):
+        pass
+    s._track_aliases[0] = 2
+    s.register_object_handler(0, on_object)
+    s._subgroup_stream_by_key[(0, 5, 0)] = 11
+
+    ok = s.subscribe_ok(request_msg=SimpleNamespace(request_id=7))
+    assert ok.track_alias == 0
+    await s._handle_unsubscribe(Unsubscribe(request_id=7))
+
+    assert s._published_aliases == {}
+    assert s._track_aliases == {0: 2}
+    assert s._object_handlers == {0: on_object}
+    assert s._subgroup_stream_by_key == {(0, 5, 0): 11}
+    assert resets == []
 
 
 def _track(session, subgroups=2):
@@ -236,3 +303,38 @@ async def test_a_returning_subscriber_gets_objects_again():
             assert session._close_err is None
     finally:
         server.close()
+
+
+def _end_stream(s, sid, alias, group_id=0, subgroup_id=0):
+    s._data_streams[sid] = _DataStreamState(
+        chain=None, key=("subgroup", (alias, group_id, subgroup_id)))
+    s._cleanup_stream(sid)
+
+
+def test_a_stream_that_ends_before_its_handler_is_reported_on_registration():
+    # A one-object stream can FIN before the subscriber registers.
+    s = _session()
+    _end_stream(s, 3, alias=7, group_id=0, subgroup_id=0)
+    got = []
+    s.register_stream_end_handler(7, lambda g, sg, clean, reset_code:
+                                  got.append((g, sg, clean)))
+    assert got == [(0, 0, True)]
+    s.register_stream_end_handler(7, lambda *a, **kw: got.append(a))
+    assert got == [(0, 0, True)]          # reported once
+
+
+def test_an_early_stream_end_past_the_hold_is_dropped():
+    s = _session()
+    s.EARLY_STREAM_END_HOLD_S = 0.0
+    _end_stream(s, 3, alias=7)
+    got = []
+    s.register_stream_end_handler(7, lambda *a, **kw: got.append(a))
+    assert got == []
+
+
+def test_early_stream_ends_are_bounded():
+    s = _session()
+    s.EARLY_STREAM_END_MAX = 2
+    for sid, alias in ((3, 1), (7, 2), (11, 3)):
+        _end_stream(s, sid, alias=alias)
+    assert list(s._early_stream_ends) == [2, 3]

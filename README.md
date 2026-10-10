@@ -29,6 +29,9 @@ Pure Python. `aiopquic` (the QUIC transport) installs as a binary wheel automati
 
 For a clean, uv-managed `.venv`, run `./bootstrap_python.sh`.
 
+HLS/DASH ingest (`pub_media --input`) needs PyAV, an optional extra:
+`uv pip install 'aiomoqt[media]'`. Without it, `--input` exits with that hint.
+
 ## Quick start
 
 ### 1. Verify the install and reach a relay
@@ -54,6 +57,9 @@ python -m aiomoqt.tools.relay_probe --url https://moqx-main.ci.openmoq.org:4433/
 ```
 
 The probe exits 0 if any draft handshakes, so it drops straight into a shell conditional.
+
+Clients verify the relay's certificate against certifi's roots; pass `-k` to accept a
+self-signed one (the loopback tools do), or `MOQTClient(ca_file=...)` to trust a private CA.
 
 ### 2. Subscribe
 
@@ -121,6 +127,8 @@ Register handlers for peer-initiated messages:
 client.register_handler(MOQTMessageType.SUBSCRIBE, my_subscribe_handler)
 ```
 
+A SUBSCRIBE, PUBLISH_OK or subscription update addressed to a track the session publishes goes to that track; the handler sees the rest. With no SUBSCRIBE handler, a SUBSCRIBE for a track the session does not publish is refused with DOES_NOT_EXIST.
+
 Request failures raise `MOQTRequestError` regardless of negotiated draft.
 
 ### Tracks
@@ -129,6 +137,16 @@ Request failures raise `MOQTRequestError` regardless of negotiated draft.
 |---|---|
 | `PublishedTrack` | stream setup, subgroup writing, pacing, TX budget |
 | `SubscribedTrack` | object reassembly, FETCH / JOIN handling |
+
+Several tracks can share a session; each gets the control messages that name it or its requests. `publish()` announces a track (PUBLISH, PUBLISH_NAMESPACE, or both). `attach()` serves it without announcing, for tracks announced together under one namespace:
+
+```python
+for name in ('video', 'audio'):
+    MyTrack(session, 'ns', name).attach()
+await session.publish_namespace(namespace='ns', wait_response=True)
+```
+
+A full track name (namespace + name) serves one track per session.
 
 `StreamMapping` selects the data-plane shape: `PER_GROUP` (subgroup stream per group) or `DATAGRAM` (one object per datagram; raw QUIC only — see Limitations).
 
@@ -166,6 +184,11 @@ python -m aiomoqt.tools.pub_media $RELAY -N demo/live --mp4 clip.mp4 --loop \
 # Same content, CMAF packaging (requires --mp4)
 python -m aiomoqt.tools.pub_media $RELAY -N cmsf/live --mp4 clip.mp4 --packaging cmaf --loop
 
+# HLS or DASH (anything FFmpeg opens) as CMAF (needs aiomoqt[media]); --rendition all
+# (experimental) = every video rendition as one alternate group, fetched in turn, so
+# large ladders fall behind real time
+python -m aiomoqt.tools.pub_media $RELAY -N vod --input https://cdn.example/master.m3u8 -t 3600
+
 # Live H.264 Annex-B ingest (OBS / ffmpeg pipe); frames stamped on arrival
 ffmpeg -i 'srt://0.0.0.0:9000?mode=listener' -map 0:v -c:v copy -f h264 - \
   | python -m aiomoqt.tools.pub_media $RELAY -N obs --h264 - --no-audio
@@ -174,6 +197,9 @@ ffmpeg -i 'srt://0.0.0.0:9000?mode=listener' -map 0:v -c:v copy -f h264 - \
 python -m aiomoqt.tools.sub_media $RELAY -N demo/live --inspect 5 --show-catalog
 ffplay media-out/video.h264      # LOC → elementary stream
 ffplay media-out/video.mp4       # CMAF → fMP4
+
+# Measure delivery instead: latency, jitter, loss, playout model; no decode, no files
+python -m aiomoqt.tools.sub_media $RELAY -N demo/live --analyze -t 60 -i 5 --report run.csv
 ```
 
 Source material should use short GOPs and no B-frames (`-g 2×fps -sc_threshold 0 -bf 0`) for low join latency. CMAF chunks carry one sample each with no composition-time offsets, so B-frame sources will not present correctly.
@@ -236,8 +262,8 @@ Each tool runs as a module (`python -m aiomoqt.tools.NAME`) and most also instal
 | Module | Console script | Purpose |
 |---|---|---|
 | `aiomoqt.versions` | `aiomoqt-versions` | version report (aiomoqt, aiopquic, picoquic/picotls SHAs) |
-| `tools.pub_media` | — | MSF/LOC/CMAF media publisher (mp4, live H.264, tone) |
-| `tools.sub_media` | — | catalog-driven media subscriber; writes playable files |
+| `tools.pub_media` | — | MSF/LOC/CMAF media publisher (mp4, live H.264, MPEG-TS, HLS/DASH, tone) |
+| `tools.sub_media` | — | catalog-driven media subscriber; writes playable files or measures delivery (`--analyze`) |
 | `tools.pub_bench` | `moq-pub-bench` | publisher benchmark |
 | `tools.sub_bench` | `moq-sub-bench` | subscriber benchmark — latency, jitter, loss |
 | `tools.loopback_bench` | `moq-loopback-bench` | in-process publisher + subscriber, no relay |

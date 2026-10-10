@@ -172,8 +172,10 @@ async def _slot_task(cfg, relay, slot, events_q, group, shard,
         except asyncio.TimeoutError:
             pass
 
-    def _on_object(msg, size_bytes, recv_time_ms, *_args, **_kw):
-        stats.on_object(msg, size_bytes, recv_time_ms)
+    def _on_object(msg, size_bytes, recv_time_us, group_id=None,
+                   subgroup_id=None, *_args, **_kw):
+        stats.on_object(msg, size_bytes, recv_time_us, group_id,
+                        subgroup_id)
 
     outcome = "died"
     try:

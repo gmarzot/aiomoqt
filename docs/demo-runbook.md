@@ -1,9 +1,10 @@
 # aiomoqt media pipeline demos
 
-Four flows. Three publish through a deployed relay into the browser
-player — CMAF from a file, LOC from a file, and OBS over SRT as live
-MPEG-TS — and one consumes an outside publisher. Goal for each: stable
-low latency with the overlay numbers to prove it.
+Five flows. Four publish through a deployed relay into the browser
+player — CMAF from a file, LOC from a file, OBS over SRT as live
+MPEG-TS, and HLS or DASH from the web — and one consumes an outside
+publisher. Goal for each: stable low latency with the overlay numbers to
+prove it.
 
 Synthetic load, ramps and churn are in
 [bench-runbook.md](bench-runbook.md).
@@ -19,7 +20,7 @@ be right:
 | Setting | Value | What it is for |
 |---|---|---|
 | catalog refresh | `--catalog-interval 1` | a viewer joining after the first waits for the next catalog object; at 10 that is 0–10 s of TTFF per tab (loopback 09-12: ~5 s at 10, ~1 s at 1) |
-| source asset | no B-frames | pub_media stamps decode order with no composition offsets, so B-frame sources judder. tos-*, tian-nature-*, bbb-720p-2000k.mp4 and sintel-1280-demo.mp4 are fine; sintel-1280-surround.mp4 is bf=2 |
+| source asset | no B-frames (`--mp4`, `--ts`) | pub_media stamps decode order with no composition offsets, so B-frame sources judder. tos-*, tian-nature-*, bbb-720p-2000k.mp4 and sintel-1280-demo.mp4 are fine; sintel-1280-surround.mp4 is bf=2. `--input` (demo E) keeps the source's offsets, so B-frames are fine there |
 | start order | publisher, then viewer | pub_media sends nothing until a viewer subscribes; its `dropped` counter is the frames skipped until then |
 
 ## Before anything: paste this in every shell
@@ -58,13 +59,17 @@ and finds whichever run is publishing under it. Copy the publisher's
 Two shells, in this order. The first one blocks — it is the dev server —
 so it cannot share a shell with anything below it.
 
-- SHELL 1, and leave it running: `cd "$PLAYA" && pnpm build && pnpm --filter @moqt/examples dev`
-  → :5173. After player edits: `pnpm -r --filter "./packages/**" build`
-  and restart vite (the examples import the packages' dist).
+- SHELL 1, and leave it running: `cd "$PLAYA" && pnpm install && pnpm --filter @moqt/examples dev`
+  → :5173. Vite serves the player packages from source and hot-reloads, so
+  player edits need no rebuild or restart; `pnpm -r build` only refreshes
+  the dist types the example pages type-check against. Run `pnpm install`
+  again after a pull that adds packages.
 - SHELL 2, the venv shell, and the one every demo below uses:
   `python -m aiomoqt.tools.relay_probe --url "$RELAY_WT" --draft 18` → expect ✓
 - SHELL 2: `hostname -I` → WSL IP for the OBS SRT URL (changes across
   reboots). Only demo C needs it.
+- SHELL 2: `uv pip install -e ".[media]"` → PyAV, for demo E only;
+  without it `--input` exits with that install hint.
 - Assets in `$ASSETS/`, all H.264 High / yuv420p / bf=0 with AAC stereo:
 
   | asset | shape | rate | used by |
@@ -80,22 +85,34 @@ so it cannot share a shell with anything below it.
   are bf=2, as is `sintel-1280-surround.mp4`. The names are close to the
   safe ones — check `has_b_frames` before substituting.
 
-## Player URL parameters (/simple/)
+## Player URL parameters (/g5-player/)
+The publisher's `player:` line opens `/g5-player/` (`--player-base`). The
+page's settings dialog edits the same parameters.
+
 | Param | Meaning | Default |
 |---|---|---|
 | `url=` | relay WT URL | probe page host |
 | `ns=` | namespace, split on `/` (`nsField=` repeatable for literal fields) | live |
 | `v=` | draft 14/16/18; a 16/18 pin never retries WT bare | 16 |
 | `catalogBootstrap=` | auto / joining-fetch / strict / subscribe | auto |
+| `targetLatency=` | overrides the catalog target (ms): LOC cushion cap and catch-up set point; CMAF buffer held ahead, soft-chase set point, live-edge and gap-jump landing | catalog value |
+| `cushion=` / `cushionMax=` | LOC render-cushion floor / cap (ms) | 200 (50 if RTT < 5 ms) / 750 |
+| `catchUp=` | LOC max playback rate chasing the target; wall-clock based | 1.0 = off |
 | `warmStart=1` | joining FETCH of the current group (LOC only; startup decode error at the seam) | off |
-| `catchUp=` | max playback rate chasing `targetLatency=` from the URL (not the catalog); wall-clock based | 1.0 = off |
-| `targetLatency=` | catch-up set point (ms); on CMAF also the seek landing; LOC cushion cap | catalog value; CMAF landing 2 s |
-| `cushion=` / `cushionMax=` | LOC render-cushion floor / cap (ms) | 200 (50 if RTT<5 ms) / target latency, at most 750 |
+| `congestionControl=` | `low-latency` / `throughput` hint to the browser's QUIC | browser default |
+| `compat=` | `request-credit`, `empty-objects`: opt-in leniency for non-conformant relays | none |
+| `authority=` | CLIENT_SETUP AUTHORITY for tenant-routed relays | none |
+| `hash=` | relay certificate hash (hex) | none |
 | `debug=1` | engine debug log, MSE tracing, media-element events in the page log | off |
+| `status=1` | playback state over the picture | off |
 
-The page log prints `Options: …` at load with exactly what reached the
-engine. Overlay "cushion ms": MSE = buffered ahead of the playhead;
-WebCodecs = scheduled audio ahead, or the render cushion when video-only.
+On draft 18 the page follows the namespace with SUBSCRIBE_NAMESPACE (SUB_NS
+badge; grey on draft 16, where it is not sent): a publisher that goes away
+and returns is re-joined without a reload. The page log prints `Options: …`
+at load with exactly what reached the engine. Readouts: LATENCY p50/p95/max
+is capture → arrival; `E2E` is capture → drawn frame (`≈` on CMAF, where it
+is arrival plus the buffer ahead); QUEUED is what each track has ahead of
+the playhead against TARGET.
 
 ## Demo A — CMAF file → glass (MSE playback)
 - SHELL 1 — Big Buck Bunny, 1920x1080@30, 2.3 Mbps:
@@ -112,13 +129,21 @@ WebCodecs = scheduled audio ahead, or the render cushion when video-only.
 - Levers: `--target-latency` on the publisher is what the catalog
   advertises and what the player's cushion target follows (seek landing
   and soft-chase set point); `targetLatency=` on the player overrides it.
-- Adapter behavior (fork, from 92e420d onward): late previous-group objects
-  are kept (no one-frame holes); a buffered hole is jumped after a wait
-  scaled to its width (300 ms floor), landing near the live edge; a
-  cushion above target + 0.5 s is drained at 1.05x until within 0.1 s.
-  Before the port (upstream v0.5.9 adapter) the same run showed 40 ms
-  holes, a 2 s wait and a 2 s → 4.3 s cushion climb; a stall line with
-  `[a–b][b+0.04–c]` ranges after the port would be a regression.
+- Player behavior on CMAF: the buffer is held at the target. A cushion
+  more than two-thirds of the target above it is shed at 1.05x, released at
+  the target as measured just before new media lands; a stall that begins
+  inside that band raises the release point
+  (`[MSE] stalled with N ms buffered while catching up; catch-up now stops
+  at M ms`). Audio and video are appended in decode order across group
+  boundaries (`audio/video order restored/missing/late` in the log); video
+  that would land behind what is already appended is dropped, since MSE
+  would otherwise drop video until the next keyframe. Resume after a pause
+  starts at the first media after it. A buffered hole is jumped after a
+  wait scaled to its width (300 ms floor), landing near the live edge.
+- CMAF floor: at 24 fps MSE stalls with about 100–150 ms buffered, so a
+  target below about 150 ms cycles stall → refill → catch-up. A video-only
+  hole that ends at a keyframe is a decode-order race or a lost object;
+  `Stale video dropped before MSE` lines name the drops the player made.
 
 ## Demo B — LOC file → glass (WebCodecs, A/V, joining fetch)
 - SHELL 1 — TianNature, 1920x1080@30, 7.9 Mbps, the highest-rate asset:
@@ -202,14 +227,17 @@ arrival. Prefer `--ts`.
   completes instead of when the next one starts (keyframes > 64 KB still
   wait); `-muxdelay 0` drops the 0.7 s default bound.
 - Measure: burn-in clock vs player frame (screenshot both), overlay
-  latency P50/P95 (capture→arrival), cushion, stalls. Glass: 09-09
+  latency P50/P95 (pub_media→arrival, see below), cushion, stalls. Glass: 09-09
   640 ms (before the 64 KB read fix and the cushion knob); 09-16 1.17 s
   without the muxer flags and 0.58 s with them (OBS 3440x1440, cushion 200).
 - On `--h264` frame pacing follows arrival stamps, so SRT/ffmpeg
   burstiness shows as uneven presentation; `--ts` stamps from the PES
-  PTS and does not have this. The latency stat on `--ts` includes a
-  constant offset equal to the encoder-to-first-arrival delay (the clock
-  anchors on the first demuxed unit).
+  PTS and does not have this. `--ts` anchors the PTS to the wall clock
+  at the least-delayed unit seen, so stamps never run ahead of arrival
+  (a late first unit or a fast `-re` clock cannot make latency
+  negative). The latency stat is therefore transport delay from
+  pub_media onward; encoder and SRT delay sit inside the anchor, and
+  only the burn-in clock shows them.
 
 ## Demo D — someone else's publisher → our subscriber (interop)
 The only flow that tests the receive path against an independent
@@ -251,12 +279,51 @@ start; Eyevinn's moqlivemock endpoint is always on.
   and dies on ALPN at draft 18; no Go toolchain here to build a current
   one. They also host a warp-player and an MSF/CMSF validator.
 
+## Demo E — HLS / DASH from the web → glass (`--input`, CMAF)
+`pub_media --input URL` republishes an HLS playlist, a DASH MPD or anything
+else FFmpeg opens as CMAF tracks, played through MSE as in demo A. HLS goes
+through FFmpeg's reader (PyAV); DASH through `aiomoqt.media.dash`, since
+PyAV ships no DASH demuxer. Chunks keep the source's decode times and
+composition offsets. Needs the `media` extra (Prep).
+- SHELL 1 — live HLS, fMP4, 2 s segments, 1080p/720p/480p/360p@24 with a
+  separate AAC group (plain http):
+  `python -m aiomoqt.tools.pub_media "$RELAY_WT" --draft 18 -k --pub-both --input http://161.153.77.254:8888/tears-of-steel/index.m3u8 --keepalive 10 --catalog-interval 1 -t 3600`
+  Startup prints one `input <track>: <codec> <size>` line per track. The
+  default `--rendition best` publishes the top video rendition and audio.
+- Live DASH, 640x360@30 with AAC, 2 s segments (DASH-IF livesim2): same line
+  with `--input https://livesim2.dashif.org/livesim2/testpic_2s/Manifest.mpd`.
+- HLS over https, MPEG-TS segments (10 s), VOD (Mux): same line with
+  `--input https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`. VOD is
+  paced in real time and ends with the stream or `-t`; `--loop` does not
+  apply to `--input`.
+- BROWSER: paste the `player:` URL. Add `&debug=1` for the engine log.
+- HLS against DASH, in the page log: `audio order restored` climbs on HLS
+  (one group, so one QUIC stream, per AAC frame) and stays near 0 on DASH
+  (one group per source segment).
+- `--rendition all` (experimental): every video rendition as one catalog
+  alternate group. Renditions are fetched one after another, so larger
+  ladders fall behind real time (the 4-rendition Kitsune ladder, ~13 Mbps
+  in total, ran ~10 objects/s per track instead of 24), and the player
+  does not switch renditions yet. On HLS, renditions whose scene-cut key
+  frames differ number their groups differently; DASH groups follow the
+  source segments and stay aligned.
+- Targets: not yet measured on a corrected WSL clock. Expect to sit a few
+  segments behind the source's live edge — HLS starts three segments
+  back, DASH two segments (or `suggestedPresentationDelay`) back — plus
+  the usual relay path.
+- Wire: `python -m aiomoqt.tools.sub_media "$RELAY_WT" -N aiomoqt --discover --draft 18 --analyze -t 60`
+- Known: rough playback from `--input` publishes is under investigation.
+  No reconnect: an input error ends the run (HTTP requests retry; a
+  missing live DASH segment is skipped; a live DASH feed with no new
+  segment for four segment durations ends). Encrypted, SegmentBase and
+  multi-period DASH and AES-128 HLS are refused; SCTE-35 / `emsg` do not
+  pass through.
+
 ## Reading a stall or a pinned cushion
 - Publisher `lag mean/max ms` per track = how late a frame was against
   its own capture stamp when the feeder sent it (source, pipe, demux).
-  Signed: NEGATIVE means the stamp is ahead of the wall clock, which a
-  receiver reads as negative end-to-end latency (the player labels it
-  "clock skew"). `tx` appears only when handing to the track costs
+  On `--ts` it is never negative: it is delay beyond the least-delayed
+  unit seen, i.e. pipe jitter. `tx` appears only when handing to the track costs
   ≥ 0.05 ms, so it showing at all means backpressure here. Neither is
   end-to-end latency: a live source's stamps anchor to their own
   arrival, so constant upstream delay reads as zero.
@@ -285,6 +352,15 @@ start; Eyevinn's moqlivemock endpoint is always on.
 
 ## Troubleshooting
 - "no such namespace" → publisher down / wrong -N / reused namespace. Blank page → vite down.
+- Periodic trouble on WSL-published streams only (a ~30 s latency sawtooth,
+  sync re-anchors, stalls every few seconds) while a browser-published
+  g5-broadcast on the same relay plays clean → look at the WSL host before
+  the code: compare its clock with Windows for 60–90 s and log scheduling
+  gaps (see the clock note in [demo-runbook-g5.md](demo-runbook-g5.md)).
+  A WSL publisher's timestamps and pacing inherit both.
+- A viewer of a namespace restarted under the same name gets no catalog →
+  moqx answers its FETCH from the earlier run's cache (openmoq/moqx#795).
+  pub_media mints a fresh namespace per run; this only bites with `-N`.
 - "no such namespace" that never resolves even with the publisher up →
   missing `--pub-both`. A bare PUBLISH leaves no route back to an idling
   publisher once the last subscriber leaves; every publish command here
@@ -310,7 +386,10 @@ start; Eyevinn's moqlivemock endpoint is always on.
   as a floor, so request ids arriving out of order across concurrent
   request streams (one SUBSCRIBE per track) read as a reuse. Update
   aiomoqt. The relay was correct.
-- Two-frame judder, steady flow → B-frame source. Use a `-bf 0` asset.
+- Two-frame judder, steady flow → B-frame source on `--mp4` or `--ts`.
+  Use a `-bf 0` asset (`--input` keeps composition offsets).
+- `--input` exits with `media ingest needs PyAV: pip install
+  'aiomoqt[media]'` → the demo E Prep step was skipped.
 - Soft/blurry picture on LOC or SRT, unchanged by encoder settings →
   the canvas backing store was never sized, so frames were drawn at the
   300x150 HTML default and stretched back by CSS (fixed e8e674c; CMAF
@@ -326,8 +405,13 @@ start; Eyevinn's moqlivemock endpoint is always on.
   known state); on LOC → check `cushion=` and the Options line.
 - Audio drops out, "audio late / snap" late count rising → cushion below
   the source's A/V skew; raise `--target-latency`.
+- `--ts` audio underruns with the page log full of `arrival gap
+  250–400ms before group N/0` → the ffmpeg muxer flags are missing
+  (Demo C). Without `-pes_payload_size 0` ffmpeg packs ~15 AAC frames
+  per PES, so audio lands in ~300 ms bursts, longer than a 200 ms
+  cushion.
 
-Pinned: moq-playa-v059 0540d37 (branch gmarzot-playa-dev on upstream
-v0.5.9; fork PR gmarzot/moq-playa#1) ·
+Pinned: moq-playa-v059 2cf770f (branch gmarzot-playa-dev, merged with
+upstream openmoq/moq-playa main 872f415) ·
 aiomoqt gmarzot-0.11.0 607b668 ·
 moqx-main v0.3.5 (linode-ci-000).

@@ -2,11 +2,12 @@
   "_schema": {
     "name":             "short id used in results table",
     "urls":             "map of transport → URL; keys: raw-quic, h3-wt",
-    "drafts":           "list of MoQT draft numbers (14, 16)",
+    "drafts":           "list of MoQT draft numbers (14, 16, 18)",
     "pub_mode":         "publisher messages: publish | publish-ns | publish-both",
     "insecure":         "bool; if true, pass --tls-disable-verify / -k (default false)",
     "disabled":         "bool; if true, skip this relay entirely (default false)",
     "disabled_suites":  "list of interop suite names to skip for this relay",
+    "xfail_suites":     "list of interop suites that run and report but never gate for this relay: a documented peer non-conformance the case correctly fails on",
     "compat":           "list of WIRE tolerance keys passed to the tools as --compat (libquicr, lenient-extensions, ...); the tools reject unknown values",
     "gating":           "list of draft numbers whose results gate CI (a FAIL fails the job). Absent/empty = non-gating: the relay still runs and reports, but its failures are XFAIL and never gate. Curate this to endpoints we hold ourselves to.",
     "notes":            "freeform (optional)"
@@ -18,11 +19,11 @@
         "raw-quic": "moqt://moqx-main.ci.openmoq.org:4433",
         "h3-wt":    "https://moqx-main.ci.openmoq.org:4433/moq-relay"
       },
-      "drafts": [14, 16, 18],
+      "drafts": [16, 18],
       "gating": [16, 18],
       "pub_mode": "publish",
       "disabled_suites": [],
-      "notes": "openmoq moqx CI relay. Covers drafts 14/16/18 over both raw-QUIC and H3/WT (/moq-relay)."
+      "notes": "openmoq moqx CI relay. Covers drafts 16/18 over both raw-QUIC and H3/WT (/moq-relay); moqx dropped d14."
     },
     {
       "name": "cloudflare-d14",
@@ -40,11 +41,11 @@
         "raw-quic": "moqt://fb.mvfst.net:9448",
         "h3-wt":    "https://fb.mvfst.net:9448/moq-relay"
       },
-      "drafts": [14, 16],
-      "gating": [16],
+      "drafts": [16, 18],
+      "gating": [16, 18],
       "pub_mode": "publish",
       "disabled_suites": [],
-      "notes": "Upstream moxygen reference relay"
+      "notes": "Upstream moxygen/mvfst reference relay, the conformant d16/d18 reference; moxygen dropped d14."
     },
     {
       "name": "moq-dev-anon",
@@ -80,7 +81,8 @@
       "insecure": true,
       "compat": ["libquicr"],
       "disabled_suites": [],
-      "notes": "Cisco libquicr (server cert unacceptable → insecure). d14 dropped (raw + WT now unresponsive — relay appears d16-only). compat=libquicr covers two non-spec behaviors, tolerated + annotated: (1) relay returns SUBSCRIBE_OK for a nonexistent track (deferred-delivery policy); (2) relay returns FETCH_ERROR code=0 (INTERNAL_ERROR) for a nonexistent-track FETCH — the fetch probe honors libquicr code=0 as a deliberate refusal (the relay answered structurally in ~85ms; it just uses a poor code), matching how the join probe already accepted its non-spec code=17. Without --compat the fetch probe still fails code=0 by default (0.9.12 stance: 0x0 is not a refusal)."
+      "xfail_suites": ["relay-data"],
+      "notes": "Cisco libquicr (server cert unacceptable → insecure). d14 dropped (raw + WT now unresponsive — relay appears d16-only). compat=libquicr covers two non-spec behaviors, tolerated + annotated: (1) relay returns SUBSCRIBE_OK for a nonexistent track (deferred-delivery policy); (2) relay returns FETCH_ERROR code=0 (INTERNAL_ERROR) for a nonexistent-track FETCH — the fetch probe honors libquicr code=0 as a deliberate refusal (the relay answered structurally in ~85ms; it just uses a poor code), matching how the join probe already accepted its non-spec code=17. Without --compat the fetch probe still fails code=0 by default (0.9.12 stance: 0x0 is not a refusal). relay-data XFAIL: libquicr never forwards PUBLISH_DONE downstream (§10.11), so data-subgroup-basic fails with \"no downstream PUBLISH_DONE\"."
     },
     {
       "name": "moqtail",
@@ -113,18 +115,6 @@
       "pub_mode": "publish-both",
       "disabled_suites": ["relay-join", "relay-fetch"],
       "notes": "Cloudflare moq-rs draft-16 interop branch. Emits a truncated trailing-extensions KVP block on SubscribeOk (kvp_start=6 tell=7 exts_end=7): a count-prefixed Track Extensions container (their kvp.rs), where d16 defines a bare KVP sequence to end-of-message. Confirmed peer non-conformance, so no tolerance: the strict parser rejects it and ctrl-msg fails. Re-verified on the wire 2026-09-16; `--compat lenient-extensions` remains available as an explicit opt-in for ad-hoc runs. relay-join + relay-fetch disabled (#24): verified unsupported — itzmanish/moq-rs README also lists FETCH 'Not Soon', and the relay never answers JOIN/FETCH (TimeoutError; join is a joining-fetch). pub-sub[publish] kept as a genuine fail; root-caused 2026-06-21 to two layers: (A) [our side, FIXED] with pub_mode=publish-both the namespace resolves, but the relay's SubscribeOk carries the same truncated trailing-extensions block as its ctrl-msg path, which crashed the multi_sub_bench subscriber (the lenient-extensions tolerance lived only in moq_interop_client, not the bench) — now plumbed via `multi_sub_bench --compat lenient-extensions`; (B) [relay side, confirmed] even with control fully working and the publisher sending 300+ objects, the relay forwards ZERO to subscribers. Ruled out on our side via live tests + spec §10.1: forward=0 and forward=1, alias-matched and alias-diverged all give 0 objects, and the relay never RESETs our data streams (track_alias has no parity rule, only session-uniqueness, which we satisfy). With bare pub_mode=publish the surface symptom is code=4 'Track not found' (relay never got PUB_NS). The same flow delivers objects vs moxygen/imquic/cloudflare-d14, so (B) is a moq-rs d16-fork forwarding bug. Upstream also advertises an H3/WT endpoint at https://.../moq but our client hits a SETUP parse error (\"Read out of bounds\") — QUIC only here until that's resolved."
-    },
-    {
-      "name": "fb-mvfst-d18",
-      "urls": {
-        "raw-quic": "moqt://fb.mvfst.net:9448",
-        "h3-wt":    "https://fb.mvfst.net:9448/moq-relay"
-      },
-      "drafts": [18],
-      "gating": [18],
-      "pub_mode": "publish",
-      "disabled_suites": [],
-      "notes": "Upstream moxygen/mvfst reference at draft-18 — the conformant d18 reference (control 6/6 over raw-QUIC, 2026-06-22). Separate row from moxygen-fb, which stays d14/d16."
     },
     {
       "name": "nokia-d18",
