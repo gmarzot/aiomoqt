@@ -72,6 +72,8 @@
   to it (§6.1).
 - Fix: `publish_namespace_done(namespace=...)` at d18 finds the announcement's request; it
   withdrew nothing without a request id.
+- Fix: a requester's FIN cancels its SUBSCRIBE_NAMESPACE or SUBSCRIBE_TRACKS and frees the prefix
+  (§6.1); we FIN our side.
 - `pub_bench`: `--withdraw-after SECONDS`, and `--second-track` to also PUBLISH `<trackname>-2`.
 - aiopquic floor `>=0.5.0a2`: a WebTransport close carries its code to the peer, and a
   refused or closed WebTransport session raises a `ConnectionError` like raw QUIC.
