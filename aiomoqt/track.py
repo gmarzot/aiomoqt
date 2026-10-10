@@ -454,6 +454,7 @@ class PublishedTrack(Track):
         if self._out is None:
             self._out = FanoutDelivery()
             self._out.on_write = self._on_produced
+            self._out.on_sent = self._on_sent
         self._out.drop_session(sub.session)
         sub.delivery = SubgroupDelivery(sub.session, sub.track_alias,
                                         priority=self.priority,
@@ -613,6 +614,10 @@ class PublishedTrack(Track):
             subgroup_id = 0
         self._remember(group_id, object_id, payload,
                        subgroup_id=subgroup_id, extensions=extensions)
+
+    def _on_sent(self, group_id: int, object_id: int) -> None:
+        """FanoutDelivery.on_sent: a produce() object reached one peer's
+        stream or datagram. A hook for subclasses."""
 
     def attach(self, session=None) -> None:
         """Serve this track on a session without announcing it:

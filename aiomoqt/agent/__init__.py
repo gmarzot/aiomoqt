@@ -9,7 +9,7 @@ deprecation cycle until the surface settles.
 """
 from __future__ import annotations
 
-from .errors import AgentError, SpecError
+from .errors import AgentError, DecodeError, SpecError, Unsupported
 from .reader import Obj, ReadStats, Reader, ReadTimeout
 from .session import AgentSession
 from .writer import WriteRefused, WriteStats, Writer
@@ -34,6 +34,8 @@ from .spec import (
 __all__ = [
     "AgentError",
     "SpecError",
+    "Unsupported",
+    "DecodeError",
     "ReadTimeout",
     "AgentSession",
     "Reader",
