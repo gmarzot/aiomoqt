@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Sessions complete SETUP at d20, d21 and d22 over raw QUIC (ALPN `moqt-20`/`-21`/`-22`) and
+  WebTransport (WT-Protocol), with the draft settled from the negotiation on both ends.
+- d20+: PUBLISH_STATE_NOTIFY is received and logged; the peer's MAX_REQUEST_UPDATES and
+  MAX_FILTER_RANGES are recorded.
+- Fix: the control-message TX guard refuses to send on a draft without a type table.
 - `aiomoqt.messages.d20`: SETUP with the d20 Setup Options (adds MAX_FILTER_RANGES 0x06 and
   MAX_REQUEST_UPDATES 0x08), unknown options ignored, and PUBLISH_STATE_NOTIFY (0x22).
 - Drafts 20, 21 and 22 are `MOQTDraft` members, opt-in: the default offer stays 18, 16, 14

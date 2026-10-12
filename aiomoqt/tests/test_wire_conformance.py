@@ -924,6 +924,26 @@ def test_d20_setup_refuses_to_serialize_what_the_wire_cannot_carry():
         D20Setup(options={0x07: 4}).serialize(prof=prof)
 
 
+def test_d20_setup_length_mismatch_closes_the_session():
+    """Through the control dispatch: a SETUP whose Length ends inside an
+    option closes the session with PROTOCOL_VIOLATION."""
+    from aiomoqt.protocol import MOQTSessionQuic
+    from aiomoqt.types import SessionCloseCode
+    assert MOQTSessionQuic.CONTROL_REGISTRY[20][0x2F00][0] is D20Setup
+    s = object.__new__(MOQTSessionQuic)
+    s.negotiated_draft = 20
+    s._control_msg_overrides = {}
+    s._control_chains = {}
+    s._bidi_stream_requests = {}
+    s._d18_control_read_sid = 3
+    s._closed = []
+    s._close_session = lambda code, reason: s._closed.append((code, reason))
+    wire = _ref_kvps([(0x07, b"aiomoqt/x")], ref_vi64)
+    s._on_control_data(3, _ref_setup(wire, length=len(wire) - 2)
+                       + b"\x00" * 8, False)
+    assert s._closed and s._closed[0][0] == SessionCloseCode.PROTOCOL_VIOLATION
+
+
 @pytest.mark.parametrize("draft", _D20_DRAFTS)
 def test_d20_publish_state_notify_exact_bytes(draft):
     # Type 0x22, Length, Number of Parameters, LARGEST_OBJECT {5, 300}.

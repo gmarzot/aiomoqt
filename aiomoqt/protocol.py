@@ -19,8 +19,11 @@ from importlib.metadata import version
 from .context import *
 from .messages import *
 from .messages.d18 import Setup
+from .messages.d20 import PublishStateNotify, Setup as D20Setup
 from .messages.fetch import _is_joining
 from .types import *
+from .types import (D20MessageType, MOQTDraft, MOQTException, MOQTMessageType,
+                    SessionCloseCode, SetupParamType)
 from .utils.buffer import Buffer, BufferReadError
 from .utils.logger import *
 from .utils.url import moqt_setup_path
@@ -241,6 +244,9 @@ class _MOQTSessionMixin:
         # One SETUP per direction — set on first receipt, dups are a
         # protocol violation (also closes the double-bring-up window).
         self._d18_setup_seen = False
+        # The peer's d20+ SETUP limits; 0 is the spec default for both.
+        self._peer_max_request_updates = 0
+        self._peer_max_filter_ranges = 0
         self._loop = asyncio.get_running_loop()
         self._wt_session_setup: Future[bool] = self._loop.create_future()
         # Raw-QUIC sessions have no WT setup phase. Pre-resolve so
@@ -2537,7 +2543,7 @@ class _MOQTSessionMixin:
         self._auth_token_cache_max = int(
             params.get(SetupParamType.MAX_AUTH_TOKEN_CACHE_SIZE, 0))
         if self._profile.control_uni_pair:
-            self.send_control_message(Setup(options=params))
+            self.send_control_message(self._setup_message(params))
         else:
             self._local_request_max = self.REQUEST_ID_WINDOW
             params[SetupParamType.MAX_REQUEST_ID] = self._local_request_max
@@ -2800,8 +2806,11 @@ class _MOQTSessionMixin:
         """
         draft = self.negotiated_draft
         legal = CONTROL_MESSAGE_TYPES.get(draft)
-        if (legal is None or msg.type is None
-                or wire_control_type(draft, msg.type) in legal):
+        if legal is None:
+            raise MOQTException(
+                SessionCloseCode.INTERNAL_ERROR,
+                f"no control message table for draft-{draft}")
+        if msg.type is None or wire_control_type(draft, msg.type) in legal:
             return
         name = getattr(msg.type, 'name', None) or type(msg).__name__
         raise MOQTException(
@@ -2883,7 +2892,13 @@ class _MOQTSessionMixin:
                               prof=self._profile, **kwargs)
 
     _REPLY_CLASSES = (RequestOk, RequestError, SubscribeOk, SubscribeDone,
-                      PublishOk, FetchOk)
+                      PublishOk, FetchOk, PublishStateNotify)
+
+    def _setup_message(self, options: Dict[int, Any]) -> Setup:
+        """SETUP of the negotiated draft's class (d18, or d20 for d20+)."""
+        cls = self.CONTROL_REGISTRY[self.negotiated_draft][
+            MOQTMessageType.SETUP][0]
+        return cls(options=options)
 
     def _resolve_auth_token(self, msg: MOQTMessage) -> Optional[Callable]:
         """Apply a token-cache operation the peer sent (§10.2.2, §10.3.1.4),
@@ -4803,13 +4818,32 @@ class _MOQTSessionMixin:
             logger.info(
                 f"MOQT: d18 server control write-uni: "
                 f"{self._d18_control_write_sid}")
-            self.send_control_message(Setup(options={
+            self.send_control_message(self._setup_message({
                 SetupParamType.IMPLEMENTATION: USER_AGENT.encode()}))
             # Replies that raced the write-uni bring-up were deferred;
             # SETUP is on the wire, so release them now.
             self._flush_pending_control()
         if not self._moqt_session_setup.done():
             self._moqt_session_setup.set_result(True)
+
+    async def _handle_d20_setup(self, msg) -> None:
+        """d20+ SETUP: the d18 exchange, after recording the peer's d20
+        limits (absent = 0)."""
+        if not self._d18_setup_seen:
+            opts = msg.options or {}
+            self._peer_max_request_updates = int(
+                opts.get(SetupParamType.MAX_REQUEST_UPDATES, 0))
+            self._peer_max_filter_ranges = int(
+                opts.get(SetupParamType.MAX_FILTER_RANGES, 0))
+            if msg.ignored:
+                logger.info(
+                    f"MOQT: ignored unknown Setup Options "
+                    f"{[hex(t) for t in msg.ignored]}")
+        await self._handle_d18_setup(msg)
+
+    async def _handle_publish_state_notify(self, msg) -> None:
+        """PUBLISH_STATE_NOTIFY (d20 §10.10) is informative; no reply."""
+        logger.info(f"MOQT receive: {msg}")
 
     # MoQT message classes for serialize/deserialize, message handler methods (unbound)
     MOQT_CONTROL_MESSAGE_REGISTRY: Dict[MOQTMessageType, Tuple[Type[MOQTMessage], Callable]] = {
@@ -4905,10 +4939,21 @@ class _MOQTSessionMixin:
     _D18_REGISTRY[D18MessageType.PUBLISH_BLOCKED] = (
         PublishBlocked, _handle_publish_blocked)
 
+    # d20, d21 and d22 share one table: d18 with the d20 SETUP codec and
+    # PUBLISH_STATE_NOTIFY. PUBLISH_OK 0x1E is reserved from d20 and is
+    # pruned below.
+    _D20_REGISTRY = dict(_D18_REGISTRY)
+    _D20_REGISTRY[MOQTMessageType.SETUP] = (D20Setup, _handle_d20_setup)
+    _D20_REGISTRY[D20MessageType.PUBLISH_STATE_NOTIFY] = (
+        PublishStateNotify, _handle_publish_state_notify)
+
     CONTROL_REGISTRY: Dict[int, Dict[int, Tuple[Type[MOQTMessage], Callable]]] = {
         MOQTDraft.DRAFT_14: MOQT_CONTROL_MESSAGE_REGISTRY,
         MOQTDraft.DRAFT_16: _D16_REGISTRY,
         MOQTDraft.DRAFT_18: _D18_REGISTRY,
+        MOQTDraft.DRAFT_20: _D20_REGISTRY,
+        MOQTDraft.DRAFT_21: _D20_REGISTRY,
+        MOQTDraft.DRAFT_22: _D20_REGISTRY,
     }
     # One source of truth with the TX guard: dispatch exactly the types
     # each draft defines (a type outside the table closes the session in

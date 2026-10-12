@@ -171,6 +171,12 @@ def test_d20_refuses_types_it_does_not_define(draft, type_):
     assert f"draft-{draft}" in str(exc.value)
 
 
+@pytest.mark.parametrize("draft", [17, 19, 23])
+def test_the_tx_guard_fails_closed_for_a_draft_without_a_table(draft):
+    with pytest.raises(Exception, match=f"draft-{draft}"):
+        _guard(_Sess(draft), _Msg(0x03))
+
+
 def test_d18_removed_types_remain_legal_on_older_drafts():
     # The guard must gate on the draft, not blanket-ban the type.
     _guard(_Sess(14), _Msg(0x09))
@@ -276,7 +282,7 @@ def test_d18_namespace_prefix_param_is_a_tuple():
     assert out[0x34] == (b"live", b"cam")
 
 
-@pytest.mark.parametrize("draft", [14, 16, 18])
+@pytest.mark.parametrize("draft", [14, 16, 18, 20, 21, 22])
 def test_rx_dispatch_matches_the_spec_tables(draft):
     """RX dispatches exactly the types the spec defines for the draft —
     a type outside the table closes the session, never a silent skip
@@ -296,6 +302,33 @@ def test_d18_receiving_a_dead_d16_type_closes_the_session():
     for dead in (0x09, 0x0A, 0x0C, 0x15, 0x17, 0x1A, 0x11):
         with pytest.raises(MOQTProtocolViolation):
             s._get_control_entry(dead)
+
+
+@pytest.mark.parametrize("draft", [20, 21, 22])
+def test_d20_receiving_a_reserved_type_closes_the_session(draft):
+    """PUBLISH_OK 0x1E and CLIENT/SERVER_SETUP 0x20/0x21 are RESERVED from
+    d20: receiving one is an unknown message type."""
+    from aiomoqt.types import MOQTProtocolViolation
+    s = object.__new__(MOQTSessionQuic)
+    s.negotiated_draft = draft
+    s._control_msg_overrides = {}
+    for reserved in (0x1E, 0x20, 0x21):
+        with pytest.raises(MOQTProtocolViolation):
+            s._get_control_entry(reserved)
+
+
+@pytest.mark.parametrize("draft,cls_module", [
+    (18, "aiomoqt.messages.d18.session_setup"),
+    (20, "aiomoqt.messages.d20.session_setup"),
+    (21, "aiomoqt.messages.d20.session_setup"),
+    (22, "aiomoqt.messages.d20.session_setup"),
+])
+def test_a_session_sends_its_drafts_setup_class(draft, cls_module):
+    s = object.__new__(MOQTSessionQuic)
+    s.negotiated_draft = draft
+    msg = s._setup_message({0x07: b"x"})
+    assert type(msg).__module__ == cls_module
+    assert msg.options == {0x07: b"x"}
 
 
 def test_publish_done_codes_swap_on_the_d18_wire():
