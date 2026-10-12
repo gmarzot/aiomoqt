@@ -76,7 +76,26 @@ SPEC_D18 = {
     0x05: "REQUEST_ERROR",
 }
 
-SPEC = {14: SPEC_D14, 16: SPEC_D16, 18: SPEC_D18}
+# draft-ietf-moq-transport-20 §10.2. PUBLISH_OK 0x1E is RESERVED ("in
+# <= 17"); PUBLISH_STATE_NOTIFY is new; 0xF is renamed PUBLISH_SKIPPED.
+SPEC_D20 = {
+    0x2F00: "SETUP",            0x10: "GOAWAY",
+    0x03: "SUBSCRIBE",          0x04: "SUBSCRIBE_OK",
+    0x22: "PUBLISH_STATE_NOTIFY",
+    0x1D: "PUBLISH",            0x0B: "PUBLISH_DONE",
+    0x16: "FETCH",              0x18: "FETCH_OK",
+    0x0D: "TRACK_STATUS",       0x06: "PUBLISH_NAMESPACE",
+    0x50: "SUBSCRIBE_NAMESPACE", 0x51: "SUBSCRIBE_TRACKS",
+    0x08: "NAMESPACE",          0x0E: "NAMESPACE_DONE",
+    0x0F: "PUBLISH_SKIPPED",    0x02: "REQUEST_UPDATE",
+    0x07: "REQUEST_OK",         0x05: "REQUEST_ERROR",
+}
+# draft-21 and draft-22 §9 Table 5: the same rows as d20.
+SPEC_D21 = dict(SPEC_D20)
+SPEC_D22 = dict(SPEC_D20)
+
+SPEC = {14: SPEC_D14, 16: SPEC_D16, 18: SPEC_D18,
+        20: SPEC_D20, 21: SPEC_D21, 22: SPEC_D22}
 
 # Removed in d18 — sending any of these is a wire violation there.
 D18_REMOVED = {
@@ -104,7 +123,7 @@ class _Msg:
 _guard = MOQTSessionQuic._assert_type_defined_by_draft
 
 
-@pytest.mark.parametrize("draft", [14, 16, 18])
+@pytest.mark.parametrize("draft", [14, 16, 18, 20, 21, 22])
 def test_runtime_table_matches_the_spec(draft):
     assert CONTROL_MESSAGE_TYPES[draft] == frozenset(SPEC[draft]), (
         f"draft-{draft} table disagrees with the spec transcription; "
@@ -114,7 +133,7 @@ def test_runtime_table_matches_the_spec(draft):
         f"{sorted(set(SPEC[draft]) - CONTROL_MESSAGE_TYPES[draft])}")
 
 
-@pytest.mark.parametrize("draft", [14, 16, 18])
+@pytest.mark.parametrize("draft", [14, 16, 18, 20, 21, 22])
 def test_every_spec_type_is_sendable_on_its_draft(draft):
     for type_, name in SPEC[draft].items():
         _guard(_Sess(draft), _Msg(type_))  # must not raise
@@ -134,6 +153,22 @@ def test_d18_renumbered_types_are_sendable_under_their_wire_code(canonical, wire
     assert wire_control_type(18, canonical) == wire
     assert wire_control_type(16, canonical) == canonical
     _guard(_Sess(18), _Msg(canonical))  # must not raise
+
+
+@pytest.mark.parametrize("draft", [20, 21, 22])
+def test_d20_publish_ok_goes_out_as_request_ok(draft):
+    from aiomoqt.types import wire_control_type
+    assert wire_control_type(draft, 0x1E) == 0x07
+    assert wire_control_type(draft, 0x11) == 0x50
+    _guard(_Sess(draft), _Msg(0x1E))  # canonical PUBLISH_OK: sent as 0x07
+
+
+@pytest.mark.parametrize("draft", [20, 21, 22])
+@pytest.mark.parametrize("type_", sorted(D18_REMOVED))
+def test_d20_refuses_types_it_does_not_define(draft, type_):
+    with pytest.raises(Exception) as exc:
+        _guard(_Sess(draft), _Msg(type_))
+    assert f"draft-{draft}" in str(exc.value)
 
 
 def test_d18_removed_types_remain_legal_on_older_drafts():

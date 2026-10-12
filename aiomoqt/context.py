@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from aiomoqt.types import MOQTDraft, ParamType
 
@@ -67,6 +67,13 @@ class DraftProfile:
     object_statuses: frozenset = frozenset({0x0, 0x3, 0x4})
                                   # Object Status values the draft defines;
                                   # d14 also has DOES_NOT_EXIST 0x1.
+    location_filter_typed: bool = False
+                                  # d22 LOCATION_FILTER (0x21) opens with a
+                                  # Location Filter Type (0x00-0x05) where
+                                  # earlier drafts carry a Length.
+    relay_forwards_publish_namespace: bool = True
+                                  # a relay forwards PUBLISH_NAMESPACE
+                                  # downstream; d22 stops it.
 
     @property
     def vi64(self) -> bool:
@@ -109,7 +116,24 @@ PROFILES = {
         subgroup_type_mask=0x6F),
 }
 
+# draft-20 and draft-21 share one wire; d22 differs only in its switches.
+# Every column not named here keeps the d18 value.
+_D20 = replace(PROFILES[MOQTDraft.DRAFT_18], draft=MOQTDraft.DRAFT_20)
+PROFILES[MOQTDraft.DRAFT_20] = _D20
+PROFILES[MOQTDraft.DRAFT_21] = replace(_D20, draft=MOQTDraft.DRAFT_21)
+PROFILES[MOQTDraft.DRAFT_22] = replace(
+    _D20, draft=MOQTDraft.DRAFT_22,
+    location_filter_typed=True,
+    relay_forwards_publish_namespace=False)
+
 
 def profile_for(draft: int) -> DraftProfile:
-    """DraftProfile for a draft number or version code (normalized)."""
-    return PROFILES[get_major_version(draft)]
+    """DraftProfile for a draft number or version code (normalized).
+    Raises ValueError for a draft without a profile."""
+    major = get_major_version(draft)
+    try:
+        return PROFILES[major]
+    except KeyError:
+        raise ValueError(
+            f"MoQT draft-{major} is not supported; "
+            f"known drafts: {sorted(int(d) for d in PROFILES)}") from None

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Drafts 20, 21 and 22 are `MOQTDraft` members, opt-in: the default offer stays 18, 16, 14
+  (`MOQT_DEFAULT_DRAFTS`).
+- `DraftProfile` rows for d20/d21 (one shape) and d22, with `location_filter_typed` and
+  `relay_forwards_publish_namespace`.
+- Fix: `wire_control_type` and `profile_for` raise for a draft without a table; PUBLISH_OK
+  fell back to 0x1E, reserved from d20.
 - Fix: a publisher writing as its WebTransport stream or session is torn down ends through
   cancellation; it died with an unretrieved `ConnectionError`.
 - A session's `auth_token_validator(token, msg)` refuses a d16+ peer request with the
