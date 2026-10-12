@@ -781,3 +781,208 @@ def test_d18_parameters_in_scope_pass_and_d16_is_not_checked():
     raw = bytes(d16.data_slice(0, d16.tell()))
     MOQTMessage._deserialize_params(Buffer(data=raw), prof=profile_for(16),
                                     buf_end=len(raw), scope="Subscribe")
+
+
+# -- d20/d21/d22 SETUP (d20 §10.3, d22 §9.1) -------------------------
+#
+# Type 0x2F00 (vi64), Length (16), then Setup Options as delta-coded
+# Key-Value-Pairs (§1.4.3) up to the Length: odd Type = Length + bytes,
+# even Type = one vi64. Unknown options MUST be ignored.
+
+from aiomoqt.messages.d20 import PublishStateNotify, Setup as D20Setup  # noqa: E402
+
+_D20_DRAFTS = [20, 21, 22]
+
+
+def _ref_kvps(items, vint):
+    """Reference §1.4.3 encoder: (type, value) pairs in wire order."""
+    out, prev = b"", 0
+    for key, value in items:
+        out += vint(key - prev)
+        prev = key
+        out += vint(len(value)) + value if key % 2 else vint(value)
+    return out
+
+
+def _ref_setup(options_wire: bytes, length=None) -> bytes:
+    n = len(options_wire) if length is None else length
+    return ref_vi64(0x2F00) + n.to_bytes(2, "big") + options_wire
+
+
+def _parse_setup(raw: bytes, draft: int):
+    buf = Buffer(data=raw, vi64=True)
+    assert buf.pull_uint_vi64() == 0x2F00
+    end = buf.tell() + buf.pull_uint16() + 2
+    return D20Setup.deserialize(buf, prof=profile_for(draft), buf_end=end)
+
+
+@pytest.mark.parametrize("draft", _D20_DRAFTS)
+def test_d20_setup_exact_bytes_and_round_trip(draft):
+    opts = {0x07: b"aiomoqt/x", 0x01: b"/moq", 0x05: b"relay:443",
+            0x08: 4, 0x06: 200, 0x04: 1 << 20}
+    expect = _ref_setup(_ref_kvps(sorted(opts.items()), ref_vi64))
+    raw = bytes(D20Setup(options=opts).serialize(prof=profile_for(draft)).data)
+    assert raw == expect
+    out = _parse_setup(raw, draft)
+    assert out.options == opts and out.ignored == []
+
+
+def test_d20_setup_bytes_match_d18_for_shared_options():
+    from aiomoqt.messages.d18 import Setup as D18Setup
+    opts = {0x01: b"/", 0x05: b"h:1", 0x07: b"x"}
+    assert bytes(D20Setup(options=opts).serialize(prof=profile_for(20)).data) \
+        == bytes(D18Setup(options=opts).serialize(prof=profile_for(18)).data)
+
+
+@pytest.mark.parametrize("draft", _D20_DRAFTS)
+def test_d20_setup_ignores_unknown_options(draft):
+    # 0x00 and 0x02 (d16 MAX_REQUEST_ID) even, 0x09 odd, 0x9D grease twice
+    # (duplicates of unknown options MUST be allowed); the known options
+    # around them still parse.
+    wire = _ref_kvps([(0x00, 7), (0x02, 100), (0x07, b"peer/1"),
+                      (0x08, 3), (0x09, b"\xff" * 300), (0x9D, b""),
+                      (0x9D, b"grease")], ref_vi64)
+    out = _parse_setup(_ref_setup(wire), draft)
+    assert out.options == {0x07: b"peer/1", 0x08: 3}
+    assert out.ignored == [0x00, 0x02, 0x09, 0x9D, 0x9D]
+
+
+def test_d20_setup_empty_is_valid():
+    out = _parse_setup(_ref_setup(b""), 20)
+    assert out.options == {} and out.ignored == []
+
+
+@pytest.mark.parametrize("draft", _D20_DRAFTS)
+def test_d20_setup_truncated_is_a_protocol_violation(draft):
+    # Length claims the whole option; the bytes stop inside its value.
+    wire = _ref_kvps([(0x07, b"aiomoqt/x")], ref_vi64)
+    raw = _ref_setup(wire)[:-3]
+    with pytest.raises(MOQTProtocolViolation, match="truncated"):
+        _parse_setup(raw, draft)
+
+
+@pytest.mark.parametrize("cut", [1, 4])
+def test_d20_setup_length_short_of_its_options_is_a_protocol_violation(cut):
+    # The Length ends inside an option: it would read the next message.
+    wire = _ref_kvps([(0x01, b"/"), (0x07, b"aiomoqt/x")], ref_vi64)
+    raw = _ref_setup(wire, length=len(wire) - cut) + b"\x00" * 8
+    with pytest.raises(MOQTProtocolViolation, match="past"):
+        _parse_setup(raw, 20)
+
+
+def test_d20_setup_length_past_its_options_is_a_protocol_violation():
+    # Length covers a dangling option Type with no Value.
+    wire = _ref_kvps([(0x01, b"/")], ref_vi64) + ref_vi64(0x06)
+    with pytest.raises(MOQTProtocolViolation):
+        _parse_setup(_ref_setup(wire), 20)
+
+
+def test_d20_setup_option_value_over_65535_is_a_protocol_violation():
+    # §1.4.3: a Length above 2^16-1 MUST close the session.
+    wire = ref_vi64(0x07) + ref_vi64(0x10000)
+    with pytest.raises(MOQTProtocolViolation, match="exceeds"):
+        _parse_setup(_ref_setup(wire), 20)
+
+
+def test_d20_setup_option_longer_than_the_message_is_a_protocol_violation():
+    wire = ref_vi64(0x07) + ref_vi64(40) + b"short"
+    with pytest.raises(MOQTProtocolViolation, match="past the SETUP"):
+        _parse_setup(_ref_setup(wire), 20)
+
+
+def test_d20_setup_option_type_overflow_is_a_protocol_violation():
+    wire = ref_vi64(0x08) + ref_vi64(1) + ref_vi64((1 << 64) - 1) \
+        + ref_vi64(0)
+    with pytest.raises(MOQTProtocolViolation, match="overflows"):
+        _parse_setup(_ref_setup(wire), 20)
+
+
+def test_d20_setup_repeated_known_option_is_a_protocol_violation():
+    wire = _ref_kvps([(0x08, 1), (0x08, 2)], ref_vi64)
+    with pytest.raises(MOQTProtocolViolation, match="repeated"):
+        _parse_setup(_ref_setup(wire), 20)
+
+
+def test_d20_setup_may_repeat_the_authorization_token():
+    # §10.3.1.4: one or more tokens. USE_VALUE (0x3), type 0, value.
+    tok = lambda v: ref_vi64(3) + ref_vi64(0) + v  # noqa: E731
+    wire = _ref_kvps([(0x03, tok(b"a")), (0x03, tok(b"b"))], ref_vi64)
+    out = _parse_setup(_ref_setup(wire), 20)
+    assert out.options[0x03] == b"a"
+
+
+def test_d20_setup_refuses_to_serialize_what_the_wire_cannot_carry():
+    prof = profile_for(20)
+    with pytest.raises(ValueError):
+        D20Setup(options={0x07: b"x" * 0x10000}).serialize(prof=prof)
+    with pytest.raises(ValueError):
+        D20Setup(options={0x09: b"x" * 40000, 0x07: b"y" * 40000}) \
+            .serialize(prof=prof)
+    with pytest.raises(TypeError):
+        D20Setup(options={0x08: b"4"}).serialize(prof=prof)
+    with pytest.raises(TypeError):
+        D20Setup(options={0x07: 4}).serialize(prof=prof)
+
+
+@pytest.mark.parametrize("draft", _D20_DRAFTS)
+def test_d20_publish_state_notify_exact_bytes(draft):
+    # Type 0x22, Length, Number of Parameters, LARGEST_OBJECT {5, 300}.
+    prof = profile_for(draft)
+    raw = bytes(PublishStateNotify(parameters={0x09: (5, 300)})
+                .serialize(prof=prof).data)
+    body = ref_vi64(1) + ref_vi64(0x09) + ref_vi64(5) + ref_vi64(300)
+    assert raw == ref_vi64(0x22) + len(body).to_bytes(2, "big") + body
+    buf = Buffer(data=raw, vi64=True)
+    buf.pull_vint()
+    end = buf.tell() + buf.pull_uint16() + 2
+    out = PublishStateNotify.deserialize(buf, prof=prof, buf_end=end)
+    assert out.parameters == {0x09: (5, 300)}
+
+
+# -- d14/d16/d18 bytes are unchanged by d20 --------------------------
+#
+# Golden images of the setup messages and of the two types d18 renumbers
+# on the wire, as the tree before d20 support encoded them.
+
+def test_d14_d16_d18_setup_bytes_unchanged():
+    from aiomoqt.messages.d18 import Setup as D18Setup
+    from aiomoqt.messages.session_setup import ClientSetup, ServerSetup
+
+    def hx(msg, draft):
+        return bytes(msg.serialize(prof=profile_for(draft)).data).hex()
+
+    assert hx(ClientSetup(versions=[0xff00000e],
+                          parameters={1: b"/", 2: 100}), 14) \
+        == "20001001c0000000ff00000e0201012f024064"
+    assert hx(ServerSetup(selected_version=0xff00000e,
+                          parameters={2: 100}), 14) \
+        == "21000cc0000000ff00000e01024064"
+    assert hx(ClientSetup(versions=[],
+                          parameters={7: b"x", 1: b"/", 2: 100}), 16) \
+        == "20000a0301012f014064050178"
+    assert hx(ServerSetup(parameters={2: 100}), 16) == "21000401024064"
+    assert hx(D18Setup(options={7: b"x", 1: b"/", 5: b"h:1"}), 18) \
+        == "af00000b01012f0403683a31020178"
+
+
+def test_d14_d16_d18_renumbered_type_bytes_unchanged():
+    from aiomoqt.messages.namespace import SubscribeNamespace
+    from aiomoqt.messages.publish import PublishOk
+
+    def hx(msg, draft):
+        return bytes(msg.serialize(prof=profile_for(draft)).data).hex()
+
+    def sub_ns():
+        return SubscribeNamespace(request_id=2, namespace_prefix=(b"n",),
+                                  parameters={})
+
+    def pub_ok():
+        return PublishOk(request_id=2, forward=1, priority=128,
+                         group_order=1, filter_type=2)
+
+    assert hx(sub_ns(), 14) == "1100050201016e00"
+    assert hx(sub_ns(), 16) == "1100060201016e0000"
+    assert hx(sub_ns(), 18) == "5000050201016e00"
+    assert hx(pub_ok(), 16) == "1e000c020410011040800101020101"
+    assert hx(pub_ok(), 18) == "07000a04100110800101020101"
+    assert hx(pub_ok(), 20) == hx(pub_ok(), 18)

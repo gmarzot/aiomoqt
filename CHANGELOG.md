@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `aiomoqt.messages.d20`: SETUP with the d20 Setup Options (adds MAX_FILTER_RANGES 0x06 and
+  MAX_REQUEST_UPDATES 0x08), unknown options ignored, and PUBLISH_STATE_NOTIFY (0x22).
 - Drafts 20, 21 and 22 are `MOQTDraft` members, opt-in: the default offer stays 18, 16, 14
   (`MOQT_DEFAULT_DRAFTS`).
 - `DraftProfile` rows for d20/d21 (one shape) and d22, with `location_filter_typed` and
