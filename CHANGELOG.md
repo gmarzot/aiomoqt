@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- aiopquic floor `>=0.5.0a3`.
+- Fix: a WebTransport client connection releases its transport's event dispatcher on exit; each
+  one kept its transport, rings and wake fd.
 - Fix: a publisher writing as its WebTransport stream or session is torn down ends through
   cancellation; it died with an unretrieved `ConnectionError`.
 - A session's `auth_token_validator(token, msg)` refuses a d16+ peer request with the
