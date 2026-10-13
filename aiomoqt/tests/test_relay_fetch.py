@@ -47,10 +47,11 @@ def _track(objects=(), live=True):
     return t
 
 
-def _join(track, session, request_id):
+def _join(track, session, request_id, forward=True):
     """Attach a subscriber without starting the forward task (no loop)."""
-    track.downstream.append((session, 1, request_id))
-    track.joined_at[request_id] = track.largest
+    d = relay._Downstream(session, 1, request_id, forward=forward)
+    d.joined_at = track.largest if forward else None
+    track.downstream.append(d)
 
 
 def _fetch(**kw):
@@ -116,6 +117,20 @@ def test_joining_fetch_without_an_anchor_is_refused():
                                           joining_request_id=7,
                                           joining_start=2)))
     assert s._errors[0][0] == int(RequestErrorCode.INVALID_RANGE)
+
+
+def test_joining_fetch_on_a_forward_0_subscription_is_refused():
+    # §10.12.2: a Joining FETCH needs Forward State 1.
+    s = _session()
+    t = _track([(g, 0) for g in range(3)])
+    relay._tracks[((b"live",), b"cam")] = t
+    _join(t, s, 7, forward=False)
+    asyncio.run(relay._on_fetch(s, _fetch(fetch_type=RELATIVE_JOINING,
+                                          namespace=None, track_name=None,
+                                          joining_request_id=7,
+                                          joining_start=1)))
+    assert s._errors[0][0] == int(RequestErrorCode.INVALID_RANGE)
+    assert s._served == []
 
 
 def test_unknown_track_is_refused():

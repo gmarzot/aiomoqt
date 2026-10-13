@@ -14,7 +14,8 @@ Deliberately absent, and staying absent:
   * A bounded recent-object cache only (CACHE_GROUPS / CACHE_BYTES,
     oldest dropped) — enough to answer a FETCH, standalone or joining,
     over what it still holds; a late subscriber starts at the live edge
-  * NO forward-state propagation (REQUEST_UPDATE Forward=0/1 upstream)
+  * Upstream Forward State is raised for a forwarding subscriber, never
+    lowered again
   * NO delivery-timeout enforcement
   * Namespace tables are in-memory and global to the process
 
@@ -59,12 +60,14 @@ from aiomoqt.types import (
     StreamResetCode, SubscribeDoneCode, SubscribeErrorCode, parse_draft_spec,
 )
 from aiomoqt.messages import SubgroupHeader
+from aiomoqt.messages.base import MOQTMessage
 from aiomoqt.messages.data import (FetchObject, ObjectDatagram,
                                    ObjectDatagramStatus)
 from aiomoqt.messages.fetch import _is_joining
 from aiomoqt.messages.publish import PublishOk
 from aiomoqt.messages.request import RequestError, RequestOk
-from aiomoqt.track import SubscribedTrack
+from aiomoqt.track import (SubscribedTrack, _UNFILTERED, _filter_window,
+                           _largest_object_param)
 from aiomoqt.context import is_draft16_or_later
 from aiomoqt.utils.logger import set_log_level, get_logger
 from aiomoqt.utils.url import parse_relay_url
@@ -236,6 +239,35 @@ CACHE_GROUPS = 8
 CACHE_BYTES = 32 * 1024 * 1024
 
 
+class _Downstream:
+    """One downstream subscription to a relayed track."""
+
+    __slots__ = ("session", "alias", "request_id", "forward", "window",
+                 "joined_at")
+
+    def __init__(self, session, alias, request_id, forward=True,
+                 window=_UNFILTERED):
+        self.session = session
+        self.alias = alias
+        self.request_id = request_id
+        # Forward State (§5.1): objects flow only while True.
+        self.forward = forward
+        # Filter window (§5.1.2): (start Location, End Group or None).
+        self.window = window
+        # Joining Location (§5.1): Largest when Forward State became 1.
+        self.joined_at = None
+
+    def passes(self, group_id, object_id) -> bool:
+        """Forward State 1 and inside the filter window."""
+        start, end_group = self.window
+        return (self.forward and (group_id, object_id) >= start
+                and (end_group is None or group_id <= end_group))
+
+    def past_end(self, group_id) -> bool:
+        end_group = self.window[1]
+        return end_group is not None and group_id > end_group
+
+
 class _RelayedTrack:
     """One upstream subscription fanned out to N downstream subscribers.
 
@@ -257,7 +289,7 @@ class _RelayedTrack:
         # Answered with Forward State 0 because nobody could be offered
         # the track yet; raised with REQUEST_UPDATE when one arrives.
         self.parked = None            # (session, Publish msg)
-        self.downstream = []          # list of (session, track_alias, request_id)
+        self.downstream: list[_Downstream] = []
         self.queue = asyncio.Queue()
         self.task = None
         # A downstream SUBSCRIBE is establishing this track: an upstream
@@ -281,11 +313,8 @@ class _RelayedTrack:
         # PUBLISH_DONE is matched to the right track on a session
         # publishing more than one.
         self.upstream_request_id = None
-        # Largest (group, object) forwarded: the Largest Location a
-        # SUBSCRIBE_OK reports, and what a joining FETCH anchors to.
+        # Largest Location (§10.2.11): largest reported or received.
         self.largest = None
-        # request_id -> Largest reported when that subscriber joined.
-        self.joined_at = {}
         # Upstream subgroup streams ended, against the Stream Count its
         # PUBLISH_DONE reports: the terminal waits for the objects.
         self._upstream_ended = 0
@@ -333,22 +362,34 @@ class _RelayedTrack:
         if self._finished:
             return
         self._finished = True
-        for session, alias, rid in list(self.downstream):
-            try:
-                for k, (sid, _hdr) in list(self._streams.items()):
-                    if k[0] == id(session):
-                        if reset_code is None:
-                            session.stream_write(sid, b"", end_stream=True)
-                        else:
-                            session.stream_reset(sid, int(reset_code))
-                        self._streams.pop(k, None)
-                session.subscribe_done(
-                    request_id=rid, status_code=status_code,
-                    stream_count=self._sent_streams.get(id(session), 0),
-                    reason=reason)
-            except Exception:
-                logger.debug("relay: finish failed for a subscriber",
-                             exc_info=True)
+        for d in list(self.downstream):
+            self._end(d, status_code, reset_code, reason)
+
+    def end_downstream(self, d) -> None:
+        """End one subscription whose End Group is behind (§5.1.2)."""
+        if d in self.downstream:
+            self.downstream.remove(d)
+            self._end(d, SubscribeDoneCode.SUBSCRIPTION_ENDED, None,
+                      "subscription ended")
+
+    def _end(self, d, status_code, reset_code, reason) -> None:
+        """FIN (or reset) a subscriber's open streams, then PUBLISH_DONE."""
+        session = d.session
+        try:
+            for k, (sid, _hdr) in list(self._streams.items()):
+                if k[0] == id(session):
+                    if reset_code is None:
+                        session.stream_write(sid, b"", end_stream=True)
+                    else:
+                        session.stream_reset(sid, int(reset_code))
+                    self._streams.pop(k, None)
+            session.subscribe_done(
+                request_id=d.request_id, status_code=status_code,
+                stream_count=self._sent_streams.get(id(session), 0),
+                reason=reason)
+        except Exception:
+            logger.debug("relay: ending a subscription failed",
+                         exc_info=True)
 
     def _enqueue_terminal(self, status, reason, key) -> None:
         """Terminal behind everything already queued."""
@@ -409,14 +450,25 @@ class _RelayedTrack:
         self.queue.put_nowait(
             (group_id, subgroup_id or 0, None, None, None, None,
              "END" if clean else "RESET", reset_code))
+        self._ensure_drain()
         self._upstream_ended += 1
         self._check_pending_done()
+
+    def note_largest(self, location) -> None:
+        """§10.2.11: Largest is the largest Location reported or seen."""
+        if location is not None and (self.largest is None
+                                     or tuple(location) > self.largest):
+            self.largest = tuple(location)
 
     def on_object(self, msg, size, ts, group_id, subgroup_id):
         """Upstream delivery callback (sync) — hand off to the drain."""
         self._objects_in += 1
         gid = getattr(msg, "group_id", None)
         gid = gid if gid is not None else group_id
+        # On arrival, so a SUBSCRIBE sees it; objects for the subscriber
+        # still attaching are its own and count once drained.
+        if not self.attaching:
+            self.note_largest((gid, msg.object_id))
         # Forward the publisher's priority, never a substitute of our
         # own: a subscriber's scheduling depends on it.
         prio = getattr(msg, "publisher_priority", None)
@@ -432,19 +484,32 @@ class _RelayedTrack:
              128 if prio is None else prio,
              getattr(msg, "status", None),
              shape))
+        self._ensure_drain()
 
-    def add_downstream(self, session, track_alias, request_id=None):
-        self.attaching = False
-        self.downstream.append((session, track_alias, request_id))
-        # The Largest reported to this subscriber: a joining FETCH from
-        # it backfills up to exactly that point.
-        self.joined_at[request_id] = self.largest
-        if self.task is None:
+    def _ensure_drain(self) -> None:
+        """Drain from the first object, subscribers or not; objects for a
+        subscriber still attaching wait for it."""
+        if self.task is None and not self._finished and not self.attaching:
             self.task = asyncio.create_task(self._forward_loop())
 
+    def add_downstream(self, session, track_alias, request_id=None,
+                       forward=True, window=_UNFILTERED) -> _Downstream:
+        self.attaching = False
+        d = _Downstream(session, track_alias, request_id, forward, window)
+        if forward:
+            # A joining FETCH from this subscriber backfills to here.
+            d.joined_at = self.largest
+        self.downstream.append(d)
+        self._ensure_drain()
+        return d
+
+    def find(self, session, request_id):
+        return next((d for d in self.downstream if d.session is session
+                     and d.request_id == request_id), None)
+
     def drop_session(self, session):
-        self.downstream = [(s, a, r) for (s, a, r) in self.downstream
-                           if s is not session]
+        self.downstream = [d for d in self.downstream
+                           if d.session is not session]
         for k in [k for k in self._streams if k[0] == id(session)]:
             self._streams.pop(k, None)
         self._sent_streams.pop(id(session), None)
@@ -468,24 +533,33 @@ class _RelayedTrack:
                 continue
             if oid is not None:
                 self._remember(gid, sgid, oid, payload, exts, prio, status)
-            for session, alias, _rid in list(self.downstream):
+            for d in list(self.downstream):
+                if oid is not None:
+                    if d.past_end(gid):
+                        self.end_downstream(d)
+                        continue
+                    if not d.passes(gid, oid):
+                        continue
                 try:
                     self._objects_out += 1
                     await self._forward_one(
-                        session, alias, gid, sgid, oid, payload, exts,
+                        d.session, d.alias, gid, sgid, oid, payload, exts,
                         prio, status, shape)
                 except Exception:
                     logger.debug("relay: forward failed, dropping subscriber",
                                  exc_info=True)
-                    self.drop_session(session)
+                    self.drop_session(d.session)
+                    continue
+                if (oid is not None and d.window[1] == gid and status in (
+                        ObjectStatus.END_OF_GROUP, ObjectStatus.END_OF_TRACK)):
+                    self.end_downstream(d)
 
     def _remember(self, gid, sgid, oid, payload, exts, prio, status) -> None:
         """Keep one object for a later FETCH, dropping oldest past the
         bound."""
         self._cache.append((gid, sgid, oid, payload, exts, prio, status))
         self._cache_bytes += len(payload or b"")
-        if self.largest is None or (gid, oid) > self.largest:
-            self.largest = (gid, oid)
+        self.note_largest((gid, oid))
         oldest_kept = gid - CACHE_GROUPS + 1
         while self._cache and (self._cache[0][0] < oldest_kept
                                or self._cache_bytes > CACHE_BYTES):
@@ -776,14 +850,14 @@ async def _establish_upstream(ns, track_name):
 
 
 def _joined_subscription(session, request_id):
-    """(key, track, anchor) for this session's subscription `request_id`,
-    where anchor is the Largest Location its SUBSCRIBE_OK reported."""
+    """(key, track, downstream) for this session's subscription
+    `request_id`, or None."""
     if request_id is None:
         return None
     for key, track in _tracks.items():
-        for sess, _alias, rid in track.downstream:
-            if sess is session and rid == request_id:
-                return key, track, track.joined_at.get(request_id)
+        d = track.find(session, request_id)
+        if d is not None:
+            return key, track, d
     return None
 
 
@@ -799,7 +873,7 @@ def _upstream_done(track, key, done) -> None:
                 f"in={track._objects_in} out={track._objects_out}, "
                 f"upstream streams ended={track._upstream_ended}")
     if track.task is None and not track.attaching:
-        # Nothing draining the queue: no subscriber ever attached.
+        # Nothing queued and no subscriber attached.
         track.finish(status_code=status, reason=reason)
         track.close()
         _tracks.pop(key, None)
@@ -837,7 +911,7 @@ async def _on_publish_done(session, msg):
                     f"{len(track.downstream)} subscriber(s), objects "
                     f"in={track._objects_in} out={track._objects_out}")
         if track.task is None:
-            # Nothing draining the queue: no subscriber ever attached.
+            # Nothing queued and no subscriber attached.
             track.finish(status_code=status, reason=reason)
             track.close()
             _tracks.pop(key, None)
@@ -852,11 +926,9 @@ async def _on_publish(session, msg):
     """Flow B: a publisher offers a track with no prior
     PUBLISH_NAMESPACE (transport 0x1D, present in d14/d16/d18 alike).
 
-    The PUBLISH_OK is held until a subscriber arrives. This relay keeps
-    no group cache, so accepting data before anyone wants it would
-    publish the track into a void and leave a later subscriber with a
-    partial track. Holding the reply keeps the publisher parked instead;
-    its transaction timeout is far longer than the wait.
+    The PUBLISH_OK is held while SUBSCRIBE_TRACKS subscribers are offered
+    the track; otherwise it is answered with Forward State 0 until a
+    subscriber wants objects (§9.5).
     """
     ns = _ns_tuple(msg.track_namespace)
     key = (ns, msg.track_name)
@@ -889,43 +961,49 @@ async def _on_publish(session, msg):
             offered = True
             asyncio.create_task(
                 _offer_track(sub_session, track, key))
-    if track.downstream:
-        _accept_publish(track)
-    elif not offered:
-        # Nobody to offer this track to, so no reply is coming from
+    if track.downstream or not offered:
+        # With nobody to offer this track to, no reply is coming from
         # anywhere: answer now rather than hold. A publisher that
         # blocks on PUBLISH_OK before subscribing (§9.5 publish-first)
         # would otherwise deadlock — it cannot subscribe until we
         # answer, and we would not answer until it subscribed.
-        _park_publish(track)
+        _answer_publish(track)
 
 
-def _park_publish(track) -> None:
-    """Answer a PUBLISH with Forward State 0 and start taking the
-    publisher's registrations, leaving forwarding off until a
-    subscriber arrives (§10.2.12)."""
+def _forwarding(track) -> bool:
+    return any(d.forward for d in track.downstream)
+
+
+def _answer_publish(track) -> None:
+    """Answer a held PUBLISH and start taking objects: Forward State 1
+    when a subscriber forwards (§9.5), else 0 until one does."""
     if track.pending_publish is None or track.upstream is not None:
         return
     session, msg = track.pending_publish
+    forward = _forwarding(track)
     session._track_aliases[msg.track_alias] = msg.request_id
     session.register_object_handler(msg.track_alias, track.on_object)
     session.register_stream_end_handler(msg.track_alias, track.on_stream_end)
+    if getattr(msg, "content_exists", 0):
+        track.note_largest((msg.largest_group_id, msg.largest_object_id))
     ok = PublishOk(
-        request_id=msg.request_id, forward=0, priority=128,
+        request_id=msg.request_id, forward=int(forward), priority=128,
         group_order=GroupOrder.ASCENDING,
         filter_type=FilterType.LATEST_OBJECT, parameters={})
-    logger.info(f"relay: PUBLISH_OK forward=0 alias={msg.track_alias} "
-                f"— parked until a subscriber arrives")
+    logger.info(f"relay: PUBLISH_OK forward={int(forward)} "
+                f"alias={msg.track_alias}"
+                + ("" if forward else " — parked until a subscriber forwards"))
     session._send_reply(msg.request_id, ok)
     track.upstream = session
     track.upstream_request_id = msg.request_id
-    track.parked = (session, msg)
+    track.parked = None if forward else (session, msg)
     track.pending_publish = None
 
 
 def _resume_parked_publish(track) -> None:
-    """Raise a parked publisher's Forward State once someone subscribes."""
-    if track.parked is None:
+    """Raise a parked publisher's Forward State once a subscriber
+    forwards."""
+    if track.parked is None or not _forwarding(track):
         return
     session, msg = track.parked
     track.parked = None
@@ -938,29 +1016,9 @@ def _resume_parked_publish(track) -> None:
                      exc_info=True)
 
 
-def _accept_publish(track) -> None:
-    """Answer a held PUBLISH with forward=1 and start taking objects."""
-    if track.pending_publish is None or track.upstream is not None:
-        return
-    session, msg = track.pending_publish
-    session._track_aliases[msg.track_alias] = msg.request_id
-    session.register_object_handler(msg.track_alias, track.on_object)
-    session.register_stream_end_handler(msg.track_alias, track.on_stream_end)
-    ok = PublishOk(
-        request_id=msg.request_id, forward=1, priority=128,
-        group_order=GroupOrder.ASCENDING,
-        filter_type=FilterType.LATEST_OBJECT, parameters={})
-    logger.info(f"relay: PUBLISH_OK forward=1 alias={msg.track_alias}")
-    session._send_reply(msg.request_id, ok)
-    track.upstream = session
-    track.upstream_request_id = msg.request_id
-    track.pending_publish = None
-
-
 def _largest_kwargs(track) -> dict:
-    """SUBSCRIBE_OK Largest Location: what the relay has actually served
-    for this track. A joining FETCH anchors its backfill to it, so a
-    track we hold nothing for reports no content."""
+    """SUBSCRIBE_OK Largest Location (§10.2.11); none when nothing has
+    been published."""
     if track.largest is None:
         return {}
     return {"content_exists": 1,
@@ -999,6 +1057,73 @@ async def _await_publisher(session, ns: tuple, track_name,
     return True
 
 
+def _attach_subscriber(session, msg, track) -> bool:
+    """SUBSCRIBE_OK and join the fan-out with the SUBSCRIBE's Forward
+    State and filter window, against Largest now (§5.1.2). False when
+    the End Group is already behind, answered INVALID_RANGE."""
+    window = _filter_window(msg.filter_type, msg.start_group,
+                            msg.start_object, msg.end_group, track.largest)
+    if (window[1] is not None and track.largest is not None
+            and track.largest[0] > window[1]):
+        code = (RequestErrorCode.INVALID_RANGE
+                if is_draft16_or_later(session.negotiated_draft)
+                else SubscribeErrorCode.INVALID_RANGE)
+        logger.info(f"relay: subscribe {track.key} -> INVALID_RANGE "
+                    f"(end group {window[1]}, largest {track.largest})")
+        session.subscribe_error(msg.request_id, error_code=int(code),
+                                reason="end group already published")
+        track.attaching = False
+        track._ensure_drain()
+        return False
+    _watch_session(session)
+    ok = session.subscribe_ok(request_msg=msg, **_largest_kwargs(track))
+    # FORWARD omitted means 1 (§10.2.12).
+    forward = msg.forward is None or bool(msg.forward)
+    track.add_downstream(session, ok.track_alias, msg.request_id,
+                         forward=forward, window=window)
+    session.register_request_cancel_handler(
+        msg.request_id, lambda rid, t=track, s=session: t.drop_session(s))
+    return True
+
+
+async def _on_request_update(session, msg):
+    """A subscriber changes its Forward State or filter: REQUEST_UPDATE
+    from d16 (§10.9), SUBSCRIBE_UPDATE at d14 (Forward State only).
+    Updates to anything but a relayed subscription get the session's
+    default reply."""
+    d16 = is_draft16_or_later(session.negotiated_draft)
+    rid = (msg.existing_request_id if d16
+           else msg.subscription_request_id)
+    found = _joined_subscription(session, rid)
+    if found is None:
+        if d16:
+            await session._handle_request_update(msg)
+        else:
+            await session._handle_subscribe_update(msg)
+        return
+    key, track, d = found
+    if d16:
+        forward = (msg.parameters or {}).get(ParamType.FORWARD)
+        ftype = _reply_filter(session, msg)
+        if ftype[0] is not None:
+            d.window = _filter_window(*ftype, track.largest)
+    else:
+        forward = msg.forward
+    if forward is not None:
+        if forward and not d.forward:
+            d.joined_at = track.largest
+        d.forward = bool(forward)
+    logger.info(f"relay: update {key} request {rid}: "
+                f"forward={int(d.forward)} window={d.window}")
+    if d16:
+        params = ({} if track.largest is None
+                  else _largest_object_param(session, track.largest))
+        session._send_reply(msg.request_id,
+                            RequestOk(request_id=msg.request_id,
+                                      parameters=params))
+    _resume_parked_publish(track)
+
+
 async def _on_subscribe(session, msg):
     """Relay a SUBSCRIBE: establish upstream, then fan out downstream."""
     ns = _ns_tuple(msg.track_namespace)
@@ -1034,17 +1159,12 @@ async def _on_subscribe(session, msg):
         _tracks.pop((ns, msg.track_name), None)
         track = None
     if track is not None and (track.pending_publish or track.upstream):
-        _watch_session(session)
-        ok = session.subscribe_ok(request_msg=msg, **_largest_kwargs(track))
-        track.add_downstream(session, ok.track_alias, msg.request_id)
-        session.register_request_cancel_handler(
-            msg.request_id,
-            lambda rid, t=track, s=session: t.drop_session(s))
-        _accept_publish(track)
-        _resume_parked_publish(track)
-        logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
-                    f"-> SUBSCRIBE_OK (published track, fanout="
-                    f"{len(track.downstream)})")
+        if _attach_subscriber(session, msg, track):
+            _answer_publish(track)
+            _resume_parked_publish(track)
+            logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
+                        f"-> SUBSCRIBE_OK (published track, fanout="
+                        f"{len(track.downstream)})")
         return
 
     # A dialled origin announces nothing, so an empty announcement table
@@ -1056,16 +1176,10 @@ async def _on_subscribe(session, msg):
     if _announced_match(ns) or _upstreams:
         track = await _establish_upstream(ns, msg.track_name)
         if track is not None:
-            _watch_session(session)
-            ok = session.subscribe_ok(request_msg=msg,
-                                      **_largest_kwargs(track))
-            track.add_downstream(session, ok.track_alias, msg.request_id)
-            session.register_request_cancel_handler(
-                msg.request_id,
-                lambda rid, t=track, s=session: t.drop_session(s))
-            logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
-                        f"-> SUBSCRIBE_OK (fanout="
-                        f"{len(track.downstream)})")
+            if _attach_subscriber(session, msg, track):
+                logger.info(f"relay: subscribe ns={ns} "
+                            f"track={msg.track_name} -> SUBSCRIBE_OK "
+                            f"(fanout={len(track.downstream)})")
             return
         # Announced but no publisher served it. Answer honestly rather
         # than acking a track that will never deliver.
@@ -1175,8 +1289,8 @@ def _prefix_covers(prefix, ns) -> bool:
 
 async def _offer_track(session, track, key):
     """§9.5: send a PUBLISH for a held/served track to a
-    SUBSCRIBE_TRACKS subscriber; on PUBLISH_OK(forward=1) wire it into
-    the fan-out."""
+    SUBSCRIBE_TRACKS subscriber; on PUBLISH_OK wire it into the fan-out
+    with the Forward State and filter it chose."""
     if not _session_live(session):
         _forget_session(session)
         return
@@ -1200,18 +1314,30 @@ async def _offer_track(session, track, key):
         # §10.2.12: FORWARD omitted from PUBLISH_OK means 1.
         forward = (getattr(reply, 'parameters', None) or {}).get(
             ParamType.FORWARD, 1)
-    if not forward:
-        logger.info(f"relay: PUBLISH offer for {key}: forward=0")
-        return
-    track.add_downstream(session, pub_msg.track_alias, pub_msg.request_id)
+    window = _filter_window(*_reply_filter(session, reply), track.largest)
+    track.add_downstream(session, pub_msg.track_alias, pub_msg.request_id,
+                         forward=bool(forward), window=window)
     session.register_request_cancel_handler(
         pub_msg.request_id,
         lambda rid, t=track, s=session: t.drop_session(s))
-    _accept_publish(track)
+    _answer_publish(track)
     _resume_parked_publish(track)
     logger.info(f"relay: PUBLISH offer accepted for {key} "
-                f"alias={pub_msg.track_alias} "
+                f"alias={pub_msg.track_alias} forward={int(bool(forward))} "
                 f"(fanout={len(track.downstream)})")
+
+
+def _reply_filter(session, reply) -> tuple:
+    """(type, start group, start object, end group) a PUBLISH_OK or
+    REQUEST_UPDATE carries: fields at d14, a parameter from d16."""
+    if getattr(reply, "filter_type", None) is not None:
+        return (reply.filter_type, reply.start_group, reply.start_object,
+                reply.end_group)
+    raw = (getattr(reply, "parameters", None) or {}).get(
+        ParamType.SUBSCRIPTION_FILTER)
+    if raw is None:
+        return (None, None, None, None)
+    return MOQTMessage._decode_filter(raw, prof=session._profile)
 
 
 # id(session) -> True once a datagram send proved unsupported there.
@@ -1289,11 +1415,13 @@ async def _on_fetch(session, msg):
                 error_code=int(RequestErrorCode.INVALID_JOINING_REQUEST_ID),
                 reason="no such subscription")
             return
-        key, track, anchor = found
-        if anchor is None:
-            # Nothing served yet: the subscription itself covers the
-            # track from its start, so there is nothing to backfill.
-            logger.info(f"relay: joining FETCH {key} has no anchor")
+        key, track, d = found
+        anchor = d.joined_at
+        if not d.forward or anchor is None:
+            # §10.12.2: Forward State 1 required; with no Joining Location
+            # the subscription covers the track from its start.
+            logger.info(f"relay: joining FETCH {key} has no anchor "
+                        f"(forward={int(d.forward)})")
             session.fetch_error(
                 request_id=msg.request_id,
                 error_code=int(RequestErrorCode.INVALID_RANGE),
@@ -1529,6 +1657,9 @@ def _build_server(bind, port, cert, key, use_quic, draft):
         MOQTMessageType.PUBLISH_NAMESPACE_DONE, _on_publish_namespace_done)
     server.register_handler(
         MOQTMessageType.SUBSCRIBE, _answered(_on_subscribe))
+    # Same code point as d16+ REQUEST_UPDATE.
+    server.register_handler(
+        MOQTMessageType.SUBSCRIBE_UPDATE, _answered(_on_request_update))
     server.register_handler(
         MOQTMessageType.PUBLISH, _answered(_on_publish))
     server.register_handler(

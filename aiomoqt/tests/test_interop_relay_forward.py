@@ -41,8 +41,8 @@ async def test_upstream_reset_becomes_a_downstream_reset_not_a_fin():
     # so an upstream reset must not be relayed as a clean stream end.
     track = _RelayedTrack(("ns", "t"))
     down = _Downstream()
-    track.downstream.append((down, 7, 1))
-    loop_task = asyncio.create_task(track._forward_loop())
+    track.add_downstream(down, 7, 1)
+    loop_task = track.task
 
     track.on_object(_Obj(group_id=0, object_id=0), 0, 0, 0, 0)
     track.on_stream_end(0, 0, clean=False, reset_code=2)   # DELIVERY_TIMEOUT
@@ -58,8 +58,8 @@ async def test_upstream_reset_becomes_a_downstream_reset_not_a_fin():
 async def test_forward_loop_survives_subgroup_end():
     track = _RelayedTrack(("ns", "t"))
     down = _Downstream()
-    track.downstream.append((down, 7, 1))
-    loop_task = asyncio.create_task(track._forward_loop())
+    track.add_downstream(down, 7, 1)
+    loop_task = track.task
 
     track.on_object(_Obj(group_id=0, object_id=0), 0, 0, 0, 0)
     track.on_stream_end(0, 0)
@@ -96,9 +96,9 @@ async def test_malformed_upstream_ends_downstream_and_drops_the_fanout():
     key = ("mal-ns", "t")
     track = _RelayedTrack(key)
     down = _Downstream()
-    track.downstream.append((down, 7, 1))
+    track.add_downstream(down, 7, 1)
     _tracks[key] = track
-    loop_task = asyncio.create_task(track._forward_loop())
+    loop_task = track.task
     try:
         track.on_object(_Obj(group_id=0, object_id=0), 0, 0, 0, 0)
         for _ in range(20):
