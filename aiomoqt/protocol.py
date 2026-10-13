@@ -4001,7 +4001,9 @@ class _MOQTSessionMixin:
             self.stream_reset(stream_id, StreamResetCode.CANCELLED)
             self._bidi_streams.pop(request_id, None)
             return None
-        message = PublishNamespaceDone(namespace=namespace, request_id=request_id)
+        if withdrawn is None and namespace is not None:
+            withdrawn = self._make_namespace_tuple(namespace)
+        message = PublishNamespaceDone(namespace=withdrawn, request_id=request_id)
         logger.info(f"MOQT send: {message}")
         self.send_control_message(message)
         return message

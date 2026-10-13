@@ -85,6 +85,9 @@ logger = get_logger(__name__)
 # more than once (sub-tests re-announce), so each session is held with a
 # refcount and drops out when it reaches zero or the session closes.
 _announced: dict[tuple, dict] = {}
+# (id(session), request_id) -> namespace of each PUBLISH_NAMESPACE still
+# held, so a withdrawal naming only the request finds its namespace.
+_announce_requests: dict[tuple, tuple] = {}
 
 # Tracks being relayed upstream->downstream, keyed by (namespace, name).
 _tracks: dict[tuple, "_RelayedTrack"] = {}
@@ -644,6 +647,8 @@ def _forget_session(session) -> None:
     _track_subs[:] = [e for e in _track_subs if e[0] is not session]
     _ns_subs[:] = [e for e in _ns_subs if e[0] is not session]
     _no_datagrams.pop(id(session), None)
+    for k in [k for k in _announce_requests if k[0] == id(session)]:
+        del _announce_requests[k]
     for ns in list(_announced):
         if _announced[ns].pop(session, None) is not None and \
                 not _announced[ns]:
@@ -683,6 +688,12 @@ async def _on_publish_namespace(session, msg):
     _supersede_namespace(ns, session)
     holders = _announced.setdefault(ns, {})
     holders[session] = holders.get(session, 0) + 1
+    _announce_requests[(id(session), msg.request_id)] = ns
+    # d18 has no PUBLISH_NAMESPACE_DONE: cancelling the request withdraws
+    # the namespace (§3.3.2).
+    session.register_request_cancel_handler(
+        msg.request_id,
+        lambda rid, s=session: _withdraw_namespace(s, request_id=rid))
     logger.info(f"relay: announce ns={ns} -> {len(holders)} publisher(s)")
     _announce_namespace(ns)
     # Reuse the protocol's built-in OK helper. It emits RequestOk on
@@ -691,11 +702,23 @@ async def _on_publish_namespace(session, msg):
 
 
 async def _on_publish_namespace_done(session, msg):
-    """Drop one publisher's hold on the namespace."""
+    """d14 names the namespace, d16 the PUBLISH_NAMESPACE request."""
     ns = _ns_tuple(msg.namespace) if msg.namespace else None
+    _withdraw_namespace(session, request_id=msg.request_id, ns=ns)
+
+
+def _withdraw_namespace(session, request_id=None, ns=None) -> None:
+    """Drop the hold one PUBLISH_NAMESPACE has on its namespace, at most
+    once however it is withdrawn; the last hold retracts the namespace."""
+    if request_id is None:
+        request_id = next((rid for (sid, rid), held
+                           in _announce_requests.items()
+                           if sid == id(session) and held == ns), None)
+    ns = _announce_requests.pop((id(session), request_id), None)
     holders = _announced.get(ns) if ns is not None else None
     if not holders or session not in holders:
-        logger.info(f"relay: publish_namespace_done for unknown ns={ns}")
+        logger.info(f"relay: withdrawal of unknown namespace "
+                    f"request_id={request_id}")
         return
     holders[session] -= 1
     if holders[session] <= 0:
@@ -731,8 +754,9 @@ async def _establish_upstream(ns, track_name):
         track.attaching = True
         name = (track_name.decode() if isinstance(track_name, bytes)
                 else track_name)
+        # The tuple, not a "/"-joined string: an element may contain "/".
         upstream = SubscribedTrack(
-            pub, "/".join(x.decode() for x in ns), name,
+            pub, ns, name,
             on_object=track.on_object,
             on_done=lambda done, t=track, k=key: _upstream_done(t, k, done))
         try:
@@ -1161,7 +1185,7 @@ async def _offer_track(session, track, key):
     # including one it publishes itself: the subscription is explicit,
     # and moq-test's publish cases use one session for both roles.
     pub_msg = session.publish(
-        namespace="/".join(x.decode() for x in ns),
+        namespace=ns,
         track_name=(name.decode() if isinstance(name, bytes) else name),
         forward=1)
     fut = session._loop.create_future()
@@ -1222,7 +1246,7 @@ async def _fetch_upstream(ns, track_name, msg):
     for pub in _publishers_for(ns):
         _install_fetch_sink(pub)
         req = pub.fetch(
-            namespace="/".join(x.decode() for x in ns),
+            namespace=ns,
             track_name=name,
             group_order=msg.group_order or GroupOrder.ASCENDING,
             start_group=msg.start_group or 0,
