@@ -404,3 +404,12 @@ async def test_sub_media_analyze_clean_loopback(packaging, tmp_path,
             == ('0', '0', '0'), r
         assert (r['missing_eog'], r['partial_groups']) == ('0', '0'), r
         assert float(r['lat_p50_ms']) >= 0
+
+
+def test_adapter_counts_wire_bytes_not_the_rebuilt_frame():
+    # A LOCMAF frame is the rebuilt CMAF chunk, larger than its object.
+    a = MediaAnalysis(cushion_ms=100)
+    a.add_track('v', role='video')
+    a.on_arrival('v', _obj(0, payload=b'w' * 10), T0, 0, 0,
+                 LocFrame(b'x' * 100, True, T0))
+    assert a.tracks['v'].bytes == 10

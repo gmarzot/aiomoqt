@@ -320,3 +320,38 @@ async def test_catalog_delta_after_a_skipped_update_opens_a_full_group():
     assert track._largest == (1, 0)
     last = session.writes[-1][2]
     assert b'"video-2"' in last and b'"video-3"' in last
+
+
+@pytest.mark.asyncio
+async def test_locmaf_tracks_subscribe_only_at_a_supported_version(monkeypatch):
+    # A track of an unknown locmafVersion, or without one, must not be
+    # subscribed; neither is one with no init to rebuild chunks against.
+    from types import SimpleNamespace
+    from aiomoqt.media import LocmafTrackSubscriber
+    from aiomoqt.media.cmaf import CmafChunker
+    from aiomoqt.track import SubscribedTrack
+
+    subscribed = []
+
+    async def _subscribe(self, *args, **kwargs):
+        subscribed.append(self.trackname)
+    monkeypatch.setattr(SubscribedTrack, "subscribe", _subscribe)
+
+    entry = b"\x00\x00\x00\x56avc1" + b"\x00" * 78
+    init = CmafChunker(SimpleNamespace(
+        timescale=90000, width=64, height=64,
+        sample_entry_bytes=entry)).init_segment()
+    tracks = [CatalogTrack(name=name, packaging="locmaf", isLive=True,
+                           locmafVersion=version, initRef=ref)
+              for name, version, ref in (("v02", "0.2", "i"),
+                                         ("vnone", None, "i"),
+                                         ("noinit", "0.3", None),
+                                         ("v03", "0.3", "i"))]
+    seen = []
+    sub = MediaSubscriber(SimpleNamespace(), _NS,
+                          track_filter=lambda t: seen.append(t.name) or True)
+    sub.catalog = Catalog(tracks=tracks,
+                          initDataList=[InitData.from_bytes("i", init)])
+    await sub._subscribe_media()
+    assert subscribed == ["v03"] and seen == ["v03"]
+    assert isinstance(sub.tracks["v03"], LocmafTrackSubscriber)

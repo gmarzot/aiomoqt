@@ -456,15 +456,24 @@ async def test_ingest_catalog_alternate_group(origin):
 
 @requires_certs
 @pytest.mark.parametrize('use_quic', [True, False], ids=['quic', 'wt'])
-@pytest.mark.parametrize('source, entry', [
-    ('fmp4', 'master.m3u8'), ('dash-number', 'm.mpd'),
-], ids=['hls', 'dash'])
+@pytest.mark.parametrize('source, entry, packaging', [
+    ('fmp4', 'master.m3u8', 'cmaf'), ('dash-number', 'm.mpd', 'cmaf'),
+    ('fmp4', 'master.m3u8', 'locmaf'),
+], ids=['hls', 'dash', 'hls-locmaf'])
 async def test_pub_media_input_through_a_relay(ladders, monkeypatch, source,
-                                               entry, use_quic):
+                                               entry, packaging, use_quic):
     """Catalog, two renditions and audio on one session each way."""
     av = load_av()
     ns = 'ingest/e2e'
-    port = _BASE_PORT + 1 + (source != 'fmp4') + (0 if use_quic else 10)
+    port = (_BASE_PORT + 1 + (source != 'fmp4') + 2 * (packaging == 'locmaf')
+            + (0 if use_quic else 10))
+    published = []
+
+    class _Recording(pub_media.LocmafTrackPublisher):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            published.append(self)
+    monkeypatch.setattr(pub_media, 'LocmafTrackPublisher', _Recording)
     origin = _Origin(ladders[source], entry=entry)
     relay._announced.clear()
     relay._tracks.clear()
@@ -472,7 +481,8 @@ async def test_pub_media_input_through_a_relay(ladders, monkeypatch, source,
                                        use_quic=use_quic, draft=18).serve()
     scheme = 'moqt' if use_quic else 'https'
     args = _parse(monkeypatch, '-N', ns, '--input', origin.url,
-                  '--rendition', 'all', '--pub-ns', '-k', '-t', str(_SECONDS),
+                  '--rendition', 'all', '--packaging', packaging,
+                  '--pub-ns', '-k', '-t', str(_SECONDS),
                   '--stats', '0', '--catalog-interval', '0.5',
                   url=f'{scheme}://localhost:{port}/')
     got = {}
@@ -502,6 +512,11 @@ async def test_pub_media_input_through_a_relay(ladders, monkeypatch, source,
         relay._tracks.clear()
     videos = [t for t in catalog.tracks if t.role == 'video']
     assert [t.altGroup for t in videos] == [1, 1]
+    assert {t.packaging for t in catalog.tracks} == {packaging}
+    assert all(getattr(t, 'objects_rejected', 0) == 0
+               for t in sub.tracks.values())
+    assert len(published) == (3 if packaging == 'locmaf' else 0)
+    assert all(t.raw_fallbacks == 0 for t in published)
     groups = {}
     for t in videos:
         objs = got.get(t.name, [])
