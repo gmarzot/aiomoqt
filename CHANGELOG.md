@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Tools: `--draft 20|21|22` (or a list such as `22,21,20,18`) on pub_bench, sub_bench,
+  relay_probe, moq_interop_client, pub_server and moq_interop_relay; defaults unchanged.
 - Sessions complete SETUP at d20, d21 and d22 over raw QUIC (ALPN `moqt-20`/`-21`/`-22`) and
   WebTransport (WT-Protocol), with the draft settled from the negotiation on both ends.
 - d20+: PUBLISH_STATE_NOTIFY is received and logged; the peer's MAX_REQUEST_UPDATES and

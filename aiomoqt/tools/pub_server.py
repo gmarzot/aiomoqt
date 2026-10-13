@@ -90,7 +90,8 @@ def parse_args():
         help='Serve H3/WebTransport (default if neither given)')
     parser.add_argument(
         '--draft', type=parse_draft_spec, default=16,
-        help='MoQT draft version when --quic (default: 16)')
+        help='MoQT draft(s) to accept: one draft, or a comma list such '
+             'as 22,21,20,18 (20-22 only when listed; default: 16)')
     parser.add_argument(
         '-N', '--namespace', type=str, default='aiomoqt',
         help='Track namespace (default: aiomoqt)')

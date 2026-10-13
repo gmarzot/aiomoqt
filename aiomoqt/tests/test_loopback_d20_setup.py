@@ -145,3 +145,61 @@ async def test_d20_multi_offer_settles_the_servers_draft(use_quic):
             assert srv.negotiated_draft == 21
     finally:
         handle.close()
+
+
+async def test_d20_serve_dual_takes_both_transports_on_one_port():
+    port = _BASE_PORT + 18
+    captured = []
+
+    async def on_setup(session, msg):
+        captured.append(session)
+        _, default = session.CONTROL_REGISTRY[session.negotiated_draft][
+            MOQTMessageType.SETUP]
+        await default(session, msg)
+
+    server = MOQTServer(host="localhost", port=port, certificate=CERT,
+                        private_key=KEY, path="/",
+                        supported_drafts=_ALL_DRAFTS)
+    server.register_handler(MOQTMessageType.SETUP, on_setup)
+    handle = await server.serve_dual()
+    try:
+        for use_quic, draft in ((True, 22), (False, 21), (True, 20)):
+            async with _client(port, use_quic, draft).connect() as session:
+                await session.client_session_init()
+                assert session.negotiated_draft == draft
+        assert [s.negotiated_draft for s in captured] == [22, 21, 20]
+        assert [s._is_wt for s in captured] == [False, True, False]
+    finally:
+        handle.close()
+
+
+# -- the dialing tools at d20+ ----------------------------------------
+
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+async def test_relay_probe_reports_d22(use_quic):
+    from aiomoqt.tools import relay_probe
+    port = _BASE_PORT + 20 + (0 if use_quic else 1)
+    handle, _ = await _start_server(port, use_quic)
+    try:
+        r = await relay_probe.probe_version(
+            "localhost", port, "/", use_quic, 22, verify_tls=False)
+        assert r["live"] and r["draft"] == 22, r
+    finally:
+        handle.close()
+
+
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+async def test_interop_client_setup_only_against_the_interop_relay(use_quic):
+    from aiomoqt.tools import moq_interop_client, moq_interop_relay
+    port = _BASE_PORT + 22 + (0 if use_quic else 1)
+    server = moq_interop_relay._build_server(
+        "localhost", port, CERT, KEY, use_quic, [22, 21, 20, 18])
+    handle = await server.serve()
+    try:
+        for draft in (20, 21, 22):
+            result = await moq_interop_client.test_setup_only(
+                "localhost", port, "/", use_quic, True, False,
+                supported_drafts=draft)
+            assert result.passed, result.message
+    finally:
+        handle.close()
