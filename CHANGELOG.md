@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `session.subscribe(on_object=, on_done=)` registers a subscription's object and PUBLISH_DONE
+  handlers before SUBSCRIBE is sent; the object handler binds to its alias as SUBSCRIBE_OK is
+  parsed, and a refusal or an abandoned wait drops both.
+- An agent `Reader` is done once PUBLISH_DONE has arrived and the streams it counts have ended,
+  or after `PUBLISH_DONE_GRACE_S`; `Reader.ended` says which. Status objects no longer reach reads.
 - Agent `Obj.value` decodes the payload as the spec's `decode` asks (bytes, UTF-8 text, JSON); a
   payload that does not decode raises `DecodeError`, and `Obj.payload` keeps the bytes.
 - `AgentSession` raises `Unsupported` for spec values it would otherwise ignore: `TrackRef.relay`,

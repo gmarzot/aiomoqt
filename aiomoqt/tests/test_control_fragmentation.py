@@ -33,6 +33,8 @@ def _control_session(draft):
     s._announced = {}
     s._discovery_subs = {}
     s._pending_requests = {}
+    s._pending_object_handlers = {}
+    s._publish_done_handlers = {}
     s._next_track_alias = 0
     s._track_aliases = {}
     s._loop = asyncio.get_running_loop()

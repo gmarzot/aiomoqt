@@ -15,25 +15,43 @@ from aiomoqt.agent import (
 from aiomoqt.agent.errors import AgentError
 from aiomoqt.agent.reader import Obj, ReadTimeout
 from aiomoqt.agent.session import AgentSession, start_at_to_wire
-from aiomoqt.types import FilterType, GroupOrder
+from aiomoqt.types import FilterType, GroupOrder, ObjectStatus
 
 
 class _Ok:
-    def __init__(self, alias):
+    def __init__(self, alias, request_id):
         self.track_alias = alias
+        self.request_id = request_id
 
 
 class _StubSession:
-    def __init__(self, alias=1):
+    """Records requests. Like the session, binds a subscription's object
+    handler to its alias and keeps its PUBLISH_DONE handler by request
+    id."""
+
+    def __init__(self, alias=1, grace=None):
         self.calls = []
         self.handlers = {}
+        self.done = {}
+        self.stream_end = {}
         self._alias = alias
+        self._rid = 0
+        if grace is not None:
+            self.PUBLISH_DONE_GRACE_S = grace
+
+    def _next_rid(self):
+        rid, self._rid = self._rid, self._rid + 2
+        return rid
 
     async def subscribe(self, **kwargs):
         self.calls.append(kwargs)
-        alias = self._alias
+        alias, rid = self._alias, self._next_rid()
         self._alias += 1
-        return _Ok(alias)
+        if kwargs.get("on_object") is not None:
+            self.handlers[alias] = kwargs["on_object"]
+        if kwargs.get("on_done") is not None:
+            self.done[rid] = kwargs["on_done"]
+        return _Ok(alias, rid)
 
     def register_object_handler(self, alias, cb):
         self.handlers[alias] = cb
@@ -41,12 +59,26 @@ class _StubSession:
     def unregister_object_handler(self, alias):
         self.handlers.pop(alias, None)
 
+    def register_stream_end_handler(self, alias, cb):
+        self.stream_end[alias] = cb
+
+    def unregister_stream_end_handler(self, alias):
+        self.stream_end.pop(alias, None)
+
 
 class _Msg:
-    def __init__(self, object_id, payload=b"x", extensions=None):
+    def __init__(self, object_id, payload=b"x", extensions=None, status=0):
         self.object_id = object_id
         self.payload = payload
         self.extensions = extensions
+        self.status = status
+
+
+class _Done:
+    def __init__(self, stream_count, status_code=0x2, reason="done"):
+        self.stream_count = stream_count
+        self.status_code = status_code
+        self.reason = reason
 
 
 def _feed(reader, group, count, start=0, recv_us=1_000_000):
@@ -279,6 +311,7 @@ async def test_session_closes_its_readers():
         await agent.reader(_spec("audio"))
         assert len(stub.handlers) == 2
     assert stub.handlers == {}
+    assert stub.stream_end == {}
 
 
 # -- decode ------------------------------------------------------------
@@ -310,6 +343,83 @@ async def test_undecodable_payload_raises_on_access():
             obj.value
         assert isinstance(err.value, AgentError)
     assert text.stats.errors == data.stats.errors == 0
+
+
+# -- completion ----------------------------------------------------------
+
+async def test_status_objects_never_reach_reads():
+    agent = AgentSession(_StubSession())
+    rdr = await agent.reader(_spec())
+    rdr.on_object(_Msg(0), 1, 1, 1, 0)
+    rdr.on_object(_Msg(1, b"", status=ObjectStatus.END_OF_GROUP), 0, 2, 1, 0)
+    assert [o.object_id for o in rdr.drain()] == [0]
+    assert rdr.stats.received == 1
+
+
+async def test_done_waits_for_stream_count():
+    """§10.11: objects can follow PUBLISH_DONE, so it alone is not the end."""
+    stub = _StubSession()
+    rdr = await AgentSession(stub).reader(_spec())
+    stub.done[rdr.request_id](_Done(stream_count=2))
+    assert not rdr.done
+    stub.stream_end[rdr.alias](0, 0, clean=True, reset_code=0)
+    assert not rdr.done
+    stub.stream_end[rdr.alias](1, 0, clean=False, reset_code=0)
+    assert rdr.done and rdr.ended == "complete"
+    assert rdr.publish_done == {"status_code": 0x2, "reason": "done",
+                                "stream_count": 2}
+
+
+async def test_streams_ended_before_publish_done_count():
+    stub = _StubSession()
+    rdr = await AgentSession(stub).reader(_spec())
+    stub.stream_end[rdr.alias](0, 0, clean=True, reset_code=0)
+    assert not rdr.done
+    stub.done[rdr.request_id](_Done(stream_count=1))
+    assert rdr.done and rdr.ended == "complete"
+
+
+async def test_zero_streams_done_at_publish_done():
+    stub = _StubSession()
+    rdr = await AgentSession(stub).reader(_spec())
+    stub.done[rdr.request_id](_Done(stream_count=0))
+    assert rdr.done and rdr.ended == "complete"
+    assert await rdr.read(5, timeout=5.0) == []
+
+
+async def test_done_after_grace_when_streams_are_missing():
+    stub = _StubSession(grace=0.05)
+    rdr = await AgentSession(stub).reader(_spec())
+    _feed(rdr, group=1, count=2)
+    stub.done[rdr.request_id](_Done(stream_count=3))
+    stub.stream_end[rdr.alias](1, 0, clean=True, reset_code=0)
+    assert not rdr.done
+    got = await rdr.read(10, timeout=5.0)
+    assert len(got) == 2
+    assert rdr.done and rdr.ended == "grace"
+
+
+async def test_publish_done_reaches_only_its_reader():
+    stub = _StubSession()
+    agent = AgentSession(stub)
+    a = await agent.reader(_spec("video"))
+    b = await agent.reader(_spec("audio"))
+    assert a.request_id != b.request_id and a.alias != b.alias
+    stub.stream_end[b.alias](0, 0, clean=True, reset_code=0)
+    stub.done[a.request_id](_Done(stream_count=1))
+    assert not a.done
+    stub.stream_end[a.alias](0, 0, clean=True, reset_code=0)
+    assert a.done and not b.done
+    assert b.publish_done is None and b.ended is None
+
+
+async def test_a_closed_reader_reports_closed():
+    stub = _StubSession(grace=0.01)
+    agent = AgentSession(stub)
+    rdr = await agent.reader(_spec())
+    agent.close_reader(rdr.name)
+    stub.done[rdr.request_id](_Done(stream_count=0))
+    assert rdr.ended == "closed"
 
 
 # -- inputs the runtime would otherwise ignore -------------------------

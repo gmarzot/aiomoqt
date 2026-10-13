@@ -25,9 +25,12 @@ class _StubSession:
     def __init__(self):
         self.calls = []
         self.handlers = {}
+        self.stream_end = {}
 
     async def subscribe(self, **kw):
         self.calls.append(kw)
+        if kw.get("on_object") is not None:
+            self.handlers[1] = kw["on_object"]
         return type("Ok", (), {"track_alias": 1, "request_id": 1})()
 
     def register_object_handler(self, alias, cb):
@@ -35,6 +38,12 @@ class _StubSession:
 
     def unregister_object_handler(self, alias):
         self.handlers.pop(alias, None)
+
+    def register_stream_end_handler(self, alias, cb):
+        self.stream_end[alias] = cb
+
+    def unregister_stream_end_handler(self, alias):
+        self.stream_end.pop(alias, None)
 
 
 class _RecordingOut:

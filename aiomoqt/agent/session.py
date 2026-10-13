@@ -5,9 +5,11 @@ connection (transport §7.1), so the object expressing "decisions before
 reasoning" has to be the object holding the connection. A list of
 independent publish specs cannot say they share one.
 
-AgentSession is that owner. It wraps a connected MOQT session, registers
-each reader against the per-alias object handler so several tracks can
-share the connection, and keeps the declared priorities together.
+AgentSession is that owner. It wraps a connected MOQT session, routes
+each reader's objects, PUBLISH_DONE and stream ends through the session's
+per-request and per-alias tables (never a session-wide handler slot) so
+several tracks can share the connection, and keeps the declared
+priorities together.
 
 Async only. A loop-owning runtime with a blocking facade wraps this
 later; nothing here assumes it is driven from the loop thread beyond
@@ -86,7 +88,12 @@ class AgentSession:
         return dict(self._readers)
 
     async def reader(self, spec: SubscribeSpec) -> Reader:
-        """Subscribe and return a bounded reader for the track."""
+        """Subscribe and return a bounded reader for the track.
+
+        The reader is done once PUBLISH_DONE has arrived and every stream
+        it counts has ended, or the session's PUBLISH_DONE_GRACE_S has
+        run out; `Reader.ended` says which.
+        """
         self._guard()
         check_supported(spec)
         if spec.track.name is None:
@@ -97,7 +104,8 @@ class AgentSession:
         if name in self._readers:
             raise AgentError(f"reader: already subscribed to {name}")
 
-        rdr = Reader(spec, name)
+        rdr = Reader(spec, name, grace_s=getattr(
+            self._session, "PUBLISH_DONE_GRACE_S", 5.0))
         filter_type, start_group, start_object, end_group = start_at_to_wire(
             spec.start_at)
         ok = await self._session.subscribe(
@@ -110,13 +118,16 @@ class AgentSession:
             end_group=end_group,
             priority=spec.priority.subscriber,
             group_order=_GROUP_ORDERS.get(spec.priority.group_order),
+            on_object=rdr.on_object,
+            on_done=rdr.on_publish_done,
             wait_response=True,
         )
         alias = getattr(ok, "track_alias", None)
         if alias is None:
             raise AgentError(f"reader: no track alias in the reply for {name}")
         rdr.alias = alias
-        self._session.register_object_handler(alias, rdr.on_object)
+        rdr.request_id = getattr(ok, "request_id", None)
+        self._session.register_stream_end_handler(alias, rdr.on_stream_end)
         self._readers[name] = rdr
         return rdr
 
@@ -184,9 +195,9 @@ class AgentSession:
         rdr = self._readers.pop(name, None)
         if rdr is None:
             return
-        alias = getattr(rdr, "alias", None)
-        if alias is not None:
-            self._session.unregister_object_handler(alias)
+        if rdr.alias is not None:
+            self._session.unregister_object_handler(rdr.alias)
+            self._session.unregister_stream_end_handler(rdr.alias)
         rdr.close()
 
     async def close(self) -> None:

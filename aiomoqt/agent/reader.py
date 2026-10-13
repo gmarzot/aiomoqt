@@ -9,6 +9,10 @@ O(1), never blocks and never raises: a consumer fault must not surface as
 a protocol error. Everything costly happens on the reading side, payload
 decoding included.
 
+A subscription is done once its PUBLISH_DONE has arrived and every stream
+it counts has ended, since objects can follow PUBLISH_DONE (§10.11), or
+when the session's PUBLISH_DONE_GRACE_S runs out first.
+
 Staleness is measured, not assumed. `age_ms` comes from the object's own
 LOC timestamp against arrival; it is never inferred from a delivery
 timeout, because no draft requires a relay to honour one.
@@ -103,44 +107,59 @@ class Reader:
     """Bounded reads over one subscription's object stream.
 
     Held by an AgentSession, which owns the connection the subscription
-    runs on.
+    runs on. `grace_s` bounds the wait for streams after PUBLISH_DONE.
     """
 
-    def __init__(self, spec: SubscribeSpec, name: str):
+    def __init__(self, spec: SubscribeSpec, name: str, *,
+                 grace_s: float = 5.0):
         self.spec = spec
         self.name = name
         self.stats = ReadStats()
+        self.alias: Optional[int] = None
+        self.request_id: Optional[int] = None
+        # Status code, reason and Stream Count of the PUBLISH_DONE.
+        self.publish_done: Optional[Dict[str, Any]] = None
         self._decode = spec.decode
+        self._grace_s = grace_s
+        self._grace: Optional[asyncio.TimerHandle] = None
+        self._streams_ended = 0
+        self._streams_expected: Optional[int] = None
         self._ring: Deque[Obj] = deque()
         self._arrival = asyncio.Event()
         self._closed = False
         self._done = False
+        self._ended: Optional[str] = None
 
     # -- ingest: event-loop side, O(1), never raises -----------------
+    # The guards cover admission as well as construction: an exception
+    # escaping here is reported by the protocol layer as a parse error
+    # and rejects the stream, so a consumer fault would present as a
+    # peer protocol violation.
 
     def on_object(self, msg, size, recv_time_us, group_id=None,
                   subgroup_id=None) -> None:
-        """Object-handler callback. Runs inside the parse path.
-
-        The guard covers admission as well as construction: an exception
-        escaping here is reported by the protocol layer as a parse error
-        and rejects the stream, so a consumer fault would present as a
-        peer protocol violation.
-        """
+        """Object-handler callback for a subscription. Runs inside the
+        parse path."""
         try:
-            self._admit(Obj(
-                track=self.name,
-                group=group_id if group_id is not None else -1,
-                object_id=getattr(msg, "object_id", -1),
-                subgroup=subgroup_id,
-                payload=getattr(msg, "payload", b"") or b"",
-                size=size,
-                recv_us=recv_time_us,
-                sent_us=send_time_us(getattr(msg, "extensions", None)),
-                decode=self._decode,
-            ))
+            self._ingest(msg, size, recv_time_us, group_id, subgroup_id)
         except Exception:
             self.stats.errors += 1
+
+    def _ingest(self, msg, size, recv_time_us, group_id,
+                subgroup_id) -> None:
+        if getattr(msg, "status", 0):
+            return  # END_OF_GROUP, END_OF_TRACK: no payload to read
+        self._admit(Obj(
+            track=self.name,
+            group=group_id if group_id is not None else -1,
+            object_id=getattr(msg, "object_id", -1),
+            subgroup=subgroup_id,
+            payload=getattr(msg, "payload", b"") or b"",
+            size=size,
+            recv_us=recv_time_us,
+            sent_us=send_time_us(getattr(msg, "extensions", None)),
+            decode=self._decode,
+        ))
 
     def _admit(self, obj: Obj) -> None:
         st = self.stats
@@ -148,8 +167,6 @@ class Reader:
             if self.spec.on_full == "drop_new":
                 st.dropped += 1
                 return
-            # block/error cannot park the parse path; both shed the
-            # oldest and are surfaced by stats rather than stalling RX.
             self._ring.popleft()
             st.dropped += 1
         if obj.group != st.last_group:
@@ -163,10 +180,45 @@ class Reader:
         self._ring.append(obj)
         self._arrival.set()
 
-    def mark_done(self) -> None:
-        """The publisher ended the subscription; unblock any waiter."""
+    # -- completion ----------------------------------------------------
+
+    def on_publish_done(self, msg) -> None:
+        """PUBLISH_DONE handler: done once the streams it counts have
+        ended, else when the grace period runs out."""
+        count = getattr(msg, "stream_count", None)
+        self.publish_done = {"status_code": getattr(msg, "status_code", None),
+                             "reason": getattr(msg, "reason", None),
+                             "stream_count": count}
+        self._streams_expected = count
+        if count is not None and self._streams_ended >= count:
+            self.mark_done("complete")
+        elif not (self._done or self._closed) and self._grace is None:
+            self._grace = asyncio.get_running_loop().call_later(
+                self._grace_s, self.mark_done, "grace")
+
+    def on_stream_end(self, group_id, subgroup_id, clean=True,
+                      reset_code=0) -> None:
+        """Stream-end handler for the subscription's track alias."""
+        self._streams_ended += 1
+        expected = self._streams_expected
+        if expected is not None and self._streams_ended >= expected:
+            self.mark_done("complete")
+
+    def mark_done(self, how: str = "complete") -> None:
+        """End the read side; reads return what is buffered instead of
+        waiting. `how` becomes `ended` unless the reader was closed."""
+        if self._done:
+            return
         self._done = True
+        if self._ended is None:
+            self._ended = how
+        self._cancel_grace()
         self._arrival.set()
+
+    def _cancel_grace(self) -> None:
+        if self._grace is not None:
+            self._grace.cancel()
+            self._grace = None
 
     # -- bounded reads: caller side ----------------------------------
 
@@ -224,11 +276,22 @@ class Reader:
 
     def close(self) -> None:
         self._closed = True
+        self._cancel_grace()
+        if self._ended is None:
+            self._ended = "closed"
         self._arrival.set()
 
     @property
     def done(self) -> bool:
         return self._done
+
+    @property
+    def ended(self) -> Optional[str]:
+        """How the read side ended. None while live; "complete" once
+        every stream PUBLISH_DONE counts has ended; "grace" when
+        PUBLISH_DONE_GRACE_S ran out first, so objects may be missing;
+        "closed" when closed here first."""
+        return self._ended
 
     @property
     def buffered(self) -> int:

@@ -20,6 +20,7 @@ from .context import *
 from .messages import *
 from .messages.d18 import Setup
 from .messages.fetch import _is_joining
+from .messages.subscribe import SubscribeOk
 from .types import *
 from .utils.buffer import Buffer, BufferReadError
 from .utils.logger import *
@@ -338,6 +339,9 @@ class _MOQTSessionMixin:
         self._request_cancel_handlers: Dict[int, Callable] = {}
         # request_id -> callback fired on PUBLISH_DONE for that request.
         self._publish_done_handlers: Dict[int, Callable] = {}
+        # Our SUBSCRIBE request id -> object handler, bound to the track
+        # alias where its SUBSCRIBE_OK is parsed.
+        self._pending_object_handlers: Dict[int, Callable] = {}
         # Tracks this session serves, by full track name; control
         # messages addressed to one are routed to it.
         self._published_tracks: Dict[Tuple[Tuple[bytes, ...], bytes], Any] = {}
@@ -505,6 +509,15 @@ class _MOQTSessionMixin:
                 response=response,
             )
         return response
+
+    async def _await_routed(self, request_id: int):
+        """_await_response for a request that registered handlers: a
+        wait that fails or is abandoned drops them."""
+        try:
+            return await self._await_response(request_id)
+        except BaseException:
+            self._drop_request_routes(request_id)
+            raise
 
     async def await_fetch_done(self, request_id: int,
                               timeout: float = 10.0) -> bool:
@@ -741,6 +754,25 @@ class _MOQTSessionMixin:
         subscription `request_id` (§10.11). Once per request; the
         session stays up."""
         self._publish_done_handlers[request_id] = callback
+
+    def _drop_request_routes(self, request_id) -> None:
+        """Forget the handlers a request of ours registered: it was
+        refused, or its awaiter gave up."""
+        self._pending_object_handlers.pop(request_id, None)
+        self._publish_done_handlers.pop(request_id, None)
+
+    def _route_reply(self, msg) -> None:
+        """Act on a reply as it is parsed, ahead of the data streams in
+        its batch and of the handler task: SUBSCRIBE_OK binds the
+        request's object handler to its alias; an error reply drops what
+        the request registered."""
+        if isinstance(msg, SubscribeOk):
+            cb = self._pending_object_handlers.pop(msg.request_id, None)
+            if cb is not None and msg.track_alias is not None:
+                self._object_handlers[msg.track_alias] = cb
+        elif self._is_error_response(msg):
+            rid = getattr(msg, 'request_id', None)
+            self._drop_request_routes(rid)
 
     def _on_request_stream_terminated(
             self, stream_id: int, *,
@@ -1037,6 +1069,7 @@ class _MOQTSessionMixin:
                 raise MOQTProtocolViolation(
                     f"{message_class.__name__} body ends "
                     f"{end_pos - buf.tell()} bytes short of its Length")
+            self._route_reply(msg)
             logger.info(f"MOQT event: control message parsed: {msg})")
             refusal = (self._resolve_auth_token(msg)
                        or self._refuse_request(msg))
@@ -3344,8 +3377,16 @@ class _MOQTSessionMixin:
         end_group: Optional[int] = 0,
         parameters: Optional[Dict[int, bytes]] = None,
         wait_response: Optional[bool] = False,
+        on_object: Optional[Callable] = None,
+        on_done: Optional[Callable] = None,
     ) -> Optional[MOQTMessage]:
-        """Subscribe to a track with configurable options."""
+        """Subscribe to a track with configurable options.
+
+        `on_object` receives this track's objects (the
+        register_object_handler signature), bound to its alias as
+        SUBSCRIBE_OK is parsed; `on_done` is its PUBLISH_DONE handler
+        (register_publish_done_handler). Both are registered before
+        SUBSCRIBE is sent and dropped if it is refused."""
         if parameters is None:
             parameters = {}
         request_id = self._allocate_request_id()
@@ -3367,12 +3408,17 @@ class _MOQTSessionMixin:
         )
         message.libquicr_compat = self._session.libquicr_compat
         self._subscriptions[request_id] = [message]
+        if on_object is not None:
+            self._pending_object_handlers[request_id] = on_object
+        if on_done is not None:
+            self.register_publish_done_handler(request_id, on_done)
         logger.info(f"MOQT send: {message}")
         self._send_request(request_id, message)
 
         if not wait_response:
             return message
-
+        if on_object is not None or on_done is not None:
+            return self._await_routed(request_id)
         return self._await_response(request_id)
 
     def track_status(
