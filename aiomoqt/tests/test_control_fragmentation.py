@@ -35,6 +35,7 @@ def _control_session(draft):
     s._pending_requests = {}
     s._pending_object_handlers = {}
     s._publish_done_handlers = {}
+    s._fetch_object_handlers = {}
     s._next_track_alias = 0
     s._track_aliases = {}
     s._loop = asyncio.get_running_loop()

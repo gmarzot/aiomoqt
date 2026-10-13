@@ -10,16 +10,19 @@ import json
 import pytest
 
 from aiomoqt.agent import (
-    DecodeError, Priority, StartAt, SubscribeSpec, TrackRef, Unsupported,
+    DecodeError, FetchSpec, Priority, StartAt, SubscribeSpec, TrackRef,
+    Unsupported,
 )
 from aiomoqt.agent.errors import AgentError
 from aiomoqt.agent.reader import Obj, ReadTimeout
 from aiomoqt.agent.session import AgentSession, start_at_to_wire
-from aiomoqt.types import FilterType, GroupOrder, ObjectStatus
+from aiomoqt.types import (
+    FilterType, GroupOrder, MOQTRequestError, ObjectStatus,
+)
 
 
 class _Ok:
-    def __init__(self, alias, request_id):
+    def __init__(self, alias=None, request_id=0):
         self.track_alias = alias
         self.request_id = request_id
 
@@ -27,13 +30,17 @@ class _Ok:
 class _StubSession:
     """Records requests. Like the session, binds a subscription's object
     handler to its alias and keeps its PUBLISH_DONE handler by request
-    id."""
+    id; fetches finish when the test sets `fetch_done[rid]`."""
 
     def __init__(self, alias=1, grace=None):
         self.calls = []
+        self.fetch_calls = []
         self.handlers = {}
         self.done = {}
         self.stream_end = {}
+        self.fetch_handlers = {}
+        self.fetch_done = {}
+        self.refuse_fetch = False
         self._alias = alias
         self._rid = 0
         if grace is not None:
@@ -65,6 +72,24 @@ class _StubSession:
     def unregister_stream_end_handler(self, alias):
         self.stream_end.pop(alias, None)
 
+    async def fetch(self, **kwargs):
+        self.fetch_calls.append(kwargs)
+        if self.refuse_fetch:
+            raise MOQTRequestError(error_code=0x3, reason="no")
+        rid = self._next_rid()
+        self.fetch_handlers[rid] = kwargs["on_object"]
+        self.fetch_done[rid] = asyncio.get_running_loop().create_future()
+        return _Ok(request_id=rid)
+
+    async def await_fetch_done(self, rid, timeout=10.0):
+        try:
+            return await asyncio.wait_for(self.fetch_done[rid], timeout)
+        except asyncio.TimeoutError:
+            return False
+
+    def unregister_fetch_object_handler(self, rid):
+        self.fetch_handlers.pop(rid, None)
+
 
 class _Msg:
     def __init__(self, object_id, payload=b"x", extensions=None, status=0):
@@ -79,6 +104,16 @@ class _Done:
         self.stream_count = stream_count
         self.status_code = status_code
         self.reason = reason
+
+
+class _FetchObj:
+    def __init__(self, group_id, object_id, payload=b"f", subgroup_id=0):
+        self.group_id = group_id
+        self.object_id = object_id
+        self.subgroup_id = subgroup_id
+        self.payload = payload
+        self.extensions = None
+        self.status = 0
 
 
 def _feed(reader, group, count, start=0, recv_us=1_000_000):
@@ -345,6 +380,15 @@ async def test_undecodable_payload_raises_on_access():
     assert text.stats.errors == data.stats.errors == 0
 
 
+async def test_fetch_objects_decode_too():
+    stub = _StubSession()
+    rdr = await AgentSession(stub).fetch(FetchSpec(
+        track=TrackRef("a", "t"), start_at=StartAt.range(0, 1),
+        decode="json"))
+    rdr.on_fetched(_FetchObj(0, 0, b"[1, 2]"), 6, 1, rdr.request_id)
+    assert rdr.drain()[0].value == [1, 2]
+
+
 # -- completion ----------------------------------------------------------
 
 async def test_status_objects_never_reach_reads():
@@ -422,6 +466,98 @@ async def test_a_closed_reader_reports_closed():
     assert rdr.ended == "closed"
 
 
+# -- fetch -----------------------------------------------------------------
+
+def _fetch_spec(**kw):
+    return FetchSpec(track=TrackRef("audit/s7", "decisions"),
+                     start_at=StartAt(mode="range", group=100, object=2,
+                                      end_group=200), **kw)
+
+
+async def test_fetch_sends_the_range():
+    stub = _StubSession()
+    await AgentSession(stub).fetch(_fetch_spec(
+        priority=Priority(subscriber=8, group_order="descending")))
+    sent, = stub.fetch_calls
+    assert (sent["namespace"], sent["track_name"]) == ("audit/s7", "decisions")
+    assert (sent["start_group"], sent["start_object"]) == (100, 2)
+    # End object 0: the whole end group.
+    assert (sent["end_group"], sent["end_object"]) == (200, 0)
+    assert sent["subscriber_priority"] == 8
+    assert sent["group_order"] is GroupOrder.DESCENDING
+    assert sent["wait_response"] is True and callable(sent["on_object"])
+
+
+async def test_fetch_reader_done_on_stream_end():
+    stub = _StubSession()
+    rdr = await AgentSession(stub).fetch(_fetch_spec())
+    deliver = stub.fetch_handlers[rdr.request_id]
+    for obj in range(3):
+        deliver(_FetchObj(100, obj + 2, b"o%d" % obj), 2, 1, rdr.request_id)
+    assert not rdr.done
+    stub.fetch_done[rdr.request_id].set_result(True)
+    got = await rdr.read(10, timeout=5.0)
+    assert [(o.group, o.object_id, o.payload) for o in got] == [
+        (100, 2, b"o0"), (100, 3, b"o1"), (100, 4, b"o2")]
+    assert rdr.done and rdr.ended == "complete"
+    assert stub.fetch_handlers == {}
+
+
+async def test_a_reset_fetch_ends_failed():
+    stub = _StubSession()
+    rdr = await AgentSession(stub).fetch(_fetch_spec())
+    stub.fetch_done[rdr.request_id].set_result(False)
+    assert await rdr.read(1, timeout=5.0) == []
+    assert rdr.ended == "failed"
+
+
+async def test_fetch_ring_is_unbounded():
+    stub = _StubSession()
+    rdr = await AgentSession(stub).fetch(_fetch_spec())
+    for obj in range(1000):
+        rdr.on_fetched(_FetchObj(100, obj), 1, 1, rdr.request_id)
+    assert rdr.buffered == 1000 and rdr.stats.dropped == 0
+
+
+async def test_two_fetches_get_their_own_readers():
+    stub = _StubSession()
+    agent = AgentSession(stub)
+    a, b = await asyncio.gather(agent.fetch(_fetch_spec()),
+                                agent.fetch(_fetch_spec()))
+    assert a is not b and a.request_id != b.request_id
+    stub.fetch_handlers[a.request_id](_FetchObj(100, 2), 1, 1, a.request_id)
+    assert (a.buffered, b.buffered) == (1, 0)
+
+
+async def test_a_refused_fetch_raises_agent_error():
+    stub = _StubSession()
+    stub.refuse_fetch = True
+    with pytest.raises(AgentError, match="fetch audit/s7/decisions failed"):
+        await AgentSession(stub).fetch(_fetch_spec())
+
+
+async def test_closing_the_session_ends_its_fetches():
+    stub = _StubSession()
+    agent = AgentSession(stub)
+    rdr = await agent.fetch(_fetch_spec())
+    await agent.close()
+    assert rdr.ended == "closed"
+    assert stub.fetch_handlers == {}
+
+
+def test_agent_takes_no_session_slot():
+    """A session-wide handler is one per message type or per session, so
+    an agent reader or fetch holding one would take it from every other
+    track. Objects, PUBLISH_DONE and fetch objects route per request."""
+    import pathlib
+    import aiomoqt.agent as agent_pkg
+    for path in pathlib.Path(agent_pkg.__file__).parent.glob("*.py"):
+        text = path.read_text()
+        for name in ("register_handler(", "on_fetch_object",
+                     "on_object_received"):
+            assert name not in text, f"{path.name} uses {name}"
+
+
 # -- inputs the runtime would otherwise ignore -------------------------
 
 @pytest.mark.parametrize("spec", (
@@ -438,6 +574,21 @@ async def test_reader_refuses_what_it_would_ignore(spec):
         await AgentSession(stub).reader(spec)
     assert isinstance(err.value, NotImplementedError)
     assert stub.calls == []
+
+
+@pytest.mark.parametrize("spec", (
+    FetchSpec(track=TrackRef("a", "t", relay="https://r.example"),
+              start_at=StartAt.range(0, 1)),
+    FetchSpec(track=TrackRef("a", "t"), start_at=StartAt.range(0, 1),
+              priority=Priority(delivery_timeout_ms=1)),
+    FetchSpec(track=TrackRef("a", "t"), start_at=StartAt.range(0, 1),
+              priority=Priority(publisher=0)),
+), ids=["relay", "delivery-timeout", "publisher-priority"])
+async def test_fetch_refuses_what_it_would_ignore(spec):
+    stub = _StubSession()
+    with pytest.raises(Unsupported):
+        await AgentSession(stub).fetch(spec)
+    assert stub.fetch_calls == []
 
 
 async def test_a_zero_delivery_timeout_is_unset():

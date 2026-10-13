@@ -1,4 +1,4 @@
-"""Bounded reads over a live subscription.
+"""Bounded reads over a live subscription or a fetch.
 
 The repo's existing tools are duration-bounded: they run for N seconds and
 report what arrived. An agent needs the opposite — "give me N objects, or
@@ -11,7 +11,8 @@ decoding included.
 
 A subscription is done once its PUBLISH_DONE has arrived and every stream
 it counts has ended, since objects can follow PUBLISH_DONE (§10.11), or
-when the session's PUBLISH_DONE_GRACE_S runs out first.
+when the session's PUBLISH_DONE_GRACE_S runs out first. A fetch is done
+when its stream ends.
 
 Staleness is measured, not assumed. `age_ms` comes from the object's own
 LOC timestamp against arrival; it is never inferred from a delivery
@@ -24,11 +25,11 @@ import json as _json
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Union
 
 from ..utils.stats import send_time_us
 from .errors import AgentError, DecodeError
-from .spec import SubscribeSpec
+from .spec import FetchSpec, SubscribeSpec
 
 
 class ReadTimeout(AgentError):
@@ -104,13 +105,13 @@ class ReadStats:
 
 
 class Reader:
-    """Bounded reads over one subscription's object stream.
+    """Bounded reads over one subscription's or one fetch's objects.
 
-    Held by an AgentSession, which owns the connection the subscription
-    runs on. `grace_s` bounds the wait for streams after PUBLISH_DONE.
+    Held by an AgentSession, which owns the connection the request runs
+    on. `grace_s` bounds the wait for streams after PUBLISH_DONE.
     """
 
-    def __init__(self, spec: SubscribeSpec, name: str, *,
+    def __init__(self, spec: Union[SubscribeSpec, FetchSpec], name: str, *,
                  grace_s: float = 5.0):
         self.spec = spec
         self.name = name
@@ -120,6 +121,10 @@ class Reader:
         # Status code, reason and Stream Count of the PUBLISH_DONE.
         self.publish_done: Optional[Dict[str, Any]] = None
         self._decode = spec.decode
+        # A fetch is finite, so its ring is unbounded.
+        self._limit = spec.buffer if isinstance(spec, SubscribeSpec) else None
+        self._drop_new = (isinstance(spec, SubscribeSpec)
+                          and spec.on_full == "drop_new")
         self._grace_s = grace_s
         self._grace: Optional[asyncio.TimerHandle] = None
         self._streams_ended = 0
@@ -145,6 +150,15 @@ class Reader:
         except Exception:
             self.stats.errors += 1
 
+    def on_fetched(self, msg, size, recv_time_us, request_id=None) -> None:
+        """Fetch-object callback; the object carries its own Location."""
+        try:
+            subgroup = (None if getattr(msg, "datagram", False)
+                        else msg.subgroup_id)
+            self._ingest(msg, size, recv_time_us, msg.group_id, subgroup)
+        except Exception:
+            self.stats.errors += 1
+
     def _ingest(self, msg, size, recv_time_us, group_id,
                 subgroup_id) -> None:
         if getattr(msg, "status", 0):
@@ -163,8 +177,8 @@ class Reader:
 
     def _admit(self, obj: Obj) -> None:
         st = self.stats
-        if len(self._ring) >= self.spec.buffer:
-            if self.spec.on_full == "drop_new":
+        if self._limit is not None and len(self._ring) >= self._limit:
+            if self._drop_new:
                 st.dropped += 1
                 return
             self._ring.popleft()
@@ -288,9 +302,10 @@ class Reader:
     @property
     def ended(self) -> Optional[str]:
         """How the read side ended. None while live; "complete" once
-        every stream PUBLISH_DONE counts has ended; "grace" when
-        PUBLISH_DONE_GRACE_S ran out first, so objects may be missing;
-        "closed" when closed here first."""
+        every stream PUBLISH_DONE counts has ended, or the fetch stream
+        finished; "grace" when PUBLISH_DONE_GRACE_S ran out first, so
+        objects may be missing; "failed" when the fetch stream was reset
+        or timed out; "closed" when closed here first."""
         return self._ended
 
     @property

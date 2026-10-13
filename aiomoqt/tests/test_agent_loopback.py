@@ -1,16 +1,21 @@
 """The agent runtime over a real session, two tracks on one session over
-raw QUIC and WebTransport: reader completion."""
+raw QUIC and WebTransport: reader completion and concurrent fetches."""
 import asyncio
 import contextlib
 import time
 
-from aiomoqt.agent import AgentSession, SubscribeSpec, TrackRef
+from aiomoqt.agent import (
+    AgentSession, FetchSpec, StartAt, SubscribeSpec, TrackRef,
+)
 from aiomoqt.client import MOQTClient
 from aiomoqt.messages import SubgroupHeader
 from aiomoqt.server import MOQTServer
 from aiomoqt.types import MOQTMessageType, SubscribeDoneCode
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
+from aiomoqt.tests.test_fetch_serving import (
+    _GROUP, _NS as _FETCH_NS, _SIZES, _loopback as _fetch_loopback,
+)
 from aiomoqt.tests.test_subscription_filter import _TRANSPORTS
 
 _BASE_PORT = 16440
@@ -108,3 +113,32 @@ async def test_publish_done_ends_only_its_reader(use_quic):
         assert not b.done and b.ended is None
         await agent.close()
         assert session._close_err is None
+
+
+# -- fetches -----------------------------------------------------------------
+
+@requires_certs
+@_TRANSPORTS
+async def test_two_fetches_on_one_session(use_quic):
+    async with _fetch_loopback(_port(2, use_quic), use_quic, prefill=3) as (
+            _tracks, rx, fetched):
+        agent = AgentSession(rx)
+        video, audio = await asyncio.gather(
+            agent.fetch(FetchSpec(track=TrackRef(_FETCH_NS, "video"),
+                                  start_at=StartAt.range(0, 1))),
+            agent.fetch(FetchSpec(track=TrackRef(_FETCH_NS, "audio"),
+                                  start_at=StartAt(mode="range", group=1,
+                                                   object=2, end_group=2))))
+        got_v = await video.read(100, timeout=5)
+        got_a = await audio.read(100, timeout=5)
+        assert video.ended == audio.ended == "complete"
+        assert [(o.group, o.object_id) for o in got_v] == [
+            (g, o) for g in (0, 1) for o in range(_GROUP)]
+        assert [(o.group, o.object_id) for o in got_a] == [
+            (g, o) for g in (1, 2) for o in range(_GROUP) if (g, o) >= (1, 2)]
+        assert {len(o.payload) for o in got_v} == {_SIZES["video"]}
+        assert {len(o.payload) for o in got_a} == {_SIZES["audio"]}
+        # Per-request routing: the session-wide handler saw nothing.
+        assert fetched == {}
+        await agent.close()
+        assert rx._close_err is None

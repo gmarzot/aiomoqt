@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `session.fetch(on_object=)` routes that FETCH's objects to its own handler ahead of
+  `on_fetch_object`, until its stream ends or the FETCH is refused.
+- `AgentSession.fetch(FetchSpec)` returns a reader over the range that is done when the fetch
+  stream ends; several can run at once on one session.
 - `session.subscribe(on_object=, on_done=)` registers a subscription's object and PUBLISH_DONE
   handlers before SUBSCRIBE is sent; the object handler binds to its alias as SUBSCRIBE_OK is
   parsed, and a refusal or an abandoned wait drops both.

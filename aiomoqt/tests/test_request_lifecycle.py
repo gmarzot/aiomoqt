@@ -407,6 +407,7 @@ def _routed_session(draft):
     s._session = SimpleNamespace(libquicr_compat=False)
     s._pending_object_handlers = {}
     s._publish_done_handlers = {}
+    s._fetch_object_handlers = {}
     s._object_handlers = {}
     s._subscriptions = {}
     s._unbound_aliases = {}
@@ -444,7 +445,8 @@ async def test_subscribe_ok_binds_the_object_handler_as_it_is_parsed(draft):
 @pytest.mark.parametrize("draft", [14, 16, 18])
 async def test_a_refused_request_drops_what_it_registered(draft):
     s = _routed_session(draft)
-    for table in (s._pending_object_handlers, s._publish_done_handlers):
+    for table in (s._pending_object_handlers, s._publish_done_handlers,
+                  s._fetch_object_handlers):
         table[4] = print
     err = (SubscribeError(request_id=4, error_code=0x4, reason="no")
            if draft < 16 else
@@ -452,7 +454,7 @@ async def test_a_refused_request_drops_what_it_registered(draft):
                         reason="no"))
     _reply(s, err, 4)
     assert s._pending_object_handlers == {}
-    assert s._publish_done_handlers == {}
+    assert s._publish_done_handlers == s._fetch_object_handlers == {}
     await asyncio.sleep(0)
 
 

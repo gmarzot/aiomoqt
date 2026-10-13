@@ -27,11 +27,11 @@ import asyncio
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..types import (
-    FilterType, GroupOrder, SCHEDULING,
+    FilterType, GroupOrder, MOQTRequestError, SCHEDULING,
 )
 from .errors import AgentError
 from .reader import Reader
-from .spec import PublishSpec, SubscribeSpec, check_supported
+from .spec import FetchSpec, PublishSpec, SubscribeSpec, check_supported
 from .writer import Writer, build_writer
 
 _FILTERS = {
@@ -64,6 +64,20 @@ def start_at_to_wire(spec_start) -> Tuple[FilterType, int, int, int]:
             spec_start.end_group or 0)
 
 
+def fetch_range_to_wire(spec_start) -> Tuple[int, int, int, int]:
+    """Map a FetchSpec range onto FETCH's (start_group, start_object,
+    end_group, end_object).
+
+    The range takes the whole end group, which session.fetch() spells
+    end_object 0; its per-draft encoding is the codec's.
+    """
+    if spec_start.mode != "range":
+        raise AgentError(
+            f"fetch: start_at mode {spec_start.mode!r} is not a range")
+    return (spec_start.group, spec_start.object or 0,
+            spec_start.end_group, 0)
+
+
 class AgentSession:
     """One connection, its readers, and its writers."""
 
@@ -75,6 +89,9 @@ class AgentSession:
         self._session = session
         self.scheduling = scheduling
         self._readers: Dict[str, Reader] = {}
+        # In-flight fetches by FETCH request id, and the tasks ending them.
+        self._fetches: Dict[int, Reader] = {}
+        self._fetch_tasks: Dict[int, asyncio.Future] = {}
         self._publishes: Dict[str, PublishSpec] = {}
         self._writers: Dict[str, Writer] = {}
         self._closed = False
@@ -130,6 +147,50 @@ class AgentSession:
         self._session.register_stream_end_handler(alias, rdr.on_stream_end)
         self._readers[name] = rdr
         return rdr
+
+    async def fetch(self, spec: FetchSpec) -> Reader:
+        """FETCH a bounded range and return a reader over its objects.
+
+        Each fetch has its own reader, so several can run at once. It is
+        done when the fetch stream ends, or after `spec.timeout_s`;
+        `Reader.ended` says which. A refused FETCH raises AgentError.
+        """
+        self._guard()
+        check_supported(spec)
+        if spec.track.name is None:
+            raise AgentError("fetch: FetchSpec.track.name is required")
+        name = str(spec.track)
+        rdr = Reader(spec, name)
+        start_group, start_object, end_group, end_object = (
+            fetch_range_to_wire(spec.start_at))
+        try:
+            ok = await self._session.fetch(
+                namespace=spec.track.namespace,
+                track_name=spec.track.name,
+                subscriber_priority=spec.priority.subscriber,
+                group_order=_GROUP_ORDERS.get(spec.priority.group_order),
+                start_group=start_group,
+                start_object=start_object,
+                end_group=end_group,
+                end_object=end_object,
+                on_object=rdr.on_fetched,
+                wait_response=True,
+            )
+        except MOQTRequestError as exc:
+            raise AgentError(f"fetch {name} failed: {exc}") from exc
+        rid = ok.request_id
+        rdr.request_id = rid
+        self._fetches[rid] = rdr
+        self._fetch_tasks[rid] = asyncio.ensure_future(
+            self._end_fetch(rid, rdr, spec.timeout_s))
+        return rdr
+
+    async def _end_fetch(self, rid: int, rdr: Reader, timeout: float) -> None:
+        clean = await self._session.await_fetch_done(rid, timeout)
+        self._session.unregister_fetch_object_handler(rid)
+        self._fetches.pop(rid, None)
+        self._fetch_tasks.pop(rid, None)
+        rdr.mark_done("complete" if clean else "failed")
 
     def writer(self, spec: PublishSpec) -> Writer:
         """Register a publication on this connection.
@@ -201,13 +262,19 @@ class AgentSession:
         rdr.close()
 
     async def close(self) -> None:
-        """Close every reader and end each writer's track: its peers get
-        PUBLISH_DONE."""
+        """Close every reader and fetch, and end each writer's track: its
+        peers get PUBLISH_DONE."""
         if self._closed:
             return
         self._closed = True
         for name in list(self._readers):
             self.close_reader(name)
+        for rid, task in list(self._fetch_tasks.items()):
+            task.cancel()
+            self._session.unregister_fetch_object_handler(rid)
+            self._fetches[rid].close()
+        self._fetches.clear()
+        self._fetch_tasks.clear()
         writers = list(self._writers.values())
         self._writers.clear()
         self._publishes.clear()

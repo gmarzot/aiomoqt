@@ -429,6 +429,9 @@ class _MOQTSessionMixin:
         # Fires for normal objects only (end-of-range markers are logged
         # and the stream is expected to FIN shortly after).
         self.on_fetch_object: Optional[Callable] = None
+        # FETCH request id -> callback for its objects, ahead of
+        # on_fetch_object (same signature).
+        self._fetch_object_handlers: Dict[int, Callable] = {}
 
         # Per-fetch completion futures. Resolved when the fetch uni
         # stream's processing task exits (FIN, RESET, or error).
@@ -755,11 +758,22 @@ class _MOQTSessionMixin:
         session stays up."""
         self._publish_done_handlers[request_id] = callback
 
+    def register_fetch_object_handler(self, request_id: int,
+                                      callback: Callable) -> None:
+        """Route FETCH `request_id`'s objects to `callback` instead of the
+        session-global on_fetch_object (same signature). Dropped when the
+        fetch stream ends or the FETCH is refused."""
+        self._fetch_object_handlers[request_id] = callback
+
+    def unregister_fetch_object_handler(self, request_id: int) -> None:
+        self._fetch_object_handlers.pop(request_id, None)
+
     def _drop_request_routes(self, request_id) -> None:
         """Forget the handlers a request of ours registered: it was
         refused, or its awaiter gave up."""
         self._pending_object_handlers.pop(request_id, None)
         self._publish_done_handlers.pop(request_id, None)
+        self._fetch_object_handlers.pop(request_id, None)
 
     def _route_reply(self, msg) -> None:
         """Act on a reply as it is parsed, ahead of the data streams in
@@ -1194,6 +1208,7 @@ class _MOQTSessionMixin:
         if key and len(key) == 2 and key[0] == 'fetch':
             request_id = key[1]
             clean = error_code == QuicErrorCode.NO_ERROR
+            self._fetch_object_handlers.pop(request_id, None)
             fut = self._fetch_done_futures.pop(request_id, None)
             if fut and not fut.done():
                 fut.set_result(clean)
@@ -1442,17 +1457,18 @@ class _MOQTSessionMixin:
             elif isinstance(msg_obj, FetchHeader):
                 pass
             elif isinstance(msg_obj, FetchObject):
-                if msg_obj.end_of_range is None and self.on_fetch_object:
+                if msg_obj.end_of_range is None:
                     parser = state.parser
                     request_id = (
                         parser.request_id
                         if isinstance(parser, FetchHeader)
                         else None
                     )
-                    now = int(time.time() * 1_000_000)
-                    self.on_fetch_object(
-                        msg_obj, consumed, now, request_id
-                    )
+                    cb = (self._fetch_object_handlers.get(request_id)
+                          or self.on_fetch_object)
+                    if cb:
+                        now = int(time.time() * 1_000_000)
+                        cb(msg_obj, consumed, now, request_id)
             else:
                 logger.error(
                     f"MOQT stream({stream_id}): unexpected msg "
@@ -3762,11 +3778,13 @@ class _MOQTSessionMixin:
         end_object: int = 0,
         parameters: Optional[Dict[int, bytes]] = None,
         wait_response: Optional[bool] = False,
+        on_object: Optional[Callable] = None,
     ) -> Optional[MOQTMessage]:
         """Standalone FETCH of a range of objects from a track.
 
         Per spec §9.16.1: End Location.Object of 0 means the entire end
-        group is requested.
+        group is requested. `on_object` receives this FETCH's objects
+        (register_fetch_object_handler), registered before it is sent.
         """
         parameters = {} if parameters is None else parameters
         request_id = self._allocate_request_id()
@@ -3790,6 +3808,8 @@ class _MOQTSessionMixin:
         self._subscriptions[request_id] = [message]
         self._fetch_done_futures[request_id] = \
             self._loop.create_future()
+        if on_object is not None:
+            self.register_fetch_object_handler(request_id, on_object)
         logger.info(f"MOQT send: {message}")
         # FETCH is a request opener: at d18 it must open its own bidi
         # request stream (like SUBSCRIBE/PUBLISH); pre-d18 _send_request
@@ -3798,6 +3818,8 @@ class _MOQTSessionMixin:
 
         if not wait_response:
             return message
+        if on_object is not None:
+            return self._await_routed(request_id)
         return self._await_response(request_id)
 
     def fetch_ok(
