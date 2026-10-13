@@ -3,11 +3,12 @@ from typing import Any, Optional, Union, Dict, Tuple
 from dataclasses import dataclass, field, fields
 
 from . import ParamType, SetupParamType, AuthTokenAliasType, AuthTokenType
-from ..context import DraftProfile
-from ..types import (
-    D18_PARAM_KINDS, D18_PARAM_SCOPE, MOQTException, MOQTProtocolViolation,
-    SessionCloseCode,
+from .params import (
+    RANGE_FILTERS, REPEATABLE, VALUE_RANGES, LocationFilter, RangeFilter,
+    param_kinds, param_scope,
 )
+from ..context import DraftProfile
+from ..types import MOQTException, MOQTProtocolViolation, SessionCloseCode
 from ..utils.buffer import Buffer, BufferReadError
 from ..utils.logger import *
 
@@ -636,9 +637,19 @@ class MOQTMessage:
         if delta_keys:
             # Sort by key for delta encoding
             parameters = dict(sorted(parameters.items()))
-        payload.push_vint(len(parameters))
+        items = list(parameters.items())
+        if prof.draft >= 18 and prof.param_table >= 20:
+            # A list value of a repeatable parameter is one instance each.
+            items = []
+            for param_type, param_value in parameters.items():
+                if (param_type in REPEATABLE
+                        and isinstance(param_value, (list, tuple))):
+                    items.extend((param_type, v) for v in param_value)
+                else:
+                    items.append((param_type, param_value))
+        payload.push_vint(len(items))
         prev_key = 0
-        for param_type, param_value in parameters.items():
+        for param_type, param_value in items:
             if delta_keys:
                 payload.push_vint(param_type - prev_key)
                 prev_key = param_type
@@ -649,15 +660,31 @@ class MOQTMessage:
                 # d18 §10.2: the Value encoding comes from each
                 # parameter's definition (§15.7), not the §1.4.3
                 # odd/even rule. Unknown params cannot exist on TX.
-                kind = D18_PARAM_KINDS.get(param_type)
+                kind = param_kinds(prof).get(param_type)
                 if kind is None:
                     raise ValueError(
-                        f"param 0x{param_type:x} is not a d18 message "
-                        f"parameter (§15.7)")
+                        f"param 0x{param_type:x} is not a "
+                        f"d{prof.param_table} message parameter (§15.7)")
                 if kind == "location":
                     loc_group, loc_object = param_value
                     payload.push_vint(loc_group)
                     payload.push_vint(loc_object)
+                elif kind == "location_filter":
+                    param_value.encode(payload, prof=prof)
+                elif kind == "range_filter":
+                    param_value.encode(payload, param_type, prof=prof)
+                elif kind == "fill":
+                    inner = Buffer(capacity=BUF_SIZE, vi64=prof.vi64)
+                    MOQTMessage._serialize_params(inner, param_value,
+                                                  prof=prof)
+                    payload.push_vint(inner.tell())
+                    payload.push_bytes(inner.data_slice(0, inner.tell()))
+                elif kind == "namespace":
+                    payload.push_vint(len(param_value))
+                    for fld in param_value:
+                        fld = fld.encode() if isinstance(fld, str) else fld
+                        payload.push_vint(len(fld))
+                        payload.push_bytes(bytes(fld))
                 elif kind == "uint8":
                     payload.push_uint8(int(param_value))
                 elif kind == "varint":
@@ -850,6 +877,7 @@ class MOQTMessage:
         params = {}
         param_count = buf.pull_vint()
         prev_key = 0
+        d20 = prof.draft >= 18 and prof.param_table >= 20
 
         for param_index in range(param_count):
             if buf_end is not None and buf.tell() >= buf_end:
@@ -867,16 +895,40 @@ class MOQTMessage:
                 # d18 §10.2: per-definition Value encodings; an unknown
                 # parameter cannot be skipped (count-bounded block) and
                 # MUST close the session. §14 reserves no grease here.
-                kind = D18_PARAM_KINDS.get(param_type)
+                kind = param_kinds(prof).get(param_type)
                 if kind is None:
                     raise MOQTProtocolViolation(
                         f"unknown message parameter 0x{param_type:x} "
                         f"(§10.2: cannot be skipped)")
-                if kind == "location":
+                if kind == "location" and d20:
+                    param_value = (buf.pull_vint(), buf.pull_vint())
+                elif kind == "location":
                     param_value = MOQTMessage._pull_location_param(
                         buf, prof=prof, buf_end=buf_end,
                         remaining=param_count - param_index - 1,
                         prev_key=prev_key, delta_keys=delta_keys)
+                elif kind == "location_filter":
+                    param_value = LocationFilter.decode(
+                        buf, prof=prof, buf_end=buf_end)
+                elif kind == "range_filter":
+                    param_value = RangeFilter.decode(
+                        buf, param_type, prof=prof, buf_end=buf_end)
+                elif kind == "fill":
+                    param_len = buf.pull_vint()
+                    value_end = buf.tell() + param_len
+                    if buf_end is not None and value_end > buf_end:
+                        raise MOQTProtocolViolation(
+                            f"FILL_PARAMETERS length {param_len} exceeds "
+                            f"remaining {buf_end - buf.tell()}")
+                    param_value = MOQTMessage._deserialize_params(
+                        buf, prof=prof, buf_end=value_end,
+                        scope="FillParameters")
+                    if buf.tell() != value_end:
+                        raise MOQTProtocolViolation(
+                            "FILL_PARAMETERS does not fill its length")
+                elif kind == "namespace":
+                    param_value = MOQTMessage._pull_tuple(
+                        buf, prof=prof, buf_end=buf_end)
                 elif kind == "uint8":
                     param_value = buf.pull_uint8()
                 elif kind == "varint":
@@ -941,12 +993,26 @@ class MOQTMessage:
                     f"parameter overran frame extent: "
                     f"{buf.tell()}/{buf_end}")
             bounds = MOQTMessage.PARAM_VALUE_RANGES.get(param_type)
+            if bounds is None and d20:
+                bounds = VALUE_RANGES.get(param_type)
             if bounds is not None and prof.draft >= 16:
                 MOQTMessage._check_range(
                     f"parameter 0x{param_type:x}", param_value, *bounds)
+            if d20 and param_type in params:
+                # §10.2: only a parameter defined as repeatable may recur.
+                if param_type not in REPEATABLE:
+                    raise MOQTProtocolViolation(
+                        f"duplicate parameter 0x{param_type:x}")
+                prior = params[param_type]
+                if not isinstance(prior, list):
+                    prior = params[param_type] = [prior]
+                prior.append(param_value)
+                continue
+            if d20 and param_type in RANGE_FILTERS:
+                param_value = [param_value]
             params[param_type] = param_value
 
-        allowed = D18_PARAM_SCOPE.get(scope) if prof.draft >= 18 else None
+        allowed = param_scope(prof).get(scope) if prof.draft >= 18 else None
         if allowed is not None:
             for param_type in params:
                 if param_type not in allowed:

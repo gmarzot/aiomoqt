@@ -1,9 +1,12 @@
 from ..types import *
 from .base import *
+from .params import LocationFilter, LocationFilterType, RangeFilter
 from .session_setup import *
 from .namespace import *
+from .namespace import PublishSkipped
 from .subscribe import *
 from .publish import *
+from .publish import PublishStateNotify
 from .fetch import *
 from .data import *
 from .request import *
@@ -26,4 +29,7 @@ __all__ = [
     # Draft-16 new message types
     'RequestOk', 'RequestError', 'RequestUpdate',
     'Namespace', 'NamespaceDone',
+    # Draft-20
+    'PublishStateNotify', 'PublishSkipped',
+    'LocationFilter', 'LocationFilterType', 'RangeFilter',
 ]
