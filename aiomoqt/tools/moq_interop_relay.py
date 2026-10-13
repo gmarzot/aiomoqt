@@ -48,6 +48,9 @@ table) for runners that expect distinct endpoints.
 import argparse
 import asyncio
 from collections import deque
+import contextlib
+import faulthandler
+import itertools
 import logging
 import os
 import sys
@@ -66,8 +69,8 @@ from aiomoqt.messages.data import (FetchObject, ObjectDatagram,
 from aiomoqt.messages.fetch import _is_joining
 from aiomoqt.messages.publish import PublishOk
 from aiomoqt.messages.request import RequestError, RequestOk
-from aiomoqt.track import (SubscribedTrack, _UNFILTERED, _filter_window,
-                           _largest_object_param)
+from aiomoqt.track import (PublishedTrack, SubscribedTrack, _UNFILTERED,
+                           _filter_window, _largest_object_param)
 from aiomoqt.context import is_draft16_or_later
 from aiomoqt.utils.logger import set_log_level, get_logger
 from aiomoqt.utils.url import parse_relay_url
@@ -119,6 +122,11 @@ UPSTREAM_WAIT_S = 3.0
 RENDEZVOUS_TIMEOUT = 0x04
 # Longest a SUBSCRIBE is held for a publisher, whatever it asks for.
 RENDEZVOUS_MAX_S = 30.0
+# Watchdog: self-probes failed in a row before exiting, the exit status
+# (EX_SOFTWARE), and the longest one probe may take.
+WATCHDOG_MISSES = 3
+WATCHDOG_EXIT = 70
+WATCHDOG_PROBE_S = 10.0
 
 
 async def _await_upstream(timeout: float = None) -> bool:
@@ -1271,6 +1279,12 @@ def parse_args():
                              "moqt://host:4433/ or https://host:443/moq. "
                              "Repeat for several. Without it the relay "
                              "only serves publishers that connect to it.")
+    parser.add_argument("--watchdog", type=float, default=0, metavar="SEC",
+                        help="Exit, for a supervisor to restart, when the "
+                             "event loop stalls for SEC seconds or "
+                             f"{WATCHDOG_MISSES} self-probes in a row fail "
+                             "(one object relayed over loopback every SEC "
+                             "seconds). 0 = off (default).")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug logging")
     return parser.parse_args()
@@ -1675,6 +1689,91 @@ def _build_server(bind, port, cert, key, use_quic, draft):
     return server
 
 
+# Tasks kept alive for the life of the process.
+_background: set = set()
+_probe_seq = itertools.count()
+
+
+class _ProbeTrack(PublishedTrack):
+    """One object, for the watchdog's round trip."""
+
+    async def generate(self, session, track_alias):
+        sid = await session.open_uni_stream()
+        hdr = SubgroupHeader(
+            track_alias=track_alias, group_id=0, subgroup_id=0,
+            publisher_priority=128, extensions_present=True,
+            prof=session._profile)
+        session.stream_write(sid, hdr.serialize().data)
+        buf = hdr.next_object(payload=b"watchdog", extensions=None,
+                              object_id=0)
+        session.stream_write(sid, buf.data, end_stream=True)
+        self._largest = (0, 0)
+
+
+async def _self_probe(host, port, use_quic, draft, timeout) -> bool:
+    """Relay one object from a publisher session to a subscriber session,
+    both on loopback, under a namespace of the probe's own."""
+    ns = f"aiomoqt-watchdog/{os.getpid()}-{next(_probe_seq)}"
+    got = asyncio.get_running_loop().create_future()
+
+    def _on_object(*_):
+        if not got.done():
+            got.set_result(True)
+
+    async def _round_trip():
+        async with contextlib.AsyncExitStack() as stack:
+            sessions = []
+            for _ in range(2):
+                client = MOQTClient(host, port, path="/", use_quic=use_quic,
+                                    verify_tls=False, supported_drafts=draft)
+                s = await stack.enter_async_context(client.connect())
+                await s.client_session_init()
+                sessions.append(s)
+            pub, sub = sessions
+            _ProbeTrack(pub, ns, "probe").attach()
+            await pub.publish_namespace(namespace=ns, wait_response=True)
+            await SubscribedTrack(sub, ns, "probe",
+                                  on_object=_on_object).subscribe(
+                                      timeout=timeout)
+            await got
+
+    try:
+        await asyncio.wait_for(_round_trip(), timeout)
+        return True
+    except Exception as e:
+        logger.warning(f"relay: watchdog probe failed: {e!r}")
+        return False
+
+
+async def _heartbeat(stall_s: float) -> None:
+    """Keep re-arming faulthandler's timer. It runs on its own C thread,
+    so an event loop stuck past `stall_s` — in Python or in native code —
+    gets every thread's stack dumped and the process exited."""
+    while True:
+        faulthandler.dump_traceback_later(stall_s, exit=True)
+        await asyncio.sleep(min(1.0, stall_s / 4))
+
+
+async def _watchdog(period, host, port, use_quic, draft) -> None:
+    """Exit so the supervisor restarts the relay when it hangs or stops
+    relaying: a loop stall past `period`, or WATCHDOG_MISSES self-probes
+    in a row that deliver no object."""
+    _background.add(asyncio.create_task(_heartbeat(period)))
+    misses = 0
+    while True:
+        await asyncio.sleep(period)
+        if await _self_probe(host, port, use_quic, draft,
+                             min(period, WATCHDOG_PROBE_S)):
+            misses = 0
+            continue
+        misses += 1
+        if misses >= WATCHDOG_MISSES:
+            logger.error(f"relay: watchdog: {misses} self-probes failed "
+                         f"in a row, exiting")
+            logging.shutdown()
+            os._exit(WATCHDOG_EXIT)
+
+
 async def main():
     args = parse_args()
     speaks = sorted(int(d) for d in MOQTDraft)
@@ -1689,8 +1788,7 @@ async def main():
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     print("aiomoqt ERSATZ-RELAY: an API demonstrator and conformance "
-          "SUT — not a production relay (no auth, no cache, no "
-          "hardening).",
+          "SUT — not a production relay (no auth, no hardening).",
           file=sys.stderr)
 
     cert = args.cert or _find_default_cert()
@@ -1736,17 +1834,28 @@ async def main():
     for url in args.upstream:
         print(f"  upstream origin: {url}")
 
+    if args.watchdog > 0:
+        host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(args.bind,
+                                                        args.bind)
+        # --quic and --dual serve raw QUIC on --port; otherwise WT.
+        _background.add(asyncio.create_task(_watchdog(
+            args.watchdog, host, args.port, args.quic or args.dual,
+            args.draft)))
+
     print(
         "=" * 64
         + "\n EXPERIMENTAL aiomoqt interop relay.\n"
-        " NOT a production relay: no group cache, no auth,\n"
-        " no scale handling.\n"
+        " NOT a production relay: no auth, no scale handling.\n"
         + "=" * 64,
         file=sys.stderr,
     )
     for _server, port, label in listeners:
         print(f"Listening on {args.bind}:{port} "
               f"({label}, draft-{args.draft})", file=sys.stderr)
+    if args.watchdog > 0:
+        print(f"Watchdog: self-probe every {args.watchdog:g}s, exit after "
+              f"{WATCHDOG_MISSES} misses or a {args.watchdog:g}s stall",
+              file=sys.stderr)
 
     try:
         await asyncio.Event().wait()
