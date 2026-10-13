@@ -3,6 +3,8 @@ from typing import Tuple, Dict, Optional, Any
 from dataclasses import dataclass, field
 
 from . import MOQTMessage, BUF_SIZE
+from .params import LocationFilter, uses_location_filter
+from ..types import ParamType, SubscribeDoneCode
 from ..context import is_draft16_or_later, DraftProfile
 from ..utils.buffer import Buffer, BufferReadError
 from ..utils.logger import get_logger
@@ -245,6 +247,10 @@ class Subscribe(MOQTMessage):
     start_object: Optional[int] = None
     end_group: Optional[int] = None
     parameters: Optional[Dict[int, Any]] = None
+    # d20+ LOCATION_FILTER. Sent in place of filter_type when set; on
+    # receive it is the filter, and filter_type and the Locations hold
+    # its d14-d18 form when one exists.
+    location_filter: Optional[LocationFilter] = None
     # Server-side runtime: set by allocate_track_alias when responding
     # with SubscribeOk. Not on the wire (Subscribe doesn't carry alias);
     # declared as a slot field so server handlers can assign it.
@@ -282,7 +288,15 @@ class Subscribe(MOQTMessage):
                 params[ParamType.GROUP_ORDER] = self.group_order
             if self.forward is not None:
                 params[ParamType.FORWARD] = self.forward
-            if self.filter_type is not None:
+            if uses_location_filter(prof):
+                lf = self.location_filter
+                if lf is None and self.filter_type is not None:
+                    lf = LocationFilter.from_subscription_filter(
+                        self.filter_type, self.start_group,
+                        self.start_object, self.end_group)
+                if lf is not None:
+                    params[ParamType.LOCATION_FILTER] = lf
+            elif self.filter_type is not None:
                 # SUBSCRIPTION_FILTER param (0x21) is odd → bytes value
                 # Encode: filter_type varint [+ start_group + start_obj [+ end_group]]
                 # Filter internals follow the negotiated varint codec
@@ -346,6 +360,7 @@ class Subscribe(MOQTMessage):
         start_group = None
         start_object = None
         end_group = None
+        location_filter = None
 
         if is_draft16_or_later(prof.draft):
             # d16: all fields are in parameters
@@ -355,7 +370,12 @@ class Subscribe(MOQTMessage):
             group_order = params.pop(ParamType.GROUP_ORDER, None)
             forward = params.pop(ParamType.FORWARD, None)
             filter_raw = params.pop(ParamType.SUBSCRIPTION_FILTER, None)
-            if filter_raw is not None:
+            if isinstance(filter_raw, LocationFilter):
+                location_filter = filter_raw
+                legacy = filter_raw.subscription_filter()
+                if legacy is not None:
+                    filter_type, start_group, start_object, end_group = legacy
+            elif filter_raw is not None:
                 (filter_type, start_group, start_object,
                  end_group) = MOQTMessage._decode_filter(filter_raw, prof=prof)
         else:
@@ -389,7 +409,8 @@ class Subscribe(MOQTMessage):
             start_group=start_group,
             start_object=start_object,
             end_group=end_group,
-            parameters=params
+            parameters=params,
+            location_filter=location_filter,
         )
 
 
@@ -683,6 +704,12 @@ class SubscribeDone(MOQTMessage):
         if prof.reply_has_request_id:
             payload.push_vint(self.request_id)
         code = int(self.status_code)
+        if (code == SubscribeDoneCode.SUBSCRIPTION_ENDED
+                and not prof.publish_done_subscription_ended):
+            raise ValueError(
+                f"PUBLISH_DONE SUBSCRIPTION_ENDED does not exist at "
+                f"d{prof.draft}: a subscription does not end at its "
+                f"filter's end")
         if prof.draft >= 18:
             code = self._D18_WIRE_SWAP.get(code, code)
         payload.push_vint(code)

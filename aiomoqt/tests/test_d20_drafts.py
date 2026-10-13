@@ -47,12 +47,20 @@ def test_d20_to_d22_are_accepted_when_named(draft):
     assert moqt_version_from_alpn(f"moqt-{draft}") == 0xff000000 + draft
 
 
+# The d20 columns that differ from d18.
+_D20_SWITCHES = dict(
+    param_table=20, publish_ok_expires_only=True,
+    publish_done_subscription_ended=False, goaway_request_id=False,
+    fetch_location_filter=True, fetch_timed_out_range=True,
+    fetch_object_status=False)
+
+
 def test_d20_and_d21_share_a_profile_and_d22_only_flips_its_switches():
     d18, d20, d21, d22 = (profile_for(d) for d in (18, 20, 21, 22))
-    assert dataclasses.replace(d20, draft=18) == d18
+    assert dataclasses.replace(d18, draft=20, **_D20_SWITCHES) == d20
     assert dataclasses.replace(d21, draft=20) == d20
     assert dataclasses.replace(
-        d22, draft=20, location_filter_typed=False,
+        d22, draft=20, param_table=20, location_filter_typed=False,
         relay_forwards_publish_namespace=True) == d20
     assert (d18.location_filter_typed, d18.relay_forwards_publish_namespace) \
         == (False, True)
