@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- LOCMAF packaging (draft-einarsson-moq-locmaf, `locmafVersion` 0.3; a port of Eyevinn/locmaf
+  v0.1.1): `aiomoqt.media.locmaf`, `LocmafTrackPublisher`, `LocmafTrackSubscriber`.
+- Catalog: `locmaf` packaging and `CatalogTrack.locmafVersion`, required exactly on locmaf tracks.
+- `MediaSubscriber` subscribes a LOCMAF track only at a supported `locmafVersion` and with an init.
+- `pub_media --packaging locmaf` with `--mp4` or `--input`; `--mp4` audio goes in ~1 s groups.
+- `sub_media --packaging` subscribes only that packaging's tracks.
+- `sub_media` writes LOCMAF tracks as fMP4 and reports each track's rejected objects.
+- `sub_media` writes `<name>.mp4` when several tracks share a role.
+- `sub_media --analyze` counts the bytes on the wire.
+- `LocTrackPublisher._package()` and `LocTrackSubscriber._unpackage()` hooks for packagers.
+- Regression: manual suite `media-locmaf` against Eyevinn's moqlivemock.
 - Fix: a publisher writing as its WebTransport stream or session is torn down ends through
   cancellation; it died with an unretrieved `ConnectionError`.
 - A session's `auth_token_validator(token, msg)` refuses a d16+ peer request with the
