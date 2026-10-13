@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Agent `PublishSpec.announce` (the default) announces the track's namespace once per session,
+  shared by its writers, and serves SUBSCRIBEs for the track; `announce=False` sends a bare
+  PUBLISH. `AgentSession.close()` withdraws the namespaces after the writers' PUBLISH_DONE.
+- `session.is_announced(namespace)`; a refused PUBLISH_NAMESPACE no longer counts as announced.
+- Fix: d14 `publish_namespace_done()` takes a `/`-separated namespace; it raised TypeError.
 - `session.fetch(on_object=)` routes that FETCH's objects to its own handler ahead of
   `on_fetch_object`, until its stream ends or the FETCH is refused.
 - `AgentSession.fetch(FetchSpec)` returns a reader over the range that is done when the fetch

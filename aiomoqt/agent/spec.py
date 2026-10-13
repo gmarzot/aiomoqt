@@ -581,7 +581,9 @@ class PublishSpec:
     group_size: Annotated[Optional[int], Range(1, None), Doc(
         "Objects per group. Omit to control grouping explicitly")] = None
     announce: Annotated[bool, Doc(
-        "Publish the namespace before serving the track")] = True
+        "true: PUBLISH_NAMESPACE the track's namespace, once per session "
+        "however many writers share it, then serve SUBSCRIBEs for the "
+        "track. false: a bare PUBLISH of the track")] = True
     buffer: Annotated[int, Range(1, 65536), Doc(
         "Writer ring depth in objects")] = DEFAULT_BUFFER
     on_full: Annotated[str, Choices(*ON_FULL), Doc(

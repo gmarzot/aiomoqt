@@ -7,6 +7,7 @@ spreads across peers, so a wrong number here is wrong for every peer.
 """
 import asyncio
 import contextlib
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,14 +19,29 @@ from aiomoqt.agent.session import AgentSession
 from aiomoqt.agent.writer import (
     WriteRefused, _as_bytes, build_writer, writers_by_priority,
 )
+from aiomoqt.context import profile_for
 from aiomoqt.delivery import StreamMapping
+from aiomoqt.types import MOQTRequestError
 
 
 class _StubSession:
-    def __init__(self):
+    """Records what the agent asks of a session. PUBLISH_NAMESPACE is
+    answered a loop turn later, the first `refuse` with an error, and
+    data-plane writes are taken as by a peer that keeps up. `log` holds
+    announcements, replies and withdrawals in order."""
+
+    def __init__(self, announced=(), refuse=0):
         self.calls = []
         self.handlers = {}
         self.stream_end = {}
+        self.announced = set(announced)
+        self.refuse = refuse
+        self.log = []
+        self.params = []
+        self.attached = []
+        self.negotiated_draft = 18
+        self._profile = profile_for(18)
+        self._sid = 3
 
     async def subscribe(self, **kw):
         self.calls.append(kw)
@@ -44,6 +60,47 @@ class _StubSession:
 
     def unregister_stream_end_handler(self, alias):
         self.stream_end.pop(alias, None)
+
+    def is_announced(self, namespace):
+        return namespace in self.announced
+
+    def _attach_track(self, track):
+        self.attached.append(track.trackname)
+
+    def publish_namespace(self, namespace, parameters=None,
+                          wait_response=False):
+        self.log.append(("announce", namespace))
+        self.params.append(parameters)
+
+        async def reply():
+            await asyncio.sleep(0)
+            if self.refuse:
+                self.refuse -= 1
+                raise MOQTRequestError(error_code=0x1, reason="refused")
+            return SimpleNamespace(request_id=len(self.log))
+        return reply()
+
+    def publish_namespace_done(self, namespace=None, request_id=None):
+        self.log.append(("withdraw", namespace))
+
+    def _send_reply(self, request_id, msg, fin=False):
+        self.log.append((type(msg).__name__, request_id))
+
+    def _unbind_request(self, request_id):
+        pass
+
+    async def open_uni_stream(self):
+        self._sid += 4
+        return self._sid
+
+    def stream_write(self, sid, data, end_stream=False):
+        pass
+
+    async def stream_write_drain(self, sid, data):
+        pass
+
+    def stream_reset(self, sid, code):
+        pass
 
 
 class _RecordingOut:
@@ -77,6 +134,15 @@ async def _drain(track, out, expected):
         await task
     except asyncio.CancelledError:
         pass
+
+
+async def _subscribed(stub, track, forward=True, request_id=7):
+    """Serve the track to one subscriber the way a SUBSCRIBE would."""
+    sub = track.subscriptions[0]
+    sub.track_alias, sub.subscribe_request_id = 1, request_id
+    sub.forward = forward
+    await track._start_generating(stub, "SUBSCRIBE")
+    return sub
 
 
 # -- numbering --------------------------------------------------------
@@ -466,6 +532,63 @@ def test_enforced_is_false_without_a_transport_priority_api():
     agent = AgentSession(_StubSession())
     assert agent.scheduling_enforced is False
     assert agent.priority_plan()["enforced"] is False
+
+
+# -- announcement -----------------------------------------------------
+
+async def test_writers_share_one_announcement():
+    stub = _StubSession()
+    agent = AgentSession(stub)
+    a, b = agent.writer(_pub("a")), agent.writer(_pub("b"))
+    await asyncio.gather(a.start(), b.start())
+    assert stub.log == [("announce", "agent")]
+    assert sorted(stub.attached) == ["a", "b"]
+    assert a.live and b.live
+
+
+async def test_a_namespace_the_app_announced_is_not_sent_again():
+    stub = _StubSession(announced={"agent"})
+    agent = AgentSession(stub)
+    wtr = agent.writer(_pub())
+    await wtr.start()
+    assert wtr.live and stub.attached == ["decisions"]
+    await agent.close()
+    assert stub.log == []
+
+
+async def test_a_refused_announcement_raises_and_start_retries():
+    stub = _StubSession(refuse=1)
+    agent = AgentSession(stub)
+    wtr = agent.writer(_pub())
+    with pytest.raises(AgentError, match="announce agent failed"):
+        await wtr.start()
+    assert not wtr.live
+    await wtr.start()
+    assert wtr.live
+    assert stub.log == [("announce", "agent"), ("announce", "agent")]
+
+
+async def test_a_writer_without_a_session_announces_with_no_token():
+    stub = _StubSession()
+    wtr, _track = build_writer(stub, _pub())
+    await wtr.start()
+    assert stub.log == [("announce", "agent")]
+    assert stub.params == [{}]
+    assert stub.attached == ["decisions"]
+
+
+async def test_close_withdraws_after_publish_done():
+    """At d14/d16 an aiomoqt peer ends the session on
+    PUBLISH_NAMESPACE_DONE, so the subscriptions end first."""
+    stub = _StubSession()
+    agent = AgentSession(stub)
+    wtr = agent.writer(_pub())
+    await wtr.start()
+    await _subscribed(stub, wtr._track)
+    await wtr.write(b"a")
+    await agent.close()
+    assert stub.log == [("announce", "agent"), ("SubscribeDone", 7),
+                        ("withdraw", "agent")]
 
 
 # -- flush, close, ordering ------------------------------------------

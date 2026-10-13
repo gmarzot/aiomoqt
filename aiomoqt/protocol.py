@@ -779,7 +779,8 @@ class _MOQTSessionMixin:
         """Act on a reply as it is parsed, ahead of the data streams in
         its batch and of the handler task: SUBSCRIBE_OK binds the
         request's object handler to its alias; an error reply drops what
-        the request registered."""
+        the request registered, and a refused PUBLISH_NAMESPACE announces
+        nothing."""
         if isinstance(msg, SubscribeOk):
             cb = self._pending_object_handlers.pop(msg.request_id, None)
             if cb is not None and msg.track_alias is not None:
@@ -787,6 +788,7 @@ class _MOQTSessionMixin:
         elif self._is_error_response(msg):
             rid = getattr(msg, 'request_id', None)
             self._drop_request_routes(rid)
+            self._announced.pop(rid, None)
 
     def _on_request_stream_terminated(
             self, stream_id: int, *,
@@ -3944,6 +3946,11 @@ class _MOQTSessionMixin:
 
         return self._await_response(request_id)
 
+    def is_announced(self, namespace: Union[str, Tuple[str, ...]]) -> bool:
+        """True while a PUBLISH_NAMESPACE we sent for `namespace` is
+        neither withdrawn nor refused."""
+        return self._make_namespace_tuple(namespace) in self._announced.values()
+
     def _our_namespaces(self) -> set:
         """Namespaces this session announces or serves tracks under."""
         return (set(self._announced.values())
@@ -4037,12 +4044,12 @@ class _MOQTSessionMixin:
 
     def publish_namespace_done(
         self,
-        namespace: Tuple[bytes, ...] = None,
+        namespace: Optional[Union[str, Tuple[str, ...]]] = None,
         request_id: int = None,
     ) -> Optional[MOQTMessage]:
         """Withdraw a track namespace announcement.
 
-        Draft-14 takes the namespace tuple, draft-16 the request_id of
+        Draft-14 takes the namespace, draft-16 the request_id of
         the original PUBLISH_NAMESPACE, and both send
         PUBLISH_NAMESPACE_DONE. Draft-18 has no such message: a request
         owns a bidirectional stream and is cancelled by abruptly
@@ -4069,6 +4076,8 @@ class _MOQTSessionMixin:
             self.stream_reset(stream_id, StreamResetCode.CANCELLED)
             self._bidi_streams.pop(request_id, None)
             return None
+        namespace = (withdrawn if namespace is None
+                     else self._make_namespace_tuple(namespace))
         message = PublishNamespaceDone(namespace=namespace, request_id=request_id)
         logger.info(f"MOQT send: {message}")
         self.send_control_message(message)

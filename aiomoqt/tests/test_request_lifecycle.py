@@ -448,6 +448,7 @@ async def test_a_refused_request_drops_what_it_registered(draft):
     for table in (s._pending_object_handlers, s._publish_done_handlers,
                   s._fetch_object_handlers):
         table[4] = print
+    s._announced[4] = (b"agent",)
     err = (SubscribeError(request_id=4, error_code=0x4, reason="no")
            if draft < 16 else
            RequestError(request_id=4, error_code=0x4, retry_interval=0,
@@ -455,6 +456,7 @@ async def test_a_refused_request_drops_what_it_registered(draft):
     _reply(s, err, 4)
     assert s._pending_object_handlers == {}
     assert s._publish_done_handlers == s._fetch_object_handlers == {}
+    assert not s.is_announced("agent")
     await asyncio.sleep(0)
 
 

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from ..delivery import StreamMapping
 from ..track import PublishedTrack
@@ -31,6 +31,9 @@ _MAPPINGS = {
 
 # (group_id, object_id, payload, group_start)
 _Item = Tuple[int, int, bytes, bool]
+
+# Announces a namespace on the writer's session; returns once it is.
+Announcer = Callable[[str], Awaitable[None]]
 
 
 class WriteRefused(AgentError):
@@ -99,12 +102,14 @@ class Writer:
     """
 
     def __init__(self, spec: PublishSpec, track: _PushTrack,
-                 queue: asyncio.Queue, stats: WriteStats):
+                 queue: asyncio.Queue, stats: WriteStats,
+                 announcer: Optional[Announcer] = None):
         self.spec = spec
         self.name = str(spec.track)
         self.stats = stats
         self._track = track
         self._queue = queue
+        self._announcer = announcer
         # Held from choosing an object's number until it is queued, so
         # concurrent writes queue in the order they were numbered.
         self._lock = asyncio.Lock()
@@ -126,10 +131,20 @@ class Writer:
         return self._live
 
     async def start(self) -> None:
-        """Announce and publish the track, so objects can reach peers."""
+        """Make the track reachable: with `announce`, announce its
+        namespace (once per session) and serve SUBSCRIBEs for it;
+        otherwise send a bare PUBLISH."""
         if self._live:
             return
-        await self._track.publish()
+        track = self._track
+        if not self.spec.announce:
+            await track.publish()
+        elif self._announcer is None:
+            await track.publish(announce_namespace=True, publish_track=False)
+        else:
+            # Before the announcement: a SUBSCRIBE may overtake its reply.
+            track.attach()
+            await self._announcer(track.namespace)
         self._live = True
 
     async def snapshot(self, payload: Any) -> None:
@@ -283,8 +298,12 @@ def _as_bytes(payload: Any) -> bytes:
 
 def build_writer(session: Any, spec: PublishSpec, *,
                  scheduling: str = "round_robin",
+                 announcer: Optional[Announcer] = None,
                  ) -> Tuple[Writer, _PushTrack]:
     """Construct the track and its writer without publishing yet.
+
+    `announcer(namespace)` announces for an `announce` writer; without
+    one, start() has the track announce its own namespace.
 
     A declared publisher priority is mapped to a transport byte once,
     here — constant for the track's life, so it never costs work in the
@@ -302,12 +321,12 @@ def build_writer(session: Any, spec: PublishSpec, *,
         session, spec.track.namespace, spec.track.name,
         priority=(spec.priority.publisher
                   if spec.priority.publisher is not None else 128),
-        queue=queue, stats=stats, mapping=mapping)
+        auth_token=None, queue=queue, stats=stats, mapping=mapping)
     if spec.priority.publisher is not None:
         from ..types import to_stream_priority
         track.stream_priority = to_stream_priority(
             spec.priority.publisher, discipline=scheduling)
-    return Writer(spec, track, queue, stats), track
+    return Writer(spec, track, queue, stats, announcer), track
 
 
 def writers_by_priority(writers: List[Writer]) -> List[Tuple[str, int]]:

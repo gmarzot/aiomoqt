@@ -8,8 +8,8 @@ independent publish specs cannot say they share one.
 AgentSession is that owner. It wraps a connected MOQT session, routes
 each reader's objects, PUBLISH_DONE and stream ends through the session's
 per-request and per-alias tables (never a session-wide handler slot) so
-several tracks can share the connection, and keeps the declared
-priorities together.
+several tracks can share the connection, announces each namespace its
+writers share once, and keeps the declared priorities together.
 
 Async only. A loop-owning runtime with a blocking facade wraps this
 later; nothing here assumes it is driven from the loop thread beyond
@@ -29,10 +29,13 @@ from typing import Any, Dict, List, Optional, Tuple
 from ..types import (
     FilterType, GroupOrder, MOQTRequestError, SCHEDULING,
 )
+from ..utils.logger import get_logger
 from .errors import AgentError
 from .reader import Reader
 from .spec import FetchSpec, PublishSpec, SubscribeSpec, check_supported
 from .writer import Writer, build_writer
+
+logger = get_logger(__name__)
 
 _FILTERS = {
     "latest": FilterType.LATEST_OBJECT,
@@ -94,6 +97,8 @@ class AgentSession:
         self._fetch_tasks: Dict[int, asyncio.Future] = {}
         self._publishes: Dict[str, PublishSpec] = {}
         self._writers: Dict[str, Writer] = {}
+        # Namespace -> the PUBLISH_NAMESPACE sent for this session's writers.
+        self._announces: Dict[str, asyncio.Future] = {}
         self._closed = False
 
     @property
@@ -204,10 +209,30 @@ class AgentSession:
         if name in self._writers:
             raise AgentError(f"writer: already publishing {name}")
         wtr, _track = build_writer(self._session, spec,
-                                   scheduling=self.scheduling)
+                                   scheduling=self.scheduling,
+                                   announcer=self._announce)
         self._writers[name] = wtr
         self._publishes[name] = spec
         return wtr
+
+    async def _announce(self, namespace: str) -> None:
+        """PUBLISH_NAMESPACE `namespace` once for all of this session's
+        writers under it; a namespace the app announced on the session
+        itself is not sent again. A refusal raises AgentError and the
+        next start() tries again."""
+        fut = self._announces.get(namespace)
+        if fut is None:
+            if self._session.is_announced(namespace):
+                return
+            fut = asyncio.ensure_future(self._session.publish_namespace(
+                namespace=namespace, wait_response=True))
+            self._announces[namespace] = fut
+        try:
+            await asyncio.shield(fut)
+        except Exception as exc:
+            if self._announces.get(namespace) is fut:
+                del self._announces[namespace]
+            raise AgentError(f"announce {namespace} failed: {exc}") from exc
 
     @property
     def writers(self) -> Dict[str, Writer]:
@@ -262,8 +287,10 @@ class AgentSession:
         rdr.close()
 
     async def close(self) -> None:
-        """Close every reader and fetch, and end each writer's track: its
-        peers get PUBLISH_DONE."""
+        """Close every reader and fetch, end each writer's track (its
+        peers get PUBLISH_DONE), then withdraw the namespaces announced
+        for them: at d14/d16 an aiomoqt peer ends the whole session on
+        PUBLISH_NAMESPACE_DONE."""
         if self._closed:
             return
         self._closed = True
@@ -280,6 +307,14 @@ class AgentSession:
         self._publishes.clear()
         await asyncio.gather(*(w.close() for w in writers),
                              return_exceptions=True)
+        for namespace, fut in self._announces.items():
+            if fut.done() and (fut.cancelled() or fut.exception()):
+                continue
+            try:
+                self._session.publish_namespace_done(namespace=namespace)
+            except Exception:
+                logger.debug(f"withdrawing {namespace} failed", exc_info=True)
+        self._announces.clear()
 
     def stats(self) -> Dict[str, Any]:
         return {name: rdr.stats.snapshot()
