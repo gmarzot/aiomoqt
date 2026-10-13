@@ -4,11 +4,17 @@ playable files, or pipes one track straight into a player.
 
   %(prog)s moqt://localhost:4433/ -N demo/live -t 30 --out ./media-out
 
-Reads the catalog track, subscribes every LOC track it describes, and
-writes:
+Reads the catalog track, subscribes every media track it describes
+(--packaging narrows to one packaging), and writes:
   <out>/video.h264   Annex-B elementary stream (SPS/PPS injected from
                      the catalog/wire decoder config at keyframes)
   <out>/audio.wav    pcm-s16 with header from the catalog track entry
+  <out>/<role>.mp4   fMP4 for CMAF and LOCMAF tracks (LOCMAF objects
+                     rebuilt to CMAF chunks); <name>.mp4 when several
+                     tracks share a role
+
+On exit it prints one line per track: `name: N frames`, plus
+`, R rejected` on LOCMAF tracks.
 
 Play them:  ffplay video.h264   /   ffplay audio.wav
 
@@ -33,6 +39,7 @@ skew are built from differences and do not.
 """
 import asyncio
 import csv
+import functools
 import logging
 import os
 import sys
@@ -41,7 +48,9 @@ import wave
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.media import MediaSubscriber
-from aiomoqt.media.catalog import PACKAGING_CMAF
+from aiomoqt.media.catalog import (
+    MEDIA_PACKAGINGS, PACKAGING_CMAF, PACKAGING_LOCMAF,
+)
 from aiomoqt.media.cmaf import init_timescale
 from aiomoqt.media.loc import LOC_PROP_TIMESCALE
 from aiomoqt.types import MOQTRequestError
@@ -69,6 +78,10 @@ def parse_args():
                              'subscriber attach to a per-run namespace '
                              'like aiomoqt/demo-<rand4> without being told '
                              'which one.')
+    parser.add_argument('--packaging', choices=MEDIA_PACKAGINGS,
+                        default=None,
+                        help='Subscribe only catalog tracks of this '
+                             'packaging (default: every media track)')
     parser.add_argument('--out', type=str, default='./media-out',
                         help='Output directory (default: ./media-out)')
     parser.add_argument('--pipe', choices=('video', 'audio'), default=None,
@@ -115,15 +128,21 @@ def parse_args():
     return args
 
 
+_CHUNKED = (PACKAGING_CMAF, PACKAGING_LOCMAF)
+
+
 class _Writers:
-    """Per-track sinks: LOC video → Annex-B .h264, pcm audio → .wav.
-    One track may stream raw to stdout instead (pipe_role)."""
+    """Per-track sinks: LOC video → Annex-B .h264, pcm audio → .wav, CMAF
+    and LOCMAF → fMP4 (<role>.mp4, or <name>.mp4 when several wanted
+    tracks share the role). One track may stream raw to stdout instead
+    (pipe_role)."""
 
     def __init__(self, out_dir: str, subscriber: MediaSubscriber,
-                 pipe_role: str = None):
+                 pipe_role: str = None, wanted=None):
         self.out = out_dir
         self.sub = subscriber
         self.pipe_role = pipe_role
+        self.wanted = wanted or (lambda entry: True)
         self.video = None
         self.ivf = None
         self.wav = None
@@ -146,7 +165,7 @@ class _Writers:
         self.counts[name] = self.counts.get(name, 0) + 1
         entry = self.sub.catalog.find(name) if self.sub.catalog else None
         role = entry.role if entry else None
-        if entry is not None and entry.packaging == 'cmaf':
+        if entry is not None and entry.packaging in _CHUNKED:
             # CMAF chunks pass through verbatim; init segment (CMAF
             # header) from the catalog prefixes the fMP4 sink.
             init = self.sub.catalog.resolve_init(entry)
@@ -159,8 +178,8 @@ class _Writers:
                 return
             fh = self.cmaf.get(name)
             if fh is None:
-                fh = open(os.path.join(self.out, f'{role or name}.mp4'),
-                          'wb')
+                fh = open(os.path.join(self.out,
+                                       f'{self._stem(entry)}.mp4'), 'wb')
                 self.cmaf[name] = fh
                 if init:
                     fh.write(init)
@@ -221,6 +240,14 @@ class _Writers:
                 self.wav.setframerate(entry.samplerate or 48000)
             self.wav.writeframes(frame.payload)
 
+    def _stem(self, entry) -> str:
+        if entry.role is None:
+            return entry.name
+        peers = [t for t in self.sub.catalog.tracks
+                 if t.role == entry.role and t.packaging in _CHUNKED
+                 and self.wanted(t)]
+        return entry.name if len(peers) > 1 else entry.role
+
     def close(self):
         self.closed = True
         if self.video:
@@ -278,10 +305,16 @@ def _fan(*sinks):
     return call
 
 
+def _wanted(args, entry) -> bool:
+    """Catalog track selected by -T and --packaging."""
+    return ((args.trackname is None or entry.name == args.trackname)
+            and (args.packaging is None or entry.packaging == args.packaging))
+
+
 def _register(analysis: MediaAnalysis, catalog, entry) -> None:
     """Add a subscribed catalog track to the analysis before its first
     object can arrive."""
-    cmaf = entry.packaging == PACKAGING_CMAF
+    cmaf = entry.packaging in _CHUNKED
     timescale = None
     if cmaf:
         init = catalog.resolve_init(entry)
@@ -374,7 +407,7 @@ async def run(args):
         await session.client_session_init()
 
         def _select(entry):
-            if args.trackname is not None and entry.name != args.trackname:
+            if not _wanted(args, entry):
                 return False
             if analysis is not None:
                 _register(analysis, sub.catalog, entry)
@@ -386,7 +419,8 @@ async def run(args):
             on_catalog=((lambda c: _status(c.to_json(indent=2)))
                         if args.show_catalog else None))
         writers = (None if args.analyze
-                   else _Writers(args.out, sub, pipe_role=args.pipe))
+                   else _Writers(args.out, sub, pipe_role=args.pipe,
+                                 wanted=functools.partial(_wanted, args)))
         if writers is not None:
             sub.on_frame = writers.on_frame
         sub.on_arrival = _fan(inspector and inspector.on_arrival,
@@ -403,8 +437,10 @@ async def run(args):
             sys.exit(2)
         _status(f"  catalog: {[t.name for t in catalog.tracks]}")
         if not sub.tracks:
-            _status("  error: no LOC/CMAF catalog track"
+            _status("  error: no media catalog track"
                     + (f" named '{args.trackname}'" if args.trackname
+                       else "")
+                    + (f" of packaging {args.packaging}" if args.packaging
                        else ""))
             sys.exit(2)
         if args.pipe == 'audio':
@@ -445,8 +481,12 @@ async def run(args):
                 writers.close()
     if writers is None:
         return rc
-    for name, n in sorted(writers.counts.items()):
-        _status(f"  {name}: {n} frames")
+    for name in sorted(set(writers.counts) | set(sub.tracks)):
+        line = f"  {name}: {writers.counts.get(name, 0)} frames"
+        rejected = getattr(sub.tracks.get(name), 'objects_rejected', None)
+        if rejected is not None:
+            line += f", {rejected} rejected"
+        _status(line)
     if args.pipe is None:
         files = [n for n, f in (("video.h264", writers.video),
                                 ("video.ivf", writers.ivf),

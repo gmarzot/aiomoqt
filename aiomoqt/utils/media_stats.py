@@ -561,7 +561,9 @@ class MediaAnalysis:
         else:
             flags = getattr(msg, 'stream_flags', None)
             ends, last = bool(flags and flags[1]), False
-        t.observe(group_id, msg.object_id, len(frame.payload), recv_us,
+        wire = getattr(msg, 'payload', None)  # a LOCMAF frame is rebuilt larger
+        t.observe(group_id, msg.object_id,
+                  len(wire if wire is not None else frame.payload), recv_us,
                   ts, scale, ends_group=ends, last_in_group=last,
                   prior_gap=exts.get(PRIOR_GROUP_ID_GAP, 0) or 0)
 
