@@ -27,13 +27,16 @@ CATALOG_TRACK_NAME = "catalog"
 # that is itself a nested catalog, §5.2).
 PACKAGING_LOC = "loc"
 PACKAGING_CMAF = "cmaf"
+PACKAGING_LOCMAF = "locmaf"   # draft-einarsson-moq-locmaf, with locmafVersion
 PACKAGING_CATALOG = "catalog"
 PACKAGING_MEDIA_TIMELINE = "mediatimeline"
 PACKAGING_EVENT_TIMELINE = "eventtimeline"
 PACKAGING_MOQLOG = "moqlog"
 PACKAGING_MOQMETRICS = "moqmetrics"
+# Packagings aiomoqt publishes and subscribes as media tracks.
+MEDIA_PACKAGINGS = (PACKAGING_LOC, PACKAGING_CMAF, PACKAGING_LOCMAF)
 _KNOWN_PACKAGING = frozenset({
-    PACKAGING_LOC, PACKAGING_CMAF, PACKAGING_CATALOG,
+    PACKAGING_LOC, PACKAGING_CMAF, PACKAGING_LOCMAF, PACKAGING_CATALOG,
     PACKAGING_MEDIA_TIMELINE, PACKAGING_EVENT_TIMELINE,
     PACKAGING_MOQLOG, PACKAGING_MOQMETRICS,
 })
@@ -133,6 +136,7 @@ class CatalogTrack:
     template: Optional[List[Any]] = None
     authInfo: Optional[Any] = None
     accessibility: Optional[Any] = None
+    locmafVersion: Optional[str] = None
     extra: Dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -372,6 +376,13 @@ class Catalog:
             if t.packaging is not None \
                     and t.packaging not in _KNOWN_PACKAGING:
                 issues.append(f"{tag}: unknown packaging {t.packaging!r}")
+            if t.packaging == PACKAGING_LOCMAF:
+                if not isinstance(t.locmafVersion, str):
+                    issues.append(f"{tag}: locmaf track requires a string "
+                                  f"locmafVersion")
+            elif t.locmafVersion is not None:
+                issues.append(f"{tag}: locmafVersion on a "
+                              f"{t.packaging!r} track")
             if t.targetLatency is not None and t.buffers is not None:
                 issues.append(
                     f"{tag}: targetLatency and buffers are exclusive")

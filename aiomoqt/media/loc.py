@@ -110,7 +110,7 @@ class LocTrackPublisher(PublishedTrack):
         self.timescale = timescale
         self.media_kind = media_kind
         self.codec_string = codec_string
-        self.frames_dropped = 0  # discarded while Forward State was 0
+        self.frames_dropped = 0  # discarded without an object id
         self._config_id = (LOC_PROP_AUDIO_CONFIG if media_kind == "audio"
                            else LOC_PROP_VIDEO_CONFIG)
         # Unknown properties are ignored by conformant receivers, so
@@ -150,6 +150,12 @@ class LocTrackPublisher(PublishedTrack):
     async def finish(self) -> None:
         """Signal end of track; generation drains the queue then stops."""
         await self._frames.put(None)
+
+    def _package(self, payload: bytes, group_id: int,
+                 object_id: int) -> Optional[bytes]:
+        """Object payload for a numbered frame; None drops the frame
+        without using its object id."""
+        return payload
 
     def _object_extensions(self, frame: LocFrame, group_start: bool,
                            session=None) -> Dict[int, Any]:
@@ -203,15 +209,19 @@ class LocTrackPublisher(PublishedTrack):
             group_start = obj_id == 0
             if frame.timestamp is None:
                 frame.timestamp = int(time.time() * 1_000_000)
+            payload = self._package(frame.payload, group_id, obj_id)
+            if payload is None:
+                self.frames_dropped += 1
+                continue
             await out.write(
-                group_id, obj_id, frame.payload,
+                group_id, obj_id, payload,
                 extensions=functools.partial(
                     self._object_extensions, frame, group_start),
                 group_start=group_start)
             self._note_largest(group_id, obj_id)
             obj_id += 1
             self._total_sent += 1
-            self._total_bytes += len(frame.payload)
+            self._total_bytes += len(payload)
 
 
 class LocTrackSubscriber(SubscribedTrack):
@@ -223,8 +233,8 @@ class LocTrackSubscriber(SubscribedTrack):
     single-subgroup tracks; temporal-layer merge is not implemented.
 
     on_arrival(msg, recv_us, group_id, subgroup_id, frame) sees every
-    object first, status markers included (frame=None), with its receive
-    wall-clock µs.
+    object first, status markers and rejected objects included
+    (frame=None), with its receive wall-clock µs.
     """
 
     def __init__(self, session, namespace: str, trackname: str = None,
@@ -243,6 +253,11 @@ class LocTrackSubscriber(SubscribedTrack):
     def set_config(self, config: Optional[bytes]) -> None:
         """Seed decoder config out-of-band (catalog initRef, §5.2.13)."""
         self.config = config
+
+    def _unpackage(self, msg, group_id: int) -> Optional[bytes]:
+        """Frame payload of a received object; None rejects it (no
+        on_frame)."""
+        return bytes(msg.payload)
 
     def _on_object(self, msg, size, recv_us, group_id, subgroup_id) -> None:
         gid = getattr(msg, 'group_id', None)
@@ -267,8 +282,13 @@ class LocTrackSubscriber(SubscribedTrack):
         # Audio Level at 0x06) and is passed through.
         consumed = _CONSUMED_IDS.union(
             p for p in _TIMESTAMP_IDS if exts.get(p, object()) == ts)
+        payload = self._unpackage(msg, gid)
+        if payload is None:
+            if self.on_arrival:
+                self.on_arrival(msg, recv_us, gid, subgroup_id, None)
+            return
         frame = LocFrame(
-            payload=bytes(msg.payload),
+            payload=payload,
             key_frame=(msg.object_id == 0),
             timestamp=ts,
             extensions={k: v for k, v in exts.items()
