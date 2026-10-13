@@ -136,6 +136,11 @@ async def _drain(track, out, expected):
         pass
 
 
+async def _settle(times=20):
+    for _ in range(times):
+        await asyncio.sleep(0)
+
+
 async def _subscribed(stub, track, forward=True, request_id=7):
     """Serve the track to one subscriber the way a SUBSCRIBE would."""
     sub = track.subscriptions[0]
@@ -589,6 +594,28 @@ async def test_close_withdraws_after_publish_done():
     await agent.close()
     assert stub.log == [("announce", "agent"), ("SubscribeDone", 7),
                         ("withdraw", "agent")]
+
+
+# -- what was sent ------------------------------------------------------
+
+async def test_sent_stays_zero_while_paused():
+    """Forward State 0: production takes every object, but no peer is
+    sent one."""
+    stub = _StubSession()
+    wtr, track = build_writer(stub, _pub())
+    sub = await _subscribed(stub, track, forward=False)
+    for i in range(5):
+        await wtr.write(bytes([i]))
+    await wtr.flush(timeout=1.0)
+    await _settle()
+    assert (wtr.stats.queued, wtr.stats.sent) == (5, 0)
+    sub.forward = True
+    wtr.end_group()                     # a resumed peer rejoins at a group
+    await wtr.write(b"go")
+    await wtr.flush(timeout=1.0)
+    await _settle()
+    assert (wtr.stats.queued, wtr.stats.sent) == (6, 1)
+    await wtr.close(timeout=1.0)
 
 
 # -- flush, close, ordering ------------------------------------------

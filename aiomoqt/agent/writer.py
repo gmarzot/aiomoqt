@@ -42,6 +42,9 @@ class WriteRefused(AgentError):
 
 @dataclass
 class WriteStats:
+    """`sent` counts per peer, objects actually written: one reaching two
+    peers counts twice, one a peer was not sent (paused, filtered out,
+    shed) not at all."""
     queued: int = 0
     sent: int = 0
     dropped: int = 0
@@ -74,9 +77,11 @@ class _PushTrack(PublishedTrack):
                 group_id, object_id, payload, group_start = item
                 await out.write(group_id, object_id, payload,
                                 group_start=group_start)
-                self._stats.sent += 1
             finally:
                 self._queue.task_done()
+
+    def _on_sent(self, group_id: int, object_id: int) -> None:
+        self._stats.sent += 1
 
     def stop(self) -> None:
         """produce() returns once the queue is drained. The sentinel wakes

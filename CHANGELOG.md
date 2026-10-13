@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Agent `WriteStats.sent` counts objects written to each peer, not objects queued: nothing for a
+  peer that is paused, filtered out or shed. `FanoutDelivery.on_sent` reports each one.
 - Agent `PublishSpec.announce` (the default) announces the track's namespace once per session,
   shared by its writers, and serves SUBSCRIBEs for the track; `announce=False` sends a bare
   PUBLISH. `AgentSession.close()` withdraws the namespaces after the writers' PUBLISH_DONE.

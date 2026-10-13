@@ -1,6 +1,6 @@
 """The agent runtime over a real session, two tracks on one session over
-raw QUIC and WebTransport: namespace announcement, reader completion
-and concurrent fetches."""
+raw QUIC and WebTransport: namespace announcement, reader completion,
+concurrent fetches and per-peer send counts."""
 import asyncio
 import contextlib
 import time
@@ -224,4 +224,47 @@ async def test_two_fetches_on_one_session(use_quic):
         # Per-request routing: the session-wide handler saw nothing.
         assert fetched == {}
         await agent.close()
+        assert rx._close_err is None
+
+
+# -- WriteStats.sent ---------------------------------------------------------
+
+@requires_certs
+@_TRANSPORTS
+async def test_a_paused_writer_counts_nothing_sent(use_quic):
+    async with _publishing(_port(3, use_quic), use_quic) as (
+            agent, peer, _seen):
+        a = agent.writer(PublishSpec(track=TrackRef("agent", "a"),
+                                     group_size=4))
+        b = agent.writer(PublishSpec(track=TrackRef("agent", "b"),
+                                     group_size=4))
+        await asyncio.gather(a.start(), b.start())
+        rx = await asyncio.wait_for(peer, 5.0)
+        sub_a = await rx.subscribe("agent", "a", forward=1,
+                                   wait_response=True)
+        await rx.subscribe("agent", "b", forward=1, wait_response=True)
+        stop = asyncio.Event()
+
+        async def pump():
+            while not stop.is_set():
+                await a.write(b"x")
+                await b.write(b"y")
+                await asyncio.sleep(0.005)
+
+        task = asyncio.ensure_future(pump())
+        try:
+            assert await _until(
+                lambda: a.stats.sent >= 8 and b.stats.sent >= 8)
+            await rx.request_update(sub_a.request_id, forward=0,
+                                    wait_response=True)
+            await asyncio.sleep(0.1)            # writes in flight land
+            sent_a, queued_a = a.stats.sent, a.stats.queued
+            sent_b = b.stats.sent
+            await asyncio.sleep(0.3)
+            assert a.stats.sent == sent_a
+            assert a.stats.queued > queued_a
+            assert b.stats.sent > sent_b
+        finally:
+            stop.set()
+            await task
         assert rx._close_err is None
