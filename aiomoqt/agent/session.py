@@ -21,6 +21,7 @@ is configured per connection and never carried in a spec.
 """
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..types import (
@@ -188,13 +189,18 @@ class AgentSession:
         rdr.close()
 
     async def close(self) -> None:
+        """Close every reader and end each writer's track: its peers get
+        PUBLISH_DONE."""
+        if self._closed:
+            return
+        self._closed = True
         for name in list(self._readers):
             self.close_reader(name)
-        for wtr in self._writers.values():
-            await wtr.close()
+        writers = list(self._writers.values())
         self._writers.clear()
         self._publishes.clear()
-        self._closed = True
+        await asyncio.gather(*(w.close() for w in writers),
+                             return_exceptions=True)
 
     def stats(self) -> Dict[str, Any]:
         return {name: rdr.stats.snapshot()

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Fix: agent `Writer.flush()` without `timeout=` waits the default deadline; it raised
+  AttributeError.
+- Fix: agent `Writer.close()` returns on a full queue, once production has ended; a write still
+  waiting for room raises.
+- Fix: concurrent writes on one agent `Writer` queue in the order they are numbered.
+- Fix: `AgentSession` refuses new work as soon as `close()` starts.
 - Fix: a publisher writing as its WebTransport stream or session is torn down ends through
   cancellation; it died with an unretrieved `ConnectionError`.
 - A session's `auth_token_validator(token, msg)` refuses a d16+ peer request with the

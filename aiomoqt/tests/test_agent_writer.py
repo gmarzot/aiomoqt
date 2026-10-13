@@ -6,6 +6,7 @@ Numbering matters: objects are numbered ONCE into a delivery the track
 spreads across peers, so a wrong number here is wrong for every peer.
 """
 import asyncio
+import contextlib
 
 import pytest
 
@@ -416,3 +417,72 @@ def test_enforced_is_false_without_a_transport_priority_api():
     agent = AgentSession(_StubSession())
     assert agent.scheduling_enforced is False
     assert agent.priority_plan()["enforced"] is False
+
+
+# -- flush, close, ordering ------------------------------------------
+
+async def test_flush_without_a_timeout_uses_the_default():
+    wtr, track = _writer()
+    await wtr.write(b"a")
+    out = _RecordingOut()
+    task = asyncio.ensure_future(track.produce(out))
+    await wtr.flush()
+    assert len(out.written) == 1
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+async def test_close_returns_with_a_full_queue():
+    wtr, track = _writer(_pub(buffer=1))
+    await wtr.write(b"a")
+    await asyncio.wait_for(wtr.close(), 1.0)
+    out = _RecordingOut()
+    await asyncio.wait_for(track.produce(out), 1.0)
+    assert [(g, o, p) for g, o, p, _s in out.written] == [(0, 0, b"a")]
+
+
+async def test_a_write_waiting_for_room_is_refused_at_close():
+    wtr, _track = _writer(_pub(buffer=1))
+    await wtr.write(b"a")
+    pending = asyncio.ensure_future(wtr.write(b"b"))
+    await asyncio.sleep(0)
+    await asyncio.wait_for(wtr.close(), 1.0)
+    with pytest.raises(AgentError, match="closed"):
+        await asyncio.wait_for(pending, 1.0)
+    assert wtr.stats.queued == 1
+
+
+async def test_concurrent_writes_queue_in_number_order():
+    """A write waiting for room keeps its place: a snapshot issued while
+    it waits queues after it."""
+    wtr, track = _writer(_pub(buffer=1))
+    out = _RecordingOut()
+    await wtr.write(b"a")
+    blocked = asyncio.ensure_future(wtr.write(b"b"))
+    await asyncio.sleep(0)
+    track._queue.get_nowait()           # production takes "a"
+    track._queue.task_done()
+    producer = asyncio.ensure_future(track.produce(out))
+    await wtr.snapshot(b"c")
+    await blocked
+    await wtr.flush(timeout=1.0)
+    producer.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await producer
+    assert [(g, o, p) for g, o, p, _s in out.written] == [
+        (0, 1, b"b"), (1, 0, b"c")]
+
+
+async def test_session_refuses_work_once_close_begins():
+    stub = _StubSession()
+    agent = AgentSession(stub)
+    wtr = agent.writer(_pub(buffer=1))
+    await wtr.write(b"a")
+    closing = asyncio.ensure_future(agent.close())
+    await asyncio.sleep(0)
+    with pytest.raises(AgentError, match="closed"):
+        await agent.reader(SubscribeSpec(track=TrackRef("world", "events")))
+    await asyncio.wait_for(closing, 1.0)
+    assert stub.calls == []
+

@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from ..delivery import StreamMapping
 from ..track import PublishedTrack
 from .errors import AgentError
-from .spec import PublishSpec
+from .spec import DEFAULT_TIMEOUT_S, PublishSpec
 
 _MAPPINGS = {
     "per_group": StreamMapping.PER_GROUP,
@@ -60,9 +60,10 @@ class _PushTrack(PublishedTrack):
         self._queue = queue
         self._stats = stats
         self.mapping = mapping
+        self._stopping = False
 
     async def produce(self, out) -> None:
-        while True:
+        while not (self._stopping and self._queue.empty()):
             item = await self._queue.get()
             try:
                 if item is None:  # close sentinel
@@ -73,6 +74,21 @@ class _PushTrack(PublishedTrack):
                 self._stats.sent += 1
             finally:
                 self._queue.task_done()
+
+    def stop(self) -> None:
+        """produce() returns once the queue is drained. The sentinel wakes
+        it on an empty queue; a full one ends on the flag."""
+        self._stopping = True
+        try:
+            self._queue.put_nowait(None)
+        except asyncio.QueueFull:
+            pass
+
+    async def finished(self, timeout: float) -> None:
+        """Wait up to `timeout` for production to end, after which every
+        peer it served has had PUBLISH_DONE."""
+        if self._production is not None:
+            await asyncio.wait({self._production}, timeout=timeout)
 
 
 class Writer:
@@ -89,6 +105,10 @@ class Writer:
         self.stats = stats
         self._track = track
         self._queue = queue
+        # Held from choosing an object's number until it is queued, so
+        # concurrent writes queue in the order they were numbered.
+        self._lock = asyncio.Lock()
+        self._putter: Optional[asyncio.Future] = None
         self._group = -1
         self._object = 0
         self._in_group = 0
@@ -118,18 +138,23 @@ class Writer:
         The group is MoQT's self-contained unit: a subscriber joining
         later starts here, so this is where a turn or a full state goes.
         """
-        self._advance_group()
-        await self._put(payload, group_start=True)
+        data = _as_bytes(payload)
+        async with self._lock:
+            self._check_open()
+            self._advance_group()
+            await self._put(data, group_start=True)
 
     async def write(self, payload: Any) -> None:
         """Append to the current group, starting one if none is open."""
-        full = (self.spec.group_size is not None
-                and self._in_group >= self.spec.group_size)
-        if self._group < 0 or self._force_new or full:
-            self._advance_group()
-            await self._put(payload, group_start=True)
-            return
-        await self._put(payload, group_start=False)
+        data = _as_bytes(payload)
+        async with self._lock:
+            self._check_open()
+            full = (self.spec.group_size is not None
+                    and self._in_group >= self.spec.group_size)
+            start = self._group < 0 or self._force_new or full
+            if start:
+                self._advance_group()
+            await self._put(data, group_start=start)
 
     def end_group(self) -> None:
         """Close the current group; the next write starts a new one."""
@@ -138,7 +163,7 @@ class Writer:
     async def flush(self, *, timeout: Optional[float] = None) -> None:
         """Wait until produce() has handed every queued object to the
         track's delivery."""
-        deadline = timeout if timeout is not None else self.spec.timeout_s
+        deadline = DEFAULT_TIMEOUT_S if timeout is None else timeout
         try:
             await asyncio.wait_for(self._queue.join(), deadline)
         except (asyncio.TimeoutError, TimeoutError) as exc:
@@ -146,13 +171,24 @@ class Writer:
                 f"flush({self.name}): {self._queue.qsize()} objects still "
                 f"queued after {deadline}s") from exc
 
-    async def close(self) -> None:
+    async def close(self, *, timeout: Optional[float] = None) -> None:
+        """Stop taking writes. Production hands on what is queued, then
+        each peer it served gets PUBLISH_DONE; this waits up to `timeout`
+        for that. A write still waiting for room raises AgentError."""
         if self._closed:
             return
         self._closed = True
-        await self._queue.put(None)
+        if self._putter is not None:
+            self._putter.cancel()
+        self._track.stop()
+        await self._track.finished(
+            DEFAULT_TIMEOUT_S if timeout is None else timeout)
 
     # -- internals ---------------------------------------------------
+
+    def _check_open(self) -> None:
+        if self._closed:
+            raise AgentError(f"writer {self.name} is closed")
 
     def _advance_group(self) -> None:
         self._group += 1
@@ -161,22 +197,33 @@ class Writer:
         self._force_new = False
         self.stats.groups += 1
 
-    async def _put(self, payload: Any, *, group_start: bool) -> None:
-        if self._closed:
-            raise AgentError(f"writer {self.name} is closed")
-        data = _as_bytes(payload)
+    async def _put(self, data: bytes, *, group_start: bool) -> None:
+        """Number and queue one object. Called with the lock held."""
         item: _Item = (self._group, self._object, data, group_start)
-        block = self._queue.full() and self.spec.on_full == "block"
-        if not block and not self._admit(item):
+        if self._queue.full() and self.spec.on_full == "block":
+            await self._wait_for_room(item)
+        elif not self._admit(item):
             return
-        # Numbered before any wait, so a write issued meanwhile cannot
-        # reuse the id.
         self._object += 1
         self._in_group += 1
-        if block:
-            await self._queue.put(item)
         self.stats.queued += 1
         self.stats.bytes += len(data)
+
+    async def _wait_for_room(self, item: _Item) -> None:
+        """Queue `item` once there is room; close() abandons the wait."""
+        put = asyncio.ensure_future(self._queue.put(item))
+        self._putter = put
+        try:
+            await put
+        except asyncio.CancelledError:
+            if (put.cancelled() and self._closed
+                    and not asyncio.current_task().cancelling()):
+                raise AgentError(
+                    f"writer {self.name} closed while waiting for room"
+                ) from None
+            raise
+        finally:
+            self._putter = None
 
     def _admit(self, item: _Item) -> bool:
         """Apply the spec's on_full policy. True if the item was queued.
