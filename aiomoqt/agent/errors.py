@@ -12,3 +12,8 @@ class SpecError(AgentError, ValueError):
     Subclasses ValueError so callers that already catch ValueError around
     config parsing keep working.
     """
+
+
+class Unsupported(AgentError, NotImplementedError):
+    """A spec sets a field to a value this runtime does not implement,
+    which it would otherwise ignore."""

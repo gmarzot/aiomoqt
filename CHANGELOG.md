@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `AgentSession` raises `Unsupported` for spec values it would otherwise ignore: `TrackRef.relay`,
+  a non-zero `delivery_timeout_ms`, a subscriber priority or group order on a publication, a
+  publisher priority on a subscription, and reader `on_full` `block` or `error`.
 - Fix: an agent `Writer` that drops a group's first object (`drop_new`, `drop_oldest`) drops the
   rest of that group; its later objects went out on the previous group's stream.
 - Fix: agent `Writer.flush()` without `timeout=` waits the default deadline; it raised

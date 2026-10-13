@@ -10,7 +10,9 @@ import contextlib
 
 import pytest
 
-from aiomoqt.agent import Priority, PublishSpec, SubscribeSpec, TrackRef
+from aiomoqt.agent import (
+    Priority, PublishSpec, SubscribeSpec, TrackRef, Unsupported,
+)
 from aiomoqt.agent.errors import AgentError
 from aiomoqt.agent.session import AgentSession
 from aiomoqt.agent.writer import (
@@ -524,3 +526,19 @@ async def test_session_refuses_work_once_close_begins():
     await asyncio.wait_for(closing, 1.0)
     assert stub.calls == []
 
+
+# -- inputs the runtime would otherwise ignore ------------------------
+
+@pytest.mark.parametrize("spec", (
+    PublishSpec(track=TrackRef("agent", "d", relay="moqt://r.example:4433")),
+    _pub(priority=Priority(delivery_timeout_ms=100)),
+    _pub(priority=Priority(subscriber=3)),
+    _pub(priority=Priority(group_order="descending")),
+), ids=["relay", "delivery-timeout", "subscriber-priority", "group-order"])
+def test_writer_refuses_what_it_would_ignore(spec):
+    agent = AgentSession(_StubSession())
+    with pytest.raises(Unsupported, match="not implemented"):
+        agent.writer(spec)
+    with pytest.raises(Unsupported):
+        build_writer(_StubSession(), spec)
+    assert agent.writers == {}

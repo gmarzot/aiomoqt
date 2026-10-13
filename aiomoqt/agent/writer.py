@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from ..delivery import StreamMapping
 from ..track import PublishedTrack
 from .errors import AgentError
-from .spec import DEFAULT_TIMEOUT_S, PublishSpec
+from .spec import DEFAULT_TIMEOUT_S, PublishSpec, check_supported
 
 _MAPPINGS = {
     "per_group": StreamMapping.PER_GROUP,
@@ -290,6 +290,7 @@ def build_writer(session: Any, spec: PublishSpec, *,
     here — constant for the track's life, so it never costs work in the
     send loop. Undeclared leaves streams at the transport default.
     """
+    check_supported(spec)
     mapping = _MAPPINGS.get(spec.mapping)
     if mapping is None:
         raise AgentError(f"publish mapping {spec.mapping!r} has no wire form")

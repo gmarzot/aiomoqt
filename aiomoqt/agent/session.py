@@ -29,7 +29,7 @@ from ..types import (
 )
 from .errors import AgentError
 from .reader import Reader
-from .spec import PublishSpec, SubscribeSpec
+from .spec import PublishSpec, SubscribeSpec, check_supported
 from .writer import Writer, build_writer
 
 _FILTERS = {
@@ -88,6 +88,7 @@ class AgentSession:
     async def reader(self, spec: SubscribeSpec) -> Reader:
         """Subscribe and return a bounded reader for the track."""
         self._guard()
+        check_supported(spec)
         if spec.track.name is None:
             raise AgentError(
                 "reader: SubscribeSpec.track.name is required; namespace "

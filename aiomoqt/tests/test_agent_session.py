@@ -8,7 +8,9 @@ import asyncio
 
 import pytest
 
-from aiomoqt.agent import Priority, StartAt, SubscribeSpec, TrackRef
+from aiomoqt.agent import (
+    Priority, StartAt, SubscribeSpec, TrackRef, Unsupported,
+)
 from aiomoqt.agent.errors import AgentError
 from aiomoqt.agent.reader import Obj, ReadTimeout
 from aiomoqt.agent.session import AgentSession, start_at_to_wire
@@ -276,3 +278,26 @@ async def test_session_closes_its_readers():
         await agent.reader(_spec("audio"))
         assert len(stub.handlers) == 2
     assert stub.handlers == {}
+
+
+# -- inputs the runtime would otherwise ignore -------------------------
+
+@pytest.mark.parametrize("spec", (
+    SubscribeSpec(
+        track=TrackRef("live/cam-1", "video", relay="moqt://r.example:4433")),
+    _spec(priority=Priority(delivery_timeout_ms=500)),
+    _spec(priority=Priority(publisher=3)),
+    _spec(on_full="block"),
+    _spec(on_full="error"),
+), ids=["relay", "delivery-timeout", "publisher-priority", "block", "error"])
+async def test_reader_refuses_what_it_would_ignore(spec):
+    stub = _StubSession()
+    with pytest.raises(Unsupported) as err:
+        await AgentSession(stub).reader(spec)
+    assert isinstance(err.value, NotImplementedError)
+    assert stub.calls == []
+
+
+async def test_a_zero_delivery_timeout_is_unset():
+    agent = AgentSession(_StubSession())
+    await agent.reader(_spec(priority=Priority(delivery_timeout_ms=0)))
