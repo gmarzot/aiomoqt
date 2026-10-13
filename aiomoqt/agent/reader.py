@@ -6,7 +6,8 @@ one group, then return" — because a turn has to end.
 
 Objects arrive on the event loop inside the parse path, so ingest here is
 O(1), never blocks and never raises: a consumer fault must not surface as
-a protocol error. Everything costly happens on the reading side.
+a protocol error. Everything costly happens on the reading side, payload
+decoding included.
 
 Staleness is measured, not assumed. `age_ms` comes from the object's own
 LOC timestamp against arrival; it is never inferred from a delivery
@@ -22,7 +23,7 @@ from dataclasses import dataclass
 from typing import Any, Deque, Dict, List, Optional
 
 from ..utils.stats import send_time_us
-from .errors import AgentError
+from .errors import AgentError, DecodeError
 from .spec import SubscribeSpec
 
 
@@ -45,6 +46,7 @@ class Obj:
     size: int
     recv_us: int
     sent_us: Optional[int] = None
+    decode: str = "bytes"
 
     @property
     def age_ms(self) -> Optional[float]:
@@ -53,6 +55,22 @@ class Obj:
         if self.sent_us is None:
             return None
         return (self.recv_us - self.sent_us) / 1000.0
+
+    @property
+    def value(self) -> Any:
+        """The payload as `decode` asks: bytes, str (UTF-8) or parsed
+        JSON. Decoded on each access; raises DecodeError when the payload
+        does not decode."""
+        if self.decode == "bytes":
+            return self.payload
+        try:
+            if self.decode == "text":
+                return self.payload.decode("utf-8")
+            return _json.loads(self.payload)
+        except ValueError as exc:
+            raise DecodeError(
+                f"{self.track} {self.group}/{self.object_id}: payload is "
+                f"not {self.decode}: {exc}") from exc
 
     def text(self, encoding: str = "utf-8") -> str:
         return self.payload.decode(encoding)
@@ -92,6 +110,7 @@ class Reader:
         self.spec = spec
         self.name = name
         self.stats = ReadStats()
+        self._decode = spec.decode
         self._ring: Deque[Obj] = deque()
         self._arrival = asyncio.Event()
         self._closed = False
@@ -118,6 +137,7 @@ class Reader:
                 size=size,
                 recv_us=recv_time_us,
                 sent_us=send_time_us(getattr(msg, "extensions", None)),
+                decode=self._decode,
             ))
         except Exception:
             self.stats.errors += 1

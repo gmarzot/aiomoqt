@@ -44,6 +44,10 @@ DECODES = ("bytes", "text", "json")
 DEFAULT_BUFFER = 256
 DEFAULT_TIMEOUT_S = 30.0
 
+_DECODE_DOC = ("How Obj.value surfaces a payload: bytes as is, text as "
+               "UTF-8, json parsed. A payload that does not decode raises "
+               "DecodeError on access; Obj.payload keeps the bytes")
+
 
 # -- annotation markers ----------------------------------------------
 # Read by both the validator below and the JSON Schema emitter, so a
@@ -509,7 +513,7 @@ class SubscribeSpec:
         "drop_new. block and error are writer policies; a reader raises "
         "Unsupported")] = "drop_oldest"
     decode: Annotated[str, Choices(*DECODES), Doc(
-        "How object payloads are surfaced")] = "bytes"
+        _DECODE_DOC)] = "bytes"
     timeout_s: Annotated[float, Range(0, None), Doc(
         "Default deadline for operations on this subscription")] = DEFAULT_TIMEOUT_S
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -539,7 +543,7 @@ class FetchSpec:
         "The range to fetch. Must use mode 'range' — a fetch is bounded")]
     priority: Priority = field(default_factory=Priority)
     decode: Annotated[str, Choices(*DECODES), Doc(
-        "How object payloads are surfaced")] = "bytes"
+        _DECODE_DOC)] = "bytes"
     timeout_s: Annotated[float, Range(0, None), Doc(
         "Deadline for the whole fetch")] = DEFAULT_TIMEOUT_S
     extra: Dict[str, Any] = field(default_factory=dict)

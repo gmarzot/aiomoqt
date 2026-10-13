@@ -5,11 +5,12 @@ contract, so the session is a stub that records what it was asked for
 and objects are injected directly into the reader's ingest callback.
 """
 import asyncio
+import json
 
 import pytest
 
 from aiomoqt.agent import (
-    Priority, StartAt, SubscribeSpec, TrackRef, Unsupported,
+    DecodeError, Priority, StartAt, SubscribeSpec, TrackRef, Unsupported,
 )
 from aiomoqt.agent.errors import AgentError
 from aiomoqt.agent.reader import Obj, ReadTimeout
@@ -278,6 +279,37 @@ async def test_session_closes_its_readers():
         await agent.reader(_spec("audio"))
         assert len(stub.handlers) == 2
     assert stub.handlers == {}
+
+
+# -- decode ------------------------------------------------------------
+
+@pytest.mark.parametrize("decode,expected", (
+    ("bytes", b'{"a": "\xc3\xa9"}'),
+    ("text", '{"a": "é"}'),
+    ("json", {"a": "é"}),
+), ids=["bytes", "text", "json"])
+async def test_decode_surfaces_value(decode, expected):
+    agent = AgentSession(_StubSession())
+    rdr = await agent.reader(_spec(decode=decode))
+    payload = json.dumps({"a": "é"}, ensure_ascii=False).encode()
+    rdr.on_object(_Msg(0, payload), len(payload), 1, 1, 0)
+    obj, = rdr.drain()
+    assert obj.value == expected
+    assert obj.payload == payload
+
+
+async def test_undecodable_payload_raises_on_access():
+    agent = AgentSession(_StubSession())
+    text = await agent.reader(_spec("text", decode="text"))
+    data = await agent.reader(_spec("data", decode="json"))
+    for rdr in (text, data):
+        rdr.on_object(_Msg(0, b"\xff{"), 2, 1, 1, 0)
+        obj, = rdr.drain()
+        assert obj.payload == b"\xff{"
+        with pytest.raises(DecodeError) as err:
+            obj.value
+        assert isinstance(err.value, AgentError)
+    assert text.stats.errors == data.stats.errors == 0
 
 
 # -- inputs the runtime would otherwise ignore -------------------------

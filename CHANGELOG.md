@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Agent `Obj.value` decodes the payload as the spec's `decode` asks (bytes, UTF-8 text, JSON); a
+  payload that does not decode raises `DecodeError`, and `Obj.payload` keeps the bytes.
 - `AgentSession` raises `Unsupported` for spec values it would otherwise ignore: `TrackRef.relay`,
   a non-zero `delivery_timeout_ms`, a subscriber priority or group order on a publication, a
   publisher priority on a subscription, and reader `on_full` `block` or `error`.
