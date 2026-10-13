@@ -139,11 +139,49 @@ async def test_drop_new_refuses_once_full():
 async def test_drop_oldest_keeps_the_newest():
     wtr, track = _writer(_pub(buffer=2, on_full="drop_oldest"))
     for i in range(4):
-        await wtr.write(bytes([i]))
+        await wtr.snapshot(bytes([i]))
     out = _RecordingOut()
     await _drain(track, out, 2)
     assert [p for _g, _o, p, _s in out.written] == [b"\x02", b"\x03"]
     assert wtr.stats.dropped == 2
+
+
+async def _drop_new_takes_a_start(wtr, track):
+    await wtr.snapshot(b"a")            # the queue is full
+    await wtr.snapshot(b"b")            # group 1's first object is dropped
+    track._queue.get_nowait()           # production takes "a"
+    track._queue.task_done()
+    await wtr.write(b"c")
+
+
+async def _drop_oldest_takes_a_start(wtr, track):
+    await wtr.snapshot(b"a")
+    await wtr.write(b"b")               # the queue is full
+    await wtr.snapshot(b"c")            # drops "a", group 0's first
+
+
+async def _drop_oldest_takes_its_own_start(wtr, track):
+    await wtr.write(b"a")
+    await wtr.write(b"b")               # the queue is full
+    await wtr.write(b"c")               # drops "a", this group's first
+    await wtr.write(b"d")
+
+
+@pytest.mark.parametrize("policy,buffer,scenario,expected", (
+    ("drop_new", 1, _drop_new_takes_a_start, [(2, 0, b"c", True)]),
+    ("drop_oldest", 2, _drop_oldest_takes_a_start, [(1, 0, b"c", True)]),
+    ("drop_oldest", 2, _drop_oldest_takes_its_own_start,
+     [(1, 0, b"d", True)]),
+), ids=["drop-new", "drop-oldest", "drop-oldest-own-group"])
+async def test_a_dropped_group_start_drops_its_group(policy, buffer,
+                                                     scenario, expected):
+    """No object goes out without its group's first: a delivery would
+    put it on the previous group's stream."""
+    wtr, track = _writer(_pub(buffer=buffer, on_full=policy))
+    await scenario(wtr, track)
+    out = _RecordingOut()
+    await _drain(track, out, len(expected))
+    assert out.written == expected
 
 
 async def test_error_policy_raises():

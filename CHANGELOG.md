@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fix: an agent `Writer` that drops a group's first object (`drop_new`, `drop_oldest`) drops the
+  rest of that group; its later objects went out on the previous group's stream.
 - Fix: agent `Writer.flush()` without `timeout=` waits the default deadline; it raised
   AttributeError.
 - Fix: agent `Writer.close()` returns on a full queue, once production has ended; a write still

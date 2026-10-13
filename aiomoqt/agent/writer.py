@@ -235,19 +235,40 @@ class Writer:
             policy = self.spec.on_full
             if policy == "drop_new":
                 self.stats.dropped += 1
+                if item[3]:
+                    self._abandon(item[0])
                 return False
             if policy == "drop_oldest":
-                try:
-                    self._queue.get_nowait()
-                    self._queue.task_done()
-                    self.stats.dropped += 1
-                except asyncio.QueueEmpty:
-                    pass
+                oldest = self._queue.get_nowait()
+                self._queue.task_done()
+                self.stats.dropped += 1
+                if oldest is not None and oldest[3]:
+                    self._abandon(oldest[0])
+                    if item[0] == oldest[0]:
+                        self.stats.dropped += 1
+                        return False
             elif policy == "error":
                 raise WriteRefused(
                     f"writer {self.name}: queue full ({self._queue.maxsize})")
         self._queue.put_nowait(item)
         return True
+
+    def _abandon(self, group_id: int) -> None:
+        """A group lost its first object: drop the rest of it too, queued
+        or still to be written, since a delivery would place them on the
+        previous group's stream."""
+        kept = []
+        while not self._queue.empty():
+            queued = self._queue.get_nowait()
+            self._queue.task_done()
+            if queued is not None and queued[0] == group_id:
+                self.stats.dropped += 1
+            else:
+                kept.append(queued)
+        for queued in kept:
+            self._queue.put_nowait(queued)
+        if self._group == group_id:
+            self._force_new = True
 
 
 def _as_bytes(payload: Any) -> bytes:
