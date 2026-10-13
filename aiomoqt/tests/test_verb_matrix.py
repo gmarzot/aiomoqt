@@ -129,8 +129,6 @@ MATRIX = [
      lambda s: s.unsubscribe(request_id=7)),
     ("unsubscribe@18", (18,), "reset",
      lambda s: s.unsubscribe(request_id=7)),
-    # NOTE: str tuples crash serialize here (API wart — tuple input
-    # bypasses _make_namespace_tuple); bytes required.
     ("publish_namespace_done@14", (14,), "control",
      lambda s: s.publish_namespace_done(namespace=(b"a",))),
     ("publish_namespace_done", (16,), "control",

@@ -18,10 +18,9 @@ RUN pip install --no-cache-dir .
 # default and loads /certs/cert.pem + /certs/priv.key per the runner's
 # certs convention.
 #
-# WARNING: MOQT_ROLE=relay starts an EXPERIMENTAL control-plane-only
-# interop relay. It does not forward data, has no authentication, and
-# is not intended for any workload outside the interop conformance
-# tests. Use moxygen / moq-rs for production traffic.
+# WARNING: MOQT_ROLE=relay starts the ersatz relay, a conformance and
+# interop fixture: no authentication and no hardening. Use moxygen /
+# moq-rs for production traffic.
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 

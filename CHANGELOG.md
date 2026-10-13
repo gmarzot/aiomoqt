@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Relay: a d18 PUBLISH_NAMESPACE cancelled by its stream, or a d16 PUBLISH_NAMESPACE_DONE
+  naming only the request, withdraws the namespace and sends NAMESPACE_DONE.
+- Relay: a namespace element containing "/" stays one element; it was split upstream and in
+  PUBLISH offers.
+- Relay: Forward State and the subscription filter apply per subscriber and REQUEST_UPDATE
+  changes them; an AbsoluteRange ends with PUBLISH_DONE SUBSCRIPTION_ENDED, or INVALID_RANGE
+  when its End Group is already published.
+- Relay: the publisher is raised to Forward State 1 only for a forwarding subscriber (§9.5);
+  Largest counts objects received before anyone subscribed (§10.2.11).
+- Relay: `--watchdog SEC` exits on an event-loop stall or failed loopback self-probes, for a
+  supervisor to restart.
+- Fix: d14 `publish_namespace_done(namespace="a/b")` raised TypeError encoding the string.
 - Fix: a publisher writing as its WebTransport stream or session is torn down ends through
   cancellation; it died with an unretrieved `ConnectionError`.
 - A session's `auth_token_validator(token, msg)` refuses a d16+ peer request with the
