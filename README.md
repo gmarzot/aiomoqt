@@ -172,7 +172,7 @@ Auth is control-plane only; there is no per-object authentication.
 
 ## Media
 
-`aiomoqt.media` implements MSF catalogs with two packagings: **LOC** (per-frame payloads, metadata in MOQ object properties) and **CMSF/CMAF** (moof+mdat chunks, CMAF header in the catalog `initDataList`).
+`aiomoqt.media` implements MSF catalogs with three packagings: **LOC** (per-frame payloads, metadata in MOQ object properties), **CMSF/CMAF** (moof+mdat chunks, CMAF header in the catalog `initDataList`) and **LOCMAF** (draft-einarsson-moq-locmaf, `locmafVersion` 0.3: the same chunks with each moof carried as a compact header, a delta of the previous one within a group; the receiver rebuilds a canonical CMAF chunk).
 
 ### Command line
 
@@ -183,6 +183,9 @@ python -m aiomoqt.tools.pub_media $RELAY -N demo/live --mp4 clip.mp4 --loop \
 
 # Same content, CMAF packaging (requires --mp4)
 python -m aiomoqt.tools.pub_media $RELAY -N cmsf/live --mp4 clip.mp4 --packaging cmaf --loop
+
+# Same chunks as LOCMAF (also with --input); audio rides ~1 s groups
+python -m aiomoqt.tools.pub_media $RELAY -N cmsf/live --mp4 clip.mp4 --packaging locmaf --loop
 
 # HLS or DASH (anything FFmpeg opens) as CMAF (needs aiomoqt[media]); --rendition all
 # (experimental) = every video rendition as one alternate group, fetched in turn, so
@@ -196,7 +199,10 @@ ffmpeg -i 'srt://0.0.0.0:9000?mode=listener' -map 0:v -c:v copy -f h264 - \
 # Subscribe: catalog-driven, writes playable files to ./media-out
 python -m aiomoqt.tools.sub_media $RELAY -N demo/live --inspect 5 --show-catalog
 ffplay media-out/video.h264      # LOC → elementary stream
-ffplay media-out/video.mp4       # CMAF → fMP4
+ffplay media-out/video.mp4       # CMAF or LOCMAF → fMP4
+
+# Only the LOCMAF tracks; the summary line per track counts rejected objects
+python -m aiomoqt.tools.sub_media $RELAY -N cmsf/live --packaging locmaf -t 30
 
 # Measure delivery instead: latency, jitter, loss, playout model; no decode, no files
 python -m aiomoqt.tools.sub_media $RELAY -N demo/live --analyze -t 60 -i 5 --report run.csv

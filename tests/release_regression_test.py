@@ -20,6 +20,9 @@ Usage:
     # Adaptive throughput bench (manual dispatch only)
     tests/release_regression_test.py --test-tier bench
 
+    # LOCMAF from Eyevinn's public moqlivemock (manual only)
+    tests/release_regression_test.py --test-suite media-locmaf
+
 Exit 0 iff every test passed. `[skip]` suites don't count.
 """
 from __future__ import annotations
@@ -29,6 +32,7 @@ import concurrent.futures
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -72,8 +76,11 @@ TIERS = {
                     "relay-join", "relay-fetch", "relay-data"],
     "bench":       ["loopback-adaptive-bench"],
 }
+# Run only when named with --test-suite: no tier and no bare run selects them.
+MANUAL_SUITES = ["media-locmaf"]
 TIER_CHOICES = tuple(TIERS.keys())
-SUITE_CHOICES = tuple(s for suites in TIERS.values() for s in suites)
+SUITE_CHOICES = (tuple(s for suites in TIERS.values() for s in suites)
+                 + tuple(MANUAL_SUITES))
 
 # load_sim quick mode: N subscribers on one synthesized track.
 MULTI_SUB_ARGS_COMMON = [
@@ -384,6 +391,44 @@ def _relay_data(url: str, draft: int, insecure: bool,
 
 
 # ---------------------------------------------------------------------------
+# Manual runners
+# ---------------------------------------------------------------------------
+# media-locmaf: sub_media against Eyevinn's moqlivemock, which publishes a
+# LOCMAF twin of every CMAF track. Public infrastructure: manual only.
+MOQLIVEMOCK_URLS = {
+    "raw-quic": "moqt://moqlivemock.demo.osaas.io:443",
+    "h3-wt": "https://moqlivemock.demo.osaas.io:443/moq",
+}
+MOQLIVEMOCK_NAMESPACES = ("mlm/cmsf/clear", "mlm/cmsf/drm-cbcs")
+_LOCMAF_TRACK_LINE = re.compile(r"^  (\S+): (\d+) frames, (\d+) rejected$",
+                                re.MULTILINE)
+
+
+def _media_locmaf(url: str, namespace: str, log: Path) -> tuple[str, str]:
+    """PASS iff every LOCMAF track subscribed delivered frames and none was
+    rejected; no per-track summary line is a FAIL."""
+    out = tempfile.mkdtemp(prefix="aiomoqt-locmaf.")
+    cmd = [sys.executable, "-m", "aiomoqt.tools.sub_media", url,
+           "-N", namespace, "--packaging", "locmaf", "--draft", "18",
+           "-t", "12", "--out", out]
+    try:
+        ok, _ = _run(cmd, log, 60)
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+    if not ok:
+        return "FAIL", "timeout"
+    tracks = _LOCMAF_TRACK_LINE.findall(log.read_text())
+    if not tracks:
+        return "FAIL", "(no LOCMAF track summary)"
+    bad = [f"{n}: {f} frames, {r} rejected" for n, f, r in tracks
+           if int(f) == 0 or int(r)]
+    if bad:
+        return "FAIL", "; ".join(bad)
+    frames = sum(int(f) for _, f, _ in tracks)
+    return "PASS", f"{len(tracks)} tracks, {frames} frames, 0 rejected"
+
+
+# ---------------------------------------------------------------------------
 # Bench-tier runners
 # ---------------------------------------------------------------------------
 def _loopback_adaptive_bench(log_dir: Path) -> tuple[str, str]:
@@ -574,7 +619,7 @@ def main() -> int:
         for t in args.test_tiers:
             enabled.update(TIERS[t])
     else:
-        enabled = set(SUITE_CHOICES)
+        enabled = set(SUITE_CHOICES) - set(MANUAL_SUITES)
     enabled -= set(args.skip_suites)
 
     with open(args.catalog) as f:
@@ -678,6 +723,17 @@ def main() -> int:
         for relay in relays:
             for res in relay_results.get(relay["name"], []):
                 results.append(res)
+
+    # --- manual suites ---
+    if "media-locmaf" in enabled:
+        print("\n== media-locmaf (moqlivemock) ==")
+        for transport, url in MOQLIVEMOCK_URLS.items():
+            for ns in MOQLIVEMOCK_NAMESPACES:
+                slug = f"media-locmaf_{transport}_{ns.replace('/', '-')}"
+                log = log_dir / f"{slug}.log"
+                status, detail = _media_locmaf(url, ns, log)
+                record_and_print((status, f"media-locmaf {transport} {ns}",
+                                  detail, log))
 
     # --- bench tier ---
     if enabled & set(TIERS["bench"]):

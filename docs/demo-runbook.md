@@ -1,9 +1,9 @@
 # aiomoqt media pipeline demos
 
-Five flows. Four publish through a deployed relay into the browser
+Six flows. Five publish through a deployed relay into the browser
 player — CMAF from a file, LOC from a file, OBS over SRT as live
-MPEG-TS, and HLS or DASH from the web — and one consumes an outside
-publisher. Goal for each: stable low latency with the overlay numbers to
+MPEG-TS, HLS or DASH from the web, and LOCMAF from a file — and one
+consumes an outside publisher. Goal for each: stable low latency with the overlay numbers to
 prove it.
 
 Synthetic load, ramps and churn are in
@@ -318,6 +318,27 @@ composition offsets. Needs the `media` extra (Prep).
   segment for four segment durations ends). Encrypted, SegmentBase and
   multi-period DASH and AES-128 HLS are refused; SCTE-35 / `emsg` do not
   pass through.
+
+## Demo F — LOCMAF file → glass (manual checklist)
+LOCMAF (draft-einarsson-moq-locmaf, `locmafVersion` 0.3) carries the same
+CMAF chunks as demo A with each moof as a compact header, a delta of the
+previous one inside a group; the player rebuilds the chunks. Audio from
+`--mp4` rides ~1 s groups, so a late joiner waits up to 1 s for audio.
+- SHELL 1:
+  `python -m aiomoqt.tools.pub_media "$RELAY_WT" --draft 18 -k --pub-both --mp4 "$ASSETS"/bbb-1080p-2500k.mp4 --packaging locmaf --loop --target-latency 200 --keepalive 10 --catalog-interval 1 -t 3600`
+  (`--input URL --packaging locmaf` publishes HLS/DASH the same way).
+- Wire: `python -m aiomoqt.tools.sub_media "$RELAY_WT" -N aiomoqt --discover --draft 18 --packaging locmaf -t 30`
+  → one `video: N frames, 0 rejected` and one `audio: …` line, N > 0.
+- BROWSER, MSE: paste the `player:` URL (`targetLatency=` set from
+  `--target-latency`). WebCodecs: the same URL plus `&locmaf=frame`.
+- BROWSER, Eyevinn's hosted warp-player against the same relay and
+  namespace.
+- Pass: each player ≥ 60 s with no stalls and no gaps.
+- Interop, public endpoint, ask before running:
+  `tests/release_regression_test.py --test-suite media-locmaf` runs
+  sub_media against moqlivemock (`mlm/cmsf/clear` and
+  `mlm/cmsf/drm-cbcs`, raw QUIC and WT, draft 18) and passes only when
+  every LOCMAF track delivers frames with 0 rejected.
 
 ## Reading a stall or a pinned cushion
 - Publisher `lag mean/max ms` per track = how late a frame was against

@@ -24,9 +24,14 @@ from ..types import (
 )
 from ..utils.logger import get_logger
 from .catalog import (
-    Catalog, CATALOG_TRACK_NAME, PACKAGING_CMAF, PACKAGING_LOC,
+    Catalog, CatalogError, CATALOG_TRACK_NAME, MEDIA_PACKAGINGS,
+    PACKAGING_LOC, PACKAGING_LOCMAF,
 )
 from .loc import LocTrackPublisher, LocTrackSubscriber
+from .locmaf import (
+    LocmafError, LocmafTrackSubscriber, SUPPORTED_LOCMAF_VERSIONS,
+    TrackContext,
+)
 
 logger = get_logger(__name__)
 
@@ -308,7 +313,8 @@ class MediaPublisher:
 
 class MediaSubscriber:
     """Consumes an MSF broadcast: reads the catalog track, then
-    subscribes every LOC media track it describes.
+    subscribes every LOC, CMAF and LOCMAF track it describes (a LOCMAF
+    track only with a supported locmafVersion and an init).
 
     on_frame(track_name, frame, group_id, object_id) receives media;
     on_arrival(track_name, msg, recv_us, group_id, subgroup_id, frame)
@@ -420,23 +426,59 @@ class MediaSubscriber:
             self.on_catalog(self.catalog)
         self._have_catalog.set()
 
+    def _locmaf_init(self, entry) -> Optional[bytes]:
+        """The CMAF header of a LOCMAF track this subscriber can decode,
+        else None: a track of an unsupported locmafVersion must not be
+        subscribed."""
+        if entry.locmafVersion not in SUPPORTED_LOCMAF_VERSIONS:
+            logger.warning(f"MediaSubscriber: skipping {entry.name!r} "
+                           f"(locmafVersion={entry.locmafVersion!r})")
+            return None
+        try:
+            init = self.catalog.resolve_init(entry)
+        except CatalogError as e:
+            init = None
+            logger.warning(f"MediaSubscriber: {entry.name!r}: {e}")
+        if init is None:
+            logger.warning(f"MediaSubscriber: skipping {entry.name!r} "
+                           f"(locmaf track without an init)")
+            return None
+        try:
+            TrackContext.from_init(init)
+        except LocmafError as e:
+            logger.warning(f"MediaSubscriber: skipping {entry.name!r}: {e}")
+            return None
+        return init
+
     async def _subscribe_media(self) -> None:
         for entry in list(self.catalog.tracks):
-            if entry.packaging not in (PACKAGING_LOC, PACKAGING_CMAF):
+            if entry.packaging not in MEDIA_PACKAGINGS:
                 logger.info(f"MediaSubscriber: skipping {entry.name!r} "
                             f"(packaging={entry.packaging!r})")
                 continue
-            if entry.name in self.tracks or not self.track_filter(entry):
+            if entry.name in self.tracks:
+                continue
+            init = None
+            if entry.packaging == PACKAGING_LOCMAF:
+                init = self._locmaf_init(entry)
+                if init is None:
+                    continue
+            if not self.track_filter(entry):
                 continue
             name = entry.name
-            sub = LocTrackSubscriber(
-                self.session,
-                entry.namespace or self.namespace, name,
+            callbacks = dict(
                 on_frame=(lambda f, gid, oid, _n=name:
                           self.on_frame and self.on_frame(_n, f, gid, oid)),
                 on_arrival=(lambda m, rx, gid, sg, f, _n=name:
                             self.on_arrival
                             and self.on_arrival(_n, m, rx, gid, sg, f)))
+            namespace = entry.namespace or self.namespace
+            if init is not None:
+                sub = LocmafTrackSubscriber(self.session, namespace, name,
+                                            init=init, **callbacks)
+            else:
+                sub = LocTrackSubscriber(self.session, namespace, name,
+                                         **callbacks)
             if entry.packaging == PACKAGING_LOC:
                 # cmaf init is a CMAF header consumed by the sink, not
                 # decoder extradata — leave config unset there.
