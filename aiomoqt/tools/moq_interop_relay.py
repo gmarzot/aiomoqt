@@ -322,6 +322,8 @@ class _RelayedTrack:
         # (group, subgroup) whose upstream stream ended cleanly; a replay
         # FINs them on the subscriber it serves.
         self._ended = set()
+        # (group, subgroup) whose first upstream object has arrived.
+        self._opened = set()
         # Alias the upstream gave this track. A publisher may reuse one
         # across successive subscriptions on a session it keeps open, so
         # the registrations under it are released when the track ends.
@@ -497,6 +499,14 @@ class _RelayedTrack:
         shape = getattr(msg, "stream_flags", None)
         if isinstance(msg, (ObjectDatagram, ObjectDatagramStatus)):
             shape = ("DGRAM", bool(getattr(msg, "end_of_group", False)))
+        elif isinstance(shape, tuple) and shape:
+            # FIRST_OBJECT holds for the object that opened the upstream
+            # stream only; a downstream stream opened later must not claim it.
+            key = (gid, subgroup_id or 0)
+            if key in self._opened:
+                shape = (False,) + tuple(shape[1:])
+            else:
+                self._opened.add(key)
         self.queue.put_nowait(
             (gid, subgroup_id or 0, msg.object_id,
              bytes(msg.payload), msg.extensions or None,
@@ -561,7 +571,8 @@ class _RelayedTrack:
                 await self._replay(shape)
                 continue
             if oid is not None:
-                self._remember(gid, sgid, oid, payload, exts, prio, status)
+                self._remember(gid, sgid, oid, payload, exts, prio, status,
+                               shape)
             for d in list(self.downstream):
                 if d.replaying:
                     continue
@@ -585,10 +596,12 @@ class _RelayedTrack:
                         ObjectStatus.END_OF_GROUP, ObjectStatus.END_OF_TRACK)):
                     self.end_downstream(d)
 
-    def _remember(self, gid, sgid, oid, payload, exts, prio, status) -> None:
-        """Keep one object for a later FETCH, dropping oldest past the
-        bound."""
-        self._cache.append((gid, sgid, oid, payload, exts, prio, status))
+    def _remember(self, gid, sgid, oid, payload, exts, prio, status,
+                  shape=None) -> None:
+        """Keep one object, with its stream shape or datagram mode, for a
+        later FETCH or replay, dropping oldest past the bound."""
+        self._cache.append((gid, sgid, oid, payload, exts, prio, status,
+                            shape))
         self._cache_bytes += len(payload or b"")
         self.note_largest((gid, oid))
         oldest_kept = gid - CACHE_GROUPS + 1
@@ -599,6 +612,7 @@ class _RelayedTrack:
         if self._cache:
             first = self._cache[0][0]
             self._ended = {k for k in self._ended if k[0] >= first}
+            self._opened = {k for k in self._opened if k[0] >= first}
 
     async def _replay(self, d) -> None:
         """The cached objects inside `d`'s window, in Location order,
@@ -609,10 +623,10 @@ class _RelayedTrack:
         objs = sorted((c for c in self._cache if d.passes(c[0], c[2])),
                       key=lambda c: (c[0], c[1], c[2]))
         try:
-            for gid, sgid, oid, payload, exts, prio, status in objs:
+            for gid, sgid, oid, payload, exts, prio, status, shape in objs:
                 self._objects_out += 1
                 await self._forward_one(d.session, d.alias, gid, sgid, oid,
-                                        payload, exts, prio, status)
+                                        payload, exts, prio, status, shape)
             for gid, sgid in sorted({(c[0], c[1]) for c in objs}):
                 if (gid, sgid) in self._ended:
                     await self._forward_one(d.session, d.alias, gid, sgid,
@@ -639,7 +653,7 @@ class _RelayedTrack:
         """Cached objects within [start, end], each (group, object)
         inclusive; `end` None means to the live edge. Ascending."""
         out = []
-        for gid, sgid, oid, payload, exts, prio, status in self._cache:
+        for gid, sgid, oid, payload, exts, prio, status, _ in self._cache:
             if (gid, oid) < start:
                 continue
             if end is not None and (gid, oid) > end:

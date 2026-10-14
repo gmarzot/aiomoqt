@@ -712,8 +712,13 @@ async def test_an_absolute_start_before_largest_is_served_from_cache(
     # serves what it holds, then what arrives, each object once.
     async with _ahead(_BASE_PORT + 140 + (not use_quic), use_quic, 4) as (
             pub, rx, msgs):
-        got = []
-        rx.on_object_received = lambda m, *_: got.append(bytes(m.payload))
+        got, first = [], {}
+
+        def _on(m, *_):
+            got.append(bytes(m.payload))
+            if m.payload:
+                first[bytes(m.payload)] = bool((m.stream_flags or (0,))[0])
+        rx.on_object_received = _on
         for name, start in (("video", 2), ("audio", 1)):
             await rx.subscribe(_AHEAD_NS, name, forward=1,
                                filter_type=FilterType.ABSOLUTE_START,
@@ -730,6 +735,52 @@ async def test_an_absolute_start_before_largest_is_served_from_cache(
             await asyncio.sleep(0.02)
         await asyncio.sleep(0.1)
         assert sorted(p for p in got if p) == want
+        # §2.2: each stream opens with its subgroup's first object, replayed
+        # or live, so FIRST_OBJECT passes through.
+        assert all(first[p] for p in want), first
+        assert rx._close_err is None
+
+
+@requires_certs
+@pytest.mark.asyncio
+@_TRANSPORTS
+async def test_a_stream_joined_mid_subgroup_does_not_claim_first_object(
+        use_quic):
+    from aiomoqt.messages import SubgroupHeader
+    async with _ahead(_BASE_PORT + 144 + (not use_quic), use_quic, 1) as (
+            pub, rx, msgs):
+        sids = {}
+        for name in ("video", "audio"):
+            sid = sids[name] = await pub.open_uni_stream()
+            hdr = SubgroupHeader(track_alias=msgs[name].track_alias,
+                                 group_id=5, subgroup_id=0,
+                                 publisher_priority=128,
+                                 extensions_present=True, prof=pub._profile)
+            pub.stream_write(sid, hdr.serialize().data)
+            pub.stream_write(sid, hdr.next_object(
+                payload=f"{name}-5.0".encode(), extensions=None,
+                object_id=0).data)
+            sids[name] = (sid, hdr)
+        for _ in range(100):
+            if all(_ahead_track(n).largest == (5, 0) for n in sids):
+                break
+            await asyncio.sleep(0.02)
+        first = {}
+        rx.on_object_received = lambda m, *_: first.setdefault(
+            bytes(m.payload), bool((m.stream_flags or (0,))[0]))
+        for name in sids:
+            await rx.subscribe(_AHEAD_NS, name, forward=1,
+                               filter_type=FilterType.LATEST_OBJECT,
+                               wait_response=True)
+        for name, (sid, hdr) in sids.items():
+            pub.stream_write(sid, hdr.next_object(
+                payload=f"{name}-5.1".encode(), extensions=None,
+                object_id=1).data)
+        for _ in range(100):
+            if len(first) >= 2:
+                break
+            await asyncio.sleep(0.02)
+        assert first == {b"video-5.1": False, b"audio-5.1": False}
         assert rx._close_err is None
 
 

@@ -22,6 +22,9 @@
 - Relay: an AbsoluteStart/AbsoluteRange SUBSCRIBE starting at or before Largest, or a
   SUBSCRIBE_TRACKS offer, gets the cached objects inside its window first, then live ones.
 - Relay: a PUBLISH offered to a SUBSCRIBE_TRACKS subscriber carries LARGEST_OBJECT (§10.2.11).
+- Relay: the cache keeps each object's stream shape and datagram mode, and a replay reuses
+  them; FIRST_OBJECT is set only on a stream that opens with the subgroup's first object, so
+  a subscriber joining mid-subgroup no longer gets it.
 - d20+: SUBSCRIBE and REQUEST_UPDATE carry LOCATION_FILTER, length-prefixed at d20/d21 and
   typed at d22; `subscribe(location_filter=)` sends the forms Filter Type cannot express.
 - d20+: a subscription filter is always valid, and its end stops Objects without
