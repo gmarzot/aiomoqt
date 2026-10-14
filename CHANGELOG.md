@@ -12,7 +12,13 @@
 - Relay: the publisher is raised to Forward State 1 only for a forwarding subscriber (§9.5);
   Largest counts objects received before anyone subscribed (§10.2.11).
 - Relay: `--watchdog SEC` exits on an event-loop stall or failed loopback self-probes, for a
-  supervisor to restart.
+  supervisor to restart; the probe runs in a child process, on the newest draft.
+- Relay: a joining FETCH that arrives before its SUBSCRIBE is attached waits for it (§10.12.2);
+  it was refused with INVALID_JOINING_REQUEST_ID.
+- Relay: Largest includes what the upstream SUBSCRIBE_OK reports, so a track served only by
+  FETCH anchors a joining FETCH; TRACK_STATUS reports Largest at d16 and d18.
+- `SubscribedTrack.largest`: the Largest Location the publisher reported in SUBSCRIBE_OK or
+  PUBLISH.
 - Fix: d14 `publish_namespace_done(namespace="a/b")` raised TypeError encoding the string.
 - Fix: a publisher writing as its WebTransport stream or session is torn down ends through
   cancellation; it died with an unretrieved `ConnectionError`.
