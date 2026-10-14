@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+- Agent `WriteStats.sent` counts objects written to each peer, not objects queued: nothing for a
+  peer that is paused, filtered out or shed. `FanoutDelivery.on_sent` reports each one.
+- Agent `PublishSpec.announce` (the default) announces the track's namespace once per session,
+  shared by its writers, and serves SUBSCRIBEs for the track; `announce=False` sends a bare
+  PUBLISH. `AgentSession.close()` withdraws the namespaces after the writers' PUBLISH_DONE.
+- `session.is_announced(namespace)`; a refused PUBLISH_NAMESPACE no longer counts as announced.
+- Fix: d14 `publish_namespace_done()` takes a `/`-separated namespace; it raised TypeError.
+- `session.fetch(on_object=)` routes that FETCH's objects to its own handler ahead of
+  `on_fetch_object`, until its stream ends or the FETCH is refused.
+- `AgentSession.fetch(FetchSpec)` returns a reader over the range that is done when the fetch
+  stream ends; several can run at once on one session.
+- `session.subscribe(on_object=, on_done=)` registers a subscription's object and PUBLISH_DONE
+  handlers before SUBSCRIBE is sent; the object handler binds to its alias as SUBSCRIBE_OK is
+  parsed, and a refusal or an abandoned wait drops both.
+- An agent `Reader` is done once PUBLISH_DONE has arrived and the streams it counts have ended,
+  or after `PUBLISH_DONE_GRACE_S`; `Reader.ended` says which. Status objects no longer reach reads.
+- Agent `Obj.value` decodes the payload as the spec's `decode` asks (bytes, UTF-8 text, JSON); a
+  payload that does not decode raises `DecodeError`, and `Obj.payload` keeps the bytes.
+- `AgentSession` raises `Unsupported` for spec values it would otherwise ignore: `TrackRef.relay`,
+  a non-zero `delivery_timeout_ms`, a subscriber priority or group order on a publication, a
+  publisher priority on a subscription, and reader `on_full` `block` or `error`.
+- Fix: an agent `Writer` that drops a group's first object (`drop_new`, `drop_oldest`) drops the
+  rest of that group; its later objects went out on the previous group's stream.
+- Fix: agent `Writer.flush()` without `timeout=` waits the default deadline; it raised
+  AttributeError.
+- Fix: agent `Writer.close()` returns on a full queue, once production has ended; a write still
+  waiting for room raises.
+- Fix: concurrent writes on one agent `Writer` queue in the order they are numbered.
+- Fix: `AgentSession` refuses new work as soon as `close()` starts.
 - Fix: a publisher writing as its WebTransport stream or session is torn down ends through
   cancellation; it died with an unretrieved `ConnectionError`.
 - A session's `auth_token_validator(token, msg)` refuses a d16+ peer request with the
