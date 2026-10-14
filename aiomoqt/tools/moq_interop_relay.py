@@ -1125,7 +1125,6 @@ def parse_args():
                         default=parse_draft_spec(_RELAY_DRAFT_DEFAULT),
                         help="MoQT draft(s) to serve: a single draft confines "
                              "negotiation to it; a list offers all of them. "
-                             "20, 21 and 22 are served only when listed. "
                              "Default from $DRAFT / $MOQT_DRAFT, else 14,16,18.")
     parser.add_argument("--upstream", action="append", default=[],
                         metavar="URL",
