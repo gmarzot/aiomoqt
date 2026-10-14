@@ -194,6 +194,44 @@ async def test_subscribe_two_tracks(draft, use_quic):
             rx.check(ok.track_alias, name)
 
 
+@_TRANSPORTS
+async def test_subscribe_routes_objects_and_done_per_request(use_quic):
+    """subscribe(on_object=, on_done=) at d22: each of two tracks' objects
+    and its PUBLISH_DONE reach that subscription's own handlers."""
+    async with _loopback(_port(34, use_quic), 22, use_quic) as (session, srv):
+        tracks = [_track(session, name) for name in _NAMES]
+        for track in tracks:
+            track.attach()
+        got = {name: [] for name in _NAMES}
+        done = {name: asyncio.get_running_loop().create_future()
+                for name in _NAMES}
+
+        def on_object(name):
+            def cb(obj, _size, _ts, group_id, _subgroup_id):
+                if obj.payload:
+                    got[name].append(
+                        (group_id, obj.object_id, bytes(obj.payload)))
+            return cb
+
+        oks = {}
+        for name in _NAMES:
+            oks[name] = await srv.subscribe(
+                _NS, name, forward=1, wait_response=True,
+                on_object=on_object(name), on_done=done[name].set_result)
+        assert len({ok.track_alias for ok in oks.values()}) == 2
+        for track in tracks:
+            track.go.set()
+        for name in _NAMES:
+            status = await asyncio.wait_for(done[name], 5)
+            assert status.request_id == oks[name].request_id
+            assert status.stream_count == len(_GROUPS)
+        assert await _until(lambda: all(
+            len(got[name]) >= _EXPECTED for name in _NAMES))
+        for name in _NAMES:
+            assert sorted(got[name]) == [
+                (g, o, _payload(name, g, o)) for g in _GROUPS for o in _OBJECTS]
+
+
 # -- PUBLISH-initiated -----------------------------------------------------
 
 @_TRANSPORTS
