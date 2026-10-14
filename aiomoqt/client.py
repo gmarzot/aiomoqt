@@ -268,6 +268,12 @@ class MOQTClient(MOQTPeer):
                     await asyncio.wait_for(session.wait_closed(), 0.3)
             except Exception:
                 pass
+            # Releases the transport's event dispatcher, which otherwise
+            # holds the transport, its rings and its wake fd.
+            try:
+                await session.detach()
+            except Exception:
+                pass
             try:
                 transport.stop()
             except Exception:

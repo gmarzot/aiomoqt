@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- aiopquic floor `>=0.5.0a4`.
+- Fix: a WebTransport client connection releases its transport's event dispatcher on exit; each
+  one kept its transport, rings and wake fd.
 - d20+: SUBSCRIBE and REQUEST_UPDATE carry LOCATION_FILTER, length-prefixed at d20/d21 and
   typed at d22; `subscribe(location_filter=)` sends the forms Filter Type cannot express.
 - d20+: a subscription filter is always valid, and its end stops Objects without
