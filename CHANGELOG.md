@@ -13,6 +13,78 @@
 - `sub_media --analyze` counts the bytes on the wire.
 - `LocTrackPublisher._package()` and `LocTrackSubscriber._unpackage()` hooks for packagers.
 - Regression: manual suite `media-locmaf` against Eyevinn's moqlivemock.
+- d20+: SUBSCRIBE and REQUEST_UPDATE carry LOCATION_FILTER, length-prefixed at d20/d21 and
+  typed at d22; `subscribe(location_filter=)` sends the forms Filter Type cannot express.
+- d20+: a subscription filter is always valid, and its end stops Objects without
+  PUBLISH_DONE; `subscribe_done()` defaults to TRACK_ENDED, SUBSCRIPTION_ENDED being gone.
+- d20+: PUBLISH_OK carries only EXPIRES; `publish_ok()` sends the changed FORWARD, priority
+  and filter in a REQUEST_UPDATE, and `SubscribedTrack` accepts a PUBLISH through it.
+- d20+: a PUBLISH answering the peer's SUBSCRIBE_TRACKS carries its FORWARD (1 when absent)
+  and subscription parameters, never its AUTHORIZATION TOKEN; a REQUEST_UPDATE of FORWARD
+  applies to later PUBLISHes.
+- d20+: a REQUEST_UPDATE from an endpoint that may not update the request, or with a
+  parameter its request type does not allow, closes with PROTOCOL_VIOLATION; so does a
+  REQUEST_OK parameter outside its request's list and a PUBLISH_STATE_NOTIFY from the
+  subscriber.
+- d20+: REQUEST_UPDATE replies are matched in order, and `request_update()` stays within
+  the peer's MAX_REQUEST_UPDATES.
+- d20+: Range Filters are refused with INVALID_FILTER (no MAX_FILTER_RANGES is sent) and
+  not sent past the peer's MAX_FILTER_RANGES.
+- d20+: FILL_PARAMETERS on a track with Objects opens a fill fetch stream and resets it,
+  counted in PUBLISH_DONE; the subscription continues.
+- d20+: a second SUBSCRIBE to a track on one session is refused NOT_SUPPORTED;
+  DUPLICATE_SUBSCRIPTION no longer exists.
+- d20+: FETCH is not implemented: `fetch()`, `joining_fetch()` and `join()` raise
+  NOT_SUPPORTED, and a peer's FETCH is answered REQUEST_ERROR NOT_SUPPORTED.
+- d20+: no END_OF_GROUP past a filter's End Object; GOAWAY carries no Request ID.
+- `aiomoqt.messages.params`: the d18, d20/d21 and d22 Message Parameter tables, the
+  LOCATION_FILTER and Range Filter codecs, and FILL_PARAMETERS.
+- d20+ message shapes: PUBLISH_OK, FETCH, FETCH_OK (inclusive End), PUBLISH_DONE codes,
+  GOAWAY, End of Timed-Out Range; `PublishSkipped` names d18's PUBLISH_BLOCKED.
+- Tools: `--draft 20|21|22` (or a list such as `22,21,20,18`) on pub_bench, sub_bench,
+  relay_probe, moq_interop_client, pub_server and moq_interop_relay; defaults unchanged.
+- Sessions complete SETUP at d20, d21 and d22 over raw QUIC (ALPN `moqt-20`/`-21`/`-22`) and
+  WebTransport (WT-Protocol), with the draft settled from the negotiation on both ends.
+- d20+: PUBLISH_STATE_NOTIFY is received and logged; the peer's MAX_REQUEST_UPDATES and
+  MAX_FILTER_RANGES are recorded.
+- Fix: the control-message TX guard refuses to send on a draft without a type table.
+- `aiomoqt.messages.d20`: SETUP with the d20 Setup Options (adds MAX_FILTER_RANGES 0x06 and
+  MAX_REQUEST_UPDATES 0x08), unknown options ignored, and PUBLISH_STATE_NOTIFY (0x22).
+- Drafts 20, 21 and 22 are `MOQTDraft` members, opt-in: the default offer stays 18, 16, 14
+  (`MOQT_DEFAULT_DRAFTS`).
+- `DraftProfile` rows for d20/d21 (one shape) and d22, with `location_filter_typed` and
+  `relay_forwards_publish_namespace`.
+- Fix: `wire_control_type` and `profile_for` raise for a draft without a table; PUBLISH_OK
+  fell back to 0x1E, reserved from d20.
+- Agent `WriteStats.sent` counts objects written to each peer, not objects queued: nothing for a
+  peer that is paused, filtered out or shed. `FanoutDelivery.on_sent` reports each one.
+- Agent `PublishSpec.announce` (the default) announces the track's namespace once per session,
+  shared by its writers, and serves SUBSCRIBEs for the track; `announce=False` sends a bare
+  PUBLISH. `AgentSession.close()` withdraws the namespaces after the writers' PUBLISH_DONE.
+- `session.is_announced(namespace)`; a refused PUBLISH_NAMESPACE no longer counts as announced.
+- Fix: d14 `publish_namespace_done()` takes a `/`-separated namespace; it raised TypeError.
+- `session.fetch(on_object=)` routes that FETCH's objects to its own handler ahead of
+  `on_fetch_object`, until its stream ends or the FETCH is refused.
+- `AgentSession.fetch(FetchSpec)` returns a reader over the range that is done when the fetch
+  stream ends; several can run at once on one session.
+- `session.subscribe(on_object=, on_done=)` registers a subscription's object and PUBLISH_DONE
+  handlers before SUBSCRIBE is sent; the object handler binds to its alias as SUBSCRIBE_OK is
+  parsed, and a refusal or an abandoned wait drops both.
+- An agent `Reader` is done once PUBLISH_DONE has arrived and the streams it counts have ended,
+  or after `PUBLISH_DONE_GRACE_S`; `Reader.ended` says which. Status objects no longer reach reads.
+- Agent `Obj.value` decodes the payload as the spec's `decode` asks (bytes, UTF-8 text, JSON); a
+  payload that does not decode raises `DecodeError`, and `Obj.payload` keeps the bytes.
+- `AgentSession` raises `Unsupported` for spec values it would otherwise ignore: `TrackRef.relay`,
+  a non-zero `delivery_timeout_ms`, a subscriber priority or group order on a publication, a
+  publisher priority on a subscription, and reader `on_full` `block` or `error`.
+- Fix: an agent `Writer` that drops a group's first object (`drop_new`, `drop_oldest`) drops the
+  rest of that group; its later objects went out on the previous group's stream.
+- Fix: agent `Writer.flush()` without `timeout=` waits the default deadline; it raised
+  AttributeError.
+- Fix: agent `Writer.close()` returns on a full queue, once production has ended; a write still
+  waiting for room raises.
+- Fix: concurrent writes on one agent `Writer` queue in the order they are numbered.
+- Fix: `AgentSession` refuses new work as soon as `close()` starts.
 - Fix: a publisher writing as its WebTransport stream or session is torn down ends through
   cancellation; it died with an unretrieved `ConnectionError`.
 - A session's `auth_token_validator(token, msg)` refuses a d16+ peer request with the

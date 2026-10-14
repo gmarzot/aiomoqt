@@ -83,7 +83,11 @@ class TestPublishedTrack:
         pub_response = MagicMock()
         pub_response.track_alias = track_alias
         pub_response.request_id = request_id
-        session.publish = MagicMock(return_value=pub_response)
+
+        def publish(**kwargs):
+            pub_response.forward = kwargs.get('forward')
+            return pub_response
+        session.publish = MagicMock(side_effect=publish)
         session.register_handler = MagicMock()
         return session
 

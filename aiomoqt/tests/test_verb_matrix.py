@@ -56,6 +56,10 @@ def _session(draft, is_client=True):
     s._bidi_streams = {7: 9}
     s._bidi_stream_requests = {9: 7}
     s._tx_updates = {}
+    s._subscribe_tracks_params = {}
+    s._request_kinds = {}
+    s._peer_max_request_updates = 0
+    s._peer_max_filter_ranges = 0
     s._request_cancel_handlers = {}
     s._publish_done_handlers = {}
     s._peer_request_max = -1
@@ -129,10 +133,10 @@ MATRIX = [
      lambda s: s.unsubscribe(request_id=7)),
     ("unsubscribe@18", (18,), "reset",
      lambda s: s.unsubscribe(request_id=7)),
-    # NOTE: str tuples crash serialize here (API wart — tuple input
-    # bypasses _make_namespace_tuple); bytes required.
     ("publish_namespace_done@14", (14,), "control",
      lambda s: s.publish_namespace_done(namespace=(b"a",))),
+    ("publish_namespace_done@14-str", (14,), "control",
+     lambda s: s.publish_namespace_done(namespace="a/b")),
     ("publish_namespace_done", (16,), "control",
      lambda s: s.publish_namespace_done(request_id=7)),
     ("publish_namespace_done@18", (18,), "reset",

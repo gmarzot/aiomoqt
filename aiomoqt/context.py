@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from aiomoqt.types import MOQTDraft, ParamType
 
@@ -67,6 +67,37 @@ class DraftProfile:
     object_statuses: frozenset = frozenset({0x0, 0x3, 0x4})
                                   # Object Status values the draft defines;
                                   # d14 also has DOES_NOT_EXIST 0x1.
+    param_table: int = 18
+                                  # Message Parameter registry and scopes in
+                                  # messages/params.py: 18, 20 (d20/d21), 22.
+                                  # Consulted from d18 on.
+    location_filter_typed: bool = False
+                                  # d22 LOCATION_FILTER (0x21) leads with a
+                                  # Location Filter Type instead of a Length.
+    relay_forwards_publish_namespace: bool = True
+                                  # a relay forwards PUBLISH_NAMESPACE
+                                  # downstream; d22 stops it.
+    publish_ok_expires_only: bool = False
+                                  # d20+ PUBLISH_OK carries only EXPIRES; the
+                                  # subscription parameters ride REQUEST_UPDATE.
+    publish_done_subscription_ended: bool = True
+                                  # PUBLISH_DONE SUBSCRIPTION_ENDED (0x3)
+                                  # exists; d20 removed it.
+    goaway_request_id: bool = True
+                                  # d18 GOAWAY may end with a Request ID; d20
+                                  # removed it.
+    fetch_location_filter: bool = False
+                                  # d20+ FETCH has no Fetch Type, Start or End
+                                  # and no Joining form: the range rides
+                                  # LOCATION_FILTER, and End Location is
+                                  # inclusive in FETCH and FETCH_OK.
+    fetch_timed_out_range: bool = False
+                                  # d20+ FETCH stream End of Timed-Out Range
+                                  # marker (0x20C).
+    fetch_object_status: bool = True
+                                  # A zero Payload Length in a FETCH object is
+                                  # followed by an Object Status (moxygen's
+                                  # d16/d18 reading); d20 defines none.
 
     @property
     def vi64(self) -> bool:
@@ -109,7 +140,33 @@ PROFILES = {
         subgroup_type_mask=0x6F),
 }
 
+# draft-20 and draft-21 share one wire; d22 differs only in its switches.
+# Every column not named here keeps the d18 value.
+_D20 = replace(
+    PROFILES[MOQTDraft.DRAFT_18], draft=MOQTDraft.DRAFT_20,
+    param_table=20,
+    publish_ok_expires_only=True,
+    publish_done_subscription_ended=False,
+    goaway_request_id=False,
+    fetch_location_filter=True,
+    fetch_timed_out_range=True,
+    fetch_object_status=False)
+PROFILES[MOQTDraft.DRAFT_20] = _D20
+PROFILES[MOQTDraft.DRAFT_21] = replace(_D20, draft=MOQTDraft.DRAFT_21)
+PROFILES[MOQTDraft.DRAFT_22] = replace(
+    _D20, draft=MOQTDraft.DRAFT_22,
+    param_table=22,
+    location_filter_typed=True,
+    relay_forwards_publish_namespace=False)
+
 
 def profile_for(draft: int) -> DraftProfile:
-    """DraftProfile for a draft number or version code (normalized)."""
-    return PROFILES[get_major_version(draft)]
+    """DraftProfile for a draft number or version code (normalized).
+    Raises ValueError for a draft without a profile."""
+    major = get_major_version(draft)
+    try:
+        return PROFILES[major]
+    except KeyError:
+        raise ValueError(
+            f"MoQT draft-{major} is not supported; "
+            f"known drafts: {sorted(int(d) for d in PROFILES)}") from None
