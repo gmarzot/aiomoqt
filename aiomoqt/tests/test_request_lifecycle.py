@@ -410,6 +410,7 @@ def _routed_session(draft):
     s._publish_done_handlers = {}
     s._fetch_object_handlers = {}
     s._object_handlers = {}
+    s._reset_early_objects()
     s._subscriptions = {}
     s._unbound_aliases = {}
     s._unbound_escalated = set()
