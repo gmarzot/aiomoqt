@@ -69,6 +69,7 @@ from aiomoqt.messages.data import (FetchObject, ObjectDatagram,
 from aiomoqt.messages.fetch import _is_joining
 from aiomoqt.messages.publish import PublishOk
 from aiomoqt.messages.request import RequestError, RequestOk
+from aiomoqt.messages.subscribe import Subscribe
 from aiomoqt.track import (PublishedTrack, SubscribedTrack, _UNFILTERED,
                            _filter_window, _largest_object_param)
 from aiomoqt.context import is_draft16_or_later
@@ -124,6 +125,8 @@ RENDEZVOUS_TIMEOUT = 0x04
 RENDEZVOUS_MAX_S = 30.0
 # Watchdog: self-probes failed in a row before exiting, the exit status
 # (EX_SOFTWARE), and the longest one probe may take.
+# Longest a joining FETCH waits for the SUBSCRIBE it names to attach.
+JOINING_WAIT_S = 5.0
 WATCHDOG_MISSES = 3
 WATCHDOG_EXIT = 70
 WATCHDOG_PROBE_S = 10.0
@@ -869,6 +872,27 @@ def _joined_subscription(session, request_id):
     return None
 
 
+def _subscribe_pending(session, request_id) -> bool:
+    """The peer's SUBSCRIBE `request_id` is admitted and unanswered."""
+    held = getattr(session, "_peer_requests", {}).get(request_id)
+    return held is not None and held[0] is Subscribe
+
+
+async def _await_joined(session, request_id):
+    """§10.12.2: hold a joining FETCH until the SUBSCRIBE it names is
+    attached. None once that SUBSCRIBE is gone, the session closes, or
+    JOINING_WAIT_S passes."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + JOINING_WAIT_S
+    while (_subscribe_pending(session, request_id)
+           and _session_live(session) and loop.time() < deadline):
+        await asyncio.sleep(0.02)
+        found = _joined_subscription(session, request_id)
+        if found is not None:
+            return found
+    return None
+
+
 def _upstream_done(track, key, done) -> None:
     """Upstream ended the track: FIN downstream streams, PUBLISH_DONE
     each subscriber, and drop the fan-out so a later SUBSCRIBE starts a
@@ -1422,6 +1446,8 @@ async def _on_fetch(session, msg):
         # §10.12.2: namespace, track and End Location come from the
         # associated subscription, so the backfill is contiguous with it.
         found = _joined_subscription(session, msg.joining_request_id)
+        if found is None:
+            found = await _await_joined(session, msg.joining_request_id)
         if found is None:
             logger.info(f"relay: joining FETCH for unknown subscription "
                         f"{msg.joining_request_id}")

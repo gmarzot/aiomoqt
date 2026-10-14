@@ -14,6 +14,7 @@ import pytest
 from aiomoqt.context import profile_for
 from aiomoqt.messages.data import FetchObject
 from aiomoqt.messages.fetch import Fetch
+from aiomoqt.messages.subscribe import Subscribe
 from aiomoqt.protocol import _MOQTSessionMixin
 from aiomoqt.tools import moq_interop_relay as relay
 from aiomoqt.types import GroupOrder, RequestErrorCode
@@ -117,6 +118,43 @@ def test_joining_fetch_without_an_anchor_is_refused():
                                           joining_request_id=7,
                                           joining_start=2)))
     assert s._errors[0][0] == int(RequestErrorCode.INVALID_RANGE)
+
+
+def test_a_joining_fetch_is_held_until_its_subscribe_attaches():
+    # §10.12.2: sent right behind its SUBSCRIBE, it waits for it.
+    key = ((b"live",), b"cam")
+    s = _session()
+    s._peer_requests = {7: (Subscribe, key)}
+    t = _track([(g, 0) for g in range(3)])
+    relay._tracks[key] = t
+
+    async def _run():
+        fetch = asyncio.create_task(relay._on_fetch(s, _fetch(
+            fetch_type=RELATIVE_JOINING, namespace=None, track_name=None,
+            joining_request_id=7, joining_start=1)))
+        await asyncio.sleep(0.1)
+        assert not fetch.done()
+        _join(t, s, 7)
+        await asyncio.wait_for(fetch, 2.0)
+    asyncio.run(_run())
+    assert s._errors == []
+    served, _ = s._served[0]
+    assert {o.group_id for o in served} == {1, 2}
+
+
+def test_a_joining_fetch_whose_subscribe_never_attaches_is_refused(
+        monkeypatch):
+    monkeypatch.setattr(relay, "JOINING_WAIT_S", 0.2)
+    key = ((b"live",), b"cam")
+    s = _session()
+    s._peer_requests = {7: (Subscribe, key)}
+    relay._tracks[key] = _track([(0, 0)])
+    asyncio.run(relay._on_fetch(s, _fetch(fetch_type=RELATIVE_JOINING,
+                                          namespace=None, track_name=None,
+                                          joining_request_id=7,
+                                          joining_start=1)))
+    assert s._errors[0][0] == int(
+        RequestErrorCode.INVALID_JOINING_REQUEST_ID)
 
 
 def test_joining_fetch_on_a_forward_0_subscription_is_refused():
