@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+- d20+: SUBSCRIBE and REQUEST_UPDATE carry LOCATION_FILTER, length-prefixed at d20/d21 and
+  typed at d22; `subscribe(location_filter=)` sends the forms Filter Type cannot express.
+- d20+: a subscription filter is always valid, and its end stops Objects without
+  PUBLISH_DONE; `subscribe_done()` defaults to TRACK_ENDED, SUBSCRIPTION_ENDED being gone.
+- d20+: PUBLISH_OK carries only EXPIRES; `publish_ok()` sends the changed FORWARD, priority
+  and filter in a REQUEST_UPDATE, and `SubscribedTrack` accepts a PUBLISH through it.
+- d20+: a PUBLISH answering the peer's SUBSCRIBE_TRACKS carries its FORWARD (1 when absent)
+  and subscription parameters, never its AUTHORIZATION TOKEN; a REQUEST_UPDATE of FORWARD
+  applies to later PUBLISHes.
+- d20+: a REQUEST_UPDATE from an endpoint that may not update the request, or with a
+  parameter its request type does not allow, closes with PROTOCOL_VIOLATION; so does a
+  REQUEST_OK parameter outside its request's list and a PUBLISH_STATE_NOTIFY from the
+  subscriber.
+- d20+: REQUEST_UPDATE replies are matched in order, and `request_update()` stays within
+  the peer's MAX_REQUEST_UPDATES.
+- d20+: Range Filters are refused with INVALID_FILTER (no MAX_FILTER_RANGES is sent) and
+  not sent past the peer's MAX_FILTER_RANGES.
+- d20+: FILL_PARAMETERS on a track with Objects opens a fill fetch stream and resets it,
+  counted in PUBLISH_DONE; the subscription continues.
+- d20+: a second SUBSCRIBE to a track on one session is refused NOT_SUPPORTED;
+  DUPLICATE_SUBSCRIPTION no longer exists.
+- d20+: FETCH is not implemented: `fetch()`, `joining_fetch()` and `join()` raise
+  NOT_SUPPORTED, and a peer's FETCH is answered REQUEST_ERROR NOT_SUPPORTED.
+- d20+: no END_OF_GROUP past a filter's End Object; GOAWAY carries no Request ID.
+- `aiomoqt.messages.params`: the d18, d20/d21 and d22 Message Parameter tables, the
+  LOCATION_FILTER and Range Filter codecs, and FILL_PARAMETERS.
+- d20+ message shapes: PUBLISH_OK, FETCH, FETCH_OK (inclusive End), PUBLISH_DONE codes,
+  GOAWAY, End of Timed-Out Range; `PublishSkipped` names d18's PUBLISH_BLOCKED.
 - Tools: `--draft 20|21|22` (or a list such as `22,21,20,18`) on pub_bench, sub_bench,
   relay_probe, moq_interop_client, pub_server and moq_interop_relay; defaults unchanged.
 - Sessions complete SETUP at d20, d21 and d22 over raw QUIC (ALPN `moqt-20`/`-21`/`-22`) and

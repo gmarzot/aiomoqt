@@ -97,7 +97,7 @@ class DraftProfile:
     fetch_object_status: bool = True
                                   # A zero Payload Length in a FETCH object is
                                   # followed by an Object Status (moxygen's
-                                  # d16/d18 reading); d20+ peers send none.
+                                  # d16/d18 reading); d20 defines none.
 
     @property
     def vi64(self) -> bool:

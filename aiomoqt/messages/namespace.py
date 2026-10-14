@@ -327,7 +327,7 @@ class PublishBlocked(MOQTMessage):
         return cls(namespace_suffix=namespace_suffix, track_name=track_name)
 
 
-# d19 renamed PUBLISH_BLOCKED to PUBLISH_SKIPPED; the wire is unchanged.
+# PUBLISH_SKIPPED (d19+) is PUBLISH_BLOCKED on the wire.
 PublishSkipped = PublishBlocked
 
 
