@@ -1529,6 +1529,15 @@ class PublishedTrack(Track):
         self.state = TrackState.CLOSED
 
 
+def _reported_largest(msg) -> Optional[tuple]:
+    """(group, object) a SUBSCRIBE_OK or PUBLISH reports, else None."""
+    if not getattr(msg, 'content_exists', 0):
+        return None
+    group = getattr(msg, 'largest_group_id', None)
+    obj = getattr(msg, 'largest_object_id', None)
+    return None if group is None or obj is None else (group, obj)
+
+
 class SubscribedTrack(Track):
     """Subscriber-side track — discovers and subscribes to a published track.
 
@@ -1549,6 +1558,9 @@ class SubscribedTrack(Track):
         self.auth_token = auth_token
         self.publish_done: Optional[object] = None  # received PUBLISH_DONE
         self.completed = False  # True if track ended cleanly
+        # Largest Location the publisher reported in SUBSCRIBE_OK or
+        # PUBLISH, as (group, object); None when it reported none.
+        self.largest: Optional[tuple] = None
         self._done_event = asyncio.Event()
 
     async def subscribe(self, timeout: float = 30.0,
@@ -1601,6 +1613,7 @@ class SubscribedTrack(Track):
                 parameters=params,
                 wait_response=True,
             )
+            self.largest = _reported_largest(ok)
             # Publisher's SUBSCRIBE_OK alias is authoritative (the
             # discovery path gets it from PUBLISH instead).
             if getattr(ok, 'track_alias', None) is not None:
@@ -1683,6 +1696,7 @@ class SubscribedTrack(Track):
             )
             print(f"  Discovered: {self.fqtn}")
 
+        self.largest = _reported_largest(pub_msg)
         # Register track_alias so incoming data streams pass admission.
         if hasattr(pub_msg, 'track_alias'):
             self.track_alias = pub_msg.track_alias

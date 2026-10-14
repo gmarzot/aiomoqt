@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- Relay: a d18 PUBLISH_NAMESPACE cancelled by its stream, or a d16 PUBLISH_NAMESPACE_DONE
+  naming only the request, withdraws the namespace and sends NAMESPACE_DONE.
+- Relay: a namespace element containing "/" stays one element; it was split upstream and in
+  PUBLISH offers.
+- Relay: Forward State and the subscription filter apply per subscriber and REQUEST_UPDATE
+  changes them; an AbsoluteRange ends with PUBLISH_DONE SUBSCRIPTION_ENDED, or INVALID_RANGE
+  when its End Group is already published.
+- Relay: the publisher is raised to Forward State 1 only for a forwarding subscriber (§9.5);
+  Largest counts objects received before anyone subscribed (§10.2.11).
+- Relay: `--watchdog SEC` exits on an event-loop stall or failed loopback self-probes, for a
+  supervisor to restart; the probe runs in a child process, on the newest draft.
+- Relay: a joining FETCH that arrives before its SUBSCRIBE is attached waits for it (§10.12.2);
+  it was refused with INVALID_JOINING_REQUEST_ID.
+- Relay: Largest includes what the upstream SUBSCRIBE_OK reports, so a track served only by
+  FETCH anchors a joining FETCH; TRACK_STATUS reports Largest at d16 and d18.
+- `SubscribedTrack.largest`: the Largest Location the publisher reported in SUBSCRIBE_OK or
+  PUBLISH.
+- Relay: an AbsoluteStart/AbsoluteRange SUBSCRIBE starting at or before Largest, or a
+  SUBSCRIBE_TRACKS offer, gets the cached objects inside its window first, then live ones.
+- Relay: a PUBLISH offered to a SUBSCRIBE_TRACKS subscriber carries LARGEST_OBJECT (§10.2.11).
+- Relay: the cache keeps each object's stream shape and datagram mode, and a replay reuses
+  them; FIRST_OBJECT is set only on a stream that opens with the subgroup's first object, so
+  a subscriber joining mid-subgroup no longer gets it.
 - Session: objects for a track alias not bound yet are held (bounded) and replayed on binding.
 - LOCMAF packaging (draft-einarsson-moq-locmaf, `locmafVersion` 0.3; a port of Eyevinn/locmaf
   v0.1.1): `aiomoqt.media.locmaf`, `LocmafTrackPublisher`, `LocmafTrackSubscriber`.
