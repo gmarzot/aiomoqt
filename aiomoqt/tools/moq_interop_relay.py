@@ -851,6 +851,8 @@ async def _establish_upstream(ns, track_name):
             continue
         track.upstream = upstream
         track.upstream_alias = upstream.track_alias
+        # §10.2.11: Largest includes what the upstream SUBSCRIBE_OK reports.
+        track.note_largest(upstream.largest)
         pub.register_stream_end_handler(upstream.track_alias,
                                         track.on_stream_end)
         _tracks[key] = track
@@ -1648,10 +1650,9 @@ async def _on_track_status(session, msg):
         )
         session._send_reply(msg.request_id, err, fin=True)
         return
-    params = {}
-    largest = getattr(track.upstream, "_largest", None)
-    if largest and session._profile.draft >= 18:
-        params[ParamType.LARGEST_OBJECT] = (largest[0], largest[1])
+    largest = track.largest
+    params = ({} if largest is None
+              else _largest_object_param(session, largest))
     logger.info(f"relay: track-status ns={ns} track={msg.track_name} "
                 f"-> OK largest={largest}")
     ok = RequestOk(request_id=msg.request_id, parameters=params)

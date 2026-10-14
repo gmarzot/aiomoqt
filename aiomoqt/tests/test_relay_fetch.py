@@ -7,17 +7,24 @@ rejects what it cannot serve: joining FETCH (no history), an unknown
 track, a range it no longer holds.
 """
 import asyncio
+import contextlib
 from types import SimpleNamespace
 
 import pytest
 
+from aiomoqt.client import MOQTClient
 from aiomoqt.context import profile_for
 from aiomoqt.messages.data import FetchObject
 from aiomoqt.messages.fetch import Fetch
 from aiomoqt.messages.subscribe import Subscribe
 from aiomoqt.protocol import _MOQTSessionMixin
 from aiomoqt.tools import moq_interop_relay as relay
-from aiomoqt.types import GroupOrder, RequestErrorCode
+from aiomoqt.track import PublishedTrack
+from aiomoqt.types import (FilterType, GroupOrder, ParamType,
+                           RequestErrorCode)
+from aiomoqt.utils.buffer import Buffer
+
+from aiomoqt.tests._certs import CERT, KEY, requires_certs
 
 STANDALONE, RELATIVE_JOINING = 0x1, 0x2
 
@@ -319,3 +326,84 @@ def test_range_inside_the_cache_is_served_from_it(monkeypatch):
     asyncio.run(relay._on_fetch(s, _fetch(start_group=4, start_object=0)))
     served, _ = s._served[0]
     assert [o.group_id for o in served] == [4, 5]
+
+
+# -- end to end: a catalog served only by FETCH, through the relay --------
+
+_E2E_PORT = 16640
+_NS = "relay/catalogs"
+_SIZES = {"cat-a": 120, "cat-b": 60}
+_GROUP = 3
+
+
+class _FetchOnly(PublishedTrack):
+    """History and a Largest Location, nothing sent on a subscription."""
+
+    async def _start_generating(self, session, trigger):
+        return None
+
+
+def _param_largest(msg):
+    raw = (msg.parameters or {}).get(ParamType.LARGEST_OBJECT)
+    if raw is None or isinstance(raw, tuple):
+        return raw
+    buf = Buffer(data=raw)
+    return (buf.pull_vint(), buf.pull_vint())
+
+
+@contextlib.asynccontextmanager
+async def _catalog_relay(port, use_quic, draft):
+    """A relay; a publisher announcing two fetch-only tracks; a
+    subscriber session. Yields the subscriber."""
+    server = relay._build_server("localhost", port, CERT, KEY,
+                                 use_quic=use_quic, draft=draft)
+    handle = await server.serve()
+    try:
+        async with contextlib.AsyncExitStack() as stack:
+            sessions = []
+            for _ in range(2):
+                client = MOQTClient("localhost", port, path="/",
+                                    use_quic=use_quic, verify_tls=False,
+                                    supported_drafts=draft)
+                s = await stack.enter_async_context(client.connect())
+                await s.client_session_init()
+                sessions.append(s)
+            pub, sub = sessions
+            for name, size in _SIZES.items():
+                track = _FetchOnly(pub, namespace=_NS, trackname=name,
+                                   object_size=size, group_size=_GROUP)
+                track.prefill(1)
+                track.attach()
+            await pub.publish_namespace(namespace=_NS, wait_response=True)
+            yield sub
+    finally:
+        handle.close()
+
+
+@requires_certs
+@pytest.mark.parametrize("draft", [16, 18])
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+async def test_a_fetch_only_track_is_served_through_the_relay(draft,
+                                                              use_quic):
+    # The G5 catalog: SUBSCRIBE with a joining FETCH right behind it; the
+    # publisher sends nothing on the subscription, so the relay anchors
+    # the FETCH on the upstream SUBSCRIBE_OK's Largest and fetches upstream.
+    port = _E2E_PORT + 2 * (draft == 18) + (not use_quic)
+    got = {}
+    async with _catalog_relay(port, use_quic, draft) as rx:
+        rx.on_fetch_object = lambda obj, _n, _ts, rid: got.setdefault(
+            rid, []).append((obj.group_id, obj.object_id, len(obj.payload)))
+        for name, size in _SIZES.items():
+            msg = rx.subscribe(_NS, name, forward=1,
+                               filter_type=FilterType.LATEST_OBJECT)
+            ok = await rx.joining_fetch(msg.request_id, joining_start=0,
+                                        wait_response=True)
+            assert (ok.largest_group_id, ok.largest_object_id) == (0, _GROUP)
+            for _ in range(100):
+                if len(got.get(ok.request_id, [])) >= _GROUP:
+                    break
+                await asyncio.sleep(0.02)
+            assert got[ok.request_id] == [(0, o, size) for o in range(_GROUP)]
+            status = await rx.track_status(_NS, name, wait_response=True)
+            assert _param_largest(status) == (0, _GROUP - 1)
+        assert rx._close_err is None
