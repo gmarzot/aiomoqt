@@ -493,15 +493,15 @@ async def test_a_subscription_outlives_its_filter(use_quic):
                                num_subgroups=1, rate=400)
         track.attach()
         got = []
-        msg = srv.subscribe(_NS, "gen", location_filter=LocationFilter
-                            .absolute(1, 0, 2, 1))
         done = []
-        srv.register_publish_done_handler(msg.request_id, done.append)
-        ok = await srv._await_response(msg.request_id)
-        srv.register_object_handler(
-            ok.track_alias,
-            lambda obj, _s, _t, g, _sg: got.append(
-                (g, obj.object_id, bool(obj.payload))))
+        # Bound as SUBSCRIBE_OK is parsed: the track produces at once.
+        msg = srv.subscribe(
+            _NS, "gen",
+            location_filter=LocationFilter.absolute(1, 0, 2, 1),
+            on_object=lambda obj, _s, _t, g, _sg: got.append(
+                (g, obj.object_id, bool(obj.payload))),
+            on_done=done.append)
+        await srv._await_response(msg.request_id)
         want = [(1, o) for o in range(4)] + [(2, 0), (2, 1)]
         assert await _until(lambda: sum(p for *_, p in got) >= len(want))
         await asyncio.sleep(0.3)
