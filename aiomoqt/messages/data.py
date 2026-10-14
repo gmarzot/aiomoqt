@@ -511,6 +511,14 @@ FETCH_FLAG_DATAGRAM = 0x40            # ignore subgroup bits
 # Special flag values for end-of-range markers
 FETCH_FLAGS_END_NON_EXISTENT = 0x8C  # End of Non-Existent Range
 FETCH_FLAGS_END_UNKNOWN = 0x10C      # End of Unknown Range
+FETCH_FLAGS_END_TIMED_OUT = 0x20C    # End of Timed-Out Range (d20+)
+
+
+def _end_of_range_flags(prof: DraftProfile) -> tuple:
+    if prof.fetch_timed_out_range:
+        return (FETCH_FLAGS_END_NON_EXISTENT, FETCH_FLAGS_END_UNKNOWN,
+                FETCH_FLAGS_END_TIMED_OUT)
+    return (FETCH_FLAGS_END_NON_EXISTENT, FETCH_FLAGS_END_UNKNOWN)
 
 
 @dataclass(slots=True)
@@ -550,19 +558,23 @@ class FetchObject(MOQTMessage):
                   prior: Optional['FetchObject'] = None,
                   group_order: int = 0x1) -> Buffer:
         if prof.vi64:
-            return self._serialize_d18(prior, group_order)
+            return self._serialize_d18(prior, group_order, prof)
         if is_draft16_or_later(prof.draft):
             return self._serialize_d16()
         return self._serialize_d14()
 
     def _serialize_d18(self, prior: Optional['FetchObject'],
-                       group_order: int) -> Buffer:
+                       group_order: int, prof: DraftProfile) -> Buffer:
         """d18 §11.4.4: vi64 codec; Group/Object carried as DELTAS.
         First object carries absolute values; a group change resets the
         Object ID to absolute; the group delta direction follows the
         fetch's Group Order."""
         buf = Buffer(capacity=BUF_SIZE + len(self.payload), vi64=True)
         if self.end_of_range is not None:
+            if self.end_of_range not in _end_of_range_flags(prof):
+                raise ValueError(
+                    f"FetchObject: End of Range 0x{self.end_of_range:x} "
+                    f"is not defined at d{prof.draft}")
             buf.push_vint(self.end_of_range)
             buf.push_vint(self.group_id)
             buf.push_vint(self.object_id)
@@ -615,6 +627,10 @@ class FetchObject(MOQTMessage):
             flags |= FETCH_FLAG_SG_PRESENT
             subgroup_field = self.subgroup_id
         if self.status != ObjectStatus.NORMAL:
+            if not prof.fetch_object_status:
+                raise ValueError(
+                    f"FetchObject: FETCH objects carry no Object Status at "
+                    f"d{prof.draft} (§11.2.1.1)")
             if self.payload:
                 raise ValueError(
                     "FetchObject: non-Normal status requires an empty "
@@ -639,13 +655,14 @@ class FetchObject(MOQTMessage):
         if has_props:
             MOQTMessage._extensions_encode(buf, self.extensions,
                                            delta=True)
-        # Zero-length objects explicitly encode Status (§11.2.1.1).
+        # Zero-length objects encode Status where the profile says so.
         if len(self.payload) > 0:
             buf.push_vint(len(self.payload))
             buf.push_bytes(self.payload)
         else:
             buf.push_vint(0)
-            buf.push_vint(self.status)
+            if prof.fetch_object_status:
+                buf.push_vint(self.status)
         return buf
 
     def _serialize_d14(self) -> Buffer:
@@ -710,7 +727,7 @@ class FetchObject(MOQTMessage):
                     *, prof: DraftProfile,
                     group_order: int = 0x1) -> 'FetchObject':
         if prof.vi64:
-            return cls._deserialize_d18(buf, prior, group_order)
+            return cls._deserialize_d18(buf, prior, group_order, prof)
         if is_draft16_or_later(prof.draft):
             return cls._deserialize_d16(buf, prior)
         return cls._deserialize_d14(buf)
@@ -718,13 +735,14 @@ class FetchObject(MOQTMessage):
     @classmethod
     def _deserialize_d18(cls, buf: Buffer,
                          prior: Optional['FetchObject'],
-                         group_order: int) -> 'FetchObject':
+                         group_order: int,
+                         prof: DraftProfile) -> 'FetchObject':
         """d18 §11.4.4 delta decode. The buffer's varint codec is vi64
         (set by the stream-type read). A zero Payload Length is followed
-        by an explicit Status varint (§11.2.1.1, as moxygen implements);
-        End-of-Range markers stand in for missing ranges."""
+        by an explicit Status varint where the profile says so (moxygen's
+        d18 reading); End-of-Range markers stand in for missing ranges."""
         flags = buf.pull_vint()
-        if flags in (FETCH_FLAGS_END_NON_EXISTENT, FETCH_FLAGS_END_UNKNOWN):
+        if flags in _end_of_range_flags(prof):
             group_id = buf.pull_vint()
             object_id = buf.pull_vint()
             return cls(group_id=group_id, object_id=object_id,
@@ -794,7 +812,8 @@ class FetchObject(MOQTMessage):
 
         payload_len = buf.pull_vint()
         if payload_len == 0:
-            status = ObjectStatus(buf.pull_vint())
+            status = (ObjectStatus(buf.pull_vint())
+                      if prof.fetch_object_status else ObjectStatus.NORMAL)
             payload = b''
             if extensions and status != ObjectStatus.NORMAL:
                 raise ValueError(

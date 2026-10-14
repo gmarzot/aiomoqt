@@ -327,6 +327,10 @@ class PublishBlocked(MOQTMessage):
         return cls(namespace_suffix=namespace_suffix, track_name=track_name)
 
 
+# PUBLISH_SKIPPED (d19+) is PUBLISH_BLOCKED on the wire.
+PublishSkipped = PublishBlocked
+
+
 @dataclass(slots=True)
 class SubscribeNamespaceOk(MOQTMessage):
     """SUBSCRIBE_NAMESPACE_OK response message."""
