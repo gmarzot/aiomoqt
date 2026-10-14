@@ -24,6 +24,14 @@ class MOQTDraft(IntEnum):
     DRAFT_14 = 14
     DRAFT_16 = 16
     DRAFT_18 = 18
+    DRAFT_20 = 20
+    DRAFT_21 = 21
+    DRAFT_22 = 22
+
+
+# What a client offers and a server accepts when supported_drafts is None,
+# newest first. Other MOQTDraft members are opt-in: named explicitly.
+MOQT_DEFAULT_DRAFTS: Tuple[int, ...] = (18, 16, 14)
 
 
 # ALPN: draft-14 uses legacy "moq-00"; draft-16+ uses "moqt-NN"
@@ -120,8 +128,8 @@ def normalize_supported_drafts(supported_drafts) -> list:
     list of plain draft NUMBERS.
 
     Accepts the forms the public API allows:
-      - None        → offer every supported draft, newest first (the
-                       "auto" offer)
+      - None        → MOQT_DEFAULT_DRAFTS, newest first (the "auto"
+                       offer); drafts outside it are opt-in
       - int         → a single draft number, e.g. 16 → [16]
       - list[int]   → several draft numbers, e.g. [16, 14]; the caller's
                       order is preserved (deduped), so a caller can put a
@@ -137,10 +145,7 @@ def normalize_supported_drafts(supported_drafts) -> list:
     order ALPN / CLIENT_SETUP / WT-Available-Protocols offer versions in.
     """
     if supported_drafts is None:
-        # auto: every draft we can speak, newest first. MOQTDraft, not
-        # MOQT_VERSIONS — the latter is only the d14 in-band CLIENT_SETUP
-        # list and omits the out-of-band d16+ drafts.
-        return sorted((int(d) for d in MOQTDraft), reverse=True)
+        return list(MOQT_DEFAULT_DRAFTS)
     if isinstance(supported_drafts, int):
         supported_drafts = [supported_drafts]
     drafts = []
@@ -232,6 +237,12 @@ class D18MessageType:
     PUBLISH_BLOCKED = 0x0F      # new in d18 (d14 TRACK_STATUS_ERROR point)
 
 
+class D20MessageType:
+    """Draft-20 code points that are new or renamed (d21 and d22 alike)."""
+    PUBLISH_STATE_NOTIFY = 0x22  # new in d20
+    PUBLISH_SKIPPED = 0x0F       # d18 PUBLISH_BLOCKED, same wire shape
+
+
 # Code points that denote the same logical message under different
 # numbers across drafts. register_handler() expands a registration to
 # every alias, so a handler registered by one draft's name also fires on
@@ -245,9 +256,9 @@ HANDLER_ALIASES: Dict[int, Tuple[int, ...]] = {
 
 # Control message types each draft defines, transcribed from the message
 # type registry table in each specification (d14 §9.2, d16 §9.2, d18
-# §10.2). Sending a type absent from the negotiated draft's table is a
-# wire violation: the peer sees an unknown control message and closes the
-# session with PROTOCOL_VIOLATION.
+# §10.2, d20 §10.2, d21/d22 §9 Table 5). Sending a type absent from the
+# negotiated draft's table is a wire violation: the peer sees an unknown
+# control message and closes the session with PROTOCOL_VIOLATION.
 #
 # d18 removed every cancellation message — UNSUBSCRIBE (0xA),
 # PUBLISH_NAMESPACE_DONE (0x9), PUBLISH_NAMESPACE_CANCEL (0xC),
@@ -256,6 +267,13 @@ HANDLER_ALIASES: Dict[int, Tuple[int, ...]] = {
 # It also dropped MAX_REQUEST_ID (0x15) and REQUESTS_BLOCKED (0x1A).
 # d18's NAMESPACE_DONE (0xE) is NOT the d16 message of the same name: it
 # answers a SUBSCRIBE_NAMESPACE and carries a namespace suffix.
+#
+# d20 reserves PUBLISH_OK (0x1E; PUBLISH is answered with REQUEST_OK) and
+# adds PUBLISH_STATE_NOTIFY (0x22). d21 and d22 keep the d20 table.
+_D20_CONTROL_TYPES = frozenset({
+    0x2F00, 0x10, 0x03, 0x04, 0x22, 0x1D, 0x0B, 0x16, 0x18, 0x0D,
+    0x06, 0x50, 0x51, 0x08, 0x0E, 0x0F, 0x02, 0x07, 0x05,
+})
 CONTROL_MESSAGE_TYPES: Dict[int, frozenset] = {
     14: frozenset({
         0x20, 0x21, 0x10, 0x15, 0x1A, 0x03, 0x04, 0x05, 0x02, 0x0A,
@@ -271,19 +289,34 @@ CONTROL_MESSAGE_TYPES: Dict[int, frozenset] = {
         0x2F00, 0x10, 0x03, 0x04, 0x1D, 0x1E, 0x0B, 0x16, 0x18, 0x0D,
         0x06, 0x50, 0x51, 0x08, 0x0E, 0x0F, 0x02, 0x07, 0x05,
     }),
+    20: _D20_CONTROL_TYPES,
+    21: _D20_CONTROL_TYPES,
+    22: _D20_CONTROL_TYPES,
 }
 
 # Code points a draft renumbers on the wire while the message class keeps
-# its canonical type: d18 SUBSCRIBE_NAMESPACE 0x11 -> 0x50, PUBLISH_OK
-# 0x1E -> REQUEST_OK 0x07.
+# its canonical type: from d18 SUBSCRIBE_NAMESPACE 0x11 -> 0x50 and
+# PUBLISH_OK 0x1E -> REQUEST_OK 0x07. Every draft has a row.
+_D18_RENUMBERED = {0x11: 0x50, 0x1E: 0x07}
 WIRE_TYPE_BY_DRAFT: Dict[int, Dict[int, int]] = {
-    18: {0x11: 0x50, 0x1E: 0x07},
+    14: {},
+    16: {},
+    18: _D18_RENUMBERED,
+    20: _D18_RENUMBERED,
+    21: _D18_RENUMBERED,
+    22: _D18_RENUMBERED,
 }
 
 
 def wire_control_type(draft: int, type_: int) -> int:
-    """Wire code point of a control message type at `draft`."""
-    return WIRE_TYPE_BY_DRAFT.get(draft, {}).get(int(type_), int(type_))
+    """Wire code point of a control message type at `draft`. Raises
+    ValueError for a draft with no table."""
+    try:
+        renumbered = WIRE_TYPE_BY_DRAFT[int(draft)]
+    except KeyError:
+        raise ValueError(
+            f"no control message table for draft-{draft}") from None
+    return renumbered.get(int(type_), int(type_))
 
 
 class ParamType(IntEnum):
@@ -313,11 +346,13 @@ class ParamType(IntEnum):
 class SetupParamType(IntEnum):
     """Setup Parameter type constants"""
     PATH = 0x01  # only relevant to raw QUIC connection
-    MAX_REQUEST_ID = 0x02
+    MAX_REQUEST_ID = 0x02       # d14/d16 only
     AUTH_TOKEN = 0x03
     MAX_AUTH_TOKEN_CACHE_SIZE = 0x04
     AUTHORITY = 0x05
+    MAX_FILTER_RANGES = 0x06    # d20+
     IMPLEMENTATION = 0x07  # Wrong in draft 14, draft-15 fixed it to this value
+    MAX_REQUEST_UPDATES = 0x08  # d20+
     GREASE_1_PARAM = 0x77
     GREASE_2_PARAM = 0x92
 
@@ -344,6 +379,7 @@ class SessionCloseCode(IntEnum):
     EXPIRED_AUTH_TOKEN = 0x18
     INVALID_AUTHORITY = 0x19
     MALFORMED_AUTHORITY = 0x1A
+    TOO_MANY_REQUEST_UPDATES = 0x1B  # d20+
 
 class ContentExistsCode(IntEnum):
     """Content Exists Code"""
