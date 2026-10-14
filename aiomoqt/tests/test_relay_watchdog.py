@@ -1,6 +1,7 @@
-"""The relay's --watchdog: a self-probe that relays one object over
-loopback, an exit after WATCHDOG_MISSES failed probes in a row, and a
-faulthandler timer that kills a stalled event loop."""
+"""The relay's --watchdog: a self-probe, run in a child process, that
+relays one object over loopback; an exit after WATCHDOG_MISSES failed
+probes in a row; and a faulthandler timer that kills a stalled event
+loop."""
 import asyncio
 import os
 import subprocess
@@ -64,6 +65,21 @@ async def test_a_probe_fails_when_the_relay_drops_objects(use_quic,
         handle.close()
 
 
+@requires_certs
+@_TRANSPORTS
+async def test_a_child_process_probe_passes_and_misses(use_quic):
+    port = _BASE_PORT + 4 + (not use_quic)
+    handle = await relay._build_server("localhost", port, CERT, KEY,
+                                       use_quic=use_quic, draft=18).serve()
+    try:
+        assert await relay._probe_in_child("127.0.0.1", port, use_quic, 18,
+                                           5.0)
+    finally:
+        handle.close()
+    assert not await relay._probe_in_child("127.0.0.1", port, use_quic, 18,
+                                           1.0)
+
+
 async def test_the_watchdog_exits_after_consecutive_misses_only(
         monkeypatch):
     results = iter([False, False, True, False, False, False])
@@ -82,14 +98,15 @@ async def test_the_watchdog_exits_after_consecutive_misses_only(
     def _exit(code):
         raise _Exit(code)
 
-    monkeypatch.setattr(relay, "_self_probe", _probe)
+    monkeypatch.setattr(relay, "_probe_in_child", _probe)
     monkeypatch.setattr(relay, "_heartbeat", _no_heartbeat)
     monkeypatch.setattr(relay.os, "_exit", _exit)
     monkeypatch.setattr(relay.logging, "shutdown", lambda: None)
     with pytest.raises(_Exit) as exc:
-        await relay._watchdog(0.01, "127.0.0.1", 1, True, 18)
+        await relay._watchdog(0.01, "127.0.0.1", 1, True, [14, 16, 18])
     assert exc.value.args == (relay.WATCHDOG_EXIT,)
     assert len(probes) == 6
+    assert {args[3] for args in probes} == {18}       # newest draft only
 
 
 def test_a_stalled_event_loop_is_dumped_and_exited():

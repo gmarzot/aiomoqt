@@ -1283,8 +1283,9 @@ def parse_args():
                         help="Exit, for a supervisor to restart, when the "
                              "event loop stalls for SEC seconds or "
                              f"{WATCHDOG_MISSES} self-probes in a row fail "
-                             "(one object relayed over loopback every SEC "
-                             "seconds). 0 = off (default).")
+                             "(a child process relays one object over "
+                             "loopback every SEC seconds). 0 = off "
+                             "(default).")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug logging")
     return parser.parse_args()
@@ -1745,6 +1746,39 @@ async def _self_probe(host, port, use_quic, draft, timeout) -> bool:
         return False
 
 
+# One self-probe; argv: host, port, use_quic (1/0), draft, timeout.
+_PROBE_CHILD = (
+    "import asyncio, logging, sys\n"
+    "from aiomoqt.tools import moq_interop_relay as r\n"
+    "logging.disable(logging.INFO)\n"
+    "h, p, q, d, t = sys.argv[1:]\n"
+    "ok = asyncio.run(r._self_probe(h, int(p), q == '1', int(d), float(t)))\n"
+    "sys.exit(0 if ok else 1)\n"
+)
+
+
+async def _probe_in_child(host, port, use_quic, draft, timeout) -> bool:
+    """Run one self-probe in a child process, so a crash in the probe's
+    client transport cannot take the relay down."""
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", _PROBE_CHILD, host, str(port),
+        "1" if use_quic else "0", str(draft), str(timeout),
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+    try:
+        _, err = await asyncio.wait_for(proc.communicate(), timeout + 15)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        logger.warning("relay: watchdog probe timed out")
+        return False
+    if proc.returncode == 0:
+        return True
+    lines = (err or b"").decode(errors="replace").strip().splitlines()
+    logger.warning(f"relay: watchdog probe failed (exit {proc.returncode})"
+                   f"{': ' + lines[-1] if lines else ''}")
+    return False
+
+
 async def _heartbeat(stall_s: float) -> None:
     """Keep re-arming faulthandler's timer. It runs on its own C thread,
     so an event loop stuck past `stall_s` — in Python or in native code —
@@ -1757,13 +1791,14 @@ async def _heartbeat(stall_s: float) -> None:
 async def _watchdog(period, host, port, use_quic, draft) -> None:
     """Exit so the supervisor restarts the relay when it hangs or stops
     relaying: a loop stall past `period`, or WATCHDOG_MISSES self-probes
-    in a row that deliver no object."""
+    in a row, on the newest draft, that deliver no object."""
     _background.add(asyncio.create_task(_heartbeat(period)))
+    newest = max(draft) if isinstance(draft, (list, tuple)) else int(draft)
     misses = 0
     while True:
         await asyncio.sleep(period)
-        if await _self_probe(host, port, use_quic, draft,
-                             min(period, WATCHDOG_PROBE_S)):
+        if await _probe_in_child(host, port, use_quic, newest,
+                                 min(period, WATCHDOG_PROBE_S)):
             misses = 0
             continue
         misses += 1
