@@ -169,6 +169,40 @@ async def test_a_paused_peer_is_gated_and_rejoins_at_a_group():
 
 
 @pytest.mark.asyncio
+async def test_on_sent_reports_only_written_objects():
+    """Once per peer per object written; nothing for a peer that is
+    paused, filtered out or shed."""
+    names = ("all", "paused", "filtered", "slow")
+    sessions = {n: _Session(n, block=n == "slow") for n in names}
+    deliveries = {n: _delivery(s) for n, s in sessions.items()}
+    deliveries["filtered"].passes = lambda g, o: o != 1
+    fan = FanoutDelivery(queue_size=2)
+    sent = []
+    fan.on_sent = lambda g, o: sent.append((g, o))
+    fan.add(deliveries["all"], joining=False)
+    fan.add(deliveries["paused"], lambda: False, joining=False)
+    fan.add(deliveries["filtered"], joining=False)
+    slow = fan.add(deliveries["slow"], joining=False)
+
+    await fan.write(0, 0, b"key", group_start=True)
+    await _settle()
+    for oid in range(1, 6):                 # overruns the slow lane
+        await fan.write(0, oid, b"pred")
+        await _settle(2)
+    sessions["slow"].release()
+    await _settle(60)
+    await fan.close()
+
+    assert slow.shed > 0
+    assert deliveries["paused"].objects_sent == 0
+    assert sorted(sent) == sorted(
+        [(0, o) for o in range(6)]              # all
+        + [(0, o) for o in (0, 2, 3, 4, 5)]     # filtered
+        + [(0, 0)])                             # slow, before it shed
+    assert len(sent) == sum(d.objects_sent for d in deliveries.values())
+
+
+@pytest.mark.asyncio
 async def test_a_lane_added_mid_stream_joins_at_the_next_group():
     a, b = _Session("a"), _Session("b")
     da, db = _delivery(a), _delivery(b)
