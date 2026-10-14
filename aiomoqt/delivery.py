@@ -141,6 +141,9 @@ class SubgroupDelivery:
         # passes(group_id, object_id): the peer's subscription filter
         # (§5.1.2); objects it excludes are not sent. None admits all.
         self.passes: Optional[Callable[[int, int], bool]] = None
+        # excludes_end(group_id, object_id): True when the filter ends in
+        # this group before object_id, so no END_OF_GROUP there.
+        self.excludes_end: Optional[Callable[[int, int], bool]] = None
         self._stream_id: Optional[int] = None
         self._header: Optional[SubgroupHeader] = None
 
@@ -159,8 +162,14 @@ class SubgroupDelivery:
         FIN. No-op when no stream is open."""
         if self._stream_id is None:
             return
-        buf = self._header.end_group(object_id=self._header.next_object_id)
-        self.session.stream_write(self._stream_id, buf.data, end_stream=True)
+        end_id = self._header.next_object_id
+        if (self.excludes_end is not None
+                and self.excludes_end(self._header.group_id, end_id)):
+            self.session.stream_write(self._stream_id, b"", end_stream=True)
+        else:
+            buf = self._header.end_group(object_id=end_id)
+            self.session.stream_write(self._stream_id, buf.data,
+                                      end_stream=True)
         self._stream_id = None
         self._header = None
 

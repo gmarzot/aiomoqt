@@ -21,9 +21,20 @@ from .messages import *
 from .messages.d18 import Setup
 from .messages.d20 import PublishStateNotify, Setup as D20Setup
 from .messages.fetch import _is_joining
+from .messages.params import (
+    RANGE_FILTERS, D20ParamType, D20RequestErrorCode, check_param_scope,
+    range_filter_count, range_filter_error, uses_location_filter,
+)
+from .messages import (
+    Fetch, LocationFilter, MOQTMessage, Publish, PublishNamespace, PublishOk,
+    RequestOk, RequestUpdate, Subscribe, SubscribeNamespace, SubscribeTracks,
+    TrackStatus,
+)
 from .types import *
-from .types import (D20MessageType, MOQTDraft, MOQTException, MOQTMessageType,
-                    SessionCloseCode, SetupParamType)
+from .types import (D20MessageType, FilterType, MOQTDraft, MOQTException,
+                    MOQTMessageType, MOQTProtocolViolation, MOQTRequestError,
+                    ParamType, RequestErrorCode, SessionCloseCode,
+                    SetupParamType, SubscribeDoneCode)
 from .utils.buffer import Buffer, BufferReadError
 from .utils.logger import *
 from .utils.url import moqt_setup_path
@@ -303,9 +314,18 @@ class _MOQTSessionMixin:
         # through _route_stream_data once the draft is settled.
         self._draft_settled = _pinned is not None
         self._pre_draft_stream_data: Dict[int, Tuple[bytearray, bool]] = {}
-        # d18 REQUEST_UPDATEs we sent, keyed by the updated request's id:
-        # the reply rides that request's stream with no id of its own.
-        self._tx_updates: Dict[int, int] = {}
+        # d18 REQUEST_UPDATEs we sent and not yet answered, keyed by the
+        # updated request's id: replies ride that request's stream with no
+        # id of their own, in order.
+        self._tx_updates: Dict[int, deque] = {}
+        # request id -> (opener class, sent by us), for the d20 rules that
+        # depend on the request a REQUEST_UPDATE or reply belongs to.
+        # Bounded; the oldest are forgotten.
+        self._request_kinds: "OrderedDict[int, Tuple[type, bool]]" = \
+            OrderedDict()
+        # The peer's d20+ SUBSCRIBE_TRACKS: request id -> the parameters a
+        # resulting PUBLISH carries (§10.20.1).
+        self._subscribe_tracks_params: Dict[int, Dict[int, Any]] = {}
         # Track aliases found malformed (§2.4.2): subscription cancelled,
         # further streams refused.
         self._malformed_aliases: Set[int] = set()
@@ -975,11 +995,14 @@ class _MOQTSessionMixin:
                     not self._profile.reply_has_request_id and
                     hasattr(msg, 'request_id')):
                 if getattr(msg, 'request_id', None) is None:
-                    update_id = (self._tx_updates.pop(request_id, None)
+                    update_id = (self._next_update_reply(request_id)
                                  if isinstance(msg, (RequestOk, RequestError))
                                  else None)
                     msg.request_id = (request_id if update_id is None
                                       else update_id)
+                    if isinstance(msg, RequestOk) and prof.param_table >= 20:
+                        self._check_request_ok_scope(msg, request_id,
+                                                     update_id)
                 elif isinstance(msg, RequestUpdate):
                     # d18 §10.9: the updated request is the stream's;
                     # answer on the same stream under the update's id.
@@ -1089,6 +1112,30 @@ class _MOQTSessionMixin:
                 f"{''.join(traceback.format_exception(type(e), e, e.__traceback__))}"
             )
             raise
+
+    def _next_update_reply(self, request_id: int) -> Optional[int]:
+        """The oldest unanswered REQUEST_UPDATE we sent on `request_id`'s
+        stream, which a REQUEST_OK or REQUEST_ERROR there answers."""
+        pending = self._tx_updates.get(request_id)
+        if not pending:
+            return None
+        update_id = pending.popleft()
+        if not pending:
+            del self._tx_updates[request_id]
+        return update_id
+
+    def _check_request_ok_scope(self, msg: RequestOk, request_id: int,
+                                update_id: Optional[int]) -> None:
+        """d20+: the parameters a REQUEST_OK may carry depend on the
+        request it answers (d22 §9.3)."""
+        if update_id is not None:
+            scope = "RequestOk:RequestUpdate"
+        else:
+            kind = self._request_kinds.get(request_id)
+            if kind is None:
+                return
+            scope = f"RequestOk:{kind[0].__name__}"
+        check_param_scope(msg.parameters or {}, scope, prof=self._profile)
 
     def _dump_data_streams(self, file=None) -> dict:
         """Per-stream chain-introspection. Returns and prints a dict of
@@ -3008,14 +3055,21 @@ class _MOQTSessionMixin:
         (§10.18-19). Returns the handler that answers a refused request
         with REQUEST_ERROR, else None; records an admitted subscription
         until it ends."""
+        d20 = self._profile.param_table >= 20
+        if isinstance(msg, PublishStateNotify):
+            self._check_publish_state_notify(msg)
+            return None
         if (isinstance(msg, RequestUpdate)
                 and is_draft16_or_later(self.negotiated_draft)):
-            return self._refuse_prefix_update(msg)
+            refusal = self._check_d20_update(msg) if d20 else None
+            return refusal or self._refuse_prefix_update(msg)
         if (not is_draft16_or_later(self.negotiated_draft)
                 or not isinstance(msg, self._REQUEST_OPENERS)
                 or getattr(msg, 'request_id', None) is None):
             return None
         rid = int(msg.request_id)
+        if d20:
+            self._note_request_kind(rid, type(msg), ours=False)
         if self._goaway_sent and self.negotiated_draft >= 18:
             return self._refusal(msg, rid, RequestErrorCode.GOING_AWAY,
                                  "the session is going away")
@@ -3031,11 +3085,15 @@ class _MOQTSessionMixin:
             reason = f"reserved namespace {ns[0].decode()}"
         elif kind is Subscribe:
             key = (ns, bytes(msg.track_name or b""))
+            # d20 allows several subscriptions to a track and drops
+            # DUPLICATE_SUBSCRIPTION; a track here serves one per session.
+            duplicate = (RequestErrorCode.NOT_SUPPORTED if d20
+                         else RequestErrorCode.DUPLICATE_SUBSCRIPTION)
             if (kind, key) in self._peer_requests.values():
-                code = RequestErrorCode.DUPLICATE_SUBSCRIPTION
+                code = duplicate
                 reason = "track already subscribed in this session"
             elif self._publish_pending(key):
-                code = RequestErrorCode.DUPLICATE_SUBSCRIPTION
+                code = duplicate
                 reason = "our PUBLISH of the track awaits its reply"
         elif kind in (SubscribeNamespace, SubscribeTracks):
             key = ns
@@ -3045,11 +3103,103 @@ class _MOQTSessionMixin:
                     code = RequestErrorCode.PREFIX_OVERLAP
                     reason = "prefix overlaps an active subscription"
                     break
+        if code is None and d20:
+            code, reason = self._d20_refusal(msg)
         if code is None:
             if key is not None:
                 self._peer_requests[rid] = (kind, key)
+            if d20 and kind is SubscribeTracks:
+                params = msg.parameters or {}
+                self._subscribe_tracks_params[rid] = {
+                    k: v for k, v in params.items()
+                    if k in self._SUBSCRIBE_TRACKS_CARRIED}
             return None
         return self._refusal(msg, rid, code, reason)
+
+    # SUBSCRIBE_TRACKS parameters a resulting PUBLISH carries: the
+    # subscription parameters PUBLISH may hold, never AUTHORIZATION TOKEN
+    # (d20 §10.2.2, §10.20.1).
+    _SUBSCRIBE_TRACKS_CARRIED = frozenset({
+        ParamType.DELIVERY_TIMEOUT,
+        0x06,                               # SUBGROUP_DELIVERY_TIMEOUT
+        ParamType.FORWARD, ParamType.SUBSCRIBER_PRIORITY,
+        ParamType.LOCATION_FILTER, ParamType.GROUP_ORDER,
+    })
+
+    def _note_request_kind(self, request_id: int, kind: type,
+                           ours: bool) -> None:
+        kinds = self._request_kinds
+        kinds[request_id] = (kind, ours)
+        if len(kinds) > self.REQUEST_KINDS_MAX:
+            kinds.popitem(last=False)
+
+    REQUEST_KINDS_MAX = 4096
+
+    def _d20_refusal(self, msg: MOQTMessage) -> Tuple[Optional[int], str]:
+        """(REQUEST_ERROR code, reason) for a d20+ request this session
+        cannot accept, else (None, "")."""
+        if isinstance(msg, Fetch):
+            return (RequestErrorCode.NOT_SUPPORTED,
+                    "FETCH is not implemented from draft-20")
+        params = msg.parameters or {}
+        # We send no MAX_FILTER_RANGES, so no Range may arrive (§5.1.4).
+        why = range_filter_error(params, max_ranges=0)
+        fill = params.get(D20ParamType.FILL_PARAMETERS)
+        if why is None and isinstance(fill, dict):
+            why = range_filter_error(fill, max_ranges=0)
+        if why is not None:
+            return D20RequestErrorCode.INVALID_FILTER, why
+        return None, ""
+
+    _UPDATE_SCOPES = {
+        Subscribe: "Subscription", Publish: "Subscription", Fetch: "Fetch",
+        PublishNamespace: "PublishNamespace",
+        SubscribeNamespace: "SubscribeNamespace",
+        SubscribeTracks: "SubscribeTracks",
+    }
+
+    def _check_d20_update(self, msg: RequestUpdate) -> Optional[Callable]:
+        """d20 §10.9: only the sender of a request, or the subscriber of a
+        PUBLISH, may update it, with the parameters its type allows.
+        Raises on a violation; returns the handler that refuses a filter
+        the session cannot take."""
+        existing = msg.existing_request_id
+        kind = self._request_kinds.get(existing)
+        if kind is None or msg.request_id is None:
+            return None
+        cls, ours = kind
+        if (ours and cls is not Publish) or (not ours and cls is TrackStatus):
+            raise MOQTProtocolViolation(
+                f"REQUEST_UPDATE for a {cls.__name__} the peer may not "
+                f"update")
+        params = msg.parameters or {}
+        check_param_scope(params, f"RequestUpdate:{self._UPDATE_SCOPES[cls]}",
+                          prof=self._profile)
+        if any(p in RANGE_FILTERS for p in params):
+            if cls is Publish and not ours:
+                raise MOQTProtocolViolation(
+                    "Range Filters in a REQUEST_UPDATE from the publisher")
+            why = range_filter_error(params, max_ranges=0)
+            if why is not None:
+                return self._refusal(msg, int(msg.request_id),
+                                     D20RequestErrorCode.INVALID_FILTER, why)
+        carried = self._subscribe_tracks_params.get(existing)
+        if (carried is not None and not ours
+                and ParamType.FORWARD in params):
+            # Later PUBLISHes for the prefix take the new Forward State.
+            carried[ParamType.FORWARD] = params[ParamType.FORWARD]
+        return None
+
+    def _check_publish_state_notify(self, msg: PublishStateNotify) -> None:
+        """d20 §10.10: only a subscription's publisher sends it."""
+        kind = self._request_kinds.get(msg.request_id)
+        if kind is None:
+            return
+        cls, ours = kind
+        if not ((ours and cls is Subscribe) or (not ours and cls is Publish)):
+            raise MOQTProtocolViolation(
+                f"PUBLISH_STATE_NOTIFY on a {cls.__name__} stream "
+                f"{'we' if ours else 'the peer'} opened")
 
     def _publish_pending(self, key) -> bool:
         """True while our PUBLISH of this Full Track Name awaits its reply:
@@ -3128,6 +3278,8 @@ class _MOQTSessionMixin:
         bidi stream and the response returns on it (no in-band Request ID);
         pre-d18 requests go on the single control stream. Raw-QUIC stream-id
         allocation is synchronous, so callers stay sync."""
+        if self._profile.param_table >= 20:
+            self._note_request_kind(request_id, type(msg), ours=True)
         if self._profile.control_uni_pair:
             if not self._is_wt:
                 # Raw QUIC: stream-id allocation is synchronous (lazy
@@ -3359,10 +3511,21 @@ class _MOQTSessionMixin:
         end_group: Optional[int] = 0,
         parameters: Optional[Dict[int, bytes]] = None,
         wait_response: Optional[bool] = False,
+        location_filter: Optional[LocationFilter] = None,
     ) -> Optional[MOQTMessage]:
-        """Subscribe to a track with configurable options."""
+        """Subscribe to a track with configurable options.
+
+        From d20 the filter travels as LOCATION_FILTER: filter_type and
+        its Locations are converted, or `location_filter` is sent as is
+        for the forms they cannot express."""
         if parameters is None:
             parameters = {}
+        if location_filter is not None and not uses_location_filter(
+                self._profile):
+            raise ValueError(
+                f"location_filter needs draft-20 or later, not "
+                f"draft-{self.negotiated_draft}")
+        self._check_filter_ranges(parameters)
         request_id = self._allocate_request_id()
         namespace_tuple = self._make_namespace_tuple(namespace)
         track_name = track_name.encode() if isinstance(track_name, str) else track_name
@@ -3378,7 +3541,8 @@ class _MOQTSessionMixin:
             start_group=start_group,
             start_object=start_object,
             end_group=end_group,
-            parameters=parameters
+            parameters=parameters,
+            location_filter=location_filter,
         )
         message.libquicr_compat = self._session.libquicr_compat
         self._subscriptions[request_id] = [message]
@@ -3438,6 +3602,16 @@ class _MOQTSessionMixin:
         params = dict(parameters or {})
         if forward is not None:
             params[ParamType.FORWARD] = int(forward)
+        if self._profile.param_table >= 20:
+            self._check_filter_ranges(params)
+            pending = self._tx_updates.get(existing_request_id, ())
+            limit = self._peer_max_request_updates
+            if limit and len(pending) >= limit:
+                # d20 §10.3.1.7: past its limit the peer closes the session.
+                raise ValueError(
+                    f"{len(pending)} REQUEST_UPDATEs already outstanding on "
+                    f"request {existing_request_id} (peer "
+                    f"MAX_REQUEST_UPDATES {limit})")
         request_id = self._allocate_request_id()
         message = RequestUpdate(request_id=request_id,
                                 existing_request_id=existing_request_id,
@@ -3450,7 +3624,8 @@ class _MOQTSessionMixin:
                     SessionCloseCode.INTERNAL_ERROR,
                     f"no request stream bound for request_id="
                     f"{existing_request_id}: cannot send REQUEST_UPDATE")
-            self._tx_updates[existing_request_id] = request_id
+            self._tx_updates.setdefault(existing_request_id,
+                                        deque()).append(request_id)
             self.send_stream_message(sid, message)
         else:
             self.send_control_message(message)
@@ -3469,9 +3644,27 @@ class _MOQTSessionMixin:
         start_object: Optional[int] = None,
         end_group: Optional[int] = None,
         parameters: Optional[Dict[int, Any]] = None,
+        location_filter: Optional[LocationFilter] = None,
     ) -> Optional[MOQTMessage]:
         """Accept a PUBLISH: PUBLISH_OK (0x1E) through d16, REQUEST_OK
-        carrying the same fields as parameters at d18 (§10.5)."""
+        carrying the same fields as parameters at d18 (§10.5).
+
+        From d20 PUBLISH_OK carries only EXPIRES (`parameters`); the
+        subscription parameters that differ from the PUBLISH's follow in
+        a REQUEST_UPDATE on its stream (d20 §10.9). GROUP_ORDER cannot
+        change there and is not sent."""
+        if self._profile.publish_ok_expires_only:
+            message = PublishOk(request_id=request_msg.request_id,
+                                parameters=dict(parameters or {}))
+            logger.info(f"MOQT send: {message}")
+            self._send_reply(request_msg.request_id, message)
+            update = self._publish_ok_update(
+                request_msg, forward, priority, filter_type, start_group,
+                start_object, end_group, location_filter)
+            if update:
+                self.request_update(request_msg.request_id,
+                                    parameters=update)
+            return message
         message = PublishOk(
             request_id=request_msg.request_id,
             forward=forward,
@@ -3486,6 +3679,44 @@ class _MOQTSessionMixin:
         logger.info(f"MOQT send: {message}")
         self._send_reply(request_msg.request_id, message)
         return message
+
+    @staticmethod
+    def _publish_ok_update(request_msg: 'Publish', forward, priority,
+                           filter_type, start_group, start_object,
+                           end_group, location_filter) -> Dict[int, Any]:
+        """The REQUEST_UPDATE parameters that turn a PUBLISH's initial
+        subscription settings into the ones a d18 PUBLISH_OK would have
+        set. Next Object is where a PUBLISH starts, so that filter needs
+        no update."""
+        initial = request_msg.parameters or {}
+        params: Dict[int, Any] = {}
+        sent_forward = 1 if request_msg.forward is None else request_msg.forward
+        if forward is not None and int(forward) != int(sent_forward):
+            params[ParamType.FORWARD] = int(forward)
+        if (priority is not None and priority != initial.get(
+                ParamType.SUBSCRIBER_PRIORITY, 128)):
+            params[ParamType.SUBSCRIBER_PRIORITY] = int(priority)
+        if location_filter is None and filter_type not in (
+                None, FilterType.LATEST_OBJECT):
+            location_filter = LocationFilter.from_subscription_filter(
+                filter_type, start_group, start_object, end_group)
+        if location_filter is not None:
+            params[ParamType.LOCATION_FILTER] = location_filter
+        return params
+
+    def _check_filter_ranges(self, params: Dict[int, Any]) -> None:
+        """Refuse to send more Range Filter ranges than the peer's
+        MAX_FILTER_RANGES allows (d20 §10.3.1.6): it would answer
+        INVALID_FILTER."""
+        if self._profile.param_table < 20:
+            return
+        fill = params.get(D20ParamType.FILL_PARAMETERS)
+        count = range_filter_count(params) + (
+            range_filter_count(fill) if isinstance(fill, dict) else 0)
+        if count > self._peer_max_filter_ranges:
+            raise ValueError(
+                f"{count} filter ranges exceed the peer's "
+                f"MAX_FILTER_RANGES {self._peer_max_filter_ranges}")
 
     def subscribe_ok(
         self,
@@ -3518,12 +3749,18 @@ class _MOQTSessionMixin:
     def subscribe_done(
         self,
         request_id: int,
-        status_code: int = SubscribeDoneCode.SUBSCRIPTION_ENDED,
+        status_code: Optional[int] = None,
         stream_count: int = 0,
         reason: str = "",
     ) -> Optional[MOQTMessage]:
         """Create and send a PUBLISH_DONE (SUBSCRIBE_DONE) response on the
-        subscription's request stream (d18) or the control stream."""
+        subscription's request stream (d18) or the control stream.
+        The default status is SUBSCRIPTION_ENDED, or TRACK_ENDED from d20,
+        which removed it."""
+        if status_code is None:
+            status_code = (SubscribeDoneCode.SUBSCRIPTION_ENDED
+                           if self._profile.publish_done_subscription_ended
+                           else SubscribeDoneCode.TRACK_ENDED)
         message = SubscribeDone(
             request_id=request_id,
             status_code=status_code,
@@ -3630,6 +3867,7 @@ class _MOQTSessionMixin:
                                FetchType.ABSOLUTE_JOINING):
             raise ValueError(
                 f"join() requires a joining fetch_type, got {fetch_type}")
+        self._check_fetch_supported()
 
         parameters = {} if parameters is None else parameters
         sub_request_id = self._allocate_request_id()
@@ -3698,6 +3936,7 @@ class _MOQTSessionMixin:
             raise ValueError(
                 f"joining_fetch() requires a joining fetch_type, "
                 f"got {fetch_type}")
+        self._check_fetch_supported()
         request_id = self._allocate_request_id()
         message = Fetch(
             request_id=request_id,
@@ -3737,6 +3976,7 @@ class _MOQTSessionMixin:
         Per spec §9.16.1: End Location.Object of 0 means the entire end
         group is requested.
         """
+        self._check_fetch_supported()
         parameters = {} if parameters is None else parameters
         request_id = self._allocate_request_id()
         namespace = self._make_namespace_tuple(namespace)
@@ -3768,6 +4008,16 @@ class _MOQTSessionMixin:
         if not wait_response:
             return message
         return self._await_response(request_id)
+
+    def _check_fetch_supported(self) -> None:
+        """FETCH from d20 (no Fetch Type, the range in LOCATION_FILTER) is
+        not implemented: refuse it before anything is sent."""
+        if self._profile.fetch_location_filter:
+            raise MOQTRequestError(
+                error_code=int(RequestErrorCode.NOT_SUPPORTED),
+                reason=f"FETCH is not implemented at "
+                       f"draft-{self.negotiated_draft}",
+                retry_interval=0)
 
     def fetch_ok(
         self,
@@ -3930,8 +4180,21 @@ class _MOQTSessionMixin:
             largest: the track's Largest Location (group, object), sent
                      as LARGEST_OBJECT; required once objects have been
                      published (§10.2.11).
+
+        From d20 a PUBLISH under the prefix of a SUBSCRIBE_TRACKS the
+        peer sent carries that request's subscription parameters, its
+        FORWARD (1 when absent) overriding `forward` (§10.20.1).
         """
         namespace_tuple = self._make_namespace_tuple(namespace)
+        carried = (self._subscribe_tracks_carry(namespace_tuple)
+                   if self._subscribe_tracks_params else None)
+        if carried is not None:
+            st_forward = int(carried.pop(ParamType.FORWARD, 1))
+            if st_forward != forward:
+                logger.info(f"MOQT: PUBLISH forward={st_forward} from "
+                            f"SUBSCRIBE_TRACKS, not {forward}")
+            forward = st_forward
+            parameters = {**(parameters or {}), **carried}
         request_id = self._allocate_request_id()
         track_alias = self._allocate_track_alias(request_id)
         track_name_bytes = track_name.encode() if isinstance(track_name, str) else track_name
@@ -3959,6 +4222,20 @@ class _MOQTSessionMixin:
             return message
 
         return self._await_response(request_id)
+
+    def _subscribe_tracks_carry(self, namespace: tuple
+                                ) -> Optional[Dict[int, Any]]:
+        """The parameters of the peer's active SUBSCRIBE_TRACKS whose
+        prefix covers `namespace`, else None."""
+        for rid, params in list(self._subscribe_tracks_params.items()):
+            held = self._peer_requests.get(rid)
+            if held is None or held[0] is not SubscribeTracks:
+                del self._subscribe_tracks_params[rid]
+                continue
+            prefix = held[1]
+            if namespace[:len(prefix)] == prefix:
+                return dict(params)
+        return None
 
     def publish_namepace_ok(
         self,
@@ -4049,6 +4326,8 @@ class _MOQTSessionMixin:
         )
         logger.info(f"MOQT send: {message}")
 
+        if self._profile.param_table >= 20:
+            self._note_request_kind(request_id, SubscribeNamespace, ours=True)
         if is_draft16_or_later(self.negotiated_draft):
             stream_id = await self.open_bidi_stream()
             self.send_stream_message(stream_id, message)
@@ -4210,6 +4489,8 @@ class _MOQTSessionMixin:
             parameters=parameters,
         )
         logger.info(f"MOQT send: {message}")
+        if self._profile.param_table >= 20:
+            self._note_request_kind(request_id, SubscribeTracks, ours=True)
         stream_id = await self.open_bidi_stream()
         self.send_stream_message(stream_id, message)
         self._bidi_streams[request_id] = stream_id
@@ -4260,7 +4541,7 @@ class _MOQTSessionMixin:
         if self._is_client and new_session_uri:
             raise ValueError("clients MUST send an empty New Session URI")
         msg = GoAway(new_session_uri=new_session_uri, timeout=timeout)
-        if self.negotiated_draft >= 18:
+        if self.negotiated_draft >= 18 and self._profile.goaway_request_id:
             if self._peer_request_max < 0:
                 msg.request_id = 0 if not self._is_client else 1
             else:
@@ -4766,6 +5047,18 @@ class _MOQTSessionMixin:
 
     async def _handle_request_update(self, msg: RequestUpdate) -> None:
         logger.info(f"MOQT event: handle RequestUpdate: {msg}")
+        d20 = self._profile.param_table >= 20
+        existing = msg.existing_request_id
+        held = self._peer_requests.get(existing)
+        if d20 and held is not None and held[0] in (SubscribeNamespace,
+                                                    SubscribeTracks):
+            # A new prefix and SUBSCRIBE_TRACKS FORWARD were applied at
+            # admission (§10.9.2, §10.2.18).
+            if existing in self._discovery_subs:
+                self._discovery_subs[existing] = held[1]
+            self._send_reply(msg.request_id,
+                             RequestOk(request_id=msg.request_id))
+            return
         # §10.9: MUST answer with exactly one REQUEST_OK or
         # REQUEST_ERROR — a session with no update semantics answers
         # honestly instead of hanging the peer; apps override.
@@ -4776,6 +5069,9 @@ class _MOQTSessionMixin:
             reason="request update not supported",
         )
         self._send_reply(msg.request_id, err)
+        if d20:
+            # d20 §10.9.1: a failed update ends the request it updated.
+            self._update_failed(msg)
 
     async def _handle_d18_setup(self, msg) -> None:
         """draft-18 SETUP receive (§10.3). SETUP is symmetric: each peer
@@ -4842,7 +5138,8 @@ class _MOQTSessionMixin:
         await self._handle_d18_setup(msg)
 
     async def _handle_publish_state_notify(self, msg) -> None:
-        """PUBLISH_STATE_NOTIFY (d20 §10.10) is informative; no reply."""
+        """PUBLISH_STATE_NOTIFY (d20 §10.10) is informative and never
+        answered; register_handler() takes it to act on it."""
         logger.info(f"MOQT receive: {msg}")
 
     # MoQT message classes for serialize/deserialize, message handler methods (unbound)
