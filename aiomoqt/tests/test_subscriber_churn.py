@@ -42,6 +42,8 @@ def _session(draft=18):
     s._stream_torn_down_evict_after = 30.0
     s._stream_end_handlers = {}
     s._early_stream_ends = OrderedDict()
+    s._reset_early_objects()
+    s._early_objects_dropped = 0
     s._fetch_done_futures = {}
     s._fetch_stream_by_request = {}
     s._group_bound = {}

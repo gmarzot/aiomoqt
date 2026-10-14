@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import functools
 import logging
 import time
@@ -403,6 +404,10 @@ class _MOQTSessionMixin:
         # Stream ends for an alias with no handler yet: a short stream can
         # end before its subscriber registers one. Replayed on registration.
         self._early_stream_ends: "OrderedDict[int, deque]" = OrderedDict()
+        # Objects for an unbound alias with no handler to take them,
+        # replayed on binding.
+        self._reset_early_objects()
+        self._early_objects_dropped: int = 0
         # track_alias -> DEFAULT_PUBLISHER_PRIORITY (property 0x0E, Track
         # scope, §12.4). A subgroup whose header sets DEFAULT_PRIORITY
         # omits the Priority field and inherits this.
@@ -676,11 +681,96 @@ class _MOQTSessionMixin:
                                 callback: Callable) -> None:
         """Route this track's objects to `callback` instead of the
         session-global on_object_received (same signature). The alias is
-        known once SUBSCRIBE_OK / PUBLISH arrives."""
-        self._object_handlers[track_alias] = callback
+        known once SUBSCRIBE_OK / PUBLISH arrives.
+
+        Objects that arrived for the alias before it was bound, in the
+        last EARLY_OBJECT_HOLD_S, are delivered at once in arrival
+        order."""
+        self._bind_object_handler(track_alias, callback)
 
     def unregister_object_handler(self, track_alias: int) -> None:
         self._object_handlers.pop(track_alias, None)
+        self._discard_early_objects(track_alias)
+
+    def _bind_object_handler(self, alias: int, callback: Callable) -> None:
+        """Bind `callback` to the alias and replay its held objects."""
+        self._object_handlers[alias] = callback
+        held = self._early_objects.pop(alias, None)
+        if not held:
+            return
+        horizon = time.monotonic() - self.EARLY_OBJECT_HOLD_S
+        for held_at, nbytes, args in held:
+            self._early_objects_count -= 1
+            self._early_objects_bytes -= nbytes
+            if held_at < horizon:
+                self._early_object_dropped(alias, "expired")
+                continue
+            try:
+                callback(*args)
+            except Exception:
+                logger.warning("object handler raised on replay",
+                               exc_info=True)
+
+    # Per-session hold bounds for early objects; the count exceeds
+    # EARLY_STREAM_END_MAX since one video group can.
+    EARLY_OBJECT_HOLD_S = 5.0
+    EARLY_OBJECT_MAX = 1024
+    EARLY_OBJECT_MAX_BYTES = 4 * 1024 * 1024
+
+    def _reset_early_objects(self) -> None:
+        # {alias: deque[(held_at, nbytes, cb_args)]}
+        self._early_objects: Dict[int, deque] = {}
+        self._early_objects_count = 0
+        self._early_objects_bytes = 0
+
+    def _hold_early_object(self, alias: int, nbytes: int, args) -> None:
+        """Hold an object for an alias no control message has bound yet;
+        one for a bound alias with no handler has no taker and drops."""
+        if alias is None or (alias in self._track_aliases
+                             and alias not in self._unbound_aliases):
+            return
+        self._expire_early_objects()
+        if (self._early_objects_count >= self.EARLY_OBJECT_MAX
+                or self._early_objects_bytes + nbytes
+                > self.EARLY_OBJECT_MAX_BYTES):
+            self._early_object_dropped(alias, "hold full")
+            return
+        # The parser reuses the object and a payload view need not outlive
+        # delivery; the hold does.
+        obj = copy.copy(args[0])
+        if isinstance(getattr(obj, 'payload', None), memoryview):
+            obj.payload = bytes(obj.payload)
+        args = (obj,) + tuple(args[1:])
+        q = self._early_objects.get(alias)
+        if q is None:
+            q = self._early_objects[alias] = deque()
+        q.append((time.monotonic(), nbytes, args))
+        self._early_objects_count += 1
+        self._early_objects_bytes += nbytes
+
+    def _expire_early_objects(self) -> None:
+        horizon = time.monotonic() - self.EARLY_OBJECT_HOLD_S
+        for alias in list(self._early_objects):
+            q = self._early_objects[alias]
+            while q and q[0][0] < horizon:
+                _, nbytes, _ = q.popleft()
+                self._early_objects_count -= 1
+                self._early_objects_bytes -= nbytes
+                self._early_object_dropped(alias, "expired")
+            if not q:
+                del self._early_objects[alias]
+
+    def _discard_early_objects(self, alias: int) -> None:
+        q = self._early_objects.pop(alias, None)
+        if q:
+            self._early_objects_count -= len(q)
+            self._early_objects_bytes -= sum(e[1] for e in q)
+            self._early_objects_dropped += len(q)
+
+    def _early_object_dropped(self, alias: int, why: str) -> None:
+        self._early_objects_dropped += 1
+        logger.debug(f"MOQT: dropped early object for track_alias={alias} "
+                     f"({why}; {self._early_objects_dropped} dropped)")
 
     def _latch_track_priority(self, track_alias: int,
                               track_extensions) -> None:
@@ -810,7 +900,7 @@ class _MOQTSessionMixin:
         if isinstance(msg, SubscribeOk):
             cb = self._pending_object_handlers.pop(msg.request_id, None)
             if cb is not None and msg.track_alias is not None:
-                self._object_handlers[msg.track_alias] = cb
+                self._bind_object_handler(msg.track_alias, cb)
         elif self._is_error_response(msg):
             rid = getattr(msg, 'request_id', None)
             self._drop_request_routes(rid)
@@ -894,7 +984,8 @@ class _MOQTSessionMixin:
 
         Streams of this track that ended in the last
         EARLY_STREAM_END_HOLD_S, before the handler existed, are
-        reported at once."""
+        reported at once; register the object handler first so held
+        objects replay ahead of them."""
         self._stream_end_handlers[track_alias] = callback
         early = self._early_stream_ends.pop(track_alias, None)
         if not early:
@@ -1471,29 +1562,32 @@ class _MOQTSessionMixin:
                     ObjectStatus.END_OF_TRACK,
                 )
                 cb = self._object_cb(alias)
+                now = int(time.time() * 1_000_000)
+                if getattr(hdr, 'default_priority', False):
+                    msg_obj.publisher_priority = (
+                        self._track_default_priority.get(
+                            alias, MOQT_DEFAULT_PRIORITY))
+                else:
+                    msg_obj.publisher_priority = getattr(
+                        hdr, 'publisher_priority', None)
+                msg_obj.stream_flags = (
+                    getattr(hdr, 'first_object', False),
+                    getattr(hdr, 'end_of_group', False),
+                    getattr(hdr, 'default_priority', False),
+                )
+                if state.subgroup_id is None:
+                    # SUBGROUP_ID_FIRST_OBJ: the header carries no
+                    # subgroup field and the parser resolves it from
+                    # the first object, so the stream's id is known
+                    # only now.
+                    state.subgroup_id = getattr(
+                        state.parser, 'subgroup_id', None)
+                args = (msg_obj, consumed, now,
+                        state.group_id, state.subgroup_id)
                 if cb:
-                    now = int(time.time() * 1_000_000)
-                    if getattr(hdr, 'default_priority', False):
-                        msg_obj.publisher_priority = (
-                            self._track_default_priority.get(
-                                alias, MOQT_DEFAULT_PRIORITY))
-                    else:
-                        msg_obj.publisher_priority = getattr(
-                            hdr, 'publisher_priority', None)
-                    msg_obj.stream_flags = (
-                        getattr(hdr, 'first_object', False),
-                        getattr(hdr, 'end_of_group', False),
-                        getattr(hdr, 'default_priority', False),
-                    )
-                    if state.subgroup_id is None:
-                        # SUBGROUP_ID_FIRST_OBJ: the header carries no
-                        # subgroup field and the parser resolves it from
-                        # the first object, so the stream's id is known
-                        # only now.
-                        state.subgroup_id = getattr(
-                            state.parser, 'subgroup_id', None)
-                    cb(msg_obj, consumed, now,
-                       state.group_id, state.subgroup_id)
+                    cb(*args)
+                else:
+                    self._hold_early_object(alias, consumed, args)
                 if terminal:
                     self._note_object_bound(alias, state.group_id,
                                             msg_obj.object_id, msg_obj.status)
@@ -2045,8 +2139,11 @@ class _MOQTSessionMixin:
                 self._malformed_track(alias, reason)
                 return
         cb = self._object_cb(alias)
+        args = (msg, consumed, now, msg.group_id, None)
         if cb:
-            cb(msg, consumed, now, msg.group_id, None)
+            cb(*args)
+        else:
+            self._hold_early_object(alias, consumed, args)
         eog = getattr(msg, 'end_of_group', False)
         if eog or status != ObjectStatus.NORMAL:
             self._note_object_bound(alias, msg.group_id, msg.object_id,
@@ -2480,6 +2577,7 @@ class _MOQTSessionMixin:
         self._published_tracks.clear()
         self._requests.clear()
         self._early_stream_ends.clear()
+        self._reset_early_objects()
 
         if not self._wt_session_setup.done():
             self._wt_session_setup.set_result(False)
@@ -4874,6 +4972,7 @@ class _MOQTSessionMixin:
         self._track_aliases.pop(track_alias, None)
         self._object_handlers.pop(track_alias, None)
         self._early_stream_ends.pop(track_alias, None)
+        self._discard_early_objects(track_alias)
         self._forget_track_bounds(track_alias)
 
     def _extend_request_credit(self, rid: int) -> None:

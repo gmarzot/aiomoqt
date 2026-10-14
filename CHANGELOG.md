@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Session: objects for a track alias not bound yet are held (bounded) and replayed on binding.
 - LOCMAF packaging (draft-einarsson-moq-locmaf, `locmafVersion` 0.3; a port of Eyevinn/locmaf
   v0.1.1): `aiomoqt.media.locmaf`, `LocmafTrackPublisher`, `LocmafTrackSubscriber`.
 - Catalog: `locmaf` packaging and `CatalogTrack.locmafVersion`, required exactly on locmaf tracks.
