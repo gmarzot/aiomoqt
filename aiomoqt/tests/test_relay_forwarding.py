@@ -637,14 +637,9 @@ _AHEAD_NS = "relay/ahead"
 
 
 async def _publish_ahead(session, name, groups):
-    """PUBLISH, then one-object groups ended by END_OF_GROUP, sent once
-    the relay has taken the PUBLISH and before anyone subscribes.
-    Returns the PUBLISH."""
+    """PUBLISH, then one-object groups ended by END_OF_GROUP, sent at once
+    without waiting for PUBLISH_OK (§5.1). Returns the PUBLISH."""
     msg = session.publish(namespace=_AHEAD_NS, track_name=name, forward=1)
-    for _ in range(100):
-        if _ahead_track(name) is not None and _ahead_track(name).upstream:
-            break
-        await asyncio.sleep(0.01)
     await _send_groups(session, msg.track_alias, name, range(groups))
     return msg
 
