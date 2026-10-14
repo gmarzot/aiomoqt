@@ -19,6 +19,9 @@
   FETCH anchors a joining FETCH; TRACK_STATUS reports Largest at d16 and d18.
 - `SubscribedTrack.largest`: the Largest Location the publisher reported in SUBSCRIBE_OK or
   PUBLISH.
+- Relay: an AbsoluteStart/AbsoluteRange SUBSCRIBE starting at or before Largest, or a
+  SUBSCRIBE_TRACKS offer, gets the cached objects inside its window first, then live ones.
+- Relay: a PUBLISH offered to a SUBSCRIBE_TRACKS subscriber carries LARGEST_OBJECT (§10.2.11).
 - d20+: SUBSCRIBE and REQUEST_UPDATE carry LOCATION_FILTER, length-prefixed at d20/d21 and
   typed at d22; `subscribe(location_filter=)` sends the forms Filter Type cannot express.
 - d20+: a subscription filter is always valid, and its end stops Objects without

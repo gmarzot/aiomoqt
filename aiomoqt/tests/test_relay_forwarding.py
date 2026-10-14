@@ -629,3 +629,136 @@ async def test_a_range_already_behind_is_refused(use_quic):
                 start_object=0, end_group=0, wait_response=True)
         assert err.value.error_code == RequestErrorCode.INVALID_RANGE
         assert rx._close_err is None
+
+
+# -- objects published before anyone subscribed ---------------------------
+
+_AHEAD_NS = "relay/ahead"
+
+
+async def _publish_ahead(session, name, groups):
+    """PUBLISH, then one-object groups ended by END_OF_GROUP, sent once
+    the relay has taken the PUBLISH and before anyone subscribes.
+    Returns the PUBLISH."""
+    msg = session.publish(namespace=_AHEAD_NS, track_name=name, forward=1)
+    for _ in range(100):
+        if _ahead_track(name) is not None and _ahead_track(name).upstream:
+            break
+        await asyncio.sleep(0.01)
+    await _send_groups(session, msg.track_alias, name, range(groups))
+    return msg
+
+
+async def _send_groups(session, alias, name, groups):
+    from aiomoqt.messages import SubgroupHeader
+    for g in groups:
+        sid = await session.open_uni_stream()
+        hdr = SubgroupHeader(track_alias=alias, group_id=g, subgroup_id=0,
+                             publisher_priority=128, extensions_present=True,
+                             prof=session._profile)
+        session.stream_write(sid, hdr.serialize().data)
+        session.stream_write(sid, hdr.next_object(
+            payload=f"{name}-{g}".encode(), extensions=None,
+            object_id=0).data)
+        session.stream_write(sid, hdr.end_group(object_id=1).data,
+                             end_stream=True)
+
+
+def _ahead_track(name):
+    return relay._tracks.get(((b"relay", b"ahead"), name.encode()))
+
+
+@contextlib.asynccontextmanager
+async def _ahead(port, use_quic, groups):
+    """A relay holding `groups` groups of video and audio, published on one
+    session before any subscriber. Yields (publisher, subscriber, msgs)."""
+    _reset_relay_state()
+    relay._track_subs.clear()
+    server = relay._build_server("localhost", port, CERT, KEY,
+                                 use_quic=use_quic, draft=18)
+    handle = await server.serve()
+    try:
+        async with contextlib.AsyncExitStack() as stack:
+            sessions = []
+            for _ in range(2):
+                client = MOQTClient("localhost", port, path="/",
+                                    use_quic=use_quic, verify_tls=False,
+                                    supported_drafts=18)
+                s = await stack.enter_async_context(client.connect())
+                await s.client_session_init()
+                sessions.append(s)
+            pub, sub = sessions
+            msgs = {name: await _publish_ahead(pub, name, groups)
+                    for name in ("video", "audio")}
+            for _ in range(100):
+                if all(_ahead_track(n) is not None
+                       and _ahead_track(n).largest == (groups - 1, 1)
+                       for n in msgs):
+                    break
+                await asyncio.sleep(0.02)
+            yield pub, sub, msgs
+    finally:
+        handle.close()
+        _reset_relay_state()
+        relay._track_subs.clear()
+
+
+@requires_certs
+@pytest.mark.asyncio
+@_TRANSPORTS
+async def test_an_absolute_start_before_largest_is_served_from_cache(
+        use_quic):
+    # §5.1.2: the Start MAY be less than the Largest Object; the relay
+    # serves what it holds, then what arrives, each object once.
+    async with _ahead(_BASE_PORT + 140 + (not use_quic), use_quic, 4) as (
+            pub, rx, msgs):
+        got = []
+        rx.on_object_received = lambda m, *_: got.append(bytes(m.payload))
+        for name, start in (("video", 2), ("audio", 1)):
+            await rx.subscribe(_AHEAD_NS, name, forward=1,
+                               filter_type=FilterType.ABSOLUTE_START,
+                               start_group=start, start_object=0,
+                               wait_response=True)
+        await asyncio.sleep(0.3)
+        for name in ("video", "audio"):
+            await _send_groups(pub, msgs[name].track_alias, name, [4])
+        want = sorted([b"video-2", b"video-3", b"video-4",
+                       b"audio-1", b"audio-2", b"audio-3", b"audio-4"])
+        for _ in range(100):
+            if len([p for p in got if p]) >= len(want):
+                break
+            await asyncio.sleep(0.02)
+        await asyncio.sleep(0.1)
+        assert sorted(p for p in got if p) == want
+        assert rx._close_err is None
+
+
+@requires_certs
+@pytest.mark.asyncio
+@_TRANSPORTS
+async def test_a_subscribe_tracks_offer_carries_largest_and_the_cache(
+        use_quic):
+    # §10.2.11: a PUBLISH for a track with objects carries LARGEST_OBJECT.
+    async with _ahead(_BASE_PORT + 142 + (not use_quic), use_quic, 2) as (
+            _pub, rx, _msgs):
+        got = {"video": [], "audio": []}
+        await rx.subscribe_tracks(namespace=_AHEAD_NS)
+        for _ in range(2):
+            offer = await rx.await_publish(timeout=5.0)
+            name = offer.track_name.decode()
+            assert (offer.largest_group_id, offer.largest_object_id) == (1, 1)
+            rx._track_aliases[offer.track_alias] = offer.request_id
+            rx.register_object_handler(
+                offer.track_alias,
+                lambda m, *_, n=name: got[n].append(bytes(m.payload)))
+            rx.publish_ok(offer, forward=1,
+                          filter_type=FilterType.ABSOLUTE_START,
+                          start_group=0, start_object=0)
+        for _ in range(100):
+            if all(len([p for p in v if p]) >= 2 for v in got.values()):
+                break
+            await asyncio.sleep(0.02)
+        assert {n: [p for p in v if p] for n, v in got.items()} == {
+            "video": [b"video-0", b"video-1"],
+            "audio": [b"audio-0", b"audio-1"]}
+        assert rx._close_err is None

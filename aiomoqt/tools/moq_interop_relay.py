@@ -254,7 +254,7 @@ class _Downstream:
     """One downstream subscription to a relayed track."""
 
     __slots__ = ("session", "alias", "request_id", "forward", "window",
-                 "joined_at")
+                 "joined_at", "replaying")
 
     def __init__(self, session, alias, request_id, forward=True,
                  window=_UNFILTERED):
@@ -267,6 +267,9 @@ class _Downstream:
         self.window = window
         # Joining Location (§5.1): Largest when Forward State became 1.
         self.joined_at = None
+        # Waiting for the cache replay queued for it; live objects skip it
+        # until then and reach it through the replay.
+        self.replaying = False
 
     def passes(self, group_id, object_id) -> bool:
         """Forward State 1 and inside the filter window."""
@@ -316,6 +319,9 @@ class _RelayedTrack:
         # all, and an unbounded one is a leak.
         self._cache = deque()
         self._cache_bytes = 0
+        # (group, subgroup) whose upstream stream ended cleanly; a replay
+        # FINs them on the subscriber it serves.
+        self._ended = set()
         # Alias the upstream gave this track. A publisher may reuse one
         # across successive subscriptions on a session it keeps open, so
         # the registrations under it are released when the track ends.
@@ -461,6 +467,8 @@ class _RelayedTrack:
         self.queue.put_nowait(
             (group_id, subgroup_id or 0, None, None, None, None,
              "END" if clean else "RESET", reset_code))
+        if clean:
+            self._ended.add((group_id, subgroup_id or 0))
         self._ensure_drain()
         self._upstream_ended += 1
         self._check_pending_done()
@@ -504,13 +512,20 @@ class _RelayedTrack:
             self.task = asyncio.create_task(self._forward_loop())
 
     def add_downstream(self, session, track_alias, request_id=None,
-                       forward=True, window=_UNFILTERED) -> _Downstream:
+                       forward=True, window=_UNFILTERED,
+                       replay=False) -> _Downstream:
+        """Join the fan-out. With `replay`, cached objects inside the
+        window go to the subscriber first, then live ones."""
         self.attaching = False
         d = _Downstream(session, track_alias, request_id, forward, window)
         if forward:
             # A joining FETCH from this subscriber backfills to here.
             d.joined_at = self.largest
         self.downstream.append(d)
+        if replay:
+            d.replaying = True
+            self.queue.put_nowait((None, None, None, None, None, None,
+                                   "REPLAY", d))
         self._ensure_drain()
         return d
 
@@ -542,9 +557,14 @@ class _RelayedTrack:
                 return
             if self._finished:
                 continue
+            if status == "REPLAY":
+                await self._replay(shape)
+                continue
             if oid is not None:
                 self._remember(gid, sgid, oid, payload, exts, prio, status)
             for d in list(self.downstream):
+                if d.replaying:
+                    continue
                 if oid is not None:
                     if d.past_end(gid):
                         self.end_downstream(d)
@@ -576,6 +596,34 @@ class _RelayedTrack:
                                or self._cache_bytes > CACHE_BYTES):
             dropped = self._cache.popleft()
             self._cache_bytes -= len(dropped[3] or b"")
+        if self._cache:
+            first = self._cache[0][0]
+            self._ended = {k for k in self._ended if k[0] >= first}
+
+    async def _replay(self, d) -> None:
+        """The cached objects inside `d`'s window, in Location order,
+        then FIN for the subgroups the publisher has already ended."""
+        d.replaying = False
+        if d not in self.downstream:
+            return
+        objs = sorted((c for c in self._cache if d.passes(c[0], c[2])),
+                      key=lambda c: (c[0], c[1], c[2]))
+        try:
+            for gid, sgid, oid, payload, exts, prio, status in objs:
+                self._objects_out += 1
+                await self._forward_one(d.session, d.alias, gid, sgid, oid,
+                                        payload, exts, prio, status)
+            for gid, sgid in sorted({(c[0], c[1]) for c in objs}):
+                if (gid, sgid) in self._ended:
+                    await self._forward_one(d.session, d.alias, gid, sgid,
+                                            None, None, None, None, "END")
+        except Exception:
+            logger.debug("relay: replay failed, dropping subscriber",
+                         exc_info=True)
+            self.drop_session(d.session)
+            return
+        logger.info(f"relay: replayed {len(objs)} cached object(s) of "
+                    f"{self.key} to request {d.request_id}")
 
     def cache_covers(self, start) -> bool:
         """True when the cache still holds the start of the range. The
@@ -1113,8 +1161,13 @@ def _attach_subscriber(session, msg, track) -> bool:
     ok = session.subscribe_ok(request_msg=msg, **_largest_kwargs(track))
     # FORWARD omitted means 1 (§10.2.12).
     forward = msg.forward is None or bool(msg.forward)
+    # An explicit Start at or before Largest is served from the cache
+    # first (§5.1.2: the Start MAY be less than the Largest Object).
+    replay = (msg.filter_type in (FilterType.ABSOLUTE_START,
+                                  FilterType.ABSOLUTE_RANGE)
+              and track.largest is not None and window[0] <= track.largest)
     track.add_downstream(session, ok.track_alias, msg.request_id,
-                         forward=forward, window=window)
+                         forward=forward, window=window, replay=replay)
     session.register_request_cancel_handler(
         msg.request_id, lambda rid, t=track, s=session: t.drop_session(s))
     return True
@@ -1342,7 +1395,7 @@ async def _offer_track(session, track, key):
     pub_msg = session.publish(
         namespace=ns,
         track_name=(name.decode() if isinstance(name, bytes) else name),
-        forward=1)
+        forward=1, largest=track.largest)
     fut = session._loop.create_future()
     session._pending_requests[pub_msg.request_id] = fut
     try:
@@ -1356,8 +1409,10 @@ async def _offer_track(session, track, key):
         forward = (getattr(reply, 'parameters', None) or {}).get(
             ParamType.FORWARD, 1)
     window = _filter_window(*_reply_filter(session, reply), track.largest)
+    # Cached objects inside the subscriber's window go first.
     track.add_downstream(session, pub_msg.track_alias, pub_msg.request_id,
-                         forward=bool(forward), window=window)
+                         forward=bool(forward), window=window,
+                         replay=track.largest is not None)
     session.register_request_cancel_handler(
         pub_msg.request_id,
         lambda rid, t=track, s=session: t.drop_session(s))
