@@ -241,3 +241,14 @@ def test_known_violations_are_still_real():
             assert actual.get(opt) == dest, (
                 f"{tool}: {opt} no longer means {dest!r} — remove it "
                 f"from KNOWN_GRID_VIOLATIONS")
+
+
+def test_packaging_flag_agrees_across_media_tools():
+    """--packaging is long-only and offers the same choices on both media
+    tools: no new letter, no per-tool subset."""
+    from aiomoqt.media import MEDIA_PACKAGINGS
+    for tool in ("pub_media", "sub_media"):
+        acts = [a for a in _parser_actions(tool) if a.dest == "packaging"]
+        assert len(acts) == 1, tool
+        assert acts[0].option_strings == ["--packaging"], tool
+        assert tuple(acts[0].choices) == MEDIA_PACKAGINGS, tool

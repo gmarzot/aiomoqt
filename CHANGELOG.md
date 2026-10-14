@@ -25,6 +25,21 @@
 - Relay: the cache keeps each object's stream shape and datagram mode, and a replay reuses
   them; FIRST_OBJECT is set only on a stream that opens with the subgroup's first object, so
   a subscriber joining mid-subgroup no longer gets it.
+- Session: objects for a track alias not bound yet are held (bounded) and replayed on binding.
+- LOCMAF packaging (draft-einarsson-moq-locmaf, `locmafVersion` 0.3; a port of Eyevinn/locmaf
+  v0.1.1): `aiomoqt.media.locmaf`, `LocmafTrackPublisher`, `LocmafTrackSubscriber`.
+- Catalog: `locmaf` packaging and `CatalogTrack.locmafVersion`, required exactly on locmaf tracks.
+- `MediaSubscriber` subscribes a LOCMAF track only at a supported `locmafVersion` and with an init.
+- `pub_media --packaging locmaf` with `--mp4` or `--input`; `--mp4` audio goes in ~1 s groups.
+- `sub_media --packaging` subscribes only that packaging's tracks.
+- `sub_media` writes LOCMAF tracks as fMP4 and reports each track's rejected objects.
+- `sub_media` writes `<name>.mp4` when several tracks share a role.
+- `sub_media --analyze` counts the bytes on the wire.
+- `LocTrackPublisher._package()` and `LocTrackSubscriber._unpackage()` hooks for packagers.
+- Regression: manual suite `media-locmaf` against Eyevinn's moqlivemock.
+- aiopquic floor `>=0.5.0a4`.
+- Fix: a WebTransport client connection releases its transport's event dispatcher on exit; each
+  one kept its transport, rings and wake fd.
 - d20+: SUBSCRIBE and REQUEST_UPDATE carry LOCATION_FILTER, length-prefixed at d20/d21 and
   typed at d22; `subscribe(location_filter=)` sends the forms Filter Type cannot express.
 - d20+: a subscription filter is always valid, and its end stops Objects without
