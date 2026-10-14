@@ -30,6 +30,7 @@ from .messages import (
     RequestOk, RequestUpdate, Subscribe, SubscribeNamespace, SubscribeTracks,
     TrackStatus,
 )
+from .messages.subscribe import SubscribeOk
 from .types import *
 from .types import (D20MessageType, FilterType, MOQTDraft, MOQTException,
                     MOQTMessageType, MOQTProtocolViolation, MOQTRequestError,
@@ -364,6 +365,9 @@ class _MOQTSessionMixin:
         self._request_cancel_handlers: Dict[int, Callable] = {}
         # request_id -> callback fired on PUBLISH_DONE for that request.
         self._publish_done_handlers: Dict[int, Callable] = {}
+        # Our SUBSCRIBE request id -> object handler, bound to the track
+        # alias where its SUBSCRIBE_OK is parsed.
+        self._pending_object_handlers: Dict[int, Callable] = {}
         # Tracks this session serves, by full track name; control
         # messages addressed to one are routed to it.
         self._published_tracks: Dict[Tuple[Tuple[bytes, ...], bytes], Any] = {}
@@ -451,6 +455,9 @@ class _MOQTSessionMixin:
         # Fires for normal objects only (end-of-range markers are logged
         # and the stream is expected to FIN shortly after).
         self.on_fetch_object: Optional[Callable] = None
+        # FETCH request id -> callback for its objects, ahead of
+        # on_fetch_object (same signature).
+        self._fetch_object_handlers: Dict[int, Callable] = {}
 
         # Per-fetch completion futures. Resolved when the fetch uni
         # stream's processing task exits (FIN, RESET, or error).
@@ -531,6 +538,15 @@ class _MOQTSessionMixin:
                 response=response,
             )
         return response
+
+    async def _await_routed(self, request_id: int):
+        """_await_response for a request that registered handlers: a
+        wait that fails or is abandoned drops them."""
+        try:
+            return await self._await_response(request_id)
+        except BaseException:
+            self._drop_request_routes(request_id)
+            raise
 
     async def await_fetch_done(self, request_id: int,
                               timeout: float = 10.0) -> bool:
@@ -767,6 +783,38 @@ class _MOQTSessionMixin:
         subscription `request_id` (§10.11). Once per request; the
         session stays up."""
         self._publish_done_handlers[request_id] = callback
+
+    def register_fetch_object_handler(self, request_id: int,
+                                      callback: Callable) -> None:
+        """Route FETCH `request_id`'s objects to `callback` instead of the
+        session-global on_fetch_object (same signature). Dropped when the
+        fetch stream ends or the FETCH is refused."""
+        self._fetch_object_handlers[request_id] = callback
+
+    def unregister_fetch_object_handler(self, request_id: int) -> None:
+        self._fetch_object_handlers.pop(request_id, None)
+
+    def _drop_request_routes(self, request_id) -> None:
+        """Forget the handlers a request of ours registered: it was
+        refused, or its awaiter gave up."""
+        self._pending_object_handlers.pop(request_id, None)
+        self._publish_done_handlers.pop(request_id, None)
+        self._fetch_object_handlers.pop(request_id, None)
+
+    def _route_reply(self, msg) -> None:
+        """Act on a reply as it is parsed, ahead of the data streams in
+        its batch and of the handler task: SUBSCRIBE_OK binds the
+        request's object handler to its alias; an error reply drops what
+        the request registered, and a refused PUBLISH_NAMESPACE announces
+        nothing."""
+        if isinstance(msg, SubscribeOk):
+            cb = self._pending_object_handlers.pop(msg.request_id, None)
+            if cb is not None and msg.track_alias is not None:
+                self._object_handlers[msg.track_alias] = cb
+        elif self._is_error_response(msg):
+            rid = getattr(msg, 'request_id', None)
+            self._drop_request_routes(rid)
+            self._announced.pop(rid, None)
 
     def _on_request_stream_terminated(
             self, stream_id: int, *,
@@ -1066,6 +1114,7 @@ class _MOQTSessionMixin:
                 raise MOQTProtocolViolation(
                     f"{message_class.__name__} body ends "
                     f"{end_pos - buf.tell()} bytes short of its Length")
+            self._route_reply(msg)
             logger.info(f"MOQT event: control message parsed: {msg})")
             refusal = (self._resolve_auth_token(msg)
                        or self._refuse_request(msg))
@@ -1214,6 +1263,7 @@ class _MOQTSessionMixin:
         if key and len(key) == 2 and key[0] == 'fetch':
             request_id = key[1]
             clean = error_code == QuicErrorCode.NO_ERROR
+            self._fetch_object_handlers.pop(request_id, None)
             fut = self._fetch_done_futures.pop(request_id, None)
             if fut and not fut.done():
                 fut.set_result(clean)
@@ -1462,17 +1512,18 @@ class _MOQTSessionMixin:
             elif isinstance(msg_obj, FetchHeader):
                 pass
             elif isinstance(msg_obj, FetchObject):
-                if msg_obj.end_of_range is None and self.on_fetch_object:
+                if msg_obj.end_of_range is None:
                     parser = state.parser
                     request_id = (
                         parser.request_id
                         if isinstance(parser, FetchHeader)
                         else None
                     )
-                    now = int(time.time() * 1_000_000)
-                    self.on_fetch_object(
-                        msg_obj, consumed, now, request_id
-                    )
+                    cb = (self._fetch_object_handlers.get(request_id)
+                          or self.on_fetch_object)
+                    if cb:
+                        now = int(time.time() * 1_000_000)
+                        cb(msg_obj, consumed, now, request_id)
             else:
                 logger.error(
                     f"MOQT stream({stream_id}): unexpected msg "
@@ -3512,12 +3563,20 @@ class _MOQTSessionMixin:
         parameters: Optional[Dict[int, bytes]] = None,
         wait_response: Optional[bool] = False,
         location_filter: Optional[LocationFilter] = None,
+        on_object: Optional[Callable] = None,
+        on_done: Optional[Callable] = None,
     ) -> Optional[MOQTMessage]:
         """Subscribe to a track with configurable options.
 
         From d20 the filter travels as LOCATION_FILTER: filter_type and
         its Locations are converted, or `location_filter` is sent as is
-        for the forms they cannot express."""
+        for the forms they cannot express.
+
+        `on_object` receives this track's objects (the
+        register_object_handler signature), bound to its alias as
+        SUBSCRIBE_OK is parsed; `on_done` is its PUBLISH_DONE handler
+        (register_publish_done_handler). Both are registered before
+        SUBSCRIBE is sent and dropped if it is refused."""
         if parameters is None:
             parameters = {}
         if location_filter is not None and not uses_location_filter(
@@ -3546,12 +3605,17 @@ class _MOQTSessionMixin:
         )
         message.libquicr_compat = self._session.libquicr_compat
         self._subscriptions[request_id] = [message]
+        if on_object is not None:
+            self._pending_object_handlers[request_id] = on_object
+        if on_done is not None:
+            self.register_publish_done_handler(request_id, on_done)
         logger.info(f"MOQT send: {message}")
         self._send_request(request_id, message)
 
         if not wait_response:
             return message
-
+        if on_object is not None or on_done is not None:
+            return self._await_routed(request_id)
         return self._await_response(request_id)
 
     def track_status(
@@ -3970,11 +4034,13 @@ class _MOQTSessionMixin:
         end_object: int = 0,
         parameters: Optional[Dict[int, bytes]] = None,
         wait_response: Optional[bool] = False,
+        on_object: Optional[Callable] = None,
     ) -> Optional[MOQTMessage]:
         """Standalone FETCH of a range of objects from a track.
 
         Per spec §9.16.1: End Location.Object of 0 means the entire end
-        group is requested.
+        group is requested. `on_object` receives this FETCH's objects
+        (register_fetch_object_handler), registered before it is sent.
         """
         self._check_fetch_supported()
         parameters = {} if parameters is None else parameters
@@ -3999,6 +4065,8 @@ class _MOQTSessionMixin:
         self._subscriptions[request_id] = [message]
         self._fetch_done_futures[request_id] = \
             self._loop.create_future()
+        if on_object is not None:
+            self.register_fetch_object_handler(request_id, on_object)
         logger.info(f"MOQT send: {message}")
         # FETCH is a request opener: at d18 it must open its own bidi
         # request stream (like SUBSCRIBE/PUBLISH); pre-d18 _send_request
@@ -4007,6 +4075,8 @@ class _MOQTSessionMixin:
 
         if not wait_response:
             return message
+        if on_object is not None:
+            return self._await_routed(request_id)
         return self._await_response(request_id)
 
     def _check_fetch_supported(self) -> None:
@@ -4141,6 +4211,11 @@ class _MOQTSessionMixin:
 
         return self._await_response(request_id)
 
+    def is_announced(self, namespace: Union[str, Tuple[str, ...]]) -> bool:
+        """True while a PUBLISH_NAMESPACE we sent for `namespace` is
+        neither withdrawn nor refused."""
+        return self._make_namespace_tuple(namespace) in self._announced.values()
+
     def _our_namespaces(self) -> set:
         """Namespaces this session announces or serves tracks under."""
         return (set(self._announced.values())
@@ -4261,12 +4336,12 @@ class _MOQTSessionMixin:
 
     def publish_namespace_done(
         self,
-        namespace: Tuple[bytes, ...] = None,
+        namespace: Optional[Union[str, Tuple[str, ...]]] = None,
         request_id: int = None,
     ) -> Optional[MOQTMessage]:
         """Withdraw a track namespace announcement.
 
-        Draft-14 takes the namespace tuple, draft-16 the request_id of
+        Draft-14 takes the namespace, draft-16 the request_id of
         the original PUBLISH_NAMESPACE, and both send
         PUBLISH_NAMESPACE_DONE. Draft-18 has no such message: a request
         owns a bidirectional stream and is cancelled by abruptly
@@ -4293,6 +4368,8 @@ class _MOQTSessionMixin:
             self.stream_reset(stream_id, StreamResetCode.CANCELLED)
             self._bidi_streams.pop(request_id, None)
             return None
+        namespace = (withdrawn if namespace is None
+                     else self._make_namespace_tuple(namespace))
         message = PublishNamespaceDone(namespace=namespace, request_id=request_id)
         logger.info(f"MOQT send: {message}")
         self.send_control_message(message)

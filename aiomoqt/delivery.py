@@ -175,13 +175,14 @@ class SubgroupDelivery:
 
     async def write(self, group_id: int, object_id: int, payload: bytes, *,
                     extensions: Optional[Dict[int, Any]] = None,
-                    group_start: bool = False) -> None:
-        """Place one object. `group_start` rotates the PER_GROUP stream.
-        A callable `extensions` is resolved against this session."""
+                    group_start: bool = False) -> bool:
+        """Place one object; False when the peer's filter excludes it.
+        `group_start` rotates the PER_GROUP stream. A callable
+        `extensions` is resolved against this session."""
         if self.passes is not None and not self.passes(group_id, object_id):
             if group_start:
                 self.end_group()
-            return
+            return False
         if callable(extensions):
             extensions = extensions(self.session)
         if self.mapping is StreamMapping.DATAGRAM:
@@ -233,6 +234,7 @@ class SubgroupDelivery:
         self._note_largest(group_id, object_id)
         self.objects_sent += 1
         self.bytes_sent += len(payload)
+        return True
 
     def abort(self) -> None:
         """Give up now, closing the open group if the session still
@@ -262,13 +264,15 @@ class _Lane:
     """
 
     def __init__(self, delivery: SubgroupDelivery, queue_size: int,
-                 gate=None):
+                 gate=None, on_sent=None):
         self.delivery = delivery
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=queue_size)
         self.shed = 0
         self.need_group = False   # skipping until the next group starts
         # Returns False while this peer's Forward State is 0 (§5.1).
         self.gate = gate
+        # Called as on_sent(group_id, object_id) for each object written.
+        self.on_sent = on_sent
         self._truncated = False
         self.task = asyncio.ensure_future(self._drain())
 
@@ -342,9 +346,11 @@ class _Lane:
                     continue
                 self.need_group = False
                 self._truncated = False
-            await self.delivery.write(group_id, object_id, payload,
-                                      extensions=extensions,
-                                      group_start=group_start)
+            sent = await self.delivery.write(group_id, object_id, payload,
+                                             extensions=extensions,
+                                             group_start=group_start)
+            if sent and self.on_sent is not None:
+                self.on_sent(group_id, object_id)
 
 
 class FanoutDelivery:
@@ -365,6 +371,10 @@ class FanoutDelivery:
         # Called as on_write(group_id, object_id, payload, extensions) for
         # each object, once, however many lanes there are.
         self.on_write: Optional[Callable] = None
+        # Called as on_sent(group_id, object_id) each time a lane writes
+        # an object to its peer: once per peer, never for one gated,
+        # filtered out or shed.
+        self.on_sent: Optional[Callable] = None
         for delivery in deliveries:
             self.add(delivery, joining=False)
 
@@ -372,10 +382,14 @@ class FanoutDelivery:
             joining: bool = True) -> _Lane:
         """Attach another peer. `joining` holds it to the next group
         boundary, which is where a mid-stream arrival can start."""
-        lane = _Lane(delivery, self.queue_size, gate)
+        lane = _Lane(delivery, self.queue_size, gate, self._sent)
         lane.need_group = joining
         self.lanes.append(lane)
         return lane
+
+    def _sent(self, group_id: int, object_id: int) -> None:
+        if self.on_sent is not None:
+            self.on_sent(group_id, object_id)
 
     def drop_session(self, session) -> bool:
         """Detach a session's lanes, closing any open group. True if it
