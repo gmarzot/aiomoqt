@@ -38,9 +38,10 @@ from .delivery import (
     FanoutDelivery, ObjectHistory, StreamMapping, SubgroupDelivery,
 )
 from .messages import (
-    MOQTMessage, ObjectDatagram, PublishOk, RequestError, RequestOk,
-    RequestUpdate,
+    FetchHeader, LocationFilter, MOQTMessage, ObjectDatagram, PublishOk,
+    RequestError, RequestOk, RequestUpdate,
 )
+from .messages.params import D20ParamType, LocationFilterType
 from .context import is_draft16_or_later
 from .messages.fetch import _is_joining
 from .utils.buffer import Buffer
@@ -131,8 +132,9 @@ _DGRAM_HEADER_MARGIN = 48
 
 
 # A subscription's filter window (§5.1.2): (start Location, end group or
-# None). Two strings stand for a window whose End Group is behind
-# production: _ENDED until its streams close, _DONE once PUBLISH_DONE went.
+# None[, last object of the end group]). Two strings stand for a window
+# whose End Group is behind production: _ENDED until its streams close,
+# _DONE once PUBLISH_DONE went.
 _UNFILTERED = ((0, 0), None)
 _ENDED = "ended"
 _DONE = "done"
@@ -153,6 +155,37 @@ def _filter_window(filter_type, start_group, start_object, end_group,
         return _UNFILTERED
     return start, (end_group if filter_type == FilterType.ABSOLUTE_RANGE
                    else None)
+
+
+def _location_window(lf: LocationFilter, largest) -> tuple:
+    """The window of a d20+ Location Filter (§5.1.2), given the Largest
+    Location when it was applied."""
+    t = lf.type
+    if t == LocationFilterType.NONE:
+        return _UNFILTERED
+    if t == LocationFilterType.NEXT_OBJECT:
+        start = (0, 0) if largest is None else (largest[0], largest[1] + 1)
+    elif t == LocationFilterType.RELATIVE_START:
+        next_group = 0 if largest is None else largest[0] + 1
+        start = (max(0, next_group - lf.start_group), 0)
+    else:
+        start = (lf.start_group, lf.start_object)
+    if t == LocationFilterType.ABSOLUTE_GROUP_END:
+        return start, lf.end_group
+    if t == LocationFilterType.ABSOLUTE_RANGE:
+        return start, lf.end_group, lf.end_object
+    return start, None
+
+
+def _subscription_window(msg, largest) -> tuple:
+    """The window a SUBSCRIBE or REQUEST_UPDATE asks for."""
+    lf = getattr(msg, 'location_filter', None)
+    if lf is not None:
+        return _location_window(lf, largest)
+    return _filter_window(getattr(msg, 'filter_type', None),
+                          getattr(msg, 'start_group', None),
+                          getattr(msg, 'start_object', None),
+                          getattr(msg, 'end_group', None), largest)
 
 
 class _SubgroupSender:
@@ -186,7 +219,8 @@ class _SubgroupSender:
     def end_stream(self) -> None:
         if self.stream_id is None:
             return
-        if self.subgroup_id == 0:
+        if self.subgroup_id == 0 and not self.sub.excludes_end(
+                self.header.group_id, self.track.group_size):
             buf = self.header.end_group(object_id=self.track.group_size)
             self.session.stream_write(self.stream_id, buf.data,
                                       end_stream=True)
@@ -249,7 +283,8 @@ class _Subscription:
     __slots__ = ('session', 'track_alias', 'request_id',
                  'subscribe_request_id', 'subscribers', 'state', 'forward',
                  'done', 'stream_count', 'generating', 'delivery', 'joining',
-                 'window', 'open_streams', 'end_status', 'senders')
+                 'window', 'open_streams', 'end_status', 'senders',
+                 'fill_streams')
 
     def __init__(self, session):
         self.session = session
@@ -279,6 +314,8 @@ class _Subscription:
         self.end_status = SubscribeDoneCode.SUBSCRIPTION_ENDED
         # _SubgroupSenders with a stream open for this peer.
         self.senders: set = set()
+        # d20 fill fetch streams opened for this peer (§5.1.3).
+        self.fill_streams = 0
 
     def passes(self, group_id: int, object_id: int) -> bool:
         """True when the subscription takes this Location: Forward State 1
@@ -286,9 +323,20 @@ class _Subscription:
         window = self.window
         if not self.forward or isinstance(window, str):
             return False
-        start, end_group = window
-        return ((group_id, object_id) >= start
-                and (end_group is None or group_id <= end_group))
+        end_group = window[1]
+        if (group_id, object_id) < window[0]:
+            return False
+        if end_group is None or group_id < end_group:
+            return True
+        return group_id == end_group and (
+            len(window) < 3 or object_id <= window[2])
+
+    def excludes_end(self, group_id: int, object_id: int) -> bool:
+        """True when a d20 filter ends inside this group, before
+        `object_id`."""
+        window = self.window
+        return (not isinstance(window, str) and len(window) > 2
+                and group_id == window[1] and object_id > window[2])
 
     def past_end(self, group_id: int) -> bool:
         """True once production is past the filter's End Group."""
@@ -454,12 +502,14 @@ class PublishedTrack(Track):
         if self._out is None:
             self._out = FanoutDelivery()
             self._out.on_write = self._on_produced
+            self._out.on_sent = self._on_sent
         self._out.drop_session(sub.session)
         sub.delivery = SubgroupDelivery(sub.session, sub.track_alias,
                                         priority=self.priority,
                                         mapping=self.mapping,
                                         stream_priority=self.stream_priority)
         sub.delivery.passes = sub.passes
+        sub.delivery.excludes_end = sub.excludes_end
         self._out.add(sub.delivery,
                       gate=lambda: sub.forward and sub.generating)
 
@@ -614,6 +664,10 @@ class PublishedTrack(Track):
         self._remember(group_id, object_id, payload,
                        subgroup_id=subgroup_id, extensions=extensions)
 
+    def _on_sent(self, group_id: int, object_id: int) -> None:
+        """FanoutDelivery.on_sent: a produce() object reached one peer's
+        stream or datagram. A hook for subclasses."""
+
     def attach(self, session=None) -> None:
         """Serve this track on a session without announcing it:
         SUBSCRIBEs for its full name, and replies and updates for its
@@ -677,6 +731,8 @@ class PublishedTrack(Track):
                 forward=forward,
                 largest=self._largest,
             )
+            # From d20 a SUBSCRIBE_TRACKS the PUBLISH answers sets it.
+            forward = pub_msg.forward
             sub.track_alias = pub_msg.track_alias
             sub.request_id = pub_msg.request_id
             # §5.1: the Largest Location PUBLISH carried is its Joining
@@ -815,7 +871,11 @@ class PublishedTrack(Track):
                    if msg.parameters else None)
         raw_filter = (msg.parameters.get(ParamType.SUBSCRIPTION_FILTER)
                       if msg.parameters else None)
-        if raw_filter is not None:
+        if isinstance(raw_filter, LocationFilter):
+            if not isinstance(sub.window, str):
+                sub.window = _location_window(raw_filter, self._largest)
+            self._cut_streams(sub)
+        elif raw_filter is not None:
             sub.window = _filter_window(
                 *MOQTMessage._decode_filter(raw_filter, prof=session._profile),
                 self._largest)
@@ -830,6 +890,7 @@ class PublishedTrack(Track):
                             RequestOk(request_id=msg.request_id,
                                       parameters=params))
         self._set_forward(sub, forward)
+        await self._fail_fill(session, sub, msg)
         if forward:
             await self._start_generating(session, "REQUEST_UPDATE")
 
@@ -847,11 +908,11 @@ class PublishedTrack(Track):
         # Report real content state: a subscriber that sees
         # ContentExists=0 rightly skips its joining FETCH (mlmsub does).
         reported = self._largest
-        window = _filter_window(getattr(msg, 'filter_type', None),
-                                getattr(msg, 'start_group', None),
-                                getattr(msg, 'start_object', None),
-                                getattr(msg, 'end_group', None), reported)
-        if (window[1] is not None and reported is not None
+        window = _subscription_window(msg, reported)
+        # From d20 a filter is always valid (§5.1.2); before, an elapsed
+        # End Group is refused.
+        if (session._profile.publish_done_subscription_ended
+                and window[1] is not None and reported is not None
                 and reported[0] > window[1]):
             # §5.1.2: the whole End Group is already published.
             code = (RequestErrorCode.INVALID_RANGE
@@ -883,9 +944,40 @@ class PublishedTrack(Track):
             lambda rid, s=sub: self._on_request_cancelled(rid, s))
         sub.window = window
         self._set_forward(sub, getattr(msg, 'forward', None))
+        await self._fail_fill(session, sub, msg)
         if sub.forward:
             sub.joining[msg.request_id] = reported
             await self._start_generating(session, "SUBSCRIBE")
+
+    async def _fail_fill(self, session, sub, msg) -> None:
+        """A d20 FILL_PARAMETERS asks for a fill fetch stream (§5.1.3).
+        Fills are not served yet, so one that has Objects to deliver
+        fails the way the spec gives: the stream opens with its
+        FETCH_HEADER and is reset. The subscription goes on."""
+        params = msg.parameters or {}
+        fill = params.get(D20ParamType.FILL_PARAMETERS)
+        if fill is None or not sub.forward or self._largest is None:
+            return
+        # The fill range: FILL_PARAMETERS' own filter, else the
+        # subscription's, read as for a FETCH (§5.1.3).
+        lf = (fill.get(ParamType.LOCATION_FILTER)
+              or getattr(msg, 'location_filter', None)
+              or params.get(ParamType.LOCATION_FILTER))
+        if isinstance(lf, LocationFilter):
+            start = _location_window(lf, self._largest)[0]
+        elif isinstance(sub.window, str):
+            return
+        else:
+            start = sub.window[0]
+        if start > self._largest:
+            return
+        stream_id = await session.open_uni_stream()
+        sub.fill_streams += 1
+        session.stream_write(stream_id, FetchHeader(
+            request_id=msg.request_id).serialize(prof=session._profile).data)
+        session.stream_reset(stream_id, StreamResetCode.INTERNAL_ERROR)
+        logger.info(f"Track: fill for request {msg.request_id} failed: "
+                    f"fills are not served")
 
     async def _on_fetch_update(self, session, msg) -> None:
         """REQUEST_UPDATE for a FETCH being served: a priority change is
@@ -1033,7 +1125,12 @@ class PublishedTrack(Track):
             self._end_subscription(sub, SubscribeDoneCode.TRACK_ENDED)
 
     def _range_ended(self, sub) -> None:
-        """Production passed the subscription's End Group."""
+        """Production passed the subscription's End Group. From d20 the
+        subscription stays open (§5.1.2): only this peer's producers
+        stop."""
+        if not sub.session._profile.publish_done_subscription_ended:
+            sub.generating = False
+            return
         self._end_subscription(sub, SubscribeDoneCode.SUBSCRIPTION_ENDED)
 
     def _end_subscription(self, sub, status: int) -> None:
@@ -1094,7 +1191,7 @@ class PublishedTrack(Track):
         # Streams this peer was actually sent, which is the delivery's
         # count when one carried the track.
         count = (sub.stream_count if sub.delivery is None
-                 else sub.delivery.stream_count)
+                 else sub.delivery.stream_count) + sub.fill_streams
         msg = SubscribeDone(
             request_id=req_id,
             status_code=status_code,
@@ -1609,18 +1706,9 @@ class SubscribedTrack(Track):
                 self.session.register_object_handler(
                     self.track_alias, self.on_object)
 
-        ok = PublishOk(
-            request_id=pub_msg.request_id,
-            forward=forward,
-            priority=128,
-            group_order=GroupOrder.ASCENDING,
-            filter_type=FilterType.LATEST_OBJECT,
-            parameters={},
-        )
         logger.info(f"Track: PUBLISH_OK {self.fqtn} "
                     f"alias={self.track_alias} forward={forward}")
-        # Reply returns on the PUBLISH's own bidi stream at d18.
-        self.session._send_reply(pub_msg.request_id, ok)
+        self.session.publish_ok(pub_msg, forward=forward)
 
         self._watch_done(pub_msg.request_id)
         self.state = TrackState.SUBSCRIBED

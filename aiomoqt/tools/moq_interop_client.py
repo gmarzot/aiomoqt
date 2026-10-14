@@ -1442,7 +1442,7 @@ def parse_args():
         help="MoQT draft, e.g. 18 or draft-18 (single = strict pin) or a "
              "comma list 18,16,14 (preference-ordered probe: pin the first "
              "whose SETUP completes) (env: DRAFT, MOQT_DRAFT). Default: "
-             "probe 18,16,14")
+             "probe 18,16,14; 20, 21 and 22 only when named")
     parser.add_argument(
         "--compat", type=str, default=os.environ.get("COMPAT", ""),
         help=(

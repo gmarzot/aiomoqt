@@ -196,7 +196,9 @@ def add_run(p, duration=DEFAULT_DURATION, interval=True):
 def add_session(p, insecure=True, certs=False, keepalive=False,
                 compat=False):
     p.add_argument('--draft', type=parse_draft_spec, default=None,
-                   help='MoQT draft version: 14, 16, or 18')
+                   help='MoQT draft: 14, 16, 18, or opt-in 20, 21, 22; a '
+                        'comma list offers several in order. Default: '
+                        'offer 18,16,14')
     if insecure:
         p.add_argument('-k', '--insecure', action='store_true',
                        help='Accept any server certificate (self-signed relays)')

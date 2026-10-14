@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional, Dict, Tuple
 
 from .base import MOQTMessage, BUF_SIZE
+from .params import LocationFilter
 from ..types import (
     MOQTMessageType, FetchType, GroupOrder, MOQTProtocolViolation, ParamType,
     SessionCloseCode,
@@ -29,6 +30,13 @@ class Fetch(MOQTMessage):
 
     The wire format of Relative and Absolute Joining Fetch is identical;
     only the publisher's range computation differs.
+
+    From d20 (§10.13) a FETCH is Request ID, Track Namespace, Track Name
+    and Parameters: no Fetch Type, no Joining form, and the range rides
+    LOCATION_FILTER with an inclusive End. start_*/end_* keep the d14-d18
+    form (End is the last Object plus one, Object 0 the whole End Group)
+    and are converted; location_filter, when set, is sent instead, and on
+    receive it is the range.
     """
     fetch_type: int
     request_id: int
@@ -44,6 +52,7 @@ class Fetch(MOQTMessage):
     joining_request_id: Optional[int] = None
     joining_start: Optional[int] = None
     parameters: Dict[int, bytes] = field(default_factory=dict)
+    location_filter: Optional[LocationFilter] = None
 
     def __post_init__(self):
         self.type = MOQTMessageType.FETCH
@@ -53,6 +62,33 @@ class Fetch(MOQTMessage):
         payload = Buffer(capacity=BUF_SIZE, vi64=prof.vi64)
 
         payload.push_vint(self.request_id)
+
+        if prof.fetch_location_filter:
+            if self.fetch_type != FetchType.STANDALONE:
+                raise ValueError(
+                    f"Joining FETCH does not exist at d{prof.draft}: "
+                    f"SUBSCRIBE with FILL_PARAMETERS, or FETCH a range")
+            payload.push_vint(len(self.namespace))
+            for part in self.namespace:
+                payload.push_vint(len(part))
+                payload.push_bytes(part)
+            payload.push_vint(len(self.track_name))
+            payload.push_bytes(self.track_name)
+            params = dict(self.parameters)
+            if self.subscriber_priority is not None:
+                params[ParamType.SUBSCRIBER_PRIORITY] = self.subscriber_priority
+            if self.group_order not in (None, GroupOrder.PUBLISHER_DEFAULT):
+                params[ParamType.GROUP_ORDER] = self.group_order
+            params[ParamType.LOCATION_FILTER] = (
+                self.location_filter
+                or LocationFilter.from_fetch_range(
+                    self.start_group, self.start_object,
+                    self.end_group, self.end_object))
+            MOQTMessage._serialize_params(payload, params, prof=prof)
+            buf.push_vint(self.type)
+            buf.push_uint16(payload.tell())
+            buf.push_bytes(payload.data)
+            return buf
 
         if is_draft16_or_later(prof.draft):
             # d16: priority and group_order live in params
@@ -118,6 +154,33 @@ class Fetch(MOQTMessage):
 
         request_id = buf.pull_vint()
 
+        if prof.fetch_location_filter:
+            namespace, track_name = MOQTMessage._pull_full_track_name(
+                buf, prof=prof)
+            params = MOQTMessage._deserialize_params(
+                buf, prof=prof, buf_end=buf_end, scope=cls.__name__)
+            location_filter = params.pop(ParamType.LOCATION_FILTER, None)
+            # No filter: {0, 0} through Largest Object (§5.1.2).
+            legacy = (location_filter or LocationFilter.none()).fetch_range()
+            if legacy is not None:
+                start_group, start_object, end_group, end_object = legacy
+            return cls(
+                fetch_type=FetchType.STANDALONE,
+                request_id=request_id,
+                namespace=namespace,
+                track_name=track_name,
+                subscriber_priority=params.pop(
+                    ParamType.SUBSCRIBER_PRIORITY, 128),
+                group_order=params.pop(
+                    ParamType.GROUP_ORDER, GroupOrder.ASCENDING),
+                start_group=start_group,
+                start_object=start_object,
+                end_group=end_group,
+                end_object=end_object,
+                parameters=params,
+                location_filter=location_filter,
+            )
+
         if is_draft16_or_later(prof.draft):
             fetch_type = buf.pull_vint()
         else:
@@ -173,6 +236,9 @@ class FetchOk(MOQTMessage):
               Largest Group ID, Largest Object ID, Params
     Draft-16: Request ID, End of Track (8), End Location, Params, Track Extensions
               (group_order removed; now a parameter 0x22)
+    Draft-20: End Location is inclusive and no parameter is defined.
+              largest_object_id keeps the d14-d18 form (last Object plus
+              one) and is converted.
     """
     request_id: int
     group_order: int = GroupOrder.DESCENDING
@@ -200,7 +266,18 @@ class FetchOk(MOQTMessage):
             # d16: no group_order fixed field
             payload.push_uint8(self.end_of_track)
             payload.push_vint(self.largest_group_id)
-            payload.push_vint(self.largest_object_id)
+            end_object = self.largest_object_id
+            if prof.fetch_location_filter:
+                if not end_object:
+                    raise ValueError(
+                        f"FETCH_OK End Location is inclusive at "
+                        f"d{prof.draft}: a whole-group End needs the last "
+                        f"Object ID")
+                if self.parameters:
+                    raise ValueError(
+                        f"FETCH_OK carries no parameters at d{prof.draft}")
+                end_object -= 1
+            payload.push_vint(end_object)
             params = dict(self.parameters)
             # §10.2.8: GROUP_ORDER may appear in SUBSCRIBE, PUBLISH_OK
             # or FETCH — not FETCH_OK; a d18 peer MUST close on it.
@@ -234,6 +311,8 @@ class FetchOk(MOQTMessage):
             end_of_track = buf.pull_uint8()
             largest_group_id = buf.pull_vint()
             largest_object_id = buf.pull_vint()
+            if prof.fetch_location_filter:
+                largest_object_id += 1
             params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
                                                  scope=cls.__name__)
             # Omitted: the order the FETCH asked for applies.

@@ -5,6 +5,7 @@ cancels the subscription."""
 import asyncio
 import contextlib
 import logging
+from collections import deque
 
 import pytest
 
@@ -148,7 +149,7 @@ async def test_an_update_before_the_fin_is_still_answered(use_quic):
         update = RequestUpdate(
             request_id=rid, existing_request_id=sub.request_id,
             parameters={ParamType.TRACK_NAMESPACE_PREFIX: (b"other", b"x")})
-        rx._tx_updates[sub.request_id] = rid
+        rx._tx_updates[sub.request_id] = deque([rid])
         rx.stream_write(rx._bidi_streams[sub.request_id],
                         update.serialize(prof=rx._profile).data,
                         end_stream=True)

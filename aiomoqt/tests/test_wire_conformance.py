@@ -781,3 +781,518 @@ def test_d18_parameters_in_scope_pass_and_d16_is_not_checked():
     raw = bytes(d16.data_slice(0, d16.tell()))
     MOQTMessage._deserialize_params(Buffer(data=raw), prof=profile_for(16),
                                     buf_end=len(raw), scope="Subscribe")
+
+
+# -- d20/d21/d22 SETUP (d20 §10.3, d22 §9.1) -------------------------
+#
+# Type 0x2F00 (vi64), Length (16), then Setup Options as delta-coded
+# Key-Value-Pairs (§1.4.3) up to the Length: odd Type = Length + bytes,
+# even Type = one vi64. Unknown options MUST be ignored.
+
+from aiomoqt.messages.d20 import PublishStateNotify, Setup as D20Setup  # noqa: E402
+
+_D20_DRAFTS = [20, 21, 22]
+
+
+def _ref_kvps(items, vint):
+    """Reference §1.4.3 encoder: (type, value) pairs in wire order."""
+    out, prev = b"", 0
+    for key, value in items:
+        out += vint(key - prev)
+        prev = key
+        out += vint(len(value)) + value if key % 2 else vint(value)
+    return out
+
+
+def _ref_setup(options_wire: bytes, length=None) -> bytes:
+    n = len(options_wire) if length is None else length
+    return ref_vi64(0x2F00) + n.to_bytes(2, "big") + options_wire
+
+
+def _parse_setup(raw: bytes, draft: int):
+    buf = Buffer(data=raw, vi64=True)
+    assert buf.pull_uint_vi64() == 0x2F00
+    end = buf.tell() + buf.pull_uint16() + 2
+    return D20Setup.deserialize(buf, prof=profile_for(draft), buf_end=end)
+
+
+@pytest.mark.parametrize("draft", _D20_DRAFTS)
+def test_d20_setup_exact_bytes_and_round_trip(draft):
+    opts = {0x07: b"aiomoqt/x", 0x01: b"/moq", 0x05: b"relay:443",
+            0x08: 4, 0x06: 200, 0x04: 1 << 20}
+    expect = _ref_setup(_ref_kvps(sorted(opts.items()), ref_vi64))
+    raw = bytes(D20Setup(options=opts).serialize(prof=profile_for(draft)).data)
+    assert raw == expect
+    out = _parse_setup(raw, draft)
+    assert out.options == opts and out.ignored == []
+
+
+def test_d20_setup_bytes_match_d18_for_shared_options():
+    from aiomoqt.messages.d18 import Setup as D18Setup
+    opts = {0x01: b"/", 0x05: b"h:1", 0x07: b"x"}
+    assert bytes(D20Setup(options=opts).serialize(prof=profile_for(20)).data) \
+        == bytes(D18Setup(options=opts).serialize(prof=profile_for(18)).data)
+
+
+@pytest.mark.parametrize("draft", _D20_DRAFTS)
+def test_d20_setup_ignores_unknown_options(draft):
+    # 0x00 and 0x02 (d16 MAX_REQUEST_ID) even, 0x09 odd, 0x9D grease twice
+    # (duplicates of unknown options MUST be allowed); the known options
+    # around them still parse.
+    wire = _ref_kvps([(0x00, 7), (0x02, 100), (0x07, b"peer/1"),
+                      (0x08, 3), (0x09, b"\xff" * 300), (0x9D, b""),
+                      (0x9D, b"grease")], ref_vi64)
+    out = _parse_setup(_ref_setup(wire), draft)
+    assert out.options == {0x07: b"peer/1", 0x08: 3}
+    assert out.ignored == [0x00, 0x02, 0x09, 0x9D, 0x9D]
+
+
+def test_d20_setup_empty_is_valid():
+    out = _parse_setup(_ref_setup(b""), 20)
+    assert out.options == {} and out.ignored == []
+
+
+@pytest.mark.parametrize("draft", _D20_DRAFTS)
+def test_d20_setup_truncated_is_a_protocol_violation(draft):
+    # Length claims the whole option; the bytes stop inside its value.
+    wire = _ref_kvps([(0x07, b"aiomoqt/x")], ref_vi64)
+    raw = _ref_setup(wire)[:-3]
+    with pytest.raises(MOQTProtocolViolation, match="truncated"):
+        _parse_setup(raw, draft)
+
+
+@pytest.mark.parametrize("cut", [1, 4])
+def test_d20_setup_length_short_of_its_options_is_a_protocol_violation(cut):
+    # The Length ends inside an option: it would read the next message.
+    wire = _ref_kvps([(0x01, b"/"), (0x07, b"aiomoqt/x")], ref_vi64)
+    raw = _ref_setup(wire, length=len(wire) - cut) + b"\x00" * 8
+    with pytest.raises(MOQTProtocolViolation, match="past"):
+        _parse_setup(raw, 20)
+
+
+def test_d20_setup_length_past_its_options_is_a_protocol_violation():
+    # Length covers a dangling option Type with no Value.
+    wire = _ref_kvps([(0x01, b"/")], ref_vi64) + ref_vi64(0x06)
+    with pytest.raises(MOQTProtocolViolation):
+        _parse_setup(_ref_setup(wire), 20)
+
+
+def test_d20_setup_option_value_over_65535_is_a_protocol_violation():
+    # §1.4.3: a Length above 2^16-1 MUST close the session.
+    wire = ref_vi64(0x07) + ref_vi64(0x10000)
+    with pytest.raises(MOQTProtocolViolation, match="exceeds"):
+        _parse_setup(_ref_setup(wire), 20)
+
+
+def test_d20_setup_option_longer_than_the_message_is_a_protocol_violation():
+    wire = ref_vi64(0x07) + ref_vi64(40) + b"short"
+    with pytest.raises(MOQTProtocolViolation, match="past the SETUP"):
+        _parse_setup(_ref_setup(wire), 20)
+
+
+def test_d20_setup_option_type_overflow_is_a_protocol_violation():
+    wire = ref_vi64(0x08) + ref_vi64(1) + ref_vi64((1 << 64) - 1) \
+        + ref_vi64(0)
+    with pytest.raises(MOQTProtocolViolation, match="overflows"):
+        _parse_setup(_ref_setup(wire), 20)
+
+
+def test_d20_setup_repeated_known_option_is_a_protocol_violation():
+    wire = _ref_kvps([(0x08, 1), (0x08, 2)], ref_vi64)
+    with pytest.raises(MOQTProtocolViolation, match="repeated"):
+        _parse_setup(_ref_setup(wire), 20)
+
+
+def test_d20_setup_may_repeat_the_authorization_token():
+    # §10.3.1.4: one or more tokens. USE_VALUE (0x3), type 0, value.
+    tok = lambda v: ref_vi64(3) + ref_vi64(0) + v  # noqa: E731
+    wire = _ref_kvps([(0x03, tok(b"a")), (0x03, tok(b"b"))], ref_vi64)
+    out = _parse_setup(_ref_setup(wire), 20)
+    assert out.options[0x03] == b"a"
+
+
+def test_d20_setup_refuses_to_serialize_what_the_wire_cannot_carry():
+    prof = profile_for(20)
+    with pytest.raises(ValueError):
+        D20Setup(options={0x07: b"x" * 0x10000}).serialize(prof=prof)
+    with pytest.raises(ValueError):
+        D20Setup(options={0x09: b"x" * 40000, 0x07: b"y" * 40000}) \
+            .serialize(prof=prof)
+    with pytest.raises(TypeError):
+        D20Setup(options={0x08: b"4"}).serialize(prof=prof)
+    with pytest.raises(TypeError):
+        D20Setup(options={0x07: 4}).serialize(prof=prof)
+
+
+def test_d20_setup_length_mismatch_closes_the_session():
+    """Through the control dispatch: a SETUP whose Length ends inside an
+    option closes the session with PROTOCOL_VIOLATION."""
+    from aiomoqt.protocol import MOQTSessionQuic
+    from aiomoqt.types import SessionCloseCode
+    assert MOQTSessionQuic.CONTROL_REGISTRY[20][0x2F00][0] is D20Setup
+    s = object.__new__(MOQTSessionQuic)
+    s.negotiated_draft = 20
+    s._control_msg_overrides = {}
+    s._control_chains = {}
+    s._bidi_stream_requests = {}
+    s._d18_control_read_sid = 3
+    s._closed = []
+    s._close_session = lambda code, reason: s._closed.append((code, reason))
+    wire = _ref_kvps([(0x07, b"aiomoqt/x")], ref_vi64)
+    s._on_control_data(3, _ref_setup(wire, length=len(wire) - 2)
+                       + b"\x00" * 8, False)
+    assert s._closed and s._closed[0][0] == SessionCloseCode.PROTOCOL_VIOLATION
+
+
+@pytest.mark.parametrize("draft", _D20_DRAFTS)
+def test_d20_publish_state_notify_exact_bytes(draft):
+    # Type 0x22, Length, Number of Parameters, LARGEST_OBJECT {5, 300}.
+    prof = profile_for(draft)
+    raw = bytes(PublishStateNotify(largest_group_id=5, largest_object_id=300)
+                .serialize(prof=prof).data)
+    body = ref_vi64(1) + ref_vi64(0x09) + ref_vi64(5) + ref_vi64(300)
+    assert raw == ref_vi64(0x22) + len(body).to_bytes(2, "big") + body
+    buf = Buffer(data=raw, vi64=True)
+    buf.pull_vint()
+    end = buf.tell() + buf.pull_uint16() + 2
+    out = PublishStateNotify.deserialize(buf, prof=prof, buf_end=end)
+    assert (out.largest_group_id, out.largest_object_id) == (5, 300)
+    assert out.parameters == {}
+
+
+# -- d14/d16/d18 bytes are unchanged by d20 --------------------------
+#
+# Golden images of the setup messages and of the two types d18 renumbers
+# on the wire, as the tree before d20 support encoded them.
+
+def test_d14_d16_d18_setup_bytes_unchanged():
+    from aiomoqt.messages.d18 import Setup as D18Setup
+    from aiomoqt.messages.session_setup import ClientSetup, ServerSetup
+
+    def hx(msg, draft):
+        return bytes(msg.serialize(prof=profile_for(draft)).data).hex()
+
+    assert hx(ClientSetup(versions=[0xff00000e],
+                          parameters={1: b"/", 2: 100}), 14) \
+        == "20001001c0000000ff00000e0201012f024064"
+    assert hx(ServerSetup(selected_version=0xff00000e,
+                          parameters={2: 100}), 14) \
+        == "21000cc0000000ff00000e01024064"
+    assert hx(ClientSetup(versions=[],
+                          parameters={7: b"x", 1: b"/", 2: 100}), 16) \
+        == "20000a0301012f014064050178"
+    assert hx(ServerSetup(parameters={2: 100}), 16) == "21000401024064"
+    assert hx(D18Setup(options={7: b"x", 1: b"/", 5: b"h:1"}), 18) \
+        == "af00000b01012f0403683a31020178"
+
+
+def test_d14_d16_d18_renumbered_type_bytes_unchanged():
+    from aiomoqt.messages.namespace import SubscribeNamespace
+    from aiomoqt.messages.publish import PublishOk
+
+    def hx(msg, draft):
+        return bytes(msg.serialize(prof=profile_for(draft)).data).hex()
+
+    def sub_ns():
+        return SubscribeNamespace(request_id=2, namespace_prefix=(b"n",),
+                                  parameters={})
+
+    def pub_ok():
+        return PublishOk(request_id=2, forward=1, priority=128,
+                         group_order=1, filter_type=2)
+
+    assert hx(sub_ns(), 14) == "1100050201016e00"
+    assert hx(sub_ns(), 16) == "1100060201016e0000"
+    assert hx(sub_ns(), 18) == "5000050201016e00"
+    assert hx(pub_ok(), 16) == "1e000c020410011040800101020101"
+    assert hx(pub_ok(), 18) == "07000a04100110800101020101"
+    # d20 PUBLISH_OK is a REQUEST_OK with EXPIRES at most.
+    assert hx(PublishOk(request_id=2), 20) == "07000100"
+
+
+# -- d20/d21/d22 LOCATION_FILTER (0x21) against the spec text ----------
+#
+# d20/d21 §5.1.2: Length, then 0-4 vi64 fields whose count selects the
+# meaning; two zeros are Next Object. d22 §9.20.9: a Location Filter
+# Type 0x00-0x05 selects the fields; nothing is length-prefixed. For one
+# byte per field, Length equals the field count equals the d22 type, so
+# only Next Object, an absolute {0, 0} start and values >= 128 tell the
+# drafts apart.
+
+from aiomoqt.messages.params import (  # noqa: E402
+    LocationFilter, LocationFilterType as LFT, RangeFilter)
+
+_prof = profile_for
+
+
+def ref_lf_d21(*fields):
+    inner = b"".join(ref_vi64(f) for f in fields)
+    return ref_vi64(len(inner)) + inner
+
+
+def ref_lf_d22(ftype, *fields):
+    return ref_vi64(ftype) + b"".join(ref_vi64(f) for f in fields)
+
+
+def _lf_encode(lf, draft):
+    buf = Buffer(capacity=64, vi64=True)
+    lf.encode(buf, prof=_prof(draft))
+    return bytes(buf.data_slice(0, buf.tell()))
+
+
+def _lf_decode(raw, draft):
+    buf = Buffer(data=raw, vi64=True)
+    lf = LocationFilter.decode(buf, prof=_prof(draft), buf_end=len(raw))
+    assert buf.tell() == len(raw)
+    return lf
+
+
+# (filter, d21 bytes, d22 bytes): every form, the separating cases first.
+_LF_VECTORS = [
+    (LocationFilter.next_object(), ref_lf_d21(0, 0), ref_lf_d22(5)),
+    (LocationFilter.absolute(200, 0), ref_lf_d21(200, 0),
+     ref_lf_d22(2, 200, 0)),
+    (LocationFilter.relative(128), ref_lf_d21(128), ref_lf_d22(1, 128)),
+    (LocationFilter.absolute(7, 300, 9, 1000),
+     ref_lf_d21(7, 300, 2, 1000), ref_lf_d22(4, 7, 300, 2, 1000)),
+    (LocationFilter.none(), ref_lf_d21(), ref_lf_d22(0)),
+    (LocationFilter.relative(0), ref_lf_d21(0), ref_lf_d22(1, 0)),
+    (LocationFilter.relative(1), ref_lf_d21(1), ref_lf_d22(1, 1)),
+    (LocationFilter.absolute(7, 3), ref_lf_d21(7, 3), ref_lf_d22(2, 7, 3)),
+    (LocationFilter.absolute(7, 3, 9), ref_lf_d21(7, 3, 2),
+     ref_lf_d22(3, 7, 3, 2)),
+    (LocationFilter.absolute(7, 3, 9, 4), ref_lf_d21(7, 3, 2, 4),
+     ref_lf_d22(4, 7, 3, 2, 4)),
+]
+
+
+@pytest.mark.parametrize("lf, d21, d22", _LF_VECTORS,
+                         ids=[v[0].type.name + str(i)
+                              for i, v in enumerate(_LF_VECTORS)])
+def test_location_filter_matches_reference(lf, d21, d22):
+    for draft in (20, 21):
+        assert _lf_encode(lf, draft) == d21
+        assert _lf_decode(d21, draft) == lf
+    assert _lf_encode(lf, 22) == d22
+    assert _lf_decode(d22, 22) == lf
+
+
+def test_d21_and_d22_disagree_where_the_spec_says():
+    # Next Object: two zero fields at d21, its own type at d22.
+    assert _lf_encode(LocationFilter.next_object(), 21) == bytes.fromhex("020000")
+    assert _lf_encode(LocationFilter.next_object(), 22) == bytes.fromhex("05")
+    # The same three bytes are Next Object at d21 and {0, 0} at d22.
+    raw = bytes.fromhex("020000")
+    assert _lf_decode(raw, 21).type == LFT.NEXT_OBJECT
+    assert _lf_decode(raw, 22) == LocationFilter.absolute(0, 0)
+    # A two-byte field: d21 counts bytes (3), d22 names the form (2).
+    assert _lf_encode(LocationFilter.absolute(200, 1), 21) == \
+        bytes.fromhex("0380c801")
+    assert _lf_encode(LocationFilter.absolute(200, 1), 22) == \
+        bytes.fromhex("0280c801")
+    # Small values encode the same in both.
+    for lf in (LocationFilter.relative(1), LocationFilter.absolute(7, 3),
+               LocationFilter.absolute(7, 3, 9),
+               LocationFilter.absolute(7, 3, 9, 4)):
+        assert _lf_encode(lf, 21) == _lf_encode(lf, 22)
+
+
+def test_d21_absolute_origin_is_the_unfiltered_form():
+    # §5.1.2: two zero fields would be Next Object; an open filter from
+    # {0, 0} equals no filter and travels as one.
+    assert _lf_encode(LocationFilter.absolute(0, 0), 21) == b"\x00"
+    assert _lf_decode(b"\x00", 21).type == LFT.NONE
+
+
+@pytest.mark.parametrize("draft, raw, match", [
+    (21, ref_lf_d21(1, 2, 3, 4, 5), "more than four"),
+    (21, bytes.fromhex("0180c8"), "crosses its length"),   # 2-byte vi64, length 1
+    (21, bytes.fromhex("0201"), "overruns"),
+    (21, ref_lf_d21((1 << 64) - 1, 0, 1), "exceeds 2\\^64-1"),
+    (22, ref_lf_d22(6), "Location Filter Type 0x6"),
+    (22, ref_lf_d22(0x80), "Location Filter Type 0x80"),
+    (22, ref_lf_d22(3, 7, 3), "truncated"),
+    (22, ref_lf_d22(4, (1 << 64) - 1, 0, 1, 0), "exceeds 2\\^64-1"),
+], ids=["d21-five-fields", "d21-field-past-length", "d21-length-past-msg",
+        "d21-end-overflow", "d22-type-6", "d22-type-128", "d22-short",
+        "d22-end-overflow"])
+def test_malformed_location_filter_is_a_protocol_violation(draft, raw, match):
+    with pytest.raises(MOQTProtocolViolation, match=match):
+        _lf_decode(raw, draft)
+
+
+def test_d21_filter_read_as_d22_desyncs():
+    # A d21 Absolute Start {200, 0} (Length 3) read at d22 is Type 3 and
+    # takes the next parameter's bytes as End Group Delta.
+    raw = ref_lf_d21(200, 0) + b"\x01"
+    got = _lf_decode(raw, 22)
+    assert got == LocationFilter.absolute(200, 0, 201)
+
+
+# -- d20 Range Filters (§5.1.4) and FILL_PARAMETERS (§10.2.15) ----------
+
+def _rf_encode(rf, ptype, draft=20):
+    buf = Buffer(capacity=64, vi64=True)
+    rf.encode(buf, ptype, prof=_prof(draft))
+    return bytes(buf.data_slice(0, buf.tell()))
+
+
+def test_range_filter_matches_spec_example():
+    # §5.1.4: ranges 3-5 and 10-15 are Start=3, End=2, Start=5, End=5.
+    rf = RangeFilter(set_id=4, ranges=((3, 5), (10, 15)))
+    raw = bytes.fromhex("05" "04" "03020505")
+    assert _rf_encode(rf, 0x25) == raw
+    assert RangeFilter.decode(Buffer(data=raw, vi64=True), 0x25,
+                              prof=_prof(20)) == rf
+
+
+def test_range_filter_open_last_range_and_property_type():
+    rf = RangeFilter(set_id=0, ranges=((2, 2), (300, None)),
+                     property_type=0x10)
+    raw = (ref_vi64(1 + 1 + 2 + 2) + b"\x00" + ref_vi64(0x10)
+           + ref_vi64(2) + ref_vi64(0) + ref_vi64(298))
+    assert _rf_encode(rf, 0x28) == raw
+    assert RangeFilter.decode(Buffer(data=raw, vi64=True), 0x28,
+                              prof=_prof(20)) == rf
+
+
+def test_zero_length_range_filter_removes_the_filter():
+    assert _rf_encode(RangeFilter(set_id=None), 0x26) == b"\x00"
+    assert RangeFilter.decode(Buffer(data=b"\x00", vi64=True), 0x26,
+                              prof=_prof(20)).set_id is None
+
+
+@pytest.mark.parametrize("raw, match", [
+    (b"\x02\x00\x80", "truncated"),          # vi64 cut by the buffer end
+    (b"\x02\x00\x80\xc8", "crosses its length"),
+    (b"\x09\x00\x01", "overruns"),
+], ids=["truncated", "crosses-length", "overruns"])
+def test_malformed_range_filter_is_a_protocol_violation(raw, match):
+    with pytest.raises(MOQTProtocolViolation, match=match):
+        RangeFilter.decode(Buffer(data=raw, vi64=True), 0x25,
+                           prof=_prof(20), buf_end=len(raw))
+
+
+def _params(params, draft):
+    buf = Buffer(capacity=256, vi64=True)
+    MOQTMessage._serialize_params(buf, params, prof=_prof(draft))
+    return bytes(buf.data_slice(0, buf.tell()))
+
+
+def _unparams(raw, draft, scope=None):
+    return MOQTMessage._deserialize_params(
+        Buffer(data=raw, vi64=True), prof=_prof(draft), buf_end=len(raw),
+        scope=scope)
+
+
+def test_fill_parameters_is_a_counted_nested_block():
+    # moq-dev's current-group join: count 1, LOCATION_FILTER StartGroup=1.
+    raw = _params({0x23: {0x21: LocationFilter.relative(1)}}, 20)
+    assert raw == bytes.fromhex("01" "23" "04" "01210101")
+    assert _unparams(raw, 20) == {0x23: {0x21: LocationFilter.relative(1)}}
+    # d22 nests the typed filter.
+    raw22 = _params({0x23: {0x21: LocationFilter.relative(1)}}, 22)
+    assert raw22 == bytes.fromhex("01" "23" "04" "01210101")
+    raw22 = _params({0x23: {0x21: LocationFilter.next_object()}}, 22)
+    assert raw22 == bytes.fromhex("01" "23" "03" "012105")
+
+
+@pytest.mark.parametrize("raw, match", [
+    (bytes.fromhex("012305" "01210101"), "overruns|exceeds remaining"),
+    (bytes.fromhex("012305" "0121010100"), "does not fill"),
+    (bytes.fromhex("012303" "011001"), "not allowed in FillParameters"),
+], ids=["past-message", "short-of-length", "forward-inside"])
+def test_malformed_fill_parameters_is_a_protocol_violation(raw, match):
+    with pytest.raises(MOQTProtocolViolation, match=match):
+        _unparams(raw, 20)
+
+
+def test_namespace_prefix_parameter_d20_prefixed_d22_bare():
+    # d20/d21 keep the d18 length prefix; d22 §9.20 makes Track
+    # Namespace an encoding of its own, with no Length.
+    assert _params({0x34: (b"a", b"bc")}, 20) == \
+        bytes.fromhex("0134 06 02 0161 026263")
+    bare = bytes.fromhex("0134 02 0161 026263")
+    assert _params({0x34: (b"a", b"bc")}, 22) == bare
+    assert _unparams(bare, 22) == {0x34: (b"a", b"bc")}
+
+
+# -- d20 FETCH / FETCH_OK / fetch objects -------------------------------
+
+def test_d20_fetch_exact_bytes():
+    # §10.13: Request ID, Track Namespace, Track Name, Parameters; the
+    # range {1, 0} through all of group 2 is LOCATION_FILTER [1, 0, 1].
+    m = Fetch(fetch_type=1, request_id=4, namespace=(b"n",), track_name=b"t",
+              subscriber_priority=None, group_order=None,
+              start_group=1, start_object=0, end_group=2, end_object=0)
+    body = b"\x04\x01\x01n\x01t" + b"\x01" + b"\x21" + ref_lf_d21(1, 0, 1)
+    for draft in (20, 21):
+        raw = bytes(m.serialize(prof=_prof(draft)).data)
+        assert raw == b"\x16" + len(body).to_bytes(2, "big") + body
+    body22 = b"\x04\x01\x01n\x01t" + b"\x01\x21" + ref_lf_d22(3, 1, 0, 1)
+    raw = bytes(m.serialize(prof=_prof(22)).data)
+    assert raw == b"\x16" + len(body22).to_bytes(2, "big") + body22
+
+
+def test_d20_fetch_ok_end_location_is_inclusive():
+    # The field keeps the d14-d18 form (last Object + 1); the wire is
+    # the last Object.
+    ok = FetchOk(request_id=None, end_of_track=1, largest_group_id=5,
+                 largest_object_id=4)
+    raw = bytes(ok.serialize(prof=_prof(20)).data)
+    assert raw == bytes.fromhex("18" "0004" "01" "05" "03" "00")
+    raw18 = bytes(ok.serialize(prof=profile_for(18)).data)
+    assert raw18 == bytes.fromhex("18" "0004" "01" "05" "04" "00")
+    got = FetchOk.deserialize(Buffer(data=raw[3:], vi64=True),
+                              prof=_prof(20), buf_end=len(raw) - 3)
+    assert (got.largest_group_id, got.largest_object_id) == (5, 4)
+
+
+def test_d20_fetch_ok_parameter_is_a_protocol_violation():
+    # FETCH_OK defines no parameter from d20; d18 tolerated GROUP_ORDER.
+    body = bytes.fromhex("00" "05" "03" "01" "22" "01")
+    with pytest.raises(MOQTProtocolViolation, match="not allowed in FetchOk"):
+        FetchOk.deserialize(Buffer(data=body, vi64=True), prof=_prof(20),
+                            buf_end=len(body))
+    FetchOk.deserialize(Buffer(data=body, vi64=True), prof=profile_for(18),
+                        buf_end=len(body))
+
+
+def test_d20_end_of_timed_out_range():
+    marker = FetchObject(group_id=7, object_id=9, end_of_range=0x20C,
+                         payload=b"")
+    raw = bytes(marker.serialize(prof=_prof(20)).data)
+    assert raw == ref_vi64(0x20C) + b"\x07\x09"
+    got = FetchObject.deserialize(Buffer(data=raw, vi64=True),
+                                  prof=_prof(20))
+    assert (got.end_of_range, got.group_id, got.object_id) == (0x20C, 7, 9)
+    # Not defined before d20: both directions refuse it.
+    with pytest.raises(ValueError, match="flags 0x20c"):
+        FetchObject.deserialize(Buffer(data=raw, vi64=True),
+                                prof=profile_for(18))
+    with pytest.raises(ValueError, match="not defined at d18"):
+        marker.serialize(prof=profile_for(18))
+
+
+def test_d20_fetch_object_carries_no_status():
+    # §11.2.1.1: no Object Status in a FETCH; a zero length is an empty
+    # Normal object (moq-dev and the contribution runner read it so).
+    objs = [FetchObject(group_id=1, object_id=0, publisher_priority=200,
+                        payload=b"tt"),
+            FetchObject(group_id=1, object_id=1, publisher_priority=200,
+                        payload=b"")]
+    prior = None
+    wire = []
+    for o in objs:
+        wire.append(bytes(o.serialize(prof=_prof(20), prior=prior).data))
+        prior = o
+    assert wire == [bytes.fromhex("1c0100c8027474"), bytes.fromhex("0000")]
+    rb = Buffer(data=b"".join(wire), vi64=True)
+    first = FetchObject.deserialize(rb, prof=_prof(20))
+    second = FetchObject.deserialize(rb, prior=first, prof=_prof(20))
+    assert rb.tell() == sum(map(len, wire))
+    assert (second.object_id, second.payload, second.status) == (
+        1, b"", ObjectStatus.NORMAL)
+    with pytest.raises(ValueError, match="no Object Status"):
+        FetchObject(group_id=1, object_id=2, payload=b"",
+                    status=ObjectStatus.END_OF_GROUP).serialize(prof=_prof(20))

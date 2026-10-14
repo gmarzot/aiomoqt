@@ -31,7 +31,7 @@ from typing import (
     get_type_hints,
 )
 
-from .errors import SpecError
+from .errors import SpecError, Unsupported
 
 SPEC_VERSION = "1"
 
@@ -43,6 +43,10 @@ DECODES = ("bytes", "text", "json")
 
 DEFAULT_BUFFER = 256
 DEFAULT_TIMEOUT_S = 30.0
+
+_DECODE_DOC = ("How Obj.value surfaces a payload: bytes as is, text as "
+               "UTF-8, json parsed. A payload that does not decode raises "
+               "DecodeError on access; Obj.payload keeps the bytes")
 
 
 # -- annotation markers ----------------------------------------------
@@ -342,7 +346,8 @@ class TrackRef:
         "Track name. Omit to discover tracks under the namespace")] = None
     relay: Annotated[Optional[str], Doc(
         "moqt:// (raw QUIC) or https:// (WebTransport) URL. Omit to use "
-        "the session already open")] = None
+        "the session already open. Not implemented: an AgentSession "
+        "raises Unsupported when it is set")] = None
 
     def __post_init__(self) -> None:
         check_instance(self)
@@ -463,16 +468,22 @@ class Priority:
 
     Lower number = higher priority; 0 is highest. These are wire values
     only — how a sender schedules against them is a transport concern.
+    A field set where it does not apply raises Unsupported when the spec
+    reaches an AgentSession.
     """
     subscriber: Annotated[Optional[int], Range(0, 255), Doc(
-        "Subscriber priority 0-255, lower = more urgent")] = None
+        "Subscriber priority 0-255, lower = more urgent. Subscriptions "
+        "and fetches only")] = None
     publisher: Annotated[Optional[int], Range(0, 255), Doc(
-        "Default publisher priority 0-255, lower = more urgent")] = None
+        "Default publisher priority 0-255, lower = more urgent. "
+        "Publications only")] = None
     group_order: Annotated[Optional[str], Choices(*GROUP_ORDERS), Doc(
-        "Delivery order across groups")] = None
+        "Delivery order across groups. Subscriptions and fetches "
+        "only")] = None
     delivery_timeout_ms: Annotated[Optional[int], Range(0, None), Doc(
         "Staleness budget in ms. ADVISORY: optional in the spec, 0 means "
-        "unset, and relays differ in whether they act on it")] = None
+        "unset, and relays differ in whether they act on it. Not "
+        "implemented: a non-zero value raises Unsupported")] = None
 
     def __post_init__(self) -> None:
         check_instance(self)
@@ -498,9 +509,11 @@ class SubscribeSpec:
     buffer: Annotated[int, Range(1, 65536), Doc(
         "Reader ring depth in objects")] = DEFAULT_BUFFER
     on_full: Annotated[str, Choices(*ON_FULL), Doc(
-        "What happens when the reader ring fills")] = "drop_oldest"
+        "What happens when the reader ring fills: drop_oldest or "
+        "drop_new. block and error are writer policies; a reader raises "
+        "Unsupported")] = "drop_oldest"
     decode: Annotated[str, Choices(*DECODES), Doc(
-        "How object payloads are surfaced")] = "bytes"
+        _DECODE_DOC)] = "bytes"
     timeout_s: Annotated[float, Range(0, None), Doc(
         "Default deadline for operations on this subscription")] = DEFAULT_TIMEOUT_S
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -530,7 +543,7 @@ class FetchSpec:
         "The range to fetch. Must use mode 'range' — a fetch is bounded")]
     priority: Priority = field(default_factory=Priority)
     decode: Annotated[str, Choices(*DECODES), Doc(
-        "How object payloads are surfaced")] = "bytes"
+        _DECODE_DOC)] = "bytes"
     timeout_s: Annotated[float, Range(0, None), Doc(
         "Deadline for the whole fetch")] = DEFAULT_TIMEOUT_S
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -568,7 +581,9 @@ class PublishSpec:
     group_size: Annotated[Optional[int], Range(1, None), Doc(
         "Objects per group. Omit to control grouping explicitly")] = None
     announce: Annotated[bool, Doc(
-        "Publish the namespace before serving the track")] = True
+        "true: PUBLISH_NAMESPACE the track's namespace, once per session "
+        "however many writers share it, then serve SUBSCRIBEs for the "
+        "track. false: a bare PUBLISH of the track")] = True
     buffer: Annotated[int, Range(1, 65536), Doc(
         "Writer ring depth in objects")] = DEFAULT_BUFFER
     on_full: Annotated[str, Choices(*ON_FULL), Doc(
@@ -585,3 +600,30 @@ class PublishSpec:
     def from_dict(cls, d: Dict[str, Any], *,
                   lenient: bool = False) -> "PublishSpec":
         return from_dict(cls, d, lenient=lenient)
+
+
+def unsupported(spec: Any) -> List[str]:
+    """Fields of a SubscribeSpec, FetchSpec or PublishSpec set to a value
+    the runtime does not implement and would otherwise ignore."""
+    bad = []
+    if spec.track.relay is not None:
+        bad.append("track.relay")
+    prio = spec.priority
+    if prio.delivery_timeout_ms:
+        bad.append("priority.delivery_timeout_ms")
+    if isinstance(spec, PublishSpec):
+        bad.extend(f"priority.{name}" for name in ("subscriber", "group_order")
+                   if getattr(prio, name) is not None)
+    elif prio.publisher is not None:
+        bad.append("priority.publisher")
+    if isinstance(spec, SubscribeSpec) and spec.on_full in ("block", "error"):
+        bad.append(f"on_full={spec.on_full!r}")
+    return bad
+
+
+def check_supported(spec: Any) -> None:
+    """Raise Unsupported for any field `unsupported()` reports."""
+    bad = unsupported(spec)
+    if bad:
+        raise Unsupported(
+            f"{type(spec).__name__}: not implemented: {', '.join(bad)}")

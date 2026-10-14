@@ -19,10 +19,13 @@ from collections import deque
 
 import pytest
 
+from types import SimpleNamespace
+
 from aiomoqt.protocol import _MOQTSessionMixin
 from aiomoqt.messages.namespace import PublishNamespaceOk
 from aiomoqt.messages.request import RequestOk, RequestError
-from aiomoqt.types import MOQTRequestError
+from aiomoqt.messages.subscribe import SubscribeError, SubscribeOk
+from aiomoqt.types import GroupOrder, MOQTRequestError
 from aiomoqt.context import profile_for
 from aiomoqt.utils.buffer import Buffer
 
@@ -49,6 +52,7 @@ def _session(is_client=True):
     s._published_aliases = {}
     s._published_tracks = {}
     s._requests = {}
+    s._subscribe_tracks_params = {}
     s._loop = asyncio.get_running_loop()
     s._sent = []
     s._send_request = lambda rid, msg: s._sent.append((rid, msg))
@@ -393,3 +397,76 @@ async def test_awaiting_after_close_fails_at_once():
         await s._await_response(2, timeout=5.0)
     assert asyncio.get_running_loop().time() - t0 < 1.0
     assert 2 not in s._pending_requests
+
+
+# -- per-request routes: what a request registers before it is sent ----
+
+def _routed_session(draft):
+    """_drive_session plus the state a SUBSCRIBE_OK or an error reply
+    touches."""
+    s = _drive_session(draft)
+    s._session = SimpleNamespace(libquicr_compat=False)
+    s._pending_object_handlers = {}
+    s._publish_done_handlers = {}
+    s._fetch_object_handlers = {}
+    s._object_handlers = {}
+    s._subscriptions = {}
+    s._unbound_aliases = {}
+    s._unbound_escalated = set()
+    s._track_default_priority = {}
+    s.on_object_received = None
+    return s
+
+
+def _reply(s, msg, rid):
+    """Parse a reply to request `rid` the way the draft carries it."""
+    wire = bytes(msg.serialize(prof=s._profile).data)
+    stream_rid = None if s._profile.reply_has_request_id else rid
+    s._moqt_handle_control_message(Buffer(data=wire), request_id=stream_rid)
+
+
+@pytest.mark.parametrize("draft", [14, 16, 18])
+async def test_subscribe_ok_binds_the_object_handler_as_it_is_parsed(draft):
+    # Objects drained in SUBSCRIBE_OK's batch run before its handler task:
+    # the alias must route to the subscriber's handler at parse time.
+    s = _routed_session(draft)
+
+    def on_object(*_):
+        pass
+
+    s._pending_object_handlers[4] = on_object
+    _reply(s, SubscribeOk(request_id=4, track_alias=300, expires=0,
+                          group_order=GroupOrder.ASCENDING,
+                          content_exists=0, parameters={}), 4)
+    assert s._object_cb(300) is on_object
+    assert s._pending_object_handlers == {}
+    await asyncio.sleep(0)
+
+
+@pytest.mark.parametrize("draft", [14, 16, 18])
+async def test_a_refused_request_drops_what_it_registered(draft):
+    s = _routed_session(draft)
+    for table in (s._pending_object_handlers, s._publish_done_handlers,
+                  s._fetch_object_handlers):
+        table[4] = print
+    s._announced[4] = (b"agent",)
+    err = (SubscribeError(request_id=4, error_code=0x4, reason="no")
+           if draft < 16 else
+           RequestError(request_id=4, error_code=0x4, retry_interval=0,
+                        reason="no"))
+    _reply(s, err, 4)
+    assert s._pending_object_handlers == {}
+    assert s._publish_done_handlers == s._fetch_object_handlers == {}
+    assert not s.is_announced("agent")
+    await asyncio.sleep(0)
+
+
+async def test_an_abandoned_subscribe_drops_its_handlers():
+    s = _routed_session(18)
+    pending = s.subscribe("ns", "t", on_object=print, on_done=print,
+                          wait_response=True)
+    assert list(s._pending_object_handlers) == [0]
+    assert list(s._publish_done_handlers) == [0]
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(pending, 0.05)
+    assert s._pending_object_handlers == s._publish_done_handlers == {}

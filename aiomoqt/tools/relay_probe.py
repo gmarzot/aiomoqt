@@ -356,7 +356,8 @@ def parse_args(argv=None):
         help="draft(s) to probe: a single draft (--draft 18) or a list "
              "(--draft 18,16). By default each listed draft is probed "
              "INDIVIDUALLY, in order; with --offer the whole list is offered "
-             "in ONE session. Default (no --draft) probes 14, 16, 18 each.")
+             "in ONE session. Default (no --draft) probes 14, 16, 18 each; "
+             "20, 21 and 22 are probed only when named.")
     p.add_argument(
         "--offer", action="store_true", default=False,
         help="with a multi-draft --draft, offer the whole list in ONE "
