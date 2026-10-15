@@ -13,8 +13,7 @@ Reads the catalog track, subscribes every media track it describes
                      rebuilt to CMAF chunks); <name>.mp4 when several
                      tracks share a role
 
-On exit it prints one line per track: `name: N frames`, plus
-`, R rejected` on LOCMAF tracks.
+On exit it prints one line per track: `name: N frames, R rejected`.
 
 Play them:  ffplay video.h264   /   ffplay audio.wav
 
@@ -82,6 +81,10 @@ def parse_args():
                         default=None,
                         help='Subscribe only catalog tracks of this '
                              'packaging (default: every media track)')
+    parser.add_argument('--loc-bare', action='store_true',
+                        help='LOC payloads without the (empty) Private '
+                             'Properties block 0x0A 0x00, from publishers '
+                             'predating loc-04 §2.2')
     parser.add_argument('--out', type=str, default='./media-out',
                         help='Output directory (default: ./media-out)')
     parser.add_argument('--pipe', choices=('video', 'audio'), default=None,
@@ -415,7 +418,7 @@ async def run(args):
 
         sub = MediaSubscriber(
             session, args.namespace, discover=args.discover,
-            track_filter=_select,
+            track_filter=_select, loc_bare=args.loc_bare,
             on_catalog=((lambda c: _status(c.to_json(indent=2)))
                         if args.show_catalog else None))
         writers = (None if args.analyze

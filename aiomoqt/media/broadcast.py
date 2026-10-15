@@ -320,7 +320,8 @@ class MediaSubscriber:
     on_arrival(track_name, msg, recv_us, group_id, subgroup_id, frame)
     sees every media-track object first (see LocTrackSubscriber);
     on_catalog(catalog) fires on every independent catalog or applied
-    delta.
+    delta. `loc_bare` expects LOC payloads without the Private
+    Properties block.
     """
 
     def __init__(self, session, namespace: str, *,
@@ -328,9 +329,11 @@ class MediaSubscriber:
                  on_catalog: Optional[Callable] = None,
                  track_filter: Optional[Callable] = None,
                  discover: bool = False,
-                 on_arrival: Optional[Callable] = None):
+                 on_arrival: Optional[Callable] = None,
+                 loc_bare: bool = False):
         self.session = session
         self.namespace = namespace
+        self.loc_bare = loc_bare
         # Treat `namespace` as a prefix and resolve it to the namespace
         # actually being published under it (§9.4), so a subscriber can
         # find a broadcast whose name it was never told.
@@ -479,8 +482,10 @@ class MediaSubscriber:
                 sub = LocmafTrackSubscriber(self.session, namespace, name,
                                             init=init, **callbacks)
             else:
+                # CMAF objects are not LOC: no Private Properties block.
+                bare = self.loc_bare or entry.packaging != PACKAGING_LOC
                 sub = LocTrackSubscriber(self.session, namespace, name,
-                                         **callbacks)
+                                         loc_bare=bare, **callbacks)
             if entry.packaging == PACKAGING_LOC:
                 # cmaf init is a CMAF header consumed by the sink, not
                 # decoder extradata — leave config unset there.

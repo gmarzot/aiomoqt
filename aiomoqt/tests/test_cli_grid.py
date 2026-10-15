@@ -252,3 +252,12 @@ def test_packaging_flag_agrees_across_media_tools():
         assert len(acts) == 1, tool
         assert acts[0].option_strings == ["--packaging"], tool
         assert tuple(acts[0].choices) == MEDIA_PACKAGINGS, tool
+
+
+def test_loc_bare_flag_agrees_across_media_tools():
+    """--loc-bare is long-only and the same switch on both media tools."""
+    for tool in ("pub_media", "sub_media"):
+        acts = [a for a in _parser_actions(tool) if a.dest == "loc_bare"]
+        assert len(acts) == 1, tool
+        assert acts[0].option_strings == ["--loc-bare"], tool
+        assert isinstance(acts[0], argparse._StoreTrueAction), tool
