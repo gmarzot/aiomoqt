@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- SERVER_SETUP carries MOQT_IMPLEMENTATION at d14/d16; `implementation=` on client and server
+  sets it, `None` omits it.
 - WebTransport client offering moqt-NN closes with WT_ALPN_ERROR and raises
   `MOQTNegotiationError` when the server's WT-Protocol is missing or not offered.
 - d20-d22 FETCH: standalone FETCH is sent and served, the range in LOCATION_FILTER with an

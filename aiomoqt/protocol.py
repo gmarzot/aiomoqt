@@ -111,7 +111,10 @@ class MOQTPeer:
     """MOQT client and server base-class."""
     def __init__(self, libquicr_compat: bool = False,
                  tx_max_inflight_bytes: Optional[int] =
-                     DEFAULT_TX_MAX_INFLIGHT_BYTES):
+                     DEFAULT_TX_MAX_INFLIGHT_BYTES,
+                 implementation: Optional[str] = USER_AGENT):
+        # MOQT_IMPLEMENTATION Setup Option value; None omits it.
+        self.implementation = implementation
         #  message handlers
         self._control_msg_handlers: Dict[int, Callable] = {}
         self.libquicr_compat = libquicr_compat
@@ -2811,7 +2814,7 @@ class _MOQTSessionMixin:
         # version array (negotiated via ALPN), no MAX_REQUEST_ID Setup
         # Option (removed), count-less Setup Options. Pre-d18 sends
         # CLIENT_SETUP with the version list.
-        params[SetupParamType.IMPLEMENTATION] = USER_AGENT.encode()
+        params.update(self._implementation_option())
         if parameters:
             params.update(parameters)  # caller SETUP options (e.g. AUTH_TOKEN)
         self._auth_token_cache_max = int(
@@ -3167,6 +3170,11 @@ class _MOQTSessionMixin:
 
     _REPLY_CLASSES = (RequestOk, RequestError, SubscribeOk, SubscribeDone,
                       PublishOk, FetchOk, PublishStateNotify)
+
+    def _implementation_option(self) -> Dict[int, bytes]:
+        impl = getattr(getattr(self, '_session', None), 'implementation',
+                       USER_AGENT)
+        return {} if impl is None else {SetupParamType.IMPLEMENTATION: impl.encode()}
 
     def _setup_message(self, options: Dict[int, Any]) -> Setup:
         """SETUP of the negotiated draft's class (d18, or d20 for d20+)."""
@@ -3698,8 +3706,7 @@ class _MOQTSessionMixin:
         parameters: Optional[Dict[int, bytes]] = None
     ) -> ServerSetup:
         """Send SERVER_SETUP message in response to CLIENT_SETUP."""
-        if parameters is None:
-            parameters = {}
+        parameters = {**self._implementation_option(), **(parameters or {})}
         if not self._profile.control_uni_pair:
             self._local_request_max = self.REQUEST_ID_WINDOW
             parameters.setdefault(SetupParamType.MAX_REQUEST_ID,
@@ -5473,8 +5480,8 @@ class _MOQTSessionMixin:
             logger.info(
                 f"MOQT: d18 server control write-uni: "
                 f"{self._d18_control_write_sid}")
-            self.send_control_message(self._setup_message({
-                SetupParamType.IMPLEMENTATION: USER_AGENT.encode()}))
+            self.send_control_message(self._setup_message(
+                self._implementation_option()))
             # Replies that raced the write-uni bring-up were deferred;
             # SETUP is on the wire, so release them now.
             self._flush_pending_control()

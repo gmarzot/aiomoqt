@@ -10,7 +10,7 @@ from aiopquic.quic.configuration import QuicConfiguration
 
 from .protocol import (
     MOQTPeer, MOQTSessionQuic, MOQTSessionWTClient,
-    DEFAULT_TX_MAX_INFLIGHT_BYTES,
+    DEFAULT_TX_MAX_INFLIGHT_BYTES, USER_AGENT,
 )
 from .types import (
     WT_ALPN_ERROR, MOQTNegotiationError, moqt_alpn_for_version,
@@ -42,9 +42,11 @@ class MOQTClient(MOQTPeer):
         keep_alive_interval: Optional[float] = None,
         socket_buffer_size: Optional[int] = None,
         qlog_dir: Optional[str] = None,
+        implementation: Optional[str] = USER_AGENT,
     ):
         super().__init__(libquicr_compat=libquicr_compat,
-                         tx_max_inflight_bytes=tx_max_inflight_bytes)
+                         tx_max_inflight_bytes=tx_max_inflight_bytes,
+                         implementation=implementation)
         from .utils.url import normalize_wt_path
         self.host = host
         self.port = port
