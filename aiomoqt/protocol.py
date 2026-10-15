@@ -1892,19 +1892,8 @@ class _MOQTSessionMixin:
                 f"awaiting control message)")
             self._check_unbound_aliases(header.track_alias)
         # subgroup_id is None in FIRST_OBJ mode — resolved on first object
-        key = (header.track_alias, header.group_id, header.subgroup_id)
         if header.subgroup_id is not None:
-            if key in self._subgroup_stream_by_key:
-                existing = self._subgroup_stream_by_key[key]
-                if existing != stream_id:
-                    raise MOQTStreamReject(
-                        SessionCloseCode.PROTOCOL_VIOLATION,
-                        f"duplicate subgroup stream for {key} "
-                        f"(already bound to stream {existing})")
-            self._subgroup_stream_by_key[key] = stream_id
-            state = self._data_streams.get(stream_id)
-            if state is not None:
-                state.key = ('subgroup', key)
+            self._bind_subgroup_stream(stream_id, header)
 
     # An unbound alias is normal for the moment between the first data
     # stream and the SUBSCRIBE_OK that binds it. It is a DEFECT when it
@@ -1948,14 +1937,22 @@ class _MOQTSessionMixin:
                                   header: 'SubgroupHeader') -> None:
         """Complete FIRST_OBJ-mode subgroup binding once subgroup_id is
         resolved from the first object."""
+        self._bind_subgroup_stream(stream_id, header)
+
+    def _bind_subgroup_stream(self, stream_id: int,
+                              header: 'SubgroupHeader') -> None:
+        """Bind (alias, group, subgroup) to this stream. A subgroup
+        reopened after a reset (§2.2) takes the key from the old stream,
+        whose later end then neither unbinds it nor reports the subgroup
+        ended."""
         key = (header.track_alias, header.group_id, header.subgroup_id)
-        if key in self._subgroup_stream_by_key:
-            existing = self._subgroup_stream_by_key[key]
-            if existing != stream_id:
-                raise MOQTStreamReject(
-                    SessionCloseCode.PROTOCOL_VIOLATION,
-                    f"duplicate subgroup stream for {key} "
-                    f"(already bound to stream {existing})")
+        existing = self._subgroup_stream_by_key.get(key)
+        if existing is not None and existing != stream_id:
+            logger.debug(f"MOQT stream({stream_id}): reopens {key}, "
+                         f"superseding stream {existing}")
+            old = self._data_streams.get(existing)
+            if old is not None:
+                old.key = None
         self._subgroup_stream_by_key[key] = stream_id
         state = self._data_streams.get(stream_id)
         if state is not None:
