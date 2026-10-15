@@ -617,6 +617,14 @@ class MOQTProtocolViolation(MOQTException):
         super().__init__(SessionCloseCode.PROTOCOL_VIOLATION, reason_phrase)
 
 
+# draft-ietf-webtrans-http3-16 §9.5: WT session closed on failed WT-Protocol negotiation.
+WT_ALPN_ERROR = 0x0817B3DD
+
+
+class MOQTNegotiationError(ConnectionError):
+    """The server's WT-Protocol answer selected none of the offered MoQT drafts."""
+
+
 class MOQTRequestError(Exception):
     """Raised when a MoQT request receives an error response.
 
