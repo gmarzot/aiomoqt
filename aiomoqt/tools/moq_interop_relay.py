@@ -58,9 +58,10 @@ import sys
 from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
 from aiomoqt.types import (
-    D18MessageType, FilterType, GroupOrder, MOQTDraft, MOQTMessageType,
-    MOQTRequestError, ObjectStatus, ParamType, RequestErrorCode,
-    StreamResetCode, SubscribeDoneCode, SubscribeErrorCode, parse_draft_spec,
+    MOQT_DEFAULT_DRAFTS, D18MessageType, FilterType, GroupOrder, MOQTDraft,
+    MOQTMessageType, MOQTRequestError, ObjectStatus, ParamType,
+    RequestErrorCode, StreamResetCode, SubscribeDoneCode, SubscribeErrorCode,
+    parse_draft_spec,
 )
 from aiomoqt.messages import SubgroupHeader
 from aiomoqt.messages.base import MOQTMessage
@@ -79,9 +80,10 @@ from aiomoqt.utils.url import parse_relay_url
 # PR #95) — or older MOQT_DRAFT — to pin the relay to one draft; the client
 # is pinned the same way, so negotiation lands on that draft. When neither is
 # set (the open-relay context, where clients offer their full version list),
-# advertise every supported draft so any client negotiates.
-_RELAY_DRAFT_DEFAULT = (os.environ.get("DRAFT")
-                        or os.environ.get("MOQT_DRAFT") or "18,16,14").strip()
+# advertise the library's default drafts, highest first.
+_RELAY_DRAFT_DEFAULT = (
+    os.environ.get("DRAFT") or os.environ.get("MOQT_DRAFT")
+    or ",".join(str(d) for d in MOQT_DEFAULT_DRAFTS)).strip()
 
 logger = get_logger(__name__)
 
@@ -1363,7 +1365,8 @@ def parse_args():
                         default=parse_draft_spec(_RELAY_DRAFT_DEFAULT),
                         help="MoQT draft(s) to serve: a single draft confines "
                              "negotiation to it; a list offers all of them. "
-                             "Default from $DRAFT / $MOQT_DRAFT, else 18,16,14.")
+                             "Default from $DRAFT / $MOQT_DRAFT, else the "
+                             "library default (MOQT_DEFAULT_DRAFTS).")
     parser.add_argument("--upstream", action="append", default=[],
                         metavar="URL",
                         help="Origin to dial for tracks no inbound "
