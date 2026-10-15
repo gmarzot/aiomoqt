@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- d20-d22 FETCH: standalone FETCH is sent and served, the range in LOCATION_FILTER with an
+  inclusive End; `fetch(location_filter=)`.
+- d20-d22 join(): SUBSCRIBE at the Next Object with FILL_PARAMETERS; joining_fetch() is a
+  REQUEST_UPDATE with FILL_PARAMETERS.
+- d20-d22 fill fetch streams are served from the object history (`session.serve_fill()`),
+  counted in PUBLISH_DONE, and accepted on receive; an empty fill opens no stream.
+- d20-d22 FILL_TIMEOUT reports objects the history dropped as End of Timed-Out Range.
+- `on_fetch_gap` receives End of Range markers.
+- A FETCH_OK ending before the FETCH's Start closes the session (d20+).
+- A fetch object referencing a prior Subgroup or Priority after a leading End of Range marker,
+  and an empty FILL_PARAMETERS, are protocol violations.
+
 - Relay: a d18 PUBLISH_NAMESPACE cancelled by its stream, or a d16 PUBLISH_NAMESPACE_DONE
   naming only the request, withdraws the namespace and sends NAMESPACE_DONE.
 - Relay: a namespace element containing "/" stays one element; it was split upstream and in
