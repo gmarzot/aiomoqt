@@ -745,8 +745,14 @@ class FetchObject(MOQTMessage):
         if flags in _end_of_range_flags(prof):
             group_id = buf.pull_vint()
             object_id = buf.pull_vint()
+            # The marker stands as the prior for the Group and Object
+            # deltas only: Subgroup and Priority stay the last actual
+            # Object's, -1 when there is none (d22 §11.4.1.2).
             return cls(group_id=group_id, object_id=object_id,
-                       end_of_range=flags, payload=b'')
+                       end_of_range=flags, payload=b'',
+                       subgroup_id=-1 if prior is None else prior.subgroup_id,
+                       publisher_priority=(-1 if prior is None
+                                           else prior.publisher_priority))
         if flags >= 0x80:
             raise ValueError(
                 f"FetchObject: invalid serialization flags 0x{flags:x}")
@@ -771,18 +777,20 @@ class FetchObject(MOQTMessage):
         else:
             group_id = prior.group_id
 
+        # A prior with a negative Subgroup/Priority is an End of Range
+        # marker with no actual Object before it (d22 §11.4.1.2).
         sg_mode = flags & FETCH_FLAG_SUBGROUP_MASK
         if flags & FETCH_FLAG_DATAGRAM:
             subgroup_id = 0
         elif sg_mode == FETCH_FLAG_SG_ZERO:
             subgroup_id = 0
         elif sg_mode == FETCH_FLAG_SG_PRIOR:
-            if prior is None:
+            if prior is None or prior.subgroup_id < 0:
                 raise ValueError(
                     "FetchObject: first object references prior Subgroup")
             subgroup_id = prior.subgroup_id
         elif sg_mode == FETCH_FLAG_SG_PRIOR_PLUS:
-            if prior is None:
+            if prior is None or prior.subgroup_id < 0:
                 raise ValueError(
                     "FetchObject: first object references prior Subgroup")
             subgroup_id = prior.subgroup_id + 1
@@ -799,7 +807,7 @@ class FetchObject(MOQTMessage):
 
         if flags & FETCH_FLAG_PRIORITY_PRESENT:
             publisher_priority = buf.pull_uint8()
-        elif prior is not None:
+        elif prior is not None and prior.publisher_priority >= 0:
             publisher_priority = prior.publisher_priority
         else:
             raise ValueError(

@@ -41,7 +41,10 @@ from .messages import (
     FetchHeader, LocationFilter, MOQTMessage, ObjectDatagram, PublishOk,
     RequestError, RequestOk, RequestUpdate,
 )
-from .messages.params import D20ParamType, LocationFilterType
+from .messages.data import FETCH_FLAGS_END_TIMED_OUT, FETCH_FLAGS_END_UNKNOWN
+from .messages.params import (
+    U64_MAX, D20ParamType, LocationFilterType, fill_range,
+)
 from .context import is_draft16_or_later
 from .messages.fetch import _is_joining
 from .utils.buffer import Buffer
@@ -284,7 +287,7 @@ class _Subscription:
                  'subscribe_request_id', 'subscribers', 'state', 'forward',
                  'done', 'stream_count', 'generating', 'delivery', 'joining',
                  'window', 'open_streams', 'end_status', 'senders',
-                 'fill_streams')
+                 'fill_streams', 'fills', 'location_filter', 'group_order')
 
     def __init__(self, session):
         self.session = session
@@ -314,8 +317,13 @@ class _Subscription:
         self.end_status = SubscribeDoneCode.SUBSCRIPTION_ENDED
         # _SubgroupSenders with a stream open for this peer.
         self.senders: set = set()
-        # d20 fill fetch streams opened for this peer (§5.1.3).
+        # Fill fetch streams opened for this peer (d20 §5.1.3), and the
+        # tasks serving them.
         self.fill_streams = 0
+        self.fills: set = set()
+        # The subscription's Location Filter and group order, for fills.
+        self.location_filter = None
+        self.group_order = None
 
     def passes(self, group_id: int, object_id: int) -> bool:
         """True when the subscription takes this Location: Forward State 1
@@ -872,6 +880,7 @@ class PublishedTrack(Track):
         raw_filter = (msg.parameters.get(ParamType.SUBSCRIPTION_FILTER)
                       if msg.parameters else None)
         if isinstance(raw_filter, LocationFilter):
+            sub.location_filter = raw_filter
             if not isinstance(sub.window, str):
                 sub.window = _location_window(raw_filter, self._largest)
             self._cut_streams(sub)
@@ -884,13 +893,14 @@ class PublishedTrack(Track):
             sub.joining[msg.existing_request_id] = self._largest
         # §10.9: exactly one REQUEST_OK or REQUEST_ERROR; LARGEST_OBJECT
         # once objects exist (§10.2.11).
-        params = ({} if self._largest is None
-                  else _largest_object_param(session, self._largest))
+        largest = self._largest
+        params = ({} if largest is None
+                  else _largest_object_param(session, largest))
         session._send_reply(msg.request_id,
                             RequestOk(request_id=msg.request_id,
                                       parameters=params))
         self._set_forward(sub, forward)
-        await self._fail_fill(session, sub, msg)
+        self._start_fill(session, sub, msg, largest)
         if forward:
             await self._start_generating(session, "REQUEST_UPDATE")
 
@@ -943,41 +953,49 @@ class PublishedTrack(Track):
             msg.request_id,
             lambda rid, s=sub: self._on_request_cancelled(rid, s))
         sub.window = window
+        sub.location_filter = getattr(msg, 'location_filter', None)
+        sub.group_order = getattr(msg, 'group_order', None)
         self._set_forward(sub, getattr(msg, 'forward', None))
-        await self._fail_fill(session, sub, msg)
+        self._start_fill(session, sub, msg, reported)
         if sub.forward:
             sub.joining[msg.request_id] = reported
             await self._start_generating(session, "SUBSCRIBE")
 
-    async def _fail_fill(self, session, sub, msg) -> None:
-        """A d20 FILL_PARAMETERS asks for a fill fetch stream (§5.1.3).
-        Fills are not served yet, so one that has Objects to deliver
-        fails the way the spec gives: the stream opens with its
-        FETCH_HEADER and is reset. The subscription goes on."""
-        params = msg.parameters or {}
-        fill = params.get(D20ParamType.FILL_PARAMETERS)
-        if fill is None or not sub.forward or self._largest is None:
+    def _start_fill(self, session, sub, msg, largest) -> None:
+        """Serve the fill fetch stream a FILL_PARAMETERS asks for
+        (d20 §5.1.3) from the object history, beside the subscription. A
+        paused subscription or an empty fill range opens none."""
+        fill = (msg.parameters or {}).get(D20ParamType.FILL_PARAMETERS)
+        if (fill is None or not sub.forward
+                or fill_range(fill, sub.location_filter, largest) is None):
             return
-        # The fill range: FILL_PARAMETERS' own filter, else the
-        # subscription's, read as for a FETCH (§5.1.3).
-        lf = (fill.get(ParamType.LOCATION_FILTER)
-              or getattr(msg, 'location_filter', None)
-              or params.get(ParamType.LOCATION_FILTER))
-        if isinstance(lf, LocationFilter):
-            start = _location_window(lf, self._largest)[0]
-        elif isinstance(sub.window, str):
-            return
-        else:
-            start = sub.window[0]
-        if start > self._largest:
-            return
-        stream_id = await session.open_uni_stream()
         sub.fill_streams += 1
-        session.stream_write(stream_id, FetchHeader(
-            request_id=msg.request_id).serialize(prof=session._profile).data)
-        session.stream_reset(stream_id, StreamResetCode.INTERNAL_ERROR)
-        logger.info(f"Track: fill for request {msg.request_id} failed: "
-                    f"fills are not served")
+        task = asyncio.ensure_future(
+            self._serve_fill(session, sub, msg, largest))
+        sub.fills.add(task)
+        task.add_done_callback(sub.fills.discard)
+
+    async def _serve_fill(self, session, sub, msg, largest) -> None:
+        try:
+            if self._history is None:
+                # d20 §5.1.3: a fill that fails opens its stream and resets it.
+                stream_id = await session.open_uni_stream()
+                session.stream_write(stream_id, FetchHeader(
+                    request_id=msg.request_id).serialize(
+                        prof=session._profile).data)
+                session.stream_reset(stream_id, StreamResetCode.INTERNAL_ERROR)
+                logger.info(f"Track: fill for request {msg.request_id} "
+                            f"failed: no object history")
+                return
+            await session.serve_fill(
+                msg, self._history, largest,
+                subscription_filter=sub.location_filter,
+                group_order=sub.group_order)
+        except asyncio.CancelledError:
+            pass  # serve_fetch reset the stream
+        except Exception:
+            logger.warning(f"Track: fill for request {msg.request_id} "
+                           f"failed", exc_info=True)
 
     async def _on_fetch_update(self, session, msg) -> None:
         """REQUEST_UPDATE for a FETCH being served: a priority change is
@@ -1018,6 +1036,8 @@ class PublishedTrack(Track):
         Locations served, inclusive, and the End Location FETCH_OK
         reports. Raises _FetchRefused."""
         largest = self._largest
+        if session._profile.fetch_location_filter:
+            return self._fetch_range_d20(msg, largest)
         if _is_joining(msg.fetch_type):
             # §10.12.2: Forward State 1, against the Joining Location.
             sub = self._sub_for(session)
@@ -1045,6 +1065,26 @@ class PublishedTrack(Track):
             last, end = largest, (largest[0], largest[1] + 1)
         return start, last, end
 
+    def _fetch_range_d20(self, msg, largest):
+        """d20 FETCH: the LOCATION_FILTER range, End inclusive and at most
+        Largest Object (d22 §3.2); a whole End Group ends at its last
+        Object."""
+        if largest is None:
+            raise _FetchRefused(RequestErrorCode.INVALID_RANGE,
+                                "no object published")
+        lf = msg.location_filter or LocationFilter.none()
+        start, last = lf.resolve(largest, fetch=True)
+        if start > largest:
+            raise _FetchRefused(RequestErrorCode.INVALID_RANGE,
+                                "start after the Largest Object")
+        if last < start:
+            raise _FetchRefused(RequestErrorCode.INVALID_RANGE,
+                                "end before start")
+        if last[1] == U64_MAX:
+            held = self._history.last_object(last[0])
+            last = max(start, (last[0], 0 if held is None else held))
+        return start, last, (last[0], last[1] + 1)
+
     async def _on_fetch(self, session, msg) -> None:
         """FETCH (§10.12) answered from the object history."""
         rid = msg.request_id
@@ -1064,9 +1104,13 @@ class PublishedTrack(Track):
         order = (GroupOrder.DESCENDING
                  if msg.group_order == GroupOrder.DESCENDING
                  else GroupOrder.ASCENDING)
+        timed_out = (session._profile.fetch_timed_out_range
+                     and D20ParamType.FILL_TIMEOUT in (msg.parameters or {}))
         objects = self._history.fetch(
             start, last, session,
-            descending=order == GroupOrder.DESCENDING)
+            descending=order == GroupOrder.DESCENDING,
+            lost_marker=(FETCH_FLAGS_END_TIMED_OUT if timed_out
+                         else FETCH_FLAGS_END_UNKNOWN))
         if not is_draft16_or_later(session.negotiated_draft):
             objects = [o for o in objects if o.end_of_range is None]
         ended = self._done and last == self._largest
@@ -1091,6 +1135,9 @@ class PublishedTrack(Track):
         subscriber there goes, and restarts for the next one."""
         sub = self._subs[0] if sub is None else sub
         sub.subscribers.discard(request_id)
+        # d22 §3.4.1: a cancelled subscription resets its fill streams.
+        for task in list(sub.fills):
+            task.cancel()
         if sub.subscribers:
             logger.info(f"Track: subscriber {request_id} left, "
                         f"{len(sub.subscribers)} still subscribed")

@@ -418,14 +418,18 @@ def test_fetch_ok_d18_omits_group_order_param():
     assert r.tell() == end               # no track extensions either
 
 
-def test_fetch_group_delta_direction_comes_from_our_request():
+@pytest.mark.parametrize("draft", [18, 22])
+def test_fetch_group_delta_direction_comes_from_our_request(draft):
     """d18 FETCH_OK carries no GROUP_ORDER, so the group-delta decode
     direction (§11.4.4.1) is the order requested in our own FETCH."""
+    from aiomoqt.context import profile_for
     from aiomoqt.protocol import _MOQTSessionMixin
     from aiomoqt.messages.fetch import Fetch
     from aiomoqt.messages.data import FetchHeader
     from aiomoqt.types import FetchType, GroupOrder
     s = object.__new__(_MOQTSessionMixin)
+    s._profile = profile_for(draft)
+    s._fill_requests = {}
     fetch = Fetch(request_id=5, fetch_type=FetchType.STANDALONE,
                   group_order=GroupOrder.DESCENDING,
                   namespace=(b"ns",), track_name=b"t")

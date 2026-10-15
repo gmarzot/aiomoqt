@@ -22,9 +22,11 @@ from .messages import *
 from .messages.d18 import Setup
 from .messages.d20 import PublishStateNotify, Setup as D20Setup
 from .messages.fetch import _is_joining
+from .messages.data import (FETCH_FLAGS_END_TIMED_OUT,
+                            FETCH_FLAGS_END_UNKNOWN)
 from .messages.params import (
     RANGE_FILTERS, D20ParamType, D20RequestErrorCode, check_param_scope,
-    range_filter_count, range_filter_error, uses_location_filter,
+    fill_range, range_filter_count, range_filter_error, uses_location_filter,
 )
 from .messages import (
     Fetch, LocationFilter, MOQTMessage, Publish, PublishNamespace, PublishOk,
@@ -457,9 +459,14 @@ class _MOQTSessionMixin:
         self.on_object_received: Optional[Callable] = None
         # Optional callback for received FetchObjects (fetch uni stream):
         #   fn(msg, size_bytes, recv_time_us, request_id)
-        # Fires for normal objects only (end-of-range markers are logged
-        # and the stream is expected to FIN shortly after).
+        # Fires for normal objects only; End of Range markers go to
+        # on_fetch_gap as fn(marker, request_id).
         self.on_fetch_object: Optional[Callable] = None
+        self.on_fetch_gap: Optional[Callable] = None
+        # d20+ fill fetch streams we asked for: SUBSCRIBE or REQUEST_UPDATE
+        # request id -> (FILL_PARAMETERS, subscription Location Filter,
+        # group order).
+        self._fill_requests: Dict[int, tuple] = {}
         # FETCH request id -> callback for its objects, ahead of
         # on_fetch_object (same signature).
         self._fetch_object_handlers: Dict[int, Callable] = {}
@@ -559,6 +566,9 @@ class _MOQTSessionMixin:
 
         The future is pre-registered by join() or fetch() before
         messages are sent, so there's no race with fast completions.
+        From d20 a fill fetch stream is awaited by the Request ID of its
+        SUBSCRIBE or REQUEST_UPDATE; an empty fill completes as the reply
+        shows it.
         Returns True if the stream completed cleanly, False on
         error/timeout.
 
@@ -890,13 +900,59 @@ class _MOQTSessionMixin:
         self._pending_object_handlers.pop(request_id, None)
         self._publish_done_handlers.pop(request_id, None)
         self._fetch_object_handlers.pop(request_id, None)
+        if (self._profile.fetch_location_filter
+                and self._fill_requests.pop(request_id, None) is not None):
+            self._end_fill(request_id, False)
+
+    def _end_fill(self, request_id: int, clean: bool) -> None:
+        """A fill we asked for will open no stream: settle its awaiters."""
+        self._fill_requests.pop(request_id, None)
+        if request_id in self._fetch_stream_by_request:
+            return
+        self._fetch_object_handlers.pop(request_id, None)
+        fut = self._fetch_done_futures.pop(request_id, None)
+        if fut is not None and not fut.done():
+            fut.set_result(clean)
+
+    @staticmethod
+    def _reply_largest(msg) -> Optional[Tuple[int, int]]:
+        """The Largest Object a SUBSCRIBE_OK or REQUEST_OK reports."""
+        if isinstance(msg, SubscribeOk):
+            if (not msg.content_exists or msg.largest_group_id is None
+                    or msg.largest_object_id is None):
+                return None
+            return (msg.largest_group_id, msg.largest_object_id)
+        largest = (getattr(msg, 'parameters', None) or {}).get(
+            ParamType.LARGEST_OBJECT)
+        return tuple(largest) if isinstance(largest, (tuple, list)) else None
+
+    def _check_fetch_ok_end(self, msg: FetchOk) -> None:
+        """d20 §10.14: an End Location before the FETCH's Start closes
+        the session."""
+        sent = next((m for m in self._subscriptions.get(msg.request_id, ())
+                     if isinstance(m, Fetch)), None)
+        if sent is None:
+            return
+        lf = sent.location_filter
+        if lf is not None:
+            start = (lf.start_group, lf.start_object)
+        else:
+            start = (sent.start_group or 0, sent.start_object or 0)
+        if None in start:
+            return  # relative to Largest Object
+        end = (msg.largest_group_id, msg.largest_object_id - 1)
+        if end < start:
+            raise MOQTProtocolViolation(
+                f"FETCH_OK End Location {end} before the FETCH's Start "
+                f"{start}")
 
     def _route_reply(self, msg) -> None:
         """Act on a reply as it is parsed, ahead of the data streams in
         its batch and of the handler task: SUBSCRIBE_OK binds the
         request's object handler to its alias; an error reply drops what
         the request registered, and a refused PUBLISH_NAMESPACE announces
-        nothing."""
+        nothing. From d20 a FETCH_OK ending before its Start closes the
+        session, and a reply showing an empty fill range ends the fill."""
         if isinstance(msg, SubscribeOk):
             cb = self._pending_object_handlers.pop(msg.request_id, None)
             if cb is not None and msg.track_alias is not None:
@@ -905,6 +961,16 @@ class _MOQTSessionMixin:
             rid = getattr(msg, 'request_id', None)
             self._drop_request_routes(rid)
             self._announced.pop(rid, None)
+            return
+        if not self._profile.fetch_location_filter:
+            return
+        if isinstance(msg, FetchOk):
+            self._check_fetch_ok_end(msg)
+        fill = self._fill_requests.get(getattr(msg, 'request_id', None))
+        if fill is not None and fill_range(
+                fill[0], fill[1], self._reply_largest(msg)) is None:
+            # d20 §5.1.3: an empty fill range opens no stream.
+            self._end_fill(msg.request_id, True)
 
     def _on_request_stream_terminated(
             self, stream_id: int, *,
@@ -1354,6 +1420,8 @@ class _MOQTSessionMixin:
         if key and len(key) == 2 and key[0] == 'fetch':
             request_id = key[1]
             clean = error_code == QuicErrorCode.NO_ERROR
+            if self._profile.fetch_location_filter:
+                self._fill_requests.pop(request_id, None)
             self._fetch_object_handlers.pop(request_id, None)
             fut = self._fetch_done_futures.pop(request_id, None)
             if fut and not fut.done():
@@ -1606,18 +1674,20 @@ class _MOQTSessionMixin:
             elif isinstance(msg_obj, FetchHeader):
                 pass
             elif isinstance(msg_obj, FetchObject):
+                parser = state.parser
+                request_id = (
+                    parser.request_id
+                    if isinstance(parser, FetchHeader)
+                    else None
+                )
                 if msg_obj.end_of_range is None:
-                    parser = state.parser
-                    request_id = (
-                        parser.request_id
-                        if isinstance(parser, FetchHeader)
-                        else None
-                    )
                     cb = (self._fetch_object_handlers.get(request_id)
                           or self.on_fetch_object)
                     if cb:
                         now = int(time.time() * 1_000_000)
                         cb(msg_obj, consumed, now, request_id)
+                elif self.on_fetch_gap is not None:
+                    self.on_fetch_gap(msg_obj, request_id)
             else:
                 logger.error(
                     f"MOQT stream({stream_id}): unexpected msg "
@@ -1751,9 +1821,17 @@ class _MOQTSessionMixin:
         - at most one uni stream per FETCH request (no reuse).
         """
         request_id = header.request_id
-        outstanding = self._subscriptions.get(request_id)
-        is_fetch = (outstanding is not None
-                    and any(isinstance(m, Fetch) for m in outstanding))
+        fill = (self._fill_requests.get(request_id)
+                if self._profile.fetch_location_filter else None)
+        if fill is not None:
+            # A fill fetch stream (d20 §5.1.3): ours to admit once.
+            header._group_order = fill[2]
+            outstanding = None
+            is_fetch = True
+        else:
+            outstanding = self._subscriptions.get(request_id)
+            is_fetch = (outstanding is not None
+                        and any(isinstance(m, Fetch) for m in outstanding))
         # Group-delta decode direction: pre-d18 the FETCH_OK carries a
         # GROUP_ORDER param; at d18 it cannot (§10.2.8), so the
         # direction is the one we requested in our own FETCH.
@@ -3287,9 +3365,6 @@ class _MOQTSessionMixin:
     def _d20_refusal(self, msg: MOQTMessage) -> Tuple[Optional[int], str]:
         """(REQUEST_ERROR code, reason) for a d20+ request this session
         cannot accept, else (None, "")."""
-        if isinstance(msg, Fetch):
-            return (RequestErrorCode.NOT_SUPPORTED,
-                    "FETCH is not implemented from draft-20")
         params = msg.parameters or {}
         # We send no MAX_FILTER_RANGES, so no Range may arrive (§5.1.4).
         why = range_filter_error(params, max_ranges=0)
@@ -3674,7 +3749,10 @@ class _MOQTSessionMixin:
         register_object_handler signature), bound to its alias as
         SUBSCRIBE_OK is parsed; `on_done` is its PUBLISH_DONE handler
         (register_publish_done_handler). Both are registered before
-        SUBSCRIBE is sent and dropped if it is refused."""
+        SUBSCRIBE is sent and dropped if it is refused. A d20
+        FILL_PARAMETERS fill stream comes under this Request ID:
+        await_fetch_done() waits for it, and its objects reach
+        on_fetch_object or register_fetch_object_handler()."""
         if parameters is None:
             parameters = {}
         if location_filter is not None and not uses_location_filter(
@@ -3703,6 +3781,8 @@ class _MOQTSessionMixin:
         )
         message.libquicr_compat = self._session.libquicr_compat
         self._subscriptions[request_id] = [message]
+        self._register_fill(request_id, parameters, self._sent_filter(message),
+                            group_order, forward)
         if on_object is not None:
             self._pending_object_handlers[request_id] = on_object
         if on_done is not None:
@@ -3778,6 +3858,12 @@ class _MOQTSessionMixin:
         message = RequestUpdate(request_id=request_id,
                                 existing_request_id=existing_request_id,
                                 parameters=params)
+        sub = next((m for m in self._subscriptions.get(existing_request_id, ())
+                    if isinstance(m, Subscribe)), None)
+        if sub is not None:
+            lf = params.get(ParamType.LOCATION_FILTER, self._sent_filter(sub))
+            self._register_fill(request_id, params, lf, sub.group_order,
+                                params.get(ParamType.FORWARD))
         logger.info(f"MOQT send: {message}")
         if self._profile.control_uni_pair:
             sid = self._bidi_streams.get(existing_request_id)
@@ -3879,6 +3965,31 @@ class _MOQTSessionMixin:
             raise ValueError(
                 f"{count} filter ranges exceed the peer's "
                 f"MAX_FILTER_RANGES {self._peer_max_filter_ranges}")
+
+    @staticmethod
+    def _sent_filter(msg: Subscribe) -> Optional[LocationFilter]:
+        """The Location Filter a SUBSCRIBE of ours carries from d20."""
+        if msg.location_filter is not None or msg.filter_type is None:
+            return msg.location_filter
+        return LocationFilter.from_subscription_filter(
+            msg.filter_type, msg.start_group, msg.start_object, msg.end_group)
+
+    def _register_fill(self, request_id: int, params: Dict[int, Any],
+                       subscription_filter: Optional[LocationFilter],
+                       group_order: Optional[int],
+                       forward: Optional[int]) -> None:
+        """Expect the fill fetch stream a SUBSCRIBE or REQUEST_UPDATE
+        carrying FILL_PARAMETERS asks for (d20 §5.1.3), under its Request
+        ID; await_fetch_done() waits for it. A paused one opens none."""
+        fill = (params or {}).get(D20ParamType.FILL_PARAMETERS)
+        if (fill is None or self._profile.param_table < 20
+                or (forward is not None and not int(forward))):
+            return
+        order = (fill.get(ParamType.GROUP_ORDER) or group_order
+                 or GroupOrder.ASCENDING)
+        self._fill_requests[request_id] = (fill, subscription_filter,
+                                           int(order))
+        self._fetch_done_futures[request_id] = self._loop.create_future()
 
     def subscribe_ok(
         self,
@@ -4024,12 +4135,29 @@ class _MOQTSessionMixin:
         Returns:
             (subscribe_response, fetch_response) when wait_response=True,
             (subscribe_msg, fetch_msg) when wait_response=False.
+
+        From d20 there is no Joining FETCH: one SUBSCRIBE at the Next
+        Object carries FILL_PARAMETERS, and the fill fetch stream under
+        its Request ID delivers the range (d20 §5.1.6). Both halves of the
+        pair are then the SUBSCRIBE's.
         """
         if fetch_type not in (FetchType.RELATIVE_JOINING,
                                FetchType.ABSOLUTE_JOINING):
             raise ValueError(
                 f"join() requires a joining fetch_type, got {fetch_type}")
-        self._check_fetch_supported()
+        if self._profile.fetch_location_filter:
+            params = dict(parameters or {})
+            params[D20ParamType.FILL_PARAMETERS] = {
+                ParamType.LOCATION_FILTER: self._joining_filter(
+                    fetch_type, joining_start)}
+            sub_msg = self.subscribe(
+                namespace, track_name, priority=subscriber_priority,
+                group_order=group_order,
+                filter_type=FilterType.LATEST_OBJECT, parameters=params)
+            if not wait_response:
+                return (sub_msg, sub_msg)
+            sub_ok = await self._await_response(sub_msg.request_id)
+            return (sub_ok, sub_ok)
 
         parameters = {} if parameters is None else parameters
         sub_request_id = self._allocate_request_id()
@@ -4098,7 +4226,20 @@ class _MOQTSessionMixin:
             raise ValueError(
                 f"joining_fetch() requires a joining fetch_type, "
                 f"got {fetch_type}")
-        self._check_fetch_supported()
+        if self._profile.fetch_location_filter:
+            # d20: a REQUEST_UPDATE with FILL_PARAMETERS; its fill fetch
+            # stream carries the update's Request ID.
+            fill = {ParamType.LOCATION_FILTER: self._joining_filter(
+                fetch_type, joining_start)}
+            if subscriber_priority is not None:
+                fill[ParamType.SUBSCRIBER_PRIORITY] = subscriber_priority
+            if group_order not in (None, GroupOrder.PUBLISHER_DEFAULT):
+                fill[ParamType.GROUP_ORDER] = group_order
+            params = dict(parameters or {})
+            params[D20ParamType.FILL_PARAMETERS] = fill
+            return self.request_update(subscription_request_id,
+                                       parameters=params,
+                                       wait_response=bool(wait_response))
         request_id = self._allocate_request_id()
         message = Fetch(
             request_id=request_id,
@@ -4133,15 +4274,24 @@ class _MOQTSessionMixin:
         parameters: Optional[Dict[int, bytes]] = None,
         wait_response: Optional[bool] = False,
         on_object: Optional[Callable] = None,
+        location_filter: Optional[LocationFilter] = None,
     ) -> Optional[MOQTMessage]:
         """Standalone FETCH of a range of objects from a track.
 
         Per spec §9.16.1: End Location.Object of 0 means the entire end
-        group is requested. `on_object` receives this FETCH's objects
-        (register_fetch_object_handler), registered before it is sent.
+        group is requested. From d20 the range travels as LOCATION_FILTER
+        with an inclusive End: the arguments are converted, or
+        `location_filter` is sent as is. `on_object` receives this
+        FETCH's objects (register_fetch_object_handler), registered
+        before it is sent.
         """
-        self._check_fetch_supported()
+        if location_filter is not None and \
+                not self._profile.fetch_location_filter:
+            raise ValueError(
+                f"location_filter needs draft-20 or later, not "
+                f"draft-{self.negotiated_draft}")
         parameters = {} if parameters is None else parameters
+        self._check_filter_ranges(parameters)
         request_id = self._allocate_request_id()
         namespace = self._make_namespace_tuple(namespace)
         if isinstance(track_name, str):
@@ -4159,6 +4309,7 @@ class _MOQTSessionMixin:
             end_group=end_group,
             end_object=end_object,
             parameters=parameters,
+            location_filter=location_filter,
         )
         self._subscriptions[request_id] = [message]
         self._fetch_done_futures[request_id] = \
@@ -4177,15 +4328,13 @@ class _MOQTSessionMixin:
             return self._await_routed(request_id)
         return self._await_response(request_id)
 
-    def _check_fetch_supported(self) -> None:
-        """FETCH from d20 (no Fetch Type, the range in LOCATION_FILTER) is
-        not implemented: refuse it before anything is sent."""
-        if self._profile.fetch_location_filter:
-            raise MOQTRequestError(
-                error_code=int(RequestErrorCode.NOT_SUPPORTED),
-                reason=f"FETCH is not implemented at "
-                       f"draft-{self.negotiated_draft}",
-                retry_interval=0)
+    @staticmethod
+    def _joining_filter(fetch_type: int, joining_start: int) -> LocationFilter:
+        """A joining range as a d20 fill Location Filter: relative counts
+        groups back from the current one, absolute names the first."""
+        if fetch_type == FetchType.RELATIVE_JOINING:
+            return LocationFilter.relative((joining_start or 0) + 1)
+        return LocationFilter.absolute(joining_start or 0, 0)
 
     def fetch_ok(
         self,
@@ -4251,6 +4400,40 @@ class _MOQTSessionMixin:
         if fin:
             self.stream_fin(stream_id)
         return stream_id
+
+    async def serve_fill(self, msg, history, largest, *,
+                         subscription_filter: Optional[LocationFilter] = None,
+                         group_order: Optional[int] = None,
+                         ) -> Optional[int]:
+        """Serve the fill fetch stream a SUBSCRIBE or REQUEST_UPDATE
+        carrying FILL_PARAMETERS asks for (d20 §5.1.3), from `history`
+        (an ObjectHistory) given the Largest Object `largest`. The stream
+        carries `msg`'s Request ID. `subscription_filter` is the
+        subscription's Location Filter, the fill range when
+        FILL_PARAMETERS has none; `group_order` its group order. Under
+        FILL_TIMEOUT, Objects the history no longer holds are reported
+        as End of Timed-Out Range, else as End of Unknown Range. Returns
+        the stream id, None when no fill stream opens (no
+        FILL_PARAMETERS, or an empty range). Call it only while the
+        subscription is not paused."""
+        params = getattr(msg, 'parameters', None) or {}
+        fill = params.get(D20ParamType.FILL_PARAMETERS)
+        if fill is None:
+            return None
+        if subscription_filter is None:
+            subscription_filter = getattr(msg, 'location_filter', None)
+        rng = fill_range(fill, subscription_filter, largest)
+        if rng is None:
+            return None
+        order = (fill.get(ParamType.GROUP_ORDER) or group_order
+                 or GroupOrder.ASCENDING)
+        timed_out = D20ParamType.FILL_TIMEOUT in fill
+        objects = history.fetch(
+            *rng, self, descending=order == GroupOrder.DESCENDING,
+            lost_marker=(FETCH_FLAGS_END_TIMED_OUT if timed_out
+                         else FETCH_FLAGS_END_UNKNOWN))
+        return await self.serve_fetch(msg.request_id, objects,
+                                      group_order=int(order))
 
     def fetch_error(
         self,

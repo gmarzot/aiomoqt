@@ -18,7 +18,7 @@ __all__ = [
     'D20ParamType', 'D20RequestErrorCode', 'LocationFilterType',
     'LocationFilter', 'RangeFilter', 'param_kinds', 'param_scope',
     'uses_location_filter', 'check_param_scope', 'range_filter_error',
-    'range_filter_count',
+    'range_filter_count', 'fill_range',
 ]
 
 U64_MAX = (1 << 64) - 1
@@ -405,6 +405,26 @@ class LocationFilter:
         if fetch and largest is not None:
             end = largest if end is None else min(end, tuple(largest))
         return start, end
+
+
+def fill_range(fill: Optional[Dict[int, Any]],
+               subscription_filter: Optional[LocationFilter],
+               largest: Optional[Tuple[int, int]]
+               ) -> Optional[Tuple[Tuple[int, int], Tuple[int, int]]]:
+    """(start, end) Locations, both inclusive, a fill fetch stream carries
+    (d22 §3.4): the LOCATION_FILTER in FILL_PARAMETERS, else the
+    subscription's, read as for a FETCH. None when no fill stream opens:
+    nothing published, or the range is empty or starts after Largest
+    Object."""
+    if largest is None:
+        return None
+    lf = (fill or {}).get(D20ParamType.LOCATION_FILTER)
+    if lf is None:
+        lf = subscription_filter or LocationFilter.none()
+    start, end = lf.resolve(tuple(largest), fetch=True)
+    if end is None or start > end:
+        return None
+    return start, end
 
 
 @dataclass(frozen=True, slots=True)

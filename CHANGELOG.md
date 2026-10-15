@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- d20-d22 FETCH: standalone FETCH is sent and served, the range in LOCATION_FILTER with an
+  inclusive End; `fetch(location_filter=)`.
+- d20-d22 join(): SUBSCRIBE at the Next Object with FILL_PARAMETERS; joining_fetch() is a
+  REQUEST_UPDATE with FILL_PARAMETERS.
+- d20-d22 fill fetch streams are served from the object history (`session.serve_fill()`),
+  counted in PUBLISH_DONE, and accepted on receive; an empty fill opens no stream.
+- d20-d22 FILL_TIMEOUT reports objects the history dropped as End of Timed-Out Range.
+- `on_fetch_gap` receives End of Range markers.
+- A FETCH_OK ending before the FETCH's Start closes the session (d20+).
+- A fetch object referencing a prior Subgroup or Priority after a leading End of Range marker,
+  and an empty FILL_PARAMETERS, are protocol violations.
 - LOC: payload carries the private-properties block (0x0A 0x00); --loc-bare opts out.
 - WebTransport: the server's `supported_drafts` order picks the draft, as raw QUIC ALPN
   does; a client offering no supported draft is refused at CONNECT (HTTP 400). Needs
