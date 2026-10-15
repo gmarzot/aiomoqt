@@ -5283,13 +5283,12 @@ class _MOQTSessionMixin:
             MaxSubscribeId(request_id=self._local_request_max))
 
     def _ingest_request_limit(self, params) -> None:
-        """Peer's MAX_REQUEST_ID Setup parameter (§9.3.1.3). Absent
-        leaves us unlimited rather than the spec's zero."""
-        if self._profile.control_uni_pair or not params:
+        """Peer's MAX_REQUEST_ID Setup parameter (§9.3.1.3); absent is
+        0, so nothing is sent until a MAX_REQUEST_ID raises it."""
+        if self._profile.control_uni_pair:
             return
-        limit = params.get(SetupParamType.MAX_REQUEST_ID)
-        if limit is not None:
-            self._peer_request_limit = int(limit)
+        limit = (params or {}).get(SetupParamType.MAX_REQUEST_ID)
+        self._peer_request_limit = 0 if limit is None else int(limit)
 
     async def _handle_max_request_id(self, msg: MaxSubscribeId) -> None:
         """§9.5: the peer raised the ceiling on our request ids; it
