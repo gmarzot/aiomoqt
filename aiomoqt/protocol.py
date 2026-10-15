@@ -2893,6 +2893,8 @@ class _MOQTSessionMixin:
         """Write bytes (and optional FIN) to stream_id."""
         if not self._session_writable():
             return
+        if self._tx_deferred and (stream_id, 'send') in self._tx_deferred:
+            return  # the stream's reset is queued
         try:
             self._quic.send_stream_data(
                 stream_id, data, end_stream=end_stream)
@@ -3044,10 +3046,9 @@ class _MOQTSessionMixin:
         Also the canonical reply to a peer's STOP_SENDING."""
         if not self._session_writable():
             return
-        try:
-            self._quic.reset_stream(stream_id, error_code)
-        except (AssertionError, AttributeError, RuntimeError) as e:
-            logger.debug(f"stream({stream_id}): reset race: {e}")
+        if self._tx_deferred:
+            self._tx_deferred.pop((stream_id, 'send'), None)
+        self._tx_op(stream_id, 'send', 'reset', error_code)
 
     def stream_stop_sending(self, stream_id: int,
                              error_code: int = SessionCloseCode.NO_ERROR) -> None:
@@ -3056,10 +3057,86 @@ class _MOQTSessionMixin:
         subscriber, FETCH_ERROR while the fetch stream is still open."""
         if not self._session_writable():
             return
+        self._tx_op(stream_id, 'recv', 'stop', error_code)
+
+    # Stream ops the transport refused on a full TX ring, retried as it
+    # drains: (stream_id, side) -> ((kind, arg), first_refused). 'send'
+    # holds the stream's terminal op, so a reset replaces a pending FIN.
+    _tx_deferred: Optional[Dict[Tuple[int, str], Tuple[Tuple[str, Any], float]]] = None
+    _tx_retry_task: Optional[asyncio.Task] = None
+    TX_RETRY_POLL_S = 0.02
+    TX_RETRY_GIVE_UP_S = 10.0
+
+    def _tx_send(self, stream_id: int, kind: str, arg: Any) -> bool:
+        """Hand one op to the transport; False when the ring is full."""
         try:
-            self._quic.stop_stream(stream_id, error_code)
-        except (AssertionError, AttributeError, RuntimeError) as e:
-            logger.debug(f"stream({stream_id}): stop_sending race: {e}")
+            if kind == 'reset':
+                self._quic.reset_stream(stream_id, arg)
+            elif kind == 'stop':
+                self._quic.stop_stream(stream_id, arg)
+            else:
+                self._quic.send_stream_data(stream_id, arg, end_stream=True)
+        except BufferError:
+            return False
+        except (AssertionError, AttributeError, RuntimeError,
+                ConnectionError) as e:
+            logger.debug(f"stream({stream_id}): {kind} race: {e}")
+        return True
+
+    def _tx_op(self, stream_id: int, side: str, kind: str, arg: Any) -> None:
+        """Send now, or queue for retry when the TX ring is full."""
+        if self._tx_send(stream_id, kind, arg):
+            return
+        logger.debug(f"stream({stream_id}): {kind} deferred: TX ring full")
+        if self._tx_deferred is None:
+            self._tx_deferred = {}
+        self._tx_deferred[(stream_id, side)] = ((kind, arg), time.monotonic())
+        if self._tx_retry_task is None:
+            self._tx_retry_task = asyncio.ensure_future(self._tx_retry())
+
+    def _tx_flush_deferred(self) -> None:
+        now = time.monotonic()
+        for key, ((kind, arg), since) in list(self._tx_deferred.items()):
+            if self._tx_send(key[0], kind, arg):
+                self._tx_deferred.pop(key, None)
+            elif now - since > self.TX_RETRY_GIVE_UP_S:
+                logger.warning(f"stream({key[0]}): {kind} dropped: TX ring "
+                               f"full for {self.TX_RETRY_GIVE_UP_S:g}s")
+                self._tx_deferred.pop(key, None)
+
+    async def _tx_retry(self) -> None:
+        """Retry deferred ops on each ring or stream drain, polling as a
+        fallback, until all are sent or the session closes."""
+        try:
+            while self._tx_deferred and self._session_writable():
+                transport = getattr(self._quic, '_transport', None)
+                ring_ev = getattr(transport, 'tx_event_ring_drain_event', None)
+                events = [ring_ev] if ring_ev is not None else []
+                get_ev = getattr(self._quic, 'get_tx_data_drain_event', None)
+                if get_ev is not None:
+                    events += [get_ev(sid) for (sid, _), ((kind, _a), _t)
+                               in self._tx_deferred.items() if kind == 'fin']
+                for ev in events:
+                    ev.clear()
+                if ring_ev is not None:
+                    transport.arm_tx_event_ring_drain_pending()
+                self._tx_flush_deferred()
+                if not self._tx_deferred:
+                    break
+                if not events:
+                    await asyncio.sleep(self.TX_RETRY_POLL_S)
+                    continue
+                waits = [asyncio.ensure_future(ev.wait()) for ev in events]
+                try:
+                    await asyncio.wait(waits, timeout=self.TX_RETRY_POLL_S,
+                                       return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    for w in waits:
+                        w.cancel()
+        finally:
+            self._tx_retry_task = None
+            if not self._session_writable():
+                self._tx_deferred = None
 
     def _stream_is_writable(self, stream_id: int) -> bool:
         """Whether send_stream_data on this session can be expected to

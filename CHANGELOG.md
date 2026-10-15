@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A reset or STOP_SENDING meeting a full TX ring is queued and retried, not raised.
 - d20-d22 FETCH: standalone FETCH is sent and served, the range in LOCATION_FILTER with an
   inclusive End; `fetch(location_filter=)`.
 - d20-d22 join(): SUBSCRIBE at the Next Object with FILL_PARAMETERS; joining_fetch() is a
