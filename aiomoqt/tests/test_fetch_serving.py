@@ -230,6 +230,7 @@ async def test_serve_fetch_resets_its_stream_when_cancelled():
 
     class _Stub:
         _profile = profile_for(18)
+        _served_fetch_streams = None
         written, resets, fins = [], [], []
 
         async def open_uni_stream(self):

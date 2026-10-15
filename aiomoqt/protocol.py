@@ -2917,6 +2917,8 @@ class _MOQTSessionMixin:
         if self._tx_deferred and (stream_id, 'send') in self._tx_deferred:
             return  # the stream's reset or FIN is queued
         if end_stream:
+            if self._served_fetch_streams:
+                self._forget_served_fetch(stream_id)
             self._tx_op(stream_id, 'send', 'fin', data)
             return
         try:
@@ -3050,6 +3052,15 @@ class _MOQTSessionMixin:
             # producer as the pre-check does, never return silently.
             logger.debug(f"stream({stream_id}): write after teardown: {e}")
             raise asyncio.CancelledError() from e
+
+    # Fetch streams serve_fetch() has open, by the peer's request id.
+    _served_fetch_streams: Optional[Dict[int, int]] = None
+
+    def _forget_served_fetch(self, stream_id: int) -> None:
+        for rid, sid in self._served_fetch_streams.items():
+            if sid == stream_id:
+                del self._served_fetch_streams[rid]
+                return
 
     def stream_fin(self, stream_id: int) -> None:
         """End-of-data on a sender-owned stream. Subgroup last object,
@@ -4488,6 +4499,9 @@ class _MOQTSessionMixin:
         stream_id = await self.open_uni_stream()
         header = FetchHeader(request_id=request_id)
         prior = None
+        if self._served_fetch_streams is None:
+            self._served_fetch_streams = {}
+        self._served_fetch_streams[request_id] = stream_id
         try:
             await self.stream_write_drain(
                 stream_id, header.serialize(prof=self._profile).data)
@@ -4495,6 +4509,8 @@ class _MOQTSessionMixin:
                 buf = obj.serialize(prof=self._profile, prior=prior,
                                     group_order=int(group_order))
                 await self.stream_write_drain(stream_id, buf.data)
+                if self._served_fetch_streams.get(request_id) != stream_id:
+                    return stream_id  # FETCH_CANCEL reset it
                 if obj.end_of_range is None:
                     prior = obj
                 else:
@@ -4509,6 +4525,9 @@ class _MOQTSessionMixin:
                                             if prior else -1))
         except asyncio.CancelledError:
             self.stream_reset(stream_id, StreamResetCode.CANCELLED)
+            raise
+        except BaseException:
+            self._served_fetch_streams.pop(request_id, None)
             raise
         if fin:
             self.stream_fin(stream_id)
@@ -5436,20 +5455,16 @@ class _MOQTSessionMixin:
                          reason=reason)
 
     async def _handle_fetch_cancel(self, msg: FetchCancel) -> None:
-        """Publisher-side: FETCH_CANCEL received for a fetch we are
-        serving. Reset the associated uni stream to release our write
-        side, and resolve any pending request state.
-        """
+        """d14/d16 FETCH_CANCEL for a fetch we serve: reset its stream
+        and tell the request's owner."""
         logger.info(f"MOQT event: handle {msg}")
-        stream_id = self._fetch_stream_by_request.pop(msg.request_id, None)
+        stream_id = (self._served_fetch_streams or {}).pop(msg.request_id,
+                                                           None)
         if stream_id is not None:
-            state = self._data_streams.get(stream_id)
-            if state is not None:
-                state.key = None  # reverse map already popped above
-            self.stream_reset(stream_id, SessionCloseCode.NO_ERROR)
+            self.stream_reset(stream_id, StreamResetCode.CANCELLED)
             logger.debug(f"MOQT stream({stream_id}): reset on FETCH_CANCEL "
                          f"for request_id={msg.request_id}")
-        self._resolve_request(msg.request_id, msg)
+        self._notify_request_cancelled(msg.request_id, "FETCH_CANCEL")
 
     async def _handle_fetch_ok(self, msg: FetchOk) -> None:
         logger.info(f"MOQT event: handle {msg}")
