@@ -927,8 +927,9 @@ class _MOQTSessionMixin:
         return tuple(largest) if isinstance(largest, (tuple, list)) else None
 
     def _check_fetch_ok_end(self, msg: FetchOk) -> None:
-        """d20 §10.14: an End Location before the FETCH's Start closes
-        the session."""
+        """An End Location before the FETCH's Start closes the session
+        (d18 §10.13, d20 §10.14). Before d20 End is the last Object plus
+        1, and Object 0 covers the whole group."""
         sent = next((m for m in self._subscriptions.get(msg.request_id, ())
                      if isinstance(m, Fetch)), None)
         if sent is None:
@@ -940,7 +941,12 @@ class _MOQTSessionMixin:
             start = (sent.start_group or 0, sent.start_object or 0)
         if None in start:
             return  # relative to Largest Object
-        end = (msg.largest_group_id, msg.largest_object_id - 1)
+        if self._profile.fetch_location_filter:
+            end = (msg.largest_group_id, msg.largest_object_id - 1)
+        elif msg.largest_object_id == 0:
+            end = (msg.largest_group_id, float('inf'))
+        else:
+            end = (msg.largest_group_id, msg.largest_object_id)
         if end < start:
             raise MOQTProtocolViolation(
                 f"FETCH_OK End Location {end} before the FETCH's Start "
@@ -951,8 +957,8 @@ class _MOQTSessionMixin:
         its batch and of the handler task: SUBSCRIBE_OK binds the
         request's object handler to its alias; an error reply drops what
         the request registered, and a refused PUBLISH_NAMESPACE announces
-        nothing. From d20 a FETCH_OK ending before its Start closes the
-        session, and a reply showing an empty fill range ends the fill."""
+        nothing. A FETCH_OK ending before its Start closes the session;
+        from d20 a reply showing an empty fill range ends the fill."""
         if isinstance(msg, SubscribeOk):
             cb = self._pending_object_handlers.pop(msg.request_id, None)
             if cb is not None and msg.track_alias is not None:
@@ -962,10 +968,10 @@ class _MOQTSessionMixin:
             self._drop_request_routes(rid)
             self._announced.pop(rid, None)
             return
-        if not self._profile.fetch_location_filter:
-            return
         if isinstance(msg, FetchOk):
             self._check_fetch_ok_end(msg)
+        if not self._profile.fetch_location_filter:
+            return
         fill = self._fill_requests.get(getattr(msg, 'request_id', None))
         if fill is not None and fill_range(
                 fill[0], fill[1], self._reply_largest(msg)) is None:

@@ -14,7 +14,7 @@
   counted in PUBLISH_DONE, and accepted on receive; an empty fill opens no stream.
 - d20-d22 FILL_TIMEOUT reports objects the history dropped as End of Timed-Out Range.
 - `on_fetch_gap` receives End of Range markers.
-- A FETCH_OK ending before the FETCH's Start closes the session (d20+).
+- A FETCH_OK ending before the FETCH's Start closes the session, at every draft.
 - A fetch object referencing a prior Subgroup or Priority after a leading End of Range marker,
   and an empty FILL_PARAMETERS, are protocol violations.
 - LOC: payload carries the private-properties block (0x0A 0x00); --loc-bare opts out.
