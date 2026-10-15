@@ -1201,7 +1201,8 @@ def test_fill_parameters_is_a_counted_nested_block():
     (bytes.fromhex("012305" "01210101"), "overruns|exceeds remaining"),
     (bytes.fromhex("012305" "0121010100"), "does not fill"),
     (bytes.fromhex("012303" "011001"), "not allowed in FillParameters"),
-], ids=["past-message", "short-of-length", "forward-inside"])
+    (bytes.fromhex("012300"), "no Number of Parameters"),
+], ids=["past-message", "short-of-length", "forward-inside", "empty"])
 def test_malformed_fill_parameters_is_a_protocol_violation(raw, match):
     with pytest.raises(MOQTProtocolViolation, match=match):
         _unparams(raw, 20)
@@ -1296,3 +1297,101 @@ def test_d20_fetch_object_carries_no_status():
     with pytest.raises(ValueError, match="no Object Status"):
         FetchObject(group_id=1, object_id=2, payload=b"",
                     status=ObjectStatus.END_OF_GROUP).serialize(prof=_prof(20))
+
+
+def test_d22_fetch_every_parameter_exact_bytes():
+    # d22 §9.11: FILL_TIMEOUT 0, SUBSCRIBER_PRIORITY 7, LOCATION_FILTER
+    # {1, 0}..{2, 3}, GROUP_ORDER Descending, INCLUDE_PROPERTIES 0; keys
+    # delta-coded in ascending order.
+    m = Fetch(fetch_type=1, request_id=4, namespace=(b"n",), track_name=b"t",
+              subscriber_priority=7, group_order=2,
+              location_filter=LocationFilter.absolute(1, 0, 2, 3),
+              parameters={0x0A: 0, 0x35: 0})
+    body = (b"\x04\x01\x01n\x01t" + b"\x05"
+            + b"\x0a\x00" + b"\x16\x07" + b"\x01" + ref_lf_d22(4, 1, 0, 1, 3)
+            + b"\x01\x02" + b"\x13\x00")
+    raw = bytes(m.serialize(prof=_prof(22)).data)
+    assert raw == b"\x16" + len(body).to_bytes(2, "big") + body
+    got = Fetch.deserialize(Buffer(data=body, vi64=True), prof=_prof(22),
+                            buf_end=len(body))
+    assert got.location_filter == LocationFilter.absolute(1, 0, 2, 3)
+    assert (got.subscriber_priority, got.group_order) == (7, 2)
+    assert got.parameters == {0x0A: 0, 0x35: 0}
+    # The d14-d18 view of the inclusive End {2, 3} is {2, 4}.
+    assert (got.start_group, got.start_object, got.end_group,
+            got.end_object) == (1, 0, 2, 4)
+
+
+@pytest.mark.parametrize("draft, params, match", [
+    (22, b"\x01\x21\x06", "Location Filter Type 0x6"),
+    (20, b"\x01\x21\x05\x01\x02\x03\x04\x05", "more than four"),
+    (22, b"\x01\x23\x01\x00", "not allowed in Fetch"),   # FILL_PARAMETERS
+    (22, b"\x01\x22\x03", "0x22"),                       # GROUP_ORDER 3
+    (21, b"\x01\x35\x02", "0x35"),                       # INCLUDE_PROPERTIES 2
+    (22, b"\x02\x21\x00\x00\x00", "duplicate"),          # LOCATION_FILTER twice
+    (20, b"\x01\x21\x04\x01", "overruns"),
+], ids=["d22-filter-type-6", "d20-five-fields", "fill-parameters",
+        "group-order-3", "include-properties-2", "filter-twice",
+        "filter-past-message"])
+def test_d20_malformed_fetch_is_a_protocol_violation(draft, params, match):
+    body = b"\x04\x01\x01n\x01t" + params
+    with pytest.raises(MOQTProtocolViolation, match=match):
+        Fetch.deserialize(Buffer(data=body, vi64=True), prof=_prof(draft),
+                          buf_end=len(body))
+
+
+def test_d22_fetch_ok_exact_bytes():
+    # d22 §9.12: End Of Track, inclusive End Location, no parameters, then
+    # Track Properties to the end of the message.
+    ok = FetchOk(request_id=None, end_of_track=0, largest_group_id=200,
+                 largest_object_id=1, track_extensions={0x08: 1000})
+    body = b"\x00" + ref_vi64(200) + b"\x00" + b"\x00" + b"\x08" + ref_vi64(1000)
+    raw = bytes(ok.serialize(prof=_prof(22)).data)
+    assert raw == b"\x18" + len(body).to_bytes(2, "big") + body
+    got = FetchOk.deserialize(Buffer(data=body, vi64=True), prof=_prof(22),
+                              buf_end=len(body))
+    assert (got.largest_group_id, got.largest_object_id) == (200, 1)
+    assert got.track_extensions == {0x08: 1000}
+
+
+def _fetch_stream(raw: bytes, draft: int, group_order=0x1):
+    rb = Buffer(data=raw, vi64=True)
+    prior, out = None, []
+    while rb.tell() < len(raw):
+        prior = FetchObject.deserialize(rb, prior=prior, prof=_prof(draft),
+                                        group_order=group_order)
+        out.append(prior)
+    return out
+
+
+@pytest.mark.parametrize("draft", _D20_DRAFTS)
+def test_d20_object_after_a_marker_takes_its_location(draft):
+    # d22 §11.4.1.2: after End of Timed-Out Range {3, 4}, an Object with
+    # flags 0 is {3, 5}, its Subgroup and Priority the last actual one's.
+    first = bytes.fromhex("1f" "02" "03" "01" "07" "0161")  # {2,1} sg 3 pri 7
+    marker = ref_vi64(0x20C) + b"\x03\x04"
+    nxt = bytes.fromhex("01" "0162")                     # sg prior, all else prior
+    got = _fetch_stream(first + marker + nxt, draft)
+    assert [(o.group_id, o.object_id, o.end_of_range) for o in got] == [
+        (2, 1, None), (3, 4, 0x20C), (3, 5, None)]
+    assert (got[2].subgroup_id, got[2].publisher_priority) == (3, 7)
+
+
+@pytest.mark.parametrize("draft", [18, 22])
+@pytest.mark.parametrize("nxt, match", [
+    (bytes.fromhex("01" "0162"), "prior Subgroup"),      # sg = prior
+    (bytes.fromhex("00" "0162"), "prior Priority"),      # priority = prior
+], ids=["subgroup", "priority"])
+def test_prior_reference_after_a_leading_marker_is_refused(draft, nxt, match):
+    # A marker with no actual Object before it carries no Subgroup or
+    # Priority to inherit.
+    marker = ref_vi64(0x10C) + b"\x03\x04"
+    with pytest.raises(ValueError, match=match):
+        _fetch_stream(marker + nxt, draft)
+
+
+@pytest.mark.parametrize("draft", _D20_DRAFTS)
+@pytest.mark.parametrize("flags", [0x80, 0x30C, 0x40C])
+def test_d20_undefined_range_indicator_is_refused(draft, flags):
+    with pytest.raises(ValueError, match="invalid serialization flags"):
+        _fetch_stream(ref_vi64(flags) + b"\x03\x04", draft)

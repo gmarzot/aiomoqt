@@ -920,6 +920,9 @@ class MOQTMessage:
                         raise MOQTProtocolViolation(
                             f"FILL_PARAMETERS length {param_len} exceeds "
                             f"remaining {buf_end - buf.tell()}")
+                    if param_len == 0:
+                        raise MOQTProtocolViolation(
+                            "FILL_PARAMETERS has no Number of Parameters")
                     param_value = MOQTMessage._deserialize_params(
                         buf, prof=prof, buf_end=value_end,
                         scope="FillParameters")
