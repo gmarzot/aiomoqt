@@ -1,7 +1,9 @@
 """LOC packaging over MoQT — draft-ietf-moq-loc-04.
 
-A LOC object payload is the raw encoded-media chunk (WebCodecs
-EncodedAudio/VideoChunk bytes); metadata rides MOQ object properties
+A LOC object payload is the LOC Private Properties block (§2.2: type
+0x0A, varint length, contents) followed by the raw encoded-media chunk
+(WebCodecs EncodedAudio/VideoChunk bytes). We send the block empty and
+skip its contents on receive. Public metadata rides MOQ object properties
 (even ID = bare vi64 value, odd ID = length-prefixed bytes — the
 codec in messages/base.py already implements this rule).
 
@@ -27,6 +29,7 @@ from typing import Any, Callable, Dict, Optional
 from ..delivery import StreamMapping
 from ..track import PublishedTrack, SubscribedTrack
 from ..types import ObjectStatus
+from ..utils.buffer import Buffer, BufferReadError
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -61,6 +64,10 @@ _CONFIG_IDS = (LOC_PROP_VIDEO_CONFIG, LOC_PROP_AUDIO_CONFIG)
 _CONSUMED_IDS = frozenset(_CONFIG_IDS + (LOC_PROP_TIMESCALE,
                                          LOC_PROP_CODECSTRING))
 
+# Private Properties block type (SecureObjects), opening every payload.
+LOC_PRIVATE_PROPERTIES = 0x0A
+_EMPTY_PRIVATE_PROPERTIES = bytes([LOC_PRIVATE_PROPERTIES, 0x00])
+
 # MoQ Streaming Format registry (loc-02 §6.2; dropped in loc-04).
 LOC_STREAMING_FORMAT_TYPE = 0x002
 
@@ -91,6 +98,9 @@ class LocTrackPublisher(PublishedTrack):
     without a catalog: each carries CODECSTRING and TIMESCALE (µs unless
     `timescale` is set), and video objects carry VIDEO_FRAME_MARKING. With
     TIMESCALE present, LOC reads timestamps as media time, not wall clock.
+
+    `loc_bare` sends the media without the Private Properties block, for
+    receivers predating it; MSF CMAF tracks, which are not LOC, use it too.
     """
 
     def __init__(self, session, namespace: str, trackname: str, *,
@@ -102,9 +112,11 @@ class LocTrackPublisher(PublishedTrack):
                  auth_token: bytes = b"bench-token",
                  queue_size: int = 256,
                  loc01_compat: bool = False,
-                 codec_string: Optional[str] = None):
+                 codec_string: Optional[str] = None,
+                 loc_bare: bool = False):
         super().__init__(session, namespace, trackname,
                          priority=priority, auth_token=auth_token)
+        self.loc_bare = loc_bare
         self.config = config
         self.mapping = mapping
         self.timescale = timescale
@@ -155,7 +167,9 @@ class LocTrackPublisher(PublishedTrack):
                  object_id: int) -> Optional[bytes]:
         """Object payload for a numbered frame; None drops the frame
         without using its object id."""
-        return payload
+        if self.loc_bare:
+            return payload
+        return _EMPTY_PRIVATE_PROPERTIES + payload
 
     def _object_extensions(self, frame: LocFrame, group_start: bool,
                            session=None) -> Dict[int, Any]:
@@ -235,20 +249,26 @@ class LocTrackSubscriber(SubscribedTrack):
     on_arrival(msg, recv_us, group_id, subgroup_id, frame) sees every
     object first, status markers and rejected objects included
     (frame=None), with its receive wall-clock µs.
+
+    An object without a well-formed Private Properties block is rejected
+    and counted in `objects_rejected`; `loc_bare` expects none.
     """
 
     def __init__(self, session, namespace: str, trackname: str = None,
                  on_frame: Optional[Callable] = None,
                  auth_token: Optional[bytes] = None,
-                 on_arrival: Optional[Callable] = None):
+                 on_arrival: Optional[Callable] = None,
+                 loc_bare: bool = False):
         super().__init__(session, namespace, trackname,
                          on_object=self._on_object, auth_token=auth_token)
         self.on_frame = on_frame
         self.on_arrival = on_arrival
+        self.loc_bare = loc_bare
         self.config: Optional[bytes] = None
         self.timescale: Optional[int] = None
         self.codec_string: Optional[str] = None
         self.frames_received = 0
+        self.objects_rejected = 0
 
     def set_config(self, config: Optional[bytes]) -> None:
         """Seed decoder config out-of-band (catalog initRef, §5.2.13)."""
@@ -257,7 +277,28 @@ class LocTrackSubscriber(SubscribedTrack):
     def _unpackage(self, msg, group_id: int) -> Optional[bytes]:
         """Frame payload of a received object; None rejects it (no
         on_frame)."""
-        return bytes(msg.payload)
+        payload = bytes(msg.payload)
+        if self.loc_bare or not payload:
+            return payload
+        # The block is required, never inferred: media may open with 0x0A.
+        buf = Buffer(data=payload)
+        try:
+            ptype = buf.pull_uint_var()
+            length = buf.pull_uint_var()
+        except BufferReadError:
+            return self._reject(msg, group_id, "truncated block header")
+        if ptype != LOC_PRIVATE_PROPERTIES:
+            return self._reject(msg, group_id, f"block type {ptype:#x}")
+        start = buf.tell() + length
+        if start > len(payload):
+            return self._reject(msg, group_id, "block overruns payload")
+        return payload[start:]
+
+    def _reject(self, msg, group_id: int, why: str) -> None:
+        self.objects_rejected += 1
+        logger.debug(f"LOC {self.trackname}: g{group_id} "
+                     f"o{msg.object_id} rejected: {why}")
+        return None
 
     def _on_object(self, msg, size, recv_us, group_id, subgroup_id) -> None:
         gid = getattr(msg, 'group_id', None)

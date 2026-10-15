@@ -161,6 +161,10 @@ def parse_args():
                              'and, on video, frame marking (0x09). With a '
                              'timescale, LOC reads timestamps as media '
                              'time rather than wall clock.')
+    parser.add_argument('--loc-bare', action='store_true',
+                        help='LOC payloads without the (empty) Private '
+                             'Properties block 0x0A 0x00, for receivers '
+                             'predating loc-04 §2.2')
     pub_mode = parser.add_mutually_exclusive_group()
     pub_mode.add_argument('--pub-ns', action='store_true',
                           help='PUBLISH_NAMESPACE only; the relay forwards '
@@ -204,8 +208,10 @@ def parse_args():
     args.rendition = args.rendition or 'best'
     if args.packaging != PACKAGING_LOC and not (args.mp4 or args.input):
         parser.error(f'--packaging {args.packaging} requires --mp4 or --input')
-    if args.loc_codecstring and args.packaging != PACKAGING_LOC:
-        parser.error('--loc-codecstring applies to LOC packaging only')
+    for flag, on in (('--loc-codecstring', args.loc_codecstring),
+                     ('--loc-bare', args.loc_bare)):
+        if on and args.packaging != PACKAGING_LOC:
+            parser.error(f'{flag} applies to LOC packaging only')
     if args.datagram and args.packaging == PACKAGING_LOCMAF:
         parser.error('--datagram does not apply to locmaf: its objects '
                      'need subgroup streams')
@@ -754,13 +760,16 @@ async def run(args):
         def _cs(codec):
             return codec if args.loc_codecstring else None
         session = sessions[0]
+        # CMAF objects are not LOC: no Private Properties block.
+        loc_bare = args.loc_bare or args.packaging == PACKAGING_CMAF
 
         def _track(name, **kwargs):
             if args.packaging == PACKAGING_LOCMAF:
                 init = catalog.resolve_init(catalog.find(name))
                 return LocmafTrackPublisher(session, args.namespace, name,
                                             init=init, **kwargs)
-            return LocTrackPublisher(session, args.namespace, name, **kwargs)
+            return LocTrackPublisher(session, args.namespace, name,
+                                     loc_bare=loc_bare, **kwargs)
         pub = FanoutPublisher(sessions, args.namespace, catalog)
         stats = {}
         feeders = []
@@ -777,7 +786,7 @@ async def run(args):
             if video is not None:
                 tracks['video'] = pub.add_track(LocTrackPublisher(
                     session, args.namespace, 'video', config=video.config,
-                    loc01_compat=args.loc01_compat,
+                    loc01_compat=args.loc01_compat, loc_bare=loc_bare,
                     codec_string=_cs(video.codec_string)))
                 stats['video'] = _TrackStats()
             if ts_audio is not None:
@@ -786,7 +795,7 @@ async def run(args):
                     config=ts_audio.asc,
                     mapping=(StreamMapping.DATAGRAM if args.datagram
                              else StreamMapping.PER_GROUP),
-                    loc01_compat=args.loc01_compat,
+                    loc01_compat=args.loc01_compat, loc_bare=loc_bare,
                     codec_string=_cs(ts_audio.codec_string)))
                 stats['audio'] = _TrackStats()
             feeders.append(_feed_ts_live(tracks, fh, dmx, first, args,
@@ -822,7 +831,7 @@ async def run(args):
             feeders.append(_feed_h264_live(
                 pub.add_track(LocTrackPublisher(
                     session, args.namespace, 'video', config=video.config,
-                    loc01_compat=args.loc01_compat,
+                    loc01_compat=args.loc01_compat, loc_bare=loc_bare,
                     codec_string=_cs(video.codec_string))),
                 fh, asm, first, args, stats['video']))
         elif video is not None and ts is None:   # --ts wired both tracks above
