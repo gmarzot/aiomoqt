@@ -1,17 +1,19 @@
 """Stream control ops on a full TX ring.
 
-aiopquic raises BufferError when its TX ring is full. A reset or
+aiopquic raises BufferError when its TX ring is full. A reset, FIN or
 STOP_SENDING that meets a full ring is queued and sent once the ring
 drains; it never escapes into the caller, which may be a fan-out lane or
-a control handler.
+a control handler. Subgroup headers wait for the ring.
 """
 import asyncio
+import copy
 from types import SimpleNamespace
 
 import pytest
 
 from aiomoqt.context import profile_for
-from aiomoqt.delivery import FanoutDelivery, SubgroupDelivery
+from aiomoqt.delivery import FanoutDelivery, StreamMapping, SubgroupDelivery
+from aiomoqt.messages import SubgroupHeader
 from aiomoqt.protocol import _MOQTSessionMixin
 from aiomoqt.types import StreamResetCode
 
@@ -182,3 +184,65 @@ async def test_lane_truncating_on_full_ring_survives(draft):
     assert not [op for op in ring.ops if op[0] == 'data' and op[1] == first
                 and op[3]], "the truncated group was FINed"
     lane.task.cancel()
+
+
+def _drain_later(ring, delay=0.02):
+    async def _go():
+        await asyncio.sleep(delay)
+        ring.drain()
+    return asyncio.ensure_future(_go())
+
+
+def _data(ring, sid):
+    return [(op[2], op[3]) for op in ring.ops if op[0] == 'data' and op[1] == sid]
+
+
+async def test_fin_on_full_ring_is_queued_then_sent():
+    s, ring = _session()
+    ring.full = True
+    s.stream_fin(7)
+    s.stream_write(9, b"tail", end_stream=True)
+    ring.drain()
+    assert await _until(lambda: len(ring.ops) == 2)
+    assert sorted(ring.ops) == [('data', 7, b"", True),
+                                ('data', 9, b"tail", True)]
+
+
+@pytest.mark.parametrize("draft", DRAFTS)
+async def test_group_header_marker_and_fin_survive_a_full_ring(draft):
+    s, ring = _session(draft)
+    delivery = SubgroupDelivery(s, track_alias=1)
+    ring.full = True
+    drain = _drain_later(ring)
+    await delivery.write(0, 0, b"a", group_start=True)
+    await drain
+    sid = delivery._stream_id
+    marker = copy.deepcopy(delivery._header).end_group(object_id=1).data
+    ring.full = True
+    delivery.end_group()
+    ring.drain()
+    assert await _until(lambda: any(fin for _, fin in _data(ring, sid)))
+    sent = _data(ring, sid)
+    assert len(sent) == 3, sent
+    assert sent[0][0] == SubgroupHeader(
+        track_alias=1, group_id=0, subgroup_id=0, publisher_priority=128,
+        extensions_present=True, prof=s._profile,
+        first_object=True).serialize().data
+    assert sent[2] == (marker, True)
+
+
+@pytest.mark.parametrize("draft", DRAFTS)
+async def test_object_stream_header_and_fin_survive_a_full_ring(draft):
+    s, ring = _session(draft)
+    delivery = SubgroupDelivery(s, track_alias=1,
+                                mapping=StreamMapping.PER_OBJECT)
+    ring.full = True
+    drain = _drain_later(ring)
+    await delivery.write(0, 0, b"a", group_start=True)
+    await drain
+    assert await _until(lambda: len(ring.ops) == 3)
+    sids = {op[1] for op in ring.ops}
+    assert len(sids) == 1
+    sent = _data(ring, sids.pop())
+    assert [fin for _, fin in sent] == [False, False, True]
+    assert sent[2][0] == b""

@@ -212,7 +212,7 @@ class SubgroupDelivery:
                 track_alias=self.track_alias, group_id=group_id,
                 subgroup_id=object_id, publisher_priority=self.priority,
                 extensions_present=True, prof=self._prof)
-            self.session.stream_write(sid, hdr.serialize().data)
+            await self.session.stream_write_drain(sid, hdr.serialize().data)
             buf = hdr.next_object(payload=payload, extensions=extensions,
                                   object_id=object_id)
             await self.session.stream_write_drain(sid, buf.data)
@@ -232,8 +232,8 @@ class SubgroupDelivery:
                     subgroup_id=0, publisher_priority=self.priority,
                     extensions_present=True, prof=self._prof,
                     first_object=group_start)
-                self.session.stream_write(self._stream_id,
-                                          self._header.serialize().data)
+                await self.session.stream_write_drain(
+                    self._stream_id, self._header.serialize().data)
             buf = self._header.next_object(payload=payload,
                                            extensions=extensions,
                                            object_id=object_id)

@@ -2894,10 +2894,12 @@ class _MOQTSessionMixin:
         if not self._session_writable():
             return
         if self._tx_deferred and (stream_id, 'send') in self._tx_deferred:
-            return  # the stream's reset is queued
+            return  # the stream's reset or FIN is queued
+        if end_stream:
+            self._tx_op(stream_id, 'send', 'fin', data)
+            return
         try:
-            self._quic.send_stream_data(
-                stream_id, data, end_stream=end_stream)
+            self._quic.send_stream_data(stream_id, data)
         except (AssertionError, AttributeError, BufferError,
                 WebTransportError) as e:
             logger.debug(f"stream({stream_id}): write race: {e}")
@@ -3031,13 +3033,7 @@ class _MOQTSessionMixin:
     def stream_fin(self, stream_id: int) -> None:
         """End-of-data on a sender-owned stream. Subgroup last object,
         fetch range complete, control GOAWAY+close use this."""
-        if not self._session_writable():
-            return
-        try:
-            self._quic.send_stream_data(stream_id, b"", end_stream=True)
-        except (AssertionError, AttributeError, BufferError,
-                RuntimeError, WebTransportError) as e:
-            logger.debug(f"stream({stream_id}): fin race: {e}")
+        self.stream_write(stream_id, b"", end_stream=True)
 
     def stream_reset(self, stream_id: int,
                       error_code: int = SessionCloseCode.NO_ERROR) -> None:
@@ -4452,9 +4448,10 @@ class _MOQTSessionMixin:
         mid-way, it resets the stream (§5.2)."""
         stream_id = await self.open_uni_stream()
         header = FetchHeader(request_id=request_id)
-        self.stream_write(stream_id, header.serialize(prof=self._profile).data)
         prior = None
         try:
+            await self.stream_write_drain(
+                stream_id, header.serialize(prof=self._profile).data)
             for obj in objects:
                 buf = obj.serialize(prof=self._profile, prior=prior,
                                     group_order=int(group_order))

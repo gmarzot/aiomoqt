@@ -139,7 +139,8 @@ class CatalogTrackPublisher(PublishedTrack):
                     subgroup_id=0, publisher_priority=self.priority,
                     prof=prof)
                 self._next_group += 1
-                session.stream_write(stream_id, header.serialize().data)
+                await session.stream_write_drain(stream_id,
+                                                 header.serialize().data)
             buf = header.next_object(payload=payload)
             await session.stream_write_drain(stream_id, buf.data)
             self._note_largest(header.group_id, header._last_object_id)
