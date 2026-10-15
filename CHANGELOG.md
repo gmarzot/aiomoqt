@@ -3,6 +3,9 @@
 ## Unreleased
 
 - LOC: payload carries the private-properties block (0x0A 0x00); --loc-bare opts out.
+- WebTransport: the server's `supported_drafts` order picks the draft, as raw QUIC ALPN
+  does; a client offering no supported draft is refused at CONNECT (HTTP 400). Needs
+  aiopquic > 0.5.0a4.
 - Relay: a d18 PUBLISH_NAMESPACE cancelled by its stream, or a d16 PUBLISH_NAMESPACE_DONE
   naming only the request, withdraws the namespace and sends NAMESPACE_DONE.
 - Relay: a namespace element containing "/" stays one element; it was split upstream and in

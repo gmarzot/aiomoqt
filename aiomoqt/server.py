@@ -164,10 +164,10 @@ class MOQTServer(MOQTPeer):
         if self.socket_buffer_size is not None:
             wt_cfg.socket_buffer_size = self.socket_buffer_size
 
-        # Advertise the supported drafts as WT subprotocols (caller order)
-        # so picowt selects the highest mutual against the client's
-        # WT-Available-Protocols. Drafts >= 15 negotiate the version this
-        # way ("moqt-NN"); d14 uses the legacy in-band CLIENT_SETUP path.
+        # WT-Protocol allowlist in supported_drafts order, as for raw-QUIC
+        # ALPN: aiopquic selects the first one the client offered and
+        # refuses an offer with no match. Drafts >= 15 negotiate this way
+        # ("moqt-NN"); d14 uses the legacy in-band CLIENT_SETUP path.
         wt_supported = [f"moqt-{d}"
                         for d in self.supported_drafts
                         if d >= 15] or None
@@ -214,6 +214,7 @@ class MOQTServer(MOQTPeer):
         async def wt_handler(_session):
             pass  # session lifetime owned by the dispatcher
 
+        # Server preference order, as in serve().
         wt_supported = [f"moqt-{d}" for d in self.supported_drafts
                         if d >= 15] or None
         return serve_dispatch(
