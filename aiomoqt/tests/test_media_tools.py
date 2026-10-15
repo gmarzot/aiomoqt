@@ -85,7 +85,10 @@ def _pub_args(monkeypatch, *argv):
     ('--packaging', 'locmaf'),
     ('--packaging', 'locmaf', '--mp4', 'x.mp4', '-D'),
     ('--packaging', 'locmaf', '--mp4', 'x.mp4', '--loc-codecstring'),
-], ids=['no-source', 'datagram', 'loc-codecstring'])
+    ('--packaging', 'locmaf', '--mp4', 'x.mp4', '--loc-bare'),
+    ('--packaging', 'cmaf', '--mp4', 'x.mp4', '--loc-bare'),
+], ids=['no-source', 'datagram', 'loc-codecstring', 'loc-bare-locmaf',
+        'loc-bare-cmaf'])
 def test_pub_media_locmaf_flag_conflicts(monkeypatch, argv):
     with pytest.raises(SystemExit):
         _pub_args(monkeypatch, *argv)
