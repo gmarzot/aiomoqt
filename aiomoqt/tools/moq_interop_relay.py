@@ -67,7 +67,6 @@ from aiomoqt.messages.base import MOQTMessage
 from aiomoqt.messages.data import (FetchObject, ObjectDatagram,
                                    ObjectDatagramStatus)
 from aiomoqt.messages.fetch import _is_joining
-from aiomoqt.messages.publish import PublishOk
 from aiomoqt.messages.request import RequestError, RequestOk
 from aiomoqt.messages.subscribe import Subscribe
 from aiomoqt.track import (PublishedTrack, SubscribedTrack, _UNFILTERED,
@@ -82,7 +81,7 @@ from aiomoqt.utils.url import parse_relay_url
 # set (the open-relay context, where clients offer their full version list),
 # advertise every supported draft so any client negotiates.
 _RELAY_DRAFT_DEFAULT = (os.environ.get("DRAFT")
-                        or os.environ.get("MOQT_DRAFT") or "14,16,18").strip()
+                        or os.environ.get("MOQT_DRAFT") or "18,16,14").strip()
 
 logger = get_logger(__name__)
 
@@ -1082,14 +1081,14 @@ def _answer_publish(track) -> None:
     session.register_stream_end_handler(msg.track_alias, track.on_stream_end)
     if getattr(msg, "content_exists", 0):
         track.note_largest((msg.largest_group_id, msg.largest_object_id))
-    ok = PublishOk(
-        request_id=msg.request_id, forward=int(forward), priority=128,
-        group_order=GroupOrder.ASCENDING,
-        filter_type=FilterType.LATEST_OBJECT, parameters={})
+    # From d20 PUBLISH_OK carries only EXPIRES and Forward State follows
+    # in a REQUEST_UPDATE; publish_ok() sends the draft's shape.
+    session.publish_ok(msg, forward=int(forward), priority=128,
+                       group_order=GroupOrder.ASCENDING,
+                       filter_type=FilterType.LATEST_OBJECT)
     logger.info(f"relay: PUBLISH_OK forward={int(forward)} "
                 f"alias={msg.track_alias}"
                 + ("" if forward else " — parked until a subscriber forwards"))
-    session._send_reply(msg.request_id, ok)
     track.upstream = session
     track.upstream_request_id = msg.request_id
     track.parked = None if forward else (session, msg)
@@ -1364,7 +1363,7 @@ def parse_args():
                         default=parse_draft_spec(_RELAY_DRAFT_DEFAULT),
                         help="MoQT draft(s) to serve: a single draft confines "
                              "negotiation to it; a list offers all of them. "
-                             "Default from $DRAFT / $MOQT_DRAFT, else 14,16,18.")
+                             "Default from $DRAFT / $MOQT_DRAFT, else 18,16,14.")
     parser.add_argument("--upstream", action="append", default=[],
                         metavar="URL",
                         help="Origin to dial for tracks no inbound "

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Relay: a d20+ PUBLISH is answered with an EXPIRES-only PUBLISH_OK, Forward State following in
+  a REQUEST_UPDATE; the PUBLISH_OK it built failed to encode. Default `--draft` is `18,16,14`.
 - d20-d22 FETCH: standalone FETCH is sent and served, the range in LOCATION_FILTER with an
   inclusive End; `fetch(location_filter=)`.
 - d20-d22 join(): SUBSCRIBE at the Next Object with FILL_PARAMETERS; joining_fetch() is a
