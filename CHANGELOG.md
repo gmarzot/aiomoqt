@@ -60,8 +60,8 @@
 - aiopquic floor `>=0.5.0a4`.
 - Fix: a WebTransport client connection releases its transport's event dispatcher on exit; each
   one kept its transport, rings and wake fd.
-- d20+: SUBSCRIBE and REQUEST_UPDATE carry LOCATION_FILTER, length-prefixed at d20/d21 and
-  typed at d22; `subscribe(location_filter=)` sends the forms Filter Type cannot express.
+- d20+: SUBSCRIBE and REQUEST_UPDATE carry LOCATION_FILTER, length-prefixed at d20 and typed
+  at d22; `subscribe(location_filter=)` sends the forms Filter Type cannot express.
 - d20+: a subscription filter is always valid, and its end stops Objects without
   PUBLISH_DONE; `subscribe_done()` defaults to TRACK_ENDED, SUBSCRIPTION_ENDED being gone.
 - d20+: PUBLISH_OK carries only EXPIRES; `publish_ok()` sends the changed FORWARD, priority
@@ -84,22 +84,23 @@
 - d20+: FETCH is not implemented: `fetch()`, `joining_fetch()` and `join()` raise
   NOT_SUPPORTED, and a peer's FETCH is answered REQUEST_ERROR NOT_SUPPORTED.
 - d20+: no END_OF_GROUP past a filter's End Object; GOAWAY carries no Request ID.
-- `aiomoqt.messages.params`: the d18, d20/d21 and d22 Message Parameter tables, the
+- `aiomoqt.messages.params`: the d18, d20 and d22 Message Parameter tables, the
   LOCATION_FILTER and Range Filter codecs, and FILL_PARAMETERS.
 - d20+ message shapes: PUBLISH_OK, FETCH, FETCH_OK (inclusive End), PUBLISH_DONE codes,
   GOAWAY, End of Timed-Out Range; `PublishSkipped` names d18's PUBLISH_BLOCKED.
-- Tools: `--draft 20|21|22` (or a list such as `22,21,20,18`) on pub_bench, sub_bench,
-  relay_probe, moq_interop_client, pub_server and moq_interop_relay; defaults unchanged.
-- Sessions complete SETUP at d20, d21 and d22 over raw QUIC (ALPN `moqt-20`/`-21`/`-22`) and
+- Tools: `--draft 20|22` (or a list such as `22,20,18`) on pub_bench, sub_bench,
+  relay_probe, moq_interop_client, pub_server and moq_interop_relay.
+- Sessions complete SETUP at d20 and d22 over raw QUIC (ALPN `moqt-20`/`-22`) and
   WebTransport (WT-Protocol), with the draft settled from the negotiation on both ends.
 - d20+: PUBLISH_STATE_NOTIFY is received and logged; the peer's MAX_REQUEST_UPDATES and
   MAX_FILTER_RANGES are recorded.
 - Fix: the control-message TX guard refuses to send on a draft without a type table.
 - `aiomoqt.messages.d20`: SETUP with the d20 Setup Options (adds MAX_FILTER_RANGES 0x06 and
   MAX_REQUEST_UPDATES 0x08), unknown options ignored, and PUBLISH_STATE_NOTIFY (0x22).
-- Drafts 20, 21 and 22 are `MOQTDraft` members, opt-in: the default offer stays 18, 16, 14
-  (`MOQT_DEFAULT_DRAFTS`).
-- `DraftProfile` rows for d20/d21 (one shape) and d22, with `location_filter_typed` and
+- Drafts 20 and 22 are `MOQTDraft` members; the default offer (`MOQT_DEFAULT_DRAFTS`) is
+  22, 20, 18, 16, 14 for clients and servers. Odd-numbered drafts are not supported.
+- `pub_server --draft` defaults to the library offer.
+- `DraftProfile` rows for d20 and d22, with `location_filter_typed` and
   `relay_forwards_publish_namespace`.
 - Fix: `wire_control_type` and `profile_for` raise for a draft without a table; PUBLISH_OK
   fell back to 0x1E, reserved from d20.

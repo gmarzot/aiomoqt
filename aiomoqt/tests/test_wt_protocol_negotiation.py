@@ -17,8 +17,8 @@ from aiomoqt.tests._certs import CERT, KEY, requires_certs
 pytestmark = requires_certs
 
 _BASE_PORT = 16900
-_SERVER_DRAFTS = [22, 21, 20, 18, 16, 14]
-_ASCENDING = [14, 16, 18, 20, 21, 22]
+_SERVER_DRAFTS = [22, 20, 18, 16, 14]
+_ASCENDING = [14, 16, 18, 20, 22]
 
 requires_wt_server_order = pytest.mark.skipif(
     Version(aiopquic.__version__) <= Version("0.5.0a4"),
@@ -86,7 +86,8 @@ async def test_wt_offer_with_no_supported_draft_is_refused(dual):
     """A d22-only client against a 18/16/14 server fails at CONNECT with
     the HTTP status, before any MoQT message is exchanged."""
     port = _BASE_PORT + 3 + (1 if dual else 0)
-    handle, seen = await _start(port, None, use_quic=False, dual=dual)
+    handle, seen = await _start(port, [18, 16, 14], use_quic=False,
+                                dual=dual)
     try:
         with pytest.raises(ConnectionError, match=r"refused \(HTTP 400\)"):
             async with asyncio.timeout(8):
@@ -100,7 +101,7 @@ async def test_wt_offer_with_no_supported_draft_is_refused(dual):
 async def test_relay_probe_reports_a_wt_refusal():
     from aiomoqt.tools import relay_probe
     port = _BASE_PORT + 5
-    handle, _ = await _start(port, None, use_quic=False)
+    handle, _ = await _start(port, [18, 16, 14], use_quic=False)
     try:
         r = await relay_probe.probe_version(
             "localhost", port, "/", False, 22, verify_tls=False)

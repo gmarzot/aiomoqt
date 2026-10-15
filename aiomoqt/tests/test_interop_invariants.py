@@ -206,7 +206,7 @@ class TestMoqtClientDraftValidation:
         # (newest first) and the server picks via ALPN / negotiation.
         from aiomoqt.client import MOQTClient
         c = MOQTClient("localhost", 4433, supported_drafts=None)
-        assert c.supported_drafts == [18, 16, 14]
+        assert c.supported_drafts == [22, 20, 18, 16, 14]
 
 
 # =====================================================================

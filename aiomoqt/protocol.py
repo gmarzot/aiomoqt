@@ -5609,7 +5609,7 @@ class _MOQTSessionMixin:
     _D18_REGISTRY[D18MessageType.PUBLISH_BLOCKED] = (
         PublishBlocked, _handle_publish_blocked)
 
-    # d20, d21 and d22 share one table: d18 with the d20 SETUP codec and
+    # d20 and d22 share one table: d18 with the d20 SETUP codec and
     # PUBLISH_STATE_NOTIFY. PUBLISH_OK 0x1E is reserved from d20 and is
     # pruned below.
     _D20_REGISTRY = dict(_D18_REGISTRY)
@@ -5622,7 +5622,6 @@ class _MOQTSessionMixin:
         MOQTDraft.DRAFT_16: _D16_REGISTRY,
         MOQTDraft.DRAFT_18: _D18_REGISTRY,
         MOQTDraft.DRAFT_20: _D20_REGISTRY,
-        MOQTDraft.DRAFT_21: _D20_REGISTRY,
         MOQTDraft.DRAFT_22: _D20_REGISTRY,
     }
     # One source of truth with the TX guard: dispatch exactly the types

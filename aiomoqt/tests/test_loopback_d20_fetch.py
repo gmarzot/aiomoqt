@@ -1,4 +1,4 @@
-"""FETCH at drafts 20, 21 and 22 over raw QUIC and WebTransport: the
+"""FETCH at drafts 20 and 22 over raw QUIC and WebTransport: the
 range in LOCATION_FILTER with an inclusive End, joining by SUBSCRIBE and
 a FETCH after LARGEST_OBJECT, fill fetch streams, and End of Timed-Out
 Range. Two tracks publish on one session; their payload sizes differ, so
@@ -30,7 +30,7 @@ _SIZES = {"video": 300, "audio": 100}
 _GROUP = 5
 _TRANSPORTS = pytest.mark.parametrize("use_quic", [True, False],
                                       ids=["quic", "wt"])
-_DRAFTS = pytest.mark.parametrize("draft", [20, 21, 22])
+_DRAFTS = pytest.mark.parametrize("draft", [20, 22])
 
 
 def _port(case: int, use_quic: bool) -> int:
@@ -202,7 +202,7 @@ async def test_fetch_refusals(use_quic):
 
 @_TRANSPORTS
 async def test_fetch_on_an_empty_track_is_refused(use_quic):
-    async with _loopback(_port(5, use_quic), 21, use_quic,
+    async with _loopback(_port(5, use_quic), 20, use_quic,
                          prefill=0) as (tracks, rx):
         assert await _refusal(rx.session.fetch(
             _NS, "video", location_filter=LocationFilter.none(),
@@ -250,7 +250,7 @@ async def test_join_at_d22(use_quic):
 async def test_join_without_waiting_keeps_the_reply(use_quic):
     """join(wait_response=False) as MediaSubscriber drives it; absolute
     joining starts at its group."""
-    async with _loopback(_port(7, use_quic), 21, use_quic) as (tracks, rx):
+    async with _loopback(_port(7, use_quic), 20, use_quic) as (tracks, rx):
         session = rx.session
         sub_msg, fetch_msg = await session.join(
             _NS, "audio", fetch_type=FetchType.ABSOLUTE_JOINING,

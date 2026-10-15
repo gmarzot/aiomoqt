@@ -10,7 +10,7 @@ from ...utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Setup Options registry, d20 §15.4 (d21 and d22 §16.4 list the same rows).
+# Setup Options registry, d20 §15.4 (d22 §16.4 lists the same rows).
 # The Value form follows the Type's parity (§1.4.3): odd = Length + bytes,
 # even = one varint.
 SETUP_OPTIONS: Dict[int, str] = {
@@ -33,7 +33,7 @@ OPTION_TYPE_MAX = (1 << 64) - 1
 
 @dataclass(slots=True)
 class Setup(_D18Setup):
-    """SETUP for d20, d21 and d22 (d20 §10.3, d22 §9.1): type 0x2F00, a
+    """SETUP for d20 and d22 (d20 §10.3, d22 §9.1): type 0x2F00, a
     16-bit Length, then delta-coded Setup Options up to the Length.
 
     `options` holds the known options. Unknown ones are skipped, as the

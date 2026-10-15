@@ -1,4 +1,4 @@
-"""Loopback SETUP at drafts 20, 21 and 22 over raw QUIC and WebTransport.
+"""Loopback SETUP at drafts 20 and 22 over raw QUIC and WebTransport.
 
 The server accepts every draft, so each end must learn the draft from
 the negotiation (ALPN moqt-NN, or WT-Available-Protocols -> WT-Protocol)
@@ -18,7 +18,7 @@ from aiomoqt.tests._certs import CERT, KEY, requires_certs
 pytestmark = requires_certs
 
 _BASE_PORT = 16600
-_ALL_DRAFTS = [22, 21, 20, 18, 16, 14]
+_ALL_DRAFTS = [22, 20, 18, 16, 14]
 
 
 async def _start_server(port, use_quic, supported_drafts=_ALL_DRAFTS):
@@ -53,7 +53,7 @@ async def _server_session(captured, timeout=3.0):
 
 
 @pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
-@pytest.mark.parametrize("draft", [20, 21, 22])
+@pytest.mark.parametrize("draft", [20, 22])
 async def test_d20_setup_connects_and_closes(draft, use_quic):
     port = _BASE_PORT + (draft - 20) * 2 + (0 if use_quic else 1)
     handle, captured = await _start_server(port, use_quic)
@@ -103,14 +103,14 @@ async def test_d20_unknown_setup_options_are_ignored_end_to_end(use_quic):
 
 
 @pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
-async def test_d20_offer_falls_back_to_a_default_server(use_quic):
-    """A client offering 22..18 settles on 18 with a server left at the
-    default drafts, which do not include 20-22."""
+async def test_d20_offer_falls_back_to_a_d18_server(use_quic):
+    """A client offering 22..18 settles on 18 with a server that stops at
+    18."""
     port = _BASE_PORT + 12 + (0 if use_quic else 1)
     handle, captured = await _start_server(port, use_quic,
-                                           supported_drafts=None)
+                                           supported_drafts=[18, 16, 14])
     try:
-        client = _client(port, use_quic, [22, 21, 20, 18])
+        client = _client(port, use_quic, [22, 20, 18])
         async with client.connect() as session:
             await session.client_session_init()
             assert session.negotiated_draft == 18
@@ -122,7 +122,7 @@ async def test_d20_offer_falls_back_to_a_default_server(use_quic):
 
 async def test_d20_is_refused_by_a_server_not_configured_for_it():
     port = _BASE_PORT + 14
-    handle, _ = await _start_server(port, True, supported_drafts=None)
+    handle, _ = await _start_server(port, True, supported_drafts=[18, 16, 14])
     try:
         with pytest.raises(Exception):
             async with asyncio.timeout(8):
@@ -136,13 +136,13 @@ async def test_d20_is_refused_by_a_server_not_configured_for_it():
 async def test_d20_multi_offer_settles_the_servers_draft(use_quic):
     port = _BASE_PORT + 16 + (0 if use_quic else 1)
     handle, captured = await _start_server(port, use_quic,
-                                           supported_drafts=[21])
+                                           supported_drafts=[20])
     try:
-        async with _client(port, use_quic, [22, 21, 20]).connect() as session:
+        async with _client(port, use_quic, [22, 20, 18]).connect() as session:
             await session.client_session_init()
-            assert session.negotiated_draft == 21
+            assert session.negotiated_draft == 20
             srv, _ = await _server_session(captured)
-            assert srv.negotiated_draft == 21
+            assert srv.negotiated_draft == 20
     finally:
         handle.close()
 
@@ -163,11 +163,11 @@ async def test_d20_serve_dual_takes_both_transports_on_one_port():
     server.register_handler(MOQTMessageType.SETUP, on_setup)
     handle = await server.serve_dual()
     try:
-        for use_quic, draft in ((True, 22), (False, 21), (True, 20)):
+        for use_quic, draft in ((True, 22), (False, 20), (True, 20)):
             async with _client(port, use_quic, draft).connect() as session:
                 await session.client_session_init()
                 assert session.negotiated_draft == draft
-        assert [s.negotiated_draft for s in captured] == [22, 21, 20]
+        assert [s.negotiated_draft for s in captured] == [22, 20, 20]
         assert [s._is_wt for s in captured] == [False, True, False]
     finally:
         handle.close()
@@ -193,13 +193,30 @@ async def test_interop_client_setup_only_against_the_interop_relay(use_quic):
     from aiomoqt.tools import moq_interop_client, moq_interop_relay
     port = _BASE_PORT + 22 + (0 if use_quic else 1)
     server = moq_interop_relay._build_server(
-        "localhost", port, CERT, KEY, use_quic, [22, 21, 20, 18])
+        "localhost", port, CERT, KEY, use_quic, [22, 20, 18])
     handle = await server.serve()
     try:
-        for draft in (20, 21, 22):
+        for draft in (20, 22):
             result = await moq_interop_client.test_setup_only(
                 "localhost", port, "/", use_quic, True, False,
                 supported_drafts=draft)
             assert result.passed, result.message
+    finally:
+        handle.close()
+
+
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+async def test_default_client_and_server_settle_d22(use_quic):
+    port = _BASE_PORT + 24 + (0 if use_quic else 1)
+    handle, captured = await _start_server(port, use_quic,
+                                           supported_drafts=None)
+    try:
+        client = MOQTClient("localhost", port, path="/", use_quic=use_quic,
+                            verify_tls=False)
+        async with client.connect() as session:
+            await session.client_session_init()
+            assert session.negotiated_draft == 22
+            srv, _ = await _server_session(captured)
+            assert srv.negotiated_draft == 22
     finally:
         handle.close()

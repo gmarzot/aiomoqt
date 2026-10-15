@@ -90,12 +90,11 @@ SPEC_D20 = {
     0x0F: "PUBLISH_SKIPPED",    0x02: "REQUEST_UPDATE",
     0x07: "REQUEST_OK",         0x05: "REQUEST_ERROR",
 }
-# draft-21 and draft-22 §9 Table 5: the same rows as d20.
-SPEC_D21 = dict(SPEC_D20)
+# draft-22 §9 Table 5: the same rows as d20.
 SPEC_D22 = dict(SPEC_D20)
 
 SPEC = {14: SPEC_D14, 16: SPEC_D16, 18: SPEC_D18,
-        20: SPEC_D20, 21: SPEC_D21, 22: SPEC_D22}
+        20: SPEC_D20, 22: SPEC_D22}
 
 # Removed in d18 — sending any of these is a wire violation there.
 D18_REMOVED = {
@@ -123,7 +122,7 @@ class _Msg:
 _guard = MOQTSessionQuic._assert_type_defined_by_draft
 
 
-@pytest.mark.parametrize("draft", [14, 16, 18, 20, 21, 22])
+@pytest.mark.parametrize("draft", [14, 16, 18, 20, 22])
 def test_runtime_table_matches_the_spec(draft):
     assert CONTROL_MESSAGE_TYPES[draft] == frozenset(SPEC[draft]), (
         f"draft-{draft} table disagrees with the spec transcription; "
@@ -133,7 +132,7 @@ def test_runtime_table_matches_the_spec(draft):
         f"{sorted(set(SPEC[draft]) - CONTROL_MESSAGE_TYPES[draft])}")
 
 
-@pytest.mark.parametrize("draft", [14, 16, 18, 20, 21, 22])
+@pytest.mark.parametrize("draft", [14, 16, 18, 20, 22])
 def test_every_spec_type_is_sendable_on_its_draft(draft):
     for type_, name in SPEC[draft].items():
         _guard(_Sess(draft), _Msg(type_))  # must not raise
@@ -155,7 +154,7 @@ def test_d18_renumbered_types_are_sendable_under_their_wire_code(canonical, wire
     _guard(_Sess(18), _Msg(canonical))  # must not raise
 
 
-@pytest.mark.parametrize("draft", [20, 21, 22])
+@pytest.mark.parametrize("draft", [20, 22])
 def test_d20_publish_ok_goes_out_as_request_ok(draft):
     from aiomoqt.types import wire_control_type
     assert wire_control_type(draft, 0x1E) == 0x07
@@ -163,7 +162,7 @@ def test_d20_publish_ok_goes_out_as_request_ok(draft):
     _guard(_Sess(draft), _Msg(0x1E))  # canonical PUBLISH_OK: sent as 0x07
 
 
-@pytest.mark.parametrize("draft", [20, 21, 22])
+@pytest.mark.parametrize("draft", [20, 22])
 @pytest.mark.parametrize("type_", sorted(D18_REMOVED))
 def test_d20_refuses_types_it_does_not_define(draft, type_):
     with pytest.raises(Exception) as exc:
@@ -282,7 +281,7 @@ def test_d18_namespace_prefix_param_is_a_tuple():
     assert out[0x34] == (b"live", b"cam")
 
 
-@pytest.mark.parametrize("draft", [14, 16, 18, 20, 21, 22])
+@pytest.mark.parametrize("draft", [14, 16, 18, 20, 22])
 def test_rx_dispatch_matches_the_spec_tables(draft):
     """RX dispatches exactly the types the spec defines for the draft —
     a type outside the table closes the session, never a silent skip
@@ -304,7 +303,7 @@ def test_d18_receiving_a_dead_d16_type_closes_the_session():
             s._get_control_entry(dead)
 
 
-@pytest.mark.parametrize("draft", [20, 21, 22])
+@pytest.mark.parametrize("draft", [20, 22])
 def test_d20_receiving_a_reserved_type_closes_the_session(draft):
     """PUBLISH_OK 0x1E and CLIENT/SERVER_SETUP 0x20/0x21 are RESERVED from
     d20: receiving one is an unknown message type."""
@@ -320,7 +319,6 @@ def test_d20_receiving_a_reserved_type_closes_the_session(draft):
 @pytest.mark.parametrize("draft,cls_module", [
     (18, "aiomoqt.messages.d18.session_setup"),
     (20, "aiomoqt.messages.d20.session_setup"),
-    (21, "aiomoqt.messages.d20.session_setup"),
     (22, "aiomoqt.messages.d20.session_setup"),
 ])
 def test_a_session_sends_its_drafts_setup_class(draft, cls_module):

@@ -1,4 +1,4 @@
-"""Loopback publish and subscribe at drafts 20, 21 and 22, over raw QUIC
+"""Loopback publish and subscribe at drafts 20 and 22, over raw QUIC
 and WebTransport, with two tracks on one session.
 
 Each track writes objects whose payload names the track, group and
@@ -30,7 +30,7 @@ from aiomoqt.tests._certs import CERT, KEY, requires_certs
 pytestmark = requires_certs
 
 _BASE_PORT = 16650
-_DRAFTS = [20, 21, 22]
+_DRAFTS = [20, 22]
 _TRANSPORTS = pytest.mark.parametrize("use_quic", [True, False],
                                       ids=["quic", "wt"])
 _NS = "d20/pubsub"
@@ -268,7 +268,7 @@ async def test_publish_two_tracks(draft, use_quic):
             rx.check(m.track_alias, m.track_name.decode())
 
 
-# -- LOCATION_FILTER: d21 and d22 differ where the spec says ----------------
+# -- LOCATION_FILTER: d20 and d22 differ where the spec says ----------------
 
 def _filter_bytes(msg: Subscribe, prof) -> bytes:
     """The LOCATION_FILTER value as `msg` goes on the wire."""
@@ -292,7 +292,7 @@ def _filter_bytes(msg: Subscribe, prof) -> bytes:
 
 
 _SEPARATING = [
-    # (filter, d21 value, d22 value)
+    # (filter, d20 value, d22 value)
     (LocationFilter.next_object(), "020000", "05"),
     (LocationFilter.absolute(0, 0), "00", "020000"),
     (LocationFilter.relative(128), "028080", "018080"),
@@ -300,13 +300,13 @@ _SEPARATING = [
 
 
 @_TRANSPORTS
-async def test_d21_and_d22_location_filters_differ_on_the_wire(use_quic):
+async def test_d20_and_d22_location_filters_differ_on_the_wire(use_quic):
     """Next Object, an absolute {0, 0} start and a value >= 128 encode
-    differently at d21 and d22; each draft's peer reads back the filter
+    differently at d20 and d22; each draft's peer reads back the filter
     that was sent, and objects flow under it."""
     sent = {}
-    for draft in (21, 22):
-        port = _port(12 + 2 * (draft - 21), use_quic)
+    for draft in (20, 22):
+        port = _port(12 + (draft - 20), use_quic)
         async with _loopback(port, draft, use_quic) as (session, srv):
             tracks = [_track(session, f"f{i}", _Seen)
                       for i in range(len(_SEPARATING))]
@@ -325,8 +325,8 @@ async def test_d21_and_d22_location_filters_differ_on_the_wire(use_quic):
                 oks.append(ok)
             for track, (lf, *_) in zip(tracks, _SEPARATING):
                 got = track.subscribes[0].location_filter
-                if lf.type == LocationFilterType.ABSOLUTE_START and draft == 21:
-                    # d21 sends an open filter from {0, 0} as no filter.
+                if lf.type == LocationFilterType.ABSOLUTE_START and draft == 20:
+                    # d20 sends an open filter from {0, 0} as no filter.
                     assert got.type == LocationFilterType.NONE
                 else:
                     assert got == lf
@@ -335,9 +335,9 @@ async def test_d21_and_d22_location_filters_differ_on_the_wire(use_quic):
                 rx.count(ok.track_alias) >= _EXPECTED for ok in oks))
             for ok, track in zip(oks, tracks):
                 rx.check(ok.track_alias, track.trackname)
-    for lf, d21, d22 in _SEPARATING:
-        assert sent[21, lf] == d21 and sent[22, lf] == d22
-        assert d21 != d22
+    for lf, d20, d22 in _SEPARATING:
+        assert sent[20, lf] == d20 and sent[22, lf] == d22
+        assert d20 != d22
 
 
 # -- SUBSCRIBE_TRACKS parameters reach the PUBLISH ---------------------------
@@ -391,7 +391,7 @@ async def test_range_filters_are_refused_without_max_filter_ranges(use_quic):
 @_TRANSPORTS
 async def test_a_parameter_outside_the_update_scope_closes(use_quic):
     """GROUP_ORDER may not appear in a subscription's REQUEST_UPDATE."""
-    async with _loopback(_port(24, use_quic), 21, use_quic,
+    async with _loopback(_port(24, use_quic), 20, use_quic,
                          clean=False) as (session, srv):
         _track(session, "video").attach()
         ok = await srv.subscribe(_NS, "video", wait_response=True)

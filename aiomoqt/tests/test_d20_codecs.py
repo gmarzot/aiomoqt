@@ -1,7 +1,5 @@
-"""draft-20/21/22 message codecs: the subscribe and publish path, then
+"""draft-20 and draft-22 message codecs: the subscribe and publish path, then
 FETCH."""
-import dataclasses
-
 import pytest
 
 from aiomoqt.context import profile_for
@@ -19,7 +17,7 @@ from aiomoqt.utils.buffer import Buffer
 prof = profile_for
 
 
-D20_DRAFTS = [20, 21, 22]
+D20_DRAFTS = [20, 22]
 
 
 def wire(msg, draft):
@@ -56,11 +54,6 @@ def unparams(raw, draft, scope=None):
     return MOQTMessage._deserialize_params(
         Buffer(data=raw, vi64=True), prof=prof(draft), buf_end=len(raw),
         scope=scope)
-
-
-def test_d20_and_d21_profiles_differ_only_in_number():
-    a, b = prof(20), prof(21)
-    assert dataclasses.replace(a, draft=21) == b
 
 
 # -- SUBSCRIBE ----------------------------------------------------------
@@ -111,11 +104,11 @@ def test_subscribe_without_a_filter_is_unfiltered(draft):
     assert got.location_filter is None and got.filter_type is None
 
 
-def test_subscribe_exact_bytes_d21_vs_d22():
+def test_subscribe_exact_bytes_d20_vs_d22():
     m = Subscribe(request_id=2, track_namespace=_NS, track_name=b"t",
                   priority=200, forward=1, filter_type=FilterType.LATEST_OBJECT)
     head = b"\x02\x01\x01n\x01t\x03\x10\x01\x10\xc8\x01"
-    assert body(wire(m, 21)) == head + b"\x02\x00\x00"
+    assert body(wire(m, 20)) == head + b"\x02\x00\x00"
     assert body(wire(m, 22)) == head + b"\x05"
 
 

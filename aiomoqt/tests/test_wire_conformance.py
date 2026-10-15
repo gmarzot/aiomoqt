@@ -783,7 +783,7 @@ def test_d18_parameters_in_scope_pass_and_d16_is_not_checked():
                                     buf_end=len(raw), scope="Subscribe")
 
 
-# -- d20/d21/d22 SETUP (d20 §10.3, d22 §9.1) -------------------------
+# -- d20/d22 SETUP (d20 §10.3, d22 §9.1) -----------------------------
 #
 # Type 0x2F00 (vi64), Length (16), then Setup Options as delta-coded
 # Key-Value-Pairs (§1.4.3) up to the Length: odd Type = Length + bytes,
@@ -791,7 +791,7 @@ def test_d18_parameters_in_scope_pass_and_d16_is_not_checked():
 
 from aiomoqt.messages.d20 import PublishStateNotify, Setup as D20Setup  # noqa: E402
 
-_D20_DRAFTS = [20, 21, 22]
+_D20_DRAFTS = [20, 22]
 
 
 def _ref_kvps(items, vint):
@@ -1010,9 +1010,9 @@ def test_d14_d16_d18_renumbered_type_bytes_unchanged():
     assert hx(PublishOk(request_id=2), 20) == "07000100"
 
 
-# -- d20/d21/d22 LOCATION_FILTER (0x21) against the spec text ----------
+# -- d20/d22 LOCATION_FILTER (0x21) against the spec text --------------
 #
-# d20/d21 §5.1.2: Length, then 0-4 vi64 fields whose count selects the
+# d20 §5.1.2: Length, then 0-4 vi64 fields whose count selects the
 # meaning; two zeros are Next Object. d22 §9.20.9: a Location Filter
 # Type 0x00-0x05 selects the fields; nothing is length-prefixed. For one
 # byte per field, Length equals the field count equals the d22 type, so
@@ -1025,7 +1025,7 @@ from aiomoqt.messages.params import (  # noqa: E402
 _prof = profile_for
 
 
-def ref_lf_d21(*fields):
+def ref_lf_d20(*fields):
     inner = b"".join(ref_vi64(f) for f in fields)
     return ref_vi64(len(inner)) + inner
 
@@ -1047,46 +1047,45 @@ def _lf_decode(raw, draft):
     return lf
 
 
-# (filter, d21 bytes, d22 bytes): every form, the separating cases first.
+# (filter, d20 bytes, d22 bytes): every form, the separating cases first.
 _LF_VECTORS = [
-    (LocationFilter.next_object(), ref_lf_d21(0, 0), ref_lf_d22(5)),
-    (LocationFilter.absolute(200, 0), ref_lf_d21(200, 0),
+    (LocationFilter.next_object(), ref_lf_d20(0, 0), ref_lf_d22(5)),
+    (LocationFilter.absolute(200, 0), ref_lf_d20(200, 0),
      ref_lf_d22(2, 200, 0)),
-    (LocationFilter.relative(128), ref_lf_d21(128), ref_lf_d22(1, 128)),
+    (LocationFilter.relative(128), ref_lf_d20(128), ref_lf_d22(1, 128)),
     (LocationFilter.absolute(7, 300, 9, 1000),
-     ref_lf_d21(7, 300, 2, 1000), ref_lf_d22(4, 7, 300, 2, 1000)),
-    (LocationFilter.none(), ref_lf_d21(), ref_lf_d22(0)),
-    (LocationFilter.relative(0), ref_lf_d21(0), ref_lf_d22(1, 0)),
-    (LocationFilter.relative(1), ref_lf_d21(1), ref_lf_d22(1, 1)),
-    (LocationFilter.absolute(7, 3), ref_lf_d21(7, 3), ref_lf_d22(2, 7, 3)),
-    (LocationFilter.absolute(7, 3, 9), ref_lf_d21(7, 3, 2),
+     ref_lf_d20(7, 300, 2, 1000), ref_lf_d22(4, 7, 300, 2, 1000)),
+    (LocationFilter.none(), ref_lf_d20(), ref_lf_d22(0)),
+    (LocationFilter.relative(0), ref_lf_d20(0), ref_lf_d22(1, 0)),
+    (LocationFilter.relative(1), ref_lf_d20(1), ref_lf_d22(1, 1)),
+    (LocationFilter.absolute(7, 3), ref_lf_d20(7, 3), ref_lf_d22(2, 7, 3)),
+    (LocationFilter.absolute(7, 3, 9), ref_lf_d20(7, 3, 2),
      ref_lf_d22(3, 7, 3, 2)),
-    (LocationFilter.absolute(7, 3, 9, 4), ref_lf_d21(7, 3, 2, 4),
+    (LocationFilter.absolute(7, 3, 9, 4), ref_lf_d20(7, 3, 2, 4),
      ref_lf_d22(4, 7, 3, 2, 4)),
 ]
 
 
-@pytest.mark.parametrize("lf, d21, d22", _LF_VECTORS,
+@pytest.mark.parametrize("lf, d20, d22", _LF_VECTORS,
                          ids=[v[0].type.name + str(i)
                               for i, v in enumerate(_LF_VECTORS)])
-def test_location_filter_matches_reference(lf, d21, d22):
-    for draft in (20, 21):
-        assert _lf_encode(lf, draft) == d21
-        assert _lf_decode(d21, draft) == lf
+def test_location_filter_matches_reference(lf, d20, d22):
+    assert _lf_encode(lf, 20) == d20
+    assert _lf_decode(d20, 20) == lf
     assert _lf_encode(lf, 22) == d22
     assert _lf_decode(d22, 22) == lf
 
 
-def test_d21_and_d22_disagree_where_the_spec_says():
-    # Next Object: two zero fields at d21, its own type at d22.
-    assert _lf_encode(LocationFilter.next_object(), 21) == bytes.fromhex("020000")
+def test_d20_and_d22_disagree_where_the_spec_says():
+    # Next Object: two zero fields at d20, its own type at d22.
+    assert _lf_encode(LocationFilter.next_object(), 20) == bytes.fromhex("020000")
     assert _lf_encode(LocationFilter.next_object(), 22) == bytes.fromhex("05")
-    # The same three bytes are Next Object at d21 and {0, 0} at d22.
+    # The same three bytes are Next Object at d20 and {0, 0} at d22.
     raw = bytes.fromhex("020000")
-    assert _lf_decode(raw, 21).type == LFT.NEXT_OBJECT
+    assert _lf_decode(raw, 20).type == LFT.NEXT_OBJECT
     assert _lf_decode(raw, 22) == LocationFilter.absolute(0, 0)
-    # A two-byte field: d21 counts bytes (3), d22 names the form (2).
-    assert _lf_encode(LocationFilter.absolute(200, 1), 21) == \
+    # A two-byte field: d20 counts bytes (3), d22 names the form (2).
+    assert _lf_encode(LocationFilter.absolute(200, 1), 20) == \
         bytes.fromhex("0380c801")
     assert _lf_encode(LocationFilter.absolute(200, 1), 22) == \
         bytes.fromhex("0280c801")
@@ -1094,37 +1093,37 @@ def test_d21_and_d22_disagree_where_the_spec_says():
     for lf in (LocationFilter.relative(1), LocationFilter.absolute(7, 3),
                LocationFilter.absolute(7, 3, 9),
                LocationFilter.absolute(7, 3, 9, 4)):
-        assert _lf_encode(lf, 21) == _lf_encode(lf, 22)
+        assert _lf_encode(lf, 20) == _lf_encode(lf, 22)
 
 
-def test_d21_absolute_origin_is_the_unfiltered_form():
+def test_d20_absolute_origin_is_the_unfiltered_form():
     # §5.1.2: two zero fields would be Next Object; an open filter from
     # {0, 0} equals no filter and travels as one.
-    assert _lf_encode(LocationFilter.absolute(0, 0), 21) == b"\x00"
-    assert _lf_decode(b"\x00", 21).type == LFT.NONE
+    assert _lf_encode(LocationFilter.absolute(0, 0), 20) == b"\x00"
+    assert _lf_decode(b"\x00", 20).type == LFT.NONE
 
 
 @pytest.mark.parametrize("draft, raw, match", [
-    (21, ref_lf_d21(1, 2, 3, 4, 5), "more than four"),
-    (21, bytes.fromhex("0180c8"), "crosses its length"),   # 2-byte vi64, length 1
-    (21, bytes.fromhex("0201"), "overruns"),
-    (21, ref_lf_d21((1 << 64) - 1, 0, 1), "exceeds 2\\^64-1"),
+    (20, ref_lf_d20(1, 2, 3, 4, 5), "more than four"),
+    (20, bytes.fromhex("0180c8"), "crosses its length"),   # 2-byte vi64, length 1
+    (20, bytes.fromhex("0201"), "overruns"),
+    (20, ref_lf_d20((1 << 64) - 1, 0, 1), "exceeds 2\\^64-1"),
     (22, ref_lf_d22(6), "Location Filter Type 0x6"),
     (22, ref_lf_d22(0x80), "Location Filter Type 0x80"),
     (22, ref_lf_d22(3, 7, 3), "truncated"),
     (22, ref_lf_d22(4, (1 << 64) - 1, 0, 1, 0), "exceeds 2\\^64-1"),
-], ids=["d21-five-fields", "d21-field-past-length", "d21-length-past-msg",
-        "d21-end-overflow", "d22-type-6", "d22-type-128", "d22-short",
+], ids=["d20-five-fields", "d20-field-past-length", "d20-length-past-msg",
+        "d20-end-overflow", "d22-type-6", "d22-type-128", "d22-short",
         "d22-end-overflow"])
 def test_malformed_location_filter_is_a_protocol_violation(draft, raw, match):
     with pytest.raises(MOQTProtocolViolation, match=match):
         _lf_decode(raw, draft)
 
 
-def test_d21_filter_read_as_d22_desyncs():
-    # A d21 Absolute Start {200, 0} (Length 3) read at d22 is Type 3 and
+def test_d20_filter_read_as_d22_desyncs():
+    # A d20 Absolute Start {200, 0} (Length 3) read at d22 is Type 3 and
     # takes the next parameter's bytes as End Group Delta.
-    raw = ref_lf_d21(200, 0) + b"\x01"
+    raw = ref_lf_d20(200, 0) + b"\x01"
     got = _lf_decode(raw, 22)
     assert got == LocationFilter.absolute(200, 0, 201)
 
@@ -1209,7 +1208,7 @@ def test_malformed_fill_parameters_is_a_protocol_violation(raw, match):
 
 
 def test_namespace_prefix_parameter_d20_prefixed_d22_bare():
-    # d20/d21 keep the d18 length prefix; d22 §9.20 makes Track
+    # d20 keeps the d18 length prefix; d22 §9.20 makes Track
     # Namespace an encoding of its own, with no Length.
     assert _params({0x34: (b"a", b"bc")}, 20) == \
         bytes.fromhex("0134 06 02 0161 026263")
@@ -1226,10 +1225,9 @@ def test_d20_fetch_exact_bytes():
     m = Fetch(fetch_type=1, request_id=4, namespace=(b"n",), track_name=b"t",
               subscriber_priority=None, group_order=None,
               start_group=1, start_object=0, end_group=2, end_object=0)
-    body = b"\x04\x01\x01n\x01t" + b"\x01" + b"\x21" + ref_lf_d21(1, 0, 1)
-    for draft in (20, 21):
-        raw = bytes(m.serialize(prof=_prof(draft)).data)
-        assert raw == b"\x16" + len(body).to_bytes(2, "big") + body
+    body = b"\x04\x01\x01n\x01t" + b"\x01" + b"\x21" + ref_lf_d20(1, 0, 1)
+    raw = bytes(m.serialize(prof=_prof(20)).data)
+    assert raw == b"\x16" + len(body).to_bytes(2, "big") + body
     body22 = b"\x04\x01\x01n\x01t" + b"\x01\x21" + ref_lf_d22(3, 1, 0, 1)
     raw = bytes(m.serialize(prof=_prof(22)).data)
     assert raw == b"\x16" + len(body22).to_bytes(2, "big") + body22
@@ -1327,7 +1325,7 @@ def test_d22_fetch_every_parameter_exact_bytes():
     (20, b"\x01\x21\x05\x01\x02\x03\x04\x05", "more than four"),
     (22, b"\x01\x23\x01\x00", "not allowed in Fetch"),   # FILL_PARAMETERS
     (22, b"\x01\x22\x03", "0x22"),                       # GROUP_ORDER 3
-    (21, b"\x01\x35\x02", "0x35"),                       # INCLUDE_PROPERTIES 2
+    (20, b"\x01\x35\x02", "0x35"),                       # INCLUDE_PROPERTIES 2
     (22, b"\x02\x21\x00\x00\x00", "duplicate"),          # LOCATION_FILTER twice
     (20, b"\x01\x21\x04\x01", "overruns"),
 ], ids=["d22-filter-type-6", "d20-five-fields", "fill-parameters",

@@ -33,6 +33,7 @@ from aiomoqt.types import (
     ParamType, FetchType, MOQTRequestError, MOQTMessageType,
     SubscribeErrorCode, RequestErrorCode, SubscribeDoneCode,
     FilterType, GroupOrder, MOQTDraft, ObjectStatus, parse_draft_spec,
+    MOQT_DEFAULT_DRAFTS,
 )
 from aiomoqt.utils.logger import set_log_level
 
@@ -1442,7 +1443,7 @@ def parse_args():
         help="MoQT draft, e.g. 18 or draft-18 (single = strict pin) or a "
              "comma list 18,16,14 (preference-ordered probe: pin the first "
              "whose SETUP completes) (env: DRAFT, MOQT_DRAFT). Default: "
-             "probe 18,16,14; 20, 21 and 22 only when named")
+             f"probe {','.join(map(str, MOQT_DEFAULT_DRAFTS))}")
     parser.add_argument(
         "--compat", type=str, default=os.environ.get("COMPAT", ""),
         help=(
@@ -1631,7 +1632,8 @@ def main():
     # but no DRAFT): probe newest first and pin the first draft whose SETUP
     # completes. An explicit --draft/DRAFT single int pins strictly; an
     # explicit list sets a custom probe order.
-    supported_drafts = args.draft if args.draft is not None else [18, 16, 14]
+    supported_drafts = (args.draft if args.draft is not None
+                        else list(MOQT_DEFAULT_DRAFTS))
 
     if args.verbose:
         transport = "QUIC" if use_quic else "WebTransport"
