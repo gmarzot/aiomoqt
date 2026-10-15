@@ -12,7 +12,7 @@ import pytest
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.messages import (
-    Fetch, LocationFilter, PublishStateNotify, RangeFilter, Subscribe,
+    LocationFilter, PublishStateNotify, RangeFilter, Subscribe,
 )
 from aiomoqt.messages.params import (
     D20ParamType, D20RequestErrorCode, LocationFilterType,
@@ -20,8 +20,8 @@ from aiomoqt.messages.params import (
 from aiomoqt.server import MOQTServer
 from aiomoqt.track import PublishedTrack
 from aiomoqt.types import (
-    FetchType, FilterType, MOQTMessageType, MOQTRequestError, ParamType,
-    RequestErrorCode, SessionCloseCode,
+    FilterType, MOQTMessageType, MOQTRequestError, ParamType,
+    SessionCloseCode,
 )
 from aiomoqt.utils.buffer import Buffer
 
@@ -340,32 +340,6 @@ async def test_d21_and_d22_location_filters_differ_on_the_wire(use_quic):
         assert d21 != d22
 
 
-# -- FETCH is refused from d20 until it is implemented -----------------------
-
-@_TRANSPORTS
-async def test_fetch_is_refused_both_ways(use_quic):
-    async with _loopback(_port(16, use_quic), 22, use_quic) as (session, srv):
-        track = _track(session, "video")
-        track.attach()
-        with pytest.raises(MOQTRequestError) as sent:
-            await srv.fetch(_NS, "video", start_group=0, start_object=0,
-                            end_group=1, end_object=0, wait_response=True)
-        assert sent.value.error_code == RequestErrorCode.NOT_SUPPORTED
-        # A FETCH that reaches the publisher anyway is answered with
-        # REQUEST_ERROR NOT_SUPPORTED.
-        rid = srv._allocate_request_id()
-        fut = srv._pending_requests[rid] = srv._loop.create_future()
-        srv._send_request(rid, Fetch(
-            fetch_type=FetchType.STANDALONE, request_id=rid,
-            namespace=(b"d20", b"pubsub"), track_name=b"video",
-            start_group=0, start_object=0, end_group=1, end_object=0,
-            parameters={}))
-        with pytest.raises(MOQTRequestError) as served:
-            await srv._await_response(rid)
-        assert fut.done()
-        assert served.value.error_code == RequestErrorCode.NOT_SUPPORTED
-
-
 # -- SUBSCRIBE_TRACKS parameters reach the PUBLISH ---------------------------
 
 @_TRANSPORTS
@@ -460,9 +434,9 @@ async def test_publish_state_notify_comes_only_from_the_publisher(use_quic):
 # -- fills and filter ends ----------------------------------------------------
 
 @_TRANSPORTS
-async def test_a_fill_fails_and_the_subscription_goes_on(use_quic):
-    """FILL_PARAMETERS on a track with Objects: the fill fetch stream
-    opens and is reset, counted in PUBLISH_DONE; live Objects flow."""
+async def test_a_fill_is_counted_and_the_subscription_goes_on(use_quic):
+    """FILL_PARAMETERS on a track with Objects: the fill fetch stream is
+    counted in PUBLISH_DONE; live Objects flow."""
     async with _loopback(_port(30, use_quic), 22, use_quic) as (session, srv):
         track = _track(session, "video")
         track.prefill(1)

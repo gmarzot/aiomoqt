@@ -78,12 +78,19 @@ class ObjectHistory:
             if self.evicted_through is None or gone > self.evicted_through:
                 self.evicted_through = gone
 
+    def last_object(self, group_id: int) -> Optional[int]:
+        """The largest Object ID held in a group, None if none is."""
+        ids = [o for g, o in self._objects if g == group_id]
+        return max(ids) if ids else None
+
     def fetch(self, start: tuple, end: tuple, session=None, *,
-              descending: bool = False) -> list:
+              descending: bool = False,
+              lost_marker: int = FETCH_FLAGS_END_UNKNOWN) -> list:
         """FetchObjects from `start` to `end`, both (group, object) and
         inclusive. Groups ascend, or descend; objects ascend within a
         group (§10.12.3). A part of the range already dropped is one End
-        of Unknown Range marker (§11.4.4.2), at the low end of the range."""
+        of Range marker of type `lost_marker` (End of Unknown Range by
+        default, §11.4.4.2), at the low end of the range."""
         lost = None
         if self.evicted_through is not None and start <= self.evicted_through:
             lost = min(self.evicted_through, end)
@@ -104,7 +111,7 @@ class ObjectHistory:
                 datagram=subgroup_id is None))
         if lost is not None:
             marker = FetchObject(group_id=lost[0], object_id=lost[1],
-                                 end_of_range=FETCH_FLAGS_END_UNKNOWN)
+                                 end_of_range=lost_marker)
             if descending:
                 out.append(marker)
             else:

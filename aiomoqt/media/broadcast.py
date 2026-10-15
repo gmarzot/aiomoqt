@@ -362,7 +362,9 @@ class MediaSubscriber:
             self.session.register_object_handler(
                 alias, self._on_catalog_object)
         try:
-            await self.session._await_response(fetch_msg.request_id)
+            # From d20 the fill rides the SUBSCRIBE, already answered.
+            if fetch_msg.request_id != sub_msg.request_id:
+                await self.session._await_response(fetch_msg.request_id)
         except MOQTRequestError as e:
             # Resubscribing would be a duplicate subscription (§5.1).
             logger.warning(
