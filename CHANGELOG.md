@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- join(): the Joining FETCH takes only AUTHORIZATION_TOKEN from `parameters`; `fetch_parameters` for the rest.
 - A subgroup reopened on a new stream is accepted, and the old stream's late reset leaves it bound.
 - A FIN meeting a full TX ring is queued and retried; subgroup and fetch headers wait for the ring.
 - A truncated subgroup (abort, lane shed or Forward State 0, LOC pause) is reset with CANCELLED, not ended with END_OF_GROUP + FIN.

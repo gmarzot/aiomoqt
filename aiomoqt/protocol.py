@@ -4190,6 +4190,7 @@ class _MOQTSessionMixin:
         joining_start: int = 0,
         parameters: Optional[Dict[int, bytes]] = None,
         wait_response: Optional[bool] = False,
+        fetch_parameters: Optional[Dict[int, Any]] = None,
     ) -> Union[Tuple[MOQTMessage, MOQTMessage], Tuple[MOQTMessage, MOQTMessage, 'asyncio.Future']]:
         """Subscribe + Joining Fetch (atomic pair).
 
@@ -4204,6 +4205,10 @@ class _MOQTSessionMixin:
                 (start = joining_start).
             joining_start: relative offset (relative) or absolute group
                 id (absolute) — see spec §9.16.2.1.
+            parameters: the SUBSCRIBE's. The FETCH takes only its
+                AUTHORIZATION_TOKEN: a SUBSCRIBE-only parameter in a FETCH
+                is a protocol violation (d18 §10.2.1).
+            fetch_parameters: the FETCH's, over that token.
             wait_response: if True, awaits and returns
                 (subscribe_ok, fetch_ok). If False, returns
                 (subscribe_msg, fetch_msg) sent messages.
@@ -4266,7 +4271,8 @@ class _MOQTSessionMixin:
             group_order=group_order,
             joining_request_id=sub_request_id,
             joining_start=joining_start,
-            parameters=dict(parameters),
+            parameters=self._joining_fetch_params(parameters,
+                                                  fetch_parameters),
         )
         self._subscriptions[fetch_request_id] = [fetch_msg]
         self._pending_requests[fetch_request_id] = self._loop.create_future()
@@ -4283,6 +4289,15 @@ class _MOQTSessionMixin:
         sub_response = await self._await_response(sub_request_id)
         fetch_response = await self._await_response(fetch_request_id)
         return (sub_response, fetch_response)
+
+    @staticmethod
+    def _joining_fetch_params(parameters: Dict[int, Any],
+                              fetch_parameters: Optional[Dict[int, Any]]
+                              ) -> Dict[int, Any]:
+        params = {k: v for k, v in parameters.items()
+                  if k == ParamType.AUTH_TOKEN}
+        params.update(fetch_parameters or {})
+        return params
 
     def joining_fetch(
         self,
