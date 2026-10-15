@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `tests/relays.json`: non-gating d20/d22 targets (moxygen-fb, imquic, nokia-d22, moqtail-d22,
+  stitcher-moq, moqarena).
 - SERVER_SETUP carries MOQT_IMPLEMENTATION at d14/d16; `implementation=` on client and server
   sets it, `None` omits it.
 - WebTransport client settles its draft from the server's WT-Protocol, or d14 in-band when
