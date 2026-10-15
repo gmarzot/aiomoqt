@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A truncated subgroup (abort, lane shed or Forward State 0, LOC pause) is reset with CANCELLED, not ended with END_OF_GROUP + FIN.
 - A reset or STOP_SENDING meeting a full TX ring is queued and retried, not raised.
 - d20-d22 FETCH: standalone FETCH is sent and served, the range in LOCATION_FILTER with an
   inclusive End; `fetch(location_filter=)`.

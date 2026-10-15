@@ -24,6 +24,7 @@ logger = get_logger(__name__)
 
 # Lane queue sentinels.
 _END_GROUP = object()
+_RESET_GROUP = object()
 _STOP = object()
 
 # Objects a lane may fall behind by before it is dropped to the next
@@ -243,19 +244,22 @@ class SubgroupDelivery:
         self.bytes_sent += len(payload)
         return True
 
-    def abort(self) -> None:
-        """Give up now, closing the open group if the session still
-        takes writes."""
-        self.end_group()
-
-    def cancel(self) -> None:
-        """Reset the open stream: the peer's subscription ended part-way
-        through a group."""
+    def reset_group(self) -> None:
+        """Reset the open group stream: the group is truncated, and a FIN
+        would claim it complete. No-op when no stream is open."""
         if self._stream_id is None:
             return
         self.session.stream_reset(self._stream_id, StreamResetCode.CANCELLED)
         self._stream_id = None
         self._header = None
+
+    def abort(self) -> None:
+        """Give up now, resetting the open group."""
+        self.reset_group()
+
+    def cancel(self) -> None:
+        """The peer's subscription ended part-way through a group."""
+        self.reset_group()
 
     async def close(self) -> None:
         """Finish cleanly: close the open group."""
@@ -284,10 +288,9 @@ class _Lane:
         self.task = asyncio.ensure_future(self._drain())
 
     def _close_truncated(self) -> None:
-        """FIN the group this lane fell out of, so the subscriber sees
-        an end and not a hole."""
+        """Reset the group this lane fell out of."""
         if not self._truncated:
-            self.delivery.end_group()
+            self.delivery.reset_group()
             self._truncated = True
 
     @property
@@ -339,9 +342,13 @@ class _Lane:
                 self.delivery.end_group()
                 self._truncated = False
                 continue
+            if item is _RESET_GROUP:
+                self._close_truncated()
+                self.need_group = True
+                continue
             group_id, object_id, payload, extensions, group_start = item
             if self.gate is not None and not self.gate():
-                # Forward State 0: send nothing, end the open group, and
+                # Forward State 0: send nothing, reset the open group, and
                 # resume only at a fresh group.
                 self._close_truncated()
                 self.need_group = True
@@ -399,17 +406,13 @@ class FanoutDelivery:
             self.on_sent(group_id, object_id)
 
     def drop_session(self, session) -> bool:
-        """Detach a session's lanes, closing any open group. True if it
+        """Detach a session's lanes, resetting any open group. True if it
         had one."""
         mine = [ln for ln in self.lanes if ln.session is session]
         for lane in mine:
             lane.task.cancel()
             self.lanes.remove(lane)
-            try:
-                lane.delivery.end_group()
-            except Exception:
-                logger.debug("fanout: lane end_group failed at drop",
-                             exc_info=True)
+            lane.delivery.reset_group()
         return bool(mine)
 
     @property
@@ -436,15 +439,17 @@ class FanoutDelivery:
         for lane in list(self.lanes):
             lane.offer(_END_GROUP)
 
+    def reset_group(self) -> None:
+        """Truncate the open group on every lane; each resumes at the
+        next group."""
+        for lane in list(self.lanes):
+            lane.offer(_RESET_GROUP)
+
     def abort(self) -> None:
-        """Give up on every lane without waiting."""
+        """Give up on every lane without waiting, resetting open groups."""
         for lane in list(self.lanes):
             lane.task.cancel()
-            try:
-                lane.delivery.end_group()
-            except Exception:
-                logger.debug("fanout: lane end_group failed at abort",
-                             exc_info=True)
+            lane.delivery.reset_group()
 
     async def close(self, timeout: float = 5.0) -> None:
         """Close the open group on every lane and wait for them to

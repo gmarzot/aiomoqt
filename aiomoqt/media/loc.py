@@ -204,9 +204,9 @@ class LocTrackPublisher(PublishedTrack):
             if frame is None:
                 break
             if not self.producing:
-                # Forward State 0: drop the frame unnumbered, end the open
+                # Forward State 0: drop the frame unnumbered, reset the open
                 # group, resume only at a key frame in a new group.
-                out.end_group()
+                out.reset_group()
                 resume_on_key = True
                 self.frames_dropped += 1
                 continue

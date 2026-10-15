@@ -319,14 +319,14 @@ def test_init_with_two_traks_is_refused():
 class _Out:
     def __init__(self):
         self.written = []
-        self.ends = 0
+        self.resets = 0
 
     async def write(self, group_id, object_id, payload, group_start=False,
                     extensions=None):
         self.written.append((group_id, object_id, payload))
 
-    def end_group(self):
-        self.ends += 1
+    def reset_group(self):
+        self.resets += 1
 
 
 async def _publish(track, frames, pause_at=()):
@@ -368,7 +368,7 @@ async def test_publisher_resumes_after_a_pause_with_a_full_header():
     # frame 2 dropped at Forward State 0, frame 3 waits for a key frame
     assert [(g, o, p[0]) for g, o, p in out.written] == [
         (0, 0, 2), (0, 1, 3), (1, 0, 2), (1, 1, 3)]
-    assert out.ends >= 1
+    assert out.resets >= 1
 
 
 @pytest.mark.parametrize('mapping', [StreamMapping.DATAGRAM,

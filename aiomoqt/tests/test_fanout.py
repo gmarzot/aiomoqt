@@ -29,6 +29,7 @@ class _Session:
         self._next = 3
         self.opened = []
         self.writes = []            # (stream_id, nbytes, fin)
+        self.resets = []            # stream_id
         self._gate = asyncio.Event()
         if not block:
             self._gate.set()
@@ -44,6 +45,12 @@ class _Session:
 
     def stream_write(self, sid, data, end_stream=False):
         self.writes.append((sid, len(data), end_stream))
+
+    def stream_reset(self, sid, code):
+        self.resets.append(sid)
+
+    def fins(self, sid):
+        return [w for w in self.writes if w[0] == sid and w[2]]
 
     async def stream_write_drain(self, sid, data):
         await self._gate.wait()
@@ -140,6 +147,10 @@ async def test_a_blocked_lane_sheds_to_the_next_group():
     assert dfast.objects_sent == 9
     assert dslow.largest == (1, 0)
     assert dslow.objects_sent < dfast.objects_sent
+    # The truncated group is reset, never ended as if complete.
+    assert slow.resets == [slow.opened[0]]
+    assert not slow.fins(slow.opened[0])
+    assert fast.resets == [] and fast.fins(fast.opened[0])
 
 
 @pytest.mark.asyncio
@@ -166,6 +177,7 @@ async def test_a_paused_peer_is_gated_and_rejoins_at_a_group():
     await fan.close()
     assert db.largest == (2, 0)
     assert da.objects_sent == 5
+    assert b.resets == [b.opened[0]] and not b.fins(b.opened[0])
 
 
 @pytest.mark.asyncio

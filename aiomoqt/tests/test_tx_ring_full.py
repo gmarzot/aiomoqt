@@ -152,3 +152,33 @@ async def test_reset_on_full_ring_leaves_the_lane_alive(draft):
         op[0] == 'data' and op[1] != first for op in ring.ops))
     assert not lane.task.done()
     lane.task.cancel()
+
+
+@pytest.mark.parametrize("draft", DRAFTS)
+async def test_lane_truncating_on_full_ring_survives(draft):
+    s, ring = _session(draft)
+    delivery = SubgroupDelivery(s, track_alias=1)
+    gate = SimpleNamespace(forward=True)
+    fan = FanoutDelivery()
+    lane = fan.add(delivery, lambda: gate.forward, joining=False)
+    await fan.write(0, 0, b"a", group_start=True)
+    assert await _until(lambda: lane.queue.empty() and delivery._stream_id)
+    first = delivery._stream_id
+
+    ring.full = True
+    gate.forward = False
+    await fan.write(0, 1, b"b")  # gated: the lane resets the open group
+    assert await _until(lambda: lane.queue.empty())
+    await asyncio.sleep(0.01)
+    assert not lane.task.done()
+    ring.drain()
+    gate.forward = True
+    await fan.write(1, 0, b"c", group_start=True)
+    assert await _until(
+        lambda: ('reset', first, int(StreamResetCode.CANCELLED)) in ring.ops)
+    assert await _until(lambda: any(
+        op[0] == 'data' and op[1] != first for op in ring.ops))
+    assert not lane.task.done()
+    assert not [op for op in ring.ops if op[0] == 'data' and op[1] == first
+                and op[3]], "the truncated group was FINed"
+    lane.task.cancel()
