@@ -318,9 +318,9 @@ class _MOQTSessionMixin:
         # through _route_stream_data once the draft is settled.
         self._draft_settled = _pinned is not None
         self._pre_draft_stream_data: Dict[int, Tuple[bytearray, bool]] = {}
-        # d18 REQUEST_UPDATEs we sent and not yet answered, keyed by the
-        # updated request's id: replies ride that request's stream with no
-        # id of their own, in order.
+        # d18 replies ride a request's stream with no id of their own and
+        # answer, in order, the request (None, until its reply) and each
+        # REQUEST_UPDATE we sent on it. Keyed by the request's id.
         self._tx_updates: Dict[int, deque] = {}
         # request id -> (opener class, sent by us), for the d20 rules that
         # depend on the request a REQUEST_UPDATE or reply belongs to.
@@ -1012,6 +1012,7 @@ class _MOQTSessionMixin:
         awaiter first; an awaiter nothing answered fails."""
         self._bidi_streams.pop(request_id, None)
         self._subscriptions.pop(request_id, None)
+        self._fail_waiting_updates(request_id, why)
         alias = next((ta for ta, rid in self._track_aliases.items()
                       if rid == request_id), None)
         if alias is not None:
@@ -1206,9 +1207,7 @@ class _MOQTSessionMixin:
                     not self._profile.reply_has_request_id and
                     hasattr(msg, 'request_id')):
                 if getattr(msg, 'request_id', None) is None:
-                    update_id = (self._next_update_reply(request_id)
-                                 if isinstance(msg, (RequestOk, RequestError))
-                                 else None)
+                    update_id = self._next_reply_owner(request_id, msg)
                     msg.request_id = (request_id if update_id is None
                                       else update_id)
                     if isinstance(msg, RequestOk) and prof.param_table >= 20:
@@ -1325,16 +1324,31 @@ class _MOQTSessionMixin:
             )
             raise
 
-    def _next_update_reply(self, request_id: int) -> Optional[int]:
-        """The oldest unanswered REQUEST_UPDATE we sent on `request_id`'s
-        stream, which a REQUEST_OK or REQUEST_ERROR there answers."""
+    def _next_reply_owner(self, request_id: int, msg) -> Optional[int]:
+        """The REQUEST_UPDATE a reply on `request_id`'s stream answers;
+        None when it answers the request itself."""
         pending = self._tx_updates.get(request_id)
         if not pending:
             return None
-        update_id = pending.popleft()
+        if not isinstance(msg, (RequestOk, RequestError)):
+            if pending[0] is not None or not isinstance(
+                    msg, (SubscribeOk, FetchOk)):
+                return None
+        owner = pending.popleft()
         if not pending:
             del self._tx_updates[request_id]
-        return update_id
+        return owner
+
+    def _fail_waiting_updates(self, request_id: int, why: str) -> None:
+        """The request's stream ended: its unanswered updates fail."""
+        for update_id in self._tx_updates.pop(request_id, ()):
+            fut = (self._pending_requests.pop(update_id, None)
+                   if update_id is not None else None)
+            if fut is not None and not fut.done():
+                fut.set_exception(MOQTRequestError(
+                    error_code=int(RequestErrorCode.INTERNAL_ERROR),
+                    reason=f"request stream ended ({why})",
+                    retry_interval=0))
 
     def _check_request_ok_scope(self, msg: RequestOk, request_id: int,
                                 update_id: Optional[int]) -> None:
@@ -2342,6 +2356,10 @@ class _MOQTSessionMixin:
                     SessionCloseCode.PROTOCOL_VIOLATION,
                     f"peer closed its control stream {stream_id}")
                 return
+            ours = self._bidi_stream_requests.get(stream_id)
+            if is_request_bidi and ours in self._tx_updates:
+                self._loop.call_soon(self._fail_waiting_updates, ours,
+                                     f"FIN (stream {stream_id})")
             if stream_id in self._cancelled_request_streams:
                 self._cancelled_request_streams.discard(stream_id)
                 request_id = self._bidi_stream_requests.pop(stream_id, None)
@@ -3581,6 +3599,7 @@ class _MOQTSessionMixin:
         if self._profile.param_table >= 20:
             self._note_request_kind(request_id, type(msg), ours=True)
         if self._profile.control_uni_pair:
+            self._tx_updates[request_id] = deque([None])
             if not self._is_wt:
                 # Raw QUIC: stream-id allocation is synchronous (lazy
                 # materialization on first send), so stay sync.
@@ -3922,12 +3941,13 @@ class _MOQTSessionMixin:
             params[ParamType.FORWARD] = int(forward)
         if self._profile.param_table >= 20:
             self._check_filter_ranges(params)
-            pending = self._tx_updates.get(existing_request_id, ())
+            pending = sum(u is not None for u in
+                          self._tx_updates.get(existing_request_id, ()))
             limit = self._peer_max_request_updates
-            if limit and len(pending) >= limit:
+            if limit and pending >= limit:
                 # d20 §10.3.1.7: past its limit the peer closes the session.
                 raise ValueError(
-                    f"{len(pending)} REQUEST_UPDATEs already outstanding on "
+                    f"{pending} REQUEST_UPDATEs already outstanding on "
                     f"request {existing_request_id} (peer "
                     f"MAX_REQUEST_UPDATES {limit})")
         request_id = self._allocate_request_id()
@@ -4172,6 +4192,7 @@ class _MOQTSessionMixin:
             self.stream_reset(stream_id, StreamResetCode.CANCELLED)
             self.stream_stop_sending(stream_id, StreamResetCode.CANCELLED)
             self._bidi_streams.pop(request_id, None)
+            self._fail_waiting_updates(request_id, "cancelled")
             return None
         message = Unsubscribe(request_id=request_id)
         logger.info(f"MOQT send: {message}")
@@ -4740,6 +4761,7 @@ class _MOQTSessionMixin:
                         f"stream {stream_id} (request_id={request_id})")
             self.stream_reset(stream_id, StreamResetCode.CANCELLED)
             self._bidi_streams.pop(request_id, None)
+            self._fail_waiting_updates(request_id, "withdrawn")
             return None
         namespace = (withdrawn if namespace is None
                      else self._make_namespace_tuple(namespace))
@@ -5024,6 +5046,7 @@ class _MOQTSessionMixin:
             self.stream_reset(stream_id, StreamResetCode.CANCELLED)
             self.stream_stop_sending(stream_id, StreamResetCode.CANCELLED)
             self._bidi_streams.pop(request_id, None)
+            self._fail_waiting_updates(request_id, "cancelled")
             return None
         prefix = self._make_namespace_tuple(namespace_prefix)
         message = UnsubscribeNamespace(namespace_prefix=prefix)

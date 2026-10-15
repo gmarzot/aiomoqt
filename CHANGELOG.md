@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- d18 replies on a request stream answer the request first, then each REQUEST_UPDATE in send order; the stream ending fails updates still waiting.
 - join(): the Joining FETCH takes only AUTHORIZATION_TOKEN from `parameters`; `fetch_parameters` for the rest.
 - A subgroup reopened on a new stream is accepted, and the old stream's late reset leaves it bound.
 - A FIN meeting a full TX ring is queued and retried; subgroup and fetch headers wait for the ring.
