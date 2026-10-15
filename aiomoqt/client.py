@@ -12,10 +12,7 @@ from .protocol import (
     MOQTPeer, MOQTSessionQuic, MOQTSessionWTClient,
     DEFAULT_TX_MAX_INFLIGHT_BYTES, USER_AGENT,
 )
-from .types import (
-    WT_ALPN_ERROR, MOQTNegotiationError, moqt_alpn_for_version,
-    normalize_supported_drafts,
-)
+from .types import moqt_alpn_for_version, normalize_supported_drafts
 from .utils.logger import *
 
 logger = get_logger(__name__)
@@ -183,19 +180,6 @@ class MOQTClient(MOQTPeer):
                 with contextlib.suppress(Exception):
                     await asyncio.wait_for(session.wait_closed(), 0.3)
 
-    @staticmethod
-    async def _check_wt_protocol(session: MOQTSessionWTClient,
-                                 offered: List[str]) -> None:
-        # draft-ietf-webtrans-http3-16 §3.3: a missing or unoffered WT-Protocol closes
-        # the session with WT_ALPN_ERROR.
-        selected = session.negotiated_protocol
-        if selected in offered:
-            return
-        reason = (f"WT-Protocol {selected!r} not in offer {offered}" if selected
-                  else "server sent no WT-Protocol")
-        await session.aclose(WT_ALPN_ERROR, reason.encode())
-        raise MOQTNegotiationError(reason)
-
     @asynccontextmanager
     async def _connect_wt(self):
         # Config source-of-truth: self.configuration when set, else
@@ -274,8 +258,6 @@ class MOQTClient(MOQTPeer):
         session.stream_ring_cap = wt_cfg.stream_ring_cap
         try:
             await session.open(timeout=10.0)
-            if wt_protocols:
-                await self._check_wt_protocol(session, wt_protocols)
             yield session
         finally:
             try:

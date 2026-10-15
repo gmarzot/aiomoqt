@@ -4,8 +4,9 @@
 
 - SERVER_SETUP carries MOQT_IMPLEMENTATION at d14/d16; `implementation=` on client and server
   sets it, `None` omits it.
-- WebTransport client offering moqt-NN closes with WT_ALPN_ERROR and raises
-  `MOQTNegotiationError` when the server's WT-Protocol is missing or not offered.
+- WebTransport client settles its draft from the server's WT-Protocol, or d14 in-band when
+  there is none and d14 was offered; otherwise it closes with WT_ALPN_ERROR and raises
+  `MOQTNegotiationError`, pins included.
 - d20-d22 FETCH: standalone FETCH is sent and served, the range in LOCATION_FILTER with an
   inclusive End; `fetch(location_filter=)`.
 - d20-d22 join(): SUBSCRIBE at the Next Object with FILL_PARAMETERS; joining_fetch() is a

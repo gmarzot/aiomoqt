@@ -2774,23 +2774,30 @@ class _MOQTSessionMixin:
         else:
             # WebTransport over aiopquic. The WT session is open by the
             # time client_session_init runs (open() awaited already);
-            # _wt_session_setup is resolved in _moqt_wt_finalize. Resolve
-            # the draft from the negotiated WT-Protocol (in-band
-            # WT-Available-Protocols -> WT-Protocol selection, surfaced by
-            # aiopquic as negotiated_protocol); a single supported draft
-            # (a pin) still wins.
-            _drafts = getattr(self._session, 'supported_drafts', None)
-            draft = _drafts[0] if _drafts and len(_drafts) == 1 else None
-            if draft is not None:
-                self._settle_draft(get_major_version(draft))
+            # _wt_session_setup is resolved in _moqt_wt_finalize. The draft
+            # is the server's WT-Protocol choice from our offer; with none,
+            # a d14 offer (versions in SETUP) proceeds. Anything else closes
+            # with WT_ALPN_ERROR (webtrans-http3 §3.3), pins included.
+            drafts = list(getattr(self._session, 'supported_drafts', None)
+                          or ())
+            offered = [f"moqt-{d}" for d in drafts
+                       if not profile_for(d).setup_carries_versions]
+            in_setup = [d for d in drafts
+                        if profile_for(d).setup_carries_versions]
+            negotiated = self.negotiated_protocol
+            if negotiated in offered:
+                self._settle_draft(get_major_version(
+                    moqt_version_from_alpn(negotiated)))
+                logger.info(
+                    f"MOQT: version set from WT-Protocol: "
+                    f"{negotiated} -> draft-{self.negotiated_draft}")
+            elif in_setup and (negotiated is None or not offered):
+                self._settle_draft(get_major_version(in_setup[0]))
             else:
-                negotiated = self.negotiated_protocol
-                if negotiated:
-                    self._settle_draft(get_major_version(
-                        moqt_version_from_alpn(negotiated)))
-                    logger.info(
-                        f"MOQT: version set from WT-Protocol: "
-                        f"{negotiated} -> draft-{self.negotiated_draft}")
+                reason = (f"WT-Protocol {negotiated!r} not in offer "
+                          f"{offered}")
+                self._close_session(WT_ALPN_ERROR, reason)
+                raise MOQTNegotiationError(reason)
             if self._profile.control_uni_pair:
                 # d18 over WT: control is a uni-stream pair, same as raw
                 # QUIC — open our write-control uni (WT create_stream); the
