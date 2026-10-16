@@ -75,20 +75,23 @@ def parse_relay_url(url: str, force_quic: bool = False,
     """
     # Bare hostname or host:port (no scheme)
     if "://" not in url:
-        # Check for host:port
         if ":" in url:
             host, port_str = url.rsplit(":", 1)
             try:
                 port = int(port_str)
+            except ValueError:
+                pass
+            else:
+                if not host:
+                    raise ValueError(f"{url}: empty host")
                 return MOQTRelay(
                     host=host,
                     port=port,
                     use_quic=force_quic,
                     path=None if force_quic else default_path,
                 )
-            except ValueError:
-                pass
-        # Plain hostname
+        if not url:
+            raise ValueError("empty host")
         return MOQTRelay(
             host=url,
             port=MOQT_DEFAULT_PORT if force_quic else HTTPS_DEFAULT_PORT,

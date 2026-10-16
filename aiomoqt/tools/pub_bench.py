@@ -12,7 +12,8 @@ import functools
 import logging
 
 from aiomoqt.client import MOQTClient
-from aiomoqt.types import ForwardingPreference, SetupParamType
+from aiomoqt.types import (ForwardingPreference, MOQTMessageType,
+                           SetupParamType)
 from aiomoqt.track import PublishedTrack, VideoTrack
 from aiomoqt.utils import wait_cond_timeout
 from aiomoqt.utils import cli as _cli
@@ -37,6 +38,31 @@ def _token_validator(rules):
     def _validate(token, _msg):
         return verdicts.get((token.token_type, bytes(token)))
     return _validate
+
+
+# Object Property types (§12.8, §12.9).
+PRIOR_GROUP_ID_GAP = 0x3C
+PRIOR_OBJECT_ID_GAP = 0x3E
+
+
+class _GapTrack(PublishedTrack):
+    """Even Group and Object IDs only, each Object carrying the gap
+    before it: Prior Group ID Gap on a Group's first Object, Prior Object
+    ID Gap on the rest."""
+
+    async def produce(self, out) -> None:
+        pad = bytes(self.object_size)
+        interval = 1.0 / self.rate if self.rate > 0 else 0
+        group_id = 0
+        while True:
+            for n in range(self.group_size):
+                object_id = 2 * n
+                props = ({PRIOR_OBJECT_ID_GAP: 1} if object_id
+                         else {PRIOR_GROUP_ID_GAP: 1} if group_id else None)
+                await out.write(group_id, object_id, pad, extensions=props,
+                                group_start=object_id == 0)
+                await asyncio.sleep(interval)
+            group_id += 2
 
 
 class _EmptyTrack(PublishedTrack):
@@ -85,9 +111,9 @@ The URL scheme selects the transport:
                         help='Refuse a request carrying this token (Token '
                              'Type, hex Value) with REQUEST_ERROR CODE; '
                              'repeatable')
-    parser.add_argument('--auth-token', type=str, default='bench-token',
-                        help='AUTH_TOKEN sent on PUBLISH_NAMESPACE; empty '
-                             'sends none (default %(default)s)')
+    parser.add_argument('--auth-token', type=str, default='',
+                        help='AUTH_TOKEN sent on PUBLISH_NAMESPACE '
+                             '(default: none)')
     parser.add_argument('--track-status', action='store_true',
                         help='Ask the peer for the track\'s status '
                              '(TRACK_STATUS) before publishing')
@@ -109,6 +135,13 @@ The URL scheme selects the transport:
                         metavar='SECONDS',
                         help='Send GOAWAY this long after publishing; '
                              'later requests are refused GOING_AWAY')
+    parser.add_argument('--redirect', action='store_true',
+                        help='Answer every SUBSCRIBE_NAMESPACE with REDIRECT '
+                             'to its own prefix on this session (d18+)')
+    parser.add_argument('--padding', type=int, default=0, metavar='BYTES',
+                        help='After SETUP, send one PADDING stream of BYTES '
+                             'zeros, and one PADDING datagram when the '
+                             'peer takes datagrams (d18+)')
     content = parser.add_mutually_exclusive_group()
     content.add_argument('--prefill', type=int, default=0, metavar='GROUPS',
                          help='Hold GROUPS groups as already published, '
@@ -117,6 +150,10 @@ The URL scheme selects the transport:
     content.add_argument('--no-objects', action='store_true',
                          help='Serve subscriptions but publish no '
                               'objects: a track with nothing published')
+    content.add_argument('--gaps', action='store_true',
+                         help='Publish even Group and Object IDs only, '
+                              'each Object with its Prior Group ID Gap or '
+                              'Prior Object ID Gap property')
     _cli.add_help(parser)
     args = parser.parse_args()
     if args.video and args.datagram:
@@ -192,6 +229,12 @@ async def run(args):
            if args.max_inflight_bytes is not None else {}),
     )
 
+    if args.redirect:
+        async def _redirect(session, msg):
+            session.redirect(msg, namespace=msg.namespace_prefix)
+        client.register_handler(MOQTMessageType.SUBSCRIBE_NAMESPACE,
+                                _redirect)
+
     print("  Connecting...")
     async with client.connect() as session:
         try:
@@ -202,6 +245,10 @@ async def run(args):
             if args.token_cache > 0:
                 setup[SetupParamType.MAX_AUTH_TOKEN_CACHE_SIZE] = args.token_cache
             await session.client_session_init(parameters=setup)
+            if args.padding:
+                await session.send_padding(args.padding)
+                if session.datagram_max_payload() >= args.padding + 8:
+                    await session.send_padding(args.padding, datagram=True)
             if args.track_status:
                 session.track_status(args.namespace, args.trackname)
 
@@ -216,7 +263,9 @@ async def run(args):
                     auth_token=args.auth_token.encode() or None,
                 )
             else:
-                track_class = _EmptyTrack if args.no_objects else PublishedTrack
+                track_class = (_EmptyTrack if args.no_objects
+                               else _GapTrack if args.gaps
+                               else PublishedTrack)
                 track = track_class(
                     session,
                     namespace=args.namespace,

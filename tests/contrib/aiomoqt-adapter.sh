@@ -81,7 +81,8 @@ esac
 
 # Track contents the scenario's fixture contract asks for: Group 7 with
 # Object 9 already published, a track with nothing published, objects sent
-# as datagrams, or two subgroup streams open at once.
+# as datagrams, two subgroup streams open at once, or skipped Group and
+# Object IDs.
 content=()
 case "$scenario_id" in
     fetch-known-first-object-with-nonzero-group-and-object-ids|\
@@ -110,6 +111,9 @@ case "$scenario_id" in
         content=(-D) ;;
     cancel-subscribe-with-multiple-open-subgroups)
         content=(-P 2) ;;
+    publish-object-with-prior-group-id-gap|\
+    publish-object-with-prior-object-id-gap)
+        content=(--gaps) ;;
 esac
 
 # Control messages the publisher originates for the scenarios that wait
@@ -134,6 +138,11 @@ case "$scenario_id" in
         control=(--second-track) ;;
     publish-distinct-content-tracks-in-same-scope)
         control=(--second-track --forward 1) ;;
+    publisher-redirects-subscribe-namespace)
+        control=(--redirect) ;;
+    observe-publisher-padding-stream|\
+    observe-publisher-padding-datagram)
+        control=(--padding 64) ;;
 esac
 
 # A 64-byte token cache holds the runner's 20-byte alias entries and stays
