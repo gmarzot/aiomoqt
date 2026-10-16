@@ -107,6 +107,10 @@ class DraftProfile:
                                   # tables below: 14, 16, 18, 20.
     padding: bool = True
                                   # PADDING streams and datagrams (d18+).
+    namespace_scoped: frozenset = frozenset(
+        {"SubscribeNamespace", "PublishNamespace"})
+                                  # requests whose Redirect has no Track
+                                  # Name (§10.6.1); d20 adds SUBSCRIBE_TRACKS.
     zero_delivery_timeout_closes: bool = False
                                   # d16 DELIVERY_TIMEOUT (0x02) of 0, as a
                                   # parameter or Track Property, closes.
@@ -165,6 +169,8 @@ _D20 = replace(
     PROFILES[MOQTDraft.DRAFT_18], draft=MOQTDraft.DRAFT_20,
     param_table=20,
     error_table=20,
+    namespace_scoped=frozenset(
+        {"SubscribeNamespace", "PublishNamespace", "SubscribeTracks"}),
     publish_ok_expires_only=True,
     publish_done_subscription_ended=False,
     goaway_request_id=False,

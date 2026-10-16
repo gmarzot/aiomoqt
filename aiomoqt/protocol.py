@@ -3755,9 +3755,8 @@ class _MOQTSessionMixin:
         bidi stream and the response returns on it (no in-band Request ID);
         pre-d18 requests go on the single control stream. Raw-QUIC stream-id
         allocation is synchronous, so callers stay sync."""
-        if self._profile.param_table >= 20:
-            self._note_request_kind(request_id, type(msg), ours=True)
         if self._profile.control_uni_pair:
+            self._note_request_kind(request_id, type(msg), ours=True)
             self._tx_updates[request_id] = deque([None])
             if not self._is_wt:
                 # Raw QUIC: stream-id allocation is synchronous (lazy
@@ -4999,7 +4998,7 @@ class _MOQTSessionMixin:
         )
         logger.info(f"MOQT send: {message}")
 
-        if self._profile.param_table >= 20:
+        if self._profile.control_uni_pair:
             self._note_request_kind(request_id, SubscribeNamespace, ours=True)
         if is_draft16_or_later(self.negotiated_draft):
             stream_id = await self.open_bidi_stream()
@@ -5076,7 +5075,7 @@ class _MOQTSessionMixin:
             raise ValueError(
                 f"REDIRECT needs draft-18 or later, not "
                 f"draft-{self._profile.draft}")
-        if (isinstance(msg, (SubscribeNamespace, PublishNamespace))
+        if (type(msg).__name__ in self._profile.namespace_scoped
                 and track_name):
             raise ValueError("a namespace-scoped REDIRECT has no track name")
         if connect_uri and self._is_client:
@@ -5194,7 +5193,7 @@ class _MOQTSessionMixin:
             parameters=parameters,
         )
         logger.info(f"MOQT send: {message}")
-        if self._profile.param_table >= 20:
+        if self._profile.control_uni_pair:
             self._note_request_kind(request_id, SubscribeTracks, ours=True)
         stream_id = await self.open_bidi_stream()
         self.send_stream_message(stream_id, message)
@@ -5749,6 +5748,13 @@ class _MOQTSessionMixin:
         logger.info(f"MOQT event: handle {msg}")
         self._track_status_requests.discard(msg.request_id)
         self._resolve_request(msg.request_id, msg)
+        kind = self._request_kinds.get(msg.request_id)
+        if (msg.redirect is not None and msg.redirect[2] and kind is not None
+                and kind[1] and kind[0].__name__ in self._profile.namespace_scoped):
+            # §10.6.1: no Track Name in a namespace-scoped Redirect.
+            self._close_session(
+                SessionCloseCode.PROTOCOL_VIOLATION,
+                f"Redirect names a track for a {kind[0].__name__}")
 
     async def _handle_namespace(self, msg) -> None:
         logger.info(f"MOQT event: handle Namespace: {msg}")

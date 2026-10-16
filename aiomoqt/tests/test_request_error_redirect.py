@@ -169,3 +169,103 @@ async def test_pub_bench_redirects_subscribe_namespace(use_quic, monkeypatch):
     assert replies == [
         (RequestErrorCode.REDIRECT, (b"", (b"redir",), b"")),
         (RequestErrorCode.REDIRECT, (b"", (b"redir", b"x"), b""))]
+
+
+# -- receiving a Redirect for a namespace-scoped request -----------------
+
+from aiomoqt.messages import RequestError as _RequestError  # noqa: E402
+from aiomoqt.types import D18MessageType, SessionCloseCode  # noqa: E402
+
+
+def _redirect_with(name):
+    """Server handler: REDIRECT naming track `name`, sent past the
+    redirect() guard."""
+    async def handler(session, msg):
+        session._send_reply(msg.request_id, _RequestError(
+            request_id=msg.request_id, error_code=RequestErrorCode.REDIRECT,
+            reason="", redirect=(b"", (b"other",), name)), fin=True)
+    return handler
+
+
+async def _namespace_redirect(session, kind, prefix):
+    if kind == "publish_namespace":
+        coro = session.publish_namespace(prefix, wait_response=True)
+    elif kind == "subscribe_namespace":
+        coro = session.subscribe_namespace(prefix, wait_response=True)
+    else:
+        coro = session.subscribe_tracks(prefix, wait_response=True)
+    try:
+        await asyncio.wait_for(coro, 3.0)
+    except (MOQTRequestError, asyncio.TimeoutError, Exception):
+        pass
+
+
+_KINDS = {"publish_namespace": MOQTMessageType.PUBLISH_NAMESPACE,
+          "subscribe_namespace": MOQTMessageType.SUBSCRIBE_NAMESPACE,
+          "subscribe_tracks": D18MessageType.SUBSCRIBE_TRACKS}
+
+
+@requires_certs
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+@pytest.mark.parametrize("draft, kind", [
+    (18, "publish_namespace"), (18, "subscribe_namespace"),
+    (20, "publish_namespace"), (20, "subscribe_tracks"),
+    (22, "publish_namespace"), (22, "subscribe_namespace"),
+])
+async def test_namespace_redirect_with_track_name_closes(draft, kind,
+                                                         use_quic):
+    """§10.6.1: a non-empty Track Name in a Redirect for a namespace-
+    scoped request closes with PROTOCOL_VIOLATION; an empty one does not."""
+    port = (16640 + 4 * list(_KINDS).index(kind) + 2 * _DRAFTS.index(draft)
+            + (0 if use_quic else 1))
+    names = iter([b"", b"t"])
+
+    async def handler(session, msg):
+        await _redirect_with(next(names))(session, msg)
+    server = MOQTServer(host="localhost", port=port, certificate=CERT,
+                        private_key=KEY, path="/", use_quic=use_quic,
+                        supported_drafts=draft)
+    server.register_handler(_KINDS[kind], handler)
+    quic_server = await server.serve()
+    try:
+        client = MOQTClient("localhost", port, path="/", use_quic=use_quic,
+                            verify_tls=False, supported_drafts=draft)
+        async with client.connect() as session:
+            await session.client_session_init()
+            await _namespace_redirect(session, kind, "redir/a")
+            assert session._close_err is None
+            await _namespace_redirect(session, kind, "redir/b")
+            for _ in range(50):
+                if session._close_err is not None:
+                    break
+                await asyncio.sleep(0.02)
+            assert session._close_err is not None
+            assert session._close_err[0] == SessionCloseCode.PROTOCOL_VIOLATION
+    finally:
+        quic_server.close()
+
+
+@requires_certs
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+async def test_track_redirect_with_track_name_is_kept(use_quic):
+    port = 16690 + (0 if use_quic else 1)
+    server = MOQTServer(host="localhost", port=port, certificate=CERT,
+                        private_key=KEY, path="/", use_quic=use_quic,
+                        supported_drafts=18)
+    server.register_handler(MOQTMessageType.SUBSCRIBE, _redirect_with(b"t"))
+    quic_server = await server.serve()
+    try:
+        client = MOQTClient("localhost", port, path="/", use_quic=use_quic,
+                            verify_tls=False, supported_drafts=18)
+        async with client.connect() as session:
+            await session.client_session_init()
+            for name in ("a", "b"):
+                with pytest.raises(MOQTRequestError) as err:
+                    await asyncio.wait_for(session.subscribe(
+                        "redir", name, wait_response=True), 5.0)
+                assert err.value.response.redirect == (b"", (b"other",), b"t")
+            assert session._close_err is None
+    finally:
+        quic_server.close()
