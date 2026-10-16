@@ -1002,11 +1002,8 @@ class _DataPublisher:
         matches = (tuple(_as_bytes(f) for f in msg.track_namespace) == self.namespace
                    and _as_bytes(msg.track_name) == self.track_name)
         if not matches or self.request is not None:
-            code = (RequestErrorCode.DOES_NOT_EXIST
-                    if is_draft16_or_later(session.negotiated_draft)
-                    else SubscribeErrorCode.TRACK_DOES_NOT_EXIST)
             session.subscribe_error(request_id=msg.request_id,
-                                    error_code=int(code),
+                                    error_code=RequestErrorCode.DOES_NOT_EXIST,
                                     reason="track does not exist")
             return
         ok = session.subscribe_ok(request_msg=msg)
