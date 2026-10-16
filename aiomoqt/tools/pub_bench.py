@@ -39,6 +39,31 @@ def _token_validator(rules):
     return _validate
 
 
+# Object Property types (§12.8, §12.9).
+PRIOR_GROUP_ID_GAP = 0x3C
+PRIOR_OBJECT_ID_GAP = 0x3E
+
+
+class _GapTrack(PublishedTrack):
+    """Even Group and Object IDs only, each Object carrying the gap
+    before it: Prior Group ID Gap on a Group's first Object, Prior Object
+    ID Gap on the rest."""
+
+    async def produce(self, out) -> None:
+        pad = bytes(self.object_size)
+        interval = 1.0 / self.rate if self.rate > 0 else 0
+        group_id = 0
+        while True:
+            for n in range(self.group_size):
+                object_id = 2 * n
+                props = ({PRIOR_OBJECT_ID_GAP: 1} if object_id
+                         else {PRIOR_GROUP_ID_GAP: 1} if group_id else None)
+                await out.write(group_id, object_id, pad, extensions=props,
+                                group_start=object_id == 0)
+                await asyncio.sleep(interval)
+            group_id += 2
+
+
 class _EmptyTrack(PublishedTrack):
     """Accepts subscriptions and never publishes an object."""
 
@@ -121,6 +146,10 @@ The URL scheme selects the transport:
     content.add_argument('--no-objects', action='store_true',
                          help='Serve subscriptions but publish no '
                               'objects: a track with nothing published')
+    content.add_argument('--gaps', action='store_true',
+                         help='Publish even Group and Object IDs only, '
+                              'each Object with its Prior Group ID Gap or '
+                              'Prior Object ID Gap property')
     _cli.add_help(parser)
     args = parser.parse_args()
     if args.video and args.datagram:
@@ -224,7 +253,9 @@ async def run(args):
                     auth_token=args.auth_token.encode() or None,
                 )
             else:
-                track_class = _EmptyTrack if args.no_objects else PublishedTrack
+                track_class = (_EmptyTrack if args.no_objects
+                               else _GapTrack if args.gaps
+                               else PublishedTrack)
                 track = track_class(
                     session,
                     namespace=args.namespace,
