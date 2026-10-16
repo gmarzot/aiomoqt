@@ -116,9 +116,17 @@ async def test_each_subscribe_ok_carries_its_tracks_properties(draft,
     ({0x0B: b""}, "cannot contain"),
     ({0x04: b"x"}, "takes an int"),
     ({0x3B: 7}, "takes bytes"),
+    ({0x04: -1}, "outside"),
+    ({0x04: 1 << 62}, "outside"),
     ({0x22: 3}, "group order"),
 ])
 def test_unsendable_properties_are_refused(props, match):
     with pytest.raises(ValueError, match=match):
         PublishedTrack(None, namespace=_NS, trackname="t",
                        immutable_properties=props)
+
+
+def test_largest_varint_value_is_accepted():
+    track = PublishedTrack(None, namespace=_NS, trackname="t",
+                           immutable_properties={0x04: (1 << 62) - 1})
+    assert track.immutable_properties == {0x04: (1 << 62) - 1}

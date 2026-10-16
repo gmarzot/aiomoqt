@@ -79,8 +79,13 @@ def _checked_immutable(props) -> Optional[Dict[int, Union[int, bytes]]]:
         raise ValueError("Immutable Properties cannot contain Immutable "
                          "Properties")
     for ptype, value in props.items():
-        if ptype % 2 == 0 and not isinstance(value, int):
-            raise ValueError(f"property 0x{ptype:x} (even) takes an int")
+        if ptype % 2 == 0:
+            if not isinstance(value, int):
+                raise ValueError(f"property 0x{ptype:x} (even) takes an int")
+            # The varint range every draft can encode.
+            if not 0 <= value < 1 << 62:
+                raise ValueError(f"property 0x{ptype:x} value {value} is "
+                                 f"outside 0..2^62-1")
         if ptype % 2 == 1:
             if not isinstance(value, (bytes, bytearray)):
                 raise ValueError(f"property 0x{ptype:x} (odd) takes bytes")
