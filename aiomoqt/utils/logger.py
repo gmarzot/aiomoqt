@@ -19,6 +19,18 @@ def set_log_level(level: any = None) -> any:
 
     return level
 
+def set_log_handler(handler: logging.Handler) -> None:
+    """Send every aiomoqt logger, existing and future, to handler."""
+    global _handler
+    old = _handler
+    _handler = handler
+    for logger in _loggers.values():
+        if old is not None:
+            logger.removeHandler(old)
+        if handler not in logger.handlers:
+            logger.addHandler(handler)
+
+
 def get_logger(name: str, level: Optional[int] = None) -> logging.Logger:
     """Get a logger with consistent formatting."""
     global _level, _handler

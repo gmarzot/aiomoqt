@@ -4,6 +4,7 @@
 
 - load_sim fails a group that subscribed but received no objects (`<< NO OBJECTS`) and prints exact `Total objects:` / `Total bytes:`.
 - Interop tier: relay-pub-sub fails on zero or missing `Total objects:`.
+- Bench workers with `--logdir` write aiomoqt logging to their per-process files (DEBUG with `-d`).
 - Received Track Properties are validated from d16 (was d18); malformed Immutable Properties close with PROTOCOL_VIOLATION even under `--compat lenient-extensions`.
 - A WebTransport client cancelled while closing still detaches its dispatcher and stops its transport.
 - The wheel no longer ships `aiomoqt/tests`.
