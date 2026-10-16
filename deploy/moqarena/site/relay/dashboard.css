@@ -2,6 +2,7 @@
 :root {
   --bg: #121212; --panel: #17171d; --panel-2: #1e1e26; --edge: #33333b;
   --text: #efefef; --dim: #a3a3ad; --faint: #6c6c78; --red: #d9532b; --field: #0d0d10;
+  --gold: #e8b339; --green: #73bf69; --amber: #f2a93b; --track: #26262e;
   --k-in: #d9532b; --k-out: #efefef; --k-host: #a3a3ad; --k-proc: #d9532b;
 }
 * { box-sizing: border-box; }
@@ -19,17 +20,56 @@ code {
 }
 
 /* header */
-.top { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
-.top h1 { font-size: 22px; font-weight: 500; margin: 0; }
-.top h1 a { color: var(--text); }
-.top h1 a:hover { text-decoration: none; }
-.top h1 b { color: var(--red); font-weight: 700; }
-.crumb { color: var(--dim); font-weight: 400; }
-.byline { color: var(--dim); }
+.hero { margin-bottom: 14px; }
+.hero-top { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 14px; }
+.brand { display: inline-flex; align-items: center; gap: 10px; color: var(--text); }
+.brand:hover { text-decoration: none; }
+.mark { width: 64px; height: 48px; flex: none; }
+.brand-text { display: flex; flex-direction: column; line-height: 1.1; }
+.brand-name { font-size: 28px; font-weight: 600; letter-spacing: -.01em; }
+.brand-name b { color: var(--red); font-weight: 700; }
+.brand-sub {
+  margin-top: 3px; font-size: 10.5px; font-weight: 600; color: var(--gold);
+  text-transform: uppercase; letter-spacing: .16em;
+}
+.badge-version {
+  border: 1px solid var(--red); background: rgba(217, 83, 43, .08); color: var(--red);
+  border-radius: 999px; padding: 3px 12px; font: 600 13px/1.4 "JetBrains Mono", ui-monospace,
+  Menlo, Consolas, monospace; overflow-wrap: anywhere;
+}
 .live { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; color: var(--dim); }
-.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); }
-.live.ok .dot { background: var(--red); box-shadow: 0 0 0 3px rgba(217, 83, 43, .25); }
-.live.ok { color: var(--text); }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--faint); }
+.live.ok { color: var(--green); }
+.live.ok .dot { background: var(--green); box-shadow: 0 0 0 3px rgba(115, 191, 105, .25); }
+
+.hero-grid {
+  display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr) auto; gap: 16px 28px;
+  align-items: start;
+}
+.mono {
+  display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 14px; margin: 0;
+  font: 14px/1.6 "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+}
+.mono dt { color: var(--gold); font-weight: 600; }
+.mono dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.facts .urls {
+  margin-top: 10px; border: 1px solid var(--edge); border-radius: 6px; padding: 8px 10px;
+}
+.urls code { font: inherit; text-decoration: underline dotted var(--faint); user-select: all; }
+
+.gauges { display: flex; gap: 10px; }
+.gauge { margin: 0; width: 112px; text-align: center; }
+.gauge svg { display: block; width: 112px; height: 98px; }
+.gauge figcaption {
+  margin-top: -4px; font-size: 12px; font-weight: 600; color: var(--gold); letter-spacing: .08em;
+}
+.gauge .g-track, .gauge .g-arc { fill: none; stroke-width: 10; stroke-linecap: round; }
+.gauge .g-track { stroke: var(--track); }
+.gauge .g-tick { fill: none; stroke-width: 3; }
+.gauge .g-value { font: 600 22px Inter, system-ui, sans-serif; }
+.gauge .ok { stroke: var(--green); fill: var(--green); }
+.gauge .warn-level { stroke: var(--amber); fill: var(--amber); }
+.gauge .high { stroke: var(--red); fill: var(--red); }
 
 .warn {
   border-left: 3px solid var(--red); background: #1d1513; padding: 8px 12px;
@@ -145,7 +185,11 @@ footer {
 }
 footer code { color: var(--dim); }
 
-@media (max-width: 1100px) { .tiles { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+@media (max-width: 1100px) {
+  .tiles { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .hero-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .gauges { grid-column: 1 / -1; }
+}
 @media (max-width: 820px) {
   .tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .charts { grid-template-columns: minmax(0, 1fr); }
@@ -156,4 +200,9 @@ footer code { color: var(--dim); }
   .kv { grid-template-columns: minmax(0, 1fr); gap: 2px; }
   .kv dt { margin-top: 6px; }
   .live { margin-left: 0; }
+  .hero-grid { grid-template-columns: minmax(0, 1fr); }
+  .gauges { justify-content: space-between; }
+  .gauge, .gauge svg { width: 30vw; max-width: 112px; }
+  .gauge svg { height: auto; }
+  .mono { font-size: 13px; }
 }

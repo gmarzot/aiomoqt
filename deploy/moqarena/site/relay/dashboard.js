@@ -179,7 +179,8 @@ const num = (v) => el('td', {class: 'n'}, v);
 
 function playLink(ns, url) {
   const q = new URLSearchParams({url, ns, v: PLAYER_DRAFT});
-  return el('a', {class: 'play', href: `${PLAYER}?${q}`}, '▶ Play');
+  return el('a', {class: 'play', href: `${PLAYER}?${q}`, target: '_blank', rel: 'noopener'},
+            '▶ Play');
 }
 
 function renderNamespaces(rows, wtUrl) {
@@ -218,16 +219,80 @@ function relayUrls(relay) {
   };
 }
 
+function fmtUptime(s) {
+  if (none(s)) return '—';
+  s = Math.max(0, Math.round(s));
+  return `${Math.floor(s / 86400)}d ${Math.floor(s % 86400 / 3600)}h ${Math.floor(s % 3600 / 60)}m`;
+}
+
+function fmtDate(epoch) {
+  const d = new Date(epoch * 1000);
+  const p = (n) => String(Math.trunc(Math.abs(n))).padStart(2, '0');
+  const off = -d.getTimezoneOffset();
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} `
+    + `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())} `
+    + `${off < 0 ? '-' : '+'}${p(off / 60)}:${p(off % 60)}`;
+}
+
 function renderRelay(s, urls) {
   const r = s.relay, v = r.versions || {};
+  $('hostname').textContent = location.hostname;
   $('url-wt').textContent = urls.wt;
   $('url-quic').textContent = urls.quic;
   $('drafts').textContent = (r.drafts || []).join(', ');
-  $('versions').textContent = [
-    ['aiomoqt', v.aiomoqt], ['aiopquic', v.aiopquic], ['picoquic', v.picoquic],
-    ['Python', v.python]].filter(([, x]) => x).map(([k, x]) => `${k} ${x}`).join(' · ');
-  $('uptime').textContent = fmtDuration(r.uptime_s)
-    + (r.watchdog_s ? ` · watchdog every ${r.watchdog_s}s` : '');
+  const badge = $('badge-version');
+  badge.textContent = v.aiomoqt ? `aiomoqt ${v.aiomoqt}` : 'aiomoqt ersatz relay';
+  badge.title = [['aiopquic', v.aiopquic], ['picoquic', v.picoquic], ['Python', v.python]]
+    .filter(([, x]) => x).map(([k, x]) => `${k} ${x}`).join(' · ');
+  $('uptime').textContent = fmtUptime(r.uptime_s)
+    + (r.watchdog_s ? ` · watchdog ${r.watchdog_s}s` : '');
+  $('date').textContent = fmtDate(s.generated);
+  const h = s.host || {};
+  $('hw').textContent = [h.arch, h.cores && `${h.cores} vCPU`,
+                         h.mem_total && `${(h.mem_total / 2 ** 30).toFixed(0)} GiB RAM`]
+    .filter(Boolean).join(' · ') || '—';
+  $('cpu-model').textContent = h.cpu_model || '—';
+  $('os').textContent = h.os || '—';
+}
+
+// -- dials ----------------------------------------------------------------------
+
+// 270° sweep from lower left (225°) clockwise to lower right (-45°).
+const G = {cx: 60, cy: 58, r: 42, tick: 52, from: 225, sweep: 270};
+
+function polar(r, deg) {
+  const a = deg * Math.PI / 180;
+  return `${(G.cx + r * Math.cos(a)).toFixed(2)},${(G.cy - r * Math.sin(a)).toFixed(2)}`;
+}
+
+function arc(r, f0, f1) {
+  const a0 = G.from - G.sweep * f0, a1 = G.from - G.sweep * f1;
+  const large = G.sweep * (f1 - f0) > 180 ? 1 : 0;
+  return `M${polar(r, a0)}A${r},${r} 0 ${large} 1 ${polar(r, a1)}`;
+}
+
+const level = (pct) => pct >= 90 ? 'high' : pct >= 70 ? 'warn-level' : 'ok';
+
+function drawGauge(svg, pct) {
+  svg.replaceChildren(
+    svgEl('path', {class: 'g-track', d: arc(G.r, 0, 1)}),
+    svgEl('path', {class: 'g-tick warn-level', d: arc(G.tick, 0.7, 0.9)}),
+    svgEl('path', {class: 'g-tick high', d: arc(G.tick, 0.9, 1)}));
+  const text = svgEl('text', {class: `g-value ${none(pct) ? '' : level(pct)}`, x: G.cx,
+                              y: G.cy + 8, 'text-anchor': 'middle', stroke: 'none'});
+  text.textContent = none(pct) ? '—' : `${Math.round(pct)}%`;
+  if (!none(pct)) {
+    const f = Math.min(Math.max(pct, 0), 100) / 100;
+    svg.append(svgEl('path', {class: `g-arc ${level(pct)}`, d: arc(G.r, 0, Math.max(f, 0.004))}));
+  }
+  svg.append(text);
+}
+
+function renderGauges(h) {
+  const pct = (used, total) => (none(used) || !total) ? null : 100 * used / total;
+  drawGauge($('gauge-cpu'), h.cpu);
+  drawGauge($('gauge-ram'), pct(h.mem_used, h.mem_total));
+  drawGauge($('gauge-disk'), pct(h.disk_used, h.disk_total));
 }
 
 function setHost(key, text) {
@@ -264,6 +329,7 @@ function render(s) {
   renderNamespaces(s.namespaces, urls.wt);
   renderTracks(s.tracks);
   renderHost(s.host);
+  renderGauges(s.host || {});
 }
 
 function showFreshness() {

@@ -5,11 +5,11 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark">
 <title>moqarena</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23121212'/%3E%3Cpath d='M7 22V10l5 7 5-7v12M21 10h4v12' stroke='%23d9532b' stroke-width='2.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='%23d9532b'/%3E%3Cpath d='M5 19c5 2.5 13 3 22-1' stroke='%239f3517' stroke-width='2' fill='none'/%3E%3Ccircle cx='11.5' cy='11' r='2.6' fill='%23a83a1a'/%3E%3Ccircle cx='21' cy='23' r='2' fill='%23a83a1a'/%3E%3C/svg%3E">
 <style>
   :root {
     --bg: #121212; --panel: #17171d; --edge: #33333b; --text: #efefef;
-    --dim: #a3a3ad; --red: #d9532b; --g5: #e42126; --field: #0d0d10;
+    --dim: #a3a3ad; --red: #d9532b; --g5: #e42126; --gold: #e8b339; --field: #0d0d10;
   }
   * { box-sizing: border-box; }
   body {
@@ -17,10 +17,14 @@
     font: 14px/1.5 Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
   }
   main { max-width: 960px; margin: 0 auto; padding: 24px 16px 48px; }
-  header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
-  h1 { font-size: 22px; font-weight: 500; margin: 0; }
-  h1 b { color: var(--red); font-weight: 700; }
-  header span { color: var(--dim); }
+  header { margin-bottom: 22px; }
+  .brand { display: inline-flex; align-items: center; gap: 10px; }
+  .mark { width: 64px; height: 48px; flex: none; }
+  h1 { margin: 0; display: flex; flex-direction: column; line-height: 1.1; }
+  .brand-name { font-size: 28px; font-weight: 600; letter-spacing: -.01em; }
+  .brand-name b { color: var(--red); font-weight: 700; }
+  .brand-sub { margin-top: 3px; font-size: 10.5px; font-weight: 600; color: var(--gold);
+    text-transform: uppercase; letter-spacing: .16em; }
   .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
   .card {
     display: block; background: var(--panel); border: 1px solid var(--edge); border-radius: 4px;
@@ -49,8 +53,30 @@
 <body>
 <main>
   <header>
-    <h1><b>moq</b>arena</h1>
-    <span>A Marz Research Project</span>
+    <div class="brand">
+      <svg class="mark" viewBox="0 0 64 48" aria-hidden="true">
+        <defs>
+          <radialGradient id="mars-shade" cx="36%" cy="30%" r="75%">
+            <stop offset="0" stop-color="#fff" stop-opacity=".22"/>
+            <stop offset=".55" stop-color="#fff" stop-opacity="0"/>
+            <stop offset="1" stop-color="#000" stop-opacity=".38"/>
+          </radialGradient>
+        </defs>
+        <g stroke-linecap="round" stroke-width="2.4">
+          <path d="M3 17h17" stroke="#e8b339"/>
+          <path d="M9 24h11" stroke="#d9532b"/>
+          <path d="M5 31h15" stroke="#e8b339" opacity=".7"/>
+        </g>
+        <circle cx="42" cy="24" r="18" fill="#d9532b"/>
+        <path d="M27 29c7 3 17 3.5 29-1.5" stroke="#9f3517" stroke-width="2.2" fill="none" opacity=".7"/>
+        <ellipse cx="35.5" cy="17.5" rx="4.2" ry="3" fill="#a83a1a" opacity=".75"/>
+        <circle cx="48.5" cy="32" r="3" fill="#a83a1a" opacity=".65"/>
+        <circle cx="46" cy="14" r="1.8" fill="#a83a1a" opacity=".65"/>
+        <circle cx="42" cy="24" r="18" fill="url(#mars-shade)"/>
+      </svg>
+      <h1><span class="brand-name"><b>moq</b>arena</span>
+        <span class="brand-sub">A Marz Research Project</span></h1>
+    </div>
   </header>
 
   <div class="grid">
@@ -74,7 +100,7 @@
       <dt>WebTransport</dt><dd><code>https://moqarena.marzresearch.net:4443/</code></dd>
       <dt>Raw QUIC</dt><dd><code>moqt://moqarena.marzresearch.net:4443</code></dd>
       <dt>Drafts</dt><dd>22, 20, 18, 16, 14 (highest common draft wins)</dd>
-      <dt>Status</dt><dd><a href="/relay/">live relay dashboard</a></dd>
+      <dt>Status</dt><dd><a href="/relay/" target="_blank" rel="noopener">live relay dashboard</a></dd>
     </dl>
   </section>
 </main>
