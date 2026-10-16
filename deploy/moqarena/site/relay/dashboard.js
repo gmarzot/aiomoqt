@@ -44,6 +44,7 @@ const fmtBytes = (v) => none(v) ? '—' : scaled(v, 1000, ['B', 'kB', 'MB', 'GB'
 const fmtNum = (v) => none(v) ? '—' : Number(v).toLocaleString('en-US');
 const fmtPct = (v, digits = 1) => none(v) ? '—' : `${Number(v).toFixed(digits)}%`;
 const fmtMs = (v) => none(v) ? '—' : `${v >= 100 ? Math.round(v) : Number(v).toFixed(1)} ms`;
+const fmtRate = (v) => none(v) ? '—' : (v >= 100 ? fmtNum(Math.round(v)) : Number(v).toFixed(1));
 const plural = (n, one, many = `${one}s`) => `${fmtNum(n)} ${n === 1 ? one : many}`;
 
 function fmtDuration(s) {
@@ -104,8 +105,8 @@ function renderTiles(s) {
   setTile('subscribers', fmtNum(T.subscribers), plural(T.publishers, 'publisher'));
   setTile('ingress', fmtBps(T.ingress_bps), `media ${fmtBps(T.media_in_bps)}`);
   setTile('egress', fmtBps(T.egress_bps), `media ${fmtBps(T.media_out_bps)}`);
-  setTile('efficiency', none(T.efficiency) ? '—' : fmtPct(100 * T.efficiency, 0),
-          'egress not received upstream');
+  const groups = s.tracks.reduce((n, r) => n + (r.groups_per_s || 0), 0);
+  setTile('objects', fmtRate(T.objects_in_per_s), `${fmtRate(groups)} groups/s in`);
   setTile('delivered', fmtBytes(T.delivered_bytes), 'media since start');
   setTile('drops', fmtNum(T.drops), 'subscribers dropped');
   setTile('loss', fmtPct(T.loss_pct, 2), 'delivery to subscribers');
@@ -199,14 +200,17 @@ function renderTracks(rows) {
     const state = STATES.has(r.state) ? r.state : 'idle';
     return el('tr', {},
       el('td', {}, el('code', {}, r.namespace)),
-      el('td', {}, el('code', {}, r.name)),
+      el('td', {title: r.largest ? `Largest ${r.largest[0]} · ${r.largest[1]}` : null},
+         el('code', {}, r.name)),
       el('td', {}, el('span', {class: `state state-${state}`}, state)),
       num(fmtNum(r.subscribers)), num(fmtNum(r.peak)),
       num(fmtBps(r.in_bps)), num(fmtBps(r.out_bps)), num(fmtBytes(r.bytes_out)),
+      num(fmtRate(r.groups_per_s)), num(fmtRate(r.objects_per_s)),
+      el('td', {class: 'n', title: `RTT up ${fmtMs(r.rtt_up_ms)} · down p50 ${fmtMs(r.rtt_down_ms)}`},
+         fmtMs(r.latency_ms)),
       num(fmtNum(r.fetches)), num(fmtNum(r.drops)),
-      num(r.largest ? `${r.largest[0]}.${r.largest[1]}` : '—'),
       num(`${fmtNum(r.cache_groups)} g · ${fmtBytes(r.cache_bytes)}`));
-  }), 12, 'No tracks.');
+  }), 14, 'No tracks.');
 }
 
 // -- relay and host -------------------------------------------------------------
@@ -273,26 +277,30 @@ function arc(r, f0, f1) {
 
 const level = (pct) => pct >= 90 ? 'high' : pct >= 70 ? 'warn-level' : 'ok';
 
-function drawGauge(svg, pct) {
-  svg.replaceChildren(
-    svgEl('path', {class: 'g-track', d: arc(G.r, 0, 1)}),
-    svgEl('path', {class: 'g-tick warn-level', d: arc(G.tick, 0.7, 0.9)}),
-    svgEl('path', {class: 'g-tick high', d: arc(G.tick, 0.9, 1)}));
-  const text = svgEl('text', {class: `g-value ${none(pct) ? '' : level(pct)}`, x: G.cx,
+// `bands`: amber and red past 70% and 90%; without, high is good and stays green.
+function drawGauge(svg, pct, bands = true) {
+  const tone = (v) => bands ? level(v) : 'ok';
+  svg.replaceChildren(svgEl('path', {class: 'g-track', d: arc(G.r, 0, 1)}));
+  if (bands) {
+    svg.append(svgEl('path', {class: 'g-tick warn-level', d: arc(G.tick, 0.7, 0.9)}),
+               svgEl('path', {class: 'g-tick high', d: arc(G.tick, 0.9, 1)}));
+  }
+  const text = svgEl('text', {class: `g-value ${none(pct) ? '' : tone(pct)}`, x: G.cx,
                               y: G.cy + 8, 'text-anchor': 'middle', stroke: 'none'});
   text.textContent = none(pct) ? '—' : `${Math.round(pct)}%`;
   if (!none(pct)) {
     const f = Math.min(Math.max(pct, 0), 100) / 100;
-    svg.append(svgEl('path', {class: `g-arc ${level(pct)}`, d: arc(G.r, 0, Math.max(f, 0.004))}));
+    svg.append(svgEl('path', {class: `g-arc ${tone(pct)}`, d: arc(G.r, 0, Math.max(f, 0.004))}));
   }
   svg.append(text);
 }
 
-function renderGauges(h) {
+function renderGauges(h, T) {
   const pct = (used, total) => (none(used) || !total) ? null : 100 * used / total;
   drawGauge($('gauge-cpu'), h.cpu);
   drawGauge($('gauge-ram'), pct(h.mem_used, h.mem_total));
   drawGauge($('gauge-disk'), pct(h.disk_used, h.disk_total));
+  drawGauge($('gauge-cdn'), none(T.efficiency) ? null : 100 * T.efficiency, false);
 }
 
 function setHost(key, text) {
@@ -329,7 +337,7 @@ function render(s) {
   renderNamespaces(s.namespaces, urls.wt);
   renderTracks(s.tracks);
   renderHost(s.host);
-  renderGauges(s.host || {});
+  renderGauges(s.host || {}, s.totals || {});
 }
 
 function showFreshness() {
@@ -362,25 +370,41 @@ async function poll() {
   }
 }
 
-document.addEventListener('click', (ev) => {
-  const button = ev.target.closest('button.copy');
-  if (!button) return;
-  const target = $(button.dataset.copy);
-  const done = (label) => {
-    button.textContent = label;
-    setTimeout(() => { button.textContent = 'Copy'; }, 1200);
-  };
+function toast(target, text) {
+  const t = $('toast');
+  const box = target.getBoundingClientRect();
+  t.textContent = text;
+  t.style.left = `${Math.round(box.left)}px`;
+  t.style.top = `${Math.round(box.bottom + 6)}px`;
+  t.hidden = false;
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => { t.hidden = true; }, 1200);
+}
+
+function copyText(target) {
   const select = () => {
     const range = document.createRange();
     range.selectNodeContents(target);
     getSelection().removeAllRanges();
     getSelection().addRange(range);
-    done('Press ⌘C / Ctrl+C');
+    toast(target, 'Press ⌘C / Ctrl+C');
   };
   if (navigator.clipboard) {
-    navigator.clipboard.writeText(target.textContent).then(() => done('Copied'), select);
+    navigator.clipboard.writeText(target.textContent).then(() => toast(target, 'Copied'), select);
   } else {
     select();
+  }
+}
+
+document.addEventListener('click', (ev) => {
+  const target = ev.target.closest('.copyable');
+  if (target) copyText(target);
+});
+document.addEventListener('keydown', (ev) => {
+  const target = ev.target.closest && ev.target.closest('.copyable');
+  if (target && (ev.key === 'Enter' || ev.key === ' ')) {
+    ev.preventDefault();
+    copyText(target);
   }
 });
 

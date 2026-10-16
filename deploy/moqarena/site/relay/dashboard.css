@@ -20,22 +20,22 @@ code {
 }
 
 /* header */
-.hero { margin-bottom: 14px; }
-.hero-top { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 14px; }
+.hero { margin-bottom: 10px; }
+.hero-top { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 8px; }
 .brand { display: inline-flex; align-items: center; gap: 10px; color: var(--text); }
 .brand:hover { text-decoration: none; }
-.mark { width: 64px; height: 48px; flex: none; }
+.mark { width: 52px; height: 39px; flex: none; }
 .brand-text { display: flex; flex-direction: column; line-height: 1.1; }
-.brand-name { font-size: 28px; font-weight: 600; letter-spacing: -.01em; }
+.brand-name { font-size: 24px; font-weight: 600; letter-spacing: -.01em; }
 .brand-name b { color: var(--red); font-weight: 700; }
 .brand-sub {
   margin-top: 3px; font-size: 10.5px; font-weight: 600; color: var(--gold);
   text-transform: uppercase; letter-spacing: .16em;
 }
 .badge-version {
-  border: 1px solid var(--red); background: rgba(217, 83, 43, .08); color: var(--red);
-  border-radius: 999px; padding: 3px 12px; font: 600 13px/1.4 "JetBrains Mono", ui-monospace,
-  Menlo, Consolas, monospace; overflow-wrap: anywhere;
+  background: #c4441f; color: #fff; border-radius: 999px; padding: 4px 14px;
+  font: 700 14px/1.4 "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+  overflow-wrap: anywhere; box-shadow: 0 0 0 1px rgba(217, 83, 43, .45);
 }
 .live { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; color: var(--dim); }
 .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--faint); }
@@ -47,26 +47,37 @@ code {
   align-items: start;
 }
 .mono {
-  display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 14px; margin: 0;
-  font: 14px/1.6 "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+  display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 1px 12px; margin: 0;
+  font: 13px/1.45 "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
 }
 .mono dt { color: var(--gold); font-weight: 600; }
 .mono dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
 .facts .urls {
-  margin-top: 10px; border: 1px solid var(--edge); border-radius: 6px; padding: 8px 10px;
+  margin-top: 6px; border: 1px solid var(--edge); border-radius: 6px; padding: 4px 8px;
 }
-.urls code { font: inherit; text-decoration: underline dotted var(--faint); user-select: all; }
+.copyable {
+  font: inherit; cursor: pointer; text-decoration: underline dotted var(--faint);
+  text-underline-offset: 3px;
+}
+.copyable:hover, .copyable:focus-visible { color: var(--gold); outline: none;
+  text-decoration-color: var(--gold); }
+.toast {
+  position: fixed; z-index: 10; padding: 2px 10px; border: 1px solid var(--green);
+  border-radius: 4px; background: var(--panel-2); color: var(--green); font-size: 12px;
+  pointer-events: none;
+}
+.toast[hidden] { display: none; }
 
-.gauges { display: flex; gap: 10px; }
-.gauge { margin: 0; width: 112px; text-align: center; }
-.gauge svg { display: block; width: 112px; height: 98px; }
+.gauges { display: flex; gap: 8px; }
+.gauge { margin: 0; width: 84px; text-align: center; }
+.gauge svg { display: block; width: 84px; height: 73px; }
 .gauge figcaption {
-  margin-top: -4px; font-size: 12px; font-weight: 600; color: var(--gold); letter-spacing: .08em;
+  margin-top: -6px; font-size: 11px; font-weight: 600; color: var(--gold); letter-spacing: .08em;
 }
 .gauge .g-track, .gauge .g-arc { fill: none; stroke-width: 10; stroke-linecap: round; }
 .gauge .g-track { stroke: var(--track); }
 .gauge .g-tick { fill: none; stroke-width: 3; }
-.gauge .g-value { font: 600 22px Inter, system-ui, sans-serif; }
+.gauge .g-value { font: 600 24px Inter, system-ui, sans-serif; }
 .gauge .ok { stroke: var(--green); fill: var(--green); }
 .gauge .warn-level { stroke: var(--amber); fill: var(--amber); }
 .gauge .high { stroke: var(--red); fill: var(--red); }
@@ -97,11 +108,6 @@ h2 {
   background: var(--field); border: 1px solid var(--edge); border-radius: 3px;
   padding: 2px 6px; user-select: all;
 }
-.copy {
-  margin-left: 6px; background: transparent; color: var(--dim); border: 1px solid var(--edge);
-  border-radius: 3px; padding: 1px 8px; font: 12px/1.6 inherit; cursor: pointer;
-}
-.copy:hover { color: var(--text); border-color: var(--red); }
 
 /* tiles */
 .tiles {
@@ -171,7 +177,7 @@ td.empty { color: var(--faint); text-align: center; padding: 14px; }
   color: var(--red); font-size: 12px; line-height: 18px;
 }
 .state { font-size: 12px; color: var(--dim); }
-.state-live { color: var(--red); font-weight: 600; }
+.state-live { color: var(--green); font-weight: 600; }
 .state-ended { color: var(--faint); }
 .play {
   display: inline-block; padding: 1px 10px; border: 1px solid var(--red); border-radius: 3px;
@@ -202,7 +208,7 @@ footer code { color: var(--dim); }
   .live { margin-left: 0; }
   .hero-grid { grid-template-columns: minmax(0, 1fr); }
   .gauges { justify-content: space-between; }
-  .gauge, .gauge svg { width: 30vw; max-width: 112px; }
+  .gauge, .gauge svg { width: 22vw; max-width: 84px; }
   .gauge svg { height: auto; }
   .mono { font-size: 13px; }
 }

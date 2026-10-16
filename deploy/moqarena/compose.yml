@@ -23,6 +23,8 @@ services:
     volumes:
       - /etc/letsencrypt:/etc/letsencrypt:ro
       - ./status:/status
+      # Host OS name for the dashboard; the container's is the image's.
+      - /etc/os-release:/host/etc/os-release:ro
     logging:
       options: {max-size: "50m", max-file: "3"}
 

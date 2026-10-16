@@ -51,11 +51,11 @@
         </dl>
         <dl class="mono urls">
           <dt>QUIC:</dt>
-          <dd><code id="url-quic">moqt://moqarena.marzresearch.net:4443</code>
-            <button class="copy" type="button" data-copy="url-quic">Copy</button></dd>
+          <dd><code class="copyable" id="url-quic" tabindex="0" role="button"
+            title="Click to copy">moqt://moqarena.marzresearch.net:4443</code></dd>
           <dt>H3/WT:</dt>
-          <dd><code id="url-wt">https://moqarena.marzresearch.net:4443/</code>
-            <button class="copy" type="button" data-copy="url-wt">Copy</button></dd>
+          <dd><code class="copyable" id="url-wt" tabindex="0" role="button"
+            title="Click to copy">https://moqarena.marzresearch.net:4443/</code></dd>
         </dl>
       </div>
       <dl class="mono facts">
@@ -70,9 +70,11 @@
         <figure class="gauge"><svg id="gauge-cpu" viewBox="0 0 120 104" role="img" aria-label="CPU"></svg><figcaption>CPU</figcaption></figure>
         <figure class="gauge"><svg id="gauge-ram" viewBox="0 0 120 104" role="img" aria-label="RAM"></svg><figcaption>RAM</figcaption></figure>
         <figure class="gauge"><svg id="gauge-disk" viewBox="0 0 120 104" role="img" aria-label="Disk"></svg><figcaption>DISK</figcaption></figure>
+        <figure class="gauge"><svg id="gauge-cdn" viewBox="0 0 120 104" role="img" aria-label="CDN efficiency"></svg><figcaption title="Share of egress not received upstream">CDN</figcaption></figure>
       </div>
     </div>
   </header>
+  <div class="toast" id="toast" role="status" hidden>Copied</div>
 
   <p class="warn">aiomoqt ersatz relay: for limited interop testing. Please keep traffic light:
     excessive traffic or extended relay testing is discouraged. Open, no auth, a small per-track
@@ -89,7 +91,7 @@
     <div class="tile" data-key="subscribers" data-spark="subscribers"><h3>Subscribers</h3><div class="value">—</div><div class="sub"></div></div>
     <div class="tile" data-key="ingress" data-spark="ingress_bps"><h3>Ingress</h3><div class="value">—</div><div class="sub"></div></div>
     <div class="tile" data-key="egress" data-spark="egress_bps"><h3>Egress</h3><div class="value">—</div><div class="sub"></div></div>
-    <div class="tile" data-key="efficiency"><h3>CDN efficiency</h3><div class="value">—</div><div class="sub"></div></div>
+    <div class="tile" data-key="objects" data-spark="objects_in_per_s"><h3>Objects/s</h3><div class="value">—</div><div class="sub"></div></div>
     <div class="tile" data-key="delivered"><h3>Delivered</h3><div class="value">—</div><div class="sub"></div></div>
     <div class="tile" data-key="drops"><h3>Drops</h3><div class="value">—</div><div class="sub"></div></div>
     <div class="tile" data-key="loss" data-spark="loss_pct"><h3>Loss</h3><div class="value">—</div><div class="sub"></div></div>
@@ -99,12 +101,12 @@
 
   <section class="charts">
     <figure class="panel chart">
-      <figcaption>Bandwidth <span class="legend"><i class="k-in"></i>in <i class="k-out"></i>out</span></figcaption>
-      <svg id="chart-bw" role="img" aria-label="Relay ingress and egress over the last 10 minutes"></svg>
-    </figure>
-    <figure class="panel chart">
       <figcaption>CPU <span class="legend"><i class="k-host"></i>host <i class="k-proc"></i>relay</span></figcaption>
       <svg id="chart-cpu" role="img" aria-label="Host and relay CPU over the last 10 minutes"></svg>
+    </figure>
+    <figure class="panel chart">
+      <figcaption>Bandwidth <span class="legend"><i class="k-in"></i>in <i class="k-out"></i>out</span></figcaption>
+      <svg id="chart-bw" role="img" aria-label="Relay ingress and egress over the last 10 minutes"></svg>
     </figure>
   </section>
 
@@ -126,9 +128,11 @@
       <table id="t-tracks">
         <thead><tr><th>Namespace</th><th>Track</th><th>State</th><th class="n">Subscribers</th>
           <th class="n">Peak</th><th class="n">In</th><th class="n">Out</th><th class="n">Delivered</th>
-          <th class="n">Fetches</th><th class="n">Drops</th><th class="n">Largest</th>
+          <th class="n">Groups/s</th><th class="n">Objects/s</th>
+          <th class="n" title="One-way network estimate: half the publisher RTT plus half the subscribers' median RTT; no queueing or buffering">Latency ≈</th>
+          <th class="n">Fetches</th><th class="n">Drops</th>
           <th class="n">Cache</th></tr></thead>
-        <tbody><tr><td colspan="12" class="empty">No tracks.</td></tr></tbody>
+        <tbody><tr><td colspan="14" class="empty">No tracks.</td></tr></tbody>
       </table>
     </div>
   </section>
