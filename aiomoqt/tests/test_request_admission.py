@@ -27,6 +27,7 @@ from aiomoqt.tests._certs import CERT, KEY, requires_certs
 
 def _session(draft):
     s = object.__new__(_MOQTSessionMixin)
+    s._published_aliases = {}
     s._peer_requests = {}
     s._requests = {}
     s._published_tracks = {}

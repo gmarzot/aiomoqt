@@ -952,6 +952,47 @@ class _MOQTSessionMixin:
                 f"FETCH_OK End Location {end} before the FETCH's Start "
                 f"{start}")
 
+    # Track Aliases of received tracks with an Established subscription:
+    # alias -> ((namespace, name), request id).
+    _established_aliases: Optional[Dict[int, Tuple[Any, int]]] = None
+
+    @staticmethod
+    def _msg_track(msg) -> Optional[Tuple[tuple, bytes]]:
+        ns = getattr(msg, 'track_namespace', None)
+        if ns is None:
+            ns = getattr(msg, 'namespace', None)
+        name = getattr(msg, 'track_name', None)
+        if ns is None or name is None:
+            return None
+        return (tuple(ns), name)
+
+    def _check_alias(self, alias: int, track, request_id: int) -> None:
+        """§11.1: a Track Alias another track's Established subscription
+        uses closes the session with DUPLICATE_TRACK_ALIAS."""
+        held = (self._established_aliases or {}).get(alias)
+        if (held is not None and held[1] != request_id
+                and None not in (held[0], track) and held[0] != track):
+            raise MOQTException(
+                SessionCloseCode.DUPLICATE_TRACK_ALIAS,
+                f"Track Alias {alias} already in use by request {held[1]}")
+
+    def _establish_alias(self, alias: int, track, request_id: int) -> None:
+        if self._established_aliases is None:
+            self._established_aliases = {}
+        self._established_aliases[alias] = (track, request_id)
+
+    def _retire_alias(self, request_id: int) -> None:
+        """A received track's subscription ended: its alias is free."""
+        held = self._established_aliases
+        if held:
+            for alias in [a for a, v in held.items() if v[1] == request_id]:
+                del held[alias]
+
+    def _retire_published_alias(self, request_id: int) -> None:
+        for alias, rid in list(self._published_aliases.items()):
+            if rid == request_id:
+                del self._published_aliases[alias]
+
     def _route_reply(self, msg) -> None:
         """Act on a reply as it is parsed, ahead of the data streams in
         its batch and of the handler task: SUBSCRIBE_OK binds the
@@ -959,6 +1000,16 @@ class _MOQTSessionMixin:
         the request registered, and a refused PUBLISH_NAMESPACE announces
         nothing. A FETCH_OK ending before its Start closes the session;
         from d20 a reply showing an empty fill range ends the fill."""
+        if isinstance(msg, SubscribeOk) and msg.track_alias is not None:
+            sent = next((m for m in self._subscriptions.get(
+                msg.request_id, ()) if isinstance(m, Subscribe)), None)
+            track = None if sent is None else self._msg_track(sent)
+            self._check_alias(msg.track_alias, track, msg.request_id)
+            self._establish_alias(msg.track_alias, track, msg.request_id)
+        elif (isinstance(msg, Publish)
+              and getattr(msg, 'track_alias', None) is not None):
+            self._check_alias(msg.track_alias, self._msg_track(msg),
+                              msg.request_id)
         if isinstance(msg, SubscribeOk):
             cb = self._pending_object_handlers.pop(msg.request_id, None)
             if cb is not None and msg.track_alias is not None:
@@ -1012,6 +1063,7 @@ class _MOQTSessionMixin:
         awaiter first; an awaiter nothing answered fails."""
         self._bidi_streams.pop(request_id, None)
         self._subscriptions.pop(request_id, None)
+        self._retire_alias(request_id)
         self._fail_waiting_updates(request_id, why)
         alias = next((ta for ta, rid in self._track_aliases.items()
                       if rid == request_id), None)
@@ -1033,6 +1085,7 @@ class _MOQTSessionMixin:
         cb = self._request_cancel_handlers.pop(request_id, None)
         self._requests.pop(request_id, None)
         self._peer_requests.pop(request_id, None)
+        self._retire_published_alias(request_id)
         if not replies_pending:
             self._publish_done_handlers.pop(request_id, None)
         logger.info(f"MOQT: request {request_id} cancelled by {why}")
@@ -4008,6 +4061,10 @@ class _MOQTSessionMixin:
         subscription parameters that differ from the PUBLISH's follow in
         a REQUEST_UPDATE on its stream (d20 §10.9). GROUP_ORDER cannot
         change there and is not sent."""
+        alias = getattr(request_msg, 'track_alias', None)
+        if alias is not None:
+            self._establish_alias(alias, self._msg_track(request_msg),
+                                  request_msg.request_id)
         if self._profile.publish_ok_expires_only:
             message = PublishOk(request_id=request_msg.request_id,
                                 parameters=dict(parameters or {}))
@@ -4148,6 +4205,7 @@ class _MOQTSessionMixin:
             reason=reason,
         )
         logger.info(f"MOQT send: {message}")
+        self._retire_published_alias(request_id)
         self._send_reply(request_id, message, fin=True)
         return message
 
@@ -4191,6 +4249,7 @@ class _MOQTSessionMixin:
         d14/d16 send UNSUBSCRIBE (0x0A). d18 removed it: a request is
         cancelled by terminating its own bidi stream (§3.3.2) — reset
         our write half, STOP_SENDING the reply half. Returns None then."""
+        self._retire_alias(request_id)
         if self.negotiated_draft >= 18:
             stream_id = self._bidi_streams.get(request_id)
             if stream_id is None:
@@ -5230,9 +5289,6 @@ class _MOQTSessionMixin:
         Receive-side state is keyed by the peer's aliases, a different
         number space, and is left alone."""
         logger.info(f"MOQT event: handle {msg}")
-        for alias, rid in list(self._published_aliases.items()):
-            if rid == msg.request_id:
-                del self._published_aliases[alias]
         self._subscriptions.pop(msg.request_id, None)
         # d18 has no UNSUBSCRIBE; there the same news arrives as a
         # terminated request stream. Both reach the owner the same way.
@@ -5250,6 +5306,7 @@ class _MOQTSessionMixin:
                      f"request_id={msg.request_id} "
                      f"status={msg.status_code} "
                      f"streams={msg.stream_count}")
+        self._retire_alias(msg.request_id)
         track_alias = next(
             (ta for ta, rid in self._track_aliases.items()
              if rid == msg.request_id),
