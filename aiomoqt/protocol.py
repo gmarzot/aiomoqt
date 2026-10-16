@@ -3081,10 +3081,9 @@ class _MOQTSessionMixin:
         undeclared stream would otherwise outrank a track that declared
         the neutral value.
         """
-        target = self if self._quic is self else self._quic
+        # On WT _quic is self; look past this mixin, as for set_stream_priority.
+        target = super() if self._quic is self else self._quic
         setter = getattr(target, 'set_default_stream_priority', None)
-        if setter is None and target is self:
-            setter = getattr(super(), 'set_default_stream_priority', None)
         if setter is None:
             return False
         try:
