@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>moqarena</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23121212'/%3E%3Cpath d='M7 22V10l5 7 5-7v12M21 10h4v12' stroke='%23d9532b' stroke-width='2.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #121212; --panel: #17171d; --edge: #33333b; --text: #efefef;
+    --dim: #a3a3ad; --red: #d9532b; --g5: #e42126; --field: #0d0d10;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 960px; margin: 0 auto; padding: 24px 16px 48px; }
+  header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
+  h1 { font-size: 22px; font-weight: 500; margin: 0; }
+  h1 b { color: var(--red); font-weight: 700; }
+  header span { color: var(--dim); }
+  .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+  .card {
+    display: block; background: var(--panel); border: 1px solid var(--edge); border-radius: 4px;
+    padding: 18px 20px; color: var(--text);
+  }
+  .card:hover { border-color: var(--red); text-decoration: none; }
+  .card strong { display: block; font-size: 20px; font-weight: 700; color: var(--text); margin-bottom: 4px; }
+  .five { color: var(--g5); font-style: normal; }
+  .card span { color: var(--dim); }
+  section { margin-top: 32px; border-top: 1px solid var(--edge); padding-top: 16px; }
+  h2 { font-size: 13px; font-weight: 500; color: var(--dim); text-transform: uppercase; letter-spacing: .04em; margin: 0 0 10px; }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: 6px 14px; margin: 0; }
+  dt { color: var(--dim); }
+  dd { margin: 0; min-width: 0; }
+  code {
+    font: 13px/1.4 "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+    background: var(--field); border: 1px solid var(--edge); border-radius: 3px;
+    padding: 2px 6px; user-select: all; overflow-wrap: anywhere;
+  }
+  a { color: var(--red); text-decoration: none; }
+  p { margin: 10px 0 0; }
+  .note { color: var(--dim); font-size: 13px; }
+  .warn { border-left: 3px solid var(--red); padding: 6px 10px; margin: 0 0 12px; background: #1d1513; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1><b>moq</b>arena</h1>
+    <span>A Marz Research Project</span>
+  </header>
+
+  <div class="grid">
+    <a class="card" href="/g5-broadcast/">
+      <strong>G<i class="five">5</i> Broadcast</strong>
+      <span>Camera, mic or screen, published as MSF/LOC. Once live, it gives a viewer link to share.</span>
+    </a>
+    <a class="card" href="/g5-player/?url=https%3A%2F%2Fmoqx-main.ci.openmoq.org%3A4433%2Fmoq-relay">
+      <strong>G<i class="five">5</i> Player</strong>
+      <span>Play a broadcast: open its viewer link, or enter the namespace in the player's settings.</span>
+    </a>
+  </div>
+  <p class="note">Repo: <a href="https://github.com/gmarzot/moq-playa/tree/gmarzot-playa-dev">gmarzot/moq-playa</a> — forked from <a href="https://github.com/openmoq/moq-playa">openmoq/moq-playa</a></p>
+
+  <section>
+    <h2>aiomoqt ersatz relay — limited testing only</h2>
+    <p class="warn">For limited interop testing. Please keep traffic light: excessive traffic or
+      extended relay testing is discouraged. Open, no auth, a small per-track cache, not a
+      production relay.</p>
+    <dl>
+      <dt>WebTransport</dt><dd><code>https://moqarena.marzresearch.net:4443/</code></dd>
+      <dt>Raw QUIC</dt><dd><code>moqt://moqarena.marzresearch.net:4443</code></dd>
+      <dt>Drafts</dt><dd>22, 20, 18, 16, 14 (highest common draft wins)</dd>
+      <dt>Status</dt><dd><a href="/relay/">live relay dashboard</a></dd>
+    </dl>
+  </section>
+</main>
+</body>
+</html>

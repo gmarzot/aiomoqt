@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>moqarena relay</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23121212'/%3E%3Cpath d='M7 22V10l5 7 5-7v12M21 10h4v12' stroke='%23d9532b' stroke-width='2.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="dashboard.css">
+<script src="dashboard.js" defer></script>
+</head>
+<body>
+<main>
+  <header class="top">
+    <h1><a href="/"><b>moq</b>arena</a> <span class="crumb">/ ersatz relay</span></h1>
+    <span class="byline">A Marz Research Project</span>
+    <span class="live" id="live"><i class="dot"></i><span id="updated">connecting…</span></span>
+  </header>
+
+  <p class="warn">aiomoqt ersatz relay: for limited interop testing. Please keep traffic light:
+    excessive traffic or extended relay testing is discouraged. Open, no auth, a small per-track
+    cache, not a production relay.</p>
+
+  <section class="panel">
+    <dl class="kv">
+      <dt>WebTransport</dt>
+      <dd><code id="url-wt">https://moqarena.marzresearch.net:4443/</code>
+        <button class="copy" type="button" data-copy="url-wt">Copy</button></dd>
+      <dt>Raw QUIC</dt>
+      <dd><code id="url-quic">moqt://moqarena.marzresearch.net:4443</code>
+        <button class="copy" type="button" data-copy="url-quic">Copy</button></dd>
+      <dt>Drafts</dt><dd id="drafts">22, 20, 18, 16, 14</dd>
+      <dt>Software</dt><dd id="versions">—</dd>
+      <dt>Uptime</dt><dd id="uptime">—</dd>
+    </dl>
+  </section>
+
+  <p class="unavailable" id="unavailable" hidden>Status unavailable: the relay has not reported
+    in the last 30 seconds.</p>
+  <noscript><p class="unavailable">Live status needs JavaScript.</p></noscript>
+
+  <section class="tiles" aria-label="Relay metrics">
+    <div class="tile" data-key="sessions" data-spark="sessions"><h3>Sessions</h3><div class="value">—</div><div class="sub"></div></div>
+    <div class="tile" data-key="namespaces"><h3>Namespaces</h3><div class="value">—</div><div class="sub"></div></div>
+    <div class="tile" data-key="tracks" data-spark="tracks"><h3>Tracks</h3><div class="value">—</div><div class="sub"></div></div>
+    <div class="tile" data-key="subscribers" data-spark="subscribers"><h3>Subscribers</h3><div class="value">—</div><div class="sub"></div></div>
+    <div class="tile" data-key="ingress" data-spark="ingress_bps"><h3>Ingress</h3><div class="value">—</div><div class="sub"></div></div>
+    <div class="tile" data-key="egress" data-spark="egress_bps"><h3>Egress</h3><div class="value">—</div><div class="sub"></div></div>
+    <div class="tile" data-key="efficiency"><h3>CDN efficiency</h3><div class="value">—</div><div class="sub"></div></div>
+    <div class="tile" data-key="delivered"><h3>Delivered</h3><div class="value">—</div><div class="sub"></div></div>
+    <div class="tile" data-key="drops"><h3>Drops</h3><div class="value">—</div><div class="sub"></div></div>
+    <div class="tile" data-key="loss" data-spark="loss_pct"><h3>Loss</h3><div class="value">—</div><div class="sub"></div></div>
+    <div class="tile" data-key="rtt" data-spark="rtt_p50_ms"><h3>RTT</h3><div class="value">—</div><div class="sub"></div></div>
+    <div class="tile" data-key="lag" data-spark="lag_p99_ms"><h3>Loop lag</h3><div class="value">—</div><div class="sub"></div></div>
+  </section>
+
+  <section class="charts">
+    <figure class="panel chart">
+      <figcaption>Bandwidth <span class="legend"><i class="k-in"></i>in <i class="k-out"></i>out</span></figcaption>
+      <svg id="chart-bw" role="img" aria-label="Relay ingress and egress over the last 10 minutes"></svg>
+    </figure>
+    <figure class="panel chart">
+      <figcaption>CPU <span class="legend"><i class="k-host"></i>host <i class="k-proc"></i>relay</span></figcaption>
+      <svg id="chart-cpu" role="img" aria-label="Host and relay CPU over the last 10 minutes"></svg>
+    </figure>
+  </section>
+
+  <section class="panel">
+    <h2>Namespaces</h2>
+    <div class="table-wrap">
+      <table id="t-namespaces">
+        <thead><tr><th>Namespace</th><th>Format</th><th>Origin</th><th class="n">Tracks</th>
+          <th class="n">Subscribers</th><th class="n">In</th><th class="n">Out</th>
+          <th class="n">Delivered</th><th></th></tr></thead>
+        <tbody><tr><td colspan="9" class="empty">No namespaces.</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Tracks</h2>
+    <div class="table-wrap">
+      <table id="t-tracks">
+        <thead><tr><th>Namespace</th><th>Track</th><th>State</th><th class="n">Subscribers</th>
+          <th class="n">Peak</th><th class="n">In</th><th class="n">Out</th><th class="n">Delivered</th>
+          <th class="n">Fetches</th><th class="n">Drops</th><th class="n">Largest</th>
+          <th class="n">Cache</th></tr></thead>
+        <tbody><tr><td colspan="12" class="empty">No tracks.</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Host</h2>
+    <dl class="kv" id="host">
+      <dt>CPU</dt><dd data-host="cpu">—</dd>
+      <dt>System</dt><dd data-host="system">—</dd>
+      <dt>Load</dt><dd data-host="load">—</dd>
+      <dt>Memory</dt><dd data-host="memory">—</dd>
+      <dt>Disk</dt><dd data-host="disk">—</dd>
+      <dt>Network</dt><dd data-host="network">—</dd>
+      <dt>UDP errors</dt><dd data-host="udp">—</dd>
+      <dt>Relay process</dt><dd data-host="process">—</dd>
+    </dl>
+  </section>
+
+  <footer>
+    <a href="/">moqarena</a> · relay: <a href="https://github.com/gmarzot/aiomoqt">aiomoqt</a>
+    <code>moq_interop_relay</code> · A Marz Research Project
+  </footer>
+</main>
+</body>
+</html>
