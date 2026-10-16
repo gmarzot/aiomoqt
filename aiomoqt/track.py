@@ -27,12 +27,12 @@ Usage:
 import asyncio
 import time
 from enum import IntEnum
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Union
 
 from .types import (
     FetchType, MOQTRequestError, ParamType, FilterType,
     ForwardingPreference, GroupOrder, LOC_TIMESTAMP, RequestErrorCode,
-    StreamResetCode, SubscribeDoneCode, SubscribeErrorCode,
+    StreamResetCode, SubscribeDoneCode,
 )
 from .delivery import (
     FanoutDelivery, ObjectHistory, StreamMapping, SubgroupDelivery,
@@ -41,6 +41,7 @@ from .messages import (
     FetchHeader, LocationFilter, MOQTMessage, ObjectDatagram, PublishOk,
     RequestError, RequestOk, RequestUpdate,
 )
+from .messages.base import BUF_SIZE
 from .messages.data import FETCH_FLAGS_END_TIMED_OUT, FETCH_FLAGS_END_UNKNOWN
 from .messages.params import (
     U64_MAX, D20ParamType, LocationFilterType, fill_range,
@@ -66,6 +67,34 @@ def _largest_object_param(session, largest: tuple) -> dict:
     buf.push_uint_var(largest[0])
     buf.push_uint_var(largest[1])
     return {ParamType.LARGEST_OBJECT: buf.data_slice(0, buf.tell())}
+
+
+def _checked_immutable(props) -> Optional[Dict[int, Union[int, bytes]]]:
+    """Immutable Properties as given, refused when they could not be sent
+    as Key-Value-Pairs or would nest Immutable Properties (§12.7)."""
+    if not props:
+        return None
+    props = dict(props)
+    if MOQTMessage.IMMUTABLE_PROPERTIES in props:
+        raise ValueError("Immutable Properties cannot contain Immutable "
+                         "Properties")
+    for ptype, value in props.items():
+        if ptype % 2 == 0:
+            if not isinstance(value, int):
+                raise ValueError(f"property 0x{ptype:x} (even) takes an int")
+            # The varint range every draft can encode.
+            if not 0 <= value < 1 << 62:
+                raise ValueError(f"property 0x{ptype:x} value {value} is "
+                                 f"outside 0..2^62-1")
+        if ptype % 2 == 1:
+            if not isinstance(value, (bytes, bytearray)):
+                raise ValueError(f"property 0x{ptype:x} (odd) takes bytes")
+            props[ptype] = bytes(value)
+    try:
+        MOQTMessage._check_property_ranges(props)
+    except Exception as e:
+        raise ValueError(str(e)) from None
+    return props
 
 
 class TrackState(IntEnum):
@@ -270,6 +299,15 @@ class _SubgroupSender:
         self.track._stream_closed(self.sub)
 
 
+# d18+ SUBGROUP_DELIVERY_TIMEOUT message parameter (§10.2.3).
+SUBGROUP_DELIVERY_TIMEOUT = 0x06
+
+
+def _min_nonzero(a: int, b: int) -> int:
+    """The smaller of two timeouts where 0 means none."""
+    return min(a, b) if a and b else (a or b)
+
+
 class _FetchRefused(Exception):
     """A FETCH this track answers with REQUEST_ERROR."""
 
@@ -287,7 +325,8 @@ class _Subscription:
                  'subscribe_request_id', 'subscribers', 'state', 'forward',
                  'done', 'stream_count', 'generating', 'delivery', 'joining',
                  'window', 'open_streams', 'end_status', 'senders',
-                 'fill_streams', 'fills', 'location_filter', 'group_order')
+                 'fill_streams', 'fills', 'location_filter', 'group_order',
+                 'object_timeout', 'subgroup_timeout')
 
     def __init__(self, session):
         self.session = session
@@ -324,6 +363,22 @@ class _Subscription:
         # The subscription's Location Filter and group order, for fills.
         self.location_filter = None
         self.group_order = None
+        # Subscriber's OBJECT_ and SUBGROUP_DELIVERY_TIMEOUT in ms (§8);
+        # 0 sets none. d14/d16 DELIVERY_TIMEOUT is the object timeout.
+        self.object_timeout = 0
+        self.subgroup_timeout = 0
+
+    def take_timeouts(self, params, prof) -> None:
+        """Record the delivery timeouts a SUBSCRIBE, PUBLISH_OK or
+        REQUEST_UPDATE carries; absent ones keep their value."""
+        if not params:
+            return
+        value = params.get(ParamType.DELIVERY_TIMEOUT)
+        if isinstance(value, int):
+            self.object_timeout = value
+        value = params.get(SUBGROUP_DELIVERY_TIMEOUT)
+        if prof.vi64 and isinstance(value, int):
+            self.subgroup_timeout = value
 
     def passes(self, group_id: int, object_id: int) -> bool:
         """True when the subscription takes this Location: Forward State 1
@@ -371,6 +426,11 @@ class PublishedTrack(Track):
     Per-peer handshake state lives in `_Subscription`, one per peer.
     `track_alias`, `forward`, `state` and the rest address the first
     peer, which is the only one most tracks have.
+
+    `immutable_properties` ({type: int for even types, bytes for odd})
+    travel as the Track's Immutable Properties (0x0B) in PUBLISH,
+    SUBSCRIBE_OK and FETCH_OK from d16, and in the TRACK_STATUS reply from
+    d18; d14 carries no Track Properties.
     """
 
     # Stream mapping for produce() tracks.
@@ -393,10 +453,12 @@ class PublishedTrack(Track):
                  object_size: int = 1024, group_size: int = 60,
                  num_subgroups: int = 1, rate: float = 0,
                  priority: int = 128,
-                 auth_token: Optional[bytes] = b"bench-token",
+                 auth_token: Optional[bytes] = None,
                  forwarding: ForwardingPreference =
                      ForwardingPreference.SUBGROUP,
-                 fetch_history_bytes: int = FETCH_HISTORY_DEFAULT):
+                 fetch_history_bytes: int = FETCH_HISTORY_DEFAULT,
+                 immutable_properties: Optional[
+                     Dict[int, Union[int, bytes]]] = None):
         # Before super(): Track.__init__ assigns track_alias/request_id/
         # state, which are properties over this list.
         self._subs = [_Subscription(session)]
@@ -409,6 +471,7 @@ class PublishedTrack(Track):
         # asks for scheduling behaves exactly as before.
         self.stream_priority = None
         self.auth_token = auth_token
+        self.immutable_properties = _checked_immutable(immutable_properties)
         self._subscriber_event = asyncio.Event()
         # (group_id, object_id) max over all objects sent; None until
         # the first object exists. Drives ContentExists/Largest Location
@@ -519,7 +582,23 @@ class PublishedTrack(Track):
         sub.delivery.passes = sub.passes
         sub.delivery.excludes_end = sub.excludes_end
         self._out.add(sub.delivery,
-                      gate=lambda: sub.forward and sub.generating)
+                      gate=lambda: sub.forward and sub.generating,
+                      deadline=lambda: self._delivery_deadline(sub))
+
+    # Track Property delivery timeouts in ms (§8, §12.1-12.2); 0 sets none.
+    object_delivery_timeout: int = 0
+    subgroup_delivery_timeout: int = 0
+
+    def _delivery_deadline(self, sub) -> Optional[float]:
+        """A peer's object delivery timeout in seconds, None for none:
+        per kind the smaller non-zero of the track's and the
+        subscriber's; datagrams take the smaller of both kinds."""
+        timeout = _min_nonzero(self.object_delivery_timeout,
+                               sub.object_timeout)
+        if self.mapping is StreamMapping.DATAGRAM:
+            timeout = _min_nonzero(timeout, _min_nonzero(
+                self.subgroup_delivery_timeout, sub.subgroup_timeout))
+        return timeout / 1000 if timeout else None
 
     def _ensure_production(self) -> asyncio.Future:
         if self._production is None:
@@ -676,6 +755,17 @@ class PublishedTrack(Track):
         """FanoutDelivery.on_sent: a produce() object reached one peer's
         stream or datagram. A hook for subclasses."""
 
+    def _track_properties(self, session) -> Optional[Dict[int, bytes]]:
+        """The Track Properties this track's replies carry on `session`."""
+        if not (self.immutable_properties
+                and session._profile.track_properties):
+            return None
+        buf = Buffer(capacity=BUF_SIZE, vi64=session._profile.vi64)
+        MOQTMessage._extensions_encode(buf, self.immutable_properties,
+                                       with_length=False, delta=True)
+        return {MOQTMessage.IMMUTABLE_PROPERTIES:
+                buf.data_slice(0, buf.tell())}
+
     def attach(self, session=None) -> None:
         """Serve this track on a session without announcing it:
         SUBSCRIBEs for its full name, and replies and updates for its
@@ -738,6 +828,7 @@ class PublishedTrack(Track):
                 track_name=self.trackname,
                 forward=forward,
                 largest=self._largest,
+                track_properties=self._track_properties(sess),
             )
             # From d20 a SUBSCRIBE_TRACKS the PUBLISH answers sets it.
             forward = pub_msg.forward
@@ -849,6 +940,7 @@ class PublishedTrack(Track):
         off the generator); forward=0 pauses object emission."""
         sub = self._sub_for(session)
         logger.info(f"Track: PUBLISH_OK: forward={msg.forward}")
+        sub.take_timeouts(getattr(msg, 'parameters', None), session._profile)
         self._set_forward(sub, msg.forward)
         if sub.forward:
             await self._start_generating(session, "PUBLISH_OK")
@@ -867,6 +959,8 @@ class PublishedTrack(Track):
             forward = (reply.parameters or {}).get(ParamType.FORWARD) \
                 if hasattr(reply, 'parameters') else None
         logger.info(f"Track: PUBLISH_OK (REQUEST_OK): forward={forward}")
+        sub.take_timeouts(getattr(reply, 'parameters', None),
+                          sub.session._profile)
         self._set_forward(sub, forward)
         if sub.forward:
             await self._start_generating(sub.session, "PUBLISH_OK")
@@ -875,6 +969,7 @@ class PublishedTrack(Track):
         """REQUEST_UPDATE — subscriber changes forward state."""
         sub = self._sub_for(session)
         logger.info(f"Track: REQUEST_UPDATE: {msg}")
+        sub.take_timeouts(msg.parameters, session._profile)
         forward = (msg.parameters.get(ParamType.FORWARD)
                    if msg.parameters else None)
         raw_filter = (msg.parameters.get(ParamType.SUBSCRIPTION_FILTER)
@@ -925,10 +1020,8 @@ class PublishedTrack(Track):
                 and window[1] is not None and reported is not None
                 and reported[0] > window[1]):
             # §5.1.2: the whole End Group is already published.
-            code = (RequestErrorCode.INVALID_RANGE
-                    if is_draft16_or_later(session.negotiated_draft)
-                    else SubscribeErrorCode.INVALID_RANGE)
-            session.subscribe_error(msg.request_id, error_code=int(code),
+            session.subscribe_error(msg.request_id,
+                                    error_code=RequestErrorCode.INVALID_RANGE,
                                     reason="end group already published")
             return
         kw = {}
@@ -936,7 +1029,9 @@ class PublishedTrack(Track):
             kw = dict(content_exists=1,
                       largest_group_id=reported[0],
                       largest_object_id=reported[1])
-        ok = session.subscribe_ok(request_msg=msg, **kw)
+        ok = session.subscribe_ok(
+            request_msg=msg, track_properties=self._track_properties(session),
+            **kw)
         if sub.done:
             session.subscribe_done(msg.request_id,
                                    status_code=SubscribeDoneCode.TRACK_ENDED,
@@ -955,6 +1050,7 @@ class PublishedTrack(Track):
         sub.window = window
         sub.location_filter = getattr(msg, 'location_filter', None)
         sub.group_order = getattr(msg, 'group_order', None)
+        sub.take_timeouts(getattr(msg, 'parameters', None), session._profile)
         self._set_forward(sub, getattr(msg, 'forward', None))
         self._start_fill(session, sub, msg, reported)
         if sub.forward:
@@ -1029,7 +1125,9 @@ class PublishedTrack(Track):
                   else _largest_object_param(session, self._largest))
         session._send_reply(msg.request_id,
                             RequestOk(request_id=msg.request_id,
-                                      parameters=params), fin=True)
+                                      parameters=params,
+                                      track_properties=self._track_properties(
+                                          session)), fin=True)
 
     def _fetch_range(self, session, msg):
         """Resolve a FETCH to (start, last, end): the first and last
@@ -1098,7 +1196,7 @@ class PublishedTrack(Track):
                                     "start after the joining location")
         except _FetchRefused as e:
             logger.info(f"Track: FETCH {rid} refused: {e.reason}")
-            session.fetch_error(request_id=rid, error_code=int(e.code),
+            session.fetch_error(request_id=rid, error_code=e.code,
                                 reason=e.reason)
             return
         order = (GroupOrder.DESCENDING
@@ -1116,7 +1214,8 @@ class PublishedTrack(Track):
         ended = self._done and last == self._largest
         session.fetch_ok(request_id=rid, end_of_track=int(ended),
                          largest_group_id=end[0], largest_object_id=end[1],
-                         group_order=int(order))
+                         group_order=int(order),
+                         track_extensions=self._track_properties(session))
         # §5.2: a cancelled FETCH resets its data stream.
         task = asyncio.current_task()
         session.register_request_cancel_handler(rid, lambda _: task.cancel())

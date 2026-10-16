@@ -61,8 +61,24 @@ class TestPublishedTrack:
         session = MagicMock()
         t = PublishedTrack(session, "bench", "track")
         assert t.priority == 128
-        assert t.auth_token == b"bench-token"
+        assert t.auth_token is None
         assert t._generating is False
+
+    async def test_default_announce_carries_no_auth_token(self):
+        from aiomoqt.media.loc import LocTrackPublisher
+        from aiomoqt.tools import pub_bench
+        for cls in (PublishedTrack, LocTrackPublisher):
+            session = MagicMock()
+            session.publish_namespace = AsyncMock()
+            t = cls(session, "bench", "track")
+            await t.publish(announce_namespace=True, publish_track=False)
+            assert session.publish_namespace.await_args.kwargs["parameters"] == {}
+        import sys
+        argv, sys.argv = sys.argv, ["pub_bench", "moqt://h:4433"]
+        try:
+            assert not pub_bench.parse_args().auth_token
+        finally:
+            sys.argv = argv
 
     def test_init_custom_priority(self):
         session = MagicMock()
@@ -102,7 +118,7 @@ class TestPublishedTrack:
             session.publish_namespace.assert_not_called()
             session.publish.assert_called_once_with(
                 namespace="bench", track_name="track", forward=0,
-                largest=None)
+                largest=None, track_properties=None)
             assert t.state == TrackState.PUBLISHED
         asyncio.run(_test())
 

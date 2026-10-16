@@ -36,6 +36,7 @@ from aiomoqt.server import MOQTServer
 from aiomoqt.track import PublishedTrack, SubscribedTrack
 from aiomoqt.types import (FilterType, MOQTMessageType, ObjectStatus,
                            parse_draft_spec)
+from aiomoqt.utils.cli import endpoint_url
 from aiomoqt.utils.format import fmt_bps, fmt_ms
 from aiomoqt.utils.stats import send_time_us
 from aiomoqt.utils.logger import set_log_level
@@ -1487,6 +1488,7 @@ def parse_args():
                           dest="pub_both",
                           help="publish via PUB_NS+PUBLISH (moqx/moq-rs default)")
     p.add_argument("relay_url", metavar="URL", nargs="?", default=None,
+                   type=endpoint_url,
                    help="Relay URL — moqt://host[:port] = raw QUIC, "
                         "https://host[:port][/path] = WebTransport. "
                         "Omit for the self-hosted loopback self-test.")

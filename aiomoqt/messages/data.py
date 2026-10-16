@@ -15,7 +15,8 @@ from . import (MOQTUnderflow, MOQTMessage, ObjectStatus, DataStreamType,
                SUBGROUP_HEADER_BASE, SUBGROUP_ID_ZERO, SUBGROUP_ID_FIRST_OBJ, SUBGROUP_ID_EXPLICIT,
                OBJECT_DATAGRAM_BASE, OBJECT_DATAGRAM_STATUS_BASE)
 from ..context import is_draft16_or_later, DraftProfile
-from ..types import MOQTProtocolViolation
+from ..types import (MOQTProtocolViolation, PADDING_DATAGRAM_TYPE,
+                     PADDING_STREAM_TYPE)
 from ..utils.buffer import Buffer, BufferReadError
 from ..utils.logger import get_logger
 from aiopquic._binding._streamchain import (
@@ -23,6 +24,19 @@ from aiopquic._binding._streamchain import (
 
 logger = get_logger(__name__)
 
+
+
+def encode_padding(size: int, *, prof: DraftProfile,
+                   datagram: bool = False) -> bytes:
+    """A PADDING stream or datagram (§11.5): its type, then `size` zero
+    bytes."""
+    if not prof.padding:
+        raise ValueError(f"no PADDING at draft-{prof.draft}")
+    if size < 0:
+        raise ValueError(f"padding size {size} is negative")
+    buf = Buffer(capacity=16, vi64=prof.vi64)
+    buf.push_vint(PADDING_DATAGRAM_TYPE if datagram else PADDING_STREAM_TYPE)
+    return buf.data + bytes(size)
 
 
 @dataclass(slots=True)

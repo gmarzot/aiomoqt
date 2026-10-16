@@ -1002,11 +1002,8 @@ class _DataPublisher:
         matches = (tuple(_as_bytes(f) for f in msg.track_namespace) == self.namespace
                    and _as_bytes(msg.track_name) == self.track_name)
         if not matches or self.request is not None:
-            code = (RequestErrorCode.DOES_NOT_EXIST
-                    if is_draft16_or_later(session.negotiated_draft)
-                    else SubscribeErrorCode.TRACK_DOES_NOT_EXIST)
             session.subscribe_error(request_id=msg.request_id,
-                                    error_code=int(code),
+                                    error_code=RequestErrorCode.DOES_NOT_EXIST,
                                     reason="track does not exist")
             return
         ok = session.subscribe_ok(request_msg=msg)
@@ -1490,13 +1487,8 @@ async def run_tests(tests: list[str], host: str, port: int, path: str,
     # own announce slot.
     global INTEROP_NAMESPACE
     base_namespace = INTEROP_NAMESPACE
-    # Auto-draft fallback (raw QUIC + WebTransport): probe the auto offer
-    # once; if SETUP fails, pin draft-14 so a draft-14-only relay that
-    # refuses the multi-version offer (moq-rs / xquic) — over raw QUIC by
-    # rejecting the ALPN, or over WT by stalling the d16 SETUP — still
-    # negotiates draft-14 instead of failing every case. Explicit --draft
-    # is untouched; the probe is a no-op against relays that negotiate
-    # auto cleanly (it just adds one connect).
+    # A draft list is a preference order: pin the first draft whose
+    # single-ALPN SETUP completes. An int pins strictly.
     effective_draft = supported_drafts
     if isinstance(supported_drafts, (list, tuple)):
         # Preference-ordered probe (e.g. --draft 18,16,14 / DRAFT=18,16,14):
@@ -1515,11 +1507,6 @@ async def run_tests(tests: list[str], host: str, port: int, path: str,
             reporter.notes.append(
                 "preference probe: no offered draft reached SETUP; "
                 f"trying draft-{effective_draft}")
-    elif supported_drafts is None and not await _probe_setup_ok(
-            host, port, path, use_quic, tls_disable_verify, debug):
-        effective_draft = 14
-        reporter.notes.append(
-            "auto multi-version handshake failed; pinned draft-14")
     for test_name in tests:
         fn = TEST_FUNCTIONS.get(test_name)
         if fn is None:

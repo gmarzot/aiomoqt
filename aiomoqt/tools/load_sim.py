@@ -64,6 +64,7 @@ from typing import Any, Dict, List
 from aiomoqt.client import MOQTClient
 from aiomoqt.track import SubscribedTrack, TrackState
 from aiomoqt.types import FilterType
+from aiomoqt.utils.cli import endpoint_url
 from aiomoqt.utils.url import parse_relay_url
 from aiomoqt.utils.format import fmt_bps
 from aiomoqt.utils.stats import TrackStats
@@ -622,6 +623,7 @@ def parse_args(argv=None):
         description="aiomoqt load_sim — MoQT load simulator "
                     "(namespaces x tracks x churning audience)")
     p.add_argument("url", metavar="URL", nargs="?", default=None,
+                   type=endpoint_url,
                    help="Relay URL — overrides the scenario's 'relay'. "
                         "moqt://host[:port] = raw QUIC; "
                         "https://host[:port][/path] = WebTransport.")

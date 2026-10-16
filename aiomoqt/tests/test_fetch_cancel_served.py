@@ -58,13 +58,19 @@ async def test_fetch_cancel_resets_the_served_stream(draft, use_quic):
     served = {}
     async with _loopback(_port(draft, use_quic), draft, use_quic,
                          served) as session:
-        fetches = {name: session.fetch("ns", name, start_group=0,
-                                       start_object=0, end_group=0,
-                                       end_object=2)
+        got_video = asyncio.Event()
+        fetches = {name: session.fetch(
+                       "ns", name, start_group=0, start_object=0,
+                       end_group=0, end_object=2,
+                       on_object=(lambda *_: got_video.set())
+                       if name == "video" else None)
                    for name in _TRACKS}
         async with asyncio.timeout(2.0):
             while not all(n in served for n in _TRACKS):
                 await asyncio.sleep(0.01)
+            # The cancel must land on a stream the client already reads.
+            await got_video.wait()
+        assert fetches["video"].request_id in session._fetch_stream_by_request
         session.send_control_message(
             FetchCancel(request_id=fetches["video"].request_id))
         video = fetches["video"].request_id

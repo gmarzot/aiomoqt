@@ -186,12 +186,13 @@ class MOQTMessage:
     @staticmethod
     def _check_track_properties(props: Optional[Dict[int, Any]], *,
                                 prof: 'DraftProfile') -> None:
-        """d18 Track Properties (§12.5-12.7): the restricted values, also
-        inside Immutable Properties, whose Key-Value-Pairs must parse and
-        hold no Immutable Properties of their own. Unknown types pass."""
+        """d16+ Track Properties (d18 §12.5-12.7): the restricted values,
+        also inside Immutable Properties, whose Key-Value-Pairs must parse
+        and hold no Immutable Properties of their own. Unknown types pass."""
         if not props:
             return
         MOQTMessage._check_property_ranges(props)
+        MOQTMessage._check_delivery_timeout(props, prof)
         inner = props.get(MOQTMessage.IMMUTABLE_PROPERTIES)
         if inner is None:
             return
@@ -201,7 +202,7 @@ class MOQTMessage:
         try:
             nested = MOQTMessage._extensions_decode(
                 Buffer(data=raw, vi64=prof.vi64), with_length=False,
-                buf_end=len(raw), delta=True) or {}
+                buf_end=len(raw), delta=True, lenient=False) or {}
         except (BufferReadError, MOQTUnderflow, RuntimeError,
                 ValueError) as e:
             raise MOQTProtocolViolation(
@@ -210,6 +211,15 @@ class MOQTMessage:
             raise MOQTProtocolViolation(
                 "Immutable Properties inside Immutable Properties")
         MOQTMessage._check_property_ranges(nested)
+        MOQTMessage._check_delivery_timeout(nested, prof)
+
+    @staticmethod
+    def _check_delivery_timeout(values: Dict[int, Any],
+                                prof: 'DraftProfile') -> None:
+        """d16 §9.2.2.2, §11.1: a DELIVERY_TIMEOUT of 0 is a violation."""
+        if (prof.zero_delivery_timeout_closes
+                and values.get(ParamType.DELIVERY_TIMEOUT) == 0):
+            raise MOQTProtocolViolation("DELIVERY_TIMEOUT of 0")
 
     @staticmethod
     def _check_property_ranges(props: Dict[int, Any]) -> None:
@@ -275,7 +285,8 @@ class MOQTMessage:
     @staticmethod
     def _extensions_decode(buf: Buffer, with_length: bool = True,
                            buf_end: Optional[int] = None,
-                           delta: bool = False) -> Optional[Dict[int, Union[int, bytes]]]:
+                           delta: bool = False,
+                           lenient: bool = True) -> Optional[Dict[int, Union[int, bytes]]]:
         # Two framing modes:
         #   with_length=True  — Object Extensions (§10.2.1.2): the
         #     extensions block is `{ Length, Headers }`. Bound is
@@ -366,7 +377,8 @@ class MOQTMessage:
                     value_len = buf.pull_vint()
                     ext_value = buf.pull_bytes(value_len)
             except (BufferReadError, MOQTUnderflow):
-                if with_length:
+                # lenient=False: no truncation tolerance (nested blocks).
+                if with_length or not lenient:
                     raise
                 # Trailing extensions block on a control message is
                 # truncated: the peer's wire-level msg_len declares
@@ -526,7 +538,8 @@ class MOQTMessage:
                 # Parameters dict - special formatting
                 str_val = self._format_parameters(value, class_name(self))
                 
-            elif isinstance(value, (list, tuple)) and value and isinstance(value[0], bytes):
+            elif (isinstance(value, (list, tuple)) and value
+                  and all(isinstance(v, bytes) for v in value)):
                 # Namespace tuple - decode each part
                 items = [self._format_bytes(item, prefer_text=True) for item in value]
                 str_val = "[" + ", ".join(items) + "]"
@@ -995,6 +1008,9 @@ class MOQTMessage:
                 raise MOQTProtocolViolation(
                     f"parameter overran frame extent: "
                     f"{buf.tell()}/{buf_end}")
+            if scope is not None and param_type == ParamType.DELIVERY_TIMEOUT:
+                MOQTMessage._check_delivery_timeout(
+                    {param_type: param_value}, prof)
             bounds = MOQTMessage.PARAM_VALUE_RANGES.get(param_type)
             if bounds is None and d20:
                 bounds = VALUE_RANGES.get(param_type)

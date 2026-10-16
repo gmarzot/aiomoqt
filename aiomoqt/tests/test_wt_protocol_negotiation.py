@@ -5,9 +5,10 @@ server's `supported_drafts` order.
 """
 import asyncio
 
-import aiopquic
 import pytest
-from packaging.version import Version
+from aiopquic.asyncio.webtransport import (
+    connect_webtransport, serve_webtransport,
+)
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
@@ -20,10 +21,46 @@ _BASE_PORT = 16900
 _SERVER_DRAFTS = [22, 20, 18, 16, 14]
 _ASCENDING = [14, 16, 18, 20, 22]
 
-requires_wt_server_order = pytest.mark.skipif(
-    Version(aiopquic.__version__) <= Version("0.5.0a4"),
-    reason="aiopquic <= 0.5.0a4 selects the WT-Protocol by client order "
-           "and accepts an offer with no match")
+_PROBE_PORT = _BASE_PORT + 7
+_probed = {}
+
+
+async def _aiopquic_wt_selection():
+    """What this aiopquic's WT-Protocol selection does, found by asking it:
+    (picks by server order, refuses an offer with no match)."""
+    if not _probed:
+        async def handler(session):
+            pass
+
+        server = await serve_webtransport(
+            "localhost", _PROBE_PORT, "/", handler=handler, cert_file=CERT,
+            key_file=KEY, wt_supported_protocols=["p-b", "p-a"])
+        try:
+            async with connect_webtransport(
+                    "localhost", _PROBE_PORT, "/", verify_peer=False,
+                    wt_available_protocols=["p-a", "p-b"]) as wt:
+                _probed["server_order"] = wt.negotiated_protocol == "p-b"
+            try:
+                async with connect_webtransport(
+                        "localhost", _PROBE_PORT, "/", verify_peer=False,
+                        wt_available_protocols=["p-c"], timeout=5.0):
+                    _probed["refuses"] = False
+            except Exception:
+                _probed["refuses"] = True
+        finally:
+            await server.aclose()
+    return _probed["server_order"], _probed["refuses"]
+
+
+@pytest.fixture
+async def wt_server_order():
+    server_order, refuses = await _aiopquic_wt_selection()
+    if not (server_order and refuses):
+        pytest.skip("aiopquic selects the WT-Protocol by client order or "
+                    "accepts an offer with no match")
+
+
+requires_wt_server_order = pytest.mark.usefixtures("wt_server_order")
 
 
 async def _start(port, drafts, *, use_quic=True, dual=False):
