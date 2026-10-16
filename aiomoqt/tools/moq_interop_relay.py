@@ -54,6 +54,8 @@ import itertools
 import logging
 import os
 import sys
+import time
+from collections import Counter
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
@@ -71,8 +73,11 @@ from aiomoqt.messages.fetch import _is_joining
 from aiomoqt.messages.request import RequestError, RequestOk
 from aiomoqt.messages.subscribe import Subscribe
 from aiomoqt.track import (PublishedTrack, SubscribedTrack, _UNFILTERED,
-                           _filter_window, _largest_object_param)
+                           _filter_window, _largest_object_param,
+                           _reported_largest)
 from aiomoqt.context import is_draft16_or_later
+from aiomoqt.tools import relay_status
+from aiomoqt.utils.buffer import Buffer
 from aiomoqt.utils.logger import set_log_level, get_logger
 from aiomoqt.utils.url import parse_relay_url
 
@@ -124,13 +129,24 @@ UPSTREAM_WAIT_S = 3.0
 RENDEZVOUS_TIMEOUT = 0x04
 # Longest a SUBSCRIBE is held for a publisher, whatever it asks for.
 RENDEZVOUS_MAX_S = 30.0
-# Watchdog: self-probes failed in a row before exiting, the exit status
-# (EX_SOFTWARE), and the longest one probe may take.
 # Longest a joining FETCH waits for the SUBSCRIBE it names to attach.
 JOINING_WAIT_S = 5.0
+# Watchdog: self-probes failed in a row before exiting, the exit status
+# (EX_SOFTWARE), and the longest one probe may take.
 WATCHDOG_MISSES = 3
 WATCHDOG_EXIT = 70
 WATCHDOG_PROBE_S = 10.0
+# Dashboard (--status-dir): write period, history kept, the longest a
+# catalog probe may take, and the wait before re-probing a namespace
+# that showed no MSF catalog.
+STATUS_INTERVAL_S = 2.0
+STATUS_HISTORY_S = 600
+CATALOG_PROBE_S = 5.0
+CATALOG_RETRY_S = 30.0
+# MSF catalog track name (§5.2.3), and the watchdog's own namespace,
+# kept off the dashboard.
+CATALOG_TRACK = b"catalog"
+WATCHDOG_NS = b"aiomoqt-watchdog"
 
 
 async def _await_upstream(timeout: float = None) -> bool:
@@ -345,6 +361,14 @@ class _RelayedTrack:
         # that never received them or one that never forwarded them.
         self._objects_in = 0
         self._objects_out = 0
+        # Dashboard counters: payload bytes, most subscribers at once,
+        # FETCHes served, subscribers dropped on a failed write.
+        self._bytes_in = 0
+        self._bytes_out = 0
+        self._peak_subs = 0
+        self._fetches = 0
+        self._drops = 0
+        self.created = time.time()
 
     @property
     def finished(self) -> bool:
@@ -485,8 +509,12 @@ class _RelayedTrack:
     def on_object(self, msg, size, ts, group_id, subgroup_id):
         """Upstream delivery callback (sync) — hand off to the drain."""
         self._objects_in += 1
+        payload = bytes(msg.payload)
+        self._bytes_in += len(payload)
         gid = getattr(msg, "group_id", None)
         gid = gid if gid is not None else group_id
+        if self.key[1] == CATALOG_TRACK and msg.object_id == 0:
+            _note_catalog(self.key[0], payload)
         # On arrival, so a SUBSCRIBE sees it; objects for the subscriber
         # still attaching are its own and count once drained.
         if not self.attaching:
@@ -510,7 +538,7 @@ class _RelayedTrack:
                 self._opened.add(key)
         self.queue.put_nowait(
             (gid, subgroup_id or 0, msg.object_id,
-             bytes(msg.payload), msg.extensions or None,
+             payload, msg.extensions or None,
              128 if prio is None else prio,
              getattr(msg, "status", None),
              shape))
@@ -533,6 +561,7 @@ class _RelayedTrack:
             # A joining FETCH from this subscriber backfills to here.
             d.joined_at = self.largest
         self.downstream.append(d)
+        self._peak_subs = max(self._peak_subs, len(self.downstream))
         if replay:
             d.replaying = True
             self.queue.put_nowait((None, None, None, None, None, None,
@@ -585,12 +614,14 @@ class _RelayedTrack:
                         continue
                 try:
                     self._objects_out += 1
+                    self._bytes_out += len(payload or b"")
                     await self._forward_one(
                         d.session, d.alias, gid, sgid, oid, payload, exts,
                         prio, status, shape)
                 except Exception:
                     logger.debug("relay: forward failed, dropping subscriber",
                                  exc_info=True)
+                    self._drops += 1
                     self.drop_session(d.session)
                     continue
                 if (oid is not None and d.window[1] == gid and status in (
@@ -626,6 +657,7 @@ class _RelayedTrack:
         try:
             for gid, sgid, oid, payload, exts, prio, status, shape in objs:
                 self._objects_out += 1
+                self._bytes_out += len(payload or b"")
                 await self._forward_one(d.session, d.alias, gid, sgid, oid,
                                         payload, exts, prio, status, shape)
             for gid, sgid in sorted({(c[0], c[1]) for c in objs}):
@@ -635,6 +667,7 @@ class _RelayedTrack:
         except Exception:
             logger.debug("relay: replay failed, dropping subscriber",
                          exc_info=True)
+            self._drops += 1
             self.drop_session(d.session)
             return
         logger.info(f"relay: replayed {len(objs)} cached object(s) of "
@@ -743,9 +776,12 @@ class _RelayedTrack:
 
 
 _watched: set = set()
+# id(session) -> {"session", "since", "ns"}: when the dashboard first saw
+# it and the namespaces it has used.
+_sessions: dict[int, dict] = {}
 
 
-def _watch_session(session) -> None:
+def _watch_session(session, ns=None) -> None:
     """Reap everything a session owns the moment it closes.
 
     Liveness cannot be decided lazily at the next request: a second
@@ -753,6 +789,12 @@ def _watch_session(session) -> None:
     observed as closed, and the stale track is then handed to the new
     subscriber, which receives nothing.
     """
+    info = _sessions.get(id(session))
+    if info is None:
+        info = _sessions[id(session)] = {
+            "session": session, "since": time.time(), "ns": set()}
+    if ns is not None:
+        info["ns"].add(tuple(ns))
     if session in _watched:
         return
     _watched.add(session)
@@ -762,6 +804,7 @@ def _watch_session(session) -> None:
             await session.async_closed()
         finally:
             _watched.discard(session)
+            _sessions.pop(id(session), None)
             _forget_session(session)
             logger.debug("relay: session closed, state released")
 
@@ -832,7 +875,7 @@ def _ns_tuple(namespace):
 async def _on_publish_namespace(session, msg):
     """Record the announcing session, ack with default OK path."""
     ns = _ns_tuple(msg.namespace)
-    _watch_session(session)
+    _watch_session(session, ns)
     _supersede_namespace(ns, session)
     holders = _announced.setdefault(ns, {})
     holders[session] = holders.get(session, 0) + 1
@@ -1045,7 +1088,7 @@ async def _on_publish(session, msg):
     if track is None:
         track = _RelayedTrack(key)
         _tracks[key] = track
-    _watch_session(session)
+    _watch_session(session, ns)
     track.pending_publish = (session, msg)
     # §9.4: a bare PUBLISH is the only notice d18 prefix subscribers get
     # that this namespace exists.
@@ -1172,7 +1215,7 @@ def _attach_subscriber(session, msg, track) -> bool:
         track.attaching = False
         track._ensure_drain()
         return False
-    _watch_session(session)
+    _watch_session(session, track.key[0])
     ok = session.subscribe_ok(request_msg=msg, **_largest_kwargs(track))
     # FORWARD omitted means 1 (§10.2.12).
     forward = msg.forward is None or bool(msg.forward)
@@ -1381,6 +1424,11 @@ def parse_args():
                              "(a child process relays one object over "
                              "loopback every SEC seconds). 0 = off "
                              "(default).")
+    parser.add_argument("--status-dir", type=str, default=None, metavar="DIR",
+                        help="Write DIR/status.json every "
+                             f"{STATUS_INTERVAL_S:g}s for the dashboard: "
+                             "namespaces, tracks, subscribers, bandwidth, "
+                             "host metrics. Off by default.")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug logging")
     return parser.parse_args()
@@ -1515,6 +1563,7 @@ async def _on_fetch(session, msg):
     resolved against its subscription and served the same way."""
     # A joining FETCH names no track: both come from its subscription.
     ns, track_name = _ns_tuple(msg.namespace), msg.track_name
+    _watch_session(session, ns or None)
     if _is_joining(msg.fetch_type):
         # §10.12.2: namespace, track and End Location come from the
         # associated subscription, so the backfill is contiguous with it.
@@ -1583,6 +1632,12 @@ async def _on_fetch(session, msg):
                  o.extensions, o.publisher_priority, o.status)
                 for o in upstream]
         end_of_track = int(getattr(up_ok, 'end_of_track', 0) or 0)
+    if track is not None:
+        track._fetches += 1
+    if track_name == CATALOG_TRACK:
+        for o in objs:
+            if o[2] == 0:
+                _note_catalog(ns, o[3])
     order = msg.group_order or GroupOrder.ASCENDING
     last_g, last_o = objs[-1][0], objs[-1][2]
     # §10.13: FETCH_OK End Location is the last Object PLUS 1, and End Of
@@ -1613,7 +1668,7 @@ async def _on_subscribe_namespace(session, msg):
     prefix subscription is answered with a PUBLISH per matching track,
     present and future, which is what those drafts expect."""
     prefix = _ns_tuple(msg.namespace_prefix)
-    _watch_session(session)
+    _watch_session(session, prefix)
     session.subscribe_namespace_ok(
         msg, stream_id=session._bidi_streams.get(msg.request_id))
 
@@ -1688,7 +1743,7 @@ async def _on_subscribe_tracks(session, msg):
     """§9.5: a SUBSCRIBE_TRACKS subscriber gets a PUBLISH for every
     matching track, present and future."""
     prefix = _ns_tuple(msg.namespace_prefix)
-    _watch_session(session)
+    _watch_session(session, prefix)
     session.subscribe_tracks_ok(msg)
 
     def _drop(rid, s=session, r=msg.request_id):
@@ -1709,6 +1764,7 @@ async def _on_track_status(session, msg):
     TRACK_STATUS_OK (REQUEST_OK) for a served track, DOES_NOT_EXIST
     otherwise. The reply rides the request's stream at d18."""
     ns = _ns_tuple(msg.track_namespace)
+    _watch_session(session, ns)
     track = _tracks.get((ns, msg.track_name))
     if track is None or not _track_live(track):
         logger.info(f"relay: track-status ns={ns} track={msg.track_name} "
@@ -1907,6 +1963,331 @@ async def _watchdog(period, host, port, use_quic, draft) -> None:
             os._exit(WATCHDOG_EXIT)
 
 
+# namespace -> [MSF format or None, loop time of the last probe, probe task]
+_catalogs: dict[tuple, list] = {}
+
+
+def _internal_ns(ns) -> bool:
+    """The watchdog's own namespaces."""
+    return bool(ns) and ns[0] == WATCHDOG_NS
+
+
+def _internal_session(info) -> bool:
+    """A session that has used only watchdog namespaces."""
+    return bool(info["ns"]) and all(_internal_ns(n) for n in info["ns"])
+
+
+def _note_catalog(ns, payload) -> None:
+    """Record the MSF format of a catalog object seen for `ns`."""
+    fmt = relay_status.classify_catalog(payload)
+    if fmt is not None:
+        _catalogs.setdefault(ns, [None, None, None])[0] = fmt
+
+
+def _status_largest(reply):
+    """Largest a TRACK_STATUS reply reports: fields at d14, LARGEST_OBJECT
+    from d16 (a varint pair at d16, a Location from d18)."""
+    largest = _reported_largest(reply)
+    if largest is not None:
+        return largest
+    raw = (getattr(reply, "parameters", None) or {}).get(
+        ParamType.LARGEST_OBJECT)
+    if isinstance(raw, (tuple, list)):
+        return tuple(raw)
+    if isinstance(raw, (bytes, bytearray, memoryview)):
+        buf = Buffer(data=bytes(raw))
+        return (buf.pull_uint_var(), buf.pull_uint_var())
+    return None
+
+
+def _catalog_sources(ns) -> list:
+    """Sessions that can answer for `ns`'s catalog: the one that
+    PUBLISHed it, then the namespace's publishers."""
+    out = []
+    track = _tracks.get((ns, CATALOG_TRACK))
+    if track is not None:
+        owner = _upstream_session(track) or (
+            track.pending_publish[0] if track.pending_publish else None)
+        if _session_live(owner):
+            out.append(owner)
+    return out + [p for p in _publishers_for(ns) if p not in out]
+
+
+async def _probe_catalog(ns) -> None:
+    """Ask each source for its newest catalog group, TRACK_STATUS for the
+    Largest then a FETCH of that group, until one yields an MSF format."""
+    for pub in _catalog_sources(ns):
+        got = []
+        try:
+            reply = await asyncio.wait_for(
+                pub.track_status(ns, CATALOG_TRACK, wait_response=True),
+                CATALOG_PROBE_S)
+            largest = _status_largest(reply)
+            if largest is None:
+                continue
+            ok = await asyncio.wait_for(
+                pub.fetch(namespace=ns, track_name=CATALOG_TRACK,
+                          start_group=largest[0], end_group=largest[0],
+                          wait_response=True,
+                          on_object=lambda obj, *_: got.append(obj)),
+                CATALOG_PROBE_S)
+            await pub.await_fetch_done(ok.request_id, timeout=CATALOG_PROBE_S)
+        except Exception as e:
+            logger.debug(f"relay: catalog probe of {ns} failed: {e!r}")
+            continue
+        for obj in got:
+            if obj.object_id == 0:
+                _note_catalog(ns, obj.payload)
+        if _catalogs.get(ns, (None,))[0] is not None:
+            return
+
+
+def _status_namespaces() -> set:
+    """Namespaces on the dashboard: announced, or carrying a track."""
+    return {ns for ns in list(_announced) + [k[0] for k in list(_tracks)]
+            if not _internal_ns(ns)}
+
+
+def _probe_catalogs(now) -> None:
+    """Probe each namespace with no MSF format yet, at most once per
+    CATALOG_RETRY_S, and forget namespaces that have gone."""
+    names = _status_namespaces()
+    for ns in [n for n in _catalogs if n not in names]:
+        task = _catalogs[ns][2]
+        if task is None or task.done():
+            del _catalogs[ns]
+    for ns in names:
+        entry = _catalogs.setdefault(ns, [None, None, None])
+        fmt, last, task = entry
+        if (fmt is not None or (task is not None and not task.done())
+                or (last is not None and now - last < CATALOG_RETRY_S)):
+            continue
+        entry[1] = now
+        entry[2] = asyncio.create_task(_probe_catalog(ns))
+
+
+def _path_quality(session) -> dict:
+    """picoquic path stats for the session's connection; {} when its
+    transport has none."""
+    try:
+        return session._quic.path_quality() or {}
+    except Exception:
+        return {}
+
+
+def _ns_str(ns) -> str:
+    return "/".join(p.decode(errors="replace") for p in ns)
+
+
+def _name_str(name) -> str:
+    return (name.decode(errors="replace") if isinstance(name, bytes)
+            else str(name))
+
+
+def _transport(session) -> str:
+    return "wt" if getattr(session, "_is_wt", False) else "quic"
+
+
+def _draft(session):
+    return getattr(session, "negotiated_draft", None)
+
+
+def _track_owner(track):
+    return _upstream_session(track) or (
+        track.pending_publish[0] if track.pending_publish else None)
+
+
+def _track_state(track, flowing) -> str:
+    if track.finished:
+        return "ended"
+    if track.pending_publish is not None:
+        return "held"
+    if track.parked is not None:
+        return "parked"
+    return "live" if flowing else "idle"
+
+
+_HISTORY_KEYS = ("t", "ingress_bps", "egress_bps", "media_in_bps",
+                 "media_out_bps", "sessions", "subscribers", "tracks",
+                 "loss_pct", "rtt_p50_ms", "lag_p99_ms", "cpu", "proc_cpu",
+                 "proc_rss", "rx_bps", "tx_bps")
+
+
+class _Status:
+    """The dashboard's status.json, rewritten every STATUS_INTERVAL_S."""
+
+    def __init__(self, path: str, relay: dict) -> None:
+        self.path = path
+        self.relay = relay
+        self.host = relay_status.HostSampler()
+        self.lag = relay_status.LoopLag()
+        self.history = relay_status.History(
+            _HISTORY_KEYS, int(STATUS_HISTORY_S / STATUS_INTERVAL_S))
+        # id(track) -> (bytes in, bytes out, drops) at the last sample.
+        self._track_prev: dict[int, tuple] = {}
+        # id(session) -> (bytes sent, bytes received, packets sent, lost).
+        self._quic_prev: dict[int, tuple] = {}
+        self._delivered = 0
+        self._drops = 0
+        self._last = None
+
+    async def run(self) -> None:
+        _background.add(asyncio.create_task(self.lag.run()))
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                now = loop.time()
+                _probe_catalogs(now)
+                relay_status.write_json_atomic(
+                    self.path, self.snapshot(now, time.time()))
+            except Exception:
+                logger.warning("relay: status write failed", exc_info=True)
+            await asyncio.sleep(STATUS_INTERVAL_S)
+
+    def snapshot(self, now: float, wall: float) -> dict:
+        """Relay, totals, namespace, track and session tables, host
+        metrics and history; rates are over the time since the last
+        snapshot, None on the first."""
+        dt = None if self._last is None else now - self._last
+        self._last = now
+
+        def bps(delta):
+            return round(delta * 8 / dt) if dt else None
+
+        pubs, subs = set(), set()
+        tracks, prev = [], {}
+        for key, t in list(_tracks.items()):
+            if _internal_ns(key[0]):
+                continue
+            p_in, p_out, p_drops = self._track_prev.get(id(t), (0, 0, 0))
+            prev[id(t)] = (t._bytes_in, t._bytes_out, t._drops)
+            self._delivered += t._bytes_out - p_out
+            self._drops += t._drops - p_drops
+            owner = _track_owner(t)
+            if owner is not None:
+                pubs.add(id(owner))
+            subs.update(id(d.session) for d in t.downstream)
+            tracks.append((key, {
+                "namespace": _ns_str(key[0]), "name": _name_str(key[1]),
+                "subscribers": len(t.downstream),
+                "forwarding": sum(1 for d in t.downstream if d.forward),
+                "peak": t._peak_subs,
+                "in_bps": bps(t._bytes_in - p_in),
+                "out_bps": bps(t._bytes_out - p_out),
+                "bytes_in": t._bytes_in, "bytes_out": t._bytes_out,
+                "objects_in": t._objects_in, "objects_out": t._objects_out,
+                "fetches": t._fetches, "drops": t._drops,
+                "largest": list(t.largest) if t.largest else None,
+                "cache_groups": len({c[0] for c in t._cache}),
+                "cache_bytes": t._cache_bytes,
+                "state": _track_state(t, t._bytes_in > p_in),
+                "origin": (f"{_transport(owner)} d{_draft(owner)}"
+                           if owner is not None else None),
+                "since": t.created,
+            }))
+        self._track_prev = prev
+
+        spaces = {}
+        for ns in _status_namespaces():
+            holders = [s for s in _announced.get(ns, {}) if _session_live(s)]
+            pubs.update(id(s) for s in holders)
+            entry = _catalogs.get(ns)
+            spaces[ns] = {
+                "namespace": _ns_str(ns), "announced": bool(holders),
+                "origin": (f"{_transport(holders[-1])} d{_draft(holders[-1])}"
+                           if holders else None),
+                "tracks": 0, "subscribers": 0, "in_bps": 0, "out_bps": 0,
+                "bytes_out": 0, "format": entry[0] if entry else None,
+            }
+        for key, row in tracks:
+            sp = spaces.get(key[0])
+            if sp is None:
+                continue
+            sp["tracks"] += 1
+            sp["subscribers"] += row["subscribers"]
+            sp["in_bps"] += row["in_bps"] or 0
+            sp["out_bps"] += row["out_bps"] or 0
+            sp["bytes_out"] += row["bytes_out"]
+            sp["origin"] = sp["origin"] or row["origin"]
+
+        sessions, quic = [], {}
+        tx = rx = sent = lost = 0
+        rtts = []
+        for info in list(_sessions.values()):
+            s = info["session"]
+            if not _session_live(s) or _internal_session(info):
+                continue
+            pq = _path_quality(s)
+            cur = (pq.get("bytes_sent", 0), pq.get("bytes_received", 0),
+                   pq.get("sent", 0), pq.get("lost", 0))
+            last = self._quic_prev.get(id(s))
+            quic[id(s)] = cur
+            d = ([max(0, c - p) for c, p in zip(cur, last)]
+                 if last is not None else [0, 0, 0, 0])
+            tx, rx, sent, lost = tx + d[0], rx + d[1], sent + d[2], lost + d[3]
+            rtt = pq.get("rtt") / 1000 if pq.get("rtt") else None
+            if rtt is not None:
+                rtts.append(rtt)
+            role = "+".join(r for r, ids in (("pub", pubs), ("sub", subs))
+                            if id(s) in ids)
+            sessions.append({
+                "transport": _transport(s), "draft": _draft(s),
+                "role": role or None, "since": info["since"],
+                "rtt_ms": round(rtt, 1) if rtt is not None else None,
+                "tx_bps": bps(d[0]) if last is not None else None,
+                "rx_bps": bps(d[1]) if last is not None else None,
+            })
+        self._quic_prev = quic
+
+        media_in = sum(r["in_bps"] or 0 for _, r in tracks)
+        media_out = sum(r["out_bps"] or 0 for _, r in tracks)
+        lag = self.lag.summary()
+        totals = {
+            "sessions": len(sessions),
+            "by_draft": dict(Counter(f"d{s['draft']}" for s in sessions)),
+            "by_transport": dict(Counter(s["transport"] for s in sessions)),
+            "publishers": sum(1 for s in sessions
+                              if (s["role"] or "").startswith("pub")),
+            "namespaces": len(spaces), "tracks": len(tracks),
+            "subscribers": sum(r["subscribers"] for _, r in tracks),
+            "ingress_bps": bps(rx), "egress_bps": bps(tx),
+            "media_in_bps": media_in, "media_out_bps": media_out,
+            # Share of egress not received upstream ("CDN efficiency").
+            "efficiency": (max(0.0, 1 - media_in / media_out)
+                           if media_out else None),
+            "delivered_bytes": self._delivered, "drops": self._drops,
+            "fetches": sum(r["fetches"] for _, r in tracks),
+            "loss_pct": round(100 * lost / sent, 2) if sent else 0.0,
+            "rtt_p50_ms": relay_status.percentile(rtts, 50),
+            "rtt_p99_ms": relay_status.percentile(rtts, 99),
+            "loop_lag_ms": lag,
+        }
+        host = dict(self.host.static, **self.host.sample(now))
+        self.history.add({
+            "t": round(wall), "ingress_bps": totals["ingress_bps"],
+            "egress_bps": totals["egress_bps"], "media_in_bps": media_in,
+            "media_out_bps": media_out, "sessions": totals["sessions"],
+            "subscribers": totals["subscribers"], "tracks": len(tracks),
+            "loss_pct": totals["loss_pct"], "rtt_p50_ms": totals["rtt_p50_ms"],
+            "lag_p99_ms": lag["p99"], "cpu": host["cpu"],
+            "proc_cpu": host["proc_cpu"], "proc_rss": host["proc_rss"],
+            "rx_bps": host["rx_bps"], "tx_bps": host["tx_bps"],
+        })
+        return {
+            "generated": wall, "interval_s": STATUS_INTERVAL_S,
+            "relay": dict(self.relay,
+                          uptime_s=round(wall - self.relay["started"])),
+            "totals": totals,
+            "namespaces": sorted(spaces.values(),
+                                 key=lambda r: r["namespace"]),
+            "tracks": sorted((r for _, r in tracks),
+                             key=lambda r: (r["namespace"], r["name"])),
+            "sessions": sorted(sessions, key=lambda r: r["since"]),
+            "host": host,
+            "history": self.history.to_json(),
+        }
+
+
 async def main():
     args = parse_args()
     speaks = sorted(int(d) for d in MOQTDraft)
@@ -1974,6 +2355,21 @@ async def main():
         _background.add(asyncio.create_task(_watchdog(
             args.watchdog, host, args.port, args.quic or args.dual,
             args.draft)))
+
+    if args.status_dir:
+        os.makedirs(args.status_dir, exist_ok=True)
+        status = _Status(os.path.join(args.status_dir, "status.json"), {
+            "versions": relay_status.versions(),
+            "drafts": wanted,
+            "port": args.port,
+            "quic_port": args.quic_port,
+            "transports": (["quic", "wt"] if args.dual or args.quic_port
+                           else ["quic"] if args.quic else ["wt"]),
+            "started": time.time(),
+            "watchdog_s": args.watchdog,
+            "cache": {"groups": CACHE_GROUPS, "bytes": CACHE_BYTES},
+        })
+        _background.add(asyncio.create_task(status.run()))
 
     print(
         "=" * 64
