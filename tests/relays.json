@@ -75,14 +75,13 @@
         "raw-quic": "moqt://us-west-2.relay.quicr.org:33437",
         "h3-wt":    "https://us-west-2.relay.quicr.org:33437/relay"
       },
-      "drafts": [16],
-      "gating": [16],
+      "drafts": [18, 20],
       "pub_mode": "publish",
       "insecure": true,
       "compat": ["libquicr"],
       "disabled_suites": [],
       "xfail_suites": ["relay-data"],
-      "notes": "Cisco libquicr (server cert unacceptable → insecure). d14 dropped (raw + WT now unresponsive — relay appears d16-only). compat=libquicr covers two non-spec behaviors, tolerated + annotated: (1) relay returns SUBSCRIBE_OK for a nonexistent track (deferred-delivery policy); (2) relay returns FETCH_ERROR code=0 (INTERNAL_ERROR) for a nonexistent-track FETCH — the fetch probe honors libquicr code=0 as a deliberate refusal (the relay answered structurally in ~85ms; it just uses a poor code), matching how the join probe already accepted its non-spec code=17. Without --compat the fetch probe still fails code=0 by default (0.9.12 stance: 0x0 is not a refusal). relay-data XFAIL: libquicr never forwards PUBLISH_DONE downstream (§10.11), so data-subgroup-basic fails with \"no downstream PUBLISH_DONE\"."
+      "notes": "Cisco libquicr (server cert unacceptable → insecure). d14 and d16 dropped (raw QUIC refuses moqt-16 in TLS; WT answers with no WT-Protocol); d18/d20 non-gating until a clean run. compat=libquicr covers two non-spec behaviors, tolerated + annotated: (1) relay returns SUBSCRIBE_OK for a nonexistent track (deferred-delivery policy); (2) relay returns FETCH_ERROR code=0 (INTERNAL_ERROR) for a nonexistent-track FETCH — the fetch probe honors libquicr code=0 as a deliberate refusal (the relay answered structurally in ~85ms; it just uses a poor code), matching how the join probe already accepted its non-spec code=17. Without --compat the fetch probe still fails code=0 by default (0.9.12 stance: 0x0 is not a refusal). relay-data XFAIL: libquicr never forwards PUBLISH_DONE downstream (§10.11), so data-subgroup-basic fails with \"no downstream PUBLISH_DONE\"."
     },
     {
       "name": "moqtail",
