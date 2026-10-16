@@ -48,3 +48,124 @@ def test_d16_never_emits_the_structure():
                        redirect=(b"", (b"live",), b"a"))
     out = _round_trip(msg, 16)
     assert out.request_id == 7 and out.redirect is None
+
+
+# -- session.redirect() -------------------------------------------------
+
+import asyncio  # noqa: E402
+
+import pytest  # noqa: E402
+
+from aiomoqt.client import MOQTClient  # noqa: E402
+from aiomoqt.messages import SubscribeNamespace  # noqa: E402
+from aiomoqt.server import MOQTServer  # noqa: E402
+from aiomoqt.types import MOQTMessageType, MOQTRequestError  # noqa: E402
+from aiomoqt.tests._certs import CERT, KEY, requires_certs  # noqa: E402
+
+_DRAFTS = [18, 20, 22]
+
+
+@requires_certs
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+@pytest.mark.parametrize("draft", _DRAFTS)
+async def test_namespace_redirect_leaves_track_name_empty(draft, use_quic):
+    """§10.6.1: Track Name MUST be empty for a namespace-scoped request."""
+    port = 16600 + _DRAFTS.index(draft) + (0 if use_quic else 4)
+    refused = []
+
+    async def on_subscribe_namespace(session, msg):
+        with pytest.raises(ValueError):
+            session.redirect(msg, track_name=b"t")
+        session.redirect(msg, namespace=msg.namespace_prefix)
+        refused.append(msg.request_id)
+
+    server = MOQTServer(host="localhost", port=port, certificate=CERT,
+                        private_key=KEY, path="/", use_quic=use_quic,
+                        supported_drafts=draft)
+    server.register_handler(MOQTMessageType.SUBSCRIBE_NAMESPACE,
+                            on_subscribe_namespace)
+    quic_server = await server.serve()
+    try:
+        client = MOQTClient("localhost", port, path="/", use_quic=use_quic,
+                            verify_tls=False, supported_drafts=draft)
+        async with client.connect() as session:
+            await session.client_session_init()
+            for prefix in ("redir/a", "redir/b"):
+                with pytest.raises(MOQTRequestError) as err:
+                    await asyncio.wait_for(session.subscribe_namespace(
+                        prefix, wait_response=True), 5.0)
+                assert err.value.error_code == RequestErrorCode.REDIRECT
+                assert err.value.response.redirect == (
+                    b"", tuple(p.encode() for p in prefix.split("/")), b"")
+    finally:
+        quic_server.close()
+    assert len(refused) == 2
+
+
+def test_redirect_needs_d18():
+    from aiomoqt.protocol import _MOQTSessionMixin
+
+    class _S(_MOQTSessionMixin):
+        def __init__(self):
+            self._profile = profile_for(16)
+
+    with pytest.raises(ValueError):
+        _S().redirect(SubscribeNamespace(request_id=1,
+                                         namespace_prefix=(b"a",)))
+
+
+def test_redirect_wire_with_empty_track_name():
+    prof = profile_for(18)
+    msg = RequestError(error_code=RequestErrorCode.REDIRECT,
+                       reason="", redirect=(b"", (b"ns",), b""))
+    raw = bytes(msg.serialize(prof=prof).data)
+    # type 0x05, length, code 0x34, retry 0, empty reason, empty URI,
+    # one namespace field "ns", empty track name.
+    assert raw == bytes([0x05, 0x00, 0x09, 0x34, 0x00, 0x00, 0x00, 0x01,
+                         0x02]) + b"ns" + bytes([0x00])
+
+
+def test_redirect_prints():
+    msg = RequestError(error_code=RequestErrorCode.REDIRECT, reason="",
+                       redirect=(b"", (b"ns",), b""))
+    assert "redirect=" in str(msg)
+
+
+@requires_certs
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+async def test_pub_bench_redirects_subscribe_namespace(use_quic, monkeypatch):
+    from aiomoqt.tools import pub_bench
+    port = 16610 + (0 if use_quic else 1)
+    replies = []
+
+    async def ask(session):
+        for prefix in ("redir", "redir/x"):
+            try:
+                await asyncio.wait_for(session.subscribe_namespace(
+                    prefix, wait_response=True), 5.0)
+            except MOQTRequestError as e:
+                replies.append((e.error_code, e.response.redirect))
+
+    async def on_publish(session, msg):
+        session.publish_ok(msg, forward=0)
+        asyncio.ensure_future(ask(session))
+
+    server = MOQTServer(host="localhost", port=port, certificate=CERT,
+                        private_key=KEY, path="/", use_quic=use_quic,
+                        supported_drafts=18)
+    server.register_handler(MOQTMessageType.PUBLISH, on_publish)
+    quic_server = await server.serve()
+    url = (f"moqt://localhost:{port}" if use_quic
+           else f"https://localhost:{port}/")
+    monkeypatch.setattr("sys.argv", [
+        "pub_bench", url, "-k", "--draft", "18", "-N", "redir", "-T", "t",
+        "--redirect", "-t", "1", "--no-stats"])
+    try:
+        await pub_bench.run(pub_bench.parse_args())
+    finally:
+        quic_server.close()
+    assert replies == [
+        (RequestErrorCode.REDIRECT, (b"", (b"redir",), b"")),
+        (RequestErrorCode.REDIRECT, (b"", (b"redir", b"x"), b""))]

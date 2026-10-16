@@ -138,6 +138,8 @@ case "$scenario_id" in
         control=(--second-track) ;;
     publish-distinct-content-tracks-in-same-scope)
         control=(--second-track --forward 1) ;;
+    publisher-redirects-subscribe-namespace)
+        control=(--redirect) ;;
     observe-publisher-padding-stream|\
     observe-publisher-padding-datagram)
         control=(--padding 64) ;;

@@ -5023,6 +5023,38 @@ class _MOQTSessionMixin:
             self._send_on_request_stream(msg.request_id, message)
         return message
 
+    def redirect(
+        self,
+        msg: MOQTMessage,
+        namespace: Optional[Tuple[bytes, ...]] = None,
+        track_name: bytes = b"",
+        connect_uri: bytes = b"",
+        reason: str = "redirect",
+    ) -> RequestError:
+        """Refuse a peer's request with REDIRECT (d18+, §10.6.1). Empty
+        namespace and track name retry the same name; an empty
+        connect_uri retries on this session. A namespace-scoped request
+        takes no track name, and only a server sends a connect_uri."""
+        if not self._profile.vi64:
+            raise ValueError(
+                f"REDIRECT needs draft-18 or later, not "
+                f"draft-{self._profile.draft}")
+        if (isinstance(msg, (SubscribeNamespace, PublishNamespace))
+                and track_name):
+            raise ValueError("a namespace-scoped REDIRECT has no track name")
+        if connect_uri and self._is_client:
+            raise ValueError("a client REDIRECT has no Connect URI")
+        message = RequestError(
+            request_id=msg.request_id,
+            error_code=RequestErrorCode.REDIRECT,
+            retry_interval=0,
+            reason=reason,
+            redirect=(connect_uri, tuple(namespace or ()), track_name),
+        )
+        logger.info(f"MOQT send: {message}")
+        self._send_reply(msg.request_id, message, fin=True)
+        return message
+
     def namespace(
         self,
         namespace_suffix: Union[str, Tuple[bytes, ...]] = (),

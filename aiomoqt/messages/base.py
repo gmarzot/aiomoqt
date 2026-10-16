@@ -526,7 +526,8 @@ class MOQTMessage:
                 # Parameters dict - special formatting
                 str_val = self._format_parameters(value, class_name(self))
                 
-            elif isinstance(value, (list, tuple)) and value and isinstance(value[0], bytes):
+            elif (isinstance(value, (list, tuple)) and value
+                  and all(isinstance(v, bytes) for v in value)):
                 # Namespace tuple - decode each part
                 items = [self._format_bytes(item, prefer_text=True) for item in value]
                 str_val = "[" + ", ".join(items) + "]"

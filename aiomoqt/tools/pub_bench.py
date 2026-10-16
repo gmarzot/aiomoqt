@@ -12,7 +12,8 @@ import functools
 import logging
 
 from aiomoqt.client import MOQTClient
-from aiomoqt.types import ForwardingPreference, SetupParamType
+from aiomoqt.types import (ForwardingPreference, MOQTMessageType,
+                           SetupParamType)
 from aiomoqt.track import PublishedTrack, VideoTrack
 from aiomoqt.utils import wait_cond_timeout
 from aiomoqt.utils import cli as _cli
@@ -134,6 +135,9 @@ The URL scheme selects the transport:
                         metavar='SECONDS',
                         help='Send GOAWAY this long after publishing; '
                              'later requests are refused GOING_AWAY')
+    parser.add_argument('--redirect', action='store_true',
+                        help='Answer every SUBSCRIBE_NAMESPACE with REDIRECT '
+                             'to its own prefix on this session (d18+)')
     parser.add_argument('--padding', type=int, default=0, metavar='BYTES',
                         help='After SETUP, send one PADDING stream of BYTES '
                              'zeros, and one PADDING datagram when the '
@@ -224,6 +228,12 @@ async def run(args):
              else args.max_inflight_bytes)}
            if args.max_inflight_bytes is not None else {}),
     )
+
+    if args.redirect:
+        async def _redirect(session, msg):
+            session.redirect(msg, namespace=msg.namespace_prefix)
+        client.register_handler(MOQTMessageType.SUBSCRIBE_NAMESPACE,
+                                _redirect)
 
     print("  Connecting...")
     async with client.connect() as session:
