@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A WebTransport client cancelled while closing still detaches its dispatcher and stops its transport.
 - The wheel no longer ships `aiomoqt/tests`.
 - `AGENTS.md` ships in the package (`aiomoqt/AGENTS.md`; the repo root links to it), refreshed for 0.12.0.
 - `PublishedTrack(immutable_properties=)`: sent as Immutable Properties (0x0B) in PUBLISH, SUBSCRIBE_OK, FETCH_OK and the TRACK_STATUS reply (d16+); `publish()` and `subscribe_ok()` take `track_properties`.
