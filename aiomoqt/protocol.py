@@ -88,10 +88,11 @@ class MOQTStreamReject(Exception):
     _reject_stream(), and end the stream task. This is strictly a
     stream-level rejection — it never closes the session.
     """
-    def __init__(self, error_code: int, reason: str):
+    def __init__(self, error_code: int, reason: str, quiet: bool = False):
         super().__init__(reason)
         self.error_code = error_code
         self.reason = reason
+        self.quiet = quiet  # an expected cancel: log at debug
 
 
 # How far below the largest peer request id a smaller one can still
@@ -1636,7 +1637,8 @@ class _MOQTSessionMixin:
                     stream_id, chain, chain.capacity  # type: ignore[arg-type]
                 )
             except MOQTStreamReject as e:
-                self._reject_stream(stream_id, e.error_code, e.reason)
+                self._reject_stream(stream_id, e.error_code, e.reason,
+                                    quiet=e.quiet)
                 return
             except MOQTUnderflow:
                 chain.rollback()
@@ -1670,7 +1672,7 @@ class _MOQTSessionMixin:
                 )
                 self._reject_stream(
                     stream_id,
-                    SessionCloseCode.PROTOCOL_VIOLATION,
+                    StreamResetCode.INTERNAL_ERROR,
                     f"parse error: {type(e).__name__}",
                 )
                 return
@@ -1796,15 +1798,17 @@ class _MOQTSessionMixin:
                     f"{type(msg_obj).__name__} size: {consumed} bytes"
                 )
 
-    def _reject_stream(self, stream_id: int, error_code: int, reason: str) -> None:
+    def _reject_stream(self, stream_id: int, error_code: int, reason: str,
+                       quiet: bool = False) -> None:
         """Terminate a uni stream at the MoQT layer via STOP_SENDING.
 
         Used for admission failures (unknown request_id/track_alias, stream
         reuse, budget exceeded). Stream-level only — never closes the
         session. Removes any binding table entries for the stream.
         """
-        logger.warning(f"MOQT stream({stream_id}): rejecting: "
-                       f"{reason} (code=0x{error_code:x})")
+        (logger.debug if quiet else logger.warning)(
+            f"MOQT stream({stream_id}): rejecting: "
+            f"{reason} (code=0x{error_code:x})")
         self.stream_stop_sending(stream_id, error_code)
         self._cleanup_stream(stream_id, QuicErrorCode.APPLICATION_ERROR,
                              reset_code=int(error_code))
@@ -1948,13 +1952,13 @@ class _MOQTSessionMixin:
                     header._group_order = int(m.group_order)
         if not is_fetch:
             raise MOQTStreamReject(
-                SessionCloseCode.PROTOCOL_VIOLATION,
+                StreamResetCode.CANCELLED,
                 f"fetch stream for unknown request_id={request_id}")
         if request_id in self._fetch_stream_by_request:
             existing = self._fetch_stream_by_request[request_id]
             if existing != stream_id:
                 raise MOQTStreamReject(
-                    SessionCloseCode.PROTOCOL_VIOLATION,
+                    StreamResetCode.CANCELLED,
                     f"duplicate fetch stream for request_id={request_id} "
                     f"(already bound to stream {existing})")
         self._fetch_stream_by_request[request_id] = stream_id
@@ -2095,7 +2099,8 @@ class _MOQTSessionMixin:
                     msg_header = None
                     self._padding_rx += 1
                     raise MOQTStreamReject(
-                        SessionCloseCode.NO_ERROR, "padding stream drained")
+                        StreamResetCode.CANCELLED, "padding stream drained",
+                        quiet=True)
                 elif is_subgroup:
                     msg_header = SubgroupHeader.deserialize(
                         buf, type_val=stream_type, prof=self._profile)
@@ -2123,7 +2128,7 @@ class _MOQTSessionMixin:
                         f"rejecting (head_hex={anchor})"
                     )
                     raise MOQTStreamReject(
-                        SessionCloseCode.PROTOCOL_VIOLATION,
+                        StreamResetCode.INTERNAL_ERROR,
                         f"stream-type parse failed: {data_type}",
                     )
 
@@ -3179,7 +3184,7 @@ class _MOQTSessionMixin:
         self.stream_write(stream_id, b"", end_stream=True)
 
     def stream_reset(self, stream_id: int,
-                      error_code: int = SessionCloseCode.NO_ERROR) -> None:
+                      error_code: int = StreamResetCode.CANCELLED) -> None:
         """RESET_STREAM. Sender-side abrupt termination — UNSUBSCRIBE,
         FETCH_CANCEL on the publisher, track teardown, error abort.
         Also the canonical reply to a peer's STOP_SENDING. A
@@ -3192,7 +3197,7 @@ class _MOQTSessionMixin:
         self._tx_op(stream_id, 'send', 'reset', error_code)
 
     def stream_stop_sending(self, stream_id: int,
-                             error_code: int = SessionCloseCode.NO_ERROR) -> None:
+                             error_code: int = StreamResetCode.CANCELLED) -> None:
         """STOP_SENDING. Receiver-side request to cancel a peer-owned
         stream — UNSUBSCRIBE on the subscriber, FETCH_CANCEL on the
         subscriber, FETCH_ERROR while the fetch stream is still open."""
@@ -5500,7 +5505,7 @@ class _MOQTSessionMixin:
             return
         for key, sid in list(self._subgroup_stream_by_key.items()):
             if key[0] == track_alias:
-                self.stream_stop_sending(sid, SessionCloseCode.NO_ERROR)
+                self.stream_stop_sending(sid, StreamResetCode.CANCELLED)
                 # Tombstone: bytes already in flight ahead of the
                 # publisher's RESET would otherwise recreate the stream's
                 # state with no parser and fail to parse.
@@ -5704,7 +5709,7 @@ class _MOQTSessionMixin:
             state = self._data_streams.get(stream_id)
             if state is not None:
                 state.key = None
-            self.stream_stop_sending(stream_id, msg.error_code)
+            self.stream_stop_sending(stream_id, StreamResetCode.CANCELLED)
             logger.debug(f"MOQT stream({stream_id}): stop_sending on "
                          f"FETCH_ERROR request_id={msg.request_id}")
         self._resolve_request(msg.request_id, msg)
