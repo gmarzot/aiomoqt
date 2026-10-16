@@ -98,6 +98,9 @@ class DraftProfile:
                                   # A zero Payload Length in a FETCH object is
                                   # followed by an Object Status (moxygen's
                                   # d16/d18 reading); d20 defines none.
+    track_properties: bool = True
+                                  # PUBLISH, SUBSCRIBE_OK and FETCH_OK end
+                                  # with Track Properties; d14 has none.
 
     @property
     def vi64(self) -> bool:
@@ -113,7 +116,8 @@ PROFILES = {
         params_delta_coded=False, varint="rfc9000",
         control_uni_pair=False, reply_has_request_id=True,
         uint8_params=frozenset(),
-        object_statuses=frozenset({0x0, 0x1, 0x3, 0x4})),
+        object_statuses=frozenset({0x0, 0x1, 0x3, 0x4}),
+        track_properties=False),
     MOQTDraft.DRAFT_16: DraftProfile(
         draft=MOQTDraft.DRAFT_16, setup_carries_versions=False,
         params_delta_coded=True, varint="rfc9000",

@@ -102,7 +102,7 @@ class TestPublishedTrack:
             session.publish_namespace.assert_not_called()
             session.publish.assert_called_once_with(
                 namespace="bench", track_name="track", forward=0,
-                largest=None)
+                largest=None, track_properties=None)
             assert t.state == TrackState.PUBLISHED
         asyncio.run(_test())
 

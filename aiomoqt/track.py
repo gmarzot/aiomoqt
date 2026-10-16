@@ -27,7 +27,7 @@ Usage:
 import asyncio
 import time
 from enum import IntEnum
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Union
 
 from .types import (
     FetchType, MOQTRequestError, ParamType, FilterType,
@@ -41,6 +41,7 @@ from .messages import (
     FetchHeader, LocationFilter, MOQTMessage, ObjectDatagram, PublishOk,
     RequestError, RequestOk, RequestUpdate,
 )
+from .messages.base import BUF_SIZE
 from .messages.data import FETCH_FLAGS_END_TIMED_OUT, FETCH_FLAGS_END_UNKNOWN
 from .messages.params import (
     U64_MAX, D20ParamType, LocationFilterType, fill_range,
@@ -66,6 +67,29 @@ def _largest_object_param(session, largest: tuple) -> dict:
     buf.push_uint_var(largest[0])
     buf.push_uint_var(largest[1])
     return {ParamType.LARGEST_OBJECT: buf.data_slice(0, buf.tell())}
+
+
+def _checked_immutable(props) -> Optional[Dict[int, Union[int, bytes]]]:
+    """Immutable Properties as given, refused when they could not be sent
+    as Key-Value-Pairs or would nest Immutable Properties (§12.7)."""
+    if not props:
+        return None
+    props = dict(props)
+    if MOQTMessage.IMMUTABLE_PROPERTIES in props:
+        raise ValueError("Immutable Properties cannot contain Immutable "
+                         "Properties")
+    for ptype, value in props.items():
+        if ptype % 2 == 0 and not isinstance(value, int):
+            raise ValueError(f"property 0x{ptype:x} (even) takes an int")
+        if ptype % 2 == 1:
+            if not isinstance(value, (bytes, bytearray)):
+                raise ValueError(f"property 0x{ptype:x} (odd) takes bytes")
+            props[ptype] = bytes(value)
+    try:
+        MOQTMessage._check_property_ranges(props)
+    except Exception as e:
+        raise ValueError(str(e)) from None
+    return props
 
 
 class TrackState(IntEnum):
@@ -371,6 +395,11 @@ class PublishedTrack(Track):
     Per-peer handshake state lives in `_Subscription`, one per peer.
     `track_alias`, `forward`, `state` and the rest address the first
     peer, which is the only one most tracks have.
+
+    `immutable_properties` ({type: int for even types, bytes for odd})
+    travel as the Track's Immutable Properties (0x0B) in PUBLISH,
+    SUBSCRIBE_OK and FETCH_OK from d16, and in the TRACK_STATUS reply from
+    d18; d14 carries no Track Properties.
     """
 
     # Stream mapping for produce() tracks.
@@ -396,7 +425,9 @@ class PublishedTrack(Track):
                  auth_token: Optional[bytes] = b"bench-token",
                  forwarding: ForwardingPreference =
                      ForwardingPreference.SUBGROUP,
-                 fetch_history_bytes: int = FETCH_HISTORY_DEFAULT):
+                 fetch_history_bytes: int = FETCH_HISTORY_DEFAULT,
+                 immutable_properties: Optional[
+                     Dict[int, Union[int, bytes]]] = None):
         # Before super(): Track.__init__ assigns track_alias/request_id/
         # state, which are properties over this list.
         self._subs = [_Subscription(session)]
@@ -409,6 +440,7 @@ class PublishedTrack(Track):
         # asks for scheduling behaves exactly as before.
         self.stream_priority = None
         self.auth_token = auth_token
+        self.immutable_properties = _checked_immutable(immutable_properties)
         self._subscriber_event = asyncio.Event()
         # (group_id, object_id) max over all objects sent; None until
         # the first object exists. Drives ContentExists/Largest Location
@@ -676,6 +708,17 @@ class PublishedTrack(Track):
         """FanoutDelivery.on_sent: a produce() object reached one peer's
         stream or datagram. A hook for subclasses."""
 
+    def _track_properties(self, session) -> Optional[Dict[int, bytes]]:
+        """The Track Properties this track's replies carry on `session`."""
+        if not (self.immutable_properties
+                and session._profile.track_properties):
+            return None
+        buf = Buffer(capacity=BUF_SIZE, vi64=session._profile.vi64)
+        MOQTMessage._extensions_encode(buf, self.immutable_properties,
+                                       with_length=False, delta=True)
+        return {MOQTMessage.IMMUTABLE_PROPERTIES:
+                buf.data_slice(0, buf.tell())}
+
     def attach(self, session=None) -> None:
         """Serve this track on a session without announcing it:
         SUBSCRIBEs for its full name, and replies and updates for its
@@ -738,6 +781,7 @@ class PublishedTrack(Track):
                 track_name=self.trackname,
                 forward=forward,
                 largest=self._largest,
+                track_properties=self._track_properties(sess),
             )
             # From d20 a SUBSCRIBE_TRACKS the PUBLISH answers sets it.
             forward = pub_msg.forward
@@ -936,7 +980,9 @@ class PublishedTrack(Track):
             kw = dict(content_exists=1,
                       largest_group_id=reported[0],
                       largest_object_id=reported[1])
-        ok = session.subscribe_ok(request_msg=msg, **kw)
+        ok = session.subscribe_ok(
+            request_msg=msg, track_properties=self._track_properties(session),
+            **kw)
         if sub.done:
             session.subscribe_done(msg.request_id,
                                    status_code=SubscribeDoneCode.TRACK_ENDED,
@@ -1029,7 +1075,9 @@ class PublishedTrack(Track):
                   else _largest_object_param(session, self._largest))
         session._send_reply(msg.request_id,
                             RequestOk(request_id=msg.request_id,
-                                      parameters=params), fin=True)
+                                      parameters=params,
+                                      track_properties=self._track_properties(
+                                          session)), fin=True)
 
     def _fetch_range(self, session, msg):
         """Resolve a FETCH to (start, last, end): the first and last
@@ -1116,7 +1164,8 @@ class PublishedTrack(Track):
         ended = self._done and last == self._largest
         session.fetch_ok(request_id=rid, end_of_track=int(ended),
                          largest_group_id=end[0], largest_object_id=end[1],
-                         group_order=int(order))
+                         group_order=int(order),
+                         track_extensions=self._track_properties(session))
         # §5.2: a cancelled FETCH resets its data stream.
         task = asyncio.current_task()
         session.register_request_cancel_handler(rid, lambda _: task.cancel())
