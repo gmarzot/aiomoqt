@@ -4,7 +4,9 @@ import re
 import socket
 import subprocess
 import sys
+import tempfile
 import time
+from pathlib import Path
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
 from aiomoqt.tools.load_sim import (
@@ -59,17 +61,31 @@ def _free_udp_port():
         return s.getsockname()[1]
 
 
+def _wait_listening(log_path, relay, timeout=30.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if "Listening on" in log_path.read_text(errors="replace"):
+            return
+        if relay.poll() is not None:
+            break
+        time.sleep(0.1)
+    raise AssertionError("relay did not start:\n"
+                         + log_path.read_text(errors="replace"))
+
+
 def run_loopback_load_sim(*extra):
     """A short load_sim against the interop relay on loopback; returns
-    (exit code, stdout)."""
+    (exit code, stdout + stderr)."""
     port = _free_udp_port()
-    relay = subprocess.Popen(
-        [sys.executable, "-m", "aiomoqt.tools.moq_interop_relay",
-         "--bind", "127.0.0.1", "--port", str(port), "--quic",
-         "--cert", CERT, "--key", KEY],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    relay_log = Path(tempfile.mkdtemp(prefix="load-sim-relay-")) / "relay.log"
+    with open(relay_log, "w") as log:
+        relay = subprocess.Popen(
+            [sys.executable, "-m", "aiomoqt.tools.moq_interop_relay",
+             "--bind", "127.0.0.1", "--port", str(port), "--quic",
+             "--cert", CERT, "--key", KEY],
+            stdout=subprocess.DEVNULL, stderr=log)
     try:
-        time.sleep(1.5)
+        _wait_listening(relay_log, relay)
         # --pub-ns: PUB_NS alone, no PUBLISH/SUBSCRIBE crossing at the relay.
         proc = subprocess.run(
             [sys.executable, "-m", "aiomoqt.tools.load_sim",
@@ -80,7 +96,7 @@ def run_loopback_load_sim(*extra):
     finally:
         relay.terminate()
         relay.wait(timeout=10)
-    return proc.returncode, proc.stdout
+    return proc.returncode, proc.stdout + proc.stderr
 
 
 @requires_certs
