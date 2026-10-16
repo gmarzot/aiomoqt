@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- `tests/relays.json`: quicr-west moves from d16 (no longer served) to non-gating d18/d20.
+- `tests/relays.json`: quicr-west gates on d18, the only draft it now serves; nokia-d18 stops gating while unreachable.
 - Received Track Properties are validated from d16 (was d18); malformed Immutable Properties close with PROTOCOL_VIOLATION even under `--compat lenient-extensions`.
 - A WebTransport client cancelled while closing still detaches its dispatcher and stops its transport.
 - The wheel no longer ships `aiomoqt/tests`.
