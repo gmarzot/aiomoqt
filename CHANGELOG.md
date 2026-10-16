@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- d14/d16: PATH or AUTHORITY in a server SETUP, or in any SETUP over WebTransport, closes with INVALID_PATH / INVALID_AUTHORITY; `client_session_init` over WT and `server_setup` refuse to send them.
 - d18+: `session.redirect(msg, ...)` refuses a request with REDIRECT; a namespace-scoped request takes no track name. pub_bench `--redirect`. A message holding a Redirect prints.
 - pub_bench `--gaps`: even Group and Object IDs only, each Object with one Prior Group ID Gap or Prior Object ID Gap property.
 - d18+: `session.send_padding(size, datagram=)` sends a PADDING stream (lowest send priority) or datagram of zeros; pub_bench `--padding`.

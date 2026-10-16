@@ -2864,6 +2864,7 @@ class _MOQTSessionMixin:
         Setup message — e.g. {SetupParamType.AUTH_TOKEN: b"..."} for
         session-level auth (Token-wrapped on the wire)."""
 
+        self._check_setup_location(parameters)
         use_quic = not self._is_wt
         _t0 = time.monotonic()
         params = {}
@@ -3385,6 +3386,30 @@ class _MOQTSessionMixin:
 
     _REPLY_CLASSES = (RequestOk, RequestError, SubscribeOk, SubscribeDone,
                       PublishOk, FetchOk, PublishStateNotify)
+
+    _SETUP_LOCATION = ((SetupParamType.PATH, SessionCloseCode.INVALID_PATH),
+                       (SetupParamType.AUTHORITY,
+                        SessionCloseCode.INVALID_AUTHORITY))
+
+    def _refuse_setup_location(self, options: Optional[Dict]) -> bool:
+        """§10.3.1.1-2: PATH and AUTHORITY are client options for native
+        QUIC; from a server, or over WT, they close the session."""
+        if not options or not (self._is_client or self._is_wt):
+            return False
+        for ptype, code in self._SETUP_LOCATION:
+            if ptype in options:
+                self._close_session(
+                    code, f"{ptype.name} option from server or over WT")
+                return True
+        return False
+
+    def _check_setup_location(self, options: Optional[Dict]) -> None:
+        """Refuse to send PATH or AUTHORITY where the peer must close."""
+        if options and (self._is_wt or not self._is_client):
+            for ptype, _ in self._SETUP_LOCATION:
+                if ptype in options:
+                    raise ValueError(
+                        f"{ptype.name} is a client option for native QUIC")
 
     def _implementation_option(self) -> Dict[int, bytes]:
         impl = getattr(getattr(self, '_session', None), 'implementation',
@@ -3940,6 +3965,7 @@ class _MOQTSessionMixin:
         parameters: Optional[Dict[int, bytes]] = None
     ) -> ServerSetup:
         """Send SERVER_SETUP message in response to CLIENT_SETUP."""
+        self._check_setup_location(parameters)
         parameters = {**self._implementation_option(), **(parameters or {})}
         if not self._profile.control_uni_pair:
             self._local_request_max = self.REQUEST_ID_WINDOW
@@ -5315,6 +5341,8 @@ class _MOQTSessionMixin:
                 )
             else:
                 self._settle_draft(selected_draft)
+            if self._refuse_setup_location(msg.parameters):
+                return
             self._ingest_request_limit(msg.parameters)
 
             # indicate moqt session setup is complete
@@ -5345,6 +5373,8 @@ class _MOQTSessionMixin:
             version_ok = (
                 is_draft16_or_later(self.negotiated_draft) or MOQT_VERSION_DRAFT14 in msg.versions
             )
+            if self._refuse_setup_location(msg.parameters):
+                return
             if version_ok:
                 self._ingest_request_limit(msg.parameters)
                 self.server_setup()
@@ -5761,17 +5791,7 @@ class _MOQTSessionMixin:
             return
         self._d18_setup_seen = True
         opts = getattr(msg, 'options', None) or {}
-        # §10.3.1: PATH and AUTHORITY are client-to-server, native-QUIC
-        # only — from a server, or over WebTransport, they close the
-        # session.
-        if SetupParamType.PATH in opts and (self._is_client or self._is_wt):
-            self._close_session(SessionCloseCode.INVALID_PATH,
-                                "PATH option from server or over WT")
-            return
-        if SetupParamType.AUTHORITY in opts and (
-                self._is_client or self._is_wt):
-            self._close_session(SessionCloseCode.INVALID_AUTHORITY,
-                                "AUTHORITY option from server or over WT")
+        if self._refuse_setup_location(opts):
             return
         # Server side has no separate session-init step: bring up our own
         # control write-uni and send SETUP on first receipt of the peer's
