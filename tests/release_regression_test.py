@@ -66,6 +66,8 @@ TIERS = {
                     "loopback-bench-d14-wt", "loopback-bench-d14-quic",
                     "loopback-bench-d16-wt", "loopback-bench-d16-quic",
                     "loopback-bench-d18-wt", "loopback-bench-d18-quic",
+                    "loopback-bench-d20-wt", "loopback-bench-d20-quic",
+                    "loopback-bench-d22-wt", "loopback-bench-d22-quic",
                     # adaptive BW over the multi-process loopback path
                     # (the in-process loopback misses the pub/sub-worker
                     # start path — see the 0.9.10 BW clobber).
@@ -675,7 +677,7 @@ def main() -> int:
             status, detail = _loopback_pub_sub_paced(log_dir)
             record_and_print((status, "loopback-pub-sub-paced", detail,
                               log_dir / "loopback-pub-sub-paced.log"))
-        for draft in (14, 16, 18):
+        for draft in (14, 16, 18, 20, 22):
             for quic in (False, True):
                 suite = f"loopback-bench-d{draft}-{'quic' if quic else 'wt'}"
                 if suite in enabled:

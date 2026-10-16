@@ -260,23 +260,28 @@ class MOQTClient(MOQTPeer):
             await session.open(timeout=10.0)
             yield session
         finally:
+            # Detach and stop run even when the close wait is cancelled.
             try:
-                if not session.session_closed:
-                    session.close(0, b"")
-                    # close() defers the CONNECTION_CLOSE to the next loop
-                    # tick and the network thread transmits it; stop()
-                    # frees that thread, so give the close time to leave.
-                    await asyncio.sleep(0)
-                    await asyncio.wait_for(session.wait_closed(), 0.3)
-            except Exception:
-                pass
-            # Releases the transport's event dispatcher, which otherwise
-            # holds the transport, its rings and its wake fd.
-            try:
-                await session.detach()
-            except Exception:
-                pass
-            try:
-                transport.stop()
-            except Exception:
-                pass
+                try:
+                    if not session.session_closed:
+                        session.close(0, b"")
+                        # A graceful close() queues the WT close next tick.
+                        await asyncio.sleep(0)
+                    # Wait for the connection to go, also after an error
+                    # close: stop() drops a close picoquic has not sent.
+                    await session.aclose(0, b"")
+                except Exception:
+                    pass
+            finally:
+                try:
+                    # Releases the transport's event dispatcher, which
+                    # otherwise holds the transport, its rings and wake fd.
+                    try:
+                        await session.detach()
+                    except Exception:
+                        pass
+                finally:
+                    try:
+                        transport.stop()
+                    except Exception:
+                        pass

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Received Track Properties are validated from d16 (was d18); malformed Immutable Properties close with PROTOCOL_VIOLATION even under `--compat lenient-extensions`.
+- A WebTransport client cancelled while closing still detaches its dispatcher and stops its transport.
+- The wheel no longer ships `aiomoqt/tests`.
+- `AGENTS.md` ships in the package (`aiomoqt/AGENTS.md`; the repo root links to it), refreshed for 0.12.0.
+- `PublishedTrack(immutable_properties=)`: sent as Immutable Properties (0x0B) in PUBLISH, SUBSCRIBE_OK, FETCH_OK and the TRACK_STATUS reply (d16+); `publish()` and `subscribe_ok()` take `track_properties`.
+- `moq_interop_client.run_tests`: removed the unreachable auto-offer draft-14 fallback.
+- Integration tier: loopback-bench draft × transport matrix covers d20 and d22.
+- WebTransport client teardown waits for the connection to close, so an error close (e.g. WT_ALPN_ERROR) is not dropped by the transport stopping.
 - MediaPublisher serves a FETCH from the objects each track published, its FETCH_OK End the end of that range; MediaSubscriber ignores a catalog object older than the one applied.
 - A received GOAWAY is recorded (`goaway_received`) and reported to `on_goaway(msg, request_id)`; no new request is sent after a control-stream GOAWAY. `goaway(request_id=)` sends one on a request stream (d18+).
 - A SUBSCRIBE_OK or PUBLISH reusing the Track Alias of another track's Established subscription closes with DUPLICATE_TRACK_ALIAS; aliases retire when the subscription ends.
