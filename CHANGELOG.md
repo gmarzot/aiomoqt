@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- MediaPublisher serves a FETCH from the objects each track published, its FETCH_OK End the end of that range; MediaSubscriber ignores a catalog object older than the one applied.
 - A received GOAWAY is recorded (`goaway_received`) and reported to `on_goaway(msg, request_id)`; no new request is sent after a control-stream GOAWAY. `goaway(request_id=)` sends one on a request stream (d18+).
 - A SUBSCRIBE_OK or PUBLISH reusing the Track Alias of another track's Established subscription closes with DUPLICATE_TRACK_ALIAS; aliases retire when the subscription ends.
 - d14/d16 FETCH_CANCEL resets the fetch stream we serve and cancels its owner; it no longer touches fetches we receive.
