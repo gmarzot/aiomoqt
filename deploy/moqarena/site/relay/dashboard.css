@@ -33,9 +33,9 @@ code {
   text-transform: uppercase; letter-spacing: .16em;
 }
 .badge-version {
-  background: #c4441f; color: #fff; border-radius: 999px; padding: 4px 14px;
-  font: 700 14px/1.4 "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
-  overflow-wrap: anywhere; box-shadow: 0 0 0 1px rgba(217, 83, 43, .45);
+  background: #1d1a10; color: var(--gold); border: 1.5px solid var(--gold); border-radius: 6px;
+  padding: 3px 12px; font: 700 14px/1.4 "JetBrains Mono", ui-monospace, Menlo, Consolas,
+  monospace; overflow-wrap: anywhere;
 }
 .live { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; color: var(--dim); }
 .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--faint); }
