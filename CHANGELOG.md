@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Requires aiopquic >= 0.5.0rc1.
 - `tests/relays.json`: quicr-west gates on d18, the only draft it now serves; nokia-d18 stops gating while unreachable.
 - d18+: a Redirect naming a track in reply to PUBLISH_NAMESPACE or SUBSCRIBE_NAMESPACE (and SUBSCRIBE_TRACKS from d20) closes with PROTOCOL_VIOLATION.
 - Delivery timeouts (§8) on produce() tracks: per subscription the smaller non-zero of the track's (`object_delivery_timeout`, `subgroup_delivery_timeout`) and the subscriber's; a late object resets its subgroup with DELIVERY_TIMEOUT, no reopen, and a late datagram is dropped. d16 DELIVERY_TIMEOUT of 0 closes with PROTOCOL_VIOLATION.
