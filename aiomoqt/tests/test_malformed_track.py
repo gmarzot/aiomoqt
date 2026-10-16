@@ -24,6 +24,7 @@ EOG, EOT, NORMAL = (ObjectStatus.END_OF_GROUP, ObjectStatus.END_OF_TRACK,
 
 def _stub():
     s = object.__new__(_MOQTSessionMixin)
+    s._tx_updates = {}
     s._data_streams = {}
     s._control_chains = {}
     s._uni_peek_stash = {}

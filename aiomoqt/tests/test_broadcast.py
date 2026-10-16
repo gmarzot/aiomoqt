@@ -126,8 +126,8 @@ async def test_broadcast_round_trip():
 @pytest.mark.asyncio
 async def test_demux_routes_d16_update_and_serves_catalog_fetch():
     # REQUEST_UPDATE references the original request via
-    # existing_request_id; a joining FETCH of the catalog is served
-    # with the current complete catalog on a fetch stream.
+    # existing_request_id; a joining FETCH of the catalog reaches the
+    # catalog track.
     from types import SimpleNamespace
     from aiomoqt.messages import RequestUpdate
     from aiomoqt.context import profile_for
@@ -157,13 +157,16 @@ async def test_demux_routes_d16_update_and_serves_catalog_fetch():
         parameters={}))
     assert routed == [7]
 
-    fetch = SimpleNamespace(track_name=None, joining_request_id=7,
-                            request_id=3)
-    await pub._demux_fetch(session, fetch)
-    assert writes[0] == ('ok', 3)
-    assert writes[1][1] == 42                      # FetchHeader
-    payload = writes[2][2]
-    assert b'"tracks"' in payload and writes[2][3]  # catalog + FIN
+    # A joining FETCH goes to the track its subscription is on.
+    fetched = []
+
+    async def _on_fetch(s, m):
+        fetched.append(m.request_id)
+    pub.catalog_track._on_fetch = _on_fetch
+    pub.catalog_track._sub_for(session).subscribers.add(11)
+    await pub._demux_fetch(session, SimpleNamespace(
+        track_name=None, joining_request_id=11, request_id=3))
+    assert fetched == [3]
 
 
 @pytest.mark.asyncio

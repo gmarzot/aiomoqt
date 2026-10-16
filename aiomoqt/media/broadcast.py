@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 from typing import Callable, Dict, Optional
 
-from ..messages import FetchHeader, FetchObject, SubgroupHeader
+from ..messages import SubgroupHeader
 from ..context import is_draft16_or_later
 from ..track import PublishedTrack, TrackState
 from ..types import (
@@ -116,6 +116,14 @@ class CatalogTrackPublisher(PublishedTrack):
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
+    async def _on_fetch(self, session, msg) -> None:
+        """FETCH from the catalog objects published; before any was, the
+        current catalog stands at (0, 0)."""
+        if self._history is not None and not len(self._history):
+            self._history.add(0, 0, self.catalog.to_json().encode(),
+                              priority=self.priority)
+        await super()._on_fetch(session, msg)
+
     async def _emit_loop(self, session, track_alias: int):
         sub = self._sub_for(session)
         prof = session._profile
@@ -139,10 +147,11 @@ class CatalogTrackPublisher(PublishedTrack):
                     subgroup_id=0, publisher_priority=self.priority,
                     prof=prof)
                 self._next_group += 1
-                session.stream_write(stream_id, header.serialize().data)
+                await session.stream_write_drain(stream_id,
+                                                 header.serialize().data)
             buf = header.next_object(payload=payload)
             await session.stream_write_drain(stream_id, buf.data)
-            self._note_largest(header.group_id, header._last_object_id)
+            self._remember(header.group_id, header._last_object_id, payload)
             self._total_sent += 1
 
         async def _emit_catalog():
@@ -267,28 +276,27 @@ class MediaPublisher:
             await track._on_publish_ok(session, msg)
 
     async def _demux_fetch(self, session, msg) -> None:
-        """Serve a joining/absolute FETCH of the catalog track with the
-        current complete catalog (a joining subscriber's first need,
-        msf-01 §5); other fetches keep the default bare FETCH_OK."""
+        """Route a FETCH to its track, which serves it from the objects it
+        has published; FETCH_OK's End is the end of that range."""
         track = None
         name = msg.track_name
         if name is not None:
             name = name.decode() if isinstance(name, bytes) else name
             track = self._by_name.get(name)
         if track is None and msg.joining_request_id is not None:
-            track = self._track_for_request(msg.joining_request_id)
-        session.fetch_ok(request_id=msg.request_id)
-        if track is not self.catalog_track:
+            track = next(
+                (t for t in self._by_name.values()
+                 if msg.joining_request_id in t._sub_for(session).subscribers),
+                None)
+        if track is None:
+            session.fetch_error(
+                request_id=msg.request_id,
+                error_code=(RequestErrorCode.DOES_NOT_EXIST
+                            if is_draft16_or_later(session.negotiated_draft)
+                            else SubscribeErrorCode.TRACK_DOES_NOT_EXIST),
+                reason="track not published here")
             return
-        sid = await session.open_uni_stream()
-        prof = session._profile
-        session.stream_write(
-            sid,
-            FetchHeader(request_id=msg.request_id).serialize(prof).data)
-        obj = FetchObject(
-            payload=self.catalog_track.catalog.to_json().encode())
-        session.stream_write(sid, obj.serialize(prof=prof).data,
-                             end_stream=True)
+        await track._on_fetch(session, msg)
 
     async def _demux_update(self, session, msg) -> None:
         from ..messages import RequestUpdate
@@ -343,6 +351,9 @@ class MediaSubscriber:
         self.on_catalog = on_catalog
         self.track_filter = track_filter or (lambda t: True)
         self.catalog: Optional[Catalog] = None
+        # Location of the last catalog object applied; the joining FETCH
+        # and the subscription can deliver the same or older ones late.
+        self._catalog_at: Optional[tuple] = None
         self.tracks: Dict[str, LocTrackSubscriber] = {}
         self._have_catalog = asyncio.Event()
 
@@ -414,6 +425,9 @@ class MediaSubscriber:
         # End-of-group / end-of-track markers carry no catalog.
         if getattr(msg, "status", None) not in (None, ObjectStatus.NORMAL):
             return
+        at = (msg.group_id if group_id is None else group_id, msg.object_id)
+        if self._catalog_at is not None and at <= self._catalog_at:
+            return
         try:
             update = Catalog.from_json(bytes(msg.payload).decode())
         except Exception as e:
@@ -427,6 +441,7 @@ class MediaSubscriber:
             self.catalog.apply(update)
         else:
             self.catalog = update
+        self._catalog_at = at
         if self.on_catalog:
             self.on_catalog(self.catalog)
         self._have_catalog.set()

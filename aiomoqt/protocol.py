@@ -201,6 +201,12 @@ class _MOQTSessionMixin:
     _is_wt = False
     # We sent a GOAWAY: every later peer request is refused (§10.4).
     _goaway_sent = False
+    # The peer's control-stream GOAWAY: no new request is sent after it.
+    goaway_received: Optional['GoAway'] = None
+    # Called as on_goaway(msg, request_id) for each GOAWAY received:
+    # request_id None for the session, else the request to migrate. May be
+    # a coroutine function.
+    on_goaway: Optional[Callable] = None
 
     @property
     def _is_client(self) -> bool:
@@ -321,9 +327,9 @@ class _MOQTSessionMixin:
         # through _route_stream_data once the draft is settled.
         self._draft_settled = _pinned is not None
         self._pre_draft_stream_data: Dict[int, Tuple[bytearray, bool]] = {}
-        # d18 REQUEST_UPDATEs we sent and not yet answered, keyed by the
-        # updated request's id: replies ride that request's stream with no
-        # id of their own, in order.
+        # d18 replies ride a request's stream with no id of their own and
+        # answer, in order, the request (None, until its reply) and each
+        # REQUEST_UPDATE we sent on it. Keyed by the request's id.
         self._tx_updates: Dict[int, deque] = {}
         # request id -> (opener class, sent by us), for the d20 rules that
         # depend on the request a REQUEST_UPDATE or reply belongs to.
@@ -664,9 +670,14 @@ class _MOQTSessionMixin:
     _peer_request_limit: Optional[int] = None
     _requests_blocked_sent = False
 
-    def _allocate_request_id(self) -> int:
-        """Next request id. At the peer's MAX_REQUEST_ID (pre-d18) send
+    def _allocate_request_id(self, opener: bool = True) -> int:
+        """Next request id. A new request (`opener`) is refused after the
+        peer's GOAWAY. At the peer's MAX_REQUEST_ID (pre-d18) send
         REQUESTS_BLOCKED once and refuse the request."""
+        if opener and self.goaway_received is not None:
+            raise MOQTRequestError(
+                error_code=int(RequestErrorCode.GOING_AWAY),
+                reason="the peer sent GOAWAY", retry_interval=0)
         limit = self._peer_request_limit
         if limit is not None and self._next_request_id >= limit:
             if not self._requests_blocked_sent:
@@ -930,8 +941,9 @@ class _MOQTSessionMixin:
         return tuple(largest) if isinstance(largest, (tuple, list)) else None
 
     def _check_fetch_ok_end(self, msg: FetchOk) -> None:
-        """d20 §10.14: an End Location before the FETCH's Start closes
-        the session."""
+        """An End Location before the FETCH's Start closes the session
+        (d18 §10.13, d20 §10.14). Before d20 End is the last Object plus
+        1, and Object 0 covers the whole group."""
         sent = next((m for m in self._subscriptions.get(msg.request_id, ())
                      if isinstance(m, Fetch)), None)
         if sent is None:
@@ -943,19 +955,75 @@ class _MOQTSessionMixin:
             start = (sent.start_group or 0, sent.start_object or 0)
         if None in start:
             return  # relative to Largest Object
-        end = (msg.largest_group_id, msg.largest_object_id - 1)
+        if self._profile.fetch_location_filter:
+            end = (msg.largest_group_id, msg.largest_object_id - 1)
+        elif msg.largest_object_id == 0:
+            end = (msg.largest_group_id, float('inf'))
+        else:
+            end = (msg.largest_group_id, msg.largest_object_id)
         if end < start:
             raise MOQTProtocolViolation(
                 f"FETCH_OK End Location {end} before the FETCH's Start "
                 f"{start}")
+
+    # Track Aliases of received tracks with an Established subscription:
+    # alias -> ((namespace, name), request id).
+    _established_aliases: Optional[Dict[int, Tuple[Any, int]]] = None
+
+    @staticmethod
+    def _msg_track(msg) -> Optional[Tuple[tuple, bytes]]:
+        ns = getattr(msg, 'track_namespace', None)
+        if ns is None:
+            ns = getattr(msg, 'namespace', None)
+        name = getattr(msg, 'track_name', None)
+        if ns is None or name is None:
+            return None
+        return (tuple(ns), name)
+
+    def _check_alias(self, alias: int, track, request_id: int) -> None:
+        """§11.1: a Track Alias another track's Established subscription
+        uses closes the session with DUPLICATE_TRACK_ALIAS."""
+        held = (self._established_aliases or {}).get(alias)
+        if (held is not None and held[1] != request_id
+                and None not in (held[0], track) and held[0] != track):
+            raise MOQTException(
+                SessionCloseCode.DUPLICATE_TRACK_ALIAS,
+                f"Track Alias {alias} already in use by request {held[1]}")
+
+    def _establish_alias(self, alias: int, track, request_id: int) -> None:
+        if self._established_aliases is None:
+            self._established_aliases = {}
+        self._established_aliases[alias] = (track, request_id)
+
+    def _retire_alias(self, request_id: int) -> None:
+        """A received track's subscription ended: its alias is free."""
+        held = self._established_aliases
+        if held:
+            for alias in [a for a, v in held.items() if v[1] == request_id]:
+                del held[alias]
+
+    def _retire_published_alias(self, request_id: int) -> None:
+        for alias, rid in list(self._published_aliases.items()):
+            if rid == request_id:
+                del self._published_aliases[alias]
 
     def _route_reply(self, msg) -> None:
         """Act on a reply as it is parsed, ahead of the data streams in
         its batch and of the handler task: SUBSCRIBE_OK binds the
         request's object handler to its alias; an error reply drops what
         the request registered, and a refused PUBLISH_NAMESPACE announces
-        nothing. From d20 a FETCH_OK ending before its Start closes the
-        session, and a reply showing an empty fill range ends the fill."""
+        nothing. A FETCH_OK ending before its Start closes the session;
+        from d20 a reply showing an empty fill range ends the fill."""
+        if isinstance(msg, SubscribeOk) and msg.track_alias is not None:
+            sent = next((m for m in self._subscriptions.get(
+                msg.request_id, ()) if isinstance(m, Subscribe)), None)
+            track = None if sent is None else self._msg_track(sent)
+            self._check_alias(msg.track_alias, track, msg.request_id)
+            self._establish_alias(msg.track_alias, track, msg.request_id)
+        elif (isinstance(msg, Publish)
+              and getattr(msg, 'track_alias', None) is not None):
+            self._check_alias(msg.track_alias, self._msg_track(msg),
+                              msg.request_id)
         if isinstance(msg, SubscribeOk):
             cb = self._pending_object_handlers.pop(msg.request_id, None)
             if cb is not None and msg.track_alias is not None:
@@ -965,10 +1033,10 @@ class _MOQTSessionMixin:
             self._drop_request_routes(rid)
             self._announced.pop(rid, None)
             return
-        if not self._profile.fetch_location_filter:
-            return
         if isinstance(msg, FetchOk):
             self._check_fetch_ok_end(msg)
+        if not self._profile.fetch_location_filter:
+            return
         fill = self._fill_requests.get(getattr(msg, 'request_id', None))
         if fill is not None and fill_range(
                 fill[0], fill[1], self._reply_largest(msg)) is None:
@@ -1009,6 +1077,8 @@ class _MOQTSessionMixin:
         awaiter first; an awaiter nothing answered fails."""
         self._bidi_streams.pop(request_id, None)
         self._subscriptions.pop(request_id, None)
+        self._retire_alias(request_id)
+        self._fail_waiting_updates(request_id, why)
         alias = next((ta for ta, rid in self._track_aliases.items()
                       if rid == request_id), None)
         if alias is not None:
@@ -1029,6 +1099,7 @@ class _MOQTSessionMixin:
         cb = self._request_cancel_handlers.pop(request_id, None)
         self._requests.pop(request_id, None)
         self._peer_requests.pop(request_id, None)
+        self._retire_published_alias(request_id)
         if not replies_pending:
             self._publish_done_handlers.pop(request_id, None)
         logger.info(f"MOQT: request {request_id} cancelled by {why}")
@@ -1203,9 +1274,7 @@ class _MOQTSessionMixin:
                     not self._profile.reply_has_request_id and
                     hasattr(msg, 'request_id')):
                 if getattr(msg, 'request_id', None) is None:
-                    update_id = (self._next_update_reply(request_id)
-                                 if isinstance(msg, (RequestOk, RequestError))
-                                 else None)
+                    update_id = self._next_reply_owner(request_id, msg)
                     msg.request_id = (request_id if update_id is None
                                       else update_id)
                     if isinstance(msg, RequestOk) and prof.param_table >= 20:
@@ -1322,16 +1391,31 @@ class _MOQTSessionMixin:
             )
             raise
 
-    def _next_update_reply(self, request_id: int) -> Optional[int]:
-        """The oldest unanswered REQUEST_UPDATE we sent on `request_id`'s
-        stream, which a REQUEST_OK or REQUEST_ERROR there answers."""
+    def _next_reply_owner(self, request_id: int, msg) -> Optional[int]:
+        """The REQUEST_UPDATE a reply on `request_id`'s stream answers;
+        None when it answers the request itself."""
         pending = self._tx_updates.get(request_id)
         if not pending:
             return None
-        update_id = pending.popleft()
+        if not isinstance(msg, (RequestOk, RequestError)):
+            if pending[0] is not None or not isinstance(
+                    msg, (SubscribeOk, FetchOk)):
+                return None
+        owner = pending.popleft()
         if not pending:
             del self._tx_updates[request_id]
-        return update_id
+        return owner
+
+    def _fail_waiting_updates(self, request_id: int, why: str) -> None:
+        """The request's stream ended: its unanswered updates fail."""
+        for update_id in self._tx_updates.pop(request_id, ()):
+            fut = (self._pending_requests.pop(update_id, None)
+                   if update_id is not None else None)
+            if fut is not None and not fut.done():
+                fut.set_exception(MOQTRequestError(
+                    error_code=int(RequestErrorCode.INTERNAL_ERROR),
+                    reason=f"request stream ended ({why})",
+                    retry_interval=0))
 
     def _check_request_ok_scope(self, msg: RequestOk, request_id: int,
                                 update_id: Optional[int]) -> None:
@@ -1895,19 +1979,8 @@ class _MOQTSessionMixin:
                 f"awaiting control message)")
             self._check_unbound_aliases(header.track_alias)
         # subgroup_id is None in FIRST_OBJ mode — resolved on first object
-        key = (header.track_alias, header.group_id, header.subgroup_id)
         if header.subgroup_id is not None:
-            if key in self._subgroup_stream_by_key:
-                existing = self._subgroup_stream_by_key[key]
-                if existing != stream_id:
-                    raise MOQTStreamReject(
-                        SessionCloseCode.PROTOCOL_VIOLATION,
-                        f"duplicate subgroup stream for {key} "
-                        f"(already bound to stream {existing})")
-            self._subgroup_stream_by_key[key] = stream_id
-            state = self._data_streams.get(stream_id)
-            if state is not None:
-                state.key = ('subgroup', key)
+            self._bind_subgroup_stream(stream_id, header)
 
     # An unbound alias is normal for the moment between the first data
     # stream and the SUBSCRIBE_OK that binds it. It is a DEFECT when it
@@ -1951,14 +2024,22 @@ class _MOQTSessionMixin:
                                   header: 'SubgroupHeader') -> None:
         """Complete FIRST_OBJ-mode subgroup binding once subgroup_id is
         resolved from the first object."""
+        self._bind_subgroup_stream(stream_id, header)
+
+    def _bind_subgroup_stream(self, stream_id: int,
+                              header: 'SubgroupHeader') -> None:
+        """Bind (alias, group, subgroup) to this stream. A subgroup
+        reopened after a reset (§2.2) takes the key from the old stream,
+        whose later end then neither unbinds it nor reports the subgroup
+        ended."""
         key = (header.track_alias, header.group_id, header.subgroup_id)
-        if key in self._subgroup_stream_by_key:
-            existing = self._subgroup_stream_by_key[key]
-            if existing != stream_id:
-                raise MOQTStreamReject(
-                    SessionCloseCode.PROTOCOL_VIOLATION,
-                    f"duplicate subgroup stream for {key} "
-                    f"(already bound to stream {existing})")
+        existing = self._subgroup_stream_by_key.get(key)
+        if existing is not None and existing != stream_id:
+            logger.debug(f"MOQT stream({stream_id}): reopens {key}, "
+                         f"superseding stream {existing}")
+            old = self._data_streams.get(existing)
+            if old is not None:
+                old.key = None
         self._subgroup_stream_by_key[key] = stream_id
         state = self._data_streams.get(stream_id)
         if state is not None:
@@ -2333,6 +2414,12 @@ class _MOQTSessionMixin:
                         f"GOAWAY Request ID {msg.request_id} has the "
                         f"wrong parity")
                     return
+                if is_request_bidi:
+                    self._report_goaway(
+                        msg, self._bidi_stream_requests.get(stream_id))
+                else:
+                    self.goaway_received = msg
+                    self._report_goaway(msg, None)
         if end_stream:
             self._control_chains.pop(stream_id, None)
             # §3.3: the control stream is never closed while the session
@@ -2342,6 +2429,10 @@ class _MOQTSessionMixin:
                     SessionCloseCode.PROTOCOL_VIOLATION,
                     f"peer closed its control stream {stream_id}")
                 return
+            ours = self._bidi_stream_requests.get(stream_id)
+            if is_request_bidi and ours in self._tx_updates:
+                self._loop.call_soon(self._fail_waiting_updates, ours,
+                                     f"FIN (stream {stream_id})")
             if stream_id in self._cancelled_request_streams:
                 self._cancelled_request_streams.discard(stream_id)
                 request_id = self._bidi_stream_requests.pop(stream_id, None)
@@ -2359,6 +2450,20 @@ class _MOQTSessionMixin:
                 del self._peer_requests[request_id]
                 self._loop.call_soon(self._end_cancelled_request,
                                      request_id, stream_id)
+
+    def _report_goaway(self, msg: 'GoAway',
+                       request_id: Optional[int]) -> None:
+        cb = self.on_goaway
+        if cb is None:
+            return
+        try:
+            result = cb(msg, request_id)
+            if asyncio.iscoroutine(result):
+                task = asyncio.ensure_future(result)
+                self._tasks.add(task)
+                task.add_done_callback(self._control_task_done)
+        except Exception:
+            logger.debug("on_goaway raised", exc_info=True)
 
     def _end_cancelled_request(self, request_id: int, stream_id: int) -> None:
         """Tear down a request the peer cancelled with FIN and FIN our
@@ -2903,9 +3008,15 @@ class _MOQTSessionMixin:
         """Write bytes (and optional FIN) to stream_id."""
         if not self._session_writable():
             return
+        if self._tx_deferred and (stream_id, 'send') in self._tx_deferred:
+            return  # the stream's reset or FIN is queued
+        if end_stream:
+            if self._served_fetch_streams:
+                self._forget_served_fetch(stream_id)
+            self._tx_op(stream_id, 'send', 'fin', data)
+            return
         try:
-            self._quic.send_stream_data(
-                stream_id, data, end_stream=end_stream)
+            self._quic.send_stream_data(stream_id, data)
         except (AssertionError, AttributeError, BufferError,
                 WebTransportError) as e:
             logger.debug(f"stream({stream_id}): write race: {e}")
@@ -3036,16 +3147,19 @@ class _MOQTSessionMixin:
             logger.debug(f"stream({stream_id}): write after teardown: {e}")
             raise asyncio.CancelledError() from e
 
+    # Fetch streams serve_fetch() has open, by the peer's request id.
+    _served_fetch_streams: Optional[Dict[int, int]] = None
+
+    def _forget_served_fetch(self, stream_id: int) -> None:
+        for rid, sid in self._served_fetch_streams.items():
+            if sid == stream_id:
+                del self._served_fetch_streams[rid]
+                return
+
     def stream_fin(self, stream_id: int) -> None:
         """End-of-data on a sender-owned stream. Subgroup last object,
         fetch range complete, control GOAWAY+close use this."""
-        if not self._session_writable():
-            return
-        try:
-            self._quic.send_stream_data(stream_id, b"", end_stream=True)
-        except (AssertionError, AttributeError, BufferError,
-                RuntimeError, WebTransportError) as e:
-            logger.debug(f"stream({stream_id}): fin race: {e}")
+        self.stream_write(stream_id, b"", end_stream=True)
 
     def stream_reset(self, stream_id: int,
                       error_code: int = SessionCloseCode.NO_ERROR) -> None:
@@ -3054,10 +3168,9 @@ class _MOQTSessionMixin:
         Also the canonical reply to a peer's STOP_SENDING."""
         if not self._session_writable():
             return
-        try:
-            self._quic.reset_stream(stream_id, error_code)
-        except (AssertionError, AttributeError, RuntimeError) as e:
-            logger.debug(f"stream({stream_id}): reset race: {e}")
+        if self._tx_deferred:
+            self._tx_deferred.pop((stream_id, 'send'), None)
+        self._tx_op(stream_id, 'send', 'reset', error_code)
 
     def stream_stop_sending(self, stream_id: int,
                              error_code: int = SessionCloseCode.NO_ERROR) -> None:
@@ -3066,10 +3179,86 @@ class _MOQTSessionMixin:
         subscriber, FETCH_ERROR while the fetch stream is still open."""
         if not self._session_writable():
             return
+        self._tx_op(stream_id, 'recv', 'stop', error_code)
+
+    # Stream ops the transport refused on a full TX ring, retried as it
+    # drains: (stream_id, side) -> ((kind, arg), first_refused). 'send'
+    # holds the stream's terminal op, so a reset replaces a pending FIN.
+    _tx_deferred: Optional[Dict[Tuple[int, str], Tuple[Tuple[str, Any], float]]] = None
+    _tx_retry_task: Optional[asyncio.Task] = None
+    TX_RETRY_POLL_S = 0.02
+    TX_RETRY_GIVE_UP_S = 10.0
+
+    def _tx_send(self, stream_id: int, kind: str, arg: Any) -> bool:
+        """Hand one op to the transport; False when the ring is full."""
         try:
-            self._quic.stop_stream(stream_id, error_code)
-        except (AssertionError, AttributeError, RuntimeError) as e:
-            logger.debug(f"stream({stream_id}): stop_sending race: {e}")
+            if kind == 'reset':
+                self._quic.reset_stream(stream_id, arg)
+            elif kind == 'stop':
+                self._quic.stop_stream(stream_id, arg)
+            else:
+                self._quic.send_stream_data(stream_id, arg, end_stream=True)
+        except BufferError:
+            return False
+        except (AssertionError, AttributeError, RuntimeError,
+                ConnectionError) as e:
+            logger.debug(f"stream({stream_id}): {kind} race: {e}")
+        return True
+
+    def _tx_op(self, stream_id: int, side: str, kind: str, arg: Any) -> None:
+        """Send now, or queue for retry when the TX ring is full."""
+        if self._tx_send(stream_id, kind, arg):
+            return
+        logger.debug(f"stream({stream_id}): {kind} deferred: TX ring full")
+        if self._tx_deferred is None:
+            self._tx_deferred = {}
+        self._tx_deferred[(stream_id, side)] = ((kind, arg), time.monotonic())
+        if self._tx_retry_task is None:
+            self._tx_retry_task = asyncio.ensure_future(self._tx_retry())
+
+    def _tx_flush_deferred(self) -> None:
+        now = time.monotonic()
+        for key, ((kind, arg), since) in list(self._tx_deferred.items()):
+            if self._tx_send(key[0], kind, arg):
+                self._tx_deferred.pop(key, None)
+            elif now - since > self.TX_RETRY_GIVE_UP_S:
+                logger.warning(f"stream({key[0]}): {kind} dropped: TX ring "
+                               f"full for {self.TX_RETRY_GIVE_UP_S:g}s")
+                self._tx_deferred.pop(key, None)
+
+    async def _tx_retry(self) -> None:
+        """Retry deferred ops on each ring or stream drain, polling as a
+        fallback, until all are sent or the session closes."""
+        try:
+            while self._tx_deferred and self._session_writable():
+                transport = getattr(self._quic, '_transport', None)
+                ring_ev = getattr(transport, 'tx_event_ring_drain_event', None)
+                events = [ring_ev] if ring_ev is not None else []
+                get_ev = getattr(self._quic, 'get_tx_data_drain_event', None)
+                if get_ev is not None:
+                    events += [get_ev(sid) for (sid, _), ((kind, _a), _t)
+                               in self._tx_deferred.items() if kind == 'fin']
+                for ev in events:
+                    ev.clear()
+                if ring_ev is not None:
+                    transport.arm_tx_event_ring_drain_pending()
+                self._tx_flush_deferred()
+                if not self._tx_deferred:
+                    break
+                if not events:
+                    await asyncio.sleep(self.TX_RETRY_POLL_S)
+                    continue
+                waits = [asyncio.ensure_future(ev.wait()) for ev in events]
+                try:
+                    await asyncio.wait(waits, timeout=self.TX_RETRY_POLL_S,
+                                       return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    for w in waits:
+                        w.cancel()
+        finally:
+            self._tx_retry_task = None
+            if not self._session_writable():
+                self._tx_deferred = None
 
     def _stream_is_writable(self, stream_id: int) -> bool:
         """Whether send_stream_data on this session can be expected to
@@ -3520,6 +3709,7 @@ class _MOQTSessionMixin:
         if self._profile.param_table >= 20:
             self._note_request_kind(request_id, type(msg), ours=True)
         if self._profile.control_uni_pair:
+            self._tx_updates[request_id] = deque([None])
             if not self._is_wt:
                 # Raw QUIC: stream-id allocation is synchronous (lazy
                 # materialization on first send), so stay sync.
@@ -3860,15 +4050,16 @@ class _MOQTSessionMixin:
             params[ParamType.FORWARD] = int(forward)
         if self._profile.param_table >= 20:
             self._check_filter_ranges(params)
-            pending = self._tx_updates.get(existing_request_id, ())
+            pending = sum(u is not None for u in
+                          self._tx_updates.get(existing_request_id, ()))
             limit = self._peer_max_request_updates
-            if limit and len(pending) >= limit:
+            if limit and pending >= limit:
                 # d20 §10.3.1.7: past its limit the peer closes the session.
                 raise ValueError(
-                    f"{len(pending)} REQUEST_UPDATEs already outstanding on "
+                    f"{pending} REQUEST_UPDATEs already outstanding on "
                     f"request {existing_request_id} (peer "
                     f"MAX_REQUEST_UPDATES {limit})")
-        request_id = self._allocate_request_id()
+        request_id = self._allocate_request_id(opener=False)
         message = RequestUpdate(request_id=request_id,
                                 existing_request_id=existing_request_id,
                                 parameters=params)
@@ -3915,6 +4106,10 @@ class _MOQTSessionMixin:
         subscription parameters that differ from the PUBLISH's follow in
         a REQUEST_UPDATE on its stream (d20 §10.9). GROUP_ORDER cannot
         change there and is not sent."""
+        alias = getattr(request_msg, 'track_alias', None)
+        if alias is not None:
+            self._establish_alias(alias, self._msg_track(request_msg),
+                                  request_msg.request_id)
         if self._profile.publish_ok_expires_only:
             message = PublishOk(request_id=request_msg.request_id,
                                 parameters=dict(parameters or {}))
@@ -4055,6 +4250,7 @@ class _MOQTSessionMixin:
             reason=reason,
         )
         logger.info(f"MOQT send: {message}")
+        self._retire_published_alias(request_id)
         self._send_reply(request_id, message, fin=True)
         return message
 
@@ -4098,6 +4294,7 @@ class _MOQTSessionMixin:
         d14/d16 send UNSUBSCRIBE (0x0A). d18 removed it: a request is
         cancelled by terminating its own bidi stream (§3.3.2) — reset
         our write half, STOP_SENDING the reply half. Returns None then."""
+        self._retire_alias(request_id)
         if self.negotiated_draft >= 18:
             stream_id = self._bidi_streams.get(request_id)
             if stream_id is None:
@@ -4110,6 +4307,7 @@ class _MOQTSessionMixin:
             self.stream_reset(stream_id, StreamResetCode.CANCELLED)
             self.stream_stop_sending(stream_id, StreamResetCode.CANCELLED)
             self._bidi_streams.pop(request_id, None)
+            self._fail_waiting_updates(request_id, "cancelled")
             return None
         message = Unsubscribe(request_id=request_id)
         logger.info(f"MOQT send: {message}")
@@ -4128,6 +4326,7 @@ class _MOQTSessionMixin:
         joining_start: int = 0,
         parameters: Optional[Dict[int, bytes]] = None,
         wait_response: Optional[bool] = False,
+        fetch_parameters: Optional[Dict[int, Any]] = None,
     ) -> Union[Tuple[MOQTMessage, MOQTMessage], Tuple[MOQTMessage, MOQTMessage, 'asyncio.Future']]:
         """Subscribe + Joining Fetch (atomic pair).
 
@@ -4142,6 +4341,10 @@ class _MOQTSessionMixin:
                 (start = joining_start).
             joining_start: relative offset (relative) or absolute group
                 id (absolute) — see spec §9.16.2.1.
+            parameters: the SUBSCRIBE's. The FETCH takes only its
+                AUTHORIZATION_TOKEN: a SUBSCRIBE-only parameter in a FETCH
+                is a protocol violation (d18 §10.2.1).
+            fetch_parameters: the FETCH's, over that token.
             wait_response: if True, awaits and returns
                 (subscribe_ok, fetch_ok). If False, returns
                 (subscribe_msg, fetch_msg) sent messages.
@@ -4204,7 +4407,8 @@ class _MOQTSessionMixin:
             group_order=group_order,
             joining_request_id=sub_request_id,
             joining_start=joining_start,
-            parameters=dict(parameters),
+            parameters=self._joining_fetch_params(parameters,
+                                                  fetch_parameters),
         )
         self._subscriptions[fetch_request_id] = [fetch_msg]
         self._pending_requests[fetch_request_id] = self._loop.create_future()
@@ -4221,6 +4425,15 @@ class _MOQTSessionMixin:
         sub_response = await self._await_response(sub_request_id)
         fetch_response = await self._await_response(fetch_request_id)
         return (sub_response, fetch_response)
+
+    @staticmethod
+    def _joining_fetch_params(parameters: Dict[int, Any],
+                              fetch_parameters: Optional[Dict[int, Any]]
+                              ) -> Dict[int, Any]:
+        params = {k: v for k, v in parameters.items()
+                  if k == ParamType.AUTH_TOKEN}
+        params.update(fetch_parameters or {})
+        return params
 
     def joining_fetch(
         self,
@@ -4389,13 +4602,19 @@ class _MOQTSessionMixin:
         mid-way, it resets the stream (§5.2)."""
         stream_id = await self.open_uni_stream()
         header = FetchHeader(request_id=request_id)
-        self.stream_write(stream_id, header.serialize(prof=self._profile).data)
         prior = None
+        if self._served_fetch_streams is None:
+            self._served_fetch_streams = {}
+        self._served_fetch_streams[request_id] = stream_id
         try:
+            await self.stream_write_drain(
+                stream_id, header.serialize(prof=self._profile).data)
             for obj in objects:
                 buf = obj.serialize(prof=self._profile, prior=prior,
                                     group_order=int(group_order))
                 await self.stream_write_drain(stream_id, buf.data)
+                if self._served_fetch_streams.get(request_id) != stream_id:
+                    return stream_id  # FETCH_CANCEL reset it
                 if obj.end_of_range is None:
                     prior = obj
                 else:
@@ -4410,6 +4629,9 @@ class _MOQTSessionMixin:
                                             if prior else -1))
         except asyncio.CancelledError:
             self.stream_reset(stream_id, StreamResetCode.CANCELLED)
+            raise
+        except BaseException:
+            self._served_fetch_streams.pop(request_id, None)
             raise
         if fin:
             self.stream_fin(stream_id)
@@ -4662,6 +4884,7 @@ class _MOQTSessionMixin:
                         f"stream {stream_id} (request_id={request_id})")
             self.stream_reset(stream_id, StreamResetCode.CANCELLED)
             self._bidi_streams.pop(request_id, None)
+            self._fail_waiting_updates(request_id, "withdrawn")
             return None
         namespace = (withdrawn if namespace is None
                      else self._make_namespace_tuple(namespace))
@@ -4903,16 +5126,26 @@ class _MOQTSessionMixin:
                     f"'{name}' (waiting for '{trackname}')")
         return await asyncio.wait_for(_next_matching(), timeout=timeout)
 
-    def goaway(self, new_session_uri: str = "",
-               timeout: int = 0) -> GoAway:
+    def goaway(self, new_session_uri: str = "", timeout: int = 0,
+               request_id: Optional[int] = None) -> GoAway:
         """Announce imminent session close / migration (§10.4).
 
         Servers MAY carry a New Session URI; clients MUST send an empty
         one. At d18 the control-stream form names the smallest peer
-        request id that might not have been processed."""
+        request id that might not have been processed. With `request_id`
+        (d18+) the GOAWAY rides that request's stream and migrates only
+        that request."""
         if self._is_client and new_session_uri:
             raise ValueError("clients MUST send an empty New Session URI")
         msg = GoAway(new_session_uri=new_session_uri, timeout=timeout)
+        if request_id is not None:
+            if not self._profile.control_uni_pair:
+                raise ValueError(
+                    f"a request GOAWAY needs draft-18 or later, not "
+                    f"draft-{self.negotiated_draft}")
+            logger.info(f"MOQT send: {msg} on request {request_id}")
+            self._send_on_request_stream(request_id, msg)
+            return msg
         if self.negotiated_draft >= 18 and self._profile.goaway_request_id:
             if self._peer_request_max < 0:
                 msg.request_id = 0 if not self._is_client else 1
@@ -4946,6 +5179,7 @@ class _MOQTSessionMixin:
             self.stream_reset(stream_id, StreamResetCode.CANCELLED)
             self.stream_stop_sending(stream_id, StreamResetCode.CANCELLED)
             self._bidi_streams.pop(request_id, None)
+            self._fail_waiting_updates(request_id, "cancelled")
             return None
         prefix = self._make_namespace_tuple(namespace_prefix)
         message = UnsubscribeNamespace(namespace_prefix=prefix)
@@ -5110,9 +5344,6 @@ class _MOQTSessionMixin:
         Receive-side state is keyed by the peer's aliases, a different
         number space, and is left alone."""
         logger.info(f"MOQT event: handle {msg}")
-        for alias, rid in list(self._published_aliases.items()):
-            if rid == msg.request_id:
-                del self._published_aliases[alias]
         self._subscriptions.pop(msg.request_id, None)
         # d18 has no UNSUBSCRIBE; there the same news arrives as a
         # terminated request stream. Both reach the owner the same way.
@@ -5130,6 +5361,7 @@ class _MOQTSessionMixin:
                      f"request_id={msg.request_id} "
                      f"status={msg.status_code} "
                      f"streams={msg.stream_count}")
+        self._retire_alias(msg.request_id)
         track_alias = next(
             (ta for ta, rid in self._track_aliases.items()
              if rid == msg.request_id),
@@ -5182,13 +5414,12 @@ class _MOQTSessionMixin:
             MaxSubscribeId(request_id=self._local_request_max))
 
     def _ingest_request_limit(self, params) -> None:
-        """Peer's MAX_REQUEST_ID Setup parameter (§9.3.1.3). Absent
-        leaves us unlimited rather than the spec's zero."""
-        if self._profile.control_uni_pair or not params:
+        """Peer's MAX_REQUEST_ID Setup parameter (§9.3.1.3); absent is
+        0, so nothing is sent until a MAX_REQUEST_ID raises it."""
+        if self._profile.control_uni_pair:
             return
-        limit = params.get(SetupParamType.MAX_REQUEST_ID)
-        if limit is not None:
-            self._peer_request_limit = int(limit)
+        limit = (params or {}).get(SetupParamType.MAX_REQUEST_ID)
+        self._peer_request_limit = 0 if limit is None else int(limit)
 
     async def _handle_max_request_id(self, msg: MaxSubscribeId) -> None:
         """§9.5: the peer raised the ceiling on our request ids; it
@@ -5336,20 +5567,16 @@ class _MOQTSessionMixin:
                          reason=reason)
 
     async def _handle_fetch_cancel(self, msg: FetchCancel) -> None:
-        """Publisher-side: FETCH_CANCEL received for a fetch we are
-        serving. Reset the associated uni stream to release our write
-        side, and resolve any pending request state.
-        """
+        """d14/d16 FETCH_CANCEL for a fetch we serve: reset its stream
+        and tell the request's owner."""
         logger.info(f"MOQT event: handle {msg}")
-        stream_id = self._fetch_stream_by_request.pop(msg.request_id, None)
+        stream_id = (self._served_fetch_streams or {}).pop(msg.request_id,
+                                                           None)
         if stream_id is not None:
-            state = self._data_streams.get(stream_id)
-            if state is not None:
-                state.key = None  # reverse map already popped above
-            self.stream_reset(stream_id, SessionCloseCode.NO_ERROR)
+            self.stream_reset(stream_id, StreamResetCode.CANCELLED)
             logger.debug(f"MOQT stream({stream_id}): reset on FETCH_CANCEL "
                          f"for request_id={msg.request_id}")
-        self._resolve_request(msg.request_id, msg)
+        self._notify_request_cancelled(msg.request_id, "FETCH_CANCEL")
 
     async def _handle_fetch_ok(self, msg: FetchOk) -> None:
         logger.info(f"MOQT event: handle {msg}")

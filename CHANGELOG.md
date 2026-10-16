@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- MediaPublisher serves a FETCH from the objects each track published, its FETCH_OK End the end of that range; MediaSubscriber ignores a catalog object older than the one applied.
+- A received GOAWAY is recorded (`goaway_received`) and reported to `on_goaway(msg, request_id)`; no new request is sent after a control-stream GOAWAY. `goaway(request_id=)` sends one on a request stream (d18+).
+- A SUBSCRIBE_OK or PUBLISH reusing the Track Alias of another track's Established subscription closes with DUPLICATE_TRACK_ALIAS; aliases retire when the subscription ends.
+- d14/d16 FETCH_CANCEL resets the fetch stream we serve and cancels its owner; it no longer touches fetches we receive.
+- d14/d16: a SETUP without MAX_REQUEST_ID allows no requests until a MAX_REQUEST_ID arrives.
+- d18 replies on a request stream answer the request first, then each REQUEST_UPDATE in send order; the stream ending fails updates still waiting.
+- join(): the Joining FETCH takes only AUTHORIZATION_TOKEN from `parameters`; `fetch_parameters` for the rest.
+- A subgroup reopened on a new stream is accepted, and the old stream's late reset leaves it bound.
+- A FIN meeting a full TX ring is queued and retried; subgroup and fetch headers wait for the ring.
+- A truncated subgroup (abort, lane shed or Forward State 0, LOC pause) is reset with CANCELLED, not ended with END_OF_GROUP + FIN.
+- A reset or STOP_SENDING meeting a full TX ring is queued and retried, not raised.
 - `tests/relays.json`: non-gating d20/d22 targets (moxygen-fb, imquic, nokia-d22, moqtail-d22,
   stitcher-moq, moqarena).
 - SERVER_SETUP carries MOQT_IMPLEMENTATION at d14/d16; `implementation=` on client and server
@@ -20,7 +31,7 @@
   counted in PUBLISH_DONE, and accepted on receive; an empty fill opens no stream.
 - d20-d22 FILL_TIMEOUT reports objects the history dropped as End of Timed-Out Range.
 - `on_fetch_gap` receives End of Range markers.
-- A FETCH_OK ending before the FETCH's Start closes the session (d20+).
+- A FETCH_OK ending before the FETCH's Start closes the session, at every draft.
 - A fetch object referencing a prior Subgroup or Priority after a leading End of Range marker,
   and an empty FILL_PARAMETERS, are protocol violations.
 - LOC: payload carries the private-properties block (0x0A 0x00); --loc-bare opts out.
