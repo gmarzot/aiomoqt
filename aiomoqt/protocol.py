@@ -466,6 +466,7 @@ class _MOQTSessionMixin:
         # Optional callback for received data objects:
         #   fn(msg, size_bytes, recv_time_us, group_id, subgroup_id)
         self.on_object_received: Optional[Callable] = None
+        self._object_cb_errors = 0
         # Optional callback for received FetchObjects (fetch uni stream):
         #   fn(msg, size_bytes, recv_time_us, request_id)
         # Fires for normal objects only; End of Range markers go to
@@ -1160,6 +1161,17 @@ class _MOQTSessionMixin:
         ends.append((time.monotonic(), group_id, subgroup_id, clean,
                      reset_code))
 
+    def _call_object_cb(self, cb: Callable, *args) -> None:
+        """Run an app object callback; a raise costs only that object."""
+        try:
+            cb(*args)
+        except Exception:
+            self._object_cb_errors += 1
+            if self._object_cb_errors == 1:
+                logger.warning("object callback raised", exc_info=True)
+            else:
+                logger.debug("object callback raised", exc_info=True)
+
     def _object_cb(self, track_alias) -> Optional[Callable]:
         """Delivery callback for a track: per-alias route, else global."""
         cb = (self._object_handlers.get(track_alias)
@@ -1740,7 +1752,7 @@ class _MOQTSessionMixin:
                 args = (msg_obj, consumed, now,
                         state.group_id, state.subgroup_id)
                 if cb:
-                    cb(*args)
+                    self._call_object_cb(cb, *args)
                 else:
                     self._hold_early_object(alias, consumed, args)
                 if terminal:
@@ -1772,9 +1784,11 @@ class _MOQTSessionMixin:
                           or self.on_fetch_object)
                     if cb:
                         now = int(time.time() * 1_000_000)
-                        cb(msg_obj, consumed, now, request_id)
+                        self._call_object_cb(cb, msg_obj, consumed, now,
+                                             request_id)
                 elif self.on_fetch_gap is not None:
-                    self.on_fetch_gap(msg_obj, request_id)
+                    self._call_object_cb(self.on_fetch_gap, msg_obj,
+                                         request_id)
             else:
                 logger.error(
                     f"MOQT stream({stream_id}): unexpected msg "
@@ -2303,7 +2317,7 @@ class _MOQTSessionMixin:
         cb = self._object_cb(alias)
         args = (msg, consumed, now, msg.group_id, None)
         if cb:
-            cb(*args)
+            self._call_object_cb(cb, *args)
         else:
             self._hold_early_object(alias, consumed, args)
         eog = getattr(msg, 'end_of_group', False)

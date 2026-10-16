@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A raising object, fetch-object or fetch-gap callback is caught per object; the rest of the drained batch is still delivered.
 - `set_default_stream_priority` on WebTransport no longer recurses; it returns False when the transport has no context default.
 - `PublishedTrack` and `LocTrackPublisher` `auth_token` default to None, and pub_bench `--auth-token` to none: a default announce carries no AUTH_TOKEN.
 - An empty host in a bare `:port` URL raises ValueError; load_sim, adaptive_bench and relay_probe `--url` exit with a usage error.
