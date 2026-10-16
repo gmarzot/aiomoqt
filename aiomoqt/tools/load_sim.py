@@ -780,7 +780,8 @@ def main():
     pubs = {ps.key: PubRT(ps) for ps in pub_specs} \
         if args.role in ("both", "pub") else {}
     groups: Dict[int, GroupRT] = {}
-    sub_events_q = MP_CTX.Queue(maxsize=100000)
+    # 32767 = macOS SEM_VALUE_MAX; a larger bound fails with EINVAL there.
+    sub_events_q = MP_CTX.Queue(maxsize=32767)
     if args.role in ("both", "sub"):
         for gs in group_specs:
             grt = GroupRT(gs)
