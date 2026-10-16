@@ -20,7 +20,7 @@ _FETCH_TOKEN = b"fetch-only"
 
 
 @contextlib.asynccontextmanager
-async def _loopback(port, use_quic, seen):
+async def _loopback(port, use_quic, seen, fetched):
     async def on_subscribe(session, msg):
         seen.setdefault(msg.track_name.decode(), {})["sub"] = msg.parameters
 
@@ -28,6 +28,8 @@ async def _loopback(port, use_quic, seen):
         sub = next(m for m in seen.values()
                    if m.get("rid") == msg.joining_request_id)
         sub["fetch"] = msg.parameters
+        if all("fetch" in seen.get(n, {}) for n in _TRACKS):
+            fetched.set()
 
     server = MOQTServer(host="localhost", port=port, certificate=CERT,
                         private_key=KEY, path="/", use_quic=use_quic,
@@ -48,8 +50,9 @@ async def _loopback(port, use_quic, seen):
 @pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
 async def test_joining_fetch_takes_only_the_auth_token(use_quic):
     seen = {}
+    fetched = asyncio.Event()
     port = _BASE_PORT + (not use_quic)
-    async with _loopback(port, use_quic, seen) as session:
+    async with _loopback(port, use_quic, seen, fetched) as session:
         for i, name in enumerate(_TRACKS):
             token = f"tok-{name}".encode()
             # The second track's FETCH names its own token.
@@ -61,10 +64,7 @@ async def test_joining_fetch_takes_only_the_auth_token(use_quic):
                 fetch_parameters=extra)
             seen.setdefault(name, {})["rid"] = sub.request_id
             assert set(fetch.parameters) == {ParamType.AUTH_TOKEN}
-        for _ in range(100):
-            if all("fetch" in seen.get(n, {}) for n in _TRACKS):
-                break
-            await asyncio.sleep(0.02)
+        await asyncio.wait_for(fetched.wait(), timeout=2.0)
         assert session._close_err is None
     for i, name in enumerate(_TRACKS):
         token = f"tok-{name}".encode()

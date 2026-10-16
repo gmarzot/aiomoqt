@@ -4271,9 +4271,11 @@ class _MOQTSessionMixin:
         content_exists: int = 0,
         largest_group_id: Optional[int] = None,
         largest_object_id: Optional[int] = None,
-        parameters: Optional[Dict[int, bytes]] = None
+        parameters: Optional[Dict[int, bytes]] = None,
+        track_properties: Optional[Dict[int, Any]] = None,
     ) -> Optional[MOQTMessage]:
-        """Create and send a SUBSCRIBE_OK response."""
+        """Create and send a SUBSCRIBE_OK response. track_properties are
+        sent from d16 and dropped at d14."""
         track_alias = self._allocate_track_alias(request_msg.request_id)
         # Set track_alias on the Subscribe msg so custom handlers can use it
         request_msg.track_alias = track_alias
@@ -4285,7 +4287,8 @@ class _MOQTSessionMixin:
             content_exists=content_exists,
             largest_group_id=largest_group_id,
             largest_object_id=largest_object_id,
-            parameters=parameters or {}
+            parameters=parameters or {},
+            track_extensions=track_properties,
         )
         logger.info(f"MOQT send: {message}")
         self._send_reply(request_msg.request_id, message)
@@ -4829,6 +4832,7 @@ class _MOQTSessionMixin:
         parameters: Optional[Dict[int, Any]] = None,
         wait_response: Optional[bool] = False,
         largest: Optional[Tuple[int, int]] = None,
+        track_properties: Optional[Dict[int, Any]] = None,
     ) -> Optional[MOQTMessage]:
         """PUBLISH — announce a specific track to the relay/subscriber.
 
@@ -4839,6 +4843,7 @@ class _MOQTSessionMixin:
             largest: the track's Largest Location (group, object), sent
                      as LARGEST_OBJECT; required once objects have been
                      published (§10.2.11).
+            track_properties: Track Properties (d16+; dropped at d14).
 
         From d20 a PUBLISH under the prefix of a SUBSCRIBE_TRACKS the
         peer sent carries that request's subscription parameters, its
@@ -4868,6 +4873,7 @@ class _MOQTSessionMixin:
             largest_group_id=None if largest is None else largest[0],
             largest_object_id=None if largest is None else largest[1],
             parameters=parameters or {},
+            track_extensions=track_properties,
         )
         logger.info(f"MOQT send: {message}")
         # Pre-register the response future before send (like subscribe /

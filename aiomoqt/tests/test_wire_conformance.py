@@ -1418,3 +1418,106 @@ def test_padding_size_is_not_negative():
     from aiomoqt.messages.data import encode_padding
     with pytest.raises(ValueError):
         encode_padding(-1, prof=profile_for(18))
+
+
+# -- Immutable Properties (0x0B) in received Track Properties ---------
+#
+# d16 §11.2 / d18 §12.7: the value is a Key-Value-Pair sequence; a
+# nested 0x0B or a KVP that cannot be parsed is malformed. Decoders
+# close with PROTOCOL_VIOLATION, also under --compat lenient-extensions.
+
+from aiomoqt.messages.publish import Publish  # noqa: E402
+
+_IMM_DRAFTS = [16, 18]
+_IMM_INNER = {0x04: 2000, 0x3B: b"m"}
+
+
+def _imm_inner(draft):
+    v = lambda x: _ref_vint(draft, x)  # noqa: E731
+    return v(0x04) + v(2000) + v(0x3B - 0x04) + v(1) + b"m"
+
+
+def _imm_props(draft, inner, trailer=True):
+    """Track Properties: Immutable Properties carrying `inner`, then a
+    mutable 0x3D so bytes follow the immutable block."""
+    v = lambda x: _ref_vint(draft, x)  # noqa: E731
+    out = v(0x0B) + v(len(inner)) + inner
+    if trailer:
+        out += v(0x3D - 0x0B) + v(3) + b"xyz"
+    return out
+
+
+def _imm_subscribe_ok(draft, props):
+    head = b"" if draft >= 18 else _ref_vint(draft, 1)
+    return head + _ref_vint(draft, 0) + _ref_vint(draft, 0) + props
+
+
+def _imm_publish(draft, props):
+    v = lambda x: _ref_vint(draft, x)  # noqa: E731
+    return (v(1) + v(1) + v(1) + b"n" + v(1) + b"x" + v(0) + v(0)
+            + props)
+
+
+_IMM_MESSAGES = {"subscribe_ok": (SubscribeOk, _imm_subscribe_ok),
+                 "publish": (Publish, _imm_publish)}
+
+
+def _imm_decode(draft, kind, props):
+    cls, build = _IMM_MESSAGES[kind]
+    body = build(draft, props)
+    prof = profile_for(draft)
+    return cls.deserialize(Buffer(data=body, vi64=prof.vi64), prof=prof,
+                           buf_end=len(body))
+
+
+@pytest.mark.parametrize("kind", list(_IMM_MESSAGES))
+@pytest.mark.parametrize("draft", _IMM_DRAFTS)
+def test_received_immutable_properties_decode(draft, kind):
+    inner = _imm_inner(draft)
+    msg = _imm_decode(draft, kind, _imm_props(draft, inner))
+    assert msg.track_extensions == {0x0B: inner, 0x3D: b"xyz"}
+    nested = MOQTMessage._extensions_decode(
+        Buffer(data=inner, vi64=profile_for(draft).vi64),
+        with_length=False, buf_end=len(inner), delta=True)
+    assert nested == _IMM_INNER
+
+
+def _imm_malformed(draft):
+    v = lambda x: _ref_vint(draft, x)  # noqa: E731
+    return {
+        "nested": (v(0x0B) + v(0), "inside Immutable"),
+        # A Type with no value.
+        "truncated": (v(0x04), "do not parse"),
+        # A value declared past the end of the Immutable Properties.
+        "overrun": (v(0x3B) + v(5) + b"ab", "do not parse"),
+    }
+
+
+@pytest.mark.parametrize("lenient", [False, True], ids=["strict", "lenient"])
+@pytest.mark.parametrize("case", ["nested", "truncated", "overrun"])
+@pytest.mark.parametrize("kind", list(_IMM_MESSAGES))
+@pytest.mark.parametrize("draft", _IMM_DRAFTS)
+def test_malformed_immutable_properties_are_a_protocol_violation(
+        draft, kind, case, lenient, monkeypatch):
+    monkeypatch.setattr(MOQTMessage, "_tolerate_trailing_extensions", lenient)
+    inner, match = _imm_malformed(draft)[case]
+    with pytest.raises(MOQTProtocolViolation, match=match):
+        _imm_decode(draft, kind, _imm_props(draft, inner))
+
+
+@pytest.mark.parametrize("vi64", [False, True], ids=["d16", "d18"])
+def test_object_immutable_properties_agree_across_codecs(vi64):
+    """An Object's Immutable Properties reach the app as the same opaque
+    bytes from the Cython subgroup parser and the python decoder."""
+    draft = 18 if vi64 else 16
+    exts = {0x0B: _imm_inner(draft)}
+    body = (encode_object_subgroup_vi64 if vi64
+            else encode_object_subgroup)(0, exts, 0, b"pay", True, True)
+    chain = StreamChain()
+    chain.extend(body)
+    fused = (chain.parse_object_subgroup_vi64 if vi64
+             else chain.parse_object_subgroup)
+    assert fused(True, 16 * 1024, True) == (0, exts, 0, b"pay")
+    buf = Buffer(data=body, vi64=vi64)
+    buf.pull_vint()
+    assert MOQTMessage._extensions_decode(buf, delta=True) == exts

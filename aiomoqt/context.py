@@ -107,6 +107,9 @@ class DraftProfile:
                                   # tables below: 14, 16, 18, 20.
     padding: bool = True
                                   # PADDING streams and datagrams (d18+).
+    track_properties: bool = True
+                                  # PUBLISH, SUBSCRIBE_OK and FETCH_OK end
+                                  # with Track Properties; d14 has none.
 
     @property
     def vi64(self) -> bool:
@@ -123,7 +126,8 @@ PROFILES = {
         control_uni_pair=False, reply_has_request_id=True,
         uint8_params=frozenset(),
         object_statuses=frozenset({0x0, 0x1, 0x3, 0x4}),
-        error_table=14, padding=False),
+        error_table=14, padding=False,
+        track_properties=False),
     MOQTDraft.DRAFT_16: DraftProfile(
         draft=MOQTDraft.DRAFT_16, setup_carries_versions=False,
         params_delta_coded=True, varint="rfc9000",
