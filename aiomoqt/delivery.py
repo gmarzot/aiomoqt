@@ -9,6 +9,7 @@ ids.
 from __future__ import annotations
 
 import asyncio
+import time
 from collections import OrderedDict
 from enum import Enum
 from typing import Any, Callable, Dict, Optional
@@ -244,12 +245,17 @@ class SubgroupDelivery:
         self.bytes_sent += len(payload)
         return True
 
-    def reset_group(self) -> None:
+    @property
+    def open_group(self) -> Optional[int]:
+        """Group ID of the open PER_GROUP stream, None when none is."""
+        return None if self._header is None else self._header.group_id
+
+    def reset_group(self, code: int = StreamResetCode.CANCELLED) -> None:
         """Reset the open group stream: the group is truncated, and a FIN
         would claim it complete. No-op when no stream is open."""
         if self._stream_id is None:
             return
-        self.session.stream_reset(self._stream_id, StreamResetCode.CANCELLED)
+        self.session.stream_reset(self._stream_id, code)
         self._stream_id = None
         self._header = None
 
@@ -275,10 +281,14 @@ class _Lane:
     """
 
     def __init__(self, delivery: SubgroupDelivery, queue_size: int,
-                 gate=None, on_sent=None):
+                 gate=None, on_sent=None, deadline=None):
         self.delivery = delivery
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=queue_size)
         self.shed = 0
+        # Returns the peer's object delivery timeout in seconds, or None
+        # (§8); objects older than it are not sent.
+        self.deadline = deadline
+        self.expired = 0
         self.need_group = False   # skipping until the next group starts
         # Returns False while this peer's Forward State is 0 (§5.1).
         self.gate = gate
@@ -346,7 +356,7 @@ class _Lane:
                 self._close_truncated()
                 self.need_group = True
                 continue
-            group_id, object_id, payload, extensions, group_start = item
+            group_id, object_id, payload, extensions, group_start, born = item
             if self.gate is not None and not self.gate():
                 # Forward State 0: send nothing, reset the open group, and
                 # resume only at a fresh group.
@@ -360,11 +370,32 @@ class _Lane:
                     continue
                 self.need_group = False
                 self._truncated = False
+            if self._late(group_id, born):
+                continue
             sent = await self.delivery.write(group_id, object_id, payload,
                                              extensions=extensions,
                                              group_start=group_start)
             if sent and self.on_sent is not None:
                 self.on_sent(group_id, object_id)
+
+
+    def _late(self, group_id: int, born: float) -> bool:
+        """§8: an object past the peer's delivery timeout is dropped; on a
+        stream, its subgroup is reset with DELIVERY_TIMEOUT and not
+        reopened, so the lane resumes at the next group."""
+        timeout = self.deadline() if self.deadline is not None else None
+        if not timeout or time.monotonic() - born <= timeout:
+            return False
+        self.expired += 1
+        if self.delivery.mapping is StreamMapping.DATAGRAM:
+            return True
+        if self.delivery.open_group == group_id:
+            self.delivery.reset_group(StreamResetCode.DELIVERY_TIMEOUT)
+        else:
+            self.delivery.end_group()
+        self._truncated = True
+        self.need_group = True
+        return True
 
 
 class FanoutDelivery:
@@ -393,10 +424,11 @@ class FanoutDelivery:
             self.add(delivery, joining=False)
 
     def add(self, delivery: SubgroupDelivery, gate=None,
-            joining: bool = True) -> _Lane:
+            joining: bool = True, deadline=None) -> _Lane:
         """Attach another peer. `joining` holds it to the next group
-        boundary, which is where a mid-stream arrival can start."""
-        lane = _Lane(delivery, self.queue_size, gate, self._sent)
+        boundary, which is where a mid-stream arrival can start.
+        `deadline()` gives its delivery timeout in seconds, or None."""
+        lane = _Lane(delivery, self.queue_size, gate, self._sent, deadline)
         lane.need_group = joining
         self.lanes.append(lane)
         return lane
@@ -431,7 +463,8 @@ class FanoutDelivery:
                     group_start: bool = False) -> None:
         if self.on_write is not None:
             self.on_write(group_id, object_id, payload, extensions)
-        item = (group_id, object_id, payload, extensions, group_start)
+        item = (group_id, object_id, payload, extensions, group_start,
+                time.monotonic())
         for lane in list(self.lanes):
             lane.offer(item)
 

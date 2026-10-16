@@ -299,6 +299,15 @@ class _SubgroupSender:
         self.track._stream_closed(self.sub)
 
 
+# d18+ SUBGROUP_DELIVERY_TIMEOUT message parameter (§10.2.3).
+SUBGROUP_DELIVERY_TIMEOUT = 0x06
+
+
+def _min_nonzero(a: int, b: int) -> int:
+    """The smaller of two timeouts where 0 means none."""
+    return min(a, b) if a and b else (a or b)
+
+
 class _FetchRefused(Exception):
     """A FETCH this track answers with REQUEST_ERROR."""
 
@@ -316,7 +325,8 @@ class _Subscription:
                  'subscribe_request_id', 'subscribers', 'state', 'forward',
                  'done', 'stream_count', 'generating', 'delivery', 'joining',
                  'window', 'open_streams', 'end_status', 'senders',
-                 'fill_streams', 'fills', 'location_filter', 'group_order')
+                 'fill_streams', 'fills', 'location_filter', 'group_order',
+                 'object_timeout', 'subgroup_timeout')
 
     def __init__(self, session):
         self.session = session
@@ -353,6 +363,22 @@ class _Subscription:
         # The subscription's Location Filter and group order, for fills.
         self.location_filter = None
         self.group_order = None
+        # Subscriber's OBJECT_ and SUBGROUP_DELIVERY_TIMEOUT in ms (§8);
+        # 0 sets none. d14/d16 DELIVERY_TIMEOUT is the object timeout.
+        self.object_timeout = 0
+        self.subgroup_timeout = 0
+
+    def take_timeouts(self, params, prof) -> None:
+        """Record the delivery timeouts a SUBSCRIBE, PUBLISH_OK or
+        REQUEST_UPDATE carries; absent ones keep their value."""
+        if not params:
+            return
+        value = params.get(ParamType.DELIVERY_TIMEOUT)
+        if isinstance(value, int):
+            self.object_timeout = value
+        value = params.get(SUBGROUP_DELIVERY_TIMEOUT)
+        if prof.vi64 and isinstance(value, int):
+            self.subgroup_timeout = value
 
     def passes(self, group_id: int, object_id: int) -> bool:
         """True when the subscription takes this Location: Forward State 1
@@ -556,7 +582,23 @@ class PublishedTrack(Track):
         sub.delivery.passes = sub.passes
         sub.delivery.excludes_end = sub.excludes_end
         self._out.add(sub.delivery,
-                      gate=lambda: sub.forward and sub.generating)
+                      gate=lambda: sub.forward and sub.generating,
+                      deadline=lambda: self._delivery_deadline(sub))
+
+    # Track Property delivery timeouts in ms (§8, §12.1-12.2); 0 sets none.
+    object_delivery_timeout: int = 0
+    subgroup_delivery_timeout: int = 0
+
+    def _delivery_deadline(self, sub) -> Optional[float]:
+        """A peer's object delivery timeout in seconds, None for none:
+        per kind the smaller non-zero of the track's and the
+        subscriber's; datagrams take the smaller of both kinds."""
+        timeout = _min_nonzero(self.object_delivery_timeout,
+                               sub.object_timeout)
+        if self.mapping is StreamMapping.DATAGRAM:
+            timeout = _min_nonzero(timeout, _min_nonzero(
+                self.subgroup_delivery_timeout, sub.subgroup_timeout))
+        return timeout / 1000 if timeout else None
 
     def _ensure_production(self) -> asyncio.Future:
         if self._production is None:
@@ -898,6 +940,7 @@ class PublishedTrack(Track):
         off the generator); forward=0 pauses object emission."""
         sub = self._sub_for(session)
         logger.info(f"Track: PUBLISH_OK: forward={msg.forward}")
+        sub.take_timeouts(getattr(msg, 'parameters', None), session._profile)
         self._set_forward(sub, msg.forward)
         if sub.forward:
             await self._start_generating(session, "PUBLISH_OK")
@@ -916,6 +959,8 @@ class PublishedTrack(Track):
             forward = (reply.parameters or {}).get(ParamType.FORWARD) \
                 if hasattr(reply, 'parameters') else None
         logger.info(f"Track: PUBLISH_OK (REQUEST_OK): forward={forward}")
+        sub.take_timeouts(getattr(reply, 'parameters', None),
+                          sub.session._profile)
         self._set_forward(sub, forward)
         if sub.forward:
             await self._start_generating(sub.session, "PUBLISH_OK")
@@ -924,6 +969,7 @@ class PublishedTrack(Track):
         """REQUEST_UPDATE — subscriber changes forward state."""
         sub = self._sub_for(session)
         logger.info(f"Track: REQUEST_UPDATE: {msg}")
+        sub.take_timeouts(msg.parameters, session._profile)
         forward = (msg.parameters.get(ParamType.FORWARD)
                    if msg.parameters else None)
         raw_filter = (msg.parameters.get(ParamType.SUBSCRIPTION_FILTER)
@@ -1004,6 +1050,7 @@ class PublishedTrack(Track):
         sub.window = window
         sub.location_filter = getattr(msg, 'location_filter', None)
         sub.group_order = getattr(msg, 'group_order', None)
+        sub.take_timeouts(getattr(msg, 'parameters', None), session._profile)
         self._set_forward(sub, getattr(msg, 'forward', None))
         self._start_fill(session, sub, msg, reported)
         if sub.forward:

@@ -107,6 +107,9 @@ class DraftProfile:
                                   # tables below: 14, 16, 18, 20.
     padding: bool = True
                                   # PADDING streams and datagrams (d18+).
+    zero_delivery_timeout_closes: bool = False
+                                  # d16 DELIVERY_TIMEOUT (0x02) of 0, as a
+                                  # parameter or Track Property, closes.
     track_properties: bool = True
                                   # PUBLISH, SUBSCRIBE_OK and FETCH_OK end
                                   # with Track Properties; d14 has none.
@@ -135,7 +138,8 @@ PROFILES = {
         uint8_params=frozenset(),
         merged_datagram_layout=True,
         subgroup_type_mask=0x2F,
-        error_table=16, padding=False),
+        error_table=16, padding=False,
+        zero_delivery_timeout_closes=True),
     # draft-18 negotiates out-of-band (ALPN/WT-Protocol) like d16 and uses
     # delta-coded params, but forks the wire codec to vi64, runs control over
     # a pair of uni streams, drops the Request ID from request replies, and

@@ -192,6 +192,7 @@ class MOQTMessage:
         if not props:
             return
         MOQTMessage._check_property_ranges(props)
+        MOQTMessage._check_delivery_timeout(props, prof)
         inner = props.get(MOQTMessage.IMMUTABLE_PROPERTIES)
         if inner is None:
             return
@@ -210,6 +211,15 @@ class MOQTMessage:
             raise MOQTProtocolViolation(
                 "Immutable Properties inside Immutable Properties")
         MOQTMessage._check_property_ranges(nested)
+        MOQTMessage._check_delivery_timeout(nested, prof)
+
+    @staticmethod
+    def _check_delivery_timeout(values: Dict[int, Any],
+                                prof: 'DraftProfile') -> None:
+        """d16 §9.2.2.2, §11.1: a DELIVERY_TIMEOUT of 0 is a violation."""
+        if (prof.zero_delivery_timeout_closes
+                and values.get(ParamType.DELIVERY_TIMEOUT) == 0):
+            raise MOQTProtocolViolation("DELIVERY_TIMEOUT of 0")
 
     @staticmethod
     def _check_property_ranges(props: Dict[int, Any]) -> None:
@@ -998,6 +1008,9 @@ class MOQTMessage:
                 raise MOQTProtocolViolation(
                     f"parameter overran frame extent: "
                     f"{buf.tell()}/{buf_end}")
+            if scope is not None and param_type == ParamType.DELIVERY_TIMEOUT:
+                MOQTMessage._check_delivery_timeout(
+                    {param_type: param_value}, prof)
             bounds = MOQTMessage.PARAM_VALUE_RANGES.get(param_type)
             if bounds is None and d20:
                 bounds = VALUE_RANGES.get(param_type)

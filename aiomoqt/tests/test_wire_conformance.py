@@ -1521,3 +1521,26 @@ def test_object_immutable_properties_agree_across_codecs(vi64):
     buf = Buffer(data=body, vi64=vi64)
     buf.pull_vint()
     assert MOQTMessage._extensions_decode(buf, delta=True) == exts
+
+
+# -- d16 DELIVERY_TIMEOUT 0 (§9.2.2.2, §11.1) ---------------------------
+
+def test_d16_zero_delivery_timeout_parameter_is_a_protocol_violation():
+    with pytest.raises(MOQTProtocolViolation, match="DELIVERY_TIMEOUT"):
+        _decode_subscribe(16, _subscribe_body(16, params=b"\x01\x02\x00"))
+
+
+def test_d16_nonzero_delivery_timeout_parameter_is_accepted():
+    got = _decode_subscribe(16, _subscribe_body(16, params=b"\x01\x02\x40\x64"))
+    assert got.parameters[0x02] == 100
+
+
+def test_zero_object_delivery_timeout_is_legal_at_d18():
+    got = _decode_subscribe(18, _subscribe_body(18, params=b"\x01\x02\x00"))
+    assert got.parameters[0x02] == 0
+
+
+def test_d16_zero_delivery_timeout_track_property_is_a_protocol_violation():
+    props = _ref_vint(16, 0x02) + _ref_vint(16, 0)
+    with pytest.raises(MOQTProtocolViolation, match="DELIVERY_TIMEOUT"):
+        _imm_decode(16, "subscribe_ok", props)
