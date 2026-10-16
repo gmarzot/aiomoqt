@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Requires aiopquic >= 0.5.0rc1.
 - load_sim fails a group that subscribed but received no objects (`<< NO OBJECTS`) and prints exact `Total objects:` / `Total bytes:`.
 - Interop tier: relay-pub-sub fails on zero or missing `Total objects:`.
 - Bench workers with `--logdir` write aiomoqt logging to their per-process files (DEBUG with `-d`).
