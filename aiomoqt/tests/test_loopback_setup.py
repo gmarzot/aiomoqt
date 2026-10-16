@@ -172,6 +172,38 @@ async def test_stream_priority_reaches_the_scheduler(use_quic):
         server.close()
 
 
+@pytest.mark.asyncio
+async def test_default_stream_priority_does_not_recurse(use_quic, monkeypatch):
+    """True only when the transport has a context default to set."""
+    from aiomoqt.protocol import _MOQTSessionMixin
+    port = _BASE_PORT + (37 if use_quic else 38)
+    server = await _start_server(
+        port, supported_drafts=18, use_quic=use_quic)
+    try:
+        client = MOQTClient(
+            "localhost", port, path="/",
+            use_quic=use_quic,
+            verify_tls=False, supported_drafts=18,
+        )
+        async with client.connect() as session:
+            await session.client_session_init()
+            calls = []
+            orig = _MOQTSessionMixin.set_default_stream_priority
+
+            def counted(self, priority):
+                calls.append(priority)
+                return orig(self, priority)
+            monkeypatch.setattr(_MOQTSessionMixin,
+                                "set_default_stream_priority", counted)
+            transport = (session._quic if use_quic
+                         else super(_MOQTSessionMixin, session))
+            has_api = hasattr(transport, "set_default_stream_priority")
+            assert session.set_default_stream_priority(128) is has_api
+            assert calls == [128]
+    finally:
+        server.close()
+
+
 @pytest.mark.parametrize("draft", (16, 18))
 @pytest.mark.asyncio
 async def test_control_stream_gets_its_own_band(use_quic, draft):

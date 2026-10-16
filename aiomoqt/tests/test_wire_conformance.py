@@ -1395,6 +1395,31 @@ def test_d20_undefined_range_indicator_is_refused(draft, flags):
         _fetch_stream(ref_vi64(flags) + b"\x03\x04", draft)
 
 
+# -- PADDING streams and datagrams (§11.5) -----------------------------
+
+@pytest.mark.parametrize("draft", [18, 20, 22])
+@pytest.mark.parametrize("datagram, ptype", [(False, 0x132B3E28),
+                                             (True, 0x132B3E29)])
+@pytest.mark.parametrize("size", [0, 1, 37])
+def test_padding_exact_bytes(draft, datagram, ptype, size):
+    from aiomoqt.messages.data import encode_padding
+    wire = encode_padding(size, prof=profile_for(draft), datagram=datagram)
+    assert wire == ref_vi64(ptype) + bytes(size)
+
+
+@pytest.mark.parametrize("draft", [14, 16])
+def test_padding_does_not_exist_before_d18(draft):
+    from aiomoqt.messages.data import encode_padding
+    with pytest.raises(ValueError):
+        encode_padding(4, prof=profile_for(draft))
+
+
+def test_padding_size_is_not_negative():
+    from aiomoqt.messages.data import encode_padding
+    with pytest.raises(ValueError):
+        encode_padding(-1, prof=profile_for(18))
+
+
 # -- Immutable Properties (0x0B) in received Track Properties ---------
 #
 # d16 §11.2 / d18 §12.7: the value is a Key-Value-Pair sequence; a
@@ -1496,3 +1521,26 @@ def test_object_immutable_properties_agree_across_codecs(vi64):
     buf = Buffer(data=body, vi64=vi64)
     buf.pull_vint()
     assert MOQTMessage._extensions_decode(buf, delta=True) == exts
+
+
+# -- d16 DELIVERY_TIMEOUT 0 (§9.2.2.2, §11.1) ---------------------------
+
+def test_d16_zero_delivery_timeout_parameter_is_a_protocol_violation():
+    with pytest.raises(MOQTProtocolViolation, match="DELIVERY_TIMEOUT"):
+        _decode_subscribe(16, _subscribe_body(16, params=b"\x01\x02\x00"))
+
+
+def test_d16_nonzero_delivery_timeout_parameter_is_accepted():
+    got = _decode_subscribe(16, _subscribe_body(16, params=b"\x01\x02\x40\x64"))
+    assert got.parameters[0x02] == 100
+
+
+def test_zero_object_delivery_timeout_is_legal_at_d18():
+    got = _decode_subscribe(18, _subscribe_body(18, params=b"\x01\x02\x00"))
+    assert got.parameters[0x02] == 0
+
+
+def test_d16_zero_delivery_timeout_track_property_is_a_protocol_violation():
+    props = _ref_vint(16, 0x02) + _ref_vint(16, 0)
+    with pytest.raises(MOQTProtocolViolation, match="DELIVERY_TIMEOUT"):
+        _imm_decode(16, "subscribe_ok", props)

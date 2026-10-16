@@ -5,6 +5,19 @@
 - load_sim fails a group that subscribed but received no objects (`<< NO OBJECTS`) and prints exact `Total objects:` / `Total bytes:`.
 - Interop tier: relay-pub-sub fails on zero or missing `Total objects:`.
 - Bench workers with `--logdir` write aiomoqt logging to their per-process files (DEBUG with `-d`).
+- `tests/relays.json`: quicr-west gates on d18, the only draft it now serves; nokia-d18 stops gating while unreachable.
+- d18+: a Redirect naming a track in reply to PUBLISH_NAMESPACE or SUBSCRIBE_NAMESPACE (and SUBSCRIBE_TRACKS from d20) closes with PROTOCOL_VIOLATION.
+- Delivery timeouts (§8) on produce() tracks: per subscription the smaller non-zero of the track's (`object_delivery_timeout`, `subgroup_delivery_timeout`) and the subscriber's; a late object resets its subgroup with DELIVERY_TIMEOUT, no reopen, and a late datagram is dropped. d16 DELIVERY_TIMEOUT of 0 closes with PROTOCOL_VIOLATION.
+- Stream resets and STOP_SENDING use stream reset codes: a finished subscription, a FETCH_ERROR and a drained PADDING stream (logged at debug) send CANCELLED, unknown or duplicate fetch streams CANCELLED, unparseable streams INTERNAL_ERROR; `stream_reset` / `stream_stop_sending` default to CANCELLED.
+- d14/d16: PATH or AUTHORITY in a server SETUP, or in any SETUP over WebTransport, closes with INVALID_PATH / INVALID_AUTHORITY; `client_session_init` over WT and `server_setup` refuse to send them.
+- d18+: `session.redirect(msg, ...)` refuses a request with REDIRECT; a namespace-scoped request takes no track name. pub_bench `--redirect`. A message holding a Redirect prints.
+- pub_bench `--gaps`: even Group and Object IDs only, each Object with one Prior Group ID Gap or Prior Object ID Gap property.
+- d18+: `session.send_padding(size, datagram=)` sends a PADDING stream (lowest send priority) or datagram of zeros; pub_bench `--padding`.
+- `subscribe_error`, `fetch_error`, `stream_reset` and `stream_stop_sending` encode a named code for the negotiated draft (`request_error_code`, `stream_reset_code`, `canonical_request_error` in `context`); d14 FETCH_ERROR and d16 UNKNOWN_OBJECT_STATUS get their own values.
+- A raising object, fetch-object or fetch-gap callback is caught per object; the rest of the drained batch is still delivered.
+- `set_default_stream_priority` on WebTransport no longer recurses; it returns False when the transport has no context default.
+- `PublishedTrack` and `LocTrackPublisher` `auth_token` default to None, and pub_bench `--auth-token` to none: a default announce carries no AUTH_TOKEN.
+- An empty host in a bare `:port` URL raises ValueError; load_sim, adaptive_bench and relay_probe `--url` exit with a usage error.
 - Received Track Properties are validated from d16 (was d18); malformed Immutable Properties close with PROTOCOL_VIOLATION even under `--compat lenient-extensions`.
 - A WebTransport client cancelled while closing still detaches its dispatcher and stops its transport.
 - The wheel no longer ships `aiomoqt/tests`.

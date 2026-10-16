@@ -75,7 +75,7 @@ def add_help(p):
 
 # -- addressing ------------------------------------------------------
 
-def _endpoint(value):
+def endpoint_url(value):
     """argparse type for a dialled URL: refuse one the dialler would."""
     try:
         parse_relay_url(value)
@@ -87,7 +87,7 @@ def _endpoint(value):
 def add_endpoint(p, required=True):
     """Positional URL for tools that dial. Scheme picks the transport."""
     kw = {} if required else {'nargs': '?', 'default': None}
-    p.add_argument('url', metavar='URL', type=_endpoint, **kw,
+    p.add_argument('url', metavar='URL', type=endpoint_url, **kw,
                    help='Endpoint. moqt://host[:port][/path] = raw QUIC; '
                         'https://host[:port][/path] = WebTransport; '
                         'host[:port] = WebTransport. The scheme selects '
@@ -97,7 +97,7 @@ def add_endpoint(p, required=True):
 def add_endpoints(p):
     """Positional URLs for tools that dial several peers at once and do
     the same work to each. args.url is a list, one entry minimum."""
-    p.add_argument('url', metavar='URL', nargs='+', type=_endpoint,
+    p.add_argument('url', metavar='URL', nargs='+', type=endpoint_url,
                    help='Endpoint(s). moqt://host[:port][/path] = raw '
                         'QUIC; https://host[:port][/path] = '
                         'WebTransport; host[:port] = WebTransport. The '
