@@ -263,11 +263,11 @@ class MOQTClient(MOQTPeer):
             try:
                 if not session.session_closed:
                     session.close(0, b"")
-                    # close() defers the CONNECTION_CLOSE to the next loop
-                    # tick and the network thread transmits it; stop()
-                    # frees that thread, so give the close time to leave.
+                    # A graceful close() queues the WT close on the next tick.
                     await asyncio.sleep(0)
-                    await asyncio.wait_for(session.wait_closed(), 0.3)
+                # Wait for the connection to go, also after an error close
+                # made earlier: stop() drops a close picoquic has not sent.
+                await session.aclose(0, b"")
             except Exception:
                 pass
             # Releases the transport's event dispatcher, which otherwise
