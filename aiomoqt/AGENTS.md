@@ -18,7 +18,7 @@ This file ships at the repo root and inside the installed package (`aiomoqt/AGEN
 | `aiomoqt/types.py`, `context.py` | draft numbers, error codes, `DraftProfile`, `profile_for()` |
 | `aiomoqt/media/` | MSF catalog, LOC, CMSF/CMAF packaging |
 | `aiomoqt/tools/` | CLI tools — bench, pub/sub media, interop relay, relay probe |
-| `aiomoqt/tests/` | the pytest tree — **inside** the package |
+| `aiomoqt/tests/` | the pytest tree — **inside** the package dir, left out of the wheel |
 | `tests/` | `release_regression_test.py` (tier runner) + `relays.json`; `contrib/` = contribution-runner sweep. No pytest files |
 
 ## Setup
