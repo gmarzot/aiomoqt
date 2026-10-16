@@ -368,6 +368,8 @@ class _RelayedTrack:
         self._peak_subs = 0
         self._fetches = 0
         self._drops = 0
+        self._groups_in = 0
+        self._last_gid = None
         self.created = time.time()
 
     @property
@@ -513,6 +515,9 @@ class _RelayedTrack:
         self._bytes_in += len(payload)
         gid = getattr(msg, "group_id", None)
         gid = gid if gid is not None else group_id
+        if gid != self._last_gid:
+            self._groups_in += 1
+            self._last_gid = gid
         if self.key[1] == CATALOG_TRACK and msg.object_id == 0:
             _note_catalog(self.key[0], payload)
         # On arrival, so a SUBSCRIBE sees it; objects for the subscriber
@@ -2110,7 +2115,7 @@ def _track_state(track, flowing) -> str:
 _HISTORY_KEYS = ("t", "ingress_bps", "egress_bps", "media_in_bps",
                  "media_out_bps", "sessions", "subscribers", "tracks",
                  "loss_pct", "rtt_p50_ms", "lag_p99_ms", "cpu", "proc_cpu",
-                 "proc_rss", "rx_bps", "tx_bps")
+                 "proc_rss", "rx_bps", "tx_bps", "objects_in_per_s")
 
 
 class _Status:
@@ -2154,19 +2159,36 @@ class _Status:
         def bps(delta):
             return round(delta * 8 / dt) if dt else None
 
+        def per_s(delta):
+            return round(delta / dt, 1) if dt else None
+
+        live = [i for i in list(_sessions.values())
+                if _session_live(i["session"]) and not _internal_session(i)]
+        pqs = {id(i["session"]): _path_quality(i["session"]) for i in live}
+
+        def rtt_ms(session):
+            pq = pqs.get(id(session))
+            rtt = (_path_quality(session) if pq is None else pq).get("rtt")
+            return rtt / 1000 if rtt else None
+
         pubs, subs = set(), set()
         tracks, prev = [], {}
         for key, t in list(_tracks.items()):
             if _internal_ns(key[0]):
                 continue
-            p_in, p_out, p_drops = self._track_prev.get(id(t), (0, 0, 0))
-            prev[id(t)] = (t._bytes_in, t._bytes_out, t._drops)
+            p_in, p_out, p_drops, p_obj, p_grp = self._track_prev.get(
+                id(t), (0, 0, 0, 0, 0))
+            prev[id(t)] = (t._bytes_in, t._bytes_out, t._drops, t._objects_in,
+                           t._groups_in)
             self._delivered += t._bytes_out - p_out
             self._drops += t._drops - p_drops
             owner = _track_owner(t)
             if owner is not None:
                 pubs.add(id(owner))
             subs.update(id(d.session) for d in t.downstream)
+            up = rtt_ms(owner) if owner is not None else None
+            down = relay_status.percentile(
+                [r for r in (rtt_ms(d.session) for d in t.downstream) if r is not None], 50)
             tracks.append((key, {
                 "namespace": _ns_str(key[0]), "name": _name_str(key[1]),
                 "subscribers": len(t.downstream),
@@ -2177,6 +2199,14 @@ class _Status:
                 "bytes_in": t._bytes_in, "bytes_out": t._bytes_out,
                 "objects_in": t._objects_in, "objects_out": t._objects_out,
                 "fetches": t._fetches, "drops": t._drops,
+                "groups_in": t._groups_in,
+                "groups_per_s": per_s(t._groups_in - p_grp),
+                "objects_per_s": per_s(t._objects_in - p_obj),
+                "rtt_up_ms": None if up is None else round(up, 1),
+                "rtt_down_ms": None if down is None else round(down, 1),
+                # One-way network estimate: half of each RTT; no queueing or buffering.
+                "latency_ms": (None if up is None or down is None
+                               else round((up + down) / 2, 1)),
                 "largest": list(t.largest) if t.largest else None,
                 "cache_groups": len({c[0] for c in t._cache}),
                 "cache_bytes": t._cache_bytes,
@@ -2213,11 +2243,9 @@ class _Status:
         sessions, quic = [], {}
         tx = rx = sent = lost = 0
         rtts = []
-        for info in list(_sessions.values()):
+        for info in live:
             s = info["session"]
-            if not _session_live(s) or _internal_session(info):
-                continue
-            pq = _path_quality(s)
+            pq = pqs[id(s)]
             cur = (pq.get("bytes_sent", 0), pq.get("bytes_received", 0),
                    pq.get("sent", 0), pq.get("lost", 0))
             last = self._quic_prev.get(id(s))
@@ -2257,6 +2285,8 @@ class _Status:
             "subscribers": sum(r["subscribers"] for _, r in tracks),
             "ingress_bps": bps(rx), "egress_bps": bps(tx),
             "media_in_bps": media_in, "media_out_bps": media_out,
+            "objects_in_per_s": (None if dt is None else round(
+                sum(r["objects_per_s"] or 0 for _, r in tracks), 1)),
             # Share of egress not received upstream ("CDN efficiency").
             "efficiency": (max(0.0, 1 - media_in / media_out)
                            if media_out else None),
@@ -2277,6 +2307,7 @@ class _Status:
             "lag_p99_ms": lag["p99"], "cpu": host["cpu"],
             "proc_cpu": host["proc_cpu"], "proc_rss": host["proc_rss"],
             "rx_bps": host["rx_bps"], "tx_bps": host["tx_bps"],
+            "objects_in_per_s": totals["objects_in_per_s"],
         })
         return {
             "generated": wall, "interval_s": STATUS_INTERVAL_S,

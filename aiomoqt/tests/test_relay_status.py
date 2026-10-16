@@ -268,6 +268,11 @@ async def test_snapshot_reports_namespaces_tracks_and_sessions(
     assert tracks["video"]["bytes_out"] > tracks["video"]["bytes_in"] > 0
     assert tracks["video"]["state"] == "live"
     assert tracks["video"]["out_bps"] > 0
+    video = tracks["video"]
+    assert video["groups_in"] > 0
+    assert video["groups_per_s"] > 0 and video["objects_per_s"] > 0
+    assert None not in (video["rtt_up_ms"], video["rtt_down_ms"], video["latency_ms"])
+    assert totals["objects_in_per_s"] > 0
 
     relay_status.write_json_atomic(status.path, snap)
     with open(status.path) as f:
