@@ -9,6 +9,9 @@
 - WebTransport client settles its draft from the server's WT-Protocol, or d14 in-band when
   there is none and d14 was offered; otherwise it closes with WT_ALPN_ERROR and raises
   `MOQTNegotiationError`, pins included.
+- Relay: a d20+ PUBLISH is answered with an EXPIRES-only PUBLISH_OK, Forward State following in
+  a REQUEST_UPDATE; the PUBLISH_OK it built failed to encode.
+- Relay: the default `--draft` is the library's `MOQT_DEFAULT_DRAFTS`; `$DRAFT` still pins it.
 - d20-d22 FETCH: standalone FETCH is sent and served, the range in LOCATION_FILTER with an
   inclusive End; `fetch(location_filter=)`.
 - d20-d22 join(): SUBSCRIBE at the Next Object with FILL_PARAMETERS; joining_fetch() is a
