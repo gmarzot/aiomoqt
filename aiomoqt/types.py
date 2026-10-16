@@ -431,6 +431,8 @@ class RequestErrorCode(IntEnum):
     INVALID_JOINING_REQUEST_ID = 0x32
     UNSUPPORTED_EXTENSION = 0x33  # d18
     REDIRECT = 0x34               # d18; REQUEST_ERROR carries a Redirect
+    CONFLICTING_FILTERS = 0x35    # d20
+    INVALID_FILTER = 0x36         # d20
 
 
 class SubscribeDoneCode(IntEnum):

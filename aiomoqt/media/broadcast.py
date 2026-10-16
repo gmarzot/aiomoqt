@@ -16,11 +16,10 @@ import asyncio
 from typing import Callable, Dict, Optional
 
 from ..messages import SubgroupHeader
-from ..context import is_draft16_or_later
 from ..track import PublishedTrack, TrackState
 from ..types import (
     MOQTMessageType, MOQTRequestError, ObjectStatus, RequestErrorCode,
-    StreamResetCode, SubscribeErrorCode,
+    StreamResetCode,
 )
 from ..utils.logger import get_logger
 from .catalog import (
@@ -263,10 +262,7 @@ class MediaPublisher:
                            f"track {name!r}")
             session.subscribe_error(
                 msg.request_id,
-                RequestErrorCode.DOES_NOT_EXIST
-                if is_draft16_or_later(session.negotiated_draft)
-                else SubscribeErrorCode.TRACK_DOES_NOT_EXIST,
-                "track not published here")
+                RequestErrorCode.DOES_NOT_EXIST, "track not published here")
             return
         await track._on_subscribe(session, msg)
 
@@ -291,9 +287,7 @@ class MediaPublisher:
         if track is None:
             session.fetch_error(
                 request_id=msg.request_id,
-                error_code=(RequestErrorCode.DOES_NOT_EXIST
-                            if is_draft16_or_later(session.negotiated_draft)
-                            else SubscribeErrorCode.TRACK_DOES_NOT_EXIST),
+                error_code=RequestErrorCode.DOES_NOT_EXIST,
                 reason="track not published here")
             return
         await track._on_fetch(session, msg)

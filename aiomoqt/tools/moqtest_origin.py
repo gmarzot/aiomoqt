@@ -311,7 +311,7 @@ async def _on_fetch(session, msg):
         p = parse_namespace(msg.namespace)
     except ValueError as e:
         session.fetch_error(request_id=msg.request_id,
-                            error_code=int(RequestErrorCode.DOES_NOT_EXIST),
+                            error_code=RequestErrorCode.DOES_NOT_EXIST,
                             reason=str(e))
         return
     win = _fetch_window(p, msg.start_group or 0, msg.start_object or 0,
@@ -367,7 +367,7 @@ async def _on_subscribe(session, msg):
         logger.info(f"origin: subscribe rejected: {e}")
         session.subscribe_error(
             request_id=msg.request_id,
-            error_code=int(RequestErrorCode.DOES_NOT_EXIST),
+            error_code=RequestErrorCode.DOES_NOT_EXIST,
             reason=str(e))
         return
     ok = session.subscribe_ok(request_msg=msg)

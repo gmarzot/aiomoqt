@@ -3178,9 +3178,11 @@ class _MOQTSessionMixin:
                       error_code: int = SessionCloseCode.NO_ERROR) -> None:
         """RESET_STREAM. Sender-side abrupt termination — UNSUBSCRIBE,
         FETCH_CANCEL on the publisher, track teardown, error abort.
-        Also the canonical reply to a peer's STOP_SENDING."""
+        Also the canonical reply to a peer's STOP_SENDING. A
+        StreamResetCode is encoded for the negotiated draft."""
         if not self._session_writable():
             return
+        error_code = stream_reset_code(error_code, self._profile)
         if self._tx_deferred:
             self._tx_deferred.pop((stream_id, 'send'), None)
         self._tx_op(stream_id, 'send', 'reset', error_code)
@@ -3192,6 +3194,7 @@ class _MOQTSessionMixin:
         subscriber, FETCH_ERROR while the fetch stream is still open."""
         if not self._session_writable():
             return
+        error_code = stream_reset_code(error_code, self._profile)
         self._tx_op(stream_id, 'recv', 'stop', error_code)
 
     # Stream ops the transport refused on a full TX ring, retried as it
@@ -4277,8 +4280,9 @@ class _MOQTSessionMixin:
 
         d14: SUBSCRIBE_ERROR on the control stream. d16+: code point
         0x05 is REQUEST_ERROR (Error Code, Retry Interval, Reason) —
-        a d14 body there desyncs the peer's parse. Callers pass the
-        draft-appropriate error code."""
+        a d14 body there desyncs the peer's parse. A named code is
+        encoded for the negotiated draft (request_error_code())."""
+        error_code = request_error_code(error_code, self._profile)
         if is_draft16_or_later(self.negotiated_draft):
             message = RequestError(
                 request_id=request_id,
@@ -4693,7 +4697,10 @@ class _MOQTSessionMixin:
         """Create and send a negative response to a FETCH.
 
         d14 sends FETCH_ERROR (0x19); d16+ dropped it — the reject is
-        the universal REQUEST_ERROR, on the request's stream at d18."""
+        the universal REQUEST_ERROR, on the request's stream at d18. A
+        named code is encoded for the negotiated draft."""
+        error_code = request_error_code(error_code, self._profile,
+                                        fetch=True)
         if is_draft16_or_later(self.negotiated_draft):
             message = RequestError(
                 request_id=request_id,
@@ -5297,10 +5304,8 @@ class _MOQTSessionMixin:
     async def _handle_subscribe(self, msg: Subscribe) -> None:
         """Refuse a SUBSCRIBE no published track or app handler took."""
         logger.info(f"MOQT receive: {msg}")
-        code = (RequestErrorCode.DOES_NOT_EXIST
-                if is_draft16_or_later(self.negotiated_draft)
-                else SubscribeErrorCode.TRACK_DOES_NOT_EXIST)
-        self.subscribe_error(msg.request_id, error_code=int(code),
+        self.subscribe_error(msg.request_id,
+                             error_code=RequestErrorCode.DOES_NOT_EXIST,
                              reason="track does not exist")
 
     async def _handle_publish_namepace(self, msg: PublishNamespace) -> None:
@@ -5576,7 +5581,7 @@ class _MOQTSessionMixin:
         else:
             code, reason = (RequestErrorCode.NOT_SUPPORTED,
                             "fetch not supported")
-        self.fetch_error(request_id=msg.request_id, error_code=int(code),
+        self.fetch_error(request_id=msg.request_id, error_code=code,
                          reason=reason)
 
     async def _handle_fetch_cancel(self, msg: FetchCancel) -> None:

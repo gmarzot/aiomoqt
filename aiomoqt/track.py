@@ -32,7 +32,7 @@ from typing import Callable, Dict, Optional
 from .types import (
     FetchType, MOQTRequestError, ParamType, FilterType,
     ForwardingPreference, GroupOrder, LOC_TIMESTAMP, RequestErrorCode,
-    StreamResetCode, SubscribeDoneCode, SubscribeErrorCode,
+    StreamResetCode, SubscribeDoneCode,
 )
 from .delivery import (
     FanoutDelivery, ObjectHistory, StreamMapping, SubgroupDelivery,
@@ -925,10 +925,8 @@ class PublishedTrack(Track):
                 and window[1] is not None and reported is not None
                 and reported[0] > window[1]):
             # §5.1.2: the whole End Group is already published.
-            code = (RequestErrorCode.INVALID_RANGE
-                    if is_draft16_or_later(session.negotiated_draft)
-                    else SubscribeErrorCode.INVALID_RANGE)
-            session.subscribe_error(msg.request_id, error_code=int(code),
+            session.subscribe_error(msg.request_id,
+                                    error_code=RequestErrorCode.INVALID_RANGE,
                                     reason="end group already published")
             return
         kw = {}
@@ -1098,7 +1096,7 @@ class PublishedTrack(Track):
                                     "start after the joining location")
         except _FetchRefused as e:
             logger.info(f"Track: FETCH {rid} refused: {e.reason}")
-            session.fetch_error(request_id=rid, error_code=int(e.code),
+            session.fetch_error(request_id=rid, error_code=e.code,
                                 reason=e.reason)
             return
         order = (GroupOrder.DESCENDING
