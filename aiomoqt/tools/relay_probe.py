@@ -45,6 +45,7 @@ from aiomoqt.types import (
     moqt_version_from_draft,
     parse_draft_spec,
 )
+from aiomoqt.utils.cli import endpoint_url
 from aiomoqt.utils.url import parse_relay_url
 
 logging.basicConfig(
@@ -364,7 +365,7 @@ def parse_args(argv=None):
              "session (ordered as given) and report the draft the relay "
              "negotiates, instead of probing each draft separately.")
     p.add_argument(
-        "--url", default=None, metavar="URL",
+        "--url", default=None, metavar="URL", type=endpoint_url,
         help="probe a single relay URL (e.g. moqt://host:port or "
              "https://host:port/path) and print one line per probed "
              "draft to stdout; bypasses --relays-file / --output-file. "
