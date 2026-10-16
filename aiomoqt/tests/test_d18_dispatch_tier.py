@@ -96,12 +96,12 @@ def test_d18_selectable_without_env_var(monkeypatch):
 
 def test_default_client_offers_every_draft(monkeypatch):
     # The no-args default offers every draft we can speak, newest first,
-    # so an auto session negotiates d18 with a d18 peer and still falls
-    # back to d16 / d14 for older ones. Derived from MOQTDraft, not
-    # MOQT_VERSIONS (the d14 in-band list, which has no d18).
+    # and falls back to older ones. Derived from MOQTDraft, not
+    # MOQT_VERSIONS (the d14 in-band list).
     monkeypatch.delenv("AIOMOQT_ENABLE_D18", raising=False)
     c = MOQTClient("localhost", 4433)
-    assert c.supported_drafts == [18, 16, 14]
+    assert c.supported_drafts == [22, 20, 18, 16, 14]
+    assert c.supported_drafts == sorted((int(d) for d in MOQTDraft), reverse=True)
 
 
 def test_supported_drafts_accepts_int_or_list():

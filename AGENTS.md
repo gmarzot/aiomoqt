@@ -110,11 +110,12 @@ track or a request (SUBSCRIBE, PUBLISH_OK, updates) route through the session's 
 request tables (`PublishedTrack.attach()`, `_bind_request()`), which take precedence over app
 handlers. `test_published_tracks_take_no_session_handler_slot` enforces this for `track.py`.
 
-**Drafts.** 14, 16 and 18 are all live. Draft numbers are plain ints everywhere
-(`MOQTDraft`, the `draft=` kwarg, `supported_drafts`); the IETF code `0xff0000NN` and the ALPN
-(`moq-00` for d14, `moqt-NN` for d16+) exist only at the wire boundary. Default offer is
-newest-first `[18, 16, 14]`. Route behavior differences through `profile_for(draft)` /
-`DraftProfile` in `context.py` rather than scattering version checks. New wire shapes need a
+**Drafts.** 14, 16, 18, 20 and 22 are all live; odd-numbered drafts are not supported. Draft
+numbers are plain ints everywhere (`MOQTDraft`, the `draft=` kwarg, `supported_drafts`); the
+IETF code `0xff0000NN` and the ALPN (`moq-00` for d14, `moqt-NN` for d16+) exist only at the
+wire boundary. Default offer is newest-first `MOQT_DEFAULT_DRAFTS = (22, 20, 18, 16, 14)`.
+Route behavior differences through `profile_for(draft)` / `DraftProfile` in `context.py`
+rather than scattering version checks. New wire shapes need a
 case in `test_wire_conformance.py` — including malformed ones, since the Cython and Python
 codecs can agree on valid bytes while diverging on invalid ones.
 

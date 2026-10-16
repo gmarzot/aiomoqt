@@ -43,7 +43,7 @@ split execution (tools that can run one end or both)
 """
 import argparse
 
-from aiomoqt.types import parse_draft_spec
+from aiomoqt.types import MOQT_DEFAULT_DRAFTS, parse_draft_spec
 from aiomoqt.utils.url import parse_relay_url
 
 # Defaults, one place. Powers of two, same on every tool.
@@ -196,9 +196,10 @@ def add_run(p, duration=DEFAULT_DURATION, interval=True):
 def add_session(p, insecure=True, certs=False, keepalive=False,
                 compat=False):
     p.add_argument('--draft', type=parse_draft_spec, default=None,
-                   help='MoQT draft: 14, 16, 18, or opt-in 20, 21, 22; a '
-                        'comma list offers several in order. Default: '
-                        'offer 18,16,14')
+                   help='MoQT draft: '
+                        f'{", ".join(map(str, sorted(MOQT_DEFAULT_DRAFTS)))}; '
+                        'a comma list offers several in order. Default: '
+                        f'offer {",".join(map(str, MOQT_DEFAULT_DRAFTS))}')
     if insecure:
         p.add_argument('-k', '--insecure', action='store_true',
                        help='Accept any server certificate (self-signed relays)')

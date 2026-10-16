@@ -4,6 +4,8 @@ import os
 import subprocess
 import sys
 
+import pytest
+
 
 def _run(module, *args, draft):
     env = {**os.environ, "DRAFT": draft}
@@ -12,14 +14,15 @@ def _run(module, *args, draft):
                           capture_output=True, text=True, timeout=60)
 
 
-def test_client_reports_an_unsupported_pin_as_not_supported():
+@pytest.mark.parametrize("draft", ["19", "21"])
+def test_client_reports_an_unsupported_pin_as_not_supported(draft):
     r = _run("aiomoqt.tools.moq_interop_client", "-r", "moqt://127.0.0.1:9",
-             "-t", "setup-only", draft="19")
+             "-t", "setup-only", draft=draft)
     assert r.returncode == 127
     assert r.stdout.splitlines()[:2] == [
         "TAP version 14",
-        "1..0 # SKIP draft 19 not supported; aiomoqt speaks "
-        "[14, 16, 18, 20, 21, 22]"]
+        f"1..0 # SKIP draft {draft} not supported; aiomoqt speaks "
+        "[14, 16, 18, 20, 22]"]
 
 
 def test_relay_refuses_an_unsupported_pin():

@@ -1,4 +1,4 @@
-"""draft-20 message shapes, shared by d20, d21 and d22.
+"""draft-20 message shapes, shared by d20 and d22.
 
 SETUP keeps the d18 frame (type 0x2F00, 16-bit Length, delta-coded Setup
 Options) and adds the d20 Setup Options registry. PUBLISH_STATE_NOTIFY is

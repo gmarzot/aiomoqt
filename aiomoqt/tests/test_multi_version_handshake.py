@@ -97,23 +97,19 @@ async def test_non_intersecting_alpn_fails():
 
 
 @pytest.mark.asyncio
-async def test_wt_default_server_and_client_settle_d18():
-    """Unpinned WT server + unpinned WT client both default to every draft
-    we speak (18, 16, 14), so an auto session settles on d18. The default
-    WT client offers moqt-18; the server, lacking in-band WT selection,
-    defaults to max(supported_drafts) = 18.
-    """
+async def test_wt_multi_draft_server_and_client_settle_d18():
+    """A WT server and client both offering 18, 16, 14 settle on d18."""
     port = _BASE_PORT + 60
     server = MOQTServer(
         host="localhost", port=port,
         certificate=CERT, private_key=KEY, path="/",
-        use_quic=False,  # WebTransport, no draft pin
+        use_quic=False, supported_drafts=[18, 16, 14],
     )
     handle = await server.serve()
     try:
         client = MOQTClient(
             "localhost", port, path="/", use_quic=False,
-            verify_tls=False,  # no draft pin
+            verify_tls=False, supported_drafts=[18, 16, 14],
         )
         async with client.connect() as session:
             await session.client_session_init()

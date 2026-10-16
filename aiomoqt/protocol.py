@@ -111,7 +111,10 @@ class MOQTPeer:
     """MOQT client and server base-class."""
     def __init__(self, libquicr_compat: bool = False,
                  tx_max_inflight_bytes: Optional[int] =
-                     DEFAULT_TX_MAX_INFLIGHT_BYTES):
+                     DEFAULT_TX_MAX_INFLIGHT_BYTES,
+                 implementation: Optional[str] = USER_AGENT):
+        # MOQT_IMPLEMENTATION Setup Option value; None omits it.
+        self.implementation = implementation
         #  message handlers
         self._control_msg_handlers: Dict[int, Callable] = {}
         self.libquicr_compat = libquicr_compat
@@ -2771,23 +2774,30 @@ class _MOQTSessionMixin:
         else:
             # WebTransport over aiopquic. The WT session is open by the
             # time client_session_init runs (open() awaited already);
-            # _wt_session_setup is resolved in _moqt_wt_finalize. Resolve
-            # the draft from the negotiated WT-Protocol (in-band
-            # WT-Available-Protocols -> WT-Protocol selection, surfaced by
-            # aiopquic as negotiated_protocol); a single supported draft
-            # (a pin) still wins.
-            _drafts = getattr(self._session, 'supported_drafts', None)
-            draft = _drafts[0] if _drafts and len(_drafts) == 1 else None
-            if draft is not None:
-                self._settle_draft(get_major_version(draft))
+            # _wt_session_setup is resolved in _moqt_wt_finalize. The draft
+            # is the server's WT-Protocol choice from our offer; with none,
+            # a d14 offer (versions in SETUP) proceeds. Anything else closes
+            # with WT_ALPN_ERROR (webtrans-http3 §3.3), pins included.
+            drafts = list(getattr(self._session, 'supported_drafts', None)
+                          or ())
+            offered = [f"moqt-{d}" for d in drafts
+                       if not profile_for(d).setup_carries_versions]
+            in_setup = [d for d in drafts
+                        if profile_for(d).setup_carries_versions]
+            negotiated = self.negotiated_protocol
+            if negotiated in offered:
+                self._settle_draft(get_major_version(
+                    moqt_version_from_alpn(negotiated)))
+                logger.info(
+                    f"MOQT: version set from WT-Protocol: "
+                    f"{negotiated} -> draft-{self.negotiated_draft}")
+            elif in_setup and (negotiated is None or not offered):
+                self._settle_draft(get_major_version(in_setup[0]))
             else:
-                negotiated = self.negotiated_protocol
-                if negotiated:
-                    self._settle_draft(get_major_version(
-                        moqt_version_from_alpn(negotiated)))
-                    logger.info(
-                        f"MOQT: version set from WT-Protocol: "
-                        f"{negotiated} -> draft-{self.negotiated_draft}")
+                reason = (f"WT-Protocol {negotiated!r} not in offer "
+                          f"{offered}")
+                self._close_session(WT_ALPN_ERROR, reason)
+                raise MOQTNegotiationError(reason)
             if self._profile.control_uni_pair:
                 # d18 over WT: control is a uni-stream pair, same as raw
                 # QUIC — open our write-control uni (WT create_stream); the
@@ -2811,7 +2821,7 @@ class _MOQTSessionMixin:
         # version array (negotiated via ALPN), no MAX_REQUEST_ID Setup
         # Option (removed), count-less Setup Options. Pre-d18 sends
         # CLIENT_SETUP with the version list.
-        params[SetupParamType.IMPLEMENTATION] = USER_AGENT.encode()
+        params.update(self._implementation_option())
         if parameters:
             params.update(parameters)  # caller SETUP options (e.g. AUTH_TOKEN)
         self._auth_token_cache_max = int(
@@ -3167,6 +3177,11 @@ class _MOQTSessionMixin:
 
     _REPLY_CLASSES = (RequestOk, RequestError, SubscribeOk, SubscribeDone,
                       PublishOk, FetchOk, PublishStateNotify)
+
+    def _implementation_option(self) -> Dict[int, bytes]:
+        impl = getattr(getattr(self, '_session', None), 'implementation',
+                       USER_AGENT)
+        return {} if impl is None else {SetupParamType.IMPLEMENTATION: impl.encode()}
 
     def _setup_message(self, options: Dict[int, Any]) -> Setup:
         """SETUP of the negotiated draft's class (d18, or d20 for d20+)."""
@@ -3698,8 +3713,7 @@ class _MOQTSessionMixin:
         parameters: Optional[Dict[int, bytes]] = None
     ) -> ServerSetup:
         """Send SERVER_SETUP message in response to CLIENT_SETUP."""
-        if parameters is None:
-            parameters = {}
+        parameters = {**self._implementation_option(), **(parameters or {})}
         if not self._profile.control_uni_pair:
             self._local_request_max = self.REQUEST_ID_WINDOW
             parameters.setdefault(SetupParamType.MAX_REQUEST_ID,
@@ -5473,8 +5487,8 @@ class _MOQTSessionMixin:
             logger.info(
                 f"MOQT: d18 server control write-uni: "
                 f"{self._d18_control_write_sid}")
-            self.send_control_message(self._setup_message({
-                SetupParamType.IMPLEMENTATION: USER_AGENT.encode()}))
+            self.send_control_message(self._setup_message(
+                self._implementation_option()))
             # Replies that raced the write-uni bring-up were deferred;
             # SETUP is on the wire, so release them now.
             self._flush_pending_control()
@@ -5595,7 +5609,7 @@ class _MOQTSessionMixin:
     _D18_REGISTRY[D18MessageType.PUBLISH_BLOCKED] = (
         PublishBlocked, _handle_publish_blocked)
 
-    # d20, d21 and d22 share one table: d18 with the d20 SETUP codec and
+    # d20 and d22 share one table: d18 with the d20 SETUP codec and
     # PUBLISH_STATE_NOTIFY. PUBLISH_OK 0x1E is reserved from d20 and is
     # pruned below.
     _D20_REGISTRY = dict(_D18_REGISTRY)
@@ -5608,7 +5622,6 @@ class _MOQTSessionMixin:
         MOQTDraft.DRAFT_16: _D16_REGISTRY,
         MOQTDraft.DRAFT_18: _D18_REGISTRY,
         MOQTDraft.DRAFT_20: _D20_REGISTRY,
-        MOQTDraft.DRAFT_21: _D20_REGISTRY,
         MOQTDraft.DRAFT_22: _D20_REGISTRY,
     }
     # One source of truth with the TX guard: dispatch exactly the types
