@@ -327,6 +327,8 @@ async def test_after_our_goaway_new_requests_are_refused(use_quic):
         await rx.subscribe(_NS, "audio", forward=1, wait_response=True)
         pub.goaway()
         await asyncio.sleep(0.05)
+        assert rx.goaway_received is not None
+        rx.goaway_received = None  # a peer that requests anyway
         assert await _error_code(rx.subscribe(
             _NS, "video", forward=1, wait_response=True)) \
             == RequestErrorCode.GOING_AWAY

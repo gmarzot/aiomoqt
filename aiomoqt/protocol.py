@@ -198,6 +198,12 @@ class _MOQTSessionMixin:
     _is_wt = False
     # We sent a GOAWAY: every later peer request is refused (§10.4).
     _goaway_sent = False
+    # The peer's control-stream GOAWAY: no new request is sent after it.
+    goaway_received: Optional['GoAway'] = None
+    # Called as on_goaway(msg, request_id) for each GOAWAY received:
+    # request_id None for the session, else the request to migrate. May be
+    # a coroutine function.
+    on_goaway: Optional[Callable] = None
 
     @property
     def _is_client(self) -> bool:
@@ -661,9 +667,14 @@ class _MOQTSessionMixin:
     _peer_request_limit: Optional[int] = None
     _requests_blocked_sent = False
 
-    def _allocate_request_id(self) -> int:
-        """Next request id. At the peer's MAX_REQUEST_ID (pre-d18) send
+    def _allocate_request_id(self, opener: bool = True) -> int:
+        """Next request id. A new request (`opener`) is refused after the
+        peer's GOAWAY. At the peer's MAX_REQUEST_ID (pre-d18) send
         REQUESTS_BLOCKED once and refuse the request."""
+        if opener and self.goaway_received is not None:
+            raise MOQTRequestError(
+                error_code=int(RequestErrorCode.GOING_AWAY),
+                reason="the peer sent GOAWAY", retry_interval=0)
         limit = self._peer_request_limit
         if limit is not None and self._next_request_id >= limit:
             if not self._requests_blocked_sent:
@@ -2400,6 +2411,12 @@ class _MOQTSessionMixin:
                         f"GOAWAY Request ID {msg.request_id} has the "
                         f"wrong parity")
                     return
+                if is_request_bidi:
+                    self._report_goaway(
+                        msg, self._bidi_stream_requests.get(stream_id))
+                else:
+                    self.goaway_received = msg
+                    self._report_goaway(msg, None)
         if end_stream:
             self._control_chains.pop(stream_id, None)
             # §3.3: the control stream is never closed while the session
@@ -2430,6 +2447,20 @@ class _MOQTSessionMixin:
                 del self._peer_requests[request_id]
                 self._loop.call_soon(self._end_cancelled_request,
                                      request_id, stream_id)
+
+    def _report_goaway(self, msg: 'GoAway',
+                       request_id: Optional[int]) -> None:
+        cb = self.on_goaway
+        if cb is None:
+            return
+        try:
+            result = cb(msg, request_id)
+            if asyncio.iscoroutine(result):
+                task = asyncio.ensure_future(result)
+                self._tasks.add(task)
+                task.add_done_callback(self._control_task_done)
+        except Exception:
+            logger.debug("on_goaway raised", exc_info=True)
 
     def _end_cancelled_request(self, request_id: int, stream_id: int) -> None:
         """Tear down a request the peer cancelled with FIN and FIN our
@@ -4014,7 +4045,7 @@ class _MOQTSessionMixin:
                     f"{pending} REQUEST_UPDATEs already outstanding on "
                     f"request {existing_request_id} (peer "
                     f"MAX_REQUEST_UPDATES {limit})")
-        request_id = self._allocate_request_id()
+        request_id = self._allocate_request_id(opener=False)
         message = RequestUpdate(request_id=request_id,
                                 existing_request_id=existing_request_id,
                                 parameters=params)
@@ -5081,16 +5112,26 @@ class _MOQTSessionMixin:
                     f"'{name}' (waiting for '{trackname}')")
         return await asyncio.wait_for(_next_matching(), timeout=timeout)
 
-    def goaway(self, new_session_uri: str = "",
-               timeout: int = 0) -> GoAway:
+    def goaway(self, new_session_uri: str = "", timeout: int = 0,
+               request_id: Optional[int] = None) -> GoAway:
         """Announce imminent session close / migration (§10.4).
 
         Servers MAY carry a New Session URI; clients MUST send an empty
         one. At d18 the control-stream form names the smallest peer
-        request id that might not have been processed."""
+        request id that might not have been processed. With `request_id`
+        (d18+) the GOAWAY rides that request's stream and migrates only
+        that request."""
         if self._is_client and new_session_uri:
             raise ValueError("clients MUST send an empty New Session URI")
         msg = GoAway(new_session_uri=new_session_uri, timeout=timeout)
+        if request_id is not None:
+            if not self._profile.control_uni_pair:
+                raise ValueError(
+                    f"a request GOAWAY needs draft-18 or later, not "
+                    f"draft-{self.negotiated_draft}")
+            logger.info(f"MOQT send: {msg} on request {request_id}")
+            self._send_on_request_stream(request_id, msg)
+            return msg
         if self.negotiated_draft >= 18 and self._profile.goaway_request_id:
             if self._peer_request_max < 0:
                 msg.request_id = 0 if not self._is_client else 1
