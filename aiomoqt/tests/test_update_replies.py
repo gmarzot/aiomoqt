@@ -116,7 +116,9 @@ async def test_stream_end_fails_the_waiting_updates(use_quic):
         srv = rx["session"]
         a, b = sorted(rx["requests"])
         srv._send_reply(a, RequestOk(request_id=a))
-        await asyncio.sleep(0.05)
+        # Request a answered: only its update still waits.
+        await _until(lambda: list(session._tx_updates.get(a, ()))
+                     == rx["updates"][a])
         srv.stream_fin(srv._bidi_streams[a])
         srv._send_reply(b, RequestOk(request_id=b))
         srv._send_reply(rx["updates"][b][0],
