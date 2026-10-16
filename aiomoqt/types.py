@@ -670,10 +670,12 @@ class MOQTRequestError(Exception):
 #     9            datagrams (picoquic's own default, left alone), so
 #                  datagrams beat bulk stream data but yield to control
 #     10 .. 254    subscription data
+#     255          PADDING streams
 STREAM_BAND_UNSET = 0
 STREAM_BAND_RESERVED = (2, 4, 6)
 STREAM_BAND_CONTROL = 8
 STREAM_BAND_DATA_FLOOR = 10
+STREAM_BAND_PADDING = 255
 
 SCHEDULING = ("round_robin", "fifo")
 

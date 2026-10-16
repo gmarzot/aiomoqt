@@ -23,7 +23,7 @@ from .messages.d18 import Setup
 from .messages.d20 import PublishStateNotify, Setup as D20Setup
 from .messages.fetch import _is_joining
 from .messages.data import (FETCH_FLAGS_END_TIMED_OUT,
-                            FETCH_FLAGS_END_UNKNOWN)
+                            FETCH_FLAGS_END_UNKNOWN, encode_padding)
 from .messages.params import (
     RANGE_FILTERS, D20ParamType, D20RequestErrorCode, check_param_scope,
     fill_range, range_filter_count, range_filter_error, uses_location_filter,
@@ -467,6 +467,7 @@ class _MOQTSessionMixin:
         #   fn(msg, size_bytes, recv_time_us, group_id, subgroup_id)
         self.on_object_received: Optional[Callable] = None
         self._object_cb_errors = 0
+        self._padding_rx = 0  # PADDING streams and datagrams discarded
         # Optional callback for received FetchObjects (fetch uni stream):
         #   fn(msg, size_bytes, recv_time_us, request_id)
         # Fires for normal objects only; End of Range markers go to
@@ -2092,6 +2093,7 @@ class _MOQTSessionMixin:
                     # control moving). No parser bound; bytes ignored.
                     data_type = "PADDING"
                     msg_header = None
+                    self._padding_rx += 1
                     raise MOQTStreamReject(
                         SessionCloseCode.NO_ERROR, "padding stream drained")
                 elif is_subgroup:
@@ -2263,6 +2265,7 @@ class _MOQTSessionMixin:
         PADDING datagram 0x132B3E29 (d18 only) is drained."""
         if self._profile.vi64 and dgram_type == PADDING_DATAGRAM_TYPE:
             logger.debug("MOQT event: PADDING datagram drained")
+            self._padding_rx += 1
             return
         valid_form = (dgram_type & ~0x2F) == 0 and (dgram_type & 0x10) == 0
         if (not valid_form) or dgram_type in self._D18_DGRAM_INVALID:
@@ -3872,6 +3875,24 @@ class _MOQTSessionMixin:
             return 0
         return q.max_datagram_payload()
 
+    async def send_padding(self, size: int, *,
+                           datagram: bool = False) -> Optional[int]:
+        """Send `size` bytes of PADDING (§11.5, d18+): a uni stream ended
+        with FIN at the lowest send priority, returning its id, or one
+        datagram, returning None."""
+        wire = encode_padding(size, prof=self._profile, datagram=datagram)
+        if datagram:
+            if len(wire) > self.datagram_max_payload():
+                raise ValueError(
+                    f"padding datagram of {len(wire)}B does not fit "
+                    f"(ceiling {self.datagram_max_payload()}B)")
+            await self.dgram_write_drain(wire)
+            return None
+        sid = await self.open_uni_stream()
+        self.set_stream_priority(sid, STREAM_BAND_PADDING)
+        await self.stream_write_drain(sid, wire, end_stream=True)
+        return sid
+
     async def dgram_write_drain(self, buf: Buffer) -> None:
         """Send a MoQT datagram, parking on transport backpressure.
 
@@ -3881,7 +3902,7 @@ class _MOQTSessionMixin:
         CancelledError once the session is closing, mirroring
         stream_write_drain.
         """
-        data = buf.data
+        data = buf if isinstance(buf, (bytes, bytearray)) else buf.data
         while True:
             if self._close_err is not None or self._quic is None:
                 raise asyncio.CancelledError

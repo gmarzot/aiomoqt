@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- d18+: `session.send_padding(size, datagram=)` sends a PADDING stream (lowest send priority) or datagram of zeros; pub_bench `--padding`.
 - `subscribe_error`, `fetch_error`, `stream_reset` and `stream_stop_sending` encode a named code for the negotiated draft (`request_error_code`, `stream_reset_code`, `canonical_request_error` in `context`); d14 FETCH_ERROR and d16 UNKNOWN_OBJECT_STATUS get their own values.
 - A raising object, fetch-object or fetch-gap callback is caught per object; the rest of the drained batch is still delivered.
 - `set_default_stream_priority` on WebTransport no longer recurses; it returns False when the transport has no context default.

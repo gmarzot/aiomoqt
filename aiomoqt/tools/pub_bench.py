@@ -109,6 +109,10 @@ The URL scheme selects the transport:
                         metavar='SECONDS',
                         help='Send GOAWAY this long after publishing; '
                              'later requests are refused GOING_AWAY')
+    parser.add_argument('--padding', type=int, default=0, metavar='BYTES',
+                        help='After SETUP, send one PADDING stream of BYTES '
+                             'zeros, and one PADDING datagram when the '
+                             'peer takes datagrams (d18+)')
     content = parser.add_mutually_exclusive_group()
     content.add_argument('--prefill', type=int, default=0, metavar='GROUPS',
                          help='Hold GROUPS groups as already published, '
@@ -202,6 +206,10 @@ async def run(args):
             if args.token_cache > 0:
                 setup[SetupParamType.MAX_AUTH_TOKEN_CACHE_SIZE] = args.token_cache
             await session.client_session_init(parameters=setup)
+            if args.padding:
+                await session.send_padding(args.padding)
+                if session.datagram_max_payload() >= args.padding + 8:
+                    await session.send_padding(args.padding, datagram=True)
             if args.track_status:
                 session.track_status(args.namespace, args.trackname)
 

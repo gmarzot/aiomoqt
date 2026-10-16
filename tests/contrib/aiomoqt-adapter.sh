@@ -134,6 +134,9 @@ case "$scenario_id" in
         control=(--second-track) ;;
     publish-distinct-content-tracks-in-same-scope)
         control=(--second-track --forward 1) ;;
+    observe-publisher-padding-stream|\
+    observe-publisher-padding-datagram)
+        control=(--padding 64) ;;
 esac
 
 # A 64-byte token cache holds the runner's 20-byte alias entries and stays

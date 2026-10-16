@@ -105,6 +105,8 @@ class DraftProfile:
     error_table: int = 18
                                   # request error and stream reset code
                                   # tables below: 14, 16, 18, 20.
+    padding: bool = True
+                                  # PADDING streams and datagrams (d18+).
 
     @property
     def vi64(self) -> bool:
@@ -121,7 +123,7 @@ PROFILES = {
         control_uni_pair=False, reply_has_request_id=True,
         uint8_params=frozenset(),
         object_statuses=frozenset({0x0, 0x1, 0x3, 0x4}),
-        error_table=14),
+        error_table=14, padding=False),
     MOQTDraft.DRAFT_16: DraftProfile(
         draft=MOQTDraft.DRAFT_16, setup_carries_versions=False,
         params_delta_coded=True, varint="rfc9000",
@@ -129,7 +131,7 @@ PROFILES = {
         uint8_params=frozenset(),
         merged_datagram_layout=True,
         subgroup_type_mask=0x2F,
-        error_table=16),
+        error_table=16, padding=False),
     # draft-18 negotiates out-of-band (ALPN/WT-Protocol) like d16 and uses
     # delta-coded params, but forks the wire codec to vi64, runs control over
     # a pair of uni streams, drops the Request ID from request replies, and
