@@ -393,7 +393,7 @@ class PublishedTrack(Track):
                  object_size: int = 1024, group_size: int = 60,
                  num_subgroups: int = 1, rate: float = 0,
                  priority: int = 128,
-                 auth_token: Optional[bytes] = b"bench-token",
+                 auth_token: Optional[bytes] = None,
                  forwarding: ForwardingPreference =
                      ForwardingPreference.SUBGROUP,
                  fetch_history_bytes: int = FETCH_HISTORY_DEFAULT):

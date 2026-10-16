@@ -85,9 +85,9 @@ The URL scheme selects the transport:
                         help='Refuse a request carrying this token (Token '
                              'Type, hex Value) with REQUEST_ERROR CODE; '
                              'repeatable')
-    parser.add_argument('--auth-token', type=str, default='bench-token',
-                        help='AUTH_TOKEN sent on PUBLISH_NAMESPACE; empty '
-                             'sends none (default %(default)s)')
+    parser.add_argument('--auth-token', type=str, default='',
+                        help='AUTH_TOKEN sent on PUBLISH_NAMESPACE '
+                             '(default: none)')
     parser.add_argument('--track-status', action='store_true',
                         help='Ask the peer for the track\'s status '
                              '(TRACK_STATUS) before publishing')

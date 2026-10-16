@@ -109,7 +109,7 @@ class LocTrackPublisher(PublishedTrack):
                  priority: int = 128,
                  timescale: Optional[int] = None,
                  media_kind: str = "video",
-                 auth_token: bytes = b"bench-token",
+                 auth_token: Optional[bytes] = None,
                  queue_size: int = 256,
                  loc01_compat: bool = False,
                  codec_string: Optional[str] = None,

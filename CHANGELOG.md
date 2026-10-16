@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `PublishedTrack` and `LocTrackPublisher` `auth_token` default to None, and pub_bench `--auth-token` to none: a default announce carries no AUTH_TOKEN.
 - An empty host in a bare `:port` URL raises ValueError; load_sim, adaptive_bench and relay_probe `--url` exit with a usage error.
 - MediaPublisher serves a FETCH from the objects each track published, its FETCH_OK End the end of that range; MediaSubscriber ignores a catalog object older than the one applied.
 - A received GOAWAY is recorded (`goaway_received`) and reported to `on_goaway(msg, request_id)`; no new request is sent after a control-stream GOAWAY. `goaway(request_id=)` sends one on a request stream (d18+).
