@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `moq_interop_client.run_tests`: removed the unreachable auto-offer draft-14 fallback.
 - Integration tier: loopback-bench draft × transport matrix covers d20 and d22.
 - WebTransport client teardown waits for the connection to close, so an error close (e.g. WT_ALPN_ERROR) is not dropped by the transport stopping.
 - MediaPublisher serves a FETCH from the objects each track published, its FETCH_OK End the end of that range; MediaSubscriber ignores a catalog object older than the one applied.
