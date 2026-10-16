@@ -1,8 +1,8 @@
-"""Message Parameter tables and value codecs for draft-20/21/22.
+"""Message Parameter tables and value codecs for draft-20 and draft-22.
 
-d20 and d21 share one wire; d22 differs only in LOCATION_FILTER (a typed
-form instead of a Length) and in TRACK_NAMESPACE_PREFIX (a bare Track
-Namespace instead of a length-prefixed one). DraftProfile.param_table
+d22 differs from d20 only in LOCATION_FILTER (a typed form instead of a
+Length) and in TRACK_NAMESPACE_PREFIX (a bare Track Namespace instead of a
+length-prefixed one). DraftProfile.param_table
 selects the table; DraftProfile.location_filter_typed selects the
 LOCATION_FILTER form.
 """
@@ -159,7 +159,7 @@ def check_param_scope(params: Iterable[int], scope: str, *,
 
 
 class LocationFilterType(IntEnum):
-    """Location Filter forms, numbered as d22 Table 6. d20/d21 express
+    """Location Filter forms, numbered as d22 Table 6. d20 expresses
     each by its field count instead."""
     NONE = 0x00
     RELATIVE_START = 0x01

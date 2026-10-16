@@ -2,7 +2,7 @@
   "_schema": {
     "name":             "short id used in results table",
     "urls":             "map of transport → URL; keys: raw-quic, h3-wt",
-    "drafts":           "list of MoQT draft numbers (14, 16, 18)",
+    "drafts":           "list of MoQT draft numbers (14, 16, 18, 20, 22)",
     "pub_mode":         "publisher messages: publish | publish-ns | publish-both",
     "insecure":         "bool; if true, pass --tls-disable-verify / -k (default false)",
     "disabled":         "bool; if true, skip this relay entirely (default false)",
@@ -41,7 +41,7 @@
         "raw-quic": "moqt://fb.mvfst.net:9448",
         "h3-wt":    "https://fb.mvfst.net:9448/moq-relay"
       },
-      "drafts": [16, 18],
+      "drafts": [16, 18, 22],
       "gating": [16, 18],
       "pub_mode": "publish",
       "disabled_suites": [],
@@ -101,10 +101,10 @@
         "raw-quic": "moqt://lminiero.it:9000",
         "h3-wt":    "https://lminiero.it:9000"
       },
-      "drafts": [16],
+      "drafts": [16, 22],
       "pub_mode": "publish",
       "disabled_suites": [],
-      "notes": "Meetecho imquic (C). d14 probes rejected (WT: \"No WebTransport protocol offered\"; QUIC close 376); only d16 tested here."
+      "notes": "Meetecho imquic (C). d14 probes rejected (WT: \"No WebTransport protocol offered\"; QUIC close 376); d16 and d22 tested here."
     },
     {
       "name": "cf-d16-interop",
@@ -138,6 +138,49 @@
       "pub_mode": "publish-both",
       "disabled_suites": [],
       "notes": "Cloudflare moq-rs draft-18-dev. Setup OK; announce/subscribe fail relay-side — moq-rs draft-18-dev has no accept_bi, so it never reads the per-request bidirectional request streams IETF d18 §3 mandates (verified against a locally-built relay + mlog). Kept as a documented relay-side failure rather than masked."
+    },
+    {
+      "name": "nokia-d22",
+      "urls": {
+        "raw-quic": "moqt://moqt.nokiaresearch.com:8443/moq"
+      },
+      "drafts": [22],
+      "pub_mode": "publish",
+      "disabled_suites": [],
+      "notes": "Nokia Research draft-22 relay, raw QUIC only."
+    },
+    {
+      "name": "moqtail-d22",
+      "urls": {
+        "raw-quic": "moqt://relay.moqtail.dev:8244",
+        "h3-wt":    "https://relay.moqtail.dev:8244"
+      },
+      "drafts": [22],
+      "pub_mode": "publish",
+      "disabled_suites": [],
+      "notes": "OzU moqtail draft-22 relay; the d14 endpoint is the separate moqtail entry."
+    },
+    {
+      "name": "stitcher-moq",
+      "urls": {
+        "raw-quic": "moqt://34-72-6-160.sslip.io:443",
+        "h3-wt":    "https://34-72-6-160.sslip.io:443"
+      },
+      "drafts": [18, 20, 22],
+      "pub_mode": "publish",
+      "disabled_suites": [],
+      "notes": "Stitcher MoQ relay, drafts 18/20/22."
+    },
+    {
+      "name": "moqarena",
+      "urls": {
+        "raw-quic": "moqt://moqarena.marzresearch.net:4443",
+        "h3-wt":    "https://moqarena.marzresearch.net:4443/"
+      },
+      "drafts": [22, 20, 18],
+      "pub_mode": "publish",
+      "disabled_suites": [],
+      "notes": "Our own open relay (moq_interop_relay)."
     }
   ]
 }

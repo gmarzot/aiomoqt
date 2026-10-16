@@ -491,14 +491,14 @@ def _relayed(name):
 
 
 @contextlib.asynccontextmanager
-async def _flowing(port, use_quic):
+async def _flowing(port, use_quic, draft=18):
     """A relay with video and audio PUBLISHed on one session, two groups
     of each already published (Largest {1, 4}). Yields a coroutine that
     opens a subscriber session and returns (session, objects), mapping
     each track name to the (group, object) Locations received."""
     _reset_relay_state()
     server = relay._build_server("localhost", port, CERT, KEY,
-                                 use_quic=use_quic, draft=18)
+                                 use_quic=use_quic, draft=draft)
     handle = await server.serve()
     by_size = {size: name for name, size in _SIZES.items()}
     try:
@@ -506,7 +506,7 @@ async def _flowing(port, use_quic):
             async def _session():
                 client = MOQTClient("localhost", port, path="/",
                                     use_quic=use_quic, verify_tls=False,
-                                    supported_drafts=18)
+                                    supported_drafts=draft)
                 s = await stack.enter_async_context(client.connect())
                 await s.client_session_init()
                 return s
@@ -540,6 +540,27 @@ async def _flowing(port, use_quic):
     finally:
         handle.close()
         _reset_relay_state()
+
+
+@requires_certs
+@pytest.mark.asyncio
+@pytest.mark.parametrize("draft", [20, 22])
+@_TRANSPORTS
+async def test_published_tracks_reach_subscribers_at_d20_and_d22(draft,
+                                                                use_quic):
+    # From d20 PUBLISH_OK carries only EXPIRES; Forward State follows in a
+    # REQUEST_UPDATE.
+    port = _flow_port(4 + (draft == 22), use_quic)
+    async with _flowing(port, use_quic, draft=draft) as subscriber:
+        rx, objects = await subscriber()
+        for name in _SIZES:
+            await rx.subscribe(_FLOW_NS, name, forward=1, wait_response=True)
+        for _ in range(150):
+            if all(objects[n] for n in _SIZES):
+                break
+            await asyncio.sleep(0.02)
+        assert all(objects[n] for n in _SIZES), objects
+        assert rx._close_err is None
 
 
 @requires_certs

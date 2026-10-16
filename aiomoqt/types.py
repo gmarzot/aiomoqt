@@ -25,13 +25,12 @@ class MOQTDraft(IntEnum):
     DRAFT_16 = 16
     DRAFT_18 = 18
     DRAFT_20 = 20
-    DRAFT_21 = 21
     DRAFT_22 = 22
 
 
 # What a client offers and a server accepts when supported_drafts is None,
-# newest first. Other MOQTDraft members are opt-in: named explicitly.
-MOQT_DEFAULT_DRAFTS: Tuple[int, ...] = (18, 16, 14)
+# newest first.
+MOQT_DEFAULT_DRAFTS: Tuple[int, ...] = (22, 20, 18, 16, 14)
 
 
 # ALPN: draft-14 uses legacy "moq-00"; draft-16+ uses "moqt-NN"
@@ -129,7 +128,7 @@ def normalize_supported_drafts(supported_drafts) -> list:
 
     Accepts the forms the public API allows:
       - None        → MOQT_DEFAULT_DRAFTS, newest first (the "auto"
-                       offer); drafts outside it are opt-in
+                       offer)
       - int         → a single draft number, e.g. 16 → [16]
       - list[int]   → several draft numbers, e.g. [16, 14]; the caller's
                       order is preserved (deduped), so a caller can put a
@@ -238,7 +237,7 @@ class D18MessageType:
 
 
 class D20MessageType:
-    """Draft-20 code points that are new or renamed (d21 and d22 alike)."""
+    """Draft-20 code points that are new or renamed; d22 keeps them."""
     PUBLISH_STATE_NOTIFY = 0x22  # new in d20
     PUBLISH_SKIPPED = 0x0F       # d18 PUBLISH_BLOCKED, same wire shape
 
@@ -256,7 +255,7 @@ HANDLER_ALIASES: Dict[int, Tuple[int, ...]] = {
 
 # Control message types each draft defines, transcribed from the message
 # type registry table in each specification (d14 §9.2, d16 §9.2, d18
-# §10.2, d20 §10.2, d21/d22 §9 Table 5). Sending a type absent from the
+# §10.2, d20 §10.2, d22 §9 Table 5). Sending a type absent from the
 # negotiated draft's table is a wire violation: the peer sees an unknown
 # control message and closes the session with PROTOCOL_VIOLATION.
 #
@@ -269,7 +268,7 @@ HANDLER_ALIASES: Dict[int, Tuple[int, ...]] = {
 # answers a SUBSCRIBE_NAMESPACE and carries a namespace suffix.
 #
 # d20 reserves PUBLISH_OK (0x1E; PUBLISH is answered with REQUEST_OK) and
-# adds PUBLISH_STATE_NOTIFY (0x22). d21 and d22 keep the d20 table.
+# adds PUBLISH_STATE_NOTIFY (0x22). d22 keeps the d20 table.
 _D20_CONTROL_TYPES = frozenset({
     0x2F00, 0x10, 0x03, 0x04, 0x22, 0x1D, 0x0B, 0x16, 0x18, 0x0D,
     0x06, 0x50, 0x51, 0x08, 0x0E, 0x0F, 0x02, 0x07, 0x05,
@@ -290,7 +289,6 @@ CONTROL_MESSAGE_TYPES: Dict[int, frozenset] = {
         0x06, 0x50, 0x51, 0x08, 0x0E, 0x0F, 0x02, 0x07, 0x05,
     }),
     20: _D20_CONTROL_TYPES,
-    21: _D20_CONTROL_TYPES,
     22: _D20_CONTROL_TYPES,
 }
 
@@ -303,7 +301,6 @@ WIRE_TYPE_BY_DRAFT: Dict[int, Dict[int, int]] = {
     16: {},
     18: _D18_RENUMBERED,
     20: _D18_RENUMBERED,
-    21: _D18_RENUMBERED,
     22: _D18_RENUMBERED,
 }
 
@@ -615,6 +612,14 @@ class MOQTProtocolViolation(MOQTException):
     """
     def __init__(self, reason_phrase: str = ""):
         super().__init__(SessionCloseCode.PROTOCOL_VIOLATION, reason_phrase)
+
+
+# draft-ietf-webtrans-http3-16 §9.5: WT session closed on failed WT-Protocol negotiation.
+WT_ALPN_ERROR = 0x0817B3DD
+
+
+class MOQTNegotiationError(ConnectionError):
+    """The server's WT-Protocol answer selected none of the offered MoQT drafts."""
 
 
 class MOQTRequestError(Exception):

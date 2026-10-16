@@ -69,7 +69,7 @@ class DraftProfile:
                                   # d14 also has DOES_NOT_EXIST 0x1.
     param_table: int = 18
                                   # Message Parameter registry and scopes in
-                                  # messages/params.py: 18, 20 (d20/d21), 22.
+                                  # messages/params.py: 18, 20, 22.
                                   # Consulted from d18 on.
     location_filter_typed: bool = False
                                   # d22 LOCATION_FILTER (0x21) leads with a
@@ -140,7 +140,7 @@ PROFILES = {
         subgroup_type_mask=0x6F),
 }
 
-# draft-20 and draft-21 share one wire; d22 differs only in its switches.
+# d22 differs from d20 only in its switches.
 # Every column not named here keeps the d18 value.
 _D20 = replace(
     PROFILES[MOQTDraft.DRAFT_18], draft=MOQTDraft.DRAFT_20,
@@ -152,7 +152,6 @@ _D20 = replace(
     fetch_timed_out_range=True,
     fetch_object_status=False)
 PROFILES[MOQTDraft.DRAFT_20] = _D20
-PROFILES[MOQTDraft.DRAFT_21] = replace(_D20, draft=MOQTDraft.DRAFT_21)
 PROFILES[MOQTDraft.DRAFT_22] = replace(
     _D20, draft=MOQTDraft.DRAFT_22,
     param_table=22,
