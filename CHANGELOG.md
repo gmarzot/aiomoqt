@@ -30,6 +30,7 @@
 - Bench workers with `--logdir` write aiomoqt logging to their per-process files (DEBUG with `-d`).
 - load_sim runs on macOS; its event queue bound exceeded the platform semaphore limit.
 - `tests/relays.json`: quicr-west gates on d18, the only draft it now serves; nokia-d18 stops gating while unreachable.
+- `tests/relays.json`: aiomoqt-relay (non-gating, d18/20/22).
 - d18+: a Redirect naming a track in reply to PUBLISH_NAMESPACE or SUBSCRIBE_NAMESPACE (and SUBSCRIBE_TRACKS from d20) closes with PROTOCOL_VIOLATION.
 - Delivery timeouts (§8) on produce() tracks: per subscription the smaller non-zero of the track's (`object_delivery_timeout`, `subgroup_delivery_timeout`) and the subscriber's; a late object resets its subgroup with DELIVERY_TIMEOUT, no reopen, and a late datagram is dropped. d16 DELIVERY_TIMEOUT of 0 closes with PROTOCOL_VIOLATION.
 - Stream resets and STOP_SENDING use stream reset codes: a finished subscription, a FETCH_ERROR and a drained PADDING stream (logged at debug) send CANCELLED, unknown or duplicate fetch streams CANCELLED, unparseable streams INTERNAL_ERROR; `stream_reset` / `stream_stop_sending` default to CANCELLED.

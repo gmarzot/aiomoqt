@@ -180,6 +180,17 @@
       "pub_mode": "publish",
       "disabled_suites": [],
       "notes": "Our own open relay (moq_interop_relay)."
+    },
+    {
+      "name": "aiomoqt-relay",
+      "urls": {
+        "raw-quic": "moqt://aiomoqt-relay.marzresearch.net:4443",
+        "h3-wt":    "https://aiomoqt-relay.marzresearch.net:4443/"
+      },
+      "drafts": [22, 20, 18],
+      "pub_mode": "publish",
+      "disabled_suites": [],
+      "notes": "Our own open relay (moq_interop_relay), second host."
     }
   ]
 }
