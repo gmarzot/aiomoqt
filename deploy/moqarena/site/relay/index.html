@@ -65,13 +65,15 @@
         <dt>DRAFTS:</dt><dd id="drafts">22, 20, 18, 16, 14</dd>
         <dt>DATE:</dt><dd id="date">—</dd>
         <dt>UPTIME:</dt><dd id="uptime">—</dd>
-        <dt></dt><dd><a class="platform-link" href="platform/">platform detail ↗</a> · <a class="platform-link" href="logs/" title="Needs the stats password">logs ↗ (private)</a></dd>
       </dl>
+      <nav class="hero-links" aria-label="Relay detail">
+        <a class="platform-link" href="platform/">platform detail ↗</a>
+        <a class="platform-link" href="logs/" title="Needs the stats password">logs ↗ (private)</a>
+      </nav>
       <div class="gauges" aria-label="Host utilization">
         <figure class="gauge"><svg id="gauge-cpu" viewBox="0 0 120 104" role="img" aria-label="CPU"></svg><figcaption>CPU</figcaption></figure>
         <figure class="gauge"><svg id="gauge-ram" viewBox="0 0 120 104" role="img" aria-label="RAM"></svg><figcaption>RAM</figcaption></figure>
         <figure class="gauge"><svg id="gauge-disk" viewBox="0 0 120 104" role="img" aria-label="Disk"></svg><figcaption>DISK</figcaption></figure>
-        <figure class="gauge"><svg id="gauge-cdn" viewBox="0 0 120 104" role="img" aria-label="CDN efficiency"></svg><figcaption title="Share of egress not received upstream">CDN</figcaption></figure>
       </div>
     </div>
   </header>
@@ -85,22 +87,25 @@
     in the last 30 seconds.</p>
   <noscript><p class="unavailable">Live status needs JavaScript.</p></noscript>
 
-  <section class="tiles" aria-label="Relay counts">
-    <div class="tile" data-key="sessions" data-spark="sessions"><h3>Sessions</h3><div class="value">—</div><div class="sub"></div></div>
-    <div class="tile" data-key="namespaces"><h3>Namespaces</h3><div class="value">—</div><div class="sub"></div></div>
-    <div class="tile" data-key="tracks" data-spark="tracks"><h3>Tracks</h3><div class="value">—</div><div class="sub"></div></div>
+  <section class="tiles" aria-label="Relay reach">
     <div class="tile" data-key="publishers"><h3>Publishers</h3><div class="value">—</div><div class="sub"></div></div>
     <div class="tile" data-key="subscribers" data-spark="subscribers"><h3>Subscribers</h3><div class="value">—</div><div class="sub"></div></div>
+    <div class="tile" data-key="namespaces"><h3>Namespaces</h3><div class="value">—</div><div class="sub"></div></div>
+    <div class="tile" data-key="tracks" data-spark="tracks"><h3>Tracks</h3><div class="value">—</div><div class="sub"></div></div>
+    <div class="tile" data-key="fetches"><h3>Fetches</h3><div class="value">—</div><div class="sub"></div></div>
     <div class="tile" data-key="delivered"><h3>Delivered</h3><div class="value">—</div><div class="sub"></div></div>
+    <div class="tile tile-gauge" data-key="cache" title="Share of FETCH data served from the relay cache instead of the publisher"><h3>Cache efficiency</h3><div class="tile-row"><div class="value">—</div><svg class="mini-gauge" id="gauge-cache" viewBox="0 0 120 104" aria-hidden="true"></svg></div><div class="sub"></div></div>
+    <div class="tile tile-gauge" data-key="cdn" title="Share of egress not received upstream"><h3>CDN efficiency</h3><div class="tile-row"><div class="value">—</div><svg class="mini-gauge" id="gauge-cdn" viewBox="0 0 120 104" aria-hidden="true"></svg></div><div class="sub"></div></div>
   </section>
-  <section class="tiles tiles-7" aria-label="Relay rates">
+  <section class="tiles tiles-detail" aria-label="Relay delivery">
+    <div class="tile" data-key="rtt" data-spark="rtt_p50_ms"><h3>RTT</h3><div class="value">—</div><div class="sub"></div></div>
+    <div class="tile" data-key="lag" data-spark="lag_p99_ms"><h3>Loop lag</h3><div class="value">—</div><div class="sub"></div></div>
+    <div class="tile" data-key="loss" data-spark="loss_pct"><h3>Loss</h3><div class="value">—</div><div class="sub"></div></div>
+    <div class="tile" data-key="drops"><h3>Drops</h3><div class="value">—</div><div class="sub"></div></div>
     <div class="tile" data-key="groups" data-spark="groups_per_s"><h3>Groups/s</h3><div class="value">—</div><div class="sub"></div></div>
     <div class="tile" data-key="objects" data-spark="objects_in_per_s"><h3>Objects/s</h3><div class="value">—</div><div class="sub"></div></div>
     <div class="tile" data-key="ingress" data-spark="ingress_bps"><h3>BW in</h3><div class="value">—</div><div class="sub"></div></div>
     <div class="tile" data-key="egress" data-spark="egress_bps"><h3>BW out</h3><div class="value">—</div><div class="sub"></div></div>
-    <div class="tile" data-key="rtt" data-spark="rtt_p50_ms"><h3>RTT</h3><div class="value">—</div><div class="sub"></div></div>
-    <div class="tile" data-key="lag" data-spark="lag_p99_ms"><h3>Loop lag</h3><div class="value">—</div><div class="sub"></div></div>
-    <div class="tile" data-key="lossdrops" data-spark="loss_pct"><h3>Loss / Drops</h3><div class="value">—</div><div class="sub"></div></div>
   </section>
 
   <div class="split">
