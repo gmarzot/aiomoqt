@@ -1,4 +1,4 @@
-// moqarena relay dashboard: relay status, namespaces and tracks, scoped to a
+// MoQ Ersatz Relay dashboard: relay status, namespaces and tracks, scoped to a
 // namespace, from /status/status.json. Uses Dash from common.js.
 'use strict';
 

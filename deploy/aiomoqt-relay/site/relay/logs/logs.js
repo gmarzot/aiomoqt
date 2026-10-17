@@ -1,4 +1,4 @@
-// moqarena relay log viewer: tails the relay's --log-dir files under files/,
+// MoQ Ersatz Relay log viewer: tails the relay's --log-dir files under files/,
 // with level and text filters. Log text is inserted as text only.
 'use strict';
 

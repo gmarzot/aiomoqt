@@ -1,7 +1,7 @@
-# moqarena: the aiomoqt ersatz relay, nginx for the pages and the relay's
+# MoQ Ersatz Relay: the aiomoqt ersatz relay, nginx for the pages and the relay's
 # status and logs, and GoAccess for the password-protected visitor report.
 # Run from this directory; see README.md.
-name: g5-site
+name: aiomoqt-relay
 
 services:
   relay:
@@ -19,8 +19,8 @@ services:
       MOQT_ROLE: relay
       MOQT_DUAL: "1"
       MOQT_PORT: "4443"
-      MOQT_CERT: /etc/letsencrypt/live/moqarena.marzresearch.net/fullchain.pem
-      MOQT_KEY: /etc/letsencrypt/live/moqarena.marzresearch.net/privkey.pem
+      MOQT_CERT: /etc/letsencrypt/live/aiomoqt-relay.marzresearch.net/fullchain.pem
+      MOQT_KEY: /etc/letsencrypt/live/aiomoqt-relay.marzresearch.net/privkey.pem
     command: ["--draft", "22,20,18,16,14", "--watchdog", "15", "--status-dir", "/status",
               "--log-dir", "/logs"]
     volumes:
@@ -35,7 +35,7 @@ services:
 
   web:
     image: nginx:alpine
-    container_name: g5-web
+    container_name: relay-web
     restart: unless-stopped
     ports:
       - "80:80"
@@ -54,7 +54,7 @@ services:
 
   goaccess:
     image: allinurl/goaccess:1.9.3
-    container_name: g5-goaccess
+    container_name: relay-goaccess
     restart: unless-stopped
     network_mode: none
     # Every 5 minutes, from the current and rotated logs: visitors without
@@ -65,11 +65,11 @@ services:
         while :; do
           zcat -f /logs/access.log* 2>/dev/null | goaccess - --log-format=COMBINED \
             --no-global-config --ignore-crawlers \
-            --html-report-title="moqarena visitors" -o /report/new.html \
+            --html-report-title="MoQ Ersatz Relay visitors" -o /report/new.html \
             && mv /report/new.html /report/index.html
           zcat -f /logs/access.log* 2>/dev/null | goaccess - --log-format=COMBINED \
             --no-global-config --crawlers-only \
-            --html-report-title="moqarena crawlers" -o /report/new-crawlers.html \
+            --html-report-title="MoQ Ersatz Relay crawlers" -o /report/new-crawlers.html \
             && mv /report/new-crawlers.html /report/crawlers.html
           sleep 300
         done
