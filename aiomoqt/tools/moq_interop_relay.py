@@ -60,7 +60,7 @@ from aiomoqt.server import MOQTServer
 from aiomoqt.types import (
     MOQT_DEFAULT_DRAFTS, D18MessageType, FilterType, GroupOrder, MOQTDraft,
     MOQTMessageType, MOQTRequestError, ObjectStatus, ParamType,
-    RequestErrorCode, StreamResetCode, SubscribeDoneCode, SubscribeErrorCode,
+    RequestErrorCode, StreamResetCode, SubscribeDoneCode,
     parse_draft_spec,
 )
 from aiomoqt.messages import SubgroupHeader
@@ -72,7 +72,8 @@ from aiomoqt.messages.request import RequestError, RequestOk
 from aiomoqt.messages.subscribe import Subscribe
 from aiomoqt.track import (PublishedTrack, SubscribedTrack, _UNFILTERED,
                            _filter_window, _largest_object_param)
-from aiomoqt.context import is_draft16_or_later
+from aiomoqt.context import (canonical_request_error, is_draft16_or_later,
+                             request_error_code)
 from aiomoqt.utils.logger import set_log_level, get_logger
 from aiomoqt.utils.url import parse_relay_url
 
@@ -878,9 +879,19 @@ def _withdraw_namespace(session, request_id=None, ns=None) -> None:
                 f"{len(_announced.get(ns, {}))} publisher(s)")
 
 
+def _upstream_refusal(err, profile, fetch=False) -> tuple:
+    """An upstream REQUEST_ERROR as (RequestErrorCode, reason), for the
+    downstream reply to encode in its own draft."""
+    code = canonical_request_error(err.error_code, profile, fetch=fetch)
+    if not isinstance(code, RequestErrorCode):
+        code = RequestErrorCode.INTERNAL_ERROR
+    return code, err.reason or "upstream error"
+
+
 async def _establish_upstream(ns, track_name):
-    """Subscribe upstream once per Full Track Name and return the
-    fan-out, or None when no publisher accepts.
+    """Subscribe upstream once per Full Track Name. Returns (fan-out,
+    None), or (None, the last upstream refusal or None) when no
+    publisher accepts.
 
     Transport §"Relays": with no Established upstream subscription for
     the Track, the relay subscribes to each publisher that announced the
@@ -893,10 +904,11 @@ async def _establish_upstream(ns, track_name):
         # cycle points at a closed session, and attaching a new
         # subscriber to it delivers nothing at all.
         if _track_live(track):
-            return track
+            return track, None
         logger.info(f"relay: dropping stale track {key}")
         track.close()
         _tracks.pop(key, None)
+    refusal = None
     for pub in _publishers_for(ns):
         track = _RelayedTrack(key)
         track.attaching = True
@@ -911,6 +923,8 @@ async def _establish_upstream(ns, track_name):
             await upstream.subscribe(timeout=10.0)
         except Exception as e:
             logger.info(f"relay: upstream subscribe failed on {ns}: {e}")
+            if isinstance(e, MOQTRequestError):
+                refusal = _upstream_refusal(e, pub._profile)
             continue
         track.upstream = upstream
         track.upstream_alias = upstream.track_alias
@@ -921,8 +935,8 @@ async def _establish_upstream(ns, track_name):
         _tracks[key] = track
         logger.info(f"relay: upstream established ns={ns} track={name} "
                     f"alias={upstream.track_alias}")
-        return track
-    return None
+        return track, None
+    return None, refusal
 
 
 def _joined_subscription(session, request_id):
@@ -1162,12 +1176,10 @@ def _attach_subscriber(session, msg, track) -> bool:
                             msg.start_object, msg.end_group, track.largest)
     if (window[1] is not None and track.largest is not None
             and track.largest[0] > window[1]):
-        code = (RequestErrorCode.INVALID_RANGE
-                if is_draft16_or_later(session.negotiated_draft)
-                else SubscribeErrorCode.INVALID_RANGE)
         logger.info(f"relay: subscribe {track.key} -> INVALID_RANGE "
                     f"(end group {window[1]}, largest {track.largest})")
-        session.subscribe_error(msg.request_id, error_code=int(code),
+        session.subscribe_error(msg.request_id,
+                                error_code=RequestErrorCode.INVALID_RANGE,
                                 reason="end group already published")
         track.attaching = False
         track._ensure_drain()
@@ -1241,14 +1253,9 @@ async def _on_subscribe(session, msg):
                 return
             logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
                         f"-> ERROR (rendezvous timeout)")
-            err = RequestError(
-                request_id=msg.request_id,
-                error_code=int(RequestErrorCode.TIMEOUT),
-                retry_interval=0,
-                reason="no publisher within the rendezvous timeout",
-            )
-            logger.info(f"MOQT send: {err}")
-            session._send_reply(msg.request_id, err, fin=True)
+            session.subscribe_error(
+                msg.request_id, error_code=RequestErrorCode.TIMEOUT,
+                reason="no publisher within the rendezvous timeout")
             return
 
     # Flow B first: a track already offered by PUBLISH is served from
@@ -1275,39 +1282,29 @@ async def _on_subscribe(session, msg):
     # fails every request a back-to-back test suite makes.
     if not _announced_match(ns) and not _upstreams and _upstream_urls:
         await _await_upstream()
+    why = "not announced"
     if _announced_match(ns) or _upstreams:
-        track = await _establish_upstream(ns, msg.track_name)
+        track, refusal = await _establish_upstream(ns, msg.track_name)
         if track is not None:
             if _attach_subscriber(session, msg, track):
                 logger.info(f"relay: subscribe ns={ns} "
                             f"track={msg.track_name} -> SUBSCRIBE_OK "
                             f"(fanout={len(track.downstream)})")
             return
-        # Announced but no publisher served it. Answer honestly rather
-        # than acking a track that will never deliver.
-        logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
-                    f"-> ERROR (no upstream)")
+        if refusal is not None:
+            # The publisher's own answer, in this subscriber's draft.
+            code, reason = refusal
+            logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
+                        f"-> {code.name} (upstream: {reason})")
+            session.subscribe_error(msg.request_id, error_code=code,
+                                    reason=reason)
+            return
+        why = "no publisher served it"
     logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
-                f"-> ERROR (not announced)")
-    # On d16+ the universal REQUEST_ERROR (0x05) carries the not-found
-    # code (0x10). On d14 the legacy SUBSCRIBE_ERROR (0x05) carries
-    # TRACK_DOES_NOT_EXIST (0x04). Send the right shape per version.
-    if is_draft16_or_later(session.negotiated_draft):
-        err = RequestError(
-            request_id=msg.request_id,
-            error_code=int(RequestErrorCode.DOES_NOT_EXIST),
-            retry_interval=0,
-            reason="track does not exist",
-        )
-        logger.info(f"MOQT send: {err}")
-        # Reply returns on the SUBSCRIBE's own bidi stream at d18.
-        session._send_reply(msg.request_id, err, fin=True)
-    else:
-        session.subscribe_error(
-            request_id=msg.request_id,
-            error_code=int(SubscribeErrorCode.TRACK_DOES_NOT_EXIST),
-            reason="track does not exist",
-        )
+                f"-> DOES_NOT_EXIST ({why})")
+    session.subscribe_error(msg.request_id,
+                            error_code=RequestErrorCode.DOES_NOT_EXIST,
+                            reason="track does not exist")
 
 
 def _find_default_cert():
@@ -1476,11 +1473,13 @@ def _install_fetch_sink(pub) -> None:
 
 async def _fetch_upstream(ns, track_name, msg):
     """Ask each publisher of `ns` for the requested range. Returns its
-    FETCH_OK and the objects, or (None, None) when nobody serves it —
+    FETCH_OK, the objects and None, or (None, None, the last upstream
+    refusal or None) when nobody serves it —
     the relay keeps only recent objects, so a historical range has to
     come from the origin."""
     name = (track_name.decode() if isinstance(track_name, bytes)
             else track_name)
+    refusal = None
     for pub in _publishers_for(ns):
         _install_fetch_sink(pub)
         req = pub.fetch(
@@ -1500,13 +1499,15 @@ async def _fetch_upstream(ns, track_name, msg):
         except (MOQTRequestError, asyncio.TimeoutError) as e:
             logger.info(f"relay: upstream FETCH declined on {ns}: {e}")
             _fetch_sinks.pop(key, None)
+            if isinstance(e, MOQTRequestError):
+                refusal = _upstream_refusal(e, pub._profile, fetch=True)
             continue
         objs = _fetch_sinks.pop(key, [])
         logger.info(f"relay: upstream FETCH {ns}/{name} -> "
                     f"{len(objs)} object(s) end_of_track="
                     f"{getattr(ok, 'end_of_track', 0)}")
-        return ok, objs
-    return None, None
+        return ok, objs, None
+    return None, None, refusal
 
 
 async def _on_fetch(session, msg):
@@ -1526,7 +1527,7 @@ async def _on_fetch(session, msg):
                         f"{msg.joining_request_id}")
             session.fetch_error(
                 request_id=msg.request_id,
-                error_code=int(RequestErrorCode.INVALID_JOINING_REQUEST_ID),
+                error_code=RequestErrorCode.INVALID_JOINING_REQUEST_ID,
                 reason="no such subscription")
             return
         key, track, d = found
@@ -1538,7 +1539,7 @@ async def _on_fetch(session, msg):
                         f"(forward={int(d.forward)})")
             session.fetch_error(
                 request_id=msg.request_id,
-                error_code=int(RequestErrorCode.INVALID_RANGE),
+                error_code=RequestErrorCode.INVALID_RANGE,
                 reason="subscription has no largest object")
             return
         start_group = int(msg.joining_start or 0)
@@ -1564,19 +1565,26 @@ async def _on_fetch(session, msg):
         # Only recent objects are held, so a historical range comes from
         # the publisher — which is also the only path for a track this
         # relay has never subscribed to.
-        up_ok, upstream = await _fetch_upstream(ns, track_name, msg)
+        up_ok, upstream, refusal = await _fetch_upstream(ns, track_name, msg)
+        if upstream is None and refusal is not None:
+            code, reason = refusal
+            logger.info(f"relay: FETCH ns={ns} track={track_name} "
+                        f"-> {code.name} (upstream: {reason})")
+            session.fetch_error(request_id=msg.request_id, error_code=code,
+                                reason=reason)
+            return
         if upstream is None:
             logger.info(f"relay: FETCH ns={ns} track={track_name} "
                         f"-> DOES_NOT_EXIST")
             session.fetch_error(
                 request_id=msg.request_id,
-                error_code=int(RequestErrorCode.DOES_NOT_EXIST),
+                error_code=RequestErrorCode.DOES_NOT_EXIST,
                 reason="track does not exist")
             return
         if not upstream:
             session.fetch_error(
                 request_id=msg.request_id,
-                error_code=int(RequestErrorCode.INVALID_RANGE),
+                error_code=RequestErrorCode.INVALID_RANGE,
                 reason="requested range unavailable")
             return
         objs = [(o.group_id, o.subgroup_id, o.object_id, o.payload,
@@ -1715,7 +1723,8 @@ async def _on_track_status(session, msg):
                     f"-> DOES_NOT_EXIST")
         err = RequestError(
             request_id=msg.request_id,
-            error_code=int(RequestErrorCode.DOES_NOT_EXIST),
+            error_code=request_error_code(RequestErrorCode.DOES_NOT_EXIST,
+                                          session._profile),
             retry_interval=0,
             reason="track not served here",
         )
