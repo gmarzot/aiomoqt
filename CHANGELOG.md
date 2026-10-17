@@ -49,6 +49,8 @@
 - Relay: a d20+ PUBLISH is answered with an EXPIRES-only PUBLISH_OK, Forward State following in
   a REQUEST_UPDATE; the PUBLISH_OK it built failed to encode.
 - Relay: the default `--draft` is the library's `MOQT_DEFAULT_DRAFTS`; `$DRAFT` still pins it.
+- Relay: `--status-dir DIR` writes `status.json` every 2 s for a dashboard: sessions,
+  namespaces (MSF/CMSF/LOCMAF from the catalog), tracks, subscribers, bandwidth, host metrics.
 - d20-d22 FETCH: standalone FETCH is sent and served, the range in LOCATION_FILTER with an
   inclusive End; `fetch(location_filter=)`.
 - d20-d22 join(): SUBSCRIBE at the Next Object with FILL_PARAMETERS; joining_fetch() is a
