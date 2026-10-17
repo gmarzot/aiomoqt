@@ -6,7 +6,7 @@ ersatz relay for limited interop testing. The relay is open, with no auth.
 | Service | Container | What it does |
 |---|---|---|
 | `relay` | `ersatz-relay` | `moq_interop_relay` on UDP 4443, raw QUIC and WebTransport, drafts 22/20/18/16/14, `--watchdog 15`, writes `status/status.json` |
-| `web` | `g5-web` | nginx on 80/443: landing page, `/g5-broadcast/`, `/g5-player/`, `/relay/` dashboard, `/status/status.json`, `/stats/` |
+| `web` | `g5-web` | nginx on 80/443: landing page, `/g5-broadcast/`, `/g5-player/`, `/relay/` dashboard and `/relay/platform/`, `/status/{status,platform}.json`, `/stats/` |
 | `goaccess` | `g5-goaccess` | rebuilds the visitor reports in `stats/` every 5 minutes from `logs/`; no network |
 
 Host: `ssh ubuntu@moqarena.marzresearch.net` (OCI, Ubuntu 22.04 aarch64, Docker with Compose v2).
@@ -24,7 +24,7 @@ site/index.html           landing page (site/ here)
 site/relay/               relay dashboard (site/ here)
 site/assets, site/g5-broadcast, site/g5-player, site/VERSION
                           moq-playa examples/dist
-status/                   status.json, written by the relay, read-only to nginx
+status/                   status.json and platform.json, written by the relay, read-only to nginx
 logs/                     nginx access log, read by GoAccess
 stats/                    GoAccess reports: index.html (visitors), crawlers.html
 stats.htpasswd            the /stats/ password

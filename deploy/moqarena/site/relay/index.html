@@ -7,6 +7,7 @@
 <title>moqarena relay</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='%23d9532b'/%3E%3Cpath d='M5 19c5 2.5 13 3 22-1' stroke='%239f3517' stroke-width='2' fill='none'/%3E%3Ccircle cx='11.5' cy='11' r='2.6' fill='%23a83a1a'/%3E%3Ccircle cx='21' cy='23' r='2' fill='%23a83a1a'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="dashboard.css">
+<script src="common.js" defer></script>
 <script src="dashboard.js" defer></script>
 </head>
 <body>
@@ -71,6 +72,7 @@
         <figure class="gauge"><svg id="gauge-ram" viewBox="0 0 120 104" role="img" aria-label="RAM"></svg><figcaption>RAM</figcaption></figure>
         <figure class="gauge"><svg id="gauge-disk" viewBox="0 0 120 104" role="img" aria-label="Disk"></svg><figcaption>DISK</figcaption></figure>
         <figure class="gauge"><svg id="gauge-cdn" viewBox="0 0 120 104" role="img" aria-label="CDN efficiency"></svg><figcaption title="Share of egress not received upstream">CDN</figcaption></figure>
+        <a class="platform-link" href="platform/">platform detail ↗</a>
       </div>
     </div>
   </header>
@@ -99,17 +101,6 @@
     <div class="tile" data-key="lag" data-spark="lag_p99_ms"><h3>Loop lag</h3><div class="value">—</div><div class="sub"></div></div>
   </section>
 
-  <section class="charts">
-    <figure class="panel chart">
-      <figcaption>CPU <span class="legend"><i class="k-host"></i>host <i class="k-proc"></i>relay</span></figcaption>
-      <svg id="chart-cpu" role="img" aria-label="Host and relay CPU over the last 10 minutes"></svg>
-    </figure>
-    <figure class="panel chart">
-      <figcaption>Bandwidth <span class="legend"><i class="k-in"></i>in <i class="k-out"></i>out</span></figcaption>
-      <svg id="chart-bw" role="img" aria-label="Relay ingress and egress over the last 10 minutes"></svg>
-    </figure>
-  </section>
-
   <section class="panel">
     <h2>Namespaces</h2>
     <div class="table-wrap">
@@ -123,32 +114,29 @@
   </section>
 
   <section class="panel">
-    <h2>Tracks</h2>
+    <h2>Tracks <span class="h2-scope" id="tracks-scope">all namespaces</span></h2>
+    <div class="scope" id="scope" role="group" aria-label="Namespace scope"></div>
+    <div class="charts">
+      <figure class="chart">
+        <figcaption>Subscribers per track <span class="legend" id="legend-subs"></span></figcaption>
+        <svg id="chart-subs" role="img" aria-label="Subscribers per track over the last 10 minutes"></svg>
+      </figure>
+      <figure class="chart">
+        <figcaption>Egress per track <span class="legend" id="legend-egress"></span></figcaption>
+        <svg id="chart-egress" role="img" aria-label="Egress per track over the last 10 minutes"></svg>
+      </figure>
+    </div>
     <div class="table-wrap">
       <table id="t-tracks">
-        <thead><tr><th>Namespace</th><th>Track</th><th>State</th><th class="n">Subscribers</th>
+        <thead><tr><th>Track</th><th>State</th><th class="n">Subscribers</th>
           <th class="n">Peak</th><th class="n">In</th><th class="n">Out</th><th class="n">Delivered</th>
           <th class="n">Groups/s</th><th class="n">Objects/s</th>
           <th class="n" title="One-way network estimate: half the publisher RTT plus half the subscribers' median RTT; no queueing or buffering">Latency ≈</th>
           <th class="n">Fetches</th><th class="n">Drops</th>
           <th class="n">Cache</th></tr></thead>
-        <tbody><tr><td colspan="14" class="empty">No tracks.</td></tr></tbody>
+        <tbody><tr><td colspan="13" class="empty">No tracks.</td></tr></tbody>
       </table>
     </div>
-  </section>
-
-  <section class="panel">
-    <h2>Host</h2>
-    <dl class="kv" id="host">
-      <dt>CPU</dt><dd data-host="cpu">—</dd>
-      <dt>System</dt><dd data-host="system">—</dd>
-      <dt>Load</dt><dd data-host="load">—</dd>
-      <dt>Memory</dt><dd data-host="memory">—</dd>
-      <dt>Disk</dt><dd data-host="disk">—</dd>
-      <dt>Network</dt><dd data-host="network">—</dd>
-      <dt>UDP errors</dt><dd data-host="udp">—</dd>
-      <dt>Relay process</dt><dd data-host="process">—</dd>
-    </dl>
   </section>
 
   <footer>
