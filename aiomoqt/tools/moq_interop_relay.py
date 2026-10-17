@@ -247,6 +247,14 @@ def _session_live(session) -> bool:
     return not (fut is not None and fut.done())
 
 
+def _cancelling() -> bool:
+    """True when the running task itself is being cancelled. A write to a
+    session that closed under it raises CancelledError too, and that
+    loses one subscriber, not the fan-out."""
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
+
+
 def _publishers_for(ns: tuple) -> list:
     """Publisher sessions that announced `ns` or a prefix of it."""
     out, seen = [], set()
@@ -577,8 +585,19 @@ class _RelayedTrack:
     def _ensure_drain(self) -> None:
         """Drain from the first object, subscribers or not; objects for a
         subscriber still attaching wait for it."""
-        if self.task is None and not self._finished and not self.attaching:
+        if self._finished or self.attaching:
+            return
+        if self.task is None or self.task.done():
             self.task = asyncio.create_task(self._forward_loop())
+            self.task.add_done_callback(self._drain_ended)
+
+    def _drain_ended(self, task) -> None:
+        """Only the terminal and close() may end the drain; anything else
+        leaves the queue growing unread, so it is logged."""
+        if self.task is not task:
+            return
+        err = "cancelled" if task.cancelled() else repr(task.exception())
+        logger.error(f"relay: forwarding {self.key} stopped: {err}")
 
     def add_downstream(self, session, track_alias, request_id=None,
                        forward=True, window=_UNFILTERED,
@@ -636,6 +655,9 @@ class _RelayedTrack:
             for d in list(self.downstream):
                 if d.replaying:
                     continue
+                if not _session_live(d.session):
+                    self.drop_session(d.session)
+                    continue
                 if oid is not None:
                     if d.past_end(gid):
                         self.end_downstream(d)
@@ -648,7 +670,9 @@ class _RelayedTrack:
                     await self._forward_one(
                         d.session, d.alias, gid, sgid, oid, payload, exts,
                         prio, status, shape)
-                except Exception:
+                except (Exception, asyncio.CancelledError):
+                    if _cancelling():
+                        raise
                     logger.debug("relay: forward failed, dropping subscriber",
                                  exc_info=True)
                     self._drops += 1
@@ -694,7 +718,9 @@ class _RelayedTrack:
                 if (gid, sgid) in self._ended:
                     await self._forward_one(d.session, d.alias, gid, sgid,
                                             None, None, None, None, "END")
-        except Exception:
+        except (Exception, asyncio.CancelledError):
+            if _cancelling():
+                raise
             logger.debug("relay: replay failed, dropping subscriber",
                          exc_info=True)
             self._drops += 1
