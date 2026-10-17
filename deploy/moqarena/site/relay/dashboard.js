@@ -170,10 +170,26 @@ function playLink(ns, url) {
                   title: 'Play in G5 Player'}, '▶');
 }
 
-// Transport and draft, then the publisher's masked address when the relay reports it.
+// "[h3/wt draft-18]" from a transport and draft.
+function via(transport, draft) {
+  if (!transport) return '';
+  return `[${transport === 'wt' ? 'h3/wt' : transport}${none(draft) ? '' : ` draft-${draft}`}]`;
+}
+
+// An origin such as "wt d18" as its transport and draft.
+function viaOrigin(origin) {
+  const m = /^(\S+) d(\d+)$/.exec(origin || '');
+  return m ? via(m[1], m[2]) : (origin ? `[${origin}]` : '');
+}
+
+// "addr [h3/wt draft-18]"; the address only when the relay reports it.
+const peer = (addr, label) => [addr, label].filter(Boolean).join(' ') || '—';
+
 function originCell(r) {
-  const td = el('td', {}, r.origin || '—');
-  if (r.origin_addr) td.append(' · ', el('span', {class: 'addr'}, r.origin_addr));
+  const label = viaOrigin(r.origin);
+  const td = el('td', {}, r.origin_addr || '');
+  if (label) td.append(r.origin_addr ? ' ' : '', el('span', {class: 'via'}, label));
+  if (!r.origin_addr && !label) td.append('—');
   return td;
 }
 
@@ -239,13 +255,13 @@ function trackDetail(r) {
       + `${fmt.plural(r.fetches, 'fetch', 'fetches')} · ${fmt.plural(r.drops, 'drop')}`,
     `cache ${fmt.num(r.cache_groups)} groups, ${fmt.bytes(r.cache_bytes)}`
       + (r.largest ? ` · largest ${r.largest[0]} · ${r.largest[1]}` : ''),
-    `from ${r.origin || '—'}${r.origin_addr ? ` ${r.origin_addr}` : ''} · RTT up ${fmt.ms(r.rtt_up_ms)}, down p50 ${fmt.ms(r.rtt_down_ms)}`,
+    `from ${peer(r.origin_addr, viaOrigin(r.origin))} · RTT up ${fmt.ms(r.rtt_up_ms)}, down p50 ${fmt.ms(r.rtt_down_ms)}`,
   ];
   const subs = r.subscriber_list || [];
   if (subs.length) {
     lines.push('subscribers:');
     for (const x of subs.slice(0, 12)) {
-      lines.push(`  ${x.transport} d${x.draft}${x.addr ? ` ${x.addr}` : ''} · ${fmt.ms(x.rtt_ms)} · ${x.forward ? 'forwarding' : 'paused'}`
+      lines.push(`  ${peer(x.addr, via(x.transport, x.draft))} · ${fmt.ms(x.rtt_ms)} · ${x.forward ? 'forwarding' : 'paused'}`
         + (none(x.since) ? '' : ` · ${fmt.duration(now - x.since)}`));
     }
     if (r.subscribers > 12) lines.push(`  … ${fmt.num(r.subscribers - 12)} more`);
