@@ -27,6 +27,7 @@ site/assets, site/g5-broadcast, site/g5-player, site/VERSION
 status/                   status.json and platform.json, written by the relay, read-only to nginx
 relay-logs/               relay.log (10 MB, 4 rotations) and crash.log, written by the relay,
                           read-only to nginx
+cores/                    relay core files
 logs/                     nginx access log, read by GoAccess
 stats/                    GoAccess reports: index.html (visitors), crawlers.html
 stats.htpasswd            the password for /private/, /stats/ and /relay/logs/
@@ -40,7 +41,7 @@ place and `/stats/` fails.
 ```sh
 tar -C deploy/moqarena -cf - compose.yml nginx.conf site | ssh ubuntu@moqarena.marzresearch.net 'tar -C ~/g5-site -xf -'
 ssh -t ubuntu@moqarena.marzresearch.net
-cd ~/g5-site && mkdir -p status relay-logs logs stats
+cd ~/g5-site && mkdir -p status relay-logs cores logs stats
 printf 'gmarzot:%s\n' "$(openssl passwd -apr1)" > stats.htpasswd    # prompts for the password
 sudo tee /etc/logrotate.d/moqarena >/dev/null <<'ROT'
 /home/ubuntu/g5-site/logs/access.log {
@@ -103,6 +104,19 @@ rotates itself at 10 MB and keeps four old files. `crash.log` gets a `relay: sta
 start and the faulthandler dump of a native crash or watchdog stall.
 It is not rotated, so trim it by hand if it grows. `--log-dir` needs an aiomoqt relay that has the
 flag; on an older image, drop it from `command`, or the relay restarts in a loop.
+
+## Core dumps
+
+The relay runs with no core size limit and `./cores` mounted at `/cores`. Ubuntu pipes cores to
+apport, which drops container crashes, so point the kernel at the mount (runtime only; reboot or an
+apport restart resets it):
+
+```sh
+sudo sysctl -w kernel.core_pattern=/cores/core.%e.%p.%t
+```
+
+The path resolves inside the crashing container. Cores are not rotated; keep the image that
+produced one (`docker image ls aiomoqt`) for `gdb`, and delete them by hand.
 
 ## Checks, run on the host
 
