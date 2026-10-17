@@ -3572,9 +3572,9 @@ class _MOQTSessionMixin:
             if (kind, key) in self._peer_requests.values():
                 code = duplicate
                 reason = "track already subscribed in this session"
-            elif self._publish_pending(key):
+            elif self._publishing(key):
                 code = duplicate
-                reason = "our PUBLISH of the track awaits its reply"
+                reason = "our PUBLISH of the track holds its subscription"
         elif kind in (SubscribeNamespace, SubscribeTracks):
             key = ns
             for k, prefix in self._peer_requests.values():
@@ -3678,17 +3678,22 @@ class _MOQTSessionMixin:
                 f"PUBLISH_STATE_NOTIFY on a {cls.__name__} stream "
                 f"{'we' if ours else 'the peer'} opened")
 
-    def _publish_pending(self, key) -> bool:
-        """True while our PUBLISH of this Full Track Name awaits its reply:
-        the subscription is Pending (publisher), §5.1."""
+    def _publishing(self, key) -> bool:
+        """True while our PUBLISH of this Full Track Name is bound: its
+        subscription is Pending (publisher) or Established, §5.1."""
         track = self._published_tracks.get(key)
         if track is None:
             return False
-        for rid, entry in self._requests.items():
-            fut = self._pending_requests.get(rid)
-            if entry.track is track and fut is not None and not fut.done():
-                return True
-        return False
+        own = 0 if self._is_client else 1
+        return any(entry.track is track and entry.role == "publisher"
+                   and rid & 1 == own
+                   for rid, entry in self._requests.items())
+
+    def _peer_subscribed(self, track) -> bool:
+        """True while a SUBSCRIBE from the peer for the track is admitted,
+        including one its handler has not reached yet."""
+        key = self._track_key(track.namespace, track.trackname)
+        return (Subscribe, key) in self._peer_requests.values()
 
     def _refuse_prefix_update(self, msg: RequestUpdate) -> Optional[Callable]:
         """§10.9.2: a REQUEST_UPDATE that moves a SUBSCRIBE_NAMESPACE or
@@ -5658,6 +5663,7 @@ class _MOQTSessionMixin:
     async def _handle_publish_error(self, msg: PublishError) -> None:
         """Subscriber rejected our PUBLISH; the awaiter raises."""
         logger.info(f"MOQT event: handle {msg}")
+        self._unbind_request(msg.request_id)
         self._resolve_request(msg.request_id, msg)
 
     async def _handle_fetch(self, msg: Fetch) -> None:
