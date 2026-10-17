@@ -4,6 +4,8 @@
 
 - Relay: error replies are encoded for the subscriber's draft (d14 FETCH_ERROR used d16 codes);
   an upstream refusal reaches the subscriber with its own code and reason, not DOES_NOT_EXIST.
+- `canonical_stream_reset()`: the StreamResetCode a received reset code means at a draft.
+- Relay: an upstream subgroup-stream reset reaches each subscriber in its draft's code (d16 0x4 UNKNOWN_OBJECT_STATUS was sent to d18 as GOING_AWAY).
 - Relay: `--status-dir` also writes `platform.json` (host detail from /proc: CPU by mode,
   pressure, memory, disks, interfaces, UDP, the relay's socket and process) and per-track
   history and subscriber lists in `status.json`.

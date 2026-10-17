@@ -6,8 +6,9 @@ import contextlib
 import pytest
 
 from aiomoqt.client import MOQTClient
-from aiomoqt.context import (canonical_request_error, profile_for,
-                             request_error_code, stream_reset_code)
+from aiomoqt.context import (canonical_request_error, canonical_stream_reset,
+                             profile_for, request_error_code,
+                             stream_reset_code)
 from aiomoqt.server import MOQTServer
 from aiomoqt.types import (MOQTMessageType, MOQTRequestError,
                            RequestErrorCode, StreamResetCode,
@@ -74,6 +75,25 @@ def test_an_unknown_wire_code_stays_as_received():
 ])
 def test_stream_reset_code_per_draft(draft, code, wire):
     assert stream_reset_code(code, profile_for(draft)) == wire
+
+
+@pytest.mark.parametrize("draft, wire, code", [
+    (14, 0x2, StreamResetCode.DELIVERY_TIMEOUT),
+    (16, 0x4, StreamResetCode.UNKNOWN_OBJECT_STATUS),
+    (16, 0x12, StreamResetCode.MALFORMED_TRACK),
+    (18, 0x4, StreamResetCode.GOING_AWAY),
+    (18, 0x6, StreamResetCode.UNKNOWN_OBJECT_STATUS),
+    (22, 0x9, StreamResetCode.EXCESSIVE_LOAD),
+])
+def test_canonical_stream_reset(draft, wire, code):
+    got = canonical_stream_reset(wire, profile_for(draft))
+    assert got is code
+    assert stream_reset_code(got, profile_for(draft)) == wire
+
+
+def test_an_unknown_reset_code_stays_as_received():
+    assert canonical_stream_reset(0x4, profile_for(14)) == 0x4
+    assert canonical_stream_reset(0x7E, profile_for(18)) == 0x7E
 
 
 @contextlib.asynccontextmanager

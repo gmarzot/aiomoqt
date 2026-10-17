@@ -75,7 +75,8 @@ from aiomoqt.messages.subscribe import Subscribe
 from aiomoqt.track import (PublishedTrack, SubscribedTrack, _UNFILTERED,
                            _filter_window, _largest_object_param,
                            _reported_largest)
-from aiomoqt.context import (canonical_request_error, is_draft16_or_later,
+from aiomoqt.context import (canonical_request_error, canonical_stream_reset,
+                             is_draft16_or_later,
                              request_error_code)
 from aiomoqt.tools import relay_status
 from aiomoqt.utils.buffer import Buffer
@@ -484,6 +485,8 @@ class _RelayedTrack:
         becomes our reset with the same code, never a FIN. A malformed
         upstream track ends every downstream subscription with
         PUBLISH_DONE MALFORMED_TRACK (§2.4.2)."""
+        if not clean:
+            reset_code = self._canonical_reset(reset_code)
         if not clean and reset_code == StreamResetCode.MALFORMED_TRACK:
             self.finish(SubscribeDoneCode.MALFORMED_TRACK,
                         reset_code=StreamResetCode.MALFORMED_TRACK,
@@ -502,6 +505,17 @@ class _RelayedTrack:
         self._ensure_drain()
         self._upstream_ended += 1
         self._check_pending_done()
+
+    def _canonical_reset(self, wire) -> StreamResetCode:
+        """An upstream reset code by meaning, so each subscriber gets it
+        encoded for its own draft; unknown codes become INTERNAL_ERROR."""
+        up = _upstream_session(self)
+        prof = getattr(up, "_profile", None)
+        code = wire if prof is None else canonical_stream_reset(wire, prof)
+        try:
+            return StreamResetCode(code)
+        except ValueError:
+            return StreamResetCode.INTERNAL_ERROR
 
     def note_largest(self, location) -> None:
         """§10.2.11: Largest is the largest Location reported or seen."""
@@ -737,11 +751,9 @@ class _RelayedTrack:
             return
         if status == "RESET":
             stream_id, _header = entry
-            try:
-                code = StreamResetCode(shape or 0)
-            except ValueError:
-                code = StreamResetCode.INTERNAL_ERROR
-            session.stream_reset(stream_id, int(code))
+            if not isinstance(shape, StreamResetCode):
+                shape = StreamResetCode.INTERNAL_ERROR
+            session.stream_reset(stream_id, shape)
             self._streams.pop(skey, None)
             return
         if entry is None:
