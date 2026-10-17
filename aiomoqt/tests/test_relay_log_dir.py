@@ -25,6 +25,8 @@ def log_dir(tmp_path, monkeypatch):
     root = logging.getLogger()
     handlers = list(root.handlers)
     shown = aiomoqt_logger._handler
+    level = relay.logger.level
+    relay.logger.setLevel(logging.INFO)
     enabled = []
     monkeypatch.setattr(relay.faulthandler, "enable",
                         lambda **kw: enabled.append(kw))
@@ -38,6 +40,7 @@ def log_dir(tmp_path, monkeypatch):
                 root.removeHandler(h)
                 h.close()
         aiomoqt_logger.set_log_handler(shown)
+        relay.logger.setLevel(level)
         if relay._crash_file is not None:
             relay._crash_file.close()
             relay._crash_file = None
