@@ -377,6 +377,8 @@ class _RelayedTrack:
         self._bytes_out = 0
         self._peak_subs = 0
         self._fetches = 0
+        # FETCH payload bytes served, by source.
+        self._fetch_bytes = {"cache": 0, "upstream": 0}
         self._drops = 0
         self._groups_in = 0
         self._last_gid = None
@@ -1762,6 +1764,23 @@ def _install_fetch_sink(pub) -> None:
     pub.on_fetch_object = _on
 
 
+# Relay-wide FETCH payload bytes by source, including tracks with no state.
+_fetch_bytes = {"cache": 0, "upstream": 0}
+
+
+def _counted_fetch(objs, track, source):
+    """FetchObjects for serve_fetch(); each payload is counted once the
+    next is asked for, i.e. written with the FETCH not cancelled."""
+    for gid, sgid, oid, payload, exts, prio, status in objs:
+        payload = payload or b""
+        yield FetchObject(group_id=gid, subgroup_id=sgid, object_id=oid,
+                          publisher_priority=prio, extensions=exts,
+                          payload=payload, status=status)
+        _fetch_bytes[source] += len(payload)
+        if track is not None:
+            track._fetch_bytes[source] += len(payload)
+
+
 async def _fetch_upstream(ns, track_name, msg):
     """Ask each publisher of `ns` for the requested range. Returns its
     FETCH_OK, the objects and None, or (None, None, the last upstream
@@ -1850,6 +1869,7 @@ async def _on_fetch(session, msg):
     have_cache = (track is not None and _track_live(track)
                   and track.cache_covers(start))
     objs = track.cached_range(start, end) if have_cache else []
+    source = "cache"
     end_of_track = 0
     if objs and objs[-1][6] == ObjectStatus.END_OF_TRACK:
         end_of_track = 1
@@ -1883,6 +1903,7 @@ async def _on_fetch(session, msg):
                  o.extensions, o.publisher_priority, o.status)
                 for o in upstream]
         end_of_track = int(getattr(up_ok, 'end_of_track', 0) or 0)
+        source = "upstream"
     if track is not None:
         track._fetches += 1
     if track_name == CATALOG_TRACK:
@@ -1901,12 +1922,7 @@ async def _on_fetch(session, msg):
     if int(order) == int(GroupOrder.DESCENDING):
         objs = sorted(objs, key=lambda o: (-o[0], o[2]))
     await session.serve_fetch(
-        msg.request_id,
-        (FetchObject(group_id=gid, subgroup_id=sgid, object_id=oid,
-                     publisher_priority=prio,
-                     extensions=exts, payload=payload or b"",
-                     status=status)
-         for gid, sgid, oid, payload, exts, prio, status in objs),
+        msg.request_id, _counted_fetch(objs, track, source),
         group_order=int(order))
     logger.info(f"relay: FETCH ns={ns} track={track_name} served "
                 f"{len(objs)} object(s) {start}..({last_g}.{last_o})")
@@ -2378,6 +2394,13 @@ TRACK_HISTORY_MAX = 24
 TRACK_SUBSCRIBERS_MAX = 50
 
 
+def _cache_efficiency():
+    """Share of FETCH payload bytes served from the cache; None before any."""
+    cache, upstream = _fetch_bytes["cache"], _fetch_bytes["upstream"]
+    total = cache + upstream
+    return round(cache / total, 4) if total else None
+
+
 class _Status:
     """The dashboard's status.json and platform.json, rewritten every
     STATUS_INTERVAL_S."""
@@ -2483,6 +2506,8 @@ class _Status:
                 "bytes_in": t._bytes_in, "bytes_out": t._bytes_out,
                 "objects_in": t._objects_in, "objects_out": t._objects_out,
                 "fetches": t._fetches, "drops": t._drops,
+                "fetch_cache_bytes": t._fetch_bytes["cache"],
+                "fetch_upstream_bytes": t._fetch_bytes["upstream"],
                 "groups_in": t._groups_in,
                 "groups_per_s": per_s(t._groups_in - p_grp),
                 "objects_per_s": per_s(t._objects_in - p_obj),
@@ -2590,6 +2615,9 @@ class _Status:
                            if media_out else None),
             "delivered_bytes": self._delivered, "drops": self._drops,
             "fetches": sum(r["fetches"] for _, r in tracks),
+            "fetch_cache_bytes": _fetch_bytes["cache"],
+            "fetch_upstream_bytes": _fetch_bytes["upstream"],
+            "cache_efficiency": _cache_efficiency(),
             "loss_pct": round(100 * lost / sent, 2) if sent else 0.0,
             "rtt_p50_ms": relay_status.percentile(rtts, 50),
             "rtt_p99_ms": relay_status.percentile(rtts, 99),
