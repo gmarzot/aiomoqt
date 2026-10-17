@@ -16,7 +16,7 @@
     margin: 0; background: var(--bg); color: var(--text);
     font: 14px/1.5 Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
   }
-  main { max-width: 960px; margin: 0 auto; padding: 24px 16px 48px; }
+  main { max-width: 1040px; margin: 0 auto; padding: 24px 16px 48px; }
   header { margin-bottom: 22px; }
   h1 { margin: 0; display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 12px; line-height: 1.1; }
   .brand-name { font-size: 28px; font-weight: 600; letter-spacing: -.01em; }
@@ -34,8 +34,9 @@
   .card strong { display: block; font-size: 20px; font-weight: 700; color: var(--text); margin-bottom: 4px; }
   .five { color: var(--g5); font-style: normal; }
   .card span { color: var(--dim); }
-  .card .tags { display: block; margin-top: 10px; color: #8a8a96;
-    font: 12px/1.5 "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace; }
+  .card .tags { display: block; margin-top: 10px; color: #8a8a96; white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis; font: 12px/1.5 "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace; }
+  @media (max-width: 600px) { .card .tags { white-space: normal; } }
   section { margin-top: 32px; border-top: 1px solid var(--edge); padding-top: 16px; }
   h2 { font-size: 13px; font-weight: 500; color: var(--dim); text-transform: uppercase; letter-spacing: .04em; margin: 0 0 10px; }
   dl { display: grid; grid-template-columns: max-content 1fr; gap: 6px 14px; margin: 0; }
@@ -63,13 +64,13 @@
   <div class="grid">
     <a class="card" href="/g5-broadcast/">
       <strong>G<i class="five">5</i> Broadcast</strong>
-      <span>Publish live camera, screen and audio from the browser to any MoQ relay.</span>
-      <span class="tags">H.264 · HEVC · AV1 · VP9 · Opus · AAC — LOC/MSF · CMSF · LOCMAF — drafts 14–18</span>
+      <span>Browser-based MoQ broadcast (webcam, screen)</span>
+      <span class="tags" title="Catalogs MSF, CMSF; packaging LOC, CMAF, LOCMAF; video H.264, HEVC, AV1, VP9; audio Opus, AAC; drafts 14 to 18">MSF/CMSF · LOC/CMAF/LOCMAF · H.264/HEVC/AV1/VP9 · Opus/AAC · d14–18</span>
     </a>
     <a class="card" href="/g5-player/?url=https%3A%2F%2Fmoqx-main.ci.openmoq.org%3A4433%2Fmoq-relay">
       <strong>G<i class="five">5</i> Player</strong>
-      <span>Watch any MoQ broadcast from any relay, with a tunable latency target.</span>
-      <span class="tags">MSF/LOC · CMSF · LOCMAF — WebCodecs + MSE — drafts 14–18</span>
+      <span>Browser-based MoQ playback</span>
+      <span class="tags" title="Catalogs MSF, CMSF; packaging LOC, CMAF, LOCMAF; decoding WebCodecs, MSE; drafts 14 to 18">MSF/CMSF · LOC/CMAF/LOCMAF · WebCodecs/MSE · d14–18</span>
     </a>
   </div>
   <p class="note">Repo: <a href="https://github.com/gmarzot/moq-playa/tree/gmarzot-playa-dev">gmarzot/moq-playa</a> — forked from <a href="https://github.com/openmoq/moq-playa">openmoq/moq-playa</a></p>
