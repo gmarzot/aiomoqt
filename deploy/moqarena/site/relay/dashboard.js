@@ -119,19 +119,22 @@ function renderTiles(s) {
   const drafts = Object.entries(T.by_draft || {}).map(([k, v]) => `${k}: ${v}`).join(', ');
   const playable = s.namespaces.filter((r) => r.format).length;
   const groups = s.tracks.reduce((n, r) => n + (r.groups_per_s || 0), 0);
+  const subSessions = (s.sessions || []).filter((x) => (x.role || '').includes('sub')).length;
   setTile('sessions', fmt.num(T.sessions), transports, drafts ? `By draft: ${drafts}` : '');
   setTile('namespaces', fmt.num(T.namespaces), playable ? `${playable} playable` : '');
   setTile('tracks', fmt.num(T.tracks), fmt.plural(T.fetches, 'fetch', 'fetches'));
-  setTile('subscribers', fmt.num(T.subscribers), fmt.plural(T.publishers, 'publisher'));
+  setTile('publishers', fmt.num(T.publishers), 'publishing sessions');
+  setTile('subscribers', fmt.num(T.subscribers), `${fmt.plural(subSessions, 'session')}`);
+  setTile('delivered', fmt.bytes(T.delivered_bytes), 'media since start');
+  setTile('groups', fmt.rate(groups), 'in, all tracks');
+  setTile('objects', fmt.rate(T.objects_in_per_s), 'in, all tracks');
   setTile('ingress', fmt.bps(T.ingress_bps), `media ${fmt.bps(T.media_in_bps)}`);
   setTile('egress', fmt.bps(T.egress_bps), `media ${fmt.bps(T.media_out_bps)}`);
-  setTile('objects', fmt.rate(T.objects_in_per_s), `${fmt.rate(groups)} groups/s in`);
-  setTile('delivered', fmt.bytes(T.delivered_bytes), 'media since start');
-  setTile('drops', fmt.num(T.drops), 'subscribers dropped');
-  setTile('loss', fmt.pct(T.loss_pct, 2), 'delivery to subscribers');
   setTile('rtt', fmt.ms(T.rtt_p50_ms), `p99 ${fmt.ms(T.rtt_p99_ms)}`);
   const lag = T.loop_lag_ms || {};
   setTile('lag', fmt.ms(lag.p99), `p50 ${fmt.ms(lag.p50)}`);
+  setTile('lossdrops', `${fmt.pct(T.loss_pct, 2)} / ${fmt.num(T.drops)}`,
+          'delivery loss / subscribers dropped');
   for (const tile of document.querySelectorAll('.tile[data-spark]')) {
     Dash.spark(tile, s.history[tile.dataset.spark] || []);
   }

@@ -115,8 +115,9 @@ h2 {
 
 /* tiles */
 .tiles {
-  display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px; margin: 0 0 12px;
+  display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px; margin: 0 0 8px;
 }
+.tiles-7 { grid-template-columns: repeat(7, minmax(0, 1fr)); margin-bottom: 12px; }
 .tile {
   background: var(--panel); border: 1px solid var(--edge); border-radius: 4px;
   padding: 10px 12px 8px; min-width: 0;
