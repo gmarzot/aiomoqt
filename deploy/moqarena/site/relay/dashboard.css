@@ -32,6 +32,7 @@ code {
   margin-top: 3px; font-size: 10.5px; font-weight: 600; color: var(--gold);
   text-transform: uppercase; letter-spacing: .16em;
 }
+.facts .badge-version { display: inline-block; margin-top: 8px; }
 .badge-version {
   background: #1d1a10; color: var(--gold); border: 1.5px solid var(--gold); border-radius: 6px;
   padding: 3px 12px; font: 700 14px/1.4 "JetBrains Mono", ui-monospace, Menlo, Consolas,
@@ -69,10 +70,10 @@ code {
 .toast[hidden] { display: none; }
 
 .gauges { display: flex; gap: 8px; }
-.gauge { margin: 0; width: 84px; text-align: center; }
-.gauge svg { display: block; width: 84px; height: 73px; }
+.gauge { margin: 0; width: 120px; text-align: center; }
+.gauge svg { display: block; width: 120px; height: 104px; }
 .gauge figcaption {
-  margin-top: -6px; font-size: 11px; font-weight: 600; color: var(--gold); letter-spacing: .08em;
+  margin-top: -6px; font-size: 12px; font-weight: 600; color: var(--gold); letter-spacing: .08em;
 }
 .gauge .g-track, .gauge .g-arc { fill: none; stroke-width: 10; stroke-linecap: round; }
 .gauge .g-track { stroke: var(--track); }
@@ -208,7 +209,7 @@ footer code { color: var(--dim); }
   .live { margin-left: 0; }
   .hero-grid { grid-template-columns: minmax(0, 1fr); }
   .gauges { justify-content: space-between; }
-  .gauge, .gauge svg { width: 22vw; max-width: 84px; }
+  .gauge, .gauge svg { width: 22vw; max-width: 120px; }
   .gauge svg { height: auto; }
   .mono { font-size: 13px; }
 }
