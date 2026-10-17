@@ -15,6 +15,8 @@
 - `MOQTSession.peer_address`: the peer's (host, port), None while unknown or with an aiopquic that cannot report it.
 - Relay status: masked peer addresses (IPv4 /24, IPv6 /48, no port) as `namespaces[].origin_addr`, `tracks[].origin_addr`, `tracks[].subscriber_list[].addr` and `sessions[].addr`.
 - Relay: one INFO line per session with its full address when first seen.
+- Relay `--log-dir DIR`: the log also goes to DIR/relay.log (10 MB x 4 rotation); crash and stall dumps go to DIR/crash.log after a start line.
+- Relay: logs `relay: start aiomoqt <ver> aiopquic <ver> pid <n>` at startup.
 - Relay: `--status-dir` also writes `platform.json` (host detail from /proc: CPU by mode,
   pressure, memory, disks, interfaces, UDP, the relay's socket and process) and per-track
   history and subscriber lists in `status.json`.

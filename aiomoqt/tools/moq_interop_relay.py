@@ -49,9 +49,11 @@ import argparse
 import asyncio
 from collections import deque
 import contextlib
+import datetime
 import faulthandler
 import itertools
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import sys
 import time
@@ -81,7 +83,7 @@ from aiomoqt.context import (canonical_request_error, canonical_stream_reset,
                              request_error_code)
 from aiomoqt.tools import relay_status
 from aiomoqt.utils.buffer import Buffer
-from aiomoqt.utils.logger import set_log_level, get_logger
+from aiomoqt.utils.logger import set_log_handler, set_log_level, get_logger
 from aiomoqt.utils.url import parse_relay_url
 
 # Version confinement. The interop runner injects DRAFT (moq-interop-runner
@@ -1662,6 +1664,11 @@ def parse_args():
                              f"{STATUS_INTERVAL_S:g}s for the dashboard: "
                              "namespaces, tracks, subscribers, bandwidth, "
                              "host metrics. Off by default.")
+    parser.add_argument("--log-dir", type=str, default=None, metavar="DIR",
+                        help="Also log to DIR/relay.log (rotated, "
+                             f"{LOG_FILE_BYTES >> 20} MB x {LOG_FILE_BACKUPS}) "
+                             "and send crash and stall dumps to "
+                             "DIR/crash.log. Off by default.")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug logging")
     return parser.parse_args()
@@ -2183,7 +2190,8 @@ async def _heartbeat(stall_s: float) -> None:
     so an event loop stuck past `stall_s` — in Python or in native code —
     gets every thread's stack dumped and the process exited."""
     while True:
-        faulthandler.dump_traceback_later(stall_s, exit=True)
+        faulthandler.dump_traceback_later(
+            stall_s, exit=True, file=_crash_file or sys.stderr)
         await asyncio.sleep(min(1.0, stall_s / 4))
 
 
@@ -2696,6 +2704,85 @@ class _Status:
         }
 
 
+# --log-dir: relay.log rotation, and the root logger's format.
+LOG_FILE_BYTES = 10 * 1024 * 1024
+LOG_FILE_BACKUPS = 4
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+# faulthandler's target with --log-dir (crash.log); stderr otherwise.
+_crash_file = None
+
+
+class _LogFile(RotatingFileHandler):
+    """relay.log; mode 0644 across rotations for a read-only reader."""
+
+    def _open(self):
+        stream = super()._open()
+        os.chmod(self.baseFilename, 0o644)
+        return stream
+
+
+class _MirrorFormatter(logging.Formatter):
+    """Each record as stderr shows it: aiomoqt loggers have their own
+    handler and format, everything else goes through the root's."""
+
+    def __init__(self, aiomoqt_formatter):
+        super().__init__(LOG_FORMAT)
+        self.aiomoqt = aiomoqt_formatter
+
+    def format(self, record):
+        if not logging.getLogger(record.name).propagate:
+            return self.aiomoqt.format(record)
+        return super().format(record)
+
+
+class _Tee(logging.Handler):
+    """Hands each record to several handlers."""
+
+    def __init__(self, *targets):
+        super().__init__()
+        self.targets = targets
+
+    def handle(self, record):
+        for target in self.targets:
+            target.handle(record)
+        return True
+
+    def emit(self, record):
+        pass
+
+
+def _versions_line() -> str:
+    v = relay_status.versions()
+    return f"aiomoqt {v['aiomoqt']} aiopquic {v['aiopquic']}"
+
+
+def _start_log_dir(log_dir: str) -> None:
+    """DIR/relay.log: the stderr log, rotated. DIR/crash.log: a start
+    line, then faulthandler's crash and stall dumps (it takes one file,
+    so they no longer reach stderr)."""
+    global _crash_file
+    os.makedirs(log_dir, exist_ok=True)
+    os.chmod(log_dir, 0o755)
+    shown = logger.handlers[0] if logger.handlers else None
+    log_file = _LogFile(os.path.join(log_dir, "relay.log"),
+                        maxBytes=LOG_FILE_BYTES, backupCount=LOG_FILE_BACKUPS)
+    log_file.setFormatter(_MirrorFormatter(
+        shown.formatter if shown is not None and shown.formatter
+        else logging.Formatter(LOG_FORMAT)))
+    logging.getLogger().addHandler(log_file)
+    set_log_handler(_Tee(shown, log_file) if shown is not None else log_file)
+
+    path = os.path.join(log_dir, "crash.log")
+    _crash_file = open(path, "a")
+    os.chmod(path, 0o644)
+    now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+    _crash_file.write(f"relay: start {now.isoformat(timespec='seconds')}Z "
+                      f"pid {os.getpid()} {_versions_line()}\n")
+    _crash_file.flush()
+    faulthandler.enable(file=_crash_file, all_threads=True)
+    logger.info(f"relay: crash and stall dumps go to {path}")
+
+
 async def main():
     args = parse_args()
     speaks = sorted(int(d) for d in MOQTDraft)
@@ -2707,8 +2794,11 @@ async def main():
     set_log_level(log_level)
     logging.basicConfig(
         level=log_level, stream=sys.stderr,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        format=LOG_FORMAT,
     )
+    if args.log_dir:
+        _start_log_dir(args.log_dir)
+    logger.info(f"relay: start {_versions_line()} pid {os.getpid()}")
     print("aiomoqt ERSATZ-RELAY: an API demonstrator and conformance "
           "SUT — not a production relay (no auth, no hardening).",
           file=sys.stderr)
