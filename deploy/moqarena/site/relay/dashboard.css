@@ -175,12 +175,11 @@ h2 {
   font-variant-numeric: tabular-nums; }
 
 /* namespaces and tracks */
-.split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); gap: 12px; }
+.split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
 .split .panel { margin: 0 0 12px; min-width: 0; }
 table.compact th, table.compact td { padding: 5px 7px; }
 table.compact td { font-size: 13px; }
 .panel.charts .chart { margin: 0; }
-.detail { color: var(--dim); font-size: 12px; margin: 2px 0 6px; }
 .h2-scope {
   margin-left: 8px; color: var(--text); text-transform: none; letter-spacing: 0;
   font: 13px "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
@@ -189,16 +188,7 @@ tr.pick { cursor: pointer; }
 tr.pick:focus-visible td { outline: 1px solid var(--gold); }
 tr.selected td { background: rgba(232, 179, 57, .07); }
 tr.selected td:first-child { box-shadow: inset 2px 0 var(--gold); }
-.expand {
-  width: 18px; background: none; border: 0; color: var(--dim); cursor: pointer; padding: 0;
-  font-size: 12px;
-}
-.expand:hover { color: var(--gold); }
 td .key-line { margin: 0 8px 2px 2px; vertical-align: middle; }
-tr.open td { background: var(--panel-2); }
-.subs-row > td { background: #121216; padding: 4px 10px 10px 36px; }
-table.subs { width: auto; font-size: 12px; }
-table.subs th, table.subs td { padding: 3px 12px 3px 0; border-bottom-color: #26262e; }
 .note { color: var(--faint); font-size: 12px; margin: 4px 0 0; }
 .platform-link { font-family: Inter, system-ui, sans-serif; font-size: 13px; color: var(--gold); }
 

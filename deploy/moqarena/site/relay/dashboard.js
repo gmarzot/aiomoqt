@@ -2,22 +2,29 @@
 // namespace, from /status/status.json. Uses Dash from common.js.
 'use strict';
 
-const {SERIES, OTHER, $, el, svgEl, none, fmt} = Dash;
+const {OTHER, $, el, svgEl, none, fmt} = Dash;
 const PLAYER = '/g5-player/';
 const PLAYER_DRAFT = '18';
 const STATES = new Set(['live', 'idle', 'held', 'parked', 'ended']);
-const TRACK_COLS = 9;
+const TRACK_COLS = 7;
+// Media track colors by name; other tracks take the remaining palette hues in order.
+const NAMED = [[/^catalog$/i, '#d9532b'], [/audio/i, '#6fbff5'], [/video/i, '#8457d0']];
+const REST = ['#199e70', '#c98500', '#d55181', '#008300', '#e66767'];
+const ORDER = [...NAMED.map(([, c]) => c), ...REST];
 
 // The selected namespace: from the URL hash, else the first one listed.
 let scope = new URLSearchParams(location.hash.slice(1)).get('ns');
-// Track ids whose subscriber list is open.
-const expanded = new Set();
-// Track id -> series color, in first-seen order; it never changes with scope.
+// Track id -> color; fixed once seen, so a track keeps it in every view.
 const colors = new Map();
 let latest = null;
 
 function colorOf(id) {
-  if (!colors.has(id)) colors.set(id, colors.size < SERIES.length ? SERIES[colors.size] : null);
+  if (!colors.has(id)) {
+    const name = id.split('\x1f').pop();
+    const named = NAMED.find(([re]) => re.test(name));
+    const used = [...colors.values()].filter((c) => REST.includes(c)).length;
+    colors.set(id, named ? named[1] : (used < REST.length ? REST[used] : null));
+  }
   return colors.get(id);
 }
 
@@ -153,11 +160,11 @@ function renderNamespaces(rows, wtUrl) {
       el('td', {}, r.format ? el('span', {class: 'badge'}, r.format) : '—'),
       el('td', {}, r.origin || '—'),
       num(fmt.num(r.tracks)), num(fmt.num(r.subscribers)),
-      num(fmt.bps(r.in_bps)), num(fmt.bps(r.out_bps)),
+      inOut(r.in_bps, r.out_bps),
       el('td', {class: 'n'}, r.format ? playLink(r.namespace, wtUrl) : ''));
     tr.dataset.ns = r.namespace;
     return tr;
-  }), 8, 'No namespaces.');
+  }), 7, 'No namespaces.');
 }
 
 // -- tracks: charts and table ---------------------------------------------------
@@ -180,7 +187,7 @@ function seriesFor(s, tracks, field) {
         : (v || 0) + (hist[field][i] || 0))) : hist[field].slice();
     }
   }
-  series.sort((a, b) => SERIES.indexOf(a.color) - SERIES.indexOf(b.color));
+  series.sort((a, b) => ORDER.indexOf(a.color) - ORDER.indexOf(b.color));
   if (other) series.push({name: 'Other', values: other, color: OTHER});
   return series;
 }
@@ -196,53 +203,47 @@ function renderTrackCharts(s, tracks) {
   Dash.chart($('chart-egress'), t, egress, {labels: true, fmt: fmt.bps});
 }
 
-function subscriberRow(r) {
-  const list = r.subscriber_list || [];
+const inOut = (i, o) => el('td', {class: 'n', title: `in ${fmt.bps(i)} · out ${fmt.bps(o)}`},
+  `${fmt.bpsShort(i)} / ${fmt.bpsShort(o)}`);
+
+// Everything the row leaves out, for its hover text.
+function trackDetail(r) {
   const now = Date.now() / 1000;
-  const body = list.length ? list.map((x) => el('tr', {},
-    el('td', {}, x.transport), el('td', {}, `d${x.draft}`), num(fmt.ms(x.rtt_ms)),
-    el('td', {}, x.forward ? 'forwarding' : 'paused'),
-    num(none(x.since) ? '—' : fmt.duration(now - x.since))))
-    : [el('tr', {}, el('td', {colspan: 5, class: 'empty'}, 'No subscribers.'))];
-  const more = r.subscribers > list.length ? el('p', {class: 'note'},
-    `First ${list.length} of ${fmt.num(r.subscribers)}.`) : '';
-  const detail = [`peak ${fmt.num(r.peak)} subscribers`, `${fmt.bytes(r.bytes_out)} delivered`,
-                  fmt.plural(r.fetches, 'fetch', 'fetches'), fmt.plural(r.drops, 'drop'),
-                  r.largest ? `largest ${r.largest[0]} · ${r.largest[1]}` : null,
-                  r.origin ? `from ${r.origin}` : null].filter(Boolean).join(' · ');
-  return el('tr', {class: 'subs-row'}, el('td', {colspan: TRACK_COLS},
-    el('p', {class: 'detail'}, detail),
-    el('table', {class: 'subs'},
-      el('thead', {}, el('tr', {}, el('th', {}, 'Transport'), el('th', {}, 'Draft'),
-        el('th', {class: 'n'}, 'RTT'), el('th', {}, 'Forward'),
-        el('th', {class: 'n'}, 'Connected'))),
-      el('tbody', {}, ...body)), more));
+  const lines = [
+    `${r.namespace} / ${r.name}`,
+    `peak ${fmt.num(r.peak)} subscribers · ${fmt.bytes(r.bytes_out)} delivered · `
+      + `${fmt.plural(r.fetches, 'fetch', 'fetches')} · ${fmt.plural(r.drops, 'drop')}`,
+    `cache ${fmt.num(r.cache_groups)} groups, ${fmt.bytes(r.cache_bytes)}`
+      + (r.largest ? ` · largest ${r.largest[0]} · ${r.largest[1]}` : ''),
+    `from ${r.origin || '—'} · RTT up ${fmt.ms(r.rtt_up_ms)}, down p50 ${fmt.ms(r.rtt_down_ms)}`,
+  ];
+  const subs = r.subscriber_list || [];
+  if (subs.length) {
+    lines.push('subscribers:');
+    for (const x of subs.slice(0, 12)) {
+      lines.push(`  ${x.transport} d${x.draft} · ${fmt.ms(x.rtt_ms)} · ${x.forward ? 'forwarding' : 'paused'}`
+        + (none(x.since) ? '' : ` · ${fmt.duration(now - x.since)}`));
+    }
+    if (r.subscribers > 12) lines.push(`  … ${fmt.num(r.subscribers - 12)} more`);
+  }
+  return lines.join('\n');
 }
 
 function trackRow(r) {
   const state = STATES.has(r.state) ? r.state : 'idle';
-  const open = expanded.has(r.id);
   const color = colorOf(r.id) || OTHER;
-  const toggle = el('button', {type: 'button', class: 'expand', 'aria-expanded': String(open),
-                               title: open ? 'Hide detail' : 'Show detail and subscribers'},
-                    open ? '▾' : '▸');
-  toggle.dataset.track = r.id;
-  const tr = el('tr', {class: open ? 'open' : null},
-    el('td', {}, toggle, el('i', {class: 'key-line', style: `background:${color}`}),
-       el('code', {}, r.name)),
-    el('td', {}, el('span', {class: `state state-${state}`}, state)),
+  return el('tr', {title: trackDetail(r)},
+    el('td', {}, el('i', {class: 'key-line', style: `background:${color}`}), el('code', {}, r.name)),
     num(fmt.num(r.subscribers)),
-    num(fmt.bps(r.in_bps)), num(fmt.bps(r.out_bps)),
+    inOut(r.in_bps, r.out_bps),
     num(fmt.rate(r.groups_per_s)), num(fmt.rate(r.objects_per_s)),
-    el('td', {class: 'n', title: `RTT up ${fmt.ms(r.rtt_up_ms)} · down p50 ${fmt.ms(r.rtt_down_ms)}`},
-       fmt.ms(r.latency_ms)),
-    num(`${fmt.num(r.cache_groups)} g · ${fmt.bytes(r.cache_bytes)}`));
-  return open ? [tr, subscriberRow(r)] : [tr];
+    num(fmt.ms(r.latency_ms)),
+    el('td', {}, el('span', {class: `state state-${state}`}, state)));
 }
 
 function renderTracks(tracks) {
   $('tracks-scope').textContent = scope || '';
-  fill($('t-tracks'), tracks.flatMap(trackRow), TRACK_COLS,
+  fill($('t-tracks'), tracks.map(trackRow), TRACK_COLS,
        scope === null ? 'No namespaces.' : 'No tracks in this namespace.');
 }
 
@@ -293,12 +294,6 @@ function copyText(target) {
 function activate(target) {
   const copy = target.closest('.copyable');
   if (copy) return copyText(copy);
-  const toggle = target.closest('.expand');
-  if (toggle) {
-    const id = toggle.dataset.track;
-    if (expanded.has(id)) expanded.delete(id); else expanded.add(id);
-    return latest && render(latest);
-  }
   const pick = target.closest('tr.pick');
   if (pick && !target.closest('a')) setScope(pick.dataset.ns);
 }

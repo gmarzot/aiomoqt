@@ -43,6 +43,7 @@ const Dash = (() => {
   const fmt = {
     bps: (v) => none(v) ? '—' : scaled(v, 1000, ['bps', 'kbps', 'Mbps', 'Gbps']),
     Bps: (v) => none(v) ? '—' : `${scaled(v, 1000, ['B', 'kB', 'MB', 'GB'])}/s`,
+    bpsShort: (v) => none(v) ? '—' : scaled(v, 1000, ['', 'k', 'M', 'G']).replace(' ', ''),
     bytes: (v) => none(v) ? '—' : scaled(v, 1000, ['B', 'kB', 'MB', 'GB', 'TB']),
     num: (v) => none(v) ? '—' : Number(v).toLocaleString('en-US'),
     pct: (v, digits = 1) => none(v) ? '—' : `${Number(v).toFixed(digits)}%`,
