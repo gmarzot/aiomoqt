@@ -11,7 +11,8 @@
   const LIST_MS = 30000;
   const MAX_RECORDS = 20000;
   const LEVELS = {DEBUG: 10, INFO: 20, WARNING: 30, ERROR: 40, CRITICAL: 50};
-  const HEAD = /^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3}) (DEBUG|INFO|WARNING|ERROR|CRITICAL) (\S+): /;
+  // aiomoqt loggers: "… 20:14:09.826 INFO : msg"; others: "… 20:14:09,826 INFO name: msg".
+  const HEAD = /^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d[.,]\d{3}) (DEBUG|INFO|WARNING|ERROR|CRITICAL)(?: +(\S+))? *: /;
   const START = /^relay: start /;
   // faulthandler: a fatal signal, or the watchdog's stall dump.
   const CRASH = /^(Fatal Python error|Timeout \(\d+:\d\d:\d\d(\.\d+)?\)!)/;
@@ -214,7 +215,7 @@
   // -- rendering --------------------------------------------------------------
 
   const text = (r) => r.lines.join('\n');
-  const lower = (r) => ((r.head ? `${r.head.ts} ${r.head.level} ${r.head.logger}: ` : '')
+  const lower = (r) => ((r.head ? `${r.head.ts} ${r.head.level} ${r.head.logger || ''}: ` : '')
     + text(r)).toLowerCase();
 
   function visible(r) {
@@ -245,9 +246,8 @@
     if (r.kind) cls.push(`kind-${r.kind}`);
     const n = el('div', {class: cls.join(' ')});
     if (r.head) {
-      n.append(el('span', {class: 'ts'}, r.head.ts), ' ',
-               el('span', {class: 'lv'}, r.head.level), ' ',
-               el('span', {class: 'lg'}, `${r.head.logger}:`), ' ');
+      n.append(el('span', {class: 'ts'}, r.head.ts), ' ', el('span', {class: 'lv'}, r.head.level), ' ');
+      if (r.head.logger) n.append(el('span', {class: 'lg'}, `${r.head.logger}:`), ' ');
     }
     n.append(...marked(text(r)));
     r.node = n;
