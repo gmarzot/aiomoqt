@@ -6,9 +6,9 @@ const {SERIES, OTHER, $, el, svgEl, none, fmt} = Dash;
 const PLAYER = '/g5-player/';
 const PLAYER_DRAFT = '18';
 const STATES = new Set(['live', 'idle', 'held', 'parked', 'ended']);
-const TRACK_COLS = 13;
+const TRACK_COLS = 9;
 
-// Namespace scope (null: all), from and to the URL hash.
+// The selected namespace: from the URL hash, else the first one listed.
 let scope = new URLSearchParams(location.hash.slice(1)).get('ns');
 // Track ids whose subscriber list is open.
 const expanded = new Set();
@@ -23,8 +23,7 @@ function colorOf(id) {
 
 function setScope(ns) {
   scope = ns;
-  history.replaceState(null, '', ns === null ? location.pathname
-    : `#${new URLSearchParams({ns})}`);
+  history.replaceState(null, '', `#${new URLSearchParams({ns})}`);
   if (latest) render(latest);
 }
 
@@ -142,41 +141,29 @@ const num = (v) => el('td', {class: 'n'}, v);
 
 function playLink(ns, url) {
   const q = new URLSearchParams({url, ns, v: PLAYER_DRAFT});
-  return el('a', {class: 'play', href: `${PLAYER}?${q}`, target: '_blank', rel: 'noopener'},
-            '▶ Play');
+  return el('a', {class: 'play', href: `${PLAYER}?${q}`, target: '_blank', rel: 'noopener',
+                  title: 'Play in G5 Player'}, '▶');
 }
 
 function renderNamespaces(rows, wtUrl) {
   fill($('t-namespaces'), rows.map((r) => {
-    const tr = el('tr', {class: `pick${r.namespace === scope ? ' selected' : ''}`,
-                         tabindex: '0', title: 'Show this namespace\'s tracks'},
+    const tr = el('tr', {class: `pick${r.namespace === scope ? ' selected' : ''}`, tabindex: '0',
+                         title: `${fmt.bytes(r.bytes_out)} delivered`},
       el('td', {}, el('code', {}, r.namespace)),
       el('td', {}, r.format ? el('span', {class: 'badge'}, r.format) : '—'),
       el('td', {}, r.origin || '—'),
       num(fmt.num(r.tracks)), num(fmt.num(r.subscribers)),
-      num(fmt.bps(r.in_bps)), num(fmt.bps(r.out_bps)), num(fmt.bytes(r.bytes_out)),
+      num(fmt.bps(r.in_bps)), num(fmt.bps(r.out_bps)),
       el('td', {class: 'n'}, r.format ? playLink(r.namespace, wtUrl) : ''));
     tr.dataset.ns = r.namespace;
     return tr;
-  }), 9, 'No namespaces.');
-}
-
-function renderScope(namespaces) {
-  const chip = (label, ns) => {
-    const b = el('button', {type: 'button', class: `chip${scope === ns ? ' on' : ''}`,
-                            'aria-pressed': String(scope === ns)}, label);
-    b.dataset.scope = ns === null ? '' : ns;
-    b.dataset.all = ns === null ? '1' : '';
-    return b;
-  };
-  $('scope').replaceChildren(el('span', {class: 'scope-label'}, 'Scope'),
-    chip('All namespaces', null), ...namespaces.map((r) => chip(r.namespace, r.namespace)));
+  }), 8, 'No namespaces.');
 }
 
 // -- tracks: charts and table ---------------------------------------------------
 
 function scoped(tracks) {
-  return scope === null ? tracks : tracks.filter((r) => r.namespace === scope);
+  return tracks.filter((r) => r.namespace === scope);
 }
 
 function seriesFor(s, tracks, field) {
@@ -186,9 +173,8 @@ function seriesFor(s, tracks, field) {
     const hist = (s.track_history || {})[r.id];
     if (!hist) continue;
     const color = colorOf(r.id);
-    const name = scope === null ? `${r.name} · ${r.namespace}` : r.name;
     if (color) {
-      series.push({name, label: r.name, values: hist[field], color});
+      series.push({name: r.name, values: hist[field], color});
     } else {
       other = other ? other.map((v, i) => (none(v) && none(hist[field][i]) ? null
         : (v || 0) + (hist[field][i] || 0))) : hist[field].slice();
@@ -220,7 +206,12 @@ function subscriberRow(r) {
     : [el('tr', {}, el('td', {colspan: 5, class: 'empty'}, 'No subscribers.'))];
   const more = r.subscribers > list.length ? el('p', {class: 'note'},
     `First ${list.length} of ${fmt.num(r.subscribers)}.`) : '';
+  const detail = [`peak ${fmt.num(r.peak)} subscribers`, `${fmt.bytes(r.bytes_out)} delivered`,
+                  fmt.plural(r.fetches, 'fetch', 'fetches'), fmt.plural(r.drops, 'drop'),
+                  r.largest ? `largest ${r.largest[0]} · ${r.largest[1]}` : null,
+                  r.origin ? `from ${r.origin}` : null].filter(Boolean).join(' · ');
   return el('tr', {class: 'subs-row'}, el('td', {colspan: TRACK_COLS},
+    el('p', {class: 'detail'}, detail),
     el('table', {class: 'subs'},
       el('thead', {}, el('tr', {}, el('th', {}, 'Transport'), el('th', {}, 'Draft'),
         el('th', {class: 'n'}, 'RTT'), el('th', {}, 'Forward'),
@@ -233,39 +224,26 @@ function trackRow(r) {
   const open = expanded.has(r.id);
   const color = colorOf(r.id) || OTHER;
   const toggle = el('button', {type: 'button', class: 'expand', 'aria-expanded': String(open),
-                               title: open ? 'Hide subscribers' : 'Show subscribers'},
+                               title: open ? 'Hide detail' : 'Show detail and subscribers'},
                     open ? '▾' : '▸');
   toggle.dataset.track = r.id;
   const tr = el('tr', {class: open ? 'open' : null},
-    el('td', {title: r.largest ? `Largest ${r.largest[0]} · ${r.largest[1]}` : null},
-       toggle, el('i', {class: 'key-line', style: `background:${color}`}),
+    el('td', {}, toggle, el('i', {class: 'key-line', style: `background:${color}`}),
        el('code', {}, r.name)),
     el('td', {}, el('span', {class: `state state-${state}`}, state)),
-    num(fmt.num(r.subscribers)), num(fmt.num(r.peak)),
-    num(fmt.bps(r.in_bps)), num(fmt.bps(r.out_bps)), num(fmt.bytes(r.bytes_out)),
+    num(fmt.num(r.subscribers)),
+    num(fmt.bps(r.in_bps)), num(fmt.bps(r.out_bps)),
     num(fmt.rate(r.groups_per_s)), num(fmt.rate(r.objects_per_s)),
     el('td', {class: 'n', title: `RTT up ${fmt.ms(r.rtt_up_ms)} · down p50 ${fmt.ms(r.rtt_down_ms)}`},
        fmt.ms(r.latency_ms)),
-    num(fmt.num(r.fetches)), num(fmt.num(r.drops)),
     num(`${fmt.num(r.cache_groups)} g · ${fmt.bytes(r.cache_bytes)}`));
   return open ? [tr, subscriberRow(r)] : [tr];
 }
 
 function renderTracks(tracks) {
-  $('tracks-scope').textContent = scope === null ? 'all namespaces' : scope;
-  const rows = [];
-  let ns = null;
-  for (const r of tracks) {
-    if (scope === null && r.namespace !== ns) {
-      ns = r.namespace;
-      const group = el('tr', {class: 'group pick', tabindex: '0', title: 'Scope to this namespace'},
-        el('td', {colspan: TRACK_COLS}, el('code', {}, ns)));
-      group.dataset.ns = ns;
-      rows.push(group);
-    }
-    rows.push(...trackRow(r));
-  }
-  fill($('t-tracks'), rows, TRACK_COLS, scope === null ? 'No tracks.' : 'No tracks in this namespace.');
+  $('tracks-scope').textContent = scope || '';
+  fill($('t-tracks'), tracks.flatMap(trackRow), TRACK_COLS,
+       scope === null ? 'No namespaces.' : 'No tracks in this namespace.');
 }
 
 // -- page -----------------------------------------------------------------------
@@ -276,8 +254,10 @@ function render(s) {
   renderRelay(s, urls);
   renderGauges(s.host || {}, s.totals || {});
   renderTiles(s);
+  if (!s.namespaces.some((r) => r.namespace === scope)) {
+    scope = s.namespaces.length ? s.namespaces[0].namespace : null;
+  }
   renderNamespaces(s.namespaces, urls.wt);
-  renderScope(s.namespaces);
   for (const r of s.tracks) colorOf(r.id);
   const tracks = scoped(s.tracks);
   renderTrackCharts(s, tracks);
@@ -313,8 +293,6 @@ function copyText(target) {
 function activate(target) {
   const copy = target.closest('.copyable');
   if (copy) return copyText(copy);
-  const chip = target.closest('.chip');
-  if (chip) return setScope(chip.dataset.all ? null : chip.dataset.scope);
   const toggle = target.closest('.expand');
   if (toggle) {
     const id = toggle.dataset.track;

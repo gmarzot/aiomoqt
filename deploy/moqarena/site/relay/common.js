@@ -285,14 +285,10 @@ const Dash = (() => {
     return () => latest;
   }
 
-  /** The live indicator and stale banner shared by both pages. */
+  /** The stale banner shared by both pages. */
   function showFreshness(stale, age) {
-    $('live').classList.toggle('ok', !stale);
-    $('live').classList.toggle('stale', stale);
     $('unavailable').hidden = !stale;
     document.body.classList.toggle('stale', stale && age !== null);
-    $('updated').textContent = age === null ? 'no status'
-      : stale ? `stale · last update ${fmt.duration(age)} ago` : 'live';
   }
 
   return {SERIES, OTHER, $, el, svgEl, none, fmt, niceMax, spark, legend, chart, poll,

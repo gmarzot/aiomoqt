@@ -40,7 +40,6 @@
           <span class="brand-sub">A Marz Research Project</span>
         </span>
       </a>
-      <span class="live" id="live"><i class="dot"></i><span id="updated">connecting…</span></span>
     </div>
 
     <div class="hero-grid">
@@ -66,13 +65,13 @@
         <dt>DRAFTS:</dt><dd id="drafts">22, 20, 18, 16, 14</dd>
         <dt>DATE:</dt><dd id="date">—</dd>
         <dt>UPTIME:</dt><dd id="uptime">—</dd>
+        <dt></dt><dd><a class="platform-link" href="platform/">platform detail ↗</a></dd>
       </dl>
       <div class="gauges" aria-label="Host utilization">
         <figure class="gauge"><svg id="gauge-cpu" viewBox="0 0 120 104" role="img" aria-label="CPU"></svg><figcaption>CPU</figcaption></figure>
         <figure class="gauge"><svg id="gauge-ram" viewBox="0 0 120 104" role="img" aria-label="RAM"></svg><figcaption>RAM</figcaption></figure>
         <figure class="gauge"><svg id="gauge-disk" viewBox="0 0 120 104" role="img" aria-label="Disk"></svg><figcaption>DISK</figcaption></figure>
         <figure class="gauge"><svg id="gauge-cdn" viewBox="0 0 120 104" role="img" aria-label="CDN efficiency"></svg><figcaption title="Share of egress not received upstream">CDN</figcaption></figure>
-        <a class="platform-link" href="platform/">platform detail ↗</a>
       </div>
     </div>
   </header>
@@ -101,42 +100,41 @@
     <div class="tile" data-key="lag" data-spark="lag_p99_ms"><h3>Loop lag</h3><div class="value">—</div><div class="sub"></div></div>
   </section>
 
-  <section class="panel">
-    <h2>Namespaces</h2>
-    <div class="table-wrap">
-      <table id="t-namespaces">
-        <thead><tr><th>Namespace</th><th>Format</th><th>Origin</th><th class="n">Tracks</th>
-          <th class="n">Subscribers</th><th class="n">In</th><th class="n">Out</th>
-          <th class="n">Delivered</th><th></th></tr></thead>
-        <tbody><tr><td colspan="9" class="empty">No namespaces.</td></tr></tbody>
-      </table>
-    </div>
-  </section>
+  <div class="split">
+    <section class="panel">
+      <h2>Namespaces</h2>
+      <div class="table-wrap">
+        <table id="t-namespaces" class="compact">
+          <thead><tr><th>Namespace</th><th>Format</th><th>Origin</th><th class="n">Tracks</th>
+            <th class="n">Subs</th><th class="n">In</th><th class="n">Out</th><th></th></tr></thead>
+          <tbody><tr><td colspan="8" class="empty">No namespaces.</td></tr></tbody>
+        </table>
+      </div>
+    </section>
 
-  <section class="panel">
-    <h2>Tracks <span class="h2-scope" id="tracks-scope">all namespaces</span></h2>
-    <div class="scope" id="scope" role="group" aria-label="Namespace scope"></div>
-    <div class="charts">
-      <figure class="chart">
-        <figcaption>Subscribers per track <span class="legend" id="legend-subs"></span></figcaption>
-        <svg id="chart-subs" role="img" aria-label="Subscribers per track over the last 10 minutes"></svg>
-      </figure>
-      <figure class="chart">
-        <figcaption>Egress per track <span class="legend" id="legend-egress"></span></figcaption>
-        <svg id="chart-egress" role="img" aria-label="Egress per track over the last 10 minutes"></svg>
-      </figure>
-    </div>
-    <div class="table-wrap">
-      <table id="t-tracks">
-        <thead><tr><th>Track</th><th>State</th><th class="n">Subscribers</th>
-          <th class="n">Peak</th><th class="n">In</th><th class="n">Out</th><th class="n">Delivered</th>
-          <th class="n">Groups/s</th><th class="n">Objects/s</th>
-          <th class="n" title="One-way network estimate: half the publisher RTT plus half the subscribers' median RTT; no queueing or buffering">Latency ≈</th>
-          <th class="n">Fetches</th><th class="n">Drops</th>
-          <th class="n">Cache</th></tr></thead>
-        <tbody><tr><td colspan="13" class="empty">No tracks.</td></tr></tbody>
-      </table>
-    </div>
+    <section class="panel">
+      <h2>Tracks <span class="h2-scope" id="tracks-scope"></span></h2>
+      <div class="table-wrap">
+        <table id="t-tracks" class="compact">
+          <thead><tr><th>Track</th><th>State</th><th class="n">Subs</th><th class="n">In</th>
+            <th class="n">Out</th><th class="n">Groups/s</th><th class="n">Objects/s</th>
+            <th class="n" title="One-way network estimate: half the publisher RTT plus half the subscribers' median RTT; no queueing or buffering">Latency ≈</th>
+            <th class="n">Cache</th></tr></thead>
+          <tbody><tr><td colspan="9" class="empty">No tracks.</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <section class="panel charts">
+    <figure class="chart">
+      <figcaption>Subscribers per track <span class="legend" id="legend-subs"></span></figcaption>
+      <svg id="chart-subs" role="img" aria-label="Subscribers per track over the last 10 minutes"></svg>
+    </figure>
+    <figure class="chart">
+      <figcaption>Egress per track <span class="legend" id="legend-egress"></span></figcaption>
+      <svg id="chart-egress" role="img" aria-label="Egress per track over the last 10 minutes"></svg>
+    </figure>
   </section>
 
   <footer>

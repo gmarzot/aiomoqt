@@ -39,13 +39,9 @@ code {
   padding: 3px 12px; font: 700 14px/1.4 "JetBrains Mono", ui-monospace, Menlo, Consolas,
   monospace; overflow-wrap: anywhere;
 }
-.live { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; color: var(--dim); }
-.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--faint); }
-.live.ok { color: var(--green); }
-.live.ok .dot { background: var(--green); box-shadow: 0 0 0 3px rgba(115, 191, 105, .25); }
 
 .hero-grid {
-  display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr) auto; gap: 16px 28px;
+  display: grid; grid-template-columns: max-content minmax(0, 1fr) auto; gap: 16px 32px;
   align-items: start;
 }
 .mono {
@@ -57,6 +53,8 @@ code {
 .facts .urls {
   margin-top: auto; border: 1px solid var(--edge); border-radius: 6px; padding: 4px 8px;
 }
+.urls { overflow-x: auto; }
+.urls dd { white-space: nowrap; overflow-wrap: normal; }
 .copyable {
   font: inherit; cursor: pointer; text-decoration: underline dotted var(--faint);
   text-underline-offset: 3px;
@@ -176,27 +174,21 @@ h2 {
 .tip-row b { color: var(--text); font-weight: 600; min-width: 64px; text-align: right;
   font-variant-numeric: tabular-nums; }
 
-/* scope and track rows */
+/* namespaces and tracks */
+.split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); gap: 12px; }
+.split .panel { margin: 0 0 12px; min-width: 0; }
+table.compact th, table.compact td { padding: 5px 7px; }
+table.compact td { font-size: 13px; }
+.panel.charts .chart { margin: 0; }
+.detail { color: var(--dim); font-size: 12px; margin: 2px 0 6px; }
 .h2-scope {
   margin-left: 8px; color: var(--text); text-transform: none; letter-spacing: 0;
   font: 13px "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
 }
-.scope { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0 0 12px; }
-.scope-label { color: var(--faint); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
-.chip {
-  background: transparent; color: var(--dim); border: 1px solid var(--edge); border-radius: 12px;
-  padding: 2px 10px; font: 12px "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
-  cursor: pointer;
-}
-.chip:hover { color: var(--text); border-color: var(--dim); }
-.chip.on { color: var(--gold); border-color: var(--gold); }
 tr.pick { cursor: pointer; }
 tr.pick:focus-visible td { outline: 1px solid var(--gold); }
 tr.selected td { background: rgba(232, 179, 57, .07); }
 tr.selected td:first-child { box-shadow: inset 2px 0 var(--gold); }
-tr.group td {
-  background: var(--panel-2); color: var(--gold); font-weight: 600; padding-top: 5px; padding-bottom: 5px;
-}
 .expand {
   width: 18px; background: none; border: 0; color: var(--dim); cursor: pointer; padding: 0;
   font-size: 12px;
@@ -208,9 +200,7 @@ tr.open td { background: var(--panel-2); }
 table.subs { width: auto; font-size: 12px; }
 table.subs th, table.subs td { padding: 3px 12px 3px 0; border-bottom-color: #26262e; }
 .note { color: var(--faint); font-size: 12px; margin: 4px 0 0; }
-.platform-link {
-  flex-basis: 100%; text-align: right; font-size: 12px; color: var(--gold); margin-top: -2px;
-}
+.platform-link { font-family: Inter, system-ui, sans-serif; font-size: 13px; color: var(--gold); }
 
 /* platform page */
 .crumb a { color: var(--dim); }
@@ -255,7 +245,7 @@ td.empty { color: var(--faint); text-align: center; padding: 14px; }
 .state-live { color: var(--green); font-weight: 600; }
 .state-ended { color: var(--faint); }
 .play {
-  display: inline-block; padding: 1px 10px; border: 1px solid var(--red); border-radius: 3px;
+  display: inline-block; padding: 0 8px; border: 1px solid var(--red); border-radius: 3px;
   color: var(--text); font-size: 12px; line-height: 20px;
 }
 .play:hover { background: var(--red); text-decoration: none; }
@@ -267,6 +257,7 @@ footer {
 footer code { color: var(--dim); }
 
 @media (max-width: 1100px) {
+  .split { grid-template-columns: minmax(0, 1fr); }
   .tiles { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .hero-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
   .gauges { grid-column: 1 / -1; }
@@ -282,7 +273,6 @@ footer code { color: var(--dim); }
   .tile .value { font-size: 22px; }
   .kv { grid-template-columns: minmax(0, 1fr); gap: 2px; }
   .kv dt { margin-top: 6px; }
-  .live { margin-left: 0; }
   .hero-grid { grid-template-columns: minmax(0, 1fr); }
   .gauges { justify-content: space-between; }
   .gauge, .gauge svg { width: 22vw; max-width: 120px; }
