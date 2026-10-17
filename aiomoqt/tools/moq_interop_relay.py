@@ -2516,7 +2516,7 @@ class _Status:
                 r = rtt_ms(d.session)
                 listed.append({
                     "transport": _transport(d.session), "draft": _draft(d.session),
-                    "addr": relay_status.mask_addr(_addr_of(d.session)),
+                    "addr": relay_status.display_addr(_addr_of(d.session)),
                     "rtt_ms": None if r is None else round(r, 1),
                     "forward": bool(d.forward),
                     "since": info["since"] if info else None})
@@ -2548,7 +2548,7 @@ class _Status:
                 "state": _track_state(t, t._bytes_in > p_in),
                 "origin": (f"{_transport(owner)} d{_draft(owner)}"
                            if owner is not None else None),
-                "origin_addr": (relay_status.mask_addr(_addr_of(owner))
+                "origin_addr": (relay_status.display_addr(_addr_of(owner))
                                 if owner is not None else None),
                 "since": t.created,
             }))
@@ -2563,7 +2563,7 @@ class _Status:
                 "namespace": _ns_str(ns), "announced": bool(holders),
                 "origin": (f"{_transport(holders[-1])} d{_draft(holders[-1])}"
                            if holders else None),
-                "origin_addr": (relay_status.mask_addr(_addr_of(holders[-1]))
+                "origin_addr": (relay_status.display_addr(_addr_of(holders[-1]))
                                 if holders else None),
                 "tracks": 0, "subscribers": 0, "in_bps": 0, "out_bps": 0,
                 "bytes_out": 0, "format": entry[0] if entry else None,
@@ -2609,7 +2609,7 @@ class _Status:
                             if id(s) in ids)
             sessions.append({
                 "transport": _transport(s), "draft": _draft(s),
-                "addr": relay_status.mask_addr(_addr_of(s)),
+                "addr": relay_status.display_addr(_addr_of(s)),
                 "role": role or None, "since": info["since"],
                 "rtt_ms": round(rtt, 1) if rtt is not None else None,
                 "tx_bps": bps(d[0]) if last is not None else None,

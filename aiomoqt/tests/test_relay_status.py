@@ -261,17 +261,17 @@ def test_write_json_atomic(tmp_path):
     assert path.stat().st_mode & 0o777 == 0o644
 
 
-@pytest.mark.parametrize("addr,masked", [
-    (("203.0.113.7", 51234), "203.0.113.x"),
-    ("198.51.100.255", "198.51.100.x"),
-    (("::ffff:203.0.113.7", 443), "203.0.113.x"),
-    (("2001:db8:abcd:12::1", 4433), "2001:db8:abcd::/48"),
-    ("2001:0db8:0000:0001::", "2001:db8:0::/48"),
-    ("fe80::1%eth0", "fe80:0:0::/48"),
+@pytest.mark.parametrize("addr,shown", [
+    (("203.0.113.7", 51234), "203.0.113.7"),
+    ("198.51.100.255", "198.51.100.255"),
+    (("::ffff:203.0.113.7", 443), "203.0.113.7"),
+    (("2001:db8:abcd:12::1", 4433), "2001:db8:abcd:12::1"),
+    ("2001:0db8:0000:0001::", "2001:db8:0:1::"),
+    ("fe80::1%eth0", "fe80::1"),
     (None, None), ("", None), ("not-an-ip", None),
 ])
-def test_mask_addr(addr, masked):
-    assert relay_status.mask_addr(addr) == masked
+def test_display_addr(addr, shown):
+    assert relay_status.display_addr(addr) == shown
 
 
 def test_peer_address_is_none_without_transport_support():
@@ -421,7 +421,7 @@ async def test_snapshot_reports_namespaces_tracks_and_sessions(
     assert "cpu_modes" in platform["host"] and "ifaces" in platform["host"]
 
     # Masked peer addresses, never a port.
-    local = {"127.0.0.x", "0:0:0::/48"}
+    local = {"127.0.0.1", "::1"}
     assert {s["addr"] for s in snap["sessions"]} <= local
     assert None not in {s["addr"] for s in snap["sessions"]}
     assert {video["origin_addr"], space["origin_addr"]} <= local
