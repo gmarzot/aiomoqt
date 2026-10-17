@@ -186,12 +186,19 @@ function playLink(ns, url) {
                   title: 'Play in G5 Player'}, '▶');
 }
 
+// Transport and draft, then the publisher's masked address when the relay reports it.
+function originCell(r) {
+  const td = el('td', {}, r.origin || '—');
+  if (r.origin_addr) td.append(' · ', el('span', {class: 'addr'}, r.origin_addr));
+  return td;
+}
+
 function renderNamespaces(rows, wtUrl) {
   fill($('t-namespaces'), rows.map((r) => {
     const tr = el('tr', {class: `pick${r.namespace === scope ? ' selected' : ''}`, tabindex: '0',
                          title: `${fmt.bytes(r.bytes_out)} delivered`},
       el('td', {}, el('code', {}, r.namespace)),
-      el('td', {}, r.origin || '—'),
+      originCell(r),
       num(fmt.num(r.tracks)), num(fmt.num(r.subscribers)), num(fmt.num(r.peak)),
       inOut(r.in_bps, r.out_bps),
       el('td', {class: 'n'}, r.format ? playLink(r.namespace, wtUrl) : ''));
@@ -248,13 +255,13 @@ function trackDetail(r) {
       + `${fmt.plural(r.fetches, 'fetch', 'fetches')} · ${fmt.plural(r.drops, 'drop')}`,
     `cache ${fmt.num(r.cache_groups)} groups, ${fmt.bytes(r.cache_bytes)}`
       + (r.largest ? ` · largest ${r.largest[0]} · ${r.largest[1]}` : ''),
-    `from ${r.origin || '—'} · RTT up ${fmt.ms(r.rtt_up_ms)}, down p50 ${fmt.ms(r.rtt_down_ms)}`,
+    `from ${r.origin || '—'}${r.origin_addr ? ` ${r.origin_addr}` : ''} · RTT up ${fmt.ms(r.rtt_up_ms)}, down p50 ${fmt.ms(r.rtt_down_ms)}`,
   ];
   const subs = r.subscriber_list || [];
   if (subs.length) {
     lines.push('subscribers:');
     for (const x of subs.slice(0, 12)) {
-      lines.push(`  ${x.transport} d${x.draft} · ${fmt.ms(x.rtt_ms)} · ${x.forward ? 'forwarding' : 'paused'}`
+      lines.push(`  ${x.transport} d${x.draft}${x.addr ? ` ${x.addr}` : ''} · ${fmt.ms(x.rtt_ms)} · ${x.forward ? 'forwarding' : 'paused'}`
         + (none(x.since) ? '' : ` · ${fmt.duration(now - x.since)}`));
     }
     if (r.subscribers > 12) lines.push(`  … ${fmt.num(r.subscribers - 12)} more`);
