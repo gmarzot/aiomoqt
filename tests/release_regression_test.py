@@ -108,13 +108,19 @@ def _relay_host(relay: dict) -> str:
     return "(no url)"
 
 
-def _run(cmd: list[str], log: Path, timeout: int) -> tuple[bool, str]:
-    """Run a command, capture to log, return (ok, tail)."""
+def _run_rc(cmd: list[str], log: Path, timeout: int) -> int | None:
+    """Run a command, capture to log, return its exit code (None on timeout)."""
     try:
         with log.open("w") as f:
-            subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT,
-                           timeout=timeout, check=False)
+            return subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT,
+                                  timeout=timeout, check=False).returncode
     except subprocess.TimeoutExpired:
+        return None
+
+
+def _run(cmd: list[str], log: Path, timeout: int) -> tuple[bool, str]:
+    """Run a command, capture to log, return (ok, tail)."""
+    if _run_rc(cmd, log, timeout) is None:
         return False, "timeout"
     tail = log.read_text().splitlines()[-6:]
     return True, "\n".join(tail)
@@ -328,14 +334,15 @@ def _relay_pub_sub(url: str, draft: int, pub_mode: str, insecure: bool,
         cmd.append("-k")
     if compat:
         cmd += ["--compat", compat]
-    ok, _ = _run(cmd, log, 120)
-    if not ok:
+    rc = _run_rc(cmd, log, 120)
+    if rc is None:
         return "FAIL", "timeout"
-    return _pub_sub_verdict(log.read_text())
+    return _pub_sub_verdict(log.read_text(), rc)
 
 
-def _pub_sub_verdict(text: str) -> tuple[str, str]:
-    """Every subscriber joined and objects arrived. A missing count fails."""
+def _pub_sub_verdict(text: str, rc: int = 0) -> tuple[str, str]:
+    """Every subscriber joined, objects arrived, and load_sim itself passed
+    (RESULT: OK, exit 0). A missing count or RESULT line fails."""
     m = re.search(r"peak\s+(\d+)/(\d+)", text)
     if not m:
         return "FAIL", "(no summary)"
@@ -344,8 +351,16 @@ def _pub_sub_verdict(text: str) -> tuple[str, str]:
     if om is None:
         return "FAIL", f"{got}/{want} subscribed, no object count"
     objects = int(om.group(1))
+    detail = f"{got}/{want} subscribed, {objects} objects"
+    rm = re.search(r"^\s*RESULT: (\w+)\s*$", text, re.MULTILINE)
+    if rm is None:
+        return "FAIL", f"{detail}, no RESULT line"
+    if rm.group(1) != "OK":
+        return "FAIL", f"{detail}, RESULT: {rm.group(1)}"
+    if rc != 0:
+        return "FAIL", f"{detail}, exit {rc}"
     status = "PASS" if got == want and objects > 0 else "FAIL"
-    return status, f"{got}/{want} subscribed, {objects} objects"
+    return status, detail
 
 
 def _relay_tap_case(url: str, draft: int, case: str, insecure: bool,

@@ -30,6 +30,8 @@
 - Integration tier: loopback-bench draft × transport matrix covers d20 and d22.
 - The GHCR image is multi-arch: linux/amd64 and linux/arm64.
 - `tests/relays.json` follows the interop runner registry: adds red5-moq-relay (d22); moqtail moves to d18 WT; moq-dev-anon re-enabled at d18/d20 with raw QUIC; cloudflare-d14 adds WT; imquic adds d18; quichemoq enabled at d18; moxygen-fb adds d14 (non-gating); cf-d16-interop removed.
+- load_sim fails a group that received under 50% of its expected objects (rate × live-subscriber-seconds while the publisher is up) and prints `expected=` per group and `Expected objects:`.
+- Interop tier: relay-pub-sub also fails on a load_sim `RESULT: FAIL`, a missing `RESULT:` line, or a non-zero exit.
 - WebTransport client teardown waits for the connection to close, so an error close (e.g. WT_ALPN_ERROR) is not dropped by the transport stopping.
 - MediaPublisher serves a FETCH from the objects each track published, its FETCH_OK End the end of that range; MediaSubscriber ignores a catalog object older than the one applied.
 - A received GOAWAY is recorded (`goaway_received`) and reported to `on_goaway(msg, request_id)`; no new request is sent after a control-stream GOAWAY. `goaway(request_id=)` sends one on a request stream (d18+).

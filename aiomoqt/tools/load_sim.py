@@ -86,6 +86,8 @@ TICK_S = 1.0
 # Grace after the last publisher ends before the controller stops
 # subscriber shards that a relay is still holding open.
 SUBS_DRAIN_GRACE_S = 5.0
+# A group fails below this fraction of rate x live-subscriber-seconds.
+EXPECTED_FLOOR = 0.5
 CMD_POLL_S = 0.1
 # Join commands in flight count against the group target until the host
 # reports an outcome; expire unanswered ones so a wedged shard can't
@@ -461,6 +463,7 @@ class GroupRT:
         self.fails = self.deaths = self.ended = 0
         self.iv = {"join": 0, "leave": 0, "fail": 0}
         self.max_live = 0
+        self.expected_objs = 0.0
 
     def live(self) -> int:
         return sum(s.live for s in self.shards)
@@ -608,6 +611,21 @@ def _drain_sub_events(events_q, groups: Dict[int, GroupRT]):
                     g.deaths += 1
                 elif ev == "ended":
                     g.ended += 1
+
+
+def _accrue_expected(groups: Dict[int, GroupRT], pubs: Dict[str, PubRT],
+                     t: float, dt: float):
+    """Add dt seconds of objects owed to each group's live subscribers: the
+    track's rate while it is on its timeline and, when published locally,
+    confirmed and not yet ended."""
+    for g in groups.values():
+        pub = g.spec.pub
+        prt = pubs.get(pub.key)
+        if not pub.active_at(t):
+            continue
+        if prt is not None and (not prt.published or prt.ended):
+            continue
+        g.expected_objs += g.live() * pub.fps * dt
 
 
 def _predict_egress(pubs: List[PubSpec], groups: List[GroupSpec]):
@@ -810,6 +828,7 @@ def main():
 
     start = time.monotonic()
     last_report = start
+    last_tick = start
     stopping = False
 
     def _on_sigint(_sig, _frm):
@@ -871,6 +890,8 @@ def main():
 
             # --- subscriber population ---
             _drain_sub_events(sub_events_q, groups)
+            _accrue_expected(groups, pubs, t, now - last_tick)
+            last_tick = now
             if not stopping:
                 for grt in groups.values():
                     _tick_group(grt, t, rng)
@@ -979,13 +1000,15 @@ def _verdict(groups: Dict[int, "GroupRT"],
     failed."""
     lines: List[str] = []
     failed = False
-    all_objs = all_bytes = 0
+    all_objs = all_bytes = all_expected = 0
     for grt in groups.values():
         gs = grt.spec
         total_rx = sum(s.stats.get("total_bytes", 0) for s in grt.shards)
         total_objs = sum(s.stats.get("total_objs", 0) for s in grt.shards)
+        expected = round(grt.expected_objs)
         all_objs += total_objs
         all_bytes += total_rx
+        all_expected += expected
         note = ""
         if grt.max_live == 0:
             note = "  << NEVER JOINED"
@@ -996,11 +1019,15 @@ def _verdict(groups: Dict[int, "GroupRT"],
         elif total_rx == 0:
             note = "  << NO OBJECTS"
             failed = True
+        elif total_objs < expected * EXPECTED_FLOOR:
+            note = f"  << BELOW {EXPECTED_FLOOR:.0%} OF EXPECTED"
+            failed = True
         lines.append(
             f"  {gs.key:<28} peak {grt.max_live:>4}/{gs.max_subs:<4} "
             f"joins={grt.joins:<5} churn={grt.churns:<5} "
             f"exodus={grt.exodus:<4} fails={grt.fails:<4} "
-            f"died={grt.deaths:<4} objs={total_objs} bytes={total_rx} "
+            f"died={grt.deaths:<4} objs={total_objs} expected={expected} "
+            f"bytes={total_rx} "
             f"rx={total_rx / 1e6:.0f}MB{note}")
     for prt in pubs.values():
         if not prt.published:
@@ -1009,6 +1036,7 @@ def _verdict(groups: Dict[int, "GroupRT"],
     if groups:
         lines.append(f"  Total objects: {all_objs}")
         lines.append(f"  Total bytes: {all_bytes}")
+        lines.append(f"  Expected objects: {all_expected}")
     lines.append(f"  {'RESULT: FAIL' if failed else 'RESULT: OK'}")
     return lines, failed
 
