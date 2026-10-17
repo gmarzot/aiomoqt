@@ -6,7 +6,7 @@ ersatz relay for limited interop testing. The relay is open, with no auth.
 | Service | Container | What it does |
 |---|---|---|
 | `relay` | `ersatz-relay` | `moq_interop_relay` on UDP 4443, raw QUIC and WebTransport, drafts 22/20/18/16/14, `--watchdog 15`, writes `status/status.json` and `relay-logs/` |
-| `web` | `g5-web` | nginx on 80/443: landing page, `/g5-broadcast/`, `/g5-player/`, `/relay/` dashboard, `/relay/platform/` and `/relay/logs/`, `/status/{status,platform}.json`, `/stats/` |
+| `web` | `g5-web` | nginx on 80/443: landing page, `/g5-broadcast/`, `/g5-player/`, `/relay/` dashboard, `/relay/platform/` and `/relay/logs/`, `/status/{status,platform}.json`, `/private/`, `/stats/` |
 | `goaccess` | `g5-goaccess` | rebuilds the visitor reports in `stats/` every 5 minutes from `logs/`; no network |
 
 Host: `ssh ubuntu@moqarena.marzresearch.net` (OCI, Ubuntu 22.04 aarch64, Docker with Compose v2).
@@ -29,7 +29,7 @@ relay-logs/               relay.log (10 MB, 4 rotations) and crash.log, written 
                           read-only to nginx
 logs/                     nginx access log, read by GoAccess
 stats/                    GoAccess reports: index.html (visitors), crawlers.html
-stats.htpasswd            the password for /stats/ and /relay/logs/
+stats.htpasswd            the password for /private/, /stats/ and /relay/logs/
 ```
 
 ## First-time setup
@@ -97,9 +97,10 @@ tar -C examples/dist -cf - assets g5-broadcast g5-player | ssh ubuntu@moqarena.m
 
 ## Relay logs
 
-`/relay/logs/` tails the relay's `--log-dir` behind the `/stats/` password; full peer addresses
-appear only there. `relay.log` rotates itself at 10 MB and keeps four old files. `crash.log` gets
-a `relay: start` line at each start and the faulthandler dump of a native crash or watchdog stall.
+`/private/` links the visitor reports and the relay logs. `/relay/logs/` tails the relay's
+`--log-dir` behind the same password; full peer addresses appear only there. `relay.log`
+rotates itself at 10 MB and keeps four old files. `crash.log` gets a `relay: start` line at each
+start and the faulthandler dump of a native crash or watchdog stall.
 It is not rotated, so trim it by hand if it grows. `--log-dir` needs an aiomoqt relay that has the
 flag; on an older image, drop it from `command`, or the relay restarts in a loop.
 

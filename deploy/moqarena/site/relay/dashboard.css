@@ -3,7 +3,7 @@
   --bg: #121212; --panel: #17171d; --panel-2: #1e1e26; --edge: #33333b;
   --text: #efefef; --dim: #a3a3ad; --faint: #6c6c78; --red: #d9532b; --field: #0d0d10;
   --gold: #e8b339; --green: #73bf69; --amber: #f2a93b; --track: #26262e;
-  --brand: #c1440e;
+  --brand: #c1440e; --mars: #b23c0e;
 }
 * { box-sizing: border-box; }
 html { -webkit-text-size-adjust: 100%; }
@@ -24,13 +24,16 @@ code {
 .hero-top { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 8px; }
 .brand { display: inline-flex; align-items: center; gap: 10px; color: var(--text); }
 .brand:hover { text-decoration: none; }
-.mark { width: 52px; height: 39px; flex: none; }
 .brand-text { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 12px; line-height: 1.1; }
 .brand-name { font-size: 24px; font-weight: 600; letter-spacing: -.01em; }
 .brand-name b { color: var(--brand); font-weight: 700; }
 .brand-sub {
   font-size: 11px; font-weight: 600; color: var(--gold);
   text-transform: uppercase; letter-spacing: .16em;
+}
+.dot {
+  display: inline-block; width: 13px; height: 13px; border-radius: 50%; background: var(--mars);
+  margin-right: 9px; vertical-align: -2px;
 }
 .facts.first { display: flex; flex-direction: column; align-self: stretch; }
 .facts .badge-version { align-self: flex-start; margin-bottom: 8px; }
@@ -46,7 +49,7 @@ code {
 }
 /* UPTIME level with the last URL line. */
 .hero-grid > .facts:not(.first) { align-self: end; padding-bottom: 5px; }
-.hero-links { display: flex; flex-direction: column; gap: 2px; }
+.hero-links { align-self: end; padding-bottom: 5px; }
 .mono {
   display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 1px 12px; margin: 0;
   font: 13px/1.45 "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
@@ -246,6 +249,11 @@ td.empty { color: var(--faint); text-align: center; padding: 14px; }
   color: var(--text); font-size: 12px; line-height: 20px;
 }
 .play:hover { background: var(--red); text-decoration: none; }
+
+/* private index */
+.private-links { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+.private-links a { font-weight: 600; margin-right: 12px; }
+.private-links span { color: var(--dim); }
 
 /* log viewer */
 .log-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; margin-bottom: 8px; }
