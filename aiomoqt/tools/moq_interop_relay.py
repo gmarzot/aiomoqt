@@ -2114,7 +2114,8 @@ def _track_state(track, flowing) -> str:
 
 _HISTORY_KEYS = ("t", "ingress_bps", "egress_bps", "media_in_bps",
                  "media_out_bps", "sessions", "subscribers", "tracks",
-                 "loss_pct", "rtt_p50_ms", "lag_p99_ms", "objects_in_per_s")
+                 "loss_pct", "rtt_p50_ms", "lag_p99_ms", "objects_in_per_s",
+                 "groups_per_s")
 _PLATFORM_KEYS = ("t", "cpu", "cpu_user", "cpu_nice", "cpu_system",
                   "cpu_iowait", "cpu_irq", "cpu_steal", "proc_cpu",
                   "proc_user", "proc_system", "proc_rss", "mem_used",
@@ -2146,6 +2147,9 @@ class _Status:
         # track id -> {series: deque}, aligned with history["t"].
         self.track_history: dict[str, dict[str, deque]] = {}
         self.platform: dict | None = None
+        # Most subscribers at once: relay-wide, and per namespace while it lasts.
+        self._subs_peak = 0
+        self._ns_peak: dict[tuple, int] = {}
         # id(track) -> (bytes in, bytes out, drops) at the last sample.
         self._track_prev: dict[int, tuple] = {}
         # id(session) -> (bytes sent, bytes received, packets sent, lost).
@@ -2270,6 +2274,10 @@ class _Status:
             sp["out_bps"] += row["out_bps"] or 0
             sp["bytes_out"] += row["bytes_out"]
             sp["origin"] = sp["origin"] or row["origin"]
+        self._ns_peak = {ns: max(self._ns_peak.get(ns, 0), sp["subscribers"])
+                         for ns, sp in spaces.items()}
+        for ns, sp in spaces.items():
+            sp["peak"] = self._ns_peak[ns]
 
         sessions, quic = [], {}
         tx = rx = sent = lost = 0
@@ -2314,10 +2322,13 @@ class _Status:
                               if (s["role"] or "").startswith("pub")),
             "namespaces": len(spaces), "tracks": len(tracks),
             "subscribers": sum(r["subscribers"] for _, r in tracks),
+            "subscribers_peak": None,
             "ingress_bps": bps(rx), "egress_bps": bps(tx),
             "media_in_bps": media_in, "media_out_bps": media_out,
             "objects_in_per_s": (None if dt is None else round(
                 sum(r["objects_per_s"] or 0 for _, r in tracks), 1)),
+            "groups_per_s": (None if dt is None else round(
+                sum(r["groups_per_s"] or 0 for _, r in tracks), 1)),
             # Share of egress not received upstream ("CDN efficiency").
             "efficiency": (max(0.0, 1 - media_in / media_out)
                            if media_out else None),
@@ -2328,6 +2339,8 @@ class _Status:
             "rtt_p99_ms": relay_status.percentile(rtts, 99),
             "loop_lag_ms": lag,
         }
+        self._subs_peak = max(self._subs_peak, totals["subscribers"])
+        totals["subscribers_peak"] = self._subs_peak
         host = dict(self.host.static, **self.host.sample(now))
         self.history.add({
             "t": round(wall), "ingress_bps": totals["ingress_bps"],
@@ -2337,6 +2350,7 @@ class _Status:
             "loss_pct": totals["loss_pct"], "rtt_p50_ms": totals["rtt_p50_ms"],
             "lag_p99_ms": lag["p99"],
             "objects_in_per_s": totals["objects_in_per_s"],
+            "groups_per_s": totals["groups_per_s"],
         })
         self._add_track_history(tracks)
         self.platform = self._platform(wall, host, totals, lag)

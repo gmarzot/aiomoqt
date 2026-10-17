@@ -362,6 +362,10 @@ async def test_snapshot_reports_namespaces_tracks_and_sessions(
     assert space["format"] == "MSF"
     assert (space["tracks"], space["subscribers"]) == (2, 3)
     assert space["announced"]
+    assert space["peak"] == 3
+    assert totals["subscribers_peak"] >= totals["subscribers"] == 3
+    assert totals["groups_per_s"] > 0
+    assert snap["history"]["groups_per_s"][-1] == totals["groups_per_s"]
 
     tracks = {r["name"]: r for r in snap["tracks"]}
     assert set(tracks) == {"catalog", "video"}
