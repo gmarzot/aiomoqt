@@ -45,6 +45,7 @@ from aiomoqt.types import (
     moqt_version_from_draft,
     parse_draft_spec,
 )
+from aiomoqt.utils.cli import endpoint_url
 from aiomoqt.utils.url import parse_relay_url
 
 logging.basicConfig(
@@ -356,14 +357,15 @@ def parse_args(argv=None):
         help="draft(s) to probe: a single draft (--draft 18) or a list "
              "(--draft 18,16). By default each listed draft is probed "
              "INDIVIDUALLY, in order; with --offer the whole list is offered "
-             "in ONE session. Default (no --draft) probes 14, 16, 18 each.")
+             "in ONE session. Default (no --draft) probes 14, 16, 18 each; "
+             "20 and 22 are probed only when named.")
     p.add_argument(
         "--offer", action="store_true", default=False,
         help="with a multi-draft --draft, offer the whole list in ONE "
              "session (ordered as given) and report the draft the relay "
              "negotiates, instead of probing each draft separately.")
     p.add_argument(
-        "--url", default=None, metavar="URL",
+        "--url", default=None, metavar="URL", type=endpoint_url,
         help="probe a single relay URL (e.g. moqt://host:port or "
              "https://host:port/path) and print one line per probed "
              "draft to stdout; bypasses --relays-file / --output-file. "

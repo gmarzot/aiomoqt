@@ -1,0 +1,4 @@
+# moq-contribution-interop-runner commit the contrib-conformance job builds
+# (it pins picoquic and its other dependencies). Bump it deliberately and
+# read the sweep diff when you do.
+mondain/moq-contribution-interop-runner@b40592e814f9d8ded9f54f45ab7e0a45f8610011

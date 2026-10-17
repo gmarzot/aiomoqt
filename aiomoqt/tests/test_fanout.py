@@ -29,6 +29,7 @@ class _Session:
         self._next = 3
         self.opened = []
         self.writes = []            # (stream_id, nbytes, fin)
+        self.resets = []            # stream_id
         self._gate = asyncio.Event()
         if not block:
             self._gate.set()
@@ -45,9 +46,18 @@ class _Session:
     def stream_write(self, sid, data, end_stream=False):
         self.writes.append((sid, len(data), end_stream))
 
+    def stream_reset(self, sid, code):
+        self.resets.append(sid)
+
+    def fins(self, sid):
+        return [w for w in self.writes if w[0] == sid and w[2]]
+
     async def stream_write_drain(self, sid, data):
         await self._gate.wait()
         self.writes.append((sid, len(data), False))
+
+    def _unbind_request(self, request_id):
+        pass
 
 
 async def _settle(times=12):
@@ -137,6 +147,10 @@ async def test_a_blocked_lane_sheds_to_the_next_group():
     assert dfast.objects_sent == 9
     assert dslow.largest == (1, 0)
     assert dslow.objects_sent < dfast.objects_sent
+    # The truncated group is reset, never ended as if complete.
+    assert slow.resets == [slow.opened[0]]
+    assert not slow.fins(slow.opened[0])
+    assert fast.resets == [] and fast.fins(fast.opened[0])
 
 
 @pytest.mark.asyncio
@@ -163,6 +177,41 @@ async def test_a_paused_peer_is_gated_and_rejoins_at_a_group():
     await fan.close()
     assert db.largest == (2, 0)
     assert da.objects_sent == 5
+    assert b.resets == [b.opened[0]] and not b.fins(b.opened[0])
+
+
+@pytest.mark.asyncio
+async def test_on_sent_reports_only_written_objects():
+    """Once per peer per object written; nothing for a peer that is
+    paused, filtered out or shed."""
+    names = ("all", "paused", "filtered", "slow")
+    sessions = {n: _Session(n, block=n == "slow") for n in names}
+    deliveries = {n: _delivery(s) for n, s in sessions.items()}
+    deliveries["filtered"].passes = lambda g, o: o != 1
+    fan = FanoutDelivery(queue_size=2)
+    sent = []
+    fan.on_sent = lambda g, o: sent.append((g, o))
+    fan.add(deliveries["all"], joining=False)
+    fan.add(deliveries["paused"], lambda: False, joining=False)
+    fan.add(deliveries["filtered"], joining=False)
+    slow = fan.add(deliveries["slow"], joining=False)
+
+    await fan.write(0, 0, b"key", group_start=True)
+    await _settle()
+    for oid in range(1, 6):                 # overruns the slow lane
+        await fan.write(0, oid, b"pred")
+        await _settle(2)
+    sessions["slow"].release()
+    await _settle(60)
+    await fan.close()
+
+    assert slow.shed > 0
+    assert deliveries["paused"].objects_sent == 0
+    assert sorted(sent) == sorted(
+        [(0, o) for o in range(6)]              # all
+        + [(0, o) for o in (0, 2, 3, 4, 5)]     # filtered
+        + [(0, 0)])                             # slow, before it shed
+    assert len(sent) == sum(d.objects_sent for d in deliveries.values())
 
 
 @pytest.mark.asyncio

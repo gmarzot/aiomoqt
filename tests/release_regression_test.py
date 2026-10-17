@@ -20,6 +20,9 @@ Usage:
     # Adaptive throughput bench (manual dispatch only)
     tests/release_regression_test.py --test-tier bench
 
+    # LOCMAF from Eyevinn's public moqlivemock (manual only)
+    tests/release_regression_test.py --test-suite media-locmaf
+
 Exit 0 iff every test passed. `[skip]` suites don't count.
 """
 from __future__ import annotations
@@ -29,6 +32,7 @@ import concurrent.futures
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -62,6 +66,8 @@ TIERS = {
                     "loopback-bench-d14-wt", "loopback-bench-d14-quic",
                     "loopback-bench-d16-wt", "loopback-bench-d16-quic",
                     "loopback-bench-d18-wt", "loopback-bench-d18-quic",
+                    "loopback-bench-d20-wt", "loopback-bench-d20-quic",
+                    "loopback-bench-d22-wt", "loopback-bench-d22-quic",
                     # adaptive BW over the multi-process loopback path
                     # (the in-process loopback misses the pub/sub-worker
                     # start path — see the 0.9.10 BW clobber).
@@ -69,11 +75,14 @@ TIERS = {
                     "loopback-adaptive-mp-d18",
                     "loopback-fetch"],
     "interop":     ["relay-ctrl-msg", "relay-pub-sub", "relay-discovery",
-                    "relay-join", "relay-fetch"],
+                    "relay-join", "relay-fetch", "relay-data"],
     "bench":       ["loopback-adaptive-bench"],
 }
+# Run only when named with --test-suite: no tier and no bare run selects them.
+MANUAL_SUITES = ["media-locmaf"]
 TIER_CHOICES = tuple(TIERS.keys())
-SUITE_CHOICES = tuple(s for suites in TIERS.values() for s in suites)
+SUITE_CHOICES = (tuple(s for suites in TIERS.values() for s in suites)
+                 + tuple(MANUAL_SUITES))
 
 # load_sim quick mode: N subscribers on one synthesized track.
 MULTI_SUB_ARGS_COMMON = [
@@ -99,13 +108,19 @@ def _relay_host(relay: dict) -> str:
     return "(no url)"
 
 
-def _run(cmd: list[str], log: Path, timeout: int) -> tuple[bool, str]:
-    """Run a command, capture to log, return (ok, tail)."""
+def _run_rc(cmd: list[str], log: Path, timeout: int) -> int | None:
+    """Run a command, capture to log, return its exit code (None on timeout)."""
     try:
         with log.open("w") as f:
-            subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT,
-                           timeout=timeout, check=False)
+            return subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT,
+                                  timeout=timeout, check=False).returncode
     except subprocess.TimeoutExpired:
+        return None
+
+
+def _run(cmd: list[str], log: Path, timeout: int) -> tuple[bool, str]:
+    """Run a command, capture to log, return (ok, tail)."""
+    if _run_rc(cmd, log, timeout) is None:
         return False, "timeout"
     tail = log.read_text().splitlines()[-6:]
     return True, "\n".join(tail)
@@ -131,25 +146,21 @@ def _pytest_file(test_file: str, log: Path,
     # output, not just the last line. Stray output from atexit /
     # connection-cleanup ("Received a connection close request") often
     # follows the summary on stderr and would otherwise mask a passing
-    # run. Match the canonical pytest format: "N passed[, M failed]
-    # [, K skipped] in T.TTs".
+    # run. The line is "N word[, N word ...] in T.TTs" in pytest's own
+    # order, e.g. "1 failed, 1063 passed, 9 skipped, 1 xfailed in 18.7s".
     text = log.read_text()
-    summary_re = re.compile(
-        r"^(\d+) passed(?:,\s*(\d+) failed)?(?:,\s*\d+ skipped)?\s+in\s+",
-        re.MULTILINE,
-    )
-    m = summary_re.search(text)
-    if m is None:
+    summary_re = re.compile(r"^\d+ \w+(?:, \d+ \w+)* in [\d.]+s",
+                            re.MULTILINE)
+    lines = summary_re.findall(text)
+    if not lines:
         return "FAIL", "(no pytest summary)"
-    failed_count = int(m.group(2) or 0)
-    summary_line = m.group(0).rstrip()
-    # Strip trailing "in" — that's the start of "in T.TTs" but the
-    # match captured up to the literal " in ". Recover the full line:
-    # find the matched start and read through to end-of-line.
-    start = m.start()
-    end = text.find("\n", start)
-    summary_line = text[start:end if end != -1 else None].strip()
-    return ("PASS" if failed_count == 0 else "FAIL"), summary_line
+    summary_line = lines[-1]
+    counts = {word: int(n) for n, word in
+              re.findall(r"(\d+) (\w+)", summary_line.rsplit(" in ", 1)[0])}
+    bad = counts.get("failed", 0) + counts.get("error", 0) \
+        + counts.get("errors", 0)
+    ok = bad == 0 and counts.get("passed", 0) > 0
+    return ("PASS" if ok else "FAIL"), summary_line
 
 
 # Kept out of the whole-tree run so a platform can skip it: on macOS the
@@ -193,7 +204,7 @@ def _loopback_pub_sub_variant(log_dir: Path, slug: str, flags: list[str],
     """Generic runner for loopback_bench variants."""
     log = log_dir / f"{slug}.log"
     cmd = [
-        "python", "-m", "aiomoqt.tools.loopback_bench",
+        sys.executable, "-m", "aiomoqt.tools.loopback_bench",
         *flags,
     ]
     ok, _ = _run(cmd, log, timeout)
@@ -263,25 +274,38 @@ def _loopback_adaptive_mp(log_dir: Path, draft: int) -> tuple[str, str]:
     fixed in 0.9.10)."""
     slug = f"loopback-adaptive-mp-d{draft}"
     log = log_dir / f"{slug}.log"
-    # -t 8 self-terminates with a clean High-water summary; _run's
-    # Python-level timeout is the backstop. No external `timeout` binary
-    # (absent on macOS runners — it's `gtimeout` there, if installed).
+    # High-water counts only intervals past warm-up with no shortfall, so
+    # -t 20 leaves several chances; one slow sample on a loaded runner must
+    # not fail the suite. _run's timeout is the backstop. No external
+    # `timeout` binary (absent on macOS runners — it's `gtimeout` there).
     cmd = [sys.executable, "-m", "aiomoqt.tools.adaptive_bench",
            "--mp", "--draft", str(draft),
            "-P", "1", "-s", "4096", "--start-mbps", "20",
            "--step-mbps", "10", "--max-mbps", "60", "--interval", "2",
-           "-t", "8"]
-    _run(cmd, log, 30)
+           "-t", "20", "-k"]
+    _run(cmd, log, 45)
     text = log.read_text()
+    if "Traceback" in text:
+        return "FAIL", "traceback"
     m = re.search(r"High-water:\s+([\d.]+)\s*([KMGT]?bps)", text)
-    if m and float(m.group(1)) > 0 and "Traceback" not in text:
+    if m is None:
+        return "FAIL", "no High-water summary (crash or timeout)"
+    if float(m.group(1)) > 0:
         return "PASS", f"high-water {m.group(1)} {m.group(2)}"
-    return "FAIL", "no data (rx=0 / crash)"
+    return "FAIL", "no interval without shortfall (high-water 0)"
 
 
 # ---------------------------------------------------------------------------
 # Interop-tier runners (per relay × transport × draft)
 # ---------------------------------------------------------------------------
+# The control-plane cases relay-ctrl-msg gates on. The client's standard run
+# also carries data-plane cases; relay-data reports those.
+CTRL_CASES = frozenset({
+    "setup-only", "announce-only", "publish-namespace-done",
+    "subscribe-error", "announce-subscribe", "subscribe-before-announce",
+})
+
+
 def _relay_ctrl_msg(url: str, draft: int, insecure: bool,
                     compat: str, log: Path) -> tuple[str, str]:
     cmd = [sys.executable, "-m", "aiomoqt.tools.moq_interop_client",
@@ -294,8 +318,10 @@ def _relay_ctrl_msg(url: str, draft: int, insecure: bool,
     if not ok:
         return "FAIL", "timeout"
     text = log.read_text()
-    ok_count = len(re.findall(r"^ok \d", text, re.MULTILINE))
-    return ("PASS" if ok_count == 6 else "FAIL"), f"{ok_count}/6"
+    passed = set(re.findall(r"^ok \d+ - (\S+)", text, re.MULTILINE))
+    ok_count = len(passed & CTRL_CASES)
+    n = len(CTRL_CASES)
+    return ("PASS" if ok_count == n else "FAIL"), f"{ok_count}/{n}"
 
 
 def _relay_pub_sub(url: str, draft: int, pub_mode: str, insecure: bool,
@@ -308,23 +334,32 @@ def _relay_pub_sub(url: str, draft: int, pub_mode: str, insecure: bool,
         cmd.append("-k")
     if compat:
         cmd += ["--compat", compat]
-    ok, _ = _run(cmd, log, 120)
-    if not ok:
+    rc = _run_rc(cmd, log, 120)
+    if rc is None:
         return "FAIL", "timeout"
-    text = log.read_text()
+    return _pub_sub_verdict(log.read_text(), rc)
+
+
+def _pub_sub_verdict(text: str, rc: int = 0) -> tuple[str, str]:
+    """Every subscriber joined, objects arrived, and load_sim itself passed
+    (RESULT: OK, exit 0). A missing count or RESULT line fails."""
     m = re.search(r"peak\s+(\d+)/(\d+)", text)
     if not m:
         return "FAIL", "(no summary)"
     got, want = m.group(1), m.group(2)
-    status = "PASS" if got == want else "FAIL"
-    detail = f"{got}/{want} ok"
-    # SUBSCRIBE_OK alone is not a pass. A subscription that carries no
-    # objects is a delivery failure whatever the relay's excuse.
-    om = re.search(r"Total objects:\s+([\d,]+)", text)
-    objects = int(om.group(1).replace(",", "")) if om else None
-    if status == "PASS" and objects == 0:
-        status = "FAIL"
-        detail = f"{got}/{want} subscribed, 0 objects delivered"
+    om = re.search(r"^\s*Total objects: (\d+)\s*$", text, re.MULTILINE)
+    if om is None:
+        return "FAIL", f"{got}/{want} subscribed, no object count"
+    objects = int(om.group(1))
+    detail = f"{got}/{want} subscribed, {objects} objects"
+    rm = re.search(r"^\s*RESULT: (\w+)\s*$", text, re.MULTILINE)
+    if rm is None:
+        return "FAIL", f"{detail}, no RESULT line"
+    if rm.group(1) != "OK":
+        return "FAIL", f"{detail}, RESULT: {rm.group(1)}"
+    if rc != 0:
+        return "FAIL", f"{detail}, exit {rc}"
+    status = "PASS" if got == want and objects > 0 else "FAIL"
     return status, detail
 
 
@@ -343,6 +378,9 @@ def _relay_tap_case(url: str, draft: int, case: str, insecure: bool,
     # TAP line for a single-case run: "ok 1 - <case>" or "not ok 1 - ..."
     if re.search(rf"^ok 1 - {re.escape(case)}", text, re.MULTILINE):
         return "PASS", "ok"
+    m = re.search(r"^  message: (.*)$", text, re.MULTILINE)
+    if m:
+        return "FAIL", m.group(1).strip('"')
     last = text.splitlines()[-1] if text else "no output"
     return "FAIL", last
 
@@ -363,6 +401,50 @@ def _relay_discovery(url: str, draft: int, insecure: bool,
                            insecure, compat, log)
 
 
+def _relay_data(url: str, draft: int, insecure: bool,
+                compat: str, log: Path) -> tuple[str, str]:
+    return _relay_tap_case(url, draft, "data-subgroup-basic",
+                           insecure, compat, log)
+
+
+# ---------------------------------------------------------------------------
+# Manual runners
+# ---------------------------------------------------------------------------
+# media-locmaf: sub_media against Eyevinn's moqlivemock, which publishes a
+# LOCMAF twin of every CMAF track. Public infrastructure: manual only.
+MOQLIVEMOCK_URLS = {
+    "raw-quic": "moqt://moqlivemock.demo.osaas.io:443",
+    "h3-wt": "https://moqlivemock.demo.osaas.io:443/moq",
+}
+MOQLIVEMOCK_NAMESPACES = ("mlm/cmsf/clear", "mlm/cmsf/drm-cbcs")
+_LOCMAF_TRACK_LINE = re.compile(r"^  (\S+): (\d+) frames, (\d+) rejected$",
+                                re.MULTILINE)
+
+
+def _media_locmaf(url: str, namespace: str, log: Path) -> tuple[str, str]:
+    """PASS iff every LOCMAF track subscribed delivered frames and none was
+    rejected; no per-track summary line is a FAIL."""
+    out = tempfile.mkdtemp(prefix="aiomoqt-locmaf.")
+    cmd = [sys.executable, "-m", "aiomoqt.tools.sub_media", url,
+           "-N", namespace, "--packaging", "locmaf", "--draft", "18",
+           "-t", "12", "--out", out]
+    try:
+        ok, _ = _run(cmd, log, 60)
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+    if not ok:
+        return "FAIL", "timeout"
+    tracks = _LOCMAF_TRACK_LINE.findall(log.read_text())
+    if not tracks:
+        return "FAIL", "(no LOCMAF track summary)"
+    bad = [f"{n}: {f} frames, {r} rejected" for n, f, r in tracks
+           if int(f) == 0 or int(r)]
+    if bad:
+        return "FAIL", "; ".join(bad)
+    frames = sum(int(f) for _, f, _ in tracks)
+    return "PASS", f"{len(tracks)} tracks, {frames} frames, 0 rejected"
+
+
 # ---------------------------------------------------------------------------
 # Bench-tier runners
 # ---------------------------------------------------------------------------
@@ -374,7 +456,7 @@ def _loopback_adaptive_bench(log_dir: Path) -> tuple[str, str]:
            sys.executable, "-m", "aiomoqt.tools.adaptive_bench",
            "--start-mbps", "10", "--step-mbps", "10",
            "--max-mbps", "500", "--interval", "3",
-           "-l", "100"]
+           "-l", "100", "-k"]
     _run(cmd, log, 45)
     text = log.read_text()
     # fmt_bps emits e.g. "80Mbps" or "1.2Gbps" (no space) — match both
@@ -444,6 +526,9 @@ def _run_relay_matrix(relay: dict, enabled: set[str],
     # recorded as XFAIL: reported, but never fails the job. Absent =
     # non-gating for every draft.
     gating_drafts = set(relay.get("gating", []))
+    # Suites that run and report but never gate: a documented peer
+    # non-conformance the case fails on correctly.
+    xfail_suites = set(relay.get("xfail_suites", []))
 
     def _dispatch(suite: str, label_suffix: str, tag: str, slug: str,
                   fn, *fn_args, gating: bool = True) -> None:
@@ -466,7 +551,7 @@ def _run_relay_matrix(relay: dict, enabled: set[str],
             return
         log = log_dir / f"{suite}_{slug}.log"
         status, detail = _with_interop_retry(fn, fn_args, log)
-        if status == "FAIL" and not gating:
+        if status == "FAIL" and (not gating or suite in xfail_suites):
             status = "XFAIL"
         results.append((status, label, detail, log))
         marker = {"PASS": "[PASS]", "FAIL": "[FAIL]",
@@ -501,6 +586,10 @@ def _run_relay_matrix(relay: dict, enabled: set[str],
             if "relay-discovery" in enabled:
                 _dispatch("relay-discovery", "", tag, slug,
                           _relay_discovery, url, draft, insecure, compat_csv,
+                          gating=gating)
+            if "relay-data" in enabled:
+                _dispatch("relay-data", "", tag, slug,
+                          _relay_data, url, draft, insecure, compat_csv,
                           gating=gating)
 
     return results
@@ -547,7 +636,7 @@ def main() -> int:
         for t in args.test_tiers:
             enabled.update(TIERS[t])
     else:
-        enabled = set(SUITE_CHOICES)
+        enabled = set(SUITE_CHOICES) - set(MANUAL_SUITES)
     enabled -= set(args.skip_suites)
 
     with open(args.catalog) as f:
@@ -603,7 +692,7 @@ def main() -> int:
             status, detail = _loopback_pub_sub_paced(log_dir)
             record_and_print((status, "loopback-pub-sub-paced", detail,
                               log_dir / "loopback-pub-sub-paced.log"))
-        for draft in (14, 16, 18):
+        for draft in (14, 16, 18, 20, 22):
             for quic in (False, True):
                 suite = f"loopback-bench-d{draft}-{'quic' if quic else 'wt'}"
                 if suite in enabled:
@@ -651,6 +740,17 @@ def main() -> int:
         for relay in relays:
             for res in relay_results.get(relay["name"], []):
                 results.append(res)
+
+    # --- manual suites ---
+    if "media-locmaf" in enabled:
+        print("\n== media-locmaf (moqlivemock) ==")
+        for transport, url in MOQLIVEMOCK_URLS.items():
+            for ns in MOQLIVEMOCK_NAMESPACES:
+                slug = f"media-locmaf_{transport}_{ns.replace('/', '-')}"
+                log = log_dir / f"{slug}.log"
+                status, detail = _media_locmaf(url, ns, log)
+                record_and_print((status, f"media-locmaf {transport} {ns}",
+                                  detail, log))
 
     # --- bench tier ---
     if enabled & set(TIERS["bench"]):

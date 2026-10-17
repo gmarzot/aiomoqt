@@ -18,7 +18,8 @@ import logging
 import os
 
 from aiomoqt.server import MOQTServer
-from aiomoqt.types import D18MessageType, MOQTMessageType, parse_draft_spec
+from aiomoqt.types import (D18MessageType, MOQT_DEFAULT_DRAFTS, MOQTMessageType,
+                           parse_draft_spec)
 from aiomoqt.track import PublishedTrack
 from aiomoqt.types import ForwardingPreference
 from aiomoqt.utils.logger import set_log_level, get_logger
@@ -89,8 +90,9 @@ def parse_args():
         '-W', '--wt', action='store_true',
         help='Serve H3/WebTransport (default if neither given)')
     parser.add_argument(
-        '--draft', type=parse_draft_spec, default=16,
-        help='MoQT draft version when --quic (default: 16)')
+        '--draft', type=parse_draft_spec, default=None,
+        help='MoQT draft(s) to accept: one draft, or a comma list such '
+             f'as 22,20,18 (default: {",".join(map(str, MOQT_DEFAULT_DRAFTS))})')
     parser.add_argument(
         '-N', '--namespace', type=str, default='aiomoqt',
         help='Track namespace (default: aiomoqt)')
@@ -292,8 +294,10 @@ async def main():
         url = f"moqt://{args.host}:{args.port}"
     else:
         url = f"https://{args.host}:{args.port}/"
+    draft = ("" if args.draft is None else " --draft " + ",".join(
+        map(str, args.draft if isinstance(args.draft, list) else [args.draft])))
     print(f"  python -m aiomoqt.tools.sub_bench {url} "
-          f"-n {args.namespace} -t 30 -i 5 --draft {args.draft} -k")
+          f"-n {args.namespace} -t 30 -i 5{draft} -k")
 
     try:
         await asyncio.Event().wait()

@@ -19,9 +19,13 @@ from collections import deque
 
 import pytest
 
+from types import SimpleNamespace
+
 from aiomoqt.protocol import _MOQTSessionMixin
+from aiomoqt.messages.namespace import PublishNamespaceOk
 from aiomoqt.messages.request import RequestOk, RequestError
-from aiomoqt.types import MOQTRequestError
+from aiomoqt.messages.subscribe import SubscribeError, SubscribeOk
+from aiomoqt.types import GroupOrder, MOQTRequestError
 from aiomoqt.context import profile_for
 from aiomoqt.utils.buffer import Buffer
 
@@ -34,11 +38,22 @@ def _session(is_client=True):
     only the attributes the tested methods touch and stubs _send_request
     to record (request_id, msg) rather than hit the wire."""
     s = object.__new__(_MOQTSessionMixin)
+    s._tx_updates = {}
+    s._peer_requests = {}
+    s._close_err = None
+    s._fetch_done_futures = {}
     s._next_request_id = 0 if is_client else 1
     s._sent_requests = deque(maxlen=1024)
+    s._track_status_requests = set()
+    s._announced = {}
+    s._discovery_subs = {}
     s._pending_requests = {}
     s._next_track_alias = 0
     s._track_aliases = {}
+    s._published_aliases = {}
+    s._published_tracks = {}
+    s._requests = {}
+    s._subscribe_tracks_params = {}
     s._loop = asyncio.get_running_loop()
     s._sent = []
     s._send_request = lambda rid, msg: s._sent.append((rid, msg))
@@ -61,12 +76,71 @@ async def test_request_stream_termination_cancels_the_request():
     fut = s._loop.create_future()
     s._pending_requests[7] = fut
     s._on_request_stream_terminated(9)
+    assert 9 not in s._bidi_stream_requests
+    await asyncio.sleep(0)
     assert fired == [7]
     assert 7 not in s._bidi_streams
-    assert 9 not in s._bidi_stream_requests
     assert 7 not in s._subscriptions
     with pytest.raises(MOQTRequestError):
         await fut
+
+
+def _stopped_session():
+    """A d18 request (id 7, stream 9) whose stream the peer has just
+    STOP_SENDINGed, with an awaiter and a PUBLISH_DONE handler."""
+    s = _session()
+    s._bidi_streams = {7: 9}
+    s._bidi_stream_requests = {9: 7}
+    s._cancelled_request_streams = set()
+    s._subscriptions = {7: ["sub"]}
+    s._request_cancel_handlers = {}
+    s._publish_done_handlers = {}
+    s.cancelled = []
+    s.register_request_cancel_handler(7, s.cancelled.append)
+    s.done = []
+    s.register_publish_done_handler(7, s.done.append)
+    s._sent_requests.append(7)
+    s.fut = s._loop.create_future()
+    s._pending_requests[7] = s.fut
+    s._on_request_stream_terminated(9, stop_sending_code=0)
+    return s
+
+
+async def test_stop_sending_does_not_swallow_the_reply():
+    # A peer may STOP_SENDING the request stream and then answer on its
+    # own half: the REQUEST_ERROR it sends still answers the request.
+    s = _stopped_session()
+    assert s.cancelled == [7]
+    assert not s.fut.done()
+    s._resolve_request(7, RequestError(request_id=7, error_code=0x2,
+                                       retry_interval=0, reason="timeout"))
+    assert s.fut.result().error_code == 0x2
+
+
+async def test_stop_sending_keeps_the_publish_done_handler():
+    s = _stopped_session()
+    assert 7 in s._publish_done_handlers
+    assert s._bidi_stream_requests == {9: 7}
+
+
+async def test_peer_half_ending_after_stop_sending_settles_the_request():
+    s = _stopped_session()
+    s._on_request_stream_terminated(9)
+    await asyncio.sleep(0)
+    assert 7 not in s._publish_done_handlers
+    assert 7 not in s._subscriptions
+    with pytest.raises(MOQTRequestError):
+        await s.fut
+
+
+async def test_reply_parsed_before_the_reset_wins():
+    # The reply's handler runs before the deferred settle.
+    s = _stopped_session()
+    s._on_request_stream_terminated(9)
+    s._resolve_request(7, RequestError(request_id=7, error_code=0x2,
+                                       retry_interval=0, reason="timeout"))
+    await asyncio.sleep(0)
+    assert s.fut.result().error_code == 0x2
 
 
 @pytest.fixture
@@ -268,15 +342,17 @@ def test_request_ok_request_id_on_wire_per_draft(draft):
 
 @pytest.mark.parametrize("draft", [14, 16, 18])
 async def test_response_resolves_correct_future_per_draft(draft):
-    # End-to-end through the real dispatch path: a peer RequestOk resolves
-    # the matching pending future via the in-band id (d14/d16) or the
-    # stream-injected id (d18).
+    # End-to-end through the real dispatch path: a peer OK resolves the
+    # matching pending future via the in-band id (d14/d16) or the
+    # stream-injected id (d18). REQUEST_OK is d16+; d14 uses its code
+    # point's PUBLISH_NAMESPACE_OK.
     s = _drive_session(draft)
     rid = s._allocate_request_id()
     fut = s._loop.create_future()
     s._pending_requests[rid] = fut
-    wire = bytes(RequestOk(request_id=rid, parameters={}).serialize(
-        prof=s._profile).data)
+    ok = (PublishNamespaceOk(request_id=rid) if draft < 16
+          else RequestOk(request_id=rid, parameters={}))
+    wire = bytes(ok.serialize(prof=s._profile).data)
     stream_rid = None if s._profile.reply_has_request_id else rid
     s._moqt_handle_control_message(Buffer(data=wire), request_id=stream_rid)
     await asyncio.sleep(0)  # let the scheduled handler task run
@@ -296,3 +372,103 @@ async def test_d18_reply_without_stream_binding_cannot_correlate(plog):
     s._moqt_handle_control_message(Buffer(data=wire), request_id=None)
     await asyncio.sleep(0)
     assert not fut.done()   # unresolved — correlation impossible
+
+
+async def test_close_fails_every_awaited_request_and_fetch():
+    s = _session()
+    req = s._loop.create_future()
+    fetch = s._loop.create_future()
+    s._pending_requests[2] = req
+    s._fetch_done_futures[4] = fetch
+    s._fail_pending("peer went away")
+    err = req.exception()
+    assert isinstance(err, MOQTRequestError) and err.response is None
+    assert "session closed: peer went away" in err.reason
+    assert fetch.result() is False
+
+
+async def test_awaiting_after_close_fails_at_once():
+    # subscribe() registers its future before sending; a closed session
+    # must not leave it to the timeout.
+    s = _session()
+    s._pending_requests[2] = s._loop.create_future()
+    s._close_err = (3, "gone")
+    t0 = asyncio.get_running_loop().time()
+    with pytest.raises(MOQTRequestError, match="session closed: gone"):
+        await s._await_response(2, timeout=5.0)
+    assert asyncio.get_running_loop().time() - t0 < 1.0
+    assert 2 not in s._pending_requests
+
+
+# -- per-request routes: what a request registers before it is sent ----
+
+def _routed_session(draft):
+    """_drive_session plus the state a SUBSCRIBE_OK or an error reply
+    touches."""
+    s = _drive_session(draft)
+    s._session = SimpleNamespace(libquicr_compat=False)
+    s._pending_object_handlers = {}
+    s._publish_done_handlers = {}
+    s._fetch_object_handlers = {}
+    s._object_handlers = {}
+    s._reset_early_objects()
+    s._subscriptions = {}
+    s._unbound_aliases = {}
+    s._unbound_escalated = set()
+    s._track_default_priority = {}
+    s.on_object_received = None
+    return s
+
+
+def _reply(s, msg, rid):
+    """Parse a reply to request `rid` the way the draft carries it."""
+    wire = bytes(msg.serialize(prof=s._profile).data)
+    stream_rid = None if s._profile.reply_has_request_id else rid
+    s._moqt_handle_control_message(Buffer(data=wire), request_id=stream_rid)
+
+
+@pytest.mark.parametrize("draft", [14, 16, 18])
+async def test_subscribe_ok_binds_the_object_handler_as_it_is_parsed(draft):
+    # Objects drained in SUBSCRIBE_OK's batch run before its handler task:
+    # the alias must route to the subscriber's handler at parse time.
+    s = _routed_session(draft)
+
+    def on_object(*_):
+        pass
+
+    s._pending_object_handlers[4] = on_object
+    _reply(s, SubscribeOk(request_id=4, track_alias=300, expires=0,
+                          group_order=GroupOrder.ASCENDING,
+                          content_exists=0, parameters={}), 4)
+    assert s._object_cb(300) is on_object
+    assert s._pending_object_handlers == {}
+    await asyncio.sleep(0)
+
+
+@pytest.mark.parametrize("draft", [14, 16, 18])
+async def test_a_refused_request_drops_what_it_registered(draft):
+    s = _routed_session(draft)
+    for table in (s._pending_object_handlers, s._publish_done_handlers,
+                  s._fetch_object_handlers):
+        table[4] = print
+    s._announced[4] = (b"agent",)
+    err = (SubscribeError(request_id=4, error_code=0x4, reason="no")
+           if draft < 16 else
+           RequestError(request_id=4, error_code=0x4, retry_interval=0,
+                        reason="no"))
+    _reply(s, err, 4)
+    assert s._pending_object_handlers == {}
+    assert s._publish_done_handlers == s._fetch_object_handlers == {}
+    assert not s.is_announced("agent")
+    await asyncio.sleep(0)
+
+
+async def test_an_abandoned_subscribe_drops_its_handlers():
+    s = _routed_session(18)
+    pending = s.subscribe("ns", "t", on_object=print, on_done=print,
+                          wait_response=True)
+    assert list(s._pending_object_handlers) == [0]
+    assert list(s._publish_done_handlers) == [0]
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(pending, 0.05)
+    assert s._pending_object_handlers == s._publish_done_handlers == {}

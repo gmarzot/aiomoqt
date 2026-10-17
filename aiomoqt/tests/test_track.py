@@ -61,8 +61,24 @@ class TestPublishedTrack:
         session = MagicMock()
         t = PublishedTrack(session, "bench", "track")
         assert t.priority == 128
-        assert t.auth_token == b"bench-token"
+        assert t.auth_token is None
         assert t._generating is False
+
+    async def test_default_announce_carries_no_auth_token(self):
+        from aiomoqt.media.loc import LocTrackPublisher
+        from aiomoqt.tools import pub_bench
+        for cls in (PublishedTrack, LocTrackPublisher):
+            session = MagicMock()
+            session.publish_namespace = AsyncMock()
+            t = cls(session, "bench", "track")
+            await t.publish(announce_namespace=True, publish_track=False)
+            assert session.publish_namespace.await_args.kwargs["parameters"] == {}
+        import sys
+        argv, sys.argv = sys.argv, ["pub_bench", "moqt://h:4433"]
+        try:
+            assert not pub_bench.parse_args().auth_token
+        finally:
+            sys.argv = argv
 
     def test_init_custom_priority(self):
         session = MagicMock()
@@ -83,8 +99,13 @@ class TestPublishedTrack:
         pub_response = MagicMock()
         pub_response.track_alias = track_alias
         pub_response.request_id = request_id
-        session.publish = MagicMock(return_value=pub_response)
+
+        def publish(**kwargs):
+            pub_response.forward = kwargs.get('forward')
+            return pub_response
+        session.publish = MagicMock(side_effect=publish)
         session.register_handler = MagicMock()
+        session._peer_subscribed = MagicMock(return_value=False)
         return session
 
     # ----- Flow B: bare PUBLISH (default) -----
@@ -97,13 +118,14 @@ class TestPublishedTrack:
             await t.publish()
             session.publish_namespace.assert_not_called()
             session.publish.assert_called_once_with(
-                namespace="bench", track_name="track", forward=0)
+                namespace="bench", track_name="track", forward=0,
+                largest=None, track_properties=None)
             assert t.state == TrackState.PUBLISHED
         asyncio.run(_test())
 
     def test_publish_flow_b_default_d16(self):
-        """d16 default: Flow B — bare PUBLISH, no PUB_NS; REQUEST_UPDATE
-        handler registered."""
+        """d16 default: Flow B — bare PUBLISH, no PUB_NS; the session
+        routes the track's name and PUBLISH request to it."""
         async def _test():
             session = self._pub_session(track_alias=42, request_id=7)
             t = PublishedTrack(session, "bench", "track")
@@ -113,7 +135,10 @@ class TestPublishedTrack:
             assert t.track_alias == 42
             assert t.request_id == 7
             assert t.state == TrackState.PUBLISHED
-            assert any(c.args[0] == 0x02 for c in session.register_handler.call_args_list)
+            session._attach_track.assert_called_once_with(t)
+            session._bind_request.assert_called_once_with(
+                7, t, t.subscriptions[0], alias=42)
+            session.register_handler.assert_not_called()
         asyncio.run(_test())
 
     # ----- Flow A: PUB_NS only -----

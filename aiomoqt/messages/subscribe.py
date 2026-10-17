@@ -3,6 +3,8 @@ from typing import Tuple, Dict, Optional, Any
 from dataclasses import dataclass, field
 
 from . import MOQTMessage, BUF_SIZE
+from .params import LocationFilter, uses_location_filter
+from ..types import ParamType, SubscribeDoneCode
 from ..context import is_draft16_or_later, DraftProfile
 from ..utils.buffer import Buffer, BufferReadError
 from ..utils.logger import get_logger
@@ -12,10 +14,10 @@ logger = get_logger(__name__)
 
 @dataclass(slots=True)
 class TrackStatus(MOQTMessage):
-    """TRACK_STATUS (0x0D) — identical format to SUBSCRIBE.
-
-    Version branching same as Subscribe.
-    Draft-16 response is REQUEST_OK/REQUEST_ERROR (no Track Alias).
+    """TRACK_STATUS (0x0D) — SUBSCRIBE's format. d14 carries priority,
+    group order, forward and filter as fields; d16+ sends none of them
+    (§10.14). The d16+ response is REQUEST_OK/REQUEST_ERROR (no Track
+    Alias).
     """
     request_id: int = 0
     track_namespace: Tuple[bytes, ...] = None
@@ -47,33 +49,10 @@ class TrackStatus(MOQTMessage):
         payload.push_bytes(self.track_name)
 
         if is_draft16_or_later(prof.draft):
-            params = dict(self.parameters or {})
-            if self.priority is not None:
-                params[ParamType.SUBSCRIBER_PRIORITY] = self.priority
-            if self.group_order is not None:
-                params[ParamType.GROUP_ORDER] = self.group_order
-            if self.forward is not None:
-                params[ParamType.FORWARD] = self.forward
-            if self.filter_type is not None:
-                # Filter internals follow the negotiated varint codec
-                # (vi64 on d18); d18 carries End Group as a delta from
-                # Start Group (moxygen MoQFramer: end - start, >= 0).
-                fbuf = Buffer(capacity=64, vi64=prof.vi64)
-                fbuf.push_vint(self.filter_type)
-                if self.filter_type in (3, 4):
-                    fbuf.push_vint(self.start_group or 0)
-                    fbuf.push_vint(self.start_object or 0)
-                if self.filter_type == 4:
-                    end = self.end_group or 0
-                    if prof.vi64:
-                        start = self.start_group or 0
-                        if end < start:
-                            raise ValueError(
-                                f"end_group {end} < start_group {start}")
-                        end -= start
-                    fbuf.push_vint(end)
-                params[ParamType.SUBSCRIPTION_FILTER] = fbuf.data_slice(0, fbuf.tell())
-            MOQTMessage._serialize_params(payload, params, prof=prof)
+            # §10.14: delivery parameters (priority, group order, forward,
+            # filter) are not included; only the caller's, e.g. AUTH_TOKEN.
+            MOQTMessage._serialize_params(payload, self.parameters or {},
+                                          prof=prof)
         else:
             payload.push_uint8(self.priority)
             payload.push_uint8(self.group_order)
@@ -96,10 +75,8 @@ class TrackStatus(MOQTMessage):
 
         request_id = buf.pull_vint()
 
-        namespace = MOQTMessage._pull_tuple(buf)
-
-        track_name_len = buf.pull_vint()
-        track_name = buf.pull_bytes(track_name_len)
+        namespace, track_name = MOQTMessage._pull_full_track_name(
+            buf, prof=prof)
 
         priority = None
         group_order = None
@@ -110,32 +87,21 @@ class TrackStatus(MOQTMessage):
         end_group = None
 
         if is_draft16_or_later(prof.draft):
-            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
+            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
             priority = params.pop(ParamType.SUBSCRIBER_PRIORITY, None)
             group_order = params.pop(ParamType.GROUP_ORDER, None)
             forward = params.pop(ParamType.FORWARD, None)
             filter_raw = params.pop(ParamType.SUBSCRIPTION_FILTER, None)
             if filter_raw is not None:
-                fbuf = Buffer(data=filter_raw, vi64=prof.vi64)
-                filter_type = fbuf.pull_vint()
-                if filter_type not in (1, 2, 3, 4):
-                    # §5.1.2: filter types are 0x1-0x4; any other value
-                    # MUST close the session with PROTOCOL_VIOLATION.
-                    raise MOQTProtocolViolation(
-                        f"unknown subscription filter type "
-                        f"0x{filter_type:x}")
-                if filter_type in (3, 4):
-                    start_group = fbuf.pull_vint()
-                    start_object = fbuf.pull_vint()
-                if filter_type == 4:
-                    end_group = fbuf.pull_vint()
-                    if prof.vi64:
-                        # d18: End Group arrives as a delta from Start.
-                        end_group += start_group or 0
+                (filter_type, start_group, start_object,
+                 end_group) = MOQTMessage._decode_filter(filter_raw, prof=prof)
         else:
             priority = buf.pull_uint8()
             group_order = buf.pull_uint8()
+            MOQTMessage._check_range("group order", group_order, 0, 2)
             forward = buf.pull_uint8()
+            MOQTMessage._check_range("forward", forward, 0, 1)
             filter_type = buf.pull_vint()
             if filter_type not in (1, 2, 3, 4):
                 raise MOQTProtocolViolation(
@@ -145,7 +111,8 @@ class TrackStatus(MOQTMessage):
                 start_object = buf.pull_vint()
             if filter_type == 4:
                 end_group = buf.pull_vint()
-            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
+            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
 
         return cls(
             request_id=request_id,
@@ -212,7 +179,8 @@ class TrackStatusOk(MOQTMessage):
             largest_group_id = buf.pull_vint()
             largest_object_id = buf.pull_vint()
 
-        params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
+        params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
 
         return cls(
             request_id=request_id,
@@ -279,6 +247,10 @@ class Subscribe(MOQTMessage):
     start_object: Optional[int] = None
     end_group: Optional[int] = None
     parameters: Optional[Dict[int, Any]] = None
+    # d20+ LOCATION_FILTER. Sent in place of filter_type when set; on
+    # receive it is the filter, and filter_type and the Locations hold
+    # its d14-d18 form when one exists.
+    location_filter: Optional[LocationFilter] = None
     # Server-side runtime: set by allocate_track_alias when responding
     # with SubscribeOk. Not on the wire (Subscribe doesn't carry alias);
     # declared as a slot field so server handlers can assign it.
@@ -311,11 +283,20 @@ class Subscribe(MOQTMessage):
             params = dict(self.parameters or {})
             if self.priority is not None:
                 params[ParamType.SUBSCRIBER_PRIORITY] = self.priority
-            if self.group_order is not None:
+            # d16+ has no 0 value; omission means the publisher's order.
+            if self.group_order not in (None, GroupOrder.PUBLISHER_DEFAULT):
                 params[ParamType.GROUP_ORDER] = self.group_order
             if self.forward is not None:
                 params[ParamType.FORWARD] = self.forward
-            if self.filter_type is not None:
+            if uses_location_filter(prof):
+                lf = self.location_filter
+                if lf is None and self.filter_type is not None:
+                    lf = LocationFilter.from_subscription_filter(
+                        self.filter_type, self.start_group,
+                        self.start_object, self.end_group)
+                if lf is not None:
+                    params[ParamType.LOCATION_FILTER] = lf
+            elif self.filter_type is not None:
                 # SUBSCRIPTION_FILTER param (0x21) is odd → bytes value
                 # Encode: filter_type varint [+ start_group + start_obj [+ end_group]]
                 # Filter internals follow the negotiated varint codec
@@ -369,10 +350,8 @@ class Subscribe(MOQTMessage):
 
         request_id = buf.pull_vint()
 
-        namespace = MOQTMessage._pull_tuple(buf)
-
-        track_name_len = buf.pull_vint()
-        track_name = buf.pull_bytes(track_name_len)
+        namespace, track_name = MOQTMessage._pull_full_track_name(
+            buf, prof=prof)
 
         priority = None
         group_order = None
@@ -381,36 +360,31 @@ class Subscribe(MOQTMessage):
         start_group = None
         start_object = None
         end_group = None
+        location_filter = None
 
         if is_draft16_or_later(prof.draft):
             # d16: all fields are in parameters
-            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
+            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
             priority = params.pop(ParamType.SUBSCRIBER_PRIORITY, None)
             group_order = params.pop(ParamType.GROUP_ORDER, None)
             forward = params.pop(ParamType.FORWARD, None)
             filter_raw = params.pop(ParamType.SUBSCRIPTION_FILTER, None)
-            if filter_raw is not None:
-                fbuf = Buffer(data=filter_raw, vi64=prof.vi64)
-                filter_type = fbuf.pull_vint()
-                if filter_type not in (1, 2, 3, 4):
-                    # §5.1.2: filter types are 0x1-0x4; any other value
-                    # MUST close the session with PROTOCOL_VIOLATION.
-                    raise MOQTProtocolViolation(
-                        f"unknown subscription filter type "
-                        f"0x{filter_type:x}")
-                if filter_type in (3, 4):
-                    start_group = fbuf.pull_vint()
-                    start_object = fbuf.pull_vint()
-                if filter_type == 4:
-                    end_group = fbuf.pull_vint()
-                    if prof.vi64:
-                        # d18: End Group arrives as a delta from Start.
-                        end_group += start_group or 0
+            if isinstance(filter_raw, LocationFilter):
+                location_filter = filter_raw
+                legacy = filter_raw.subscription_filter()
+                if legacy is not None:
+                    filter_type, start_group, start_object, end_group = legacy
+            elif filter_raw is not None:
+                (filter_type, start_group, start_object,
+                 end_group) = MOQTMessage._decode_filter(filter_raw, prof=prof)
         else:
             # d14: fixed fields on wire
             priority = buf.pull_uint8()
             group_order = buf.pull_uint8()
+            MOQTMessage._check_range("group order", group_order, 0, 2)
             forward = buf.pull_uint8()
+            MOQTMessage._check_range("forward", forward, 0, 1)
             filter_type = buf.pull_vint()
             if filter_type not in (1, 2, 3, 4):
                 raise MOQTProtocolViolation(
@@ -421,7 +395,8 @@ class Subscribe(MOQTMessage):
             if filter_type == 4:
                 end_group = buf.pull_vint()
 
-            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
+            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
 
         return cls(
             request_id=request_id,
@@ -434,7 +409,8 @@ class Subscribe(MOQTMessage):
             start_group=start_group,
             start_object=start_object,
             end_group=end_group,
-            parameters=params
+            parameters=params,
+            location_filter=location_filter,
         )
 
 
@@ -528,7 +504,8 @@ class SubscribeOk(MOQTMessage):
         track_extensions = None
 
         if is_draft16_or_later(prof.draft):
-            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
+            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
             expires = params.pop(ParamType.EXPIRES, None)
             largest = params.pop(ParamType.LARGEST_OBJECT, None)
             if largest is not None:
@@ -545,19 +522,28 @@ class SubscribeOk(MOQTMessage):
                 content_exists = ContentExistsCode.NO_CONTENT
             track_extensions = MOQTMessage._extensions_decode(
                 buf, with_length=False, buf_end=buf_end, delta=True)
+            if prof.track_properties:
+                MOQTMessage._check_track_properties(track_extensions,
+                                                    prof=prof)
             group_order = GroupOrder.ASCENDING
             if track_extensions is not None:
                 group_order_val = track_extensions.pop(0x22, None)
                 if group_order_val is not None:
+                    MOQTMessage._check_range(
+                        "default publisher group order",
+                        group_order_val, 1, 2)
                     group_order = GroupOrder(group_order_val)
         else:
             expires = buf.pull_vint()
-            group_order = GroupOrder(buf.pull_uint8())
+            group_order = buf.pull_uint8()
+            MOQTMessage._check_range("group order", group_order, 1, 2)
+            group_order = GroupOrder(group_order)
             content_exists = buf.pull_uint8()
             if content_exists == ContentExistsCode.EXISTS:
                 largest_group_id = buf.pull_vint()
                 largest_object_id = buf.pull_vint()
-            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
+            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
 
         return cls(
             request_id=request_id,
@@ -654,7 +640,9 @@ class SubscribeUpdate(MOQTMessage):
         end_group = buf.pull_vint()
         priority = buf.pull_uint8()
         forward = buf.pull_uint8()
-        params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end)
+        MOQTMessage._check_range("forward", forward, 0, 1)
+        params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                                 scope=cls.__name__)
 
         return cls(
             request_id=request_id,
@@ -716,6 +704,12 @@ class SubscribeDone(MOQTMessage):
         if prof.reply_has_request_id:
             payload.push_vint(self.request_id)
         code = int(self.status_code)
+        if (code == SubscribeDoneCode.SUBSCRIPTION_ENDED
+                and not prof.publish_done_subscription_ended):
+            raise ValueError(
+                f"PUBLISH_DONE SUBSCRIPTION_ENDED does not exist at "
+                f"d{prof.draft}: a subscription does not end at its "
+                f"filter's end")
         if prof.draft >= 18:
             code = self._D18_WIRE_SWAP.get(code, code)
         payload.push_vint(code)

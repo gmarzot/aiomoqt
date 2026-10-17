@@ -13,6 +13,7 @@ from aiopquic.buffer import Buffer
 
 def _session(draft=18):
     s = object.__new__(_MOQTSessionMixin)
+    s._peer_requests = {}
     s.negotiated_draft = draft
     s._profile = profile_for(draft)
     s._bidi_streams = {5: 9}
@@ -77,7 +78,7 @@ def test_relay_answers_ok_for_served_track_and_error_for_unknown():
     class _Track:
         finished = False
         pending_publish = ("sess", "msg")
-        upstream = type("U", (), {"_largest": (7, 42)})()
+        largest = (7, 42)
 
     s = _session(18)
     saved = dict(relay._tracks)

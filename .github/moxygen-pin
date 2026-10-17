@@ -11,5 +11,6 @@
 #
 # A rolling snapshot tag carries no assets of its own: it is a pointer
 # whose body names the per-rev release holding them. Use either a version
-# tag (v0.3.0) or a resolved per-rev tag (snapshot-<sha12>).
-snapshot-e0918d648d79
+# tag (v0.3.0) or a resolved per-rev tag (snapshot-<sha12>). Per-rev
+# snapshots are pruned upstream after a few weeks; version tags stay.
+v0.3.5

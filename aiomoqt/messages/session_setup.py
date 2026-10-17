@@ -122,7 +122,7 @@ class GoAway(MOQTMessage):
         payload.push_bytes(uri_bytes)
         if prof.draft >= 18:
             payload.push_vint(self.timeout or 0)
-            if self.request_id is not None:
+            if prof.goaway_request_id and self.request_id is not None:
                 payload.push_vint(self.request_id)
 
         buf.vi64 = prof.vi64
@@ -147,9 +147,10 @@ class GoAway(MOQTMessage):
         request_id = None
         if prof.draft >= 18:
             timeout = buf.pull_vint()
-            # Request ID: only in the control-stream form; the message
+            # Request ID: only in the d18 control-stream form; the message
             # Length covers it, so remaining bytes decide presence.
-            if buf_end is not None and buf.tell() < buf_end:
+            if (prof.goaway_request_id and buf_end is not None
+                    and buf.tell() < buf_end):
                 request_id = buf.pull_vint()
 
         return cls(new_session_uri=uri, timeout=timeout,

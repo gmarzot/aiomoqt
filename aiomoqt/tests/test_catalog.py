@@ -238,3 +238,57 @@ def test_property_carried_init_data():
 def test_property_init_data_round_trips():
     d = {"id": "v", "type": "object-property", "data": "0x0D"}
     assert InitData.from_dict(d).to_dict() == d
+
+
+# -- LOCMAF (draft-einarsson-moq-locmaf) --------------------------------
+
+def _locmaf_track(**kw):
+    return dict({"name": "video_locmaf", "packaging": "locmaf",
+                 "isLive": True, "locmafVersion": "0.3"}, **kw)
+
+
+def test_locmaf_version_round_trips():
+    cat = Catalog.from_dict({"version": "1", "tracks": [_locmaf_track()]})
+    track = cat.tracks[0]
+    assert track.locmafVersion == "0.3" and track.extra == {}
+    assert cat.to_dict()["tracks"][0]["locmafVersion"] == "0.3"
+    assert cat.validate() == []
+
+
+@pytest.mark.parametrize("track", [
+    _locmaf_track(locmafVersion=None),
+    _locmaf_track(locmafVersion=3),
+    dict(_locmaf_track(), packaging="cmaf"),
+], ids=["locmaf-without", "locmaf-not-a-string", "cmaf-with"])
+def test_locmaf_version_present_exactly_on_locmaf_tracks(track):
+    if track["locmafVersion"] is None:
+        del track["locmafVersion"]
+    cat = Catalog.from_dict({"version": "1", "tracks": [track]})
+    assert any("locmafVersion" in i for i in cat.validate())
+
+
+def test_moqlivemock_shaped_catalog_validates():
+    """A CMSF catalog as moqlivemock publishes it: every CMAF track has a
+    LOCMAF twin in its altGroup, both referencing one init entry."""
+    tracks = []
+    for i, (name, role, codec) in enumerate((
+            ("video_400kbps_avc", "video", "avc1.64001e"),
+            ("audio_monotonic_128kbps_aac", "audio", "mp4a.40.2"))):
+        base = {"name": name, "packaging": "cmaf", "isLive": True,
+                "targetLatency": 1000, "role": role, "renderGroup": 1,
+                "altGroup": i + 1, "initRef": f"init{i}", "codec": codec,
+                "bitrate": 400_000}
+        if role == "video":
+            base.update(width=640, height=360, framerate=25)
+        else:
+            base.update(samplerate=48000, channelConfig="2")
+        tracks += [base, dict(base, name=name + "_locmaf",
+                              packaging="locmaf", locmafVersion="0.3",
+                              bitrate=390_000)]
+    cat = Catalog.from_dict({
+        "version": 1, "generatedAt": 1, "tracks": tracks,
+        "initDataList": [{"id": "init0", "data": "AAAA"},
+                         {"id": "init1", "data": "AAAB"}]})
+    assert cat.validate() == []
+    cmaf, twin = cat.find("video_400kbps_avc"), cat.find("video_400kbps_avc_locmaf")
+    assert cat.resolve_init(cmaf) == cat.resolve_init(twin)

@@ -24,6 +24,13 @@ class MOQTDraft(IntEnum):
     DRAFT_14 = 14
     DRAFT_16 = 16
     DRAFT_18 = 18
+    DRAFT_20 = 20
+    DRAFT_22 = 22
+
+
+# What a client offers and a server accepts when supported_drafts is None,
+# newest first.
+MOQT_DEFAULT_DRAFTS: Tuple[int, ...] = (22, 20, 18, 16, 14)
 
 
 # ALPN: draft-14 uses legacy "moq-00"; draft-16+ uses "moqt-NN"
@@ -120,8 +127,8 @@ def normalize_supported_drafts(supported_drafts) -> list:
     list of plain draft NUMBERS.
 
     Accepts the forms the public API allows:
-      - None        → offer every supported draft, newest first (the
-                       "auto" offer)
+      - None        → MOQT_DEFAULT_DRAFTS, newest first (the "auto"
+                       offer)
       - int         → a single draft number, e.g. 16 → [16]
       - list[int]   → several draft numbers, e.g. [16, 14]; the caller's
                       order is preserved (deduped), so a caller can put a
@@ -137,10 +144,7 @@ def normalize_supported_drafts(supported_drafts) -> list:
     order ALPN / CLIENT_SETUP / WT-Available-Protocols offer versions in.
     """
     if supported_drafts is None:
-        # auto: every draft we can speak, newest first. MOQTDraft, not
-        # MOQT_VERSIONS — the latter is only the d14 in-band CLIENT_SETUP
-        # list and omits the out-of-band d16+ drafts.
-        return sorted((int(d) for d in MOQTDraft), reverse=True)
+        return list(MOQT_DEFAULT_DRAFTS)
     if isinstance(supported_drafts, int):
         supported_drafts = [supported_drafts]
     drafts = []
@@ -232,6 +236,12 @@ class D18MessageType:
     PUBLISH_BLOCKED = 0x0F      # new in d18 (d14 TRACK_STATUS_ERROR point)
 
 
+class D20MessageType:
+    """Draft-20 code points that are new or renamed; d22 keeps them."""
+    PUBLISH_STATE_NOTIFY = 0x22  # new in d20
+    PUBLISH_SKIPPED = 0x0F       # d18 PUBLISH_BLOCKED, same wire shape
+
+
 # Code points that denote the same logical message under different
 # numbers across drafts. register_handler() expands a registration to
 # every alias, so a handler registered by one draft's name also fires on
@@ -245,9 +255,9 @@ HANDLER_ALIASES: Dict[int, Tuple[int, ...]] = {
 
 # Control message types each draft defines, transcribed from the message
 # type registry table in each specification (d14 §9.2, d16 §9.2, d18
-# §10.2). Sending a type absent from the negotiated draft's table is a
-# wire violation: the peer sees an unknown control message and closes the
-# session with PROTOCOL_VIOLATION.
+# §10.2, d20 §10.2, d22 §9 Table 5). Sending a type absent from the
+# negotiated draft's table is a wire violation: the peer sees an unknown
+# control message and closes the session with PROTOCOL_VIOLATION.
 #
 # d18 removed every cancellation message — UNSUBSCRIBE (0xA),
 # PUBLISH_NAMESPACE_DONE (0x9), PUBLISH_NAMESPACE_CANCEL (0xC),
@@ -256,6 +266,13 @@ HANDLER_ALIASES: Dict[int, Tuple[int, ...]] = {
 # It also dropped MAX_REQUEST_ID (0x15) and REQUESTS_BLOCKED (0x1A).
 # d18's NAMESPACE_DONE (0xE) is NOT the d16 message of the same name: it
 # answers a SUBSCRIBE_NAMESPACE and carries a namespace suffix.
+#
+# d20 reserves PUBLISH_OK (0x1E; PUBLISH is answered with REQUEST_OK) and
+# adds PUBLISH_STATE_NOTIFY (0x22). d22 keeps the d20 table.
+_D20_CONTROL_TYPES = frozenset({
+    0x2F00, 0x10, 0x03, 0x04, 0x22, 0x1D, 0x0B, 0x16, 0x18, 0x0D,
+    0x06, 0x50, 0x51, 0x08, 0x0E, 0x0F, 0x02, 0x07, 0x05,
+})
 CONTROL_MESSAGE_TYPES: Dict[int, frozenset] = {
     14: frozenset({
         0x20, 0x21, 0x10, 0x15, 0x1A, 0x03, 0x04, 0x05, 0x02, 0x0A,
@@ -271,19 +288,32 @@ CONTROL_MESSAGE_TYPES: Dict[int, frozenset] = {
         0x2F00, 0x10, 0x03, 0x04, 0x1D, 0x1E, 0x0B, 0x16, 0x18, 0x0D,
         0x06, 0x50, 0x51, 0x08, 0x0E, 0x0F, 0x02, 0x07, 0x05,
     }),
+    20: _D20_CONTROL_TYPES,
+    22: _D20_CONTROL_TYPES,
 }
 
 # Code points a draft renumbers on the wire while the message class keeps
-# its canonical type: d18 SUBSCRIBE_NAMESPACE 0x11 -> 0x50, PUBLISH_OK
-# 0x1E -> REQUEST_OK 0x07.
+# its canonical type: from d18 SUBSCRIBE_NAMESPACE 0x11 -> 0x50 and
+# PUBLISH_OK 0x1E -> REQUEST_OK 0x07. Every draft has a row.
+_D18_RENUMBERED = {0x11: 0x50, 0x1E: 0x07}
 WIRE_TYPE_BY_DRAFT: Dict[int, Dict[int, int]] = {
-    18: {0x11: 0x50, 0x1E: 0x07},
+    14: {},
+    16: {},
+    18: _D18_RENUMBERED,
+    20: _D18_RENUMBERED,
+    22: _D18_RENUMBERED,
 }
 
 
 def wire_control_type(draft: int, type_: int) -> int:
-    """Wire code point of a control message type at `draft`."""
-    return WIRE_TYPE_BY_DRAFT.get(draft, {}).get(int(type_), int(type_))
+    """Wire code point of a control message type at `draft`. Raises
+    ValueError for a draft with no table."""
+    try:
+        renumbered = WIRE_TYPE_BY_DRAFT[int(draft)]
+    except KeyError:
+        raise ValueError(
+            f"no control message table for draft-{draft}") from None
+    return renumbered.get(int(type_), int(type_))
 
 
 class ParamType(IntEnum):
@@ -305,6 +335,7 @@ class ParamType(IntEnum):
     OBJECT_FILTER = 0x27
     DYNAMIC_GROUPS = 0x30
     NEW_GROUP_REQUEST = 0x32
+    TRACK_NAMESPACE_PREFIX = 0x34   # d18: REQUEST_UPDATE of a namespace subscription
     GREASE_1_PARAM = 0x55
     GREASE_2_PARAM = 0x8A
 
@@ -312,11 +343,13 @@ class ParamType(IntEnum):
 class SetupParamType(IntEnum):
     """Setup Parameter type constants"""
     PATH = 0x01  # only relevant to raw QUIC connection
-    MAX_REQUEST_ID = 0x02
+    MAX_REQUEST_ID = 0x02       # d14/d16 only
     AUTH_TOKEN = 0x03
     MAX_AUTH_TOKEN_CACHE_SIZE = 0x04
     AUTHORITY = 0x05
+    MAX_FILTER_RANGES = 0x06    # d20+
     IMPLEMENTATION = 0x07  # Wrong in draft 14, draft-15 fixed it to this value
+    MAX_REQUEST_UPDATES = 0x08  # d20+
     GREASE_1_PARAM = 0x77
     GREASE_2_PARAM = 0x92
 
@@ -343,6 +376,7 @@ class SessionCloseCode(IntEnum):
     EXPIRED_AUTH_TOKEN = 0x18
     INVALID_AUTHORITY = 0x19
     MALFORMED_AUTHORITY = 0x1A
+    TOO_MANY_REQUEST_UPDATES = 0x1B  # d20+
 
 class ContentExistsCode(IntEnum):
     """Content Exists Code"""
@@ -397,6 +431,8 @@ class RequestErrorCode(IntEnum):
     INVALID_JOINING_REQUEST_ID = 0x32
     UNSUPPORTED_EXTENSION = 0x33  # d18
     REDIRECT = 0x34               # d18; REQUEST_ERROR carries a Redirect
+    CONFLICTING_FILTERS = 0x35    # d20
+    INVALID_FILTER = 0x36         # d20
 
 
 class SubscribeDoneCode(IntEnum):
@@ -433,7 +469,24 @@ D18_PARAM_KINDS: Dict[int, str] = {
     0x21: "bytes",     # SUBSCRIPTION_FILTER
     0x22: "uint8",     # GROUP_ORDER
     0x32: "varint",    # NEW_GROUP_REQUEST
-    0x34: "tuple",     # TRACK_NAMESPACE_PREFIX (Track Namespace)
+    0x34: "tuple",     # TRACK_NAMESPACE_PREFIX: length-prefixed Track Namespace
+}
+
+# d18 §10.2.x: the requests each Message Parameter may appear in, keyed by
+# message class (§10.2.1). Replies are not checked: moq-dev's SUBSCRIBE_OK
+# carries GROUP_ORDER, and what REQUEST_OK may carry depends on the
+# request it answers.
+D18_PARAM_SCOPE: Dict[str, frozenset] = {
+    "Subscribe": frozenset({0x02, 0x03, 0x04, 0x06, 0x10, 0x20, 0x21, 0x22,
+                            0x32}),
+    "Publish": frozenset({0x03, 0x08, 0x09, 0x10}),
+    "Fetch": frozenset({0x03, 0x0A, 0x20, 0x22}),
+    "TrackStatus": frozenset({0x03}),
+    "PublishNamespace": frozenset({0x03}),
+    "SubscribeNamespace": frozenset({0x03}),
+    "SubscribeTracks": frozenset({0x03, 0x10}),
+    "RequestUpdate": frozenset({0x02, 0x03, 0x06, 0x10, 0x20, 0x21, 0x32,
+                                0x34}),
 }
 
 
@@ -563,6 +616,14 @@ class MOQTProtocolViolation(MOQTException):
         super().__init__(SessionCloseCode.PROTOCOL_VIOLATION, reason_phrase)
 
 
+# draft-ietf-webtrans-http3-16 §9.5: WT session closed on failed WT-Protocol negotiation.
+WT_ALPN_ERROR = 0x0817B3DD
+
+
+class MOQTNegotiationError(ConnectionError):
+    """The server's WT-Protocol answer selected none of the offered MoQT drafts."""
+
+
 class MOQTRequestError(Exception):
     """Raised when a MoQT request receives an error response.
 
@@ -577,3 +638,69 @@ class MOQTRequestError(Exception):
         self.retry_interval = retry_interval  # d16: ms before retry+1; 0=don't retry
         self.response = response              # original message object
         super().__init__(f"request error: code={error_code} reason={reason}")
+
+
+# --- transport stream scheduling ------------------------------------------
+#
+# picoquic's stream priority is local only: RFC 9000 §2.3 gives QUIC no wire
+# mechanism for priority and asks only that an implementation offer an API.
+# MoQT does not say how its priority maps onto a scheduler either — §7.2
+# defines an ordering and leaves ordering among equals implementation-defined
+# — so the band layout below is ours to choose. The wire always carries the
+# declared 8-bit MoQT value unchanged; this is the local mapping.
+#
+# Two picoquic behaviours shape it, both measured (tests/bench/sim_link):
+#
+#   - Scheduling is STRICT, not weighted. A lower band takes everything it
+#     has ready before a higher one is served, so there is no way to express
+#     a weighted split. A band that does not saturate leaves the surplus to
+#     the bands below it; only a greedy sender starves them.
+#   - The low bit selects the discipline among streams of EQUAL priority:
+#     even orders by least-recently-sent (fair, ~equal shares), odd by lowest
+#     stream id (one stream takes everything). Every band here is even.
+#
+# Layout, lower = more urgent:
+#
+#     0            disallowed; means "no priority given" on the wire between
+#                  aiomoqt and the transport
+#     2, 4, 6      reserved above control, for a use case not yet defined.
+#                  Anything placed here outranks the control stream and can
+#                  starve it under a greedy sender — deliberate escape hatch
+#     8            control streams
+#     9            datagrams (picoquic's own default, left alone), so
+#                  datagrams beat bulk stream data but yield to control
+#     10 .. 254    subscription data
+#     255          PADDING streams
+STREAM_BAND_UNSET = 0
+STREAM_BAND_RESERVED = (2, 4, 6)
+STREAM_BAND_CONTROL = 8
+STREAM_BAND_DATA_FLOOR = 10
+STREAM_BAND_PADDING = 255
+
+SCHEDULING = ("round_robin", "fifo")
+
+
+def to_stream_priority(moqt_priority: int, *,
+                       discipline: str = "round_robin") -> int:
+    """Map a MoQT publisher priority (0-255, lower = more urgent) to a band.
+
+    The low bit is cleared and re-set from `discipline`, never inherited from
+    the MoQT value: it selects picoquic's tiebreak among equals rather than
+    adding resolution, so carrying it through would make adjacent priorities
+    differ in kind. round_robin shares a band fairly; fifo hands the whole
+    band to its lowest stream id, which no caller can steer.
+
+    Clamped to STREAM_BAND_DATA_FLOOR so declared data can never rise above
+    the control band — a greedy track at a lower band would starve the
+    session's own control stream. The cost is that MoQT 0-10 collapse into
+    one band, leaving 123 distinct bands above it.
+    """
+    if discipline not in SCHEDULING:
+        raise ValueError(
+            f"discipline must be one of {', '.join(SCHEDULING)}, "
+            f"got {discipline!r}")
+    if not 0 <= moqt_priority <= 255:
+        raise ValueError(
+            f"MoQT priority must be 0-255, got {moqt_priority}")
+    band = max(STREAM_BAND_DATA_FLOOR, moqt_priority & 0xFE)
+    return band | (1 if discipline == "fifo" else 0)

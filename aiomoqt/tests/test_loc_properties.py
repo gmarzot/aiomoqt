@@ -28,7 +28,7 @@ def _sub():
     return LocTrackSubscriber(None, "loc/ns", "track")
 
 
-def _obj(exts, payload=b"f", object_id=0, group_id=0):
+def _obj(exts, payload=b"\x0a\x00f", object_id=0, group_id=0):
     return SimpleNamespace(extensions=exts, payload=payload,
                            object_id=object_id, group_id=group_id)
 
