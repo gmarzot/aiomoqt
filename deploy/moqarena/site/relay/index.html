@@ -59,8 +59,7 @@
   <div class="toast" id="toast" role="status" hidden>Copied</div>
 
   <p class="warn">aiomoqt ersatz relay: for limited interop testing. Please keep traffic light:
-    excessive traffic or extended relay testing is discouraged. Open, no auth, a small per-track
-    cache, not a production relay.</p>
+    excessive traffic or extended relay testing is discouraged. Not a production relay.</p>
 
   <p class="unavailable" id="unavailable" hidden>Status unavailable: the relay has not reported
     in the last 30 seconds.</p>
@@ -71,20 +70,16 @@
     <div class="tile" data-key="subscribers" data-spark="subscribers"><h3>Subscribers</h3><div class="value">—</div><div class="sub"></div></div>
     <div class="tile" data-key="namespaces"><h3>Namespaces</h3><div class="value">—</div><div class="sub"></div></div>
     <div class="tile" data-key="tracks" data-spark="tracks"><h3>Tracks</h3><div class="value">—</div><div class="sub"></div></div>
-    <div class="tile" data-key="fetches"><h3>Fetches</h3><div class="value">—</div><div class="sub"></div></div>
-    <div class="tile" data-key="delivered"><h3>Delivered</h3><div class="value">—</div><div class="sub"></div></div>
-    <div class="tile tile-gauge" data-key="cache" title="Share of FETCH data served from the relay cache instead of the publisher"><h3>Cache efficiency</h3><div class="tile-row"><div class="value">—</div><svg class="mini-gauge" id="gauge-cache" viewBox="0 0 120 104" aria-hidden="true"></svg></div><div class="sub"></div></div>
-    <div class="tile tile-gauge" data-key="cdn" title="Share of egress not received upstream"><h3>CDN efficiency</h3><div class="tile-row"><div class="value">—</div><svg class="mini-gauge" id="gauge-cdn" viewBox="0 0 120 104" aria-hidden="true"></svg></div><div class="sub"></div></div>
-  </section>
-  <section class="tiles tiles-detail" aria-label="Relay delivery">
-    <div class="tile" data-key="rtt" data-spark="rtt_p50_ms"><h3>RTT</h3><div class="value">—</div><div class="sub"></div></div>
-    <div class="tile" data-key="lag" data-spark="lag_p99_ms"><h3>Loop lag</h3><div class="value">—</div><div class="sub"></div></div>
-    <div class="tile" data-key="loss" data-spark="loss_pct"><h3>Loss</h3><div class="value">—</div><div class="sub"></div></div>
-    <div class="tile" data-key="drops"><h3>Drops</h3><div class="value">—</div><div class="sub"></div></div>
-    <div class="tile" data-key="groups" data-spark="groups_per_s"><h3>Groups/s</h3><div class="value">—</div><div class="sub"></div></div>
-    <div class="tile" data-key="objects" data-spark="objects_in_per_s"><h3>Objects/s</h3><div class="value">—</div><div class="sub"></div></div>
     <div class="tile" data-key="ingress" data-spark="ingress_bps"><h3>BW in</h3><div class="value">—</div><div class="sub"></div></div>
     <div class="tile" data-key="egress" data-spark="egress_bps"><h3>BW out</h3><div class="value">—</div><div class="sub"></div></div>
+  </section>
+  <section class="tiles tiles-detail" aria-label="Relay delivery">
+    <div class="tile" data-key="groups" data-spark="groups_per_s"><h3>Groups/s</h3><div class="value">—</div><div class="sub"></div></div>
+    <div class="tile" data-key="objects" data-spark="objects_in_per_s"><h3>Objects/s</h3><div class="value">—</div><div class="sub"></div></div>
+    <div class="tile" data-key="lag" data-spark="lag_p99_ms"><h3>Loop lag</h3><div class="value">—</div><div class="sub"></div></div>
+    <div class="tile" data-key="rtt" data-spark="rtt_p50_ms"><h3>RTT</h3><div class="value">—</div><div class="sub"></div></div>
+    <div class="tile" data-key="drops"><h3>Drops</h3><div class="value">—</div><div class="sub"></div></div>
+    <div class="tile" data-key="loss" data-spark="loss_pct"><h3>Loss</h3><div class="value">—</div><div class="sub"></div></div>
   </section>
 
   <div class="split">
