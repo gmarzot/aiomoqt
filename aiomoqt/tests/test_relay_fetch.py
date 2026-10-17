@@ -13,14 +13,14 @@ from types import SimpleNamespace
 import pytest
 
 from aiomoqt.client import MOQTClient
-from aiomoqt.context import profile_for
+from aiomoqt.context import profile_for, request_error_code
 from aiomoqt.messages.data import FetchObject
 from aiomoqt.messages.fetch import Fetch
 from aiomoqt.messages.subscribe import Subscribe
 from aiomoqt.protocol import _MOQTSessionMixin
 from aiomoqt.tools import moq_interop_relay as relay
 from aiomoqt.track import PublishedTrack
-from aiomoqt.types import (FilterType, GroupOrder, ParamType,
+from aiomoqt.types import (FilterType, GroupOrder, MOQTRequestError, ParamType,
                            RequestErrorCode)
 from aiomoqt.utils.buffer import Buffer
 
@@ -36,8 +36,10 @@ def _session(draft=18):
     s._errors = []
     s._oks = []
     s._served = []
+    # Recorded as the wire value the session would send at this draft.
     s.fetch_error = lambda request_id, error_code, reason: (
-        s._errors.append((error_code, reason)))
+        s._errors.append((request_error_code(error_code, s._profile, fetch=True),
+                          reason)))
     s.fetch_ok = lambda **kw: s._oks.append(kw)
 
     async def _serve(request_id, objects, group_order=None, fin=True):
@@ -203,7 +205,7 @@ def test_range_outside_the_cache_falls_back_to_upstream(monkeypatch):
         ok = SimpleNamespace(end_of_track=1)
         return ok, [FetchObject(group_id=0, subgroup_id=0, object_id=i,
                                 publisher_priority=128, payload=b"z")
-                    for i in range(3)]
+                    for i in range(3)], None
     monkeypatch.setattr(relay, "_fetch_upstream", _upstream)
     asyncio.run(relay._on_fetch(s, _fetch(start_group=0, start_object=0,
                                           end_group=1, end_object=0)))
@@ -306,13 +308,56 @@ def test_range_older_than_the_cache_goes_upstream(monkeypatch):
         return SimpleNamespace(end_of_track=0), [
             FetchObject(group_id=g, subgroup_id=0, object_id=0,
                         publisher_priority=128, payload=b"z")
-            for g in range(0, 6)]
+            for g in range(0, 6)], None
     monkeypatch.setattr(relay, "_fetch_upstream", _upstream)
     asyncio.run(relay._on_fetch(s, _fetch(start_group=0, start_object=0,
                                           end_group=5, end_object=0)))
     assert asked == [(0, 5)]                      # went upstream
     served, _ = s._served[0]
     assert [o.group_id for o in served] == [0, 1, 2, 3, 4, 5]
+
+
+@pytest.mark.parametrize("draft,does_not_exist,invalid_range,invalid_joining", [
+    (14, 0x4, 0x5, 0x7), (16, 0x10, 0x11, 0x32), (18, 0x10, 0x11, 0x32),
+    (20, 0x10, 0x11, 0x0), (22, 0x10, 0x11, 0x0)])
+def test_refusals_carry_the_drafts_wire_codes(draft, does_not_exist,
+                                              invalid_range, invalid_joining):
+    # d14 has its own FETCH_ERROR codes; d20 has no INVALID_JOINING_REQUEST_ID.
+    s = _session(draft)
+    asyncio.run(relay._on_fetch(s, _fetch(start_group=0, start_object=0)))
+    t = _track()
+    relay._tracks[((b"live",), b"cam")] = t
+    _join(t, s, 7)
+    asyncio.run(relay._on_fetch(s, _fetch(fetch_type=RELATIVE_JOINING,
+                                          joining_request_id=7,
+                                          joining_start=2)))
+    asyncio.run(relay._on_fetch(s, _fetch(fetch_type=RELATIVE_JOINING,
+                                          joining_request_id=99,
+                                          joining_start=2)))
+    assert [code for code, _ in s._errors] == [does_not_exist, invalid_range,
+                                              invalid_joining]
+
+
+def test_an_upstream_refusal_is_answered_in_the_subscribers_draft(
+        monkeypatch):
+    # A d14 publisher's INVALID_RANGE (0x5) reaches a d18 subscriber as
+    # 0x11, with the publisher's reason.
+    s = _session(18)
+    refused = MOQTRequestError(error_code=0x5, reason="range gone")
+
+    async def _upstream(ns, track_name, msg):
+        return None, None, relay._upstream_refusal(refused, profile_for(14),
+                                                   fetch=True)
+    monkeypatch.setattr(relay, "_fetch_upstream", _upstream)
+    asyncio.run(relay._on_fetch(s, _fetch(start_group=0, start_object=0,
+                                          end_group=1, end_object=0)))
+    assert s._errors == [(0x11, "range gone")]
+
+
+def test_an_upstream_code_the_draft_lacks_becomes_internal_error():
+    refused = MOQTRequestError(error_code=0x99, reason="")
+    assert relay._upstream_refusal(refused, profile_for(18)) == (
+        RequestErrorCode.INTERNAL_ERROR, "upstream error")
 
 
 def test_range_inside_the_cache_is_served_from_it(monkeypatch):

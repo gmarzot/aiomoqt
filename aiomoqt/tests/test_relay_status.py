@@ -261,6 +261,32 @@ def test_write_json_atomic(tmp_path):
     assert path.stat().st_mode & 0o777 == 0o644
 
 
+@pytest.mark.parametrize("addr,masked", [
+    (("203.0.113.7", 51234), "203.0.113.x"),
+    ("198.51.100.255", "198.51.100.x"),
+    (("::ffff:203.0.113.7", 443), "203.0.113.x"),
+    (("2001:db8:abcd:12::1", 4433), "2001:db8:abcd::/48"),
+    ("2001:0db8:0000:0001::", "2001:db8:0::/48"),
+    ("fe80::1%eth0", "fe80:0:0::/48"),
+    (None, None), ("", None), ("not-an-ip", None),
+])
+def test_mask_addr(addr, masked):
+    assert relay_status.mask_addr(addr) == masked
+
+
+def test_peer_address_is_none_without_transport_support():
+    from types import SimpleNamespace
+    from aiomoqt.protocol import _MOQTSessionMixin
+    prop = _MOQTSessionMixin.peer_address.fget
+    old = SimpleNamespace(_is_wt=False, _quic=object())
+    assert prop(old) is None
+    wt = SimpleNamespace(_is_wt=True, _transport=object(), cnx_ptr=1)
+    assert prop(wt) is None
+    quic = SimpleNamespace(_is_wt=False, _quic=SimpleNamespace(
+        peer_address=lambda: ("192.0.2.1", 4433)))
+    assert prop(quic) == ("192.0.2.1", 4433)
+
+
 def test_versions_names_the_stack():
     v = relay_status.versions()
     assert set(v) == {"aiomoqt", "aiopquic", "picoquic", "python"}
@@ -393,6 +419,13 @@ async def test_snapshot_reports_namespaces_tracks_and_sessions(
     assert platform["history"]["t"] == snap["history"]["t"]
     assert platform["bandwidth"]["egress_bps"] == totals["egress_bps"]
     assert "cpu_modes" in platform["host"] and "ifaces" in platform["host"]
+
+    # Masked peer addresses, never a port.
+    local = {"127.0.0.x", "0:0:0::/48"}
+    assert {s["addr"] for s in snap["sessions"]} <= local
+    assert None not in {s["addr"] for s in snap["sessions"]}
+    assert {video["origin_addr"], space["origin_addr"]} <= local
+    assert {s["addr"] for s in video["subscriber_list"]} <= local
 
     relay_status.write_json_atomic(status.path, snap)
     with open(status.path) as f:

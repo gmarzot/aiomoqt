@@ -49,9 +49,11 @@ import argparse
 import asyncio
 from collections import deque
 import contextlib
+import datetime
 import faulthandler
 import itertools
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import sys
 import time
@@ -62,7 +64,7 @@ from aiomoqt.server import MOQTServer
 from aiomoqt.types import (
     MOQT_DEFAULT_DRAFTS, D18MessageType, FilterType, GroupOrder, MOQTDraft,
     MOQTMessageType, MOQTRequestError, ObjectStatus, ParamType,
-    RequestErrorCode, StreamResetCode, SubscribeDoneCode, SubscribeErrorCode,
+    RequestErrorCode, StreamResetCode, SubscribeDoneCode,
     parse_draft_spec,
 )
 from aiomoqt.messages import SubgroupHeader
@@ -70,15 +72,18 @@ from aiomoqt.messages.base import MOQTMessage
 from aiomoqt.messages.data import (FetchObject, ObjectDatagram,
                                    ObjectDatagramStatus)
 from aiomoqt.messages.fetch import _is_joining
+from aiomoqt.messages.publish import PublishError
 from aiomoqt.messages.request import RequestError, RequestOk
 from aiomoqt.messages.subscribe import Subscribe
 from aiomoqt.track import (PublishedTrack, SubscribedTrack, _UNFILTERED,
                            _filter_window, _largest_object_param,
                            _reported_largest)
-from aiomoqt.context import is_draft16_or_later
+from aiomoqt.context import (canonical_request_error, canonical_stream_reset,
+                             is_draft16_or_later,
+                             request_error_code)
 from aiomoqt.tools import relay_status
 from aiomoqt.utils.buffer import Buffer
-from aiomoqt.utils.logger import set_log_level, get_logger
+from aiomoqt.utils.logger import set_log_handler, set_log_level, get_logger
 from aiomoqt.utils.url import parse_relay_url
 
 # Version confinement. The interop runner injects DRAFT (moq-interop-runner
@@ -104,6 +109,8 @@ _announce_requests: dict[tuple, tuple] = {}
 
 # Tracks being relayed upstream->downstream, keyed by (namespace, name).
 _tracks: dict[tuple, "_RelayedTrack"] = {}
+# (namespace, name) -> the upstream SUBSCRIBE outstanding for it.
+_establishing: dict[tuple, "_Establishing"] = {}
 
 # Sessions this relay dialled OUT to. An origin does not announce to us,
 # so it never lands in _announced; it is tried as a fallback when no
@@ -131,6 +138,9 @@ RENDEZVOUS_TIMEOUT = 0x04
 RENDEZVOUS_MAX_S = 30.0
 # Longest a joining FETCH waits for the SUBSCRIBE it names to attach.
 JOINING_WAIT_S = 5.0
+# Longest the relay waits for a PUBLISH after an upstream refuses its
+# SUBSCRIBE as a duplicate subscription (§5.1: the PUBLISH crossed it).
+PUBLISH_WAIT_S = 1.5
 # Watchdog: self-probes failed in a row before exiting, the exit status
 # (EX_SOFTWARE), and the longest one probe may take.
 WATCHDOG_MISSES = 3
@@ -367,6 +377,8 @@ class _RelayedTrack:
         self._bytes_out = 0
         self._peak_subs = 0
         self._fetches = 0
+        # FETCH payload bytes served, by source.
+        self._fetch_bytes = {"cache": 0, "upstream": 0}
         self._drops = 0
         self._groups_in = 0
         self._last_gid = None
@@ -483,6 +495,8 @@ class _RelayedTrack:
         becomes our reset with the same code, never a FIN. A malformed
         upstream track ends every downstream subscription with
         PUBLISH_DONE MALFORMED_TRACK (§2.4.2)."""
+        if not clean:
+            reset_code = self._canonical_reset(reset_code)
         if not clean and reset_code == StreamResetCode.MALFORMED_TRACK:
             self.finish(SubscribeDoneCode.MALFORMED_TRACK,
                         reset_code=StreamResetCode.MALFORMED_TRACK,
@@ -501,6 +515,17 @@ class _RelayedTrack:
         self._ensure_drain()
         self._upstream_ended += 1
         self._check_pending_done()
+
+    def _canonical_reset(self, wire) -> StreamResetCode:
+        """An upstream reset code by meaning, so each subscriber gets it
+        encoded for its own draft; unknown codes become INTERNAL_ERROR."""
+        up = _upstream_session(self)
+        prof = getattr(up, "_profile", None)
+        code = wire if prof is None else canonical_stream_reset(wire, prof)
+        try:
+            return StreamResetCode(code)
+        except ValueError:
+            return StreamResetCode.INTERNAL_ERROR
 
     def note_largest(self, location) -> None:
         """§10.2.11: Largest is the largest Location reported or seen."""
@@ -736,11 +761,9 @@ class _RelayedTrack:
             return
         if status == "RESET":
             stream_id, _header = entry
-            try:
-                code = StreamResetCode(shape or 0)
-            except ValueError:
-                code = StreamResetCode.INTERNAL_ERROR
-            session.stream_reset(stream_id, int(code))
+            if not isinstance(shape, StreamResetCode):
+                shape = StreamResetCode.INTERNAL_ERROR
+            session.stream_reset(stream_id, shape)
             self._streams.pop(skey, None)
             return
         if entry is None:
@@ -797,7 +820,9 @@ def _watch_session(session, ns=None) -> None:
     info = _sessions.get(id(session))
     if info is None:
         info = _sessions[id(session)] = {
-            "session": session, "since": time.time(), "ns": set()}
+            "session": session, "since": time.time(), "ns": set(),
+            "addr": None}
+        _background.add(asyncio.create_task(_log_peer(session, info)))
     if ns is not None:
         info["ns"].add(tuple(ns))
     if session in _watched:
@@ -814,6 +839,44 @@ def _watch_session(session, ns=None) -> None:
             logger.debug("relay: session closed, state released")
 
     asyncio.create_task(_reap())
+
+
+def _peer_address(session):
+    try:
+        return session.peer_address
+    except Exception:
+        return None
+
+
+def _addr_of(session):
+    """The session's (host, port), cached once known; None until then."""
+    info = _sessions.get(id(session))
+    if info is not None and info.get("addr"):
+        return info["addr"]
+    addr = _peer_address(session)
+    if addr and info is not None:
+        info["addr"] = addr
+    return addr
+
+
+async def _log_peer(session, info) -> None:
+    """Log a new session's full address once the transport reports it."""
+    try:
+        for _ in range(50):
+            addr = info.get("addr") or _peer_address(session)
+            if addr:
+                info["addr"] = addr
+                host, port = addr[0], addr[1]
+                if ":" in host:
+                    host = f"[{host}]"
+                logger.info(f"relay: session {_transport(session)} "
+                            f"d{_draft(session)} from {host}:{port}")
+                return
+            if not _session_live(session):
+                return
+            await asyncio.sleep(0.1)
+    finally:
+        _background.discard(asyncio.current_task())
 
 
 def _supersede_namespace(ns: tuple, session) -> None:
@@ -926,26 +989,127 @@ def _withdraw_namespace(session, request_id=None, ns=None) -> None:
                 f"{len(_announced.get(ns, {}))} publisher(s)")
 
 
-async def _establish_upstream(ns, track_name):
-    """Subscribe upstream once per Full Track Name and return the
-    fan-out, or None when no publisher accepts.
+def _upstream_refusal(err, profile, fetch=False) -> tuple:
+    """An upstream REQUEST_ERROR as (RequestErrorCode, reason), for the
+    downstream reply to encode in its own draft."""
+    code = canonical_request_error(err.error_code, profile, fetch=fetch)
+    if not isinstance(code, RequestErrorCode):
+        code = RequestErrorCode.INTERNAL_ERROR
+    return code, err.reason or "upstream error"
+
+
+class _Establishing:
+    """One upstream SUBSCRIBE in flight for a Full Track Name; every
+    subscriber arriving meanwhile awaits `fut` for (fan-out, refusal)."""
+
+    def __init__(self, key):
+        self.key = key
+        self.fut = asyncio.get_running_loop().create_future()
+        # The publisher session the SUBSCRIBE is outstanding on.
+        self.pub = None
+        # Forward State of each waiting subscriber.
+        self.forwards: list[bool] = []
+        self.task = None
+
+    def resolve(self, result) -> None:
+        if _establishing.get(self.key) is self:
+            del _establishing[self.key]
+        if not self.fut.done():
+            self.fut.set_result(result)
+
+
+async def _establish_upstream(ns, track_name, forward=True):
+    """Subscribe upstream once per Full Track Name. Returns (fan-out,
+    None), or (None, the last upstream refusal or None) when no
+    publisher accepts. Concurrent callers share one upstream SUBSCRIBE.
 
     Transport §"Relays": with no Established upstream subscription for
     the Track, the relay subscribes to each publisher that announced the
     subscription's namespace or a prefix of it.
     """
     key = (ns, track_name)
+    entry = _establishing.get(key)
+    if entry is None:
+        track = _tracks.get(key)
+        if track is not None:
+            # Reuse only a live upstream. A track cached from an earlier
+            # cycle points at a closed session, and attaching a new
+            # subscriber to it delivers nothing at all.
+            if _track_live(track):
+                return track, None
+            logger.info(f"relay: dropping stale track {key}")
+            track.close()
+            _tracks.pop(key, None)
+        entry = _Establishing(key)
+        _establishing[key] = entry
+        entry.task = asyncio.create_task(_subscribe_upstream(entry))
+    entry.forwards.append(bool(forward))
+    return await asyncio.shield(entry.fut)
+
+
+def _parked_publish(key):
+    """The live track a PUBLISH registered for `key`, else None."""
     track = _tracks.get(key)
-    if track is not None:
-        # Reuse only a live upstream. A track cached from an earlier
-        # cycle points at a closed session, and attaching a new
-        # subscriber to it delivers nothing at all.
-        if _track_live(track):
-            return track
-        logger.info(f"relay: dropping stale track {key}")
-        track.close()
-        _tracks.pop(key, None)
+    if (track is not None and _track_live(track)
+            and (track.pending_publish is not None
+                 or _is_session(track.upstream))):
+        return track
+    return None
+
+
+def _is_session(obj) -> bool:
+    return obj is not None and hasattr(obj, "_moqt_session_closed")
+
+
+def _duplicate_refusal(err, profile) -> bool:
+    """The publisher refused our SUBSCRIBE because it PUBLISHes the
+    track (§5.1); NOT_SUPPORTED from d20, which drops the code."""
+    code = canonical_request_error(err.error_code, profile)
+    if profile.param_table >= 20:
+        return code == RequestErrorCode.NOT_SUPPORTED
+    return code == RequestErrorCode.DUPLICATE_SUBSCRIPTION
+
+
+def _pending_subscribe_id(session, ns, track_name):
+    """Request ID of our newest SUBSCRIBE for the track on `session`."""
+    name = (track_name.encode() if isinstance(track_name, str)
+            else bytes(track_name))
+    for rid in sorted(getattr(session, "_subscriptions", {}), reverse=True):
+        msgs = session._subscriptions.get(rid) or ()
+        msg = msgs[0] if msgs else None
+        if (isinstance(msg, Subscribe) and msg.track_name == name
+                and tuple(msg.track_namespace) == tuple(ns)):
+            return rid
+    return None
+
+
+def _cancel_upstream_subscribe(session, ns, track_name) -> None:
+    rid = _pending_subscribe_id(session, ns, track_name)
+    if rid is None:
+        return
+    try:
+        session.unsubscribe(rid)
+    except Exception:
+        logger.debug("relay: cancelling the upstream SUBSCRIBE failed",
+                     exc_info=True)
+
+
+async def _subscribe_upstream(entry) -> None:
+    try:
+        result = await _subscribe_publishers(entry)
+    except Exception:
+        logger.exception(f"relay: upstream subscribe for {entry.key} failed")
+        result = (None, None)
+    entry.resolve(result)
+
+
+async def _subscribe_publishers(entry):
+    key = entry.key
+    ns, track_name = key
+    refusal = None
     for pub in _publishers_for(ns):
+        if entry.fut.done():
+            break
         track = _RelayedTrack(key)
         track.attaching = True
         name = (track_name.decode() if isinstance(track_name, bytes)
@@ -955,11 +1119,39 @@ async def _establish_upstream(ns, track_name):
             pub, ns, name,
             on_object=track.on_object,
             on_done=lambda done, t=track, k=key: _upstream_done(t, k, done))
+        entry.pub = pub
         try:
             await upstream.subscribe(timeout=10.0)
         except Exception as e:
+            if entry.fut.done():
+                break
             logger.info(f"relay: upstream subscribe failed on {ns}: {e}")
+            if not isinstance(e, MOQTRequestError):
+                continue
+            refusal = _upstream_refusal(e, pub._profile)
+            if _duplicate_refusal(e, pub._profile):
+                # Its PUBLISH of the track is on the way; _on_publish
+                # resolves the entry when it lands.
+                try:
+                    await asyncio.wait_for(asyncio.shield(entry.fut),
+                                           PUBLISH_WAIT_S)
+                except asyncio.TimeoutError:
+                    logger.info(f"relay: no PUBLISH of {key} within "
+                                f"{PUBLISH_WAIT_S}s of the refusal")
             continue
+        if entry.fut.done():
+            # A crossing PUBLISH took over; the SUBSCRIBE was cancelled.
+            if upstream.track_alias is not None:
+                pub.unregister_object_handler(upstream.track_alias)
+            break
+        parked = _parked_publish(key)
+        if parked is not None:
+            # A PUBLISH from another session landed meanwhile and owns
+            # the track: never overwrite it.
+            _cancel_upstream_subscribe(pub, ns, track_name)
+            if upstream.track_alias is not None:
+                pub.unregister_object_handler(upstream.track_alias)
+            return parked, None
         track.upstream = upstream
         track.upstream_alias = upstream.track_alias
         # §10.2.11: Largest includes what the upstream SUBSCRIBE_OK reports.
@@ -969,8 +1161,8 @@ async def _establish_upstream(ns, track_name):
         _tracks[key] = track
         logger.info(f"relay: upstream established ns={ns} track={name} "
                     f"alias={upstream.track_alias}")
-        return track
-    return None
+        return track, None
+    return None, refusal
 
 
 def _joined_subscription(session, request_id):
@@ -989,6 +1181,16 @@ def _subscribe_pending(session, request_id) -> bool:
     """The peer's SUBSCRIBE `request_id` is admitted and unanswered."""
     held = getattr(session, "_peer_requests", {}).get(request_id)
     return held is not None and held[0] is Subscribe
+
+
+def _still_wanted(session, request_id) -> bool:
+    """False once the subscriber cancelled the request or closed; no
+    reply is sent then."""
+    if not _session_live(session):
+        return False
+    if not is_draft16_or_later(session.negotiated_draft):
+        return True
+    return _subscribe_pending(session, request_id)
 
 
 async def _await_joined(session, request_id):
@@ -1081,6 +1283,15 @@ async def _on_publish(session, msg):
     if track is not None:
         owner = _upstream_session(track) or (
             track.pending_publish[0] if track.pending_publish else None)
+        if (owner is session and not track.finished
+                and not _is_session(track.upstream)
+                and track.upstream is not None):
+            # §5.1: our SUBSCRIBE already holds this session's
+            # subscription to the track.
+            logger.info(f"relay: publish {key} -> DUPLICATE_SUBSCRIPTION "
+                        f"(upstream subscription established)")
+            _refuse_publish(session, msg, "track already subscribed")
+            return
         if track.finished or owner is not session:
             # One publisher per Full Track Name. The predecessor's
             # close may not have been observed yet, and reusing its
@@ -1093,6 +1304,15 @@ async def _on_publish(session, msg):
     if track is None:
         track = _RelayedTrack(key)
         _tracks[key] = track
+    entry = _establishing.get(key)
+    crossing = (entry is not None and entry.pub is session
+                and not entry.fut.done())
+    if crossing:
+        # §5.1: this PUBLISH crossed our SUBSCRIBE on the same session;
+        # end the SUBSCRIBE and serve the waiters from the PUBLISH.
+        logger.info(f"relay: publish {key} crossed our upstream SUBSCRIBE; "
+                    f"cancelling it")
+        _cancel_upstream_subscribe(session, ns, msg.track_name)
     _watch_session(session, ns)
     track.pending_publish = (session, msg)
     # §9.4: a bare PUBLISH is the only notice d18 prefix subscribers get
@@ -1106,6 +1326,10 @@ async def _on_publish(session, msg):
             offered = True
             asyncio.create_task(
                 _offer_track(sub_session, track, key))
+    if crossing:
+        _answer_publish(track, forward=any(entry.forwards))
+        entry.resolve((track, None))
+        return
     if track.downstream or not offered:
         # With nobody to offer this track to, no reply is coming from
         # anywhere: answer now rather than hold. A publisher that
@@ -1119,13 +1343,14 @@ def _forwarding(track) -> bool:
     return any(d.forward for d in track.downstream)
 
 
-def _answer_publish(track) -> None:
+def _answer_publish(track, forward=None) -> None:
     """Answer a held PUBLISH and start taking objects: Forward State 1
     when a subscriber forwards (§9.5), else 0 until one does."""
     if track.pending_publish is None or track.upstream is not None:
         return
     session, msg = track.pending_publish
-    forward = _forwarding(track)
+    if forward is None:
+        forward = _forwarding(track)
     session._track_aliases[msg.track_alias] = msg.request_id
     session.register_object_handler(msg.track_alias, track.on_object)
     session.register_stream_end_handler(msg.track_alias, track.on_stream_end)
@@ -1143,6 +1368,22 @@ def _answer_publish(track) -> None:
     track.upstream_request_id = msg.request_id
     track.parked = None if forward else (session, msg)
     track.pending_publish = None
+
+
+def _refuse_publish(session, msg, reason) -> None:
+    """DUPLICATE_SUBSCRIPTION for a PUBLISH (NOT_SUPPORTED from d20,
+    PUBLISH_ERROR at d14)."""
+    prof = session._profile
+    code = (RequestErrorCode.NOT_SUPPORTED if prof.param_table >= 20
+            else RequestErrorCode.DUPLICATE_SUBSCRIPTION)
+    if is_draft16_or_later(session.negotiated_draft):
+        session.subscribe_error(msg.request_id, error_code=code,
+                                reason=reason)
+        return
+    reply = PublishError(request_id=msg.request_id,
+                         error_code=request_error_code(code, prof),
+                         reason=reason)
+    session.send_control_message(reply)
 
 
 def _resume_parked_publish(track) -> None:
@@ -1210,12 +1451,10 @@ def _attach_subscriber(session, msg, track) -> bool:
                             msg.start_object, msg.end_group, track.largest)
     if (window[1] is not None and track.largest is not None
             and track.largest[0] > window[1]):
-        code = (RequestErrorCode.INVALID_RANGE
-                if is_draft16_or_later(session.negotiated_draft)
-                else SubscribeErrorCode.INVALID_RANGE)
         logger.info(f"relay: subscribe {track.key} -> INVALID_RANGE "
                     f"(end group {window[1]}, largest {track.largest})")
-        session.subscribe_error(msg.request_id, error_code=int(code),
+        session.subscribe_error(msg.request_id,
+                                error_code=RequestErrorCode.INVALID_RANGE,
                                 reason="end group already published")
         track.attaching = False
         track._ensure_drain()
@@ -1285,18 +1524,13 @@ async def _on_subscribe(session, msg):
         logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
                     f"held up to {wait_s:.3f}s for a publisher")
         if not await _await_publisher(session, ns, msg.track_name, wait_s):
-            if not _session_live(session):
+            if not _still_wanted(session, msg.request_id):
                 return
             logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
                         f"-> ERROR (rendezvous timeout)")
-            err = RequestError(
-                request_id=msg.request_id,
-                error_code=int(RequestErrorCode.TIMEOUT),
-                retry_interval=0,
-                reason="no publisher within the rendezvous timeout",
-            )
-            logger.info(f"MOQT send: {err}")
-            session._send_reply(msg.request_id, err, fin=True)
+            session.subscribe_error(
+                msg.request_id, error_code=RequestErrorCode.TIMEOUT,
+                reason="no publisher within the rendezvous timeout")
             return
 
     # Flow B first: a track already offered by PUBLISH is served from
@@ -1323,39 +1557,37 @@ async def _on_subscribe(session, msg):
     # fails every request a back-to-back test suite makes.
     if not _announced_match(ns) and not _upstreams and _upstream_urls:
         await _await_upstream()
+    why = "not announced"
     if _announced_match(ns) or _upstreams:
-        track = await _establish_upstream(ns, msg.track_name)
+        forward = msg.forward is None or bool(msg.forward)
+        track, refusal = await _establish_upstream(ns, msg.track_name,
+                                                   forward=forward)
+        if not _still_wanted(session, msg.request_id):
+            logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
+                        f"cancelled before its reply")
+            return
         if track is not None:
             if _attach_subscriber(session, msg, track):
+                _answer_publish(track)
+                _resume_parked_publish(track)
                 logger.info(f"relay: subscribe ns={ns} "
                             f"track={msg.track_name} -> SUBSCRIBE_OK "
                             f"(fanout={len(track.downstream)})")
             return
-        # Announced but no publisher served it. Answer honestly rather
-        # than acking a track that will never deliver.
-        logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
-                    f"-> ERROR (no upstream)")
+        if refusal is not None:
+            # The publisher's own answer, in this subscriber's draft.
+            code, reason = refusal
+            logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
+                        f"-> {code.name} (upstream: {reason})")
+            session.subscribe_error(msg.request_id, error_code=code,
+                                    reason=reason)
+            return
+        why = "no publisher served it"
     logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
-                f"-> ERROR (not announced)")
-    # On d16+ the universal REQUEST_ERROR (0x05) carries the not-found
-    # code (0x10). On d14 the legacy SUBSCRIBE_ERROR (0x05) carries
-    # TRACK_DOES_NOT_EXIST (0x04). Send the right shape per version.
-    if is_draft16_or_later(session.negotiated_draft):
-        err = RequestError(
-            request_id=msg.request_id,
-            error_code=int(RequestErrorCode.DOES_NOT_EXIST),
-            retry_interval=0,
-            reason="track does not exist",
-        )
-        logger.info(f"MOQT send: {err}")
-        # Reply returns on the SUBSCRIBE's own bidi stream at d18.
-        session._send_reply(msg.request_id, err, fin=True)
-    else:
-        session.subscribe_error(
-            request_id=msg.request_id,
-            error_code=int(SubscribeErrorCode.TRACK_DOES_NOT_EXIST),
-            reason="track does not exist",
-        )
+                f"-> DOES_NOT_EXIST ({why})")
+    session.subscribe_error(msg.request_id,
+                            error_code=RequestErrorCode.DOES_NOT_EXIST,
+                            reason="track does not exist")
 
 
 def _find_default_cert():
@@ -1434,6 +1666,11 @@ def parse_args():
                              f"{STATUS_INTERVAL_S:g}s for the dashboard: "
                              "namespaces, tracks, subscribers, bandwidth, "
                              "host metrics. Off by default.")
+    parser.add_argument("--log-dir", type=str, default=None, metavar="DIR",
+                        help="Also log to DIR/relay.log (rotated, "
+                             f"{LOG_FILE_BYTES >> 20} MB x {LOG_FILE_BACKUPS}) "
+                             "and send crash and stall dumps to "
+                             "DIR/crash.log. Off by default.")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug logging")
     return parser.parse_args()
@@ -1527,13 +1764,32 @@ def _install_fetch_sink(pub) -> None:
     pub.on_fetch_object = _on
 
 
+# Relay-wide FETCH payload bytes by source, including tracks with no state.
+_fetch_bytes = {"cache": 0, "upstream": 0}
+
+
+def _counted_fetch(objs, track, source):
+    """FetchObjects for serve_fetch(); each payload is counted once the
+    next is asked for, i.e. written with the FETCH not cancelled."""
+    for gid, sgid, oid, payload, exts, prio, status in objs:
+        payload = payload or b""
+        yield FetchObject(group_id=gid, subgroup_id=sgid, object_id=oid,
+                          publisher_priority=prio, extensions=exts,
+                          payload=payload, status=status)
+        _fetch_bytes[source] += len(payload)
+        if track is not None:
+            track._fetch_bytes[source] += len(payload)
+
+
 async def _fetch_upstream(ns, track_name, msg):
     """Ask each publisher of `ns` for the requested range. Returns its
-    FETCH_OK and the objects, or (None, None) when nobody serves it —
+    FETCH_OK, the objects and None, or (None, None, the last upstream
+    refusal or None) when nobody serves it —
     the relay keeps only recent objects, so a historical range has to
     come from the origin."""
     name = (track_name.decode() if isinstance(track_name, bytes)
             else track_name)
+    refusal = None
     for pub in _publishers_for(ns):
         _install_fetch_sink(pub)
         req = pub.fetch(
@@ -1553,13 +1809,15 @@ async def _fetch_upstream(ns, track_name, msg):
         except (MOQTRequestError, asyncio.TimeoutError) as e:
             logger.info(f"relay: upstream FETCH declined on {ns}: {e}")
             _fetch_sinks.pop(key, None)
+            if isinstance(e, MOQTRequestError):
+                refusal = _upstream_refusal(e, pub._profile, fetch=True)
             continue
         objs = _fetch_sinks.pop(key, [])
         logger.info(f"relay: upstream FETCH {ns}/{name} -> "
                     f"{len(objs)} object(s) end_of_track="
                     f"{getattr(ok, 'end_of_track', 0)}")
-        return ok, objs
-    return None, None
+        return ok, objs, None
+    return None, None, refusal
 
 
 async def _on_fetch(session, msg):
@@ -1580,7 +1838,7 @@ async def _on_fetch(session, msg):
                         f"{msg.joining_request_id}")
             session.fetch_error(
                 request_id=msg.request_id,
-                error_code=int(RequestErrorCode.INVALID_JOINING_REQUEST_ID),
+                error_code=RequestErrorCode.INVALID_JOINING_REQUEST_ID,
                 reason="no such subscription")
             return
         key, track, d = found
@@ -1592,7 +1850,7 @@ async def _on_fetch(session, msg):
                         f"(forward={int(d.forward)})")
             session.fetch_error(
                 request_id=msg.request_id,
-                error_code=int(RequestErrorCode.INVALID_RANGE),
+                error_code=RequestErrorCode.INVALID_RANGE,
                 reason="subscription has no largest object")
             return
         start_group = int(msg.joining_start or 0)
@@ -1611,6 +1869,7 @@ async def _on_fetch(session, msg):
     have_cache = (track is not None and _track_live(track)
                   and track.cache_covers(start))
     objs = track.cached_range(start, end) if have_cache else []
+    source = "cache"
     end_of_track = 0
     if objs and objs[-1][6] == ObjectStatus.END_OF_TRACK:
         end_of_track = 1
@@ -1618,25 +1877,33 @@ async def _on_fetch(session, msg):
         # Only recent objects are held, so a historical range comes from
         # the publisher — which is also the only path for a track this
         # relay has never subscribed to.
-        up_ok, upstream = await _fetch_upstream(ns, track_name, msg)
+        up_ok, upstream, refusal = await _fetch_upstream(ns, track_name, msg)
+        if upstream is None and refusal is not None:
+            code, reason = refusal
+            logger.info(f"relay: FETCH ns={ns} track={track_name} "
+                        f"-> {code.name} (upstream: {reason})")
+            session.fetch_error(request_id=msg.request_id, error_code=code,
+                                reason=reason)
+            return
         if upstream is None:
             logger.info(f"relay: FETCH ns={ns} track={track_name} "
                         f"-> DOES_NOT_EXIST")
             session.fetch_error(
                 request_id=msg.request_id,
-                error_code=int(RequestErrorCode.DOES_NOT_EXIST),
+                error_code=RequestErrorCode.DOES_NOT_EXIST,
                 reason="track does not exist")
             return
         if not upstream:
             session.fetch_error(
                 request_id=msg.request_id,
-                error_code=int(RequestErrorCode.INVALID_RANGE),
+                error_code=RequestErrorCode.INVALID_RANGE,
                 reason="requested range unavailable")
             return
         objs = [(o.group_id, o.subgroup_id, o.object_id, o.payload,
                  o.extensions, o.publisher_priority, o.status)
                 for o in upstream]
         end_of_track = int(getattr(up_ok, 'end_of_track', 0) or 0)
+        source = "upstream"
     if track is not None:
         track._fetches += 1
     if track_name == CATALOG_TRACK:
@@ -1655,12 +1922,7 @@ async def _on_fetch(session, msg):
     if int(order) == int(GroupOrder.DESCENDING):
         objs = sorted(objs, key=lambda o: (-o[0], o[2]))
     await session.serve_fetch(
-        msg.request_id,
-        (FetchObject(group_id=gid, subgroup_id=sgid, object_id=oid,
-                     publisher_priority=prio,
-                     extensions=exts, payload=payload or b"",
-                     status=status)
-         for gid, sgid, oid, payload, exts, prio, status in objs),
+        msg.request_id, _counted_fetch(objs, track, source),
         group_order=int(order))
     logger.info(f"relay: FETCH ns={ns} track={track_name} served "
                 f"{len(objs)} object(s) {start}..({last_g}.{last_o})")
@@ -1776,7 +2038,8 @@ async def _on_track_status(session, msg):
                     f"-> DOES_NOT_EXIST")
         err = RequestError(
             request_id=msg.request_id,
-            error_code=int(RequestErrorCode.DOES_NOT_EXIST),
+            error_code=request_error_code(RequestErrorCode.DOES_NOT_EXIST,
+                                          session._profile),
             retry_interval=0,
             reason="track not served here",
         )
@@ -1943,7 +2206,8 @@ async def _heartbeat(stall_s: float) -> None:
     so an event loop stuck past `stall_s` — in Python or in native code —
     gets every thread's stack dumped and the process exited."""
     while True:
-        faulthandler.dump_traceback_later(stall_s, exit=True)
+        faulthandler.dump_traceback_later(
+            stall_s, exit=True, file=_crash_file or sys.stderr)
         await asyncio.sleep(min(1.0, stall_s / 4))
 
 
@@ -2130,6 +2394,13 @@ TRACK_HISTORY_MAX = 24
 TRACK_SUBSCRIBERS_MAX = 50
 
 
+def _cache_efficiency():
+    """Share of FETCH payload bytes served from the cache; None before any."""
+    cache, upstream = _fetch_bytes["cache"], _fetch_bytes["upstream"]
+    total = cache + upstream
+    return round(cache / total, 4) if total else None
+
+
 class _Status:
     """The dashboard's status.json and platform.json, rewritten every
     STATUS_INTERVAL_S."""
@@ -2219,6 +2490,7 @@ class _Status:
                 r = rtt_ms(d.session)
                 listed.append({
                     "transport": _transport(d.session), "draft": _draft(d.session),
+                    "addr": relay_status.mask_addr(_addr_of(d.session)),
                     "rtt_ms": None if r is None else round(r, 1),
                     "forward": bool(d.forward),
                     "since": info["since"] if info else None})
@@ -2234,6 +2506,8 @@ class _Status:
                 "bytes_in": t._bytes_in, "bytes_out": t._bytes_out,
                 "objects_in": t._objects_in, "objects_out": t._objects_out,
                 "fetches": t._fetches, "drops": t._drops,
+                "fetch_cache_bytes": t._fetch_bytes["cache"],
+                "fetch_upstream_bytes": t._fetch_bytes["upstream"],
                 "groups_in": t._groups_in,
                 "groups_per_s": per_s(t._groups_in - p_grp),
                 "objects_per_s": per_s(t._objects_in - p_obj),
@@ -2248,6 +2522,8 @@ class _Status:
                 "state": _track_state(t, t._bytes_in > p_in),
                 "origin": (f"{_transport(owner)} d{_draft(owner)}"
                            if owner is not None else None),
+                "origin_addr": (relay_status.mask_addr(_addr_of(owner))
+                                if owner is not None else None),
                 "since": t.created,
             }))
         self._track_prev = prev
@@ -2261,6 +2537,8 @@ class _Status:
                 "namespace": _ns_str(ns), "announced": bool(holders),
                 "origin": (f"{_transport(holders[-1])} d{_draft(holders[-1])}"
                            if holders else None),
+                "origin_addr": (relay_status.mask_addr(_addr_of(holders[-1]))
+                                if holders else None),
                 "tracks": 0, "subscribers": 0, "in_bps": 0, "out_bps": 0,
                 "bytes_out": 0, "format": entry[0] if entry else None,
             }
@@ -2273,7 +2551,9 @@ class _Status:
             sp["in_bps"] += row["in_bps"] or 0
             sp["out_bps"] += row["out_bps"] or 0
             sp["bytes_out"] += row["bytes_out"]
-            sp["origin"] = sp["origin"] or row["origin"]
+            if sp["origin"] is None:
+                sp["origin"] = row["origin"]
+                sp["origin_addr"] = row["origin_addr"]
         self._ns_peak = {ns: max(self._ns_peak.get(ns, 0), sp["subscribers"])
                          for ns, sp in spaces.items()}
         for ns, sp in spaces.items():
@@ -2303,6 +2583,7 @@ class _Status:
                             if id(s) in ids)
             sessions.append({
                 "transport": _transport(s), "draft": _draft(s),
+                "addr": relay_status.mask_addr(_addr_of(s)),
                 "role": role or None, "since": info["since"],
                 "rtt_ms": round(rtt, 1) if rtt is not None else None,
                 "tx_bps": bps(d[0]) if last is not None else None,
@@ -2334,6 +2615,9 @@ class _Status:
                            if media_out else None),
             "delivered_bytes": self._delivered, "drops": self._drops,
             "fetches": sum(r["fetches"] for _, r in tracks),
+            "fetch_cache_bytes": _fetch_bytes["cache"],
+            "fetch_upstream_bytes": _fetch_bytes["upstream"],
+            "cache_efficiency": _cache_efficiency(),
             "loss_pct": round(100 * lost / sent, 2) if sent else 0.0,
             "rtt_p50_ms": relay_status.percentile(rtts, 50),
             "rtt_p99_ms": relay_status.percentile(rtts, 99),
@@ -2448,6 +2732,85 @@ class _Status:
         }
 
 
+# --log-dir: relay.log rotation, and the root logger's format.
+LOG_FILE_BYTES = 10 * 1024 * 1024
+LOG_FILE_BACKUPS = 4
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+# faulthandler's target with --log-dir (crash.log); stderr otherwise.
+_crash_file = None
+
+
+class _LogFile(RotatingFileHandler):
+    """relay.log; mode 0644 across rotations for a read-only reader."""
+
+    def _open(self):
+        stream = super()._open()
+        os.chmod(self.baseFilename, 0o644)
+        return stream
+
+
+class _MirrorFormatter(logging.Formatter):
+    """Each record as stderr shows it: aiomoqt loggers have their own
+    handler and format, everything else goes through the root's."""
+
+    def __init__(self, aiomoqt_formatter):
+        super().__init__(LOG_FORMAT)
+        self.aiomoqt = aiomoqt_formatter
+
+    def format(self, record):
+        if not logging.getLogger(record.name).propagate:
+            return self.aiomoqt.format(record)
+        return super().format(record)
+
+
+class _Tee(logging.Handler):
+    """Hands each record to several handlers."""
+
+    def __init__(self, *targets):
+        super().__init__()
+        self.targets = targets
+
+    def handle(self, record):
+        for target in self.targets:
+            target.handle(record)
+        return True
+
+    def emit(self, record):
+        pass
+
+
+def _versions_line() -> str:
+    v = relay_status.versions()
+    return f"aiomoqt {v['aiomoqt']} aiopquic {v['aiopquic']}"
+
+
+def _start_log_dir(log_dir: str) -> None:
+    """DIR/relay.log: the stderr log, rotated. DIR/crash.log: a start
+    line, then faulthandler's crash and stall dumps (it takes one file,
+    so they no longer reach stderr)."""
+    global _crash_file
+    os.makedirs(log_dir, exist_ok=True)
+    os.chmod(log_dir, 0o755)
+    shown = logger.handlers[0] if logger.handlers else None
+    log_file = _LogFile(os.path.join(log_dir, "relay.log"),
+                        maxBytes=LOG_FILE_BYTES, backupCount=LOG_FILE_BACKUPS)
+    log_file.setFormatter(_MirrorFormatter(
+        shown.formatter if shown is not None and shown.formatter
+        else logging.Formatter(LOG_FORMAT)))
+    logging.getLogger().addHandler(log_file)
+    set_log_handler(_Tee(shown, log_file) if shown is not None else log_file)
+
+    path = os.path.join(log_dir, "crash.log")
+    _crash_file = open(path, "a")
+    os.chmod(path, 0o644)
+    now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+    _crash_file.write(f"relay: start {now.isoformat(timespec='seconds')}Z "
+                      f"pid {os.getpid()} {_versions_line()}\n")
+    _crash_file.flush()
+    faulthandler.enable(file=_crash_file, all_threads=True)
+    logger.info(f"relay: crash and stall dumps go to {path}")
+
+
 async def main():
     args = parse_args()
     speaks = sorted(int(d) for d in MOQTDraft)
@@ -2459,8 +2822,11 @@ async def main():
     set_log_level(log_level)
     logging.basicConfig(
         level=log_level, stream=sys.stderr,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        format=LOG_FORMAT,
     )
+    if args.log_dir:
+        _start_log_dir(args.log_dir)
+    logger.info(f"relay: start {_versions_line()} pid {os.getpid()}")
     print("aiomoqt ERSATZ-RELAY: an API demonstrator and conformance "
           "SUT — not a production relay (no auth, no hardening).",
           file=sys.stderr)

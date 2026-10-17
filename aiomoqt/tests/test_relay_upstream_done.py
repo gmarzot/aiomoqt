@@ -104,8 +104,8 @@ async def test_a_track_that_ends_while_its_subscriber_attaches_reaches_it(
     # The subscriber attaches after the whole 150 ms track has ended.
     establish = relay._establish_upstream
 
-    async def late(ns, track_name):
-        track = await establish(ns, track_name)
+    async def late(ns, track_name, **kw):
+        track = await establish(ns, track_name, **kw)
         await asyncio.sleep(0.2)
         return track
 

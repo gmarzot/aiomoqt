@@ -275,3 +275,13 @@ def stream_reset_code(code: int, profile: DraftProfile) -> int:
     if not isinstance(code, StreamResetCode):
         return int(code)
     return _STREAM_RESETS[profile.error_table].get(code, 0)
+
+
+def canonical_stream_reset(wire: int, profile: DraftProfile) -> int:
+    """The StreamResetCode a received RESET_STREAM / STOP_SENDING code
+    means at this draft; a code the draft does not define comes back
+    unchanged."""
+    for canonical, value in _STREAM_RESETS[profile.error_table].items():
+        if value == wire:
+            return canonical
+    return wire
