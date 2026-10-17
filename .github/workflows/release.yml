@@ -208,17 +208,21 @@ jobs:
         registry: ghcr.io
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
     - name: Build and push Docker image
       run: |
         VERSION="${{ needs.tag.outputs.version }}"
         IMAGE=ghcr.io/${{ github.repository }}
-        docker build --build-arg VERSION="$VERSION" -t "$IMAGE:$VERSION" .
-        docker push "$IMAGE:$VERSION"
+        TAGS=(-t "$IMAGE:$VERSION")
         # :latest tracks stable only. Interop CI and the runner pull it,
         # so a pre-release must not become everyone's default image.
         if [[ "$VERSION" =~ (a|b|rc)[0-9]+$ ]]; then
           echo "pre-release $VERSION — leaving :latest untouched"
-          exit 0
+        else
+          TAGS+=(-t "$IMAGE:latest")
         fi
-        docker tag "$IMAGE:$VERSION" "$IMAGE:latest"
-        docker push "$IMAGE:latest"
+        docker buildx build --platform linux/amd64,linux/arm64 \
+          --build-arg VERSION="$VERSION" "${TAGS[@]}" --push .
