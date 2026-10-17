@@ -136,8 +136,11 @@ function renderTiles(s) {
   const groups = s.tracks.reduce((n, r) => n + (r.groups_per_s || 0), 0);
   setTile('publishers', fmt.num(T.publishers), pubs.transports || 'publishing sessions',
           pubList.length ? `By draft: ${pubs.drafts}` : 'No publishing sessions');
-  setTile('subscribers', fmt.num(T.subscribers),
-          `${fmt.plural(subList.length, 'session')} · peak ${fmt.num(T.subscribers_peak)}`,
+  // A viewer counts once; without totals.subscriptions, count sub-role sessions.
+  const subscriptions = T.subscriptions ?? T.subscribers;
+  const viewers = none(T.subscriptions) ? subList.length : T.subscribers;
+  setTile('subscribers', fmt.num(viewers),
+          `${fmt.plural(subscriptions, 'subscription')} · peak ${fmt.num(T.subscribers_peak)}`,
           subList.length ? `${subs.transports}; by draft: ${subs.drafts}` : 'No subscribing sessions');
   setTile('namespaces', fmt.num(T.namespaces), playable ? `${playable} playable` : '');
   setTile('tracks', fmt.num(T.tracks), `${fmt.num(live)} live`);
