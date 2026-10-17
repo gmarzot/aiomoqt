@@ -11,14 +11,14 @@ from enum import IntEnum
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 from ..context import DraftProfile
-from ..types import D18_PARAM_KINDS, D18_PARAM_SCOPE, MOQTProtocolViolation
+from ..types import D18_PARAM_KINDS, D18_PARAM_SCOPE, MOQTProtocolViolation, ParamType
 from ..utils.buffer import Buffer, BufferReadError
 
 __all__ = [
     'D20ParamType', 'D20RequestErrorCode', 'LocationFilterType',
     'LocationFilter', 'RangeFilter', 'param_kinds', 'param_scope',
     'uses_location_filter', 'check_param_scope', 'range_filter_error',
-    'range_filter_count', 'fill_range',
+    'range_filter_count', 'fill_range', 'param_name',
 ]
 
 U64_MAX = (1 << 64) - 1
@@ -126,6 +126,40 @@ REPEATABLE = frozenset({0x03}) | RANGE_FILTERS
 
 # Restricted values, closed with PROTOCOL_VIOLATION (§10.2.18, §10.2.21).
 VALUE_RANGES = {0x35: (0, 1)}
+
+
+# Message Parameter names from d18 (§15.7); earlier drafts use ParamType.
+_D18_NAMES: Dict[int, str] = {
+    0x02: "OBJECT_DELIVERY_TIMEOUT",
+    0x03: "AUTHORIZATION_TOKEN",
+    0x04: "RENDEZVOUS_TIMEOUT",
+    0x06: "SUBGROUP_DELIVERY_TIMEOUT",
+    0x08: "EXPIRES",
+    0x09: "LARGEST_OBJECT",
+    0x0A: "FILL_TIMEOUT",
+    0x10: "FORWARD",
+    0x20: "SUBSCRIBER_PRIORITY",
+    0x21: "SUBSCRIPTION_FILTER",
+    0x22: "GROUP_ORDER",
+    0x32: "NEW_GROUP_REQUEST",
+    0x34: "TRACK_NAMESPACE_PREFIX",
+}
+_D20_NAMES: Dict[int, str] = {**_D18_NAMES,
+                              **{int(p): p.name for p in D20ParamType}}
+_NAMES = {18: _D18_NAMES, 20: _D20_NAMES, 22: _D20_NAMES}
+
+
+def param_name(ptype: int, prof: Optional[DraftProfile] = None) -> str:
+    """Display name of a Message Parameter at `prof`'s draft (ParamType
+    names when None or pre-d18); hex when the draft defines none."""
+    if prof is not None and prof.vi64:
+        name = _NAMES[prof.param_table].get(ptype)
+    else:
+        try:
+            name = ParamType(ptype).name
+        except ValueError:
+            name = None
+    return name or f"0x{ptype:02x}"
 
 
 def param_kinds(prof: DraftProfile) -> Dict[int, str]:

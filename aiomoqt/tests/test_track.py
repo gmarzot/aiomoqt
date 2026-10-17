@@ -105,6 +105,7 @@ class TestPublishedTrack:
             return pub_response
         session.publish = MagicMock(side_effect=publish)
         session.register_handler = MagicMock()
+        session._peer_subscribed = MagicMock(return_value=False)
         return session
 
     # ----- Flow B: bare PUBLISH (default) -----

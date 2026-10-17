@@ -797,6 +797,9 @@ class PublishedTrack(Track):
             carrying forward=1. 1: objects start immediately after
             PUBLISH, before PUBLISH_OK; the peer's PUBLISH_OK or a later
             update may set forward=0, which pauses emission.
+
+        A track the peer already subscribes to on this session sends no
+        PUBLISH: that subscription serves it (§5.1).
         """
         if not (announce_namespace or publish_track):
             raise ValueError(
@@ -821,6 +824,14 @@ class PublishedTrack(Track):
             )
             sub.state = TrackState.ANNOUNCED
             logger.info(f"Track: announced namespace '{self.namespace}'")
+
+        if publish_track and (sub.subscribe_request_id in sub.subscribers
+                              or sess._peer_subscribed(self)):
+            # §5.1: one publisher-role subscription per track; the peer's
+            # SUBSCRIBE already serves it.
+            logger.info(f"Track: {self.fqtn} already subscribed by the "
+                        f"peer, no PUBLISH")
+            publish_track = False
 
         if publish_track:
             pub_msg = sess.publish(
@@ -940,6 +951,8 @@ class PublishedTrack(Track):
         off the generator); forward=0 pauses object emission."""
         sub = self._sub_for(session)
         logger.info(f"Track: PUBLISH_OK: forward={msg.forward}")
+        if self._held_by_subscribe(sub, msg.request_id):
+            return
         sub.take_timeouts(getattr(msg, 'parameters', None), session._profile)
         self._set_forward(sub, msg.forward)
         if sub.forward:
@@ -953,6 +966,10 @@ class PublishedTrack(Track):
             reply = await sub.session._await_response(request_id)
         except MOQTRequestError as e:
             logger.info(f"Track: PUBLISH rejected: {e}")
+            if e.response is not None:
+                sub.session._unbind_request(request_id)
+            return
+        if self._held_by_subscribe(sub, request_id):
             return
         forward = getattr(reply, 'forward', None)
         if forward is None:
@@ -964,6 +981,18 @@ class PublishedTrack(Track):
         self._set_forward(sub, forward)
         if sub.forward:
             await self._start_generating(sub.session, "PUBLISH_OK")
+
+    @staticmethod
+    def _held_by_subscribe(sub, request_id) -> bool:
+        """True when a live SUBSCRIBE, not PUBLISH `request_id`, holds the
+        peer's subscription; the PUBLISH reply then changes nothing."""
+        held = (sub.subscribe_request_id in sub.subscribers
+                and sub.subscribe_request_id != request_id)
+        if held:
+            logger.info(f"Track: reply to PUBLISH {request_id} ignored: "
+                        f"SUBSCRIBE {sub.subscribe_request_id} holds the "
+                        f"subscription")
+        return held
 
     async def _on_request_update(self, session, msg: RequestUpdate):
         """REQUEST_UPDATE — subscriber changes forward state."""

@@ -1,5 +1,5 @@
 """Session-level request admission (d16+): reserved namespaces (d18
-§3.2.1-2), a duplicate subscription or one crossing our pending PUBLISH
+§3.2.1-2), a duplicate subscription or one crossing our PUBLISH
 (§5.1), and an overlapping namespace prefix, created or moved by an update
 (§10.18-19, §10.9.2), are refused with REQUEST_ERROR before the
 application sees the request."""
@@ -34,6 +34,7 @@ def _session(draft):
     s._pending_requests = {}
     s._bidi_streams = {}
     s.negotiated_draft = draft
+    s.is_client = True
     s._profile = profile_for(draft)
     s._request_cancel_handlers = {}
     s._publish_done_handlers = {}
@@ -123,7 +124,7 @@ async def test_d18_subscribe_tracks_overlap_space_is_independent():
         == RequestErrorCode.PREFIX_OVERLAP
 
 
-async def test_a_subscribe_crossing_our_pending_publish_is_a_duplicate():
+async def test_a_subscribe_crossing_our_publish_is_a_duplicate():
     s = _session(18)
     track = object()
     s._published_tracks[((b"a",), b"t")] = track
@@ -131,7 +132,9 @@ async def test_a_subscribe_crossing_our_pending_publish_is_a_duplicate():
     s._pending_requests[0] = asyncio.get_running_loop().create_future()
     assert await _refused(s, _sub(1)) == RequestErrorCode.DUPLICATE_SUBSCRIPTION
     s._pending_requests[0].set_result(None)            # the PUBLISH answered
-    assert await _refused(s, _sub(3)) is None
+    assert await _refused(s, _sub(3)) == RequestErrorCode.DUPLICATE_SUBSCRIPTION
+    s._unbind_request(0)                               # the PUBLISH ended
+    assert await _refused(s, _sub(5)) is None
 
 
 def _prefix_update(rid, existing, prefix):
@@ -261,9 +264,9 @@ async def test_session_namespace_never_reaches_an_app_handler():
 
 @requires_certs
 @pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
-async def test_a_subscribe_crossing_an_unanswered_publish_is_refused(use_quic):
-    # Two tracks on one session: only the one whose PUBLISH awaits its
-    # reply refuses the crossing SUBSCRIBE (§5.1).
+async def test_a_subscribe_crossing_a_publish_is_refused(use_quic):
+    # Two tracks on one session: a PUBLISH Pending or Established refuses
+    # the crossing SUBSCRIBE (§5.1).
     port = _BASE_PORT + 40 + (not use_quic)
     publishes: asyncio.Queue = asyncio.Queue()
 
@@ -293,7 +296,9 @@ async def test_a_subscribe_crossing_an_unanswered_publish_is_refused(use_quic):
             assert await _error_code(rx.subscribe(
                 _NS, "video", forward=1, wait_response=True)) \
                 == RequestErrorCode.DUPLICATE_SUBSCRIPTION
-            await rx.subscribe(_NS, "audio", forward=1, wait_response=True)
+            assert await _error_code(rx.subscribe(
+                _NS, "audio", forward=1, wait_response=True)) \
+                == RequestErrorCode.DUPLICATE_SUBSCRIPTION
             assert pub._close_err is None and rx._close_err is None
     finally:
         quic_server.close()

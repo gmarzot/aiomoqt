@@ -6,6 +6,7 @@
   pressure, memory, disks, interfaces, UDP, the relay's socket and process) and per-track
   history and subscriber lists in `status.json`.
 - Requires aiopquic >= 0.5.0rc1.
+- One publisher-role subscription per track per session: `publish()` sends no PUBLISH for a track the peer already subscribes to, a SUBSCRIBE crossing our established PUBLISH is refused (DUPLICATE_SUBSCRIPTION; NOT_SUPPORTED from d20), and a PUBLISH reply never changes a SUBSCRIBE's state.
 - load_sim fails a group that subscribed but received no objects (`<< NO OBJECTS`) and prints exact `Total objects:` / `Total bytes:`.
 - Interop tier: relay-pub-sub fails on zero or missing `Total objects:`.
 - Bench workers with `--logdir` write aiomoqt logging to their per-process files (DEBUG with `-d`).
@@ -30,6 +31,14 @@
 - `PublishedTrack(immutable_properties=)`: sent as Immutable Properties (0x0B) in PUBLISH, SUBSCRIBE_OK, FETCH_OK and the TRACK_STATUS reply (d16+); `publish()` and `subscribe_ok()` take `track_properties`.
 - `moq_interop_client.run_tests`: removed the unreachable auto-offer draft-14 fallback.
 - Integration tier: loopback-bench draft × transport matrix covers d20 and d22.
+- The GHCR image is multi-arch: linux/amd64 and linux/arm64.
+- `tests/relays.json` follows the interop runner registry: adds red5-moq-relay (d22); moqtail moves to d18 WT; moq-dev-anon re-enabled at d18/d20 with raw QUIC; cloudflare-d14 adds WT; imquic adds d18; quichemoq enabled at d18; moxygen-fb adds d14 (non-gating); cf-d16-interop removed.
+- load_sim fails a group that received under 50% of its expected objects (rate × live-subscriber-seconds while the publisher is up) and prints `expected=` per group and `Expected objects:`.
+- Interop tier: relay-pub-sub also fails on a load_sim `RESULT: FAIL`, a missing `RESULT:` line, or a non-zero exit.
+- A WebTransport server with no WT-Protocol that receives a d18+ SETUP on a uni stream closes with "SETUP on a uni stream with no WT-Protocol: offer moqt-NN in WT-Available-Protocols".
+- Logged messages name Message Parameters from the negotiated draft's table (0x04 is RENDEZVOUS_TIMEOUT from d18); `MOQTMessage.describe(prof)`, `messages.params.param_name`.
+- Integration tier: loopback-bench variants run under the runner's own interpreter, not `python` from PATH.
+- `aiomoqt.agent` docstring describes what ships; it named an `aiomoqt.mcp` package and `mcp` extra that do not exist.
 - WebTransport client teardown waits for the connection to close, so an error close (e.g. WT_ALPN_ERROR) is not dropped by the transport stopping.
 - MediaPublisher serves a FETCH from the objects each track published, its FETCH_OK End the end of that range; MediaSubscriber ignores a catalog object older than the one applied.
 - A received GOAWAY is recorded (`goaway_received`) and reported to `on_goaway(msg, request_id)`; no new request is sent after a control-stream GOAWAY. `goaway(request_id=)` sends one on a request stream (d18+).

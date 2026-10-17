@@ -5,7 +5,7 @@ from dataclasses import dataclass, field, fields
 from . import ParamType, SetupParamType, AuthTokenAliasType, AuthTokenType
 from .params import (
     RANGE_FILTERS, REPEATABLE, VALUE_RANGES, LocationFilter, RangeFilter,
-    param_kinds, param_scope,
+    param_kinds, param_name, param_scope,
 )
 from ..context import DraftProfile
 from ..types import MOQTException, MOQTProtocolViolation, SessionCloseCode
@@ -512,7 +512,10 @@ class MOQTMessage:
         raise NotImplementedError()
 
     def __str__(self) -> str:
-        """Generic string representation showing all fields."""
+        return self.describe()
+
+    def describe(self, prof: Optional[DraftProfile] = None) -> str:
+        """All fields, with Message Parameters named at `prof`'s draft."""
         parts = []
         
         for field in fields(self.__class__):
@@ -536,7 +539,7 @@ class MOQTMessage:
                     
             elif field.name == "parameters":
                 # Parameters dict - special formatting
-                str_val = self._format_parameters(value, class_name(self))
+                str_val = self._format_parameters(value, class_name(self), prof)
                 
             elif (isinstance(value, (list, tuple)) and value
                   and all(isinstance(v, bytes) for v in value)):
@@ -557,7 +560,8 @@ class MOQTMessage:
         return f"{class_name(self)}({', '.join(parts)})"
 
     @staticmethod
-    def _format_parameters(params: dict, message_class_name: str) -> str:
+    def _format_parameters(params: dict, message_class_name: str,
+                           prof: Optional[DraftProfile] = None) -> str:
         """Format parameters dict for display."""
         if not params:
             return "{}"
@@ -567,23 +571,22 @@ class MOQTMessage:
         
         items = []
         for k, v in params.items():
-            # Try to get enum name
-            try:
-                if is_setup:
-                    param_name = SetupParamType(k).name
-                else:
-                    param_name = ParamType(k).name
-            except ValueError:
-                param_name = f"0x{k:02x}"
+            if is_setup:
+                try:
+                    pname = SetupParamType(k).name
+                except ValueError:
+                    pname = f"0x{k:02x}"
+            else:
+                pname = param_name(k, prof)
             
             # Format value - even types are ints, odd types are bytes
             if k % 2 == 0:
-                items.append(f"{param_name}={v}")
+                items.append(f"{pname}={v}")
             else:
                 if isinstance(v, bytes):
-                    items.append(f"{param_name}={MOQTMessage._format_bytes(v, prefer_text=True)}")
+                    items.append(f"{pname}={MOQTMessage._format_bytes(v, prefer_text=True)}")
                 else:
-                    items.append(f"{param_name}=\"{v}\"")
+                    items.append(f"{pname}=\"{v}\"")
         
         return "{" + ", ".join(items) + "}"
 
