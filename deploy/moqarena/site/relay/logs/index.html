@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>moqarena relay logs</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='%23c1440e'/%3E%3Cpath d='M5 19c5 2.5 13 3 22-1' stroke='%237d2a08' stroke-width='2' fill='none'/%3E%3Ccircle cx='11.5' cy='11' r='2.6' fill='%238a2f0a'/%3E%3Ccircle cx='21' cy='23' r='2' fill='%238a2f0a'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="../dashboard.css">
+<script src="../common.js" defer></script>
+<script src="logs.js" defer></script>
+</head>
+<body>
+<main>
+  <header class="hero">
+    <div class="hero-top">
+      <a class="brand" href="/" aria-label="moqarena home">
+        <svg class="mark" viewBox="0 0 64 48" aria-hidden="true">
+          <defs>
+            <radialGradient id="mars-shade" cx="36%" cy="30%" r="75%">
+              <stop offset="0" stop-color="#fff" stop-opacity=".22"/>
+              <stop offset=".55" stop-color="#fff" stop-opacity="0"/>
+              <stop offset="1" stop-color="#000" stop-opacity=".38"/>
+            </radialGradient>
+          </defs>
+          <g stroke-linecap="round" stroke-width="2.4">
+            <path d="M3 17h17" stroke="#e8b339"/>
+            <path d="M9 24h11" stroke="#c1440e"/>
+            <path d="M5 31h15" stroke="#e8b339" opacity=".7"/>
+          </g>
+          <circle cx="42" cy="24" r="18" fill="#c1440e"/>
+          <path d="M27 29c7 3 17 3.5 29-1.5" stroke="#7d2a08" stroke-width="2.2" fill="none" opacity=".7"/>
+          <ellipse cx="35.5" cy="17.5" rx="4.2" ry="3" fill="#8a2f0a" opacity=".75"/>
+          <circle cx="48.5" cy="32" r="3" fill="#8a2f0a" opacity=".65"/>
+          <circle cx="46" cy="14" r="1.8" fill="#8a2f0a" opacity=".65"/>
+          <circle cx="42" cy="24" r="18" fill="url(#mars-shade)"/>
+        </svg>
+        <span class="brand-text">
+          <span class="brand-name"><b>moq</b>arena</span>
+          <span class="brand-sub">A Marz Research Project</span>
+        </span>
+      </a>
+      <span class="crumb"><a href="../">ersatz relay</a> / logs</span>
+    </div>
+  </header>
+
+  <noscript><p class="unavailable">The log viewer needs JavaScript.</p></noscript>
+
+  <section class="panel log-bar" aria-label="Log controls">
+    <label>File <select id="file"></select></label>
+    <label>Level <select id="level">
+      <option value="0">all</option>
+      <option value="20">INFO and up</option>
+      <option value="30">WARNING and up</option>
+      <option value="40">ERROR and up</option>
+    </select></label>
+    <label class="grow">Filter <input id="filter" type="search" placeholder="text in the line"
+      autocomplete="off" spellcheck="false"></label>
+    <label class="check"><input id="follow" type="checkbox" checked> Follow</label>
+    <label class="check"><input id="wrap" type="checkbox"> Wrap</label>
+    <button id="earlier" type="button">Load earlier</button>
+    <a id="download" class="platform-link" href="files/relay.log" download>raw ↓</a>
+  </section>
+
+  <p class="log-status mono-line">
+    <span id="status">—</span>
+    <span class="jumps">
+      <button type="button" class="jump" id="jump-restart" disabled>restarts <b>0</b></button>
+      <button type="button" class="jump jump-error" id="jump-error" disabled>errors <b>0</b></button>
+      <button type="button" class="jump jump-crash" id="jump-crash" disabled>crash dumps <b>0</b></button>
+    </span>
+  </p>
+
+  <div class="log-pane" id="pane" tabindex="0" role="log" aria-label="Relay log"></div>
+
+  <footer>
+    <a href="/">moqarena</a> · <a href="../">ersatz relay</a> · the relay's --log-dir, times UTC ·
+    private · A Marz Research Project
+  </footer>
+</main>
+</body>
+</html>

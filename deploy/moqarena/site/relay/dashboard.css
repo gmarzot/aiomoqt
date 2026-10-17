@@ -242,6 +242,52 @@ td.empty { color: var(--faint); text-align: center; padding: 14px; }
 }
 .play:hover { background: var(--red); text-decoration: none; }
 
+/* log viewer */
+.log-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; margin-bottom: 8px; }
+.log-bar label { display: inline-flex; align-items: center; gap: 6px; color: var(--dim); font-size: 13px; }
+.log-bar label.grow { flex: 1 1 220px; }
+.log-bar label.grow input { flex: 1; min-width: 0; }
+.log-bar select, .log-bar input[type=search], .log-bar button, .jump {
+  background: var(--field); color: var(--text); border: 1px solid var(--edge); border-radius: 4px;
+  padding: 3px 8px; font: 13px/1.4 Inter, system-ui, sans-serif;
+}
+.log-bar button, .jump { cursor: pointer; }
+.log-bar button:disabled, .jump:disabled { color: var(--faint); cursor: default; }
+.log-bar select:focus-visible, .log-bar input:focus-visible, .log-bar button:focus-visible,
+.jump:focus-visible, .log-pane:focus-visible { outline: 1px solid var(--gold); }
+.log-status {
+  display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px 16px; margin: 0 0 8px;
+  color: var(--dim); font: 12px/1.5 "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+}
+.log-status .bad { color: var(--amber); }
+.jumps { display: inline-flex; gap: 8px; }
+.jump b { font-weight: 600; }
+.jump-error:not(:disabled) b, .jump-crash:not(:disabled) b { color: var(--red); }
+.log-pane {
+  height: calc(100vh - 230px); min-height: 320px; overflow: auto; background: var(--field);
+  border: 1px solid var(--edge); border-radius: 6px; padding: 6px 0;
+  font: 12px/1.5 "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+}
+.rec { white-space: pre; padding: 0 10px; }
+.log-pane.wrap .rec { white-space: pre-wrap; overflow-wrap: anywhere; }
+.rec .ts { color: var(--faint); }
+.rec .lv { color: var(--dim); }
+.rec .lg { color: var(--faint); }
+.rec.lvl-debug { color: var(--dim); }
+.rec.lvl-warning, .rec.lvl-warning .lv { color: var(--amber); }
+.rec.lvl-error, .rec.lvl-critical, .rec.lvl-error .lv, .rec.lvl-critical .lv { color: #ef7a5a; }
+.rec.kind-start, .rec.kind-note {
+  color: var(--gold); border-top: 1px solid var(--gold); margin-top: 6px; padding-top: 3px;
+}
+.rec.kind-note { color: var(--dim); border-top-style: dashed; }
+.rec.kind-crash {
+  color: #ef7a5a; background: rgba(217, 83, 43, .12); border-left: 3px solid var(--red);
+  padding-left: 7px; margin: 4px 0;
+}
+.rec mark { background: rgba(232, 179, 57, .32); color: inherit; border-radius: 2px; }
+.rec.hit { animation: hit 1.6s ease-out; }
+@keyframes hit { from { background: rgba(232, 179, 57, .28); } }
+
 footer {
   margin-top: 20px; padding-top: 12px; border-top: 1px solid var(--edge); color: var(--dim);
   font-size: 13px;
