@@ -816,7 +816,9 @@ def _watch_session(session, ns=None) -> None:
     info = _sessions.get(id(session))
     if info is None:
         info = _sessions[id(session)] = {
-            "session": session, "since": time.time(), "ns": set()}
+            "session": session, "since": time.time(), "ns": set(),
+            "addr": None}
+        _background.add(asyncio.create_task(_log_peer(session, info)))
     if ns is not None:
         info["ns"].add(tuple(ns))
     if session in _watched:
@@ -833,6 +835,44 @@ def _watch_session(session, ns=None) -> None:
             logger.debug("relay: session closed, state released")
 
     asyncio.create_task(_reap())
+
+
+def _peer_address(session):
+    try:
+        return session.peer_address
+    except Exception:
+        return None
+
+
+def _addr_of(session):
+    """The session's (host, port), cached once known; None until then."""
+    info = _sessions.get(id(session))
+    if info is not None and info.get("addr"):
+        return info["addr"]
+    addr = _peer_address(session)
+    if addr and info is not None:
+        info["addr"] = addr
+    return addr
+
+
+async def _log_peer(session, info) -> None:
+    """Log a new session's full address once the transport reports it."""
+    try:
+        for _ in range(50):
+            addr = info.get("addr") or _peer_address(session)
+            if addr:
+                info["addr"] = addr
+                host, port = addr[0], addr[1]
+                if ":" in host:
+                    host = f"[{host}]"
+                logger.info(f"relay: session {_transport(session)} "
+                            f"d{_draft(session)} from {host}:{port}")
+                return
+            if not _session_live(session):
+                return
+            await asyncio.sleep(0.1)
+    finally:
+        _background.discard(asyncio.current_task())
 
 
 def _supersede_namespace(ns: tuple, session) -> None:
@@ -2419,6 +2459,7 @@ class _Status:
                 r = rtt_ms(d.session)
                 listed.append({
                     "transport": _transport(d.session), "draft": _draft(d.session),
+                    "addr": relay_status.mask_addr(_addr_of(d.session)),
                     "rtt_ms": None if r is None else round(r, 1),
                     "forward": bool(d.forward),
                     "since": info["since"] if info else None})
@@ -2448,6 +2489,8 @@ class _Status:
                 "state": _track_state(t, t._bytes_in > p_in),
                 "origin": (f"{_transport(owner)} d{_draft(owner)}"
                            if owner is not None else None),
+                "origin_addr": (relay_status.mask_addr(_addr_of(owner))
+                                if owner is not None else None),
                 "since": t.created,
             }))
         self._track_prev = prev
@@ -2461,6 +2504,8 @@ class _Status:
                 "namespace": _ns_str(ns), "announced": bool(holders),
                 "origin": (f"{_transport(holders[-1])} d{_draft(holders[-1])}"
                            if holders else None),
+                "origin_addr": (relay_status.mask_addr(_addr_of(holders[-1]))
+                                if holders else None),
                 "tracks": 0, "subscribers": 0, "in_bps": 0, "out_bps": 0,
                 "bytes_out": 0, "format": entry[0] if entry else None,
             }
@@ -2473,7 +2518,9 @@ class _Status:
             sp["in_bps"] += row["in_bps"] or 0
             sp["out_bps"] += row["out_bps"] or 0
             sp["bytes_out"] += row["bytes_out"]
-            sp["origin"] = sp["origin"] or row["origin"]
+            if sp["origin"] is None:
+                sp["origin"] = row["origin"]
+                sp["origin_addr"] = row["origin_addr"]
         self._ns_peak = {ns: max(self._ns_peak.get(ns, 0), sp["subscribers"])
                          for ns, sp in spaces.items()}
         for ns, sp in spaces.items():
@@ -2503,6 +2550,7 @@ class _Status:
                             if id(s) in ids)
             sessions.append({
                 "transport": _transport(s), "draft": _draft(s),
+                "addr": relay_status.mask_addr(_addr_of(s)),
                 "role": role or None, "since": info["since"],
                 "rtt_ms": round(rtt, 1) if rtt is not None else None,
                 "tx_bps": bps(d[0]) if last is not None else None,

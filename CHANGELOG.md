@@ -12,6 +12,9 @@
 - Relay: a PUBLISH beside an established upstream subscription on its session is refused DUPLICATE_SUBSCRIPTION.
 - Relay: an upstream subscription never replaces a track a PUBLISH holds.
 - Relay: no reply to a SUBSCRIBE the subscriber cancelled while it was held.
+- `MOQTSession.peer_address`: the peer's (host, port), None while unknown or with an aiopquic that cannot report it.
+- Relay status: masked peer addresses (IPv4 /24, IPv6 /48, no port) as `namespaces[].origin_addr`, `tracks[].origin_addr`, `tracks[].subscriber_list[].addr` and `sessions[].addr`.
+- Relay: one INFO line per session with its full address when first seen.
 - Relay: `--status-dir` also writes `platform.json` (host detail from /proc: CPU by mode,
   pressure, memory, disks, interfaces, UDP, the relay's socket and process) and per-track
   history and subscriber lists in `status.json`.

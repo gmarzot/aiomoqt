@@ -4,6 +4,7 @@ atomic JSON writer. Host metrics are Linux only; elsewhere they are empty.
 """
 
 import asyncio
+import ipaddress
 import json
 import os
 import platform
@@ -492,6 +493,26 @@ def write_json_atomic(path: str, obj: Any) -> None:
         json.dump(obj, f, separators=(",", ":"))
     os.chmod(tmp, 0o644)
     os.replace(tmp, path)
+
+
+def mask_addr(addr) -> str | None:
+    """A peer address fit for a public page: IPv4 as its /24
+    ("a.b.c.x"), IPv6 as its /48 ("a:b:c::/48"), an IPv4-mapped IPv6
+    address as IPv4. Takes a host or (host, port); the port is never
+    kept. None when unknown or unparseable."""
+    host = addr[0] if isinstance(addr, (tuple, list)) else addr
+    if not host:
+        return None
+    try:
+        ip = ipaddress.ip_address(str(host).split("%")[0])
+    except ValueError:
+        return None
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    if ip.version == 4:
+        return ".".join(str(ip).split(".")[:3]) + ".x"
+    hextets = ip.exploded.split(":")[:3]
+    return ":".join(f"{int(h, 16):x}" for h in hextets) + "::/48"
 
 
 def versions() -> dict[str, str]:

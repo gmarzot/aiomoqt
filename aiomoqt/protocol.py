@@ -3865,6 +3865,19 @@ class _MOQTSessionMixin:
         }
 
     @property
+    def peer_address(self) -> Optional[Tuple[str, int]]:
+        """The peer's (host, port); None while unknown, after close, or
+        with an aiopquic that cannot report it. An IPv4-mapped IPv6
+        address comes back as IPv4."""
+        if self._is_wt:
+            tr = getattr(self, '_transport', None)
+            ptr = getattr(self, 'cnx_ptr', 0)
+            fn = getattr(tr, 'peer_address', None)
+            return fn(ptr) if fn is not None and ptr else None
+        fn = getattr(self._quic, 'peer_address', None)
+        return fn() if fn is not None else None
+
+    @property
     def qlog_paths(self) -> List[str]:
         """qlog file(s) for this connection (probe ask #7): matches the
         session's connection-ID hex names under the effective qlog_dir
