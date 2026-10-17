@@ -47,7 +47,7 @@ def _session(draft):
 def _clean_tables():
     tracks, announced = dict(relay._tracks), dict(relay._announced)
     watch = relay._watch_session
-    relay._watch_session = lambda sess: None
+    relay._watch_session = lambda sess, ns=None: None
     relay._tracks.clear()
     relay._announced.clear()
     relay._announce_requests.clear()
