@@ -1,245 +1,49 @@
-// moqarena relay dashboard: polls the relay's status.json and renders it.
-// Namespace and track names come from publishers: text only, never HTML.
+// moqarena relay dashboard: relay status, namespaces and tracks, scoped to a
+// namespace, from /status/status.json. Uses Dash from common.js.
 'use strict';
 
-const STATUS_URL = '/status/status.json';
-const POLL_MS = 2000;
-// No new snapshot for this long marks the relay stale.
-const STALE_S = 30;
-const WINDOW_S = 600;
+const {OTHER, $, el, svgEl, none, fmt} = Dash;
 const PLAYER = '/g5-player/';
 const PLAYER_DRAFT = '18';
-const SVG = 'http://www.w3.org/2000/svg';
 const STATES = new Set(['live', 'idle', 'held', 'parked', 'ended']);
+const TRACK_COLS = 8;
+// Media track colors by name; other tracks take the remaining palette hues in order.
+const NAMED = [[/^catalog$/i, '#d9532b'], [/audio/i, '#6fbff5'], [/video/i, '#a57be6']];
+const REST = ['#199e70', '#c98500', '#d55181', '#008300', '#e66767'];
+const ORDER = [...NAMED.map(([, c]) => c), ...REST];
 
-const $ = (id) => document.getElementById(id);
+// The selected namespace: from the URL hash, else the first one listed.
+let scope = new URLSearchParams(location.hash.slice(1)).get('ns');
+// Track id -> color; fixed once seen, so a track keeps it in every view.
+const colors = new Map();
+let latest = null;
 
-function el(tag, attrs, ...children) {
-  const e = document.createElement(tag);
-  for (const [k, v] of Object.entries(attrs || {})) {
-    if (v !== undefined && v !== null) e.setAttribute(k, v);
+function colorOf(id) {
+  if (!colors.has(id)) {
+    const name = id.split('\x1f').pop();
+    const named = NAMED.find(([re]) => re.test(name));
+    const used = [...colors.values()].filter((c) => REST.includes(c)).length;
+    colors.set(id, named ? named[1] : (used < REST.length ? REST[used] : null));
   }
-  for (const c of children) e.append(c instanceof Node ? c : String(c ?? ''));
-  return e;
+  return colors.get(id);
 }
 
-function svgEl(tag, attrs) {
-  const e = document.createElementNS(SVG, tag);
-  for (const [k, v] of Object.entries(attrs || {})) e.setAttribute(k, v);
-  return e;
+function setScope(ns) {
+  scope = ns;
+  history.replaceState(null, '', `#${new URLSearchParams({ns})}`);
+  if (latest) render(latest);
 }
 
-// -- formatting -----------------------------------------------------------
-
-const none = (v) => v === null || v === undefined || Number.isNaN(v);
-
-function scaled(v, step, units) {
-  let i = 0;
-  while (Math.abs(v) >= step && i < units.length - 1) { v /= step; i++; }
-  return `${i === 0 || v >= 100 ? Math.round(v) : v.toFixed(1)} ${units[i]}`;
-}
-
-const fmtBps = (v) => none(v) ? '—' : scaled(v, 1000, ['bps', 'kbps', 'Mbps', 'Gbps']);
-const fmtBytes = (v) => none(v) ? '—' : scaled(v, 1000, ['B', 'kB', 'MB', 'GB', 'TB']);
-const fmtNum = (v) => none(v) ? '—' : Number(v).toLocaleString('en-US');
-const fmtPct = (v, digits = 1) => none(v) ? '—' : `${Number(v).toFixed(digits)}%`;
-const fmtMs = (v) => none(v) ? '—' : `${v >= 100 ? Math.round(v) : Number(v).toFixed(1)} ms`;
-const fmtRate = (v) => none(v) ? '—' : (v >= 100 ? fmtNum(Math.round(v)) : Number(v).toFixed(1));
-const plural = (n, one, many = `${one}s`) => `${fmtNum(n)} ${n === 1 ? one : many}`;
-
-function fmtDuration(s) {
-  if (none(s)) return '—';
-  s = Math.max(0, Math.round(s));
-  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600);
-  const m = Math.floor(s % 3600 / 60);
-  if (d) return `${d}d ${h}h`;
-  if (h) return `${h}h ${m}m`;
-  if (m) return `${m}m ${s % 60}s`;
-  return `${s}s`;
-}
-
-// -- tiles and sparklines ---------------------------------------------------
-
-function setTile(key, value, sub, title) {
-  const t = document.querySelector(`.tile[data-key="${key}"]`);
-  t.querySelector('.value').textContent = value;
-  t.querySelector('.sub').textContent = sub || '';
-  if (title) t.title = title;
-}
-
-function pathFor(values, x, y) {
-  // One run per stretch of known values: a gap breaks the line.
-  let d = '', pen = false;
-  values.forEach((v, i) => {
-    if (none(v)) { pen = false; return; }
-    d += `${pen ? 'L' : 'M'}${x(i).toFixed(1)},${y(v).toFixed(1)}`;
-    pen = true;
-  });
-  return d;
-}
-
-function drawSpark(tile, values) {
-  let svg = tile.querySelector('svg.spark');
-  if (!svg) {
-    svg = svgEl('svg', {class: 'spark', viewBox: '0 0 100 24', preserveAspectRatio: 'none',
-                        'aria-hidden': 'true'});
-    tile.append(svg);
-  }
-  const known = values.filter((v) => !none(v));
-  const max = Math.max(...known, 0) || 1;
-  const n = Math.max(values.length - 1, 1);
-  svg.replaceChildren(svgEl('path', {
-    d: pathFor(values, (i) => 100 * i / n, (v) => 22 - 20 * v / max)}));
-}
-
-function renderTiles(s) {
-  const T = s.totals;
-  const transports = Object.entries(T.by_transport || {})
-    .map(([k, v]) => `${v} ${k}`).join(' · ');
-  const drafts = Object.entries(T.by_draft || {})
-    .map(([k, v]) => `${k}: ${v}`).join(', ');
-  const playable = s.namespaces.filter((r) => r.format).length;
-  setTile('sessions', fmtNum(T.sessions), transports, drafts ? `By draft: ${drafts}` : '');
-  setTile('namespaces', fmtNum(T.namespaces), playable ? `${playable} playable` : '');
-  setTile('tracks', fmtNum(T.tracks), plural(T.fetches, 'fetch', 'fetches'));
-  setTile('subscribers', fmtNum(T.subscribers), plural(T.publishers, 'publisher'));
-  setTile('ingress', fmtBps(T.ingress_bps), `media ${fmtBps(T.media_in_bps)}`);
-  setTile('egress', fmtBps(T.egress_bps), `media ${fmtBps(T.media_out_bps)}`);
-  const groups = s.tracks.reduce((n, r) => n + (r.groups_per_s || 0), 0);
-  setTile('objects', fmtRate(T.objects_in_per_s), `${fmtRate(groups)} groups/s in`);
-  setTile('delivered', fmtBytes(T.delivered_bytes), 'media since start');
-  setTile('drops', fmtNum(T.drops), 'subscribers dropped');
-  setTile('loss', fmtPct(T.loss_pct, 2), 'delivery to subscribers');
-  setTile('rtt', fmtMs(T.rtt_p50_ms), `p99 ${fmtMs(T.rtt_p99_ms)}`);
-  const lag = T.loop_lag_ms || {};
-  setTile('lag', fmtMs(lag.p99), `p50 ${fmtMs(lag.p50)}`);
-  for (const tile of document.querySelectorAll('.tile[data-spark]')) {
-    drawSpark(tile, s.history[tile.dataset.spark] || []);
-  }
-}
-
-// -- charts -------------------------------------------------------------------
-
-function niceMax(v) {
-  if (!(v > 0)) return 1;
-  const p = 10 ** Math.floor(Math.log10(v));
-  return [1, 2, 5, 10].map((m) => m * p).find((m) => v <= m);
-}
-
-function drawChart(svg, t, series, fmt, fixedMax) {
-  const w = Math.max(240, svg.clientWidth || 600);
-  const h = Math.max(120, svg.clientHeight || 180);
-  svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
-  svg.replaceChildren();
-  const pad = {l: 72, r: 10, t: 10, b: 22};
-  const iw = w - pad.l - pad.r, ih = h - pad.t - pad.b;
-  const known = series.flatMap((s) => s.values.filter((v) => !none(v)));
-  const max = fixedMax || niceMax(Math.max(...known, 0));
-  const now = t.length ? t[t.length - 1] : 0;
-  const x = (i) => pad.l + iw * (1 - (now - t[i]) / WINDOW_S);
-  const y = (v) => pad.t + ih * (1 - Math.min(v, max) / max);
-  for (const f of [0, 0.5, 1]) {
-    const gy = y(max * f);
-    svg.append(svgEl('line', {class: 'grid', x1: pad.l, x2: w - pad.r, y1: gy, y2: gy}));
-    const label = svgEl('text', {class: 'axis', x: pad.l - 8, y: gy + 4, 'text-anchor': 'end'});
-    label.textContent = fmt(max * f);
-    svg.append(label);
-  }
-  [['−10m', pad.l, 'start'], ['−5m', pad.l + iw / 2, 'middle'], ['now', w - pad.r, 'end']]
-    .forEach(([text, lx, anchor]) => {
-      const label = svgEl('text', {class: 'axis', x: lx, y: h - 6, 'text-anchor': anchor});
-      label.textContent = text;
-      svg.append(label);
-    });
-  for (const s of series) {
-    svg.append(svgEl('path', {class: `line ${s.cls}`, d: pathFor(s.values, x, y)}));
-  }
-}
-
-function renderCharts(s) {
-  const H = s.history;
-  drawChart($('chart-bw'), H.t, [
-    {values: H.ingress_bps, cls: 'k-in'}, {values: H.egress_bps, cls: 'k-out'}], fmtBps);
-  drawChart($('chart-cpu'), H.t, [
-    {values: H.cpu, cls: 'k-host'}, {values: H.proc_cpu, cls: 'k-proc'}],
-  (v) => `${Math.round(v)}%`, 100);
-}
-
-// -- tables -------------------------------------------------------------------
-
-function fill(table, rows, cols, empty) {
-  const body = table.tBodies[0];
-  if (!rows.length) {
-    body.replaceChildren(el('tr', {}, el('td', {colspan: cols, class: 'empty'}, empty)));
-    return;
-  }
-  body.replaceChildren(...rows);
-}
-
-const num = (v) => el('td', {class: 'n'}, v);
-
-function playLink(ns, url) {
-  const q = new URLSearchParams({url, ns, v: PLAYER_DRAFT});
-  return el('a', {class: 'play', href: `${PLAYER}?${q}`, target: '_blank', rel: 'noopener'},
-            '▶ Play');
-}
-
-function renderNamespaces(rows, wtUrl) {
-  fill($('t-namespaces'), rows.map((r) => el('tr', {},
-    el('td', {}, el('code', {}, r.namespace)),
-    el('td', {}, r.format ? el('span', {class: 'badge'}, r.format) : '—'),
-    el('td', {}, r.origin || '—'),
-    num(fmtNum(r.tracks)), num(fmtNum(r.subscribers)),
-    num(fmtBps(r.in_bps)), num(fmtBps(r.out_bps)), num(fmtBytes(r.bytes_out)),
-    el('td', {class: 'n'}, r.format ? playLink(r.namespace, wtUrl) : ''))),
-  9, 'No namespaces.');
-}
-
-function renderTracks(rows) {
-  fill($('t-tracks'), rows.map((r) => {
-    const state = STATES.has(r.state) ? r.state : 'idle';
-    return el('tr', {},
-      el('td', {}, el('code', {}, r.namespace)),
-      el('td', {title: r.largest ? `Largest ${r.largest[0]} · ${r.largest[1]}` : null},
-         el('code', {}, r.name)),
-      el('td', {}, el('span', {class: `state state-${state}`}, state)),
-      num(fmtNum(r.subscribers)), num(fmtNum(r.peak)),
-      num(fmtBps(r.in_bps)), num(fmtBps(r.out_bps)), num(fmtBytes(r.bytes_out)),
-      num(fmtRate(r.groups_per_s)), num(fmtRate(r.objects_per_s)),
-      el('td', {class: 'n', title: `RTT up ${fmtMs(r.rtt_up_ms)} · down p50 ${fmtMs(r.rtt_down_ms)}`},
-         fmtMs(r.latency_ms)),
-      num(fmtNum(r.fetches)), num(fmtNum(r.drops)),
-      num(`${fmtNum(r.cache_groups)} g · ${fmtBytes(r.cache_bytes)}`));
-  }), 14, 'No tracks.');
-}
-
-// -- relay and host -------------------------------------------------------------
+// -- header -------------------------------------------------------------------
 
 function relayUrls(relay) {
   const host = location.hostname;
-  return {
-    wt: `https://${host}:${relay.port}/`,
-    quic: `moqt://${host}:${relay.quic_port || relay.port}`,
-  };
-}
-
-function fmtUptime(s) {
-  if (none(s)) return '—';
-  s = Math.max(0, Math.round(s));
-  return `${Math.floor(s / 86400)}d ${Math.floor(s % 86400 / 3600)}h ${Math.floor(s % 3600 / 60)}m`;
-}
-
-function fmtDate(epoch) {
-  const d = new Date(epoch * 1000);
-  const p = (n) => String(Math.trunc(Math.abs(n))).padStart(2, '0');
-  const off = -d.getTimezoneOffset();
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} `
-    + `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())} `
-    + `${off < 0 ? '-' : '+'}${p(off / 60)}:${p(off % 60)}`;
+  return {wt: `https://${host}:${relay.port}/`,
+          quic: `moqt://${host}:${relay.quic_port || relay.port}`};
 }
 
 function renderRelay(s, urls) {
-  const r = s.relay, v = r.versions || {};
+  const r = s.relay, v = r.versions || {}, h = s.host || {};
   $('hostname').textContent = location.hostname;
   $('url-wt').textContent = urls.wt;
   $('url-quic').textContent = urls.quic;
@@ -248,18 +52,15 @@ function renderRelay(s, urls) {
   badge.textContent = v.aiomoqt ? `aiomoqt ${v.aiomoqt}` : 'aiomoqt ersatz relay';
   badge.title = [['aiopquic', v.aiopquic], ['picoquic', v.picoquic], ['Python', v.python]]
     .filter(([, x]) => x).map(([k, x]) => `${k} ${x}`).join(' · ');
-  $('uptime').textContent = fmtUptime(r.uptime_s)
+  $('uptime').textContent = fmt.uptime(r.uptime_s)
     + (r.watchdog_s ? ` · watchdog ${r.watchdog_s}s` : '');
-  $('date').textContent = fmtDate(s.generated);
-  const h = s.host || {};
+  $('date').textContent = fmt.date(s.generated);
   $('hw').textContent = [h.arch, h.cores && `${h.cores} vCPU`,
                          h.mem_total && `${(h.mem_total / 2 ** 30).toFixed(0)} GiB RAM`]
     .filter(Boolean).join(' · ') || '—';
   $('cpu-model').textContent = h.cpu_model || '—';
   $('os').textContent = h.os || '—';
 }
-
-// -- dials ----------------------------------------------------------------------
 
 // 270° sweep from lower left (225°) clockwise to lower right (-45°).
 const G = {cx: 60, cy: 58, r: 42, tick: 52, from: 225, sweep: 270};
@@ -303,71 +104,171 @@ function renderGauges(h, T) {
   drawGauge($('gauge-cdn'), none(T.efficiency) ? null : 100 * T.efficiency, false);
 }
 
-function setHost(key, text) {
-  document.querySelector(`[data-host="${key}"]`).textContent = text;
+// -- tiles ----------------------------------------------------------------------
+
+function setTile(key, value, sub, title) {
+  const t = document.querySelector(`.tile[data-key="${key}"]`);
+  t.querySelector('.value').textContent = value;
+  t.querySelector('.sub').textContent = sub || '';
+  if (title) t.title = title;
 }
 
-function renderHost(h) {
-  setHost('cpu', `${h.cpu_model || '—'} · ${plural(h.cores, 'core')} · ${fmtPct(h.cpu)} busy`);
-  setHost('system', [h.os, h.kernel && `Linux ${h.kernel}`, h.arch,
-                     !none(h.uptime_s) && `up ${fmtDuration(h.uptime_s)}`]
-    .filter(Boolean).join(' · '));
-  setHost('load', (h.load || []).map((x) => x.toFixed(2)).join(' / ') || '—');
-  setHost('memory', `${fmtBytes(h.mem_used)} of ${fmtBytes(h.mem_total)}`);
-  setHost('disk', none(h.disk_total) ? '—'
-    : `${fmtBytes(h.disk_used)} of ${fmtBytes(h.disk_total)}`);
-  setHost('network', `rx ${fmtBps(h.rx_bps)} · tx ${fmtBps(h.tx_bps)}`);
-  const rate = (v) => none(v) ? '—' : v.toFixed(1);
-  setHost('udp', `${rate(h.udp_in_errors)} in · ${rate(h.udp_rcvbuf_errors)} rcvbuf per s`);
-  setHost('process', `${fmtPct(h.proc_cpu)} CPU · ${fmtBytes(h.proc_rss)} RSS · `
-    + plural(h.proc_threads, 'thread'));
+function renderTiles(s) {
+  const T = s.totals;
+  const transports = Object.entries(T.by_transport || {}).map(([k, v]) => `${v} ${k}`).join(' · ');
+  const drafts = Object.entries(T.by_draft || {}).map(([k, v]) => `${k}: ${v}`).join(', ');
+  const playable = s.namespaces.filter((r) => r.format).length;
+  const groups = s.tracks.reduce((n, r) => n + (r.groups_per_s || 0), 0);
+  const subSessions = (s.sessions || []).filter((x) => (x.role || '').includes('sub')).length;
+  setTile('sessions', fmt.num(T.sessions), transports, drafts ? `By draft: ${drafts}` : '');
+  setTile('namespaces', fmt.num(T.namespaces), playable ? `${playable} playable` : '');
+  setTile('tracks', fmt.num(T.tracks), fmt.plural(T.fetches, 'fetch', 'fetches'));
+  setTile('publishers', fmt.num(T.publishers), 'publishing sessions');
+  setTile('subscribers', fmt.num(T.subscribers),
+          `${fmt.plural(subSessions, 'session')} · peak ${fmt.num(T.subscribers_peak)}`);
+  setTile('delivered', fmt.bytes(T.delivered_bytes), 'media since start');
+  setTile('groups', fmt.rate(none(T.groups_per_s) ? groups : T.groups_per_s), 'in, all tracks');
+  setTile('objects', fmt.rate(T.objects_in_per_s), 'in, all tracks');
+  setTile('ingress', fmt.bps(T.ingress_bps), `media ${fmt.bps(T.media_in_bps)}`);
+  setTile('egress', fmt.bps(T.egress_bps), `media ${fmt.bps(T.media_out_bps)}`);
+  setTile('rtt', fmt.ms(T.rtt_p50_ms), `p99 ${fmt.ms(T.rtt_p99_ms)}`);
+  const lag = T.loop_lag_ms || {};
+  setTile('lag', fmt.ms(lag.p99), `p50 ${fmt.ms(lag.p50)}`);
+  setTile('lossdrops', `${fmt.pct(T.loss_pct, 2)} / ${fmt.num(T.drops)}`,
+          'delivery loss / subscribers dropped');
+  for (const tile of document.querySelectorAll('.tile[data-spark]')) {
+    Dash.spark(tile, s.history[tile.dataset.spark] || []);
+  }
 }
 
-// -- polling ------------------------------------------------------------------
+// -- namespaces and scope -------------------------------------------------------
 
-let latest = null;
-let generated = null;
-let changedAt = 0;
+function fill(table, rows, cols, empty) {
+  table.tBodies[0].replaceChildren(...(rows.length ? rows
+    : [el('tr', {}, el('td', {colspan: cols, class: 'empty'}, empty))]));
+}
+
+const num = (v) => el('td', {class: 'n'}, v);
+
+function playLink(ns, url) {
+  const q = new URLSearchParams({url, ns, v: PLAYER_DRAFT});
+  return el('a', {class: 'play', href: `${PLAYER}?${q}`, target: '_blank', rel: 'noopener',
+                  title: 'Play in G5 Player'}, '▶');
+}
+
+function renderNamespaces(rows, wtUrl) {
+  fill($('t-namespaces'), rows.map((r) => {
+    const tr = el('tr', {class: `pick${r.namespace === scope ? ' selected' : ''}`, tabindex: '0',
+                         title: `${fmt.bytes(r.bytes_out)} delivered`},
+      el('td', {}, el('code', {}, r.namespace)),
+      el('td', {}, r.origin || '—'),
+      num(fmt.num(r.tracks)), num(fmt.num(r.subscribers)), num(fmt.num(r.peak)),
+      inOut(r.in_bps, r.out_bps),
+      el('td', {class: 'n'}, r.format ? playLink(r.namespace, wtUrl) : ''));
+    tr.dataset.ns = r.namespace;
+    return tr;
+  }), 7, 'No namespaces.');
+}
+
+// -- tracks: charts and table ---------------------------------------------------
+
+function scoped(tracks) {
+  return tracks.filter((r) => r.namespace === scope);
+}
+
+function seriesFor(s, tracks, field) {
+  const series = [];
+  let other = null;
+  for (const r of tracks) {
+    const hist = (s.track_history || {})[r.id];
+    if (!hist) continue;
+    const color = colorOf(r.id);
+    if (color) {
+      series.push({name: r.name, values: hist[field], color});
+    } else {
+      other = other ? other.map((v, i) => (none(v) && none(hist[field][i]) ? null
+        : (v || 0) + (hist[field][i] || 0))) : hist[field].slice();
+    }
+  }
+  series.sort((a, b) => ORDER.indexOf(a.color) - ORDER.indexOf(b.color));
+  if (other) series.push({name: 'Other', values: other, color: OTHER});
+  return series;
+}
+
+function renderTrackCharts(s, tracks) {
+  const t = s.history.t || [];
+  const subs = seriesFor(s, tracks, 'subscribers');
+  const egress = seriesFor(s, tracks, 'out_bps');
+  Dash.legend($('legend-subs'), subs);
+  Dash.legend($('legend-egress'), egress);
+  Dash.chart($('chart-subs'), t, subs,
+             {labels: true, fmt: (v) => none(v) ? '—' : fmt.num(Math.round(v))});
+  Dash.chart($('chart-egress'), t, egress, {labels: true, fmt: fmt.bps});
+}
+
+const inOut = (i, o) => el('td', {class: 'n', title: `in ${fmt.bps(i)} · out ${fmt.bps(o)}`},
+  `${fmt.bpsShort(i)} / ${fmt.bpsShort(o)}`);
+
+// Everything the row leaves out, for its hover text.
+function trackDetail(r) {
+  const now = Date.now() / 1000;
+  const lines = [
+    `${r.namespace} / ${r.name}`,
+    `peak ${fmt.num(r.peak)} subscribers · ${fmt.bytes(r.bytes_out)} delivered · `
+      + `${fmt.plural(r.fetches, 'fetch', 'fetches')} · ${fmt.plural(r.drops, 'drop')}`,
+    `cache ${fmt.num(r.cache_groups)} groups, ${fmt.bytes(r.cache_bytes)}`
+      + (r.largest ? ` · largest ${r.largest[0]} · ${r.largest[1]}` : ''),
+    `from ${r.origin || '—'} · RTT up ${fmt.ms(r.rtt_up_ms)}, down p50 ${fmt.ms(r.rtt_down_ms)}`,
+  ];
+  const subs = r.subscriber_list || [];
+  if (subs.length) {
+    lines.push('subscribers:');
+    for (const x of subs.slice(0, 12)) {
+      lines.push(`  ${x.transport} d${x.draft} · ${fmt.ms(x.rtt_ms)} · ${x.forward ? 'forwarding' : 'paused'}`
+        + (none(x.since) ? '' : ` · ${fmt.duration(now - x.since)}`));
+    }
+    if (r.subscribers > 12) lines.push(`  … ${fmt.num(r.subscribers - 12)} more`);
+  }
+  return lines.join('\n');
+}
+
+// `format`: the namespace's MSF format, shown on its catalog track.
+function trackRow(r, format) {
+  const state = STATES.has(r.state) ? r.state : 'idle';
+  const color = colorOf(r.id) || OTHER;
+  const name = [el('code', {}, r.name)];
+  if (format && r.name === 'catalog') name.push(el('span', {class: 'format'}, ` (${format})`));
+  return el('tr', {title: trackDetail(r)},
+    el('td', {}, el('i', {class: 'key-line', style: `background:${color}`}), ...name),
+    num(fmt.num(r.subscribers)), num(fmt.num(r.peak)),
+    num(fmt.rate(r.groups_per_s)), num(fmt.rate(r.objects_per_s)),
+    inOut(r.in_bps, r.out_bps),
+    num(fmt.ms(r.latency_ms)),
+    el('td', {}, el('span', {class: `state state-${state}`}, state)));
+}
+
+function renderTracks(tracks, format) {
+  $('tracks-scope').textContent = scope || '';
+  fill($('t-tracks'), tracks.map((r) => trackRow(r, format)), TRACK_COLS,
+       scope === null ? 'No namespaces.' : 'No tracks in this namespace.');
+}
+
+// -- page -----------------------------------------------------------------------
 
 function render(s) {
+  latest = s;
   const urls = relayUrls(s.relay);
   renderRelay(s, urls);
-  renderTiles(s);
-  renderCharts(s);
-  renderNamespaces(s.namespaces, urls.wt);
-  renderTracks(s.tracks);
-  renderHost(s.host);
   renderGauges(s.host || {}, s.totals || {});
-}
-
-function showFreshness() {
-  const age = (performance.now() - changedAt) / 1000;
-  const stale = !latest || age > STALE_S;
-  $('live').classList.toggle('ok', !stale);
-  $('live').classList.toggle('stale', stale);
-  $('unavailable').hidden = !stale;
-  document.body.classList.toggle('stale', stale && !!latest);
-  $('updated').textContent = !latest ? 'no status'
-    : stale ? `stale · last update ${fmtDuration(age)} ago` : 'live';
-}
-
-async function poll() {
-  try {
-    const r = await fetch(STATUS_URL, {cache: 'no-store'});
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const s = await r.json();
-    if (s.generated !== generated) {
-      generated = s.generated;
-      changedAt = performance.now();
-    }
-    latest = s;
-    render(s);
-  } catch (e) {
-    console.debug('status poll failed', e);
-  } finally {
-    showFreshness();
-    setTimeout(poll, POLL_MS);
+  renderTiles(s);
+  if (!s.namespaces.some((r) => r.namespace === scope)) {
+    scope = s.namespaces.length ? s.namespaces[0].namespace : null;
   }
+  renderNamespaces(s.namespaces, urls.wt);
+  for (const r of s.tracks) colorOf(r.id);
+  const tracks = scoped(s.tracks);
+  renderTrackCharts(s, tracks);
+  renderTracks(tracks, (s.namespaces.find((r) => r.namespace === scope) || {}).format);
 }
 
 function toast(target, text) {
@@ -396,22 +297,26 @@ function copyText(target) {
   }
 }
 
-document.addEventListener('click', (ev) => {
-  const target = ev.target.closest('.copyable');
-  if (target) copyText(target);
-});
+function activate(target) {
+  const copy = target.closest('.copyable');
+  if (copy) return copyText(copy);
+  const pick = target.closest('tr.pick');
+  if (pick && !target.closest('a')) setScope(pick.dataset.ns);
+}
+
+document.addEventListener('click', (ev) => activate(ev.target));
 document.addEventListener('keydown', (ev) => {
-  const target = ev.target.closest && ev.target.closest('.copyable');
-  if (target && (ev.key === 'Enter' || ev.key === ' ')) {
+  if ((ev.key === 'Enter' || ev.key === ' ') && ev.target.closest
+      && ev.target.closest('.copyable, tr.pick')) {
     ev.preventDefault();
-    copyText(target);
+    activate(ev.target);
   }
 });
 
 let resizeTimer = null;
 window.addEventListener('resize', () => {
   clearTimeout(resizeTimer);
-  resizeTimer = setTimeout(() => latest && renderCharts(latest), 150);
+  resizeTimer = setTimeout(() => latest && render(latest), 150);
 });
 
-poll();
+Dash.poll('/status/status.json', render, Dash.showFreshness);
