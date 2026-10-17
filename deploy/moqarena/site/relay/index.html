@@ -94,7 +94,7 @@
     <div class="tile" data-key="delivered"><h3>Delivered</h3><div class="value">—</div><div class="sub"></div></div>
   </section>
   <section class="tiles tiles-7" aria-label="Relay rates">
-    <div class="tile" data-key="groups"><h3>Groups/s</h3><div class="value">—</div><div class="sub"></div></div>
+    <div class="tile" data-key="groups" data-spark="groups_per_s"><h3>Groups/s</h3><div class="value">—</div><div class="sub"></div></div>
     <div class="tile" data-key="objects" data-spark="objects_in_per_s"><h3>Objects/s</h3><div class="value">—</div><div class="sub"></div></div>
     <div class="tile" data-key="ingress" data-spark="ingress_bps"><h3>BW in</h3><div class="value">—</div><div class="sub"></div></div>
     <div class="tile" data-key="egress" data-spark="egress_bps"><h3>BW out</h3><div class="value">—</div><div class="sub"></div></div>
@@ -108,8 +108,8 @@
       <h2>Namespaces</h2>
       <div class="table-wrap">
         <table id="t-namespaces" class="compact">
-          <thead><tr><th>Namespace</th><th>Format</th><th>Origin</th><th class="n">Tracks</th>
-            <th class="n">Subs</th><th class="n">In / Out</th><th></th></tr></thead>
+          <thead><tr><th>Namespace</th><th>Origin</th><th class="n">Tracks</th>
+            <th class="n">Subs</th><th class="n">Peak</th><th class="n">In / Out</th><th></th></tr></thead>
           <tbody><tr><td colspan="7" class="empty">No namespaces.</td></tr></tbody>
         </table>
       </div>
@@ -119,11 +119,11 @@
       <h2>Tracks <span class="h2-scope" id="tracks-scope"></span></h2>
       <div class="table-wrap">
         <table id="t-tracks" class="compact">
-          <thead><tr><th>Track</th><th class="n">Subs</th><th class="n">In / Out</th>
-            <th class="n">Groups/s</th><th class="n">Objects/s</th>
+          <thead><tr><th>Track</th><th class="n">Subs</th><th class="n">Peak</th>
+            <th class="n">Groups/s</th><th class="n">Objects/s</th><th class="n">In / Out</th>
             <th class="n" title="One-way network estimate: half the publisher RTT plus half the subscribers' median RTT; no queueing or buffering">Latency ≈</th>
             <th>State</th></tr></thead>
-          <tbody><tr><td colspan="7" class="empty">No tracks.</td></tr></tbody>
+          <tbody><tr><td colspan="8" class="empty">No tracks.</td></tr></tbody>
         </table>
       </div>
     </section>

@@ -6,9 +6,9 @@ const {OTHER, $, el, svgEl, none, fmt} = Dash;
 const PLAYER = '/g5-player/';
 const PLAYER_DRAFT = '18';
 const STATES = new Set(['live', 'idle', 'held', 'parked', 'ended']);
-const TRACK_COLS = 7;
+const TRACK_COLS = 8;
 // Media track colors by name; other tracks take the remaining palette hues in order.
-const NAMED = [[/^catalog$/i, '#d9532b'], [/audio/i, '#6fbff5'], [/video/i, '#8457d0']];
+const NAMED = [[/^catalog$/i, '#d9532b'], [/audio/i, '#6fbff5'], [/video/i, '#a57be6']];
 const REST = ['#199e70', '#c98500', '#d55181', '#008300', '#e66767'];
 const ORDER = [...NAMED.map(([, c]) => c), ...REST];
 
@@ -124,9 +124,10 @@ function renderTiles(s) {
   setTile('namespaces', fmt.num(T.namespaces), playable ? `${playable} playable` : '');
   setTile('tracks', fmt.num(T.tracks), fmt.plural(T.fetches, 'fetch', 'fetches'));
   setTile('publishers', fmt.num(T.publishers), 'publishing sessions');
-  setTile('subscribers', fmt.num(T.subscribers), `${fmt.plural(subSessions, 'session')}`);
+  setTile('subscribers', fmt.num(T.subscribers),
+          `${fmt.plural(subSessions, 'session')} · peak ${fmt.num(T.subscribers_peak)}`);
   setTile('delivered', fmt.bytes(T.delivered_bytes), 'media since start');
-  setTile('groups', fmt.rate(groups), 'in, all tracks');
+  setTile('groups', fmt.rate(none(T.groups_per_s) ? groups : T.groups_per_s), 'in, all tracks');
   setTile('objects', fmt.rate(T.objects_in_per_s), 'in, all tracks');
   setTile('ingress', fmt.bps(T.ingress_bps), `media ${fmt.bps(T.media_in_bps)}`);
   setTile('egress', fmt.bps(T.egress_bps), `media ${fmt.bps(T.media_out_bps)}`);
@@ -160,9 +161,8 @@ function renderNamespaces(rows, wtUrl) {
     const tr = el('tr', {class: `pick${r.namespace === scope ? ' selected' : ''}`, tabindex: '0',
                          title: `${fmt.bytes(r.bytes_out)} delivered`},
       el('td', {}, el('code', {}, r.namespace)),
-      el('td', {}, r.format ? el('span', {class: 'badge'}, r.format) : '—'),
       el('td', {}, r.origin || '—'),
-      num(fmt.num(r.tracks)), num(fmt.num(r.subscribers)),
+      num(fmt.num(r.tracks)), num(fmt.num(r.subscribers)), num(fmt.num(r.peak)),
       inOut(r.in_bps, r.out_bps),
       el('td', {class: 'n'}, r.format ? playLink(r.namespace, wtUrl) : ''));
     tr.dataset.ns = r.namespace;
@@ -232,21 +232,24 @@ function trackDetail(r) {
   return lines.join('\n');
 }
 
-function trackRow(r) {
+// `format`: the namespace's MSF format, shown on its catalog track.
+function trackRow(r, format) {
   const state = STATES.has(r.state) ? r.state : 'idle';
   const color = colorOf(r.id) || OTHER;
+  const name = [el('code', {}, r.name)];
+  if (format && r.name === 'catalog') name.push(el('span', {class: 'format'}, ` (${format})`));
   return el('tr', {title: trackDetail(r)},
-    el('td', {}, el('i', {class: 'key-line', style: `background:${color}`}), el('code', {}, r.name)),
-    num(fmt.num(r.subscribers)),
-    inOut(r.in_bps, r.out_bps),
+    el('td', {}, el('i', {class: 'key-line', style: `background:${color}`}), ...name),
+    num(fmt.num(r.subscribers)), num(fmt.num(r.peak)),
     num(fmt.rate(r.groups_per_s)), num(fmt.rate(r.objects_per_s)),
+    inOut(r.in_bps, r.out_bps),
     num(fmt.ms(r.latency_ms)),
     el('td', {}, el('span', {class: `state state-${state}`}, state)));
 }
 
-function renderTracks(tracks) {
+function renderTracks(tracks, format) {
   $('tracks-scope').textContent = scope || '';
-  fill($('t-tracks'), tracks.map(trackRow), TRACK_COLS,
+  fill($('t-tracks'), tracks.map((r) => trackRow(r, format)), TRACK_COLS,
        scope === null ? 'No namespaces.' : 'No tracks in this namespace.');
 }
 
@@ -265,7 +268,7 @@ function render(s) {
   for (const r of s.tracks) colorOf(r.id);
   const tracks = scoped(s.tracks);
   renderTrackCharts(s, tracks);
-  renderTracks(tracks);
+  renderTracks(tracks, (s.namespaces.find((r) => r.namespace === scope) || {}).format);
 }
 
 function toast(target, text) {

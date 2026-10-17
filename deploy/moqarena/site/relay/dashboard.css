@@ -187,8 +187,9 @@ table.compact td { font-size: 13px; }
 }
 tr.pick { cursor: pointer; }
 tr.pick:focus-visible td { outline: 1px solid var(--gold); }
-tr.selected td { background: rgba(232, 179, 57, .07); }
-tr.selected td:first-child { box-shadow: inset 2px 0 var(--gold); }
+tr.selected td { background: #24242d; }
+tr.selected td:first-child code { color: var(--text); font-weight: 700; }
+.format { color: var(--dim); }
 td .key-line { margin: 0 8px 2px 2px; vertical-align: middle; }
 .note { color: var(--faint); font-size: 12px; margin: 4px 0 0; }
 .platform-link { font-family: Inter, system-ui, sans-serif; font-size: 13px; color: var(--gold); }
