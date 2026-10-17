@@ -70,6 +70,7 @@ from aiomoqt.messages.base import MOQTMessage
 from aiomoqt.messages.data import (FetchObject, ObjectDatagram,
                                    ObjectDatagramStatus)
 from aiomoqt.messages.fetch import _is_joining
+from aiomoqt.messages.publish import PublishError
 from aiomoqt.messages.request import RequestError, RequestOk
 from aiomoqt.messages.subscribe import Subscribe
 from aiomoqt.track import (PublishedTrack, SubscribedTrack, _UNFILTERED,
@@ -106,6 +107,8 @@ _announce_requests: dict[tuple, tuple] = {}
 
 # Tracks being relayed upstream->downstream, keyed by (namespace, name).
 _tracks: dict[tuple, "_RelayedTrack"] = {}
+# (namespace, name) -> the upstream SUBSCRIBE outstanding for it.
+_establishing: dict[tuple, "_Establishing"] = {}
 
 # Sessions this relay dialled OUT to. An origin does not announce to us,
 # so it never lands in _announced; it is tried as a fallback when no
@@ -133,6 +136,9 @@ RENDEZVOUS_TIMEOUT = 0x04
 RENDEZVOUS_MAX_S = 30.0
 # Longest a joining FETCH waits for the SUBSCRIBE it names to attach.
 JOINING_WAIT_S = 5.0
+# Longest the relay waits for a PUBLISH after an upstream refuses its
+# SUBSCRIBE as a duplicate subscription (§5.1: the PUBLISH crossed it).
+PUBLISH_WAIT_S = 1.5
 # Watchdog: self-probes failed in a row before exiting, the exit status
 # (EX_SOFTWARE), and the longest one probe may take.
 WATCHDOG_MISSES = 3
@@ -948,28 +954,118 @@ def _upstream_refusal(err, profile, fetch=False) -> tuple:
     return code, err.reason or "upstream error"
 
 
-async def _establish_upstream(ns, track_name):
+class _Establishing:
+    """One upstream SUBSCRIBE in flight for a Full Track Name; every
+    subscriber arriving meanwhile awaits `fut` for (fan-out, refusal)."""
+
+    def __init__(self, key):
+        self.key = key
+        self.fut = asyncio.get_running_loop().create_future()
+        # The publisher session the SUBSCRIBE is outstanding on.
+        self.pub = None
+        # Forward State of each waiting subscriber.
+        self.forwards: list[bool] = []
+        self.task = None
+
+    def resolve(self, result) -> None:
+        if _establishing.get(self.key) is self:
+            del _establishing[self.key]
+        if not self.fut.done():
+            self.fut.set_result(result)
+
+
+async def _establish_upstream(ns, track_name, forward=True):
     """Subscribe upstream once per Full Track Name. Returns (fan-out,
     None), or (None, the last upstream refusal or None) when no
-    publisher accepts.
+    publisher accepts. Concurrent callers share one upstream SUBSCRIBE.
 
     Transport §"Relays": with no Established upstream subscription for
     the Track, the relay subscribes to each publisher that announced the
     subscription's namespace or a prefix of it.
     """
     key = (ns, track_name)
+    entry = _establishing.get(key)
+    if entry is None:
+        track = _tracks.get(key)
+        if track is not None:
+            # Reuse only a live upstream. A track cached from an earlier
+            # cycle points at a closed session, and attaching a new
+            # subscriber to it delivers nothing at all.
+            if _track_live(track):
+                return track, None
+            logger.info(f"relay: dropping stale track {key}")
+            track.close()
+            _tracks.pop(key, None)
+        entry = _Establishing(key)
+        _establishing[key] = entry
+        entry.task = asyncio.create_task(_subscribe_upstream(entry))
+    entry.forwards.append(bool(forward))
+    return await asyncio.shield(entry.fut)
+
+
+def _parked_publish(key):
+    """The live track a PUBLISH registered for `key`, else None."""
     track = _tracks.get(key)
-    if track is not None:
-        # Reuse only a live upstream. A track cached from an earlier
-        # cycle points at a closed session, and attaching a new
-        # subscriber to it delivers nothing at all.
-        if _track_live(track):
-            return track, None
-        logger.info(f"relay: dropping stale track {key}")
-        track.close()
-        _tracks.pop(key, None)
+    if (track is not None and _track_live(track)
+            and (track.pending_publish is not None
+                 or _is_session(track.upstream))):
+        return track
+    return None
+
+
+def _is_session(obj) -> bool:
+    return obj is not None and hasattr(obj, "_moqt_session_closed")
+
+
+def _duplicate_refusal(err, profile) -> bool:
+    """The publisher refused our SUBSCRIBE because it PUBLISHes the
+    track (§5.1); NOT_SUPPORTED from d20, which drops the code."""
+    code = canonical_request_error(err.error_code, profile)
+    if profile.param_table >= 20:
+        return code == RequestErrorCode.NOT_SUPPORTED
+    return code == RequestErrorCode.DUPLICATE_SUBSCRIPTION
+
+
+def _pending_subscribe_id(session, ns, track_name):
+    """Request ID of our newest SUBSCRIBE for the track on `session`."""
+    name = (track_name.encode() if isinstance(track_name, str)
+            else bytes(track_name))
+    for rid in sorted(getattr(session, "_subscriptions", {}), reverse=True):
+        msgs = session._subscriptions.get(rid) or ()
+        msg = msgs[0] if msgs else None
+        if (isinstance(msg, Subscribe) and msg.track_name == name
+                and tuple(msg.track_namespace) == tuple(ns)):
+            return rid
+    return None
+
+
+def _cancel_upstream_subscribe(session, ns, track_name) -> None:
+    rid = _pending_subscribe_id(session, ns, track_name)
+    if rid is None:
+        return
+    try:
+        session.unsubscribe(rid)
+    except Exception:
+        logger.debug("relay: cancelling the upstream SUBSCRIBE failed",
+                     exc_info=True)
+
+
+async def _subscribe_upstream(entry) -> None:
+    try:
+        result = await _subscribe_publishers(entry)
+    except Exception:
+        logger.exception(f"relay: upstream subscribe for {entry.key} failed")
+        result = (None, None)
+    entry.resolve(result)
+
+
+async def _subscribe_publishers(entry):
+    key = entry.key
+    ns, track_name = key
     refusal = None
     for pub in _publishers_for(ns):
+        if entry.fut.done():
+            break
         track = _RelayedTrack(key)
         track.attaching = True
         name = (track_name.decode() if isinstance(track_name, bytes)
@@ -979,13 +1075,39 @@ async def _establish_upstream(ns, track_name):
             pub, ns, name,
             on_object=track.on_object,
             on_done=lambda done, t=track, k=key: _upstream_done(t, k, done))
+        entry.pub = pub
         try:
             await upstream.subscribe(timeout=10.0)
         except Exception as e:
+            if entry.fut.done():
+                break
             logger.info(f"relay: upstream subscribe failed on {ns}: {e}")
-            if isinstance(e, MOQTRequestError):
-                refusal = _upstream_refusal(e, pub._profile)
+            if not isinstance(e, MOQTRequestError):
+                continue
+            refusal = _upstream_refusal(e, pub._profile)
+            if _duplicate_refusal(e, pub._profile):
+                # Its PUBLISH of the track is on the way; _on_publish
+                # resolves the entry when it lands.
+                try:
+                    await asyncio.wait_for(asyncio.shield(entry.fut),
+                                           PUBLISH_WAIT_S)
+                except asyncio.TimeoutError:
+                    logger.info(f"relay: no PUBLISH of {key} within "
+                                f"{PUBLISH_WAIT_S}s of the refusal")
             continue
+        if entry.fut.done():
+            # A crossing PUBLISH took over; the SUBSCRIBE was cancelled.
+            if upstream.track_alias is not None:
+                pub.unregister_object_handler(upstream.track_alias)
+            break
+        parked = _parked_publish(key)
+        if parked is not None:
+            # A PUBLISH from another session landed meanwhile and owns
+            # the track: never overwrite it.
+            _cancel_upstream_subscribe(pub, ns, track_name)
+            if upstream.track_alias is not None:
+                pub.unregister_object_handler(upstream.track_alias)
+            return parked, None
         track.upstream = upstream
         track.upstream_alias = upstream.track_alias
         # §10.2.11: Largest includes what the upstream SUBSCRIBE_OK reports.
@@ -1015,6 +1137,16 @@ def _subscribe_pending(session, request_id) -> bool:
     """The peer's SUBSCRIBE `request_id` is admitted and unanswered."""
     held = getattr(session, "_peer_requests", {}).get(request_id)
     return held is not None and held[0] is Subscribe
+
+
+def _still_wanted(session, request_id) -> bool:
+    """False once the subscriber cancelled the request or closed; no
+    reply is sent then."""
+    if not _session_live(session):
+        return False
+    if not is_draft16_or_later(session.negotiated_draft):
+        return True
+    return _subscribe_pending(session, request_id)
 
 
 async def _await_joined(session, request_id):
@@ -1107,6 +1239,15 @@ async def _on_publish(session, msg):
     if track is not None:
         owner = _upstream_session(track) or (
             track.pending_publish[0] if track.pending_publish else None)
+        if (owner is session and not track.finished
+                and not _is_session(track.upstream)
+                and track.upstream is not None):
+            # §5.1: our SUBSCRIBE already holds this session's
+            # subscription to the track.
+            logger.info(f"relay: publish {key} -> DUPLICATE_SUBSCRIPTION "
+                        f"(upstream subscription established)")
+            _refuse_publish(session, msg, "track already subscribed")
+            return
         if track.finished or owner is not session:
             # One publisher per Full Track Name. The predecessor's
             # close may not have been observed yet, and reusing its
@@ -1119,6 +1260,15 @@ async def _on_publish(session, msg):
     if track is None:
         track = _RelayedTrack(key)
         _tracks[key] = track
+    entry = _establishing.get(key)
+    crossing = (entry is not None and entry.pub is session
+                and not entry.fut.done())
+    if crossing:
+        # §5.1: this PUBLISH crossed our SUBSCRIBE on the same session;
+        # end the SUBSCRIBE and serve the waiters from the PUBLISH.
+        logger.info(f"relay: publish {key} crossed our upstream SUBSCRIBE; "
+                    f"cancelling it")
+        _cancel_upstream_subscribe(session, ns, msg.track_name)
     _watch_session(session, ns)
     track.pending_publish = (session, msg)
     # §9.4: a bare PUBLISH is the only notice d18 prefix subscribers get
@@ -1132,6 +1282,10 @@ async def _on_publish(session, msg):
             offered = True
             asyncio.create_task(
                 _offer_track(sub_session, track, key))
+    if crossing:
+        _answer_publish(track, forward=any(entry.forwards))
+        entry.resolve((track, None))
+        return
     if track.downstream or not offered:
         # With nobody to offer this track to, no reply is coming from
         # anywhere: answer now rather than hold. A publisher that
@@ -1145,13 +1299,14 @@ def _forwarding(track) -> bool:
     return any(d.forward for d in track.downstream)
 
 
-def _answer_publish(track) -> None:
+def _answer_publish(track, forward=None) -> None:
     """Answer a held PUBLISH and start taking objects: Forward State 1
     when a subscriber forwards (§9.5), else 0 until one does."""
     if track.pending_publish is None or track.upstream is not None:
         return
     session, msg = track.pending_publish
-    forward = _forwarding(track)
+    if forward is None:
+        forward = _forwarding(track)
     session._track_aliases[msg.track_alias] = msg.request_id
     session.register_object_handler(msg.track_alias, track.on_object)
     session.register_stream_end_handler(msg.track_alias, track.on_stream_end)
@@ -1169,6 +1324,22 @@ def _answer_publish(track) -> None:
     track.upstream_request_id = msg.request_id
     track.parked = None if forward else (session, msg)
     track.pending_publish = None
+
+
+def _refuse_publish(session, msg, reason) -> None:
+    """DUPLICATE_SUBSCRIPTION for a PUBLISH (NOT_SUPPORTED from d20,
+    PUBLISH_ERROR at d14)."""
+    prof = session._profile
+    code = (RequestErrorCode.NOT_SUPPORTED if prof.param_table >= 20
+            else RequestErrorCode.DUPLICATE_SUBSCRIPTION)
+    if is_draft16_or_later(session.negotiated_draft):
+        session.subscribe_error(msg.request_id, error_code=code,
+                                reason=reason)
+        return
+    reply = PublishError(request_id=msg.request_id,
+                         error_code=request_error_code(code, prof),
+                         reason=reason)
+    session.send_control_message(reply)
 
 
 def _resume_parked_publish(track) -> None:
@@ -1309,7 +1480,7 @@ async def _on_subscribe(session, msg):
         logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
                     f"held up to {wait_s:.3f}s for a publisher")
         if not await _await_publisher(session, ns, msg.track_name, wait_s):
-            if not _session_live(session):
+            if not _still_wanted(session, msg.request_id):
                 return
             logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
                         f"-> ERROR (rendezvous timeout)")
@@ -1344,9 +1515,17 @@ async def _on_subscribe(session, msg):
         await _await_upstream()
     why = "not announced"
     if _announced_match(ns) or _upstreams:
-        track, refusal = await _establish_upstream(ns, msg.track_name)
+        forward = msg.forward is None or bool(msg.forward)
+        track, refusal = await _establish_upstream(ns, msg.track_name,
+                                                   forward=forward)
+        if not _still_wanted(session, msg.request_id):
+            logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
+                        f"cancelled before its reply")
+            return
         if track is not None:
             if _attach_subscriber(session, msg, track):
+                _answer_publish(track)
+                _resume_parked_publish(track)
                 logger.info(f"relay: subscribe ns={ns} "
                             f"track={msg.track_name} -> SUBSCRIBE_OK "
                             f"(fanout={len(track.downstream)})")

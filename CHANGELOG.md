@@ -6,6 +6,12 @@
   an upstream refusal reaches the subscriber with its own code and reason, not DOES_NOT_EXIST.
 - `canonical_stream_reset()`: the StreamResetCode a received reset code means at a draft.
 - Relay: an upstream subgroup-stream reset reaches each subscriber in its draft's code (d16 0x4 UNKNOWN_OBJECT_STATUS was sent to d18 as GOING_AWAY).
+- Relay: concurrent subscribers to a track share one upstream SUBSCRIBE.
+- Relay: a PUBLISH crossing its pending upstream SUBSCRIBE on that session cancels the SUBSCRIBE and is answered with the waiting subscribers' Forward State (§5.1).
+- Relay: an upstream DUPLICATE_SUBSCRIPTION refusal waits up to 1.5 s for that publisher's PUBLISH.
+- Relay: a PUBLISH beside an established upstream subscription on its session is refused DUPLICATE_SUBSCRIPTION.
+- Relay: an upstream subscription never replaces a track a PUBLISH holds.
+- Relay: no reply to a SUBSCRIBE the subscriber cancelled while it was held.
 - Relay: `--status-dir` also writes `platform.json` (host detail from /proc: CPU by mode,
   pressure, memory, disks, interfaces, UDP, the relay's socket and process) and per-track
   history and subscriber lists in `status.json`.
