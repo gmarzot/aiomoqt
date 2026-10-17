@@ -1358,7 +1358,7 @@ class _MOQTSessionMixin:
                     f"{message_class.__name__} body ends "
                     f"{end_pos - buf.tell()} bytes short of its Length")
             self._route_reply(msg)
-            logger.info(f"MOQT event: control message parsed: {msg})")
+            logger.info(f"MOQT event: control message parsed: {self._msgstr(msg)})")
             refusal = (self._resolve_auth_token(msg)
                        or self._refuse_request(msg))
             routed = refusal or self._track_handler(msg)
@@ -2112,7 +2112,7 @@ class _MOQTSessionMixin:
                     self._admit_fetch_stream(stream_id, msg_header)
                 else:
                     raise MOQTProtocolViolation(
-                        f"unknown data stream type 0x{stream_type:x}")
+                        self._unknown_stream_type_reason(buf, pos, stream_type))
 
                 if msg_header is None:
                     # Parse failure on the data stream type byte. Reject
@@ -2568,6 +2568,19 @@ class _MOQTSessionMixin:
 
         if stream_id == self._control_read_stream_id:
             self._on_control_data(stream_id, data, end_stream)
+
+    def _unknown_stream_type_reason(self, buf, pos: int, stream_type: int) -> str:
+        """Close reason for an unknown uni stream type. A WT server with no
+        WT-Protocol runs the d14 fallback, so a d18+ SETUP lands here; name
+        the missing offer instead of the misparsed type."""
+        if (self._is_wt and not self._is_client
+                and not self._profile.control_uni_pair
+                and not getattr(self, 'negotiated_protocol', None)
+                and self._d18_peek_is_setup(
+                    buf.data_slice(pos, min(pos + 9, buf.capacity)))):
+            return ("SETUP on a uni stream with no WT-Protocol: offer "
+                    "moqt-NN in WT-Available-Protocols")
+        return f"unknown data stream type 0x{stream_type:x}"
 
     @staticmethod
     def _d18_peek_is_setup(data) -> Optional[bool]:
@@ -3316,6 +3329,13 @@ class _MOQTSessionMixin:
             f"refusing to send {name} (type 0x{int(msg.type):02x}): "
             f"not defined by draft-{draft}")
 
+    def _msgstr(self, msg) -> str:
+        """A message rendered for logs, parameters named at this session's draft."""
+        describe = getattr(msg, 'describe', None)
+        if describe is None:
+            return str(msg)
+        return describe(getattr(self, '_profile', None))
+
     def send_control_message(self, msg: MOQTMessage) -> None:
         """Serialize and send a MoQT control message on the control
         stream. Serialization happens here at the session's negotiated
@@ -3572,9 +3592,9 @@ class _MOQTSessionMixin:
             if (kind, key) in self._peer_requests.values():
                 code = duplicate
                 reason = "track already subscribed in this session"
-            elif self._publish_pending(key):
+            elif self._publishing(key):
                 code = duplicate
-                reason = "our PUBLISH of the track awaits its reply"
+                reason = "our PUBLISH of the track holds its subscription"
         elif kind in (SubscribeNamespace, SubscribeTracks):
             key = ns
             for k, prefix in self._peer_requests.values():
@@ -3678,17 +3698,22 @@ class _MOQTSessionMixin:
                 f"PUBLISH_STATE_NOTIFY on a {cls.__name__} stream "
                 f"{'we' if ours else 'the peer'} opened")
 
-    def _publish_pending(self, key) -> bool:
-        """True while our PUBLISH of this Full Track Name awaits its reply:
-        the subscription is Pending (publisher), §5.1."""
+    def _publishing(self, key) -> bool:
+        """True while our PUBLISH of this Full Track Name is bound: its
+        subscription is Pending (publisher) or Established, §5.1."""
         track = self._published_tracks.get(key)
         if track is None:
             return False
-        for rid, entry in self._requests.items():
-            fut = self._pending_requests.get(rid)
-            if entry.track is track and fut is not None and not fut.done():
-                return True
-        return False
+        own = 0 if self._is_client else 1
+        return any(entry.track is track and entry.role == "publisher"
+                   and rid & 1 == own
+                   for rid, entry in self._requests.items())
+
+    def _peer_subscribed(self, track) -> bool:
+        """True while a SUBSCRIBE from the peer for the track is admitted,
+        including one its handler has not reached yet."""
+        key = self._track_key(track.namespace, track.trackname)
+        return (Subscribe, key) in self._peer_requests.values()
 
     def _refuse_prefix_update(self, msg: RequestUpdate) -> Optional[Callable]:
         """§10.9.2: a REQUEST_UPDATE that moves a SUBSCRIBE_NAMESPACE or
@@ -3958,7 +3983,7 @@ class _MOQTSessionMixin:
             versions=versions,
             parameters=parameters
         )
-        logger.info(f"MOQT send: {message}")
+        logger.info(f"MOQT send: {self._msgstr(message)}")
         self.send_control_message(message)
 
         return message
@@ -3982,7 +4007,7 @@ class _MOQTSessionMixin:
             selected_version=selected_version,
             parameters=parameters
         )
-        logger.info(f"MOQT send: {message}")
+        logger.info(f"MOQT send: {self._msgstr(message)}")
         self.send_control_message(message)
         return message
 
@@ -4058,7 +4083,7 @@ class _MOQTSessionMixin:
             self._pending_object_handlers[request_id] = on_object
         if on_done is not None:
             self.register_publish_done_handler(request_id, on_done)
-        logger.info(f"MOQT send: {message}")
+        logger.info(f"MOQT send: {self._msgstr(message)}")
         self._send_request(request_id, message)
 
         if not wait_response:
@@ -4095,7 +4120,7 @@ class _MOQTSessionMixin:
             filter_type=filter_type,
             parameters=parameters or {},
         )
-        logger.info(f"MOQT send: {message}")
+        logger.info(f"MOQT send: {self._msgstr(message)}")
         self._send_request(request_id, message)
         if not wait_response:
             return message
@@ -4136,7 +4161,7 @@ class _MOQTSessionMixin:
             lf = params.get(ParamType.LOCATION_FILTER, self._sent_filter(sub))
             self._register_fill(request_id, params, lf, sub.group_order,
                                 params.get(ParamType.FORWARD))
-        logger.info(f"MOQT send: {message}")
+        logger.info(f"MOQT send: {self._msgstr(message)}")
         if self._profile.control_uni_pair:
             sid = self._bidi_streams.get(existing_request_id)
             if sid is None:
@@ -4180,7 +4205,7 @@ class _MOQTSessionMixin:
         if self._profile.publish_ok_expires_only:
             message = PublishOk(request_id=request_msg.request_id,
                                 parameters=dict(parameters or {}))
-            logger.info(f"MOQT send: {message}")
+            logger.info(f"MOQT send: {self._msgstr(message)}")
             self._send_reply(request_msg.request_id, message)
             update = self._publish_ok_update(
                 request_msg, forward, priority, filter_type, start_group,
@@ -4200,7 +4225,7 @@ class _MOQTSessionMixin:
             end_group=end_group,
             parameters=parameters or {},
         )
-        logger.info(f"MOQT send: {message}")
+        logger.info(f"MOQT send: {self._msgstr(message)}")
         self._send_reply(request_msg.request_id, message)
         return message
 
@@ -4294,7 +4319,7 @@ class _MOQTSessionMixin:
             parameters=parameters or {},
             track_extensions=track_properties,
         )
-        logger.info(f"MOQT send: {message}")
+        logger.info(f"MOQT send: {self._msgstr(message)}")
         self._send_reply(request_msg.request_id, message)
         return message
 
@@ -4319,7 +4344,7 @@ class _MOQTSessionMixin:
             stream_count=stream_count,
             reason=reason,
         )
-        logger.info(f"MOQT send: {message}")
+        logger.info(f"MOQT send: {self._msgstr(message)}")
         self._retire_published_alias(request_id)
         self._send_reply(request_id, message, fin=True)
         return message
@@ -4344,7 +4369,7 @@ class _MOQTSessionMixin:
                 retry_interval=0,
                 reason=reason,
             )
-            logger.info(f"MOQT send: {message}")
+            logger.info(f"MOQT send: {self._msgstr(message)}")
             self._send_reply(request_id, message, fin=True)
         else:
             message = SubscribeError(
@@ -4352,7 +4377,7 @@ class _MOQTSessionMixin:
                 error_code=error_code,
                 reason=reason,
             )
-            logger.info(f"MOQT send: {message}")
+            logger.info(f"MOQT send: {self._msgstr(message)}")
             self.send_control_message(message)
         return message
     
@@ -4381,7 +4406,7 @@ class _MOQTSessionMixin:
             self._fail_waiting_updates(request_id, "cancelled")
             return None
         message = Unsubscribe(request_id=request_id)
-        logger.info(f"MOQT send: {message}")
+        logger.info(f"MOQT send: {self._msgstr(message)}")
         self.send_control_message(message)
         return message
 
@@ -4550,7 +4575,7 @@ class _MOQTSessionMixin:
         )
         self._subscriptions[request_id] = [message]
         self._fetch_done_futures[request_id] = self._loop.create_future()
-        logger.info(f"MOQT send: {message}")
+        logger.info(f"MOQT send: {self._msgstr(message)}")
         self._send_request(request_id, message)
         if not wait_response:
             return message
@@ -4614,7 +4639,7 @@ class _MOQTSessionMixin:
             self._loop.create_future()
         if on_object is not None:
             self.register_fetch_object_handler(request_id, on_object)
-        logger.info(f"MOQT send: {message}")
+        logger.info(f"MOQT send: {self._msgstr(message)}")
         # FETCH is a request opener: at d18 it must open its own bidi
         # request stream (like SUBSCRIBE/PUBLISH); pre-d18 _send_request
         # falls back to the single control stream.
@@ -4654,7 +4679,7 @@ class _MOQTSessionMixin:
             parameters=parameters or {},
             track_extensions=track_extensions or {},
         )
-        logger.info(f"MOQT send: {message}")
+        logger.info(f"MOQT send: {self._msgstr(message)}")
         # FETCH_OK is a response: at d18 it returns on the request's own
         # bidi stream; pre-d18 _send_reply falls back to the control stream.
         self._send_reply(request_id, message)
@@ -4762,7 +4787,7 @@ class _MOQTSessionMixin:
                 retry_interval=0,
                 reason=reason,
             )
-            logger.info(f"MOQT send: {message}")
+            logger.info(f"MOQT send: {self._msgstr(message)}")
             self._send_reply(request_id, message, fin=True)
         else:
             message = FetchError(
@@ -4770,7 +4795,7 @@ class _MOQTSessionMixin:
                 error_code=error_code,
                 reason=reason,
             )
-            logger.info(f"MOQT send: {message}")
+            logger.info(f"MOQT send: {self._msgstr(message)}")
             self.send_control_message(message)
         return message
 
@@ -4792,7 +4817,7 @@ class _MOQTSessionMixin:
         # resolve before the awaiter registers (race we hit in join()).
         if wait_response:
             self._pending_requests[request_id] = self._loop.create_future()
-        logger.info(f"MOQT send: {message}")
+        logger.info(f"MOQT send: {self._msgstr(message)}")
         self._send_request(request_id, message)
         self._announced[request_id] = namespace_tuple
         self._report_namespace(namespace_tuple, withdrawn=False)
@@ -4879,7 +4904,7 @@ class _MOQTSessionMixin:
             parameters=parameters or {},
             track_extensions=track_properties,
         )
-        logger.info(f"MOQT send: {message}")
+        logger.info(f"MOQT send: {self._msgstr(message)}")
         # Pre-register the response future before send (like subscribe /
         # fetch / publish_namespace) so a fast peer ack can't resolve
         # before the awaiter registers — a race on loopback.
@@ -4920,7 +4945,7 @@ class _MOQTSessionMixin:
             message = RequestOk(request_id=msg.request_id)
         else:
             message = PublishNamespaceOk(request_id=msg.request_id)
-        logger.info(f"MOQT send: {message} request_id: {msg.request_id} namespace: {msg.namespace}")
+        logger.info(f"MOQT send: {self._msgstr(message)} request_id: {msg.request_id} namespace: {msg.namespace}")
         # PUBLISH_NAMESPACE is "Request, First" at d18: it opens its own
         # bidi stream and the reply returns on that stream, carrying no
         # Request ID. Sending it on the control stream instead left the
@@ -4966,7 +4991,7 @@ class _MOQTSessionMixin:
         namespace = (withdrawn if namespace is None
                      else self._make_namespace_tuple(namespace))
         message = PublishNamespaceDone(namespace=namespace, request_id=request_id)
-        logger.info(f"MOQT send: {message}")
+        logger.info(f"MOQT send: {self._msgstr(message)}")
         self.send_control_message(message)
         return message
 
@@ -4996,7 +5021,7 @@ class _MOQTSessionMixin:
             subscribe_options=subscribe_options,
             parameters=parameters
         )
-        logger.info(f"MOQT send: {message}")
+        logger.info(f"MOQT send: {self._msgstr(message)}")
 
         if self._profile.control_uni_pair:
             self._note_request_kind(request_id, SubscribeNamespace, ours=True)
@@ -5030,11 +5055,11 @@ class _MOQTSessionMixin:
         """
         if not is_draft16_or_later(self.negotiated_draft):
             message = SubscribeNamespaceOk(request_id=msg.request_id)
-            logger.info(f"MOQT send: {message}")
+            logger.info(f"MOQT send: {self._msgstr(message)}")
             self.send_control_message(message)
             return message
         message = RequestOk(request_id=msg.request_id)
-        logger.info(f"MOQT send: {message}")
+        logger.info(f"MOQT send: {self._msgstr(message)}")
         if stream_id is not None:
             self.send_stream_message(stream_id, message)
         else:
@@ -5052,7 +5077,7 @@ class _MOQTSessionMixin:
         PUBLISH per track in the requested namespace.
         """
         message = RequestOk(request_id=msg.request_id)
-        logger.info(f"MOQT send: {message}")
+        logger.info(f"MOQT send: {self._msgstr(message)}")
         if stream_id is not None:
             self.send_stream_message(stream_id, message)
         else:
@@ -5087,7 +5112,7 @@ class _MOQTSessionMixin:
             reason=reason,
             redirect=(connect_uri, tuple(namespace or ()), track_name),
         )
-        logger.info(f"MOQT send: {message}")
+        logger.info(f"MOQT send: {self._msgstr(message)}")
         self._send_reply(msg.request_id, message, fin=True)
         return message
 
@@ -5117,7 +5142,7 @@ class _MOQTSessionMixin:
                 SessionCloseCode.INTERNAL_ERROR,
                 f"NAMESPACE is not defined by draft-{self.negotiated_draft}")
         message = Namespace(namespace_suffix=suffix)
-        logger.info(f"MOQT send: {message}")
+        logger.info(f"MOQT send: {self._msgstr(message)}")
         if stream_id is not None:
             self.send_stream_message(stream_id, message)
         elif request_id is not None:
@@ -5152,7 +5177,7 @@ class _MOQTSessionMixin:
                 f"NAMESPACE_DONE is not defined by "
                 f"draft-{self.negotiated_draft}")
         message = NamespaceDone(namespace_suffix=suffix)
-        logger.info(f"MOQT send: {message}")
+        logger.info(f"MOQT send: {self._msgstr(message)}")
         if stream_id is not None:
             self.send_stream_message(stream_id, message)
         elif request_id is not None:
@@ -5192,7 +5217,7 @@ class _MOQTSessionMixin:
             namespace_prefix=ns,
             parameters=parameters,
         )
-        logger.info(f"MOQT send: {message}")
+        logger.info(f"MOQT send: {self._msgstr(message)}")
         if self._profile.control_uni_pair:
             self._note_request_kind(request_id, SubscribeTracks, ours=True)
         stream_id = await self.open_bidi_stream()
@@ -5252,7 +5277,7 @@ class _MOQTSessionMixin:
                 raise ValueError(
                     f"a request GOAWAY needs draft-18 or later, not "
                     f"draft-{self.negotiated_draft}")
-            logger.info(f"MOQT send: {msg} on request {request_id}")
+            logger.info(f"MOQT send: {self._msgstr(msg)} on request {request_id}")
             self._send_on_request_stream(request_id, msg)
             return msg
         if self.negotiated_draft >= 18 and self._profile.goaway_request_id:
@@ -5260,7 +5285,7 @@ class _MOQTSessionMixin:
                 msg.request_id = 0 if not self._is_client else 1
             else:
                 msg.request_id = self._peer_request_max + 2
-        logger.info(f"MOQT send: {msg}")
+        logger.info(f"MOQT send: {self._msgstr(msg)}")
         self.send_control_message(msg)
         self._goaway_sent = True
         return msg
@@ -5292,7 +5317,7 @@ class _MOQTSessionMixin:
             return None
         prefix = self._make_namespace_tuple(namespace_prefix)
         message = UnsubscribeNamespace(namespace_prefix=prefix)
-        logger.info(f"MOQT send: {message}")
+        logger.info(f"MOQT send: {self._msgstr(message)}")
         self.send_control_message(message)
         return message
 
@@ -5314,7 +5339,7 @@ class _MOQTSessionMixin:
             self._control_msg_overrides[alias] = handler
     
     async def _handle_server_setup(self, msg: ServerSetup) -> None:
-        logger.info(f"MOQT event: handle {msg}")
+        logger.info(f"MOQT event: handle {self._msgstr(msg)}")
 
         if not self._is_client:
             error = "MOQT event: received SERVER_SETUP message as server"
@@ -5359,7 +5384,7 @@ class _MOQTSessionMixin:
             self._moqt_session_setup.set_result(True)
 
     async def _handle_client_setup(self, msg: ClientSetup) -> None:
-        logger.info(f"MOQT event: handle {msg}")
+        logger.info(f"MOQT event: handle {self._msgstr(msg)}")
         # Send SERVER_SETUP in response
         if self._is_client:
             error = "MOQT event: received CLIENT_SETUP message as client"
@@ -5396,21 +5421,21 @@ class _MOQTSessionMixin:
 
     async def _handle_subscribe(self, msg: Subscribe) -> None:
         """Refuse a SUBSCRIBE no published track or app handler took."""
-        logger.info(f"MOQT receive: {msg}")
+        logger.info(f"MOQT receive: {self._msgstr(msg)}")
         self.subscribe_error(msg.request_id,
                              error_code=RequestErrorCode.DOES_NOT_EXIST,
                              reason="track does not exist")
 
     async def _handle_publish_namepace(self, msg: PublishNamespace) -> None:
-        logger.info(f"MOQT receive: {msg}")
+        logger.info(f"MOQT receive: {self._msgstr(msg)}")
         self.publish_namepace_ok(msg)
 
     async def _handle_subscribe_update(self, msg: SubscribeUpdate) -> None:
-        logger.info(f"MOQT event: handle {msg}")
+        logger.info(f"MOQT event: handle {self._msgstr(msg)}")
         # Handle subscription update
 
     async def _handle_subscribe_ok(self, msg: SubscribeOk) -> None:
-        logger.info(f"MOQT event: handle {msg}")
+        logger.info(f"MOQT event: handle {self._msgstr(msg)}")
         if msg.request_id in self._subscriptions:
             self._subscriptions[msg.request_id].append(msg)
         # The publisher's alias assignment is authoritative — SUBSCRIBE
@@ -5423,21 +5448,21 @@ class _MOQTSessionMixin:
         self._resolve_request(msg.request_id, msg)
 
     async def _handle_subscribe_error(self, msg: SubscribeError) -> None:
-        logger.info(f"MOQT event: handle {msg}")
+        logger.info(f"MOQT event: handle {self._msgstr(msg)}")
         if msg.request_id in self._subscriptions:
             self._subscriptions[msg.request_id].append(msg)
         self._resolve_request(msg.request_id, msg)
 
     async def _handle_publish_namepace_ok(self, msg: PublishNamespaceOk) -> None:
-        logger.info(f"MOQT event: handle {msg}")
+        logger.info(f"MOQT event: handle {self._msgstr(msg)}")
         self._resolve_request(msg.request_id, msg)
 
     async def _handle_publish_namepace_error(self, msg: PublishNamespaceError) -> None:
-        logger.info(f"MOQT event: handle {msg}")
+        logger.info(f"MOQT event: handle {self._msgstr(msg)}")
         self._resolve_request(msg.request_id, msg)
 
     async def _handle_publish_namepace_done(self, msg: PublishNamespaceDone) -> None:
-        logger.info(f"MOQT event: handle {msg}")
+        logger.info(f"MOQT event: handle {self._msgstr(msg)}")
         # Publisher is releasing the namespace — for subscribers whose
         # only interest is this namespace, that's a clean end-of-track
         # signal. Close the session so bench tools exit promptly
@@ -5446,7 +5471,7 @@ class _MOQTSessionMixin:
                             "publisher namespace done")
 
     async def _handle_publish_namepace_cancel(self, msg: PublishNamespaceCancel) -> None:
-        logger.info(f"MOQT event: handle {msg}")
+        logger.info(f"MOQT event: handle {self._msgstr(msg)}")
         # Handle announcement cancellation
 
     async def _handle_unsubscribe(self, msg: Unsubscribe) -> None:
@@ -5454,7 +5479,7 @@ class _MOQTSessionMixin:
         issued and notify the owner, which owns the data streams.
         Receive-side state is keyed by the peer's aliases, a different
         number space, and is left alone."""
-        logger.info(f"MOQT event: handle {msg}")
+        logger.info(f"MOQT event: handle {self._msgstr(msg)}")
         self._subscriptions.pop(msg.request_id, None)
         # d18 has no UNSUBSCRIBE; there the same news arrives as a
         # terminated request stream. Both reach the owner the same way.
@@ -5535,7 +5560,7 @@ class _MOQTSessionMixin:
     async def _handle_max_request_id(self, msg: MaxSubscribeId) -> None:
         """§9.5: the peer raised the ceiling on our request ids; it
         MUST only increase."""
-        logger.info(f"MOQT event: handle {msg}")
+        logger.info(f"MOQT event: handle {self._msgstr(msg)}")
         new = int(msg.request_id)
         if (self._peer_request_limit is not None
                 and new <= self._peer_request_limit):
@@ -5546,11 +5571,11 @@ class _MOQTSessionMixin:
         self._requests_blocked_sent = False
 
     async def _handle_subscribes_blocked(self, msg: SubscribesBlocked) -> None:
-        logger.info(f"MOQT event: handle {msg}")
+        logger.info(f"MOQT event: handle {self._msgstr(msg)}")
         # Handle subscribes blocked notification
 
     async def _handle_track_status(self, msg: TrackStatus) -> None:
-        logger.info(f"MOQT event: handle {msg}")
+        logger.info(f"MOQT event: handle {self._msgstr(msg)}")
         if is_draft16_or_later(self.negotiated_draft):
             # §10.14: the receiver MUST answer with exactly one
             # TRACK_STATUS_OK or REQUEST_ERROR. A session with no track
@@ -5566,15 +5591,15 @@ class _MOQTSessionMixin:
             self._send_reply(msg.request_id, err, fin=True)
 
     async def _handle_track_status_ok(self, msg: TrackStatusOk) -> None:
-        logger.info(f"MOQT event: handle {msg}")
+        logger.info(f"MOQT event: handle {self._msgstr(msg)}")
         self._resolve_request(msg.request_id, msg)
 
     async def _handle_track_status_error(self, msg: TrackStatusError) -> None:
-        logger.info(f"MOQT event: handle {msg}")
+        logger.info(f"MOQT event: handle {self._msgstr(msg)}")
         self._resolve_request(msg.request_id, msg)
 
     async def _handle_goaway(self, msg: GoAway) -> None:
-        logger.info(f"MOQT event: handle {msg}")
+        logger.info(f"MOQT event: handle {self._msgstr(msg)}")
         # §10.4: only a server may carry a New Session URI. One GOAWAY per
         # stream is enforced in _on_control_data.
         if not self._is_client and msg.new_session_uri:
@@ -5590,7 +5615,7 @@ class _MOQTSessionMixin:
                 and msg.request_id not in self._peer_requests)
 
     async def _handle_subscribe_namespace(self, msg: SubscribeNamespace) -> None:
-        logger.info(f"MOQT event: handle {msg}")
+        logger.info(f"MOQT event: handle {self._msgstr(msg)}")
         if self._cancelled_unhandled(msg):
             return
         stream_id = self._bidi_streams.get(msg.request_id)
@@ -5615,7 +5640,7 @@ class _MOQTSessionMixin:
         PUBLISH per track (the same announcement d14/d16 relays pushed
         unprompted from SUBSCRIBE_NAMESPACE). An app that registers its
         own handler for this type overrides the default ack."""
-        logger.info(f"MOQT event: handle {msg}")
+        logger.info(f"MOQT event: handle {self._msgstr(msg)}")
         if self._cancelled_unhandled(msg):
             return
         self.subscribe_tracks_ok(msg)
@@ -5623,18 +5648,18 @@ class _MOQTSessionMixin:
     async def _handle_publish_blocked(self, msg: PublishBlocked) -> None:
         # d18 PUBLISH_BLOCKED (0x0F) — subscriber-side notice that a track
         # cannot be published. Log-only for now.
-        logger.info(f"MOQT event: handle {msg}")
+        logger.info(f"MOQT event: handle {self._msgstr(msg)}")
 
     async def _handle_subscribe_namespace_ok(self, msg: SubscribeNamespaceOk) -> None:
-        logger.info(f"MOQT event: handle {msg}")
+        logger.info(f"MOQT event: handle {self._msgstr(msg)}")
         self._resolve_request(msg.request_id, msg)
 
     async def _handle_subscribe_namespace_error(self, msg: SubscribeNamespaceError) -> None:
-        logger.info(f"MOQT event: handle {msg}")
+        logger.info(f"MOQT event: handle {self._msgstr(msg)}")
         self._resolve_request(msg.request_id, msg)
 
     async def _handle_unsubscribe_namespace(self, msg: UnsubscribeNamespace) -> None:
-        logger.info(f"MOQT event: handle {msg}")
+        logger.info(f"MOQT event: handle {self._msgstr(msg)}")
         # No response required per draft-14
         prefix = tuple(msg.namespace_prefix or ())
         for rid, (kind, key) in list(self._peer_requests.items()):
@@ -5642,7 +5667,7 @@ class _MOQTSessionMixin:
                 del self._peer_requests[rid]
 
     async def _handle_publish(self, msg: Publish) -> None:
-        logger.info(f"MOQT event: handle {msg}")
+        logger.info(f"MOQT event: handle {self._msgstr(msg)}")
         self._publish_announcements.put_nowait(msg)
 
     async def _handle_publish_ok(self, msg: PublishOk) -> None:
@@ -5652,12 +5677,13 @@ class _MOQTSessionMixin:
         REQUEST_OK on the request's stream, so nothing else resolves
         the sender's future — without this an awaited publish() waits
         out its whole timeout on an offer that was accepted."""
-        logger.info(f"MOQT event: handle {msg}")
+        logger.info(f"MOQT event: handle {self._msgstr(msg)}")
         self._resolve_request(msg.request_id, msg)
 
     async def _handle_publish_error(self, msg: PublishError) -> None:
         """Subscriber rejected our PUBLISH; the awaiter raises."""
-        logger.info(f"MOQT event: handle {msg}")
+        logger.info(f"MOQT event: handle {self._msgstr(msg)}")
+        self._unbind_request(msg.request_id)
         self._resolve_request(msg.request_id, msg)
 
     async def _handle_fetch(self, msg: Fetch) -> None:
@@ -5667,7 +5693,7 @@ class _MOQTSessionMixin:
         (INVALID_JOINING_REQUEST_ID, §10.12.2); a standalone one is
         refused NOT_SUPPORTED. Override via register_handler(FETCH, ...)
         to serve others (see serve_fetch())."""
-        logger.info(f"MOQT event: handle {msg}")
+        logger.info(f"MOQT event: handle {self._msgstr(msg)}")
         if _is_joining(msg.fetch_type):
             code, reason = (RequestErrorCode.INVALID_JOINING_REQUEST_ID,
                             "no such subscription")
@@ -5680,7 +5706,7 @@ class _MOQTSessionMixin:
     async def _handle_fetch_cancel(self, msg: FetchCancel) -> None:
         """d14/d16 FETCH_CANCEL for a fetch we serve: reset its stream
         and tell the request's owner."""
-        logger.info(f"MOQT event: handle {msg}")
+        logger.info(f"MOQT event: handle {self._msgstr(msg)}")
         stream_id = (self._served_fetch_streams or {}).pop(msg.request_id,
                                                            None)
         if stream_id is not None:
@@ -5690,7 +5716,7 @@ class _MOQTSessionMixin:
         self._notify_request_cancelled(msg.request_id, "FETCH_CANCEL")
 
     async def _handle_fetch_ok(self, msg: FetchOk) -> None:
-        logger.info(f"MOQT event: handle {msg}")
+        logger.info(f"MOQT event: handle {self._msgstr(msg)}")
         self._resolve_request(msg.request_id, msg)
 
     async def _handle_fetch_error(self, msg: FetchError) -> None:
@@ -5702,7 +5728,7 @@ class _MOQTSessionMixin:
         write side. Then resolve the pending request future with the
         error.
         """
-        logger.info(f"MOQT event: handle {msg}")
+        logger.info(f"MOQT event: handle {self._msgstr(msg)}")
         stream_id = self._fetch_stream_by_request.pop(msg.request_id, None)
         if stream_id is not None:
             state = self._data_streams.get(stream_id)
@@ -5716,7 +5742,7 @@ class _MOQTSessionMixin:
     # Data handlers need full update - stream reader in progress
     async def _handle_subgroup_header(self, msg: SubgroupHeader, buf: Buffer) -> None:
         """Handle subgroup header message."""
-        logger.info(f"MOQT event: handle {msg}")
+        logger.info(f"MOQT event: handle {self._msgstr(msg)}")
         # Process subgroup header - 
         sub_id = self._track_aliases.get(msg.track_alias)
         if sub_id is not None:
@@ -5729,11 +5755,11 @@ class _MOQTSessionMixin:
         inline in _moqt_handle_data_stream — unknown request_ids are
         rejected at the stream level via STOP_SENDING. Kept here for
         registry completeness so user overrides can hook in."""
-        logger.info(f"MOQT event: handle {msg}")
+        logger.info(f"MOQT event: handle {self._msgstr(msg)}")
         return
 
     async def _handle_request_ok(self, msg: RequestOk) -> None:
-        logger.info(f"MOQT event: handle {msg}")
+        logger.info(f"MOQT event: handle {self._msgstr(msg)}")
         status = msg.request_id in self._track_status_requests
         self._track_status_requests.discard(msg.request_id)
         if msg.track_properties and not status:
@@ -5745,7 +5771,7 @@ class _MOQTSessionMixin:
         self._resolve_request(msg.request_id, msg)
 
     async def _handle_request_error(self, msg: RequestError) -> None:
-        logger.info(f"MOQT event: handle {msg}")
+        logger.info(f"MOQT event: handle {self._msgstr(msg)}")
         self._track_status_requests.discard(msg.request_id)
         self._resolve_request(msg.request_id, msg)
         kind = self._request_kinds.get(msg.request_id)
@@ -5757,14 +5783,14 @@ class _MOQTSessionMixin:
                 f"Redirect names a track for a {kind[0].__name__}")
 
     async def _handle_namespace(self, msg) -> None:
-        logger.info(f"MOQT event: handle Namespace: {msg}")
+        logger.info(f"MOQT event: handle Namespace: {self._msgstr(msg)}")
         self._namespace_announcements.put_nowait(msg)
 
     async def _handle_namespace_done(self, msg) -> None:
-        logger.info(f"MOQT event: handle NamespaceDone: {msg}")
+        logger.info(f"MOQT event: handle NamespaceDone: {self._msgstr(msg)}")
 
     async def _handle_request_update(self, msg: RequestUpdate) -> None:
-        logger.info(f"MOQT event: handle RequestUpdate: {msg}")
+        logger.info(f"MOQT event: handle RequestUpdate: {self._msgstr(msg)}")
         d20 = self._profile.param_table >= 20
         existing = msg.existing_request_id
         held = self._peer_requests.get(existing)
@@ -5796,7 +5822,7 @@ class _MOQTSessionMixin:
         sends its own SETUP on its control write-uni (the client at
         session init, the server on binding the control read-uni). On
         receipt of the peer's SETUP the session is established."""
-        logger.info(f"MOQT event: handle d18 Setup: {msg}")
+        logger.info(f"MOQT event: handle d18 Setup: {self._msgstr(msg)}")
         # One SETUP per direction (§10.3). The flag is set synchronously
         # at first entry, closing the reentry window two pipelined SETUP
         # handler tasks would otherwise share while the server's
@@ -5848,7 +5874,7 @@ class _MOQTSessionMixin:
     async def _handle_publish_state_notify(self, msg) -> None:
         """PUBLISH_STATE_NOTIFY (d20 §10.10) is informative and never
         answered; register_handler() takes it to act on it."""
-        logger.info(f"MOQT receive: {msg}")
+        logger.info(f"MOQT receive: {self._msgstr(msg)}")
 
     # MoQT message classes for serialize/deserialize, message handler methods (unbound)
     MOQT_CONTROL_MESSAGE_REGISTRY: Dict[MOQTMessageType, Tuple[Type[MOQTMessage], Callable]] = {

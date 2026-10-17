@@ -2123,20 +2123,42 @@ def _track_state(track, flowing) -> str:
 
 _HISTORY_KEYS = ("t", "ingress_bps", "egress_bps", "media_in_bps",
                  "media_out_bps", "sessions", "subscribers", "tracks",
-                 "loss_pct", "rtt_p50_ms", "lag_p99_ms", "cpu", "proc_cpu",
-                 "proc_rss", "rx_bps", "tx_bps", "objects_in_per_s")
+                 "loss_pct", "rtt_p50_ms", "lag_p99_ms", "objects_in_per_s",
+                 "groups_per_s")
+_PLATFORM_KEYS = ("t", "cpu", "cpu_user", "cpu_nice", "cpu_system",
+                  "cpu_iowait", "cpu_irq", "cpu_steal", "proc_cpu",
+                  "proc_user", "proc_system", "proc_rss", "mem_used",
+                  "mem_buffers", "mem_cached", "rx_bps", "tx_bps",
+                  "ingress_bps", "egress_bps", "udp_in", "udp_out",
+                  "udp_errors", "sock_drops", "sock_rx_queue",
+                  "disk_read_Bps", "disk_write_Bps", "psi_cpu", "psi_io",
+                  "psi_memory", "ctxt_per_s", "lag_p99_ms")
+# Tracks with their own history; later ones go without until one ends.
+TRACK_HISTORY_MAX = 24
+# Subscribers listed per track.
+TRACK_SUBSCRIBERS_MAX = 50
 
 
 class _Status:
-    """The dashboard's status.json, rewritten every STATUS_INTERVAL_S."""
+    """The dashboard's status.json and platform.json, rewritten every
+    STATUS_INTERVAL_S."""
 
     def __init__(self, path: str, relay: dict) -> None:
         self.path = path
+        self.platform_path = os.path.join(os.path.dirname(path),
+                                          "platform.json")
         self.relay = relay
-        self.host = relay_status.HostSampler()
+        self.host = relay_status.HostSampler(udp_port=relay.get("port"))
         self.lag = relay_status.LoopLag()
-        self.history = relay_status.History(
-            _HISTORY_KEYS, int(STATUS_HISTORY_S / STATUS_INTERVAL_S))
+        length = int(STATUS_HISTORY_S / STATUS_INTERVAL_S)
+        self.history = relay_status.History(_HISTORY_KEYS, length)
+        self.platform_history = relay_status.History(_PLATFORM_KEYS, length)
+        # track id -> {series: deque}, aligned with history["t"].
+        self.track_history: dict[str, dict[str, deque]] = {}
+        self.platform: dict | None = None
+        # Most subscribers at once: relay-wide, and per namespace while it lasts.
+        self._subs_peak = 0
+        self._ns_peak: dict[tuple, int] = {}
         # id(track) -> (bytes in, bytes out, drops) at the last sample.
         self._track_prev: dict[int, tuple] = {}
         # id(session) -> (bytes sent, bytes received, packets sent, lost).
@@ -2154,6 +2176,8 @@ class _Status:
                 _probe_catalogs(now)
                 relay_status.write_json_atomic(
                     self.path, self.snapshot(now, time.time()))
+                relay_status.write_json_atomic(self.platform_path,
+                                               self.platform)
             except Exception:
                 logger.warning("relay: status write failed", exc_info=True)
             await asyncio.sleep(STATUS_INTERVAL_S)
@@ -2198,8 +2222,19 @@ class _Status:
             up = rtt_ms(owner) if owner is not None else None
             down = relay_status.percentile(
                 [r for r in (rtt_ms(d.session) for d in t.downstream) if r is not None], 50)
+            listed = []
+            for d in t.downstream[:TRACK_SUBSCRIBERS_MAX]:
+                info = _sessions.get(id(d.session))
+                r = rtt_ms(d.session)
+                listed.append({
+                    "transport": _transport(d.session), "draft": _draft(d.session),
+                    "rtt_ms": None if r is None else round(r, 1),
+                    "forward": bool(d.forward),
+                    "since": info["since"] if info else None})
             tracks.append((key, {
+                "id": "\x1f".join((_ns_str(key[0]), _name_str(key[1]))),
                 "namespace": _ns_str(key[0]), "name": _name_str(key[1]),
+                "subscriber_list": listed,
                 "subscribers": len(t.downstream),
                 "forwarding": sum(1 for d in t.downstream if d.forward),
                 "peak": t._peak_subs,
@@ -2248,6 +2283,10 @@ class _Status:
             sp["out_bps"] += row["out_bps"] or 0
             sp["bytes_out"] += row["bytes_out"]
             sp["origin"] = sp["origin"] or row["origin"]
+        self._ns_peak = {ns: max(self._ns_peak.get(ns, 0), sp["subscribers"])
+                         for ns, sp in spaces.items()}
+        for ns, sp in spaces.items():
+            sp["peak"] = self._ns_peak[ns]
 
         sessions, quic = [], {}
         tx = rx = sent = lost = 0
@@ -2292,10 +2331,13 @@ class _Status:
                               if (s["role"] or "").startswith("pub")),
             "namespaces": len(spaces), "tracks": len(tracks),
             "subscribers": sum(r["subscribers"] for _, r in tracks),
+            "subscribers_peak": None,
             "ingress_bps": bps(rx), "egress_bps": bps(tx),
             "media_in_bps": media_in, "media_out_bps": media_out,
             "objects_in_per_s": (None if dt is None else round(
                 sum(r["objects_per_s"] or 0 for _, r in tracks), 1)),
+            "groups_per_s": (None if dt is None else round(
+                sum(r["groups_per_s"] or 0 for _, r in tracks), 1)),
             # Share of egress not received upstream ("CDN efficiency").
             "efficiency": (max(0.0, 1 - media_in / media_out)
                            if media_out else None),
@@ -2306,6 +2348,8 @@ class _Status:
             "rtt_p99_ms": relay_status.percentile(rtts, 99),
             "loop_lag_ms": lag,
         }
+        self._subs_peak = max(self._subs_peak, totals["subscribers"])
+        totals["subscribers_peak"] = self._subs_peak
         host = dict(self.host.static, **self.host.sample(now))
         self.history.add({
             "t": round(wall), "ingress_bps": totals["ingress_bps"],
@@ -2313,11 +2357,12 @@ class _Status:
             "media_out_bps": media_out, "sessions": totals["sessions"],
             "subscribers": totals["subscribers"], "tracks": len(tracks),
             "loss_pct": totals["loss_pct"], "rtt_p50_ms": totals["rtt_p50_ms"],
-            "lag_p99_ms": lag["p99"], "cpu": host["cpu"],
-            "proc_cpu": host["proc_cpu"], "proc_rss": host["proc_rss"],
-            "rx_bps": host["rx_bps"], "tx_bps": host["tx_bps"],
+            "lag_p99_ms": lag["p99"],
             "objects_in_per_s": totals["objects_in_per_s"],
+            "groups_per_s": totals["groups_per_s"],
         })
+        self._add_track_history(tracks)
+        self.platform = self._platform(wall, host, totals, lag)
         return {
             "generated": wall, "interval_s": STATUS_INTERVAL_S,
             "relay": dict(self.relay,
@@ -2328,8 +2373,87 @@ class _Status:
             "tracks": sorted((r for _, r in tracks),
                              key=lambda r: (r["namespace"], r["name"])),
             "sessions": sorted(sessions, key=lambda r: r["since"]),
-            "host": host,
+            "host": {k: host.get(k) for k in (
+                *self.host.static, "cpu", "mem_used", "mem_total",
+                "disk_used", "disk_total", "uptime_s")},
             "history": self.history.to_json(),
+            "track_history": {tid: {k: list(v) for k, v in series.items()}
+                              for tid, series in self.track_history.items()},
+        }
+
+    def _add_track_history(self, tracks) -> None:
+        """One point per tracked track, None for one absent this tick; a
+        track absent for the whole window is dropped."""
+        length = self.history.length
+        filled = len(self.history.series["t"])
+        now = {row["id"]: row for _, row in tracks}
+        for tid, row in now.items():
+            if (tid not in self.track_history
+                    and len(self.track_history) < TRACK_HISTORY_MAX):
+                self.track_history[tid] = {
+                    k: deque([None] * (filled - 1), maxlen=length)
+                    for k in ("subscribers", "in_bps", "out_bps")}
+        for tid, series in list(self.track_history.items()):
+            row = now.get(tid)
+            for k, col in series.items():
+                col.append(None if row is None else row[k])
+            if row is None and all(v is None for v in series["subscribers"]):
+                del self.track_history[tid]
+
+    def _platform(self, wall: float, host: dict, totals: dict,
+                  lag: dict) -> dict:
+        """platform.json: host detail for the platform page, with its own
+        history."""
+        modes = host.get("cpu_modes") or {}
+        udp = host.get("udp") or {}
+        sock = host.get("udp_socket") or {}
+        mem = host.get("mem") or {}
+        psi = host.get("psi") or {}
+        proc = host.get("proc") or {}
+        disks = host.get("disks") or []
+        point = {
+            "t": round(wall), "cpu": host.get("cpu"),
+            "cpu_user": modes.get("user"), "cpu_nice": modes.get("nice"),
+            "cpu_system": modes.get("system"),
+            "cpu_iowait": modes.get("iowait"),
+            "cpu_irq": (None if not modes else
+                        round(modes["irq"] + modes["softirq"], 1)),
+            "cpu_steal": modes.get("steal"),
+            "proc_cpu": host.get("proc_cpu"),
+            "proc_user": proc.get("user_pct"),
+            "proc_system": proc.get("system_pct"),
+            "proc_rss": host.get("proc_rss"),
+            "mem_used": mem.get("used"), "mem_buffers": mem.get("buffers"),
+            "mem_cached": mem.get("cached"),
+            "rx_bps": host.get("rx_bps"), "tx_bps": host.get("tx_bps"),
+            "ingress_bps": totals["ingress_bps"],
+            "egress_bps": totals["egress_bps"],
+            "udp_in": udp.get("InDatagrams"), "udp_out": udp.get("OutDatagrams"),
+            "udp_errors": (None if not udp else round(
+                udp.get("InErrors", 0) + udp.get("RcvbufErrors", 0)
+                + udp.get("SndbufErrors", 0), 1)),
+            "sock_drops": sock.get("drops_per_s"),
+            "sock_rx_queue": sock.get("rx_queue"),
+            "disk_read_Bps": (sum(d["read_Bps"] for d in disks)
+                              if disks else None),
+            "disk_write_Bps": (sum(d["write_Bps"] for d in disks)
+                               if disks else None),
+            "psi_cpu": (psi.get("cpu") or {}).get("some"),
+            "psi_io": (psi.get("io") or {}).get("some"),
+            "psi_memory": (psi.get("memory") or {}).get("some"),
+            "ctxt_per_s": host.get("ctxt_per_s"), "lag_p99_ms": lag["p99"],
+        }
+        self.platform_history.add(point)
+        return {
+            "generated": wall, "interval_s": STATUS_INTERVAL_S,
+            "relay": {"versions": self.relay.get("versions"),
+                      "uptime_s": round(wall - self.relay["started"])},
+            "host": host,
+            "bandwidth": {"ingress_bps": totals["ingress_bps"],
+                          "egress_bps": totals["egress_bps"],
+                          "loss_pct": totals["loss_pct"]},
+            "loop_lag_ms": lag,
+            "history": self.platform_history.to_json(),
         }
 
 

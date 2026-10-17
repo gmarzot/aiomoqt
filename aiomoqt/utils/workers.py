@@ -33,7 +33,7 @@ from aiomoqt.messages.base import MOQTMessage
 from aiomoqt.track import SubscribedTrack, TrackState
 from aiomoqt.types import FilterType
 from aiomoqt.utils.url import parse_relay_url
-from aiomoqt.utils.logger import set_log_level
+from aiomoqt.utils.logger import set_log_handler, set_log_level
 from aiomoqt.utils.stats import TrackStats
 
 
@@ -84,7 +84,9 @@ def _setup_quiet_logging(logdir, name, debug):
         logfile = os.path.join(logdir, f'{name}.log')
         lvl = logging.DEBUG if debug else logging.INFO
         logging.basicConfig(filename=logfile, force=True, level=lvl,
-                            format='%(asctime)s %(levelname)s %(message)s')
+                            format='%(asctime)s %(levelname)s %(name)s: %(message)s')
+        # aiomoqt loggers do not propagate; give them the file handler too.
+        set_log_handler(logging.getLogger().handlers[0])
         set_log_level(lvl)
     else:
         lvl = logging.DEBUG if debug else logging.WARNING
