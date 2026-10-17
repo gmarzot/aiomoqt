@@ -331,21 +331,21 @@ def _relay_pub_sub(url: str, draft: int, pub_mode: str, insecure: bool,
     ok, _ = _run(cmd, log, 120)
     if not ok:
         return "FAIL", "timeout"
-    text = log.read_text()
+    return _pub_sub_verdict(log.read_text())
+
+
+def _pub_sub_verdict(text: str) -> tuple[str, str]:
+    """Every subscriber joined and objects arrived. A missing count fails."""
     m = re.search(r"peak\s+(\d+)/(\d+)", text)
     if not m:
         return "FAIL", "(no summary)"
     got, want = m.group(1), m.group(2)
-    status = "PASS" if got == want else "FAIL"
-    detail = f"{got}/{want} ok"
-    # SUBSCRIBE_OK alone is not a pass. A subscription that carries no
-    # objects is a delivery failure whatever the relay's excuse.
-    om = re.search(r"Total objects:\s+([\d,]+)", text)
-    objects = int(om.group(1).replace(",", "")) if om else None
-    if status == "PASS" and objects == 0:
-        status = "FAIL"
-        detail = f"{got}/{want} subscribed, 0 objects delivered"
-    return status, detail
+    om = re.search(r"^\s*Total objects: (\d+)\s*$", text, re.MULTILINE)
+    if om is None:
+        return "FAIL", f"{got}/{want} subscribed, no object count"
+    objects = int(om.group(1))
+    status = "PASS" if got == want and objects > 0 else "FAIL"
+    return status, f"{got}/{want} subscribed, {objects} objects"
 
 
 def _relay_tap_case(url: str, draft: int, case: str, insecure: bool,

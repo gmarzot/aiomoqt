@@ -154,7 +154,7 @@ EXAMPLE_SCENARIO = {
 # Events on events_queue (all tagged group/shard):
 #   {'kind':'evt','ev': 'joined'|'join_failed'|'left'|'ended'|'died', ...}
 #   {'kind':'group_stats', 'live', 'rx_bytes', 'rx_objs',
-#    'lat_p90_ms', 'total_bytes', ...}   every STATS_INTERVAL_S
+#    'lat_p90_ms', 'total_bytes', 'total_objs', ...}   every STATS_INTERVAL_S
 # ---------------------------------------------------------------------------
 
 async def _slot_task(cfg, relay, slot, events_q, group, shard,
@@ -312,12 +312,14 @@ async def _group_host_task(cfg, mp_stop_event, cmd_q, events_q):
                 del slots[sid]
             rx_bytes = rx_objs = live = 0
             total_bytes = reaped_bytes
+            total_objs = reaped_objs
             worst_p90 = 0.0
             for s in slots.values():
                 snap = s["stats"].snapshot()
                 rx_bytes += snap["rx_bytes"]
                 rx_objs += snap["rx_objs"]
                 total_bytes += snap["total_bytes"]
+                total_objs += snap["total_objs"]
                 worst_p90 = max(worst_p90, snap["lat_p90_ms"])
                 if s["live"]:
                     live += 1
@@ -325,7 +327,7 @@ async def _group_host_task(cfg, mp_stop_event, cmd_q, events_q):
                 "kind": "group_stats", "group": group, "shard": shard,
                 "live": live, "rx_bytes": rx_bytes, "rx_objs": rx_objs,
                 "lat_p90_ms": worst_p90, "total_bytes": total_bytes,
-                "t": time.monotonic(),
+                "total_objs": total_objs, "t": time.monotonic(),
             })
 
     cmd_task = asyncio.create_task(_cmd_loop())
@@ -778,7 +780,8 @@ def main():
     pubs = {ps.key: PubRT(ps) for ps in pub_specs} \
         if args.role in ("both", "pub") else {}
     groups: Dict[int, GroupRT] = {}
-    sub_events_q = MP_CTX.Queue(maxsize=100000)
+    # 32767 = macOS SEM_VALUE_MAX; a larger bound fails with EINVAL there.
+    sub_events_q = MP_CTX.Queue(maxsize=32767)
     if args.role in ("both", "sub"):
         for gs in group_specs:
             grt = GroupRT(gs)
@@ -955,17 +958,34 @@ def main():
             if proc.is_alive():
                 proc.terminate()
                 proc.join(timeout=1.0)
+        # Stats the shards posted before they stopped.
+        _drain_sub_events(sub_events_q, groups)
         for q in [sub_events_q]:
             q.cancel_join_thread()
         if csv_f:
             csv_f.close()
 
     # --- summary + verdict ---
+    lines, failed = _verdict(groups, pubs)
     print("─" * 72)
+    for line in lines:
+        print(line)
+    return 1 if failed else 0
+
+
+def _verdict(groups: Dict[int, "GroupRT"],
+             pubs: Dict[str, "PubRT"]) -> tuple[List[str], bool]:
+    """Summary lines with exact object and byte counts, and whether the run
+    failed."""
+    lines: List[str] = []
     failed = False
+    all_objs = all_bytes = 0
     for grt in groups.values():
         gs = grt.spec
         total_rx = sum(s.stats.get("total_bytes", 0) for s in grt.shards)
+        total_objs = sum(s.stats.get("total_objs", 0) for s in grt.shards)
+        all_objs += total_objs
+        all_bytes += total_rx
         note = ""
         if grt.max_live == 0:
             note = "  << NEVER JOINED"
@@ -973,17 +993,24 @@ def main():
         elif grt.max_live < gs.max_subs * 0.5:
             note = "  << BELOW 50% OF TARGET"
             failed = True
-        print(f"  {gs.key:<28} peak {grt.max_live:>4}/{gs.max_subs:<4} "
-              f"joins={grt.joins:<5} churn={grt.churns:<5} "
-              f"exodus={grt.exodus:<4} fails={grt.fails:<4} "
-              f"died={grt.deaths:<4} rx={total_rx / 1e6:.0f}MB{note}")
-    if pubs:
-        for prt in pubs.values():
-            if not prt.published:
-                print(f"  {prt.spec.key:<28} << PUBLISHER NEVER CONFIRMED")
-                failed = True
-    print(f"  {'RESULT: FAIL' if failed else 'RESULT: OK'}")
-    return 1 if failed else 0
+        elif total_rx == 0:
+            note = "  << NO OBJECTS"
+            failed = True
+        lines.append(
+            f"  {gs.key:<28} peak {grt.max_live:>4}/{gs.max_subs:<4} "
+            f"joins={grt.joins:<5} churn={grt.churns:<5} "
+            f"exodus={grt.exodus:<4} fails={grt.fails:<4} "
+            f"died={grt.deaths:<4} objs={total_objs} bytes={total_rx} "
+            f"rx={total_rx / 1e6:.0f}MB{note}")
+    for prt in pubs.values():
+        if not prt.published:
+            lines.append(f"  {prt.spec.key:<28} << PUBLISHER NEVER CONFIRMED")
+            failed = True
+    if groups:
+        lines.append(f"  Total objects: {all_objs}")
+        lines.append(f"  Total bytes: {all_bytes}")
+    lines.append(f"  {'RESULT: FAIL' if failed else 'RESULT: OK'}")
+    return lines, failed
 
 
 def cli():
