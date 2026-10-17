@@ -1,5 +1,5 @@
 # moqarena: the aiomoqt ersatz relay, nginx for the pages and the relay's
-# status, and GoAccess for the password-protected visitor report.
+# status and logs, and GoAccess for the password-protected visitor report.
 # Run from this directory; see README.md.
 name: g5-site
 
@@ -19,10 +19,12 @@ services:
       MOQT_PORT: "4443"
       MOQT_CERT: /etc/letsencrypt/live/moqarena.marzresearch.net/fullchain.pem
       MOQT_KEY: /etc/letsencrypt/live/moqarena.marzresearch.net/privkey.pem
-    command: ["--draft", "22,20,18,16,14", "--watchdog", "15", "--status-dir", "/status"]
+    command: ["--draft", "22,20,18,16,14", "--watchdog", "15", "--status-dir", "/status",
+              "--log-dir", "/logs"]
     volumes:
       - /etc/letsencrypt:/etc/letsencrypt:ro
       - ./status:/status
+      - ./relay-logs:/logs
       # Host OS name for the dashboard; the container's is the image's.
       - /etc/os-release:/host/etc/os-release:ro
     logging:
@@ -39,6 +41,7 @@ services:
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
       - ./site:/srv/g5:ro
       - ./status:/srv/status:ro
+      - ./relay-logs:/srv/relay-logs:ro
       - ./stats:/srv/stats:ro
       - ./stats.htpasswd:/etc/nginx/stats.htpasswd:ro
       - ./logs:/var/log/nginx/site

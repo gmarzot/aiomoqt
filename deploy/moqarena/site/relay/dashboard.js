@@ -79,7 +79,8 @@ function arc(r, f0, f1) {
 const level = (pct) => pct >= 90 ? 'high' : pct >= 70 ? 'warn-level' : 'ok';
 
 // `bands`: amber and red past 70% and 90%; without, high is good and stays green.
-function drawGauge(svg, pct, bands = true) {
+// `label`: the value inside the arc.
+function drawGauge(svg, pct, bands = true, label = true) {
   const tone = (v) => bands ? level(v) : 'ok';
   svg.replaceChildren(svgEl('path', {class: 'g-track', d: arc(G.r, 0, 1)}));
   if (bands) {
@@ -93,15 +94,14 @@ function drawGauge(svg, pct, bands = true) {
     const f = Math.min(Math.max(pct, 0), 100) / 100;
     svg.append(svgEl('path', {class: `g-arc ${tone(pct)}`, d: arc(G.r, 0, Math.max(f, 0.004))}));
   }
-  svg.append(text);
+  if (label) svg.append(text);
 }
 
-function renderGauges(h, T) {
+function renderGauges(h) {
   const pct = (used, total) => (none(used) || !total) ? null : 100 * used / total;
   drawGauge($('gauge-cpu'), h.cpu);
   drawGauge($('gauge-ram'), pct(h.mem_used, h.mem_total));
   drawGauge($('gauge-disk'), pct(h.disk_used, h.disk_total));
-  drawGauge($('gauge-cdn'), none(T.efficiency) ? null : 100 * T.efficiency, false);
 }
 
 // -- tiles ----------------------------------------------------------------------
@@ -113,29 +113,59 @@ function setTile(key, value, sub, title) {
   if (title) t.title = title;
 }
 
+// Transport and draft counts of `list`: "2 wt · 1 quic", "d18: 2, d22: 1".
+function sessionMix(list) {
+  const count = (key) => {
+    const m = new Map();
+    for (const x of list) m.set(key(x), (m.get(key(x)) || 0) + 1);
+    return [...m];
+  };
+  return {
+    transports: count((x) => x.transport).map(([k, v]) => `${v} ${k}`).join(' · '),
+    drafts: count((x) => `d${x.draft}`).map(([k, v]) => `${k}: ${v}`).join(', '),
+  };
+}
+
+const pct100 = (v) => none(v) ? null : 100 * v;
+
 function renderTiles(s) {
   const T = s.totals;
-  const transports = Object.entries(T.by_transport || {}).map(([k, v]) => `${v} ${k}`).join(' · ');
-  const drafts = Object.entries(T.by_draft || {}).map(([k, v]) => `${k}: ${v}`).join(', ');
+  const sessions = s.sessions || [];
+  const pubList = sessions.filter((x) => (x.role || '').includes('pub'));
+  const subList = sessions.filter((x) => (x.role || '').includes('sub'));
+  const pubs = sessionMix(pubList), subs = sessionMix(subList);
   const playable = s.namespaces.filter((r) => r.format).length;
+  const live = s.tracks.filter((r) => r.state === 'live').length;
   const groups = s.tracks.reduce((n, r) => n + (r.groups_per_s || 0), 0);
-  const subSessions = (s.sessions || []).filter((x) => (x.role || '').includes('sub')).length;
-  setTile('sessions', fmt.num(T.sessions), transports, drafts ? `By draft: ${drafts}` : '');
-  setTile('namespaces', fmt.num(T.namespaces), playable ? `${playable} playable` : '');
-  setTile('tracks', fmt.num(T.tracks), fmt.plural(T.fetches, 'fetch', 'fetches'));
-  setTile('publishers', fmt.num(T.publishers), 'publishing sessions');
+  const fetched = none(T.fetch_cache_bytes) || none(T.fetch_upstream_bytes) ? null
+    : T.fetch_cache_bytes + T.fetch_upstream_bytes;
+  setTile('publishers', fmt.num(T.publishers), pubs.transports || 'publishing sessions',
+          pubList.length ? `By draft: ${pubs.drafts}` : 'No publishing sessions');
   setTile('subscribers', fmt.num(T.subscribers),
-          `${fmt.plural(subSessions, 'session')} · peak ${fmt.num(T.subscribers_peak)}`);
+          `${fmt.plural(subList.length, 'session')} · peak ${fmt.num(T.subscribers_peak)}`,
+          subList.length ? `${subs.transports}; by draft: ${subs.drafts}` : 'No subscribing sessions');
+  setTile('namespaces', fmt.num(T.namespaces), playable ? `${playable} playable` : '');
+  setTile('tracks', fmt.num(T.tracks), `${fmt.num(live)} live`);
+  setTile('fetches', fmt.num(T.fetches), fetched === null ? 'since start' : `${fmt.bytes(fetched)} served`);
   setTile('delivered', fmt.bytes(T.delivered_bytes), 'media since start');
+  const cache = pct100(T.cache_efficiency);
+  setTile('cache', fmt.pct(cache, 0),
+          fetched === null ? 'not reported' : fetched ? `of ${fmt.bytes(fetched)} fetched` : 'no fetches yet',
+          'Share of FETCH data served from the relay cache instead of the publisher'
+            + (fetched === null ? '. This relay build does not report it.' : ''));
+  drawGauge($('gauge-cache'), cache, false, false);
+  const cdn = pct100(T.efficiency);
+  setTile('cdn', fmt.pct(cdn, 0), `${fmt.bpsShort(T.media_in_bps)} in → ${fmt.bpsShort(T.media_out_bps)} out`);
+  drawGauge($('gauge-cdn'), cdn, false, false);
+  setTile('rtt', fmt.ms(T.rtt_p50_ms), `p99 ${fmt.ms(T.rtt_p99_ms)}`);
+  const lag = T.loop_lag_ms || {};
+  setTile('lag', fmt.ms(lag.p99), `p50 ${fmt.ms(lag.p50)}`);
+  setTile('loss', fmt.pct(T.loss_pct, 2), 'delivery sessions');
+  setTile('drops', fmt.num(T.drops), 'subscribers dropped');
   setTile('groups', fmt.rate(none(T.groups_per_s) ? groups : T.groups_per_s), 'in, all tracks');
   setTile('objects', fmt.rate(T.objects_in_per_s), 'in, all tracks');
   setTile('ingress', fmt.bps(T.ingress_bps), `media ${fmt.bps(T.media_in_bps)}`);
   setTile('egress', fmt.bps(T.egress_bps), `media ${fmt.bps(T.media_out_bps)}`);
-  setTile('rtt', fmt.ms(T.rtt_p50_ms), `p99 ${fmt.ms(T.rtt_p99_ms)}`);
-  const lag = T.loop_lag_ms || {};
-  setTile('lag', fmt.ms(lag.p99), `p50 ${fmt.ms(lag.p50)}`);
-  setTile('lossdrops', `${fmt.pct(T.loss_pct, 2)} / ${fmt.num(T.drops)}`,
-          'delivery loss / subscribers dropped');
   for (const tile of document.querySelectorAll('.tile[data-spark]')) {
     Dash.spark(tile, s.history[tile.dataset.spark] || []);
   }
@@ -156,12 +186,19 @@ function playLink(ns, url) {
                   title: 'Play in G5 Player'}, '▶');
 }
 
+// Transport and draft, then the publisher's masked address when the relay reports it.
+function originCell(r) {
+  const td = el('td', {}, r.origin || '—');
+  if (r.origin_addr) td.append(' · ', el('span', {class: 'addr'}, r.origin_addr));
+  return td;
+}
+
 function renderNamespaces(rows, wtUrl) {
   fill($('t-namespaces'), rows.map((r) => {
     const tr = el('tr', {class: `pick${r.namespace === scope ? ' selected' : ''}`, tabindex: '0',
                          title: `${fmt.bytes(r.bytes_out)} delivered`},
       el('td', {}, el('code', {}, r.namespace)),
-      el('td', {}, r.origin || '—'),
+      originCell(r),
       num(fmt.num(r.tracks)), num(fmt.num(r.subscribers)), num(fmt.num(r.peak)),
       inOut(r.in_bps, r.out_bps),
       el('td', {class: 'n'}, r.format ? playLink(r.namespace, wtUrl) : ''));
@@ -218,13 +255,13 @@ function trackDetail(r) {
       + `${fmt.plural(r.fetches, 'fetch', 'fetches')} · ${fmt.plural(r.drops, 'drop')}`,
     `cache ${fmt.num(r.cache_groups)} groups, ${fmt.bytes(r.cache_bytes)}`
       + (r.largest ? ` · largest ${r.largest[0]} · ${r.largest[1]}` : ''),
-    `from ${r.origin || '—'} · RTT up ${fmt.ms(r.rtt_up_ms)}, down p50 ${fmt.ms(r.rtt_down_ms)}`,
+    `from ${r.origin || '—'}${r.origin_addr ? ` ${r.origin_addr}` : ''} · RTT up ${fmt.ms(r.rtt_up_ms)}, down p50 ${fmt.ms(r.rtt_down_ms)}`,
   ];
   const subs = r.subscriber_list || [];
   if (subs.length) {
     lines.push('subscribers:');
     for (const x of subs.slice(0, 12)) {
-      lines.push(`  ${x.transport} d${x.draft} · ${fmt.ms(x.rtt_ms)} · ${x.forward ? 'forwarding' : 'paused'}`
+      lines.push(`  ${x.transport} d${x.draft}${x.addr ? ` ${x.addr}` : ''} · ${fmt.ms(x.rtt_ms)} · ${x.forward ? 'forwarding' : 'paused'}`
         + (none(x.since) ? '' : ` · ${fmt.duration(now - x.since)}`));
     }
     if (r.subscribers > 12) lines.push(`  … ${fmt.num(r.subscribers - 12)} more`);
@@ -259,7 +296,7 @@ function render(s) {
   latest = s;
   const urls = relayUrls(s.relay);
   renderRelay(s, urls);
-  renderGauges(s.host || {}, s.totals || {});
+  renderGauges(s.host || {});
   renderTiles(s);
   if (!s.namespaces.some((r) => r.namespace === scope)) {
     scope = s.namespaces.length ? s.namespaces[0].namespace : null;

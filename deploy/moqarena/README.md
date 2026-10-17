@@ -5,8 +5,8 @@ ersatz relay for limited interop testing. The relay is open, with no auth.
 
 | Service | Container | What it does |
 |---|---|---|
-| `relay` | `ersatz-relay` | `moq_interop_relay` on UDP 4443, raw QUIC and WebTransport, drafts 22/20/18/16/14, `--watchdog 15`, writes `status/status.json` |
-| `web` | `g5-web` | nginx on 80/443: landing page, `/g5-broadcast/`, `/g5-player/`, `/relay/` dashboard and `/relay/platform/`, `/status/{status,platform}.json`, `/stats/` |
+| `relay` | `ersatz-relay` | `moq_interop_relay` on UDP 4443, raw QUIC and WebTransport, drafts 22/20/18/16/14, `--watchdog 15`, writes `status/status.json` and `relay-logs/` |
+| `web` | `g5-web` | nginx on 80/443: landing page, `/g5-broadcast/`, `/g5-player/`, `/relay/` dashboard, `/relay/platform/` and `/relay/logs/`, `/status/{status,platform}.json`, `/private/`, `/stats/` |
 | `goaccess` | `g5-goaccess` | rebuilds the visitor reports in `stats/` every 5 minutes from `logs/`; no network |
 
 Host: `ssh ubuntu@moqarena.marzresearch.net` (OCI, Ubuntu 22.04 aarch64, Docker with Compose v2).
@@ -25,9 +25,11 @@ site/relay/               relay dashboard (site/ here)
 site/assets, site/g5-broadcast, site/g5-player, site/VERSION
                           moq-playa examples/dist
 status/                   status.json and platform.json, written by the relay, read-only to nginx
+relay-logs/               relay.log (10 MB, 4 rotations) and crash.log, written by the relay,
+                          read-only to nginx
 logs/                     nginx access log, read by GoAccess
 stats/                    GoAccess reports: index.html (visitors), crawlers.html
-stats.htpasswd            the /stats/ password
+stats.htpasswd            the password for /private/, /stats/ and /relay/logs/
 ```
 
 ## First-time setup
@@ -38,7 +40,7 @@ place and `/stats/` fails.
 ```sh
 tar -C deploy/moqarena -cf - compose.yml nginx.conf site | ssh ubuntu@moqarena.marzresearch.net 'tar -C ~/g5-site -xf -'
 ssh -t ubuntu@moqarena.marzresearch.net
-cd ~/g5-site && mkdir -p status logs stats
+cd ~/g5-site && mkdir -p status relay-logs logs stats
 printf 'gmarzot:%s\n' "$(openssl passwd -apr1)" > stats.htpasswd    # prompts for the password
 sudo tee /etc/logrotate.d/moqarena >/dev/null <<'ROT'
 /home/ubuntu/g5-site/logs/access.log {
@@ -93,12 +95,22 @@ tar -C examples/dist -cf - assets g5-broadcast g5-player | ssh ubuntu@moqarena.m
 `nginx.conf` is bind-mounted as a single file. Replacing it gives it a new inode, and
 `nginx -s reload` still reads the old one. After copying it, run `docker compose restart web`.
 
+## Relay logs
+
+`/private/` links the visitor reports and the relay logs. `/relay/logs/` tails the relay's
+`--log-dir` behind the same password; full peer addresses appear only there. `relay.log`
+rotates itself at 10 MB and keeps four old files. `crash.log` gets a `relay: start` line at each
+start and the faulthandler dump of a native crash or watchdog stall.
+It is not rotated, so trim it by hand if it grows. `--log-dir` needs an aiomoqt relay that has the
+flag; on an older image, drop it from `command`, or the relay restarts in a loop.
+
 ## Checks, run on the host
 
 ```sh
 curl -s https://moqarena.marzresearch.net/status/status.json | python3 -c 'import json,sys,time; s=json.load(sys.stdin); print(round(time.time()-s["generated"]), "s old,", s["totals"]["sessions"], "sessions")'
 docker run --rm --network host --entrypoint python aiomoqt:dev -c 'import asyncio; from aiomoqt.tools import moq_interop_relay as r; print(asyncio.run(r._self_probe("127.0.0.1", 4443, True, 18, 8.0)))'
 curl -s -o /dev/null -w '%{http_code}\n' https://moqarena.marzresearch.net/stats/    # 401 without the password
+curl -s -o /dev/null -w '%{http_code}\n' https://moqarena.marzresearch.net/relay/logs/files/relay.log    # 401 too
 ```
 
 `docker logs ersatz-relay` shows a watchdog probe under `aiomoqt-watchdog/…` every 15 s. That is
