@@ -8,6 +8,7 @@ track, a range it no longer holds.
 """
 import asyncio
 import contextlib
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -21,7 +22,7 @@ from aiomoqt.protocol import _MOQTSessionMixin
 from aiomoqt.tools import moq_interop_relay as relay
 from aiomoqt.track import PublishedTrack
 from aiomoqt.types import (FilterType, GroupOrder, MOQTRequestError, ParamType,
-                           RequestErrorCode)
+                           RequestErrorCode, StreamResetCode)
 from aiomoqt.utils.buffer import Buffer
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
@@ -452,3 +453,67 @@ async def test_a_fetch_only_track_is_served_through_the_relay(draft,
             status = await rx.track_status(_NS, name, wait_response=True)
             assert _param_largest(status) == (0, _GROUP - 1)
         assert rx._close_err is None
+
+
+@requires_certs
+@pytest.mark.parametrize("draft", [18, 22])
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+async def test_a_fetch_cancelled_before_the_upstream_answers(
+        draft, use_quic, monkeypatch, caplog):
+    # The subscriber cancels while the relay waits on the publisher; the
+    # late FETCH_OK / REQUEST_ERROR is dropped and the session carries on.
+    gate, asked, finished, relayed = asyncio.Event(), [], [], []
+    real_upstream, real_on_fetch = relay._fetch_upstream, relay._on_fetch
+
+    async def _held_upstream(ns, track_name, msg):
+        asked.append(msg.request_id)
+        await gate.wait()
+        return await real_upstream(ns, track_name, msg)
+
+    async def _on_fetch(session, msg):
+        relayed.append(session)
+        try:
+            await real_on_fetch(session, msg)
+        finally:
+            finished.append(msg.request_id)
+
+    monkeypatch.setattr(relay, "_fetch_upstream", _held_upstream)
+    monkeypatch.setattr(relay, "_on_fetch", _on_fetch)
+    port = _E2E_PORT + 10 + 2 * (draft == 22) + (not use_quic)
+    async with _catalog_relay(port, use_quic, draft) as rx:
+        # cat-a is served upstream; "missing" is declined upstream.
+        reqs = [rx.fetch(_NS, name, start_group=0, start_object=0,
+                         end_group=1, end_object=0)
+                for name in ("cat-a", "missing")]
+        for _ in range(200):
+            if len(asked) == len(reqs):
+                break
+            await asyncio.sleep(0.02)
+        assert len(asked) == len(reqs)
+        down = relayed[0]
+        for m in reqs:
+            sid = rx._bidi_streams[m.request_id]
+            rx.stream_reset(sid, StreamResetCode.CANCELLED)
+            rx.stream_stop_sending(sid, StreamResetCode.CANCELLED)
+        for _ in range(200):
+            if not any(m.request_id in down._bidi_streams for m in reqs):
+                break
+            await asyncio.sleep(0.02)
+        gate.set()
+        for _ in range(500):
+            if len(finished) == len(reqs):
+                break
+            await asyncio.sleep(0.02)
+        assert len(finished) == len(reqs)
+        got = []
+        rx.on_fetch_object = lambda obj, _n, _ts, rid: got.append(rid)
+        ok = await asyncio.wait_for(rx.fetch(
+            _NS, "cat-b", start_group=0, start_object=0, end_group=1,
+            end_object=0, wait_response=True), 10.0)
+        for _ in range(100):
+            if got.count(ok.request_id) >= _GROUP:
+                break
+            await asyncio.sleep(0.02)
+        assert got.count(ok.request_id) == _GROUP
+        assert rx._close_err is None and down._close_err is None
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]

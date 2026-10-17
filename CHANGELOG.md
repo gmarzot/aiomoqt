@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Session: a reply to a request the peer already cancelled is dropped (logged at DEBUG) instead of raising.
 - Relay status: FETCH payload bytes served from the cache and from upstream as `tracks[].fetch_cache_bytes` / `fetch_upstream_bytes`, relay-wide in `totals`, with `totals.cache_efficiency`.
 - Relay: error replies are encoded for the subscriber's draft (d14 FETCH_ERROR used d16 codes);
   an upstream refusal reaches the subscriber with its own code and reason, not DOES_NOT_EXIST.

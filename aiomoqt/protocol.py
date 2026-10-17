@@ -1099,6 +1099,7 @@ class _MOQTSessionMixin:
         said so: a terminated request stream at d18, UNSUBSCRIBE before
         it. Publishers stop feeding on this. With replies_pending the
         PUBLISH_DONE handler stays for a PUBLISH_DONE still inbound."""
+        self._note_request_gone(request_id)
         cb = self._request_cancel_handlers.pop(request_id, None)
         self._requests.pop(request_id, None)
         self._peer_requests.pop(request_id, None)
@@ -3736,6 +3737,29 @@ class _MOQTSessionMixin:
         self._peer_requests[existing] = (kind, prefix)
         return None
 
+    # Request IDs the peer cancelled, oldest first; replies to them are dropped.
+    _gone_requests: Optional['OrderedDict[int, None]'] = None
+    GONE_REQUESTS_MAX = 1024
+
+    def _note_request_gone(self, request_id: int) -> None:
+        gone = self._gone_requests
+        if gone is None:
+            gone = self._gone_requests = OrderedDict()
+        gone[request_id] = None
+        if len(gone) > self.GONE_REQUESTS_MAX:
+            gone.popitem(last=False)
+
+    def _reply_to_gone_request(self, request_id: int,
+                               msg: MOQTMessage) -> bool:
+        """True, and the reply is dropped, when the peer has cancelled
+        the request (STOP_SENDING, reset, FIN, UNSUBSCRIBE, FETCH_CANCEL):
+        a handler answering after an await races the cancel."""
+        if not self._gone_requests or request_id not in self._gone_requests:
+            return False
+        logger.debug(f"MOQT: request {request_id} cancelled by peer; "
+                     f"dropping {type(msg).__name__}")
+        return True
+
     def _send_reply(self, request_id: int, msg: MOQTMessage,
                     fin: bool = False) -> None:
         """Send a response to a request. In d18 responses travel on the
@@ -3744,6 +3768,8 @@ class _MOQTSessionMixin:
         our half of the request stream after a terminal reply
         (REQUEST_ERROR, PUBLISH_DONE, TRACK_STATUS_OK: §3.3.2, §10.11,
         §10.14); it has no meaning on the control stream."""
+        if self._reply_to_gone_request(request_id, msg):
+            return
         if fin:
             self._peer_requests.pop(request_id, None)
         if self._profile.control_uni_pair:
@@ -3756,6 +3782,8 @@ class _MOQTSessionMixin:
         """Send on the bidi stream a request owns: every request in d18,
         SUBSCRIBE_NAMESPACE from d16. Pre-d18 an unbound request falls
         back to the control stream; d18 has no such path."""
+        if self._reply_to_gone_request(request_id, msg):
+            return
         sid = (self._bidi_streams.get(request_id)
                if is_draft16_or_later(self.negotiated_draft) else None)
         if sid is not None:
@@ -4391,7 +4419,7 @@ class _MOQTSessionMixin:
                 reason=reason,
             )
             logger.info(f"MOQT send: {self._msgstr(message)}")
-            self.send_control_message(message)
+            self._send_reply(request_id, message)
         return message
     
     def unsubscribe(
@@ -4809,7 +4837,7 @@ class _MOQTSessionMixin:
                 reason=reason,
             )
             logger.info(f"MOQT send: {self._msgstr(message)}")
-            self.send_control_message(message)
+            self._send_reply(request_id, message)
         return message
 
     def publish_namespace(

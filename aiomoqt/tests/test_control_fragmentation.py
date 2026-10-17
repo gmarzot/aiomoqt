@@ -677,3 +677,69 @@ async def test_runner_malformed_subscribe_closes_the_session(case):
     await asyncio.sleep(0)
     assert s._closed
     assert s._closed[0][0] == SessionCloseCode.PROTOCOL_VIOLATION
+
+
+def _reply_session(draft):
+    """A session holding peer request 1, recording what it would send."""
+    s = _control_session(draft)
+    s._subscriptions = {}
+    s._request_cancel_handlers = {}
+    s._sent_wire = []
+    s.send_stream_message = lambda sid, m: s._sent_wire.append((sid, m))
+    s.stream_write = lambda sid, data, end_stream=False: s._sent_wire.append(
+        (sid, bytes(data), end_stream))
+    s.send_control_message = lambda m: s._sent_wire.append(("ctl", m))
+    s._peer_requests[1] = (None, None)
+    if s._profile.control_uni_pair:
+        s._bidi_stream_requests[4] = 1
+        s._bidi_streams[1] = 4
+    return s
+
+
+def _reply_all(s, rid):
+    s.fetch_ok(request_id=rid)
+    s.fetch_error(request_id=rid, error_code=0x10, reason="gone upstream")
+    s.subscribe_error(request_id=rid)
+    s.subscribe_done(request_id=rid)
+
+
+@pytest.mark.parametrize("draft", [18, 22])
+@pytest.mark.parametrize("how", ["stop_sending", "reset",
+                                 "fin_after_stop_sending"])
+async def test_replies_to_a_cancelled_request_are_dropped(draft, how):
+    s = _reply_session(draft)
+    if how == "reset":
+        s._on_request_stream_terminated(4)
+    else:
+        s._on_request_stream_terminated(4, stop_sending_code=0)
+        if how == "fin_after_stop_sending":
+            s._on_control_data(4, b"", True, is_request_bidi=True)
+    await asyncio.sleep(0)
+    _reply_all(s, 1)
+    assert s._sent_wire == []
+    assert s._closed == []
+
+
+@pytest.mark.parametrize("draft", [14, 16])
+@pytest.mark.parametrize("cancel", ["FetchCancel", "Unsubscribe"])
+async def test_replies_after_a_control_stream_cancel_are_dropped(draft,
+                                                                 cancel):
+    from aiomoqt.messages.fetch import FetchCancel
+    from aiomoqt.messages.subscribe import Unsubscribe
+    s = _reply_session(draft)
+    if cancel == "FetchCancel":
+        await s._handle_fetch_cancel(FetchCancel(request_id=1))
+    else:
+        await s._handle_unsubscribe(Unsubscribe(request_id=1))
+    _reply_all(s, 1)
+    assert s._sent_wire == []
+
+
+@pytest.mark.parametrize("draft", [18, 22])
+async def test_a_reply_to_an_unknown_request_still_raises(draft):
+    from aiomoqt.types import MOQTException
+    s = _reply_session(draft)
+    s._on_request_stream_terminated(4, stop_sending_code=0)
+    with pytest.raises(MOQTException, match="no request stream bound"):
+        s.fetch_error(request_id=9, error_code=0x10, reason="never asked")
+    assert s._sent_wire == []
