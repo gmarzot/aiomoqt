@@ -3,6 +3,7 @@
   --bg: #121212; --panel: #17171d; --panel-2: #1e1e26; --edge: #33333b;
   --text: #efefef; --dim: #a3a3ad; --faint: #6c6c78; --red: #d9532b; --field: #0d0d10;
   --gold: #e8b339; --green: #73bf69; --amber: #f2a93b; --track: #26262e;
+  --brand: #c1440e;
 }
 * { box-sizing: border-box; }
 html { -webkit-text-size-adjust: 100%; }
@@ -26,7 +27,7 @@ code {
 .mark { width: 52px; height: 39px; flex: none; }
 .brand-text { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 12px; line-height: 1.1; }
 .brand-name { font-size: 24px; font-weight: 600; letter-spacing: -.01em; }
-.brand-name b { color: var(--red); font-weight: 700; }
+.brand-name b { color: var(--brand); font-weight: 700; }
 .brand-sub {
   font-size: 11px; font-weight: 600; color: var(--gold);
   text-transform: uppercase; letter-spacing: .16em;
@@ -136,7 +137,7 @@ h2 {
 }
 .spark { display: block; width: 100%; height: 24px; margin-top: 4px; }
 .spark path {
-  fill: none; stroke: var(--red); stroke-width: 1.5; vector-effect: non-scaling-stroke;
+  fill: none; stroke: var(--brand); stroke-width: 1.5; vector-effect: non-scaling-stroke;
   stroke-linejoin: round;
 }
 
