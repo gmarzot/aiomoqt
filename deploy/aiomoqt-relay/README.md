@@ -1,27 +1,34 @@
-# moqarena
+# MoQ Ersatz Relay
 
-`moqarena.marzresearch.net` serves the G5 Broadcast and G5 Player test pages, and runs the aiomoqt
-ersatz relay for limited interop testing. The relay is open, with no auth.
+`aiomoqt-relay.marzresearch.net` runs the aiomoqt ersatz relay for limited interop testing, its
+dashboard, and the G5 Broadcast and G5 Player test pages. The relay is open, with no auth.
 
 | Service | Container | What it does |
 |---|---|---|
-| `relay` | `ersatz-relay` | `moq_interop_relay` on UDP 4443, raw QUIC and WebTransport, drafts 22/20/18/16/14, `--watchdog 15`, writes `status/status.json` and `relay-logs/` |
-| `web` | `g5-web` | nginx on 80/443: landing page, `/g5-broadcast/`, `/g5-player/`, `/relay/` dashboard, `/relay/platform/` and `/relay/logs/`, `/status/{status,platform}.json`, `/private/`, `/stats/` |
-| `goaccess` | `g5-goaccess` | rebuilds the visitor reports in `stats/` every 5 minutes from `logs/`; no network |
+| `relay` | `ersatz-relay` | `moq_interop_relay` on UDP 4443, raw QUIC and WebTransport, drafts 22/20/18/16/14, `--watchdog 15`, writes `status/` and `relay-logs/` |
+| `web` | `relay-web` | nginx on 80/443: landing page, `/g5-broadcast/`, `/g5-player/`, `/relay/` dashboard, `/relay/platform/` and `/relay/logs/`, `/status/{status,platform}.json`, `/private/`, `/stats/` |
+| `goaccess` | `relay-goaccess` | rebuilds the visitor reports in `stats/` every 5 minutes from `logs/`; no network |
 
-Host: `ssh ubuntu@moqarena.marzresearch.net` (OCI, Ubuntu 22.04 aarch64, Docker with Compose v2).
-The OCI security list opens UDP 4433-4443 and TCP 80/443. The certificate comes from snap certbot
-with dns-cloudflare. Its deploy hooks in `/etc/letsencrypt/renewal-hooks/deploy/` restart
-`ersatz-relay` and reload `g5-web` by name.
+Host: `ssh ubuntu@aiomoqt-relay.marzresearch.net` (129.146.35.142; OCI, Ubuntu 24.04 aarch64,
+Docker with Compose v2). The subnet's security list opens UDP 4433-4443 and TCP 80/443; the host's
+own iptables (`/etc/iptables/rules.v4`) must also accept TCP 443 and UDP 4443. The certificate
+comes from apt certbot with dns-cloudflare (`/etc/cloudflare/credentials.ini`, 0600). Its deploy
+hooks in `/etc/letsencrypt/renewal-hooks/deploy/` restart `ersatz-relay` and reload `relay-web` by
+name.
+
+The host is also the perf and release-gate box. UDP 4443 belongs to the public relay; test relays
+use 5443 and up. Before a bench that needs a quiet box, `docker stop ersatz-relay`, and start it
+again after.
 
 ## Layout on the host
 
-Everything lives in `~/g5-site`; run every `docker compose` command from there.
+Everything lives in `~/aiomoqt-relay`; run every `docker compose` command from there.
 
 ```
 compose.yml, nginx.conf   this directory
 site/index.html           landing page (site/ here)
-site/relay/               relay dashboard (site/ here)
+site/relay/, site/private/
+                          dashboard, platform, log viewer and private index (site/ here)
 site/assets, site/g5-broadcast, site/g5-player, site/VERSION
                           moq-playa examples/dist
 status/                   status.json and platform.json, written by the relay, read-only to nginx
@@ -31,6 +38,7 @@ cores/                    relay core files
 logs/                     nginx access log, read by GoAccess
 stats/                    GoAccess reports: index.html (visitors), crawlers.html
 stats.htpasswd            the password for /private/, /stats/ and /relay/logs/
+build/                    relay image build context
 ```
 
 ## First-time setup
@@ -39,12 +47,12 @@ Create `stats.htpasswd` before the first `up`. If it is missing, Docker creates 
 place and `/stats/` fails.
 
 ```sh
-tar -C deploy/moqarena -cf - compose.yml nginx.conf site | ssh ubuntu@moqarena.marzresearch.net 'tar -C ~/g5-site -xf -'
-ssh -t ubuntu@moqarena.marzresearch.net
-cd ~/g5-site && mkdir -p status relay-logs cores logs stats
-printf 'gmarzot:%s\n' "$(openssl passwd -apr1)" > stats.htpasswd    # prompts for the password
-sudo tee /etc/logrotate.d/moqarena >/dev/null <<'ROT'
-/home/ubuntu/g5-site/logs/access.log {
+tar -C deploy/aiomoqt-relay -cf - compose.yml nginx.conf site | ssh ubuntu@aiomoqt-relay.marzresearch.net 'mkdir -p ~/aiomoqt-relay && tar -C ~/aiomoqt-relay -xf -'
+ssh -t ubuntu@aiomoqt-relay.marzresearch.net
+cd ~/aiomoqt-relay && mkdir -p status relay-logs cores logs stats
+printf 'moqadmin:%s\n' "$(openssl passwd -6)" > stats.htpasswd    # prompts for the password
+sudo tee /etc/logrotate.d/aiomoqt-relay >/dev/null <<'ROT'
+/home/ubuntu/aiomoqt-relay/logs/access.log {
     daily
     rotate 30
     compress
@@ -54,18 +62,28 @@ sudo tee /etc/logrotate.d/moqarena >/dev/null <<'ROT'
     copytruncate
 }
 ROT
-docker rm -f ersatz-relay      # a relay started by hand; compose recreates it
 docker compose up -d
+```
+
+Certificate and firewall, once:
+
+```sh
+sudo apt-get install -y certbot python3-certbot-dns-cloudflare
+sudo certbot certonly --dns-cloudflare --dns-cloudflare-credentials /etc/cloudflare/credentials.ini -d aiomoqt-relay.marzresearch.net
+sudo iptables -I INPUT 5 -p tcp --dport 443 -j ACCEPT
+sudo iptables -I INPUT 5 -p udp --dport 4443 -j ACCEPT
+sudo netfilter-persistent save
 ```
 
 ## Relay image
 
-The image is built on the host from the repo's `Dockerfile`. The build context has no `.git`, so
-pass the version explicitly. Run `python -m setuptools_scm` in the checkout to get it.
+The relay runs the newest aiomoqt (`gmarzot-0.12.0`) and aiopquic (`gmarzot-0.5.0`) code, built on
+the host from the repo's `Dockerfile`. The build context has no `.git`, so pass the version
+explicitly. Run `python -m setuptools_scm` in the checkout to get it.
 
 ```sh
-tar --exclude=.git --exclude=certs -cf - . | ssh ubuntu@moqarena.marzresearch.net 'rm -rf ~/Projects/aiomoqt && mkdir -p ~/Projects/aiomoqt && tar -C ~/Projects/aiomoqt -xf -'
-ssh ubuntu@moqarena.marzresearch.net 'docker build --build-arg VERSION=<pep440> -t aiomoqt:<sha> ~/Projects/aiomoqt'
+tar --exclude=.git --exclude=certs -cf - . | ssh ubuntu@aiomoqt-relay.marzresearch.net 'rm -rf ~/aiomoqt-relay/build && mkdir -p ~/aiomoqt-relay/build && tar -C ~/aiomoqt-relay/build -xf -'
+ssh ubuntu@aiomoqt-relay.marzresearch.net 'docker build --build-arg VERSION=<pep440> -t aiomoqt:<sha> ~/aiomoqt-relay/build'
 ```
 
 To run an aiopquic build that is not on PyPI, layer its wheel on top. The cp312 aarch64 wheel comes
@@ -88,7 +106,7 @@ openmoq/moq-playa:
 
 ```sh
 pnpm -r build      # in the moq-playa checkout
-tar -C examples/dist -cf - assets g5-broadcast g5-player | ssh ubuntu@moqarena.marzresearch.net 'tar -C ~/g5-site/site -xf -'
+tar -C examples/dist -cf - assets g5-broadcast g5-player | ssh ubuntu@aiomoqt-relay.marzresearch.net 'tar -C ~/aiomoqt-relay/site -xf -'
 ```
 
 ## nginx config
@@ -99,11 +117,9 @@ tar -C examples/dist -cf - assets g5-broadcast g5-player | ssh ubuntu@moqarena.m
 ## Relay logs
 
 `/private/` links the visitor reports and the relay logs. `/relay/logs/` tails the relay's
-`--log-dir` behind the same password; full peer addresses appear only there. `relay.log`
-rotates itself at 10 MB and keeps four old files. `crash.log` gets a `relay: start` line at each
-start and the faulthandler dump of a native crash or watchdog stall.
-It is not rotated, so trim it by hand if it grows. `--log-dir` needs an aiomoqt relay that has the
-flag; on an older image, drop it from `command`, or the relay restarts in a loop.
+`--log-dir` behind the same password. `relay.log` rotates itself at 10 MB and keeps four old
+files. `crash.log` gets a `relay: start` line at each start and the faulthandler dump of a native
+crash or watchdog stall. It is not rotated, so trim it by hand if it grows.
 
 ## Core dumps
 
@@ -113,18 +129,19 @@ apport restart resets it):
 
 ```sh
 sudo sysctl -w kernel.core_pattern=/cores/core.%e.%p.%t
+sudo install -d -m 1777 /cores    # cores of processes outside containers
 ```
 
-The path resolves inside the crashing container. Cores are not rotated; keep the image that
-produced one (`docker image ls aiomoqt`) for `gdb`, and delete them by hand.
+The path resolves inside the crashing process's mount namespace. Cores are not rotated; keep the
+image that produced one (`docker image ls aiomoqt`) for `gdb`, and delete them by hand.
 
 ## Checks, run on the host
 
 ```sh
-curl -s https://moqarena.marzresearch.net/status/status.json | python3 -c 'import json,sys,time; s=json.load(sys.stdin); print(round(time.time()-s["generated"]), "s old,", s["totals"]["sessions"], "sessions")'
+curl -s https://aiomoqt-relay.marzresearch.net/status/status.json | python3 -c 'import json,sys,time; s=json.load(sys.stdin); print(round(time.time()-s["generated"]), "s old,", s["totals"]["sessions"], "sessions")'
 docker run --rm --network host --entrypoint python aiomoqt:dev -c 'import asyncio; from aiomoqt.tools import moq_interop_relay as r; print(asyncio.run(r._self_probe("127.0.0.1", 4443, True, 18, 8.0)))'
-curl -s -o /dev/null -w '%{http_code}\n' https://moqarena.marzresearch.net/stats/    # 401 without the password
-curl -s -o /dev/null -w '%{http_code}\n' https://moqarena.marzresearch.net/relay/logs/files/relay.log    # 401 too
+curl -s -o /dev/null -w '%{http_code}\n' https://aiomoqt-relay.marzresearch.net/stats/    # 401 without the password
+curl -s -o /dev/null -w '%{http_code}\n' https://aiomoqt-relay.marzresearch.net/relay/logs/files/relay.log    # 401 too
 ```
 
 `docker logs ersatz-relay` shows a watchdog probe under `aiomoqt-watchdog/…` every 15 s. That is
