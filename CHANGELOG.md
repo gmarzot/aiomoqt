@@ -21,7 +21,7 @@
 - Relay: `--status-dir` also writes `platform.json` (host detail from /proc: CPU by mode,
   pressure, memory, disks, interfaces, UDP, the relay's socket and process) and per-track
   history and subscriber lists in `status.json`.
-- Requires aiopquic >= 0.5.0rc1.
+- Requires aiopquic >= 0.5.0rc3.
 - One publisher-role subscription per track per session: `publish()` sends no PUBLISH for a track the peer already subscribes to, a SUBSCRIBE crossing our established PUBLISH is refused (DUPLICATE_SUBSCRIPTION; NOT_SUPPORTED from d20), and a PUBLISH reply never changes a SUBSCRIBE's state.
 - load_sim fails a group that subscribed but received no objects (`<< NO OBJECTS`) and prints exact `Total objects:` / `Total bytes:`.
 - Interop tier: relay-pub-sub fails on zero or missing `Total objects:`.
