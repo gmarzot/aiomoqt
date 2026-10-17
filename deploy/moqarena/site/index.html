@@ -51,7 +51,9 @@
   p { margin: 10px 0 0; }
   .note { color: var(--dim); font-size: 13px; }
   footer { margin-top: 32px; }
-  .warn { border-left: 3px solid var(--red); padding: 6px 10px; margin: 0 0 12px; background: #1d1513; }
+  .warn { border-left: 3px solid var(--red); padding: 6px 10px; margin: 0 0 12px; background: #1d1513;
+    font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  @media (max-width: 900px) { .warn { white-space: normal; } }
 </style>
 </head>
 <body>
@@ -78,8 +80,7 @@
   <section>
     <h2>aiomoqt ersatz relay — limited testing only</h2>
     <p class="warn">For limited interop testing. Please keep traffic light: excessive traffic or
-      extended relay testing is discouraged. Open, no auth, a small per-track cache, not a
-      production relay.</p>
+      extended relay testing is discouraged. Not a production relay.</p>
     <dl>
       <dt>WebTransport</dt><dd><code>https://moqarena.marzresearch.net:4443/</code></dd>
       <dt>Raw QUIC</dt><dd><code>moqt://moqarena.marzresearch.net:4443</code></dd>

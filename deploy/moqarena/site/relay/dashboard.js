@@ -79,8 +79,7 @@ function arc(r, f0, f1) {
 const level = (pct) => pct >= 90 ? 'high' : pct >= 70 ? 'warn-level' : 'ok';
 
 // `bands`: amber and red past 70% and 90%; without, high is good and stays green.
-// `label`: the value inside the arc.
-function drawGauge(svg, pct, bands = true, label = true) {
+function drawGauge(svg, pct, bands = true) {
   const tone = (v) => bands ? level(v) : 'ok';
   svg.replaceChildren(svgEl('path', {class: 'g-track', d: arc(G.r, 0, 1)}));
   if (bands) {
@@ -94,7 +93,7 @@ function drawGauge(svg, pct, bands = true, label = true) {
     const f = Math.min(Math.max(pct, 0), 100) / 100;
     svg.append(svgEl('path', {class: `g-arc ${tone(pct)}`, d: arc(G.r, 0, Math.max(f, 0.004))}));
   }
-  if (label) svg.append(text);
+  svg.append(text);
 }
 
 function renderGauges(h) {
@@ -126,8 +125,6 @@ function sessionMix(list) {
   };
 }
 
-const pct100 = (v) => none(v) ? null : 100 * v;
-
 function renderTiles(s) {
   const T = s.totals;
   const sessions = s.sessions || [];
@@ -137,8 +134,6 @@ function renderTiles(s) {
   const playable = s.namespaces.filter((r) => r.format).length;
   const live = s.tracks.filter((r) => r.state === 'live').length;
   const groups = s.tracks.reduce((n, r) => n + (r.groups_per_s || 0), 0);
-  const fetched = none(T.fetch_cache_bytes) || none(T.fetch_upstream_bytes) ? null
-    : T.fetch_cache_bytes + T.fetch_upstream_bytes;
   setTile('publishers', fmt.num(T.publishers), pubs.transports || 'publishing sessions',
           pubList.length ? `By draft: ${pubs.drafts}` : 'No publishing sessions');
   setTile('subscribers', fmt.num(T.subscribers),
@@ -146,17 +141,6 @@ function renderTiles(s) {
           subList.length ? `${subs.transports}; by draft: ${subs.drafts}` : 'No subscribing sessions');
   setTile('namespaces', fmt.num(T.namespaces), playable ? `${playable} playable` : '');
   setTile('tracks', fmt.num(T.tracks), `${fmt.num(live)} live`);
-  setTile('fetches', fmt.num(T.fetches), fetched === null ? 'since start' : `${fmt.bytes(fetched)} served`);
-  setTile('delivered', fmt.bytes(T.delivered_bytes), 'media since start');
-  const cache = pct100(T.cache_efficiency);
-  setTile('cache', fmt.pct(cache, 0),
-          fetched === null ? 'not reported' : fetched ? `of ${fmt.bytes(fetched)} fetched` : 'no fetches yet',
-          'Share of FETCH data served from the relay cache instead of the publisher'
-            + (fetched === null ? '. This relay build does not report it.' : ''));
-  drawGauge($('gauge-cache'), cache, false, false);
-  const cdn = pct100(T.efficiency);
-  setTile('cdn', fmt.pct(cdn, 0), `${fmt.bpsShort(T.media_in_bps)} in → ${fmt.bpsShort(T.media_out_bps)} out`);
-  drawGauge($('gauge-cdn'), cdn, false, false);
   setTile('rtt', fmt.ms(T.rtt_p50_ms), `p99 ${fmt.ms(T.rtt_p99_ms)}`);
   const lag = T.loop_lag_ms || {};
   setTile('lag', fmt.ms(lag.p99), `p50 ${fmt.ms(lag.p50)}`);
