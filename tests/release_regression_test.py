@@ -204,7 +204,7 @@ def _loopback_pub_sub_variant(log_dir: Path, slug: str, flags: list[str],
     """Generic runner for loopback_bench variants."""
     log = log_dir / f"{slug}.log"
     cmd = [
-        "python", "-m", "aiomoqt.tools.loopback_bench",
+        sys.executable, "-m", "aiomoqt.tools.loopback_bench",
         *flags,
     ]
     ok, _ = _run(cmd, log, timeout)

@@ -34,6 +34,7 @@
 - Interop tier: relay-pub-sub also fails on a load_sim `RESULT: FAIL`, a missing `RESULT:` line, or a non-zero exit.
 - A WebTransport server with no WT-Protocol that receives a d18+ SETUP on a uni stream closes with "SETUP on a uni stream with no WT-Protocol: offer moqt-NN in WT-Available-Protocols".
 - Logged messages name Message Parameters from the negotiated draft's table (0x04 is RENDEZVOUS_TIMEOUT from d18); `MOQTMessage.describe(prof)`, `messages.params.param_name`.
+- Integration tier: loopback-bench variants run under the runner's own interpreter, not `python` from PATH.
 - WebTransport client teardown waits for the connection to close, so an error close (e.g. WT_ALPN_ERROR) is not dropped by the transport stopping.
 - MediaPublisher serves a FETCH from the objects each track published, its FETCH_OK End the end of that range; MediaSubscriber ignores a catalog object older than the one applied.
 - A received GOAWAY is recorded (`goaway_received`) and reported to `on_goaway(msg, request_id)`; no new request is sent after a control-stream GOAWAY. `goaway(request_id=)` sends one on a request stream (d18+).

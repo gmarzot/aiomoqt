@@ -1,6 +1,7 @@
 """The runner's relay-pub-sub verdict: zero or missing objects, a FAIL or missing
 load_sim RESULT line, or a non-zero exit fail."""
 import importlib.util
+import sys
 from pathlib import Path
 
 import pytest
@@ -71,3 +72,16 @@ def test_nonzero_exit_fails(runner):
     status, detail = runner._pub_sub_verdict(_text(90), 1)
     assert status == "FAIL"
     assert "exit 1" in detail
+
+
+def test_loopback_variants_run_this_interpreter(runner, monkeypatch, tmp_path):
+    seen = []
+
+    def fake_run(cmd, log, timeout):
+        seen.append(cmd)
+        log.write_text("")
+        return True, ""
+
+    monkeypatch.setattr(runner, "_run", fake_run)
+    runner._loopback_pub_sub_variant(tmp_path, "v", ["-t", "1"], 5)
+    assert seen and seen[0][0] == sys.executable
