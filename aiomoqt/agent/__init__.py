@@ -1,8 +1,9 @@
 """Declarative, agent-facing API over MoQT.
 
 Specs are plain dataclasses that round-trip through JSON, so a model can
-emit one and a harness can persist it. Nothing here imports the MCP SDK;
-the MCP server lives in aiomoqt.mcp behind the `mcp` extra.
+emit one and a harness can persist it; `schema` emits their JSON Schema.
+AgentSession runs them as Reader and Writer handles over a MoQT session.
+No MCP server ships; nothing here imports an MCP SDK.
 
 Provisional through 0.12.x: names and fields may change without a
 deprecation cycle until the surface settles.
