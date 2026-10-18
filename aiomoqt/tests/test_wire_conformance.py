@@ -1207,6 +1207,16 @@ def test_malformed_fill_parameters_is_a_protocol_violation(raw, match):
         _unparams(raw, 20)
 
 
+@pytest.mark.parametrize("draft", [20, 22])
+def test_forbidden_fill_parameter_closes_before_its_value_is_decoded(draft):
+    # AUTHORIZATION_TOKEN (0x03) with an undecodable value inside
+    # FILL_PARAMETERS: the scope check (Table 7) comes first.
+    raw = bytes.fromhex("012304" "010301ff")
+    with pytest.raises(MOQTProtocolViolation,
+                       match="0x3 not allowed in FillParameters"):
+        _unparams(raw, draft)
+
+
 def test_namespace_prefix_parameter_d20_prefixed_d22_bare():
     # d20 keeps the d18 length prefix; d22 §9.20 makes Track
     # Namespace an encoding of its own, with no Length.

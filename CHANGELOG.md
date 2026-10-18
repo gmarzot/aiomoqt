@@ -11,6 +11,7 @@
 - CI: contribution-runner sweep at d18 and d22 (runner has no d20; its d21 is moqt-21).
 - URL: a moqt:// URL with an empty query keeps its `?` in the SETUP PATH (`/moq?`).
 - Session: from d20, a request stream FIN'd mid-message closes the session with PROTOCOL_VIOLATION.
+- Messages: a parameter outside its message's scope (e.g. inside FILL_PARAMETERS) closes before its value is decoded.
 
 ## v0.12.0
 

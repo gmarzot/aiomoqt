@@ -894,6 +894,7 @@ class MOQTMessage:
         param_count = buf.pull_vint()
         prev_key = 0
         d20 = prof.draft >= 18 and prof.param_table >= 20
+        allowed = param_scope(prof).get(scope) if prof.draft >= 18 else None
 
         for param_index in range(param_count):
             if buf_end is not None and buf.tell() >= buf_end:
@@ -916,6 +917,11 @@ class MOQTMessage:
                     raise MOQTProtocolViolation(
                         f"unknown message parameter 0x{param_type:x} "
                         f"(§10.2: cannot be skipped)")
+                if allowed is not None and param_type not in allowed:
+                    # §10.2.1: checked before the value is decoded, so an
+                    # out-of-scope parameter closes as PROTOCOL_VIOLATION.
+                    raise MOQTProtocolViolation(
+                        f"parameter 0x{param_type:x} not allowed in {scope}")
                 if kind == "location" and d20:
                     param_value = (buf.pull_vint(), buf.pull_vint())
                 elif kind == "location":
@@ -1033,15 +1039,6 @@ class MOQTMessage:
             if d20 and param_type in RANGE_FILTERS:
                 param_value = [param_value]
             params[param_type] = param_value
-
-        allowed = param_scope(prof).get(scope) if prof.draft >= 18 else None
-        if allowed is not None:
-            for param_type in params:
-                if param_type not in allowed:
-                    # §10.2.1: a parameter outside its message types MUST
-                    # close the connection.
-                    raise MOQTProtocolViolation(
-                        f"parameter 0x{param_type:x} not allowed in {scope}")
         return params
 
     @staticmethod
