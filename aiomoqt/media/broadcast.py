@@ -15,14 +15,22 @@ from __future__ import annotations
 import asyncio
 from typing import Callable, Dict, Optional
 
-from ..messages import FetchHeader, FetchObject, SubgroupHeader
-from ..track import PublishedTrack, SubscribedTrack, TrackState
-from ..types import MOQTMessageType, ObjectStatus
+from ..messages import SubgroupHeader
+from ..track import PublishedTrack, TrackState
+from ..types import (
+    MOQTMessageType, MOQTRequestError, ObjectStatus, RequestErrorCode,
+    StreamResetCode,
+)
 from ..utils.logger import get_logger
 from .catalog import (
-    Catalog, CATALOG_TRACK_NAME, PACKAGING_CMAF, PACKAGING_LOC,
+    Catalog, CatalogError, CATALOG_TRACK_NAME, MEDIA_PACKAGINGS,
+    PACKAGING_LOC, PACKAGING_LOCMAF,
 )
 from .loc import LocTrackPublisher, LocTrackSubscriber
+from .locmaf import (
+    LocmafError, LocmafTrackSubscriber, SUPPORTED_LOCMAF_VERSIONS,
+    TrackContext,
+)
 
 logger = get_logger(__name__)
 
@@ -34,7 +42,17 @@ CATALOG_PUBLISHER_PRIORITY = 64
 
 class CatalogTrackPublisher(PublishedTrack):
     """Publishes the "catalog" track: the current independent catalog
-    opens each group; queued deltas follow as Objects >= 1."""
+    opens each group; queued deltas follow as Objects >= 1.
+
+    One emitter serves the current subscription. It sends nothing at
+    Forward State 0 (§5.1), opens a new group with the current catalog
+    when forwarding resumes, and is cancelled with its open stream reset
+    when the subscription ends (§5.1.1); the next SUBSCRIBE starts a new
+    one. Group IDs continue across subscriptions.
+    """
+
+    # Queued when forwarding resumes: send the current catalog.
+    _RESUME = object()
 
     def __init__(self, session, namespace: str, catalog: Catalog):
         super().__init__(session, namespace, CATALOG_TRACK_NAME,
@@ -45,10 +63,33 @@ class CatalogTrackPublisher(PublishedTrack):
         # SUBSCRIBE_OK must say ContentExists even before generation.
         self._largest = (0, 0)
         self._updates: asyncio.Queue = asyncio.Queue()
+        # A relay holding later groups would read a restarted 0 as stale.
+        self._next_group = 0
+        self._emitter: Optional[asyncio.Task] = None
+
+    def _serving(self) -> bool:
+        return self._emitter is not None and not self._emitter.done()
+
+    def _fold(self, update: Catalog) -> None:
+        """Make `update` part of the current catalog without sending it."""
+        if update.is_delta:
+            self.catalog.apply(update)
+        else:
+            self.catalog = update
 
     async def publish_catalog(self, catalog: Catalog) -> None:
-        """Queue a new independent catalog (starts a new group)."""
-        await self._updates.put(catalog)
+        """Queue a new independent catalog (starts a new group). While no
+        subscription is served it supersedes everything queued, so a
+        periodic refresh cannot grow the queue."""
+        if self._serving():
+            await self._updates.put(catalog)
+            return
+        finished = False
+        while not self._updates.empty():
+            finished |= self._updates.get_nowait() is None
+        self.catalog = catalog
+        if finished:
+            self._updates.put_nowait(None)
 
     async def publish_delta(self, delta: Catalog) -> None:
         """Queue a delta update (next object in the current group)."""
@@ -57,10 +98,38 @@ class CatalogTrackPublisher(PublishedTrack):
     async def finish(self) -> None:
         await self._updates.put(None)
 
+    def _set_forward(self, sub, forward: Optional[int]) -> None:
+        resumed = forward is not None and bool(forward) and not sub.forward
+        super()._set_forward(sub, forward)
+        if resumed and self._serving():
+            self._updates.put_nowait(self._RESUME)
+
     async def generate(self, session, track_alias: int):
+        """Serve the catalog to the subscription under `track_alias`,
+        replacing any earlier emitter."""
+        if self._emitter is not None:
+            self._emitter.cancel()
+        task = asyncio.ensure_future(self._emit_loop(session, track_alias))
+        self._emitter = task
+        # Owned like a producer: the last subscriber leaving cancels it.
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _on_fetch(self, session, msg) -> None:
+        """FETCH from the catalog objects published; before any was, the
+        current catalog stands at (0, 0)."""
+        if self._history is not None and not len(self._history):
+            self._history.add(0, 0, self.catalog.to_json().encode(),
+                              priority=self.priority)
+        await super()._on_fetch(session, msg)
+
+    async def _emit_loop(self, session, track_alias: int):
+        sub = self._sub_for(session)
         prof = session._profile
         header = None
         stream_id = None
+        # Deltas may follow only in a group that has seen every update.
+        can_append = False
 
         async def _emit(payload: bytes, new_group: bool):
             nonlocal header, stream_id
@@ -69,38 +138,61 @@ class CatalogTrackPublisher(PublishedTrack):
                     buf = header.end_group(object_id=header.next_object_id)
                     session.stream_write(stream_id, buf.data,
                                          end_stream=True)
+                    stream_id = None
                 stream_id = await session.open_uni_stream()
                 self._stream_count += 1
                 header = SubgroupHeader(
-                    track_alias=track_alias,
-                    group_id=0 if header is None else header.group_id + 1,
+                    track_alias=track_alias, group_id=self._next_group,
                     subgroup_id=0, publisher_priority=self.priority,
                     prof=prof)
-                session.stream_write(stream_id, header.serialize().data)
+                self._next_group += 1
+                await session.stream_write_drain(stream_id,
+                                                 header.serialize().data)
             buf = header.next_object(payload=payload)
             await session.stream_write_drain(stream_id, buf.data)
-            self._note_largest(header.group_id, header._last_object_id)
+            self._remember(header.group_id, header._last_object_id, payload)
             self._total_sent += 1
 
-        # A joining subscriber needs a complete catalog first (§11.2).
-        await _emit(self.catalog.to_json().encode(), new_group=True)
+        async def _emit_catalog():
+            nonlocal can_append
+            # A joining subscriber needs a complete catalog first (§11.2).
+            await _emit(self.catalog.to_json().encode(), new_group=True)
+            can_append = True
+
         try:
+            if sub.forward:
+                await _emit_catalog()
             while True:
                 update = await self._updates.get()
                 if update is None:
                     break
-                await _emit(update.to_json().encode(),
-                            new_group=not update.is_delta)
-                # self.catalog tracks what has been emitted, so a group
-                # start always opens with every prior delta folded in.
-                if update.is_delta:
-                    self.catalog.apply(update)
+                if update is self._RESUME:
+                    if sub.forward:
+                        await _emit_catalog()
+                    continue
+                if not sub.forward:
+                    # §5.1: no Objects at Forward State 0.
+                    self._fold(update)
+                    can_append = False
+                    continue
+                if update.is_delta and can_append:
+                    await _emit(update.to_json().encode(), new_group=False)
+                    self._fold(update)
                 else:
-                    self.catalog = update
-        finally:
-            if stream_id is not None:
-                buf = header.end_group(object_id=header.next_object_id)
-                session.stream_write(stream_id, buf.data, end_stream=True)
+                    self._fold(update)
+                    await _emit_catalog()
+        except asyncio.CancelledError:
+            # §5.1.1: the subscription ended; reset its open stream.
+            if stream_id is not None and session._close_err is None:
+                session.stream_reset(stream_id, StreamResetCode.CANCELLED)
+            raise
+        except Exception as e:
+            if session._close_err is None:
+                logger.warning(f"Catalog: emitter stopped: {e}")
+            return
+        if stream_id is not None:
+            buf = header.end_group(object_id=header.next_object_id)
+            session.stream_write(stream_id, buf.data, end_stream=True)
         self._send_publish_done(session)
 
 
@@ -168,6 +260,9 @@ class MediaPublisher:
         if track is None:
             logger.warning(f"MediaPublisher: SUBSCRIBE for unknown "
                            f"track {name!r}")
+            session.subscribe_error(
+                msg.request_id,
+                RequestErrorCode.DOES_NOT_EXIST, "track not published here")
             return
         await track._on_subscribe(session, msg)
 
@@ -177,28 +272,25 @@ class MediaPublisher:
             await track._on_publish_ok(session, msg)
 
     async def _demux_fetch(self, session, msg) -> None:
-        """Serve a joining/absolute FETCH of the catalog track with the
-        current complete catalog (a joining subscriber's first need,
-        msf-01 §5); other fetches keep the default bare FETCH_OK."""
+        """Route a FETCH to its track, which serves it from the objects it
+        has published; FETCH_OK's End is the end of that range."""
         track = None
         name = msg.track_name
         if name is not None:
             name = name.decode() if isinstance(name, bytes) else name
             track = self._by_name.get(name)
         if track is None and msg.joining_request_id is not None:
-            track = self._track_for_request(msg.joining_request_id)
-        session.fetch_ok(request_id=msg.request_id)
-        if track is not self.catalog_track:
+            track = next(
+                (t for t in self._by_name.values()
+                 if msg.joining_request_id in t._sub_for(session).subscribers),
+                None)
+        if track is None:
+            session.fetch_error(
+                request_id=msg.request_id,
+                error_code=RequestErrorCode.DOES_NOT_EXIST,
+                reason="track not published here")
             return
-        sid = await session.open_uni_stream()
-        prof = session._profile
-        session.stream_write(
-            sid,
-            FetchHeader(request_id=msg.request_id).serialize(prof).data)
-        obj = FetchObject(
-            payload=self.catalog_track.catalog.to_json().encode())
-        session.stream_write(sid, obj.serialize(prof=prof).data,
-                             end_stream=True)
+        await track._on_fetch(session, msg)
 
     async def _demux_update(self, session, msg) -> None:
         from ..messages import RequestUpdate
@@ -223,62 +315,72 @@ class MediaPublisher:
 
 class MediaSubscriber:
     """Consumes an MSF broadcast: reads the catalog track, then
-    subscribes every LOC media track it describes.
+    subscribes every LOC, CMAF and LOCMAF track it describes (a LOCMAF
+    track only with a supported locmafVersion and an init).
 
     on_frame(track_name, frame, group_id, object_id) receives media;
+    on_arrival(track_name, msg, recv_us, group_id, subgroup_id, frame)
+    sees every media-track object first (see LocTrackSubscriber);
     on_catalog(catalog) fires on every independent catalog or applied
-    delta.
+    delta. `loc_bare` expects LOC payloads without the Private
+    Properties block.
     """
 
     def __init__(self, session, namespace: str, *,
                  on_frame: Optional[Callable] = None,
                  on_catalog: Optional[Callable] = None,
                  track_filter: Optional[Callable] = None,
-                 discover: bool = False):
+                 discover: bool = False,
+                 on_arrival: Optional[Callable] = None,
+                 loc_bare: bool = False):
         self.session = session
         self.namespace = namespace
+        self.loc_bare = loc_bare
         # Treat `namespace` as a prefix and resolve it to the namespace
         # actually being published under it (§9.4), so a subscriber can
         # find a broadcast whose name it was never told.
         self.discover = discover
         self.on_frame = on_frame
+        self.on_arrival = on_arrival
         self.on_catalog = on_catalog
         self.track_filter = track_filter or (lambda t: True)
         self.catalog: Optional[Catalog] = None
+        # Location of the last catalog object applied; the joining FETCH
+        # and the subscription can deliver the same or older ones late.
+        self._catalog_at: Optional[tuple] = None
         self.tracks: Dict[str, LocTrackSubscriber] = {}
         self._have_catalog = asyncio.Event()
-        self._catalog_sub: Optional[SubscribedTrack] = None
 
     async def start(self, timeout: float = 10.0) -> Catalog:
         """Join the catalog track (SUBSCRIBE + joining FETCH, msf-01 §5
         — a late joiner needs the relay-cached complete catalog), await
-        the first one, subscribe its media tracks. Falls back to plain
-        SUBSCRIBE when the peer can't serve the fetch."""
+        the first one, subscribe its media tracks. When the peer can't
+        serve the fetch the subscription alone carries the catalog."""
         if self.discover:
             await self._resolve_namespace(timeout)
         self.session.on_fetch_object = self._on_catalog_fetch_object
         # Global fallback catches catalog objects that arrive before the
         # per-alias registration (§10.4.2 data-before-OK race).
         self.session.on_object_received = self._on_catalog_object
+        sub_msg, fetch_msg = await self.session.join(
+            self.namespace, CATALOG_TRACK_NAME, joining_start=0)
+        sub_ok = await self.session._await_response(sub_msg.request_id)
+        alias = getattr(sub_ok, 'track_alias', None)
+        if alias is not None:
+            self.session.register_object_handler(
+                alias, self._on_catalog_object)
         try:
-            sub_ok, _fetch_ok = await self.session.join(
-                self.namespace, CATALOG_TRACK_NAME, joining_start=0,
-                wait_response=True)
-            alias = getattr(sub_ok, 'track_alias', None)
-            if alias is not None:
-                self.session.register_object_handler(
-                    alias, self._on_catalog_object)
-        except Exception as e:
+            # From d20 the fill rides the SUBSCRIBE, already answered.
+            if fetch_msg.request_id != sub_msg.request_id:
+                await self.session._await_response(fetch_msg.request_id)
+        except MOQTRequestError as e:
+            # Resubscribing would be a duplicate subscription (§5.1).
             logger.warning(
                 f"MediaSubscriber: catalog joining FETCH refused ({e}); "
-                f"falling back to plain subscribe. msf-01 §5 requires the "
-                f"fetch, and without it only a catalog still being "
-                f"republished will arrive — a late joiner to a settled "
-                f"broadcast gets nothing")
-            self._catalog_sub = SubscribedTrack(
-                self.session, self.namespace, CATALOG_TRACK_NAME,
-                on_object=self._on_catalog_object)
-            await self._catalog_sub.subscribe()
+                f"keeping the subscription. msf-01 §5 requires the fetch, "
+                f"and without it only a catalog still being republished "
+                f"will arrive — a late joiner to a settled broadcast gets "
+                f"nothing")
         await asyncio.wait_for(self._have_catalog.wait(), timeout)
         await self._subscribe_media()
         return self.catalog
@@ -317,6 +419,9 @@ class MediaSubscriber:
         # End-of-group / end-of-track markers carry no catalog.
         if getattr(msg, "status", None) not in (None, ObjectStatus.NORMAL):
             return
+        at = (msg.group_id if group_id is None else group_id, msg.object_id)
+        if self._catalog_at is not None and at <= self._catalog_at:
+            return
         try:
             update = Catalog.from_json(bytes(msg.payload).decode())
         except Exception as e:
@@ -330,24 +435,66 @@ class MediaSubscriber:
             self.catalog.apply(update)
         else:
             self.catalog = update
+        self._catalog_at = at
         if self.on_catalog:
             self.on_catalog(self.catalog)
         self._have_catalog.set()
 
+    def _locmaf_init(self, entry) -> Optional[bytes]:
+        """The CMAF header of a LOCMAF track this subscriber can decode,
+        else None: a track of an unsupported locmafVersion must not be
+        subscribed."""
+        if entry.locmafVersion not in SUPPORTED_LOCMAF_VERSIONS:
+            logger.warning(f"MediaSubscriber: skipping {entry.name!r} "
+                           f"(locmafVersion={entry.locmafVersion!r})")
+            return None
+        try:
+            init = self.catalog.resolve_init(entry)
+        except CatalogError as e:
+            init = None
+            logger.warning(f"MediaSubscriber: {entry.name!r}: {e}")
+        if init is None:
+            logger.warning(f"MediaSubscriber: skipping {entry.name!r} "
+                           f"(locmaf track without an init)")
+            return None
+        try:
+            TrackContext.from_init(init)
+        except LocmafError as e:
+            logger.warning(f"MediaSubscriber: skipping {entry.name!r}: {e}")
+            return None
+        return init
+
     async def _subscribe_media(self) -> None:
         for entry in list(self.catalog.tracks):
-            if entry.packaging not in (PACKAGING_LOC, PACKAGING_CMAF):
+            if entry.packaging not in MEDIA_PACKAGINGS:
                 logger.info(f"MediaSubscriber: skipping {entry.name!r} "
                             f"(packaging={entry.packaging!r})")
                 continue
-            if entry.name in self.tracks or not self.track_filter(entry):
+            if entry.name in self.tracks:
+                continue
+            init = None
+            if entry.packaging == PACKAGING_LOCMAF:
+                init = self._locmaf_init(entry)
+                if init is None:
+                    continue
+            if not self.track_filter(entry):
                 continue
             name = entry.name
-            sub = LocTrackSubscriber(
-                self.session,
-                entry.namespace or self.namespace, name,
+            callbacks = dict(
                 on_frame=(lambda f, gid, oid, _n=name:
-                          self.on_frame and self.on_frame(_n, f, gid, oid)))
+                          self.on_frame and self.on_frame(_n, f, gid, oid)),
+                on_arrival=(lambda m, rx, gid, sg, f, _n=name:
+                            self.on_arrival
+                            and self.on_arrival(_n, m, rx, gid, sg, f)))
+            namespace = entry.namespace or self.namespace
+            if init is not None:
+                sub = LocmafTrackSubscriber(self.session, namespace, name,
+                                            init=init, **callbacks)
+            else:
+                # CMAF objects are not LOC: no Private Properties block.
+                bare = self.loc_bare or entry.packaging != PACKAGING_LOC
+                sub = LocTrackSubscriber(self.session, namespace, name,
+                                         loc_bare=bare, **callbacks)
             if entry.packaging == PACKAGING_LOC:
                 # cmaf init is a CMAF header consumed by the sink, not
                 # decoder extradata — leave config unset there.

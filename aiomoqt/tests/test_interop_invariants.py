@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-from aiomoqt.utils.url import parse_relay_url
+from aiomoqt.utils.url import moqt_setup_path, parse_relay_url
 from aiomoqt.types import (
     MOQT_VERSION_DRAFT14, MOQT_VERSION_DRAFT16, MOQT_VERSIONS,
     moqt_version_from_draft, moqt_alpn_for_version,
@@ -57,6 +57,73 @@ class TestUrlPathLeadingSlash:
         r = parse_relay_url("https://host.example.net",
                             default_path="moq-relay")
         assert r.path == "/moq-relay"
+
+
+@pytest.mark.parametrize("url", ["moqt://:4433/moq", "moqt:///moq",
+                                 "moqt://:24443/moq", "https://:4433/moq",
+                                 "https://:443/moq-relay", ":4433", ""])
+def test_an_empty_host_is_refused(url):
+    # MoQT §3.1.1 (moqt) and RFC 9110 §4.2.2 (https).
+    with pytest.raises(ValueError, match="empty host"):
+        parse_relay_url(url)
+
+
+@pytest.mark.parametrize("url", [":4433", ""])
+def test_an_empty_host_is_refused_over_quic(url):
+    with pytest.raises(ValueError, match="empty host"):
+        parse_relay_url(url, force_quic=True)
+
+
+def test_a_bracketed_ipv6_host_parses():
+    r = parse_relay_url("moqt://[::1]:4433/x")
+    assert (r.host, r.port, r.use_quic, r.path) == ("::1", 4433, True, "/x")
+
+
+@pytest.mark.parametrize("bad", ["moqt://:4433/moq", ":4433"])
+def test_a_tool_refuses_an_empty_host_url(bad):
+    from aiomoqt.utils import cli
+    parser = cli.make_parser("t")
+    cli.add_endpoint(parser)
+    with pytest.raises(SystemExit) as exit_:
+        parser.parse_args([bad])
+    assert exit_.value.code == 2
+    assert parser.parse_args(["moqt://h:4433/moq"]).url == "moqt://h:4433/moq"
+
+
+@pytest.mark.parametrize("module, argv", [
+    ("aiomoqt.tools.load_sim", [":4433"]),
+    ("aiomoqt.tools.adaptive_bench", [":4433"]),
+    ("aiomoqt.tools.relay_probe", ["--url", ":4433"]),
+])
+def test_every_dialling_tool_refuses_an_empty_host(module, argv, monkeypatch):
+    import importlib
+    mod = importlib.import_module(module)
+    monkeypatch.setattr("sys.argv", [module] + argv)
+    with pytest.raises(SystemExit) as exit_:
+        mod.parse_args()
+    assert exit_.value.code == 2
+
+
+class TestMoqtSetupPath:
+    """§10.3.1.2: over native QUIC the URI's path-abempty (and query) is
+    the SETUP PATH, the only place a moqt:// path reaches the relay."""
+
+    def test_moqt_url_keeps_its_path(self):
+        assert parse_relay_url("moqt://cdn.moq.dev:443/anon").path == "/anon"
+
+    def test_moqt_url_keeps_its_query(self):
+        r = parse_relay_url("moqt://relay.example:4443/moq?jwt=abc")
+        assert r.path == "/moq?jwt=abc"
+
+    def test_moqt_url_without_path_is_empty(self):
+        assert parse_relay_url("moqt://relay.example:4443").path == ""
+
+    @pytest.mark.parametrize("path, sent", [
+        (None, ""), ("", ""), ("/", "/"), ("/anon", "/anon"),
+        ("anon", "/anon"), ("?q=1", "?q=1"),
+    ])
+    def test_setup_path_is_path_abempty(self, path, sent):
+        assert moqt_setup_path(path) == sent
 
 
 # =====================================================================
@@ -166,7 +233,7 @@ class TestMoqtClientDraftValidation:
         # (newest first) and the server picks via ALPN / negotiation.
         from aiomoqt.client import MOQTClient
         c = MOQTClient("localhost", 4433, supported_drafts=None)
-        assert c.supported_drafts == [18, 16, 14]
+        assert c.supported_drafts == [22, 20, 18, 16, 14]
 
 
 # =====================================================================

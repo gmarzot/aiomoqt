@@ -6,7 +6,7 @@ import pytest
 
 from aiomoqt.media.sources import (
     AnnexBAssembler, Mp4AvcReader, Mp4Error, annexb_is_keyframe,
-    avcc_codec_string, avcc_from_sps_pps, pcm_tone_frames,
+    avcc_codec_string, avcc_from_sps_pps, hvcc_codec_string, pcm_tone_frames,
     split_annexb, sps_dimensions,
 )
 
@@ -193,3 +193,14 @@ def test_annexb_assembler_aud_and_sei():
     assert frames[0][0] == (struct.pack('>I', len(sei)) + sei
                             + struct.pack('>I', len(idr)) + idr)
     assert frames[0][1] and frames[1][1]
+
+
+@pytest.mark.parametrize("head, compat, level, entry, expected", [
+    (0x01, 0x60000000, 93, 'hvc1', "hvc1.1.6.L93.B0"),    # Main, 3.1
+    (0x02, 0x20000000, 153, 'hev1', "hev1.2.4.L153.B0"),  # Main 10, 5.1
+    (0x21, 0x60000000, 120, 'hvc1', "hvc1.1.6.H120.B0"),  # high tier
+])
+def test_hvcc_codec_string(head, compat, level, entry, expected):
+    hvcc = (bytes([1, head]) + compat.to_bytes(4, 'big')
+            + bytes([0xB0, 0, 0, 0, 0, 0, level]))
+    assert hvcc_codec_string(hvcc, entry) == expected

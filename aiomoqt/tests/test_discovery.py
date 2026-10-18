@@ -32,7 +32,8 @@ _BASE_PORT = 14520
 # -- handler aliasing ------------------------------------------------
 
 def _peer():
-    return MOQTClient("localhost", 4433, path="/", use_quic=True)
+    return MOQTClient("localhost", 4433, path="/", use_quic=True,
+                      supported_drafts=18)
 
 
 def test_pre_d18_registration_also_covers_the_d18_point():

@@ -15,7 +15,8 @@ from . import (MOQTUnderflow, MOQTMessage, ObjectStatus, DataStreamType,
                SUBGROUP_HEADER_BASE, SUBGROUP_ID_ZERO, SUBGROUP_ID_FIRST_OBJ, SUBGROUP_ID_EXPLICIT,
                OBJECT_DATAGRAM_BASE, OBJECT_DATAGRAM_STATUS_BASE)
 from ..context import is_draft16_or_later, DraftProfile
-from ..types import MOQTProtocolViolation
+from ..types import (MOQTProtocolViolation, PADDING_DATAGRAM_TYPE,
+                     PADDING_STREAM_TYPE)
 from ..utils.buffer import Buffer, BufferReadError
 from ..utils.logger import get_logger
 from aiopquic._binding._streamchain import (
@@ -23,6 +24,19 @@ from aiopquic._binding._streamchain import (
 
 logger = get_logger(__name__)
 
+
+
+def encode_padding(size: int, *, prof: DraftProfile,
+                   datagram: bool = False) -> bytes:
+    """A PADDING stream or datagram (§11.5): its type, then `size` zero
+    bytes."""
+    if not prof.padding:
+        raise ValueError(f"no PADDING at draft-{prof.draft}")
+    if size < 0:
+        raise ValueError(f"padding size {size} is negative")
+    buf = Buffer(capacity=16, vi64=prof.vi64)
+    buf.push_vint(PADDING_DATAGRAM_TYPE if datagram else PADDING_STREAM_TYPE)
+    return buf.data + bytes(size)
 
 
 @dataclass(slots=True)
@@ -92,8 +106,9 @@ class SubgroupHeader(MOQTMessage):
     end_of_group: bool = False
     subgroup_id_mode: int = SUBGROUP_ID_EXPLICIT
     # d18 FIRST_OBJECT bit (0x40): the first object on this stream is the
-    # first object published in the subgroup.
-    first_object: bool = False
+    # first object published in the subgroup. An original publisher's new
+    # subgroup MUST set it (§2.2); a relay passes what it received.
+    first_object: bool = True
     # d16+ DEFAULT_PRIORITY bit (0x20): the Priority field is absent and
     # the subgroup inherits the priority from the control message that
     # established the subscription. Set on receive so a forwarder can
@@ -132,10 +147,12 @@ class SubgroupHeader(MOQTMessage):
             type_val |= 0x08
         # d16+ DEFAULT_PRIORITY (0x20): the Priority field is omitted and
         # the subgroup inherits the subscription's. d18 FIRST_OBJECT
-        # (0x40): this stream opens with the subgroup's first object.
+        # (0x40): this stream opens with the subgroup's first object; the
+        # bit exists only in profiles whose type mask has it.
         if self.default_priority:
             type_val |= 0x20
-        if self.first_object:
+        if (self.first_object and self.prof is not None
+                and self.prof.subgroup_type_mask & 0x40):
             type_val |= 0x40
         return type_val
 
@@ -452,7 +469,7 @@ class ObjectHeader(MOQTMessage):
             extensions_present: Whether subgroup header has extensions flag set.
             prev_object_id: Previous object's ID for delta decoding (None = first object).
         """
-        obj = cls.__new__(cls)
+        obj = cls(object_id=0)
         obj.deserialize_into(buf, buf_len, extensions_present, prev_object_id)
         return obj
 
@@ -508,6 +525,14 @@ FETCH_FLAG_DATAGRAM = 0x40            # ignore subgroup bits
 # Special flag values for end-of-range markers
 FETCH_FLAGS_END_NON_EXISTENT = 0x8C  # End of Non-Existent Range
 FETCH_FLAGS_END_UNKNOWN = 0x10C      # End of Unknown Range
+FETCH_FLAGS_END_TIMED_OUT = 0x20C    # End of Timed-Out Range (d20+)
+
+
+def _end_of_range_flags(prof: DraftProfile) -> tuple:
+    if prof.fetch_timed_out_range:
+        return (FETCH_FLAGS_END_NON_EXISTENT, FETCH_FLAGS_END_UNKNOWN,
+                FETCH_FLAGS_END_TIMED_OUT)
+    return (FETCH_FLAGS_END_NON_EXISTENT, FETCH_FLAGS_END_UNKNOWN)
 
 
 @dataclass(slots=True)
@@ -540,24 +565,30 @@ class FetchObject(MOQTMessage):
     payload: bytes = b''
     # d16 only: end-of-range marker flag (0x8C or 0x10C)
     end_of_range: Optional[int] = None
+    # Forwarding Preference Datagram: no Subgroup ID (flag 0x40).
+    datagram: bool = False
 
     def serialize(self, *, prof: DraftProfile,
                   prior: Optional['FetchObject'] = None,
                   group_order: int = 0x1) -> Buffer:
         if prof.vi64:
-            return self._serialize_d18(prior, group_order)
+            return self._serialize_d18(prior, group_order, prof)
         if is_draft16_or_later(prof.draft):
             return self._serialize_d16()
         return self._serialize_d14()
 
     def _serialize_d18(self, prior: Optional['FetchObject'],
-                       group_order: int) -> Buffer:
+                       group_order: int, prof: DraftProfile) -> Buffer:
         """d18 §11.4.4: vi64 codec; Group/Object carried as DELTAS.
         First object carries absolute values; a group change resets the
         Object ID to absolute; the group delta direction follows the
         fetch's Group Order."""
         buf = Buffer(capacity=BUF_SIZE + len(self.payload), vi64=True)
         if self.end_of_range is not None:
+            if self.end_of_range not in _end_of_range_flags(prof):
+                raise ValueError(
+                    f"FetchObject: End of Range 0x{self.end_of_range:x} "
+                    f"is not defined at d{prof.draft}")
             buf.push_vint(self.end_of_range)
             buf.push_vint(self.group_id)
             buf.push_vint(self.object_id)
@@ -595,16 +626,25 @@ class FetchObject(MOQTMessage):
                 object_field = delta
             if self.publisher_priority != prior.publisher_priority:
                 flags |= FETCH_FLAG_PRIORITY_PRESENT
-        if self.subgroup_id == 0:
+        # A datagram's Subgroup ID reads as 0 when it is the prior.
+        prior_sg = (None if prior is None
+                    else 0 if prior.datagram else prior.subgroup_id)
+        if self.datagram:
+            flags |= FETCH_FLAG_DATAGRAM
+        elif self.subgroup_id == 0:
             pass  # SG mode 0b00
-        elif prior is not None and self.subgroup_id == prior.subgroup_id:
+        elif prior_sg is not None and self.subgroup_id == prior_sg:
             flags |= FETCH_FLAG_SG_PRIOR
-        elif prior is not None and self.subgroup_id == prior.subgroup_id + 1:
+        elif prior_sg is not None and self.subgroup_id == prior_sg + 1:
             flags |= FETCH_FLAG_SG_PRIOR_PLUS
         else:
             flags |= FETCH_FLAG_SG_PRESENT
             subgroup_field = self.subgroup_id
         if self.status != ObjectStatus.NORMAL:
+            if not prof.fetch_object_status:
+                raise ValueError(
+                    f"FetchObject: FETCH objects carry no Object Status at "
+                    f"d{prof.draft} (§11.2.1.1)")
             if self.payload:
                 raise ValueError(
                     "FetchObject: non-Normal status requires an empty "
@@ -629,13 +669,14 @@ class FetchObject(MOQTMessage):
         if has_props:
             MOQTMessage._extensions_encode(buf, self.extensions,
                                            delta=True)
-        # Zero-length objects explicitly encode Status (§11.2.1.1).
+        # Zero-length objects encode Status where the profile says so.
         if len(self.payload) > 0:
             buf.push_vint(len(self.payload))
             buf.push_bytes(self.payload)
         else:
             buf.push_vint(0)
-            buf.push_vint(self.status)
+            if prof.fetch_object_status:
+                buf.push_vint(self.status)
         return buf
 
     def _serialize_d14(self) -> Buffer:
@@ -665,17 +706,19 @@ class FetchObject(MOQTMessage):
             return buf
 
         # Default: emit fully-explicit object (no delta refs).
-        # Subgroup mode = 0x03 (present), object/group/priority present.
-        flags = (FETCH_FLAG_SG_PRESENT
-                 | FETCH_FLAG_OBJECT_ID_PRESENT
+        # Subgroup mode = 0x03 (present), object/group/priority present;
+        # a datagram carries no Subgroup ID.
+        flags = (FETCH_FLAG_OBJECT_ID_PRESENT
                  | FETCH_FLAG_GROUP_ID_PRESENT
                  | FETCH_FLAG_PRIORITY_PRESENT)
+        flags |= FETCH_FLAG_DATAGRAM if self.datagram else FETCH_FLAG_SG_PRESENT
         if self.extensions:
             flags |= FETCH_FLAG_EXTENSIONS_PRESENT
 
         buf.push_uint_var(flags)
         buf.push_uint_var(self.group_id)
-        buf.push_uint_var(self.subgroup_id)
+        if not self.datagram:
+            buf.push_uint_var(self.subgroup_id)
         buf.push_uint_var(self.object_id)
         buf.push_uint8(self.publisher_priority)
         if flags & FETCH_FLAG_EXTENSIONS_PRESENT:
@@ -698,7 +741,7 @@ class FetchObject(MOQTMessage):
                     *, prof: DraftProfile,
                     group_order: int = 0x1) -> 'FetchObject':
         if prof.vi64:
-            return cls._deserialize_d18(buf, prior, group_order)
+            return cls._deserialize_d18(buf, prior, group_order, prof)
         if is_draft16_or_later(prof.draft):
             return cls._deserialize_d16(buf, prior)
         return cls._deserialize_d14(buf)
@@ -706,17 +749,24 @@ class FetchObject(MOQTMessage):
     @classmethod
     def _deserialize_d18(cls, buf: Buffer,
                          prior: Optional['FetchObject'],
-                         group_order: int) -> 'FetchObject':
+                         group_order: int,
+                         prof: DraftProfile) -> 'FetchObject':
         """d18 §11.4.4 delta decode. The buffer's varint codec is vi64
         (set by the stream-type read). A zero Payload Length is followed
-        by an explicit Status varint (§11.2.1.1, as moxygen implements);
-        End-of-Range markers stand in for missing ranges."""
+        by an explicit Status varint where the profile says so (moxygen's
+        d18 reading); End-of-Range markers stand in for missing ranges."""
         flags = buf.pull_vint()
-        if flags in (FETCH_FLAGS_END_NON_EXISTENT, FETCH_FLAGS_END_UNKNOWN):
+        if flags in _end_of_range_flags(prof):
             group_id = buf.pull_vint()
             object_id = buf.pull_vint()
+            # The marker stands as the prior for the Group and Object
+            # deltas only: Subgroup and Priority stay the last actual
+            # Object's, -1 when there is none (d22 §11.4.1.2).
             return cls(group_id=group_id, object_id=object_id,
-                       end_of_range=flags, payload=b'')
+                       end_of_range=flags, payload=b'',
+                       subgroup_id=-1 if prior is None else prior.subgroup_id,
+                       publisher_priority=(-1 if prior is None
+                                           else prior.publisher_priority))
         if flags >= 0x80:
             raise ValueError(
                 f"FetchObject: invalid serialization flags 0x{flags:x}")
@@ -741,18 +791,20 @@ class FetchObject(MOQTMessage):
         else:
             group_id = prior.group_id
 
+        # A prior with a negative Subgroup/Priority is an End of Range
+        # marker with no actual Object before it (d22 §11.4.1.2).
         sg_mode = flags & FETCH_FLAG_SUBGROUP_MASK
         if flags & FETCH_FLAG_DATAGRAM:
             subgroup_id = 0
         elif sg_mode == FETCH_FLAG_SG_ZERO:
             subgroup_id = 0
         elif sg_mode == FETCH_FLAG_SG_PRIOR:
-            if prior is None:
+            if prior is None or prior.subgroup_id < 0:
                 raise ValueError(
                     "FetchObject: first object references prior Subgroup")
             subgroup_id = prior.subgroup_id
         elif sg_mode == FETCH_FLAG_SG_PRIOR_PLUS:
-            if prior is None:
+            if prior is None or prior.subgroup_id < 0:
                 raise ValueError(
                     "FetchObject: first object references prior Subgroup")
             subgroup_id = prior.subgroup_id + 1
@@ -769,7 +821,7 @@ class FetchObject(MOQTMessage):
 
         if flags & FETCH_FLAG_PRIORITY_PRESENT:
             publisher_priority = buf.pull_uint8()
-        elif prior is not None:
+        elif prior is not None and prior.publisher_priority >= 0:
             publisher_priority = prior.publisher_priority
         else:
             raise ValueError(
@@ -782,7 +834,8 @@ class FetchObject(MOQTMessage):
 
         payload_len = buf.pull_vint()
         if payload_len == 0:
-            status = ObjectStatus(buf.pull_vint())
+            status = (ObjectStatus(buf.pull_vint())
+                      if prof.fetch_object_status else ObjectStatus.NORMAL)
             payload = b''
             if extensions and status != ObjectStatus.NORMAL:
                 raise ValueError(
@@ -799,6 +852,7 @@ class FetchObject(MOQTMessage):
             extensions=extensions,
             status=status,
             payload=payload,
+            datagram=bool(flags & FETCH_FLAG_DATAGRAM),
         )
 
     @classmethod
@@ -907,6 +961,7 @@ class FetchObject(MOQTMessage):
             extensions=extensions,
             status=status,
             payload=payload,
+            datagram=bool(flags & FETCH_FLAG_DATAGRAM),
         )
 
 

@@ -23,10 +23,14 @@ def _stub(draft):
     s.is_client = True
     s._next_request_id = 0
     s._sent_requests = deque(maxlen=64)
+    s._track_status_requests = set()
+    s._announced = {}
+    s._discovery_subs = {}
     s._pending_requests = {}
     s._peer_request_max = -1
     s._peer_request_seen = set()
     s._track_aliases = {}
+    s._published_tracks = {}
     s._subscriptions = {}
     s._request_cancel_handlers = {}
     s._publish_done_handlers = {}
@@ -101,7 +105,7 @@ async def test_setup_parameter_sets_the_peer_ceiling_pre_d18_only():
     assert s._peer_request_limit is None
     s = _stub(16)
     s._ingest_request_limit({})
-    assert s._peer_request_limit is None                 # absent: unlimited
+    assert s._peer_request_limit == 0                    # absent: 0
 
 
 @pytest.mark.asyncio
@@ -110,3 +114,19 @@ async def test_d18_has_no_ceiling():
     assert s._local_request_max is None
     s._extend_request_credit(10 ** 6)
     assert s.sent == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("params", [None, {}, {SetupParamType.IMPLEMENTATION: b"x"}],
+                         ids=["none", "empty", "other"])
+@pytest.mark.parametrize("draft", [14, 16])
+async def test_no_max_request_id_means_no_requests(draft, params):
+    # §9.3.1.3: the default is 0; until MAX_REQUEST_ID nothing may be sent.
+    s = _stub(draft)
+    s._ingest_request_limit(params)
+    with pytest.raises(MOQTRequestError):
+        s.track_status("n", "t")
+    assert not [m for m in s.sent if isinstance(m, TrackStatus)]
+    await s._handle_max_request_id(MaxSubscribeId(request_id=2))
+    s.track_status("n", "t")
+    assert [m for m in s.sent if isinstance(m, TrackStatus)]

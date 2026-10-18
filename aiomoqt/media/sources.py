@@ -236,6 +236,25 @@ def _read_descriptor(d: bytes, pos: int):
     return tag, size, pos
 
 
+def esds_asc(d: bytes, pos: int) -> Tuple[int, bytes]:
+    """(objectTypeIndication, AudioSpecificConfig) from the esds box
+    body at `pos` (0x40 = MPEG-4 Audio)."""
+    pos += 4  # version/flags
+    tag, _, pos = _read_descriptor(d, pos)
+    if tag != 0x03:
+        raise Mp4Error(f"expected ES descriptor, got {tag:#x}")
+    pos += 3  # ES_ID + streamDependence/URL/OCR flags (none set)
+    tag, _, pos = _read_descriptor(d, pos)
+    if tag != 0x04:
+        raise Mp4Error(f"expected DecoderConfig descriptor, got {tag:#x}")
+    oti = d[pos]
+    pos += 13
+    tag, size, pos = _read_descriptor(d, pos)
+    if tag != 0x05:
+        raise Mp4Error("no DecoderSpecificInfo (AudioSpecificConfig)")
+    return oti, d[pos:pos + size]
+
+
 class Mp4AudioTrack(_TrackReader):
     """AAC (mp4a) track: samples are raw AAC access units — LOC payload
     for mp4a.40.x; asc = AudioSpecificConfig (decoder description /
@@ -248,20 +267,7 @@ class Mp4AudioTrack(_TrackReader):
         esds = _find(d, ebody + 28, eend, b'esds')
         if esds is None:
             raise Mp4Error("no esds in mp4a sample entry")
-        pos = esds[0] + 4  # version/flags
-        tag, _, pos = _read_descriptor(d, pos)
-        if tag != 0x03:
-            raise Mp4Error(f"expected ES descriptor, got {tag:#x}")
-        pos += 3  # ES_ID + streamDependence/URL/OCR flags (none set)
-        tag, _, pos = _read_descriptor(d, pos)
-        if tag != 0x04:
-            raise Mp4Error(f"expected DecoderConfig descriptor, got {tag:#x}")
-        self.object_type_indication = d[pos]  # 0x40 = MPEG-4 Audio
-        pos += 13
-        tag, size, pos = _read_descriptor(d, pos)
-        if tag != 0x05:
-            raise Mp4Error("no DecoderSpecificInfo (AudioSpecificConfig)")
-        self.asc = d[pos:pos + size]
+        self.object_type_indication, self.asc = esds_asc(d, esds[0])
 
     @property
     def codec_string(self) -> str:
@@ -580,6 +586,19 @@ def av1c_codec_string(av1c: bytes) -> str:
     high, twelve = av1c[2] & 0x40, av1c[2] & 0x20
     depth = 12 if twelve else (10 if high else 8)
     return f"av01.{profile}.{level:02d}{tier}.{depth:02d}"
+
+
+def hvcc_codec_string(hvcc: bytes, sample_entry: str = 'hvc1') -> str:
+    """RFC 6381 codec string from hvcC (ISO/IEC 14496-15 Annex E, e.g.
+    hvc1.1.6.L93.B0): compatibility flags bit-reversed, trailing zero
+    constraint bytes omitted."""
+    space = ('', 'A', 'B', 'C')[hvcc[1] >> 6]
+    tier = 'H' if hvcc[1] & 0x20 else 'L'
+    compat = int(f"{int.from_bytes(hvcc[2:6], 'big'):032b}"[::-1], 2)
+    parts = [sample_entry, f"{space}{hvcc[1] & 0x1F}", f"{compat:X}",
+             f"{tier}{hvcc[12]}"]
+    parts += [f"{b:X}" for b in hvcc[6:12].rstrip(b'\x00')]
+    return '.'.join(parts)
 
 
 class IvfWriter:

@@ -10,7 +10,7 @@ from aiopquic.asyncio.webtransport import serve_webtransport
 from aiopquic.quic.configuration import QuicConfiguration
 
 from .protocol import (DEFAULT_TX_MAX_INFLIGHT_BYTES, MOQTPeer,
-                        MOQTSessionQuic, MOQTSessionWTServer)
+                        MOQTSessionQuic, MOQTSessionWTServer, USER_AGENT)
 from .types import moqt_alpn_for_version, normalize_supported_drafts
 from .utils.logger import *
 
@@ -64,8 +64,12 @@ class MOQTServer(MOQTPeer):
         congestion_control_algorithm: Optional[str] = None,
         keep_alive_interval: Optional[float] = None,
         socket_buffer_size: Optional[int] = None,
+        stream_ring_cap: Optional[int] = None,
+        max_connections: Optional[int] = None,
+        implementation: Optional[str] = USER_AGENT,
     ):
-        super().__init__(tx_max_inflight_bytes=tx_max_inflight_bytes)
+        super().__init__(tx_max_inflight_bytes=tx_max_inflight_bytes,
+                         implementation=implementation)
         self.host = host
         self.port = port
         self.path = path
@@ -93,6 +97,14 @@ class MOQTServer(MOQTPeer):
         # UDP SO_RCVBUF/SO_SNDBUF request (bytes). None = aiopquic
         # default (64 MiB, kernel-clamped to rmem_max/wmem_max).
         self.socket_buffer_size = socket_buffer_size
+        # Per-stream TX ring (QuicConfiguration.stream_ring_cap), allocated
+        # whole per stream: memory scales with it times open streams. Must
+        # be >= the largest object and above tx_max_inflight_bytes. None =
+        # aiopquic default (4 MiB).
+        self.stream_ring_cap = stream_ring_cap
+        # Most connections held at once (aiopquic >= 0.5.1). None =
+        # aiopquic default (256).
+        self.max_connections = max_connections
         self._loop = asyncio.get_running_loop()
         self._server_closed: Future[Tuple[int, str]] = self._loop.create_future()
         self._next_subscribe_id = 1
@@ -124,6 +136,10 @@ class MOQTServer(MOQTPeer):
                 cfg.keep_alive_interval = self.keep_alive_interval
             if self.socket_buffer_size is not None:
                 cfg.socket_buffer_size = self.socket_buffer_size
+            if self.stream_ring_cap is not None:
+                cfg.stream_ring_cap = self.stream_ring_cap
+            if self.max_connections is not None:
+                cfg.max_connections = self.max_connections
             cfg.load_cert_chain(self.certificate, self.private_key)
             protocol = lambda *a, **kw: MOQTSessionQuic(*a, **kw, session=self)
             return aiopquic_serve(
@@ -163,11 +179,15 @@ class MOQTServer(MOQTPeer):
             wt_cfg.keep_alive_interval = self.keep_alive_interval
         if self.socket_buffer_size is not None:
             wt_cfg.socket_buffer_size = self.socket_buffer_size
+        if self.stream_ring_cap is not None:
+            wt_cfg.stream_ring_cap = self.stream_ring_cap
+        if self.max_connections is not None:
+            wt_cfg.max_connections = self.max_connections
 
-        # Advertise the supported drafts as WT subprotocols (caller order)
-        # so picowt selects the highest mutual against the client's
-        # WT-Available-Protocols. Drafts >= 15 negotiate the version this
-        # way ("moqt-NN"); d14 uses the legacy in-band CLIENT_SETUP path.
+        # WT-Protocol allowlist in supported_drafts order, as for raw-QUIC
+        # ALPN: aiopquic selects the first one the client offered and
+        # refuses an offer with no match. Drafts >= 15 negotiate this way
+        # ("moqt-NN"); d14 uses the legacy in-band CLIENT_SETUP path.
         wt_supported = [f"moqt-{d}"
                         for d in self.supported_drafts
                         if d >= 15] or None
@@ -207,6 +227,10 @@ class MOQTServer(MOQTPeer):
             cfg.keep_alive_interval = self.keep_alive_interval
         if self.socket_buffer_size is not None:
             cfg.socket_buffer_size = self.socket_buffer_size
+        if self.stream_ring_cap is not None:
+            cfg.stream_ring_cap = self.stream_ring_cap
+        if self.max_connections is not None:
+            cfg.max_connections = self.max_connections
 
         def wt_factory(transport, state):
             return MOQTSessionWTServer(transport, state, session=self)
@@ -214,6 +238,7 @@ class MOQTServer(MOQTPeer):
         async def wt_handler(_session):
             pass  # session lifetime owned by the dispatcher
 
+        # Server preference order, as in serve().
         wt_supported = [f"moqt-{d}" for d in self.supported_drafts
                         if d >= 15] or None
         return serve_dispatch(

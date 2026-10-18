@@ -76,7 +76,25 @@ SPEC_D18 = {
     0x05: "REQUEST_ERROR",
 }
 
-SPEC = {14: SPEC_D14, 16: SPEC_D16, 18: SPEC_D18}
+# draft-ietf-moq-transport-20 §10.2. PUBLISH_OK 0x1E is RESERVED ("in
+# <= 17"); PUBLISH_STATE_NOTIFY is new; 0xF is renamed PUBLISH_SKIPPED.
+SPEC_D20 = {
+    0x2F00: "SETUP",            0x10: "GOAWAY",
+    0x03: "SUBSCRIBE",          0x04: "SUBSCRIBE_OK",
+    0x22: "PUBLISH_STATE_NOTIFY",
+    0x1D: "PUBLISH",            0x0B: "PUBLISH_DONE",
+    0x16: "FETCH",              0x18: "FETCH_OK",
+    0x0D: "TRACK_STATUS",       0x06: "PUBLISH_NAMESPACE",
+    0x50: "SUBSCRIBE_NAMESPACE", 0x51: "SUBSCRIBE_TRACKS",
+    0x08: "NAMESPACE",          0x0E: "NAMESPACE_DONE",
+    0x0F: "PUBLISH_SKIPPED",    0x02: "REQUEST_UPDATE",
+    0x07: "REQUEST_OK",         0x05: "REQUEST_ERROR",
+}
+# draft-22 §9 Table 5: the same rows as d20.
+SPEC_D22 = dict(SPEC_D20)
+
+SPEC = {14: SPEC_D14, 16: SPEC_D16, 18: SPEC_D18,
+        20: SPEC_D20, 22: SPEC_D22}
 
 # Removed in d18 — sending any of these is a wire violation there.
 D18_REMOVED = {
@@ -104,7 +122,7 @@ class _Msg:
 _guard = MOQTSessionQuic._assert_type_defined_by_draft
 
 
-@pytest.mark.parametrize("draft", [14, 16, 18])
+@pytest.mark.parametrize("draft", [14, 16, 18, 20, 22])
 def test_runtime_table_matches_the_spec(draft):
     assert CONTROL_MESSAGE_TYPES[draft] == frozenset(SPEC[draft]), (
         f"draft-{draft} table disagrees with the spec transcription; "
@@ -114,7 +132,7 @@ def test_runtime_table_matches_the_spec(draft):
         f"{sorted(set(SPEC[draft]) - CONTROL_MESSAGE_TYPES[draft])}")
 
 
-@pytest.mark.parametrize("draft", [14, 16, 18])
+@pytest.mark.parametrize("draft", [14, 16, 18, 20, 22])
 def test_every_spec_type_is_sendable_on_its_draft(draft):
     for type_, name in SPEC[draft].items():
         _guard(_Sess(draft), _Msg(type_))  # must not raise
@@ -134,6 +152,28 @@ def test_d18_renumbered_types_are_sendable_under_their_wire_code(canonical, wire
     assert wire_control_type(18, canonical) == wire
     assert wire_control_type(16, canonical) == canonical
     _guard(_Sess(18), _Msg(canonical))  # must not raise
+
+
+@pytest.mark.parametrize("draft", [20, 22])
+def test_d20_publish_ok_goes_out_as_request_ok(draft):
+    from aiomoqt.types import wire_control_type
+    assert wire_control_type(draft, 0x1E) == 0x07
+    assert wire_control_type(draft, 0x11) == 0x50
+    _guard(_Sess(draft), _Msg(0x1E))  # canonical PUBLISH_OK: sent as 0x07
+
+
+@pytest.mark.parametrize("draft", [20, 22])
+@pytest.mark.parametrize("type_", sorted(D18_REMOVED))
+def test_d20_refuses_types_it_does_not_define(draft, type_):
+    with pytest.raises(Exception) as exc:
+        _guard(_Sess(draft), _Msg(type_))
+    assert f"draft-{draft}" in str(exc.value)
+
+
+@pytest.mark.parametrize("draft", [17, 19, 23])
+def test_the_tx_guard_fails_closed_for_a_draft_without_a_table(draft):
+    with pytest.raises(Exception, match=f"draft-{draft}"):
+        _guard(_Sess(draft), _Msg(0x03))
 
 
 def test_d18_removed_types_remain_legal_on_older_drafts():
@@ -225,22 +265,23 @@ def test_d18_unknown_message_parameter_is_fatal():
 
 
 def test_d18_namespace_prefix_param_is_a_tuple():
-    """§10.2.14: TRACK_NAMESPACE_PREFIX is Track-Namespace-encoded
-    (field count + length-prefixed fields), not odd/even KVP."""
+    """§10.2.14: TRACK_NAMESPACE_PREFIX is a Track Namespace (field count +
+    length-prefixed fields) carried as a §10.2 Length-prefixed value, as
+    moxygen encodes it; not odd/even KVP."""
     from aiopquic.buffer import Buffer
     prof = profile_for(18)
     payload = Buffer(capacity=256, vi64=True)
     MOQTMessage._serialize_params(
         payload, {0x34: (b"live", b"cam")}, prof=prof)
     raw = bytes(payload.data_slice(0, payload.tell()))
-    assert raw == bytes([0x01, 0x34, 0x02,
+    assert raw == bytes([0x01, 0x34, 0x0A, 0x02,
                          0x04]) + b"live" + bytes([0x03]) + b"cam"
     r = Buffer(data=raw, vi64=True)
     out = MOQTMessage._deserialize_params(r, prof=prof, buf_end=len(raw))
     assert out[0x34] == (b"live", b"cam")
 
 
-@pytest.mark.parametrize("draft", [14, 16, 18])
+@pytest.mark.parametrize("draft", [14, 16, 18, 20, 22])
 def test_rx_dispatch_matches_the_spec_tables(draft):
     """RX dispatches exactly the types the spec defines for the draft —
     a type outside the table closes the session, never a silent skip
@@ -260,6 +301,32 @@ def test_d18_receiving_a_dead_d16_type_closes_the_session():
     for dead in (0x09, 0x0A, 0x0C, 0x15, 0x17, 0x1A, 0x11):
         with pytest.raises(MOQTProtocolViolation):
             s._get_control_entry(dead)
+
+
+@pytest.mark.parametrize("draft", [20, 22])
+def test_d20_receiving_a_reserved_type_closes_the_session(draft):
+    """PUBLISH_OK 0x1E and CLIENT/SERVER_SETUP 0x20/0x21 are RESERVED from
+    d20: receiving one is an unknown message type."""
+    from aiomoqt.types import MOQTProtocolViolation
+    s = object.__new__(MOQTSessionQuic)
+    s.negotiated_draft = draft
+    s._control_msg_overrides = {}
+    for reserved in (0x1E, 0x20, 0x21):
+        with pytest.raises(MOQTProtocolViolation):
+            s._get_control_entry(reserved)
+
+
+@pytest.mark.parametrize("draft,cls_module", [
+    (18, "aiomoqt.messages.d18.session_setup"),
+    (20, "aiomoqt.messages.d20.session_setup"),
+    (22, "aiomoqt.messages.d20.session_setup"),
+])
+def test_a_session_sends_its_drafts_setup_class(draft, cls_module):
+    s = object.__new__(MOQTSessionQuic)
+    s.negotiated_draft = draft
+    msg = s._setup_message({0x07: b"x"})
+    assert type(msg).__module__ == cls_module
+    assert msg.options == {0x07: b"x"}
 
 
 def test_publish_done_codes_swap_on_the_d18_wire():
@@ -349,14 +416,18 @@ def test_fetch_ok_d18_omits_group_order_param():
     assert r.tell() == end               # no track extensions either
 
 
-def test_fetch_group_delta_direction_comes_from_our_request():
+@pytest.mark.parametrize("draft", [18, 22])
+def test_fetch_group_delta_direction_comes_from_our_request(draft):
     """d18 FETCH_OK carries no GROUP_ORDER, so the group-delta decode
     direction (§11.4.4.1) is the order requested in our own FETCH."""
+    from aiomoqt.context import profile_for
     from aiomoqt.protocol import _MOQTSessionMixin
     from aiomoqt.messages.fetch import Fetch
     from aiomoqt.messages.data import FetchHeader
     from aiomoqt.types import FetchType, GroupOrder
     s = object.__new__(_MOQTSessionMixin)
+    s._profile = profile_for(draft)
+    s._fill_requests = {}
     fetch = Fetch(request_id=5, fetch_type=FetchType.STANDALONE,
                   group_order=GroupOrder.DESCENDING,
                   namespace=(b"ns",), track_name=b"t")

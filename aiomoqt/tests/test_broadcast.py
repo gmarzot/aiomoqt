@@ -11,7 +11,7 @@ from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
 from aiomoqt.types import MOQTMessageType
 from aiomoqt.media import (
-    Catalog, CatalogTrack, DeltaOp, InitData,
+    Catalog, CatalogTrack, CatalogTrackPublisher, DeltaOp, InitData,
     LocTrackPublisher, MediaPublisher, MediaSubscriber, StreamMapping,
 )
 
@@ -126,8 +126,8 @@ async def test_broadcast_round_trip():
 @pytest.mark.asyncio
 async def test_demux_routes_d16_update_and_serves_catalog_fetch():
     # REQUEST_UPDATE references the original request via
-    # existing_request_id; a joining FETCH of the catalog is served
-    # with the current complete catalog on a fetch stream.
+    # existing_request_id; a joining FETCH of the catalog reaches the
+    # catalog track.
     from types import SimpleNamespace
     from aiomoqt.messages import RequestUpdate
     from aiomoqt.context import profile_for
@@ -157,13 +157,16 @@ async def test_demux_routes_d16_update_and_serves_catalog_fetch():
         parameters={}))
     assert routed == [7]
 
-    fetch = SimpleNamespace(track_name=None, joining_request_id=7,
-                            request_id=3)
-    await pub._demux_fetch(session, fetch)
-    assert writes[0] == ('ok', 3)
-    assert writes[1][1] == 42                      # FetchHeader
-    payload = writes[2][2]
-    assert b'"tracks"' in payload and writes[2][3]  # catalog + FIN
+    # A joining FETCH goes to the track its subscription is on.
+    fetched = []
+
+    async def _on_fetch(s, m):
+        fetched.append(m.request_id)
+    pub.catalog_track._on_fetch = _on_fetch
+    pub.catalog_track._sub_for(session).subscribers.add(11)
+    await pub._demux_fetch(session, SimpleNamespace(
+        track_name=None, joining_request_id=11, request_id=3))
+    assert fetched == [3]
 
 
 @pytest.mark.asyncio
@@ -195,3 +198,163 @@ async def test_broadcast_delta_update():
     assert sub.catalog.find("video-2").bitrate == 500_000
     # track_filter honored: only audio was subscribed.
     assert set(sub.tracks) == {"audio"}
+
+
+# -- catalog track against relay-driven subscription changes ------------
+
+def _recording_session():
+    """A session that records what the catalog emitter writes."""
+    from types import SimpleNamespace
+    from aiomoqt.context import profile_for
+
+    writes = []
+    next_sid = iter(range(100, 1000))
+
+    async def _open_uni():
+        sid = next(next_sid)
+        writes.append(('open', sid))
+        return sid
+
+    async def _write_drain(sid, data):
+        writes.append(('w', sid, bytes(data), False))
+
+    return SimpleNamespace(
+        writes=writes,
+        _profile=profile_for(18),
+        _close_err=None,
+        open_uni_stream=_open_uni,
+        stream_write=lambda sid, data, end_stream=False:
+            writes.append(('w', sid, bytes(data), end_stream)),
+        stream_write_drain=_write_drain,
+        stream_reset=lambda sid, code: writes.append(('reset', sid, int(code))),
+        _send_reply=lambda rid, msg, fin=False: writes.append(('done', rid)),
+    )
+
+
+def _opened(session):
+    return [w[1] for w in session.writes if w[0] == 'open']
+
+
+def _clone(name):
+    return Catalog.delta([DeltaOp("clone", [CatalogTrack(
+        parentName="video", name=name, bitrate=500_000)])])
+
+
+async def _settle():
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_catalog_sends_nothing_at_forward_0_and_the_catalog_on_resume():
+    session = _recording_session()
+    track = CatalogTrackPublisher(session, _NS, _catalog())
+    sub = track._sub_for(session)
+    await track.generate(session, 5)
+    await _settle()
+    assert len(_opened(session)) == 1                    # group 0
+
+    track._set_forward(sub, 0)
+    await track.publish_catalog(_catalog())              # a refresh while paused
+    await track.publish_delta(_clone("video-2"))
+    await _settle()
+    assert len(_opened(session)) == 1                    # §5.1: no Objects
+    assert track.catalog.find("video-2") is not None     # folded in
+
+    track._set_forward(sub, 1)
+    await _settle()
+    assert len(_opened(session)) == 2                    # one catalog on resume
+    assert track._largest == (1, 0)
+    assert b'"video-2"' in session.writes[-1][2]
+
+
+@pytest.mark.asyncio
+async def test_catalog_subscription_end_resets_and_the_next_continues_group_ids():
+    from aiomoqt.types import StreamResetCode
+    session = _recording_session()
+    track = CatalogTrackPublisher(session, _NS, _catalog())
+    sub = track._sub_for(session)
+    sub.generating = True
+    sub.subscribers.add(9)
+    await track.generate(session, 5)
+    await _settle()
+    first = _opened(session)[0]
+
+    track._on_request_cancelled(9, sub)                  # the relay ended it
+    await _settle()
+    assert ('reset', first, int(StreamResetCode.CANCELLED)) in session.writes
+    assert not track._serving()
+
+    sub.generating = True
+    await track.generate(session, 6)                     # the next SUBSCRIBE
+    await _settle()
+    assert len(_opened(session)) == 2
+    assert track._largest == (1, 0)                      # not a restarted 0
+
+
+@pytest.mark.asyncio
+async def test_catalog_refresh_while_unserved_does_not_queue():
+    session = _recording_session()
+    track = CatalogTrackPublisher(session, _NS, _catalog())
+    for _ in range(50):
+        await track.publish_catalog(_catalog())
+    assert track._updates.qsize() == 0
+    await track.finish()
+    await track.publish_catalog(_catalog())
+    assert track._updates.qsize() == 1                   # the finish survives
+
+
+@pytest.mark.asyncio
+async def test_catalog_delta_after_a_skipped_update_opens_a_full_group():
+    session = _recording_session()
+    track = CatalogTrackPublisher(session, _NS, _catalog())
+    sub = track._sub_for(session)
+    await track.generate(session, 5)
+    await _settle()
+
+    track._set_forward(sub, 0)
+    await track.publish_delta(_clone("video-2"))         # folded, not sent
+    await _settle()
+    # Forwarding back before the resume marker is handled: the group still
+    # open lacks video-2, so the next delta cannot extend it.
+    sub.forward = True
+    await track.publish_delta(_clone("video-3"))
+    await _settle()
+    assert track._largest == (1, 0)
+    last = session.writes[-1][2]
+    assert b'"video-2"' in last and b'"video-3"' in last
+
+
+@pytest.mark.asyncio
+async def test_locmaf_tracks_subscribe_only_at_a_supported_version(monkeypatch):
+    # A track of an unknown locmafVersion, or without one, must not be
+    # subscribed; neither is one with no init to rebuild chunks against.
+    from types import SimpleNamespace
+    from aiomoqt.media import LocmafTrackSubscriber
+    from aiomoqt.media.cmaf import CmafChunker
+    from aiomoqt.track import SubscribedTrack
+
+    subscribed = []
+
+    async def _subscribe(self, *args, **kwargs):
+        subscribed.append(self.trackname)
+    monkeypatch.setattr(SubscribedTrack, "subscribe", _subscribe)
+
+    entry = b"\x00\x00\x00\x56avc1" + b"\x00" * 78
+    init = CmafChunker(SimpleNamespace(
+        timescale=90000, width=64, height=64,
+        sample_entry_bytes=entry)).init_segment()
+    tracks = [CatalogTrack(name=name, packaging="locmaf", isLive=True,
+                           locmafVersion=version, initRef=ref)
+              for name, version, ref in (("v02", "0.2", "i"),
+                                         ("vnone", None, "i"),
+                                         ("noinit", "0.3", None),
+                                         ("v03", "0.3", "i"))]
+    seen = []
+    sub = MediaSubscriber(SimpleNamespace(), _NS,
+                          track_filter=lambda t: seen.append(t.name) or True)
+    sub.catalog = Catalog(tracks=tracks,
+                          initDataList=[InitData.from_bytes("i", init)])
+    await sub._subscribe_media()
+    assert subscribed == ["v03"] and seen == ["v03"]
+    assert isinstance(sub.tracks["v03"], LocmafTrackSubscriber)

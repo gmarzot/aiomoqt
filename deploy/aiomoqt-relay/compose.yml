@@ -1,0 +1,82 @@
+# MoQ Ersatz Relay: the aiomoqt ersatz relay, nginx for the pages and the relay's
+# status and logs, and GoAccess for the password-protected visitor report.
+# Run from this directory; see README.md.
+name: aiomoqt-relay
+
+services:
+  relay:
+    image: aiomoqt:dev
+    # The certbot renewal hook restarts it by this name.
+    container_name: ersatz-relay
+    network_mode: host
+    restart: unless-stopped
+    mem_limit: 2g
+    # Core files land in ./cores; see README.md for the host's core_pattern.
+    ulimits: {core: -1}
+    environment:
+      PYTHONUNBUFFERED: "1"
+      PYTHONFAULTHANDLER: "1"
+      # Stream buffers (1 MiB) are mmapped, so freed ones go back to the OS.
+      MALLOC_MMAP_THRESHOLD_: "1048576"
+      MOQT_ROLE: relay
+      MOQT_DUAL: "1"
+      MOQT_PORT: "4443"
+      MOQT_CERT: /etc/letsencrypt/live/aiomoqt-relay.marzresearch.net/fullchain.pem
+      MOQT_KEY: /etc/letsencrypt/live/aiomoqt-relay.marzresearch.net/privkey.pem
+    command: ["--draft", "22,20,18,16,14", "--watchdog", "15", "--status-dir", "/status",
+              "--log-dir", "/logs"]
+    volumes:
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+      - ./status:/status
+      - ./relay-logs:/logs
+      - ./cores:/cores
+      # Host OS name for the dashboard; the container's is the image's.
+      - /etc/os-release:/host/etc/os-release:ro
+    logging:
+      options: {max-size: "50m", max-file: "3"}
+
+  web:
+    image: nginx:alpine
+    container_name: relay-web
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./site:/srv/g5:ro
+      - ./status:/srv/status:ro
+      - ./relay-logs:/srv/relay-logs:ro
+      - ./stats:/srv/stats:ro
+      - ./stats.htpasswd:/etc/nginx/stats.htpasswd:ro
+      - ./logs:/var/log/nginx/site
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+    logging:
+      options: {max-size: "10m", max-file: "3"}
+
+  goaccess:
+    image: allinurl/goaccess:1.9.3
+    container_name: relay-goaccess
+    restart: unless-stopped
+    network_mode: none
+    # Every 5 minutes, from the current and rotated logs: visitors without
+    # crawlers, and crawlers alone. Each report replaces the old one whole.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        while :; do
+          zcat -f /logs/access.log* 2>/dev/null | goaccess - --log-format=COMBINED \
+            --no-global-config --ignore-crawlers \
+            --html-report-title="MoQ Ersatz Relay visitors" -o /report/new.html \
+            && mv /report/new.html /report/index.html
+          zcat -f /logs/access.log* 2>/dev/null | goaccess - --log-format=COMBINED \
+            --no-global-config --crawlers-only \
+            --html-report-title="MoQ Ersatz Relay crawlers" -o /report/new-crawlers.html \
+            && mv /report/new-crawlers.html /report/crawlers.html
+          sleep 300
+        done
+    volumes:
+      - ./logs:/logs:ro
+      - ./stats:/report
+    logging:
+      options: {max-size: "10m", max-file: "3"}

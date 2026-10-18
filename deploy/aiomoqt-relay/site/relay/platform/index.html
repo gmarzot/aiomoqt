@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>MoQ Ersatz Relay platform</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='%23b23c0e'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="../dashboard.css">
+<script src="../common.js" defer></script>
+<script src="platform.js" defer></script>
+</head>
+<body>
+<main>
+  <header class="hero">
+    <div class="hero-top">
+      <a class="brand" href="/" aria-label="MoQ Ersatz Relay home">
+        <span class="brand-text">
+          <span class="brand-name"><b>MoQ</b> Ersatz Relay</span>
+          <span class="brand-sub"><span class="dot" aria-hidden="true"></span>A Marz Research Project</span>
+        </span>
+      </a>
+      <span class="crumb"><a href="../">dashboard</a> / platform</span>
+    </div>
+  </header>
+
+  <p class="unavailable" id="unavailable" hidden>Status unavailable: the relay has not reported
+    in the last 30 seconds.</p>
+  <noscript><p class="unavailable">Live status needs JavaScript.</p></noscript>
+
+  <section class="panel">
+    <dl class="mono facts-grid">
+      <dt>HW:</dt><dd id="hw">—</dd>
+      <dt>CPU:</dt><dd id="cpu-model">—</dd>
+      <dt>OS:</dt><dd id="os">—</dd>
+      <dt>KERNEL:</dt><dd id="kernel">—</dd>
+      <dt>UPTIME:</dt><dd id="host-uptime">—</dd>
+      <dt>LOAD:</dt><dd id="load">—</dd>
+      <dt>PROCS:</dt><dd id="procs">—</dd>
+      <dt>RELAY:</dt><dd id="relay">—</dd>
+    </dl>
+  </section>
+
+  <section class="platform-grid">
+    <figure class="panel chart wide">
+      <figcaption>CPU time by mode <span class="legend" id="legend-cpu"></span></figcaption>
+      <svg id="chart-cpu" role="img" aria-label="Host CPU time by mode over the last 10 minutes"></svg>
+      <div class="cores" id="cores" aria-label="Per-core utilization"></div>
+      <p class="stat-line" id="cpu-stats"></p>
+    </figure>
+    <figure class="panel chart">
+      <figcaption>Relay process CPU <span class="legend" id="legend-proc"></span></figcaption>
+      <svg id="chart-proc" role="img" aria-label="Relay process CPU over the last 10 minutes"></svg>
+      <p class="stat-line" id="proc-stats"></p>
+    </figure>
+    <figure class="panel chart">
+      <figcaption>Pressure stall, some, 10 s average <span class="legend" id="legend-psi"></span></figcaption>
+      <svg id="chart-psi" role="img" aria-label="Pressure stall information over the last 10 minutes"></svg>
+      <p class="stat-line" id="psi-stats"></p>
+    </figure>
+    <figure class="panel chart">
+      <figcaption>Memory <span class="legend" id="legend-mem"></span></figcaption>
+      <svg id="chart-mem" role="img" aria-label="Host memory over the last 10 minutes"></svg>
+      <p class="stat-line" id="mem-stats"></p>
+    </figure>
+    <figure class="panel chart">
+      <figcaption>Relay bandwidth, QUIC <span class="legend" id="legend-bw"></span></figcaption>
+      <svg id="chart-bw" role="img" aria-label="Relay ingress and egress over the last 10 minutes"></svg>
+      <p class="stat-line" id="bw-stats"></p>
+    </figure>
+    <figure class="panel chart">
+      <figcaption>Host network <span class="legend" id="legend-net"></span></figcaption>
+      <svg id="chart-net" role="img" aria-label="Host network receive and transmit over the last 10 minutes"></svg>
+      <div class="table-wrap">
+        <table id="t-ifaces">
+          <thead><tr><th>Interface</th><th class="n">Rx</th><th class="n">Tx</th>
+            <th class="n">Rx pkt/s</th><th class="n">Tx pkt/s</th><th class="n">Errors/s</th>
+            <th class="n">Drops/s</th></tr></thead>
+          <tbody><tr><td colspan="7" class="empty">—</td></tr></tbody>
+        </table>
+      </div>
+    </figure>
+    <figure class="panel chart">
+      <figcaption>UDP datagrams <span class="legend" id="legend-udp"></span></figcaption>
+      <svg id="chart-udp" role="img" aria-label="UDP datagrams per second over the last 10 minutes"></svg>
+      <div class="table-wrap">
+        <table id="t-udp">
+          <thead><tr><th>Counter</th><th class="n">Per second</th></tr></thead>
+          <tbody><tr><td colspan="2" class="empty">—</td></tr></tbody>
+        </table>
+      </div>
+    </figure>
+    <figure class="panel chart">
+      <figcaption>UDP errors and relay socket drops <span class="legend" id="legend-udp-err"></span></figcaption>
+      <svg id="chart-udp-err" role="img" aria-label="UDP errors and relay socket drops over the last 10 minutes"></svg>
+      <p class="stat-line" id="sock-stats"></p>
+    </figure>
+    <figure class="panel chart">
+      <figcaption>Disk I/O <span class="legend" id="legend-disk"></span></figcaption>
+      <svg id="chart-disk" role="img" aria-label="Disk reads and writes over the last 10 minutes"></svg>
+      <div class="table-wrap">
+        <table id="t-disks">
+          <thead><tr><th>Device</th><th class="n">Read</th><th class="n">Write</th>
+            <th class="n">Read IOPS</th><th class="n">Write IOPS</th><th class="n">Busy</th></tr></thead>
+          <tbody><tr><td colspan="6" class="empty">—</td></tr></tbody>
+        </table>
+      </div>
+      <p class="stat-line" id="fs-stats"></p>
+    </figure>
+  </section>
+
+  <footer>
+    <a href="/">MoQ Ersatz Relay</a> · <a href="../">dashboard</a> · host data from /proc ·
+    A Marz Research Project
+  </footer>
+</main>
+</body>
+</html>

@@ -1,6 +1,10 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-from aiomoqt.types import MOQTDraft, ParamType
+from enum import IntEnum
+from types import MappingProxyType
+
+from aiomoqt.types import (MOQTDraft, ParamType, RequestErrorCode,
+                           StreamResetCode)
 
 
 def get_major_version(version: int) -> int:
@@ -67,6 +71,56 @@ class DraftProfile:
     object_statuses: frozenset = frozenset({0x0, 0x3, 0x4})
                                   # Object Status values the draft defines;
                                   # d14 also has DOES_NOT_EXIST 0x1.
+    param_table: int = 18
+                                  # Message Parameter registry and scopes in
+                                  # messages/params.py: 18, 20, 22.
+                                  # Consulted from d18 on.
+    location_filter_typed: bool = False
+                                  # d22 LOCATION_FILTER (0x21) leads with a
+                                  # Location Filter Type instead of a Length.
+    relay_forwards_publish_namespace: bool = True
+                                  # a relay forwards PUBLISH_NAMESPACE
+                                  # downstream; d22 stops it.
+    publish_ok_expires_only: bool = False
+                                  # d20+ PUBLISH_OK carries only EXPIRES; the
+                                  # subscription parameters ride REQUEST_UPDATE.
+    publish_done_subscription_ended: bool = True
+                                  # PUBLISH_DONE SUBSCRIPTION_ENDED (0x3)
+                                  # exists; d20 removed it.
+    goaway_request_id: bool = True
+                                  # d18 GOAWAY may end with a Request ID; d20
+                                  # removed it.
+    fetch_location_filter: bool = False
+                                  # d20+ FETCH has no Fetch Type, Start or End
+                                  # and no Joining form: the range rides
+                                  # LOCATION_FILTER, and End Location is
+                                  # inclusive in FETCH and FETCH_OK.
+    fetch_timed_out_range: bool = False
+                                  # d20+ FETCH stream End of Timed-Out Range
+                                  # marker (0x20C).
+    fetch_object_status: bool = True
+                                  # A zero Payload Length in a FETCH object is
+                                  # followed by an Object Status (moxygen's
+                                  # d16/d18 reading); d20 defines none.
+    error_table: int = 18
+                                  # request error and stream reset code
+                                  # tables below: 14, 16, 18, 20.
+    padding: bool = True
+                                  # PADDING streams and datagrams (d18+).
+    namespace_scoped: frozenset = frozenset(
+        {"SubscribeNamespace", "PublishNamespace"})
+                                  # requests whose Redirect has no Track
+                                  # Name (§10.6.1); d20 adds SUBSCRIBE_TRACKS.
+    zero_delivery_timeout_closes: bool = False
+                                  # d16 DELIVERY_TIMEOUT (0x02) of 0, as a
+                                  # parameter or Track Property, closes.
+    track_properties: bool = True
+                                  # PUBLISH, SUBSCRIBE_OK and FETCH_OK end
+                                  # with Track Properties; d14 has none.
+    update_has_location: bool = False
+                                  # d14 SUBSCRIBE_UPDATE carries Start, End
+                                  # Group, Priority and Forward as fields;
+                                  # d16+ REQUEST_UPDATE only parameters.
 
     @property
     def vi64(self) -> bool:
@@ -82,14 +136,18 @@ PROFILES = {
         params_delta_coded=False, varint="rfc9000",
         control_uni_pair=False, reply_has_request_id=True,
         uint8_params=frozenset(),
-        object_statuses=frozenset({0x0, 0x1, 0x3, 0x4})),
+        object_statuses=frozenset({0x0, 0x1, 0x3, 0x4}),
+        error_table=14, padding=False, update_has_location=True,
+        track_properties=False),
     MOQTDraft.DRAFT_16: DraftProfile(
         draft=MOQTDraft.DRAFT_16, setup_carries_versions=False,
         params_delta_coded=True, varint="rfc9000",
         control_uni_pair=False, reply_has_request_id=True,
         uint8_params=frozenset(),
         merged_datagram_layout=True,
-        subgroup_type_mask=0x2F),
+        subgroup_type_mask=0x2F,
+        error_table=16, padding=False,
+        zero_delivery_timeout_closes=True),
     # draft-18 negotiates out-of-band (ALPN/WT-Protocol) like d16 and uses
     # delta-coded params, but forks the wire codec to vi64, runs control over
     # a pair of uni streams, drops the Request ID from request replies, and
@@ -109,7 +167,125 @@ PROFILES = {
         subgroup_type_mask=0x6F),
 }
 
+# d22 differs from d20 only in its switches.
+# Every column not named here keeps the d18 value.
+_D20 = replace(
+    PROFILES[MOQTDraft.DRAFT_18], draft=MOQTDraft.DRAFT_20,
+    param_table=20,
+    error_table=20,
+    namespace_scoped=frozenset(
+        {"SubscribeNamespace", "PublishNamespace", "SubscribeTracks"}),
+    publish_ok_expires_only=True,
+    publish_done_subscription_ended=False,
+    goaway_request_id=False,
+    fetch_location_filter=True,
+    fetch_timed_out_range=True,
+    fetch_object_status=False)
+PROFILES[MOQTDraft.DRAFT_20] = _D20
+PROFILES[MOQTDraft.DRAFT_22] = replace(
+    _D20, draft=MOQTDraft.DRAFT_22,
+    param_table=22,
+    location_filter_typed=True,
+    relay_forwards_publish_namespace=False)
+
 
 def profile_for(draft: int) -> DraftProfile:
-    """DraftProfile for a draft number or version code (normalized)."""
-    return PROFILES[get_major_version(draft)]
+    """DraftProfile for a draft number or version code (normalized).
+    Raises ValueError for a draft without a profile."""
+    major = get_major_version(draft)
+    try:
+        return PROFILES[major]
+    except KeyError:
+        raise ValueError(
+            f"MoQT draft-{major} is not supported; "
+            f"known drafts: {sorted(int(d) for d in PROFILES)}") from None
+
+
+# Request error codes by name, per error_table. d14 has separate
+# SUBSCRIBE_ERROR and FETCH_ERROR spaces; d16+ one REQUEST_ERROR space.
+_E = RequestErrorCode
+_D14_SUBSCRIBE_ERRORS = {
+    _E.INTERNAL_ERROR: 0x0, _E.UNAUTHORIZED: 0x1, _E.TIMEOUT: 0x2,
+    _E.NOT_SUPPORTED: 0x3, _E.DOES_NOT_EXIST: 0x4, _E.INVALID_RANGE: 0x5,
+    _E.MALFORMED_AUTH_TOKEN: 0x10, _E.EXPIRED_AUTH_TOKEN: 0x12,
+}
+_D14_FETCH_ERRORS = {**_D14_SUBSCRIBE_ERRORS,
+                     _E.INVALID_JOINING_REQUEST_ID: 0x7,
+                     _E.MALFORMED_TRACK: 0x9}
+_D16_ERRORS = {code: int(code) for code in (
+    _E.INTERNAL_ERROR, _E.UNAUTHORIZED, _E.TIMEOUT, _E.NOT_SUPPORTED,
+    _E.MALFORMED_AUTH_TOKEN, _E.EXPIRED_AUTH_TOKEN, _E.DOES_NOT_EXIST,
+    _E.INVALID_RANGE, _E.MALFORMED_TRACK, _E.DUPLICATE_SUBSCRIPTION,
+    _E.UNINTERESTED, _E.PREFIX_OVERLAP, _E.INVALID_JOINING_REQUEST_ID)}
+_D18_ERRORS = {**_D16_ERRORS, **{code: int(code) for code in (
+    _E.GOING_AWAY, _E.EXCESSIVE_LOAD, _E.NAMESPACE_TOO_LARGE,
+    _E.UNSUPPORTED_EXTENSION, _E.REDIRECT)}}
+_D20_ERRORS = {**{code: wire for code, wire in _D18_ERRORS.items()
+                  if code not in (_E.DUPLICATE_SUBSCRIPTION,
+                                  _E.INVALID_JOINING_REQUEST_ID)},
+               _E.CONFLICTING_FILTERS: 0x35, _E.INVALID_FILTER: 0x36}
+# {(error_table, is_fetch): {RequestErrorCode: wire}}
+_REQUEST_ERRORS = MappingProxyType({
+    (14, False): _D14_SUBSCRIBE_ERRORS, (14, True): _D14_FETCH_ERRORS,
+    **{(16, f): _D16_ERRORS for f in (False, True)},
+    **{(18, f): _D18_ERRORS for f in (False, True)},
+    **{(20, f): _D20_ERRORS for f in (False, True)},
+})
+_ERROR_ALIASES = {"TRACK_DOES_NOT_EXIST": "DOES_NOT_EXIST"}
+
+_R = StreamResetCode
+_D14_RESETS = {code: int(code) for code in (
+    _R.INTERNAL_ERROR, _R.CANCELLED, _R.DELIVERY_TIMEOUT, _R.SESSION_CLOSED)}
+_STREAM_RESETS = MappingProxyType({
+    14: _D14_RESETS,
+    16: {**_D14_RESETS, _R.UNKNOWN_OBJECT_STATUS: 0x4,
+         _R.MALFORMED_TRACK: 0x12},
+    18: {code: int(code) for code in _R},
+    20: {code: int(code) for code in _R},
+})
+
+
+def request_error_code(code: int, profile: DraftProfile,
+                       fetch: bool = False) -> int:
+    """Wire value of an error code for a REQUEST_ERROR, SUBSCRIBE_ERROR or
+    FETCH_ERROR at this profile's draft. A named code (any *ErrorCode
+    member) is looked up by name, INTERNAL_ERROR when the draft lacks it;
+    a plain int is sent as given."""
+    if not isinstance(code, IntEnum):
+        return int(code)
+    name = _ERROR_ALIASES.get(code.name, code.name)
+    try:
+        canonical = RequestErrorCode[name]
+    except KeyError:
+        return int(code)
+    table = _REQUEST_ERRORS[(profile.error_table, fetch)]
+    return table.get(canonical, 0)
+
+
+def canonical_request_error(wire: int, profile: DraftProfile,
+                            fetch: bool = False) -> int:
+    """The RequestErrorCode a received error code means at this draft;
+    a code the draft does not define comes back unchanged."""
+    for canonical, value in _REQUEST_ERRORS[(profile.error_table,
+                                             fetch)].items():
+        if value == wire:
+            return canonical
+    return wire
+
+
+def stream_reset_code(code: int, profile: DraftProfile) -> int:
+    """Wire value of a RESET_STREAM / STOP_SENDING code at this draft. A
+    StreamResetCode the draft lacks is INTERNAL_ERROR; other ints pass."""
+    if not isinstance(code, StreamResetCode):
+        return int(code)
+    return _STREAM_RESETS[profile.error_table].get(code, 0)
+
+
+def canonical_stream_reset(wire: int, profile: DraftProfile) -> int:
+    """The StreamResetCode a received RESET_STREAM / STOP_SENDING code
+    means at this draft; a code the draft does not define comes back
+    unchanged."""
+    for canonical, value in _STREAM_RESETS[profile.error_table].items():
+        if value == wire:
+            return canonical
+    return wire

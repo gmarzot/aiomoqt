@@ -23,9 +23,16 @@ their timestamps (--no-pace to blast).
   ffmpeg -i srt://0.0.0.0:9000?mode=listener -c:v copy -bsf:v h264_mp4toannexb \\
     -f h264 - | %(prog)s https://relay.example/moq-relay -N obs --h264 -
 
-  # live MPEG-TS ingest: H.264 + AAC on one pipe, stamped from the PES PTS
+  # live MPEG-TS ingest: H.264 + AAC on one pipe, stamped from the PES PTS;
+  # the muxer flags stop ffmpeg batching ~300 ms of audio into one PES
   ffmpeg -fflags nobuffer -i srt://0.0.0.0:9000?mode=listener -map 0:v -map 0:a \\
-    -c copy -f mpegts -flush_packets 1 - | %(prog)s https://relay.example/moq-relay -N obs --ts -
+    -c copy -f mpegts -pes_payload_size 0 -omit_video_pes_length 0 -muxdelay 0 \\
+    -flush_packets 1 - | %(prog)s https://relay.example/moq-relay -N obs --ts -
+
+  # HLS/DASH (anything FFmpeg opens) as CMAF tracks; needs the media
+  # extra: pip install 'aiomoqt[media]'. --rendition all is experimental.
+  %(prog)s https://relay.example/moq-relay -N vod --input https://cdn.example/master.m3u8
+  %(prog)s https://relay.example/moq-relay -N abr --input https://cdn.example/live.mpd --rendition all
 
 Each run prints a ready-to-paste player URL per relay (see
 --player-base). Relays on different drafts need a --draft all of
@@ -33,8 +40,10 @@ them accept.
 """
 import asyncio
 import contextlib
+import functools
 import logging
 import sys
+import threading
 import time
 import uuid
 from typing import Optional
@@ -42,9 +51,15 @@ from typing import Optional
 from aiomoqt.client import MOQTClient
 from aiomoqt.fanout import FanoutPublisher
 from aiomoqt.media import (
-    Catalog, CatalogTrack, InitData, LocTrackPublisher, StreamMapping,
+    Catalog, CatalogTrack, InitData, LocTrackPublisher, LocmafTrackPublisher,
+    StreamMapping,
+)
+from aiomoqt.media.catalog import (
+    MEDIA_PACKAGINGS, PACKAGING_CMAF, PACKAGING_LOC, PACKAGING_LOCMAF,
 )
 from aiomoqt.media.cmaf import CmafChunker
+from aiomoqt.media.ingest import INSTALL_HINT, RENDITIONS, Ingest
+from aiomoqt.media.locmaf import LOCMAF_VERSION
 from aiomoqt.media.mpegts import TsDemuxer
 from aiomoqt.media.sources import (
     AnnexBAssembler, Mp4Reader, avcc_codec_string, pcm_tone_frames,
@@ -59,6 +74,8 @@ from aiomoqt.utils.url import parse_relay_url
 _SAMPLERATE = 48000
 _CHANNELS = 2
 _FRAME_MS = 20
+# LOCMAF audio from --mp4: ~1 s groups, so deltas carry most frames.
+_LOCMAF_AUDIO_GROUP_US = 1_000_000
 
 
 def parse_args():
@@ -88,18 +105,32 @@ def parse_args():
                         help='Publish a live MPEG-TS stream ("-" = stdin): '
                              'H.264 video and AAC audio, stamped from '
                              'the PES timestamps')
+    parser.add_argument('--input', type=str, default=None, metavar='URL',
+                        help='Publish anything FFmpeg opens (HLS or DASH '
+                             'playlist, file, ...) as CMAF tracks, paced '
+                             'to its timestamps; needs PyAV '
+                             f"({INSTALL_HINT})")
+    parser.add_argument('--rendition', choices=RENDITIONS, default=None,
+                        help='With --input: best = the top video '
+                             'rendition (default); all = every video '
+                             'rendition, as one catalog alternate group '
+                             '(experimental: renditions are fetched in '
+                             'turn, so large ladders fall behind real '
+                             'time)')
     parser.add_argument('--player-base', type=str,
                         default='http://localhost:5173/g5-player/',
                         metavar='URL',
                         help='Base of the player URL printed at start '
                              '(default: the moq-playa simple example)')
-    parser.add_argument('--packaging', choices=('loc', 'cmaf'),
-                        default='loc',
-                        help='Media packaging (cmsf draft): loc = '
-                             'per-frame LOC payloads (default); cmaf = '
-                             'CMAF chunks (moof+mdat per frame, header '
-                             'in catalog initDataList). cmaf needs '
-                             '--mp4.')
+    parser.add_argument('--packaging', choices=MEDIA_PACKAGINGS,
+                        default=None,
+                        help='Media packaging: loc = per-frame LOC '
+                             'payloads (default); cmaf = CMAF chunks '
+                             '(moof+mdat per frame, header in catalog '
+                             'initDataList); locmaf = the same chunks with '
+                             'compact moof headers (draft-einarsson-moq-'
+                             'locmaf). cmaf and locmaf need --mp4 or '
+                             '--input; --input defaults to cmaf.')
     parser.add_argument('--freq', type=float, default=440.0,
                         help='Tone frequency Hz (default: 440)')
     parser.add_argument('--no-pace', action='store_true',
@@ -130,6 +161,10 @@ def parse_args():
                              'and, on video, frame marking (0x09). With a '
                              'timescale, LOC reads timestamps as media '
                              'time rather than wall clock.')
+    parser.add_argument('--loc-bare', action='store_true',
+                        help='LOC payloads without the (empty) Private '
+                             'Properties block 0x0A 0x00, for receivers '
+                             'predating loc-04 §2.2')
     pub_mode = parser.add_mutually_exclusive_group()
     pub_mode.add_argument('--pub-ns', action='store_true',
                           help='PUBLISH_NAMESPACE only; the relay forwards '
@@ -156,12 +191,30 @@ def parse_args():
     _cli.add_session(parser, keepalive=10, compat=True)
     _cli.add_help(parser)
     args = parser.parse_args()
-    if sum(bool(s) for s in (args.mp4, args.h264, args.ts)) > 1:
-        parser.error('--mp4, --h264 and --ts are mutually exclusive')
-    if args.packaging == 'cmaf' and not args.mp4:
-        parser.error('--packaging cmaf requires --mp4')
-    if args.loc_codecstring and args.packaging != 'loc':
-        parser.error('--loc-codecstring applies to LOC packaging only')
+    if sum(bool(s) for s in (args.mp4, args.h264, args.ts, args.input)) > 1:
+        parser.error('--mp4, --h264, --ts and --input are mutually exclusive')
+    if args.input:
+        if args.packaging == PACKAGING_LOC:
+            parser.error('--input publishes cmaf or locmaf packaging')
+        for flag, on in (('--loop', args.loop), ('--tone', args.tone),
+                         ('--datagram', args.datagram),
+                         ('--loc-codecstring', args.loc_codecstring)):
+            if on:
+                parser.error(f'{flag} does not apply to --input')
+    elif args.rendition:
+        parser.error('--rendition applies to --input only')
+    args.packaging = args.packaging or (
+        PACKAGING_CMAF if args.input else PACKAGING_LOC)
+    args.rendition = args.rendition or 'best'
+    if args.packaging != PACKAGING_LOC and not (args.mp4 or args.input):
+        parser.error(f'--packaging {args.packaging} requires --mp4 or --input')
+    for flag, on in (('--loc-codecstring', args.loc_codecstring),
+                     ('--loc-bare', args.loc_bare)):
+        if on and args.packaging != PACKAGING_LOC:
+            parser.error(f'{flag} applies to LOC packaging only')
+    if args.datagram and args.packaging == PACKAGING_LOCMAF:
+        parser.error('--datagram does not apply to locmaf: its objects '
+                     'need subgroup streams')
     return args
 
 
@@ -183,7 +236,7 @@ def _player_url(args, relay, url: str, draft=None) -> str:
         q.append(f"v={draft}")
     q.append("catalogBootstrap=subscribe")
     if args.target_latency:
-        knob = 'targetLatency' if args.packaging == 'cmaf' else 'cushion'
+        knob = 'cushion' if args.packaging == PACKAGING_LOC else 'targetLatency'
         q.append(f"{knob}={args.target_latency}")
     return args.player_base + '?' + '&'.join(q)
 
@@ -226,8 +279,89 @@ def _build_catalog(args, video, audio, chunkers=None) -> Catalog:
     if getattr(args, 'target_latency', None) is not None:
         for t in tracks:
             t.targetLatency = args.target_latency
+    for t in tracks:
+        if t.packaging == PACKAGING_LOCMAF:
+            t.locmafVersion = LOCMAF_VERSION
     return Catalog(generatedAt=int(time.time() * 1000), tracks=tracks,
                    initDataList=init or None)
+
+
+def _build_ingest_catalog(args, ingest: Ingest) -> Catalog:
+    """One cmaf (or locmaf) track per ingested stream; several video
+    renditions form one alternate group (msf §5.2.12)."""
+    packaging = getattr(args, 'packaging', None) or PACKAGING_CMAF
+    renditions = sum(t.kind == 'video' for t in ingest.tracks)
+    tracks = []
+    init = []
+    for i, t in enumerate(ingest.tracks):
+        ref = f"i{i}"
+        if t.kind == 'video':
+            entry = CatalogTrack(
+                name=t.name, packaging=packaging, isLive=True, role='video',
+                renderGroup=1, altGroup=1 if renditions > 1 else None,
+                codec=t.codec, width=t.width, height=t.height,
+                framerate=t.fps, bitrate=t.bitrate or 2_000_000,
+                initRef=ref)
+        else:
+            entry = CatalogTrack(
+                name=t.name, packaging=packaging, isLive=True, role='audio',
+                renderGroup=1, codec=t.codec, samplerate=t.samplerate,
+                channelConfig=str(t.channels),
+                bitrate=t.bitrate or 128_000, initRef=ref)
+        entry.targetLatency = args.target_latency
+        if packaging == PACKAGING_LOCMAF:
+            entry.locmafVersion = LOCMAF_VERSION
+        tracks.append(entry)
+        init.append(InitData.from_bytes(ref, t.init))
+    return Catalog(generatedAt=int(time.time() * 1000), tracks=tracks,
+                   initDataList=init)
+
+
+async def _open_ingest(args) -> Ingest:
+    """Open --input and read until every track has its CMAF header. A
+    cancelled open (Ctrl-C) stops the executor thread too."""
+    stop = threading.Event()
+    open_ = functools.partial(Ingest, args.input, rendition=args.rendition,
+                              audio=not args.no_audio, stop=stop)
+    try:
+        ingest = await asyncio.get_running_loop().run_in_executor(None, open_)
+    except asyncio.CancelledError:
+        stop.set()
+        raise
+    except ImportError as e:
+        raise SystemExit(f"  error: {e}")
+    except Exception as e:
+        raise SystemExit(f"  error: {args.input}: {type(e).__name__}: {e}")
+    unknown = [t.name for t in ingest.tracks if t.codec is None]
+    if unknown:
+        ingest.close()
+        raise SystemExit(f"  error: no codec string for {', '.join(unknown)}")
+    for t in ingest.tracks:
+        size = f" {t.width}x{t.height}" if t.kind == 'video' else ''
+        print(f"  input {t.name}: {t.codec}{size}"
+              + (f" {t.bitrate // 1000} kbps" if t.bitrate else ''))
+    return ingest
+
+
+async def _feed_ingest(ingest: Ingest, tracks: dict, args, stats: dict):
+    """Send each CMAF chunk paced to its decode time; the first chunk
+    anchors the clock, so a live input runs as far behind its edge as
+    the demuxer starts."""
+    start = first = None
+    try:
+        async for c in ingest.chunks():
+            if first is None:
+                start, first = time.monotonic(), c.time_us
+            ts = c.time_us - first
+            if ts > args.duration * 1_000_000:
+                break
+            await _pace(start, ts, not args.no_pace)
+            await _send(tracks[c.track], stats[c.track], c.payload, c.key,
+                        group_id=c.group_id)
+    finally:
+        ingest.close()
+    for track in tracks.values():
+        await track.finish()
 
 
 class _LiveH264:
@@ -393,7 +527,8 @@ async def _pace(start: float, ts_us: int, pace: bool):
 
 
 async def _send(track, stats, payload: bytes, key: bool,
-                timestamp: Optional[int] = None):
+                timestamp: Optional[int] = None,
+                group_id: Optional[int] = None):
     """Send one frame, or drop it while no subscriber has started
     generation: a paced feeder stays on the clock instead of queueing a
     backlog for a late joiner.
@@ -407,7 +542,8 @@ async def _send(track, stats, payload: bytes, key: bool,
     entry_us = int(time.time() * 1_000_000)
     if timestamp is None:
         timestamp = entry_us
-    await track.send_frame(payload, key_frame=key, timestamp=timestamp)
+    await track.send_frame(payload, key_frame=key, timestamp=timestamp,
+                           group_id=group_id)
     # lag: how late the frame already was when we got it (source, pipe,
     # demux). tx: what handing it to the track cost us.
     stats.count(payload, entry_us - timestamp,
@@ -516,14 +652,17 @@ async def _feed_tone(track, args, stats: _TrackStats):
 
 
 async def _feed_mp4_track(track, source, args, stats: _TrackStats, *,
-                          all_key=False, gap_us=33_333, wrap=None):
+                          all_key=False, group_us=None, gap_us=33_333,
+                          wrap=None):
     """Feed an mp4 track's samples, paced to their media timestamps and
     stamped with the wall clock at send (LOC default clock); --loop
     restarts the file at later timestamps (audio: every AU is a sync
-    frame, giving LOC's one-object-per-group audio mapping).
+    frame, giving LOC's one-object-per-group audio mapping, or with
+    group_us one group per that much media time).
     wrap(sample) transforms the payload (CMAF chunking)."""
     start = time.monotonic()
     base_us = 0
+    group_ts = None
     while True:
         last = 0
         for s in source.samples():
@@ -532,7 +671,12 @@ async def _feed_mp4_track(track, source, args, stats: _TrackStats, *,
                 break
             await _pace(start, ts, not args.no_pace)
             payload = wrap(s) if wrap else s.payload
-            key = all_key or s.key_frame
+            if group_us is not None:
+                key = group_ts is None or ts - group_ts >= group_us
+                if key:
+                    group_ts = ts
+            else:
+                key = all_key or s.key_frame
             await _send(track, stats, payload, key)
             last = ts
         base_us = last + gap_us
@@ -560,15 +704,19 @@ async def run(args):
     mp4_audio = (reader.audio
                  if reader and not (args.tone or args.no_audio) else None)
     chunkers = {}
-    if args.packaging == 'cmaf':
+    if args.packaging != PACKAGING_LOC and not args.input:
         chunkers['video'] = CmafChunker(video)
         if mp4_audio is not None:
             chunkers['audio'] = CmafChunker(mp4_audio)
         elif not args.no_audio:
-            print("  note: cmaf packaging — tone audio skipped "
+            print(f"  note: {args.packaging} packaging — tone audio skipped "
                   "(no AAC track in the mp4)")
             args.no_audio = True
-    catalog = _build_catalog(args, video, mp4_audio or ts_audio, chunkers)
+    ingest = await _open_ingest(args) if args.input else None
+    if ingest is not None:
+        catalog = _build_ingest_catalog(args, ingest)
+    else:
+        catalog = _build_catalog(args, video, mp4_audio or ts_audio, chunkers)
 
     clients = [MOQTClient(
         relay.host, relay.port, path=relay.path,
@@ -583,6 +731,9 @@ async def run(args):
           f"namespace: {args.namespace}")
     print(f"  tracks: {', '.join(t.name for t in catalog.tracks)}")
     async with contextlib.AsyncExitStack() as stack:
+        if ingest is not None:
+            stack.callback(ingest.close)
+
         async def _open(url, client):
             try:
                 s = await stack.enter_async_context(client.connect())
@@ -609,16 +760,33 @@ async def run(args):
         def _cs(codec):
             return codec if args.loc_codecstring else None
         session = sessions[0]
+        # CMAF objects are not LOC: no Private Properties block.
+        loc_bare = args.loc_bare or args.packaging == PACKAGING_CMAF
+
+        def _track(name, **kwargs):
+            if args.packaging == PACKAGING_LOCMAF:
+                init = catalog.resolve_init(catalog.find(name))
+                return LocmafTrackPublisher(session, args.namespace, name,
+                                            init=init, **kwargs)
+            return LocTrackPublisher(session, args.namespace, name,
+                                     loc_bare=loc_bare, **kwargs)
         pub = FanoutPublisher(sessions, args.namespace, catalog)
         stats = {}
         feeders = []
-        if ts is not None:
+        if ingest is not None:
+            tracks = {}
+            for t in ingest.tracks:
+                tracks[t.name] = pub.add_track(
+                    _track(t.name, media_kind=t.kind))
+                stats[t.name] = _TrackStats()
+            feeders.append(_feed_ingest(ingest, tracks, args, stats))
+        elif ts is not None:
             fh, dmx, first, _, _ = ts
             tracks = {}
             if video is not None:
                 tracks['video'] = pub.add_track(LocTrackPublisher(
                     session, args.namespace, 'video', config=video.config,
-                    loc01_compat=args.loc01_compat,
+                    loc01_compat=args.loc01_compat, loc_bare=loc_bare,
                     codec_string=_cs(video.codec_string)))
                 stats['video'] = _TrackStats()
             if ts_audio is not None:
@@ -627,14 +795,14 @@ async def run(args):
                     config=ts_audio.asc,
                     mapping=(StreamMapping.DATAGRAM if args.datagram
                              else StreamMapping.PER_GROUP),
-                    loc01_compat=args.loc01_compat,
+                    loc01_compat=args.loc01_compat, loc_bare=loc_bare,
                     codec_string=_cs(ts_audio.codec_string)))
                 stats['audio'] = _TrackStats()
             feeders.append(_feed_ts_live(tracks, fh, dmx, first, args,
                                          stats, pub))
         elif not args.no_audio:
-            audio_track = pub.add_track(LocTrackPublisher(
-                session, args.namespace, 'audio', media_kind='audio',
+            audio_track = pub.add_track(_track(
+                'audio', media_kind='audio',
                 config=mp4_audio.asc if mp4_audio is not None else None,
                 mapping=(StreamMapping.DATAGRAM if args.datagram
                          else StreamMapping.PER_GROUP),
@@ -647,6 +815,9 @@ async def run(args):
                 feeders.append(_feed_mp4_track(
                     audio_track, mp4_audio, args, stats['audio'],
                     all_key=True,
+                    group_us=(_LOCMAF_AUDIO_GROUP_US
+                              if args.packaging == PACKAGING_LOCMAF
+                              else None),
                     gap_us=1_000_000 * 1024 // mp4_audio.samplerate,
                     wrap=(lambda s, ck=a_ck:
                           ck.chunk(s.payload, s.duration)) if a_ck
@@ -660,15 +831,15 @@ async def run(args):
             feeders.append(_feed_h264_live(
                 pub.add_track(LocTrackPublisher(
                     session, args.namespace, 'video', config=video.config,
-                    loc01_compat=args.loc01_compat,
+                    loc01_compat=args.loc01_compat, loc_bare=loc_bare,
                     codec_string=_cs(video.codec_string))),
                 fh, asm, first, args, stats['video']))
         elif video is not None and ts is None:   # --ts wired both tracks above
             v_ck = chunkers.get('video')
             stats['video'] = _TrackStats()
             feeders.append(_feed_mp4_track(
-                pub.add_track(LocTrackPublisher(
-                    session, args.namespace, 'video',
+                pub.add_track(_track(
+                    'video',
                     config=None if v_ck else video.config,
                     loc01_compat=args.loc01_compat,
                     codec_string=_cs(video.codec_string))),

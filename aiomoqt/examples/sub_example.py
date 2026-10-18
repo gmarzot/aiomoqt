@@ -4,7 +4,8 @@ import asyncio
 import argparse
 import logging
 
-from aiomoqt.types import ParamType, MOQTException, MOQTRequestError, parse_draft_spec
+from aiomoqt.types import (MOQT_DEFAULT_DRAFTS, ParamType, MOQTException, MOQTRequestError,
+                           parse_draft_spec)
 from aiomoqt.client import MOQTClient
 from aiomoqt.utils.url import parse_relay_url
 from aiomoqt.track import SubscribedTrack
@@ -27,7 +28,9 @@ def parse_args():
     parser.add_argument('--keylogfile', type=str, default=None, help='TLS secrets file')
     parser.add_argument('-k', '--insecure', action='store_true', help='Skip TLS certificate verification')
     parser.add_argument('--auth-token', type=str, default=None, help='Auth token')
-    parser.add_argument('--draft', type=parse_draft_spec, default=None, help='MoQT draft version: 14, 16, or 18')
+    parser.add_argument('--draft', type=parse_draft_spec, default=None,
+                        help='MoQT draft, or a comma list offered in order (default: '
+                        f'{",".join(map(str, MOQT_DEFAULT_DRAFTS))})')
     parser.add_argument('--libquicr-compat', action='store_true', help='Use libquicr filter encoding (LAPS)')
     parser.add_argument('-t', '--duration', type=int, default=120, help='Duration in seconds (default: 120)')
     parser.add_argument('--subscribe-options', type=int, default=None,

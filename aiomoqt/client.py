@@ -1,4 +1,6 @@
 import asyncio
+import contextlib
+import ssl
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import List, Optional, Union
 
@@ -8,7 +10,7 @@ from aiopquic.quic.configuration import QuicConfiguration
 
 from .protocol import (
     MOQTPeer, MOQTSessionQuic, MOQTSessionWTClient,
-    DEFAULT_TX_MAX_INFLIGHT_BYTES,
+    DEFAULT_TX_MAX_INFLIGHT_BYTES, USER_AGENT,
 )
 from .types import moqt_alpn_for_version, normalize_supported_drafts
 from .utils.logger import *
@@ -24,6 +26,7 @@ class MOQTClient(MOQTPeer):
         path: Optional[str] = None,
         use_quic: Optional[bool] = False,
         verify_tls: Optional[bool] = True,
+        ca_file: Optional[str] = None,
         configuration: Optional[QuicConfiguration] = None,
         debug: Optional[bool] = False,
         keylog_filename: Optional[str] = None,
@@ -36,15 +39,18 @@ class MOQTClient(MOQTPeer):
         keep_alive_interval: Optional[float] = None,
         socket_buffer_size: Optional[int] = None,
         qlog_dir: Optional[str] = None,
+        implementation: Optional[str] = USER_AGENT,
     ):
         super().__init__(libquicr_compat=libquicr_compat,
-                         tx_max_inflight_bytes=tx_max_inflight_bytes)
+                         tx_max_inflight_bytes=tx_max_inflight_bytes,
+                         implementation=implementation)
         from .utils.url import normalize_wt_path
         self.host = host
         self.port = port
         self.path = normalize_wt_path(path)
         self.use_quic = use_quic
         self.verify_tls = verify_tls
+        self.ca_file = ca_file
         self.debug = debug
         # Path to picoquic text log file. When set, aiopquic enables
         # picoquic_set_log_level(1) + picoquic_set_textlog on the
@@ -129,6 +135,10 @@ class MOQTClient(MOQTPeer):
                     server_name=self.host,
                     secrets_log_file=self.keylog_filename,
                 )
+            if not self.verify_tls:
+                cfg.verify_mode = ssl.CERT_NONE
+            if self.ca_file is not None and cfg.cafile is None:
+                cfg.cafile = self.ca_file
             if self.qlog_dir is not None and cfg.qlog_dir is None:
                 cfg.qlog_dir = self.qlog_dir
             # None defers to the aiopquic default (bbr1).
@@ -151,13 +161,24 @@ class MOQTClient(MOQTPeer):
                     "MOQT: quic_debug_log requested for raw-QUIC client; "
                     "not yet plumbed in aiopquic.connect (use WT or wait "
                     "for aiopquic 0.3.2)")
-            return aiopquic_connect(
-                self.host, self.port,
-                configuration=cfg,
-                create_protocol=protocol,
-            )
+            return self._connect_quic(cfg, protocol)
 
         return self._connect_wt()
+
+    @asynccontextmanager
+    async def _connect_quic(self, cfg, protocol):
+        async with aiopquic_connect(self.host, self.port, configuration=cfg,
+                                    create_protocol=protocol) as session:
+            try:
+                yield session
+            finally:
+                # aiopquic stops the transport as this block exits; give the
+                # CONNECTION_CLOSE time to leave first.
+                if not session._moqt_session_closed.done():
+                    session.close()
+                await asyncio.sleep(0)
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(session.wait_closed(), 0.3)
 
     @asynccontextmanager
     async def _connect_wt(self):
@@ -188,6 +209,8 @@ class MOQTClient(MOQTPeer):
             transport = TransportContext()
         transport.start(
             is_client=True, alpn="h3",
+            verify_peer=bool(self.verify_tls) and wt_cfg.verify_peer,
+            ca_file=self.ca_file or wt_cfg.cafile,
             max_datagram_frame_size=64 * 1024,
             debug_log=self.quic_debug_log,
             rx_data_ring_cap=wt_cfg.max_stream_data,
@@ -237,17 +260,28 @@ class MOQTClient(MOQTPeer):
             await session.open(timeout=10.0)
             yield session
         finally:
+            # Detach and stop run even when the close wait is cancelled.
             try:
-                if not session.session_closed:
-                    session.close(0, b"")
-                    # close() defers the CONNECTION_CLOSE to the next loop
-                    # tick and the network thread transmits it; stop()
-                    # frees that thread, so give the close time to leave.
-                    await asyncio.sleep(0)
-                    await asyncio.wait_for(session.wait_closed(), 0.3)
-            except Exception:
-                pass
-            try:
-                transport.stop()
-            except Exception:
-                pass
+                try:
+                    if not session.session_closed:
+                        session.close(0, b"")
+                        # A graceful close() queues the WT close next tick.
+                        await asyncio.sleep(0)
+                    # Wait for the connection to go, also after an error
+                    # close: stop() drops a close picoquic has not sent.
+                    await session.aclose(0, b"")
+                except Exception:
+                    pass
+            finally:
+                try:
+                    # Releases the transport's event dispatcher, which
+                    # otherwise holds the transport, its rings and wake fd.
+                    try:
+                        await session.detach()
+                    except Exception:
+                        pass
+                finally:
+                    try:
+                        transport.stop()
+                    except Exception:
+                        pass

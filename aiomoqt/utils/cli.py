@@ -43,7 +43,8 @@ split execution (tools that can run one end or both)
 """
 import argparse
 
-from aiomoqt.types import parse_draft_spec
+from aiomoqt.types import MOQT_DEFAULT_DRAFTS, parse_draft_spec
+from aiomoqt.utils.url import parse_relay_url
 
 # Defaults, one place. Powers of two, same on every tool.
 DEFAULT_OBJECT_SIZE = 4096
@@ -74,10 +75,19 @@ def add_help(p):
 
 # -- addressing ------------------------------------------------------
 
+def endpoint_url(value):
+    """argparse type for a dialled URL: refuse one the dialler would."""
+    try:
+        parse_relay_url(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e))
+    return value
+
+
 def add_endpoint(p, required=True):
     """Positional URL for tools that dial. Scheme picks the transport."""
     kw = {} if required else {'nargs': '?', 'default': None}
-    p.add_argument('url', metavar='URL', **kw,
+    p.add_argument('url', metavar='URL', type=endpoint_url, **kw,
                    help='Endpoint. moqt://host[:port][/path] = raw QUIC; '
                         'https://host[:port][/path] = WebTransport; '
                         'host[:port] = WebTransport. The scheme selects '
@@ -87,7 +97,7 @@ def add_endpoint(p, required=True):
 def add_endpoints(p):
     """Positional URLs for tools that dial several peers at once and do
     the same work to each. args.url is a list, one entry minimum."""
-    p.add_argument('url', metavar='URL', nargs='+',
+    p.add_argument('url', metavar='URL', nargs='+', type=endpoint_url,
                    help='Endpoint(s). moqt://host[:port][/path] = raw '
                         'QUIC; https://host[:port][/path] = '
                         'WebTransport; host[:port] = WebTransport. The '
@@ -186,10 +196,13 @@ def add_run(p, duration=DEFAULT_DURATION, interval=True):
 def add_session(p, insecure=True, certs=False, keepalive=False,
                 compat=False):
     p.add_argument('--draft', type=parse_draft_spec, default=None,
-                   help='MoQT draft version: 14, 16, or 18')
+                   help='MoQT draft: '
+                        f'{", ".join(map(str, sorted(MOQT_DEFAULT_DRAFTS)))}; '
+                        'a comma list offers several in order. Default: '
+                        f'offer {",".join(map(str, MOQT_DEFAULT_DRAFTS))}')
     if insecure:
         p.add_argument('-k', '--insecure', action='store_true',
-                       help='Skip TLS certificate verification')
+                       help='Accept any server certificate (self-signed relays)')
     if certs:
         p.add_argument('--cert', type=str, default=None,
                        help='TLS certificate file')
