@@ -4,6 +4,7 @@
 
 - Requires aiopquic >= 0.5.2 (a lost RX wake stalled servers under load).
 - Relay: `--cc-algo` defaults to cubic (about 65% more fan-out than bbr on one worker).
+- Relay: the upstream SUBSCRIBE for an unfiltered subscriber omits the filter from d16 (AbsoluteStart {0, 0} at d14).
 
 ## v0.12.0
 

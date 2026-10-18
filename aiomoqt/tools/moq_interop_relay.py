@@ -1105,8 +1105,8 @@ async def _establish_upstream(ns, track_name, forward=True, sub=None):
 
 def _upstream_filter(sub) -> dict:
     """The first subscriber's start for a shared upstream SUBSCRIBE, with
-    no End Group: later subscribers may want more. Unfiltered (§10.2.9) is
-    AbsoluteStart {0, 0}, which every draft can carry."""
+    no End Group: later subscribers may want more. An unfiltered one stays
+    unfiltered (filter_type None; see _filter_for)."""
     ftype = getattr(sub, "filter_type", None)
     if sub is None or ftype in (FilterType.LATEST_OBJECT,
                                 FilterType.NEXT_GROUP_START):
@@ -1115,8 +1115,17 @@ def _upstream_filter(sub) -> dict:
         return {"filter_type": FilterType.ABSOLUTE_START,
                 "start_group": sub.start_group or 0,
                 "start_object": sub.start_object or 0}
-    return {"filter_type": FilterType.ABSOLUTE_START,
-            "start_group": 0, "start_object": 0}
+    return {"filter_type": None}
+
+
+def _filter_for(pub, kwargs: dict) -> dict:
+    """From d16 an omitted filter is unfiltered (§10.2.9); d14 has no
+    omission, so it carries AbsoluteStart {0, 0}."""
+    if "filter_type" in kwargs and kwargs["filter_type"] is None and not (
+            is_draft16_or_later(pub.negotiated_draft)):
+        return {"filter_type": FilterType.ABSOLUTE_START,
+                "start_group": 0, "start_object": 0}
+    return kwargs
 
 
 def _parked_publish(key):
@@ -1193,7 +1202,8 @@ async def _subscribe_publishers(entry):
             on_done=lambda done, t=track, k=key: _upstream_done(t, k, done))
         entry.pub = pub
         try:
-            await upstream.subscribe(timeout=10.0, **entry.filter)
+            await upstream.subscribe(timeout=10.0,
+                                     **_filter_for(pub, entry.filter))
         except Exception as e:
             if entry.fut.done():
                 break
