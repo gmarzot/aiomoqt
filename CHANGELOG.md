@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Interop client: data-subgroup-basic follows MoQT Test revision 2 (`moq-test` routing prefix, test tuple in the subscribed namespace).
+- Publisher: the subgroups of a track start each group together, so a slow subgroup no longer drifts behind and a late subscriber gets every subgroup.
 
 ## v0.13.0rc1
 
