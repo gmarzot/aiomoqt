@@ -80,13 +80,15 @@ sudo netfilter-persistent save
 The relay's picoquic worker thread is the bottleneck under fan-out, mostly per-packet kernel work, so
 the host keeps other per-packet work off its cores:
 
-- **No connection tracking for the relay's port**, in the iptables `raw` table (saved by
-  `netfilter-persistent save`). The `INPUT` rule for UDP 4443 still admits the untracked packets.
+- **No connection tracking for the relay's port**, in the iptables `raw` table. The `INPUT` rule for
+  UDP 4443 still admits the untracked packets. `/etc/iptables/rules.v4` holds curated Docker chains,
+  so add the two rules to its `*raw` table by hand; `netfilter-persistent save` would capture
+  transient container rules.
 
   ```sh
   sudo iptables -t raw -I PREROUTING -p udp --dport 4443 -j NOTRACK
   sudo iptables -t raw -I OUTPUT -p udp --sport 4443 -j NOTRACK
-  sudo netfilter-persistent save
+  sudo sh -c 'iptables-restore --test < /etc/iptables/rules.v4'    # after editing the file
   ```
 
 - **NIC interrupts on CPU 0, the relay on CPUs 1-2.** `host/relay-irq-affinity.sh` pins the NIC's
