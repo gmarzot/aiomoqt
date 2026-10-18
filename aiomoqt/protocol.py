@@ -2471,8 +2471,9 @@ class _MOQTSessionMixin:
                         f"FIN after STOP_SENDING (stream {stream_id})")
             held = self._peer_requests.get(
                 self._bidi_stream_requests.get(stream_id))
-            if held is not None and held[0] in (SubscribeNamespace,
-                                                 SubscribeTracks):
+            if (held is not None
+                    and self._profile.request_fin_cancels_discovery
+                    and held[0] in (SubscribeNamespace, SubscribeTracks)):
                 # §6.1: a FIN cancels these. Free the prefix now; close the
                 # stream a loop turn later, after replies already due.
                 request_id = self._bidi_stream_requests.pop(stream_id)

@@ -117,6 +117,10 @@ class DraftProfile:
     track_properties: bool = True
                                   # PUBLISH, SUBSCRIBE_OK and FETCH_OK end
                                   # with Track Properties; d14 has none.
+    request_fin_cancels_discovery: bool = True
+                                  # d18: a requester FIN cancels its
+                                  # SUBSCRIBE_NAMESPACE / SUBSCRIBE_TRACKS;
+                                  # d20+ FIN is not a cancellation.
     truncated_request_closes: bool = False
                                   # d20+: a request stream FIN'd mid-message
                                   # closes the session (FIN is not a cancel).
@@ -184,7 +188,8 @@ _D20 = replace(
     fetch_location_filter=True,
     fetch_timed_out_range=True,
     fetch_object_status=False,
-    truncated_request_closes=True)
+    truncated_request_closes=True,
+    request_fin_cancels_discovery=False)
 PROFILES[MOQTDraft.DRAFT_20] = _D20
 PROFILES[MOQTDraft.DRAFT_22] = replace(
     _D20, draft=MOQTDraft.DRAFT_22,

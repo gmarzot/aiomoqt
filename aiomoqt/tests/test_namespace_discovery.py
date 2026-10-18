@@ -1,7 +1,7 @@
 """A publisher answers SUBSCRIBE_NAMESPACE with NAMESPACE for each namespace
 it publishes under the prefix, reports later announcements, and sends
-NAMESPACE_DONE when it withdraws one (d18 §6.1). A FIN from the requester
-cancels the subscription."""
+NAMESPACE_DONE when it withdraws one (d18 §6.1). At d18 a FIN from the
+requester cancels the subscription; from d20 it does not (§6.4.2)."""
 import asyncio
 import contextlib
 import logging
@@ -27,7 +27,7 @@ _TRANSPORTS = pytest.mark.parametrize("use_quic", [True, False],
 
 
 @contextlib.asynccontextmanager
-async def _discovery(port, use_quic):
+async def _discovery(port, use_quic, draft=18):
     """Yields (publisher, server session, queue of (kind, suffix)) where
     kind is NAMESPACE or DONE as the server session receives them."""
     peer = asyncio.get_running_loop().create_future()
@@ -46,7 +46,7 @@ async def _discovery(port, use_quic):
 
     server = MOQTServer(host="localhost", port=port, certificate=CERT,
                         private_key=KEY, path="/", use_quic=use_quic,
-                        supported_drafts=18)
+                        supported_drafts=draft)
     server.register_handler(MOQTMessageType.PUBLISH_NAMESPACE,
                             _on_publish_namespace)
     server.register_handler(D16MessageType.NAMESPACE, _on_namespace)
@@ -54,7 +54,7 @@ async def _discovery(port, use_quic):
     quic_server = await server.serve()
     try:
         client = MOQTClient("localhost", port, path="/", use_quic=use_quic,
-                            verify_tls=False, supported_drafts=18)
+                            verify_tls=False, supported_drafts=draft)
         async with client.connect() as pub:
             await pub.client_session_init()
             await pub.publish_namespace(namespace="disc/a", wait_response=True)
@@ -158,4 +158,37 @@ async def test_an_update_before_the_fin_is_still_answered(use_quic):
         assert err.value.error_code == RequestErrorCode.PREFIX_OVERLAP
         await asyncio.sleep(0.05)
         assert sorted(pub._discovery_subs.values()) == [(b"other",)]
+        assert pub._close_err is None and rx._close_err is None
+
+
+@requires_certs
+@_TRANSPORTS
+@pytest.mark.parametrize("draft", [20, 22])
+async def test_a_fin_with_the_request_does_not_cancel_from_d20(
+        use_quic, draft):
+    # Each request and its FIN in one frame, as the contribution runner
+    # sends them: both are answered and both keep reporting.
+    port = _BASE_PORT + 8 + 2 * (draft == 22) + (not use_quic)
+    async with _discovery(port, use_quic, draft) as (pub, rx, seen):
+        PublishedTrack(pub, namespace="other/x", trackname="t").attach()
+        replies = []
+        for prefix in ((b"disc",), (b"other",)):
+            rid = rx._allocate_request_id()
+            msg = SubscribeNamespace(request_id=rid, namespace_prefix=prefix,
+                                     subscribe_options=0, parameters={})
+            sid = await rx.open_bidi_stream()
+            rx._bidi_streams[rid] = sid
+            rx._bidi_stream_requests[sid] = rid
+            rx._note_request_kind(rid, SubscribeNamespace, ours=True)
+            replies.append(asyncio.ensure_future(rx._await_response(rid)))
+            await asyncio.sleep(0)
+            rx.stream_write(sid, msg.serialize(prof=rx._profile).data,
+                            end_stream=True)
+        await asyncio.wait_for(asyncio.gather(*replies), 5.0)
+        got = {await _next(seen) for _ in range(2)}
+        assert got == {("NAMESPACE", (b"a",)), ("NAMESPACE", (b"x",))}
+        assert sorted(pub._discovery_subs.values()) == [
+            (b"disc",), (b"other",)]
+        await pub.publish_namespace(namespace="disc/c", wait_response=True)
+        assert await _next(seen) == ("NAMESPACE", (b"c",))
         assert pub._close_err is None and rx._close_err is None
