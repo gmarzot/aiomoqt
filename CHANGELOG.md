@@ -7,6 +7,7 @@
 - Relay: the upstream SUBSCRIBE for an unfiltered subscriber omits the filter from d16 (AbsoluteStart {0, 0} at d14).
 - Relay status: `platform.json` `transport[]` carries each listener's aiopquic RX wake and worker counters.
 - Relay watchdog: a failed self-probe logs those counters, wakes each transport's reader once (Linux) and logs them again.
+- Server: a UDP port taken on the IPv6 side ([::]:port) is a warning; IPv4 still serves.
 
 ## v0.12.0
 
