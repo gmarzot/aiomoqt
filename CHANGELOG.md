@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.13.0rc1
 
 - Requires aiopquic >= 0.6.0: servers also bind IPv6 when it is usable (IPv4 only, with a warning, when `[::]:port` cannot bind).
 - Relay: `--cc-algo` defaults to cubic (about 65% more fan-out than bbr on one worker).
