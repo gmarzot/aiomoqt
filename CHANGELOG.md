@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.12.0
 
 - Relay: a subscriber whose session closes under a write is dropped; forwarding for the track no longer stops, which left later subscribers with nothing and the queue growing without bound.
 - Session: a reply to a request the peer already cancelled is dropped (logged at DEBUG) instead of raising.
