@@ -27,7 +27,8 @@ _probed = {}
 
 async def _aiopquic_wt_selection():
     """What this aiopquic's WT-Protocol selection does, found by asking it:
-    (picks by server order, refuses an offer with no match)."""
+    (whose order wins, "server" or "client"; refuses an offer with no
+    match)."""
     if not _probed:
         async def handler(session):
             pass
@@ -39,7 +40,8 @@ async def _aiopquic_wt_selection():
             async with connect_webtransport(
                     "localhost", _PROBE_PORT, "/", verify_peer=False,
                     wt_available_protocols=["p-a", "p-b"]) as wt:
-                _probed["server_order"] = wt.negotiated_protocol == "p-b"
+                _probed["order"] = {"p-b": "server", "p-a": "client"}.get(
+                    wt.negotiated_protocol)
             try:
                 async with connect_webtransport(
                         "localhost", _PROBE_PORT, "/", verify_peer=False,
@@ -49,34 +51,38 @@ async def _aiopquic_wt_selection():
                 _probed["refuses"] = True
         finally:
             await server.aclose()
-    return _probed["server_order"], _probed["refuses"]
+    return _probed["order"], _probed["refuses"]
 
 
 @pytest.fixture
-async def wt_server_order():
-    server_order, refuses = await _aiopquic_wt_selection()
-    if not (server_order and refuses):
-        pytest.skip("aiopquic selects the WT-Protocol by client order or "
-                    "accepts an offer with no match")
+async def wt_selection():
+    order, refuses = await _aiopquic_wt_selection()
+    if order is None or not refuses:
+        pytest.skip("aiopquic picks no WT-Protocol by preference or accepts "
+                    "an offer with no match")
+    return order
 
 
-requires_wt_server_order = pytest.mark.usefixtures("wt_server_order")
+requires_wt_selection = pytest.mark.usefixtures("wt_selection")
 
 
 async def _start(port, drafts, *, use_quic=True, dual=False):
     """Start a server; returns (handle, sessions whose SETUP arrived)."""
     seen = []
 
-    async def on_setup(session, msg):
-        seen.append(session)
-        _, default = session.CONTROL_REGISTRY[session.negotiated_draft][
-            MOQTMessageType.SETUP]
-        await default(session, msg)
+    def on_setup(msg_type):
+        async def handler(session, msg):
+            seen.append(session)
+            _, default = session.CONTROL_REGISTRY[session.negotiated_draft][msg_type]
+            await default(session, msg)
+        return handler
 
     server = MOQTServer(host="localhost", port=port, certificate=CERT,
                         private_key=KEY, path="/", use_quic=use_quic,
                         supported_drafts=drafts)
-    server.register_handler(MOQTMessageType.SETUP, on_setup)
+    # d18+ sends SETUP; d16 sends CLIENT_SETUP.
+    for msg_type in (MOQTMessageType.SETUP, MOQTMessageType.CLIENT_SETUP):
+        server.register_handler(msg_type, on_setup(msg_type))
     handle = await (server.serve_dual() if dual else server.serve())
     return handle, seen
 
@@ -93,15 +99,28 @@ async def _negotiate(port, use_quic, drafts):
                 getattr(session, "negotiated_protocol", None))
 
 
-@requires_wt_server_order
 @pytest.mark.parametrize("dual", [False, True], ids=["serve", "serve_dual"])
-async def test_wt_ascending_offer_gets_the_servers_highest(dual):
+async def test_wt_ascending_offer_follows_the_selection_order(dual, wt_selection):
+    """Server order picks the server's highest; client order picks the
+    client's first offer the server supports (d14 is never offered)."""
     port = _BASE_PORT + (1 if dual else 0)
     handle, seen = await _start(port, _SERVER_DRAFTS, use_quic=False, dual=dual)
+    want = 22 if wt_selection == "server" else 16
     try:
         draft, proto = await _negotiate(port, False, _ASCENDING)
+        assert (draft, proto) == (want, f"moqt-{want}")
+        assert [s.negotiated_draft for s in seen] == [want]
+    finally:
+        handle.close()
+
+
+@requires_wt_selection
+async def test_wt_newest_first_offer_gets_the_highest():
+    port = _BASE_PORT + 8
+    handle, _ = await _start(port, _SERVER_DRAFTS, use_quic=False)
+    try:
+        draft, proto = await _negotiate(port, False, list(reversed(_ASCENDING)))
         assert (draft, proto) == (22, "moqt-22")
-        assert [s.negotiated_draft for s in seen] == [22]
     finally:
         handle.close()
 
@@ -117,7 +136,7 @@ async def test_quic_ascending_offer_gets_the_servers_highest():
         handle.close()
 
 
-@requires_wt_server_order
+@requires_wt_selection
 @pytest.mark.parametrize("dual", [False, True], ids=["serve", "serve_dual"])
 async def test_wt_offer_with_no_supported_draft_is_refused(dual):
     """A d22-only client against a 18/16/14 server fails at CONNECT with
@@ -134,7 +153,7 @@ async def test_wt_offer_with_no_supported_draft_is_refused(dual):
         handle.close()
 
 
-@requires_wt_server_order
+@requires_wt_selection
 async def test_relay_probe_reports_a_wt_refusal():
     from aiomoqt.tools import relay_probe
     port = _BASE_PORT + 5

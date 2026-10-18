@@ -386,10 +386,15 @@ async def test_snapshot_reports_namespaces_tracks_and_sessions(
     assert [r["namespace"] for r in snap["namespaces"]] == [_NS]
     space = snap["namespaces"][0]
     assert space["format"] == "MSF"
-    assert (space["tracks"], space["subscribers"]) == (2, 3)
+    # sub1 on two tracks counts once as a subscriber, twice as subscriptions.
+    assert (space["tracks"], space["subscribers"], space["subscriptions"]) == (
+        2, 2, 3)
     assert space["announced"]
-    assert space["peak"] == 3
-    assert totals["subscribers_peak"] >= totals["subscribers"] == 3
+    assert space["peak"] == 2
+    assert totals["subscribers_peak"] >= totals["subscribers"] == 2
+    assert totals["subscriptions"] == 3
+    assert snap["history"]["subscribers"][-1] == 2
+    assert snap["history"]["subscriptions"][-1] == 3
     assert totals["groups_per_s"] > 0
     assert snap["history"]["groups_per_s"][-1] == totals["groups_per_s"]
 
@@ -410,6 +415,13 @@ async def test_snapshot_reports_namespaces_tracks_and_sessions(
     assert [(s["transport"], s["draft"], s["forward"])
             for s in tracks["video"]["subscriber_list"]] == [
         ("quic" if use_quic else "wt", 18, True)] * 2
+    ids = {s["role"]: [] for s in snap["sessions"]}
+    for s in snap["sessions"]:
+        ids[s["role"]].append(s["id"])
+    assert len({s["id"] for s in snap["sessions"]}) == 3
+    listed = {s["session"] for t in tracks.values()
+              for s in t["subscriber_list"]}
+    assert listed == set(ids["sub"])
     assert all(s["rtt_ms"] is not None for s in tracks["video"]["subscriber_list"])
     history = snap["track_history"][tracks["video"]["id"]]
     assert history["subscribers"][-1] == 2 and history["out_bps"][-1] > 0
@@ -420,7 +432,7 @@ async def test_snapshot_reports_namespaces_tracks_and_sessions(
     assert platform["bandwidth"]["egress_bps"] == totals["egress_bps"]
     assert "cpu_modes" in platform["host"] and "ifaces" in platform["host"]
 
-    # Masked peer addresses, never a port.
+    # Peer addresses, never a port.
     local = {"127.0.0.1", "::1"}
     assert {s["addr"] for s in snap["sessions"]} <= local
     assert None not in {s["addr"] for s in snap["sessions"]}

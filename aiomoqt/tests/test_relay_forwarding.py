@@ -829,3 +829,190 @@ async def test_a_subscribe_tracks_offer_carries_largest_and_the_cache(
             "video": [b"video-0", b"video-1"],
             "audio": [b"audio-0", b"audio-1"]}
         assert rx._close_err is None
+
+
+@requires_certs
+@pytest.mark.asyncio
+@_TRANSPORTS
+async def test_d14_parked_publishes_are_raised_by_subscribe_update(use_quic):
+    # d14 §9.10: the update that raises a parked PUBLISH is SUBSCRIBE_UPDATE,
+    # which carries Start, End Group, Priority and Forward as fields.
+    async with _flowing(_flow_port(6, use_quic), use_quic,
+                        draft=14) as subscriber:
+        rx, objects = await subscriber()
+        for name in _SIZES:
+            await rx.subscribe(_FLOW_NS, name, forward=1, wait_response=True)
+        for _ in range(150):
+            if all(objects[n] for n in _SIZES):
+                break
+            await asyncio.sleep(0.02)
+        assert all(objects[n] for n in _SIZES), objects
+        assert all(_relayed(n).parked is None for n in _SIZES)
+        assert rx._close_err is None
+
+
+@requires_certs
+@pytest.mark.asyncio
+@_TRANSPORTS
+async def test_upstream_subscribe_keeps_each_subscribers_start(use_quic):
+    # §10.2.9: a SUBSCRIBE with no filter is unfiltered. The shared upstream
+    # SUBSCRIBE must not narrow it to Largest Object, nor end where one
+    # subscriber's range ends.
+    port = _flow_port(7, use_quic)
+    _reset_relay_state()
+    server = relay._build_server("localhost", port, CERT, KEY,
+                                 use_quic=use_quic, draft=18)
+    handle = await server.serve()
+    upstream = {}
+    try:
+        pub_client = MOQTClient("localhost", port, path="/",
+                                use_quic=use_quic, verify_tls=False,
+                                supported_drafts=18)
+
+        async def on_subscribe(session, msg):
+            upstream[bytes(msg.track_name)] = msg
+            session.subscribe_ok(request_msg=msg)
+        pub_client.register_handler(MOQTMessageType.SUBSCRIBE, on_subscribe)
+        async with pub_client.connect() as pub:
+            await pub.client_session_init()
+            await pub.publish_namespace(namespace="relay/filt", parameters={},
+                                        wait_response=True)
+            sub_client = MOQTClient("localhost", port, path="/",
+                                    use_quic=use_quic, verify_tls=False,
+                                    supported_drafts=18)
+            async with sub_client.connect() as rx:
+                await rx.client_session_init()
+                await rx.subscribe("relay/filt", "all", filter_type=None,
+                                   wait_response=True)
+                await rx.subscribe("relay/filt", "range",
+                                   filter_type=FilterType.ABSOLUTE_RANGE,
+                                   start_group=2, start_object=1,
+                                   end_group=5, wait_response=True)
+    finally:
+        handle.close()
+        _reset_relay_state()
+    got = {name: (m.filter_type, m.start_group, m.start_object)
+           for name, m in upstream.items()}
+    assert got == {b"all": (FilterType.ABSOLUTE_START, 0, 0),
+                   b"range": (FilterType.ABSOLUTE_START, 2, 1)}, got
+
+
+@requires_certs
+@pytest.mark.asyncio
+@_TRANSPORTS
+async def test_d14_request_update_repeats_each_subscriptions_location(
+        use_quic):
+    # d14 §9.10: Start never decreases, so an update that only pauses a
+    # subscription repeats the Start its filter resolved to and its range.
+    async with _flowing(_flow_port(8, use_quic), use_quic,
+                        draft=14) as subscriber:
+        rx, _objects = await subscriber()
+        latest = await rx.subscribe(_FLOW_NS, "video", forward=1, priority=7,
+                                    wait_response=True)
+        ranged = await rx.subscribe(_FLOW_NS, "audio", forward=1,
+                                    filter_type=FilterType.ABSOLUTE_RANGE,
+                                    start_group=1, start_object=2,
+                                    end_group=9, wait_response=True)
+        video = rx.request_update(latest.request_id, forward=0)
+        audio = rx.request_update(ranged.request_id, forward=0)
+        with pytest.raises(ValueError):
+            rx.request_update(latest.request_id + 100, forward=0)
+        await asyncio.sleep(0.2)
+        assert rx._close_err is None
+    assert latest.largest_group_id is not None
+    assert (video.subscription_request_id, video.start_group,
+            video.start_object, video.end_group, video.priority,
+            video.forward) == (latest.request_id, latest.largest_group_id,
+                               latest.largest_object_id + 1, 0, 7, 0)
+    assert (audio.subscription_request_id, audio.start_group,
+            audio.start_object, audio.end_group, audio.forward) == (
+                ranged.request_id, 1, 2, 10, 0)
+
+
+@requires_certs
+@pytest.mark.asyncio
+@_TRANSPORTS
+async def test_a_second_publisher_in_a_namespace_keeps_the_firsts_track(
+        use_quic):
+    # Two live publishers announce the same namespace, each serving its own
+    # track. The second announcement must not close the first's track.
+    port = _flow_port(9, use_quic)
+    ns = "relay/shared"
+    got = {"a": 0, "b": 0}
+    _reset_relay_state()
+    server = relay._build_server("localhost", port, CERT, KEY,
+                                 use_quic=use_quic, draft=18)
+    handle = await server.serve()
+    try:
+        async with contextlib.AsyncExitStack() as stack:
+            async def _session():
+                client = MOQTClient("localhost", port, path="/",
+                                    use_quic=use_quic, verify_tls=False,
+                                    supported_drafts=18)
+                s = await stack.enter_async_context(client.connect())
+                await s.client_session_init()
+                return s
+
+            def _count(name):
+                def on_object(*_args):
+                    got[name] += 1
+                return on_object
+
+            async def _publisher(name):
+                pub = await _session()
+                PublishedTrack(pub, namespace=ns, trackname=name,
+                               object_size=100, group_size=5,
+                               rate=200).attach()
+                await pub.publish_namespace(namespace=ns, wait_response=True)
+
+            await _publisher("a")
+            rx = await _session()
+            await SubscribedTrack(rx, ns, "a",
+                                  on_object=_count("a")).subscribe(timeout=5)
+            first = relay._tracks[(relay._ns_tuple(ns), b"a")]
+            await _publisher("b")
+            before = got["a"]
+            await SubscribedTrack(rx, ns, "b",
+                                  on_object=_count("b")).subscribe(timeout=5)
+            for _ in range(150):
+                if got["b"] and got["a"] > before + 5:
+                    break
+                await asyncio.sleep(0.02)
+            assert relay._tracks.get((relay._ns_tuple(ns), b"a")) is first
+            assert got["a"] > before + 5 and got["b"], got
+    finally:
+        handle.close()
+        _reset_relay_state()
+
+
+def test_a_closed_track_takes_no_objects():
+    track = relay._RelayedTrack(("ns", "t"))
+    track.close()
+    track.on_object(_Obj(group_id=0, object_id=0), 0, 0, 0, 0)
+    assert track.task is None and track.queue.empty()
+
+
+class _Obj:
+    def __init__(self, group_id, object_id):
+        self.group_id = group_id
+        self.object_id = object_id
+        self.payload = b"x" * 8
+        self.extensions = None
+        self.publisher_priority = 128
+        self.status = None
+        self.stream_flags = None
+
+
+@pytest.mark.asyncio
+async def test_relay_flags_reach_the_server(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["moq_interop_relay"])
+    transport = relay.transport_settings(relay.parse_args())
+    assert transport == {"congestion_control_algorithm": "bbr",
+                         "max_connections": 4096,
+                         "stream_ring_cap": 1 << 20,
+                         "tx_max_inflight_bytes": 512 << 10}
+    server = relay._build_server("localhost", 0, CERT, KEY, True, 18,
+                                 **transport)
+    assert (server.congestion_control_algorithm, server.max_connections,
+            server.stream_ring_cap, server.tx_max_inflight_bytes) == (
+                "bbr", 4096, 1 << 20, 512 << 10)

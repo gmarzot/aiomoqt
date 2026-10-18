@@ -10,7 +10,6 @@ import pytest
 
 import aiomoqt.track as track_module
 from aiomoqt.client import MOQTClient
-from aiomoqt.messages import SubscribeUpdate
 from aiomoqt.protocol import _MOQTSessionMixin
 from aiomoqt.server import MOQTServer
 from aiomoqt.track import PublishedTrack
@@ -235,14 +234,8 @@ async def test_update_reaches_its_own_track(draft):
         by_name = {t.trackname: t for t in tracks}
         target = by_name[msgs[0].track_name.decode()]
         sub = rx.session
-        if draft >= 16:
-            sub.request_update(msgs[0].request_id, forward=0)
-        else:
-            sub.send_control_message(SubscribeUpdate(
-                request_id=sub._allocate_request_id(),
-                subscription_request_id=msgs[0].request_id,
-                start_group=0, start_object=0, end_group=0,
-                priority=128, forward=0))
+        # d14 needs the Start a PUBLISH_OK of ours set: none here.
+        sub.request_update(msgs[0].request_id, forward=0, start=(0, 0))
         paused = await _until(lambda: not target.forward)
         forward = {t.trackname: t.forward for t in tracks}
         assert paused, f"forward per track: {forward}"
