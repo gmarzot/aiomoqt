@@ -22,7 +22,7 @@ python=${AIOMOQT_PYTHON:-}
 
 jq -e '
     .schema_version == 1 and
-    (.draft == 18 or .draft == 21) and
+    (.draft == 18 or .draft == 21 or .draft == 22) and
     (.transport == "native_quic" or .transport == "webtransport") and
     (.scenario_id | type == "string" and length > 0) and
     (.endpoint | type == "string" and length > 0 and (contains("\n") | not)) and
@@ -32,8 +32,9 @@ jq -e '
 ' "$request_file" >/dev/null || fail 'unsupported or malformed request'
 
 draft=$(jq -r '.draft' "$request_file")
-# aiomoqt speaks drafts 14, 16 and 18; refuse rather than guess.
-[[ "$draft" == 18 ]] || fail "draft $draft is not supported by aiomoqt"
+# The runner has no draft 20; its draft 21 is moqt-21, which aiomoqt does not offer.
+[[ "$draft" == 18 || "$draft" == 22 ]] ||
+    fail "draft $draft is not supported by aiomoqt"
 transport=$(jq -r '.transport' "$request_file")
 endpoint=$(jq -r '.endpoint' "$request_file")
 timeout_ms=$(jq -r '.scenario_timeout_ms' "$request_file")
@@ -65,7 +66,8 @@ track=$(hex_to_text "$(jq -r '.track_name_hex' "$request_file")")
 flow=(--pub-ns)
 case "$scenario_id" in
     publish-track-under-single-period-namespace|\
-    application-publish-track-in-session-namespace)
+    application-publish-track-in-session-namespace|\
+    d22-application-track-publication-under-session)
         flow=(--pub-both) ;;
     initiate-track-publication|\
     publish-track-namespace-fields|\
@@ -75,7 +77,14 @@ case "$scenario_id" in
     publish-with-multiple-message-parameter-types|\
     publish-with-multiple-configured-parameters|\
     publish-existing-track-after-observed-object-publication|\
-    receive-request-update-ok-with-track-properties)
+    receive-request-update-ok-with-track-properties|\
+    d22-publish-ok-with-track-properties|\
+    d22-publish-update-ok-with-track-properties|\
+    d22-publish-request-error-oversized-reason|\
+    d22-reject-publish-before-object-production|\
+    d22-publisher-request-stream-placement|\
+    d22-publisher-key-value-type-deltas|\
+    d22-publisher-emitted-namespace-fields)
         flow=() ;;
 esac
 
@@ -105,15 +114,36 @@ case "$scenario_id" in
     publish-with-multiple-configured-parameters)
         content=(--prefill 10) ;;
     receive-joining-fetch-for-track-with-no-published-objects|\
-    receive-standalone-fetch-for-track-with-no-published-objects)
+    receive-standalone-fetch-for-track-with-no-published-objects|\
+    d22-fetch-track-with-no-published-objects)
         content=(--no-objects) ;;
-    fetch-object-previously-observed-as-datagram)
+    fetch-object-previously-observed-as-datagram|\
+    d22-fetch-datagram-preference|\
+    d22-object-datagram-flags)
         content=(-D) ;;
-    cancel-subscribe-with-multiple-open-subgroups)
+    cancel-subscribe-with-multiple-open-subgroups|\
+    d22-cancel-subscribe-with-open-streams)
         content=(-P 2) ;;
     publish-object-with-prior-group-id-gap|\
-    publish-object-with-prior-object-id-gap)
+    publish-object-with-prior-object-id-gap|\
+    d22-prior-*-gap-*|\
+    d22-fetch-known-gap)
         content=(--gaps) ;;
+    d22-fetch-*|\
+    d22-largest-object-*|\
+    d22-repeat-object-retrieval|\
+    d22-immutable-property-repeat|\
+    d22-object-immutable-property-singleton|\
+    d22-overlapping-subscriptions-*|\
+    d22-forward-location-and-range-filter-conjunction|\
+    d22-fill-fails-before-first-object|\
+    d22-cancel-subscription-with-concurrent-fill-streams|\
+    d22-subscribe-tracks-publish-skipped-then-capacity-recovers|\
+    d22-subgroup-completion-withheld-acknowledgments|\
+    d22-cancel-fetch-with-open-request-and-data-streams|\
+    d22-failed-fetch-update-data-reset|\
+    d22-publish-state-notify-on-fetch)
+        content=(--prefill 10) ;;
 esac
 
 # Control messages the publisher originates for the scenarios that wait
@@ -122,26 +152,38 @@ control=()
 case "$scenario_id" in
     observe-publisher-client-goaway|\
     send-new-request-after-publisher-control-goaway|\
-    publisher-control-goaway-with-pending-request-at-cutoff)
+    publisher-control-goaway-with-pending-request-at-cutoff|\
+    d22-publisher-client-goaway-control|\
+    d22-publisher-client-goaway-request|\
+    d22-new-request-after-publisher-goaway)
         control=(--goaway-after 1) ;;
     publisher-queries-track-status-before-resuming-publication|\
     publisher-recovery-track-status-*)
         control=(--track-status) ;;
     publisher-ends-subscription-with-no-data-streams|\
-    finish-subscription-with-open-object-streams)
+    finish-subscription-with-open-object-streams|\
+    d22-publish-done-without-data-streams)
         control=(--end-after 1) ;;
-    receive-request-update-ok-with-track-properties)
+    receive-request-update-ok-with-track-properties|\
+    d22-publish-update-ok-with-track-properties)
         control=(--publish-update) ;;
-    publish-and-withdraw-namespace-during-discovery)
+    publish-and-withdraw-namespace-during-discovery|\
+    d22-namespace-discovery-withdrawal-order)
         control=(--withdraw-after 1) ;;
-    publish-two-simultaneous-tracks)
+    publish-two-simultaneous-tracks|\
+    d22-concurrent-distinct-track-subscriptions)
         control=(--second-track) ;;
-    publish-distinct-content-tracks-in-same-scope)
+    publish-distinct-content-tracks-in-same-scope|\
+    d22-publish-distinct-tracks-in-one-scope)
         control=(--second-track --forward 1) ;;
-    publisher-redirects-subscribe-namespace)
+    publisher-redirects-subscribe-namespace|\
+    d22-publisher-namespace-redirect|\
+    d22-publisher-subscribe-tracks-redirect)
         control=(--redirect) ;;
     observe-publisher-padding-stream|\
-    observe-publisher-padding-datagram)
+    observe-publisher-padding-datagram|\
+    d22-padding-stream-emission|\
+    d22-padding-datagram-emission)
         control=(--padding 64) ;;
 esac
 
@@ -149,8 +191,13 @@ esac
 # below its 80-byte oversize-registration probe; the overflow probe needs
 # one under 17 bytes, so none is advertised.
 token_cache=64
-[[ "$scenario_id" != register-request-token-exceeding-advertised-cache-size ]] ||
-    token_cache=0
+case "$scenario_id" in
+    register-request-token-exceeding-advertised-cache-size|\
+    d22-request-token-cache-overflow|\
+    d22-setup-register-default-zero-cache|\
+    d22-request-alias-registration-with-default-zero-cache)
+        token_cache=0 ;;
+esac
 
 timeout_seconds=$(((timeout_ms + 999) / 1000))
 # The runner's certificate is self-signed for the test; pub_bench has no
@@ -160,7 +207,7 @@ timeout_seconds=$(((timeout_ms + 999) / 1000))
 # (MALFORMED_AUTH_TOKEN), expired (EXPIRED_AUTH_TOKEN) and denied
 # (UNAUTHORIZED).
 exec "$python" -m aiomoqt.tools.pub_bench "$endpoint" \
-    -N "$namespace" -T "$track" --draft 18 -k "${flow[@]}" --auth-token '' \
+    -N "$namespace" -T "$track" --draft "$draft" -k "${flow[@]}" --auth-token '' \
     -s 64 -g 10 -r 50 -t "$timeout_seconds" --no-stats "${content[@]}" \
     "${control[@]}" \
     --token-cache "$token_cache" \

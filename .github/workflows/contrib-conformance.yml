@@ -2,9 +2,11 @@ name: Contribution conformance
 
 # Publisher conformance under moq-contribution-interop-runner: the runner
 # drives aiomoqt's publisher (pub_bench, via tests/contrib/aiomoqt-adapter.sh)
-# through every d18 native-QUIC scenario that needs no FETCH and scores each
-# draft requirement. tests/contrib/sweep.py compares the outcomes with
-# tests/contrib/baseline.json and writes the job summary.
+# through every native-QUIC scenario of drafts 18 and 22, one job per draft,
+# and scores each draft requirement. tests/contrib/sweep.py compares the
+# outcomes with that draft's entry in tests/contrib/baseline.json and writes
+# the job summary. The runner has no draft 20; its draft 21 is the moqt-21
+# ALPN, which aiomoqt does not offer.
 #
 # Report-only: a regression is listed, not failed. Add --gate to the sweep
 # step to fail on one.
@@ -29,10 +31,14 @@ env:
 
 jobs:
   sweep:
-    name: contribution runner (d18, native QUIC)
+    name: contribution runner (d${{ matrix.draft }}, native QUIC)
     if: >-
       github.event_name != 'pull_request' ||
       github.event.label.name == 'ci:run-conformance'
+    strategy:
+      fail-fast: false
+      matrix:
+        draft: [18, 22]
     runs-on: ubuntu-24.04
     timeout-minutes: 50
     steps:
@@ -81,13 +87,13 @@ jobs:
           python tests/contrib/sweep.py \
             --runner runner-install/bin/moq-interop-runner \
             --runner-data runner-install/share/moq-interop \
-            --out contrib-out
+            --draft ${{ matrix.draft }} --out contrib-out
 
       - name: Upload results and publisher logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: contrib-conformance-${{ github.sha }}
+          name: contrib-conformance-d${{ matrix.draft }}-${{ github.sha }}
           path: |
             contrib-out/summary.md
             contrib-out/outcomes.json

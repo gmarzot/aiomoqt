@@ -8,6 +8,7 @@
 - Relay status: `platform.json` `transport[]` carries each listener's aiopquic RX wake and worker counters.
 - Relay watchdog: a failed self-probe logs those counters, wakes each transport's reader once (Linux) and logs them again.
 - Server: a UDP port taken on the IPv6 side ([::]:port) is a warning; IPv4 still serves.
+- CI: contribution-runner sweep at d18 and d22 (runner has no d20; its d21 is moqt-21).
 
 ## v0.12.0
 
