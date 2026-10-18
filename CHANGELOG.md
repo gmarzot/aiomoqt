@@ -4,6 +4,7 @@
 
 - Interop client: data-subgroup-basic follows MoQT Test revision 2 (`moq-test` routing prefix, test tuple in the subscribed namespace).
 - Publisher: the subgroups of a track start each group together, so a slow subgroup no longer drifts behind and a late subscriber gets every subgroup.
+- sub_bench: Lost counts objects missing from whole groups (a lost subgroup, a stream's head or tail), not only in-stream gaps.
 
 ## v0.13.0rc1
 
