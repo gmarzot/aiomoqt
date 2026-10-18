@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- CI: release.yml requires green CI and MoQ conformance on the release tree instead of re-running them, publishes the wheel it smoke-tested, and has a `dry_run` input; conformance runs on release branches only, and a new push cancels the run it supersedes.
+
 ## v0.13.0
 
 - Requires aiopquic >= 0.6.0 (the 0.6.0 release).
