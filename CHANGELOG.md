@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- sub_media: `--analyze` interval rows use the sub_bench / loopback_bench columns; the
+  summary is per-track result lines.
+
 ## v0.13.0rc2
 
 - Interop client: data-subgroup-basic follows MoQT Test revision 2 (`moq-test` routing prefix, test tuple in the subscribed namespace).
