@@ -4920,6 +4920,7 @@ class _MOQTSessionMixin:
     ) -> Optional[MOQTMessage]:
         """PublishNamespace track namespace availability."""
         namespace_tuple = self._make_namespace_tuple(namespace)
+        self._check_sendable_namespace(namespace_tuple)
         request_id = self._allocate_request_id()
         message = PublishNamespace(
             request_id=request_id,
@@ -4939,6 +4940,16 @@ class _MOQTSessionMixin:
             return message
 
         return self._await_response(request_id)
+
+    def _check_sendable_namespace(self, namespace: Tuple[bytes, ...]) -> None:
+        """Raise ValueError for a reserved namespace (first field starting
+        with "."; d18 §2.4.1, d22 §2.4.3 and §6.5)."""
+        prof = getattr(self, '_profile', None)
+        if (prof is not None and prof.reserved_period_namespaces
+                and namespace and namespace[0].startswith(b".")):
+            raise ValueError(
+                f"namespace {namespace[0].decode(errors='replace')!r}/...: "
+                f"a first field starting with '.' is reserved")
 
     def is_announced(self, namespace: Union[str, Tuple[str, ...]]) -> bool:
         """True while a PUBLISH_NAMESPACE we sent for `namespace` is
@@ -4992,6 +5003,7 @@ class _MOQTSessionMixin:
         FORWARD (1 when absent) overriding `forward` (§10.20.1).
         """
         namespace_tuple = self._make_namespace_tuple(namespace)
+        self._check_sendable_namespace(namespace_tuple)
         carried = (self._subscribe_tracks_carry(namespace_tuple)
                    if self._subscribe_tracks_params else None)
         if carried is not None:

@@ -117,6 +117,9 @@ class DraftProfile:
     track_properties: bool = True
                                   # PUBLISH, SUBSCRIBE_OK and FETCH_OK end
                                   # with Track Properties; d14 has none.
+    reserved_period_namespaces: bool = False
+                                  # d18+: a namespace whose first field starts
+                                  # with "." is reserved; never sent.
     request_fin_cancels_discovery: bool = True
                                   # d18: a requester FIN cancels its
                                   # SUBSCRIBE_NAMESPACE / SUBSCRIBE_TRACKS;
@@ -171,7 +174,8 @@ PROFILES = {
         location_params=frozenset({ParamType.LARGEST_OBJECT}),
         two_level_discovery=True,
         merged_datagram_layout=True,
-        subgroup_type_mask=0x6F),
+        subgroup_type_mask=0x6F,
+        reserved_period_namespaces=True),
 }
 
 # d22 differs from d20 only in its switches.

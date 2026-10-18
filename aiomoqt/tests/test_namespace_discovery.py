@@ -192,3 +192,39 @@ async def test_a_fin_with_the_request_does_not_cancel_from_d20(
         await pub.publish_namespace(namespace="disc/c", wait_response=True)
         assert await _next(seen) == ("NAMESPACE", (b"c",))
         assert pub._close_err is None and rx._close_err is None
+
+
+@requires_certs
+@_TRANSPORTS
+@pytest.mark.parametrize("draft", [18, 22])
+async def test_reserved_namespaces_are_never_sent(use_quic, draft):
+    port = _BASE_PORT + 12 + 2 * (draft == 22) + (not use_quic)
+    async with _discovery(port, use_quic, draft) as (pub, rx, seen):
+        await rx.subscribe_namespace("", wait_response=True)
+        assert await _next(seen) == ("NAMESPACE", (b"disc", b"a"))
+        for ns in (".", ".session/x", ".interop"):
+            with pytest.raises(ValueError, match="reserved"):
+                pub.publish_namespace(namespace=ns)
+            with pytest.raises(ValueError, match="reserved"):
+                pub.publish(namespace=ns, track_name="t")
+            track = PublishedTrack(pub, namespace=ns, trackname="t")
+            with pytest.raises(ValueError, match="reserved"):
+                await track.publish(announce_namespace=True,
+                                    publish_track=False)
+        await pub.publish_namespace(namespace="disc/b", wait_response=True)
+        assert await _next(seen) == ("NAMESPACE", (b"disc", b"b"))
+        assert seen.empty()
+        assert pub._close_err is None and rx._close_err is None
+
+
+def test_reserved_namespace_check_is_d18_and_later():
+    from aiomoqt.context import profile_for
+    from aiomoqt.protocol import _MOQTSessionMixin
+    s = object.__new__(_MOQTSessionMixin)
+    s._profile = profile_for(16)
+    s._check_sendable_namespace((b".x",))
+    for draft in (18, 20, 22):
+        s._profile = profile_for(draft)
+        s._check_sendable_namespace((b"a", b".x"))
+        with pytest.raises(ValueError):
+            s._check_sendable_namespace((b".",))

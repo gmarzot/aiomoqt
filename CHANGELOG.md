@@ -13,6 +13,7 @@
 - Session: from d20, a request stream FIN'd mid-message closes the session with PROTOCOL_VIOLATION.
 - Messages: a parameter outside its message's scope (e.g. inside FILL_PARAMETERS) closes before its value is decoded.
 - Session: from d20, a FIN on a SUBSCRIBE_NAMESPACE or SUBSCRIBE_TRACKS stream does not cancel it; the request is answered.
+- Session: from d18, `publish_namespace()` and `publish()` raise ValueError for a namespace whose first field starts with `.`.
 
 ## v0.12.0
 
