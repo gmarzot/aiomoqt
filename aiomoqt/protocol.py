@@ -2395,7 +2395,9 @@ class _MOQTSessionMixin:
             if msg is None:
                 error = (f"control stream({stream_id}): parse failed at "
                          f"{chain.tell()} of {chain.capacity} bytes")
-                logger.error(f"MOQT error: {error}")
+                logger.error(
+                    f"MOQT error: {error} head_hex="
+                    f"{chain.data_slice(0, min(64, chain.capacity)).hex()}")
                 self._close_session(
                     SessionCloseCode.PROTOCOL_VIOLATION, error)
                 return

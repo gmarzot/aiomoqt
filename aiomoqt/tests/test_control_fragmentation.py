@@ -185,6 +185,19 @@ async def test_a_body_short_of_its_length_closes_the_session(draft):
     assert "short of its Length" in s._closed[0][1]
 
 
+async def test_a_message_that_fails_to_parse_is_logged_in_hex(caplog):
+    s = _control_session(18)
+    wire = bytearray(RequestError(
+        request_id=7, error_code=0x10, retry_interval=0,
+        reason="gone").serialize(prof=s._profile).data)
+    declared = int.from_bytes(wire[1:3], "big")
+    wire[1:3] = (declared + 1).to_bytes(2, "big")
+    wire += b"\x00"
+    _feed_reply(s, bytes(wire))
+    assert s._closed
+    assert f"head_hex={bytes(wire).hex()}" in caplog.text
+
+
 @pytest.mark.parametrize("draft", [14, 16, 18])
 async def test_two_messages_one_event(draft):
     s = _control_session(draft)
