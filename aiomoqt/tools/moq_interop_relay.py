@@ -148,6 +148,9 @@ PUBLISH_WAIT_S = 1.5
 WATCHDOG_MISSES = 3
 WATCHDOG_EXIT = 70
 WATCHDOG_PROBE_S = 10.0
+# After a failed probe, how long to let a woken reader drain before
+# reading the transport counters again.
+WATCHDOG_KICK_S = 0.5
 # Dashboard (--status-dir): write period, history kept, the longest a
 # catalog probe may take, and the wait before re-probing a namespace
 # that showed no MSF catalog.
@@ -2343,10 +2346,66 @@ async def _heartbeat(stall_s: float) -> None:
         await asyncio.sleep(min(1.0, stall_s / 4))
 
 
-async def _watchdog(period, host, port, use_quic, draft) -> None:
+# aiopquic counters that show the RX wake state and worker progress.
+TRANSPORT_COUNTERS = (
+    "rx_notify_pending_now", "rx_event_ring_count_now",
+    "rx_overflow_depth_now", "rx_overflow_max_depth", "rx_overflow_pushed",
+    "rx_event_drops", "tx_event_ring_count_now", "loop_callbacks",
+    "wake_calls", "wake_skipped_coalesced")
+
+
+def _transport_of(handle):
+    """The aiopquic TransportContext behind a serve() handle, else None."""
+    transport = getattr(handle, "_transport", None)
+    if transport is None:
+        transport = getattr(getattr(handle, "_engine", None), "_transport",
+                            None)
+    return transport
+
+
+def transport_counters(handles) -> list:
+    """TRANSPORT_COUNTERS of each listener's transport."""
+    out = []
+    for handle in handles:
+        try:
+            counters = _transport_of(handle).counters
+        except Exception:
+            continue
+        out.append({k: counters.get(k) for k in TRANSPORT_COUNTERS})
+    return out
+
+
+def _kick_rx(handle) -> bool:
+    """Wake asyncio's reader for the transport once, as the network thread
+    does. Linux only: elsewhere the wake fd's write end is not exposed."""
+    transport = _transport_of(handle)
+    if transport is None or not sys.platform.startswith("linux"):
+        return False
+    try:
+        os.write(transport.eventfd, (1).to_bytes(8, sys.byteorder))
+    except (OSError, AttributeError):
+        return False
+    return True
+
+
+async def _diagnose_probe_miss(handles) -> None:
+    """Log the transports' RX wake state, wake each reader once, and log
+    the state again: queued events draining after the kick mean a lost
+    wake; staying queued means no reader is attached."""
+    logger.warning(f"relay: watchdog: probe failed; transport "
+                   f"{transport_counters(handles)}")
+    kicked = [_kick_rx(h) for h in handles]
+    await asyncio.sleep(WATCHDOG_KICK_S)
+    logger.warning(f"relay: watchdog: woke readers {kicked}; transport "
+                   f"{transport_counters(handles)}")
+
+
+async def _watchdog(period, host, port, use_quic, draft,
+                    handles=()) -> None:
     """Exit so the supervisor restarts the relay when it hangs or stops
     relaying: a loop stall past `period`, or WATCHDOG_MISSES self-probes
-    in a row, on the newest draft, that deliver no object."""
+    in a row, on the newest draft, that deliver no object. Each failed
+    probe logs the transports' RX wake state and wakes their readers."""
     _background.add(asyncio.create_task(_heartbeat(period)))
     newest = max(draft) if isinstance(draft, (list, tuple)) else int(draft)
     misses = 0
@@ -2357,6 +2416,7 @@ async def _watchdog(period, host, port, use_quic, draft) -> None:
             misses = 0
             continue
         misses += 1
+        await _diagnose_probe_miss(handles)
         if misses >= WATCHDOG_MISSES:
             logger.error(f"relay: watchdog: {misses} self-probes failed "
                          f"in a row, exiting")
@@ -2538,8 +2598,10 @@ class _Status:
     """The dashboard's status.json and platform.json, rewritten every
     STATUS_INTERVAL_S."""
 
-    def __init__(self, path: str, relay: dict) -> None:
+    def __init__(self, path: str, relay: dict, handles=()) -> None:
         self.path = path
+        # serve() handles whose aiopquic counters platform.json carries.
+        self.handles = list(handles)
         self.platform_path = os.path.join(os.path.dirname(path),
                                           "platform.json")
         self.relay = relay
@@ -2869,6 +2931,7 @@ class _Status:
                           "egress_bps": totals["egress_bps"],
                           "loss_pct": totals["loss_pct"]},
             "loop_lag_ms": lag,
+            "transport": transport_counters(self.handles),
             "history": self.platform_history.to_json(),
         }
 
@@ -3027,7 +3090,7 @@ async def main():
         # --quic and --dual serve raw QUIC on --port; otherwise WT.
         _background.add(asyncio.create_task(_watchdog(
             args.watchdog, host, args.port, args.quic or args.dual,
-            args.draft)))
+            args.draft, handles)))
 
     if args.status_dir:
         os.makedirs(args.status_dir, exist_ok=True)
@@ -3041,7 +3104,7 @@ async def main():
             "started": time.time(),
             "watchdog_s": args.watchdog,
             "cache": {"groups": CACHE_GROUPS, "bytes": CACHE_BYTES},
-        })
+        }, handles)
         _background.add(asyncio.create_task(status.run()))
 
     print(

@@ -5,6 +5,8 @@
 - Requires aiopquic >= 0.5.2 (a lost RX wake stalled servers under load).
 - Relay: `--cc-algo` defaults to cubic (about 65% more fan-out than bbr on one worker).
 - Relay: the upstream SUBSCRIBE for an unfiltered subscriber omits the filter from d16 (AbsoluteStart {0, 0} at d14).
+- Relay status: `platform.json` `transport[]` carries each listener's aiopquic RX wake and worker counters.
+- Relay watchdog: a failed self-probe logs those counters, wakes each transport's reader once (Linux) and logs them again.
 
 ## v0.12.0
 
