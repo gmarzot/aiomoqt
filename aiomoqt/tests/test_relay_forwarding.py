@@ -1007,7 +1007,7 @@ class _Obj:
 async def test_relay_flags_reach_the_server(monkeypatch):
     monkeypatch.setattr("sys.argv", ["moq_interop_relay"])
     transport = relay.transport_settings(relay.parse_args())
-    assert transport == {"congestion_control_algorithm": "bbr",
+    assert transport == {"congestion_control_algorithm": "cubic",
                          "max_connections": 4096,
                          "stream_ring_cap": 1 << 20,
                          "tx_max_inflight_bytes": 512 << 10}
@@ -1015,4 +1015,4 @@ async def test_relay_flags_reach_the_server(monkeypatch):
                                  **transport)
     assert (server.congestion_control_algorithm, server.max_connections,
             server.stream_ring_cap, server.tx_max_inflight_bytes) == (
-                "bbr", 4096, 1 << 20, 512 << 10)
+                "cubic", 4096, 1 << 20, 512 << 10)

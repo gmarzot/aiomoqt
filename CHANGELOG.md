@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Requires aiopquic >= 0.5.2 (a lost RX wake stalled servers under load).
+- Relay: `--cc-algo` defaults to cubic (about 65% more fan-out than bbr on one worker).
 
 ## v0.12.0
 
