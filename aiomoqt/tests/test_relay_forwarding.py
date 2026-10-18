@@ -927,3 +927,92 @@ async def test_d14_request_update_repeats_each_subscriptions_location(
     assert (audio.subscription_request_id, audio.start_group,
             audio.start_object, audio.end_group, audio.forward) == (
                 ranged.request_id, 1, 2, 10, 0)
+
+
+@requires_certs
+@pytest.mark.asyncio
+@_TRANSPORTS
+async def test_a_second_publisher_in_a_namespace_keeps_the_firsts_track(
+        use_quic):
+    # Two live publishers announce the same namespace, each serving its own
+    # track. The second announcement must not close the first's track.
+    port = _flow_port(9, use_quic)
+    ns = "relay/shared"
+    got = {"a": 0, "b": 0}
+    _reset_relay_state()
+    server = relay._build_server("localhost", port, CERT, KEY,
+                                 use_quic=use_quic, draft=18)
+    handle = await server.serve()
+    try:
+        async with contextlib.AsyncExitStack() as stack:
+            async def _session():
+                client = MOQTClient("localhost", port, path="/",
+                                    use_quic=use_quic, verify_tls=False,
+                                    supported_drafts=18)
+                s = await stack.enter_async_context(client.connect())
+                await s.client_session_init()
+                return s
+
+            def _count(name):
+                def on_object(*_args):
+                    got[name] += 1
+                return on_object
+
+            async def _publisher(name):
+                pub = await _session()
+                PublishedTrack(pub, namespace=ns, trackname=name,
+                               object_size=100, group_size=5,
+                               rate=200).attach()
+                await pub.publish_namespace(namespace=ns, wait_response=True)
+
+            await _publisher("a")
+            rx = await _session()
+            await SubscribedTrack(rx, ns, "a",
+                                  on_object=_count("a")).subscribe(timeout=5)
+            first = relay._tracks[(relay._ns_tuple(ns), b"a")]
+            await _publisher("b")
+            before = got["a"]
+            await SubscribedTrack(rx, ns, "b",
+                                  on_object=_count("b")).subscribe(timeout=5)
+            for _ in range(150):
+                if got["b"] and got["a"] > before + 5:
+                    break
+                await asyncio.sleep(0.02)
+            assert relay._tracks.get((relay._ns_tuple(ns), b"a")) is first
+            assert got["a"] > before + 5 and got["b"], got
+    finally:
+        handle.close()
+        _reset_relay_state()
+
+
+def test_a_closed_track_takes_no_objects():
+    track = relay._RelayedTrack(("ns", "t"))
+    track.close()
+    track.on_object(_Obj(group_id=0, object_id=0), 0, 0, 0, 0)
+    assert track.task is None and track.queue.empty()
+
+
+class _Obj:
+    def __init__(self, group_id, object_id):
+        self.group_id = group_id
+        self.object_id = object_id
+        self.payload = b"x" * 8
+        self.extensions = None
+        self.publisher_priority = 128
+        self.status = None
+        self.stream_flags = None
+
+
+@pytest.mark.asyncio
+async def test_relay_flags_reach_the_server(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["moq_interop_relay"])
+    transport = relay.transport_settings(relay.parse_args())
+    assert transport == {"congestion_control_algorithm": "bbr",
+                         "max_connections": 4096,
+                         "stream_ring_cap": 1 << 20,
+                         "tx_max_inflight_bytes": 512 << 10}
+    server = relay._build_server("localhost", 0, CERT, KEY, True, 18,
+                                 **transport)
+    assert (server.congestion_control_algorithm, server.max_connections,
+            server.stream_ring_cap, server.tx_max_inflight_bytes) == (
+                "bbr", 4096, 1 << 20, 512 << 10)

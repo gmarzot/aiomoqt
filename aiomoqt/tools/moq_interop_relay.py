@@ -351,6 +351,10 @@ class _RelayedTrack:
         # id(session) -> subgroup streams opened (PUBLISH_DONE count)
         self._sent_streams = {}
         self._finished = False
+        # Closed: takes no objects and never restarts its drain.
+        self._closed = False
+        # Alias of the PUBLISH feeding this track, on the publisher's session.
+        self.publish_alias = None
         # Recent objects, oldest first, for standalone FETCH. Bounded by
         # groups and bytes; a relay with no cache can serve no fetch at
         # all, and an unbounded one is a leak.
@@ -415,12 +419,26 @@ class _RelayedTrack:
 
     def close(self) -> None:
         """Release the fan-out: stop the drain and forget its streams."""
+        self._closed = True
         self.release_upstream()
+        self._release_publish()
         if self.task is not None:
             self.task.cancel()
             self.task = None
         self.downstream.clear()
         self._streams.clear()
+
+    def _release_publish(self) -> None:
+        """Drop the PUBLISH's handlers on the publisher's session, unless a
+        newer track on that session has taken the alias."""
+        session = _upstream_session(self)
+        alias, self.publish_alias = self.publish_alias, None
+        if session is None or alias is None:
+            return
+        if getattr(session, "_object_handlers", {}).get(alias) != self.on_object:
+            return
+        session.unregister_object_handler(alias)
+        session.unregister_stream_end_handler(alias)
 
     def finish(self, status_code=0x2, reset_code=None, reason="track ended"):
         """Terminate downstream subscriptions (§11.4.1): FIN any open
@@ -545,6 +563,8 @@ class _RelayedTrack:
 
     def on_object(self, msg, size, ts, group_id, subgroup_id):
         """Upstream delivery callback (sync) — hand off to the drain."""
+        if self._closed:
+            return
         self._objects_in += 1
         payload = bytes(msg.payload)
         self._bytes_in += len(payload)
@@ -587,7 +607,7 @@ class _RelayedTrack:
     def _ensure_drain(self) -> None:
         """Drain from the first object, subscribers or not; objects for a
         subscriber still attaching wait for it."""
-        if self._finished or self.attaching:
+        if self._finished or self._closed or self.attaching:
             return
         if self.task is None or self.task.done():
             self.task = asyncio.create_task(self._forward_loop())
@@ -867,8 +887,9 @@ def _watch_session(session, ns=None) -> None:
             _sessions.pop(id(session), None)
             _forget_session(session)
             logger.debug("relay: session closed, state released")
+            _background.discard(asyncio.current_task())
 
-    asyncio.create_task(_reap())
+    _background.add(asyncio.create_task(_reap()))
 
 
 def _peer_address(session):
@@ -910,8 +931,8 @@ async def _log_peer(session, info) -> None:
 
 
 def _supersede_namespace(ns: tuple, session) -> None:
-    """A publisher arriving for a namespace replaces any track cached
-    against a different session.
+    """A publisher arriving for a namespace replaces tracks cached against
+    a session that has gone.
 
     Session close is not a usable trigger on its own: a client that
     reconnects promptly announces again before its previous session has
@@ -924,7 +945,9 @@ def _supersede_namespace(ns: tuple, session) -> None:
             continue
         owner = _upstream_session(track) or (
             track.pending_publish[0] if track.pending_publish else None)
-        if owner is not None and owner is not session:
+        # A live owner is another publisher in the same namespace.
+        if (owner is not None and owner is not session
+                and not _session_live(owner)):
             logger.info(f"relay: superseding track {key} for a new publisher")
             track.close()
             _tracks.pop(key, None)
@@ -1405,6 +1428,7 @@ def _answer_publish(track, forward=None) -> None:
     session._track_aliases[msg.track_alias] = msg.request_id
     session.register_object_handler(msg.track_alias, track.on_object)
     session.register_stream_end_handler(msg.track_alias, track.on_stream_end)
+    track.publish_alias = msg.track_alias
     if getattr(msg, "content_exists", 0):
         track.note_largest((msg.largest_group_id, msg.largest_object_id))
     # From d20 PUBLISH_OK carries only EXPIRES and Forward State follows
@@ -1683,6 +1707,14 @@ def _find_default_key(cert_path):
     return None
 
 
+def transport_settings(args) -> dict:
+    """MOQTServer transport settings from the relay's flags."""
+    return {"congestion_control_algorithm": args.cc_algo,
+            "max_connections": args.max_connections,
+            "stream_ring_cap": args.stream_ring_cap,
+            "tx_max_inflight_bytes": args.max_inflight_bytes}
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="MoQT interop-runner relay (control-plane only)",
@@ -1741,6 +1773,21 @@ def parse_args():
                              f"{LOG_FILE_BYTES >> 20} MB x {LOG_FILE_BACKUPS}) "
                              "and send crash and stall dumps to "
                              "DIR/crash.log. Off by default.")
+    parser.add_argument("--cc-algo", type=str, default="bbr",
+                        help="Congestion control (bbr | bbr1 | newreno | "
+                             "cubic | dcubic | prague | fast). Default: bbr")
+    parser.add_argument("--max-connections", type=int, default=4096,
+                        help="Most connections held at once (aiopquic "
+                             ">= 0.5.1). Default: 4096")
+    parser.add_argument("--stream-ring-cap", type=int, default=1 << 20,
+                        metavar="BYTES",
+                        help="Per-stream send buffer, allocated whole for "
+                             "each open stream; must exceed the largest "
+                             "object. Default: 1 MiB")
+    parser.add_argument("--max-inflight-bytes", type=int, default=512 << 10,
+                        metavar="BYTES",
+                        help="Per-stream send budget, below "
+                             "--stream-ring-cap. Default: 512 KiB")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug logging")
     return parser.parse_args()
@@ -2149,14 +2196,16 @@ def _answered(handler):
     return _wrapped
 
 
-def _build_server(bind, port, cert, key, use_quic, draft):
-    """Construct a MOQTServer with the relay's control-plane handlers."""
+def _build_server(bind, port, cert, key, use_quic, draft, **transport):
+    """Construct a MOQTServer with the relay's control-plane handlers.
+    `transport` passes MOQTServer transport settings through."""
     server = MOQTServer(
         host=bind, port=port,
         certificate=cert, private_key=key,
         path="/",
         use_quic=use_quic,
         supported_drafts=draft,
+        **transport,
     )
     server.register_handler(
         MOQTMessageType.PUBLISH_NAMESPACE, _answered(_on_publish_namespace))
@@ -2922,9 +2971,15 @@ async def main():
               "serves both transports)", file=sys.stderr)
         sys.exit(2)
 
+    if not 0 < args.max_inflight_bytes < args.stream_ring_cap:
+        print("Error: --max-inflight-bytes must be above 0 and below "
+              "--stream-ring-cap", file=sys.stderr)
+        sys.exit(2)
+    transport = transport_settings(args)
+
     # Primary listener: WebTransport unless --quic; both with --dual.
     listeners = [(_build_server(args.bind, args.port, cert, key,
-                                args.quic, args.draft),
+                                args.quic, args.draft, **transport),
                   args.port,
                   "dual raw QUIC + H3/WebTransport" if args.dual
                   else ("raw QUIC" if args.quic else "H3/WebTransport"))]
@@ -2940,7 +2995,7 @@ async def main():
             sys.exit(2)
         listeners.append(
             (_build_server(args.bind, args.quic_port, cert, key,
-                           True, args.draft),
+                           True, args.draft, **transport),
              args.quic_port, "raw QUIC"))
 
     handles = [await (server.serve_dual() if args.dual else server.serve())
