@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Requires aiopquic >= 0.5.2 (a lost RX wake stalled servers under load).
+
 ## v0.12.0
 
 - Relay: a subscriber whose session closes under a write is dropped; forwarding for the track no longer stops, which left later subscribers with nothing and the queue growing without bound.
