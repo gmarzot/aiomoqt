@@ -4173,11 +4173,24 @@ class _MOQTSessionMixin:
         forward: Optional[int] = None,
         parameters: Optional[Dict[int, Any]] = None,
         wait_response: bool = False,
+        *,
+        start: Optional[Tuple[int, int]] = None,
+        end_group: Optional[int] = None,
+        priority: Optional[int] = None,
     ):
         """REQUEST_UPDATE (§10.9; SUBSCRIBE_UPDATE 0x02 at d16): change
         the parameters of an outstanding request. d18 sends it on that
         request's own stream and its REQUEST_OK/ERROR comes back there;
-        d16 uses the control stream with the Existing Request ID."""
+        d16 uses the control stream with the Existing Request ID.
+
+        d14 sends SUBSCRIBE_UPDATE, which has no reply. Its Start Location,
+        End Group and Subscriber Priority are `start`, `end_group` and
+        `priority`, else taken from our SUBSCRIBE for that request; with
+        neither, ValueError."""
+        if self._profile.update_has_location:
+            return self._subscribe_update(existing_request_id, forward,
+                                          parameters, start, end_group,
+                                          priority)
         params = dict(parameters or {})
         if forward is not None:
             params[ParamType.FORWARD] = int(forward)
@@ -4218,6 +4231,58 @@ class _MOQTSessionMixin:
         if not wait_response:
             return message
         return self._await_response(request_id)
+
+    def _subscribe_update(self, existing_request_id: int,
+                          forward: Optional[int],
+                          parameters: Optional[Dict[int, Any]],
+                          start: Optional[Tuple[int, int]],
+                          end_group: Optional[int],
+                          priority: Optional[int]) -> SubscribeUpdate:
+        """d14 SUBSCRIBE_UPDATE (§9.10). Omitted fields keep what our
+        SUBSCRIBE for the request set: a Start Location never decreases."""
+        msgs = self._subscriptions.get(existing_request_id, ())
+        sub = next((m for m in msgs if isinstance(m, Subscribe)), None)
+        if sub is None and start is None:
+            raise ValueError(
+                f"SUBSCRIBE_UPDATE for request {existing_request_id} needs "
+                f"start=: this session sent no SUBSCRIBE for it")
+        if start is None:
+            ok = next((m for m in msgs if isinstance(m, SubscribeOk)), None)
+            start = self._filter_start(sub, ok)
+        if end_group is None:
+            end_group = (sub.end_group + 1 if sub is not None
+                         and sub.filter_type == FilterType.ABSOLUTE_RANGE
+                         else 0)
+        if priority is None:
+            priority = (sub.priority if sub is not None
+                        and sub.priority is not None else 128)
+        if forward is None:
+            forward = 1 if sub is None or sub.forward is None else sub.forward
+        params = {k: v for k, v in (parameters or {}).items()
+                  if k != ParamType.FORWARD}
+        message = SubscribeUpdate(
+            request_id=self._allocate_request_id(opener=False),
+            subscription_request_id=existing_request_id,
+            start_group=start[0], start_object=start[1],
+            end_group=end_group, priority=priority, forward=int(forward),
+            parameters=params)
+        logger.info(f"MOQT send: {self._msgstr(message)}")
+        self.send_control_message(message)
+        return message
+
+    @staticmethod
+    def _filter_start(sub: Subscribe,
+                      ok: Optional[SubscribeOk]) -> Tuple[int, int]:
+        """The Start Location a d14 SUBSCRIBE's filter resolved to
+        (§5.1.2): Largest Object comes from SUBSCRIBE_OK."""
+        if sub.filter_type in (FilterType.ABSOLUTE_START,
+                               FilterType.ABSOLUTE_RANGE):
+            return (sub.start_group or 0, sub.start_object or 0)
+        if ok is None or ok.largest_group_id is None:
+            return (0, 0)
+        if sub.filter_type == FilterType.NEXT_GROUP_START:
+            return (ok.largest_group_id + 1, 0)
+        return (ok.largest_group_id, (ok.largest_object_id or 0) + 1)
 
     def publish_ok(
         self,
