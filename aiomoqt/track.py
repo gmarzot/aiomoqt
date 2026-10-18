@@ -1449,6 +1449,9 @@ class PublishedTrack(Track):
             self._tasks.add(task)
             return
 
+        # Subgroups advance groups together; the slowest sets the pace.
+        barrier = (asyncio.Barrier(self.num_subgroups)
+                   if self.num_subgroups > 1 else None)
         for subgroup_id in range(self.num_subgroups):
             # §7: lower value = higher priority. Siblings ride one step
             # BELOW subgroup 0 (0 would be the highest priority there is).
@@ -1462,6 +1465,7 @@ class PublishedTrack(Track):
                     priority=priority,
                     pad=pad,
                     first_group=first_group,
+                    barrier=barrier,
                 )
             )
             task.add_done_callback(lambda t: self._tasks.discard(t))
@@ -1575,7 +1579,8 @@ class PublishedTrack(Track):
     async def _generate_subgroup(self, session, subgroup_id: int,
                                   track_alias: int, priority: int,
                                   pad: bytes, first_group: int = 0,
-                                  report_interval: float = 5.0):
+                                  report_interval: float = 5.0,
+                                  barrier: Optional[asyncio.Barrier] = None):
         """Generate a single subgroup stream."""
         start_time = time.monotonic()
         last_report = start_time
@@ -1596,9 +1601,10 @@ class PublishedTrack(Track):
         try:
             while True:
                 if sender.header is None or cur_obj_id >= self.group_size:
+                    if barrier is not None and group_id >= first_group:
+                        await barrier.wait()
                     group_id += 1
-                    # group_id is shared across subgroups in lockstep;
-                    # only subgroup 0 counts so totals match the sub side.
+                    # Only subgroup 0 counts so totals match the sub side.
                     if subgroup_id == 0:
                         self._total_groups += 1
                         self._iv_groups += 1
@@ -1674,7 +1680,7 @@ class PublishedTrack(Track):
                 # No explicit yield in the r=0 path: stream_write_drain
                 # handles pressure-based GIL release internally.
 
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, asyncio.BrokenBarrierError) as e:
             # Sender cancelled mid-subgroup → spec wants a RESET so the
             # subscriber sees a definitive end (not silent stall).
             sender.reset()
@@ -1688,7 +1694,11 @@ class PublishedTrack(Track):
                       f"{fmt_bps(bps)} ({dur:.1f}s)")
             logger.info(f"Track: subgroup {subgroup_id} "
                         f"sent {local_sent} objects")
-            raise
+            if isinstance(e, asyncio.CancelledError):
+                raise
+        finally:
+            if barrier is not None:
+                await barrier.abort()
 
     async def wait_for_subscribers(self, timeout: float = None):
         """Wait until at least one subscriber arrives."""
@@ -2040,7 +2050,8 @@ class VideoTrack(PublishedTrack):
     async def _generate_subgroup(self, session, subgroup_id: int,
                                   track_alias: int, priority: int,
                                   pad: bytes, first_group: int = 0,
-                                  report_interval: float = 5.0):
+                                  report_interval: float = 5.0,
+                                  barrier: Optional[asyncio.Barrier] = None):
         """Generate video frames with variable I/B/P sizes."""
         start_time = time.monotonic()
         last_report = start_time
@@ -2064,6 +2075,8 @@ class VideoTrack(PublishedTrack):
         try:
             while True:
                 if sender.header is None or cur_obj_id >= self.group_size:
+                    if barrier is not None and group_id >= first_group:
+                        await barrier.wait()
                     group_id += 1
                     self._total_groups += 1
                     self._iv_groups += 1
@@ -2142,7 +2155,7 @@ class VideoTrack(PublishedTrack):
                 # No explicit yield in the r=0 path: stream_write_drain
                 # handles pressure-based GIL release internally.
 
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, asyncio.BrokenBarrierError) as e:
             sender.reset()
             dur = time.monotonic() - start_time
             if dur > 0 and report:
@@ -2154,4 +2167,8 @@ class VideoTrack(PublishedTrack):
                       f"{fmt_bps(bps)} ({dur:.1f}s)")
             logger.info(f"VideoTrack: subgroup {subgroup_id} "
                         f"sent {local_sent} objects")
-            raise
+            if isinstance(e, asyncio.CancelledError):
+                raise
+        finally:
+            if barrier is not None:
+                await barrier.abort()

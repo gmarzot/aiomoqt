@@ -47,7 +47,8 @@ class BenchReporter:
 
     def __init__(self, report_interval: float = 5.0,
                  minimal: bool = False):
-        self.stats = TrackStats(windowed=False, minimal=minimal)
+        self.stats = TrackStats(windowed=False, minimal=minimal,
+                                group_loss=True)
         self.report_interval = report_interval
         self._last_report = 0.0
         self._header_printed = False
