@@ -11,6 +11,8 @@ services:
     network_mode: host
     restart: unless-stopped
     mem_limit: 2g
+    # Off CPU 0, which takes the NIC interrupts (host/relay-irq-affinity.service).
+    cpuset: "1,2"
     # Core files land in ./cores; see README.md for the host's core_pattern.
     ulimits: {core: -1}
     environment:
@@ -61,15 +63,21 @@ services:
     network_mode: none
     # Every 5 minutes, from the current and rotated logs: visitors without
     # crawlers, and crawlers alone. Each report replaces the old one whole.
+    # BusyBox zcat -f does not pass plain files through, so only .gz is zcat'd.
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
+        logs() {
+          for f in /logs/access.log*; do
+            case "$$f" in *.gz) zcat "$$f" ;; *) cat "$$f" ;; esac
+          done 2>/dev/null
+        }
         while :; do
-          zcat -f /logs/access.log* 2>/dev/null | goaccess - --log-format=COMBINED \
+          logs | goaccess - --log-format=COMBINED \
             --no-global-config --ignore-crawlers \
             --html-report-title="MoQ Ersatz Relay visitors" -o /report/new.html \
             && mv /report/new.html /report/index.html
-          zcat -f /logs/access.log* 2>/dev/null | goaccess - --log-format=COMBINED \
+          logs | goaccess - --log-format=COMBINED \
             --no-global-config --crawlers-only \
             --html-report-title="MoQ Ersatz Relay crawlers" -o /report/new-crawlers.html \
             && mv /report/new-crawlers.html /report/crawlers.html

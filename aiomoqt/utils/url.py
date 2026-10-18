@@ -106,7 +106,9 @@ def parse_relay_url(url: str, force_quic: bool = False,
         raise ValueError(f"{url}: empty host")
 
     if scheme == "moqt":
-        query = f"?{parsed.query}" if parsed.query else ""
+        # An empty query ("/moq?") is still present (§9.1.2).
+        query = (f"?{parsed.query}"
+                 if parsed.query or "?" in url.split("#", 1)[0] else "")
         return MOQTRelay(
             host=parsed.hostname,
             port=parsed.port or MOQT_DEFAULT_PORT,

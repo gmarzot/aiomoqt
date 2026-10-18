@@ -185,6 +185,19 @@ async def test_a_body_short_of_its_length_closes_the_session(draft):
     assert "short of its Length" in s._closed[0][1]
 
 
+async def test_a_message_that_fails_to_parse_is_logged_in_hex(caplog):
+    s = _control_session(18)
+    wire = bytearray(RequestError(
+        request_id=7, error_code=0x10, retry_interval=0,
+        reason="gone").serialize(prof=s._profile).data)
+    declared = int.from_bytes(wire[1:3], "big")
+    wire[1:3] = (declared + 1).to_bytes(2, "big")
+    wire += b"\x00"
+    _feed_reply(s, bytes(wire))
+    assert s._closed
+    assert f"head_hex={bytes(wire).hex()}" in caplog.text
+
+
 @pytest.mark.parametrize("draft", [14, 16, 18])
 async def test_two_messages_one_event(draft):
     s = _control_session(draft)
@@ -265,6 +278,19 @@ async def test_fin_with_truncated_message_pops_chain():
     wire = _ok_wire(s)
     s._on_control_data(5, wire[:2], True)          # header only + FIN
     assert 5 not in s._control_chains              # released, not pinned
+
+
+@pytest.mark.parametrize("draft, closes", [(18, False), (20, True),
+                                            (22, True)])
+async def test_request_stream_fin_with_truncated_message(draft, closes):
+    # d20+: a request stream FIN'd mid-message closes the session.
+    s = _control_session(draft)
+    s._bidi_stream_requests[4] = None
+    frame = _subscribe_frame(s, 1)
+    s._on_control_data(4, frame[:-1], True, is_request_bidi=True)
+    assert 4 not in s._control_chains
+    assert [code for code, _ in s._closed] == (
+        [SessionCloseCode.PROTOCOL_VIOLATION] if closes else [])
 
 
 async def test_parse_exception_contained_not_escaped():

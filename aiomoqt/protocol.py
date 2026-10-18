@@ -2371,6 +2371,12 @@ class _MOQTSessionMixin:
                         self._close_session(
                             SessionCloseCode.PROTOCOL_VIOLATION,
                             "control stream FIN with truncated message")
+                    elif (is_request_bidi
+                          and self._profile.truncated_request_closes):
+                        self._close_session(
+                            SessionCloseCode.PROTOCOL_VIOLATION,
+                            f"request stream {stream_id} FIN with "
+                            f"truncated message")
                 return
             except Exception as e:
                 # Containment (data-plane _drain_stream parity): a parse
@@ -2389,7 +2395,9 @@ class _MOQTSessionMixin:
             if msg is None:
                 error = (f"control stream({stream_id}): parse failed at "
                          f"{chain.tell()} of {chain.capacity} bytes")
-                logger.error(f"MOQT error: {error}")
+                logger.error(
+                    f"MOQT error: {error} head_hex="
+                    f"{chain.data_slice(0, min(64, chain.capacity)).hex()}")
                 self._close_session(
                     SessionCloseCode.PROTOCOL_VIOLATION, error)
                 return
@@ -2465,8 +2473,9 @@ class _MOQTSessionMixin:
                         f"FIN after STOP_SENDING (stream {stream_id})")
             held = self._peer_requests.get(
                 self._bidi_stream_requests.get(stream_id))
-            if held is not None and held[0] in (SubscribeNamespace,
-                                                 SubscribeTracks):
+            if (held is not None
+                    and self._profile.request_fin_cancels_discovery
+                    and held[0] in (SubscribeNamespace, SubscribeTracks)):
                 # §6.1: a FIN cancels these. Free the prefix now; close the
                 # stream a loop turn later, after replies already due.
                 request_id = self._bidi_stream_requests.pop(stream_id)
@@ -4913,6 +4922,7 @@ class _MOQTSessionMixin:
     ) -> Optional[MOQTMessage]:
         """PublishNamespace track namespace availability."""
         namespace_tuple = self._make_namespace_tuple(namespace)
+        self._check_sendable_namespace(namespace_tuple)
         request_id = self._allocate_request_id()
         message = PublishNamespace(
             request_id=request_id,
@@ -4932,6 +4942,16 @@ class _MOQTSessionMixin:
             return message
 
         return self._await_response(request_id)
+
+    def _check_sendable_namespace(self, namespace: Tuple[bytes, ...]) -> None:
+        """Raise ValueError for a reserved namespace (first field starting
+        with "."; d18 §2.4.1, d22 §2.4.3 and §6.5)."""
+        prof = getattr(self, '_profile', None)
+        if (prof is not None and prof.reserved_period_namespaces
+                and namespace and namespace[0].startswith(b".")):
+            raise ValueError(
+                f"namespace {namespace[0].decode(errors='replace')!r}/...: "
+                f"a first field starting with '.' is reserved")
 
     def is_announced(self, namespace: Union[str, Tuple[str, ...]]) -> bool:
         """True while a PUBLISH_NAMESPACE we sent for `namespace` is
@@ -4985,6 +5005,7 @@ class _MOQTSessionMixin:
         FORWARD (1 when absent) overriding `forward` (§10.20.1).
         """
         namespace_tuple = self._make_namespace_tuple(namespace)
+        self._check_sendable_namespace(namespace_tuple)
         carried = (self._subscribe_tracks_carry(namespace_tuple)
                    if self._subscribe_tracks_params else None)
         if carried is not None:

@@ -113,3 +113,83 @@ async def test_malformed_upstream_ends_downstream_and_drops_the_fanout():
     finally:
         loop_task.cancel()
         _tracks.pop(key, None)
+
+
+@pytest.mark.parametrize("draft", [14, 16, 18, 22])
+@pytest.mark.parametrize("exts", [None, {0x10: 7}, {0x10: 7, 0x0B: b"ab"}])
+def test_fast_object_encoding_matches_next_object(draft, exts):
+    # The relay forwards with next_object_bytes; it must equal next_object.
+    from aiomoqt.messages import SubgroupHeader
+    prof = profile_for(draft)
+    slow, fast = (SubgroupHeader(track_alias=1, group_id=3, subgroup_id=0,
+                                 publisher_priority=128,
+                                 extensions_present=True, prof=prof)
+                  for _ in range(2))
+    for oid in (0, 1, 4):
+        a = slow.next_object(payload=b"p" * oid, extensions=exts,
+                             object_id=oid).data
+        b = fast.next_object_bytes(payload=b"p" * oid, extensions=exts,
+                                   object_id=oid)
+        assert bytes(a) == bytes(b), (draft, exts, oid)
+
+
+class _Capturing(_Downstream):
+    """Records the bytes written to each stream."""
+
+    def __init__(self):
+        super().__init__()
+        self.data = {}
+
+    def stream_write(self, sid, data, end_stream=False):
+        self.data.setdefault(sid, bytearray()).extend(data)
+        super().stream_write(sid, data, end_stream)
+
+    async def stream_write_drain(self, sid, data):
+        self.data.setdefault(sid, bytearray()).extend(data)
+        await super().stream_write_drain(sid, data)
+
+
+@pytest.mark.asyncio
+async def test_each_object_is_encoded_once_per_stream_state(monkeypatch):
+    # Three subscribers in step share one encoding per object; one joining
+    # mid-group starts from another state and costs one more, once.
+    from aiomoqt.messages import SubgroupHeader
+    calls = []
+    real = SubgroupHeader.next_object_bytes
+
+    def counting(self, *args, **kwargs):
+        calls.append(kwargs.get("object_id"))
+        return real(self, *args, **kwargs)
+    monkeypatch.setattr(SubgroupHeader, "next_object_bytes", counting)
+
+    track = _RelayedTrack(("ns", "t"))
+    early = [_Capturing() for _ in range(3)]
+    for alias, down in enumerate(early, start=1):
+        track.add_downstream(down, alias, alias)
+    try:
+        for oid in range(2):
+            track.on_object(_Obj(group_id=0, object_id=oid), 0, 0, 0, 0)
+        for _ in range(20):
+            await asyncio.sleep(0)
+        late = _Capturing()
+        track.add_downstream(late, 9, 9)
+        for oid in range(2, 4):
+            track.on_object(_Obj(group_id=0, object_id=oid), 0, 0, 0, 0)
+        for _ in range(20):
+            await asyncio.sleep(0)
+    finally:
+        track.task.cancel()
+
+    assert calls == [0, 1, 2, 2, 3], calls
+    # Every subscriber's stream carries exactly what its own header would
+    # have encoded.
+    for down, oids in [*((d, range(4)) for d in early), (late, range(2, 4))]:
+        (sid,) = down.data
+        header = SubgroupHeader(track_alias=0, group_id=0, subgroup_id=0,
+                                publisher_priority=128,
+                                extensions_present=True,
+                                prof=down._profile)
+        objects = b"".join(header.next_object_bytes(payload=b"x" * 8,
+                                                    object_id=oid)
+                           for oid in oids)
+        assert bytes(down.data[sid]).endswith(objects)

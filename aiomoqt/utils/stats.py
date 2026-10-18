@@ -175,6 +175,12 @@ class TrackStats:
     arrive with object_id skipping by N, so the stride is learned per
     (group, subgroup) rather than assumed to be 1. Datagrams have no
     subgroup, so they key on group alone.
+
+    group_loss=True also counts objects missing from whole groups, which
+    in-stream gaps cannot see (a lost subgroup, a stream's head or tail).
+    It assumes a fixed group size, learned as the largest object id + 1.
+    A group is settled once a group two ahead arrives; the first group
+    (joined mid-way) and the newest two are never settled.
     """
 
     def __init__(self, window_s: float = 5.0,
@@ -182,7 +188,8 @@ class TrackStats:
                  iv_reservoir: int = 16384,
                  windowed: bool = True,
                  minimal: bool = False,
-                 latency_every: int = 1):
+                 latency_every: int = 1,
+                 group_loss: bool = False):
         # windowed=False skips the rolling-window upkeep that only
         # snapshot() reads — table-printing consumers (interval_row /
         # summary) never touch it, and this runs per object on the
@@ -253,6 +260,17 @@ class TrackStats:
         self._lk_s = None
         self._lk_prev = None
         self._lk_stride = None
+
+        # Whole-group loss: objects received per open group, gap losses
+        # already counted per group, and the shortfall of settled groups
+        # so a late arrival reverses it.
+        self._grp_rx: Optional[dict] = {} if group_loss else None
+        self._grp_gap: dict = {}
+        self._grp_short: dict = {}
+        self._grp_size = 0
+        self._grp_first = None
+        self._grp_max = -1
+        self._grp_floor = -1
 
         # Interval + snapshot deltas
         self._iv_objects = 0
@@ -354,6 +372,13 @@ class TrackStats:
             self._saw_datagram = True
         sg = (getattr(msg, 'subgroup_id', None)
               if subgroup_id is None else subgroup_id) if has_sg else None
+        grp_rx = self._grp_rx
+        if grp_rx is not None:
+            n = grp_rx.get(gid)
+            if n is not None and oid < self._grp_size:
+                grp_rx[gid] = n + 1
+            else:
+                self._group_object(gid, oid, sg)
         if gid == self._lk_g and sg == self._lk_s:
             prev = self._lk_prev
         else:
@@ -370,7 +395,10 @@ class TrackStats:
             stride = self._lk_stride = oid - prev
         if stride and stride > 0:
             if oid > prev + stride:
-                self.total_lost += (oid - prev - stride) // stride
+                lost = (oid - prev - stride) // stride
+                self.total_lost += lost
+                if grp_rx is not None:
+                    self._grp_gap[gid] = self._grp_gap.get(gid, 0) + lost
                 self._note_missing(prev + stride, oid, stride)
             elif oid < prev:
                 self.total_ooo += 1
@@ -378,6 +406,50 @@ class TrackStats:
         self._lk_prev = oid if oid > prev else prev
 
     _MISSING_CAP = 65536
+    _SETTLED_CAP = 1024
+
+    def _group_object(self, gid: int, oid: int, sg) -> None:
+        """Whole-group accounting off the fast path: a new group, a
+        larger object id, or a late arrival in a settled group."""
+        if oid >= self._grp_size:
+            self._grp_size = oid + 1
+        grp_rx = self._grp_rx
+        n = grp_rx.get(gid)
+        if n is not None:
+            grp_rx[gid] = n + 1
+            return
+        short = self._grp_short.get(gid)
+        if short is not None:
+            in_gap = oid in self._missing.get(
+                (gid, sg if sg is not None else 0), ())
+            if short > 0 and not in_gap:
+                self._grp_short[gid] = short - 1
+                self.total_lost -= 1
+            return
+        if gid <= self._grp_floor:
+            return
+        if self._grp_first is None:
+            self._grp_first = gid
+        elif gid < self._grp_first:
+            return
+        grp_rx[gid] = 1
+        if gid > self._grp_max:
+            self._grp_max = gid
+            for g in [g for g in grp_rx if g <= gid - 2]:
+                self._settle_group(g)
+
+    def _settle_group(self, gid: int) -> None:
+        n = self._grp_rx.pop(gid)
+        gap = self._grp_gap.pop(gid, 0)
+        short = (0 if gid == self._grp_first
+                 else max(0, self._grp_size - n - gap))
+        self.total_lost += short
+        settled = self._grp_short
+        settled[gid] = short
+        while len(settled) > self._SETTLED_CAP:
+            settled.pop(next(iter(settled)))
+        if gid > self._grp_floor:
+            self._grp_floor = gid
 
     def _live_key(self) -> tuple:
         return (self._lk_g, self._lk_s if self._lk_s is not None else 0)
@@ -402,6 +474,9 @@ class TrackStats:
             ms.discard(oid)
             self._missing_n -= 1
             self.total_lost -= 1
+            gid = self._lk_g
+            if gid in self._grp_gap:
+                self._grp_gap[gid] -= 1
 
     def _flush_key(self) -> None:
         """Write the cached subgroup state back to the dicts."""

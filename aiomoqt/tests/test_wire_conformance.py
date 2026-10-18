@@ -1184,27 +1184,64 @@ def _unparams(raw, draft, scope=None):
         scope=scope)
 
 
-def test_fill_parameters_is_a_counted_nested_block():
-    # moq-dev's current-group join: count 1, LOCATION_FILTER StartGroup=1.
-    raw = _params({0x23: {0x21: LocationFilter.relative(1)}}, 20)
-    assert raw == bytes.fromhex("01" "23" "04" "01210101")
-    assert _unparams(raw, 20) == {0x23: {0x21: LocationFilter.relative(1)}}
-    # d22 nests the typed filter.
-    raw22 = _params({0x23: {0x21: LocationFilter.relative(1)}}, 22)
-    assert raw22 == bytes.fromhex("01" "23" "04" "01210101")
-    raw22 = _params({0x23: {0x21: LocationFilter.next_object()}}, 22)
-    assert raw22 == bytes.fromhex("01" "23" "03" "012105")
+_NO_SUBGROUP_FILTER = RangeFilter(set_id=None)
+
+
+@pytest.mark.parametrize("draft", [20, 22])
+@pytest.mark.parametrize("params, raw", [
+    ({0x23: {0x0A: 5}}, "01" "23" "01" "0a05"),
+    ({0x23: {0x21: LocationFilter.relative(1)}}, "01" "23" "01" "210101"),
+    ({0x23: {0x0A: 5, 0x21: LocationFilter.relative(1)},
+      0x25: [_NO_SUBGROUP_FILTER]},
+     "02" "23" "02" "0a05" "170101" "02" "00"),
+    ({0x23: {}}, "01" "23" "00"),
+], ids=["fill-only", "location-filter", "then-subgroup-filter", "empty"])
+def test_fill_parameters_is_count_prefixed(draft, params, raw):
+    # moq-transport PR #2015: Number of Parameters, then the Parameters,
+    # with no Length; LOCATION_FILTER inside keeps its own encoding.
+    assert _params(params, draft) == bytes.fromhex(raw)
+    assert _unparams(bytes.fromhex(raw), draft) == params
+
+
+def test_d22_fill_nests_the_typed_location_filter():
+    raw = _params({0x23: {0x21: LocationFilter.next_object()}}, 22)
+    assert raw == bytes.fromhex("01" "23" "01" "2105")
+    assert _unparams(raw, 22) == {0x23: {0x21: LocationFilter.next_object()}}
+
+
+@pytest.mark.parametrize("raw, fill", [
+    ("01" "23" "04" "01210101", {0x21: LocationFilter.relative(1)}),
+    ("01" "23" "03" "010a05", {0x0A: 5}),
+    ("01" "23" "01" "00", {}),
+], ids=["location-filter", "fill-timeout", "empty"])
+def test_length_prefixed_fill_parameters_is_still_read(raw, fill):
+    # The published d20/d22 spelling: Length, then a counted block.
+    assert _unparams(bytes.fromhex(raw), 20) == {0x23: fill}
 
 
 @pytest.mark.parametrize("raw, match", [
-    (bytes.fromhex("012305" "01210101"), "overruns|exceeds remaining"),
-    (bytes.fromhex("012305" "0121010100"), "does not fill"),
-    (bytes.fromhex("012303" "011001"), "not allowed in FillParameters"),
-    (bytes.fromhex("012300"), "no Number of Parameters"),
-], ids=["past-message", "short-of-length", "forward-inside", "empty"])
+    ("012305" "01210101", "unknown message parameter|exceeds remaining"),
+    ("012305" "0121010100", "does not fill its length"),
+    ("012303" "011001", "not allowed in FillParameters"),
+    ("0123" "02" "0a05", "exhausted"),
+    ("0123" "ffff", "out of bounds"),
+], ids=["past-message", "short-of-length", "forward-inside",
+        "count-beyond-bytes", "junk"])
 def test_malformed_fill_parameters_is_a_protocol_violation(raw, match):
     with pytest.raises(MOQTProtocolViolation, match=match):
-        _unparams(raw, 20)
+        _unparams(bytes.fromhex(raw), 20)
+
+
+@pytest.mark.parametrize("draft", [20, 22])
+@pytest.mark.parametrize("raw", ["0123" "01" "0301ff", "012304" "010301ff"],
+                         ids=["counted", "length-prefixed"])
+def test_forbidden_fill_parameter_closes_before_its_value_is_decoded(
+        draft, raw):
+    # AUTHORIZATION_TOKEN (0x03) with an undecodable value inside
+    # FILL_PARAMETERS: the scope check (Table 7) comes first.
+    with pytest.raises(MOQTProtocolViolation, match="not allowed in "
+                       "FillParameters"):
+        _unparams(bytes.fromhex(raw), draft)
 
 
 def test_namespace_prefix_parameter_d20_prefixed_d22_bare():

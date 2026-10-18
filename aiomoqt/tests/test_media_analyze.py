@@ -257,9 +257,10 @@ def test_adapter_reads_every_end_of_group_form():
     def frame(m):
         return LocFrame(b'x', False, T0 + m * MS)
     a.on_arrival('v', _obj(0), T0, 0, 0, frame(0))
-    # Stream header END_OF_GROUP bit: FIN ends group 0.
+    # Stream header END_OF_GROUP bit: the clean FIN ends group 0.
     a.on_arrival('v', _obj(1, flags=(False, True, False)), T0 + 1 * MS, 0,
                  0, frame(1))
+    a.on_stream_end('v', 0, 0, True, 0)
     a.on_arrival('v', _obj(0), T0 + 10 * MS, 1, 0, frame(10))
     # END_OF_GROUP status object.
     a.on_arrival('v', _obj(1, status=ObjectStatus.END_OF_GROUP),

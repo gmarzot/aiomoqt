@@ -230,11 +230,22 @@ class SubgroupHeader(MOQTMessage):
         data = encode(
             delta, extensions, status_int, payload,
             self.extensions_present, self._kvp_delta)
-        self._last_object_id = obj_id
+        self.advance(obj_id)
+        return data
+
+    def advance(self, object_id: int) -> None:
+        """Record `object_id` as written on this stream, as next_object does,
+        for bytes encoded elsewhere (one encoding shared by several streams
+        in the same state)."""
+        self._last_object_id = object_id
         if (self.subgroup_id_mode == SUBGROUP_ID_FIRST_OBJ
                 and self.subgroup_id is None):
-            self.subgroup_id = obj_id
-        return data
+            self.subgroup_id = object_id
+
+    def encoding_state(self) -> tuple:
+        """What next_object's bytes depend on besides the object itself."""
+        return (self._vi64, self._kvp_delta, self.extensions_present,
+                self._last_object_id)
 
     def end_group(self, extensions: Optional[Dict] = None,
                   object_id: Optional[int] = None) -> Buffer:

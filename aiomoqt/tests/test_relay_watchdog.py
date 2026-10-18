@@ -80,6 +80,34 @@ async def test_a_child_process_probe_passes_and_misses(use_quic):
                                            1.0)
 
 
+@requires_certs
+@pytest.mark.parametrize("mode", ["quic", "wt", "dual"])
+async def test_a_failed_probe_logs_transport_state_and_wakes_readers(
+        mode, caplog):
+    port = _BASE_PORT + 6 + ["quic", "wt", "dual"].index(mode)
+    server = relay._build_server("localhost", port, CERT, KEY,
+                                 use_quic=mode != "wt", draft=18)
+    handle = await (server.serve_dual() if mode == "dual"
+                    else server.serve())
+    try:
+        with caplog.at_level("WARNING"):
+            await relay._diagnose_probe_miss([handle])
+        lines = [r.getMessage() for r in caplog.records
+                 if "relay: watchdog:" in r.getMessage()]
+        assert len(lines) == 2, lines
+        assert "rx_notify_pending_now" in lines[0]
+        assert ("woke readers [True]" if sys.platform.startswith("linux")
+                else "woke readers [False]") in lines[1]
+        (counters,) = relay.transport_counters([handle])
+        assert set(counters) == set(relay.TRANSPORT_COUNTERS)
+        assert counters["loop_callbacks"] > 0
+        # A spurious wake costs one empty drain; the relay still relays.
+        assert await relay._self_probe("127.0.0.1", port, mode != "wt", 18,
+                                       5.0)
+    finally:
+        handle.close()
+
+
 async def test_the_watchdog_exits_after_consecutive_misses_only(
         monkeypatch):
     results = iter([False, False, True, False, False, False])
@@ -100,6 +128,7 @@ async def test_the_watchdog_exits_after_consecutive_misses_only(
 
     monkeypatch.setattr(relay, "_probe_in_child", _probe)
     monkeypatch.setattr(relay, "_heartbeat", _no_heartbeat)
+    monkeypatch.setattr(relay, "WATCHDOG_KICK_S", 0)
     monkeypatch.setattr(relay.os, "_exit", _exit)
     monkeypatch.setattr(relay.logging, "shutdown", lambda: None)
     with pytest.raises(_Exit) as exc:

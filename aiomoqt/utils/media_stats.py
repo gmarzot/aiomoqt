@@ -20,7 +20,7 @@ from typing import Dict, List, Optional, Tuple
 
 from ..media.cmaf import chunk_decode_time
 from ..types import ObjectStatus
-from .format import fmt_bps
+from .format import fmt_bps, fmt_ms, fmt_rate
 from .stats import LOC_TIMESCALE, _pct, _Reservoir
 
 DEFAULT_CUSHION_MS = 500
@@ -53,7 +53,7 @@ def _med(xs) -> Optional[float]:
 
 class _Group:
     __slots__ = ('seen', 'max_oid', 'holes', 'ended', 'eog_oid',
-                 'last_rx', 'joined', 'final')
+                 'last_rx', 'joined', 'final', 'fin_ends', 'truncated')
 
     def __init__(self, joined: bool, now: int):
         self.seen: set = set()
@@ -64,6 +64,8 @@ class _Group:
         self.last_rx = now
         self.joined = joined     # subscription began inside this group
         self.final = False
+        self.fin_ends = False    # a subgroup header says its FIN ends the group
+        self.truncated = False   # a subgroup stream of it was reset
 
 
 class TrackAnalysis:
@@ -73,7 +75,8 @@ class TrackAnalysis:
     reverses that loss."""
 
     _COUNTERS = ('objects', 'bytes', 'groups', 'lost', 'lost_groups',
-                 'reorders', 'dups', 'late', 'underruns', 'stall_us')
+                 'reorders', 'dups', 'late', 'underruns', 'stall_us',
+                 'resets')
 
     def __init__(self, name: str, role: Optional[str] = None,
                  timescale: Optional[int] = None, cmaf: bool = False,
@@ -97,7 +100,10 @@ class TrackAnalysis:
         self.late_reorders = 0
         self.lost_groups = 0
         self.partial_groups = 0
+        self.truncated_groups = 0
         self.missing_eog = 0
+        self.resets = 0
+        self.reset_codes: Dict[int, int] = {}
         self.pre_anchor = 0
         self.late = 0
         self.underruns = 0
@@ -118,6 +124,7 @@ class TrackAnalysis:
         self._prev_rm: Optional[Tuple[int, int]] = None
 
         self._lat = _Reservoir(10000)
+        self._lat_sum = 0.0
         self.lat_max: Optional[float] = None
         self._settle = _Reservoir(1000)
         self.settle_max: Optional[float] = None
@@ -151,9 +158,10 @@ class TrackAnalysis:
                 ends_group: bool = False, last_in_group: bool = False,
                 prior_gap: int = 0) -> None:
         """One media object. `ts` is in `timescale` units (None = µs).
-        ends_group: its stream's FIN ends the group (header bit);
-        last_in_group: it is the group's final object (datagram bit);
-        prior_gap: the Prior Group ID Gap property."""
+        ends_group: its stream's FIN ends the group (header bit), which
+        stream_end() confirms; last_in_group: it is the group's final
+        object (datagram bit); prior_gap: the Prior Group ID Gap
+        property."""
         self._tick(recv_us)
         if self.first_rx is None:
             self.first_rx = recv_us
@@ -165,9 +173,11 @@ class TrackAnalysis:
         self.objects += 1
         self.bytes += size
         g = self._groups.get(gid)
-        if g is not None and (ends_group or last_in_group):
-            g.ended = True
+        if g is not None:
+            if ends_group:
+                g.fin_ends = True
             if last_in_group:
+                g.ended = True
                 g.eog_oid = oid + 1
         if oid == 0:
             self._key_bytes += size
@@ -185,6 +195,7 @@ class TrackAnalysis:
         if self.wall:
             lat = (recv_us - m_us) / 1000
             self._lat.add(lat)
+            self._lat_sum += lat
             self._iv_lat.append(lat)
             self.lat_max = lat if self.lat_max is None else max(
                 self.lat_max, lat)
@@ -223,6 +234,20 @@ class TrackAnalysis:
         if eog_oid > 0:
             g.max_oid = max(g.max_oid if g.max_oid is not None else -1,
                             eog_oid - 1)
+
+    def stream_end(self, gid: int, clean: bool, reset_code: int) -> None:
+        """A subgroup stream ended: FIN when `clean`, else reset. A FIN
+        ends the group only if its header said so; a reset truncates the
+        subgroup at an unknown point."""
+        g = self._groups.get(gid)
+        if clean:
+            if g is not None and g.fin_ends:
+                g.ended = True
+            return
+        self.resets += 1
+        self.reset_codes[reset_code] = self.reset_codes.get(reset_code, 0) + 1
+        if g is not None:
+            g.truncated = True
 
     # -- continuity --------------------------------------------------
 
@@ -365,11 +390,13 @@ class TrackAnalysis:
             del self._gaps[gid]
 
     def _judge(self, g: _Group) -> None:
+        if g.truncated:
+            self.truncated_groups += 1
         if g.joined:
             return
-        if g.holes:
+        if g.holes or g.truncated:
             self.partial_groups += 1
-        if not g.ended:
+        if not g.ended and not g.truncated:
             self.missing_eog += 1
         n = (g.eog_oid if g.eog_oid is not None
              else (g.max_oid + 1 if g.max_oid is not None else 0))
@@ -437,19 +464,26 @@ class TrackAnalysis:
         lat, self._iv_lat = sorted(self._iv_lat), []
         buf, self._iv_buf = sorted(self._iv_buf), []
         dt_s = dt_s or 1e-9
+        expected = self.objects + self.lost
         return dict(
             track=self.name, objects=d['objects'],
+            objects_total=self.objects, groups_total=self.groups,
             obj_rate=d['objects'] / dt_s,
+            group_rate=d['groups'] / dt_s,
             bitrate_bps=d['bytes'] * 8 / dt_s,
+            lat_avg_ms=sum(lat) / len(lat) if lat else None,
+            lat_p99_ms=_pct(lat, 99) if lat else None,
             lat_p50_ms=_pct(lat, 50) if lat else None,
             lat_p95_ms=_pct(lat, 95) if lat else None,
             lat_max_ms=lat[-1] if lat else None,
             jitter_ms=(self.jitter_ms if self.timed and d['objects']
                        else None),
             lost=d['lost'], lost_groups=d['lost_groups'],
+            lost_total=self.lost, lost_groups_total=self.lost_groups,
+            loss_pct=100 * self.lost / expected if expected else 0.0,
             pending=self.pending, reorders=d['reorders'], dups=d['dups'],
             late=d['late'], underruns=d['underruns'],
-            stall_ms=d['stall_us'] / 1000,
+            stall_ms=d['stall_us'] / 1000, resets=d['resets'],
             buf_min_ms=buf[0] if buf else None,
             buf_p50_ms=_pct(buf, 50) if buf else None,
             groups=d['groups'])
@@ -459,8 +493,11 @@ class TrackAnalysis:
         self._finalize(now_us, force=True)
         active = ((self.last_rx - self.first_rx) / 1e6
                   if self.first_rx is not None else 0) or 1e-9
-        lat_p50, lat_p95 = (self._lat.percentiles(50, 95)
-                            if self._lat.items else (None, None))
+        lat_p50, lat_p95, lat_p99 = (self._lat.percentiles(50, 95, 99)
+                                     if self._lat.items
+                                     else (None, None, None))
+        n_lat = self._lat.seen
+        expected = self.objects + self.lost
         settle_p50, = (self._settle.percentiles(50)
                        if self._settle.items else (None,))
         buf_p50, = (self._buf.percentiles(50)
@@ -476,19 +513,27 @@ class TrackAnalysis:
             ratio = ((self._key_bytes / self._key_n)
                      / (self._p_bytes / self._p_n))
         return dict(
-            track=self.name, objects=self.objects,
+            track=self.name, objects=self.objects, active_s=active,
+            objects_total=self.objects, groups_total=self.groups,
             obj_rate=self.objects / active,
+            group_rate=self.groups / active,
             bitrate_bps=self.bytes * 8 / active,
-            lat_p50_ms=lat_p50, lat_p95_ms=lat_p95, lat_max_ms=self.lat_max,
+            lat_avg_ms=self._lat_sum / n_lat if n_lat else None,
+            lat_p50_ms=lat_p50, lat_p95_ms=lat_p95, lat_p99_ms=lat_p99,
+            lat_max_ms=self.lat_max,
             jitter_ms=self.jitter_ms if self.timed else None,
             jitter_max_ms=self.jitter_max_ms if self.timed else None,
             lost=self.lost, lost_groups=self.lost_groups,
+            lost_total=self.lost, lost_groups_total=self.lost_groups,
+            loss_pct=100 * self.lost / expected if expected else 0.0,
             pending=self.pending, reorders=self.reorders,
             late_reorders=self.late_reorders,
             settle_p50_ms=settle_p50, settle_max_ms=self.settle_max,
             dups=self.dups, groups=self.groups,
             partial_groups=self.partial_groups,
+            truncated_groups=self.truncated_groups,
             missing_eog=self.missing_eog,
+            resets=self.resets, reset_codes=dict(self.reset_codes),
             gop_p50=_med(gop) if gop else None,
             kf_int_ms=_med(kf) if multi and kf else None,
             kf_int_sd_ms=(statistics.pstdev(kf)
@@ -509,7 +554,7 @@ CSV_FIELDS = (
     'stall_ms', 'buf_min_ms', 'buf_p50_ms', 'groups', 'partial_groups',
     'missing_eog', 'settle_p50_ms', 'gop_p50', 'kf_int_ms', 'kf_int_sd_ms',
     'kf_int_min_ms', 'kf_int_max_ms', 'key_p_ratio', 'key_cost_ms',
-    'skew_ms',
+    'skew_ms', 'lat_avg_ms', 'lat_p99_ms', 'resets', 'truncated_groups',
 )
 
 
@@ -567,6 +612,14 @@ class MediaAnalysis:
                   ts, scale, ends_group=ends, last_in_group=last,
                   prior_gap=exts.get(PRIOR_GROUP_ID_GAP, 0) or 0)
 
+    def on_stream_end(self, name: str, group_id: int,
+                      subgroup_id: Optional[int], clean: bool,
+                      reset_code: int) -> None:
+        """A subgroup stream of track `name` ended (FIN when `clean`)."""
+        t = self.tracks.get(name)
+        if t is not None:
+            t.stream_end(group_id, clean, reset_code)
+
     def _pair(self) -> Tuple[Optional[TrackAnalysis],
                              Optional[TrackAnalysis]]:
         video = next((t for t in self.tracks.values()
@@ -613,61 +666,54 @@ class MediaAnalysis:
 
 # -- rendering ---------------------------------------------------------
 
-# One number per cell, times in ms: '-' is a zero count, blank is n/a.
-LEGEND = ("times in ms; '-' = none; blank = n/a. Latency includes any "
-          "clock offset between publisher and subscriber.")
-
-_IV_COLS = (('Obj/s', 6), ('Bitrate', 9), ('Lat50', 7), ('Lat95', 6),
-            ('LatMax', 7), ('Jitter', 7), ('BufMin', 8), ('Buf50', 6),
-            ('Lost', 7), ('Reord', 6), ('Dup', 5), ('Late', 5),
-            ('Under', 6), ('AVskew', 8))
-_SUM_COLS = (('Objects', 8), ('Groups', 7), ('GOP', 5), ('KeyInt', 7),
-             ('Key/P', 6), ('KeyCost', 8), ('Partial', 8), ('NoEOG', 6),
-             ('Settle', 7), ('Stall', 6), ('Cushion', 8), ('PreKey', 7))
+# Interval columns follow TrackStats (sub_bench, loopback_bench), then the
+# analysis-only ones. Grps, Objs and Loss are running totals; the rest
+# cover the interval.
+_IV_COLS = (('Grps', 7), ('GrpRate', 10), ('Objs', 10), ('ObjRate', 10),
+            ('Bitrate', 10), ('Latency', 21), ('Jitter', 9), ('Loss', 16),
+            ('Reord', 7), ('Late', 6), ('Stall', 7), ('Reset', 7),
+            ('AVskew', 8))
 
 
-def _n(v: Optional[float]) -> str:
-    """A measured value: one decimal below 10, blank when unavailable."""
+def _ms(v: Optional[float]) -> str:
+    """Signed time with fmt_ms units; '--' when unavailable."""
     if v is None:
-        return ''
-    a = abs(v)
-    s = f"{a:.1f}" if a < 10 else f"{a:.0f}"
-    if s == '0.0':
-        return '0'
-    return '-' + s if v < 0 else s
-
-
-def _c(v) -> str:
-    """A count: '-' when zero."""
-    return '-' if not v else _n(v) if isinstance(v, float) else str(v)
-
-
-def _cells(values, cols) -> str:
-    return ''.join(f"{v:>{w}}" for v, (_, w) in zip(values, cols)).rstrip()
+        return '--'
+    if abs(v) < 5e-5:
+        return '0ms'
+    return ('-' if v < 0 else '') + fmt_ms(abs(v))
 
 
 def _track_width(names) -> int:
     return max([5] + [len(n) for n in names]) + 2
 
 
+def _cells(values) -> str:
+    return ''.join(f"{v:<{w}}"
+                   for v, (_, w) in zip(values, _IV_COLS)).rstrip()
+
+
 def interval_header(names) -> str:
     """Column header for format_interval() rows of these tracks."""
     tw = _track_width(names)
     return (f"  {'Interval':<10}{'Track':<{tw}}"
-            + _cells([c for c, _ in _IV_COLS], _IV_COLS))
+            + _cells([c for c, _ in _IV_COLS]))
 
 
 def _iv_line(label: str, tw: int, r: dict) -> str:
-    g = r['lost_groups']
-    lost = f"{r['lost']}+{g}g" if g else _c(r['lost'])
+    lat = ('--' if r['lat_avg_ms'] is None
+           else f"{_ms(r['lat_avg_ms'])} p99:{_ms(r['lat_p99_ms'])}")
+    g = r['lost_groups_total']
+    loss = (f"{r['loss_pct']:.2f}% ({r['lost_total']}"
+            + (f"+{g}g" if g else '') + ")")
+    skew = r.get('skew_ms')
     values = (
-        _c(r['obj_rate']),
-        fmt_bps(r['bitrate_bps']) if r['bitrate_bps'] else '-',
-        _n(r['lat_p50_ms']), _n(r['lat_p95_ms']), _n(r['lat_max_ms']),
-        _n(r['jitter_ms']), _n(r['buf_min_ms']), _n(r['buf_p50_ms']),
-        lost, _c(r['reorders']), _c(r['dups']), _c(r['late']),
-        _c(r['underruns']), _n(r.get('skew_ms')))
-    return f"  {label:<10}{r['track']:<{tw}}" + _cells(values, _IV_COLS)
+        str(r['groups_total']), fmt_rate(r['group_rate']),
+        str(r['objects_total']), fmt_rate(r['obj_rate']),
+        fmt_bps(r['bitrate_bps']), lat, _ms(r['jitter_ms']), loss,
+        str(r['reorders']), str(r['late']), str(r['underruns']),
+        str(r['resets']), '' if skew is None else _ms(skew))
+    return f"  {label:<10}{r['track']:<{tw}}" + _cells(values)
 
 
 def format_interval(t0: float, t1: float, rows: List[dict]) -> List[str]:
@@ -678,47 +724,66 @@ def format_interval(t0: float, t1: float, rows: List[dict]) -> List[str]:
 
 
 def _notes(r: dict) -> List[str]:
-    name, out = r['track'], []
-    if not r['timed']:
-        out.append(f"{name}: no timestamps; latency, jitter and playout "
-                   f"not measured")
-    elif not r['wall']:
-        out.append(f"{name}: media-time timestamps; latency not measured")
+    out = []
     lo, hi, mid = r['kf_int_min_ms'], r['kf_int_max_ms'], r['kf_int_ms']
     if mid and (lo < 0.9 * mid or hi > 1.1 * mid):
-        out.append(f"{name}: keyframe interval ranged {_n(lo)}-{_n(hi)} ms")
-    if r['lost_groups']:
-        out.append(f"{name}: {r['lost_groups']} whole groups lost")
+        out.append(f"keyframe interval ranged {_ms(lo)}-{_ms(hi)}")
+    if r['reset_codes']:
+        codes = ', '.join(f"0x{c:x} x{n}" for c, n in
+                          sorted(r['reset_codes'].items()))
+        out.append(f"reset codes {codes}")
     if r['late_reorders']:
-        out.append(f"{name}: {r['late_reorders']} objects arrived after "
-                   f"the cushion; counted as reorders, not losses")
+        out.append(f"{r['late_reorders']} objects arrived after the "
+                   f"cushion; counted as reorders, not losses")
     if r['pending']:
-        out.append(f"{name}: {r['pending']} missing objects still pending "
-                   f"at the end")
+        out.append(f"{r['pending']} missing objects still pending at "
+                   f"the end")
+    return out
+
+
+def _track_summary(r: dict) -> List[str]:
+    out = [f"  {r['track']}  {r['active_s']:.1f}s  {r['objects']} objs  "
+           f"{r['groups']} grps  {fmt_bps(r['bitrate_bps'])}"]
+    if r['wall']:
+        out.append(f"    Latency:   p50={r['lat_p50_ms']:.1f}  "
+                   f"p95={r['lat_p95_ms']:.1f}  max={r['lat_max_ms']:.1f} ms")
+    elif r['timed']:
+        out.append("    Latency:   n/a (media-time timestamps)")
+    else:
+        out.append("    Latency:   n/a (no timestamps)")
+    out.append("    Jitter:    " + ('n/a' if r['jitter_ms'] is None
+                                    else f"{r['jitter_ms']:.1f} ms"))
+    lost = str(r['lost']) + (f" + {r['lost_groups']} groups"
+                             if r['lost_groups'] else '')
+    out.append(f"    Lost:      {lost} ({r['loss_pct']:.2f}%)   "
+               f"Reordered: {r['reorders']}   Duplicates: {r['dups']}")
+    grp = []
+    if r['kf_int_ms'] is not None:
+        grp += [f"GOP {r['gop_p50']:.0f}",
+                f"key interval {_ms(r['kf_int_ms'])}"]
+        if r['key_p_ratio'] is not None:
+            grp.append(f"key/P {r['key_p_ratio']:.1f}x")
+        if r['key_cost_ms'] is not None:
+            grp.append(f"key cost {_ms(r['key_cost_ms'])}")
+    grp += [f"partial {r['partial_groups']}", f"reset {r['resets']}",
+            f"no END_OF_GROUP {r['missing_eog']}"]
+    out.append("    Groups:    " + '  '.join(grp))
+    if r['timed']:
+        out.append(f"    Playout:   cushion {_ms(r['cushion_ms'])}  "
+                   f"late {r['late']}  stalls {r['underruns']} "
+                   f"({_ms(r['stall_ms'])})")
+    out += [f"    Note:      {n}" for n in _notes(r)]
     return out
 
 
 def format_summary(rows: List[dict], skew: dict) -> List[str]:
-    """Totals in the interval columns, then per-track group, keyframe
-    and playout detail, notes, and the legend."""
-    tw = _track_width(r['track'] for r in rows)
-    out = [_iv_line('total' if i == 0 else '', tw, r)
-           for i, r in enumerate(rows)]
-    out.append('')
-    out.append(f"  {'Track':<{tw}}" + _cells([c for c, _ in _SUM_COLS],
-                                              _SUM_COLS))
+    """Per-track result block, then A/V skew."""
+    out = []
     for r in rows:
-        ratio, gop = r['key_p_ratio'], r['gop_p50']
-        values = (
-            str(r['objects']), str(r['groups']),
-            '' if gop is None else f"{gop:.0f}",
-            _n(r['kf_int_ms']), f"{ratio:.1f}" if ratio else '',
-            _n(r['key_cost_ms']), _c(r['partial_groups']),
-            _c(r['missing_eog']), _n(r['settle_p50_ms']),
-            _c(r['stall_ms']), _n(r['cushion_ms']), _c(r['pre_anchor']))
-        out.append(f"  {r['track']:<{tw}}" + _cells(values, _SUM_COLS))
-    out += [f"  {line}" for r in rows for line in _notes(r)]
-    out.append(f"  {LEGEND}")
+        out += _track_summary(r)
+    if skew['n']:
+        out.append(f"  A/V skew:    p50 {_ms(skew['p50_ms'])}  "
+                   f"max {_ms(skew['max_ms'])}")
     return out
 
 

@@ -68,7 +68,8 @@ _D20_SWITCHES = dict(
     param_table=20, error_table=20, publish_ok_expires_only=True,
     publish_done_subscription_ended=False, goaway_request_id=False,
     fetch_location_filter=True, fetch_timed_out_range=True,
-    fetch_object_status=False,
+    fetch_object_status=False, truncated_request_closes=True,
+    request_fin_cancels_discovery=False, fill_parameters_counted=True,
     namespace_scoped=frozenset(
         {"SubscribeNamespace", "PublishNamespace", "SubscribeTracks"}))
 

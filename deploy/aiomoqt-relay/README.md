@@ -75,6 +75,32 @@ sudo iptables -I INPUT 5 -p udp --dport 4443 -j ACCEPT
 sudo netfilter-persistent save
 ```
 
+## Host tuning
+
+The relay's picoquic worker thread is the bottleneck under fan-out, mostly per-packet kernel work, so
+the host keeps other per-packet work off its cores:
+
+- **No connection tracking for the relay's port**, in the iptables `raw` table. The `INPUT` rule for
+  UDP 4443 still admits the untracked packets. `/etc/iptables/rules.v4` holds curated Docker chains,
+  so add the two rules to its `*raw` table by hand; `netfilter-persistent save` would capture
+  transient container rules.
+
+  ```sh
+  sudo iptables -t raw -I PREROUTING -p udp --dport 4443 -j NOTRACK
+  sudo iptables -t raw -I OUTPUT -p udp --sport 4443 -j NOTRACK
+  sudo sh -c 'iptables-restore --test < /etc/iptables/rules.v4'    # after editing the file
+  ```
+
+- **NIC interrupts on CPU 0, the relay on CPUs 1-2.** `host/relay-irq-affinity.sh` pins the NIC's
+  queue interrupts to CPU 0, and `host/relay-irq-affinity.service` runs it at boot (irqbalance is
+  off). The relay service has `cpuset: "1,2"`.
+
+  ```sh
+  sudo install -m 755 host/relay-irq-affinity.sh /usr/local/sbin/
+  sudo install -m 644 host/relay-irq-affinity.service /etc/systemd/system/
+  sudo systemctl daemon-reload && sudo systemctl enable --now relay-irq-affinity.service
+  ```
+
 ## Relay image
 
 The relay runs the newest aiomoqt (`gmarzot-0.12.0`) and aiopquic (`gmarzot-0.5.0`) code, built on
