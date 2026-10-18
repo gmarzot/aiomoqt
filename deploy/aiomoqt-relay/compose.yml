@@ -16,6 +16,8 @@ services:
     environment:
       PYTHONUNBUFFERED: "1"
       PYTHONFAULTHANDLER: "1"
+      # Stream buffers (1 MiB) are mmapped, so freed ones go back to the OS.
+      MALLOC_MMAP_THRESHOLD_: "1048576"
       MOQT_ROLE: relay
       MOQT_DUAL: "1"
       MOQT_PORT: "4443"
