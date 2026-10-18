@@ -117,6 +117,9 @@ class DraftProfile:
     track_properties: bool = True
                                   # PUBLISH, SUBSCRIBE_OK and FETCH_OK end
                                   # with Track Properties; d14 has none.
+    truncated_request_closes: bool = False
+                                  # d20+: a request stream FIN'd mid-message
+                                  # closes the session (FIN is not a cancel).
     update_has_location: bool = False
                                   # d14 SUBSCRIBE_UPDATE carries Start, End
                                   # Group, Priority and Forward as fields;
@@ -180,7 +183,8 @@ _D20 = replace(
     goaway_request_id=False,
     fetch_location_filter=True,
     fetch_timed_out_range=True,
-    fetch_object_status=False)
+    fetch_object_status=False,
+    truncated_request_closes=True)
 PROFILES[MOQTDraft.DRAFT_20] = _D20
 PROFILES[MOQTDraft.DRAFT_22] = replace(
     _D20, draft=MOQTDraft.DRAFT_22,

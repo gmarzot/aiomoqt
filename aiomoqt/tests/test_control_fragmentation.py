@@ -267,6 +267,19 @@ async def test_fin_with_truncated_message_pops_chain():
     assert 5 not in s._control_chains              # released, not pinned
 
 
+@pytest.mark.parametrize("draft, closes", [(18, False), (20, True),
+                                            (22, True)])
+async def test_request_stream_fin_with_truncated_message(draft, closes):
+    # d20+: a request stream FIN'd mid-message closes the session.
+    s = _control_session(draft)
+    s._bidi_stream_requests[4] = None
+    frame = _subscribe_frame(s, 1)
+    s._on_control_data(4, frame[:-1], True, is_request_bidi=True)
+    assert 4 not in s._control_chains
+    assert [code for code, _ in s._closed] == (
+        [SessionCloseCode.PROTOCOL_VIOLATION] if closes else [])
+
+
 async def test_parse_exception_contained_not_escaped():
     # A non-underflow deserialize exception must not escape into the
     # event loop (WT would drop the rest of the batch) — it closes the

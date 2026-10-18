@@ -2371,6 +2371,12 @@ class _MOQTSessionMixin:
                         self._close_session(
                             SessionCloseCode.PROTOCOL_VIOLATION,
                             "control stream FIN with truncated message")
+                    elif (is_request_bidi
+                          and self._profile.truncated_request_closes):
+                        self._close_session(
+                            SessionCloseCode.PROTOCOL_VIOLATION,
+                            f"request stream {stream_id} FIN with "
+                            f"truncated message")
                 return
             except Exception as e:
                 # Containment (data-plane _drain_stream parity): a parse
