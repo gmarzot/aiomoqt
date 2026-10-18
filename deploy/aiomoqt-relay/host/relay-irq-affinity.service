@@ -1,0 +1,12 @@
+[Unit]
+Description=Steer relay NIC interrupts to CPU 0
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/relay-irq-affinity.sh enp0s6 0
+
+[Install]
+WantedBy=multi-user.target
