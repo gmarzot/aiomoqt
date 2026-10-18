@@ -1,8 +1,8 @@
 """Publisher conformance sweep against moq-contribution-interop-runner.
 
-Starts the runner in driven mode with the aiomoqt adapter, runs every d18
-scenario on one transport, merges the requirement outcomes and compares
-them with a baseline of passing rows.
+Starts the runner in driven mode with the aiomoqt adapter, runs every
+scenario of one draft on one transport, merges the requirement outcomes and
+compares them with that draft's baseline of passing rows.
 
     python tests/contrib/sweep.py --runner build/moq-interop-runner --out out
 
@@ -25,9 +25,21 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 PIN = HERE.parent.parent / ".github" / "contrib-runner-pin"
 TRACK = {"namespace_hex": ["6d65646961"], "name_hex": "766964655f31"}
+# Reserved-namespace scenarios the runner accepts only with the namespace
+# they test (".", an unregistered ".interop", ".session").
+NAMESPACE = {
+    "d22-attempt-single-period-namespace-use": ["2e"],
+    "d22-attempt-single-period-track-publication": ["2e"],
+    "d22-attempt-single-period-namespace-publication": ["2e"],
+    "d22-attempt-unregistered-period-namespace-publication":
+        ["2e696e7465726f70"],
+    "d22-application-track-publication-under-session": ["2e73657373696f6e"],
+    "d22-application-namespace-publication-under-session":
+        ["2e73657373696f6e"],
+}
 # Run alone: the API refuses these inside a batch of raw probes.
 TYPED = {"subscribe-to-publisher-track",
-         "subscribe-again-to-established-publisher-track"}
+         "subscribe-again-to-established-publisher-track", *NAMESPACE}
 BATCH = 100
 RANK = {"fail": 3, "pass": 2, "not_run": 1}
 
@@ -80,13 +92,14 @@ def _start_runner(args, out):
            "--tls-cert", str(cert), "--tls-key", str(key),
            "--driver-executable", str(args.adapter),
            "--driver-log-root", str(out / "driver-logs"),
-           # d18 gives an unknown token alias no REQUEST_ERROR code; the
-           # session sends UNKNOWN_AUTH_TOKEN_ALIAS's session code, 0x17.
-           "--unknown-auth-token-alias-compat-code", "0x17",
            # Credentials the adapter's --token-reject policy refuses.
            "--invalid-auth-token", "1:696e76616c6964",
            "--expired-auth-token", "1:65787069726564",
            "--denied-authorization-token", "denied"]
+    if args.draft == 18:
+        # d18 gives an unknown token alias no REQUEST_ERROR code; the
+        # session sends UNKNOWN_AUTH_TOKEN_ALIAS's session code, 0x17.
+        cmd += ["--unknown-auth-token-alias-compat-code", "0x17"]
     if args.runner_data:
         cmd += ["--docs", str(args.runner_data / "docs"),
                 "--requirements", str(args.runner_data / "requirements")]
@@ -117,10 +130,13 @@ def _stop(proc):
 
 
 def _run(base, args, out, scenarios):
+    track = TRACK
+    if len(scenarios) == 1 and scenarios[0] in NAMESPACE:
+        track = dict(TRACK, namespace_hex=NAMESPACE[scenarios[0]])
     status, body = _call(base, "POST", "/api/v1/runs", {
-        "draft": 18, "transport": args.transport, "mode": "driven",
+        "draft": args.draft, "transport": args.transport, "mode": "driven",
         "scenarios": scenarios, "timeout_ms": args.timeout_ms,
-        "track": TRACK})
+        "track": track})
     if status != 201:
         return status, body
     rid = body["run"]["id"]
@@ -152,11 +168,12 @@ def sweep(base, args, out):
         stale.unlink()
     _, health = _call(base, "GET", "/healthz")
     todo = sorted({p["scenario"] for p in health["executable_profiles"]
-                   if p["draft"] == 18 and p["transport"] == args.transport
+                   if p["draft"] == args.draft
+                   and p["transport"] == args.transport
                    and p["mode"] == "driven"})
     if not todo:
-        raise SweepError(f"runner offers no driven d18 {args.transport} "
-                         f"scenarios")
+        raise SweepError(f"runner offers no driven d{args.draft} "
+                         f"{args.transport} scenarios")
     typed = set(TYPED)
     batch = [s for s in todo if s not in typed]
     print(f"{len(todo)} scenarios", flush=True)
@@ -224,7 +241,7 @@ def outcomes(results):
     return rows
 
 
-def report(rows, baseline, runner_id, transport):
+def report(rows, baseline, runner_id, draft, transport):
     passed = {k for k, r in rows.items() if r["outcome"] == "pass"}
     regressed = sorted(set(baseline) - passed)
     gained = sorted(passed - set(baseline))
@@ -234,7 +251,7 @@ def report(rows, baseline, runner_id, transport):
                                       "SHOULD NOT", "MAY").index(s)
                        if s in ("MUST", "MUST NOT", "SHOULD", "SHOULD NOT",
                                 "MAY") else 9)
-    lines = [f"## Contribution runner: d18 {transport}",
+    lines = [f"## Contribution runner: d{draft} {transport}",
              f"`{runner_id}`, {len(rows)} scored requirements", "",
              "| strength | pass | fail | not run |", "|---|---|---|---|"]
     for s in strengths:
@@ -275,6 +292,9 @@ def main():
                     help="record this sweep's passing rows as the baseline")
     ap.add_argument("--gate", action="store_true",
                     help="exit 1 when a baseline row no longer passes")
+    # The runner has no draft 20; its draft 21 is moqt-21, which aiomoqt
+    # does not offer.
+    ap.add_argument("--draft", type=int, choices=(18, 22), default=18)
     ap.add_argument("--transport", default="native-quic")
     ap.add_argument("--timeout-ms", type=int, default=8000,
                     help="per-scenario timeout")
@@ -297,25 +317,32 @@ def main():
         print(f"sweep failed: {e}", file=sys.stderr)
         return 2
     (args.out / "outcomes.json").write_text(json.dumps(rows, indent=1))
-    if args.write_baseline:
-        args.baseline.write_text(json.dumps({
-            "runner": runner_id, "draft": 18, "transport": args.transport,
-            "pass": sorted(k for k, r in rows.items()
-                           if r["outcome"] == "pass")}, indent=1) + "\n")
-        print(f"baseline written: {args.baseline}")
-        return 0
+    # One entry per draft and transport; --write-baseline replaces only its own.
+    key = f"d{args.draft} {args.transport}"
     try:
-        base_doc = json.loads(args.baseline.read_text())
+        base_doc = (json.loads(args.baseline.read_text())
+                    if args.baseline.exists() else {})
     except (OSError, ValueError) as e:
         print(f"no usable baseline {args.baseline}: {e}", file=sys.stderr)
         return 2
-    want = {"runner": runner_id, "draft": 18, "transport": args.transport}
-    got = {k: base_doc.get(k) for k in want}
-    if got != want:
-        print(f"baseline {args.baseline} is for {got}, this sweep is "
-              f"{want}; refresh it with --write-baseline", file=sys.stderr)
+    if args.write_baseline:
+        base_doc[key] = {"runner": runner_id, "pass": sorted(
+            k for k, r in rows.items() if r["outcome"] == "pass")}
+        args.baseline.write_text(json.dumps(
+            dict(sorted(base_doc.items())), indent=1) + "\n")
+        print(f"baseline written: {args.baseline} [{key}]")
+        return 0
+    entry = base_doc.get(key)
+    if entry is None:
+        print(f"no {key} entry in {args.baseline}; every pass is reported "
+              f"as new", file=sys.stderr)
+        entry = {"runner": runner_id, "pass": []}
+    if entry.get("runner") != runner_id:
+        print(f"baseline {args.baseline} [{key}] is for {entry.get('runner')}"
+              f", this sweep is {runner_id}; refresh it with "
+              f"--write-baseline", file=sys.stderr)
         return 2
-    text, regressed = report(rows, base_doc["pass"], runner_id,
+    text, regressed = report(rows, entry["pass"], runner_id, args.draft,
                              args.transport)
     (args.out / "summary.md").write_text(text)
     if os.environ.get("GITHUB_STEP_SUMMARY"):

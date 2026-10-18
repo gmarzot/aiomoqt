@@ -1,4 +1,5 @@
 import asyncio
+import errno
 import ipaddress
 import socket
 from asyncio.futures import Future
@@ -43,6 +44,26 @@ def _check_udp_port_free(host: str, port: int) -> None:
         probe.bind(("0.0.0.0", port))
     except OSError as e:
         raise OSError(f"UDP port {port} unavailable: {e.strerror}") from e
+    finally:
+        probe.close()
+    _warn_if_ipv6_port_taken(port)
+
+
+def _warn_if_ipv6_port_taken(port: int) -> None:
+    """The transport may also serve [::]:port. A conflict there leaves IPv6
+    clients out while IPv4 still serves, so it warns; a host without IPv6
+    says nothing."""
+    try:
+        probe = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+    except OSError:
+        return
+    try:
+        probe.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        probe.bind(("::", port))
+    except OSError as e:
+        if e.errno == errno.EADDRINUSE:
+            logger.warning(f"MOQT server: UDP [::]:{port} is in use; IPv6 "
+                           f"clients cannot reach this server")
     finally:
         probe.close()
 

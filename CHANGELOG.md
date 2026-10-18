@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- Requires aiopquic >= 0.6.0: servers also bind IPv6 when it is usable (IPv4 only, with a warning, when `[::]:port` cannot bind).
+- Relay: `--cc-algo` defaults to cubic (about 65% more fan-out than bbr on one worker).
+- Relay: the upstream SUBSCRIBE for an unfiltered subscriber omits the filter from d16 (AbsoluteStart {0, 0} at d14).
+- Relay status: `platform.json` `transport[]` carries each listener's aiopquic RX wake and worker counters.
+- Relay watchdog: a failed self-probe logs those counters, wakes each transport's reader once (Linux) and logs them again.
+- Server: a UDP port taken on the IPv6 side ([::]:port) is a warning; IPv4 still serves.
+- CI: contribution-runner sweep at d18 and d22 (runner has no d20; its d21 is moqt-21).
+- URL: a moqt:// URL with an empty query keeps its `?` in the SETUP PATH (`/moq?`).
+- Session: from d20, a request stream FIN'd mid-message closes the session with PROTOCOL_VIOLATION.
+- Messages: a parameter outside its message's scope (e.g. inside FILL_PARAMETERS) closes before its value is decoded.
+- Session: from d20, a FIN on a SUBSCRIBE_NAMESPACE or SUBSCRIBE_TRACKS stream does not cancel it; the request is answered.
+- Session: from d18, `publish_namespace()` and `publish()` raise ValueError for a namespace whose first field starts with `.`.
+- Messages: FILL_PARAMETERS is sent as Number of Parameters then Parameters, no Length (moq-transport PR #2015); the length-prefixed form is still read.
+- Relay: each object is encoded once per stream state and shared across subscribers; `SubgroupHeader.advance()` / `encoding_state()`.
+
 ## v0.12.0
 
 - Relay: a subscriber whose session closes under a write is dropped; forwarding for the track no longer stops, which left later subscribers with nothing and the queue growing without bound.

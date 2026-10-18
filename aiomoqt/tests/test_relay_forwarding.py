@@ -851,23 +851,35 @@ async def test_d14_parked_publishes_are_raised_by_subscribe_update(use_quic):
         assert rx._close_err is None
 
 
+# (publisher draft, subscriber draft): the upstream SUBSCRIBE takes the
+# publisher's draft.
+_FILTER_DRAFTS = [(18, 18), (22, 22), (14, 18)]
+
+
 @requires_certs
 @pytest.mark.asyncio
 @_TRANSPORTS
-async def test_upstream_subscribe_keeps_each_subscribers_start(use_quic):
+@pytest.mark.parametrize("pub_draft,sub_draft", _FILTER_DRAFTS,
+                         ids=["d18", "d22", "d14-pub"])
+async def test_upstream_subscribe_keeps_each_subscribers_start(
+        use_quic, pub_draft, sub_draft):
     # §10.2.9: a SUBSCRIBE with no filter is unfiltered. The shared upstream
-    # SUBSCRIBE must not narrow it to Largest Object, nor end where one
+    # SUBSCRIBE must stay unfiltered (omitted from d16, AbsoluteStart {0, 0}
+    # at d14, which has no omission), and must not end where one
     # subscriber's range ends.
-    port = _flow_port(7, use_quic)
+    i = _FILTER_DRAFTS.index((pub_draft, sub_draft))
+    port = _BASE_PORT + 160 + 2 * i + (not use_quic)
     _reset_relay_state()
     server = relay._build_server("localhost", port, CERT, KEY,
-                                 use_quic=use_quic, draft=18)
+                                 use_quic=use_quic,
+                                 draft=sorted({pub_draft, sub_draft},
+                                              reverse=True))
     handle = await server.serve()
     upstream = {}
     try:
         pub_client = MOQTClient("localhost", port, path="/",
                                 use_quic=use_quic, verify_tls=False,
-                                supported_drafts=18)
+                                supported_drafts=pub_draft)
 
         async def on_subscribe(session, msg):
             upstream[bytes(msg.track_name)] = msg
@@ -879,7 +891,7 @@ async def test_upstream_subscribe_keeps_each_subscribers_start(use_quic):
                                         wait_response=True)
             sub_client = MOQTClient("localhost", port, path="/",
                                     use_quic=use_quic, verify_tls=False,
-                                    supported_drafts=18)
+                                    supported_drafts=sub_draft)
             async with sub_client.connect() as rx:
                 await rx.client_session_init()
                 await rx.subscribe("relay/filt", "all", filter_type=None,
@@ -893,8 +905,12 @@ async def test_upstream_subscribe_keeps_each_subscribers_start(use_quic):
         _reset_relay_state()
     got = {name: (m.filter_type, m.start_group, m.start_object)
            for name, m in upstream.items()}
-    assert got == {b"all": (FilterType.ABSOLUTE_START, 0, 0),
+    unfiltered = ((FilterType.ABSOLUTE_START, 0, 0) if pub_draft == 14
+                  else (None, None, None))
+    assert got == {b"all": unfiltered,
                    b"range": (FilterType.ABSOLUTE_START, 2, 1)}, got
+    # Omitted, not a Location Filter of type None (0x00).
+    assert upstream[b"all"].location_filter is None
 
 
 @requires_certs
@@ -1007,7 +1023,7 @@ class _Obj:
 async def test_relay_flags_reach_the_server(monkeypatch):
     monkeypatch.setattr("sys.argv", ["moq_interop_relay"])
     transport = relay.transport_settings(relay.parse_args())
-    assert transport == {"congestion_control_algorithm": "bbr",
+    assert transport == {"congestion_control_algorithm": "cubic",
                          "max_connections": 4096,
                          "stream_ring_cap": 1 << 20,
                          "tx_max_inflight_bytes": 512 << 10}
@@ -1015,4 +1031,4 @@ async def test_relay_flags_reach_the_server(monkeypatch):
                                  **transport)
     assert (server.congestion_control_algorithm, server.max_connections,
             server.stream_ring_cap, server.tx_max_inflight_bytes) == (
-                "bbr", 4096, 1 << 20, 512 << 10)
+                "cubic", 4096, 1 << 20, 512 << 10)

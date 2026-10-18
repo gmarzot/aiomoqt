@@ -330,6 +330,7 @@ async def _relay(port, use_quic, draft):
                 s = await stack.enter_async_context(client.connect())
                 await s.client_session_init()
                 return s
+            connect.handle = handle
             yield connect
     finally:
         handle.close()
@@ -367,7 +368,7 @@ async def test_snapshot_reports_namespaces_tracks_and_sessions(
             pytest.fail("no catalog classified or video relayed")
 
         status = relay._Status(str(tmp_path / "status.json"),
-                               {"started": time.time()})
+                               {"started": time.time()}, [connect.handle])
         loop = asyncio.get_running_loop()
         status.snapshot(loop.time(), time.time())
         await asyncio.sleep(0.3)
@@ -431,6 +432,9 @@ async def test_snapshot_reports_namespaces_tracks_and_sessions(
     assert platform["history"]["t"] == snap["history"]["t"]
     assert platform["bandwidth"]["egress_bps"] == totals["egress_bps"]
     assert "cpu_modes" in platform["host"] and "ifaces" in platform["host"]
+    (transport,) = platform["transport"]
+    assert set(transport) == set(relay.TRANSPORT_COUNTERS)
+    assert transport["loop_callbacks"] > 0
 
     # Peer addresses, never a port.
     local = {"127.0.0.1", "::1"}

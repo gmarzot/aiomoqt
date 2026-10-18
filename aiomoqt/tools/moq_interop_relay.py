@@ -148,6 +148,9 @@ PUBLISH_WAIT_S = 1.5
 WATCHDOG_MISSES = 3
 WATCHDOG_EXIT = 70
 WATCHDOG_PROBE_S = 10.0
+# After a failed probe, how long to let a woken reader drain before
+# reading the transport counters again.
+WATCHDOG_KICK_S = 0.5
 # Dashboard (--status-dir): write period, history kept, the longest a
 # catalog probe may take, and the wait before re-probing a namespace
 # that showed no MSF catalog.
@@ -674,6 +677,7 @@ class _RelayedTrack:
             if oid is not None:
                 self._remember(gid, sgid, oid, payload, exts, prio, status,
                                shape)
+            encoded = {}
             for d in list(self.downstream):
                 if d.replaying:
                     continue
@@ -691,7 +695,7 @@ class _RelayedTrack:
                     self._bytes_out += len(payload or b"")
                     await self._forward_one(
                         d.session, d.alias, gid, sgid, oid, payload, exts,
-                        prio, status, shape)
+                        prio, status, shape, encoded)
                 except (Exception, asyncio.CancelledError):
                     if _cancelling():
                         raise
@@ -774,7 +778,8 @@ class _RelayedTrack:
         return out
 
     async def _forward_one(self, session, alias, gid, sgid, oid,
-                           payload, exts, prio, status=None, shape=None):
+                           payload, exts, prio, status=None, shape=None,
+                           encoded=None):
         """Write one object downstream, opening the (group, subgroup)
         stream on first sight. Group/subgroup identity is preserved from
         upstream so the downstream sees the publisher's structure."""
@@ -846,9 +851,17 @@ class _RelayedTrack:
             session.stream_write(stream_id, buf.data, end_stream=True)
             self._streams.pop(skey, None)
             return
-        buf = header.next_object(payload=payload, extensions=exts,
-                                 object_id=oid)
-        await session.stream_write_drain(stream_id, buf.data)
+        # One encoding per object per stream state, shared by subscribers.
+        state = header.encoding_state()
+        data = None if encoded is None else encoded.get(state)
+        if data is None:
+            data = header.next_object_bytes(payload=payload, extensions=exts,
+                                            object_id=oid)
+            if encoded is not None:
+                encoded[state] = data
+        else:
+            header.advance(oid)
+        await session.stream_write_drain(stream_id, data)
 
 
 _watched: set = set()
@@ -1105,8 +1118,8 @@ async def _establish_upstream(ns, track_name, forward=True, sub=None):
 
 def _upstream_filter(sub) -> dict:
     """The first subscriber's start for a shared upstream SUBSCRIBE, with
-    no End Group: later subscribers may want more. Unfiltered (§10.2.9) is
-    AbsoluteStart {0, 0}, which every draft can carry."""
+    no End Group: later subscribers may want more. An unfiltered one stays
+    unfiltered (filter_type None; see _filter_for)."""
     ftype = getattr(sub, "filter_type", None)
     if sub is None or ftype in (FilterType.LATEST_OBJECT,
                                 FilterType.NEXT_GROUP_START):
@@ -1115,8 +1128,17 @@ def _upstream_filter(sub) -> dict:
         return {"filter_type": FilterType.ABSOLUTE_START,
                 "start_group": sub.start_group or 0,
                 "start_object": sub.start_object or 0}
-    return {"filter_type": FilterType.ABSOLUTE_START,
-            "start_group": 0, "start_object": 0}
+    return {"filter_type": None}
+
+
+def _filter_for(pub, kwargs: dict) -> dict:
+    """From d16 an omitted filter is unfiltered (§10.2.9); d14 has no
+    omission, so it carries AbsoluteStart {0, 0}."""
+    if "filter_type" in kwargs and kwargs["filter_type"] is None and not (
+            is_draft16_or_later(pub.negotiated_draft)):
+        return {"filter_type": FilterType.ABSOLUTE_START,
+                "start_group": 0, "start_object": 0}
+    return kwargs
 
 
 def _parked_publish(key):
@@ -1193,7 +1215,8 @@ async def _subscribe_publishers(entry):
             on_done=lambda done, t=track, k=key: _upstream_done(t, k, done))
         entry.pub = pub
         try:
-            await upstream.subscribe(timeout=10.0, **entry.filter)
+            await upstream.subscribe(timeout=10.0,
+                                     **_filter_for(pub, entry.filter))
         except Exception as e:
             if entry.fut.done():
                 break
@@ -1773,9 +1796,12 @@ def parse_args():
                              f"{LOG_FILE_BYTES >> 20} MB x {LOG_FILE_BACKUPS}) "
                              "and send crash and stall dumps to "
                              "DIR/crash.log. Off by default.")
-    parser.add_argument("--cc-algo", type=str, default="bbr",
-                        help="Congestion control (bbr | bbr1 | newreno | "
-                             "cubic | dcubic | prague | fast). Default: bbr")
+    # cubic: about 65% more fan-out than bbr on one worker, whose sends
+    # are syscall-bound; bbr's per-peer pacing defeats send batching.
+    parser.add_argument("--cc-algo", type=str, default="cubic",
+                        help="Congestion control (cubic | bbr | bbr1 | c4 | "
+                             "newreno | dcubic | prague | fast). Default: "
+                             "cubic")
     parser.add_argument("--max-connections", type=int, default=4096,
                         help="Most connections held at once (aiopquic "
                              ">= 0.5.1). Default: 4096")
@@ -2330,10 +2356,66 @@ async def _heartbeat(stall_s: float) -> None:
         await asyncio.sleep(min(1.0, stall_s / 4))
 
 
-async def _watchdog(period, host, port, use_quic, draft) -> None:
+# aiopquic counters that show the RX wake state and worker progress.
+TRANSPORT_COUNTERS = (
+    "rx_notify_pending_now", "rx_event_ring_count_now",
+    "rx_overflow_depth_now", "rx_overflow_max_depth", "rx_overflow_pushed",
+    "rx_event_drops", "tx_event_ring_count_now", "loop_callbacks",
+    "wake_calls", "wake_skipped_coalesced")
+
+
+def _transport_of(handle):
+    """The aiopquic TransportContext behind a serve() handle, else None."""
+    transport = getattr(handle, "_transport", None)
+    if transport is None:
+        transport = getattr(getattr(handle, "_engine", None), "_transport",
+                            None)
+    return transport
+
+
+def transport_counters(handles) -> list:
+    """TRANSPORT_COUNTERS of each listener's transport."""
+    out = []
+    for handle in handles:
+        try:
+            counters = _transport_of(handle).counters
+        except Exception:
+            continue
+        out.append({k: counters.get(k) for k in TRANSPORT_COUNTERS})
+    return out
+
+
+def _kick_rx(handle) -> bool:
+    """Wake asyncio's reader for the transport once, as the network thread
+    does. Linux only: elsewhere the wake fd's write end is not exposed."""
+    transport = _transport_of(handle)
+    if transport is None or not sys.platform.startswith("linux"):
+        return False
+    try:
+        os.write(transport.eventfd, (1).to_bytes(8, sys.byteorder))
+    except (OSError, AttributeError):
+        return False
+    return True
+
+
+async def _diagnose_probe_miss(handles) -> None:
+    """Log the transports' RX wake state, wake each reader once, and log
+    the state again: queued events draining after the kick mean a lost
+    wake; staying queued means no reader is attached."""
+    logger.warning(f"relay: watchdog: probe failed; transport "
+                   f"{transport_counters(handles)}")
+    kicked = [_kick_rx(h) for h in handles]
+    await asyncio.sleep(WATCHDOG_KICK_S)
+    logger.warning(f"relay: watchdog: woke readers {kicked}; transport "
+                   f"{transport_counters(handles)}")
+
+
+async def _watchdog(period, host, port, use_quic, draft,
+                    handles=()) -> None:
     """Exit so the supervisor restarts the relay when it hangs or stops
     relaying: a loop stall past `period`, or WATCHDOG_MISSES self-probes
-    in a row, on the newest draft, that deliver no object."""
+    in a row, on the newest draft, that deliver no object. Each failed
+    probe logs the transports' RX wake state and wakes their readers."""
     _background.add(asyncio.create_task(_heartbeat(period)))
     newest = max(draft) if isinstance(draft, (list, tuple)) else int(draft)
     misses = 0
@@ -2344,6 +2426,7 @@ async def _watchdog(period, host, port, use_quic, draft) -> None:
             misses = 0
             continue
         misses += 1
+        await _diagnose_probe_miss(handles)
         if misses >= WATCHDOG_MISSES:
             logger.error(f"relay: watchdog: {misses} self-probes failed "
                          f"in a row, exiting")
@@ -2525,8 +2608,10 @@ class _Status:
     """The dashboard's status.json and platform.json, rewritten every
     STATUS_INTERVAL_S."""
 
-    def __init__(self, path: str, relay: dict) -> None:
+    def __init__(self, path: str, relay: dict, handles=()) -> None:
         self.path = path
+        # serve() handles whose aiopquic counters platform.json carries.
+        self.handles = list(handles)
         self.platform_path = os.path.join(os.path.dirname(path),
                                           "platform.json")
         self.relay = relay
@@ -2856,6 +2941,7 @@ class _Status:
                           "egress_bps": totals["egress_bps"],
                           "loss_pct": totals["loss_pct"]},
             "loop_lag_ms": lag,
+            "transport": transport_counters(self.handles),
             "history": self.platform_history.to_json(),
         }
 
@@ -3014,7 +3100,7 @@ async def main():
         # --quic and --dual serve raw QUIC on --port; otherwise WT.
         _background.add(asyncio.create_task(_watchdog(
             args.watchdog, host, args.port, args.quic or args.dual,
-            args.draft)))
+            args.draft, handles)))
 
     if args.status_dir:
         os.makedirs(args.status_dir, exist_ok=True)
@@ -3028,7 +3114,7 @@ async def main():
             "started": time.time(),
             "watchdog_s": args.watchdog,
             "cache": {"groups": CACHE_GROUPS, "bytes": CACHE_BYTES},
-        })
+        }, handles)
         _background.add(asyncio.create_task(status.run()))
 
     print(

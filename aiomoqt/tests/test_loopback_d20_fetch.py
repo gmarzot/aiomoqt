@@ -212,11 +212,14 @@ async def test_fetch_on_an_empty_track_is_refused(use_quic):
 # -- joining -------------------------------------------------------------------
 
 @_TRANSPORTS
-async def test_join_at_d22(use_quic):
+@_DRAFTS
+async def test_join(draft, use_quic):
     """join() is one SUBSCRIBE at the Next Object with FILL_PARAMETERS:
     the fill stream, under the SUBSCRIBE's Request ID, ends at the Largest
     Object its SUBSCRIBE_OK reports and live objects follow, each once."""
-    async with _loopback(_port(6, use_quic), 22, use_quic) as (tracks, rx):
+    case = 6 if draft == 22 else 17
+    async with _loopback(_port(case, use_quic), draft, use_quic) as (
+            tracks, rx):
         session = rx.session
         live = []
         sub_ok, fill = await session.join(

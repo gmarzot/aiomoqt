@@ -689,6 +689,9 @@ class MOQTMessage:
                     param_value.encode(payload, prof=prof)
                 elif kind == "range_filter":
                     param_value.encode(payload, param_type, prof=prof)
+                elif kind == "fill" and prof.fill_parameters_counted:
+                    MOQTMessage._serialize_params(payload, param_value,
+                                                  prof=prof)
                 elif kind == "fill":
                     inner = Buffer(capacity=BUF_SIZE, vi64=prof.vi64)
                     MOQTMessage._serialize_params(inner, param_value,
@@ -873,6 +876,47 @@ class MOQTMessage:
                             buf_end: Optional[int] = None,
                             delta_keys: bool = None,
                             scope: Optional[str] = None) -> Dict[int, Any]:
+        """Deserialize a parameter block (see _pull_params).
+
+        FILL_PARAMETERS is read count-prefixed (PR #2015). Transition
+        tolerance for the published d20/d22 text: a block with a
+        FILL_PARAMETERS that does not parse that way, or does not end at
+        buf_end, is reread with the value length-prefixed."""
+        start = buf.tell()
+        fill = []
+        try:
+            params = MOQTMessage._pull_params(
+                buf, prof=prof, buf_end=buf_end, delta_keys=delta_keys,
+                scope=scope, fill_seen=fill)
+            if not fill or buf_end is None or buf.tell() == buf_end:
+                return params
+            err = MOQTProtocolViolation(
+                "FILL_PARAMETERS block does not end the parameters")
+        except (MOQTProtocolViolation, BufferReadError, MOQTUnderflow) as e:
+            if not fill or buf_end is None:
+                raise
+            err = e
+        reached = buf.tell()
+        buf.seek(start)
+        try:
+            return MOQTMessage._pull_params(
+                buf, prof=prof, buf_end=buf_end, delta_keys=delta_keys,
+                scope=scope, fill_length_prefixed=True)
+        except (MOQTProtocolViolation, BufferReadError, MOQTUnderflow) as e:
+            # Report the reading that got further.
+            if buf.tell() > reached:
+                err = e
+        if not isinstance(err, MOQTProtocolViolation):
+            err = MOQTProtocolViolation(f"FILL_PARAMETERS: {err}")
+        raise err
+
+    @staticmethod
+    def _pull_params(buf: Buffer, *, prof: DraftProfile,
+                     buf_end: Optional[int] = None,
+                     delta_keys: bool = None,
+                     scope: Optional[str] = None,
+                     fill_length_prefixed: bool = False,
+                     fill_seen: Optional[list] = None) -> Dict[int, Any]:
         """
         Deserialize parameters using Key-Value-Pair structure.
 
@@ -894,6 +938,7 @@ class MOQTMessage:
         param_count = buf.pull_vint()
         prev_key = 0
         d20 = prof.draft >= 18 and prof.param_table >= 20
+        allowed = param_scope(prof).get(scope) if prof.draft >= 18 else None
 
         for param_index in range(param_count):
             if buf_end is not None and buf.tell() >= buf_end:
@@ -916,6 +961,11 @@ class MOQTMessage:
                     raise MOQTProtocolViolation(
                         f"unknown message parameter 0x{param_type:x} "
                         f"(§10.2: cannot be skipped)")
+                if allowed is not None and param_type not in allowed:
+                    # §10.2.1: checked before the value is decoded, so an
+                    # out-of-scope parameter closes as PROTOCOL_VIOLATION.
+                    raise MOQTProtocolViolation(
+                        f"parameter 0x{param_type:x} not allowed in {scope}")
                 if kind == "location" and d20:
                     param_value = (buf.pull_vint(), buf.pull_vint())
                 elif kind == "location":
@@ -929,6 +979,12 @@ class MOQTMessage:
                 elif kind == "range_filter":
                     param_value = RangeFilter.decode(
                         buf, param_type, prof=prof, buf_end=buf_end)
+                elif kind == "fill" and not fill_length_prefixed:
+                    if fill_seen is not None:
+                        fill_seen.append(param_type)
+                    param_value = MOQTMessage._pull_params(
+                        buf, prof=prof, buf_end=buf_end,
+                        scope="FillParameters")
                 elif kind == "fill":
                     param_len = buf.pull_vint()
                     value_end = buf.tell() + param_len
@@ -939,7 +995,7 @@ class MOQTMessage:
                     if param_len == 0:
                         raise MOQTProtocolViolation(
                             "FILL_PARAMETERS has no Number of Parameters")
-                    param_value = MOQTMessage._deserialize_params(
+                    param_value = MOQTMessage._pull_params(
                         buf, prof=prof, buf_end=value_end,
                         scope="FillParameters")
                     if buf.tell() != value_end:
@@ -1033,15 +1089,6 @@ class MOQTMessage:
             if d20 and param_type in RANGE_FILTERS:
                 param_value = [param_value]
             params[param_type] = param_value
-
-        allowed = param_scope(prof).get(scope) if prof.draft >= 18 else None
-        if allowed is not None:
-            for param_type in params:
-                if param_type not in allowed:
-                    # §10.2.1: a parameter outside its message types MUST
-                    # close the connection.
-                    raise MOQTProtocolViolation(
-                        f"parameter 0x{param_type:x} not allowed in {scope}")
         return params
 
     @staticmethod

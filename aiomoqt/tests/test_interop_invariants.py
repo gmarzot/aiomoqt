@@ -115,6 +115,10 @@ class TestMoqtSetupPath:
         r = parse_relay_url("moqt://relay.example:4443/moq?jwt=abc")
         assert r.path == "/moq?jwt=abc"
 
+    def test_moqt_url_keeps_an_empty_query(self):
+        r = parse_relay_url("moqt://relay.example:4443/moq?")
+        assert r.path == "/moq?"
+
     def test_moqt_url_without_path_is_empty(self):
         assert parse_relay_url("moqt://relay.example:4443").path == ""
 

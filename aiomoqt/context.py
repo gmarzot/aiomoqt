@@ -117,6 +117,20 @@ class DraftProfile:
     track_properties: bool = True
                                   # PUBLISH, SUBSCRIBE_OK and FETCH_OK end
                                   # with Track Properties; d14 has none.
+    fill_parameters_counted: bool = False
+                                  # FILL_PARAMETERS value is Number of
+                                  # Parameters then Parameters, no Length
+                                  # (moq-transport PR #2015); d20+.
+    reserved_period_namespaces: bool = False
+                                  # d18+: a namespace whose first field starts
+                                  # with "." is reserved; never sent.
+    request_fin_cancels_discovery: bool = True
+                                  # d18: a requester FIN cancels its
+                                  # SUBSCRIBE_NAMESPACE / SUBSCRIBE_TRACKS;
+                                  # d20+ FIN is not a cancellation.
+    truncated_request_closes: bool = False
+                                  # d20+: a request stream FIN'd mid-message
+                                  # closes the session (FIN is not a cancel).
     update_has_location: bool = False
                                   # d14 SUBSCRIBE_UPDATE carries Start, End
                                   # Group, Priority and Forward as fields;
@@ -164,7 +178,8 @@ PROFILES = {
         location_params=frozenset({ParamType.LARGEST_OBJECT}),
         two_level_discovery=True,
         merged_datagram_layout=True,
-        subgroup_type_mask=0x6F),
+        subgroup_type_mask=0x6F,
+        reserved_period_namespaces=True),
 }
 
 # d22 differs from d20 only in its switches.
@@ -180,7 +195,10 @@ _D20 = replace(
     goaway_request_id=False,
     fetch_location_filter=True,
     fetch_timed_out_range=True,
-    fetch_object_status=False)
+    fetch_object_status=False,
+    truncated_request_closes=True,
+    request_fin_cancels_discovery=False,
+    fill_parameters_counted=True)
 PROFILES[MOQTDraft.DRAFT_20] = _D20
 PROFILES[MOQTDraft.DRAFT_22] = replace(
     _D20, draft=MOQTDraft.DRAFT_22,

@@ -61,3 +61,27 @@ def test_wildcard_bind_says_nothing():
         _check_udp_port_free("0.0.0.0", _free_port())
         _check_udp_port_free("", _free_port())
     assert said == []
+
+
+def test_an_ipv6_side_conflict_warns_and_ipv4_still_serves():
+    try:
+        holder = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        holder.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        holder.bind(("::", 0))
+    except OSError:
+        pytest.skip("no IPv6 on this host")
+    port = holder.getsockname()[1]
+    said = []
+    try:
+        with mock.patch.object(server.logger, "warning",
+                               lambda m, *a: said.append(m)):
+            _check_udp_port_free("0.0.0.0", port)   # IPv4 free: no raise
+    finally:
+        holder.close()
+    assert said == [f"MOQT server: UDP [::]:{port} is in use; IPv6 clients "
+                    f"cannot reach this server"]
+    said.clear()
+    with mock.patch.object(server.logger, "warning",
+                           lambda m, *a: said.append(m)):
+        _check_udp_port_free("0.0.0.0", port)
+    assert said == []
