@@ -35,6 +35,7 @@
 - Relay: a PUBLISH a held SUBSCRIBE waits for is answered with Forward State 1.
 - Relay: the upstream SUBSCRIBE keeps the first subscriber's start (unfiltered = AbsoluteStart {0, 0}), with no End Group.
 - Relay status: `subscribers` counts distinct sessions (totals, namespaces, history), `subscriptions` the per-track sum; `sessions[].id` and `tracks[].subscriber_list[].session` link them.
+- `MOQTServer(stream_ring_cap=, max_connections=)`: per-stream send buffer and connection limit (aiopquic >= 0.5.1).
 - WT-Protocol negotiation tests follow whichever selection order the installed aiopquic uses.
 - d18+: a Redirect naming a track in reply to PUBLISH_NAMESPACE or SUBSCRIBE_NAMESPACE (and SUBSCRIBE_TRACKS from d20) closes with PROTOCOL_VIOLATION.
 - Delivery timeouts (§8) on produce() tracks: per subscription the smaller non-zero of the track's (`object_delivery_timeout`, `subgroup_delivery_timeout`) and the subscriber's; a late object resets its subgroup with DELIVERY_TIMEOUT, no reopen, and a late datagram is dropped. d16 DELIVERY_TIMEOUT of 0 closes with PROTOCOL_VIOLATION.

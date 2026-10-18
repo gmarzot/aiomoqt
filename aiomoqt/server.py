@@ -64,6 +64,8 @@ class MOQTServer(MOQTPeer):
         congestion_control_algorithm: Optional[str] = None,
         keep_alive_interval: Optional[float] = None,
         socket_buffer_size: Optional[int] = None,
+        stream_ring_cap: Optional[int] = None,
+        max_connections: Optional[int] = None,
         implementation: Optional[str] = USER_AGENT,
     ):
         super().__init__(tx_max_inflight_bytes=tx_max_inflight_bytes,
@@ -95,6 +97,14 @@ class MOQTServer(MOQTPeer):
         # UDP SO_RCVBUF/SO_SNDBUF request (bytes). None = aiopquic
         # default (64 MiB, kernel-clamped to rmem_max/wmem_max).
         self.socket_buffer_size = socket_buffer_size
+        # Per-stream TX ring (QuicConfiguration.stream_ring_cap), allocated
+        # whole per stream: memory scales with it times open streams. Must
+        # be >= the largest object and above tx_max_inflight_bytes. None =
+        # aiopquic default (4 MiB).
+        self.stream_ring_cap = stream_ring_cap
+        # Most connections held at once (aiopquic >= 0.5.1). None =
+        # aiopquic default (256).
+        self.max_connections = max_connections
         self._loop = asyncio.get_running_loop()
         self._server_closed: Future[Tuple[int, str]] = self._loop.create_future()
         self._next_subscribe_id = 1
@@ -126,6 +136,10 @@ class MOQTServer(MOQTPeer):
                 cfg.keep_alive_interval = self.keep_alive_interval
             if self.socket_buffer_size is not None:
                 cfg.socket_buffer_size = self.socket_buffer_size
+            if self.stream_ring_cap is not None:
+                cfg.stream_ring_cap = self.stream_ring_cap
+            if self.max_connections is not None:
+                cfg.max_connections = self.max_connections
             cfg.load_cert_chain(self.certificate, self.private_key)
             protocol = lambda *a, **kw: MOQTSessionQuic(*a, **kw, session=self)
             return aiopquic_serve(
@@ -165,6 +179,10 @@ class MOQTServer(MOQTPeer):
             wt_cfg.keep_alive_interval = self.keep_alive_interval
         if self.socket_buffer_size is not None:
             wt_cfg.socket_buffer_size = self.socket_buffer_size
+        if self.stream_ring_cap is not None:
+            wt_cfg.stream_ring_cap = self.stream_ring_cap
+        if self.max_connections is not None:
+            wt_cfg.max_connections = self.max_connections
 
         # WT-Protocol allowlist in supported_drafts order, as for raw-QUIC
         # ALPN: aiopquic selects the first one the client offered and
@@ -209,6 +227,10 @@ class MOQTServer(MOQTPeer):
             cfg.keep_alive_interval = self.keep_alive_interval
         if self.socket_buffer_size is not None:
             cfg.socket_buffer_size = self.socket_buffer_size
+        if self.stream_ring_cap is not None:
+            cfg.stream_ring_cap = self.stream_ring_cap
+        if self.max_connections is not None:
+            cfg.max_connections = self.max_connections
 
         def wt_factory(transport, state):
             return MOQTSessionWTServer(transport, state, session=self)
