@@ -835,6 +835,8 @@ _watched: set = set()
 # id(session) -> {"session", "since", "ns"}: when the dashboard first saw
 # it and the namespaces it has used.
 _sessions: dict[int, dict] = {}
+# Short opaque session ids for the dashboard.
+_session_ids = itertools.count(1)
 
 
 def _watch_session(session, ns=None) -> None:
@@ -849,7 +851,7 @@ def _watch_session(session, ns=None) -> None:
     if info is None:
         info = _sessions[id(session)] = {
             "session": session, "since": time.time(), "ns": set(),
-            "addr": None}
+            "addr": None, "id": next(_session_ids)}
         _background.add(asyncio.create_task(_log_peer(session, info)))
     if ns is not None:
         info["ns"].add(tuple(ns))
@@ -2445,7 +2447,8 @@ def _track_state(track, flowing) -> str:
 
 
 _HISTORY_KEYS = ("t", "ingress_bps", "egress_bps", "media_in_bps",
-                 "media_out_bps", "sessions", "subscribers", "tracks",
+                 "media_out_bps", "sessions", "subscribers", "subscriptions",
+                 "tracks",
                  "loss_pct", "rtt_p50_ms", "lag_p99_ms", "objects_in_per_s",
                  "groups_per_s")
 _PLATFORM_KEYS = ("t", "cpu", "cpu_user", "cpu_nice", "cpu_system",
@@ -2535,6 +2538,7 @@ class _Status:
             return rtt / 1000 if rtt else None
 
         pubs, subs = set(), set()
+        ns_viewers: dict[tuple, set] = {}
         tracks, prev = [], {}
         for key, t in list(_tracks.items()):
             if _internal_ns(key[0]):
@@ -2549,6 +2553,8 @@ class _Status:
             if owner is not None:
                 pubs.add(id(owner))
             subs.update(id(d.session) for d in t.downstream)
+            ns_viewers.setdefault(key[0], set()).update(
+                id(d.session) for d in t.downstream)
             up = rtt_ms(owner) if owner is not None else None
             down = relay_status.percentile(
                 [r for r in (rtt_ms(d.session) for d in t.downstream) if r is not None], 50)
@@ -2557,6 +2563,7 @@ class _Status:
                 info = _sessions.get(id(d.session))
                 r = rtt_ms(d.session)
                 listed.append({
+                    "session": info["id"] if info else None,
                     "transport": _transport(d.session), "draft": _draft(d.session),
                     "addr": relay_status.display_addr(_addr_of(d.session)),
                     "rtt_ms": None if r is None else round(r, 1),
@@ -2607,7 +2614,8 @@ class _Status:
                            if holders else None),
                 "origin_addr": (relay_status.display_addr(_addr_of(holders[-1]))
                                 if holders else None),
-                "tracks": 0, "subscribers": 0, "in_bps": 0, "out_bps": 0,
+                "tracks": 0, "subscribers": len(ns_viewers.get(ns, ())),
+                "subscriptions": 0, "in_bps": 0, "out_bps": 0,
                 "bytes_out": 0, "format": entry[0] if entry else None,
             }
         for key, row in tracks:
@@ -2615,7 +2623,7 @@ class _Status:
             if sp is None:
                 continue
             sp["tracks"] += 1
-            sp["subscribers"] += row["subscribers"]
+            sp["subscriptions"] += row["subscribers"]
             sp["in_bps"] += row["in_bps"] or 0
             sp["out_bps"] += row["out_bps"] or 0
             sp["bytes_out"] += row["bytes_out"]
@@ -2650,7 +2658,7 @@ class _Status:
             role = "+".join(r for r, ids in (("pub", pubs), ("sub", subs))
                             if id(s) in ids)
             sessions.append({
-                "transport": _transport(s), "draft": _draft(s),
+                "id": info["id"], "transport": _transport(s), "draft": _draft(s),
                 "addr": relay_status.display_addr(_addr_of(s)),
                 "role": role or None, "since": info["since"],
                 "rtt_ms": round(rtt, 1) if rtt is not None else None,
@@ -2670,7 +2678,9 @@ class _Status:
             "publishers": sum(1 for s in sessions
                               if (s["role"] or "").startswith("pub")),
             "namespaces": len(spaces), "tracks": len(tracks),
-            "subscribers": sum(r["subscribers"] for _, r in tracks),
+            # Distinct sessions; a session on several tracks counts once.
+            "subscribers": len(subs),
+            "subscriptions": sum(r["subscribers"] for _, r in tracks),
             "subscribers_peak": None,
             "ingress_bps": bps(rx), "egress_bps": bps(tx),
             "media_in_bps": media_in, "media_out_bps": media_out,
@@ -2698,7 +2708,8 @@ class _Status:
             "t": round(wall), "ingress_bps": totals["ingress_bps"],
             "egress_bps": totals["egress_bps"], "media_in_bps": media_in,
             "media_out_bps": media_out, "sessions": totals["sessions"],
-            "subscribers": totals["subscribers"], "tracks": len(tracks),
+            "subscribers": totals["subscribers"],
+            "subscriptions": totals["subscriptions"], "tracks": len(tracks),
             "loss_pct": totals["loss_pct"], "rtt_p50_ms": totals["rtt_p50_ms"],
             "lag_p99_ms": lag["p99"],
             "objects_in_per_s": totals["objects_in_per_s"],
