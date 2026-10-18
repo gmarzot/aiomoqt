@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- A control message that fails to parse is logged with its first 64 bytes in hex.
+
 ## v0.13.0rc1
 
 - Requires aiopquic >= 0.6.0: servers also bind IPv6 when it is usable (IPv4 only, with a warning, when `[::]:port` cannot bind).
