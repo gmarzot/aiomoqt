@@ -1,11 +1,13 @@
 """Relay RENDEZVOUS_TIMEOUT (d18 §10.2.6): a SUBSCRIBE for a track with no
 publisher is held up to the requested time, then answered TIMEOUT."""
 import asyncio
+import contextlib
 import time
 
 import pytest
 
 from aiomoqt.client import MOQTClient
+from aiomoqt.track import PublishedTrack
 from aiomoqt.tools import moq_interop_client as interop_client
 from aiomoqt.tools import moq_interop_relay as relay
 from aiomoqt.types import MOQTMessageType, MOQTRequestError, RequestErrorCode
@@ -127,3 +129,76 @@ async def test_interop_client_case_skips_before_d18():
     r = await _client_case(_BASE_PORT + 5, 16)
     assert r.skipped
     assert "draft-16" in r.skip_reason
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+async def test_a_held_subscriber_has_the_publish_answered_forwarding(
+        use_quic, monkeypatch):
+    # A PUBLISH arriving for a held SUBSCRIBE starts forwarding in its
+    # PUBLISH_OK, with no REQUEST_UPDATE a publisher may not support.
+    port = _BASE_PORT + 6 + (not use_quic)
+    names = ("video", "audio")
+    got = {name: 0 for name in names}
+    answered, raised = {}, []
+    answer, resume = relay._answer_publish, relay._resume_parked_publish
+
+    def answer_spy(track, forward=None):
+        pending = track.pending_publish is not None
+        answer(track, forward)
+        if pending and track.pending_publish is None:
+            answered[bytes(track.key[1])] = track.parked is None
+
+    def resume_spy(track):
+        if track.parked is not None:
+            raised.append(track.key)
+        resume(track)
+    monkeypatch.setattr(relay, "_answer_publish", answer_spy)
+    monkeypatch.setattr(relay, "_resume_parked_publish", resume_spy)
+    relay._announced.clear()
+    relay._tracks.clear()
+    server = relay._build_server("localhost", port, CERT, KEY,
+                                 use_quic=use_quic, draft=18)
+    handle = await server.serve()
+    try:
+        async with contextlib.AsyncExitStack() as stack:
+            async def _session():
+                client = MOQTClient("localhost", port, path="/",
+                                    use_quic=use_quic, verify_tls=False,
+                                    supported_drafts=18)
+                s = await stack.enter_async_context(client.connect())
+                await s.client_session_init()
+                return s
+
+            def _count(name):
+                def on_object(*_args):
+                    got[name] += 1
+                return on_object
+
+            rx = await _session()
+            held = [asyncio.create_task(rx.subscribe(
+                "rv/held", name, forward=1,
+                parameters={relay.RENDEZVOUS_TIMEOUT: 5000},
+                on_object=_count(name), wait_response=True))
+                for name in names]
+            await asyncio.sleep(0.3)
+            pub = await _session()
+            for name in names:
+                track = PublishedTrack(pub, namespace="rv/held",
+                                       trackname=name, object_size=100,
+                                       group_size=5, rate=200)
+                await track.publish(announce_namespace=False,
+                                    publish_track=True)
+            await asyncio.gather(*held)
+            for _ in range(150):
+                if all(got.values()):
+                    break
+                await asyncio.sleep(0.02)
+    finally:
+        handle.close()
+        relay._announced.clear()
+        relay._tracks.clear()
+    assert all(got.values()), got
+    assert answered == {name.encode(): True for name in names}, answered
+    assert raised == []

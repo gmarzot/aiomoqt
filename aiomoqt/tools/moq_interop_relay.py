@@ -111,6 +111,8 @@ _announce_requests: dict[tuple, tuple] = {}
 _tracks: dict[tuple, "_RelayedTrack"] = {}
 # (namespace, name) -> the upstream SUBSCRIBE outstanding for it.
 _establishing: dict[tuple, "_Establishing"] = {}
+# (namespace, name) -> Forward State of each SUBSCRIBE held for a publisher.
+_held_forwards: dict[tuple, list[bool]] = {}
 
 # Sessions this relay dialled OUT to. An origin does not announce to us,
 # so it never lands in _announced; it is tried as a fallback when no
@@ -1035,6 +1037,8 @@ class _Establishing:
         self.pub = None
         # Forward State of each waiting subscriber.
         self.forwards: list[bool] = []
+        # subscribe() filter kwargs for the upstream SUBSCRIBE.
+        self.filter: dict = {}
         self.task = None
 
     def resolve(self, result) -> None:
@@ -1044,7 +1048,7 @@ class _Establishing:
             self.fut.set_result(result)
 
 
-async def _establish_upstream(ns, track_name, forward=True):
+async def _establish_upstream(ns, track_name, forward=True, sub=None):
     """Subscribe upstream once per Full Track Name. Returns (fan-out,
     None), or (None, the last upstream refusal or None) when no
     publisher accepts. Concurrent callers share one upstream SUBSCRIBE.
@@ -1067,10 +1071,27 @@ async def _establish_upstream(ns, track_name, forward=True):
             track.close()
             _tracks.pop(key, None)
         entry = _Establishing(key)
+        entry.filter = _upstream_filter(sub)
         _establishing[key] = entry
         entry.task = asyncio.create_task(_subscribe_upstream(entry))
     entry.forwards.append(bool(forward))
     return await asyncio.shield(entry.fut)
+
+
+def _upstream_filter(sub) -> dict:
+    """The first subscriber's start for a shared upstream SUBSCRIBE, with
+    no End Group: later subscribers may want more. Unfiltered (§10.2.9) is
+    AbsoluteStart {0, 0}, which every draft can carry."""
+    ftype = getattr(sub, "filter_type", None)
+    if sub is None or ftype in (FilterType.LATEST_OBJECT,
+                                FilterType.NEXT_GROUP_START):
+        return {"filter_type": ftype or FilterType.LATEST_OBJECT}
+    if ftype in (FilterType.ABSOLUTE_START, FilterType.ABSOLUTE_RANGE):
+        return {"filter_type": FilterType.ABSOLUTE_START,
+                "start_group": sub.start_group or 0,
+                "start_object": sub.start_object or 0}
+    return {"filter_type": FilterType.ABSOLUTE_START,
+            "start_group": 0, "start_object": 0}
 
 
 def _parked_publish(key):
@@ -1147,7 +1168,7 @@ async def _subscribe_publishers(entry):
             on_done=lambda done, t=track, k=key: _upstream_done(t, k, done))
         entry.pub = pub
         try:
-            await upstream.subscribe(timeout=10.0)
+            await upstream.subscribe(timeout=10.0, **entry.filter)
         except Exception as e:
             if entry.fut.done():
                 break
@@ -1366,7 +1387,9 @@ async def _on_publish(session, msg):
 
 
 def _forwarding(track) -> bool:
-    return any(d.forward for d in track.downstream)
+    """A subscriber, attached or held for a publisher, wants objects."""
+    return (any(d.forward for d in track.downstream)
+            or any(_held_forwards.get(track.key, ())))
 
 
 def _answer_publish(track, forward=None) -> None:
@@ -1412,6 +1435,14 @@ def _refuse_publish(session, msg, reason) -> None:
     session.send_control_message(reply)
 
 
+def _publish_ok_location(msg) -> dict:
+    """The d14 SUBSCRIBE_UPDATE fields our PUBLISH_OK set: a Largest
+    Object filter (§5.1.2), open-ended, priority 128."""
+    start = ((msg.largest_group_id, msg.largest_object_id + 1)
+             if getattr(msg, "content_exists", 0) else (0, 0))
+    return {"start": start, "end_group": 0, "priority": 128}
+
+
 def _resume_parked_publish(track) -> None:
     """Raise a parked publisher's Forward State once a subscriber
     forwards."""
@@ -1420,7 +1451,8 @@ def _resume_parked_publish(track) -> None:
     session, msg = track.parked
     track.parked = None
     try:
-        session.request_update(msg.request_id, forward=1)
+        session.request_update(msg.request_id, forward=1,
+                               **_publish_ok_location(msg))
         logger.info(f"relay: REQUEST_UPDATE forward=1 "
                     f"alias={msg.track_alias}")
     except Exception:
@@ -1549,7 +1581,17 @@ async def _on_subscribe(session, msg):
     if wait_s and not _publisher_known(ns, msg.track_name):
         logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
                     f"held up to {wait_s:.3f}s for a publisher")
-        if not await _await_publisher(session, ns, msg.track_name, wait_s):
+        key = (ns, msg.track_name)
+        wants = msg.forward is None or bool(msg.forward)
+        _held_forwards.setdefault(key, []).append(wants)
+        try:
+            found = await _await_publisher(session, ns, msg.track_name, wait_s)
+        finally:
+            held = _held_forwards[key]
+            held.remove(wants)
+            if not held:
+                del _held_forwards[key]
+        if not found:
             if not _still_wanted(session, msg.request_id):
                 return
             logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
@@ -1587,7 +1629,7 @@ async def _on_subscribe(session, msg):
     if _announced_match(ns) or _upstreams:
         forward = msg.forward is None or bool(msg.forward)
         track, refusal = await _establish_upstream(ns, msg.track_name,
-                                                   forward=forward)
+                                                   forward=forward, sub=msg)
         if not _still_wanted(session, msg.request_id):
             logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
                         f"cancelled before its reply")
