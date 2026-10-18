@@ -134,6 +134,8 @@ function renderTiles(s) {
   const playable = s.namespaces.filter((r) => r.format).length;
   const live = s.tracks.filter((r) => r.state === 'live').length;
   const groups = s.tracks.reduce((n, r) => n + (r.groups_per_s || 0), 0);
+  // Delivered rates: each track's input rate times its subscribers.
+  const fanout = (k) => s.tracks.reduce((n, r) => n + (r[k] || 0) * (r.subscribers || 0), 0);
   setTile('publishers', fmt.num(T.publishers), pubs.transports || 'publishing sessions',
           pubList.length ? `By draft: ${pubs.drafts}` : 'No publishing sessions');
   // A viewer counts once; without totals.subscriptions, count sub-role sessions.
@@ -149,8 +151,11 @@ function renderTiles(s) {
   setTile('lag', fmt.ms(lag.p99), `p50 ${fmt.ms(lag.p50)}`);
   setTile('loss', fmt.pct(T.loss_pct, 2), 'delivery sessions');
   setTile('drops', fmt.num(T.drops), 'subscribers dropped');
-  setTile('groups', fmt.rate(none(T.groups_per_s) ? groups : T.groups_per_s), 'in, all tracks');
-  setTile('objects', fmt.rate(T.objects_in_per_s), 'in, all tracks');
+  const groupsIn = none(T.groups_per_s) ? groups : T.groups_per_s;
+  setTile('groups', fmt.rate(fanout('groups_per_s')), `out · ${fmt.rate(groupsIn)} in`,
+          'Delivered to subscribers: each track\'s group rate times its subscribers; in = received from publishers');
+  setTile('objects', fmt.rate(fanout('objects_per_s')), `out · ${fmt.rate(T.objects_in_per_s)} in`,
+          'Delivered to subscribers: each track\'s object rate times its subscribers; in = received from publishers');
   setTile('ingress', fmt.bps(T.ingress_bps), `media ${fmt.bps(T.media_in_bps)}`);
   setTile('egress', fmt.bps(T.egress_bps), `media ${fmt.bps(T.media_out_bps)}`);
   for (const tile of document.querySelectorAll('.tile[data-spark]')) {

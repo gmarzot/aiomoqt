@@ -317,3 +317,64 @@ def test_stream_groups_still_reported():
     assert 'n/a' not in row, row
     assert s.summary()['datagram'] is False
     assert s.summary()['groups'] == 3
+
+
+# -- whole-group loss ------------------------------------------------
+
+def _feed_groups(s, groups, size=8, subgroups=4, skip=()):
+    """Interleave `subgroups` streams per group; `skip` holds
+    (group, subgroup) pairs that never arrive."""
+    us = _now_us()
+    for g in groups:
+        for o in range(size):
+            sg = o % subgroups
+            if (g, sg) not in skip:
+                s.on_object(Obj(g, o, subgroup_id=sg), 10, us)
+
+
+def test_a_missing_subgroup_counts_as_lost():
+    s = TrackStats(group_loss=True)
+    _feed_groups(s, range(6), skip={(2, 1)})
+    assert s.summary()['lost'] == 2
+
+
+def test_full_groups_count_no_loss():
+    s = TrackStats(group_loss=True)
+    _feed_groups(s, range(6))
+    assert s.summary()['lost'] == 0
+
+
+def test_a_mid_group_join_is_not_loss():
+    s = TrackStats(group_loss=True)
+    us = _now_us()
+    for o in (5, 6, 7):
+        s.on_object(Obj(0, o, subgroup_id=o % 4), 10, us)
+    _feed_groups(s, range(1, 5))
+    assert s.summary()['lost'] == 0
+
+
+def test_a_late_subgroup_reverses_settled_loss():
+    s = TrackStats(group_loss=True)
+    _feed_groups(s, range(5), skip={(1, 3)})
+    assert s.summary()['lost'] == 2
+    us = _now_us()
+    for o in (3, 7):
+        s.on_object(Obj(1, o, subgroup_id=3), 10, us)
+    assert s.summary()['lost'] == 0
+
+
+def test_in_stream_gap_is_not_counted_twice():
+    s = TrackStats(group_loss=True)
+    us = _now_us()
+    _feed_groups(s, range(2), size=12)
+    for o in range(12):
+        if o != 5:          # subgroup 1 carries 1, 5, 9: a gap, not a tail
+            s.on_object(Obj(2, o, subgroup_id=o % 4), 10, us)
+    _feed_groups(s, range(3, 6), size=12)
+    assert s.summary()['lost'] == 1
+
+
+def test_group_loss_is_opt_in():
+    s = TrackStats()
+    _feed_groups(s, range(6), skip={(2, 1)})
+    assert s.summary()['lost'] == 0

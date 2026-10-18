@@ -29,6 +29,7 @@ from aiomoqt.context import is_draft16_or_later, profile_for
 from aiomoqt.messages import SubgroupHeader
 from aiomoqt.messages.base import MOQTMessage
 from aiomoqt.track import PublishedTrack, SubscribedTrack
+from aiomoqt.tools.moqtest_origin import parse_namespace as parse_moq_test
 from aiomoqt.types import (
     ParamType, FetchType, MOQTRequestError, MOQTMessageType,
     SubscribeErrorCode, RequestErrorCode, SubscribeDoneCode,
@@ -952,13 +953,15 @@ async def test_subscribe_before_announce(host, port, path, use_quic,
 # Data plane (docs/tests/data-plane/)
 # ---------------------------------------------------------------------------
 
-# data-subgroup-basic canonical case: one subgroup per group.
-DATA_SUBGROUP_BASIC_REVISION = 1
+# data-subgroup-basic canonical case: one subgroup per group, as the MoQT
+# Test tuple appended to the routing prefix of the subscribed namespace.
+DATA_SUBGROUP_BASIC_REVISION = 2
+DATA_SUBGROUP_BASIC_CASE = ("moq-test-00", "0", "0", "0", "2", "4", "5", "64",
+                            "32", "2", "1", "1", "0", "-1", "-1", "0")
 _DATA_GROUPS = 3
 _DATA_OBJECTS = 5
 _DATA_PRIORITY = 128
 _DATA_FILL = b"t"
-_DATA_GAP_S = 0.002
 _DATA_PHASE_S = 5.0
 _DATA_DELIVERY_S = 10.0
 # PUBLISH_DONE Stream Count from a publisher that cannot count its streams.
@@ -968,6 +971,13 @@ _UNKNOWN_STREAM_COUNT = (1 << 62) - 1
 def _run_id() -> str:
     """Run-unique namespace field: 128 random bits, lowercase hex."""
     return secrets.token_hex(16)
+
+
+def _sendable(p) -> bool:
+    """The MoQT Test cases this publisher serves: one subgroup per group,
+    no End of Group markers, extensions or delivery timeout."""
+    return (p.fp == 0 and not p.markers and p.int_ext < 0 and p.var_ext < 0
+            and not p.pub_timeout)
 
 
 def _data_object_size(object_id: int) -> int:
@@ -996,16 +1006,26 @@ class _DataPublisher:
         # or UNSUBSCRIBE): there is no request stream left for PUBLISH_DONE.
         self.cancelled = False
         self.done_sent = False
+        # The MoQT Test parameters the subscribed namespace selected.
+        self.params = None
         self.subscribed = asyncio.Event()
 
     async def on_subscribe(self, session, msg):
-        matches = (tuple(_as_bytes(f) for f in msg.track_namespace) == self.namespace
-                   and _as_bytes(msg.track_name) == self.track_name)
-        if not matches or self.request is not None:
+        ns = tuple(_as_bytes(f) for f in msg.track_namespace)
+        params = None
+        if (ns[:len(self.namespace)] == self.namespace
+                and _as_bytes(msg.track_name) == self.track_name
+                and self.request is None):
+            try:
+                params = parse_moq_test(ns[len(self.namespace):])
+            except ValueError:
+                pass
+        if params is None or not _sendable(params):
             session.subscribe_error(request_id=msg.request_id,
                                     error_code=RequestErrorCode.DOES_NOT_EXIST,
                                     reason="track does not exist")
             return
+        self.params = params
         ok = session.subscribe_ok(request_msg=msg)
         self.request = msg
         self.track_alias = ok.track_alias
@@ -1018,20 +1038,23 @@ class _DataPublisher:
         """One subgroup stream per group, ended by FIN with no end-of-group
         signal, then PUBLISH_DONE. Returns the number of streams opened."""
         prof = profile_for(session.negotiated_draft)
+        p = self.params
+        groups = range(p.start_group, p.last_group + 1, p.g_inc)
+        objects = range(p.start_object, p.last_object + 1, p.o_inc)
         streams = 0
-        for group_id in range(_DATA_GROUPS):
+        for group_id in groups:
             stream_id = await session.open_uni_stream()
             streams += 1
             header = SubgroupHeader(
                 track_alias=self.track_alias, group_id=group_id,
                 subgroup_id=0, publisher_priority=_DATA_PRIORITY, prof=prof)
             session.stream_write(stream_id, header.serialize().data)
-            for object_id in range(_DATA_OBJECTS):
-                if group_id or object_id:
-                    await asyncio.sleep(_DATA_GAP_S)
-                buf = header.next_object(
-                    payload=_DATA_FILL * _data_object_size(object_id),
-                    object_id=object_id)
+            for object_id in objects:
+                if group_id != p.start_group or object_id != p.start_object:
+                    await asyncio.sleep(p.freq_ms / 1000)
+                size = p.size0 if object_id == p.start_object else p.size_gt0
+                buf = header.next_object(payload=_DATA_FILL * size,
+                                         object_id=object_id)
                 await session.stream_write_drain(stream_id, buf.data)
             session.stream_write(stream_id, b"", end_stream=True)
         if not self.cancelled:
@@ -1135,14 +1158,15 @@ async def test_data_subgroup_basic(host, port, path, use_quic,
                                    compat=frozenset()) -> TestResult:
     """data-subgroup-basic: three groups of five objects, one subgroup
     stream per group, relayed from publisher to subscriber and checked
-    object by object."""
+    object by object. The publisher announces the routing prefix
+    ("moq-test", name, run id); the subscriber appends the MoQT Test tuple."""
     name = "data-subgroup-basic"
     t0 = time.monotonic()
     loop = asyncio.get_running_loop()
     sessions = {}
-    fields = (*_NS_PREFIX, "moq-interop", name, _run_id())
-    namespace = "/".join(fields)
-    pub = _DataPublisher(tuple(f.encode() for f in fields), b"track")
+    prefix = (*_NS_PREFIX, "moq-test", name, _run_id())
+    namespace = "/".join(prefix)
+    pub = _DataPublisher(tuple(f.encode() for f in prefix), b"track")
     sub = _DataSubscriber()
     pub_client = _make_client(host, port, path, use_quic, tls_disable_verify,
                               debug, supported_drafts=supported_drafts)
@@ -1182,8 +1206,9 @@ async def test_data_subgroup_basic(host, port, path, use_quic,
                     phase.reschedule(loop.time() + _DATA_PHASE_S)
                     d16 = is_draft16_or_later(sub_session.negotiated_draft)
                     track = SubscribedTrack(
-                        sub_session, namespace, "track",
-                        on_object=sub.on_object, on_done=sub.on_done)
+                        sub_session,
+                        "/".join((namespace, *DATA_SUBGROUP_BASIC_CASE)),
+                        "track", on_object=sub.on_object, on_done=sub.on_done)
                     await track.subscribe(
                         forward=None, group_order=GroupOrder.ASCENDING,
                         filter_type=None if d16 else FilterType.LATEST_OBJECT)
