@@ -15,6 +15,7 @@
 - Session: from d20, a FIN on a SUBSCRIBE_NAMESPACE or SUBSCRIBE_TRACKS stream does not cancel it; the request is answered.
 - Session: from d18, `publish_namespace()` and `publish()` raise ValueError for a namespace whose first field starts with `.`.
 - Messages: FILL_PARAMETERS is sent as Number of Parameters then Parameters, no Length (moq-transport PR #2015); the length-prefixed form is still read.
+- Relay: each object is encoded once per stream state and shared across subscribers; `SubgroupHeader.advance()` / `encoding_state()`.
 
 ## v0.12.0
 

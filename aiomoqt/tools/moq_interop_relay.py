@@ -677,6 +677,7 @@ class _RelayedTrack:
             if oid is not None:
                 self._remember(gid, sgid, oid, payload, exts, prio, status,
                                shape)
+            encoded = {}
             for d in list(self.downstream):
                 if d.replaying:
                     continue
@@ -694,7 +695,7 @@ class _RelayedTrack:
                     self._bytes_out += len(payload or b"")
                     await self._forward_one(
                         d.session, d.alias, gid, sgid, oid, payload, exts,
-                        prio, status, shape)
+                        prio, status, shape, encoded)
                 except (Exception, asyncio.CancelledError):
                     if _cancelling():
                         raise
@@ -777,7 +778,8 @@ class _RelayedTrack:
         return out
 
     async def _forward_one(self, session, alias, gid, sgid, oid,
-                           payload, exts, prio, status=None, shape=None):
+                           payload, exts, prio, status=None, shape=None,
+                           encoded=None):
         """Write one object downstream, opening the (group, subgroup)
         stream on first sight. Group/subgroup identity is preserved from
         upstream so the downstream sees the publisher's structure."""
@@ -849,9 +851,17 @@ class _RelayedTrack:
             session.stream_write(stream_id, buf.data, end_stream=True)
             self._streams.pop(skey, None)
             return
-        buf = header.next_object(payload=payload, extensions=exts,
-                                 object_id=oid)
-        await session.stream_write_drain(stream_id, buf.data)
+        # One encoding per object per stream state, shared by subscribers.
+        state = header.encoding_state()
+        data = None if encoded is None else encoded.get(state)
+        if data is None:
+            data = header.next_object_bytes(payload=payload, extensions=exts,
+                                            object_id=oid)
+            if encoded is not None:
+                encoded[state] = data
+        else:
+            header.advance(oid)
+        await session.stream_write_drain(stream_id, data)
 
 
 _watched: set = set()
