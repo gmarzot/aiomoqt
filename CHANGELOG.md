@@ -4,6 +4,12 @@
 
 - A control message that fails to parse is logged with its first 64 bytes in hex.
 
+## v0.13.0rc2
+
+- Interop client: data-subgroup-basic follows MoQT Test revision 2 (`moq-test` routing prefix, test tuple in the subscribed namespace).
+- Publisher: the subgroups of a track start each group together, so a slow subgroup no longer drifts behind and a late subscriber gets every subgroup.
+- sub_bench: Lost counts objects missing from whole groups (a lost subgroup, a stream's head or tail), not only in-stream gaps.
+
 ## v0.13.0rc1
 
 - Requires aiopquic >= 0.6.0: servers also bind IPv6 when it is usable (IPv4 only, with a warning, when `[::]:port` cannot bind).
