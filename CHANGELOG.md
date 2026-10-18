@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Interop client: data-subgroup-basic follows MoQT Test revision 2 (`moq-test` routing prefix, test tuple in the subscribed namespace).
+
 ## v0.13.0rc1
 
 - Requires aiopquic >= 0.6.0: servers also bind IPv6 when it is usable (IPv4 only, with a warning, when `[::]:port` cannot bind).

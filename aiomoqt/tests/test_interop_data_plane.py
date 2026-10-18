@@ -32,7 +32,7 @@ async def _run(port, draft, use_quic):
 @requires_certs
 @pytest.mark.asyncio
 @pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
-@pytest.mark.parametrize("draft", [14, 16, 18])
+@pytest.mark.parametrize("draft", [14, 16, 18, 20, 22])
 async def test_canonical_case_through_the_relay(draft, use_quic):
     port = _BASE_PORT + 2 * draft + (0 if use_quic else 1)
     r = await _run(port, draft, use_quic)
@@ -148,7 +148,8 @@ async def _publish(cancel_first):
     pub = client._DataPublisher((b"ns",), b"track")
     s = _FakeSession()
     await pub.on_subscribe(s, SimpleNamespace(
-        track_namespace=(b"ns",), track_name=b"track", request_id=7,
+        track_namespace=(b"ns", *(f.encode() for f in client.DATA_SUBGROUP_BASIC_CASE)),
+        track_name=b"track", request_id=7,
         forward=None))
     if cancel_first:
         s.cancel[7](7)
@@ -205,3 +206,53 @@ async def test_a_test_that_raises_fails_and_the_run_continues(monkeypatch):
     assert [(r.name, r.passed) for r in rep.results] == [
         ("raises", False), ("passes", True)]
     assert "AttributeError" in rep.results[0].message
+
+
+@requires_certs
+@pytest.mark.asyncio
+async def test_the_case_rides_below_a_moq_test_routing_prefix(monkeypatch):
+    # PUBLISH_NAMESPACE carries ("moq-test", name, run id); the
+    # upstream SUBSCRIBE carries that prefix plus the 16-field MoQT Test tuple.
+    seen = []
+    on_subscribe = client._DataPublisher.on_subscribe
+
+    async def spy(self, session, msg):
+        seen.append(tuple(bytes(f) for f in msg.track_namespace))
+        await on_subscribe(self, session, msg)
+    monkeypatch.setattr(client._DataPublisher, "on_subscribe", spy)
+    announced = []
+    on_ns = relay._on_publish_namespace
+
+    async def ns_spy(session, msg):
+        announced.append(relay._ns_tuple(msg.namespace))
+        return await on_ns(session, msg)
+    monkeypatch.setattr(relay, "_on_publish_namespace", ns_spy)
+    r = await _run(_BASE_PORT + 3, 18, True)
+    assert r.passed, r.message
+    (prefix,) = announced
+    assert prefix[:2] == (b"moq-test", b"data-subgroup-basic") and len(prefix) == 3
+    (ns,) = seen
+    assert ns[:3] == prefix and len(ns) == 19
+    assert ns[3:] == tuple(f.encode() for f in client.DATA_SUBGROUP_BASIC_CASE)
+
+
+@pytest.mark.parametrize("suffix", [
+    ("moq-test-00", "1", "0", "0", "2", "4", "5", "64", "32", "2", "1", "1",
+     "0", "-1", "-1", "0"),                       # one subgroup per object
+    ("moq-test-00", "0", "0", "0", "2", "4", "5", "64", "32", "2", "1", "1",
+     "1", "-1", "-1", "0"),                       # End of Group markers
+    ("not-moq-test",),
+])
+@pytest.mark.asyncio
+async def test_a_case_this_publisher_cannot_serve_is_refused(suffix):
+    prefix = (b"moq-test", b"data-subgroup-basic", b"run")
+    pub = client._DataPublisher(prefix, b"track")
+    refused = []
+    session = SimpleNamespace(
+        subscribe_error=lambda **kw: refused.append(kw),
+        subscribe_ok=lambda **kw: pytest.fail("accepted"))
+    msg = SimpleNamespace(request_id=4, track_name=b"track",
+                          track_namespace=(*prefix, *(f.encode() for f in suffix)))
+    await pub.on_subscribe(session, msg)
+    assert refused and refused[0]["request_id"] == 4
+    assert pub.request is None
