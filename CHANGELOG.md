@@ -7,6 +7,7 @@
 - Perf: a subgroup object skips the filter check while its subscription forwards unfiltered, and is encoded with positional calls.
 - Perf: an object on an open, unfiltered subgroup stream is written without a coroutine of its own.
 - Perf: a received object reaches its callback without the per-object wrapper call; a raising callback still costs only that object.
+- SubscribedTrack: an object that arrives before its SUBSCRIBE_OK reaches its own track; the track no longer claims the session-wide `on_object_received`, which sent such objects to whichever track subscribed last.
 
 ## v0.13.0
 

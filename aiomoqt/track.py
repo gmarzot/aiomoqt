@@ -1797,9 +1797,6 @@ class SubscribedTrack(Track):
                 (§7.1). None omits the parameter and takes the default.
             group_order: delivery order across groups. None omits it.
         """
-        if self.on_object:
-            self.session.on_object_received = self.on_object
-
         if self.trackname is not None:
             params = {}
             if self.auth_token is not None:
@@ -1816,6 +1813,7 @@ class SubscribedTrack(Track):
                 group_order=group_order,
                 parameters=params,
                 wait_response=True,
+                on_object=self.on_object,
             )
             self.largest = _reported_largest(ok)
             # Publisher's SUBSCRIBE_OK alias is authoritative (the
