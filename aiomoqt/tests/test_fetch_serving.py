@@ -60,6 +60,33 @@ def test_dropped_objects_are_marked_unknown(descending):
         (1, 0), (1, 1), (2, 0), (2, 1)]
 
 
+def test_out_of_order_adds_evict_oldest_first_and_track_the_largest():
+    # Parallel subgroups publish a group's objects out of id order.
+    h = ObjectHistory(3 * (10 + 64))
+    for loc in [(0, 1), (0, 0), (0, 3), (0, 2), (1, 0)]:
+        h.add(*loc, b"x" * 10)
+    assert len(h) == 3 and h.evicted_through == (0, 1)
+    got = h.fetch((0, 0), (1, 0))
+    assert got[0].end_of_range == FETCH_FLAGS_END_UNKNOWN
+    assert _locations(got[1:]) == [(0, 2), (0, 3), (1, 0)]
+
+
+def test_a_duplicate_of_a_dropped_location_is_not_served():
+    h = ObjectHistory(2 * (10 + 64))
+    h.add(0, 0, b"a" * 10)
+    h.add(0, 1, b"b" * 10)
+    h.add(0, 0, b"c" * 10)                  # pushes out the first (0, 0)
+    assert h.evicted_through == (0, 0)
+    assert _locations(h.fetch((0, 1), (0, 1))) == [(0, 1)]
+    assert [o.end_of_range for o in h.fetch((0, 0), (0, 0))] == [
+        FETCH_FLAGS_END_UNKNOWN]
+
+
+def test_last_object_is_the_largest_held_in_the_group():
+    h = _filled(groups=2, objects=3)
+    assert h.last_object(1) == 2 and h.last_object(5) is None
+
+
 def test_history_resolves_extensions_and_marks_datagrams():
     h = ObjectHistory(1 << 20)
     h.add(0, 0, b"x", subgroup_id=None, extensions=lambda s: {6: s})

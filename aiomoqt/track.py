@@ -735,9 +735,8 @@ class PublishedTrack(Track):
         `subgroup_id` None marks a datagram."""
         self._note_largest(group_id, object_id)
         if self._history is not None:
-            self._history.add(group_id, object_id, payload,
-                              subgroup_id=subgroup_id, extensions=extensions,
-                              priority=self.priority)
+            self._history.add(group_id, object_id, payload, subgroup_id,
+                              extensions, self.priority)
 
     def _on_produced(self, group_id: int, object_id: int, payload: bytes,
                      extensions) -> None:
