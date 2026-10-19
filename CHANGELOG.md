@@ -4,6 +4,7 @@
 
 - CI: release.yml requires green CI and MoQ conformance on the release tree instead of re-running them, publishes the wheel it smoke-tested, and has a `dry_run` input; conformance runs on release branches only, and a new push cancels the run it supersedes.
 - Perf: FETCH history records each published object with an append (no hashing); duplicate Locations are resolved when fetched.
+- Perf: a subgroup object skips the filter check while its subscription forwards unfiltered, and is encoded with positional calls.
 
 ## v0.13.0
 
