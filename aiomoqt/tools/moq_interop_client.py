@@ -34,7 +34,7 @@ from aiomoqt.types import (
     ParamType, FetchType, MOQTRequestError, MOQTMessageType,
     SubscribeErrorCode, RequestErrorCode, SubscribeDoneCode,
     FilterType, GroupOrder, MOQTDraft, ObjectStatus, parse_draft_spec,
-    MOQT_DEFAULT_DRAFTS,
+    MOQT_DEFAULT_DRAFTS, D16MessageType,
 )
 from aiomoqt.utils.logger import set_log_level
 
@@ -203,6 +203,10 @@ STANDARD_TESTS = [
     "announce-subscribe",
     "subscribe-before-announce",
     "data-subgroup-basic",
+    "subscribe-namespace-lifecycle",
+    "namespace-discovery",
+    "publish-track-only",
+    "publish-track-subscribe",
 ]
 
 # Leading Track Namespace fields from --namespace-prefix.
@@ -1386,6 +1390,237 @@ async def test_join(host, port, path, use_quic, tls_disable_verify,
 
 
 # ---------------------------------------------------------------------------
+# Namespace subscription and direct PUBLISH
+# ---------------------------------------------------------------------------
+
+SUBSCRIBE_NAMESPACE_LIFECYCLE_REVISION = 1
+# d16 Subscribe Options: NAMESPACE messages, no PUBLISH.
+_SUBSCRIBE_OPTIONS_NAMESPACE = 0x01
+_LIFECYCLE_STEP_S = 5.0
+_PUBLISHED_OBJECTS = 5
+
+
+async def test_subscribe_namespace_lifecycle(host, port, path, use_quic,
+                                             tls_disable_verify, debug,
+                                             supported_drafts=None,
+                                             compat=frozenset(),
+                                             timeout=15.0) -> TestResult:
+    """subscribe-namespace-lifecycle: a namespace subscriber hears
+    NAMESPACE when a separate publisher publishes that namespace, then
+    NAMESPACE_DONE when it is withdrawn. Draft-16 asks for NAMESPACE with
+    Subscribe Options; draft-14 has no NAMESPACE message."""
+    name = "subscribe-namespace-lifecycle"
+    t0 = time.monotonic()
+    sessions = {}
+    namespace = f"{INTEROP_NAMESPACE}/{_run_id()}"
+    expected = [("NAMESPACE", ()), ("NAMESPACE_DONE", ())]
+    seen = []
+    observed = []
+    changed = asyncio.Event()
+
+    def _record(kind):
+        async def handler(session, msg):
+            seen.append((kind, tuple(_as_bytes(f)
+                                     for f in msg.namespace_suffix)))
+            changed.set()
+        return handler
+
+    async def _until(n) -> bool:
+        try:
+            async with asyncio.timeout(_LIFECYCLE_STEP_S):
+                while len(seen) < n:
+                    changed.clear()
+                    await changed.wait()
+            return True
+        except TimeoutError:
+            return False
+
+    def _result(passed, message, **kw):
+        return TestResult(
+            name=name, passed=passed,
+            duration_ms=(time.monotonic() - t0) * 1000,
+            sessions=sessions, message=message,
+            spec_revision=SUBSCRIBE_NAMESPACE_LIFECYCLE_REVISION, **kw)
+
+    sub_client = _make_client(host, port, path, use_quic,
+                              tls_disable_verify, debug,
+                              supported_drafts=supported_drafts)
+    pub_client = _make_client(host, port, path, use_quic,
+                              tls_disable_verify, debug,
+                              supported_drafts=supported_drafts)
+    try:
+        async with asyncio.timeout(timeout):
+            async with sub_client.connect() as sub_session:
+                await sub_session.client_session_init()
+                sessions["subscriber"] = _session_meta(sub_session)
+                draft = sub_session.negotiated_draft
+                if draft < 16:
+                    sub_session.close()
+                    return _result(
+                        True, "", skipped=True,
+                        skip_reason=f"NAMESPACE is draft-16; "
+                                    f"negotiated draft-{draft}")
+                sub_session.register_handler(
+                    D16MessageType.NAMESPACE, _record("NAMESPACE"))
+                sub_session.register_handler(
+                    D16MessageType.NAMESPACE_DONE, _record("NAMESPACE_DONE"))
+                await sub_session.subscribe_namespace(
+                    namespace,
+                    subscribe_options=(_SUBSCRIBE_OPTIONS_NAMESPACE
+                                       if draft == 16 else 0),
+                    wait_response=True)
+                async with pub_client.connect() as pub_session:
+                    await pub_session.client_session_init()
+                    sessions["publisher"] = _session_meta(pub_session)
+                    await pub_session.publish_namespace(
+                        namespace=namespace, parameters=_PUB_NS_PARAMS,
+                        wait_response=True)
+                    if await _until(1):
+                        pub_session.publish_namespace_done(
+                            namespace=namespace)
+                        await _until(2)
+                    # Teardown can produce NAMESPACE_DONE on its own.
+                    observed = list(seen)
+                    pub_session.close()
+                sub_session.close()
+    except Exception as e:
+        return _result(False, f"Failed: {_format_exc(e)}",
+                       expected="NAMESPACE then NAMESPACE_DONE",
+                       received=_format_exc(e))
+
+    got = ", ".join(f"{kind} {suffix}" for kind, suffix in observed)
+    if observed[:2] == expected:
+        return _result(True, "NAMESPACE then NAMESPACE_DONE received")
+    if not observed:
+        msg = f"no NAMESPACE within {_LIFECYCLE_STEP_S:g}s"
+    elif observed == expected[:1]:
+        msg = (f"NAMESPACE received, no NAMESPACE_DONE within "
+               f"{_LIFECYCLE_STEP_S:g}s")
+    else:
+        msg = f"received {got}"
+    return _result(False, msg,
+                   expected="NAMESPACE (), NAMESPACE_DONE ()",
+                   received=got or "nothing")
+
+
+async def test_publish_track_only(host, port, path, use_quic,
+                                  tls_disable_verify, debug,
+                                  supported_drafts=None, compat=frozenset(),
+                                  timeout=5.0) -> TestResult:
+    """publish-track-only: PUBLISH a track nobody subscribes to, receive
+    PUBLISH_OK, end the track with PUBLISH_DONE."""
+    name = "publish-track-only"
+    t0 = time.monotonic()
+    sessions = {}
+    client = _make_client(host, port, path, use_quic, tls_disable_verify,
+                          debug, supported_drafts=supported_drafts)
+    try:
+        async with asyncio.timeout(timeout):
+            async with client.connect() as session:
+                await session.client_session_init()
+                sessions["publisher"] = _session_meta(session)
+                pub_msg = session.publish(namespace=INTEROP_NAMESPACE,
+                                          track_name=INTEROP_TRACK)
+                await session._await_response(pub_msg.request_id)
+                session.subscribe_done(
+                    request_id=pub_msg.request_id,
+                    status_code=SubscribeDoneCode.TRACK_ENDED,
+                    stream_count=0, reason="track ended")
+                await asyncio.sleep(0.1)
+                session.close()
+        return TestResult(
+            name=name, passed=True,
+            duration_ms=(time.monotonic() - t0) * 1000,
+            sessions=sessions,
+            message="PUBLISH_OK received, PUBLISH_DONE sent")
+    except Exception as e:
+        return TestResult(
+            name=name, passed=False,
+            duration_ms=(time.monotonic() - t0) * 1000,
+            sessions=sessions,
+            message=f"Failed: {_format_exc(e)}",
+            expected="PUBLISH_OK",
+            received=_format_exc(e))
+
+
+async def test_publish_track_subscribe(host, port, path, use_quic,
+                                       tls_disable_verify, debug,
+                                       supported_drafts=None,
+                                       compat=frozenset(),
+                                       timeout=15.0) -> TestResult:
+    """publish-track-subscribe: a publisher PUBLISHes a track before any
+    subscriber exists; a separate subscriber then SUBSCRIBEs to it and
+    must receive its objects."""
+    name = "publish-track-subscribe"
+    t0 = time.monotonic()
+    sessions = {}
+    received = []
+    enough = asyncio.Event()
+
+    def _on_object(msg, *_):
+        received.append(msg.object_id)
+        if len(received) >= _PUBLISHED_OBJECTS:
+            enough.set()
+
+    pub_client = _make_client(host, port, path, use_quic,
+                              tls_disable_verify, debug,
+                              supported_drafts=supported_drafts)
+    sub_client = _make_client(host, port, path, use_quic,
+                              tls_disable_verify, debug,
+                              supported_drafts=supported_drafts)
+    try:
+        async with asyncio.timeout(timeout):
+            async with pub_client.connect() as pub_session:
+                await pub_session.client_session_init()
+                sessions["publisher"] = _session_meta(pub_session)
+                track = PublishedTrack(
+                    pub_session,
+                    namespace=INTEROP_NAMESPACE,
+                    trackname=INTEROP_TRACK,
+                    object_size=64, group_size=10, num_subgroups=1, rate=50,
+                )
+                track._quiet = True
+                track._stats_header_printed = True
+                await track.publish(publish_track=True)
+
+                async with sub_client.connect() as sub_session:
+                    await sub_session.client_session_init()
+                    sessions["subscriber"] = _session_meta(sub_session)
+                    subscribed = SubscribedTrack(
+                        sub_session, INTEROP_NAMESPACE, INTEROP_TRACK,
+                        on_object=_on_object)
+                    subscribed._quiet = True
+                    await subscribed.subscribe(timeout=_SUBSCRIBE_WAIT)
+                    try:
+                        async with asyncio.timeout(_DATA_DELIVERY_S):
+                            await enough.wait()
+                    except TimeoutError:
+                        pass
+                    sub_session.close()
+                pub_session.close()
+    except Exception as e:
+        return TestResult(
+            name=name, passed=False,
+            duration_ms=(time.monotonic() - t0) * 1000,
+            sessions=sessions,
+            message=f"Failed: {_format_exc(e)}",
+            expected=f"SUBSCRIBE_OK and {_PUBLISHED_OBJECTS} objects",
+            received=_format_exc(e))
+
+    passed = len(received) >= _PUBLISHED_OBJECTS
+    return TestResult(
+        name=name, passed=passed,
+        duration_ms=(time.monotonic() - t0) * 1000,
+        sessions=sessions,
+        message=(f"{len(received)} objects received from the published track"
+                 if passed else
+                 f"{len(received)} of {_PUBLISHED_OBJECTS} objects within "
+                 f"{_DATA_DELIVERY_S:g}s"),
+        expected=f"{_PUBLISHED_OBJECTS} objects",
+        received=f"{len(received)} objects")
+
+
+# ---------------------------------------------------------------------------
 # Test dispatch
 # ---------------------------------------------------------------------------
 
@@ -1401,6 +1636,9 @@ TEST_FUNCTIONS = {
     "namespace-discovery": test_namespace_discovery,
     "fetch": test_fetch,
     "join": test_join,
+    "subscribe-namespace-lifecycle": test_subscribe_namespace_lifecycle,
+    "publish-track-only": test_publish_track_only,
+    "publish-track-subscribe": test_publish_track_subscribe,
 }
 
 

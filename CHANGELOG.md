@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Interop client: the standard run adds subscribe-namespace-lifecycle, namespace-discovery, publish-track-only and publish-track-subscribe.
 - CI: release.yml requires green CI and MoQ conformance on the release tree instead of re-running them, publishes the wheel it smoke-tested, and has a `dry_run` input; conformance runs on release branches only, and a new push cancels the run it supersedes.
 
 ## v0.13.0
