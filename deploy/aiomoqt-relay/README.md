@@ -103,7 +103,7 @@ the host keeps other per-packet work off its cores:
 
 ## Relay image
 
-The relay runs the newest aiomoqt (`gmarzot-0.12.0`) and aiopquic (`gmarzot-0.5.0`) code, built on
+The relay runs the newest aiomoqt (`gmarzot-0.13.1`) and aiopquic (`gmarzot-0.7.0`) code, built on
 the host from the repo's `Dockerfile`. The build context has no `.git`, so pass the version
 explicitly. Run `python -m setuptools_scm` in the checkout to get it.
 
