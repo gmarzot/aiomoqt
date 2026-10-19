@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Publisher: a PUBLISH_OK (d16, d18) or SUBSCRIBE that omits FORWARD starts delivery, the default of 1 (§10.2.12).
 - Interop client: the standard run adds subscribe-namespace-lifecycle, namespace-discovery, publish-track-only and publish-track-subscribe.
 - CI: release.yml requires green CI and MoQ conformance on the release tree instead of re-running them, publishes the wheel it smoke-tested, and has a `dry_run` input; conformance runs on release branches only, and a new push cancels the run it supersedes.
 

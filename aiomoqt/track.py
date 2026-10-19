@@ -954,7 +954,8 @@ class PublishedTrack(Track):
         if self._held_by_subscribe(sub, msg.request_id):
             return
         sub.take_timeouts(getattr(msg, 'parameters', None), session._profile)
-        self._set_forward(sub, msg.forward)
+        # An omitted FORWARD means 1 everywhere but REQUEST_UPDATE.
+        self._set_forward(sub, 1 if msg.forward is None else msg.forward)
         if sub.forward:
             await self._start_generating(session, "PUBLISH_OK")
 
@@ -975,6 +976,10 @@ class PublishedTrack(Track):
         if forward is None:
             forward = (reply.parameters or {}).get(ParamType.FORWARD) \
                 if hasattr(reply, 'parameters') else None
+        # Omitted means 1 (§10.2.12); from d20 PUBLISH_OK carries no
+        # FORWARD and the PUBLISH's own value stands.
+        if forward is None and not sub.session._profile.publish_ok_expires_only:
+            forward = 1
         logger.info(f"Track: PUBLISH_OK (REQUEST_OK): forward={forward}")
         sub.take_timeouts(getattr(reply, 'parameters', None),
                           sub.session._profile)
@@ -1080,7 +1085,8 @@ class PublishedTrack(Track):
         sub.location_filter = getattr(msg, 'location_filter', None)
         sub.group_order = getattr(msg, 'group_order', None)
         sub.take_timeouts(getattr(msg, 'parameters', None), session._profile)
-        self._set_forward(sub, getattr(msg, 'forward', None))
+        forward = getattr(msg, 'forward', None)
+        self._set_forward(sub, 1 if forward is None else forward)
         self._start_fill(session, sub, msg, reported)
         if sub.forward:
             sub.joining[msg.request_id] = reported
