@@ -262,6 +262,16 @@ class _SubgroupSender:
         self.sub.senders.discard(self)
         self.track._stream_closed(self.sub)
 
+    def encode_open(self, object_id: int, payload: bytes, extensions):
+        """Wire bytes for an object on this subgroup's open stream while the
+        subscription forwards unfiltered; None when send() must handle it."""
+        sub = self.sub
+        if (self.stream_id is None or not sub.forward
+                or sub.window is not _UNFILTERED):
+            return None
+        return self.header.next_object_bytes(
+            payload, extensions, ObjectStatus.NORMAL, object_id)
+
     async def send(self, object_id: int, payload: bytes,
                    extensions) -> int:
         """Write one object; bytes written, 0 when the window excludes
@@ -1623,7 +1633,15 @@ class PublishedTrack(Track):
                 extensions = {LOC_TIMESTAMP: int(time.time() * 1_000_000)}
                 self._remember(group_id, cur_obj_id, payload, subgroup_id,
                                extensions)
-                obj_bytes = await sender.send(cur_obj_id, payload, extensions)
+                data = sender.encode_open(cur_obj_id, payload, extensions)
+                if data is None:
+                    obj_bytes = await sender.send(cur_obj_id, payload,
+                                                  extensions)
+                else:
+                    if session._close_err is not None:
+                        raise asyncio.CancelledError
+                    await session.stream_write_drain(sender.stream_id, data)
+                    obj_bytes = len(data)
                 cur_obj_id += self.num_subgroups
                 if obj_bytes:
                     local_sent += 1
@@ -2105,9 +2123,17 @@ class VideoTrack(PublishedTrack):
 
                 extensions = {
                     LOC_TIMESTAMP: int(time.time() * 1_000_000)}
-                self._remember(group_id, cur_obj_id, payload,
-                               subgroup_id=subgroup_id, extensions=extensions)
-                obj_bytes = await sender.send(cur_obj_id, payload, extensions)
+                self._remember(group_id, cur_obj_id, payload, subgroup_id,
+                               extensions)
+                data = sender.encode_open(cur_obj_id, payload, extensions)
+                if data is None:
+                    obj_bytes = await sender.send(cur_obj_id, payload,
+                                                  extensions)
+                else:
+                    if session._close_err is not None:
+                        raise asyncio.CancelledError
+                    await session.stream_write_drain(sender.stream_id, data)
+                    obj_bytes = len(data)
                 cur_obj_id += self.num_subgroups
                 if obj_bytes:
                     local_sent += 1
