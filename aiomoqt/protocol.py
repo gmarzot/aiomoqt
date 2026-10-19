@@ -1169,11 +1169,15 @@ class _MOQTSessionMixin:
         try:
             cb(*args)
         except Exception:
-            self._object_cb_errors += 1
-            if self._object_cb_errors == 1:
-                logger.warning("object callback raised", exc_info=True)
-            else:
-                logger.debug("object callback raised", exc_info=True)
+            self._object_cb_raised()
+
+    def _object_cb_raised(self) -> None:
+        """Count and log the object callback exception being handled."""
+        self._object_cb_errors += 1
+        if self._object_cb_errors == 1:
+            logger.warning("object callback raised", exc_info=True)
+        else:
+            logger.debug("object callback raised", exc_info=True)
 
     def _object_cb(self, track_alias) -> Optional[Callable]:
         """Delivery callback for a track: per-alias route, else global."""
@@ -1753,12 +1757,16 @@ class _MOQTSessionMixin:
                     # only now.
                     state.subgroup_id = getattr(
                         state.parser, 'subgroup_id', None)
-                args = (msg_obj, consumed, now,
-                        state.group_id, state.subgroup_id)
                 if cb:
-                    self._call_object_cb(cb, *args)
+                    try:
+                        cb(msg_obj, consumed, now, state.group_id,
+                           state.subgroup_id)
+                    except Exception:
+                        self._object_cb_raised()
                 else:
-                    self._hold_early_object(alias, consumed, args)
+                    self._hold_early_object(
+                        alias, consumed, (msg_obj, consumed, now,
+                                          state.group_id, state.subgroup_id))
                 if terminal:
                     self._note_object_bound(alias, state.group_id,
                                             msg_obj.object_id, msg_obj.status)
@@ -2324,11 +2332,14 @@ class _MOQTSessionMixin:
                 self._malformed_track(alias, reason)
                 return
         cb = self._object_cb(alias)
-        args = (msg, consumed, now, msg.group_id, None)
         if cb:
-            self._call_object_cb(cb, *args)
+            try:
+                cb(msg, consumed, now, msg.group_id, None)
+            except Exception:
+                self._object_cb_raised()
         else:
-            self._hold_early_object(alias, consumed, args)
+            self._hold_early_object(alias, consumed,
+                                    (msg, consumed, now, msg.group_id, None))
         eog = getattr(msg, 'end_of_group', False)
         if eog or status != ObjectStatus.NORMAL:
             self._note_object_bound(alias, msg.group_id, msg.object_id,

@@ -38,6 +38,9 @@ class _RecordingSender:
         self.header = SimpleNamespace(group_id=group_id)
         self.events.append(("group", self.subgroup_id, group_id))
 
+    def encode_open(self, object_id, payload, extensions):
+        return None
+
     async def send(self, object_id, payload, extensions):
         await asyncio.sleep(0.004 if self.subgroup_id == _SLOW else 0)
         return len(payload)
@@ -116,7 +119,15 @@ async def test_a_late_subscriber_gets_every_subgroup_of_each_group(
             await asyncio.sleep(0.008)
         return await real_send(self, object_id, payload, extensions)
 
+    real_encode = track_mod._SubgroupSender.encode_open
+
+    def _encode(self, object_id, payload, extensions):
+        if self.subgroup_id == _SLOW:
+            return None                     # every object goes through _send
+        return real_encode(self, object_id, payload, extensions)
+
     monkeypatch.setattr(track_mod._SubgroupSender, "send", _send)
+    monkeypatch.setattr(track_mod._SubgroupSender, "encode_open", _encode)
     port = _BASE_PORT + 10 + (not use_quic)
     _reset_relay_state()
     server = relay._build_server("localhost", port, CERT, KEY,
