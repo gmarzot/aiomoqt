@@ -24,32 +24,25 @@ name: MoQ conformance
 # moxygen needs folly/proxygen via getdeps, far too slow for a gate).
 # The tag is pinned in .github/moxygen-pin.
 #
-# Runs on push to main and to a release branch, and on demand.
+# Runs on push to a release branch, and on demand. Main only receives a
+# squash of a release branch's tree, which release.yml checks was scored.
 # workflow_dispatch is only offered for workflows present on the default
 # branch, so until this lands on main the branch trigger is what runs it.
 
 on:
   push:
-    branches: [main, 'gmarzot-*']
+    branches: ['gmarzot-*']
   workflow_dispatch:
     inputs:
       ref:
         description: 'Branch or SHA to test (defaults to the current ref)'
         required: false
         type: string
-  workflow_call:
-    inputs:
-      ref:
-        description: 'Branch, tag or SHA to test'
-        required: false
-        type: string
 
-# Per commit, not per branch: a conformance run is a measurement of one
-# commit and takes ~15 minutes, so a later push starts its own run
-# instead of cancelling the score still being collected.
+# A newer push to the branch supersedes the run still scoring the old head.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.sha }}
-  cancel-in-progress: false
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"

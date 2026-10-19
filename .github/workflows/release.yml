@@ -1,8 +1,10 @@
 name: Release
 
-# Manually triggered from the Actions tab. Creates the tag, runs a
-# final test matrix as a gate, then publishes to TestPyPI -> PyPI,
-# cuts a GitHub Release, and pushes the Docker image to GHCR.
+# Manually triggered from the Actions tab. Requires green CI and MoQ
+# conformance on a commit with this exact tree (no re-run), builds the
+# wheel and sdist once, smoke-tests the wheel in a clean venv, then tags,
+# publishes those files to TestPyPI -> PyPI, cuts a GitHub Release, and
+# pushes the Docker image to GHCR.
 #
 # workflow_dispatch is restricted to repo collaborators with write
 # access by GitHub's default policy, so this is effectively owner-only.
@@ -14,6 +16,10 @@ on:
         description: 'Version to release (e.g. 0.8.2, must match N.N.N)'
         required: true
         type: string
+      dry_run:
+        description: 'Verify, build and smoke-test only: no tag, no publish'
+        type: boolean
+        default: false
 
 # Opt every job + every third-party action into the Node 24 runtime
 # ahead of GitHub's 2026-06-02 hard cutover (Node 20 removed entirely
@@ -23,7 +29,104 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+    - name: Require green CI and MoQ conformance on this tree
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPO: ${{ github.repository }}
+      run: |
+        tree_of() { gh api "repos/$REPO/git/commits/$1" --jq .tree.sha; }
+        tree=$(tree_of "$GITHUB_SHA")
+        echo "release tree $tree (commit $GITHUB_SHA)"
+        # A run records its head commit. For a PR run that is the head,
+        # whose tree is the tested merge once main is merged back into it.
+        for wf in ci.yml moq-conformance.yml; do
+          found=""
+          for sha in $(gh api "repos/$REPO/actions/workflows/$wf/runs?status=success&per_page=100" \
+                         --jq '.workflow_runs[].head_sha' | awk '!seen[$0]++'); do
+            if [ "$(tree_of "$sha")" = "$tree" ]; then found=$sha; break; fi
+          done
+          if [ -z "$found" ]; then
+            echo "error: no successful $wf run on a commit with tree $tree" \
+                 "(still running, or not run on this content)" >&2
+            exit 1
+          fi
+          echo "$wf: green on $found"
+        done
+
+  build:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    - name: Build sdist and wheel
+      env:
+        PYTHONWARNINGS: "ignore::UserWarning"
+        SETUPTOOLS_SCM_PRETEND_VERSION_FOR_AIOMOQT: ${{ inputs.version }}
+      run: |
+        python -m pip install --upgrade pip build
+        python -m build
+    - uses: actions/upload-artifact@v4
+      with:
+        name: dist
+        path: dist/
+
+  smoke:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+    steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+    - uses: actions/download-artifact@v4
+      with:
+        name: dist
+        path: dist
+    - name: Install the wheel in a clean venv
+      run: |
+        python -m venv /tmp/venv
+        # aiopquic released minutes earlier may not be on the index yet.
+        for _ in 1 2 3 4 5; do
+          /tmp/venv/bin/pip install dist/*.whl && exit 0
+          sleep 60
+        done
+        exit 1
+    - name: Version and loopback pub/sub, raw QUIC and WebTransport
+      working-directory: /tmp
+      run: |
+        got=$(/tmp/venv/bin/python -I -c "import aiomoqt; print(aiomoqt.__version__)")
+        if [ "$got" != "${{ inputs.version }}" ]; then
+          echo "error: installed aiomoqt $got, expected ${{ inputs.version }}" >&2
+          exit 1
+        fi
+        openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem \
+          -days 1 -subj "/CN=localhost" 2>/dev/null
+        for t in -Q -W; do
+          /tmp/venv/bin/moq-loopback-bench $t -t 3 -s 1024 -r 2000 \
+            --cert cert.pem --key key.pem | tee bench.txt
+          n=$(sed -n 's/^ *Objects: *\([0-9,]*\).*/\1/p' bench.txt | tr -d ,)
+          if [ "${n:-0}" -le 0 ]; then
+            echo "error: no objects delivered ($t)" >&2
+            exit 1
+          fi
+        done
+
   tag:
+    needs: smoke
+    if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.validate.outputs.version }}
@@ -64,70 +167,24 @@ jobs:
         git push origin "$VERSION"
         echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-  test:
-    needs: tag
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.12", "3.13", "3.14"]
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        ref: ${{ needs.tag.outputs.version }}
-        fetch-depth: 0
-    - uses: ./.github/actions/setup-aiomoqt
-      with:
-        python-version: ${{ matrix.python-version }}
-    - name: Generate self-signed cert for loopback
-      run: |
-        mkdir -p certs
-        openssl req -x509 -newkey rsa:2048 -nodes \
-          -keyout certs/key.pem -out certs/cert.pem \
-          -days 1 -subj "/CN=localhost"
-    - name: Run unit + integration tiers
-      run: |
-        python tests/release_regression_test.py \
-          --test-tier unit --test-tier integration
-    - name: Upload logs on failure
-      if: failure()
-      uses: actions/upload-artifact@v4
-      with:
-        name: regression-logs-py${{ matrix.python-version }}
-        path: /tmp/aiomoqt-regression.*/
-
-  conformance:
-    needs: tag
-    uses: ./.github/workflows/moq-conformance.yml
-    with:
-      ref: ${{ needs.tag.outputs.version }}
-
   publish-test:
-    needs: [tag, test, conformance]
+    needs: tag
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-      with:
-        ref: ${{ needs.tag.outputs.version }}
-        fetch-depth: 0
-    - name: Set up Python
-      uses: actions/setup-python@v5
+    - uses: actions/setup-python@v5
       with:
         python-version: "3.12"
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install build twine
-    - name: Build and publish to TestPyPI
+    - uses: actions/download-artifact@v4
+      with:
+        name: dist
+        path: dist
+    - name: Publish to TestPyPI
       env:
         TWINE_USERNAME: __token__
         TWINE_PASSWORD: ${{ secrets.TEST_PYPI_API_TOKEN }}
         TWINE_REPOSITORY_URL: https://test.pypi.org/legacy/
-        PYTHONWARNINGS: "ignore::UserWarning"
-        # Force exact version, bypassing setuptools_scm git/tree
-        # detection. Insurance against dirty-tree at the tagged commit.
-        SETUPTOOLS_SCM_PRETEND_VERSION_FOR_AIOMOQT: ${{ needs.tag.outputs.version }}
       run: |
-        python -m build
+        python -m pip install --upgrade pip twine
         # TestPyPI is a staging gate; retry it and skip files a previous
         # attempt already landed. Production stays strict below.
         for attempt in 1 2 3; do
@@ -139,32 +196,23 @@ jobs:
         exit 1
 
   publish-prod:
-    needs: [tag, test, publish-test]
+    needs: [tag, publish-test]
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-      with:
-        ref: ${{ needs.tag.outputs.version }}
-        fetch-depth: 0
-    - name: Set up Python
-      uses: actions/setup-python@v5
+    - uses: actions/setup-python@v5
       with:
         python-version: "3.12"
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install build twine
-    - name: Build and publish to PyPI
+    - uses: actions/download-artifact@v4
+      with:
+        name: dist
+        path: dist
+    - name: Publish to PyPI
       env:
         TWINE_USERNAME: __token__
         TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
         TWINE_REPOSITORY_URL: https://upload.pypi.org/legacy/
-        PYTHONWARNINGS: "ignore::UserWarning"
-        # Force exact version, bypassing setuptools_scm git/tree
-        # detection. Insurance against dirty-tree at the tagged commit.
-        SETUPTOOLS_SCM_PRETEND_VERSION_FOR_AIOMOQT: ${{ needs.tag.outputs.version }}
       run: |
-        python -m build
+        python -m pip install --upgrade pip twine
         twine upload dist/*
 
   github-release:
