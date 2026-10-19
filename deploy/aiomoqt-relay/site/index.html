@@ -52,11 +52,22 @@
   p { margin: 10px 0 0; }
   .note { color: var(--dim); font-size: 13px; }
   footer { margin-top: 32px; }
-  [data-versions] { margin-top: 4px; font-size: 12px; }
+  [data-versions] { margin-top: 4px; font-size: 12px; white-space: pre-line; }
   [data-versions]:empty { display: none; }
   .warn { border-left: 3px solid var(--red); padding: 6px 10px; margin: 0 0 12px; background: #1d1513;
     font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   @media (max-width: 900px) { .warn { white-space: normal; } }
+  .relay { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr); gap: 12px 24px;
+    align-items: center; }
+  @media (max-width: 760px) { .relay { grid-template-columns: minmax(0, 1fr); } }
+  .card.dash { border-color: var(--red); }
+  .card.dash strong { color: var(--red); }
+  code.url {
+    background: #1d1a10; color: var(--gold); border: 1.5px solid var(--gold); border-radius: 6px;
+    padding: 3px 10px; font-weight: 700;
+  }
+  .relay dl { align-items: center; }
+  footer a.quiet, footer a.quiet:hover { color: inherit; }
 </style>
 </head>
 <body>
@@ -84,15 +95,20 @@
     <h2>aiomoqt ersatz relay — limited testing only</h2>
     <p class="warn">For limited interop testing. Please keep traffic light: excessive traffic or
       extended relay testing is discouraged. Not a production relay.</p>
-    <dl>
-      <dt>WebTransport</dt><dd><code>https://aiomoqt-relay.marzresearch.net:4443/</code></dd>
-      <dt>Raw QUIC</dt><dd><code>moqt://aiomoqt-relay.marzresearch.net:4443</code></dd>
-      <dt>Drafts</dt><dd>22, 20, 18, 16, 14 (highest common draft wins)</dd>
-      <dt>Status</dt><dd><a href="/relay/" target="_blank" rel="noopener">live relay dashboard</a></dd>
-    </dl>
+    <div class="relay">
+      <a class="card dash" href="/relay/" target="_blank" rel="noopener">
+        <strong>Live relay dashboard ↗</strong>
+        <span>Publishers, subscribers, tracks, bandwidth and latency, live</span>
+      </a>
+      <dl>
+        <dt>WebTransport</dt><dd><code class="url">https://aiomoqt-relay.marzresearch.net:4443/</code></dd>
+        <dt>Raw QUIC</dt><dd><code class="url">moqt://aiomoqt-relay.marzresearch.net:4443</code></dd>
+        <dt>Drafts</dt><dd>22, 20, 18, 16, 14</dd>
+      </dl>
+    </div>
   </section>
 
-  <footer class="note"><a href="/private/" title="Password required">private ↗</a>
+  <footer class="note">MoQ Ersatz Relay · <a class="quiet" href="/private/">A Marz Research Project</a>
     <div data-versions></div>
   </footer>
 </main>

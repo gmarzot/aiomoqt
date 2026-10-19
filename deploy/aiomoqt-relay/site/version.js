@@ -40,8 +40,10 @@
     const nodes = document.querySelectorAll('[data-versions]');
     if (!nodes.length) return;
     const [platform, site] = await Promise.all([get('/status/platform.json'), get('/VERSION')]);
-    const line = relayParts(platform).concat(pagesParts(site)).join(' · ');
-    for (const n of nodes) n.textContent = line;
+    // One line for the relay, one for the G5 pages ([data-versions] is pre-line).
+    const lines = [relayParts(platform), pagesParts(site)].filter((p) => p.length);
+    const text = lines.map((p) => p.join(' · ')).join('\n');
+    for (const n of nodes) n.textContent = text;
   }
 
   render();
