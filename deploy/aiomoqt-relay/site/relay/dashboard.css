@@ -305,7 +305,6 @@ footer {
   font-size: 13px;
 }
 footer code { color: var(--dim); }
-footer [data-versions] { margin-top: 4px; font-size: 12px; }
 footer [data-versions]:empty { display: none; }
 
 @media (max-width: 1100px) {
