@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Relay: d16 SUBSCRIBE_NAMESPACE follows its Subscribe Options; NAMESPACE (0x01) or both (0x02) gets NAMESPACE and NAMESPACE_DONE.
+- Relay: d14 namespace subscribers are forwarded PUBLISH_NAMESPACE and PUBLISH_NAMESPACE_DONE.
+- Relay: a namespace whose last publisher's session closes is withdrawn from namespace subscribers.
 - Publisher: a PUBLISH_OK (d16, d18) or SUBSCRIBE that omits FORWARD starts delivery, the default of 1 (§10.2.12).
 - Interop client: the standard run adds subscribe-namespace-lifecycle, namespace-discovery, publish-track-only and publish-track-subscribe.
 - CI: release.yml requires green CI and MoQ conformance on the release tree instead of re-running them, publishes the wheel it smoke-tested, and has a `dry_run` input; conformance runs on release branches only, and a new push cancels the run it supersedes.

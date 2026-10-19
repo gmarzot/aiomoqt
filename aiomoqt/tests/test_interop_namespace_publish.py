@@ -58,7 +58,7 @@ def test_the_standard_run_includes_every_case():
 
 @requires_certs
 @_TRANSPORTS
-@pytest.mark.parametrize("draft", [18, 20, 22])
+@pytest.mark.parametrize("draft", [16, 18, 20, 22])
 async def test_namespace_lifecycle_through_the_relay(draft, use_quic):
     r = await _run(_LIFECYCLE, _port(_LIFECYCLE, draft, use_quic), draft,
                    use_quic)
@@ -73,17 +73,6 @@ async def test_namespace_lifecycle_skips_draft_14(use_quic):
     r = await _run(_LIFECYCLE, _port(_LIFECYCLE, 14, use_quic), 14, use_quic)
     assert r.skipped and r.passed
     assert r.skip_reason == "NAMESPACE is draft-16; negotiated draft-14"
-
-
-@requires_certs
-@_TRANSPORTS
-@pytest.mark.xfail(strict=True,
-                   reason="the relay ignores d16 Subscribe Options and "
-                          "sends no NAMESPACE")
-async def test_namespace_lifecycle_draft_16(use_quic, monkeypatch):
-    monkeypatch.setattr(client, "_LIFECYCLE_STEP_S", 0.5)
-    r = await _run(_LIFECYCLE, _port(_LIFECYCLE, 16, use_quic), 16, use_quic)
-    assert r.passed, r.message
 
 
 @requires_certs

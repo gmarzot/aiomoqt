@@ -971,6 +971,7 @@ def _forget_session(session) -> None:
     its downstream subscriptions."""
     _track_subs[:] = [e for e in _track_subs if e[0] is not session]
     _ns_subs[:] = [e for e in _ns_subs if e[0] is not session]
+    _announce_subs[:] = [e for e in _announce_subs if e[0] is not session]
     _no_datagrams.pop(id(session), None)
     for k in [k for k in _announce_requests if k[0] == id(session)]:
         del _announce_requests[k]
@@ -978,6 +979,7 @@ def _forget_session(session) -> None:
         if _announced[ns].pop(session, None) is not None and \
                 not _announced[ns]:
             del _announced[ns]
+            _retract_namespace(ns)
             # This session's own prefix subscriptions were dropped just
             # above, so this reaches the observers that remain.
             _retract_namespace(ns)
@@ -1021,6 +1023,7 @@ async def _on_publish_namespace(session, msg):
         lambda rid, s=session: _withdraw_namespace(s, request_id=rid))
     logger.info(f"relay: announce ns={ns} -> {len(holders)} publisher(s)")
     _announce_namespace(ns)
+    _forward_announcements(ns, session)
     # Reuse the protocol's built-in OK helper. It emits RequestOk on
     # d16+ and PublishNamespaceOk on d14, matching peer expectation.
     session.publish_namepace_ok(msg)
@@ -1821,8 +1824,15 @@ def parse_args():
 
 # SUBSCRIBE_TRACKS subscribers: (session, prefix_tuple, request_id).
 _track_subs: list = []
-# (session, prefix, request_id) for d18 SUBSCRIBE_NAMESPACE subscribers.
+# (session, prefix, request_id) for SUBSCRIBE_NAMESPACE subscribers sent
+# NAMESPACE / NAMESPACE_DONE: d18 on, and d16 when Subscribe Options ask.
 _ns_subs: list = []
+# (session, prefix, request_id) for d14 SUBSCRIBE_NAMESPACE subscribers,
+# forwarded PUBLISH_NAMESPACE / PUBLISH_NAMESPACE_DONE.
+_announce_subs: list = []
+# d16 SUBSCRIBE_NAMESPACE Subscribe Options.
+_SUBSCRIBE_OPTIONS_NAMESPACE = 0x01
+_SUBSCRIBE_OPTIONS_BOTH = 0x02
 
 
 def _prefix_covers(prefix, ns) -> bool:
@@ -2074,9 +2084,9 @@ async def _on_fetch(session, msg):
 async def _on_subscribe_namespace(session, msg):
     """Namespace discovery (§9.4). d18 answers NAMESPACE per namespace
     under the prefix — the subscriber then asks each one for its tracks
-    with SUBSCRIBE_TRACKS. d14/d16 have no NAMESPACE message: the same
-    prefix subscription is answered with a PUBLISH per matching track,
-    present and future, which is what those drafts expect."""
+    with SUBSCRIBE_TRACKS. d16 sends NAMESPACE, a PUBLISH per matching
+    track, or both, as its Subscribe Options ask. d14 forwards matching
+    PUBLISH_NAMESPACEs and a PUBLISH per matching track."""
     prefix = _ns_tuple(msg.namespace_prefix)
     _watch_session(session, prefix)
     session.subscribe_namespace_ok(
@@ -2087,6 +2097,8 @@ async def _on_subscribe_namespace(session, msg):
                        if not (e[0] is s and e[2] == r)]
         _track_subs[:] = [e for e in _track_subs
                           if not (e[0] is s and e[2] == r)]
+        _announce_subs[:] = [e for e in _announce_subs
+                             if not (e[0] is s and e[2] == r)]
     session.register_request_cancel_handler(msg.request_id, _drop)
 
     if session._profile.two_level_discovery:
@@ -2096,6 +2108,21 @@ async def _on_subscribe_namespace(session, msg):
         logger.info(f"relay: subscribe-namespace prefix={prefix} "
                     f"(d18 discovery, subs={len(_ns_subs)})")
         return
+
+    options = msg.subscribe_options
+    if not is_draft16_or_later(session.negotiated_draft):
+        _announce_subs.append((session, prefix, msg.request_id))
+        for ns in list(_announced):
+            if _prefix_covers(prefix, ns):
+                _forward_announce(session, ns)
+    elif options in (_SUBSCRIBE_OPTIONS_NAMESPACE, _SUBSCRIBE_OPTIONS_BOTH):
+        _ns_subs.append((session, prefix, msg.request_id))
+        for ns in _known_namespaces(prefix):
+            _offer_namespace(session, msg.request_id, prefix, ns)
+        if options == _SUBSCRIBE_OPTIONS_NAMESPACE:
+            logger.info(f"relay: subscribe-namespace prefix={prefix} "
+                        f"(d16 NAMESPACE, subs={len(_ns_subs)})")
+            return
 
     _track_subs.append((session, prefix, msg.request_id))
     logger.info(f"relay: subscribe-namespace prefix={prefix} "
@@ -2128,14 +2155,32 @@ def _offer_namespace(session, request_id, prefix, ns) -> None:
 
 
 def _announce_namespace(ns) -> None:
-    """Tell d18 prefix subscribers about a namespace that just appeared."""
+    """Tell NAMESPACE subscribers about a namespace that just appeared."""
     for session, prefix, rid in list(_ns_subs):
         if _prefix_covers(prefix, ns) and _session_live(session):
             _offer_namespace(session, rid, prefix, ns)
 
 
+def _forward_announcements(ns, publisher) -> None:
+    """d14: forward a new PUBLISH_NAMESPACE to namespace subscribers."""
+    for session, prefix, _rid in list(_announce_subs):
+        if session is not publisher and _prefix_covers(prefix, ns):
+            _forward_announce(session, ns)
+
+
+def _forward_announce(session, ns) -> None:
+    """One PUBLISH_NAMESPACE to a d14 namespace subscriber, once."""
+    if not _session_live(session) or session.is_announced(ns):
+        return
+    try:
+        session.publish_namespace(namespace=ns)
+    except Exception:
+        logger.debug("relay: PUBLISH_NAMESPACE forward failed", exc_info=True)
+
+
 def _retract_namespace(ns) -> None:
-    """Tell d18 prefix subscribers a namespace has gone (§10.8).
+    """Tell prefix subscribers a namespace has gone (§10.8): NAMESPACE_DONE
+    from d16, PUBLISH_NAMESPACE_DONE at d14.
 
     The counterpart to _announce_namespace: an observer that was told a
     namespace exists otherwise goes on believing it after the last
@@ -2147,6 +2192,14 @@ def _retract_namespace(ns) -> None:
                 session.namespace_done(ns[len(prefix):], request_id=rid)
             except Exception:
                 logger.debug("relay: NAMESPACE_DONE failed", exc_info=True)
+    for session, prefix, _rid in list(_announce_subs):
+        if (_prefix_covers(prefix, ns) and _session_live(session)
+                and session.is_announced(ns)):
+            try:
+                session.publish_namespace_done(namespace=ns)
+            except Exception:
+                logger.debug("relay: PUBLISH_NAMESPACE_DONE failed",
+                             exc_info=True)
 
 
 async def _on_subscribe_tracks(session, msg):
