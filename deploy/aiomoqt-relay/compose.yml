@@ -25,7 +25,7 @@ services:
       MOQT_PORT: "4443"
       MOQT_CERT: /etc/letsencrypt/live/aiomoqt-relay.marzresearch.net/fullchain.pem
       MOQT_KEY: /etc/letsencrypt/live/aiomoqt-relay.marzresearch.net/privkey.pem
-    command: ["--draft", "22,20,18,16,14", "--watchdog", "15", "--status-dir", "/status",
+    command: ["--draft", "22,20,18,16,14", "--watchdog", "30", "--status-dir", "/status",
               "--log-dir", "/logs"]
     volumes:
       - /etc/letsencrypt:/etc/letsencrypt:ro

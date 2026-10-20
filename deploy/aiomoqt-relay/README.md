@@ -5,7 +5,7 @@ dashboard, and the G5 Broadcast and G5 Player test pages. The relay is open, wit
 
 | Service | Container | What it does |
 |---|---|---|
-| `relay` | `ersatz-relay` | `moq_interop_relay` on UDP 4443, raw QUIC and WebTransport, drafts 22/20/18/16/14, `--watchdog 15`, writes `status/` and `relay-logs/` |
+| `relay` | `ersatz-relay` | `moq_interop_relay` on UDP 4443, raw QUIC and WebTransport, drafts 22/20/18/16/14, `--watchdog 30`, writes `status/` and `relay-logs/` |
 | `web` | `relay-web` | nginx on 80/443: landing page, `/g5-broadcast/`, `/g5-player/`, `/relay/` dashboard, `/relay/platform/` and `/relay/logs/`, `/status/{status,platform}.json`, `/private/`, `/stats/` |
 | `goaccess` | `relay-goaccess` | rebuilds the visitor reports in `stats/` every 5 minutes from `logs/`; no network |
 
@@ -170,7 +170,7 @@ curl -s -o /dev/null -w '%{http_code}\n' https://aiomoqt-relay.marzresearch.net/
 curl -s -o /dev/null -w '%{http_code}\n' https://aiomoqt-relay.marzresearch.net/relay/logs/files/relay.log    # 401 too
 ```
 
-`docker logs ersatz-relay` shows a watchdog probe under `aiomoqt-watchdog/…` every 15 s. That is
+`docker logs ersatz-relay` shows a watchdog probe under `aiomoqt-watchdog/…` every 30 s. That is
 expected, and the dashboard leaves it out.
 
 ## Taking it down
