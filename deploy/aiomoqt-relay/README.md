@@ -149,6 +149,14 @@ tar -C examples/dist -cf - assets g5-broadcast g5-player | ssh ubuntu@aiomoqt-re
 files. `crash.log` gets a `relay: start` line at each start and the faulthandler dump of a native
 crash or watchdog stall. It is not rotated, so trim it by hand if it grows.
 
+In the log viewer, Shift- or Ctrl-click on "Load earlier" loads the whole selected file (up to
+200,000 records).
+
+DEBUG logging: the switch on `/private/` and in the log viewer, or `docker kill -s USR1 ersatz-relay`;
+either toggles it and logs `relay: debug logging on/off`. The switch reaches the relay's `--control`
+socket (`status/control.sock`) through `/private/debug`, which needs the password and, for POST, an
+`X-Relay-Control: 1` header. Never send SIGUSR2: it stops the relay.
+
 ## Core dumps
 
 The relay runs with no core size limit and `./cores` mounted at `/cores`. Ubuntu pipes cores to

@@ -33,7 +33,7 @@ services:
       MOQT_CERT: /etc/letsencrypt/live/aiomoqt-relay.marzresearch.net/fullchain.pem
       MOQT_KEY: /etc/letsencrypt/live/aiomoqt-relay.marzresearch.net/privkey.pem
     command: ["--draft", "22,20,18,16,14", "--watchdog", "30", "--status-dir", "/status",
-              "--log-dir", "/logs"]
+              "--log-dir", "/logs", "--control", "/status/control.sock"]
     volumes:
       # This certificate only; live/ links into archive/.
       - /etc/letsencrypt/live/aiomoqt-relay.marzresearch.net:/etc/letsencrypt/live/aiomoqt-relay.marzresearch.net:ro

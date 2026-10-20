@@ -10,6 +10,8 @@
   const POLL_MS = 2000;
   const LIST_MS = 30000;
   const MAX_RECORDS = 20000;
+  // Shift- or Ctrl-click on "Load earlier" loads the whole file under this cap.
+  const MAX_RECORDS_ALL = 200000;
   const LEVELS = {DEBUG: 10, INFO: 20, WARNING: 30, ERROR: 40, CRITICAL: 50};
   // aiomoqt loggers: "… 20:14:09.826 INFO : msg"; others: "… 20:14:09,826 INFO name: msg".
   const HEAD = /^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d[.,]\d{3}) (DEBUG|INFO|WARNING|ERROR|CRITICAL)(?: +(\S+))? *: /;
@@ -20,7 +22,7 @@
 
   const state = {
     file: 'relay.log', level: 0, q: '', follow: true,
-    records: [], start: 0, end: 0, size: null, gen: 0,
+    records: [], start: 0, end: 0, size: null, gen: 0, cap: MAX_RECORDS,
     polled: null, error: null, timer: null, cursor: {},
   };
 
@@ -91,6 +93,7 @@
   /** Load the last CHUNK bytes of the current file; `note` marks why the view restarted. */
   async function loadTail(note) {
     const gen = ++state.gen;
+    state.cap = MAX_RECORDS;
     let res;
     try {
       res = await getRange(state.file, `bytes=-${CHUNK}`);
@@ -144,10 +147,12 @@
     appendRecords(before, touched);
   }
 
-  async function loadEarlier() {
-    if (state.start <= 0 || state.records.length >= MAX_RECORDS) return;
+  async function loadEarlier(e) {
+    const all = !!(e && (e.shiftKey || e.ctrlKey || e.metaKey));
+    if (all) state.cap = MAX_RECORDS_ALL;
+    if (state.start <= 0 || state.records.length >= state.cap) return;
     const gen = state.gen;
-    const from = Math.max(0, state.start - CHUNK);
+    const from = all ? 0 : Math.max(0, state.start - CHUNK);
     let res;
     try {
       res = await getRange(state.file, `bytes=${from}-${state.start - 1}`);
@@ -257,7 +262,7 @@
   const atBottom = (pane) => pane.scrollHeight - pane.scrollTop - pane.clientHeight < 8;
 
   function trim() {
-    const over = state.records.length - MAX_RECORDS;
+    const over = state.records.length - state.cap;
     if (over <= 0) return;
     for (const r of state.records.splice(0, over)) r.node?.remove();
     state.start = state.records[0].off;
@@ -288,6 +293,7 @@
     const shown = state.records.filter((r) => r.node?.isConnected);
     const s = state.error
       || `${state.file} · ${fmt.bytes(state.size)} · showing ${fmt.bytes(state.end - state.start)}`
+        + (state.start === 0 ? ' (whole file)' : '')
         + ` · ${state.follow ? 'following' : 'paused'}`
         + (state.polled ? `, read ${new Date(state.polled).toISOString().slice(11, 19)} UTC` : '');
     $('status').textContent = s;
@@ -299,9 +305,10 @@
       b.disabled = n === 0;
     }
     const earlier = $('earlier');
-    earlier.disabled = state.start <= 0 || state.records.length >= MAX_RECORDS;
-    earlier.title = state.records.length >= MAX_RECORDS
-      ? `At ${fmt.num(MAX_RECORDS)} records: download the raw file for more.` : '';
+    earlier.disabled = state.start <= 0 || state.records.length >= state.cap;
+    earlier.title = state.records.length >= state.cap
+      ? `At ${fmt.num(state.cap)} records: download the raw file for more.`
+      : 'Shift- or Ctrl-click: load the whole file';
   }
 
   /** Scroll to the latest shown record of `kind`, then to earlier ones on each click. */
