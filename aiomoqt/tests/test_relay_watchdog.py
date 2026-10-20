@@ -247,3 +247,37 @@ def test_sigusr1_toggles_debug_logging():
         assert get_log_level() == logging.INFO
     assert [m for m in records.at(logging.INFO) if "debug logging" in m] == [
         "relay: debug logging on", "relay: debug logging off"]
+
+
+async def test_the_control_socket_reports_and_toggles_debug():
+    import json
+    import tempfile
+    from aiomoqt.tests.test_log_contract import _captured
+    # macOS caps AF_UNIX paths at 104 bytes; pytest's tmp_path is longer.
+    tmp = tempfile.TemporaryDirectory(dir="/tmp")
+    path = os.path.join(tmp.name, "control.sock")
+
+    async def call(method, target="/debug"):
+        reader, writer = await asyncio.open_unix_connection(path)
+        writer.write(f"{method} {target} HTTP/1.1\r\nHost: relay\r\n\r\n"
+                     .encode())
+        data = await reader.read()
+        writer.close()
+        head, _, body = data.partition(b"\r\n\r\n")
+        return head.split(b" ")[1].decode(), json.loads(body)
+
+    before = set(relay._background)
+    with _captured(logging.INFO):
+        await relay._serve_control(path)
+        try:
+            assert await call("GET") == ("200", {"debug": False})
+            assert await call("POST") == ("200", {"debug": True})
+            assert await call("GET") == ("200", {"debug": True})
+            assert await call("POST") == ("200", {"debug": False})
+            assert (await call("GET", "/status"))[0] == "404"
+            assert os.stat(path).st_mode & 0o777 == 0o666
+        finally:
+            for server in set(relay._background) - before:
+                server.close()
+                relay._background.discard(server)
+            tmp.cleanup()

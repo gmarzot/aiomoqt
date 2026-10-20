@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Relay: `--control PATH` serves HTTP on a Unix socket; `GET /debug` reports DEBUG logging and `POST /debug` toggles it, for a button behind the private page.
 - LOC: self-describing objects carry TIMESCALE only when the track sets one; the default 1e6 made LOC read wall-clock timestamps as media time.
 - pub_media: paced sources (mp4, tone, HLS/DASH ingest) stamp each frame with its scheduled wall-clock capture time instead of its send time.
 - Requires aiopquic >= 0.6.1: a raw-QUIC client's close no longer creates a phantom server session.
