@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Relay: `--control PATH` serves HTTP on a Unix socket; `GET /debug` reports DEBUG logging and `POST /debug` toggles it, for a button behind the private page.
 - Requires aiopquic >= 0.6.1: a raw-QUIC client's close no longer creates a phantom server session.
 - Logging: each control message logs once at INFO, where it crosses the wire (`MOQT send:` out, `control message parsed:` in); the handlers' repeat lines, control-stream plumbing and the version-from-ALPN line are DEBUG, and `setup complete: draft-N` logs on both sides.
 - `MOQTServer(quiet_peers=…)`: a session whose peer's SETUP implementation starts with a listed prefix logs below WARNING at DEBUG.

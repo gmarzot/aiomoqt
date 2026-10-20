@@ -52,6 +52,7 @@ import contextlib
 import datetime
 import faulthandler
 import itertools
+import json
 import logging
 from logging.handlers import RotatingFileHandler
 import os
@@ -1795,6 +1796,10 @@ def parse_args():
                              "(a child process relays one object over "
                              "loopback every SEC seconds). 0 = off "
                              "(default).")
+    parser.add_argument("--control", type=str, default=None, metavar="PATH",
+                        help="Serve HTTP on the Unix socket PATH: GET /debug "
+                             "reports DEBUG logging, POST /debug toggles it "
+                             "(as SIGUSR1)")
     parser.add_argument("--status-dir", type=str, default=None, metavar="DIR",
                         help="Write DIR/status.json every "
                              f"{STATUS_INTERVAL_S:g}s for the dashboard: "
@@ -3066,6 +3071,42 @@ def _toggle_debug() -> None:
         logger.info("relay: debug logging on")
 
 
+async def _on_control(reader, writer) -> None:
+    """One HTTP/1.1 request on the control socket."""
+    try:
+        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5.0)
+        method, path = (head.split(b"\r\n", 1)[0].decode("latin-1")
+                        .split(" ")[:2])
+        if path != "/debug" or method not in ("GET", "POST"):
+            status, body = "404 Not Found", {"error": "not found"}
+        else:
+            if method == "POST":
+                _toggle_debug()
+            status = "200 OK"
+            body = {"debug": get_log_level() == logging.DEBUG}
+        data = json.dumps(body).encode()
+        writer.write(f"HTTP/1.1 {status}\r\nContent-Type: application/json"
+                     f"\r\nContent-Length: {len(data)}\r\n"
+                     f"Connection: close\r\n\r\n".encode() + data)
+        await writer.drain()
+    except (asyncio.IncompleteReadError, asyncio.LimitOverrunError,
+            asyncio.TimeoutError, ValueError, ConnectionError):
+        pass
+    finally:
+        writer.close()
+
+
+async def _serve_control(path: str) -> None:
+    """The --control socket; world-writable, for a proxy in another
+    container. Its parent directory decides who can reach it."""
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(path)
+    server = await asyncio.start_unix_server(_on_control, path=path)
+    os.chmod(path, 0o666)
+    _background.add(server)
+    logger.info(f"relay: control socket {path}")
+
+
 async def main():
     args = parse_args()
     speaks = sorted(int(d) for d in MOQTDraft)
@@ -3083,6 +3124,8 @@ async def main():
         _start_log_dir(args.log_dir)
     asyncio.get_running_loop().add_signal_handler(signal.SIGUSR1,
                                                   _toggle_debug)
+    if args.control:
+        await _serve_control(args.control)
     logger.info(f"relay: start {_versions_line()} pid {os.getpid()}")
     print("aiomoqt ERSATZ-RELAY: an API demonstrator and conformance "
           "SUT — not a production relay (no auth, no hardening).",
