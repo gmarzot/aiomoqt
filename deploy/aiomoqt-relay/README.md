@@ -50,6 +50,8 @@ place and `/stats/` fails.
 tar -C deploy/aiomoqt-relay -cf - compose.yml nginx.conf site | ssh ubuntu@aiomoqt-relay.marzresearch.net 'mkdir -p ~/aiomoqt-relay && tar -C ~/aiomoqt-relay -xf -'
 ssh -t ubuntu@aiomoqt-relay.marzresearch.net
 cd ~/aiomoqt-relay && mkdir -p status relay-logs cores logs stats
+# The relay and GoAccess run with no capabilities, so root must own what they write.
+sudo chown root:ubuntu status relay-logs cores stats && sudo chmod 2775 status relay-logs cores stats
 printf 'moqadmin:%s\n' "$(openssl passwd -6)" > stats.htpasswd    # prompts for the password
 sudo tee /etc/logrotate.d/aiomoqt-relay >/dev/null <<'ROT'
 /home/ubuntu/aiomoqt-relay/logs/access.log {
