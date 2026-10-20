@@ -347,17 +347,18 @@ async def _feed_ingest(ingest: Ingest, tracks: dict, args, stats: dict):
     """Send each CMAF chunk paced to its decode time; the first chunk
     anchors the clock, so a live input runs as far behind its edge as
     the demuxer starts."""
-    start = first = None
+    start = first = wall0 = None
     try:
         async for c in ingest.chunks():
             if first is None:
                 start, first = time.monotonic(), c.time_us
+                wall0 = int(time.time() * 1_000_000)
             ts = c.time_us - first
             if ts > args.duration * 1_000_000:
                 break
             await _pace(start, ts, not args.no_pace)
             await _send(tracks[c.track], stats[c.track], c.payload, c.key,
-                        group_id=c.group_id)
+                        timestamp=wall0 + ts, group_id=c.group_id)
     finally:
         ingest.close()
     for track in tracks.values():
@@ -534,8 +535,9 @@ async def _send(track, stats, payload: bytes, key: bool,
     backlog for a late joiner.
 
     LOC timestamps without a TIMESCALE property are µs since the Unix
-    epoch — players schedule against the wall clock. Sources without
-    their own presentation clock are stamped at send time."""
+    epoch — players schedule against the wall clock. Paced sources pass
+    their scheduled capture time; a live source without its own clock is
+    stamped at send time."""
     if track.demand[0] == 0:
         stats.dropped += 1
         return
@@ -641,13 +643,13 @@ async def _report_stats(stats: dict, interval: float, pub: FanoutPublisher):
 
 
 async def _feed_tone(track, args, stats: _TrackStats):
-    start = time.monotonic()
+    start, wall0 = time.monotonic(), int(time.time() * 1_000_000)
     for payload, ts in pcm_tone_frames(
             duration_s=args.duration, freq=args.freq,
             samplerate=_SAMPLERATE, channels=_CHANNELS,
             frame_ms=_FRAME_MS):
         await _pace(start, ts, not args.no_pace)
-        await _send(track, stats, payload, True)
+        await _send(track, stats, payload, True, timestamp=wall0 + ts)
     await track.finish()
 
 
@@ -655,12 +657,12 @@ async def _feed_mp4_track(track, source, args, stats: _TrackStats, *,
                           all_key=False, group_us=None, gap_us=33_333,
                           wrap=None):
     """Feed an mp4 track's samples, paced to their media timestamps and
-    stamped with the wall clock at send (LOC default clock); --loop
+    stamped with their scheduled wall-clock capture time; --loop
     restarts the file at later timestamps (audio: every AU is a sync
     frame, giving LOC's one-object-per-group audio mapping, or with
     group_us one group per that much media time).
     wrap(sample) transforms the payload (CMAF chunking)."""
-    start = time.monotonic()
+    start, wall0 = time.monotonic(), int(time.time() * 1_000_000)
     base_us = 0
     group_ts = None
     while True:
@@ -677,7 +679,7 @@ async def _feed_mp4_track(track, source, args, stats: _TrackStats, *,
                     group_ts = ts
             else:
                 key = all_key or s.key_frame
-            await _send(track, stats, payload, key)
+            await _send(track, stats, payload, key, timestamp=wall0 + ts)
             last = ts
         base_us = last + gap_us
         if not args.loop or base_us > args.duration * 1_000_000:
