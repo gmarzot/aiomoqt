@@ -122,6 +122,14 @@ rather than scattering version checks. New wire shapes need a
 case in `test_wire_conformance.py` — including malformed ones, since the Cython and Python
 codecs can agree on valid bytes while diverging on invalid ones.
 
+**Logging.** INFO tells a session's story, one line per event: setup (`setup complete:
+draft-N`) and close; each control message where it crosses the wire (`MOQT send:` out,
+`control message parsed:` in); and request or track outcomes no message carries (cancellations,
+refusals, forward-state changes, `Track:` and `relay:` summaries). DEBUG is a second view of a
+message already logged, transport plumbing, and anything per object or per data stream. WARNING
+is a tolerated peer deviation or a bound hit; ERROR ends a session. `MOQTServer(quiet_peers=…)`
+logs a health probe's sessions at DEBUG; the relay's SIGUSR1 toggles DEBUG at runtime.
+
 **CHANGELOG.md** is hand-written and fine-grained: one short line per change under
 `## Unreleased`, no narration. Commits are `area: short imperative summary`, e.g.
 `relay: every request gets a terminal reply`. Comments say what the code does or why a

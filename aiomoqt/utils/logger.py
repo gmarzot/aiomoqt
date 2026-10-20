@@ -1,5 +1,6 @@
 import logging
 import sys
+from contextvars import ContextVar
 from logging import getLevelName
 from typing import Optional, Dict, Any
 
@@ -8,6 +9,31 @@ _loggers: Dict[str, logging.Logger] = {}
 
 _level = None
 _handler = None
+
+# True while handling a session whose records below WARNING are DEBUG
+# records (MOQTServer quiet_peers).
+quiet_session: ContextVar[bool] = ContextVar("aiomoqt_quiet_session",
+                                             default=False)
+
+
+class _QuietSessionFilter(logging.Filter):
+    """Demote a quiet session's records below WARNING to DEBUG."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if (logging.DEBUG < record.levelno < logging.WARNING
+                and quiet_session.get()):
+            record.levelno, record.levelname = logging.DEBUG, "DEBUG"
+            logger = _loggers.get(record.name)
+            return logger is not None and logger.isEnabledFor(logging.DEBUG)
+        return True
+
+
+_quiet_filter = _QuietSessionFilter()
+
+
+def get_log_level() -> Optional[int]:
+    """The level set_log_level() last set, None if never set."""
+    return _level
 
 
 def set_log_level(level: any = None) -> any:
@@ -56,6 +82,8 @@ def get_logger(name: str, level: Optional[int] = None) -> logging.Logger:
         # (e.g. multiprocessing workers calling logging.basicConfig)
         # which would emit each message twice.
         logger.propagate = False
+    if _quiet_filter not in logger.filters:
+        logger.addFilter(_quiet_filter)
 
     if _level is not None:
         level = _level
