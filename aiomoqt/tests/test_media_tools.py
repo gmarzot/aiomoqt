@@ -87,8 +87,10 @@ def _pub_args(monkeypatch, *argv):
     ('--packaging', 'locmaf', '--mp4', 'x.mp4', '--loc-codecstring'),
     ('--packaging', 'locmaf', '--mp4', 'x.mp4', '--loc-bare'),
     ('--packaging', 'cmaf', '--mp4', 'x.mp4', '--loc-bare'),
+    ('--packaging', 'locmaf', '--mp4', 'x.mp4', '--loc-timescale', '90000'),
+    ('--loc-timescale', '0'),
 ], ids=['no-source', 'datagram', 'loc-codecstring', 'loc-bare-locmaf',
-        'loc-bare-cmaf'])
+        'loc-bare-cmaf', 'loc-timescale-locmaf', 'loc-timescale-zero'])
 def test_pub_media_locmaf_flag_conflicts(monkeypatch, argv):
     with pytest.raises(SystemExit):
         _pub_args(monkeypatch, *argv)
@@ -125,3 +127,9 @@ def test_writers_name_mp4_files_by_track_when_roles_are_shared(tmp_path):
     assert sorted(p.name for p in tmp_path.iterdir()) == [
         'audio.mp4', 'video.mp4', 'video_locmaf.mp4']
     assert (tmp_path / 'video_locmaf.mp4').read_bytes() == b'video_locmaf'
+
+
+def test_pub_media_loc_timescale_is_parsed(monkeypatch):
+    assert _pub_args(monkeypatch).loc_timescale is None
+    assert _pub_args(monkeypatch, '--loc-timescale', '90000').loc_timescale \
+        == 90000

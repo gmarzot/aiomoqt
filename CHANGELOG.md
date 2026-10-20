@@ -4,6 +4,7 @@
 
 - LOC: self-describing objects carry TIMESCALE only when the track sets one; the default 1e6 made LOC read wall-clock timestamps as media time.
 - pub_media: paced sources (mp4, tone, HLS/DASH ingest) stamp each frame with its scheduled wall-clock capture time instead of its send time.
+- pub_media `--loc-timescale TICKS`: LOC timestamps as media time at TICKS per second, with TIMESCALE on each group's first object (every object with `--loc-codecstring`); LOC packaging only.
 - Requires aiopquic >= 0.6.1: a raw-QUIC client's close no longer creates a phantom server session.
 - Logging: each control message logs once at INFO, where it crosses the wire (`MOQT send:` out, `control message parsed:` in); the handlers' repeat lines, control-stream plumbing and the version-from-ALPN line are DEBUG, and `setup complete: draft-N` logs on both sides.
 - `MOQTServer(quiet_peers=…)`: a session whose peer's SETUP implementation starts with a listed prefix logs below WARNING at DEBUG.
