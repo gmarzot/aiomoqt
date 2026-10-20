@@ -95,9 +95,10 @@ class LocTrackPublisher(PublishedTrack):
     AUDIO_CONFIG per `media_kind`.
 
     `codec_string` makes every object self-describing for receivers
-    without a catalog: each carries CODECSTRING and TIMESCALE (µs unless
-    `timescale` is set), and video objects carry VIDEO_FRAME_MARKING. With
-    TIMESCALE present, LOC reads timestamps as media time, not wall clock.
+    without a catalog: each carries CODECSTRING, and TIMESCALE when
+    `timescale` is set; video objects carry VIDEO_FRAME_MARKING. Without
+    TIMESCALE the timestamps are wall-clock µs, LOC's default; with it,
+    LOC reads them as media time.
 
     `loc_bare` sends the media without the Private Properties block, for
     receivers predating it; MSF CMAF tracks, which are not LOC, use it too.
@@ -180,7 +181,8 @@ class LocTrackPublisher(PublishedTrack):
             exts[prop_id] = ts
         if self.codec_string is not None:
             exts[LOC_PROP_CODECSTRING] = self.codec_string.encode()
-            exts[LOC_PROP_TIMESCALE] = self.timescale or 1_000_000
+            if self.timescale is not None:
+                exts[LOC_PROP_TIMESCALE] = self.timescale
             if self.media_kind == "video":
                 exts[LOC_PROP_VIDEO_FRAME_MARKING] = bytes([
                     _FM_START | _FM_END

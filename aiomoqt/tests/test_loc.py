@@ -253,7 +253,8 @@ async def test_codec_string_properties_on_every_object():
     delta = video._object_extensions(LocFrame(b"p", False, 6), False, _D18)
     for exts in (key, delta):
         assert exts[LOC_PROP_CODECSTRING] == b"avc1.64001F"
-        assert exts[LOC_PROP_TIMESCALE] == 1_000_000
+        # Wall-clock µs: LOC's default, so no TIMESCALE.
+        assert LOC_PROP_TIMESCALE not in exts
     assert key[LOC_PROP_VIDEO_FRAME_MARKING] == b"\xe0"    # S|E|I
     assert delta[LOC_PROP_VIDEO_FRAME_MARKING] == b"\xc0"  # S|E
 
@@ -283,7 +284,7 @@ async def test_codec_string_round_trip():
         server.close()
     assert len(got) == len(_VIDEO_FRAMES)
     assert sub.codec_string == "avc1.64001F"
-    assert sub.timescale == 1_000_000
+    assert sub.timescale is None
     marking = {(g, o): bytes(f.extensions[LOC_PROP_VIDEO_FRAME_MARKING])
                for g, o, f in got}
     assert marking[(0, 0)] == marking[(1, 0)] == b"\xe0"
