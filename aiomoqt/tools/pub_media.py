@@ -157,10 +157,9 @@ def parse_args():
                         help='Make every LOC object self-describing for '
                              'players without a catalog '
                              '(moq-encoder-player): codec string (0x11, '
-                             'proposed, not in loc-04), timescale (0x08) '
-                             'and, on video, frame marking (0x09). With a '
-                             'timescale, LOC reads timestamps as media '
-                             'time rather than wall clock.')
+                             'proposed, not in loc-04) and, on video, '
+                             'frame marking (0x09). Timestamps stay '
+                             'wall-clock µs (no timescale).')
     parser.add_argument('--loc-bare', action='store_true',
                         help='LOC payloads without the (empty) Private '
                              'Properties block 0x0A 0x00, for receivers '
