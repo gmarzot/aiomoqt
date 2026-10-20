@@ -4549,6 +4549,7 @@ class _MOQTSessionMixin:
         parameters: Optional[Dict[int, bytes]] = None,
         wait_response: Optional[bool] = False,
         fetch_parameters: Optional[Dict[int, Any]] = None,
+        on_object: Optional[Callable] = None,
     ) -> Union[Tuple[MOQTMessage, MOQTMessage], Tuple[MOQTMessage, MOQTMessage, 'asyncio.Future']]:
         """Subscribe + Joining Fetch (atomic pair).
 
@@ -4567,6 +4568,9 @@ class _MOQTSessionMixin:
                 AUTHORIZATION_TOKEN: a SUBSCRIBE-only parameter in a FETCH
                 is a protocol violation (d18 §10.2.1).
             fetch_parameters: the FETCH's, over that token.
+            on_object: the subscription's object callback, bound to its
+                alias as SUBSCRIBE_OK arrives; objects that came first are
+                replayed to it.
             wait_response: if True, awaits and returns
                 (subscribe_ok, fetch_ok). If False, returns
                 (subscribe_msg, fetch_msg) sent messages.
@@ -4592,7 +4596,8 @@ class _MOQTSessionMixin:
             sub_msg = self.subscribe(
                 namespace, track_name, priority=subscriber_priority,
                 group_order=group_order,
-                filter_type=FilterType.LATEST_OBJECT, parameters=params)
+                filter_type=FilterType.LATEST_OBJECT, parameters=params,
+                on_object=on_object)
             if not wait_response:
                 return (sub_msg, sub_msg)
             sub_ok = await self._await_response(sub_msg.request_id)
@@ -4615,6 +4620,8 @@ class _MOQTSessionMixin:
             parameters=parameters,
         )
         self._subscriptions[sub_request_id] = [sub_msg]
+        if on_object is not None:
+            self._pending_object_handlers[sub_request_id] = on_object
         # Pre-register response futures before send so loopback / low-RTT
         # peers can't resolve them before our awaiter registers.
         self._pending_requests[sub_request_id] = self._loop.create_future()

@@ -8,6 +8,7 @@
 - Perf: an object on an open, unfiltered subgroup stream is written without a coroutine of its own.
 - Perf: a received object reaches its callback without the per-object wrapper call; a raising callback still costs only that object.
 - SubscribedTrack: an object that arrives before its SUBSCRIBE_OK reaches its own track; the track no longer claims the session-wide `on_object_received`, which sent such objects to whichever track subscribed last.
+- `session.join(on_object=)`: the subscription's callback binds as SUBSCRIBE_OK arrives; MediaSubscriber uses it for the catalog instead of the session-wide `on_object_received`.
 
 ## v0.13.0
 

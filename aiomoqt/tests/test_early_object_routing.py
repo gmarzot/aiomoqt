@@ -86,3 +86,66 @@ async def test_an_early_object_reaches_its_own_track(use_quic):
     early, bound = aliases["a"]
     assert early == bound                    # the object really was early
     assert got == {"a": [b"a"], "b": [b"b"]}
+
+
+def _joined_publisher(aliases):
+    """Joined track a: an object before its SUBSCRIBE_OK and one right
+    after it. Track b is answered after a."""
+    a_bound = asyncio.Event()
+
+    async def on_subscribe(session, msg):
+        name = msg.track_name.decode()
+        if name == "a":
+            early = session._next_track_alias
+            await _send_object(session, early, b"a")
+            await asyncio.sleep(0.3)
+            ok = session.subscribe_ok(request_msg=msg, content_exists=0)
+            await _send_object(session, ok.track_alias, b"a2")
+            aliases["a"] = (early, ok.track_alias)
+            a_bound.set()
+        else:
+            await a_bound.wait()
+            ok = session.subscribe_ok(request_msg=msg, content_exists=0)
+            await _send_object(session, ok.track_alias, b"b")
+    return on_subscribe
+
+
+@_TRANSPORTS
+@pytest.mark.asyncio
+async def test_a_joined_track_gets_objects_on_both_sides_of_its_reply(
+        use_quic):
+    port = _BASE_PORT + 2 + (not use_quic)
+    aliases, got = {}, {}
+    moqt = MOQTServer(host="localhost", port=port, certificate=CERT,
+                      private_key=KEY, path="/", use_quic=use_quic,
+                      supported_drafts=18)
+    moqt.register_handler(MOQTMessageType.SUBSCRIBE,
+                          _joined_publisher(aliases))
+    server = await moqt.serve()
+
+    def _collect(name):
+        return lambda obj, *a: got.setdefault(name, []).append(
+            bytes(obj.payload))
+    try:
+        client = MOQTClient("localhost", port, path="/", use_quic=use_quic,
+                            verify_tls=False, supported_drafts=18)
+        async with client.connect() as session:
+            await session.client_session_init()
+            sub_msg, _ = await session.join(_NS, "a", joining_start=0,
+                                            on_object=_collect("a"))
+            track_b = SubscribedTrack(session, _NS, "b",
+                                      on_object=_collect("b"))
+            track_b._quiet = True
+            await asyncio.gather(
+                session._await_response(sub_msg.request_id),
+                track_b.subscribe(timeout=8.0))
+            for _ in range(100):
+                if sum(len(v) for v in got.values()) >= 3:
+                    break
+                await asyncio.sleep(0.02)
+            assert session.on_object_received is None
+    finally:
+        server.close()
+    early, bound = aliases["a"]
+    assert early == bound
+    assert got == {"a": [b"a", b"a2"], "b": [b"b"]}
