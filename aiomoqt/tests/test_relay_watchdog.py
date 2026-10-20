@@ -3,6 +3,7 @@ relays one object over loopback; an exit after WATCHDOG_MISSES failed
 probes in a row; and a faulthandler timer that kills a stalled event
 loop."""
 import asyncio
+import logging
 import os
 import subprocess
 import sys
@@ -161,3 +162,88 @@ def test_a_stalled_event_loop_is_dumped_and_exited():
     assert proc.returncode == 1, proc.stderr
     assert time.monotonic() - start < 8
     assert "Timeout" in proc.stderr and "most recent call first" in proc.stderr
+
+
+@requires_certs
+@_TRANSPORTS
+async def test_probes_pass_and_the_relay_logs_their_sessions_quietly(
+        use_quic):
+    from aiomoqt.tests.test_log_contract import _captured
+    port = _BASE_PORT + 10 + (not use_quic)
+    handle = await relay._build_server("localhost", port, CERT, KEY,
+                                       use_quic=use_quic, draft=18).serve()
+    try:
+        with _captured(logging.INFO) as records:
+            assert await relay._self_probe("127.0.0.1", port, use_quic, 18,
+                                           5.0, full=False)
+            assert await relay._self_probe("127.0.0.1", port, use_quic, 18,
+                                           5.0)
+    finally:
+        handle.close()
+    info = records.at(logging.INFO)
+    # The probe's own client side logs as usual; the relay's side does not:
+    # no relay summaries, and not its parse of the probe's SETUP.
+    assert not [m for m in info if m.startswith("relay:")]
+    assert not [m for m in info if "parsed: Setup(" in m
+                and relay.WATCHDOG_IMPL in m]
+
+
+class _Stop(Exception):
+    pass
+
+
+async def _no_heartbeat(_stall_s):
+    return None
+
+
+async def test_the_watchdog_relays_an_object_every_nth_probe(monkeypatch):
+    fulls = []
+
+    async def _probe(*args):
+        fulls.append(args[5])
+        if len(fulls) == 2 * relay.WATCHDOG_FULL_EVERY + 1:
+            raise _Stop
+        return True
+
+    monkeypatch.setattr(relay, "_probe_in_child", _probe)
+    monkeypatch.setattr(relay, "_heartbeat", _no_heartbeat)
+    with pytest.raises(_Stop):
+        await relay._watchdog(0.01, "127.0.0.1", 1, True, 18)
+    every = [True] + [False] * (relay.WATCHDOG_FULL_EVERY - 1)
+    assert fulls == every * 2 + [True]
+
+
+async def test_the_watchdog_summarises_its_probes(monkeypatch):
+    from aiomoqt.tests.test_log_contract import _captured
+    results = iter([True, False])
+
+    async def _probe(*args):
+        try:
+            return next(results)
+        except StopIteration:
+            raise _Stop
+
+    async def _no_diagnosis(_handles):
+        return None
+
+    monkeypatch.setattr(relay, "_probe_in_child", _probe)
+    monkeypatch.setattr(relay, "_heartbeat", _no_heartbeat)
+    monkeypatch.setattr(relay, "_diagnose_probe_miss", _no_diagnosis)
+    monkeypatch.setattr(relay, "WATCHDOG_REPORT_S", 0.0)
+    with _captured(logging.INFO) as records, pytest.raises(_Stop):
+        await relay._watchdog(0.01, "127.0.0.1", 1, True, 18)
+    assert [m for m in records.at(logging.INFO) if "probes ok" in m] == [
+        "relay: watchdog: 1/1 probes ok in the last 0 h",
+        "relay: watchdog: 0/1 probes ok in the last 0 h"]
+
+
+def test_sigusr1_toggles_debug_logging():
+    from aiomoqt.tests.test_log_contract import _captured
+    from aiomoqt.utils.logger import get_log_level
+    with _captured(logging.INFO) as records:
+        relay._toggle_debug()
+        assert get_log_level() == logging.DEBUG
+        relay._toggle_debug()
+        assert get_log_level() == logging.INFO
+    assert [m for m in records.at(logging.INFO) if "debug logging" in m] == [
+        "relay: debug logging on", "relay: debug logging off"]
