@@ -249,10 +249,13 @@ def test_sigusr1_toggles_debug_logging():
         "relay: debug logging on", "relay: debug logging off"]
 
 
-async def test_the_control_socket_reports_and_toggles_debug(tmp_path):
+async def test_the_control_socket_reports_and_toggles_debug():
     import json
+    import tempfile
     from aiomoqt.tests.test_log_contract import _captured
-    path = str(tmp_path / "control.sock")
+    # macOS caps AF_UNIX paths at 104 bytes; pytest's tmp_path is longer.
+    tmp = tempfile.TemporaryDirectory(dir="/tmp")
+    path = os.path.join(tmp.name, "control.sock")
 
     async def call(method, target="/debug"):
         reader, writer = await asyncio.open_unix_connection(path)
@@ -277,3 +280,4 @@ async def test_the_control_socket_reports_and_toggles_debug(tmp_path):
             for server in set(relay._background) - before:
                 server.close()
                 relay._background.discard(server)
+            tmp.cleanup()
