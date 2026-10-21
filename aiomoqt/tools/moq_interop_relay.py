@@ -74,7 +74,7 @@ from aiomoqt.messages.base import MOQTMessage
 from aiomoqt.messages.data import (FetchObject, ObjectDatagram,
                                    ObjectDatagramStatus)
 from aiomoqt.messages.fetch import _is_joining
-from aiomoqt.messages.params import LocationFilter
+from aiomoqt.messages.params import U64_MAX, LocationFilter
 from aiomoqt.messages.publish import PublishError
 from aiomoqt.messages.request import RequestError, RequestOk
 from aiomoqt.messages.subscribe import Subscribe
@@ -796,6 +796,13 @@ class _RelayedTrack:
             return False
         first = (self._cache[0][0], self._cache[0][2])
         return start >= first
+
+    def group_end(self, group_id, start):
+        """The last cached Location of a group, which is its END_OF_GROUP
+        when held; (group, 0) when none is held, and never before
+        `start`."""
+        oids = [c[2] for c in self._cache if c[0] == group_id]
+        return max(start, (group_id, max(oids) if oids else 0))
 
     def cached_range(self, start, end):
         """Cached objects within [start, end], each (group, object)
@@ -2012,6 +2019,25 @@ async def _fetch_upstream(ns, track_name, msg):
     return None, None, refusal
 
 
+def _fetch_range(msg, largest):
+    """(start, end) Locations a FETCH asks for, both inclusive, the end at
+    most `largest`: (group, 2^64-1) for a whole End Group below it, None
+    for no End with nothing published. d14-d18 End is the last Object
+    plus one, Object 0 the whole End Group."""
+    if msg.location_filter is not None:
+        return msg.location_filter.resolve(largest, fetch=True)
+    start = (msg.start_group or 0, msg.start_object or 0)
+    if msg.end_group is None:
+        end = None
+    elif not msg.end_object:
+        end = (msg.end_group, U64_MAX)
+    else:
+        end = (msg.end_group, msg.end_object - 1)
+    if largest is not None:
+        end = largest if end is None else min(end, largest)
+    return start, end
+
+
 async def _on_fetch(session, msg):
     """FETCH (§10.12) served from the track's recent-object cache, or
     from the publisher when the range predates it. A joining FETCH is
@@ -2054,10 +2080,7 @@ async def _on_fetch(session, msg):
         logger.info(f"relay: joining FETCH {key} groups {start_group}.."
                     f"{anchor[0]} (anchor {anchor})")
     track = _tracks.get((ns, track_name))
-    start = (msg.start_group or 0, msg.start_object or 0)
-    end = (None if msg.end_group is None
-           else (msg.end_group, msg.end_object
-                 if msg.end_object is not None else (1 << 62)))
+    start, end = _fetch_range(msg, None if track is None else track.largest)
     have_cache = (track is not None and _track_live(track)
                   and track.cache_covers(start))
     objs = track.cached_range(start, end) if have_cache else []
@@ -2104,12 +2127,18 @@ async def _on_fetch(session, msg):
                 _note_catalog(ns, o[3])
     order = msg.group_order or GroupOrder.ASCENDING
     last_g, last_o = objs[-1][0], objs[-1][2]
-    # §10.13: FETCH_OK End Location is the last Object PLUS 1, and End Of
-    # Track says the range reached the track's end — which only the
-    # publisher knows, so it is carried over from its FETCH_OK.
+    # FETCH_OK End Location (d22 §9.12): the requested End, at most
+    # Largest; a whole End Group ends at its last Object. From upstream,
+    # the last Object served, with the publisher's End Of Track.
+    end_loc = (last_g, last_o)
+    if source == "cache" and end is not None:
+        end_loc = (end if end[1] != U64_MAX
+                   else track.group_end(end[0], start))
+    # fetch_ok() takes End as the last Object plus one at every draft.
     session.fetch_ok(request_id=msg.request_id,
                      end_of_track=end_of_track,
-                     largest_group_id=last_g, largest_object_id=last_o + 1,
+                     largest_group_id=end_loc[0],
+                     largest_object_id=end_loc[1] + 1,
                      group_order=int(order))
     if int(order) == int(GroupOrder.DESCENDING):
         objs = sorted(objs, key=lambda o: (-o[0], o[2]))

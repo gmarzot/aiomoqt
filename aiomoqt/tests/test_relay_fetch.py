@@ -228,10 +228,55 @@ def test_cached_window_is_served_with_exclusive_end_location():
                                           end_group=2, end_object=0)))
     assert s._errors == []
     ok = s._oks[0]
-    # §10.13: End Location is the last object PLUS 1.
-    assert (ok['largest_group_id'], ok['largest_object_id']) == (2, 1)
+    # §10.13: End Location is the last object PLUS 1; Object 0 asked for
+    # the whole End Group.
+    assert (ok['largest_group_id'], ok['largest_object_id']) == (2, 2)
     served, _order = s._served[0]
-    assert [(o.group_id, o.object_id) for o in served] == [(1, 1), (2, 0)]
+    assert [(o.group_id, o.object_id) for o in served] == [
+        (1, 1), (2, 0), (2, 1)]
+
+
+@pytest.mark.parametrize("groups", [[(0, 0), (0, 2)],
+                                    [(0, 0), (0, 2), (1, 0)]],
+                         ids=["largest", "behind"])
+def test_a_d22_whole_group_fetch_ends_at_its_last_object(groups):
+    # d22 §9.12: End Location is inclusive; a whole End Group ends at its
+    # last Object, whether or not it holds Largest Object.
+    s = _session(22)
+    relay._tracks[((b"live",), b"cam")] = _track(groups)
+    asyncio.run(relay._on_fetch(s, _fetch(
+        start_group=0, start_object=0, end_group=0, end_object=0,
+        location_filter=LocationFilter.absolute(0, 0, 0))))
+    assert s._errors == []
+    served, _ = s._served[0]
+    assert [(o.group_id, o.object_id) for o in served] == [(0, 0), (0, 2)]
+    ok = s._oks[0]
+    # End {0, 2}, in FETCH_OK's last-plus-one form.
+    assert (ok['largest_group_id'], ok['largest_object_id']) == (0, 3)
+
+
+def test_a_d22_fetch_ends_at_largest_when_asked_past_it():
+    s = _session(22)
+    relay._tracks[((b"live",), b"cam")] = _track([(0, 0), (0, 1), (1, 0)])
+    asyncio.run(relay._on_fetch(s, _fetch(
+        start_group=0, start_object=1, end_group=5, end_object=4,
+        location_filter=LocationFilter.absolute(0, 1, 5, 3))))
+    served, _ = s._served[0]
+    assert [(o.group_id, o.object_id) for o in served] == [(0, 1), (1, 0)]
+    ok = s._oks[0]
+    assert (ok['largest_group_id'], ok['largest_object_id']) == (1, 1)
+
+
+def test_a_d18_fetch_serves_up_to_its_end_object():
+    # d18 §10.12: End Location is the last Object plus one.
+    s = _session(18)
+    relay._tracks[((b"live",), b"cam")] = _track([(0, o) for o in range(4)])
+    asyncio.run(relay._on_fetch(s, _fetch(start_group=0, start_object=0,
+                                          end_group=0, end_object=2)))
+    served, _ = s._served[0]
+    assert [(o.group_id, o.object_id) for o in served] == [(0, 0), (0, 1)]
+    ok = s._oks[0]
+    assert (ok['largest_group_id'], ok['largest_object_id']) == (0, 2)
 
 
 def test_descending_request_serves_groups_in_reverse():
@@ -624,4 +669,41 @@ async def test_a_d22_fetch_of_cached_groups_carries_no_object_status(
             assert fin is True, name
             assert got == [(g, 0, f"{name}-{g}-0".encode())
                            for g in range(3)]
+        assert rx._close_err is None
+
+
+@requires_certs
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+async def test_a_d22_whole_group_fetch_reports_its_last_object(use_quic):
+    # d22 §9.12: group 0 holds objects 0 and 2, no END_OF_GROUP; the whole
+    # group is both of them and End Location is {0, 2}, whether group 0
+    # holds Largest Object (video) or a later group does (audio).
+    layouts = {"video": ((0, 0, (0, 2), None),),
+               "audio": ((0, 0, (0, 2), None), (1, 0, (0,), None))}
+    async with _cached(_CACHE_PORT + 2 + (not use_quic), use_quic, 22,
+                       layouts) as rx:
+        for name in layouts:
+            ok, got, fin = await _fetched(
+                rx, name, location_filter=LocationFilter.absolute(0, 0, 0))
+            assert fin is True, name
+            assert [(g, o) for g, o, _ in got] == [(0, 0), (0, 2)], name
+            # FETCH_OK keeps the last-plus-one form; the wire carries {0, 2}.
+            assert (ok.largest_group_id, ok.largest_object_id - 1) == (0, 2)
+        assert rx._close_err is None
+
+
+@requires_certs
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+async def test_a_d18_fetch_ends_before_its_end_object(use_quic):
+    # d18 §10.12: End Location is the last Object plus one.
+    layout = ((0, 0, (0, 1, 2, 3), None),)
+    async with _cached(_CACHE_PORT + 4 + (not use_quic), use_quic, 18,
+                       {"video": layout, "audio": layout}) as rx:
+        for name in ("video", "audio"):
+            ok, got, fin = await _fetched(rx, name, start_group=0,
+                                          start_object=0, end_group=0,
+                                          end_object=2)
+            assert fin is True, name
+            assert [(g, o) for g, o, _ in got] == [(0, 0), (0, 1)], name
+            assert (ok.largest_group_id, ok.largest_object_id) == (0, 2)
         assert rx._close_err is None
