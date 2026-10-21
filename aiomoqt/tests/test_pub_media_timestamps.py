@@ -11,6 +11,7 @@ from aiomoqt.tools import pub_media
 
 class _Track:
     demand = [1]
+    timescale = None
 
     def __init__(self):
         self.stamps = []
@@ -51,3 +52,23 @@ async def test_a_paced_mp4_track_is_stamped_on_schedule():
         SimpleNamespace(duration=1.0, no_pace=False, loop=False),
         pub_media._TrackStats())
     assert [s - track.stamps[0] for s in track.stamps] == offsets
+
+
+@pytest.mark.asyncio
+async def test_a_loc_timescale_stamps_in_its_ticks():
+    track = _Track()
+    track.timescale = 90_000
+    await pub_media._send(track, pub_media._TrackStats(), b"x", True,
+                          timestamp=2_000_000)
+    assert track.stamps == [180_000]                     # 2 s at 90 kHz
+
+
+def test_an_unstamped_frame_takes_the_wall_clock_in_track_ticks():
+    from types import SimpleNamespace as NS
+    from aiomoqt.media import LocTrackPublisher
+    session = NS(negotiated_draft=18)
+    now = time.time()
+    assert abs(LocTrackPublisher(session, "ns", "v")._now()
+               - now * 1_000_000) < 1_000_000
+    assert abs(LocTrackPublisher(session, "ns", "v", timescale=90_000)._now()
+               - now * 90_000) < 90_000

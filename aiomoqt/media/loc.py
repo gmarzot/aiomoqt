@@ -172,11 +172,15 @@ class LocTrackPublisher(PublishedTrack):
             return payload
         return _EMPTY_PRIVATE_PROPERTIES + payload
 
+    def _now(self) -> int:
+        """The wall clock in this track's timestamp units."""
+        return int(time.time() * (self.timescale or 1_000_000))
+
     def _object_extensions(self, frame: LocFrame, group_start: bool,
                            session=None) -> Dict[int, Any]:
         exts: Dict[int, Any] = dict(frame.extensions or ())
         ts = (frame.timestamp if frame.timestamp is not None
-              else int(time.time() * 1_000_000))
+              else self._now())
         for prop_id in self._timestamp_ids(session or self.session):
             exts[prop_id] = ts
         if self.codec_string is not None:
@@ -224,7 +228,7 @@ class LocTrackPublisher(PublishedTrack):
                 obj_id = 0
             group_start = obj_id == 0
             if frame.timestamp is None:
-                frame.timestamp = int(time.time() * 1_000_000)
+                frame.timestamp = self._now()
             payload = self._package(frame.payload, group_id, obj_id)
             if payload is None:
                 self.frames_dropped += 1
