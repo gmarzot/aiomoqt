@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.13.1
 
 - Relay: a track's Track Properties from PUBLISH or the upstream SUBSCRIBE_OK are cached and sent unchanged on its SUBSCRIBE_OK, PUBLISH, FETCH_OK and TRACK_STATUS replies, the newest set replacing the last; from d18 a Mandatory Track Property gets UNSUPPORTED_EXTENSION.
 - Relay: the dashboard learns a namespace's catalog format only from catalog objects it relays, and no longer sends publishers TRACK_STATUS and FETCH for a `catalog` track.
