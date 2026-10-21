@@ -75,18 +75,16 @@ from aiomoqt.messages.data import (FetchObject, ObjectDatagram,
                                    ObjectDatagramStatus)
 from aiomoqt.messages.fetch import _is_joining
 from aiomoqt.messages.params import U64_MAX, LocationFilter
-from aiomoqt.messages.publish import PublishError
+from aiomoqt.messages.publish import Publish, PublishError
 from aiomoqt.messages.request import RequestError, RequestOk
-from aiomoqt.messages.subscribe import Subscribe
+from aiomoqt.messages.subscribe import Subscribe, SubscribeOk
 from aiomoqt.track import (PublishedTrack, SubscribedTrack, _UNFILTERED,
                            _filter_window, _largest_object_param,
-                           _location_window, _reported_largest,
-                           _subscription_window)
+                           _location_window, _subscription_window)
 from aiomoqt.context import (canonical_request_error, canonical_stream_reset,
                              is_draft16_or_later,
                              request_error_code)
 from aiomoqt.tools import relay_status
-from aiomoqt.utils.buffer import Buffer
 from aiomoqt import __version__ as AIOMOQT_VERSION
 from aiomoqt.utils.logger import (get_log_level, get_logger, set_log_handler,
                                   set_log_level)
@@ -163,17 +161,15 @@ WATCHDOG_REPORT_S = 3600.0
 # After a failed probe, how long to let a woken reader drain before
 # reading the transport counters again.
 WATCHDOG_KICK_S = 0.5
-# Dashboard (--status-dir): write period, history kept, the longest a
-# catalog probe may take, and the wait before re-probing a namespace
-# that showed no MSF catalog.
+# Dashboard (--status-dir): write period and history kept.
 STATUS_INTERVAL_S = 2.0
 STATUS_HISTORY_S = 600
-CATALOG_PROBE_S = 5.0
-CATALOG_RETRY_S = 30.0
 # MSF catalog track name (§5.2.3), and the watchdog's own namespace,
 # kept off the dashboard.
 CATALOG_TRACK = b"catalog"
 WATCHDOG_NS = b"aiomoqt-watchdog"
+# DEFAULT_PUBLISHER_GROUP_ORDER (§10.5), decoded into group_order.
+DEFAULT_GROUP_ORDER_PROPERTY = 0x22
 
 
 async def _await_upstream(timeout: float = None) -> bool:
@@ -396,6 +392,9 @@ class _RelayedTrack:
         self.upstream_request_id = None
         # Largest Location (§10.2.11): largest reported or received.
         self.largest = None
+        # Track Properties as last received from upstream (§8.4): sent on
+        # every reply for the track, replaced whole, never merged.
+        self.properties: dict = {}
         # Upstream subgroup streams ended, against the Stream Count its
         # PUBLISH_DONE reports: the terminal waits for the objects.
         self._upstream_ended = 0
@@ -1097,6 +1096,32 @@ def _withdraw_namespace(session, request_id=None, ns=None) -> None:
                 f"{len(_announced.get(ns, {}))} publisher(s)")
 
 
+# Mandatory Track Properties (§3.7, from d18); this relay understands none.
+_MANDATORY_PROPERTIES = range(0x4000, 0x8000)
+_MANDATORY_REFUSAL = (RequestErrorCode.UNSUPPORTED_EXTENSION,
+                      "unsupported mandatory track property")
+
+
+def _track_properties(session, msg) -> dict:
+    """The Track Properties a PUBLISH, SUBSCRIBE_OK or FETCH_OK carries.
+    The codec lifts DEFAULT_PUBLISHER_GROUP_ORDER into group_order; a
+    Descending one goes back in (omitted means Ascending)."""
+    if msg is None or not session._profile.track_properties:
+        return {}
+    props = dict(getattr(msg, "track_extensions", None) or {})
+    if (isinstance(msg, (Publish, SubscribeOk))
+            and msg.group_order == GroupOrder.DESCENDING):
+        props[DEFAULT_GROUP_ORDER_PROPERTY] = int(GroupOrder.DESCENDING)
+    return props
+
+
+def _mandatory(session, props) -> bool:
+    """`props` holds a Mandatory Track Property (§3.7): the track is
+    neither processed nor forwarded."""
+    return ((session.negotiated_draft or 0) >= 18
+            and any(t in _MANDATORY_PROPERTIES for t in props))
+
+
 def _upstream_refusal(err, profile, fetch=False) -> tuple:
     """An upstream REQUEST_ERROR as (RequestErrorCode, reason), for the
     downstream reply to encode in its own draft."""
@@ -1221,13 +1246,23 @@ def _pending_subscribe_id(session, ns, track_name):
 
 def _cancel_upstream_subscribe(session, ns, track_name) -> None:
     rid = _pending_subscribe_id(session, ns, track_name)
-    if rid is None:
-        return
+    if rid is not None:
+        _cancel_request(session, rid)
+
+
+def _cancel_request(session, rid) -> None:
+    """Cancel one of our upstream requests (§3.3.2)."""
     try:
         session.unsubscribe(rid)
     except Exception:
-        logger.debug("relay: cancelling the upstream SUBSCRIBE failed",
+        logger.debug(f"relay: cancelling upstream request {rid} failed",
                      exc_info=True)
+
+
+def _subscribe_ok_for(session, rid):
+    """The SUBSCRIBE_OK `session` received for our request `rid`."""
+    return next((m for m in session._subscriptions.get(rid) or ()
+                 if isinstance(m, SubscribeOk)), None)
 
 
 async def _subscribe_upstream(entry) -> None:
@@ -1281,6 +1316,16 @@ async def _subscribe_publishers(entry):
             if upstream.track_alias is not None:
                 pub.unregister_object_handler(upstream.track_alias)
             break
+        rid = getattr(upstream, "request_id", None)
+        props = _track_properties(pub, _subscribe_ok_for(pub, rid))
+        if _mandatory(pub, props):
+            logger.info(f"relay: upstream subscribe {key} -> "
+                        f"UNSUPPORTED_EXTENSION {sorted(props)}")
+            _cancel_request(pub, rid)
+            if upstream.track_alias is not None:
+                pub.unregister_object_handler(upstream.track_alias)
+            refusal = _MANDATORY_REFUSAL
+            continue
         parked = _parked_publish(key)
         if parked is not None:
             # A PUBLISH from another session landed meanwhile and owns
@@ -1291,6 +1336,7 @@ async def _subscribe_publishers(entry):
             return parked, None
         track.upstream = upstream
         track.upstream_alias = upstream.track_alias
+        track.properties = props
         # §10.2.11: Largest includes what the upstream SUBSCRIBE_OK reports.
         track.note_largest(upstream.largest)
         pub.register_stream_end_handler(upstream.track_alias,
@@ -1416,6 +1462,13 @@ async def _on_publish(session, msg):
     """
     ns = _ns_tuple(msg.track_namespace)
     key = (ns, msg.track_name)
+    props = _track_properties(session, msg)
+    if _mandatory(session, props):
+        logger.info(f"relay: publish {key} -> UNSUPPORTED_EXTENSION "
+                    f"{sorted(props)}")
+        code, reason = _MANDATORY_REFUSAL
+        _refuse_publish(session, msg, reason, code=code)
+        return
     track = _tracks.get(key)
     if track is not None:
         owner = _upstream_session(track) or (
@@ -1452,6 +1505,7 @@ async def _on_publish(session, msg):
         _cancel_upstream_subscribe(session, ns, msg.track_name)
     _watch_session(session, ns)
     track.pending_publish = (session, msg)
+    track.properties = props
     # §9.4: a bare PUBLISH is the only notice d18 prefix subscribers get
     # that this namespace exists.
     _announce_namespace(ns)
@@ -1510,12 +1564,13 @@ def _answer_publish(track, forward=None) -> None:
     track.pending_publish = None
 
 
-def _refuse_publish(session, msg, reason) -> None:
-    """DUPLICATE_SUBSCRIPTION for a PUBLISH (NOT_SUPPORTED from d20,
-    PUBLISH_ERROR at d14)."""
+def _refuse_publish(session, msg, reason, code=None) -> None:
+    """Refuse a PUBLISH, by default DUPLICATE_SUBSCRIPTION (NOT_SUPPORTED
+    from d20); PUBLISH_ERROR at d14."""
     prof = session._profile
-    code = (RequestErrorCode.NOT_SUPPORTED if prof.param_table >= 20
-            else RequestErrorCode.DUPLICATE_SUBSCRIPTION)
+    if code is None:
+        code = (RequestErrorCode.NOT_SUPPORTED if prof.param_table >= 20
+                else RequestErrorCode.DUPLICATE_SUBSCRIPTION)
     if is_draft16_or_later(session.negotiated_draft):
         session.subscribe_error(msg.request_id, error_code=code,
                                 reason=reason)
@@ -1608,7 +1663,8 @@ def _attach_subscriber(session, msg, track) -> bool:
         track._ensure_drain()
         return False
     _watch_session(session, track.key[0])
-    ok = session.subscribe_ok(request_msg=msg, **_largest_kwargs(track))
+    ok = session.subscribe_ok(request_msg=msg, **_largest_kwargs(track),
+                              track_properties=track.properties)
     # FORWARD omitted means 1 (§10.2.12).
     forward = msg.forward is None or bool(msg.forward)
     # A filter starting at or before Largest is served from the cache
@@ -1897,7 +1953,8 @@ async def _offer_track(session, track, key):
     pub_msg = session.publish(
         namespace=ns,
         track_name=(name.decode() if isinstance(name, bytes) else name),
-        forward=1, largest=track.largest)
+        forward=1, largest=track.largest,
+        track_properties=track.properties)
     fut = session._loop.create_future()
     session._pending_requests[pub_msg.request_id] = fut
     try:
@@ -2005,12 +2062,21 @@ async def _fetch_upstream(ns, track_name, msg):
         _fetch_sinks[key] = []
         try:
             ok = await pub._await_response(req.request_id, timeout=10.0)
-            await pub.await_fetch_done(req.request_id, timeout=10.0)
+            mandatory = _mandatory(pub, _track_properties(pub, ok))
+            if not mandatory:
+                await pub.await_fetch_done(req.request_id, timeout=10.0)
         except (MOQTRequestError, asyncio.TimeoutError) as e:
             logger.info(f"relay: upstream FETCH declined on {ns}: {e}")
             _fetch_sinks.pop(key, None)
             if isinstance(e, MOQTRequestError):
                 refusal = _upstream_refusal(e, pub._profile, fetch=True)
+            continue
+        if mandatory:
+            logger.info(f"relay: upstream FETCH {ns}/{name} -> "
+                        f"UNSUPPORTED_EXTENSION")
+            _fetch_sinks.pop(key, None)
+            _cancel_request(pub, req.request_id)
+            refusal = _MANDATORY_REFUSAL
             continue
         objs = _fetch_sinks.pop(key, [])
         logger.info(f"relay: upstream FETCH {ns}/{name} -> "
@@ -2086,6 +2152,7 @@ async def _on_fetch(session, msg):
                   and track.cache_covers(start))
     objs = track.cached_range(start, end) if have_cache else []
     source = "cache"
+    props = track.properties if track is not None else {}
     end_of_track = 0
     if objs and objs[-1][6] == ObjectStatus.END_OF_TRACK:
         end_of_track = 1
@@ -2119,6 +2186,7 @@ async def _on_fetch(session, msg):
                  o.extensions, o.publisher_priority, o.status)
                 for o in upstream]
         end_of_track = int(getattr(up_ok, 'end_of_track', 0) or 0)
+        props = dict(getattr(up_ok, "track_extensions", None) or {})
         source = "upstream"
     if track is not None:
         track._fetches += 1
@@ -2140,7 +2208,7 @@ async def _on_fetch(session, msg):
                      end_of_track=end_of_track,
                      largest_group_id=end_loc[0],
                      largest_object_id=end_loc[1] + 1,
-                     group_order=int(order))
+                     group_order=int(order), track_extensions=props)
     if int(order) == int(GroupOrder.DESCENDING):
         objs = sorted(objs, key=lambda o: (-o[0], o[2]))
     await session.serve_fetch(
@@ -2315,7 +2383,8 @@ async def _on_track_status(session, msg):
               else _largest_object_param(session, largest))
     logger.info(f"relay: track-status ns={ns} track={msg.track_name} "
                 f"-> OK largest={largest}")
-    ok = RequestOk(request_id=msg.request_id, parameters=params)
+    ok = RequestOk(request_id=msg.request_id, parameters=params,
+                   track_properties=track.properties)
     session._send_reply(msg.request_id, ok, fin=True)
 
 
@@ -2577,8 +2646,8 @@ async def _watchdog(period, host, port, use_quic, draft,
             os._exit(WATCHDOG_EXIT)
 
 
-# namespace -> [MSF format or None, loop time of the last probe, probe task]
-_catalogs: dict[tuple, list] = {}
+# namespace -> MSF format of the last catalog object relayed for it
+_catalogs: dict[tuple, str] = {}
 
 
 def _internal_ns(ns) -> bool:
@@ -2595,65 +2664,7 @@ def _note_catalog(ns, payload) -> None:
     """Record the MSF format of a catalog object seen for `ns`."""
     fmt = relay_status.classify_catalog(payload)
     if fmt is not None:
-        _catalogs.setdefault(ns, [None, None, None])[0] = fmt
-
-
-def _status_largest(reply):
-    """Largest a TRACK_STATUS reply reports: fields at d14, LARGEST_OBJECT
-    from d16 (a varint pair at d16, a Location from d18)."""
-    largest = _reported_largest(reply)
-    if largest is not None:
-        return largest
-    raw = (getattr(reply, "parameters", None) or {}).get(
-        ParamType.LARGEST_OBJECT)
-    if isinstance(raw, (tuple, list)):
-        return tuple(raw)
-    if isinstance(raw, (bytes, bytearray, memoryview)):
-        buf = Buffer(data=bytes(raw))
-        return (buf.pull_uint_var(), buf.pull_uint_var())
-    return None
-
-
-def _catalog_sources(ns) -> list:
-    """Sessions that can answer for `ns`'s catalog: the one that
-    PUBLISHed it, then the namespace's publishers."""
-    out = []
-    track = _tracks.get((ns, CATALOG_TRACK))
-    if track is not None:
-        owner = _upstream_session(track) or (
-            track.pending_publish[0] if track.pending_publish else None)
-        if _session_live(owner):
-            out.append(owner)
-    return out + [p for p in _publishers_for(ns) if p not in out]
-
-
-async def _probe_catalog(ns) -> None:
-    """Ask each source for its newest catalog group, TRACK_STATUS for the
-    Largest then a FETCH of that group, until one yields an MSF format."""
-    for pub in _catalog_sources(ns):
-        got = []
-        try:
-            reply = await asyncio.wait_for(
-                pub.track_status(ns, CATALOG_TRACK, wait_response=True),
-                CATALOG_PROBE_S)
-            largest = _status_largest(reply)
-            if largest is None:
-                continue
-            ok = await asyncio.wait_for(
-                pub.fetch(namespace=ns, track_name=CATALOG_TRACK,
-                          start_group=largest[0], end_group=largest[0],
-                          wait_response=True,
-                          on_object=lambda obj, *_: got.append(obj)),
-                CATALOG_PROBE_S)
-            await pub.await_fetch_done(ok.request_id, timeout=CATALOG_PROBE_S)
-        except Exception as e:
-            logger.debug(f"relay: catalog probe of {ns} failed: {e!r}")
-            continue
-        for obj in got:
-            if obj.object_id == 0:
-                _note_catalog(ns, obj.payload)
-        if _catalogs.get(ns, (None,))[0] is not None:
-            return
+        _catalogs[ns] = fmt
 
 
 def _status_namespaces() -> set:
@@ -2662,22 +2673,11 @@ def _status_namespaces() -> set:
             if not _internal_ns(ns)}
 
 
-def _probe_catalogs(now) -> None:
-    """Probe each namespace with no MSF format yet, at most once per
-    CATALOG_RETRY_S, and forget namespaces that have gone."""
+def _prune_catalogs() -> None:
+    """Forget the formats of namespaces that have gone."""
     names = _status_namespaces()
     for ns in [n for n in _catalogs if n not in names]:
-        task = _catalogs[ns][2]
-        if task is None or task.done():
-            del _catalogs[ns]
-    for ns in names:
-        entry = _catalogs.setdefault(ns, [None, None, None])
-        fmt, last, task = entry
-        if (fmt is not None or (task is not None and not task.done())
-                or (last is not None and now - last < CATALOG_RETRY_S)):
-            continue
-        entry[1] = now
-        entry[2] = asyncio.create_task(_probe_catalog(ns))
+        del _catalogs[ns]
 
 
 def _path_quality(session) -> dict:
@@ -2783,7 +2783,7 @@ class _Status:
         while True:
             try:
                 now = loop.time()
-                _probe_catalogs(now)
+                _prune_catalogs()
                 relay_status.write_json_atomic(
                     self.path, self.snapshot(now, time.time()))
                 relay_status.write_json_atomic(self.platform_path,
@@ -2884,7 +2884,6 @@ class _Status:
         for ns in _status_namespaces():
             holders = [s for s in _announced.get(ns, {}) if _session_live(s)]
             pubs.update(id(s) for s in holders)
-            entry = _catalogs.get(ns)
             spaces[ns] = {
                 "namespace": _ns_str(ns), "announced": bool(holders),
                 "origin": (f"{_transport(holders[-1])} d{_draft(holders[-1])}"
@@ -2893,7 +2892,7 @@ class _Status:
                                 if holders else None),
                 "tracks": 0, "subscribers": len(ns_viewers.get(ns, ())),
                 "subscriptions": 0, "in_bps": 0, "out_bps": 0,
-                "bytes_out": 0, "format": entry[0] if entry else None,
+                "bytes_out": 0, "format": _catalogs.get(ns),
             }
         for key, row in tracks:
             sp = spaces.get(key[0])
