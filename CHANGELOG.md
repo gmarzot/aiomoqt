@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Relay: a d20/d22 REQUEST_UPDATE that changes the Location Filter applies it instead of failing the update.
 - Relay: a d20/d22 subscription's Location Filter bounds what it is sent, End Object and relative start included; a start at or before Largest Object replays from the cache.
 - Relay: `--control PATH` serves HTTP on a Unix socket; `GET /debug` reports DEBUG logging and `POST /debug` toggles it, for a button behind the private page.
 - LOC: self-describing objects carry TIMESCALE only when the track sets one; the default 1e6 made LOC read wall-clock timestamps as media time.

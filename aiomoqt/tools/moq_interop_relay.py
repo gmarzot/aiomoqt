@@ -74,12 +74,14 @@ from aiomoqt.messages.base import MOQTMessage
 from aiomoqt.messages.data import (FetchObject, ObjectDatagram,
                                    ObjectDatagramStatus)
 from aiomoqt.messages.fetch import _is_joining
+from aiomoqt.messages.params import LocationFilter
 from aiomoqt.messages.publish import PublishError
 from aiomoqt.messages.request import RequestError, RequestOk
 from aiomoqt.messages.subscribe import Subscribe
 from aiomoqt.track import (PublishedTrack, SubscribedTrack, _UNFILTERED,
                            _filter_window, _largest_object_param,
-                           _reported_largest, _subscription_window)
+                           _location_window, _reported_largest,
+                           _subscription_window)
 from aiomoqt.context import (canonical_request_error, canonical_stream_reset,
                              is_draft16_or_later,
                              request_error_code)
@@ -1617,9 +1619,9 @@ async def _on_request_update(session, msg):
     key, track, d = found
     if d16:
         forward = (msg.parameters or {}).get(ParamType.FORWARD)
-        ftype = _reply_filter(session, msg)
-        if ftype[0] is not None:
-            d.window = _filter_window(*ftype, track.largest)
+        window = _reply_window(session, msg, track.largest)
+        if window is not None:
+            d.window = window
     else:
         forward = msg.forward
     if forward is not None:
@@ -1886,7 +1888,7 @@ async def _offer_track(session, track, key):
         # §10.2.12: FORWARD omitted from PUBLISH_OK means 1.
         forward = (getattr(reply, 'parameters', None) or {}).get(
             ParamType.FORWARD, 1)
-    window = _filter_window(*_reply_filter(session, reply), track.largest)
+    window = _reply_window(session, reply, track.largest) or _UNFILTERED
     # Cached objects inside the subscriber's window go first.
     track.add_downstream(session, pub_msg.track_alias, pub_msg.request_id,
                          forward=bool(forward), window=window,
@@ -1901,17 +1903,21 @@ async def _offer_track(session, track, key):
                 f"(fanout={len(track.downstream)})")
 
 
-def _reply_filter(session, reply) -> tuple:
-    """(type, start group, start object, end group) a PUBLISH_OK or
-    REQUEST_UPDATE carries: fields at d14, a parameter from d16."""
+def _reply_window(session, reply, largest):
+    """The filter window a PUBLISH_OK or REQUEST_UPDATE asks for against
+    `largest`, None when it carries no filter: fields at d14, a parameter
+    from d16, a Location Filter from d20."""
     if getattr(reply, "filter_type", None) is not None:
-        return (reply.filter_type, reply.start_group, reply.start_object,
-                reply.end_group)
+        return _filter_window(reply.filter_type, reply.start_group,
+                              reply.start_object, reply.end_group, largest)
     raw = (getattr(reply, "parameters", None) or {}).get(
         ParamType.SUBSCRIPTION_FILTER)
     if raw is None:
-        return (None, None, None, None)
-    return MOQTMessage._decode_filter(raw, prof=session._profile)
+        return None
+    if isinstance(raw, LocationFilter):
+        return _location_window(raw, largest)
+    return _filter_window(*MOQTMessage._decode_filter(
+        raw, prof=session._profile), largest)
 
 
 # id(session) -> True once a datagram send proved unsupported there.

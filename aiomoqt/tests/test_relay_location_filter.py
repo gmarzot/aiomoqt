@@ -11,6 +11,7 @@ from aiomoqt.messages import SubgroupHeader
 from aiomoqt.messages.params import LocationFilter
 from aiomoqt.tools import moq_interop_relay as relay
 from aiomoqt.track import PublishedTrack
+from aiomoqt.types import ParamType
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
 
@@ -157,3 +158,54 @@ async def test_a_start_before_largest_replays_only_the_range(draft,
         await asyncio.sleep(0.2)
         assert {n: sorted(v) for n, v in got.items()} == want
         assert rx._close_err is None
+
+
+async def _flowing(connect, names, rate=100):
+    """A publisher producing `names` (5-object groups at `rate` objects/s)
+    and a subscriber session. Returns (rx, subscriptions, got)."""
+    pub = await connect()
+    for name in names:
+        PublishedTrack(pub, namespace=_NS, trackname=name, object_size=100,
+                       group_size=5, rate=rate).attach()
+    await pub.publish_namespace(namespace=_NS, wait_response=True)
+    rx = await connect()
+    got = {name: [] for name in names}
+    subs = {}
+    for name in names:
+        subs[name] = await rx.subscribe(
+            _NS, name, forward=1, wait_response=True,
+            on_object=lambda m, _s, _t, g, _sg, n=name: got[n].append(
+                (g, m.object_id)) if m.payload else None)
+    assert await _until(lambda: all(got[n] for n in names)), got
+    return rx, subs, got
+
+
+@pytest.mark.parametrize("draft", [20, 22])
+@_TRANSPORTS
+async def test_a_request_update_replaces_the_filter(draft, use_quic, caplog):
+    # §9.5.1: a REQUEST_UPDATE's LOCATION_FILTER replaces the window; each
+    # track keeps its own.
+    spans = {"video": ((0, 1), (0, 3)), "audio": ((0, 3), (1, 1))}
+    async with _relay(_port(2, draft, use_quic), use_quic, draft) as connect:
+        rx, subs, got = await _flowing(connect, spans)
+        want, ends = {}, {}
+        for name, ((g0, o0), (g1, o1)) in spans.items():
+            base = _relayed(name).largest[0] + 3
+            start, end = (base + g0, o0), (base + g1, o1)
+            await rx.request_update(
+                subs[name].request_id, wait_response=True,
+                parameters={ParamType.LOCATION_FILTER: LocationFilter.absolute(
+                    *start, *end)})
+            want[name] = [loc for loc in ((g, o) for g in range(start[0],
+                                                                end[0] + 1)
+                                          for o in range(5))
+                          if start <= loc <= end]
+            ends[name] = (start, end)
+        assert await _until(lambda: all(
+            _relayed(n).largest >= (ends[n][1][0] + 1, 1) for n in spans))
+        await asyncio.sleep(0.1)
+        for name, (start, _end) in ends.items():
+            assert sorted(loc for loc in got[name] if loc >= start) == (
+                want[name]), name
+        assert rx._close_err is None
+    assert not [r for r in caplog.records if "handler failed" in r.message]
