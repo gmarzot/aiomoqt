@@ -10,6 +10,11 @@
 - Logging: each control message logs once at INFO, where it crosses the wire (`MOQT send:` out, `control message parsed:` in); the handlers' repeat lines, control-stream plumbing and the version-from-ALPN line are DEBUG, and `setup complete: draft-N` logs on both sides.
 - `MOQTServer(quiet_peers=…)`: a session whose peer's SETUP implementation starts with a listed prefix logs below WARNING at DEBUG.
 - Relay: the watchdog names itself in SETUP and its sessions log at DEBUG; three probes in four only complete SETUP; an hourly INFO line counts probes; SIGUSR1 toggles DEBUG logging.
+- Relay: d16 SUBSCRIBE_NAMESPACE follows its Subscribe Options; NAMESPACE (0x01) or both (0x02) gets NAMESPACE and NAMESPACE_DONE.
+- Relay: d14 namespace subscribers are forwarded PUBLISH_NAMESPACE and PUBLISH_NAMESPACE_DONE.
+- Relay: a namespace whose last publisher's session closes is withdrawn from namespace subscribers.
+- Publisher: a PUBLISH_OK (d16, d18) or SUBSCRIBE that omits FORWARD starts delivery, the default of 1 (§10.2.12).
+- Interop client: the standard run adds subscribe-namespace-lifecycle, namespace-discovery, publish-track-only and publish-track-subscribe.
 - CI: release.yml requires green CI and MoQ conformance on the release tree instead of re-running them, publishes the wheel it smoke-tested, and has a `dry_run` input; conformance runs on release branches only, and a new push cancels the run it supersedes.
 - Perf: FETCH history records each published object with an append (no hashing); duplicate Locations are resolved when fetched.
 - Perf: a subgroup object skips the filter check while its subscription forwards unfiltered, and is encoded with positional calls.
