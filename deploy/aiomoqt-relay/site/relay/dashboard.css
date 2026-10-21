@@ -254,7 +254,6 @@ td.empty { color: var(--faint); text-align: center; padding: 14px; }
 .private-links a { font-weight: 600; margin-right: 12px; }
 .private-links span { color: var(--dim); }
 .debug-toggle { display: inline-flex; align-items: center; gap: 8px; }
-.private-links .debug-toggle span { color: var(--text); font-weight: 600; margin-right: 4px; }
 .debug-toggle.on span { color: var(--amber); }
 .debug-toggle button {
   font: inherit; font-size: 12px; padding: 2px 10px; border-radius: 3px; cursor: pointer;
