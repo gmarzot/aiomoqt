@@ -79,7 +79,7 @@ from aiomoqt.messages.request import RequestError, RequestOk
 from aiomoqt.messages.subscribe import Subscribe
 from aiomoqt.track import (PublishedTrack, SubscribedTrack, _UNFILTERED,
                            _filter_window, _largest_object_param,
-                           _reported_largest)
+                           _reported_largest, _subscription_window)
 from aiomoqt.context import (canonical_request_error, canonical_stream_reset,
                              is_draft16_or_later,
                              request_error_code)
@@ -313,7 +313,8 @@ class _Downstream:
         self.request_id = request_id
         # Forward State (§5.1): objects flow only while True.
         self.forward = forward
-        # Filter window (§5.1.2): (start Location, End Group or None).
+        # Filter window (§5.1.2): (start Location, End Group or None[,
+        # last Object of the End Group]).
         self.window = window
         # Joining Location (§5.1): Largest when Forward State became 1.
         self.joined_at = None
@@ -323,9 +324,14 @@ class _Downstream:
 
     def passes(self, group_id, object_id) -> bool:
         """Forward State 1 and inside the filter window."""
-        start, end_group = self.window
-        return (self.forward and (group_id, object_id) >= start
-                and (end_group is None or group_id <= end_group))
+        window = self.window
+        if not self.forward or (group_id, object_id) < window[0]:
+            return False
+        end_group = window[1]
+        if end_group is None or group_id < end_group:
+            return True
+        return group_id == end_group and (
+            len(window) < 3 or object_id <= window[2])
 
     def past_end(self, group_id) -> bool:
         end_group = self.window[1]
@@ -1567,8 +1573,7 @@ def _attach_subscriber(session, msg, track) -> bool:
     """SUBSCRIBE_OK and join the fan-out with the SUBSCRIBE's Forward
     State and filter window, against Largest now (§5.1.2). False when
     the End Group is already behind, answered INVALID_RANGE."""
-    window = _filter_window(msg.filter_type, msg.start_group,
-                            msg.start_object, msg.end_group, track.largest)
+    window = _subscription_window(msg, track.largest)
     if (window[1] is not None and track.largest is not None
             and track.largest[0] > window[1]):
         logger.info(f"relay: subscribe {track.key} -> INVALID_RANGE "
@@ -1583,11 +1588,10 @@ def _attach_subscriber(session, msg, track) -> bool:
     ok = session.subscribe_ok(request_msg=msg, **_largest_kwargs(track))
     # FORWARD omitted means 1 (§10.2.12).
     forward = msg.forward is None or bool(msg.forward)
-    # An explicit Start at or before Largest is served from the cache
+    # A filter starting at or before Largest is served from the cache
     # first (§5.1.2: the Start MAY be less than the Largest Object).
-    replay = (msg.filter_type in (FilterType.ABSOLUTE_START,
-                                  FilterType.ABSOLUTE_RANGE)
-              and track.largest is not None and window[0] <= track.largest)
+    replay = (window is not _UNFILTERED and track.largest is not None
+              and window[0] <= track.largest)
     track.add_downstream(session, ok.track_alias, msg.request_id,
                          forward=forward, window=window, replay=replay)
     session.register_request_cancel_handler(
