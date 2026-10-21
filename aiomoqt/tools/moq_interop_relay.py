@@ -80,13 +80,11 @@ from aiomoqt.messages.request import RequestError, RequestOk
 from aiomoqt.messages.subscribe import Subscribe
 from aiomoqt.track import (PublishedTrack, SubscribedTrack, _UNFILTERED,
                            _filter_window, _largest_object_param,
-                           _location_window, _reported_largest,
-                           _subscription_window)
+                           _location_window, _subscription_window)
 from aiomoqt.context import (canonical_request_error, canonical_stream_reset,
                              is_draft16_or_later,
                              request_error_code)
 from aiomoqt.tools import relay_status
-from aiomoqt.utils.buffer import Buffer
 from aiomoqt import __version__ as AIOMOQT_VERSION
 from aiomoqt.utils.logger import (get_log_level, get_logger, set_log_handler,
                                   set_log_level)
@@ -163,13 +161,9 @@ WATCHDOG_REPORT_S = 3600.0
 # After a failed probe, how long to let a woken reader drain before
 # reading the transport counters again.
 WATCHDOG_KICK_S = 0.5
-# Dashboard (--status-dir): write period, history kept, the longest a
-# catalog probe may take, and the wait before re-probing a namespace
-# that showed no MSF catalog.
+# Dashboard (--status-dir): write period and history kept.
 STATUS_INTERVAL_S = 2.0
 STATUS_HISTORY_S = 600
-CATALOG_PROBE_S = 5.0
-CATALOG_RETRY_S = 30.0
 # MSF catalog track name (§5.2.3), and the watchdog's own namespace,
 # kept off the dashboard.
 CATALOG_TRACK = b"catalog"
@@ -2577,8 +2571,8 @@ async def _watchdog(period, host, port, use_quic, draft,
             os._exit(WATCHDOG_EXIT)
 
 
-# namespace -> [MSF format or None, loop time of the last probe, probe task]
-_catalogs: dict[tuple, list] = {}
+# namespace -> MSF format of the last catalog object relayed for it
+_catalogs: dict[tuple, str] = {}
 
 
 def _internal_ns(ns) -> bool:
@@ -2595,65 +2589,7 @@ def _note_catalog(ns, payload) -> None:
     """Record the MSF format of a catalog object seen for `ns`."""
     fmt = relay_status.classify_catalog(payload)
     if fmt is not None:
-        _catalogs.setdefault(ns, [None, None, None])[0] = fmt
-
-
-def _status_largest(reply):
-    """Largest a TRACK_STATUS reply reports: fields at d14, LARGEST_OBJECT
-    from d16 (a varint pair at d16, a Location from d18)."""
-    largest = _reported_largest(reply)
-    if largest is not None:
-        return largest
-    raw = (getattr(reply, "parameters", None) or {}).get(
-        ParamType.LARGEST_OBJECT)
-    if isinstance(raw, (tuple, list)):
-        return tuple(raw)
-    if isinstance(raw, (bytes, bytearray, memoryview)):
-        buf = Buffer(data=bytes(raw))
-        return (buf.pull_uint_var(), buf.pull_uint_var())
-    return None
-
-
-def _catalog_sources(ns) -> list:
-    """Sessions that can answer for `ns`'s catalog: the one that
-    PUBLISHed it, then the namespace's publishers."""
-    out = []
-    track = _tracks.get((ns, CATALOG_TRACK))
-    if track is not None:
-        owner = _upstream_session(track) or (
-            track.pending_publish[0] if track.pending_publish else None)
-        if _session_live(owner):
-            out.append(owner)
-    return out + [p for p in _publishers_for(ns) if p not in out]
-
-
-async def _probe_catalog(ns) -> None:
-    """Ask each source for its newest catalog group, TRACK_STATUS for the
-    Largest then a FETCH of that group, until one yields an MSF format."""
-    for pub in _catalog_sources(ns):
-        got = []
-        try:
-            reply = await asyncio.wait_for(
-                pub.track_status(ns, CATALOG_TRACK, wait_response=True),
-                CATALOG_PROBE_S)
-            largest = _status_largest(reply)
-            if largest is None:
-                continue
-            ok = await asyncio.wait_for(
-                pub.fetch(namespace=ns, track_name=CATALOG_TRACK,
-                          start_group=largest[0], end_group=largest[0],
-                          wait_response=True,
-                          on_object=lambda obj, *_: got.append(obj)),
-                CATALOG_PROBE_S)
-            await pub.await_fetch_done(ok.request_id, timeout=CATALOG_PROBE_S)
-        except Exception as e:
-            logger.debug(f"relay: catalog probe of {ns} failed: {e!r}")
-            continue
-        for obj in got:
-            if obj.object_id == 0:
-                _note_catalog(ns, obj.payload)
-        if _catalogs.get(ns, (None,))[0] is not None:
-            return
+        _catalogs[ns] = fmt
 
 
 def _status_namespaces() -> set:
@@ -2662,22 +2598,11 @@ def _status_namespaces() -> set:
             if not _internal_ns(ns)}
 
 
-def _probe_catalogs(now) -> None:
-    """Probe each namespace with no MSF format yet, at most once per
-    CATALOG_RETRY_S, and forget namespaces that have gone."""
+def _prune_catalogs() -> None:
+    """Forget the formats of namespaces that have gone."""
     names = _status_namespaces()
     for ns in [n for n in _catalogs if n not in names]:
-        task = _catalogs[ns][2]
-        if task is None or task.done():
-            del _catalogs[ns]
-    for ns in names:
-        entry = _catalogs.setdefault(ns, [None, None, None])
-        fmt, last, task = entry
-        if (fmt is not None or (task is not None and not task.done())
-                or (last is not None and now - last < CATALOG_RETRY_S)):
-            continue
-        entry[1] = now
-        entry[2] = asyncio.create_task(_probe_catalog(ns))
+        del _catalogs[ns]
 
 
 def _path_quality(session) -> dict:
@@ -2783,7 +2708,7 @@ class _Status:
         while True:
             try:
                 now = loop.time()
-                _probe_catalogs(now)
+                _prune_catalogs()
                 relay_status.write_json_atomic(
                     self.path, self.snapshot(now, time.time()))
                 relay_status.write_json_atomic(self.platform_path,
@@ -2884,7 +2809,6 @@ class _Status:
         for ns in _status_namespaces():
             holders = [s for s in _announced.get(ns, {}) if _session_live(s)]
             pubs.update(id(s) for s in holders)
-            entry = _catalogs.get(ns)
             spaces[ns] = {
                 "namespace": _ns_str(ns), "announced": bool(holders),
                 "origin": (f"{_transport(holders[-1])} d{_draft(holders[-1])}"
@@ -2893,7 +2817,7 @@ class _Status:
                                 if holders else None),
                 "tracks": 0, "subscribers": len(ns_viewers.get(ns, ())),
                 "subscriptions": 0, "in_bps": 0, "out_bps": 0,
-                "bytes_out": 0, "format": entry[0] if entry else None,
+                "bytes_out": 0, "format": _catalogs.get(ns),
             }
         for key, row in tracks:
             sp = spaces.get(key[0])

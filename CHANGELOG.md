@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Relay: the dashboard learns a namespace's catalog format only from catalog objects it relays, and no longer sends publishers TRACK_STATUS and FETCH for a `catalog` track.
 - A WebTransport SETUP sent with no WT-Protocol logs the peer's address in its error line.
 - Relay: a FETCH from the cache serves exactly its range (a whole End Group was cut to its first Object, and d14-d18 served one Object past the End), and FETCH_OK's End Location is the requested End, at most Largest Object; a whole End Group ends at its last Object.
 - `serve_fetch()`: from d20 objects with an Object Status (a cached END_OF_GROUP) are not sent, since FETCH carries none; a FETCH that fails mid-stream resets its data stream instead of leaving it open.

@@ -14,12 +14,12 @@ from aiomoqt.media.catalog import Catalog, CatalogTrack
 from aiomoqt.tools import moq_interop_relay as relay
 from aiomoqt.tools import relay_status
 from aiomoqt.track import PublishedTrack, SubscribedTrack
+from aiomoqt.types import MOQTMessageType
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
 
 _PORT = 17500
 _NS = "status/live"
-_PLAIN_NS = "status/plain"
 _TRANSPORTS = pytest.mark.parametrize("use_quic", [True, False],
                                       ids=["quic", "wt"])
 
@@ -360,7 +360,7 @@ async def test_snapshot_reports_namespaces_tracks_and_sessions(
         ns = relay._ns_tuple(_NS)
         for _ in range(150):
             video = relay._tracks.get((ns, b"video"))
-            if (relay._catalogs.get(ns, [None])[0] and video is not None
+            if (relay._catalogs.get(ns) and video is not None
                     and video._bytes_out):
                 break
             await asyncio.sleep(0.02)
@@ -449,36 +449,40 @@ async def test_snapshot_reports_namespaces_tracks_and_sessions(
 
 
 @requires_certs
-@pytest.mark.parametrize("draft", [16, 18])
+@pytest.mark.parametrize("draft", [18, 22])
 @_TRANSPORTS
-async def test_probe_classifies_a_catalog_nobody_subscribed_to(
-        draft, use_quic, relay_tables, monkeypatch):
-    # The probe asks the publisher directly (TRACK_STATUS, then a FETCH of
-    # that group) and leaves no relayed track behind. A namespace with no
-    # catalog stays unclassified and is not probed again until the retry.
-    monkeypatch.setattr(relay, "CATALOG_PROBE_S", 2.0)
-    port = _PORT + 2 + 2 * (draft == 18) + (not use_quic)
+async def test_status_loop_sends_publishers_no_requests(
+        draft, use_quic, relay_tables, monkeypatch, tmp_path):
+    # A namespace the dashboard lists stays unclassified until a catalog
+    # object is relayed; the relay never asks its publisher for one.
+    monkeypatch.setattr(relay, "STATUS_INTERVAL_S", 0.1)
+    port = _PORT + 2 + 2 * (draft == 22) + (not use_quic)
     async with _relay(port, use_quic, draft) as connect:
         pub = await connect()
-        CatalogTrackPublisher(pub, _NS, _catalog("cmaf")).attach()
+        asked = []
+
+        async def record(session, msg):
+            asked.append(msg)
+        for t in (MOQTMessageType.TRACK_STATUS, MOQTMessageType.FETCH,
+                  MOQTMessageType.SUBSCRIBE):
+            pub.register_handler(t, record)
         await pub.publish_namespace(namespace=_NS, wait_response=True)
-        await pub.publish_namespace(namespace=_PLAIN_NS, wait_response=True)
-        ns, plain = relay._ns_tuple(_NS), relay._ns_tuple(_PLAIN_NS)
-        for _ in range(100):
-            if ns in relay._announced and plain in relay._announced:
-                break
-            await asyncio.sleep(0.02)
-        else:
-            pytest.fail("namespaces not announced")
+        ns = relay._ns_tuple(_NS)
 
-        loop = asyncio.get_running_loop()
-        relay._probe_catalogs(loop.time())
-        tasks = [relay._catalogs[n][2] for n in (ns, plain)]
-        await asyncio.wait_for(asyncio.gather(*tasks), 15)
-        assert relay._catalogs[ns][0] == "CMSF"
-        assert relay._catalogs[plain][0] is None
-        assert (ns, relay.CATALOG_TRACK) not in relay._tracks
-
-        relay._probe_catalogs(loop.time())
-        assert relay._catalogs[plain][2] is tasks[1]
+        background = set(relay._background)
+        status = relay._Status(str(tmp_path / "status.json"),
+                               {"started": time.time()}, [connect.handle])
+        runner = asyncio.create_task(status.run())
+        try:
+            await asyncio.sleep(1.0)
+        finally:
+            runner.cancel()
+            for task in set(relay._background) - background:
+                task.cancel()
+                relay._background.discard(task)
+        assert asked == []
+        with open(status.path) as f:
+            (space,) = json.load(f)["namespaces"]
+        assert space["namespace"] == _NS and space["format"] is None
+        assert ns not in relay._catalogs
         assert pub._close_err is None
