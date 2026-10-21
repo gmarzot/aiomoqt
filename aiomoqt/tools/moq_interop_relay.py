@@ -1612,7 +1612,8 @@ def _attach_subscriber(session, msg, track) -> bool:
     # FORWARD omitted means 1 (§10.2.12).
     forward = msg.forward is None or bool(msg.forward)
     # A filter starting at or before Largest is served from the cache
-    # first (§5.1.2: the Start MAY be less than the Largest Object).
+    # first (§5.1.2: the Start MAY be less than the Largest Object); an
+    # unfiltered subscription starts at the live edge.
     replay = (window is not _UNFILTERED and track.largest is not None
               and window[0] <= track.largest)
     track.add_downstream(session, ok.track_alias, msg.request_id,

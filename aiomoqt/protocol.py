@@ -1664,7 +1664,8 @@ class _MOQTSessionMixin:
                 chain.rollback()
                 return
             except MOQTProtocolViolation as e:
-                logger.error(f"MOQT stream({stream_id}): {e.reason_phrase}")
+                logger.error(f"MOQT stream({stream_id}): {e.reason_phrase}"
+                             f"{getattr(e, 'log_detail', '')}")
                 self._close_session(SessionCloseCode.PROTOCOL_VIOLATION,
                                     e.reason_phrase)
                 return
@@ -2132,8 +2133,7 @@ class _MOQTSessionMixin:
                     data_type = "FETCH_HEADER"
                     self._admit_fetch_stream(stream_id, msg_header)
                 else:
-                    raise MOQTProtocolViolation(
-                        self._unknown_stream_type_reason(buf, pos, stream_type))
+                    raise self._unknown_stream_type(buf, pos, stream_type)
 
                 if msg_header is None:
                     # Parse failure on the data stream type byte. Reject
@@ -2602,18 +2602,30 @@ class _MOQTSessionMixin:
         if stream_id == self._control_read_stream_id:
             self._on_control_data(stream_id, data, end_stream)
 
-    def _unknown_stream_type_reason(self, buf, pos: int, stream_type: int) -> str:
-        """Close reason for an unknown uni stream type. A WT server with no
+    def _unknown_stream_type(self, buf, pos: int,
+                             stream_type: int) -> MOQTProtocolViolation:
+        """The close for an unknown uni stream type. A WT server with no
         WT-Protocol runs the d14 fallback, so a d18+ SETUP lands here; name
-        the missing offer instead of the misparsed type."""
+        the missing offer instead of the misparsed type, and the peer in
+        log_detail, for the log line only."""
         if (self._is_wt and not self._is_client
                 and not self._profile.control_uni_pair
                 and not getattr(self, 'negotiated_protocol', None)
                 and self._d18_peek_is_setup(
                     buf.data_slice(pos, min(pos + 9, buf.capacity)))):
-            return ("SETUP on a uni stream with no WT-Protocol: offer "
-                    "moqt-NN in WT-Available-Protocols")
-        return f"unknown data stream type 0x{stream_type:x}"
+            err = MOQTProtocolViolation(
+                "SETUP on a uni stream with no WT-Protocol: offer "
+                "moqt-NN in WT-Available-Protocols")
+            try:
+                addr = self.peer_address
+            except Exception:
+                addr = None
+            if addr:
+                host = f"[{addr[0]}]" if ":" in addr[0] else addr[0]
+                err.log_detail = f" (peer {host}:{addr[1]})"
+            return err
+        return MOQTProtocolViolation(
+            f"unknown data stream type 0x{stream_type:x}")
 
     @staticmethod
     def _d18_peek_is_setup(data) -> Optional[bool]:

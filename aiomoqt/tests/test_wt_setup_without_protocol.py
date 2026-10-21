@@ -2,6 +2,8 @@
 a d18+ SETUP arriving there on a uni stream closes with a reason naming the
 missing WT-Available-Protocols offer, not as an unknown data stream type."""
 import asyncio
+import logging
+import re
 
 from aiopquic.asyncio.webtransport import connect_webtransport
 
@@ -21,7 +23,7 @@ def _setup_prefix() -> bytes:
     return bytes(b.data) + b"\x00\x04\x00\x00\x00\x00"
 
 
-async def test_d18_setup_without_wt_protocol_names_the_offer():
+async def test_d18_setup_without_wt_protocol_names_the_offer(caplog):
     server = MOQTServer(host="localhost", port=_PORT, certificate=CERT,
                         private_key=KEY, path="/", use_quic=False,
                         supported_drafts=[22, 20, 18, 16, 14])
@@ -40,5 +42,12 @@ async def test_d18_setup_without_wt_protocol_names_the_offer():
         assert "SETUP on a uni stream with no WT-Protocol" in reason, reason
         assert "WT-Available-Protocols" in reason, reason
         assert "unknown data stream type" not in reason
+        # The server's stream error line names the peer.
+        logged = [r.getMessage() for r in caplog.records
+                  if r.levelno == logging.ERROR
+                  and r.getMessage().startswith("MOQT stream(")
+                  and "no WT-Protocol" in r.getMessage()]
+        assert len(logged) == 1, logged
+        assert re.search(r"peer \[?[0-9a-f.:]+\]?:\d+\)$", logged[0]), logged
     finally:
         handle.close()
