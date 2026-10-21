@@ -2,12 +2,26 @@
 
 ## Unreleased
 
+- Relay: `--control PATH` serves HTTP on a Unix socket; `GET /debug` reports DEBUG logging and `POST /debug` toggles it, for a button behind the private page.
+- LOC: self-describing objects carry TIMESCALE only when the track sets one; the default 1e6 made LOC read wall-clock timestamps as media time.
+- pub_media: paced sources (mp4, tone, HLS/DASH ingest) stamp each frame with its scheduled wall-clock capture time instead of its send time.
+- pub_media `--loc-timescale TICKS`: LOC timestamps as media time at TICKS per second, with TIMESCALE on each group's first object (every object with `--loc-codecstring`); LOC packaging only.
+- Requires aiopquic >= 0.6.1: a raw-QUIC client's close no longer creates a phantom server session.
+- Logging: each control message logs once at INFO, where it crosses the wire (`MOQT send:` out, `control message parsed:` in); the handlers' repeat lines, control-stream plumbing and the version-from-ALPN line are DEBUG, and `setup complete: draft-N` logs on both sides.
+- `MOQTServer(quiet_peers=…)`: a session whose peer's SETUP implementation starts with a listed prefix logs below WARNING at DEBUG.
+- Relay: the watchdog names itself in SETUP and its sessions log at DEBUG; three probes in four only complete SETUP; an hourly INFO line counts probes; SIGUSR1 toggles DEBUG logging.
 - Relay: d16 SUBSCRIBE_NAMESPACE follows its Subscribe Options; NAMESPACE (0x01) or both (0x02) gets NAMESPACE and NAMESPACE_DONE.
 - Relay: d14 namespace subscribers are forwarded PUBLISH_NAMESPACE and PUBLISH_NAMESPACE_DONE.
 - Relay: a namespace whose last publisher's session closes is withdrawn from namespace subscribers.
 - Publisher: a PUBLISH_OK (d16, d18) or SUBSCRIBE that omits FORWARD starts delivery, the default of 1 (§10.2.12).
 - Interop client: the standard run adds subscribe-namespace-lifecycle, namespace-discovery, publish-track-only and publish-track-subscribe.
 - CI: release.yml requires green CI and MoQ conformance on the release tree instead of re-running them, publishes the wheel it smoke-tested, and has a `dry_run` input; conformance runs on release branches only, and a new push cancels the run it supersedes.
+- Perf: FETCH history records each published object with an append (no hashing); duplicate Locations are resolved when fetched.
+- Perf: a subgroup object skips the filter check while its subscription forwards unfiltered, and is encoded with positional calls.
+- Perf: an object on an open, unfiltered subgroup stream is written without a coroutine of its own.
+- Perf: a received object reaches its callback without the per-object wrapper call; a raising callback still costs only that object.
+- SubscribedTrack: an object that arrives before its SUBSCRIBE_OK reaches its own track; the track no longer claims the session-wide `on_object_received`, which sent such objects to whichever track subscribed last.
+- `session.join(on_object=)`: the subscription's callback binds as SUBSCRIBE_OK arrives; MediaSubscriber uses it for the catalog instead of the session-wide `on_object_received`.
 
 ## v0.13.0
 

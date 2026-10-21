@@ -52,9 +52,11 @@ import contextlib
 import datetime
 import faulthandler
 import itertools
+import json
 import logging
 from logging.handlers import RotatingFileHandler
 import os
+import signal
 import sys
 import time
 from collections import Counter
@@ -83,7 +85,9 @@ from aiomoqt.context import (canonical_request_error, canonical_stream_reset,
                              request_error_code)
 from aiomoqt.tools import relay_status
 from aiomoqt.utils.buffer import Buffer
-from aiomoqt.utils.logger import set_log_handler, set_log_level, get_logger
+from aiomoqt import __version__ as AIOMOQT_VERSION
+from aiomoqt.utils.logger import (get_log_level, get_logger, set_log_handler,
+                                  set_log_level)
 from aiomoqt.utils.url import parse_relay_url
 
 # Version confinement. The interop runner injects DRAFT (moq-interop-runner
@@ -148,6 +152,12 @@ PUBLISH_WAIT_S = 1.5
 WATCHDOG_MISSES = 3
 WATCHDOG_EXIT = 70
 WATCHDOG_PROBE_S = 10.0
+# The probe's SETUP implementation prefix; the relay logs its sessions at
+# DEBUG. One probe in WATCHDOG_FULL_EVERY relays an object; the rest only
+# complete SETUP. Probe results are summarised every WATCHDOG_REPORT_S.
+WATCHDOG_IMPL = "aiomoqt-watchdog/"
+WATCHDOG_FULL_EVERY = 4
+WATCHDOG_REPORT_S = 3600.0
 # After a failed probe, how long to let a woken reader drain before
 # reading the transport counters again.
 WATCHDOG_KICK_S = 0.5
@@ -1789,6 +1799,10 @@ def parse_args():
                              "(a child process relays one object over "
                              "loopback every SEC seconds). 0 = off "
                              "(default).")
+    parser.add_argument("--control", type=str, default=None, metavar="PATH",
+                        help="Serve HTTP on the Unix socket PATH: GET /debug "
+                             "reports DEBUG logging, POST /debug toggles it "
+                             "(as SIGUSR1)")
     parser.add_argument("--status-dir", type=str, default=None, metavar="DIR",
                         help="Write DIR/status.json every "
                              f"{STATUS_INTERVAL_S:g}s for the dashboard: "
@@ -1818,7 +1832,8 @@ def parse_args():
                         help="Per-stream send budget, below "
                              "--stream-ring-cap. Default: 512 KiB")
     parser.add_argument("--debug", action="store_true",
-                        help="Enable debug logging")
+                        help="Enable debug logging (SIGUSR1 toggles it at "
+                             "runtime)")
     return parser.parse_args()
 
 
@@ -2284,6 +2299,7 @@ def _build_server(bind, port, cert, key, use_quic, draft, **transport):
         path="/",
         use_quic=use_quic,
         supported_drafts=draft,
+        quiet_peers=(WATCHDOG_IMPL,),
         **transport,
     )
     server.register_handler(
@@ -2331,10 +2347,13 @@ class _ProbeTrack(PublishedTrack):
         self._largest = (0, 0)
 
 
-async def _self_probe(host, port, use_quic, draft, timeout) -> bool:
-    """Relay one object from a publisher session to a subscriber session,
-    both on loopback, under a namespace of the probe's own."""
+async def _self_probe(host, port, use_quic, draft, timeout,
+                      full=True) -> bool:
+    """Complete SETUP on one loopback session or, `full`, relay one object
+    from a publisher session to a subscriber session under a namespace of
+    the probe's own."""
     ns = f"aiomoqt-watchdog/{os.getpid()}-{next(_probe_seq)}"
+    impl = f"{WATCHDOG_IMPL}{AIOMOQT_VERSION}"
     got = asyncio.get_running_loop().create_future()
 
     def _on_object(*_):
@@ -2344,12 +2363,15 @@ async def _self_probe(host, port, use_quic, draft, timeout) -> bool:
     async def _round_trip():
         async with contextlib.AsyncExitStack() as stack:
             sessions = []
-            for _ in range(2):
+            for _ in range(2 if full else 1):
                 client = MOQTClient(host, port, path="/", use_quic=use_quic,
-                                    verify_tls=False, supported_drafts=draft)
+                                    verify_tls=False, supported_drafts=draft,
+                                    implementation=impl)
                 s = await stack.enter_async_context(client.connect())
                 await s.client_session_init()
                 sessions.append(s)
+            if not full:
+                return
             pub, sub = sessions
             _ProbeTrack(pub, ns, "probe").attach()
             await pub.publish_namespace(namespace=ns, wait_response=True)
@@ -2371,18 +2393,21 @@ _PROBE_CHILD = (
     "import asyncio, logging, sys\n"
     "from aiomoqt.tools import moq_interop_relay as r\n"
     "logging.disable(logging.INFO)\n"
-    "h, p, q, d, t = sys.argv[1:]\n"
-    "ok = asyncio.run(r._self_probe(h, int(p), q == '1', int(d), float(t)))\n"
+    "h, p, q, d, t, f = sys.argv[1:]\n"
+    "ok = asyncio.run(r._self_probe(h, int(p), q == '1', int(d), float(t),\n"
+    "                               f == '1'))\n"
     "sys.exit(0 if ok else 1)\n"
 )
 
 
-async def _probe_in_child(host, port, use_quic, draft, timeout) -> bool:
+async def _probe_in_child(host, port, use_quic, draft, timeout,
+                          full=True) -> bool:
     """Run one self-probe in a child process, so a crash in the probe's
     client transport cannot take the relay down."""
     proc = await asyncio.create_subprocess_exec(
         sys.executable, "-c", _PROBE_CHILD, host, str(port),
         "1" if use_quic else "0", str(draft), str(timeout),
+        "1" if full else "0",
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
     try:
         _, err = await asyncio.wait_for(proc.communicate(), timeout + 15)
@@ -2472,10 +2497,21 @@ async def _watchdog(period, host, port, use_quic, draft,
     _background.add(asyncio.create_task(_heartbeat(period)))
     newest = max(draft) if isinstance(draft, (list, tuple)) else int(draft)
     misses = 0
+    ticks = ok = 0
+    report_at = time.monotonic() + WATCHDOG_REPORT_S
     while True:
         await asyncio.sleep(period)
-        if await _probe_in_child(host, port, use_quic, newest,
-                                 min(period, WATCHDOG_PROBE_S)):
+        full = ticks % WATCHDOG_FULL_EVERY == 0
+        ticks += 1
+        passed = await _probe_in_child(host, port, use_quic, newest,
+                                       min(period, WATCHDOG_PROBE_S), full)
+        ok += passed
+        if time.monotonic() >= report_at:
+            logger.info(f"relay: watchdog: {ok}/{ticks} probes ok in the "
+                        f"last {WATCHDOG_REPORT_S / 3600:g} h")
+            ticks = ok = 0
+            report_at = time.monotonic() + WATCHDOG_REPORT_S
+        if passed:
             misses = 0
             continue
         misses += 1
@@ -3078,6 +3114,52 @@ def _start_log_dir(log_dir: str) -> None:
     logger.info(f"relay: crash and stall dumps go to {path}")
 
 
+def _toggle_debug() -> None:
+    """SIGUSR1: switch aiomoqt logging between DEBUG and INFO."""
+    if get_log_level() == logging.DEBUG:
+        set_log_level(logging.INFO)
+        logger.info("relay: debug logging off")
+    else:
+        set_log_level(logging.DEBUG)
+        logger.info("relay: debug logging on")
+
+
+async def _on_control(reader, writer) -> None:
+    """One HTTP/1.1 request on the control socket."""
+    try:
+        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5.0)
+        method, path = (head.split(b"\r\n", 1)[0].decode("latin-1")
+                        .split(" ")[:2])
+        if path != "/debug" or method not in ("GET", "POST"):
+            status, body = "404 Not Found", {"error": "not found"}
+        else:
+            if method == "POST":
+                _toggle_debug()
+            status = "200 OK"
+            body = {"debug": get_log_level() == logging.DEBUG}
+        data = json.dumps(body).encode()
+        writer.write(f"HTTP/1.1 {status}\r\nContent-Type: application/json"
+                     f"\r\nContent-Length: {len(data)}\r\n"
+                     f"Connection: close\r\n\r\n".encode() + data)
+        await writer.drain()
+    except (asyncio.IncompleteReadError, asyncio.LimitOverrunError,
+            asyncio.TimeoutError, ValueError, ConnectionError):
+        pass
+    finally:
+        writer.close()
+
+
+async def _serve_control(path: str) -> None:
+    """The --control socket; world-writable, for a proxy in another
+    container. Its parent directory decides who can reach it."""
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(path)
+    server = await asyncio.start_unix_server(_on_control, path=path)
+    os.chmod(path, 0o666)
+    _background.add(server)
+    logger.info(f"relay: control socket {path}")
+
+
 async def main():
     args = parse_args()
     speaks = sorted(int(d) for d in MOQTDraft)
@@ -3093,6 +3175,10 @@ async def main():
     )
     if args.log_dir:
         _start_log_dir(args.log_dir)
+    asyncio.get_running_loop().add_signal_handler(signal.SIGUSR1,
+                                                  _toggle_debug)
+    if args.control:
+        await _serve_control(args.control)
     logger.info(f"relay: start {_versions_line()} pid {os.getpid()}")
     print("aiomoqt ERSATZ-RELAY: an API demonstrator and conformance "
           "SUT — not a production relay (no auth, no hardening).",

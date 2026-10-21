@@ -401,7 +401,8 @@ class TestSubscribedTrack:
         asyncio.run(_test())
 
     def test_on_object_callback_set(self):
-        """on_object callback is wired to session."""
+        """on_object is bound to this track's subscription, not the
+        session-wide handler."""
         async def _test():
             session = MagicMock()
             # Discovery succeeds
@@ -424,7 +425,8 @@ class TestSubscribedTrack:
                                 on_object=cb)
             await t.subscribe()
 
-            assert session.on_object_received is cb
+            assert session.subscribe.call_args.kwargs["on_object"] is cb
+            assert session.on_object_received is None
 
         asyncio.run(_test())
 

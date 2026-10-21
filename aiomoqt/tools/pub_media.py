@@ -157,10 +157,16 @@ def parse_args():
                         help='Make every LOC object self-describing for '
                              'players without a catalog '
                              '(moq-encoder-player): codec string (0x11, '
-                             'proposed, not in loc-04), timescale (0x08) '
-                             'and, on video, frame marking (0x09). With a '
-                             'timescale, LOC reads timestamps as media '
-                             'time rather than wall clock.')
+                             'proposed, not in loc-04) and, on video, '
+                             'frame marking (0x09). Timestamps stay '
+                             'wall-clock µs (no timescale).')
+    parser.add_argument('--loc-timescale', type=int, default=None,
+                        metavar='TICKS',
+                        help='LOC timestamps as media time at TICKS per '
+                             'second: TIMESCALE (0x08) on the first object '
+                             'of each group, and on every object with '
+                             '--loc-codecstring. Default: wall-clock µs, '
+                             'no TIMESCALE. 1000000 keeps µs values.')
     parser.add_argument('--loc-bare', action='store_true',
                         help='LOC payloads without the (empty) Private '
                              'Properties block 0x0A 0x00, for receivers '
@@ -208,8 +214,11 @@ def parse_args():
     args.rendition = args.rendition or 'best'
     if args.packaging != PACKAGING_LOC and not (args.mp4 or args.input):
         parser.error(f'--packaging {args.packaging} requires --mp4 or --input')
+    if args.loc_timescale is not None and args.loc_timescale <= 0:
+        parser.error('--loc-timescale must be positive')
     for flag, on in (('--loc-codecstring', args.loc_codecstring),
-                     ('--loc-bare', args.loc_bare)):
+                     ('--loc-bare', args.loc_bare),
+                     ('--loc-timescale', args.loc_timescale)):
         if on and args.packaging != PACKAGING_LOC:
             parser.error(f'{flag} applies to LOC packaging only')
     if args.datagram and args.packaging == PACKAGING_LOCMAF:
@@ -347,17 +356,18 @@ async def _feed_ingest(ingest: Ingest, tracks: dict, args, stats: dict):
     """Send each CMAF chunk paced to its decode time; the first chunk
     anchors the clock, so a live input runs as far behind its edge as
     the demuxer starts."""
-    start = first = None
+    start = first = wall0 = None
     try:
         async for c in ingest.chunks():
             if first is None:
                 start, first = time.monotonic(), c.time_us
+                wall0 = int(time.time() * 1_000_000)
             ts = c.time_us - first
             if ts > args.duration * 1_000_000:
                 break
             await _pace(start, ts, not args.no_pace)
             await _send(tracks[c.track], stats[c.track], c.payload, c.key,
-                        group_id=c.group_id)
+                        timestamp=wall0 + ts, group_id=c.group_id)
     finally:
         ingest.close()
     for track in tracks.values():
@@ -534,15 +544,18 @@ async def _send(track, stats, payload: bytes, key: bool,
     backlog for a late joiner.
 
     LOC timestamps without a TIMESCALE property are µs since the Unix
-    epoch — players schedule against the wall clock. Sources without
-    their own presentation clock are stamped at send time."""
+    epoch — players schedule against the wall clock. Paced sources pass
+    their scheduled capture time; a live source without its own clock is
+    stamped at send time."""
     if track.demand[0] == 0:
         stats.dropped += 1
         return
     entry_us = int(time.time() * 1_000_000)
     if timestamp is None:
         timestamp = entry_us
-    await track.send_frame(payload, key_frame=key, timestamp=timestamp,
+    stamp = (timestamp * track.timescale // 1_000_000 if track.timescale
+             else timestamp)
+    await track.send_frame(payload, key_frame=key, timestamp=stamp,
                            group_id=group_id)
     # lag: how late the frame already was when we got it (source, pipe,
     # demux). tx: what handing it to the track cost us.
@@ -641,13 +654,13 @@ async def _report_stats(stats: dict, interval: float, pub: FanoutPublisher):
 
 
 async def _feed_tone(track, args, stats: _TrackStats):
-    start = time.monotonic()
+    start, wall0 = time.monotonic(), int(time.time() * 1_000_000)
     for payload, ts in pcm_tone_frames(
             duration_s=args.duration, freq=args.freq,
             samplerate=_SAMPLERATE, channels=_CHANNELS,
             frame_ms=_FRAME_MS):
         await _pace(start, ts, not args.no_pace)
-        await _send(track, stats, payload, True)
+        await _send(track, stats, payload, True, timestamp=wall0 + ts)
     await track.finish()
 
 
@@ -655,12 +668,12 @@ async def _feed_mp4_track(track, source, args, stats: _TrackStats, *,
                           all_key=False, group_us=None, gap_us=33_333,
                           wrap=None):
     """Feed an mp4 track's samples, paced to their media timestamps and
-    stamped with the wall clock at send (LOC default clock); --loop
+    stamped with their scheduled wall-clock capture time; --loop
     restarts the file at later timestamps (audio: every AU is a sync
     frame, giving LOC's one-object-per-group audio mapping, or with
     group_us one group per that much media time).
     wrap(sample) transforms the payload (CMAF chunking)."""
-    start = time.monotonic()
+    start, wall0 = time.monotonic(), int(time.time() * 1_000_000)
     base_us = 0
     group_ts = None
     while True:
@@ -677,7 +690,7 @@ async def _feed_mp4_track(track, source, args, stats: _TrackStats, *,
                     group_ts = ts
             else:
                 key = all_key or s.key_frame
-            await _send(track, stats, payload, key)
+            await _send(track, stats, payload, key, timestamp=wall0 + ts)
             last = ts
         base_us = last + gap_us
         if not args.loop or base_us > args.duration * 1_000_000:
@@ -769,7 +782,8 @@ async def run(args):
                 return LocmafTrackPublisher(session, args.namespace, name,
                                             init=init, **kwargs)
             return LocTrackPublisher(session, args.namespace, name,
-                                     loc_bare=loc_bare, **kwargs)
+                                     loc_bare=loc_bare,
+                                     timescale=args.loc_timescale, **kwargs)
         pub = FanoutPublisher(sessions, args.namespace, catalog)
         stats = {}
         feeders = []
@@ -787,6 +801,7 @@ async def run(args):
                 tracks['video'] = pub.add_track(LocTrackPublisher(
                     session, args.namespace, 'video', config=video.config,
                     loc01_compat=args.loc01_compat, loc_bare=loc_bare,
+                    timescale=args.loc_timescale,
                     codec_string=_cs(video.codec_string)))
                 stats['video'] = _TrackStats()
             if ts_audio is not None:
@@ -796,6 +811,7 @@ async def run(args):
                     mapping=(StreamMapping.DATAGRAM if args.datagram
                              else StreamMapping.PER_GROUP),
                     loc01_compat=args.loc01_compat, loc_bare=loc_bare,
+                    timescale=args.loc_timescale,
                     codec_string=_cs(ts_audio.codec_string)))
                 stats['audio'] = _TrackStats()
             feeders.append(_feed_ts_live(tracks, fh, dmx, first, args,
@@ -832,6 +848,7 @@ async def run(args):
                 pub.add_track(LocTrackPublisher(
                     session, args.namespace, 'video', config=video.config,
                     loc01_compat=args.loc01_compat, loc_bare=loc_bare,
+                    timescale=args.loc_timescale,
                     codec_string=_cs(video.codec_string))),
                 fh, asm, first, args, stats['video']))
         elif video is not None and ts is None:   # --ts wired both tracks above

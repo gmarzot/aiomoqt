@@ -52,11 +52,22 @@
   p { margin: 10px 0 0; }
   .note { color: var(--dim); font-size: 13px; }
   footer { margin-top: 32px; }
-  [data-versions] { margin-top: 4px; font-size: 12px; }
-  [data-versions]:empty { display: none; }
+  [data-versions]:empty, [data-pages-build]:empty { display: none; }
+  [data-pages-build]::before { content: " · "; }
   .warn { border-left: 3px solid var(--red); padding: 6px 10px; margin: 0 0 12px; background: #1d1513;
     font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   @media (max-width: 900px) { .warn { white-space: normal; } }
+  .relay { background: var(--panel); border-radius: 4px; padding: 14px 18px; }
+  .relay dl { gap: 8px 14px; align-items: center; min-width: 0; }
+  .relay dt { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
+  code.url { color: var(--text); border-radius: 4px; padding: 3px 10px; }
+  code.url:hover { border-color: var(--red); }
+  .drafts { font: 13px/1.4 "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace; }
+  .dash-line { margin: 0 0 12px; }
+  .dash { font-size: 15px; font-weight: 500; }
+  .dash:hover { text-decoration: underline; text-underline-offset: 3px; }
+  .dash-line span { color: var(--dim); font-size: 12px; margin-left: 8px; }
+  footer a.quiet, footer a.quiet:hover { color: inherit; }
 </style>
 </head>
 <body>
@@ -78,22 +89,25 @@
       <span class="tags" title="Catalogs MSF, CMSF; packaging LOC, CMAF, LOCMAF; decoding WebCodecs, MSE; drafts 14 to 18">MSF/CMSF · LOC/CMAF/LOCMAF · WebCodecs/MSE · d14–18</span>
     </a>
   </div>
-  <p class="note">Repo: <a href="https://github.com/gmarzot/moq-playa/tree/gmarzot-playa-dev">gmarzot/moq-playa</a> — forked from <a href="https://github.com/openmoq/moq-playa">openmoq/moq-playa</a></p>
+  <p class="note">Repo: <a href="https://github.com/gmarzot/moq-playa/tree/gmarzot-playa-dev">gmarzot/moq-playa</a> — forked from <a href="https://github.com/openmoq/moq-playa">openmoq/moq-playa</a><span data-pages-build></span></p>
 
   <section>
     <h2>aiomoqt ersatz relay — limited testing only</h2>
     <p class="warn">For limited interop testing. Please keep traffic light: excessive traffic or
       extended relay testing is discouraged. Not a production relay.</p>
-    <dl>
-      <dt>WebTransport</dt><dd><code>https://aiomoqt-relay.marzresearch.net:4443/</code></dd>
-      <dt>Raw QUIC</dt><dd><code>moqt://aiomoqt-relay.marzresearch.net:4443</code></dd>
-      <dt>Drafts</dt><dd>22, 20, 18, 16, 14 (highest common draft wins)</dd>
-      <dt>Status</dt><dd><a href="/relay/" target="_blank" rel="noopener">live relay dashboard</a></dd>
-    </dl>
+    <div class="relay">
+      <p class="dash-line"><a class="dash" href="/relay/" target="_blank" rel="noopener">Live relay dashboard →</a>
+        <span>publishers, subscribers, tracks, bandwidth, latency</span></p>
+      <dl>
+        <dt>WebTransport</dt><dd><code class="url">https://aiomoqt-relay.marzresearch.net:4443/</code></dd>
+        <dt>Raw QUIC</dt><dd><code class="url">moqt://aiomoqt-relay.marzresearch.net:4443</code></dd>
+        <dt>Drafts</dt><dd class="drafts">22 · 20 · 18 · 16 · 14</dd>
+      </dl>
+    </div>
   </section>
 
-  <footer class="note"><a href="/private/" title="Password required">private ↗</a>
-    <div data-versions></div>
+  <footer class="note">MoQ Ersatz Relay · <a class="quiet" href="/private/">A Marz Research Project</a>
+    <span data-versions></span>
   </footer>
 </main>
 </body>

@@ -1,4 +1,4 @@
-// Fills [data-versions] with the relay's software and start time and the G5 pages' build.
+// Fills [data-versions] with the relay's software and start time, [data-pages-build] with the G5 pages' build.
 'use strict';
 
 (() => {
@@ -13,35 +13,40 @@
     }
   }
 
-  function relayParts(body) {
+  // "[aiomoqt … · aiopquic … · picoquic … · deployed: …]" from the relay's platform.json.
+  function relayLine(body) {
     try {
       const { generated, relay } = JSON.parse(body);
       const v = relay.versions;
       // "v2026.10.08.c908872-0-gc9088724" names the picoquic snapshot by date.
       const pico = /^v?(\d{4}\.\d\d\.\d\d)/.exec(v.picoquic || '');
-      const parts = [`relay aiomoqt ${v.aiomoqt}`, `aiopquic ${v.aiopquic}`];
+      const parts = [`aiomoqt ${v.aiomoqt}`, `aiopquic ${v.aiopquic}`];
       if (pico) parts.push(`picoquic ${pico[1]}`);
-      if (relay.uptime_s != null) parts.push(`up since ${when((generated - relay.uptime_s) * 1000)}`);
-      return parts;
+      if (relay.uptime_s != null) parts.push(`deployed: ${when((generated - relay.uptime_s) * 1000)}`);
+      return `[${parts.join(' · ')}]`;
     } catch {
-      return [];
+      return '';
     }
   }
 
   // /VERSION: "moq-playa <build> <built-at ISO 8601>".
-  function pagesParts(body) {
+  function pagesLine(body) {
     const m = /^moq-playa (\S+)(?:\s+(\S+))?/.exec((body || '').trim());
-    if (!m) return [];
+    if (!m) return '';
     const at = Date.parse(m[2]);
-    return [`G5 pages moq-playa ${m[1]}`].concat(Number.isNaN(at) ? [] : [`built ${when(at)}`]);
+    return `G5 pages moq-playa ${m[1]}` + (Number.isNaN(at) ? '' : ` · built ${when(at)}`);
   }
 
-  async function render() {
-    const nodes = document.querySelectorAll('[data-versions]');
+  async function fill(selector, url, line) {
+    const nodes = document.querySelectorAll(selector);
     if (!nodes.length) return;
-    const [platform, site] = await Promise.all([get('/status/platform.json'), get('/VERSION')]);
-    const line = relayParts(platform).concat(pagesParts(site)).join(' · ');
-    for (const n of nodes) n.textContent = line;
+    const text = line(await get(url));
+    for (const n of nodes) n.textContent = text;
+  }
+
+  function render() {
+    fill('[data-versions]', '/status/platform.json', relayLine);
+    fill('[data-pages-build]', '/VERSION', pagesLine);
   }
 
   render();

@@ -3,7 +3,7 @@ import errno
 import ipaddress
 import socket
 from asyncio.futures import Future
-from typing import Any, List, Optional, Tuple, Union, Coroutine
+from typing import Any, Coroutine, Iterable, List, Optional, Tuple, Union
 
 from aiopquic.asyncio.server import serve as aiopquic_serve
 from aiopquic.asyncio.dispatch import serve_dispatch
@@ -88,6 +88,7 @@ class MOQTServer(MOQTPeer):
         stream_ring_cap: Optional[int] = None,
         max_connections: Optional[int] = None,
         implementation: Optional[str] = USER_AGENT,
+        quiet_peers: Iterable[str] = (),
     ):
         super().__init__(tx_max_inflight_bytes=tx_max_inflight_bytes,
                          implementation=implementation)
@@ -126,6 +127,10 @@ class MOQTServer(MOQTPeer):
         # Most connections held at once (aiopquic >= 0.5.1). None =
         # aiopquic default (256).
         self.max_connections = max_connections
+        # Sessions whose peer's SETUP names an implementation starting
+        # with one of these log below WARNING at DEBUG (a health probe's
+        # sessions, say).
+        self.quiet_peers = tuple(quiet_peers)
         self._loop = asyncio.get_running_loop()
         self._server_closed: Future[Tuple[int, str]] = self._loop.create_future()
         self._next_subscribe_id = 1

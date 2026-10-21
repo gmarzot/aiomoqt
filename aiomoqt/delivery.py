@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections import OrderedDict
+from collections import deque
 from enum import Enum
 from typing import Any, Callable, Dict, Optional
 
@@ -48,41 +48,62 @@ _HISTORY_ENTRY_BYTES = 64
 class ObjectHistory:
     """Recently published objects, for answering FETCH (§10.12).
 
-    Keyed by (group, object); the first record of a Location wins, since
-    a published object never changes (§2.1). Bounded by `max_bytes`, the
-    oldest dropped first.
+    Records are kept in publication order, bounded by `max_bytes`, the
+    oldest dropped first. The first record of a Location wins, since a
+    published object never changes (§2.1); duplicates are resolved when
+    fetched, keeping the per-object add free of hashing.
     """
+
+    __slots__ = ("max_bytes", "_records", "_bytes", "evicted_through")
 
     def __init__(self, max_bytes: int):
         self.max_bytes = max_bytes
-        self._objects: OrderedDict = OrderedDict()
+        # (group, object, subgroup, payload, extensions, priority)
+        self._records: deque = deque()
         self._bytes = 0
         # Largest Location dropped: below it, status is unknown.
         self.evicted_through: Optional[tuple] = None
 
     def __len__(self) -> int:
-        return len(self._objects)
+        return len(self._records)
 
-    def add(self, group_id: int, object_id: int, payload: bytes, *,
+    def add(self, group_id: int, object_id: int, payload: bytes,
             subgroup_id: Optional[int] = 0, extensions: Any = None,
             priority: int = 128) -> None:
         """Record one object. `subgroup_id` None marks one sent as a
         datagram; `extensions` may be a callable taking the session that
         fetches it."""
-        key = (group_id, object_id)
-        if key in self._objects:
-            return
-        self._objects[key] = (subgroup_id, payload, extensions, priority)
+        self._records.append((group_id, object_id, subgroup_id, payload,
+                              extensions, priority))
         self._bytes += len(payload) + _HISTORY_ENTRY_BYTES
-        while self._bytes > self.max_bytes and self._objects:
-            gone, old = self._objects.popitem(last=False)
-            self._bytes -= len(old[1]) + _HISTORY_ENTRY_BYTES
-            if self.evicted_through is None or gone > self.evicted_through:
-                self.evicted_through = gone
+        if self._bytes > self.max_bytes:
+            self._evict()
+
+    def _evict(self) -> None:
+        records = self._records
+        held = self._bytes
+        through = self.evicted_through
+        while held > self.max_bytes and records:
+            rec = records.popleft()
+            held -= len(rec[3]) + _HISTORY_ENTRY_BYTES
+            gone = (rec[0], rec[1])
+            if through is None or gone > through:
+                through = gone
+        self._bytes = held
+        self.evicted_through = through
+
+    def _held(self, start: tuple, end: tuple) -> dict:
+        """Location -> first record of it, for Locations in [start, end]."""
+        held = {}
+        for rec in self._records:
+            key = (rec[0], rec[1])
+            if start <= key <= end and key not in held:
+                held[key] = rec
+        return held
 
     def last_object(self, group_id: int) -> Optional[int]:
         """The largest Object ID held in a group, None if none is."""
-        ids = [o for g, o in self._objects if g == group_id]
+        ids = [r[1] for r in self._records if r[0] == group_id]
         return max(ids) if ids else None
 
     def fetch(self, start: tuple, end: tuple, session=None, *,
@@ -97,13 +118,13 @@ class ObjectHistory:
         if self.evicted_through is not None and start <= self.evicted_through:
             lost = min(self.evicted_through, end)
             start = max(start, (lost[0], lost[1] + 1))
-        keys = sorted(k for k in self._objects if start <= k <= end)
+        held = self._held(start, end)
+        keys = sorted(held)
         if descending:
             keys.sort(key=lambda k: (-k[0], k[1]))
         out = []
-        for group_id, object_id in keys:
-            subgroup_id, payload, exts, priority = self._objects[
-                (group_id, object_id)]
+        for key in keys:
+            group_id, object_id, subgroup_id, payload, exts, priority = held[key]
             if callable(exts):
                 exts = exts(session)
             out.append(FetchObject(

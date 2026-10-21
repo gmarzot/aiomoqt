@@ -15,8 +15,15 @@ services:
     cpuset: "1,2"
     # Core files land in ./cores; see README.md for the host's core_pattern.
     ulimits: {core: -1}
+    # No capabilities, no privilege gain, read-only root: it binds UDP 4443 and
+    # writes only its root-owned mounts (README.md, "First-time setup").
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    tmpfs: [/tmp]
     environment:
       PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
       PYTHONFAULTHANDLER: "1"
       # Stream buffers (1 MiB) are mmapped, so freed ones go back to the OS.
       MALLOC_MMAP_THRESHOLD_: "1048576"
@@ -25,10 +32,12 @@ services:
       MOQT_PORT: "4443"
       MOQT_CERT: /etc/letsencrypt/live/aiomoqt-relay.marzresearch.net/fullchain.pem
       MOQT_KEY: /etc/letsencrypt/live/aiomoqt-relay.marzresearch.net/privkey.pem
-    command: ["--draft", "22,20,18,16,14", "--watchdog", "15", "--status-dir", "/status",
-              "--log-dir", "/logs"]
+    command: ["--draft", "22,20,18,16,14", "--watchdog", "30", "--status-dir", "/status",
+              "--log-dir", "/logs", "--control", "/status/control.sock"]
     volumes:
-      - /etc/letsencrypt:/etc/letsencrypt:ro
+      # This certificate only; live/ links into archive/.
+      - /etc/letsencrypt/live/aiomoqt-relay.marzresearch.net:/etc/letsencrypt/live/aiomoqt-relay.marzresearch.net:ro
+      - /etc/letsencrypt/archive/aiomoqt-relay.marzresearch.net:/etc/letsencrypt/archive/aiomoqt-relay.marzresearch.net:ro
       - ./status:/status
       - ./relay-logs:/logs
       - ./cores:/cores
@@ -41,6 +50,7 @@ services:
     image: nginx:alpine
     container_name: relay-web
     restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
     ports:
       - "80:80"
       - "443:443"
@@ -52,7 +62,8 @@ services:
       - ./stats:/srv/stats:ro
       - ./stats.htpasswd:/etc/nginx/stats.htpasswd:ro
       - ./logs:/var/log/nginx/site
-      - /etc/letsencrypt:/etc/letsencrypt:ro
+      - /etc/letsencrypt/live/aiomoqt-relay.marzresearch.net:/etc/letsencrypt/live/aiomoqt-relay.marzresearch.net:ro
+      - /etc/letsencrypt/archive/aiomoqt-relay.marzresearch.net:/etc/letsencrypt/archive/aiomoqt-relay.marzresearch.net:ro
     logging:
       options: {max-size: "10m", max-file: "3"}
 
@@ -61,6 +72,10 @@ services:
     container_name: relay-goaccess
     restart: unless-stopped
     network_mode: none
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    tmpfs: [/tmp]
     # Every 5 minutes, from the current and rotated logs: visitors without
     # crawlers, and crawlers alone. Each report replaces the old one whole.
     # BusyBox zcat -f does not pass plain files through, so only .gz is zcat'd.

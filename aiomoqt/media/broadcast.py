@@ -359,11 +359,9 @@ class MediaSubscriber:
         if self.discover:
             await self._resolve_namespace(timeout)
         self.session.on_fetch_object = self._on_catalog_fetch_object
-        # Global fallback catches catalog objects that arrive before the
-        # per-alias registration (§10.4.2 data-before-OK race).
-        self.session.on_object_received = self._on_catalog_object
         sub_msg, fetch_msg = await self.session.join(
-            self.namespace, CATALOG_TRACK_NAME, joining_start=0)
+            self.namespace, CATALOG_TRACK_NAME, joining_start=0,
+            on_object=self._on_catalog_object)
         sub_ok = await self.session._await_response(sub_msg.request_id)
         alias = getattr(sub_ok, 'track_alias', None)
         if alias is not None:
