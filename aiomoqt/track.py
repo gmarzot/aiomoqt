@@ -31,8 +31,8 @@ from typing import Callable, Dict, Optional, Union
 
 from .types import (
     FetchType, MOQTRequestError, ParamType, FilterType,
-    ForwardingPreference, GroupOrder, LOC_TIMESTAMP, RequestErrorCode,
-    StreamResetCode, SubscribeDoneCode,
+    ForwardingPreference, GroupOrder, LOC_TIMESTAMP, ObjectStatus,
+    RequestErrorCode, StreamResetCode, SubscribeDoneCode,
 )
 from .delivery import (
     FanoutDelivery, ObjectHistory, StreamMapping, SubgroupDelivery,
@@ -262,11 +262,23 @@ class _SubgroupSender:
         self.sub.senders.discard(self)
         self.track._stream_closed(self.sub)
 
+    def encode_open(self, object_id: int, payload: bytes, extensions):
+        """Wire bytes for an object on this subgroup's open stream while the
+        subscription forwards unfiltered; None when send() must handle it."""
+        sub = self.sub
+        if (self.stream_id is None or not sub.forward
+                or sub.window is not _UNFILTERED):
+            return None
+        return self.header.next_object_bytes(
+            payload, extensions, ObjectStatus.NORMAL, object_id)
+
     async def send(self, object_id: int, payload: bytes,
                    extensions) -> int:
         """Write one object; bytes written, 0 when the window excludes
         it."""
-        if not self.sub.passes(self.header.group_id, object_id):
+        sub = self.sub
+        if not (sub.forward and sub.window is _UNFILTERED) and not sub.passes(
+                self.header.group_id, object_id):
             return 0
         session = self.session
         if self.stream_id is None:
@@ -280,7 +292,7 @@ class _SubgroupSender:
             await session.stream_write_drain(
                 self.stream_id, self.header.serialize().data)
         data = self.header.next_object_bytes(
-            payload=payload, extensions=extensions, object_id=object_id)
+            payload, extensions, ObjectStatus.NORMAL, object_id)
         if session._close_err is not None:
             raise asyncio.CancelledError
         await session.stream_write_drain(self.stream_id, data)
@@ -729,15 +741,14 @@ class PublishedTrack(Track):
                                  else object_id % self.num_subgroups),
                     extensions=extensions)
 
-    def _remember(self, group_id: int, object_id: int, payload: bytes, *,
+    def _remember(self, group_id: int, object_id: int, payload: bytes,
                   subgroup_id: Optional[int] = 0, extensions=None) -> None:
         """One object published: Largest Location and the FETCH history.
         `subgroup_id` None marks a datagram."""
         self._note_largest(group_id, object_id)
         if self._history is not None:
-            self._history.add(group_id, object_id, payload,
-                              subgroup_id=subgroup_id, extensions=extensions,
-                              priority=self.priority)
+            self._history.add(group_id, object_id, payload, subgroup_id,
+                              extensions, self.priority)
 
     def _on_produced(self, group_id: int, object_id: int, payload: bytes,
                      extensions) -> None:
@@ -954,7 +965,8 @@ class PublishedTrack(Track):
         if self._held_by_subscribe(sub, msg.request_id):
             return
         sub.take_timeouts(getattr(msg, 'parameters', None), session._profile)
-        self._set_forward(sub, msg.forward)
+        # An omitted FORWARD means 1 everywhere but REQUEST_UPDATE.
+        self._set_forward(sub, 1 if msg.forward is None else msg.forward)
         if sub.forward:
             await self._start_generating(session, "PUBLISH_OK")
 
@@ -975,6 +987,10 @@ class PublishedTrack(Track):
         if forward is None:
             forward = (reply.parameters or {}).get(ParamType.FORWARD) \
                 if hasattr(reply, 'parameters') else None
+        # Omitted means 1 (§10.2.12); from d20 PUBLISH_OK carries no
+        # FORWARD and the PUBLISH's own value stands.
+        if forward is None and not sub.session._profile.publish_ok_expires_only:
+            forward = 1
         logger.info(f"Track: PUBLISH_OK (REQUEST_OK): forward={forward}")
         sub.take_timeouts(getattr(reply, 'parameters', None),
                           sub.session._profile)
@@ -1080,7 +1096,8 @@ class PublishedTrack(Track):
         sub.location_filter = getattr(msg, 'location_filter', None)
         sub.group_order = getattr(msg, 'group_order', None)
         sub.take_timeouts(getattr(msg, 'parameters', None), session._profile)
-        self._set_forward(sub, getattr(msg, 'forward', None))
+        forward = getattr(msg, 'forward', None)
+        self._set_forward(sub, 1 if forward is None else forward)
         self._start_fill(session, sub, msg, reported)
         if sub.forward:
             sub.joining[msg.request_id] = reported
@@ -1620,9 +1637,17 @@ class PublishedTrack(Track):
                 payload = (seq_info + b'|' + pad)[:self.object_size]
 
                 extensions = {LOC_TIMESTAMP: int(time.time() * 1_000_000)}
-                self._remember(group_id, cur_obj_id, payload,
-                               subgroup_id=subgroup_id, extensions=extensions)
-                obj_bytes = await sender.send(cur_obj_id, payload, extensions)
+                self._remember(group_id, cur_obj_id, payload, subgroup_id,
+                               extensions)
+                data = sender.encode_open(cur_obj_id, payload, extensions)
+                if data is None:
+                    obj_bytes = await sender.send(cur_obj_id, payload,
+                                                  extensions)
+                else:
+                    if session._close_err is not None:
+                        raise asyncio.CancelledError
+                    await session.stream_write_drain(sender.stream_id, data)
+                    obj_bytes = len(data)
                 cur_obj_id += self.num_subgroups
                 if obj_bytes:
                     local_sent += 1
@@ -1778,9 +1803,6 @@ class SubscribedTrack(Track):
                 (§7.1). None omits the parameter and takes the default.
             group_order: delivery order across groups. None omits it.
         """
-        if self.on_object:
-            self.session.on_object_received = self.on_object
-
         if self.trackname is not None:
             params = {}
             if self.auth_token is not None:
@@ -1797,6 +1819,7 @@ class SubscribedTrack(Track):
                 group_order=group_order,
                 parameters=params,
                 wait_response=True,
+                on_object=self.on_object,
             )
             self.largest = _reported_largest(ok)
             # Publisher's SUBSCRIBE_OK alias is authoritative (the
@@ -2104,9 +2127,17 @@ class VideoTrack(PublishedTrack):
 
                 extensions = {
                     LOC_TIMESTAMP: int(time.time() * 1_000_000)}
-                self._remember(group_id, cur_obj_id, payload,
-                               subgroup_id=subgroup_id, extensions=extensions)
-                obj_bytes = await sender.send(cur_obj_id, payload, extensions)
+                self._remember(group_id, cur_obj_id, payload, subgroup_id,
+                               extensions)
+                data = sender.encode_open(cur_obj_id, payload, extensions)
+                if data is None:
+                    obj_bytes = await sender.send(cur_obj_id, payload,
+                                                  extensions)
+                else:
+                    if session._close_err is not None:
+                        raise asyncio.CancelledError
+                    await session.stream_write_drain(sender.stream_id, data)
+                    obj_bytes = len(data)
                 cur_obj_id += self.num_subgroups
                 if obj_bytes:
                     local_sent += 1

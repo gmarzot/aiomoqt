@@ -93,6 +93,8 @@ async def _run_subscriber(port, **kwargs):
                 frames.setdefault(name, []).append((gid, oid, f)),
             **kwargs)
         await sub.start()
+        # The catalog binds by request id; no session-wide handler.
+        assert session.on_object_received is None
         for _ in range(200):
             if (len(frames.get("video", [])) >= _N_VIDEO
                     and len(frames.get("audio", [])) >= _N_AUDIO):

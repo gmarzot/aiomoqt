@@ -95,9 +95,10 @@ class LocTrackPublisher(PublishedTrack):
     AUDIO_CONFIG per `media_kind`.
 
     `codec_string` makes every object self-describing for receivers
-    without a catalog: each carries CODECSTRING and TIMESCALE (µs unless
-    `timescale` is set), and video objects carry VIDEO_FRAME_MARKING. With
-    TIMESCALE present, LOC reads timestamps as media time, not wall clock.
+    without a catalog: each carries CODECSTRING, and TIMESCALE when
+    `timescale` is set; video objects carry VIDEO_FRAME_MARKING. Without
+    TIMESCALE the timestamps are wall-clock µs, LOC's default; with it,
+    LOC reads them as media time.
 
     `loc_bare` sends the media without the Private Properties block, for
     receivers predating it; MSF CMAF tracks, which are not LOC, use it too.
@@ -171,16 +172,21 @@ class LocTrackPublisher(PublishedTrack):
             return payload
         return _EMPTY_PRIVATE_PROPERTIES + payload
 
+    def _now(self) -> int:
+        """The wall clock in this track's timestamp units."""
+        return int(time.time() * (self.timescale or 1_000_000))
+
     def _object_extensions(self, frame: LocFrame, group_start: bool,
                            session=None) -> Dict[int, Any]:
         exts: Dict[int, Any] = dict(frame.extensions or ())
         ts = (frame.timestamp if frame.timestamp is not None
-              else int(time.time() * 1_000_000))
+              else self._now())
         for prop_id in self._timestamp_ids(session or self.session):
             exts[prop_id] = ts
         if self.codec_string is not None:
             exts[LOC_PROP_CODECSTRING] = self.codec_string.encode()
-            exts[LOC_PROP_TIMESCALE] = self.timescale or 1_000_000
+            if self.timescale is not None:
+                exts[LOC_PROP_TIMESCALE] = self.timescale
             if self.media_kind == "video":
                 exts[LOC_PROP_VIDEO_FRAME_MARKING] = bytes([
                     _FM_START | _FM_END
@@ -222,7 +228,7 @@ class LocTrackPublisher(PublishedTrack):
                 obj_id = 0
             group_start = obj_id == 0
             if frame.timestamp is None:
-                frame.timestamp = int(time.time() * 1_000_000)
+                frame.timestamp = self._now()
             payload = self._package(frame.payload, group_id, obj_id)
             if payload is None:
                 self.frames_dropped += 1

@@ -60,6 +60,33 @@ def test_dropped_objects_are_marked_unknown(descending):
         (1, 0), (1, 1), (2, 0), (2, 1)]
 
 
+def test_out_of_order_adds_evict_oldest_first_and_track_the_largest():
+    # Parallel subgroups publish a group's objects out of id order.
+    h = ObjectHistory(3 * (10 + 64))
+    for loc in [(0, 1), (0, 0), (0, 3), (0, 2), (1, 0)]:
+        h.add(*loc, b"x" * 10)
+    assert len(h) == 3 and h.evicted_through == (0, 1)
+    got = h.fetch((0, 0), (1, 0))
+    assert got[0].end_of_range == FETCH_FLAGS_END_UNKNOWN
+    assert _locations(got[1:]) == [(0, 2), (0, 3), (1, 0)]
+
+
+def test_a_duplicate_of_a_dropped_location_is_not_served():
+    h = ObjectHistory(2 * (10 + 64))
+    h.add(0, 0, b"a" * 10)
+    h.add(0, 1, b"b" * 10)
+    h.add(0, 0, b"c" * 10)                  # pushes out the first (0, 0)
+    assert h.evicted_through == (0, 0)
+    assert _locations(h.fetch((0, 1), (0, 1))) == [(0, 1)]
+    assert [o.end_of_range for o in h.fetch((0, 0), (0, 0))] == [
+        FETCH_FLAGS_END_UNKNOWN]
+
+
+def test_last_object_is_the_largest_held_in_the_group():
+    h = _filled(groups=2, objects=3)
+    assert h.last_object(1) == 2 and h.last_object(5) is None
+
+
 def test_history_resolves_extensions_and_marks_datagrams():
     h = ObjectHistory(1 << 20)
     h.add(0, 0, b"x", subgroup_id=None, extensions=lambda s: {6: s})
@@ -256,6 +283,63 @@ async def test_serve_fetch_resets_its_stream_when_cancelled():
     with pytest.raises(asyncio.CancelledError):
         await serve
     assert stub.resets == [(9, StreamResetCode.CANCELLED)] and stub.fins == []
+
+
+def _fetch_stub(draft):
+    """A session for serve_fetch() that records its stream operations."""
+    from aiomoqt.context import profile_for
+
+    class _Stub:
+        _profile = profile_for(draft)
+        _served_fetch_streams = None
+
+        def __init__(self):
+            self.written, self.resets, self.fins = [], [], []
+
+        async def open_uni_stream(self):
+            return 9
+
+        async def stream_write_drain(self, sid, data, end_stream=False):
+            self.written.append(bytes(data))
+
+        def stream_reset(self, sid, code):
+            self.resets.append((sid, code))
+
+        def stream_fin(self, sid):
+            self.fins.append(sid)
+    return _Stub()
+
+
+@pytest.mark.parametrize("draft,served", [(18, 3), (20, 2), (22, 2)])
+async def test_serve_fetch_drops_object_status_where_fetch_has_none(draft,
+                                                                    served):
+    # d22 §11.1.1: Objects delivered by FETCH carry no Object Status, so a
+    # cached END_OF_GROUP is not one of them.
+    from aiomoqt.messages.data import FetchObject
+    from aiomoqt.protocol import _MOQTSessionMixin
+    from aiomoqt.types import ObjectStatus
+    stub = _fetch_stub(draft)
+    await _MOQTSessionMixin.serve_fetch(stub, 1, [
+        FetchObject(group_id=0, object_id=0, payload=b"x"),
+        FetchObject(group_id=0, object_id=1, status=ObjectStatus.END_OF_GROUP),
+        FetchObject(group_id=1, object_id=0, payload=b"y")])
+    assert len(stub.written) == 1 + served
+    assert stub.fins == [9] and stub.resets == []
+
+
+async def test_serve_fetch_resets_its_stream_when_serving_fails():
+    from aiomoqt.messages.data import FetchObject
+    from aiomoqt.protocol import _MOQTSessionMixin
+
+    def _objects():
+        yield FetchObject(group_id=0, object_id=0, payload=b"x")
+        raise RuntimeError("cache gone")
+
+    stub = _fetch_stub(22)
+    with pytest.raises(RuntimeError):
+        await _MOQTSessionMixin.serve_fetch(stub, 1, _objects())
+    assert stub.resets == [(9, StreamResetCode.INTERNAL_ERROR)]
+    assert stub.fins == []
 
 
 @requires_certs

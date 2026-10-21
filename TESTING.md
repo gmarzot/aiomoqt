@@ -249,7 +249,7 @@ workflow pushes a fresh image on every tag.
 The runner drives `pub_bench` through `tests/contrib/aiomoqt-adapter.sh` in every d18
 native-QUIC scenario that needs no FETCH; the script compares the scored requirements with
 `tests/contrib/baseline.json`. CI runs it in `contrib-conformance.yml` on pushes to `main` and
-`gmarzot-0.12.0` and on PRs labelled `ci:run-conformance`, report-only for now.
+`gmarzot-0.13.1` and on PRs labelled `ci:run-conformance`, report-only for now.
 
 Build the runner at the commit in `.github/contrib-runner-pin`, then:
 

@@ -223,14 +223,16 @@ class SubgroupHeader(MOQTMessage):
             delta = obj_id
         else:
             delta = obj_id - self._last_object_id - 1
-        status_int = (status.value if hasattr(status, 'value')
-                      else int(status))
         encode = (encode_object_subgroup_vi64 if self._vi64
                   else encode_object_subgroup)
         data = encode(
-            delta, extensions, status_int, payload,
+            delta, extensions, int(status), payload,
             self.extensions_present, self._kvp_delta)
-        self.advance(obj_id)
+        # advance(obj_id), inline on the per-object path.
+        self._last_object_id = obj_id
+        if (self.subgroup_id_mode == SUBGROUP_ID_FIRST_OBJ
+                and self.subgroup_id is None):
+            self.subgroup_id = obj_id
         return data
 
     def advance(self, object_id: int) -> None:

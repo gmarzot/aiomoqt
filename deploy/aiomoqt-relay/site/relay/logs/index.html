@@ -9,6 +9,8 @@
 <link rel="stylesheet" href="../dashboard.css">
 <script src="../common.js" defer></script>
 <script src="logs.js" defer></script>
+<script src="/private/debug.js" defer></script>
+<script src="/version.js" defer></script>
 </head>
 <body>
 <main>
@@ -39,6 +41,7 @@
     <label class="check"><input id="follow" type="checkbox" checked> Follow</label>
     <label class="check"><input id="wrap" type="checkbox"> Wrap</label>
     <button id="earlier" type="button">Load earlier</button>
+    <span class="debug-toggle" data-debug-toggle></span>
     <a id="download" class="platform-link" href="files/relay.log" download>raw ↓</a>
   </section>
 
@@ -56,6 +59,7 @@
   <footer>
     <a href="/">MoQ Ersatz Relay</a> · <a href="/private/">private</a> · <a href="../">dashboard</a> · the relay's --log-dir, times UTC ·
     private · A Marz Research Project
+    <span data-versions></span>
   </footer>
 </main>
 </body>

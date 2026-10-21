@@ -79,6 +79,7 @@ def test_relay_answers_ok_for_served_track_and_error_for_unknown():
         finished = False
         pending_publish = ("sess", "msg")
         largest = (7, 42)
+        properties = {}
 
     s = _session(18)
     saved = dict(relay._tracks)
