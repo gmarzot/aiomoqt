@@ -74,12 +74,14 @@ from aiomoqt.messages.base import MOQTMessage
 from aiomoqt.messages.data import (FetchObject, ObjectDatagram,
                                    ObjectDatagramStatus)
 from aiomoqt.messages.fetch import _is_joining
+from aiomoqt.messages.params import U64_MAX, LocationFilter
 from aiomoqt.messages.publish import PublishError
 from aiomoqt.messages.request import RequestError, RequestOk
 from aiomoqt.messages.subscribe import Subscribe
 from aiomoqt.track import (PublishedTrack, SubscribedTrack, _UNFILTERED,
                            _filter_window, _largest_object_param,
-                           _reported_largest)
+                           _location_window, _reported_largest,
+                           _subscription_window)
 from aiomoqt.context import (canonical_request_error, canonical_stream_reset,
                              is_draft16_or_later,
                              request_error_code)
@@ -313,7 +315,8 @@ class _Downstream:
         self.request_id = request_id
         # Forward State (§5.1): objects flow only while True.
         self.forward = forward
-        # Filter window (§5.1.2): (start Location, End Group or None).
+        # Filter window (§5.1.2): (start Location, End Group or None[,
+        # last Object of the End Group]).
         self.window = window
         # Joining Location (§5.1): Largest when Forward State became 1.
         self.joined_at = None
@@ -323,9 +326,14 @@ class _Downstream:
 
     def passes(self, group_id, object_id) -> bool:
         """Forward State 1 and inside the filter window."""
-        start, end_group = self.window
-        return (self.forward and (group_id, object_id) >= start
-                and (end_group is None or group_id <= end_group))
+        window = self.window
+        if not self.forward or (group_id, object_id) < window[0]:
+            return False
+        end_group = window[1]
+        if end_group is None or group_id < end_group:
+            return True
+        return group_id == end_group and (
+            len(window) < 3 or object_id <= window[2])
 
     def past_end(self, group_id) -> bool:
         end_group = self.window[1]
@@ -465,23 +473,37 @@ class _RelayedTrack:
             self._end(d, status_code, reset_code, reason)
 
     def end_downstream(self, d) -> None:
-        """End one subscription whose End Group is behind (§5.1.2)."""
+        """A subscription whose End is behind production (§5.1.2) ends
+        with PUBLISH_DONE SUBSCRIPTION_ENDED; from d20 it stays open and
+        only its streams close (d22 §3.3.1)."""
+        if not d.session._profile.publish_done_subscription_ended:
+            try:
+                self._close_streams(d.session)
+            except Exception:
+                logger.debug("relay: closing a subscriber's streams failed",
+                             exc_info=True)
+            return
         if d in self.downstream:
             self.downstream.remove(d)
             self._end(d, SubscribeDoneCode.SUBSCRIPTION_ENDED, None,
                       "subscription ended")
 
+    def _close_streams(self, session, reset_code=None) -> None:
+        """FIN the session's open streams, or reset them with
+        `reset_code`."""
+        for k, (sid, _hdr) in list(self._streams.items()):
+            if k[0] == id(session):
+                if reset_code is None:
+                    session.stream_write(sid, b"", end_stream=True)
+                else:
+                    session.stream_reset(sid, int(reset_code))
+                self._streams.pop(k, None)
+
     def _end(self, d, status_code, reset_code, reason) -> None:
         """FIN (or reset) a subscriber's open streams, then PUBLISH_DONE."""
         session = d.session
         try:
-            for k, (sid, _hdr) in list(self._streams.items()):
-                if k[0] == id(session):
-                    if reset_code is None:
-                        session.stream_write(sid, b"", end_stream=True)
-                    else:
-                        session.stream_reset(sid, int(reset_code))
-                    self._streams.pop(k, None)
+            self._close_streams(session, reset_code)
             session.subscribe_done(
                 request_id=d.request_id, status_code=status_code,
                 stream_count=self._sent_streams.get(id(session), 0),
@@ -774,6 +796,13 @@ class _RelayedTrack:
             return False
         first = (self._cache[0][0], self._cache[0][2])
         return start >= first
+
+    def group_end(self, group_id, start):
+        """The last cached Location of a group, which is its END_OF_GROUP
+        when held; (group, 0) when none is held, and never before
+        `start`."""
+        oids = [c[2] for c in self._cache if c[0] == group_id]
+        return max(start, (group_id, max(oids) if oids else 0))
 
     def cached_range(self, start, end):
         """Cached objects within [start, end], each (group, object)
@@ -1567,8 +1596,7 @@ def _attach_subscriber(session, msg, track) -> bool:
     """SUBSCRIBE_OK and join the fan-out with the SUBSCRIBE's Forward
     State and filter window, against Largest now (§5.1.2). False when
     the End Group is already behind, answered INVALID_RANGE."""
-    window = _filter_window(msg.filter_type, msg.start_group,
-                            msg.start_object, msg.end_group, track.largest)
+    window = _subscription_window(msg, track.largest)
     if (window[1] is not None and track.largest is not None
             and track.largest[0] > window[1]):
         logger.info(f"relay: subscribe {track.key} -> INVALID_RANGE "
@@ -1583,11 +1611,11 @@ def _attach_subscriber(session, msg, track) -> bool:
     ok = session.subscribe_ok(request_msg=msg, **_largest_kwargs(track))
     # FORWARD omitted means 1 (§10.2.12).
     forward = msg.forward is None or bool(msg.forward)
-    # An explicit Start at or before Largest is served from the cache
-    # first (§5.1.2: the Start MAY be less than the Largest Object).
-    replay = (msg.filter_type in (FilterType.ABSOLUTE_START,
-                                  FilterType.ABSOLUTE_RANGE)
-              and track.largest is not None and window[0] <= track.largest)
+    # A filter starting at or before Largest is served from the cache
+    # first (§5.1.2: the Start MAY be less than the Largest Object); an
+    # unfiltered subscription starts at the live edge.
+    replay = (window is not _UNFILTERED and track.largest is not None
+              and window[0] <= track.largest)
     track.add_downstream(session, ok.track_alias, msg.request_id,
                          forward=forward, window=window, replay=replay)
     session.register_request_cancel_handler(
@@ -1613,9 +1641,9 @@ async def _on_request_update(session, msg):
     key, track, d = found
     if d16:
         forward = (msg.parameters or {}).get(ParamType.FORWARD)
-        ftype = _reply_filter(session, msg)
-        if ftype[0] is not None:
-            d.window = _filter_window(*ftype, track.largest)
+        window = _reply_window(session, msg, track.largest)
+        if window is not None:
+            d.window = window
     else:
         forward = msg.forward
     if forward is not None:
@@ -1882,7 +1910,7 @@ async def _offer_track(session, track, key):
         # §10.2.12: FORWARD omitted from PUBLISH_OK means 1.
         forward = (getattr(reply, 'parameters', None) or {}).get(
             ParamType.FORWARD, 1)
-    window = _filter_window(*_reply_filter(session, reply), track.largest)
+    window = _reply_window(session, reply, track.largest) or _UNFILTERED
     # Cached objects inside the subscriber's window go first.
     track.add_downstream(session, pub_msg.track_alias, pub_msg.request_id,
                          forward=bool(forward), window=window,
@@ -1897,17 +1925,21 @@ async def _offer_track(session, track, key):
                 f"(fanout={len(track.downstream)})")
 
 
-def _reply_filter(session, reply) -> tuple:
-    """(type, start group, start object, end group) a PUBLISH_OK or
-    REQUEST_UPDATE carries: fields at d14, a parameter from d16."""
+def _reply_window(session, reply, largest):
+    """The filter window a PUBLISH_OK or REQUEST_UPDATE asks for against
+    `largest`, None when it carries no filter: fields at d14, a parameter
+    from d16, a Location Filter from d20."""
     if getattr(reply, "filter_type", None) is not None:
-        return (reply.filter_type, reply.start_group, reply.start_object,
-                reply.end_group)
+        return _filter_window(reply.filter_type, reply.start_group,
+                              reply.start_object, reply.end_group, largest)
     raw = (getattr(reply, "parameters", None) or {}).get(
         ParamType.SUBSCRIPTION_FILTER)
     if raw is None:
-        return (None, None, None, None)
-    return MOQTMessage._decode_filter(raw, prof=session._profile)
+        return None
+    if isinstance(raw, LocationFilter):
+        return _location_window(raw, largest)
+    return _filter_window(*MOQTMessage._decode_filter(
+        raw, prof=session._profile), largest)
 
 
 # id(session) -> True once a datagram send proved unsupported there.
@@ -1988,6 +2020,25 @@ async def _fetch_upstream(ns, track_name, msg):
     return None, None, refusal
 
 
+def _fetch_range(msg, largest):
+    """(start, end) Locations a FETCH asks for, both inclusive, the end at
+    most `largest`: (group, 2^64-1) for a whole End Group below it, None
+    for no End with nothing published. d14-d18 End is the last Object
+    plus one, Object 0 the whole End Group."""
+    if msg.location_filter is not None:
+        return msg.location_filter.resolve(largest, fetch=True)
+    start = (msg.start_group or 0, msg.start_object or 0)
+    if msg.end_group is None:
+        end = None
+    elif not msg.end_object:
+        end = (msg.end_group, U64_MAX)
+    else:
+        end = (msg.end_group, msg.end_object - 1)
+    if largest is not None:
+        end = largest if end is None else min(end, largest)
+    return start, end
+
+
 async def _on_fetch(session, msg):
     """FETCH (§10.12) served from the track's recent-object cache, or
     from the publisher when the range predates it. A joining FETCH is
@@ -2030,10 +2081,7 @@ async def _on_fetch(session, msg):
         logger.info(f"relay: joining FETCH {key} groups {start_group}.."
                     f"{anchor[0]} (anchor {anchor})")
     track = _tracks.get((ns, track_name))
-    start = (msg.start_group or 0, msg.start_object or 0)
-    end = (None if msg.end_group is None
-           else (msg.end_group, msg.end_object
-                 if msg.end_object is not None else (1 << 62)))
+    start, end = _fetch_range(msg, None if track is None else track.largest)
     have_cache = (track is not None and _track_live(track)
                   and track.cache_covers(start))
     objs = track.cached_range(start, end) if have_cache else []
@@ -2080,12 +2128,18 @@ async def _on_fetch(session, msg):
                 _note_catalog(ns, o[3])
     order = msg.group_order or GroupOrder.ASCENDING
     last_g, last_o = objs[-1][0], objs[-1][2]
-    # §10.13: FETCH_OK End Location is the last Object PLUS 1, and End Of
-    # Track says the range reached the track's end — which only the
-    # publisher knows, so it is carried over from its FETCH_OK.
+    # FETCH_OK End Location (d22 §9.12): the requested End, at most
+    # Largest; a whole End Group ends at its last Object. From upstream,
+    # the last Object served, with the publisher's End Of Track.
+    end_loc = (last_g, last_o)
+    if source == "cache" and end is not None:
+        end_loc = (end if end[1] != U64_MAX
+                   else track.group_end(end[0], start))
+    # fetch_ok() takes End as the last Object plus one at every draft.
     session.fetch_ok(request_id=msg.request_id,
                      end_of_track=end_of_track,
-                     largest_group_id=last_g, largest_object_id=last_o + 1,
+                     largest_group_id=end_loc[0],
+                     largest_object_id=end_loc[1] + 1,
                      group_order=int(order))
     if int(order) == int(GroupOrder.DESCENDING):
         objs = sorted(objs, key=lambda o: (-o[0], o[2]))
