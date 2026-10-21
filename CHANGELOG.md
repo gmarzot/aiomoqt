@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Relay: a track's Track Properties from PUBLISH or the upstream SUBSCRIBE_OK are cached and sent unchanged on its SUBSCRIBE_OK, PUBLISH, FETCH_OK and TRACK_STATUS replies, the newest set replacing the last; from d18 a Mandatory Track Property gets UNSUPPORTED_EXTENSION.
 - Relay: the dashboard learns a namespace's catalog format only from catalog objects it relays, and no longer sends publishers TRACK_STATUS and FETCH for a `catalog` track.
 - A WebTransport SETUP sent with no WT-Protocol logs the peer's address in its error line.
 - Relay: a FETCH from the cache serves exactly its range (a whole End Group was cut to its first Object, and d14-d18 served one Object past the End), and FETCH_OK's End Location is the requested End, at most Largest Object; a whole End Group ends at its last Object.
