@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Relay: from d20 a subscription whose Location Filter production has passed keeps going with its streams closed, instead of ending with PUBLISH_DONE SUBSCRIPTION_ENDED, which d20 removed.
 - Relay: a d20/d22 REQUEST_UPDATE that changes the Location Filter applies it instead of failing the update.
 - Relay: a d20/d22 subscription's Location Filter bounds what it is sent, End Object and relative start included; a start at or before Largest Object replays from the cache.
 - Relay: `--control PATH` serves HTTP on a Unix socket; `GET /debug` reports DEBUG logging and `POST /debug` toggles it, for a button behind the private page.

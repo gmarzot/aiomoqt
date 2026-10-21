@@ -11,7 +11,7 @@ from aiomoqt.messages import SubgroupHeader
 from aiomoqt.messages.params import LocationFilter
 from aiomoqt.tools import moq_interop_relay as relay
 from aiomoqt.track import PublishedTrack
-from aiomoqt.types import ParamType
+from aiomoqt.types import FilterType, ParamType, SubscribeDoneCode
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
 
@@ -160,9 +160,11 @@ async def test_a_start_before_largest_replays_only_the_range(draft,
         assert rx._close_err is None
 
 
-async def _flowing(connect, names, rate=100):
+async def _flowing(connect, names, rate=100, filters=None):
     """A publisher producing `names` (5-object groups at `rate` objects/s)
-    and a subscriber session. Returns (rx, subscriptions, got)."""
+    and a subscriber session, subscribed under filters[name] (subscribe()
+    keyword arguments; none = unfiltered). Returns (rx, subscriptions,
+    got)."""
     pub = await connect()
     for name in names:
         PublishedTrack(pub, namespace=_NS, trackname=name, object_size=100,
@@ -172,8 +174,9 @@ async def _flowing(connect, names, rate=100):
     got = {name: [] for name in names}
     subs = {}
     for name in names:
+        kw = (filters or {}).get(name, {"filter_type": None})
         subs[name] = await rx.subscribe(
-            _NS, name, forward=1, wait_response=True,
+            _NS, name, forward=1, wait_response=True, **kw,
             on_object=lambda m, _s, _t, g, _sg, n=name: got[n].append(
                 (g, m.object_id)) if m.payload else None)
     assert await _until(lambda: all(got[n] for n in names)), got
@@ -209,3 +212,52 @@ async def test_a_request_update_replaces_the_filter(draft, use_quic, caplog):
                 want[name]), name
         assert rx._close_err is None
     assert not [r for r in caplog.records if "handler failed" in r.message]
+
+
+@pytest.mark.parametrize("draft", [18, 20, 22])
+@_TRANSPORTS
+async def test_a_range_behind_production_keeps_its_subscription(draft,
+                                                               use_quic):
+    # d22 §3.3.1: a subscription does not end because Largest Object
+    # passed its filter; its streams close and it stays open. Up to d18 it
+    # ends with PUBLISH_DONE SUBSCRIPTION_ENDED.
+    ends = {"video": 2, "audio": 3}
+    if draft >= 20:
+        filters = {n: {"location_filter": LocationFilter.absolute(0, 0, e)}
+                   for n, e in ends.items()}
+    else:
+        filters = {n: {"filter_type": FilterType.ABSOLUTE_RANGE,
+                       "start_group": 0, "start_object": 0, "end_group": e}
+                   for n, e in ends.items()}
+    async with _relay(_port(3, draft, use_quic), use_quic, draft) as connect:
+        rx, subs, got = await _flowing(connect, ends, filters=filters)
+        done = {}
+        for name, ok in subs.items():
+            done[name] = asyncio.get_running_loop().create_future()
+            rx.register_publish_done_handler(ok.request_id,
+                                             done[name].set_result)
+        assert await _until(lambda: all(
+            _relayed(n).largest >= (e + 2, 0) for n, e in ends.items()))
+        await asyncio.sleep(0.1)
+        for name, end in ends.items():
+            assert {g for g, _ in got[name]} == set(range(end + 1)), name
+        if draft < 20:
+            for name in ends:
+                status = await asyncio.wait_for(done[name], 5.0)
+                assert status.status_code == (
+                    SubscribeDoneCode.SUBSCRIPTION_ENDED)
+            return
+        assert not any(f.done() for f in done.values())
+        assert not any(_relayed(n)._streams for n in ends)
+        # Still subscribed: a wider filter brings objects again.
+        starts = {}
+        for name in ends:
+            starts[name] = _relayed(name).largest[0] + 2
+            await rx.request_update(
+                subs[name].request_id, wait_response=True,
+                parameters={ParamType.LOCATION_FILTER: LocationFilter.absolute(
+                    starts[name], 0)})
+        assert await _until(lambda: all(
+            any(g >= starts[n] for g, _ in got[n]) for n in ends)), got
+        assert not any(f.done() for f in done.values())
+        assert rx._close_err is None

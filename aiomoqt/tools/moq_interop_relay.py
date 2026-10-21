@@ -473,23 +473,37 @@ class _RelayedTrack:
             self._end(d, status_code, reset_code, reason)
 
     def end_downstream(self, d) -> None:
-        """End one subscription whose End Group is behind (§5.1.2)."""
+        """A subscription whose End is behind production (§5.1.2) ends
+        with PUBLISH_DONE SUBSCRIPTION_ENDED; from d20 it stays open and
+        only its streams close (d22 §3.3.1)."""
+        if not d.session._profile.publish_done_subscription_ended:
+            try:
+                self._close_streams(d.session)
+            except Exception:
+                logger.debug("relay: closing a subscriber's streams failed",
+                             exc_info=True)
+            return
         if d in self.downstream:
             self.downstream.remove(d)
             self._end(d, SubscribeDoneCode.SUBSCRIPTION_ENDED, None,
                       "subscription ended")
 
+    def _close_streams(self, session, reset_code=None) -> None:
+        """FIN the session's open streams, or reset them with
+        `reset_code`."""
+        for k, (sid, _hdr) in list(self._streams.items()):
+            if k[0] == id(session):
+                if reset_code is None:
+                    session.stream_write(sid, b"", end_stream=True)
+                else:
+                    session.stream_reset(sid, int(reset_code))
+                self._streams.pop(k, None)
+
     def _end(self, d, status_code, reset_code, reason) -> None:
         """FIN (or reset) a subscriber's open streams, then PUBLISH_DONE."""
         session = d.session
         try:
-            for k, (sid, _hdr) in list(self._streams.items()):
-                if k[0] == id(session):
-                    if reset_code is None:
-                        session.stream_write(sid, b"", end_stream=True)
-                    else:
-                        session.stream_reset(sid, int(reset_code))
-                    self._streams.pop(k, None)
+            self._close_streams(session, reset_code)
             session.subscribe_done(
                 request_id=d.request_id, status_code=status_code,
                 stream_count=self._sent_streams.get(id(session), 0),
