@@ -37,8 +37,9 @@ from .messages.subscribe import SubscribeOk
 from .types import *
 from .types import (D20MessageType, FilterType, MOQTDraft, MOQTException,
                     MOQTMessageType, MOQTProtocolViolation, MOQTRequestError,
-                    ParamType, RequestErrorCode, SessionCloseCode,
-                    SetupParamType, SubscribeDoneCode)
+                    ObjectStatus, ParamType, RequestErrorCode,
+                    SessionCloseCode, SetupParamType, StreamResetCode,
+                    SubscribeDoneCode)
 from .utils.buffer import Buffer, BufferReadError
 from .utils.logger import *
 from .utils.logger import quiet_session
@@ -4870,12 +4871,15 @@ class _MOQTSessionMixin:
         Opens the fetch data stream, writes FETCH_HEADER, then each
         FetchObject in ascending order as a delta-coded object, then
         FINs unless `fin=False` (the caller then owns the FIN).
-        `objects` is any iterable of FetchObject. Call fetch_ok() first
-        (its End Location must be known). Returns the stream id. Cancelled
-        mid-way, it resets the stream (§5.2)."""
+        `objects` is any iterable of FetchObject; where FETCH carries no
+        Object Status (d20+), objects with one are skipped. Call
+        fetch_ok() first (its End Location must be known). Returns the
+        stream id. Cancelled mid-way, it resets the stream (§5.2); a
+        failure resets it too."""
         stream_id = await self.open_uni_stream()
         header = FetchHeader(request_id=request_id)
         prior = None
+        with_status = self._profile.fetch_object_status
         if self._served_fetch_streams is None:
             self._served_fetch_streams = {}
         self._served_fetch_streams[request_id] = stream_id
@@ -4883,6 +4887,9 @@ class _MOQTSessionMixin:
             await self.stream_write_drain(
                 stream_id, header.serialize(prof=self._profile).data)
             for obj in objects:
+                if (not with_status and obj.end_of_range is None
+                        and obj.status not in (None, ObjectStatus.NORMAL)):
+                    continue
                 buf = obj.serialize(prof=self._profile, prior=prior,
                                     group_order=int(group_order))
                 await self.stream_write_drain(stream_id, buf.data)
@@ -4905,6 +4912,7 @@ class _MOQTSessionMixin:
             raise
         except BaseException:
             self._served_fetch_streams.pop(request_id, None)
+            self.stream_reset(stream_id, StreamResetCode.INTERNAL_ERROR)
             raise
         if fin:
             self.stream_fin(stream_id)

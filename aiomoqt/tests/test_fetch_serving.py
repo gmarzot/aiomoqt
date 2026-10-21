@@ -285,6 +285,63 @@ async def test_serve_fetch_resets_its_stream_when_cancelled():
     assert stub.resets == [(9, StreamResetCode.CANCELLED)] and stub.fins == []
 
 
+def _fetch_stub(draft):
+    """A session for serve_fetch() that records its stream operations."""
+    from aiomoqt.context import profile_for
+
+    class _Stub:
+        _profile = profile_for(draft)
+        _served_fetch_streams = None
+
+        def __init__(self):
+            self.written, self.resets, self.fins = [], [], []
+
+        async def open_uni_stream(self):
+            return 9
+
+        async def stream_write_drain(self, sid, data, end_stream=False):
+            self.written.append(bytes(data))
+
+        def stream_reset(self, sid, code):
+            self.resets.append((sid, code))
+
+        def stream_fin(self, sid):
+            self.fins.append(sid)
+    return _Stub()
+
+
+@pytest.mark.parametrize("draft,served", [(18, 3), (20, 2), (22, 2)])
+async def test_serve_fetch_drops_object_status_where_fetch_has_none(draft,
+                                                                    served):
+    # d22 §11.1.1: Objects delivered by FETCH carry no Object Status, so a
+    # cached END_OF_GROUP is not one of them.
+    from aiomoqt.messages.data import FetchObject
+    from aiomoqt.protocol import _MOQTSessionMixin
+    from aiomoqt.types import ObjectStatus
+    stub = _fetch_stub(draft)
+    await _MOQTSessionMixin.serve_fetch(stub, 1, [
+        FetchObject(group_id=0, object_id=0, payload=b"x"),
+        FetchObject(group_id=0, object_id=1, status=ObjectStatus.END_OF_GROUP),
+        FetchObject(group_id=1, object_id=0, payload=b"y")])
+    assert len(stub.written) == 1 + served
+    assert stub.fins == [9] and stub.resets == []
+
+
+async def test_serve_fetch_resets_its_stream_when_serving_fails():
+    from aiomoqt.messages.data import FetchObject
+    from aiomoqt.protocol import _MOQTSessionMixin
+
+    def _objects():
+        yield FetchObject(group_id=0, object_id=0, payload=b"x")
+        raise RuntimeError("cache gone")
+
+    stub = _fetch_stub(22)
+    with pytest.raises(RuntimeError):
+        await _MOQTSessionMixin.serve_fetch(stub, 1, _objects())
+    assert stub.resets == [(9, StreamResetCode.INTERNAL_ERROR)]
+    assert stub.fins == []
+
+
 @requires_certs
 @_TRANSPORTS
 async def test_a_cancelled_fetch_resets_its_data_stream(use_quic):

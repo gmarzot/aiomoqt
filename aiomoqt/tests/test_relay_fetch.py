@@ -16,7 +16,9 @@ import pytest
 from aiomoqt.client import MOQTClient
 from aiomoqt.context import profile_for, request_error_code
 from aiomoqt.messages.data import FetchObject
+from aiomoqt.messages import SubgroupHeader
 from aiomoqt.messages.fetch import Fetch
+from aiomoqt.messages.params import LocationFilter
 from aiomoqt.messages.subscribe import Subscribe
 from aiomoqt.protocol import _MOQTSessionMixin
 from aiomoqt.tools import moq_interop_relay as relay
@@ -517,3 +519,109 @@ async def test_a_fetch_cancelled_before_the_upstream_answers(
         assert got.count(ok.request_id) == _GROUP
         assert rx._close_err is None and down._close_err is None
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+# -- FETCH from the cache, end to end --------------------------------------
+
+_CACHE_PORT = 18800
+_CACHE_NS = "relay/cached"
+
+
+class _Layout(PublishedTrack):
+    """Writes `layout` once, as it starts: one stream per (group,
+    subgroup, object ids, END_OF_GROUP object id or None)."""
+
+    layout = ()
+    written = False
+
+    async def generate(self, session, track_alias):
+        if self.written:
+            return
+        self.written = True
+        for gid, sgid, oids, eog in self.layout:
+            sid = await session.open_uni_stream()
+            hdr = SubgroupHeader(track_alias=track_alias, group_id=gid,
+                                 subgroup_id=sgid, publisher_priority=128,
+                                 extensions_present=True,
+                                 prof=session._profile)
+            session.stream_write(sid, hdr.serialize().data)
+            for oid in oids:
+                await session.stream_write_drain(sid, hdr.next_object(
+                    payload=f"{self.trackname}-{gid}-{oid}".encode(),
+                    extensions=None, object_id=oid).data)
+            if eog is None:
+                session.stream_fin(sid)
+            else:
+                session.stream_write(sid, hdr.end_group(object_id=eog).data,
+                                     end_stream=True)
+
+
+@contextlib.asynccontextmanager
+async def _cached(port, use_quic, draft, layouts):
+    """A relay holding each track's `layouts[name]` in its cache, PUBLISHed
+    on one session. Yields a subscriber session."""
+    relay._tracks.clear()
+    relay._announced.clear()
+    server = relay._build_server("localhost", port, CERT, KEY,
+                                 use_quic=use_quic, draft=draft)
+    handle = await server.serve()
+    try:
+        async with contextlib.AsyncExitStack() as stack:
+            sessions = []
+            for _ in range(2):
+                client = MOQTClient("localhost", port, path="/",
+                                    use_quic=use_quic, verify_tls=False,
+                                    supported_drafts=draft)
+                s = await stack.enter_async_context(client.connect())
+                await s.client_session_init()
+                sessions.append(s)
+            pub, rx = sessions
+            want = {}
+            for name, layout in layouts.items():
+                track = _Layout(pub, namespace=_CACHE_NS, trackname=name)
+                track.layout = layout
+                await track.publish(publish_track=True, forward=1)
+                want[(relay._ns_tuple(_CACHE_NS), name.encode())] = max(
+                    (g, max(o + (e,) if e is not None else o))
+                    for g, _sg, o, e in layout)
+            for _ in range(150):
+                if all(relay._tracks.get(k) is not None
+                       and relay._tracks[k].largest == v
+                       for k, v in want.items()):
+                    break
+                await asyncio.sleep(0.02)
+            yield rx
+    finally:
+        handle.close()
+        relay._tracks.clear()
+        relay._announced.clear()
+
+
+async def _fetched(rx, name, **kw):
+    """FETCH `name` from the relay: (FETCH_OK, objects as (group, object,
+    payload), True once the stream FINs)."""
+    got = []
+    ok = await asyncio.wait_for(rx.fetch(
+        _CACHE_NS, name, wait_response=True,
+        on_object=lambda obj, _n, _ts, _rid: got.append(
+            (obj.group_id, obj.object_id, bytes(obj.payload))), **kw), 5)
+    fin = await rx.await_fetch_done(ok.request_id, timeout=5)
+    return ok, got, fin
+
+
+@requires_certs
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+async def test_a_d22_fetch_of_cached_groups_carries_no_object_status(
+        use_quic):
+    # d22 §11.1.1: a FETCH serves the payload objects and FINs; the cached
+    # END_OF_GROUP objects are not sent.
+    layout = tuple((g, 0, (0,), 1) for g in range(3))
+    async with _cached(_CACHE_PORT + (not use_quic), use_quic, 22,
+                       {"video": layout, "audio": layout}) as rx:
+        for name in ("video", "audio"):
+            _ok, got, fin = await _fetched(
+                rx, name, location_filter=LocationFilter.absolute(0, 0, 2))
+            assert fin is True, name
+            assert got == [(g, 0, f"{name}-{g}-0".encode())
+                           for g in range(3)]
+        assert rx._close_err is None

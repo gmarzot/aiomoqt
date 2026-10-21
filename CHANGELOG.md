@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `serve_fetch()`: from d20 objects with an Object Status (a cached END_OF_GROUP) are not sent, since FETCH carries none; a FETCH that fails mid-stream resets its data stream instead of leaving it open.
 - Relay: from d20 a subscription whose Location Filter production has passed keeps going with its streams closed, instead of ending with PUBLISH_DONE SUBSCRIPTION_ENDED, which d20 removed.
 - Relay: a d20/d22 REQUEST_UPDATE that changes the Location Filter applies it instead of failing the update.
 - Relay: a d20/d22 subscription's Location Filter bounds what it is sent, End Object and relative start included; a start at or before Largest Object replays from the cache.
