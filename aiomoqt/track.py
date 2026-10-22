@@ -833,9 +833,7 @@ class PublishedTrack(Track):
         if not session._profile.track_properties:
             return None
         props = dict(self.track_properties or ())
-        if self.timestamps != 'loc':
-            props.update(self._timestamp_writer().track_properties(
-                session._profile.vi64))
+        props.update(self._timing_properties(session._profile.vi64))
         if self.immutable_properties:
             buf = Buffer(capacity=BUF_SIZE, vi64=session._profile.vi64)
             MOQTMessage._extensions_encode(buf, self.immutable_properties,
@@ -843,6 +841,12 @@ class PublishedTrack(Track):
             props[MOQTMessage.IMMUTABLE_PROPERTIES] = buf.data_slice(
                 0, buf.tell())
         return props or None
+
+    def _timing_properties(self, vi64: bool) -> Dict[int, Any]:
+        """Track Properties of the generated objects' timestamps."""
+        if self.timestamps == 'loc':
+            return {}
+        return self._timestamp_writer().track_properties(vi64)
 
     def _timestamp_writer(self) -> TimestampWriter:
         w = self._ts_writer
@@ -853,10 +857,11 @@ class PublishedTrack(Track):
                 int(time.time() * 1_000_000))
         return w
 
-    def _stamper(self) -> Optional[Callable]:
+    def _stamper(self, session) -> Optional[Callable]:
         """Per-object properties for generated objects; None stamps LOC
-        TIMESTAMP inline."""
-        if self.timestamps == 'loc':
+        TIMESTAMP inline, as on d14, which carries no Track Properties."""
+        if (self.timestamps == 'loc'
+                or not session._profile.track_properties):
             return None
         return self._timestamp_writer().stamp
 
@@ -1601,7 +1606,7 @@ class PublishedTrack(Track):
         prof = session._profile
         report = not getattr(self, '_quiet', False)
         sub = self._sub_for(session)
-        stamp = self._stamper()
+        stamp = self._stamper(session)
 
         try:
             await self._await_schedule(first_group, 0)
@@ -1713,7 +1718,7 @@ class PublishedTrack(Track):
         sub = self._sub_for(session)
         sender = _SubgroupSender(self, session, sub, track_alias,
                                  subgroup_id, priority)
-        stamp = self._stamper()
+        stamp = self._stamper(session)
 
         local_sent = 0
 
@@ -2291,7 +2296,7 @@ class VideoTrack(PublishedTrack):
         i_pad = b'\x49' * self.i_frame_size  # 'I'
         p_pad = b'\x50' * self.p_frame_size  # 'P'
         b_pad = b'\x42' * self.b_frame_size  # 'B'
-        stamp = self._stamper()
+        stamp = self._stamper(session)
 
         try:
             await self._await_schedule(first_group, subgroup_id)

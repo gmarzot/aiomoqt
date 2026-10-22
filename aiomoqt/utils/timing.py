@@ -310,3 +310,54 @@ class TimestampWriter:
         if c:
             exts[OBJECT_TIMESTAMP] = (c << 1) ^ (c >> 63)
         return exts
+
+
+class MediaTimestamps:
+    """Timing properties for a media track whose objects carry known
+    capture times (wall-clock µs).
+
+    On a fixed cadence (`group_multiplier` given): TIMESCALE and
+    TIMESTAMP_MAPPING anchored at `wall0_us`, and OBJECT_TIMESTAMP only
+    on an object off schedule. Otherwise Appendix A.2: TIMESCALE 1e6 and
+    each object's capture time as OBJECT_TIMESTAMP. No CLOCK_ID or
+    TIMESTAMP_ORIGIN: these are wall-clock tracks. `wall0_us` times the
+    timescale should be a whole number of µs·ticks/1e6, or every mapped
+    time is off by the remainder."""
+
+    def __init__(self, wall0_us: int, timescale: int = 1_000_000,
+                 group_multiplier: Optional[int] = None,
+                 object_multiplier: int = 0):
+        self.wall0_us = wall0_us
+        self.mapped = group_multiplier is not None
+        self.timescale = timescale if self.mapped else 1_000_000
+        self.group_multiplier = group_multiplier
+        self.object_multiplier = object_multiplier
+        self.base = wall0_us * self.timescale // 1_000_000
+
+    def track_properties(self, vi64: bool) -> Dict[int, Any]:
+        props: Dict[int, Any] = {TIMESCALE: self.timescale}
+        if self.mapped:
+            props[TIMESTAMP_MAPPING] = encode_mapping(
+                0, self.base, self.group_multiplier,
+                self.object_multiplier, vi64)
+        return props
+
+    def _ticks(self, capture_us: int) -> int:
+        """Ticks since wall0, rounded to the nearest."""
+        d = (capture_us - self.wall0_us) * self.timescale
+        return (2 * d + 1_000_000) // 2_000_000
+
+    def group_for(self, capture_us: int) -> Optional[int]:
+        """The scheduled group of a group-opening object."""
+        if not self.mapped or not self.group_multiplier:
+            return None
+        g = self.group_multiplier
+        return max(0, (2 * self._ticks(capture_us) + g) // (2 * g))
+
+    def object_properties(self, group_id: int, object_id: int,
+                          capture_us: int) -> Dict[int, Any]:
+        if not self.mapped:
+            return {OBJECT_TIMESTAMP: capture_us}
+        c = self._ticks(capture_us) - (group_id * self.group_multiplier
+                                       + object_id * self.object_multiplier)
+        return {OBJECT_TIMESTAMP: (c << 1) ^ (c >> 63)} if c else {}
