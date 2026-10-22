@@ -244,6 +244,31 @@ async def test_drop_session_detaches_a_lane():
     assert db.objects_sent == 0
 
 
+@pytest.mark.asyncio
+async def test_a_reset_during_a_header_drain_leaves_the_lane_writing():
+    s = _Session(block=True)
+    d = _delivery(s)
+    fan = FanoutDelivery([d])
+    sent = []
+    fan.on_sent = lambda g, o: sent.append((g, o))
+    lane = fan.lanes[0]
+    await fan.write(0, 0, b"k0", group_start=True)
+    await _settle()                     # parked in the header drain
+    d.cancel()                          # e.g. PUBLISH_OK with FORWARD=0
+    s.release()
+    await _settle()
+    await fan.write(1, 0, b"k1", group_start=True)
+    await fan.write(1, 1, b"p1")
+    await _settle()
+    assert not lane.task.done()
+    first, second = s.opened
+    assert s.resets == [first]
+    assert [w for w in s.writes if w[0] == second and w[1]] != []
+    assert sent == [(1, 0), (1, 1)]
+    assert d.objects_sent == 2
+    await fan.close()
+
+
 # -- the track layer -------------------------------------------------
 
 @pytest.mark.asyncio

@@ -178,6 +178,8 @@ class SubgroupDelivery:
         self._header: Optional[SubgroupHeader] = None
         # Group whose stream the peer stopped; not reopened (§11.3.2).
         self._stopped_group: Optional[int] = None
+        # Counts reset_group() calls; a write spanning one is abandoned.
+        self._epoch = 0
 
     @property
     def _prof(self):
@@ -219,6 +221,9 @@ class SubgroupDelivery:
             return False
         if callable(extensions):
             extensions = extensions(self.session)
+        # A reset_group() can land at any await below; the write then
+        # stops without touching what the reset left.
+        epoch = self._epoch
         try:
             if self.mapping is StreamMapping.DATAGRAM:
                 dgram = ObjectDatagram(
@@ -249,25 +254,34 @@ class SubgroupDelivery:
                     # A filter can admit a group part-way through: the stream
                     # then opens on a later object, not the group's first.
                     self.end_group()
-                    self._stream_id = await self.session.open_uni_stream()
+                    sid = await self.session.open_uni_stream()
                     self.stream_count += 1
+                    if self._epoch != epoch:
+                        self.session.stream_reset(sid, StreamResetCode.CANCELLED)
+                        return False
                     if self.stream_priority is not None:
                         self.session.set_stream_priority(
-                            self._stream_id, self.stream_priority)
-                    self._header = SubgroupHeader(
+                            sid, self.stream_priority)
+                    hdr = SubgroupHeader(
                         track_alias=self.track_alias, group_id=group_id,
                         subgroup_id=0, publisher_priority=self.priority,
                         extensions_present=True, prof=self._prof,
                         first_object=group_start)
+                    self._stream_id, self._header = sid, hdr
                     await self.session.stream_write_drain(
-                        self._stream_id, self._header.serialize().data)
-                buf = self._header.next_object(payload=payload,
-                                               extensions=extensions,
-                                               object_id=object_id)
-                await self.session.stream_write_drain(self._stream_id, buf.data)
+                        sid, hdr.serialize().data)
+                    if self._epoch != epoch:
+                        return False
+                sid, hdr = self._stream_id, self._header
+                buf = hdr.next_object(payload=payload, extensions=extensions,
+                                      object_id=object_id)
+                await self.session.stream_write_drain(sid, buf.data)
+                if self._epoch != epoch:
+                    return False
         except MOQTStreamStopped:
             # The session has reset the stream; a group's is not reopened.
-            if self.mapping is StreamMapping.PER_GROUP:
+            if (self.mapping is StreamMapping.PER_GROUP
+                    and self._epoch == epoch):
                 self._stopped_group = group_id
                 self._stream_id = None
                 self._header = None
@@ -285,6 +299,7 @@ class SubgroupDelivery:
     def reset_group(self, code: int = StreamResetCode.CANCELLED) -> None:
         """Reset the open group stream: the group is truncated, and a FIN
         would claim it complete. No-op when no stream is open."""
+        self._epoch += 1
         if self._stream_id is None:
             return
         self.session.stream_reset(self._stream_id, code)
