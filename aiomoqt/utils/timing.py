@@ -95,10 +95,11 @@ class TrackTiming:
     Properties. `clock_id` 0 (absent) is the POSIX wall clock; another
     value is a media clock with no latency figure. `loc_timescale` is a
     LOC TIMESCALE (0x08) seen as a Track Property or on any object of
-    the track, after which LOC timestamps are media time."""
+    the track, after which LOC timestamps are media time. `plain` is
+    True while neither is known: LOC TIMESTAMP then needs no resolver."""
 
     __slots__ = ('timescale', 'clock_id', 'origin', 'mapping',
-                 'loc_timescale', '_wall')
+                 'loc_timescale', '_wall', 'plain')
 
     def __init__(self, timescale: Optional[int] = None, clock_id: int = 0,
                  origin: int = 0,
@@ -110,6 +111,7 @@ class TrackTiming:
         self.mapping = mapping
         self.loc_timescale = loc_timescale
         self._wall = clock_id == 0
+        self.plain = timescale is None and loc_timescale is None
 
     def assign(self, other: 'TrackTiming') -> None:
         """Take `other`'s values, keeping this object's identity."""
@@ -156,9 +158,12 @@ class TrackTiming:
         """The object's timestamp in ticks (§5), None when it has none.
         Assumes a declared track; raises TimestampMalformed."""
         ots = None
-        if exts and not TIMING_IDS.isdisjoint(exts):
-            check_object_properties(exts)
+        if exts:
             ots = exts.get(OBJECT_TIMESTAMP)
+            # Only the Python codec yields KeyValuePairs (duplicates).
+            if not TRACK_IDS.isdisjoint(exts) or (
+                    ots is not None and type(exts) is not dict):
+                check_object_properties(exts)
         m = self.mapping
         if m is not None:
             ts = m[1] + (group_id - m[0]) * m[2] + object_id * m[3]
@@ -227,6 +232,7 @@ def capture_time_us(timing: Optional[TrackTiming], group_id: Optional[int],
     if LOC_TIMESCALE in exts:
         if timing is not None:
             timing.loc_timescale = exts[LOC_TIMESCALE]
+            timing.plain = False
     elif timing is None or timing.loc_timescale is None:
         ts = exts.get(LOC_TIMESTAMP)
         if ts is not None:

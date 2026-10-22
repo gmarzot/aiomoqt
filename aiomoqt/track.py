@@ -52,8 +52,7 @@ from .utils.buffer import Buffer, BufferReadError
 from .utils.format import fmt_bps, fmt_rate
 from .utils.logger import get_logger
 from .utils.timing import (
-    TIMING_IDS, TimestampMalformed, TimestampWriter, TrackTiming,
-    check_object,
+    TimestampMalformed, TimestampWriter, TrackTiming, check_object,
 )
 
 logger = get_logger(__name__)
@@ -1924,13 +1923,32 @@ class SubscribedTrack(Track):
         except TimestampMalformed as e:
             self.timing.assign(TrackTiming())
             self.timing_error = str(e)
+        self._route_timing_checks(msg)
+
+    def _checks_every_object(self) -> bool:
+        return (self.timestamp_errors == 'cancel'
+                and (self.timing.timescale is not None
+                     or self.timing_error is not None))
+
+    def _route_timing_checks(self, msg) -> None:
+        """Cancel mode: a track with timing properties has every object
+        checked; one without has only objects carrying a timing property
+        routed to the check, by the session (_timing_watch)."""
+        if self.timestamp_errors != 'cancel' or self.on_object is None:
+            return
+        alias = getattr(msg, 'track_alias', None)
+        if self._checks_every_object():
+            # A SUBSCRIBE_OK arrives before its handler is bound.
+            pending = getattr(self.session, '_pending_object_handlers', {})
+            if pending.get(getattr(msg, 'request_id', None)) is not None:
+                pending[msg.request_id] = self._checked_object
+        elif alias is not None:
+            self.session._timing_watch[alias] = self._checked_object
 
     def _handler(self) -> Optional[Callable]:
         """The object handler to register: on_object itself, or behind
-        the timing check when malformed timing cancels the track."""
-        if self.on_object is None:
-            return None
-        if self.timestamp_errors != 'cancel':
+        the timing check on a track whose timing properties it checks."""
+        if self.on_object is None or not self._checks_every_object():
             return self.on_object
         return self._checked_object
 
@@ -1940,16 +1958,17 @@ class SubscribedTrack(Track):
         if self.timing_error is not None:
             return          # cancelled once subscribe() has the alias
         timing = self.timing
-        exts = msg.extensions
-        if timing.timescale is not None or (
-                exts and not TIMING_IDS.isdisjoint(exts)):
-            gid = getattr(msg, 'group_id', None)
-            try:
-                check_object(timing, args[2] if gid is None else gid,
-                             msg.object_id, exts)
-            except TimestampMalformed as e:
-                self._cancel_malformed(str(e))
-                return
+        gid = getattr(msg, 'group_id', None)
+        try:
+            if timing.timescale is not None:
+                timing.timestamp(args[2] if gid is None else gid,
+                                 msg.object_id, msg.extensions)
+            else:
+                # Routed here only for an object carrying timing ids.
+                check_object(timing, 0, msg.object_id, msg.extensions)
+        except TimestampMalformed as e:
+            self._cancel_malformed(str(e))
+            return
         self.on_object(msg, *args)
 
     def _cancel_malformed(self, reason: str) -> None:
@@ -1957,6 +1976,7 @@ class SubscribedTrack(Track):
         if self.malformed is not None:
             return
         self.malformed = reason
+        self.session._timing_watch.pop(self.track_alias, None)
         self.session._malformed_track(self.track_alias, reason)
         self._done_event.set()
 
@@ -2006,7 +2026,7 @@ class SubscribedTrack(Track):
                 group_order=group_order,
                 parameters=params,
                 wait_response=True,
-                on_object=self._handler(),
+                on_object=self.on_object,
                 on_reply=self.take_track_properties,
             )
             self.largest = _reported_largest(ok)
@@ -2129,6 +2149,7 @@ class SubscribedTrack(Track):
         self.request_id = request_id
 
         def _done(msg):
+            self.session._timing_watch.pop(self.track_alias, None)
             self.publish_done = msg
             self._done_event.set()
             if self.on_done is not None:

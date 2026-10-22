@@ -46,6 +46,7 @@ def _stub(draft=18):
     s._unbound_aliases = {}
     s._unbound_escalated = set()
     s._malformed_aliases = set()
+    s._timing_watch = {}
     s._group_bound = {}
     s._track_bound = {}
     s._object_handlers = {}

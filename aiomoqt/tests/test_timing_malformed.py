@@ -195,3 +195,40 @@ async def test_report_policy_keeps_receiving(draft, use_quic):
         "group_id": 0, "object_id": 0,
         "extensions": {OBJECT_TIMESTAMP: 7}})(), 0) is None
     assert stats.ts_malformed == 1
+
+
+def _subscribed(props, policy='cancel'):
+    from types import SimpleNamespace as NS
+    from aiomoqt.context import profile_for
+    sess = NS(_profile=profile_for(18), _pending_object_handlers={0: None},
+              _timing_watch={})
+
+    def sink(*a):
+        pass
+    sub = SubscribedTrack(sess, _NS, "t", on_object=sink,
+                          timestamp_errors=policy)
+    sess._pending_object_handlers[0] = sink
+    sub.take_track_properties(NS(track_extensions=props, request_id=0,
+                                 track_alias=3))
+    return sub, sess, sink
+
+
+def test_a_track_without_timing_keeps_its_handler_unwrapped():
+    sub, sess, sink = _subscribed({0x3F: b"x"})
+    assert sess._pending_object_handlers[0] is sink
+    assert sub._handler() is sink
+    # Only objects carrying a timing property are routed to the check.
+    assert sess._timing_watch == {3: sub._checked_object}
+
+
+def test_a_track_with_timing_checks_every_object():
+    sub, sess, _ = _subscribed({TIMESCALE: 1000})
+    assert sess._pending_object_handlers[0] == sub._checked_object
+    assert sub._handler() == sub._checked_object
+    assert sess._timing_watch == {}
+
+
+def test_report_policy_installs_no_check():
+    sub, sess, sink = _subscribed({TIMESCALE: 1000}, 'report')
+    assert sess._pending_object_handlers[0] is sink
+    assert sub._handler() is sink and sess._timing_watch == {}

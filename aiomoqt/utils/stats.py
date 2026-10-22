@@ -35,7 +35,7 @@ from typing import Optional
 from .format import fmt_bps, fmt_ms, fmt_rate
 from .timing import (
     BENCH_TIMESTAMP as MOQT_TIMESTAMP_EXT, LOC_TIMESCALE, LOC_TIMESTAMP,
-    TimestampMalformed, TrackTiming, capture_time_us,
+    SOURCE_LOC, TimestampMalformed, TrackTiming, capture_time_us,
 )
 from ..types import ObjectStatus
 
@@ -48,6 +48,11 @@ def send_time_us(exts, timing: Optional[TrackTiming] = None,
                  object_id: Optional[int] = None) -> Optional[int]:
     """Sender wall-clock µs of an object (utils.timing precedence); None
     when it has none or its timing properties are malformed."""
+    if ((timing is None or timing.plain) and exts
+            and LOC_TIMESCALE not in exts):
+        ts = exts.get(LOC_TIMESTAMP)
+        if ts is not None:
+            return ts
     try:
         return capture_time_us(timing, group_id, object_id, exts)[0]
     except TimestampMalformed:
@@ -286,6 +291,7 @@ class TrackStats:
         self.timing = TrackTiming()
         self.ts_sources: set = set()
         self._last_src: Optional[str] = None
+        self._saw_loc = False
         self.ts_malformed = 0
 
     def _send_us(self, msg, group_id) -> Optional[int]:
@@ -305,7 +311,8 @@ class TrackStats:
     @property
     def ts_source(self) -> Optional[str]:
         """Timestamp source(s) latency was measured from."""
-        return '+'.join(sorted(self.ts_sources)) or None
+        srcs = self.ts_sources | ({SOURCE_LOC} if self._saw_loc else set())
+        return '+'.join(sorted(srcs)) or None
 
     # -- ingest ------------------------------------------------------
 
@@ -342,15 +349,23 @@ class TrackStats:
         self.last_object_time = now
 
         every = self.latency_every
+        sample = True
         if every > 1:
             self._lat_tick += 1
             if self._lat_tick < every:
-                send_us = None
+                sample = False
             else:
                 self._lat_tick = 0
+        send_us = None
+        if sample:
+            # A track without frindell or LOC timescale reads LOC
+            # TIMESTAMP directly; anything else goes to the resolver.
+            exts = getattr(msg, 'extensions', None)
+            if (self.timing.plain and exts and LOC_TIMESCALE not in exts
+                    and (send_us := exts.get(LOC_TIMESTAMP)) is not None):
+                self._saw_loc = True
+            else:
                 send_us = self._send_us(msg, group_id)
-        else:
-            send_us = self._send_us(msg, group_id)
         if send_us is not None and recv_time_us is not None:
             raw = recv_time_us - send_us
             if _LAT_MIN_US <= raw <= _LAT_MAX_US:

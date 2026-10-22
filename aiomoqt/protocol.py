@@ -44,6 +44,7 @@ from .utils.buffer import Buffer, BufferReadError
 from .utils.logger import *
 from .utils.logger import quiet_session
 from .utils.url import moqt_setup_path
+from .utils.timing import TIMING_IDS
 from aiopquic.streamchain import StreamChain
 from aiopquic.asyncio.webtransport import WebTransportError
 
@@ -351,6 +352,10 @@ class _MOQTSessionMixin:
         # Track aliases found malformed (§2.4.2): subscription cancelled,
         # further streams refused.
         self._malformed_aliases: Set[int] = set()
+        # alias -> handler for its objects that carry a frindell timing
+        # property (utils.timing.TIMING_IDS): a track that declared none
+        # checks only those.
+        self._timing_watch: Dict[int, Callable] = {}
         # alias -> {group_id: first object id that does not exist}, from
         # END_OF_GROUP status objects and FIN on END_OF_GROUP-bit streams.
         self._group_bound: Dict[int, Dict[int, int]] = {}
@@ -1757,6 +1762,10 @@ class _MOQTSessionMixin:
                     ObjectStatus.END_OF_TRACK,
                 )
                 cb = self._object_cb(alias)
+                watch = self._timing_watch
+                if watch and msg_obj.extensions and not TIMING_IDS.isdisjoint(
+                        msg_obj.extensions):
+                    cb = watch.get(alias, cb)
                 now = int(time.time() * 1_000_000)
                 if getattr(hdr, 'default_priority', False):
                     msg_obj.publisher_priority = (
@@ -2351,6 +2360,10 @@ class _MOQTSessionMixin:
                 self._malformed_track(alias, reason)
                 return
         cb = self._object_cb(alias)
+        watch = self._timing_watch
+        if watch and msg.extensions and not TIMING_IDS.isdisjoint(
+                msg.extensions):
+            cb = watch.get(alias, cb)
         if cb:
             try:
                 cb(msg, consumed, now, msg.group_id, None)

@@ -141,3 +141,14 @@ def test_agent_reader_ages_objects_from_the_reply_timing():
     rdr.on_object(_msg(0, 0, {OBJECT_TIMESTAMP: W}), 1, W + 4000, 0, 0)
     obj = rdr._ring[0]
     assert obj.sent_us == W and obj.age_ms == pytest.approx(4.0)
+
+
+def test_track_stats_loc_fast_path_reports_and_respects_loc_timescale():
+    stats = TrackStats(windowed=False)
+    stats.on_object(_msg(0, 0, {LOC_TIMESTAMP: W}), 10, W + 1000)
+    assert stats.ts_source == SOURCE_LOC and stats.lat_count == 1
+    # A LOC TIMESCALE makes later 0x10 values media time: no sample.
+    stats.on_object(_msg(0, 1, {LOC_TIMESTAMP: 9, LOC_TIMESCALE: 90000}),
+                    10, W + 2000)
+    stats.on_object(_msg(0, 2, {LOC_TIMESTAMP: 99}), 10, W + 3000)
+    assert stats.lat_count == 1
