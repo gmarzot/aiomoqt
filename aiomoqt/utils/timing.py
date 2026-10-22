@@ -1,0 +1,219 @@
+"""Object capture times: draft-frindell-moq-timestamp-00 Track and Object
+Properties, LOC TIMESTAMP (loc-04) and the legacy bench property 0x20.
+
+capture_time_us() resolves one object, in that order of precedence, to
+wall-clock µs since the epoch and the source it came from. A track's
+frindell Track Properties are parsed once into a TrackTiming; a
+violation of the draft's rules raises TimestampMalformed (the track is
+malformed, MOQT §12.1).
+"""
+from typing import Any, Dict, Iterable, Optional, Tuple
+
+from .buffer import Buffer, BufferReadError
+
+# draft-frindell-moq-timestamp-00 §9 (provisional code points).
+TIMESCALE = 0x2C7A51E0
+CLOCK_ID = 0x3E8D2B70
+TIMESTAMP_ORIGIN = 0x31B49A6E
+TIMESTAMP_MAPPING = 0x27F308C5
+OBJECT_TIMESTAMP = 0x2D1A
+TRACK_IDS = frozenset((TIMESCALE, CLOCK_ID, TIMESTAMP_ORIGIN,
+                       TIMESTAMP_MAPPING))
+TIMING_IDS = TRACK_IDS | {OBJECT_TIMESTAMP}
+NAMES = {TIMESCALE: "TIMESCALE", CLOCK_ID: "CLOCK_ID",
+         TIMESTAMP_ORIGIN: "TIMESTAMP_ORIGIN",
+         TIMESTAMP_MAPPING: "TIMESTAMP_MAPPING",
+         OBJECT_TIMESTAMP: "OBJECT_TIMESTAMP"}
+
+# loc-04: TIMESTAMP is wall-clock µs unless a TIMESCALE gives its units.
+LOC_TIMESTAMP = 0x10
+LOC_TIMESCALE = 0x08
+BENCH_TIMESTAMP = 0x20
+
+SOURCE_FRINDELL = "frindell"
+SOURCE_LOC = "loc"
+SOURCE_BENCH = "bench"
+
+U64_MAX = (1 << 64) - 1
+
+
+class TimestampMalformed(ValueError):
+    """Timing properties that make the track malformed."""
+
+
+def zigzag_encode(v: int) -> int:
+    """§2.1: 0, -1, 1, -2, ... -> 0, 1, 2, 3, ..."""
+    if not -(1 << 63) <= v < 1 << 63:
+        raise ValueError(f"{v} is outside the 64-bit signed range")
+    return (v << 1) ^ (v >> 63)
+
+
+def zigzag_decode(u: int) -> int:
+    return (u >> 1) ^ -(u & 1)
+
+
+def encode_mapping(base_group: int, base_timestamp: int,
+                   group_multiplier: int, object_multiplier: int,
+                   vi64: bool) -> bytes:
+    """TIMESTAMP_MAPPING value (§4.4): four integers in the session's
+    variable-length integer encoding."""
+    buf = Buffer(capacity=40, vi64=vi64)
+    for v in (base_group, base_timestamp, group_multiplier,
+              object_multiplier):
+        buf.push_vint(v)
+    return bytes(buf.data_slice(0, buf.tell()))
+
+
+def decode_mapping(raw: bytes, vi64: bool) -> Tuple[int, int, int, int]:
+    """§4.4: exactly four integers, else TimestampMalformed."""
+    raw = bytes(raw)
+    buf = Buffer(data=raw, vi64=vi64)
+    out = []
+    try:
+        while buf.tell() < len(raw) and len(out) < 4:
+            out.append(buf.pull_vint())
+    except (BufferReadError, ValueError):
+        raise TimestampMalformed(
+            "TIMESTAMP_MAPPING is not four integers") from None
+    if len(out) != 4 or buf.tell() != len(raw):
+        raise TimestampMalformed("TIMESTAMP_MAPPING is not four integers")
+    return out[0], out[1], out[2], out[3]
+
+
+def _name(ptype: int) -> str:
+    return NAMES.get(ptype, f"0x{ptype:x}")
+
+
+class TrackTiming:
+    """One track's timing context.
+
+    `timescale` is None unless the track declares frindell Track
+    Properties. `clock_id` 0 (absent) is the POSIX wall clock; another
+    value is a media clock with no latency figure. `loc_timescale` is a
+    LOC TIMESCALE (0x08) seen as a Track Property or on any object of
+    the track, after which LOC timestamps are media time."""
+
+    __slots__ = ('timescale', 'clock_id', 'origin', 'mapping',
+                 'loc_timescale', '_wall')
+
+    def __init__(self, timescale: Optional[int] = None, clock_id: int = 0,
+                 origin: int = 0,
+                 mapping: Optional[Tuple[int, int, int, int]] = None,
+                 loc_timescale: Optional[int] = None):
+        self.timescale = timescale
+        self.clock_id = clock_id
+        self.origin = origin
+        self.mapping = mapping
+        self.loc_timescale = loc_timescale
+        self._wall = clock_id == 0
+
+    def assign(self, other: 'TrackTiming') -> None:
+        """Take `other`'s values, keeping this object's identity."""
+        for name in self.__slots__:
+            setattr(self, name, getattr(other, name))
+
+    @property
+    def declared(self) -> bool:
+        """The track declares frindell timestamps."""
+        return self.timescale is not None
+
+    @property
+    def wall_clock(self) -> bool:
+        return self._wall
+
+    @classmethod
+    def from_properties(cls, props: Optional[Dict[int, Any]], vi64: bool,
+                        duplicates: Iterable[int] = ()) -> 'TrackTiming':
+        """Parse merged Track Properties (Immutable Properties unwrapped);
+        `duplicates` are the types seen more than once across both sets.
+        Raises TimestampMalformed (§3, §4)."""
+        props = props or {}
+        for ptype in TIMING_IDS.intersection(duplicates):
+            raise TimestampMalformed(f"{_name(ptype)} appears more than once")
+        if OBJECT_TIMESTAMP in props:
+            raise TimestampMalformed("OBJECT_TIMESTAMP as a Track Property")
+        loc_ts = props.get(LOC_TIMESCALE)
+        loc_ts = loc_ts if isinstance(loc_ts, int) else None
+        if TRACK_IDS.isdisjoint(props):
+            return cls(loc_timescale=loc_ts)
+        timescale = props.get(TIMESCALE)
+        if not timescale:
+            raise TimestampMalformed("TIMESCALE missing or 0")
+        clock_id = props.get(CLOCK_ID)
+        origin = props.get(TIMESTAMP_ORIGIN)
+        if origin is not None and clock_id is None:
+            raise TimestampMalformed("TIMESTAMP_ORIGIN without CLOCK_ID")
+        raw = props.get(TIMESTAMP_MAPPING)
+        mapping = None if raw is None else decode_mapping(raw, vi64)
+        return cls(timescale, clock_id or 0, origin or 0, mapping, loc_ts)
+
+    def timestamp(self, group_id: int, object_id: int,
+                  exts: Optional[Dict[int, Any]]) -> Optional[int]:
+        """The object's timestamp in ticks (§5), None when it has none.
+        Assumes a declared track; raises TimestampMalformed."""
+        ots = None
+        if exts:
+            if not TIMING_IDS.isdisjoint(exts):
+                check_object_properties(exts)
+                ots = exts.get(OBJECT_TIMESTAMP)
+            dups = getattr(exts, 'duplicates', None)
+            if dups and OBJECT_TIMESTAMP in dups:
+                raise TimestampMalformed(
+                    "OBJECT_TIMESTAMP appears more than once")
+        m = self.mapping
+        if m is not None:
+            ts = m[1] + (group_id - m[0]) * m[2] + object_id * m[3]
+            if ots is not None:
+                ts += zigzag_decode(ots)
+        elif ots is not None:
+            ts = ots
+        else:
+            return None
+        if ts < 0 or ts > U64_MAX:
+            raise TimestampMalformed(f"timestamp {ts} outside 0..2^64-1")
+        return ts
+
+    def media_us(self, group_id: int, object_id: int,
+                 exts: Optional[Dict[int, Any]]) -> Optional[int]:
+        """The object's time on the track's clock in µs, wall clock or
+        not; None when it has no timestamp."""
+        ts = self.timestamp(group_id, object_id, exts)
+        if ts is None:
+            return None
+        return (self.origin + ts) * 1_000_000 // self.timescale
+
+
+def check_object_properties(exts: Dict[int, Any]) -> None:
+    """§3: no Track-scope timing property on an object."""
+    for ptype in TRACK_IDS.intersection(exts):
+        raise TimestampMalformed(f"{_name(ptype)} as an Object Property")
+
+
+def capture_time_us(timing: Optional[TrackTiming], group_id: Optional[int],
+                    object_id: Optional[int],
+                    exts: Optional[Dict[int, Any]]
+                    ) -> Tuple[Optional[int], Optional[str]]:
+    """(capture µs since the epoch, source) of one object, or (None,
+    None). Precedence: frindell on a wall-clock track, then LOC
+    TIMESTAMP without a LOC TIMESCALE (Track Property, or on any object
+    of the track when `timing` keeps it), then the bench property 0x20.
+    Raises TimestampMalformed."""
+    if timing is not None and timing.timescale is not None:
+        ts = timing.timestamp(group_id or 0, object_id or 0, exts)
+        if ts is not None and timing._wall:
+            return ((timing.origin + ts) * 1_000_000 // timing.timescale,
+                    SOURCE_FRINDELL)
+    elif exts and not TIMING_IDS.isdisjoint(exts):
+        check_object_properties(exts)
+        raise TimestampMalformed("OBJECT_TIMESTAMP without TIMESCALE")
+    if not exts:
+        return None, None
+    if LOC_TIMESCALE in exts:
+        if timing is not None:
+            timing.loc_timescale = exts[LOC_TIMESCALE]
+    elif timing is None or timing.loc_timescale is None:
+        ts = exts.get(LOC_TIMESTAMP)
+        if ts is not None:
+            return ts, SOURCE_LOC
+    ts = exts.get(BENCH_TIMESTAMP)
+    return (ts, SOURCE_BENCH) if ts is not None else (None, None)

@@ -202,6 +202,7 @@ async def _slot_task(cfg, relay, slot, events_q, group, shard,
                     session, cfg["namespace"], trackname=cfg["trackname"],
                     on_object=_on_object,
                 )
+                stats.timing = track.timing
                 try:
                     await track.subscribe(
                         timeout=SUBSCRIBE_EACH_TIMEOUT_S,

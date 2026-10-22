@@ -12,8 +12,9 @@
 Both views come from the same counters, so identical traffic reports
 identical numbers regardless of which tool observed it.
 
-Receivers get latency and jitter (they need the peer's send timestamp
-from the LOC TIMESTAMP or bench 0x20 property and a local receive clock).
+Receivers get latency and jitter (they need the peer's send timestamp,
+resolved by utils.timing from frindell, LOC TIMESTAMP or bench 0x20
+properties, and a local receive clock).
 Publishers use `SenderStats`, which shares the rate/group accounting but
 has no latency view — there is no round trip to measure.
 
@@ -32,25 +33,25 @@ from collections import deque
 from typing import Optional
 
 from .format import fmt_bps, fmt_ms, fmt_rate
+from .timing import (
+    BENCH_TIMESTAMP as MOQT_TIMESTAMP_EXT, LOC_TIMESCALE, LOC_TIMESTAMP,
+    TimestampMalformed, TrackTiming, capture_time_us,
+)
 from ..types import ObjectStatus
 
-MOQT_TIMESTAMP_EXT = 0x20
-# loc-04 TIMESTAMP: wall-clock µs since the epoch unless TIMESCALE is
-# present, which makes it media time.
-LOC_TIMESTAMP = 0x10
-LOC_TIMESCALE = 0x08
+__all__ = ['MOQT_TIMESTAMP_EXT', 'LOC_TIMESCALE', 'LOC_TIMESTAMP',
+           'SenderStats', 'TrackStats', 'send_time_us']
 
 
-def send_time_us(exts) -> Optional[int]:
-    """Sender wall-clock µs from object properties: LOC TIMESTAMP when no
-    TIMESCALE rides with it, else the legacy bench property 0x20."""
-    if not exts:
+def send_time_us(exts, timing: Optional[TrackTiming] = None,
+                 group_id: Optional[int] = None,
+                 object_id: Optional[int] = None) -> Optional[int]:
+    """Sender wall-clock µs of an object (utils.timing precedence); None
+    when it has none or its timing properties are malformed."""
+    try:
+        return capture_time_us(timing, group_id, object_id, exts)[0]
+    except TimestampMalformed:
         return None
-    if LOC_TIMESCALE not in exts:
-        ts = exts.get(LOC_TIMESTAMP)
-        if ts is not None:
-            return ts
-    return exts.get(MOQT_TIMESTAMP_EXT)
 
 # Latency sanity window: reject clock-skew / deframer garbage. Real
 # under-load latency can be seconds, so the ceiling is generous; the
@@ -281,6 +282,31 @@ class TrackStats:
         self._snap_bytes = 0
         self._snap_lost = 0
 
+        # Track timing context; a subscriber shares its SubscribedTrack's.
+        self.timing = TrackTiming()
+        self.ts_sources: set = set()
+        self._last_src: Optional[str] = None
+        self.ts_malformed = 0
+
+    def _send_us(self, msg, group_id) -> Optional[int]:
+        try:
+            us, src = capture_time_us(
+                self.timing, getattr(msg, 'group_id', group_id),
+                getattr(msg, 'object_id', None),
+                getattr(msg, 'extensions', None))
+        except TimestampMalformed:
+            self.ts_malformed += 1
+            return None
+        if src is not self._last_src and src is not None:
+            self._last_src = src
+            self.ts_sources.add(src)
+        return us
+
+    @property
+    def ts_source(self) -> Optional[str]:
+        """Timestamp source(s) latency was measured from."""
+        return '+'.join(sorted(self.ts_sources)) or None
+
     # -- ingest ------------------------------------------------------
 
     def on_object(self, msg, size_bytes: int, recv_time_us: int,
@@ -322,9 +348,9 @@ class TrackStats:
                 send_us = None
             else:
                 self._lat_tick = 0
-                send_us = send_time_us(getattr(msg, 'extensions', None))
+                send_us = self._send_us(msg, group_id)
         else:
-            send_us = send_time_us(getattr(msg, 'extensions', None))
+            send_us = self._send_us(msg, group_id)
         if send_us is not None and recv_time_us is not None:
             raw = recv_time_us - send_us
             if _LAT_MIN_US <= raw <= _LAT_MAX_US:
@@ -520,6 +546,7 @@ class TrackStats:
             jitter_ms=self.jitter, loss=self.total_lost,
             groups=len(self._groups_seen),
             total_objs=self.total_objects, total_bytes=self.total_bytes,
+            ts_source=self.ts_source,
         )
 
     @staticmethod
@@ -591,5 +618,6 @@ class TrackStats:
             lat_p50=p50, lat_p95=p95, lat_p99=p99,
             jitter_ms=self.jitter,
             lost=self.total_lost, ooo=self.total_ooo,
+            ts_source=self.ts_source, ts_malformed=self.ts_malformed,
             loss_pct=(self.total_lost / expected * 100) if expected else 0.0,
         )

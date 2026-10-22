@@ -51,6 +51,7 @@ from .messages.fetch import _is_joining
 from .utils.buffer import Buffer, BufferReadError
 from .utils.format import fmt_bps, fmt_rate
 from .utils.logger import get_logger
+from .utils.timing import TimestampMalformed, TrackTiming
 
 logger = get_logger(__name__)
 
@@ -1825,6 +1826,11 @@ class SubscribedTrack(Track):
         self.immutable_properties: Optional[Dict[int, Any]] = None
         self.properties: Dict[int, Any] = {}
         self.property_duplicates: frozenset = frozenset()
+        # Timing context from the Track Properties, updated in place so a
+        # holder (TrackStats.timing) follows it; timing_error says why
+        # the timing properties make the track malformed.
+        self.timing = TrackTiming()
+        self.timing_error: Optional[str] = None
         self._done_event = asyncio.Event()
 
     def take_track_properties(self, msg) -> None:
@@ -1839,6 +1845,13 @@ class SubscribedTrack(Track):
         self.immutable_properties = immutable
         self.properties = merged
         self.property_duplicates = dups
+        try:
+            self.timing.assign(TrackTiming.from_properties(
+                merged, self.session._profile.vi64, dups))
+            self.timing_error = None
+        except TimestampMalformed as e:
+            self.timing.assign(TrackTiming())
+            self.timing_error = str(e)
 
     async def subscribe(self, timeout: float = 30.0,
                         forward: int = 1,

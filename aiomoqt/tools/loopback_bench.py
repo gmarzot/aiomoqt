@@ -241,6 +241,7 @@ async def run_subscriber(args, stats):
                 trackname="track",
                 on_object=stats.on_object,
             )
+            stats.stats.timing = track.timing
             # Loopback server does not send PUBLISH; use direct SUBSCRIBE.
             # Loopback passes explicit trackname → auto-routes to direct.
             await track.subscribe()

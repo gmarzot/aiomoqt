@@ -156,6 +156,8 @@ class LiveStats:
         self._last_recv_ms = 0
         self._last_send_ms = 0
         self._jitter = 0.0
+        # Shared with the SubscribedTrack; see utils.timing.
+        self.timing = None
 
     def on_object(self, msg, size_bytes, recv_time_us,
                   group_id=None, subgroup_id=None):
@@ -168,7 +170,9 @@ class LiveStats:
                      and getattr(msg, 'status', ObjectStatus.NORMAL)
                      != ObjectStatus.NORMAL)
 
-        send_us = send_time_us(getattr(msg, 'extensions', None))
+        send_us = send_time_us(getattr(msg, 'extensions', None), self.timing,
+                               getattr(msg, 'group_id', group_id),
+                               getattr(msg, 'object_id', None))
         latency = None
         if send_us is not None:
             raw_us = recv_time_us - send_us
@@ -1341,6 +1345,7 @@ async def run_subscriber_client(host: str, port: int, path: str,
                     trackname=args.trackname,
                     on_object=stats.on_object,
                 )
+                stats.timing = track.timing
                 try:
                     await track.subscribe()
                     break

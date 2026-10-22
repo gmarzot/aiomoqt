@@ -5,6 +5,8 @@
 - `PublishedTrack(track_properties=)`: top-level Track Properties on PUBLISH, SUBSCRIBE_OK, FETCH_OK and the TRACK_STATUS reply, beside `immutable_properties`; a type in both is refused.
 - `SubscribedTrack` keeps the Track Properties of its SUBSCRIBE_OK or PUBLISH (`track_properties`, `immutable_properties`, merged `properties`, `property_duplicates`); `take_track_properties()` takes a FETCH_OK's; `MediaSubscriber.properties(name)`.
 - `session.subscribe(on_reply=)`: called with the SUBSCRIBE_OK as it is parsed, before the track's first object.
+- `utils.timing`: one capture-time resolver (draft-frindell-moq-timestamp-00 on a wall-clock track, then LOC TIMESTAMP without a LOC TIMESCALE, then bench 0x20); `SubscribedTrack.timing` holds the track's context.
+- sub_bench, loopback_bench, adaptive_bench, load_sim, the agent reader and sub_media `--analyze`/`--report`/`--inspect` take latency from the resolver and report its source per track.
 
 ## v0.13.1
 
