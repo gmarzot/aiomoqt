@@ -66,7 +66,8 @@ from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
 from aiomoqt.types import (
     MOQT_DEFAULT_DRAFTS, D18MessageType, FilterType, GroupOrder, MOQTDraft,
-    MOQTMessageType, MOQTRequestError, ObjectStatus, ParamType,
+    MOQTMessageType, MOQTRequestError, MOQTStreamStopped, ObjectStatus,
+    ParamType,
     RequestErrorCode, StreamResetCode, SubscribeDoneCode,
     parse_draft_spec,
 )
@@ -377,6 +378,9 @@ class _RelayedTrack:
         self._streams = {}
         # id(session) -> subgroup streams opened (PUBLISH_DONE count)
         self._sent_streams = {}
+        # (id(session), group, subgroup) whose stream the subscriber
+        # stopped: its later objects are skipped, never reopened (§11.3.2).
+        self._stopped = set()
         self._finished = False
         # Closed: takes no objects and never restarts its drain.
         self._closed = False
@@ -698,6 +702,7 @@ class _RelayedTrack:
                            if d.session is not session]
         for k in [k for k in self._streams if k[0] == id(session)]:
             self._streams.pop(k, None)
+        self._stopped = {k for k in self._stopped if k[0] != id(session)}
         self._sent_streams.pop(id(session), None)
 
     async def _forward_loop(self):
@@ -771,6 +776,7 @@ class _RelayedTrack:
             first = self._cache[0][0]
             self._ended = {k for k in self._ended if k[0] >= first}
             self._opened = {k for k in self._opened if k[0] >= first}
+            self._stopped = {k for k in self._stopped if k[1] >= first}
 
     async def _replay(self, d) -> None:
         """The cached objects inside `d`'s window, in Location order,
@@ -862,6 +868,8 @@ class _RelayedTrack:
                 logger.warning("relay: no datagram TX on this session, "
                                "forwarding objects on streams")
         skey = (id(session), gid, sgid)
+        if skey in self._stopped:
+            return
         entry = self._streams.get(skey)
         if entry is None and status in ("END", "RESET"):
             return
@@ -914,7 +922,12 @@ class _RelayedTrack:
                 encoded[state] = data
         else:
             header.advance(oid)
-        await session.stream_write_drain(stream_id, data)
+        try:
+            await session.stream_write_drain(stream_id, data)
+        except MOQTStreamStopped:
+            # The session has reset the stream; the subscription goes on.
+            self._streams.pop(skey, None)
+            self._stopped.add(skey)
 
 
 _watched: set = set()

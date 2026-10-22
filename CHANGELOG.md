@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- STOP_SENDING on one subgroup stream ends that stream only: the relay and PublishedTrack skip the rest of that subgroup and keep the subscription; the write raises `MOQTStreamStopped` (a `CancelledError`) while the session lives.
 - Relay: d20/d22 FILL_PARAMETERS on a SUBSCRIBE or REQUEST_UPDATE opens a fill fetch stream, from the cache or an upstream FETCH, reset when neither holds the range or reporting a Timed-Out gap under FILL_TIMEOUT; none while paused; counted in PUBLISH_DONE.
 - d20/d22: a length-prefixed FILL_PARAMETERS value may hold bare parameters with no Number of Parameters, and may be empty.
 

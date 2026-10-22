@@ -37,6 +37,7 @@ from .messages.subscribe import SubscribeOk
 from .types import *
 from .types import (D20MessageType, FilterType, MOQTDraft, MOQTException,
                     MOQTMessageType, MOQTProtocolViolation, MOQTRequestError,
+                    MOQTStreamStopped,
                     ObjectStatus, ParamType, RequestErrorCode,
                     SessionCloseCode, SetupParamType, StreamResetCode,
                     SubscribeDoneCode)
@@ -381,6 +382,7 @@ class _MOQTSessionMixin:
         self._bidi_stream_requests: Dict[int, int] = {}  # map bidi stream_id to request_id (d16)
         # Request streams cancelled by STOP_SENDING whose peer half is still open.
         self._cancelled_request_streams: Set[int] = set()
+        self._stopped_streams = set()
         # request_id -> callback fired when the request's stream is
         # terminated by the peer (§3.3.2 cancellation).
         self._request_cancel_handlers: Dict[int, Callable] = {}
@@ -2795,6 +2797,7 @@ class _MOQTSessionMixin:
                 event.stream_id,
                 stop_sending_code=int(event.error_code or 0))
             if not bound:
+                self._stopped_streams.add(event.stream_id)
                 self._cleanup_stream(
                     event.stream_id, QuicErrorCode.APPLICATION_ERROR)
             return
@@ -3209,6 +3212,9 @@ class _MOQTSessionMixin:
             # without ever suspending, so the event loop starves and
             # task cancellation can never be delivered.
             raise asyncio.CancelledError()
+        if stream_id in self._stopped_streams:
+            self._stopped_streams.discard(stream_id)
+            raise MOQTStreamStopped()
         quic = self._quic
         max_bytes = self._session.tx_max_inflight_bytes
         # Byte-budget gate (aiomoqt-owned policy). Per-stream sc->tx
@@ -3237,13 +3243,18 @@ class _MOQTSessionMixin:
         except (AssertionError, AttributeError) as e:
             logger.debug(f"stream({stream_id}): write race: {e}")
         except ConnectionError as e:
-            # Stream or session torn down under the write: end the
-            # producer as the pre-check does, never return silently.
+            # Torn down under the write: never return silently. A stream
+            # gone on a live session ends that stream only.
             logger.debug(f"stream({stream_id}): write after teardown: {e}")
+            if (self._session_writable()
+                    and not getattr(self._quic, 'closed', False)):
+                raise MOQTStreamStopped() from e
             raise asyncio.CancelledError() from e
 
     # Fetch streams serve_fetch() has open, by the peer's request id.
     _served_fetch_streams: Optional[Dict[int, int]] = None
+    # Send streams the peer stopped; the next write raises MOQTStreamStopped.
+    _stopped_streams: Set[int] = frozenset()
 
     def _forget_served_fetch(self, stream_id: int) -> None:
         for rid, sid in self._served_fetch_streams.items():

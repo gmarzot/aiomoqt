@@ -30,7 +30,7 @@ from enum import IntEnum
 from typing import Callable, Dict, Optional, Union
 
 from .types import (
-    FetchType, MOQTRequestError, ParamType, FilterType,
+    FetchType, MOQTRequestError, MOQTStreamStopped, ParamType, FilterType,
     ForwardingPreference, GroupOrder, LOC_TIMESTAMP, ObjectStatus,
     RequestErrorCode, StreamResetCode, SubscribeDoneCode,
 )
@@ -236,10 +236,13 @@ class _SubgroupSender:
         self.priority = priority
         self.header = None
         self.stream_id = None
+        # The peer stopped this group's stream (§11.3.2: not reopened).
+        self.stopped = False
 
     def new_group(self, group_id: int) -> None:
         """End the open stream; the next object starts `group_id`."""
         self.end_stream()
+        self.stopped = False
         self.header = self.session.subgroup_header(
             track_alias=self.track_alias,
             group_id=group_id,
@@ -277,26 +280,41 @@ class _SubgroupSender:
         """Write one object; bytes written, 0 when the window excludes
         it."""
         sub = self.sub
-        if not (sub.forward and sub.window is _UNFILTERED) and not sub.passes(
+        if self.stopped or not (
+                sub.forward and sub.window is _UNFILTERED) and not sub.passes(
                 self.header.group_id, object_id):
             return 0
         session = self.session
-        if self.stream_id is None:
-            self.stream_id = await session.open_uni_stream()
-            self.track._stream_count += 1
-            self.track._stream_opened(self.sub)
-            self.sub.senders.add(self)
-            self.header.first_object = object_id == self.subgroup_id
+        try:
+            if self.stream_id is None:
+                self.stream_id = await session.open_uni_stream()
+                self.track._stream_count += 1
+                self.track._stream_opened(self.sub)
+                self.sub.senders.add(self)
+                self.header.first_object = object_id == self.subgroup_id
+                if session._close_err is not None:
+                    raise asyncio.CancelledError
+                await session.stream_write_drain(
+                    self.stream_id, self.header.serialize().data)
+            data = self.header.next_object_bytes(
+                payload, extensions, ObjectStatus.NORMAL, object_id)
             if session._close_err is not None:
                 raise asyncio.CancelledError
-            await session.stream_write_drain(
-                self.stream_id, self.header.serialize().data)
-        data = self.header.next_object_bytes(
-            payload, extensions, ObjectStatus.NORMAL, object_id)
-        if session._close_err is not None:
-            raise asyncio.CancelledError
-        await session.stream_write_drain(self.stream_id, data)
+            await session.stream_write_drain(self.stream_id, data)
+        except MOQTStreamStopped:
+            self.stop()
+            return 0
         return len(data)
+
+    def stop(self) -> None:
+        """The peer stopped the stream, which the session has reset: skip
+        the rest of the group."""
+        self.stopped = True
+        if self.stream_id is None:
+            return
+        self.stream_id = None
+        self.sub.senders.discard(self)
+        self.track._stream_closed(self.sub)
 
     def reset(self) -> None:
         """Abandon the open stream: a RESET tells the subscriber it
@@ -1646,8 +1664,13 @@ class PublishedTrack(Track):
                 else:
                     if session._close_err is not None:
                         raise asyncio.CancelledError
-                    await session.stream_write_drain(sender.stream_id, data)
-                    obj_bytes = len(data)
+                    try:
+                        await session.stream_write_drain(sender.stream_id,
+                                                         data)
+                        obj_bytes = len(data)
+                    except MOQTStreamStopped:
+                        sender.stop()
+                        obj_bytes = 0
                 cur_obj_id += self.num_subgroups
                 if obj_bytes:
                     local_sent += 1
@@ -2136,8 +2159,13 @@ class VideoTrack(PublishedTrack):
                 else:
                     if session._close_err is not None:
                         raise asyncio.CancelledError
-                    await session.stream_write_drain(sender.stream_id, data)
-                    obj_bytes = len(data)
+                    try:
+                        await session.stream_write_drain(sender.stream_id,
+                                                         data)
+                        obj_bytes = len(data)
+                    except MOQTStreamStopped:
+                        sender.stop()
+                        obj_bytes = 0
                 cur_obj_id += self.num_subgroups
                 if obj_bytes:
                     local_sent += 1
