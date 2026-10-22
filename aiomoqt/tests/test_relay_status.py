@@ -4,9 +4,8 @@ import asyncio
 import contextlib
 import json
 import os
-import time
-
 import sys
+import time
 
 import pytest
 
