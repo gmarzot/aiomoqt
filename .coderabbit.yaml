@@ -6,8 +6,6 @@ reviews:
   auto_review:
     enabled: true
     drafts: true
-  path_filters:
-    - "!perf/baselines/**"
   path_instructions:
     - path: "aiomoqt/**/*.py"
       instructions: >-

@@ -27,8 +27,6 @@ uv pip install aiomoqt    # or: pip install aiomoqt
 
 Pure Python. `aiopquic` (the QUIC transport) installs as a binary wheel automatically. Prebuilt wheels exist for Linux (glibc 2.34+, RHEL 9 / Ubuntu 22.04+) and macOS arm64; other platforms build `aiopquic` from sdist and need a C toolchain — see [aiopquic install notes](https://github.com/gmarzot/aiopquic#installation).
 
-For a clean, uv-managed `.venv`, run `./bootstrap_python.sh`.
-
 HLS/DASH ingest (`pub_media --input`) needs PyAV, an optional extra:
 `uv pip install 'aiomoqt[media]'`. Without it, `--input` exits with that hint.
 
