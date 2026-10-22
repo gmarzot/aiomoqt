@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Relay: status files are encoded with json's C encoder.
+- Relay: status bit rates are integers and milliseconds carry two decimals.
 
 ## v0.13.1
 

@@ -2928,7 +2928,7 @@ class _Status:
             # a session the relay mostly receives on.
             if id(s) in subs:
                 sent, lost = sent + d[2], lost + d[3]
-            rtt = pq.get("rtt") / 1000 if pq.get("rtt") else None
+            rtt = round(pq.get("rtt") / 1000, 2) if pq.get("rtt") else None
             if rtt is not None:
                 rtts.append(rtt)
             role = "+".join(r for r, ids in (("pub", pubs), ("sub", subs))

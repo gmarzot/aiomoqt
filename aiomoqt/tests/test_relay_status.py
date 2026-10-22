@@ -496,3 +496,99 @@ async def test_status_loop_sends_publishers_no_requests(
         assert space["namespace"] == _NS and space["format"] is None
         assert ns not in relay._catalogs
         assert pub._close_err is None
+
+
+# -- dashboard schema ----------------------------------------------------
+
+_SCHEMA = os.path.join(os.path.dirname(__file__), "vectors",
+                       "relay_status_schema.json")
+# Keys that are data (track ids, drafts, interfaces), not schema.
+_DATA_KEYED = ("track_history", "by_draft", "by_transport")
+
+
+_KINDS = ((dict, "object"), (list, "array"), (str, "string"), (bool, "bool"),
+          (int, "int"), (float, "float"))
+
+
+def _schema(obj, path="", out=None):
+    """{path: sorted non-null JSON types}; list items share one path."""
+    out = {} if out is None else out
+    kinds = out.setdefault(path, [])
+    kind = next((name for t, name in _KINDS if isinstance(obj, t)), None)
+    if kind and kind not in kinds:
+        kinds.append(kind)
+        kinds.sort()
+    if isinstance(obj, dict):
+        wild = path.rsplit(".", 1)[-1] in _DATA_KEYED
+        for k, v in obj.items():
+            _schema(v, f"{path}.{'*' if wild else k}", out)
+    elif isinstance(obj, list):
+        for v in obj:
+            _schema(v, f"{path}[]", out)
+    return out
+
+
+def _parent(path):
+    return path[:-2] if path.endswith("[]") else path.rsplit(".", 1)[0]
+
+
+@requires_certs
+async def test_snapshot_schema_unchanged(relay_tables, tmp_path):
+    # Keys, nesting and types as the dashboard reads them; only a count or a
+    # bit rate may turn from float to int.
+    async with _relay(_PORT + 8, True, 18) as connect:
+        pub = await connect()
+        PublishedTrack(pub, namespace=_NS, trackname="video",
+                       object_size=200, group_size=10, rate=200).attach()
+        await pub.publish_namespace(namespace=_NS, wait_response=True)
+        sub = await connect()
+        await SubscribedTrack(sub, _NS, "video").subscribe(timeout=5)
+        status = relay._Status(str(tmp_path / "status.json"),
+                               {"started": time.time()}, [connect.handle])
+        loop = asyncio.get_running_loop()
+        status.snapshot(loop.time(), time.time())
+        await asyncio.sleep(0.3)
+        snap = status.snapshot(loop.time(), time.time())
+    got = {"status": _schema(snap), "platform": _schema(status.platform)}
+    if os.environ.get("AIOMOQT_REGEN_SCHEMA"):
+        with open(_SCHEMA, "w") as f:
+            json.dump(got, f, indent=1, sort_keys=True)
+    with open(_SCHEMA) as f:
+        want = json.load(f)
+    for doc in want:
+        old, new = want[doc], got[doc]
+        # Host-dependent subtrees (disks, interfaces) may be empty here.
+        for a, b in ((old, new), (new, old)):
+            for path in a:
+                if path and _parent(path) in b and b[_parent(path)]:
+                    assert path in b, f"{doc}{path}"
+        for path in set(old) & set(new):
+            o, n = old[path], new[path]
+            if o and n and o != n:
+                widened = set(n) - set(o) == {"int"} or set(o) - set(n) == {"float"}
+                assert widened and path.rstrip("[]").endswith(_INT_OK), (doc, path, o, n)
+    for doc, obj in (("status", snap), ("platform", status.platform)):
+        _assert_rounded(obj, doc)
+
+
+_INT_OK = ("bps", "Bps", "subscribers", "subscriptions", "tracks", "sessions")
+
+
+def _assert_rounded(obj, path):
+    """Bit rates are ints and milliseconds have at most 2 decimals."""
+    items = (obj.items() if isinstance(obj, dict)
+             else enumerate(obj) if isinstance(obj, list) else ())
+    for k, v in items:
+        key = path if isinstance(k, int) else f"{path}.{k}"
+        if isinstance(v, (dict, list)):
+            _assert_rounded(v, key)
+        elif isinstance(v, float):
+            assert not key.endswith(("bps", "Bps")), key
+            if "_ms" in key:
+                assert v == round(v, 2), (key, v)
+
+
+def test_loop_lag_summary_is_rounded():
+    lag = relay_status.LoopLag()
+    lag.samples.extend([0.0012345, 0.0098765])
+    assert lag.summary() == {"p50": 1.23, "p99": 9.88, "max": 9.88}
