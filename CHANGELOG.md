@@ -3,6 +3,8 @@
 ## Unreleased
 
 - `PublishedTrack(track_properties=)`: top-level Track Properties on PUBLISH, SUBSCRIBE_OK, FETCH_OK and the TRACK_STATUS reply, beside `immutable_properties`; a type in both is refused.
+- `SubscribedTrack` keeps the Track Properties of its SUBSCRIBE_OK or PUBLISH (`track_properties`, `immutable_properties`, merged `properties`, `property_duplicates`); `take_track_properties()` takes a FETCH_OK's; `MediaSubscriber.properties(name)`.
+- `session.subscribe(on_reply=)`: called with the SUBSCRIBE_OK as it is parsed, before the track's first object.
 
 ## v0.13.1
 

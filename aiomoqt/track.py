@@ -27,7 +27,7 @@ Usage:
 import asyncio
 import time
 from enum import IntEnum
-from typing import Callable, Dict, Optional, Union
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 from .types import (
     FetchType, MOQTRequestError, ParamType, FilterType,
@@ -48,7 +48,7 @@ from .messages.params import (
 )
 from .context import is_draft16_or_later
 from .messages.fetch import _is_joining
-from .utils.buffer import Buffer
+from .utils.buffer import Buffer, BufferReadError
 from .utils.format import fmt_bps, fmt_rate
 from .utils.logger import get_logger
 
@@ -95,6 +95,42 @@ def _checked_immutable(props, what: str = "Immutable Properties"
     except Exception as e:
         raise ValueError(str(e)) from None
     return props
+
+
+def _reply_properties(msg) -> Optional[Dict[int, Any]]:
+    """Track Properties of a SUBSCRIBE_OK, PUBLISH, FETCH_OK or REQUEST_OK."""
+    props = getattr(msg, 'track_extensions', None)
+    if props is None:
+        props = getattr(msg, 'track_properties', None)
+    return props
+
+
+def merge_track_properties(props: Optional[Dict[int, Any]], vi64: bool
+                           ) -> Tuple[Dict[int, Any],
+                                      Optional[Dict[int, Any]], frozenset]:
+    """(merged view, Immutable Properties, types seen more than once) of
+    received Track Properties. The merged view unwraps Immutable
+    Properties (0x0B) beside the top-level ones."""
+    if not props:
+        return {}, None, frozenset()
+    merged = dict(props)
+    dups = set(getattr(props, 'duplicates', ()))
+    raw = merged.pop(MOQTMessage.IMMUTABLE_PROPERTIES, None)
+    if raw is None:
+        return merged, None, frozenset(dups)
+    raw = bytes(raw)
+    try:
+        inner = MOQTMessage._extensions_decode(
+            Buffer(data=raw, vi64=vi64), with_length=False,
+            buf_end=len(raw), delta=True, lenient=False) or {}
+    except (BufferReadError, RuntimeError, ValueError):
+        # Unreachable for a reply the codec accepted (§12.7 check).
+        return merged, None, frozenset(dups)
+    dups.update(getattr(inner, 'duplicates', ()))
+    dups.update(merged.keys() & inner.keys())
+    for ptype, value in inner.items():
+        merged.setdefault(ptype, value)
+    return merged, dict(inner), frozenset(dups)
 
 
 class TrackState(IntEnum):
@@ -1784,7 +1820,25 @@ class SubscribedTrack(Track):
         # Largest Location the publisher reported in SUBSCRIBE_OK or
         # PUBLISH, as (group, object); None when it reported none.
         self.largest: Optional[tuple] = None
+        # Track Properties as received; see take_track_properties().
+        self.track_properties: Optional[Dict[int, Any]] = None
+        self.immutable_properties: Optional[Dict[int, Any]] = None
+        self.properties: Dict[int, Any] = {}
+        self.property_duplicates: frozenset = frozenset()
         self._done_event = asyncio.Event()
+
+    def take_track_properties(self, msg) -> None:
+        """Keep the Track Properties of a SUBSCRIBE_OK, PUBLISH or
+        FETCH_OK for this track: `track_properties` as received,
+        `immutable_properties` decoded from 0x0B, `properties` both
+        merged, `property_duplicates` the types seen more than once."""
+        props = _reply_properties(msg)
+        merged, immutable, dups = merge_track_properties(
+            props, self.session._profile.vi64)
+        self.track_properties = dict(props) if props else None
+        self.immutable_properties = immutable
+        self.properties = merged
+        self.property_duplicates = dups
 
     async def subscribe(self, timeout: float = 30.0,
                         forward: int = 1,
@@ -1833,6 +1887,7 @@ class SubscribedTrack(Track):
                 parameters=params,
                 wait_response=True,
                 on_object=self.on_object,
+                on_reply=self.take_track_properties,
             )
             self.largest = _reported_largest(ok)
             # Publisher's SUBSCRIBE_OK alias is authoritative (the
@@ -1918,6 +1973,7 @@ class SubscribedTrack(Track):
             print(f"  Discovered: {self.fqtn}")
 
         self.largest = _reported_largest(pub_msg)
+        self.take_track_properties(pub_msg)
         # Register track_alias so incoming data streams pass admission.
         if hasattr(pub_msg, 'track_alias'):
             self.track_alias = pub_msg.track_alias
