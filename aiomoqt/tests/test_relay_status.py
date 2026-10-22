@@ -532,6 +532,16 @@ def _parent(path):
     return path[:-2] if path.endswith("[]") else path.rsplit(".", 1)[0]
 
 
+def _under_empty_list(path, schema):
+    """`path` lies in list items that `schema` never saw."""
+    i = path.find("[]")
+    while i != -1:
+        if path[:i + 2] not in schema:
+            return True
+        i = path.find("[]", i + 2)
+    return False
+
+
 @requires_certs
 async def test_snapshot_schema_unchanged(relay_tables, tmp_path):
     # Keys, nesting and types as the dashboard reads them; only a count or a
@@ -557,10 +567,11 @@ async def test_snapshot_schema_unchanged(relay_tables, tmp_path):
         want = json.load(f)
     for doc in want:
         old, new = want[doc], got[doc]
-        # Host-dependent subtrees (disks, interfaces) may be empty here.
+        # Host-dependent lists (disks, interfaces) may be empty on either side.
         for a, b in ((old, new), (new, old)):
             for path in a:
-                if path and _parent(path) in b and b[_parent(path)]:
+                if path and _parent(path) in b and b[_parent(path)] \
+                        and not _under_empty_list(path, b):
                     assert path in b, f"{doc}{path}"
         for path in set(old) & set(new):
             o, n = old[path], new[path]
