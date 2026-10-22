@@ -238,11 +238,14 @@ class _SubgroupSender:
         self.stream_id = None
         # The peer stopped this group's stream (§11.3.2: not reopened).
         self.stopped = False
+        # The open stream lacks objects of the window: reset, not FIN.
+        self.short = False
 
     def new_group(self, group_id: int) -> None:
         """End the open stream; the next object starts `group_id`."""
         self.end_stream()
         self.stopped = False
+        self.short = False
         self.header = self.session.subgroup_header(
             track_alias=self.track_alias,
             group_id=group_id,
@@ -253,6 +256,9 @@ class _SubgroupSender:
 
     def end_stream(self) -> None:
         if self.stream_id is None:
+            return
+        if self.short:
+            self.reset()
             return
         if self.subgroup_id == 0 and not self.sub.excludes_end(
                 self.header.group_id, self.track.group_size):
@@ -296,6 +302,7 @@ class _SubgroupSender:
                     raise asyncio.CancelledError
                 await session.stream_write_drain(
                     self.stream_id, self.header.serialize().data)
+                await self._send_head(object_id)
             data = self.header.next_object_bytes(
                 payload, extensions, ObjectStatus.NORMAL, object_id)
             if session._close_err is not None:
@@ -305,6 +312,32 @@ class _SubgroupSender:
             self.stop()
             return 0
         return len(data)
+
+    async def _send_head(self, object_id: int) -> None:
+        """A stream opening past the first object the window admits in
+        its group (resumed mid-group) first carries the earlier objects
+        from the history; lacking any, it is marked short (§11.3.2)."""
+        group_id = self.header.group_id
+        step = self.track.num_subgroups
+        first = max(self.sub.window[0], (group_id, 0))[1]
+        first += (self.subgroup_id - first) % step
+        missing = range(first, object_id, step)
+        if not missing:
+            return
+        history = self.track._history
+        held = {} if history is None else history._held(
+            (group_id, first), (group_id, object_id - 1))
+        recs = [held.get((group_id, oid)) for oid in missing]
+        if any(r is None or (r[2] or 0) != self.subgroup_id for r in recs):
+            self.short = True
+            return
+        session = self.session
+        for _, oid, _, payload, exts, _ in recs:
+            if callable(exts):
+                exts = exts(session)
+            await session.stream_write_drain(
+                self.stream_id, self.header.next_object_bytes(
+                    payload, exts, ObjectStatus.NORMAL, oid))
 
     def stop(self) -> None:
         """The peer stopped the stream, which the session has reset: skip
@@ -1804,7 +1837,8 @@ class SubscribedTrack(Track):
                         start_object: int = 0,
                         end_group: int = 0,
                         priority: Optional[int] = None,
-                        group_order: Optional[GroupOrder] = None):
+                        group_order: Optional[GroupOrder] = None,
+                        location_filter: Optional[LocationFilter] = None):
         """Subscribe to the track.
 
         Auto-routed on trackname presence:
@@ -1825,6 +1859,8 @@ class SubscribedTrack(Track):
             priority: subscriber priority 0-255, lower = more urgent
                 (§7.1). None omits the parameter and takes the default.
             group_order: delivery order across groups. None omits it.
+            location_filter: d20+ Location Filter, sent in place of the
+                filter_type form on a direct SUBSCRIBE.
         """
         if self.trackname is not None:
             params = {}
@@ -1843,6 +1879,7 @@ class SubscribedTrack(Track):
                 parameters=params,
                 wait_response=True,
                 on_object=self.on_object,
+                location_filter=location_filter,
             )
             self.largest = _reported_largest(ok)
             # Publisher's SUBSCRIBE_OK alias is authoritative (the
