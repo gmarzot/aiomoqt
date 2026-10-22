@@ -8,6 +8,8 @@
 - `utils.timing`: one capture-time resolver (draft-frindell-moq-timestamp-00 on a wall-clock track, then LOC TIMESTAMP without a LOC TIMESCALE, then bench 0x20); `SubscribedTrack.timing` holds the track's context.
 - sub_bench, loopback_bench, adaptive_bench, load_sim, the agent reader and sub_media `--analyze`/`--report`/`--inspect` take latency from the resolver and report its source per track.
 - sub_media `--analyze`: a LOC TIMESCALE seen on any object (or as a Track Property) holds for the track, so `--loc-timescale` streams no longer mix µs and ticks.
+- Malformed draft-frindell-moq-timestamp properties (duplicates, wrong scope, TIMESCALE missing or 0, TIMESTAMP_ORIGIN without CLOCK_ID, a mapping that is not four integers, a timestamp outside 0..2^64-1) cancel the subscription (MOQT §12.1); `SubscribedTrack(timestamp_errors='report')` and `--timestamp-errors report` on sub_bench, loopback_bench and sub_media keep receiving and count them.
+- Key-Value-Pair blocks decoded in Python (control messages, datagrams, FETCH) mark repeated types in `KeyValuePairs.duplicates`.
 
 ## v0.13.1
 

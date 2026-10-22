@@ -264,9 +264,11 @@ class LocTrackSubscriber(SubscribedTrack):
                  on_frame: Optional[Callable] = None,
                  auth_token: Optional[bytes] = None,
                  on_arrival: Optional[Callable] = None,
-                 loc_bare: bool = False):
+                 loc_bare: bool = False,
+                 timestamp_errors: str = 'cancel'):
         super().__init__(session, namespace, trackname,
-                         on_object=self._on_object, auth_token=auth_token)
+                         on_object=self._on_object, auth_token=auth_token,
+                         timestamp_errors=timestamp_errors)
         self.on_frame = on_frame
         self.on_arrival = on_arrival
         self.loc_bare = loc_bare

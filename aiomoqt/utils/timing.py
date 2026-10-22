@@ -152,14 +152,9 @@ class TrackTiming:
         """The object's timestamp in ticks (§5), None when it has none.
         Assumes a declared track; raises TimestampMalformed."""
         ots = None
-        if exts:
-            if not TIMING_IDS.isdisjoint(exts):
-                check_object_properties(exts)
-                ots = exts.get(OBJECT_TIMESTAMP)
-            dups = getattr(exts, 'duplicates', None)
-            if dups and OBJECT_TIMESTAMP in dups:
-                raise TimestampMalformed(
-                    "OBJECT_TIMESTAMP appears more than once")
+        if exts and not TIMING_IDS.isdisjoint(exts):
+            check_object_properties(exts)
+            ots = exts.get(OBJECT_TIMESTAMP)
         m = self.mapping
         if m is not None:
             ts = m[1] + (group_id - m[0]) * m[2] + object_id * m[3]
@@ -184,9 +179,26 @@ class TrackTiming:
 
 
 def check_object_properties(exts: Dict[int, Any]) -> None:
-    """§3: no Track-scope timing property on an object."""
+    """§3: no Track-scope timing property on an object, and
+    OBJECT_TIMESTAMP at most once (seen only where the codec marks
+    duplicates: datagrams and FETCH; subgroup objects are decoded by
+    aiopquic, which keeps the last)."""
     for ptype in TRACK_IDS.intersection(exts):
         raise TimestampMalformed(f"{_name(ptype)} as an Object Property")
+    dups = getattr(exts, 'duplicates', None)
+    if dups and OBJECT_TIMESTAMP in dups:
+        raise TimestampMalformed("OBJECT_TIMESTAMP appears more than once")
+
+
+def check_object(timing: Optional['TrackTiming'], group_id: int,
+                 object_id: int, exts: Optional[Dict[int, Any]]) -> None:
+    """Raise TimestampMalformed when an object breaks §3-§5 on a track
+    with this timing context."""
+    if timing is not None and timing.timescale is not None:
+        timing.timestamp(group_id, object_id, exts)
+    elif exts and not TIMING_IDS.isdisjoint(exts):
+        check_object_properties(exts)
+        raise TimestampMalformed("OBJECT_TIMESTAMP without TIMESCALE")
 
 
 def capture_time_us(timing: Optional[TrackTiming], group_id: Optional[int],

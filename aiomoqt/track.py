@@ -51,7 +51,9 @@ from .messages.fetch import _is_joining
 from .utils.buffer import Buffer, BufferReadError
 from .utils.format import fmt_bps, fmt_rate
 from .utils.logger import get_logger
-from .utils.timing import TimestampMalformed, TrackTiming
+from .utils.timing import (
+    TIMING_IDS, TimestampMalformed, TrackTiming, check_object,
+)
 
 logger = get_logger(__name__)
 
@@ -1803,15 +1805,26 @@ class SubscribedTrack(Track):
 
     Handles namespace subscription, track discovery via PUBLISH messages,
     and data reception.
+
+    Timing properties (draft-frindell-moq-timestamp-00) that break its
+    rules make the track malformed: with `timestamp_errors='cancel'`
+    (default) the subscription is cancelled (MOQT §12.1) and `malformed`
+    says why; 'report' delivers everything and leaves the judgement to
+    the consumer (`timing_error`, utils.timing).
     """
 
     def __init__(self, session, namespace: str, trackname: str = None,
                  on_object: Optional[Callable] = None,
                  report_interval: float = 5.0,
                  auth_token: Optional[bytes] = None,
-                 on_done: Optional[Callable] = None):
+                 on_done: Optional[Callable] = None,
+                 timestamp_errors: str = 'cancel'):
+        if timestamp_errors not in ('cancel', 'report'):
+            raise ValueError(f"timestamp_errors {timestamp_errors!r}")
         super().__init__(session, namespace, trackname)
         self.on_object = on_object
+        self.timestamp_errors = timestamp_errors
+        self.malformed: Optional[str] = None
         # Called with the PUBLISH_DONE that ends this subscription.
         self.on_done = on_done
         self.report_interval = report_interval
@@ -1852,6 +1865,41 @@ class SubscribedTrack(Track):
         except TimestampMalformed as e:
             self.timing.assign(TrackTiming())
             self.timing_error = str(e)
+
+    def _handler(self) -> Optional[Callable]:
+        """The object handler to register: on_object itself, or behind
+        the timing check when malformed timing cancels the track."""
+        if self.on_object is None:
+            return None
+        if self.timestamp_errors != 'cancel':
+            return self.on_object
+        return self._checked_object
+
+    def _checked_object(self, msg, *args) -> None:
+        if self.malformed is not None:
+            return
+        if self.timing_error is not None:
+            return          # cancelled once subscribe() has the alias
+        timing = self.timing
+        exts = msg.extensions
+        if timing.timescale is not None or (
+                exts and not TIMING_IDS.isdisjoint(exts)):
+            gid = getattr(msg, 'group_id', None)
+            try:
+                check_object(timing, args[2] if gid is None else gid,
+                             msg.object_id, exts)
+            except TimestampMalformed as e:
+                self._cancel_malformed(str(e))
+                return
+        self.on_object(msg, *args)
+
+    def _cancel_malformed(self, reason: str) -> None:
+        """MOQT §12.1: cancel the subscription and refuse its streams."""
+        if self.malformed is not None:
+            return
+        self.malformed = reason
+        self.session._malformed_track(self.track_alias, reason)
+        self._done_event.set()
 
     async def subscribe(self, timeout: float = 30.0,
                         forward: int = 1,
@@ -1899,7 +1947,7 @@ class SubscribedTrack(Track):
                 group_order=group_order,
                 parameters=params,
                 wait_response=True,
-                on_object=self.on_object,
+                on_object=self._handler(),
                 on_reply=self.take_track_properties,
             )
             self.largest = _reported_largest(ok)
@@ -1909,9 +1957,10 @@ class SubscribedTrack(Track):
                 self.track_alias = ok.track_alias
                 if self.on_object:
                     self.session.register_object_handler(
-                        self.track_alias, self.on_object)
+                        self.track_alias, self._handler())
             self._watch_done(getattr(ok, 'request_id', None))
             self.state = TrackState.SUBSCRIBED
+            self._check_track_timing()
             logger.info(f"Track: subscribed (direct) to {self.fqtn}")
             return
 
@@ -1994,7 +2043,7 @@ class SubscribedTrack(Track):
                 pub_msg.track_alias] = pub_msg.request_id
             if self.on_object:
                 self.session.register_object_handler(
-                    self.track_alias, self.on_object)
+                    self.track_alias, self._handler())
 
         logger.info(f"Track: PUBLISH_OK {self.fqtn} "
                     f"alias={self.track_alias} forward={forward}")
@@ -2002,7 +2051,16 @@ class SubscribedTrack(Track):
 
         self._watch_done(pub_msg.request_id)
         self.state = TrackState.SUBSCRIBED
+        self._check_track_timing()
         logger.info(f"Track: subscribed to {self.fqtn}")
+
+    def _check_track_timing(self) -> None:
+        if self.timing_error is None:
+            return
+        logger.warning(f"Track: {self.fqtn}: malformed timing properties: "
+                       f"{self.timing_error}")
+        if self.timestamp_errors == 'cancel':
+            self._cancel_malformed(self.timing_error)
 
     def _watch_done(self, request_id) -> None:
         """Record this subscription's PUBLISH_DONE (§10.11) and release
@@ -2035,6 +2093,9 @@ class SubscribedTrack(Track):
                 if not fut.done():
                     fut.cancel()
         self.state = TrackState.CLOSED
+        if self.malformed is not None:
+            self.completed = False
+            return
         if self.publish_done is not None:
             code = getattr(self.publish_done, 'status_code', 0)
             self.completed = code in (SubscribeDoneCode.TRACK_ENDED,

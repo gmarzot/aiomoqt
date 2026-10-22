@@ -17,6 +17,7 @@ from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
 from aiomoqt.track import PublishedTrack, SubscribedTrack
 from aiomoqt.types import ForwardingPreference
+from aiomoqt.utils import cli as _cli
 from aiomoqt.utils import wait_cond_timeout
 from aiomoqt.utils.logger import set_log_level
 from aiomoqt.tools.sub_bench import BenchReporter
@@ -126,6 +127,7 @@ def parse_args():
     parser.add_argument(
         '-?', '--help', action='help',
         help='Show this help message and exit')
+    _cli.add_timestamp_checking(parser)
     args = parser.parse_args()
     if args.datagram and not args.quic:
         parser.error("-D/--datagram requires -Q (raw QUIC); "
@@ -240,6 +242,7 @@ async def run_subscriber(args, stats):
                 namespace="aiomoqt",
                 trackname="track",
                 on_object=stats.on_object,
+                timestamp_errors=args.timestamp_errors,
             )
             stats.stats.timing = track.timing
             # Loopback server does not send PUBLISH; use direct SUBSCRIBE.

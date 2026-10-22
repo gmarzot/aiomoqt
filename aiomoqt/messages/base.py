@@ -28,6 +28,13 @@ BUF_SIZE = 4 * 1024  # 4KB buffer size for messages
 from aiopquic.exceptions import StreamUnderflow as MOQTUnderflow  # noqa: E402
 
 
+class KeyValuePairs(dict):
+    """A decoded Key-Value-Pair block in which some Type appeared more
+    than once; the dict keeps the last value of each, `duplicates` names
+    them."""
+    __slots__ = ('duplicates',)
+
+
 @dataclass(frozen=True, slots=True)
 class AuthTokenRef:
     """An AUTHORIZATION TOKEN that operates on the receiver's token cache
@@ -343,6 +350,7 @@ class MOQTMessage:
                 return None
 
         exts = {}
+        dups = None
         prev = 0
         while buf.tell() < exts_end:
             kvp_start = buf.tell()
@@ -422,8 +430,13 @@ class MOQTMessage:
                     f"exts_end={exts_end} kvp_start={kvp_start} "
                     f"ext_id=0x{ext_id:x}"
                 )
+            if ext_id in exts:
+                dups = {ext_id} if dups is None else dups | {ext_id}
             exts[ext_id] = ext_value
 
+        if dups is not None:
+            exts = KeyValuePairs(exts)
+            exts.duplicates = frozenset(dups)
         return exts if exts else None
           
     @staticmethod

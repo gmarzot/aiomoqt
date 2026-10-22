@@ -323,7 +323,8 @@ class MediaSubscriber:
     sees every media-track object first (see LocTrackSubscriber);
     on_catalog(catalog) fires on every independent catalog or applied
     delta. `loc_bare` expects LOC payloads without the Private
-    Properties block. A media track's Track Properties are its
+    Properties block. `timestamp_errors` is each media track's
+    SubscribedTrack policy. A media track's Track Properties are its
     subscriber's (`tracks[name]`); `properties(name)` is the merged view.
     """
 
@@ -333,10 +334,12 @@ class MediaSubscriber:
                  track_filter: Optional[Callable] = None,
                  discover: bool = False,
                  on_arrival: Optional[Callable] = None,
-                 loc_bare: bool = False):
+                 loc_bare: bool = False,
+                 timestamp_errors: str = 'cancel'):
         self.session = session
         self.namespace = namespace
         self.loc_bare = loc_bare
+        self.timestamp_errors = timestamp_errors
         # Treat `namespace` as a prefix and resolve it to the namespace
         # actually being published under it (§9.4), so a subscriber can
         # find a broadcast whose name it was never told.
@@ -490,7 +493,8 @@ class MediaSubscriber:
                           self.on_frame and self.on_frame(_n, f, gid, oid)),
                 on_arrival=(lambda m, rx, gid, sg, f, _n=name:
                             self.on_arrival
-                            and self.on_arrival(_n, m, rx, gid, sg, f)))
+                            and self.on_arrival(_n, m, rx, gid, sg, f)),
+                timestamp_errors=self.timestamp_errors)
             namespace = entry.namespace or self.namespace
             if init is not None:
                 sub = LocmafTrackSubscriber(self.session, namespace, name,

@@ -121,6 +121,7 @@ def parse_args():
                              'rows as CSV to PATH (- = stdout)')
     _cli.add_run(parser, duration=30)
     _cli.add_session(parser, keepalive=True)
+    _cli.add_timestamp_checking(parser)
     _cli.add_help(parser)
     args = parser.parse_args()
     if args.analyze and args.pipe:
@@ -436,6 +437,7 @@ async def run(args):
         sub = MediaSubscriber(
             session, args.namespace, discover=args.discover,
             track_filter=_select, loc_bare=args.loc_bare,
+            timestamp_errors=args.timestamp_errors,
             on_catalog=((lambda c: _status(c.to_json(indent=2)))
                         if args.show_catalog else None))
         writers = (None if args.analyze
