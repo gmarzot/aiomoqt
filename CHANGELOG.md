@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- pub_media: the stats line reports frames shed per relay with one relay too.
 - PublishedTrack: a SUBSCRIBE, PUBLISH_OK or update that finds the peer's fan-out lane stopped replaces it instead of ignoring the duplicate.
 - Fan-out: a lane whose write raises logs a warning with the track and peer, resets the open group and resumes at the next group; cancellation still ends it.
 - Fan-out: a group reset while its subgroup write is suspended (PUBLISH_OK FORWARD=0 racing the first header) abandons that write instead of killing the peer's lane.
