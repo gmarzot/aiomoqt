@@ -649,6 +649,15 @@ class PublishedTrack(Track):
                       gate=lambda: sub.forward and sub.generating,
                       deadline=lambda: self._delivery_deadline(sub))
 
+    def _lane_stopped(self, sub) -> bool:
+        """True when production runs but this peer's lane task has ended."""
+        if (self._out is None or sub.delivery is None
+                or self._production is None or self._production.done()):
+            return False
+        lane = next((ln for ln in self._out.lanes
+                     if ln.delivery is sub.delivery), None)
+        return lane is None or lane.task.done()
+
     # Track Property delivery timeouts in ms (§8, §12.1-12.2); 0 sets none.
     object_delivery_timeout: int = 0
     subgroup_delivery_timeout: int = 0
@@ -968,6 +977,11 @@ class PublishedTrack(Track):
             logger.info(f"Track: {trigger} after PUBLISH_DONE — ignored")
             return
         if sub.generating:
+            if self._lane_stopped(sub):
+                logger.warning(f"Track: {self.fqtn} alias={sub.track_alias} "
+                               f"lane had stopped; replaced on {trigger}")
+                self._add_delivery(sub)
+                return
             logger.info(f"Track: ignoring duplicate {trigger}")
             return
         logger.info(f"Track: subscriber arrived via {trigger}, "

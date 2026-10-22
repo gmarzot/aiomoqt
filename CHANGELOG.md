@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- PublishedTrack: a SUBSCRIBE, PUBLISH_OK or update that finds the peer's fan-out lane stopped replaces it instead of ignoring the duplicate.
 - Fan-out: a lane whose write raises logs a warning with the track and peer, resets the open group and resumes at the next group; cancellation still ends it.
 - Fan-out: a group reset while its subgroup write is suspended (PUBLISH_OK FORWARD=0 racing the first header) abandons that write instead of killing the peer's lane.
 - Relay: a d20/d22 Relative Start subscription carries its Location Filter upstream; before d20 the relay fetches the current group's head from upstream, and a subgroup stream it cannot deliver whole from the subscription's start is reset, not FINed.

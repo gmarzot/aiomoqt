@@ -445,6 +445,23 @@ async def test_a_peer_returning_from_idle_swaps_its_lane_not_production():
     await production
 
 
+@pytest.mark.asyncio
+async def test_a_stopped_lane_is_replaced_when_forward_resumes():
+    a = _Session("a")
+    track = LocTrackPublisher(a, _NS, "video")
+    await track._start_generating(a, "PUBLISH_OK")
+    dead = track._out.lanes[0]
+    dead.task.cancel()
+    await _settle()
+    await track._start_generating(a, "REQUEST_UPDATE")
+    lane, = track._out.lanes
+    assert lane is not dead and not lane.task.done()
+    await track.send_frame(b"idr", key_frame=True, timestamp=1)
+    await track.finish()
+    await track._production
+    assert track._sub_for(a).delivery.objects_sent == 1
+
+
 def test_packaging_does_not_know_about_peers():
     # Fan-out belongs to the track and delivery layers, so any packager
     # gets it unchanged. broadcast.py composes sessions and is exempt.
