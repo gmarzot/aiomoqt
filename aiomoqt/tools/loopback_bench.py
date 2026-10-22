@@ -127,6 +127,7 @@ def parse_args():
     parser.add_argument(
         '-?', '--help', action='help',
         help='Show this help message and exit')
+    _cli.add_timestamps(parser)
     _cli.add_timestamp_checking(parser)
     args = parser.parse_args()
     if args.datagram and not args.quic:
@@ -184,13 +185,15 @@ async def _on_subscribe(session, msg, args):
         rate=args.rate,
         forwarding=(ForwardingPreference.DATAGRAM if args.datagram
                     else ForwardingPreference.SUBGROUP),
+        timestamps=args.timestamps,
     )
     # Suppress publisher periodic stats in loopback mode —
     # both sides print to the same terminal, causing interleaved output
     track._stats_header_printed = True  # skip header
     track._quiet = True  # checked in _generate_subgroup
     # d14 direct connection: respond with subscribe_ok and generate
-    ok = session.subscribe_ok(request_msg=msg)
+    ok = session.subscribe_ok(
+        request_msg=msg, track_properties=track._track_properties(session))
     track.track_alias = ok.track_alias
     track._generating = True
     await track.generate(session, ok.track_alias)

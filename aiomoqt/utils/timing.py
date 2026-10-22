@@ -7,7 +7,11 @@ frindell Track Properties are parsed once into a TrackTiming; a
 violation of the draft's rules raises TimestampMalformed (the track is
 malformed, MOQT §12.1).
 """
+import time
+from fractions import Fraction
+from math import gcd
 from typing import Any, Dict, Iterable, Optional, Tuple
+
 
 from .buffer import Buffer, BufferReadError
 
@@ -229,3 +233,80 @@ def capture_time_us(timing: Optional[TrackTiming], group_id: Optional[int],
             return ts, SOURCE_LOC
     ts = exts.get(BENCH_TIMESTAMP)
     return (ts, SOURCE_BENCH) if ts is not None else (None, None)
+
+
+TIMESTAMP_MODES = ('loc', 'frindell', 'both')
+
+
+class TimestampWriter:
+    """Timing properties for a generated track (`mode` loc, frindell or
+    both; loc is LOC TIMESTAMP 0x10 alone).
+
+    Paced (`rate` > 0): TIMESCALE in ticks that divide both a µs and the
+    object period exactly, TIMESTAMP_MAPPING (first group, wall clock at
+    start, group period, object period) and per object a zig-zag
+    OBJECT_TIMESTAMP correction of actual minus scheduled send time,
+    omitted when 0. Unpaced: Appendix A.2, TIMESCALE 1e6 and an explicit
+    OBJECT_TIMESTAMP per object. No CLOCK_ID or TIMESTAMP_ORIGIN: the
+    wall clock anchor is the mapping's Base Timestamp."""
+
+    def __init__(self, mode: str, rate: float, group_size: int,
+                 first_group: int, wall_us: int):
+        if mode not in TIMESTAMP_MODES:
+            raise ValueError(f"timestamps {mode!r}: one of "
+                             f"{', '.join(TIMESTAMP_MODES)}")
+        self.loc = mode in ('loc', 'both')
+        self.frindell = mode in ('frindell', 'both')
+        self.mapping: Optional[Tuple[int, int, int, int]] = None
+        self.timescale = 1_000_000
+        self.wall_us = wall_us
+        if rate > 0:
+            r = Fraction(rate).limit_denominator(1001)
+            p, q = r.numerator, r.denominator
+            self.timescale = 1_000_000 * p // gcd(1_000_000 * q, p)
+            om = self.timescale * q // p
+            self.mapping = (first_group, wall_us * (self.timescale
+                                                   // 1_000_000),
+                            om * group_size, om)
+        self._k = self.timescale // 1_000_000
+
+    def track_properties(self, vi64: bool) -> Dict[int, Any]:
+        if not self.frindell:
+            return {}
+        props: Dict[int, Any] = {TIMESCALE: self.timescale}
+        if self.mapping is not None:
+            props[TIMESTAMP_MAPPING] = encode_mapping(*self.mapping, vi64)
+        return props
+
+    def scheduled_us(self, group_id: int, object_id: int) -> Optional[int]:
+        """Wall-clock µs the mapping schedules an object at."""
+        m = self.mapping
+        if m is None:
+            return None
+        return (m[1] + (group_id - m[0]) * m[2]
+                + object_id * m[3]) // self._k
+
+    def next_group(self, now_us: int, at_least: int) -> int:
+        """The first group, at or after `at_least`, not yet due."""
+        m = self.mapping
+        if m is None:
+            return at_least
+        ahead = now_us * self._k - m[1]
+        due = m[0] + max(0, -(-ahead // m[2]))
+        return max(at_least, due)
+
+    def stamp(self, group_id: int, object_id: int) -> Dict[int, Any]:
+        """Object Properties for an object sent now."""
+        now = int(time.time() * 1_000_000)
+        exts: Dict[int, Any] = {LOC_TIMESTAMP: now} if self.loc else {}
+        if not self.frindell:
+            return exts
+        m = self.mapping
+        if m is None:
+            exts[OBJECT_TIMESTAMP] = now
+            return exts
+        c = now * self._k - (m[1] + (group_id - m[0]) * m[2]
+                             + object_id * m[3])
+        if c:
+            exts[OBJECT_TIMESTAMP] = (c << 1) ^ (c >> 63)
+        return exts

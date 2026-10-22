@@ -255,6 +255,19 @@ def add_split_role(p, mp=True):
                             'instead of one')
 
 
+def add_timestamps(p):
+    """Publisher timing properties for generated objects."""
+    g = p.add_argument_group('timestamp writing')
+    g.add_argument('--timestamps', choices=('loc', 'frindell', 'both'),
+                   default='loc',
+                   help='Object timestamps: loc = LOC TIMESTAMP 0x10 '
+                        '(default); frindell = draft-frindell-moq-'
+                        'timestamp Track Properties (TIMESCALE, and with '
+                        '-r a TIMESTAMP_MAPPING) plus OBJECT_TIMESTAMP '
+                        '(a correction when paced, explicit with -r 0); '
+                        'both = frindell plus 0x10')
+
+
 def add_timestamp_checking(p):
     """Subscriber policy for timing properties that break
     draft-frindell-moq-timestamp."""

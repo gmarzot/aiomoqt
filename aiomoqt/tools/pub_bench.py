@@ -86,6 +86,7 @@ The URL scheme selects the transport:
     _cli.add_publisher_media(parser)
     _cli.add_run(parser, interval=False)
     _cli.add_session(parser)
+    _cli.add_timestamps(parser)
     pub_mode = parser.add_mutually_exclusive_group()
     pub_mode.add_argument('--pub-ns', action='store_true',
                           help='Flow A: PUB_NS only, wait for SUBSCRIBE '
@@ -261,6 +262,7 @@ async def run(args):
                     resolution=args.video,
                     fps=args.rate or 30,
                     auth_token=args.auth_token.encode() or None,
+                    timestamps=args.timestamps,
                 )
             else:
                 track_class = (_EmptyTrack if args.no_objects
@@ -278,6 +280,7 @@ async def run(args):
                                 if args.datagram
                                 else ForwardingPreference.SUBGROUP),
                     auth_token=args.auth_token.encode() or None,
+                    timestamps=args.timestamps,
                 )
             if args.prefill:
                 track.prefill(args.prefill)
@@ -297,6 +300,7 @@ async def run(args):
                     num_subgroups=args.streams,
                     rate=args.rate,
                     auth_token=args.auth_token.encode() or None,
+                    timestamps=args.timestamps,
                 )
                 await second.publish(forward=args.forward)
             loop = asyncio.get_running_loop()

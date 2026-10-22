@@ -52,7 +52,8 @@ from .utils.buffer import Buffer, BufferReadError
 from .utils.format import fmt_bps, fmt_rate
 from .utils.logger import get_logger
 from .utils.timing import (
-    TIMING_IDS, TimestampMalformed, TrackTiming, check_object,
+    TIMING_IDS, TimestampMalformed, TimestampWriter, TrackTiming,
+    check_object,
 )
 
 logger = get_logger(__name__)
@@ -483,6 +484,11 @@ class PublishedTrack(Track):
     inside Immutable Properties (0x0B), in PUBLISH, SUBSCRIBE_OK and
     FETCH_OK from d16, and in the TRACK_STATUS reply from d18; d14
     carries no Track Properties. A type may appear in only one of them.
+
+    `timestamps` sets the generated objects' timing properties: 'loc'
+    (LOC TIMESTAMP 0x10, the default), 'frindell'
+    (draft-frindell-moq-timestamp-00, see utils.timing.TimestampWriter)
+    or 'both'. produce() tracks stamp their own objects.
     """
 
     # Stream mapping for produce() tracks.
@@ -512,7 +518,8 @@ class PublishedTrack(Track):
                  immutable_properties: Optional[
                      Dict[int, Union[int, bytes]]] = None,
                  track_properties: Optional[
-                     Dict[int, Union[int, bytes]]] = None):
+                     Dict[int, Union[int, bytes]]] = None,
+                 timestamps: str = 'loc'):
         # Before super(): Track.__init__ assigns track_alias/request_id/
         # state, which are properties over this list.
         self._subs = [_Subscription(session)]
@@ -528,6 +535,11 @@ class PublishedTrack(Track):
         self.immutable_properties = _checked_immutable(immutable_properties)
         self.track_properties = _checked_immutable(track_properties,
                                                    "Track Properties")
+        if timestamps not in ('loc', 'frindell', 'both'):
+            raise ValueError(f"timestamps {timestamps!r}")
+        self.timestamps = timestamps
+        # Anchored on first use: the first reply or production start.
+        self._ts_writer: Optional[TimestampWriter] = None
         both = set(self.track_properties or ()) & set(
             self.immutable_properties or ())
         if both:
@@ -821,6 +833,9 @@ class PublishedTrack(Track):
         if not session._profile.track_properties:
             return None
         props = dict(self.track_properties or ())
+        if self.timestamps != 'loc':
+            props.update(self._timestamp_writer().track_properties(
+                session._profile.vi64))
         if self.immutable_properties:
             buf = Buffer(capacity=BUF_SIZE, vi64=session._profile.vi64)
             MOQTMessage._extensions_encode(buf, self.immutable_properties,
@@ -828,6 +843,33 @@ class PublishedTrack(Track):
             props[MOQTMessage.IMMUTABLE_PROPERTIES] = buf.data_slice(
                 0, buf.tell())
         return props or None
+
+    def _timestamp_writer(self) -> TimestampWriter:
+        w = self._ts_writer
+        if w is None:
+            first = 0 if self._largest is None else self._largest[0] + 1
+            w = self._ts_writer = TimestampWriter(
+                self.timestamps, self.rate, self.group_size, first,
+                int(time.time() * 1_000_000))
+        return w
+
+    def _stamper(self) -> Optional[Callable]:
+        """Per-object properties for generated objects; None stamps LOC
+        TIMESTAMP inline."""
+        if self.timestamps == 'loc':
+            return None
+        return self._timestamp_writer().stamp
+
+    async def _await_schedule(self, group_id: int, object_id: int) -> None:
+        """Hold a paced frindell producer until its first object is due,
+        so on-schedule objects carry no correction."""
+        if self.timestamps == 'loc' or self.rate <= 0:
+            return
+        due = self._timestamp_writer().scheduled_us(group_id, object_id)
+        if due is not None:
+            lead = due / 1e6 - time.time()
+            if lead > 0:
+                await asyncio.sleep(lead)
 
     def attach(self, session=None) -> None:
         """Serve this track on a session without announcing it:
@@ -1509,6 +1551,9 @@ class PublishedTrack(Track):
         idle period restarts production on the same track, numbering on
         from the Largest group so no Location is published twice."""
         first_group = 0 if self._largest is None else self._largest[0] + 1
+        if self.timestamps != 'loc':
+            first_group = self._timestamp_writer().next_group(
+                int(time.time() * 1_000_000), first_group)
         if self.forwarding == ForwardingPreference.DATAGRAM:
             task = asyncio.create_task(
                 self._generate_datagrams(
@@ -1556,8 +1601,11 @@ class PublishedTrack(Track):
         prof = session._profile
         report = not getattr(self, '_quiet', False)
         sub = self._sub_for(session)
+        stamp = self._stamper()
 
         try:
+            await self._await_schedule(first_group, 0)
+            next_frame_time = time.monotonic()
             while True:
                 if cur_obj_id >= self.group_size:
                     group_id += 1
@@ -1573,8 +1621,9 @@ class PublishedTrack(Track):
                     group_id=group_id,
                     object_id=cur_obj_id,
                     publisher_priority=self.priority,
-                    extensions={
-                        LOC_TIMESTAMP: int(time.time() * 1_000_000)},
+                    extensions=(
+                        {LOC_TIMESTAMP: int(time.time() * 1_000_000)}
+                        if stamp is None else stamp(group_id, cur_obj_id)),
                     payload=payload,
                     end_of_group=(cur_obj_id == self.group_size - 1),
                 )
@@ -1664,10 +1713,13 @@ class PublishedTrack(Track):
         sub = self._sub_for(session)
         sender = _SubgroupSender(self, session, sub, track_alias,
                                  subgroup_id, priority)
+        stamp = self._stamper()
 
         local_sent = 0
 
         try:
+            await self._await_schedule(first_group, subgroup_id)
+            next_frame_time = time.monotonic()
             while True:
                 if sender.header is None or cur_obj_id >= self.group_size:
                     if barrier is not None and group_id >= first_group:
@@ -1688,7 +1740,9 @@ class PublishedTrack(Track):
                 seq_info = f"{group_id}.{cur_obj_id}".encode()
                 payload = (seq_info + b'|' + pad)[:self.object_size]
 
-                extensions = {LOC_TIMESTAMP: int(time.time() * 1_000_000)}
+                extensions = (
+                    {LOC_TIMESTAMP: int(time.time() * 1_000_000)}
+                    if stamp is None else stamp(group_id, cur_obj_id))
                 self._remember(group_id, cur_obj_id, payload, subgroup_id,
                                extensions)
                 data = sender.encode_open(cur_obj_id, payload, extensions)
@@ -2237,8 +2291,11 @@ class VideoTrack(PublishedTrack):
         i_pad = b'\x49' * self.i_frame_size  # 'I'
         p_pad = b'\x50' * self.p_frame_size  # 'P'
         b_pad = b'\x42' * self.b_frame_size  # 'B'
+        stamp = self._stamper()
 
         try:
+            await self._await_schedule(first_group, subgroup_id)
+            next_frame_time = time.monotonic()
             while True:
                 if sender.header is None or cur_obj_id >= self.group_size:
                     if barrier is not None and group_id >= first_group:
@@ -2268,8 +2325,9 @@ class VideoTrack(PublishedTrack):
                 payload = (seq_info + b'|'
                            + frame_pad)[:frame_size]
 
-                extensions = {
-                    LOC_TIMESTAMP: int(time.time() * 1_000_000)}
+                extensions = (
+                    {LOC_TIMESTAMP: int(time.time() * 1_000_000)}
+                    if stamp is None else stamp(group_id, cur_obj_id))
                 self._remember(group_id, cur_obj_id, payload, subgroup_id,
                                extensions)
                 data = sender.encode_open(cur_obj_id, payload, extensions)
