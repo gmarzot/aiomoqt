@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from aiomoqt import delivery as delivery_mod
 from aiomoqt.context import profile_for
 from aiomoqt.delivery import FanoutDelivery, StreamMapping, SubgroupDelivery
 from aiomoqt.fanout import FanoutPublisher
@@ -266,6 +267,43 @@ async def test_a_reset_during_a_header_drain_leaves_the_lane_writing():
     assert [w for w in s.writes if w[0] == second and w[1]] != []
     assert sent == [(1, 0), (1, 1)]
     assert d.objects_sent == 2
+    await fan.close()
+
+
+class _Failing(_Session):
+    """The first drained write raises."""
+
+    def __init__(self):
+        super().__init__()
+        self.failed = False
+
+    async def stream_write_drain(self, sid, data):
+        if not self.failed:
+            self.failed = True
+            raise RuntimeError("transport fault")
+        await super().stream_write_drain(sid, data)
+
+
+@pytest.mark.asyncio
+async def test_a_lane_survives_a_failed_write(caplog):
+    s = _Failing()
+    d = _delivery(s)
+    fan = FanoutDelivery()
+    fan.name = "fan/test/video"
+    lane = fan.add(d, joining=False)
+    delivery_mod.logger.addHandler(caplog.handler)
+    try:
+        await fan.write(0, 0, b"k0", group_start=True)
+        await fan.write(0, 1, b"p0")    # skipped: the lane waits for a group
+        await fan.write(1, 0, b"k1", group_start=True)
+        await _settle()
+    finally:
+        delivery_mod.logger.removeHandler(caplog.handler)
+    assert not lane.task.done()
+    assert d.objects_sent == 1 and d.largest == (1, 0)
+    assert s.resets == [s.opened[0]]
+    assert any("fan/test/video" in r.getMessage() and r.levelname == "WARNING"
+               for r in caplog.records)
     await fan.close()
 
 

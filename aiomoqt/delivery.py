@@ -328,8 +328,9 @@ class _Lane:
     """
 
     def __init__(self, delivery: SubgroupDelivery, queue_size: int,
-                 gate=None, on_sent=None, deadline=None):
+                 gate=None, on_sent=None, deadline=None, name: str = ""):
         self.delivery = delivery
+        self.name = name     # the track's, for logs
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=queue_size)
         self.shed = 0
         # Returns the peer's object delivery timeout in seconds, or None
@@ -395,36 +396,52 @@ class _Lane:
             item = await self.queue.get()
             if item is _STOP:
                 return
-            if item is _END_GROUP:
-                self.delivery.end_group()
-                self._truncated = False
-                continue
-            if item is _RESET_GROUP:
-                self._close_truncated()
+            try:
+                await self._handle(item)
+            except Exception:
+                # Cancellation (MOQTStreamStopped included) still ends the
+                # lane; anything else costs this peer the open group only.
+                logger.warning(
+                    f"Fanout: lane {self.name} alias="
+                    f"{self.delivery.track_alias} peer="
+                    f"{getattr(self.session, 'peer_address', None)} write "
+                    f"failed; resuming at the next group", exc_info=True)
                 self.need_group = True
-                continue
-            group_id, object_id, payload, extensions, group_start, born = item
-            if self.gate is not None and not self.gate():
-                # Forward State 0: send nothing, reset the open group, and
-                # resume only at a fresh group.
-                self._close_truncated()
-                self.need_group = True
-                continue
-            if self.need_group:
-                if not group_start:
+                try:
                     self._close_truncated()
-                    self.shed += 1
-                    continue
-                self.need_group = False
-                self._truncated = False
-            if self._late(group_id, born):
-                continue
-            sent = await self.delivery.write(group_id, object_id, payload,
-                                             extensions=extensions,
-                                             group_start=group_start)
-            if sent and self.on_sent is not None:
-                self.on_sent(group_id, object_id)
+                except Exception:
+                    self._truncated = True
 
+    async def _handle(self, item) -> None:
+        if item is _END_GROUP:
+            self.delivery.end_group()
+            self._truncated = False
+            return
+        if item is _RESET_GROUP:
+            self._close_truncated()
+            self.need_group = True
+            return
+        group_id, object_id, payload, extensions, group_start, born = item
+        if self.gate is not None and not self.gate():
+            # Forward State 0: send nothing, reset the open group, and
+            # resume only at a fresh group.
+            self._close_truncated()
+            self.need_group = True
+            return
+        if self.need_group:
+            if not group_start:
+                self._close_truncated()
+                self.shed += 1
+                return
+            self.need_group = False
+            self._truncated = False
+        if self._late(group_id, born):
+            return
+        sent = await self.delivery.write(group_id, object_id, payload,
+                                         extensions=extensions,
+                                         group_start=group_start)
+        if sent and self.on_sent is not None:
+            self.on_sent(group_id, object_id)
 
     def _late(self, group_id: int, born: float) -> bool:
         """§8: an object past the peer's delivery timeout is dropped; on a
@@ -459,6 +476,7 @@ class FanoutDelivery:
     def __init__(self, deliveries=(), *,
                  queue_size: int = LANE_QUEUE_DEFAULT):
         self.queue_size = queue_size
+        self.name = ""       # the track's, for logs
         self.lanes: list = []
         # Called as on_write(group_id, object_id, payload, extensions) for
         # each object, once, however many lanes there are.
@@ -475,7 +493,8 @@ class FanoutDelivery:
         """Attach another peer. `joining` holds it to the next group
         boundary, which is where a mid-stream arrival can start.
         `deadline()` gives its delivery timeout in seconds, or None."""
-        lane = _Lane(delivery, self.queue_size, gate, self._sent, deadline)
+        lane = _Lane(delivery, self.queue_size, gate, self._sent, deadline,
+                     self.name)
         lane.need_group = joining
         self.lanes.append(lane)
         return lane

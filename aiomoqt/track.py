@@ -635,6 +635,7 @@ class PublishedTrack(Track):
         boundary."""
         if self._out is None:
             self._out = FanoutDelivery()
+            self._out.name = self.fqtn
             self._out.on_write = self._on_produced
             self._out.on_sent = self._on_sent
         self._out.drop_session(sub.session)
