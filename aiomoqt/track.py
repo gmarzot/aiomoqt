@@ -69,15 +69,15 @@ def _largest_object_param(session, largest: tuple) -> dict:
     return {ParamType.LARGEST_OBJECT: buf.data_slice(0, buf.tell())}
 
 
-def _checked_immutable(props) -> Optional[Dict[int, Union[int, bytes]]]:
-    """Immutable Properties as given, refused when they could not be sent
-    as Key-Value-Pairs or would nest Immutable Properties (§12.7)."""
+def _checked_immutable(props, what: str = "Immutable Properties"
+                       ) -> Optional[Dict[int, Union[int, bytes]]]:
+    """Track Properties as given, refused when they could not be sent as
+    Key-Value-Pairs or would carry Immutable Properties (§12.7)."""
     if not props:
         return None
     props = dict(props)
     if MOQTMessage.IMMUTABLE_PROPERTIES in props:
-        raise ValueError("Immutable Properties cannot contain Immutable "
-                         "Properties")
+        raise ValueError(f"{what} cannot contain Immutable Properties")
     for ptype, value in props.items():
         if ptype % 2 == 0:
             if not isinstance(value, int):
@@ -439,10 +439,11 @@ class PublishedTrack(Track):
     `track_alias`, `forward`, `state` and the rest address the first
     peer, which is the only one most tracks have.
 
-    `immutable_properties` ({type: int for even types, bytes for odd})
-    travel as the Track's Immutable Properties (0x0B) in PUBLISH,
-    SUBSCRIBE_OK and FETCH_OK from d16, and in the TRACK_STATUS reply from
-    d18; d14 carries no Track Properties.
+    `track_properties` and `immutable_properties` ({type: int for even
+    types, bytes for odd}) travel as the Track's Properties, the latter
+    inside Immutable Properties (0x0B), in PUBLISH, SUBSCRIBE_OK and
+    FETCH_OK from d16, and in the TRACK_STATUS reply from d18; d14
+    carries no Track Properties. A type may appear in only one of them.
     """
 
     # Stream mapping for produce() tracks.
@@ -470,6 +471,8 @@ class PublishedTrack(Track):
                      ForwardingPreference.SUBGROUP,
                  fetch_history_bytes: int = FETCH_HISTORY_DEFAULT,
                  immutable_properties: Optional[
+                     Dict[int, Union[int, bytes]]] = None,
+                 track_properties: Optional[
                      Dict[int, Union[int, bytes]]] = None):
         # Before super(): Track.__init__ assigns track_alias/request_id/
         # state, which are properties over this list.
@@ -484,6 +487,14 @@ class PublishedTrack(Track):
         self.stream_priority = None
         self.auth_token = auth_token
         self.immutable_properties = _checked_immutable(immutable_properties)
+        self.track_properties = _checked_immutable(track_properties,
+                                                   "Track Properties")
+        both = set(self.track_properties or ()) & set(
+            self.immutable_properties or ())
+        if both:
+            raise ValueError(
+                "properties in both Track Properties and Immutable "
+                "Properties: " + ", ".join(f"0x{t:x}" for t in sorted(both)))
         self._subscriber_event = asyncio.Event()
         # (group_id, object_id) max over all objects sent; None until
         # the first object exists. Drives ContentExists/Largest Location
@@ -768,14 +779,16 @@ class PublishedTrack(Track):
 
     def _track_properties(self, session) -> Optional[Dict[int, bytes]]:
         """The Track Properties this track's replies carry on `session`."""
-        if not (self.immutable_properties
-                and session._profile.track_properties):
+        if not session._profile.track_properties:
             return None
-        buf = Buffer(capacity=BUF_SIZE, vi64=session._profile.vi64)
-        MOQTMessage._extensions_encode(buf, self.immutable_properties,
-                                       with_length=False, delta=True)
-        return {MOQTMessage.IMMUTABLE_PROPERTIES:
-                buf.data_slice(0, buf.tell())}
+        props = dict(self.track_properties or ())
+        if self.immutable_properties:
+            buf = Buffer(capacity=BUF_SIZE, vi64=session._profile.vi64)
+            MOQTMessage._extensions_encode(buf, self.immutable_properties,
+                                           with_length=False, delta=True)
+            props[MOQTMessage.IMMUTABLE_PROPERTIES] = buf.data_slice(
+                0, buf.tell())
+        return props or None
 
     def attach(self, session=None) -> None:
         """Serve this track on a session without announcing it:
