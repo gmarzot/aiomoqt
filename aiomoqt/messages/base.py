@@ -1,3 +1,4 @@
+import itertools
 import os
 from typing import Any, Optional, Union, Dict, Tuple
 from dataclasses import dataclass, field, fields
@@ -881,7 +882,8 @@ class MOQTMessage:
         FILL_PARAMETERS is read count-prefixed (PR #2015). Transition
         tolerance for the published d20/d22 text: a block with a
         FILL_PARAMETERS that does not parse that way, or does not end at
-        buf_end, is reread with the value length-prefixed."""
+        buf_end, is reread with the value length-prefixed: a counted
+        block, or bare parameters to the value's end."""
         start = buf.tell()
         fill = []
         try:
@@ -916,7 +918,8 @@ class MOQTMessage:
                      delta_keys: bool = None,
                      scope: Optional[str] = None,
                      fill_length_prefixed: bool = False,
-                     fill_seen: Optional[list] = None) -> Dict[int, Any]:
+                     fill_seen: Optional[list] = None,
+                     bare: bool = False) -> Dict[int, Any]:
         """
         Deserialize parameters using Key-Value-Pair structure.
 
@@ -924,7 +927,8 @@ class MOQTMessage:
         delta-decoded). When buf_end is supplied the parameter block is
         bounded to it: a declared count or length that would read past
         buf_end raises MOQTProtocolViolation (spec §9 — the Length
-        field is the authoritative message extent).
+        field is the authoritative message extent). bare reads
+        parameters with no Number of Parameters up to buf_end.
 
         Returns:
             Dict mapping parameter type to value
@@ -935,12 +939,15 @@ class MOQTMessage:
         if delta_keys is None:
             delta_keys = prof.params_delta_coded
         params = {}
-        param_count = buf.pull_vint()
+        param_count = None if bare else buf.pull_vint()
         prev_key = 0
         d20 = prof.draft >= 18 and prof.param_table >= 20
         allowed = param_scope(prof).get(scope) if prof.draft >= 18 else None
 
-        for param_index in range(param_count):
+        for param_index in (itertools.count() if bare
+                            else range(param_count)):
+            if bare and buf.tell() >= buf_end:
+                break
             if buf_end is not None and buf.tell() >= buf_end:
                 raise MOQTProtocolViolation(
                     f"parameters declared {param_count} but buffer "
@@ -992,12 +999,18 @@ class MOQTMessage:
                         raise MOQTProtocolViolation(
                             f"FILL_PARAMETERS length {param_len} exceeds "
                             f"remaining {buf_end - buf.tell()}")
-                    if param_len == 0:
-                        raise MOQTProtocolViolation(
-                            "FILL_PARAMETERS has no Number of Parameters")
+                    # Value is a counted block, or a bare parameter run
+                    # to its end: no Table 7 type is below 0x0A, so a
+                    # first varint below 0x0A is a Number of Parameters.
+                    fill_bare = False
+                    if param_len:
+                        mark = buf.tell()
+                        fill_bare = buf.pull_vint() >= 0x0A
+                        buf.seek(mark)
                     param_value = MOQTMessage._pull_params(
                         buf, prof=prof, buf_end=value_end,
-                        scope="FillParameters")
+                        scope="FillParameters", bare=fill_bare) \
+                        if param_len else {}
                     if buf.tell() != value_end:
                         raise MOQTProtocolViolation(
                             "FILL_PARAMETERS does not fill its length")
