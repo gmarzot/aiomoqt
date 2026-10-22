@@ -488,9 +488,11 @@ def classify_catalog(payload: bytes) -> Optional[str]:
 
 def write_json_atomic(path: str, obj: Any) -> None:
     """Replace `path` whole, so a reader never sees a partial file."""
+    # dumps, not dump: only dumps uses the C encoder.
+    text = json.dumps(obj, separators=(",", ":"))
     tmp = f"{path}.tmp"
     with open(tmp, "w") as f:
-        json.dump(obj, f, separators=(",", ":"))
+        f.write(text)
     os.chmod(tmp, 0o644)
     os.replace(tmp, path)
 

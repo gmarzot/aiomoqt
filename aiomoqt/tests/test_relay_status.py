@@ -261,6 +261,16 @@ def test_write_json_atomic(tmp_path):
     assert path.stat().st_mode & 0o777 == 0o644
 
 
+def test_write_json_atomic_uses_c_encoder(tmp_path, monkeypatch):
+    # json.dump always runs the pure-Python encoder.
+    def no_dump(*args, **kwargs):
+        raise AssertionError("json.dump called")
+    monkeypatch.setattr(relay_status.json, "dump", no_dump)
+    path = tmp_path / "status.json"
+    relay_status.write_json_atomic(str(path), {"a": [1.5, None]})
+    assert path.read_text() == '{"a":[1.5,null]}'
+
+
 @pytest.mark.parametrize("addr,shown", [
     (("203.0.113.7", 51234), "203.0.113.7"),
     ("198.51.100.255", "198.51.100.255"),
