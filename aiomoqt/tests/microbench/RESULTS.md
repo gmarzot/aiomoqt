@@ -133,13 +133,13 @@ target through N=100 × 100/s.
 
 ```bash
 # All benches assume aiopquic is built and pip-installed editable
-# into aiomoqt's venv:
-cd /home/gmarzot/Projects/moq/aiopquic
+# into aiomoqt's venv, with both repos checked out side by side:
+cd ../aiopquic
 ./build_picoquic.sh
-/home/gmarzot/Projects/moq/aiomoqt/.venv/bin/python setup.py build_ext --inplace
-/home/gmarzot/Projects/moq/aiomoqt/.venv/bin/pip install -e . --no-deps --no-build-isolation
+../aiomoqt/.venv/bin/python setup.py build_ext --inplace
+../aiomoqt/.venv/bin/pip install -e . --no-deps --no-build-isolation
 
-cd /home/gmarzot/Projects/moq/aiomoqt
+cd ../aiomoqt
 source .venv/bin/activate
 
 # B1b accumulator (StreamChain + Buffer)

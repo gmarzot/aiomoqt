@@ -400,10 +400,11 @@ python -m aiomoqt.versions
 ```
 
 ```
-aiomoqt:   0.11.0 (~/src/aiomoqt/aiomoqt) [2026-08-28 11:57]
-aiopquic:  0.4.0 (~/src/aiopquic/src/aiopquic) [2026-08-28 11:58]
-  - picoquic:  1.1.51.1 (7bbf9ef0) [2026-08-03]
-  - picotls:   master (bfa67875) [2026-04-20]
+aiomoqt:   0.13.1 (~/.venv/lib/python3.13/site-packages/aiomoqt) [2026-10-21 16:43]
+aiopquic:  0.6.1 (~/.venv/lib/python3.13/site-packages/aiopquic) [2026-10-21 16:43]
+  - picoquic:  1.1.53.0 (2026.10.08.c908872-0-c9088724) [2026-10-08]
+  - picotls:   master (f06553b8) [2026-09-30]
+  - openssl:   OpenSSL 3.5.8 (~/.venv/lib/python3.13/site-packages/aiopquic.libs/libcrypto-c37e28d8.so.3.5.8)
 ```
 
 ## Limitations

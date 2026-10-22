@@ -18,20 +18,20 @@ transport-layer baselines and runtime tuning (jemalloc, GSO) in
 | `adaptive_bench` | loopback or relay | rate ramp until latency/buffer growth degrades |
 
 ```bash
-# Single-process loopback (no relay; -q = raw QUIC, default WT)
-python -m aiomoqt.tools.loopback_bench -P 8 -s 4096 -g 200 -t 30 -q
+# Single-process loopback (no relay; -Q = raw QUIC, default WT)
+python -m aiomoqt.tools.loopback_bench -P 8 -s 4096 -g 200 -t 30 -Q
 
 # Two-process (shell 1 publisher, shell 2 subscriber). The publisher
-# serves WT at "/" (raw QUIC with -q has no path); the subscriber needs
-# -k for the self-signed loopback cert. -t goes on the subscriber here
-# (pub_server runs until Ctrl-C). Omit --trackname to exercise track-
-# name discovery; -n must match the server's namespace.
-python -m aiomoqt.tools.pub_server -P 8 -s 4096 -g 200 -r 35000 -n aiomoqt
-python -m aiomoqt.tools.sub_bench https://localhost:4434/ -n aiomoqt --draft 16 -k -t 30 -i 5
+# serves WT at "/" (-Q serves raw QUIC: dial moqt://localhost:4434); the
+# subscriber needs -k for the self-signed loopback cert. -t goes on the
+# subscriber here (pub_server runs until Ctrl-C). Omit -T to exercise
+# track-name discovery; -N must match the server's namespace.
+python -m aiomoqt.tools.pub_server -P 8 -s 4096 -g 200 -r 35000 -N aiomoqt
+python -m aiomoqt.tools.sub_bench https://localhost:4434/ -N aiomoqt -k -t 30 -i 5
 
-# Through a relay
-python -m aiomoqt.tools.pub_bench moqt://relay.ex.com -s 4096 -P 4 -r 8000 -t 30
-python -m aiomoqt.tools.sub_bench moqt://relay.ex.com -i 5
+# Through a relay (the URL scheme selects the transport)
+python -m aiomoqt.tools.pub_bench moqt://relay.example.com:4433 -s 4096 -P 4 -r 8000 -t 30
+python -m aiomoqt.tools.sub_bench moqt://relay.example.com:4433 -i 5
 ```
 
 Convention: set `-t` on the publisher only; the subscriber exits on the
@@ -41,13 +41,15 @@ track's natural close.
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `-s, --object-size` | Payload size (bytes) | tool-specific |
-| `-g, --group-size` | Objects per group (each group = fresh stream per subgroup) | 10000 |
+| `URL` | Dialing tools: `moqt://` = raw QUIC, `https://` or bare `host:port` = WebTransport | — |
+| `-Q, --quic` / `-W, --wt` | Listening tools: raw QUIC / WebTransport; both = one port | WT |
+| `-N, --namespace` | Track namespace | `aiomoqt` |
+| `-s, --object-size` | Payload size (bytes) | 4096 |
+| `-g, --group-size` | Objects per group (each group = fresh stream per subgroup) | tool-specific |
 | `-P, --streams` | Parallel subgroup streams | 1 |
 | `-r, --rate` | Aggregate objects/sec across all streams (0 = max) | 0 |
 | `-t, --duration` | Duration seconds (publisher side) | tool-specific |
 | `-i, --interval` | Report interval seconds | 5 |
-| `-q, --quic` | Raw QUIC (URL tools: override for https:// URLs) | WT |
 | `--cc-algo` | Congestion control (bbr1, bbr, cubic, newreno, ...) | aiopquic default |
 | `--draft` | MoQT draft version | tool-specific |
 | `--max-queued-bytes` | Aggregate publisher TX budget, all streams | aiopquic default |
@@ -107,43 +109,16 @@ Unpaced latency in this table is dominated by the default TX budgets,
 per the section above; lower budgets trade throughput stability for
 latency.
 
-## Interop matrix (point in time)
+## Interop
 
-Control-message and pub-sub results against live public relays
-(6 [moq-interop-runner](https://github.com/englishm/moq-interop-runner)
-cases plus a 3-subscriber pub-sub bench; error codes validated to
-spec-conformant values). Probed via
-`tests/release_regression_test.py --test-tier interop`; refreshed at
-release gates, so treat as indicative — relay deployments change.
-
-| Relay | Draft | Transport | ctrl-msg | pub-sub |
-|-------|-------|-----------|----------|---------|
-| OpenMoQ moqx | d14 | QUIC | 6/6 | 3/3 |
-| OpenMoQ moqx | d14 | H3/WT | 6/6 | 3/3 |
-| OpenMoQ moqx | d16 | QUIC | 6/6 | 3/3 |
-| OpenMoQ moqx | d16 | H3/WT | 6/6 | 3/3 |
-| Meta moxygen | d14 | QUIC | 6/6 | 3/3 |
-| Meta moxygen | d14 | H3/WT | 6/6 | 3/3 |
-| Meta moxygen | d16 | QUIC | 6/6 | 3/3 |
-| Meta moxygen | d16 | H3/WT | 6/6 | 3/3 |
-| Cloudflare moq-rs | d14 | QUIC | 5/6 | 3/3 |
-| Cloudflare moq-rs (d16 interop branch) | d16 | QUIC | 6/6 | unverified |
-| Quicr libquicr | d14 | QUIC | 5/6 | 3/3 |
-| Quicr libquicr | d14 | H3/WT | 5/6 | 3/3 |
-| Quicr libquicr | d16 | H3/WT | 5/6 | 3/3 |
-| Meetecho imquic | d16 | QUIC | 6/6 | unverified |
-| Meetecho imquic | d16 | H3/WT | 5/6 | unverified |
-| OzU moqtail | d14 | H3/WT | 6/6 | unverified |
-
-`unverified` — suite did not complete end-to-end. Endpoints that did
-not answer a QUIC Initial at probe time are omitted. See
-[`tests/relays.json`](tests/relays.json) for the full catalog,
-per-endpoint notes, and relays disabled by default.
-
-Test cases: `setup-only`, `announce-only`, `publish-namespace-done`,
-`subscribe-error`, `announce-subscribe`, `subscribe-before-announce`,
-plus `fetch` and `join` probes (not in the default matrix — most
-relays do not implement these yet).
+Interop against live public relays runs as the `interop` tier of
+`tests/release_regression_test.py`: the
+[moq-interop-runner](https://github.com/englishm/moq-interop-runner)
+control-message cases plus pub-sub, discovery, join, fetch and data
+checks, per relay, draft (14 to 22) and transport. The weekly
+`interop-regression` workflow posts the per-relay table in its job
+summary. [`tests/relays.json`](tests/relays.json) is the catalog, with
+per-endpoint drafts, notes, and non-gating or disabled suites.
 
 ## Appendix: example loopback runs (single box)
 

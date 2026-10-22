@@ -144,7 +144,7 @@
 - A truncated subgroup (abort, lane shed or Forward State 0, LOC pause) is reset with CANCELLED, not ended with END_OF_GROUP + FIN.
 - A reset or STOP_SENDING meeting a full TX ring is queued and retried, not raised.
 - `tests/relays.json`: non-gating d20/d22 targets (moxygen-fb, imquic, nokia-d22, moqtail-d22,
-  stitcher-moq, moqarena).
+  stitcher-moq).
 - SERVER_SETUP carries MOQT_IMPLEMENTATION at d14/d16; `implementation=` on client and server
   sets it, `None` omits it.
 - WebTransport client settles its draft from the server's WT-Protocol, or d14 in-band when
@@ -1335,7 +1335,7 @@ divergence reads a `DraftProfile` capability flag.
 ### Release regression: flake resistance, macOS loopback-fetch, catalog trim
 
 - **Interop tier retries transient flakes.** A failing relay/suite is retried up to 2 extra times; a genuine fail fails every attempt, a flake recovers and is annotated `(flaky: recovered on attempt N)`. External-relay/network jitter (timeouts, the `multi_sub_bench` fixed publisher-register wait racing a relay's namespace registration) no longer reads as a real failure.
-- **macOS skips `loopback-fetch`** (new `--skip-suite` flag): on macOS the native QUIC connection close stalls ~10s when a fetch stream is left un-drained at session exit — confirmed on a real macOS box (argo) that it's the aiopquic/picoquic close drain over loopback, *not* pytest teardown as first assumed — tipping loopback-fetch over its timeout. The fetch logic is platform-independent (covered on Linux) and the bench matrix covers macOS loopback delivery; tracked as an aiopquic follow-up.
+- **macOS skips `loopback-fetch`** (new `--skip-suite` flag): on macOS the native QUIC connection close stalls ~10s when a fetch stream is left un-drained at session exit — confirmed on a real macOS box (Apple M4) that it's the aiopquic/picoquic close drain over loopback, *not* pytest teardown as first assumed — tipping loopback-fetch over its timeout. The fetch logic is platform-independent (covered on Linux) and the bench matrix covers macOS loopback delivery; tracked as an aiopquic follow-up.
 - **Catalog trim (#24):** disabled the no-answer / unsupported suites that will never pass — `cloudflare-d14` `relay-fetch` and `cf-d16-interop` `relay-join`/`relay-fetch`. Verified against the implementations rather than inferred from the timeout: both `cloudflare/moq-rs` and `itzmanish/moq-rs` READMEs list FETCH as "Not Soon", and the relay neither forwards nor errors a FETCH (open upstream issues cloudflare/moq-rs#57 passthrough, #58 error). Genuine conformance fails are kept (cf-d16 pub-sub routing, quicr-west fetch code=0).
 
 ## v0.9.11
@@ -1574,7 +1574,7 @@ aiopquic 0.3.2. **195 passed / 0 skipped** (was 191/4).
 
 Pytest 195/0/0; regression unit + integration green; interop
 `moqx-main` and `moxygen-fb` both 6/6 ctrl + 3/3 pub-sub on all
-4 corners (d14/d16 × WT/raw-QUIC); linux + macOS argo confirmed.
+4 corners (d14/d16 × WT/raw-QUIC); linux + macOS (Apple M4) confirmed.
 
 ## v0.9.3 (2026-05-13)
 
@@ -1597,7 +1597,7 @@ aiopquic 0.3.1, 30 s windows):
 |  980 Mbps |  987 Mbps | 3938 ms / **65 ms** | 0 |
 | 1500 Mbps | 1.3-1.4 Gbps | — / ~150 ms       | 0 |
 
-Cross-platform sanity on argo (Apple M4, native macOS):
+Cross-platform sanity on macOS (Apple M4):
 
 | Target | Tx | Rx | avg lat |
 |---|---|---|---|
