@@ -165,7 +165,7 @@ WATCHDOG_KICK_S = 0.5
 STATUS_INTERVAL_S = 2.0
 STATUS_HISTORY_S = 600
 # platform.json is mostly history; its page tolerates a slower refresh.
-PLATFORM_INTERVAL_S = 10.0
+PLATFORM_INTERVAL_S = 5.0
 # MSF catalog track name (§5.2.3), and the watchdog's own namespace,
 # kept off the dashboard.
 CATALOG_TRACK = b"catalog"

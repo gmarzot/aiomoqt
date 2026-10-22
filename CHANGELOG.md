@@ -4,7 +4,7 @@
 
 - Relay: status files are encoded with json's C encoder.
 - Relay: status bit rates are integers and milliseconds carry two decimals.
-- Relay: platform.json is rewritten every 10 s instead of every 2 s.
+- Relay: platform.json is rewritten every 5 s instead of every 2 s.
 
 ## v0.13.1
 
