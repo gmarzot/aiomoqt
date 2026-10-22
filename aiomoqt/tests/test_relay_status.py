@@ -6,6 +6,8 @@ import json
 import os
 import time
 
+import sys
+
 import pytest
 
 from aiomoqt.client import MOQTClient
@@ -542,6 +544,8 @@ def _under_empty_list(path, schema):
     return False
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"),
+                    reason="the host sampler's fields come from /proc")
 @requires_certs
 async def test_snapshot_schema_unchanged(relay_tables, tmp_path):
     # Keys, nesting and types as the dashboard reads them; only a count or a
