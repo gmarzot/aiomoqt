@@ -592,3 +592,26 @@ def test_loop_lag_summary_is_rounded():
     lag = relay_status.LoopLag()
     lag.samples.extend([0.0012345, 0.0098765])
     assert lag.summary() == {"p50": 1.23, "p99": 9.88, "max": 9.88}
+
+
+async def test_platform_written_less_often_than_status(
+        relay_tables, monkeypatch, tmp_path):
+    monkeypatch.setattr(relay, "STATUS_INTERVAL_S", 0.05)
+    monkeypatch.setattr(relay, "PLATFORM_INTERVAL_S", 0.5)
+    written = []
+    monkeypatch.setattr(relay_status, "write_json_atomic",
+                        lambda path, obj: written.append(os.path.basename(path)))
+    background = set(relay._background)
+    status = relay._Status(str(tmp_path / "status.json"),
+                           {"started": time.time()})
+    runner = asyncio.create_task(status.run())
+    try:
+        await asyncio.sleep(0.8)
+    finally:
+        runner.cancel()
+        for task in set(relay._background) - background:
+            task.cancel()
+            relay._background.discard(task)
+    assert written[:2] == ["status.json", "platform.json"]
+    assert written.count("platform.json") <= 2
+    assert written.count("status.json") >= 6
