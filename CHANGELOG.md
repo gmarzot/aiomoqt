@@ -10,6 +10,7 @@
 - sub_media `--analyze`: a LOC TIMESCALE seen on any object (or as a Track Property) holds for the track, so `--loc-timescale` streams no longer mix µs and ticks.
 - Malformed draft-frindell-moq-timestamp properties (duplicates, wrong scope, TIMESCALE missing or 0, TIMESTAMP_ORIGIN without CLOCK_ID, a mapping that is not four integers, a timestamp outside 0..2^64-1) cancel the subscription (MOQT §12.1); `SubscribedTrack(timestamp_errors='report')` and `--timestamp-errors report` on sub_bench, loopback_bench and sub_media keep receiving and count them.
 - Key-Value-Pair blocks decoded in Python (control messages, datagrams, FETCH) mark repeated types in `KeyValuePairs.duplicates`.
+- Wire conformance: draft-frindell-moq-timestamp TIMESCALE, CLOCK_ID, TIMESTAMP_ORIGIN, TIMESTAMP_MAPPING and OBJECT_TIMESTAMP against hand-derived bytes at d16 and d18, valid and malformed.
 
 ## v0.13.1
 

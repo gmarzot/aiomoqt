@@ -1581,3 +1581,196 @@ def test_d16_zero_delivery_timeout_track_property_is_a_protocol_violation():
     props = _ref_vint(16, 0x02) + _ref_vint(16, 0)
     with pytest.raises(MOQTProtocolViolation, match="DELIVERY_TIMEOUT"):
         _imm_decode(16, "subscribe_ok", props)
+
+
+# -- draft-frindell-moq-timestamp-00 properties (§3-§5, §9) -------------
+#
+# Track Properties: TIMESCALE 0x2C7A51E0, CLOCK_ID 0x3E8D2B70 and
+# TIMESTAMP_ORIGIN 0x31B49A6E are even (bare integer); TIMESTAMP_MAPPING
+# 0x27F308C5 is odd (length-prefixed), holding four integers. Object
+# Property OBJECT_TIMESTAMP 0x2D1A (even). Integers follow the session:
+# RFC 9000 varints at d16, vi64 from d18. Types are delta-coded.
+
+from types import SimpleNamespace  # noqa: E402
+
+from aiomoqt.track import PublishedTrack  # noqa: E402
+from aiomoqt.utils.timing import (  # noqa: E402
+    CLOCK_ID, OBJECT_TIMESTAMP, TIMESCALE, TIMESTAMP_MAPPING,
+    TIMESTAMP_ORIGIN, TimestampMalformed, TrackTiming, capture_time_us,
+    check_object, encode_mapping,
+)
+
+_W = 1_767_225_600_000_000
+
+
+def _ref_delta_kvps(draft, pairs):
+    """Delta-coded Key-Value-Pairs from (type, int | bytes), in order."""
+    v = lambda x: _ref_vint(draft, x)  # noqa: E731
+    out, prev = b"", 0
+    for ptype, value in pairs:
+        out += v(ptype - prev)
+        prev = ptype
+        out += (v(value) if ptype % 2 == 0
+                else v(len(value)) + value)
+    return out
+
+
+def _ref_mapping(draft, *ints):
+    return b"".join(_ref_vint(draft, i) for i in ints)
+
+
+def _track_timing(draft, kind, pairs):
+    msg = _imm_decode(draft, kind, _ref_delta_kvps(draft, pairs))
+    return TrackTiming.from_properties(
+        msg.track_extensions, profile_for(draft).vi64,
+        getattr(msg.track_extensions, 'duplicates', ()))
+
+
+_FRINDELL_DRAFTS = [16, 18]
+
+
+@pytest.mark.parametrize("kind", list(_IMM_MESSAGES))
+@pytest.mark.parametrize("draft", _FRINDELL_DRAFTS)
+def test_frindell_track_properties_decode(draft, kind):
+    base_ts = _W * 30000 // 1_000_000
+    mapping = _ref_mapping(draft, 5, base_ts, 60060, 1001)
+    t = _track_timing(draft, kind, [
+        (TIMESTAMP_MAPPING, mapping), (TIMESCALE, 30000),
+        (TIMESTAMP_ORIGIN, 0), (CLOCK_ID, 0)])
+    assert (t.timescale, t.clock_id, t.origin) == (30000, 0, 0)
+    assert t.mapping == (5, base_ts, 60060, 1001)
+    # The encoder writes the same value bytes.
+    assert encode_mapping(5, base_ts, 60060, 1001,
+                          profile_for(draft).vi64) == mapping
+
+
+@pytest.mark.parametrize("draft", _FRINDELL_DRAFTS)
+def test_frindell_track_properties_encode_exact_bytes(draft):
+    vi64 = profile_for(draft).vi64
+    mapping = encode_mapping(0, 7, 1000, 10, vi64)
+    track = PublishedTrack(None, namespace="n", trackname="t",
+                           track_properties={TIMESCALE: 1000,
+                                             TIMESTAMP_MAPPING: mapping})
+    s = SimpleNamespace(_profile=profile_for(draft))
+    buf = Buffer(capacity=64, vi64=vi64)
+    MOQTMessage._extensions_encode(buf, track._track_properties(s),
+                                   with_length=False, delta=True)
+    assert bytes(buf.data_slice(0, buf.tell())) == _ref_delta_kvps(draft, [
+        (TIMESTAMP_MAPPING, _ref_mapping(draft, 0, 7, 1000, 10)),
+        (TIMESCALE, 1000)])
+
+
+@pytest.mark.parametrize("draft", _FRINDELL_DRAFTS)
+@pytest.mark.parametrize("case", [
+    "duplicate-timescale", "object-timestamp-on-track", "timescale-0",
+    "no-timescale", "origin-without-clock", "mapping-3", "mapping-5",
+    "mapping-trailing-byte", "mapping-truncated"])
+def test_malformed_frindell_track_properties(draft, case):
+    v = lambda x: _ref_vint(draft, x)  # noqa: E731
+    four = _ref_mapping(draft, 0, 1, 2, 3)
+    pairs, why = {
+        "duplicate-timescale": ([(TIMESCALE, 1000), (TIMESCALE, 1000)],
+                                "more than once"),
+        "object-timestamp-on-track": ([(OBJECT_TIMESTAMP, 1),
+                                       (TIMESCALE, 1000)],
+                                      "as a Track Property"),
+        "timescale-0": ([(TIMESCALE, 0)], "TIMESCALE missing or 0"),
+        "no-timescale": ([(CLOCK_ID, 0)], "TIMESCALE missing"),
+        "origin-without-clock": ([(TIMESCALE, 1000),
+                                  (TIMESTAMP_ORIGIN, 9)],
+                                 "without CLOCK_ID"),
+        "mapping-3": ([(TIMESTAMP_MAPPING, _ref_mapping(draft, 0, 1, 2)),
+                       (TIMESCALE, 1000)], "four integers"),
+        "mapping-5": ([(TIMESTAMP_MAPPING, four + v(4)),
+                       (TIMESCALE, 1000)], "four integers"),
+        "mapping-trailing-byte": ([(TIMESTAMP_MAPPING, four + b"\x00"),
+                                   (TIMESCALE, 1000)], "four integers"),
+        # A multi-byte integer cut short inside the value.
+        "mapping-truncated": ([(TIMESTAMP_MAPPING,
+                                _ref_mapping(draft, 0, 1, 2) + v(1 << 20)[:1]),
+                               (TIMESCALE, 1000)], "four integers"),
+    }[case]
+    with pytest.raises(TimestampMalformed, match=why):
+        _track_timing(draft, "subscribe_ok", pairs)
+
+
+def _object_block(draft, pairs):
+    body = _ref_delta_kvps(draft, pairs)
+    return _ref_vint(draft, len(body)) + body
+
+
+@pytest.mark.parametrize("draft", _FRINDELL_DRAFTS)
+@pytest.mark.parametrize("correction, wire", [(0, 0), (-1, 1), (1, 2),
+                                             (-300, 599), (300, 600)])
+def test_object_timestamp_zigzag_both_codecs(draft, correction, wire):
+    vi64 = profile_for(draft).vi64
+    block = _object_block(draft, [(0x10, _W), (OBJECT_TIMESTAMP, wire)])
+    py = MOQTMessage._extensions_decode(Buffer(data=block, vi64=vi64),
+                                        delta=True)
+    chain = StreamChain()
+    chain.extend(_ref_vint(draft, 0) + block + _ref_vint(draft, 3) + b"pay")
+    fused = (chain.parse_object_subgroup_vi64 if vi64
+             else chain.parse_object_subgroup)
+    assert fused(True, 16 * 1024, True)[1] == py
+    t = TrackTiming(timescale=1_000_000, mapping=(0, _W, 0, 0))
+    assert capture_time_us(t, 0, 0, py)[0] == _W + correction
+
+
+@pytest.mark.parametrize("draft", _FRINDELL_DRAFTS)
+def test_explicit_object_timestamp_both_codecs(draft):
+    vi64 = profile_for(draft).vi64
+    block = _object_block(draft, [(OBJECT_TIMESTAMP, _W)])
+    py = MOQTMessage._extensions_decode(Buffer(data=block, vi64=vi64),
+                                        delta=True)
+    assert py == {OBJECT_TIMESTAMP: _W}
+    assert capture_time_us(TrackTiming(timescale=1_000_000), 0, 0, py) == (
+        _W, "frindell")
+
+
+@pytest.mark.parametrize("draft", _FRINDELL_DRAFTS)
+@pytest.mark.parametrize("case", [
+    "duplicate", "timescale-on-object", "mapping-on-object",
+    "clock-on-object", "origin-on-object", "no-track-timescale",
+    "negative", "past-2-64"])
+def test_malformed_frindell_objects(draft, case):
+    vi64 = profile_for(draft).vi64
+    mapped = TrackTiming(timescale=1000, mapping=(10, 0, 1000, 1))
+    timing, gid, pairs, why = {
+        "duplicate": (mapped, 10, [(OBJECT_TIMESTAMP, 2),
+                                   (OBJECT_TIMESTAMP, 4)], "more than once"),
+        "timescale-on-object": (mapped, 10, [(TIMESCALE, 1000)],
+                                "TIMESCALE as an Object"),
+        "mapping-on-object": (mapped, 10, [(TIMESTAMP_MAPPING, b"\x00")],
+                              "TIMESTAMP_MAPPING as an Object"),
+        "clock-on-object": (None, 0, [(CLOCK_ID, 0)], "CLOCK_ID as an"),
+        "origin-on-object": (None, 0, [(TIMESTAMP_ORIGIN, 0)],
+                             "TIMESTAMP_ORIGIN as an"),
+        "no-track-timescale": (None, 0, [(OBJECT_TIMESTAMP, 5)],
+                               "without TIMESCALE"),
+        # Group 9 maps to -1000; a correction of +999 leaves it negative.
+        "negative": (mapped, 9, [(OBJECT_TIMESTAMP, 1998)], "outside"),
+        "past-2-64": (TrackTiming(timescale=1, mapping=(0, (1 << 62) - 1,
+                                                        1 << 62, 0)),
+                      4, [], "outside"),
+    }[case]
+    py = MOQTMessage._extensions_decode(
+        Buffer(data=_object_block(draft, pairs), vi64=vi64), delta=True)
+    with pytest.raises(TimestampMalformed, match=why):
+        check_object(timing, gid, 0, py)
+
+
+@pytest.mark.parametrize("draft", _FRINDELL_DRAFTS)
+def test_aiopquic_object_codec_keeps_the_last_duplicate(draft):
+    """Subgroup objects are decoded by aiopquic, which keeps the last of
+    a repeated type and does not mark it; only the Python codec
+    (datagrams, FETCH) can report the duplicate."""
+    vi64 = profile_for(draft).vi64
+    block = _object_block(draft, [(OBJECT_TIMESTAMP, 2),
+                                  (OBJECT_TIMESTAMP, 4)])
+    chain = StreamChain()
+    chain.extend(_ref_vint(draft, 0) + block + _ref_vint(draft, 3) + b"pay")
+    fused = (chain.parse_object_subgroup_vi64 if vi64
+             else chain.parse_object_subgroup)
+    exts = fused(True, 16 * 1024, True)[1]
+    assert exts == {OBJECT_TIMESTAMP: 4}
+    assert not getattr(exts, 'duplicates', None)
