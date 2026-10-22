@@ -46,7 +46,8 @@ flags instead. `--help` works on every tool.
 
 - TLS: clients verify the relay's certificate by default. A self-signed relay needs `-k` /
   `verify_tls=False`; a private CA goes in `ca_file=`.
-- Congestion control: aiopquic's default is `bbr1`; `moq-interop-relay` defaults to `cubic`.
+- Congestion control: aiopquic's default is `bbr1`; `moq-interop-relay` defaults to `cubic`;
+  moqx defaults to BBR2.
   `--cc-algo` takes `bbr` (v3), `bbr1`, `c4`, `cubic`, `dcubic`, `fast`, `newreno`, `prague`
   and `reno`. Open theory: BBRv1 ProbeRTT (cwnd floored at 4 packets for ≥200 ms, every 10 s
   once min-RTT goes stale under jitter) may cause periodic latency spikes on paced flows. It
@@ -57,7 +58,6 @@ flags instead. `--help` works on every tool.
   #2118), not reproduced on the current pin. Use `cubic` or `newreno` for loopback timing runs.
 - `moq-relay-probe -f` reads its own relay-list schema; use `--url` for a single probe.
 - `moq-interop-relay` is a conformance and interop fixture, not a production relay: a bounded
-  recent-object cache (8 groups / 32 MiB per track) for FETCH and JOIN, a late subscriber starts
-  at the live edge; no authentication, authorization or rate limiting; a per-stream TX budget
+  recent-object cache (8 groups / 32 MiB per track) for FETCH and JOIN; no authentication, authorization or rate limiting; a per-stream TX budget
   but unbounded per-track forwarding queues; no delivery timeout. Its module docstring has the
   details.

@@ -4,9 +4,7 @@
 Runs unit, integration, interop, and bench tiers against a relay catalog.
 Each suite is a discrete test with its own status line; tiers group them.
 
-Usage:
-    cd ~/Projects/moq/aiomoqt
-
+Usage, from the repo root:
     # CI path: unit + integration (no network)
     tests/release_regression_test.py --test-tier unit --test-tier integration
 
@@ -23,7 +21,7 @@ Usage:
     # LOCMAF from Eyevinn's public moqlivemock (manual only)
     tests/release_regression_test.py --test-suite media-locmaf
 
-Exit 0 iff every test passed. `[skip]` suites don't count.
+Exit 1 iff a suite fails; SKIP and XFAIL don't gate.
 """
 from __future__ import annotations
 
