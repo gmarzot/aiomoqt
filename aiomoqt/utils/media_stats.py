@@ -625,8 +625,7 @@ class MediaAnalysis:
         if timing is None:
             timing = t.timing = ((self.timing_of and self.timing_of(name))
                                  or TrackTiming())
-        ts, scale = frame.timestamp, exts.get(LOC_TIMESCALE)
-        wall = None
+        ts, wall = frame.timestamp, None
         try:
             cap, src = capture_time_us(timing, group_id, msg.object_id, exts)
             if src == SOURCE_FRINDELL:
@@ -639,6 +638,9 @@ class MediaAnalysis:
         except TimestampMalformed:
             t.ts_malformed += 1
             src = None
+        if wall is None:
+            # A LOC TIMESCALE rides only some objects; it holds for the track.
+            scale = exts.get(LOC_TIMESCALE, timing.loc_timescale)
         if ts is None and t.cmaf:
             ts, scale = chunk_decode_time(frame.payload), t.timescale
             src = SOURCE_TFDT if ts is not None else None

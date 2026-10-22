@@ -417,3 +417,23 @@ def test_adapter_counts_wire_bytes_not_the_rebuilt_frame():
     a.on_arrival('v', _obj(0, payload=b'w' * 10), T0, 0, 0,
                  LocFrame(b'x' * 100, True, T0))
     assert a.tracks['v'].bytes == 10
+
+
+def test_loc_timescale_on_group_start_holds_for_the_track():
+    """pub_media --loc-timescale sends TIMESCALE (0x08) only on each
+    group's first object; the rest are in the same ticks."""
+    from aiomoqt.media.loc import LocFrame
+    a = MediaAnalysis()
+    a.add_track('video', role='video')
+    a.start(0)
+    for i in range(60):
+        g, o = divmod(i, 30)
+        ticks = i * 3000                      # 30 fps at 90 kHz
+        exts = {0x10: ticks, **({0x08: 90000} if o == 0 else {})}
+        msg = NS(group_id=g, object_id=o, extensions=exts, status=None,
+                 stream_flags=None, payload=b"x")
+        a.on_arrival('video', msg, 1_000_000 + i * 33_333, g, 0,
+                     LocFrame(b"x", o == 0, timestamp=ticks))
+    rows, _ = a.summary(3_000_000)
+    assert rows[0]['jitter_ms'] < 1.0
+    assert not rows[0]['wall']

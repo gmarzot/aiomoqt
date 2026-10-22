@@ -7,6 +7,7 @@
 - `session.subscribe(on_reply=)`: called with the SUBSCRIBE_OK as it is parsed, before the track's first object.
 - `utils.timing`: one capture-time resolver (draft-frindell-moq-timestamp-00 on a wall-clock track, then LOC TIMESTAMP without a LOC TIMESCALE, then bench 0x20); `SubscribedTrack.timing` holds the track's context.
 - sub_bench, loopback_bench, adaptive_bench, load_sim, the agent reader and sub_media `--analyze`/`--report`/`--inspect` take latency from the resolver and report its source per track.
+- sub_media `--analyze`: a LOC TIMESCALE seen on any object (or as a Track Property) holds for the track, so `--loc-timescale` streams no longer mix µs and ticks.
 
 ## v0.13.1
 
