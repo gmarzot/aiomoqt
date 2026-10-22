@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `aiomoqt/AGENTS.md`, shipped in the wheel, is a short guide for agents using the package; the repo-root `AGENTS.md` is the contributor guide.
+
 ## v0.13.1
 
 - Relay: a track's Track Properties from PUBLISH or the upstream SUBSCRIBE_OK are cached and sent unchanged on its SUBSCRIBE_OK, PUBLISH, FETCH_OK and TRACK_STATUS replies, the newest set replacing the last; from d18 a Mandatory Track Property gets UNSUPPORTED_EXTENSION.
