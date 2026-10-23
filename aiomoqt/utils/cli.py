@@ -6,10 +6,10 @@ inherit the same contract for free.
 
 The groups take no feature toggles. That is deliberate: a helper with
 `add_media(streams=False, datagram=True, ...)` centralizes only the help
-TEXT while each call site still picks its own subset and defaults, so
-the flags drift apart again one level up. Each group here adds a fixed
-set with fixed defaults; a tool needing a different subset asks for a
-different group.
+TEXT while each call site still picks its own subset, so the flags drift
+apart again one level up. Each group adds a fixed set of flags; its
+arguments only set default values. A tool needing a different subset
+asks for a different group. test_cli_grid enforces both.
 
 THE GRID
 --------
@@ -31,10 +31,12 @@ addressing
 identity          -N/--namespace  -T/--trackname
 publisher media   -s/--object-size -g/--group-size -P/--streams
                   -r/--rate -D/--datagram --video
-run               -t/--duration -i/--interval -d/--debug
-session           --draft -k/--insecure --cert/--key --keylogfile
-                  --cc-algo --keepalive --max-queued-bytes
-                  --max-inflight-bytes --quic-debug --compat
+run               -t/--duration -d/--debug --no-stats
+interval          -i/--interval
+session           --draft -k/--insecure --keylogfile --cc-algo
+                  --max-queued-bytes --max-inflight-bytes --quic-debug
+keepalive         --keepalive
+compat            --compat
 help              -h/-?/--help on every tool (-? is a shell glob: quote it)
 
 split execution (tools that can run one end or both)
@@ -86,10 +88,9 @@ def endpoint_url(value):
     return value
 
 
-def add_endpoint(p, required=True):
+def add_endpoint(p):
     """Positional URL for tools that dial. Scheme picks the transport."""
-    kw = {} if required else {'nargs': '?', 'default': None}
-    p.add_argument('url', metavar='URL', type=endpoint_url, **kw,
+    p.add_argument('url', metavar='URL', type=endpoint_url,
                    help='Endpoint. moqt://host[:port][/path] = raw QUIC; '
                         'https://host[:port][/path] = WebTransport; '
                         'host[:port] = WebTransport. The scheme selects '
@@ -107,7 +108,7 @@ def add_endpoints(p):
                         'URLs: the same work to each.')
 
 
-def add_listener(p, port=4433, path=True):
+def add_listener(p, port=4433):
     """Transport + bind address for tools that listen. -Q -W together
     serve both protocols on one port (ALPN dispatch)."""
     p.add_argument('-Q', '--quic', action='store_true',
@@ -120,10 +121,9 @@ def add_listener(p, port=4433, path=True):
                    help='Bind address (default: localhost)')
     p.add_argument('-p', '--port', type=int, default=port,
                    help=f'Listen port (default: {port})')
-    if path:
-        p.add_argument('--path', type=str, default='/',
-                       help='MoQT path — WT CONNECT path and raw-QUIC '
-                            'PATH setup parameter (default: /)')
+    p.add_argument('--path', type=str, default='/',
+                   help='MoQT path — WT CONNECT path and raw-QUIC '
+                        'PATH setup parameter (default: /)')
 
 
 def resolve_listener(args):
@@ -179,14 +179,9 @@ def add_publisher_media(p):
 
 # -- run / session ---------------------------------------------------
 
-def add_run(p, duration=DEFAULT_DURATION, interval=True):
+def add_run(p, duration=DEFAULT_DURATION):
     p.add_argument('-t', '--duration', type=int, default=duration,
                    help=f'Duration seconds (default: {duration})')
-    if interval:
-        p.add_argument('-i', '--interval', type=float,
-                       default=DEFAULT_INTERVAL,
-                       help=f'Report interval seconds '
-                            f'(default: {DEFAULT_INTERVAL:g})')
     p.add_argument('-d', '--debug', action='store_true',
                    help='Verbose logging')
     p.add_argument('--no-stats', action='store_true',
@@ -195,21 +190,20 @@ def add_run(p, duration=DEFAULT_DURATION, interval=True):
                         'delivery ceiling without the measurement in it.')
 
 
-def add_session(p, insecure=True, certs=False, keepalive=False,
-                compat=False):
+def add_interval(p):
+    p.add_argument('-i', '--interval', type=float, default=DEFAULT_INTERVAL,
+                   help=f'Report interval seconds '
+                        f'(default: {DEFAULT_INTERVAL:g})')
+
+
+def add_session(p):
     p.add_argument('--draft', type=parse_draft_spec, default=None,
                    help='MoQT draft: '
                         f'{", ".join(map(str, sorted(MOQT_DEFAULT_DRAFTS)))}; '
                         'a comma list offers several in order. Default: '
                         f'offer {",".join(map(str, MOQT_DEFAULT_DRAFTS))}')
-    if insecure:
-        p.add_argument('-k', '--insecure', action='store_true',
-                       help='Accept any server certificate (self-signed relays)')
-    if certs:
-        p.add_argument('--cert', type=str, default=None,
-                       help='TLS certificate file')
-        p.add_argument('--key', type=str, default=None,
-                       help='TLS private key file')
+    p.add_argument('-k', '--insecure', action='store_true',
+                   help='Accept any server certificate (self-signed relays)')
     p.add_argument('--keylogfile', type=str, default=None,
                    help='TLS secrets log (NSS Key Log Format) for '
                         'Wireshark decryption')
@@ -217,16 +211,6 @@ def add_session(p, insecure=True, certs=False, keepalive=False,
                    help='Congestion control (bbr | bbr1 | newreno | '
                         'cubic | dcubic | prague | fast). Default: '
                         'aiopquic default (bbr1)')
-    if keepalive:
-        # keepalive=True: flag, default off; a number: default seconds.
-        ka_default = None if keepalive is True else float(keepalive)
-        p.add_argument('--keepalive', type=float, default=ka_default,
-                       metavar='SEC',
-                       help='QUIC keep-alive interval seconds (PING), so '
-                            'a flow-controlled quiet connection is not '
-                            'dropped on idle timeout. 0 disables. '
-                            'Default: ' + ('off' if ka_default is None
-                                           else f'{ka_default:g}'))
     p.add_argument('--max-queued-bytes', type=int, default=None,
                    help='Aggregate publisher TX budget across ALL '
                         'streams. Default: aiopquic default (4 MiB). '
@@ -236,25 +220,36 @@ def add_session(p, insecure=True, certs=False, keepalive=False,
                         '(1 MiB). 0 disables.')
     p.add_argument('--quic-debug', action='store_true',
                    help='Verbose QUIC-layer logging')
-    if compat:
-        p.add_argument('--compat', type=str, default='',
-                       help='Comma-separated relay compat tolerances: '
-                            'lenient-extensions (truncated trailing-'
-                            'extensions block on control messages), '
-                            'libquicr, all')
 
 
-def add_split_role(p, mp=True):
+def add_keepalive(p, default=None):
+    """default: seconds, or None for off."""
+    p.add_argument('--keepalive', type=float, default=default,
+                   metavar='SEC',
+                   help='QUIC keep-alive interval seconds (PING), so a '
+                        'flow-controlled quiet connection is not dropped '
+                        'on idle timeout. 0 disables. Default: '
+                        + ('off' if default is None else f'{default:g}'))
+
+
+def add_compat(p):
+    p.add_argument('--compat', type=str, default='',
+                   help='Comma-separated relay compat tolerances: '
+                        'lenient-extensions (truncated trailing-'
+                        'extensions block on control messages), '
+                        'libquicr, all')
+
+
+def add_split_role(p):
     """For tools that can run one end or both. --role says which end(s);
     --mp says whether to spread that role across processes; URL presence
     says whether the peer is a remote relay."""
     p.add_argument('--role', choices=('both', 'pub', 'sub'),
                    default='both',
                    help='Which end(s) this process runs (default: both)')
-    if mp:
-        p.add_argument('--mp', action='store_true',
-                       help='Run this role across separate processes '
-                            'instead of one')
+    p.add_argument('--mp', action='store_true',
+                   help='Run this role across separate processes '
+                        'instead of one')
 
 
 def add_timestamps(p):

@@ -1501,8 +1501,8 @@ def parse_args():
     p.add_argument("--loopback", action="store_true",
                    help="Explicitly select the loopback self-test "
                         "(the default when no URL is given)")
-    p.add_argument("-p", "--port", type=int, default=None,
-                   metavar="PORT", dest="loopback_port",
+    p.add_argument("--loopback-port", type=int, default=None,
+                   metavar="PORT",
                    help="Loopback listen port (default: 4435)")
     p.add_argument("--mp", action="store_true", dest="mp_loopback",
                    help="Run this role across separate processes rather "
@@ -1520,7 +1520,7 @@ def parse_args():
     p.add_argument("--key", default=KEY)
     p.add_argument("--report", metavar="PATH",
                    help="write per-sample metrics as CSV to PATH")
-    p.add_argument("-l", "--latency-threshold", type=float, default=100.0,
+    p.add_argument("--latency-threshold", type=float, default=100.0,
                    metavar="MS", dest="latency_threshold",
                    help="p90 latency SLA in ms; back off after 2 intervals "
                         "over (default: 100)")
@@ -1612,7 +1612,8 @@ def parse_args():
     # Addressing: a URL says where to dial; loopback options say what to
     # bind. Never both — silent precedence hides which mode you got.
     if args.relay_url and (args.loopback or args.loopback_port is not None):
-        p.error("--loopback/-p are self-test options and cannot be "
+        p.error("--loopback/--loopback-port are self-test options and "
+                "cannot be "
                 "combined with a URL — a URL says where to dial, "
                 "loopback options say what to bind")
 

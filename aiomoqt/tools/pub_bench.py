@@ -84,7 +84,7 @@ The URL scheme selects the transport:
     _cli.add_endpoint(parser)
     _cli.add_identity(parser)
     _cli.add_publisher_media(parser)
-    _cli.add_run(parser, interval=False)
+    _cli.add_run(parser)
     _cli.add_session(parser)
     _cli.add_timestamps(parser)
     pub_mode = parser.add_mutually_exclusive_group()

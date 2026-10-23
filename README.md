@@ -329,9 +329,9 @@ python -m aiomoqt.tools.moq_interop_relay --bind 0.0.0.0 --port 4443 \
 Reads a relay list, performs a real CLIENT_SETUP / SERVER_SETUP handshake per (endpoint × draft), and writes a JSON status report. Accepts CLI flags, environment variables, or both (CLI overrides env).
 
 ```bash
-python -m aiomoqt.tools.relay_probe -f relays.json -o status.json
+python -m aiomoqt.tools.relay_probe --relays-file relays.json -o status.json
 RELAYS_FILE=relays.json OUTPUT_FILE=status.json python -m aiomoqt.tools.relay_probe
-python -m aiomoqt.tools.relay_probe -f relays.json -o status.json --interval 300
+python -m aiomoqt.tools.relay_probe --relays-file relays.json -o status.json --interval 300
 ```
 
 | CLI flag | Env var | Default | Meaning |

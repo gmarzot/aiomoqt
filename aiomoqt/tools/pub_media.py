@@ -205,8 +205,10 @@ def parse_args():
              'object of each group. Sources without a fixed GOP (live '
              'inputs, irregular keyframes) send OBJECT_TIMESTAMP on every '
              'object instead. LOC timestamps are unchanged.')
-    _cli.add_run(parser, duration=30, interval=False)
-    _cli.add_session(parser, keepalive=10, compat=True)
+    _cli.add_run(parser, duration=30)
+    _cli.add_session(parser)
+    _cli.add_keepalive(parser, default=10)
+    _cli.add_compat(parser)
     _cli.add_help(parser)
     args = parser.parse_args()
     if sum(bool(s) for s in (args.mp4, args.h264, args.ts, args.input)) > 1:

@@ -454,7 +454,7 @@ def _loopback_adaptive_bench(log_dir: Path) -> tuple[str, str]:
            sys.executable, "-m", "aiomoqt.tools.adaptive_bench",
            "--start-mbps", "10", "--step-mbps", "10",
            "--max-mbps", "500", "--interval", "3",
-           "-l", "100", "-k"]
+           "--latency-threshold", "100", "-k"]
     _run(cmd, log, 45)
     text = log.read_text()
     # fmt_bps emits e.g. "80Mbps" or "1.2Gbps" (no space) — match both

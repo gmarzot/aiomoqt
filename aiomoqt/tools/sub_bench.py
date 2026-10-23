@@ -131,7 +131,10 @@ examples:
     _cli.add_endpoint(parser)
     _cli.add_identity(parser)
     _cli.add_run(parser, duration=0)   # 0 = run until publisher closes
-    _cli.add_session(parser, keepalive=True, compat=True)
+    _cli.add_interval(parser)
+    _cli.add_session(parser)
+    _cli.add_keepalive(parser)
+    _cli.add_compat(parser)
     _cli.add_timestamp_checking(parser)
     parser.add_argument(
         '--auth-token', type=str, default=None,

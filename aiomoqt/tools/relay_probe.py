@@ -338,7 +338,7 @@ def parse_args(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument(
-        "-f", "--relays-file", default=RELAYS_FILE, metavar="PATH",
+        "--relays-file", default=RELAYS_FILE, metavar="PATH",
         help=f"input relay list JSON (env: RELAYS_FILE; "
              f"default: {RELAYS_FILE!r})")
     p.add_argument(

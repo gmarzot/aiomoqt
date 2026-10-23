@@ -56,7 +56,7 @@ flags instead. `-h` (also `-?`, `--help`) prints help on every tool.
   `--cc-algo cubic`.
 - Loopback timing: picoquic's BBRv3 is reported to freeze cwnd below 128 µs RTT (upstream
   #2118), not reproduced on the current pin. Use `cubic` or `newreno` for loopback timing runs.
-- `moq-relay-probe -f` reads its own relay-list schema; use `--url` for a single probe.
+- `moq-relay-probe --relays-file` reads its own relay-list schema; use `--url` for a single probe.
 - `moq-interop-relay` is a conformance and interop fixture, not a production relay: a bounded
   recent-object cache (8 groups / 32 MiB per track) for FETCH and JOIN; no authentication, authorization or rate limiting; a per-stream TX budget
   but unbounded per-track forwarding queues; no delivery timeout. Its module docstring has the
