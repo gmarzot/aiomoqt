@@ -1994,6 +1994,10 @@ class SubscribedTrack(Track):
         except TimestampMalformed as e:
             self.timing.assign(TrackTiming())
             self.timing_error = str(e)
+        # Objects can reach the check before subscribe() resumes.
+        alias = getattr(msg, 'track_alias', None)
+        if alias is not None:
+            self.track_alias = alias
         self._route_timing_checks(msg)
 
     def _checks_every_object(self) -> bool:
