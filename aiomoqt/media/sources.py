@@ -274,23 +274,48 @@ class Mp4AudioTrack(_TrackReader):
         """RFC 6381 (e.g. mp4a.40.2) from the ASC audioObjectType."""
         return f"mp4a.40.{(self.asc[0] >> 3) & 0x1F}"
 
+    @property
+    def config(self) -> bytes:
+        """Decoder description: the AudioSpecificConfig."""
+        return self.asc
+
+
+class Mp4OpusTrack(_TrackReader):
+    """Opus track (Opus sample entry + dOps): samples are Opus packets,
+    decoded at 48 kHz. No decoder description: mono and stereo need
+    none (WebCodecs Opus registration)."""
+
+    def _parse_entry(self, ebody, eend):
+        d = self._data
+        dops = _find(d, ebody + 28, eend, b'dOps')
+        if dops is None:
+            raise Mp4Error("no dOps in Opus sample entry")
+        self.channels = d[dops[0] + 1]
+        self.pre_skip = struct.unpack_from('>H', d, dops[0] + 2)[0]
+        self.samplerate = 48000
+
+    codec_string = 'opus'
+    config = None
+
 
 class Mp4Reader:
-    """Plain (non-fragmented) MP4: first H.264 video and/or first AAC
-    audio track. At least one must be present."""
+    """Plain (non-fragmented) MP4: first video track and/or first AAC or
+    Opus audio track. At least one must be present."""
 
     def __init__(self, path: str):
         with open(path, 'rb') as f:
             data = f.read()
         self.video: Optional[Mp4VideoTrack] = None
-        self.audio: Optional[Mp4AudioTrack] = None
+        self.audio: Optional[_TrackReader] = None
         for etype, ebody, eend, trak in _traks(data):
             if etype in (b'avc1', b'avc3', b'av01') and self.video is None:
                 self.video = Mp4VideoTrack(data, (ebody, eend), trak)
             elif etype == b'mp4a' and self.audio is None:
                 self.audio = Mp4AudioTrack(data, (ebody, eend), trak)
+            elif etype == b'Opus' and self.audio is None:
+                self.audio = Mp4OpusTrack(data, (ebody, eend), trak)
         if self.video is None and self.audio is None:
-            raise Mp4Error("no avc1/avc3/av01 or mp4a track")
+            raise Mp4Error("no avc1/avc3/av01, mp4a or Opus track")
 
 
 class Mp4AvcReader(Mp4VideoTrack):

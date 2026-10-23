@@ -105,8 +105,8 @@ def parse_args():
                              'pipe); frames are stamped on arrival')
     parser.add_argument('--ts', type=str, default=None, metavar='FILE',
                         help='Publish a live MPEG-TS stream ("-" = stdin): '
-                             'H.264 video and AAC audio, stamped from '
-                             'the PES timestamps')
+                             'H.264 video and AAC or Opus audio, stamped '
+                             'from the PES timestamps')
     parser.add_argument('--input', type=str, default=None, metavar='URL',
                         help='Publish anything FFmpeg opens (HLS or DASH '
                              'playlist, file, ...) as CMAF tracks, paced '
@@ -145,8 +145,8 @@ def parse_args():
                         help='Video only — omit the audio track')
     parser.add_argument('--tone', action='store_true',
                         help='Synthesized pcm-s16 tone audio even when '
-                             'the mp4 has an AAC track (default: use '
-                             'the mp4\'s AAC audio when present)')
+                             'the mp4 has an AAC or Opus track (default: '
+                             'use the mp4\'s audio when present)')
     parser.add_argument('--target-latency', type=int, default=None,
                         metavar='MS',
                         help='Catalog targetLatency (msf-01 §5.2.8) — '
@@ -268,15 +268,18 @@ def _build_catalog(args, video, audio, chunkers=None) -> Catalog:
     tracks = []
     init = []
     if audio is not None:
+        # Opus over LOC needs no decoder description, so no initData.
+        a_init = (chunkers['audio'].init_segment() if 'audio' in chunkers
+                  else audio.config)
         tracks.append(CatalogTrack(
             name='audio', packaging=packaging, isLive=True, role='audio',
             renderGroup=1, codec=audio.codec_string,
             samplerate=audio.samplerate,
             channelConfig=str(audio.channels),
-            bitrate=audio.avg_bitrate or 128_000, initRef='a0'))
-        init.append(InitData.from_bytes(
-            'a0', chunkers['audio'].init_segment()
-            if 'audio' in chunkers else audio.asc))
+            bitrate=audio.avg_bitrate or 128_000,
+            initRef='a0' if a_init else None))
+        if a_init:
+            init.append(InitData.from_bytes('a0', a_init))
     elif not args.no_audio:
         tracks.append(CatalogTrack(
             name='audio', packaging='loc', isLive=True, role='audio',
@@ -433,18 +436,16 @@ async def _feed_h264_live(track, fh, asm, first, args, stats):
     await track.finish()
 
 
-class _LiveAac:
-    """Catalog-facing view of a live ADTS audio stream."""
+class _LiveAudio:
+    """Catalog-facing view of a live AAC (ADTS) or Opus audio stream."""
 
     def __init__(self, dmx: TsDemuxer):
-        self.asc = dmx.audio_asc
+        self.config = dmx.audio_asc
         self.samplerate = dmx.audio_samplerate
         self.channels = dmx.audio_channels
         self.avg_bitrate = None
-
-    @property
-    def codec_string(self) -> str:
-        return f"mp4a.40.{(self.asc[0] >> 3) & 0x1F}"
+        self.codec_string = ('opus' if dmx.audio_codec == 'opus'
+                             else f"mp4a.40.{(self.config[0] >> 3) & 0x1F}")
 
 
 def _open_live_ts(args):
@@ -460,7 +461,7 @@ def _open_live_ts(args):
         if dmx.video_pid is not None and dmx.video.config is None:
             return False
         want_audio = not args.no_audio and dmx.audio_pid is not None
-        return not want_audio or dmx.audio_asc is not None
+        return not want_audio or dmx.audio_samplerate is not None
 
     while not ready():
         chunk = fh.read1(65536)
@@ -471,10 +472,11 @@ def _open_live_ts(args):
             dmx.to_us(units[0].pts)  # anchor at arrival, not at first send
         first += units
     video = _LiveH264(dmx.video) if dmx.video_pid is not None else None
-    audio = (_LiveAac(dmx)
+    audio = (_LiveAudio(dmx)
              if dmx.audio_pid is not None and not args.no_audio else None)
     if video is None and audio is None:
-        raise SystemExit('  error: ts stream has no H.264 video or AAC audio')
+        raise SystemExit('  error: ts stream has no H.264 video or AAC/Opus '
+                         'audio')
     return fh, dmx, first, video, audio
 
 
@@ -498,17 +500,20 @@ async def _apply_config_change(dmx: TsDemuxer, tracks: dict, pub):
         print(f"  video config changed: {view.width}x{view.height} "
               f"{view.codec_string}")
     audio = tracks.get('audio')
-    if audio is not None and dmx.audio_asc != audio.config:
+    entry = cat.find('audio')
+    if audio is not None and (
+            dmx.audio_asc != audio.config or (
+                entry is not None
+                and entry.channelConfig != str(dmx.audio_channels))):
         audio.config = dmx.audio_asc
-        view = _LiveAac(dmx)
+        view = _LiveAudio(dmx)
         if audio.codec_string is not None:
             audio.codec_string = view.codec_string
-        for t in cat.tracks:
-            if t.name == 'audio':
-                t.codec, t.samplerate = view.codec_string, view.samplerate
-                t.channelConfig = str(view.channels)
-        if 'a0' in init:
-            init['a0'].data = InitData.from_bytes('a0', view.asc).data
+        if entry is not None:
+            entry.codec, entry.samplerate = view.codec_string, view.samplerate
+            entry.channelConfig = str(view.channels)
+        if 'a0' in init and view.config:
+            init['a0'].data = InitData.from_bytes('a0', view.config).data
         print(f"  audio config changed: {view.codec_string} "
               f"{view.samplerate}Hz {view.channels}ch")
     cat.generatedAt = int(time.time() * 1000)
@@ -577,6 +582,11 @@ def _sample_cadence(source):
     if sync[0] != 1 or len(gaps) > 1:
         return None
     return stts[0], (gaps.pop() if gaps else len(source._sizes))
+
+
+def _sample_us(source) -> int:
+    """Duration of an mp4 track's first sample in µs."""
+    return source._stts[0][1] * 1_000_000 // source.timescale
 
 
 def _frindell_for(source, wall0: int, group_us=None):
@@ -798,7 +808,7 @@ async def run(args):
             chunkers['audio'] = CmafChunker(mp4_audio)
         elif not args.no_audio:
             print(f"  note: {args.packaging} packaging — tone audio skipped "
-                  "(no AAC track in the mp4)")
+                  "(no AAC or Opus track in the mp4)")
             args.no_audio = True
     ingest = await _open_ingest(args) if args.input else None
     if ingest is not None:
@@ -896,7 +906,7 @@ async def run(args):
             if ts_audio is not None:
                 tracks['audio'] = pub.add_track(_timed(LocTrackPublisher(
                     session, args.namespace, 'audio', media_kind='audio',
-                    config=ts_audio.asc,
+                    config=ts_audio.config,
                     mapping=(StreamMapping.DATAGRAM if args.datagram
                              else StreamMapping.PER_GROUP),
                     loc01_compat=args.loc01_compat, loc_bare=loc_bare,
@@ -913,7 +923,7 @@ async def run(args):
             spf = _SAMPLERATE * _FRAME_MS // 1000
             audio_track = pub.add_track(_timed(_track(
                 'audio', media_kind='audio',
-                config=mp4_audio.asc if mp4_audio is not None else None,
+                config=mp4_audio.config if mp4_audio is not None else None,
                 mapping=(StreamMapping.DATAGRAM if args.datagram
                          else StreamMapping.PER_GROUP),
                 loc01_compat=args.loc01_compat,
@@ -929,7 +939,7 @@ async def run(args):
                     audio_track, mp4_audio, args, stats['audio'],
                     all_key=True,
                     group_us=audio_group_us,
-                    gap_us=1_000_000 * 1024 // mp4_audio.samplerate,
+                    gap_us=_sample_us(mp4_audio),
                     wrap=(lambda s, ck=a_ck:
                           ck.chunk(s.payload, s.duration)) if a_ck
                     else None, clock=clock))
