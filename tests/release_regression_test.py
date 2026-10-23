@@ -70,7 +70,10 @@ TIERS = {
                     # (the in-process loopback misses the pub/sub-worker
                     # start path — see the 0.9.10 BW clobber).
                     "loopback-adaptive-mp-d14", "loopback-adaptive-mp-d16",
-                    "loopback-adaptive-mp-d18",
+                    "loopback-adaptive-mp-d18", "loopback-adaptive-mp-d20",
+                    "loopback-adaptive-mp-d22",
+                    # adaptive BW in relay mode over raw QUIC
+                    "loopback-adaptive-relay-quic-d22",
                     "loopback-fetch"],
     "interop":     ["relay-ctrl-msg", "relay-pub-sub", "relay-discovery",
                     "relay-join", "relay-fetch", "relay-data"],
@@ -282,7 +285,10 @@ def _loopback_adaptive_mp(log_dir: Path, draft: int) -> tuple[str, str]:
            "--step-mbps", "10", "--max-mbps", "60", "--interval", "2",
            "-t", "20", "-k"]
     _run(cmd, log, 45)
-    text = log.read_text()
+    return _adaptive_verdict(log.read_text())
+
+
+def _adaptive_verdict(text: str) -> tuple[str, str]:
     if "Traceback" in text:
         return "FAIL", "traceback"
     m = re.search(r"High-water:\s+([\d.]+)\s*([KMGT]?bps)", text)
@@ -291,6 +297,44 @@ def _loopback_adaptive_mp(log_dir: Path, draft: int) -> tuple[str, str]:
     if float(m.group(1)) > 0:
         return "PASS", f"high-water {m.group(1)} {m.group(2)}"
     return "FAIL", "no interval without shortfall (high-water 0)"
+
+
+def _loopback_adaptive_relay_quic(log_dir: Path, draft: int) -> tuple[str, str]:
+    """adaptive_bench in relay mode (pub and sub processes) through the
+    local interop relay over raw QUIC."""
+    import socket
+    import time
+    slug = f"loopback-adaptive-relay-quic-d{draft}"
+    log = log_dir / f"{slug}.log"
+    relay_log = log_dir / f"{slug}-relay.log"
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    with open(relay_log, "w") as f:
+        relay = subprocess.Popen(
+            [sys.executable, "-m", "aiomoqt.tools.moq_interop_relay",
+             "--bind", "127.0.0.1", "--port", str(port), "--quic",
+             "--cert", "certs/cert.pem", "--key", "certs/key.pem"],
+            stdout=subprocess.DEVNULL, stderr=f)
+    try:
+        deadline = time.monotonic() + 15
+        while "Listening on" not in relay_log.read_text():
+            if relay.poll() is not None or time.monotonic() > deadline:
+                return "FAIL", "relay did not start"
+            time.sleep(0.1)
+        cmd = [sys.executable, "-m", "aiomoqt.tools.adaptive_bench",
+               f"moqt://127.0.0.1:{port}", "--draft", str(draft),
+               "-P", "1", "-s", "4096", "--start-mbps", "20",
+               "--step-mbps", "10", "--max-mbps", "60", "--interval", "2",
+               "-t", "20", "-k"]
+        _run(cmd, log, 45)
+        return _adaptive_verdict(log.read_text())
+    finally:
+        relay.terminate()
+        try:
+            relay.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            relay.kill()
 
 
 # ---------------------------------------------------------------------------
@@ -697,12 +741,17 @@ def main() -> int:
                     status, detail = _loopback_bench_combo(log_dir, draft, quic)
                     record_and_print((status, suite, detail,
                                       log_dir / f"{suite}.log"))
-        for draft in (14, 16, 18):
+        for draft in (14, 16, 18, 20, 22):
             suite = f"loopback-adaptive-mp-d{draft}"
             if suite in enabled:
                 status, detail = _loopback_adaptive_mp(log_dir, draft)
                 record_and_print((status, suite, detail,
                                   log_dir / f"{suite}.log"))
+        suite = "loopback-adaptive-relay-quic-d22"
+        if suite in enabled:
+            status, detail = _loopback_adaptive_relay_quic(log_dir, 22)
+            record_and_print((status, suite, detail,
+                              log_dir / f"{suite}.log"))
         if "loopback-fetch" in enabled:
             status, detail = _loopback_fetch(log_dir)
             record_and_print((status, "loopback-fetch", detail,
