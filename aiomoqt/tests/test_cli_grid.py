@@ -315,3 +315,16 @@ def test_load_sim_draft_takes_a_draft_list():
     acts = [a for a in _parser_actions("load_sim") if a.dest == "draft"]
     assert acts[0].type("22,20") == [22, 20]
     assert "22" in acts[0].help
+
+
+@pytest.mark.parametrize("argv,insecure", [
+    ([], True), (["-k"], True), (["--insecure"], True),
+    (["--cert", "c.pem", "--key", "k.pem"], False),
+    (["--cert", "c.pem", "--key", "k.pem", "-k"], True),
+])
+def test_loopback_bench_insecure(monkeypatch, argv, insecure):
+    from aiomoqt.tools import loopback_bench
+    monkeypatch.setattr(sys, "argv", ["loopback_bench", *argv])
+    args = loopback_bench.parse_args()
+    assert args.insecure is insecure
+    assert args.cert
