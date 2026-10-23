@@ -1045,10 +1045,18 @@ def _verdict(groups: Dict[int, "GroupRT"],
     return lines, failed
 
 
+def _run():
+    # Ctrl-C before main() installs its SIGINT handler.
+    try:
+        return main()
+    except KeyboardInterrupt:
+        return 130
+
+
 def cli():
     """Console entry point (moq-load-sim)."""
-    sys.exit(main())
+    sys.exit(_run())
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_run())
