@@ -2,6 +2,7 @@
 
 ## v0.13.2
 
+- Relay: the first subscriber no longer narrows the upstream subscription; Next Object with nothing cached starts at {0, 0}, unfiltered subscribers get cached objects, and an earlier start is fetched upstream.
 - adaptive_bench and load_sim: worker processes ignore Ctrl-C; the parent stops them.
 - Relay status: each session reports `rtt_min_ms` beside `rtt_ms`.
 - Relay status: a session's `loss_pct` is null unless the relay delivers to it; publisher sessions no longer read ~60% loss from unacked ACK-only packets.
