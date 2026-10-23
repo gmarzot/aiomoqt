@@ -799,6 +799,16 @@ def main():
         compat=args.compat,
     )
 
+    stopping = False
+
+    def _on_sigint(_sig, _frm):
+        nonlocal stopping
+        stopping = True
+
+    # Before any fork: a SIGINT during fork() raises in an at-fork
+    # callback, where Python discards it.
+    signal.signal(signal.SIGINT, _on_sigint)
+
     pubs = {ps.key: PubRT(ps) for ps in pub_specs} \
         if args.role in ("both", "pub") else {}
     groups: Dict[int, GroupRT] = {}
@@ -833,13 +843,6 @@ def main():
     start = time.monotonic()
     last_report = start
     last_tick = start
-    stopping = False
-
-    def _on_sigint(_sig, _frm):
-        nonlocal stopping
-        stopping = True
-
-    signal.signal(signal.SIGINT, _on_sigint)
 
     def _pub_rate_ops(ps: PubSpec) -> float:
         return ps.fps
@@ -985,7 +988,9 @@ def main():
                 proc.join(timeout=1.0)
         # Stats the shards posted before they stopped.
         _drain_sub_events(sub_events_q, groups)
-        for q in [sub_events_q]:
+        # Unread commands to a stopped shard must not block exit.
+        for q in [sub_events_q] + [s.cmd_q for g in groups.values()
+                                   for s in g.shards]:
             q.cancel_join_thread()
         if csv_f:
             csv_f.close()
@@ -995,6 +1000,8 @@ def main():
     print("─" * 72)
     for line in lines:
         print(line)
+    if stopping:
+        return 130     # interrupted: the verdict covers a partial run
     return 1 if failed else 0
 
 
