@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.13.2
 
 - loopback_bench: `--cert` without `-k` verifies against that cert, and a run with no objects exits 1.
 - load_sim: Ctrl-C during startup exits 130 without a traceback.
