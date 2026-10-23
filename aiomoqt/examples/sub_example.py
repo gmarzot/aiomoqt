@@ -7,6 +7,7 @@ import logging
 from aiomoqt.types import (MOQT_DEFAULT_DRAFTS, ParamType, MOQTException, MOQTRequestError,
                            parse_draft_spec)
 from aiomoqt.client import MOQTClient
+from aiomoqt.utils.cli import add_help
 from aiomoqt.utils.url import parse_relay_url
 from aiomoqt.track import SubscribedTrack
 from aiomoqt.utils import wait_cond_timeout
@@ -40,9 +41,7 @@ def parse_args():
                              '(bbr | bbr1 | newreno | cubic | dcubic | '
                              'prague | fast). Default: bbr')
 
-    parser.add_argument(
-        '-?', '--help', action='help',
-        help='Show this help message and exit')
+    add_help(parser)
     args = parser.parse_args()
     # One positional URL replaces -h/--port/--path/-q: the scheme
     # selects the transport, exactly like the aiomoqt tools.

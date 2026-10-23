@@ -35,7 +35,7 @@ run               -t/--duration -i/--interval -d/--debug
 session           --draft -k/--insecure --cert/--key --keylogfile
                   --cc-algo --keepalive --max-queued-bytes
                   --max-inflight-bytes --quic-debug --compat
-help              -?/--help    (-h stays free for hosts/URLs)
+help              -h/-?/--help on every tool (-? is a shell glob: quote it)
 
 split execution (tools that can run one end or both)
   --role both|pub|sub    which end(s) this process runs
@@ -62,14 +62,16 @@ VIDEO_PROFILES = ('240p', '270p', '360p', '480p',
 
 
 def make_parser(description, epilog=None):
-    """Parser in the house style: no -h help (hosts/URLs need it)."""
+    """Parser in the house style; add_help() adds the help flags."""
     return argparse.ArgumentParser(
         add_help=False, description=description, epilog=epilog,
         formatter_class=argparse.RawDescriptionHelpFormatter)
 
 
 def add_help(p):
-    p.add_argument('-?', '--help', action='help',
+    """-h, -? and --help all print help. Build the parser with
+    add_help=False (make_parser does) so argparse adds no -h of its own."""
+    p.add_argument('-h', '-?', '--help', action='help',
                    help='Show this help message and exit')
 
 

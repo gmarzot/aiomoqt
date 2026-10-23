@@ -64,6 +64,7 @@ from typing import Any, Dict, List
 from aiomoqt.client import MOQTClient
 from aiomoqt.track import SubscribedTrack, TrackState
 from aiomoqt.types import FilterType
+from aiomoqt.utils import cli as _cli
 from aiomoqt.utils.cli import endpoint_url
 from aiomoqt.utils.url import parse_relay_url
 from aiomoqt.utils.format import fmt_bps
@@ -709,8 +710,7 @@ def parse_args(argv=None):
     p.add_argument("--logdir", default=None,
                    help="Per-process debug log directory")
     p.add_argument("-d", "--debug", action="store_true")
-    p.add_argument("-?", "--help", action="help",
-                   help="Show this help message and exit")
+    _cli.add_help(p)
     args = p.parse_args(argv)
     return p, args
 

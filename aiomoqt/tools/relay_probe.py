@@ -45,7 +45,7 @@ from aiomoqt.types import (
     moqt_version_from_draft,
     parse_draft_spec,
 )
-from aiomoqt.utils.cli import endpoint_url
+from aiomoqt.utils.cli import add_help, endpoint_url
 from aiomoqt.utils.url import parse_relay_url
 
 logging.basicConfig(
@@ -323,6 +323,7 @@ def parse_args(argv=None):
     import argparse
     p = argparse.ArgumentParser(
         prog="python -m aiomoqt.tools.relay_probe",
+        add_help=False,
         description="MOQ relay probe — liveness and draft-version check.",
         epilog=(
             "Each CLI flag defaults from its matching environment "
@@ -380,6 +381,7 @@ def parse_args(argv=None):
         help="verbose handshake logging (DEBUG level on aiomoqt + "
              "relay-probe loggers). Off by default in --url mode so "
              "stdout stays clean for scripting.")
+    add_help(p)
     return p.parse_args(argv)
 
 

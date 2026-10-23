@@ -40,7 +40,7 @@ Most tools share one flag grid from `aiomoqt.utils.cli` (listed in its module do
 A dialed URL's scheme selects the transport: `moqt://host:port/path` is raw QUIC,
 `https://host:port/path` or bare `host:port` is WebTransport. Listeners take `-Q` (raw QUIC),
 `-W` (WebTransport), or both on one port. `moq-interop-client` follows the interop runner's
-flags instead. `--help` works on every tool.
+flags instead. `-h` (also `-?`, `--help`) prints help on every tool.
 
 ## Known traps
 

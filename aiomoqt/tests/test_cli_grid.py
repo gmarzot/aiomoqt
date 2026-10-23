@@ -12,6 +12,7 @@ Two kinds of test here:
 """
 import argparse
 import importlib
+import sys
 
 import pytest
 
@@ -21,7 +22,7 @@ from aiomoqt.utils import cli
 TOOLS = [
     "pub_bench", "sub_bench", "loopback_bench", "adaptive_bench",
     "pub_server", "load_sim", "relay_probe",
-    "moq_interop_client", "moq_interop_relay",
+    "moq_interop_client", "moq_interop_relay", "moqtest_origin",
     "pub_media", "sub_media",
 ]
 
@@ -218,16 +219,27 @@ def test_uvloop_is_gone(tool):
             f"{tool}: --uvloop was removed — it never helped")
 
 
+HELP_FLAGS = ("-h", "-?", "--help")
+
+
 @pytest.mark.parametrize("tool", TOOLS + EXAMPLES)
-def test_help_flag_is_question_mark(tool):
-    """-h stays free for hosts/URLs, so help is -?/--help."""
+def test_help_action_is_the_shared_one(tool):
     pkg = "aiomoqt.tools" if tool in TOOLS else "aiomoqt.examples"
-    acts = _parser_actions(tool, pkg)
-    helps = [a for a in acts if isinstance(a, argparse._HelpAction)]
-    if not helps:
-        pytest.skip(f"{tool}: no help action captured")
-    opts = {o for a in helps for o in a.option_strings}
-    assert "-?" in opts or "--help" in opts
+    helps = [a for a in _parser_actions(tool, pkg)
+             if isinstance(a, argparse._HelpAction)]
+    assert [tuple(a.option_strings) for a in helps] == [HELP_FLAGS]
+
+
+@pytest.mark.parametrize("flag", HELP_FLAGS)
+@pytest.mark.parametrize("tool", TOOLS + EXAMPLES)
+def test_help_flags_print_help(tool, flag, monkeypatch, capsys):
+    pkg = "aiomoqt.tools" if tool in TOOLS else "aiomoqt.examples"
+    mod = importlib.import_module(f"{pkg}.{tool}")
+    monkeypatch.setattr(sys, "argv", [tool, flag])
+    with pytest.raises(SystemExit) as e:
+        mod.parse_args([flag]) if _takes_argv(mod) else mod.parse_args()
+    assert e.value.code == 0
+    assert "usage:" in capsys.readouterr().out
 
 
 def test_known_violations_are_still_real():

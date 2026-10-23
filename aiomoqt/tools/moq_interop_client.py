@@ -36,6 +36,7 @@ from aiomoqt.types import (
     FilterType, GroupOrder, MOQTDraft, ObjectStatus, parse_draft_spec,
     MOQT_DEFAULT_DRAFTS, D16MessageType,
 )
+from aiomoqt.utils.cli import add_help
 from aiomoqt.utils.logger import set_log_level
 
 try:
@@ -1670,6 +1671,7 @@ def parse_compat(raw: str) -> frozenset:
 def parse_args():
     parser = argparse.ArgumentParser(
         description="MoQ Interop Test Client (aiomoqt)",
+        add_help=False,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Environment variables: RELAY_URL, TESTCASE, MOQT_DRAFT, "
@@ -1733,6 +1735,7 @@ def parse_args():
             "sent); some anonymous-scope relays reject any AUTH_TOKEN."
         ),
     )
+    add_help(parser)
     return parser.parse_args()
 
 

@@ -4,6 +4,7 @@ import argparse
 import asyncio
 
 from aiomoqt.server import MOQTServer
+from aiomoqt.utils.cli import add_help
 from aiomoqt.utils.logger import get_logger, set_log_level
 
 
@@ -31,9 +32,7 @@ def parse_args():
                              '(bbr | bbr1 | newreno | cubic | dcubic | '
                              'prague | fast). Default: bbr')
 
-    parser.add_argument(
-        '-?', '--help', action='help',
-        help='Show this help message and exit')
+    add_help(parser)
     return parser.parse_args()
 
 async def main(args):

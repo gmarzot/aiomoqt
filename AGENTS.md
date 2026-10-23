@@ -122,6 +122,8 @@ it. `test_cli_grid.py` checks that each tool in its `TOOLS` list uses a grid sho
 its grid meaning; tolerated exceptions are listed in `KNOWN_GRID_VIOLATIONS`. A dialed URL's
 scheme selects the transport (`moqt://` raw QUIC, `https://` or bare `host:port`
 WebTransport); listeners use `-Q`/`-W`, and both together serve one port via ALPN dispatch.
+`-h`, `-?` and `--help` print help on every tool and example (`cli.add_help`; the test requires
+all three). Write `-h` in docs: `-?` is a shell glob.
 
 **Fan-out layering.** Peer mechanics live in `PublishedTrack` and `aiomoqt/delivery.py`.
 Packagers under `aiomoqt/media/` only package and number objects; `broadcast.py` is the single

@@ -261,7 +261,7 @@ await server.serve_dual()   # raw QUIC + H3/WT on one port
 
 ## Tools
 
-Each tool runs as a module (`python -m aiomoqt.tools.NAME`) and most also install a console script. Every tool prints its full option set with `-?` / `--help` — note `-h` is `--host`, not help. Bench and media tools take a positional relay URL: `moqt://host[:port]` for raw QUIC, `https://host[:port]/[path]` for H3/WebTransport.
+Each tool runs as a module (`python -m aiomoqt.tools.NAME`) and most also install a console script. Every tool prints its full option set with `-h` (also `-?` or `--help`). Bench and media tools take a positional relay URL: `moqt://host[:port]` for raw QUIC, `https://host[:port]/[path]` for H3/WebTransport.
 
 | Module | Console script | Purpose |
 |---|---|---|

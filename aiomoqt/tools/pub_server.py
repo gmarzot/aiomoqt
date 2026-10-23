@@ -122,9 +122,7 @@ def parse_args():
         help='Congestion control algorithm '
              '(bbr | bbr1 | newreno | cubic | dcubic | prague | fast). '
              'Default: aiopquic default (bbr1)')
-    parser.add_argument(
-        '-?', '--help', action='help',
-        help='Show this help message and exit')
+    _cli.add_help(parser)
     parser.add_argument(
         '-D', '--datagram', action='store_true',
         help='ObjectDatagrams instead of subgroup streams (requires '

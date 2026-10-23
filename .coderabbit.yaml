@@ -25,8 +25,8 @@ reviews:
         One CLI flag letter has one meaning across every tool (-N namespace,
         -T trackname, -s size, -g group size, -P streams, -r rate, -t duration,
         -i interval, -k insecure, -d debug, -D datagram, -p port, -Q raw QUIC,
-        -W WebTransport; -h is not help, -? is). No feature toggles on the shared
-        grid helpers.
+        -W WebTransport; -h, -? and --help are help on every tool). No feature
+        toggles on the shared grid helpers.
     - path: "aiomoqt/tests/**"
       instructions: >-
         Every fix needs a test that fails without it. Zero objects delivered is a

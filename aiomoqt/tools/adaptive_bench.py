@@ -36,6 +36,7 @@ from aiomoqt.server import MOQTServer
 from aiomoqt.track import PublishedTrack, SubscribedTrack
 from aiomoqt.types import (FilterType, MOQTMessageType, ObjectStatus,
                            parse_draft_spec)
+from aiomoqt.utils import cli as _cli
 from aiomoqt.utils.cli import endpoint_url
 from aiomoqt.utils.format import fmt_bps, fmt_ms
 from aiomoqt.utils.stats import send_time_us
@@ -1605,9 +1606,7 @@ def parse_args():
                         "one stream's un-transmitted bytes exceed this. "
                         "Default: aiomoqt default (1 MiB). "
                         "Pass 0 to disable.")
-    p.add_argument(
-        '-?', '--help', action='help',
-        help='Show this help message and exit')
+    _cli.add_help(p)
     args = p.parse_args()
 
     # Addressing: a URL says where to dial; loopback options say what to

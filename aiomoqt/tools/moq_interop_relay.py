@@ -92,6 +92,7 @@ from aiomoqt.tools import relay_status
 from aiomoqt import __version__ as AIOMOQT_VERSION
 from aiomoqt.utils.logger import (get_log_level, get_logger, set_log_handler,
                                   set_log_level)
+from aiomoqt.utils.cli import add_help
 from aiomoqt.utils.url import parse_relay_url
 
 # Version confinement. The interop runner injects DRAFT (moq-interop-runner
@@ -2056,6 +2057,7 @@ def transport_settings(args) -> dict:
 def parse_args():
     parser = argparse.ArgumentParser(
         description="MoQT interop-runner relay (control-plane only)",
+        add_help=False,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -2136,6 +2138,7 @@ def parse_args():
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug logging (SIGUSR1 toggles it at "
                              "runtime)")
+    add_help(parser)
     return parser.parse_args()
 
 
