@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- pub_media: `--stats-json` writes `@mtt <json>` events to stdout (ready, stats, endpoint_lost, done) and human output to stderr.
 - pub_media: SIGTERM and SIGINT end every track with PUBLISH_DONE, drain 1 s and exit 0.
 - Delivery: an object datagram over the session's datagram limit raises `DatagramTooLarge` and is never sent or streamed; a produce() track then ends with PUBLISH_DONE INTERNAL_ERROR, and pub_media exits 64.
 - pub_media: `--audio-frames-per-group N` (one object per frame, N per group; a CMAF fragment of N chunks) and `--audio-subgroups group|object`.

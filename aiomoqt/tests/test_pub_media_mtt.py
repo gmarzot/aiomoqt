@@ -3,7 +3,9 @@ sources, object-to-subgroup and audio group mapping, the datagram size
 limit, signal shutdown and --stats-json, end to end through the interop
 relay into sub_media --analyze where a session is involved."""
 import asyncio
+import contextlib
 import csv
+import json
 import os
 import threading
 import time
@@ -521,3 +523,94 @@ async def test_signal_ends_tracks_with_publish_done(
     assert {n for n, *_ in publish_dones} >= {'video', 'audio'}
     assert all(status == 0x2 for _, status, _ in publish_dones)
     assert _subgroups(arrivals, 'video') and _subgroups(arrivals, 'audio')
+
+
+# -- T6: --stats-json --------------------------------------------------------
+
+def _mtt_events(out: str):
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    assert lines and all(ln.startswith('@mtt {') for ln in lines), lines[:3]
+    return [json.loads(ln[len('@mtt '):]) for ln in lines]
+
+
+@requires_certs
+@pytest.mark.parametrize('use_quic', [True, False], ids=['quic', 'wt'])
+async def test_stats_json_events(monkeypatch, capsys, h264_aac, use_quic):
+    from aiomoqt.tools import sub_media
+    port = _BASE_PORT + 70 + (not use_quic)
+    scheme = 'moqt' if use_quic else 'https'
+    url = f'{scheme}://localhost:{port}/'
+    # Nothing listens there: the dial fails after ~10 s, so only once.
+    dead = [] if use_quic else [f'https://localhost:{port + 5}/']
+    pub_args = _argv(monkeypatch, 'pub_media', url, *dead, '-k', '--draft',
+                     '18', '-t', '3', '--stats', '0.5', '--pub-ns', '-N',
+                     'mtt/json', '--mp4', h264_aac, '--loop', '--stats-json')
+    sub_args = _argv(monkeypatch, 'sub_media', url, '-k', '--draft', '18',
+                     '-N', 'mtt/json', '--analyze', '-t', '2', '-i', '1')
+
+    async def body(relay):
+        async def _sub():
+            while not relay._announced:
+                await asyncio.sleep(0.05)
+            return await sub_media.run(sub_args)
+        sub = asyncio.ensure_future(_sub())
+        await asyncio.wait_for(pub_media.run(pub_args), 20)
+        return await asyncio.wait_for(sub, 10)
+    await _with_relay(port, use_quic, body)
+    captured = capsys.readouterr()
+    events = _mtt_events(captured.out)
+    assert 'publishing...' in captured.err and '[pub ' in captured.err
+    kinds = [e['event'] for e in events]
+    assert kinds[0] == 'ready' and kinds[-1] == 'done'
+    assert events[-1]['reason'] == 'duration'
+    assert events[0]['endpoints'] == [
+        {'url': url, 'state': 'up', 'draft': 18}] + [
+        {'url': u, 'state': 'down', 'draft': None} for u in dead]
+    stats = [e for e in events if e['event'] == 'stats']
+    assert len(stats) >= 3
+    last = stats[-1]
+    assert set(last['tracks']) == {'video', 'audio'}
+    assert last['tracks']['video']['objects'] > 0
+    assert last['tracks']['video']['groups'] >= 1
+    assert last['tracks']['audio']['kbps'] > 0
+    assert {'dropped', 'discarded'} <= set(last['tracks']['audio'])
+    assert any(s['subscribers'] == 1 for s in stats)
+    assert all(s['t'] > 0 for s in stats)
+
+
+@requires_certs
+async def test_stats_json_reports_a_lost_endpoint(monkeypatch, capsys,
+                                                  h264_aac):
+    from aiomoqt.tests._certs import CERT, KEY
+    from aiomoqt.tools import moq_interop_relay as relay
+    port = _BASE_PORT + 72
+    urls = [f'moqt://localhost:{port}/', f'moqt://localhost:{port + 1}/']
+    servers = [await relay._build_server('localhost', p, CERT, KEY,
+                                         use_quic=True, draft=18).serve()
+               for p in (port, port + 1)]
+    sessions = []
+    connect = pub_media.MOQTClient.connect
+
+    @contextlib.asynccontextmanager
+    async def recording(self):
+        async with connect(self) as session:
+            sessions.append((self.port, session))
+            yield session
+    monkeypatch.setattr(pub_media.MOQTClient, 'connect', recording)
+    pub_args = _argv(monkeypatch, 'pub_media', *urls, '-k', '--draft', '18',
+                     '-t', '4', '--stats', '0', '--pub-ns', '-N', 'mtt/lost',
+                     '--mp4', h264_aac, '--loop', '--stats-json')
+    try:
+        pub = asyncio.ensure_future(pub_media.run(pub_args))
+        await asyncio.sleep(1.5)
+        dict(sessions)[port + 1].close(reason_phrase='lost in test')
+        await asyncio.wait_for(pub, 20)
+    finally:
+        for s in servers:
+            s.close()
+        relay._announced.clear()
+        relay._tracks.clear()
+    events = _mtt_events(capsys.readouterr().out)
+    lost = [e for e in events if e['event'] == 'endpoint_lost']
+    assert [e['url'] for e in lost] == [urls[1]] and lost[0]['reason']
+    assert events[-1] == {'event': 'done', 'reason': 'duration'}

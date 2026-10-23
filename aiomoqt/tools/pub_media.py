@@ -41,6 +41,7 @@ them accept.
 import asyncio
 import contextlib
 import functools
+import json
 import logging
 import math
 import signal
@@ -226,6 +227,12 @@ def parse_args():
              'object of each group. Sources without a fixed GOP (live '
              'inputs, irregular keyframes) send OBJECT_TIMESTAMP on every '
              'object instead. LOC timestamps are unchanged.')
+    out_group = parser.add_argument_group('machine output')
+    out_group.add_argument(
+        '--stats-json', action='store_true',
+        help='Events as "@mtt <json>" lines on stdout (ready, stats every '
+             '--stats interval, endpoint_lost, done); human output goes '
+             'to stderr')
     _cli.add_run(parser, duration=30, interval=False)
     _cli.add_session(parser, keepalive=10, compat=True)
     _cli.add_help(parser)
@@ -696,6 +703,8 @@ async def _send(track, stats, payload: bytes, key: bool,
     # demux). tx: what handing it to the track cost us.
     stats.count(payload, entry_us - timestamp,
                 int(time.time() * 1_000_000) - entry_us)
+    if key:
+        stats.groups += 1
 
 
 class _TrackStats:
@@ -708,13 +717,14 @@ class _TrackStats:
     their own arrival, so a constant upstream delay is inside the anchor
     and reads as zero. Capture-to-parse latency belongs to the receiver
     (sub_media's ts_skew_ms, the player's overlay)."""
-    __slots__ = ('objects', 'bytes', 'dropped',
+    __slots__ = ('objects', 'bytes', 'dropped', 'groups',
                  '_lag_sum', '_lag_n', '_lag_max', '_tx_sum')
 
     def __init__(self):
         self.objects = 0
         self.bytes = 0
         self.dropped = 0
+        self.groups = 0
         self._lag_sum = 0
         self._lag_n = 0
         self._lag_max = 0
@@ -754,18 +764,34 @@ async def _refresh_catalog(pub: FanoutPublisher, interval: float):
         await track.publish_catalog(track.catalog)
 
 
-async def _report_stats(stats: dict, interval: float, pub: FanoutPublisher):
+class _MttEvents:
+    """--stats-json: one `@mtt <compact json>` line per event."""
+
+    def __init__(self, fh):
+        self.fh = fh
+        self.t0 = time.monotonic()
+
+    def emit(self, event: str, **fields) -> None:
+        self.fh.write('@mtt ' + json.dumps({'event': event, **fields},
+                                           separators=(',', ':')) + '\n')
+        self.fh.flush()
+
+
+async def _report_stats(stats: dict, interval: float, pub: FanoutPublisher,
+                        events: Optional[_MttEvents] = None):
     """One line per interval: per-track objects produced, object rate and
     bitrate over the interval, frames dropped before a subscriber
     arrived, frames the track discarded unnumbered (waiting for a key
     frame, Forward State 0), frames shed per relay (index = URL position)
-    and, with several relays, the demand count."""
+    and, with several relays, the demand count. `events` also gets a
+    stats event per interval."""
     t0 = time.monotonic()
     prev_obj = {name: 0 for name in stats}
     prev_bytes = {name: 0 for name in stats}
     while True:
         await asyncio.sleep(interval)
         parts = []
+        tracks = {}
         for name, st in stats.items():
             track = pub.tracks.get(name)
             discarded = getattr(track, 'frames_dropped', 0)
@@ -774,6 +800,9 @@ async def _report_stats(stats: dict, interval: float, pub: FanoutPublisher):
             kbps = (st.bytes - prev_bytes[name]) * 8 / interval / 1000
             prev_obj[name] = objects
             prev_bytes[name] = st.bytes
+            tracks[name] = dict(objects=objects, groups=st.groups,
+                                kbps=round(kbps), dropped=st.dropped,
+                                discarded=discarded)
             lag = st.take_lag()
             line = (f"{name}: {objects} obj · {ops:.0f} obj/s · {kbps:.0f} kbps"
                     + (f" · lag {lag[0]:.0f}/{lag[1]:.0f} ms" if lag else "")
@@ -790,6 +819,11 @@ async def _report_stats(stats: dict, interval: float, pub: FanoutPublisher):
             parts.append(line)
         m, s = divmod(time.monotonic() - t0, 60)
         print(f"  [pub {int(m)}:{s:06.3f}] " + " · ".join(parts))
+        if events is not None:
+            events.emit('stats', t=round(time.monotonic() - events.t0, 3),
+                        tracks=tracks, subscribers=max(
+                            (t.demand[0] for t in pub.tracks.values()),
+                            default=0))
 
 
 async def _feed_tone(track, args, stats: _TrackStats, clock=None,
@@ -858,6 +892,28 @@ def _on_stop_signals(loop, handler) -> list:
 
 
 async def run(args):
+    """Publish until the duration, a signal or an error; with
+    --stats-json, human output goes to stderr and events to stdout."""
+    if not getattr(args, 'stats_json', False):
+        await _run(args, None)
+        return
+    events = _MttEvents(sys.stdout)
+    reason = 'error'
+    try:
+        with contextlib.redirect_stdout(sys.stderr):
+            reason = await _run(args, events)
+    except SystemExit as e:
+        reason = 'error' if e.code else 'duration'
+        raise
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        reason = 'signal'
+        raise
+    finally:
+        events.emit('done', reason=reason)
+
+
+async def _run(args, events: Optional[_MttEvents]) -> str:
+    """The run; 'duration' or 'signal' for how it ended."""
     set_log_level(logging.DEBUG if args.debug else logging.WARNING)
     libquicr = apply_compat(getattr(args, 'compat', ''))
     urls = args.url if isinstance(args.url, list) else [args.url]
@@ -920,7 +976,13 @@ async def run(args):
         opened = await asyncio.gather(*(_open(u, c)
                                         for u, c in zip(urls, clients)))
         up = [i for i, s in enumerate(opened) if s is not None]
+        if events is not None:
+            endpoints = [dict(url=u, state='up' if s is not None else 'down',
+                              draft=getattr(s, 'negotiated_draft', None))
+                         for u, s in zip(urls, opened)]
         if not up:
+            if events is not None:
+                events.emit('ready', endpoints=endpoints)
             raise SystemExit(1)
         urls = [urls[i] for i in up]
         relays = [relays[i] for i in up]
@@ -1055,8 +1117,10 @@ async def run(args):
                         publish_track=(not args.pub_ns or args.pub_both),
                         forward=args.forward)
         print("  publishing...")
+        if events is not None:
+            events.emit('ready', endpoints=endpoints)
         reporter = (asyncio.ensure_future(
-            _report_stats(stats, args.stats, pub))
+            _report_stats(stats, args.stats, pub, events))
             if args.stats > 0 and stats else None)
         refresher = (asyncio.ensure_future(
             _refresh_catalog(pub, args.catalog_interval))
@@ -1088,6 +1152,9 @@ async def run(args):
                 s = closed.pop(fut)
                 code, reason = getattr(s, '_close_err', None) or ('?', '')
                 url = urls[sessions.index(s)]
+                if events is not None:
+                    events.emit('endpoint_lost', url=url,
+                                reason=f"code={code} {reason}".strip())
                 if closed:
                     print(f"  error: {url} closed: code={code} "
                           f"reason='{reason}' — continuing on {len(closed)}")
@@ -1116,7 +1183,7 @@ async def run(args):
             await pub.catalog_track.finish()
             await asyncio.sleep(1.0)
             print("  done (signal)")
-            return
+            return 'signal'
         error = None if feed.cancelled() else feed.exception()
         if isinstance(error, DatagramTooLarge):
             # The track sent PUBLISH_DONE; the other feeders stop here.
@@ -1129,6 +1196,7 @@ async def run(args):
         await pub.catalog_track.finish()
         await asyncio.sleep(1.0)  # drain tail before teardown
     print("  done")
+    return 'duration'
 
 
 def main():
