@@ -164,6 +164,8 @@ WATCHDOG_KICK_S = 0.5
 # Dashboard (--status-dir): write period and history kept.
 STATUS_INTERVAL_S = 2.0
 STATUS_HISTORY_S = 600
+# platform.json is mostly history; its page tolerates a slower refresh.
+PLATFORM_INTERVAL_S = 5.0
 # MSF catalog track name (§5.2.3), and the watchdog's own namespace,
 # kept off the dashboard.
 CATALOG_TRACK = b"catalog"
@@ -2748,8 +2750,8 @@ def _cache_efficiency():
 
 
 class _Status:
-    """The dashboard's status.json and platform.json, rewritten every
-    STATUS_INTERVAL_S."""
+    """The dashboard's status.json, rewritten every STATUS_INTERVAL_S, and
+    platform.json, every PLATFORM_INTERVAL_S."""
 
     def __init__(self, path: str, relay: dict, handles=()) -> None:
         self.path = path
@@ -2780,14 +2782,17 @@ class _Status:
     async def run(self) -> None:
         _background.add(asyncio.create_task(self.lag.run()))
         loop = asyncio.get_running_loop()
+        platform_due = 0.0
         while True:
             try:
                 now = loop.time()
                 _prune_catalogs()
                 relay_status.write_json_atomic(
                     self.path, self.snapshot(now, time.time()))
-                relay_status.write_json_atomic(self.platform_path,
-                                               self.platform)
+                if now >= platform_due:
+                    platform_due = now + PLATFORM_INTERVAL_S
+                    relay_status.write_json_atomic(self.platform_path,
+                                                   self.platform)
             except Exception:
                 logger.warning("relay: status write failed", exc_info=True)
             await asyncio.sleep(STATUS_INTERVAL_S)
@@ -2928,7 +2933,7 @@ class _Status:
             # a session the relay mostly receives on.
             if id(s) in subs:
                 sent, lost = sent + d[2], lost + d[3]
-            rtt = pq.get("rtt") / 1000 if pq.get("rtt") else None
+            rtt = round(pq.get("rtt") / 1000, 2) if pq.get("rtt") else None
             if rtt is not None:
                 rtts.append(rtt)
             role = "+".join(r for r, ids in (("pub", pubs), ("sub", subs))

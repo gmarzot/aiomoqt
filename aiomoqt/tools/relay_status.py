@@ -374,18 +374,20 @@ class HostSampler:
                 out[key] = round(per_s(c1[name], c0[name]), 1)
         rx = sum(v[0] for v in cur["net"].values())
         tx = sum(v[4] for v in cur["net"].values())
-        out["rx_bps"] = per_s(rx, sum(v[0] for v in prev["net"].values())) * 8
-        out["tx_bps"] = per_s(tx, sum(v[4] for v in prev["net"].values())) * 8
+        out["rx_bps"] = round(per_s(rx, sum(v[0] for v in prev["net"].values())) * 8)
+        out["tx_bps"] = round(per_s(tx, sum(v[4] for v in prev["net"].values())) * 8)
         for name, v in sorted(cur["net"].items()):
             p = prev["net"].get(name)
             if p is None:
                 continue
             out["ifaces"].append({
                 "name": name,
-                "rx_bps": per_s(v[0], p[0]) * 8, "tx_bps": per_s(v[4], p[4]) * 8,
-                "rx_pps": per_s(v[1], p[1]), "tx_pps": per_s(v[5], p[5]),
-                "errs_per_s": per_s(v[2] + v[6], p[2] + p[6]),
-                "drops_per_s": per_s(v[3] + v[7], p[3] + p[7]),
+                "rx_bps": round(per_s(v[0], p[0]) * 8),
+                "tx_bps": round(per_s(v[4], p[4]) * 8),
+                "rx_pps": round(per_s(v[1], p[1]), 1),
+                "tx_pps": round(per_s(v[5], p[5]), 1),
+                "errs_per_s": round(per_s(v[2] + v[6], p[2] + p[6]), 1),
+                "drops_per_s": round(per_s(v[3] + v[7], p[3] + p[7]), 1),
             })
         u0, u1 = prev["udp"], cur["udp"]
         out["udp"] = {k: round(per_s(u1[k], u0[k]), 1) for k in u1 if k in u0}
@@ -398,9 +400,9 @@ class HostSampler:
             out["disks"].append({
                 "name": name,
                 "read_iops": round(per_s(v[0], p[0]), 1),
-                "read_Bps": per_s(v[1], p[1]) * 512,
+                "read_Bps": round(per_s(v[1], p[1]) * 512),
                 "write_iops": round(per_s(v[2], p[2]), 1),
-                "write_Bps": per_s(v[3], p[3]) * 512,
+                "write_Bps": round(per_s(v[3], p[3]) * 512),
                 "busy_pct": round(min(100.0, per_s(v[4], p[4]) / 10), 1),
             })
         if out["udp_socket"] is not None and prev["sock"] is not None:
@@ -444,7 +446,7 @@ class LoopLag:
 
     def summary(self) -> dict[str, Optional[float]]:
         """p50, p99 and max lag in milliseconds."""
-        ms = [s * 1000 for s in self.samples]
+        ms = [round(s * 1000, 2) for s in self.samples]
         return {"p50": percentile(ms, 50), "p99": percentile(ms, 99),
                 "max": max(ms) if ms else None}
 
@@ -488,9 +490,11 @@ def classify_catalog(payload: bytes) -> Optional[str]:
 
 def write_json_atomic(path: str, obj: Any) -> None:
     """Replace `path` whole, so a reader never sees a partial file."""
+    # dumps, not dump: only dumps uses the C encoder.
+    text = json.dumps(obj, separators=(",", ":"))
     tmp = f"{path}.tmp"
     with open(tmp, "w") as f:
-        json.dump(obj, f, separators=(",", ":"))
+        f.write(text)
     os.chmod(tmp, 0o644)
     os.replace(tmp, path)
 
