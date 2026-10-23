@@ -696,6 +696,9 @@
   ".sessions[].role": [
    "string"
   ],
+  ".sessions[].rtt_min_ms": [
+   "float"
+  ],
   ".sessions[].rtt_ms": [
    "float"
   ],
