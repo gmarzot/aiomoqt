@@ -2,6 +2,7 @@
 
 ## v0.13.2
 
+- Relay status: a session's `loss_pct` is null unless the relay delivers to it; publisher sessions no longer read ~60% loss from unacked ACK-only packets.
 - load_sim: Ctrl-C during startup no longer hangs: the handler is installed before workers fork, and unread shard commands do not block exit.
 - load_sim: an interrupted run prints its verdict and exits 130.
 - loopback_bench: `--cert` without `-k` verifies against that cert, and a run with no objects exits 1.

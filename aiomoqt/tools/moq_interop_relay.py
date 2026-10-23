@@ -3289,9 +3289,10 @@ class _Status:
             d = ([max(0, c - p) for c, p in zip(cur, last)]
                  if last is not None else [0, 0, 0, 0])
             tx, rx = tx + d[0], rx + d[1]
-            # Loss counts on delivery only: picoquic reports packets lost on
-            # a session the relay mostly receives on.
-            if id(s) in subs:
+            # Loss counts on delivery only: toward a publisher the relay sends
+            # mostly ACK-only packets, which picoquic counts lost unacked.
+            delivery = id(s) in subs
+            if delivery:
                 sent, lost = sent + d[2], lost + d[3]
             rtt = round(pq.get("rtt") / 1000, 2) if pq.get("rtt") else None
             if rtt is not None:
@@ -3305,7 +3306,8 @@ class _Status:
                 "rtt_ms": round(rtt, 1) if rtt is not None else None,
                 "tx_bps": bps(d[0]) if last is not None else None,
                 "rx_bps": bps(d[1]) if last is not None else None,
-                "loss_pct": (round(100 * d[3] / d[2], 2) if d[2] else None),
+                "loss_pct": (round(100 * d[3] / d[2], 2)
+                             if delivery and d[2] else None),
             })
         self._quic_prev = quic
 
