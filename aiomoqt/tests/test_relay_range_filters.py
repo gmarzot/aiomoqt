@@ -1,7 +1,8 @@
 """Relay Range Filters (d22 §3.3.2, d20 §5.1.4): SUBGROUP, OBJECTID,
 PRIORITY and OBJECT_PROPERTY filters per subscriber on live forwarding,
 cache replay, fill streams and FETCH; REQUEST_UPDATE replacing or
-removing them; the MAX_FILTER_RANGES bound. Two tracks per session."""
+removing them; TRACK_PROPERTY_FILTER on SUBSCRIBE_TRACKS; the
+MAX_FILTER_RANGES bound. Two tracks per session."""
 import asyncio
 import contextlib
 
@@ -100,6 +101,7 @@ def _reset():
     relay._announce_requests.clear()
     relay._tracks.clear()
     relay._track_subs.clear()
+    relay._track_sub_filters.clear()
     relay._ns_subs.clear()
 
 
@@ -340,6 +342,53 @@ async def test_fetch_takes_range_filters(use_quic):
         assert (oks["video"].largest_group_id,
                 oks["video"].largest_object_id) in ((1, 6), (1, 5))
         assert fx.session._close_err is None
+
+
+class _Propertied(PublishedTrack):
+    def __init__(self, *args, props=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.props = props or {}
+
+    def _track_properties(self, session):
+        return {**(super()._track_properties(session) or {}), **self.props}
+
+
+@requires_certs
+@pytest.mark.parametrize("draft", [20, 22])
+@_TRANSPORTS
+async def test_subscribe_tracks_offers_only_matching_tracks(draft,
+                                                            use_quic):
+    # §3.3.2, §3.6.1: only PUBLISHes passing the TRACK_PROPERTY_FILTER
+    # are forwarded; the other Range Filters filter their objects.
+    props = {"video": {_TRACK_PROP: 1}, "audio": {_TRACK_PROP: 1},
+             "data": {_TRACK_PROP: 2}, "meta": {}}
+    async with _relay(_port(7, draft, use_quic), use_quic, draft) as connect:
+        pub = await connect()
+        for name, p in props.items():
+            await _Propertied(pub, namespace=_NS, trackname=name,
+                              object_size=50, group_size=5, rate=100,
+                              props=p).publish()
+        assert await _until(lambda: all(_relayed(n) for n in props))
+        rx = await connect()
+        got = {n: [] for n in _NAMES}
+        await rx.subscribe_tracks(namespace=_NS, parameters={
+            P.TRACK_PROPERTY_FILTER: _rf((1, 1), prop=_TRACK_PROP),
+            P.OBJECTID_FILTER: _rf((0, 1))})
+        offered = []
+        for _ in _NAMES:
+            offer = await rx.await_publish(timeout=5.0)
+            name = offer.track_name.decode()
+            offered.append(name)
+            rx._track_aliases[offer.track_alias] = offer.request_id
+            rx.register_object_handler(offer.track_alias,
+                                       _collect(got, name))
+            rx.publish_ok(offer, forward=1)
+        assert sorted(offered) == sorted(_NAMES)
+        with pytest.raises(asyncio.TimeoutError):
+            await rx.await_publish(timeout=0.5)
+        assert await _until(lambda: all(len(v) >= 4 for v in got.values()))
+        assert {o for v in got.values() for _g, o in v} == {0, 1}
+        assert rx._close_err is None and pub._close_err is None
 
 
 def _many(n, start=0):

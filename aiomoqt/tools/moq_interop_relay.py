@@ -1103,6 +1103,8 @@ def _forget_session(session) -> None:
     """Drop everything a closing session owned: its announcements and
     its downstream subscriptions."""
     _track_subs[:] = [e for e in _track_subs if e[0] is not session]
+    for k in [k for k in _track_sub_filters if k[0] == id(session)]:
+        del _track_sub_filters[k]
     _ns_subs[:] = [e for e in _ns_subs if e[0] is not session]
     _announce_subs[:] = [e for e in _announce_subs if e[0] is not session]
     _no_datagrams.pop(id(session), None)
@@ -1668,11 +1670,12 @@ async def _on_publish(session, msg):
     logger.info(f"relay: publish ns={ns} track={msg.track_name} "
                 f"alias={msg.track_alias}")
     offered = False
-    for sub_session, prefix, _rid in list(_track_subs):
-        if _prefix_covers(prefix, ns):
+    for sub_session, prefix, rid in list(_track_subs):
+        if (_prefix_covers(prefix, ns)
+                and _track_sub_admits(sub_session, rid, track)):
             offered = True
             asyncio.create_task(
-                _offer_track(sub_session, track, key))
+                _offer_track(sub_session, track, key, rid))
     if crossing:
         _answer_publish(track, forward=any(entry.forwards))
         entry.resolve((track, None))
@@ -1957,6 +1960,7 @@ async def _on_request_update(session, msg):
     found = _joined_subscription(session, rid)
     if found is None:
         if d16:
+            _update_track_sub_filters(session, rid, msg.parameters or {})
             await session._handle_request_update(msg)
         else:
             await session._handle_subscribe_update(msg)
@@ -2226,6 +2230,10 @@ def parse_args():
 
 # SUBSCRIBE_TRACKS subscribers: (session, prefix_tuple, request_id).
 _track_subs: list = []
+# (id(session), request_id) -> a SUBSCRIBE_TRACKS's Range Filter
+# parameters: TRACK_PROPERTY_FILTER selects the tracks offered, the rest
+# filter their objects (§3.6.1).
+_track_sub_filters: dict = {}
 # (session, prefix, request_id) for SUBSCRIBE_NAMESPACE subscribers sent
 # NAMESPACE / NAMESPACE_DONE: d18 on, and d16 when Subscribe Options ask.
 _ns_subs: list = []
@@ -2242,10 +2250,27 @@ def _prefix_covers(prefix, ns) -> bool:
     return ns[:len(prefix)] == prefix
 
 
-async def _offer_track(session, track, key):
+def _track_sub_admits(session, request_id, track) -> bool:
+    """The track passes the SUBSCRIBE_TRACKS's TRACK_PROPERTY_FILTERs."""
+    params = _track_sub_filters.get((id(session), request_id))
+    return not params or RangeFilters.from_params(params).for_track(
+        track.properties) is not None
+
+
+def _update_track_sub_filters(session, request_id, params) -> None:
+    """A REQUEST_UPDATE to a SUBSCRIBE_TRACKS: its filters apply to the
+    tracks offered from now on."""
+    key = (id(session), request_id)
+    if key in _track_sub_filters and any(p in RANGE_FILTERS for p in params):
+        _track_sub_filters[key] = merge_range_filters(
+            _track_sub_filters[key], params)
+
+
+async def _offer_track(session, track, key, request_id=None):
     """§9.5: send a PUBLISH for a held/served track to a
     SUBSCRIBE_TRACKS subscriber; on PUBLISH_OK wire it into the fan-out
-    with the Forward State and filter it chose."""
+    with the Forward State and filter it chose, under the Range Filters
+    of SUBSCRIBE_TRACKS `request_id`."""
     if not _session_live(session):
         _forget_session(session)
         return
@@ -2272,9 +2297,11 @@ async def _offer_track(session, track, key):
             ParamType.FORWARD, 1)
     window = _reply_window(session, reply, track.largest) or _UNFILTERED
     # Cached objects inside the subscriber's window go first.
-    track.add_downstream(session, pub_msg.track_alias, pub_msg.request_id,
-                         forward=bool(forward), window=window,
-                         replay=track.largest is not None)
+    d = track.add_downstream(session, pub_msg.track_alias,
+                             pub_msg.request_id, forward=bool(forward),
+                             window=window, replay=track.largest is not None)
+    d.set_filters(_track_sub_filters.get((id(session), request_id), {}),
+                  track.properties)
     session.register_request_cancel_handler(
         pub_msg.request_id,
         lambda rid, t=track, s=session: t.drop_session(s))
@@ -2657,14 +2684,23 @@ async def _on_subscribe_tracks(session, msg):
     def _drop(rid, s=session, r=msg.request_id):
         _track_subs[:] = [e for e in _track_subs
                           if not (e[0] is s and e[2] == r)]
+        _track_sub_filters.pop((id(s), r), None)
     _track_subs.append((session, prefix, msg.request_id))
+    filters = merge_range_filters({}, msg.parameters or {})
+    if filters:
+        _track_sub_filters[(id(session), msg.request_id)] = filters
     session.register_request_cancel_handler(msg.request_id, _drop)
     logger.info(f"relay: subscribe-tracks prefix={prefix} "
                 f"(subs={len(_track_subs)})")
     for key, track in list(_tracks.items()):
         if _prefix_covers(prefix, key[0]) and (
                 track.pending_publish or track.upstream):
-            asyncio.create_task(_offer_track(session, track, key))
+            if not _track_sub_admits(session, msg.request_id, track):
+                logger.info(f"relay: {key} filtered out of subscribe-tracks "
+                            f"request {msg.request_id}")
+                continue
+            asyncio.create_task(
+                _offer_track(session, track, key, msg.request_id))
 
 
 async def _on_track_status(session, msg):
