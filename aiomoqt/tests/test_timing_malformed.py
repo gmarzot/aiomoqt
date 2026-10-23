@@ -232,3 +232,18 @@ def test_report_policy_installs_no_check():
     sub, sess, sink = _subscribed({TIMESCALE: 1000}, 'report')
     assert sess._pending_object_handlers[0] is sink
     assert sub._handler() is sink and sess._timing_watch == {}
+
+
+@pytest.mark.parametrize("props, exts", [
+    ({0x3F: b"x"}, {OBJECT_TIMESTAMP: 7}),
+    ({TIMESCALE: 1000}, {TIMESCALE: 1000}),
+], ids=["watched", "checked"])
+def test_object_before_subscribe_returns_cancels_its_own_alias(props, exts):
+    from types import SimpleNamespace as NS
+    sub, sess, _ = _subscribed(props)
+    cancelled = []
+    sess._malformed_track = lambda alias, *a: cancelled.append(alias)
+    check = sess._timing_watch.get(3) or sess._pending_object_handlers[0]
+    check(NS(object_id=0, group_id=0, extensions=exts), 16, 0, 0, 0)
+    assert sub.malformed and cancelled == [3]
+    assert sess._timing_watch == {}
