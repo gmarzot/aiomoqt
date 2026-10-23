@@ -2,6 +2,7 @@
 
 ## v0.13.2
 
+- Relay: the first subscriber no longer narrows the upstream subscription; Next Object with nothing cached starts at {0, 0}, unfiltered subscribers get cached objects, and an earlier start is fetched upstream.
 - load_sim: Ctrl-C during startup no longer hangs: the handler is installed before workers fork, and unread shard commands do not block exit.
 - load_sim: an interrupted run prints its verdict and exits 130.
 - loopback_bench: `--cert` without `-k` verifies against that cert, and a run with no objects exits 1.
