@@ -106,7 +106,7 @@ async def main():
 asyncio.run(main())
 ```
 
-`PublishedTrack` owns stream setup, subgroup headers, object numbering, pacing, and fan-out: `produce()` numbers the sequence once however many subscribers there are. `SubscribedTrack` is the receive side. Both are in [`aiomoqt/track.py`](aiomoqt/track.py); the raw stream API underneath — `open_uni_stream()`, `SubgroupHeader`, `stream_write()` — is in [`aiomoqt/delivery.py`](aiomoqt/delivery.py).
+`PublishedTrack` owns stream setup, subgroup headers, object numbering, pacing, and fan-out: `produce()` numbers the sequence once however many subscribers there are. `SubscribedTrack` is the receive side. Both are in [`aiomoqt/track.py`](aiomoqt/track.py); the raw stream API underneath is the session's `open_uni_stream()` and `stream_write()` ([`aiomoqt/protocol.py`](aiomoqt/protocol.py)) and `SubgroupHeader` ([`aiomoqt/messages/data.py`](aiomoqt/messages/data.py)).
 
 ## API guide
 
@@ -116,12 +116,14 @@ Every control message takes `wait_response`:
 
 ```python
 resp = await session.subscribe('ns', 'track', wait_response=True)   # awaits the response
-req  = await session.subscribe('ns', 'track')                       # response via handler
+req  = session.subscribe('ns', 'track')       # returns the SUBSCRIBE sent; response via handler
 ```
 
 Register handlers for peer-initiated messages:
 
 ```python
+from aiomoqt.types import MOQTMessageType
+
 client.register_handler(MOQTMessageType.SUBSCRIBE, my_subscribe_handler)
 ```
 
