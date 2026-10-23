@@ -18,7 +18,8 @@ __all__ = [
     'D20ParamType', 'D20RequestErrorCode', 'LocationFilterType',
     'LocationFilter', 'RangeFilter', 'param_kinds', 'param_scope',
     'uses_location_filter', 'check_param_scope', 'range_filter_error',
-    'range_filter_count', 'fill_range', 'param_name',
+    'range_filter_count', 'fill_range', 'param_name', 'RangeFilters',
+    'merge_range_filters',
 ]
 
 U64_MAX = (1 << 64) - 1
@@ -574,3 +575,89 @@ def range_filter_error(params: Dict[int, Any], *,
     if max_ranges is not None and range_filter_count(params) > max_ranges:
         return f"more than MAX_FILTER_RANGES {max_ranges} ranges"
     return None
+
+
+def merge_range_filters(current: Dict[int, Any],
+                        update: Dict[int, Any]) -> Dict[int, list]:
+    """The Range Filter parameters after `update` applies to `current`
+    (§3.3.2): a Parameter Type present in `update` replaces that type
+    whole, a zero-length one removes it, an omitted one is unchanged.
+    Also how FILL_PARAMETERS overrides its subscription (§9.20.15)."""
+    out: Dict[int, list] = {}
+    for ptype in sorted(RANGE_FILTERS):
+        src = update if ptype in update else current
+        kept = [f for p, f in _range_filter_items({ptype: src.get(ptype)})
+                if f.set_id is not None]
+        if kept:
+            out[ptype] = kept
+    return out
+
+
+def _in_ranges(f: RangeFilter, value: Any) -> bool:
+    if not isinstance(value, int):
+        return False
+    return any(start <= value and (end is None or value <= end)
+               for start, end in f.ranges)
+
+
+@dataclass(frozen=True, slots=True)
+class RangeFilters:
+    """The Range Filters of one request (§3.3.2), compiled: the filters
+    of a SetID are AND'd, SetIDs OR'd. No sets passes everything."""
+    sets: Tuple[Tuple[Tuple[int, RangeFilter], ...], ...] = ()
+
+    @classmethod
+    def from_params(cls, params: Optional[Dict[int, Any]]) -> 'RangeFilters':
+        by_set: Dict[int, list] = {}
+        for ptype, f in _range_filter_items(params or {}):
+            if f.set_id is not None:
+                by_set.setdefault(f.set_id, []).append((ptype, f))
+        return cls(tuple(tuple(v) for _, v in sorted(by_set.items())))
+
+    def __bool__(self) -> bool:
+        return bool(self.sets)
+
+    def for_track(self, properties: Optional[Dict[int, Any]]
+                  ) -> Optional['RangeFilters']:
+        """The object filters left for a track with these Track
+        Properties: the sets whose TRACK_PROPERTY_FILTERs it passes,
+        without them. None when no set admits the track."""
+        if not self.sets:
+            return self
+        props = properties or {}
+        kept = []
+        for fs in self.sets:
+            if all(_in_ranges(f, props.get(f.property_type))
+                   for p, f in fs if p == D20ParamType.TRACK_PROPERTY_FILTER):
+                kept.append(tuple((p, f) for p, f in fs
+                                  if p != D20ParamType.TRACK_PROPERTY_FILTER))
+        if not kept:
+            return None
+        if not all(kept):
+            return RangeFilters()
+        return RangeFilters(tuple(kept))
+
+    def admits(self, subgroup_id: int, object_id: int, priority: int,
+               properties: Optional[Dict[int, Any]]) -> bool:
+        """An object passes (§9.20.10-13). A missing Object Property
+        fails its filter; TRACK_PROPERTY_FILTERs are for_track()'s."""
+        if not self.sets:
+            return True
+        props = properties or {}
+        for fs in self.sets:
+            for ptype, f in fs:
+                if ptype == D20ParamType.SUBGROUP_FILTER:
+                    value = subgroup_id
+                elif ptype == D20ParamType.OBJECTID_FILTER:
+                    value = object_id
+                elif ptype == D20ParamType.PRIORITY_FILTER:
+                    value = priority
+                elif ptype == D20ParamType.OBJECT_PROPERTY_FILTER:
+                    value = props.get(f.property_type)
+                else:
+                    continue
+                if not _in_ranges(f, value):
+                    break
+            else:
+                return True
+        return False
