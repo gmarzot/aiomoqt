@@ -276,7 +276,7 @@ The publisher's rate is nudged up every interval until the subscriber's
 samples say stop.
 
 ```
-python -m aiomoqt.tools.adaptive_bench "$RELAY_QUIC" -k --draft 18 --start-mbps 10 --step-mbps 10 --max-mbps 500 -l 100 --report bw-ramp.csv
+python -m aiomoqt.tools.adaptive_bench "$RELAY_QUIC" -k --draft 18 --start-mbps 10 --step-mbps 10 --max-mbps 500 --latency-threshold 100 --report bw-ramp.csv
 ```
 
 Add `--mp` when chasing a transmit ceiling: one Python process is

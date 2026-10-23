@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- load_sim: Ctrl-C during startup exits 130 without a traceback.
+- The `test` extra installs jsonschema, so CI runs the agent-spec tests.
+- moq_interop_client `fetch` and `join`: the client publishes a live track through the relay and passes only when the FETCH or joining FETCH returns its objects; a refusal now fails.
+- loopback_bench: `-k/--insecure`; it verifies the certificate when `--cert` is given without `-k`.
+- adaptive_bench: latency and jitter with no samples print n/a, not 0.0us.
+- load_sim: `--draft` takes 14-22 or a comma list, as the other tools do.
+- Relay: an unusable `--control` path exits with a one-line error.
+- adaptive_bench `--mp` and relay runs: rates divide by the time measured so far, not a fixed 5 s, so early intervals no longer read as a shortfall.
+- relay_probe and moq_interop_client: Ctrl-C exits 130 without a traceback.
+- PublishedTrack: a producer task that fails as the session closes is logged at DEBUG, not reported as "Task exception was never retrieved".
+- `MOQTServer.close_sessions()`; the relay and pub_server close their sessions on SIGINT and SIGTERM, so peers see the close at once instead of at the idle timeout.
+- Latency reports (TrackStats tools, sub_media `--analyze`/`--report`, adaptive_bench): a negative latency prints a one-time clock-offset warning and is marked "(clock offset)"; the figures are kept and show their sign.
+- sub_bench exits 1 when it cannot connect or receives no objects, and `-t` bounds connecting; pub_bench exits 1 with a one-line error on a dead port, also within `-t`.
+- adaptive_bench: Ctrl-C in its first half second exits cleanly instead of raising UnboundLocalError.
+- pub_server: `-Q -W` serves raw QUIC and WebTransport on one port; the subscriber hint uses `-N` and lists a URL per transport.
+- CLI: a short flag means one thing on every tool. adaptive_bench `-p` is now `--loopback-port` and `-l` is `--latency-threshold`; relay_probe `-f` is `--relays-file`.
+- Tools and examples: `-h`, `-?` and `--help` all print help; relay_probe, moq_interop_client, moq_interop_relay and moqtest_origin gain `-?`.
 - pub_media: H.265 video from `--mp4` (hvc1/hev1; loc, cmaf, locmaf) and `--ts` (stream type 0x24, parameter sets in band, catalog codec `hev1`).
 - pub_media: `--stats-json` writes `@mtt <json>` events to stdout (ready, stats, endpoint_lost, done) and human output to stderr.
 - pub_media: SIGTERM and SIGINT end every track with PUBLISH_DONE, drain 1 s and exit 0.

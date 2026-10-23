@@ -120,7 +120,9 @@ def parse_args():
                         help='With --analyze: write interval and summary '
                              'rows as CSV to PATH (- = stdout)')
     _cli.add_run(parser, duration=30)
-    _cli.add_session(parser, keepalive=True)
+    _cli.add_interval(parser)
+    _cli.add_session(parser)
+    _cli.add_keepalive(parser)
     _cli.add_timestamp_checking(parser)
     _cli.add_help(parser)
     args = parser.parse_args()

@@ -33,9 +33,10 @@ installed package. Keep its API boundary and traps consistent with this file.
 
 Python >= 3.12 (CI: 3.12 / 3.13 / 3.14 on linux and macos).
 
-    uv pip install -e ".[test,media]" jsonschema      # ".[dev]" adds ruff + ty
+    uv pip install -e ".[test,media]"      # ".[dev]" adds ruff + ty
 
-`media` (PyAV) and `jsonschema` are optional; without them the media and agent-spec tests skip.
+`media` (PyAV) is optional; without it the media tests skip. `test` brings `jsonschema` for the
+agent-spec tests.
 Install editable: the loopback suites and bench scripts resolve `certs/` relative to the working
 tree. `pytest` writes `certs/` on first run; for the bench tools see README "Development".
 Version comes from `setuptools_scm` (git tags): a shallow clone without tags builds as
@@ -118,10 +119,15 @@ errors in our own internals; check against an installed wheel in a clean venv in
 ## Conventions
 
 **CLI grid.** `aiomoqt/utils/cli.py` defines the shared flag grid; its module docstring lists
-it. `test_cli_grid.py` checks that each tool in its `TOOLS` list uses a grid short flag only for
-its grid meaning; tolerated exceptions are listed in `KNOWN_GRID_VIOLATIONS`. A dialed URL's
+it. `test_cli_grid.py` checks every tool in `TOOLS` and every example: a grid short flag means
+only its grid meaning, and any short flag means one thing across all of them. There are no
+exceptions; `moq_interop_client`'s `-r/-t/-l/-v` are the interop runner's interface, listed in
+`EXTERNAL_CONTRACT` and tested against it. The `add_*` groups take no toggles: arguments set
+defaults, never which flags exist (also tested). A dialed URL's
 scheme selects the transport (`moqt://` raw QUIC, `https://` or bare `host:port`
 WebTransport); listeners use `-Q`/`-W`, and both together serve one port via ALPN dispatch.
+`-h`, `-?` and `--help` print help on every tool and example (`cli.add_help`; the test requires
+all three). Write `-h` in docs: `-?` is a shell glob.
 
 **Fan-out layering.** Peer mechanics live in `PublishedTrack` and `aiomoqt/delivery.py`.
 Packagers under `aiomoqt/media/` only package and number objects; `broadcast.py` is the single

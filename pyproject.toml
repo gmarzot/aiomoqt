@@ -58,10 +58,12 @@ moq-interop-relay = "aiomoqt.tools.moq_interop_relay:cli"
 test = [
     "pytest",
     "pytest-asyncio",
+    "jsonschema",
 ]
 dev = [
     "pytest",
     "pytest-asyncio",
+    "jsonschema",
     "ruff",
     "ty",
 ]

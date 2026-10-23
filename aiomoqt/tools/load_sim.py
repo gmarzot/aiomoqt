@@ -63,7 +63,8 @@ from typing import Any, Dict, List
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.track import SubscribedTrack, TrackState
-from aiomoqt.types import FilterType
+from aiomoqt.types import MOQT_DEFAULT_DRAFTS, FilterType, parse_draft_spec
+from aiomoqt.utils import cli as _cli
 from aiomoqt.utils.cli import endpoint_url
 from aiomoqt.utils.url import parse_relay_url
 from aiomoqt.utils.format import fmt_bps
@@ -687,8 +688,11 @@ def parse_args(argv=None):
                         "as moq_interop_client")
     p.add_argument("-k", "--insecure", action="store_true",
                    help="Skip TLS verification")
-    p.add_argument("--draft", type=int, default=None,
-                   help="MoQT draft version: 14, 16, or 18")
+    p.add_argument("--draft", type=parse_draft_spec, default=None,
+                   help="MoQT draft: "
+                        f"{', '.join(map(str, sorted(MOQT_DEFAULT_DRAFTS)))}; "
+                        "a comma list offers several in order. Default: "
+                        f"offer {','.join(map(str, MOQT_DEFAULT_DRAFTS))}")
     p.add_argument("--duration-scale", type=float, default=1.0,
                    help="Multiply publisher start/duration timelines")
     p.add_argument("--subs-per-proc", type=int, default=100,
@@ -709,8 +713,7 @@ def parse_args(argv=None):
     p.add_argument("--logdir", default=None,
                    help="Per-process debug log directory")
     p.add_argument("-d", "--debug", action="store_true")
-    p.add_argument("-?", "--help", action="help",
-                   help="Show this help message and exit")
+    _cli.add_help(p)
     args = p.parse_args(argv)
     return p, args
 
@@ -1042,10 +1045,18 @@ def _verdict(groups: Dict[int, "GroupRT"],
     return lines, failed
 
 
+def _run():
+    # Ctrl-C before main() installs its SIGINT handler.
+    try:
+        return main()
+    except KeyboardInterrupt:
+        return 130
+
+
 def cli():
     """Console entry point (moq-load-sim)."""
-    sys.exit(main())
+    sys.exit(_run())
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_run())
