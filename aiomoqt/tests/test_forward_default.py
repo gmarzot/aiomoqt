@@ -175,3 +175,26 @@ async def test_subscribe_without_forward_resumes_a_paused_track(draft,
         assert flowing, {n: rx.count(a) for n, a in resumed.items()}
         for name, alias in resumed.items():
             _assert_own_sizes(rx, alias, name)
+
+
+@_TRANSPORTS
+@pytest.mark.parametrize("draft", [16, 18])
+async def test_update_read_with_the_publish_ok_keeps_forward(draft, use_quic):
+    """PUBLISH_OK forward=0 and REQUEST_UPDATE forward=1 sent back to back
+    reach the publisher in one read; the update is the newer state."""
+    rx = _Receiver()
+    async with _loopback(_port(3, draft, use_quic), draft, rx,
+                         use_quic) as session:
+        for track in _tracks(session):
+            await track.publish(forward=0)
+        msgs = [await asyncio.wait_for(rx.publishes.get(), 5.0)
+                for _ in _SIZES]
+        for msg in msgs:
+            rx.watch(rx.session, msg.track_alias)
+            rx.session.publish_ok(msg, forward=0)
+            rx.session.request_update(msg.request_id, forward=1)
+        flowing = await _until(lambda: all(
+            rx.count(m.track_alias) >= _MIN_OBJECTS for m in msgs))
+        assert flowing, {m.track_name: rx.count(m.track_alias) for m in msgs}
+        for m in msgs:
+            _assert_own_sizes(rx, m.track_alias, m.track_name.decode())

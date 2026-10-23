@@ -2,6 +2,7 @@
 
 ## v0.13.2
 
+- PublishedTrack (d18): a REQUEST_UPDATE read together with the PUBLISH reply no longer has its Forward State undone by that reply, which left the track paused with subscribers waiting.
 - load_sim: Ctrl-C during startup no longer hangs: the handler is installed before workers fork, and unread shard commands do not block exit.
 - load_sim: an interrupted run prints its verdict and exits 130.
 - loopback_bench: `--cert` without `-k` verifies against that cert, and a run with no objects exits 1.

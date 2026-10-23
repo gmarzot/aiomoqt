@@ -429,7 +429,7 @@ class _Subscription:
                  'done', 'stream_count', 'generating', 'delivery', 'joining',
                  'window', 'open_streams', 'end_status', 'senders',
                  'fill_streams', 'fills', 'location_filter', 'group_order',
-                 'object_timeout', 'subgroup_timeout')
+                 'object_timeout', 'subgroup_timeout', 'updated_request')
 
     def __init__(self, session):
         self.session = session
@@ -470,6 +470,8 @@ class _Subscription:
         # 0 sets none. d14/d16 DELIVERY_TIMEOUT is the object timeout.
         self.object_timeout = 0
         self.subgroup_timeout = 0
+        # Request whose Forward State a REQUEST_UPDATE has set.
+        self.updated_request = None
 
     def take_timeouts(self, params, prof) -> None:
         """Record the delivery timeouts a SUBSCRIBE, PUBLISH_OK or
@@ -1166,6 +1168,10 @@ class PublishedTrack(Track):
         # FORWARD and the PUBLISH's own value stands.
         if forward is None and not sub.session._profile.publish_ok_expires_only:
             forward = 1
+        # A REQUEST_UPDATE read with the reply runs first (this task
+        # resumes a hop later) and is the newer Forward State.
+        if sub.updated_request == request_id:
+            forward = None
         logger.info(f"Track: PUBLISH_OK (REQUEST_OK): forward={forward}")
         sub.take_timeouts(getattr(reply, 'parameters', None),
                           sub.session._profile)
@@ -1206,6 +1212,8 @@ class PublishedTrack(Track):
             self._cut_streams(sub)
         if forward and not sub.forward:
             sub.joining[msg.existing_request_id] = self._largest
+        if forward is not None:
+            sub.updated_request = msg.existing_request_id
         # §10.9: exactly one REQUEST_OK or REQUEST_ERROR; LARGEST_OBJECT
         # once objects exist (§10.2.11).
         largest = self._largest
