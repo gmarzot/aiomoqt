@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Fan-out: each object is encoded once per header state and the bytes shared by every peer in that state (datagrams: per alias and draft codec).
 - SubscribedTrack: a timing-malformed object that arrives before SUBSCRIBE_OK is processed cancels its own track, not alias 0.
 - Relay: status files are encoded with json's C encoder.
 - Relay: status bit rates are integers and milliseconds carry two decimals.
