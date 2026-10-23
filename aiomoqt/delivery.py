@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections import deque
+from collections import Counter, deque
 from enum import Enum
 from typing import Any, Callable, Dict, Optional
 
@@ -153,6 +153,35 @@ class ObjectHistory:
         return out
 
 
+def _same_extensions(a, b) -> bool:
+    """True when two extension blocks encode alike: equal, in the same
+    order (d14 encodes them in order)."""
+    if a is b:
+        return True
+    if a is None or b is None or a != b:
+        return False
+    return list(a) == list(b)
+
+
+# Encodings of one object kept for other peers. Each is held while the
+# object is queued; past this, peers in further states encode their own.
+_ENCODINGS_MAX = 4
+
+
+def _cached(encoded: list, key, extensions) -> Optional[bytes]:
+    """The bytes another peer got for this object under `key` with the
+    same extensions, None if none did."""
+    for k, exts, data in encoded:
+        if k == key and _same_extensions(exts, extensions):
+            return data
+    return None
+
+
+def _cache(encoded: list, key, extensions, data: bytes) -> None:
+    if len(encoded) < _ENCODINGS_MAX:
+        encoded.append((key, extensions, data))
+
+
 class SubgroupDelivery:
     """One session's copy of an object sequence.
 
@@ -191,6 +220,9 @@ class SubgroupDelivery:
         self._stopped_group: Optional[int] = None
         # Counts reset_group() calls; a write spanning one is abandoned.
         self._epoch = 0
+        # False when no other lane sends the same datagram bytes; set by
+        # FanoutDelivery.
+        self._datagrams_shared = True
 
     @property
     def _prof(self):
@@ -220,10 +252,13 @@ class SubgroupDelivery:
 
     async def write(self, group_id: int, object_id: int, payload: bytes, *,
                     extensions: Optional[Dict[int, Any]] = None,
-                    group_start: bool = False) -> bool:
+                    group_start: bool = False,
+                    encoded: Optional[list] = None) -> bool:
         """Place one object; False when the peer's filter excludes it.
         `group_start` rotates the PER_GROUP stream. A callable
-        `extensions` is resolved against this session."""
+        `extensions` is resolved against this session. `encoded` is a
+        list shared by the deliveries writing this object: peers in the
+        same encoding state reuse one encoding through it."""
         if self.passes is not None and not self.passes(group_id, object_id):
             if group_start:
                 self.end_group()
@@ -237,11 +272,8 @@ class SubgroupDelivery:
         epoch = self._epoch
         try:
             if self.mapping is StreamMapping.DATAGRAM:
-                dgram = ObjectDatagram(
-                    track_alias=self.track_alias, group_id=group_id,
-                    object_id=object_id, publisher_priority=self.priority,
-                    extensions=extensions, payload=payload)
-                data = dgram.serialize(prof=self._prof).data
+                data = self._datagram_bytes(
+                    group_id, object_id, payload, extensions, encoded)
                 limit = self.session.datagram_max_payload()
                 if len(data) > limit:
                     raise DatagramTooLarge(len(data), limit)
@@ -259,9 +291,9 @@ class SubgroupDelivery:
                     subgroup_id=object_id, publisher_priority=self.priority,
                     extensions_present=True, prof=self._prof)
                 await self.session.stream_write_drain(sid, hdr.serialize().data)
-                buf = hdr.next_object(payload=payload, extensions=extensions,
-                                      object_id=object_id)
-                await self.session.stream_write_drain(sid, buf.data)
+                data = self._object_bytes(hdr, object_id, payload,
+                                          extensions, encoded)
+                await self.session.stream_write_drain(sid, data)
                 self.session.stream_write(sid, b"", end_stream=True)
             else:  # PER_GROUP
                 if group_start or self._stream_id is None:
@@ -287,9 +319,9 @@ class SubgroupDelivery:
                     if self._epoch != epoch:
                         return False
                 sid, hdr = self._stream_id, self._header
-                buf = hdr.next_object(payload=payload, extensions=extensions,
-                                      object_id=object_id)
-                await self.session.stream_write_drain(sid, buf.data)
+                data = self._object_bytes(hdr, object_id, payload,
+                                          extensions, encoded)
+                await self.session.stream_write_drain(sid, data)
                 if self._epoch != epoch:
                     return False
         except MOQTStreamStopped:
@@ -304,6 +336,50 @@ class SubgroupDelivery:
         self.objects_sent += 1
         self.bytes_sent += len(payload)
         return True
+
+    def _datagram_key(self) -> tuple:
+        """Every field of this delivery its datagrams' bytes depend on."""
+        prof = self._prof
+        return (self.track_alias, self.priority,
+                prof is not None and prof.vi64,
+                prof is not None and prof.merged_datagram_layout,
+                prof is not None and prof.params_delta_coded)
+
+    def _datagram_bytes(self, group_id: int, object_id: int, payload: bytes,
+                        extensions, encoded: Optional[list]) -> bytes:
+        """The object as this peer's datagram."""
+        key = None
+        if encoded is not None and self._datagrams_shared:
+            key = self._datagram_key()
+            data = _cached(encoded, key, extensions)
+            if data is not None:
+                return data
+        data = ObjectDatagram(
+            track_alias=self.track_alias, group_id=group_id,
+            object_id=object_id, publisher_priority=self.priority,
+            extensions=extensions,
+            payload=payload).serialize(prof=self._prof).data
+        if key is not None:
+            _cache(encoded, key, extensions, data)
+        return data
+
+    @staticmethod
+    def _object_bytes(hdr: SubgroupHeader, object_id: int, payload: bytes,
+                      extensions, encoded: Optional[list]) -> bytes:
+        """The object's bytes on hdr's stream, keyed by the header's
+        encoding state: the bytes depend on it and the object only."""
+        if encoded is None:
+            return hdr.next_object_bytes(payload, extensions,
+                                         object_id=object_id)
+        state = hdr.encoding_state()
+        data = _cached(encoded, state, extensions)
+        if data is None:
+            data = hdr.next_object_bytes(payload, extensions,
+                                         object_id=object_id)
+            _cache(encoded, state, extensions, data)
+        else:
+            hdr.advance(object_id)
+        return data
 
     @property
     def open_group(self) -> Optional[int]:
@@ -444,7 +520,8 @@ class _Lane:
             self._close_truncated()
             self.need_group = True
             return
-        group_id, object_id, payload, extensions, group_start, born = item
+        (group_id, object_id, payload, extensions, group_start, born,
+         encoded) = item
         if self.gate is not None and not self.gate():
             # Forward State 0: send nothing, reset the open group, and
             # resume only at a fresh group.
@@ -462,7 +539,8 @@ class _Lane:
             return
         sent = await self.delivery.write(group_id, object_id, payload,
                                          extensions=extensions,
-                                         group_start=group_start)
+                                         group_start=group_start,
+                                         encoded=encoded)
         if sent and self.on_sent is not None:
             self.on_sent(group_id, object_id)
 
@@ -522,11 +600,21 @@ class FanoutDelivery:
                      self.name, self._fail)
         lane.need_group = joining
         self.lanes.append(lane)
+        self._mark_shared_datagrams()
         return lane
 
     def _fail(self, error: Exception) -> None:
         if self.error is None:
             self.error = error
+
+    def _mark_shared_datagrams(self) -> None:
+        """Datagrams carry the alias, so a lane shares their bytes only
+        with lanes of the same datagram key; the rest keep none."""
+        lanes = [ln.delivery for ln in self.lanes
+                 if ln.delivery.mapping is StreamMapping.DATAGRAM]
+        keys = Counter(d._datagram_key() for d in lanes)
+        for d in lanes:
+            d._datagrams_shared = keys[d._datagram_key()] > 1
 
     def _sent(self, group_id: int, object_id: int) -> None:
         if self.on_sent is not None:
@@ -540,6 +628,8 @@ class FanoutDelivery:
             lane.task.cancel()
             self.lanes.remove(lane)
             lane.delivery.reset_group()
+        if mine:
+            self._mark_shared_datagrams()
         return bool(mine)
 
     @property
@@ -560,8 +650,11 @@ class FanoutDelivery:
             raise self.error
         if self.on_write is not None:
             self.on_write(group_id, object_id, payload, extensions)
+        # One encoding per header state, shared by the lanes in it; it
+        # lives as long as the item is queued.
+        encoded = [] if len(self.lanes) > 1 else None
         item = (group_id, object_id, payload, extensions, group_start,
-                time.monotonic())
+                time.monotonic(), encoded)
         for lane in list(self.lanes):
             lane.offer(item)
 

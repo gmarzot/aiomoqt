@@ -10,6 +10,8 @@
 - pub_media: `--video-subgroups object` sends each video object on its own subgroup stream (subgroup ID = object ID).
 - pub_media: the stats line counts objects produced and reports frames the track discarded (waiting for a key frame, Forward State 0) as `discarded`.
 - pub_media: Opus audio from `--ts` and `--mp4` (loc, cmaf, locmaf), one object per Opus packet; catalog codec `opus`.
+- Relay: a FETCH, joining FETCH or fill the cache cannot serve goes to the session that PUBLISHed the track, not only to namespace publishers.
+- Fan-out: each object is encoded once per header state and the bytes shared by every peer in that state (datagrams: per alias and draft codec).
 - SubscribedTrack: a timing-malformed object that arrives before SUBSCRIBE_OK is processed cancels its own track, not alias 0.
 - Relay: status files are encoded with json's C encoder.
 - Relay: status bit rates are integers and milliseconds carry two decimals.
