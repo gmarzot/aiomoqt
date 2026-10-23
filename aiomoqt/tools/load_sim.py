@@ -985,7 +985,9 @@ def main():
                 proc.join(timeout=1.0)
         # Stats the shards posted before they stopped.
         _drain_sub_events(sub_events_q, groups)
-        for q in [sub_events_q]:
+        # Unread commands to a stopped shard must not block exit.
+        for q in [sub_events_q] + [s.cmd_q for g in groups.values()
+                                   for s in g.shards]:
             q.cancel_join_thread()
         if csv_f:
             csv_f.close()
