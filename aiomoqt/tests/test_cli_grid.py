@@ -195,8 +195,12 @@ def test_groups_take_no_feature_toggles():
                     if isinstance(prm.default, bool)], fn.__name__
         base = _group_flags(fn)
         for prm in params:
-            kw = {prm.name: _other_value(prm.default)}
-            assert _group_flags(fn, **kw) == base, (
+            try:
+                flags = _group_flags(fn, **{prm.name: _other_value(prm.default)})
+            except (TypeError, ValueError):
+                # An unannotated None default may be numeric.
+                flags = _group_flags(fn, **{prm.name: 1})
+            assert flags == base, (
                 f"{fn.__name__}({prm.name}=...) changes the flag set")
 
 
