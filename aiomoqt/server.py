@@ -2,6 +2,7 @@ import asyncio
 import errno
 import ipaddress
 import socket
+import weakref
 from asyncio.futures import Future
 from typing import Any, Coroutine, Iterable, List, Optional, Tuple, Union
 
@@ -12,7 +13,8 @@ from aiopquic.quic.configuration import QuicConfiguration
 
 from .protocol import (DEFAULT_TX_MAX_INFLIGHT_BYTES, MOQTPeer,
                         MOQTSessionQuic, MOQTSessionWTServer, USER_AGENT)
-from .types import moqt_alpn_for_version, normalize_supported_drafts
+from .types import (SessionCloseCode, moqt_alpn_for_version,
+                    normalize_supported_drafts)
 from .utils.logger import *
 
 logger = get_logger(__name__)
@@ -134,6 +136,7 @@ class MOQTServer(MOQTPeer):
         self._loop = asyncio.get_running_loop()
         self._server_closed: Future[Tuple[int, str]] = self._loop.create_future()
         self._next_subscribe_id = 1
+        self._live: weakref.WeakSet = weakref.WeakSet()
 
     def serve(self) -> Coroutine[Any, Any, Any]:
         """Start the MOQT server."""
@@ -167,7 +170,8 @@ class MOQTServer(MOQTPeer):
             if self.max_connections is not None:
                 cfg.max_connections = self.max_connections
             cfg.load_cert_chain(self.certificate, self.private_key)
-            protocol = lambda *a, **kw: MOQTSessionQuic(*a, **kw, session=self)
+            protocol = lambda *a, **kw: self._adopt(
+                MOQTSessionQuic(*a, **kw, session=self))
             return aiopquic_serve(
                 self.host, self.port,
                 configuration=cfg,
@@ -177,7 +181,8 @@ class MOQTServer(MOQTPeer):
         # WebTransport mode (use_quic=False): serve_webtransport with
         # MOQTSessionWTServer as the session factory.
         def factory(transport, state):
-            return MOQTSessionWTServer(transport, state, session=self)
+            return self._adopt(
+                MOQTSessionWTServer(transport, state, session=self))
 
         async def handler(_session):
             pass  # session lifetime owned by the dispatcher
@@ -259,7 +264,8 @@ class MOQTServer(MOQTPeer):
             cfg.max_connections = self.max_connections
 
         def wt_factory(transport, state):
-            return MOQTSessionWTServer(transport, state, session=self)
+            return self._adopt(
+                MOQTSessionWTServer(transport, state, session=self))
 
         async def wt_handler(_session):
             pass  # session lifetime owned by the dispatcher
@@ -270,13 +276,34 @@ class MOQTServer(MOQTPeer):
         return serve_dispatch(
             self.host, self.port,
             configuration=cfg,
-            create_protocol=lambda *a, **kw: MOQTSessionQuic(
-                *a, **kw, session=self),
+            create_protocol=lambda *a, **kw: self._adopt(MOQTSessionQuic(
+                *a, **kw, session=self)),
             wt_path=self.path or "",
             wt_handler=wt_handler,
             wt_session_factory=wt_factory,
             wt_supported_protocols=wt_supported,
         )
+
+    def _adopt(self, session):
+        self._live.add(session)
+        return session
+
+    async def close_sessions(self, timeout: float = 1.0) -> None:
+        """Close every live session (NO_ERROR) and wait up to `timeout`
+        for the closes to leave. Call before closing the serve() handle,
+        which stops the transport without telling the peers."""
+        live = [s for s in list(self._live) if s._close_err is None]
+        for s in live:
+            s.close(SessionCloseCode.NO_ERROR, "server shutting down")
+        # Raw QUIC: the connection's own close; WT: the peer drops it.
+        done = [getattr(s, '_cnx_closed', None) or getattr(s, '_closed', None)
+                for s in live]
+        waits = [asyncio.ensure_future(ev.wait()) for ev in done
+                 if ev is not None]
+        if waits:
+            _, pending = await asyncio.wait(waits, timeout=timeout)
+            for w in pending:
+                w.cancel()
 
     async def closed(self) -> bool:
         if not self._server_closed.done():

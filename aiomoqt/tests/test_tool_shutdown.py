@@ -1,11 +1,13 @@
 """SIGINT and SIGTERM on long-running tools: a clean exit, no traceback or
 unretrieved task exception."""
 import signal
+import subprocess
+import time
 
 import pytest
 
-from aiomoqt.tests._certs import requires_certs
-from aiomoqt.tests._procs import spawn, stop, wait_for
+from aiomoqt.tests._certs import CERT, KEY, requires_certs
+from aiomoqt.tests._procs import free_udp_port, spawn, stop, wait_for
 
 CLEAN_RC = (0, 130)
 
@@ -31,3 +33,68 @@ def test_adaptive_bench_sigint(tmp_path, marker):
     wait_for(log, marker, proc)
     rc, out = _interrupt(proc, log)
     assert rc in CLEAN_RC, out
+
+
+def _closed_within(peers, seconds):
+    """Every peer process exits within `seconds`: it saw the close."""
+    deadline = time.monotonic() + seconds
+    for p in peers:
+        try:
+            p.wait(timeout=max(0.1, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            return False
+    return True
+
+
+@requires_certs
+@pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM],
+                         ids=["INT", "TERM"])
+@pytest.mark.parametrize("listen,url", [
+    ("-Q", "moqt://localhost:{}"), ("-W", "https://localhost:{}/")],
+    ids=["quic", "wt"])
+def test_pub_server_closes_its_sessions(tmp_path, listen, url, sig):
+    port = free_udp_port()
+    slog, blog = tmp_path / "server.log", tmp_path / "sub.log"
+    server = spawn("pub_server", "-p", port, "-r", 100, "-s", 256, listen,
+                   log=slog)
+    sub = None
+    try:
+        wait_for(slog, "publisher server ready", server)
+        sub = spawn("sub_bench", url.format(port), "-k", "-t", 60, log=blog)
+        wait_for(blog, "receiving", sub)
+        rc, _ = _interrupt(server, slog, sig)
+        assert rc in CLEAN_RC
+        assert _closed_within([sub], 5), blog.read_text()
+    finally:
+        if sub is not None:
+            stop(sub)
+
+
+@requires_certs
+@pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM],
+                         ids=["INT", "TERM"])
+@pytest.mark.parametrize("transport", ["quic", "wt"])
+def test_relay_closes_its_sessions(tmp_path, transport, sig):
+    port = free_udp_port()
+    rlog = tmp_path / "relay.log"
+    url = (f"moqt://127.0.0.1:{port}" if transport == "quic"
+           else f"https://127.0.0.1:{port}/")
+    relay = spawn("moq_interop_relay", "--bind", "127.0.0.1", "--port", port,
+                  "--dual", "--cert", CERT, "--key", KEY, log=rlog)
+    peers = []
+    try:
+        wait_for(rlog, "Listening on", relay)
+        plog, blog = tmp_path / "pub.log", tmp_path / "sub.log"
+        peers.append(spawn("pub_bench", url, "-k", "-t", 60, "-r", 100,
+                           "-s", 256, "-T", "t", log=plog))
+        wait_for(plog, "waiting for subscriber", peers[0])
+        peers.append(spawn("sub_bench", url, "-k", "-t", 60, "-T", "t",
+                           log=blog))
+        wait_for(blog, "receiving", peers[1])
+        rc, _ = _interrupt(relay, rlog, sig)
+        assert rc in CLEAN_RC
+        assert _closed_within(peers, 5), (plog.read_text()
+                                           + blog.read_text())
+    finally:
+        for p in peers:
+            stop(p)

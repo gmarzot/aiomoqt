@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `MOQTServer.close_sessions()`; the relay and pub_server close their sessions on SIGINT and SIGTERM, so peers see the close at once instead of at the idle timeout.
 - Latency reports (TrackStats tools, sub_media `--analyze`/`--report`, adaptive_bench): a negative latency prints a one-time clock-offset warning and is marked "(clock offset)"; the figures are kept and show their sign.
 - sub_bench exits 1 when it cannot connect or receives no objects, and `-t` bounds connecting; pub_bench exits 1 with a one-line error on a dead port, also within `-t`.
 - adaptive_bench: Ctrl-C in its first half second exits cleanly instead of raising UnboundLocalError.

@@ -16,6 +16,7 @@ import argparse
 import asyncio
 import logging
 import os
+import signal
 
 from aiomoqt.server import MOQTServer
 from aiomoqt.types import (D18MessageType, MOQT_DEFAULT_DRAFTS, MOQTMessageType,
@@ -304,11 +305,15 @@ async def main():
         print(f"  python -m aiomoqt.tools.sub_bench {url} "
               f"-N {args.namespace} -t 30 -i 5{draft} -k")
 
+    # SIGTERM shuts down like Ctrl-C: peers get a CONNECTION_CLOSE.
+    asyncio.get_running_loop().add_signal_handler(
+        signal.SIGTERM, asyncio.current_task().cancel)
     try:
         await asyncio.Event().wait()
     except asyncio.CancelledError:
         pass
     finally:
+        await server.close_sessions()
         quic_server.close()
         print("\nServer stopped.")
 

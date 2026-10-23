@@ -3551,11 +3551,16 @@ async def main():
               f"{WATCHDOG_MISSES} misses or a {args.watchdog:g}s stall",
               file=sys.stderr)
 
+    # SIGTERM shuts down like Ctrl-C: peers get a CONNECTION_CLOSE.
+    asyncio.get_running_loop().add_signal_handler(
+        signal.SIGTERM, asyncio.current_task().cancel)
     try:
         await asyncio.Event().wait()
     except asyncio.CancelledError:
         pass
     finally:
+        await asyncio.gather(*(server.close_sessions()
+                               for server, _port, _label in listeners))
         for h in handles:
             h.close()
 
