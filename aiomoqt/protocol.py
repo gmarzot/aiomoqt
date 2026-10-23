@@ -523,10 +523,30 @@ class _MOQTSessionMixin:
         # request_id -> clean. Bounded; the oldest are forgotten.
         self._fetch_done_results: "OrderedDict[int, bool]" = OrderedDict()
 
-        # Queue for namespace announcements (populated by _handle_namespace)
-        self._namespace_announcements: asyncio.Queue = asyncio.Queue()
-        # Queue for track announcements (populated by _handle_publish)
-        self._publish_announcements: asyncio.Queue = asyncio.Queue()
+        # Announcements for await_namespace() / await_publish(), filled
+        # by the default handlers; when full the oldest is dropped.
+        self._namespace_announcements: asyncio.Queue = asyncio.Queue(
+            maxsize=self.ANNOUNCEMENT_QUEUE_MAX)
+        self._publish_announcements: asyncio.Queue = asyncio.Queue(
+            maxsize=self.ANNOUNCEMENT_QUEUE_MAX)
+        self._announcements_overflowing: Set[str] = set()
+
+    ANNOUNCEMENT_QUEUE_MAX = 1024
+
+    def _queue_announcement(self, queue: asyncio.Queue, msg,
+                            what: str) -> None:
+        """Queue `msg`, dropping the oldest when full; one WARNING per
+        run of drops."""
+        if not queue.full():
+            self._announcements_overflowing.discard(what)
+        else:
+            queue.get_nowait()
+            if what not in self._announcements_overflowing:
+                self._announcements_overflowing.add(what)
+                logger.warning(
+                    f"MOQT: {what} queue full ({queue.maxsize}): dropping "
+                    f"the oldest unread")
+        queue.put_nowait(msg)
 
     # -- Error response types (any version) --
     _ERROR_TYPES = (SubscribeError, PublishError, FetchError,
@@ -6004,7 +6024,7 @@ class _MOQTSessionMixin:
 
     async def _handle_publish(self, msg: Publish) -> None:
         logger.debug(f"MOQT event: handle {self._msgstr(msg)}")
-        self._publish_announcements.put_nowait(msg)
+        self._queue_announcement(self._publish_announcements, msg, "PUBLISH")
 
     async def _handle_publish_ok(self, msg: PublishOk) -> None:
         """Subscriber accepted our PUBLISH.
@@ -6120,7 +6140,8 @@ class _MOQTSessionMixin:
 
     async def _handle_namespace(self, msg) -> None:
         logger.debug(f"MOQT event: handle Namespace: {self._msgstr(msg)}")
-        self._namespace_announcements.put_nowait(msg)
+        self._queue_announcement(self._namespace_announcements, msg,
+                                 "NAMESPACE")
 
     async def _handle_namespace_done(self, msg) -> None:
         logger.debug(f"MOQT event: handle NamespaceDone: {self._msgstr(msg)}")

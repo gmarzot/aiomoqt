@@ -2,6 +2,7 @@
 
 ## v0.13.2
 
+- `await_publish()` and `await_namespace()` queue at most 1024 announcements; past that the oldest is dropped, with one WARNING per run of drops.
 - Fan-out: a lane that sheds objects at a group boundary resets the truncated subgroup instead of ending it with END_OF_GROUP and FIN.
 - `max_object_bytes` on MOQTClient and MOQTServer (default 64 MiB): a data stream declaring a larger object gets STOP_SENDING EXCESSIVE_LOAD, and more than 4x that held in incomplete objects closes the session with INTERNAL_ERROR.
 - A data stream on a track alias that nothing binds within 5 s gets STOP_SENDING CANCELLED.

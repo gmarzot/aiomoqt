@@ -1,16 +1,19 @@
 """Receive bounds. An object declaring more than max_object_bytes stops
 its own stream and nothing else; bytes held in incomplete objects are
 bounded per session; a stream on a track alias nothing binds is reaped
-at the binding deadline. Two tracks on one session throughout; the
-oversize case also over raw QUIC and WebTransport."""
+at the binding deadline; the announcement queues are bounded. Two
+tracks on one session throughout; the oversize case also over raw QUIC
+and WebTransport."""
 import asyncio
 import contextlib
+import logging
 import time
 from collections import OrderedDict
 from types import SimpleNamespace
 
 import pytest
 
+import aiomoqt.protocol as protocol_mod
 from aiomoqt.client import MOQTClient
 from aiomoqt.context import profile_for
 from aiomoqt.messages.data import SubgroupHeader
@@ -239,3 +242,31 @@ async def test_oversize_object_stops_one_track_the_other_keeps_delivering(
         assert ends["small"] == [(True, 0)]
         assert session._close_err is None
         assert session._rx_held_bytes == 0
+
+
+@requires_certs
+@pytest.mark.asyncio
+async def test_announcement_queues_are_bounded(caplog):
+    async with _loopback(_BASE_PORT + 2, True) as session:
+        n = session.ANNOUNCEMENT_QUEUE_MAX
+        protocol_mod.logger.addHandler(caplog.handler)
+        try:
+            for i in range(n + 10):
+                await session._handle_publish(SimpleNamespace(seq=i))
+                await session._handle_namespace(SimpleNamespace(seq=i))
+            full = [r for r in caplog.records
+                    if r.levelno == logging.WARNING
+                    and "queue full" in r.getMessage()]
+            assert len(full) == 2                        # one per queue
+            assert session._publish_announcements.qsize() == n
+            assert session._namespace_announcements.qsize() == n
+            assert (await session.await_publish(timeout=1)).seq == 10
+            assert (await session.await_namespace(timeout=1)).seq == 10
+            # Read from, then overrun again: a new run warns once more.
+            for i in range(n + 10, n + 13):
+                await session._handle_publish(SimpleNamespace(seq=i))
+            full = [r for r in caplog.records
+                    if "PUBLISH queue full" in r.getMessage()]
+            assert len(full) == 2
+        finally:
+            protocol_mod.logger.removeHandler(caplog.handler)
