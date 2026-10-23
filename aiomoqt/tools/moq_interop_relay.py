@@ -842,7 +842,8 @@ class _RelayedTrack:
 
     def cached_range(self, start, end):
         """Cached objects within [start, end], each (group, object)
-        inclusive; `end` None means to the live edge. Ascending."""
+        inclusive; `end` None means to the live edge. In Location order,
+        across subgroups (§3.2.1)."""
         out = []
         for gid, sgid, oid, payload, exts, prio, status, _ in self._cache:
             if (gid, oid) < start:
@@ -850,6 +851,7 @@ class _RelayedTrack:
             if end is not None and (gid, oid) > end:
                 continue
             out.append((gid, sgid, oid, payload, exts, prio, status))
+        out.sort(key=lambda o: (o[0], o[2]))
         return out
 
     def _short(self, gid, start) -> bool:

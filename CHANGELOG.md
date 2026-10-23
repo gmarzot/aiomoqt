@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Relay: FETCH and fill streams served from the cache send each group's objects in Object ID order across subgroups.
 - SubscribedTrack: a timing-malformed object that arrives before SUBSCRIBE_OK is processed cancels its own track, not alias 0.
 - Relay: status files are encoded with json's C encoder.
 - Relay: status bit rates are integers and milliseconds carry two decimals.
