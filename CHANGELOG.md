@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- load_sim: `--draft` takes 14-22 or a comma list, as the other tools do.
 - Relay: an unusable `--control` path exits with a one-line error.
 - adaptive_bench `--mp` and relay runs: rates divide by the time measured so far, not a fixed 5 s, so early intervals no longer read as a shortfall.
 - relay_probe and moq_interop_client: Ctrl-C exits 130 without a traceback.

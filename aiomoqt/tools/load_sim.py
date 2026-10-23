@@ -63,7 +63,7 @@ from typing import Any, Dict, List
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.track import SubscribedTrack, TrackState
-from aiomoqt.types import FilterType
+from aiomoqt.types import MOQT_DEFAULT_DRAFTS, FilterType, parse_draft_spec
 from aiomoqt.utils import cli as _cli
 from aiomoqt.utils.cli import endpoint_url
 from aiomoqt.utils.url import parse_relay_url
@@ -688,8 +688,11 @@ def parse_args(argv=None):
                         "as moq_interop_client")
     p.add_argument("-k", "--insecure", action="store_true",
                    help="Skip TLS verification")
-    p.add_argument("--draft", type=int, default=None,
-                   help="MoQT draft version: 14, 16, or 18")
+    p.add_argument("--draft", type=parse_draft_spec, default=None,
+                   help="MoQT draft: "
+                        f"{', '.join(map(str, sorted(MOQT_DEFAULT_DRAFTS)))}; "
+                        "a comma list offers several in order. Default: "
+                        f"offer {','.join(map(str, MOQT_DEFAULT_DRAFTS))}")
     p.add_argument("--duration-scale", type=float, default=1.0,
                    help="Multiply publisher start/duration timelines")
     p.add_argument("--subs-per-proc", type=int, default=100,

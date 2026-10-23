@@ -309,3 +309,9 @@ def test_loc_bare_flag_agrees_across_media_tools():
         assert len(acts) == 1, tool
         assert acts[0].option_strings == ["--loc-bare"], tool
         assert isinstance(acts[0], argparse._StoreTrueAction), tool
+
+
+def test_load_sim_draft_takes_a_draft_list():
+    acts = [a for a in _parser_actions("load_sim") if a.dest == "draft"]
+    assert acts[0].type("22,20") == [22, 20]
+    assert "22" in acts[0].help
