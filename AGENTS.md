@@ -33,9 +33,10 @@ installed package. Keep its API boundary and traps consistent with this file.
 
 Python >= 3.12 (CI: 3.12 / 3.13 / 3.14 on linux and macos).
 
-    uv pip install -e ".[test,media]" jsonschema      # ".[dev]" adds ruff + ty
+    uv pip install -e ".[test,media]"      # ".[dev]" adds ruff + ty
 
-`media` (PyAV) and `jsonschema` are optional; without them the media and agent-spec tests skip.
+`media` (PyAV) is optional; without it the media tests skip. `test` brings `jsonschema` for the
+agent-spec tests.
 Install editable: the loopback suites and bench scripts resolve `certs/` relative to the working
 tree. `pytest` writes `certs/` on first run; for the bench tools see README "Development".
 Version comes from `setuptools_scm` (git tags): a shallow clone without tags builds as
