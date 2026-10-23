@@ -144,6 +144,24 @@ class CmafChunker:
         return moof + _box(b'mdat', payload)
 
 
+# ProducerReferenceTimeBox flags (ISO 14496-12 §8.16.5): the NTP time is
+# when the sample was captured.
+PRFT_CAPTURED = 0x18
+NTP_UNIX_OFFSET_S = 2_208_988_800
+
+
+def prft_box(capture_us: int, media_time: int,
+             track_id: int = CmafChunker.TRACK_ID,
+             flags: int = PRFT_CAPTURED) -> bytes:
+    """A version-1 prft: `capture_us` (wall-clock µs) as 64-bit NTP for
+    the sample at `media_time` (its tfdt, track timescale)."""
+    sec, us = divmod(capture_us, 1_000_000)
+    # Fraction rounded up, so a reader's floor gives back the same µs.
+    ntp = ((sec + NTP_UNIX_OFFSET_S) << 32) | -(-(us << 32) // 1_000_000)
+    return _full(b'prft', 1, flags,
+                 struct.pack('>IQQ', track_id, ntp, media_time))
+
+
 # -- readers ---------------------------------------------------------
 
 def _full_box_field(data: bytes, path: tuple, v0: tuple, v1: tuple):

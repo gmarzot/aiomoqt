@@ -142,6 +142,7 @@ class AgentSession:
             group_order=_GROUP_ORDERS.get(spec.priority.group_order),
             on_object=rdr.on_object,
             on_done=rdr.on_publish_done,
+            on_reply=lambda m: rdr.on_reply(m, self._session._profile.vi64),
             wait_response=True,
         )
         alias = getattr(ok, "track_alias", None)

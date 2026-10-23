@@ -27,7 +27,7 @@ Usage:
 import asyncio
 import time
 from enum import IntEnum
-from typing import Callable, Dict, Optional, Union
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 from .types import (
     FetchType, MOQTRequestError, MOQTStreamStopped, ParamType, FilterType,
@@ -48,9 +48,12 @@ from .messages.params import (
 )
 from .context import is_draft16_or_later
 from .messages.fetch import _is_joining
-from .utils.buffer import Buffer
+from .utils.buffer import Buffer, BufferReadError
 from .utils.format import fmt_bps, fmt_rate
 from .utils.logger import get_logger
+from .utils.timing import (
+    TimestampMalformed, TimestampWriter, TrackTiming, check_object,
+)
 
 logger = get_logger(__name__)
 
@@ -69,15 +72,15 @@ def _largest_object_param(session, largest: tuple) -> dict:
     return {ParamType.LARGEST_OBJECT: buf.data_slice(0, buf.tell())}
 
 
-def _checked_immutable(props) -> Optional[Dict[int, Union[int, bytes]]]:
-    """Immutable Properties as given, refused when they could not be sent
-    as Key-Value-Pairs or would nest Immutable Properties (§12.7)."""
+def _checked_immutable(props, what: str = "Immutable Properties"
+                       ) -> Optional[Dict[int, Union[int, bytes]]]:
+    """Track Properties as given, refused when they could not be sent as
+    Key-Value-Pairs or would carry Immutable Properties (§12.7)."""
     if not props:
         return None
     props = dict(props)
     if MOQTMessage.IMMUTABLE_PROPERTIES in props:
-        raise ValueError("Immutable Properties cannot contain Immutable "
-                         "Properties")
+        raise ValueError(f"{what} cannot contain Immutable Properties")
     for ptype, value in props.items():
         if ptype % 2 == 0:
             if not isinstance(value, int):
@@ -95,6 +98,42 @@ def _checked_immutable(props) -> Optional[Dict[int, Union[int, bytes]]]:
     except Exception as e:
         raise ValueError(str(e)) from None
     return props
+
+
+def _reply_properties(msg) -> Optional[Dict[int, Any]]:
+    """Track Properties of a SUBSCRIBE_OK, PUBLISH, FETCH_OK or REQUEST_OK."""
+    props = getattr(msg, 'track_extensions', None)
+    if props is None:
+        props = getattr(msg, 'track_properties', None)
+    return props
+
+
+def merge_track_properties(props: Optional[Dict[int, Any]], vi64: bool
+                           ) -> Tuple[Dict[int, Any],
+                                      Optional[Dict[int, Any]], frozenset]:
+    """(merged view, Immutable Properties, types seen more than once) of
+    received Track Properties. The merged view unwraps Immutable
+    Properties (0x0B) beside the top-level ones."""
+    if not props:
+        return {}, None, frozenset()
+    merged = dict(props)
+    dups = set(getattr(props, 'duplicates', ()))
+    raw = merged.pop(MOQTMessage.IMMUTABLE_PROPERTIES, None)
+    if raw is None:
+        return merged, None, frozenset(dups)
+    raw = bytes(raw)
+    try:
+        inner = MOQTMessage._extensions_decode(
+            Buffer(data=raw, vi64=vi64), with_length=False,
+            buf_end=len(raw), delta=True, lenient=False) or {}
+    except (BufferReadError, RuntimeError, ValueError):
+        # Unreachable for a reply the codec accepted (§12.7 check).
+        return merged, None, frozenset(dups)
+    dups.update(getattr(inner, 'duplicates', ()))
+    dups.update(merged.keys() & inner.keys())
+    for ptype, value in inner.items():
+        merged.setdefault(ptype, value)
+    return merged, dict(inner), frozenset(dups)
 
 
 class TrackState(IntEnum):
@@ -490,10 +529,16 @@ class PublishedTrack(Track):
     `track_alias`, `forward`, `state` and the rest address the first
     peer, which is the only one most tracks have.
 
-    `immutable_properties` ({type: int for even types, bytes for odd})
-    travel as the Track's Immutable Properties (0x0B) in PUBLISH,
-    SUBSCRIBE_OK and FETCH_OK from d16, and in the TRACK_STATUS reply from
-    d18; d14 carries no Track Properties.
+    `track_properties` and `immutable_properties` ({type: int for even
+    types, bytes for odd}) travel as the Track's Properties, the latter
+    inside Immutable Properties (0x0B), in PUBLISH, SUBSCRIBE_OK and
+    FETCH_OK from d16, and in the TRACK_STATUS reply from d18; d14
+    carries no Track Properties. A type may appear in only one of them.
+
+    `timestamps` sets the generated objects' timing properties: 'loc'
+    (LOC TIMESTAMP 0x10, the default), 'frindell'
+    (draft-frindell-moq-timestamp-00, see utils.timing.TimestampWriter)
+    or 'both'. produce() tracks stamp their own objects.
     """
 
     # Stream mapping for produce() tracks.
@@ -521,7 +566,10 @@ class PublishedTrack(Track):
                      ForwardingPreference.SUBGROUP,
                  fetch_history_bytes: int = FETCH_HISTORY_DEFAULT,
                  immutable_properties: Optional[
-                     Dict[int, Union[int, bytes]]] = None):
+                     Dict[int, Union[int, bytes]]] = None,
+                 track_properties: Optional[
+                     Dict[int, Union[int, bytes]]] = None,
+                 timestamps: str = 'loc'):
         # Before super(): Track.__init__ assigns track_alias/request_id/
         # state, which are properties over this list.
         self._subs = [_Subscription(session)]
@@ -535,6 +583,19 @@ class PublishedTrack(Track):
         self.stream_priority = None
         self.auth_token = auth_token
         self.immutable_properties = _checked_immutable(immutable_properties)
+        self.track_properties = _checked_immutable(track_properties,
+                                                   "Track Properties")
+        if timestamps not in ('loc', 'frindell', 'both'):
+            raise ValueError(f"timestamps {timestamps!r}")
+        self.timestamps = timestamps
+        # Anchored on first use: the first reply or production start.
+        self._ts_writer: Optional[TimestampWriter] = None
+        both = set(self.track_properties or ()) & set(
+            self.immutable_properties or ())
+        if both:
+            raise ValueError(
+                "properties in both Track Properties and Immutable "
+                "Properties: " + ", ".join(f"0x{t:x}" for t in sorted(both)))
         self._subscriber_event = asyncio.Event()
         # (group_id, object_id) max over all objects sent; None until
         # the first object exists. Drives ContentExists/Largest Location
@@ -829,14 +890,51 @@ class PublishedTrack(Track):
 
     def _track_properties(self, session) -> Optional[Dict[int, bytes]]:
         """The Track Properties this track's replies carry on `session`."""
-        if not (self.immutable_properties
-                and session._profile.track_properties):
+        if not session._profile.track_properties:
             return None
-        buf = Buffer(capacity=BUF_SIZE, vi64=session._profile.vi64)
-        MOQTMessage._extensions_encode(buf, self.immutable_properties,
-                                       with_length=False, delta=True)
-        return {MOQTMessage.IMMUTABLE_PROPERTIES:
-                buf.data_slice(0, buf.tell())}
+        props = dict(self.track_properties or ())
+        props.update(self._timing_properties(session._profile.vi64))
+        if self.immutable_properties:
+            buf = Buffer(capacity=BUF_SIZE, vi64=session._profile.vi64)
+            MOQTMessage._extensions_encode(buf, self.immutable_properties,
+                                           with_length=False, delta=True)
+            props[MOQTMessage.IMMUTABLE_PROPERTIES] = buf.data_slice(
+                0, buf.tell())
+        return props or None
+
+    def _timing_properties(self, vi64: bool) -> Dict[int, Any]:
+        """Track Properties of the generated objects' timestamps."""
+        if self.timestamps == 'loc':
+            return {}
+        return self._timestamp_writer().track_properties(vi64)
+
+    def _timestamp_writer(self) -> TimestampWriter:
+        w = self._ts_writer
+        if w is None:
+            first = 0 if self._largest is None else self._largest[0] + 1
+            w = self._ts_writer = TimestampWriter(
+                self.timestamps, self.rate, self.group_size, first,
+                int(time.time() * 1_000_000))
+        return w
+
+    def _stamper(self, session) -> Optional[Callable]:
+        """Per-object properties for generated objects; None stamps LOC
+        TIMESTAMP inline, as on d14, which carries no Track Properties."""
+        if (self.timestamps == 'loc'
+                or not session._profile.track_properties):
+            return None
+        return self._timestamp_writer().stamp
+
+    async def _await_schedule(self, group_id: int, object_id: int) -> None:
+        """Hold a paced frindell producer until its first object is due,
+        so on-schedule objects carry no correction."""
+        if self.timestamps == 'loc' or self.rate <= 0:
+            return
+        due = self._timestamp_writer().scheduled_us(group_id, object_id)
+        if due is not None:
+            lead = due / 1e6 - time.time()
+            if lead > 0:
+                await asyncio.sleep(lead)
 
     def attach(self, session=None) -> None:
         """Serve this track on a session without announcing it:
@@ -1523,6 +1621,9 @@ class PublishedTrack(Track):
         idle period restarts production on the same track, numbering on
         from the Largest group so no Location is published twice."""
         first_group = 0 if self._largest is None else self._largest[0] + 1
+        if self.timestamps != 'loc':
+            first_group = self._timestamp_writer().next_group(
+                int(time.time() * 1_000_000), first_group)
         if self.forwarding == ForwardingPreference.DATAGRAM:
             task = asyncio.create_task(
                 self._generate_datagrams(
@@ -1570,8 +1671,11 @@ class PublishedTrack(Track):
         prof = session._profile
         report = not getattr(self, '_quiet', False)
         sub = self._sub_for(session)
+        stamp = self._stamper(session)
 
         try:
+            await self._await_schedule(first_group, 0)
+            next_frame_time = time.monotonic()
             while True:
                 if cur_obj_id >= self.group_size:
                     group_id += 1
@@ -1587,8 +1691,9 @@ class PublishedTrack(Track):
                     group_id=group_id,
                     object_id=cur_obj_id,
                     publisher_priority=self.priority,
-                    extensions={
-                        LOC_TIMESTAMP: int(time.time() * 1_000_000)},
+                    extensions=(
+                        {LOC_TIMESTAMP: int(time.time() * 1_000_000)}
+                        if stamp is None else stamp(group_id, cur_obj_id)),
                     payload=payload,
                     end_of_group=(cur_obj_id == self.group_size - 1),
                 )
@@ -1678,10 +1783,13 @@ class PublishedTrack(Track):
         sub = self._sub_for(session)
         sender = _SubgroupSender(self, session, sub, track_alias,
                                  subgroup_id, priority)
+        stamp = self._stamper(session)
 
         local_sent = 0
 
         try:
+            await self._await_schedule(first_group, subgroup_id)
+            next_frame_time = time.monotonic()
             while True:
                 if sender.header is None or cur_obj_id >= self.group_size:
                     if barrier is not None and group_id >= first_group:
@@ -1702,7 +1810,9 @@ class PublishedTrack(Track):
                 seq_info = f"{group_id}.{cur_obj_id}".encode()
                 payload = (seq_info + b'|' + pad)[:self.object_size]
 
-                extensions = {LOC_TIMESTAMP: int(time.time() * 1_000_000)}
+                extensions = (
+                    {LOC_TIMESTAMP: int(time.time() * 1_000_000)}
+                    if stamp is None else stamp(group_id, cur_obj_id))
                 self._remember(group_id, cur_obj_id, payload, subgroup_id,
                                extensions)
                 data = sender.encode_open(cur_obj_id, payload, extensions)
@@ -1824,15 +1934,26 @@ class SubscribedTrack(Track):
 
     Handles namespace subscription, track discovery via PUBLISH messages,
     and data reception.
+
+    Timing properties (draft-frindell-moq-timestamp-00) that break its
+    rules make the track malformed: with `timestamp_errors='cancel'`
+    (default) the subscription is cancelled (MOQT §12.1) and `malformed`
+    says why; 'report' delivers everything and leaves the judgement to
+    the consumer (`timing_error`, utils.timing).
     """
 
     def __init__(self, session, namespace: str, trackname: str = None,
                  on_object: Optional[Callable] = None,
                  report_interval: float = 5.0,
                  auth_token: Optional[bytes] = None,
-                 on_done: Optional[Callable] = None):
+                 on_done: Optional[Callable] = None,
+                 timestamp_errors: str = 'cancel'):
+        if timestamp_errors not in ('cancel', 'report'):
+            raise ValueError(f"timestamp_errors {timestamp_errors!r}")
         super().__init__(session, namespace, trackname)
         self.on_object = on_object
+        self.timestamp_errors = timestamp_errors
+        self.malformed: Optional[str] = None
         # Called with the PUBLISH_DONE that ends this subscription.
         self.on_done = on_done
         self.report_interval = report_interval
@@ -1842,7 +1963,93 @@ class SubscribedTrack(Track):
         # Largest Location the publisher reported in SUBSCRIBE_OK or
         # PUBLISH, as (group, object); None when it reported none.
         self.largest: Optional[tuple] = None
+        # Track Properties as received; see take_track_properties().
+        self.track_properties: Optional[Dict[int, Any]] = None
+        self.immutable_properties: Optional[Dict[int, Any]] = None
+        self.properties: Dict[int, Any] = {}
+        self.property_duplicates: frozenset = frozenset()
+        # Timing context from the Track Properties, updated in place so a
+        # holder (TrackStats.timing) follows it; timing_error says why
+        # the timing properties make the track malformed.
+        self.timing = TrackTiming()
+        self.timing_error: Optional[str] = None
         self._done_event = asyncio.Event()
+
+    def take_track_properties(self, msg) -> None:
+        """Keep the Track Properties of a SUBSCRIBE_OK, PUBLISH or
+        FETCH_OK for this track: `track_properties` as received,
+        `immutable_properties` decoded from 0x0B, `properties` both
+        merged, `property_duplicates` the types seen more than once."""
+        props = _reply_properties(msg)
+        merged, immutable, dups = merge_track_properties(
+            props, self.session._profile.vi64)
+        self.track_properties = dict(props) if props else None
+        self.immutable_properties = immutable
+        self.properties = merged
+        self.property_duplicates = dups
+        try:
+            self.timing.assign(TrackTiming.from_properties(
+                merged, self.session._profile.vi64, dups))
+            self.timing_error = None
+        except TimestampMalformed as e:
+            self.timing.assign(TrackTiming())
+            self.timing_error = str(e)
+        self._route_timing_checks(msg)
+
+    def _checks_every_object(self) -> bool:
+        return (self.timestamp_errors == 'cancel'
+                and (self.timing.timescale is not None
+                     or self.timing_error is not None))
+
+    def _route_timing_checks(self, msg) -> None:
+        """Cancel mode: a track with timing properties has every object
+        checked; one without has only objects carrying a timing property
+        routed to the check, by the session (_timing_watch)."""
+        if self.timestamp_errors != 'cancel' or self.on_object is None:
+            return
+        alias = getattr(msg, 'track_alias', None)
+        if self._checks_every_object():
+            # A SUBSCRIBE_OK arrives before its handler is bound.
+            pending = getattr(self.session, '_pending_object_handlers', {})
+            if pending.get(getattr(msg, 'request_id', None)) is not None:
+                pending[msg.request_id] = self._checked_object
+        elif alias is not None:
+            self.session._timing_watch[alias] = self._checked_object
+
+    def _handler(self) -> Optional[Callable]:
+        """The object handler to register: on_object itself, or behind
+        the timing check on a track whose timing properties it checks."""
+        if self.on_object is None or not self._checks_every_object():
+            return self.on_object
+        return self._checked_object
+
+    def _checked_object(self, msg, *args) -> None:
+        if self.malformed is not None:
+            return
+        if self.timing_error is not None:
+            return          # cancelled once subscribe() has the alias
+        timing = self.timing
+        gid = getattr(msg, 'group_id', None)
+        try:
+            if timing.timescale is not None:
+                timing.timestamp(args[2] if gid is None else gid,
+                                 msg.object_id, msg.extensions)
+            else:
+                # Routed here only for an object carrying timing ids.
+                check_object(timing, 0, msg.object_id, msg.extensions)
+        except TimestampMalformed as e:
+            self._cancel_malformed(str(e))
+            return
+        self.on_object(msg, *args)
+
+    def _cancel_malformed(self, reason: str) -> None:
+        """MOQT §12.1: cancel the subscription and refuse its streams."""
+        if self.malformed is not None:
+            return
+        self.malformed = reason
+        self.session._timing_watch.pop(self.track_alias, None)
+        self.session._malformed_track(self.track_alias, reason)
+        self._done_event.set()
 
     async def subscribe(self, timeout: float = 30.0,
                         forward: int = 1,
@@ -1895,6 +2102,7 @@ class SubscribedTrack(Track):
                 wait_response=True,
                 on_object=self.on_object,
                 location_filter=location_filter,
+                on_reply=self.take_track_properties,
             )
             self.largest = _reported_largest(ok)
             # Publisher's SUBSCRIBE_OK alias is authoritative (the
@@ -1903,9 +2111,10 @@ class SubscribedTrack(Track):
                 self.track_alias = ok.track_alias
                 if self.on_object:
                     self.session.register_object_handler(
-                        self.track_alias, self.on_object)
+                        self.track_alias, self._handler())
             self._watch_done(getattr(ok, 'request_id', None))
             self.state = TrackState.SUBSCRIBED
+            self._check_track_timing()
             logger.info(f"Track: subscribed (direct) to {self.fqtn}")
             return
 
@@ -1980,6 +2189,7 @@ class SubscribedTrack(Track):
             print(f"  Discovered: {self.fqtn}")
 
         self.largest = _reported_largest(pub_msg)
+        self.take_track_properties(pub_msg)
         # Register track_alias so incoming data streams pass admission.
         if hasattr(pub_msg, 'track_alias'):
             self.track_alias = pub_msg.track_alias
@@ -1987,7 +2197,7 @@ class SubscribedTrack(Track):
                 pub_msg.track_alias] = pub_msg.request_id
             if self.on_object:
                 self.session.register_object_handler(
-                    self.track_alias, self.on_object)
+                    self.track_alias, self._handler())
 
         logger.info(f"Track: PUBLISH_OK {self.fqtn} "
                     f"alias={self.track_alias} forward={forward}")
@@ -1995,7 +2205,16 @@ class SubscribedTrack(Track):
 
         self._watch_done(pub_msg.request_id)
         self.state = TrackState.SUBSCRIBED
+        self._check_track_timing()
         logger.info(f"Track: subscribed to {self.fqtn}")
+
+    def _check_track_timing(self) -> None:
+        if self.timing_error is None:
+            return
+        logger.warning(f"Track: {self.fqtn}: malformed timing properties: "
+                       f"{self.timing_error}")
+        if self.timestamp_errors == 'cancel':
+            self._cancel_malformed(self.timing_error)
 
     def _watch_done(self, request_id) -> None:
         """Record this subscription's PUBLISH_DONE (§10.11) and release
@@ -2005,6 +2224,7 @@ class SubscribedTrack(Track):
         self.request_id = request_id
 
         def _done(msg):
+            self.session._timing_watch.pop(self.track_alias, None)
             self.publish_done = msg
             self._done_event.set()
             if self.on_done is not None:
@@ -2028,6 +2248,9 @@ class SubscribedTrack(Track):
                 if not fut.done():
                     fut.cancel()
         self.state = TrackState.CLOSED
+        if self.malformed is not None:
+            self.completed = False
+            return
         if self.publish_done is not None:
             code = getattr(self.publish_done, 'status_code', 0)
             self.completed = code in (SubscribeDoneCode.TRACK_ENDED,
@@ -2169,8 +2392,11 @@ class VideoTrack(PublishedTrack):
         i_pad = b'\x49' * self.i_frame_size  # 'I'
         p_pad = b'\x50' * self.p_frame_size  # 'P'
         b_pad = b'\x42' * self.b_frame_size  # 'B'
+        stamp = self._stamper(session)
 
         try:
+            await self._await_schedule(first_group, subgroup_id)
+            next_frame_time = time.monotonic()
             while True:
                 if sender.header is None or cur_obj_id >= self.group_size:
                     if barrier is not None and group_id >= first_group:
@@ -2200,8 +2426,9 @@ class VideoTrack(PublishedTrack):
                 payload = (seq_info + b'|'
                            + frame_pad)[:frame_size]
 
-                extensions = {
-                    LOC_TIMESTAMP: int(time.time() * 1_000_000)}
+                extensions = (
+                    {LOC_TIMESTAMP: int(time.time() * 1_000_000)}
+                    if stamp is None else stamp(group_id, cur_obj_id))
                 self._remember(group_id, cur_obj_id, payload, subgroup_id,
                                extensions)
                 data = sender.encode_open(cur_obj_id, payload, extensions)

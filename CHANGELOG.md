@@ -15,6 +15,18 @@
 - STOP_SENDING on one subgroup stream ends that stream only: the relay and PublishedTrack skip the rest of that subgroup and keep the subscription; the write raises `MOQTStreamStopped` (a `CancelledError`) while the session lives.
 - Relay: d20/d22 FILL_PARAMETERS on a SUBSCRIBE or REQUEST_UPDATE opens a fill fetch stream, from the cache or an upstream FETCH, reset when neither holds the range or reporting a Timed-Out gap under FILL_TIMEOUT; none while paused; counted in PUBLISH_DONE.
 - d20/d22: a length-prefixed FILL_PARAMETERS value may hold bare parameters with no Number of Parameters, and may be empty.
+- `PublishedTrack(track_properties=)`: top-level Track Properties on PUBLISH, SUBSCRIBE_OK, FETCH_OK and the TRACK_STATUS reply, beside `immutable_properties`; a type in both is refused.
+- `SubscribedTrack` keeps the Track Properties of its SUBSCRIBE_OK or PUBLISH (`track_properties`, `immutable_properties`, merged `properties`, `property_duplicates`); `take_track_properties()` takes a FETCH_OK's; `MediaSubscriber.properties(name)`.
+- `session.subscribe(on_reply=)`: called with the SUBSCRIBE_OK as it is parsed, before the track's first object.
+- `utils.timing`: one capture-time resolver (draft-frindell-moq-timestamp-00 on a wall-clock track, then LOC TIMESTAMP without a LOC TIMESCALE, then bench 0x20); `SubscribedTrack.timing` holds the track's context.
+- sub_bench, loopback_bench, adaptive_bench, load_sim, the agent reader and sub_media `--analyze`/`--report`/`--inspect` take latency from the resolver and report its source per track.
+- sub_media `--analyze`: a LOC TIMESCALE seen on any object (or as a Track Property) holds for the track, so `--loc-timescale` streams no longer mix µs and ticks.
+- Malformed draft-frindell-moq-timestamp properties (duplicates, wrong scope, TIMESCALE missing or 0, TIMESTAMP_ORIGIN without CLOCK_ID, a mapping that is not four integers, a timestamp outside 0..2^64-1) cancel the subscription (MOQT §12.1); `SubscribedTrack(timestamp_errors='report')` and `--timestamp-errors report` on sub_bench, loopback_bench and sub_media keep receiving and count them.
+- Key-Value-Pair blocks decoded in Python (control messages, datagrams, FETCH) mark repeated types in `KeyValuePairs.duplicates`.
+- Wire conformance: draft-frindell-moq-timestamp TIMESCALE, CLOCK_ID, TIMESTAMP_ORIGIN, TIMESTAMP_MAPPING and OBJECT_TIMESTAMP against hand-derived bytes at d16 and d18, valid and malformed.
+- `PublishedTrack(timestamps='loc'|'frindell'|'both')` and `--timestamps` on pub_bench, loopback_bench and pub_server: generated objects can carry draft-frindell-moq-timestamp timing (paced: TIMESCALE + TIMESTAMP_MAPPING + zig-zag correction; `-r 0`: explicit OBJECT_TIMESTAMP in µs); LOC 0x10 stays the default.
+- pub_media `--timestamp-mapping`: TIMESCALE and TIMESTAMP_MAPPING Track Properties on a fixed-cadence track (the mp4's own timescale, the tone at 48 kHz) with OBJECT_TIMESTAMP only off schedule, explicit OBJECT_TIMESTAMP on live and irregular-GOP sources, and a capture-time prft on each CMAF/LOCMAF group start; LOC TIMESTAMP is unchanged.
+- pub_media: paced feeders share one start and wall clock.
 
 ## v0.13.1
 

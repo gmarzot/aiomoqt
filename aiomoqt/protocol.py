@@ -45,6 +45,7 @@ from .utils.buffer import Buffer, BufferReadError
 from .utils.logger import *
 from .utils.logger import quiet_session
 from .utils.url import moqt_setup_path
+from .utils.timing import TIMING_IDS
 from aiopquic.streamchain import StreamChain
 from aiopquic.asyncio.webtransport import WebTransportError
 
@@ -352,6 +353,10 @@ class _MOQTSessionMixin:
         # Track aliases found malformed (§2.4.2): subscription cancelled,
         # further streams refused.
         self._malformed_aliases: Set[int] = set()
+        # alias -> handler for its objects that carry a frindell timing
+        # property (utils.timing.TIMING_IDS): a track that declared none
+        # checks only those.
+        self._timing_watch: Dict[int, Callable] = {}
         # alias -> {group_id: first object id that does not exist}, from
         # END_OF_GROUP status objects and FIN on END_OF_GROUP-bit streams.
         self._group_bound: Dict[int, Dict[int, int]] = {}
@@ -391,6 +396,9 @@ class _MOQTSessionMixin:
         # Our SUBSCRIBE request id -> object handler, bound to the track
         # alias where its SUBSCRIBE_OK is parsed.
         self._pending_object_handlers: Dict[int, Callable] = {}
+        # Our SUBSCRIBE request id -> callback given its SUBSCRIBE_OK as
+        # it is parsed, before any object of the track is delivered.
+        self._pending_reply_hooks: Dict[int, Callable] = {}
         # Tracks this session serves, by full track name; control
         # messages addressed to one are routed to it.
         self._published_tracks: Dict[Tuple[Tuple[bytes, ...], bytes], Any] = {}
@@ -925,6 +933,7 @@ class _MOQTSessionMixin:
         """Forget the handlers a request of ours registered: it was
         refused, or its awaiter gave up."""
         self._pending_object_handlers.pop(request_id, None)
+        self._pending_reply_hooks.pop(request_id, None)
         self._publish_done_handlers.pop(request_id, None)
         self._fetch_object_handlers.pop(request_id, None)
         if (self._profile.fetch_location_filter
@@ -1038,6 +1047,9 @@ class _MOQTSessionMixin:
             self._check_alias(msg.track_alias, self._msg_track(msg),
                               msg.request_id)
         if isinstance(msg, SubscribeOk):
+            hook = self._pending_reply_hooks.pop(msg.request_id, None)
+            if hook is not None:
+                hook(msg)
             cb = self._pending_object_handlers.pop(msg.request_id, None)
             if cb is not None and msg.track_alias is not None:
                 self._bind_object_handler(msg.track_alias, cb)
@@ -1752,6 +1764,10 @@ class _MOQTSessionMixin:
                     ObjectStatus.END_OF_TRACK,
                 )
                 cb = self._object_cb(alias)
+                watch = self._timing_watch
+                if watch and msg_obj.extensions and not TIMING_IDS.isdisjoint(
+                        msg_obj.extensions):
+                    cb = watch.get(alias, cb)
                 now = int(time.time() * 1_000_000)
                 if getattr(hdr, 'default_priority', False):
                     msg_obj.publisher_priority = (
@@ -2346,6 +2362,10 @@ class _MOQTSessionMixin:
                 self._malformed_track(alias, reason)
                 return
         cb = self._object_cb(alias)
+        watch = self._timing_watch
+        if watch and msg.extensions and not TIMING_IDS.isdisjoint(
+                msg.extensions):
+            cb = watch.get(alias, cb)
         if cb:
             try:
                 cb(msg, consumed, now, msg.group_id, None)
@@ -4163,6 +4183,7 @@ class _MOQTSessionMixin:
         location_filter: Optional[LocationFilter] = None,
         on_object: Optional[Callable] = None,
         on_done: Optional[Callable] = None,
+        on_reply: Optional[Callable] = None,
     ) -> Optional[MOQTMessage]:
         """Subscribe to a track with configurable options.
 
@@ -4174,7 +4195,9 @@ class _MOQTSessionMixin:
         register_object_handler signature), bound to its alias as
         SUBSCRIBE_OK is parsed; `on_done` is its PUBLISH_DONE handler
         (register_publish_done_handler). Both are registered before
-        SUBSCRIBE is sent and dropped if it is refused. A d20
+        SUBSCRIBE is sent and dropped if it is refused. `on_reply` is
+        called with the SUBSCRIBE_OK as it is parsed, before on_object
+        sees any object. A d20
         FILL_PARAMETERS fill stream comes under this Request ID:
         await_fetch_done() waits for it, and its objects reach
         on_fetch_object or register_fetch_object_handler()."""
@@ -4210,6 +4233,8 @@ class _MOQTSessionMixin:
                             group_order, forward)
         if on_object is not None:
             self._pending_object_handlers[request_id] = on_object
+        if on_reply is not None:
+            self._pending_reply_hooks[request_id] = on_reply
         if on_done is not None:
             self.register_publish_done_handler(request_id, on_done)
         logger.info(f"MOQT send: {self._msgstr(message)}")
@@ -4217,7 +4242,7 @@ class _MOQTSessionMixin:
 
         if not wait_response:
             return message
-        if on_object is not None or on_done is not None:
+        if on_object is not None or on_done is not None or on_reply:
             return self._await_routed(request_id)
         return self._await_response(request_id)
 

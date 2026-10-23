@@ -22,6 +22,7 @@ from aiomoqt.types import (D18MessageType, MOQT_DEFAULT_DRAFTS, MOQTMessageType,
                            parse_draft_spec)
 from aiomoqt.track import PublishedTrack
 from aiomoqt.types import ForwardingPreference
+from aiomoqt.utils import cli as _cli
 from aiomoqt.utils.logger import set_log_level, get_logger
 
 logger = get_logger(__name__)
@@ -128,6 +129,7 @@ def parse_args():
         '-D', '--datagram', action='store_true',
         help='ObjectDatagrams instead of subgroup streams (requires '
              '-q raw QUIC; object must fit one packet, ~1150B max)')
+    _cli.add_timestamps(parser)
     args = parser.parse_args()
     if not args.quic and not args.wt:
         args.wt = True
@@ -152,8 +154,10 @@ async def _on_subscribe(session, msg, args):
         rate=args.rate,
         forwarding=(ForwardingPreference.DATAGRAM if args.datagram
                     else ForwardingPreference.SUBGROUP),
+        timestamps=args.timestamps,
     )
-    ok = session.subscribe_ok(request_msg=msg)
+    ok = session.subscribe_ok(
+        request_msg=msg, track_properties=track._track_properties(session))
     track.track_alias = ok.track_alias
     track._generating = True
     logger.info(f"Subscriber connected, generating data "
@@ -209,6 +213,7 @@ async def _announce_track(session, args):
         rate=args.rate,
         forwarding=(ForwardingPreference.DATAGRAM if args.datagram
                     else ForwardingPreference.SUBGROUP),
+        timestamps=args.timestamps,
     )
     await track.publish(
         announce_namespace=(args.pub_ns or args.pub_both),

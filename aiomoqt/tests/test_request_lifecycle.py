@@ -408,6 +408,7 @@ def _routed_session(draft):
     s = _drive_session(draft)
     s._session = SimpleNamespace(libquicr_compat=False)
     s._pending_object_handlers = {}
+    s._pending_reply_hooks = {}
     s._publish_done_handlers = {}
     s._fetch_object_handlers = {}
     s._object_handlers = {}
