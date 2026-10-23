@@ -3304,6 +3304,8 @@ class _Status:
                 "addr": relay_status.display_addr(_addr_of(s)),
                 "role": role or None, "since": info["since"],
                 "rtt_ms": round(rtt, 1) if rtt is not None else None,
+                "rtt_min_ms": (round(pq["rtt_min"] / 1000, 1)
+                               if pq.get("rtt_min") else None),
                 "tx_bps": bps(d[0]) if last is not None else None,
                 "rx_bps": bps(d[1]) if last is not None else None,
                 "loss_pct": (round(100 * d[3] / d[2], 2)

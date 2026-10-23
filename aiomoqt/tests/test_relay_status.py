@@ -534,6 +534,8 @@ async def test_session_loss_only_on_delivery(relay_tables, tmp_path, monkeypatch
     by_role = {s["role"]: s for s in snap["sessions"]}
     assert by_role["pub"]["loss_pct"] is None
     assert by_role["sub"]["loss_pct"] is not None
+    for s in snap["sessions"]:
+        assert 0 <= s["rtt_min_ms"] <= s["rtt_ms"], s
 
 
 _KINDS = ((dict, "object"), (list, "array"), (str, "string"), (bool, "bool"),

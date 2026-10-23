@@ -2,6 +2,7 @@
 
 ## v0.13.2
 
+- Relay status: each session reports `rtt_min_ms` beside `rtt_ms`.
 - Relay status: a session's `loss_pct` is null unless the relay delivers to it; publisher sessions no longer read ~60% loss from unacked ACK-only packets.
 - load_sim: Ctrl-C during startup no longer hangs: the handler is installed before workers fork, and unread shard commands do not block exit.
 - load_sim: an interrupted run prints its verdict and exits 130.
