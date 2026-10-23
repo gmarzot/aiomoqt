@@ -15,7 +15,7 @@ from enum import Enum
 from typing import Any, Callable, Dict, Optional
 
 from .messages import SubgroupHeader
-from .types import StreamResetCode
+from .types import MOQTStreamStopped, StreamResetCode
 from .messages.data import (
     FETCH_FLAGS_END_UNKNOWN, FetchObject, ObjectDatagram,
 )
@@ -176,6 +176,10 @@ class SubgroupDelivery:
         self.excludes_end: Optional[Callable[[int, int], bool]] = None
         self._stream_id: Optional[int] = None
         self._header: Optional[SubgroupHeader] = None
+        # Group whose stream the peer stopped; not reopened (§11.3.2).
+        self._stopped_group: Optional[int] = None
+        # Counts reset_group() calls; a write spanning one is abandoned.
+        self._epoch = 0
 
     @property
     def _prof(self):
@@ -213,54 +217,75 @@ class SubgroupDelivery:
             if group_start:
                 self.end_group()
             return False
+        if group_id == self._stopped_group and not group_start:
+            return False
         if callable(extensions):
             extensions = extensions(self.session)
-        if self.mapping is StreamMapping.DATAGRAM:
-            dgram = ObjectDatagram(
-                track_alias=self.track_alias, group_id=group_id,
-                object_id=object_id, publisher_priority=self.priority,
-                extensions=extensions, payload=payload)
-            await self.session.dgram_write_drain(
-                dgram.serialize(prof=self._prof))
-        elif self.mapping is StreamMapping.PER_OBJECT:
-            # One stream per object ⇒ one subgroup per object (a subgroup
-            # owns exactly one stream); the object keeps its decode-order
-            # id via subgroup_id.
-            sid = await self.session.open_uni_stream()
-            self.stream_count += 1
-            if self.stream_priority is not None:
-                self.session.set_stream_priority(sid, self.stream_priority)
-            hdr = SubgroupHeader(
-                track_alias=self.track_alias, group_id=group_id,
-                subgroup_id=object_id, publisher_priority=self.priority,
-                extensions_present=True, prof=self._prof)
-            await self.session.stream_write_drain(sid, hdr.serialize().data)
-            buf = hdr.next_object(payload=payload, extensions=extensions,
-                                  object_id=object_id)
-            await self.session.stream_write_drain(sid, buf.data)
-            self.session.stream_write(sid, b"", end_stream=True)
-        else:  # PER_GROUP
-            if group_start or self._stream_id is None:
-                # A filter can admit a group part-way through: the stream
-                # then opens on a later object, not the group's first.
-                self.end_group()
-                self._stream_id = await self.session.open_uni_stream()
+        # A reset_group() can land at any await below; the write then
+        # stops without touching what the reset left.
+        epoch = self._epoch
+        try:
+            if self.mapping is StreamMapping.DATAGRAM:
+                dgram = ObjectDatagram(
+                    track_alias=self.track_alias, group_id=group_id,
+                    object_id=object_id, publisher_priority=self.priority,
+                    extensions=extensions, payload=payload)
+                await self.session.dgram_write_drain(
+                    dgram.serialize(prof=self._prof))
+            elif self.mapping is StreamMapping.PER_OBJECT:
+                # One stream per object ⇒ one subgroup per object (a subgroup
+                # owns exactly one stream); the object keeps its decode-order
+                # id via subgroup_id.
+                sid = await self.session.open_uni_stream()
                 self.stream_count += 1
                 if self.stream_priority is not None:
-                    self.session.set_stream_priority(
-                        self._stream_id, self.stream_priority)
-                self._header = SubgroupHeader(
+                    self.session.set_stream_priority(sid, self.stream_priority)
+                hdr = SubgroupHeader(
                     track_alias=self.track_alias, group_id=group_id,
-                    subgroup_id=0, publisher_priority=self.priority,
-                    extensions_present=True, prof=self._prof,
-                    first_object=group_start)
-                await self.session.stream_write_drain(
-                    self._stream_id, self._header.serialize().data)
-            buf = self._header.next_object(payload=payload,
-                                           extensions=extensions,
-                                           object_id=object_id)
-            await self.session.stream_write_drain(self._stream_id, buf.data)
-
+                    subgroup_id=object_id, publisher_priority=self.priority,
+                    extensions_present=True, prof=self._prof)
+                await self.session.stream_write_drain(sid, hdr.serialize().data)
+                buf = hdr.next_object(payload=payload, extensions=extensions,
+                                      object_id=object_id)
+                await self.session.stream_write_drain(sid, buf.data)
+                self.session.stream_write(sid, b"", end_stream=True)
+            else:  # PER_GROUP
+                if group_start or self._stream_id is None:
+                    # A filter can admit a group part-way through: the stream
+                    # then opens on a later object, not the group's first.
+                    self.end_group()
+                    sid = await self.session.open_uni_stream()
+                    self.stream_count += 1
+                    if self._epoch != epoch:
+                        self.session.stream_reset(sid, StreamResetCode.CANCELLED)
+                        return False
+                    if self.stream_priority is not None:
+                        self.session.set_stream_priority(
+                            sid, self.stream_priority)
+                    hdr = SubgroupHeader(
+                        track_alias=self.track_alias, group_id=group_id,
+                        subgroup_id=0, publisher_priority=self.priority,
+                        extensions_present=True, prof=self._prof,
+                        first_object=group_start)
+                    self._stream_id, self._header = sid, hdr
+                    await self.session.stream_write_drain(
+                        sid, hdr.serialize().data)
+                    if self._epoch != epoch:
+                        return False
+                sid, hdr = self._stream_id, self._header
+                buf = hdr.next_object(payload=payload, extensions=extensions,
+                                      object_id=object_id)
+                await self.session.stream_write_drain(sid, buf.data)
+                if self._epoch != epoch:
+                    return False
+        except MOQTStreamStopped:
+            # The session has reset the stream; a group's is not reopened.
+            if (self.mapping is StreamMapping.PER_GROUP
+                    and self._epoch == epoch):
+                self._stopped_group = group_id
+                self._stream_id = None
+                self._header = None
+            return False
         self._note_largest(group_id, object_id)
         self.objects_sent += 1
         self.bytes_sent += len(payload)
@@ -274,6 +299,7 @@ class SubgroupDelivery:
     def reset_group(self, code: int = StreamResetCode.CANCELLED) -> None:
         """Reset the open group stream: the group is truncated, and a FIN
         would claim it complete. No-op when no stream is open."""
+        self._epoch += 1
         if self._stream_id is None:
             return
         self.session.stream_reset(self._stream_id, code)
@@ -302,8 +328,9 @@ class _Lane:
     """
 
     def __init__(self, delivery: SubgroupDelivery, queue_size: int,
-                 gate=None, on_sent=None, deadline=None):
+                 gate=None, on_sent=None, deadline=None, name: str = ""):
         self.delivery = delivery
+        self.name = name     # the track's, for logs
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=queue_size)
         self.shed = 0
         # Returns the peer's object delivery timeout in seconds, or None
@@ -369,36 +396,52 @@ class _Lane:
             item = await self.queue.get()
             if item is _STOP:
                 return
-            if item is _END_GROUP:
-                self.delivery.end_group()
-                self._truncated = False
-                continue
-            if item is _RESET_GROUP:
-                self._close_truncated()
+            try:
+                await self._handle(item)
+            except Exception:
+                # Cancellation (MOQTStreamStopped included) still ends the
+                # lane; anything else costs this peer the open group only.
+                logger.warning(
+                    f"Fanout: lane {self.name} alias="
+                    f"{self.delivery.track_alias} peer="
+                    f"{getattr(self.session, 'peer_address', None)} write "
+                    f"failed; resuming at the next group", exc_info=True)
                 self.need_group = True
-                continue
-            group_id, object_id, payload, extensions, group_start, born = item
-            if self.gate is not None and not self.gate():
-                # Forward State 0: send nothing, reset the open group, and
-                # resume only at a fresh group.
-                self._close_truncated()
-                self.need_group = True
-                continue
-            if self.need_group:
-                if not group_start:
+                try:
                     self._close_truncated()
-                    self.shed += 1
-                    continue
-                self.need_group = False
-                self._truncated = False
-            if self._late(group_id, born):
-                continue
-            sent = await self.delivery.write(group_id, object_id, payload,
-                                             extensions=extensions,
-                                             group_start=group_start)
-            if sent and self.on_sent is not None:
-                self.on_sent(group_id, object_id)
+                except Exception:
+                    self._truncated = True
 
+    async def _handle(self, item) -> None:
+        if item is _END_GROUP:
+            self.delivery.end_group()
+            self._truncated = False
+            return
+        if item is _RESET_GROUP:
+            self._close_truncated()
+            self.need_group = True
+            return
+        group_id, object_id, payload, extensions, group_start, born = item
+        if self.gate is not None and not self.gate():
+            # Forward State 0: send nothing, reset the open group, and
+            # resume only at a fresh group.
+            self._close_truncated()
+            self.need_group = True
+            return
+        if self.need_group:
+            if not group_start:
+                self._close_truncated()
+                self.shed += 1
+                return
+            self.need_group = False
+            self._truncated = False
+        if self._late(group_id, born):
+            return
+        sent = await self.delivery.write(group_id, object_id, payload,
+                                         extensions=extensions,
+                                         group_start=group_start)
+        if sent and self.on_sent is not None:
+            self.on_sent(group_id, object_id)
 
     def _late(self, group_id: int, born: float) -> bool:
         """§8: an object past the peer's delivery timeout is dropped; on a
@@ -433,6 +476,7 @@ class FanoutDelivery:
     def __init__(self, deliveries=(), *,
                  queue_size: int = LANE_QUEUE_DEFAULT):
         self.queue_size = queue_size
+        self.name = ""       # the track's, for logs
         self.lanes: list = []
         # Called as on_write(group_id, object_id, payload, extensions) for
         # each object, once, however many lanes there are.
@@ -449,7 +493,8 @@ class FanoutDelivery:
         """Attach another peer. `joining` holds it to the next group
         boundary, which is where a mid-stream arrival can start.
         `deadline()` gives its delivery timeout in seconds, or None."""
-        lane = _Lane(delivery, self.queue_size, gate, self._sent, deadline)
+        lane = _Lane(delivery, self.queue_size, gate, self._sent, deadline,
+                     self.name)
         lane.need_group = joining
         self.lanes.append(lane)
         return lane

@@ -101,6 +101,10 @@ class BenchReporter:
                   f"sd={s['lat_sd']:.1f} ms")
             print(f"               p50={s['lat_p50']:.1f}  "
                   f"p95={s['lat_p95']:.1f}  p99={s['lat_p99']:.1f} ms")
+        if s.get('ts_source') or s.get('ts_malformed'):
+            bad = (f"  ({s['ts_malformed']} malformed)"
+                   if s.get('ts_malformed') else '')
+            print(f"  Timestamps:  {s.get('ts_source') or 'none'}{bad}")
         if s.get('minimal'):
             print("  Jitter:      n/a")
             print("  Lost:        n/a  (--no-stats: counters only)")
@@ -128,6 +132,7 @@ examples:
     _cli.add_identity(parser)
     _cli.add_run(parser, duration=0)   # 0 = run until publisher closes
     _cli.add_session(parser, keepalive=True, compat=True)
+    _cli.add_timestamp_checking(parser)
     parser.add_argument(
         '--auth-token', type=str, default=None,
         help='Send this token as AUTH_TOKEN parameter on SUBSCRIBE '
@@ -191,7 +196,9 @@ async def run(args):
                     on_object=stats.on_object,
                     auth_token=(args.auth_token.encode()
                                 if args.auth_token else None),
+                    timestamp_errors=args.timestamp_errors,
                 )
+                stats.stats.timing = track.timing
                 await track.subscribe()
                 print(f"  Subscribed to '{track.fqtn}', receiving...\n")
                 stats.start()

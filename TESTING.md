@@ -190,12 +190,12 @@ stale-cache collisions on relays that key by (namespace, trackname).
 
 Shell 1 (publisher):
 ```bash
-python -m aiomoqt.tools.pub_bench moqt://moqx-local-000.marzresearch.net:4433 -s 500000 -t 120 -r 30 -g 30 -k --draft 16
+python -m aiomoqt.tools.pub_bench moqt://your-relay.example:4433 -s 500000 -t 120 -r 30 -g 30 -k --draft 16
 ```
 
 Shell 2 (subscriber):
 ```bash
-python -m aiomoqt.tools.sub_bench moqt://moqx-local-000.marzresearch.net:4433 -k --draft 16
+python -m aiomoqt.tools.sub_bench moqt://your-relay.example:4433 -k --draft 16
 ```
 
 Expected: ~116 Mbps, ~30 obj/s, zero loss, auto-discovered trackname.
@@ -204,12 +204,12 @@ Expected: ~116 Mbps, ~30 obj/s, zero loss, auto-discovered trackname.
 
 Shell 1:
 ```bash
-python -m aiomoqt.tools.pub_bench moqt://moqx-local-000.marzresearch.net:4433 -s 1024 -t 120 -r 120 -g 60 -P 4 -k --draft 16
+python -m aiomoqt.tools.pub_bench moqt://your-relay.example:4433 -s 1024 -t 120 -r 120 -g 60 -P 4 -k --draft 16
 ```
 
 Shell 2:
 ```bash
-python -m aiomoqt.tools.sub_bench moqt://moqx-local-000.marzresearch.net:4433 -k --draft 16
+python -m aiomoqt.tools.sub_bench moqt://your-relay.example:4433 -k --draft 16
 ```
 
 Expected: ~480 obj/s, ~4 Mbps, p50 latency ~1 ms.
@@ -218,12 +218,12 @@ Expected: ~480 obj/s, ~4 Mbps, p50 latency ~1 ms.
 
 Shell 1:
 ```bash
-python -m aiomoqt.tools.pub_bench moqt://moqx-local-000.marzresearch.net:4433 -s 4096 -t 120 -g 1000 -P 4 -k --draft 16
+python -m aiomoqt.tools.pub_bench moqt://your-relay.example:4433 -s 4096 -t 120 -g 1000 -P 4 -k --draft 16
 ```
 
 Shell 2:
 ```bash
-python -m aiomoqt.tools.sub_bench moqt://moqx-local-000.marzresearch.net:4433 -k --draft 16
+python -m aiomoqt.tools.sub_bench moqt://your-relay.example:4433 -k --draft 16
 ```
 
 Expected: sustained high throughput. Watch p99 latency and loss to
@@ -249,7 +249,7 @@ workflow pushes a fresh image on every tag.
 The runner drives `pub_bench` through `tests/contrib/aiomoqt-adapter.sh` in every d18
 native-QUIC scenario that needs no FETCH; the script compares the scored requirements with
 `tests/contrib/baseline.json`. CI runs it in `contrib-conformance.yml` on pushes to `main` and
-`gmarzot-0.13.1` and on PRs labelled `ci:run-conformance`, report-only for now.
+`gmarzot-0.14.0` and on PRs labelled `ci:run-conformance`, report-only for now.
 
 Build the runner at the commit in `.github/contrib-runner-pin`, then:
 

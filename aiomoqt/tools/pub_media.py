@@ -42,6 +42,7 @@ import asyncio
 import contextlib
 import functools
 import logging
+import math
 import sys
 import threading
 import time
@@ -57,7 +58,7 @@ from aiomoqt.media import (
 from aiomoqt.media.catalog import (
     MEDIA_PACKAGINGS, PACKAGING_CMAF, PACKAGING_LOC, PACKAGING_LOCMAF,
 )
-from aiomoqt.media.cmaf import CmafChunker
+from aiomoqt.media.cmaf import CmafChunker, chunk_decode_time, prft_box
 from aiomoqt.media.ingest import INSTALL_HINT, RENDITIONS, Ingest
 from aiomoqt.media.locmaf import LOCMAF_VERSION
 from aiomoqt.media.mpegts import TsDemuxer
@@ -68,6 +69,7 @@ from aiomoqt.media.sources import (
 from aiomoqt.track import TrackState
 from aiomoqt.utils import cli as _cli
 from aiomoqt.utils.logger import set_log_level
+from aiomoqt.utils.timing import MediaTimestamps
 from aiomoqt.utils.workers import apply_compat
 from aiomoqt.utils.url import parse_relay_url
 
@@ -193,6 +195,16 @@ def parse_args():
     parser.add_argument('--stats', type=float, default=5.0, metavar='SECS',
                         help='Print per-track publish metrics every SECS '
                              'seconds (0 disables; default: 5)')
+    ts_group = parser.add_argument_group('timestamp writing')
+    ts_group.add_argument(
+        '--timestamp-mapping', action='store_true',
+        help='Also send draft-frindell-moq-timestamp timing: Track '
+             'Properties TIMESCALE and TIMESTAMP_MAPPING (wall clock at '
+             'start, group and frame period), OBJECT_TIMESTAMP only on a '
+             'frame off schedule, and a prft box on the first CMAF/LOCMAF '
+             'object of each group. Sources without a fixed GOP (live '
+             'inputs, irregular keyframes) send OBJECT_TIMESTAMP on every '
+             'object instead. LOC timestamps are unchanged.')
     _cli.add_run(parser, duration=30, interval=False)
     _cli.add_session(parser, keepalive=10, compat=True)
     _cli.add_help(parser)
@@ -366,7 +378,10 @@ async def _feed_ingest(ingest: Ingest, tracks: dict, args, stats: dict):
             if ts > args.duration * 1_000_000:
                 break
             await _pace(start, ts, not args.no_pace)
-            await _send(tracks[c.track], stats[c.track], c.payload, c.key,
+            payload = c.payload
+            if c.key and getattr(args, 'timestamp_mapping', False):
+                payload = _with_prft(payload, wall0 + ts)
+            await _send(tracks[c.track], stats[c.track], payload, c.key,
                         timestamp=wall0 + ts, group_id=c.group_id)
     finally:
         ingest.close()
@@ -529,6 +544,55 @@ async def _feed_ts_live(tracks: dict, fh, dmx: TsDemuxer, first, args,
         await track.finish()
 
 
+def _with_prft(chunk: bytes, capture_us: int) -> bytes:
+    """A CMAF chunk led by a prft for its first sample."""
+    tfdt = chunk_decode_time(chunk)
+    return chunk if tfdt is None else prft_box(capture_us, tfdt) + chunk
+
+
+def _media_clock(timescales, align: bool):
+    """(monotonic, wall-clock µs) every paced feeder starts from. With
+    `align`, the wall clock is the next µs at which each timescale has a
+    whole tick count, so mapped timestamps match LOC's exactly."""
+    now = int(time.time() * 1_000_000)
+    unit = 1
+    if align:
+        for t in timescales:
+            unit = math.lcm(unit, 1_000_000 // math.gcd(t, 1_000_000))
+        unit = min(unit, 1_000_000)
+    wall0 = -(-now // unit) * unit
+    return time.monotonic() + (wall0 - now) / 1e6, wall0
+
+
+def _sample_cadence(source):
+    """(sample duration, samples per group) of an mp4 track with one
+    sample duration and evenly spaced sync samples, else None."""
+    stts = [d for c, d in source._stts if c]
+    if len(set(stts[:-1] if len(stts) > 1 else stts)) != 1:
+        return None
+    if source._sync is None:
+        return stts[0], 1
+    sync = sorted(source._sync)
+    gaps = {b - a for a, b in zip(sync, sync[1:])}
+    if sync[0] != 1 or len(gaps) > 1:
+        return None
+    return stts[0], (gaps.pop() if gaps else len(source._sizes))
+
+
+def _frindell_for(source, wall0: int, group_us=None):
+    """MediaTimestamps for an mp4 track: mapped on a fixed cadence in the
+    track's own timescale, else explicit."""
+    cadence = _sample_cadence(source)
+    if cadence is None:
+        return MediaTimestamps(wall0)
+    dur, per_group = cadence
+    if group_us is not None:
+        frame_us = dur * 1_000_000 / source.timescale
+        per_group = math.ceil(group_us / frame_us)
+    om = dur if per_group > 1 else 0
+    return MediaTimestamps(wall0, source.timescale, dur * per_group, om)
+
+
 async def _pace(start: float, ts_us: int, pace: bool):
     if pace:
         delay = start + ts_us / 1e6 - time.monotonic()
@@ -555,8 +619,14 @@ async def _send(track, stats, payload: bytes, key: bool,
         timestamp = entry_us
     stamp = (timestamp * track.timescale // 1_000_000 if track.timescale
              else timestamp)
+    kw = {}
+    frindell = getattr(track, 'frindell', None)
+    if frindell is not None:
+        kw['capture_us'] = timestamp
+        if key and group_id is None:
+            group_id = frindell.group_for(timestamp)
     await track.send_frame(payload, key_frame=key, timestamp=stamp,
-                           group_id=group_id)
+                           group_id=group_id, **kw)
     # lag: how late the frame already was when we got it (source, pipe,
     # demux). tx: what handing it to the track cost us.
     stats.count(payload, entry_us - timestamp,
@@ -622,8 +692,8 @@ async def _refresh_catalog(pub: FanoutPublisher, interval: float):
 async def _report_stats(stats: dict, interval: float, pub: FanoutPublisher):
     """One line per interval: per-track object total, object rate and
     bitrate over the interval, frames dropped before a subscriber
-    arrived, and with several relays the demand count and frames shed
-    per relay (index = URL position)."""
+    arrived, frames shed per relay (index = URL position) and, with
+    several relays, the demand count."""
     t0 = time.monotonic()
     prev_obj = {name: 0 for name in stats}
     prev_bytes = {name: 0 for name in stats}
@@ -644,17 +714,17 @@ async def _report_stats(stats: dict, interval: float, pub: FanoutPublisher):
             if track is not None and len(pub.sessions) > 1:
                 have, total = track.demand
                 line += f" · demand {have}/{total}"
-                shed = getattr(track, 'shed', {})
-                if shed:
-                    line += " · shed " + ",".join(
-                        f"{i}:{n}" for i, n in sorted(shed.items()))
+            shed = getattr(track, 'shed', None) or {}
+            if shed:
+                line += " · shed " + ",".join(
+                    f"{i}:{n}" for i, n in sorted(shed.items()))
             parts.append(line)
         m, s = divmod(time.monotonic() - t0, 60)
         print(f"  [pub {int(m)}:{s:06.3f}] " + " · ".join(parts))
 
 
-async def _feed_tone(track, args, stats: _TrackStats):
-    start, wall0 = time.monotonic(), int(time.time() * 1_000_000)
+async def _feed_tone(track, args, stats: _TrackStats, clock=None):
+    start, wall0 = clock or (time.monotonic(), int(time.time() * 1_000_000))
     for payload, ts in pcm_tone_frames(
             duration_s=args.duration, freq=args.freq,
             samplerate=_SAMPLERATE, channels=_CHANNELS,
@@ -666,14 +736,17 @@ async def _feed_tone(track, args, stats: _TrackStats):
 
 async def _feed_mp4_track(track, source, args, stats: _TrackStats, *,
                           all_key=False, group_us=None, gap_us=33_333,
-                          wrap=None):
+                          wrap=None, clock=None):
     """Feed an mp4 track's samples, paced to their media timestamps and
     stamped with their scheduled wall-clock capture time; --loop
     restarts the file at later timestamps (audio: every AU is a sync
     frame, giving LOC's one-object-per-group audio mapping, or with
     group_us one group per that much media time).
-    wrap(sample) transforms the payload (CMAF chunking)."""
-    start, wall0 = time.monotonic(), int(time.time() * 1_000_000)
+    wrap(sample) transforms the payload (CMAF chunking); a group's first
+    chunk is led by a prft with --timestamp-mapping. `clock` is the
+    (monotonic, wall µs) start shared with the other feeders."""
+    start, wall0 = clock or (time.monotonic(), int(time.time() * 1_000_000))
+    prft = wrap is not None and getattr(args, 'timestamp_mapping', False)
     base_us = 0
     group_ts = None
     while True:
@@ -690,6 +763,8 @@ async def _feed_mp4_track(track, source, args, stats: _TrackStats, *,
                     group_ts = ts
             else:
                 key = all_key or s.key_frame
+            if prft and key:
+                payload = _with_prft(payload, wall0 + ts)
             await _send(track, stats, payload, key, timestamp=wall0 + ts)
             last = ts
         base_us = last + gap_us
@@ -784,87 +859,109 @@ async def run(args):
             return LocTrackPublisher(session, args.namespace, name,
                                      loc_bare=loc_bare,
                                      timescale=args.loc_timescale, **kwargs)
+        # One start for every paced feeder; with --timestamp-mapping its
+        # wall clock anchors each track's TIMESTAMP_MAPPING.
+        timescales = [_SAMPLERATE] + [
+            s.timescale for s in (video if reader else None, mp4_audio)
+            if s is not None]
+        clock = _media_clock(timescales, args.timestamp_mapping)
+        wall0 = clock[1]
+
+        def _timed(track, frindell):
+            if args.timestamp_mapping:
+                track.frindell = frindell
+            return track
         pub = FanoutPublisher(sessions, args.namespace, catalog)
         stats = {}
         feeders = []
         if ingest is not None:
             tracks = {}
             for t in ingest.tracks:
-                tracks[t.name] = pub.add_track(
-                    _track(t.name, media_kind=t.kind))
+                tracks[t.name] = pub.add_track(_timed(
+                    _track(t.name, media_kind=t.kind),
+                    MediaTimestamps(wall0)))
                 stats[t.name] = _TrackStats()
             feeders.append(_feed_ingest(ingest, tracks, args, stats))
         elif ts is not None:
             fh, dmx, first, _, _ = ts
             tracks = {}
             if video is not None:
-                tracks['video'] = pub.add_track(LocTrackPublisher(
+                tracks['video'] = pub.add_track(_timed(LocTrackPublisher(
                     session, args.namespace, 'video', config=video.config,
                     loc01_compat=args.loc01_compat, loc_bare=loc_bare,
                     timescale=args.loc_timescale,
-                    codec_string=_cs(video.codec_string)))
+                    codec_string=_cs(video.codec_string)),
+                    MediaTimestamps(wall0)))
                 stats['video'] = _TrackStats()
             if ts_audio is not None:
-                tracks['audio'] = pub.add_track(LocTrackPublisher(
+                tracks['audio'] = pub.add_track(_timed(LocTrackPublisher(
                     session, args.namespace, 'audio', media_kind='audio',
                     config=ts_audio.asc,
                     mapping=(StreamMapping.DATAGRAM if args.datagram
                              else StreamMapping.PER_GROUP),
                     loc01_compat=args.loc01_compat, loc_bare=loc_bare,
                     timescale=args.loc_timescale,
-                    codec_string=_cs(ts_audio.codec_string)))
+                    codec_string=_cs(ts_audio.codec_string)),
+                    MediaTimestamps(wall0)))
                 stats['audio'] = _TrackStats()
             feeders.append(_feed_ts_live(tracks, fh, dmx, first, args,
                                          stats, pub))
         elif not args.no_audio:
-            audio_track = pub.add_track(_track(
+            audio_group_us = (_LOCMAF_AUDIO_GROUP_US
+                              if args.packaging == PACKAGING_LOCMAF
+                              else None)
+            spf = _SAMPLERATE * _FRAME_MS // 1000
+            audio_track = pub.add_track(_timed(_track(
                 'audio', media_kind='audio',
                 config=mp4_audio.asc if mp4_audio is not None else None,
                 mapping=(StreamMapping.DATAGRAM if args.datagram
                          else StreamMapping.PER_GROUP),
                 loc01_compat=args.loc01_compat,
                 codec_string=_cs(mp4_audio.codec_string
-                                 if mp4_audio is not None else 'pcm-s16')))
+                                 if mp4_audio is not None else 'pcm-s16')),
+                (_frindell_for(mp4_audio, wall0, audio_group_us)
+                 if mp4_audio is not None
+                 else MediaTimestamps(wall0, _SAMPLERATE, spf))))
             stats['audio'] = _TrackStats()
             if mp4_audio is not None:
                 a_ck = chunkers.get('audio')
                 feeders.append(_feed_mp4_track(
                     audio_track, mp4_audio, args, stats['audio'],
                     all_key=True,
-                    group_us=(_LOCMAF_AUDIO_GROUP_US
-                              if args.packaging == PACKAGING_LOCMAF
-                              else None),
+                    group_us=audio_group_us,
                     gap_us=1_000_000 * 1024 // mp4_audio.samplerate,
                     wrap=(lambda s, ck=a_ck:
                           ck.chunk(s.payload, s.duration)) if a_ck
-                    else None))
+                    else None, clock=clock))
             else:
                 feeders.append(_feed_tone(audio_track, args,
-                                          stats['audio']))
+                                          stats['audio'], clock=clock))
         if live is not None:
             fh, asm, first, _ = live
             stats['video'] = _TrackStats()
             feeders.append(_feed_h264_live(
-                pub.add_track(LocTrackPublisher(
+                pub.add_track(_timed(LocTrackPublisher(
                     session, args.namespace, 'video', config=video.config,
                     loc01_compat=args.loc01_compat, loc_bare=loc_bare,
                     timescale=args.loc_timescale,
-                    codec_string=_cs(video.codec_string))),
+                    codec_string=_cs(video.codec_string)),
+                    MediaTimestamps(wall0))),
                 fh, asm, first, args, stats['video']))
         elif video is not None and ts is None:   # --ts wired both tracks above
             v_ck = chunkers.get('video')
             stats['video'] = _TrackStats()
             feeders.append(_feed_mp4_track(
-                pub.add_track(_track(
+                pub.add_track(_timed(_track(
                     'video',
                     config=None if v_ck else video.config,
                     loc01_compat=args.loc01_compat,
-                    codec_string=_cs(video.codec_string))),
+                    codec_string=_cs(video.codec_string)),
+                    _frindell_for(video, wall0))),
                 video, args, stats['video'],
                 gap_us=int(1e6 / (video.fps or 30)),
                 wrap=(lambda s, ck=v_ck:
                       ck.chunk(s.payload, s.duration, s.key_frame))
-                if v_ck else None))
+                if v_ck else None, clock=clock))
         await pub.start(announce_namespace=(args.pub_ns or args.pub_both),
                         publish_track=(not args.pub_ns or args.pub_both),
                         forward=args.forward)

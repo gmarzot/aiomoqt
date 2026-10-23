@@ -6,12 +6,10 @@ reviews:
   auto_review:
     enabled: true
     drafts: true
-  path_filters:
-    - "!perf/baselines/**"
   path_instructions:
     - path: "aiomoqt/**/*.py"
       instructions: >-
-        MoQT drafts 14, 16 and 18 are live. Draft numbers are plain ints; the IETF
+        MoQT drafts 14, 16, 18, 20 and 22 are live. Draft numbers are plain ints; the IETF
         code 0xff0000NN and the ALPN strings appear only at the wire boundary.
         Behaviour differences go through profile_for(draft) / DraftProfile, not
         scattered version checks. A new wire shape needs a case in

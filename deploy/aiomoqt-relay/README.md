@@ -9,7 +9,7 @@ dashboard, and the G5 Broadcast and G5 Player test pages. The relay is open, wit
 | `web` | `relay-web` | nginx on 80/443: landing page, `/g5-broadcast/`, `/g5-player/`, `/relay/` dashboard, `/relay/platform/` and `/relay/logs/`, `/status/{status,platform}.json`, `/private/`, `/stats/` |
 | `goaccess` | `relay-goaccess` | rebuilds the visitor reports in `stats/` every 5 minutes from `logs/`; no network |
 
-Host: `ssh ubuntu@aiomoqt-relay.marzresearch.net` (129.146.35.142; OCI, Ubuntu 24.04 aarch64,
+Host: `ssh ubuntu@aiomoqt-relay.marzresearch.net` (OCI, Ubuntu 24.04 aarch64,
 Docker with Compose v2). The subnet's security list opens UDP 4433-4443 and TCP 80/443; the host's
 own iptables (`/etc/iptables/rules.v4`) must also accept TCP 443 and UDP 4443. The certificate
 comes from apt certbot with dns-cloudflare (`/etc/cloudflare/credentials.ini`, 0600). Its deploy
@@ -105,7 +105,7 @@ the host keeps other per-packet work off its cores:
 
 ## Relay image
 
-The relay runs the newest aiomoqt (`gmarzot-0.13.1`) and aiopquic (`gmarzot-0.7.0`) code, built on
+The relay runs the newest aiomoqt (`gmarzot-0.13.2`) and aiopquic (`gmarzot-0.7.0`) code, built on
 the host from the repo's `Dockerfile`. The build context has no `.git`, so pass the version
 explicitly. Run `python -m setuptools_scm` in the checkout to get it.
 

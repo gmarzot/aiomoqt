@@ -24,7 +24,8 @@ from aiomoqt.tests.microbench._stats import Stats
 
 
 AIOPQUIC = os.environ.get(
-    'AIOPQUIC_DIR', '/home/gmarzot/Projects/moq/aiopquic')
+    'AIOPQUIC_DIR',
+    os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', 'aiopquic'))
 CERT = os.path.join(AIOPQUIC, 'third_party/picoquic/certs/cert.pem')
 KEY = os.path.join(AIOPQUIC, 'third_party/picoquic/certs/key.pem')
 

@@ -179,7 +179,7 @@
       "drafts": [22, 20, 18],
       "pub_mode": "publish",
       "disabled_suites": [],
-      "notes": "Our own open relay (moq_interop_relay), second host."
+      "notes": "Our own open relay (moq_interop_relay)."
     }
   ]
 }

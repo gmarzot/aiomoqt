@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+- Relay: status files are encoded with json's C encoder.
+- Relay: status bit rates are integers and milliseconds carry two decimals.
+- Relay: platform.json is rewritten every 5 s instead of every 2 s.
+- `aiomoqt/AGENTS.md`, shipped in the wheel, is a short guide for agents using the package; the repo-root `AGENTS.md` is the contributor guide.
+- pub_media: the stats line reports frames shed per relay with one relay too.
+- PublishedTrack: a SUBSCRIBE, PUBLISH_OK or update that finds the peer's fan-out lane stopped replaces it instead of ignoring the duplicate.
+- Fan-out: a lane whose write raises logs a warning with the track and peer, resets the open group and resumes at the next group; cancellation still ends it.
+- Fan-out: a group reset while its subgroup write is suspended (PUBLISH_OK FORWARD=0 racing the first header) abandons that write instead of killing the peer's lane.
+- Relay: a d20/d22 Relative Start subscription carries its Location Filter upstream; before d20 the relay fetches the current group's head from upstream, and a subgroup stream it cannot deliver whole from the subscription's start is reset, not FINed.
+- PublishedTrack: a subgroup stream opening mid-group (Forward State resumed) sends the group's earlier objects from the FETCH history, or is reset when the history lacks them; `SubscribedTrack.subscribe(location_filter=…)`.
+- STOP_SENDING on one subgroup stream ends that stream only: the relay and PublishedTrack skip the rest of that subgroup and keep the subscription; the write raises `MOQTStreamStopped` (a `CancelledError`) while the session lives.
+- Relay: d20/d22 FILL_PARAMETERS on a SUBSCRIBE or REQUEST_UPDATE opens a fill fetch stream, from the cache or an upstream FETCH, reset when neither holds the range or reporting a Timed-Out gap under FILL_TIMEOUT; none while paused; counted in PUBLISH_DONE.
+- d20/d22: a length-prefixed FILL_PARAMETERS value may hold bare parameters with no Number of Parameters, and may be empty.
+- `PublishedTrack(track_properties=)`: top-level Track Properties on PUBLISH, SUBSCRIBE_OK, FETCH_OK and the TRACK_STATUS reply, beside `immutable_properties`; a type in both is refused.
+- `SubscribedTrack` keeps the Track Properties of its SUBSCRIBE_OK or PUBLISH (`track_properties`, `immutable_properties`, merged `properties`, `property_duplicates`); `take_track_properties()` takes a FETCH_OK's; `MediaSubscriber.properties(name)`.
+- `session.subscribe(on_reply=)`: called with the SUBSCRIBE_OK as it is parsed, before the track's first object.
+- `utils.timing`: one capture-time resolver (draft-frindell-moq-timestamp-00 on a wall-clock track, then LOC TIMESTAMP without a LOC TIMESCALE, then bench 0x20); `SubscribedTrack.timing` holds the track's context.
+- sub_bench, loopback_bench, adaptive_bench, load_sim, the agent reader and sub_media `--analyze`/`--report`/`--inspect` take latency from the resolver and report its source per track.
+- sub_media `--analyze`: a LOC TIMESCALE seen on any object (or as a Track Property) holds for the track, so `--loc-timescale` streams no longer mix µs and ticks.
+- Malformed draft-frindell-moq-timestamp properties (duplicates, wrong scope, TIMESCALE missing or 0, TIMESTAMP_ORIGIN without CLOCK_ID, a mapping that is not four integers, a timestamp outside 0..2^64-1) cancel the subscription (MOQT §12.1); `SubscribedTrack(timestamp_errors='report')` and `--timestamp-errors report` on sub_bench, loopback_bench and sub_media keep receiving and count them.
+- Key-Value-Pair blocks decoded in Python (control messages, datagrams, FETCH) mark repeated types in `KeyValuePairs.duplicates`.
+- Wire conformance: draft-frindell-moq-timestamp TIMESCALE, CLOCK_ID, TIMESTAMP_ORIGIN, TIMESTAMP_MAPPING and OBJECT_TIMESTAMP against hand-derived bytes at d16 and d18, valid and malformed.
+- `PublishedTrack(timestamps='loc'|'frindell'|'both')` and `--timestamps` on pub_bench, loopback_bench and pub_server: generated objects can carry draft-frindell-moq-timestamp timing (paced: TIMESCALE + TIMESTAMP_MAPPING + zig-zag correction; `-r 0`: explicit OBJECT_TIMESTAMP in µs); LOC 0x10 stays the default.
+- pub_media `--timestamp-mapping`: TIMESCALE and TIMESTAMP_MAPPING Track Properties on a fixed-cadence track (the mp4's own timescale, the tone at 48 kHz) with OBJECT_TIMESTAMP only off schedule, explicit OBJECT_TIMESTAMP on live and irregular-GOP sources, and a capture-time prft on each CMAF/LOCMAF group start; LOC TIMESTAMP is unchanged.
+- pub_media: paced feeders share one start and wall clock.
+
 ## v0.13.1
 
 - Relay: a track's Track Properties from PUBLISH or the upstream SUBSCRIBE_OK are cached and sent unchanged on its SUBSCRIBE_OK, PUBLISH, FETCH_OK and TRACK_STATUS replies, the newest set replacing the last; from d18 a Mandatory Track Property gets UNSUPPORTED_EXTENSION.
@@ -140,7 +168,7 @@
 - A truncated subgroup (abort, lane shed or Forward State 0, LOC pause) is reset with CANCELLED, not ended with END_OF_GROUP + FIN.
 - A reset or STOP_SENDING meeting a full TX ring is queued and retried, not raised.
 - `tests/relays.json`: non-gating d20/d22 targets (moxygen-fb, imquic, nokia-d22, moqtail-d22,
-  stitcher-moq, moqarena).
+  stitcher-moq).
 - SERVER_SETUP carries MOQT_IMPLEMENTATION at d14/d16; `implementation=` on client and server
   sets it, `None` omits it.
 - WebTransport client settles its draft from the server's WT-Protocol, or d14 in-band when
@@ -1331,7 +1359,7 @@ divergence reads a `DraftProfile` capability flag.
 ### Release regression: flake resistance, macOS loopback-fetch, catalog trim
 
 - **Interop tier retries transient flakes.** A failing relay/suite is retried up to 2 extra times; a genuine fail fails every attempt, a flake recovers and is annotated `(flaky: recovered on attempt N)`. External-relay/network jitter (timeouts, the `multi_sub_bench` fixed publisher-register wait racing a relay's namespace registration) no longer reads as a real failure.
-- **macOS skips `loopback-fetch`** (new `--skip-suite` flag): on macOS the native QUIC connection close stalls ~10s when a fetch stream is left un-drained at session exit — confirmed on a real macOS box (argo) that it's the aiopquic/picoquic close drain over loopback, *not* pytest teardown as first assumed — tipping loopback-fetch over its timeout. The fetch logic is platform-independent (covered on Linux) and the bench matrix covers macOS loopback delivery; tracked as an aiopquic follow-up.
+- **macOS skips `loopback-fetch`** (new `--skip-suite` flag): on macOS the native QUIC connection close stalls ~10s when a fetch stream is left un-drained at session exit — confirmed on a real macOS box (Apple M4) that it's the aiopquic/picoquic close drain over loopback, *not* pytest teardown as first assumed — tipping loopback-fetch over its timeout. The fetch logic is platform-independent (covered on Linux) and the bench matrix covers macOS loopback delivery; tracked as an aiopquic follow-up.
 - **Catalog trim (#24):** disabled the no-answer / unsupported suites that will never pass — `cloudflare-d14` `relay-fetch` and `cf-d16-interop` `relay-join`/`relay-fetch`. Verified against the implementations rather than inferred from the timeout: both `cloudflare/moq-rs` and `itzmanish/moq-rs` READMEs list FETCH as "Not Soon", and the relay neither forwards nor errors a FETCH (open upstream issues cloudflare/moq-rs#57 passthrough, #58 error). Genuine conformance fails are kept (cf-d16 pub-sub routing, quicr-west fetch code=0).
 
 ## v0.9.11
@@ -1570,7 +1598,7 @@ aiopquic 0.3.2. **195 passed / 0 skipped** (was 191/4).
 
 Pytest 195/0/0; regression unit + integration green; interop
 `moqx-main` and `moxygen-fb` both 6/6 ctrl + 3/3 pub-sub on all
-4 corners (d14/d16 × WT/raw-QUIC); linux + macOS argo confirmed.
+4 corners (d14/d16 × WT/raw-QUIC); linux + macOS (Apple M4) confirmed.
 
 ## v0.9.3 (2026-05-13)
 
@@ -1593,7 +1621,7 @@ aiopquic 0.3.1, 30 s windows):
 |  980 Mbps |  987 Mbps | 3938 ms / **65 ms** | 0 |
 | 1500 Mbps | 1.3-1.4 Gbps | — / ~150 ms       | 0 |
 
-Cross-platform sanity on argo (Apple M4, native macOS):
+Cross-platform sanity on macOS (Apple M4):
 
 | Target | Tx | Rx | avg lat |
 |---|---|---|---|
