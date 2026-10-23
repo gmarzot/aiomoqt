@@ -115,6 +115,8 @@ class Signal:
     tx_ring_depth_bytes: int = 0
     tx_ring_depth_max_bytes: int = 0
     tx_ring_streams: int = 0
+    # False when no latency sample arrived: shown as n/a, not 0.
+    latency_known: bool = True
 
 
 @dataclass
@@ -458,6 +460,7 @@ class BWActuator:
             tx_ring_depth_bytes=self._mp_tx_ring_depth,
             tx_ring_depth_max_bytes=self._mp_tx_ring_depth_max,
             tx_ring_streams=self._mp_tx_ring_streams,
+            latency_known=bool(lats),
         )
 
     async def shutdown(self) -> None:
@@ -720,6 +723,7 @@ class SubsActuator:
         rx_bps_total = 0.0
         worst_p90 = 0.0
         worst_mean = 0.0
+        lat_known = False
         max_loss_pct = 0.0
         jitter_sum = 0.0
         jitter_n = 0
@@ -742,6 +746,8 @@ class SubsActuator:
             if (now - self._spawned_t.get(wid, now)) >= startup_grace:
                 worst_p90 = max(worst_p90, s.get('lat_p90_ms', 0.0))
                 worst_mean = max(worst_mean, s.get('lat_mean_ms', 0.0))
+                # A worker with no samples reports 0.0.
+                lat_known |= bool(s.get('lat_p90_ms') or s.get('lat_mean_ms'))
             loss_ct = s.get('loss', 0)
             total = s.get('total_objs', 0) or 1
             lpct = 100.0 * loss_ct / (loss_ct + total) if (loss_ct + total) else 0.0
@@ -807,6 +813,7 @@ class SubsActuator:
             active_subs=active_subs,
             failed_subs=failed_this_window,
             health=health,
+            latency_known=lat_known,
         )
 
     async def shutdown(self) -> None:
@@ -1205,10 +1212,12 @@ class AIMDController:
         bw = fmt_bps(sig.target_mbps * 1e6)
         tx = fmt_bps(sig.tx_mbps * 1e6)
         rx = fmt_bps(sig.rx_mbps * 1e6)
-        mean = fmt_ms_signed(sig.latency_mean_ms)
-        p90 = fmt_ms_signed(sig.latency_p90_ms)
-        jit = fmt_ms(sig.jitter_ms)
-        if sig.latency_mean_ms < 0:
+        mean = (fmt_ms_signed(sig.latency_mean_ms) if sig.latency_known
+                else "n/a")
+        p90 = (fmt_ms_signed(sig.latency_p90_ms) if sig.latency_known
+               else "n/a")
+        jit = fmt_ms(sig.jitter_ms) if sig.latency_known else "n/a"
+        if sig.latency_known and sig.latency_mean_ms < 0:
             action = f"{action} {CLOCK_OFFSET_MARK}"
         if self.actuator.unit == "subs":
             print(

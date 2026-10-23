@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- adaptive_bench: latency and jitter with no samples print n/a, not 0.0us.
 - load_sim: `--draft` takes 14-22 or a comma list, as the other tools do.
 - Relay: an unusable `--control` path exits with a one-line error.
 - adaptive_bench `--mp` and relay runs: rates divide by the time measured so far, not a fixed 5 s, so early intervals no longer read as a shortfall.
