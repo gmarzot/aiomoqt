@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- relay_probe and moq_interop_client: Ctrl-C exits 130 without a traceback.
 - PublishedTrack: a producer task that fails as the session closes is logged at DEBUG, not reported as "Task exception was never retrieved".
 - `MOQTServer.close_sessions()`; the relay and pub_server close their sessions on SIGINT and SIGTERM, so peers see the close at once instead of at the idle timeout.
 - Latency reports (TrackStats tools, sub_media `--analyze`/`--report`, adaptive_bench): a negative latency prints a one-time clock-offset warning and is marked "(clock offset)"; the figures are kept and show their sign.

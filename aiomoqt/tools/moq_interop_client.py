@@ -1915,13 +1915,17 @@ def main():
     else:
         tests = STANDARD_TESTS
 
-    asyncio.run(
-        run_tests(tests, host, port, path, use_quic,
-                  args.tls_disable_verify, args.debug,
-                  supported_drafts=supported_drafts,
-                  compat=compat,
-                  reporter=reporter)
-    )
+    try:
+        asyncio.run(
+            run_tests(tests, host, port, path, use_quic,
+                      args.tls_disable_verify, args.debug,
+                      supported_drafts=supported_drafts,
+                      compat=compat,
+                      reporter=reporter)
+        )
+    except KeyboardInterrupt:
+        print("\n# Interrupted.", file=sys.stderr)
+        sys.exit(130)
 
     # TAP output to stdout
     print(reporter.report())

@@ -98,3 +98,30 @@ def test_relay_closes_its_sessions(tmp_path, transport, sig):
     finally:
         for p in peers:
             stop(p)
+
+
+@requires_certs
+def test_relay_probe_sigint(tmp_path):
+    log = tmp_path / "probe.log"
+    proc = spawn("relay_probe", "--url", f"moqt://127.0.0.1:{free_udp_port()}",
+                 "--timeout", 20, "--draft", 18, "-d", log=log)
+    wait_for(log, "session connect", proc)
+    rc, out = _interrupt(proc, log)
+    assert rc in CLEAN_RC, out
+
+
+@requires_certs
+def test_interop_client_sigint(tmp_path):
+    port = free_udp_port()
+    rlog, clog = tmp_path / "relay.log", tmp_path / "client.log"
+    relay = spawn("moq_interop_relay", "--bind", "127.0.0.1", "--port", port,
+                  "--quic", "--cert", CERT, "--key", KEY, log=rlog)
+    try:
+        wait_for(rlog, "Listening on", relay)
+        proc = spawn("moq_interop_client", "-r", f"moqt://127.0.0.1:{port}",
+                     "--tls-disable-verify", "-v", log=clog)
+        wait_for(clog, "[PASS]", proc)
+        rc, out = _interrupt(proc, clog)
+        assert rc in CLEAN_RC, out
+    finally:
+        stop(relay)

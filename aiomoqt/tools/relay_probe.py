@@ -444,6 +444,14 @@ async def _probe_single_url(url, timeout, debug=False, verify_tls=True):
 
 def cli():
     """Console entry point (moq-relay-probe)."""
+    try:
+        _cli()
+    except KeyboardInterrupt:
+        print("\n  Interrupted.", file=sys.stderr)
+        raise SystemExit(130)
+
+
+def _cli():
     global DRAFT_FILTER, RELAYS_FILE, OUTPUT_FILE
     global PROBE_TIMEOUT, PROBE_INTERVAL, VERIFY_TLS
     args = parse_args()
