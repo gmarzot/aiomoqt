@@ -799,6 +799,16 @@ def main():
         compat=args.compat,
     )
 
+    stopping = False
+
+    def _on_sigint(_sig, _frm):
+        nonlocal stopping
+        stopping = True
+
+    # Before any fork: a SIGINT during fork() raises in an at-fork
+    # callback, where Python discards it.
+    signal.signal(signal.SIGINT, _on_sigint)
+
     pubs = {ps.key: PubRT(ps) for ps in pub_specs} \
         if args.role in ("both", "pub") else {}
     groups: Dict[int, GroupRT] = {}
@@ -833,13 +843,6 @@ def main():
     start = time.monotonic()
     last_report = start
     last_tick = start
-    stopping = False
-
-    def _on_sigint(_sig, _frm):
-        nonlocal stopping
-        stopping = True
-
-    signal.signal(signal.SIGINT, _on_sigint)
 
     def _pub_rate_ops(ps: PubSpec) -> float:
         return ps.fps
