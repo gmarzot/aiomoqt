@@ -66,8 +66,8 @@ from aiomoqt.media.ingest import INSTALL_HINT, RENDITIONS, Ingest
 from aiomoqt.media.locmaf import LOCMAF_VERSION
 from aiomoqt.media.mpegts import TsDemuxer
 from aiomoqt.media.sources import (
-    AnnexBAssembler, Mp4Reader, avcc_codec_string, pcm_tone_frames,
-    sps_dimensions,
+    AnnexBAssembler, HevcAnnexBAssembler, Mp4Reader, avcc_codec_string,
+    hevc_sps_info, hvcc_codec_string, pcm_tone_frames, sps_dimensions,
 )
 from aiomoqt.track import TrackState
 from aiomoqt.utils import cli as _cli
@@ -102,8 +102,8 @@ def parse_args():
         namespace_help='MoQT namespace (default: aiomoqt/demo-<rand4>, '
                        'fresh per run; pass one explicitly to pin it)')
     parser.add_argument('--mp4', type=str, default=None, metavar='FILE',
-                        help='Publish this mp4\'s H.264 track as LOC '
-                             'video (samples pass through, no decode)')
+                        help='Publish this mp4\'s H.264, H.265 or AV1 track '
+                             'as video (samples pass through, no decode)')
     parser.add_argument('--loop', action='store_true',
                         help='Loop the mp4 for the full duration')
     parser.add_argument('--h264', type=str, default=None, metavar='FILE',
@@ -112,8 +112,8 @@ def parse_args():
                              'pipe); frames are stamped on arrival')
     parser.add_argument('--ts', type=str, default=None, metavar='FILE',
                         help='Publish a live MPEG-TS stream ("-" = stdin): '
-                             'H.264 video and AAC or Opus audio, stamped '
-                             'from the PES timestamps')
+                             'H.264 or H.265 video and AAC or Opus audio, '
+                             'stamped from the PES timestamps')
     parser.add_argument('--input', type=str, default=None, metavar='URL',
                         help='Publish anything FFmpeg opens (HLS or DASH '
                              'playlist, file, ...) as CMAF tracks, paced '
@@ -439,13 +439,19 @@ async def _feed_ingest(ingest: Ingest, tracks: dict, args, stats: dict):
         await track.finish()
 
 
-class _LiveH264:
-    """Catalog-facing view of a live Annex-B source."""
+class _LiveVideo:
+    """Catalog-facing view of a live Annex-B source. H.265 parameter
+    sets stay in band, so its codec string is hev1."""
 
     def __init__(self, asm: AnnexBAssembler):
         self.config = asm.config
-        self.codec_string = avcc_codec_string(self.config)
-        self.width, self.height = sps_dimensions(asm.sps)
+        if isinstance(asm, HevcAnnexBAssembler):
+            self.codec_string = hvcc_codec_string(self.config, 'hev1')
+            info = hevc_sps_info(asm.sps)
+            self.width, self.height = info['width'], info['height']
+        else:
+            self.codec_string = avcc_codec_string(self.config)
+            self.width, self.height = sps_dimensions(asm.sps)
         self.fps = None
         self.avg_bitrate = None
 
@@ -461,7 +467,7 @@ def _open_live_h264(args):
         if not chunk:
             raise SystemExit('  error: h264 stream ended before SPS/PPS')
         first += asm.feed(chunk)
-    return fh, asm, first, _LiveH264(asm)
+    return fh, asm, first, _LiveVideo(asm)
 
 
 async def _feed_h264_live(track, fh, asm, first, args, stats):
@@ -518,12 +524,12 @@ def _open_live_ts(args):
         if units and not first:
             dmx.to_us(units[0].pts)  # anchor at arrival, not at first send
         first += units
-    video = _LiveH264(dmx.video) if dmx.video_pid is not None else None
+    video = _LiveVideo(dmx.video) if dmx.video_pid is not None else None
     audio = (_LiveAudio(dmx)
              if dmx.audio_pid is not None and not args.no_audio else None)
     if video is None and audio is None:
-        raise SystemExit('  error: ts stream has no H.264 video or AAC/Opus '
-                         'audio')
+        raise SystemExit('  error: ts stream has no H.264/H.265 video or '
+                         'AAC/Opus audio')
     return fh, dmx, first, video, audio
 
 
@@ -535,7 +541,7 @@ async def _apply_config_change(dmx: TsDemuxer, tracks: dict, pub):
     video = tracks.get('video')
     if video is not None and dmx.video.config != video.config:
         video.config = dmx.video.config
-        view = _LiveH264(dmx.video)
+        view = _LiveVideo(dmx.video)
         if video.codec_string is not None:
             video.codec_string = view.codec_string
         for t in cat.tracks:

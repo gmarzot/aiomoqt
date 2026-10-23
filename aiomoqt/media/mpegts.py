@@ -1,9 +1,11 @@
 """MPEG-TS demux for live ingest: PAT/PMT → PES → H.264 access units
-and AAC or Opus frames, with the PES presentation timestamps preserved.
+or H.265 access units and AAC or Opus frames, with the PES presentation
+timestamps preserved.
 
 One pipe (`ffmpeg … -c copy -f mpegts -`) carries both tracks with the
 encoder's own timing, so A/V sync and frame pacing follow the source
-rather than pipe arrival. Stream types: 0x1B (H.264 Annex-B), 0x0F
+rather than pipe arrival. Stream types: 0x1B (H.264 Annex-B), 0x24
+(H.265 Annex-B), 0x0F
 (AAC ADTS) and 0x06 registered as 'Opus' (ETSI TS 102 366 Annex D);
 others are reported once and ignored.
 """
@@ -11,12 +13,13 @@ import logging
 import time
 from typing import Callable, Dict, List, NamedTuple, Optional, Set, Tuple
 
-from .sources import _ADTS_FREQ, AnnexBAssembler
+from .sources import _ADTS_FREQ, AnnexBAssembler, HevcAnnexBAssembler
 
 logger = logging.getLogger(__name__)
 
 TS_PACKET = 188
 STREAM_TYPE_H264 = 0x1B
+STREAM_TYPE_HEVC = 0x24
 STREAM_TYPE_AAC_ADTS = 0x0F
 STREAM_TYPE_PRIVATE = 0x06
 _OPUS_REGISTRATION = b'Opus'
@@ -182,9 +185,10 @@ class TsDemuxer:
     """Incremental transport-stream demuxer. feed() returns the access
     units completed by the chunk; close() flushes the last PES at EOF.
 
-    Video: each PES is fed through an AnnexBAssembler and closed, so the
-    units it held take the PES PTS (one AU per PES in practice); SPS/PPS
-    land in `video.config`. Audio: ADTS frames are split, the
+    Video: each PES is fed through an AnnexBAssembler (H.264) or
+    HevcAnnexBAssembler (H.265, `video_codec` 'hevc') and closed, so the
+    units it held take the PES PTS (one AU per PES in practice);
+    parameter sets land in `video.config`. Audio: ADTS frames are split, the
     AudioSpecificConfig derived from the header, and each frame's PTS
     advanced by 1024 samples within the PES; Opus packets are split from
     their control headers (`audio_asc` stays None) and advanced by their
@@ -196,7 +200,8 @@ class TsDemuxer:
 
     def __init__(self, clock: Optional[TsClock] = None):
         self.clock = clock or TsClock()
-        self.video = AnnexBAssembler()
+        self.video: AnnexBAssembler = AnnexBAssembler()
+        self.video_codec: Optional[str] = None
         self.video_pid: Optional[int] = None
         self.audio_pid: Optional[int] = None
         self.audio_codec: Optional[str] = None
@@ -323,8 +328,13 @@ class TsDemuxer:
             es_len = ((sec[i + 3] & 0x0F) << 8) | sec[i + 4]
             desc = sec[i + 5:i + 5 + es_len]
             i += 5 + es_len
-            if stype == STREAM_TYPE_H264 and video is None:
+            if stype in (STREAM_TYPE_H264, STREAM_TYPE_HEVC) and video is None:
                 video = pid
+                codec = 'hevc' if stype == STREAM_TYPE_HEVC else 'h264'
+                if codec != self.video_codec:
+                    self.video_codec = codec
+                    self.video = (HevcAnnexBAssembler() if codec == 'hevc'
+                                  else AnnexBAssembler())
             elif stype == STREAM_TYPE_AAC_ADTS and audio is None:
                 audio = pid
                 self.audio_codec = 'aac'

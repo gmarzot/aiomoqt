@@ -614,3 +614,66 @@ async def test_stats_json_reports_a_lost_endpoint(monkeypatch, capsys,
     lost = [e for e in events if e['event'] == 'endpoint_lost']
     assert [e['url'] for e in lost] == [urls[1]] and lost[0]['reason']
     assert events[-1] == {'event': 'done', 'reason': 'duration'}
+
+
+# -- T7: H.265 ---------------------------------------------------------------
+
+def test_mp4_hevc_track_is_read(tmp_path):
+    from aiomoqt.media.cmaf import CmafChunker, init_codec_string
+    video = Mp4Reader(_encode(tmp_path / 'h.mp4', 'mp4',
+                              vcodec='libx265')).video
+    assert video.codec_string == 'hvc1.1.6.L30.90'
+    assert video.config == video.hvcc and video.config[0] == 1
+    assert (video.width, video.height) == (160, 96)
+    samples = list(video.samples())
+    assert len(samples) == 90 and sum(s.key_frame for s in samples) == 3
+    assert init_codec_string(CmafChunker(video).init_segment()) == (
+        'hvc1.1.6.L30.90')
+
+
+def test_ts_hevc_is_demuxed_with_parameter_sets_in_band(tmp_path):
+    data = open(_encode(tmp_path / 'h.ts', 'mpegts', vcodec='libx265'),
+                'rb').read()
+    d = TsDemuxer()
+    units = []
+    for i in range(0, len(data), 1316):
+        units += d.feed(data[i:i + 1316])
+    units += d.close()
+    video = [u for u in units if u.kind == 'video']
+    assert d.video_codec == 'hevc' and d.cc_errors == 0
+    assert len(video) == 90 and sum(u.key for u in video) == 3
+    assert {b.pts - a.pts for a, b in zip(video, video[1:])} == {3000}
+    first = video[0].payload
+    assert first[4] >> 1 & 0x3F == 32           # VPS leads the first AU
+    view = pub_media._LiveVideo(d.video)
+    assert view.codec_string == 'hev1.1.6.L30.90'
+    assert (view.width, view.height) == (160, 96)
+    assert view.config[22] == 3                 # VPS, SPS, PPS arrays
+
+
+@requires_certs
+@pytest.mark.parametrize('source,packaging,use_quic', [
+    ('mp4', 'loc', True), ('mp4', 'cmaf', False), ('mp4', 'locmaf', True),
+    ('ts', 'loc', False)])
+async def test_hevc_reaches_analyze(tmp_path, monkeypatch, capsys, source,
+                                    packaging, use_quic):
+    port = (_BASE_PORT + 80
+            + ['mp4-loc', 'mp4-cmaf', 'mp4-locmaf', 'ts-loc'].index(
+                f'{source}-{packaging}'))
+    if source == 'mp4':
+        clip = _encode(tmp_path / 'h.mp4', 'mp4', vcodec='libx265')
+        pub = ['--mp4', clip, '--loop', '--packaging', packaging]
+        codec = 'hvc1.1.6.L30.90'
+    else:
+        data = open(_encode(tmp_path / 'h.ts', 'mpegts', vcodec='libx265',
+                            seconds=6), 'rb').read()
+        pub = ['--ts', _paced_fifo(tmp_path, data, 6)]
+        codec = 'hev1.1.6.L30.90'
+    rows = await _analyze(monkeypatch, tmp_path, port,
+                          [*pub, '--timestamp-mapping'], use_quic=use_quic,
+                          sub_argv=['--show-catalog'])
+    assert f'"codec": "{codec}"' in capsys.readouterr().err
+    video = rows['video']
+    assert int(video['objects']) > 20, video
+    assert 25 <= float(video['obj_rate']) <= 35, video
+    assert int(rows['audio']['objects']) > 0

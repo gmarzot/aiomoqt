@@ -103,9 +103,9 @@ def test_pat_pmt_video_only():
 
 def test_unsupported_stream_type_is_ignored():
     d = TsDemuxer()
-    d.feed(pat() + pmt([(0x24, VIDEO_PID), (STREAM_TYPE_AAC_ADTS, AUDIO_PID)]))
+    d.feed(pat() + pmt([(0x10, VIDEO_PID), (STREAM_TYPE_AAC_ADTS, AUDIO_PID)]))
     assert d.video_pid is None and d.audio_pid == AUDIO_PID
-    assert d.unsupported == {0x24}
+    assert d.unsupported == {0x10}
 
 
 def test_video_au_spanning_packets_with_config():
