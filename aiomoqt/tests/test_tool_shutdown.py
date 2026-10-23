@@ -184,4 +184,6 @@ def test_sigint_exits_cleanly(relay_with_publishers, tmp_path, tool, argv,
     proc = spawn(tool, *args, log=log)
     wait_for(log, start if when == "start" else mid, proc)
     rc, out = _interrupt(proc, log)
-    assert rc in CLEAN_RC, out
+    # load_sim stopped before any object reports its zero-object FAIL verdict.
+    ok = CLEAN_RC + ((1,) if tool == "load_sim" and when == "start" else ())
+    assert rc in ok, out
