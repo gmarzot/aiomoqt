@@ -11,6 +11,7 @@ Usage:
 import argparse
 import asyncio
 import logging
+import sys
 
 from aiomoqt.types import MOQTMessageType, parse_draft_spec
 from aiomoqt.client import MOQTClient
@@ -88,7 +89,7 @@ def parse_args():
     parser.add_argument(
         '-k', '--insecure', action='store_true', default=None,
         help='Skip certificate verification (the default unless --cert '
-             'is given)')
+             'is given; then that cert is the trust anchor)')
     parser.add_argument(
         '-d', '--debug', action='store_true')
     parser.add_argument(
@@ -241,6 +242,7 @@ async def run_subscriber(args, stats):
         use_quic=args.quic,
         supported_drafts=args.draft,
         verify_tls=not args.insecure,
+        ca_file=None if args.insecure else args.cert,
         debug=args.debug,
         congestion_control_algorithm=args.cc_algo,
     )
@@ -300,7 +302,7 @@ async def main():
         print("  Error: TLS certificate required. "
               "Use --cert and --key,")
         print("  or place cert.pem/key.pem in <project>/certs/")
-        return
+        return 1
 
     print("  Starting server...")
     quic_server = await run_server(args)
@@ -342,6 +344,7 @@ async def main():
     # Give worker thread + close walker a tick to run before we sample.
     await asyncio.sleep(0.5)
     stats.print_summary()
+    received = stats.stats.total_objects
 
     # AIOMOQT_TASK_DUMP=1 also enables a final post-shutdown counter dump
     # so we can tell whether the close-walker swept leaked WT links
@@ -357,18 +360,17 @@ async def main():
         except Exception as _e2:
             print(f"(post-shutdown counter dump failed: {_e2})",
                   file=_sys2.stderr)
+    return 0 if received else 1
 
 
 def cli():
     """Console entry point (moq-loopback-bench)."""
     try:
-        asyncio.run(main())
+        sys.exit(asyncio.run(main()))
     except KeyboardInterrupt:
         print("\n  Interrupted.")
+        sys.exit(130)
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n  Interrupted.")
+    cli()
