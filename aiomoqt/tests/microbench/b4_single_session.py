@@ -27,7 +27,6 @@ def _find_cert():
     candidates = [
         os.path.join(os.path.dirname(__file__),
                      '..', '..', '..', 'certs', 'cert.pem'),
-        '/home/gmarzot/Projects/moq/aiomoqt/certs/cert.pem',
         os.path.expanduser('~/.local/share/moqt/cert.pem'),
     ]
     for c in candidates:

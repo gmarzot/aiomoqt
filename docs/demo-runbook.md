@@ -285,9 +285,8 @@ else FFmpeg opens as CMAF tracks, played through MSE as in demo A. HLS goes
 through FFmpeg's reader (PyAV); DASH through `aiomoqt.media.dash`, since
 PyAV ships no DASH demuxer. Chunks keep the source's decode times and
 composition offsets. Needs the `media` extra (Prep).
-- SHELL 1 — live HLS, fMP4, 2 s segments, 1080p/720p/480p/360p@24 with a
-  separate AAC group (plain http):
-  `python -m aiomoqt.tools.pub_media "$RELAY_WT" --draft 18 -k --pub-both --input http://161.153.77.254:8888/tears-of-steel/index.m3u8 --keepalive 10 --catalog-interval 1 -t 3600`
+- SHELL 1 — a live HLS playlist from your own origin:
+  `python -m aiomoqt.tools.pub_media "$RELAY_WT" --draft 18 -k --pub-both --input http://hls-origin.example/live/index.m3u8 --keepalive 10 --catalog-interval 1 -t 3600`
   Startup prints one `input <track>: <codec> <size>` line per track. The
   default `--rendition best` publishes the top video rendition and audio.
 - Live DASH, 640x360@30 with AAC, 2 s segments (DASH-IF livesim2): same line
@@ -431,8 +430,3 @@ previous one inside a group; the player rebuilds the chunks. Audio from
   (Demo C). Without `-pes_payload_size 0` ffmpeg packs ~15 AAC frames
   per PES, so audio lands in ~300 ms bursts, longer than a 200 ms
   cushion.
-
-Pinned: moq-playa-v059 2cf770f (branch gmarzot-playa-dev, merged with
-upstream openmoq/moq-playa main 872f415) ·
-aiomoqt gmarzot-0.11.0 607b668 ·
-moqx-main v0.3.5 (linode-ci-000).

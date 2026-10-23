@@ -4,9 +4,7 @@
 Runs unit, integration, interop, and bench tiers against a relay catalog.
 Each suite is a discrete test with its own status line; tiers group them.
 
-Usage:
-    cd ~/Projects/moq/aiomoqt
-
+Usage, from the repo root:
     # CI path: unit + integration (no network)
     tests/release_regression_test.py --test-tier unit --test-tier integration
 
@@ -23,7 +21,7 @@ Usage:
     # LOCMAF from Eyevinn's public moqlivemock (manual only)
     tests/release_regression_test.py --test-suite media-locmaf
 
-Exit 0 iff every test passed. `[skip]` suites don't count.
+Exit 1 iff a suite fails; SKIP and XFAIL don't gate.
 """
 from __future__ import annotations
 
@@ -614,11 +612,11 @@ def main() -> int:
                     choices=SUITE_CHOICES, metavar="SUITE",
                     dest="skip_suites",
                     help="exclude this suite even if its tier is selected "
-                         "(repeatable). macOS CI skips loopback-fetch: its "
-                         "per-test event-loop teardown is pathologically slow "
-                         "on GitHub macOS runners. The fetch logic is covered "
-                         "on Linux, and the bench matrix covers macOS "
-                         "loopback delivery.")
+                         "(repeatable). macOS CI skips loopback-fetch: the "
+                         "native QUIC close stalls ~10 s on an un-drained "
+                         "fetch stream over loopback. The fetch logic is "
+                         "covered on Linux, and the bench matrix covers "
+                         "macOS loopback delivery.")
     ap.add_argument("--only", metavar="RELAY",
                     help="within the interop tier, only test this relay "
                          "by name")
