@@ -1,6 +1,7 @@
 """pub_media's paced sources stamp each frame with its scheduled
 wall-clock capture time (start anchor + media offset), so the spacing of
 LOC timestamps is exact whatever the send-time jitter."""
+import asyncio
 import time
 from types import SimpleNamespace
 
@@ -72,3 +73,16 @@ def test_an_unstamped_frame_takes_the_wall_clock_in_track_ticks():
                - now * 1_000_000) < 1_000_000
     assert abs(LocTrackPublisher(session, "ns", "v", timescale=90_000)._now()
                - now * 90_000) < 90_000
+
+
+@pytest.mark.asyncio
+async def test_the_stats_line_reports_shed_frames(capsys):
+    # One relay: a lane that stopped writing sheds, and the line says so.
+    track = SimpleNamespace(shed={0: 12}, demand=(1, 1))
+    pub = SimpleNamespace(tracks={"video": track}, sessions=[object()])
+    stats = {"video": pub_media._TrackStats()}
+    task = asyncio.ensure_future(pub_media._report_stats(stats, 0.01, pub))
+    await asyncio.sleep(0.03)
+    task.cancel()
+    line = capsys.readouterr().out.splitlines()[0]
+    assert "shed 0:12" in line

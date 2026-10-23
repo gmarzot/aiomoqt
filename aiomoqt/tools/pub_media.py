@@ -622,8 +622,8 @@ async def _refresh_catalog(pub: FanoutPublisher, interval: float):
 async def _report_stats(stats: dict, interval: float, pub: FanoutPublisher):
     """One line per interval: per-track object total, object rate and
     bitrate over the interval, frames dropped before a subscriber
-    arrived, and with several relays the demand count and frames shed
-    per relay (index = URL position)."""
+    arrived, frames shed per relay (index = URL position) and, with
+    several relays, the demand count."""
     t0 = time.monotonic()
     prev_obj = {name: 0 for name in stats}
     prev_bytes = {name: 0 for name in stats}
@@ -644,10 +644,10 @@ async def _report_stats(stats: dict, interval: float, pub: FanoutPublisher):
             if track is not None and len(pub.sessions) > 1:
                 have, total = track.demand
                 line += f" · demand {have}/{total}"
-                shed = getattr(track, 'shed', {})
-                if shed:
-                    line += " · shed " + ",".join(
-                        f"{i}:{n}" for i, n in sorted(shed.items()))
+            shed = getattr(track, 'shed', None) or {}
+            if shed:
+                line += " · shed " + ",".join(
+                    f"{i}:{n}" for i, n in sorted(shed.items()))
             parts.append(line)
         m, s = divmod(time.monotonic() - t0, 60)
         print(f"  [pub {int(m)}:{s:06.3f}] " + " · ".join(parts))

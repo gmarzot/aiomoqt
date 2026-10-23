@@ -6,6 +6,10 @@
 - Relay: status bit rates are integers and milliseconds carry two decimals.
 - Relay: platform.json is rewritten every 5 s instead of every 2 s.
 - `aiomoqt/AGENTS.md`, shipped in the wheel, is a short guide for agents using the package; the repo-root `AGENTS.md` is the contributor guide.
+- pub_media: the stats line reports frames shed per relay with one relay too.
+- PublishedTrack: a SUBSCRIBE, PUBLISH_OK or update that finds the peer's fan-out lane stopped replaces it instead of ignoring the duplicate.
+- Fan-out: a lane whose write raises logs a warning with the track and peer, resets the open group and resumes at the next group; cancellation still ends it.
+- Fan-out: a group reset while its subgroup write is suspended (PUBLISH_OK FORWARD=0 racing the first header) abandons that write instead of killing the peer's lane.
 - Relay: a d20/d22 Relative Start subscription carries its Location Filter upstream; before d20 the relay fetches the current group's head from upstream, and a subgroup stream it cannot deliver whole from the subscription's start is reset, not FINed.
 - PublishedTrack: a subgroup stream opening mid-group (Forward State resumed) sends the group's earlier objects from the FETCH history, or is reset when the history lacks them; `SubscribedTrack.subscribe(location_filter=…)`.
 - STOP_SENDING on one subgroup stream ends that stream only: the relay and PublishedTrack skip the rest of that subgroup and keep the subscription; the write raises `MOQTStreamStopped` (a `CancelledError`) while the session lives.
