@@ -1,5 +1,6 @@
 """SIGINT and SIGTERM on long-running tools: a clean exit, no traceback or
 unretrieved task exception."""
+import os
 import signal
 import subprocess
 import time
@@ -7,7 +8,8 @@ import time
 import pytest
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
-from aiomoqt.tests._procs import free_udp_port, spawn, stop, wait_for
+from aiomoqt.tests._procs import (ENV, REPO, free_udp_port, spawn, stop,
+                                  tool_cmd, wait_for)
 
 CLEAN_RC = (0, 130)
 
@@ -32,6 +34,56 @@ def test_adaptive_bench_sigint(tmp_path, marker):
     proc = spawn("adaptive_bench", "--interval", 1, "-t", 30, log=log)
     wait_for(log, marker, proc)
     rc, out = _interrupt(proc, log)
+    assert rc in CLEAN_RC, out
+
+
+@pytest.mark.parametrize("entry,nargs", [
+    ("sub_worker_entry", 1), ("sub_batch_worker_entry", 1),
+    ("pub_worker_entry", 2), ("loopback_server_entry", 2)])
+def test_workers_leave_sigint_to_the_parent(monkeypatch, entry, nargs):
+    # The parent stops workers by event; a worker ignores Ctrl-C.
+    from aiomoqt.utils import workers
+
+    seen = []
+
+    def run(coro):
+        coro.close()
+        seen.append(signal.getsignal(signal.SIGINT))
+    monkeypatch.setattr(workers, "_setup_quiet_logging", lambda *a: None)
+    monkeypatch.setattr(workers.asyncio, "run", run)
+    old = signal.getsignal(signal.SIGINT)
+    try:
+        getattr(workers, entry)({"sub_id": 0, "worker_id": 0}, None,
+                                *([None] * nargs))
+    finally:
+        signal.signal(signal.SIGINT, old)
+    assert seen == [signal.SIG_IGN]
+
+
+@requires_certs
+def test_adaptive_bench_mp_sigint_process_group(tmp_path):
+    # A terminal Ctrl-C reaches every worker process, not only the parent.
+    log = tmp_path / "adaptive.log"
+    with open(log, "w") as f:
+        proc = subprocess.Popen(
+            tool_cmd("adaptive_bench", "--mp", "--interval", 1, "-t", 30,
+                     "--loopback-port", free_udp_port()),
+            stdout=f, stderr=subprocess.STDOUT, cwd=REPO, env=ENV,
+            start_new_session=True)
+    try:
+        wait_for(log, "warming", proc)
+        time.sleep(1)
+        os.killpg(proc.pid, signal.SIGINT)
+        rc = proc.wait(timeout=20)
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        stop(proc)
+    out = log.read_text(errors="replace")
+    assert "Traceback" not in out, out
+    assert "never retrieved" not in out, out
     assert rc in CLEAN_RC, out
 
 
