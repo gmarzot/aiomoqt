@@ -2,11 +2,13 @@
 sources, object-to-subgroup and audio group mapping, the datagram size
 limit, signal shutdown and --stats-json, end to end through the interop
 relay into sub_media --analyze where a session is involved."""
+import asyncio
 import csv
 import os
 import threading
 import time
 from fractions import Fraction
+from types import SimpleNamespace
 
 import pytest
 
@@ -186,3 +188,38 @@ async def test_opus_reaches_analyze_at_50_objects_per_second(
     # LOCMAF audio defaults to ~1 s groups.
     assert float(audio['gop_p50']) == (50 if packaging == 'locmaf' else 1)
     assert int(rows['video']['objects']) > 0
+
+
+# -- stats line ----------------------------------------------------------
+
+class _Out:
+    def __init__(self):
+        self.written = []
+
+    async def write(self, group_id, object_id, payload, **kw):
+        self.written.append((group_id, object_id))
+
+    def reset_group(self):
+        pass
+
+
+async def test_stats_line_counts_objects_produced_not_frames_discarded(
+        capsys):
+    from aiomoqt.media import LocTrackPublisher
+    track = LocTrackPublisher(None, 'ns', 'video')
+    track._subs[0].forward = track._subs[0].generating = True
+    st = pub_media._TrackStats()
+    for key in (False, False, False, True, False):
+        await track.send_frame(b'x', key_frame=key, timestamp=1)
+        st.count(b'x')
+    await track.finish()
+    out = _Out()
+    await track.produce(out)
+    assert len(out.written) == 2 and track.frames_dropped == 3
+    pub = SimpleNamespace(tracks={'video': track}, sessions=[None])
+    task = asyncio.ensure_future(
+        pub_media._report_stats({'video': st}, 0.01, pub))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    line = capsys.readouterr().out.splitlines()[0]
+    assert 'video: 2 obj' in line and 'discarded 3' in line, line

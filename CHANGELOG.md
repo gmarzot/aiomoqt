@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- pub_media: the stats line counts objects produced and reports frames the track discarded (waiting for a key frame, Forward State 0) as `discarded`.
 - pub_media: Opus audio from `--ts` and `--mp4` (loc, cmaf, locmaf), one object per Opus packet; catalog codec `opus`.
 - SubscribedTrack: a timing-malformed object that arrives before SUBSCRIBE_OK is processed cancels its own track, not alias 0.
 - Relay: status files are encoded with json's C encoder.

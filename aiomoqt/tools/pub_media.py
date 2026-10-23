@@ -700,10 +700,11 @@ async def _refresh_catalog(pub: FanoutPublisher, interval: float):
 
 
 async def _report_stats(stats: dict, interval: float, pub: FanoutPublisher):
-    """One line per interval: per-track object total, object rate and
+    """One line per interval: per-track objects produced, object rate and
     bitrate over the interval, frames dropped before a subscriber
-    arrived, frames shed per relay (index = URL position) and, with
-    several relays, the demand count."""
+    arrived, frames the track discarded unnumbered (waiting for a key
+    frame, Forward State 0), frames shed per relay (index = URL position)
+    and, with several relays, the demand count."""
     t0 = time.monotonic()
     prev_obj = {name: 0 for name in stats}
     prev_bytes = {name: 0 for name in stats}
@@ -711,16 +712,19 @@ async def _report_stats(stats: dict, interval: float, pub: FanoutPublisher):
         await asyncio.sleep(interval)
         parts = []
         for name, st in stats.items():
-            ops = (st.objects - prev_obj[name]) / interval
+            track = pub.tracks.get(name)
+            discarded = getattr(track, 'frames_dropped', 0)
+            objects = st.objects - discarded
+            ops = (objects - prev_obj[name]) / interval
             kbps = (st.bytes - prev_bytes[name]) * 8 / interval / 1000
-            prev_obj[name] = st.objects
+            prev_obj[name] = objects
             prev_bytes[name] = st.bytes
             lag = st.take_lag()
-            line = (f"{name}: {st.objects} obj · {ops:.0f} obj/s · {kbps:.0f} kbps"
+            line = (f"{name}: {objects} obj · {ops:.0f} obj/s · {kbps:.0f} kbps"
                     + (f" · lag {lag[0]:.0f}/{lag[1]:.0f} ms" if lag else "")
                     + (f" · tx {lag[2]:.1f} ms" if lag and lag[2] >= 0.05 else "")
-                    + (f" · dropped {st.dropped}" if st.dropped else ""))
-            track = pub.tracks.get(name)
+                    + (f" · dropped {st.dropped}" if st.dropped else "")
+                    + (f" · discarded {discarded}" if discarded else ""))
             if track is not None and len(pub.sessions) > 1:
                 have, total = track.demand
                 line += f" · demand {have}/{total}"
