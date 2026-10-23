@@ -15,7 +15,7 @@ from enum import Enum
 from typing import Any, Callable, Dict, Optional
 
 from .messages import SubgroupHeader
-from .types import StreamResetCode
+from .types import MOQTStreamStopped, StreamResetCode
 from .messages.data import (
     FETCH_FLAGS_END_UNKNOWN, FetchObject, ObjectDatagram,
 )
@@ -176,6 +176,8 @@ class SubgroupDelivery:
         self.excludes_end: Optional[Callable[[int, int], bool]] = None
         self._stream_id: Optional[int] = None
         self._header: Optional[SubgroupHeader] = None
+        # Group whose stream the peer stopped; not reopened (§11.3.2).
+        self._stopped_group: Optional[int] = None
 
     @property
     def _prof(self):
@@ -213,54 +215,63 @@ class SubgroupDelivery:
             if group_start:
                 self.end_group()
             return False
+        if group_id == self._stopped_group and not group_start:
+            return False
         if callable(extensions):
             extensions = extensions(self.session)
-        if self.mapping is StreamMapping.DATAGRAM:
-            dgram = ObjectDatagram(
-                track_alias=self.track_alias, group_id=group_id,
-                object_id=object_id, publisher_priority=self.priority,
-                extensions=extensions, payload=payload)
-            await self.session.dgram_write_drain(
-                dgram.serialize(prof=self._prof))
-        elif self.mapping is StreamMapping.PER_OBJECT:
-            # One stream per object ⇒ one subgroup per object (a subgroup
-            # owns exactly one stream); the object keeps its decode-order
-            # id via subgroup_id.
-            sid = await self.session.open_uni_stream()
-            self.stream_count += 1
-            if self.stream_priority is not None:
-                self.session.set_stream_priority(sid, self.stream_priority)
-            hdr = SubgroupHeader(
-                track_alias=self.track_alias, group_id=group_id,
-                subgroup_id=object_id, publisher_priority=self.priority,
-                extensions_present=True, prof=self._prof)
-            await self.session.stream_write_drain(sid, hdr.serialize().data)
-            buf = hdr.next_object(payload=payload, extensions=extensions,
-                                  object_id=object_id)
-            await self.session.stream_write_drain(sid, buf.data)
-            self.session.stream_write(sid, b"", end_stream=True)
-        else:  # PER_GROUP
-            if group_start or self._stream_id is None:
-                # A filter can admit a group part-way through: the stream
-                # then opens on a later object, not the group's first.
-                self.end_group()
-                self._stream_id = await self.session.open_uni_stream()
+        try:
+            if self.mapping is StreamMapping.DATAGRAM:
+                dgram = ObjectDatagram(
+                    track_alias=self.track_alias, group_id=group_id,
+                    object_id=object_id, publisher_priority=self.priority,
+                    extensions=extensions, payload=payload)
+                await self.session.dgram_write_drain(
+                    dgram.serialize(prof=self._prof))
+            elif self.mapping is StreamMapping.PER_OBJECT:
+                # One stream per object ⇒ one subgroup per object (a subgroup
+                # owns exactly one stream); the object keeps its decode-order
+                # id via subgroup_id.
+                sid = await self.session.open_uni_stream()
                 self.stream_count += 1
                 if self.stream_priority is not None:
-                    self.session.set_stream_priority(
-                        self._stream_id, self.stream_priority)
-                self._header = SubgroupHeader(
+                    self.session.set_stream_priority(sid, self.stream_priority)
+                hdr = SubgroupHeader(
                     track_alias=self.track_alias, group_id=group_id,
-                    subgroup_id=0, publisher_priority=self.priority,
-                    extensions_present=True, prof=self._prof,
-                    first_object=group_start)
-                await self.session.stream_write_drain(
-                    self._stream_id, self._header.serialize().data)
-            buf = self._header.next_object(payload=payload,
-                                           extensions=extensions,
-                                           object_id=object_id)
-            await self.session.stream_write_drain(self._stream_id, buf.data)
-
+                    subgroup_id=object_id, publisher_priority=self.priority,
+                    extensions_present=True, prof=self._prof)
+                await self.session.stream_write_drain(sid, hdr.serialize().data)
+                buf = hdr.next_object(payload=payload, extensions=extensions,
+                                      object_id=object_id)
+                await self.session.stream_write_drain(sid, buf.data)
+                self.session.stream_write(sid, b"", end_stream=True)
+            else:  # PER_GROUP
+                if group_start or self._stream_id is None:
+                    # A filter can admit a group part-way through: the stream
+                    # then opens on a later object, not the group's first.
+                    self.end_group()
+                    self._stream_id = await self.session.open_uni_stream()
+                    self.stream_count += 1
+                    if self.stream_priority is not None:
+                        self.session.set_stream_priority(
+                            self._stream_id, self.stream_priority)
+                    self._header = SubgroupHeader(
+                        track_alias=self.track_alias, group_id=group_id,
+                        subgroup_id=0, publisher_priority=self.priority,
+                        extensions_present=True, prof=self._prof,
+                        first_object=group_start)
+                    await self.session.stream_write_drain(
+                        self._stream_id, self._header.serialize().data)
+                buf = self._header.next_object(payload=payload,
+                                               extensions=extensions,
+                                               object_id=object_id)
+                await self.session.stream_write_drain(self._stream_id, buf.data)
+        except MOQTStreamStopped:
+            # The session has reset the stream; a group's is not reopened.
+            if self.mapping is StreamMapping.PER_GROUP:
+                self._stopped_group = group_id
+                self._stream_id = None
+                self._header = None
+            return False
         self._note_largest(group_id, object_id)
         self.objects_sent += 1
         self.bytes_sent += len(payload)

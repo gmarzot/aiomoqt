@@ -60,21 +60,25 @@ import signal
 import sys
 import time
 from collections import Counter
+from types import SimpleNamespace
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
 from aiomoqt.types import (
     MOQT_DEFAULT_DRAFTS, D18MessageType, FilterType, GroupOrder, MOQTDraft,
-    MOQTMessageType, MOQTRequestError, ObjectStatus, ParamType,
+    MOQTMessageType, MOQTRequestError, MOQTStreamStopped, ObjectStatus,
+    ParamType,
     RequestErrorCode, StreamResetCode, SubscribeDoneCode,
     parse_draft_spec,
 )
-from aiomoqt.messages import SubgroupHeader
+from aiomoqt.messages import FetchHeader, SubgroupHeader
 from aiomoqt.messages.base import MOQTMessage
-from aiomoqt.messages.data import (FetchObject, ObjectDatagram,
-                                   ObjectDatagramStatus)
+from aiomoqt.messages.data import (FETCH_FLAGS_END_TIMED_OUT, FetchObject,
+                                   ObjectDatagram, ObjectDatagramStatus)
 from aiomoqt.messages.fetch import _is_joining
-from aiomoqt.messages.params import U64_MAX, LocationFilter
+from aiomoqt.messages.params import (U64_MAX, D20ParamType, LocationFilter,
+                                     LocationFilterType, fill_range,
+                                     uses_location_filter)
 from aiomoqt.messages.publish import Publish, PublishError
 from aiomoqt.messages.request import RequestError, RequestOk
 from aiomoqt.messages.subscribe import Subscribe, SubscribeOk
@@ -147,6 +151,11 @@ JOINING_WAIT_S = 5.0
 # Longest the relay waits for a PUBLISH after an upstream refuses its
 # SUBSCRIBE as a duplicate subscription (§5.1: the PUBLISH crossed it).
 PUBLISH_WAIT_S = 1.5
+# Longest a fill waits on an upstream FETCH; caps FILL_TIMEOUT (§9.20.5).
+FILL_UPSTREAM_S = 10.0
+# Longest a SUBSCRIBE waits on an upstream FETCH for the group head the
+# upstream subscription did not deliver.
+BACKFILL_S = 2.0
 # Watchdog: self-probes failed in a row before exiting, the exit status
 # (EX_SOFTWARE), and the longest one probe may take.
 WATCHDOG_MISSES = 3
@@ -304,7 +313,8 @@ class _Downstream:
     """One downstream subscription to a relayed track."""
 
     __slots__ = ("session", "alias", "request_id", "forward", "window",
-                 "joined_at", "replaying")
+                 "joined_at", "replaying", "location_filter", "group_order",
+                 "fills")
 
     def __init__(self, session, alias, request_id, forward=True,
                  window=_UNFILTERED):
@@ -321,6 +331,11 @@ class _Downstream:
         # Waiting for the cache replay queued for it; live objects skip it
         # until then and reach it through the replay.
         self.replaying = False
+        # d20+ Location Filter and group order, for fill ranges (§3.4).
+        self.location_filter = None
+        self.group_order = None
+        # Fill fetch stream tasks; cancelling one resets its stream.
+        self.fills: set = set()
 
     def passes(self, group_id, object_id) -> bool:
         """Forward State 1 and inside the filter window."""
@@ -336,6 +351,11 @@ class _Downstream:
     def past_end(self, group_id) -> bool:
         end_group = self.window[1]
         return end_group is not None and group_id > end_group
+
+    @property
+    def start(self):
+        """Start Location; None when unfiltered."""
+        return None if self.window is _UNFILTERED else self.window[0]
 
 
 class _RelayedTrack:
@@ -369,6 +389,9 @@ class _RelayedTrack:
         self._streams = {}
         # id(session) -> subgroup streams opened (PUBLISH_DONE count)
         self._sent_streams = {}
+        # (id(session), group, subgroup) whose stream the subscriber
+        # stopped: its later objects are skipped, never reopened (§11.3.2).
+        self._stopped = set()
         self._finished = False
         # Closed: takes no objects and never restarts its drain.
         self._closed = False
@@ -394,6 +417,9 @@ class _RelayedTrack:
         self.upstream_request_id = None
         # Largest Location (§10.2.11): largest reported or received.
         self.largest = None
+        # From here on every upstream object of a subgroup reaches the
+        # relay (§11.3.2); None when unknown.
+        self.complete_from = None
         # Track Properties as last received from upstream (§8.4): sent on
         # every reply for the track, replaced whole, never merged.
         self.properties: dict = {}
@@ -681,10 +707,16 @@ class _RelayedTrack:
                      and d.request_id == request_id), None)
 
     def drop_session(self, session):
+        for d in self.downstream:
+            if d.session is session:
+                # d22 §3.4.1: a cancelled subscription resets its fills.
+                for task in list(d.fills):
+                    task.cancel()
         self.downstream = [d for d in self.downstream
                            if d.session is not session]
         for k in [k for k in self._streams if k[0] == id(session)]:
             self._streams.pop(k, None)
+        self._stopped = {k for k in self._stopped if k[0] != id(session)}
         self._sent_streams.pop(id(session), None)
 
     async def _forward_loop(self):
@@ -728,7 +760,7 @@ class _RelayedTrack:
                     self._bytes_out += len(payload or b"")
                     await self._forward_one(
                         d.session, d.alias, gid, sgid, oid, payload, exts,
-                        prio, status, shape, encoded)
+                        prio, status, shape, encoded, start=d.start)
                 except (Exception, asyncio.CancelledError):
                     if _cancelling():
                         raise
@@ -758,6 +790,7 @@ class _RelayedTrack:
             first = self._cache[0][0]
             self._ended = {k for k in self._ended if k[0] >= first}
             self._opened = {k for k in self._opened if k[0] >= first}
+            self._stopped = {k for k in self._stopped if k[1] >= first}
 
     async def _replay(self, d) -> None:
         """The cached objects inside `d`'s window, in Location order,
@@ -772,11 +805,13 @@ class _RelayedTrack:
                 self._objects_out += 1
                 self._bytes_out += len(payload or b"")
                 await self._forward_one(d.session, d.alias, gid, sgid, oid,
-                                        payload, exts, prio, status, shape)
+                                        payload, exts, prio, status, shape,
+                                        start=d.start)
             for gid, sgid in sorted({(c[0], c[1]) for c in objs}):
                 if (gid, sgid) in self._ended:
                     await self._forward_one(d.session, d.alias, gid, sgid,
-                                            None, None, None, None, "END")
+                                            None, None, None, None, "END",
+                                            start=d.start)
         except (Exception, asyncio.CancelledError):
             if _cancelling():
                 raise
@@ -817,12 +852,21 @@ class _RelayedTrack:
             out.append((gid, sgid, oid, payload, exts, prio, status))
         return out
 
+    def _short(self, gid, start) -> bool:
+        """A subscription starting at `start` is owed objects of group
+        `gid` from before what upstream delivered to this relay."""
+        cf = self.complete_from
+        return (start is not None and cf is not None
+                and max(start, (gid, 0)) < cf)
+
     async def _forward_one(self, session, alias, gid, sgid, oid,
                            payload, exts, prio, status=None, shape=None,
-                           encoded=None):
+                           encoded=None, start=None):
         """Write one object downstream, opening the (group, subgroup)
         stream on first sight. Group/subgroup identity is preserved from
-        upstream so the downstream sees the publisher's structure."""
+        upstream so the downstream sees the publisher's structure. A
+        stream short of objects from `start` is reset, never FINed
+        (§11.3.2)."""
         if (isinstance(shape, tuple) and shape and shape[0] == "DGRAM"
                 and not _no_datagrams.get(id(session))):
             prof = session._profile
@@ -849,6 +893,8 @@ class _RelayedTrack:
                 logger.warning("relay: no datagram TX on this session, "
                                "forwarding objects on streams")
         skey = (id(session), gid, sgid)
+        if skey in self._stopped:
+            return
         entry = self._streams.get(skey)
         if entry is None and status in ("END", "RESET"):
             return
@@ -877,6 +923,11 @@ class _RelayedTrack:
             self._sent_streams[id(session)] = \
                 self._sent_streams.get(id(session), 0) + 1
         stream_id, header = entry
+        if status in ("END", ObjectStatus.END_OF_GROUP,
+                      ObjectStatus.END_OF_TRACK) and self._short(gid, start):
+            session.stream_reset(stream_id, StreamResetCode.INTERNAL_ERROR)
+            self._streams.pop(skey, None)
+            return
         if status == "END":
             # Upstream closed the subgroup stream without a marker, so
             # the group end IS the FIN. Writing a marker here would be
@@ -901,7 +952,12 @@ class _RelayedTrack:
                 encoded[state] = data
         else:
             header.advance(oid)
-        await session.stream_write_drain(stream_id, data)
+        try:
+            await session.stream_write_drain(stream_id, data)
+        except MOQTStreamStopped:
+            # The session has reset the stream; the subscription goes on.
+            self._streams.pop(skey, None)
+            self._stopped.add(skey)
 
 
 _watched: set = set()
@@ -1189,6 +1245,17 @@ def _upstream_filter(sub) -> dict:
     """The first subscriber's start for a shared upstream SUBSCRIBE, with
     no End Group: later subscribers may want more. An unfiltered one stays
     unfiltered (filter_type None; see _filter_for)."""
+    lf = getattr(sub, "location_filter", None)
+    if lf is not None:
+        if lf.type == LocationFilterType.RELATIVE_START:
+            return {"location_filter": lf}
+        if lf.type == LocationFilterType.NEXT_OBJECT:
+            return {"filter_type": FilterType.LATEST_OBJECT}
+        if lf.type == LocationFilterType.NONE:
+            return {"filter_type": None}
+        return {"filter_type": FilterType.ABSOLUTE_START,
+                "start_group": lf.start_group,
+                "start_object": lf.start_object}
     ftype = getattr(sub, "filter_type", None)
     if sub is None or ftype in (FilterType.LATEST_OBJECT,
                                 FilterType.NEXT_GROUP_START):
@@ -1202,12 +1269,60 @@ def _upstream_filter(sub) -> dict:
 
 def _filter_for(pub, kwargs: dict) -> dict:
     """From d16 an omitted filter is unfiltered (§10.2.9); d14 has no
-    omission, so it carries AbsoluteStart {0, 0}."""
+    omission, so it carries AbsoluteStart {0, 0}. Before d20 a relative
+    start is sent as Largest Object; _backfill() fetches the rest."""
+    if "location_filter" in kwargs and not uses_location_filter(
+            pub._profile):
+        return {"filter_type": FilterType.LATEST_OBJECT}
     if "filter_type" in kwargs and kwargs["filter_type"] is None and not (
             is_draft16_or_later(pub.negotiated_draft)):
         return {"filter_type": FilterType.ABSOLUTE_START,
                 "start_group": 0, "start_object": 0}
     return kwargs
+
+
+def _delivery_start(kwargs: dict, largest):
+    """Where an upstream SUBSCRIBE with these subscribe() kwargs starts
+    delivering, given the Largest its SUBSCRIBE_OK reported. Unfiltered
+    is taken as the live edge."""
+    lf = kwargs.get("location_filter")
+    if lf is not None:
+        return _location_window(lf, largest)[0]
+    return _filter_window(kwargs.get("filter_type")
+                          or FilterType.LATEST_OBJECT,
+                          kwargs.get("start_group"),
+                          kwargs.get("start_object"), None, largest)[0]
+
+
+async def _backfill(track, msg) -> None:
+    """Fetch from upstream the head of the group a subscription starts in
+    when the upstream subscription began after it, into the cache, so the
+    subscriber's streams are complete from its start (§11.3.2). Left
+    short when nothing serves it; those streams are then reset."""
+    cf = track.complete_from
+    window = _subscription_window(msg, track.largest)
+    if cf is None or window is _UNFILTERED:
+        return
+    start = max(window[0], (cf[0], 0))
+    ns, name = track.key
+    if start >= cf or track.cache_covers(start) or not _publishers_for(ns):
+        return
+    rng = SimpleNamespace(group_order=GroupOrder.ASCENDING,
+                          start_group=start[0], start_object=start[1],
+                          end_group=cf[0], end_object=cf[1])
+    _, objs, _ = await _fetch_upstream(ns, name, rng, timeout=BACKFILL_S)
+    if objs is None or track.complete_from != cf:
+        return
+    held = {(c[0], c[2]) for c in track._cache}
+    new = [(o.group_id, o.subgroup_id, o.object_id, bytes(o.payload),
+            o.extensions or None, o.publisher_priority, o.status, None)
+           for o in objs if (o.group_id, o.object_id) not in held]
+    track._cache = deque(sorted([*new, *track._cache],
+                                key=lambda c: (c[0], c[2])))
+    track._cache_bytes += sum(len(c[3]) for c in new)
+    track.complete_from = start
+    logger.info(f"relay: backfilled {len(new)} object(s) of {track.key} "
+                f"{start}..{cf}")
 
 
 def _parked_publish(key):
@@ -1293,9 +1408,9 @@ async def _subscribe_publishers(entry):
             on_object=track.on_object,
             on_done=lambda done, t=track, k=key: _upstream_done(t, k, done))
         entry.pub = pub
+        upstream_filter = _filter_for(pub, entry.filter)
         try:
-            await upstream.subscribe(timeout=10.0,
-                                     **_filter_for(pub, entry.filter))
+            await upstream.subscribe(timeout=10.0, **upstream_filter)
         except Exception as e:
             if entry.fut.done():
                 break
@@ -1341,6 +1456,8 @@ async def _subscribe_publishers(entry):
         track.properties = props
         # §10.2.11: Largest includes what the upstream SUBSCRIBE_OK reports.
         track.note_largest(upstream.largest)
+        track.complete_from = _delivery_start(upstream_filter,
+                                              upstream.largest)
         pub.register_stream_end_handler(upstream.track_alias,
                                         track.on_stream_end)
         _tracks[key] = track
@@ -1552,6 +1669,8 @@ def _answer_publish(track, forward=None) -> None:
     track.publish_alias = msg.track_alias
     if getattr(msg, "content_exists", 0):
         track.note_largest((msg.largest_group_id, msg.largest_object_id))
+    if forward:
+        track.complete_from = _publish_ok_location(msg)["start"]
     # From d20 PUBLISH_OK carries only EXPIRES and Forward State follows
     # in a REQUEST_UPDATE; publish_ok() sends the draft's shape.
     session.publish_ok(msg, forward=int(forward), priority=128,
@@ -1598,6 +1717,7 @@ def _resume_parked_publish(track) -> None:
         return
     session, msg = track.parked
     track.parked = None
+    track.complete_from = _publish_ok_location(msg)["start"]
     try:
         session.request_update(msg.request_id, forward=1,
                                **_publish_ok_location(msg))
@@ -1674,11 +1794,101 @@ def _attach_subscriber(session, msg, track) -> bool:
     # unfiltered subscription starts at the live edge.
     replay = (window is not _UNFILTERED and track.largest is not None
               and window[0] <= track.largest)
-    track.add_downstream(session, ok.track_alias, msg.request_id,
-                         forward=forward, window=window, replay=replay)
+    d = track.add_downstream(session, ok.track_alias, msg.request_id,
+                             forward=forward, window=window, replay=replay)
+    d.location_filter = getattr(msg, "location_filter", None)
+    d.group_order = getattr(msg, "group_order", None)
     session.register_request_cancel_handler(
         msg.request_id, lambda rid, t=track, s=session: t.drop_session(s))
+    _start_fill(track, d, msg)
     return True
+
+
+def _start_fill(track, d, msg) -> None:
+    """Open the fill fetch stream a FILL_PARAMETERS asks for (d22 §3.4.1),
+    under `msg`'s Request ID: none while paused or for an empty range."""
+    fill = (msg.parameters or {}).get(D20ParamType.FILL_PARAMETERS)
+    if (fill is None or not d.forward
+            or d.session._profile.param_table < 20):
+        return
+    rng = fill_range(fill, d.location_filter, track.largest)
+    if rng is None:
+        return
+    sid = id(d.session)
+    track._sent_streams[sid] = track._sent_streams.get(sid, 0) + 1
+    task = asyncio.create_task(_serve_fill(track, d, msg.request_id, fill,
+                                           rng))
+    d.fills.add(task)
+    task.add_done_callback(d.fills.discard)
+
+
+async def _serve_fill(track, d, request_id, fill, rng) -> None:
+    """A fill fetch stream from the cache, else from an upstream FETCH.
+    Under FILL_TIMEOUT what neither holds is a Timed-Out gap (§9.20.5);
+    without it the fill fails, which is a reset (§3.4.1)."""
+    session = d.session
+    start, end = rng
+    ns, name = track.key
+    timeout_ms = fill.get(D20ParamType.FILL_TIMEOUT)
+    order = int(fill.get(ParamType.GROUP_ORDER) or d.group_order
+                or GroupOrder.ASCENDING)
+    objs, source, serving = None, "cache", False
+    try:
+        if track.cache_covers(start):
+            objs = track.cached_range(start, end)
+        elif timeout_ms != 0 and _publishers_for(ns):
+            wait = FILL_UPSTREAM_S if timeout_ms is None else min(
+                timeout_ms / 1000, FILL_UPSTREAM_S)
+            rng_msg = SimpleNamespace(
+                group_order=order, start_group=start[0],
+                start_object=start[1], end_group=end[0],
+                end_object=0 if end[1] == U64_MAX else end[1] + 1)
+            _, up, _ = await _fetch_upstream(ns, name, rng_msg, timeout=wait)
+            if up:
+                objs, source = [(o.group_id, o.subgroup_id, o.object_id,
+                                 o.payload, o.extensions,
+                                 o.publisher_priority, o.status)
+                                for o in up], "upstream"
+        gap = None
+        if objs is None and timeout_ms is not None:
+            objs = track.cached_range(start, end)
+            g, o = (objs[0][0], objs[0][2]) if objs else (end[0], end[1] + 1)
+            gap = FetchObject(group_id=g if o else g - 1,
+                              object_id=o - 1 if o else U64_MAX,
+                              end_of_range=FETCH_FLAGS_END_TIMED_OUT)
+        if objs is None:
+            logger.info(f"relay: fill {track.key} request {request_id} "
+                        f"{start}..{end} unavailable, reset")
+            await _fail_fill(session, request_id)
+            return
+        if order == int(GroupOrder.DESCENDING):
+            objs = sorted(objs, key=lambda o: (-o[0], o[2]))
+        served = _counted_fetch(objs, track, source)
+        if gap is not None:
+            served = itertools.chain((gap,), served)
+        serving = True
+        await session.serve_fetch(request_id, served, group_order=order)
+        logger.info(f"relay: fill {track.key} request {request_id} served "
+                    f"{len(objs)} object(s) {start}..{end} from {source}")
+    except asyncio.CancelledError:
+        pass  # serve_fetch reset the stream
+    except Exception:
+        logger.debug(f"relay: fill for request {request_id} failed",
+                     exc_info=True)
+        if not serving:
+            await _fail_fill(session, request_id)
+
+
+async def _fail_fill(session, request_id) -> None:
+    """§3.4.1: a failed fill opens its stream and resets it after the
+    FETCH_HEADER."""
+    try:
+        stream_id = await session.open_uni_stream()
+        session.stream_write(stream_id, FetchHeader(
+            request_id=request_id).serialize(prof=session._profile).data)
+        session.stream_reset(stream_id, StreamResetCode.INTERNAL_ERROR)
+    except Exception:
+        logger.debug("relay: resetting a fill stream failed", exc_info=True)
 
 
 async def _on_request_update(session, msg):
@@ -1702,6 +1912,9 @@ async def _on_request_update(session, msg):
         window = _reply_window(session, msg, track.largest)
         if window is not None:
             d.window = window
+        lf = (msg.parameters or {}).get(ParamType.SUBSCRIPTION_FILTER)
+        if isinstance(lf, LocationFilter):
+            d.location_filter = lf
     else:
         forward = msg.forward
     if forward is not None:
@@ -1716,6 +1929,7 @@ async def _on_request_update(session, msg):
         session._send_reply(msg.request_id,
                             RequestOk(request_id=msg.request_id,
                                       parameters=params))
+        _start_fill(track, d, msg)
     _resume_parked_publish(track)
 
 
@@ -1759,6 +1973,7 @@ async def _on_subscribe(session, msg):
         _tracks.pop((ns, msg.track_name), None)
         track = None
     if track is not None and (track.pending_publish or track.upstream):
+        await _backfill(track, msg)
         if _attach_subscriber(session, msg, track):
             _answer_publish(track)
             _resume_parked_publish(track)
@@ -1783,6 +1998,7 @@ async def _on_subscribe(session, msg):
                         f"cancelled before its reply")
             return
         if track is not None:
+            await _backfill(track, msg)
             if _attach_subscriber(session, msg, track):
                 _answer_publish(track)
                 _resume_parked_publish(track)
@@ -2040,7 +2256,7 @@ def _counted_fetch(objs, track, source):
             track._fetch_bytes[source] += len(payload)
 
 
-async def _fetch_upstream(ns, track_name, msg):
+async def _fetch_upstream(ns, track_name, msg, timeout=10.0):
     """Ask each publisher of `ns` for the requested range. Returns its
     FETCH_OK, the objects and None, or (None, None, the last upstream
     refusal or None) when nobody serves it —
@@ -2063,10 +2279,13 @@ async def _fetch_upstream(ns, track_name, msg):
         key = (id(pub), req.request_id)
         _fetch_sinks[key] = []
         try:
-            ok = await pub._await_response(req.request_id, timeout=10.0)
+            ok = await pub._await_response(req.request_id, timeout=timeout)
             mandatory = _mandatory(pub, _track_properties(pub, ok))
             if not mandatory:
-                await pub.await_fetch_done(req.request_id, timeout=10.0)
+                await pub.await_fetch_done(req.request_id, timeout=timeout)
+        except asyncio.CancelledError:
+            _fetch_sinks.pop(key, None)
+            raise
         except (MOQTRequestError, asyncio.TimeoutError) as e:
             logger.info(f"relay: upstream FETCH declined on {ns}: {e}")
             _fetch_sinks.pop(key, None)

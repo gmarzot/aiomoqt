@@ -1219,11 +1219,56 @@ def test_length_prefixed_fill_parameters_is_still_read(raw, fill):
     assert _unparams(bytes.fromhex(raw), 20) == {0x23: fill}
 
 
+@pytest.mark.parametrize("draft", [20, 22])
+@pytest.mark.parametrize("raw, fill", [
+    ("01" "23" "03" "210101", {0x21: LocationFilter.relative(1)}),
+    ("01" "23" "05" "0a05" "170101",
+     {0x0A: 5, 0x21: LocationFilter.relative(1)}),
+    ("01" "23" "00", {}),
+    ("01" "23" "06" "02" "0a05" "170101",
+     {0x0A: 5, 0x21: LocationFilter.relative(1)}),
+], ids=["bare-one", "bare-two", "empty-value", "length-and-count"])
+def test_length_prefixed_fill_value_is_counted_or_bare(draft, raw, fill):
+    # A first varint below 0x0A (no Table 7 type is) is a Number of
+    # Parameters; otherwise the parameters run to the value's end.
+    assert _unparams(bytes.fromhex(raw), draft) == {0x23: fill}
+
+
+def test_d22_subscribe_with_bare_length_prefixed_fill_decodes():
+    # LOCATION_FILTER Next Object, then FILL_PARAMETERS Length 3 holding
+    # a bare LOCATION_FILTER Relative Start 1.
+    raw = bytes.fromhex("03001e00010b67352d343431306562386307636174616c6f67"
+                        "0221050203210101")
+    assert int.from_bytes(raw[1:3], "big") == len(raw) - 3
+    got = _decode_subscribe(22, raw[3:])
+    assert (got.track_namespace, got.track_name) == ((b"g5-4410eb8c",),
+                                                     b"catalog")
+    assert got.location_filter == LocationFilter.next_object()
+    assert got.parameters[0x23] == {0x21: LocationFilter.relative(1)}
+
+
+@pytest.mark.parametrize("raw, match", [
+    ("01" "23" "02" "210101", "unknown message parameter|truncated|"
+     "overran|exceeds|exhausted"),
+    ("01" "23" "02" "1001", "not allowed in FillParameters"),
+    ("01" "23" "02" "7f01", "unknown message parameter"),
+    ("01" "23" "03" "02" "0a05", "exhausted|unknown message parameter"),
+    ("01" "23" "05" "01" "0a05" "0a", "does not fill its length|"
+     "duplicate|exhausted|unknown"),
+], ids=["bare-overruns-length", "bare-forward-inside", "bare-unknown-type",
+        "count-beyond-content", "count-short-of-content"])
+def test_malformed_length_prefixed_fill_value_is_a_protocol_violation(
+        raw, match):
+    for draft in (20, 22):
+        with pytest.raises(MOQTProtocolViolation, match=match):
+            _unparams(bytes.fromhex(raw), draft)
+
+
 @pytest.mark.parametrize("raw, match", [
     ("012305" "01210101", "unknown message parameter|exceeds remaining"),
     ("012305" "0121010100", "does not fill its length"),
     ("012303" "011001", "not allowed in FillParameters"),
-    ("0123" "02" "0a05", "exhausted"),
+    ("0123" "03" "0a05", "exhausted"),
     ("0123" "ffff", "out of bounds"),
 ], ids=["past-message", "short-of-length", "forward-inside",
         "count-beyond-bytes", "junk"])
