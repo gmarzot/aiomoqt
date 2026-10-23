@@ -1819,3 +1819,76 @@ def test_aiopquic_object_codec_keeps_the_last_duplicate(draft):
     exts = fused(True, 16 * 1024, True)[1]
     assert exts == {OBJECT_TIMESTAMP: 4}
     assert not getattr(exts, 'duplicates', None)
+
+
+# -- an object declaring more payload than the receiver accepts -------
+#
+# A Payload Length is the receiver's commitment to buffer that much.
+# Over the session's limit it is refused at the length, before any of
+# the payload arrives, by both subgroup codecs and every FETCH shape.
+
+from aiomoqt.messages.data import ObjectHeader, MOQTObjectTooLarge  # noqa: E402
+
+_LIMIT = 1024
+
+
+def _subgroup_object(draft, declared, present):
+    v = lambda x: _ref_vint(draft, x)                     # noqa: E731
+    return v(0) + v(0) + v(declared) + b"p" * present     # delta, no props
+
+
+def _parse_subgroup(draft, raw, fused):
+    vi64 = profile_for(draft).vi64
+    if fused:
+        buf = StreamChain()
+        buf.extend(raw)
+    else:
+        buf = Buffer(data=raw, vi64=vi64)
+    obj = ObjectHeader(object_id=0)
+    obj.deserialize_into(buf, len(raw), extensions_present=True, vi64=vi64,
+                         kvp_delta=draft >= 16, max_payload=_LIMIT)
+    return obj
+
+
+@pytest.mark.parametrize("fused", [True, False], ids=["cython", "python"])
+@pytest.mark.parametrize("draft", [14, 16, 18, 20, 22])
+@pytest.mark.parametrize("declared", [_LIMIT + 1, 1 << 40])
+def test_subgroup_object_over_the_limit_is_refused_at_its_length(
+        draft, fused, declared):
+    raw = _subgroup_object(draft, declared, 8)
+    with pytest.raises(MOQTObjectTooLarge) as e:
+        _parse_subgroup(draft, raw, fused)
+    assert (e.value.length, e.value.limit) == (declared, _LIMIT)
+
+
+@pytest.mark.parametrize("fused", [True, False], ids=["cython", "python"])
+@pytest.mark.parametrize("draft", [14, 18])
+def test_subgroup_object_at_the_limit_is_accepted(draft, fused):
+    obj = _parse_subgroup(draft, _subgroup_object(draft, _LIMIT, _LIMIT),
+                          fused)
+    assert len(obj.payload) == _LIMIT
+
+
+@pytest.mark.parametrize("fused", [True, False], ids=["cython", "python"])
+def test_a_complete_object_over_the_limit_is_refused(fused):
+    with pytest.raises(MOQTObjectTooLarge):
+        _parse_subgroup(18, _subgroup_object(18, _LIMIT + 1, _LIMIT + 1),
+                        fused)
+
+
+@pytest.mark.parametrize("draft", [14, 16, 18, 22])
+def test_fetch_object_over_the_limit_is_refused_at_its_length(draft):
+    prof = profile_for(draft)
+    obj = FetchObject(group_id=1, subgroup_id=0, object_id=0,
+                      publisher_priority=128, payload=b"f" * (_LIMIT + 1))
+    raw = bytes(obj.serialize(prof=prof).data)
+    for present in (raw[:-_LIMIT], raw):                # partial and whole
+        with pytest.raises(MOQTObjectTooLarge):
+            FetchObject.deserialize(Buffer(data=present, vi64=prof.vi64),
+                                    prof=prof, max_payload=_LIMIT)
+    ok = FetchObject(group_id=1, subgroup_id=0, object_id=0,
+                     publisher_priority=128, payload=b"f" * _LIMIT)
+    got = FetchObject.deserialize(
+        Buffer(data=bytes(ok.serialize(prof=prof).data), vi64=prof.vi64),
+        prof=prof, max_payload=_LIMIT)
+    assert len(got.payload) == _LIMIT
