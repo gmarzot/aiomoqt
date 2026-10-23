@@ -3685,7 +3685,7 @@ async def main():
         file=sys.stderr,
     )
     for _server, port, label in listeners:
-        print(f"Listening on {args.bind}:{port} "
+        print(f"Listening on all interfaces, UDP port {port} "
               f"({label}, draft-{args.draft})", file=sys.stderr)
     if args.watchdog > 0:
         print(f"Watchdog: self-probe every {args.watchdog:g}s, exit after "

@@ -2,6 +2,7 @@
 
 ## v0.13.2
 
+- Relay: the listening line reports all interfaces, which is what aiopquic binds whatever `--bind` says.
 - README: the subscribe and handler examples match the API. server_example: `-Q` serves raw QUIC, `-Q -W` both on one port; `--retry` is gone.
 - `await_publish()` and `await_namespace()` queue at most 1024 announcements; past that the oldest is dropped, with one WARNING per run of drops.
 - Fan-out: a lane that sheds objects at a group boundary resets the truncated subgroup instead of ending it with END_OF_GROUP and FIN.
