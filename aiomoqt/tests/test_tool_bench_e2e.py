@@ -82,3 +82,33 @@ def test_sub_bench_with_no_objects_fails(tmp_path):
         stop(relay)
     assert "No data received" in out, out
     assert rc != 0, out
+
+
+@requires_certs
+@pytest.mark.parametrize("transport", ["-Q", "-W"])
+def test_loopback_bench_verifies_its_own_cert(transport):
+    rc, out = run("loopback_bench", transport, "-p", free_udp_port(),
+                  "--draft", 18, "-t", 2, "-s", 1200, "--cert", CERT,
+                  "--key", KEY)
+    assert rc == 0, out
+    assert objects_received(out) > 0
+
+
+def test_loopback_bench_without_objects_exits_1(monkeypatch):
+    import asyncio
+    import sys
+    from aiomoqt.tools import loopback_bench
+
+    class _Server:
+        def close(self):
+            pass
+
+    async def _serve(args):
+        return _Server()
+
+    async def _nothing(args, stats):
+        pass
+    monkeypatch.setattr(loopback_bench, "run_server", _serve)
+    monkeypatch.setattr(loopback_bench, "run_subscriber", _nothing)
+    monkeypatch.setattr(sys, "argv", ["loopback_bench", "-t", "1"])
+    assert asyncio.run(loopback_bench.main()) == 1
