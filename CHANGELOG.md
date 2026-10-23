@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- moq_interop_client `fetch` and `join`: the client publishes a live track through the relay and passes only when the FETCH or joining FETCH returns its objects; a refusal now fails.
 - loopback_bench: `-k/--insecure`; it verifies the certificate when `--cert` is given without `-k`.
 - adaptive_bench: latency and jitter with no samples print n/a, not 0.0us.
 - load_sim: `--draft` takes 14-22 or a comma list, as the other tools do.
