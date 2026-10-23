@@ -3,6 +3,7 @@
 ## v0.13.2
 
 - load_sim: Ctrl-C during startup no longer hangs on unread shard commands.
+- load_sim: an interrupted run prints its verdict and exits 130.
 - loopback_bench: `--cert` without `-k` verifies against that cert, and a run with no objects exits 1.
 - load_sim: Ctrl-C during startup exits 130 without a traceback.
 - The `test` extra installs jsonschema, so CI runs the agent-spec tests.

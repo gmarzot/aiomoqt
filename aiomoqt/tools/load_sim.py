@@ -997,6 +997,8 @@ def main():
     print("─" * 72)
     for line in lines:
         print(line)
+    if stopping:
+        return 130     # interrupted: the verdict covers a partial run
     return 1 if failed else 0
 
 

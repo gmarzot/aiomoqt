@@ -185,7 +185,6 @@ def test_sigint_exits_cleanly(relay_with_publishers, tmp_path, tool, argv,
     wait_for(log, start if when == "start" else mid, proc)
     rc, out = _interrupt(proc, log)
     # Stopped before any object, a tool may report its zero-object failure.
-    zero = when == "start" and ("No data received" in out
-                                or "RESULT: FAIL" in out)
+    zero = when == "start" and "No data received" in out
     ok = CLEAN_RC + ((1,) if zero else ())
     assert rc in ok, out
