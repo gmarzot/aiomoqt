@@ -610,6 +610,21 @@ async def _feed_ts_live(tracks: dict, fh, dmx: TsDemuxer, first, args,
         await track.finish()
 
 
+def _cmaf_wrap(chunker: CmafChunker, video: bool):
+    """_feed_mp4_track wrap: a CMAF chunk whose tfdt and duration are the
+    sample's paced span in track ticks, so looping keeps tfdt on the
+    pacing clock."""
+    def ticks(us: int) -> int:
+        return (us * chunker.timescale + 500_000) // 1_000_000
+
+    def wrap(s, ts_us: int, end_us: Optional[int]) -> bytes:
+        dt = ticks(ts_us)
+        dur = s.duration if end_us is None else ticks(end_us) - dt
+        return chunker.chunk(s.payload, dur, s.key_frame if video else True,
+                             decode_time=dt)
+    return wrap
+
+
 def _with_prft(chunk: bytes, capture_us: int) -> bytes:
     """A CMAF chunk led by a prft for its first sample."""
     tfdt = chunk_decode_time(chunk)
@@ -854,7 +869,8 @@ async def _feed_mp4_track(track, source, args, stats: _TrackStats, *,
     stamped with their scheduled wall-clock capture time; --loop
     restarts the file at later timestamps. Groups open on sync samples,
     or with `group_frames` (audio) every that many samples.
-    wrap(sample) transforms the payload (CMAF chunking); a group's first
+    wrap(sample, ts_us, end_us) transforms the payload (CMAF chunking)
+    given its paced span, end_us None when unknown; a group's first
     chunk is led by a prft with --timestamp-mapping. `clock` is the
     (monotonic, wall µs) start shared with the other feeders."""
     start, wall0 = clock or (time.monotonic(), int(time.time() * 1_000_000))
@@ -863,12 +879,21 @@ async def _feed_mp4_track(track, source, args, stats: _TrackStats, *,
     n = 0
     while True:
         last = 0
-        for s in source.samples():
+        samples = source.samples()
+        s = next(samples, None)
+        while s is not None:
+            nxt = next(samples, None)
             ts = base_us + s.timestamp_us
             if ts > args.duration * 1_000_000:
                 break
             await _pace(start, ts, not args.no_pace)
-            payload = wrap(s) if wrap else s.payload
+            if wrap is None:
+                payload = s.payload
+            else:
+                # A pass's last sample runs to the next pass's start.
+                end = (base_us + nxt.timestamp_us if nxt is not None
+                       else ts + gap_us if args.loop else None)
+                payload = wrap(s, ts, end)
             if group_frames is not None:
                 key = n % group_frames == 0
                 n += 1
@@ -878,6 +903,7 @@ async def _feed_mp4_track(track, source, args, stats: _TrackStats, *,
                 payload = _with_prft(payload, wall0 + ts)
             await _send(track, stats, payload, key, timestamp=wall0 + ts)
             last = ts
+            s = nxt
         base_us = last + gap_us
         if not args.loop or base_us > args.duration * 1_000_000:
             break
@@ -1088,9 +1114,8 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
                     audio_track, mp4_audio, args, stats['audio'],
                     group_frames=a_per,
                     gap_us=_sample_us(mp4_audio),
-                    wrap=(lambda s, ck=a_ck:
-                          ck.chunk(s.payload, s.duration)) if a_ck
-                    else None, clock=clock))
+                    wrap=_cmaf_wrap(a_ck, video=False) if a_ck else None,
+                    clock=clock))
             else:
                 feeders.append(_feed_tone(audio_track, args,
                                           stats['audio'], clock=clock,
@@ -1118,9 +1143,8 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
                     _frindell_for(video, wall0))),
                 video, args, stats['video'],
                 gap_us=int(1e6 / (video.fps or 30)),
-                wrap=(lambda s, ck=v_ck:
-                      ck.chunk(s.payload, s.duration, s.key_frame))
-                if v_ck else None, clock=clock))
+                wrap=_cmaf_wrap(v_ck, video=True) if v_ck else None,
+                clock=clock))
         await pub.start(announce_namespace=(args.pub_ns or args.pub_both),
                         publish_track=(not args.pub_ns or args.pub_both),
                         forward=args.forward)
