@@ -125,3 +125,63 @@ def test_interop_client_sigint(tmp_path):
         assert rc in CLEAN_RC, out
     finally:
         stop(relay)
+
+
+@pytest.fixture(scope="module")
+def relay_with_publishers(tmp_path_factory):
+    """The relay (both transports on one port) with a bench track
+    aiomoqt/t and a media broadcast demo/live."""
+    d = tmp_path_factory.mktemp("relay")
+    port = free_udp_port()
+    url = f"moqt://127.0.0.1:{port}"
+    procs = [spawn("moq_interop_relay", "--bind", "127.0.0.1", "--port", port,
+                   "--dual", "--cert", CERT, "--key", KEY,
+                   log=d / "relay.log")]
+    try:
+        wait_for(d / "relay.log", "Listening on", procs[0])
+        procs.append(spawn("pub_bench", url, "-k", "-t", 300, "-T", "t",
+                           "-r", 50, "-s", 256, log=d / "pub.log"))
+        wait_for(d / "pub.log", "waiting for subscriber", procs[1])
+        procs.append(spawn("pub_media", url, "-k", "-t", 300,
+                           "-N", "demo/live", log=d / "media.log"))
+        wait_for(d / "media.log", "publishing", procs[2])
+        yield url
+    finally:
+        for p in reversed(procs):
+            stop(p)
+
+
+# tool, argv (URL substituted), start marker, mid-run marker
+LONG_RUNNING = [
+    ("pub_bench", ["{url}", "-k", "-t", 60, "-T", "p2", "-r", 50],
+     "Connecting", "waiting for subscriber"),
+    ("sub_bench", ["{url}", "-k", "-t", 60, "-T", "t", "-i", 1],
+     "Connecting", "receiving"),
+    ("loopback_bench", ["-p", "{port}", "-t", 60, "-i", 1, "-r", 100,
+                        "-s", 512], "Starting server", "0-1s"),
+    ("load_sim", ["{url}", "--subs", 2, "-t", 60, "-i", 1, "-k",
+                  "--draft", 18, "--pub-ns", "-N", "ls"], "scenario:",
+     "subs=2"),
+    ("pub_media", ["{url}", "-k", "-t", 60, "-N", "demo/other"], "relay:",
+     "publishing"),
+    ("sub_media", ["{url}", "-k", "-t", 60, "-N", "demo/live", "--analyze",
+                   "-i", 1], "relay:", "0-1s"),
+    ("moqtest_origin", ["--bind", "127.0.0.1", "--port", "{port}", "--quic",
+                        "--cert", CERT, "--key", KEY], "moqtest-origin:",
+     "moqtest-origin:"),
+]
+
+
+@requires_certs
+@pytest.mark.parametrize("when", ["start", "mid-run"])
+@pytest.mark.parametrize("tool,argv,start,mid", LONG_RUNNING,
+                         ids=[c[0] for c in LONG_RUNNING])
+def test_sigint_exits_cleanly(relay_with_publishers, tmp_path, tool, argv,
+                              start, mid, when):
+    port = free_udp_port()
+    args = [str(a).format(url=relay_with_publishers, port=port) for a in argv]
+    log = tmp_path / f"{tool}.log"
+    proc = spawn(tool, *args, log=log)
+    wait_for(log, start if when == "start" else mid, proc)
+    rc, out = _interrupt(proc, log)
+    assert rc in CLEAN_RC, out
