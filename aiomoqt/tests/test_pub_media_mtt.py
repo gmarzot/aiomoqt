@@ -468,3 +468,56 @@ async def test_aac_and_opus_fit_datagrams(tmp_path, monkeypatch, arrivals,
                               ['--mp4', clip, '--loop', '-D'])
         assert int(rows['audio']['objects']) > 40
         assert {sg for _, sg, _ in _subgroups(arrivals, 'audio')} == {None}
+
+
+# -- T5: signals -----------------------------------------------------------
+
+async def _with_relay(port, use_quic, body):
+    from aiomoqt.tests._certs import CERT, KEY
+    from aiomoqt.tools import moq_interop_relay as relay
+    relay._announced.clear()
+    relay._tracks.clear()
+    handle = await relay._build_server('localhost', port, CERT, KEY,
+                                       use_quic=use_quic, draft=18).serve()
+    try:
+        return await body(relay)
+    finally:
+        handle.close()
+        relay._announced.clear()
+        relay._tracks.clear()
+
+
+@requires_certs
+@pytest.mark.parametrize('sig,use_quic', [
+    ('SIGTERM', True), ('SIGTERM', False), ('SIGINT', True)])
+async def test_signal_ends_tracks_with_publish_done(
+        monkeypatch, arrivals, publish_dones, h264_aac, sig, use_quic):
+    import signal
+    from aiomoqt.tools import sub_media
+    port = _BASE_PORT + 60 + 2 * (sig == 'SIGINT') + (not use_quic)
+    url = f"{'moqt' if use_quic else 'https'}://localhost:{port}/"
+    pub_args = _argv(monkeypatch, 'pub_media', url, '-k', '--draft', '18',
+                     '-t', '30', '--stats', '0', '--pub-ns', '-N', 'mtt/sig',
+                     '--mp4', h264_aac, '--loop')
+    sub_args = _argv(monkeypatch, 'sub_media', url, '-k', '--draft', '18',
+                     '-N', 'mtt/sig', '--analyze', '-t', '4', '-i', '1')
+
+    async def body(relay):
+        async def _sub_then_signal():
+            while not relay._announced:
+                await asyncio.sleep(0.05)
+            sub = asyncio.ensure_future(sub_media.run(sub_args))
+            await asyncio.sleep(2.0)
+            os.kill(os.getpid(), getattr(signal, sig))
+            return await sub
+        driver = asyncio.ensure_future(_sub_then_signal())
+        t0 = time.monotonic()
+        await asyncio.wait_for(pub_media.run(pub_args), 20)
+        elapsed = time.monotonic() - t0
+        await asyncio.wait_for(driver, 10)
+        return elapsed
+    elapsed = await _with_relay(port, use_quic, body)
+    assert elapsed < 10, elapsed           # not the 30 s duration
+    assert {n for n, *_ in publish_dones} >= {'video', 'audio'}
+    assert all(status == 0x2 for _, status, _ in publish_dones)
+    assert _subgroups(arrivals, 'video') and _subgroups(arrivals, 'audio')

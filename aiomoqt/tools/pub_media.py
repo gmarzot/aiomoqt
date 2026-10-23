@@ -43,6 +43,7 @@ import contextlib
 import functools
 import logging
 import math
+import signal
 import sys
 import threading
 import time
@@ -841,6 +842,21 @@ async def _feed_mp4_track(track, source, args, stats: _TrackStats, *,
     await track.finish()
 
 
+_STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+
+
+def _on_stop_signals(loop, handler) -> list:
+    """Route SIGINT and SIGTERM to `handler`; the signals installed."""
+    installed = []
+    for sig in _STOP_SIGNALS:
+        try:
+            loop.add_signal_handler(sig, handler)
+        except (NotImplementedError, RuntimeError, ValueError):
+            continue
+        installed.append(sig)
+    return installed
+
+
 async def run(args):
     set_log_level(logging.DEBUG if args.debug else logging.WARNING)
     libquicr = apply_compat(getattr(args, 'compat', ''))
@@ -1045,6 +1061,14 @@ async def run(args):
         refresher = (asyncio.ensure_future(
             _refresh_catalog(pub, args.catalog_interval))
             if args.catalog_interval > 0 else None)
+        # SIGINT and SIGTERM end every track with PUBLISH_DONE, drain and
+        # exit 0.
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        signals = _on_stop_signals(loop, stop.set)
+        stack.callback(lambda: [loop.remove_signal_handler(sig)
+                                for sig in signals])
+        stopping = asyncio.ensure_future(stop.wait())
         feeders = [asyncio.ensure_future(f) for f in feeders]
         feed = asyncio.gather(*feeders)
         # An interrupted run cancels the feeders; collect that outcome so
@@ -1056,9 +1080,9 @@ async def run(args):
         # A relay lost mid-run is dropped and the rest continue; the
         # run fails only when no relay is left.
         while True:
-            done, _ = await asyncio.wait({feed, *closed},
+            done, _ = await asyncio.wait({feed, stopping, *closed},
                                          return_when=asyncio.FIRST_COMPLETED)
-            if feed in done:
+            if feed in done or stopping in done:
                 break
             for fut in done:
                 s = closed.pop(fut)
@@ -1076,6 +1100,7 @@ async def run(args):
                 print(f"  error: session closed: code={code} "
                       f"reason='{reason}'")
                 feed.cancel()
+                stopping.cancel()
                 raise SystemExit(1)
         if reporter is not None:
             reporter.cancel()
@@ -1083,6 +1108,15 @@ async def run(args):
             refresher.cancel()
         for fut in closed:
             fut.cancel()
+        stopping.cancel()
+        if stop.is_set():
+            feed.cancel()
+            for track in pub.tracks.values():
+                track.end()
+            await pub.catalog_track.finish()
+            await asyncio.sleep(1.0)
+            print("  done (signal)")
+            return
         error = None if feed.cancelled() else feed.exception()
         if isinstance(error, DatagramTooLarge):
             # The track sent PUBLISH_DONE; the other feeders stop here.
@@ -1098,6 +1132,8 @@ async def run(args):
 
 
 def main():
+    # Until run() takes over the signal, SIGTERM stops a run as SIGINT does.
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
     try:
         asyncio.run(run(parse_args()))
     except KeyboardInterrupt:
