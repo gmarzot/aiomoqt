@@ -357,8 +357,7 @@ class _Lane:
         self.gate = gate
         # Called as on_sent(group_id, object_id) for each object written.
         self.on_sent = on_sent
-        # Called with an error that ends the track, after which the lane
-        # stops.
+        # Called with an error that ends the track; the lane then stops.
         self.on_fatal = on_fatal
         self._truncated = False
         self.task = asyncio.ensure_future(self._drain())

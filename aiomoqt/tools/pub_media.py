@@ -76,7 +76,7 @@ from aiomoqt.utils.timing import MediaTimestamps
 from aiomoqt.utils.workers import apply_compat
 from aiomoqt.utils.url import parse_relay_url
 
-# An object did not fit a datagram (the moq-test-tracks adapter contract).
+# Exit status when an object does not fit a datagram.
 EXIT_DATAGRAM_TOO_LARGE = 64
 
 _SAMPLERATE = 48000
@@ -1131,8 +1131,7 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
         refresher = (asyncio.ensure_future(
             _refresh_catalog(pub, args.catalog_interval))
             if args.catalog_interval > 0 else None)
-        # SIGINT and SIGTERM end every track with PUBLISH_DONE, drain and
-        # exit 0.
+        # SIGINT and SIGTERM: PUBLISH_DONE on every track, drain, exit 0.
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
         signals = _on_stop_signals(loop, stop.set)
