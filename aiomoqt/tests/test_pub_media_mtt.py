@@ -352,3 +352,119 @@ def test_audio_mapping_refused_where_it_cannot_apply(monkeypatch, capsys,
     with pytest.raises(SystemExit):
         _pub_args(monkeypatch, *argv)
     assert why in capsys.readouterr().err
+
+
+# -- T4: datagram size limit ---------------------------------------------
+
+class _DgramSession:
+    _profile = None
+
+    def __init__(self, limit):
+        self.limit = limit
+        self.dgrams = []
+        self.streams = 0
+
+    def datagram_max_payload(self):
+        return self.limit
+
+    async def dgram_write_drain(self, data):
+        self.dgrams.append(data)
+
+    async def open_uni_stream(self):
+        self.streams += 1
+        return 4 * self.streams
+
+
+async def test_oversize_datagram_is_refused_not_streamed():
+    from aiomoqt.context import profile_for
+    from aiomoqt.delivery import (
+        DatagramTooLarge, FanoutDelivery, StreamMapping, SubgroupDelivery,
+    )
+    session = _DgramSession(200)
+    session._profile = profile_for(18)
+    delivery = SubgroupDelivery(session, 1, mapping=StreamMapping.DATAGRAM)
+    assert await delivery.write(0, 0, b'x' * 100, group_start=True)
+    with pytest.raises(DatagramTooLarge) as e:
+        await delivery.write(1, 0, b'x' * 200, group_start=True)
+    assert e.value.limit == 200 and e.value.size > 200
+    assert len(session.dgrams) == 1 and session.streams == 0
+    # Through a fan-out lane, the error ends the track's production.
+    out = FanoutDelivery()
+    out.add(SubgroupDelivery(session, 1, mapping=StreamMapping.DATAGRAM),
+            joining=False)
+    await out.write(2, 0, b'x' * 300, group_start=True)
+    await asyncio.sleep(0.01)
+    assert isinstance(out.error, DatagramTooLarge)
+    with pytest.raises(DatagramTooLarge):
+        await out.write(3, 0, b'x', group_start=True)
+    assert len(session.dgrams) == 1 and session.streams == 0
+    await out.close()
+
+
+@pytest.fixture
+def publish_dones(monkeypatch):
+    from aiomoqt.track import PublishedTrack
+    seen = []
+    orig = PublishedTrack._send_publish_done
+
+    def record(self, session, status_code=0x2, final=True, reason=None):
+        seen.append((self.trackname, int(status_code), reason))
+        return orig(self, session, status_code, final, reason=reason)
+    monkeypatch.setattr(PublishedTrack, '_send_publish_done', record)
+    return seen
+
+
+@requires_certs
+async def test_datagram_too_large_exits_64(tmp_path, monkeypatch, arrivals,
+                                           publish_dones, h264_aac, capsys):
+    from aiomoqt.tests._certs import CERT, KEY
+    from aiomoqt.tools import moq_interop_relay as relay
+    from aiomoqt.tools import sub_media
+    port = _BASE_PORT + 50
+    url = f'moqt://localhost:{port}/'
+    relay._announced.clear()
+    relay._tracks.clear()
+    handle = await relay._build_server('localhost', port, CERT, KEY,
+                                       use_quic=True, draft=18).serve()
+    # pcm-s16 tone: 3840 B per 20 ms frame, over any datagram limit.
+    pub_args = _argv(monkeypatch, 'pub_media', url, '-k', '--draft', '18',
+                     '-t', '6', '--stats', '0', '--pub-ns', '-N', 'mtt/dg',
+                     '--mp4', h264_aac, '--loop', '--tone', '-D')
+    sub_args = _argv(monkeypatch, 'sub_media', url, '-k', '--draft', '18',
+                     '-N', 'mtt/dg', '--analyze', '-t', '3', '-i', '1')
+
+    async def _sub():
+        for _ in range(200):
+            if relay._announced:
+                break
+            await asyncio.sleep(0.05)
+        await sub_media.run(sub_args)
+    # SystemExit must not escape a task: pub_media runs in this one.
+    sub = asyncio.create_task(_sub())
+    try:
+        with pytest.raises(SystemExit) as e:
+            await asyncio.wait_for(pub_media.run(pub_args), 10)
+        assert e.value.code == 64
+        await asyncio.wait_for(sub, 10)
+    finally:
+        if not sub.done():
+            sub.cancel()
+        handle.close()
+        relay._announced.clear()
+        relay._tracks.clear()
+    assert 'exceeds the' in capsys.readouterr().out
+    assert not _subgroups(arrivals, 'audio')
+    done = [d for d in publish_dones if d[0] == 'audio']
+    assert done and done[0][1] == 0x0 and 'datagram limit' in done[0][2]
+
+
+@requires_certs
+async def test_aac_and_opus_fit_datagrams(tmp_path, monkeypatch, arrivals,
+                                          h264_aac):
+    opus = _encode(tmp_path / 'o.mp4', 'mp4', layout='stereo')
+    for k, clip in enumerate((h264_aac, opus)):
+        arrivals.clear()
+        rows = await _analyze(monkeypatch, tmp_path, _BASE_PORT + 51 + k,
+                              ['--mp4', clip, '--loop', '-D'])
+        assert int(rows['audio']['objects']) > 40
+        assert {sg for _, sg, _ in _subgroups(arrivals, 'audio')} == {None}

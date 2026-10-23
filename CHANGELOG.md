@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Delivery: an object datagram over the session's datagram limit raises `DatagramTooLarge` and is never sent or streamed; a produce() track then ends with PUBLISH_DONE INTERNAL_ERROR, and pub_media exits 64.
 - pub_media: `--audio-frames-per-group N` (one object per frame, N per group; a CMAF fragment of N chunks) and `--audio-subgroups group|object`.
 - pub_media: `--video-subgroups object` sends each video object on its own subgroup stream (subgroup ID = object ID).
 - pub_media: the stats line counts objects produced and reports frames the track discarded (waiting for a key frame, Forward State 0) as `discarded`.

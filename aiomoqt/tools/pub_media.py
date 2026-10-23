@@ -50,6 +50,7 @@ import uuid
 from typing import Optional
 
 from aiomoqt.client import MOQTClient
+from aiomoqt.delivery import DatagramTooLarge
 from aiomoqt.fanout import FanoutPublisher
 from aiomoqt.media import (
     Catalog, CatalogTrack, InitData, LocTrackPublisher, LocmafTrackPublisher,
@@ -72,6 +73,9 @@ from aiomoqt.utils.logger import set_log_level
 from aiomoqt.utils.timing import MediaTimestamps
 from aiomoqt.utils.workers import apply_compat
 from aiomoqt.utils.url import parse_relay_url
+
+# An object did not fit a datagram (the moq-test-tracks adapter contract).
+EXIT_DATAGRAM_TOO_LARGE = 64
 
 _SAMPLERATE = 48000
 _CHANNELS = 2
@@ -1041,7 +1045,8 @@ async def run(args):
         refresher = (asyncio.ensure_future(
             _refresh_catalog(pub, args.catalog_interval))
             if args.catalog_interval > 0 else None)
-        feed = asyncio.ensure_future(asyncio.gather(*feeders))
+        feeders = [asyncio.ensure_future(f) for f in feeders]
+        feed = asyncio.gather(*feeders)
         # An interrupted run cancels the feeders; collect that outcome so
         # Ctrl-C exits quietly instead of logging an unretrieved exception.
         feed.add_done_callback(
@@ -1078,6 +1083,14 @@ async def run(args):
             refresher.cancel()
         for fut in closed:
             fut.cancel()
+        error = None if feed.cancelled() else feed.exception()
+        if isinstance(error, DatagramTooLarge):
+            # The track sent PUBLISH_DONE; the other feeders stop here.
+            for f in feeders:
+                f.cancel()
+            print(f"  error: {error}")
+            await asyncio.sleep(1.0)
+            raise SystemExit(EXIT_DATAGRAM_TOO_LARGE)
         await feed
         await pub.catalog_track.finish()
         await asyncio.sleep(1.0)  # drain tail before teardown

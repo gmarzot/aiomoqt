@@ -34,6 +34,17 @@ _STOP = object()
 LANE_QUEUE_DEFAULT = 256
 
 
+class DatagramTooLarge(ValueError):
+    """An object datagram larger than the session's datagram payload
+    limit. It is not sent, nor moved to a stream."""
+
+    def __init__(self, size: int, limit: int):
+        super().__init__(f"object datagram of {size} B exceeds the "
+                         f"{limit} B datagram limit")
+        self.size = size
+        self.limit = limit
+
+
 class StreamMapping(Enum):
     PER_GROUP = "per_group"    # loc-02 §4.2: one uni stream per group
     PER_OBJECT = "per_object"  # msf-01 §6: one uni stream per object
@@ -230,8 +241,11 @@ class SubgroupDelivery:
                     track_alias=self.track_alias, group_id=group_id,
                     object_id=object_id, publisher_priority=self.priority,
                     extensions=extensions, payload=payload)
-                await self.session.dgram_write_drain(
-                    dgram.serialize(prof=self._prof))
+                data = dgram.serialize(prof=self._prof).data
+                limit = self.session.datagram_max_payload()
+                if len(data) > limit:
+                    raise DatagramTooLarge(len(data), limit)
+                await self.session.dgram_write_drain(data)
             elif self.mapping is StreamMapping.PER_OBJECT:
                 # One stream per object ⇒ one subgroup per object (a subgroup
                 # owns exactly one stream); the object keeps its decode-order
@@ -328,7 +342,8 @@ class _Lane:
     """
 
     def __init__(self, delivery: SubgroupDelivery, queue_size: int,
-                 gate=None, on_sent=None, deadline=None, name: str = ""):
+                 gate=None, on_sent=None, deadline=None, name: str = "",
+                 on_fatal=None):
         self.delivery = delivery
         self.name = name     # the track's, for logs
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=queue_size)
@@ -342,6 +357,9 @@ class _Lane:
         self.gate = gate
         # Called as on_sent(group_id, object_id) for each object written.
         self.on_sent = on_sent
+        # Called with an error that ends the track, after which the lane
+        # stops.
+        self.on_fatal = on_fatal
         self._truncated = False
         self.task = asyncio.ensure_future(self._drain())
 
@@ -398,6 +416,12 @@ class _Lane:
                 return
             try:
                 await self._handle(item)
+            except DatagramTooLarge as e:
+                logger.error(f"Fanout: lane {self.name} alias="
+                             f"{self.delivery.track_alias}: {e}")
+                if self.on_fatal is not None:
+                    self.on_fatal(e)
+                return
             except Exception:
                 # Cancellation (MOQTStreamStopped included) still ends the
                 # lane; anything else costs this peer the open group only.
@@ -485,6 +509,8 @@ class FanoutDelivery:
         # an object to its peer: once per peer, never for one gated,
         # filtered out or shed.
         self.on_sent: Optional[Callable] = None
+        # An error that ends the track (DatagramTooLarge); write() raises it.
+        self.error: Optional[Exception] = None
         for delivery in deliveries:
             self.add(delivery, joining=False)
 
@@ -494,10 +520,14 @@ class FanoutDelivery:
         boundary, which is where a mid-stream arrival can start.
         `deadline()` gives its delivery timeout in seconds, or None."""
         lane = _Lane(delivery, self.queue_size, gate, self._sent, deadline,
-                     self.name)
+                     self.name, self._fail)
         lane.need_group = joining
         self.lanes.append(lane)
         return lane
+
+    def _fail(self, error: Exception) -> None:
+        if self.error is None:
+            self.error = error
 
     def _sent(self, group_id: int, object_id: int) -> None:
         if self.on_sent is not None:
@@ -527,6 +557,8 @@ class FanoutDelivery:
     async def write(self, group_id: int, object_id: int, payload: bytes, *,
                     extensions: Optional[Dict[int, Any]] = None,
                     group_start: bool = False) -> None:
+        if self.error is not None:
+            raise self.error
         if self.on_write is not None:
             self.on_write(group_id, object_id, payload, extensions)
         item = (group_id, object_id, payload, extensions, group_start,

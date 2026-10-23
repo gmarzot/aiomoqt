@@ -161,11 +161,14 @@ class LocTrackPublisher(PublishedTrack):
                          extensions: Optional[Dict[int, Any]] = None,
                          group_id: Optional[int] = None,
                          capture_us: Optional[int] = None) -> None:
-        """Queue one frame (awaits when the queue is full).
+        """Queue one frame (awaits when the queue is full); raises the
+        error that ended production (`error`), if one did.
 
         `group_id` sets the group a key frame opens, so tracks fed from
         one source can keep equally numbered groups time-aligned (msf
         §4.2); ignored unless above the current group."""
+        if self.error is not None:
+            raise self.error
         await self._frames.put(LocFrame(payload, key_frame, timestamp,
                                         extensions, group_id, capture_us))
 

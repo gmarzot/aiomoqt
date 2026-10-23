@@ -35,7 +35,8 @@ from .types import (
     RequestErrorCode, StreamResetCode, SubscribeDoneCode,
 )
 from .delivery import (
-    FanoutDelivery, ObjectHistory, StreamMapping, SubgroupDelivery,
+    DatagramTooLarge, FanoutDelivery, ObjectHistory, StreamMapping,
+    SubgroupDelivery,
 )
 from .messages import (
     FetchHeader, LocationFilter, MOQTMessage, ObjectDatagram, PublishOk,
@@ -611,6 +612,8 @@ class PublishedTrack(Track):
         # produce() tracks: the shared delivery and the one production run.
         self._out: Optional[FanoutDelivery] = None
         self._production: Optional[asyncio.Future] = None
+        # The error that ended production, if one did.
+        self.error: Optional[Exception] = None
         # Aggregate stats across all subgroup streams; subgroup 0 reports.
         self._iv_objects = 0
         self._iv_bytes = 0
@@ -741,19 +744,27 @@ class PublishedTrack(Track):
 
     async def _run_production(self) -> None:
         """Run produce() once, flush every peer, then send each peer that
-        was served its PUBLISH_DONE."""
+        was served its PUBLISH_DONE. A datagram over the path limit ends
+        the track: PUBLISH_DONE INTERNAL_ERROR, the error kept in
+        `error`."""
         out = self._out
+        status, reason = SubscribeDoneCode.TRACK_ENDED, None
         try:
             await self.produce(out)
         except asyncio.CancelledError:
             out.abort()
             raise
+        except DatagramTooLarge as e:
+            out.abort()
+            self.error = e
+            status, reason = SubscribeDoneCode.INTERNAL_ERROR, str(e)
         else:
             await out.close()
         finally:
             for sub in list(self._subs):
-                if sub.delivery is not None:
-                    self._send_publish_done(sub.session)
+                if sub.delivery is not None and not sub.done:
+                    self._send_publish_done(sub.session, status,
+                                            reason=reason)
 
     @property
     def track_alias(self) -> int:
@@ -1518,7 +1529,8 @@ class PublishedTrack(Track):
         sub.subscribers.clear()
 
     def _send_publish_done(self, session, status_code=0x2,
-                           final: bool = True):
+                           final: bool = True,
+                           reason: Optional[str] = None):
         """Send PUBLISH_DONE with stream count for clean shutdown.
         `final` False ends only the subscription: the track stays open
         to a later one.
@@ -1552,7 +1564,8 @@ class PublishedTrack(Track):
             request_id=req_id,
             status_code=status_code,
             stream_count=count,
-            reason="track ended" if final else "subscription ended",
+            reason=reason or ("track ended" if final
+                              else "subscription ended"),
         )
         logger.info(f"Track: PUBLISH_DONE request_id={req_id} "
                     f"streams={count}")
