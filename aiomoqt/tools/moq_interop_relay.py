@@ -3458,7 +3458,10 @@ async def main():
     asyncio.get_running_loop().add_signal_handler(signal.SIGUSR1,
                                                   _toggle_debug)
     if args.control:
-        await _serve_control(args.control)
+        try:
+            await _serve_control(args.control)
+        except OSError as e:
+            sys.exit(f"error: --control {args.control}: {e.strerror or e}")
     logger.info(f"relay: start {_versions_line()} pid {os.getpid()}")
     print("aiomoqt ERSATZ-RELAY: an API demonstrator and conformance "
           "SUT — not a production relay (no auth, no hardening).",
