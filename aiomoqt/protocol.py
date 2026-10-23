@@ -3554,7 +3554,30 @@ class _MOQTSessionMixin:
         """SETUP of the negotiated draft's class (d18, or d20 for d20+)."""
         cls = self.CONTROL_REGISTRY[self.negotiated_draft][
             MOQTMessageType.SETUP][0]
+        if self._profile.param_table >= 20 and self._max_filter_ranges:
+            options = {SetupParamType.MAX_FILTER_RANGES:
+                       self._max_filter_ranges, **options}
         return cls(options=options)
+
+    @property
+    def _max_filter_ranges(self) -> int:
+        """The MAX_FILTER_RANGES this end sends (d20+ §9.1.6); 0 omits it
+        and refuses every Range Filter."""
+        return int(getattr(getattr(self, '_session', None),
+                           'max_filter_ranges', 0) or 0)
+
+    def _filter_refusal(self, params: Dict[int, Any]) -> Optional[str]:
+        """Why Range Filters in `params`, FILL_PARAMETERS included, MUST
+        be refused with INVALID_FILTER (§3.3.2), else None."""
+        fill = params.get(D20ParamType.FILL_PARAMETERS)
+        fill = fill if isinstance(fill, dict) else {}
+        why = range_filter_error(params) or range_filter_error(fill)
+        if why is not None:
+            return why
+        limit = self._max_filter_ranges
+        if range_filter_count(params) + range_filter_count(fill) > limit:
+            return f"more than MAX_FILTER_RANGES {limit} ranges"
+        return None
 
     def _resolve_auth_token(self, msg: MOQTMessage) -> Optional[Callable]:
         """Apply a token-cache operation the peer sent (§10.2.2, §10.3.1.4),
@@ -3747,12 +3770,7 @@ class _MOQTSessionMixin:
     def _d20_refusal(self, msg: MOQTMessage) -> Tuple[Optional[int], str]:
         """(REQUEST_ERROR code, reason) for a d20+ request this session
         cannot accept, else (None, "")."""
-        params = msg.parameters or {}
-        # We send no MAX_FILTER_RANGES, so no Range may arrive (§5.1.4).
-        why = range_filter_error(params, max_ranges=0)
-        fill = params.get(D20ParamType.FILL_PARAMETERS)
-        if why is None and isinstance(fill, dict):
-            why = range_filter_error(fill, max_ranges=0)
+        why = self._filter_refusal(msg.parameters or {})
         if why is not None:
             return D20RequestErrorCode.INVALID_FILTER, why
         return None, ""
@@ -3781,14 +3799,14 @@ class _MOQTSessionMixin:
         params = msg.parameters or {}
         check_param_scope(params, f"RequestUpdate:{self._UPDATE_SCOPES[cls]}",
                           prof=self._profile)
-        if any(p in RANGE_FILTERS for p in params):
-            if cls is Publish and not ours:
-                raise MOQTProtocolViolation(
-                    "Range Filters in a REQUEST_UPDATE from the publisher")
-            why = range_filter_error(params, max_ranges=0)
-            if why is not None:
-                return self._refusal(msg, int(msg.request_id),
-                                     D20RequestErrorCode.INVALID_FILTER, why)
+        if (any(p in RANGE_FILTERS for p in params)
+                and cls is Publish and not ours):
+            raise MOQTProtocolViolation(
+                "Range Filters in a REQUEST_UPDATE from the publisher")
+        why = self._filter_refusal(params)
+        if why is not None:
+            return self._refusal(msg, int(msg.request_id),
+                                 D20RequestErrorCode.INVALID_FILTER, why)
         carried = self._subscribe_tracks_params.get(existing)
         if (carried is not None and not ours
                 and ParamType.FORWARD in params):

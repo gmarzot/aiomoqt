@@ -76,8 +76,11 @@ from aiomoqt.messages.base import MOQTMessage
 from aiomoqt.messages.data import (FETCH_FLAGS_END_TIMED_OUT, FetchObject,
                                    ObjectDatagram, ObjectDatagramStatus)
 from aiomoqt.messages.fetch import _is_joining
-from aiomoqt.messages.params import (U64_MAX, D20ParamType, LocationFilter,
-                                     LocationFilterType, fill_range,
+from aiomoqt.messages.params import (RANGE_FILTERS, U64_MAX, D20ParamType,
+                                     D20RequestErrorCode,
+                                     LocationFilter, LocationFilterType,
+                                     RangeFilter, RangeFilters, fill_range,
+                                     merge_range_filters, range_filter_count,
                                      uses_location_filter)
 from aiomoqt.messages.publish import Publish, PublishError
 from aiomoqt.messages.request import RequestError, RequestOk
@@ -305,9 +308,28 @@ def _publishers_for(ns: tuple) -> list:
     return out
 
 
+def _fetch_sources(ns: tuple, track_name) -> list:
+    """Sessions to FETCH a track from: the one feeding it, which for a
+    bare PUBLISH is the only one, then the publishers of `ns`."""
+    name = (track_name.encode() if isinstance(track_name, str)
+            else bytes(track_name))
+    track = _tracks.get((tuple(ns), name))
+    owner = _track_owner(track) if track is not None else None
+    pubs = _publishers_for(ns)
+    if not _session_live(owner) or any(p is owner for p in pubs):
+        return pubs
+    return [owner, *pubs]
+
+
 # Recent-object cache bounds, per track: whichever is hit first.
 CACHE_GROUPS = 8
 CACHE_BYTES = 32 * 1024 * 1024
+
+# MAX_FILTER_RANGES advertised at d20+ (§9.1.6).
+MAX_FILTER_RANGES = 16
+
+# Admits no object: a track the request's TRACK_PROPERTY_FILTERs exclude.
+_REJECT_ALL = RangeFilters(((D20ParamType.OBJECTID_FILTER, RangeFilter()),),)
 
 
 class _Downstream:
@@ -315,7 +337,7 @@ class _Downstream:
 
     __slots__ = ("session", "alias", "request_id", "forward", "window",
                  "joined_at", "replaying", "location_filter", "group_order",
-                 "fills")
+                 "fills", "range_params", "filters")
 
     def __init__(self, session, alias, request_id, forward=True,
                  window=_UNFILTERED):
@@ -337,6 +359,22 @@ class _Downstream:
         self.group_order = None
         # Fill fetch stream tasks; cancelling one resets its stream.
         self.fills: set = set()
+        # Range Filter parameters in effect (§3.3.2), and their compiled
+        # form for this track; None passes every object.
+        self.range_params: dict = {}
+        self.filters = None
+
+    def set_filters(self, params, track_properties) -> None:
+        self.range_params = params
+        compiled = RangeFilters.from_params(params).for_track(
+            track_properties)
+        self.filters = (_REJECT_ALL if compiled is None
+                        else compiled or None)
+
+    def admits(self, sgid, oid, prio, exts) -> bool:
+        """The object passes the Range Filters."""
+        return self.filters is None or self.filters.admits(
+            sgid, oid, prio, exts)
 
     def passes(self, group_id, object_id) -> bool:
         """Forward State 1 and inside the filter window."""
@@ -750,18 +788,27 @@ class _RelayedTrack:
                 if not _session_live(d.session):
                     self.drop_session(d.session)
                     continue
+                out = (oid, payload, exts, status, shape)
                 if oid is not None:
                     if d.past_end(gid):
                         self.end_downstream(d)
                         continue
                     if not d.passes(gid, oid):
                         continue
+                    if not d.admits(sgid, oid, prio, exts):
+                        if status not in (ObjectStatus.END_OF_GROUP,
+                                          ObjectStatus.END_OF_TRACK):
+                            continue
+                        # A filtered-out end marker still ends its stream.
+                        out = (None, None, None, "END", None)
                 try:
                     self._objects_out += 1
                     self._bytes_out += len(payload or b"")
+                    o_oid, o_payload, o_exts, o_status, o_shape = out
                     await self._forward_one(
-                        d.session, d.alias, gid, sgid, oid, payload, exts,
-                        prio, status, shape, encoded, start=d.start)
+                        d.session, d.alias, gid, sgid, o_oid, o_payload,
+                        o_exts, prio, o_status, o_shape, encoded,
+                        start=d.start)
                 except (Exception, asyncio.CancelledError):
                     if _cancelling():
                         raise
@@ -799,7 +846,8 @@ class _RelayedTrack:
         d.replaying = False
         if d not in self.downstream:
             return
-        objs = sorted((c for c in self._cache if d.passes(c[0], c[2])),
+        objs = sorted((c for c in self._cache if d.passes(c[0], c[2])
+                       and d.admits(c[1], c[2], c[5], c[4])),
                       key=lambda c: (c[0], c[1], c[2]))
         try:
             for gid, sgid, oid, payload, exts, prio, status, shape in objs:
@@ -843,7 +891,8 @@ class _RelayedTrack:
 
     def cached_range(self, start, end):
         """Cached objects within [start, end], each (group, object)
-        inclusive; `end` None means to the live edge. Ascending."""
+        inclusive; `end` None means to the live edge. In Location order,
+        across subgroups (§3.2.1)."""
         out = []
         for gid, sgid, oid, payload, exts, prio, status, _ in self._cache:
             if (gid, oid) < start:
@@ -851,6 +900,7 @@ class _RelayedTrack:
             if end is not None and (gid, oid) > end:
                 continue
             out.append((gid, sgid, oid, payload, exts, prio, status))
+        out.sort(key=lambda o: (o[0], o[2]))
         return out
 
     def _short(self, gid, start) -> bool:
@@ -1067,6 +1117,8 @@ def _forget_session(session) -> None:
     """Drop everything a closing session owned: its announcements and
     its downstream subscriptions."""
     _track_subs[:] = [e for e in _track_subs if e[0] is not session]
+    for k in [k for k in _track_sub_filters if k[0] == id(session)]:
+        del _track_sub_filters[k]
     _ns_subs[:] = [e for e in _ns_subs if e[0] is not session]
     _announce_subs[:] = [e for e in _announce_subs if e[0] is not session]
     _no_datagrams.pop(id(session), None)
@@ -1306,7 +1358,8 @@ async def _backfill(track, msg) -> None:
         return
     start = max(window[0], (cf[0], 0))
     ns, name = track.key
-    if start >= cf or track.cache_covers(start) or not _publishers_for(ns):
+    if (start >= cf or track.cache_covers(start)
+            or not _fetch_sources(ns, name)):
         return
     rng = SimpleNamespace(group_order=GroupOrder.ASCENDING,
                           start_group=start[0], start_object=start[1],
@@ -1632,11 +1685,12 @@ async def _on_publish(session, msg):
     logger.info(f"relay: publish ns={ns} track={msg.track_name} "
                 f"alias={msg.track_alias}")
     offered = False
-    for sub_session, prefix, _rid in list(_track_subs):
-        if _prefix_covers(prefix, ns):
+    for sub_session, prefix, rid in list(_track_subs):
+        if (_prefix_covers(prefix, ns)
+                and _track_sub_admits(sub_session, rid, track)):
             offered = True
             asyncio.create_task(
-                _offer_track(sub_session, track, key))
+                _offer_track(sub_session, track, key, rid))
     if crossing:
         _answer_publish(track, forward=any(entry.forwards))
         entry.resolve((track, None))
@@ -1799,6 +1853,8 @@ def _attach_subscriber(session, msg, track) -> bool:
                              forward=forward, window=window, replay=replay)
     d.location_filter = getattr(msg, "location_filter", None)
     d.group_order = getattr(msg, "group_order", None)
+    d.set_filters(merge_range_filters({}, msg.parameters or {}),
+                  track.properties)
     session.register_request_cancel_handler(
         msg.request_id, lambda rid, t=track, s=session: t.drop_session(s))
     _start_fill(track, d, msg)
@@ -1817,13 +1873,20 @@ def _start_fill(track, d, msg) -> None:
         return
     sid = id(d.session)
     track._sent_streams[sid] = track._sent_streams.get(sid, 0) + 1
+    # FILL_PARAMETERS overrides the subscription's filters by type (§3.4).
+    filters = RangeFilters.from_params(
+        merge_range_filters(d.range_params, fill)).for_track(
+            track.properties)
+    if filters is None:
+        filters = _REJECT_ALL
     task = asyncio.create_task(_serve_fill(track, d, msg.request_id, fill,
-                                           rng))
+                                           rng, filters))
     d.fills.add(task)
     task.add_done_callback(d.fills.discard)
 
 
-async def _serve_fill(track, d, request_id, fill, rng) -> None:
+async def _serve_fill(track, d, request_id, fill, rng,
+                      filters=None) -> None:
     """A fill fetch stream from the cache, else from an upstream FETCH.
     Under FILL_TIMEOUT what neither holds is a Timed-Out gap (§9.20.5);
     without it the fill fails, which is a reset (§3.4.1)."""
@@ -1837,7 +1900,7 @@ async def _serve_fill(track, d, request_id, fill, rng) -> None:
     try:
         if track.cache_covers(start):
             objs = track.cached_range(start, end)
-        elif timeout_ms != 0 and _publishers_for(ns):
+        elif timeout_ms != 0 and _fetch_sources(ns, name):
             wait = FILL_UPSTREAM_S if timeout_ms is None else min(
                 timeout_ms / 1000, FILL_UPSTREAM_S)
             rng_msg = SimpleNamespace(
@@ -1862,6 +1925,7 @@ async def _serve_fill(track, d, request_id, fill, rng) -> None:
                         f"{start}..{end} unavailable, reset")
             await _fail_fill(session, request_id)
             return
+        objs = _filtered(objs, filters)
         if order == int(GroupOrder.DESCENDING):
             objs = sorted(objs, key=lambda o: (-o[0], o[2]))
         served = _counted_fetch(objs, track, source)
@@ -1878,6 +1942,14 @@ async def _serve_fill(track, d, request_id, fill, rng) -> None:
                      exc_info=True)
         if not serving:
             await _fail_fill(session, request_id)
+
+
+def _filtered(objs, filters):
+    """Fetch tuples (group, subgroup, object, payload, properties,
+    priority, status) that pass `filters`."""
+    if not filters:
+        return objs
+    return [o for o in objs if filters.admits(o[1], o[2], o[5], o[4])]
 
 
 async def _fail_fill(session, request_id) -> None:
@@ -1903,11 +1975,14 @@ async def _on_request_update(session, msg):
     found = _joined_subscription(session, rid)
     if found is None:
         if d16:
+            _update_track_sub_filters(session, rid, msg.parameters or {})
             await session._handle_request_update(msg)
         else:
             await session._handle_subscribe_update(msg)
         return
     key, track, d = found
+    if d16 and not _update_filters(session, msg, track, d):
+        return
     if d16:
         forward = (msg.parameters or {}).get(ParamType.FORWARD)
         window = _reply_window(session, msg, track.largest)
@@ -1932,6 +2007,34 @@ async def _on_request_update(session, msg):
                                       parameters=params))
         _start_fill(track, d, msg)
     _resume_parked_publish(track)
+
+
+def _update_filters(session, msg, track, d) -> bool:
+    """Apply a REQUEST_UPDATE's Range Filters to `d` (§3.3.2). Past
+    MAX_FILTER_RANGES it fails: INVALID_FILTER, then PUBLISH_DONE
+    UPDATE_FAILED (§9.5.1). False when it failed."""
+    params = msg.parameters or {}
+    if not any(p in RANGE_FILTERS for p in params):
+        return True
+    merged = merge_range_filters(d.range_params, params)
+    fill = params.get(D20ParamType.FILL_PARAMETERS)
+    count = range_filter_count(merged) + (
+        range_filter_count(merge_range_filters(merged, fill))
+        if isinstance(fill, dict) else 0)
+    if count > session._max_filter_ranges:
+        why = f"more than MAX_FILTER_RANGES {session._max_filter_ranges}"
+        logger.info(f"relay: update {track.key} request "
+                    f"{msg.existing_request_id} -> INVALID_FILTER ({why})")
+        session._send_on_request_stream(msg.request_id, RequestError(
+            request_id=msg.request_id,
+            error_code=int(D20RequestErrorCode.INVALID_FILTER),
+            retry_interval=0, reason=why))
+        if d in track.downstream:
+            track.downstream.remove(d)
+        track._end(d, SubscribeDoneCode.UPDATE_FAILED, None, why)
+        return False
+    d.set_filters(merged, track.properties)
+    return True
 
 
 async def _on_subscribe(session, msg):
@@ -2144,6 +2247,10 @@ def parse_args():
 
 # SUBSCRIBE_TRACKS subscribers: (session, prefix_tuple, request_id).
 _track_subs: list = []
+# (id(session), request_id) -> a SUBSCRIBE_TRACKS's Range Filter
+# parameters: TRACK_PROPERTY_FILTER selects the tracks offered, the rest
+# filter their objects (§3.6.1).
+_track_sub_filters: dict = {}
 # (session, prefix, request_id) for SUBSCRIBE_NAMESPACE subscribers sent
 # NAMESPACE / NAMESPACE_DONE: d18 on, and d16 when Subscribe Options ask.
 _ns_subs: list = []
@@ -2160,10 +2267,27 @@ def _prefix_covers(prefix, ns) -> bool:
     return ns[:len(prefix)] == prefix
 
 
-async def _offer_track(session, track, key):
+def _track_sub_admits(session, request_id, track) -> bool:
+    """The track passes the SUBSCRIBE_TRACKS's TRACK_PROPERTY_FILTERs."""
+    params = _track_sub_filters.get((id(session), request_id))
+    return not params or RangeFilters.from_params(params).for_track(
+        track.properties) is not None
+
+
+def _update_track_sub_filters(session, request_id, params) -> None:
+    """A REQUEST_UPDATE to a SUBSCRIBE_TRACKS: its filters apply to the
+    tracks offered from now on."""
+    key = (id(session), request_id)
+    if key in _track_sub_filters and any(p in RANGE_FILTERS for p in params):
+        _track_sub_filters[key] = merge_range_filters(
+            _track_sub_filters[key], params)
+
+
+async def _offer_track(session, track, key, request_id=None):
     """§9.5: send a PUBLISH for a held/served track to a
     SUBSCRIBE_TRACKS subscriber; on PUBLISH_OK wire it into the fan-out
-    with the Forward State and filter it chose."""
+    with the Forward State and filter it chose, under the Range Filters
+    of SUBSCRIBE_TRACKS `request_id`."""
     if not _session_live(session):
         _forget_session(session)
         return
@@ -2190,9 +2314,11 @@ async def _offer_track(session, track, key):
             ParamType.FORWARD, 1)
     window = _reply_window(session, reply, track.largest) or _UNFILTERED
     # Cached objects inside the subscriber's window go first.
-    track.add_downstream(session, pub_msg.track_alias, pub_msg.request_id,
-                         forward=bool(forward), window=window,
-                         replay=track.largest is not None)
+    d = track.add_downstream(session, pub_msg.track_alias,
+                             pub_msg.request_id, forward=bool(forward),
+                             window=window, replay=track.largest is not None)
+    d.set_filters(_track_sub_filters.get((id(session), request_id), {}),
+                  track.properties)
     session.register_request_cancel_handler(
         pub_msg.request_id,
         lambda rid, t=track, s=session: t.drop_session(s))
@@ -2260,7 +2386,7 @@ def _counted_fetch(objs, track, source):
 
 
 async def _fetch_upstream(ns, track_name, msg, timeout=10.0):
-    """Ask each publisher of `ns` for the requested range. Returns its
+    """Ask each source of the track for the requested range. Returns its
     FETCH_OK, the objects and None, or (None, None, the last upstream
     refusal or None) when nobody serves it —
     the relay keeps only recent objects, so a historical range has to
@@ -2268,7 +2394,7 @@ async def _fetch_upstream(ns, track_name, msg, timeout=10.0):
     name = (track_name.decode() if isinstance(track_name, bytes)
             else track_name)
     refusal = None
-    for pub in _publishers_for(ns):
+    for pub in _fetch_sources(ns, track_name):
         _install_fetch_sink(pub)
         req = pub.fetch(
             namespace=ns,
@@ -2433,6 +2559,8 @@ async def _on_fetch(session, msg):
                      largest_group_id=end_loc[0],
                      largest_object_id=end_loc[1] + 1,
                      group_order=int(order), track_extensions=props)
+    # Range Filters drop objects, never the FETCH_OK End (§3.2.2).
+    objs = _filtered(objs, RangeFilters.from_params(msg.parameters))
     if int(order) == int(GroupOrder.DESCENDING):
         objs = sorted(objs, key=lambda o: (-o[0], o[2]))
     await session.serve_fetch(
@@ -2573,14 +2701,23 @@ async def _on_subscribe_tracks(session, msg):
     def _drop(rid, s=session, r=msg.request_id):
         _track_subs[:] = [e for e in _track_subs
                           if not (e[0] is s and e[2] == r)]
+        _track_sub_filters.pop((id(s), r), None)
     _track_subs.append((session, prefix, msg.request_id))
+    filters = merge_range_filters({}, msg.parameters or {})
+    if filters:
+        _track_sub_filters[(id(session), msg.request_id)] = filters
     session.register_request_cancel_handler(msg.request_id, _drop)
     logger.info(f"relay: subscribe-tracks prefix={prefix} "
                 f"(subs={len(_track_subs)})")
     for key, track in list(_tracks.items()):
         if _prefix_covers(prefix, key[0]) and (
                 track.pending_publish or track.upstream):
-            asyncio.create_task(_offer_track(session, track, key))
+            if not _track_sub_admits(session, msg.request_id, track):
+                logger.info(f"relay: {key} filtered out of subscribe-tracks "
+                            f"request {msg.request_id}")
+                continue
+            asyncio.create_task(
+                _offer_track(session, track, key, msg.request_id))
 
 
 async def _on_track_status(session, msg):
@@ -2647,6 +2784,7 @@ def _build_server(bind, port, cert, key, use_quic, draft, **transport):
         use_quic=use_quic,
         supported_drafts=draft,
         quiet_peers=(WATCHDOG_IMPL,),
+        max_filter_ranges=MAX_FILTER_RANGES,
         **transport,
     )
     server.register_handler(

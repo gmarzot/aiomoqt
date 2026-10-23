@@ -18,6 +18,19 @@
 - pub_server: `-Q -W` serves raw QUIC and WebTransport on one port; the subscriber hint uses `-N` and lists a URL per transport.
 - CLI: a short flag means one thing on every tool. adaptive_bench `-p` is now `--loopback-port` and `-l` is `--latency-threshold`; relay_probe `-f` is `--relays-file`.
 - Tools and examples: `-h`, `-?` and `--help` all print help; relay_probe, moq_interop_client, moq_interop_relay and moqtest_origin gain `-?`.
+- pub_media: H.265 video from `--mp4` (hvc1/hev1; loc, cmaf, locmaf) and `--ts` (stream type 0x24, parameter sets in band, catalog codec `hev1`).
+- pub_media: `--stats-json` writes `@mtt <json>` events to stdout (ready, stats, endpoint_lost, done) and human output to stderr.
+- pub_media: SIGTERM and SIGINT end every track with PUBLISH_DONE, drain 1 s and exit 0.
+- Delivery: an object datagram over the session's datagram limit raises `DatagramTooLarge` and is never sent or streamed; a produce() track then ends with PUBLISH_DONE INTERNAL_ERROR, and pub_media exits 64.
+- pub_media: `--audio-frames-per-group N` (one object per frame, N per group; a CMAF fragment of N chunks) and `--audio-subgroups group|object`.
+- pub_media: `--video-subgroups object` sends each video object on its own subgroup stream (subgroup ID = object ID).
+- pub_media: the stats line counts objects produced and reports frames the track discarded (waiting for a key frame, Forward State 0) as `discarded`.
+- pub_media: Opus audio from `--ts` and `--mp4` (loc, cmaf, locmaf), one object per Opus packet; catalog codec `opus`.
+- Relay: SUBSCRIBE_TRACKS with TRACK_PROPERTY_FILTER is offered only the tracks whose Track Properties pass it; its other Range Filters filter each resulting subscription.
+- Relay: d20/d22 SETUP advertises MAX_FILTER_RANGES 16 and applies SUBGROUP, OBJECTID, PRIORITY and OBJECT_PROPERTY Range Filters per subscriber on live objects, cache replay, fill streams and FETCH; REQUEST_UPDATE replaces or removes them; `MOQTServer(max_filter_ranges=)`.
+- Relay: FETCH and fill streams served from the cache send each group's objects in Object ID order across subgroups.
+- Relay: a FETCH, joining FETCH or fill the cache cannot serve goes to the session that PUBLISHed the track, not only to namespace publishers.
+- Fan-out: each object is encoded once per header state and the bytes shared by every peer in that state (datagrams: per alias and draft codec).
 - SubscribedTrack: a timing-malformed object that arrives before SUBSCRIBE_OK is processed cancels its own track, not alias 0.
 - Relay: status files are encoded with json's C encoder.
 - Relay: status bit rates are integers and milliseconds carry two decimals.

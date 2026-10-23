@@ -49,6 +49,18 @@ def _snapshot():
     return status.snapshot(asyncio.get_running_loop().time(), time.time())
 
 
+def test_cached_range_is_in_object_order_across_subgroups():
+    # §3.2.1: within a group, fetched objects go in Object ID order;
+    # subgroup streams arrive one after another.
+    t = relay._RelayedTrack(((b"live",), b"cam"))
+    for gid in (0, 1):
+        for sgid, oids in ((0, (0, 2)), (1, (1, 3))):
+            for oid in oids:
+                t._remember(gid, sgid, oid, b"x", None, 128, None)
+    assert [(o[0], o[2]) for o in t.cached_range((0, 1), (1, 2))] == [
+        (0, 1), (0, 2), (0, 3), (1, 0), (1, 1), (1, 2)]
+
+
 def test_a_cancelled_fetch_counts_only_what_it_served(relay_tables):
     # The object being written when the FETCH is cancelled is not counted.
     t = relay._RelayedTrack(((b"live",), b"cam"))
