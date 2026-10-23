@@ -10,7 +10,7 @@ Usage:
   python -m aiomoqt.tools.pub_server -s 16384 -g 10000 -P 4 -r 0
 
   # Shell 2: connect subscriber
-  python -m aiomoqt.tools.sub_bench https://localhost:4434/moq -t 30 -i 5
+  python -m aiomoqt.tools.sub_bench https://localhost:4434/ -k -t 30 -i 5
 """
 import argparse
 import asyncio
@@ -89,7 +89,8 @@ def parse_args():
         '-Q', '--quic', action='store_true', help='Serve raw QUIC')
     parser.add_argument(
         '-W', '--wt', action='store_true',
-        help='Serve H3/WebTransport (default if neither given)')
+        help='Serve H3/WebTransport (default if neither given). With -Q, '
+             'serves both on one port.')
     parser.add_argument(
         '--draft', type=parse_draft_spec, default=None,
         help='MoQT draft(s) to accept: one draft, or a comma list such '
@@ -278,9 +279,11 @@ async def main():
     server.register_handler(
         D18MessageType.SUBSCRIBE_TRACKS,
         partial(_on_subscribe_tracks, args=args))
-    quic_server = await server.serve()
+    dual = args.quic and args.wt
+    quic_server = await (server.serve_dual() if dual else server.serve())
 
-    transport = "raw QUIC" if args.quic else "H3/WebTransport"
+    transport = ("raw QUIC + H3/WebTransport" if dual
+                 else "raw QUIC" if args.quic else "H3/WebTransport")
     rate_s = f"{args.rate}/s" if args.rate > 0 else "max"
     print(f"MoQT publisher server ready on {args.host}:{args.port}")
     print(f"  transport: {transport}")
@@ -289,18 +292,17 @@ async def main():
     print(f"  groups:    {args.group_size} objects/group")
     print(f"  rate:      {rate_s}")
     print("\nConnect subscriber (track-name discovery; -t on the sub):")
-    # URL carries the path: raw QUIC has none; WT serves at "/" (the
-    # MOQTServer(path="/") above) — not "/moq". sub_bench needs -k for
-    # the self-signed loopback cert. With discovery, --trackname is
-    # optional; -n must match this server's namespace.
+    # WT serves at "/" (path="/" above). -k: self-signed loopback cert.
+    urls = []
     if args.quic:
-        url = f"moqt://{args.host}:{args.port}"
-    else:
-        url = f"https://{args.host}:{args.port}/"
+        urls.append(f"moqt://{args.host}:{args.port}")
+    if args.wt:
+        urls.append(f"https://{args.host}:{args.port}/")
     draft = ("" if args.draft is None else " --draft " + ",".join(
         map(str, args.draft if isinstance(args.draft, list) else [args.draft])))
-    print(f"  python -m aiomoqt.tools.sub_bench {url} "
-          f"-n {args.namespace} -t 30 -i 5{draft} -k")
+    for url in urls:
+        print(f"  python -m aiomoqt.tools.sub_bench {url} "
+              f"-N {args.namespace} -t 30 -i 5{draft} -k")
 
     try:
         await asyncio.Event().wait()

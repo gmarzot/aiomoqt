@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- pub_server: `-Q -W` serves raw QUIC and WebTransport on one port; the subscriber hint uses `-N` and lists a URL per transport.
 - CLI: a short flag means one thing on every tool. adaptive_bench `-p` is now `--loopback-port` and `-l` is `--latency-threshold`; relay_probe `-f` is `--relays-file`.
 - Tools and examples: `-h`, `-?` and `--help` all print help; relay_probe, moq_interop_client, moq_interop_relay and moqtest_origin gain `-?`.
 - SubscribedTrack: a timing-malformed object that arrives before SUBSCRIBE_OK is processed cancels its own track, not alias 0.
