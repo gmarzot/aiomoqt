@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- sub_bench exits 1 when it cannot connect or receives no objects, and `-t` bounds connecting; pub_bench exits 1 with a one-line error on a dead port, also within `-t`.
 - adaptive_bench: Ctrl-C in its first half second exits cleanly instead of raising UnboundLocalError.
 - pub_server: `-Q -W` serves raw QUIC and WebTransport on one port; the subscriber hint uses `-N` and lists a URL per transport.
 - CLI: a short flag means one thing on every tool. adaptive_bench `-p` is now `--loopback-port` and `-l` is `--latency-threshold`; relay_probe `-f` is `--relays-file`.

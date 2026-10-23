@@ -1,8 +1,10 @@
 """pub_server and sub_bench as processes: each listener mode, both
 transports, d18 and d22."""
+import time
+
 import pytest
 
-from aiomoqt.tests._certs import requires_certs
+from aiomoqt.tests._certs import CERT, KEY, requires_certs
 from aiomoqt.tests._procs import (free_udp_port, objects_received, run, spawn,
                                   stop, wait_for)
 
@@ -42,3 +44,41 @@ def test_sub_bench_receives_from_pub_server(pub_server, listen, dial, draft):
                   "--draft", draft)
     assert objects_received(out) > 0, out
     assert rc == 0, out
+
+
+@requires_certs
+@pytest.mark.parametrize("dial", ["quic", "wt"])
+def test_sub_bench_fails_on_a_dead_port_within_its_duration(dial):
+    t0 = time.monotonic()
+    rc, out = run("sub_bench", _url(dial, free_udp_port()), "-k", "-t", 2,
+                  timeout=30)
+    assert rc != 0, out
+    assert "Connection failed" in out, out
+    assert "Traceback" not in out, out
+    assert time.monotonic() - t0 < 12, out
+
+
+@requires_certs
+@pytest.mark.parametrize("dial", ["quic", "wt"])
+def test_pub_bench_fails_cleanly_on_a_dead_port(dial):
+    rc, out = run("pub_bench", _url(dial, free_udp_port()), "-k", "-t", 2,
+                  timeout=60)
+    assert rc != 0, out
+    assert "Connection failed" in out, out
+    assert "Traceback" not in out, out
+
+
+@requires_certs
+def test_sub_bench_with_no_objects_fails(tmp_path):
+    port = free_udp_port()
+    log = tmp_path / "relay.log"
+    relay = spawn("moq_interop_relay", "--bind", "127.0.0.1", "--port", port,
+                  "--quic", "--cert", CERT, "--key", KEY, log=log)
+    try:
+        wait_for(log, "Listening on", relay)
+        rc, out = run("sub_bench", f"moqt://127.0.0.1:{port}", "-k",
+                      "-T", "nobody", "-t", 2, timeout=30)
+    finally:
+        stop(relay)
+    assert "No data received" in out, out
+    assert rc != 0, out

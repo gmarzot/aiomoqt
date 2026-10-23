@@ -12,8 +12,10 @@ Usage:
   moq-sub-bench relay.example.com -t 60 -i 10
 """
 import asyncio
+import contextlib
 import logging
 import os
+import sys
 import time
 import tracemalloc
 
@@ -186,29 +188,38 @@ async def run(args):
         keep_alive_interval=args.keepalive,
     )
 
+    failed = True
     try:
         print("  Connecting...")
-        async with client.connect() as session:
+        async with contextlib.AsyncExitStack() as stack:
+            # -t bounds connecting as well as receiving.
             try:
-                await session.client_session_init()
-
-                track = SubscribedTrack(
-                    session,
-                    namespace=args.namespace,
-                    trackname=args.trackname,
-                    on_object=stats.on_object,
-                    auth_token=(args.auth_token.encode()
-                                if args.auth_token else None),
-                    timestamp_errors=args.timestamp_errors,
-                )
-                stats.stats.timing = track.timing
-                await track.subscribe()
+                async with asyncio.timeout(args.duration or None):
+                    session = await stack.enter_async_context(
+                        client.connect())
+            except TimeoutError:
+                raise ConnectionError(f"no session within {args.duration}s")
+            try:
+                async with asyncio.timeout(args.duration or None):
+                    await session.client_session_init()
+                    track = SubscribedTrack(
+                        session,
+                        namespace=args.namespace,
+                        trackname=args.trackname,
+                        on_object=stats.on_object,
+                        auth_token=(args.auth_token.encode()
+                                    if args.auth_token else None),
+                        timestamp_errors=args.timestamp_errors,
+                    )
+                    stats.stats.timing = track.timing
+                    await track.subscribe()
                 print(f"  Subscribed to '{track.fqtn}', receiving...\n")
                 stats.start()
 
                 if not await wait_cond_timeout(
                         track.wait_closed(), timeout=args.duration):
                     track.completed = True
+                failed = False
 
             except MOQTRequestError as e:
                 print(f"  Request error: {e}")
@@ -217,6 +228,8 @@ async def run(args):
                 print(f"  MoQT error: {e}")
                 session.close(
                     e.error_code, e.reason_phrase)
+            except TimeoutError:
+                print(f"  Error: no subscription within {args.duration}s")
             except Exception as e:
                 print(f"  Error: {e}")
     except Exception as e:
@@ -231,18 +244,17 @@ async def run(args):
         for stat in top[:25]:
             print(f"  {stat.size / (1024 * 1024):8.1f} MB  "
                   f"{stat.count:>8d} blocks  {stat.traceback}")
+    # Zero objects is a failed run.
+    return 1 if failed or not stats.stats.total_objects else 0
 
 
 def cli():
     """Console entry point (moq-sub-bench)."""
     try:
-        asyncio.run(run(parse_args()))
+        sys.exit(asyncio.run(run(parse_args())))
     except KeyboardInterrupt:
         print("\n  Interrupted.")
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(run(parse_args()))
-    except KeyboardInterrupt:
-        print("\n  Interrupted.")
+    cli()
