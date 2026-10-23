@@ -1614,6 +1614,13 @@ class PublishedTrack(Track):
         self._withdraw_namespace(session)
         session._close_session()
 
+    def _producer_done(self, task) -> None:
+        # Retrieve the exception: a write racing the session close raises.
+        self._tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            logger.debug(f"Track: {self.fqtn} producer ended: "
+                         f"{task.exception()!r}")
+
     def _spawn_producers(self, session, track_alias: int,
                          pad: bytes) -> None:
         """Start one producer task per subgroup, or a single task for
@@ -1629,7 +1636,7 @@ class PublishedTrack(Track):
                 self._generate_datagrams(
                     session=session, track_alias=track_alias, pad=pad,
                     first_group=first_group))
-            task.add_done_callback(lambda t: self._tasks.discard(t))
+            task.add_done_callback(self._producer_done)
             self._tasks.add(task)
             return
 
@@ -1652,7 +1659,7 @@ class PublishedTrack(Track):
                     barrier=barrier,
                 )
             )
-            task.add_done_callback(lambda t: self._tasks.discard(t))
+            task.add_done_callback(self._producer_done)
             self._tasks.add(task)
 
     async def _generate_datagrams(self, session, track_alias: int,
