@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- adaptive_bench: Ctrl-C in its first half second exits cleanly instead of raising UnboundLocalError.
 - pub_server: `-Q -W` serves raw QUIC and WebTransport on one port; the subscriber hint uses `-N` and lists a URL per transport.
 - CLI: a short flag means one thing on every tool. adaptive_bench `-p` is now `--loopback-port` and `-l` is `--latency-threshold`; relay_probe `-f` is `--relays-file`.
 - Tools and examples: `-h`, `-?` and `--help` all print help; relay_probe, moq_interop_client, moq_interop_relay and moqtest_origin gain `-?`.

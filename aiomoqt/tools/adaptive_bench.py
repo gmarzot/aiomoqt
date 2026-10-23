@@ -1958,6 +1958,7 @@ async def main():
     # (publisher started, but no subscriber → rx stays 0).
     subs_pub_proc = None
     subs_pub_stop = None
+    lag_task = None
     try:
         if relay_mode or (args.mode == "bw" and args.mp_loopback):
             if args.mode == "bw" and pub_proc is not None and sub_proc is not None:
@@ -2076,7 +2077,6 @@ async def main():
         # publisher resets, the wall is single-loop tail latency
         # (harness coupling), not the pico/mvfst stacks. Prints peak +
         # mean lag each report interval.
-        lag_task = None
         if os.environ.get("AIOMOQT_LOOP_LAG") == "1":
             async def _loop_lag_probe():
                 period = 0.1
