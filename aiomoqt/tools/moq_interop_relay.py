@@ -304,6 +304,19 @@ def _publishers_for(ns: tuple) -> list:
     return out
 
 
+def _fetch_sources(ns: tuple, track_name) -> list:
+    """Sessions to FETCH a track from: the one feeding it, which for a
+    bare PUBLISH is the only one, then the publishers of `ns`."""
+    name = (track_name.encode() if isinstance(track_name, str)
+            else bytes(track_name))
+    track = _tracks.get((tuple(ns), name))
+    owner = _track_owner(track) if track is not None else None
+    pubs = _publishers_for(ns)
+    if not _session_live(owner) or any(p is owner for p in pubs):
+        return pubs
+    return [owner, *pubs]
+
+
 # Recent-object cache bounds, per track: whichever is hit first.
 CACHE_GROUPS = 8
 CACHE_BYTES = 32 * 1024 * 1024
@@ -1305,7 +1318,8 @@ async def _backfill(track, msg) -> None:
         return
     start = max(window[0], (cf[0], 0))
     ns, name = track.key
-    if start >= cf or track.cache_covers(start) or not _publishers_for(ns):
+    if (start >= cf or track.cache_covers(start)
+            or not _fetch_sources(ns, name)):
         return
     rng = SimpleNamespace(group_order=GroupOrder.ASCENDING,
                           start_group=start[0], start_object=start[1],
@@ -1836,7 +1850,7 @@ async def _serve_fill(track, d, request_id, fill, rng) -> None:
     try:
         if track.cache_covers(start):
             objs = track.cached_range(start, end)
-        elif timeout_ms != 0 and _publishers_for(ns):
+        elif timeout_ms != 0 and _fetch_sources(ns, name):
             wait = FILL_UPSTREAM_S if timeout_ms is None else min(
                 timeout_ms / 1000, FILL_UPSTREAM_S)
             rng_msg = SimpleNamespace(
@@ -2257,7 +2271,7 @@ def _counted_fetch(objs, track, source):
 
 
 async def _fetch_upstream(ns, track_name, msg, timeout=10.0):
-    """Ask each publisher of `ns` for the requested range. Returns its
+    """Ask each source of the track for the requested range. Returns its
     FETCH_OK, the objects and None, or (None, None, the last upstream
     refusal or None) when nobody serves it —
     the relay keeps only recent objects, so a historical range has to
@@ -2265,7 +2279,7 @@ async def _fetch_upstream(ns, track_name, msg, timeout=10.0):
     name = (track_name.decode() if isinstance(track_name, bytes)
             else track_name)
     refusal = None
-    for pub in _publishers_for(ns):
+    for pub in _fetch_sources(ns, track_name):
         _install_fetch_sink(pub)
         req = pub.fetch(
             namespace=ns,

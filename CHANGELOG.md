@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Relay: a FETCH, joining FETCH or fill the cache cannot serve goes to the session that PUBLISHed the track, not only to namespace publishers.
 - SubscribedTrack: a timing-malformed object that arrives before SUBSCRIBE_OK is processed cancels its own track, not alias 0.
 - Relay: status files are encoded with json's C encoder.
 - Relay: status bit rates are integers and milliseconds carry two decimals.
