@@ -290,3 +290,65 @@ def test_video_subgroups_object_refused_where_it_cannot_apply(
     with pytest.raises(SystemExit):
         _pub_args(monkeypatch, *argv)
     assert why in capsys.readouterr().err
+
+
+@requires_certs
+@pytest.mark.parametrize('packaging', ['loc', 'cmaf', 'locmaf'])
+@pytest.mark.parametrize('per_group', [1, 10, 50])
+async def test_audio_frames_per_group(tmp_path, monkeypatch, arrivals,
+                                      packaging, per_group):
+    port = (_BASE_PORT + 30 + 3 * [1, 10, 50].index(per_group)
+            + ['loc', 'cmaf', 'locmaf'].index(packaging))
+    clip = _encode(tmp_path / 'o.mp4', 'mp4', layout='stereo')
+    rows = await _analyze(
+        monkeypatch, tmp_path, port,
+        ['--mp4', clip, '--loop', '--packaging', packaging,
+         '--audio-frames-per-group', str(per_group), '--timestamp-mapping'],
+        use_quic=per_group != 10)
+    audio = rows['audio']
+    assert float(audio['gop_p50']) == per_group, audio
+    assert 40 <= float(audio['obj_rate']) <= 60, audio
+    assert audio['ts_malformed'] == '0'
+    groups = {}
+    for g, sg, o in _subgroups(arrivals, 'audio'):
+        groups.setdefault(g, []).append(o)
+        assert sg == 0
+    assert all(max(objs) < per_group for objs in groups.values())
+
+
+@requires_certs
+@pytest.mark.parametrize('source,use_quic', [('ts', True), ('tone', False)])
+async def test_audio_subgroup_per_object_in_groups_of_n(
+        tmp_path, monkeypatch, arrivals, h264_aac, source, use_quic):
+    port = _BASE_PORT + 40 + (source == 'tone')
+    if source == 'ts':
+        data = open(_encode(tmp_path / 'o.ts', 'mpegts', seconds=6),
+                    'rb').read()
+        pub = ['--ts', _paced_fifo(tmp_path, data, 6)]
+    else:
+        pub = ['--mp4', h264_aac, '--loop', '--tone']
+    rows = await _analyze(
+        monkeypatch, tmp_path, port,
+        [*pub, '--audio-frames-per-group', '10', '--audio-subgroups',
+         'object'], use_quic=use_quic)
+    assert float(rows['audio']['gop_p50']) == 10
+    audio = _subgroups(arrivals, 'audio')
+    assert all(sg == o for _, sg, o in audio)
+    assert {sg for _, sg, _ in audio} == set(range(10))
+    assert {sg for _, sg, _ in _subgroups(arrivals, 'video')} == {0}
+
+
+@pytest.mark.parametrize('argv,why', [
+    (['--audio-frames-per-group', '0'], '1-100'),
+    (['--audio-frames-per-group', '101'], '1-100'),
+    (['--mp4', 'x.mp4', '--packaging', 'locmaf', '--audio-subgroups',
+      'object'], 'does not apply to locmaf'),
+    (['-D', '--audio-subgroups', 'object'], 'exclusive'),
+    (['--input', 'x.m3u8', '--audio-frames-per-group', '5'],
+     'not apply to --input'),
+])
+def test_audio_mapping_refused_where_it_cannot_apply(monkeypatch, capsys,
+                                                     argv, why):
+    with pytest.raises(SystemExit):
+        _pub_args(monkeypatch, *argv)
+    assert why in capsys.readouterr().err

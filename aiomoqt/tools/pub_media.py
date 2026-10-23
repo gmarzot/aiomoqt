@@ -76,7 +76,8 @@ from aiomoqt.utils.url import parse_relay_url
 _SAMPLERATE = 48000
 _CHANNELS = 2
 _FRAME_MS = 20
-# LOCMAF audio from --mp4: ~1 s groups, so deltas carry most frames.
+# LOCMAF audio from --mp4 by default: ~1 s groups, so deltas carry most
+# frames.
 _LOCMAF_AUDIO_GROUP_US = 1_000_000
 
 
@@ -201,6 +202,15 @@ def parse_args():
         help='Video objects to subgroup streams: group = one subgroup '
              'stream per group (default); object = one per object, '
              'subgroup ID = object ID. Not with locmaf.')
+    map_group.add_argument(
+        '--audio-frames-per-group', type=int, default=None, metavar='N',
+        help='Audio frames per group, 1-100, one object each (default: '
+             '1; locmaf: about 1 s). cmaf and locmaf: a group is one CMAF '
+             'fragment of N one-frame chunks.')
+    map_group.add_argument(
+        '--audio-subgroups', choices=('group', 'object'), default='group',
+        help='Audio objects to subgroup streams, as --video-subgroups. '
+             'Not with locmaf or --datagram.')
     ts_group = parser.add_argument_group('timestamp writing')
     ts_group.add_argument(
         '--timestamp-mapping', action='store_true',
@@ -248,6 +258,19 @@ def parse_args():
                          'locmaf: its objects need per-group streams')
         if args.input:
             parser.error('--video-subgroups does not apply to --input')
+    n = args.audio_frames_per_group
+    if n is not None and not 1 <= n <= 100:
+        parser.error('--audio-frames-per-group must be 1-100')
+    if args.audio_subgroups == 'object':
+        if args.packaging == PACKAGING_LOCMAF:
+            parser.error('--audio-subgroups object does not apply to '
+                         'locmaf: its objects need per-group streams')
+        if args.datagram:
+            parser.error('--audio-subgroups object and --datagram are '
+                         'exclusive')
+    if args.input and (n is not None or args.audio_subgroups != 'group'):
+        parser.error('--audio-frames-per-group and --audio-subgroups do '
+                     'not apply to --input')
     return args
 
 
@@ -534,22 +557,28 @@ async def _apply_config_change(dmx: TsDemuxer, tracks: dict, pub):
 
 
 async def _feed_ts_live(tracks: dict, fh, dmx: TsDemuxer, first, args,
-                        stats: dict, pub):
+                        stats: dict, pub, audio_per_group: int = 1):
     """Dispatch demuxed access units to their tracks with PTS-derived
-    stamps."""
+    stamps; audio opens a group every `audio_per_group` frames."""
     loop = asyncio.get_running_loop()
     deadline = time.monotonic() + args.duration
     units = list(first)
     eof = False
+    n_audio = 0
     while True:
         if dmx.config_changed:
             dmx.config_changed = False
             await _apply_config_change(dmx, tracks, pub)
         for u in units:
             track = tracks.get(u.kind)
-            if track is not None:
-                await _send(track, stats[u.kind], u.payload, u.key,
-                            timestamp=dmx.to_us(u.pts))
+            if track is None:
+                continue
+            key = u.key
+            if u.kind == 'audio':
+                key = n_audio % audio_per_group == 0
+                n_audio += 1
+            await _send(track, stats[u.kind], u.payload, key,
+                        timestamp=dmx.to_us(u.pts))
         if eof or time.monotonic() >= deadline:
             break
         chunk = await loop.run_in_executor(None, fh.read1, 65536)
@@ -601,16 +630,25 @@ def _sample_us(source) -> int:
     return source._stts[0][1] * 1_000_000 // source.timescale
 
 
-def _frindell_for(source, wall0: int, group_us=None):
+def _audio_per_group(args, frame_us: float) -> int:
+    """Audio frames per group: --audio-frames-per-group, else 1, or about
+    1 s of frames for locmaf."""
+    if args.audio_frames_per_group:
+        return args.audio_frames_per_group
+    if args.packaging == PACKAGING_LOCMAF:
+        return math.ceil(_LOCMAF_AUDIO_GROUP_US / frame_us)
+    return 1
+
+
+def _frindell_for(source, wall0: int, per_group=None):
     """MediaTimestamps for an mp4 track: mapped on a fixed cadence in the
-    track's own timescale, else explicit."""
+    track's own timescale, else explicit. `per_group` overrides the
+    samples per group the sync samples give."""
     cadence = _sample_cadence(source)
     if cadence is None:
         return MediaTimestamps(wall0)
-    dur, per_group = cadence
-    if group_us is not None:
-        frame_us = dur * 1_000_000 / source.timescale
-        per_group = math.ceil(group_us / frame_us)
+    dur, sync_group = cadence
+    per_group = per_group or sync_group
     om = dur if per_group > 1 else 0
     return MediaTimestamps(wall0, source.timescale, dur * per_group, om)
 
@@ -749,32 +787,33 @@ async def _report_stats(stats: dict, interval: float, pub: FanoutPublisher):
         print(f"  [pub {int(m)}:{s:06.3f}] " + " · ".join(parts))
 
 
-async def _feed_tone(track, args, stats: _TrackStats, clock=None):
+async def _feed_tone(track, args, stats: _TrackStats, clock=None,
+                     per_group: int = 1):
     start, wall0 = clock or (time.monotonic(), int(time.time() * 1_000_000))
-    for payload, ts in pcm_tone_frames(
+    for i, (payload, ts) in enumerate(pcm_tone_frames(
             duration_s=args.duration, freq=args.freq,
             samplerate=_SAMPLERATE, channels=_CHANNELS,
-            frame_ms=_FRAME_MS):
+            frame_ms=_FRAME_MS)):
         await _pace(start, ts, not args.no_pace)
-        await _send(track, stats, payload, True, timestamp=wall0 + ts)
+        await _send(track, stats, payload, i % per_group == 0,
+                    timestamp=wall0 + ts)
     await track.finish()
 
 
 async def _feed_mp4_track(track, source, args, stats: _TrackStats, *,
-                          all_key=False, group_us=None, gap_us=33_333,
+                          group_frames=None, gap_us=33_333,
                           wrap=None, clock=None):
     """Feed an mp4 track's samples, paced to their media timestamps and
     stamped with their scheduled wall-clock capture time; --loop
-    restarts the file at later timestamps (audio: every AU is a sync
-    frame, giving LOC's one-object-per-group audio mapping, or with
-    group_us one group per that much media time).
+    restarts the file at later timestamps. Groups open on sync samples,
+    or with `group_frames` (audio) every that many samples.
     wrap(sample) transforms the payload (CMAF chunking); a group's first
     chunk is led by a prft with --timestamp-mapping. `clock` is the
     (monotonic, wall µs) start shared with the other feeders."""
     start, wall0 = clock or (time.monotonic(), int(time.time() * 1_000_000))
     prft = wrap is not None and getattr(args, 'timestamp_mapping', False)
     base_us = 0
-    group_ts = None
+    n = 0
     while True:
         last = 0
         for s in source.samples():
@@ -783,12 +822,11 @@ async def _feed_mp4_track(track, source, args, stats: _TrackStats, *,
                 break
             await _pace(start, ts, not args.no_pace)
             payload = wrap(s) if wrap else s.payload
-            if group_us is not None:
-                key = group_ts is None or ts - group_ts >= group_us
-                if key:
-                    group_ts = ts
+            if group_frames is not None:
+                key = n % group_frames == 0
+                n += 1
             else:
-                key = all_key or s.key_frame
+                key = s.key_frame
             if prft and key:
                 payload = _with_prft(payload, wall0 + ts)
             await _send(track, stats, payload, key, timestamp=wall0 + ts)
@@ -875,6 +913,10 @@ async def run(args):
             return codec if args.loc_codecstring else None
         v_map = (StreamMapping.PER_OBJECT if args.video_subgroups == 'object'
                  else StreamMapping.PER_GROUP)
+        a_map = (StreamMapping.DATAGRAM if args.datagram
+                 else StreamMapping.PER_OBJECT
+                 if args.audio_subgroups == 'object'
+                 else StreamMapping.PER_GROUP)
         session = sessions[0]
         # CMAF objects are not LOC: no Private Properties block.
         loc_bare = args.loc_bare or args.packaging == PACKAGING_CMAF
@@ -913,6 +955,7 @@ async def run(args):
         elif ts is not None:
             fh, dmx, first, _, _ = ts
             tracks = {}
+            a_per = _audio_per_group(args, _FRAME_MS * 1000)
             if video is not None:
                 tracks['video'] = pub.add_track(_timed(LocTrackPublisher(
                     session, args.namespace, 'video', config=video.config,
@@ -924,46 +967,44 @@ async def run(args):
             if ts_audio is not None:
                 tracks['audio'] = pub.add_track(_timed(LocTrackPublisher(
                     session, args.namespace, 'audio', media_kind='audio',
-                    config=ts_audio.config,
-                    mapping=(StreamMapping.DATAGRAM if args.datagram
-                             else StreamMapping.PER_GROUP),
+                    config=ts_audio.config, mapping=a_map,
                     loc01_compat=args.loc01_compat, loc_bare=loc_bare,
                     timescale=args.loc_timescale,
                     codec_string=_cs(ts_audio.codec_string)),
                     MediaTimestamps(wall0)))
                 stats['audio'] = _TrackStats()
             feeders.append(_feed_ts_live(tracks, fh, dmx, first, args,
-                                         stats, pub))
+                                         stats, pub, a_per))
         elif not args.no_audio:
-            audio_group_us = (_LOCMAF_AUDIO_GROUP_US
-                              if args.packaging == PACKAGING_LOCMAF
-                              else None)
             spf = _SAMPLERATE * _FRAME_MS // 1000
+            a_per = _audio_per_group(
+                args, _sample_us(mp4_audio) if mp4_audio is not None
+                else _FRAME_MS * 1000)
             audio_track = pub.add_track(_timed(_track(
                 'audio', media_kind='audio',
                 config=mp4_audio.config if mp4_audio is not None else None,
-                mapping=(StreamMapping.DATAGRAM if args.datagram
-                         else StreamMapping.PER_GROUP),
+                mapping=a_map,
                 loc01_compat=args.loc01_compat,
                 codec_string=_cs(mp4_audio.codec_string
                                  if mp4_audio is not None else 'pcm-s16')),
-                (_frindell_for(mp4_audio, wall0, audio_group_us)
+                (_frindell_for(mp4_audio, wall0, a_per)
                  if mp4_audio is not None
-                 else MediaTimestamps(wall0, _SAMPLERATE, spf))))
+                 else MediaTimestamps(wall0, _SAMPLERATE, spf * a_per,
+                                      spf if a_per > 1 else 0))))
             stats['audio'] = _TrackStats()
             if mp4_audio is not None:
                 a_ck = chunkers.get('audio')
                 feeders.append(_feed_mp4_track(
                     audio_track, mp4_audio, args, stats['audio'],
-                    all_key=True,
-                    group_us=audio_group_us,
+                    group_frames=a_per,
                     gap_us=_sample_us(mp4_audio),
                     wrap=(lambda s, ck=a_ck:
                           ck.chunk(s.payload, s.duration)) if a_ck
                     else None, clock=clock))
             else:
                 feeders.append(_feed_tone(audio_track, args,
-                                          stats['audio'], clock=clock))
+                                          stats['audio'], clock=clock,
+                                          per_group=a_per))
         if live is not None:
             fh, asm, first, _ = live
             stats['video'] = _TrackStats()
