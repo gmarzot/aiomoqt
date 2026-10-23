@@ -28,11 +28,12 @@ measuring a delivery ceiling without the measurement in the way.
 """
 import math
 import random
+import sys
 import time
 from collections import deque
 from typing import Optional
 
-from .format import fmt_bps, fmt_ms, fmt_rate
+from .format import fmt_bps, fmt_ms, fmt_ms_signed, fmt_rate
 from .timing import (
     BENCH_TIMESTAMP as MOQT_TIMESTAMP_EXT, LOC_TIMESCALE, LOC_TIMESTAMP,
     SOURCE_LOC, TimestampMalformed, TrackTiming, capture_time_us,
@@ -63,6 +64,21 @@ def send_time_us(exts, timing: Optional[TrackTiming] = None,
 # floor allows small negative skew before discarding.
 _LAT_MIN_US = -1_000_000
 _LAT_MAX_US = 600_000_000
+
+# Marks a latency figure that is negative, so skewed by the clocks.
+CLOCK_OFFSET_MARK = "(clock offset)"
+_clock_warned = False
+
+
+def note_clock_offset(lat_ms: float) -> None:
+    """Warn once per process that a sender-stamped latency came out
+    negative. The figures are kept: they still compare relatively."""
+    global _clock_warned
+    if lat_ms < 0 and not _clock_warned:
+        _clock_warned = True
+        print(f"warning: latency < 0: sender and receiver clocks differ by "
+              f"at least {-lat_ms:.0f} ms; sync clocks (chrony/NTP) for "
+              f"absolute latency", file=sys.stderr, flush=True)
 
 
 def _pct(sorted_data: list, p: float) -> float:
@@ -368,6 +384,8 @@ class TrackStats:
                 send_us = self._send_us(msg, group_id)
         if send_us is not None and recv_time_us is not None:
             raw = recv_time_us - send_us
+            if raw < 0:
+                note_clock_offset(raw / 1000.0)
             if _LAT_MIN_US <= raw <= _LAT_MAX_US:
                 lat = raw / 1000.0
                 self.lat_count += 1
@@ -576,10 +594,12 @@ class TrackStats:
         if dt <= 0:
             return ""
         elapsed = now - self.start_time
+        skewed = False
         if self._iv_lat_res.items:
             avg = sum(self._iv_lat_res.items) / len(self._iv_lat_res.items)
             p99, = self._iv_lat_res.percentiles(99)
-            lat_s = f"{fmt_ms(avg)} p99:{fmt_ms(p99)}"
+            lat_s = f"{fmt_ms_signed(avg)} p99:{fmt_ms_signed(p99)}"
+            skewed = min(self._iv_lat_res.items) < 0
         else:
             lat_s = "--"
         expected = self.total_objects + self.total_lost
@@ -597,7 +617,8 @@ class TrackStats:
                f"{fmt_rate(self._iv_objects / dt):<10}"
                f"{fmt_bps(self._iv_bytes * 8 / dt):<10}"
                f"{lat_s:<21}{jit_s:<9}"
-               f"{loss_s:<16}")
+               f"{loss_s:<16}"
+               + (CLOCK_OFFSET_MARK if skewed else ""))
         self._iv_objects = self._iv_bytes = self._iv_groups = 0
         self._iv_start = now
         self._iv_lat_res.clear()
@@ -631,6 +652,7 @@ class TrackStats:
             lat_max=self.lat_max if self.lat_count else 0.0,
             lat_mean=mean, lat_sd=var ** 0.5 if var > 0 else 0.0,
             lat_p50=p50, lat_p95=p95, lat_p99=p99,
+            clock_offset=bool(self.lat_count) and self.lat_min < 0,
             jitter_ms=self.jitter,
             lost=self.total_lost, ooo=self.total_ooo,
             ts_source=self.ts_source, ts_malformed=self.ts_malformed,

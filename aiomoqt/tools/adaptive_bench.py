@@ -38,8 +38,9 @@ from aiomoqt.types import (FilterType, MOQTMessageType, ObjectStatus,
                            parse_draft_spec)
 from aiomoqt.utils import cli as _cli
 from aiomoqt.utils.cli import endpoint_url
-from aiomoqt.utils.format import fmt_bps, fmt_ms
-from aiomoqt.utils.stats import send_time_us
+from aiomoqt.utils.format import fmt_bps, fmt_ms, fmt_ms_signed
+from aiomoqt.utils.stats import (CLOCK_OFFSET_MARK, note_clock_offset,
+                                 send_time_us)
 from aiomoqt.utils.logger import set_log_level
 
 
@@ -177,6 +178,8 @@ class LiveStats:
         latency = None
         if send_us is not None:
             raw_us = recv_time_us - send_us
+            if raw_us < 0:
+                note_clock_offset(raw_us / 1000.0)
             # Accept up to 10 minutes (under-load latency can exceed
             # 60s); reject negatives and varint-garbage outliers.
             if -1_000_000 <= raw_us <= 600_000_000:
@@ -1195,9 +1198,11 @@ class AIMDController:
         bw = fmt_bps(sig.target_mbps * 1e6)
         tx = fmt_bps(sig.tx_mbps * 1e6)
         rx = fmt_bps(sig.rx_mbps * 1e6)
-        mean = fmt_ms(sig.latency_mean_ms)
-        p90 = fmt_ms(sig.latency_p90_ms)
+        mean = fmt_ms_signed(sig.latency_mean_ms)
+        p90 = fmt_ms_signed(sig.latency_p90_ms)
         jit = fmt_ms(sig.jitter_ms)
+        if sig.latency_mean_ms < 0:
+            action = f"{action} {CLOCK_OFFSET_MARK}"
         if self.actuator.unit == "subs":
             print(
                 f"  {int(round(t_rel)):>5d}s     "

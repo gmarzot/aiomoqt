@@ -98,9 +98,10 @@ class BenchReporter:
         print(f"  ObjRate:     {s['obj_rate']:.1f} obj/s")
         print(f"  Throughput:  {s['mbps']:.2f} Mbps")
         if s['lat_mean']:
+            mark = "  (clock offset)" if s.get('clock_offset') else ""
             print(f"  Latency:     min={s['lat_min']:.1f}  "
                   f"avg={s['lat_mean']:.1f}  max={s['lat_max']:.1f}  "
-                  f"sd={s['lat_sd']:.1f} ms")
+                  f"sd={s['lat_sd']:.1f} ms{mark}")
             print(f"               p50={s['lat_p50']:.1f}  "
                   f"p95={s['lat_p95']:.1f}  p99={s['lat_p99']:.1f} ms")
         if s.get('ts_source') or s.get('ts_malformed'):
