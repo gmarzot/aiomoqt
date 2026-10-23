@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Relay: d20/d22 SETUP advertises MAX_FILTER_RANGES 16 and applies SUBGROUP, OBJECTID, PRIORITY and OBJECT_PROPERTY Range Filters per subscriber on live objects, cache replay, fill streams and FETCH; REQUEST_UPDATE replaces or removes them; `MOQTServer(max_filter_ranges=)`.
 - Relay: FETCH and fill streams served from the cache send each group's objects in Object ID order across subgroups.
 - SubscribedTrack: a timing-malformed object that arrives before SUBSCRIBE_OK is processed cancels its own track, not alias 0.
 - Relay: status files are encoded with json's C encoder.

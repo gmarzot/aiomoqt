@@ -89,6 +89,7 @@ class MOQTServer(MOQTPeer):
         max_connections: Optional[int] = None,
         implementation: Optional[str] = USER_AGENT,
         quiet_peers: Iterable[str] = (),
+        max_filter_ranges: int = 0,
     ):
         super().__init__(tx_max_inflight_bytes=tx_max_inflight_bytes,
                          implementation=implementation)
@@ -131,6 +132,9 @@ class MOQTServer(MOQTPeer):
         # with one of these log below WARNING at DEBUG (a health probe's
         # sessions, say).
         self.quiet_peers = tuple(quiet_peers)
+        # MAX_FILTER_RANGES sent at d20+ (§9.1.6). Nonzero only where the
+        # application applies Range Filters; 0 refuses them all.
+        self.max_filter_ranges = int(max_filter_ranges)
         self._loop = asyncio.get_running_loop()
         self._server_closed: Future[Tuple[int, str]] = self._loop.create_future()
         self._next_subscribe_id = 1
