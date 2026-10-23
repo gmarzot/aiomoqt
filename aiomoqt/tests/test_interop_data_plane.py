@@ -292,7 +292,7 @@ async def test_history_cases_deliver_objects(name, draft, use_quic):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("name", ["fetch", "join"])
 async def test_history_case_without_objects_fails(monkeypatch, name):
-    # A structured refusal no longer passes: the case needs objects.
+    # A structured refusal fails: the case needs objects.
     async def refuse(session, msg):
         session.fetch_error(msg.request_id, RequestErrorCode.DOES_NOT_EXIST,
                             "no history")

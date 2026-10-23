@@ -1,5 +1,5 @@
-"""adaptive_bench's multi-process rate covers the time actually measured,
-not a fixed 5 s window, so the first intervals are not under-reported."""
+"""adaptive_bench's multi-process rate divides by the time measured so far,
+capped at the window, and missing latency prints as n/a."""
 import queue
 
 from aiomoqt.tools import adaptive_bench as ab
