@@ -10,6 +10,9 @@
 - pub_media: `--video-subgroups object` sends each video object on its own subgroup stream (subgroup ID = object ID).
 - pub_media: the stats line counts objects produced and reports frames the track discarded (waiting for a key frame, Forward State 0) as `discarded`.
 - pub_media: Opus audio from `--ts` and `--mp4` (loc, cmaf, locmaf), one object per Opus packet; catalog codec `opus`.
+- Relay: SUBSCRIBE_TRACKS with TRACK_PROPERTY_FILTER is offered only the tracks whose Track Properties pass it; its other Range Filters filter each resulting subscription.
+- Relay: d20/d22 SETUP advertises MAX_FILTER_RANGES 16 and applies SUBGROUP, OBJECTID, PRIORITY and OBJECT_PROPERTY Range Filters per subscriber on live objects, cache replay, fill streams and FETCH; REQUEST_UPDATE replaces or removes them; `MOQTServer(max_filter_ranges=)`.
+- Relay: FETCH and fill streams served from the cache send each group's objects in Object ID order across subgroups.
 - Relay: a FETCH, joining FETCH or fill the cache cannot serve goes to the session that PUBLISHed the track, not only to namespace publishers.
 - Fan-out: each object is encoded once per header state and the bytes shared by every peer in that state (datagrams: per alias and draft codec).
 - SubscribedTrack: a timing-malformed object that arrives before SUBSCRIBE_OK is processed cancels its own track, not alias 0.
