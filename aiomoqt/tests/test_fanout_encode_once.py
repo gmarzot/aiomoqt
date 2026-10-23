@@ -49,6 +49,9 @@ class _Session:
         await asyncio.sleep(0)
         self.streams[sid] += data
 
+    def datagram_max_payload(self):
+        return 1 << 16
+
     async def dgram_write_drain(self, buf):
         await asyncio.sleep(0)
         self.dgrams.append(bytes(buf if isinstance(buf, bytes) else buf.data))

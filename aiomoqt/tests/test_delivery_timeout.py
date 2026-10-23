@@ -78,6 +78,9 @@ class _FakeSession:
     async def dgram_write_drain(self, buf):
         self.dgrams.append(buf)
 
+    def datagram_max_payload(self):
+        return 1200
+
 
 async def _run_lane(mapping, items, timeout):
     session = _FakeSession()

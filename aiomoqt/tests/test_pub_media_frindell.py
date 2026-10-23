@@ -78,7 +78,7 @@ def test_cadence_needs_one_duration_and_even_keyframes():
     assert not explicit.mapped
     audio = pub_media._frindell_for(
         NS(_stts=[(100, 1024)], _sync=None, _sizes=[1] * 100,
-           timescale=48000), W, group_us=1_000_000)
+           timescale=48000), W, per_group=47)
     assert (audio.group_multiplier, audio.object_multiplier) == (
         47 * 1024, 1024)
 
