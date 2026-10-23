@@ -176,7 +176,7 @@ def _other_value(default):
     if isinstance(default, bool):
         return not default
     if default is None:
-        return 1
+        return "other"
     if isinstance(default, (int, float)):
         return default + 1
     return "other"

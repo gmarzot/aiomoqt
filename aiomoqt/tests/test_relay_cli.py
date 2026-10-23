@@ -1,7 +1,11 @@
 """moq_interop_relay run as a process with its operator flags."""
 import json
+import pathlib
 import socket
+import tempfile
 import time
+
+import pytest
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
 from aiomoqt.tests._procs import (free_udp_port, objects_received, run, spawn,
@@ -41,10 +45,17 @@ def _status(path, timeout=10):
     raise AssertionError(f"no {path}")
 
 
+@pytest.fixture
+def short_dir():
+    # macOS caps AF_UNIX paths near 104 bytes; pytest's tmp_path is longer.
+    with tempfile.TemporaryDirectory(dir="/tmp") as d:
+        yield pathlib.Path(d)
+
+
 @requires_certs
-def test_relay_operator_flags(tmp_path):
+def test_relay_operator_flags(tmp_path, short_dir):
     port = free_udp_port()
-    ctl, status_dir, log_dir = (tmp_path / "ctl.sock", tmp_path / "status",
+    ctl, status_dir, log_dir = (short_dir / "ctl.sock", tmp_path / "status",
                                 tmp_path / "logs")
     log = tmp_path / "relay.out"
     relay = spawn("moq_interop_relay", "--bind", "127.0.0.1", "--port", port,
