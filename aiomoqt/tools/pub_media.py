@@ -195,6 +195,12 @@ def parse_args():
     parser.add_argument('--stats', type=float, default=5.0, metavar='SECS',
                         help='Print per-track publish metrics every SECS '
                              'seconds (0 disables; default: 5)')
+    map_group = parser.add_argument_group('object mapping')
+    map_group.add_argument(
+        '--video-subgroups', choices=('group', 'object'), default='group',
+        help='Video objects to subgroup streams: group = one subgroup '
+             'stream per group (default); object = one per object, '
+             'subgroup ID = object ID. Not with locmaf.')
     ts_group = parser.add_argument_group('timestamp writing')
     ts_group.add_argument(
         '--timestamp-mapping', action='store_true',
@@ -236,6 +242,12 @@ def parse_args():
     if args.datagram and args.packaging == PACKAGING_LOCMAF:
         parser.error('--datagram does not apply to locmaf: its objects '
                      'need subgroup streams')
+    if args.video_subgroups == 'object':
+        if args.packaging == PACKAGING_LOCMAF:
+            parser.error('--video-subgroups object does not apply to '
+                         'locmaf: its objects need per-group streams')
+        if args.input:
+            parser.error('--video-subgroups does not apply to --input')
     return args
 
 
@@ -861,6 +873,8 @@ async def run(args):
 
         def _cs(codec):
             return codec if args.loc_codecstring else None
+        v_map = (StreamMapping.PER_OBJECT if args.video_subgroups == 'object'
+                 else StreamMapping.PER_GROUP)
         session = sessions[0]
         # CMAF objects are not LOC: no Private Properties block.
         loc_bare = args.loc_bare or args.packaging == PACKAGING_CMAF
@@ -902,7 +916,7 @@ async def run(args):
             if video is not None:
                 tracks['video'] = pub.add_track(_timed(LocTrackPublisher(
                     session, args.namespace, 'video', config=video.config,
-                    loc01_compat=args.loc01_compat, loc_bare=loc_bare,
+                    mapping=v_map, loc01_compat=args.loc01_compat, loc_bare=loc_bare,
                     timescale=args.loc_timescale,
                     codec_string=_cs(video.codec_string)),
                     MediaTimestamps(wall0)))
@@ -956,7 +970,7 @@ async def run(args):
             feeders.append(_feed_h264_live(
                 pub.add_track(_timed(LocTrackPublisher(
                     session, args.namespace, 'video', config=video.config,
-                    loc01_compat=args.loc01_compat, loc_bare=loc_bare,
+                    mapping=v_map, loc01_compat=args.loc01_compat, loc_bare=loc_bare,
                     timescale=args.loc_timescale,
                     codec_string=_cs(video.codec_string)),
                     MediaTimestamps(wall0))),
@@ -966,7 +980,7 @@ async def run(args):
             stats['video'] = _TrackStats()
             feeders.append(_feed_mp4_track(
                 pub.add_track(_timed(_track(
-                    'video',
+                    'video', mapping=v_map,
                     config=None if v_ck else video.config,
                     loc01_compat=args.loc01_compat,
                     codec_string=_cs(video.codec_string)),

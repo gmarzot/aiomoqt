@@ -223,3 +223,70 @@ async def test_stats_line_counts_objects_produced_not_frames_discarded(
     task.cancel()
     line = capsys.readouterr().out.splitlines()[0]
     assert 'video: 2 obj' in line and 'discarded 3' in line, line
+
+
+# -- T2/T3: object mapping -------------------------------------------------
+
+@pytest.fixture
+def arrivals(monkeypatch):
+    """(track, group, subgroup, object) of every media object sub_media
+    --analyze sees; subgroup None for a datagram."""
+    from aiomoqt.utils.media_stats import MediaAnalysis
+    seen = []
+    orig = MediaAnalysis.on_arrival
+
+    def record(self, name, msg, recv_us, group_id, subgroup_id, frame):
+        if frame is not None:
+            seen.append((name, group_id, subgroup_id, msg.object_id))
+        return orig(self, name, msg, recv_us, group_id, subgroup_id, frame)
+    monkeypatch.setattr(MediaAnalysis, 'on_arrival', record)
+    return seen
+
+
+@pytest.fixture(scope='module')
+def h264_aac(tmp_path_factory):
+    return _encode(tmp_path_factory.mktemp('mtt') / 'clip.mp4', 'mp4',
+                   acodec='aac', layout='mono')
+
+
+def _subgroups(seen, track):
+    return [(g, sg, o) for n, g, sg, o in seen if n == track]
+
+
+@requires_certs
+@pytest.mark.parametrize('packaging,use_quic', [
+    ('loc', True), ('loc', False), ('cmaf', True)])
+async def test_video_subgroup_per_object(tmp_path, monkeypatch, arrivals,
+                                         h264_aac, packaging, use_quic):
+    port = _BASE_PORT + 20 + 2 * (packaging == 'cmaf') + (not use_quic)
+    rows = await _analyze(
+        monkeypatch, tmp_path, port,
+        ['--mp4', h264_aac, '--loop', '--packaging', packaging,
+         '--video-subgroups', 'object'], use_quic=use_quic)
+    video = _subgroups(arrivals, 'video')
+    assert int(rows['video']['objects']) > 30 and video
+    assert all(sg == o for _, sg, o in video), video[:5]
+    assert len({sg for _, sg, _ in video}) > 10
+    # Audio keeps its own mapping: one subgroup stream per group.
+    assert {sg for _, sg, _ in _subgroups(arrivals, 'audio')} == {0}
+
+
+@requires_certs
+async def test_video_subgroups_default_to_one_per_group(
+        tmp_path, monkeypatch, arrivals, h264_aac):
+    await _analyze(monkeypatch, tmp_path, _BASE_PORT + 24,
+                   ['--mp4', h264_aac, '--loop'])
+    assert {sg for _, sg, _ in _subgroups(arrivals, 'video')} == {0}
+
+
+@pytest.mark.parametrize('argv,why', [
+    (['--mp4', 'x.mp4', '--packaging', 'locmaf', '--video-subgroups',
+      'object'], 'does not apply to locmaf'),
+    (['--input', 'x.m3u8', '--video-subgroups', 'object'],
+     'does not apply to --input'),
+])
+def test_video_subgroups_object_refused_where_it_cannot_apply(
+        monkeypatch, capsys, argv, why):
+    with pytest.raises(SystemExit):
+        _pub_args(monkeypatch, *argv)
+    assert why in capsys.readouterr().err
