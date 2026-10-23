@@ -296,6 +296,9 @@ class BWActuator:
         self._mp_total_lost = 0
         self._mp_total_objs = 0
         self._mp_window_s = 5.0
+        # Measurement start: the first apply(). Rates divide by the time
+        # actually covered, never more than the window.
+        self._mp_t0: Optional[float] = None
         # publisher rates from pub_stats events.
         # tx_bytes  = bytes the publisher queued via send_stream_data.
         # wire_bytes = bytes picoquic actually placed on the wire
@@ -322,6 +325,8 @@ class BWActuator:
         self.state.target_mbps = level
         rate_ops = self.scenario.aggregate_ops(level)
         self.state.rate_ops = rate_ops
+        if self._mp_t0 is None:
+            self._mp_t0 = time.monotonic()
         if self.is_mp:
             try:
                 self._rate_q.put_nowait({'rate_ops': rate_ops})
@@ -425,7 +430,9 @@ class BWActuator:
             tx_bytes = wire_bytes
         else:
             tx_bytes = sum(b for (_, b) in self._mp_tx_window)
-        win = max(0.5, self._mp_window_s)
+        covered = (t - self._mp_t0 if self._mp_t0 is not None
+                   else self._mp_window_s)
+        win = max(0.5, min(self._mp_window_s, covered))
         rx_mbps = (rx_bytes * 8) / (win * 1e6)
         tx_mbps = (tx_bytes * 8) / (win * 1e6)
         loss_pct = (100.0 * self._mp_total_lost
