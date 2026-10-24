@@ -43,11 +43,11 @@
         "raw-quic": "moqt://fb.mvfst.net:9448",
         "h3-wt":    "https://fb.mvfst.net:9448/moq-relay"
       },
-      "drafts": [14, 16, 18, 22],
+      "drafts": [16, 18, 22],
       "gating": [16, 18],
       "pub_mode": "publish",
       "disabled_suites": [],
-      "notes": "Upstream moxygen/mvfst reference relay, the conformant d16/d18 reference. d14 runs non-gating."
+      "notes": "Upstream moxygen/mvfst reference relay, the conformant d16/d18 reference. moxygen no longer supports d14."
     },
     {
       "name": "moq-dev-anon",

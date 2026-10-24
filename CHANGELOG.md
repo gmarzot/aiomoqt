@@ -3,7 +3,7 @@
 ## v0.14.0
 
 - SubscribedTrack discovery: a refused SUBSCRIBE_TRACKS raises its MOQTRequestError at once, and `subscribe(expected_trackname=...)` waits for that track's PUBLISH; moq_interop_client namespace-discovery uses both.
-- Interop tier: Nokia d18 and d22 on their current ports; quichemoq, moqtail d18 and quicr-west WT dropped; per-relay load_sim namespace and XFAIL reasons.
+- Interop tier: Nokia d18 and d22 on their current ports; quichemoq, moqtail d18, quicr-west WT and moxygen d14 dropped; per-relay load_sim namespace and XFAIL reasons.
 
 ## v0.13.3
 
