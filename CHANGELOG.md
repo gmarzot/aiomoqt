@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.14.0
+
+- DEBUG logs no longer report each received stream data chunk as an unhandled QUIC event.
+
 ## v0.13.2
 
 - pub_media: the `player:` line is printed only when `--player-base` or `AIOMOQT_PLAYER_URL` is set; the localhost default is gone.

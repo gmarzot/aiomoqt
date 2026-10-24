@@ -2875,6 +2875,7 @@ class _MOQTSessionMixin:
                 return
 
             self._ingest_stream_data(stream_id, data, event.end_stream)
+            return
 
         elif isinstance(event, DatagramFrameReceived) and self._wt_session_setup.done():
             msg_buf = Buffer(data=event.data)
