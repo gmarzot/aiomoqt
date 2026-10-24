@@ -1,5 +1,7 @@
 # Changelog
 
+## v0.13.3
+
 ## v0.13.2
 
 - pub_media: the `player:` line is printed only when `--player-base` or `AIOMOQT_PLAYER_URL` is set; the localhost default is gone.
