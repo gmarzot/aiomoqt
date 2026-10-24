@@ -2,6 +2,8 @@
 
 ## v0.13.2
 
+- pub_media: the `player:` line is printed only when `--player-base` or `AIOMOQT_PLAYER_URL` is set; the localhost default is gone.
+- Bench and media stats: a negative latency within 1 ms is rounding on one clock and no longer warns or marks a clock offset.
 - Relay: the listening line reports all interfaces, which is what aiopquic binds whatever `--bind` says.
 - README: the subscribe and handler examples match the API. server_example: `-Q` serves raw QUIC, `-Q -W` both on one port; `--retry` is gone.
 - `await_publish()` and `await_namespace()` queue at most 1024 announcements; past that the oldest is dropped, with one WARNING per run of drops.

@@ -22,8 +22,8 @@ from typing import Callable, Dict, List, Optional, Tuple
 from ..media.cmaf import chunk_decode_time
 from ..types import ObjectStatus
 from .format import fmt_bps, fmt_ms, fmt_rate
-from .stats import (CLOCK_OFFSET_MARK, LOC_TIMESCALE, _pct, _Reservoir,
-                    note_clock_offset)
+from .stats import (CLOCK_OFFSET_MARK, CLOCK_OFFSET_MIN_MS, LOC_TIMESCALE,
+                    _pct, _Reservoir, note_clock_offset)
 from .timing import (
     SOURCE_FRINDELL, TimestampMalformed, TrackTiming, capture_time_us,
 )
@@ -498,7 +498,7 @@ class TrackAnalysis:
             lat_p50_ms=_pct(lat, 50) if lat else None,
             lat_p95_ms=_pct(lat, 95) if lat else None,
             lat_max_ms=lat[-1] if lat else None,
-            clock_offset=bool(lat) and lat[0] < 0,
+            clock_offset=bool(lat) and lat[0] < CLOCK_OFFSET_MIN_MS,
             jitter_ms=(self.jitter_ms if self.timed and d['objects']
                        else None),
             lost=d['lost'], lost_groups=d['lost_groups'],
@@ -544,7 +544,8 @@ class TrackAnalysis:
             lat_avg_ms=self._lat_sum / n_lat if n_lat else None,
             lat_p50_ms=lat_p50, lat_p95_ms=lat_p95, lat_p99_ms=lat_p99,
             lat_max_ms=self.lat_max,
-            clock_offset=self.lat_min is not None and self.lat_min < 0,
+            clock_offset=(self.lat_min is not None
+                          and self.lat_min < CLOCK_OFFSET_MIN_MS),
             jitter_ms=self.jitter_ms if self.timed else None,
             jitter_max_ms=self.jitter_max_ms if self.timed else None,
             lost=self.lost, lost_groups=self.lost_groups,

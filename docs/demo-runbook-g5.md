@@ -121,8 +121,8 @@ whole fields and does not apply.
   with the WSL one: read the clock note below before comparing latencies.
 
 ### M2 — aiomoqt publisher → browser player
-- `pub_media` prints a `/g5-player/` URL per relay: demos A–C in
-  [demo-runbook.md](demo-runbook.md).
+- With `AIOMOQT_PLAYER_URL` set, `pub_media` prints a `/g5-player/` URL
+  per relay: demos A–C in [demo-runbook.md](demo-runbook.md).
 
 ### M3 — path canary next to a g5 pair
 - Publisher first, then subscriber, while a G1/G2 pair runs:

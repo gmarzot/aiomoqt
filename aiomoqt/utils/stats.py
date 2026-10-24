@@ -67,14 +67,17 @@ _LAT_MAX_US = 600_000_000
 
 # Marks a latency figure that is negative, so skewed by the clocks.
 CLOCK_OFFSET_MARK = "(clock offset)"
+# Latency above this is rounding on one clock, not an offset (ms).
+CLOCK_OFFSET_MIN_MS = -1.0
 _clock_warned = False
 
 
 def note_clock_offset(lat_ms: float) -> None:
     """Warn once per process that a sender-stamped latency came out
-    negative. The figures are kept: they still compare relatively."""
+    below CLOCK_OFFSET_MIN_MS. The figures are kept: they still compare
+    relatively."""
     global _clock_warned
-    if lat_ms < 0 and not _clock_warned:
+    if lat_ms < CLOCK_OFFSET_MIN_MS and not _clock_warned:
         _clock_warned = True
         print(f"warning: latency < 0: sender and receiver clocks differ by "
               f"at least {-lat_ms:.0f} ms; sync clocks (chrony/NTP) for "
@@ -599,7 +602,7 @@ class TrackStats:
             avg = sum(self._iv_lat_res.items) / len(self._iv_lat_res.items)
             p99, = self._iv_lat_res.percentiles(99)
             lat_s = f"{fmt_ms_signed(avg)} p99:{fmt_ms_signed(p99)}"
-            skewed = min(self._iv_lat_res.items) < 0
+            skewed = min(self._iv_lat_res.items) < CLOCK_OFFSET_MIN_MS
         else:
             lat_s = "--"
         expected = self.total_objects + self.total_lost
@@ -652,7 +655,8 @@ class TrackStats:
             lat_max=self.lat_max if self.lat_count else 0.0,
             lat_mean=mean, lat_sd=var ** 0.5 if var > 0 else 0.0,
             lat_p50=p50, lat_p95=p95, lat_p99=p99,
-            clock_offset=bool(self.lat_count) and self.lat_min < 0,
+            clock_offset=(bool(self.lat_count)
+                          and self.lat_min < CLOCK_OFFSET_MIN_MS),
             jitter_ms=self.jitter,
             lost=self.total_lost, ooo=self.total_ooo,
             ts_source=self.ts_source, ts_malformed=self.ts_malformed,

@@ -34,9 +34,9 @@ their timestamps (--no-pace to blast).
   %(prog)s https://relay.example/moq-relay -N vod --input https://cdn.example/master.m3u8
   %(prog)s https://relay.example/moq-relay -N abr --input https://cdn.example/live.mpd --rendition all
 
-Each run prints a ready-to-paste player URL per relay (see
---player-base). Relays on different drafts need a --draft all of
-them accept.
+With --player-base or $AIOMOQT_PLAYER_URL set, each run prints a
+ready-to-paste player URL per relay. Relays on different drafts need a
+--draft all of them accept.
 """
 import asyncio
 import contextlib
@@ -44,6 +44,7 @@ import functools
 import json
 import logging
 import math
+import os
 import signal
 import sys
 import threading
@@ -127,10 +128,11 @@ def parse_args():
                              'turn, so large ladders fall behind real '
                              'time)')
     parser.add_argument('--player-base', type=str,
-                        default='http://localhost:5173/g5-player/',
+                        default=os.environ.get('AIOMOQT_PLAYER_URL'),
                         metavar='URL',
-                        help='Base of the player URL printed at start '
-                             '(default: the moq-playa simple example)')
+                        help='Player page for the URL printed at start '
+                             '(default: $AIOMOQT_PLAYER_URL; no player '
+                             'line when unset)')
     parser.add_argument('--packaging', choices=MEDIA_PACKAGINGS,
                         default=None,
                         help='Media packaging: loc = per-frame LOC '
@@ -1022,8 +1024,9 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
         relays = [relays[i] for i in up]
         sessions = [opened[i] for i in up]
         for url, relay, s in zip(urls, relays, sessions):
-            draft = getattr(s, 'negotiated_draft', None)
-            print(f"  player: {_player_url(args, relay, url, draft)}")
+            if args.player_base:
+                draft = getattr(s, 'negotiated_draft', None)
+                print(f"  player: {_player_url(args, relay, url, draft)}")
 
         def _cs(codec):
             return codec if args.loc_codecstring else None

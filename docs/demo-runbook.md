@@ -31,7 +31,13 @@ source .venv/bin/activate
 export RELAY_WT=https://moqx-main.ci.openmoq.org:4433/moq-relay
 export ASSETS=$HOME/Projects/moq/media-assets
 export PLAYA=$HOME/Projects/moq/moq-playa-v059
+export AIOMOQT_PLAYER_URL=http://localhost:5173/g5-player/
 ```
+
+`AIOMOQT_PLAYER_URL` is the player page `pub_media` builds its `player:`
+line from (`--player-base` overrides it); unset, no player line is
+printed. Use the local vite page from Prep, as above, or the deployed G5
+player, `https://aiomoqt-relay.marzresearch.net/g5-player/`.
 
 Every `python -m aiomoqt.tools.…` line below needs that venv. The one
 exception is the vite shell in Prep, which runs from `$PLAYA` and needs
@@ -86,7 +92,7 @@ so it cannot share a shell with anything below it.
   safe ones — check `has_b_frames` before substituting.
 
 ## Player URL parameters (/g5-player/)
-The publisher's `player:` line opens `/g5-player/` (`--player-base`). The
+The publisher's `player:` line opens `$AIOMOQT_PLAYER_URL` (`--player-base`). The
 page's settings dialog edits the same parameters.
 
 | Param | Meaning | Default |
