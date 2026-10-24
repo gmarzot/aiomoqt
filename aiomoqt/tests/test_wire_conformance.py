@@ -321,45 +321,69 @@ def test_d18_fetch_first_object_must_be_absolute():
         FetchObject.deserialize(rb, prior=None, prof=prof)
 
 
-def test_d18_fetch_zero_length_encodes_status():
-    # Golden bytes per moxygen's writer (writeStreamObject): a zero
-    # Payload Length is followed by an explicit Status varint.
+def test_d18_fetch_zero_length_carries_no_status():
     objs = [
         FetchObject(group_id=1, subgroup_id=0, object_id=0,
                     publisher_priority=200, payload=b"tt"),
         FetchObject(group_id=1, subgroup_id=0, object_id=1,
                     publisher_priority=200, payload=b""),
-        FetchObject(group_id=1, subgroup_id=0, object_id=2,
-                    publisher_priority=200,
-                    status=ObjectStatus.END_OF_GROUP, payload=b""),
     ]
     chain = _fetch_chain_roundtrip(objs)
     # First: flags GD|OD|PRI = 0x1C, absolute ids, len 2 + payload.
     assert chain[0][0] == bytes.fromhex("1c0100c8027474")
-    # Zero-length Normal: flags 0, len 0, explicit status 0.
-    assert chain[1][0] == bytes.fromhex("000000")
-    # End of Group: flags 0, len 0, status 3.
-    assert chain[2][0] == bytes.fromhex("000003")
-    assert [g.status for _, g in chain] == [
-        ObjectStatus.NORMAL, ObjectStatus.NORMAL, ObjectStatus.END_OF_GROUP]
-    assert [g.payload for _, g in chain] == [b"tt", b"", b""]
+    # Zero-length Normal: flags 0, len 0, nothing after.
+    assert chain[1][0] == bytes.fromhex("0000")
+    assert [g.payload for _, g in chain] == [b"tt", b""]
 
 
-def test_d18_fetch_non_normal_status_guards():
-    prof = profile_for(18)
-    with pytest.raises(ValueError, match="empty payload"):
-        FetchObject(group_id=1, object_id=0,
-                    status=ObjectStatus.END_OF_GROUP,
-                    payload=b"x").serialize(prof=prof)
-    with pytest.raises(ValueError, match="non-Normal"):
-        FetchObject(group_id=1, object_id=0,
-                    status=ObjectStatus.END_OF_GROUP,
-                    extensions={8: 1}, payload=b"").serialize(prof=prof)
-    # RX: properties on a non-Normal object close the parse.
-    raw = bytes.fromhex("3c0100c802080500 03".replace(" ", ""))
-    rb = Buffer(data=raw, vi64=True)
-    with pytest.raises(ValueError, match="non-Normal"):
-        FetchObject.deserialize(rb, prior=None, prof=prof)
+# d14 §10.4.4 keeps the Status after a zero Payload Length; d16
+# §10.2.1.1 and d18 §11.2.1.1: absent in Objects delivered via a FETCH.
+@pytest.mark.parametrize("draft, raw", [
+    (14, "05000c80000000"),
+    (16, "1f05000c8000"),
+    (18, "1c050c8000"),
+])
+def test_fetch_zero_length_object_status_by_draft(draft, raw):
+    prof = profile_for(draft)
+    obj = FetchObject(group_id=5, object_id=12, publisher_priority=128)
+    assert bytes(obj.serialize(prof=prof).data) == bytes.fromhex(raw)
+    got = FetchObject.deserialize(
+        Buffer(data=bytes.fromhex(raw), vi64=prof.vi64), prof=prof)
+    assert (got.object_id, got.payload, got.status) == (
+        12, b"", ObjectStatus.NORMAL)
+
+
+def test_d14_fetch_end_of_group_keeps_its_status():
+    prof = profile_for(14)
+    raw = bytes(FetchObject(group_id=5, object_id=12, publisher_priority=128,
+                            status=ObjectStatus.END_OF_GROUP)
+                .serialize(prof=prof).data)
+    assert raw == bytes.fromhex("05000c80000003")
+    got = FetchObject.deserialize(Buffer(data=raw), prof=prof)
+    assert got.status == ObjectStatus.END_OF_GROUP
+
+
+@pytest.mark.parametrize("draft", [16, 18])
+def test_fetch_object_with_status_is_not_encoded(draft):
+    with pytest.raises(ValueError, match="no Object Status"):
+        FetchObject(group_id=5, object_id=12, publisher_priority=128,
+                    status=ObjectStatus.END_OF_GROUP).serialize(
+                        prof=profile_for(draft))
+
+
+@pytest.mark.parametrize("draft, raw", [
+    (16, "1f05000c800003"),
+    (18, "1c050c800003"),
+])
+def test_fetch_object_with_trailing_status_does_not_parse(draft, raw):
+    # aiomoqt 0.13.2's form: the Status reads as the next object's
+    # Serialization Flags (0x03: Subgroup ID present), then runs short.
+    prof = profile_for(draft)
+    rb = Buffer(data=bytes.fromhex(raw), vi64=prof.vi64)
+    first = FetchObject.deserialize(rb, prof=prof)
+    assert (first.object_id, first.status) == (12, ObjectStatus.NORMAL)
+    with pytest.raises(Exception):
+        FetchObject.deserialize(rb, prior=first, prof=prof)
 
 
 def test_d18_fetch_first_object_sg_prior_rejected():

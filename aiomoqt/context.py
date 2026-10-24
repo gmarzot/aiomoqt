@@ -98,10 +98,10 @@ class DraftProfile:
     fetch_timed_out_range: bool = False
                                   # d20+ FETCH stream End of Timed-Out Range
                                   # marker (0x20C).
-    fetch_object_status: bool = True
+    fetch_object_status: bool = False
                                   # A zero Payload Length in a FETCH object is
-                                  # followed by an Object Status (moxygen's
-                                  # d16/d18 reading); d20 defines none.
+                                  # followed by an Object Status (d14); d16+
+                                  # FETCH objects carry none.
     error_table: int = 18
                                   # request error and stream reset code
                                   # tables below: 14, 16, 18, 20.
@@ -152,7 +152,7 @@ PROFILES = {
         uint8_params=frozenset(),
         object_statuses=frozenset({0x0, 0x1, 0x3, 0x4}),
         error_table=14, padding=False, update_has_location=True,
-        track_properties=False),
+        track_properties=False, fetch_object_status=True),
     MOQTDraft.DRAFT_16: DraftProfile(
         draft=MOQTDraft.DRAFT_16, setup_carries_versions=False,
         params_delta_coded=True, varint="rfc9000",
@@ -195,7 +195,6 @@ _D20 = replace(
     goaway_request_id=False,
     fetch_location_filter=True,
     fetch_timed_out_range=True,
-    fetch_object_status=False,
     truncated_request_closes=True,
     request_fin_cancels_discovery=False,
     fill_parameters_counted=True)

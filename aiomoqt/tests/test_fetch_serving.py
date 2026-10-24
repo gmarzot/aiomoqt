@@ -310,11 +310,12 @@ def _fetch_stub(draft):
     return _Stub()
 
 
-@pytest.mark.parametrize("draft,served", [(18, 3), (20, 2), (22, 2)])
+@pytest.mark.parametrize("draft,served", [(14, 3), (16, 2), (18, 2),
+                                           (20, 2), (22, 2)])
 async def test_serve_fetch_drops_object_status_where_fetch_has_none(draft,
                                                                     served):
-    # d22 §11.1.1: Objects delivered by FETCH carry no Object Status, so a
-    # cached END_OF_GROUP is not one of them.
+    # d16+: Objects delivered by FETCH carry no Object Status, so a
+    # cached END_OF_GROUP is not one of them; d14 sends it.
     from aiomoqt.messages.data import FetchObject
     from aiomoqt.protocol import _MOQTSessionMixin
     from aiomoqt.types import ObjectStatus
