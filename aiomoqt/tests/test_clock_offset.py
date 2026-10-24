@@ -77,3 +77,25 @@ def test_media_analysis_warns_once_and_marks(capsys):
     assert summ["clock_offset"]
     text = "\n".join(media_stats._track_summary(summ))
     assert "Latency:" in text and stats.CLOCK_OFFSET_MARK in text, text
+
+
+def test_sub_millisecond_negative_is_rounding(capsys):
+    s = TrackStats()
+    now = int(time.time() * 1e6)
+    for oid in range(20):
+        s.on_object(Obj(oid, now + 400 + oid), 100, now + oid)
+    assert WARNING not in capsys.readouterr().err
+    assert not s.summary()["clock_offset"]
+    assert stats.CLOCK_OFFSET_MARK not in s.interval_row(
+        time.monotonic() + 1)
+
+
+def test_media_analysis_ignores_sub_millisecond_negatives(capsys):
+    t = media_stats.TrackAnalysis("video")
+    now = int(time.time() * 1e6)
+    for oid in range(20):
+        t.observe(0, oid, 100, now + oid * 1000,
+                  ts=now + 300 + oid * 1000, wall=True)
+    assert WARNING not in capsys.readouterr().err
+    assert not t.interval(now + 30_000, 1.0)["clock_offset"]
+    assert not t.summary(now + 30_000)["clock_offset"]

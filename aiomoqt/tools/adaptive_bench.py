@@ -39,8 +39,8 @@ from aiomoqt.types import (FilterType, MOQTMessageType, ObjectStatus,
 from aiomoqt.utils import cli as _cli
 from aiomoqt.utils.cli import endpoint_url
 from aiomoqt.utils.format import fmt_bps, fmt_ms, fmt_ms_signed
-from aiomoqt.utils.stats import (CLOCK_OFFSET_MARK, note_clock_offset,
-                                 send_time_us)
+from aiomoqt.utils.stats import (CLOCK_OFFSET_MARK, CLOCK_OFFSET_MIN_MS,
+                                 note_clock_offset, send_time_us)
 from aiomoqt.utils.logger import set_log_level
 
 
@@ -1217,7 +1217,8 @@ class AIMDController:
         p90 = (fmt_ms_signed(sig.latency_p90_ms) if sig.latency_known
                else "n/a")
         jit = fmt_ms(sig.jitter_ms) if sig.latency_known else "n/a"
-        if sig.latency_known and sig.latency_mean_ms < 0:
+        if (sig.latency_known
+                and sig.latency_mean_ms < CLOCK_OFFSET_MIN_MS):
             action = f"{action} {CLOCK_OFFSET_MARK}"
         if self.actuator.unit == "subs":
             print(

@@ -679,3 +679,46 @@ async def test_hevc_reaches_analyze(tmp_path, monkeypatch, capsys, source,
         # A paced FIFO feeds TS in bursts on slow runners; only the mp4 rate is steady.
         assert 25 <= float(video['obj_rate']) <= 35, video
     assert int(rows['audio']['objects']) > 0
+
+
+# -- player link ---------------------------------------------------------------
+
+@pytest.mark.parametrize("env,flag,want", [
+    (None, None, None),
+    ("https://player.example/g5-player/", None,
+     "https://player.example/g5-player/"),
+    ("https://player.example/g5-player/", "http://localhost:5173/g5-player/",
+     "http://localhost:5173/g5-player/")])
+def test_player_base_from_flag_then_environment(monkeypatch, env, flag, want):
+    if env is None:
+        monkeypatch.delenv('AIOMOQT_PLAYER_URL', raising=False)
+    else:
+        monkeypatch.setenv('AIOMOQT_PLAYER_URL', env)
+    args = _argv(monkeypatch, 'pub_media', 'moqt://localhost:1/',
+                 *(['--player-base', flag] if flag else []))
+    assert args.player_base == want
+
+
+@requires_certs
+@pytest.mark.parametrize("base", [None, "https://player.example/g5-player/"])
+async def test_player_line_only_with_a_player_url(monkeypatch, capsys,
+                                                  h264_aac, base):
+    port = _BASE_PORT + 90 + (base is not None)
+    url = f'moqt://localhost:{port}/'
+    if base is None:
+        monkeypatch.delenv('AIOMOQT_PLAYER_URL', raising=False)
+    else:
+        monkeypatch.setenv('AIOMOQT_PLAYER_URL', base)
+    pub_args = _argv(monkeypatch, 'pub_media', url, '-k', '--draft', '18',
+                     '-t', '1', '--pub-ns', '-N', 'mtt/player',
+                     '--mp4', h264_aac)
+
+    async def body(relay):
+        await asyncio.wait_for(pub_media.run(pub_args), 15)
+    await _with_relay(port, True, body)
+    players = [ln.split() for ln in capsys.readouterr().out.splitlines()
+               if ln.strip().startswith('player:')]
+    if base is None:
+        assert players == []
+    else:
+        assert len(players) == 1 and players[0][1].startswith(base + '?')
