@@ -1701,18 +1701,23 @@ class _MOQTSessionMixin:
             self._data_streams[stream_id] = state
             self._schedule_stream_reaper()
 
+        chain = state.chain
         if data and len(data) > 0:
-            state.chain.extend(data)
+            chain.extend(data)
 
-        if state.chain.capacity > 0:
+        if chain.capacity > 0:
             self._drain_stream(stream_id, state)
 
-        if self._data_streams.get(stream_id) is state:
-            held = state.chain.capacity - state.chain.tell()
-            if held != state.held:
-                self._rx_held_bytes += held - state.held
+        # An empty chain with nothing counted leaves the count unchanged.
+        held = chain.capacity
+        if held or state.held:
+            held -= chain.tell()
+            if (held != state.held
+                    and self._data_streams.get(stream_id) is state):
+                total = self._rx_held_bytes + held - state.held
+                self._rx_held_bytes = total
                 state.held = held
-                if self._rx_held_bytes > self._rx_held_limit:
+                if total > self._rx_held_limit:
                     self._close_session(
                         SessionCloseCode.INTERNAL_ERROR,
                         f"{self._rx_held_bytes} bytes held in incomplete "
