@@ -3,6 +3,7 @@
 ## v0.14.0
 
 - Data streams: an object spanning several chunks is parsed once its bytes have arrived, not again on every chunk.
+- d20/d22 FILL_PARAMETERS: a Length-prefixed value is read as a counted block when one ends exactly at the Length, else as bare parameters (moxygen's form), so a counted block of ten or more parameters decodes.
 
 ## v0.13.2
 

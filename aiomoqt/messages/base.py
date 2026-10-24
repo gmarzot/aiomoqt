@@ -926,6 +926,33 @@ class MOQTMessage:
         raise err
 
     @staticmethod
+    def _pull_fill_value(buf: Buffer, prof: DraftProfile,
+                         value_end: int) -> Dict[int, Any]:
+        """A FILL_PARAMETERS value bounded by its Length: a counted block
+        (shape B), or bare parameters to value_end (shape A). No Table 7
+        type is below 0x0A, so a smaller first varint is a count; a
+        larger one is a count only if the counted block ends exactly at
+        value_end, and errors report the bare reading."""
+        start = buf.tell()
+        if buf.pull_vint() >= 0x0A:
+            buf.seek(start)
+            try:
+                params = MOQTMessage._pull_params(
+                    buf, prof=prof, buf_end=value_end,
+                    scope="FillParameters")
+                if buf.tell() == value_end:
+                    return params
+            except (MOQTProtocolViolation, BufferReadError, MOQTUnderflow):
+                pass
+            buf.seek(start)
+            return MOQTMessage._pull_params(
+                buf, prof=prof, buf_end=value_end, scope="FillParameters",
+                bare=True)
+        buf.seek(start)
+        return MOQTMessage._pull_params(
+            buf, prof=prof, buf_end=value_end, scope="FillParameters")
+
+    @staticmethod
     def _pull_params(buf: Buffer, *, prof: DraftProfile,
                      buf_end: Optional[int] = None,
                      delta_keys: bool = None,
@@ -1012,18 +1039,8 @@ class MOQTMessage:
                         raise MOQTProtocolViolation(
                             f"FILL_PARAMETERS length {param_len} exceeds "
                             f"remaining {buf_end - buf.tell()}")
-                    # Value is a counted block, or a bare parameter run
-                    # to its end: no Table 7 type is below 0x0A, so a
-                    # first varint below 0x0A is a Number of Parameters.
-                    fill_bare = False
-                    if param_len:
-                        mark = buf.tell()
-                        fill_bare = buf.pull_vint() >= 0x0A
-                        buf.seek(mark)
-                    param_value = MOQTMessage._pull_params(
-                        buf, prof=prof, buf_end=value_end,
-                        scope="FillParameters", bare=fill_bare) \
-                        if param_len else {}
+                    param_value = MOQTMessage._pull_fill_value(
+                        buf, prof, value_end) if param_len else {}
                     if buf.tell() != value_end:
                         raise MOQTProtocolViolation(
                             "FILL_PARAMETERS does not fill its length")
