@@ -8,7 +8,7 @@ import contextlib
 import pytest
 
 from aiomoqt.client import MOQTClient
-from aiomoqt.delivery import ObjectHistory
+from aiomoqt.delivery import MAX_OBJECT_ID, ObjectHistory
 from aiomoqt.messages.data import FETCH_FLAGS_END_UNKNOWN
 from aiomoqt.server import MOQTServer
 from aiomoqt.track import PublishedTrack
@@ -82,6 +82,33 @@ def test_a_duplicate_of_a_dropped_location_is_not_served():
         FETCH_FLAGS_END_UNKNOWN]
 
 
+def test_a_whole_group_fetch_of_an_evicted_group_ends_at_a_valid_location():
+    # The open end of a whole-group FETCH is (g, 1 << 62), past the
+    # RFC 9000 varint; the marker ends at the largest Object ID instead.
+    h = ObjectHistory(4000)
+    for g in range(10):
+        for o in range(5):
+            h.add(g, o, b"x" * 100, subgroup_id=None)
+    assert h.evicted_through > (2, 4)
+    marker, = h.fetch((2, 0), (2, 1 << 62))
+    assert marker.end_of_range == FETCH_FLAGS_END_UNKNOWN
+    assert (marker.group_id, marker.object_id) == (2, MAX_OBJECT_ID)
+    assert marker._serialize_d16().data.hex() == "410c" "02" + "ff" * 8
+
+
+def test_a_whole_group_marker_ends_at_the_groups_last_held_object():
+    h = ObjectHistory(3 * (10 + 64))
+    for loc in [(0, 0), (0, 1), (1, 0), (0, 2)]:
+        h.add(*loc, b"x" * 10)
+    assert h.evicted_through == (0, 0) and h.last_object(0) == 2
+    h.add(2, 0, b"x" * 10)                  # evicts (0, 1)
+    h.add(3, 0, b"x" * 10)                  # evicts (1, 0)
+    assert h.evicted_through == (1, 0)
+    got = h.fetch((0, 0), (0, 1 << 62))
+    assert (got[0].group_id, got[0].object_id) == (0, 2)
+    assert got[0].end_of_range == FETCH_FLAGS_END_UNKNOWN
+
+
 def test_last_object_is_the_largest_held_in_the_group():
     h = _filled(groups=2, objects=3)
     assert h.last_object(1) == 2 and h.last_object(5) is None
@@ -109,11 +136,12 @@ def _port(case: int, use_quic: bool) -> int:
 
 
 @contextlib.asynccontextmanager
-async def _loopback(port, use_quic, prefill=3):
+async def _loopback(port, use_quic, prefill=3, draft=18, held_groups=None):
     """The client publishes video and audio under _NS, each with `prefill`
     groups already published; yields (tracks, server session, fetched),
     the server being the side that subscribes and fetches. `fetched` maps
-    a FETCH request id to the objects it delivered."""
+    a FETCH request id to the objects it delivered. `held_groups` bounds
+    each track's history to that many groups."""
     peer = asyncio.get_running_loop().create_future()
     fetched: dict = {}
 
@@ -126,20 +154,22 @@ async def _loopback(port, use_quic, prefill=3):
 
     server = MOQTServer(host="localhost", port=port, certificate=CERT,
                         private_key=KEY, path="/", use_quic=use_quic,
-                        supported_drafts=18)
+                        supported_drafts=draft)
     server.register_handler(MOQTMessageType.PUBLISH_NAMESPACE,
                             _on_publish_namespace)
     quic_server = await server.serve()
     try:
         client = MOQTClient("localhost", port, path="/", use_quic=use_quic,
-                            verify_tls=False, supported_drafts=18)
+                            verify_tls=False, supported_drafts=draft)
         async with client.connect() as pub:
             await pub.client_session_init()
             tracks = {}
             for name, size in _SIZES.items():
+                kw = {} if held_groups is None else {
+                    "fetch_history_bytes": held_groups * _GROUP * (size + 64)}
                 track = PublishedTrack(pub, namespace=_NS, trackname=name,
                                        object_size=size, group_size=_GROUP,
-                                       rate=200)
+                                       rate=200, **kw)
                 if prefill:
                     track.prefill(prefill)
                 track.attach()
@@ -222,6 +252,29 @@ async def test_fetch_refusals(use_quic):
         assert await _refusal(rx.joining_fetch(
             999, joining_start=0, wait_response=True)) \
             == RequestErrorCode.INVALID_JOINING_REQUEST_ID
+        assert rx._close_err is None
+
+
+@requires_certs
+@_TRANSPORTS
+@pytest.mark.parametrize("draft", [16, 18])
+async def test_a_whole_group_fetch_of_an_evicted_group_completes(use_quic,
+                                                                 draft):
+    # Each history holds group 2 only; FETCH group 0 whole (End {0, 0}).
+    async with _loopback(_port(8 + (draft == 18), use_quic), use_quic,
+                         draft=draft, held_groups=1) as (tracks, rx, fetched):
+        gaps = []
+        rx.on_fetch_gap = lambda obj, rid: gaps.append(
+            (rid, obj.end_of_range, obj.group_id, obj.object_id))
+        for name in _SIZES:
+            assert tracks[name]._history.evicted_through == (1, _GROUP - 1)
+            ok, objs = await _fetch(rx, fetched, rx.fetch(
+                _NS, name, start_group=0, start_object=0, end_group=0,
+                end_object=0, wait_response=True))
+            assert objs == []
+            assert gaps[-1] == (ok.request_id, FETCH_FLAGS_END_UNKNOWN, 0,
+                                MAX_OBJECT_ID)
+        assert len(gaps) == len(_SIZES)
         assert rx._close_err is None
 
 
@@ -310,11 +363,12 @@ def _fetch_stub(draft):
     return _Stub()
 
 
-@pytest.mark.parametrize("draft,served", [(18, 3), (20, 2), (22, 2)])
+@pytest.mark.parametrize("draft,served", [(14, 3), (16, 2), (18, 2),
+                                           (20, 2), (22, 2)])
 async def test_serve_fetch_drops_object_status_where_fetch_has_none(draft,
                                                                     served):
-    # d22 §11.1.1: Objects delivered by FETCH carry no Object Status, so a
-    # cached END_OF_GROUP is not one of them.
+    # d16+: Objects delivered by FETCH carry no Object Status, so a
+    # cached END_OF_GROUP is not one of them; d14 sends it.
     from aiomoqt.messages.data import FetchObject
     from aiomoqt.protocol import _MOQTSessionMixin
     from aiomoqt.types import ObjectStatus
