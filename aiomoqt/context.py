@@ -117,10 +117,6 @@ class DraftProfile:
     track_properties: bool = True
                                   # PUBLISH, SUBSCRIBE_OK and FETCH_OK end
                                   # with Track Properties; d14 has none.
-    fill_parameters_counted: bool = False
-                                  # FILL_PARAMETERS value is Number of
-                                  # Parameters then Parameters, no Length
-                                  # (moq-transport PR #2015); d20+.
     reserved_period_namespaces: bool = False
                                   # d18+: a namespace whose first field starts
                                   # with "." is reserved; never sent.
@@ -196,8 +192,7 @@ _D20 = replace(
     fetch_location_filter=True,
     fetch_timed_out_range=True,
     truncated_request_closes=True,
-    request_fin_cancels_discovery=False,
-    fill_parameters_counted=True)
+    request_fin_cancels_discovery=False)
 PROFILES[MOQTDraft.DRAFT_20] = _D20
 PROFILES[MOQTDraft.DRAFT_22] = replace(
     _D20, draft=MOQTDraft.DRAFT_22,

@@ -1241,26 +1241,52 @@ def _unparams(raw, draft, scope=None):
 _NO_SUBGROUP_FILTER = RangeFilter(set_id=None)
 
 
+# d20 §10.2.15, d22 §9.20.15: FILL_PARAMETERS is length-prefixed; its
+# value is a parameter block as for a separate message (Number of
+# Parameters, then Parameters). Bytes derived by hand.
 @pytest.mark.parametrize("draft", [20, 22])
 @pytest.mark.parametrize("params, raw", [
-    ({0x23: {0x0A: 5}}, "01" "23" "01" "0a05"),
-    ({0x23: {0x21: LocationFilter.relative(1)}}, "01" "23" "01" "210101"),
+    ({0x23: {0x21: LocationFilter.relative(2)}}, "01" "23" "04" "01210102"),
+    ({0x23: {0x0A: 5}}, "01" "23" "03" "010a05"),
     ({0x23: {0x0A: 5, 0x21: LocationFilter.relative(1)},
       0x25: [_NO_SUBGROUP_FILTER]},
-     "02" "23" "02" "0a05" "170101" "02" "00"),
-    ({0x23: {}}, "01" "23" "00"),
-], ids=["fill-only", "location-filter", "then-subgroup-filter", "empty"])
-def test_fill_parameters_is_count_prefixed(draft, params, raw):
-    # moq-transport PR #2015: Number of Parameters, then the Parameters,
-    # with no Length; LOCATION_FILTER inside keeps its own encoding.
+     "02" "23" "06" "020a05170101" "02" "00"),
+    ({0x23: {}}, "01" "23" "01" "00"),
+], ids=["location-filter", "fill-only", "then-subgroup-filter", "empty"])
+def test_fill_parameters_is_length_prefixed(draft, params, raw):
     assert _params(params, draft) == bytes.fromhex(raw)
     assert _unparams(bytes.fromhex(raw), draft) == params
 
 
 def test_d22_fill_nests_the_typed_location_filter():
     raw = _params({0x23: {0x21: LocationFilter.next_object()}}, 22)
-    assert raw == bytes.fromhex("01" "23" "01" "2105")
+    assert raw == bytes.fromhex("01" "23" "03" "012105")
     assert _unparams(raw, 22) == {0x23: {0x21: LocationFilter.next_object()}}
+
+
+@pytest.mark.parametrize("draft", [20, 22])
+@pytest.mark.parametrize("raw, fill", [
+    ("01" "23" "01" "210102", {0x21: LocationFilter.relative(2)}),
+    ("01" "23" "01" "0a05", {0x0A: 5}),
+    ("02" "23" "02" "0a05170101" "02" "00",
+     {0x0A: 5, 0x21: LocationFilter.relative(1)}),
+    ("01" "23" "00", {}),
+], ids=["location-filter", "fill-only", "then-subgroup-filter", "empty"])
+def test_count_prefixed_fill_parameters_is_still_read(draft, raw, fill):
+    # moq-transport PR #2015 (aiomoqt 0.13.2): Number of Parameters,
+    # then the Parameters, with no Length.
+    assert _unparams(bytes.fromhex(raw), draft)[0x23] == fill
+
+
+@pytest.mark.parametrize("draft", [20, 22])
+@pytest.mark.parametrize("raw", [
+    "01" "23" "03" "01210102",
+    "01" "23" "02" "02" "0a05",
+], ids=["one-byte-short", "count-past-length"])
+def test_fill_length_shorter_than_its_count_is_a_protocol_violation(draft,
+                                                                    raw):
+    with pytest.raises(MOQTProtocolViolation):
+        _unparams(bytes.fromhex(raw), draft)
 
 
 @pytest.mark.parametrize("raw, fill", [
@@ -1303,7 +1329,7 @@ def test_d22_subscribe_with_bare_length_prefixed_fill_decodes():
 
 @pytest.mark.parametrize("raw, match", [
     ("01" "23" "02" "210101", "unknown message parameter|truncated|"
-     "overran|exceeds|exhausted"),
+     "overran|overruns|exceeds|exhausted"),
     ("01" "23" "02" "1001", "not allowed in FillParameters"),
     ("01" "23" "02" "7f01", "unknown message parameter"),
     ("01" "23" "03" "02" "0a05", "exhausted|unknown message parameter"),
@@ -1332,15 +1358,19 @@ def test_malformed_fill_parameters_is_a_protocol_violation(raw, match):
 
 
 @pytest.mark.parametrize("draft", [20, 22])
-@pytest.mark.parametrize("raw", ["0123" "01" "0301ff", "012304" "010301ff"],
+@pytest.mark.parametrize("raw, counted", [("0123" "01" "0301ff", True),
+                                          ("012304" "010301ff", False)],
                          ids=["counted", "length-prefixed"])
 def test_forbidden_fill_parameter_closes_before_its_value_is_decoded(
-        draft, raw):
+        draft, raw, counted):
     # AUTHORIZATION_TOKEN (0x03) with an undecodable value inside
     # FILL_PARAMETERS: the scope check (Table 7) comes first.
+    raw = bytes.fromhex(raw)
     with pytest.raises(MOQTProtocolViolation, match="not allowed in "
                        "FillParameters"):
-        _unparams(bytes.fromhex(raw), draft)
+        MOQTMessage._pull_params(Buffer(data=raw, vi64=True),
+                                 prof=_prof(draft), buf_end=len(raw),
+                                 fill_counted=counted)
 
 
 def test_namespace_prefix_parameter_d20_prefixed_d22_bare():
