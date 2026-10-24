@@ -7,6 +7,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p "$1"
 OUT="$(cd "$1" && pwd)"
+# A stale results.json from a reused OUT_DIR would read as this run's verdict.
+rm -f "$OUT/results.json"
 KEYS="${2:-aiomoqt-relay}"
 PUBS="${3:-rust,js-web}"
 SUBS="${4:-rust,js-web,js-bun}"
