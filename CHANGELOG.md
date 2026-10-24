@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.14.0
+
+- A publisher session answers SUBSCRIBE_TRACKS itself: a PUBLISH for each attached track under the prefix, and for each attached while it is open, filtered by TRACK_PROPERTY_FILTER; an application handler for the type still answers instead. PublishedTrack.publish() sends no second PUBLISH while one is bound on the session.
+
 ## v0.13.3
 
 - FETCH at d16 and d18: objects carry no Object Status and status objects are not sent. aiomoqt 0.13.2 and earlier send one, so a FETCH from such a publisher that includes a status object does not parse.

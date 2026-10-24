@@ -207,6 +207,7 @@ async def test_attached_tracks_share_one_namespace(draft, use_quic):
 def test_a_full_name_serves_one_track_per_session():
     session = object.__new__(_MOQTSessionMixin)
     session._published_tracks = {}
+    session._peer_requests = {}
     video = PublishedTrack(session, namespace=_NS, trackname="video")
     video.attach(session)
     video.attach(session)

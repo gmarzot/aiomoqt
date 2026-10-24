@@ -1016,6 +1016,13 @@ class PublishedTrack(Track):
                         f"peer, no PUBLISH")
             publish_track = False
 
+        if publish_track and sess._publishing(
+                sess._track_key(self.namespace, self.trackname)):
+            # One PUBLISH per track per session, here or from SUBSCRIBE_TRACKS.
+            logger.info(f"Track: {self.fqtn} already PUBLISHed on this "
+                        f"session")
+            publish_track = False
+
         if publish_track:
             pub_msg = sess.publish(
                 namespace=self.namespace,
