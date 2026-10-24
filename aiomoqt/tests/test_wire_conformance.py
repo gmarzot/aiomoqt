@@ -386,6 +386,36 @@ def test_fetch_object_with_trailing_status_does_not_parse(draft, raw):
         FetchObject.deserialize(rb, prior=first, prof=prof)
 
 
+# A whole-group FETCH of an evicted group: the End of Unknown Range
+# marker ends at Object ID 2^62-1, which both varint codecs carry.
+@pytest.mark.parametrize("draft, raw", [
+    (16, "410c" "02" "ffffffffffffffff"),
+    (18, "810c" "02" "ff3fffffffffffffff"),
+])
+def test_whole_group_unknown_range_marker_bytes(draft, raw):
+    from aiomoqt.delivery import ObjectHistory
+    from aiomoqt.messages.data import FETCH_FLAGS_END_UNKNOWN
+    prof = profile_for(draft)
+    h = ObjectHistory(4000)
+    for g in range(10):
+        for o in range(5):
+            h.add(g, o, b"x" * 100)
+    marker, = h.fetch((2, 0), (2, 1 << 62))
+    assert bytes(marker.serialize(prof=prof).data) == bytes.fromhex(raw)
+    got = FetchObject.deserialize(
+        Buffer(data=bytes.fromhex(raw), vi64=prof.vi64), prof=prof)
+    assert (got.end_of_range, got.group_id, got.object_id) == (
+        FETCH_FLAGS_END_UNKNOWN, 2, (1 << 62) - 1)
+
+
+def test_d16_object_id_past_the_varint_is_not_encoded():
+    from aiomoqt.messages.data import FETCH_FLAGS_END_UNKNOWN
+    with pytest.raises(ValueError, match="too large"):
+        FetchObject(group_id=2, object_id=1 << 62,
+                    end_of_range=FETCH_FLAGS_END_UNKNOWN).serialize(
+                        prof=profile_for(16))
+
+
 def test_d18_fetch_first_object_sg_prior_rejected():
     prof = profile_for(18)
     # flags GD|OD|PRI|SG=prior (0x1D): prior-Subgroup ref on first object.
