@@ -16,7 +16,7 @@ name: Contribution conformance
 
 on:
   push:
-    branches: [gmarzot-0.13.2]
+    branches: [gmarzot-0.13.3]
   pull_request:
     types: [labeled]
   workflow_dispatch:

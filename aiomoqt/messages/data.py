@@ -746,6 +746,11 @@ class FetchObject(MOQTMessage):
             buf.push_uint_var(self.object_id)
             return buf
 
+        if self.status != ObjectStatus.NORMAL:
+            raise ValueError(
+                "FetchObject: FETCH objects carry no Object Status at d16 "
+                "(§10.2.1.1)")
+
         # Default: emit fully-explicit object (no delta refs).
         # Subgroup mode = 0x03 (present), object/group/priority present;
         # a datagram carries no Subgroup ID.
@@ -767,13 +772,8 @@ class FetchObject(MOQTMessage):
             MOQTMessage._extensions_encode(buf, self.extensions,
                                            delta=True)
 
-        # Payload length and payload
-        if self.status == ObjectStatus.NORMAL and len(self.payload) > 0:
-            buf.push_uint_var(len(self.payload))
-            buf.push_bytes(self.payload)
-        else:
-            buf.push_uint_var(0)
-            buf.push_uint_var(self.status)
+        buf.push_uint_var(len(self.payload))
+        buf.push_bytes(self.payload)
         return buf
 
     @classmethod
@@ -798,9 +798,9 @@ class FetchObject(MOQTMessage):
                          prof: DraftProfile,
                          max_payload: int = 0) -> 'FetchObject':
         """d18 §11.4.4 delta decode. The buffer's varint codec is vi64
-        (set by the stream-type read). A zero Payload Length is followed
-        by an explicit Status varint where the profile says so (moxygen's
-        d18 reading); End-of-Range markers stand in for missing ranges."""
+        (set by the stream-type read). FETCH objects carry no Object
+        Status (§11.2.1.1); End-of-Range markers stand in for missing
+        ranges."""
         flags = buf.pull_vint()
         if flags in _end_of_range_flags(prof):
             group_id = buf.pull_vint()
@@ -994,15 +994,10 @@ class FetchObject(MOQTMessage):
         else:
             extensions = None
 
-        # Payload length and payload (with optional Status)
+        # No Object Status follows a zero Payload Length (§10.2.1.1).
         payload_len = buf.pull_uint_var()
         _check_payload_len(payload_len, max_payload)
-        if payload_len == 0:
-            status = ObjectStatus(buf.pull_uint_var())
-            payload = b''
-        else:
-            status = ObjectStatus.NORMAL
-            payload = buf.pull_bytes(payload_len)
+        payload = buf.pull_bytes(payload_len) if payload_len else b''
 
         return cls(
             group_id=group_id,
@@ -1010,7 +1005,7 @@ class FetchObject(MOQTMessage):
             object_id=object_id,
             publisher_priority=publisher_priority,
             extensions=extensions,
-            status=status,
+            status=ObjectStatus.NORMAL,
             payload=payload,
             datagram=bool(flags & FETCH_FLAG_DATAGRAM),
         )

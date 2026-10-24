@@ -673,6 +673,27 @@ async def test_a_d22_fetch_of_cached_groups_carries_no_object_status(
 
 
 @requires_certs
+@pytest.mark.parametrize("draft", [16, 18])
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+async def test_a_d16_d18_fetch_of_cached_groups_carries_no_object_status(
+        draft, use_quic):
+    # d16 §10.2.1.1, d18 §11.2.1.1: Object Status is absent in Objects
+    # delivered via a FETCH; the cached END_OF_GROUP objects are not sent.
+    layout = tuple((g, 0, (0,), 1) for g in range(3))
+    port = _CACHE_PORT + 6 + 2 * (draft == 18) + (not use_quic)
+    async with _cached(port, use_quic, draft,
+                       {"video": layout, "audio": layout}) as rx:
+        for name in ("video", "audio"):
+            _ok, got, fin = await _fetched(rx, name, start_group=0,
+                                           start_object=0, end_group=2,
+                                           end_object=2)
+            assert fin is True, name
+            assert got == [(g, 0, f"{name}-{g}-0".encode())
+                           for g in range(3)]
+        assert rx._close_err is None
+
+
+@requires_certs
 @pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
 async def test_a_d22_whole_group_fetch_reports_its_last_object(use_quic):
     # d22 §9.12: group 0 holds objects 0 and 2, no END_OF_GROUP; the whole

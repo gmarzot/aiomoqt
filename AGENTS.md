@@ -55,7 +55,7 @@ draft × transport matrix over localhost. `interop` = live relays from `tests/re
 `bench` = measurement only. `media-locmaf` is a manual suite (named with `--test-suite` only)
 against Eyevinn's public moqlivemock. `moqdev-smoke`, also manual, runs moq-dev's relay smoke
 (rust, js-web and js-bun clients) in Docker against `--moqdev-relays` (default
-`aiomoqt-relay`); run it on moqx-001. A run with no `--test-tier` or `--test-suite` selects
+`aiomoqt-relay`); run it on moq-test. A run with no `--test-tier` or `--test-suite` selects
 every tier, **including interop**. Exit is 1 iff some suite FAILed; SKIP and XFAIL (a failure on
 a non-gating relay or draft) do not gate.
 
