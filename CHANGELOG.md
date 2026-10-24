@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.14.0
+
+- SubscribedTrack discovery: a refused SUBSCRIBE_TRACKS raises its MOQTRequestError at once, and `subscribe(expected_trackname=...)` waits for that track's PUBLISH; moq_interop_client namespace-discovery uses both.
+
 ## v0.13.3
 
 - FETCH at d16 and d18: objects carry no Object Status and status objects are not sent. aiomoqt 0.13.2 and earlier send one, so a FETCH from such a publisher that includes a status object does not parse.
