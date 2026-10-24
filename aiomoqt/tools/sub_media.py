@@ -39,7 +39,6 @@ skew are built from differences and do not.
 import asyncio
 import csv
 import functools
-import logging
 import os
 import sys
 import time
@@ -57,7 +56,6 @@ from aiomoqt.media.sources import (
     IvfWriter, adts_frame, avcc_param_sets, lp_to_annexb,
 )
 from aiomoqt.utils import cli as _cli
-from aiomoqt.utils.logger import set_log_level
 from aiomoqt.utils.media_stats import (
     CSV_FIELDS, MediaAnalysis, csv_row, format_interval, format_summary,
     interval_header, wall_clock_us,
@@ -124,6 +122,7 @@ def parse_args():
     _cli.add_session(parser)
     _cli.add_keepalive(parser)
     _cli.add_timestamp_checking(parser)
+    _cli.add_logging(parser)
     _cli.add_help(parser)
     args = parser.parse_args()
     if args.analyze and args.pipe:
@@ -398,7 +397,7 @@ def _finish_analysis(analysis: MediaAnalysis, start_us: int, end_us: int,
 
 
 async def run(args):
-    set_log_level(logging.DEBUG if args.debug else logging.WARNING)
+    _cli.apply_logging(args)
     relay = parse_relay_url(args.url)
     if not args.analyze:
         os.makedirs(args.out, exist_ok=True)

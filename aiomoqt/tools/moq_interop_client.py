@@ -36,8 +36,7 @@ from aiomoqt.types import (
     FilterType, GroupOrder, MOQTDraft, ObjectStatus, parse_draft_spec,
     MOQT_DEFAULT_DRAFTS, D16MessageType,
 )
-from aiomoqt.utils.cli import add_help
-from aiomoqt.utils.logger import set_log_level
+from aiomoqt.utils.cli import add_help, add_logging, apply_logging
 
 try:
     from aiomoqt import __version__ as AIOMOQT_VERSION
@@ -1741,6 +1740,7 @@ def parse_args():
             "sent); some anonymous-scope relays reject any AUTH_TOKEN."
         ),
     )
+    add_logging(parser)
     add_help(parser)
     return parser.parse_args()
 
@@ -1846,8 +1846,7 @@ def main():
             args.draft = usable
 
     # Configure logging
-    log_level = logging.DEBUG if args.debug else logging.WARNING
-    set_log_level(log_level)
+    log_level = apply_logging(args)
     logging.basicConfig(level=log_level, stream=sys.stderr,
                         format="%(levelname)s %(name)s: %(message)s")
 

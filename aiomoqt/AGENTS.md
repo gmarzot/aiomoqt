@@ -42,6 +42,22 @@ A dialed URL's scheme selects the transport: `moqt://host:port/path` is raw QUIC
 `-W` (WebTransport), or both on one port. `moq-interop-client` follows the interop runner's
 flags instead. `-h` (also `-?`, `--help`) prints help on every tool.
 
+## Logging
+
+Levels: ERROR, WARNING, INFO (one line per session event and control message), DEBUG (second
+views, transport plumbing, per-stream lifecycle; bounded however many objects flow) and TRACE
+(`aiomoqt.utils.logger.TRACE`, 5: per object, per chunk, per datagram, wire hex). Category
+loggers, stable names: `aiomoqt.control`, `aiomoqt.data`, `aiomoqt.fetch`, `aiomoqt.transport`,
+`aiomoqt.relay`; other lines use module loggers (`aiomoqt.protocol`, ...). aiomoqt loggers do not
+propagate to the root logger: attach a handler with `aiomoqt.utils.logger.set_log_handler()`.
+
+Tools take `--log-level {error,warning,info,debug,trace}` (`-d` = `debug`) and `--log
+CAT=LEVEL[,...]`, e.g. `--log data=trace`. The `AIOMOQT_LOG` environment variable takes the same
+spec, plus a bare `LEVEL` for every logger (`AIOMOQT_LOG=debug,data=trace`); tool flags win. In
+code: `set_log_level(level)` and `set_logger_levels({"data": "trace"})`, or
+`configure_logging(level, spec)`. `moq-interop-relay` steps INFO → DEBUG → TRACE → INFO on
+SIGUSR1.
+
 ## Known traps
 
 - TLS: clients verify the relay's certificate by default. A self-signed relay needs `-k` /

@@ -41,7 +41,6 @@ from aiomoqt.utils.cli import endpoint_url
 from aiomoqt.utils.format import fmt_bps, fmt_ms, fmt_ms_signed
 from aiomoqt.utils.stats import (CLOCK_OFFSET_MARK, CLOCK_OFFSET_MIN_MS,
                                  note_clock_offset, send_time_us)
-from aiomoqt.utils.logger import set_log_level
 
 
 # ---------------------------------------------------------------------------
@@ -1628,6 +1627,7 @@ def parse_args():
                         "one stream's un-transmitted bytes exceed this. "
                         "Default: aiomoqt default (1 MiB). "
                         "Pass 0 to disable.")
+    _cli.add_logging(p)
     _cli.add_help(p)
     args = p.parse_args()
 
@@ -1802,7 +1802,7 @@ async def main():
               file=sys.stderr)
         return 2
 
-    set_log_level(__import__('logging').WARNING)
+    _cli.apply_logging(args)
 
     state = BenchState()
     stats = LiveStats(object_size=args.scenario.object_size,

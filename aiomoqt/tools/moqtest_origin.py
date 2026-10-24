@@ -40,8 +40,8 @@ from aiomoqt.types import (
 from aiomoqt.tools.moq_interop_relay import (
     _find_default_cert, _find_default_key,
 )
-from aiomoqt.utils.cli import add_help
-from aiomoqt.utils.logger import get_logger, set_log_level
+from aiomoqt.utils.cli import add_help, add_logging, apply_logging
+from aiomoqt.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -403,13 +403,14 @@ def parse_args():
                     help="both transports on one port")
     ap.add_argument("--draft", type=parse_draft_spec, default=None)
     ap.add_argument("--debug", action="store_true")
+    add_logging(ap)
     add_help(ap)
     return ap.parse_args()
 
 
 async def main():
     args = parse_args()
-    set_log_level(logging.DEBUG if args.debug else logging.INFO)
+    apply_logging(args, default=logging.INFO)
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                         format="%(asctime)s %(levelname)s %(message)s")
     cert = args.cert or _find_default_cert()

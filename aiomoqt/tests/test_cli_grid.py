@@ -332,3 +332,9 @@ def test_loopback_bench_insecure(monkeypatch, argv, insecure):
     args = loopback_bench.parse_args()
     assert args.insecure is insecure
     assert args.cert
+
+
+@pytest.mark.parametrize("tool", TOOLS)
+def test_every_tool_takes_the_logging_flags(tool):
+    flags = {o for a in _parser_actions(tool) for o in a.option_strings}
+    assert {"--log-level", "--log"} <= flags

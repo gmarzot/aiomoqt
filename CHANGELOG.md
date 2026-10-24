@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.14.0
+
+- Logging: a TRACE level below DEBUG holds per-object, per-chunk and wire-hex detail; category loggers `aiomoqt.control`, `.data`, `.fetch`, `.transport`, `.relay`; tools take `--log-level` and `--log CAT=LEVEL`, `AIOMOQT_LOG` the same spec; the relay's SIGUSR1 steps INFO, DEBUG, TRACE.
+
 ## v0.13.3
 
 - FETCH at d16 and d18: objects carry no Object Status and status objects are not sent. aiomoqt 0.13.2 and earlier send one, so a FETCH from such a publisher that includes a status object does not parse.
