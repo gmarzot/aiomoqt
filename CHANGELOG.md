@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.14.0
+
+- Data streams: an object spanning several chunks is parsed once its bytes have arrived, not again on every chunk.
+
 ## v0.13.2
 
 - pub_media: the `player:` line is printed only when `--player-base` or `AIOMOQT_PLAYER_URL` is set; the localhost default is gone.

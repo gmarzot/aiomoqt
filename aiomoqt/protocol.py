@@ -189,6 +189,9 @@ class _DataStreamState:
     publisher_priority: Optional[int] = None
     # Unparsed bytes counted in the session's _rx_held_bytes.
     held: int = 0
+    # Chain capacity a parse needs to progress: 1, or what the last
+    # underflow asked for (chain coordinates, until the next commit).
+    need: int = 1
 
 
 @dataclass(slots=True)
@@ -1705,7 +1708,7 @@ class _MOQTSessionMixin:
         if data and len(data) > 0:
             chain.extend(data)
 
-        if chain.capacity > 0:
+        if chain.capacity >= state.need:
             self._drain_stream(stream_id, state)
 
         # An empty chain with nothing counted leaves the count unchanged.
@@ -1747,11 +1750,13 @@ class _MOQTSessionMixin:
 
         Synchronous — runs inside the asyncio event-loop thread. The
         save/rollback/commit pattern survives across calls because the
-        chain is per-state. On underflow: chain.rollback() and return
-        (wait for more chunks). On stream-level reject: _reject_stream.
+        chain is per-state. On underflow: chain.rollback(), record in
+        state.need the capacity a reparse needs, and return. On
+        stream-level reject: _reject_stream.
         On session-fatal: _close_session.
         """
         chain = state.chain
+        state.need = 1
         while chain.capacity > 0:
             chain.save()
             try:
@@ -1762,8 +1767,9 @@ class _MOQTSessionMixin:
                 self._reject_stream(stream_id, e.error_code, e.reason,
                                     quiet=e.quiet)
                 return
-            except MOQTUnderflow:
+            except MOQTUnderflow as e:
                 chain.rollback()
+                state.need = e.needed
                 return
             except BufferReadError:
                 chain.rollback()
