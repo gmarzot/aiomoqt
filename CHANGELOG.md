@@ -76,6 +76,7 @@
 - pub_media `--timestamp-mapping`: TIMESCALE and TIMESTAMP_MAPPING Track Properties on a fixed-cadence track (the mp4's own timescale, the tone at 48 kHz) with OBJECT_TIMESTAMP only off schedule, explicit OBJECT_TIMESTAMP on live and irregular-GOP sources, and a capture-time prft on each CMAF/LOCMAF group start; LOC TIMESTAMP is unchanged.
 - pub_media: paced feeders share one start and wall clock.
 - Relay: the object cache keeps its 8 newest groups when group IDs skip; a timestamp-numbered catalog no longer loses its previous group, which reset fills the cache could serve.
+- Release regression: manual suite `moqdev-smoke` runs moq-dev's relay smoke against aiomoqt-relay in Docker.
 
 ## v0.13.1
 
