@@ -80,10 +80,12 @@ class BenchReporter:
 
     def finish(self):
         """Print the interval still open when the run ends, so a run of
-        -t N reports through second N."""
+        -t N reports through second N. A sliver under half an interval,
+        left when an object printed the last row just before the end, is
+        not a row of its own."""
         now = time.monotonic()
         if (self._header_printed and self.stats.total_objects
-                and now - self._last_report >= 0.1):
+                and now - self._last_report >= self.report_interval / 2):
             print(self.stats.interval_row(now))
             self._last_report = now
 
