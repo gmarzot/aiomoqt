@@ -25,7 +25,7 @@ installed package. Keep its API boundary and traps consistent with this file.
 | `aiomoqt/examples/` | minimal pub, sub, join and server examples; ship in the wheel |
 | `aiomoqt/versions.py` | `aiomoqt-versions`: aiomoqt, aiopquic, picoquic and picotls build info |
 | `aiomoqt/tests/` | the pytest tree, **inside** the package dir, left out of the wheel |
-| `tests/` | `release_regression_test.py` (tier runner) + `relays.json`; `contrib/` = contribution-runner sweep. No pytest files |
+| `tests/` | `release_regression_test.py` (tier runner) + `relays.json`; `contrib/` = contribution-runner sweep; `moqdev-smoke/` = moq-dev's relay smoke in Docker. No pytest files |
 | `deploy/aiomoqt-relay/` | compose, nginx and runbook for the public ersatz relay |
 | `docs/` | bench and demo runbooks |
 
@@ -53,12 +53,15 @@ one suite directly, `--skip-suite` drops one from a selected tier.
 `unit` = the whole pytest tree, one run. `integration` = tools, multi-process paths and the
 draft × transport matrix over localhost. `interop` = live relays from `tests/relays.json`.
 `bench` = measurement only. `media-locmaf` is a manual suite (named with `--test-suite` only)
-against Eyevinn's public moqlivemock. A run with no `--test-tier` or `--test-suite` selects
+against Eyevinn's public moqlivemock. `moqdev-smoke`, also manual, runs moq-dev's relay smoke
+(rust, js-web and js-bun clients) in Docker against `--moqdev-relays` (default
+`aiomoqt-relay`); run it on moqx-001. A run with no `--test-tier` or `--test-suite` selects
 every tier, **including interop**. Exit is 1 iff some suite FAILed; SKIP and XFAIL (a failure on
 a non-gating relay or draft) do not gate.
 
-Network rule: the interop tier, a bare runner run, `relay_probe`, `moq_interop_client` and
-`media-locmaf` reach public infrastructure. Run them from CI or a remote host, not a laptop.
+Network rule: the interop tier, a bare runner run, `relay_probe`, `moq_interop_client`,
+`media-locmaf` and `moqdev-smoke` reach public infrastructure. Run them from CI or a remote
+host, not a laptop.
 
 Plain pytest works too (`pytest.ini`: `testpaths = aiomoqt/tests`, `asyncio_mode=auto`):
 

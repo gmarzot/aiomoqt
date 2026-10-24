@@ -21,6 +21,9 @@ Usage, from the repo root:
     # LOCMAF from Eyevinn's public moqlivemock (manual only)
     tests/release_regression_test.py --test-suite media-locmaf
 
+    # moq-dev's relay smoke against aiomoqt-relay, in Docker (manual only)
+    tests/release_regression_test.py --test-suite moqdev-smoke
+
 Exit 1 iff a suite fails; SKIP and XFAIL don't gate.
 """
 from __future__ import annotations
@@ -80,7 +83,7 @@ TIERS = {
     "bench":       ["loopback-adaptive-bench"],
 }
 # Run only when named with --test-suite: no tier and no bare run selects them.
-MANUAL_SUITES = ["media-locmaf"]
+MANUAL_SUITES = ["media-locmaf", "moqdev-smoke"]
 TIER_CHOICES = tuple(TIERS.keys())
 SUITE_CHOICES = (tuple(s for suites in TIERS.values() for s in suites)
                  + tuple(MANUAL_SUITES))
@@ -487,6 +490,50 @@ def _media_locmaf(url: str, namespace: str, log: Path) -> tuple[str, str]:
     return "PASS", f"{len(tracks)} tracks, {frames} frames, 0 rejected"
 
 
+# moqdev-smoke: moq-dev's relay smoke (moq-dev/moq test/smoke) against
+# moq-interop-runner registry keys, in Docker. Public infrastructure: manual only.
+MOQDEV_SMOKE = Path(__file__).parent / "moqdev-smoke" / "run.sh"
+
+
+def _moqdev_smoke_results(keys: str,
+                          results_json: Path) -> list[tuple[str, str, str]]:
+    """(status, label, detail) per endpoint of each key. An endpoint passes iff
+    the harness marked it ok and every cell passed or was skipped; a key with
+    no endpoint is a FAIL."""
+    try:
+        endpoints = json.loads(results_json.read_text())["endpoints"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return [("FAIL", f"moqdev-smoke {keys}", "(no results.json)")]
+    out = []
+    for key in keys.split(","):
+        mine = [e for e in endpoints if e.get("key") == key]
+        if not mine:
+            out.append(("FAIL", f"moqdev-smoke {key}", "(no endpoint in results)"))
+        for e in mine:
+            cells = e.get("cells") or {}
+            passed = sum(1 for c in cells.values() if c.get("status") == "PASS")
+            bad = [f"{pair}: {c.get('status')} {c.get('reason', '')}".rstrip()
+                   for pair, c in cells.items()
+                   if c.get("status") not in ("PASS", "SKIP")]
+            label = f"moqdev-smoke {key} {e.get('transport')}"
+            if e.get("ok") and passed and not bad:
+                versions = ", ".join(e.get("versions") or [])
+                out.append(("PASS", label,
+                            f"{passed}/{len(cells)} cells {versions}".rstrip()))
+            else:
+                out.append(("FAIL", label,
+                            "; ".join(bad) or f"(matrix incomplete: {passed} passed)"))
+    return out
+
+
+def _moqdev_smoke(keys: str, out: Path,
+                  log: Path) -> list[tuple[str, str, str]]:
+    # 2400 s covers the first run's image build (~2.6 GB).
+    if _run_rc(["bash", str(MOQDEV_SMOKE), str(out), keys], log, 2400) is None:
+        return [("FAIL", f"moqdev-smoke {keys}", "timeout")]
+    return _moqdev_smoke_results(keys, out / "results.json")
+
+
 # ---------------------------------------------------------------------------
 # Bench-tier runners
 # ---------------------------------------------------------------------------
@@ -671,6 +718,9 @@ def main() -> int:
     ap.add_argument("--interop-parallel", type=int, default=4,
                     metavar="N", help="relays to run concurrently in the "
                                       "interop tier (default: 4)")
+    ap.add_argument("--moqdev-relays", default="aiomoqt-relay", metavar="KEYS",
+                    help="comma-separated moq-interop-runner registry keys "
+                         "for moqdev-smoke (default: aiomoqt-relay)")
     args = ap.parse_args()
 
     if args.test_tiers or args.test_suites:
@@ -798,6 +848,12 @@ def main() -> int:
                 status, detail = _media_locmaf(url, ns, log)
                 record_and_print((status, f"media-locmaf {transport} {ns}",
                                   detail, log))
+    if "moqdev-smoke" in enabled:
+        print("\n== moqdev-smoke (moq-dev relay smoke) ==")
+        log = log_dir / "moqdev-smoke.log"
+        for status, label, detail in _moqdev_smoke(
+                args.moqdev_relays, log_dir / "moqdev-smoke", log):
+            record_and_print((status, label, detail, log))
 
     # --- bench tier ---
     if enabled & set(TIERS["bench"]):
