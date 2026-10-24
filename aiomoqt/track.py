@@ -27,15 +27,16 @@ Usage:
 import asyncio
 import time
 from enum import IntEnum
-from typing import Callable, Dict, Optional, Union
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 from .types import (
-    FetchType, MOQTRequestError, ParamType, FilterType,
+    FetchType, MOQTRequestError, MOQTStreamStopped, ParamType, FilterType,
     ForwardingPreference, GroupOrder, LOC_TIMESTAMP, ObjectStatus,
     RequestErrorCode, StreamResetCode, SubscribeDoneCode,
 )
 from .delivery import (
-    FanoutDelivery, ObjectHistory, StreamMapping, SubgroupDelivery,
+    DatagramTooLarge, FanoutDelivery, ObjectHistory, StreamMapping,
+    SubgroupDelivery,
 )
 from .messages import (
     FetchHeader, LocationFilter, MOQTMessage, ObjectDatagram, PublishOk,
@@ -48,9 +49,12 @@ from .messages.params import (
 )
 from .context import is_draft16_or_later
 from .messages.fetch import _is_joining
-from .utils.buffer import Buffer
+from .utils.buffer import Buffer, BufferReadError
 from .utils.format import fmt_bps, fmt_rate
 from .utils.logger import get_logger
+from .utils.timing import (
+    TimestampMalformed, TimestampWriter, TrackTiming, check_object,
+)
 
 logger = get_logger(__name__)
 
@@ -69,15 +73,15 @@ def _largest_object_param(session, largest: tuple) -> dict:
     return {ParamType.LARGEST_OBJECT: buf.data_slice(0, buf.tell())}
 
 
-def _checked_immutable(props) -> Optional[Dict[int, Union[int, bytes]]]:
-    """Immutable Properties as given, refused when they could not be sent
-    as Key-Value-Pairs or would nest Immutable Properties (§12.7)."""
+def _checked_immutable(props, what: str = "Immutable Properties"
+                       ) -> Optional[Dict[int, Union[int, bytes]]]:
+    """Track Properties as given, refused when they could not be sent as
+    Key-Value-Pairs or would carry Immutable Properties (§12.7)."""
     if not props:
         return None
     props = dict(props)
     if MOQTMessage.IMMUTABLE_PROPERTIES in props:
-        raise ValueError("Immutable Properties cannot contain Immutable "
-                         "Properties")
+        raise ValueError(f"{what} cannot contain Immutable Properties")
     for ptype, value in props.items():
         if ptype % 2 == 0:
             if not isinstance(value, int):
@@ -95,6 +99,42 @@ def _checked_immutable(props) -> Optional[Dict[int, Union[int, bytes]]]:
     except Exception as e:
         raise ValueError(str(e)) from None
     return props
+
+
+def _reply_properties(msg) -> Optional[Dict[int, Any]]:
+    """Track Properties of a SUBSCRIBE_OK, PUBLISH, FETCH_OK or REQUEST_OK."""
+    props = getattr(msg, 'track_extensions', None)
+    if props is None:
+        props = getattr(msg, 'track_properties', None)
+    return props
+
+
+def merge_track_properties(props: Optional[Dict[int, Any]], vi64: bool
+                           ) -> Tuple[Dict[int, Any],
+                                      Optional[Dict[int, Any]], frozenset]:
+    """(merged view, Immutable Properties, types seen more than once) of
+    received Track Properties. The merged view unwraps Immutable
+    Properties (0x0B) beside the top-level ones."""
+    if not props:
+        return {}, None, frozenset()
+    merged = dict(props)
+    dups = set(getattr(props, 'duplicates', ()))
+    raw = merged.pop(MOQTMessage.IMMUTABLE_PROPERTIES, None)
+    if raw is None:
+        return merged, None, frozenset(dups)
+    raw = bytes(raw)
+    try:
+        inner = MOQTMessage._extensions_decode(
+            Buffer(data=raw, vi64=vi64), with_length=False,
+            buf_end=len(raw), delta=True, lenient=False) or {}
+    except (BufferReadError, RuntimeError, ValueError):
+        # Unreachable for a reply the codec accepted (§12.7 check).
+        return merged, None, frozenset(dups)
+    dups.update(getattr(inner, 'duplicates', ()))
+    dups.update(merged.keys() & inner.keys())
+    for ptype, value in inner.items():
+        merged.setdefault(ptype, value)
+    return merged, dict(inner), frozenset(dups)
 
 
 class TrackState(IntEnum):
@@ -236,10 +276,16 @@ class _SubgroupSender:
         self.priority = priority
         self.header = None
         self.stream_id = None
+        # The peer stopped this group's stream (§11.3.2: not reopened).
+        self.stopped = False
+        # The open stream lacks objects of the window: reset, not FIN.
+        self.short = False
 
     def new_group(self, group_id: int) -> None:
         """End the open stream; the next object starts `group_id`."""
         self.end_stream()
+        self.stopped = False
+        self.short = False
         self.header = self.session.subgroup_header(
             track_alias=self.track_alias,
             group_id=group_id,
@@ -250,6 +296,9 @@ class _SubgroupSender:
 
     def end_stream(self) -> None:
         if self.stream_id is None:
+            return
+        if self.short:
+            self.reset()
             return
         if self.subgroup_id == 0 and not self.sub.excludes_end(
                 self.header.group_id, self.track.group_size):
@@ -277,26 +326,68 @@ class _SubgroupSender:
         """Write one object; bytes written, 0 when the window excludes
         it."""
         sub = self.sub
-        if not (sub.forward and sub.window is _UNFILTERED) and not sub.passes(
+        if self.stopped or not (
+                sub.forward and sub.window is _UNFILTERED) and not sub.passes(
                 self.header.group_id, object_id):
             return 0
         session = self.session
-        if self.stream_id is None:
-            self.stream_id = await session.open_uni_stream()
-            self.track._stream_count += 1
-            self.track._stream_opened(self.sub)
-            self.sub.senders.add(self)
-            self.header.first_object = object_id == self.subgroup_id
+        try:
+            if self.stream_id is None:
+                self.stream_id = await session.open_uni_stream()
+                self.track._stream_count += 1
+                self.track._stream_opened(self.sub)
+                self.sub.senders.add(self)
+                self.header.first_object = object_id == self.subgroup_id
+                if session._close_err is not None:
+                    raise asyncio.CancelledError
+                await session.stream_write_drain(
+                    self.stream_id, self.header.serialize().data)
+                await self._send_head(object_id)
+            data = self.header.next_object_bytes(
+                payload, extensions, ObjectStatus.NORMAL, object_id)
             if session._close_err is not None:
                 raise asyncio.CancelledError
-            await session.stream_write_drain(
-                self.stream_id, self.header.serialize().data)
-        data = self.header.next_object_bytes(
-            payload, extensions, ObjectStatus.NORMAL, object_id)
-        if session._close_err is not None:
-            raise asyncio.CancelledError
-        await session.stream_write_drain(self.stream_id, data)
+            await session.stream_write_drain(self.stream_id, data)
+        except MOQTStreamStopped:
+            self.stop()
+            return 0
         return len(data)
+
+    async def _send_head(self, object_id: int) -> None:
+        """A stream opening past the first object the window admits in
+        its group (resumed mid-group) first carries the earlier objects
+        from the history; lacking any, it is marked short (§11.3.2)."""
+        group_id = self.header.group_id
+        step = self.track.num_subgroups
+        first = max(self.sub.window[0], (group_id, 0))[1]
+        first += (self.subgroup_id - first) % step
+        missing = range(first, object_id, step)
+        if not missing:
+            return
+        history = self.track._history
+        held = {} if history is None else history._held(
+            (group_id, first), (group_id, object_id - 1))
+        recs = [held.get((group_id, oid)) for oid in missing]
+        if any(r is None or (r[2] or 0) != self.subgroup_id for r in recs):
+            self.short = True
+            return
+        session = self.session
+        for _, oid, _, payload, exts, _ in recs:
+            if callable(exts):
+                exts = exts(session)
+            await session.stream_write_drain(
+                self.stream_id, self.header.next_object_bytes(
+                    payload, exts, ObjectStatus.NORMAL, oid))
+
+    def stop(self) -> None:
+        """The peer stopped the stream, which the session has reset: skip
+        the rest of the group."""
+        self.stopped = True
+        if self.stream_id is None:
+            return
+        self.stream_id = None
+        self.sub.senders.discard(self)
+        self.track._stream_closed(self.sub)
 
     def reset(self) -> None:
         """Abandon the open stream: a RESET tells the subscriber it
@@ -338,7 +429,7 @@ class _Subscription:
                  'done', 'stream_count', 'generating', 'delivery', 'joining',
                  'window', 'open_streams', 'end_status', 'senders',
                  'fill_streams', 'fills', 'location_filter', 'group_order',
-                 'object_timeout', 'subgroup_timeout')
+                 'object_timeout', 'subgroup_timeout', 'updated_request')
 
     def __init__(self, session):
         self.session = session
@@ -379,6 +470,8 @@ class _Subscription:
         # 0 sets none. d14/d16 DELIVERY_TIMEOUT is the object timeout.
         self.object_timeout = 0
         self.subgroup_timeout = 0
+        # Request whose Forward State a REQUEST_UPDATE has set.
+        self.updated_request = None
 
     def take_timeouts(self, params, prof) -> None:
         """Record the delivery timeouts a SUBSCRIBE, PUBLISH_OK or
@@ -439,10 +532,16 @@ class PublishedTrack(Track):
     `track_alias`, `forward`, `state` and the rest address the first
     peer, which is the only one most tracks have.
 
-    `immutable_properties` ({type: int for even types, bytes for odd})
-    travel as the Track's Immutable Properties (0x0B) in PUBLISH,
-    SUBSCRIBE_OK and FETCH_OK from d16, and in the TRACK_STATUS reply from
-    d18; d14 carries no Track Properties.
+    `track_properties` and `immutable_properties` ({type: int for even
+    types, bytes for odd}) travel as the Track's Properties, the latter
+    inside Immutable Properties (0x0B), in PUBLISH, SUBSCRIBE_OK and
+    FETCH_OK from d16, and in the TRACK_STATUS reply from d18; d14
+    carries no Track Properties. A type may appear in only one of them.
+
+    `timestamps` sets the generated objects' timing properties: 'loc'
+    (LOC TIMESTAMP 0x10, the default), 'frindell'
+    (draft-frindell-moq-timestamp-00, see utils.timing.TimestampWriter)
+    or 'both'. produce() tracks stamp their own objects.
     """
 
     # Stream mapping for produce() tracks.
@@ -470,7 +569,10 @@ class PublishedTrack(Track):
                      ForwardingPreference.SUBGROUP,
                  fetch_history_bytes: int = FETCH_HISTORY_DEFAULT,
                  immutable_properties: Optional[
-                     Dict[int, Union[int, bytes]]] = None):
+                     Dict[int, Union[int, bytes]]] = None,
+                 track_properties: Optional[
+                     Dict[int, Union[int, bytes]]] = None,
+                 timestamps: str = 'loc'):
         # Before super(): Track.__init__ assigns track_alias/request_id/
         # state, which are properties over this list.
         self._subs = [_Subscription(session)]
@@ -484,6 +586,19 @@ class PublishedTrack(Track):
         self.stream_priority = None
         self.auth_token = auth_token
         self.immutable_properties = _checked_immutable(immutable_properties)
+        self.track_properties = _checked_immutable(track_properties,
+                                                   "Track Properties")
+        if timestamps not in ('loc', 'frindell', 'both'):
+            raise ValueError(f"timestamps {timestamps!r}")
+        self.timestamps = timestamps
+        # Anchored on first use: the first reply or production start.
+        self._ts_writer: Optional[TimestampWriter] = None
+        both = set(self.track_properties or ()) & set(
+            self.immutable_properties or ())
+        if both:
+            raise ValueError(
+                "properties in both Track Properties and Immutable "
+                "Properties: " + ", ".join(f"0x{t:x}" for t in sorted(both)))
         self._subscriber_event = asyncio.Event()
         # (group_id, object_id) max over all objects sent; None until
         # the first object exists. Drives ContentExists/Largest Location
@@ -499,6 +614,8 @@ class PublishedTrack(Track):
         # produce() tracks: the shared delivery and the one production run.
         self._out: Optional[FanoutDelivery] = None
         self._production: Optional[asyncio.Future] = None
+        # The error that ended production, if one did.
+        self.error: Optional[Exception] = None
         # Aggregate stats across all subgroup streams; subgroup 0 reports.
         self._iv_objects = 0
         self._iv_bytes = 0
@@ -584,6 +701,7 @@ class PublishedTrack(Track):
         boundary."""
         if self._out is None:
             self._out = FanoutDelivery()
+            self._out.name = self.fqtn
             self._out.on_write = self._on_produced
             self._out.on_sent = self._on_sent
         self._out.drop_session(sub.session)
@@ -596,6 +714,15 @@ class PublishedTrack(Track):
         self._out.add(sub.delivery,
                       gate=lambda: sub.forward and sub.generating,
                       deadline=lambda: self._delivery_deadline(sub))
+
+    def _lane_stopped(self, sub) -> bool:
+        """True when production runs but this peer's lane task has ended."""
+        if (self._out is None or sub.delivery is None
+                or self._production is None or self._production.done()):
+            return False
+        lane = next((ln for ln in self._out.lanes
+                     if ln.delivery is sub.delivery), None)
+        return lane is None or lane.task.done()
 
     # Track Property delivery timeouts in ms (§8, §12.1-12.2); 0 sets none.
     object_delivery_timeout: int = 0
@@ -619,19 +746,27 @@ class PublishedTrack(Track):
 
     async def _run_production(self) -> None:
         """Run produce() once, flush every peer, then send each peer that
-        was served its PUBLISH_DONE."""
+        was served its PUBLISH_DONE. A datagram over the path limit ends
+        the track: PUBLISH_DONE INTERNAL_ERROR, the error kept in
+        `error`."""
         out = self._out
+        status, reason = SubscribeDoneCode.TRACK_ENDED, None
         try:
             await self.produce(out)
         except asyncio.CancelledError:
             out.abort()
             raise
+        except DatagramTooLarge as e:
+            out.abort()
+            self.error = e
+            status, reason = SubscribeDoneCode.INTERNAL_ERROR, str(e)
         else:
             await out.close()
         finally:
             for sub in list(self._subs):
-                if sub.delivery is not None:
-                    self._send_publish_done(sub.session)
+                if sub.delivery is not None and not sub.done:
+                    self._send_publish_done(sub.session, status,
+                                            reason=reason)
 
     @property
     def track_alias(self) -> int:
@@ -768,14 +903,51 @@ class PublishedTrack(Track):
 
     def _track_properties(self, session) -> Optional[Dict[int, bytes]]:
         """The Track Properties this track's replies carry on `session`."""
-        if not (self.immutable_properties
-                and session._profile.track_properties):
+        if not session._profile.track_properties:
             return None
-        buf = Buffer(capacity=BUF_SIZE, vi64=session._profile.vi64)
-        MOQTMessage._extensions_encode(buf, self.immutable_properties,
-                                       with_length=False, delta=True)
-        return {MOQTMessage.IMMUTABLE_PROPERTIES:
-                buf.data_slice(0, buf.tell())}
+        props = dict(self.track_properties or ())
+        props.update(self._timing_properties(session._profile.vi64))
+        if self.immutable_properties:
+            buf = Buffer(capacity=BUF_SIZE, vi64=session._profile.vi64)
+            MOQTMessage._extensions_encode(buf, self.immutable_properties,
+                                           with_length=False, delta=True)
+            props[MOQTMessage.IMMUTABLE_PROPERTIES] = buf.data_slice(
+                0, buf.tell())
+        return props or None
+
+    def _timing_properties(self, vi64: bool) -> Dict[int, Any]:
+        """Track Properties of the generated objects' timestamps."""
+        if self.timestamps == 'loc':
+            return {}
+        return self._timestamp_writer().track_properties(vi64)
+
+    def _timestamp_writer(self) -> TimestampWriter:
+        w = self._ts_writer
+        if w is None:
+            first = 0 if self._largest is None else self._largest[0] + 1
+            w = self._ts_writer = TimestampWriter(
+                self.timestamps, self.rate, self.group_size, first,
+                int(time.time() * 1_000_000))
+        return w
+
+    def _stamper(self, session) -> Optional[Callable]:
+        """Per-object properties for generated objects; None stamps LOC
+        TIMESTAMP inline, as on d14, which carries no Track Properties."""
+        if (self.timestamps == 'loc'
+                or not session._profile.track_properties):
+            return None
+        return self._timestamp_writer().stamp
+
+    async def _await_schedule(self, group_id: int, object_id: int) -> None:
+        """Hold a paced frindell producer until its first object is due,
+        so on-schedule objects carry no correction."""
+        if self.timestamps == 'loc' or self.rate <= 0:
+            return
+        due = self._timestamp_writer().scheduled_us(group_id, object_id)
+        if due is not None:
+            lead = due / 1e6 - time.time()
+            if lead > 0:
+                await asyncio.sleep(lead)
 
     def attach(self, session=None) -> None:
         """Serve this track on a session without announcing it:
@@ -916,6 +1088,11 @@ class PublishedTrack(Track):
             logger.info(f"Track: {trigger} after PUBLISH_DONE — ignored")
             return
         if sub.generating:
+            if self._lane_stopped(sub):
+                logger.warning(f"Track: {self.fqtn} alias={sub.track_alias} "
+                               f"lane had stopped; replaced on {trigger}")
+                self._add_delivery(sub)
+                return
             logger.info(f"Track: ignoring duplicate {trigger}")
             return
         logger.info(f"Track: subscriber arrived via {trigger}, "
@@ -991,6 +1168,10 @@ class PublishedTrack(Track):
         # FORWARD and the PUBLISH's own value stands.
         if forward is None and not sub.session._profile.publish_ok_expires_only:
             forward = 1
+        # A REQUEST_UPDATE read with the reply runs first (this task
+        # resumes a hop later) and is the newer Forward State.
+        if sub.updated_request == request_id:
+            forward = None
         logger.info(f"Track: PUBLISH_OK (REQUEST_OK): forward={forward}")
         sub.take_timeouts(getattr(reply, 'parameters', None),
                           sub.session._profile)
@@ -1031,6 +1212,8 @@ class PublishedTrack(Track):
             self._cut_streams(sub)
         if forward and not sub.forward:
             sub.joining[msg.existing_request_id] = self._largest
+        if forward is not None:
+            sub.updated_request = msg.existing_request_id
         # §10.9: exactly one REQUEST_OK or REQUEST_ERROR; LARGEST_OBJECT
         # once objects exist (§10.2.11).
         largest = self._largest
@@ -1354,7 +1537,8 @@ class PublishedTrack(Track):
         sub.subscribers.clear()
 
     def _send_publish_done(self, session, status_code=0x2,
-                           final: bool = True):
+                           final: bool = True,
+                           reason: Optional[str] = None):
         """Send PUBLISH_DONE with stream count for clean shutdown.
         `final` False ends only the subscription: the track stays open
         to a later one.
@@ -1388,7 +1572,8 @@ class PublishedTrack(Track):
             request_id=req_id,
             status_code=status_code,
             stream_count=count,
-            reason="track ended" if final else "subscription ended",
+            reason=reason or ("track ended" if final
+                              else "subscription ended"),
         )
         logger.info(f"Track: PUBLISH_DONE request_id={req_id} "
                     f"streams={count}")
@@ -1450,6 +1635,13 @@ class PublishedTrack(Track):
         self._withdraw_namespace(session)
         session._close_session()
 
+    def _producer_done(self, task) -> None:
+        # Retrieve the exception: a write racing the session close raises.
+        self._tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            logger.debug(f"Track: {self.fqtn} producer ended: "
+                         f"{task.exception()!r}")
+
     def _spawn_producers(self, session, track_alias: int,
                          pad: bytes) -> None:
         """Start one producer task per subgroup, or a single task for
@@ -1457,12 +1649,15 @@ class PublishedTrack(Track):
         idle period restarts production on the same track, numbering on
         from the Largest group so no Location is published twice."""
         first_group = 0 if self._largest is None else self._largest[0] + 1
+        if self.timestamps != 'loc':
+            first_group = self._timestamp_writer().next_group(
+                int(time.time() * 1_000_000), first_group)
         if self.forwarding == ForwardingPreference.DATAGRAM:
             task = asyncio.create_task(
                 self._generate_datagrams(
                     session=session, track_alias=track_alias, pad=pad,
                     first_group=first_group))
-            task.add_done_callback(lambda t: self._tasks.discard(t))
+            task.add_done_callback(self._producer_done)
             self._tasks.add(task)
             return
 
@@ -1485,7 +1680,7 @@ class PublishedTrack(Track):
                     barrier=barrier,
                 )
             )
-            task.add_done_callback(lambda t: self._tasks.discard(t))
+            task.add_done_callback(self._producer_done)
             self._tasks.add(task)
 
     async def _generate_datagrams(self, session, track_alias: int,
@@ -1504,8 +1699,11 @@ class PublishedTrack(Track):
         prof = session._profile
         report = not getattr(self, '_quiet', False)
         sub = self._sub_for(session)
+        stamp = self._stamper(session)
 
         try:
+            await self._await_schedule(first_group, 0)
+            next_frame_time = time.monotonic()
             while True:
                 if cur_obj_id >= self.group_size:
                     group_id += 1
@@ -1521,8 +1719,9 @@ class PublishedTrack(Track):
                     group_id=group_id,
                     object_id=cur_obj_id,
                     publisher_priority=self.priority,
-                    extensions={
-                        LOC_TIMESTAMP: int(time.time() * 1_000_000)},
+                    extensions=(
+                        {LOC_TIMESTAMP: int(time.time() * 1_000_000)}
+                        if stamp is None else stamp(group_id, cur_obj_id)),
                     payload=payload,
                     end_of_group=(cur_obj_id == self.group_size - 1),
                 )
@@ -1612,10 +1811,13 @@ class PublishedTrack(Track):
         sub = self._sub_for(session)
         sender = _SubgroupSender(self, session, sub, track_alias,
                                  subgroup_id, priority)
+        stamp = self._stamper(session)
 
         local_sent = 0
 
         try:
+            await self._await_schedule(first_group, subgroup_id)
+            next_frame_time = time.monotonic()
             while True:
                 if sender.header is None or cur_obj_id >= self.group_size:
                     if barrier is not None and group_id >= first_group:
@@ -1636,7 +1838,9 @@ class PublishedTrack(Track):
                 seq_info = f"{group_id}.{cur_obj_id}".encode()
                 payload = (seq_info + b'|' + pad)[:self.object_size]
 
-                extensions = {LOC_TIMESTAMP: int(time.time() * 1_000_000)}
+                extensions = (
+                    {LOC_TIMESTAMP: int(time.time() * 1_000_000)}
+                    if stamp is None else stamp(group_id, cur_obj_id))
                 self._remember(group_id, cur_obj_id, payload, subgroup_id,
                                extensions)
                 data = sender.encode_open(cur_obj_id, payload, extensions)
@@ -1646,8 +1850,13 @@ class PublishedTrack(Track):
                 else:
                     if session._close_err is not None:
                         raise asyncio.CancelledError
-                    await session.stream_write_drain(sender.stream_id, data)
-                    obj_bytes = len(data)
+                    try:
+                        await session.stream_write_drain(sender.stream_id,
+                                                         data)
+                        obj_bytes = len(data)
+                    except MOQTStreamStopped:
+                        sender.stop()
+                        obj_bytes = 0
                 cur_obj_id += self.num_subgroups
                 if obj_bytes:
                     local_sent += 1
@@ -1753,15 +1962,26 @@ class SubscribedTrack(Track):
 
     Handles namespace subscription, track discovery via PUBLISH messages,
     and data reception.
+
+    Timing properties (draft-frindell-moq-timestamp-00) that break its
+    rules make the track malformed: with `timestamp_errors='cancel'`
+    (default) the subscription is cancelled (MOQT §12.1) and `malformed`
+    says why; 'report' delivers everything and leaves the judgement to
+    the consumer (`timing_error`, utils.timing).
     """
 
     def __init__(self, session, namespace: str, trackname: str = None,
                  on_object: Optional[Callable] = None,
                  report_interval: float = 5.0,
                  auth_token: Optional[bytes] = None,
-                 on_done: Optional[Callable] = None):
+                 on_done: Optional[Callable] = None,
+                 timestamp_errors: str = 'cancel'):
+        if timestamp_errors not in ('cancel', 'report'):
+            raise ValueError(f"timestamp_errors {timestamp_errors!r}")
         super().__init__(session, namespace, trackname)
         self.on_object = on_object
+        self.timestamp_errors = timestamp_errors
+        self.malformed: Optional[str] = None
         # Called with the PUBLISH_DONE that ends this subscription.
         self.on_done = on_done
         self.report_interval = report_interval
@@ -1771,7 +1991,97 @@ class SubscribedTrack(Track):
         # Largest Location the publisher reported in SUBSCRIBE_OK or
         # PUBLISH, as (group, object); None when it reported none.
         self.largest: Optional[tuple] = None
+        # Track Properties as received; see take_track_properties().
+        self.track_properties: Optional[Dict[int, Any]] = None
+        self.immutable_properties: Optional[Dict[int, Any]] = None
+        self.properties: Dict[int, Any] = {}
+        self.property_duplicates: frozenset = frozenset()
+        # Timing context from the Track Properties, updated in place so a
+        # holder (TrackStats.timing) follows it; timing_error says why
+        # the timing properties make the track malformed.
+        self.timing = TrackTiming()
+        self.timing_error: Optional[str] = None
         self._done_event = asyncio.Event()
+
+    def take_track_properties(self, msg) -> None:
+        """Keep the Track Properties of a SUBSCRIBE_OK, PUBLISH or
+        FETCH_OK for this track: `track_properties` as received,
+        `immutable_properties` decoded from 0x0B, `properties` both
+        merged, `property_duplicates` the types seen more than once."""
+        props = _reply_properties(msg)
+        merged, immutable, dups = merge_track_properties(
+            props, self.session._profile.vi64)
+        self.track_properties = dict(props) if props else None
+        self.immutable_properties = immutable
+        self.properties = merged
+        self.property_duplicates = dups
+        try:
+            self.timing.assign(TrackTiming.from_properties(
+                merged, self.session._profile.vi64, dups))
+            self.timing_error = None
+        except TimestampMalformed as e:
+            self.timing.assign(TrackTiming())
+            self.timing_error = str(e)
+        # Objects can reach the check before subscribe() resumes.
+        alias = getattr(msg, 'track_alias', None)
+        if alias is not None:
+            self.track_alias = alias
+        self._route_timing_checks(msg)
+
+    def _checks_every_object(self) -> bool:
+        return (self.timestamp_errors == 'cancel'
+                and (self.timing.timescale is not None
+                     or self.timing_error is not None))
+
+    def _route_timing_checks(self, msg) -> None:
+        """Cancel mode: a track with timing properties has every object
+        checked; one without has only objects carrying a timing property
+        routed to the check, by the session (_timing_watch)."""
+        if self.timestamp_errors != 'cancel' or self.on_object is None:
+            return
+        alias = getattr(msg, 'track_alias', None)
+        if self._checks_every_object():
+            # A SUBSCRIBE_OK arrives before its handler is bound.
+            pending = getattr(self.session, '_pending_object_handlers', {})
+            if pending.get(getattr(msg, 'request_id', None)) is not None:
+                pending[msg.request_id] = self._checked_object
+        elif alias is not None:
+            self.session._timing_watch[alias] = self._checked_object
+
+    def _handler(self) -> Optional[Callable]:
+        """The object handler to register: on_object itself, or behind
+        the timing check on a track whose timing properties it checks."""
+        if self.on_object is None or not self._checks_every_object():
+            return self.on_object
+        return self._checked_object
+
+    def _checked_object(self, msg, *args) -> None:
+        if self.malformed is not None:
+            return
+        if self.timing_error is not None:
+            return          # cancelled once subscribe() has the alias
+        timing = self.timing
+        gid = getattr(msg, 'group_id', None)
+        try:
+            if timing.timescale is not None:
+                timing.timestamp(args[2] if gid is None else gid,
+                                 msg.object_id, msg.extensions)
+            else:
+                # Routed here only for an object carrying timing ids.
+                check_object(timing, 0, msg.object_id, msg.extensions)
+        except TimestampMalformed as e:
+            self._cancel_malformed(str(e))
+            return
+        self.on_object(msg, *args)
+
+    def _cancel_malformed(self, reason: str) -> None:
+        """MOQT §12.1: cancel the subscription and refuse its streams."""
+        if self.malformed is not None:
+            return
+        self.malformed = reason
+        self.session._timing_watch.pop(self.track_alias, None)
+        self.session._malformed_track(self.track_alias, reason)
+        self._done_event.set()
 
     async def subscribe(self, timeout: float = 30.0,
                         forward: int = 1,
@@ -1781,7 +2091,8 @@ class SubscribedTrack(Track):
                         start_object: int = 0,
                         end_group: int = 0,
                         priority: Optional[int] = None,
-                        group_order: Optional[GroupOrder] = None):
+                        group_order: Optional[GroupOrder] = None,
+                        location_filter: Optional[LocationFilter] = None):
         """Subscribe to the track.
 
         Auto-routed on trackname presence:
@@ -1802,6 +2113,8 @@ class SubscribedTrack(Track):
             priority: subscriber priority 0-255, lower = more urgent
                 (§7.1). None omits the parameter and takes the default.
             group_order: delivery order across groups. None omits it.
+            location_filter: d20+ Location Filter, sent in place of the
+                filter_type form on a direct SUBSCRIBE.
         """
         if self.trackname is not None:
             params = {}
@@ -1820,6 +2133,8 @@ class SubscribedTrack(Track):
                 parameters=params,
                 wait_response=True,
                 on_object=self.on_object,
+                location_filter=location_filter,
+                on_reply=self.take_track_properties,
             )
             self.largest = _reported_largest(ok)
             # Publisher's SUBSCRIBE_OK alias is authoritative (the
@@ -1828,9 +2143,10 @@ class SubscribedTrack(Track):
                 self.track_alias = ok.track_alias
                 if self.on_object:
                     self.session.register_object_handler(
-                        self.track_alias, self.on_object)
+                        self.track_alias, self._handler())
             self._watch_done(getattr(ok, 'request_id', None))
             self.state = TrackState.SUBSCRIBED
+            self._check_track_timing()
             logger.info(f"Track: subscribed (direct) to {self.fqtn}")
             return
 
@@ -1905,6 +2221,7 @@ class SubscribedTrack(Track):
             print(f"  Discovered: {self.fqtn}")
 
         self.largest = _reported_largest(pub_msg)
+        self.take_track_properties(pub_msg)
         # Register track_alias so incoming data streams pass admission.
         if hasattr(pub_msg, 'track_alias'):
             self.track_alias = pub_msg.track_alias
@@ -1912,7 +2229,7 @@ class SubscribedTrack(Track):
                 pub_msg.track_alias] = pub_msg.request_id
             if self.on_object:
                 self.session.register_object_handler(
-                    self.track_alias, self.on_object)
+                    self.track_alias, self._handler())
 
         logger.info(f"Track: PUBLISH_OK {self.fqtn} "
                     f"alias={self.track_alias} forward={forward}")
@@ -1920,7 +2237,16 @@ class SubscribedTrack(Track):
 
         self._watch_done(pub_msg.request_id)
         self.state = TrackState.SUBSCRIBED
+        self._check_track_timing()
         logger.info(f"Track: subscribed to {self.fqtn}")
+
+    def _check_track_timing(self) -> None:
+        if self.timing_error is None:
+            return
+        logger.warning(f"Track: {self.fqtn}: malformed timing properties: "
+                       f"{self.timing_error}")
+        if self.timestamp_errors == 'cancel':
+            self._cancel_malformed(self.timing_error)
 
     def _watch_done(self, request_id) -> None:
         """Record this subscription's PUBLISH_DONE (§10.11) and release
@@ -1930,6 +2256,7 @@ class SubscribedTrack(Track):
         self.request_id = request_id
 
         def _done(msg):
+            self.session._timing_watch.pop(self.track_alias, None)
             self.publish_done = msg
             self._done_event.set()
             if self.on_done is not None:
@@ -1953,6 +2280,9 @@ class SubscribedTrack(Track):
                 if not fut.done():
                     fut.cancel()
         self.state = TrackState.CLOSED
+        if self.malformed is not None:
+            self.completed = False
+            return
         if self.publish_done is not None:
             code = getattr(self.publish_done, 'status_code', 0)
             self.completed = code in (SubscribeDoneCode.TRACK_ENDED,
@@ -2094,8 +2424,11 @@ class VideoTrack(PublishedTrack):
         i_pad = b'\x49' * self.i_frame_size  # 'I'
         p_pad = b'\x50' * self.p_frame_size  # 'P'
         b_pad = b'\x42' * self.b_frame_size  # 'B'
+        stamp = self._stamper(session)
 
         try:
+            await self._await_schedule(first_group, subgroup_id)
+            next_frame_time = time.monotonic()
             while True:
                 if sender.header is None or cur_obj_id >= self.group_size:
                     if barrier is not None and group_id >= first_group:
@@ -2125,8 +2458,9 @@ class VideoTrack(PublishedTrack):
                 payload = (seq_info + b'|'
                            + frame_pad)[:frame_size]
 
-                extensions = {
-                    LOC_TIMESTAMP: int(time.time() * 1_000_000)}
+                extensions = (
+                    {LOC_TIMESTAMP: int(time.time() * 1_000_000)}
+                    if stamp is None else stamp(group_id, cur_obj_id))
                 self._remember(group_id, cur_obj_id, payload, subgroup_id,
                                extensions)
                 data = sender.encode_open(cur_obj_id, payload, extensions)
@@ -2136,8 +2470,13 @@ class VideoTrack(PublishedTrack):
                 else:
                     if session._close_err is not None:
                         raise asyncio.CancelledError
-                    await session.stream_write_drain(sender.stream_id, data)
-                    obj_bytes = len(data)
+                    try:
+                        await session.stream_write_drain(sender.stream_id,
+                                                         data)
+                        obj_bytes = len(data)
+                    except MOQTStreamStopped:
+                        sender.stop()
+                        obj_bytes = 0
                 cur_obj_id += self.num_subgroups
                 if obj_bytes:
                     local_sent += 1

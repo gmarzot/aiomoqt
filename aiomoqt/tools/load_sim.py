@@ -63,7 +63,8 @@ from typing import Any, Dict, List
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.track import SubscribedTrack, TrackState
-from aiomoqt.types import FilterType
+from aiomoqt.types import MOQT_DEFAULT_DRAFTS, FilterType, parse_draft_spec
+from aiomoqt.utils import cli as _cli
 from aiomoqt.utils.cli import endpoint_url
 from aiomoqt.utils.url import parse_relay_url
 from aiomoqt.utils.format import fmt_bps
@@ -202,6 +203,7 @@ async def _slot_task(cfg, relay, slot, events_q, group, shard,
                     session, cfg["namespace"], trackname=cfg["trackname"],
                     on_object=_on_object,
                 )
+                stats.timing = track.timing
                 try:
                     await track.subscribe(
                         timeout=SUBSCRIBE_EACH_TIMEOUT_S,
@@ -686,8 +688,11 @@ def parse_args(argv=None):
                         "as moq_interop_client")
     p.add_argument("-k", "--insecure", action="store_true",
                    help="Skip TLS verification")
-    p.add_argument("--draft", type=int, default=None,
-                   help="MoQT draft version: 14, 16, or 18")
+    p.add_argument("--draft", type=parse_draft_spec, default=None,
+                   help="MoQT draft: "
+                        f"{', '.join(map(str, sorted(MOQT_DEFAULT_DRAFTS)))}; "
+                        "a comma list offers several in order. Default: "
+                        f"offer {','.join(map(str, MOQT_DEFAULT_DRAFTS))}")
     p.add_argument("--duration-scale", type=float, default=1.0,
                    help="Multiply publisher start/duration timelines")
     p.add_argument("--subs-per-proc", type=int, default=100,
@@ -708,8 +713,7 @@ def parse_args(argv=None):
     p.add_argument("--logdir", default=None,
                    help="Per-process debug log directory")
     p.add_argument("-d", "--debug", action="store_true")
-    p.add_argument("-?", "--help", action="help",
-                   help="Show this help message and exit")
+    _cli.add_help(p)
     args = p.parse_args(argv)
     return p, args
 
@@ -795,6 +799,16 @@ def main():
         compat=args.compat,
     )
 
+    stopping = False
+
+    def _on_sigint(_sig, _frm):
+        nonlocal stopping
+        stopping = True
+
+    # Before any fork: a SIGINT during fork() raises in an at-fork
+    # callback, where Python discards it.
+    signal.signal(signal.SIGINT, _on_sigint)
+
     pubs = {ps.key: PubRT(ps) for ps in pub_specs} \
         if args.role in ("both", "pub") else {}
     groups: Dict[int, GroupRT] = {}
@@ -829,13 +843,6 @@ def main():
     start = time.monotonic()
     last_report = start
     last_tick = start
-    stopping = False
-
-    def _on_sigint(_sig, _frm):
-        nonlocal stopping
-        stopping = True
-
-    signal.signal(signal.SIGINT, _on_sigint)
 
     def _pub_rate_ops(ps: PubSpec) -> float:
         return ps.fps
@@ -981,7 +988,9 @@ def main():
                 proc.join(timeout=1.0)
         # Stats the shards posted before they stopped.
         _drain_sub_events(sub_events_q, groups)
-        for q in [sub_events_q]:
+        # Unread commands to a stopped shard must not block exit.
+        for q in [sub_events_q] + [s.cmd_q for g in groups.values()
+                                   for s in g.shards]:
             q.cancel_join_thread()
         if csv_f:
             csv_f.close()
@@ -991,6 +1000,8 @@ def main():
     print("─" * 72)
     for line in lines:
         print(line)
+    if stopping:
+        return 130     # interrupted: the verdict covers a partial run
     return 1 if failed else 0
 
 
@@ -1041,10 +1052,18 @@ def _verdict(groups: Dict[int, "GroupRT"],
     return lines, failed
 
 
+def _run():
+    # Ctrl-C before main() installs its SIGINT handler.
+    try:
+        return main()
+    except KeyboardInterrupt:
+        return 130
+
+
 def cli():
     """Console entry point (moq-load-sim)."""
-    sys.exit(main())
+    sys.exit(_run())
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_run())

@@ -6,12 +6,10 @@ reviews:
   auto_review:
     enabled: true
     drafts: true
-  path_filters:
-    - "!perf/baselines/**"
   path_instructions:
     - path: "aiomoqt/**/*.py"
       instructions: >-
-        MoQT drafts 14, 16 and 18 are live. Draft numbers are plain ints; the IETF
+        MoQT drafts 14, 16, 18, 20 and 22 are live. Draft numbers are plain ints; the IETF
         code 0xff0000NN and the ALPN strings appear only at the wire boundary.
         Behaviour differences go through profile_for(draft) / DraftProfile, not
         scattered version checks. A new wire shape needs a case in
@@ -27,8 +25,9 @@ reviews:
         One CLI flag letter has one meaning across every tool (-N namespace,
         -T trackname, -s size, -g group size, -P streams, -r rate, -t duration,
         -i interval, -k insecure, -d debug, -D datagram, -p port, -Q raw QUIC,
-        -W WebTransport; -h is not help, -? is). No feature toggles on the shared
-        grid helpers.
+        -W WebTransport; -h, -? and --help are help on every tool). Only
+        moq_interop_client's -r/-t/-l/-v differ: the interop runner's interface.
+        No feature toggles on the shared grid helpers.
     - path: "aiomoqt/tests/**"
       instructions: >-
         Every fix needs a test that fails without it. Zero objects delivered is a

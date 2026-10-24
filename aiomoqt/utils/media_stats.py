@@ -7,7 +7,8 @@ counts objects a player would have had too late.
 
 Clocks: latency is receive wall clock minus the publisher's timestamp,
 so it carries the clock offset between two machines and is reported only
-for wall-clock timestamps. Jitter, the playout model, keyframe cost and
+for wall-clock timestamps. The timestamp is resolved by utils.timing:
+frindell properties, then LOC TIMESTAMP, then the CMAF tfdt. Jitter, the playout model, keyframe cost and
 cross-track skew are built from differences, in which a constant offset
 cancels.
 
@@ -16,12 +17,19 @@ summary(); nothing here reads a clock.
 """
 import statistics
 from collections import deque
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from ..media.cmaf import chunk_decode_time
 from ..types import ObjectStatus
 from .format import fmt_bps, fmt_ms, fmt_rate
-from .stats import LOC_TIMESCALE, _pct, _Reservoir
+from .stats import (CLOCK_OFFSET_MARK, CLOCK_OFFSET_MIN_MS, LOC_TIMESCALE,
+                    _pct, _Reservoir, note_clock_offset)
+from .timing import (
+    SOURCE_FRINDELL, TimestampMalformed, TrackTiming, capture_time_us,
+)
+
+SOURCE_FRINDELL_MEDIA = "frindell-media"
+SOURCE_TFDT = "tfdt"
 
 DEFAULT_CUSHION_MS = 500
 PRIOR_GROUP_ID_GAP = 0x3C
@@ -89,6 +97,9 @@ class TrackAnalysis:
         self._cushion_us = int(cushion_ms * 1000)
         self.wall: Optional[bool] = None
         self.timed = False
+        self.timing: Optional[TrackTiming] = None
+        self.ts_sources: set = set()
+        self.ts_malformed = 0
 
         self.objects = 0
         self.bytes = 0
@@ -126,6 +137,7 @@ class TrackAnalysis:
         self._lat = _Reservoir(10000)
         self._lat_sum = 0.0
         self.lat_max: Optional[float] = None
+        self.lat_min: Optional[float] = None
         self._settle = _Reservoir(1000)
         self.settle_max: Optional[float] = None
         self._gop = _Reservoir(1000)
@@ -156,8 +168,11 @@ class TrackAnalysis:
                 ts: Optional[int] = None,
                 timescale: Optional[int] = None, *,
                 ends_group: bool = False, last_in_group: bool = False,
-                prior_gap: int = 0) -> None:
-        """One media object. `ts` is in `timescale` units (None = µs).
+                prior_gap: int = 0, wall: Optional[bool] = None,
+                source: Optional[str] = None) -> None:
+        """One media object. `ts` is in `timescale` units (None = µs);
+        `wall` says whether it is wall clock (None: judge by value);
+        `source` names where it came from.
         ends_group: its stream's FIN ends the group (header bit), which
         stream_end() confirms; last_in_group: it is the group's final
         object (datagram bit); prior_gap: the Prior Group ID Gap
@@ -188,10 +203,13 @@ class TrackAnalysis:
         if ts is None:
             return
         self.timed = True
+        if source is not None:
+            self.ts_sources.add(source)
         m_us = (ts if timescale in (None, 1_000_000)
                 else ts * 1_000_000 // timescale)
         if self.wall is None:
-            self.wall = wall_clock_us(ts, timescale, recv_us) is not None
+            self.wall = (wall if wall is not None else
+                         wall_clock_us(ts, timescale, recv_us) is not None)
         if self.wall:
             lat = (recv_us - m_us) / 1000
             self._lat.add(lat)
@@ -199,6 +217,10 @@ class TrackAnalysis:
             self._iv_lat.append(lat)
             self.lat_max = lat if self.lat_max is None else max(
                 self.lat_max, lat)
+            if self.lat_min is None or lat < self.lat_min:
+                self.lat_min = lat
+                if lat < 0:
+                    note_clock_offset(lat)
         if self._prev_rm is not None:
             d = (recv_us - self._prev_rm[0]) - (m_us - self._prev_rm[1])
             self.jitter_ms += (abs(d) / 1000 - self.jitter_ms) / 16
@@ -476,6 +498,7 @@ class TrackAnalysis:
             lat_p50_ms=_pct(lat, 50) if lat else None,
             lat_p95_ms=_pct(lat, 95) if lat else None,
             lat_max_ms=lat[-1] if lat else None,
+            clock_offset=bool(lat) and lat[0] < CLOCK_OFFSET_MIN_MS,
             jitter_ms=(self.jitter_ms if self.timed and d['objects']
                        else None),
             lost=d['lost'], lost_groups=d['lost_groups'],
@@ -521,6 +544,8 @@ class TrackAnalysis:
             lat_avg_ms=self._lat_sum / n_lat if n_lat else None,
             lat_p50_ms=lat_p50, lat_p95_ms=lat_p95, lat_p99_ms=lat_p99,
             lat_max_ms=self.lat_max,
+            clock_offset=(self.lat_min is not None
+                          and self.lat_min < CLOCK_OFFSET_MIN_MS),
             jitter_ms=self.jitter_ms if self.timed else None,
             jitter_max_ms=self.jitter_max_ms if self.timed else None,
             lost=self.lost, lost_groups=self.lost_groups,
@@ -544,7 +569,9 @@ class TrackAnalysis:
             cushion_ms=self.cushion_ms, late=self.late,
             underruns=self.underruns, stall_ms=self.stall_us / 1000,
             buf_min_ms=self.buf_min, buf_p50_ms=buf_p50,
-            pre_anchor=self.pre_anchor, wall=self.wall, timed=self.timed)
+            pre_anchor=self.pre_anchor, wall=self.wall, timed=self.timed,
+            ts_source='+'.join(sorted(self.ts_sources)) or None,
+            ts_malformed=self.ts_malformed)
 
 
 CSV_FIELDS = (
@@ -555,6 +582,7 @@ CSV_FIELDS = (
     'missing_eog', 'settle_p50_ms', 'gop_p50', 'kf_int_ms', 'kf_int_sd_ms',
     'kf_int_min_ms', 'kf_int_max_ms', 'key_p_ratio', 'key_cost_ms',
     'skew_ms', 'lat_avg_ms', 'lat_p99_ms', 'resets', 'truncated_groups',
+    'ts_source', 'ts_malformed',
 )
 
 
@@ -564,8 +592,12 @@ class MediaAnalysis:
     audio track, when both carry wall-clock timestamps. `cushion_ms`
     overrides every track's catalog targetLatency."""
 
-    def __init__(self, cushion_ms: Optional[float] = None):
+    def __init__(self, cushion_ms: Optional[float] = None,
+                 timing_of: Optional[Callable[[str], Optional[TrackTiming]]]
+                 = None):
         self.cushion_ms = cushion_ms
+        # Track name -> its subscriber's timing context.
+        self.timing_of = timing_of
         self.tracks: Dict[str, TrackAnalysis] = {}
         self._t0: Optional[int] = None
         self._iv_t: Optional[int] = None
@@ -598,9 +630,31 @@ class MediaAnalysis:
         if frame is None:
             return
         exts = getattr(msg, 'extensions', None) or {}
-        ts, scale = frame.timestamp, exts.get(LOC_TIMESCALE)
+        timing = t.timing
+        if timing is None:
+            timing = t.timing = ((self.timing_of and self.timing_of(name))
+                                 or TrackTiming())
+        ts, wall = frame.timestamp, None
+        try:
+            cap, src = capture_time_us(timing, group_id, msg.object_id, exts)
+            if src == SOURCE_FRINDELL:
+                ts, scale, wall = cap, None, True
+            elif src is None and timing.declared:
+                media = timing.media_us(group_id, msg.object_id, exts)
+                if media is not None:
+                    ts, scale, wall = media, None, False
+                    src = SOURCE_FRINDELL_MEDIA
+        except TimestampMalformed:
+            t.ts_malformed += 1
+            src = None
+        if wall is None:
+            # A LOC TIMESCALE rides only some objects; it holds for the track.
+            scale = exts.get(LOC_TIMESCALE, timing.loc_timescale)
         if ts is None and t.cmaf:
             ts, scale = chunk_decode_time(frame.payload), t.timescale
+            src = SOURCE_TFDT if ts is not None else None
+        elif src is None and ts is not None:
+            src = "loc"
         if subgroup_id is None:
             ends, last = False, bool(getattr(msg, 'end_of_group', False))
         else:
@@ -610,7 +664,8 @@ class MediaAnalysis:
         t.observe(group_id, msg.object_id,
                   len(wire if wire is not None else frame.payload), recv_us,
                   ts, scale, ends_group=ends, last_in_group=last,
-                  prior_gap=exts.get(PRIOR_GROUP_ID_GAP, 0) or 0)
+                  prior_gap=exts.get(PRIOR_GROUP_ID_GAP, 0) or 0,
+                  wall=wall, source=src)
 
     def on_stream_end(self, name: str, group_id: int,
                       subgroup_id: Optional[int], clean: bool,
@@ -713,7 +768,8 @@ def _iv_line(label: str, tw: int, r: dict) -> str:
         fmt_bps(r['bitrate_bps']), lat, _ms(r['jitter_ms']), loss,
         str(r['reorders']), str(r['late']), str(r['underruns']),
         str(r['resets']), '' if skew is None else _ms(skew))
-    return f"  {label:<10}{r['track']:<{tw}}" + _cells(values)
+    return (f"  {label:<10}{r['track']:<{tw}}" + _cells(values)
+            + (f"  {CLOCK_OFFSET_MARK}" if r.get('clock_offset') else ''))
 
 
 def format_interval(t0: float, t1: float, rows: List[dict]) -> List[str]:
@@ -735,6 +791,9 @@ def _notes(r: dict) -> List[str]:
     if r['late_reorders']:
         out.append(f"{r['late_reorders']} objects arrived after the "
                    f"cushion; counted as reorders, not losses")
+    if r.get('ts_malformed'):
+        out.append(f"{r['ts_malformed']} objects with malformed timestamp "
+                   f"properties")
     if r['pending']:
         out.append(f"{r['pending']} missing objects still pending at "
                    f"the end")
@@ -744,11 +803,14 @@ def _notes(r: dict) -> List[str]:
 def _track_summary(r: dict) -> List[str]:
     out = [f"  {r['track']}  {r['active_s']:.1f}s  {r['objects']} objs  "
            f"{r['groups']} grps  {fmt_bps(r['bitrate_bps'])}"]
-    if r['wall']:
+    src = f"  [{r['ts_source']}]" if r.get('ts_source') else ''
+    if r['wall'] and r['lat_p50_ms'] is not None:
         out.append(f"    Latency:   p50={r['lat_p50_ms']:.1f}  "
-                   f"p95={r['lat_p95_ms']:.1f}  max={r['lat_max_ms']:.1f} ms")
+                   f"p95={r['lat_p95_ms']:.1f}  max={r['lat_max_ms']:.1f} ms"
+                   + (f" {CLOCK_OFFSET_MARK}" if r.get('clock_offset') else '')
+                   + src)
     elif r['timed']:
-        out.append("    Latency:   n/a (media-time timestamps)")
+        out.append("    Latency:   n/a (media-time timestamps)" + src)
     else:
         out.append("    Latency:   n/a (no timestamps)")
     out.append("    Jitter:    " + ('n/a' if r['jitter_ms'] is None

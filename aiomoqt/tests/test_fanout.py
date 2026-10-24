@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from aiomoqt import delivery as delivery_mod
 from aiomoqt.context import profile_for
 from aiomoqt.delivery import FanoutDelivery, StreamMapping, SubgroupDelivery
 from aiomoqt.fanout import FanoutPublisher
@@ -153,6 +154,47 @@ async def test_a_blocked_lane_sheds_to_the_next_group():
     assert fast.resets == [] and fast.fins(fast.opened[0])
 
 
+async def _overrun_at_a_group_boundary(boundary):
+    """A blocked lane's queue overflows on the item that ends group 0
+    (`boundary` writes it); returns both sessions once drained."""
+    fast, slow = _Session("fast"), _Session("slow", block=True)
+    fan = FanoutDelivery(queue_size=2)
+    fan.add(_delivery(fast), joining=False)
+    lane = fan.add(_delivery(slow), joining=False)
+    await fan.write(0, 0, b"key", group_start=True)
+    await _settle()                         # slow lane parked in group 0
+    await fan.write(0, 1, b"pred")
+    await _settle(2)                        # the fast lane keeps draining
+    await fan.write(0, 2, b"pred")          # slow queue now full
+    await _settle(2)
+    await boundary(fan)                     # overflows: backlog flushed
+    assert lane.shed == 2
+    slow.release()
+    await _settle(60)
+    await fan.close()
+    return fast, slow
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["next_group", "end_group"])
+async def test_overflow_at_a_group_boundary_resets_the_group(boundary):
+    async def _next_group(fan):
+        await fan.write(1, 0, b"key", group_start=True)
+
+    async def _end_group(fan):
+        fan.end_group()
+
+    fast, slow = await _overrun_at_a_group_boundary(
+        {"next_group": _next_group, "end_group": _end_group}[boundary])
+    # Group 0 lost objects 1 and 2 on the slow peer: reset, no
+    # END_OF_GROUP and no FIN.
+    first = slow.opened[0]
+    assert slow.resets == [first]
+    assert not slow.fins(first)
+    assert len([w for w in slow.writes if w[0] == first]) == 2  # header, object 0
+    assert fast.resets == [] and fast.fins(fast.opened[0])
+
+
 @pytest.mark.asyncio
 async def test_a_paused_peer_is_gated_and_rejoins_at_a_group():
     a, b = _Session("a"), _Session("b")
@@ -242,6 +284,68 @@ async def test_drop_session_detaches_a_lane():
     await fan.close()
     assert [ln.session for ln in fan.lanes] == [a]
     assert db.objects_sent == 0
+
+
+@pytest.mark.asyncio
+async def test_a_reset_during_a_header_drain_leaves_the_lane_writing():
+    s = _Session(block=True)
+    d = _delivery(s)
+    fan = FanoutDelivery([d])
+    sent = []
+    fan.on_sent = lambda g, o: sent.append((g, o))
+    lane = fan.lanes[0]
+    await fan.write(0, 0, b"k0", group_start=True)
+    await _settle()                     # parked in the header drain
+    d.cancel()                          # e.g. PUBLISH_OK with FORWARD=0
+    s.release()
+    await _settle()
+    await fan.write(1, 0, b"k1", group_start=True)
+    await fan.write(1, 1, b"p1")
+    await _settle()
+    assert not lane.task.done()
+    first, second = s.opened
+    assert s.resets == [first]
+    assert [w for w in s.writes if w[0] == second and w[1]] != []
+    assert sent == [(1, 0), (1, 1)]
+    assert d.objects_sent == 2
+    await fan.close()
+
+
+class _Failing(_Session):
+    """The first drained write raises."""
+
+    def __init__(self):
+        super().__init__()
+        self.failed = False
+
+    async def stream_write_drain(self, sid, data):
+        if not self.failed:
+            self.failed = True
+            raise RuntimeError("transport fault")
+        await super().stream_write_drain(sid, data)
+
+
+@pytest.mark.asyncio
+async def test_a_lane_survives_a_failed_write(caplog):
+    s = _Failing()
+    d = _delivery(s)
+    fan = FanoutDelivery()
+    fan.name = "fan/test/video"
+    lane = fan.add(d, joining=False)
+    delivery_mod.logger.addHandler(caplog.handler)
+    try:
+        await fan.write(0, 0, b"k0", group_start=True)
+        await fan.write(0, 1, b"p0")    # skipped: the lane waits for a group
+        await fan.write(1, 0, b"k1", group_start=True)
+        await _settle()
+    finally:
+        delivery_mod.logger.removeHandler(caplog.handler)
+    assert not lane.task.done()
+    assert d.objects_sent == 1 and d.largest == (1, 0)
+    assert s.resets == [s.opened[0]]
+    assert any("fan/test/video" in r.getMessage() and r.levelname == "WARNING"
+               for r in caplog.records)
+    await fan.close()
 
 
 # -- the track layer -------------------------------------------------
@@ -380,6 +484,23 @@ async def test_a_peer_returning_from_idle_swaps_its_lane_not_production():
     assert sub_b.delivery.track_alias == 9
     await track.finish()
     await production
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_lane_is_replaced_when_forward_resumes():
+    a = _Session("a")
+    track = LocTrackPublisher(a, _NS, "video")
+    await track._start_generating(a, "PUBLISH_OK")
+    dead = track._out.lanes[0]
+    dead.task.cancel()
+    await _settle()
+    await track._start_generating(a, "REQUEST_UPDATE")
+    lane, = track._out.lanes
+    assert lane is not dead and not lane.task.done()
+    await track.send_frame(b"idr", key_frame=True, timestamp=1)
+    await track.finish()
+    await track._production
+    assert track._sub_for(a).delivery.objects_sent == 1
 
 
 def test_packaging_does_not_know_about_peers():

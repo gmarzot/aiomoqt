@@ -188,32 +188,39 @@ class _TrackReader:
 
 
 class Mp4VideoTrack(_TrackReader):
-    """Video track. H.264 (avc1/avc3): samples are 4-byte-length-
-    prefixed AVC = LOC canonical payloads, avcc = decoder description.
-    AV1 (av01): samples are temporal units = WebCodecs chunk payloads
-    verbatim; config travels in-band, so no description is emitted."""
+    """Video track. H.264 (avc1/avc3) and H.265 (hvc1/hev1): samples are
+    4-byte-length-prefixed NAL units = LOC canonical payloads, avcC or
+    hvcC = decoder description. AV1 (av01): samples are temporal units =
+    WebCodecs chunk payloads verbatim; config travels in-band, so no
+    description is emitted."""
 
     def _parse_entry(self, ebody, eend):
         d = self._data
+        self.sample_entry_type = d[ebody - 4:ebody].decode('latin-1')
         self.width, self.height = struct.unpack_from('>HH', d, ebody + 24)
         avcc = _find(d, ebody + 78, eend, b'avcC')
+        hvcc = _find(d, ebody + 78, eend, b'hvcC')
         av1c = _find(d, ebody + 78, eend, b'av1C')
         self.avcc = d[avcc[0]:avcc[1]] if avcc else None
+        self.hvcc = d[hvcc[0]:hvcc[1]] if hvcc else None
         self.av1c = d[av1c[0]:av1c[1]] if av1c else None
-        if self.avcc is None and self.av1c is None:
-            raise Mp4Error("no avcC/av1C in video sample entry")
+        if self.avcc is None and self.hvcc is None and self.av1c is None:
+            raise Mp4Error("no avcC/hvcC/av1C in video sample entry")
 
     @property
     def codec_string(self) -> str:
         if self.avcc is not None:
             return avcc_codec_string(self.avcc)
+        if self.hvcc is not None:
+            return hvcc_codec_string(self.hvcc, self.sample_entry_type)
         return av1c_codec_string(self.av1c)
 
     @property
     def config(self) -> Optional[bytes]:
-        """Decoder description (WebCodecs): avcC for H.264; None for
-        AV1 (registry: config OBUs ride in-band, no description)."""
-        return self.avcc
+        """Decoder description (WebCodecs): avcC for H.264, hvcC for
+        H.265; None for AV1 (registry: config OBUs ride in-band, no
+        description)."""
+        return self.avcc if self.avcc is not None else self.hvcc
 
     @property
     def fps(self) -> Optional[float]:
@@ -274,23 +281,51 @@ class Mp4AudioTrack(_TrackReader):
         """RFC 6381 (e.g. mp4a.40.2) from the ASC audioObjectType."""
         return f"mp4a.40.{(self.asc[0] >> 3) & 0x1F}"
 
+    @property
+    def config(self) -> bytes:
+        """Decoder description: the AudioSpecificConfig."""
+        return self.asc
+
+
+class Mp4OpusTrack(_TrackReader):
+    """Opus track (Opus sample entry + dOps): samples are Opus packets,
+    decoded at 48 kHz. No decoder description: mono and stereo need
+    none (WebCodecs Opus registration)."""
+
+    def _parse_entry(self, ebody, eend):
+        d = self._data
+        dops = _find(d, ebody + 28, eend, b'dOps')
+        if dops is None:
+            raise Mp4Error("no dOps in Opus sample entry")
+        self.channels = d[dops[0] + 1]
+        self.pre_skip = struct.unpack_from('>H', d, dops[0] + 2)[0]
+        self.samplerate = 48000
+
+    codec_string = 'opus'
+    config = None
+
+
+_VIDEO_ENTRIES = (b'avc1', b'avc3', b'hvc1', b'hev1', b'av01')
+
 
 class Mp4Reader:
-    """Plain (non-fragmented) MP4: first H.264 video and/or first AAC
-    audio track. At least one must be present."""
+    """Plain (non-fragmented) MP4: first video track and/or first AAC or
+    Opus audio track. At least one must be present."""
 
     def __init__(self, path: str):
         with open(path, 'rb') as f:
             data = f.read()
         self.video: Optional[Mp4VideoTrack] = None
-        self.audio: Optional[Mp4AudioTrack] = None
+        self.audio: Optional[_TrackReader] = None
         for etype, ebody, eend, trak in _traks(data):
-            if etype in (b'avc1', b'avc3', b'av01') and self.video is None:
+            if etype in _VIDEO_ENTRIES and self.video is None:
                 self.video = Mp4VideoTrack(data, (ebody, eend), trak)
             elif etype == b'mp4a' and self.audio is None:
                 self.audio = Mp4AudioTrack(data, (ebody, eend), trak)
+            elif etype == b'Opus' and self.audio is None:
+                self.audio = Mp4OpusTrack(data, (ebody, eend), trak)
         if self.video is None and self.audio is None:
-            raise Mp4Error("no avc1/avc3/av01 or mp4a track")
+            raise Mp4Error("no avc1/avc3/hvc1/hev1/av01, mp4a or Opus track")
 
 
 class Mp4AvcReader(Mp4VideoTrack):
@@ -541,12 +576,15 @@ class AnnexBAssembler:
                 out.append(nal)
             i = j
 
+    @staticmethod
+    def _is_key(nals: List[bytes]) -> bool:
+        return any((n[0] & 0x1F) == 5 for n in nals)
+
     def _flush(self, out: List[Tuple[bytes, bool]]) -> None:
         if self._au:
             payload = b''.join(struct.pack('>I', len(n)) + n
                                for n in self._au)
-            key = any((n[0] & 0x1F) == 5 for n in self._au)
-            out.append((payload, key))
+            out.append((payload, self._is_key(self._au)))
         self._au = []
         self._au_has_vcl = False
 
@@ -622,3 +660,107 @@ class IvfWriter:
             self._fh.seek(24)
             self._fh.write(struct.pack('<I', self._n))
         self._fh.close()
+
+
+# -- H.265 ------------------------------------------------------------
+
+_HEVC_VPS, _HEVC_SPS, _HEVC_PPS, _HEVC_AUD = 32, 33, 34, 35
+_HEVC_SEI_SUFFIX = 40
+
+
+def _hevc_type(nal: bytes) -> int:
+    return (nal[0] >> 1) & 0x3F
+
+
+def hevc_sps_info(sps: bytes) -> dict:
+    """Fields of a raw H.265 SPS NAL unit an hvcC and a catalog need:
+    `ptl` (the 12 general profile_tier_level bytes), sub-layer count and
+    nesting, chroma format, bit depths and the cropped dimensions."""
+    rbsp = _rbsp(sps[2:])
+    r = _BitReader(rbsp)
+    r.u(4)                                  # sps_video_parameter_set_id
+    max_sub_layers = r.u(3) + 1
+    nested = r.u(1)
+    ptl = rbsp[1:13]
+    r.u(96)
+    present = [(r.u(1), r.u(1)) for _ in range(max_sub_layers - 1)]
+    if max_sub_layers > 1:
+        r.u(2 * (9 - max_sub_layers))
+    for profile, level in present:
+        r.u(88 * profile + 8 * level)
+    r.ue()                                  # sps_seq_parameter_set_id
+    chroma = r.ue()
+    if chroma == 3:
+        r.u(1)
+    width, height = r.ue(), r.ue()
+    if r.u(1):                              # conformance window
+        left, right, top, bottom = r.ue(), r.ue(), r.ue(), r.ue()
+        unit_x = 2 if chroma in (1, 2) else 1
+        unit_y = 2 if chroma == 1 else 1
+        width -= (left + right) * unit_x
+        height -= (top + bottom) * unit_y
+    return dict(ptl=ptl, sub_layers=max_sub_layers, nested=nested,
+                chroma=chroma, luma_bits=r.ue() + 8, chroma_bits=r.ue() + 8,
+                width=width, height=height)
+
+
+def hvcc_from_parameter_sets(vps: bytes, sps: bytes, pps: bytes) -> bytes:
+    """An hvcC record (ISO/IEC 14496-15 §8.3.3) from raw VPS/SPS/PPS NAL
+    units, with 4-byte NAL lengths."""
+    info = hevc_sps_info(sps)
+    out = bytearray([1]) + info['ptl']
+    out += struct.pack('>HBBBBH', 0xF000, 0xFC, 0xFC | info['chroma'],
+                       0xF8 | (info['luma_bits'] - 8),
+                       0xF8 | (info['chroma_bits'] - 8), 0)
+    out.append((info['sub_layers'] << 3) | (info['nested'] << 2) | 3)
+    out.append(3)
+    for kind, nal in ((_HEVC_VPS, vps), (_HEVC_SPS, sps), (_HEVC_PPS, pps)):
+        out += bytes([0x80 | kind]) + struct.pack('>HH', 1, len(nal)) + nal
+    return bytes(out)
+
+
+class HevcAnnexBAssembler(AnnexBAssembler):
+    """AnnexBAssembler for H.265. VPS/SPS/PPS feed `config` (hvcC) and
+    stay in the access unit, in band as hev1 expects; AUD NALs delimit
+    and are dropped. Key frames are IRAP pictures."""
+
+    def __init__(self):
+        super().__init__()
+        self.vps: Optional[bytes] = None
+
+    @property
+    def config(self) -> Optional[bytes]:
+        if self.vps and self.sps and self.pps:
+            return hvcc_from_parameter_sets(self.vps, self.sps, self.pps)
+        return None
+
+    @staticmethod
+    def _is_key(nals: List[bytes]) -> bool:
+        return any(16 <= _hevc_type(n) <= 23 for n in nals)
+
+    def _push(self, nal: bytes, out: List[Tuple[bytes, bool]]) -> None:
+        if len(nal) < 2:
+            return
+        t = _hevc_type(nal)
+        if t == _HEVC_AUD:
+            self._flush(out)
+            return
+        if t < 32:
+            # first_slice_segment_in_pic_flag opens a new picture.
+            if self._au_has_vcl and len(nal) > 2 and nal[2] & 0x80:
+                self._flush(out)
+            self._au.append(nal)
+            self._au_has_vcl = True
+            return
+        if t == _HEVC_SEI_SUFFIX:
+            self._au.append(nal)
+            return
+        if self._au_has_vcl:
+            self._flush(out)
+        if t == _HEVC_VPS:
+            self.vps = nal
+        elif t == _HEVC_SPS:
+            self.sps = nal
+        elif t == _HEVC_PPS:
+            self.pps = nal
+        self._au.append(nal)

@@ -4,9 +4,7 @@
 Runs unit, integration, interop, and bench tiers against a relay catalog.
 Each suite is a discrete test with its own status line; tiers group them.
 
-Usage:
-    cd ~/Projects/moq/aiomoqt
-
+Usage, from the repo root:
     # CI path: unit + integration (no network)
     tests/release_regression_test.py --test-tier unit --test-tier integration
 
@@ -23,7 +21,10 @@ Usage:
     # LOCMAF from Eyevinn's public moqlivemock (manual only)
     tests/release_regression_test.py --test-suite media-locmaf
 
-Exit 0 iff every test passed. `[skip]` suites don't count.
+    # moq-dev's relay smoke against aiomoqt-relay, in Docker (manual only)
+    tests/release_regression_test.py --test-suite moqdev-smoke
+
+Exit 1 iff a suite fails; SKIP and XFAIL don't gate.
 """
 from __future__ import annotations
 
@@ -72,14 +73,17 @@ TIERS = {
                     # (the in-process loopback misses the pub/sub-worker
                     # start path — see the 0.9.10 BW clobber).
                     "loopback-adaptive-mp-d14", "loopback-adaptive-mp-d16",
-                    "loopback-adaptive-mp-d18",
+                    "loopback-adaptive-mp-d18", "loopback-adaptive-mp-d20",
+                    "loopback-adaptive-mp-d22",
+                    # adaptive BW in relay mode over raw QUIC
+                    "loopback-adaptive-relay-quic-d22",
                     "loopback-fetch"],
     "interop":     ["relay-ctrl-msg", "relay-pub-sub", "relay-discovery",
                     "relay-join", "relay-fetch", "relay-data"],
     "bench":       ["loopback-adaptive-bench"],
 }
 # Run only when named with --test-suite: no tier and no bare run selects them.
-MANUAL_SUITES = ["media-locmaf"]
+MANUAL_SUITES = ["media-locmaf", "moqdev-smoke"]
 TIER_CHOICES = tuple(TIERS.keys())
 SUITE_CHOICES = (tuple(s for suites in TIERS.values() for s in suites)
                  + tuple(MANUAL_SUITES))
@@ -284,7 +288,10 @@ def _loopback_adaptive_mp(log_dir: Path, draft: int) -> tuple[str, str]:
            "--step-mbps", "10", "--max-mbps", "60", "--interval", "2",
            "-t", "20", "-k"]
     _run(cmd, log, 45)
-    text = log.read_text()
+    return _adaptive_verdict(log.read_text())
+
+
+def _adaptive_verdict(text: str) -> tuple[str, str]:
     if "Traceback" in text:
         return "FAIL", "traceback"
     m = re.search(r"High-water:\s+([\d.]+)\s*([KMGT]?bps)", text)
@@ -293,6 +300,44 @@ def _loopback_adaptive_mp(log_dir: Path, draft: int) -> tuple[str, str]:
     if float(m.group(1)) > 0:
         return "PASS", f"high-water {m.group(1)} {m.group(2)}"
     return "FAIL", "no interval without shortfall (high-water 0)"
+
+
+def _loopback_adaptive_relay_quic(log_dir: Path, draft: int) -> tuple[str, str]:
+    """adaptive_bench in relay mode (pub and sub processes) through the
+    local interop relay over raw QUIC."""
+    import socket
+    import time
+    slug = f"loopback-adaptive-relay-quic-d{draft}"
+    log = log_dir / f"{slug}.log"
+    relay_log = log_dir / f"{slug}-relay.log"
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    with open(relay_log, "w") as f:
+        relay = subprocess.Popen(
+            [sys.executable, "-m", "aiomoqt.tools.moq_interop_relay",
+             "--bind", "127.0.0.1", "--port", str(port), "--quic",
+             "--cert", "certs/cert.pem", "--key", "certs/key.pem"],
+            stdout=subprocess.DEVNULL, stderr=f)
+    try:
+        deadline = time.monotonic() + 15
+        while "Listening on" not in relay_log.read_text():
+            if relay.poll() is not None or time.monotonic() > deadline:
+                return "FAIL", "relay did not start"
+            time.sleep(0.1)
+        cmd = [sys.executable, "-m", "aiomoqt.tools.adaptive_bench",
+               f"moqt://127.0.0.1:{port}", "--draft", str(draft),
+               "-P", "1", "-s", "4096", "--start-mbps", "20",
+               "--step-mbps", "10", "--max-mbps", "60", "--interval", "2",
+               "-t", "20", "-k"]
+        _run(cmd, log, 45)
+        return _adaptive_verdict(log.read_text())
+    finally:
+        relay.terminate()
+        try:
+            relay.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            relay.kill()
 
 
 # ---------------------------------------------------------------------------
@@ -445,6 +490,50 @@ def _media_locmaf(url: str, namespace: str, log: Path) -> tuple[str, str]:
     return "PASS", f"{len(tracks)} tracks, {frames} frames, 0 rejected"
 
 
+# moqdev-smoke: moq-dev's relay smoke (moq-dev/moq test/smoke) against
+# moq-interop-runner registry keys, in Docker. Public infrastructure: manual only.
+MOQDEV_SMOKE = Path(__file__).parent / "moqdev-smoke" / "run.sh"
+
+
+def _moqdev_smoke_results(keys: str,
+                          results_json: Path) -> list[tuple[str, str, str]]:
+    """(status, label, detail) per endpoint of each key. An endpoint passes iff
+    the harness marked it ok and every cell passed or was skipped; a key with
+    no endpoint is a FAIL."""
+    try:
+        endpoints = json.loads(results_json.read_text())["endpoints"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return [("FAIL", f"moqdev-smoke {keys}", "(no results.json)")]
+    out = []
+    for key in keys.split(","):
+        mine = [e for e in endpoints if e.get("key") == key]
+        if not mine:
+            out.append(("FAIL", f"moqdev-smoke {key}", "(no endpoint in results)"))
+        for e in mine:
+            cells = e.get("cells") or {}
+            passed = sum(1 for c in cells.values() if c.get("status") == "PASS")
+            bad = [f"{pair}: {c.get('status')} {c.get('reason', '')}".rstrip()
+                   for pair, c in cells.items()
+                   if c.get("status") not in ("PASS", "SKIP")]
+            label = f"moqdev-smoke {key} {e.get('transport')}"
+            if e.get("ok") and passed and not bad:
+                versions = ", ".join(e.get("versions") or [])
+                out.append(("PASS", label,
+                            f"{passed}/{len(cells)} cells {versions}".rstrip()))
+            else:
+                out.append(("FAIL", label,
+                            "; ".join(bad) or f"(matrix incomplete: {passed} passed)"))
+    return out
+
+
+def _moqdev_smoke(keys: str, out: Path,
+                  log: Path) -> list[tuple[str, str, str]]:
+    # 2400 s covers the first run's image build (~2.6 GB).
+    if _run_rc(["bash", str(MOQDEV_SMOKE), str(out), keys], log, 2400) is None:
+        return [("FAIL", f"moqdev-smoke {keys}", "timeout")]
+    return _moqdev_smoke_results(keys, out / "results.json")
+
+
 # ---------------------------------------------------------------------------
 # Bench-tier runners
 # ---------------------------------------------------------------------------
@@ -456,7 +545,7 @@ def _loopback_adaptive_bench(log_dir: Path) -> tuple[str, str]:
            sys.executable, "-m", "aiomoqt.tools.adaptive_bench",
            "--start-mbps", "10", "--step-mbps", "10",
            "--max-mbps", "500", "--interval", "3",
-           "-l", "100", "-k"]
+           "--latency-threshold", "100", "-k"]
     _run(cmd, log, 45)
     text = log.read_text()
     # fmt_bps emits e.g. "80Mbps" or "1.2Gbps" (no space) — match both
@@ -614,11 +703,11 @@ def main() -> int:
                     choices=SUITE_CHOICES, metavar="SUITE",
                     dest="skip_suites",
                     help="exclude this suite even if its tier is selected "
-                         "(repeatable). macOS CI skips loopback-fetch: its "
-                         "per-test event-loop teardown is pathologically slow "
-                         "on GitHub macOS runners. The fetch logic is covered "
-                         "on Linux, and the bench matrix covers macOS "
-                         "loopback delivery.")
+                         "(repeatable). macOS CI skips loopback-fetch: the "
+                         "native QUIC close stalls ~10 s on an un-drained "
+                         "fetch stream over loopback. The fetch logic is "
+                         "covered on Linux, and the bench matrix covers "
+                         "macOS loopback delivery.")
     ap.add_argument("--only", metavar="RELAY",
                     help="within the interop tier, only test this relay "
                          "by name")
@@ -629,6 +718,9 @@ def main() -> int:
     ap.add_argument("--interop-parallel", type=int, default=4,
                     metavar="N", help="relays to run concurrently in the "
                                       "interop tier (default: 4)")
+    ap.add_argument("--moqdev-relays", default="aiomoqt-relay", metavar="KEYS",
+                    help="comma-separated moq-interop-runner registry keys "
+                         "for moqdev-smoke (default: aiomoqt-relay)")
     args = ap.parse_args()
 
     if args.test_tiers or args.test_suites:
@@ -699,12 +791,17 @@ def main() -> int:
                     status, detail = _loopback_bench_combo(log_dir, draft, quic)
                     record_and_print((status, suite, detail,
                                       log_dir / f"{suite}.log"))
-        for draft in (14, 16, 18):
+        for draft in (14, 16, 18, 20, 22):
             suite = f"loopback-adaptive-mp-d{draft}"
             if suite in enabled:
                 status, detail = _loopback_adaptive_mp(log_dir, draft)
                 record_and_print((status, suite, detail,
                                   log_dir / f"{suite}.log"))
+        suite = "loopback-adaptive-relay-quic-d22"
+        if suite in enabled:
+            status, detail = _loopback_adaptive_relay_quic(log_dir, 22)
+            record_and_print((status, suite, detail,
+                              log_dir / f"{suite}.log"))
         if "loopback-fetch" in enabled:
             status, detail = _loopback_fetch(log_dir)
             record_and_print((status, "loopback-fetch", detail,
@@ -751,6 +848,12 @@ def main() -> int:
                 status, detail = _media_locmaf(url, ns, log)
                 record_and_print((status, f"media-locmaf {transport} {ns}",
                                   detail, log))
+    if "moqdev-smoke" in enabled:
+        print("\n== moqdev-smoke (moq-dev relay smoke) ==")
+        log = log_dir / "moqdev-smoke.log"
+        for status, label, detail in _moqdev_smoke(
+                args.moqdev_relays, log_dir / "moqdev-smoke", log):
+            record_and_print((status, label, detail, log))
 
     # --- bench tier ---
     if enabled & set(TIERS["bench"]):

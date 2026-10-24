@@ -23,6 +23,7 @@ import asyncio
 import logging
 import multiprocessing
 import os
+import signal
 import sys
 import time
 from collections import deque
@@ -93,6 +94,11 @@ def _setup_quiet_logging(logdir, name, debug):
         logging.basicConfig(stream=sys.stderr, force=True, level=lvl,
                             format=f'[{name}] %(asctime)s %(levelname)s %(message)s')
         set_log_level(lvl)
+
+
+def _ignore_sigint():
+    """The parent stops workers by event; Ctrl-C goes to the parent only."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 
 def _bridge_stop_event(mp_stop_event):
@@ -257,6 +263,7 @@ def sub_worker_entry(config: Dict[str, Any], mp_stop_event, events_queue):
     _setup_quiet_logging(config.get('logdir'),
                          f"sub-{config['sub_id']}",
                          config.get('debug', False))
+    _ignore_sigint()
     # AIOMOQT_PROFILE_SUB=<path> wraps this worker's main loop in
     # cProfile. Writes <path>.<sub_id> .prof on exit so multi-sub runs
     # don't clobber each other. Effectively free when the env is unset.
@@ -457,6 +464,7 @@ def sub_batch_worker_entry(config: Dict[str, Any], mp_stop_event,
     _setup_quiet_logging(config.get('logdir'),
                          f"subw-{config['worker_id']}",
                          config.get('debug', False))
+    _ignore_sigint()
     try:
         asyncio.run(_subscriber_batch_task(config, mp_stop_event,
                                            events_queue))
@@ -657,6 +665,7 @@ def pub_worker_entry(config: Dict[str, Any], mp_stop_event,
     """Process entrypoint. Spawned via multiprocessing.Process."""
     _setup_quiet_logging(config.get('logdir'), 'pub',
                          config.get('debug', False))
+    _ignore_sigint()
     try:
         asyncio.run(_publisher_task(config, mp_stop_event,
                                      rate_queue, events_queue))
@@ -818,6 +827,7 @@ def loopback_server_entry(config: Dict[str, Any], mp_stop_event,
     --mp-loopback mode (adaptive_bench)."""
     _setup_quiet_logging(config.get('logdir'), 'loopback-server',
                          config.get('debug', False))
+    _ignore_sigint()
     try:
         asyncio.run(_loopback_server_task(config, mp_stop_event,
                                             rate_queue, events_queue))

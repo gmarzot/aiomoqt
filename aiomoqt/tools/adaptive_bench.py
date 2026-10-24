@@ -36,9 +36,11 @@ from aiomoqt.server import MOQTServer
 from aiomoqt.track import PublishedTrack, SubscribedTrack
 from aiomoqt.types import (FilterType, MOQTMessageType, ObjectStatus,
                            parse_draft_spec)
+from aiomoqt.utils import cli as _cli
 from aiomoqt.utils.cli import endpoint_url
-from aiomoqt.utils.format import fmt_bps, fmt_ms
-from aiomoqt.utils.stats import send_time_us
+from aiomoqt.utils.format import fmt_bps, fmt_ms, fmt_ms_signed
+from aiomoqt.utils.stats import (CLOCK_OFFSET_MARK, CLOCK_OFFSET_MIN_MS,
+                                 note_clock_offset, send_time_us)
 from aiomoqt.utils.logger import set_log_level
 
 
@@ -113,6 +115,8 @@ class Signal:
     tx_ring_depth_bytes: int = 0
     tx_ring_depth_max_bytes: int = 0
     tx_ring_streams: int = 0
+    # False when no latency sample arrived: shown as n/a, not 0.
+    latency_known: bool = True
 
 
 @dataclass
@@ -156,6 +160,8 @@ class LiveStats:
         self._last_recv_ms = 0
         self._last_send_ms = 0
         self._jitter = 0.0
+        # Shared with the SubscribedTrack; see utils.timing.
+        self.timing = None
 
     def on_object(self, msg, size_bytes, recv_time_us,
                   group_id=None, subgroup_id=None):
@@ -168,10 +174,14 @@ class LiveStats:
                      and getattr(msg, 'status', ObjectStatus.NORMAL)
                      != ObjectStatus.NORMAL)
 
-        send_us = send_time_us(getattr(msg, 'extensions', None))
+        send_us = send_time_us(getattr(msg, 'extensions', None), self.timing,
+                               getattr(msg, 'group_id', group_id),
+                               getattr(msg, 'object_id', None))
         latency = None
         if send_us is not None:
             raw_us = recv_time_us - send_us
+            if raw_us < 0:
+                note_clock_offset(raw_us / 1000.0)
             # Accept up to 10 minutes (under-load latency can exceed
             # 60s); reject negatives and varint-garbage outliers.
             if -1_000_000 <= raw_us <= 600_000_000:
@@ -288,6 +298,9 @@ class BWActuator:
         self._mp_total_lost = 0
         self._mp_total_objs = 0
         self._mp_window_s = 5.0
+        # Measurement start: the first apply(). Rates divide by the time
+        # actually covered, never more than the window.
+        self._mp_t0: Optional[float] = None
         # publisher rates from pub_stats events.
         # tx_bytes  = bytes the publisher queued via send_stream_data.
         # wire_bytes = bytes picoquic actually placed on the wire
@@ -314,6 +327,8 @@ class BWActuator:
         self.state.target_mbps = level
         rate_ops = self.scenario.aggregate_ops(level)
         self.state.rate_ops = rate_ops
+        if self._mp_t0 is None:
+            self._mp_t0 = time.monotonic()
         if self.is_mp:
             try:
                 self._rate_q.put_nowait({'rate_ops': rate_ops})
@@ -417,7 +432,9 @@ class BWActuator:
             tx_bytes = wire_bytes
         else:
             tx_bytes = sum(b for (_, b) in self._mp_tx_window)
-        win = max(0.5, self._mp_window_s)
+        covered = (t - self._mp_t0 if self._mp_t0 is not None
+                   else self._mp_window_s)
+        win = max(0.5, min(self._mp_window_s, covered))
         rx_mbps = (rx_bytes * 8) / (win * 1e6)
         tx_mbps = (tx_bytes * 8) / (win * 1e6)
         loss_pct = (100.0 * self._mp_total_lost
@@ -443,6 +460,7 @@ class BWActuator:
             tx_ring_depth_bytes=self._mp_tx_ring_depth,
             tx_ring_depth_max_bytes=self._mp_tx_ring_depth_max,
             tx_ring_streams=self._mp_tx_ring_streams,
+            latency_known=bool(lats),
         )
 
     async def shutdown(self) -> None:
@@ -705,6 +723,7 @@ class SubsActuator:
         rx_bps_total = 0.0
         worst_p90 = 0.0
         worst_mean = 0.0
+        lat_known = False
         max_loss_pct = 0.0
         jitter_sum = 0.0
         jitter_n = 0
@@ -727,6 +746,8 @@ class SubsActuator:
             if (now - self._spawned_t.get(wid, now)) >= startup_grace:
                 worst_p90 = max(worst_p90, s.get('lat_p90_ms', 0.0))
                 worst_mean = max(worst_mean, s.get('lat_mean_ms', 0.0))
+                # A worker with no samples reports 0.0.
+                lat_known |= bool(s.get('lat_p90_ms') or s.get('lat_mean_ms'))
             loss_ct = s.get('loss', 0)
             total = s.get('total_objs', 0) or 1
             lpct = 100.0 * loss_ct / (loss_ct + total) if (loss_ct + total) else 0.0
@@ -792,6 +813,7 @@ class SubsActuator:
             active_subs=active_subs,
             failed_subs=failed_this_window,
             health=health,
+            latency_known=lat_known,
         )
 
     async def shutdown(self) -> None:
@@ -1190,9 +1212,14 @@ class AIMDController:
         bw = fmt_bps(sig.target_mbps * 1e6)
         tx = fmt_bps(sig.tx_mbps * 1e6)
         rx = fmt_bps(sig.rx_mbps * 1e6)
-        mean = fmt_ms(sig.latency_mean_ms)
-        p90 = fmt_ms(sig.latency_p90_ms)
-        jit = fmt_ms(sig.jitter_ms)
+        mean = (fmt_ms_signed(sig.latency_mean_ms) if sig.latency_known
+                else "n/a")
+        p90 = (fmt_ms_signed(sig.latency_p90_ms) if sig.latency_known
+               else "n/a")
+        jit = fmt_ms(sig.jitter_ms) if sig.latency_known else "n/a"
+        if (sig.latency_known
+                and sig.latency_mean_ms < CLOCK_OFFSET_MIN_MS):
+            action = f"{action} {CLOCK_OFFSET_MARK}"
         if self.actuator.unit == "subs":
             print(
                 f"  {int(round(t_rel)):>5d}s     "
@@ -1341,6 +1368,7 @@ async def run_subscriber_client(host: str, port: int, path: str,
                     trackname=args.trackname,
                     on_object=stats.on_object,
                 )
+                stats.timing = track.timing
                 try:
                     await track.subscribe()
                     break
@@ -1495,8 +1523,8 @@ def parse_args():
     p.add_argument("--loopback", action="store_true",
                    help="Explicitly select the loopback self-test "
                         "(the default when no URL is given)")
-    p.add_argument("-p", "--port", type=int, default=None,
-                   metavar="PORT", dest="loopback_port",
+    p.add_argument("--loopback-port", type=int, default=None,
+                   metavar="PORT",
                    help="Loopback listen port (default: 4435)")
     p.add_argument("--mp", action="store_true", dest="mp_loopback",
                    help="Run this role across separate processes rather "
@@ -1514,7 +1542,7 @@ def parse_args():
     p.add_argument("--key", default=KEY)
     p.add_argument("--report", metavar="PATH",
                    help="write per-sample metrics as CSV to PATH")
-    p.add_argument("-l", "--latency-threshold", type=float, default=100.0,
+    p.add_argument("--latency-threshold", type=float, default=100.0,
                    metavar="MS", dest="latency_threshold",
                    help="p90 latency SLA in ms; back off after 2 intervals "
                         "over (default: 100)")
@@ -1600,15 +1628,14 @@ def parse_args():
                         "one stream's un-transmitted bytes exceed this. "
                         "Default: aiomoqt default (1 MiB). "
                         "Pass 0 to disable.")
-    p.add_argument(
-        '-?', '--help', action='help',
-        help='Show this help message and exit')
+    _cli.add_help(p)
     args = p.parse_args()
 
     # Addressing: a URL says where to dial; loopback options say what to
     # bind. Never both — silent precedence hides which mode you got.
     if args.relay_url and (args.loopback or args.loopback_port is not None):
-        p.error("--loopback/-p are self-test options and cannot be "
+        p.error("--loopback/--loopback-port are self-test options and "
+                "cannot be "
                 "combined with a URL — a URL says where to dial, "
                 "loopback options say what to bind")
 
@@ -1953,6 +1980,7 @@ async def main():
     # (publisher started, but no subscriber → rx stays 0).
     subs_pub_proc = None
     subs_pub_stop = None
+    lag_task = None
     try:
         if relay_mode or (args.mode == "bw" and args.mp_loopback):
             if args.mode == "bw" and pub_proc is not None and sub_proc is not None:
@@ -2071,7 +2099,6 @@ async def main():
         # publisher resets, the wall is single-loop tail latency
         # (harness coupling), not the pico/mvfst stacks. Prints peak +
         # mean lag each report interval.
-        lag_task = None
         if os.environ.get("AIOMOQT_LOOP_LAG") == "1":
             async def _loop_lag_probe():
                 period = 0.1

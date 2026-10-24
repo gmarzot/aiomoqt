@@ -8,8 +8,10 @@
 """
 import argparse
 import asyncio
+import contextlib
 import functools
 import logging
+import sys
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.types import (ForwardingPreference, MOQTMessageType,
@@ -84,8 +86,9 @@ The URL scheme selects the transport:
     _cli.add_endpoint(parser)
     _cli.add_identity(parser)
     _cli.add_publisher_media(parser)
-    _cli.add_run(parser, interval=False)
+    _cli.add_run(parser)
     _cli.add_session(parser)
+    _cli.add_timestamps(parser)
     pub_mode = parser.add_mutually_exclusive_group()
     pub_mode.add_argument('--pub-ns', action='store_true',
                           help='Flow A: PUB_NS only, wait for SUBSCRIBE '
@@ -236,7 +239,17 @@ async def run(args):
                                 _redirect)
 
     print("  Connecting...")
-    async with client.connect() as session:
+    failed = False
+    async with contextlib.AsyncExitStack() as stack:
+        try:
+            async with asyncio.timeout(args.duration or None):
+                session = await stack.enter_async_context(client.connect())
+        except TimeoutError:
+            print(f"  Connection failed: no session within {args.duration}s")
+            return 1
+        except Exception as e:
+            print(f"  Connection failed: {e}")
+            return 1
         try:
             if args.token_reject:
                 session.auth_token_validator = _token_validator(
@@ -261,6 +274,7 @@ async def run(args):
                     resolution=args.video,
                     fps=args.rate or 30,
                     auth_token=args.auth_token.encode() or None,
+                    timestamps=args.timestamps,
                 )
             else:
                 track_class = (_EmptyTrack if args.no_objects
@@ -278,6 +292,7 @@ async def run(args):
                                 if args.datagram
                                 else ForwardingPreference.SUBGROUP),
                     auth_token=args.auth_token.encode() or None,
+                    timestamps=args.timestamps,
                 )
             if args.prefill:
                 track.prefill(args.prefill)
@@ -297,6 +312,7 @@ async def run(args):
                     num_subgroups=args.streams,
                     rate=args.rate,
                     auth_token=args.auth_token.encode() or None,
+                    timestamps=args.timestamps,
                 )
                 await second.publish(forward=args.forward)
             loop = asyncio.get_running_loop()
@@ -316,21 +332,19 @@ async def run(args):
                 print(f"\n  Duration {args.duration}s reached.")
         except Exception as e:
             print(f"  Error: {e}")
+            failed = True
 
     print("  Done.")
+    return 1 if failed else 0
 
 
 def cli():
     """Console entry point (moq-pub-bench)."""
     try:
-        asyncio.run(run(parse_args()))
+        sys.exit(asyncio.run(run(parse_args())))
     except KeyboardInterrupt:
         print("\n  Interrupted.")
 
 
 if __name__ == "__main__":
-    try:
-        args = parse_args()
-        asyncio.run(run(args))
-    except KeyboardInterrupt:
-        print("\n  Interrupted.")
+    cli()

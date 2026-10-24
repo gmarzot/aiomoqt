@@ -27,7 +27,9 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Deque, Dict, List, Optional, Union
 
+from ..track import merge_track_properties
 from ..utils.stats import send_time_us
+from ..utils.timing import TimestampMalformed, TrackTiming
 from .errors import AgentError, DecodeError
 from .spec import FetchSpec, SubscribeSpec
 
@@ -134,12 +136,22 @@ class Reader:
         self._closed = False
         self._done = False
         self._ended: Optional[str] = None
+        self.timing = TrackTiming()
 
     # -- ingest: event-loop side, O(1), never raises -----------------
     # The guards cover admission as well as construction: an exception
     # escaping here is reported by the protocol layer as a parse error
     # and rejects the stream, so a consumer fault would present as a
     # peer protocol violation.
+
+    def on_reply(self, msg, vi64: bool) -> None:
+        """SUBSCRIBE_OK hook: the track's timing context."""
+        merged, _, dups = merge_track_properties(
+            getattr(msg, 'track_extensions', None), vi64)
+        try:
+            self.timing = TrackTiming.from_properties(merged, vi64, dups)
+        except TimestampMalformed:
+            self.stats.errors += 1
 
     def on_object(self, msg, size, recv_time_us, group_id=None,
                   subgroup_id=None) -> None:
@@ -171,7 +183,9 @@ class Reader:
             payload=getattr(msg, "payload", b"") or b"",
             size=size,
             recv_us=recv_time_us,
-            sent_us=send_time_us(getattr(msg, "extensions", None)),
+            sent_us=send_time_us(getattr(msg, "extensions", None),
+                                 self.timing, group_id,
+                                 getattr(msg, "object_id", None)),
             decode=self._decode,
         ))
 

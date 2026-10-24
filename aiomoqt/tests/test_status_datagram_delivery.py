@@ -14,6 +14,7 @@ def _session(draft):
     s._object_handlers = {}
     s._track_default_priority = {}
     s._malformed_aliases = set()
+    s._timing_watch = {}
     s._group_bound = {}
     s._track_bound = {}
     s.delivered = []

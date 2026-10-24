@@ -13,7 +13,7 @@ higher objects are deltas; a new independent catalog starts a new group.
 from __future__ import annotations
 
 import asyncio
-from typing import Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from ..messages import SubgroupHeader
 from ..track import PublishedTrack, TrackState
@@ -323,7 +323,9 @@ class MediaSubscriber:
     sees every media-track object first (see LocTrackSubscriber);
     on_catalog(catalog) fires on every independent catalog or applied
     delta. `loc_bare` expects LOC payloads without the Private
-    Properties block.
+    Properties block. `timestamp_errors` is each media track's
+    SubscribedTrack policy. A media track's Track Properties are its
+    subscriber's (`tracks[name]`); `properties(name)` is the merged view.
     """
 
     def __init__(self, session, namespace: str, *,
@@ -332,10 +334,12 @@ class MediaSubscriber:
                  track_filter: Optional[Callable] = None,
                  discover: bool = False,
                  on_arrival: Optional[Callable] = None,
-                 loc_bare: bool = False):
+                 loc_bare: bool = False,
+                 timestamp_errors: str = 'cancel'):
         self.session = session
         self.namespace = namespace
         self.loc_bare = loc_bare
+        self.timestamp_errors = timestamp_errors
         # Treat `namespace` as a prefix and resolve it to the namespace
         # actually being published under it (§9.4), so a subscriber can
         # find a broadcast whose name it was never told.
@@ -350,6 +354,12 @@ class MediaSubscriber:
         self._catalog_at: Optional[tuple] = None
         self.tracks: Dict[str, LocTrackSubscriber] = {}
         self._have_catalog = asyncio.Event()
+
+    def properties(self, name: str) -> Dict[int, Any]:
+        """Merged Track Properties (0x0B unwrapped) of media track `name`;
+        empty until its SUBSCRIBE_OK or PUBLISH arrives."""
+        sub = self.tracks.get(name)
+        return sub.properties if sub is not None else {}
 
     async def start(self, timeout: float = 10.0) -> Catalog:
         """Join the catalog track (SUBSCRIBE + joining FETCH, msf-01 §5
@@ -483,7 +493,8 @@ class MediaSubscriber:
                           self.on_frame and self.on_frame(_n, f, gid, oid)),
                 on_arrival=(lambda m, rx, gid, sg, f, _n=name:
                             self.on_arrival
-                            and self.on_arrival(_n, m, rx, gid, sg, f)))
+                            and self.on_arrival(_n, m, rx, gid, sg, f)),
+                timestamp_errors=self.timestamp_errors)
             namespace = entry.namespace or self.namespace
             if init is not None:
                 sub = LocmafTrackSubscriber(self.session, namespace, name,
@@ -499,5 +510,11 @@ class MediaSubscriber:
                 init = self.catalog.resolve_init(entry)
                 if init is not None:
                     sub.set_config(init)
-            await sub.subscribe()
+            # Registered first: its objects can arrive before subscribe()
+            # returns.
             self.tracks[name] = sub
+            try:
+                await sub.subscribe()
+            except BaseException:
+                self.tracks.pop(name, None)
+                raise
