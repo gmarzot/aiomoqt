@@ -291,16 +291,24 @@ else FFmpeg opens as CMAF tracks, played through MSE as in demo A. HLS goes
 through FFmpeg's reader (PyAV); DASH through `aiomoqt.media.dash`, since
 PyAV ships no DASH demuxer. Chunks keep the source's decode times and
 composition offsets. Needs the `media` extra (Prep).
-- SHELL 1 — a live HLS playlist from your own origin:
-  `python -m aiomoqt.tools.pub_media "$RELAY_WT" --draft 18 -k --pub-both --input http://hls-origin.example/live/index.m3u8 --keepalive 10 --catalog-interval 1 -t 3600`
+- SHELL 1 — live DASH, 640x360@30 with AAC, 2 s segments (DASH-IF livesim2):
+  `python -m aiomoqt.tools.pub_media "$RELAY_WT" --draft 18 -k --pub-both --input https://livesim2.dashif.org/livesim2/testpic_2s/Manifest.mpd --keepalive 10 --catalog-interval 1 -t 3600`
   Startup prints one `input <track>: <codec> <size>` line per track. The
   default `--rendition best` publishes the top video rendition and audio.
-- Live DASH, 640x360@30 with AAC, 2 s segments (DASH-IF livesim2): same line
-  with `--input https://livesim2.dashif.org/livesim2/testpic_2s/Manifest.mpd`.
-- HLS over https, MPEG-TS segments (10 s), VOD (Mux): same line with
-  `--input https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`. VOD is
-  paced in real time and ends with the stream or `-t`; `--loop` does not
-  apply to `--input`.
+- Other sources: the same line with another `--input`. All answered on
+  2026-10-24; public endpoints come and go, so re-check one that fails.
+
+  | `--input` | what | top rendition |
+  |---|---|---|
+  | `https://cph-p2p-msl.akamaized.net/hls/live/2000341/test/master.m3u8` | live HLS, Akamai test channel | 1920x1080@30, ~11 Mbps, HE-AAC |
+  | `https://ntv1.akamaized.net/hls/live/2014075/NASA-NTV1-HLS/master.m3u8` | live HLS, NASA TV public channel | 1280x720@29.97, ~2 Mbps |
+  | `http://sample.vodobox.net/skate_phantom_flex_4k/skate_phantom_flex_4k.m3u8` | HLS VOD, 4K ladder | 3840x2160, ~10.8 Mbps |
+  | `https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8` | HLS VOD (Mux), MPEG-TS, 10 s segments | |
+  | `https://storage.googleapis.com/shaka-demo-assets/angel-one/dash.mpd` | DASH VOD (Shaka demo) | ~4.5 Mbps |
+  | `"$HLS_URL"` | your own HLS origin | |
+
+  VOD is paced in real time and ends with the stream or `-t`; `--loop`
+  does not apply to `--input`.
 - BROWSER: paste the `player:` URL. Add `&debug=1` for the engine log.
 - HLS against DASH, in the page log: `audio order restored` climbs on HLS
   (one group, so one QUIC stream, per AAC frame) and stays near 0 on DASH
