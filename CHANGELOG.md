@@ -75,6 +75,7 @@
 - `PublishedTrack(timestamps='loc'|'frindell'|'both')` and `--timestamps` on pub_bench, loopback_bench and pub_server: generated objects can carry draft-frindell-moq-timestamp timing (paced: TIMESCALE + TIMESTAMP_MAPPING + zig-zag correction; `-r 0`: explicit OBJECT_TIMESTAMP in µs); LOC 0x10 stays the default.
 - pub_media `--timestamp-mapping`: TIMESCALE and TIMESTAMP_MAPPING Track Properties on a fixed-cadence track (the mp4's own timescale, the tone at 48 kHz) with OBJECT_TIMESTAMP only off schedule, explicit OBJECT_TIMESTAMP on live and irregular-GOP sources, and a capture-time prft on each CMAF/LOCMAF group start; LOC TIMESTAMP is unchanged.
 - pub_media: paced feeders share one start and wall clock.
+- Relay: the object cache keeps its 8 newest groups when group IDs skip; a timestamp-numbered catalog no longer loses its previous group, which reset fills the cache could serve.
 
 ## v0.13.1
 
