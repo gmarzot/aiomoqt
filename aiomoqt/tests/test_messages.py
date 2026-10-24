@@ -1901,24 +1901,23 @@ class TestFetchObjectD16:
         assert result.end_of_range == FETCH_FLAGS_END_UNKNOWN
         assert result.group_id == 20
 
-    def test_status_end_of_group(self):
-        """payload_len=0 with END_OF_GROUP status code."""
+    @pytest.mark.parametrize("status", [ObjectStatus.END_OF_GROUP,
+                                        ObjectStatus.END_OF_TRACK])
+    def test_status_is_not_encoded(self, status):
+        """d16 FETCH objects carry no Object Status (§10.2.1.1)."""
         obj = FetchObject(group_id=3, subgroup_id=0, object_id=30,
-                          publisher_priority=128,
-                          status=ObjectStatus.END_OF_GROUP,
+                          publisher_priority=128, status=status,
                           payload=b'')
-        result = _fetch_object_roundtrip(obj, MOQT_VERSION_DRAFT16)
-        assert result.status == ObjectStatus.END_OF_GROUP
-        assert result.payload == b''
+        with pytest.raises(ValueError, match="no Object Status"):
+            _fetch_object_roundtrip(obj, MOQT_VERSION_DRAFT16)
 
-    def test_status_end_of_track(self):
-        """payload_len=0 with END_OF_TRACK status code."""
-        obj = FetchObject(group_id=5, subgroup_id=0, object_id=100,
-                          publisher_priority=128,
-                          status=ObjectStatus.END_OF_TRACK,
-                          payload=b'')
+    def test_zero_length_normal(self):
+        """payload_len=0 ends the object; no Status follows."""
+        obj = FetchObject(group_id=3, subgroup_id=0, object_id=30,
+                          publisher_priority=128, payload=b'')
         result = _fetch_object_roundtrip(obj, MOQT_VERSION_DRAFT16)
-        assert result.status == ObjectStatus.END_OF_TRACK
+        assert result.status == ObjectStatus.NORMAL
+        assert result.payload == b''
 
     def test_first_object_missing_group_id_raises(self):
         """First object on stream missing Group ID → ValueError."""

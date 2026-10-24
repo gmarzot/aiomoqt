@@ -5,6 +5,12 @@
 - Data streams: an object spanning several chunks is parsed once its bytes have arrived, not again on every chunk.
 - d20/d22 FILL_PARAMETERS: a Length-prefixed value is read as a counted block when one ends exactly at the Length, else as bare parameters (moxygen's form), so a counted block of ten or more parameters decodes.
 
+## v0.13.3
+
+- FETCH at d16 and d18: objects carry no Object Status and status objects are not sent. aiomoqt 0.13.2 and earlier send one, so a FETCH from such a publisher that includes a status object does not parse.
+- PublishedTrack: a whole-group FETCH of a group no longer in the history ends its End of Unknown Range at a valid Object ID; at d16 it failed after FETCH_OK and the FETCH hung.
+- d20/d22 FILL_PARAMETERS is sent length-prefixed (Length, then a counted parameter block), as the drafts define, so join() and joining FETCH work through third-party relays; the count-only form is still read.
+
 ## v0.13.2
 
 - pub_media: the `player:` line is printed only when `--player-base` or `AIOMOQT_PLAYER_URL` is set; the localhost default is gone.

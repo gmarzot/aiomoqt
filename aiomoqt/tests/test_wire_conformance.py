@@ -321,45 +321,99 @@ def test_d18_fetch_first_object_must_be_absolute():
         FetchObject.deserialize(rb, prior=None, prof=prof)
 
 
-def test_d18_fetch_zero_length_encodes_status():
-    # Golden bytes per moxygen's writer (writeStreamObject): a zero
-    # Payload Length is followed by an explicit Status varint.
+def test_d18_fetch_zero_length_carries_no_status():
     objs = [
         FetchObject(group_id=1, subgroup_id=0, object_id=0,
                     publisher_priority=200, payload=b"tt"),
         FetchObject(group_id=1, subgroup_id=0, object_id=1,
                     publisher_priority=200, payload=b""),
-        FetchObject(group_id=1, subgroup_id=0, object_id=2,
-                    publisher_priority=200,
-                    status=ObjectStatus.END_OF_GROUP, payload=b""),
     ]
     chain = _fetch_chain_roundtrip(objs)
     # First: flags GD|OD|PRI = 0x1C, absolute ids, len 2 + payload.
     assert chain[0][0] == bytes.fromhex("1c0100c8027474")
-    # Zero-length Normal: flags 0, len 0, explicit status 0.
-    assert chain[1][0] == bytes.fromhex("000000")
-    # End of Group: flags 0, len 0, status 3.
-    assert chain[2][0] == bytes.fromhex("000003")
-    assert [g.status for _, g in chain] == [
-        ObjectStatus.NORMAL, ObjectStatus.NORMAL, ObjectStatus.END_OF_GROUP]
-    assert [g.payload for _, g in chain] == [b"tt", b"", b""]
+    # Zero-length Normal: flags 0, len 0, nothing after.
+    assert chain[1][0] == bytes.fromhex("0000")
+    assert [g.payload for _, g in chain] == [b"tt", b""]
 
 
-def test_d18_fetch_non_normal_status_guards():
-    prof = profile_for(18)
-    with pytest.raises(ValueError, match="empty payload"):
-        FetchObject(group_id=1, object_id=0,
-                    status=ObjectStatus.END_OF_GROUP,
-                    payload=b"x").serialize(prof=prof)
-    with pytest.raises(ValueError, match="non-Normal"):
-        FetchObject(group_id=1, object_id=0,
-                    status=ObjectStatus.END_OF_GROUP,
-                    extensions={8: 1}, payload=b"").serialize(prof=prof)
-    # RX: properties on a non-Normal object close the parse.
-    raw = bytes.fromhex("3c0100c802080500 03".replace(" ", ""))
-    rb = Buffer(data=raw, vi64=True)
-    with pytest.raises(ValueError, match="non-Normal"):
-        FetchObject.deserialize(rb, prior=None, prof=prof)
+# d14 §10.4.4 keeps the Status after a zero Payload Length; d16
+# §10.2.1.1 and d18 §11.2.1.1: absent in Objects delivered via a FETCH.
+@pytest.mark.parametrize("draft, raw", [
+    (14, "05000c80000000"),
+    (16, "1f05000c8000"),
+    (18, "1c050c8000"),
+])
+def test_fetch_zero_length_object_status_by_draft(draft, raw):
+    prof = profile_for(draft)
+    obj = FetchObject(group_id=5, object_id=12, publisher_priority=128)
+    assert bytes(obj.serialize(prof=prof).data) == bytes.fromhex(raw)
+    got = FetchObject.deserialize(
+        Buffer(data=bytes.fromhex(raw), vi64=prof.vi64), prof=prof)
+    assert (got.object_id, got.payload, got.status) == (
+        12, b"", ObjectStatus.NORMAL)
+
+
+def test_d14_fetch_end_of_group_keeps_its_status():
+    prof = profile_for(14)
+    raw = bytes(FetchObject(group_id=5, object_id=12, publisher_priority=128,
+                            status=ObjectStatus.END_OF_GROUP)
+                .serialize(prof=prof).data)
+    assert raw == bytes.fromhex("05000c80000003")
+    got = FetchObject.deserialize(Buffer(data=raw), prof=prof)
+    assert got.status == ObjectStatus.END_OF_GROUP
+
+
+@pytest.mark.parametrize("draft", [16, 18])
+def test_fetch_object_with_status_is_not_encoded(draft):
+    with pytest.raises(ValueError, match="no Object Status"):
+        FetchObject(group_id=5, object_id=12, publisher_priority=128,
+                    status=ObjectStatus.END_OF_GROUP).serialize(
+                        prof=profile_for(draft))
+
+
+@pytest.mark.parametrize("draft, raw", [
+    (16, "1f05000c800003"),
+    (18, "1c050c800003"),
+])
+def test_fetch_object_with_trailing_status_does_not_parse(draft, raw):
+    # aiomoqt 0.13.2's form: the Status reads as the next object's
+    # Serialization Flags (0x03: Subgroup ID present), then runs short.
+    prof = profile_for(draft)
+    rb = Buffer(data=bytes.fromhex(raw), vi64=prof.vi64)
+    first = FetchObject.deserialize(rb, prof=prof)
+    assert (first.object_id, first.status) == (12, ObjectStatus.NORMAL)
+    with pytest.raises(Exception):
+        FetchObject.deserialize(rb, prior=first, prof=prof)
+
+
+# A whole-group FETCH of an evicted group: the End of Unknown Range
+# marker ends at Object ID 2^62-1, which both varint codecs carry.
+@pytest.mark.parametrize("draft, raw", [
+    (16, "410c" "02" "ffffffffffffffff"),
+    (18, "810c" "02" "ff3fffffffffffffff"),
+])
+def test_whole_group_unknown_range_marker_bytes(draft, raw):
+    from aiomoqt.delivery import ObjectHistory
+    from aiomoqt.messages.data import FETCH_FLAGS_END_UNKNOWN
+    prof = profile_for(draft)
+    h = ObjectHistory(4000)
+    for g in range(10):
+        for o in range(5):
+            h.add(g, o, b"x" * 100)
+    marker, = h.fetch((2, 0), (2, 1 << 62))
+    assert bytes(marker.serialize(prof=prof).data) == bytes.fromhex(raw)
+    got = FetchObject.deserialize(
+        Buffer(data=bytes.fromhex(raw), vi64=prof.vi64), prof=prof)
+    assert (got.end_of_range, got.group_id, got.object_id) == (
+        FETCH_FLAGS_END_UNKNOWN, 2, (1 << 62) - 1)
+
+
+def test_d16_object_id_past_the_varint_is_not_encoded():
+    from aiomoqt.messages.data import FETCH_FLAGS_END_UNKNOWN
+    with pytest.raises(ValueError, match="too large"):
+        FetchObject(group_id=2, object_id=1 << 62,
+                    end_of_range=FETCH_FLAGS_END_UNKNOWN).serialize(
+                        prof=profile_for(16))
 
 
 def test_d18_fetch_first_object_sg_prior_rejected():
@@ -1187,26 +1241,52 @@ def _unparams(raw, draft, scope=None):
 _NO_SUBGROUP_FILTER = RangeFilter(set_id=None)
 
 
+# d20 §10.2.15, d22 §9.20.15: FILL_PARAMETERS is length-prefixed; its
+# value is a parameter block as for a separate message (Number of
+# Parameters, then Parameters). Bytes derived by hand.
 @pytest.mark.parametrize("draft", [20, 22])
 @pytest.mark.parametrize("params, raw", [
-    ({0x23: {0x0A: 5}}, "01" "23" "01" "0a05"),
-    ({0x23: {0x21: LocationFilter.relative(1)}}, "01" "23" "01" "210101"),
+    ({0x23: {0x21: LocationFilter.relative(2)}}, "01" "23" "04" "01210102"),
+    ({0x23: {0x0A: 5}}, "01" "23" "03" "010a05"),
     ({0x23: {0x0A: 5, 0x21: LocationFilter.relative(1)},
       0x25: [_NO_SUBGROUP_FILTER]},
-     "02" "23" "02" "0a05" "170101" "02" "00"),
-    ({0x23: {}}, "01" "23" "00"),
-], ids=["fill-only", "location-filter", "then-subgroup-filter", "empty"])
-def test_fill_parameters_is_count_prefixed(draft, params, raw):
-    # moq-transport PR #2015: Number of Parameters, then the Parameters,
-    # with no Length; LOCATION_FILTER inside keeps its own encoding.
+     "02" "23" "06" "020a05170101" "02" "00"),
+    ({0x23: {}}, "01" "23" "01" "00"),
+], ids=["location-filter", "fill-only", "then-subgroup-filter", "empty"])
+def test_fill_parameters_is_length_prefixed(draft, params, raw):
     assert _params(params, draft) == bytes.fromhex(raw)
     assert _unparams(bytes.fromhex(raw), draft) == params
 
 
 def test_d22_fill_nests_the_typed_location_filter():
     raw = _params({0x23: {0x21: LocationFilter.next_object()}}, 22)
-    assert raw == bytes.fromhex("01" "23" "01" "2105")
+    assert raw == bytes.fromhex("01" "23" "03" "012105")
     assert _unparams(raw, 22) == {0x23: {0x21: LocationFilter.next_object()}}
+
+
+@pytest.mark.parametrize("draft", [20, 22])
+@pytest.mark.parametrize("raw, fill", [
+    ("01" "23" "01" "210102", {0x21: LocationFilter.relative(2)}),
+    ("01" "23" "01" "0a05", {0x0A: 5}),
+    ("02" "23" "02" "0a05170101" "02" "00",
+     {0x0A: 5, 0x21: LocationFilter.relative(1)}),
+    ("01" "23" "00", {}),
+], ids=["location-filter", "fill-only", "then-subgroup-filter", "empty"])
+def test_count_prefixed_fill_parameters_is_still_read(draft, raw, fill):
+    # moq-transport PR #2015 (aiomoqt 0.13.2): Number of Parameters,
+    # then the Parameters, with no Length.
+    assert _unparams(bytes.fromhex(raw), draft)[0x23] == fill
+
+
+@pytest.mark.parametrize("draft", [20, 22])
+@pytest.mark.parametrize("raw", [
+    "01" "23" "03" "01210102",
+    "01" "23" "02" "02" "0a05",
+], ids=["one-byte-short", "count-past-length"])
+def test_fill_length_shorter_than_its_count_is_a_protocol_violation(draft,
+                                                                    raw):
+    with pytest.raises(MOQTProtocolViolation):
+        _unparams(bytes.fromhex(raw), draft)
 
 
 @pytest.mark.parametrize("raw, fill", [
@@ -1303,7 +1383,7 @@ def test_shape_a_parameter_overrunning_its_length_is_a_protocol_violation(
 
 @pytest.mark.parametrize("raw, match", [
     ("01" "23" "02" "210101", "unknown message parameter|truncated|"
-     "overran|exceeds|exhausted"),
+     "overran|overruns|exceeds|exhausted"),
     ("01" "23" "02" "1001", "not allowed in FillParameters"),
     ("01" "23" "02" "7f01", "unknown message parameter"),
     ("01" "23" "03" "02" "0a05", "exhausted|unknown message parameter"),
@@ -1332,15 +1412,19 @@ def test_malformed_fill_parameters_is_a_protocol_violation(raw, match):
 
 
 @pytest.mark.parametrize("draft", [20, 22])
-@pytest.mark.parametrize("raw", ["0123" "01" "0301ff", "012304" "010301ff"],
+@pytest.mark.parametrize("raw, counted", [("0123" "01" "0301ff", True),
+                                          ("012304" "010301ff", False)],
                          ids=["counted", "length-prefixed"])
 def test_forbidden_fill_parameter_closes_before_its_value_is_decoded(
-        draft, raw):
+        draft, raw, counted):
     # AUTHORIZATION_TOKEN (0x03) with an undecodable value inside
     # FILL_PARAMETERS: the scope check (Table 7) comes first.
+    raw = bytes.fromhex(raw)
     with pytest.raises(MOQTProtocolViolation, match="not allowed in "
                        "FillParameters"):
-        _unparams(bytes.fromhex(raw), draft)
+        MOQTMessage._pull_params(Buffer(data=raw, vi64=True),
+                                 prof=_prof(draft), buf_end=len(raw),
+                                 fill_counted=counted)
 
 
 def test_namespace_prefix_parameter_d20_prefixed_d22_bare():
