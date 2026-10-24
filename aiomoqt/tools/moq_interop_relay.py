@@ -441,6 +441,9 @@ class _RelayedTrack:
         # all, and an unbounded one is a leak.
         self._cache = deque()
         self._cache_bytes = 0
+        # Objects cached per group ID; the bound counts groups, as IDs
+        # may skip.
+        self._groups = {}
         # (group, subgroup) whose upstream stream ended cleanly; a replay
         # FINs them on the subscriber it serves.
         self._ended = set()
@@ -839,12 +842,20 @@ class _RelayedTrack:
         self._cache.append((gid, sgid, oid, payload, exts, prio, status,
                             shape))
         self._cache_bytes += len(payload or b"")
+        self._groups[gid] = self._groups.get(gid, 0) + 1
         self.note_largest((gid, oid))
-        oldest_kept = gid - CACHE_GROUPS + 1
-        while self._cache and (self._cache[0][0] < oldest_kept
+        self._evict()
+
+    def _evict(self) -> None:
+        """Drop the oldest objects past CACHE_GROUPS groups or
+        CACHE_BYTES."""
+        while self._cache and (len(self._groups) > CACHE_GROUPS
                                or self._cache_bytes > CACHE_BYTES):
             dropped = self._cache.popleft()
             self._cache_bytes -= len(dropped[3] or b"")
+            left = self._groups.pop(dropped[0]) - 1
+            if left:
+                self._groups[dropped[0]] = left
         if self._cache:
             first = self._cache[0][0]
             self._ended = {k for k in self._ended if k[0] >= first}
@@ -1363,7 +1374,12 @@ async def _backfill(track, msg, largest) -> None:
         return
     want = _subscription_window(msg, largest)[0]
     if want < (track.upstream_from or cf):
-        start = max(want, (max(0, cf[0] - CACHE_GROUPS + 1), 0))
+        # The cache's reach: CACHE_GROUPS groups, by the IDs it has seen
+        # below cf, never short of a contiguous span.
+        seen = sorted(g for g in track._groups if g < cf[0])
+        reach = min([cf[0] - CACHE_GROUPS + 1,
+                     *seen[-(CACHE_GROUPS - 1):][:1]])
+        start = max(want, (max(0, reach), 0))
     else:
         start = max(want, (cf[0], 0))
     ns, name = track.key
@@ -1385,6 +1401,9 @@ async def _backfill(track, msg, largest) -> None:
     track._cache = deque(sorted([*new, *track._cache],
                                 key=lambda c: (c[0], c[2])))
     track._cache_bytes += sum(len(c[3]) for c in new)
+    for c in new:
+        track._groups[c[0]] = track._groups.get(c[0], 0) + 1
+    track._evict()
     track._backfilled.update((c[0], c[2]) for c in new)
     # Groups before complete_from's came whole: a replay FINs them.
     track._ended.update((c[0], c[1]) for c in new if c[0] < cf[0])
@@ -1944,6 +1963,9 @@ async def _serve_fill(track, d, request_id, fill, rng,
                                  o.payload, o.extensions,
                                  o.publisher_priority, o.status)
                                 for o in up], "upstream"
+        if objs is None and track.cache_covers(start):
+            # Cached while upstream was asked.
+            objs = track.cached_range(start, end)
         gap = None
         if objs is None and timeout_ms is not None:
             objs = track.cached_range(start, end)
@@ -2546,14 +2568,20 @@ async def _on_fetch(session, msg):
         # the publisher — which is also the only path for a track this
         # relay has never subscribed to.
         up_ok, upstream, refusal = await _fetch_upstream(ns, track_name, msg)
-        if upstream is None and refusal is not None:
+        if (not upstream and track is not None and _track_live(track)
+                and track.cache_covers(start)):
+            # Cached while upstream was asked.
+            objs = track.cached_range(start, end)
+        if objs:
+            end_of_track = int(objs[-1][6] == ObjectStatus.END_OF_TRACK)
+        elif upstream is None and refusal is not None:
             code, reason = refusal
             logger.info(f"relay: FETCH ns={ns} track={track_name} "
                         f"-> {code.name} (upstream: {reason})")
             session.fetch_error(request_id=msg.request_id, error_code=code,
                                 reason=reason)
             return
-        if upstream is None:
+        elif upstream is None:
             logger.info(f"relay: FETCH ns={ns} track={track_name} "
                         f"-> DOES_NOT_EXIST")
             session.fetch_error(
@@ -2561,18 +2589,19 @@ async def _on_fetch(session, msg):
                 error_code=RequestErrorCode.DOES_NOT_EXIST,
                 reason="track does not exist")
             return
-        if not upstream:
+        elif not upstream:
             session.fetch_error(
                 request_id=msg.request_id,
                 error_code=RequestErrorCode.INVALID_RANGE,
                 reason="requested range unavailable")
             return
-        objs = [(o.group_id, o.subgroup_id, o.object_id, o.payload,
-                 o.extensions, o.publisher_priority, o.status)
-                for o in upstream]
-        end_of_track = int(getattr(up_ok, 'end_of_track', 0) or 0)
-        props = dict(getattr(up_ok, "track_extensions", None) or {})
-        source = "upstream"
+        else:
+            objs = [(o.group_id, o.subgroup_id, o.object_id, o.payload,
+                     o.extensions, o.publisher_priority, o.status)
+                    for o in upstream]
+            end_of_track = int(getattr(up_ok, 'end_of_track', 0) or 0)
+            props = dict(getattr(up_ok, "track_extensions", None) or {})
+            source = "upstream"
     if track is not None:
         track._fetches += 1
     if track_name == CATALOG_TRACK:
