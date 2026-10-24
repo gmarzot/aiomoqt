@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.14.0
+
+- loopback_bench and sub_bench print the interval still open when the run ends, so `-t N` reports through second N.
+
 ## v0.13.2
 
 - pub_media: the `player:` line is printed only when `--player-base` or `AIOMOQT_PLAYER_URL` is set; the localhost default is gone.
