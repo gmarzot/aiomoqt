@@ -2,6 +2,12 @@
 
 ## v0.13.2
 
+- Relay: the listening line reports all interfaces, which is what aiopquic binds whatever `--bind` says.
+- README: the subscribe and handler examples match the API. server_example: `-Q` serves raw QUIC, `-Q -W` both on one port; `--retry` is gone.
+- `await_publish()` and `await_namespace()` queue at most 1024 announcements; past that the oldest is dropped, with one WARNING per run of drops.
+- Fan-out: a lane that sheds objects at a group boundary resets the truncated subgroup instead of ending it with END_OF_GROUP and FIN.
+- `max_object_bytes` on MOQTClient and MOQTServer (default 64 MiB): a data stream declaring a larger object gets STOP_SENDING EXCESSIVE_LOAD, and more than 4x that held in incomplete objects closes the session with INTERNAL_ERROR.
+- A data stream on a track alias that nothing binds within 5 s gets STOP_SENDING CANCELLED.
 - pub_media `--loop` with CMAF: tfdt follows the paced timestamps, so audio no longer drifts from video when the clip's last audio frame is short.
 - Relay: the first subscriber no longer narrows the upstream subscription; Next Object with nothing cached starts at {0, 0}, unfiltered subscribers get cached objects, and an earlier start is fetched upstream.
 - adaptive_bench and load_sim: worker processes ignore Ctrl-C; the parent stops them.

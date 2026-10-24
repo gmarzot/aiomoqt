@@ -154,6 +154,47 @@ async def test_a_blocked_lane_sheds_to_the_next_group():
     assert fast.resets == [] and fast.fins(fast.opened[0])
 
 
+async def _overrun_at_a_group_boundary(boundary):
+    """A blocked lane's queue overflows on the item that ends group 0
+    (`boundary` writes it); returns both sessions once drained."""
+    fast, slow = _Session("fast"), _Session("slow", block=True)
+    fan = FanoutDelivery(queue_size=2)
+    fan.add(_delivery(fast), joining=False)
+    lane = fan.add(_delivery(slow), joining=False)
+    await fan.write(0, 0, b"key", group_start=True)
+    await _settle()                         # slow lane parked in group 0
+    await fan.write(0, 1, b"pred")
+    await _settle(2)                        # the fast lane keeps draining
+    await fan.write(0, 2, b"pred")          # slow queue now full
+    await _settle(2)
+    await boundary(fan)                     # overflows: backlog flushed
+    assert lane.shed == 2
+    slow.release()
+    await _settle(60)
+    await fan.close()
+    return fast, slow
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["next_group", "end_group"])
+async def test_overflow_at_a_group_boundary_resets_the_group(boundary):
+    async def _next_group(fan):
+        await fan.write(1, 0, b"key", group_start=True)
+
+    async def _end_group(fan):
+        fan.end_group()
+
+    fast, slow = await _overrun_at_a_group_boundary(
+        {"next_group": _next_group, "end_group": _end_group}[boundary])
+    # Group 0 lost objects 1 and 2 on the slow peer: reset, no
+    # END_OF_GROUP and no FIN.
+    first = slow.opened[0]
+    assert slow.resets == [first]
+    assert not slow.fins(first)
+    assert len([w for w in slow.writes if w[0] == first]) == 2  # header, object 0
+    assert fast.resets == [] and fast.fins(fast.opened[0])
+
+
 @pytest.mark.asyncio
 async def test_a_paused_peer_is_gated_and_rejoins_at_a_group():
     a, b = _Session("a"), _Session("b")

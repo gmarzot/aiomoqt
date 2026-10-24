@@ -513,8 +513,12 @@ class _Lane:
 
     async def _handle(self, item) -> None:
         if item is _END_GROUP:
-            self.delivery.end_group()
-            self._truncated = False
+            # A group the lane fell out of is reset, never ended.
+            if self.need_group:
+                self._close_truncated()
+            else:
+                self.delivery.end_group()
+                self._truncated = False
             return
         if item is _RESET_GROUP:
             self._close_truncated()
@@ -529,8 +533,8 @@ class _Lane:
             self.need_group = True
             return
         if self.need_group:
+            self._close_truncated()
             if not group_start:
-                self._close_truncated()
                 self.shed += 1
                 return
             self.need_group = False

@@ -17,13 +17,13 @@ def parse_args():
     parser.add_argument('-Q', '--quic', action='store_true',
                         help='Serve raw QUIC')
     parser.add_argument('-W', '--wt', action='store_true',
-                        help='Serve H3/WebTransport (default)')
+                        help='Serve H3/WebTransport (default; with -Q, '
+                             'both on one port)')
     parser.add_argument('--cert', dest='certificate', type=str, required=True,
                         help='TLS server certificate')
     parser.add_argument('--key', dest='private_key', type=str, required=True,
                         help='TLS private key')
     parser.add_argument('--path', type=str, default="", help='MOQT WebTransport path (default: "/")')
-    parser.add_argument('--retry', action='store_true', help='send a retry for new connections')
     parser.add_argument('--debug', action='store_true', help='Enable debug output')
     parser.add_argument('--quic-debug', action='store_true',  help='Enable quic debug output')
     parser.add_argument('--keylogfile', type=str, default=None, help='TLS secrets file')
@@ -46,6 +46,7 @@ async def main(args):
         certificate=args.certificate,
         private_key=args.private_key,
         path=args.path,
+        use_quic=args.quic and not args.wt,
         debug=args.debug,
         congestion_control_algorithm=args.cc_algo,
     )
@@ -53,7 +54,10 @@ async def main(args):
     logger.info(f"MOQT server: starting session: {server}")
     try:
         # run until closed
-        quic_server = await server.serve()
+        if args.quic and args.wt:
+            quic_server = await server.serve_dual()
+        else:
+            quic_server = await server.serve()
 
         await server.closed()
             

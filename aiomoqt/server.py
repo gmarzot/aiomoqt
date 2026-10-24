@@ -13,6 +13,7 @@ from aiopquic.quic.configuration import QuicConfiguration
 
 from .protocol import (DEFAULT_TX_MAX_INFLIGHT_BYTES, MOQTPeer,
                         MOQTSessionQuic, MOQTSessionWTServer, USER_AGENT)
+from .messages.data import DEFAULT_MAX_OBJECT_BYTES
 from .types import (SessionCloseCode, moqt_alpn_for_version,
                     normalize_supported_drafts)
 from .utils.logger import *
@@ -92,9 +93,11 @@ class MOQTServer(MOQTPeer):
         implementation: Optional[str] = USER_AGENT,
         quiet_peers: Iterable[str] = (),
         max_filter_ranges: int = 0,
+        max_object_bytes: int = DEFAULT_MAX_OBJECT_BYTES,
     ):
         super().__init__(tx_max_inflight_bytes=tx_max_inflight_bytes,
-                         implementation=implementation)
+                         implementation=implementation,
+                         max_object_bytes=max_object_bytes)
         self.host = host
         self.port = port
         self.path = path
