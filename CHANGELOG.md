@@ -2,6 +2,7 @@
 
 ## v0.13.2
 
+- pub_media `--loop` with CMAF: tfdt follows the paced timestamps, so audio no longer drifts from video when the clip's last audio frame is short.
 - Relay: the first subscriber no longer narrows the upstream subscription; Next Object with nothing cached starts at {0, 0}, unfiltered subscribers get cached objects, and an earlier start is fetched upstream.
 - adaptive_bench and load_sim: worker processes ignore Ctrl-C; the parent stops them.
 - Relay status: each session reports `rtt_min_ms` beside `rtt_ms`.
