@@ -2250,9 +2250,29 @@ class SubscribedTrack(Track):
                                trackname: Optional[str],
                                tracks_reply: Optional[asyncio.Future]):
         """The discovered PUBLISH, or the peer's refusal of SUBSCRIBE_TRACKS.
-        A reply that times out leaves the PUBLISH wait running."""
-        publish = asyncio.ensure_future(
-            self.session.await_publish(timeout=timeout, trackname=trackname))
+        A reply that times out leaves the PUBLISH wait running; a PUBLISH
+        wait that times out names the tracks offered instead."""
+        offered = []
+
+        async def _matching():
+            try:
+                async with asyncio.timeout(timeout):
+                    while True:
+                        msg = await self.session.await_publish(timeout=timeout)
+                        name = (msg.track_name.decode()
+                                if isinstance(msg.track_name, bytes)
+                                else msg.track_name)
+                        if trackname is None or name == trackname:
+                            return msg
+                        offered.append(name)
+            except TimeoutError:
+                if offered:
+                    raise TimeoutError(
+                        f"no PUBLISH for '{trackname}'; offered: "
+                        f"{', '.join(offered)}") from None
+                raise
+
+        publish = asyncio.ensure_future(_matching())
         if tracks_reply is None:
             return await publish
         tracks_reply.add_done_callback(

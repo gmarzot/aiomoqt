@@ -92,3 +92,21 @@ async def test_expected_trackname_skips_other_tracks(draft, use_quic):
         assert sub.trackname == "video"
         assert sub.namespace == "disc/a"
         assert pub._close_err is None and rx._close_err is None
+
+
+@requires_certs
+@_CASES
+async def test_expected_trackname_timeout_names_the_offered_tracks(draft,
+                                                                  use_quic):
+    async def offer(session, msg):
+        session.subscribe_tracks_ok(msg)
+        await PublishedTrack(session, namespace="disc/a",
+                             trackname="track.2dvideo").publish(publish_track=True)
+
+    async with _peers(_port(8, draft, use_quic), use_quic, draft,
+                      offer) as (pub, rx):
+        sub = SubscribedTrack(rx, "disc/a")
+        sub._quiet = True
+        with pytest.raises(TimeoutError, match="offered: track.2dvideo"):
+            await sub.subscribe(timeout=1, expected_trackname="track-video")
+        assert pub._close_err is None and rx._close_err is None
