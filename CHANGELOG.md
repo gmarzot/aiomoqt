@@ -8,6 +8,11 @@
 - Fan-out: a lane that sheds objects at a group boundary resets the truncated subgroup instead of ending it with END_OF_GROUP and FIN.
 - `max_object_bytes` on MOQTClient and MOQTServer (default 64 MiB): a data stream declaring a larger object gets STOP_SENDING EXCESSIVE_LOAD, and more than 4x that held in incomplete objects closes the session with INTERNAL_ERROR.
 - A data stream on a track alias that nothing binds within 5 s gets STOP_SENDING CANCELLED.
+- pub_media `--loop` with CMAF: tfdt follows the paced timestamps, so audio no longer drifts from video when the clip's last audio frame is short.
+- Relay: the first subscriber no longer narrows the upstream subscription; Next Object with nothing cached starts at {0, 0}, unfiltered subscribers get cached objects, and an earlier start is fetched upstream.
+- adaptive_bench and load_sim: worker processes ignore Ctrl-C; the parent stops them.
+- Relay status: each session reports `rtt_min_ms` beside `rtt_ms`.
+- Relay status: a session's `loss_pct` is null unless the relay delivers to it; publisher sessions no longer read ~60% loss from unacked ACK-only packets.
 - PublishedTrack (d18): a REQUEST_UPDATE read together with the PUBLISH reply no longer has its Forward State undone by that reply, which left the track paused with subscribers waiting.
 - load_sim: Ctrl-C during startup no longer hangs: the handler is installed before workers fork, and unread shard commands do not block exit.
 - load_sim: an interrupted run prints its verdict and exits 130.

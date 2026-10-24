@@ -507,6 +507,37 @@ _SCHEMA = os.path.join(os.path.dirname(__file__), "vectors",
 _DATA_KEYED = ("track_history", "by_draft", "by_transport")
 
 
+@requires_certs
+async def test_session_loss_only_on_delivery(relay_tables, tmp_path, monkeypatch):
+    # A publisher session carries mostly unacked ACK-only packets from the
+    # relay; picoquic counts them lost, so its loss_pct must stay null.
+    real = relay._path_quality
+
+    def lossy(session):
+        pq = dict(real(session))
+        pq["lost"] = pq.get("sent", 0) // 2
+        return pq
+    monkeypatch.setattr(relay, "_path_quality", lossy)
+    async with _relay(_PORT + 9, True, 18) as connect:
+        pub = await connect()
+        PublishedTrack(pub, namespace=_NS, trackname="video",
+                       object_size=200, group_size=10, rate=200).attach()
+        await pub.publish_namespace(namespace=_NS, wait_response=True)
+        sub = await connect()
+        await SubscribedTrack(sub, _NS, "video").subscribe(timeout=5)
+        status = relay._Status(str(tmp_path / "status.json"),
+                               {"started": time.time()}, [connect.handle])
+        loop = asyncio.get_running_loop()
+        status.snapshot(loop.time(), time.time())
+        await asyncio.sleep(0.3)
+        snap = status.snapshot(loop.time(), time.time())
+    by_role = {s["role"]: s for s in snap["sessions"]}
+    assert by_role["pub"]["loss_pct"] is None
+    assert by_role["sub"]["loss_pct"] is not None
+    for s in snap["sessions"]:
+        assert 0 <= s["rtt_min_ms"] <= s["rtt_ms"], s
+
+
 _KINDS = ((dict, "object"), (list, "array"), (str, "string"), (bool, "bool"),
           (int, "int"), (float, "float"))
 

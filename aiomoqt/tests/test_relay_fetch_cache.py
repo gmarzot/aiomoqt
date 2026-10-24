@@ -162,9 +162,11 @@ async def test_fetch_bytes_by_source_in_status(use_quic, relay_tables):
             end_group=g0 + 1, end_object=0, wait_response=True), 5)
         cache_bytes = await _served(ok.request_id)
 
-        # Nothing forwarded: the joining FETCH goes upstream.
+        # Nothing forwarded: the joining FETCH goes upstream. The
+        # subscription starts past what exists, so nothing is backfilled.
         msg = rx.subscribe(_NS, _HIST, forward=1,
-                           filter_type=FilterType.LATEST_OBJECT)
+                           filter_type=FilterType.ABSOLUTE_START,
+                           start_group=1, start_object=0)
         ok = await rx.joining_fetch(msg.request_id, joining_start=0,
                                     wait_response=True)
         hist_bytes = await _served(ok.request_id)

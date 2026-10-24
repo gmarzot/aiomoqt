@@ -393,8 +393,8 @@ class _Downstream:
 
     @property
     def start(self):
-        """Start Location; None when unfiltered."""
-        return None if self.window is _UNFILTERED else self.window[0]
+        """Start Location; {0, 0} when unfiltered (d18 §5.1.2)."""
+        return self.window[0]
 
 
 class _RelayedTrack:
@@ -459,6 +459,12 @@ class _RelayedTrack:
         # From here on every upstream object of a subgroup reaches the
         # relay (§11.3.2); None when unknown.
         self.complete_from = None
+        # Where the upstream filter starts; {0, 0} when unfiltered.
+        self.upstream_from = None
+        # Groups whose Object 0 arrived from upstream: complete from it.
+        self._heads = set()
+        # Locations a backfill FETCH cached; the live copy is dropped.
+        self._backfilled = set()
         # Track Properties as last received from upstream (§8.4): sent on
         # every reply for the track, replaced whole, never merged.
         self.properties: dict = {}
@@ -674,6 +680,8 @@ class _RelayedTrack:
         if gid != self._last_gid:
             self._groups_in += 1
             self._last_gid = gid
+        if msg.object_id == 0:
+            self._heads.add(gid)
         if self.key[1] == CATALOG_TRACK and msg.object_id == 0:
             _note_catalog(self.key[0], payload)
         # On arrival, so a SUBSCRIBE sees it; objects for the subscriber
@@ -779,6 +787,9 @@ class _RelayedTrack:
                 await self._replay(shape)
                 continue
             if oid is not None:
+                if (gid, oid) in self._backfilled:
+                    self._backfilled.discard((gid, oid))
+                    continue
                 self._remember(gid, sgid, oid, payload, exts, prio, status,
                                shape)
             encoded = {}
@@ -838,6 +849,9 @@ class _RelayedTrack:
             first = self._cache[0][0]
             self._ended = {k for k in self._ended if k[0] >= first}
             self._opened = {k for k in self._opened if k[0] >= first}
+            self._heads = {g for g in self._heads if g >= first}
+            self._backfilled = {k for k in self._backfilled
+                                if k[0] >= first}
             self._stopped = {k for k in self._stopped if k[1] >= first}
 
     async def _replay(self, d) -> None:
@@ -908,7 +922,7 @@ class _RelayedTrack:
         `gid` from before what upstream delivered to this relay."""
         cf = self.complete_from
         return (start is not None and cf is not None
-                and max(start, (gid, 0)) < cf)
+                and max(start, (gid, 0)) < cf and gid not in self._heads)
 
     async def _forward_one(self, session, alias, gid, sgid, oid,
                            payload, exts, prio, status=None, shape=None,
@@ -1295,29 +1309,20 @@ async def _establish_upstream(ns, track_name, forward=True, sub=None):
 
 
 def _upstream_filter(sub) -> dict:
-    """The first subscriber's start for a shared upstream SUBSCRIBE, with
-    no End Group: later subscribers may want more. An unfiltered one stays
-    unfiltered (filter_type None; see _filter_for)."""
+    """The upstream SUBSCRIBE for a track the relay holds nothing of,
+    open-ended so later subscribers can join. A filter relative to
+    Largest starts at {0, 0} here (§3.1.4), so the upstream is unfiltered
+    (see _filter_for); an absolute start is kept. A Relative Start is
+    carried for the publisher to resolve."""
     lf = getattr(sub, "location_filter", None)
-    if lf is not None:
-        if lf.type == LocationFilterType.RELATIVE_START:
-            return {"location_filter": lf}
-        if lf.type == LocationFilterType.NEXT_OBJECT:
-            return {"filter_type": FilterType.LATEST_OBJECT}
-        if lf.type == LocationFilterType.NONE:
-            return {"filter_type": None}
-        return {"filter_type": FilterType.ABSOLUTE_START,
-                "start_group": lf.start_group,
-                "start_object": lf.start_object}
-    ftype = getattr(sub, "filter_type", None)
-    if sub is None or ftype in (FilterType.LATEST_OBJECT,
-                                FilterType.NEXT_GROUP_START):
-        return {"filter_type": ftype or FilterType.LATEST_OBJECT}
-    if ftype in (FilterType.ABSOLUTE_START, FilterType.ABSOLUTE_RANGE):
-        return {"filter_type": FilterType.ABSOLUTE_START,
-                "start_group": sub.start_group or 0,
-                "start_object": sub.start_object or 0}
-    return {"filter_type": None}
+    if lf is not None and lf.type == LocationFilterType.RELATIVE_START:
+        return {"location_filter": lf}
+    start = (_UNFILTERED if sub is None
+             else _subscription_window(sub, None))[0]
+    if start == (0, 0):
+        return {"filter_type": None}
+    return {"filter_type": FilterType.ABSOLUTE_START,
+            "start_group": start[0], "start_object": start[1]}
 
 
 def _filter_for(pub, kwargs: dict) -> dict:
@@ -1347,23 +1352,29 @@ def _delivery_start(kwargs: dict, largest):
                           kwargs.get("start_object"), None, largest)[0]
 
 
-async def _backfill(track, msg) -> None:
-    """Fetch from upstream the head of the group a subscription starts in
-    when the upstream subscription began after it, into the cache, so the
-    subscriber's streams are complete from its start (§11.3.2). Left
-    short when nothing serves it; those streams are then reset."""
+async def _backfill(track, msg, largest) -> None:
+    """Fetch into the cache what a subscription resolved against
+    `largest` is owed from before complete_from (§11.3.2): back to the
+    cache's reach when the upstream filter never asked for it (§9.5.1),
+    else the head of the group delivery began in. Left short when
+    nothing serves it; those streams are then reset."""
     cf = track.complete_from
-    window = _subscription_window(msg, track.largest)
-    if cf is None or window is _UNFILTERED:
+    if cf is None:
         return
-    start = max(window[0], (cf[0], 0))
+    want = _subscription_window(msg, largest)[0]
+    if want < (track.upstream_from or cf):
+        start = max(want, (max(0, cf[0] - CACHE_GROUPS + 1), 0))
+    else:
+        start = max(want, (cf[0], 0))
     ns, name = track.key
     if (start >= cf or track.cache_covers(start)
             or not _fetch_sources(ns, name)):
         return
+    # FETCH End is the last Object plus one; Object 0 is the whole group.
+    end = cf if cf[1] else (cf[0] - 1, 0)
     rng = SimpleNamespace(group_order=GroupOrder.ASCENDING,
                           start_group=start[0], start_object=start[1],
-                          end_group=cf[0], end_object=cf[1])
+                          end_group=end[0], end_object=end[1])
     _, objs, _ = await _fetch_upstream(ns, name, rng, timeout=BACKFILL_S)
     if objs is None or track.complete_from != cf:
         return
@@ -1374,7 +1385,11 @@ async def _backfill(track, msg) -> None:
     track._cache = deque(sorted([*new, *track._cache],
                                 key=lambda c: (c[0], c[2])))
     track._cache_bytes += sum(len(c[3]) for c in new)
+    track._backfilled.update((c[0], c[2]) for c in new)
+    # Groups before complete_from's came whole: a replay FINs them.
+    track._ended.update((c[0], c[1]) for c in new if c[0] < cf[0])
     track.complete_from = start
+    track.upstream_from = min(track.upstream_from or cf, start)
     logger.info(f"relay: backfilled {len(new)} object(s) of {track.key} "
                 f"{start}..{cf}")
 
@@ -1512,6 +1527,9 @@ async def _subscribe_publishers(entry):
         track.note_largest(upstream.largest)
         track.complete_from = _delivery_start(upstream_filter,
                                               upstream.largest)
+        unfiltered = ("location_filter" not in upstream_filter
+                      and upstream_filter.get("filter_type") is None)
+        track.upstream_from = (0, 0) if unfiltered else track.complete_from
         pub.register_stream_end_handler(upstream.track_alias,
                                         track.on_stream_end)
         _tracks[key] = track
@@ -1793,6 +1811,18 @@ def _largest_kwargs(track) -> dict:
             "largest_object_id": track.largest[1]}
 
 
+def _resolve_against(msg, seen, track):
+    """The Largest a SUBSCRIBE's filter resolves against: the relay's own
+    when it arrived (§3.1.4). A Relative Start arriving with none went
+    upstream (_upstream_filter) and resolves against the Largest the
+    publisher reported."""
+    lf = getattr(msg, "location_filter", None)
+    if (seen is None and lf is not None
+            and lf.type == LocationFilterType.RELATIVE_START):
+        return track.largest
+    return seen
+
+
 def _publisher_known(ns: tuple, track_name) -> bool:
     """A publisher could serve this track now: it PUBLISHed the track,
     announced a covering namespace, or the relay dials an origin."""
@@ -1824,11 +1854,13 @@ async def _await_publisher(session, ns: tuple, track_name,
     return True
 
 
-def _attach_subscriber(session, msg, track) -> bool:
+def _attach_subscriber(session, msg, track, largest) -> bool:
     """SUBSCRIBE_OK and join the fan-out with the SUBSCRIBE's Forward
-    State and filter window, against Largest now (§5.1.2). False when
-    the End Group is already behind, answered INVALID_RANGE."""
-    window = _subscription_window(msg, track.largest)
+    State and filter window, resolved against `largest` (§5.1.2); the
+    reply and a joining FETCH take the Largest the relay knows now
+    (§10.2.11). False when the End Group is already behind, answered
+    INVALID_RANGE."""
+    window = _subscription_window(msg, largest)
     if (window[1] is not None and track.largest is not None
             and track.largest[0] > window[1]):
         logger.info(f"relay: subscribe {track.key} -> INVALID_RANGE "
@@ -1844,11 +1876,10 @@ def _attach_subscriber(session, msg, track) -> bool:
                               track_properties=track.properties)
     # FORWARD omitted means 1 (§10.2.12).
     forward = msg.forward is None or bool(msg.forward)
-    # A filter starting at or before Largest is served from the cache
-    # first (§5.1.2: the Start MAY be less than the Largest Object); an
-    # unfiltered subscription starts at the live edge.
-    replay = (window is not _UNFILTERED and track.largest is not None
-              and window[0] <= track.largest)
+    # A window starting at or before Largest is served from the cache
+    # first (§5.1.2: the Start MAY be less than the Largest Object);
+    # unfiltered starts at {0, 0}.
+    replay = track.largest is not None and window[0] <= track.largest
     d = track.add_downstream(session, ok.track_alias, msg.request_id,
                              forward=forward, window=window, replay=replay)
     d.location_filter = getattr(msg, "location_filter", None)
@@ -2076,9 +2107,12 @@ async def _on_subscribe(session, msg):
         track.close()
         _tracks.pop((ns, msg.track_name), None)
         track = None
+    # The relay's Largest as it takes the SUBSCRIBE (§3.1.4).
+    seen = None if track is None else track.largest
     if track is not None and (track.pending_publish or track.upstream):
-        await _backfill(track, msg)
-        if _attach_subscriber(session, msg, track):
+        largest = _resolve_against(msg, seen, track)
+        await _backfill(track, msg, largest)
+        if _attach_subscriber(session, msg, track, largest):
             _answer_publish(track)
             _resume_parked_publish(track)
             logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
@@ -2102,8 +2136,9 @@ async def _on_subscribe(session, msg):
                         f"cancelled before its reply")
             return
         if track is not None:
-            await _backfill(track, msg)
-            if _attach_subscriber(session, msg, track):
+            largest = _resolve_against(msg, seen, track)
+            await _backfill(track, msg, largest)
+            if _attach_subscriber(session, msg, track, largest):
                 _answer_publish(track)
                 _resume_parked_publish(track)
                 logger.info(f"relay: subscribe ns={ns} "
@@ -3289,9 +3324,10 @@ class _Status:
             d = ([max(0, c - p) for c, p in zip(cur, last)]
                  if last is not None else [0, 0, 0, 0])
             tx, rx = tx + d[0], rx + d[1]
-            # Loss counts on delivery only: picoquic reports packets lost on
-            # a session the relay mostly receives on.
-            if id(s) in subs:
+            # Loss counts on delivery only: toward a publisher the relay sends
+            # mostly ACK-only packets, which picoquic counts lost unacked.
+            delivery = id(s) in subs
+            if delivery:
                 sent, lost = sent + d[2], lost + d[3]
             rtt = round(pq.get("rtt") / 1000, 2) if pq.get("rtt") else None
             if rtt is not None:
@@ -3303,9 +3339,12 @@ class _Status:
                 "addr": relay_status.display_addr(_addr_of(s)),
                 "role": role or None, "since": info["since"],
                 "rtt_ms": round(rtt, 1) if rtt is not None else None,
+                "rtt_min_ms": (round(pq["rtt_min"] / 1000, 1)
+                               if pq.get("rtt_min") else None),
                 "tx_bps": bps(d[0]) if last is not None else None,
                 "rx_bps": bps(d[1]) if last is not None else None,
-                "loss_pct": (round(100 * d[3] / d[2], 2) if d[2] else None),
+                "loss_pct": (round(100 * d[3] / d[2], 2)
+                             if delivery and d[2] else None),
             })
         self._quic_prev = quic
 
