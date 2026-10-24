@@ -23,6 +23,9 @@ from .utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+# Largest Object ID every draft's varint carries (RFC 9000: 2^62-1).
+MAX_OBJECT_ID = (1 << 62) - 1
+
 # Lane queue sentinels.
 _END_GROUP = object()
 _RESET_GROUP = object()
@@ -124,10 +127,15 @@ class ObjectHistory:
         inclusive. Groups ascend, or descend; objects ascend within a
         group (§10.12.3). A part of the range already dropped is one End
         of Range marker of type `lost_marker` (End of Unknown Range by
-        default, §11.4.4.2), at the low end of the range."""
+        default, §11.4.4.2), at the low end of the range. An `end` past
+        MAX_OBJECT_ID (a whole group) ends the marker at the group's last
+        held Object, else at MAX_OBJECT_ID."""
         lost = None
         if self.evicted_through is not None and start <= self.evicted_through:
             lost = min(self.evicted_through, end)
+            if lost[1] > MAX_OBJECT_ID:
+                last = self.last_object(lost[0])
+                lost = (lost[0], MAX_OBJECT_ID if last is None else last)
             start = max(start, (lost[0], lost[1] + 1))
         held = self._held(start, end)
         keys = sorted(held)
