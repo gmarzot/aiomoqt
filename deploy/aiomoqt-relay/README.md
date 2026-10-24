@@ -152,10 +152,11 @@ crash or watchdog stall. It is not rotated, so trim it by hand if it grows.
 In the log viewer, Shift- or Ctrl-click on "Load earlier" loads the whole selected file (up to
 200,000 records).
 
-DEBUG logging: the switch in the log viewer's toolbar, or `docker kill -s USR1 ersatz-relay`;
-either toggles it and logs `relay: debug logging on/off`. The switch reaches the relay's `--control`
-socket (`status/control.sock`) through `/private/debug`, which needs the password and, for POST, an
-`X-Relay-Control: 1` header. Never send SIGUSR2: it stops the relay.
+Log level: the switch in the log viewer's toolbar toggles DEBUG and logs `relay: debug logging
+on/off`; `docker kill -s USR1 ersatz-relay` steps INFO, DEBUG, TRACE, INFO and logs `relay: log
+level <LEVEL>`. The switch reaches the relay's `--control` socket (`status/control.sock`) through
+`/private/debug`, which needs the password and, for POST, an `X-Relay-Control: 1` header. Never
+send SIGUSR2: it stops the relay.
 
 ## Core dumps
 
