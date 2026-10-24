@@ -55,7 +55,7 @@ def _stub(max_object_bytes=1000):
     s._object_cb_errors = 0
     s._close_err = None
     s._max_object_bytes = max_object_bytes
-    s._rx_held_limit = s.RX_HELD_FACTOR * max_object_bytes
+    s._rx_held_limit = 4 * max_object_bytes
     s._loop = SimpleNamespace(call_later=lambda delay, cb: SimpleNamespace(
         cancel=lambda: None))
     s.delivered = []
@@ -239,6 +239,7 @@ async def test_oversize_object_stops_one_track_the_other_keeps_delivering(
         assert before < _SMALL
         assert await _until(lambda: len(got["small"]) == _SMALL)
         assert got["big"] == []
+        assert await _until(lambda: ends["small"])   # FIN follows the last object
         assert ends["small"] == [(True, 0)]
         assert session._close_err is None
         assert session._rx_held_bytes == 0

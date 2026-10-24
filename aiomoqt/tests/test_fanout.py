@@ -164,7 +164,9 @@ async def _overrun_at_a_group_boundary(boundary):
     await fan.write(0, 0, b"key", group_start=True)
     await _settle()                         # slow lane parked in group 0
     await fan.write(0, 1, b"pred")
+    await _settle(2)                        # the fast lane keeps draining
     await fan.write(0, 2, b"pred")          # slow queue now full
+    await _settle(2)
     await boundary(fan)                     # overflows: backlog flushed
     assert lane.shed == 2
     slow.release()
