@@ -51,12 +51,13 @@ from .context import is_draft16_or_later
 from .messages.fetch import _is_joining
 from .utils.buffer import Buffer, BufferReadError
 from .utils.format import fmt_bps, fmt_rate
-from .utils.logger import get_logger
+from .utils.logger import TRACE, get_category_logger, get_logger
 from .utils.timing import (
     TimestampMalformed, TimestampWriter, TrackTiming, check_object,
 )
 
 logger = get_logger(__name__)
+data_log = get_category_logger("data")
 
 # Bytes of recent objects a PublishedTrack keeps to answer FETCH.
 FETCH_HISTORY_DEFAULT = 1 << 20
@@ -1708,6 +1709,7 @@ class PublishedTrack(Track):
                 if cur_obj_id >= self.group_size:
                     group_id += 1
                     cur_obj_id = 0
+                    trace = data_log.isEnabledFor(TRACE)
                     if sub.past_end(group_id):
                         self._range_ended(sub)
                         raise asyncio.CancelledError
@@ -1736,6 +1738,11 @@ class PublishedTrack(Track):
                     raise asyncio.CancelledError
                 if admitted:
                     await session.dgram_write_drain(buf)
+                    if trace:
+                        data_log.log(TRACE, f"MOQT send: object {group_id}."
+                                            f"{cur_obj_id - 1} alias="
+                                            f"{track_alias} {obj_bytes} bytes"
+                                            f" (datagram)")
                     self._total_sent += 1
                     self._total_bytes += obj_bytes
                     self._iv_objects += 1
@@ -1831,6 +1838,7 @@ class PublishedTrack(Track):
                     if session._close_err:
                         raise asyncio.CancelledError
                     sender.new_group(group_id)
+                    trace = data_log.isEnabledFor(TRACE)
                     if sub.past_end(group_id):
                         self._range_ended(sub)
                         raise asyncio.CancelledError
@@ -1857,6 +1865,10 @@ class PublishedTrack(Track):
                     except MOQTStreamStopped:
                         sender.stop()
                         obj_bytes = 0
+                if trace and obj_bytes:
+                    data_log.log(TRACE, f"MOQT send: object {group_id}."
+                                        f"{cur_obj_id} alias={track_alias} "
+                                        f"{obj_bytes} bytes")
                 cur_obj_id += self.num_subgroups
                 if obj_bytes:
                     local_sent += 1
@@ -2440,6 +2452,7 @@ class VideoTrack(PublishedTrack):
                     if session._close_err:
                         raise asyncio.CancelledError
                     sender.new_group(group_id)
+                    trace = data_log.isEnabledFor(TRACE)
                     if sub.past_end(group_id):
                         self._range_ended(sub)
                         raise asyncio.CancelledError
@@ -2477,6 +2490,10 @@ class VideoTrack(PublishedTrack):
                     except MOQTStreamStopped:
                         sender.stop()
                         obj_bytes = 0
+                if trace and obj_bytes:
+                    data_log.log(TRACE, f"MOQT send: object {group_id}."
+                                        f"{cur_obj_id} alias={track_alias} "
+                                        f"{obj_bytes} bytes")
                 cur_obj_id += self.num_subgroups
                 if obj_bytes:
                     local_sent += 1

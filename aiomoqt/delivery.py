@@ -19,9 +19,10 @@ from .types import MOQTStreamStopped, StreamResetCode
 from .messages.data import (
     FETCH_FLAGS_END_UNKNOWN, FetchObject, ObjectDatagram,
 )
-from .utils.logger import get_logger
+from .utils.logger import TRACE, get_category_logger, get_logger
 
 logger = get_logger(__name__)
+data_log = get_category_logger("data")
 
 # Largest Object ID every draft's varint carries (RFC 9000: 2^62-1).
 MAX_OBJECT_ID = (1 << 62) - 1
@@ -343,6 +344,10 @@ class SubgroupDelivery:
         self._note_largest(group_id, object_id)
         self.objects_sent += 1
         self.bytes_sent += len(payload)
+        if data_log.isEnabledFor(TRACE):
+            data_log.log(TRACE, f"MOQT send: object {group_id}.{object_id} "
+                                f"alias={self.track_alias} {len(payload)} "
+                                f"bytes ({self.mapping.name})")
         return True
 
     def _datagram_key(self) -> tuple:
