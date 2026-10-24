@@ -6,7 +6,7 @@ import pytest
 
 from aiomoqt.tools import moq_interop_client as client
 from aiomoqt.tools import moq_interop_relay as relay
-from aiomoqt.types import ObjectStatus
+from aiomoqt.types import ObjectStatus, RequestErrorCode
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
 
@@ -256,3 +256,48 @@ async def test_a_case_this_publisher_cannot_serve_is_refused(suffix):
     await pub.on_subscribe(session, msg)
     assert refused and refused[0]["request_id"] == 4
     assert pub.request is None
+
+
+async def _run_case(case, port, draft, use_quic):
+    relay._announced.clear()
+    relay._tracks.clear()
+    server = relay._build_server("localhost", port, CERT, KEY,
+                                 use_quic=use_quic, draft=draft)
+    handle = await server.serve()
+    try:
+        return await case("localhost", port, "/", use_quic, True, False,
+                          supported_drafts=draft)
+    finally:
+        await server.close_sessions()
+        handle.close()
+        relay._announced.clear()
+        relay._tracks.clear()
+
+
+@requires_certs
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+@pytest.mark.parametrize("draft", [14, 16, 18, 20, 22])
+@pytest.mark.parametrize("name", ["fetch", "join"])
+async def test_history_cases_deliver_objects(name, draft, use_quic):
+    port = (_BASE_PORT + 100 + 2 * draft + (0 if use_quic else 1)
+            + (0 if name == "fetch" else 50))
+    r = await _run_case(client.TEST_FUNCTIONS[name], port, draft, use_quic)
+    assert r.passed, r.message
+    n = int(r.message.split()[0])
+    assert n > 0, r.message
+
+
+@requires_certs
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["fetch", "join"])
+async def test_history_case_without_objects_fails(monkeypatch, name):
+    # A structured refusal fails: the case needs objects.
+    async def refuse(session, msg):
+        session.fetch_error(msg.request_id, RequestErrorCode.DOES_NOT_EXIST,
+                            "no history")
+
+    monkeypatch.setattr(relay, "_on_fetch", refuse)
+    port = _BASE_PORT + 99 + (0 if name == "fetch" else 1)
+    r = await _run_case(client.TEST_FUNCTIONS[name], port, 18, True)
+    assert not r.passed, r.message

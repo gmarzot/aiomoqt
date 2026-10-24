@@ -25,7 +25,7 @@ installed package. Keep its API boundary and traps consistent with this file.
 | `aiomoqt/examples/` | minimal pub, sub, join and server examples; ship in the wheel |
 | `aiomoqt/versions.py` | `aiomoqt-versions`: aiomoqt, aiopquic, picoquic and picotls build info |
 | `aiomoqt/tests/` | the pytest tree, **inside** the package dir, left out of the wheel |
-| `tests/` | `release_regression_test.py` (tier runner) + `relays.json`; `contrib/` = contribution-runner sweep. No pytest files |
+| `tests/` | `release_regression_test.py` (tier runner) + `relays.json`; `contrib/` = contribution-runner sweep; `moqdev-smoke/` = moq-dev's relay smoke in Docker. No pytest files |
 | `deploy/aiomoqt-relay/` | compose, nginx and runbook for the public ersatz relay |
 | `docs/` | bench and demo runbooks |
 
@@ -33,9 +33,10 @@ installed package. Keep its API boundary and traps consistent with this file.
 
 Python >= 3.12 (CI: 3.12 / 3.13 / 3.14 on linux and macos).
 
-    uv pip install -e ".[test,media]" jsonschema      # ".[dev]" adds ruff + ty
+    uv pip install -e ".[test,media]"      # ".[dev]" adds ruff + ty
 
-`media` (PyAV) and `jsonschema` are optional; without them the media and agent-spec tests skip.
+`media` (PyAV) is optional; without it the media tests skip. `test` brings `jsonschema` for the
+agent-spec tests.
 Install editable: the loopback suites and bench scripts resolve `certs/` relative to the working
 tree. `pytest` writes `certs/` on first run; for the bench tools see README "Development".
 Version comes from `setuptools_scm` (git tags): a shallow clone without tags builds as
@@ -52,12 +53,15 @@ one suite directly, `--skip-suite` drops one from a selected tier.
 `unit` = the whole pytest tree, one run. `integration` = tools, multi-process paths and the
 draft × transport matrix over localhost. `interop` = live relays from `tests/relays.json`.
 `bench` = measurement only. `media-locmaf` is a manual suite (named with `--test-suite` only)
-against Eyevinn's public moqlivemock. A run with no `--test-tier` or `--test-suite` selects
+against Eyevinn's public moqlivemock. `moqdev-smoke`, also manual, runs moq-dev's relay smoke
+(rust, js-web and js-bun clients) in Docker against `--moqdev-relays` (default
+`aiomoqt-relay`); run it on moqx-001. A run with no `--test-tier` or `--test-suite` selects
 every tier, **including interop**. Exit is 1 iff some suite FAILed; SKIP and XFAIL (a failure on
 a non-gating relay or draft) do not gate.
 
-Network rule: the interop tier, a bare runner run, `relay_probe`, `moq_interop_client` and
-`media-locmaf` reach public infrastructure. Run them from CI or a remote host, not a laptop.
+Network rule: the interop tier, a bare runner run, `relay_probe`, `moq_interop_client`,
+`media-locmaf` and `moqdev-smoke` reach public infrastructure. Run them from CI or a remote
+host, not a laptop.
 
 Plain pytest works too (`pytest.ini`: `testpaths = aiomoqt/tests`, `asyncio_mode=auto`):
 
@@ -118,10 +122,15 @@ errors in our own internals; check against an installed wheel in a clean venv in
 ## Conventions
 
 **CLI grid.** `aiomoqt/utils/cli.py` defines the shared flag grid; its module docstring lists
-it. `test_cli_grid.py` checks that each tool in its `TOOLS` list uses a grid short flag only for
-its grid meaning; tolerated exceptions are listed in `KNOWN_GRID_VIOLATIONS`. A dialed URL's
+it. `test_cli_grid.py` checks every tool in `TOOLS` and every example: a grid short flag means
+only its grid meaning, and any short flag means one thing across all of them. There are no
+exceptions; `moq_interop_client`'s `-r/-t/-l/-v` are the interop runner's interface, listed in
+`EXTERNAL_CONTRACT` and tested against it. The `add_*` groups take no toggles: arguments set
+defaults, never which flags exist (also tested). A dialed URL's
 scheme selects the transport (`moqt://` raw QUIC, `https://` or bare `host:port`
 WebTransport); listeners use `-Q`/`-W`, and both together serve one port via ALPN dispatch.
+`-h`, `-?` and `--help` print help on every tool and example (`cli.add_help`; the test requires
+all three). Write `-h` in docs: `-?` is a shell glob.
 
 **Fan-out layering.** Peer mechanics live in `PublishedTrack` and `aiomoqt/delivery.py`.
 Packagers under `aiomoqt/media/` only package and number objects; `broadcast.py` is the single

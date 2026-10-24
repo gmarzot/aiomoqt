@@ -8,6 +8,7 @@ from aiomoqt.types import MOQT_DEFAULT_DRAFTS, ForwardingPreference, parse_draft
 from aiomoqt.client import MOQTClient
 from aiomoqt.track import PublishedTrack, VideoTrack
 from aiomoqt.utils import class_name, get_logger, set_log_level, wait_cond_timeout
+from aiomoqt.utils.cli import add_help
 from aiomoqt.utils.url import parse_relay_url
 
 GROUP_SIZE = 30
@@ -64,9 +65,7 @@ def parse_args():
              'exceed this. Default: aiomoqt default (1 MiB). '
              'Pass 0 to disable.')
 
-    parser.add_argument(
-        '-?', '--help', action='help',
-        help='Show this help message and exit')
+    add_help(parser)
     parser.add_argument(
         '--datagram', action='store_true',
         help='ObjectDatagrams instead of subgroup streams (raw QUIC '

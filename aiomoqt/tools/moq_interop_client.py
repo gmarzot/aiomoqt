@@ -36,6 +36,7 @@ from aiomoqt.types import (
     FilterType, GroupOrder, MOQTDraft, ObjectStatus, parse_draft_spec,
     MOQT_DEFAULT_DRAFTS, D16MessageType,
 )
+from aiomoqt.utils.cli import add_help
 from aiomoqt.utils.logger import set_log_level
 
 try:
@@ -78,7 +79,7 @@ INTERNAL_ERROR_CODE = 0
 
 def _is_refusal(code: int, compat: frozenset) -> bool:
     """Whether a structured error code counts as a valid relay refusal for
-    the subscribe / join / fetch probes: any code except INTERNAL_ERROR
+    the subscribe probes: any code except INTERNAL_ERROR
     (0x0), which signals a server fault rather than a policy decision —
     unless the endpoint's compat declares 0 as its deliberate refusal
     code (moq-rs / moq-dev / libquicr)."""
@@ -1269,124 +1270,130 @@ async def test_data_subgroup_basic(host, port, path, use_quic,
     return result(True, summary)
 
 
+_HISTORY_GROUP = 5          # objects per group on the relayed track
+_HISTORY_WAIT_S = 5.0       # until the relay has forwarded two groups
+
+
+async def _relay_history(host, port, path, use_quic, tls_disable_verify,
+                         debug, supported_drafts, name, sessions, body):
+    """Run `body(sub_client, namespace, first_group)` once the relay has
+    forwarded two whole groups of a live publisher's track to a
+    subscriber, so they are history the relay can serve."""
+    loop = asyncio.get_running_loop()
+    prefix = (*_NS_PREFIX, "moq-test", name, _run_id())
+    namespace = "/".join(prefix)
+    pub_client = _make_client(host, port, path, use_quic, tls_disable_verify,
+                              debug, supported_drafts=supported_drafts)
+    sub_client = _make_client(host, port, path, use_quic, tls_disable_verify,
+                              debug, supported_drafts=supported_drafts)
+    async with pub_client.connect() as pub_session:
+        await pub_session.client_session_init()
+        sessions["publisher"] = _session_meta(pub_session)
+        track = PublishedTrack(pub_session, namespace=namespace,
+                               trackname="track", object_size=64,
+                               group_size=_HISTORY_GROUP, rate=50)
+        await track.publish(announce_namespace=True, publish_track=False)
+        groups = []
+        two_groups = loop.create_future()
+
+        def on_object(msg, _size, _recv, group_id=None, *_):
+            g = getattr(msg, "group_id", group_id)
+            if g not in groups:
+                groups.append(g)
+            if len(groups) >= 3 and not two_groups.done():
+                two_groups.set_result(None)
+
+        async with sub_client.connect() as sub_session:
+            await sub_session.client_session_init()
+            sessions["subscriber"] = _session_meta(sub_session)
+            live = SubscribedTrack(sub_session, namespace, "track",
+                                   on_object=on_object)
+            await live.subscribe()
+            await asyncio.wait_for(two_groups, _HISTORY_WAIT_S)
+            # groups[0] may have been joined mid-group; groups[1] is whole.
+            return await body(sub_client, namespace, groups[1])
+
+
+def _history_result(name, t0, sessions, fetched, what):
+    n = len(fetched)
+    return TestResult(
+        name=name, passed=n > 0,
+        duration_ms=(time.monotonic() - t0) * 1000, sessions=sessions,
+        message=(f"{n} objects received by {what}" if n
+                 else f"no objects received by {what}"),
+        expected="" if n else f"objects from {what}",
+        received="" if n else "0 objects")
+
+
 async def test_fetch(host, port, path, use_quic, tls_disable_verify,
                      debug, supported_drafts=None, compat=frozenset(),
-                     timeout=6.0) -> TestResult:
-    """FETCH probe: send a standalone FETCH; relay handles if it responds
-    with FETCH_OK or structured FETCH_ERROR. Timeout/close = fail."""
+                     timeout=15.0) -> TestResult:
+    """FETCH: a standalone FETCH of a group the relay has already
+    forwarded returns that group's objects."""
     t0 = time.monotonic()
     sessions = {}
-    client = _make_client(host, port, path, use_quic,
-                          tls_disable_verify, debug,
-                          supported_drafts=supported_drafts)
+    fetched = []
+
+    async def body(sub_client, namespace, group):
+        async with sub_client.connect() as session:
+            await session.client_session_init()
+            sessions["fetcher"] = _session_meta(session)
+            session.on_fetch_object = lambda msg, *_: fetched.append(msg)
+            ok = await session.fetch(
+                namespace=namespace, track_name="track",
+                start_group=group, start_object=0,
+                end_group=group, end_object=0, wait_response=True)
+            await session.await_fetch_done(ok.request_id, timeout=5)
+
     try:
         async with asyncio.timeout(timeout):
-            async with client.connect() as session:
-                await session.client_session_init()
-                sessions["subscriber"] = _session_meta(session)
-                spec_ok = True
-                try:
-                    await session.fetch(
-                        namespace=INTEROP_NAMESPACE,
-                        track_name=INTEROP_TRACK,
-                        start_group=0, start_object=0,
-                        end_group=0, end_object=0,
-                        wait_response=True,
-                    )
-                    msg = "FETCH_OK received"
-                except MOQTRequestError as e:
-                    # Any structured FETCH_ERROR means the relay answered
-                    # the FETCH (it didn't time out / close). Mirror the
-                    # join probe: accept it as a refusal via _is_refusal
-                    # (INTERNAL_ERROR 0x0 only under the endpoint's compat,
-                    # e.g. libquicr returns code=0 for a nonexistent track),
-                    # annotating spec vs non-spec codes. A timeout/close
-                    # still fails via the outer except.
-                    code = int(e.error_code)
-                    spec_ok = _is_refusal(code, compat)
-                    benign = code in SUBSCRIBE_BENIGN_ERROR_CODES
-                    if benign:
-                        msg = f"FETCH_ERROR (valid): code={e.error_code}"
-                    elif spec_ok:
-                        msg = (
-                            f"FETCH_ERROR accepted (non-spec "
-                            f"code={e.error_code})"
-                        )
-                    else:
-                        msg = (
-                            f"Non-conformant FETCH_ERROR code={e.error_code} "
-                            f"(expected benign code or FETCH_OK)"
-                        )
-                session.close()
-        return TestResult(
-            name="fetch", passed=spec_ok,
-            duration_ms=(time.monotonic() - t0) * 1000,
-            sessions=sessions, message=msg,
-        )
+            await _relay_history(host, port, path, use_quic,
+                                 tls_disable_verify, debug, supported_drafts,
+                                 "fetch", sessions, body)
     except Exception as e:
         return TestResult(
             name="fetch", passed=False,
-            duration_ms=(time.monotonic() - t0) * 1000,
-            sessions=sessions,
+            duration_ms=(time.monotonic() - t0) * 1000, sessions=sessions,
             message=f"Failed: {_format_exc(e)}",
-            expected="FETCH_OK or FETCH_ERROR",
-            received=_format_exc(e),
-        )
+            expected="FETCH_OK and the group's objects",
+            received=_format_exc(e))
+    return _history_result("fetch", t0, sessions, fetched, "the FETCH")
 
 
 async def test_join(host, port, path, use_quic, tls_disable_verify,
                     debug, supported_drafts=None, compat=frozenset(),
-                    timeout=6.0) -> TestResult:
-    """JOIN probe: send SUBSCRIBE + JOINING_FETCH(RELATIVE, start=0).
-    Relay handles if it responds (OK or structured error). Timeout = fail."""
+                    timeout=15.0) -> TestResult:
+    """JOIN: SUBSCRIBE plus a joining FETCH one group back, against a
+    live track the relay has already forwarded, returns the earlier
+    group's objects."""
     t0 = time.monotonic()
     sessions = {}
-    client = _make_client(host, port, path, use_quic,
-                          tls_disable_verify, debug,
-                          supported_drafts=supported_drafts)
+    fetched = []
+
+    async def body(sub_client, namespace, _group):
+        async with sub_client.connect() as session:
+            await session.client_session_init()
+            sessions["joiner"] = _session_meta(session)
+            session.on_fetch_object = lambda msg, *_: fetched.append(msg)
+            _, fetch_ok = await session.join(
+                namespace=namespace, track_name="track",
+                fetch_type=FetchType.RELATIVE_JOINING, joining_start=1,
+                wait_response=True)
+            await session.await_fetch_done(fetch_ok.request_id, timeout=5)
+
     try:
         async with asyncio.timeout(timeout):
-            async with client.connect() as session:
-                await session.client_session_init()
-                sessions["subscriber"] = _session_meta(session)
-                spec_ok = True
-                try:
-                    await session.join(
-                        namespace=INTEROP_NAMESPACE,
-                        track_name=INTEROP_TRACK,
-                        fetch_type=FetchType.RELATIVE_JOINING,
-                        joining_start=0,
-                        wait_response=True,
-                    )
-                    msg = "SUBSCRIBE_OK + FETCH_OK received"
-                except MOQTRequestError as e:
-                    # Any structured error answers the JOIN probe (the relay
-                    # responded and refused); spec code noted, not required.
-                    # A timeout still fails (outer except).
-                    spec_ok = _is_refusal(int(e.error_code), compat)
-                    benign = (int(e.error_code)
-                              in SUBSCRIBE_BENIGN_ERROR_CODES)
-                    msg = (
-                        f"structured error (valid): code={e.error_code}"
-                        if benign else
-                        f"structured error accepted (non-spec "
-                        f"code={e.error_code})"
-                    )
-                session.close()
-        return TestResult(
-            name="join", passed=spec_ok,
-            duration_ms=(time.monotonic() - t0) * 1000,
-            sessions=sessions, message=msg,
-        )
+            await _relay_history(host, port, path, use_quic,
+                                 tls_disable_verify, debug, supported_drafts,
+                                 "join", sessions, body)
     except Exception as e:
         return TestResult(
             name="join", passed=False,
-            duration_ms=(time.monotonic() - t0) * 1000,
-            sessions=sessions,
+            duration_ms=(time.monotonic() - t0) * 1000, sessions=sessions,
             message=f"Failed: {_format_exc(e)}",
-            expected="SUBSCRIBE_OK + FETCH_OK or structured error",
-            received=_format_exc(e),
-        )
+            expected="SUBSCRIBE_OK, FETCH_OK and earlier objects",
+            received=_format_exc(e))
+    return _history_result("join", t0, sessions, fetched, "the joining FETCH")
 
 
 # ---------------------------------------------------------------------------
@@ -1670,6 +1677,7 @@ def parse_compat(raw: str) -> frozenset:
 def parse_args():
     parser = argparse.ArgumentParser(
         description="MoQ Interop Test Client (aiomoqt)",
+        add_help=False,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Environment variables: RELAY_URL, TESTCASE, MOQT_DRAFT, "
@@ -1733,6 +1741,7 @@ def parse_args():
             "sent); some anonymous-scope relays reject any AUTH_TOKEN."
         ),
     )
+    add_help(parser)
     return parser.parse_args()
 
 
@@ -1912,13 +1921,17 @@ def main():
     else:
         tests = STANDARD_TESTS
 
-    asyncio.run(
-        run_tests(tests, host, port, path, use_quic,
-                  args.tls_disable_verify, args.debug,
-                  supported_drafts=supported_drafts,
-                  compat=compat,
-                  reporter=reporter)
-    )
+    try:
+        asyncio.run(
+            run_tests(tests, host, port, path, use_quic,
+                      args.tls_disable_verify, args.debug,
+                      supported_drafts=supported_drafts,
+                      compat=compat,
+                      reporter=reporter)
+        )
+    except KeyboardInterrupt:
+        print("\n# Interrupted.", file=sys.stderr)
+        sys.exit(130)
 
     # TAP output to stdout
     print(reporter.report())

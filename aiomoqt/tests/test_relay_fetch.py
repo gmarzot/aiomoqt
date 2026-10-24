@@ -18,7 +18,7 @@ from aiomoqt.context import profile_for, request_error_code
 from aiomoqt.messages.data import FetchObject
 from aiomoqt.messages import SubgroupHeader
 from aiomoqt.messages.fetch import Fetch
-from aiomoqt.messages.params import LocationFilter
+from aiomoqt.messages.params import D20ParamType, LocationFilter
 from aiomoqt.messages.subscribe import Subscribe
 from aiomoqt.protocol import _MOQTSessionMixin
 from aiomoqt.tools import moq_interop_relay as relay
@@ -706,4 +706,122 @@ async def test_a_d18_fetch_ends_before_its_end_object(use_quic):
             assert fin is True, name
             assert [(g, o) for g, o, _ in got] == [(0, 0), (0, 1)], name
             assert (ok.largest_group_id, ok.largest_object_id) == (0, 2)
+        assert rx._close_err is None
+
+
+# -- joining FETCH for a track known only by PUBLISH -----------------------
+
+_PUB_PORT = 15600
+_PUB_NS = "relay/published"
+_PUB_SIZES = {"catalog": 90, "video": 200}
+
+
+@contextlib.asynccontextmanager
+async def _published_relay(port, use_quic, draft):
+    """A relay; a publisher PUBLISHing two fetch-only tracks with two
+    groups of history and no PUBLISH_NAMESPACE; a subscriber session."""
+    relay._tracks.clear()
+    relay._announced.clear()
+    server = relay._build_server("localhost", port, CERT, KEY,
+                                 use_quic=use_quic, draft=draft)
+    handle = await server.serve()
+    try:
+        async with contextlib.AsyncExitStack() as stack:
+            sessions = []
+            for _ in range(2):
+                client = MOQTClient("localhost", port, path="/",
+                                    use_quic=use_quic, verify_tls=False,
+                                    supported_drafts=draft)
+                s = await stack.enter_async_context(client.connect())
+                await s.client_session_init()
+                sessions.append(s)
+            pub, sub = sessions
+            for name, size in _PUB_SIZES.items():
+                track = _FetchOnly(pub, namespace=_PUB_NS, trackname=name,
+                                   object_size=size, group_size=_GROUP)
+                track.prefill(2)
+                await track.publish(publish_track=True)
+            keys = [(relay._ns_tuple(_PUB_NS), n.encode())
+                    for n in _PUB_SIZES]
+            for _ in range(150):
+                if all(relay._tracks.get(k) is not None
+                       and relay._tracks[k].largest == (1, _GROUP - 1)
+                       for k in keys):
+                    break
+                await asyncio.sleep(0.02)
+            assert not relay._announced
+            yield sub
+    finally:
+        handle.close()
+        relay._tracks.clear()
+        relay._announced.clear()
+
+
+@requires_certs
+@pytest.mark.parametrize("draft", [18, 22])
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+async def test_a_joining_fetch_reaches_a_publish_only_publisher(draft,
+                                                                use_quic):
+    # MSF catalog bootstrap: SUBSCRIBE plus a joining FETCH for the
+    # current group. The relay's cache is empty, so the FETCH goes to the
+    # session that PUBLISHed the track.
+    port = _PUB_PORT + 2 * (draft == 22) + (not use_quic)
+    got = {}
+    async with _published_relay(port, use_quic, draft) as rx:
+        rx.on_fetch_object = lambda obj, _n, _ts, rid: got.setdefault(
+            rid, []).append((obj.group_id, obj.object_id, len(obj.payload)))
+        for name, size in _PUB_SIZES.items():
+            sub = await rx.subscribe(_PUB_NS, name, forward=1,
+                                     filter_type=FilterType.LATEST_OBJECT,
+                                     wait_response=True)
+            ok = await asyncio.wait_for(rx.joining_fetch(
+                sub.request_id, joining_start=0, wait_response=True), 10)
+            assert await rx.await_fetch_done(ok.request_id, timeout=8), name
+            assert got.get(ok.request_id) == [
+                (1, o, size) for o in range(_GROUP)], name
+        assert rx._close_err is None
+
+
+@requires_certs
+@pytest.mark.parametrize("draft", [18, 22])
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+async def test_a_standalone_fetch_reaches_a_publish_only_publisher(draft,
+                                                                   use_quic):
+    port = _PUB_PORT + 4 + 2 * (draft == 22) + (not use_quic)
+    got = {}
+    async with _published_relay(port, use_quic, draft) as rx:
+        rx.on_fetch_object = lambda obj, _n, _ts, rid: got.setdefault(
+            rid, []).append((obj.group_id, obj.object_id))
+        rng = ({"location_filter": LocationFilter.absolute(0, 0, 1)}
+               if draft >= 20 else
+               {"start_group": 0, "start_object": 0, "end_group": 2,
+                "end_object": 0})
+        for name in _PUB_SIZES:
+            ok = await asyncio.wait_for(rx.fetch(
+                _PUB_NS, name, wait_response=True, **rng), 10)
+            assert await rx.await_fetch_done(ok.request_id, timeout=8), name
+            assert got.get(ok.request_id) == [
+                (g, o) for g in range(2) for o in range(_GROUP)], name
+        assert rx._close_err is None
+
+
+@requires_certs
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+async def test_a_subscribe_fill_reaches_a_publish_only_publisher(use_quic):
+    # d22: FILL_PARAMETERS on the SUBSCRIBE asks for the current group;
+    # the fill stream carries the catalog's latest object.
+    port = _PUB_PORT + 8 + (not use_quic)
+    got = {}
+    fill = {D20ParamType.FILL_PARAMETERS: {
+        ParamType.LOCATION_FILTER: LocationFilter.relative(1)}}
+    async with _published_relay(port, use_quic, 22) as rx:
+        rx.on_fetch_object = lambda obj, _n, _ts, rid: got.setdefault(
+            rid, []).append((obj.group_id, obj.object_id, len(obj.payload)))
+        for name, size in _PUB_SIZES.items():
+            ok = await rx.subscribe(
+                _PUB_NS, name, location_filter=LocationFilter.next_object(),
+                parameters=fill, wait_response=True)
+            assert await rx.await_fetch_done(ok.request_id, timeout=8), name
+            assert got.get(ok.request_id) == [
+                (1, o, size) for o in range(_GROUP)], name
         assert rx._close_err is None

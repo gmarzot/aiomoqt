@@ -11,6 +11,7 @@ Usage:
 import argparse
 import asyncio
 import logging
+import sys
 
 from aiomoqt.types import MOQTMessageType, parse_draft_spec
 from aiomoqt.client import MOQTClient
@@ -80,9 +81,15 @@ def parse_args():
         '-p', '--port', type=int, default=4434,
         help='Local port (default: 4434)')
     parser.add_argument(
-        '--cert', type=str, default=CERT)
+        '--cert', type=str, default=None,
+        help='TLS certificate (default: the self-signed test cert)')
     parser.add_argument(
-        '--key', type=str, default=KEY)
+        '--key', type=str, default=None,
+        help='TLS key (default: the test cert\'s key)')
+    parser.add_argument(
+        '-k', '--insecure', action='store_true', default=None,
+        help='Skip certificate verification (the default unless --cert '
+             'is given; then that cert is the trust anchor)')
     parser.add_argument(
         '-d', '--debug', action='store_true')
     parser.add_argument(
@@ -124,12 +131,15 @@ def parse_args():
              'at stream rollover while total un-transmitted TX bytes '
              'exceed this. Steady-state latency ~ value / throughput. '
              'Default: aiopquic default (4 MiB). Pass 0 to disable.')
-    parser.add_argument(
-        '-?', '--help', action='help',
-        help='Show this help message and exit')
+    _cli.add_help(parser)
     _cli.add_timestamps(parser)
     _cli.add_timestamp_checking(parser)
     args = parser.parse_args()
+    if args.insecure is None:
+        # The self-signed test cert cannot verify.
+        args.insecure = args.cert is None
+    args.cert = args.cert or CERT
+    args.key = args.key or KEY
     if args.datagram and not args.quic:
         parser.error("-D/--datagram requires -Q (raw QUIC); "
                      "WT datagram TX is not wired yet")
@@ -231,7 +241,8 @@ async def run_subscriber(args, stats):
         path="/",
         use_quic=args.quic,
         supported_drafts=args.draft,
-        verify_tls=False,
+        verify_tls=not args.insecure,
+        ca_file=None if args.insecure else args.cert,
         debug=args.debug,
         congestion_control_algorithm=args.cc_algo,
     )
@@ -291,7 +302,7 @@ async def main():
         print("  Error: TLS certificate required. "
               "Use --cert and --key,")
         print("  or place cert.pem/key.pem in <project>/certs/")
-        return
+        return 1
 
     print("  Starting server...")
     quic_server = await run_server(args)
@@ -333,6 +344,7 @@ async def main():
     # Give worker thread + close walker a tick to run before we sample.
     await asyncio.sleep(0.5)
     stats.print_summary()
+    received = stats.stats.total_objects
 
     # AIOMOQT_TASK_DUMP=1 also enables a final post-shutdown counter dump
     # so we can tell whether the close-walker swept leaked WT links
@@ -348,18 +360,17 @@ async def main():
         except Exception as _e2:
             print(f"(post-shutdown counter dump failed: {_e2})",
                   file=_sys2.stderr)
+    return 0 if received else 1
 
 
 def cli():
     """Console entry point (moq-loopback-bench)."""
     try:
-        asyncio.run(main())
+        sys.exit(asyncio.run(main()))
     except KeyboardInterrupt:
         print("\n  Interrupted.")
+        sys.exit(130)
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n  Interrupted.")
+    cli()

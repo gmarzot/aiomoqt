@@ -106,7 +106,7 @@ async def main():
 asyncio.run(main())
 ```
 
-`PublishedTrack` owns stream setup, subgroup headers, object numbering, pacing, and fan-out: `produce()` numbers the sequence once however many subscribers there are. `SubscribedTrack` is the receive side. Both are in [`aiomoqt/track.py`](aiomoqt/track.py); the raw stream API underneath — `open_uni_stream()`, `SubgroupHeader`, `stream_write()` — is in [`aiomoqt/delivery.py`](aiomoqt/delivery.py).
+`PublishedTrack` owns stream setup, subgroup headers, object numbering, pacing, and fan-out: `produce()` numbers the sequence once however many subscribers there are. `SubscribedTrack` is the receive side. Both are in [`aiomoqt/track.py`](aiomoqt/track.py); the raw stream API underneath is the session's `open_uni_stream()` and `stream_write()` ([`aiomoqt/protocol.py`](aiomoqt/protocol.py)) and `SubgroupHeader` ([`aiomoqt/messages/data.py`](aiomoqt/messages/data.py)).
 
 ## API guide
 
@@ -116,12 +116,14 @@ Every control message takes `wait_response`:
 
 ```python
 resp = await session.subscribe('ns', 'track', wait_response=True)   # awaits the response
-req  = await session.subscribe('ns', 'track')                       # response via handler
+req  = session.subscribe('ns', 'track')       # returns the SUBSCRIBE sent; response via handler
 ```
 
 Register handlers for peer-initiated messages:
 
 ```python
+from aiomoqt.types import MOQTMessageType
+
 client.register_handler(MOQTMessageType.SUBSCRIBE, my_subscribe_handler)
 ```
 
@@ -261,7 +263,7 @@ await server.serve_dual()   # raw QUIC + H3/WT on one port
 
 ## Tools
 
-Each tool runs as a module (`python -m aiomoqt.tools.NAME`) and most also install a console script. Every tool prints its full option set with `-?` / `--help` — note `-h` is `--host`, not help. Bench and media tools take a positional relay URL: `moqt://host[:port]` for raw QUIC, `https://host[:port]/[path]` for H3/WebTransport.
+Each tool runs as a module (`python -m aiomoqt.tools.NAME`) and most also install a console script. Every tool prints its full option set with `-h` (also `-?` or `--help`). Bench and media tools take a positional relay URL: `moqt://host[:port]` for raw QUIC, `https://host[:port]/[path]` for H3/WebTransport.
 
 | Module | Console script | Purpose |
 |---|---|---|
@@ -329,9 +331,9 @@ python -m aiomoqt.tools.moq_interop_relay --bind 0.0.0.0 --port 4443 \
 Reads a relay list, performs a real CLIENT_SETUP / SERVER_SETUP handshake per (endpoint × draft), and writes a JSON status report. Accepts CLI flags, environment variables, or both (CLI overrides env).
 
 ```bash
-python -m aiomoqt.tools.relay_probe -f relays.json -o status.json
+python -m aiomoqt.tools.relay_probe --relays-file relays.json -o status.json
 RELAYS_FILE=relays.json OUTPUT_FILE=status.json python -m aiomoqt.tools.relay_probe
-python -m aiomoqt.tools.relay_probe -f relays.json -o status.json --interval 300
+python -m aiomoqt.tools.relay_probe --relays-file relays.json -o status.json --interval 300
 ```
 
 | CLI flag | Env var | Default | Meaning |

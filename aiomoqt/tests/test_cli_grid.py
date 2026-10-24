@@ -12,6 +12,7 @@ Two kinds of test here:
 """
 import argparse
 import importlib
+import sys
 
 import pytest
 
@@ -21,7 +22,7 @@ from aiomoqt.utils import cli
 TOOLS = [
     "pub_bench", "sub_bench", "loopback_bench", "adaptive_bench",
     "pub_server", "load_sim", "relay_probe",
-    "moq_interop_client", "moq_interop_relay",
+    "moq_interop_client", "moq_interop_relay", "moqtest_origin",
     "pub_media", "sub_media",
 ]
 
@@ -45,15 +46,12 @@ SHORT_FLAG_MEANING = {
     "-W": "wt",
 }
 
-# No tool is exempt wholesale. moq_interop_client keeps two flags that
-# collide with the grid because the external interop-runner invokes it
-# with them; they are enumerated so the exemption is auditable and
-# disappears the moment the runner PR lands. Everything else about that
-# tool — and every other tool — must satisfy the grid.
-GRID_EXEMPT: set = set()
-KNOWN_GRID_VIOLATIONS = {
-    # tool: {short flag: dest it currently means}
-    "moq_interop_client": {"-r": "relay", "-t": "test"},
+# Flags another program invokes a tool with. moq_interop_client follows
+# moq-interop-runner docs/TEST-CLIENT-INTERFACE.md ("Options"):
+#   -r, --relay <URL>   -t, --test <NAME>   -l, --list   -v, --verbose
+EXTERNAL_CONTRACT = {
+    "moq_interop_client": {"-r": "--relay", "-t": "--test",
+                           "-l": "--list", "-v": "--verbose"},
 }
 
 
@@ -155,7 +153,7 @@ def test_datagram_guard_rejects_wt_transport():
 
 def test_url_and_listener_options_are_mutually_exclusive():
     p = cli.make_parser("t")
-    cli.add_endpoint(p, required=False)
+    p.add_argument("url", nargs="?")
     cli.add_listener(p)
     with pytest.raises(SystemExit):
         cli.check_url_vs_listener(p, p.parse_args(["moqt://h", "-Q"]))
@@ -163,35 +161,91 @@ def test_url_and_listener_options_are_mutually_exclusive():
     cli.check_url_vs_listener(p, p.parse_args(["-Q"]))             # ok
 
 
+def _groups():
+    return [getattr(cli, n) for n in sorted(dir(cli))
+            if n.startswith("add_") and callable(getattr(cli, n))]
+
+
+def _group_flags(fn, **kw):
+    p = cli.make_parser("t")
+    fn(p, **kw)
+    return sorted(tuple(a.option_strings) or (a.dest,) for a in p._actions)
+
+
+def _other_value(default):
+    if isinstance(default, bool):
+        return not default
+    if default is None:
+        return "other"
+    if isinstance(default, (int, float)):
+        return default + 1
+    return "other"
+
+
 def test_groups_take_no_feature_toggles():
     """The anti-drift property: a caller cannot ask for a subset, so
-    every tool that adds a group gets the identical flag set."""
+    every tool that adds a group gets the identical flag set. Arguments
+    may set defaults only."""
     import inspect
-    for fn in (cli.add_publisher_media, cli.add_identity, cli.add_endpoint):
-        params = inspect.signature(fn).parameters
-        bool_toggles = [n for n, prm in params.items()
-                        if isinstance(prm.default, bool)
-                        and n not in ("required",)]
-        assert not bool_toggles, (
-            f"{fn.__name__} grew boolean toggles {bool_toggles} — that "
-            f"moves the flag choice back to each call site")
+    groups = _groups()
+    assert len(groups) >= 12
+    for fn in groups:
+        params = list(inspect.signature(fn).parameters.values())[1:]
+        assert not [prm.name for prm in params
+                    if isinstance(prm.default, bool)], fn.__name__
+        base = _group_flags(fn)
+        for prm in params:
+            try:
+                flags = _group_flags(fn, **{prm.name: _other_value(prm.default)})
+            except (TypeError, ValueError):
+                # An unannotated None default may be numeric.
+                flags = _group_flags(fn, **{prm.name: 1})
+            assert flags == base, (
+                f"{fn.__name__}({prm.name}=...) changes the flag set")
 
 
 # -- cross-tool consistency -----------------------------------------
 
-@pytest.mark.parametrize("tool", TOOLS)
+@pytest.mark.parametrize("tool", TOOLS + EXAMPLES)
 def test_tool_short_flags_match_grid(tool):
-    allowed = KNOWN_GRID_VIOLATIONS.get(tool, {})
-    for act in _parser_actions(tool):
+    pkg = "aiomoqt.tools" if tool in TOOLS else "aiomoqt.examples"
+    contract = EXTERNAL_CONTRACT.get(tool, {})
+    for act in _parser_actions(tool, pkg):
         for opt in act.option_strings:
-            if opt in SHORT_FLAG_MEANING:
-                if allowed.get(opt) == act.dest:
-                    continue      # enumerated, pending the runner PR
+            if opt in SHORT_FLAG_MEANING and opt not in contract:
                 want = SHORT_FLAG_MEANING[opt]
-                ok = act.dest == want or act.dest.endswith("_" + want)
-                assert ok, (
+                assert act.dest == want, (
                     f"{tool}: {opt} means {act.dest!r} but the grid "
                     f"reserves it for {want!r}")
+
+
+def test_short_flag_has_one_meaning_across_tools():
+    meanings = {}
+    for tool in TOOLS + EXAMPLES:
+        pkg = "aiomoqt.tools" if tool in TOOLS else "aiomoqt.examples"
+        contract = EXTERNAL_CONTRACT.get(tool, {})
+        for act in _parser_actions(tool, pkg):
+            for opt in act.option_strings:
+                if opt.startswith("--") or opt in contract:
+                    continue
+                meanings.setdefault(opt, {}).setdefault(act.dest, []).append(
+                    tool)
+    clashes = {o: m for o, m in meanings.items() if len(m) > 1}
+    assert not clashes
+
+
+@pytest.mark.parametrize("tool", sorted(EXTERNAL_CONTRACT))
+def test_external_contract_matches_its_interface(tool):
+    contract = EXTERNAL_CONTRACT[tool]
+    acts = _parser_actions(tool)
+    for short, long_ in contract.items():
+        owners = [a for a in acts if short in a.option_strings]
+        assert len(owners) == 1, short
+        assert owners[0].option_strings == [short, long_]
+        assert owners[0].dest == long_[2:]
+    shorts = {o for a in acts for o in a.option_strings
+              if not o.startswith("--")}
+    assert shorts == set(contract) | {"-h", "-?"}
 
 
 @pytest.mark.parametrize("tool", TOOLS)
@@ -218,29 +272,27 @@ def test_uvloop_is_gone(tool):
             f"{tool}: --uvloop was removed — it never helped")
 
 
+HELP_FLAGS = ("-h", "-?", "--help")
+
+
 @pytest.mark.parametrize("tool", TOOLS + EXAMPLES)
-def test_help_flag_is_question_mark(tool):
-    """-h stays free for hosts/URLs, so help is -?/--help."""
+def test_help_action_is_the_shared_one(tool):
     pkg = "aiomoqt.tools" if tool in TOOLS else "aiomoqt.examples"
-    acts = _parser_actions(tool, pkg)
-    helps = [a for a in acts if isinstance(a, argparse._HelpAction)]
-    if not helps:
-        pytest.skip(f"{tool}: no help action captured")
-    opts = {o for a in helps for o in a.option_strings}
-    assert "-?" in opts or "--help" in opts
+    helps = [a for a in _parser_actions(tool, pkg)
+             if isinstance(a, argparse._HelpAction)]
+    assert [tuple(a.option_strings) for a in helps] == [HELP_FLAGS]
 
 
-def test_known_violations_are_still_real():
-    """The exemption list must not outlive the violations it covers —
-    once the interop-runner PR lands and the flags change, this fails
-    and the stale entry gets deleted."""
-    for tool, flags in KNOWN_GRID_VIOLATIONS.items():
-        actual = {o: a.dest for a in _parser_actions(tool)
-                  for o in a.option_strings}
-        for opt, dest in flags.items():
-            assert actual.get(opt) == dest, (
-                f"{tool}: {opt} no longer means {dest!r} — remove it "
-                f"from KNOWN_GRID_VIOLATIONS")
+@pytest.mark.parametrize("flag", HELP_FLAGS)
+@pytest.mark.parametrize("tool", TOOLS + EXAMPLES)
+def test_help_flags_print_help(tool, flag, monkeypatch, capsys):
+    pkg = "aiomoqt.tools" if tool in TOOLS else "aiomoqt.examples"
+    mod = importlib.import_module(f"{pkg}.{tool}")
+    monkeypatch.setattr(sys, "argv", [tool, flag])
+    with pytest.raises(SystemExit) as e:
+        mod.parse_args([flag]) if _takes_argv(mod) else mod.parse_args()
+    assert e.value.code == 0
+    assert "usage:" in capsys.readouterr().out
 
 
 def test_packaging_flag_agrees_across_media_tools():
@@ -261,3 +313,22 @@ def test_loc_bare_flag_agrees_across_media_tools():
         assert len(acts) == 1, tool
         assert acts[0].option_strings == ["--loc-bare"], tool
         assert isinstance(acts[0], argparse._StoreTrueAction), tool
+
+
+def test_load_sim_draft_takes_a_draft_list():
+    acts = [a for a in _parser_actions("load_sim") if a.dest == "draft"]
+    assert acts[0].type("22,20") == [22, 20]
+    assert "22" in acts[0].help
+
+
+@pytest.mark.parametrize("argv,insecure", [
+    ([], True), (["-k"], True), (["--insecure"], True),
+    (["--cert", "c.pem", "--key", "k.pem"], False),
+    (["--cert", "c.pem", "--key", "k.pem", "-k"], True),
+])
+def test_loopback_bench_insecure(monkeypatch, argv, insecure):
+    from aiomoqt.tools import loopback_bench
+    monkeypatch.setattr(sys, "argv", ["loopback_bench", *argv])
+    args = loopback_bench.parse_args()
+    assert args.insecure is insecure
+    assert args.cert

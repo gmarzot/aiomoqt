@@ -35,7 +35,8 @@ from .types import (
     RequestErrorCode, StreamResetCode, SubscribeDoneCode,
 )
 from .delivery import (
-    FanoutDelivery, ObjectHistory, StreamMapping, SubgroupDelivery,
+    DatagramTooLarge, FanoutDelivery, ObjectHistory, StreamMapping,
+    SubgroupDelivery,
 )
 from .messages import (
     FetchHeader, LocationFilter, MOQTMessage, ObjectDatagram, PublishOk,
@@ -428,7 +429,7 @@ class _Subscription:
                  'done', 'stream_count', 'generating', 'delivery', 'joining',
                  'window', 'open_streams', 'end_status', 'senders',
                  'fill_streams', 'fills', 'location_filter', 'group_order',
-                 'object_timeout', 'subgroup_timeout')
+                 'object_timeout', 'subgroup_timeout', 'updated_request')
 
     def __init__(self, session):
         self.session = session
@@ -469,6 +470,8 @@ class _Subscription:
         # 0 sets none. d14/d16 DELIVERY_TIMEOUT is the object timeout.
         self.object_timeout = 0
         self.subgroup_timeout = 0
+        # Request whose Forward State a REQUEST_UPDATE has set.
+        self.updated_request = None
 
     def take_timeouts(self, params, prof) -> None:
         """Record the delivery timeouts a SUBSCRIBE, PUBLISH_OK or
@@ -611,6 +614,8 @@ class PublishedTrack(Track):
         # produce() tracks: the shared delivery and the one production run.
         self._out: Optional[FanoutDelivery] = None
         self._production: Optional[asyncio.Future] = None
+        # The error that ended production, if one did.
+        self.error: Optional[Exception] = None
         # Aggregate stats across all subgroup streams; subgroup 0 reports.
         self._iv_objects = 0
         self._iv_bytes = 0
@@ -741,19 +746,27 @@ class PublishedTrack(Track):
 
     async def _run_production(self) -> None:
         """Run produce() once, flush every peer, then send each peer that
-        was served its PUBLISH_DONE."""
+        was served its PUBLISH_DONE. A datagram over the path limit ends
+        the track: PUBLISH_DONE INTERNAL_ERROR, the error kept in
+        `error`."""
         out = self._out
+        status, reason = SubscribeDoneCode.TRACK_ENDED, None
         try:
             await self.produce(out)
         except asyncio.CancelledError:
             out.abort()
             raise
+        except DatagramTooLarge as e:
+            out.abort()
+            self.error = e
+            status, reason = SubscribeDoneCode.INTERNAL_ERROR, str(e)
         else:
             await out.close()
         finally:
             for sub in list(self._subs):
-                if sub.delivery is not None:
-                    self._send_publish_done(sub.session)
+                if sub.delivery is not None and not sub.done:
+                    self._send_publish_done(sub.session, status,
+                                            reason=reason)
 
     @property
     def track_alias(self) -> int:
@@ -1155,6 +1168,10 @@ class PublishedTrack(Track):
         # FORWARD and the PUBLISH's own value stands.
         if forward is None and not sub.session._profile.publish_ok_expires_only:
             forward = 1
+        # A REQUEST_UPDATE read with the reply runs first (this task
+        # resumes a hop later) and is the newer Forward State.
+        if sub.updated_request == request_id:
+            forward = None
         logger.info(f"Track: PUBLISH_OK (REQUEST_OK): forward={forward}")
         sub.take_timeouts(getattr(reply, 'parameters', None),
                           sub.session._profile)
@@ -1195,6 +1212,8 @@ class PublishedTrack(Track):
             self._cut_streams(sub)
         if forward and not sub.forward:
             sub.joining[msg.existing_request_id] = self._largest
+        if forward is not None:
+            sub.updated_request = msg.existing_request_id
         # §10.9: exactly one REQUEST_OK or REQUEST_ERROR; LARGEST_OBJECT
         # once objects exist (§10.2.11).
         largest = self._largest
@@ -1518,7 +1537,8 @@ class PublishedTrack(Track):
         sub.subscribers.clear()
 
     def _send_publish_done(self, session, status_code=0x2,
-                           final: bool = True):
+                           final: bool = True,
+                           reason: Optional[str] = None):
         """Send PUBLISH_DONE with stream count for clean shutdown.
         `final` False ends only the subscription: the track stays open
         to a later one.
@@ -1552,7 +1572,8 @@ class PublishedTrack(Track):
             request_id=req_id,
             status_code=status_code,
             stream_count=count,
-            reason="track ended" if final else "subscription ended",
+            reason=reason or ("track ended" if final
+                              else "subscription ended"),
         )
         logger.info(f"Track: PUBLISH_DONE request_id={req_id} "
                     f"streams={count}")
@@ -1614,6 +1635,13 @@ class PublishedTrack(Track):
         self._withdraw_namespace(session)
         session._close_session()
 
+    def _producer_done(self, task) -> None:
+        # Retrieve the exception: a write racing the session close raises.
+        self._tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            logger.debug(f"Track: {self.fqtn} producer ended: "
+                         f"{task.exception()!r}")
+
     def _spawn_producers(self, session, track_alias: int,
                          pad: bytes) -> None:
         """Start one producer task per subgroup, or a single task for
@@ -1629,7 +1657,7 @@ class PublishedTrack(Track):
                 self._generate_datagrams(
                     session=session, track_alias=track_alias, pad=pad,
                     first_group=first_group))
-            task.add_done_callback(lambda t: self._tasks.discard(t))
+            task.add_done_callback(self._producer_done)
             self._tasks.add(task)
             return
 
@@ -1652,7 +1680,7 @@ class PublishedTrack(Track):
                     barrier=barrier,
                 )
             )
-            task.add_done_callback(lambda t: self._tasks.discard(t))
+            task.add_done_callback(self._producer_done)
             self._tasks.add(task)
 
     async def _generate_datagrams(self, session, track_alias: int,
@@ -1994,6 +2022,10 @@ class SubscribedTrack(Track):
         except TimestampMalformed as e:
             self.timing.assign(TrackTiming())
             self.timing_error = str(e)
+        # Objects can reach the check before subscribe() resumes.
+        alias = getattr(msg, 'track_alias', None)
+        if alias is not None:
+            self.track_alias = alias
         self._route_timing_checks(msg)
 
     def _checks_every_object(self) -> bool:

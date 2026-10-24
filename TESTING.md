@@ -74,7 +74,8 @@ or `--test-suite <suite>` (runs a single suite, ignoring tier).
 Covers what pytest cannot reach: the tools, the multi-process paths, and the draft × transport matrix.
 - **`loopback-pub-sub`** — `loopback_bench` at fixed rate; asserts throughput > 0 and zero loss. Variants: `-tiny`, `-streams`, `-paced`.
 - **`loopback-bench-d{14,16,18,20,22}-{wt,quic}`** — session-setup / framing smoke for every draft × transport.
-- **`loopback-adaptive-mp-d{14,16,18}`** — adaptive BW over the multi-process loopback path.
+- **`loopback-adaptive-mp-d{14,16,18,20,22}`** — adaptive BW over the multi-process loopback path.
+- **`loopback-adaptive-relay-quic-d22`** — adaptive BW in relay mode through the local interop relay over raw QUIC.
 - **`loopback-fetch`** — standalone `FETCH` variants: joining-relative, explicit range, invalid-range rejection, unknown request-id rejection.
 
 ### `interop` tier (per active relay × transport × draft)

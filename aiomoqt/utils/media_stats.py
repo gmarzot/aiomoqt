@@ -22,7 +22,8 @@ from typing import Callable, Dict, List, Optional, Tuple
 from ..media.cmaf import chunk_decode_time
 from ..types import ObjectStatus
 from .format import fmt_bps, fmt_ms, fmt_rate
-from .stats import LOC_TIMESCALE, _pct, _Reservoir
+from .stats import (CLOCK_OFFSET_MARK, CLOCK_OFFSET_MIN_MS, LOC_TIMESCALE,
+                    _pct, _Reservoir, note_clock_offset)
 from .timing import (
     SOURCE_FRINDELL, TimestampMalformed, TrackTiming, capture_time_us,
 )
@@ -136,6 +137,7 @@ class TrackAnalysis:
         self._lat = _Reservoir(10000)
         self._lat_sum = 0.0
         self.lat_max: Optional[float] = None
+        self.lat_min: Optional[float] = None
         self._settle = _Reservoir(1000)
         self.settle_max: Optional[float] = None
         self._gop = _Reservoir(1000)
@@ -215,6 +217,10 @@ class TrackAnalysis:
             self._iv_lat.append(lat)
             self.lat_max = lat if self.lat_max is None else max(
                 self.lat_max, lat)
+            if self.lat_min is None or lat < self.lat_min:
+                self.lat_min = lat
+                if lat < 0:
+                    note_clock_offset(lat)
         if self._prev_rm is not None:
             d = (recv_us - self._prev_rm[0]) - (m_us - self._prev_rm[1])
             self.jitter_ms += (abs(d) / 1000 - self.jitter_ms) / 16
@@ -492,6 +498,7 @@ class TrackAnalysis:
             lat_p50_ms=_pct(lat, 50) if lat else None,
             lat_p95_ms=_pct(lat, 95) if lat else None,
             lat_max_ms=lat[-1] if lat else None,
+            clock_offset=bool(lat) and lat[0] < CLOCK_OFFSET_MIN_MS,
             jitter_ms=(self.jitter_ms if self.timed and d['objects']
                        else None),
             lost=d['lost'], lost_groups=d['lost_groups'],
@@ -537,6 +544,8 @@ class TrackAnalysis:
             lat_avg_ms=self._lat_sum / n_lat if n_lat else None,
             lat_p50_ms=lat_p50, lat_p95_ms=lat_p95, lat_p99_ms=lat_p99,
             lat_max_ms=self.lat_max,
+            clock_offset=(self.lat_min is not None
+                          and self.lat_min < CLOCK_OFFSET_MIN_MS),
             jitter_ms=self.jitter_ms if self.timed else None,
             jitter_max_ms=self.jitter_max_ms if self.timed else None,
             lost=self.lost, lost_groups=self.lost_groups,
@@ -759,7 +768,8 @@ def _iv_line(label: str, tw: int, r: dict) -> str:
         fmt_bps(r['bitrate_bps']), lat, _ms(r['jitter_ms']), loss,
         str(r['reorders']), str(r['late']), str(r['underruns']),
         str(r['resets']), '' if skew is None else _ms(skew))
-    return f"  {label:<10}{r['track']:<{tw}}" + _cells(values)
+    return (f"  {label:<10}{r['track']:<{tw}}" + _cells(values)
+            + (f"  {CLOCK_OFFSET_MARK}" if r.get('clock_offset') else ''))
 
 
 def format_interval(t0: float, t1: float, rows: List[dict]) -> List[str]:
@@ -797,6 +807,7 @@ def _track_summary(r: dict) -> List[str]:
     if r['wall'] and r['lat_p50_ms'] is not None:
         out.append(f"    Latency:   p50={r['lat_p50_ms']:.1f}  "
                    f"p95={r['lat_p95_ms']:.1f}  max={r['lat_max_ms']:.1f} ms"
+                   + (f" {CLOCK_OFFSET_MARK}" if r.get('clock_offset') else '')
                    + src)
     elif r['timed']:
         out.append("    Latency:   n/a (media-time timestamps)" + src)

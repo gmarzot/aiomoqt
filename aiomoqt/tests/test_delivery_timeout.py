@@ -78,6 +78,9 @@ class _FakeSession:
     async def dgram_write_drain(self, buf):
         self.dgrams.append(buf)
 
+    def datagram_max_payload(self):
+        return 1200
+
 
 async def _run_lane(mapping, items, timeout):
     session = _FakeSession()
@@ -86,7 +89,8 @@ async def _run_lane(mapping, items, timeout):
     lane = out.add(delivery, joining=False, deadline=lambda: timeout)
     for group_id, object_id, age in items:
         lane.queue.put_nowait((group_id, object_id, b"p", None,
-                               object_id == 0, time.monotonic() - age))
+                               object_id == 0, time.monotonic() - age,
+                               None))
     await out.close()
     return session, delivery, lane
 

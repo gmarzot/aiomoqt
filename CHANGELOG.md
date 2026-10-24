@@ -1,7 +1,55 @@
 # Changelog
 
-## Unreleased
+## v0.13.2
 
+- pub_media: the `player:` line is printed only when `--player-base` or `AIOMOQT_PLAYER_URL` is set; the localhost default is gone.
+- Bench and media stats: a negative latency within 1 ms is rounding on one clock and no longer warns or marks a clock offset.
+- Relay: the listening line reports all interfaces, which is what aiopquic binds whatever `--bind` says.
+- README: the subscribe and handler examples match the API. server_example: `-Q` serves raw QUIC, `-Q -W` both on one port; `--retry` is gone.
+- `await_publish()` and `await_namespace()` queue at most 1024 announcements; past that the oldest is dropped, with one WARNING per run of drops.
+- Fan-out: a lane that sheds objects at a group boundary resets the truncated subgroup instead of ending it with END_OF_GROUP and FIN.
+- `max_object_bytes` on MOQTClient and MOQTServer (default 64 MiB): a data stream declaring a larger object gets STOP_SENDING EXCESSIVE_LOAD, and more than 4x that held in incomplete objects closes the session with INTERNAL_ERROR.
+- A data stream on a track alias that nothing binds within 5 s gets STOP_SENDING CANCELLED.
+- pub_media `--loop` with CMAF: tfdt follows the paced timestamps, so audio no longer drifts from video when the clip's last audio frame is short.
+- Relay: the first subscriber no longer narrows the upstream subscription; Next Object with nothing cached starts at {0, 0}, unfiltered subscribers get cached objects, and an earlier start is fetched upstream.
+- adaptive_bench and load_sim: worker processes ignore Ctrl-C; the parent stops them.
+- Relay status: each session reports `rtt_min_ms` beside `rtt_ms`.
+- Relay status: a session's `loss_pct` is null unless the relay delivers to it; publisher sessions no longer read ~60% loss from unacked ACK-only packets.
+- PublishedTrack (d18): a REQUEST_UPDATE read together with the PUBLISH reply no longer has its Forward State undone by that reply, which left the track paused with subscribers waiting.
+- load_sim: Ctrl-C during startup no longer hangs: the handler is installed before workers fork, and unread shard commands do not block exit.
+- load_sim: an interrupted run prints its verdict and exits 130.
+- loopback_bench: `--cert` without `-k` verifies against that cert, and a run with no objects exits 1.
+- load_sim: Ctrl-C during startup exits 130 without a traceback.
+- The `test` extra installs jsonschema, so CI runs the agent-spec tests.
+- moq_interop_client `fetch` and `join`: the client publishes a live track through the relay and passes only when the FETCH or joining FETCH returns its objects; a refusal now fails.
+- loopback_bench: `-k/--insecure`; it verifies the certificate when `--cert` is given without `-k`.
+- adaptive_bench: latency and jitter with no samples print n/a, not 0.0us.
+- load_sim: `--draft` takes 14-22 or a comma list, as the other tools do.
+- Relay: an unusable `--control` path exits with a one-line error.
+- adaptive_bench `--mp` and relay runs: rates divide by the time measured so far, not a fixed 5 s, so early intervals no longer read as a shortfall.
+- relay_probe and moq_interop_client: Ctrl-C exits 130 without a traceback.
+- PublishedTrack: a producer task that fails as the session closes is logged at DEBUG, not reported as "Task exception was never retrieved".
+- `MOQTServer.close_sessions()`; the relay and pub_server close their sessions on SIGINT and SIGTERM, so peers see the close at once instead of at the idle timeout.
+- Latency reports (TrackStats tools, sub_media `--analyze`/`--report`, adaptive_bench): a negative latency prints a one-time clock-offset warning and is marked "(clock offset)"; the figures are kept and show their sign.
+- sub_bench exits 1 when it cannot connect or receives no objects, and `-t` bounds connecting; pub_bench exits 1 with a one-line error on a dead port, also within `-t`.
+- adaptive_bench: Ctrl-C in its first half second exits cleanly instead of raising UnboundLocalError.
+- pub_server: `-Q -W` serves raw QUIC and WebTransport on one port; the subscriber hint uses `-N` and lists a URL per transport.
+- CLI: a short flag means one thing on every tool. adaptive_bench `-p` is now `--loopback-port` and `-l` is `--latency-threshold`; relay_probe `-f` is `--relays-file`.
+- Tools and examples: `-h`, `-?` and `--help` all print help; relay_probe, moq_interop_client, moq_interop_relay and moqtest_origin gain `-?`.
+- pub_media: H.265 video from `--mp4` (hvc1/hev1; loc, cmaf, locmaf) and `--ts` (stream type 0x24, parameter sets in band, catalog codec `hev1`).
+- pub_media: `--stats-json` writes `@mtt <json>` events to stdout (ready, stats, endpoint_lost, done) and human output to stderr.
+- pub_media: SIGTERM and SIGINT end every track with PUBLISH_DONE, drain 1 s and exit 0.
+- Delivery: an object datagram over the session's datagram limit raises `DatagramTooLarge` and is never sent or streamed; a produce() track then ends with PUBLISH_DONE INTERNAL_ERROR, and pub_media exits 64.
+- pub_media: `--audio-frames-per-group N` (one object per frame, N per group; a CMAF fragment of N chunks) and `--audio-subgroups group|object`.
+- pub_media: `--video-subgroups object` sends each video object on its own subgroup stream (subgroup ID = object ID).
+- pub_media: the stats line counts objects produced and reports frames the track discarded (waiting for a key frame, Forward State 0) as `discarded`.
+- pub_media: Opus audio from `--ts` and `--mp4` (loc, cmaf, locmaf), one object per Opus packet; catalog codec `opus`.
+- Relay: SUBSCRIBE_TRACKS with TRACK_PROPERTY_FILTER is offered only the tracks whose Track Properties pass it; its other Range Filters filter each resulting subscription.
+- Relay: d20/d22 SETUP advertises MAX_FILTER_RANGES 16 and applies SUBGROUP, OBJECTID, PRIORITY and OBJECT_PROPERTY Range Filters per subscriber on live objects, cache replay, fill streams and FETCH; REQUEST_UPDATE replaces or removes them; `MOQTServer(max_filter_ranges=)`.
+- Relay: FETCH and fill streams served from the cache send each group's objects in Object ID order across subgroups.
+- Relay: a FETCH, joining FETCH or fill the cache cannot serve goes to the session that PUBLISHed the track, not only to namespace publishers.
+- Fan-out: each object is encoded once per header state and the bytes shared by every peer in that state (datagrams: per alias and draft codec).
+- SubscribedTrack: a timing-malformed object that arrives before SUBSCRIBE_OK is processed cancels its own track, not alias 0.
 - Relay: status files are encoded with json's C encoder.
 - Relay: status bit rates are integers and milliseconds carry two decimals.
 - Relay: platform.json is rewritten every 5 s instead of every 2 s.
@@ -27,6 +75,8 @@
 - `PublishedTrack(timestamps='loc'|'frindell'|'both')` and `--timestamps` on pub_bench, loopback_bench and pub_server: generated objects can carry draft-frindell-moq-timestamp timing (paced: TIMESCALE + TIMESTAMP_MAPPING + zig-zag correction; `-r 0`: explicit OBJECT_TIMESTAMP in µs); LOC 0x10 stays the default.
 - pub_media `--timestamp-mapping`: TIMESCALE and TIMESTAMP_MAPPING Track Properties on a fixed-cadence track (the mp4's own timescale, the tone at 48 kHz) with OBJECT_TIMESTAMP only off schedule, explicit OBJECT_TIMESTAMP on live and irregular-GOP sources, and a capture-time prft on each CMAF/LOCMAF group start; LOC TIMESTAMP is unchanged.
 - pub_media: paced feeders share one start and wall clock.
+- Relay: the object cache keeps its 8 newest groups when group IDs skip; a timestamp-numbered catalog no longer loses its previous group, which reset fills the cache could serve.
+- Release regression: manual suite `moqdev-smoke` runs moq-dev's relay smoke against aiomoqt-relay in Docker.
 
 ## v0.13.1
 
