@@ -703,10 +703,8 @@ class MOQTMessage:
                     param_value.encode(payload, prof=prof)
                 elif kind == "range_filter":
                     param_value.encode(payload, param_type, prof=prof)
-                elif kind == "fill" and prof.fill_parameters_counted:
-                    MOQTMessage._serialize_params(payload, param_value,
-                                                  prof=prof)
                 elif kind == "fill":
+                    # Length, then a counted parameter block.
                     inner = Buffer(capacity=BUF_SIZE, vi64=prof.vi64)
                     MOQTMessage._serialize_params(inner, param_value,
                                                   prof=prof)
@@ -892,11 +890,11 @@ class MOQTMessage:
                             scope: Optional[str] = None) -> Dict[int, Any]:
         """Deserialize a parameter block (see _pull_params).
 
-        FILL_PARAMETERS is read count-prefixed (PR #2015). Transition
-        tolerance for the published d20/d22 text: a block with a
+        FILL_PARAMETERS is read length-prefixed (d20/d22): a counted
+        block, or bare parameters to the value's end. A block with a
         FILL_PARAMETERS that does not parse that way, or does not end at
-        buf_end, is reread with the value length-prefixed: a counted
-        block, or bare parameters to the value's end."""
+        buf_end, is reread with the value count-prefixed and no Length
+        (moq-transport PR #2015)."""
         start = buf.tell()
         fill = []
         try:
@@ -916,7 +914,7 @@ class MOQTMessage:
         try:
             return MOQTMessage._pull_params(
                 buf, prof=prof, buf_end=buf_end, delta_keys=delta_keys,
-                scope=scope, fill_length_prefixed=True)
+                scope=scope, fill_counted=True)
         except (MOQTProtocolViolation, BufferReadError, MOQTUnderflow) as e:
             # Report the reading that got further.
             if buf.tell() > reached:
@@ -930,7 +928,7 @@ class MOQTMessage:
                      buf_end: Optional[int] = None,
                      delta_keys: bool = None,
                      scope: Optional[str] = None,
-                     fill_length_prefixed: bool = False,
+                     fill_counted: bool = False,
                      fill_seen: Optional[list] = None,
                      bare: bool = False) -> Dict[int, Any]:
         """
@@ -999,13 +997,13 @@ class MOQTMessage:
                 elif kind == "range_filter":
                     param_value = RangeFilter.decode(
                         buf, param_type, prof=prof, buf_end=buf_end)
-                elif kind == "fill" and not fill_length_prefixed:
-                    if fill_seen is not None:
-                        fill_seen.append(param_type)
+                elif kind == "fill" and fill_counted:
                     param_value = MOQTMessage._pull_params(
                         buf, prof=prof, buf_end=buf_end,
                         scope="FillParameters")
                 elif kind == "fill":
+                    if fill_seen is not None:
+                        fill_seen.append(param_type)
                     param_len = buf.pull_vint()
                     value_end = buf.tell() + param_len
                     if buf_end is not None and value_end > buf_end:

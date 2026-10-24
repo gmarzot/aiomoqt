@@ -5032,7 +5032,7 @@ class _MOQTSessionMixin:
         FetchObject in ascending order as a delta-coded object, then
         FINs unless `fin=False` (the caller then owns the FIN).
         `objects` is any iterable of FetchObject; where FETCH carries no
-        Object Status (d20+), objects with one are skipped. Call
+        Object Status (d16+), objects with one are skipped. Call
         fetch_ok() first (its End Location must be known). Returns the
         stream id. Cancelled mid-way, it resets the stream (§5.2); a
         failure resets it too."""
