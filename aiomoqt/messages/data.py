@@ -466,7 +466,8 @@ class ObjectHeader(MOQTMessage):
                 # spans the declared length.
                 _check_payload_len(e.needed - e.pos, max_payload)
                 raise
-            _check_payload_len(len(payload), max_payload)
+            if max_payload and len(payload) > max_payload:
+                raise MOQTObjectTooLarge(len(payload), max_payload)
         except AttributeError:
             pull = buf.pull_uint_vi64 if vi64 else buf.pull_uint_var
             delta = pull()
