@@ -2,7 +2,7 @@
 
 ## v0.14.0
 
-- DEBUG logs no longer report each received stream data chunk as an unhandled QUIC event.
+- DEBUG logs no longer report each received stream data chunk, or the QUIC handshake completing, as an unhandled QUIC event.
 
 ## v0.13.2
 
