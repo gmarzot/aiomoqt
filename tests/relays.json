@@ -7,7 +7,8 @@
     "insecure":         "bool; if true, pass --tls-disable-verify / -k (default false)",
     "disabled":         "bool; if true, skip this relay entirely (default false)",
     "disabled_suites":  "list of interop suite names to skip for this relay",
-    "xfail_suites":     "list of interop suites that run and report but never gate for this relay: a documented peer non-conformance the case correctly fails on",
+    "xfail_suites":     "interop suites that run and report but never gate for this relay: a documented peer non-conformance the case correctly fails on. A list, or a map of suite → reason printed with the XFAIL",
+    "namespace":        "load_sim namespace for relay-pub-sub (default: aiomoqt), for relays that scope publishing by namespace",
     "compat":           "list of WIRE tolerance keys passed to the tools as --compat (libquicr, lenient-extensions, ...); the tools reject unknown values",
     "gating":           "list of draft numbers whose results gate CI (a FAIL fails the job). Absent/empty = non-gating: the relay still runs and reports, but its failures are XFAIL and never gate. Curate this to endpoints we hold ourselves to.",
     "notes":            "freeform (optional)"
@@ -33,8 +34,8 @@
       },
       "drafts": [14],
       "pub_mode": "publish-both",
-      "disabled_suites": ["relay-fetch"],
-      "notes": "CF d14 moq-rs: publisher must send PUB_NS + PUBLISH. relay-fetch disabled (#24): verified unsupported — cloudflare/moq-rs README lists FETCH 'Not Soon', and its relay neither forwards nor errors FETCH (open upstream issues cloudflare/moq-rs#57 passthrough, #58 error), so it never answers (TimeoutError). join works."
+      "disabled_suites": ["relay-fetch", "relay-join", "relay-discovery"],
+      "notes": "CF d14 moq-rs: publisher must send PUB_NS + PUBLISH. It answers neither FETCH, joining FETCH included (cloudflare/moq-rs#57, #58), nor SUBSCRIBE_ANNOUNCES, so fetch, join and discovery are disabled."
     },
     {
       "name": "moxygen-fb",
@@ -54,26 +55,15 @@
         "raw-quic": "moqt://cdn.moq.dev:443/anon",
         "h3-wt":    "https://cdn.moq.dev:443/anon"
       },
-      "drafts": [18, 20],
+      "drafts": [18, 20, 22],
       "pub_mode": "publish",
       "disabled_suites": ["relay-join", "relay-fetch"],
-      "notes": "moq-dev-rs anon endpoint. Re-enabled at d18/d20 per the runner registry; earlier d14/d16 runs saw publish rejected at QUIC and SUBSCRIBE code=404."
-    },
-    {
-      "name": "quichemoq",
-      "urls": {
-        "h3-wt": "https://quichemoq.dev:443"
-      },
-      "drafts": [18],
-      "pub_mode": "publish",
-      "disabled_suites": [],
-      "notes": "quiche-moq, WebTransport only, d18."
+      "notes": "moq-dev-rs (moq-lite) anon endpoint. Refuses PUBLISH and SUBSCRIBE_TRACKS as not supported, which relay-discovery reports."
     },
     {
       "name": "quicr-west",
       "urls": {
-        "raw-quic": "moqt://us-west-2.relay.quicr.org:33437",
-        "h3-wt":    "https://us-west-2.relay.quicr.org:33437/relay"
+        "raw-quic": "moqt://us-west-2.relay.quicr.org:33437"
       },
       "drafts": [18],
       "gating": [18],
@@ -81,18 +71,11 @@
       "insecure": true,
       "compat": ["libquicr"],
       "disabled_suites": [],
-      "xfail_suites": ["relay-data"],
-      "notes": "Cisco libquicr (server cert unacceptable → insecure). Serves d18 only: moqt-16 and moqt-20 are refused in TLS on raw QUIC, and WT answers them with no WT-Protocol. compat=libquicr covers two non-spec behaviors, tolerated + annotated: (1) relay returns SUBSCRIBE_OK for a nonexistent track (deferred-delivery policy); (2) relay returns FETCH_ERROR code=0 (INTERNAL_ERROR) for a nonexistent-track FETCH — the fetch probe honors libquicr code=0 as a deliberate refusal (the relay answered structurally in ~85ms; it just uses a poor code), matching how the join probe already accepted its non-spec code=17. Without --compat the fetch probe still fails code=0 by default (0.9.12 stance: 0x0 is not a refusal). relay-data XFAIL: libquicr never forwards PUBLISH_DONE downstream (§10.11), so data-subgroup-basic fails with \"no downstream PUBLISH_DONE\"."
-    },
-    {
-      "name": "moqtail",
-      "urls": {
-        "h3-wt": "https://relay.moqtail.dev"
+      "xfail_suites": {
+        "relay-data": "libquicr never forwards PUBLISH_DONE downstream (§10.11)",
+        "relay-fetch": "intermittent FIN mid-object on its FETCH stream, likely an Object Status, which FETCH objects do not carry"
       },
-      "drafts": [18],
-      "pub_mode": "publish",
-      "disabled_suites": [],
-      "notes": "OzU moqtail (Rust) draft-18 relay, WT; d22 is the separate moqtail-d22 entry."
+      "notes": "Cisco libquicr (server cert unacceptable → insecure). Serves d18 only: moqt-16 and moqt-20 are refused in TLS. Its WT endpoint (/relay) answers CONNECT with 404, so only raw QUIC is listed. compat=libquicr covers two non-spec behaviors, tolerated + annotated: (1) relay returns SUBSCRIBE_OK for a nonexistent track (deferred-delivery policy); (2) relay returns FETCH_ERROR code=0 (INTERNAL_ERROR) for a nonexistent-track FETCH — the fetch probe honors libquicr code=0 as a deliberate refusal (the relay answered structurally in ~85ms; it just uses a poor code), matching how the join probe already accepted its non-spec code=17. Without --compat the fetch probe still fails code=0 by default (0x0 is not a refusal)."
     },
     {
       "name": "imquic",
@@ -100,21 +83,21 @@
         "raw-quic": "moqt://lminiero.it:9000",
         "h3-wt":    "https://lminiero.it:9000"
       },
-      "drafts": [16, 18, 22],
-      "pub_mode": "publish",
+      "drafts": [16, 18, 20, 22],
+      "pub_mode": "publish-ns",
       "disabled_suites": [],
-      "notes": "Meetecho imquic (C). d14 probes rejected (WT: \"No WebTransport protocol offered\"; QUIC close 376)."
+      "notes": "Meetecho imquic (C). d14 probes rejected (WT: \"No WebTransport protocol offered\"; QUIC close 376). publish-ns: a PUBLISHed track reaches only the first of several subscribers. Peer issues seen: namespaces come back display-escaped ('-' → '.2d'), and the d16/d18 FETCH_OK End Location can precede the FETCH's Start."
     },
     {
       "name": "nokia-d18",
       "urls": {
-        "raw-quic": "moqt://moqt.nokiaresearch.com:4443/moq",
-        "h3-wt":    "https://moqt.nokiaresearch.com:4443/moq"
+        "raw-quic": "moqt://moqt.nokiaresearch.com:8443/moq",
+        "h3-wt":    "https://moqt.nokiaresearch.com:8443/moq"
       },
       "drafts": [18],
       "pub_mode": "publish",
       "disabled_suites": [],
-      "notes": "Nokia Research draft-18 relay (independent impl). ~5/6: announce-subscribe fails relay-side (the reference moq-dev-rs client also fails it there), not an aiomoqt issue. Non-gating: host down 2026-10-16/17 (every connect timed out, QUIC and WT)."
+      "notes": "Nokia Research draft-18 relay (independent impl) on :8443; draft-22 is nokia-d22 on :4443."
     },
     {
       "name": "cf-d18-interop",
@@ -125,17 +108,21 @@
       "drafts": [18],
       "pub_mode": "publish-both",
       "disabled_suites": [],
-      "notes": "Cloudflare moq-rs draft-18-dev. Setup OK; announce/subscribe fail relay-side — moq-rs draft-18-dev has no accept_bi, so it never reads the per-request bidirectional request streams IETF d18 §3 mandates (verified against a locally-built relay + mlog). Kept as a documented relay-side failure rather than masked."
+      "notes": "Cloudflare moq-rs draft-18 interop relay; publisher sends PUB_NS + PUBLISH."
     },
     {
       "name": "nokia-d22",
       "urls": {
-        "raw-quic": "moqt://moqt.nokiaresearch.com:8443/moq"
+        "raw-quic": "moqt://moqt.nokiaresearch.com:4443/moq",
+        "h3-wt":    "https://moqt.nokiaresearch.com:4443/moq"
       },
       "drafts": [22],
       "pub_mode": "publish",
       "disabled_suites": [],
-      "notes": "Nokia Research draft-22 relay, raw QUIC only. Non-gating: host down 2026-10-16/17."
+      "xfail_suites": {
+        "relay-join": "its fill fetch stream intermittently carries an Object Status, which FETCH-delivered objects do not (d22 §11.1.1)"
+      },
+      "notes": "Nokia Research draft-22 relay on :4443; draft-18 is nokia-d18 on :8443."
     },
     {
       "name": "moqtail-d22",
@@ -146,7 +133,7 @@
       "drafts": [22],
       "pub_mode": "publish",
       "disabled_suites": [],
-      "notes": "OzU moqtail draft-22 relay; d18 is the separate moqtail entry."
+      "notes": "OzU moqtail draft-22 relay."
     },
     {
       "name": "stitcher-moq",
@@ -156,8 +143,9 @@
       },
       "drafts": [18, 20, 22],
       "pub_mode": "publish",
+      "namespace": "moq-test/aiomoqt",
       "disabled_suites": [],
-      "notes": "Stitcher MoQ relay, drafts 18/20/22."
+      "notes": "Stitcher MoQ (moq-dev deployment), drafts 18/20/22. Publishing is scoped to moq-test/*. Refuses PUBLISH, SUBSCRIBE_TRACKS and multi-group FETCH as not supported, and serves no fill."
     },
     {
       "name": "red5-moq-relay",
