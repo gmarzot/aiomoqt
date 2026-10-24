@@ -1757,15 +1757,15 @@ class _MOQTSessionMixin:
                 self._reject_stream(stream_id, e.error_code, e.reason,
                                     quiet=e.quiet)
                 return
-            except MOQTObjectTooLarge as e:
-                self._reject_stream(stream_id, StreamResetCode.EXCESSIVE_LOAD,
-                                    str(e))
-                return
             except MOQTUnderflow:
                 chain.rollback()
                 return
             except BufferReadError:
                 chain.rollback()
+                return
+            except MOQTObjectTooLarge as e:
+                self._reject_stream(stream_id, StreamResetCode.EXCESSIVE_LOAD,
+                                    str(e))
                 return
             except MOQTProtocolViolation as e:
                 logger.error(f"MOQT stream({stream_id}): {e.reason_phrase}"
@@ -2281,14 +2281,11 @@ class _MOQTSessionMixin:
                         # may print or forward the object.
                         obj = ObjectHeader(object_id=0)
                         sg_header._obj_cache = obj
+                    # Positional: keyword passing costs per object.
                     obj.deserialize_into(
-                        buf, len,
-                        extensions_present=sg_header.extensions_present,
-                        prev_object_id=sg_header._last_object_id,
-                        vi64=sg_header._vi64,
-                        kvp_delta=sg_header._kvp_delta,
-                        max_payload=self._max_object_bytes,
-                    )
+                        buf, len, sg_header.extensions_present,
+                        sg_header._last_object_id, sg_header._vi64,
+                        sg_header._kvp_delta, self._max_object_bytes)
                     msg_header = obj
                     # Update delta tracking state
                     sg_header._last_object_id = msg_header.object_id
