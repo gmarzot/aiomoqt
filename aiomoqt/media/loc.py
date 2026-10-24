@@ -31,6 +31,7 @@ from ..track import PublishedTrack, SubscribedTrack
 from ..types import ObjectStatus
 from ..utils.buffer import Buffer, BufferReadError
 from ..utils.logger import get_logger
+from ..utils.timing import OBJECT_TIMESTAMP
 
 logger = get_logger(__name__)
 
@@ -76,12 +77,14 @@ LOC_STREAMING_FORMAT_TYPE = 0x002
 class LocFrame:
     """One encoded media chunk. `timestamp` is in track timescale units
     (µs since Unix epoch when the track carries no TIMESCALE).
-    `group_id` numbers the group a key frame opens (None: next)."""
+    `group_id` numbers the group a key frame opens (None: next).
+    `capture_us` is its wall-clock capture time for `frindell` timing."""
     payload: bytes
     key_frame: bool = False
     timestamp: Optional[int] = None
     extensions: Optional[Dict[int, Any]] = None
     group_id: Optional[int] = None
+    capture_us: Optional[int] = None
 
 
 class LocTrackPublisher(PublishedTrack):
@@ -102,6 +105,10 @@ class LocTrackPublisher(PublishedTrack):
 
     `loc_bare` sends the media without the Private Properties block, for
     receivers predating it; MSF CMAF tracks, which are not LOC, use it too.
+
+    `frindell` (a utils.timing.MediaTimestamps) adds
+    draft-frindell-moq-timestamp Track Properties, and OBJECT_TIMESTAMP
+    from each frame's `capture_us`, beside the LOC timestamp.
     """
 
     def __init__(self, session, namespace: str, trackname: str, *,
@@ -123,6 +130,7 @@ class LocTrackPublisher(PublishedTrack):
         self.timescale = timescale
         self.media_kind = media_kind
         self.codec_string = codec_string
+        self.frindell = None
         self.frames_dropped = 0  # discarded without an object id
         self._config_id = (LOC_PROP_AUDIO_CONFIG if media_kind == "audio"
                            else LOC_PROP_VIDEO_CONFIG)
@@ -151,14 +159,23 @@ class LocTrackPublisher(PublishedTrack):
     async def send_frame(self, payload: bytes, *, key_frame: bool = False,
                          timestamp: Optional[int] = None,
                          extensions: Optional[Dict[int, Any]] = None,
-                         group_id: Optional[int] = None) -> None:
-        """Queue one frame (awaits when the queue is full).
+                         group_id: Optional[int] = None,
+                         capture_us: Optional[int] = None) -> None:
+        """Queue one frame (awaits when the queue is full); raises the
+        error that ended production (`error`), if one did.
 
         `group_id` sets the group a key frame opens, so tracks fed from
         one source can keep equally numbered groups time-aligned (msf
         §4.2); ignored unless above the current group."""
+        if self.error is not None:
+            raise self.error
         await self._frames.put(LocFrame(payload, key_frame, timestamp,
-                                        extensions, group_id))
+                                        extensions, group_id, capture_us))
+
+    def _timing_properties(self, vi64: bool) -> Dict[int, Any]:
+        if self.frindell is None:
+            return super()._timing_properties(vi64)
+        return self.frindell.track_properties(vi64)
 
     async def finish(self) -> None:
         """Signal end of track; generation drains the queue then stops."""
@@ -179,9 +196,13 @@ class LocTrackPublisher(PublishedTrack):
     def _object_extensions(self, frame: LocFrame, group_start: bool,
                            session=None) -> Dict[int, Any]:
         exts: Dict[int, Any] = dict(frame.extensions or ())
+        session = session or self.session
+        if (OBJECT_TIMESTAMP in exts
+                and not session._profile.track_properties):
+            del exts[OBJECT_TIMESTAMP]      # d14: no TIMESCALE to go with it
         ts = (frame.timestamp if frame.timestamp is not None
               else self._now())
-        for prop_id in self._timestamp_ids(session or self.session):
+        for prop_id in self._timestamp_ids(session):
             exts[prop_id] = ts
         if self.codec_string is not None:
             exts[LOC_PROP_CODECSTRING] = self.codec_string.encode()
@@ -229,6 +250,11 @@ class LocTrackPublisher(PublishedTrack):
             group_start = obj_id == 0
             if frame.timestamp is None:
                 frame.timestamp = self._now()
+            if self.frindell is not None and frame.capture_us is not None:
+                frame.extensions = {
+                    **(frame.extensions or {}),
+                    **self.frindell.object_properties(group_id, obj_id,
+                                                      frame.capture_us)}
             payload = self._package(frame.payload, group_id, obj_id)
             if payload is None:
                 self.frames_dropped += 1
@@ -264,9 +290,11 @@ class LocTrackSubscriber(SubscribedTrack):
                  on_frame: Optional[Callable] = None,
                  auth_token: Optional[bytes] = None,
                  on_arrival: Optional[Callable] = None,
-                 loc_bare: bool = False):
+                 loc_bare: bool = False,
+                 timestamp_errors: str = 'cancel'):
         super().__init__(session, namespace, trackname,
-                         on_object=self._on_object, auth_token=auth_token)
+                         on_object=self._on_object, auth_token=auth_token,
+                         timestamp_errors=timestamp_errors)
         self.on_frame = on_frame
         self.on_arrival = on_arrival
         self.loc_bare = loc_bare

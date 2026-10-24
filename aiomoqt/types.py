@@ -1,3 +1,4 @@
+import asyncio
 import re
 from enum import IntEnum
 from typing import Dict, Tuple
@@ -622,6 +623,12 @@ WT_ALPN_ERROR = 0x0817B3DD
 
 class MOQTNegotiationError(ConnectionError):
     """The server's WT-Protocol answer selected none of the offered MoQT drafts."""
+
+
+class MOQTStreamStopped(asyncio.CancelledError):
+    """A write to a data stream the peer stopped or reset while the session
+    lives: that stream is over, the session is not. A CancelledError, so a
+    writer that does not catch it ends as on session teardown."""
 
 
 class MOQTRequestError(Exception):

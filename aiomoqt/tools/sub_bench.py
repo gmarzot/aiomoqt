@@ -12,8 +12,10 @@ Usage:
   moq-sub-bench relay.example.com -t 60 -i 10
 """
 import asyncio
+import contextlib
 import logging
 import os
+import sys
 import time
 import tracemalloc
 
@@ -96,11 +98,16 @@ class BenchReporter:
         print(f"  ObjRate:     {s['obj_rate']:.1f} obj/s")
         print(f"  Throughput:  {s['mbps']:.2f} Mbps")
         if s['lat_mean']:
+            mark = "  (clock offset)" if s.get('clock_offset') else ""
             print(f"  Latency:     min={s['lat_min']:.1f}  "
                   f"avg={s['lat_mean']:.1f}  max={s['lat_max']:.1f}  "
-                  f"sd={s['lat_sd']:.1f} ms")
+                  f"sd={s['lat_sd']:.1f} ms{mark}")
             print(f"               p50={s['lat_p50']:.1f}  "
                   f"p95={s['lat_p95']:.1f}  p99={s['lat_p99']:.1f} ms")
+        if s.get('ts_source') or s.get('ts_malformed'):
+            bad = (f"  ({s['ts_malformed']} malformed)"
+                   if s.get('ts_malformed') else '')
+            print(f"  Timestamps:  {s.get('ts_source') or 'none'}{bad}")
         if s.get('minimal'):
             print("  Jitter:      n/a")
             print("  Lost:        n/a  (--no-stats: counters only)")
@@ -127,7 +134,11 @@ examples:
     _cli.add_endpoint(parser)
     _cli.add_identity(parser)
     _cli.add_run(parser, duration=0)   # 0 = run until publisher closes
-    _cli.add_session(parser, keepalive=True, compat=True)
+    _cli.add_interval(parser)
+    _cli.add_session(parser)
+    _cli.add_keepalive(parser)
+    _cli.add_compat(parser)
+    _cli.add_timestamp_checking(parser)
     parser.add_argument(
         '--auth-token', type=str, default=None,
         help='Send this token as AUTH_TOKEN parameter on SUBSCRIBE '
@@ -178,27 +189,38 @@ async def run(args):
         keep_alive_interval=args.keepalive,
     )
 
+    failed = True
     try:
         print("  Connecting...")
-        async with client.connect() as session:
+        async with contextlib.AsyncExitStack() as stack:
+            # -t bounds connecting as well as receiving.
             try:
-                await session.client_session_init()
-
-                track = SubscribedTrack(
-                    session,
-                    namespace=args.namespace,
-                    trackname=args.trackname,
-                    on_object=stats.on_object,
-                    auth_token=(args.auth_token.encode()
-                                if args.auth_token else None),
-                )
-                await track.subscribe()
+                async with asyncio.timeout(args.duration or None):
+                    session = await stack.enter_async_context(
+                        client.connect())
+            except TimeoutError:
+                raise ConnectionError(f"no session within {args.duration}s")
+            try:
+                async with asyncio.timeout(args.duration or None):
+                    await session.client_session_init()
+                    track = SubscribedTrack(
+                        session,
+                        namespace=args.namespace,
+                        trackname=args.trackname,
+                        on_object=stats.on_object,
+                        auth_token=(args.auth_token.encode()
+                                    if args.auth_token else None),
+                        timestamp_errors=args.timestamp_errors,
+                    )
+                    stats.stats.timing = track.timing
+                    await track.subscribe()
                 print(f"  Subscribed to '{track.fqtn}', receiving...\n")
                 stats.start()
 
                 if not await wait_cond_timeout(
                         track.wait_closed(), timeout=args.duration):
                     track.completed = True
+                failed = False
 
             except MOQTRequestError as e:
                 print(f"  Request error: {e}")
@@ -207,6 +229,8 @@ async def run(args):
                 print(f"  MoQT error: {e}")
                 session.close(
                     e.error_code, e.reason_phrase)
+            except TimeoutError:
+                print(f"  Error: no subscription within {args.duration}s")
             except Exception as e:
                 print(f"  Error: {e}")
     except Exception as e:
@@ -221,18 +245,17 @@ async def run(args):
         for stat in top[:25]:
             print(f"  {stat.size / (1024 * 1024):8.1f} MB  "
                   f"{stat.count:>8d} blocks  {stat.traceback}")
+    # Zero objects is a failed run.
+    return 1 if failed or not stats.stats.total_objects else 0
 
 
 def cli():
     """Console entry point (moq-sub-bench)."""
     try:
-        asyncio.run(run(parse_args()))
+        sys.exit(asyncio.run(run(parse_args())))
     except KeyboardInterrupt:
         print("\n  Interrupted.")
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(run(parse_args()))
-    except KeyboardInterrupt:
-        print("\n  Interrupted.")
+    cli()

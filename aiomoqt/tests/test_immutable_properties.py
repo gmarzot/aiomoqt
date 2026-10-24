@@ -130,3 +130,71 @@ def test_largest_varint_value_is_accepted():
     track = PublishedTrack(None, namespace=_NS, trackname="t",
                            immutable_properties={0x04: (1 << 62) - 1})
     assert track.immutable_properties == {0x04: (1 << 62) - 1}
+
+
+# -- top-level (mutable) Track Properties ----------------------------
+
+_TOP = {
+    "video": {0x2C7A51E0: 30000, 0x3F: b"v-top"},
+    "audio": {0x2C7A51E0: 48000, 0x41: b"a-top"},
+}
+
+
+def _both_tracks(session):
+    return {name: PublishedTrack(session, namespace=_NS, trackname=name,
+                                 immutable_properties=_PROPS[name],
+                                 track_properties=_TOP[name])
+            for name in _PROPS}
+
+
+def _top(msg):
+    exts = dict(msg.track_extensions or {})
+    exts.pop(MOQTMessage.IMMUTABLE_PROPERTIES, None)
+    return exts or None
+
+
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+@pytest.mark.parametrize("draft", [16, 18, 20])
+async def test_publish_carries_top_level_properties(draft, use_quic):
+    publishes = asyncio.Queue()
+    async with _loopback(_port(2, draft, use_quic), draft, use_quic,
+                         publishes) as session:
+        for track in _both_tracks(session).values():
+            await track.publish(forward=0)
+        for _ in _PROPS:
+            _, msg = await asyncio.wait_for(publishes.get(), 5.0)
+            name = msg.track_name.decode()
+            assert _top(msg) == _TOP[name], name
+            assert _immutable(msg, draft) == _PROPS[name], name
+        assert session._close_err is None
+
+
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+@pytest.mark.parametrize("draft", [16, 18, 20])
+async def test_subscribe_ok_carries_top_level_properties(draft, use_quic):
+    publishes = asyncio.Queue()
+    async with _loopback(_port(3, draft, use_quic), draft, use_quic,
+                         publishes) as session:
+        for track in _both_tracks(session).values():
+            track.attach()
+        await session.publish_namespace(namespace=_NS, wait_response=True)
+        peer, _ = await asyncio.wait_for(publishes.get(), 5.0)
+        for name in reversed(list(_PROPS)):
+            ok = await peer.subscribe(_NS, name, forward=0,
+                                      wait_response=True)
+            assert _top(ok) == _TOP[name], name
+            assert _immutable(ok, draft) == _PROPS[name], name
+        assert session._close_err is None and peer._close_err is None
+
+
+def test_a_property_in_both_sets_is_refused():
+    with pytest.raises(ValueError, match="both"):
+        PublishedTrack(None, namespace=_NS, trackname="t",
+                       immutable_properties={0x2C7A51E0: 1000},
+                       track_properties={0x2C7A51E0: 1000})
+
+
+def test_top_level_properties_cannot_carry_immutable_properties():
+    with pytest.raises(ValueError, match="Track Properties cannot"):
+        PublishedTrack(None, namespace=_NS, trackname="t",
+                       track_properties={0x0B: b""})

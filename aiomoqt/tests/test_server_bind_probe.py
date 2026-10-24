@@ -36,7 +36,7 @@ def test_port_zero_is_never_probed():
 
 @pytest.mark.parametrize("host, loopback", [
     ("localhost", True), ("127.0.0.1", True), ("127.0.0.53", True),
-    ("::1", True), ("10.0.0.5", False), ("stingray.local", False),
+    ("::1", True), ("10.0.0.5", False), ("host.invalid", False),
 ])
 def test_widened_bind_warns_only_for_a_named_interface(host, loopback):
     # The transport binds every interface whatever we ask for. Saying so

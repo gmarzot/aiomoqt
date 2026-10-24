@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import os
+import sys
 import time
 
 import pytest
@@ -261,6 +262,16 @@ def test_write_json_atomic(tmp_path):
     assert path.stat().st_mode & 0o777 == 0o644
 
 
+def test_write_json_atomic_uses_c_encoder(tmp_path, monkeypatch):
+    # json.dump always runs the pure-Python encoder.
+    def no_dump(*args, **kwargs):
+        raise AssertionError("json.dump called")
+    monkeypatch.setattr(relay_status.json, "dump", no_dump)
+    path = tmp_path / "status.json"
+    relay_status.write_json_atomic(str(path), {"a": [1.5, None]})
+    assert path.read_text() == '{"a":[1.5,null]}'
+
+
 @pytest.mark.parametrize("addr,shown", [
     (("203.0.113.7", 51234), "203.0.113.7"),
     ("198.51.100.255", "198.51.100.255"),
@@ -486,3 +497,166 @@ async def test_status_loop_sends_publishers_no_requests(
         assert space["namespace"] == _NS and space["format"] is None
         assert ns not in relay._catalogs
         assert pub._close_err is None
+
+
+# -- dashboard schema ----------------------------------------------------
+
+_SCHEMA = os.path.join(os.path.dirname(__file__), "vectors",
+                       "relay_status_schema.json")
+# Keys that are data (track ids, drafts, interfaces), not schema.
+_DATA_KEYED = ("track_history", "by_draft", "by_transport")
+
+
+@requires_certs
+async def test_session_loss_only_on_delivery(relay_tables, tmp_path, monkeypatch):
+    # A publisher session carries mostly unacked ACK-only packets from the
+    # relay; picoquic counts them lost, so its loss_pct must stay null.
+    real = relay._path_quality
+
+    def lossy(session):
+        pq = dict(real(session))
+        pq["lost"] = pq.get("sent", 0) // 2
+        return pq
+    monkeypatch.setattr(relay, "_path_quality", lossy)
+    async with _relay(_PORT + 9, True, 18) as connect:
+        pub = await connect()
+        PublishedTrack(pub, namespace=_NS, trackname="video",
+                       object_size=200, group_size=10, rate=200).attach()
+        await pub.publish_namespace(namespace=_NS, wait_response=True)
+        sub = await connect()
+        await SubscribedTrack(sub, _NS, "video").subscribe(timeout=5)
+        status = relay._Status(str(tmp_path / "status.json"),
+                               {"started": time.time()}, [connect.handle])
+        loop = asyncio.get_running_loop()
+        status.snapshot(loop.time(), time.time())
+        await asyncio.sleep(0.3)
+        snap = status.snapshot(loop.time(), time.time())
+    by_role = {s["role"]: s for s in snap["sessions"]}
+    assert by_role["pub"]["loss_pct"] is None
+    assert by_role["sub"]["loss_pct"] is not None
+    for s in snap["sessions"]:
+        assert 0 <= s["rtt_min_ms"] <= s["rtt_ms"], s
+
+
+_KINDS = ((dict, "object"), (list, "array"), (str, "string"), (bool, "bool"),
+          (int, "int"), (float, "float"))
+
+
+def _schema(obj, path="", out=None):
+    """{path: sorted non-null JSON types}; list items share one path."""
+    out = {} if out is None else out
+    kinds = out.setdefault(path, [])
+    kind = next((name for t, name in _KINDS if isinstance(obj, t)), None)
+    if kind and kind not in kinds:
+        kinds.append(kind)
+        kinds.sort()
+    if isinstance(obj, dict):
+        wild = path.rsplit(".", 1)[-1] in _DATA_KEYED
+        for k, v in obj.items():
+            _schema(v, f"{path}.{'*' if wild else k}", out)
+    elif isinstance(obj, list):
+        for v in obj:
+            _schema(v, f"{path}[]", out)
+    return out
+
+
+def _parent(path):
+    return path[:-2] if path.endswith("[]") else path.rsplit(".", 1)[0]
+
+
+def _under_empty_list(path, schema):
+    """`path` lies in list items that `schema` never saw."""
+    i = path.find("[]")
+    while i != -1:
+        if path[:i + 2] not in schema:
+            return True
+        i = path.find("[]", i + 2)
+    return False
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"),
+                    reason="the host sampler's fields come from /proc")
+@requires_certs
+async def test_snapshot_schema_unchanged(relay_tables, tmp_path):
+    # Keys, nesting and types as the dashboard reads them; only a count or a
+    # bit rate may turn from float to int.
+    async with _relay(_PORT + 8, True, 18) as connect:
+        pub = await connect()
+        PublishedTrack(pub, namespace=_NS, trackname="video",
+                       object_size=200, group_size=10, rate=200).attach()
+        await pub.publish_namespace(namespace=_NS, wait_response=True)
+        sub = await connect()
+        await SubscribedTrack(sub, _NS, "video").subscribe(timeout=5)
+        status = relay._Status(str(tmp_path / "status.json"),
+                               {"started": time.time()}, [connect.handle])
+        loop = asyncio.get_running_loop()
+        status.snapshot(loop.time(), time.time())
+        await asyncio.sleep(0.3)
+        snap = status.snapshot(loop.time(), time.time())
+    got = {"status": _schema(snap), "platform": _schema(status.platform)}
+    if os.environ.get("AIOMOQT_REGEN_SCHEMA"):
+        with open(_SCHEMA, "w") as f:
+            json.dump(got, f, indent=1, sort_keys=True)
+    with open(_SCHEMA) as f:
+        want = json.load(f)
+    for doc in want:
+        old, new = want[doc], got[doc]
+        # Host-dependent lists (disks, interfaces) may be empty on either side.
+        for a, b in ((old, new), (new, old)):
+            for path in a:
+                if path and _parent(path) in b and b[_parent(path)] \
+                        and not _under_empty_list(path, b):
+                    assert path in b, f"{doc}{path}"
+        for path in set(old) & set(new):
+            o, n = old[path], new[path]
+            if o and n and o != n:
+                widened = set(n) - set(o) == {"int"} or set(o) - set(n) == {"float"}
+                assert widened and path.rstrip("[]").endswith(_INT_OK), (doc, path, o, n)
+    for doc, obj in (("status", snap), ("platform", status.platform)):
+        _assert_rounded(obj, doc)
+
+
+_INT_OK = ("bps", "Bps", "subscribers", "subscriptions", "tracks", "sessions")
+
+
+def _assert_rounded(obj, path):
+    """Bit rates are ints and milliseconds have at most 2 decimals."""
+    items = (obj.items() if isinstance(obj, dict)
+             else enumerate(obj) if isinstance(obj, list) else ())
+    for k, v in items:
+        key = path if isinstance(k, int) else f"{path}.{k}"
+        if isinstance(v, (dict, list)):
+            _assert_rounded(v, key)
+        elif isinstance(v, float):
+            assert not key.endswith(("bps", "Bps")), key
+            if "_ms" in key:
+                assert v == round(v, 2), (key, v)
+
+
+def test_loop_lag_summary_is_rounded():
+    lag = relay_status.LoopLag()
+    lag.samples.extend([0.0012345, 0.0098765])
+    assert lag.summary() == {"p50": 1.23, "p99": 9.88, "max": 9.88}
+
+
+async def test_platform_written_less_often_than_status(
+        relay_tables, monkeypatch, tmp_path):
+    monkeypatch.setattr(relay, "STATUS_INTERVAL_S", 0.05)
+    monkeypatch.setattr(relay, "PLATFORM_INTERVAL_S", 0.5)
+    written = []
+    monkeypatch.setattr(relay_status, "write_json_atomic",
+                        lambda path, obj: written.append(os.path.basename(path)))
+    background = set(relay._background)
+    status = relay._Status(str(tmp_path / "status.json"),
+                           {"started": time.time()})
+    runner = asyncio.create_task(status.run())
+    try:
+        await asyncio.sleep(0.8)
+    finally:
+        runner.cancel()
+        for task in set(relay._background) - background:
+            task.cancel()
+            relay._background.discard(task)
+    assert written[:2] == ["status.json", "platform.json"]
+    assert written.count("platform.json") <= 2
+    assert written.count("status.json") >= 6

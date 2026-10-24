@@ -1,22 +1,28 @@
 """MPEG-TS demux for live ingest: PAT/PMT → PES → H.264 access units
-and AAC frames, with the PES presentation timestamps preserved.
+or H.265 access units and AAC or Opus frames, with the PES presentation
+timestamps preserved.
 
 One pipe (`ffmpeg … -c copy -f mpegts -`) carries both tracks with the
 encoder's own timing, so A/V sync and frame pacing follow the source
-rather than pipe arrival. Stream types: 0x1B (H.264 Annex-B) and 0x0F
-(AAC ADTS); others are reported once and ignored.
+rather than pipe arrival. Stream types: 0x1B (H.264 Annex-B), 0x24
+(H.265 Annex-B), 0x0F
+(AAC ADTS) and 0x06 registered as 'Opus' (ETSI TS 102 366 Annex D);
+others are reported once and ignored.
 """
 import logging
 import time
 from typing import Callable, Dict, List, NamedTuple, Optional, Set, Tuple
 
-from .sources import _ADTS_FREQ, AnnexBAssembler
+from .sources import _ADTS_FREQ, AnnexBAssembler, HevcAnnexBAssembler
 
 logger = logging.getLogger(__name__)
 
 TS_PACKET = 188
 STREAM_TYPE_H264 = 0x1B
+STREAM_TYPE_HEVC = 0x24
 STREAM_TYPE_AAC_ADTS = 0x0F
+STREAM_TYPE_PRIVATE = 0x06
+_OPUS_REGISTRATION = b'Opus'
 _PTS_WRAP = 1 << 33
 _PTS_HALF = 1 << 32
 _AAC_FRAME_SAMPLES = 1024
@@ -93,6 +99,83 @@ def adts_split(data: bytes) -> List[Tuple[bytes, int, int, bytes]]:
     return out
 
 
+def opus_split(data: bytes) -> List[bytes]:
+    """Opus packets out of a PES payload of opus_control_header-framed
+    access units; trim and extension fields are skipped. A truncated
+    trailing unit is dropped."""
+    out = []
+    pos = 0
+    n = len(data)
+    while pos + 2 <= n:
+        hdr = (data[pos] << 8) | data[pos + 1]
+        if hdr & 0xFFE0 != 0x7FE0:
+            break
+        pos += 2
+        size = 0
+        while pos < n:
+            b = data[pos]
+            pos += 1
+            size += b
+            if b != 0xFF:
+                break
+        pos += 2 * bool(hdr & 0x10) + 2 * bool(hdr & 0x08)
+        if hdr & 0x04:
+            if pos >= n:
+                break
+            pos += 1 + data[pos]
+        if pos + size > n:
+            break
+        out.append(data[pos:pos + size])
+        pos += size
+    return out
+
+
+def opus_samples(packet: bytes) -> int:
+    """Duration of an Opus packet in 48 kHz samples, from its TOC byte
+    (RFC 6716 §3.1)."""
+    if not packet:
+        return 0
+    toc = packet[0]
+    config = toc >> 3
+    if config < 12:
+        frame = (480, 960, 1920, 2880)[config & 3]
+    elif config < 16:
+        frame = (480, 960)[config & 1]
+    else:
+        frame = (120, 240, 480, 960)[config & 3]
+    code = toc & 3
+    if code == 0:
+        return frame
+    if code < 3:
+        return 2 * frame
+    return frame * (packet[1] & 0x3F if len(packet) > 1 else 0)
+
+
+def _opus_channels(descriptors: bytes) -> Optional[int]:
+    """Channel count from a DVB extension descriptor (0x7F, tag 0x80);
+    None when the PMT carries none."""
+    i = 0
+    while i + 2 <= len(descriptors):
+        tag, size = descriptors[i], descriptors[i + 1]
+        body = descriptors[i + 2:i + 2 + size]
+        if tag == 0x7F and len(body) >= 2 and body[0] == 0x80:
+            code = body[1]
+            return 2 if code == 0 else code if code <= 8 else None
+        i += 2 + size
+    return None
+
+
+def _registered(descriptors: bytes, fourcc: bytes) -> bool:
+    """True when a registration descriptor (0x05) names `fourcc`."""
+    i = 0
+    while i + 2 <= len(descriptors):
+        tag, size = descriptors[i], descriptors[i + 1]
+        if tag == 0x05 and descriptors[i + 2:i + 6] == fourcc:
+            return True
+        i += 2 + size
+    return False
+
+
 def _pts_at(b: bytes, i: int) -> int:
     return ((((b[i] >> 1) & 7) << 30) | (b[i + 1] << 22)
             | (((b[i + 2] >> 1) & 0x7F) << 15) | (b[i + 3] << 7) | (b[i + 4] >> 1))
@@ -102,20 +185,27 @@ class TsDemuxer:
     """Incremental transport-stream demuxer. feed() returns the access
     units completed by the chunk; close() flushes the last PES at EOF.
 
-    Video: each PES is fed through an AnnexBAssembler and closed, so the
-    units it held take the PES PTS (one AU per PES in practice); SPS/PPS
-    land in `video.config`. Audio: ADTS frames are split, the
+    Video: each PES is fed through an AnnexBAssembler (H.264) or
+    HevcAnnexBAssembler (H.265, `video_codec` 'hevc') and closed, so the
+    units it held take the PES PTS (one AU per PES in practice);
+    parameter sets land in `video.config`. Audio: ADTS frames are split, the
     AudioSpecificConfig derived from the header, and each frame's PTS
-    advanced by 1024 samples within the PES.
+    advanced by 1024 samples within the PES; Opus packets are split from
+    their control headers (`audio_asc` stays None) and advanced by their
+    TOC duration. `audio_codec` is 'aac' or 'opus'.
 
     `config_changed` is raised (and left for the caller to clear) when a
-    later SPS/PPS or ADTS header differs from the first."""
+    later SPS/PPS, ADTS header or Opus channel count differs from the
+    first."""
 
     def __init__(self, clock: Optional[TsClock] = None):
         self.clock = clock or TsClock()
-        self.video = AnnexBAssembler()
+        self.video: AnnexBAssembler = AnnexBAssembler()
+        self.video_codec: Optional[str] = None
         self.video_pid: Optional[int] = None
         self.audio_pid: Optional[int] = None
+        self.audio_codec: Optional[str] = None
+        self._opus_channels: Optional[int] = None
         self.audio_asc: Optional[bytes] = None
         self.audio_samplerate: Optional[int] = None
         self.audio_channels: Optional[int] = None
@@ -236,11 +326,23 @@ class TsDemuxer:
             stype = sec[i]
             pid = ((sec[i + 1] & 0x1F) << 8) | sec[i + 2]
             es_len = ((sec[i + 3] & 0x0F) << 8) | sec[i + 4]
+            desc = sec[i + 5:i + 5 + es_len]
             i += 5 + es_len
-            if stype == STREAM_TYPE_H264 and video is None:
+            if stype in (STREAM_TYPE_H264, STREAM_TYPE_HEVC) and video is None:
                 video = pid
+                codec = 'hevc' if stype == STREAM_TYPE_HEVC else 'h264'
+                if codec != self.video_codec:
+                    self.video_codec = codec
+                    self.video = (HevcAnnexBAssembler() if codec == 'hevc'
+                                  else AnnexBAssembler())
             elif stype == STREAM_TYPE_AAC_ADTS and audio is None:
                 audio = pid
+                self.audio_codec = 'aac'
+            elif (stype == STREAM_TYPE_PRIVATE and audio is None
+                  and _registered(desc, _OPUS_REGISTRATION)):
+                audio = pid
+                self.audio_codec = 'opus'
+                self._opus_channels = _opus_channels(desc)
             elif stype not in self.unsupported:
                 self.unsupported.add(stype)
                 logger.warning(f"mpegts: stream type {stype:#x} on pid "
@@ -305,6 +407,9 @@ class TsDemuxer:
             self._video_config = cfg
 
     def _emit_audio(self, data: bytes, pts: int, out: List[TsUnit]) -> None:
+        if self.audio_codec == 'opus':
+            self._emit_opus(data, pts, out)
+            return
         for i, (asc, rate, chan, au) in enumerate(adts_split(data)):
             if asc != self.audio_asc:
                 if self.audio_asc is not None:
@@ -314,3 +419,18 @@ class TsDemuxer:
                 self.audio_channels = chan
             out.append(TsUnit('audio', au, True,
                               pts + i * _AAC_FRAME_SAMPLES * 90_000 // rate))
+
+    def _emit_opus(self, data: bytes, pts: int, out: List[TsUnit]) -> None:
+        samples = 0
+        for pkt in opus_split(data):
+            if not pkt:
+                continue
+            channels = self._opus_channels or (2 if pkt[0] & 0x04 else 1)
+            if channels != self.audio_channels:
+                if self.audio_channels is not None:
+                    self.config_changed = True
+                self.audio_samplerate = 48000
+                self.audio_channels = channels
+            out.append(TsUnit('audio', pkt, True,
+                              pts + samples * 90_000 // 48_000))
+            samples += opus_samples(pkt)

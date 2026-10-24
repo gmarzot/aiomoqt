@@ -1,0 +1,953 @@
+{
+ "platform": {
+  "": [
+   "object"
+  ],
+  ".bandwidth": [
+   "object"
+  ],
+  ".bandwidth.egress_bps": [
+   "int"
+  ],
+  ".bandwidth.ingress_bps": [
+   "int"
+  ],
+  ".bandwidth.loss_pct": [
+   "float"
+  ],
+  ".generated": [
+   "float"
+  ],
+  ".history": [
+   "object"
+  ],
+  ".history.cpu": [
+   "array"
+  ],
+  ".history.cpu[]": [
+   "float"
+  ],
+  ".history.cpu_iowait": [
+   "array"
+  ],
+  ".history.cpu_iowait[]": [
+   "float"
+  ],
+  ".history.cpu_irq": [
+   "array"
+  ],
+  ".history.cpu_irq[]": [
+   "float"
+  ],
+  ".history.cpu_nice": [
+   "array"
+  ],
+  ".history.cpu_nice[]": [
+   "float"
+  ],
+  ".history.cpu_steal": [
+   "array"
+  ],
+  ".history.cpu_steal[]": [
+   "float"
+  ],
+  ".history.cpu_system": [
+   "array"
+  ],
+  ".history.cpu_system[]": [
+   "float"
+  ],
+  ".history.cpu_user": [
+   "array"
+  ],
+  ".history.cpu_user[]": [
+   "float"
+  ],
+  ".history.ctxt_per_s": [
+   "array"
+  ],
+  ".history.ctxt_per_s[]": [
+   "float"
+  ],
+  ".history.disk_read_Bps": [
+   "array"
+  ],
+  ".history.disk_read_Bps[]": [
+   "float"
+  ],
+  ".history.disk_write_Bps": [
+   "array"
+  ],
+  ".history.disk_write_Bps[]": [
+   "float"
+  ],
+  ".history.egress_bps": [
+   "array"
+  ],
+  ".history.egress_bps[]": [
+   "int"
+  ],
+  ".history.ingress_bps": [
+   "array"
+  ],
+  ".history.ingress_bps[]": [
+   "int"
+  ],
+  ".history.lag_p99_ms": [
+   "array"
+  ],
+  ".history.lag_p99_ms[]": [],
+  ".history.mem_buffers": [
+   "array"
+  ],
+  ".history.mem_buffers[]": [
+   "int"
+  ],
+  ".history.mem_cached": [
+   "array"
+  ],
+  ".history.mem_cached[]": [
+   "int"
+  ],
+  ".history.mem_used": [
+   "array"
+  ],
+  ".history.mem_used[]": [
+   "int"
+  ],
+  ".history.proc_cpu": [
+   "array"
+  ],
+  ".history.proc_cpu[]": [
+   "float"
+  ],
+  ".history.proc_rss": [
+   "array"
+  ],
+  ".history.proc_rss[]": [
+   "int"
+  ],
+  ".history.proc_system": [
+   "array"
+  ],
+  ".history.proc_system[]": [
+   "float"
+  ],
+  ".history.proc_user": [
+   "array"
+  ],
+  ".history.proc_user[]": [
+   "float"
+  ],
+  ".history.psi_cpu": [
+   "array"
+  ],
+  ".history.psi_cpu[]": [
+   "float"
+  ],
+  ".history.psi_io": [
+   "array"
+  ],
+  ".history.psi_io[]": [
+   "float"
+  ],
+  ".history.psi_memory": [
+   "array"
+  ],
+  ".history.psi_memory[]": [
+   "float"
+  ],
+  ".history.rx_bps": [
+   "array"
+  ],
+  ".history.rx_bps[]": [
+   "float"
+  ],
+  ".history.sock_drops": [
+   "array"
+  ],
+  ".history.sock_drops[]": [],
+  ".history.sock_rx_queue": [
+   "array"
+  ],
+  ".history.sock_rx_queue[]": [],
+  ".history.t": [
+   "array"
+  ],
+  ".history.t[]": [
+   "int"
+  ],
+  ".history.tx_bps": [
+   "array"
+  ],
+  ".history.tx_bps[]": [
+   "float"
+  ],
+  ".history.udp_errors": [
+   "array"
+  ],
+  ".history.udp_errors[]": [
+   "float"
+  ],
+  ".history.udp_in": [
+   "array"
+  ],
+  ".history.udp_in[]": [
+   "float"
+  ],
+  ".history.udp_out": [
+   "array"
+  ],
+  ".history.udp_out[]": [
+   "float"
+  ],
+  ".host": [
+   "object"
+  ],
+  ".host.arch": [
+   "string"
+  ],
+  ".host.cores": [
+   "int"
+  ],
+  ".host.cpu": [
+   "float"
+  ],
+  ".host.cpu_cores": [
+   "array"
+  ],
+  ".host.cpu_cores[]": [
+   "float"
+  ],
+  ".host.cpu_model": [
+   "string"
+  ],
+  ".host.cpu_modes": [
+   "object"
+  ],
+  ".host.cpu_modes.idle": [
+   "float"
+  ],
+  ".host.cpu_modes.iowait": [
+   "float"
+  ],
+  ".host.cpu_modes.irq": [
+   "float"
+  ],
+  ".host.cpu_modes.nice": [
+   "float"
+  ],
+  ".host.cpu_modes.softirq": [
+   "float"
+  ],
+  ".host.cpu_modes.steal": [
+   "float"
+  ],
+  ".host.cpu_modes.system": [
+   "float"
+  ],
+  ".host.cpu_modes.user": [
+   "float"
+  ],
+  ".host.ctxt_per_s": [
+   "float"
+  ],
+  ".host.disk_total": [
+   "int"
+  ],
+  ".host.disk_used": [
+   "int"
+  ],
+  ".host.disks": [
+   "array"
+  ],
+  ".host.disks[]": [
+   "object"
+  ],
+  ".host.disks[].busy_pct": [
+   "float"
+  ],
+  ".host.disks[].name": [
+   "string"
+  ],
+  ".host.disks[].read_Bps": [
+   "float"
+  ],
+  ".host.disks[].read_iops": [
+   "float"
+  ],
+  ".host.disks[].write_Bps": [
+   "float"
+  ],
+  ".host.disks[].write_iops": [
+   "float"
+  ],
+  ".host.forks_per_s": [
+   "float"
+  ],
+  ".host.ifaces": [
+   "array"
+  ],
+  ".host.intr_per_s": [
+   "float"
+  ],
+  ".host.kernel": [
+   "string"
+  ],
+  ".host.load": [
+   "array"
+  ],
+  ".host.load[]": [
+   "float"
+  ],
+  ".host.mem": [
+   "object"
+  ],
+  ".host.mem.available": [
+   "int"
+  ],
+  ".host.mem.buffers": [
+   "int"
+  ],
+  ".host.mem.cached": [
+   "int"
+  ],
+  ".host.mem.free": [
+   "int"
+  ],
+  ".host.mem.swap_total": [
+   "int"
+  ],
+  ".host.mem.swap_used": [
+   "int"
+  ],
+  ".host.mem.total": [
+   "int"
+  ],
+  ".host.mem.used": [
+   "int"
+  ],
+  ".host.mem_total": [
+   "int"
+  ],
+  ".host.mem_used": [
+   "int"
+  ],
+  ".host.os": [
+   "string"
+  ],
+  ".host.proc": [
+   "object"
+  ],
+  ".host.proc.ctx_invol_per_s": [
+   "float"
+  ],
+  ".host.proc.ctx_vol_per_s": [
+   "float"
+  ],
+  ".host.proc.fds": [
+   "int"
+  ],
+  ".host.proc.rss": [
+   "int"
+  ],
+  ".host.proc.system_pct": [
+   "float"
+  ],
+  ".host.proc.threads": [
+   "int"
+  ],
+  ".host.proc.user_pct": [
+   "float"
+  ],
+  ".host.proc_cpu": [
+   "float"
+  ],
+  ".host.proc_rss": [
+   "int"
+  ],
+  ".host.proc_threads": [
+   "int"
+  ],
+  ".host.procs_blocked": [
+   "int"
+  ],
+  ".host.procs_running": [
+   "int"
+  ],
+  ".host.psi": [
+   "object"
+  ],
+  ".host.psi.cpu": [
+   "object"
+  ],
+  ".host.psi.cpu.full": [
+   "float"
+  ],
+  ".host.psi.cpu.some": [
+   "float"
+  ],
+  ".host.psi.io": [
+   "object"
+  ],
+  ".host.psi.io.full": [
+   "float"
+  ],
+  ".host.psi.io.some": [
+   "float"
+  ],
+  ".host.psi.memory": [
+   "object"
+  ],
+  ".host.psi.memory.full": [
+   "float"
+  ],
+  ".host.psi.memory.some": [
+   "float"
+  ],
+  ".host.rx_bps": [
+   "float"
+  ],
+  ".host.tx_bps": [
+   "float"
+  ],
+  ".host.udp": [
+   "object"
+  ],
+  ".host.udp.InDatagrams": [
+   "float"
+  ],
+  ".host.udp.InErrors": [
+   "float"
+  ],
+  ".host.udp.NoPorts": [
+   "float"
+  ],
+  ".host.udp.OutDatagrams": [
+   "float"
+  ],
+  ".host.udp.RcvbufErrors": [
+   "float"
+  ],
+  ".host.udp.SndbufErrors": [
+   "float"
+  ],
+  ".host.udp_in_errors": [
+   "float"
+  ],
+  ".host.udp_rcvbuf_errors": [
+   "float"
+  ],
+  ".host.udp_socket": [],
+  ".host.uptime_s": [
+   "float"
+  ],
+  ".interval_s": [
+   "float"
+  ],
+  ".loop_lag_ms": [
+   "object"
+  ],
+  ".loop_lag_ms.max": [],
+  ".loop_lag_ms.p50": [],
+  ".loop_lag_ms.p99": [],
+  ".relay": [
+   "object"
+  ],
+  ".relay.uptime_s": [
+   "int"
+  ],
+  ".relay.versions": [],
+  ".transport": [
+   "array"
+  ],
+  ".transport[]": [
+   "object"
+  ],
+  ".transport[].loop_callbacks": [
+   "int"
+  ],
+  ".transport[].rx_event_drops": [
+   "int"
+  ],
+  ".transport[].rx_event_ring_count_now": [
+   "int"
+  ],
+  ".transport[].rx_notify_pending_now": [
+   "int"
+  ],
+  ".transport[].rx_overflow_depth_now": [
+   "int"
+  ],
+  ".transport[].rx_overflow_max_depth": [
+   "int"
+  ],
+  ".transport[].rx_overflow_pushed": [
+   "int"
+  ],
+  ".transport[].tx_event_ring_count_now": [
+   "int"
+  ],
+  ".transport[].wake_calls": [
+   "int"
+  ],
+  ".transport[].wake_skipped_coalesced": [
+   "int"
+  ]
+ },
+ "status": {
+  "": [
+   "object"
+  ],
+  ".generated": [
+   "float"
+  ],
+  ".history": [
+   "object"
+  ],
+  ".history.egress_bps": [
+   "array"
+  ],
+  ".history.egress_bps[]": [
+   "int"
+  ],
+  ".history.groups_per_s": [
+   "array"
+  ],
+  ".history.groups_per_s[]": [
+   "float"
+  ],
+  ".history.ingress_bps": [
+   "array"
+  ],
+  ".history.ingress_bps[]": [
+   "int"
+  ],
+  ".history.lag_p99_ms": [
+   "array"
+  ],
+  ".history.lag_p99_ms[]": [],
+  ".history.loss_pct": [
+   "array"
+  ],
+  ".history.loss_pct[]": [
+   "float"
+  ],
+  ".history.media_in_bps": [
+   "array"
+  ],
+  ".history.media_in_bps[]": [
+   "int"
+  ],
+  ".history.media_out_bps": [
+   "array"
+  ],
+  ".history.media_out_bps[]": [
+   "int"
+  ],
+  ".history.objects_in_per_s": [
+   "array"
+  ],
+  ".history.objects_in_per_s[]": [
+   "float"
+  ],
+  ".history.rtt_p50_ms": [
+   "array"
+  ],
+  ".history.rtt_p50_ms[]": [
+   "float"
+  ],
+  ".history.sessions": [
+   "array"
+  ],
+  ".history.sessions[]": [
+   "int"
+  ],
+  ".history.subscribers": [
+   "array"
+  ],
+  ".history.subscribers[]": [
+   "int"
+  ],
+  ".history.subscriptions": [
+   "array"
+  ],
+  ".history.subscriptions[]": [
+   "int"
+  ],
+  ".history.t": [
+   "array"
+  ],
+  ".history.t[]": [
+   "int"
+  ],
+  ".history.tracks": [
+   "array"
+  ],
+  ".history.tracks[]": [
+   "int"
+  ],
+  ".host": [
+   "object"
+  ],
+  ".host.arch": [
+   "string"
+  ],
+  ".host.cores": [
+   "int"
+  ],
+  ".host.cpu": [
+   "float"
+  ],
+  ".host.cpu_model": [
+   "string"
+  ],
+  ".host.disk_total": [
+   "int"
+  ],
+  ".host.disk_used": [
+   "int"
+  ],
+  ".host.kernel": [
+   "string"
+  ],
+  ".host.mem_total": [
+   "int"
+  ],
+  ".host.mem_used": [
+   "int"
+  ],
+  ".host.os": [
+   "string"
+  ],
+  ".host.uptime_s": [
+   "float"
+  ],
+  ".interval_s": [
+   "float"
+  ],
+  ".namespaces": [
+   "array"
+  ],
+  ".namespaces[]": [
+   "object"
+  ],
+  ".namespaces[].announced": [
+   "bool"
+  ],
+  ".namespaces[].bytes_out": [
+   "int"
+  ],
+  ".namespaces[].format": [],
+  ".namespaces[].in_bps": [
+   "int"
+  ],
+  ".namespaces[].namespace": [
+   "string"
+  ],
+  ".namespaces[].origin": [
+   "string"
+  ],
+  ".namespaces[].origin_addr": [
+   "string"
+  ],
+  ".namespaces[].out_bps": [
+   "int"
+  ],
+  ".namespaces[].peak": [
+   "int"
+  ],
+  ".namespaces[].subscribers": [
+   "int"
+  ],
+  ".namespaces[].subscriptions": [
+   "int"
+  ],
+  ".namespaces[].tracks": [
+   "int"
+  ],
+  ".relay": [
+   "object"
+  ],
+  ".relay.started": [
+   "float"
+  ],
+  ".relay.uptime_s": [
+   "int"
+  ],
+  ".sessions": [
+   "array"
+  ],
+  ".sessions[]": [
+   "object"
+  ],
+  ".sessions[].addr": [
+   "string"
+  ],
+  ".sessions[].draft": [
+   "int"
+  ],
+  ".sessions[].id": [
+   "int"
+  ],
+  ".sessions[].loss_pct": [
+   "float"
+  ],
+  ".sessions[].role": [
+   "string"
+  ],
+  ".sessions[].rtt_min_ms": [
+   "float"
+  ],
+  ".sessions[].rtt_ms": [
+   "float"
+  ],
+  ".sessions[].rx_bps": [
+   "int"
+  ],
+  ".sessions[].since": [
+   "float"
+  ],
+  ".sessions[].transport": [
+   "string"
+  ],
+  ".sessions[].tx_bps": [
+   "int"
+  ],
+  ".totals": [
+   "object"
+  ],
+  ".totals.by_draft": [
+   "object"
+  ],
+  ".totals.by_draft.*": [
+   "int"
+  ],
+  ".totals.by_transport": [
+   "object"
+  ],
+  ".totals.by_transport.*": [
+   "int"
+  ],
+  ".totals.cache_efficiency": [],
+  ".totals.delivered_bytes": [
+   "int"
+  ],
+  ".totals.drops": [
+   "int"
+  ],
+  ".totals.efficiency": [
+   "float"
+  ],
+  ".totals.egress_bps": [
+   "int"
+  ],
+  ".totals.fetch_cache_bytes": [
+   "int"
+  ],
+  ".totals.fetch_upstream_bytes": [
+   "int"
+  ],
+  ".totals.fetches": [
+   "int"
+  ],
+  ".totals.groups_per_s": [
+   "float"
+  ],
+  ".totals.ingress_bps": [
+   "int"
+  ],
+  ".totals.loop_lag_ms": [
+   "object"
+  ],
+  ".totals.loop_lag_ms.max": [],
+  ".totals.loop_lag_ms.p50": [],
+  ".totals.loop_lag_ms.p99": [],
+  ".totals.loss_pct": [
+   "float"
+  ],
+  ".totals.media_in_bps": [
+   "int"
+  ],
+  ".totals.media_out_bps": [
+   "int"
+  ],
+  ".totals.namespaces": [
+   "int"
+  ],
+  ".totals.objects_in_per_s": [
+   "float"
+  ],
+  ".totals.publishers": [
+   "int"
+  ],
+  ".totals.rtt_p50_ms": [
+   "float"
+  ],
+  ".totals.rtt_p99_ms": [
+   "float"
+  ],
+  ".totals.sessions": [
+   "int"
+  ],
+  ".totals.subscribers": [
+   "int"
+  ],
+  ".totals.subscribers_peak": [
+   "int"
+  ],
+  ".totals.subscriptions": [
+   "int"
+  ],
+  ".totals.tracks": [
+   "int"
+  ],
+  ".track_history": [
+   "object"
+  ],
+  ".track_history.*": [
+   "object"
+  ],
+  ".track_history.*.in_bps": [
+   "array"
+  ],
+  ".track_history.*.in_bps[]": [
+   "int"
+  ],
+  ".track_history.*.out_bps": [
+   "array"
+  ],
+  ".track_history.*.out_bps[]": [
+   "int"
+  ],
+  ".track_history.*.subscribers": [
+   "array"
+  ],
+  ".track_history.*.subscribers[]": [
+   "int"
+  ],
+  ".tracks": [
+   "array"
+  ],
+  ".tracks[]": [
+   "object"
+  ],
+  ".tracks[].bytes_in": [
+   "int"
+  ],
+  ".tracks[].bytes_out": [
+   "int"
+  ],
+  ".tracks[].cache_bytes": [
+   "int"
+  ],
+  ".tracks[].cache_groups": [
+   "int"
+  ],
+  ".tracks[].drops": [
+   "int"
+  ],
+  ".tracks[].fetch_cache_bytes": [
+   "int"
+  ],
+  ".tracks[].fetch_upstream_bytes": [
+   "int"
+  ],
+  ".tracks[].fetches": [
+   "int"
+  ],
+  ".tracks[].forwarding": [
+   "int"
+  ],
+  ".tracks[].groups_in": [
+   "int"
+  ],
+  ".tracks[].groups_per_s": [
+   "float"
+  ],
+  ".tracks[].id": [
+   "string"
+  ],
+  ".tracks[].in_bps": [
+   "int"
+  ],
+  ".tracks[].largest": [
+   "array"
+  ],
+  ".tracks[].largest[]": [
+   "int"
+  ],
+  ".tracks[].latency_ms": [
+   "float"
+  ],
+  ".tracks[].name": [
+   "string"
+  ],
+  ".tracks[].namespace": [
+   "string"
+  ],
+  ".tracks[].objects_in": [
+   "int"
+  ],
+  ".tracks[].objects_out": [
+   "int"
+  ],
+  ".tracks[].objects_per_s": [
+   "float"
+  ],
+  ".tracks[].origin": [
+   "string"
+  ],
+  ".tracks[].origin_addr": [
+   "string"
+  ],
+  ".tracks[].out_bps": [
+   "int"
+  ],
+  ".tracks[].peak": [
+   "int"
+  ],
+  ".tracks[].rtt_down_ms": [
+   "float"
+  ],
+  ".tracks[].rtt_up_ms": [
+   "float"
+  ],
+  ".tracks[].since": [
+   "float"
+  ],
+  ".tracks[].state": [
+   "string"
+  ],
+  ".tracks[].subscriber_list": [
+   "array"
+  ],
+  ".tracks[].subscriber_list[]": [
+   "object"
+  ],
+  ".tracks[].subscriber_list[].addr": [
+   "string"
+  ],
+  ".tracks[].subscriber_list[].draft": [
+   "int"
+  ],
+  ".tracks[].subscriber_list[].forward": [
+   "bool"
+  ],
+  ".tracks[].subscriber_list[].rtt_ms": [
+   "float"
+  ],
+  ".tracks[].subscriber_list[].session": [
+   "int"
+  ],
+  ".tracks[].subscriber_list[].since": [
+   "float"
+  ],
+  ".tracks[].subscriber_list[].transport": [
+   "string"
+  ],
+  ".tracks[].subscribers": [
+   "int"
+  ]
+ }
+}

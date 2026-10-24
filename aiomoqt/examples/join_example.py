@@ -5,6 +5,7 @@ import logging
 
 from aiomoqt.types import ParamType, MOQTException, parse_draft_spec
 from aiomoqt.client import MOQTClient
+from aiomoqt.utils.cli import add_help
 from aiomoqt.utils.url import parse_relay_url
 from aiomoqt.messages import SubscribeError, SubscribeNamespaceError
 from aiomoqt.utils.logger import *
@@ -31,9 +32,7 @@ def parse_args():
                         help='Congestion control algorithm '
                              '(bbr | bbr1 | newreno | cubic | dcubic | '
                              'prague | fast). Default: aiopquic default (bbr1)')
-    parser.add_argument(
-        '-?', '--help', action='help',
-        help='Show this help message and exit')
+    add_help(parser)
     args = parser.parse_args()
     # One positional URL replaces -h/--port/--path/-q: the scheme
     # selects the transport, exactly like the aiomoqt tools.

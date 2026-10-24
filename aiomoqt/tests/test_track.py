@@ -425,7 +425,10 @@ class TestSubscribedTrack:
                                 on_object=cb)
             await t.subscribe()
 
-            assert session.subscribe.call_args.kwargs["on_object"] is cb
+            handler = session.subscribe.call_args.kwargs["on_object"]
+            msg = MagicMock(group_id=0, object_id=0, extensions={})
+            handler(msg, 1, 2, 0, 0)
+            cb.assert_called_once_with(msg, 1, 2, 0, 0)
             assert session.on_object_received is None
 
         asyncio.run(_test())

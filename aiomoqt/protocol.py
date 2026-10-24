@@ -23,7 +23,8 @@ from .messages.d18 import Setup
 from .messages.d20 import PublishStateNotify, Setup as D20Setup
 from .messages.fetch import _is_joining
 from .messages.data import (FETCH_FLAGS_END_TIMED_OUT,
-                            FETCH_FLAGS_END_UNKNOWN, encode_padding)
+                            FETCH_FLAGS_END_UNKNOWN, encode_padding,
+                            DEFAULT_MAX_OBJECT_BYTES, MOQTObjectTooLarge)
 from .messages.params import (
     RANGE_FILTERS, D20ParamType, D20RequestErrorCode, check_param_scope,
     fill_range, range_filter_count, range_filter_error, uses_location_filter,
@@ -37,6 +38,7 @@ from .messages.subscribe import SubscribeOk
 from .types import *
 from .types import (D20MessageType, FilterType, MOQTDraft, MOQTException,
                     MOQTMessageType, MOQTProtocolViolation, MOQTRequestError,
+                    MOQTStreamStopped,
                     ObjectStatus, ParamType, RequestErrorCode,
                     SessionCloseCode, SetupParamType, StreamResetCode,
                     SubscribeDoneCode)
@@ -44,6 +46,7 @@ from .utils.buffer import Buffer, BufferReadError
 from .utils.logger import *
 from .utils.logger import quiet_session
 from .utils.url import moqt_setup_path
+from .utils.timing import TIMING_IDS
 from aiopquic.streamchain import StreamChain
 from aiopquic.asyncio.webtransport import WebTransportError
 
@@ -115,9 +118,16 @@ class MOQTPeer:
     def __init__(self, libquicr_compat: bool = False,
                  tx_max_inflight_bytes: Optional[int] =
                      DEFAULT_TX_MAX_INFLIGHT_BYTES,
-                 implementation: Optional[str] = USER_AGENT):
+                 implementation: Optional[str] = USER_AGENT,
+                 max_object_bytes: int = DEFAULT_MAX_OBJECT_BYTES):
         # MOQT_IMPLEMENTATION Setup Option value; None omits it.
         self.implementation = implementation
+        # Largest object payload accepted. Bytes held in incomplete
+        # objects are bounded per session at RX_HELD_FACTOR times this.
+        if int(max_object_bytes) <= 0:
+            raise ValueError(f"max_object_bytes must be positive, "
+                             f"not {max_object_bytes}")
+        self.max_object_bytes = int(max_object_bytes)
         #  message handlers
         self._control_msg_handlers: Dict[int, Callable] = {}
         self.libquicr_compat = libquicr_compat
@@ -177,6 +187,8 @@ class _DataStreamState:
     # priority rather than substitute its own, so it has to be able to
     # see it: the object itself does not carry it.
     publisher_priority: Optional[int] = None
+    # Unparsed bytes counted in the session's _rx_held_bytes.
+    held: int = 0
 
 
 @dataclass(slots=True)
@@ -280,6 +292,9 @@ class _MOQTSessionMixin:
         # The peer's d20+ SETUP limits; 0 is the spec default for both.
         self._peer_max_request_updates = 0
         self._peer_max_filter_ranges = 0
+        self._max_object_bytes = int(getattr(
+            session, 'max_object_bytes', DEFAULT_MAX_OBJECT_BYTES))
+        self._rx_held_limit = self.RX_HELD_FACTOR * self._max_object_bytes
         self._loop = asyncio.get_running_loop()
         self._wt_session_setup: Future[bool] = self._loop.create_future()
         # Raw-QUIC sessions have no WT setup phase. Pre-resolve so
@@ -351,6 +366,10 @@ class _MOQTSessionMixin:
         # Track aliases found malformed (§2.4.2): subscription cancelled,
         # further streams refused.
         self._malformed_aliases: Set[int] = set()
+        # alias -> handler for its objects that carry a frindell timing
+        # property (utils.timing.TIMING_IDS): a track that declared none
+        # checks only those.
+        self._timing_watch: Dict[int, Callable] = {}
         # alias -> {group_id: first object id that does not exist}, from
         # END_OF_GROUP status objects and FIN on END_OF_GROUP-bit streams.
         self._group_bound: Dict[int, Dict[int, int]] = {}
@@ -381,6 +400,7 @@ class _MOQTSessionMixin:
         self._bidi_stream_requests: Dict[int, int] = {}  # map bidi stream_id to request_id (d16)
         # Request streams cancelled by STOP_SENDING whose peer half is still open.
         self._cancelled_request_streams: Set[int] = set()
+        self._stopped_streams = set()
         # request_id -> callback fired when the request's stream is
         # terminated by the peer (§3.3.2 cancellation).
         self._request_cancel_handlers: Dict[int, Callable] = {}
@@ -389,6 +409,9 @@ class _MOQTSessionMixin:
         # Our SUBSCRIBE request id -> object handler, bound to the track
         # alias where its SUBSCRIBE_OK is parsed.
         self._pending_object_handlers: Dict[int, Callable] = {}
+        # Our SUBSCRIBE request id -> callback given its SUBSCRIBE_OK as
+        # it is parsed, before any object of the track is delivered.
+        self._pending_reply_hooks: Dict[int, Callable] = {}
         # Tracks this session serves, by full track name; control
         # messages addressed to one are routed to it.
         self._published_tracks: Dict[Tuple[Tuple[bytes, ...], bytes], Any] = {}
@@ -500,10 +523,30 @@ class _MOQTSessionMixin:
         # request_id -> clean. Bounded; the oldest are forgotten.
         self._fetch_done_results: "OrderedDict[int, bool]" = OrderedDict()
 
-        # Queue for namespace announcements (populated by _handle_namespace)
-        self._namespace_announcements: asyncio.Queue = asyncio.Queue()
-        # Queue for track announcements (populated by _handle_publish)
-        self._publish_announcements: asyncio.Queue = asyncio.Queue()
+        # Announcements for await_namespace() / await_publish(), filled
+        # by the default handlers; when full the oldest is dropped.
+        self._namespace_announcements: asyncio.Queue = asyncio.Queue(
+            maxsize=self.ANNOUNCEMENT_QUEUE_MAX)
+        self._publish_announcements: asyncio.Queue = asyncio.Queue(
+            maxsize=self.ANNOUNCEMENT_QUEUE_MAX)
+        self._announcements_overflowing: Set[str] = set()
+
+    ANNOUNCEMENT_QUEUE_MAX = 1024
+
+    def _queue_announcement(self, queue: asyncio.Queue, msg,
+                            what: str) -> None:
+        """Queue `msg`, dropping the oldest when full; one WARNING per
+        run of drops."""
+        if not queue.full():
+            self._announcements_overflowing.discard(what)
+        else:
+            queue.get_nowait()
+            if what not in self._announcements_overflowing:
+                self._announcements_overflowing.add(what)
+                logger.warning(
+                    f"MOQT: {what} queue full ({queue.maxsize}): dropping "
+                    f"the oldest unread")
+        queue.put_nowait(msg)
 
     # -- Error response types (any version) --
     _ERROR_TYPES = (SubscribeError, PublishError, FetchError,
@@ -923,6 +966,7 @@ class _MOQTSessionMixin:
         """Forget the handlers a request of ours registered: it was
         refused, or its awaiter gave up."""
         self._pending_object_handlers.pop(request_id, None)
+        self._pending_reply_hooks.pop(request_id, None)
         self._publish_done_handlers.pop(request_id, None)
         self._fetch_object_handlers.pop(request_id, None)
         if (self._profile.fetch_location_filter
@@ -1001,6 +1045,18 @@ class _MOQTSessionMixin:
                 SessionCloseCode.DUPLICATE_TRACK_ALIAS,
                 f"Track Alias {alias} already in use by request {held[1]}")
 
+    # Aliases of PUBLISHes received, answered or not: data may precede
+    # PUBLISH_OK. Bounded; the oldest are forgotten.
+    _offered_aliases: Optional["OrderedDict[int, None]"] = None
+    OFFERED_ALIASES_MAX = 4096
+
+    def _offer_alias(self, alias: int) -> None:
+        if self._offered_aliases is None:
+            self._offered_aliases = OrderedDict()
+        self._offered_aliases[alias] = None
+        if len(self._offered_aliases) > self.OFFERED_ALIASES_MAX:
+            self._offered_aliases.popitem(last=False)
+
     def _establish_alias(self, alias: int, track, request_id: int) -> None:
         if self._established_aliases is None:
             self._established_aliases = {}
@@ -1035,7 +1091,11 @@ class _MOQTSessionMixin:
               and getattr(msg, 'track_alias', None) is not None):
             self._check_alias(msg.track_alias, self._msg_track(msg),
                               msg.request_id)
+            self._offer_alias(msg.track_alias)
         if isinstance(msg, SubscribeOk):
+            hook = self._pending_reply_hooks.pop(msg.request_id, None)
+            if hook is not None:
+                hook(msg)
             cb = self._pending_object_handlers.pop(msg.request_id, None)
             if cb is not None and msg.track_alias is not None:
                 self._bind_object_handler(msg.track_alias, cb)
@@ -1515,6 +1575,8 @@ class _MOQTSessionMixin:
         self._control_chains.pop(stream_id, None)
         self._uni_peek_stash.pop(stream_id, None)
         self._mark_stream_torn_down(stream_id)
+        if state is not None and state.held:
+            self._rx_held_bytes -= state.held
         key = state.key if state is not None else None
         if key and len(key) == 2 and key[0] == 'subgroup':
             alias, group_id, subgroup_id = key[1]
@@ -1551,9 +1613,16 @@ class _MOQTSessionMixin:
 
     FETCH_RESULTS_KEPT = 256
 
-    # A uni data stream whose header has not parsed within the deadline
-    # is abandoned (STOP_SENDING): its bytes and stream credit would
-    # otherwise stay pinned for the session's life.
+    # Receive bounds, until __init__ reads the owner's max_object_bytes.
+    _max_object_bytes = DEFAULT_MAX_OBJECT_BYTES
+    RX_HELD_FACTOR = 4
+    _rx_held_limit = RX_HELD_FACTOR * DEFAULT_MAX_OBJECT_BYTES
+    _rx_held_bytes = 0
+
+    # A uni data stream whose header has not parsed, or whose track
+    # alias nothing has bound, within the deadline is abandoned
+    # (STOP_SENDING): its bytes and stream credit would otherwise stay
+    # pinned for the session's life.
     STREAM_BIND_DEADLINE_S = 5.0
     STREAM_REAPER_PERIOD_S = 1.0
     _reaper_handle = None
@@ -1564,21 +1633,39 @@ class _MOQTSessionMixin:
                 self.STREAM_REAPER_PERIOD_S, self._reap_streams)
 
     def _reap_streams(self) -> None:
-        """Drop header-less uni streams past the binding deadline; runs
-        once a period while any data stream is open."""
+        """Drop uni streams still header-less or on an unbound alias
+        past the binding deadline; runs once a period while any data
+        stream is open."""
         self._reaper_handle = None
         if self._close_err is not None:
             return
         cutoff = time.monotonic() - self.STREAM_BIND_DEADLINE_S
         for sid, state in list(self._data_streams.items()):
-            if state.parser is None and state.last_activity < cutoff:
+            if state.last_activity >= cutoff:
+                continue
+            parser = state.parser
+            if parser is None:
                 held = getattr(state.chain, 'capacity', 0)
                 self._reject_stream(
                     sid, StreamResetCode.DELIVERY_TIMEOUT,
                     f"no stream header within "
                     f"{self.STREAM_BIND_DEADLINE_S:g}s ({held} bytes held)")
+            elif (isinstance(parser, SubgroupHeader)
+                  and self._alias_unbound(parser.track_alias)):
+                self._reject_stream(
+                    sid, StreamResetCode.CANCELLED,
+                    f"track_alias={parser.track_alias} unbound after "
+                    f"{self.STREAM_BIND_DEADLINE_S:g}s")
         if self._data_streams:
             self._schedule_stream_reaper()
+
+    def _alias_unbound(self, alias: int) -> bool:
+        """No control message or application has claimed this alias."""
+        return (alias in self._unbound_aliases
+                and alias not in self._track_aliases
+                and alias not in self._object_handlers
+                and alias not in (self._established_aliases or ())
+                and alias not in (self._offered_aliases or ()))
 
     def _mark_stream_torn_down(self, stream_id: int) -> None:
         """Mark a stream torn down so subsequent in-flight chunks are
@@ -1614,11 +1701,29 @@ class _MOQTSessionMixin:
             self._data_streams[stream_id] = state
             self._schedule_stream_reaper()
 
+        chain = state.chain
         if data and len(data) > 0:
-            state.chain.extend(data)
+            chain.extend(data)
 
-        if state.chain.capacity > 0:
+        if chain.capacity > 0:
             self._drain_stream(stream_id, state)
+
+        # An empty chain with nothing counted leaves the count unchanged.
+        held = chain.capacity
+        if held or state.held:
+            held -= chain.tell()
+            if (held != state.held
+                    and self._data_streams.get(stream_id) is state):
+                total = self._rx_held_bytes + held - state.held
+                self._rx_held_bytes = total
+                state.held = held
+                if total > self._rx_held_limit:
+                    self._close_session(
+                        SessionCloseCode.INTERNAL_ERROR,
+                        f"{self._rx_held_bytes} bytes held in incomplete "
+                        f"objects, over the {self._rx_held_limit}-byte "
+                        f"session limit")
+                    return
 
         if end_stream and stream_id in self._data_streams:
             # §11.4: a FIN in the middle of a serialized Object closes
@@ -1662,6 +1767,10 @@ class _MOQTSessionMixin:
                 return
             except BufferReadError:
                 chain.rollback()
+                return
+            except MOQTObjectTooLarge as e:
+                self._reject_stream(stream_id, StreamResetCode.EXCESSIVE_LOAD,
+                                    str(e))
                 return
             except MOQTProtocolViolation as e:
                 logger.error(f"MOQT stream({stream_id}): {e.reason_phrase}"
@@ -1750,6 +1859,10 @@ class _MOQTSessionMixin:
                     ObjectStatus.END_OF_TRACK,
                 )
                 cb = self._object_cb(alias)
+                watch = self._timing_watch
+                if watch and msg_obj.extensions and not TIMING_IDS.isdisjoint(
+                        msg_obj.extensions):
+                    cb = watch.get(alias, cb)
                 now = int(time.time() * 1_000_000)
                 if getattr(hdr, 'default_priority', False):
                     msg_obj.publisher_priority = (
@@ -2173,13 +2286,11 @@ class _MOQTSessionMixin:
                         # may print or forward the object.
                         obj = ObjectHeader(object_id=0)
                         sg_header._obj_cache = obj
+                    # Positional: keyword passing costs per object.
                     obj.deserialize_into(
-                        buf, len,
-                        extensions_present=sg_header.extensions_present,
-                        prev_object_id=sg_header._last_object_id,
-                        vi64=sg_header._vi64,
-                        kvp_delta=sg_header._kvp_delta,
-                    )
+                        buf, len, sg_header.extensions_present,
+                        sg_header._last_object_id, sg_header._vi64,
+                        sg_header._kvp_delta, self._max_object_bytes)
                     msg_header = obj
                     # Update delta tracking state
                     sg_header._last_object_id = msg_header.object_id
@@ -2194,7 +2305,8 @@ class _MOQTSessionMixin:
                     fh: FetchHeader = parser
                     msg_header = FetchObject.deserialize(
                         buf, prior=fh._prior_obj, prof=self._profile,
-                        group_order=fh._group_order)
+                        group_order=fh._group_order,
+                        max_payload=self._max_object_bytes)
                     # §11.4.4.2: a marker becomes the prior for the
                     # Group/Object deltas; its subgroup and priority
                     # stay those of the last actual object.
@@ -2344,6 +2456,10 @@ class _MOQTSessionMixin:
                 self._malformed_track(alias, reason)
                 return
         cb = self._object_cb(alias)
+        watch = self._timing_watch
+        if watch and msg.extensions and not TIMING_IDS.isdisjoint(
+                msg.extensions):
+            cb = watch.get(alias, cb)
         if cb:
             try:
                 cb(msg, consumed, now, msg.group_id, None)
@@ -2795,6 +2911,7 @@ class _MOQTSessionMixin:
                 event.stream_id,
                 stop_sending_code=int(event.error_code or 0))
             if not bound:
+                self._stopped_streams.add(event.stream_id)
                 self._cleanup_stream(
                     event.stream_id, QuicErrorCode.APPLICATION_ERROR)
             return
@@ -3209,6 +3326,9 @@ class _MOQTSessionMixin:
             # without ever suspending, so the event loop starves and
             # task cancellation can never be delivered.
             raise asyncio.CancelledError()
+        if stream_id in self._stopped_streams:
+            self._stopped_streams.discard(stream_id)
+            raise MOQTStreamStopped()
         quic = self._quic
         max_bytes = self._session.tx_max_inflight_bytes
         # Byte-budget gate (aiomoqt-owned policy). Per-stream sc->tx
@@ -3237,13 +3357,18 @@ class _MOQTSessionMixin:
         except (AssertionError, AttributeError) as e:
             logger.debug(f"stream({stream_id}): write race: {e}")
         except ConnectionError as e:
-            # Stream or session torn down under the write: end the
-            # producer as the pre-check does, never return silently.
+            # Torn down under the write: never return silently. A stream
+            # gone on a live session ends that stream only.
             logger.debug(f"stream({stream_id}): write after teardown: {e}")
+            if (self._session_writable()
+                    and not getattr(self._quic, 'closed', False)):
+                raise MOQTStreamStopped() from e
             raise asyncio.CancelledError() from e
 
     # Fetch streams serve_fetch() has open, by the peer's request id.
     _served_fetch_streams: Optional[Dict[int, int]] = None
+    # Send streams the peer stopped; the next write raises MOQTStreamStopped.
+    _stopped_streams: Set[int] = frozenset()
 
     def _forget_served_fetch(self, stream_id: int) -> None:
         for rid, sid in self._served_fetch_streams.items():
@@ -3523,7 +3648,30 @@ class _MOQTSessionMixin:
         """SETUP of the negotiated draft's class (d18, or d20 for d20+)."""
         cls = self.CONTROL_REGISTRY[self.negotiated_draft][
             MOQTMessageType.SETUP][0]
+        if self._profile.param_table >= 20 and self._max_filter_ranges:
+            options = {SetupParamType.MAX_FILTER_RANGES:
+                       self._max_filter_ranges, **options}
         return cls(options=options)
+
+    @property
+    def _max_filter_ranges(self) -> int:
+        """The MAX_FILTER_RANGES this end sends (d20+ §9.1.6); 0 omits it
+        and refuses every Range Filter."""
+        return int(getattr(getattr(self, '_session', None),
+                           'max_filter_ranges', 0) or 0)
+
+    def _filter_refusal(self, params: Dict[int, Any]) -> Optional[str]:
+        """Why Range Filters in `params`, FILL_PARAMETERS included, MUST
+        be refused with INVALID_FILTER (§3.3.2), else None."""
+        fill = params.get(D20ParamType.FILL_PARAMETERS)
+        fill = fill if isinstance(fill, dict) else {}
+        why = range_filter_error(params) or range_filter_error(fill)
+        if why is not None:
+            return why
+        limit = self._max_filter_ranges
+        if range_filter_count(params) + range_filter_count(fill) > limit:
+            return f"more than MAX_FILTER_RANGES {limit} ranges"
+        return None
 
     def _resolve_auth_token(self, msg: MOQTMessage) -> Optional[Callable]:
         """Apply a token-cache operation the peer sent (§10.2.2, §10.3.1.4),
@@ -3716,12 +3864,7 @@ class _MOQTSessionMixin:
     def _d20_refusal(self, msg: MOQTMessage) -> Tuple[Optional[int], str]:
         """(REQUEST_ERROR code, reason) for a d20+ request this session
         cannot accept, else (None, "")."""
-        params = msg.parameters or {}
-        # We send no MAX_FILTER_RANGES, so no Range may arrive (§5.1.4).
-        why = range_filter_error(params, max_ranges=0)
-        fill = params.get(D20ParamType.FILL_PARAMETERS)
-        if why is None and isinstance(fill, dict):
-            why = range_filter_error(fill, max_ranges=0)
+        why = self._filter_refusal(msg.parameters or {})
         if why is not None:
             return D20RequestErrorCode.INVALID_FILTER, why
         return None, ""
@@ -3750,14 +3893,14 @@ class _MOQTSessionMixin:
         params = msg.parameters or {}
         check_param_scope(params, f"RequestUpdate:{self._UPDATE_SCOPES[cls]}",
                           prof=self._profile)
-        if any(p in RANGE_FILTERS for p in params):
-            if cls is Publish and not ours:
-                raise MOQTProtocolViolation(
-                    "Range Filters in a REQUEST_UPDATE from the publisher")
-            why = range_filter_error(params, max_ranges=0)
-            if why is not None:
-                return self._refusal(msg, int(msg.request_id),
-                                     D20RequestErrorCode.INVALID_FILTER, why)
+        if (any(p in RANGE_FILTERS for p in params)
+                and cls is Publish and not ours):
+            raise MOQTProtocolViolation(
+                "Range Filters in a REQUEST_UPDATE from the publisher")
+        why = self._filter_refusal(params)
+        if why is not None:
+            return self._refusal(msg, int(msg.request_id),
+                                 D20RequestErrorCode.INVALID_FILTER, why)
         carried = self._subscribe_tracks_params.get(existing)
         if (carried is not None and not ours
                 and ParamType.FORWARD in params):
@@ -4152,6 +4295,7 @@ class _MOQTSessionMixin:
         location_filter: Optional[LocationFilter] = None,
         on_object: Optional[Callable] = None,
         on_done: Optional[Callable] = None,
+        on_reply: Optional[Callable] = None,
     ) -> Optional[MOQTMessage]:
         """Subscribe to a track with configurable options.
 
@@ -4163,7 +4307,9 @@ class _MOQTSessionMixin:
         register_object_handler signature), bound to its alias as
         SUBSCRIBE_OK is parsed; `on_done` is its PUBLISH_DONE handler
         (register_publish_done_handler). Both are registered before
-        SUBSCRIBE is sent and dropped if it is refused. A d20
+        SUBSCRIBE is sent and dropped if it is refused. `on_reply` is
+        called with the SUBSCRIBE_OK as it is parsed, before on_object
+        sees any object. A d20
         FILL_PARAMETERS fill stream comes under this Request ID:
         await_fetch_done() waits for it, and its objects reach
         on_fetch_object or register_fetch_object_handler()."""
@@ -4199,6 +4345,8 @@ class _MOQTSessionMixin:
                             group_order, forward)
         if on_object is not None:
             self._pending_object_handlers[request_id] = on_object
+        if on_reply is not None:
+            self._pending_reply_hooks[request_id] = on_reply
         if on_done is not None:
             self.register_publish_done_handler(request_id, on_done)
         logger.info(f"MOQT send: {self._msgstr(message)}")
@@ -4206,7 +4354,7 @@ class _MOQTSessionMixin:
 
         if not wait_response:
             return message
-        if on_object is not None or on_done is not None:
+        if on_object is not None or on_done is not None or on_reply:
             return self._await_routed(request_id)
         return self._await_response(request_id)
 
@@ -5878,7 +6026,7 @@ class _MOQTSessionMixin:
 
     async def _handle_publish(self, msg: Publish) -> None:
         logger.debug(f"MOQT event: handle {self._msgstr(msg)}")
-        self._publish_announcements.put_nowait(msg)
+        self._queue_announcement(self._publish_announcements, msg, "PUBLISH")
 
     async def _handle_publish_ok(self, msg: PublishOk) -> None:
         """Subscriber accepted our PUBLISH.
@@ -5994,7 +6142,8 @@ class _MOQTSessionMixin:
 
     async def _handle_namespace(self, msg) -> None:
         logger.debug(f"MOQT event: handle Namespace: {self._msgstr(msg)}")
-        self._namespace_announcements.put_nowait(msg)
+        self._queue_announcement(self._namespace_announcements, msg,
+                                 "NAMESPACE")
 
     async def _handle_namespace_done(self, msg) -> None:
         logger.debug(f"MOQT event: handle NamespaceDone: {self._msgstr(msg)}")

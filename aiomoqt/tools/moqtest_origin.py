@@ -40,6 +40,7 @@ from aiomoqt.types import (
 from aiomoqt.tools.moq_interop_relay import (
     _find_default_cert, _find_default_key,
 )
+from aiomoqt.utils.cli import add_help
 from aiomoqt.utils.logger import get_logger, set_log_level
 
 logger = get_logger(__name__)
@@ -390,7 +391,8 @@ def _build_server(bind, port, cert, key, use_quic, draft):
 
 
 def parse_args():
-    ap = argparse.ArgumentParser(description="moqtest origin (SUT)")
+    ap = argparse.ArgumentParser(description="moqtest origin (SUT)",
+                                 add_help=False)
     ap.add_argument("--bind", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=4443)
     ap.add_argument("--cert")
@@ -401,6 +403,7 @@ def parse_args():
                     help="both transports on one port")
     ap.add_argument("--draft", type=parse_draft_spec, default=None)
     ap.add_argument("--debug", action="store_true")
+    add_help(ap)
     return ap.parse_args()
 
 

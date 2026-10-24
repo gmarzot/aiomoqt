@@ -5,7 +5,7 @@ emit one and a harness can persist it; `schema` emits their JSON Schema.
 AgentSession runs them as Reader and Writer handles over a MoQT session.
 No MCP server ships; nothing here imports an MCP SDK.
 
-Provisional through 0.12.x: names and fields may change without a
+Provisional through 0.13.x: names and fields may change without a
 deprecation cycle until the surface settles.
 """
 from __future__ import annotations

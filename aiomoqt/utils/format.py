@@ -40,6 +40,13 @@ def fmt_ms(ms: float) -> str:
     return _num2(ms / 1000) + "s"
 
 
+def fmt_ms_signed(ms: float) -> str:
+    """fmt_ms keeping the sign of a negative time."""
+    if ms != ms:
+        return "--"
+    return ("-" if ms < 0 else "") + fmt_ms(abs(ms))
+
+
 def fmt_rate(per_s: float) -> str:
     """Format an object/event rate per second with 2-place style."""
     if per_s != per_s or per_s < 0:

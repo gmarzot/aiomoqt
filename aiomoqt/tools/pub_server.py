@@ -10,18 +10,20 @@ Usage:
   python -m aiomoqt.tools.pub_server -s 16384 -g 10000 -P 4 -r 0
 
   # Shell 2: connect subscriber
-  python -m aiomoqt.tools.sub_bench https://localhost:4434/moq -t 30 -i 5
+  python -m aiomoqt.tools.sub_bench https://localhost:4434/ -k -t 30 -i 5
 """
 import argparse
 import asyncio
 import logging
 import os
+import signal
 
 from aiomoqt.server import MOQTServer
 from aiomoqt.types import (D18MessageType, MOQT_DEFAULT_DRAFTS, MOQTMessageType,
                            parse_draft_spec)
 from aiomoqt.track import PublishedTrack
 from aiomoqt.types import ForwardingPreference
+from aiomoqt.utils import cli as _cli
 from aiomoqt.utils.logger import set_log_level, get_logger
 
 logger = get_logger(__name__)
@@ -88,7 +90,8 @@ def parse_args():
         '-Q', '--quic', action='store_true', help='Serve raw QUIC')
     parser.add_argument(
         '-W', '--wt', action='store_true',
-        help='Serve H3/WebTransport (default if neither given)')
+        help='Serve H3/WebTransport (default if neither given). With -Q, '
+             'serves both on one port.')
     parser.add_argument(
         '--draft', type=parse_draft_spec, default=None,
         help='MoQT draft(s) to accept: one draft, or a comma list such '
@@ -121,13 +124,12 @@ def parse_args():
         help='Congestion control algorithm '
              '(bbr | bbr1 | newreno | cubic | dcubic | prague | fast). '
              'Default: aiopquic default (bbr1)')
-    parser.add_argument(
-        '-?', '--help', action='help',
-        help='Show this help message and exit')
+    _cli.add_help(parser)
     parser.add_argument(
         '-D', '--datagram', action='store_true',
         help='ObjectDatagrams instead of subgroup streams (requires '
              '-q raw QUIC; object must fit one packet, ~1150B max)')
+    _cli.add_timestamps(parser)
     args = parser.parse_args()
     if not args.quic and not args.wt:
         args.wt = True
@@ -152,8 +154,10 @@ async def _on_subscribe(session, msg, args):
         rate=args.rate,
         forwarding=(ForwardingPreference.DATAGRAM if args.datagram
                     else ForwardingPreference.SUBGROUP),
+        timestamps=args.timestamps,
     )
-    ok = session.subscribe_ok(request_msg=msg)
+    ok = session.subscribe_ok(
+        request_msg=msg, track_properties=track._track_properties(session))
     track.track_alias = ok.track_alias
     track._generating = True
     logger.info(f"Subscriber connected, generating data "
@@ -209,6 +213,7 @@ async def _announce_track(session, args):
         rate=args.rate,
         forwarding=(ForwardingPreference.DATAGRAM if args.datagram
                     else ForwardingPreference.SUBGROUP),
+        timestamps=args.timestamps,
     )
     await track.publish(
         announce_namespace=(args.pub_ns or args.pub_both),
@@ -275,9 +280,11 @@ async def main():
     server.register_handler(
         D18MessageType.SUBSCRIBE_TRACKS,
         partial(_on_subscribe_tracks, args=args))
-    quic_server = await server.serve()
+    dual = args.quic and args.wt
+    quic_server = await (server.serve_dual() if dual else server.serve())
 
-    transport = "raw QUIC" if args.quic else "H3/WebTransport"
+    transport = ("raw QUIC + H3/WebTransport" if dual
+                 else "raw QUIC" if args.quic else "H3/WebTransport")
     rate_s = f"{args.rate}/s" if args.rate > 0 else "max"
     print(f"MoQT publisher server ready on {args.host}:{args.port}")
     print(f"  transport: {transport}")
@@ -286,24 +293,27 @@ async def main():
     print(f"  groups:    {args.group_size} objects/group")
     print(f"  rate:      {rate_s}")
     print("\nConnect subscriber (track-name discovery; -t on the sub):")
-    # URL carries the path: raw QUIC has none; WT serves at "/" (the
-    # MOQTServer(path="/") above) — not "/moq". sub_bench needs -k for
-    # the self-signed loopback cert. With discovery, --trackname is
-    # optional; -n must match this server's namespace.
+    # WT serves at "/" (path="/" above). -k: self-signed loopback cert.
+    urls = []
     if args.quic:
-        url = f"moqt://{args.host}:{args.port}"
-    else:
-        url = f"https://{args.host}:{args.port}/"
+        urls.append(f"moqt://{args.host}:{args.port}")
+    if args.wt:
+        urls.append(f"https://{args.host}:{args.port}/")
     draft = ("" if args.draft is None else " --draft " + ",".join(
         map(str, args.draft if isinstance(args.draft, list) else [args.draft])))
-    print(f"  python -m aiomoqt.tools.sub_bench {url} "
-          f"-n {args.namespace} -t 30 -i 5{draft} -k")
+    for url in urls:
+        print(f"  python -m aiomoqt.tools.sub_bench {url} "
+              f"-N {args.namespace} -t 30 -i 5{draft} -k")
 
+    # SIGTERM shuts down like Ctrl-C: peers get a CONNECTION_CLOSE.
+    asyncio.get_running_loop().add_signal_handler(
+        signal.SIGTERM, asyncio.current_task().cancel)
     try:
         await asyncio.Event().wait()
     except asyncio.CancelledError:
         pass
     finally:
+        await server.close_sessions()
         quic_server.close()
         print("\nServer stopped.")
 

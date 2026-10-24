@@ -62,6 +62,7 @@ from aiomoqt.utils.media_stats import (
     CSV_FIELDS, MediaAnalysis, csv_row, format_interval, format_summary,
     interval_header, wall_clock_us,
 )
+from aiomoqt.utils.timing import TimestampMalformed, capture_time_us
 from aiomoqt.utils.url import parse_relay_url
 
 
@@ -119,7 +120,10 @@ def parse_args():
                         help='With --analyze: write interval and summary '
                              'rows as CSV to PATH (- = stdout)')
     _cli.add_run(parser, duration=30)
-    _cli.add_session(parser, keepalive=True)
+    _cli.add_interval(parser)
+    _cli.add_session(parser)
+    _cli.add_keepalive(parser)
+    _cli.add_timestamp_checking(parser)
     _cli.add_help(parser)
     args = parser.parse_args()
     if args.analyze and args.pipe:
@@ -280,6 +284,7 @@ class _Inspector:
     def __init__(self, n: int):
         self.n = n
         self.counts = {}
+        self.timing_of = lambda name: None
 
     def on_arrival(self, name, msg, recv_us, group_id, subgroup_id, frame):
         if frame is None:
@@ -288,12 +293,18 @@ class _Inspector:
         if c > self.n:
             return
         exts = msg.extensions or {}
-        wall = wall_clock_us(frame.timestamp, exts.get(LOC_PROP_TIMESCALE),
-                             recv_us)
+        try:
+            cap, src = capture_time_us(self.timing_of(name), group_id,
+                                        msg.object_id, exts)
+        except TimestampMalformed:
+            cap, src = None, 'malformed'
+        wall = (cap if src == 'frindell' else
+                wall_clock_us(frame.timestamp, exts.get(LOC_PROP_TIMESCALE),
+                              recv_us))
         skew = None if wall is None else round((recv_us - wall) / 1000)
         _status(f"  [{name}] g{group_id}.o{msg.object_id} "
                 f"{len(frame.payload)}B key={frame.key_frame} "
-                f"ts_skew_ms={skew} "
+                f"ts_skew_ms={skew} ts_source={src} "
                 f"extra_props={sorted((frame.extensions or {}))}")
 
 
@@ -395,6 +406,15 @@ async def run(args):
                 if args.analyze else None)
     report = _open_report(args.report)
     inspector = _Inspector(args.inspect) if args.inspect else None
+    sub = None
+
+    def _timing_of(name):
+        track = sub.tracks.get(name) if sub is not None else None
+        return track.timing if track is not None else None
+    if inspector is not None:
+        inspector.timing_of = _timing_of
+    if analysis is not None:
+        analysis.timing_of = _timing_of
 
     client = MOQTClient(
         relay.host, relay.port, path=relay.path,
@@ -419,6 +439,7 @@ async def run(args):
         sub = MediaSubscriber(
             session, args.namespace, discover=args.discover,
             track_filter=_select, loc_bare=args.loc_bare,
+            timestamp_errors=args.timestamp_errors,
             on_catalog=((lambda c: _status(c.to_json(indent=2)))
                         if args.show_catalog else None))
         writers = (None if args.analyze
