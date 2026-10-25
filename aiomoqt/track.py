@@ -2099,7 +2099,8 @@ class SubscribedTrack(Track):
                         end_group: int = 0,
                         priority: Optional[int] = None,
                         group_order: Optional[GroupOrder] = None,
-                        location_filter: Optional[LocationFilter] = None):
+                        location_filter: Optional[LocationFilter] = None,
+                        expected_trackname: Optional[str] = None):
         """Subscribe to the track.
 
         Auto-routed on trackname presence:
@@ -2122,6 +2123,8 @@ class SubscribedTrack(Track):
             group_order: delivery order across groups. None omits it.
             location_filter: d20+ Location Filter, sent in place of the
                 filter_type form on a direct SUBSCRIBE.
+            expected_trackname: discovery only: wait for this track's
+                PUBLISH and drop the namespace's other tracks.
         """
         if self.trackname is not None:
             params = {}
@@ -2180,6 +2183,7 @@ class SubscribedTrack(Track):
         ns_params = {}
         if self.auth_token is not None:
             ns_params[ParamType.AUTH_TOKEN] = self.auth_token
+        tracks_reply = None
         await self.session.subscribe_namespace(
             namespace_prefix=self.namespace,
             parameters=ns_params,
@@ -2201,8 +2205,10 @@ class SubscribedTrack(Track):
                 part for part in (self.namespace, *suffix) if part)
             logger.info(f"Track: d18 namespace discovered: {full_ns}")
             self.namespace = full_ns
-            await self.session.subscribe_tracks(
-                namespace=full_ns, parameters=ns_params)
+            # The reply races the PUBLISH that answers it; a refusal ends
+            # discovery at once.
+            tracks_reply = asyncio.ensure_future(self.session.subscribe_tracks(
+                namespace=full_ns, parameters=ns_params, wait_response=True))
 
         if not getattr(self, '_quiet', False):
             if self.trackname is None:
@@ -2210,8 +2216,8 @@ class SubscribedTrack(Track):
                       f"'{self.namespace}'...")
             else:
                 print(f"  Waiting for track '{self.fqtn}'...")
-        pub_msg = await self.session.await_publish(
-            timeout=timeout, trackname=self.trackname)
+        pub_msg = await self._await_discovery(
+            timeout, expected_trackname, tracks_reply)
 
         # Extract namespace/trackname from PUBLISH (namespace may have
         # grown past the prefix we subscribed to).
@@ -2246,6 +2252,49 @@ class SubscribedTrack(Track):
         self.state = TrackState.SUBSCRIBED
         self._check_track_timing()
         logger.info(f"Track: subscribed to {self.fqtn}")
+
+    async def _await_discovery(self, timeout: float,
+                               trackname: Optional[str],
+                               tracks_reply: Optional[asyncio.Future]):
+        """The discovered PUBLISH, or the peer's refusal of SUBSCRIBE_TRACKS.
+        A reply that times out leaves the PUBLISH wait running; a PUBLISH
+        wait that times out names the tracks offered instead."""
+        offered = []
+
+        async def _matching():
+            try:
+                async with asyncio.timeout(timeout):
+                    while True:
+                        msg = await self.session.await_publish(timeout=timeout)
+                        name = (msg.track_name.decode()
+                                if isinstance(msg.track_name, bytes)
+                                else msg.track_name)
+                        if trackname is None or name == trackname:
+                            return msg
+                        offered.append(name)
+            except TimeoutError:
+                if offered:
+                    raise TimeoutError(
+                        f"no PUBLISH for '{trackname}'; offered: "
+                        f"{', '.join(offered)}") from None
+                raise
+
+        publish = asyncio.ensure_future(_matching())
+        if tracks_reply is None:
+            return await publish
+        tracks_reply.add_done_callback(
+            lambda f: f.cancelled() or f.exception())
+        try:
+            done, _ = await asyncio.wait(
+                {publish, tracks_reply}, return_when=asyncio.FIRST_COMPLETED)
+            if publish not in done and not tracks_reply.cancelled():
+                err = tracks_reply.exception()
+                if (isinstance(err, MOQTRequestError)
+                        and err.response is not None):
+                    raise err
+            return await publish
+        finally:
+            publish.cancel()
 
     def _check_track_timing(self) -> None:
         if self.timing_error is None:

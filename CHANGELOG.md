@@ -2,6 +2,12 @@
 
 ## v0.14.0
 
+- Data streams: an object spanning several chunks is parsed once its bytes have arrived, not again on every chunk.
+- d20/d22 FILL_PARAMETERS: a Length-prefixed value is read as a counted block when one ends exactly at the Length, else as bare parameters (moxygen's form), so a counted block of ten or more parameters decodes.
+- DEBUG logs no longer report each received stream data chunk, or the QUIC handshake completing, as an unhandled QUIC event.
+- loopback_bench and sub_bench print the interval still open when the run ends, so `-t N` reports through second N.
+- SubscribedTrack discovery: a refused SUBSCRIBE_TRACKS raises its MOQTRequestError at once, and `subscribe(expected_trackname=...)` waits for that track's PUBLISH, naming the tracks offered if it times out; moq_interop_client namespace-discovery uses both.
+- Interop tier: Nokia d18 and d22 on their current ports; quichemoq, moqtail d18, quicr-west WT and moxygen d14 dropped; per-relay load_sim namespace and XFAIL reasons.
 - A publisher session answers SUBSCRIBE_TRACKS itself: a PUBLISH for each attached track under the prefix, and for each attached while it is open, filtered by TRACK_PROPERTY_FILTER; an application handler for the type still answers instead. PublishedTrack.publish() sends no second PUBLISH while one is bound on the session.
 
 ## v0.13.3
