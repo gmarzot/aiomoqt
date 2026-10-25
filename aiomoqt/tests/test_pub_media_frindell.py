@@ -1,6 +1,6 @@
 """pub_media --timestamp-mapping: draft-frindell-moq-timestamp Track
 Properties and corrections beside LOC TIMESTAMP, a prft on each CMAF and
-LOCMAF group start, end to end through the interop relay into sub_media
+LOCMAF group start, end to end through aiomoqt-relay into sub_media
 --analyze over raw QUIC and WebTransport, audio and video on one
 session."""
 import asyncio

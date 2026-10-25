@@ -278,7 +278,7 @@ Each tool runs as a module (`python -m aiomoqt.tools.NAME`) and most also instal
 | `tools.load_sim` | `moq-load-sim` | multi-session load generator |
 | `tools.relay_probe` | `moq-relay-probe` | relay liveness and draft-version probe |
 | `tools.moq_interop_client` | `moq-interop-client` | interop test client (TAP output) |
-| `tools.moq_interop_relay` | `moq-interop-relay` | interop test relay (forwards; not production) |
+| `tools.moq_interop_relay` | `aiomoqt-relay`, `moq-interop-relay` | MoQT relay: raw QUIC and WebTransport, FETCH cache |
 
 Examples under `aiomoqt.examples` are minimal, readable clients rather than instrumented tools:
 
@@ -313,14 +313,14 @@ python -m aiomoqt.tools.moq_interop_client -r "moqt://relay.ex.com:4433" -t subs
 python -m aiomoqt.tools.moq_interop_client -l                                         # list cases
 ```
 
-### Interop relay
+### aiomoqt-relay
 
-`moq_interop_relay` is a **test fixture, not a production relay**. It forwards objects from an upstream publisher to downstream subscribers, fans one upstream subscription out to several subscribers, serves both publish flows (`PUBLISH_NAMESPACE` and bare `PUBLISH`), and dials upstream origins with `--upstream`. It has no group cache — so no joining FETCH and a late subscriber sees only what arrives next — no forward-state propagation, no `PUBLISH` forwarding to `SUBSCRIBE_TRACKS` subscribers, no authentication, and no backpressure. Use moxygen, moq-rs, or another real relay for any workload.
+`aiomoqt-relay` (module `moq_interop_relay`, also installed as `moq-interop-relay`) is a MoQT relay built on aiomoqt, serving raw QUIC and WebTransport at drafts 14 to 22. It forwards objects from an upstream publisher to downstream subscribers, fans one upstream subscription out to several subscribers, serves both publish flows (`PUBLISH_NAMESPACE` and bare `PUBLISH`), offers `PUBLISH` to `SUBSCRIBE_TRACKS` subscribers, and dials upstream origins with `--upstream`. A bounded recent-object cache per track (8 groups, 32 MiB) answers standalone and joining FETCH; a late subscriber starts at the live edge. It runs the public relay at `aiomoqt-relay.marzresearch.net`, and moxygen's moqtest conformance suite and the interop runner test against it.
 
-Its purpose is to exercise aiomoqt's server-side primitives — `MOQTServer`, the announce and subscribe handlers, `serve_dual()` — and to be driven by an external conformance suite, so both sides of the stack are covered. Because the relay re-encodes everything it forwards, a conformance client checking those objects is checking aiomoqt's encoder, not merely its routing.
+Limits: no authentication, authorization or rate limiting; unbounded per-track forwarding queues; upstream Forward State is raised, never lowered; no delivery timeout. Written in Python, it carries less traffic than the Rust and C++ relays. Because the relay re-encodes everything it forwards, a conformance client checking those objects is checking aiomoqt's encoder, not merely its routing.
 
 ```bash
-python -m aiomoqt.tools.moq_interop_relay --bind 0.0.0.0 --port 4443 \
+aiomoqt-relay --bind 0.0.0.0 --port 4443 \
     --cert cert.pem --key key.pem --dual     # raw QUIC + WT on one port
 ```
 
@@ -413,7 +413,7 @@ aiopquic:  0.6.1 (~/.venv/lib/python3.13/site-packages/aiopquic) [2026-10-21 16:
 
 - **WebTransport datagram TX is not implemented.** Datagram publishing and reception work over raw QUIC; on WebTransport, datagram reception works but `StreamMapping.DATAGRAM` publishing raises. Use `PER_GROUP` mapping over WebTransport.
 - **`relay_probe -f` and `tests/relays.json` use different schemas.** The probe expects a top-level array of `{id, name, endpoints:[{url}]}`; the interop catalog is `{relays:[{name, urls:{...}, drafts:[...]}]}`. Use `--url` for single-endpoint probes until the loader accepts both.
-- **`moq_interop_relay` is a conformance fixture**, not a production relay — it forwards and fans out, but has no group cache (hence no joining FETCH), no forward-state propagation, no authz, and no backpressure. See [Interop relay](#interop-relay).
+- **`aiomoqt-relay` has no authentication or rate limiting**, unbounded per-track forwarding queues and no delivery timeout. See [aiomoqt-relay](#aiomoqt-relay).
 
 ## Roadmap
 

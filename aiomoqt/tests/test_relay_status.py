@@ -1,4 +1,4 @@
-"""Ersatz-relay dashboard status: host metrics from /proc, MSF catalog
+"""aiomoqt-relay dashboard status: host metrics from /proc, MSF catalog
 classification, and the relay's status snapshot end to end."""
 import asyncio
 import contextlib

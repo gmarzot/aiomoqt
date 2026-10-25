@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
-"""ERSATZ-RELAY — a stand-in MoQT relay, not a production relay.
+"""aiomoqt-relay: a MoQT relay built on aiomoqt.
 
-It genuinely relays (moxygen's moqtest conformance suite gates our CI
-against it), but it exists for exactly two purposes:
+Relays raw QUIC and WebTransport sessions at drafts 14, 16, 18, 20 and
+22. It runs the public aiomoqt-relay, and moxygen's moqtest conformance
+suite and the interop runner test against it. Written in Python, it
+carries less traffic than the Rust and C++ relays.
 
-  1. exercise aiomoqt's server-role API surface end to end, and
-  2. stand as the SUT for conformance and interop harnesses.
+Limits:
 
-Deliberately absent, and staying absent:
-
-  * NO authentication, authorization, or rate limiting
-  * NO load handling, bounded queues, or production hardening
-  * A bounded recent-object cache only (CACHE_GROUPS / CACHE_BYTES,
-    oldest dropped) — enough to answer a FETCH, standalone or joining,
-    over what it still holds; a late subscriber starts at the live edge
+  * No authentication, authorization or rate limiting.
+  * A per-stream send budget (--max-inflight-bytes); per-track
+    forwarding queues are unbounded; no per-session namespace or
+    subscription caps.
+  * A bounded recent-object cache per track (CACHE_GROUPS / CACHE_BYTES,
+    oldest group dropped): enough to answer a FETCH, standalone or
+    joining, over what it still holds; a late subscriber starts at the
+    live edge.
   * Upstream Forward State is raised for a forwarding subscriber, never
-    lowered again
-  * NO delivery-timeout enforcement
-  * Namespace tables are in-memory and global to the process
+    lowered again.
+  * No delivery-timeout enforcement.
+  * Namespace tables are in memory and global to the process.
 
 Routing model (cross-session, single relay instance):
   - PUBLISH_NAMESPACE: record the announcing session under the
@@ -2217,7 +2219,7 @@ def transport_settings(args) -> dict:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="MoQT interop-runner relay (control-plane only)",
+        description="aiomoqt-relay: a MoQT relay (raw QUIC and WebTransport)",
         add_help=False,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
@@ -3680,9 +3682,6 @@ async def main():
         except OSError as e:
             sys.exit(f"error: --control {args.control}: {e.strerror or e}")
     logger.info(f"relay: start {_versions_line()} pid {os.getpid()}")
-    print("aiomoqt ERSATZ-RELAY: an API demonstrator and conformance "
-          "SUT — not a production relay (no auth, no hardening).",
-          file=sys.stderr)
 
     cert = args.cert or _find_default_cert()
     key = args.key or _find_default_key(cert)
@@ -3758,8 +3757,8 @@ async def main():
 
     print(
         "=" * 64
-        + "\n EXPERIMENTAL aiomoqt interop relay.\n"
-        " NOT a production relay: no auth, no scale handling.\n"
+        + "\n aiomoqt-relay: a MoQT relay in Python.\n"
+        " No authentication or rate limiting.\n"
         + "=" * 64,
         file=sys.stderr,
     )

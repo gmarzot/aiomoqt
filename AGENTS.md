@@ -20,13 +20,13 @@ installed package. Keep its API boundary and traps consistent with this file.
 | `aiomoqt/agent/` | declarative, JSON-round-tripping specs and `AgentSession` / `Reader` / `Writer` |
 | `aiomoqt/types.py`, `context.py` | draft numbers, error codes, `DraftProfile`, `profile_for()` |
 | `aiomoqt/media/` | MSF catalog, `broadcast.py` composer, LOC, CMAF, LOCMAF packaging; ingest (PyAV, DASH, MPEG-TS) and synthetic sources |
-| `aiomoqt/tools/` | CLI tools: pub/sub/loopback/adaptive benches, `pub_server`, `load_sim`, `pub_media` / `sub_media`, `relay_probe`, `moq_interop_client`, `moq_interop_relay` (ersatz relay), `moqtest_origin`, `relay_status`; `scenarios/` for `load_sim` |
+| `aiomoqt/tools/` | CLI tools: pub/sub/loopback/adaptive benches, `pub_server`, `load_sim`, `pub_media` / `sub_media`, `relay_probe`, `moq_interop_client`, `moq_interop_relay` (aiomoqt-relay), `moqtest_origin`, `relay_status`; `scenarios/` for `load_sim` |
 | `aiomoqt/utils/` | CLI grid (`cli.py`), stats, URL parsing, logging, bench workers |
 | `aiomoqt/examples/` | minimal pub, sub, join and server examples; ship in the wheel |
 | `aiomoqt/versions.py` | `aiomoqt-versions`: aiomoqt, aiopquic, picoquic and picotls build info |
 | `aiomoqt/tests/` | the pytest tree, **inside** the package dir, left out of the wheel |
 | `tests/` | `release_regression_test.py` (tier runner) + `relays.json`; `contrib/` = contribution-runner sweep; `moqdev-smoke/` = moq-dev's relay smoke in Docker. No pytest files |
-| `deploy/aiomoqt-relay/` | compose, nginx and runbook for the public ersatz relay |
+| `deploy/aiomoqt-relay/` | compose, nginx and runbook for the public aiomoqt-relay |
 | `docs/` | bench and demo runbooks |
 
 ## Setup
@@ -164,7 +164,7 @@ tolerated peer deviation or a bound hit; ERROR ends a session.
 
 Category loggers, stable names: `aiomoqt.control` (control messages, requests), `aiomoqt.data`
 (subgroup streams, datagrams, objects in and out), `aiomoqt.fetch` (FETCH streams and objects),
-`aiomoqt.transport` (QUIC and WebTransport events, stream ops, ALPN), `aiomoqt.relay` (the ersatz
+`aiomoqt.transport` (QUIC and WebTransport events, stream ops, ALPN), `aiomoqt.relay` (the
 relay). A line that belongs to none uses its module logger. Tools take `--log-level
 {error,warning,info,debug,trace}` (`-d`/`--debug` = `debug`) and `--log CAT=LEVEL[,…]` from the
 grid (`add_logging`, `apply_logging`); `AIOMOQT_LOG` takes the same spec, where a bare `LEVEL`

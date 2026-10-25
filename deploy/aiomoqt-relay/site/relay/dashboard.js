@@ -1,4 +1,4 @@
-// MoQ Ersatz Relay dashboard: relay status, namespaces and tracks, scoped to a
+// aiomoqt-relay dashboard: relay status, namespaces and tracks, scoped to a
 // namespace, from /status/status.json. Uses Dash from common.js.
 'use strict';
 
@@ -49,7 +49,7 @@ function renderRelay(s, urls) {
   $('url-quic').textContent = urls.quic;
   $('drafts').textContent = (r.drafts || []).join(', ');
   const badge = $('badge-version');
-  badge.textContent = v.aiomoqt ? `aiomoqt ${v.aiomoqt}` : 'aiomoqt ersatz relay';
+  badge.textContent = v.aiomoqt ? `aiomoqt ${v.aiomoqt}` : 'aiomoqt-relay';
   badge.title = [['aiopquic', v.aiopquic], ['picoquic', v.picoquic], ['Python', v.python]]
     .filter(([, x]) => x).map(([k, x]) => `${k} ${x}`).join(' · ');
   $('uptime').textContent = fmt.uptime(r.uptime_s)

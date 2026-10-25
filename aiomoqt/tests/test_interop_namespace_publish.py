@@ -1,5 +1,5 @@
 """moq-interop-runner namespace and direct-PUBLISH cases: our interop
-client against our interop relay, in one process."""
+client against aiomoqt-relay, in one process."""
 import pytest
 
 from aiomoqt.tools import moq_interop_client as client
