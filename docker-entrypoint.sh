@@ -1,7 +1,7 @@
 #!/bin/sh
 # Container entrypoint. MOQT_ROLE selects the program:
 #   client (default) — moq-interop-runner client
-#   relay            — the ersatz relay on UDP/${MOQT_PORT:-4443}
+#   relay            — aiomoqt-relay on UDP/${MOQT_PORT:-4443}
 #   origin           — the moqtest origin (conformance SUT, serves
 #                      draft-afrind-moq-test tracks incl. FETCH)
 # MOQT_QUIC=1 serves raw QUIC instead of WebTransport; MOQT_DUAL=1 both

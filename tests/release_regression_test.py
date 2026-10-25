@@ -304,7 +304,7 @@ def _adaptive_verdict(text: str) -> tuple[str, str]:
 
 def _loopback_adaptive_relay_quic(log_dir: Path, draft: int) -> tuple[str, str]:
     """adaptive_bench in relay mode (pub and sub processes) through the
-    local interop relay over raw QUIC."""
+    local aiomoqt-relay over raw QUIC."""
     import socket
     import time
     slug = f"loopback-adaptive-relay-quic-d{draft}"

@@ -1,4 +1,4 @@
-# MoQ Ersatz Relay: the aiomoqt ersatz relay, nginx for the pages and the relay's
+# aiomoqt-relay: the relay, nginx for the pages and the relay's
 # status and logs, and GoAccess for the password-protected visitor report.
 # Run from this directory; see README.md.
 name: aiomoqt-relay
@@ -7,7 +7,7 @@ services:
   relay:
     image: aiomoqt:dev
     # The certbot renewal hook restarts it by this name.
-    container_name: ersatz-relay
+    container_name: aiomoqt-relay
     network_mode: host
     restart: unless-stopped
     mem_limit: 2g
@@ -90,11 +90,11 @@ services:
         while :; do
           logs | goaccess - --log-format=COMBINED \
             --no-global-config --ignore-crawlers \
-            --html-report-title="MoQ Ersatz Relay visitors" -o /report/new.html \
+            --html-report-title="aiomoqt-relay visitors" -o /report/new.html \
             && mv /report/new.html /report/index.html
           logs | goaccess - --log-format=COMBINED \
             --no-global-config --crawlers-only \
-            --html-report-title="MoQ Ersatz Relay crawlers" -o /report/new-crawlers.html \
+            --html-report-title="aiomoqt-relay crawlers" -o /report/new-crawlers.html \
             && mv /report/new-crawlers.html /report/crawlers.html
           sleep 300
         done

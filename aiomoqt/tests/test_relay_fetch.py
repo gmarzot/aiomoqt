@@ -1,4 +1,4 @@
-"""Ersatz-relay standalone FETCH, served from its recent-object cache.
+"""aiomoqt-relay standalone FETCH, served from its recent-object cache.
 
 The relay registered no FETCH handler, so the session default accepted
 with FETCH_OK and never opened the data stream — a peer waited forever.

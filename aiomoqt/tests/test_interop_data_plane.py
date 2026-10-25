@@ -1,5 +1,5 @@
-"""moq-interop-runner data-plane scenarios: our interop client against our
-interop relay, in one process."""
+"""moq-interop-runner data-plane scenarios: our interop client against
+aiomoqt-relay, in one process."""
 from types import SimpleNamespace
 
 import pytest

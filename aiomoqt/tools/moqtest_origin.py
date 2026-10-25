@@ -5,7 +5,7 @@ A moq-test track is a deterministic function of its 16-field namespace
 tuple, so an origin can compute any group, object, or range on demand —
 no relay, no cache, no fan-out. This makes the plain aiomoqt server-role
 API the SUT for moxygen's moqtest_client (subscribe modes; publish mode
-needs the ersatz-relay).
+needs aiomoqt-relay).
 
 Parameter tuple (mirrors moxygen moqtest/Utils.cpp):
   [0]  "moq-test-00"

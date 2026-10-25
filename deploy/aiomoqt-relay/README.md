@@ -1,11 +1,11 @@
-# MoQ Ersatz Relay
+# aiomoqt-relay
 
-`aiomoqt-relay.marzresearch.net` runs the aiomoqt ersatz relay for limited interop testing, its
+`aiomoqt-relay.marzresearch.net` runs aiomoqt-relay, its
 dashboard, and the G5 Broadcast and G5 Player test pages. The relay is open, with no auth.
 
 | Service | Container | What it does |
 |---|---|---|
-| `relay` | `ersatz-relay` | `moq_interop_relay` on UDP 4443, raw QUIC and WebTransport, drafts 22/20/18/16/14, `--watchdog 30`, writes `status/` and `relay-logs/` |
+| `relay` | `aiomoqt-relay` | `moq_interop_relay` on UDP 4443, raw QUIC and WebTransport, drafts 22/20/18/16/14, `--watchdog 30`, writes `status/` and `relay-logs/` |
 | `web` | `relay-web` | nginx on 80/443: landing page, `/g5-broadcast/`, `/g5-player/`, `/relay/` dashboard, `/relay/platform/` and `/relay/logs/`, `/status/{status,platform}.json`, `/private/`, `/stats/` |
 | `goaccess` | `relay-goaccess` | rebuilds the visitor reports in `stats/` every 5 minutes from `logs/`; no network |
 
@@ -13,11 +13,11 @@ Host: `ssh ubuntu@aiomoqt-relay.marzresearch.net` (OCI, Ubuntu 24.04 aarch64,
 Docker with Compose v2). The subnet's security list opens UDP 4433-4443 and TCP 80/443; the host's
 own iptables (`/etc/iptables/rules.v4`) must also accept TCP 443 and UDP 4443. The certificate
 comes from apt certbot with dns-cloudflare (`/etc/cloudflare/credentials.ini`, 0600). Its deploy
-hooks in `/etc/letsencrypt/renewal-hooks/deploy/` restart `ersatz-relay` and reload `relay-web` by
+hooks in `/etc/letsencrypt/renewal-hooks/deploy/` restart `aiomoqt-relay` and reload `relay-web` by
 name.
 
 The host is also the perf and release-gate box. UDP 4443 belongs to the public relay; test relays
-use 5443 and up. Before a bench that needs a quiet box, `docker stop ersatz-relay`, and start it
+use 5443 and up. Before a bench that needs a quiet box, `docker stop aiomoqt-relay`, and start it
 again after.
 
 ## Layout on the host
@@ -153,7 +153,7 @@ In the log viewer, Shift- or Ctrl-click on "Load earlier" loads the whole select
 200,000 records).
 
 Log level: the switch in the log viewer's toolbar toggles DEBUG and logs `relay: debug logging
-on/off`; `docker kill -s USR1 ersatz-relay` steps INFO, DEBUG, TRACE, INFO and logs `relay: log
+on/off`; `docker kill -s USR1 aiomoqt-relay` steps INFO, DEBUG, TRACE, INFO and logs `relay: log
 level <LEVEL>`. The switch reaches the relay's `--control` socket (`status/control.sock`) through
 `/private/debug`, which needs the password and, for POST, an `X-Relay-Control: 1` header. Never
 send SIGUSR2: it stops the relay.
@@ -181,9 +181,9 @@ curl -s -o /dev/null -w '%{http_code}\n' https://aiomoqt-relay.marzresearch.net/
 curl -s -o /dev/null -w '%{http_code}\n' https://aiomoqt-relay.marzresearch.net/relay/logs/files/relay.log    # 401 too
 ```
 
-`docker logs ersatz-relay` shows a watchdog probe under `aiomoqt-watchdog/…` every 30 s. That is
+`docker logs aiomoqt-relay` shows a watchdog probe under `aiomoqt-watchdog/…` every 30 s. That is
 expected, and the dashboard leaves it out.
 
 ## Taking it down
 
-`docker compose down` stops everything; `docker stop ersatz-relay` stops just the relay.
+`docker compose down` stops everything; `docker stop aiomoqt-relay` stops just the relay.

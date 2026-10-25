@@ -1,4 +1,4 @@
-// MoQ Ersatz Relay platform page: host and relay-process detail from
+// aiomoqt-relay platform page: host and relay-process detail from
 // /status/platform.json. Uses Dash from common.js.
 'use strict';
 

@@ -52,6 +52,7 @@ moq-pub-server = "aiomoqt.tools.pub_server:cli"
 moq-load-sim = "aiomoqt.tools.load_sim:cli"
 moq-relay-probe = "aiomoqt.tools.relay_probe:cli"
 moq-interop-client = "aiomoqt.tools.moq_interop_client:cli"
+aiomoqt-relay = "aiomoqt.tools.moq_interop_relay:cli"
 moq-interop-relay = "aiomoqt.tools.moq_interop_relay:cli"
 
 [project.optional-dependencies]

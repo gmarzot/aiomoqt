@@ -12,7 +12,7 @@ Category loggers cut across modules (names are stable):
   aiomoqt.data       subgroup streams and datagrams, objects in and out
   aiomoqt.fetch      FETCH streams and their objects
   aiomoqt.transport  QUIC/WebTransport events, stream ops, ALPN
-  aiomoqt.relay      the ersatz relay (moq_interop_relay)
+  aiomoqt.relay      aiomoqt-relay (moq_interop_relay)
 
 Everything else logs to its module logger (aiomoqt.protocol, ...).
 
