@@ -97,16 +97,19 @@ unreleased aiopquic change. `pin-guard` hard-fails it on main or a release-label
 ## Release flow
 
 1. Work lands on the dev branch `gmarzot-X.Y.Z`, which has an open tracking PR to main.
-2. Squash-merge the tracking PR to main.
-3. Dispatch `release.yml` on main with the version (`N.N.N`, optionally `a`/`b`/`rcN`).
+2. Release candidates: dispatch `release.yml` on the dev branch with `N.N.NrcN` (or `a`/`b`).
+3. Final release: squash-merge the tracking PR to main, then dispatch `release.yml` on main with
+   `N.N.N`.
    `verify` requires a green `ci.yml` run and a green `moq-conformance.yml` run on a commit with
    the identical tree; it does not re-run them. The wheel is built once and smoke-tested, then
    tagged and published. `dry_run` stops after the smoke test.
-4. Merge main back into the dev branch, then open the next dev branch and its tracking PR.
+4. Merge main back into the dev branches. Start the next dev branch from the release tag and open
+   its tracking PR.
 
-Version trap: release tags sit on squash commits that are not ancestors of the dev branch, so
-dev builds report a stale base such as `0.13.0rc3.devN`. Check releases with
-`git diff <commit> <tag>`, not ancestry.
+Versions: setuptools_scm describes from the last final tag (rc, a and b tags are ignored) with
+`release-branch-semver`, so a dev build reports the next minor, e.g. `0.14.0.devN` after 0.13.3;
+N is not meaningful. Release tags sit on squash commits that are not ancestors of the dev
+branch: check releases with `git diff <commit> <tag>`, not ancestry.
 
 ## Lint and types
 

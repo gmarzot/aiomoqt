@@ -83,7 +83,7 @@ select = ["E", "F", "W"]
 ignore = ["E501"]  # line length handled by formatter
 
 [build-system]
-requires = ["setuptools>=77", "setuptools_scm[toml]>=6.2"]
+requires = ["setuptools>=77", "setuptools_scm[toml]>=8"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
@@ -99,4 +99,9 @@ exclude = ["aiomoqt.tests*"]
 "aiomoqt" = ["tests/*", "tests/**/*"]
 
 [tool.setuptools_scm]
+# Dev builds version as the next minor above the last final release tag.
+version_scheme = "release-branch-semver"
+
+[tool.setuptools_scm.scm.git]
+describe_command = "git describe --dirty --tags --long --match [0-9]* --exclude *rc* --exclude *a[0-9]* --exclude *b[0-9]*"
 
