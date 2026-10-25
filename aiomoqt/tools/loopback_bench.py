@@ -269,6 +269,7 @@ async def run_subscriber(args, stats):
             if not await wait_cond_timeout(
                     track.wait_closed(), timeout=args.duration):
                 track.completed = True
+            stats.finish()
     except Exception as e:
         print(f"  Subscriber error: {e}")
 

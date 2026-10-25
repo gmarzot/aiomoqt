@@ -78,6 +78,17 @@ class BenchReporter:
             print(self.stats.interval_row(now))
             self._last_report = now
 
+    def finish(self):
+        """Print the interval still open when the run ends, so a run of
+        -t N reports through second N. A sliver under half an interval,
+        left when an object printed the last row just before the end, is
+        not a row of its own."""
+        now = time.monotonic()
+        if (self._header_printed and self.stats.total_objects
+                and now - self._last_report >= self.report_interval / 2):
+            print(self.stats.interval_row(now))
+            self._last_report = now
+
     def print_summary(self):
         s = self.stats.summary()
         if not s:
@@ -220,6 +231,7 @@ async def run(args):
                 if not await wait_cond_timeout(
                         track.wait_closed(), timeout=args.duration):
                     track.completed = True
+                stats.finish()
                 failed = False
 
             except MOQTRequestError as e:

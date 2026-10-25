@@ -1327,6 +1327,60 @@ def test_d22_subscribe_with_bare_length_prefixed_fill_decodes():
     assert got.parameters[0x23] == {0x21: LocationFilter.relative(1)}
 
 
+_REL2 = {0x21: LocationFilter.relative(2)}
+_TIMEOUT_REL2 = {0x0A: 5, 0x21: LocationFilter.relative(2)}
+
+
+# Shape A (moxygen): Length, then Parameters with no count,
+# read to the Length. Shape B: Length, then a counted block. Shape C
+# (moq-transport PR #2015): a counted block, no Length. Bytes by hand.
+@pytest.mark.parametrize("draft", [20, 22])
+@pytest.mark.parametrize("raw, params", [
+    ("01" "23" "03" "210102", {0x23: _REL2}),
+    ("01" "23" "02" "0a05", {0x23: {0x0A: 5}}),
+    ("01" "23" "05" "0a05" "170102", {0x23: _TIMEOUT_REL2}),
+    ("02" "23" "05" "0a05" "170102" "02" "00",
+     {0x23: _TIMEOUT_REL2, 0x25: [_NO_SUBGROUP_FILTER]}),
+    ("01" "23" "04" "01" "210102", {0x23: _REL2}),
+    ("02" "23" "06" "02" "0a05" "170102" "02" "00",
+     {0x23: _TIMEOUT_REL2, 0x25: [_NO_SUBGROUP_FILTER]}),
+    ("01" "23" "01" "210102", {0x23: _REL2}),
+    ("02" "23" "02" "0a05" "170102" "02" "00",
+     {0x23: _TIMEOUT_REL2, 0x25: [_NO_SUBGROUP_FILTER]}),
+    ("01" "23" "00", {0x23: {}}),
+    ("01" "23" "01" "00", {0x23: {}}),
+], ids=["a-location-filter", "a-type-reads-as-count-10",
+        "a-two-first-reads-as-count", "a-then-subgroup-filter",
+        "b-location-filter", "b-then-subgroup-filter", "c-location-filter",
+        "c-then-subgroup-filter", "empty", "b-empty"])
+def test_fill_parameters_shapes_a_b_and_c_decode(draft, raw, params):
+    assert _unparams(bytes.fromhex(raw), draft) == params
+
+
+@pytest.mark.parametrize("draft", [20, 22])
+def test_shape_b_with_a_count_of_ten_is_not_read_as_shape_a(draft):
+    # Ten SUBGROUP_FILTERs (repeatable): the count 0x0A could be the
+    # first type of a shape A value.
+    inner = "0a" + "".join(("25" if i == 0 else "00") + f"03{i:02x}0000"
+                           for i in range(10))
+    raw = bytes.fromhex("01" "23" f"{len(inner) // 2:02x}" + inner)
+    assert _unparams(raw, draft) == {0x23: {0x25: [
+        RangeFilter(set_id=i, ranges=((0, 0),)) for i in range(10)]}}
+
+
+@pytest.mark.parametrize("draft", [20, 22])
+@pytest.mark.parametrize("raw", [
+    "01" "23" "02" "210102",
+    "02" "23" "02" "210102" "02" "00",
+    "01" "23" "04" "0a05" "1701" "02",
+], ids=["overruns-length", "overruns-into-next-parameter",
+        "second-overruns-length"])
+def test_shape_a_parameter_overrunning_its_length_is_a_protocol_violation(
+        draft, raw):
+    with pytest.raises(MOQTProtocolViolation):
+        _unparams(bytes.fromhex(raw), draft)
+
+
 @pytest.mark.parametrize("raw, match", [
     ("01" "23" "02" "210101", "unknown message parameter|truncated|"
      "overran|overruns|exceeds|exhausted"),
