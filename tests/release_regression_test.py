@@ -370,11 +370,13 @@ def _relay_ctrl_msg(url: str, draft: int, insecure: bool,
 
 
 def _relay_pub_sub(url: str, draft: int, pub_mode: str, insecure: bool,
-                   compat: str, log: Path,
-                   trackname: str) -> tuple[str, str]:
+                   compat: str, log: Path, trackname: str,
+                   namespace: str | None = None) -> tuple[str, str]:
     cmd = [sys.executable, "-m", "aiomoqt.tools.load_sim",
            url, *MULTI_SUB_ARGS_COMMON, "--draft", str(draft),
            "-T", trackname, *PUB_MODE_FLAGS[pub_mode]]
+    if namespace:
+        cmd += ["-N", namespace]
     if insecure:
         cmd.append("-k")
     if compat:
@@ -616,8 +618,10 @@ def _run_relay_matrix(relay: dict, enabled: set[str],
     # non-gating for every draft.
     gating_drafts = set(relay.get("gating", []))
     # Suites that run and report but never gate: a documented peer
-    # non-conformance the case fails on correctly.
-    xfail_suites = set(relay.get("xfail_suites", []))
+    # non-conformance the case fails on correctly. A map gives each a reason.
+    xfail = relay.get("xfail_suites", [])
+    xfail_suites = xfail if isinstance(xfail, dict) else dict.fromkeys(xfail, "")
+    namespace = relay.get("namespace")
 
     def _dispatch(suite: str, label_suffix: str, tag: str, slug: str,
                   fn, *fn_args, gating: bool = True) -> None:
@@ -642,6 +646,8 @@ def _run_relay_matrix(relay: dict, enabled: set[str],
         status, detail = _with_interop_retry(fn, fn_args, log)
         if status == "FAIL" and (not gating or suite in xfail_suites):
             status = "XFAIL"
+            if xfail_suites.get(suite):
+                detail = f"{detail} (expected: {xfail_suites[suite]})"
         results.append((status, label, detail, log))
         marker = {"PASS": "[PASS]", "FAIL": "[FAIL]",
                   "XFAIL": "[XFAIL]"}[status]
@@ -662,7 +668,7 @@ def _run_relay_matrix(relay: dict, enabled: set[str],
                 _dispatch("relay-pub-sub", f"[{pub_mode}]", tag, slug,
                           lambda u, d, log: _relay_pub_sub(
                               u, d, pub_mode, insecure, compat_csv,
-                              log, tn),
+                              log, tn, namespace),
                           url, draft, gating=gating)
             if "relay-join" in enabled:
                 _dispatch("relay-join", "", tag, slug,
