@@ -106,3 +106,15 @@ async def test_no_host_binds_every_interface():
             assert _taken(socket.AF_INET6, "::", port)
     finally:
         handle.close()
+
+
+@pytest.mark.asyncio
+async def test_a_busy_address_fails_at_serve():
+    holder = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    holder.bind(("127.0.0.1", 0))
+    port = holder.getsockname()[1]
+    try:
+        with pytest.raises(OSError):
+            await _serve("127.0.0.1", port)
+    finally:
+        holder.close()
