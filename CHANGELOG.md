@@ -2,6 +2,7 @@
 
 ## v0.14.0
 
+- DEBUG logs no longer report each received stream data chunk, or the QUIC handshake completing, as an unhandled QUIC event.
 - loopback_bench and sub_bench print the interval still open when the run ends, so `-t N` reports through second N.
 
 ## v0.13.3

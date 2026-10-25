@@ -11,7 +11,7 @@ from typing import (Any, Callable, DefaultDict, Dict, List, Optional, Set,
 
 from aiopquic.quic.connection import QuicErrorCode, stream_is_unidirectional
 from aiopquic.quic.events import (
-    DatagramFrameReceived, ProtocolNegotiated, QuicEvent,
+    DatagramFrameReceived, HandshakeCompleted, ProtocolNegotiated, QuicEvent,
     StopSendingReceived, StreamDataReceived, StreamReset,
 )
 
@@ -2875,6 +2875,7 @@ class _MOQTSessionMixin:
                 return
 
             self._ingest_stream_data(stream_id, data, event.end_stream)
+            return
 
         elif isinstance(event, DatagramFrameReceived) and self._wt_session_setup.done():
             msg_buf = Buffer(data=event.data)
@@ -2900,6 +2901,9 @@ class _MOQTSessionMixin:
                     logger.debug(
                         f"MOQT: datagram parse failed "
                         f"(#{self._dgram_parse_errors}): {e}")
+            return
+        elif isinstance(event, HandshakeCompleted):
+            logger.debug("QUIC: handshake complete")
             return
         elif isinstance(event, StopSendingReceived):
             logger.debug(f"MOQT event: StopSendingReceived: stream {event.stream_id}")
