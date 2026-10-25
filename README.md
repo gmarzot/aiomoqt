@@ -315,7 +315,7 @@ python -m aiomoqt.tools.moq_interop_client -l                                   
 
 ### aiomoqt-relay
 
-`aiomoqt-relay` (module `moq_interop_relay`, also installed as `moq-interop-relay`) is a MoQT relay built on aiomoqt, serving raw QUIC and WebTransport at drafts 14 to 22. It forwards objects from an upstream publisher to downstream subscribers, fans one upstream subscription out to several subscribers, serves both publish flows (`PUBLISH_NAMESPACE` and bare `PUBLISH`), offers `PUBLISH` to `SUBSCRIBE_TRACKS` subscribers, and dials upstream origins with `--upstream`. A bounded recent-object cache per track (8 groups, 32 MiB) answers standalone and joining FETCH; a late subscriber starts at the live edge. It runs the public relay at `aiomoqt-relay.marzresearch.net`, and moxygen's moqtest conformance suite and the interop runner test against it.
+`aiomoqt-relay` (module `moq_interop_relay`, also installed as `moq-interop-relay`) is a MoQT relay built on aiomoqt, serving raw QUIC and WebTransport at drafts 14 to 22. It forwards objects from an upstream publisher to downstream subscribers, fans one upstream subscription out to several subscribers, serves both publish flows (`PUBLISH_NAMESPACE` and bare `PUBLISH`), offers `PUBLISH` to `SUBSCRIBE_TRACKS` subscribers, and dials upstream origins with `--upstream`. A recent-object cache per track (8 groups, 32 MiB) answers standalone and joining FETCH; one relay-wide budget (`--cache-bytes`, default 256 MiB) caps all tracks together by dropping the oldest group of the least recently used track. A late subscriber starts at the live edge. It runs the public relay at `aiomoqt-relay.marzresearch.net`, and moxygen's moqtest conformance suite and the interop runner test against it.
 
 Limits: no authentication, authorization or rate limiting; unbounded per-track forwarding queues; upstream Forward State is raised, never lowered; no delivery timeout. Written in Python, it carries less traffic than the Rust and C++ relays. Because the relay re-encodes everything it forwards, a conformance client checking those objects is checking aiomoqt's encoder, not merely its routing.
 
@@ -413,7 +413,7 @@ aiopquic:  0.6.1 (~/.venv/lib/python3.13/site-packages/aiopquic) [2026-10-21 16:
 
 - **WebTransport datagram TX is not implemented.** Datagram publishing and reception work over raw QUIC; on WebTransport, datagram reception works but `StreamMapping.DATAGRAM` publishing raises. Use `PER_GROUP` mapping over WebTransport.
 - **`relay_probe -f` and `tests/relays.json` use different schemas.** The probe expects a top-level array of `{id, name, endpoints:[{url}]}`; the interop catalog is `{relays:[{name, urls:{...}, drafts:[...]}]}`. Use `--url` for single-endpoint probes until the loader accepts both.
-- **`aiomoqt-relay` has no authentication or rate limiting**, unbounded per-track forwarding queues and no delivery timeout. See [aiomoqt-relay](#aiomoqt-relay).
+- **`aiomoqt-relay` has no authentication or rate limiting**, unbounded per-track forwarding queues and no delivery timeout. Its cache budget (`--cache-bytes`) never drops a subscribed track's live group, so live groups alone can exceed it. See [aiomoqt-relay](#aiomoqt-relay).
 
 ## Roadmap
 

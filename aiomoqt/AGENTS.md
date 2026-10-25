@@ -74,6 +74,7 @@ SIGUSR1.
   #2118), not reproduced on the current pin. Use `cubic` or `newreno` for loopback timing runs.
 - `moq-relay-probe --relays-file` reads its own relay-list schema; use `--url` for a single probe.
 - `aiomoqt-relay` (also `moq-interop-relay`) is a MoQT relay in Python: a bounded
-  recent-object cache (8 groups / 32 MiB per track) for FETCH and JOIN; no authentication, authorization or rate limiting; a per-stream TX budget
+  recent-object cache (8 groups / 32 MiB per track, all tracks under one `--cache-bytes` budget,
+  least recently used evicted first) for FETCH and JOIN; no authentication, authorization or rate limiting; a per-stream TX budget
   but unbounded per-track forwarding queues; no delivery timeout. Its module docstring has the
   details.

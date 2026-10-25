@@ -13,9 +13,11 @@ Limits:
     forwarding queues are unbounded; no per-session namespace or
     subscription caps.
   * A bounded recent-object cache per track (CACHE_GROUPS / CACHE_BYTES,
-    oldest group dropped): enough to answer a FETCH, standalone or
-    joining, over what it still holds; a late subscriber starts at the
-    live edge.
+    oldest group dropped) under a relay-wide budget (--cache-bytes),
+    which drops the oldest group of the least recently used track, never
+    the live group of a subscribed one: enough to answer a FETCH,
+    standalone or joining, over what it still holds; a late subscriber
+    starts at the live edge.
   * Upstream Forward State is raised for a forwarding subscriber, never
     lowered again.
   * No delivery-timeout enforcement.
@@ -49,7 +51,7 @@ table) for runners that expect distinct endpoints.
 
 import argparse
 import asyncio
-from collections import deque
+from collections import OrderedDict, deque
 import contextlib
 import datetime
 import faulthandler
@@ -332,6 +334,8 @@ def _fetch_sources(ns: tuple, track_name) -> list:
 # Recent-object cache bounds, per track: whichever is hit first.
 CACHE_GROUPS = 8
 CACHE_BYTES = 32 * 1024 * 1024
+# Relay-wide cache budget (--cache-bytes).
+CACHE_BUDGET_BYTES = 256 * 1024 * 1024
 
 # MAX_FILTER_RANGES advertised at d20+ (§9.1.6).
 MAX_FILTER_RANGES = 16
@@ -403,6 +407,45 @@ class _Downstream:
     def start(self):
         """Start Location; {0, 0} when unfiltered (d18 §5.1.2)."""
         return self.window[0]
+
+
+class _CacheBudget:
+    """Cache bytes across all tracks, held to CACHE_BUDGET_BYTES by
+    dropping the oldest group of the least recently used track."""
+
+    def __init__(self) -> None:
+        # Tracks holding cached objects, least recently used first.
+        self.lru: OrderedDict = OrderedDict()
+        self.bytes = 0
+        self.evictions = 0
+        self._overrun = False
+
+    def touch(self, track) -> None:
+        """`track`'s cache was written, replayed or fetched from."""
+        if track._cache:
+            self.lru[track] = None
+            self.lru.move_to_end(track)
+
+    def forget(self, track) -> None:
+        self.lru.pop(track, None)
+
+    def enforce(self) -> None:
+        while self.bytes > CACHE_BUDGET_BYTES:
+            victim = next((t for t in self.lru if t._evictable()), None)
+            if victim is None:
+                if not self._overrun:
+                    self._overrun = True
+                    logger.warning(
+                        f"relay: cache {self.bytes} bytes over its "
+                        f"{CACHE_BUDGET_BYTES}-byte budget: the rest is "
+                        f"subscribed tracks' live groups")
+                return
+            victim._drop_oldest_group()
+            self.evictions += 1
+        self._overrun = False
+
+
+_budget = _CacheBudget()
 
 
 class _RelayedTrack:
@@ -531,6 +574,15 @@ class _RelayedTrack:
             self.task = None
         self.downstream.clear()
         self._streams.clear()
+        self._drop_cache()
+
+    def _drop_cache(self) -> None:
+        """Empty the cache and return its bytes to the relay budget."""
+        _budget.bytes -= self._cache_bytes
+        _budget.forget(self)
+        self._cache.clear()
+        self._cache_bytes = 0
+        self._groups.clear()
 
     def _release_publish(self) -> None:
         """Drop the PUBLISH's handlers on the publisher's session, unless a
@@ -789,6 +841,7 @@ class _RelayedTrack:
                 self.release_upstream()
                 self.downstream.clear()
                 self._streams.clear()
+                self._drop_cache()
                 self.task = None
                 _tracks.pop(key, None)
                 return
@@ -849,22 +902,54 @@ class _RelayedTrack:
         later FETCH or replay, dropping oldest past the bound."""
         self._cache.append((gid, sgid, oid, payload, exts, prio, status,
                             shape))
-        self._cache_bytes += len(payload or b"")
+        size = len(payload or b"")
+        self._cache_bytes += size
+        _budget.bytes += size
         self._groups[gid] = self._groups.get(gid, 0) + 1
         self.note_largest((gid, oid))
+        _budget.touch(self)
         self._evict()
 
     def _evict(self) -> None:
         """Drop the oldest objects past CACHE_GROUPS groups or
-        CACHE_BYTES."""
+        CACHE_BYTES, then hold the relay to its budget."""
         while self._cache and (len(self._groups) > CACHE_GROUPS
                                or self._cache_bytes > CACHE_BYTES):
             dropped = self._cache.popleft()
-            self._cache_bytes -= len(dropped[3] or b"")
+            size = len(dropped[3] or b"")
+            self._cache_bytes -= size
+            _budget.bytes -= size
             left = self._groups.pop(dropped[0]) - 1
             if left:
                 self._groups[dropped[0]] = left
-        if self._cache:
+        self._prune()
+        _budget.enforce()
+
+    def _evictable(self) -> bool:
+        """Holds a group the budget may drop: anything but the newest
+        group of a track with a live subscriber."""
+        if len(self._groups) > 1:
+            return True
+        return bool(self._groups) and not any(
+            _session_live(d.session) for d in self.downstream)
+
+    def _drop_oldest_group(self) -> None:
+        """Drop every cached object of the oldest group, so the cache
+        stays a contiguous run of the newest groups."""
+        oldest = min(self._groups)
+        size = sum(len(c[3] or b"") for c in self._cache if c[0] == oldest)
+        self._cache = deque(c for c in self._cache if c[0] != oldest)
+        del self._groups[oldest]
+        self._cache_bytes -= size
+        _budget.bytes -= size
+        self._prune()
+
+    def _prune(self) -> None:
+        """Forget per-group state below the oldest cached group; an
+        empty cache leaves the budget's LRU."""
+        if not self._cache:
+            _budget.forget(self)
+        else:
             first = self._cache[0][0]
             self._ended = {k for k in self._ended if k[0] >= first}
             self._opened = {k for k in self._opened if k[0] >= first}
@@ -882,6 +967,8 @@ class _RelayedTrack:
         objs = sorted((c for c in self._cache if d.passes(c[0], c[2])
                        and d.admits(c[1], c[2], c[5], c[4])),
                       key=lambda c: (c[0], c[1], c[2]))
+        if objs:
+            _budget.touch(self)
         try:
             for gid, sgid, oid, payload, exts, prio, status, shape in objs:
                 self._objects_out += 1
@@ -934,6 +1021,8 @@ class _RelayedTrack:
                 continue
             out.append((gid, sgid, oid, payload, exts, prio, status))
         out.sort(key=lambda o: (o[0], o[2]))
+        if out:
+            _budget.touch(self)
         return out
 
     def _short(self, gid, start) -> bool:
@@ -1402,7 +1491,8 @@ async def _backfill(track, msg, largest) -> None:
                           start_group=start[0], start_object=start[1],
                           end_group=end[0], end_object=end[1])
     _, objs, _ = await _fetch_upstream(ns, name, rng, timeout=BACKFILL_S)
-    if objs is None or track.complete_from != cf:
+    if (objs is None or track.complete_from != cf or track._closed
+            or track.finished):
         return
     held = {(c[0], c[2]) for c in track._cache}
     new = [(o.group_id, o.subgroup_id, o.object_id, bytes(o.payload),
@@ -1410,9 +1500,12 @@ async def _backfill(track, msg, largest) -> None:
            for o in objs if (o.group_id, o.object_id) not in held]
     track._cache = deque(sorted([*new, *track._cache],
                                 key=lambda c: (c[0], c[2])))
-    track._cache_bytes += sum(len(c[3]) for c in new)
+    size = sum(len(c[3]) for c in new)
+    track._cache_bytes += size
+    _budget.bytes += size
     for c in new:
         track._groups[c[0]] = track._groups.get(c[0], 0) + 1
+    _budget.touch(track)
     track._evict()
     track._backfilled.update((c[0], c[2]) for c in new)
     # Groups before complete_from's came whole: a replay FINs them.
@@ -2369,6 +2462,11 @@ def parse_args():
                         metavar="BYTES",
                         help="Per-stream send budget, below "
                              "--stream-ring-cap. Default: 512 KiB")
+    parser.add_argument("--cache-bytes", type=int,
+                        default=CACHE_BUDGET_BYTES, metavar="BYTES",
+                        help="Object cache budget across all tracks; past "
+                             "it the least recently used tracks lose their "
+                             "oldest groups. Default: 256 MiB")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug logging (= --log-level debug). "
                              "SIGUSR1 steps the level at runtime: INFO, "
@@ -3481,6 +3579,9 @@ class _Status:
             "fetch_cache_bytes": _fetch_bytes["cache"],
             "fetch_upstream_bytes": _fetch_bytes["upstream"],
             "cache_efficiency": _cache_efficiency(),
+            "cache_budget": CACHE_BUDGET_BYTES,
+            "cache_bytes": _budget.bytes,
+            "cache_evictions": _budget.evictions,
             "loss_pct": round(100 * lost / sent, 2) if sent else 0.0,
             "rtt_p50_ms": relay_status.percentile(rtts, 50),
             "rtt_p99_ms": relay_status.percentile(rtts, 99),
@@ -3773,6 +3874,11 @@ async def main():
         print("Error: --max-inflight-bytes must be above 0 and below "
               "--stream-ring-cap", file=sys.stderr)
         sys.exit(2)
+    if args.cache_bytes <= 0:
+        print("Error: --cache-bytes must be above 0", file=sys.stderr)
+        sys.exit(2)
+    global CACHE_BUDGET_BYTES
+    CACHE_BUDGET_BYTES = args.cache_bytes
     transport = transport_settings(args)
 
     # Primary listener: WebTransport unless --quic; both with --dual.
@@ -3825,7 +3931,8 @@ async def main():
                            else ["quic"] if args.quic else ["wt"]),
             "started": time.time(),
             "watchdog_s": args.watchdog,
-            "cache": {"groups": CACHE_GROUPS, "bytes": CACHE_BYTES},
+            "cache": {"groups": CACHE_GROUPS, "bytes": CACHE_BYTES,
+                      "budget": CACHE_BUDGET_BYTES},
         }, handles)
         _background.add(asyncio.create_task(status.run()))
 
