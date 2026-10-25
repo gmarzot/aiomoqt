@@ -26,7 +26,8 @@ from .messages.data import (FETCH_FLAGS_END_TIMED_OUT,
                             FETCH_FLAGS_END_UNKNOWN, encode_padding,
                             DEFAULT_MAX_OBJECT_BYTES, MOQTObjectTooLarge)
 from .messages.params import (
-    RANGE_FILTERS, D20ParamType, D20RequestErrorCode, check_param_scope,
+    RANGE_FILTERS, D20ParamType, D20RequestErrorCode, RangeFilters,
+    check_param_scope,
     fill_range, range_filter_count, range_filter_error, uses_location_filter,
 )
 from .messages import (
@@ -36,7 +37,7 @@ from .messages import (
 )
 from .messages.subscribe import SubscribeOk
 from .types import *
-from .types import (D20MessageType, FilterType, MOQTDraft, MOQTException,
+from .types import (D18MessageType, D20MessageType, FilterType, MOQTDraft, MOQTException,
                     MOQTMessageType, MOQTProtocolViolation, MOQTRequestError,
                     MOQTStreamStopped,
                     ObjectStatus, ParamType, RequestErrorCode,
@@ -370,6 +371,8 @@ class _MOQTSessionMixin:
         # The peer's d20+ SUBSCRIBE_TRACKS: request id -> the parameters a
         # resulting PUBLISH carries (§10.20.1).
         self._subscribe_tracks_params: Dict[int, Dict[int, Any]] = {}
+        # The peer's SUBSCRIBE_TRACKS: request id -> its TRACK_PROPERTY_FILTERs.
+        self._subscribe_tracks_filters: Dict[int, Dict[int, Any]] = {}
         # Track aliases found malformed (§2.4.2): subscription cancelled,
         # further streams refused.
         self._malformed_aliases: Set[int] = set()
@@ -888,6 +891,10 @@ class _MOQTSessionMixin:
                 f"track {track.namespace}/{track.trackname} is already "
                 f"published on this session by another track")
         self._published_tracks[key] = track
+        if held is None:
+            rid = self._open_subscribe_tracks(key[0])
+            if rid is not None:
+                self._loop.create_task(self._offer_track(rid, track))
 
     def _bind_request(self, request_id: int, track, sub=None,
                       alias: Optional[int] = None) -> None:
@@ -6026,15 +6033,56 @@ class _MOQTSessionMixin:
                 self.namespace(ns[len(prefix):], request_id=rid)
 
     async def _handle_subscribe_tracks(self, msg: SubscribeTracks) -> None:
-        """d18 SUBSCRIBE_TRACKS (0x51) — a subscriber asking one
-        namespace for its tracks. Ack it; the application answers with
-        PUBLISH per track (the same announcement d14/d16 relays pushed
-        unprompted from SUBSCRIBE_NAMESPACE). An app that registers its
-        own handler for this type overrides the default ack."""
+        """d18 SUBSCRIBE_TRACKS (0x51) — a subscriber asking for the
+        tracks under a namespace prefix (§3.6). Ack it and PUBLISH each
+        attached track under the prefix, then each one attached while it
+        stays open. An app that registers its own handler for this type
+        answers instead."""
         control_log.debug(f"MOQT event: handle {self._msgstr(msg)}")
         if self._cancelled_unhandled(msg):
             return
         self.subscribe_tracks_ok(msg)
+        rid = msg.request_id
+        filters = {k: v for k, v in (msg.parameters or {}).items()
+                   if k == D20ParamType.TRACK_PROPERTY_FILTER}
+        for stale in [r for r in self._subscribe_tracks_filters
+                      if r not in self._peer_requests]:
+            del self._subscribe_tracks_filters[stale]
+        if filters:
+            self._subscribe_tracks_filters[rid] = filters
+        prefix = tuple(msg.namespace_prefix or ())
+        for key, track in list(self._published_tracks.items()):
+            if key[0][:len(prefix)] == prefix:
+                await self._offer_track(rid, track)
+
+    def _open_subscribe_tracks(self, namespace: tuple) -> Optional[int]:
+        """The peer's open SUBSCRIBE_TRACKS covering `namespace` that this
+        session answers by default, else None."""
+        for rid, (kind, prefix) in list(self._peer_requests.items()):
+            if kind is SubscribeTracks and namespace[:len(prefix)] == prefix:
+                if D18MessageType.SUBSCRIBE_TRACKS in self._control_msg_overrides:
+                    return None
+                return rid
+        return None
+
+    async def _offer_track(self, request_id: int, track) -> None:
+        """PUBLISH `track` for SUBSCRIBE_TRACKS `request_id`, unless it is
+        already published or subscribed here or fails the request's
+        TRACK_PROPERTY_FILTERs (§3.6.1)."""
+        if track._sub_for(self).session is not self:
+            return
+        key = self._track_key(track.namespace, track.trackname)
+        if self._publishing(key) or self._peer_subscribed(track):
+            return
+        filters = self._subscribe_tracks_filters.get(request_id)
+        if filters and RangeFilters.from_params(filters).for_track(
+                track._track_properties(self)) is None:
+            return
+        try:
+            await track.publish(publish_track=True, session=self)
+        except Exception as e:
+            logger.info(f"MOQT: SUBSCRIBE_TRACKS {request_id}: no PUBLISH "
+                        f"of {track.fqtn}: {e}")
 
     async def _handle_publish_blocked(self, msg: PublishBlocked) -> None:
         # d18 PUBLISH_BLOCKED (0x0F) — subscriber-side notice that a track

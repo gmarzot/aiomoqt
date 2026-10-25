@@ -803,7 +803,10 @@ async def test_namespace_discovery(host, port, path, use_quic,
                     discovered = SubscribedTrack(
                         sub_session, INTEROP_NAMESPACE)
                     discovered._quiet = True
-                    await discovered.subscribe(timeout=timeout / 2)
+                    # The relay may offer other tracks in the namespace.
+                    await discovered.subscribe(
+                        timeout=timeout / 2,
+                        expected_trackname=INTEROP_TRACK)
                     found = discovered.trackname
                     passed = found == INTEROP_TRACK
                     msg = (f"discovered '{found}'" if passed else
