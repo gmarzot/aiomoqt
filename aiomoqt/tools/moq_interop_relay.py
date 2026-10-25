@@ -93,9 +93,10 @@ from aiomoqt.context import (canonical_request_error, canonical_stream_reset,
                              request_error_code)
 from aiomoqt.tools import relay_status
 from aiomoqt import __version__ as AIOMOQT_VERSION
-from aiomoqt.utils.logger import (get_log_level, get_logger, set_log_handler,
-                                  set_log_level)
-from aiomoqt.utils.cli import add_help
+from aiomoqt.utils.logger import (get_category_logger, get_log_level,
+                                  set_log_handler, set_log_level,
+                                  step_log_level)
+from aiomoqt.utils.cli import add_help, add_logging, apply_logging
 from aiomoqt.utils.url import parse_relay_url
 
 # Version confinement. The interop runner injects DRAFT (moq-interop-runner
@@ -107,7 +108,7 @@ _RELAY_DRAFT_DEFAULT = (
     os.environ.get("DRAFT") or os.environ.get("MOQT_DRAFT")
     or ",".join(str(d) for d in MOQT_DEFAULT_DRAFTS)).strip()
 
-logger = get_logger(__name__)
+logger = get_category_logger("relay")
 
 
 # Cross-session announcement table: namespace tuple -> the publisher
@@ -2265,8 +2266,7 @@ def parse_args():
                              "(default).")
     parser.add_argument("--control", type=str, default=None, metavar="PATH",
                         help="Serve HTTP on the Unix socket PATH: GET /debug "
-                             "reports DEBUG logging, POST /debug toggles it "
-                             "(as SIGUSR1)")
+                             "reports DEBUG logging, POST /debug toggles it")
     parser.add_argument("--status-dir", type=str, default=None, metavar="DIR",
                         help="Write DIR/status.json every "
                              f"{STATUS_INTERVAL_S:g}s for the dashboard: "
@@ -2296,8 +2296,10 @@ def parse_args():
                         help="Per-stream send budget, below "
                              "--stream-ring-cap. Default: 512 KiB")
     parser.add_argument("--debug", action="store_true",
-                        help="Enable debug logging (SIGUSR1 toggles it at "
-                             "runtime)")
+                        help="Enable debug logging (= --log-level debug). "
+                             "SIGUSR1 steps the level at runtime: INFO, "
+                             "DEBUG, TRACE, INFO")
+    add_logging(parser)
     add_help(parser)
     return parser.parse_args()
 
@@ -3600,9 +3602,19 @@ def _start_log_dir(log_dir: str) -> None:
     logger.info(f"relay: crash and stall dumps go to {path}")
 
 
+def _debug_on() -> bool:
+    return (get_log_level() or logging.INFO) <= logging.DEBUG
+
+
+def _step_log_level() -> None:
+    """SIGUSR1: aiomoqt logging INFO -> DEBUG -> TRACE -> INFO."""
+    level = step_log_level()
+    logger.info(f"relay: log level {logging.getLevelName(level)}")
+
+
 def _toggle_debug() -> None:
-    """SIGUSR1: switch aiomoqt logging between DEBUG and INFO."""
-    if get_log_level() == logging.DEBUG:
+    """POST /debug: switch aiomoqt logging between DEBUG and INFO."""
+    if _debug_on():
         set_log_level(logging.INFO)
         logger.info("relay: debug logging off")
     else:
@@ -3622,7 +3634,7 @@ async def _on_control(reader, writer) -> None:
             if method == "POST":
                 _toggle_debug()
             status = "200 OK"
-            body = {"debug": get_log_level() == logging.DEBUG}
+            body = {"debug": _debug_on()}
         data = json.dumps(body).encode()
         writer.write(f"HTTP/1.1 {status}\r\nContent-Type: application/json"
                      f"\r\nContent-Length: {len(data)}\r\n"
@@ -3653,8 +3665,7 @@ async def main():
     if any(d not in speaks for d in wanted):
         sys.exit(f"error: draft {','.join(map(str, wanted))} not supported; "
                  f"aiomoqt speaks {speaks}")
-    log_level = logging.DEBUG if args.debug else logging.INFO
-    set_log_level(log_level)
+    log_level = apply_logging(args, default=logging.INFO)
     logging.basicConfig(
         level=log_level, stream=sys.stderr,
         format=LOG_FORMAT,
@@ -3662,7 +3673,7 @@ async def main():
     if args.log_dir:
         _start_log_dir(args.log_dir)
     asyncio.get_running_loop().add_signal_handler(signal.SIGUSR1,
-                                                  _toggle_debug)
+                                                  _step_log_level)
     if args.control:
         try:
             await _serve_control(args.control)

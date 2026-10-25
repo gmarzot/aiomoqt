@@ -9,6 +9,7 @@
 - SubscribedTrack discovery: a refused SUBSCRIBE_TRACKS raises its MOQTRequestError at once, and `subscribe(expected_trackname=...)` waits for that track's PUBLISH, naming the tracks offered if it times out; moq_interop_client namespace-discovery uses both.
 - Interop tier: Nokia d18 and d22 on their current ports; quichemoq, moqtail d18, quicr-west WT and moxygen d14 dropped; per-relay load_sim namespace and XFAIL reasons.
 - A publisher session answers SUBSCRIBE_TRACKS itself: a PUBLISH for each attached track under the prefix, and for each attached while it is open, filtered by TRACK_PROPERTY_FILTER; an application handler for the type still answers instead. PublishedTrack.publish() sends no second PUBLISH while one is bound on the session.
+- Logging: a TRACE level below DEBUG holds per-object, per-chunk and wire-hex detail; category loggers `aiomoqt.control`, `.data`, `.fetch`, `.transport`, `.relay`; tools take `--log-level` and `--log CAT=LEVEL`, `AIOMOQT_LOG` the same spec; the relay's SIGUSR1 steps INFO, DEBUG, TRACE.
 
 ## v0.13.3
 

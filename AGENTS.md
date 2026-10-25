@@ -156,9 +156,21 @@ codecs can agree on valid bytes while diverging on invalid ones.
 draft-N`) and close; each control message where it crosses the wire (`MOQT send:` out,
 `control message parsed:` in); and request or track outcomes no message carries (cancellations,
 refusals, forward-state changes, `Track:` and `relay:` summaries). DEBUG is a second view of a
-message already logged, transport plumbing, and anything per object or per data stream. WARNING
-is a tolerated peer deviation or a bound hit; ERROR ends a session. `MOQTServer(quiet_peers=…)`
-logs a health probe's sessions at DEBUG; the relay's SIGUSR1 toggles DEBUG at runtime.
+message already logged, transport plumbing, per-stream lifecycle (open, close, reset) and request
+or track bookkeeping; its volume does not grow with the object count. TRACE (`TRACE = 5` in
+`aiomoqt.utils.logger`, registered by name only) is per object, per chunk, per datagram and wire
+hex: emit it as `log.log(TRACE, …)`, behind `log.isEnabledFor(TRACE)` on hot paths. WARNING is a
+tolerated peer deviation or a bound hit; ERROR ends a session.
+
+Category loggers, stable names: `aiomoqt.control` (control messages, requests), `aiomoqt.data`
+(subgroup streams, datagrams, objects in and out), `aiomoqt.fetch` (FETCH streams and objects),
+`aiomoqt.transport` (QUIC and WebTransport events, stream ops, ALPN), `aiomoqt.relay` (the ersatz
+relay). A line that belongs to none uses its module logger. Tools take `--log-level
+{error,warning,info,debug,trace}` (`-d`/`--debug` = `debug`) and `--log CAT=LEVEL[,…]` from the
+grid (`add_logging`, `apply_logging`); `AIOMOQT_LOG` takes the same spec, where a bare `LEVEL`
+sets every logger, and the flags win. `MOQTServer(quiet_peers=…)` logs a health probe's sessions
+at DEBUG. The relay's SIGUSR1 steps INFO → DEBUG → TRACE → INFO; its `--control` socket's
+`POST /debug` toggles DEBUG.
 
 **CHANGELOG, commits, comments.** One short CHANGELOG line per user-visible change; commits
 `area: short imperative summary`; comments say what or why in few words, never history.

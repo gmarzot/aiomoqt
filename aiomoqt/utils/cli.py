@@ -32,6 +32,8 @@ identity          -N/--namespace  -T/--trackname
 publisher media   -s/--object-size -g/--group-size -P/--streams
                   -r/--rate -D/--datagram --video
 run               -t/--duration -d/--debug --no-stats
+logging           --log-level --log (long only; -d/--debug = --log-level
+                  debug)
 interval          -i/--interval
 session           --draft -k/--insecure --keylogfile --cc-algo
                   --max-queued-bytes --max-inflight-bytes --quic-debug
@@ -44,8 +46,11 @@ split execution (tools that can run one end or both)
   --mp                   spread this role across processes
 """
 import argparse
+import logging
 
 from aiomoqt.types import MOQT_DEFAULT_DRAFTS, parse_draft_spec
+from aiomoqt.utils.logger import (CATEGORIES, LEVELS, configure_logging,
+                                  parse_log_spec)
 from aiomoqt.utils.url import parse_relay_url
 
 # Defaults, one place. Powers of two, same on every tool.
@@ -188,6 +193,43 @@ def add_run(p, duration=DEFAULT_DURATION):
                    help='Count objects and bytes only — no latency, '
                         'jitter, loss or group accounting. Measures the '
                         'delivery ceiling without the measurement in it.')
+
+
+def log_spec(value):
+    """argparse type for --log: CAT=LEVEL[,CAT=LEVEL...]."""
+    try:
+        parse_log_spec(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e))
+    return value
+
+
+def add_logging(p):
+    """Log levels; resolve with apply_logging()."""
+    p.add_argument('--log-level', type=str.lower, choices=tuple(LEVELS),
+                   default=None, metavar='LEVEL',
+                   help=f'Log level: {", ".join(LEVELS)} (default: the '
+                        f'tool\'s). -d/--debug = --log-level debug.')
+    p.add_argument('--log', type=log_spec, action='append', default=None,
+                   metavar='CAT=LEVEL[,...]',
+                   help=f'Per-category levels; categories: '
+                        f'{", ".join(CATEGORIES)}. Repeatable. The '
+                        f'AIOMOQT_LOG environment variable takes the '
+                        f'same spec; these flags win.')
+
+
+def apply_logging(args, default=logging.WARNING):
+    """Set levels from --log-level, -d/--debug, --log and AIOMOQT_LOG.
+    Exits with the error on a bad AIOMOQT_LOG. Returns the level."""
+    level = getattr(args, 'log_level', None)
+    if level is None and getattr(args, 'debug', False):
+        level = 'debug'
+    spec = ','.join(getattr(args, 'log', None) or ())
+    try:
+        return configure_logging(level=level and LEVELS[level],
+                                 spec=spec or None, default=default)
+    except ValueError as e:
+        raise SystemExit(f'error: {e}')
 
 
 def add_interval(p):

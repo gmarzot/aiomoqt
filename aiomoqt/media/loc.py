@@ -30,7 +30,7 @@ from ..delivery import StreamMapping
 from ..track import PublishedTrack, SubscribedTrack
 from ..types import ObjectStatus
 from ..utils.buffer import Buffer, BufferReadError
-from ..utils.logger import get_logger
+from ..utils.logger import TRACE, get_logger
 from ..utils.timing import OBJECT_TIMESTAMP
 
 logger = get_logger(__name__)
@@ -330,8 +330,8 @@ class LocTrackSubscriber(SubscribedTrack):
 
     def _reject(self, msg, group_id: int, why: str) -> None:
         self.objects_rejected += 1
-        logger.debug(f"LOC {self.trackname}: g{group_id} "
-                     f"o{msg.object_id} rejected: {why}")
+        logger.log(TRACE, f"LOC {self.trackname}: g{group_id} "
+                          f"o{msg.object_id} rejected: {why}")
         return None
 
     def _on_object(self, msg, size, recv_us, group_id, subgroup_id) -> None:

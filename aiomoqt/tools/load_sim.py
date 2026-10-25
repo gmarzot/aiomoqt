@@ -52,6 +52,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import math
 import random
 import signal
@@ -713,6 +714,7 @@ def parse_args(argv=None):
     p.add_argument("--logdir", default=None,
                    help="Per-process debug log directory")
     p.add_argument("-d", "--debug", action="store_true")
+    _cli.add_logging(p)
     _cli.add_help(p)
     args = p.parse_args(argv)
     return p, args
@@ -720,6 +722,7 @@ def parse_args(argv=None):
 
 def main():
     p, args = parse_args()
+    _cli.apply_logging(args, default=logging.INFO)
 
     if args.example:
         print(json.dumps(EXAMPLE_SCENARIO, indent=2))

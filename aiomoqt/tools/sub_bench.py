@@ -13,7 +13,6 @@ Usage:
 """
 import asyncio
 import contextlib
-import logging
 import os
 import sys
 import time
@@ -32,7 +31,7 @@ from aiomoqt.track import SubscribedTrack
 from aiomoqt.utils import wait_cond_timeout
 from aiomoqt.utils import cli as _cli
 from aiomoqt.utils.stats import TrackStats
-from aiomoqt.utils.logger import set_log_level, get_logger
+from aiomoqt.utils.logger import get_logger
 from aiomoqt.utils.url import parse_relay_url
 
 
@@ -154,6 +153,7 @@ examples:
         '--auth-token', type=str, default=None,
         help='Send this token as AUTH_TOKEN parameter on SUBSCRIBE '
              '(required by some relays)')
+    _cli.add_logging(parser)
     _cli.add_help(parser)
     return parser.parse_args()
 
@@ -172,9 +172,7 @@ def print_banner(relay, args):
 
 
 async def run(args):
-    log_level = (logging.DEBUG if args.debug
-                 else logging.WARNING)
-    set_log_level(log_level)
+    _cli.apply_logging(args)
 
     # AIOMOQT_TASK_DUMP=1 installs a SIGUSR1 handler that dumps every
     # asyncio task's stack to stderr. Useful for diagnosing hangs:

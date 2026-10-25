@@ -10,7 +10,6 @@ import argparse
 import asyncio
 import contextlib
 import functools
-import logging
 import sys
 
 from aiomoqt.client import MOQTClient
@@ -19,7 +18,6 @@ from aiomoqt.types import (ForwardingPreference, MOQTMessageType,
 from aiomoqt.track import PublishedTrack, VideoTrack
 from aiomoqt.utils import wait_cond_timeout
 from aiomoqt.utils import cli as _cli
-from aiomoqt.utils.logger import set_log_level
 from aiomoqt.utils.url import parse_relay_url
 
 
@@ -157,6 +155,7 @@ The URL scheme selects the transport:
                          help='Publish even Group and Object IDs only, '
                               'each Object with its Prior Group ID Gap or '
                               'Prior Object ID Gap property')
+    _cli.add_logging(parser)
     _cli.add_help(parser)
     args = parser.parse_args()
     if args.video and args.datagram:
@@ -204,8 +203,7 @@ def print_banner(relay, args):
 
 
 async def run(args):
-    log_level = logging.DEBUG if args.debug else logging.WARNING
-    set_log_level(log_level)
+    _cli.apply_logging(args)
 
     # AIOMOQT_TASK_DUMP=1 installs a SIGUSR1 handler that dumps every
     # asyncio task's stack to stderr. Useful for diagnosing hangs:

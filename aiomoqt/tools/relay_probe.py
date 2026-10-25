@@ -45,7 +45,8 @@ from aiomoqt.types import (
     moqt_version_from_draft,
     parse_draft_spec,
 )
-from aiomoqt.utils.cli import add_help, endpoint_url
+from aiomoqt.utils.cli import (add_help, add_logging, apply_logging,
+                               endpoint_url)
 from aiomoqt.utils.url import parse_relay_url
 
 logging.basicConfig(
@@ -381,6 +382,7 @@ def parse_args(argv=None):
         help="verbose handshake logging (DEBUG level on aiomoqt + "
              "relay-probe loggers). Off by default in --url mode so "
              "stdout stays clean for scripting.")
+    add_logging(p)
     add_help(p)
     return p.parse_args(argv)
 
@@ -415,16 +417,12 @@ async def _probe_single_url(url, timeout, debug=False, verify_tls=True):
     """One-shot probe: print one human-readable line per (draft, transport)
     combo. No JSON, no file I/O. Exits with code 0 if any draft was LIVE,
     else 1 — easy to wire into shell scripts."""
-    from aiomoqt.utils.logger import set_log_level
-    # Default quiet: only the one-line result reaches stdout. Suppress the
-    # aiomoqt + aiopquic connection logs (including handshake-failure
-    # WARNING/ERROR) — a failed probe is still reported on the printed ✗ line
-    # with its error code. --debug shows the full handshake.
+    # Quiet by default (cli() sets aiomoqt to CRITICAL): only the one-line
+    # result reaches stdout, a failed probe's error code on its ✗ line.
+    # --debug shows the full handshake.
     if debug:
-        set_log_level(logging.DEBUG)
         logging.getLogger("relay-probe").setLevel(logging.DEBUG)
     else:
-        set_log_level(logging.CRITICAL)
         logging.getLogger("relay-probe").setLevel(logging.WARNING)
         logging.getLogger("aiopquic").setLevel(logging.CRITICAL)
     global PROBE_TIMEOUT
@@ -469,10 +467,12 @@ def _cli():
             # Probe each listed draft individually, in the given order.
             drafts = spec if isinstance(spec, list) else [spec]
             DRAFT_FILTER = [(f"draft-{d}", d) for d in drafts]
+    level = apply_logging(
+        args, default=logging.CRITICAL if args.url else logging.INFO)
     if args.url:
         # Single-URL mode: skip the relays-file / output-file machinery.
         rc = asyncio.run(_probe_single_url(
-            args.url, args.timeout, debug=args.debug,
+            args.url, args.timeout, debug=level <= logging.DEBUG,
             verify_tls=VERIFY_TLS))
         raise SystemExit(rc)
     # CLI overrides env overrides hard default. Rebinding module-level

@@ -42,7 +42,6 @@ import asyncio
 import contextlib
 import functools
 import json
-import logging
 import math
 import os
 import signal
@@ -72,7 +71,6 @@ from aiomoqt.media.sources import (
 )
 from aiomoqt.track import TrackState
 from aiomoqt.utils import cli as _cli
-from aiomoqt.utils.logger import set_log_level
 from aiomoqt.utils.timing import MediaTimestamps
 from aiomoqt.utils.workers import apply_compat
 from aiomoqt.utils.url import parse_relay_url
@@ -239,6 +237,7 @@ def parse_args():
     _cli.add_session(parser)
     _cli.add_keepalive(parser, default=10)
     _cli.add_compat(parser)
+    _cli.add_logging(parser)
     _cli.add_help(parser)
     args = parser.parse_args()
     if sum(bool(s) for s in (args.mp4, args.h264, args.ts, args.input)) > 1:
@@ -950,7 +949,7 @@ async def run(args):
 
 async def _run(args, events: Optional[_MttEvents]) -> str:
     """The run; 'duration' or 'signal' for how it ended."""
-    set_log_level(logging.DEBUG if args.debug else logging.WARNING)
+    _cli.apply_logging(args)
     libquicr = apply_compat(getattr(args, 'compat', ''))
     urls = args.url if isinstance(args.url, list) else [args.url]
     relays = [parse_relay_url(u) for u in urls]

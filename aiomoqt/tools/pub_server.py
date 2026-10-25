@@ -14,7 +14,6 @@ Usage:
 """
 import argparse
 import asyncio
-import logging
 import os
 import signal
 
@@ -24,7 +23,7 @@ from aiomoqt.types import (D18MessageType, MOQT_DEFAULT_DRAFTS, MOQTMessageType,
 from aiomoqt.track import PublishedTrack
 from aiomoqt.types import ForwardingPreference
 from aiomoqt.utils import cli as _cli
-from aiomoqt.utils.logger import set_log_level, get_logger
+from aiomoqt.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -124,6 +123,7 @@ def parse_args():
         help='Congestion control algorithm '
              '(bbr | bbr1 | newreno | cubic | dcubic | prague | fast). '
              'Default: aiopquic default (bbr1)')
+    _cli.add_logging(parser)
     _cli.add_help(parser)
     parser.add_argument(
         '-D', '--datagram', action='store_true',
@@ -231,8 +231,7 @@ async def main():
     from functools import partial
 
     args = parse_args()
-    log_level = logging.DEBUG if args.debug else logging.WARNING
-    set_log_level(log_level)
+    _cli.apply_logging(args)
 
     # AIOMOQT_TASK_DUMP=1 installs a SIGUSR1 handler that dumps every
     # asyncio task's stack to stderr. Useful for diagnosing hangs:

@@ -10,7 +10,6 @@ Usage:
 """
 import argparse
 import asyncio
-import logging
 import sys
 
 from aiomoqt.types import MOQTMessageType, parse_draft_spec
@@ -20,7 +19,6 @@ from aiomoqt.track import PublishedTrack, SubscribedTrack
 from aiomoqt.types import ForwardingPreference
 from aiomoqt.utils import cli as _cli
 from aiomoqt.utils import wait_cond_timeout
-from aiomoqt.utils.logger import set_log_level
 from aiomoqt.tools.sub_bench import BenchReporter
 
 
@@ -131,6 +129,7 @@ def parse_args():
              'at stream rollover while total un-transmitted TX bytes '
              'exceed this. Steady-state latency ~ value / throughput. '
              'Default: aiopquic default (4 MiB). Pass 0 to disable.')
+    _cli.add_logging(parser)
     _cli.add_help(parser)
     _cli.add_timestamps(parser)
     _cli.add_timestamp_checking(parser)
@@ -276,8 +275,7 @@ async def run_subscriber(args, stats):
 
 async def main():
     args = parse_args()
-    log_level = logging.DEBUG if args.debug else logging.WARNING
-    set_log_level(log_level)
+    _cli.apply_logging(args)
 
     # AIOMOQT_TASK_DUMP=1 installs SIGUSR1 (task stacks) + SIGUSR2
     # (aiopquic counters) handlers. No-op when env not set.
