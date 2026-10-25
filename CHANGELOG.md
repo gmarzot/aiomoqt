@@ -2,6 +2,7 @@
 
 ## v0.14.0
 
+- Relay `--workers N` and `MOQTServer(workers=N)`: N picoquic worker threads share the port, each with its own connections (Linux; needs aiopquic `workers=`).
 - Data streams: an object spanning several chunks is parsed once its bytes have arrived, not again on every chunk.
 - d20/d22 FILL_PARAMETERS: a Length-prefixed value is read as a counted block when one ends exactly at the Length, else as bare parameters (moxygen's form), so a counted block of ten or more parameters decodes.
 - DEBUG logs no longer report each received stream data chunk, or the QUIC handshake completing, as an unhandled QUIC event.

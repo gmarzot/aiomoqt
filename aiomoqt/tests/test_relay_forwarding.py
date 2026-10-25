@@ -7,8 +7,12 @@ that decides which publisher a SUBSCRIBE reaches.
 """
 import asyncio
 import contextlib
+import inspect
+import sys
 
 import pytest
+from aiopquic._binding._transport import TransportContext
+from aiopquic.asyncio.server import serve as aiopquic_serve
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
@@ -491,14 +495,16 @@ def _relayed(name):
 
 
 @contextlib.asynccontextmanager
-async def _flowing(port, use_quic, draft=18):
+async def _flowing(port, use_quic, draft=18, workers=1):
     """A relay with video and audio PUBLISHed on one session, two groups
     of each already published (Largest {1, 4}). Yields a coroutine that
     opens a subscriber session and returns (session, objects), mapping
-    each track name to the (group, object) Locations received."""
+    each track name to the (group, object) Locations received; its
+    `server` and `handle` attributes are the relay's."""
     _reset_relay_state()
     server = relay._build_server("localhost", port, CERT, KEY,
-                                 use_quic=use_quic, draft=draft)
+                                 use_quic=use_quic, draft=draft,
+                                 workers=workers)
     handle = await server.serve()
     by_size = {size: name for name, size in _SIZES.items()}
     try:
@@ -536,6 +542,8 @@ async def _flowing(port, use_quic, draft=18):
                 s.on_object_received = _on_object
                 return s, objects
 
+            _subscriber.server = server
+            _subscriber.handle = handle
             yield _subscriber
     finally:
         handle.close()
@@ -561,6 +569,50 @@ async def test_published_tracks_reach_subscribers_at_d20_and_d22(draft,
             await asyncio.sleep(0.02)
         assert all(objects[n] for n in _SIZES), objects
         assert rx._close_err is None
+
+
+_HAS_WORKERS = (sys.platform.startswith("linux")
+                and "workers" in inspect.signature(aiopquic_serve).parameters)
+
+
+def _worker_of(session):
+    """id() of the TransportContext (worker) a server session runs on."""
+    for obj in (session, getattr(session, "_quic", None)):
+        transport = getattr(obj, "_transport", None)
+        if isinstance(transport, TransportContext):
+            return id(transport)
+    return None
+
+
+@requires_certs
+@pytest.mark.asyncio
+@_TRANSPORTS
+@pytest.mark.skipif(not _HAS_WORKERS, reason="needs aiopquic workers=")
+async def test_two_workers_fan_out_to_subscribers_on_both(use_quic):
+    # The publisher's session sits on one worker; subscribers are added
+    # until the kernel's 4-tuple hash has put sessions on both.
+    async with _flowing(_flow_port(15, use_quic), use_quic,
+                        workers=2) as subscriber:
+        workers = {id(t) for t in subscriber.handle.transports}
+        assert len(workers) == 2
+        subs = []
+        for _ in range(16):
+            rx, objects = await subscriber()
+            for name in _SIZES:
+                await rx.subscribe(_FLOW_NS, name, forward=1,
+                                   wait_response=True)
+            subs.append((rx, objects))
+            on = {_worker_of(s) for s in subscriber.server._live}
+            if len(subs) >= 2 and on == workers:
+                break
+        assert {_worker_of(s) for s in subscriber.server._live} == workers
+        for _ in range(150):
+            if all(objects[n] for _, objects in subs for n in _SIZES):
+                break
+            await asyncio.sleep(0.02)
+        assert all(objects[n] for _, objects in subs for n in _SIZES), \
+            [objects for _, objects in subs]
+        assert all(rx._close_err is None for rx, _ in subs)
 
 
 @requires_certs
@@ -1025,10 +1077,12 @@ async def test_relay_flags_reach_the_server(monkeypatch):
     transport = relay.transport_settings(relay.parse_args())
     assert transport == {"congestion_control_algorithm": "cubic",
                          "max_connections": 4096,
+                         "workers": 1,
                          "stream_ring_cap": 1 << 20,
                          "tx_max_inflight_bytes": 512 << 10}
     server = relay._build_server("localhost", 0, CERT, KEY, True, 18,
                                  **transport)
     assert (server.congestion_control_algorithm, server.max_connections,
-            server.stream_ring_cap, server.tx_max_inflight_bytes) == (
-                "cubic", 4096, 1 << 20, 512 << 10)
+            server.workers, server.stream_ring_cap,
+            server.tx_max_inflight_bytes) == (
+                "cubic", 4096, 1, 1 << 20, 512 << 10)

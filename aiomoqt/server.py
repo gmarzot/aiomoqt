@@ -83,6 +83,7 @@ class MOQTServer(MOQTPeer):
         socket_buffer_size: Optional[int] = None,
         stream_ring_cap: Optional[int] = None,
         max_connections: Optional[int] = None,
+        workers: int = 1,
         implementation: Optional[str] = USER_AGENT,
         quiet_peers: Iterable[str] = (),
         max_filter_ranges: int = 0,
@@ -126,6 +127,9 @@ class MOQTServer(MOQTPeer):
         # Most connections held at once (aiopquic >= 0.5.1). None =
         # aiopquic default (256).
         self.max_connections = max_connections
+        # picoquic contexts sharing the port, one network thread each
+        # (aiopquic workers=, Linux).
+        self.workers = int(workers)
         # Sessions whose peer's SETUP names an implementation starting
         # with one of these log below WARNING at DEBUG (a health probe's
         # sessions, say).
@@ -177,6 +181,7 @@ class MOQTServer(MOQTPeer):
                 self.host, self.port,
                 configuration=cfg,
                 create_protocol=protocol,
+                **self._worker_args(),
             )
 
         # WebTransport mode (use_quic=False): serve_webtransport with
@@ -230,6 +235,7 @@ class MOQTServer(MOQTPeer):
             session_factory=factory,
             configuration=wt_cfg,
             wt_supported_protocols=wt_supported,
+            **self._worker_args(),
         )
 
     def serve_dual(self) -> Coroutine[Any, Any, Any]:
@@ -284,7 +290,12 @@ class MOQTServer(MOQTPeer):
             wt_handler=wt_handler,
             wt_session_factory=wt_factory,
             wt_supported_protocols=wt_supported,
+            **self._worker_args(),
         )
+
+    def _worker_args(self) -> dict:
+        # Omitted at 1, so an aiopquic without workers= still serves.
+        return {"workers": self.workers} if self.workers != 1 else {}
 
     def _adopt(self, session):
         self._live.add(session)
