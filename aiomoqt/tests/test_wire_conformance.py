@@ -1771,8 +1771,9 @@ def test_d16_zero_delivery_timeout_track_property_is_a_protocol_violation():
 # Track Properties: TIMESCALE 0x2C7A51E0, CLOCK_ID 0x3E8D2B70 and
 # TIMESTAMP_ORIGIN 0x31B49A6E are even (bare integer); TIMESTAMP_MAPPING
 # 0x27F308C5 is odd (length-prefixed), holding four integers. Object
-# Property OBJECT_TIMESTAMP 0x2D1A (even). Integers follow the session:
-# RFC 9000 varints at d16, vi64 from d18. Types are delta-coded.
+# Property OBJECT_TIMESTAMP 0x2D1A (even). Key-Value-Pair framing follows the
+# session (RFC 9000 varints at d16, vi64 from d18); TIMESTAMP_MAPPING's four
+# integers are vi64 at every draft. Types are delta-coded.
 
 from types import SimpleNamespace  # noqa: E402
 
@@ -1798,8 +1799,12 @@ def _ref_delta_kvps(draft, pairs):
     return out
 
 
-def _ref_mapping(draft, *ints):
-    return b"".join(_ref_vint(draft, i) for i in ints)
+def _ref_mapping(*ints):
+    return b"".join(ref_vi64(i) for i in ints)
+
+
+def _ref_mapping_rfc9000(*ints):
+    return b"".join(ref_rfc9000(i) for i in ints)
 
 
 def _track_timing(draft, kind, pairs):
@@ -1816,21 +1821,35 @@ _FRINDELL_DRAFTS = [16, 18]
 @pytest.mark.parametrize("draft", _FRINDELL_DRAFTS)
 def test_frindell_track_properties_decode(draft, kind):
     base_ts = _W * 30000 // 1_000_000
-    mapping = _ref_mapping(draft, 5, base_ts, 60060, 1001)
+    mapping = _ref_mapping(5, base_ts, 60060, 1001)
     t = _track_timing(draft, kind, [
         (TIMESTAMP_MAPPING, mapping), (TIMESCALE, 30000),
         (TIMESTAMP_ORIGIN, 0), (CLOCK_ID, 0)])
     assert (t.timescale, t.clock_id, t.origin) == (30000, 0, 0)
     assert t.mapping == (5, base_ts, 60060, 1001)
     # The encoder writes the same value bytes.
-    assert encode_mapping(5, base_ts, 60060, 1001,
-                          profile_for(draft).vi64) == mapping
+    assert encode_mapping(5, base_ts, 60060, 1001) == mapping
+
+
+@pytest.mark.parametrize("draft", _FRINDELL_DRAFTS)
+def test_frindell_mapping_rfc9000_form_read_at_d16_only(draft):
+    # Older peers wrote the mapping in the session's encoding.
+    base_ts = _W * 30000 // 1_000_000
+    legacy = _ref_mapping_rfc9000(5, base_ts, 60060, 1001)
+    assert legacy != _ref_mapping(5, base_ts, 60060, 1001)
+    pairs = [(TIMESTAMP_MAPPING, legacy), (TIMESCALE, 30000)]
+    if draft < 18:
+        t = _track_timing(draft, "subscribe_ok", pairs)
+        assert t.mapping == (5, base_ts, 60060, 1001)
+    else:
+        with pytest.raises(TimestampMalformed, match="four integers"):
+            _track_timing(draft, "subscribe_ok", pairs)
 
 
 @pytest.mark.parametrize("draft", _FRINDELL_DRAFTS)
 def test_frindell_track_properties_encode_exact_bytes(draft):
     vi64 = profile_for(draft).vi64
-    mapping = encode_mapping(0, 7, 1000, 10, vi64)
+    mapping = encode_mapping(0, 7, 1000, 10)
     track = PublishedTrack(None, namespace="n", trackname="t",
                            track_properties={TIMESCALE: 1000,
                                              TIMESTAMP_MAPPING: mapping})
@@ -1839,7 +1858,7 @@ def test_frindell_track_properties_encode_exact_bytes(draft):
     MOQTMessage._extensions_encode(buf, track._track_properties(s),
                                    with_length=False, delta=True)
     assert bytes(buf.data_slice(0, buf.tell())) == _ref_delta_kvps(draft, [
-        (TIMESTAMP_MAPPING, _ref_mapping(draft, 0, 7, 1000, 10)),
+        (TIMESTAMP_MAPPING, _ref_mapping(0, 7, 1000, 10)),
         (TIMESCALE, 1000)])
 
 
@@ -1849,8 +1868,7 @@ def test_frindell_track_properties_encode_exact_bytes(draft):
     "no-timescale", "origin-without-clock", "mapping-3", "mapping-5",
     "mapping-trailing-byte", "mapping-truncated"])
 def test_malformed_frindell_track_properties(draft, case):
-    v = lambda x: _ref_vint(draft, x)  # noqa: E731
-    four = _ref_mapping(draft, 0, 1, 2, 3)
+    four = _ref_mapping(0, 1, 2, 3)
     pairs, why = {
         "duplicate-timescale": ([(TIMESCALE, 1000), (TIMESCALE, 1000)],
                                 "more than once"),
@@ -1862,15 +1880,15 @@ def test_malformed_frindell_track_properties(draft, case):
         "origin-without-clock": ([(TIMESCALE, 1000),
                                   (TIMESTAMP_ORIGIN, 9)],
                                  "without CLOCK_ID"),
-        "mapping-3": ([(TIMESTAMP_MAPPING, _ref_mapping(draft, 0, 1, 2)),
+        "mapping-3": ([(TIMESTAMP_MAPPING, _ref_mapping(0, 1, 2)),
                        (TIMESCALE, 1000)], "four integers"),
-        "mapping-5": ([(TIMESTAMP_MAPPING, four + v(4)),
+        "mapping-5": ([(TIMESTAMP_MAPPING, four + ref_vi64(4)),
                        (TIMESCALE, 1000)], "four integers"),
         "mapping-trailing-byte": ([(TIMESTAMP_MAPPING, four + b"\x00"),
                                    (TIMESCALE, 1000)], "four integers"),
         # A multi-byte integer cut short inside the value.
         "mapping-truncated": ([(TIMESTAMP_MAPPING,
-                                _ref_mapping(draft, 0, 1, 2) + v(1 << 20)[:1]),
+                                _ref_mapping(0, 1, 2) + ref_vi64(1 << 20)[:1]),
                                (TIMESCALE, 1000)], "four integers"),
     }[case]
     with pytest.raises(TimestampMalformed, match=why):
