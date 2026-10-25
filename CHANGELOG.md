@@ -2,6 +2,10 @@
 
 ## v0.14.0
 
+- Data streams: an object spanning several chunks is parsed once its bytes have arrived, not again on every chunk.
+- d20/d22 FILL_PARAMETERS: a Length-prefixed value is read as a counted block when one ends exactly at the Length, else as bare parameters (moxygen's form), so a counted block of ten or more parameters decodes.
+- DEBUG logs no longer report each received stream data chunk, or the QUIC handshake completing, as an unhandled QUIC event.
+- loopback_bench and sub_bench print the interval still open when the run ends, so `-t N` reports through second N.
 - Logging: a TRACE level below DEBUG holds per-object, per-chunk and wire-hex detail; category loggers `aiomoqt.control`, `.data`, `.fetch`, `.transport`, `.relay`; tools take `--log-level` and `--log CAT=LEVEL`, `AIOMOQT_LOG` the same spec; the relay's SIGUSR1 steps INFO, DEBUG, TRACE.
 
 ## v0.13.3

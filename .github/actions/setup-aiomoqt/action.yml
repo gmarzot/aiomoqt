@@ -144,3 +144,9 @@ runs:
         else
           pip install -e .
         fi
+        # A pinned dev build's scm version can sit below the aiopquic floor,
+        # so the install above may have replaced it from PyPI: put it back.
+        if [ "${{ steps.pin.outputs.pinned }}" = "true" ]; then
+          pip install --force-reinstall --no-deps "$GITHUB_WORKSPACE"/.aiopquic-wheel/aiopquic-*.whl
+        fi
+        python -m aiomoqt.versions
