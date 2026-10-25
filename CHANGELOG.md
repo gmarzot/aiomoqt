@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.14.0
+
+- loopback_bench and sub_bench print the interval still open when the run ends, so `-t N` reports through second N.
+
 ## v0.13.3
 
 - FETCH at d16 and d18: objects carry no Object Status and status objects are not sent. aiomoqt 0.13.2 and earlier send one, so a FETCH from such a publisher that includes a status object does not parse.
