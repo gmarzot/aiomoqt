@@ -39,7 +39,7 @@ Routing model (cross-session, single relay instance):
 Run on UDP/4443 with the runner's /certs convention:
 
   python -m aiomoqt.tools.moq_interop_relay \\
-      --bind 0.0.0.0 --port 4443 \\
+      --port 4443 \\
       --cert /certs/cert.pem --key /certs/priv.key
 
 Transports: WebTransport by default, raw QUIC with `--quic`, or BOTH
@@ -67,7 +67,7 @@ from collections import Counter
 from types import SimpleNamespace
 
 from aiomoqt.client import MOQTClient
-from aiomoqt.server import MOQTServer
+from aiomoqt.server import MOQTServer, _listen_desc
 from aiomoqt.types import (
     MOQT_DEFAULT_DRAFTS, D18MessageType, FilterType, GroupOrder, MOQTDraft,
     MOQTMessageType, MOQTRequestError, MOQTStreamStopped, ObjectStatus,
@@ -2384,8 +2384,8 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--bind", type=str, default="0.0.0.0",
-                        help="Bind address (default: 0.0.0.0)")
+    parser.add_argument("--bind", type=str, default=None,
+                        help="Bind address (default: all interfaces, IPv4 and IPv6)")
     parser.add_argument("--port", type=int, default=4443,
                         help="UDP listen port (default: 4443)")
     parser.add_argument("--cert", type=str, default=None,
@@ -3944,7 +3944,7 @@ async def main():
         file=sys.stderr,
     )
     for _server, port, label in listeners:
-        print(f"Listening on all interfaces, UDP port {port} "
+        print(f"Listening on {_listen_desc(args.bind)}, UDP port {port} "
               f"({label}, draft-{args.draft})", file=sys.stderr)
     if args.watchdog > 0:
         print(f"Watchdog: self-probe every {args.watchdog:g}s, exit after "

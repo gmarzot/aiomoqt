@@ -122,8 +122,8 @@ def add_listener(p, port=4433):
                    help='Serve H3/WebTransport (default if neither -Q '
                         'nor -W given). With -Q, serves both on one '
                         'port via per-connection ALPN dispatch.')
-    p.add_argument('--bind', type=str, default='localhost',
-                   help='Bind address (default: localhost)')
+    p.add_argument('--bind', type=str, default=None,
+                   help='Bind address (default: all interfaces, IPv4 and IPv6)')
     p.add_argument('-p', '--port', type=int, default=port,
                    help=f'Listen port (default: {port})')
     p.add_argument('--path', type=str, default='/',

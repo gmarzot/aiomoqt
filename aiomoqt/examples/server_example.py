@@ -10,8 +10,8 @@ from aiomoqt.utils.logger import get_logger, set_log_level
 
 def parse_args():
     parser = argparse.ArgumentParser(description='MOQT WebTransport Server', add_help=False)
-    parser.add_argument('--bind', dest='host', type=str, default='localhost',
-                        help='Bind address (default: localhost)')
+    parser.add_argument('--bind', dest='host', type=str, default=None,
+                        help='Bind address (default: all interfaces, IPv4 and IPv6)')
     parser.add_argument('-p', '--port', type=int, default=4433,
                         help='Listen port (default: 4433)')
     parser.add_argument('-Q', '--quic', action='store_true',

@@ -53,8 +53,8 @@ def parse_args():
         epilog=__doc__,
     )
     parser.add_argument(
-        '--bind', dest='host', type=str, default='localhost',
-        help='Bind address (default: localhost)')
+        '--bind', dest='host', type=str, default=None,
+        help='Bind address (default: all interfaces, IPv4 and IPv6)')
     parser.add_argument(
         '-p', '--port', type=int, default=4434,
         help='Listen port (default: 4434)')
