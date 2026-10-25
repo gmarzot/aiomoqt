@@ -660,3 +660,41 @@ async def test_platform_written_less_often_than_status(
     assert written[:2] == ["status.json", "platform.json"]
     assert written.count("platform.json") <= 2
     assert written.count("status.json") >= 6
+
+
+def _tick(status, rows):
+    """One status tick carrying these track rows."""
+    status.history.add({"t": time.time()})
+    status._add_track_history([(None, r) for r in rows])
+
+
+def _row(tid, subs=1):
+    return {"id": tid, "subscribers": subs, "in_bps": 1000, "out_bps": 1000 * subs}
+
+
+def test_live_tracks_take_history_slots_from_ended_ones(tmp_path):
+    # Ended tracks keep their history only while slots are free: a live
+    # track takes the slot of the track gone longest.
+    status = relay._Status(str(tmp_path / "status.json"), {"started": time.time()})
+    cap = relay.TRACK_HISTORY_MAX
+    old = [_row(f"old\x1f{i}") for i in range(cap)]
+    _tick(status, old)
+    _tick(status, old[1:])
+    _tick(status, [])
+    new = [_row(f"new\x1f{i}", subs=i % 2) for i in range(3)]
+    _tick(status, new)
+    hist = status.track_history
+    assert len(hist) == cap
+    assert all(r["id"] in hist for r in new)
+    assert "old\x1f0" not in hist
+    assert list(hist["new\x1f1"]["subscribers"])[-1] == 1
+
+
+def test_live_tracks_keep_their_slots(tmp_path):
+    status = relay._Status(str(tmp_path / "status.json"), {"started": time.time()})
+    cap = relay.TRACK_HISTORY_MAX
+    live = [_row(f"live\x1f{i}") for i in range(cap)]
+    _tick(status, live)
+    _tick(status, live + [_row("late")])
+    assert len(status.track_history) == cap
+    assert "late" not in status.track_history

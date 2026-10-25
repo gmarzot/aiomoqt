@@ -3334,7 +3334,7 @@ _PLATFORM_KEYS = ("t", "cpu", "cpu_user", "cpu_nice", "cpu_system",
                   "udp_errors", "sock_drops", "sock_rx_queue",
                   "disk_read_Bps", "disk_write_Bps", "psi_cpu", "psi_io",
                   "psi_memory", "ctxt_per_s", "lag_p99_ms")
-# Tracks with their own history; later ones go without until one ends.
+# Tracks with their own history; a present track takes an ended one's slot.
 TRACK_HISTORY_MAX = 24
 # Subscribers listed per track.
 TRACK_SUBSCRIBERS_MAX = 50
@@ -3623,22 +3623,42 @@ class _Status:
 
     def _add_track_history(self, tracks) -> None:
         """One point per tracked track, None for one absent this tick; a
-        track absent for the whole window is dropped."""
+        track absent for the whole window is dropped. With every slot
+        taken, a present track (subscribed ones first) takes the slot of
+        the track absent longest."""
         length = self.history.length
         filled = len(self.history.series["t"])
         now = {row["id"]: row for _, row in tracks}
-        for tid, row in now.items():
-            if (tid not in self.track_history
-                    and len(self.track_history) < TRACK_HISTORY_MAX):
-                self.track_history[tid] = {
-                    k: deque([None] * (filled - 1), maxlen=length)
-                    for k in ("subscribers", "in_bps", "out_bps")}
+        for tid in sorted(now, key=lambda t: -(now[t]["subscribers"] or 0)):
+            if tid in self.track_history:
+                continue
+            if len(self.track_history) >= TRACK_HISTORY_MAX:
+                gone = self._longest_gone(now)
+                if gone is None:
+                    continue
+                del self.track_history[gone]
+            self.track_history[tid] = {
+                k: deque([None] * (filled - 1), maxlen=length)
+                for k in ("subscribers", "in_bps", "out_bps")}
         for tid, series in list(self.track_history.items()):
             row = now.get(tid)
             for k, col in series.items():
                 col.append(None if row is None else row[k])
             if row is None and all(v is None for v in series["subscribers"]):
                 del self.track_history[tid]
+
+    def _longest_gone(self, now):
+        """The tracked track absent from `now` for the most ticks, or None."""
+        def absent(tid):
+            col = self.track_history[tid]["subscribers"]
+            ticks = 0
+            for v in reversed(col):
+                if v is not None:
+                    break
+                ticks += 1
+            return ticks
+        gone = [tid for tid in self.track_history if tid not in now]
+        return max(gone, key=absent, default=None)
 
     def _platform(self, wall: float, host: dict, totals: dict,
                   lag: dict) -> dict:
