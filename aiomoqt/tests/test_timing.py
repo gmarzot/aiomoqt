@@ -34,7 +34,7 @@ def test_zigzag_order(v, u):
 def test_mapped_track_takes_schedule_plus_correction(vi64):
     # 30 fps at 30000 ticks/s, 60-object groups, anchored at wall W.
     t = _timing({TIMESCALE: 30000, TIMESTAMP_MAPPING: encode_mapping(
-        10, W * 30000 // 1_000_000, 60060, 1001, vi64)}, vi64)
+        10, W * 30000 // 1_000_000, 60060, 1001)}, vi64)
     sched = W + (2 * 60060 + 3 * 1001) * 1_000_000 // 30000
     assert capture_time_us(t, 12, 3, None) == (sched, SOURCE_FRINDELL)
     late = {OBJECT_TIMESTAMP: zigzag_encode(30)}       # +1 ms
@@ -119,7 +119,7 @@ def test_track_stats_counts_malformed_timestamps():
 
 def test_media_analysis_reports_frindell_latency_and_source():
     timing = _timing({TIMESCALE: 48000, TIMESTAMP_MAPPING: encode_mapping(
-        0, W * 48000 // 1_000_000, 960, 0, True)})
+        0, W * 48000 // 1_000_000, 960, 0)})
     a = MediaAnalysis(timing_of=lambda name: timing)
     a.add_track('audio', role='audio')
     a.start(W)

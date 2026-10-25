@@ -1256,9 +1256,6 @@ def _forget_session(session) -> None:
                 not _announced[ns]:
             del _announced[ns]
             _retract_namespace(ns)
-            # This session's own prefix subscriptions were dropped just
-            # above, so this reaches the observers that remain.
-            _retract_namespace(ns)
     for key, track in list(_tracks.items()):
         track.drop_session(session)
         if _upstream_session(track) is session or (
