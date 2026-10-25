@@ -48,10 +48,10 @@ def test_malformed_track_properties(vi64, props, dups, why):
     props = dict(props)
     raw = props.get(TIMESTAMP_MAPPING)
     if raw is not None:
-        four = encode_mapping(0, 1, 2, 3, vi64)
+        four = encode_mapping(0, 1, 2, 3)
         props[TIMESTAMP_MAPPING] = {
             "3": four[:-1], "5": four + four[-1:], "trail": four + b"\xff",
-            "cut": four[:-1] + (b"\xc0" if not vi64 else b"\xff")}[raw]
+            "cut": four[:-1] + b"\xff"}[raw]
     with pytest.raises(TimestampMalformed, match=why):
         TrackTiming.from_properties(props, vi64, dups)
 
