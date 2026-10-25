@@ -320,7 +320,7 @@ python -m aiomoqt.tools.moq_interop_client -l                                   
 Limits: no authentication, authorization or rate limiting; unbounded per-track forwarding queues; upstream Forward State is raised, never lowered; no delivery timeout. Written in Python, it carries less traffic than the Rust and C++ relays. Because the relay re-encodes everything it forwards, a conformance client checking those objects is checking aiomoqt's encoder, not merely its routing.
 
 ```bash
-aiomoqt-relay --bind 0.0.0.0 --port 4443 \
+aiomoqt-relay --port 4443 \
     --cert cert.pem --key key.pem --dual     # raw QUIC + WT on one port
 ```
 

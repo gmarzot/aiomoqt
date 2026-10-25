@@ -393,7 +393,8 @@ def _build_server(bind, port, cert, key, use_quic, draft):
 def parse_args():
     ap = argparse.ArgumentParser(description="moqtest origin (SUT)",
                                  add_help=False)
-    ap.add_argument("--bind", default="0.0.0.0")
+    ap.add_argument("--bind", default=None,
+                    help="Bind address (default: all interfaces, IPv4 and IPv6)")
     ap.add_argument("--port", type=int, default=4443)
     ap.add_argument("--cert")
     ap.add_argument("--key")

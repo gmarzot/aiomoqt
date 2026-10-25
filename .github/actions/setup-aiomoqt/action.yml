@@ -147,6 +147,12 @@ runs:
         # A pinned dev build's scm version can sit below the aiopquic floor,
         # so the install above may have replaced it from PyPI: put it back.
         if [ "${{ steps.pin.outputs.pinned }}" = "true" ]; then
-          pip install --force-reinstall --no-deps "$GITHUB_WORKSPACE"/.aiopquic-wheel/aiopquic-*.whl
+          whl=$(ls "$GITHUB_WORKSPACE"/.aiopquic-wheel/aiopquic-*.whl)
+          pip install --force-reinstall --no-deps "$whl"
+          want=$(unzip -p "$whl" '*.dist-info/METADATA' | sed -n 's/^Version: //p')
+          have=$(python -c 'import importlib.metadata as m; print(m.version("aiopquic"))')
+          if [ "$want" != "$have" ]; then
+            echo "::error::installed aiopquic $have is not the pinned build $want"; exit 1
+          fi
         fi
         python -m aiomoqt.versions

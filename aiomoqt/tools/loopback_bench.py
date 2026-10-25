@@ -73,8 +73,8 @@ def parse_args():
              'without the measurement in it.')
     parser.add_argument(
         '--bind', type=str, default='localhost',
-        help='Address the subscriber dials; the publisher listens on '
-             'all interfaces (default: localhost)')
+        help='Address the publisher listens on and the subscriber '
+             'dials (default: localhost)')
     parser.add_argument(
         '-p', '--port', type=int, default=4434,
         help='Local port (default: 4434)')

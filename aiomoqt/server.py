@@ -1,6 +1,5 @@
 import asyncio
 import errno
-import ipaddress
 import socket
 import weakref
 from asyncio.futures import Future
@@ -21,27 +20,20 @@ from .utils.logger import *
 logger = get_logger(__name__)
 
 
-def _is_loopback(host: str) -> bool:
-    if host == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
+_WILDCARDS = (None, "", "::", "0.0.0.0")
 
 
-def _check_udp_port_free(host: str, port: int) -> None:
-    """Fail before the transport thread swallows EADDRINUSE. The transport
-    binds every interface (aiopquic takes no bind address), so probe
-    0.0.0.0 and say so when a narrower host was requested."""
-    if port == 0:
+def _listen_desc(host: Optional[str]) -> str:
+    if host in (None, "", "::"):
+        return "all interfaces"
+    return "all IPv4 interfaces" if host == "0.0.0.0" else host
+
+
+def _check_udp_port_free(host: Optional[str], port: int) -> None:
+    """Fail before the transport thread swallows EADDRINUSE on a wildcard
+    bind; aiopquic checks a specific host itself."""
+    if port == 0 or host not in _WILDCARDS:
         return
-    if host not in ("", "0.0.0.0"):
-        # A loopback request still works, it is only also exposed; a
-        # named interface silently widening is the surprising case.
-        report = logger.info if _is_loopback(host) else logger.warning
-        report(f"MOQT server: the transport takes no bind address; "
-               f"{host} requested, listening on 0.0.0.0:{port}")
     probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         probe.bind(("0.0.0.0", port))
@@ -49,7 +41,8 @@ def _check_udp_port_free(host: str, port: int) -> None:
         raise OSError(f"UDP port {port} unavailable: {e.strerror}") from e
     finally:
         probe.close()
-    _warn_if_ipv6_port_taken(port)
+    if host != "0.0.0.0":
+        _warn_if_ipv6_port_taken(port)
 
 
 def _warn_if_ipv6_port_taken(port: int) -> None:
@@ -75,7 +68,7 @@ class MOQTServer(MOQTPeer):
     """Server-side session manager."""
     def __init__(
         self,
-        host: str,
+        host: Optional[str],
         port: int,
         certificate: str,
         private_key: str,
@@ -147,7 +140,8 @@ class MOQTServer(MOQTPeer):
 
     def serve(self) -> Coroutine[Any, Any, Any]:
         """Start the MOQT server."""
-        logger.info(f"Starting MOQT server on {self.host}:{self.port}")
+        logger.info(f"Starting MOQT server on {_listen_desc(self.host)}, "
+                    f"UDP port {self.port}")
         _check_udp_port_free(self.host, self.port)
 
         if self.use_quic:
@@ -245,7 +239,8 @@ class MOQTServer(MOQTPeer):
         per-draft MoQT ALPNs; WT connections via WT-Protocol. Replaces
         the two-listener --quic-port arrangement."""
         logger.info(
-            f"Starting dual-stack MOQT server on {self.host}:{self.port}")
+            f"Starting dual-stack MOQT server on {_listen_desc(self.host)}, "
+            f"UDP port {self.port}")
         _check_udp_port_free(self.host, self.port)
         cfg = QuicConfiguration(
             alpn_protocols=[moqt_alpn_for_version(d)
