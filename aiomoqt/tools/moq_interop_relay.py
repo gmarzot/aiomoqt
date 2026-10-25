@@ -3748,6 +3748,7 @@ def transport_settings(args) -> dict:
             "congestion_control_options": args.cc_options,
             "packet_train_mode": args.pacing_trains,
             "max_connections": args.max_connections,
+            "workers": args.workers,
             "stream_ring_cap": args.stream_ring_cap,
             "tx_max_inflight_bytes": args.max_inflight_bytes}
 
@@ -3883,6 +3884,10 @@ def parse_args(argv=None):
     parser.add_argument("--max-connections", type=int, default=4096,
                         help="Most connections held at once (aiopquic "
                              ">= 0.5.1). Default: 4096")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="picoquic worker threads sharing the port, "
+                             "each with its own connections (Linux, "
+                             "aiopquic with workers=). Default: 1")
     parser.add_argument("--stream-ring-cap", type=int, default=1 << 20,
                         metavar="BYTES",
                         help="Per-stream send buffer, allocated whole for "
@@ -4784,31 +4789,34 @@ TRANSPORT_COUNTERS = (
     "wake_calls", "wake_skipped_coalesced", "loop_late_checks", "loop_late_us")
 
 
-def _transport_of(handle):
-    """The aiopquic TransportContext behind a serve() handle, else None."""
+def _transports_of(handle) -> list:
+    """Every worker's aiopquic TransportContext behind a serve() handle."""
+    transports = getattr(handle, "transports", None)
+    if transports:
+        return list(transports)
     transport = getattr(handle, "_transport", None)
     if transport is None:
         transport = getattr(getattr(handle, "_engine", None), "_transport",
                             None)
-    return transport
+    return [] if transport is None else [transport]
 
 
 def transport_counters(handles) -> list:
-    """TRANSPORT_COUNTERS of each listener's transport."""
+    """TRANSPORT_COUNTERS of each listener's transports, one per worker."""
     out = []
     for handle in handles:
-        try:
-            counters = _transport_of(handle).counters
-        except Exception:
-            continue
-        out.append({k: counters.get(k) for k in TRANSPORT_COUNTERS})
+        for transport in _transports_of(handle):
+            try:
+                counters = transport.counters
+            except Exception:
+                continue
+            out.append({k: counters.get(k) for k in TRANSPORT_COUNTERS})
     return out
 
 
-def _kick_rx(handle) -> bool:
+def _kick_rx(transport) -> bool:
     """Wake asyncio's reader for the transport once, as the network thread
     does. Linux only: elsewhere the wake fd's write end is not exposed."""
-    transport = _transport_of(handle)
     if transport is None or not sys.platform.startswith("linux"):
         return False
     try:
@@ -4824,7 +4832,7 @@ async def _diagnose_probe_miss(handles) -> None:
     wake; staying queued means no reader is attached."""
     logger.warning(f"relay: watchdog: probe failed; transport "
                    f"{transport_counters(handles)}")
-    kicked = [_kick_rx(h) for h in handles]
+    kicked = [_kick_rx(t) for h in handles for t in _transports_of(h)]
     await asyncio.sleep(WATCHDOG_KICK_S)
     logger.warning(f"relay: watchdog: woke readers {kicked}; transport "
                    f"{transport_counters(handles)}")
@@ -5653,8 +5661,7 @@ async def _refuse_connections(handles) -> None:
     ones keep running."""
     transports = {}
     for h in handles:
-        t = _transport_of(h)
-        if t is not None:
+        for t in _transports_of(h):
             transports[id(t)] = t
     for t in transports.values():
         refuse = getattr(t, "set_max_connections", None)
@@ -5860,6 +5867,7 @@ async def main():
                            else ["quic"] if args.quic else ["wt"]),
             "started": time.time(),
             "watchdog_s": args.watchdog,
+            "workers": args.workers,
             "cache": {"groups": CACHE_GROUPS, "bytes": CACHE_BYTES,
                       "budget": CACHE_BUDGET_BYTES},
             "per_session": {"namespaces": MAX_NAMESPACES_PER_SESSION,
