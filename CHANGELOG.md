@@ -10,6 +10,7 @@
 - Interop tier: Nokia d18 and d22 on their current ports; quichemoq, moqtail d18, quicr-west WT and moxygen d14 dropped; per-relay load_sim namespace and XFAIL reasons.
 - A publisher session answers SUBSCRIBE_TRACKS itself: a PUBLISH for each attached track under the prefix, and for each attached while it is open, filtered by TRACK_PROPERTY_FILTER; an application handler for the type still answers instead. PublishedTrack.publish() sends no second PUBLISH while one is bound on the session.
 - Logging: a TRACE level below DEBUG holds per-object, per-chunk and wire-hex detail; category loggers `aiomoqt.control`, `.data`, `.fetch`, `.transport`, `.relay`; tools take `--log-level` and `--log CAT=LEVEL`, `AIOMOQT_LOG` the same spec; the relay's SIGUSR1 steps INFO, DEBUG, TRACE.
+- aiomoqt-relay `--catalog-probe` (on in the deploy): the relay subscribes to an announced or published namespace's catalog at once, so the dashboard's play button shows before anyone plays it.
 - The ersatz relay is now aiomoqt-relay: an `aiomoqt-relay` command (`moq-interop-relay` still works), and the deploy's container is `aiomoqt-relay`.
 - aiomoqt-relay: `--cache-bytes` (default 256 MiB) caps the object cache across all tracks, evicting the least recently used track's oldest group; status totals `cache_budget`, `cache_bytes`, `cache_evictions`.
 
