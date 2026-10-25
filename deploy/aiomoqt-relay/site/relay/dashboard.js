@@ -212,11 +212,11 @@ function renderNamespaces(rows, wtUrl) {
   fill($('t-namespaces'), rows.map((r) => {
     const tr = el('tr', {class: `pick${r.namespace === scope ? ' selected' : ''}`, tabindex: '0',
                          title: `${fmt.bytes(r.bytes_out)} delivered`},
-      el('td', {}, r.format ? playLink(r.namespace, wtUrl) : ''),
       el('td', {class: 'ns'}, nsCode(r.namespace)),
       originCell(r),
       num(fmt.num(r.tracks)), num(fmt.num(r.subscribers)), num(fmt.num(r.peak)),
-      inOut(r.in_bps, r.out_bps));
+      inOut(r.in_bps, r.out_bps),
+      el('td', {class: 'n'}, r.format ? playLink(r.namespace, wtUrl) : ''));
     tr.dataset.ns = r.namespace;
     return tr;
   }), 7, 'No namespaces.');

@@ -246,8 +246,8 @@ td.empty { color: var(--faint); text-align: center; padding: 14px; }
 .state-live { color: var(--green); font-weight: 600; }
 .state-ended { color: var(--faint); }
 .play {
-  display: inline-block; padding: 0 8px; border: 1px solid var(--red); border-radius: 3px;
-  color: var(--text); font-size: 12px; line-height: 20px;
+  display: inline-block; padding: 0 5px; border: 1px solid var(--red); border-radius: 3px;
+  color: var(--text); font-size: 10px; line-height: 16px;
 }
 .play:hover { background: var(--red); text-decoration: none; }
 
