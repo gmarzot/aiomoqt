@@ -3,6 +3,13 @@
 ## v0.14.0
 
 - DEBUG logs no longer report each received stream data chunk, or the QUIC handshake completing, as an unhandled QUIC event.
+- loopback_bench and sub_bench print the interval still open when the run ends, so `-t N` reports through second N.
+
+## v0.13.3
+
+- FETCH at d16 and d18: objects carry no Object Status and status objects are not sent. aiomoqt 0.13.2 and earlier send one, so a FETCH from such a publisher that includes a status object does not parse.
+- PublishedTrack: a whole-group FETCH of a group no longer in the history ends its End of Unknown Range at a valid Object ID; at d16 it failed after FETCH_OK and the FETCH hung.
+- d20/d22 FILL_PARAMETERS is sent length-prefixed (Length, then a counted parameter block), as the drafts define, so join() and joining FETCH work through third-party relays; the count-only form is still read.
 
 ## v0.13.2
 
