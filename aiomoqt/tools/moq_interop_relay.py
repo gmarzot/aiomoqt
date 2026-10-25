@@ -188,6 +188,11 @@ CATALOG_TRACK = b"catalog"
 WATCHDOG_NS = b"aiomoqt-watchdog"
 # DEFAULT_PUBLISHER_GROUP_ORDER (§10.5), decoded into group_order.
 DEFAULT_GROUP_ORDER_PROPERTY = 0x22
+# --catalog-probe: subscribe to an announced namespace's catalog after each
+# delay until one succeeds; interop test namespaces ("moq-test...") are skipped.
+CATALOG_PROBE_DELAYS_S = (0.5, 2.0)
+CATALOG_PROBE_SKIP = b"moq-test"
+_catalog_probe = False
 
 
 async def _await_upstream(timeout: float = None) -> bool:
@@ -1204,6 +1209,8 @@ async def _on_publish_namespace(session, msg):
     # Reuse the protocol's built-in OK helper. It emits RequestOk on
     # d16+ and PublishNamespaceOk on d14, matching peer expectation.
     session.publish_namepace_ok(msg)
+    if _catalog_probe and _probe_wanted(ns):
+        _spawn(_probe_catalog(ns))
 
 
 async def _on_publish_namespace_done(session, msg):
@@ -1414,6 +1421,64 @@ async def _backfill(track, msg, largest) -> None:
     track.upstream_from = min(track.upstream_from or cf, start)
     logger.info(f"relay: backfilled {len(new)} object(s) of {track.key} "
                 f"{start}..{cf}")
+
+
+def _probe_wanted(ns) -> bool:
+    return (bool(ns) and not _internal_ns(ns)
+            and not ns[0].startswith(CATALOG_PROBE_SKIP))
+
+
+def _probing(track) -> bool:
+    """--catalog-probe forwards this catalog with no subscriber."""
+    return (_catalog_probe and track.key[1] == CATALOG_TRACK
+            and _probe_wanted(track.key[0]))
+
+
+async def _probe_catalog_head(track) -> None:
+    """Backfill the catalog's current group from its head, as a viewer's
+    SUBSCRIBE would, when it was published before the relay subscribed."""
+    if track.largest is None or track.key[0] in _catalogs:
+        return
+    g = track.largest[0]
+    head = SimpleNamespace(filter_type=FilterType.ABSOLUTE_START,
+                           start_group=g, start_object=0, end_group=None)
+    await _backfill(track, head, track.largest)
+    for c in list(track._cache):
+        if c[0] == g and c[2] == 0:
+            _note_catalog(track.key[0], c[3])
+            return
+
+
+async def _probe_catalog(ns) -> None:
+    """Subscribe to an announced namespace's catalog as a viewer would, so
+    the dashboard knows its format before anyone plays it."""
+    key = (ns, CATALOG_TRACK)
+    for delay in CATALOG_PROBE_DELAYS_S:
+        await asyncio.sleep(delay)
+        track = _tracks.get(key)
+        if (not _announced_match(ns) or ns in _catalogs
+                or key in _establishing
+                or (track is not None and _track_live(track))):
+            return
+        track, refusal = await _establish_upstream(ns, CATALOG_TRACK)
+        if track is None:
+            reason = refusal[1] if refusal else "no publisher served it"
+            logger.info(f"relay: catalog probe ns={ns} -> none ({reason})")
+            continue
+        await _probe_catalog_head(track)
+        if not track.downstream:
+            track.attaching = False
+            track._ensure_drain()
+        logger.info(f"relay: catalog probe ns={ns} -> "
+                    f"{_catalogs.get(ns) or 'no MSF catalog yet'}")
+        return
+
+
+def _spawn(coro) -> None:
+    """Run `coro` in the background, held until it ends."""
+    task = asyncio.create_task(coro)
+    _background.add(task)
+    task.add_done_callback(_background.discard)
 
 
 def _parked_publish(key):
@@ -1742,6 +1807,8 @@ async def _on_publish(session, msg):
         # would otherwise deadlock — it cannot subscribe until we
         # answer, and we would not answer until it subscribed.
         _answer_publish(track)
+        if _probing(track) and not track.downstream:
+            _spawn(_probe_catalog_head(track))
 
 
 def _forwarding(track) -> bool:
@@ -1757,7 +1824,7 @@ def _answer_publish(track, forward=None) -> None:
         return
     session, msg = track.pending_publish
     if forward is None:
-        forward = _forwarding(track)
+        forward = _forwarding(track) or _probing(track)
     session._track_aliases[msg.track_alias] = msg.request_id
     session.register_object_handler(msg.track_alias, track.on_object)
     session.register_stream_end_handler(msg.track_alias, track.on_stream_end)
@@ -2266,6 +2333,11 @@ def parse_args():
                              "(a child process relays one object over "
                              "loopback every SEC seconds). 0 = off "
                              "(default).")
+    parser.add_argument("--catalog-probe", action="store_true",
+                        help="Subscribe to each announced or published "
+                             "namespace's catalog track at once, so the "
+                             "dashboard shows its MSF format before anyone "
+                             "plays it. Skips namespaces starting moq-test.")
     parser.add_argument("--control", type=str, default=None, metavar="PATH",
                         help="Serve HTTP on the Unix socket PATH: GET /debug "
                              "reports DEBUG logging, POST /debug toggles it")
@@ -3661,7 +3733,9 @@ async def _serve_control(path: str) -> None:
 
 
 async def main():
+    global _catalog_probe
     args = parse_args()
+    _catalog_probe = args.catalog_probe
     speaks = sorted(int(d) for d in MOQTDraft)
     wanted = args.draft if isinstance(args.draft, list) else [args.draft]
     if any(d not in speaks for d in wanted):
