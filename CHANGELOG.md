@@ -2,6 +2,7 @@
 
 ## v0.14.0
 
+- aiomoqt-relay: a publisher's session closing sends each namespace subscriber one NAMESPACE_DONE, not two; strict players closed the session on the second.
 - Data streams: an object spanning several chunks is parsed once its bytes have arrived, not again on every chunk.
 - d20/d22 FILL_PARAMETERS: a Length-prefixed value is read as a counted block when one ends exactly at the Length, else as bare parameters (moxygen's form), so a counted block of ten or more parameters decodes.
 - DEBUG logs no longer report each received stream data chunk, or the QUIC handshake completing, as an unhandled QUIC event.
