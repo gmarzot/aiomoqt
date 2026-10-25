@@ -729,7 +729,16 @@
   ".totals.by_transport.*": [
    "int"
   ],
+  ".totals.cache_budget": [
+   "int"
+  ],
+  ".totals.cache_bytes": [
+   "int"
+  ],
   ".totals.cache_efficiency": [],
+  ".totals.cache_evictions": [
+   "int"
+  ],
   ".totals.delivered_bytes": [
    "int"
   ],
