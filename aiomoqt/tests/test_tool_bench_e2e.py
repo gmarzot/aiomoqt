@@ -1,5 +1,6 @@
 """pub_server and sub_bench as processes: each listener mode, both
 transports, d18 and d22."""
+import re
 import time
 
 import pytest
@@ -44,6 +45,8 @@ def test_sub_bench_receives_from_pub_server(pub_server, listen, dial, draft):
                   "--draft", draft)
     assert objects_received(out) > 0, out
     assert rc == 0, out
+    rows = re.findall(r"^\s+\d+-(\d+)s\s", out, re.MULTILINE)
+    assert rows and rows[-1] == "2", out
 
 
 @requires_certs
@@ -92,6 +95,15 @@ def test_loopback_bench_verifies_its_own_cert(transport):
                   "--key", KEY)
     assert rc == 0, out
     assert objects_received(out) > 0
+
+
+@requires_certs
+def test_loopback_bench_reports_through_its_last_second():
+    rc, out = run("loopback_bench", "-Q", "-p", free_udp_port(), "--draft", 18,
+                  "-t", 3, "-i", 1, "-s", 1200, "-k")
+    assert rc == 0, out
+    rows = re.findall(r"^\s+(\d+)-(\d+)s\s", out, re.MULTILINE)
+    assert len(rows) == 3 and rows[-1][1] == "3", out
 
 
 def test_loopback_bench_without_objects_exits_1(monkeypatch):
