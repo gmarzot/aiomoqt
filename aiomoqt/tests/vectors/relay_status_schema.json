@@ -943,10 +943,22 @@
   ".tracks[].subscriber_list[].forward": [
    "bool"
   ],
+  ".tracks[].subscriber_list[].lane_bytes": [
+   "int"
+  ],
+  ".tracks[].subscriber_list[].lane_objects": [
+   "int"
+  ],
   ".tracks[].subscriber_list[].rtt_ms": [
    "float"
   ],
   ".tracks[].subscriber_list[].session": [
+   "int"
+  ],
+  ".tracks[].subscriber_list[].shed_episodes": [
+   "int"
+  ],
+  ".tracks[].subscriber_list[].shed_objects": [
    "int"
   ],
   ".tracks[].subscriber_list[].since": [
