@@ -31,6 +31,7 @@ from typing import Any, Dict
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.messages.base import MOQTMessage
+from aiomoqt.protocol import _MOQTSessionMixin
 from aiomoqt.track import SubscribedTrack, TrackState
 from aiomoqt.types import FilterType
 from aiomoqt.utils.url import parse_relay_url
@@ -46,6 +47,8 @@ def apply_compat(compat) -> bool:
     keys = {k.strip() for k in (compat or "").split(",") if k.strip()}
     if "all" in keys or "lenient-extensions" in keys:
         MOQTMessage._tolerate_trailing_extensions = True
+    if "all" in keys or "missing-request-credit" in keys:
+        _MOQTSessionMixin._tolerate_missing_request_credit = True
     return "all" in keys or "libquicr" in keys
 
 

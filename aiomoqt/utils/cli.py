@@ -279,7 +279,8 @@ def add_compat(p):
                    help='Comma-separated relay compat tolerances: '
                         'lenient-extensions (truncated trailing-'
                         'extensions block on control messages), '
-                        'libquicr, all')
+                        'missing-request-credit (a d14/d16 peer SETUP '
+                        'without MAX_REQUEST_ID), libquicr, all')
 
 
 def add_split_role(p):
