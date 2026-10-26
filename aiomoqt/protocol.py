@@ -1429,7 +1429,7 @@ class _MOQTSessionMixin:
                         and rid >= self._local_request_max):
                     raise MOQTException(
                         SessionCloseCode.TOO_MANY_REQUESTS,
-                        f"peer request_id {rid} beyond our MAX_REQUEST_ID "
+                        f"peer request_id {rid} at or beyond our MAX_REQUEST_ID "
                         f"{self._local_request_max}")
                 self._peer_request_seen.add(rid)
                 if rid > self._peer_request_max:
@@ -2560,13 +2560,14 @@ class _MOQTSessionMixin:
                     f"control parse error: {type(e).__name__}")
                 return
             if msg is None:
-                error = (f"control stream({stream_id}): parse failed at "
-                         f"{chain.tell()} of {chain.capacity} bytes")
+                # The handler logged why and, normally, closed the session.
                 logger.error(
-                    f"MOQT error: {error} head_hex="
+                    f"MOQT control stream({stream_id}): rejected message head_hex="
                     f"{chain.data_slice(0, min(64, chain.capacity)).hex()}")
-                self._close_session(
-                    SessionCloseCode.PROTOCOL_VIOLATION, error)
+                if self._close_err is None:
+                    self._close_session(
+                        SessionCloseCode.PROTOCOL_VIOLATION,
+                        f"control stream({stream_id}): parse failed")
                 return
             chain.commit()
             if msg is self._MSG_SKIPPED:

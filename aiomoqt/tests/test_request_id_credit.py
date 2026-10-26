@@ -66,6 +66,25 @@ async def test_peer_request_at_our_ceiling_closes_with_too_many_requests():
 
 
 @pytest.mark.asyncio
+async def test_request_at_ceiling_on_control_stream_closes_once(caplog):
+    s = _stub(16)
+    s.is_client = False                           # peer requests are even
+    s._local_request_max = 8
+    s._close_err = None
+    s._control_chains = {}
+    s._control_stream_id = 0
+
+    def close(code, reason):
+        s.closed.append((code, reason))
+        s._close_err = s._close_err or (code, reason)
+    s._close_session = close
+    msg = TrackStatus(request_id=8, track_namespace=(b"n",), track_name=b"t")
+    s._on_control_data(0, bytes(msg.serialize(prof=s._profile).data), False)
+    assert [c for c, _ in s.closed] == [SessionCloseCode.TOO_MANY_REQUESTS]
+    assert "parse failed" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_ceiling_is_raised_before_the_peer_reaches_it():
     s = _stub(16)
     s._local_request_max = 8

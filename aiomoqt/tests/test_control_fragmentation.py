@@ -26,6 +26,7 @@ def _control_session(draft):
     plus the control-chain map, bidi-binding maps, and a recording
     _close_session (bypasses __init__ / QUIC)."""
     s = object.__new__(_MOQTSessionMixin)
+    s._close_err = None
     s._published_aliases = {}
     s._peer_requests = {}
     s._next_request_id = 0
