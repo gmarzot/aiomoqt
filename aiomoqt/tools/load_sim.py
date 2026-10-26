@@ -685,7 +685,8 @@ def parse_args(argv=None):
                        help="quick mode: PUB_NS + PUBLISH")
     p.add_argument("--compat", default=None,
                    help="comma-separated peer compat tolerances "
-                        "(lenient-extensions, libquicr, all) — same keys "
+                        "(lenient-extensions, missing-request-credit, libquicr, "
+                        "all) — same keys "
                         "as moq_interop_client")
     p.add_argument("-k", "--insecure", action="store_true",
                    help="Skip TLS verification")

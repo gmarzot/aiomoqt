@@ -28,6 +28,7 @@ from aiomoqt.client import MOQTClient
 from aiomoqt.context import is_draft16_or_later, profile_for
 from aiomoqt.messages import SubgroupHeader
 from aiomoqt.messages.base import MOQTMessage
+from aiomoqt.protocol import _MOQTSessionMixin
 from aiomoqt.track import PublishedTrack, SubscribedTrack
 from aiomoqt.tools.moqtest_origin import parse_namespace as parse_moq_test
 from aiomoqt.types import (
@@ -102,6 +103,7 @@ KNOWN_COMPAT_IMPLS = frozenset({
     "moq-rs-d16",         # itzmanish/moq-rs draft-16 fork (CF endpoint)
     "libquicr",           # Cisco libquicr — accepts SUBSCRIBE to unknown tracks
     "lenient-extensions",  # tolerate truncated trailing extensions block
+    "missing-request-credit",  # d14/d16 peer SETUP without MAX_REQUEST_ID
     "all",                # enable every known compat tolerance
 })
 
@@ -1873,6 +1875,8 @@ def main():
     # control-message dispatcher (default policy).
     if _compat_active(compat, "lenient-extensions"):
         MOQTMessage._tolerate_trailing_extensions = True
+    if _compat_active(compat, "missing-request-credit"):
+        _MOQTSessionMixin._tolerate_missing_request_credit = True
 
     # Apply namespace prefix and auth-token, if set, before the
     # tests capture INTEROP_NAMESPACE / _PUB_NS_PARAMS from module

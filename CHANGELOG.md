@@ -19,6 +19,7 @@
 - Servers bind the address they are given (aiopquic 0.7.0): `--bind` and `MOQTServer(host=...)` default to all interfaces, IPv4 and IPv6; `0.0.0.0` is IPv4 only; an address or hostname binds only that. The image passes `--bind` only when `MOQT_BIND` is set.
 - aiomoqt-relay: a REQUEST_UPDATE that arrives while its SUBSCRIBE waits on the upstream is answered after the SUBSCRIBE_OK instead of ahead of it with NOT_SUPPORTED; update replies log `MOQT send:` at INFO.
 - TIMESTAMP_MAPPING's four integers are vi64 at every draft, so the value survives relays that bridge d16 and d18 sessions; d16 sessions still read the RFC 9000 form older peers send.
+- `--compat missing-request-credit`: a d14/d16 peer whose SETUP has no MAX_REQUEST_ID (the Oracle relay) leaves our requests uncapped, with one WARNING, instead of capped at 0; a MAX_REQUEST_ID that arrives is still honoured. `all` includes it.
 
 ## v0.13.3
 
