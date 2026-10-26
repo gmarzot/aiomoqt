@@ -6240,8 +6240,9 @@ class _MOQTSessionMixin:
             # admission (§10.9.2, §10.2.18).
             if existing in self._discovery_subs:
                 self._discovery_subs[existing] = held[1]
-            self._send_reply(msg.request_id,
-                             RequestOk(request_id=msg.request_id))
+            ok = RequestOk(request_id=msg.request_id)
+            control_log.info(f"MOQT send: {self._msgstr(ok)}")
+            self._send_reply(msg.request_id, ok)
             return
         # §10.9: MUST answer with exactly one REQUEST_OK or
         # REQUEST_ERROR — a session with no update semantics answers
@@ -6252,6 +6253,7 @@ class _MOQTSessionMixin:
             retry_interval=0,
             reason="request update not supported",
         )
+        control_log.info(f"MOQT send: {self._msgstr(err)}")
         self._send_reply(msg.request_id, err)
         if d20:
             # d20 §10.9.1: a failed update ends the request it updated.
