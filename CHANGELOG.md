@@ -2,6 +2,7 @@
 
 ## v0.14.0
 
+- A control message that closes the session (such as a request at the MAX_REQUEST_ID ceiling) no longer logs a second close as a parse failure.
 - aiomoqt-relay dashboard: a live track takes the history slot of the track ended longest, so busy relays keep charting their live tracks.
 - aiomoqt-relay: a publisher's session closing sends each namespace subscriber one NAMESPACE_DONE, not two; strict players closed the session on the second.
 - Data streams: an object spanning several chunks is parsed once its bytes have arrived, not again on every chunk.

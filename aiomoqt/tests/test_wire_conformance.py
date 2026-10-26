@@ -990,6 +990,7 @@ def test_d20_setup_length_mismatch_closes_the_session():
     s._control_chains = {}
     s._bidi_stream_requests = {}
     s._d18_control_read_sid = 3
+    s._close_err = None
     s._closed = []
     s._close_session = lambda code, reason: s._closed.append((code, reason))
     wire = _ref_kvps([(0x07, b"aiomoqt/x")], ref_vi64)
