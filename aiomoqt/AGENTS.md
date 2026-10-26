@@ -76,5 +76,5 @@ SIGUSR1.
 - `aiomoqt-relay` (also `moq-interop-relay`) is a MoQT relay in Python: a bounded
   recent-object cache (8 groups / 32 MiB per track, all tracks under one `--cache-bytes` budget,
   least recently used evicted first) for FETCH and JOIN; no authentication, authorization or rate limiting; a per-stream TX budget
-  but unbounded per-track forwarding queues; no delivery timeout. Its module docstring has the
-  details.
+  and a bounded send lane per subscriber, shedding whole groups (streams reset) from one that falls
+  behind; no delivery timeout. Its module docstring has the details.

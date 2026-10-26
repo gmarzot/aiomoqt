@@ -9,9 +9,10 @@ carries less traffic than the Rust and C++ relays.
 Limits:
 
   * No authentication, authorization or rate limiting.
-  * A per-stream send budget (--max-inflight-bytes); per-track
-    forwarding queues are unbounded; no per-session namespace or
-    subscription caps.
+  * A per-stream send budget (--max-inflight-bytes) and a send lane per
+    subscriber holding at most LANE_BYTES of live objects: a subscriber
+    that falls further behind loses whole groups, their streams reset;
+    no per-session namespace or subscription caps.
   * A bounded recent-object cache per track (CACHE_GROUPS / CACHE_BYTES,
     oldest group dropped) under a relay-wide budget (--cache-bytes),
     which drops the oldest group of the least recently used track, never
@@ -342,6 +343,9 @@ CACHE_BYTES = 32 * 1024 * 1024
 # Relay-wide cache budget (--cache-bytes).
 CACHE_BUDGET_BYTES = 256 * 1024 * 1024
 
+# Live object bytes a subscriber's send lane holds before it sheds groups.
+LANE_BYTES = 4 * 1024 * 1024
+
 # MAX_FILTER_RANGES advertised at d20+ (§9.1.6).
 MAX_FILTER_RANGES = 16
 
@@ -354,7 +358,7 @@ class _Downstream:
 
     __slots__ = ("session", "alias", "request_id", "forward", "window",
                  "joined_at", "replaying", "location_filter", "group_order",
-                 "fills", "range_params", "filters")
+                 "fills", "range_params", "filters", "lane")
 
     def __init__(self, session, alias, request_id, forward=True,
                  window=_UNFILTERED):
@@ -380,6 +384,8 @@ class _Downstream:
         # form for this track; None passes every object.
         self.range_params: dict = {}
         self.filters = None
+        # Its _SendLane, created with the first object for it.
+        self.lane = None
 
     def set_filters(self, params, track_properties) -> None:
         self.range_params = params
@@ -452,6 +458,200 @@ class _CacheBudget:
 
 _budget = _CacheBudget()
 
+# Send lanes still running, including those draining past their track.
+_lanes: set = set()
+
+
+class _SendLane:
+    """One subscriber's objects behind its own FIFO and writer task.
+
+    The track hands each object to every lane without waiting, so a
+    subscriber held up by its transport holds up only itself. Past
+    LANE_BYTES of live objects the lane sheds whole groups: their open
+    subgroup streams are reset, never FINed short, and delivery resumes
+    at a newer group.
+    """
+
+    def __init__(self, track, d):
+        self.track = track
+        self.d = d
+        # (gid, size, live, sgid, oid, payload, exts, prio, status, shape,
+        # encoded), or ("CUT",) / ("CLOSE",) / ("FINAL", code, None, reason).
+        self.items: deque = deque()
+        self.bytes = 0           # live object bytes queued
+        self.replay_bytes = 0    # cache replay bytes queued, not bounded
+        self.objects = 0
+        self.floor = None        # objects of groups below it are shed
+        self.shed = 0            # objects shed
+        self.sheds = 0           # shed episodes
+        self.shedding = False
+        self.final = False       # PUBLISH_DONE queued: takes nothing more
+        self.busy = False        # a write is in progress
+        self.stopped = False
+        self._cut = False
+        self._closing = False
+        self._wake = asyncio.Event()
+        _lanes.add(self)
+        track._lanes.add(self)
+        self.task = asyncio.ensure_future(self._run())
+
+    @property
+    def idle(self) -> bool:
+        return not self.items and not self.busy
+
+    def _put(self, item) -> None:
+        self.items.append(item)
+        self._wake.set()
+
+    def _count(self, item, sign) -> None:
+        if item[4] is None:
+            return
+        self.objects += sign
+        if item[2]:
+            self.bytes += sign * item[1]
+        else:
+            self.replay_bytes += sign * item[1]
+
+    def offer(self, gid, live, sgid, oid, payload, exts, prio, status,
+              shape, encoded=None) -> None:
+        """Queue an object or stream end for group `gid`; `live` objects
+        count against LANE_BYTES, a cache replay does not."""
+        if self.stopped or self.final:
+            return
+        if self.floor is not None and gid < self.floor:
+            if oid is not None:
+                self.shed += 1
+            return
+        item = (gid, len(payload or b""), live, sgid, oid, payload, exts,
+                prio, status, shape, encoded)
+        self._count(item, 1)
+        self._put(item)
+        if live and self.bytes > LANE_BYTES:
+            self._shed(gid)
+
+    def _drop_below(self, floor) -> None:
+        kept = deque()
+        for item in self.items:
+            if isinstance(item[0], str) or item[0] >= floor:
+                kept.append(item)
+                continue
+            self._count(item, -1)
+            if item[4] is not None:
+                self.shed += 1
+        self.items = kept
+
+    def _shed(self, gid) -> None:
+        """Drop the groups queued before `gid`, and `gid` too if it alone
+        is over the bound; their open streams are reset first."""
+        floor = gid
+        self._drop_below(floor)
+        if self.bytes > LANE_BYTES:
+            floor = gid + 1
+            self._drop_below(floor)
+        self.floor = floor if self.floor is None else max(self.floor, floor)
+        if not self._cut:
+            self._cut = True
+            self.items.appendleft(("CUT",))
+            self._wake.set()
+        if not self.shedding:
+            self.shedding = True
+            self.sheds += 1
+            d = self.d
+            logger.warning(
+                f"relay: {self.track.key} subscriber "
+                f"{_peer_address(d.session)} request {d.request_id} over "
+                f"its {LANE_BYTES}-byte send lane: resetting groups below "
+                f"{self.floor}")
+
+    def close_streams(self) -> None:
+        """FIN the subscriber's open streams once what is queued is out."""
+        if not self._closing and not self.final and not self.stopped:
+            self._closing = True
+            self._put(("CLOSE",))
+
+    def finish(self, status_code, reason) -> None:
+        """PUBLISH_DONE once what is queued is out; nothing more is taken."""
+        if not self.final and not self.stopped:
+            self.final = True
+            self._put(("FINAL", status_code, None, reason))
+
+    def stop(self) -> bool:
+        """End now, dropping what is queued. True if an object was
+        dropped or its write abandoned."""
+        if self.stopped:
+            return False
+        self.stopped = True
+        lost = self.objects > 0 or self.busy
+        self.items.clear()
+        self.bytes = self.replay_bytes = self.objects = 0
+        self._wake.set()
+        if self.task is not asyncio.current_task():
+            self.task.cancel()
+        self._exit()
+        return lost
+
+    def _exit(self) -> None:
+        _lanes.discard(self)
+        self.track._lanes.discard(self)
+
+    async def _run(self) -> None:
+        try:
+            while not self.stopped:
+                if not self.items:
+                    self.shedding = False
+                    self._wake.clear()
+                    await self._wake.wait()
+                    continue
+                if not await self._handle(self.items.popleft()):
+                    return
+        finally:
+            self._exit()
+
+    async def _handle(self, item) -> bool:
+        """Write one item; False ends the lane."""
+        track, d = self.track, self.d
+        kind = item[0]
+        if isinstance(kind, str):
+            try:
+                if kind == "CUT":
+                    self._cut = False
+                    track._reset_streams(d.session, self.floor)
+                elif kind == "CLOSE":
+                    self._closing = False
+                    track._close_streams(d.session)
+                else:
+                    track._end(d, *item[1:])
+                    return False
+            except Exception:
+                logger.debug(f"relay: {kind} on a send lane failed",
+                             exc_info=True)
+            return True
+        self._count(item, -1)
+        if not _session_live(d.session):
+            track.drop_session(d.session)
+            return False
+        (gid, size, _live, sgid, oid, payload, exts, prio, status, shape,
+         encoded) = item
+        self.busy = True
+        try:
+            await track._forward_one(d.session, d.alias, gid, sgid, oid,
+                                     payload, exts, prio, status, shape,
+                                     encoded, start=d.start)
+        except (Exception, asyncio.CancelledError):
+            if _cancelling():
+                raise
+            logger.debug("relay: forward failed, dropping subscriber",
+                         exc_info=True)
+            track._drops += 1
+            track.drop_session(d.session)
+            return False
+        finally:
+            self.busy = False
+        if oid is not None:
+            track._objects_out += 1
+            track._bytes_out += size
+        return True
+
 
 class _RelayedTrack:
     """One upstream subscription fanned out to N downstream subscribers.
@@ -461,9 +661,9 @@ class _RelayedTrack:
     for the same track joins this fan-out instead of opening a second
     upstream SUBSCRIBE.
 
-    Objects arrive on a synchronous callback but forwarding has to open
-    streams, which is async — inbound objects go through a queue drained
-    by one task per track, which also keeps them in arrival order.
+    Objects arrive on a synchronous callback. One task per track takes
+    them in arrival order, caches and filters them, and hands each to
+    every subscriber's _SendLane, which does the writing.
     """
 
     def __init__(self, key):
@@ -475,6 +675,9 @@ class _RelayedTrack:
         # the track yet; raised with REQUEST_UPDATE when one arrives.
         self.parked = None            # (session, Publish msg)
         self.downstream: list[_Downstream] = []
+        # Send lanes still running, including those of subscribers that
+        # have left `downstream` and are draining to their PUBLISH_DONE.
+        self._lanes: set = set()
         self.queue = asyncio.Queue()
         self.task = None
         # A downstream SUBSCRIBE is establishing this track: an upstream
@@ -577,9 +780,28 @@ class _RelayedTrack:
         if self.task is not None:
             self.task.cancel()
             self.task = None
-        self.downstream.clear()
-        self._streams.clear()
+        self._release_downstream()
         self._drop_cache()
+
+    def _release_downstream(self) -> None:
+        """Forget the subscribers; lanes draining to their PUBLISH_DONE
+        keep their streams, the rest stop."""
+        for lane in list(self._lanes):
+            if not lane.final:
+                lane.stop()
+        draining = {id(lane.d.session) for lane in self._lanes}
+        self.downstream.clear()
+        for k in [k for k in self._streams if k[0] not in draining]:
+            self._streams.pop(k, None)
+
+    def _lane(self, d) -> _SendLane:
+        if d.lane is None:
+            d.lane = _SendLane(self, d)
+        return d.lane
+
+    def _queued(self, d) -> bool:
+        """`d`'s lane still holds or is writing something."""
+        return d.lane is not None and not d.lane.idle
 
     def _drop_cache(self) -> None:
         """Empty the cache and return its bytes to the relay budget."""
@@ -610,13 +832,20 @@ class _RelayedTrack:
             return
         self._finished = True
         for d in list(self.downstream):
-            self._end(d, status_code, reset_code, reason)
+            if reset_code is None and self._queued(d):
+                d.lane.finish(status_code, reason)
+            else:
+                self._end(d, status_code, reset_code, reason)
 
     def end_downstream(self, d) -> None:
         """A subscription whose End is behind production (§5.1.2) ends
         with PUBLISH_DONE SUBSCRIPTION_ENDED; from d20 it stays open and
-        only its streams close (d22 §3.3.1)."""
+        only its streams close (d22 §3.3.1). Either follows what its lane
+        holds."""
         if not d.session._profile.publish_done_subscription_ended:
+            if self._queued(d):
+                d.lane.close_streams()
+                return
             try:
                 self._close_streams(d.session)
             except Exception:
@@ -625,6 +854,10 @@ class _RelayedTrack:
             return
         if d in self.downstream:
             self.downstream.remove(d)
+            if self._queued(d):
+                d.lane.finish(SubscribeDoneCode.SUBSCRIPTION_ENDED,
+                              "subscription ended")
+                return
             self._end(d, SubscribeDoneCode.SUBSCRIPTION_ENDED, None,
                       "subscription ended")
 
@@ -639,9 +872,19 @@ class _RelayedTrack:
                     session.stream_reset(sid, int(reset_code))
                 self._streams.pop(k, None)
 
+    def _reset_streams(self, session, below) -> None:
+        """Reset the session's open streams of groups below `below`."""
+        for k, (sid, _hdr) in list(self._streams.items()):
+            if k[0] == id(session) and k[1] < below:
+                session.stream_reset(sid, StreamResetCode.CANCELLED)
+                self._streams.pop(k, None)
+
     def _end(self, d, status_code, reset_code, reason) -> None:
-        """FIN (or reset) a subscriber's open streams, then PUBLISH_DONE."""
+        """FIN (or reset) a subscriber's open streams, then PUBLISH_DONE.
+        Objects its lane still held are dropped, so its streams are reset."""
         session = d.session
+        if (d.lane is not None and d.lane.stop() and reset_code is None):
+            reset_code = StreamResetCode.CANCELLED
         try:
             self._close_streams(session, reset_code)
             session.subscribe_done(
@@ -822,6 +1065,9 @@ class _RelayedTrack:
                      and d.request_id == request_id), None)
 
     def drop_session(self, session):
+        for lane in [lane for lane in self._lanes
+                     if lane.d.session is session]:
+            lane.stop()
         for d in self.downstream:
             if d.session is session:
                 # d22 §3.4.1: a cancelled subscription resets its fills.
@@ -839,13 +1085,12 @@ class _RelayedTrack:
             gid, sgid, oid, payload, exts, prio, status, shape = \
                 await self.queue.get()
             if status == "DONE":
-                # Terminal, in queue order: everything already queued has
-                # been written downstream before PUBLISH_DONE goes out.
+                # Terminal, in queue order: each subscriber's PUBLISH_DONE
+                # follows what its lane already holds.
                 code, reason, key = shape
                 self.finish(status_code=code, reason=reason)
                 self.release_upstream()
-                self.downstream.clear()
-                self._streams.clear()
+                self._release_downstream()
                 self._drop_cache()
                 self.task = None
                 _tracks.pop(key, None)
@@ -853,7 +1098,7 @@ class _RelayedTrack:
             if self._finished:
                 continue
             if status == "REPLAY":
-                await self._replay(shape)
+                self._replay(shape)
                 continue
             if oid is not None:
                 if (gid, oid) in self._backfilled:
@@ -881,22 +1126,9 @@ class _RelayedTrack:
                             continue
                         # A filtered-out end marker still ends its stream.
                         out = (None, None, None, "END", None)
-                try:
-                    self._objects_out += 1
-                    self._bytes_out += len(payload or b"")
-                    o_oid, o_payload, o_exts, o_status, o_shape = out
-                    await self._forward_one(
-                        d.session, d.alias, gid, sgid, o_oid, o_payload,
-                        o_exts, prio, o_status, o_shape, encoded,
-                        start=d.start)
-                except (Exception, asyncio.CancelledError):
-                    if _cancelling():
-                        raise
-                    logger.debug("relay: forward failed, dropping subscriber",
-                                 exc_info=True)
-                    self._drops += 1
-                    self.drop_session(d.session)
-                    continue
+                o_oid, o_payload, o_exts, o_status, o_shape = out
+                self._lane(d).offer(gid, True, sgid, o_oid, o_payload,
+                                    o_exts, prio, o_status, o_shape, encoded)
                 if (oid is not None and d.window[1] == gid and status in (
                         ObjectStatus.END_OF_GROUP, ObjectStatus.END_OF_TRACK)):
                     self.end_downstream(d)
@@ -963,9 +1195,10 @@ class _RelayedTrack:
                                 if k[0] >= first}
             self._stopped = {k for k in self._stopped if k[1] >= first}
 
-    async def _replay(self, d) -> None:
-        """The cached objects inside `d`'s window, in Location order,
-        then FIN for the subgroups the publisher has already ended."""
+    def _replay(self, d) -> None:
+        """Queue on `d`'s lane the cached objects inside its window, in
+        Location order, then FIN for the subgroups the publisher has
+        already ended; live objects follow."""
         d.replaying = False
         if d not in self.downstream:
             return
@@ -974,27 +1207,15 @@ class _RelayedTrack:
                       key=lambda c: (c[0], c[1], c[2]))
         if objs:
             _budget.touch(self)
-        try:
-            for gid, sgid, oid, payload, exts, prio, status, shape in objs:
-                self._objects_out += 1
-                self._bytes_out += len(payload or b"")
-                await self._forward_one(d.session, d.alias, gid, sgid, oid,
-                                        payload, exts, prio, status, shape,
-                                        start=d.start)
-            for gid, sgid in sorted({(c[0], c[1]) for c in objs}):
-                if (gid, sgid) in self._ended:
-                    await self._forward_one(d.session, d.alias, gid, sgid,
-                                            None, None, None, None, "END",
-                                            start=d.start)
-        except (Exception, asyncio.CancelledError):
-            if _cancelling():
-                raise
-            logger.debug("relay: replay failed, dropping subscriber",
-                         exc_info=True)
-            self._drops += 1
-            self.drop_session(d.session)
-            return
-        logger.info(f"relay: replayed {len(objs)} cached object(s) of "
+        lane = self._lane(d)
+        for gid, sgid, oid, payload, exts, prio, status, shape in objs:
+            lane.offer(gid, False, sgid, oid, payload, exts, prio, status,
+                       shape)
+        for gid, sgid in sorted({(c[0], c[1]) for c in objs}):
+            if (gid, sgid) in self._ended:
+                lane.offer(gid, False, sgid, None, None, None, None, "END",
+                           None)
+        logger.info(f"relay: replaying {len(objs)} cached object(s) of "
                     f"{self.key} to request {d.request_id}")
 
     def cache_covers(self, start) -> bool:
@@ -1256,6 +1477,8 @@ def _forget_session(session) -> None:
                 not _announced[ns]:
             del _announced[ns]
             _retract_namespace(ns)
+    for lane in [lane for lane in _lanes if lane.d.session is session]:
+        lane.track.drop_session(session)
     for key, track in list(_tracks.items()):
         track.drop_session(session)
         if _upstream_session(track) is session or (
@@ -3488,6 +3711,11 @@ class _Status:
                     "addr": relay_status.display_addr(_addr_of(d.session)),
                     "rtt_ms": None if r is None else round(r, 1),
                     "forward": bool(d.forward),
+                    "lane_bytes": (lane.bytes + lane.replay_bytes
+                                   if (lane := d.lane) else 0),
+                    "lane_objects": lane.objects if lane else 0,
+                    "shed_objects": lane.shed if lane else 0,
+                    "shed_episodes": lane.sheds if lane else 0,
                     "since": info["since"] if info else None})
             tracks.append((key, {
                 "id": "\x1f".join((_ns_str(key[0]), _name_str(key[1]))),
