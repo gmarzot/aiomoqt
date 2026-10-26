@@ -15,6 +15,7 @@
 - The ersatz relay is now aiomoqt-relay: an `aiomoqt-relay` command (`moq-interop-relay` still works), and the deploy's container is `aiomoqt-relay`.
 - aiomoqt-relay: `--cache-bytes` (default 256 MiB) caps the object cache across all tracks, evicting the least recently used track's oldest group; status totals `cache_budget`, `cache_bytes`, `cache_evictions`.
 - Servers bind the address they are given (aiopquic 0.7.0): `--bind` and `MOQTServer(host=...)` default to all interfaces, IPv4 and IPv6; `0.0.0.0` is IPv4 only; an address or hostname binds only that. The image passes `--bind` only when `MOQT_BIND` is set.
+- aiomoqt-relay: a REQUEST_UPDATE that arrives while its SUBSCRIBE waits on the upstream is answered after the SUBSCRIBE_OK instead of ahead of it with NOT_SUPPORTED; update replies log `MOQT send:` at INFO.
 - TIMESTAMP_MAPPING's four integers are vi64 at every draft, so the value survives relays that bridge d16 and d18 sessions; d16 sessions still read the RFC 9000 form older peers send.
 
 ## v0.13.3

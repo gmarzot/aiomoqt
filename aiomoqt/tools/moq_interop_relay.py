@@ -113,6 +113,7 @@ _RELAY_DRAFT_DEFAULT = (
     or ",".join(str(d) for d in MOQT_DEFAULT_DRAFTS)).strip()
 
 logger = get_category_logger("relay")
+control_log = get_category_logger("control")
 
 
 # Cross-session announcement table: namespace tuple -> the publisher
@@ -157,6 +158,10 @@ RENDEZVOUS_TIMEOUT = 0x04
 RENDEZVOUS_MAX_S = 30.0
 # Longest a joining FETCH waits for the SUBSCRIBE it names to attach.
 JOINING_WAIT_S = 5.0
+# A REQUEST_UPDATE to a SUBSCRIBE still pending upstream waits for its
+# answer, no longer than the SUBSCRIBE itself can be held.
+HELD_UPDATE_MAX_S = RENDEZVOUS_MAX_S + UPSTREAM_WAIT_S
+HELD_UPDATE_POLL_S = 0.01
 # Longest the relay waits for a PUBLISH after an upstream refuses its
 # SUBSCRIBE as a duplicate subscription (§5.1: the PUBLISH crossed it).
 PUBLISH_WAIT_S = 1.5
@@ -2186,6 +2191,18 @@ async def _on_request_update(session, msg):
     rid = (msg.existing_request_id if d16
            else msg.subscription_request_id)
     found = _joined_subscription(session, rid)
+    held = _held_updates.get((session, rid))
+    if d16 and (held is not None
+                or (found is None and _subscribe_pending(session, rid))):
+        # Answered after the SUBSCRIBE it updates, in arrival order: its
+        # reply must not overtake the SUBSCRIBE_OK on the request stream.
+        if held is None:
+            held = _held_updates[(session, rid)] = []
+            _spawn(_release_held_updates(session, rid))
+        held.append(msg)
+        logger.info(f"relay: update request {msg.request_id} held until "
+                    f"SUBSCRIBE {rid} is answered")
+        return
     if found is None:
         if d16:
             _update_track_sub_filters(session, rid, msg.parameters or {})
@@ -2193,7 +2210,33 @@ async def _on_request_update(session, msg):
         else:
             await session._handle_subscribe_update(msg)
         return
+    _apply_update(session, msg, found, d16)
+
+
+# (session, SUBSCRIBE request id) -> REQUEST_UPDATEs waiting for it.
+_held_updates: dict = {}
+
+
+async def _release_held_updates(session, rid) -> None:
+    """Answer the updates held for SUBSCRIBE `rid` once it is answered:
+    applied after its SUBSCRIBE_OK, else given the session's default."""
+    deadline = time.monotonic() + HELD_UPDATE_MAX_S
+    while (_joined_subscription(session, rid) is None
+           and _subscribe_pending(session, rid) and _session_live(session)
+           and time.monotonic() < deadline):
+        await asyncio.sleep(HELD_UPDATE_POLL_S)
+    found = _joined_subscription(session, rid)
+    for msg in _held_updates.pop((session, rid), []):
+        if found is not None:
+            _apply_update(session, msg, found, True)
+        else:
+            await session._handle_request_update(msg)
+
+
+def _apply_update(session, msg, found, d16: bool) -> None:
+    """Apply an update to a joined downstream subscription and answer it."""
     key, track, d = found
+    rid = msg.existing_request_id if d16 else msg.subscription_request_id
     if d16 and not _update_filters(session, msg, track, d):
         return
     if d16:
@@ -2215,9 +2258,9 @@ async def _on_request_update(session, msg):
     if d16:
         params = ({} if track.largest is None
                   else _largest_object_param(session, track.largest))
-        session._send_reply(msg.request_id,
-                            RequestOk(request_id=msg.request_id,
-                                      parameters=params))
+        ok = RequestOk(request_id=msg.request_id, parameters=params)
+        control_log.info(f"MOQT send: {session._msgstr(ok)}")
+        session._send_reply(msg.request_id, ok)
         _start_fill(track, d, msg)
     _resume_parked_publish(track)
 
