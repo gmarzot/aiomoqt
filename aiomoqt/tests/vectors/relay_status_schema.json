@@ -745,6 +745,9 @@
   ".totals.cache_evictions": [
    "int"
   ],
+  ".totals.cache_truncations": [
+   "int"
+  ],
   ".totals.delivered_bytes": [
    "int"
   ],
@@ -953,6 +956,9 @@
    "int"
   ],
   ".tracks[].subscriber_list[].lane_objects": [
+   "int"
+  ],
+  ".tracks[].subscriber_list[].lane_tx_bytes": [
    "int"
   ],
   ".tracks[].subscriber_list[].rtt_ms": [
