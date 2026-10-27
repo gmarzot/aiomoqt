@@ -147,3 +147,40 @@ def test_a_broadcast_declares_audio_above_video():
     assert pub.catalog_track.priority == CATALOG_PUBLISHER_PRIORITY
     assert (audio.priority, video.priority, own.priority) == (64, 128, 90)
     assert audio._stream_band(session) < video._stream_band(session)
+
+
+def _has_datagram_priority() -> bool:
+    from aiopquic.asyncio.webtransport import WebTransportSession
+    from aiopquic.quic.connection import QuicConnection
+    return (hasattr(QuicConnection, "set_datagram_priority")
+            and hasattr(WebTransportSession, "set_datagram_priority"))
+
+
+@pytest.mark.skipif(not _has_datagram_priority(),
+                    reason="aiopquic without a datagram priority setter")
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+async def test_datagrams_share_the_neutral_band(use_quic, monkeypatch):
+    calls = []
+    orig = _MOQTSessionMixin.set_datagram_priority
+
+    def spy(self, priority):
+        ok = orig(self, priority)
+        calls.append((priority, ok))
+        return ok
+    monkeypatch.setattr(_MOQTSessionMixin, "set_datagram_priority", spy)
+    _reset_relay_state()
+    port = _BASE_PORT + 40 + (not use_quic)
+    server = relay._build_server("localhost", port, CERT, KEY,
+                                 use_quic=use_quic, draft=18)
+    handle = await server.serve()
+    try:
+        client = MOQTClient("localhost", port, path="/", use_quic=use_quic,
+                            verify_tls=False, supported_drafts=18)
+        async with client.connect() as session:
+            await session.client_session_init()
+            await asyncio.sleep(0.1)
+    finally:
+        handle.close()
+    band = to_stream_priority(128, discipline="fifo")
+    assert len(calls) == 2, calls                       # client and relay
+    assert all(c == (band, True) for c in calls), calls
