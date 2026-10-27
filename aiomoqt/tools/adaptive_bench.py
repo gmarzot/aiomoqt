@@ -40,6 +40,7 @@ from aiomoqt.utils import cli as _cli
 from aiomoqt.utils.cli import endpoint_url
 from aiomoqt.utils.format import fmt_bps, fmt_ms, fmt_ms_signed
 from aiomoqt.utils.stats import (CLOCK_OFFSET_MARK, CLOCK_OFFSET_MIN_MS,
+                                 KEY_PRUNE_EVERY, KEY_REORDER_SLACK,
                                  note_clock_offset, send_time_us)
 
 
@@ -151,14 +152,17 @@ class LiveStats:
     def __init__(self, object_size: int, window_s: float = 5.0):
         self.object_size = object_size
         self.window_s = window_s
-        # Each event: (monotonic_t, bytes, latency_ms_or_None)
+        # Each event: (monotonic_t, bytes, latency_ms_or_None, lost),
+        # lost = objects found missing when this one arrived.
         self._events: deque = deque()
-        # Loss tracking per (group_id, subgroup_id). Auto-detect stride
-        # so multi-subgroup streams (PublishedTrack strides object IDs
-        # by num_subgroups per subgroup) aren't falsely reported as loss.
+        # Loss tracking per (group_id, subgroup_id), for groups within
+        # the stats key horizon. Auto-detect stride so multi-subgroup
+        # streams (PublishedTrack strides object IDs by num_subgroups
+        # per subgroup) aren't falsely reported as loss.
         self._last_seen: dict = {}
         self._stride: dict = {}
-        self._lost = 0
+        self._newest_gid = -1
+        self._prune_at = 0
         # Jitter (RFC 3550)
         self._last_recv_ms = 0
         self._last_send_ms = 0
@@ -196,11 +200,7 @@ class LiveStats:
                 self._last_recv_ms = recv_time_us
                 self._last_send_ms = send_us
 
-        self._events.append((t, size_bytes, latency))
-        cutoff = t - self.window_s
-        while self._events and self._events[0][0] < cutoff:
-            self._events.popleft()
-
+        lost = 0
         if not is_status:
             gid = getattr(msg, 'group_id', group_id)
             sid = subgroup_id if subgroup_id is not None else 0
@@ -210,6 +210,11 @@ class LiveStats:
             if last is None:
                 # First object seen on this (group, subgroup)
                 self._last_seen[key] = oid
+                if gid is not None and gid > self._newest_gid:
+                    self._newest_gid = gid
+                    if gid >= self._prune_at:
+                        self._prune(gid - KEY_REORDER_SLACK)
+                        self._prune_at = gid + KEY_PRUNE_EVERY
             else:
                 stride = self._stride.get(key)
                 if stride is None and oid > last:
@@ -218,10 +223,20 @@ class LiveStats:
                     self._stride[key] = stride
                 if stride is not None and stride > 0 and oid > last + stride:
                     # Objects missing on this subgroup's stride
-                    self._lost += (oid - last - stride) // stride
+                    lost = (oid - last - stride) // stride
                 if oid > last:
                     self._last_seen[key] = oid
                 # else: reorder/duplicate within this subgroup — ignore
+
+        self._events.append((t, size_bytes, latency, lost))
+        cutoff = t - self.window_s
+        while self._events and self._events[0][0] < cutoff:
+            self._events.popleft()
+
+    def _prune(self, floor: int) -> None:
+        for d in (self._last_seen, self._stride):
+            for k in [k for k in d if k[0] is not None and k[0] < floor]:
+                del d[k]
 
     def sample(self, target_mbps: float) -> Sample:
         t = time.monotonic()
@@ -242,8 +257,8 @@ class LiveStats:
         mean = sum(lats) / len(lats) if lats else 0.0
         p90 = lats[min(int(len(lats) * 0.90), len(lats) - 1)] if lats else 0.0
 
-        total_expected = n + self._lost
-        loss_pct = 100.0 * self._lost / total_expected if total_expected else 0.0
+        lost = sum(e[3] for e in self._events)
+        loss_pct = 100.0 * lost / (n + lost) if n + lost else 0.0
 
         return Sample(
             t=t,
@@ -879,13 +894,17 @@ class AIMDController:
     - Tracks high_water_mbps = highest stable rate seen so far.
     """
 
+    BASELINE_SAMPLES = 1024
+    BASELINE_MATURE = 100
+
     def __init__(self, actuator, state: BenchState,
                  interval_s: float, writer=None,
                  latency_threshold_ms: float = 100.0,
                  backoff_factor: float = 0.9,
                  loss_threshold_pct: float = 0.5,
                  duration_s: float | None = None,
-                 tick_s: float | None = None):
+                 tick_s: float | None = None,
+                 skew_safe: bool = False):
         self.actuator = actuator
         self.state = state
         self.interval_s = interval_s
@@ -907,6 +926,11 @@ class AIMDController:
         self.backoff_factor = backoff_factor
         self.loss_threshold_pct = loss_threshold_pct
         self.duration_s = duration_s
+        # Skew-safe: latency is measured over a running baseline (the
+        # min p90 seen, its 1st percentile once mature), which cancels a
+        # constant clock offset between hosts.
+        self.skew_safe = skew_safe
+        self._p90_seen: deque = deque(maxlen=self.BASELINE_SAMPLES)
         self.shortfall_streak = 0
         self.pressure_streak = 0
         self.hold_intervals = 0
@@ -976,7 +1000,7 @@ class AIMDController:
             #   1.0 = idle (p90 = 0), 0.0 = at SLA, <0 = overshoot.
             # p90 is more sensitive than p50 — catches queue build-up
             # sooner while being less noisy than p99.
-            headroom = (self.latency_threshold_ms - sig.latency_p90_ms) \
+            headroom = (self.latency_threshold_ms - self._control_p90(sig)) \
                 / self.latency_threshold_ms
 
             # Back-off triggers ONLY on sustained p90 latency overshoot.
@@ -1135,6 +1159,22 @@ class AIMDController:
                 continue
             self.hold_intervals = 0
             await self._apply(min(a.max_level, level + step), sig, "ramp")
+
+    def _control_p90(self, sig: Signal) -> float:
+        """The p90 the controller acts on: absolute, or over the
+        running baseline when skew-safe."""
+        if not self.skew_safe:
+            return sig.latency_p90_ms
+        if not sig.latency_known:
+            return 0.0
+        seen = self._p90_seen
+        seen.append(sig.latency_p90_ms)
+        if len(seen) < self.BASELINE_MATURE:
+            baseline = min(seen)
+        else:
+            ordered = sorted(seen)
+            baseline = ordered[len(ordered) // 100]
+        return sig.latency_p90_ms - baseline
 
     def _emit(self, sig: Signal, action: str, force: bool = False) -> None:
         """Throttle console + CSV output to report_s. The control loop
@@ -1576,10 +1616,9 @@ def parse_args():
                 "— subscribe/unsubscribe rate-encoded or additive "
                 "layer tracks — so no out-of-band channel is needed.)")
 
-    # Absolute latency is measured as recv_clock - peer send timestamp:
-    # co-located that is one clock, split it inherits the hosts' offset
-    # straight into the controller's back-off signal. Jitter (a
-    # difference of differences) and shortfall (a count) are immune.
+    # Latency is recv_clock - peer send timestamp: split across hosts it
+    # carries their clock offset, so the controller acts on p90 over a
+    # running baseline instead (AIMDController skew_safe).
     args.skew_safe_signals = args.role != "both"
 
     args.sub_filter = filter_choices[args.sub_filter]
@@ -1634,7 +1673,9 @@ def _print_banner(args):
     if args.mode == "subs":
         cli_name = args.sub_filter.name.lower().replace("_", "-")
         print(f"  subscribe filter:   {cli_name}")
-    print(f"  latency threshold:  {args.latency_threshold:.0f} ms")
+    print(f"  latency threshold:  {args.latency_threshold:.0f} ms"
+          + (" over baseline (split hosts)" if args.skew_safe_signals
+             else ""))
     print(f"  transport:          {_cli.describe_transport(args)}")
     print("─" * 68)
     print()
@@ -1924,6 +1965,7 @@ async def main():
         backoff_factor=args.backoff_factor,
         duration_s=args.duration,
         tick_s=(args.join_rate if args.mode == "subs" else None),
+        skew_safe=args.skew_safe_signals,
     )
 
     server = None

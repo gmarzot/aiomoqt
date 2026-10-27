@@ -136,3 +136,122 @@ async def test_subs_rate_divides_by_the_batch_interval(monkeypatch):
     sig = await _observe(a, 1, active=10, delivering=10,
                          rx_bytes=20 * 1_250_000, dt=2.0)
     assert sig.rx_mbps == pytest.approx(100)
+
+
+# -- bounded per-group state --------------------------------------------
+
+def test_trackstats_state_is_bounded():
+    from aiomoqt.utils.stats import KEY_HORIZON
+    stats = TrackStats(windowed=False)
+    for gid in range(100_000):
+        _feed(stats, gid, 0)
+        _feed(stats, gid, 1)
+    stats.snapshot()
+    assert stats.total_groups == 100_000
+    assert len(stats._expected) <= KEY_HORIZON
+    assert len(stats._stride) <= KEY_HORIZON
+    assert len(stats._recent_groups) <= KEY_HORIZON
+
+
+def test_trackstats_reorder_within_horizon_still_counts():
+    stats = TrackStats(windowed=False)
+    for gid in range(200):
+        for oid in (0, 1, 3):
+            _feed(stats, gid, oid)
+    assert stats.total_lost == 200
+    # Object 2 of a group 40 behind the newest: a reorder, not a loss.
+    _feed(stats, 160, 2)
+    assert stats.total_lost == 199 and stats.total_ooo == 1
+    assert stats.summary()['groups'] == 200
+
+
+def test_livestats_state_is_bounded():
+    from aiomoqt.utils.stats import KEY_HORIZON
+    live = ab.LiveStats(1000)
+    for gid in range(10_000):
+        for oid in (0, 1):
+            msg, now_us = _obj(gid, oid)
+            live.on_object(msg, 1000, now_us)
+    assert len(live._last_seen) <= KEY_HORIZON
+    assert len(live._stride) <= KEY_HORIZON
+
+
+# -- whole-group loss ----------------------------------------------------
+
+def test_missing_middle_group_is_lost_until_it_arrives():
+    stats = TrackStats(group_loss=True)
+    for gid in (0, 1, 3, 4, 5):
+        for oid in range(8):
+            _feed(stats, gid, oid)
+    assert stats.summary()['lost'] == 8
+    for oid in range(8):
+        _feed(stats, 2, oid)
+    assert stats.summary()['lost'] == 0
+
+
+def test_skipped_groups_need_the_opt_in():
+    stats = TrackStats()
+    for gid in (0, 1, 3, 4, 5):
+        for oid in range(8):
+            _feed(stats, gid, oid)
+    assert stats.summary()['lost'] == 0
+
+
+# -- loopback loss window ------------------------------------------------
+
+def test_loopback_loss_is_windowed(monkeypatch):
+    live = ab.LiveStats(1000)
+    monkeypatch.setattr(ab.time, 'monotonic', lambda: 100)
+    for oid in (0, 1, 3):
+        msg, now_us = _obj(0, oid)
+        live.on_object(msg, 1000, now_us)
+    assert live.sample(1).loss_pct == pytest.approx(25.0)
+    monkeypatch.setattr(ab.time, 'monotonic', lambda: 110)
+    for oid in range(10):
+        msg, now_us = _obj(1, oid)
+        live.on_object(msg, 1000, now_us)
+    assert live.sample(1).loss_pct == 0.0
+
+
+# -- split-host clock offset ---------------------------------------------
+
+async def _run_controller(skew_safe, p90s):
+    from unittest.mock import AsyncMock
+    state = ab.BenchState()
+    sigs = [ab.Signal(t=time.monotonic(), level=10, latency_mean_ms=p90,
+                      latency_p90_ms=p90, loss_pct=0, shortfall=False,
+                      target_mbps=10, tx_mbps=10, rx_mbps=10)
+            for p90 in p90s]
+    actions = []
+
+    async def observe():
+        if not sigs:
+            state.stop.set()
+            return ab.Signal(t=time.monotonic(), level=10, latency_mean_ms=0,
+                             latency_p90_ms=0, loss_pct=0, shortfall=False,
+                             target_mbps=10, tx_mbps=10, rx_mbps=10,
+                             latency_known=False)
+        return sigs.pop(0)
+
+    actuator = SimpleNamespace(initial_level=10, unit='Mbps', min_level=1,
+                               max_level=1000, initial_step=10,
+                               step_floor=0.5, apply=AsyncMock(),
+                               observe=observe)
+    ctl = ab.AIMDController(actuator, state, interval_s=0.001,
+                            latency_threshold_ms=100, skew_safe=skew_safe)
+    ctl._emit = lambda sig, action, force=False: actions.append(action)
+    await ctl.run()
+    return actions
+
+
+async def test_constant_clock_offset_does_not_back_off():
+    # Receiver clock 5 s ahead: every p90 reads ~5000 ms.
+    p90s = [5000 + (i % 3) for i in range(12)]
+    assert not any('back-off' in a or 'watch' in a
+                   for a in await _run_controller(True, p90s))
+    assert any('back-off' in a for a in await _run_controller(False, p90s))
+
+
+async def test_queueing_over_the_offset_still_backs_off():
+    p90s = [5000] * 6 + [5300] * 6
+    assert any('back-off' in a for a in await _run_controller(True, p90s))
