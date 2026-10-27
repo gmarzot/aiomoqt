@@ -14,7 +14,8 @@ from aiomoqt.utils.stats import TrackStats, send_time_us
 from aiomoqt.utils.timing import (
     BENCH_TIMESTAMP, CLOCK_ID, LOC_TIMESCALE, LOC_TIMESTAMP,
     OBJECT_TIMESTAMP, SOURCE_BENCH, SOURCE_FRINDELL, SOURCE_LOC, TIMESCALE,
-    TIMESTAMP_MAPPING, TIMESTAMP_ORIGIN, TrackTiming, capture_time_us,
+    TIMESTAMP_MAPPING, TIMESTAMP_ORIGIN, TimestampMalformed, TrackTiming,
+    capture_time_us,
     encode_mapping, zigzag_encode,
 )
 
@@ -152,3 +153,26 @@ def test_track_stats_loc_fast_path_reports_and_respects_loc_timescale():
                     10, W + 2000)
     stats.on_object(_msg(0, 2, {LOC_TIMESTAMP: 99}), 10, W + 3000)
     assert stats.lat_count == 1
+
+
+@pytest.mark.parametrize("base_s", [
+    9e16 / 1000,                    # ~2.8 million years ahead (10-25 garbage)
+    1.0,                            # 1970
+    946_684_799,                    # just before 2000
+], ids=["far-future", "1970", "pre-2000"])
+def test_implausible_wall_clock_mapping_is_malformed(base_s):
+    with pytest.raises(TimestampMalformed, match="not a plausible wall-clock"):
+        _timing({TIMESCALE: 1000, TIMESTAMP_MAPPING: encode_mapping(
+            0, int(base_s * 1000), 33, 0)})
+
+
+def test_plausible_wall_clock_mapping_and_clock_id_bases_pass():
+    _timing({TIMESCALE: 30000, TIMESTAMP_MAPPING: encode_mapping(
+        0, W * 30000 // 1_000_000, 60060, 1001)})
+    # An archive captured years ago is still wall clock.
+    _timing({TIMESCALE: 1000, TIMESTAMP_MAPPING: encode_mapping(
+        0, 1_262_304_000_000, 33, 0)})                  # 2010
+    # With CLOCK_ID the base has no wall-clock meaning: any value.
+    _timing({TIMESCALE: 1000, CLOCK_ID: 7,
+             TIMESTAMP_MAPPING: encode_mapping(0, 1, 33, 0)})
+

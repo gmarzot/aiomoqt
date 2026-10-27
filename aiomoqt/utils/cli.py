@@ -308,15 +308,15 @@ def add_timestamps(p):
                         'both = frindell plus 0x10')
 
 
-def add_timestamp_checking(p):
+def add_timestamp_checking(p, default='cancel', default_help=None):
     """Subscriber policy for timing properties that break
     draft-frindell-moq-timestamp."""
     g = p.add_argument_group('timestamp checking')
     g.add_argument('--timestamp-errors', choices=('cancel', 'report'),
-                   default='cancel',
+                   default=default,
                    help='Malformed timestamp properties: cancel the '
-                        'subscription (default, MOQT §12.1) or report '
-                        'them and keep receiving')
+                        'subscription (MOQT §12.1) or report them and keep '
+                        f'receiving (default: {default_help or default})')
 
 
 # -- validation ------------------------------------------------------

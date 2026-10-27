@@ -39,10 +39,26 @@ SOURCE_LOC = "loc"
 SOURCE_BENCH = "bench"
 
 U64_MAX = (1 << 64) - 1
+# A wall-clock mapping (no CLOCK_ID) whose base lies outside this window
+# is taken as garbage: 2000-01-01 to a day ahead of now.
+WALL_CLOCK_MIN_S = 946_684_800
+WALL_CLOCK_AHEAD_S = 86_400
 
 
 class TimestampMalformed(ValueError):
     """Timing properties that make the track malformed."""
+
+
+def _check_wall_clock_base(base: int, timescale: int) -> None:
+    """Without CLOCK_ID the mapping is wall-clock ticks since 1970 (§4);
+    a base far outside any plausible capture time is a mangled value,
+    such as integers read in the wrong varint encoding."""
+    base_s = base / timescale
+    if not WALL_CLOCK_MIN_S <= base_s <= time.time() + WALL_CLOCK_AHEAD_S:
+        raise TimestampMalformed(
+            f"TIMESTAMP_MAPPING base {base_s:.0f} s since 1970 is not a "
+            f"plausible wall-clock time (a draft or encoding mismatch "
+            f"through a relay?)")
 
 
 def zigzag_encode(v: int) -> int:
@@ -160,6 +176,8 @@ class TrackTiming:
             raise TimestampMalformed("TIMESTAMP_ORIGIN without CLOCK_ID")
         raw = props.get(TIMESTAMP_MAPPING)
         mapping = None if raw is None else decode_mapping(raw, vi64)
+        if mapping is not None and not clock_id:
+            _check_wall_clock_base(mapping[1], timescale)
         return cls(timescale, clock_id or 0, origin or 0, mapping, loc_ts)
 
     def timestamp(self, group_id: int, object_id: int,
