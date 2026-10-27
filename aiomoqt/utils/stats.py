@@ -69,12 +69,25 @@ _LAT_MAX_US = 600_000_000
 CLOCK_OFFSET_MARK = "(clock offset)"
 # Latency above this is rounding on one clock, not an offset (ms).
 CLOCK_OFFSET_MIN_MS = -1.0
+# An offset shifts every sample; a wall-clock step shifts only objects in
+# flight across it (at most step/interval of them). The offset test reads
+# this low percentile, not the minimum, so a step is not an offset.
+CLOCK_OFFSET_PCT = 1
 _clock_warned = False
 
 
+def _offset_figure(sorted_lat: list) -> Optional[float]:
+    """The CLOCK_OFFSET_PCT latency when it is below CLOCK_OFFSET_MIN_MS,
+    else None."""
+    if not sorted_lat:
+        return None
+    v = _pct(sorted_lat, CLOCK_OFFSET_PCT)
+    return v if v < CLOCK_OFFSET_MIN_MS else None
+
+
 def note_clock_offset(lat_ms: float) -> None:
-    """Warn once per process that a sender-stamped latency came out
-    below CLOCK_OFFSET_MIN_MS. The figures are kept: they still compare
+    """Warn once per process that a sender-stamped latency figure came
+    out below CLOCK_OFFSET_MIN_MS. The figures are kept: they still compare
     relatively."""
     global _clock_warned
     if lat_ms < CLOCK_OFFSET_MIN_MS and not _clock_warned:
@@ -387,8 +400,6 @@ class TrackStats:
                 send_us = self._send_us(msg, group_id)
         if send_us is not None and recv_time_us is not None:
             raw = recv_time_us - send_us
-            if raw < 0:
-                note_clock_offset(raw / 1000.0)
             if _LAT_MIN_US <= raw <= _LAT_MAX_US:
                 lat = raw / 1000.0
                 self.lat_count += 1
@@ -569,6 +580,9 @@ class TrackStats:
             self._window = deque(list(self._window)[::2])
             self._win_stride *= 2
         lats = sorted(v for _, v in self._window)
+        off = _offset_figure(lats)
+        if off is not None:
+            note_clock_offset(off)
         iv_objs = self.total_objects - self._snap_objects
         iv_bytes = self.total_bytes - self._snap_bytes
         iv_lost = self.total_lost - self._snap_lost
@@ -602,7 +616,10 @@ class TrackStats:
             avg = sum(self._iv_lat_res.items) / len(self._iv_lat_res.items)
             p99, = self._iv_lat_res.percentiles(99)
             lat_s = f"{fmt_ms_signed(avg)} p99:{fmt_ms_signed(p99)}"
-            skewed = min(self._iv_lat_res.items) < CLOCK_OFFSET_MIN_MS
+            off = _offset_figure(sorted(self._iv_lat_res.items))
+            if off is not None:
+                skewed = True
+                note_clock_offset(off)
         else:
             lat_s = "--"
         expected = self.total_objects + self.total_lost
@@ -641,6 +658,9 @@ class TrackStats:
         var = ((self.lat_sum_sq / self.lat_count) - mean * mean
                if self.lat_count else 0.0)
         p50, p95, p99 = self._lat_res.percentiles(50, 95, 99)
+        off = _offset_figure(sorted(self._lat_res.items))
+        if off is not None:
+            note_clock_offset(off)
         expected = self.total_objects + self.total_lost
         return dict(
             duration_s=dur, active_s=active,
@@ -655,8 +675,7 @@ class TrackStats:
             lat_max=self.lat_max if self.lat_count else 0.0,
             lat_mean=mean, lat_sd=var ** 0.5 if var > 0 else 0.0,
             lat_p50=p50, lat_p95=p95, lat_p99=p99,
-            clock_offset=(bool(self.lat_count)
-                          and self.lat_min < CLOCK_OFFSET_MIN_MS),
+            clock_offset=off is not None,
             jitter_ms=self.jitter,
             lost=self.total_lost, ooo=self.total_ooo,
             ts_source=self.ts_source, ts_malformed=self.ts_malformed,
