@@ -167,10 +167,10 @@ async def test_a_slow_subscriber_sheds_groups_without_holding_up_others(
     assert fast.count >= sent - _RATE, (fast.count, sent)
     assert late.count >= _GROUP, late.count
     assert fast_audio.count and slow_audio.count
-    # The slow one shed whole groups, once per episode, with a WARNING.
+    # The slow one shed whole groups; the first episode logs a WARNING.
     assert shed > 0 and sheds >= 1, (shed, sheds)
     warned = [r for r in caplog.records if "send lane" in r.getMessage()]
-    assert len(warned) == sheds, [r.getMessage() for r in warned]
+    assert len(warned) == 1, [r.getMessage() for r in warned]
     resets = {k: code for k, (clean, code) in slow.ends.items() if not clean}
     assert resets, slow.ends
     assert set(resets.values()) == {StreamResetCode.CANCELLED}, resets

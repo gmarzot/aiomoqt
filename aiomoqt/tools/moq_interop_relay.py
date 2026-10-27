@@ -24,7 +24,9 @@ Limits:
     the live group of a subscribed one: enough to answer a FETCH,
     standalone or joining, over what it still holds; a late subscriber
     starts at the live edge. Past CACHE_BUDGET_BYTES + CACHE_BYTES the
-    largest live group is dropped and the rest of it goes uncached.
+    largest live group is dropped and the rest of it goes uncached. A
+    replay owed objects the cache no longer holds resets that subgroup
+    stream rather than FIN it.
     Cache and lanes charge each object its payload, its properties and
     a per-record overhead (retained_object_bytes).
   * Upstream Forward State is raised for a forwarding subscriber, never
@@ -357,6 +359,8 @@ CACHE_BUDGET_BYTES = 256 * 1024 * 1024
 LANE_BYTES = 4 * 1024 * 1024
 # Live offers between reads of a lane's transport backlog.
 LANE_TX_PROBE = 8
+# Seconds between a subscriber's shed log lines after its first.
+SHED_LOG_S = 10.0
 # Requests one session may hold open; see the module docstring.
 MAX_NAMESPACES_PER_SESSION = 256
 MAX_SUBSCRIPTIONS_PER_SESSION = 1024
@@ -402,7 +406,7 @@ class _Downstream:
 
     __slots__ = ("session", "alias", "request_id", "forward", "window",
                  "joined_at", "replaying", "location_filter", "group_order",
-                 "fills", "range_params", "filters", "lane")
+                 "fills", "range_params", "filters", "lane", "lost")
 
     def __init__(self, session, alias, request_id, forward=True,
                  window=_UNFILTERED):
@@ -430,6 +434,9 @@ class _Downstream:
         self.filters = None
         # Its _SendLane, created with the first object for it.
         self.lane = None
+        # Groups whose replay lacked objects it was owed: their streams
+        # end in a reset.
+        self.lost = ()
 
     def set_filters(self, params, track_properties) -> None:
         self.range_params = params
@@ -540,6 +547,8 @@ class _SendLane:
         self.floor = None        # objects of groups below it are shed
         self.shed = 0            # objects shed
         self.sheds = 0           # shed episodes
+        self._logged_at = None
+        self._logged_sheds = 0
         self.shedding = False
         self.final = False       # PUBLISH_DONE queued: takes nothing more
         self.busy = False        # a write is in progress
@@ -626,12 +635,27 @@ class _SendLane:
         if not self.shedding:
             self.shedding = True
             self.sheds += 1
-            d = self.d
+            self._log_shed()
+
+    def _log_shed(self) -> None:
+        """WARNING on the first shed, then one INFO line per SHED_LOG_S
+        with the episodes since the last line."""
+        now = time.monotonic()
+        if self._logged_at is not None and now - self._logged_at < SHED_LOG_S:
+            return
+        d = self.d
+        who = (f"relay: {self.track.key} subscriber "
+               f"{_peer_address(d.session)} request {d.request_id}")
+        if self._logged_at is None:
             logger.warning(
-                f"relay: {self.track.key} subscriber "
-                f"{_peer_address(d.session)} request {d.request_id} over "
-                f"its {LANE_BYTES}-byte send lane: resetting groups below "
+                f"{who} over its {LANE_BYTES}-byte send lane: resetting "
+                f"groups below {self.floor}")
+        else:
+            logger.info(
+                f"{who} shed {self.sheds - self._logged_sheds} more "
+                f"time(s) over its send lane: resetting groups below "
                 f"{self.floor}")
+        self._logged_at, self._logged_sheds = now, self.sheds
 
     def close_streams(self) -> None:
         """FIN the subscriber's open streams once what is queued is out."""
@@ -706,7 +730,7 @@ class _SendLane:
         try:
             await track._forward_one(d.session, d.alias, gid, sgid, oid,
                                      payload, exts, prio, status, shape,
-                                     encoded, start=d.start)
+                                     encoded, start=d.start, lost=d.lost)
         except (Exception, asyncio.CancelledError):
             if _cancelling():
                 raise
@@ -779,6 +803,9 @@ class _RelayedTrack:
         # Live group dropped at the relay's hard ceiling: the rest of it
         # is not cached.
         self._uncached = None
+        # Group -> largest Object ID dropped from, or never put in, the
+        # cache.
+        self._lost = {}
         # (group, subgroup) whose upstream stream ended cleanly; a replay
         # FINs them on the subscriber it serves.
         self._ended = set()
@@ -1252,6 +1279,7 @@ class _RelayedTrack:
         if self._uncached is not None:
             if gid == self._uncached:
                 self.note_largest((gid, oid))
+                self._note_lost(gid, oid)
                 return
             if gid > self._uncached:
                 self._uncached = None
@@ -1273,6 +1301,7 @@ class _RelayedTrack:
                                or self._cache_bytes > CACHE_BYTES):
             dropped = self._cache.popleft()
             size = retained_object_bytes(dropped[3], dropped[4])
+            self._note_lost(dropped[0], dropped[2])
             self._cache_bytes -= size
             _budget.bytes -= size
             left = self._groups.pop(dropped[0]) - 1
@@ -1305,9 +1334,14 @@ class _RelayedTrack:
         self._uncached = gid
         self._drop_group(gid)
 
+    def _note_lost(self, gid, oid) -> None:
+        if oid > self._lost.get(gid, -1):
+            self._lost[gid] = oid
+
     def _drop_group(self, gid) -> None:
         size = sum(retained_object_bytes(c[3], c[4]) for c in self._cache
                    if c[0] == gid)
+        self._note_lost(gid, max(c[2] for c in self._cache if c[0] == gid))
         self._cache = deque(c for c in self._cache if c[0] != gid)
         del self._groups[gid]
         self._cache_bytes -= size
@@ -1317,6 +1351,9 @@ class _RelayedTrack:
     def _prune(self) -> None:
         """Forget per-group state below the oldest cached group; an
         empty cache leaves the budget's LRU."""
+        floor = (self._cache[0][0] if self._cache
+                 else self.largest[0] if self.largest else 0)
+        self._lost = {g: o for g, o in self._lost.items() if g >= floor}
         if not self._cache:
             _budget.forget(self)
         else:
@@ -1335,6 +1372,7 @@ class _RelayedTrack:
         d.replaying = False
         if d not in self.downstream:
             return
+        d.lost = {g for g, o in self._lost.items() if (g, o) >= d.start}
         objs = sorted((c for c in self._cache if d.passes(c[0], c[2])
                        and d.admits(c[1], c[2], c[5], c[4])),
                       key=lambda c: (c[0], c[1], c[2]))
@@ -1393,7 +1431,7 @@ class _RelayedTrack:
 
     async def _forward_one(self, session, alias, gid, sgid, oid,
                            payload, exts, prio, status=None, shape=None,
-                           encoded=None, start=None):
+                           encoded=None, start=None, lost=()):
         """Write one object downstream, opening the (group, subgroup)
         stream on first sight. Group/subgroup identity is preserved from
         upstream so the downstream sees the publisher's structure. A
@@ -1459,7 +1497,8 @@ class _RelayedTrack:
                 self._sent_streams.get(id(session), 0) + 1
         stream_id, header = entry
         if status in ("END", ObjectStatus.END_OF_GROUP,
-                      ObjectStatus.END_OF_TRACK) and self._short(gid, start):
+                      ObjectStatus.END_OF_TRACK) and (
+                          gid in lost or self._short(gid, start)):
             session.stream_reset(stream_id, StreamResetCode.INTERNAL_ERROR)
             self._streams.pop(skey, None)
             return

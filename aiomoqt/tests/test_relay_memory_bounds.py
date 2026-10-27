@@ -5,6 +5,7 @@ still hold in the transport."""
 import asyncio
 import contextlib
 import gc
+import logging
 import os
 import signal
 import subprocess
@@ -20,6 +21,8 @@ from aiomoqt.delivery import (OBJECT_RECORD_BYTES, ObjectHistory,
 from aiomoqt.tools import moq_interop_relay as relay
 from aiomoqt.track import PublishedTrack, SubscribedTrack
 from aiomoqt.types import ObjectStatus
+
+from aiomoqt.tests.test_relay_send_lanes import _Fake, _obj, _settle
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
 
@@ -191,6 +194,69 @@ def test_the_hard_ceiling_holds_across_live_groups(monkeypatch):
         t._drop_cache()
 
 
+# -- a replay short of objects ends its streams in a reset ------------------
+
+def _ends(fake):
+    return ({e[1] for e in fake.kinds("fin")},
+            {e[1] for e in fake.kinds("reset")})
+
+
+async def _join_and_end(t, gid, window=relay._UNFILTERED):
+    """A late subscriber replaying `t`, then one more object of `gid` and
+    its stream end."""
+    late = _Fake()
+    t.add_downstream(late, 2, 2, window=window, replay=True)
+    await _settle()
+    t.on_object(_obj(gid, 9), 0, 0, gid, 0)
+    t.on_stream_end(gid, 0)
+    await _settle()
+    assert late.kinds("open"), late.log
+    return late
+
+
+async def test_a_late_joiner_into_a_truncated_group_sees_a_reset(
+        monkeypatch):
+    monkeypatch.setattr(relay, "CACHE_BUDGET_BYTES", 1)
+    monkeypatch.setattr(relay, "CACHE_BYTES", 5_000)
+    tracks = [relay._RelayedTrack(("ns", n)) for n in ("a", "b")]
+    early = {t.key: _Fake() for t in tracks}
+    try:
+        for t in tracks:
+            t.add_downstream(early[t.key], 1, 1)
+        for oid in range(4):
+            for t in tracks:
+                t.on_object(_obj(0, oid), 0, 0, 0, 0)
+                await _settle(5)
+        assert relay._budget.truncations >= 1
+        (t,) = [t for t in tracks if t._uncached == 0]
+        late = await _join_and_end(t, 0)
+        assert _ends(late)[0] == set() and _ends(late)[1], late.log
+        # Live delivery was whole: FINed.
+        fins, resets = _ends(early[t.key])
+        assert fins and not resets
+    finally:
+        for t in tracks:
+            t.close()
+
+
+# A window starting at what the cache still holds is whole: FINed.
+@pytest.mark.parametrize("start, whole", [((0, 0), False), ((0, 2), True)])
+async def test_a_late_joiner_into_a_partly_evicted_group_sees_a_reset(
+        monkeypatch, start, whole):
+    monkeypatch.setattr(relay, "CACHE_BYTES", 2_500)
+    t = relay._RelayedTrack(("ns", "t"))
+    try:
+        t.add_downstream(_Fake(), 1, 1)
+        for oid in range(4):
+            t.on_object(_obj(0, oid), 0, 0, 0, 0)
+            await _settle(5)
+        assert [c[2] for c in t._cache] == [2, 3]
+        fins, resets = _ends(await _join_and_end(t, 0, (start, None)))
+        assert (bool(fins), bool(resets)) == (whole, not whole)
+    finally:
+        t.close()
+
+
 # -- live, over both transports --------------------------------------------
 
 @requires_certs
@@ -268,8 +334,9 @@ def _ring_backlog(session):
 
 @requires_certs
 @pytest.mark.skipif(sys.platform == "win32", reason="SIGSTOP")
-async def test_a_stalled_raw_quic_viewer_is_bounded(monkeypatch):
+async def test_a_stalled_raw_quic_viewer_is_bounded(monkeypatch, caplog):
     monkeypatch.setattr(relay, "LANE_BYTES", 1 << 20)
+    caplog.set_level(logging.WARNING, logger="aiomoqt.relay")
     for table in (relay._announced, relay._announce_requests, relay._tracks):
         table.clear()
     ns, name = "membounds/stall", "video"
@@ -301,7 +368,11 @@ async def test_a_stalled_raw_quic_viewer_is_bounded(monkeypatch):
             print("peak backlog", peak, "lane", d.lane and d.lane.bytes,
                   "sheds", d.lane and d.lane.sheds)
             assert peak <= relay.LANE_BYTES + 2 * 200_000, peak
-            assert d.lane.sheds >= 1
+            assert d.lane.sheds >= 5
+            # One WARNING, the repeats folded into a line per SHED_LOG_S.
+            warned = [r for r in caplog.records
+                      if "send lane" in r.getMessage()]
+            assert len(warned) == 1, [r.getMessage() for r in warned]
     finally:
         if proc is not None:
             proc.kill()
