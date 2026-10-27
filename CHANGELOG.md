@@ -2,9 +2,11 @@
 
 ## v0.14.0
 
+- aiomoqt-relay: each subscriber has its own bounded send lane, so a slow subscriber no longer throttles a track for the others or starves a late joiner; past the bound it loses whole groups, their streams reset; status shows each subscriber's lane depth and sheds.
 - A control message that closes the session (such as a request at the MAX_REQUEST_ID ceiling) no longer logs a second close as a parse failure.
 - aiomoqt-relay dashboard: a live track takes the history slot of the track ended longest, so busy relays keep charting their live tracks.
 - aiomoqt-relay: a publisher's session closing sends each namespace subscriber one NAMESPACE_DONE, not two; strict players closed the session on the second.
+- aiomoqt-relay deploy: congestion control `bbr` (BBRv3) instead of the relay's `cubic` default.
 - Data streams: an object spanning several chunks is parsed once its bytes have arrived, not again on every chunk.
 - d20/d22 FILL_PARAMETERS: a Length-prefixed value is read as a counted block when one ends exactly at the Length, else as bare parameters (moxygen's form), so a counted block of ten or more parameters decodes.
 - DEBUG logs no longer report each received stream data chunk, or the QUIC handshake completing, as an unhandled QUIC event.
@@ -19,6 +21,7 @@
 - Servers bind the address they are given (aiopquic 0.7.0): `--bind` and `MOQTServer(host=...)` default to all interfaces, IPv4 and IPv6; `0.0.0.0` is IPv4 only; an address or hostname binds only that. The image passes `--bind` only when `MOQT_BIND` is set.
 - aiomoqt-relay: a REQUEST_UPDATE that arrives while its SUBSCRIBE waits on the upstream is answered after the SUBSCRIBE_OK instead of ahead of it with NOT_SUPPORTED; update replies log `MOQT send:` at INFO.
 - TIMESTAMP_MAPPING's four integers are vi64 at every draft, so the value survives relays that bridge d16 and d18 sessions; d16 sessions still read the RFC 9000 form older peers send.
+- `--compat missing-request-credit`: a d14/d16 peer whose SETUP has no MAX_REQUEST_ID (the Oracle relay) leaves our requests uncapped, with one WARNING, instead of capped at 0; a MAX_REQUEST_ID that arrives is still honoured. `all` includes it.
 
 ## v0.13.3
 

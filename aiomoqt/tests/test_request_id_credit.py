@@ -149,3 +149,58 @@ async def test_no_max_request_id_means_no_requests(draft, params):
     await s._handle_max_request_id(MaxSubscribeId(request_id=2))
     s.track_status("n", "t")
     assert [m for m in s.sent if isinstance(m, TrackStatus)]
+
+
+@pytest.fixture
+def missing_credit(monkeypatch):
+    monkeypatch.setattr(_MOQTSessionMixin, "_tolerate_missing_request_credit",
+                        True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("draft", [14, 16])
+async def test_compat_lets_requests_out_without_max_request_id(
+        draft, missing_credit, caplog):
+    # --compat missing-request-credit: an absent MAX_REQUEST_ID leaves our
+    # requests uncapped, with one WARNING, and no REQUESTS_BLOCKED.
+    s = _stub(draft)
+    with caplog.at_level("WARNING", logger="aiomoqt.protocol"):
+        s._ingest_request_limit({})
+    assert s._peer_request_limit is None
+    assert [r.message for r in caplog.records].count(
+        "MOQT: peer SETUP has no MAX_REQUEST_ID; sending requests without "
+        "credit (--compat missing-request-credit)") == 1
+    for _ in range(3):
+        s.track_status("n", "t")
+    assert len([m for m in s.sent if isinstance(m, TrackStatus)]) == 3
+    assert not [m for m in s.sent
+                if type(m).__name__ == "SubscribesBlocked"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("draft", [14, 16])
+async def test_compat_still_honours_a_max_request_id(draft, missing_credit):
+    s = _stub(draft)
+    s._ingest_request_limit({SetupParamType.MAX_REQUEST_ID: 2})
+    s.track_status("n", "t")
+    with pytest.raises(MOQTRequestError):
+        s.track_status("n", "t")
+    # One arriving later caps an uncapped session too.
+    u = _stub(draft)
+    u._ingest_request_limit({})
+    await u._handle_max_request_id(MaxSubscribeId(request_id=2))
+    u.track_status("n", "t")
+    with pytest.raises(MOQTRequestError):
+        u.track_status("n", "t")
+
+
+def test_apply_compat_sets_missing_request_credit(monkeypatch):
+    from aiomoqt.utils.workers import apply_compat
+    monkeypatch.setattr(_MOQTSessionMixin, "_tolerate_missing_request_credit",
+                        False)
+    apply_compat("missing-request-credit")
+    assert _MOQTSessionMixin._tolerate_missing_request_credit is True
+    monkeypatch.setattr(_MOQTSessionMixin, "_tolerate_missing_request_credit",
+                        False)
+    apply_compat("all")
+    assert _MOQTSessionMixin._tolerate_missing_request_credit is True

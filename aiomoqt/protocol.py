@@ -733,6 +733,9 @@ class _MOQTSessionMixin:
     REQUEST_ID_WINDOW = 10000
     _local_request_max: Optional[int] = None
     _peer_request_limit: Optional[int] = None
+    # --compat missing-request-credit: a peer SETUP without MAX_REQUEST_ID
+    # leaves our requests uncapped instead of at 0.
+    _tolerate_missing_request_credit = False
     _requests_blocked_sent = False
 
     def _allocate_request_id(self, opener: bool = True) -> int:
@@ -5966,6 +5969,12 @@ class _MOQTSessionMixin:
         if self._profile.control_uni_pair:
             return
         limit = (params or {}).get(SetupParamType.MAX_REQUEST_ID)
+        if limit is None and self._tolerate_missing_request_credit:
+            logger.warning("MOQT: peer SETUP has no MAX_REQUEST_ID; sending "
+                           "requests without credit (--compat "
+                           "missing-request-credit)")
+            self._peer_request_limit = None
+            return
         self._peer_request_limit = 0 if limit is None else int(limit)
 
     async def _handle_max_request_id(self, msg: MaxSubscribeId) -> None:
