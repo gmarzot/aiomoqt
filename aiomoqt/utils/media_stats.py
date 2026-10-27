@@ -22,11 +22,14 @@ from typing import Callable, Dict, List, Optional, Tuple
 from ..media.cmaf import chunk_decode_time
 from ..types import ObjectStatus
 from .format import fmt_bps, fmt_ms, fmt_rate
+from .logger import get_logger
 from .stats import (CLOCK_OFFSET_MARK, CLOCK_OFFSET_MIN_MS, LOC_TIMESCALE,
                     _pct, _Reservoir, note_clock_offset)
 from .timing import (
     SOURCE_FRINDELL, TimestampMalformed, TrackTiming, capture_time_us,
 )
+
+logger = get_logger(__name__)
 
 SOURCE_FRINDELL_MEDIA = "frindell-media"
 SOURCE_TFDT = "tfdt"
@@ -100,6 +103,8 @@ class TrackAnalysis:
         self.timing: Optional[TrackTiming] = None
         self.ts_sources: set = set()
         self.ts_malformed = 0
+        # Objects whose frindell capture time is not near the receive clock.
+        self.ts_implausible = 0
 
         self.objects = 0
         self.bytes = 0
@@ -237,6 +242,14 @@ class TrackAnalysis:
         else:
             self._transit_p.add(transit)
         self._playout(oid, m_us, recv_us)
+
+    def drop_latency(self) -> None:
+        """Treat the track as media time: discard latency taken so far."""
+        self.wall = False
+        self._lat = _Reservoir(10000)
+        self._lat_sum = 0.0
+        self.lat_max = self.lat_min = None
+        self._iv_lat = []
 
     def end_group(self, gid: int, eog_oid: int, recv_us: int) -> None:
         """END_OF_GROUP status: no object at or past `eog_oid` exists."""
@@ -571,7 +584,8 @@ class TrackAnalysis:
             buf_min_ms=self.buf_min, buf_p50_ms=buf_p50,
             pre_anchor=self.pre_anchor, wall=self.wall, timed=self.timed,
             ts_source='+'.join(sorted(self.ts_sources)) or None,
-            ts_malformed=self.ts_malformed)
+            ts_malformed=self.ts_malformed,
+            ts_implausible=self.ts_implausible)
 
 
 CSV_FIELDS = (
@@ -638,7 +652,10 @@ class MediaAnalysis:
         try:
             cap, src = capture_time_us(timing, group_id, msg.object_id, exts)
             if src == SOURCE_FRINDELL:
-                ts, scale, wall = cap, None, True
+                ts, scale, wall = cap, None, self._frindell_wall(t, cap,
+                                                                recv_us)
+                if not wall:
+                    src = SOURCE_FRINDELL_MEDIA
             elif src is None and timing.declared:
                 media = timing.media_us(group_id, msg.object_id, exts)
                 if media is not None:
@@ -666,6 +683,22 @@ class MediaAnalysis:
                   ts, scale, ends_group=ends, last_in_group=last,
                   prior_gap=exts.get(PRIOR_GROUP_ID_GAP, 0) or 0,
                   wall=wall, source=src)
+
+    @staticmethod
+    def _frindell_wall(t: TrackAnalysis, cap: int, recv_us: int) -> bool:
+        """Whether frindell capture time `cap` counts as wall clock. A
+        valid mapping can compute times far from now; the first such
+        object makes the whole track media time."""
+        if wall_clock_us(cap, None, recv_us) is None:
+            if t.ts_implausible == 0:
+                logger.warning(
+                    f"{t.name}: computed capture time {cap / 1e6:.0f} s "
+                    f"since 1970 is not within a day of now; latency not "
+                    f"reported (media time, or a draft or encoding mismatch "
+                    f"through a relay?)")
+                t.drop_latency()
+            t.ts_implausible += 1
+        return t.ts_implausible == 0
 
     def on_stream_end(self, name: str, group_id: int,
                       subgroup_id: Optional[int], clean: bool,
@@ -794,6 +827,9 @@ def _notes(r: dict) -> List[str]:
     if r.get('ts_malformed'):
         out.append(f"{r['ts_malformed']} objects with malformed timestamp "
                    f"properties")
+    if r.get('ts_implausible'):
+        out.append(f"{r['ts_implausible']} objects with capture times not "
+                   f"within a day of the receive clock; no latency")
     if r['pending']:
         out.append(f"{r['pending']} missing objects still pending at "
                    f"the end")

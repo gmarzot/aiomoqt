@@ -200,11 +200,11 @@ async def test_publish_first_is_answered_then_raised():
                                 publish_track=True)
             for _ in range(100):
                 t = _track_for("relay/pf")
-                if t is not None and t.parked is not None:
+                if t is not None and t.paused:
                     break
                 await asyncio.sleep(0.02)
             t = _track_for("relay/pf")
-            assert t is not None and t.parked is not None, (
+            assert t is not None and t.paused, (
                 "PUBLISH was held with no subscriber to wait for")
 
             got = []
@@ -225,7 +225,7 @@ async def test_publish_first_is_answered_then_raised():
                         break
                     await asyncio.sleep(0.02)
             assert got == _FRAMES, f"publish-first delivered {got}"
-            assert _track_for("relay/pf").parked is None, (
+            assert not _track_for("relay/pf").paused, (
                 "forward state was never raised")
     finally:
         handle.close()
@@ -258,7 +258,7 @@ async def test_no_subscriber_to_offer_means_the_reply_is_answered(draft):
             await asyncio.sleep(0.3)
             t = _track_for("relay/pre18")
             assert t is not None, "no track registered"
-            assert t.parked is not None, (
+            assert t.paused, (
                 f"d{draft} held the PUBLISH with nobody to offer it to; "
                 f"a publisher waiting on PUBLISH_OK before it subscribes "
                 f"deadlocks")
@@ -310,7 +310,7 @@ async def test_a_waiting_prefix_subscriber_still_holds_the_reply():
                     await asyncio.sleep(0.02)
                 t = _track_for("relay/sf")
                 assert t is not None, "no track registered"
-                assert t.parked is None, (
+                assert not t.paused, (
                     "the reply was answered early instead of held")
             assert got == _FRAMES, f"subscribe-first delivered {got}"
     finally:
@@ -521,7 +521,7 @@ async def _flowing(port, use_quic, draft=18):
                 await track.publish(announce_namespace=False,
                                     publish_track=True)
             for _ in range(100):
-                if all(_relayed(n) is not None and _relayed(n).parked
+                if all(_relayed(n) is not None and _relayed(n).paused
                        for n in _SIZES):
                     break
                 await asyncio.sleep(0.02)
@@ -577,7 +577,7 @@ async def test_a_forward_0_subscriber_gets_nothing_until_it_updates(
                                    wait_response=True)
         await asyncio.sleep(0.3)
         assert objects["video"] == [] and objects["audio"]
-        assert _relayed("video").parked is not None
+        assert _relayed("video").paused
         await rx.request_update(video.request_id, forward=1,
                                 wait_response=True)
         for _ in range(100):
@@ -835,8 +835,8 @@ async def test_a_subscribe_tracks_offer_carries_largest_and_the_cache(
 @requires_certs
 @pytest.mark.asyncio
 @_TRANSPORTS
-async def test_d14_parked_publishes_are_raised_by_subscribe_update(use_quic):
-    # d14 §9.10: the update that raises a parked PUBLISH is SUBSCRIBE_UPDATE,
+async def test_d14_paused_publishes_are_raised_by_subscribe_update(use_quic):
+    # d14 §9.10: the update that raises a paused PUBLISH is SUBSCRIBE_UPDATE,
     # which carries Start, End Group, Priority and Forward as fields.
     async with _flowing(_flow_port(6, use_quic), use_quic,
                         draft=14) as subscriber:
@@ -848,7 +848,7 @@ async def test_d14_parked_publishes_are_raised_by_subscribe_update(use_quic):
                 break
             await asyncio.sleep(0.02)
         assert all(objects[n] for n in _SIZES), objects
-        assert all(_relayed(n).parked is None for n in _SIZES)
+        assert not any(_relayed(n).paused for n in _SIZES)
         assert rx._close_err is None
 
 
@@ -1024,7 +1024,7 @@ class _Obj:
 async def test_relay_flags_reach_the_server(monkeypatch):
     monkeypatch.setattr("sys.argv", ["moq_interop_relay"])
     transport = relay.transport_settings(relay.parse_args())
-    assert transport == {"congestion_control_algorithm": "cubic",
+    assert transport == {"congestion_control_algorithm": "bbr",
                          "max_connections": 4096,
                          "stream_ring_cap": 1 << 20,
                          "tx_max_inflight_bytes": 512 << 10}
@@ -1032,7 +1032,7 @@ async def test_relay_flags_reach_the_server(monkeypatch):
                                  **transport)
     assert (server.congestion_control_algorithm, server.max_connections,
             server.stream_ring_cap, server.tx_max_inflight_bytes) == (
-                "cubic", 4096, 1 << 20, 512 << 10)
+                "bbr", 4096, 1 << 20, 512 << 10)
 
 
 @requires_certs

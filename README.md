@@ -317,7 +317,7 @@ python -m aiomoqt.tools.moq_interop_client -l                                   
 
 `aiomoqt-relay` (module `moq_interop_relay`, also installed as `moq-interop-relay`) is a MoQT relay built on aiomoqt, serving raw QUIC and WebTransport at drafts 14 to 22. It forwards objects from an upstream publisher to downstream subscribers, fans one upstream subscription out to several subscribers, serves both publish flows (`PUBLISH_NAMESPACE` and bare `PUBLISH`), offers `PUBLISH` to `SUBSCRIBE_TRACKS` subscribers, and dials upstream origins with `--upstream`. A recent-object cache per track (8 groups, 32 MiB) answers standalone and joining FETCH; one relay-wide budget (`--cache-bytes`, default 256 MiB) caps all tracks together by dropping the oldest group of the least recently used track, and past the budget plus 32 MiB the largest live group goes uncached. Cache and send lanes charge each object its payload, its properties and about 192 bytes of record overhead. A late subscriber starts at the live edge. It runs the public relay at `aiomoqt-relay.marzresearch.net`, and moxygen's moqtest conformance suite and the interop runner test against it.
 
-Limits: no authentication, authorization or rate limiting; each subscriber's send lane holds up to 4 MiB, counting what its streams still hold in the transport, and a subscriber that falls further behind loses whole groups, their streams reset, and a lane that completes no write for 10 s logs one `lane stalled` WARNING; upstream Forward State is raised, never lowered; no delivery timeout. Written in Python, it carries less traffic than the Rust and C++ relays. Because the relay re-encodes everything it forwards, a conformance client checking those objects is checking aiomoqt's encoder, not merely its routing.
+Limits: no authentication, authorization or rate limiting; each subscriber's send lane holds up to 4 MiB, counting what its streams still hold in the transport, and a subscriber that falls further behind loses whole groups, their streams reset, and a lane that completes no write for 10 s logs one `lane stalled` WARNING; upstream Forward State is raised for a viewer and lowered once no viewer has forwarded the track for `--pause-after` seconds (default 60, 0 = never); no delivery timeout. Written in Python, it carries less traffic than the Rust and C++ relays. Because the relay re-encodes everything it forwards, a conformance client checking those objects is checking aiomoqt's encoder, not merely its routing.
 
 ```bash
 aiomoqt-relay --port 4443 \
@@ -402,9 +402,9 @@ python -m aiomoqt.versions
 ```
 
 ```
-aiomoqt:   0.13.1 (~/.venv/lib/python3.13/site-packages/aiomoqt) [2026-10-21 16:43]
-aiopquic:  0.6.1 (~/.venv/lib/python3.13/site-packages/aiopquic) [2026-10-21 16:43]
-  - picoquic:  1.1.53.0 (2026.10.08.c908872-0-c9088724) [2026-10-08]
+aiomoqt:   0.14.0 (~/.venv/lib/python3.13/site-packages/aiomoqt) [2026-10-27 17:17]
+aiopquic:  0.7.0 (~/.venv/lib/python3.13/site-packages/aiopquic) [2026-10-27 17:17]
+  - picoquic:  1.1.53.0 (2026.10.22.70b5fd5-0-70b5fd5a) [2026-10-22]
   - picotls:   master (f06553b8) [2026-09-30]
   - openssl:   OpenSSL 3.5.8 (~/.venv/lib/python3.13/site-packages/aiopquic.libs/libcrypto-c37e28d8.so.3.5.8)
 ```

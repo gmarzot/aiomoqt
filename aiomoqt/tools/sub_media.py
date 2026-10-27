@@ -53,7 +53,7 @@ from aiomoqt.media.cmaf import init_timescale
 from aiomoqt.media.loc import LOC_PROP_TIMESCALE
 from aiomoqt.types import MOQTRequestError
 from aiomoqt.media.sources import (
-    IvfWriter, adts_frame, avcc_param_sets, lp_to_annexb,
+    IvfWriter, adts_frame, as_annexb, avcc_param_sets,
 )
 from aiomoqt.utils import cli as _cli
 from aiomoqt.utils.media_stats import (
@@ -216,13 +216,13 @@ class _Writers:
             param_sets = (avcc_param_sets(config)
                           if frame.key_frame and config else b'')
             if self.pipe_role == 'video':
-                self._pipe(param_sets + lp_to_annexb(frame.payload))
+                self._pipe(param_sets + as_annexb(frame.payload))
                 return
             if self.video is None:
                 self.video = open(os.path.join(self.out, 'video.h264'),
                                   'wb')
             self.video.write(param_sets)
-            self.video.write(lp_to_annexb(frame.payload))
+            self.video.write(as_annexb(frame.payload))
         elif role == 'audio' and (entry.codec or '').startswith('mp4a'):
             # Raw AAC AUs; the AudioSpecificConfig arrives via catalog
             # initRef. ADTS-wrapped output is directly playable.
@@ -428,8 +428,7 @@ async def run(args):
         use_quic=relay.use_quic, verify_tls=not args.insecure,
         supported_drafts=args.draft, debug=args.debug,
         keylog_filename=args.keylogfile,
-        congestion_control_algorithm=args.cc_algo,
-        keep_alive_interval=args.keepalive,
+        **_cli.transport_kwargs(args),
     )
     _status(f"  relay: {relay}  namespace: {args.namespace}")
     rc = 0

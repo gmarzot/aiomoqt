@@ -343,3 +343,21 @@ def test_loopback_bench_insecure(monkeypatch, argv, insecure):
 def test_every_tool_takes_the_logging_flags(tool):
     flags = {o for a in _parser_actions(tool) for o in a.option_strings}
     assert {"--log-level", "--log"} <= flags
+
+
+@pytest.mark.parametrize("argv, expected", [
+    ([], {}),
+    (["--cc-algo", "cubic", "--max-queued-bytes", "0",
+      "--max-inflight-bytes", "0", "--keepalive", "2.5"],
+     {"congestion_control_algorithm": "cubic", "tx_max_queued_bytes": 0,
+      "tx_max_inflight_bytes": None, "keep_alive_interval": 2.5}),
+    (["--max-inflight-bytes", "4096"], {"tx_max_inflight_bytes": 4096}),
+])
+def test_transport_kwargs(argv, expected):
+    p = argparse.ArgumentParser()
+    cli.add_session(p)
+    cli.add_keepalive(p)
+    cc_default = p.get_default("cc_algo")
+    if cc_default is not None:
+        expected.setdefault("congestion_control_algorithm", cc_default)
+    assert cli.transport_kwargs(p.parse_args(argv)) == expected

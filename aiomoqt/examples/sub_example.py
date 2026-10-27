@@ -37,9 +37,8 @@ def parse_args():
     parser.add_argument('--subscribe-options', type=int, default=None,
                         help='d16 subscribe_namespace options: 0=PUBLISH, 1=NAMESPACE, 2=both')
     parser.add_argument('--cc-algo', type=str, default='bbr',
-                        help='Congestion control algorithm '
-                             '(bbr | bbr1 | newreno | cubic | dcubic | '
-                             'prague | fast). Default: bbr')
+                        help='Congestion control (bbr | bbr1 | c4 | cubic | '
+                             'dcubic | fast | newreno | prague). Default: bbr')
 
     add_help(parser)
     args = parser.parse_args()

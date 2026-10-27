@@ -180,7 +180,7 @@ class Track:
         self.num_subgroups = num_subgroups
         self.rate = rate
         self.track_alias: int = 0
-        self.request_id: int = 0
+        self.request_id: Optional[int] = None
         self.state: TrackState = TrackState.IDLE
         self._tasks: set = set()
 
@@ -438,7 +438,7 @@ class _Subscription:
     def __init__(self, session):
         self.session = session
         self.track_alias: int = 0
-        self.request_id: int = 0
+        self.request_id: Optional[int] = None
         # request_id from the relay's SUBSCRIBE, for PUBLISH_DONE.
         self.subscribe_request_id = None
         # Request ids subscribed through this peer; it idles when this
@@ -795,11 +795,11 @@ class PublishedTrack(Track):
         self._subs[0].track_alias = value
 
     @property
-    def request_id(self) -> int:
+    def request_id(self) -> Optional[int]:
         return self._subs[0].request_id
 
     @request_id.setter
-    def request_id(self, value: int) -> None:
+    def request_id(self, value: Optional[int]) -> None:
         self._subs[0].request_id = value
 
     @property
@@ -1576,8 +1576,7 @@ class PublishedTrack(Track):
         sub = self._sub_for(session)
         # d14 carries the relay's SUBSCRIBE request_id; d16's REQUEST_
         # UPDATE flow has none, so fall back to our own PUBLISH
-        # request_id. Sending request_id=0/None makes the relay reject
-        # it as "publishDone for invalid id=0".
+        # request_id. None means no request was assigned; 0 is valid.
         req_id = sub.subscribe_request_id
         if req_id is None:
             req_id = sub.request_id
@@ -1588,7 +1587,7 @@ class PublishedTrack(Track):
         for rid in (*sub.subscribers, sub.request_id,
                     sub.subscribe_request_id):
             session._unbind_request(rid)
-        if not req_id:
+        if req_id is None:
             return
         # Streams this peer was actually sent, which is the delivery's
         # count when one carried the track.
@@ -2025,6 +2024,7 @@ class SubscribedTrack(Track):
         self.auth_token = auth_token
         self.publish_done: Optional[object] = None  # received PUBLISH_DONE
         self.completed = False  # True if track ended cleanly
+        self.cancelled = False  # True once unsubscribe() ended it
         # Largest Location the publisher reported in SUBSCRIBE_OK or
         # PUBLISH, as (group, object); None when it reported none.
         self.largest: Optional[tuple] = None
@@ -2289,7 +2289,9 @@ class SubscribedTrack(Track):
         """The discovered PUBLISH, or the peer's refusal of SUBSCRIBE_TRACKS.
         A reply that times out leaves the PUBLISH wait running; a PUBLISH
         wait that times out names the tracks offered instead."""
+        from .protocol import _MOQTSessionMixin
         offered = []
+        prefix = _MOQTSessionMixin._make_namespace_tuple(self.namespace)
 
         async def _matching():
             try:
@@ -2299,6 +2301,14 @@ class SubscribedTrack(Track):
                         name = (msg.track_name.decode()
                                 if isinstance(msg.track_name, bytes)
                                 else msg.track_name)
+                        ns = tuple(p.encode() if isinstance(p, str) else p
+                                   for p in msg.track_namespace)
+                        if ns[:len(prefix)] != prefix:
+                            # Outside the requested namespace.
+                            offered.append('/'.join(
+                                [p.decode(errors='replace') for p in ns]
+                                + [name]))
+                            continue
                         if trackname is None or name == trackname:
                             return msg
                         offered.append(name)
@@ -2350,9 +2360,20 @@ class SubscribedTrack(Track):
 
         self.session.register_publish_done_handler(request_id, _done)
 
+    def unsubscribe(self) -> None:
+        """Cancel the subscription and end the track: wait_closed()
+        returns, with `cancelled` set and `completed` False."""
+        if self.cancelled:
+            return
+        self.cancelled = True
+        if self.request_id is not None and self.publish_done is None:
+            self.session._timing_watch.pop(self.track_alias, None)
+            self.session.unsubscribe(self.request_id)
+        self._done_event.set()
+
     async def wait_closed(self) -> None:
-        """Wait for this track to end: its PUBLISH_DONE, or the session
-        closing under it.
+        """Wait for this track to end: its PUBLISH_DONE, unsubscribe(),
+        or the session closing under it.
 
         Sets self.completed if the track ended cleanly (no StreamReset).
         """
@@ -2366,7 +2387,7 @@ class SubscribedTrack(Track):
                 if not fut.done():
                     fut.cancel()
         self.state = TrackState.CLOSED
-        if self.malformed is not None:
+        if self.malformed is not None or self.cancelled:
             self.completed = False
             return
         if self.publish_done is not None:

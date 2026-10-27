@@ -249,10 +249,9 @@ def add_session(p):
     p.add_argument('--keylogfile', type=str, default=None,
                    help='TLS secrets log (NSS Key Log Format) for '
                         'Wireshark decryption')
-    p.add_argument('--cc-algo', type=str, default=None,
-                   help='Congestion control (bbr | bbr1 | newreno | '
-                        'cubic | dcubic | prague | fast). Default: '
-                        'aiopquic default (bbr1)')
+    p.add_argument('--cc-algo', type=str, default='bbr',
+                   help='Congestion control (bbr | bbr1 | c4 | cubic | '
+                        'dcubic | fast | newreno | prague). Default: bbr')
     p.add_argument('--max-queued-bytes', type=int, default=None,
                    help='Aggregate publisher TX budget across ALL '
                         'streams. Default: aiopquic default (4 MiB). '
@@ -262,6 +261,37 @@ def add_session(p):
                         '(1 MiB). 0 disables.')
     p.add_argument('--quic-debug', action='store_true',
                    help='Verbose QUIC-layer logging')
+
+
+def transport_kwargs(args) -> dict:
+    """MOQTClient / MOQTServer transport kwargs from the --cc-algo,
+    --max-queued-bytes, --max-inflight-bytes and --keepalive flags. An
+    unset flag is left out so the library default applies;
+    --max-inflight-bytes 0 maps to None (disabled)."""
+    kw = {}
+    for attr, key in (('cc_algo', 'congestion_control_algorithm'),
+                      ('max_queued_bytes', 'tx_max_queued_bytes'),
+                      ('keepalive', 'keep_alive_interval')):
+        value = getattr(args, attr, None)
+        if value is not None:
+            kw[key] = value
+    inflight = getattr(args, 'max_inflight_bytes', None)
+    if inflight is not None:
+        kw['tx_max_inflight_bytes'] = inflight or None
+    return kw
+
+
+def describe_transport(args) -> str:
+    """One-line effective CC and TX budgets, for tool banners."""
+    def budget(value, default):
+        if value is None:
+            return default
+        return 'off' if value == 0 else f'{value} B'
+    keepalive = getattr(args, 'keepalive', None)
+    return (f"cc={getattr(args, 'cc_algo', None) or 'default'}  "
+            f"queued={budget(getattr(args, 'max_queued_bytes', None), 'default')}  "
+            f"inflight={budget(getattr(args, 'max_inflight_bytes', None), 'default')}  "
+            f"keepalive={'off' if not keepalive else f'{keepalive:g}s'}")
 
 
 def add_keepalive(p, default=None):

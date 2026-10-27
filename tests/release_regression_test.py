@@ -176,12 +176,11 @@ def _pytest_all(log_dir: Path) -> tuple[str, str]:
     """Every pytest test in one run. Naming files individually leaves new
     test modules silently unrun; the tool-driven suites below cover only
     what pytest cannot reach."""
-    # --durations names the slow tests in the log: the tree runs in ~2s
-    # on Linux and ~200s on macOS. Cause not established.
+    # --durations names the slowest tests in the log.
     extra = [f"--ignore={p}" for p in _PYTEST_STANDALONE]
     extra.append("--durations=10")
     return _pytest_file("aiomoqt/tests", log_dir / "pytest.log", extra,
-                        timeout=900)
+                        timeout=1800)
 
 
 # ---------------------------------------------------------------------------
@@ -421,10 +420,16 @@ def _relay_tap_case(url: str, draft: int, case: str, insecure: bool,
     ok, _ = _run(cmd, log, 90)
     if not ok:
         return "FAIL", "timeout"
-    text = log.read_text()
-    # TAP line for a single-case run: "ok 1 - <case>" or "not ok 1 - ..."
-    if re.search(rf"^ok 1 - {re.escape(case)}", text, re.MULTILINE):
-        return "PASS", "ok"
+    return _tap_case_verdict(log.read_text(), case)
+
+
+def _tap_case_verdict(text: str, case: str) -> tuple[str, str]:
+    """A single-case TAP run: "ok 1 - <case>" passes, with a SKIP directive
+    it is a SKIP and its reason; anything else fails with its message."""
+    m = re.search(rf"^ok 1 - {re.escape(case)}(.*)$", text, re.MULTILINE)
+    if m:
+        skip = re.search(r"# SKIP\s*(.*)", m.group(1), re.IGNORECASE)
+        return ("SKIP", skip.group(1) or "skipped") if skip else ("PASS", "ok")
     m = re.search(r"^  message: (.*)$", text, re.MULTILINE)
     if m:
         return "FAIL", m.group(1).strip('"')
@@ -541,21 +546,24 @@ def _moqdev_smoke(keys: str, out: Path,
 # ---------------------------------------------------------------------------
 def _loopback_adaptive_bench(log_dir: Path) -> tuple[str, str]:
     log = log_dir / "loopback-adaptive-bench.log"
-    # Loopback self-test: short ramp, kill after ~30s so the runner
-    # isn't held open by the forever-probing controller.
-    cmd = ["timeout", "--signal=INT", "--kill-after=3", "30",
+    # Loopback self-test, capped by -t; timeout is the backstop.
+    cmd = ["timeout", "--signal=INT", "--kill-after=3", "40",
            sys.executable, "-m", "aiomoqt.tools.adaptive_bench",
            "--start-mbps", "10", "--step-mbps", "10",
-           "--max-mbps", "500", "--interval", "3",
+           "--max-mbps", "500", "--interval", "3", "-t", "30",
            "--latency-threshold", "100", "-k"]
-    _run(cmd, log, 45)
+    rc = _run_rc(cmd, log, 55)
     text = log.read_text()
-    # fmt_bps emits e.g. "80Mbps" or "1.2Gbps" (no space) — match both
-    # space-and-no-space forms.
+    # fmt_bps emits e.g. "80Mbps" or "1.2Gbps" (no space).
     m = re.search(r"High-water:\s+([\d.]+)\s*([KMGT]?bps)", text)
-    if m:
-        return "PASS", f"high-water {m.group(1)} {m.group(2)}"
-    return "FAIL", "(no summary — check log)"
+    if rc != 0:
+        return "FAIL", f"exit {rc}" + (f", high-water {m.group(1)} {m.group(2)}"
+                                        if m else "")
+    if not m:
+        return "FAIL", "(no summary — check log)"
+    if float(m.group(1)) <= 0:
+        return "FAIL", f"high-water {m.group(1)} {m.group(2)}"
+    return "PASS", f"high-water {m.group(1)} {m.group(2)}"
 
 
 # ---------------------------------------------------------------------------
@@ -650,7 +658,7 @@ def _run_relay_matrix(relay: dict, enabled: set[str],
                 detail = f"{detail} (expected: {xfail_suites[suite]})"
         results.append((status, label, detail, log))
         marker = {"PASS": "[PASS]", "FAIL": "[FAIL]",
-                  "XFAIL": "[XFAIL]"}[status]
+                  "XFAIL": "[XFAIL]", "SKIP": "[skip]"}[status]
         _progress(f"  {marker} {label}  {detail}")
 
     for transport, url in relay["urls"].items():

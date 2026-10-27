@@ -29,8 +29,9 @@ Limits:
     stream rather than FIN it.
     Cache and lanes charge each object its payload, its properties and
     a per-record overhead (retained_object_bytes).
-  * Upstream Forward State is raised for a forwarding subscriber, never
-    lowered again.
+  * Upstream Forward State is raised for a forwarding subscriber and
+    lowered again once none has forwarded for --pause-after seconds;
+    a --catalog-probe catalog keeps flowing.
   * No delivery-timeout enforcement.
   * Namespace tables are in memory and global to the process.
 
@@ -58,6 +59,12 @@ on one port with `--dual` (per-connection ALPN dispatch via aiopquic
 serve_dispatch). `--quic-port N` remains as the legacy two-listener
 arrangement (second raw-QUIC listener sharing the global namespace
 table) for runners that expect distinct endpoints.
+
+Stopping: SIGTERM or SIGINT drains. The relay refuses new sessions, sends
+GOAWAY to every session (New Session URI from --goaway-uri, else empty:
+reconnect to this address), waits up to --drain-timeout seconds for them
+to leave, closes the rest with GOAWAY_TIMEOUT and exits. A second signal
+exits at once.
 """
 
 import argparse
@@ -74,6 +81,7 @@ import os
 import signal
 import sys
 import time
+import tomllib
 from collections import Counter
 from types import SimpleNamespace
 
@@ -83,7 +91,8 @@ from aiomoqt.types import (
     MOQT_DEFAULT_DRAFTS, D18MessageType, FilterType, GroupOrder, MOQTDraft,
     MOQTMessageType, MOQTRequestError, MOQTStreamStopped, ObjectStatus,
     ParamType,
-    RequestErrorCode, SCHEDULING, StreamResetCode, SubscribeDoneCode,
+    RequestErrorCode, SCHEDULING, SessionCloseCode, StreamResetCode,
+    SubscribeDoneCode,
     parse_draft_spec, to_stream_priority,
 )
 from aiomoqt.delivery import retained_object_bytes
@@ -212,6 +221,11 @@ DEFAULT_GROUP_ORDER_PROPERTY = 0x22
 CATALOG_PROBE_DELAYS_S = (0.5, 2.0)
 CATALOG_PROBE_SKIP = b"moq-test"
 _catalog_probe = False
+# --pause-after: seconds a pulled track may go with no forwarding
+# subscriber before its upstream Forward State drops to 0; 0 = never.
+PAUSE_AFTER_S = 60.0
+_pause_after = PAUSE_AFTER_S
+_pause_sweep = None
 
 
 async def _await_upstream(timeout: float = None) -> bool:
@@ -863,9 +877,15 @@ class _RelayedTrack:
         self.upstream = None
         # Flow B: the publisher's PUBLISH, held until someone subscribes.
         self.pending_publish = None   # (session, Publish msg)
-        # Answered with Forward State 0 because nobody could be offered
-        # the track yet; raised with REQUEST_UPDATE when one arrives.
-        self.parked = None            # (session, Publish msg)
+        # Upstream Forward State is 0: answered so in PUBLISH_OK, or
+        # lowered by --pause-after; a forwarding subscriber raises it.
+        self.paused = False
+        # The PUBLISH feeding this track, once answered.
+        self.publish_msg = None
+        # Loop time since which no subscriber has forwarded, else None.
+        self.unwatched_since = None
+        # Resumed after a pause: the next object sets complete_from.
+        self._resync = False
         self.downstream: list[_Downstream] = []
         # Send lanes still running, including those of subscribers that
         # have left `downstream` and are draining to their PUBLISH_DONE.
@@ -1225,6 +1245,10 @@ class _RelayedTrack:
             self._last_gid = gid
         if msg.object_id == 0:
             self._heads.add(gid)
+        if self._resync:
+            # Objects before this one went unsent while paused.
+            self._resync = False
+            self.complete_from = (gid, msg.object_id)
         if self.key[1] == CATALOG_TRACK and msg.object_id == 0:
             _note_catalog(self.key[0], payload)
         # On arrival, so a SUBSCRIBE sees it; objects for the subscriber
@@ -1535,8 +1559,7 @@ class _RelayedTrack:
         upstream so the downstream sees the publisher's structure. A
         stream short of objects from `start` is reset, never FINed
         (§11.3.2). `lane` is told what each write awaits."""
-        if (isinstance(shape, tuple) and shape and shape[0] == "DGRAM"
-                and not _no_datagrams.get(id(session))):
+        if isinstance(shape, tuple) and shape and shape[0] == "DGRAM":
             prof = session._profile
             is_status = (status or ObjectStatus.NORMAL) != ObjectStatus.NORMAL
             if is_status and not prof.merged_datagram_layout:
@@ -1551,15 +1574,8 @@ class _RelayedTrack:
                     payload=payload or b"",
                     end_of_group=bool(shape[1]),
                     status=status or ObjectStatus.NORMAL)
-            try:
-                session.send_dgram_message(dgram.serialize(prof=prof))
-                return
-            except NotImplementedError:
-                # A transport with no datagram TX: deliver on a subgroup
-                # stream rather than drop objects.
-                _no_datagrams[id(session)] = True
-                logger.warning("relay: no datagram TX on this session, "
-                               "forwarding objects on streams")
+            _send_datagram(session, dgram.serialize(prof=prof), alias, gid, oid)
+            return
         skey = (id(session), gid, sgid)
         if skey in self._stopped:
             return
@@ -1757,7 +1773,7 @@ def _forget_session(session) -> None:
         del _track_sub_filters[k]
     _ns_subs[:] = [e for e in _ns_subs if e[0] is not session]
     _announce_subs[:] = [e for e in _announce_subs if e[0] is not session]
-    _no_datagrams.pop(id(session), None)
+    _dgram_drops.pop(id(session), None)
     _subscribing.pop(id(session), None)
     _cap_warned.difference_update(
         [k for k in _cap_warned if k[0] == id(session)])
@@ -2129,7 +2145,7 @@ def _spawn(coro) -> None:
     task.add_done_callback(_background.discard)
 
 
-def _parked_publish(key):
+def _live_published(key):
     """The live track a PUBLISH registered for `key`, else None."""
     track = _tracks.get(key)
     if (track is not None and _track_live(track)
@@ -2247,14 +2263,14 @@ async def _subscribe_publishers(entry):
                 pub.unregister_object_handler(upstream.track_alias)
             refusal = _MANDATORY_REFUSAL
             continue
-        parked = _parked_publish(key)
-        if parked is not None:
+        owned = _live_published(key)
+        if owned is not None:
             # A PUBLISH from another session landed meanwhile and owns
             # the track: never overwrite it.
             _cancel_upstream_subscribe(pub, ns, track_name)
             if upstream.track_alias is not None:
                 pub.unregister_object_handler(upstream.track_alias)
-            return parked, None
+            return owned, None
         track.upstream = upstream
         track.upstream_alias = upstream.track_alias
         track.properties = props
@@ -2488,11 +2504,13 @@ def _answer_publish(track, forward=None) -> None:
                        filter_type=FilterType.LATEST_OBJECT)
     logger.info(f"relay: PUBLISH_OK forward={int(forward)} "
                 f"alias={msg.track_alias}"
-                + ("" if forward else " — parked until a subscriber forwards"))
+                + ("" if forward else " — paused until a subscriber forwards"))
     track.upstream = session
     track.upstream_request_id = msg.request_id
-    track.parked = None if forward else (session, msg)
+    track.paused = not forward
+    track.publish_msg = msg
     track.pending_publish = None
+    _ensure_pause_sweep()
 
 
 def _refuse_publish(session, msg, reason, code=None) -> None:
@@ -2520,22 +2538,101 @@ def _publish_ok_location(msg) -> dict:
     return {"start": start, "end_group": 0, "priority": 128}
 
 
-def _resume_parked_publish(track) -> None:
-    """Raise a parked publisher's Forward State once a subscriber
+def _upstream_request(track):
+    """(session, request id, d14 SUBSCRIBE_UPDATE location) of the
+    request feeding `track`, or None."""
+    up = track.upstream
+    if _is_session(up):
+        msg = track.publish_msg
+        if msg is None:
+            return None
+        return up, msg.request_id, _publish_ok_location(msg)
+    session = getattr(up, "session", None)
+    rid = getattr(up, "request_id", None)
+    if session is None or rid is None:
+        return None
+    return session, rid, {}
+
+
+def _resume_paused(track) -> None:
+    """Raise a paused upstream's Forward State once a subscriber
     forwards."""
-    if track.parked is None or not _forwarding(track):
+    if not track.paused or not _forwarding(track):
         return
-    session, msg = track.parked
-    track.parked = None
-    track.complete_from = _publish_ok_location(msg)["start"]
+    req = _upstream_request(track)
+    if req is None:
+        return
+    session, rid, location = req
+    track.paused = False
+    track.unwatched_since = None
+    if track._objects_in:
+        track.complete_from = None
+        track._resync = True
+    elif track.publish_msg is not None:
+        track.complete_from = location["start"]
     try:
-        session.request_update(msg.request_id, forward=1,
-                               **_publish_ok_location(msg))
-        logger.info(f"relay: REQUEST_UPDATE forward=1 "
-                    f"alias={msg.track_alias}")
+        session.request_update(rid, forward=1, **location)
+        logger.info(f"relay: resumed {track.key} upstream: REQUEST_UPDATE "
+                    f"forward=1 request {rid}")
     except Exception:
-        logger.debug("relay: raising the parked forward state failed",
+        logger.debug("relay: raising the upstream forward state failed",
                      exc_info=True)
+
+
+def _pause_upstream(track) -> None:
+    """Lower the upstream Forward State of a track nobody forwards."""
+    track.unwatched_since = None
+    req = _upstream_request(track)
+    if req is None or not _session_live(req[0]):
+        return
+    session, rid, location = req
+    try:
+        session.request_update(rid, forward=0, **location)
+    except Exception:
+        logger.debug("relay: lowering the upstream forward state failed",
+                     exc_info=True)
+        return
+    track.paused = True
+    logger.info(f"relay: paused {track.key} upstream, no forwarding "
+                f"subscriber for {_pause_after:g}s: REQUEST_UPDATE "
+                f"forward=0 request {rid}")
+
+
+def _pausable(track) -> bool:
+    """Pulled from upstream with no subscriber forwarding it."""
+    if (track.paused or track.finished or track._closed or track.attaching
+            or track.pending_publish is not None or track.upstream is None
+            or track.key in _establishing or _probing(track)):
+        return False
+    return not (any(d.forward and _session_live(d.session)
+                    for d in track.downstream)
+                or any(_held_forwards.get(track.key, ())))
+
+
+async def _sweep_unwatched() -> None:
+    """Pause each track left unwatched for --pause-after seconds."""
+    loop = asyncio.get_running_loop()
+    while _pause_after > 0:
+        await asyncio.sleep(min(max(_pause_after / 4, 0.02), 1.0))
+        now = loop.time()
+        for track in list(_tracks.values()):
+            if not _pausable(track):
+                track.unwatched_since = None
+            elif track.unwatched_since is None:
+                track.unwatched_since = now
+            elif now - track.unwatched_since >= _pause_after:
+                _pause_upstream(track)
+
+
+def _ensure_pause_sweep() -> None:
+    """Run the sweep on this loop while --pause-after is on."""
+    global _pause_sweep
+    if _pause_after <= 0:
+        return
+    loop = asyncio.get_running_loop()
+    if (_pause_sweep is None or _pause_sweep.done()
+            or _pause_sweep.get_loop() is not loop):
+        _pause_sweep = loop.create_task(_sweep_unwatched())
 
 
 def _largest_kwargs(track) -> dict:
@@ -2609,6 +2706,7 @@ def _attach_subscriber(session, msg, track, largest) -> bool:
         track._ensure_drain()
         return False
     _watch_session(session, track.key[0])
+    _ensure_pause_sweep()
     ok = session.subscribe_ok(request_msg=msg, **_largest_kwargs(track),
                               track_properties=track.properties)
     # FORWARD omitted means 1 (§10.2.12).
@@ -2817,7 +2915,7 @@ def _apply_update(session, msg, found, d16: bool) -> None:
         control_log.info(f"MOQT send: {session._msgstr(ok)}")
         session._send_reply(msg.request_id, ok)
         _start_fill(track, d, msg)
-    _resume_parked_publish(track)
+    _resume_paused(track)
 
 
 def _update_filters(session, msg, track, d) -> bool:
@@ -2909,7 +3007,7 @@ async def _relay_subscribe(session, msg):
         await _backfill(track, msg, largest)
         if _attach_subscriber(session, msg, track, largest):
             _answer_publish(track)
-            _resume_parked_publish(track)
+            _resume_paused(track)
             logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
                         f"-> SUBSCRIBE_OK (published track, fanout="
                         f"{len(track.downstream)})")
@@ -2935,7 +3033,7 @@ async def _relay_subscribe(session, msg):
             await _backfill(track, msg, largest)
             if _attach_subscriber(session, msg, track, largest):
                 _answer_publish(track)
-                _resume_parked_publish(track)
+                _resume_paused(track)
                 logger.info(f"relay: subscribe ns={ns} "
                             f"track={msg.track_name} -> SUBSCRIBE_OK "
                             f"(fanout={len(track.downstream)})")
@@ -2987,13 +3085,18 @@ def transport_settings(args) -> dict:
             "tx_max_inflight_bytes": args.max_inflight_bytes}
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="aiomoqt-relay: a MoQT relay (raw QUIC and WebTransport)",
         add_help=False,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
+    parser.add_argument("--config", type=str, default=None, metavar="PATH",
+                        help="Read flags from a TOML file. Keys are long "
+                             "flag names: cache-bytes = 268435456, "
+                             "catalog-probe = true, upstream = [\"URL\"]. "
+                             "Flags on the command line override it.")
     parser.add_argument("--bind", type=str, default=None,
                         help="Bind address (default: all interfaces, IPv4 and IPv6)")
     parser.add_argument("--port", type=int, default=4443,
@@ -3041,6 +3144,22 @@ def parse_args():
                              "namespace's catalog track at once, so the "
                              "dashboard shows its MSF format before anyone "
                              "plays it. Skips namespaces starting moq-test.")
+    parser.add_argument("--pause-after", type=float, default=PAUSE_AFTER_S,
+                        metavar="SEC",
+                        help="Pause a track upstream (Forward State 0) once "
+                             "no subscriber has forwarded it for SEC "
+                             "seconds; the next subscriber resumes it. "
+                             "--catalog-probe catalogs keep flowing. "
+                             f"0 = never. Default: {PAUSE_AFTER_S:g}")
+    parser.add_argument("--goaway-uri", type=str, default="", metavar="URL",
+                        help="New Session URI sent in GOAWAY on SIGTERM or "
+                             "SIGINT. Default: empty, peers reconnect to "
+                             "the same address")
+    parser.add_argument("--drain-timeout", type=float, default=5.0,
+                        metavar="SEC",
+                        help="On SIGTERM or SIGINT, wait up to SEC seconds "
+                             "after GOAWAY for sessions to leave before "
+                             "exiting. Default: 5")
     parser.add_argument("--control", type=str, default=None, metavar="PATH",
                         help="Serve HTTP on the Unix socket PATH: GET /debug "
                              "reports DEBUG logging, POST /debug toggles it")
@@ -3054,12 +3173,10 @@ def parse_args():
                              f"{LOG_FILE_BYTES >> 20} MB x {LOG_FILE_BACKUPS}) "
                              "and send crash and stall dumps to "
                              "DIR/crash.log. Off by default.")
-    # cubic: about 65% more fan-out than bbr on one worker, whose sends
-    # are syscall-bound; bbr's per-peer pacing defeats send batching.
-    parser.add_argument("--cc-algo", type=str, default="cubic",
-                        help="Congestion control (cubic | bbr | bbr1 | c4 | "
-                             "newreno | dcubic | prague | fast). Default: "
-                             "cubic")
+    parser.add_argument("--cc-algo", type=str, default="bbr",
+                        help="Congestion control (bbr | bbr1 | c4 | cubic | "
+                             "dcubic | fast | newreno | prague). Default: "
+                             "bbr")
     parser.add_argument("--max-connections", type=int, default=4096,
                         help="Most connections held at once (aiopquic "
                              ">= 0.5.1). Default: 4096")
@@ -3099,7 +3216,93 @@ def parse_args():
                              "DEBUG, TRACE, INFO")
     add_logging(parser)
     add_help(parser)
-    return parser.parse_args()
+    return _parse_with_config(parser, argv)
+
+
+def _parse_with_config(parser, argv=None):
+    """Parse `argv`, filling flags it does not give from --config."""
+    args = parser.parse_args(argv)
+    if args.config is None:
+        return args
+    try:
+        with open(args.config, "rb") as f:
+            table = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        parser.error(f"--config {args.config}: {e}")
+    given = _given_dests(parser, argv)
+    for key, value in table.items():
+        action = _config_action(parser, key)
+        if action is None:
+            parser.error(f"--config {args.config}: unknown key '{key}'")
+        try:
+            value = _config_value(action, value)
+        except (TypeError, ValueError, argparse.ArgumentTypeError) as e:
+            parser.error(f"--config {args.config}: {key}: {e}")
+        if action.dest not in given:
+            setattr(args, action.dest, value)
+    return args
+
+
+def _given_dests(parser, argv) -> set:
+    """Dests the command line itself sets."""
+    saved = [(a, a.default) for a in parser._actions]
+    for a, _ in saved:
+        a.default = argparse.SUPPRESS
+    try:
+        return set(vars(parser.parse_args(argv)))
+    finally:
+        for a, default in saved:
+            a.default = default
+
+
+def _config_action(parser, key):
+    """The action a --config key names: a long flag, not --config or
+    --help."""
+    for a in parser._actions:
+        if (f"--{key}" in a.option_strings and a.dest != "config"
+                and not isinstance(a, argparse._HelpAction)):
+            return a
+    return None
+
+
+def _config_value(action, value):
+    """A TOML value as the action would store it."""
+    if isinstance(action, (argparse._StoreTrueAction,
+                           argparse._StoreFalseAction,
+                           argparse._StoreConstAction)):
+        if not isinstance(value, bool):
+            raise TypeError(f"expected true or false, got {value!r}")
+        return action.const if value else action.default
+    if isinstance(action, argparse._AppendAction) or action.nargs in (
+            "*", "+") or isinstance(action.nargs, int):
+        if not isinstance(value, list):
+            raise TypeError(f"expected a list, got {value!r}")
+        return [_config_scalar(action, v) for v in value]
+    return _config_scalar(action, value)
+
+
+def _config_scalar(action, value):
+    """One TOML scalar through the action's type and choices."""
+    kind = action.type
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise TypeError(f"expected a {getattr(kind, '__name__', 'string')}, "
+                        f"got {value!r}")
+    if kind is int:
+        if not isinstance(value, int):
+            raise TypeError(f"expected an integer, got {value!r}")
+    elif kind is float:
+        if isinstance(value, str):
+            raise TypeError(f"expected a number, got {value!r}")
+        value = float(value)
+    elif kind is None or kind is str:
+        if not isinstance(value, str):
+            raise TypeError(f"expected a string, got {value!r}")
+    else:
+        value = kind(str(value))
+    if action.choices is not None and value not in action.choices:
+        raise ValueError(f"{value!r} is not one of "
+                         f"{', '.join(map(str, action.choices))}")
+    return value
 
 
 # SUBSCRIBE_TRACKS subscribers: (session, prefix_tuple, request_id).
@@ -3180,7 +3383,7 @@ async def _offer_track(session, track, key, request_id=None):
         pub_msg.request_id,
         lambda rid, t=track, s=session: t.drop_session(s))
     _answer_publish(track)
-    _resume_parked_publish(track)
+    _resume_paused(track)
     logger.info(f"relay: PUBLISH offer accepted for {key} "
                 f"alias={pub_msg.track_alias} forward={int(bool(forward))} "
                 f"(fanout={len(track.downstream)})")
@@ -3203,8 +3406,32 @@ def _reply_window(session, reply, largest):
         raw, prof=session._profile), largest)
 
 
-# id(session) -> True once a datagram send proved unsupported there.
-_no_datagrams: dict = {}
+# id(session) -> datagram objects dropped for not fitting that session.
+_dgram_drops: dict = {}
+
+
+def _send_datagram(session, buf, alias, gid, oid) -> None:
+    """Send one datagram object, or drop it silently when it exceeds the
+    session's datagram limit (0 = no datagram TX): an object keeps its
+    forwarding preference, never moving to a stream."""
+    wire = buf.data
+    limit = session.datagram_max_payload()
+    why = f"{len(wire)}B > {limit}B"
+    if len(wire) <= limit:
+        try:
+            session.send_dgram_message(buf)
+            return
+        except (NotImplementedError, ValueError) as e:
+            why = f"{len(wire)}B: {e}"
+    drops = _dgram_drops.get(id(session), 0) + 1
+    _dgram_drops[id(session)] = drops
+    if drops == 1:
+        logger.warning(f"relay: dropping datagram objects that do not fit "
+                       f"this session (alias={alias}, {why})")
+    elif logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"relay: datagram object {gid}.{oid} alias={alias} "
+                     f"dropped ({why})")
+
 
 # (id(session), request_id) -> objects collected from an upstream FETCH.
 _fetch_sinks: dict = {}
@@ -3948,16 +4175,17 @@ def _track_state(track, flowing) -> str:
         return "ended"
     if track.pending_publish is not None:
         return "held"
-    if track.parked is not None:
-        return "parked"
+    if track.paused:
+        return "parked"  # dashboard.js state name
     return "live" if flowing else "idle"
 
 
 _HISTORY_KEYS = ("t", "ingress_bps", "egress_bps", "media_in_bps",
-                 "media_out_bps", "sessions", "subscribers", "subscriptions",
-                 "tracks",
+                 "media_out_bps", "sessions", "publishers", "namespaces",
+                 "subscribers", "subscriptions", "tracks",
                  "loss_pct", "rtt_p50_ms", "lag_p99_ms", "objects_in_per_s",
-                 "groups_per_s")
+                 "objects_out_per_s", "groups_per_s", "groups_out_per_s",
+                 "drops")
 _PLATFORM_KEYS = ("t", "cpu", "cpu_user", "cpu_nice", "cpu_system",
                   "cpu_iowait", "cpu_irq", "cpu_steal", "proc_cpu",
                   "proc_user", "proc_system", "proc_rss", "mem_used",
@@ -4194,6 +4422,7 @@ class _Status:
                              if delivery and d[2] else None),
                 "namespaces": _session_namespaces(s),
                 "subscriptions": held_subs[id(s)],
+                "dgram_drops": _dgram_drops.get(id(s), 0),
             })
         self._quic_prev = quic
 
@@ -4217,6 +4446,11 @@ class _Status:
                 sum(r["objects_per_s"] or 0 for _, r in tracks), 1)),
             "groups_per_s": (None if dt is None else round(
                 sum(r["groups_per_s"] or 0 for _, r in tracks), 1)),
+            # Delivered rates: each track's input rate times its subscribers.
+            "objects_out_per_s": (None if dt is None else round(sum(
+                (r["objects_per_s"] or 0) * r["subscribers"] for _, r in tracks), 1)),
+            "groups_out_per_s": (None if dt is None else round(sum(
+                (r["groups_per_s"] or 0) * r["subscribers"] for _, r in tracks), 1)),
             # Share of egress not received upstream ("CDN efficiency").
             "efficiency": (max(0.0, 1 - media_in / media_out)
                            if media_out else None),
@@ -4241,12 +4475,17 @@ class _Status:
             "t": round(wall), "ingress_bps": totals["ingress_bps"],
             "egress_bps": totals["egress_bps"], "media_in_bps": media_in,
             "media_out_bps": media_out, "sessions": totals["sessions"],
+            "publishers": totals["publishers"],
+            "namespaces": totals["namespaces"],
             "subscribers": totals["subscribers"],
             "subscriptions": totals["subscriptions"], "tracks": len(tracks),
             "loss_pct": totals["loss_pct"], "rtt_p50_ms": totals["rtt_p50_ms"],
             "lag_p99_ms": lag["p99"],
             "objects_in_per_s": totals["objects_in_per_s"],
+            "objects_out_per_s": totals["objects_out_per_s"],
             "groups_per_s": totals["groups_per_s"],
+            "groups_out_per_s": totals["groups_out_per_s"],
+            "drops": totals["drops"],
         })
         self._add_track_history(tracks)
         self.platform = self._platform(wall, host, totals, lag)
@@ -4500,10 +4739,79 @@ async def _serve_control(path: str) -> None:
     logger.info(f"relay: control socket {path}")
 
 
+# Seconds between drain passes.
+DRAIN_POLL_S = 0.05
+
+
+def _setup_done(session) -> bool:
+    fut = getattr(session, "_moqt_session_setup", None)
+    return (fut is not None and fut.done() and not fut.cancelled()
+            and fut.result() is True)
+
+
+async def _wait_closed(sessions, timeout: float) -> None:
+    """Wait up to `timeout` for closed sessions' connections to leave."""
+    done = [getattr(s, "_cnx_closed", None) or getattr(s, "_closed", None)
+            for s in sessions]
+    waits = [asyncio.ensure_future(ev.wait()) for ev in done
+             if ev is not None]
+    if waits:
+        _, pending = await asyncio.wait(waits, timeout=timeout)
+        for w in pending:
+            w.cancel()
+
+
+async def _drain(servers, uri: str, timeout: float, why: str) -> None:
+    """GOAWAY to every set-up session, refusing any other, then wait up
+    to `timeout` seconds for them to leave; close the rest with
+    GOAWAY_TIMEOUT."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+
+    def live():
+        return [s for srv in servers for s in list(srv._live)
+                if _session_live(s)]
+    held = {s for s in live() if _setup_done(s)}
+    logger.info(f"relay: {why}: draining {len(held)} sessions, GOAWAY "
+                f"{'to ' + uri if uri else 'to this address'}, up to "
+                f"{timeout:g}s")
+    for s in held:
+        try:
+            s.drain()
+            s.goaway(uri, timeout=int(timeout * 1000))
+        except Exception:
+            logger.debug("relay: GOAWAY failed", exc_info=True)
+    while True:
+        left = []
+        for s in live():
+            if s in held:
+                left.append(s)
+            else:
+                try:
+                    s.close(SessionCloseCode.NO_ERROR, "relay shutting down")
+                except Exception:
+                    logger.debug("relay: refusing a session failed",
+                                 exc_info=True)
+        if not left:
+            logger.info("relay: drained, all sessions gone")
+            return
+        if loop.time() >= deadline:
+            logger.info(f"relay: drain timed out, {len(left)} sessions "
+                        f"left")
+            for s in left:
+                s.close(SessionCloseCode.GOAWAY_TIMEOUT, "GOAWAY timeout")
+            await _wait_closed(left, 1.0)
+            return
+        await asyncio.sleep(DRAIN_POLL_S)
+
+
 async def main():
-    global _catalog_probe
+    global _catalog_probe, _pause_after
     args = parse_args()
     _catalog_probe = args.catalog_probe
+    if args.pause_after < 0:
+        sys.exit("error: --pause-after must be 0 or above")
+    _pause_after = args.pause_after
     speaks = sorted(int(d) for d in MOQTDraft)
     wanted = args.draft if isinstance(args.draft, list) else [args.draft]
     if any(d not in speaks for d in wanted):
@@ -4543,6 +4851,9 @@ async def main():
         sys.exit(2)
     if args.cache_bytes <= 0:
         print("Error: --cache-bytes must be above 0", file=sys.stderr)
+        sys.exit(2)
+    if args.drain_timeout < 0:
+        print("Error: --drain-timeout must be 0 or more", file=sys.stderr)
         sys.exit(2)
     global CACHE_BUDGET_BYTES, STREAM_SCHEDULING
     CACHE_BUDGET_BYTES = args.cache_bytes
@@ -4591,13 +4902,15 @@ async def main():
 
     _background.add(asyncio.create_task(_watch_lanes()))
 
+    watchdog = None
     if args.watchdog > 0:
         host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(args.bind,
                                                         args.bind)
         # --quic and --dual serve raw QUIC on --port; otherwise WT.
-        _background.add(asyncio.create_task(_watchdog(
+        watchdog = asyncio.create_task(_watchdog(
             args.watchdog, host, args.port, args.quic or args.dual,
-            args.draft, handles)))
+            args.draft, handles))
+        _background.add(watchdog)
 
     if args.status_dir:
         os.makedirs(args.status_dir, exist_ok=True)
@@ -4632,18 +4945,36 @@ async def main():
               f"{WATCHDOG_MISSES} misses or a {args.watchdog:g}s stall",
               file=sys.stderr)
 
-    # SIGTERM shuts down like Ctrl-C: peers get a CONNECTION_CLOSE.
-    asyncio.get_running_loop().add_signal_handler(
-        signal.SIGTERM, asyncio.current_task().cancel)
+    # SIGTERM or SIGINT drains; a second one exits at once.
+    stop = asyncio.Event()
+    stopped_by = []
+    main_task = asyncio.current_task()
+
+    def _on_stop(sig):
+        if stop.is_set():
+            logger.info(f"relay: {sig.name} again, exiting now")
+            main_task.cancel()
+            return
+        stopped_by.append(sig.name)
+        stop.set()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        asyncio.get_running_loop().add_signal_handler(sig, _on_stop, sig)
+    servers = [server for server, _port, _label in listeners]
+    wait = 1.0
     try:
-        await asyncio.Event().wait()
+        await stop.wait()
+        if watchdog is not None:
+            watchdog.cancel()
+        await _drain(servers, args.goaway_uri, args.drain_timeout,
+                     stopped_by[0])
     except asyncio.CancelledError:
-        pass
+        wait = 0
     finally:
-        await asyncio.gather(*(server.close_sessions()
-                               for server, _port, _label in listeners))
+        await asyncio.gather(*(server.close_sessions(timeout=wait)
+                               for server in servers))
         for h in handles:
             h.close()
+        logger.info("relay: exit")
 
 
 def cli():

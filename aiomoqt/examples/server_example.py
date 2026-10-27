@@ -28,9 +28,8 @@ def parse_args():
     parser.add_argument('--quic-debug', action='store_true',  help='Enable quic debug output')
     parser.add_argument('--keylogfile', type=str, default=None, help='TLS secrets file')
     parser.add_argument('--cc-algo', type=str, default='bbr',
-                        help='Congestion control algorithm '
-                             '(bbr | bbr1 | newreno | cubic | dcubic | '
-                             'prague | fast). Default: bbr')
+                        help='Congestion control (bbr | bbr1 | c4 | cubic | '
+                             'dcubic | fast | newreno | prague). Default: bbr')
 
     add_help(parser)
     return parser.parse_args()

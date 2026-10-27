@@ -1,7 +1,6 @@
 """MOQTServer binds the host it is given: one address, the IPv4 wildcard,
 or by default every interface on both families."""
 import errno
-import inspect
 import socket
 
 import pytest
@@ -11,19 +10,7 @@ from aiomoqt.server import MOQTServer
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
 
 
-def _binds_host() -> bool:
-    from aiopquic._binding._transport import TransportContext
-    try:
-        return "host" in inspect.signature(TransportContext.start).parameters
-    except (TypeError, ValueError):
-        return False
-
-
-pytestmark = [
-    requires_certs,
-    pytest.mark.skipif(not _binds_host(),
-                       reason="aiopquic without a listener host (< 0.7.0)"),
-]
+pytestmark = [requires_certs]
 
 
 def _have_ipv6() -> bool:

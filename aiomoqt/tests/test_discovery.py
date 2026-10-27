@@ -222,3 +222,36 @@ async def test_d18_server_reports_namespace_before_tracks():
             assert pub.track_name.decode() == _TRACK
     finally:
         server.close()
+
+
+# -- discovery stays inside the requested namespace -------------------
+
+def _announcing(*announcements):
+    import asyncio
+    from types import SimpleNamespace
+    queue = asyncio.Queue()
+    for ns, name in announcements:
+        queue.put_nowait(SimpleNamespace(
+            track_namespace=tuple(p.encode() for p in ns.split("/")),
+            track_name=name.encode()))
+
+    async def await_publish(timeout=1):
+        return await asyncio.wait_for(queue.get(), timeout)
+    return SimpleNamespace(await_publish=await_publish)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trackname", ["video", None])
+async def test_discovery_ignores_another_namespaces_track(trackname):
+    session = _announcing(("other", "video"), ("wanted/live", "video"))
+    track = SubscribedTrack(session, "wanted")
+    got = await track._await_discovery(0.5, trackname, None)
+    assert got.track_namespace == (b"wanted", b"live")
+
+
+@pytest.mark.asyncio
+async def test_discovery_times_out_on_only_foreign_namespaces():
+    session = _announcing(("other", "video"), ("wantedx", "video"))
+    track = SubscribedTrack(session, "wanted")
+    with pytest.raises(TimeoutError, match="other/video"):
+        await track._await_discovery(0.2, "video", None)

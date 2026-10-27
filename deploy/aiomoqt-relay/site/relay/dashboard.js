@@ -105,12 +105,27 @@ function renderGauges(h) {
 
 // -- tiles ----------------------------------------------------------------------
 
+// `sub`: text, or an array of text and nodes.
 function setTile(key, value, sub, title) {
   const t = document.querySelector(`.tile[data-key="${key}"]`);
   t.querySelector('.value').textContent = value;
-  t.querySelector('.sub').textContent = sub || '';
+  t.querySelector('.sub').replaceChildren(...[].concat(sub || ''));
   if (title) t.title = title;
 }
+
+// Counters plotted as their increase per sample.
+const CUMULATIVE = new Set(['drops']);
+
+// A tile's sparkline series from history; a key the relay lacks is an empty series.
+function sparkValues(history, key) {
+  const v = history[key] || [];
+  if (!CUMULATIVE.has(key)) return v;
+  return v.map((x, i) => (i === 0 || none(x) || none(v[i - 1])) ? null : Math.max(x - v[i - 1], 0));
+}
+
+// "■ out · ■ 12.0 in", keyed to the sparkline's two series.
+const inOutSub = (rateIn) => [el('i', {class: 'key-area s0'}), 'out · ',
+                              el('i', {class: 'key-area s1'}), `${fmt.rate(rateIn)} in`];
 
 // Transport and draft counts of `list`: "2 wt · 1 quic", "d18: 2, d22: 1".
 function sessionMix(list) {
@@ -152,14 +167,15 @@ function renderTiles(s) {
   setTile('loss', fmt.pct(T.loss_pct, 2), 'delivery sessions');
   setTile('drops', fmt.num(T.drops), 'subscribers dropped');
   const groupsIn = none(T.groups_per_s) ? groups : T.groups_per_s;
-  setTile('groups', fmt.rate(fanout('groups_per_s')), `out · ${fmt.rate(groupsIn)} in`,
+  const out = (k, rate) => fmt.rate(none(T[k]) ? fanout(rate) : T[k]);
+  setTile('groups', out('groups_out_per_s', 'groups_per_s'), inOutSub(groupsIn),
           'Delivered to subscribers: each track\'s group rate times its subscribers; in = received from publishers');
-  setTile('objects', fmt.rate(fanout('objects_per_s')), `out · ${fmt.rate(T.objects_in_per_s)} in`,
+  setTile('objects', out('objects_out_per_s', 'objects_per_s'), inOutSub(T.objects_in_per_s),
           'Delivered to subscribers: each track\'s object rate times its subscribers; in = received from publishers');
   setTile('ingress', fmt.bps(T.ingress_bps), `media ${fmt.bps(T.media_in_bps)}`);
   setTile('egress', fmt.bps(T.egress_bps), `media ${fmt.bps(T.media_out_bps)}`);
   for (const tile of document.querySelectorAll('.tile[data-spark]')) {
-    Dash.spark(tile, s.history[tile.dataset.spark] || []);
+    Dash.spark(tile, ...tile.dataset.spark.split(' ').map((k) => sparkValues(s.history, k)));
   }
 }
 

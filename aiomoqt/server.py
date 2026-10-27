@@ -78,7 +78,7 @@ class MOQTServer(MOQTPeer):
         debug: Optional[bool] = False,
         tx_max_inflight_bytes: Optional[int] = DEFAULT_TX_MAX_INFLIGHT_BYTES,
         tx_max_queued_bytes: Optional[int] = None,
-        congestion_control_algorithm: Optional[str] = None,
+        congestion_control_algorithm: Optional[str] = "bbr",
         keep_alive_interval: Optional[float] = None,
         socket_buffer_size: Optional[int] = None,
         stream_ring_cap: Optional[int] = None,
@@ -155,8 +155,7 @@ class MOQTServer(MOQTPeer):
                 max_data=2**24, max_stream_data=2**24,
                 max_datagram_frame_size=64 * 1024,
             )
-            # None defers to the aiopquic default (bbr1) — loss-based
-            # CCs collapse on GIL-induced loss blips and can't recover.
+            # None defers to the aiopquic default.
             if self.congestion_control_algorithm is not None:
                 cfg.congestion_control_algorithm = (
                     self.congestion_control_algorithm)
