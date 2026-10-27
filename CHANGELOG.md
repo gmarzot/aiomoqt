@@ -2,6 +2,13 @@
 
 ## v0.14.0
 
+- adaptive_bench bw mode controls on the subscriber's own windowed p90 (it was a percentile of interval means), and an empty window reads n/a, not 0 ms; CSV latency columns are `win_*` (bw) or `worst_*` (subs).
+- adaptive_bench subs mode counts a subscriber only while it receives at least half its rate, and checks the delivering total against `--shortfall-ratio`; the high-water mark counts those subscribers.
+- adaptive_bench exits nonzero when it received no data or its publisher never published, and 130 when interrupted.
+- `--cc-algo`, `--max-queued-bytes`, `--max-inflight-bytes` and `--keepalive` reach every adaptive_bench worker, and the budget flags now apply in load_sim, pub_media, sub_bench and sub_media (`cli.transport_kwargs`); banners show them. load_sim gains the grid's session flags.
+- load_sim counts connect and setup failures as failed joins, with their cause, and a join stopped midway as neither.
+- Split-host adaptive_bench (`--role sub`) acts on p90 over a running baseline, cancelling a constant clock offset.
+- TrackStats and adaptive_bench keep per-group loss state for the last 64-80 groups only; with `group_loss` a skipped group id counts as a whole group lost; adaptive_bench's loopback loss is windowed; snapshots carry `dt` and `lat_n`.
 - Datagram tracks publish over WebTransport: `datagram_max_payload()` reports the WT session's ceiling, and `-D` is accepted over `https://`.
 - Malformed input is a protocol error: a control message that does not decode, or an invalid FETCH object (formerly a stream reset), closes the session with PROTOCOL_VIOLATION and a short reason; an Object whose Properties do not parse resets its stream as a malformed track; a length past the message is refused before it is read; invalid UTF-8 in a reason phrase is replaced, not an error.
 - pub_media exits 69 when no relay is reachable or every relay is lost, and 70 on an internal error or a source it cannot read (both were 1); `--help` lists the codes, and a relay that has not answered within 10 s counts as down.

@@ -279,13 +279,23 @@ samples say stop.
 python -m aiomoqt.tools.adaptive_bench "$RELAY_QUIC" -k --draft 18 --start-mbps 10 --step-mbps 10 --max-mbps 500 --latency-threshold 100 --report bw-ramp.csv
 ```
 
-Add `--mp` when chasing a transmit ceiling: one Python process is
-GIL-bound, so without it the interpreter can be what you measure.
+Against a relay the publisher and subscriber always run in separate
+processes. `--mp` matters only for the loopback self-test (flow A), where
+one Python process is GIL-bound and can be what you measure.
 
-Stops on p90 latency over `-l` (default 100 ms) for two intervals
-running, or achieved-over-commanded below `--shortfall-ratio` (0.85).
+Latency is the subscriber's p90 over its last 5 s. The controller backs
+off when it stays over `--latency-threshold` (default 100 ms) for two
+intervals. A shortfall, achieved below `--shortfall-ratio` (0.85) of
+commanded, holds the ramp and backs off once it lasts three intervals.
 Back-off multiplies by `--backoff-factor` (0.9; closer to 1.0 for gentler
-steps). Hard caps are `--max-mbps` and `-t` seconds.
+steps). Hard caps are `--max-mbps` and `-t` seconds. A run that receives
+nothing exits nonzero.
+
+**Set the threshold relative to the path RTT.** Absolute latency
+includes the path, and the ramp takes full steps only while p90 is under
+half the threshold; once it has backed off, it probes upward only then.
+On a 49 ms path a 100 ms threshold freezes the ramp well below the
+relay's ceiling. Use about 250 ms against a remote relay.
 
 **Bandwidth mode cannot be split across hosts.** The controller actuates
 the publisher while measuring at the subscriber, so separating them with
@@ -326,6 +336,17 @@ Ramp knobs:
 | `-S` / `--stagger` | seconds between individual joins inside a group (default 0.1). Spaces the QUIC Initials so a group does not burst the relay; 0 opens the batch at once |
 | `--sub-filter` | `next-group-start` skips the current-group replay some relays do on `latest-object`, the default |
 
+A subscriber counts toward the high-water mark only while it receives at
+least half of `--sub-mbps`, judged over the last few seconds and 3 s
+after its latest subscribe. Fewer such subscribers than the mature
+target, or a total below `--shortfall-ratio` of their combined rate, is a
+shortfall; a lossy or starved subscriber is not counted as capacity. The
+latency threshold works as in flow C, so set it from the path RTT here
+too.
+
+The ramp ends at `--max-subs`; it cannot hold a fixed count. For a fixed
+audience use `load_sim --subs N` (flow E).
+
 **Latency comes from the object's LOC timestamp** (property 0x10,
 wall-clock µs): pub_bench and pub_media both stamp it, so an audience run
 against a live broadcast reports real delivery latency. pub_media
@@ -334,10 +355,11 @@ time — latency then reads 0.
 
 **Absolute latency is not trustworthy across hosts.** It is the
 receiver's clock minus the sender's timestamp, so a split run carries the
-hosts' clock offset straight into the back-off signal. adaptive_bench
-knows: whenever the role is not `both` it sets a skew-safe flag and leans
-on signals that are differences or counts — jitter is a difference of
-differences, shortfall is a count — and neither inherits the offset.
+hosts' clock offset. Whenever the role is not `both`, adaptive_bench
+measures p90 over a running baseline — the lowest p90 seen, its 1st
+percentile once it has 100 samples — which cancels a constant offset.
+The threshold is then the queueing delay allowed over that baseline, and
+the banner says so. A clock that drifts during the run still leaks in.
 
 ## E — scenario load and churn
 

@@ -3,9 +3,8 @@
 A subscriber worker runs one MOQTClient in its own process and posts
 two message types to a multiprocessing.Queue:
 
-  {"kind": "stats",  "sub_id": N, "t", "rx_bytes", "rx_objs",
-    "lat_mean_ms", "lat_p50_ms", "lat_p99_ms", "loss",
-    "total_bytes", "total_objs"}            — every 1 s
+  {"kind": "stats", "sub_id": N, **TrackStats.snapshot()}   — every 1 s
+    (deltas over "dt"; windowed latency from "lat_n" samples)
 
   {"kind": "health", "sub_id": N, "state": "subscribed" |
     "subscribe_failed" | "stream_reset" | "closed",

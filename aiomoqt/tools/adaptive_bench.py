@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""aiomoqt adaptive bench — single-process feedback-driven ramp.
+"""aiomoqt adaptive bench — feedback-driven load ramp.
 
-Runs a publisher + subscriber pair in one Python process (loopback
-self-test) or against a relay. The publisher's rate is live-mutated
-by a controller task reading subscriber-side samples (p90 latency,
-loss, achieved throughput) out of a shared BenchState. One continuous
-steady-state publisher whose pacing the controller nudges up or down
-per interval — no subprocess-per-step loop.
+bw mode ramps one publisher's rate; subs mode ramps the subscriber count
+on a fixed-rate track. With no URL it is a loopback self-test (one
+process, or pub and sub processes with --mp); against a relay the
+publisher and subscribers always run in worker processes. A controller
+reads subscriber-side samples (p90 latency, achieved throughput,
+delivering subscribers) each interval and nudges one continuous
+publisher, or the subscriber count, up or down.
 
 Load axes are independent CLI flags: --object-size, -P streams,
 --start-mbps, --step-mbps, --max-mbps. With P > 1, each subgroup gets
@@ -16,7 +17,7 @@ regardless of parallelism.
 Usage:
   python -m aiomoqt.tools.adaptive_bench
   python -m aiomoqt.tools.adaptive_bench -P 4 --step-mbps 20
-  python -m aiomoqt.tools.adaptive_bench -r moqt://host:4433 -k --max-mbps 500
+  python -m aiomoqt.tools.adaptive_bench moqt://host:4433 -k --max-mbps 500
 """
 import argparse
 import asyncio
@@ -280,14 +281,15 @@ class LiveStats:
 class BWActuator:
     """Actuator for bandwidth-ramp mode.
 
-    Loopback mode (no -r): publisher + subscriber tasks share the main
-    asyncio loop; rate is mutated by writing self.state.rate_ops which
-    the in-process publisher polls. Stats from the in-process LiveStats.
+    Loopback (no URL, no --mp): publisher + subscriber tasks share the
+    main asyncio loop; rate is mutated by writing self.state.rate_ops
+    which the in-process publisher polls. Stats from the in-process
+    LiveStats.
 
-    Relay mode (-r URL): publisher and subscriber each run in their own
-    multiprocessing.Process. Rate flows pub-ward via a rate_queue;
-    stats flow subscriber-ward via events_queue. Aggregated by the
-    actuator into the same Signal shape so the controller is mode-blind.
+    Relay URL or --mp loopback: publisher and subscriber each run in
+    their own multiprocessing.Process. Rate flows pub-ward via a
+    rate_queue; stats flow back via events_queue. Latency is the one
+    subscriber's own windowed p90 from its latest snapshot.
     """
     unit = "Mbps"
 
@@ -876,22 +878,27 @@ class SubsActuator:
 # ---------------------------------------------------------------------------
 
 class AIMDController:
-    """Simple additive-increase / multiplicative-decrease policy.
+    """Additive-increase / multiplicative-decrease over a LoadActuator.
 
-    Keeps probing forever. QUIC windows widen under pressure, so a
-    rate that tripped a signal once may be fine a minute later. The
-    controller never locks in a ceiling — it just backs off on a
-    signal and immediately resumes ramping from the lower rate. Exit
-    is user-driven (Ctrl-C) or --max-mbps.
+    Keeps probing: it backs off on a signal and resumes ramping from the
+    lower level, never locking in a ceiling. Ends at the actuator's max
+    level, -t/--duration, Ctrl-C, or rx=0 for 3 intervals (a failure).
 
-    - Every `interval_s`, snapshot metrics and decide.
-    - Ramp: +step_mbps while loss==0 and p50 stays under SLA.
-    - Back off: multiply aggregate by backoff_factor on any signal.
-    - Signals:
-        * loss_pct > loss_threshold_pct in the last window
-        * p90 > latency_threshold_ms for 2 consecutive intervals
-        * achieved rx_bitrate < shortfall_ratio * commanded for 2 intervals
-    - Tracks high_water_mbps = highest stable rate seen so far.
+    - Every tick, observe a Signal and decide.
+    - headroom = (threshold - p90) / threshold; p90 is over a running
+      baseline when skew_safe.
+    - Ramp: initial_step scaled by headroom (full at >= 0.5, zero at
+      0.05) and shrunk by each direction flip; once the step rounds
+      below step_floor, probe +step_floor only at headroom >= 0.5.
+    - p90 over threshold for 2 intervals: back off by up to
+      backoff_factor (less on a shallow overshoot, at most one step),
+      then drain until headroom >= 0.2.
+    - Shortfall: hold; sustained for 3 intervals, bw backs off toward
+      the delivered rate and subs holds and respawns.
+    - Loss is reported, not acted on; in subs mode a slot losing over
+      half its rate stops counting as delivering, which is a shortfall.
+    - high_water: the best delivered level (bw: rx Mbps; subs:
+      delivering subscribers) seen with headroom >= 0.2 and no shortfall.
     """
 
     BASELINE_SAMPLES = 1024
@@ -1003,17 +1010,10 @@ class AIMDController:
             headroom = (self.latency_threshold_ms - self._control_p90(sig)) \
                 / self.latency_threshold_ms
 
-            # Back-off triggers ONLY on sustained p90 latency overshoot.
-            # Loss is reported in the row but never drives the ramp —
-            # we want the bench to reveal the actual throughput/latency
-            # curve, not throttle on transient dips QUIC will recover
-            # from on its own. Shortfall is tolerated for transients
-            # but HOLDS the ramp when sustained (see below): delivery
-            # structurally below command means a producer/CPU wall, and
-            # ramping past it only inflates the target into fiction.
-            # First bad latency interval just 'watches' — back off
-            # after two consecutive overshoots so transient RTT spikes
-            # don't trigger a cliff.
+            # Back off on sustained p90 overshoot; the first bad interval
+            # only watches, so a transient RTT spike is not a cliff. Loss
+            # does not drive the ramp directly. Shortfall holds the ramp
+            # (see below).
             if sig.shortfall:
                 self.shortfall_streak += 1
             else:
@@ -1455,13 +1455,14 @@ def parse_args():
                    help="parallel subgroup streams (default: 1)")
     p.add_argument("-g", "--group-size", type=int, default=4096,
                    dest="group_size",
-                   help="objects per group (default: 10000)")
+                   help="objects per group (default: 4096)")
     p.add_argument("--start-mbps", type=float, default=10.0,
                    help="initial aggregate bitrate (default: 10)")
     p.add_argument("--step-mbps", type=float, default=10.0,
                    help="ramp step size (default: 10)")
     p.add_argument("--max-mbps", type=float, default=10000.0,
-                   help="cap; controller stops on signal first (default: 10000)")
+                   help="bw-mode cap; the run ends on reaching it "
+                        "(default: 10000)")
     p.add_argument("--interval", type=float, default=5.0,
                    metavar="S", help="controller tick period seconds (default: 5)")
     p.add_argument("--draft", type=parse_draft_spec, default=None,
@@ -1489,9 +1490,9 @@ def parse_args():
                    metavar="PORT",
                    help="Loopback listen port (default: 4435)")
     p.add_argument("--mp", action="store_true", dest="mp_loopback",
-                   help="Run this role across separate processes rather "
-                        "than one (use when measuring TX ceilings — a "
-                        "single process is GIL-bound).")
+                   help="Loopback self-test: run publisher and subscriber "
+                        "in separate processes (a single process is "
+                        "GIL-bound). Relay runs always do.")
     p.add_argument("--role", choices=("both", "pub", "sub"),
                    default="both",
                    help="Which end(s) this process runs (default: both). "
@@ -1525,7 +1526,8 @@ def parse_args():
                         "Also the batch size: one worker process hosts a "
                         "group of this many self-healing subscriptions.")
     p.add_argument("--max-subs", type=int, default=200,
-                   help="subs-mode: cap (default: 200)")
+                   help="subs-mode: cap; the run ends on reaching it "
+                        "(default: 200)")
     p.add_argument("--sub-mbps", type=float, default=10.0,
                    help="subs-mode: fixed per-track publisher bitrate "
                         "(default: 10 Mbps)")
