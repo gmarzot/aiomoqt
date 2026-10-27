@@ -119,10 +119,9 @@ def parse_args():
         '-d', '--debug', action='store_true',
         help='Enable debug output')
     parser.add_argument(
-        '--cc-algo', type=str, default=None,
-        help='Congestion control algorithm '
-             '(bbr | bbr1 | newreno | cubic | dcubic | prague | fast). '
-             'Default: aiopquic default (bbr1)')
+        '--cc-algo', type=str, default='bbr',
+        help='Congestion control (bbr | bbr1 | c4 | cubic | dcubic | '
+             'fast | newreno | prague). Default: bbr')
     _cli.add_logging(parser)
     _cli.add_help(parser)
     parser.add_argument(

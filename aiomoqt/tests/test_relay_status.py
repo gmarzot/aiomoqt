@@ -426,6 +426,13 @@ async def test_snapshot_reports_namespaces_tracks_and_sessions(
     assert video["groups_per_s"] > 0 and video["objects_per_s"] > 0
     assert None not in (video["rtt_up_ms"], video["rtt_down_ms"], video["latency_ms"])
     assert totals["objects_in_per_s"] > 0
+    # Two video subscribers: delivered exceeds received.
+    assert totals["objects_out_per_s"] > totals["objects_in_per_s"]
+    assert totals["groups_out_per_s"] > totals["groups_per_s"]
+    hist = snap["history"]
+    assert (hist["publishers"][-1], hist["namespaces"][-1]) == (1, 1)
+    for k in ("objects_out_per_s", "groups_out_per_s", "drops"):
+        assert hist[k][-1] == totals[k], k
 
     # Each video subscriber is listed with its session.
     assert [(s["transport"], s["draft"], s["forward"])

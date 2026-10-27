@@ -17,7 +17,7 @@
     <div class="hero-top">
       <a class="brand" href="/" aria-label="aiomoqt-relay home">
         <span class="brand-text">
-          <span class="brand-name"><b>aiomoqt</b>-relay</span>
+          <span class="brand-name">aiomoqt-relay</span>
           <span class="brand-sub"><span class="dot" aria-hidden="true"></span>A Marz Research Project</span>
         </span>
       </a>
@@ -67,20 +67,20 @@
   <noscript><p class="unavailable">Live status needs JavaScript.</p></noscript>
 
   <section class="tiles" aria-label="Relay reach">
-    <div class="tile" data-key="publishers"><h3>Publishers</h3><div class="value">—</div><div class="sub"></div></div>
+    <div class="tile" data-key="publishers" data-spark="publishers"><h3>Publishers</h3><div class="value">—</div><div class="sub"></div></div>
     <div class="tile" data-key="subscribers" data-spark="subscribers"><h3>Subscribers</h3><div class="value">—</div><div class="sub"></div></div>
-    <div class="tile" data-key="namespaces"><h3>Namespaces</h3><div class="value">—</div><div class="sub"></div></div>
+    <div class="tile" data-key="namespaces" data-spark="namespaces"><h3>Namespaces</h3><div class="value">—</div><div class="sub"></div></div>
     <div class="tile" data-key="tracks" data-spark="tracks"><h3>Tracks</h3><div class="value">—</div><div class="sub"></div></div>
     <div class="tile" data-key="ingress" data-spark="ingress_bps"><h3>BW in</h3><div class="value">—</div><div class="sub"></div></div>
     <div class="tile" data-key="egress" data-spark="egress_bps"><h3>BW out</h3><div class="value">—</div><div class="sub"></div></div>
   </section>
   <section class="tiles tiles-detail" aria-label="Relay delivery">
-    <div class="tile" data-key="groups"><h3>Groups/s</h3><div class="value">—</div><div class="sub"></div></div>
-    <div class="tile" data-key="objects"><h3>Objects/s</h3><div class="value">—</div><div class="sub"></div></div>
+    <div class="tile" data-key="groups" data-spark="groups_out_per_s groups_per_s"><h3>Groups/s</h3><div class="value">—</div><div class="sub"></div></div>
+    <div class="tile" data-key="objects" data-spark="objects_out_per_s objects_in_per_s"><h3>Objects/s</h3><div class="value">—</div><div class="sub"></div></div>
     <div class="tile" data-key="lag" data-spark="lag_p99_ms"><h3>Loop lag</h3><div class="value">—</div><div class="sub"></div></div>
     <div class="tile" data-key="rtt" data-spark="rtt_p50_ms"><h3>RTT</h3><div class="value">—</div><div class="sub"></div></div>
-    <div class="tile" data-key="drops"><h3>Drops</h3><div class="value">—</div><div class="sub"></div></div>
     <div class="tile" data-key="loss" data-spark="loss_pct"><h3>Loss</h3><div class="value">—</div><div class="sub"></div></div>
+    <div class="tile" data-key="drops" data-spark="drops"><h3>Drops</h3><div class="value">—</div><div class="sub"></div></div>
   </section>
 
   <div class="split">

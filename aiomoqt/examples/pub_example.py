@@ -46,11 +46,9 @@ def parse_args():
     parser.add_argument('--gop-pattern', type=str, default='ibp',
                         choices=['ibp', 'ip', 'ionly'],
                         help='GOP pattern (default: ibp)')
-    parser.add_argument('--cc-algo', type=str, default=None,
-                        help='Congestion control algorithm '
-                             '(bbr | bbr1 | newreno | cubic | dcubic | '
-                             'prague | fast). Default: aiopquic default '
-                             '(bbr1)')
+    parser.add_argument('--cc-algo', type=str, default='bbr',
+                        help='Congestion control (bbr | bbr1 | c4 | cubic | '
+                             'dcubic | fast | newreno | prague). Default: bbr')
     parser.add_argument(
         '--max-queued-bytes', type=int, default=None,
         help='Aggregate publisher byte budget across ALL streams '
@@ -87,7 +85,7 @@ async def main(host: str, port: int, path: str, namespace: str, trackname: str,
                insecure: bool = False, auth_token: str = None, draft: int = None,
                streams: int = 1, object_size: int = 1024, rate: float = 30,
                duration: int = 120, video: str = None, gop_pattern: str = 'ibp',
-               cc_algo: str = None, max_queued_bytes: int = None,
+               cc_algo: str = 'bbr', max_queued_bytes: int = None,
                max_inflight_bytes: int = None):
     log_level = logging.DEBUG if debug else logging.INFO
     set_log_level(log_level)

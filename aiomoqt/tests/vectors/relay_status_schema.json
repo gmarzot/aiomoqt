@@ -505,11 +505,23 @@
   ".history": [
    "object"
   ],
+  ".history.drops": [
+   "array"
+  ],
+  ".history.drops[]": [
+   "int"
+  ],
   ".history.egress_bps": [
    "array"
   ],
   ".history.egress_bps[]": [
    "int"
+  ],
+  ".history.groups_out_per_s": [
+   "array"
+  ],
+  ".history.groups_out_per_s[]": [
+   "float"
   ],
   ".history.groups_per_s": [
    "array"
@@ -545,11 +557,29 @@
   ".history.media_out_bps[]": [
    "int"
   ],
+  ".history.namespaces": [
+   "array"
+  ],
+  ".history.namespaces[]": [
+   "int"
+  ],
   ".history.objects_in_per_s": [
    "array"
   ],
   ".history.objects_in_per_s[]": [
    "float"
+  ],
+  ".history.objects_out_per_s": [
+   "array"
+  ],
+  ".history.objects_out_per_s[]": [
+   "float"
+  ],
+  ".history.publishers": [
+   "array"
+  ],
+  ".history.publishers[]": [
+   "int"
   ],
   ".history.rtt_p50_ms": [
    "array"
@@ -766,6 +796,9 @@
   ".totals.fetches": [
    "int"
   ],
+  ".totals.groups_out_per_s": [
+   "float"
+  ],
   ".totals.groups_per_s": [
    "float"
   ],
@@ -791,6 +824,9 @@
    "int"
   ],
   ".totals.objects_in_per_s": [
+   "float"
+  ],
+  ".totals.objects_out_per_s": [
    "float"
   ],
   ".totals.publishers": [
