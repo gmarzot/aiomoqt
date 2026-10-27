@@ -958,6 +958,12 @@
   ".tracks[].subscriber_list[].lane_objects": [
    "int"
   ],
+  ".tracks[].subscriber_list[].lane_stalled_s": [
+   "int"
+  ],
+  ".tracks[].subscriber_list[].lane_stalls": [
+   "int"
+  ],
   ".tracks[].subscriber_list[].lane_tx_bytes": [
    "int"
   ],

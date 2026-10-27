@@ -77,5 +77,5 @@ SIGUSR1.
   recent-object cache (8 groups / 32 MiB per track, all tracks under one `--cache-bytes` budget,
   least recently used evicted first; objects charged payload, properties and record overhead) for FETCH and JOIN; no authentication, authorization or rate limiting; a per-stream TX budget
   and a bounded send lane per subscriber, shedding whole groups (streams reset) from one that falls
-  behind; per-session caps on namespace requests and SUBSCRIBEs (`--max-namespaces-per-session`,
+  behind, and logging a `lane stalled` WARNING for one that makes no progress for 10 s; per-session caps on namespace requests and SUBSCRIBEs (`--max-namespaces-per-session`,
   `--max-subscriptions-per-session`), refused past them with EXCESSIVE_LOAD; no delivery timeout. Its module docstring has the details.
