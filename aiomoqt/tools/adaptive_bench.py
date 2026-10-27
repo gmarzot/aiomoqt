@@ -562,9 +562,8 @@ class SubsActuator:
         # without changing the report cadence.
         self.stagger = stagger
         self.shortfall_ratio = shortfall_ratio
-        # ONE window governs "delivering" (per slot, in the worker),
-        # "active" and "kept" (not reaped). Floored so sub-second
-        # intervals don't reap on normal jitter.
+        # One window for "delivering" (judged in the worker), "active"
+        # and "kept" (not reaped); floored so jitter doesn't reap.
         self.keep_window = max(3.0, 1.5 * interval_s)
         self.transport_options = dict(transport_options or {})
         # Each worker process hosts a BATCH of subscriptions and
@@ -933,9 +932,7 @@ class AIMDController:
         self.backoff_factor = backoff_factor
         self.loss_threshold_pct = loss_threshold_pct
         self.duration_s = duration_s
-        # Skew-safe: latency is measured over a running baseline (the
-        # min p90 seen, its 1st percentile once mature), which cancels a
-        # constant clock offset between hosts.
+        # Skew-safe: act on p90 over a running baseline (see _control_p90).
         self.skew_safe = skew_safe
         self._p90_seen: deque = deque(maxlen=self.BASELINE_SAMPLES)
         self.shortfall_streak = 0
@@ -1161,8 +1158,9 @@ class AIMDController:
             await self._apply(min(a.max_level, level + step), sig, "ramp")
 
     def _control_p90(self, sig: Signal) -> float:
-        """The p90 the controller acts on: absolute, or over the
-        running baseline when skew-safe."""
+        """The p90 the controller acts on: absolute, or when skew-safe
+        over a baseline (min p90 seen, its 1st percentile once mature)
+        that cancels a constant clock offset between hosts."""
         if not self.skew_safe:
             return sig.latency_p90_ms
         if not sig.latency_known:
