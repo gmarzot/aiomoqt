@@ -235,11 +235,14 @@ class TestResult:
 
 
 class TAPReporter:
-    """Emit TAP version 14 output with run-identifying headers."""
+    """Emit TAP version 14 output with run-identifying headers. Given a
+    `stream`, begin() writes the header and plan there and each add() its
+    result, so a run cut short keeps what it reached."""
 
     def __init__(self, *, target_url: str = "",
                  aiomoqt_version: str = "",
-                 compat: frozenset = frozenset()):
+                 compat: frozenset = frozenset(),
+                 stream=None):
         self.results: list[TestResult] = []
         self.target_url = target_url
         self.aiomoqt_version = aiomoqt_version
@@ -247,9 +250,24 @@ class TAPReporter:
         self.started_at = _utc_now_iso()
         self.ended_at = ""
         self.notes: list[str] = []
+        self.stream = stream
+        self._streaming = False
+
+    def begin(self, planned: int) -> None:
+        if self.stream is not None:
+            self._write(self._header(planned))
+            self._streaming = True
 
     def add(self, result: TestResult):
         self.results.append(result)
+        if self._streaming:
+            self._write(self._result_lines(len(self.results), result))
+
+    def end(self) -> None:
+        """Finish a streamed report: end time and totals."""
+        self.finalize()
+        if self._streaming:
+            self._write([f"# ended: {self.ended_at}", *self._trailer()])
 
     def finalize(self):
         if not self.ended_at:
@@ -257,9 +275,20 @@ class TAPReporter:
 
     def report(self) -> str:
         self.finalize()
+        lines = self._header(len(self.results), ended=True)
+        for i, r in enumerate(self.results, 1):
+            lines += self._result_lines(i, r)
+        return "\n".join(lines + self._trailer())
+
+    def _write(self, lines: list) -> None:
+        self.stream.write("\n".join(lines) + "\n")
+        self.stream.flush()
+
+    def _header(self, planned: int, ended: bool = False) -> list:
         lines = ["TAP version 14"]
         lines.append(f"# date: {self.started_at}")
-        lines.append(f"# ended: {self.ended_at}")
+        if ended:
+            lines.append(f"# ended: {self.ended_at}")
         if self.target_url:
             lines.append(f"# target: {self.target_url}")
         if self.aiomoqt_version:
@@ -268,50 +297,53 @@ class TAPReporter:
             lines.append(f"# compat: {','.join(sorted(self.compat))}")
         for note in self.notes:
             lines.append(f"# note: {note}")
-        lines.append(f"1..{len(self.results)}")
-        for i, r in enumerate(self.results, 1):
-            status = "ok" if r.passed else "not ok"
-            skip = f" # SKIP {r.skip_reason}" if r.skipped else ""
-            tag = " # COMPAT" if r.compat and not r.skipped else ""
-            lines.append(f"{status} {i} - {r.name}{skip}{tag}")
-            lines.append("  ---")
-            lines.append(f"  duration_ms: {round(r.duration_ms)}")
-            if self.aiomoqt_version:
-                lines.append(
-                    f"  implementation_version: {_yaml_str(self.aiomoqt_version)}")
-            if r.spec_revision:
-                lines.append(f"  test_spec_revision: {r.spec_revision}")
-            roles = {k: v for k, v in r.sessions.items() if v}
-            if roles:
-                lines.append("  sessions:")
-                for role, meta in roles.items():
-                    lines.append(f"    {role}:")
-                    for k, v in meta.items():
-                        lines.append(f"      {k}: {_yaml_str(v)}")
-            if r.message:
-                lines.append(f"  message: {_yaml_str(r.message)}")
-            if r.expected:
-                lines.append(f"  expected: {_yaml_str(r.expected)}")
-            if r.received:
-                lines.append(f"  received: {_yaml_str(r.received)}")
-            if r.compat:
-                lines.append("  compat: true")
-                if r.compat_note:
-                    lines.append(f"  compat_note: {_yaml_str(r.compat_note)}")
-            if r.wire_noncompliance_count:
-                lines.append(
-                    f"  wire_noncompliance: {r.wire_noncompliance_count}"
-                )
-            lines.append("  ...")
+        lines.append(f"1..{planned}")
+        return lines
+
+    def _result_lines(self, i: int, r: TestResult) -> list:
+        status = "ok" if r.passed else "not ok"
+        skip = f" # SKIP {r.skip_reason}" if r.skipped else ""
+        tag = " # COMPAT" if r.compat and not r.skipped else ""
+        lines = [f"{status} {i} - {r.name}{skip}{tag}"]
+        lines.append("  ---")
+        lines.append(f"  duration_ms: {round(r.duration_ms)}")
+        if self.aiomoqt_version:
+            lines.append(
+                f"  implementation_version: {_yaml_str(self.aiomoqt_version)}")
+        if r.spec_revision:
+            lines.append(f"  test_spec_revision: {r.spec_revision}")
+        roles = {k: v for k, v in r.sessions.items() if v}
+        if roles:
+            lines.append("  sessions:")
+            for role, meta in roles.items():
+                lines.append(f"    {role}:")
+                for k, v in meta.items():
+                    lines.append(f"      {k}: {_yaml_str(v)}")
+        if r.message:
+            lines.append(f"  message: {_yaml_str(r.message)}")
+        if r.expected:
+            lines.append(f"  expected: {_yaml_str(r.expected)}")
+        if r.received:
+            lines.append(f"  received: {_yaml_str(r.received)}")
+        if r.compat:
+            lines.append("  compat: true")
+            if r.compat_note:
+                lines.append(f"  compat_note: {_yaml_str(r.compat_note)}")
+        if r.wire_noncompliance_count:
+            lines.append(
+                f"  wire_noncompliance: {r.wire_noncompliance_count}"
+            )
+        lines.append("  ...")
+        return lines
+
+    def _trailer(self) -> list:
         total_noncompliance = sum(
             r.wire_noncompliance_count for r in self.results
         )
-        if total_noncompliance:
-            lines.append(
-                f"# wire_noncompliance_total: trailing_extensions="
-                f"{total_noncompliance}"
-            )
-        return "\n".join(lines)
+        if not total_noncompliance:
+            return []
+        return [f"# wire_noncompliance_total: trailing_extensions="
+                f"{total_noncompliance}"]
 
 
 def _yaml_str(value) -> str:
@@ -1819,13 +1851,23 @@ async def run_tests(tests: list[str], host: str, port: int, path: str,
             reporter.notes.append(
                 "preference probe: no offered draft reached SETUP; "
                 f"trying draft-{effective_draft}")
-    for test_name in tests:
+    reporter.begin(len(tests))
+    # Set once SETUP cannot complete: the remaining cases fail unrun.
+    no_setup = ""
+    for i, test_name in enumerate(tests):
         fn = TEST_FUNCTIONS.get(test_name)
         if fn is None:
             reporter.add(TestResult(
                 name=test_name, passed=True, skipped=True,
                 skip_reason="Unknown test case",
             ))
+            continue
+        if no_setup:
+            result = TestResult(name=test_name, passed=False,
+                                message=f"not run: {no_setup}")
+            reporter.add(result)
+            print(f"  [FAIL] {result.name}: {result.message}",
+                  file=sys.stderr)
             continue
         INTEROP_NAMESPACE = f"{base_namespace}/{test_name}"
         nc_before = MOQTMessage._trailing_extensions_truncation_count
@@ -1860,6 +1902,14 @@ async def run_tests(tests: list[str], host: str, port: int, path: str,
         status = "PASS" if result.passed else "FAIL"
         tag = " (COMPAT)" if result.compat else ""
         print(f"  [{status}{tag}] {result.name}: {result.message}", file=sys.stderr)
+        # A second attempt confirms SETUP cannot complete.
+        if (test_name == "setup-only" and not result.passed
+                and i < len(tests) - 1
+                and not await _probe_setup_ok(
+                    host, port, path, use_quic, tls_disable_verify, debug,
+                    draft=effective_draft)):
+            no_setup = ("SETUP did not complete: "
+                        f"{result.received or result.message}")
     return reporter
 
 
@@ -1950,6 +2000,7 @@ def main():
         target_url=args.relay,
         aiomoqt_version=AIOMOQT_VERSION,
         compat=compat,
+        stream=sys.stdout,
     )
 
     # Select tests
@@ -1974,8 +2025,7 @@ def main():
         print("\n# Interrupted.", file=sys.stderr)
         sys.exit(130)
 
-    # TAP output to stdout
-    print(reporter.report())
+    reporter.end()
 
     # Exit code
     all_passed = all(r.passed for r in reporter.results)
