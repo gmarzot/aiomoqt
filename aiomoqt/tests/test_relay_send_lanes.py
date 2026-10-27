@@ -191,7 +191,8 @@ class _Fake:
     def __init__(self, blocked=False):
         self._profile = profile_for(18)
         self._next = 3
-        self.log = []            # ("open"|"data"|"fin"|"reset"|"done", ...)
+        self.log = []   # ("open"|"hdr"|"data"|"fin"|"reset"|"done", ...)
+        self._unwritten = set()  # opened, header not yet written
         self.gate = asyncio.Event()
         if not blocked:
             self.gate.set()
@@ -203,6 +204,7 @@ class _Fake:
         sid = self._next
         self._next += 4
         self.log.append(("open", sid))
+        self._unwritten.add(sid)
         return sid
 
     def stream_write(self, sid, data, end_stream=False):
@@ -211,7 +213,11 @@ class _Fake:
 
     async def stream_write_drain(self, sid, data):
         await self.gate.wait()
-        self.log.append(("data", sid))
+        if sid in self._unwritten:
+            self._unwritten.discard(sid)
+            self.log.append(("hdr", sid))
+        else:
+            self.log.append(("data", sid))
 
     def stream_reset(self, sid, code):
         self.log.append(("reset", sid, int(code)))

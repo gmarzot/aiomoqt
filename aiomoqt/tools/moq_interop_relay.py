@@ -566,6 +566,7 @@ class _SendLane:
         self.shedding = False
         self.final = False       # PUBLISH_DONE queued: takes nothing more
         self.busy = False        # a write is in progress
+        self.opening = False     # that write opens a subgroup stream
         self.stopped = False
         self._cut = False
         self._closing = False
@@ -642,6 +643,10 @@ class _SendLane:
             self._drop_below(floor)
             self.tx_bytes = self.track._tx_queued(session, floor)
         self.floor = floor if self.floor is None else max(self.floor, floor)
+        if self.busy and self.opening:
+            # A parked header write waits on this session's transport
+            # backlog, which only these resets free.
+            self.track._reset_streams(session, self.floor)
         if not self._cut:
             self._cut = True
             self.items.appendleft(("CUT",))
@@ -741,6 +746,7 @@ class _SendLane:
         (gid, _cost, _live, sgid, oid, payload, exts, prio, status, shape,
          encoded) = item
         self.busy = True
+        self.opening = (id(d.session), gid, sgid) not in track._streams
         try:
             await track._forward_one(d.session, d.alias, gid, sgid, oid,
                                      payload, exts, prio, status, shape,
@@ -1512,7 +1518,16 @@ class _RelayedTrack:
                 publisher_priority=prio, extensions_present=True,
                 end_of_group=eog, first_object=first_obj,
                 prof=session._profile)
-            session.stream_write(stream_id, header.serialize().data)
+            try:
+                await session.stream_write_drain(stream_id,
+                                                 header.serialize().data)
+            except MOQTStreamStopped:
+                self._stopped.add(skey)
+                return
+            except BaseException:
+                # Never leave a stream open without its header.
+                session.stream_reset(stream_id, StreamResetCode.CANCELLED)
+                raise
             entry = (stream_id, header)
             self._streams[skey] = entry
             self._tx_streams.setdefault(id(session), {})[(gid, sgid)] = \
@@ -2723,7 +2738,7 @@ async def _fail_fill(session, request_id) -> None:
     FETCH_HEADER."""
     try:
         stream_id = await session.open_uni_stream()
-        session.stream_write(stream_id, FetchHeader(
+        await session.stream_write_drain(stream_id, FetchHeader(
             request_id=request_id).serialize(prof=session._profile).data)
         session.stream_reset(stream_id, StreamResetCode.INTERNAL_ERROR)
     except Exception:
