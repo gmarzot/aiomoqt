@@ -32,10 +32,10 @@ services:
       MOQT_PORT: "4443"
       MOQT_CERT: /etc/letsencrypt/live/aiomoqt-relay.marzresearch.net/fullchain.pem
       MOQT_KEY: /etc/letsencrypt/live/aiomoqt-relay.marzresearch.net/privkey.pem
-    command: ["--draft", "22,20,18,16,14", "--watchdog", "30", "--status-dir", "/status",
-              "--log-dir", "/logs", "--control", "/status/control.sock", "--catalog-probe",
-              "--cache-bytes", "268435456", "--cc-algo", "bbr"]
+    # Relay flags live in relay.toml; flags added here override it.
+    command: ["--config", "/etc/aiomoqt-relay/relay.toml"]
     volumes:
+      - ./relay.toml:/etc/aiomoqt-relay/relay.toml:ro
       # This certificate only; live/ links into archive/.
       - /etc/letsencrypt/live/aiomoqt-relay.marzresearch.net:/etc/letsencrypt/live/aiomoqt-relay.marzresearch.net:ro
       - /etc/letsencrypt/archive/aiomoqt-relay.marzresearch.net:/etc/letsencrypt/archive/aiomoqt-relay.marzresearch.net:ro

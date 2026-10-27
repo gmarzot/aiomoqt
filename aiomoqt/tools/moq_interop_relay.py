@@ -67,6 +67,7 @@ import os
 import signal
 import sys
 import time
+import tomllib
 from collections import Counter
 from types import SimpleNamespace
 
@@ -2724,13 +2725,18 @@ def transport_settings(args) -> dict:
             "tx_max_inflight_bytes": args.max_inflight_bytes}
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="aiomoqt-relay: a MoQT relay (raw QUIC and WebTransport)",
         add_help=False,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
+    parser.add_argument("--config", type=str, default=None, metavar="PATH",
+                        help="Read flags from a TOML file. Keys are long "
+                             "flag names: cache-bytes = 268435456, "
+                             "catalog-probe = true, upstream = [\"URL\"]. "
+                             "Flags on the command line override it.")
     parser.add_argument("--bind", type=str, default=None,
                         help="Bind address (default: all interfaces, IPv4 and IPv6)")
     parser.add_argument("--port", type=int, default=4443,
@@ -2836,7 +2842,93 @@ def parse_args():
                              "DEBUG, TRACE, INFO")
     add_logging(parser)
     add_help(parser)
-    return parser.parse_args()
+    return _parse_with_config(parser, argv)
+
+
+def _parse_with_config(parser, argv=None):
+    """Parse `argv`, filling flags it does not give from --config."""
+    args = parser.parse_args(argv)
+    if args.config is None:
+        return args
+    try:
+        with open(args.config, "rb") as f:
+            table = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        parser.error(f"--config {args.config}: {e}")
+    given = _given_dests(parser, argv)
+    for key, value in table.items():
+        action = _config_action(parser, key)
+        if action is None:
+            parser.error(f"--config {args.config}: unknown key '{key}'")
+        try:
+            value = _config_value(action, value)
+        except (TypeError, ValueError, argparse.ArgumentTypeError) as e:
+            parser.error(f"--config {args.config}: {key}: {e}")
+        if action.dest not in given:
+            setattr(args, action.dest, value)
+    return args
+
+
+def _given_dests(parser, argv) -> set:
+    """Dests the command line itself sets."""
+    saved = [(a, a.default) for a in parser._actions]
+    for a, _ in saved:
+        a.default = argparse.SUPPRESS
+    try:
+        return set(vars(parser.parse_args(argv)))
+    finally:
+        for a, default in saved:
+            a.default = default
+
+
+def _config_action(parser, key):
+    """The action a --config key names: a long flag, not --config or
+    --help."""
+    for a in parser._actions:
+        if (f"--{key}" in a.option_strings and a.dest != "config"
+                and not isinstance(a, argparse._HelpAction)):
+            return a
+    return None
+
+
+def _config_value(action, value):
+    """A TOML value as the action would store it."""
+    if isinstance(action, (argparse._StoreTrueAction,
+                           argparse._StoreFalseAction,
+                           argparse._StoreConstAction)):
+        if not isinstance(value, bool):
+            raise TypeError(f"expected true or false, got {value!r}")
+        return action.const if value else action.default
+    if isinstance(action, argparse._AppendAction) or action.nargs in (
+            "*", "+") or isinstance(action.nargs, int):
+        if not isinstance(value, list):
+            raise TypeError(f"expected a list, got {value!r}")
+        return [_config_scalar(action, v) for v in value]
+    return _config_scalar(action, value)
+
+
+def _config_scalar(action, value):
+    """One TOML scalar through the action's type and choices."""
+    kind = action.type
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise TypeError(f"expected a {getattr(kind, '__name__', 'string')}, "
+                        f"got {value!r}")
+    if kind is int:
+        if not isinstance(value, int):
+            raise TypeError(f"expected an integer, got {value!r}")
+    elif kind is float:
+        if isinstance(value, str):
+            raise TypeError(f"expected a number, got {value!r}")
+        value = float(value)
+    elif kind is None or kind is str:
+        if not isinstance(value, str):
+            raise TypeError(f"expected a string, got {value!r}")
+    else:
+        value = kind(str(value))
+    if action.choices is not None and value not in action.choices:
+        raise ValueError(f"{value!r} is not one of "
+                         f"{', '.join(map(str, action.choices))}")
+    return value
 
 
 # SUBSCRIBE_TRACKS subscribers: (session, prefix_tuple, request_id).

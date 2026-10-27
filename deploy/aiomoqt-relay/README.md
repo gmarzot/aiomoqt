@@ -25,7 +25,8 @@ again after.
 Everything lives in `~/aiomoqt-relay`; run every `docker compose` command from there.
 
 ```
-compose.yml, nginx.conf   this directory
+compose.yml, nginx.conf, relay.toml
+                          this directory
 site/index.html           landing page (site/ here)
 site/relay/, site/private/
                           dashboard, platform, log viewer and private index (site/ here)
@@ -47,7 +48,7 @@ Create `stats.htpasswd` before the first `up`. If it is missing, Docker creates 
 place and `/stats/` fails.
 
 ```sh
-tar -C deploy/aiomoqt-relay -cf - compose.yml nginx.conf site | ssh ubuntu@aiomoqt-relay.marzresearch.net 'mkdir -p ~/aiomoqt-relay && tar -C ~/aiomoqt-relay -xf -'
+tar -C deploy/aiomoqt-relay -cf - compose.yml nginx.conf relay.toml site | ssh ubuntu@aiomoqt-relay.marzresearch.net 'mkdir -p ~/aiomoqt-relay && tar -C ~/aiomoqt-relay -xf -'
 ssh -t ubuntu@aiomoqt-relay.marzresearch.net
 cd ~/aiomoqt-relay && mkdir -p status relay-logs cores logs stats
 # The relay and GoAccess run with no capabilities, so root must own what they write.
@@ -136,6 +137,14 @@ openmoq/moq-playa:
 pnpm -r build      # in the moq-playa checkout
 tar -C examples/dist -cf - assets g5-broadcast g5-player | ssh ubuntu@aiomoqt-relay.marzresearch.net 'tar -C ~/aiomoqt-relay/site -xf -'
 ```
+
+## Relay settings
+
+`relay.toml` holds the relay's flags, mounted read-only and read with `--config`. Its keys are the
+long flag names (`cache-bytes = 268435456`, `catalog-probe = true`, lists for repeatable flags);
+an unknown key or a wrong type stops the relay with an error naming it. Flags added to the
+compose `command:` override the file. Port, certificate and transports stay in the `MOQT_*`
+environment. After copying an edited file over, run `docker compose restart relay`.
 
 ## nginx config
 
