@@ -4,6 +4,11 @@
 
 - Datagram tracks publish over WebTransport: `datagram_max_payload()` reports the WT session's ceiling, and `-D` is accepted over `https://`.
 - Malformed input is a protocol error: a control message that does not decode, or an invalid FETCH object (formerly a stream reset), closes the session with PROTOCOL_VIOLATION and a short reason; an Object whose Properties do not parse resets its stream as a malformed track; a length past the message is refused before it is read; invalid UTF-8 in a reason phrase is replaced, not an error.
+- pub_media exits 69 when no relay is reachable or every relay is lost, and 70 on an internal error or a source it cannot read (both were 1); `--help` lists the codes, and a relay that has not answered within 10 s counts as down.
+- pub_media `--stats-json`: `ready` only once a relay is up.
+- pub_media on SIGINT/SIGTERM: after PUBLISH_DONE on each track it withdraws an announced namespace, refuses SUBSCRIBE and FETCH arriving meanwhile, and closes its sessions, within about a second.
+- pub_media `--reconnect`: a lost relay is redialled 1, 2, 4 … s apart (at most 30 s) at the draft it negotiated and published to again while the media timeline runs on; `@mtt` events `endpoint_lost` and `endpoint_up`.
+- `session.drain()` refuses the peer's later SUBSCRIBE and FETCH (GOING_AWAY from d18, INTERNAL_ERROR before); `FanoutPublisher.add_session()` adds or restores a relay mid-run.
 - Data streams use their track's publisher priority as the transport band, FIFO within a band (`MOQTPeer.stream_scheduling`, `PublishedTrack(stream_scheduling=)`, aiomoqt-relay `--stream-scheduling` select round_robin); undeclared streams sit at the neutral 128, and pub_media declares audio 64 above video 128.
 - Limits on what one peer can open: a refused or cancelled request frees its state (at d18 its request stream now closes; 512 refusals used to exhaust the stream credit); d14/d16 MAX_REQUEST_ID is raised only while the peer holds under `MAX_OPEN_PEER_REQUESTS` (1000) open; aiomoqt-relay `--max-namespaces-per-session` (256) and `--max-subscriptions-per-session` (1024) refuse past them with EXCESSIVE_LOAD, and status shows each session's counts.
 - aiomoqt-relay: each subscriber has its own bounded send lane, so a slow subscriber no longer throttles a track for the others or starves a late joiner; past the bound it loses whole groups, their streams reset; status shows each subscriber's lane depth and sheds.
@@ -27,6 +32,7 @@
 - TIMESTAMP_MAPPING's four integers are vi64 at every draft, so the value survives relays that bridge d16 and d18 sessions; d16 sessions still read the RFC 9000 form older peers send.
 - `--compat missing-request-credit`: a d14/d16 peer whose SETUP has no MAX_REQUEST_ID (the Oracle relay) leaves our requests uncapped, with one WARNING, instead of capped at 0; a MAX_REQUEST_ID that arrives is still honoured. `all` includes it.
 - `publish_namespace_ok()` replaces the misspelled `publish_namepace_ok()`, which stays as an alias; a d16+ SETUP send log names the draft instead of a d14 version; bench latency is marked as a clock offset when its 1st percentile is negative, so a wall-clock step no longer is.
+- Timing: a wall-clock TIMESTAMP_MAPPING (no CLOCK_ID) whose base is not a plausible capture time (before 2000 or over a day ahead) is malformed, with a hint at a draft mismatch through a relay, instead of yielding nonsense latency. sub_media `--analyze` defaults to `--timestamp-errors report`, so a malformed track is reported and kept rather than cancelled.
 
 ## v0.13.3
 

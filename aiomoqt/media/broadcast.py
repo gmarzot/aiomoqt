@@ -70,6 +70,15 @@ class CatalogTrackPublisher(PublishedTrack):
         self._next_group = 0
         self._emitter: Optional[asyncio.Task] = None
 
+    @property
+    def next_group(self) -> int:
+        """Group ID the next independent catalog opens."""
+        return self._next_group
+
+    @next_group.setter
+    def next_group(self, group_id: int) -> None:
+        self._next_group = group_id
+
     def _serving(self) -> bool:
         return self._emitter is not None and not self._emitter.done()
 
