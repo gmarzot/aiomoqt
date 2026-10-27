@@ -55,6 +55,7 @@ def _control_session(draft):
     s._cancelled_request_streams = set()
     s._peer_goaway_streams = set()
     s._bidi_streams = {}
+    s._peer_request_low = 0
     s._peer_request_seen = set()
     s._tx_updates = {}
     s._d18_control_read_sid = None
@@ -541,20 +542,29 @@ async def test_out_of_order_request_ids_are_not_a_violation():
     assert s._peer_request_seen == {2, 4, 6, 8, 10}
 
 
-async def test_request_id_older_than_the_reorder_window_closes():
-    # Beyond the window the set can no longer vouch for an id, so it is
-    # treated as the duplicate §10.1 requires closing on.
-    from aiomoqt.protocol import PEER_REQUEST_REORDER_WINDOW
+async def test_request_id_below_the_low_water_mark_closes(monkeypatch):
+    # An unseen id stays acceptable until the seen set passes its cap;
+    # then the mark steps over it and the id counts as a duplicate.
+    from aiomoqt import protocol
     from aiomoqt.types import MOQTMessageType, SessionCloseCode
+    monkeypatch.setattr(protocol, "PEER_REQUEST_SEEN_CAP", 8)
     s = _control_session(16)
     s.is_client = False
     s._peer_request_max = -1
     s._control_msg_overrides[MOQTMessageType.SUBSCRIBE] = _noop_handler
-    high = PEER_REQUEST_REORDER_WINDOW * 2
-    s._on_control_data(0, _subscribe_frame(s, high), False)
+    for rid in range(4, 18, 2):              # 0 and 2 held back
+        s._on_control_data(0, _subscribe_frame(s, rid), False)
+    s._on_control_data(0, _subscribe_frame(s, 2), False)
     await asyncio.sleep(0)
     assert s._closed == []
-    s._on_control_data(0, _subscribe_frame(s, 2), False)
+    assert s._peer_request_low == 0          # 0 still a hole
+    for rid in range(18, 40, 2):
+        s._on_control_data(0, _subscribe_frame(s, rid), False)
+    await asyncio.sleep(0)
+    assert s._closed == []
+    assert 0 < s._peer_request_low
+    assert len(s._peer_request_seen) <= 8
+    s._on_control_data(0, _subscribe_frame(s, 0), False)
     await asyncio.sleep(0)
     assert s._closed
     assert s._closed[0][0] == SessionCloseCode.INVALID_REQUEST_ID

@@ -108,16 +108,10 @@ class MOQTStreamReject(Exception):
         self.quiet = quiet  # an expected cancel: log at debug
 
 
-# How far below the largest peer request id a smaller one can still
-# arrive and be believed. Requests ride separate streams with no
-# ordering between them, so the depth is the peer's request
-# concurrency; ids step by 2, so this is 64 outstanding requests.
-PEER_REQUEST_REORDER_WINDOW = 128
-
-
-def rid_floor(peer_request_max: int) -> int:
-    """Oldest peer request id still inside the reorder window."""
-    return peer_request_max - PEER_REQUEST_REORDER_WINDOW
+# Peer request ids seen above the low-water mark that are kept to
+# detect duplicates. Past it the mark steps forward, and ids below the
+# new mark count as duplicates.
+PEER_REQUEST_SEEN_CAP = 4096
 
 
 # base class for client and server session objects
@@ -347,10 +341,11 @@ class _MOQTSessionMixin:
         self._moqt_session_closed: Future[Tuple[int,str]] = self._loop.create_future()
         self._next_request_id = 0 if self._is_client else 1
         # Largest request id received from the peer (§10.1: the peer
-        # increments by 2 per request), and the ids actually seen within
-        # the reorder window — arrival order across request streams is
-        # not guaranteed, so only the set can identify a duplicate.
+        # increments by 2 per request). Arrival order across request
+        # streams is not guaranteed: every id below the low-water mark
+        # counts as seen, and the ids seen above it are kept in the set.
         self._peer_request_max = -1
+        self._peer_request_low = 0
         self._peer_request_seen: set = set()
         # Streams that carried a peer GOAWAY: one per control or request
         # stream (§10.4).
@@ -1201,8 +1196,7 @@ class _MOQTSessionMixin:
         self._subscriptions.pop(request_id, None)
         self._retire_alias(request_id)
         self._fail_waiting_updates(request_id, why)
-        alias = next((ta for ta, rid in self._track_aliases.items()
-                      if rid == request_id), None)
+        alias = self._release_track_later(request_id)
         if alias is not None:
             self._forget_track_bounds(alias)
         fut = self._pending_requests.pop(request_id, None)
@@ -1211,6 +1205,25 @@ class _MOQTSessionMixin:
                 error_code=0x1, reason=f"request cancelled by peer ({why})",
                 retry_interval=0))
         self._notify_request_cancelled(request_id, why)
+
+    def _note_peer_request_id(self, rid: int, parity: int) -> None:
+        """Record a peer request id: advance the low-water mark over the
+        ids seen contiguously; past PEER_REQUEST_SEEN_CAP, step it over
+        the oldest quarter of the set."""
+        if rid > self._peer_request_max:
+            self._peer_request_max = rid
+        seen = self._peer_request_seen
+        seen.add(rid)
+        low = self._peer_request_low
+        if (low & 1) != parity:
+            low += 1
+        if len(seen) > PEER_REQUEST_SEEN_CAP:
+            low = max(low, sorted(seen)[PEER_REQUEST_SEEN_CAP // 4] + 2)
+            seen.difference_update([i for i in seen if i < low])
+        while low in seen:
+            seen.discard(low)
+            low += 2
+        self._peer_request_low = low
 
     def _notify_request_cancelled(self, request_id: int, why: str,
                                   replies_pending: bool = False) -> None:
@@ -1452,15 +1465,10 @@ class _MOQTSessionMixin:
                     raise MOQTException(
                         SessionCloseCode.INVALID_REQUEST_ID,
                         f"peer request_id {rid} has wrong parity")
-                # §10.1 closes on a DUPLICATE id — NOT on arrival order.
-                # Each request rides its own bidi stream and QUIC gives no
-                # ordering across streams, so the ids of requests a peer
-                # issued concurrently (a relay forwarding one SUBSCRIBE per
-                # track) legitimately arrive out of order. Only a repeat,
-                # or an id so old the window can no longer vouch for it,
-                # is a violation.
-                floor = rid_floor(self._peer_request_max)
-                if rid in self._peer_request_seen or rid < floor:
+                # §10.1 closes on a duplicate id, not on arrival order:
+                # requests ride separate streams, so concurrent ones can
+                # arrive out of order.
+                if rid < self._peer_request_low or rid in self._peer_request_seen:
                     raise MOQTException(
                         SessionCloseCode.INVALID_REQUEST_ID,
                         f"duplicate peer request_id {rid} "
@@ -1471,13 +1479,7 @@ class _MOQTSessionMixin:
                         SessionCloseCode.TOO_MANY_REQUESTS,
                         f"peer request_id {rid} at or beyond our MAX_REQUEST_ID "
                         f"{self._local_request_max}")
-                self._peer_request_seen.add(rid)
-                if rid > self._peer_request_max:
-                    self._peer_request_max = rid
-                    floor = rid_floor(rid)
-                    if floor > 0:
-                        self._peer_request_seen.difference_update(
-                            [i for i in self._peer_request_seen if i < floor])
+                self._note_peer_request_id(rid, peer_parity)
                 if (self._local_request_max is not None
                         and not isinstance(msg, RequestUpdate)):
                     if self._unanswered_peer_requests is None:
@@ -3196,7 +3198,8 @@ class _MOQTSessionMixin:
 
     async def async_closed(self) -> bool:
         if not self._moqt_session_closed.done():
-            self._close_err = await self._moqt_session_closed
+            # An observer's cancellation must not cancel the session's signal.
+            self._close_err = await asyncio.shield(self._moqt_session_closed)
         return True
 
 
@@ -5003,6 +5006,7 @@ class _MOQTSessionMixin:
         our write half, STOP_SENDING the reply half. Returns None then."""
         self._retire_alias(request_id)
         self._subscriptions.pop(request_id, None)
+        self._release_track_later(request_id)
         if self.negotiated_draft >= 18:
             stream_id = self._bidi_streams.get(request_id)
             if stream_id is None:
@@ -6157,14 +6161,7 @@ class _MOQTSessionMixin:
                           f"status={msg.status_code} "
                           f"streams={msg.stream_count}")
         self._retire_alias(msg.request_id)
-        track_alias = next(
-            (ta for ta, rid in self._track_aliases.items()
-             if rid == msg.request_id),
-            None)
-        if track_alias is not None:
-            self._loop.call_later(self.PUBLISH_DONE_GRACE_S,
-                                  self._release_finished_track,
-                                  track_alias, msg.request_id)
+        self._release_track_later(msg.request_id)
         future = self._pending_requests.get(msg.request_id)
         if future and not future.done():
             future.set_result(msg)
@@ -6177,6 +6174,17 @@ class _MOQTSessionMixin:
         # Terminal for that subscription only: the session stays up.
         # Owners learn of it through register_publish_done_handler().
         self._subscriptions.pop(msg.request_id, None)
+
+    def _release_track_later(self, request_id: int) -> Optional[int]:
+        """Schedule the release of the request's receive track after
+        PUBLISH_DONE_GRACE_S; returns its alias, None if it has none."""
+        alias = next((ta for ta, rid in self._track_aliases.items()
+                      if rid == request_id), None)
+        if alias is not None:
+            self._loop.call_later(self.PUBLISH_DONE_GRACE_S,
+                                  self._release_finished_track,
+                                  alias, request_id)
+        return alias
 
     def _release_finished_track(self, track_alias: int,
                                 request_id: int) -> None:
@@ -6194,7 +6202,11 @@ class _MOQTSessionMixin:
                 # state with no parser and fail to parse.
                 self._mark_stream_torn_down(sid)
         self._track_aliases.pop(track_alias, None)
+        self._publish_done_handlers.pop(request_id, None)
         self._object_handlers.pop(track_alias, None)
+        self._timing_watch.pop(track_alias, None)
+        self._stream_end_handlers.pop(track_alias, None)
+        self._track_default_priority.pop(track_alias, None)
         self._early_stream_ends.pop(track_alias, None)
         self._discard_early_objects(track_alias)
         self._forget_track_bounds(track_alias)

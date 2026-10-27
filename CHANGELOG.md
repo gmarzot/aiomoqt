@@ -6,6 +6,12 @@
 - aiomoqt-relay `--pause-after SEC` (default 60, 0 = never): a track no subscriber has forwarded for that long is paused upstream (Forward State 0) and resumed by the next subscriber; `--catalog-probe` catalogs keep flowing.
 - aiomoqt-relay `--config PATH` reads flags from a TOML file keyed by long flag name; command-line flags override it, unknown keys and wrong types are errors. The deploy reads `relay.toml`.
 - aiomoqt-relay drains on SIGTERM/SIGINT: it refuses new sessions, sends GOAWAY (`--goaway-uri`, default empty) and waits up to `--drain-timeout` (5 s) before exiting; a second signal exits at once. pub_media `--reconnect` redials at once on GOAWAY, to its New Session URI if given.
+- Ending one track, or cancelling or timing out a wait on it or on `async_closed()`, no longer ends other tracks' `wait_closed()` or the session's close signal.
+- `Track.request_id` and `PublishedTrack.request_id` are None until a request is assigned (were 0); request ID 0 now gets its PUBLISH_DONE.
+- A peer request ID arriving after many later ones is accepted; only a repeat, or one older than the last 4096 IDs seen, closes the session (was 64 behind the largest).
+- A cancelled subscription, from either side, releases its receive state after the PUBLISH_DONE grace, including timing watches, stream-end handlers and default priority.
+- Track discovery accepts only a PUBLISH inside the requested namespace.
+- `SubscribedTrack.unsubscribe()` cancels the subscription and ends `wait_closed()`, with `cancelled` set and `completed` False.
 - Congestion control defaults to `bbr` (BBRv3) in `MOQTClient`, `MOQTServer`, aiomoqt-relay (was `cubic`), the tools and the examples, whichever aiopquic is installed.
 - Datagram tracks publish over WebTransport: `datagram_max_payload()` reports the WT session's ceiling, and `-D` is accepted over `https://`.
 - aiomoqt-relay: a datagram object too large for a subscriber's session is dropped for that subscriber (it no longer raises, or falls back to streams); status counts each session's `dgram_drops`.
