@@ -51,6 +51,12 @@ on one port with `--dual` (per-connection ALPN dispatch via aiopquic
 serve_dispatch). `--quic-port N` remains as the legacy two-listener
 arrangement (second raw-QUIC listener sharing the global namespace
 table) for runners that expect distinct endpoints.
+
+Stopping: SIGTERM or SIGINT drains. The relay refuses new sessions, sends
+GOAWAY to every session (New Session URI from --goaway-uri, else empty:
+reconnect to this address), waits up to --drain-timeout seconds for them
+to leave, closes the rest with GOAWAY_TIMEOUT and exits. A second signal
+exits at once.
 """
 
 import argparse
@@ -76,7 +82,8 @@ from aiomoqt.types import (
     MOQT_DEFAULT_DRAFTS, D18MessageType, FilterType, GroupOrder, MOQTDraft,
     MOQTMessageType, MOQTRequestError, MOQTStreamStopped, ObjectStatus,
     ParamType,
-    RequestErrorCode, SCHEDULING, StreamResetCode, SubscribeDoneCode,
+    RequestErrorCode, SCHEDULING, SessionCloseCode, StreamResetCode,
+    SubscribeDoneCode,
     parse_draft_spec, to_stream_priority,
 )
 from aiomoqt.messages import FetchHeader, SubgroupHeader
@@ -2778,6 +2785,15 @@ def parse_args():
                              "namespace's catalog track at once, so the "
                              "dashboard shows its MSF format before anyone "
                              "plays it. Skips namespaces starting moq-test.")
+    parser.add_argument("--goaway-uri", type=str, default="", metavar="URL",
+                        help="New Session URI sent in GOAWAY on SIGTERM or "
+                             "SIGINT. Default: empty, peers reconnect to "
+                             "the same address")
+    parser.add_argument("--drain-timeout", type=float, default=5.0,
+                        metavar="SEC",
+                        help="On SIGTERM or SIGINT, wait up to SEC seconds "
+                             "after GOAWAY for sessions to leave before "
+                             "exiting. Default: 5")
     parser.add_argument("--control", type=str, default=None, metavar="PATH",
                         help="Serve HTTP on the Unix socket PATH: GET /debug "
                              "reports DEBUG logging, POST /debug toggles it")
@@ -4232,6 +4248,72 @@ async def _serve_control(path: str) -> None:
     logger.info(f"relay: control socket {path}")
 
 
+# Seconds between drain passes.
+DRAIN_POLL_S = 0.05
+
+
+def _setup_done(session) -> bool:
+    fut = getattr(session, "_moqt_session_setup", None)
+    return (fut is not None and fut.done() and not fut.cancelled()
+            and fut.result() is True)
+
+
+async def _wait_closed(sessions, timeout: float) -> None:
+    """Wait up to `timeout` for closed sessions' connections to leave."""
+    done = [getattr(s, "_cnx_closed", None) or getattr(s, "_closed", None)
+            for s in sessions]
+    waits = [asyncio.ensure_future(ev.wait()) for ev in done
+             if ev is not None]
+    if waits:
+        _, pending = await asyncio.wait(waits, timeout=timeout)
+        for w in pending:
+            w.cancel()
+
+
+async def _drain(servers, uri: str, timeout: float, why: str) -> None:
+    """GOAWAY to every set-up session, refusing any other, then wait up
+    to `timeout` seconds for them to leave; close the rest with
+    GOAWAY_TIMEOUT."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+
+    def live():
+        return [s for srv in servers for s in list(srv._live)
+                if _session_live(s)]
+    held = {s for s in live() if _setup_done(s)}
+    logger.info(f"relay: {why}: draining {len(held)} sessions, GOAWAY "
+                f"{'to ' + uri if uri else 'to this address'}, up to "
+                f"{timeout:g}s")
+    for s in held:
+        try:
+            s.drain()
+            s.goaway(uri, timeout=int(timeout * 1000))
+        except Exception:
+            logger.debug("relay: GOAWAY failed", exc_info=True)
+    while True:
+        left = []
+        for s in live():
+            if s in held:
+                left.append(s)
+            else:
+                try:
+                    s.close(SessionCloseCode.NO_ERROR, "relay shutting down")
+                except Exception:
+                    logger.debug("relay: refusing a session failed",
+                                 exc_info=True)
+        if not left:
+            logger.info("relay: drained, all sessions gone")
+            return
+        if loop.time() >= deadline:
+            logger.info(f"relay: drain timed out, {len(left)} sessions "
+                        f"left")
+            for s in left:
+                s.close(SessionCloseCode.GOAWAY_TIMEOUT, "GOAWAY timeout")
+            await _wait_closed(left, 1.0)
+            return
+        await asyncio.sleep(DRAIN_POLL_S)
+
+
 async def main():
     global _catalog_probe
     args = parse_args()
@@ -4275,6 +4357,9 @@ async def main():
         sys.exit(2)
     if args.cache_bytes <= 0:
         print("Error: --cache-bytes must be above 0", file=sys.stderr)
+        sys.exit(2)
+    if args.drain_timeout < 0:
+        print("Error: --drain-timeout must be 0 or more", file=sys.stderr)
         sys.exit(2)
     global CACHE_BUDGET_BYTES, STREAM_SCHEDULING
     CACHE_BUDGET_BYTES = args.cache_bytes
@@ -4321,13 +4406,15 @@ async def main():
     for url in args.upstream:
         print(f"  upstream origin: {url}")
 
+    watchdog = None
     if args.watchdog > 0:
         host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(args.bind,
                                                         args.bind)
         # --quic and --dual serve raw QUIC on --port; otherwise WT.
-        _background.add(asyncio.create_task(_watchdog(
+        watchdog = asyncio.create_task(_watchdog(
             args.watchdog, host, args.port, args.quic or args.dual,
-            args.draft, handles)))
+            args.draft, handles))
+        _background.add(watchdog)
 
     if args.status_dir:
         os.makedirs(args.status_dir, exist_ok=True)
@@ -4362,18 +4449,36 @@ async def main():
               f"{WATCHDOG_MISSES} misses or a {args.watchdog:g}s stall",
               file=sys.stderr)
 
-    # SIGTERM shuts down like Ctrl-C: peers get a CONNECTION_CLOSE.
-    asyncio.get_running_loop().add_signal_handler(
-        signal.SIGTERM, asyncio.current_task().cancel)
+    # SIGTERM or SIGINT drains; a second one exits at once.
+    stop = asyncio.Event()
+    stopped_by = []
+    main_task = asyncio.current_task()
+
+    def _on_stop(sig):
+        if stop.is_set():
+            logger.info(f"relay: {sig.name} again, exiting now")
+            main_task.cancel()
+            return
+        stopped_by.append(sig.name)
+        stop.set()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        asyncio.get_running_loop().add_signal_handler(sig, _on_stop, sig)
+    servers = [server for server, _port, _label in listeners]
+    wait = 1.0
     try:
-        await asyncio.Event().wait()
+        await stop.wait()
+        if watchdog is not None:
+            watchdog.cancel()
+        await _drain(servers, args.goaway_uri, args.drain_timeout,
+                     stopped_by[0])
     except asyncio.CancelledError:
-        pass
+        wait = 0
     finally:
-        await asyncio.gather(*(server.close_sessions()
-                               for server, _port, _label in listeners))
+        await asyncio.gather(*(server.close_sessions(timeout=wait)
+                               for server in servers))
         for h in handles:
             h.close()
+        logger.info("relay: exit")
 
 
 def cli():
