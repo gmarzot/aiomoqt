@@ -2024,6 +2024,7 @@ class SubscribedTrack(Track):
         self.auth_token = auth_token
         self.publish_done: Optional[object] = None  # received PUBLISH_DONE
         self.completed = False  # True if track ended cleanly
+        self.cancelled = False  # True once unsubscribe() ended it
         # Largest Location the publisher reported in SUBSCRIBE_OK or
         # PUBLISH, as (group, object); None when it reported none.
         self.largest: Optional[tuple] = None
@@ -2359,9 +2360,20 @@ class SubscribedTrack(Track):
 
         self.session.register_publish_done_handler(request_id, _done)
 
+    def unsubscribe(self) -> None:
+        """Cancel the subscription and end the track: wait_closed()
+        returns, with `cancelled` set and `completed` False."""
+        if self.cancelled:
+            return
+        self.cancelled = True
+        if self.request_id is not None and self.publish_done is None:
+            self.session._timing_watch.pop(self.track_alias, None)
+            self.session.unsubscribe(self.request_id)
+        self._done_event.set()
+
     async def wait_closed(self) -> None:
-        """Wait for this track to end: its PUBLISH_DONE, or the session
-        closing under it.
+        """Wait for this track to end: its PUBLISH_DONE, unsubscribe(),
+        or the session closing under it.
 
         Sets self.completed if the track ended cleanly (no StreamReset).
         """
@@ -2375,7 +2387,7 @@ class SubscribedTrack(Track):
                 if not fut.done():
                     fut.cancel()
         self.state = TrackState.CLOSED
-        if self.malformed is not None:
+        if self.malformed is not None or self.cancelled:
             self.completed = False
             return
         if self.publish_done is not None:

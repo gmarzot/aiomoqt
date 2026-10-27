@@ -149,3 +149,58 @@ def test_publish_request_zero_gets_publish_done():
     assert done.status_code == SubscribeDoneCode.TRACK_ENDED
     assert session._send_reply.call_args.kwargs == {"fin": True}
 
+
+@requires_certs
+@_CASES
+async def test_unsubscribe_ends_only_that_track(draft, use_quic):
+    async with _tracks(2, draft, use_quic) as (rx, pubs, subs, counts):
+        audio_wait = asyncio.create_task(subs["audio"].wait_closed())
+        video_wait = asyncio.create_task(subs["video"].wait_closed())
+        try:
+            subs["video"].unsubscribe()
+            await asyncio.wait_for(video_wait, 5)
+            assert subs["video"].cancelled
+            assert not subs["video"].completed
+            before = counts["audio"]
+            await _until(lambda: counts["audio"] >= before + 2)
+            assert not audio_wait.done()
+            assert not subs["audio"].cancelled
+            assert rx._close_err is None
+        finally:
+            for task in (audio_wait, video_wait):
+                task.cancel()
+            await asyncio.gather(audio_wait, video_wait,
+                                 return_exceptions=True)
+
+
+@requires_certs
+@_CASES
+async def test_cancelled_subscriptions_release_receive_state(draft, use_quic):
+    async with _session(3, draft, use_quic) as (tx, rx, pubs):
+        rx.PUBLISH_DONE_GRACE_S = 0.2
+        counts = {"audio": 0, "video": 0}
+        rids = []
+        for i in range(6):
+            name = ("audio", "video")[i % 2]
+            before = counts[name]
+            sub = await _subscribe(rx, name, counts)
+            await _until(lambda: counts[name] > before)
+            rid = sub.request_id
+            rids.append(rid)
+            assert rx._track_aliases and rx._timing_watch
+            if i < 3:
+                sub.unsubscribe()
+            else:
+                rx.unsubscribe(rid)
+            await _until(lambda: rid not in tx._peer_requests
+                         and rid not in rx._bidi_streams)
+        await _until(lambda: not rx._track_aliases)
+        assert not rx._object_handlers
+        assert not rx._timing_watch
+        assert not rx._stream_end_handlers
+        assert not rx._track_default_priority
+        assert not rx._subscriptions
+        assert not rx._bidi_streams
+        assert not set(rids) & set(rx._publish_done_handlers)
+        assert not set(rids) & set(rx._pending_requests)
+        assert rx._close_err is None

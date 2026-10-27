@@ -2,6 +2,12 @@
 
 ## v0.14.0
 
+- Ending one track, or cancelling or timing out a wait on it or on `async_closed()`, no longer ends other tracks' `wait_closed()` or the session's close signal.
+- `Track.request_id` and `PublishedTrack.request_id` are None until a request is assigned (were 0); request ID 0 now gets its PUBLISH_DONE.
+- A peer request ID arriving after many later ones is accepted; only a repeat, or one older than the last 4096 IDs seen, closes the session (was 64 behind the largest).
+- A cancelled subscription, from either side, releases its receive state after the PUBLISH_DONE grace, including timing watches, stream-end handlers and default priority.
+- Track discovery accepts only a PUBLISH inside the requested namespace.
+- `SubscribedTrack.unsubscribe()` cancels the subscription and ends `wait_closed()`, with `cancelled` set and `completed` False.
 - Datagram tracks publish over WebTransport: `datagram_max_payload()` reports the WT session's ceiling, and `-D` is accepted over `https://`.
 - Malformed input is a protocol error: a control message that does not decode, or an invalid FETCH object (formerly a stream reset), closes the session with PROTOCOL_VIOLATION and a short reason; an Object whose Properties do not parse resets its stream as a malformed track; a length past the message is refused before it is read; invalid UTF-8 in a reason phrase is replaced, not an error.
 - pub_media exits 69 when no relay is reachable or every relay is lost, and 70 on an internal error or a source it cannot read (both were 1); `--help` lists the codes, and a relay that has not answered within 10 s counts as down.

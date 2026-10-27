@@ -1196,8 +1196,7 @@ class _MOQTSessionMixin:
         self._subscriptions.pop(request_id, None)
         self._retire_alias(request_id)
         self._fail_waiting_updates(request_id, why)
-        alias = next((ta for ta, rid in self._track_aliases.items()
-                      if rid == request_id), None)
+        alias = self._release_track_later(request_id)
         if alias is not None:
             self._forget_track_bounds(alias)
         fut = self._pending_requests.pop(request_id, None)
@@ -4998,6 +4997,7 @@ class _MOQTSessionMixin:
         our write half, STOP_SENDING the reply half. Returns None then."""
         self._retire_alias(request_id)
         self._subscriptions.pop(request_id, None)
+        self._release_track_later(request_id)
         if self.negotiated_draft >= 18:
             stream_id = self._bidi_streams.get(request_id)
             if stream_id is None:
@@ -6152,14 +6152,7 @@ class _MOQTSessionMixin:
                           f"status={msg.status_code} "
                           f"streams={msg.stream_count}")
         self._retire_alias(msg.request_id)
-        track_alias = next(
-            (ta for ta, rid in self._track_aliases.items()
-             if rid == msg.request_id),
-            None)
-        if track_alias is not None:
-            self._loop.call_later(self.PUBLISH_DONE_GRACE_S,
-                                  self._release_finished_track,
-                                  track_alias, msg.request_id)
+        self._release_track_later(msg.request_id)
         future = self._pending_requests.get(msg.request_id)
         if future and not future.done():
             future.set_result(msg)
@@ -6172,6 +6165,17 @@ class _MOQTSessionMixin:
         # Terminal for that subscription only: the session stays up.
         # Owners learn of it through register_publish_done_handler().
         self._subscriptions.pop(msg.request_id, None)
+
+    def _release_track_later(self, request_id: int) -> Optional[int]:
+        """Schedule the release of the request's receive track after
+        PUBLISH_DONE_GRACE_S; returns its alias, None if it has none."""
+        alias = next((ta for ta, rid in self._track_aliases.items()
+                      if rid == request_id), None)
+        if alias is not None:
+            self._loop.call_later(self.PUBLISH_DONE_GRACE_S,
+                                  self._release_finished_track,
+                                  alias, request_id)
+        return alias
 
     def _release_finished_track(self, track_alias: int,
                                 request_id: int) -> None:
@@ -6189,7 +6193,11 @@ class _MOQTSessionMixin:
                 # state with no parser and fail to parse.
                 self._mark_stream_torn_down(sid)
         self._track_aliases.pop(track_alias, None)
+        self._publish_done_handlers.pop(request_id, None)
         self._object_handlers.pop(track_alias, None)
+        self._timing_watch.pop(track_alias, None)
+        self._stream_end_handlers.pop(track_alias, None)
+        self._track_default_priority.pop(track_alias, None)
         self._early_stream_ends.pop(track_alias, None)
         self._discard_early_objects(track_alias)
         self._forget_track_bounds(track_alias)
