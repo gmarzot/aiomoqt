@@ -12,6 +12,13 @@
 - A cancelled subscription, from either side, releases its receive state after the PUBLISH_DONE grace, including timing watches, stream-end handlers and default priority.
 - Track discovery accepts only a PUBLISH inside the requested namespace.
 - `SubscribedTrack.unsubscribe()` cancels the subscription and ends `wait_closed()`, with `cancelled` set and `completed` False.
+- adaptive_bench bw mode controls on the subscriber's own windowed p90 (it was a percentile of interval means), and an empty window reads n/a, not 0 ms; CSV latency columns are `win_*` (bw) or `worst_*` (subs).
+- adaptive_bench subs mode counts a subscriber only while it receives at least half its rate, and checks the delivering total against `--shortfall-ratio`; the high-water mark counts those subscribers.
+- adaptive_bench exits nonzero when it received no data or its publisher never published, and 130 when interrupted.
+- `--cc-algo`, `--max-queued-bytes`, `--max-inflight-bytes` and `--keepalive` reach every adaptive_bench worker, and the budget flags now apply in load_sim, pub_media, sub_bench and sub_media (`cli.transport_kwargs`); banners show them. load_sim gains the grid's session flags.
+- load_sim counts connect and setup failures as failed joins, with their cause, and a join stopped midway as neither.
+- Split-host adaptive_bench (`--role sub`) acts on p90 over a running baseline, cancelling a constant clock offset.
+- TrackStats and adaptive_bench keep per-group loss state for the last 64-80 groups only; with `group_loss` a skipped group id counts as a whole group lost; adaptive_bench's loopback loss is windowed; snapshots carry `dt` and `lat_n`.
 - Congestion control defaults to `bbr` (BBRv3) in `MOQTClient`, `MOQTServer`, aiomoqt-relay (was `cubic`), the tools and the examples, whichever aiopquic is installed.
 - Datagram tracks publish over WebTransport: `datagram_max_payload()` reports the WT session's ceiling, and `-D` is accepted over `https://`.
 - aiomoqt-relay: a datagram object too large for a subscriber's session is dropped for that subscriber (it no longer raises, or falls back to streams); status counts each session's `dgram_drops`.

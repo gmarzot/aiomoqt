@@ -428,8 +428,7 @@ async def run(args):
         use_quic=relay.use_quic, verify_tls=not args.insecure,
         supported_drafts=args.draft, debug=args.debug,
         keylog_filename=args.keylogfile,
-        congestion_control_algorithm=args.cc_algo,
-        keep_alive_interval=args.keepalive,
+        **_cli.transport_kwargs(args),
     )
     _status(f"  relay: {relay}  namespace: {args.namespace}")
     rc = 0

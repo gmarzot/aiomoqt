@@ -194,8 +194,7 @@ async def run(args):
         supported_drafts=args.draft,
         debug=args.debug,
         keylog_filename=args.keylogfile,
-        congestion_control_algorithm=args.cc_algo,
-        keep_alive_interval=args.keepalive,
+        **_cli.transport_kwargs(args),
     )
 
     failed = True

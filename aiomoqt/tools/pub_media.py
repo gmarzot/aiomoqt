@@ -1090,8 +1090,7 @@ class _Endpoint:
             supported_drafts=([self.draft] if self.draft is not None
                               else args.draft),
             debug=args.debug, keylog_filename=args.keylogfile,
-            congestion_control_algorithm=args.cc_algo,
-            keep_alive_interval=args.keepalive,
+            **_cli.transport_kwargs(args),
             libquicr_compat=self.libquicr)
         stack = contextlib.AsyncExitStack()
 
