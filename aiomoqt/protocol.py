@@ -730,6 +730,14 @@ class _MOQTSessionMixin:
     # d14/d16 request-id credit (§9.5): our advertised ceiling on the
     # peer's ids and theirs on ours. None = no ceiling (d18).
     REQUEST_ID_WINDOW = 10000
+    # d14/d16: our MAX_REQUEST_ID is raised only while the peer holds
+    # fewer requests open than this (unanswered, or holding session state).
+    MAX_OPEN_PEER_REQUESTS = 1000
+    CREDIT_RECHECK_S = 0.5
+    _unanswered_peer_requests: Optional[Set[int]] = None
+    _credit_recheck: Optional[asyncio.TimerHandle] = None
+    _credit_held = False
+    _credit_warned = False
     _local_request_max: Optional[int] = None
     _peer_request_limit: Optional[int] = None
     # --compat missing-request-credit: a peer SETUP without MAX_REQUEST_ID
@@ -1190,6 +1198,8 @@ class _MOQTSessionMixin:
         it. Publishers stop feeding on this. With replies_pending the
         PUBLISH_DONE handler stays for a PUBLISH_DONE still inbound."""
         self._note_request_gone(request_id)
+        if self._unanswered_peer_requests:
+            self._unanswered_peer_requests.discard(request_id)
         cb = self._request_cancel_handlers.pop(request_id, None)
         self._requests.pop(request_id, None)
         self._peer_requests.pop(request_id, None)
@@ -1447,6 +1457,11 @@ class _MOQTSessionMixin:
                     if floor > 0:
                         self._peer_request_seen.difference_update(
                             [i for i in self._peer_request_seen if i < floor])
+                if (self._local_request_max is not None
+                        and not isinstance(msg, RequestUpdate)):
+                    if self._unanswered_peer_requests is None:
+                        self._unanswered_peer_requests = set()
+                    self._unanswered_peer_requests.add(rid)
                 self._extend_request_credit(rid)
             msg_len += hdr_len
             if end_pos > buf.tell():
@@ -3641,6 +3656,9 @@ class _MOQTSessionMixin:
         if self._quic is None:
             raise MOQTException(SessionCloseCode.INTERNAL_ERROR,
                                 "session not initialized")
+        if self._unanswered_peer_requests:
+            self._unanswered_peer_requests.discard(
+                getattr(msg, 'request_id', None))
         self._assert_type_defined_by_draft(msg)
         if (self._profile.control_uni_pair and
                 isinstance(msg, self._REPLY_CLASSES)):
@@ -3689,6 +3707,9 @@ class _MOQTSessionMixin:
         stream (d16+ SUBSCRIBE_NAMESPACE response routing). Like
         send_control_message, serialization happens here at the session
         profile so callers never thread prof=."""
+        if self._unanswered_peer_requests:
+            self._unanswered_peer_requests.discard(
+                getattr(msg, 'request_id', None))
         self._assert_type_defined_by_draft(msg)
         self.stream_write(stream_id, msg.serialize(prof=self._profile).data)
 
@@ -6014,13 +6035,45 @@ class _MOQTSessionMixin:
         self._forget_track_bounds(track_alias)
 
     def _extend_request_credit(self, rid: int) -> None:
-        """Raise our MAX_REQUEST_ID before the peer reaches it (§9.5)."""
+        """Raise our MAX_REQUEST_ID before the peer reaches it (§9.5),
+        unless it holds MAX_OPEN_PEER_REQUESTS open; then retry every
+        CREDIT_RECHECK_S."""
         limit = self._local_request_max
         if limit is None or rid < limit - self.REQUEST_ID_WINDOW // 2:
             return
+        held = self._open_peer_requests()
+        if held >= self.MAX_OPEN_PEER_REQUESTS:
+            if not self._credit_warned:
+                self._credit_warned = True
+                logger.warning(
+                    f"MOQT: peer holds {held} open requests (cap "
+                    f"{self.MAX_OPEN_PEER_REQUESTS}): MAX_REQUEST_ID held "
+                    f"at {limit}")
+            self._credit_held = True
+            if self._credit_recheck is None:
+                self._credit_recheck = self._loop.call_later(
+                    self.CREDIT_RECHECK_S, self._recheck_request_credit)
+            return
         self._local_request_max = limit + self.REQUEST_ID_WINDOW
+        if self._credit_held:
+            self._credit_held = False
+            logger.info(f"MOQT: peer holds {held} open requests: "
+                        f"MAX_REQUEST_ID raised to {self._local_request_max}")
         self.send_control_message(
             MaxSubscribeId(request_id=self._local_request_max))
+
+    def _recheck_request_credit(self) -> None:
+        self._credit_recheck = None
+        if self._close_err is None:
+            self._extend_request_credit(self._peer_request_max)
+
+    def _open_peer_requests(self) -> int:
+        """The peer's requests that are unanswered or hold session state."""
+        own = 0 if self._is_client else 1
+        held = set(self._unanswered_peer_requests or ())
+        held.update(self._peer_requests)
+        held.update(r for r in self._requests if r & 1 != own)
+        return len(held)
 
     def _ingest_request_limit(self, params) -> None:
         """Peer's MAX_REQUEST_ID Setup parameter (§9.3.1.3); absent is
