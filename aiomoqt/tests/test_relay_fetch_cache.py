@@ -71,7 +71,8 @@ def test_a_cancelled_fetch_counts_only_what_it_served(relay_tables):
     s = type("S", (), {})()
     s.fetch_ok = lambda **kw: None
 
-    async def _serve(request_id, objects, group_order=None, fin=True):
+    async def _serve(request_id, objects, group_order=None, fin=True,
+                     stream_priority=None):
         it = iter(objects)
         next(it)
         next(it)

@@ -97,7 +97,7 @@ async def test_setup_auth_token_roundtrip(use_quic):
         token = msg.parameters.get(ParamType.AUTH_TOKEN)
         if token is not None:
             received_tokens.append(token)
-        session.publish_namepace_ok(msg)
+        session.publish_namespace_ok(msg)
 
     server = await _start_server(
         port, supported_drafts=16, use_quic=use_quic,
@@ -197,7 +197,9 @@ async def test_default_stream_priority_does_not_recurse(use_quic, monkeypatch):
                                 "set_default_stream_priority", counted)
             transport = (session._quic if use_quic
                          else super(_MOQTSessionMixin, session))
-            has_api = hasattr(transport, "set_default_stream_priority")
+            has_api = (hasattr(transport, "set_default_stream_priority")
+                       or hasattr(getattr(session, "_transport", None),
+                                  "set_default_stream_priority"))
             assert session.set_default_stream_priority(128) is has_api
             assert calls == [128]
     finally:

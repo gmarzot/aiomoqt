@@ -3,6 +3,7 @@
 ## v0.14.0
 
 - Malformed input is a protocol error: a control message that does not decode, or an invalid FETCH object (formerly a stream reset), closes the session with PROTOCOL_VIOLATION and a short reason; an Object whose Properties do not parse resets its stream as a malformed track; a length past the message is refused before it is read; invalid UTF-8 in a reason phrase is replaced, not an error.
+- Data streams use their track's publisher priority as the transport band, FIFO within a band (`MOQTPeer.stream_scheduling`, `PublishedTrack(stream_scheduling=)`, aiomoqt-relay `--stream-scheduling` select round_robin); undeclared streams sit at the neutral 128, and pub_media declares audio 64 above video 128.
 - aiomoqt-relay: each subscriber has its own bounded send lane, so a slow subscriber no longer throttles a track for the others or starves a late joiner; past the bound it loses whole groups, their streams reset; status shows each subscriber's lane depth and sheds.
 - A control message that closes the session (such as a request at the MAX_REQUEST_ID ceiling) no longer logs a second close as a parse failure.
 - aiomoqt-relay dashboard: a live track takes the history slot of the track ended longest, so busy relays keep charting their live tracks.
@@ -23,6 +24,7 @@
 - aiomoqt-relay: a REQUEST_UPDATE that arrives while its SUBSCRIBE waits on the upstream is answered after the SUBSCRIBE_OK instead of ahead of it with NOT_SUPPORTED; update replies log `MOQT send:` at INFO.
 - TIMESTAMP_MAPPING's four integers are vi64 at every draft, so the value survives relays that bridge d16 and d18 sessions; d16 sessions still read the RFC 9000 form older peers send.
 - `--compat missing-request-credit`: a d14/d16 peer whose SETUP has no MAX_REQUEST_ID (the Oracle relay) leaves our requests uncapped, with one WARNING, instead of capped at 0; a MAX_REQUEST_ID that arrives is still honoured. `all` includes it.
+- `publish_namespace_ok()` replaces the misspelled `publish_namepace_ok()`, which stays as an alias; a d16+ SETUP send log names the draft instead of a d14 version; bench latency is marked as a clock offset when its 1st percentile is negative, so a wall-clock step no longer is.
 
 ## v0.13.3
 
