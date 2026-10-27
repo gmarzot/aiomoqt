@@ -32,6 +32,7 @@ from ..types import ObjectStatus
 from ..utils.buffer import Buffer, BufferReadError
 from ..utils.logger import TRACE, get_logger
 from ..utils.timing import OBJECT_TIMESTAMP
+from .sources import avcc_param_sets, hvcc_param_sets, lp_to_annexb
 
 logger = get_logger(__name__)
 
@@ -68,6 +69,13 @@ _CONSUMED_IDS = frozenset(_CONFIG_IDS + (LOC_PROP_TIMESCALE,
 # Private Properties block type (SecureObjects), opening every payload.
 LOC_PRIVATE_PROPERTIES = 0x0A
 _EMPTY_PRIVATE_PROPERTIES = bytes([LOC_PRIVATE_PROPERTIES, 0x00])
+
+# Annex B codec family → (parameter sets from config, NAL header byte is
+# a parameter set).
+_ANNEXB = {
+    'h264': (avcc_param_sets, lambda h: (h & 0x1F) in (7, 8)),
+    'h265': (hvcc_param_sets, lambda h: 32 <= ((h >> 1) & 0x3F) <= 34),
+}
 
 # MoQ Streaming Format registry (loc-02 §6.2; dropped in loc-04).
 LOC_STREAMING_FORMAT_TYPE = 0x002
@@ -108,6 +116,10 @@ class LocTrackPublisher(PublishedTrack):
     `loc_bare` sends the media without the Private Properties block, for
     receivers predating it; MSF CMAF tracks, which are not LOC, use it too.
 
+    `annexb` ('h264' or 'h265') sends length-prefixed video payloads as
+    Annex B (loc-04 §2.1.4) with the parameter sets from `config` ahead of
+    every key frame that lacks its own (§2.1.1); no VIDEO_CONFIG is sent.
+
     `frindell` (a utils.timing.MediaTimestamps) adds
     draft-frindell-moq-timestamp Track Properties, and OBJECT_TIMESTAMP
     from each frame's `capture_us`, beside the LOC timestamp.
@@ -124,11 +136,19 @@ class LocTrackPublisher(PublishedTrack):
                  loc01_compat: bool = False,
                  codec_string: Optional[str] = None,
                  loc_bare: bool = False,
-                 config_property: Optional[str] = 'object'):
+                 config_property: Optional[str] = 'object',
+                 annexb: Optional[str] = None):
         super().__init__(session, namespace, trackname,
                          priority=priority, auth_token=auth_token)
         if config_property not in ('object', 'track', None):
             raise ValueError(f"config_property {config_property!r}")
+        if annexb is not None and (annexb not in _ANNEXB
+                                   or media_kind != 'video'):
+            raise ValueError(f"annexb {annexb!r} for {media_kind}")
+        self.annexb = annexb
+        self._param_sets: tuple = (None, b'')
+        if annexb is not None:
+            config_property = None
         self.loc_bare = loc_bare
         self.config = config
         self.config_property = config_property
@@ -198,9 +218,27 @@ class LocTrackPublisher(PublishedTrack):
                  object_id: int) -> Optional[bytes]:
         """Object payload for a numbered frame; None drops the frame
         without using its object id."""
+        if self.annexb is not None:
+            payload = self._annexb(payload, object_id == 0)
         if self.loc_bare:
             return payload
         return _EMPTY_PRIVATE_PROPERTIES + payload
+
+    def _annexb(self, payload: bytes, key_frame: bool) -> bytes:
+        """Length-prefixed NAL units as Annex B; a key frame without
+        parameter sets of its own gets those of `config` first."""
+        out = lp_to_annexb(payload)
+        if not key_frame or self.config is None:
+            return out
+        from_config, is_param_set = _ANNEXB[self.annexb]
+        pos = 0
+        while pos + 4 < len(payload):
+            if is_param_set(payload[pos + 4]):
+                return out
+            pos += 4 + int.from_bytes(payload[pos:pos + 4], 'big')
+        if self._param_sets[0] is not self.config:
+            self._param_sets = (self.config, from_config(self.config))
+        return self._param_sets[1] + out
 
     def _now(self) -> int:
         """The wall clock in this track's timestamp units."""

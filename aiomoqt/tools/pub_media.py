@@ -17,7 +17,9 @@ audio, plus video from an mp4) to a relay.
 The video track sends the mp4's samples byte-for-byte as LOC canonical
 payloads (loc-02 §2.1.3); the avcC extradata rides the catalog
 initDataList and VIDEO_CONFIG group-start properties. Frames pace to
-their timestamps (--no-pace to blast).
+their timestamps (--no-pace to blast). With --annexb, or --no-catalog,
+H.264/H.265 goes out as Annex B with the parameter sets in every key
+frame (loc-04 §2.1.1, §2.1.4) and codec avc3/hev1.
 
   # live H.264 Annex-B ingest (OBS/ffmpeg pipe; frames stamped on arrival)
   ffmpeg -i srt://0.0.0.0:9000?mode=listener -c:v copy -bsf:v h264_mp4toannexb \\
@@ -216,7 +218,14 @@ def parse_args():
                              '1: start right after PUBLISH.')
     parser.add_argument('--no-catalog', action='store_true',
                         help='Publish no catalog track (LOC only): '
-                             'receivers configure from the media')
+                             'receivers configure from the media; '
+                             'implies --annexb')
+    parser.add_argument('--annexb', action='store_true',
+                        help='LOC H.264/H.265 video as Annex B: start '
+                             'codes instead of length prefixes, parameter '
+                             'sets in every key frame instead of '
+                             'VIDEO_CONFIG or catalog initData; catalog '
+                             'codec avc3/hev1')
     parser.add_argument('--catalog-bitrate', type=int, default=None,
                         metavar='BPS',
                         help='Catalog bitrate of the video track (of audio '
@@ -313,6 +322,7 @@ def parse_args():
     if args.loc_timescale is not None and args.loc_timescale <= 0:
         parser.error('--loc-timescale must be positive')
     for flag, on in (('--loc-codecstring', args.loc_codecstring),
+                     ('--annexb', args.annexb),
                      ('--loc-bare', args.loc_bare),
                      ('--loc-timescale', args.loc_timescale)):
         if on and args.packaging != PACKAGING_LOC:
@@ -415,6 +425,26 @@ def _player_url(args, relay, url: str, draft=None) -> str:
     return args.player_base + '?' + '&'.join(q)
 
 
+def _annexb_family(args, video) -> Optional[str]:
+    """'h264' or 'h265' when LOC video goes out as Annex B: --annexb, or
+    --no-catalog, which leaves the parameter sets nowhere but the payload."""
+    if (video is None or getattr(args, 'packaging', None) != PACKAGING_LOC
+            or not (getattr(args, 'annexb', False)
+                    or getattr(args, 'no_catalog', False))):
+        return None
+    codec = video.codec_string or ''
+    if codec.startswith(('avc1', 'avc3')):
+        return 'h264'
+    if codec.startswith(('hvc1', 'hev1')):
+        return 'h265'
+    return None
+
+
+def _annexb_codec(codec: str) -> str:
+    """The in-band parameter set form of a codec string: avc3, hev1."""
+    return {'avc1': 'avc3', 'hvc1': 'hev1'}.get(codec[:4], codec[:4]) + codec[4:]
+
+
 def _build_catalog(args, video, audio, chunkers=None) -> Catalog:
     packaging = args.packaging
     chunkers = chunkers or {}
@@ -446,18 +476,23 @@ def _build_catalog(args, video, audio, chunkers=None) -> Catalog:
             bitrate=_SAMPLERATE * _CHANNELS * 16))
     if video is not None:
         cmaf = 'video' in chunkers
+        # Annex B: a decoder description would contradict the payload.
+        annexb = _annexb_family(args, video) is not None
+        v_config = None if annexb else video.config
         tracks.insert(0, CatalogTrack(
             name='video', packaging=packaging, isLive=True, role='video',
-            renderGroup=1, codec=video.codec_string,
+            renderGroup=1,
+            codec=(_annexb_codec(video.codec_string) if annexb
+                   else video.codec_string),
             width=video.width, height=video.height,
             framerate=video.fps,
             bitrate=(explicit or video.avg_bitrate
                      or (None if live_ts else 2_000_000)),
-            initRef='v0' if (cmaf or video.config) else None))
+            initRef='v0' if (cmaf or v_config) else None))
         if cmaf:
             init.append(InitData.from_bytes(
                 'v0', chunkers['video'].init_segment()))
-        elif video.config:
+        elif v_config:
             init.append(_init_data(args, 'v0', video.config,
                                    LOC_PROP_VIDEO_CONFIG))
     if getattr(args, 'target_latency', None) is not None:
@@ -656,16 +691,17 @@ async def _apply_config_change(dmx: TsDemuxer, tracks: dict, pub):
     if video is not None and dmx.video.config != video.config:
         video.config = dmx.video.config
         view = _LiveVideo(dmx.video)
+        codec = (_annexb_codec(view.codec_string) if video.annexb
+                 else view.codec_string)
         if video.codec_string is not None:
-            video.codec_string = view.codec_string
+            video.codec_string = codec
         for t in (cat.tracks if cat is not None else ()):
             if t.name == 'video':
-                t.codec, t.width, t.height = (view.codec_string, view.width,
-                                              view.height)
+                t.codec, t.width, t.height = codec, view.width, view.height
         if 'v0' in init:
             init['v0'].data = InitData.from_bytes('v0', view.config).data
         print(f"  video config changed: {view.width}x{view.height} "
-              f"{view.codec_string}")
+              f"{codec}")
     audio = tracks.get('audio')
     entry = cat.find('audio') if cat is not None else None
     if audio is not None and (
@@ -1232,6 +1268,11 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
             print(f"  note: {args.packaging} packaging — tone audio skipped "
                   "(no AAC or Opus track in the mp4)")
             args.no_audio = True
+    annexb = _annexb_family(args, video)
+    if args.annexb and annexb is None:
+        print("  note: --annexb applies to H.264/H.265 video; off")
+    v_codec = (_annexb_codec(video.codec_string) if annexb
+               else video.codec_string if video is not None else None)
     ingest = await _open_ingest(args) if args.input else None
     if ingest is not None:
         catalog = _build_ingest_catalog(args, ingest)
@@ -1318,7 +1359,7 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
                     session, args.namespace, 'video', config=video.config,
                     mapping=v_map, loc01_compat=args.loc01_compat, loc_bare=loc_bare,
                     timescale=args.loc_timescale, config_property=cfg_at,
-                    codec_string=_cs(video.codec_string)),
+                    codec_string=_cs(v_codec), annexb=annexb),
                     _ts_timestamps(args, dmx, first, 'video', wall0)))
                 stats['video'] = _TrackStats()
             if ts_audio is not None:
@@ -1369,7 +1410,7 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
                     session, args.namespace, 'video', config=video.config,
                     mapping=v_map, loc01_compat=args.loc01_compat, loc_bare=loc_bare,
                     timescale=args.loc_timescale, config_property=cfg_at,
-                    codec_string=_cs(video.codec_string)),
+                    codec_string=_cs(v_codec), annexb=annexb),
                     MediaTimestamps(wall0))),
                 fh, asm, first, args, stats['video']))
         elif video is not None and ts is None:   # --ts wired both tracks above
@@ -1380,7 +1421,7 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
                     'video', mapping=v_map,
                     config=None if v_ck else video.config,
                     loc01_compat=args.loc01_compat,
-                    codec_string=_cs(video.codec_string)),
+                    codec_string=_cs(v_codec), annexb=annexb),
                     _frindell_for(video, wall0))),
                 video, args, stats['video'],
                 gap_us=int(1e6 / (video.fps or 30)),
