@@ -197,7 +197,9 @@ async def test_default_stream_priority_does_not_recurse(use_quic, monkeypatch):
                                 "set_default_stream_priority", counted)
             transport = (session._quic if use_quic
                          else super(_MOQTSessionMixin, session))
-            has_api = hasattr(transport, "set_default_stream_priority")
+            has_api = (hasattr(transport, "set_default_stream_priority")
+                       or hasattr(getattr(session, "_transport", None),
+                                  "set_default_stream_priority"))
             assert session.set_default_stream_priority(128) is has_api
             assert calls == [128]
     finally:

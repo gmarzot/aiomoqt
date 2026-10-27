@@ -76,7 +76,8 @@ def _session(draft=18):
         request_error_code(error_code, s._profile, fetch=True))
     s.fetch_ok = lambda **kw: None
 
-    async def _serve(request_id, objects, group_order=None, fin=True):
+    async def _serve(request_id, objects, group_order=None, fin=True,
+                     stream_priority=None):
         s._served.append(list(objects))
         return 0
     s.serve_fetch = _serve

@@ -206,11 +206,8 @@ class SubgroupDelivery:
         self.session = session
         self.track_alias = track_alias
         self.priority = priority
-        # Transport send priority for this track's streams. None leaves
-        # every stream at the transport default, which is what callers
-        # that never ask for scheduling get. Precomputed by the caller:
-        # the wire byte is constant per track, so it never costs work in
-        # the send loop.
+        # Transport band for this track's streams, precomputed by the
+        # caller; None leaves the session default.
         self.stream_priority = stream_priority
         self.mapping = mapping
         self.stream_count = 0

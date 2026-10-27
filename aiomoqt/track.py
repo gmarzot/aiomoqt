@@ -33,6 +33,7 @@ from .types import (
     FetchType, MOQTRequestError, MOQTStreamStopped, ParamType, FilterType,
     ForwardingPreference, GroupOrder, LOC_TIMESTAMP, ObjectStatus,
     RequestErrorCode, StreamResetCode, SubscribeDoneCode,
+    SCHEDULING, to_stream_priority,
 )
 from .delivery import (
     DatagramTooLarge, FanoutDelivery, ObjectHistory, StreamMapping,
@@ -275,6 +276,7 @@ class _SubgroupSender:
         self.track_alias = track_alias
         self.subgroup_id = subgroup_id
         self.priority = priority
+        self.band = track._stream_band(session, priority)
         self.header = None
         self.stream_id = None
         # The peer stopped this group's stream (§11.3.2: not reopened).
@@ -335,6 +337,7 @@ class _SubgroupSender:
         try:
             if self.stream_id is None:
                 self.stream_id = await session.open_uni_stream()
+                session.set_stream_priority(self.stream_id, self.band)
                 self.track._stream_count += 1
                 self.track._stream_opened(self.sub)
                 self.sub.senders.add(self)
@@ -573,7 +576,8 @@ class PublishedTrack(Track):
                      Dict[int, Union[int, bytes]]] = None,
                  track_properties: Optional[
                      Dict[int, Union[int, bytes]]] = None,
-                 timestamps: str = 'loc'):
+                 timestamps: str = 'loc',
+                 stream_scheduling: Optional[str] = None):
         # Before super(): Track.__init__ assigns track_alias/request_id/
         # state, which are properties over this list.
         self._subs = [_Subscription(session)]
@@ -581,10 +585,12 @@ class PublishedTrack(Track):
                          object_size, group_size, num_subgroups, rate)
         self.forwarding = forwarding
         self.priority = priority
-        # Transport send priority for this track's streams; None leaves
-        # them at the transport default. Opt-in, so a track that never
-        # asks for scheduling behaves exactly as before.
+        # Transport band for this track's data streams; None derives it
+        # from `priority` and `stream_scheduling` (None: the session's).
         self.stream_priority = None
+        if stream_scheduling not in (None, *SCHEDULING):
+            raise ValueError(f"stream_scheduling {stream_scheduling!r}")
+        self.stream_scheduling = stream_scheduling
         self.auth_token = auth_token
         self.immutable_properties = _checked_immutable(immutable_properties)
         self.track_properties = _checked_immutable(track_properties,
@@ -696,6 +702,16 @@ class PublishedTrack(Track):
     def _produces(self) -> bool:
         return type(self).produce is not PublishedTrack.produce
 
+    def _stream_band(self, session, priority: Optional[int] = None) -> int:
+        """Transport band for this track's data streams on `session`."""
+        if self.stream_priority is not None:
+            return self.stream_priority
+        sched = self.stream_scheduling or getattr(
+            session, 'stream_scheduling', "fifo")
+        return to_stream_priority(
+            self.priority if priority is None else priority,
+            discipline=sched)
+
     def _add_delivery(self, sub) -> None:
         """Give a peer its delivery of the object sequence under its
         current alias, replacing any it had. It joins at the next group
@@ -709,7 +725,8 @@ class PublishedTrack(Track):
         sub.delivery = SubgroupDelivery(sub.session, sub.track_alias,
                                         priority=self.priority,
                                         mapping=self.mapping,
-                                        stream_priority=self.stream_priority)
+                                        stream_priority=self._stream_band(
+                                            sub.session))
         sub.delivery.passes = sub.passes
         sub.delivery.excludes_end = sub.excludes_end
         self._out.add(sub.delivery,
@@ -1323,7 +1340,8 @@ class PublishedTrack(Track):
             await session.serve_fill(
                 msg, self._history, largest,
                 subscription_filter=sub.location_filter,
-                group_order=sub.group_order)
+                group_order=sub.group_order,
+                stream_priority=self._stream_band(session))
         except asyncio.CancelledError:
             pass  # serve_fetch reset the stream
         except Exception:
@@ -1458,7 +1476,9 @@ class PublishedTrack(Track):
         session.register_request_cancel_handler(rid, lambda _: task.cancel())
         session._bind_fetch(rid, self)
         try:
-            await session.serve_fetch(rid, objects, group_order=int(order))
+            await session.serve_fetch(rid, objects, group_order=int(order),
+                                      stream_priority=self._stream_band(
+                                          session))
         finally:
             session._request_cancel_handlers.pop(rid, None)
             session._unbind_request(rid)
