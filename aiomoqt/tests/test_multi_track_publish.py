@@ -84,7 +84,7 @@ class _Receiver:
         self.session = session
         if self._on_namespace is not None:
             await self._on_namespace(self, session, msg)
-        session.publish_namepace_ok(msg)
+        session.publish_namespace_ok(msg)
 
 
 @contextlib.asynccontextmanager

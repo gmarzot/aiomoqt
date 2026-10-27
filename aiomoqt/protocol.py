@@ -4340,18 +4340,20 @@ class _MOQTSessionMixin:
         if parameters is None:
             parameters = {}
 
+        if not self._profile.setup_carries_versions:
+            versions = None  # negotiated out of band, not on the wire
         message = ClientSetup(
             versions=versions,
             parameters=parameters
         )
-        control_log.info(f"MOQT send: {self._msgstr(message)}")
+        control_log.info(f"MOQT send: {self._msgstr(message)} draft-{self.negotiated_draft}")
         self.send_control_message(message)
 
         return message
 
     def server_setup(
         self,
-        selected_version: int = MOQT_VERSION_DRAFT14,
+        selected_version: Optional[int] = MOQT_VERSION_DRAFT14,
         parameters: Optional[Dict[int, bytes]] = None
     ) -> ServerSetup:
         """Send SERVER_SETUP message in response to CLIENT_SETUP."""
@@ -4364,11 +4366,13 @@ class _MOQTSessionMixin:
         self._auth_token_cache_max = int(
             parameters.get(SetupParamType.MAX_AUTH_TOKEN_CACHE_SIZE, 0))
 
+        if not self._profile.setup_carries_versions:
+            selected_version = None  # negotiated out of band, not on the wire
         message = ServerSetup(
             selected_version=selected_version,
             parameters=parameters
         )
-        control_log.info(f"MOQT send: {self._msgstr(message)}")
+        control_log.info(f"MOQT send: {self._msgstr(message)} draft-{self.negotiated_draft}")
         self.send_control_message(message)
         return message
 
@@ -5399,7 +5403,7 @@ class _MOQTSessionMixin:
                 return dict(params)
         return None
 
-    def publish_namepace_ok(
+    def publish_namespace_ok(
         self,
         msg: PublishNamespace,
     ) -> Optional[MOQTMessage]:
@@ -5420,6 +5424,9 @@ class _MOQTSessionMixin:
         # peer unable to correlate it, so the announce never resolved.
         self._send_reply(msg.request_id, message)
         return message
+
+    # Old misspelling, kept as an alias.
+    publish_namepace_ok = publish_namespace_ok
 
     def publish_namespace_done(
         self,
@@ -5901,9 +5908,9 @@ class _MOQTSessionMixin:
                              error_code=RequestErrorCode.DOES_NOT_EXIST,
                              reason="track does not exist")
 
-    async def _handle_publish_namepace(self, msg: PublishNamespace) -> None:
+    async def _handle_publish_namespace(self, msg: PublishNamespace) -> None:
         control_log.debug(f"MOQT receive: {self._msgstr(msg)}")
-        self.publish_namepace_ok(msg)
+        self.publish_namespace_ok(msg)
 
     async def _handle_subscribe_update(self, msg: SubscribeUpdate) -> None:
         control_log.debug(f"MOQT event: handle {self._msgstr(msg)}")
@@ -5928,15 +5935,15 @@ class _MOQTSessionMixin:
             self._subscriptions[msg.request_id].append(msg)
         self._resolve_request(msg.request_id, msg)
 
-    async def _handle_publish_namepace_ok(self, msg: PublishNamespaceOk) -> None:
+    async def _handle_publish_namespace_ok(self, msg: PublishNamespaceOk) -> None:
         control_log.debug(f"MOQT event: handle {self._msgstr(msg)}")
         self._resolve_request(msg.request_id, msg)
 
-    async def _handle_publish_namepace_error(self, msg: PublishNamespaceError) -> None:
+    async def _handle_publish_namespace_error(self, msg: PublishNamespaceError) -> None:
         control_log.debug(f"MOQT event: handle {self._msgstr(msg)}")
         self._resolve_request(msg.request_id, msg)
 
-    async def _handle_publish_namepace_done(self, msg: PublishNamespaceDone) -> None:
+    async def _handle_publish_namespace_done(self, msg: PublishNamespaceDone) -> None:
         control_log.debug(f"MOQT event: handle {self._msgstr(msg)}")
         # Publisher is releasing the namespace — for subscribers whose
         # only interest is this namespace, that's a clean end-of-track
@@ -5945,7 +5952,7 @@ class _MOQTSessionMixin:
         self._close_session(SessionCloseCode.NO_ERROR,
                             "publisher namespace done")
 
-    async def _handle_publish_namepace_cancel(self, msg: PublishNamespaceCancel) -> None:
+    async def _handle_publish_namespace_cancel(self, msg: PublishNamespaceCancel) -> None:
         control_log.debug(f"MOQT event: handle {self._msgstr(msg)}")
         # Handle announcement cancellation
 
@@ -6416,11 +6423,11 @@ class _MOQTSessionMixin:
        MOQTMessageType.SUBSCRIBE_ERROR: (SubscribeError, _handle_subscribe_error),
 
        # PublishNamespace messages
-       MOQTMessageType.PUBLISH_NAMESPACE: (PublishNamespace, _handle_publish_namepace),
-       MOQTMessageType.PUBLISH_NAMESPACE_OK: (PublishNamespaceOk, _handle_publish_namepace_ok),
-       MOQTMessageType.PUBLISH_NAMESPACE_ERROR: (PublishNamespaceError, _handle_publish_namepace_error),
-       MOQTMessageType.PUBLISH_NAMESPACE_DONE: (PublishNamespaceDone, _handle_publish_namepace_done),
-       MOQTMessageType.PUBLISH_NAMESPACE_CANCEL: (PublishNamespaceCancel, _handle_publish_namepace_cancel),
+       MOQTMessageType.PUBLISH_NAMESPACE: (PublishNamespace, _handle_publish_namespace),
+       MOQTMessageType.PUBLISH_NAMESPACE_OK: (PublishNamespaceOk, _handle_publish_namespace_ok),
+       MOQTMessageType.PUBLISH_NAMESPACE_ERROR: (PublishNamespaceError, _handle_publish_namespace_error),
+       MOQTMessageType.PUBLISH_NAMESPACE_DONE: (PublishNamespaceDone, _handle_publish_namespace_done),
+       MOQTMessageType.PUBLISH_NAMESPACE_CANCEL: (PublishNamespaceCancel, _handle_publish_namespace_cancel),
 
        # Subscribe control messages
        MOQTMessageType.UNSUBSCRIBE: (Unsubscribe, _handle_unsubscribe),

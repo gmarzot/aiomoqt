@@ -99,11 +99,13 @@ def test_loopback_bench_verifies_its_own_cert(transport):
 
 @requires_certs
 def test_loopback_bench_reports_through_its_last_second():
+    # 2 s intervals: a row printed late still leaves the closing row
+    # its half-interval (1 s) on a loaded CPU.
     rc, out = run("loopback_bench", "-Q", "-p", free_udp_port(), "--draft", 18,
-                  "-t", 3, "-i", 1, "-s", 1200, "-k")
+                  "-t", 4, "-i", 2, "-s", 1200, "-k")
     assert rc == 0, out
     rows = re.findall(r"^\s+(\d+)-(\d+)s\s", out, re.MULTILINE)
-    assert len(rows) == 3 and rows[-1][1] == "3", out
+    assert len(rows) == 2 and rows[-1][1] == "4", out
 
 
 def test_loopback_bench_without_objects_exits_1(monkeypatch):

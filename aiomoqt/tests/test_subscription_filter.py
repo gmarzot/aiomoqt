@@ -101,7 +101,7 @@ async def _loopback(port, use_quic):
 
     async def _on_publish_namespace(session, msg):
         session.on_object_received = _on_object
-        session.publish_namepace_ok(msg)
+        session.publish_namespace_ok(msg)
         if not peer.done():
             peer.set_result(session)
 
