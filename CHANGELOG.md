@@ -40,6 +40,7 @@
 - `publish_namespace_ok()` replaces the misspelled `publish_namepace_ok()`, which stays as an alias; a d16+ SETUP send log names the draft instead of a d14 version; bench latency is marked as a clock offset when its 1st percentile is negative, so a wall-clock step no longer is.
 - Timing: a wall-clock TIMESTAMP_MAPPING (no CLOCK_ID) whose base is not a plausible capture time (before 2000 or over a day ahead) is malformed, with a hint at a draft mismatch through a relay, instead of yielding nonsense latency. sub_media `--analyze` defaults to `--timestamp-errors report`, so a malformed track is reported and kept rather than cancelled.
 - Datagrams share the neutral data band (129) instead of picoquic's 9, so a datagram track no longer strictly outranks stream data (needs aiopquic with `set_datagram_priority`, 0.7.0).
+- moq_interop_client: namespace-discovery, publish-track-only and publish-track-subscribe report SKIP, not a failure, when the relay refuses PUBLISH as NOT_SUPPORTED.
 
 ## v0.13.3
 

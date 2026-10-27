@@ -4,6 +4,7 @@ import pytest
 
 from aiomoqt.tools import moq_interop_client as client
 from aiomoqt.tools import moq_interop_relay as relay
+from aiomoqt.types import RequestErrorCode
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
 
@@ -129,3 +130,36 @@ async def test_publish_track_subscribe_fails_when_objects_are_dropped(
     r = await _run("publish-track-subscribe", _BASE_PORT + 103, 18, True)
     assert not r.passed
     assert r.message == "0 of 5 objects within 1s"
+
+
+def _refuse_publish(monkeypatch, code):
+    async def refuse(session, msg):
+        relay._refuse_publish(session, msg, "PUBLISH is not supported",
+                              code=code)
+    monkeypatch.setattr(relay, "_on_publish", refuse)
+    monkeypatch.setattr(client, "_SUBSCRIBE_WAIT", 1.0)
+
+
+@requires_certs
+@_TRANSPORTS
+@pytest.mark.parametrize("draft", _DRAFTS)
+@pytest.mark.parametrize("case", _CASES[1:])
+async def test_case_skips_when_the_relay_does_not_support_publish(
+        monkeypatch, case, draft, use_quic):
+    _refuse_publish(monkeypatch, RequestErrorCode.NOT_SUPPORTED)
+    r = await _run(case, _port(case, draft, use_quic) + 120, draft,
+                   use_quic, timeout=3.0)
+    assert r.passed and r.skipped, r.message
+    assert r.skip_reason == "relay does not support PUBLISH"
+    assert r.message == ("PUBLISH refused NOT_SUPPORTED: "
+                         "PUBLISH is not supported")
+
+
+@requires_certs
+@pytest.mark.parametrize("case", _CASES[1:])
+async def test_case_fails_when_the_relay_refuses_publish_otherwise(
+        monkeypatch, case):
+    _refuse_publish(monkeypatch, RequestErrorCode.UNAUTHORIZED)
+    r = await _run(case, _BASE_PORT + 190 + _CASES.index(case), 18, True,
+                   timeout=3.0)
+    assert not r.passed and not r.skipped, r.message

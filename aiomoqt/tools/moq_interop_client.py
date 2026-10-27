@@ -22,7 +22,7 @@ import os
 import secrets
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.context import is_draft16_or_later, profile_for
@@ -351,6 +351,35 @@ def _make_client(host: str, port: int, path: str, use_quic: bool,
         debug=debug,
         supported_drafts=supported_drafts,
     )
+
+
+def _publish_reply(session, request_id: int) -> asyncio.Future:
+    """The future the relay's reply to our PUBLISH resolves. Take it before
+    the next await; a d14/d16 PUBLISH_OK goes to the track and leaves it
+    pending."""
+    fut = session._pending_requests.get(request_id)
+    if fut is None:
+        fut = session._loop.create_future()
+        session._pending_requests[request_id] = fut
+    return fut
+
+
+def _skip_unsupported_publish(result: TestResult, reply) -> TestResult:
+    """A failure becomes a SKIP when the relay refused our PUBLISH as
+    NOT_SUPPORTED (0x3 in every draft's table)."""
+    if reply is None or not reply.done() or reply.cancelled():
+        return result
+    if reply.exception() is not None or result.passed:
+        return result
+    msg = reply.result()
+    if (not _MOQTSessionMixin._is_error_response(msg)
+            or getattr(msg, "error_code", None)
+            != int(RequestErrorCode.NOT_SUPPORTED)):
+        return result
+    return replace(result, passed=True, skipped=True,
+                   skip_reason="relay does not support PUBLISH",
+                   message=f"PUBLISH refused NOT_SUPPORTED: "
+                           f"{getattr(msg, 'reason', '')}")
 
 
 # ---------------------------------------------------------------------------
@@ -770,6 +799,7 @@ async def test_namespace_discovery(host, port, path, use_quic,
     """
     t0 = time.monotonic()
     sessions = {}
+    reply = None
     try:
         async with asyncio.timeout(timeout):
             pub_client = _make_client(host, port, path, use_quic,
@@ -798,6 +828,7 @@ async def test_namespace_discovery(host, port, path, use_quic,
                 # d14/d16 need the PUBLISH for the fused response.
                 await track.publish(announce_namespace=True,
                                     publish_track=True)
+                reply = _publish_reply(pub_session, track.request_id)
 
                 async with sub_client.connect() as sub_session:
                     await sub_session.client_session_init()
@@ -817,23 +848,23 @@ async def test_namespace_discovery(host, port, path, use_quic,
                     sub_session.close()
                 pub_session.close()
 
-        return TestResult(
+        return _skip_unsupported_publish(TestResult(
             name="namespace-discovery", passed=passed,
             duration_ms=(time.monotonic() - t0) * 1000,
             sessions=sessions,
             message=msg,
             expected=f"PUBLISH announcing '{INTEROP_TRACK}'",
             received=str(found),
-        )
+        ), reply)
     except Exception as e:
-        return TestResult(
+        return _skip_unsupported_publish(TestResult(
             name="namespace-discovery", passed=False,
             duration_ms=(time.monotonic() - t0) * 1000,
             sessions=sessions,
             message=f"Failed: {_format_exc(e)}",
             expected=f"PUBLISH announcing '{INTEROP_TRACK}'",
             received=_format_exc(e),
-        )
+        ), reply)
 
 
 async def test_subscribe_before_announce(host, port, path, use_quic,
@@ -1523,6 +1554,7 @@ async def test_publish_track_only(host, port, path, use_quic,
     name = "publish-track-only"
     t0 = time.monotonic()
     sessions = {}
+    reply = None
     client = _make_client(host, port, path, use_quic, tls_disable_verify,
                           debug, supported_drafts=supported_drafts)
     try:
@@ -1532,6 +1564,7 @@ async def test_publish_track_only(host, port, path, use_quic,
                 sessions["publisher"] = _session_meta(session)
                 pub_msg = session.publish(namespace=INTEROP_NAMESPACE,
                                           track_name=INTEROP_TRACK)
+                reply = _publish_reply(session, pub_msg.request_id)
                 await session._await_response(pub_msg.request_id)
                 session.subscribe_done(
                     request_id=pub_msg.request_id,
@@ -1545,13 +1578,13 @@ async def test_publish_track_only(host, port, path, use_quic,
             sessions=sessions,
             message="PUBLISH_OK received, PUBLISH_DONE sent")
     except Exception as e:
-        return TestResult(
+        return _skip_unsupported_publish(TestResult(
             name=name, passed=False,
             duration_ms=(time.monotonic() - t0) * 1000,
             sessions=sessions,
             message=f"Failed: {_format_exc(e)}",
             expected="PUBLISH_OK",
-            received=_format_exc(e))
+            received=_format_exc(e)), reply)
 
 
 async def test_publish_track_subscribe(host, port, path, use_quic,
@@ -1567,6 +1600,7 @@ async def test_publish_track_subscribe(host, port, path, use_quic,
     sessions = {}
     received = []
     enough = asyncio.Event()
+    reply = None
 
     def _on_object(msg, *_):
         received.append(msg.object_id)
@@ -1593,6 +1627,7 @@ async def test_publish_track_subscribe(host, port, path, use_quic,
                 track._quiet = True
                 track._stats_header_printed = True
                 await track.publish(publish_track=True)
+                reply = _publish_reply(pub_session, track.request_id)
 
                 async with sub_client.connect() as sub_session:
                     await sub_session.client_session_init()
@@ -1610,16 +1645,16 @@ async def test_publish_track_subscribe(host, port, path, use_quic,
                     sub_session.close()
                 pub_session.close()
     except Exception as e:
-        return TestResult(
+        return _skip_unsupported_publish(TestResult(
             name=name, passed=False,
             duration_ms=(time.monotonic() - t0) * 1000,
             sessions=sessions,
             message=f"Failed: {_format_exc(e)}",
             expected=f"SUBSCRIBE_OK and {_PUBLISHED_OBJECTS} objects",
-            received=_format_exc(e))
+            received=_format_exc(e)), reply)
 
     passed = len(received) >= _PUBLISHED_OBJECTS
-    return TestResult(
+    return _skip_unsupported_publish(TestResult(
         name=name, passed=passed,
         duration_ms=(time.monotonic() - t0) * 1000,
         sessions=sessions,
@@ -1628,7 +1663,7 @@ async def test_publish_track_subscribe(host, port, path, use_quic,
                  f"{len(received)} of {_PUBLISHED_OBJECTS} objects within "
                  f"{_DATA_DELIVERY_S:g}s"),
         expected=f"{_PUBLISHED_OBJECTS} objects",
-        received=f"{len(received)} objects")
+        received=f"{len(received)} objects"), reply)
 
 
 # ---------------------------------------------------------------------------
