@@ -318,6 +318,7 @@ class TrackStats:
         self._snap_objects = 0
         self._snap_bytes = 0
         self._snap_lost = 0
+        self._snap_t = time.monotonic()
 
         # Track timing context; a subscriber shares its SubscribedTrack's.
         self.timing = TrackTiming()
@@ -567,8 +568,10 @@ class TrackStats:
     # -- views -------------------------------------------------------
 
     def snapshot(self) -> dict:
-        """Per-call deltas + windowed latency. For controllers summing
-        across workers without double-counting."""
+        """Per-call deltas over `dt` seconds + windowed latency from
+        `lat_n` samples (0 = none; the latency fields are then 0.0, not
+        a measurement). For controllers summing across workers without
+        double-counting."""
         self._flush_key()
         now = time.monotonic()
         cutoff = now - self.window_s
@@ -589,9 +592,11 @@ class TrackStats:
         self._snap_objects = self.total_objects
         self._snap_bytes = self.total_bytes
         self._snap_lost = self.total_lost
+        dt = now - self._snap_t
+        self._snap_t = now
         return dict(
-            t=now, rx_objs=iv_objs, rx_bytes=iv_bytes, iv_lost=iv_lost,
-            lat_mean_ms=(sum(lats) / len(lats)) if lats else 0.0,
+            t=now, dt=dt, rx_objs=iv_objs, rx_bytes=iv_bytes, iv_lost=iv_lost,
+            lat_n=len(lats), lat_mean_ms=(sum(lats) / len(lats)) if lats else 0.0,
             lat_p90_ms=_pct(lats, 90), lat_p99_ms=_pct(lats, 99),
             jitter_ms=self.jitter, loss=self.total_lost,
             groups=len(self._groups_seen),

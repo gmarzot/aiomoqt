@@ -57,6 +57,10 @@ SUBSCRIBE_EACH_TIMEOUT_S = 5.0
 STATS_INTERVAL_S = 1.0
 STOP_POLL_S = 0.1
 SELF_HEAL_BACKOFF_S = 0.5
+# A slot's delivery is judged this long after its (re)subscribe, and
+# counts while it receives at least DELIVERING_FLOOR of its expected rate.
+SLOT_GRACE_S = 3.0
+DELIVERING_FLOOR = 0.5
 
 # Spawn context for all bench parents. Linux pins "fork": Python 3.14
 # switched the Linux default to forkserver, whose by-name SemLock reopen
@@ -312,8 +316,8 @@ async def _slot_supervisor(config, relay, stop_ev, stats, state,
     passed in and persists across reopens, so a transient drop doesn't
     reset the batch's cumulative totals or latency window.
 
-    state['active'] reflects whether this slot is currently subscribed
-    and delivering — the batch stats loop sums it for the active count.
+    state['active'] reflects whether this slot is currently subscribed;
+    state['since'] is the time of its latest subscribe.
     """
     if initial_delay > 0:
         try:
@@ -371,6 +375,7 @@ async def _slot_supervisor(config, relay, stop_ev, stats, state,
                         break
                 if subscribed:
                     state['active'] = True
+                    state['since'] = time.monotonic()
                     while not stop_ev.is_set():
                         if getattr(track, 'state', None) == TrackState.CLOSED:
                             break
@@ -391,6 +396,25 @@ async def _slot_supervisor(config, relay, stop_ev, stats, state,
     state['active'] = False
 
 
+def slot_delivering(hist, since: float, now: float, window_s: float,
+                    expected_bps: float, grace_s: float = SLOT_GRACE_S) -> bool:
+    """Whether a subscribed slot received at least DELIVERING_FLOOR of
+    expected_bps (bytes/s) over the last window_s, counted from its latest
+    subscribe. hist holds (t, cumulative bytes) samples, oldest first. A
+    slot inside its grace is not delivering yet."""
+    if now - since < grace_s:
+        return False
+    start = max(since, now - window_s)
+    base = next(((t, b) for t, b in hist if t >= start), None)
+    if base is None or not hist:
+        return False
+    t_last, b_last = hist[-1]
+    elapsed = t_last - base[0]
+    if elapsed <= 0:
+        return False
+    return (b_last - base[1]) / elapsed >= DELIVERING_FLOOR * expected_bps
+
+
 async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
                                  events_queue):
     """Host config['batch_size'] subscriptions on one event loop, each
@@ -398,10 +422,14 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
     event per STATS_INTERVAL_S:
 
       {"kind": "batch_stats", "worker_id": W, "batch_size": K,
-       "active": <subscribed slots>, "t",
-       "rx_bytes", "rx_objs" (deltas since last post),
-       "lat_p90_ms", "lat_mean_ms" (worst across slots),
+       "active": <subscribed slots>, "delivering": <slots at rate>,
+       "t", "dt", "rx_bytes", "rx_objs" (deltas over dt),
+       "lat_n", "lat_p90_ms", "lat_mean_ms" (worst slot with samples),
        "jitter_ms", "loss", "total_bytes", "total_objs"}
+
+    A slot is delivering per slot_delivering() against config
+    'per_sub_mbps' over config 'keep_window' seconds; without
+    per_sub_mbps every subscribed slot counts.
     """
     worker_id = config['worker_id']
     K = max(1, int(config.get('batch_size', 1)))
@@ -410,18 +438,27 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
                             force_quic=config.get('force_quic', False))
     stop_ev = _bridge_stop_event(mp_stop_event)
 
+    per_sub_mbps = config.get('per_sub_mbps') or 0.0
+    expected_bps = per_sub_mbps * 1e6 / 8
+    window_s = float(config.get('keep_window', 3.0))
+
     # (stats, state) per slot; stats persist across a slot's reopens.
-    slots = [(TrackStats(), {'active': False}) for _ in range(K)]
+    slots = [(TrackStats(), {'active': False, 'since': 0.0,
+                             'hist': deque()})
+             for _ in range(K)]
 
     async def _batch_stats_loop():
+        last_t = time.monotonic()
         while not stop_ev.is_set():
             await asyncio.sleep(STATS_INTERVAL_S)
+            now = time.monotonic()
             agg_bytes = agg_objs = agg_iv_lost = 0
             cum_loss = total_bytes = total_objs = 0
-            worst_p90 = worst_mean = 0.0
+            worst_p90 = worst_mean = None
+            lat_n = 0
             jitter_sum = 0.0
             jitter_n = 0
-            active = 0
+            active = delivering = 0
             for stats, state in slots:
                 snap = stats.snapshot()
                 agg_bytes += snap['rx_bytes']
@@ -430,24 +467,38 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
                 cum_loss += snap['loss']
                 total_bytes += snap['total_bytes']
                 total_objs += snap['total_objs']
-                if snap['lat_p90_ms'] > worst_p90:
-                    worst_p90 = snap['lat_p90_ms']
-                if snap['lat_mean_ms'] > worst_mean:
-                    worst_mean = snap['lat_mean_ms']
+                if snap['lat_n']:
+                    lat_n += snap['lat_n']
+                    p90, mean = snap['lat_p90_ms'], snap['lat_mean_ms']
+                    worst_p90 = p90 if worst_p90 is None else max(worst_p90, p90)
+                    worst_mean = (mean if worst_mean is None
+                                  else max(worst_mean, mean))
                 jitter_sum += snap['jitter_ms']
                 jitter_n += 1
+                hist = state['hist']
+                hist.append((now, snap['total_bytes']))
+                while hist and hist[0][0] < now - window_s - STATS_INTERVAL_S:
+                    hist.popleft()
                 if state['active']:
                     active += 1
+                    if not expected_bps or slot_delivering(
+                            hist, state['since'], now, window_s,
+                            expected_bps):
+                        delivering += 1
             _post(events_queue, {
                 'kind': 'batch_stats', 'worker_id': worker_id,
                 'batch_size': K, 'active': active,
-                't': time.monotonic(),
+                'delivering': delivering,
+                't': now, 'dt': now - last_t,
                 'rx_bytes': agg_bytes, 'rx_objs': agg_objs,
                 'iv_lost': agg_iv_lost, 'loss': cum_loss,
-                'lat_p90_ms': worst_p90, 'lat_mean_ms': worst_mean,
+                'lat_n': lat_n,
+                'lat_p90_ms': 0.0 if worst_p90 is None else worst_p90,
+                'lat_mean_ms': 0.0 if worst_mean is None else worst_mean,
                 'jitter_ms': jitter_sum / jitter_n if jitter_n else 0.0,
                 'total_bytes': total_bytes, 'total_objs': total_objs,
             })
+            last_t = now
 
     supervisors = [
         asyncio.create_task(

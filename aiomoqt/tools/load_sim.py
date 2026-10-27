@@ -158,7 +158,7 @@ EXAMPLE_SCENARIO = {
 # Commands on cmd_queue:  ('add', n) | ('remove', n) | ('stop',)
 # Events on events_queue (all tagged group/shard):
 #   {'kind':'evt','ev': 'joined'|'join_failed'|'left'|'ended'|'died', ...}
-#   {'kind':'group_stats', 'live', 'rx_bytes', 'rx_objs',
+#   {'kind':'group_stats', 'live', 'dt', 'rx_bytes', 'rx_objs' (over dt),
 #    'lat_p90_ms', 'total_bytes', 'total_objs', ...}   every STATS_INTERVAL_S
 # ---------------------------------------------------------------------------
 
@@ -319,8 +319,11 @@ async def _group_host_task(cfg, mp_stop_event, cmd_q, events_q):
 
     async def _stats_loop():
         nonlocal reaped_bytes, reaped_objs
+        last_t = time.monotonic()
         while not stop_ev.is_set():
             await asyncio.sleep(STATS_INTERVAL_S)
+            now = time.monotonic()
+            dt, last_t = now - last_t, now
             # Reap finished slots, folding their cumulative totals into
             # the group's running counters so departed subscribers keep
             # counting toward total_bytes.
@@ -344,7 +347,8 @@ async def _group_host_task(cfg, mp_stop_event, cmd_q, events_q):
                     live += 1
             _post(events_q, {
                 "kind": "group_stats", "group": group, "shard": shard,
-                "live": live, "rx_bytes": rx_bytes, "rx_objs": rx_objs,
+                "live": live, "dt": dt,
+                "rx_bytes": rx_bytes, "rx_objs": rx_objs,
                 "lat_p90_ms": worst_p90, "total_bytes": total_bytes,
                 "total_objs": total_objs, "t": time.monotonic(),
             })
@@ -631,6 +635,11 @@ def _drain_sub_events(events_q, groups: Dict[int, GroupRT]):
                     g.deaths += 1
                 elif ev == "ended":
                     g.ended += 1
+
+
+def _rx_Bps(group_stats: dict) -> float:
+    """A shard's latest receive rate, bytes/s."""
+    return group_stats.get("rx_bytes", 0) / max(group_stats.get("dt", 1.0), 1e-3)
 
 
 def _accrue_expected(groups: Dict[int, GroupRT], pubs: Dict[str, PubRT],
@@ -924,7 +933,7 @@ def main():
             if now - last_report >= args.interval:
                 last_report = now
                 live_total = sum(g.live() for g in groups.values())
-                rx_bps = sum(s.stats.get("rx_bytes", 0) * 8
+                rx_bps = sum(_rx_Bps(s.stats) * 8
                              for g in groups.values() for s in g.shards)
                 p90 = max((s.stats.get("lat_p90_ms", 0.0)
                            for g in groups.values() for s in g.shards),
@@ -950,7 +959,7 @@ def main():
                             g.spec.key, [0, 0, 0, 0.0])
                         row[0] += g.live()
                         row[1] += g.spec.max_subs
-                        row[2] += sum(s.stats.get("rx_bytes", 0)
+                        row[2] += sum(_rx_Bps(s.stats)
                                       for s in g.shards)
                         row[3] = max(row[3],
                                      max((s.stats.get("lat_p90_ms", 0.0)

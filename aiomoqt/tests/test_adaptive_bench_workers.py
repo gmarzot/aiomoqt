@@ -47,7 +47,7 @@ def _processes(monkeypatch, *, receive=True, fixed=False, published=True):
                 events.put({'kind': 'batch_stats' if batch else 'stats',
                             'worker_id': cfg.get('worker_id', 0),
                             'active': 1, 't': time.monotonic(),
-                            'rx_bytes': 1_000_000, 'rx_objs': 1,
+                            'rx_bytes': 2_000_000, 'rx_objs': 1,
                             'total_objs': 1})
 
         def is_alive(self):

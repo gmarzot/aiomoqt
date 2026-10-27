@@ -76,6 +76,7 @@ class Sample:
     p90_ms: float
     loss_pct: float
     jitter_ms: float
+    latency_known: bool = True
 
 
 @dataclass
@@ -104,7 +105,8 @@ class Signal:
     jitter_ms: float = 0.0
     # Liveness — meaningful in subs-mode; BWActuator fills defaults.
     target_subs: int = 1    # count the actuator is trying to maintain
-    active_subs: int = 1    # subs currently receiving data
+    active_subs: int = 1    # subs currently subscribed
+    delivering_subs: int = 1  # subscribed subs receiving their rate
     failed_subs: int = 0    # new subscribe/reset failures in this interval
     health: str = "ok"      # "ok" | "degraded" | "failing"
     # aiopquic SPSC TX ring depth (bytes queued in the publisher's
@@ -230,7 +232,8 @@ class LiveStats:
             return Sample(t=t, target_mbps=target_mbps,
                           rx_rate_ops=0.0, rx_bitrate_mbps=0.0,
                           mean_ms=0.0, p90_ms=0.0,
-                          loss_pct=0.0, jitter_ms=self._jitter)
+                          loss_pct=0.0, jitter_ms=self._jitter,
+                          latency_known=False)
 
         window_t = max(0.01, self._events[-1][0] - self._events[0][0])
         n = len(self._events)
@@ -251,6 +254,7 @@ class LiveStats:
             p90_ms=p90,
             loss_pct=loss_pct,
             jitter_ms=self._jitter,
+            latency_known=bool(lats),
         )
 
 
@@ -294,8 +298,10 @@ class BWActuator:
         self._events_q = mp_events_queue
         self._stop_ev = mp_stop_event
         # rolling stats aggregated from sub-worker events
-        self._mp_lat_window = []  # (t, lat_ms)
         self._mp_rx_window = []   # (t, rx_bytes)
+        # The one subscriber worker's latest windowed latency (its
+        # TrackStats window matches _mp_window_s): (n, mean, p90).
+        self._mp_lat = (0, 0.0, 0.0)
         self._mp_total_lost = 0
         self._mp_total_objs = 0
         self._mp_window_s = 5.0
@@ -360,17 +366,9 @@ class BWActuator:
                 rx_bytes = ev.get('rx_bytes', 0)
                 if rx_bytes:
                     self._mp_rx_window.append((t, rx_bytes))
-                # TrackStats.snapshot() exposes mean/p99 plus a
-                # raw 'lat_samples' tuple if present; otherwise we
-                # synthesize a single sample at the reported mean.
-                samples = ev.get('lat_samples') or ()
-                if samples:
-                    for lat in samples:
-                        self._mp_lat_window.append((t, lat))
-                else:
-                    m = ev.get('lat_mean_ms')
-                    if m is not None:
-                        self._mp_lat_window.append((t, m))
+                self._mp_lat = (ev.get('lat_n', 0),
+                                ev.get('lat_mean_ms', 0.0),
+                                ev.get('lat_p90_ms', 0.0))
                 self._mp_total_objs += ev.get('rx_objs', 0)
                 self._mp_total_lost += ev.get('iv_lost', 0)
                 # Per-sub-id smoothed jitter; aggregate is averaged
@@ -382,9 +380,6 @@ class BWActuator:
             # health events: no-op for stats; logged elsewhere.
         # Trim windows.
         cutoff = time.monotonic() - self._mp_window_s
-        self._mp_lat_window = [
-            (t, lat) for (t, lat) in self._mp_lat_window if t >= cutoff
-        ]
         self._mp_rx_window = [
             (t, b) for (t, b) in self._mp_rx_window if t >= cutoff
         ]
@@ -413,18 +408,12 @@ class BWActuator:
                 tx_mbps=self.state.tx_rate_mbps,
                 rx_mbps=sample.rx_bitrate_mbps,
                 jitter_ms=sample.jitter_ms,
+                latency_known=sample.latency_known,
             )
         # Multiprocess path
         self._drain_events()
         t = time.monotonic()
-        lats = sorted(lat for (_, lat) in self._mp_lat_window
-                      if lat is not None)
-        if lats:
-            mean = sum(lats) / len(lats)
-            p90 = lats[min(int(len(lats) * 0.90), len(lats) - 1)]
-        else:
-            mean = 0.0
-            p90 = 0.0
+        lat_n, mean, p90 = self._mp_lat
         rx_bytes = sum(b for (_, b) in self._mp_rx_window)
         # tx column reports wire-bytes (picoquic ground truth); falls
         # back to queued bytes if the wire counter isn't available.
@@ -461,7 +450,7 @@ class BWActuator:
             tx_ring_depth_bytes=self._mp_tx_ring_depth,
             tx_ring_depth_max_bytes=self._mp_tx_ring_depth_max,
             tx_ring_streams=self._mp_tx_ring_streams,
-            latency_known=bool(lats),
+            latency_known=lat_n > 0,
         )
 
     async def shutdown(self) -> None:
@@ -483,6 +472,12 @@ class BWActuator:
                 pass
 
 
+def _delivering(batch: dict) -> int:
+    """A batch's slots receiving their rate; 'active' from a worker
+    that does not judge delivery."""
+    return int(batch.get('delivering', batch.get('active', 0)))
+
+
 class SubsActuator:
     """Actuator for subscriber-ramp mode.
 
@@ -493,13 +488,18 @@ class SubsActuator:
     spawns/terminates whole workers to reach ceil(level / K). observe()
     drains batch_stats events and aggregates:
 
-      rx_mbps      = sum of per-worker batch rx_mbps (last 1s each)
-      latency      = worst batch p90 across workers
-      loss_pct     = max per-batch loss_pct
-      shortfall    = active_subs < target_subs for 2+ intervals
-      failed_subs  = subs lost to reaped (dead/silent) workers since
-                     the last observe()
-      active_subs  = sum of workers' currently-subscribed slot counts
+      rx_mbps         = sum of per-worker batch rates (rx_bytes / dt)
+      latency         = worst slot p90 across mature workers
+      loss_pct        = max per-batch loss_pct
+      active_subs     = subscribed slots
+      delivering_subs = subscribed slots receiving >= half their rate
+                        over the keep window (judged in the worker)
+      shortfall       = for 2+ ticks, mature delivering slots short of
+                        the mature target, or rx_mbps under
+                        shortfall_ratio x delivering_subs x per_sub_mbps;
+                        or any failed_subs
+      failed_subs     = subs lost to reaped (dead/silent) workers since
+                        the last observe()
 
     Each worker is GIL-isolated. The publisher runs in its own process
     (spawned by the subs-mode entrypoint) so its event loop is never
@@ -516,6 +516,7 @@ class SubsActuator:
                  sub_filter: FilterType = FilterType.LATEST_OBJECT,
                  interval_s: float = 5.0,
                  stagger: float = 0.1,
+                 shortfall_ratio: float = 0.85,
                  transport_options: Optional[dict] = None):
         self.relay_url = relay_url
         self.namespace = namespace
@@ -543,6 +544,11 @@ class SubsActuator:
         # decoupled from interval_s so handshake spacing is tunable
         # without changing the report cadence.
         self.stagger = stagger
+        self.shortfall_ratio = shortfall_ratio
+        # ONE window governs "delivering" (per slot, in the worker),
+        # "active" and "kept" (not reaped). Floored so sub-second
+        # intervals don't reap on normal jitter.
+        self.keep_window = max(3.0, 1.5 * interval_s)
         self.transport_options = dict(transport_options or {})
         # Each worker process hosts a BATCH of subscriptions and
         # self-heals individual drops internally. --step-subs doubles as
@@ -624,6 +630,8 @@ class SubsActuator:
                 insecure=self.insecure,
                 force_quic=self.force_quic,
                 sub_filter=int(self.sub_filter),
+                per_sub_mbps=self.per_sub_mbps,
+                keep_window=self.keep_window,
                 **self.transport_options,
             )
             from aiomoqt.utils.workers import sub_batch_worker_entry
@@ -674,18 +682,11 @@ class SubsActuator:
             if msg.get('active', 0) > 0:
                 self._subscribed_ever.add(wid)
 
-        # "Active" subs = subs delivering recently. A worker self-heals
-        # individual drops, so its reported active count is the truth of
-        # how many of its K slots are currently subscribed; we still gate
-        # the worker on recent bytes so a stalled connection's batch
-        # isn't counted as delivering.
+        # A worker reports how many of its K slots are subscribed
+        # ('active') and how many of those receive their rate
+        # ('delivering'); a worker without recent bytes counts for none.
         now = time.monotonic()
-        # ONE window governs both "active" (counted as delivering) and
-        # "kept" (not reaped) — eliminates the limbo band where a worker
-        # is neither active nor reaped and pins shortfall forever. Scaled
-        # with interval, floored so sub-second intervals don't reap on
-        # normal jitter.
-        keep_window = max(3.0, 1.5 * self.interval_s)
+        keep_window = self.keep_window
         bytes_cutoff = now - keep_window
         live_ids = [wid for wid, t in self._last_bytes_t.items()
                     if t >= bytes_cutoff and wid in self._workers]
@@ -728,27 +729,27 @@ class SubsActuator:
         max_loss_pct = 0.0
         jitter_sum = 0.0
         jitter_n = 0
-        active_subs = 0
+        active_subs = delivering_subs = 0
 
         self._t_last_observe = now
 
         for wid in live_ids:
             s = self._latest_batch.get(wid, {})
             active_subs += int(s.get('active', 0))
-            # rx_bytes is the batch's per-snapshot delta (~1s); convert
-            # to Mbps using STATS_INTERVAL_S.
-            rx_bytes = s.get('rx_bytes', 0)
-            rx_bps_total += rx_bytes * 8
+            delivering_subs += _delivering(s)
+            # rx_bytes is the batch's delta over its dt.
+            rx_bps_total += s.get('rx_bytes', 0) * 8 / max(s.get('dt', 1.0), 1e-3)
             # Latency drives the back-off, so only MATURE workers feed it:
             # a worker still in its startup grace is catching up (old
             # send-timestamps -> seconds-scale p90) and would trip the SLA
             # back-off on every group add. Sustained congestion still
             # registers once it matures.
             if (now - self._spawned_t.get(wid, now)) >= startup_grace:
-                worst_p90 = max(worst_p90, s.get('lat_p90_ms', 0.0))
-                worst_mean = max(worst_mean, s.get('lat_mean_ms', 0.0))
-                # A worker with no samples reports 0.0.
-                lat_known |= bool(s.get('lat_p90_ms') or s.get('lat_mean_ms'))
+                if s.get('lat_n', 0) > 0:
+                    p90, mean = s['lat_p90_ms'], s['lat_mean_ms']
+                    worst_p90 = p90 if not lat_known else max(worst_p90, p90)
+                    worst_mean = mean if not lat_known else max(worst_mean, mean)
+                    lat_known = True
             loss_ct = s.get('loss', 0)
             total = s.get('total_objs', 0) or 1
             lpct = 100.0 * loss_ct / (loss_ct + total) if (loss_ct + total) else 0.0
@@ -775,16 +776,22 @@ class SubsActuator:
         # so a partial final batch isn't over-expected. A group that never
         # delivers is still caught by the starve reaper above
         # (failed_this_window), which forces the shortfall independently.
+        # Mature slots count only while delivering their rate.
         mature_active = 0
         mature_target = 0
         for wid in self._workers:
             if (now - self._spawned_t.get(wid, now)) < startup_grace:
                 continue
-            mature_active += int(self._latest_batch.get(wid, {}).get('active', 0))
+            mature_active += _delivering(self._latest_batch.get(wid, {}))
             mature_target += self.batch_size
         mature_target = min(mature_target, target_subs)
 
-        if mature_active < mature_target:
+        # Aggregate check: the delivering subs together receive their rate.
+        rx_mbps = rx_bps_total / 1e6
+        rx_short = (delivering_subs > 0 and rx_mbps < self.shortfall_ratio
+                    * delivering_subs * self.per_sub_mbps)
+        behind = mature_active < mature_target or rx_short
+        if behind:
             self._shortfall_streak += 1
         else:
             self._shortfall_streak = 0
@@ -792,7 +799,7 @@ class SubsActuator:
 
         if failed_this_window > 0:
             health = "failing"
-        elif mature_active < mature_target:
+        elif behind:
             health = "degraded"
         else:
             health = "ok"
@@ -808,10 +815,11 @@ class SubsActuator:
             shortfall=shortfall,
             target_mbps=target_mbps,
             tx_mbps=target_mbps,   # single publisher; assume delivers
-            rx_mbps=rx_bps_total / 1e6,
+            rx_mbps=rx_mbps,
             jitter_ms=avg_jitter_ms,
             target_subs=target_subs,
             active_subs=active_subs,
+            delivering_subs=delivering_subs,
             failed_subs=failed_this_window,
             health=health,
             latency_known=lat_known,
@@ -1062,7 +1070,7 @@ class AIMDController:
             if a.unit == "Mbps":
                 observed = sig.rx_mbps
             else:
-                observed = float(sig.active_subs)
+                observed = float(sig.delivering_subs)
             if (observed > self.high_water
                     and headroom >= 0.2
                     and not sig.shortfall):
@@ -1182,11 +1190,13 @@ class AIMDController:
         actual_span = 7 + 2 + 7 + (3 + 5 if has_subs else 0)
         latency_span = 6 + 2 + 6 + 2 + 6
         time_pad = 10
+        lat_title = ("Latency (worst sub)" if has_subs
+                     else "Latency (window)")
         print(
             f"  {' '*time_pad}"
             f"{'Target'.center(target_span)}    │  "
             f"{'Actual'.center(actual_span)}  │  "
-            f"{'Latency'.center(latency_span)}  │"
+            f"{lat_title.center(latency_span)}  │"
         )
         if has_subs:
             print(
@@ -1227,7 +1237,7 @@ class AIMDController:
             print(
                 f"  {int(round(t_rel)):>5d}s     "
                 f"{bw:<7}    {sig.target_subs:<5}  │  "
-                f"{tx:<7}  {rx:<7}   {sig.active_subs:<5}  │  "
+                f"{tx:<7}  {rx:<7}   {sig.delivering_subs:<5}  │  "
                 f"{mean:<6}  {p90:<6}  {jit:<6}  │  "
                 f"{f'{sig.loss_pct:.1f}%':<5}  {action}",
                 flush=True,
@@ -1752,9 +1762,12 @@ async def main():
     if args.report:
         csv_file = open(args.report, "w", newline="")
         csv_writer = csv.writer(csv_file)
+        # bw: the subscriber's windowed latency; subs: the worst slot's.
+        lat_cols = (["win_mean_ms", "win_p90_ms"] if args.mode == "bw"
+                    else ["worst_mean_ms", "worst_p90_ms"])
         csv_writer.writerow([
             "t_monotonic", "target_mbps", "tx_mbps", "rx_mbps",
-            "mean_ms", "p90_ms", "loss_pct",
+            *lat_cols, "loss_pct",
         ])
 
     mp_cleanup_queues: list = []
@@ -1784,6 +1797,7 @@ async def main():
             sub_filter=args.sub_filter,
             interval_s=args.scenario.interval_s,
             stagger=args.stagger,
+            shortfall_ratio=args.shortfall_ratio,
             transport_options=_cli.transport_kwargs(args),
         )
     else:
