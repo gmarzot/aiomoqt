@@ -244,7 +244,9 @@ def parse_args():
                         help='Redial a lost relay 1, 2, 4 ... s apart (at '
                              'most 30 s) at the draft it negotiated, until '
                              'the duration ends, and publish to it again; '
-                             'the media timeline runs on meanwhile. '
+                             'the media timeline runs on meanwhile. A relay '
+                             'GOAWAY redials at once, to its New Session URI '
+                             'if it gives one. '
                              'Default: a lost relay is dropped')
     map_group = parser.add_argument_group('object mapping')
     map_group.add_argument(
@@ -1075,6 +1077,8 @@ class _Endpoint:
         self.session = None
         self.draft: Optional[int] = None
         self._stack: Optional[contextlib.AsyncExitStack] = None
+        # --reconnect: the session's GOAWAY New Session URI ('' = same).
+        self._goaway: Optional[asyncio.Future] = None
 
     async def open(self):
         """Dial and set up a session within _DIAL_TIMEOUT_S; None, with
@@ -1106,7 +1110,38 @@ class _Endpoint:
         self._stack, self.session = stack, session
         if self.draft is None:
             self.draft = getattr(session, 'negotiated_draft', None)
+        if args.reconnect:
+            goaway = self._goaway = asyncio.get_running_loop().create_future()
+
+            def on_goaway(msg, request_id):
+                if request_id is None and not goaway.done():
+                    goaway.set_result(msg.new_session_uri or '')
+            session.on_goaway = on_goaway
+            if session.goaway_received is not None:
+                on_goaway(session.goaway_received, None)
         return session
+
+    async def lost(self) -> Optional[str]:
+        """Wait for the session to close (None) or, with --reconnect, for
+        a GOAWAY (its New Session URI, '' for this relay)."""
+        closed = asyncio.ensure_future(self.session.async_closed())
+        waits = {closed} if self._goaway is None else {closed, self._goaway}
+        try:
+            await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            closed.cancel()
+        if self._goaway is not None and self._goaway.done():
+            return self._goaway.result()
+        return None
+
+    def migrate(self, uri: str) -> None:
+        """Dial `uri` from now on; kept as is when it does not parse."""
+        try:
+            relay = parse_relay_url(uri)
+        except ValueError as e:
+            print(f"  error: {self.url}: GOAWAY URI {uri!r}: {e}")
+            return
+        self.url, self.relay = uri, relay
 
     async def close(self) -> None:
         """Leave the session's connection, if one is open."""
@@ -1119,14 +1154,14 @@ async def _close_endpoints(endpoints) -> None:
     await asyncio.gather(*(ep.close() for ep in endpoints))
 
 
-async def _redial(ep: _Endpoint, pub: FanoutPublisher, start: dict) -> None:
-    """--reconnect: dial `ep` 1, 2, 4 ... s apart (at most
-    _RECONNECT_MAX_S) until it is up and publishing again; cancelled when
-    the run ends."""
-    delay = 1.0
+async def _redial(ep: _Endpoint, pub: FanoutPublisher, start: dict,
+                  delay: float = 1.0) -> None:
+    """--reconnect: dial `ep` after `delay`, then 1, 2, 4 ... s apart (at
+    most _RECONNECT_MAX_S) until it is up and publishing again; cancelled
+    when the run ends."""
     while True:
         await asyncio.sleep(delay)
-        delay = min(delay * 2, _RECONNECT_MAX_S)
+        delay = min(max(delay * 2, 1.0), _RECONNECT_MAX_S)
         session = await ep.open()
         if session is None:
             continue
@@ -1412,8 +1447,7 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
         # Ctrl-C exits quietly instead of logging an unretrieved exception.
         feed.add_done_callback(
             lambda f: f.cancelled() or f.exception())
-        live = {asyncio.ensure_future(ep.session.async_closed()): ep
-                for ep in up}
+        live = {asyncio.ensure_future(ep.lost()): ep for ep in up}
         redial = {}
         # A relay lost mid-run is dropped, or redialled with --reconnect;
         # without it the run fails once no relay is left.
@@ -1428,21 +1462,31 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
                     if fut in redial:
                         ep = redial.pop(fut)
                         fut.result()
-                        live[asyncio.ensure_future(
-                            ep.session.async_closed())] = ep
+                        live[asyncio.ensure_future(ep.lost())] = ep
                         print(f"  reconnected: {ep.url} (draft-{ep.draft})")
                         if events is not None:
                             events.emit('endpoint_up', url=ep.url,
                                         draft=ep.draft)
                         continue
                     ep = live.pop(fut)
-                    code, reason = (getattr(ep.session, '_close_err', None)
-                                    or ('?', ''))
+                    uri = fut.result()
+                    if uri is not None:
+                        lost = f"GOAWAY {uri}".strip()
+                    else:
+                        code, reason = (getattr(ep.session, '_close_err',
+                                                None) or ('?', ''))
+                        lost = f"code={code} {reason}".strip()
                     if events is not None:
-                        events.emit('endpoint_lost', url=ep.url,
-                                    reason=f"code={code} {reason}".strip())
+                        events.emit('endpoint_lost', url=ep.url, reason=lost)
                     pub.drop(ep.session)
                     await ep.close()
+                    if uri is not None:
+                        print(f"  {ep.url}: {lost} — reconnecting")
+                        if uri:
+                            ep.migrate(uri)
+                        redial[asyncio.ensure_future(
+                            _redial(ep, pub, start, delay=0))] = ep
+                        continue
                     lost = f"{ep.url} closed: code={code} reason='{reason}'"
                     if args.reconnect:
                         print(f"  error: {lost} — reconnecting")
