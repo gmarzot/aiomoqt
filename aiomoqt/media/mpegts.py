@@ -344,7 +344,7 @@ class TsDemuxer:
         # Emit a video PES at its stuffed last packet, not the next PUSI.
         self.eager_video = True
         self._ended: Set[int] = set()
-        # 48 kHz samples per audio frame, from the first frame.
+        # Samples per audio frame at the audio rate, from the first frame.
         self.audio_frame_samples: Optional[int] = None
 
     @property
