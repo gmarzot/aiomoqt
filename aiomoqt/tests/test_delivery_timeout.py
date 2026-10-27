@@ -170,7 +170,7 @@ async def test_late_objects_reset_the_subgroup(draft, use_quic):
 
     async def on_publish_namespace(session, msg):
         rx["session"] = session
-        session.publish_namepace_ok(msg)
+        session.publish_namespace_ok(msg)
     server.register_handler(MOQTMessageType.PUBLISH_NAMESPACE,
                             on_publish_namespace)
     quic_server = await server.serve()
