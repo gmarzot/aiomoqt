@@ -2289,7 +2289,9 @@ class SubscribedTrack(Track):
         """The discovered PUBLISH, or the peer's refusal of SUBSCRIBE_TRACKS.
         A reply that times out leaves the PUBLISH wait running; a PUBLISH
         wait that times out names the tracks offered instead."""
+        from .protocol import _MOQTSessionMixin
         offered = []
+        prefix = _MOQTSessionMixin._make_namespace_tuple(self.namespace)
 
         async def _matching():
             try:
@@ -2299,6 +2301,14 @@ class SubscribedTrack(Track):
                         name = (msg.track_name.decode()
                                 if isinstance(msg.track_name, bytes)
                                 else msg.track_name)
+                        ns = tuple(p.encode() if isinstance(p, str) else p
+                                   for p in msg.track_namespace)
+                        if ns[:len(prefix)] != prefix:
+                            # Outside the requested namespace.
+                            offered.append('/'.join(
+                                [p.decode(errors='replace') for p in ns]
+                                + [name]))
+                            continue
                         if trackname is None or name == trackname:
                             return msg
                         offered.append(name)
