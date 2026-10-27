@@ -37,7 +37,7 @@
 - TIMESTAMP_MAPPING's four integers are vi64 at every draft, so the value survives relays that bridge d16 and d18 sessions; d16 sessions still read the RFC 9000 form older peers send.
 - `--compat missing-request-credit`: a d14/d16 peer whose SETUP has no MAX_REQUEST_ID (the Oracle relay) leaves our requests uncapped, with one WARNING, instead of capped at 0; a MAX_REQUEST_ID that arrives is still honoured. `all` includes it.
 - `publish_namespace_ok()` replaces the misspelled `publish_namepace_ok()`, which stays as an alias; a d16+ SETUP send log names the draft instead of a d14 version; bench latency is marked as a clock offset when its 1st percentile is negative, so a wall-clock step no longer is.
-- Timing: a wall-clock TIMESTAMP_MAPPING (no CLOCK_ID) whose base is not a plausible capture time (before 2000 or over a day ahead) is malformed, with a hint at a draft mismatch through a relay, instead of yielding nonsense latency. sub_media `--analyze` defaults to `--timestamp-errors report`, so a malformed track is reported and kept rather than cancelled.
+- Timing: any TIMESTAMP_MAPPING anchor is valid, including the timestamp draft's zero-based and pre-2000 examples; sub_media `--analyze` reports a track whose computed capture times are not within a day of now as media time (no latency) with one WARNING, and defaults to `--timestamp-errors report`, so a malformed track is reported and kept rather than cancelled.
 - Datagrams share the neutral data band (129) instead of picoquic's 9, so a datagram track no longer strictly outranks stream data (needs aiopquic with `set_datagram_priority`, 0.7.0).
 
 ## v0.13.3
