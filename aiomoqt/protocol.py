@@ -22,7 +22,7 @@ from .messages import *
 from .messages.d18 import Setup
 from .messages.d20 import PublishStateNotify, Setup as D20Setup
 from .messages.fetch import _is_joining
-from .types import to_stream_priority
+from .types import SCHEDULING, to_stream_priority
 from .messages.data import (FETCH_FLAGS_END_TIMED_OUT,
                             FETCH_FLAGS_END_UNKNOWN, encode_padding,
                             DEFAULT_MAX_OBJECT_BYTES, MOQTObjectTooLarge)
@@ -149,6 +149,22 @@ class MOQTPeer:
         # streams (both in QuicConfiguration). Pass None to opt out
         # entirely.
         self.tx_max_inflight_bytes = tx_max_inflight_bytes
+        self._stream_scheduling = "fifo"
+
+    @property
+    def stream_scheduling(self) -> str:
+        """picoquic's tiebreak within a data stream band: "fifo" (lowest
+        stream id first, keeping a track's groups in order) or
+        "round_robin". Applies to sessions set up after the change."""
+        return self._stream_scheduling
+
+    @stream_scheduling.setter
+    def stream_scheduling(self, value: str) -> None:
+        if value not in SCHEDULING:
+            raise ValueError(
+                f"stream_scheduling must be one of {', '.join(SCHEDULING)}, "
+                f"got {value!r}")
+        self._stream_scheduling = value
 
     def register_handler(self, msg_type: int, handler: Callable) -> None:
         """Register a custom handler that overrides the default handler
@@ -3664,16 +3680,28 @@ class _MOQTSessionMixin:
                     raise ValueError(
                         f"{ptype.name} is a client option for native QUIC")
 
-    # Data streams start in MoQT's neutral band, round-robin among equals;
-    # picoquic's own default (9) is FIFO by stream id, so one long stream
-    # (a video group) held every later stream (audio objects) behind it.
-    DEFAULT_DATA_STREAM_PRIORITY = to_stream_priority(128)
+    # Undeclared data streams sit in MoQT's neutral band, not picoquic's
+    # default 9, which outranks every declared data band.
+    DEFAULT_DATA_STREAM_PRIORITY = to_stream_priority(128, discipline="fifo")
+
+    @property
+    def stream_scheduling(self) -> str:
+        """The peer's MOQTPeer.stream_scheduling."""
+        return getattr(getattr(self, '_session', None), 'stream_scheduling',
+                       "fifo")
+
+    def data_stream_band(self, publisher_priority: int) -> int:
+        """Transport band for a data stream of this publisher priority."""
+        return to_stream_priority(publisher_priority,
+                                  discipline=self.stream_scheduling)
 
     def _on_setup_complete(self) -> None:
         logger.info(f"MOQT session: setup complete: "
                     f"draft-{self.negotiated_draft} "
                     f"({'WT' if self._is_wt else 'raw QUIC'})")
-        self.set_default_stream_priority(self.DEFAULT_DATA_STREAM_PRIORITY)
+        # Datagrams stay at picoquic's default 9, above every data band:
+        # aiopquic exposes no datagram priority setter.
+        self.set_default_stream_priority(self.data_stream_band(128))
 
     def _quiet_peer(self, msg) -> bool:
         """The peer's SETUP names an implementation the server's
@@ -5076,7 +5104,8 @@ class _MOQTSessionMixin:
 
     async def serve_fetch(self, request_id: int, objects, *,
                           group_order: int = GroupOrder.ASCENDING,
-                          fin: bool = True) -> int:
+                          fin: bool = True,
+                          stream_priority: Optional[int] = None) -> int:
         """Serve a FETCH's objects on its own uni stream (§10.13).
 
         Opens the fetch data stream, writes FETCH_HEADER, then each
@@ -5086,8 +5115,11 @@ class _MOQTSessionMixin:
         Object Status (d16+), objects with one are skipped. Call
         fetch_ok() first (its End Location must be known). Returns the
         stream id. Cancelled mid-way, it resets the stream (§5.2); a
-        failure resets it too."""
+        failure resets it too. `stream_priority` is the stream's transport
+        band; None leaves the session default."""
         stream_id = await self.open_uni_stream()
+        if stream_priority is not None:
+            self.set_stream_priority(stream_id, stream_priority)
         header = FetchHeader(request_id=request_id)
         prior = None
         with_status = self._profile.fetch_object_status
@@ -5137,6 +5169,7 @@ class _MOQTSessionMixin:
     async def serve_fill(self, msg, history, largest, *,
                          subscription_filter: Optional[LocationFilter] = None,
                          group_order: Optional[int] = None,
+                         stream_priority: Optional[int] = None,
                          ) -> Optional[int]:
         """Serve the fill fetch stream a SUBSCRIBE or REQUEST_UPDATE
         carrying FILL_PARAMETERS asks for (d20 §5.1.3), from `history`
@@ -5166,7 +5199,8 @@ class _MOQTSessionMixin:
             lost_marker=(FETCH_FLAGS_END_TIMED_OUT if timed_out
                          else FETCH_FLAGS_END_UNKNOWN))
         return await self.serve_fetch(msg.request_id, objects,
-                                      group_order=int(order))
+                                      group_order=int(order),
+                                      stream_priority=stream_priority)
 
     def fetch_error(
         self,
