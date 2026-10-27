@@ -22,6 +22,7 @@ from .messages import *
 from .messages.d18 import Setup
 from .messages.d20 import PublishStateNotify, Setup as D20Setup
 from .messages.fetch import _is_joining
+from .types import to_stream_priority
 from .messages.data import (FETCH_FLAGS_END_TIMED_OUT,
                             FETCH_FLAGS_END_UNKNOWN, encode_padding,
                             DEFAULT_MAX_OBJECT_BYTES, MOQTObjectTooLarge)
@@ -3215,7 +3216,7 @@ class _MOQTSessionMixin:
             raise MOQTException(*self._close_err)
         
         self._established_ms = (time.monotonic() - _t0) * 1000.0
-        self._log_setup_complete()
+        self._on_setup_complete()
 
     async def open_uni_stream(self) -> int:
         """Open a unidirectional data stream. Returns the stream ID."""
@@ -3329,8 +3330,13 @@ class _MOQTSessionMixin:
         the neutral value.
         """
         # On WT _quic is self; look past this mixin, as for set_stream_priority.
-        target = super() if self._quic is self else self._quic
+        quic = getattr(self, '_quic', None)
+        target = super() if quic is self else quic
         setter = getattr(target, 'set_default_stream_priority', None)
+        if setter is None and quic is self:
+            # aiopquic's WebTransportSession has none; its transport does.
+            setter = getattr(getattr(self, '_transport', None),
+                             'set_default_stream_priority', None)
         if setter is None:
             return False
         try:
@@ -3655,10 +3661,16 @@ class _MOQTSessionMixin:
                     raise ValueError(
                         f"{ptype.name} is a client option for native QUIC")
 
-    def _log_setup_complete(self) -> None:
+    # Data streams start in MoQT's neutral band, round-robin among equals;
+    # picoquic's own default (9) is FIFO by stream id, so one long stream
+    # (a video group) held every later stream (audio objects) behind it.
+    DEFAULT_DATA_STREAM_PRIORITY = to_stream_priority(128)
+
+    def _on_setup_complete(self) -> None:
         logger.info(f"MOQT session: setup complete: "
                     f"draft-{self.negotiated_draft} "
                     f"({'WT' if self._is_wt else 'raw QUIC'})")
+        self.set_default_stream_priority(self.DEFAULT_DATA_STREAM_PRIORITY)
 
     def _quiet_peer(self, msg) -> bool:
         """The peer's SETUP names an implementation the server's
@@ -5812,7 +5824,7 @@ class _MOQTSessionMixin:
                 self._ingest_request_limit(msg.parameters)
                 self.server_setup()
                 self._moqt_session_setup.set_result(True)
-                self._log_setup_complete()
+                self._on_setup_complete()
             else:
                 self._close_session(
                     SessionCloseCode.VERSION_NEGOTIATION_FAILED,
@@ -6299,7 +6311,7 @@ class _MOQTSessionMixin:
         if not self._moqt_session_setup.done():
             self._moqt_session_setup.set_result(True)
             if not self._is_client:
-                self._log_setup_complete()
+                self._on_setup_complete()
 
     async def _handle_d20_setup(self, msg) -> None:
         """d20+ SETUP: the d18 exchange, after recording the peer's d20
