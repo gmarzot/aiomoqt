@@ -420,10 +420,16 @@ def _relay_tap_case(url: str, draft: int, case: str, insecure: bool,
     ok, _ = _run(cmd, log, 90)
     if not ok:
         return "FAIL", "timeout"
-    text = log.read_text()
-    # TAP line for a single-case run: "ok 1 - <case>" or "not ok 1 - ..."
-    if re.search(rf"^ok 1 - {re.escape(case)}", text, re.MULTILINE):
-        return "PASS", "ok"
+    return _tap_case_verdict(log.read_text(), case)
+
+
+def _tap_case_verdict(text: str, case: str) -> tuple[str, str]:
+    """A single-case TAP run: "ok 1 - <case>" passes, with a SKIP directive
+    it is a SKIP and its reason; anything else fails with its message."""
+    m = re.search(rf"^ok 1 - {re.escape(case)}(.*)$", text, re.MULTILINE)
+    if m:
+        skip = re.search(r"# SKIP\s*(.*)", m.group(1), re.IGNORECASE)
+        return ("SKIP", skip.group(1) or "skipped") if skip else ("PASS", "ok")
     m = re.search(r"^  message: (.*)$", text, re.MULTILINE)
     if m:
         return "FAIL", m.group(1).strip('"')
@@ -652,7 +658,7 @@ def _run_relay_matrix(relay: dict, enabled: set[str],
                 detail = f"{detail} (expected: {xfail_suites[suite]})"
         results.append((status, label, detail, log))
         marker = {"PASS": "[PASS]", "FAIL": "[FAIL]",
-                  "XFAIL": "[XFAIL]"}[status]
+                  "XFAIL": "[XFAIL]", "SKIP": "[skip]"}[status]
         _progress(f"  {marker} {label}  {detail}")
 
     for transport, url in relay["urls"].items():
