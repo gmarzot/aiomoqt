@@ -20,6 +20,7 @@
 - aiomoqt-relay: each subscriber has its own bounded send lane, so a slow subscriber no longer throttles a track for the others or starves a late joiner; past the bound it loses whole groups, their streams reset; status shows each subscriber's lane depth and sheds.
 - A control message that closes the session (such as a request at the MAX_REQUEST_ID ceiling) no longer logs a second close as a parse failure.
 - aiomoqt-relay dashboard: a live track takes the history slot of the track ended longest, so busy relays keep charting their live tracks.
+- aiomoqt-relay dashboard: every tile has a sparkline, Groups/s and Objects/s plot delivered and received on one scale, and Drops follows Loss; status history adds publishers, namespaces, drops and the delivered group and object rates.
 - aiomoqt-relay: a publisher's session closing sends each namespace subscriber one NAMESPACE_DONE, not two; strict players closed the session on the second.
 - aiomoqt-relay deploy: congestion control `bbr` (BBRv3) instead of the relay's `cubic` default.
 - Data streams: an object spanning several chunks is parsed once its bytes have arrived, not again on every chunk.
