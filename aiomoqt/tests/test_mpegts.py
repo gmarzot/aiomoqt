@@ -112,9 +112,8 @@ def test_video_au_spanning_packets_with_config():
     d = TsDemuxer()
     pkts, cc = packetize(VIDEO_PID, video_pes([b'\x09\xf0', _SPS, _PPS, idr(500)], 90_000))
     assert len(pkts) == 4                    # 514-byte IDR + params span four packets
-    units = d.feed(av_stream() + b''.join(pkts))
-    assert units == []                       # the PES closes at the next unit start
-    units = d.feed(b''.join(packetize(VIDEO_PID, video_pes([b'\x41\x9a\x00'], 93_000), cc)[0]))
+    assert d.feed(av_stream() + b''.join(pkts[:3])) == []
+    units = d.feed(pkts[3])                  # the stuffed last packet closes the PES
     assert len(units) == 1
     u = units[0]
     assert u.kind == 'video' and u.key and u.pts == 90_000
@@ -122,9 +121,9 @@ def test_video_au_spanning_packets_with_config():
     assert u.payload == struct.pack('>I', len(body)) + body   # AUD/SPS/PPS excluded
     assert d.video.config is not None and d.video.config[0] == 1
     assert d.config_changed is False
-    # EOF flushes the non-IDR frame with its own PTS.
-    tail = d.close()
-    assert len(tail) == 1 and not tail[0].key and tail[0].pts == 93_000
+    units = d.feed(b''.join(packetize(VIDEO_PID, video_pes([b'\x41\x9a\x00'], 93_000), cc)[0]))
+    assert len(units) == 1 and not units[0].key and units[0].pts == 93_000
+    assert d.close() == []
 
 
 def test_audio_frames_in_one_bounded_pes():
@@ -216,8 +215,7 @@ def test_continuity_gap_discards_the_pes_and_recovers():
     assert d.cc_errors == 1
     nxt, _ = packetize(VIDEO_PID, video_pes([b'\x41\x9a\x00'], 3000), cc)
     units = d.feed(b''.join(nxt))
-    assert units == []                       # the damaged PES was dropped, not emitted
-    assert d.close()[0].pts == 3000          # the next PES is intact
+    assert [u.pts for u in units] == [3000]  # the damaged PES was dropped; the next is intact
 
 
 def test_duplicate_packet_is_ignored():
