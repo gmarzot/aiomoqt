@@ -2,6 +2,7 @@
 
 ## v0.14.0
 
+- Limits on what one peer can open: a refused or cancelled request frees its state (at d18 its request stream now closes; 512 refusals used to exhaust the stream credit); d14/d16 MAX_REQUEST_ID is raised only while the peer holds under `MAX_OPEN_PEER_REQUESTS` (1000) open; aiomoqt-relay `--max-namespaces-per-session` (256) and `--max-subscriptions-per-session` (1024) refuse past them with EXCESSIVE_LOAD, and status shows each session's counts.
 - aiomoqt-relay: each subscriber has its own bounded send lane, so a slow subscriber no longer throttles a track for the others or starves a late joiner; past the bound it loses whole groups, their streams reset; status shows each subscriber's lane depth and sheds.
 - A control message that closes the session (such as a request at the MAX_REQUEST_ID ceiling) no longer logs a second close as a parse failure.
 - aiomoqt-relay dashboard: a live track takes the history slot of the track ended longest, so busy relays keep charting their live tracks.

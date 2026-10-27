@@ -413,7 +413,7 @@ aiopquic:  0.6.1 (~/.venv/lib/python3.13/site-packages/aiopquic) [2026-10-21 16:
 
 - **WebTransport datagram TX is not implemented.** Datagram publishing and reception work over raw QUIC; on WebTransport, datagram reception works but `StreamMapping.DATAGRAM` publishing raises. Use `PER_GROUP` mapping over WebTransport.
 - **`relay_probe -f` and `tests/relays.json` use different schemas.** The probe expects a top-level array of `{id, name, endpoints:[{url}]}`; the interop catalog is `{relays:[{name, urls:{...}, drafts:[...]}]}`. Use `--url` for single-endpoint probes until the loader accepts both.
-- **`aiomoqt-relay` has no authentication or rate limiting** and no delivery timeout; a subscriber that falls more than its send lane's bound behind loses whole groups. Its cache budget (`--cache-bytes`) never drops a subscribed track's live group, so live groups alone can exceed it. See [aiomoqt-relay](#aiomoqt-relay).
+- **`aiomoqt-relay` has no authentication or rate limiting** and no delivery timeout; a subscriber that falls more than its send lane's bound behind loses whole groups. One session holds at most `--max-namespaces-per-session` (256) namespace requests and `--max-subscriptions-per-session` (1024) SUBSCRIBEs; more are refused with EXCESSIVE_LOAD (INTERNAL_ERROR at d14/d16). Its cache budget (`--cache-bytes`) never drops a subscribed track's live group, so live groups alone can exceed it. See [aiomoqt-relay](#aiomoqt-relay).
 
 ## Roadmap
 
