@@ -73,8 +73,8 @@ from aiomoqt.types import (
     MOQT_DEFAULT_DRAFTS, D18MessageType, FilterType, GroupOrder, MOQTDraft,
     MOQTMessageType, MOQTRequestError, MOQTStreamStopped, ObjectStatus,
     ParamType,
-    RequestErrorCode, StreamResetCode, SubscribeDoneCode,
-    parse_draft_spec,
+    RequestErrorCode, SCHEDULING, StreamResetCode, SubscribeDoneCode,
+    parse_draft_spec, to_stream_priority,
 )
 from aiomoqt.messages import FetchHeader, SubgroupHeader
 from aiomoqt.messages.base import MOQTMessage
@@ -345,6 +345,18 @@ CACHE_BUDGET_BYTES = 256 * 1024 * 1024
 
 # Live object bytes a subscriber's send lane holds before it sheds groups.
 LANE_BYTES = 4 * 1024 * 1024
+
+# Tiebreak within a data stream band (--stream-scheduling).
+STREAM_SCHEDULING = "fifo"
+
+
+def _stream_band(session, priority) -> int:
+    """Transport band for a downstream data stream of this publisher
+    priority."""
+    if priority is None or not 0 <= priority <= 255:
+        priority = 128
+    return to_stream_priority(priority, discipline=getattr(
+        session, 'stream_scheduling', STREAM_SCHEDULING))
 
 # MAX_FILTER_RANGES advertised at d20+ (§9.1.6).
 MAX_FILTER_RANGES = 16
@@ -1306,6 +1318,7 @@ class _RelayedTrack:
             return
         if entry is None:
             stream_id = await session.open_uni_stream()
+            session.set_stream_priority(stream_id, _stream_band(session, prio))
             # Mirror the upstream stream's shape: END_OF_GROUP,
             # FIRST_OBJECT and the subgroup-id mode are part of the
             # delivery semantics a subscriber checks, and re-encoding
@@ -2373,7 +2386,9 @@ async def _serve_fill(track, d, request_id, fill, rng,
         if gap is not None:
             served = itertools.chain((gap,), served)
         serving = True
-        await session.serve_fetch(request_id, served, group_order=order)
+        await session.serve_fetch(
+            request_id, served, group_order=order,
+            stream_priority=_stream_band(session, objs[0][5] if objs else None))
         logger.info(f"relay: fill {track.key} request {request_id} served "
                     f"{len(objs)} object(s) {start}..{end} from {source}")
     except asyncio.CancelledError:
@@ -2730,6 +2745,11 @@ def parse_args():
                         help="Object cache budget across all tracks; past "
                              "it the least recently used tracks lose their "
                              "oldest groups. Default: 256 MiB")
+    parser.add_argument("--stream-scheduling", choices=SCHEDULING,
+                        default=STREAM_SCHEDULING,
+                        help="Order among data streams of one priority: "
+                             "fifo keeps each track's groups in order, "
+                             "round_robin shares the band. Default: fifo")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug logging (= --log-level debug). "
                              "SIGUSR1 steps the level at runtime: INFO, "
@@ -3066,7 +3086,8 @@ async def _on_fetch(session, msg):
         objs = sorted(objs, key=lambda o: (-o[0], o[2]))
     await session.serve_fetch(
         msg.request_id, _counted_fetch(objs, track, source),
-        group_order=int(order))
+        group_order=int(order),
+        stream_priority=_stream_band(session, objs[0][5] if objs else None))
     logger.info(f"relay: FETCH ns={ns} track={track_name} served "
                 f"{len(objs)} object(s) {start}..({last_g}.{last_o})")
 
@@ -3288,6 +3309,7 @@ def _build_server(bind, port, cert, key, use_quic, draft, **transport):
         max_filter_ranges=MAX_FILTER_RANGES,
         **transport,
     )
+    server.stream_scheduling = STREAM_SCHEDULING
     server.register_handler(
         MOQTMessageType.PUBLISH_NAMESPACE, _answered(_on_publish_namespace))
     server.register_handler(
@@ -4165,8 +4187,9 @@ async def main():
     if args.cache_bytes <= 0:
         print("Error: --cache-bytes must be above 0", file=sys.stderr)
         sys.exit(2)
-    global CACHE_BUDGET_BYTES
+    global CACHE_BUDGET_BYTES, STREAM_SCHEDULING
     CACHE_BUDGET_BYTES = args.cache_bytes
+    STREAM_SCHEDULING = args.stream_scheduling
     transport = transport_settings(args)
 
     # Primary listener: WebTransport unless --quic; both with --dual.

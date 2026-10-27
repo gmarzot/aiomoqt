@@ -35,9 +35,12 @@ from .locmaf import (
 logger = get_logger(__name__)
 
 # §5.2: the catalog track SHOULD outrank every track it describes.
-# MoQT priority is ascending-urgency, so this sits below the
-# PublishedTrack default of 128 that the media tracks take.
+# MoQT priority is ascending-urgency (lower = more urgent).
 CATALOG_PUBLISHER_PRIORITY = 64
+# Audio outranks video: a video group's long stream must not hold audio.
+AUDIO_PUBLISHER_PRIORITY = 64
+VIDEO_PUBLISHER_PRIORITY = 128
+_DEFAULT_PUBLISHER_PRIORITY = 128
 
 
 class CatalogTrackPublisher(PublishedTrack):
@@ -140,6 +143,8 @@ class CatalogTrackPublisher(PublishedTrack):
                                          end_stream=True)
                     stream_id = None
                 stream_id = await session.open_uni_stream()
+                session.set_stream_priority(stream_id,
+                                            self._stream_band(session))
                 self._stream_count += 1
                 header = SubgroupHeader(
                     track_alias=track_alias, group_id=self._next_group,
@@ -209,6 +214,11 @@ class MediaPublisher:
             CATALOG_TRACK_NAME: self.catalog_track}
 
     def add_track(self, track: LocTrackPublisher) -> LocTrackPublisher:
+        """A track left at the default priority takes its media kind's."""
+        if track.priority == _DEFAULT_PUBLISHER_PRIORITY:
+            track.priority = (AUDIO_PUBLISHER_PRIORITY
+                              if getattr(track, 'media_kind', None) == "audio"
+                              else VIDEO_PUBLISHER_PRIORITY)
         self._by_name[track.trackname] = track
         return track
 

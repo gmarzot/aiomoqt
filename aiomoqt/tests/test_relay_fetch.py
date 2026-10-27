@@ -45,7 +45,8 @@ def _session(draft=18):
                           reason)))
     s.fetch_ok = lambda **kw: s._oks.append(kw)
 
-    async def _serve(request_id, objects, group_order=None, fin=True):
+    async def _serve(request_id, objects, group_order=None, fin=True,
+                     stream_priority=None):
         s._served.append((list(objects), group_order))
         return 0
     s.serve_fetch = _serve

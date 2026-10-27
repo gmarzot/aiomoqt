@@ -196,6 +196,9 @@ class _Fake:
         if not blocked:
             self.gate.set()
 
+    def set_stream_priority(self, _sid, _band):
+        return True
+
     async def open_uni_stream(self):
         sid = self._next
         self._next += 4

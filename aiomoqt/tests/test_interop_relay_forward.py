@@ -16,6 +16,9 @@ class _Downstream:
         self.writes = []            # (stream_id, nbytes, fin)
         self.dones = []             # (request_id, PUBLISH_DONE status)
 
+    def set_stream_priority(self, _sid, _band):
+        return True
+
     async def open_uni_stream(self):
         sid = self._next
         self._next += 4
