@@ -68,8 +68,8 @@ def parse_args():
     add_help(parser)
     parser.add_argument(
         '--datagram', action='store_true',
-        help='ObjectDatagrams instead of subgroup streams (raw QUIC '
-             'only; object must fit one packet; not valid with --video)')
+        help='ObjectDatagrams instead of subgroup streams (object '
+             'must fit one packet; not valid with --video)')
     args = parser.parse_args()
     # One positional URL replaces -h/--port/--path/-q: the scheme
     # selects the transport, exactly like the aiomoqt tools.
@@ -78,9 +78,6 @@ def parse_args():
     args.path, args.use_quic = _r.path or "", _r.use_quic
     if args.datagram and args.video:
         parser.error("--datagram does not support --video yet")
-    if args.datagram and not args.use_quic:
-        parser.error("--datagram requires a moqt:// URL (raw QUIC); "
-                     "WT datagram TX is not wired yet")
     return args
 
 

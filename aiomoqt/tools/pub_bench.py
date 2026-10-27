@@ -162,8 +162,7 @@ The URL scheme selects the transport:
         parser.error('--video cannot use -D/--datagram: profile I-frames '
                      f'({VideoTrack.PROFILES[args.video]["i_frame"]} B) '
                      'far exceed the one-packet datagram ceiling')
-    _cli.check_datagram(parser, args,
-                       serve_quic=parse_relay_url(args.url).use_quic)
+    _cli.check_datagram(parser, args)
     if args.trackname is None:
         import uuid
         sz = args.object_size

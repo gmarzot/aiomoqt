@@ -60,7 +60,6 @@ async def test_padding_streams_both_ways(draft, use_quic):
         server.close()
 
 
-# WT datagram TX is not wired, so datagrams run over raw QUIC only.
 @pytest.mark.asyncio
 @pytest.mark.parametrize("draft", _DRAFTS)
 async def test_padding_datagram(draft):
