@@ -105,27 +105,33 @@ function renderGauges(h) {
 
 // -- tiles ----------------------------------------------------------------------
 
-// `sub`: text, or an array of text and nodes.
+// `value`, `sub`: text, or an array of text and nodes.
 function setTile(key, value, sub, title) {
   const t = document.querySelector(`.tile[data-key="${key}"]`);
-  t.querySelector('.value').textContent = value;
+  t.querySelector('.value').replaceChildren(...[].concat(value));
   t.querySelector('.sub').replaceChildren(...[].concat(sub || ''));
   if (title) t.title = title;
 }
 
-// Counters plotted as their increase per sample.
-const CUMULATIVE = new Set(['drops']);
-
-// A tile's sparkline series from history; a key the relay lacks is an empty series.
-function sparkValues(history, key) {
-  const v = history[key] || [];
-  if (!CUMULATIVE.has(key)) return v;
-  return v.map((x, i) => (i === 0 || none(x) || none(v[i - 1])) ? null : Math.max(x - v[i - 1], 0));
+// Out and in side by side, each above its sparkline key.
+function setPair(key, rateOut, rateIn, title) {
+  setTile(key, [el('span', {}, fmt.rate(rateOut)), el('span', {}, fmt.rate(rateIn))],
+          [el('span', {}, el('i', {class: 'key-area s0'}), 'out'),
+           el('span', {}, el('i', {class: 'key-area s1'}), 'in')], title);
 }
 
-// "■ out · ■ 12.0 in", keyed to the sparkline's two series.
-const inOutSub = (rateIn) => [el('i', {class: 'key-area s0'}), 'out · ',
-                              el('i', {class: 'key-area s1'}), `${fmt.rate(rateIn)} in`];
+// New drops per minute over the 10-minute history, oldest first; null without drops history.
+function dropsPerMinute(h) {
+  const t = h.t || [], d = h.drops;
+  if (!d || !t.length) return null;
+  const buckets = new Array(10).fill(0);
+  for (let i = 1; i < t.length; i++) {
+    if (none(d[i]) || none(d[i - 1])) continue;
+    const k = 9 - Math.floor((t[t.length - 1] - t[i]) / 60);
+    if (k >= 0) buckets[k] += Math.max(d[i] - d[i - 1], 0);
+  }
+  return buckets;
+}
 
 // Transport and draft counts of `list`: "2 wt · 1 quic", "d18: 2, d22: 1".
 function sessionMix(list) {
@@ -146,13 +152,14 @@ function renderTiles(s) {
   const pubList = sessions.filter((x) => (x.role || '').includes('pub'));
   const subList = sessions.filter((x) => (x.role || '').includes('sub'));
   const pubs = sessionMix(pubList), subs = sessionMix(subList);
+  const drops = dropsPerMinute(s.history);
   const playable = s.namespaces.filter((r) => r.format).length;
   const live = s.tracks.filter((r) => r.state === 'live').length;
   const groups = s.tracks.reduce((n, r) => n + (r.groups_per_s || 0), 0);
   // Delivered rates: each track's input rate times its subscribers.
   const fanout = (k) => s.tracks.reduce((n, r) => n + (r[k] || 0) * (r.subscribers || 0), 0);
-  setTile('publishers', fmt.num(T.publishers), pubs.transports || 'publishing sessions',
-          pubList.length ? `By draft: ${pubs.drafts}` : 'No publishing sessions');
+  setTile('publishers', fmt.num(T.publishers), 'publishing sessions',
+          pubList.length ? `${pubs.transports}; by draft: ${pubs.drafts}` : 'No publishing sessions');
   // A viewer counts once; without totals.subscriptions, count sub-role sessions.
   const subscriptions = T.subscriptions ?? T.subscribers;
   const viewers = none(T.subscriptions) ? subList.length : T.subscribers;
@@ -165,18 +172,20 @@ function renderTiles(s) {
   const lag = T.loop_lag_ms || {};
   setTile('lag', fmt.ms(lag.p99), `p50 ${fmt.ms(lag.p50)}`);
   setTile('loss', fmt.pct(T.loss_pct, 2), 'delivery sessions');
-  setTile('drops', fmt.num(T.drops), 'subscribers dropped');
+  setTile('drops', drops ? fmt.num(drops.reduce((a, b) => a + b, 0)) : '—',
+          `${fmt.num(T.drops)} since start`, 'Subscribers dropped; bars per minute');
   const groupsIn = none(T.groups_per_s) ? groups : T.groups_per_s;
-  const out = (k, rate) => fmt.rate(none(T[k]) ? fanout(rate) : T[k]);
-  setTile('groups', out('groups_out_per_s', 'groups_per_s'), inOutSub(groupsIn),
-          'Delivered to subscribers: each track\'s group rate times its subscribers; in = received from publishers');
-  setTile('objects', out('objects_out_per_s', 'objects_per_s'), inOutSub(T.objects_in_per_s),
-          'Delivered to subscribers: each track\'s object rate times its subscribers; in = received from publishers');
+  const out = (k, rate) => (none(T[k]) ? fanout(rate) : T[k]);
+  setPair('groups', out('groups_out_per_s', 'groups_per_s'), groupsIn,
+          'Out = delivered to subscribers: each track\'s group rate times its subscribers; in = received from publishers');
+  setPair('objects', out('objects_out_per_s', 'objects_per_s'), T.objects_in_per_s,
+          'Out = delivered to subscribers: each track\'s object rate times its subscribers; in = received from publishers');
   setTile('ingress', fmt.bps(T.ingress_bps), `media ${fmt.bps(T.media_in_bps)}`);
   setTile('egress', fmt.bps(T.egress_bps), `media ${fmt.bps(T.media_out_bps)}`);
   for (const tile of document.querySelectorAll('.tile[data-spark]')) {
-    Dash.spark(tile, ...tile.dataset.spark.split(' ').map((k) => sparkValues(s.history, k)));
+    Dash.spark(tile, ...tile.dataset.spark.split(' ').map((k) => s.history[k] || []));
   }
+  Dash.bars(document.querySelector('.tile[data-key="drops"]'), drops || []);
 }
 
 // -- namespaces and scope -------------------------------------------------------

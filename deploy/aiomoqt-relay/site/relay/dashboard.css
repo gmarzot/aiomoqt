@@ -147,6 +147,12 @@ h2 {
 .spark .area { fill: var(--brand); fill-opacity: .25; stroke: none; }
 .spark .line.s1 { stroke: var(--gold); }
 .spark .area.s1 { fill: var(--gold); }
+.spark .bar { fill: var(--brand); }
+.spark .base { stroke: var(--edge); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.tile.pair .value, .tile.pair .sub {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 8px;
+}
+.tile.pair .value > span, .tile.pair .sub > span { overflow: hidden; text-overflow: ellipsis; }
 .tile .sub .key-area { width: 8px; height: 8px; margin-right: 4px; }
 .key-area.s0 { background: var(--brand); }
 .key-area.s1 { background: var(--gold); }
