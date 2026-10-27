@@ -402,9 +402,9 @@ python -m aiomoqt.versions
 ```
 
 ```
-aiomoqt:   0.13.1 (~/.venv/lib/python3.13/site-packages/aiomoqt) [2026-10-21 16:43]
-aiopquic:  0.6.1 (~/.venv/lib/python3.13/site-packages/aiopquic) [2026-10-21 16:43]
-  - picoquic:  1.1.53.0 (2026.10.08.c908872-0-c9088724) [2026-10-08]
+aiomoqt:   0.14.0 (~/.venv/lib/python3.13/site-packages/aiomoqt) [2026-10-27 17:17]
+aiopquic:  0.7.0 (~/.venv/lib/python3.13/site-packages/aiopquic) [2026-10-27 17:17]
+  - picoquic:  1.1.53.0 (2026.10.22.70b5fd5-0-70b5fd5a) [2026-10-22]
   - picotls:   master (f06553b8) [2026-09-30]
   - openssl:   OpenSSL 3.5.8 (~/.venv/lib/python3.13/site-packages/aiopquic.libs/libcrypto-c37e28d8.so.3.5.8)
 ```

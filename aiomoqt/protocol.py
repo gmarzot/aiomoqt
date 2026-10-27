@@ -3439,7 +3439,7 @@ class _MOQTSessionMixin:
         """Send priority of this connection's datagrams, on the same scale
         as stream priorities: higher-priority streams go first, equal
         ones alternate with datagrams. False when the transport offers
-        no setter (aiopquic before 0.7.0)."""
+        no setter."""
         quic = getattr(self, '_quic', None)
         target = super() if quic is self else quic
         setter = getattr(target, 'set_datagram_priority', None)

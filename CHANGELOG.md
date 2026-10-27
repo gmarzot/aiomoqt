@@ -2,6 +2,7 @@
 
 ## v0.14.0
 
+- Requires aiopquic 0.7.0: datagram priority and the server bind host need it (0.6.x silently ignored both).
 - Congestion control defaults to `bbr` (BBRv3) in `MOQTClient`, `MOQTServer`, aiomoqt-relay (was `cubic`), the tools and the examples, whichever aiopquic is installed.
 - Datagram tracks publish over WebTransport: `datagram_max_payload()` reports the WT session's ceiling, and `-D` is accepted over `https://`.
 - Malformed input is a protocol error: a control message that does not decode, or an invalid FETCH object (formerly a stream reset), closes the session with PROTOCOL_VIOLATION and a short reason; an Object whose Properties do not parse resets its stream as a malformed track; a length past the message is refused before it is read; invalid UTF-8 in a reason phrase is replaced, not an error.
