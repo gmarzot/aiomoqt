@@ -1120,6 +1120,7 @@ class _MOQTSessionMixin:
             rid = getattr(msg, 'request_id', None)
             self._drop_request_routes(rid)
             self._announced.pop(rid, None)
+            self._subscriptions.pop(rid, None)
             return
         if isinstance(msg, FetchOk):
             self._check_fetch_ok_end(msg)
@@ -1155,6 +1156,10 @@ class _MOQTSessionMixin:
             return
         request_id = self._bidi_stream_requests.pop(stream_id, None)
         self._cancelled_request_streams.discard(stream_id)
+        if self._request_stream_ends:
+            self._request_stream_ends.pop(stream_id, None)
+        if self._request_stream_updates:
+            self._request_stream_updates.pop(stream_id, None)
         if request_id is not None:
             self._loop.call_soon(self._settle_cancelled_request, request_id,
                                  f"stream termination (stream {stream_id})")
@@ -1392,6 +1397,7 @@ class _MOQTSessionMixin:
                     sid = self._bidi_streams.get(request_id)
                     if sid is not None:
                         self._bidi_streams[int(msg.request_id)] = sid
+                        self._note_stream_update(sid, int(msg.request_id))
             # Latch DEFAULT_PUBLISHER_PRIORITY synchronously: data
             # streams drain in the same event batch, and the deferred
             # handler task loses that race (group-0 objects would
@@ -2653,6 +2659,8 @@ class _MOQTSessionMixin:
                 del self._peer_requests[request_id]
                 self._loop.call_soon(self._end_cancelled_request,
                                      request_id, stream_id)
+            if is_request_bidi:
+                self._request_half_ended(stream_id, self._PEER_HALF)
 
     def _report_goaway(self, msg: 'GoAway',
                        request_id: Optional[int]) -> None:
@@ -2675,6 +2683,64 @@ class _MOQTSessionMixin:
             return
         self._settle_cancelled_request(request_id, f"FIN (stream {stream_id})")
         self.stream_fin(stream_id)
+
+    # Ended halves of bound request streams: stream_id -> bits.
+    _LOCAL_HALF, _PEER_HALF = 1, 2
+    _request_stream_ends: Optional[Dict[int, int]] = None
+    # Request stream -> the peer's REQUEST_UPDATE ids bound to it.
+    _request_stream_updates: Optional[Dict[int, List[int]]] = None
+
+    def _note_stream_update(self, stream_id: int, update_id: int) -> None:
+        if self._request_stream_updates is None:
+            self._request_stream_updates = {}
+        self._request_stream_updates.setdefault(stream_id, []).append(
+            update_id)
+
+    def _request_half_ended(self, stream_id: int, half: int) -> None:
+        """Record an ended half of a bound request stream; with both
+        ended its bindings are released. The peer ending its half of our
+        request ends ours too, except a PUBLISH, whose PUBLISH_DONE may
+        still be due."""
+        request_id = self._bidi_stream_requests.get(stream_id)
+        if request_id is None:
+            if self._request_stream_ends:
+                self._request_stream_ends.pop(stream_id, None)
+            return
+        if self._request_stream_ends is None:
+            self._request_stream_ends = {}
+        ends = self._request_stream_ends
+        state = ends.get(stream_id, 0) | half
+        if state == self._LOCAL_HALF | self._PEER_HALF:
+            ends.pop(stream_id, None)
+            # A loop turn later: reply handlers parsed with the FIN run first.
+            self._loop.call_soon(self._release_request_stream, stream_id)
+            return
+        ends[stream_id] = state
+        ours = request_id & 1 == (0 if self._is_client else 1)
+        if (half == self._PEER_HALF and ours
+                and self._request_kinds.get(request_id, (None,))[0]
+                is not Publish):
+            self.stream_fin(stream_id)
+
+    def _release_request_stream(self, stream_id: int) -> None:
+        """Forget a request stream both ends have closed. Replies still
+        queued for its requests are dropped."""
+        request_id = self._bidi_stream_requests.pop(stream_id, None)
+        if self._request_stream_ends is not None:
+            self._request_stream_ends.pop(stream_id, None)
+        updates = (self._request_stream_updates.pop(stream_id, ())
+                   if self._request_stream_updates else ())
+        self._control_chains.pop(stream_id, None)
+        self._cancelled_request_streams.discard(stream_id)
+        if request_id is None:
+            return
+        theirs = request_id & 1 != (0 if self._is_client else 1)
+        for rid in (request_id, *updates):
+            if self._bidi_streams.get(rid) == stream_id:
+                del self._bidi_streams[rid]
+            if theirs:
+                self._note_request_gone(rid)
+        self._peer_requests.pop(request_id, None)
 
     def _ingest_stream_data(self, stream_id: int, data, end_stream: bool) -> None:
         """Route stream bytes, or hold them while a raw-QUIC session's
@@ -2947,7 +3013,7 @@ class _MOQTSessionMixin:
             self._on_request_stream_terminated(
                 event.stream_id,
                 stop_sending_code=int(event.error_code or 0))
-            if not bound:
+            if not bound and event.stream_id not in self._stream_torn_down:
                 self._stopped_streams.add(event.stream_id)
                 self._cleanup_stream(
                     event.stream_id, QuicErrorCode.APPLICATION_ERROR)
@@ -3258,6 +3324,8 @@ class _MOQTSessionMixin:
         """Write bytes (and optional FIN) to stream_id."""
         if not self._session_writable():
             return
+        if end_stream and stream_id in self._bidi_stream_requests:
+            self._request_half_ended(stream_id, self._LOCAL_HALF)
         if self._tx_deferred and (stream_id, 'send') in self._tx_deferred:
             return  # the stream's reset or FIN is queued
         if end_stream:
@@ -3426,6 +3494,8 @@ class _MOQTSessionMixin:
         StreamResetCode is encoded for the negotiated draft."""
         if not self._session_writable():
             return
+        if stream_id in self._bidi_stream_requests:
+            self._request_half_ended(stream_id, self._LOCAL_HALF)
         error_code = stream_reset_code(error_code, self._profile)
         if self._tx_deferred:
             self._tx_deferred.pop((stream_id, 'send'), None)
@@ -4761,6 +4831,7 @@ class _MOQTSessionMixin:
         cancelled by terminating its own bidi stream (§3.3.2) — reset
         our write half, STOP_SENDING the reply half. Returns None then."""
         self._retire_alias(request_id)
+        self._subscriptions.pop(request_id, None)
         if self.negotiated_draft >= 18:
             stream_id = self._bidi_streams.get(request_id)
             if stream_id is None:
