@@ -257,3 +257,142 @@ def test_ffmpeg_generated_stream(tmp_path):
     assert d.audio_asc == _ASC_MONO and d.audio_samplerate == 48000
     assert len(audio) > 90
     assert {b.pts - a.pts for a, b in zip(audio, audio[1:])} == {1920}
+
+
+# ── unit completion and the capture instant ───────────────────────────
+
+def _video_au(n: int, pts: int) -> bytes:
+    """Frame `n` at `pts`, sized never to fill its last packet exactly."""
+    if n == 0:
+        return video_pes([_SPS, _PPS, idr(700)], pts)
+    au = video_pes([b'\x41\x9a' + bytes(300 + n)], pts)
+    return au if len(au) % 184 else video_pes([b'\x41\x9a' + bytes(301 + n)], pts)
+
+
+def test_video_and_audio_are_stamped_at_their_arrival():
+    """Each frame's packets arrive on schedule; its unit is stamped when its
+    last packet is in, so video lags audio by no frame."""
+    wall = [1_000.0]
+    d = TsDemuxer(TsClock(now=lambda: wall[0]))
+    d.feed(av_stream())
+    lag = {'video': [], 'audio': []}
+    vcc = acc = 0
+    for i in range(60):                       # 2 s: video 30 fps, audio 1024 @ 48 kHz
+        t_v, t_a = i / 30, i * 1024 / 48000
+        for t, kind in sorted(((t_v, 'video'), (t_a, 'audio'))):
+            wall[0] = 1_000.0 + t
+            if kind == 'video':
+                pkts, vcc = packetize(VIDEO_PID, _video_au(i, int(t_v * 90_000)), vcc)
+            else:
+                pkts, acc = packetize(AUDIO_PID, audio_pes([b'\x01' * 300], round(t_a * 90_000)), acc)
+            for u in d.feed(b''.join(pkts)):
+                lag[u.kind].append(int(wall[0] * 1_000_000) - d.to_us(u.pts))
+    assert len(lag['video']) == 60 and len(lag['audio']) == 60
+    assert max(map(abs, lag['video'] + lag['audio'])) <= 20   # rounding only
+
+
+def test_an_exactly_filled_video_pes_closes_at_the_next_pes():
+    d = TsDemuxer()
+    d.feed(av_stream())
+    body = b'\x41\x9a' + bytes(range(256)) * 3
+    pes0 = video_pes([body], 0)
+    pes0 = video_pes([body[:len(body) - len(pes0) % 184]], 0)
+    assert len(pes0) % 184 == 0
+    pkts, cc = packetize(VIDEO_PID, pes0)
+    assert d.feed(b''.join(pkts)) == []       # no stuffing: completion unknown
+    units = d.feed(b''.join(packetize(VIDEO_PID, _video_au(1, 3000), cc)[0]))
+    assert [u.pts for u in units] == [0, 3000]
+
+
+def test_a_pcr_only_adaptation_field_does_not_end_a_pes():
+    pcr = bytes([7, 0x10]) + bytes(6)                       # PCR, no stuffing
+    payload = video_pes([idr(400)], 0)
+    first = bytes([0x47, 0x40 | (VIDEO_PID >> 8), VIDEO_PID & 0xFF, 0x30]) + pcr
+    first += payload[:188 - len(first)]
+    rest, _ = packetize(VIDEO_PID, payload[188 - 12:], cc0=1)
+    rest[0] = bytes([rest[0][0], rest[0][1] & ~0x40]) + rest[0][2:]   # continuation, not PUSI
+    d = TsDemuxer()
+    d.feed(av_stream())
+    assert d.feed(first) == []
+    units = d.feed(b''.join(rest))
+    assert len(units) == 1 and units[0].payload.endswith(idr(400)[-50:])
+
+
+def test_a_pes_continuing_past_stuffing_turns_eager_completion_off(caplog):
+    d = TsDemuxer()
+    d.feed(av_stream())
+    au = video_pes([idr(400)], 0)
+    early = packet(VIDEO_PID, au[:100], pusi=True, cc=0)    # stuffed, yet not the end
+    tail, cc = packetize(VIDEO_PID, au[100:], cc0=1)
+    tail[0] = bytes([tail[0][0], tail[0][1] & ~0x40]) + tail[0][2:]
+    assert len(d.feed(early)) == 1                          # emitted, cut short
+    assert d.feed(b''.join(tail)) == [] and not d.eager_video
+    assert 'continued past a stuffed packet' in caplog.text
+    pkts, cc = packetize(VIDEO_PID, _video_au(1, 3000), cc)
+    assert d.feed(b''.join(pkts)) == []                     # waits for the next PES now
+    assert [u.pts for u in d.close()] == [3000]
+
+
+@pytest.mark.skipif(shutil.which('ffmpeg') is None, reason='ffmpeg not installed')
+def test_ffmpeg_video_units_complete_before_the_next_frame(tmp_path):
+    out = tmp_path / 'v.ts'
+    subprocess.run([
+        'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
+        '-f', 'lavfi', '-i', 'testsrc=size=320x240:rate=30', '-t', '1',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-bf', '0',
+        '-f', 'mpegts', '-muxdelay', '0', '-muxpreload', '0', str(out),
+    ], check=True)
+    data = out.read_bytes()
+    d = TsDemuxer()
+    late = n = 0
+    for i in range(0, len(data), 188):
+        pkt = data[i:i + 188]
+        pid = ((pkt[1] & 0x1F) << 8) | pkt[2]
+        units = [u for u in d.feed(pkt) if u.kind == 'video']
+        n += len(units)
+        # A unit emitted on the next frame's first packet waited a frame.
+        late += bool(units) and pid == d.video_pid and bool(pkt[1] & 0x40)
+    assert n >= 29 and late == 0 and d.eager_video
+
+
+# ── cadence and measured rates ────────────────────────────────────────
+
+def test_cadence_timescales():
+    from fractions import Fraction
+    from aiomoqt.media.mpegts import TsCadence
+    c = TsCadence.parse('fps=30,gop=60')
+    assert (c.timescale, c.frame_ticks, c.gop, c.framerate) == (30000, 1000, 60, 30.0)
+    c = TsCadence.parse('gop=48, fps=24000/1001')
+    assert (c.timescale, c.frame_ticks, c.framerate) == (24000, 1001, 23.98)
+    assert c.fps == Fraction(24000, 1001)
+    m = c.video_timestamps(1_000_000)
+    assert (m.timescale, m.group_multiplier, m.object_multiplier) == (24000, 48 * 1001, 1001)
+    a = TsCadence.audio_timestamps(1_000_000, 48000, 960, 1)
+    assert (a.timescale, a.group_multiplier, a.object_multiplier) == (48000, 960, 0)
+    for bad in ('fps=30', 'gop=60', 'fps=0,gop=60', 'fps=30,gop=0', 'rate=30,gop=1',
+                'fps=x,gop=2'):
+        with pytest.raises(ValueError):
+            TsCadence.parse(bad)
+
+
+def test_held_clock_keeps_the_pts_schedule():
+    wall = [1_000.0]
+    clk = TsClock(now=lambda: wall[0])
+    assert clk.to_us(0) == 1_000_000_000
+    clk.hold()
+    wall[0] = 1_000.010                       # 10 ms in, but PTS says 33 ms
+    assert clk.to_us(3000) == 1_000_033_333   # ahead of arrival, not slid
+    wall[0] = 1_000.050
+    assert clk.to_us(6000) == 1_000_066_666
+
+
+def test_rates_measure_fps_and_bitrate_over_whole_groups():
+    from aiomoqt.media.mpegts import TsRates, TsUnit
+    r = TsRates(window_s=1.0)
+    for i in range(120):                      # 30 fps, key every 15 frames
+        key = i % 15 == 0
+        r.add(TsUnit('video', bytes(5000 if key else 1000), key, i * 3000))
+        r.add(TsUnit('audio', bytes(400), True, i * 1920))
+    assert r.fps == 30.0
+    assert r.bps['video'] == (5000 + 14 * 1000) * 8 * 2       # two GOPs a second
+    assert r.bps['audio'] == 400 * 8 * 48000 // 1024

@@ -280,9 +280,10 @@ def _registered(descriptors: bytes, fourcc: bytes) -> bool:
     return False
 
 
-def _af_stuffed(pkt: bytes) -> bool:
-    """True when the adaptation field holds stuffing bytes, which a muxer
-    adds only to the last packet of a PES (ISO 13818-1 §2.4.3.5)."""
+def _af_stuffed(pkt: bytes, pusi: bool) -> bool:
+    """True when the adaptation field only pads the packet, which a muxer
+    does to the last packet of a PES (ISO 13818-1 §2.4.3.5): stuffing
+    bytes, or a field carrying nothing (indicator flags mark a PES start)."""
     af_len = pkt[4]
     if af_len == 0:
         return True
@@ -293,7 +294,7 @@ def _af_stuffed(pkt: bytes) -> bool:
         i += 1 + pkt[i]
     if flags & 0x01 and i < end:
         i += 1 + pkt[i]
-    return i < end
+    return i < end or flags == 0 or (not pusi and not flags & 0x1F)
 
 
 def _pts_at(b: bytes, i: int) -> int:
@@ -395,7 +396,7 @@ class TsDemuxer:
         stuffed = False
         if afc & 2:
             off += 1 + pkt[4]
-            stuffed = _af_stuffed(pkt)
+            stuffed = _af_stuffed(pkt, pusi)
         if off >= TS_PACKET:
             return
         payload = pkt[off:]
