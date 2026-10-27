@@ -201,8 +201,8 @@ table.compact td, table.compact td code { font-size: 12px; }
 #t-namespaces td.ns code { overflow-wrap: break-word; }
 .panel.charts .chart { margin: 0; }
 .h2-scope {
-  margin-left: 8px; color: var(--text); text-transform: none; letter-spacing: 0;
-  font: 12px "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+  display: block; margin-top: 4px; color: var(--text); text-transform: none; letter-spacing: 0;
+  font: 12px "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace; overflow-wrap: anywhere;
 }
 tr.pick { cursor: pointer; }
 tr.pick:focus-visible td { outline: 1px solid var(--gold); }
@@ -349,4 +349,8 @@ footer [data-versions]:empty { display: none; }
   .gauge, .gauge svg { width: 22vw; max-width: 120px; }
   .gauge svg { height: auto; }
   .mono { font-size: 13px; }
+  /* Phones hide namespaces' Origin, Tracks, Peak and tracks' Peak, Groups/s, Latency. */
+  #t-namespaces :is(th, td):is(:nth-child(2), :nth-child(3), :nth-child(5)),
+  #t-tracks :is(th, td):is(:nth-child(3), :nth-child(4), :nth-child(7)) { display: none; }
+  table.compact th, table.compact td { padding: 5px 4px; }
 }
