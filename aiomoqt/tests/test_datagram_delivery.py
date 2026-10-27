@@ -220,23 +220,33 @@ async def test_stream_and_datagram_tracks_coexist(draft, use_quic):
 @pytest.mark.asyncio
 @_TRANSPORTS
 async def test_datagram_writer_parks_on_a_full_ring(use_quic):
-    """A burst larger than the datagram record ring parks the writer on
-    the drain event and completes; the subscriber still receives."""
+    """A full datagram record ring parks the writer on the drain event;
+    it resends once the ring drains and the subscriber still receives.
+    One full ring is forced (the worker may drain a real burst as fast
+    as it arrives); real ones are counted too."""
     port = _BASE_PORT + 44 + (not use_quic)
     n, size = 400, 1000
     full = []
+    calls = []
     done = asyncio.Event()
 
     async def _on_subscribe(session, msg):
         ok = session.subscribe_ok(request_msg=msg, content_exists=0)
-        send = session._quic.send_datagram_frame
+        quic = session._quic
+        send = quic.send_datagram_frame
+        loop = asyncio.get_running_loop()
 
         def counting(data):
+            calls.append(1)
+            if len(calls) == 10:                   # report the ring full once
+                full.append(1)
+                loop.call_later(0.02, quic.get_datagram_tx_drain_event().set)
+                return 0
             sent = send(data)
             if not sent:
                 full.append(1)
             return sent
-        session._quic.send_datagram_frame = counting
+        quic.send_datagram_frame = counting
         for oid in range(n):
             await session.dgram_write_drain(ObjectDatagram(
                 track_alias=ok.track_alias, group_id=0, object_id=oid,
@@ -258,7 +268,8 @@ async def test_datagram_writer_parks_on_a_full_ring(use_quic):
                 if len(got) >= n // 2:
                     break
                 await asyncio.sleep(0.02)
-            assert full, "the burst never filled the datagram ring"
+            assert full
+            assert len(calls) == n + len(full)     # each full one resent
             assert got and all(isinstance(m, ObjectDatagram) for m in got)
             assert session._close_err is None
     finally:
