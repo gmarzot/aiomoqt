@@ -3850,8 +3850,8 @@ class _MOQTSessionMixin:
         """The handler refusing a SUBSCRIBE or FETCH after drain():
         GOING_AWAY from d18, INTERNAL_ERROR before it."""
         rid = int(msg.request_id)
-        code = (RequestErrorCode.GOING_AWAY if self.negotiated_draft >= 18
-                else RequestErrorCode.INTERNAL_ERROR)
+        # A draft without GOING_AWAY sends INTERNAL_ERROR (its error table).
+        code = RequestErrorCode.GOING_AWAY
         reason = "the session is shutting down"
         logger.info(f"MOQT: refusing {type(msg).__name__} {rid}: {reason}")
 
