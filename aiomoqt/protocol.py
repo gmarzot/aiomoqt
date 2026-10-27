@@ -249,6 +249,8 @@ class _MOQTSessionMixin:
     _quiet_token = None
     # We sent a GOAWAY: every later peer request is refused (§10.4).
     _goaway_sent = False
+    # drain(): every later peer SUBSCRIBE and FETCH is refused.
+    _draining = False
     # The peer's control-stream GOAWAY: no new request is sent after it.
     goaway_received: Optional['GoAway'] = None
     # Called as on_goaway(msg, request_id) for each GOAWAY received:
@@ -3938,6 +3940,22 @@ class _MOQTSessionMixin:
                 session._send_on_request_stream(rid, err, fin=True)
         return refuse
 
+    def _drain_refusal(self, msg: MOQTMessage) -> Callable:
+        """The handler refusing a SUBSCRIBE or FETCH after drain():
+        GOING_AWAY from d18, INTERNAL_ERROR before it."""
+        rid = int(msg.request_id)
+        # A draft without GOING_AWAY sends INTERNAL_ERROR (its error table).
+        code = RequestErrorCode.GOING_AWAY
+        reason = "the session is shutting down"
+        logger.info(f"MOQT: refusing {type(msg).__name__} {rid}: {reason}")
+
+        async def refuse(session, _msg):
+            if isinstance(msg, Fetch):
+                session.fetch_error(rid, code, reason)
+            else:
+                session.subscribe_error(rid, code, reason)
+        return refuse
+
     def _update_failed(self, msg: RequestUpdate) -> None:
         """§10.9.1: a failed REQUEST_UPDATE ends the request it updated —
         a track's subscription with PUBLISH_DONE UPDATE_FAILED, a FETCH by
@@ -3970,6 +3988,9 @@ class _MOQTSessionMixin:
                 and is_draft16_or_later(self.negotiated_draft)):
             refusal = self._check_d20_update(msg) if d20 else None
             return refusal or self._refuse_prefix_update(msg)
+        if (self._draining and isinstance(msg, (Subscribe, Fetch))
+                and getattr(msg, 'request_id', None) is not None):
+            return self._drain_refusal(msg)
         if (not is_draft16_or_later(self.negotiated_draft)
                 or not isinstance(msg, self._REQUEST_OPENERS)
                 or getattr(msg, 'request_id', None) is None):
@@ -5842,6 +5863,12 @@ class _MOQTSessionMixin:
                     f"await_publish: dropping announcement for "
                     f"'{name}' (waiting for '{trackname}')")
         return await asyncio.wait_for(_next_matching(), timeout=timeout)
+
+    def drain(self) -> None:
+        """Refuse every SUBSCRIBE and FETCH the peer sends from now on, as
+        a publisher winding down does: error code GOING_AWAY from d18,
+        INTERNAL_ERROR before. Sends nothing itself."""
+        self._draining = True
 
     def goaway(self, new_session_uri: str = "", timeout: int = 0,
                request_id: Optional[int] = None) -> GoAway:
