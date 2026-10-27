@@ -2,6 +2,7 @@
 
 ## v0.14.0
 
+- Malformed input is a protocol error: a control message that does not decode, or an invalid FETCH object (formerly a stream reset), closes the session with PROTOCOL_VIOLATION and a short reason; an Object whose Properties do not parse resets its stream as a malformed track; a length past the message is refused before it is read; invalid UTF-8 in a reason phrase is replaced, not an error.
 - aiomoqt-relay: each subscriber has its own bounded send lane, so a slow subscriber no longer throttles a track for the others or starves a late joiner; past the bound it loses whole groups, their streams reset; status shows each subscriber's lane depth and sheds.
 - A control message that closes the session (such as a request at the MAX_REQUEST_ID ceiling) no longer logs a second close as a parse failure.
 - aiomoqt-relay dashboard: a live track takes the history slot of the track ended longest, so busy relays keep charting their live tracks.

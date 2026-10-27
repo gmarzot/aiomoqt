@@ -35,6 +35,7 @@ from .messages import (
     RequestOk, RequestUpdate, Subscribe, SubscribeNamespace, SubscribeTracks,
     TrackStatus,
 )
+from .messages.base import MOQTMalformedKVP
 from .messages.subscribe import SubscribeOk
 from .types import *
 from .types import (D18MessageType, D20MessageType, FilterType, MOQTDraft, MOQTException,
@@ -1364,7 +1365,7 @@ class _MOQTSessionMixin:
             # in PUBLISH / SUBSCRIBE_OK / FETCH_OK) know where to stop
             # instead of reading past the payload. Other message types
             # accept and ignore it for signature uniformity.
-            msg = message_class.deserialize(buf, prof=self._profile, buf_end=end_pos)
+            msg = message_class.decode(buf, prof=self._profile, buf_end=end_pos)
             # Length is the message extent: a body that parsed past it
             # consumed the next message's bytes.
             if buf.tell() > end_pos:
@@ -1791,6 +1792,13 @@ class _MOQTSessionMixin:
             except MOQTObjectTooLarge as e:
                 self._reject_stream(stream_id, StreamResetCode.EXCESSIVE_LOAD,
                                     str(e))
+                return
+            except MOQTMalformedKVP as e:
+                # d18 §12.7: a Key-Value-Pair that cannot be parsed makes
+                # the track malformed; the session stays up.
+                self._malformed_track(
+                    getattr(state.parser, 'track_alias', None),
+                    e.reason_phrase, stream_id)
                 return
             except MOQTProtocolViolation as e:
                 logger.error(f"MOQT stream({stream_id}): {e.reason_phrase}"
@@ -2445,6 +2453,8 @@ class _MOQTSessionMixin:
         try:
             msg = ObjectDatagram.deserialize(
                 buf, buf.capacity, type_val=dgram_type, prof=self._profile)
+        except MOQTMalformedKVP:
+            raise   # the caller drops the datagram
         except (ValueError, MOQTProtocolViolation) as e:
             msg, error = None, f"datagram: {e}"
         else:
