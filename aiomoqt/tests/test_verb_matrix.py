@@ -11,6 +11,7 @@ The GAPS section pins the verbs the API cannot yet initiate; closing
 one without updating the matrix fails the ratchet on purpose.
 """
 import asyncio
+import logging
 from collections import deque
 
 import pytest
@@ -237,3 +238,25 @@ def test_gap_is_still_open(verb):
     s = _session(18)
     assert not hasattr(s, verb), (
         f"'{verb}' now exists — move it from GAPS into MATRIX")
+
+
+def test_d16_setup_send_log_names_the_draft_not_a_d14_code(caplog):
+    from aiomoqt import protocol
+    lg = protocol.control_log
+    prev = lg.level
+    lg.addHandler(caplog.handler)
+    lg.setLevel(logging.INFO)
+    try:
+        s = _session(16, is_client=False)
+        s._is_wt = False
+        s.server_setup()
+        s.client_setup(versions=[0xff00000e])
+    finally:
+        lg.setLevel(prev)
+        lg.removeHandler(caplog.handler)
+    sent = [r.getMessage() for r in caplog.records
+            if r.getMessage().startswith("MOQT send:")]
+    assert len(sent) == 2
+    for line in sent:
+        assert "0xff00000e" not in line
+        assert line.endswith("draft-16")

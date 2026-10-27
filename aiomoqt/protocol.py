@@ -4279,18 +4279,20 @@ class _MOQTSessionMixin:
         if parameters is None:
             parameters = {}
 
+        if not self._profile.setup_carries_versions:
+            versions = None  # negotiated out of band, not on the wire
         message = ClientSetup(
             versions=versions,
             parameters=parameters
         )
-        control_log.info(f"MOQT send: {self._msgstr(message)}")
+        control_log.info(f"MOQT send: {self._msgstr(message)} draft-{self.negotiated_draft}")
         self.send_control_message(message)
 
         return message
 
     def server_setup(
         self,
-        selected_version: int = MOQT_VERSION_DRAFT14,
+        selected_version: Optional[int] = MOQT_VERSION_DRAFT14,
         parameters: Optional[Dict[int, bytes]] = None
     ) -> ServerSetup:
         """Send SERVER_SETUP message in response to CLIENT_SETUP."""
@@ -4303,11 +4305,13 @@ class _MOQTSessionMixin:
         self._auth_token_cache_max = int(
             parameters.get(SetupParamType.MAX_AUTH_TOKEN_CACHE_SIZE, 0))
 
+        if not self._profile.setup_carries_versions:
+            selected_version = None  # negotiated out of band, not on the wire
         message = ServerSetup(
             selected_version=selected_version,
             parameters=parameters
         )
-        control_log.info(f"MOQT send: {self._msgstr(message)}")
+        control_log.info(f"MOQT send: {self._msgstr(message)} draft-{self.negotiated_draft}")
         self.send_control_message(message)
         return message
 
