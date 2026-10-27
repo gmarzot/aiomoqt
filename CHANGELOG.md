@@ -4,6 +4,7 @@
 
 - Congestion control defaults to `bbr` (BBRv3) in `MOQTClient`, `MOQTServer`, aiomoqt-relay (was `cubic`), the tools and the examples, whichever aiopquic is installed.
 - Datagram tracks publish over WebTransport: `datagram_max_payload()` reports the WT session's ceiling, and `-D` is accepted over `https://`.
+- aiomoqt-relay: a datagram object too large for a subscriber's session is dropped for that subscriber (it no longer raises, or falls back to streams); status counts each session's `dgram_drops`.
 - Malformed input is a protocol error: a control message that does not decode, or an invalid FETCH object (formerly a stream reset), closes the session with PROTOCOL_VIOLATION and a short reason; an Object whose Properties do not parse resets its stream as a malformed track; a length past the message is refused before it is read; invalid UTF-8 in a reason phrase is replaced, not an error.
 - pub_media exits 69 when no relay is reachable or every relay is lost, and 70 on an internal error or a source it cannot read (both were 1); `--help` lists the codes, and a relay that has not answered within 10 s counts as down.
 - pub_media `--stats-json`: `ready` only once a relay is up.

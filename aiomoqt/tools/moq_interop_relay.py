@@ -1290,8 +1290,7 @@ class _RelayedTrack:
         upstream so the downstream sees the publisher's structure. A
         stream short of objects from `start` is reset, never FINed
         (§11.3.2)."""
-        if (isinstance(shape, tuple) and shape and shape[0] == "DGRAM"
-                and not _no_datagrams.get(id(session))):
+        if isinstance(shape, tuple) and shape and shape[0] == "DGRAM":
             prof = session._profile
             is_status = (status or ObjectStatus.NORMAL) != ObjectStatus.NORMAL
             if is_status and not prof.merged_datagram_layout:
@@ -1306,15 +1305,8 @@ class _RelayedTrack:
                     payload=payload or b"",
                     end_of_group=bool(shape[1]),
                     status=status or ObjectStatus.NORMAL)
-            try:
-                session.send_dgram_message(dgram.serialize(prof=prof))
-                return
-            except NotImplementedError:
-                # A transport with no datagram TX: deliver on a subgroup
-                # stream rather than drop objects.
-                _no_datagrams[id(session)] = True
-                logger.warning("relay: no datagram TX on this session, "
-                               "forwarding objects on streams")
+            _send_datagram(session, dgram.serialize(prof=prof), alias, gid, oid)
+            return
         skey = (id(session), gid, sgid)
         if skey in self._stopped:
             return
@@ -1494,7 +1486,7 @@ def _forget_session(session) -> None:
         del _track_sub_filters[k]
     _ns_subs[:] = [e for e in _ns_subs if e[0] is not session]
     _announce_subs[:] = [e for e in _announce_subs if e[0] is not session]
-    _no_datagrams.pop(id(session), None)
+    _dgram_drops.pop(id(session), None)
     _subscribing.pop(id(session), None)
     _cap_warned.difference_update(
         [k for k in _cap_warned if k[0] == id(session)])
@@ -2938,8 +2930,32 @@ def _reply_window(session, reply, largest):
         raw, prof=session._profile), largest)
 
 
-# id(session) -> True once a datagram send proved unsupported there.
-_no_datagrams: dict = {}
+# id(session) -> datagram objects dropped for not fitting that session.
+_dgram_drops: dict = {}
+
+
+def _send_datagram(session, buf, alias, gid, oid) -> None:
+    """Send one datagram object, or drop it silently when it exceeds the
+    session's datagram limit (0 = no datagram TX): an object keeps its
+    forwarding preference, never moving to a stream."""
+    wire = buf.data
+    limit = session.datagram_max_payload()
+    why = f"{len(wire)}B > {limit}B"
+    if len(wire) <= limit:
+        try:
+            session.send_dgram_message(buf)
+            return
+        except (NotImplementedError, ValueError) as e:
+            why = f"{len(wire)}B: {e}"
+    drops = _dgram_drops.get(id(session), 0) + 1
+    _dgram_drops[id(session)] = drops
+    if drops == 1:
+        logger.warning(f"relay: dropping datagram objects that do not fit "
+                       f"this session (alias={alias}, {why})")
+    elif logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"relay: datagram object {gid}.{oid} alias={alias} "
+                     f"dropped ({why})")
+
 
 # (id(session), request_id) -> objects collected from an upstream FETCH.
 _fetch_sinks: dict = {}
@@ -3926,6 +3942,7 @@ class _Status:
                              if delivery and d[2] else None),
                 "namespaces": _session_namespaces(s),
                 "subscriptions": held_subs[id(s)],
+                "dgram_drops": _dgram_drops.get(id(s), 0),
             })
         self._quic_prev = quic
 
