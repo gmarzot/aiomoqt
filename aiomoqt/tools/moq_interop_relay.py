@@ -10,8 +10,10 @@ Limits:
 
   * No authentication, authorization or rate limiting.
   * A per-stream send budget (--max-inflight-bytes) and a send lane per
-    subscriber holding at most LANE_BYTES of live objects: a subscriber
-    that falls further behind loses whole groups, their streams reset.
+    subscriber holding at most LANE_BYTES, counting its queued live
+    objects and what its streams still hold in the transport: a
+    subscriber that falls further behind loses whole groups, their
+    streams reset.
   * Per session, at most --max-namespaces-per-session namespace requests
     (PUBLISH_NAMESPACE, SUBSCRIBE_NAMESPACE, SUBSCRIBE_TRACKS) and
     --max-subscriptions-per-session SUBSCRIBEs held; past either, a
@@ -21,7 +23,12 @@ Limits:
     which drops the oldest group of the least recently used track, never
     the live group of a subscribed one: enough to answer a FETCH,
     standalone or joining, over what it still holds; a late subscriber
-    starts at the live edge.
+    starts at the live edge. Past CACHE_BUDGET_BYTES + CACHE_BYTES the
+    largest live group is dropped and the rest of it goes uncached. A
+    replay owed objects the cache no longer holds resets that subgroup
+    stream rather than FIN it.
+    Cache and lanes charge each object its payload, its properties and
+    a per-record overhead (retained_object_bytes).
   * Upstream Forward State is raised for a forwarding subscriber and
     lowered again once none has forwarded for --pause-after seconds;
     a --catalog-probe catalog keeps flowing.
@@ -88,6 +95,7 @@ from aiomoqt.types import (
     SubscribeDoneCode,
     parse_draft_spec, to_stream_priority,
 )
+from aiomoqt.delivery import retained_object_bytes
 from aiomoqt.messages import FetchHeader, SubgroupHeader
 from aiomoqt.messages.base import MOQTMessage
 from aiomoqt.messages.data import (FETCH_FLAGS_END_TIMED_OUT, FetchObject,
@@ -360,8 +368,13 @@ CACHE_BYTES = 32 * 1024 * 1024
 # Relay-wide cache budget (--cache-bytes).
 CACHE_BUDGET_BYTES = 256 * 1024 * 1024
 
-# Live object bytes a subscriber's send lane holds before it sheds groups.
+# Bytes a subscriber's send lane holds, queued live objects plus what its
+# streams hold in the transport, before it sheds groups.
 LANE_BYTES = 4 * 1024 * 1024
+# Live offers between reads of a lane's transport backlog.
+LANE_TX_PROBE = 8
+# Seconds between a subscriber's shed log lines after its first.
+SHED_LOG_S = 10.0
 # Requests one session may hold open; see the module docstring.
 MAX_NAMESPACES_PER_SESSION = 256
 MAX_SUBSCRIPTIONS_PER_SESSION = 1024
@@ -384,6 +397,17 @@ def _stream_band(session, priority) -> int:
     return to_stream_priority(priority, discipline=getattr(
         session, 'stream_scheduling', STREAM_SCHEDULING))
 
+
+def _no_tx(_stream_id) -> int:
+    return 0
+
+
+def _tx_used(session):
+    """The session's per-stream count of bytes queued in the transport."""
+    quic = getattr(session, "_quic", None)
+    return getattr(quic, "tx_data_ring_used", None) or _no_tx
+
+
 # MAX_FILTER_RANGES advertised at d20+ (§9.1.6).
 MAX_FILTER_RANGES = 16
 
@@ -396,7 +420,7 @@ class _Downstream:
 
     __slots__ = ("session", "alias", "request_id", "forward", "window",
                  "joined_at", "replaying", "location_filter", "group_order",
-                 "fills", "range_params", "filters", "lane")
+                 "fills", "range_params", "filters", "lane", "lost")
 
     def __init__(self, session, alias, request_id, forward=True,
                  window=_UNFILTERED):
@@ -424,6 +448,9 @@ class _Downstream:
         self.filters = None
         # Its _SendLane, created with the first object for it.
         self.lane = None
+        # Groups whose replay lacked objects it was owed: their streams
+        # end in a reset.
+        self.lost = ()
 
     def set_filters(self, params, track_properties) -> None:
         self.range_params = params
@@ -467,6 +494,8 @@ class _CacheBudget:
         self.lru: OrderedDict = OrderedDict()
         self.bytes = 0
         self.evictions = 0
+        # Live groups dropped at the hard ceiling.
+        self.truncations = 0
         self._overrun = False
 
     def touch(self, track) -> None:
@@ -481,6 +510,13 @@ class _CacheBudget:
     def enforce(self) -> None:
         while self.bytes > CACHE_BUDGET_BYTES:
             victim = next((t for t in self.lru if t._evictable()), None)
+            if victim is None and self.bytes > CACHE_BUDGET_BYTES + CACHE_BYTES:
+                largest = max(self.lru, key=lambda t: t._cache_bytes,
+                              default=None)
+                if largest is not None:
+                    largest._truncate_live()
+                    self.truncations += 1
+                    continue
             if victim is None:
                 if not self._overrun:
                     self._overrun = True
@@ -518,10 +554,15 @@ class _SendLane:
         self.items: deque = deque()
         self.bytes = 0           # live object bytes queued
         self.replay_bytes = 0    # cache replay bytes queued, not bounded
+        self.tx_bytes = 0        # held by the transport, as last read
+        self._probe_gid = None
+        self._probe_n = 0
         self.objects = 0
         self.floor = None        # objects of groups below it are shed
         self.shed = 0            # objects shed
         self.sheds = 0           # shed episodes
+        self._logged_at = None
+        self._logged_sheds = 0
         self.shedding = False
         self.final = False       # PUBLISH_DONE queued: takes nothing more
         self.busy = False        # a write is in progress
@@ -551,21 +592,32 @@ class _SendLane:
             self.replay_bytes += sign * item[1]
 
     def offer(self, gid, live, sgid, oid, payload, exts, prio, status,
-              shape, encoded=None) -> None:
+              shape, encoded=None, cost=None) -> None:
         """Queue an object or stream end for group `gid`; `live` objects
-        count against LANE_BYTES, a cache replay does not."""
+        count against LANE_BYTES, a cache replay does not. `cost` is the
+        object's retained_object_bytes, when already known."""
         if self.stopped or self.final:
             return
         if self.floor is not None and gid < self.floor:
             if oid is not None:
                 self.shed += 1
             return
-        item = (gid, len(payload or b""), live, sgid, oid, payload, exts,
-                prio, status, shape, encoded)
+        if oid is None:
+            cost = 0
+        elif cost is None:
+            cost = retained_object_bytes(payload, exts)
+        item = (gid, cost, live, sgid, oid, payload, exts, prio, status,
+                shape, encoded)
         self._count(item, 1)
         self._put(item)
-        if live and self.bytes > LANE_BYTES:
-            self._shed(gid)
+        if live:
+            if gid != self._probe_gid or self._probe_n >= LANE_TX_PROBE:
+                self._probe_gid, self._probe_n = gid, 0
+                self.tx_bytes = self.track._tx_queued(self.d.session,
+                                                      self.floor)
+            self._probe_n += 1
+            if self.bytes + self.tx_bytes > LANE_BYTES:
+                self._shed(gid)
 
     def _drop_below(self, floor) -> None:
         kept = deque()
@@ -583,9 +635,12 @@ class _SendLane:
         is over the bound; their open streams are reset first."""
         floor = gid
         self._drop_below(floor)
-        if self.bytes > LANE_BYTES:
+        session = self.d.session
+        self.tx_bytes = self.track._tx_queued(session, floor)
+        if self.bytes + self.tx_bytes > LANE_BYTES:
             floor = gid + 1
             self._drop_below(floor)
+            self.tx_bytes = self.track._tx_queued(session, floor)
         self.floor = floor if self.floor is None else max(self.floor, floor)
         if not self._cut:
             self._cut = True
@@ -594,12 +649,27 @@ class _SendLane:
         if not self.shedding:
             self.shedding = True
             self.sheds += 1
-            d = self.d
+            self._log_shed()
+
+    def _log_shed(self) -> None:
+        """WARNING on the first shed, then one INFO line per SHED_LOG_S
+        with the episodes since the last line."""
+        now = time.monotonic()
+        if self._logged_at is not None and now - self._logged_at < SHED_LOG_S:
+            return
+        d = self.d
+        who = (f"relay: {self.track.key} subscriber "
+               f"{_peer_address(d.session)} request {d.request_id}")
+        if self._logged_at is None:
             logger.warning(
-                f"relay: {self.track.key} subscriber "
-                f"{_peer_address(d.session)} request {d.request_id} over "
-                f"its {LANE_BYTES}-byte send lane: resetting groups below "
+                f"{who} over its {LANE_BYTES}-byte send lane: resetting "
+                f"groups below {self.floor}")
+        else:
+            logger.info(
+                f"{who} shed {self.sheds - self._logged_sheds} more "
+                f"time(s) over its send lane: resetting groups below "
                 f"{self.floor}")
+        self._logged_at, self._logged_sheds = now, self.sheds
 
     def close_streams(self) -> None:
         """FIN the subscriber's open streams once what is queued is out."""
@@ -621,7 +691,7 @@ class _SendLane:
         self.stopped = True
         lost = self.objects > 0 or self.busy
         self.items.clear()
-        self.bytes = self.replay_bytes = self.objects = 0
+        self.bytes = self.replay_bytes = self.objects = self.tx_bytes = 0
         self._wake.set()
         if self.task is not asyncio.current_task():
             self.task.cancel()
@@ -668,13 +738,13 @@ class _SendLane:
         if not _session_live(d.session):
             track.drop_session(d.session)
             return False
-        (gid, size, _live, sgid, oid, payload, exts, prio, status, shape,
+        (gid, _cost, _live, sgid, oid, payload, exts, prio, status, shape,
          encoded) = item
         self.busy = True
         try:
             await track._forward_one(d.session, d.alias, gid, sgid, oid,
                                      payload, exts, prio, status, shape,
-                                     encoded, start=d.start)
+                                     encoded, start=d.start, lost=d.lost)
         except (Exception, asyncio.CancelledError):
             if _cancelling():
                 raise
@@ -687,7 +757,7 @@ class _SendLane:
             self.busy = False
         if oid is not None:
             track._objects_out += 1
-            track._bytes_out += size
+            track._bytes_out += len(payload or b"")
         return True
 
 
@@ -729,6 +799,9 @@ class _RelayedTrack:
         self.attaching = False
         # (id(session), group, subgroup) -> (stream_id, SubgroupHeader)
         self._streams = {}
+        # id(session) -> {(group, subgroup): stream_id} of the streams
+        # opened, kept past FIN until the transport has drained them.
+        self._tx_streams: dict = {}
         # id(session) -> subgroup streams opened (PUBLISH_DONE count)
         self._sent_streams = {}
         # (id(session), group, subgroup) whose stream the subscriber
@@ -747,6 +820,12 @@ class _RelayedTrack:
         # Objects cached per group ID; the bound counts groups, as IDs
         # may skip.
         self._groups = {}
+        # Live group dropped at the relay's hard ceiling: the rest of it
+        # is not cached.
+        self._uncached = None
+        # Group -> largest Object ID dropped from, or never put in, the
+        # cache.
+        self._lost = {}
         # (group, subgroup) whose upstream stream ended cleanly; a replay
         # FINs them on the subscriber it serves.
         self._ended = set()
@@ -837,6 +916,8 @@ class _RelayedTrack:
         self.downstream.clear()
         for k in [k for k in self._streams if k[0] not in draining]:
             self._streams.pop(k, None)
+        for k in [k for k in self._tx_streams if k not in draining]:
+            del self._tx_streams[k]
 
     def _lane(self, d) -> _SendLane:
         if d.lane is None:
@@ -908,6 +989,8 @@ class _RelayedTrack:
     def _close_streams(self, session, reset_code=None) -> None:
         """FIN the session's open streams, or reset them with
         `reset_code`."""
+        if reset_code is not None:
+            self._tx_streams.pop(id(session), None)
         for k, (sid, _hdr) in list(self._streams.items()):
             if k[0] == id(session):
                 if reset_code is None:
@@ -917,11 +1000,38 @@ class _RelayedTrack:
                 self._streams.pop(k, None)
 
     def _reset_streams(self, session, below) -> None:
-        """Reset the session's open streams of groups below `below`."""
+        """Reset the session's streams of groups below `below`: open ones,
+        and FINed ones the transport has not yet sent out."""
+        sk = id(session)
+        tx = self._tx_streams.get(sk) or {}
+        used = _tx_used(session)
+        for k, sid in list(tx.items()):
+            if k[0] < below:
+                del tx[k]
+                if (sk, *k) not in self._streams and used(sid):
+                    session.stream_reset(sid, StreamResetCode.CANCELLED)
         for k, (sid, _hdr) in list(self._streams.items()):
-            if k[0] == id(session) and k[1] < below:
+            if k[0] == sk and k[1] < below:
                 session.stream_reset(sid, StreamResetCode.CANCELLED)
                 self._streams.pop(k, None)
+
+    def _tx_queued(self, session, floor=None) -> int:
+        """Bytes the transport still holds on the session's streams of
+        this track, groups below `floor` excepted. Drained FINed streams
+        are forgotten."""
+        tx = self._tx_streams.get(id(session))
+        if not tx:
+            return 0
+        sk = id(session)
+        used = _tx_used(session)
+        total = 0
+        for k, sid in list(tx.items()):
+            n = used(sid)
+            if not n and (sk, *k) not in self._streams:
+                del tx[k]
+            elif floor is None or k[0] >= floor:
+                total += n
+        return total
 
     def _end(self, d, status_code, reset_code, reason) -> None:
         """FIN (or reset) a subscriber's open streams, then PUBLISH_DONE.
@@ -1127,6 +1237,7 @@ class _RelayedTrack:
             self._streams.pop(k, None)
         self._stopped = {k for k in self._stopped if k[0] != id(session)}
         self._sent_streams.pop(id(session), None)
+        self._tx_streams.pop(id(session), None)
 
     async def _forward_loop(self):
         while True:
@@ -1152,8 +1263,11 @@ class _RelayedTrack:
                 if (gid, oid) in self._backfilled:
                     self._backfilled.discard((gid, oid))
                     continue
+                cost = retained_object_bytes(payload, exts)
                 self._remember(gid, sgid, oid, payload, exts, prio, status,
-                               shape)
+                               shape, cost)
+            else:
+                cost = 0
             encoded = {}
             for d in list(self.downstream):
                 if d.replaying:
@@ -1176,18 +1290,27 @@ class _RelayedTrack:
                         out = (None, None, None, "END", None)
                 o_oid, o_payload, o_exts, o_status, o_shape = out
                 self._lane(d).offer(gid, True, sgid, o_oid, o_payload,
-                                    o_exts, prio, o_status, o_shape, encoded)
+                                    o_exts, prio, o_status, o_shape, encoded,
+                                    cost)
                 if (oid is not None and d.window[1] == gid and status in (
                         ObjectStatus.END_OF_GROUP, ObjectStatus.END_OF_TRACK)):
                     self.end_downstream(d)
 
     def _remember(self, gid, sgid, oid, payload, exts, prio, status,
-                  shape=None) -> None:
+                  shape=None, cost=None) -> None:
         """Keep one object, with its stream shape or datagram mode, for a
         later FETCH or replay, dropping oldest past the bound."""
+        if self._uncached is not None:
+            if gid == self._uncached:
+                self.note_largest((gid, oid))
+                self._note_lost(gid, oid)
+                return
+            if gid > self._uncached:
+                self._uncached = None
         self._cache.append((gid, sgid, oid, payload, exts, prio, status,
                             shape))
-        size = len(payload or b"")
+        size = (retained_object_bytes(payload, exts) if cost is None
+                else cost)
         self._cache_bytes += size
         _budget.bytes += size
         self._groups[gid] = self._groups.get(gid, 0) + 1
@@ -1201,7 +1324,8 @@ class _RelayedTrack:
         while self._cache and (len(self._groups) > CACHE_GROUPS
                                or self._cache_bytes > CACHE_BYTES):
             dropped = self._cache.popleft()
-            size = len(dropped[3] or b"")
+            size = retained_object_bytes(dropped[3], dropped[4])
+            self._note_lost(dropped[0], dropped[2])
             self._cache_bytes -= size
             _budget.bytes -= size
             left = self._groups.pop(dropped[0]) - 1
@@ -1221,10 +1345,29 @@ class _RelayedTrack:
     def _drop_oldest_group(self) -> None:
         """Drop every cached object of the oldest group, so the cache
         stays a contiguous run of the newest groups."""
-        oldest = min(self._groups)
-        size = sum(len(c[3] or b"") for c in self._cache if c[0] == oldest)
-        self._cache = deque(c for c in self._cache if c[0] != oldest)
-        del self._groups[oldest]
+        self._drop_group(min(self._groups))
+
+    def _truncate_live(self) -> None:
+        """At the relay's hard ceiling: drop the newest cached group and
+        cache none of the rest of it. Live delivery is unaffected."""
+        gid = max(self._groups)
+        logger.warning(
+            f"relay: cache {_budget.bytes} bytes over its "
+            f"{CACHE_BUDGET_BYTES + CACHE_BYTES}-byte ceiling: dropping "
+            f"live group {gid} of {self.key} ({self._cache_bytes} bytes)")
+        self._uncached = gid
+        self._drop_group(gid)
+
+    def _note_lost(self, gid, oid) -> None:
+        if oid > self._lost.get(gid, -1):
+            self._lost[gid] = oid
+
+    def _drop_group(self, gid) -> None:
+        size = sum(retained_object_bytes(c[3], c[4]) for c in self._cache
+                   if c[0] == gid)
+        self._note_lost(gid, max(c[2] for c in self._cache if c[0] == gid))
+        self._cache = deque(c for c in self._cache if c[0] != gid)
+        del self._groups[gid]
         self._cache_bytes -= size
         _budget.bytes -= size
         self._prune()
@@ -1232,6 +1375,9 @@ class _RelayedTrack:
     def _prune(self) -> None:
         """Forget per-group state below the oldest cached group; an
         empty cache leaves the budget's LRU."""
+        floor = (self._cache[0][0] if self._cache
+                 else self.largest[0] if self.largest else 0)
+        self._lost = {g: o for g, o in self._lost.items() if g >= floor}
         if not self._cache:
             _budget.forget(self)
         else:
@@ -1250,6 +1396,7 @@ class _RelayedTrack:
         d.replaying = False
         if d not in self.downstream:
             return
+        d.lost = {g for g, o in self._lost.items() if (g, o) >= d.start}
         objs = sorted((c for c in self._cache if d.passes(c[0], c[2])
                        and d.admits(c[1], c[2], c[5], c[4])),
                       key=lambda c: (c[0], c[1], c[2]))
@@ -1308,7 +1455,7 @@ class _RelayedTrack:
 
     async def _forward_one(self, session, alias, gid, sgid, oid,
                            payload, exts, prio, status=None, shape=None,
-                           encoded=None, start=None):
+                           encoded=None, start=None, lost=()):
         """Write one object downstream, opening the (group, subgroup)
         stream on first sight. Group/subgroup identity is preserved from
         upstream so the downstream sees the publisher's structure. A
@@ -1368,11 +1515,14 @@ class _RelayedTrack:
             session.stream_write(stream_id, header.serialize().data)
             entry = (stream_id, header)
             self._streams[skey] = entry
+            self._tx_streams.setdefault(id(session), {})[(gid, sgid)] = \
+                stream_id
             self._sent_streams[id(session)] = \
                 self._sent_streams.get(id(session), 0) + 1
         stream_id, header = entry
         if status in ("END", ObjectStatus.END_OF_GROUP,
-                      ObjectStatus.END_OF_TRACK) and self._short(gid, start):
+                      ObjectStatus.END_OF_TRACK) and (
+                          gid in lost or self._short(gid, start)):
             session.stream_reset(stream_id, StreamResetCode.INTERNAL_ERROR)
             self._streams.pop(skey, None)
             return
@@ -1816,7 +1966,7 @@ async def _backfill(track, msg, largest) -> None:
            for o in objs if (o.group_id, o.object_id) not in held]
     track._cache = deque(sorted([*new, *track._cache],
                                 key=lambda c: (c[0], c[2])))
-    size = sum(len(c[3]) for c in new)
+    size = sum(retained_object_bytes(c[3], c[4]) for c in new)
     track._cache_bytes += size
     _budget.bytes += size
     for c in new:
@@ -4032,6 +4182,7 @@ class _Status:
                     "lane_bytes": (lane.bytes + lane.replay_bytes
                                    if (lane := d.lane) else 0),
                     "lane_objects": lane.objects if lane else 0,
+                    "lane_tx_bytes": lane.tx_bytes if lane else 0,
                     "shed_objects": lane.shed if lane else 0,
                     "shed_episodes": lane.sheds if lane else 0,
                     "since": info["since"] if info else None})
@@ -4178,6 +4329,7 @@ class _Status:
             "cache_budget": CACHE_BUDGET_BYTES,
             "cache_bytes": _budget.bytes,
             "cache_evictions": _budget.evictions,
+            "cache_truncations": _budget.truncations,
             "loss_pct": round(100 * lost / sent, 2) if sent else 0.0,
             "rtt_p50_ms": relay_status.percentile(rtts, 50),
             "rtt_p99_ms": relay_status.percentile(rtts, 99),

@@ -8,7 +8,7 @@ import contextlib
 import pytest
 
 from aiomoqt.client import MOQTClient
-from aiomoqt.delivery import MAX_OBJECT_ID, ObjectHistory
+from aiomoqt.delivery import MAX_OBJECT_ID, OBJECT_RECORD_BYTES, ObjectHistory
 from aiomoqt.messages.data import FETCH_FLAGS_END_UNKNOWN
 from aiomoqt.server import MOQTServer
 from aiomoqt.track import PublishedTrack
@@ -50,7 +50,7 @@ def test_history_keeps_the_first_record_of_a_location():
 
 @pytest.mark.parametrize("descending", [False, True])
 def test_dropped_objects_are_marked_unknown(descending):
-    h = _filled(cap=4 * (10 + 64))           # room for 4 of the 6 objects
+    h = _filled(cap=4 * (10 + OBJECT_RECORD_BYTES))           # room for 4 of the 6 objects
     assert len(h) == 4 and h.evicted_through == (0, 1)
     got = h.fetch((0, 0), (2, 1), descending=descending)
     marker = got[-1] if descending else got[0]
@@ -62,7 +62,7 @@ def test_dropped_objects_are_marked_unknown(descending):
 
 def test_out_of_order_adds_evict_oldest_first_and_track_the_largest():
     # Parallel subgroups publish a group's objects out of id order.
-    h = ObjectHistory(3 * (10 + 64))
+    h = ObjectHistory(3 * (10 + OBJECT_RECORD_BYTES))
     for loc in [(0, 1), (0, 0), (0, 3), (0, 2), (1, 0)]:
         h.add(*loc, b"x" * 10)
     assert len(h) == 3 and h.evicted_through == (0, 1)
@@ -72,7 +72,7 @@ def test_out_of_order_adds_evict_oldest_first_and_track_the_largest():
 
 
 def test_a_duplicate_of_a_dropped_location_is_not_served():
-    h = ObjectHistory(2 * (10 + 64))
+    h = ObjectHistory(2 * (10 + OBJECT_RECORD_BYTES))
     h.add(0, 0, b"a" * 10)
     h.add(0, 1, b"b" * 10)
     h.add(0, 0, b"c" * 10)                  # pushes out the first (0, 0)
@@ -97,7 +97,7 @@ def test_a_whole_group_fetch_of_an_evicted_group_ends_at_a_valid_location():
 
 
 def test_a_whole_group_marker_ends_at_the_groups_last_held_object():
-    h = ObjectHistory(3 * (10 + 64))
+    h = ObjectHistory(3 * (10 + OBJECT_RECORD_BYTES))
     for loc in [(0, 0), (0, 1), (1, 0), (0, 2)]:
         h.add(*loc, b"x" * 10)
     assert h.evicted_through == (0, 0) and h.last_object(0) == 2
@@ -165,8 +165,10 @@ async def _loopback(port, use_quic, prefill=3, draft=18, held_groups=None):
             await pub.client_session_init()
             tracks = {}
             for name, size in _SIZES.items():
+                # Each object also carries one integer property: 16 B.
                 kw = {} if held_groups is None else {
-                    "fetch_history_bytes": held_groups * _GROUP * (size + 64)}
+                    "fetch_history_bytes": held_groups * _GROUP
+                    * (size + 16 + OBJECT_RECORD_BYTES)}
                 track = PublishedTrack(pub, namespace=_NS, trackname=name,
                                        object_size=size, group_size=_GROUP,
                                        rate=200, **kw)
