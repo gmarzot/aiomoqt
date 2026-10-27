@@ -135,6 +135,8 @@ class BenchState:
     stop: asyncio.Event = field(default_factory=asyncio.Event)
     ceiling_reason: Optional[str] = None
     ceiling_mbps: Optional[float] = None
+    received_data: bool = False
+    failed: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -514,7 +516,7 @@ class SubsActuator:
                  sub_filter: FilterType = FilterType.LATEST_OBJECT,
                  interval_s: float = 5.0,
                  stagger: float = 0.1,
-                 keep_alive_interval: float | None = None):
+                 transport_options: Optional[dict] = None):
         self.relay_url = relay_url
         self.namespace = namespace
         self.trackname = trackname
@@ -541,7 +543,7 @@ class SubsActuator:
         # decoupled from interval_s so handshake spacing is tunable
         # without changing the report cadence.
         self.stagger = stagger
-        self.keep_alive_interval = keep_alive_interval
+        self.transport_options = dict(transport_options or {})
         # Each worker process hosts a BATCH of subscriptions and
         # self-heals individual drops internally. --step-subs doubles as
         # the batch size K: one worker == one group of K subs, so the
@@ -622,7 +624,7 @@ class SubsActuator:
                 insecure=self.insecure,
                 force_quic=self.force_quic,
                 sub_filter=int(self.sub_filter),
-                keep_alive_interval=self.keep_alive_interval,
+                **self.transport_options,
             )
             from aiomoqt.utils.workers import sub_batch_worker_entry
             p = self._mp.Process(
@@ -938,6 +940,7 @@ class AIMDController:
 
             sig = await a.observe()
             self.samples += 1
+            state.received_data |= sig.rx_mbps > 0
 
             if self.samples < 2:
                 self._emit(sig, "warming")
@@ -951,6 +954,7 @@ class AIMDController:
                 if self.no_data_streak >= 3 * self._tpr:
                     state.ceiling_reason = ("no data received — subscribe "
                                             "failed or publisher stalled")
+                    state.failed = True
                     self._emit(sig, "ABORT: rx=0", force=True)
                     state.stop.set()
                     return
@@ -1326,12 +1330,7 @@ async def run_loopback_server(args, state: BenchState):
         host="localhost", port=args.port,
         certificate=args.cert, private_key=args.key,
         path="",
-        congestion_control_algorithm=args.cc_algo,
-        tx_max_queued_bytes=args.max_queued_bytes,
-        **({'tx_max_inflight_bytes':
-            (None if args.max_inflight_bytes == 0
-             else args.max_inflight_bytes)}
-           if args.max_inflight_bytes is not None else {}),
+        **_cli.transport_kwargs(args),
     )
     server.register_handler(
         MOQTMessageType.SUBSCRIBE, partial(_on_subscribe))
@@ -1353,7 +1352,7 @@ async def run_subscriber_client(host: str, port: int, path: str,
         use_quic=use_quic,
         verify_tls=verify_tls,
         supported_drafts=args.draft,
-        congestion_control_algorithm=args.cc_algo,
+        **_cli.transport_kwargs(args),
     )
     try:
         async with client.connect() as session:
@@ -1388,92 +1387,6 @@ async def run_subscriber_client(host: str, port: int, path: str,
             session.close()
     except Exception as e:
         print(f"  subscriber error: {e}")
-        state.stop.set()
-
-
-# ---------------------------------------------------------------------------
-# Relay-mode publisher: a second MOQTClient that publishes bench.load at
-# a rate driven by state.rate_ops. Used when -r URL is passed (no local
-# loopback server).
-# ---------------------------------------------------------------------------
-
-async def run_publisher_client(host: str, port: int, path: str,
-                               use_quic: bool, verify_tls: bool,
-                               args,
-                               state: BenchState):
-    client = MOQTClient(
-        host, port,
-        path=path,
-        use_quic=use_quic,
-        verify_tls=verify_tls,
-        supported_drafts=args.draft,
-        congestion_control_algorithm=args.cc_algo,
-        tx_max_queued_bytes=args.max_queued_bytes,
-        **({'tx_max_inflight_bytes':
-            (None if args.max_inflight_bytes == 0
-             else args.max_inflight_bytes)}
-           if args.max_inflight_bytes is not None else {}),
-    )
-    try:
-        async with client.connect() as session:
-            await session.client_session_init()
-            # PublishedTrack.rate is AGGREGATE across subgroups — no
-            # pre-division (the track divides in its send loop).
-            track = PublishedTrack(
-                session,
-                namespace=args.namespace,
-                trackname=args.trackname,
-                object_size=args.scenario.object_size,
-                group_size=args.group_size,
-                num_subgroups=args.scenario.subgroups,
-                rate=state.rate_ops,
-            )
-            track._quiet = True
-            track._stats_header_printed = True
-
-            async def _rate_sync():
-                last = -1.0
-                last_bytes = track._total_bytes
-                last_t = time.monotonic()
-                tick = 0
-                while not state.stop.is_set():
-                    await asyncio.sleep(0.05)
-                    if state.rate_ops != last:
-                        track.rate = (state.rate_ops
-                                      / max(1, args.scenario.subgroups))
-                        last = state.rate_ops
-                    tick += 1
-                    if tick >= 20:  # ~1s at 50ms tick
-                        tick = 0
-                        now = time.monotonic()
-                        cur_bytes = track._total_bytes
-                        dt = now - last_t
-                        if dt > 0:
-                            state.tx_rate_mbps = (cur_bytes - last_bytes) \
-                                * 8.0 / (dt * 1e6)
-                        last_t = now
-                        last_bytes = cur_bytes
-
-            sync = asyncio.create_task(_rate_sync())
-            try:
-                await track.publish(
-                    announce_namespace=(args.pub_ns or args.pub_both),
-                    publish_track=(not args.pub_ns or args.pub_both),
-                )
-                # Keep the session alive until the controller stops us.
-                # track.publish() only emits PUB_NS / PUBLISH; data flow
-                # happens in response to incoming SUBSCRIBE.
-                while not state.stop.is_set():
-                    await asyncio.sleep(0.2)
-            finally:
-                sync.cancel()
-                try:
-                    await sync
-                except (asyncio.CancelledError, Exception):
-                    pass
-                session.close()
-    except Exception as e:
-        print(f"  publisher error: {e}")
         state.stop.set()
 
 
@@ -1712,6 +1625,7 @@ def _print_banner(args):
         cli_name = args.sub_filter.name.lower().replace("_", "-")
         print(f"  subscribe filter:   {cli_name}")
     print(f"  latency threshold:  {args.latency_threshold:.0f} ms")
+    print(f"  transport:          {_cli.describe_transport(args)}")
     print("─" * 68)
     print()
     print()
@@ -1758,7 +1672,8 @@ async def _run_fixed_publisher(args) -> int:
         num_subgroups=args.scenario.subgroups,
         initial_rate_ops=args.scenario.aggregate_ops(args.sub_mbps),
         pub_ns=args.pub_ns, pub_both=args.pub_both,
-        debug=args.debug, keep_alive_interval=args.keepalive,
+        debug=args.debug,
+        **_cli.transport_kwargs(args),
     )
     proc = mp.Process(target=pub_worker_entry,
                       args=(cfg, stop, rate_q, events_q), daemon=True)
@@ -1768,25 +1683,47 @@ async def _run_fixed_publisher(args) -> int:
     print(f"    moq-adaptive-bench {args.relay_url} --mode subs "
           f"--role sub -N {args.namespace} -T {args.trackname} "
           f"--sub-mbps {args.sub_mbps}")
+    published = failed = interrupted = False
+
+    def drain_health():
+        nonlocal published, failed
+        from queue import Empty
+        while True:
+            try:
+                event = events_q.get_nowait()
+            except Empty:
+                break
+            if event.get('kind') == 'pub_stats':
+                published = True
+            elif event.get('kind') == 'pub_health':
+                published |= event.get('state') == 'published'
+                failed |= event.get('state') == 'failed'
+
     try:
         deadline = (time.monotonic() + args.duration
                     if args.duration else None)
         while proc.is_alive():
+            drain_health()
+            if failed:
+                break
             if deadline and time.monotonic() >= deadline:
                 break
             await asyncio.sleep(0.5)
     except (KeyboardInterrupt, asyncio.CancelledError):
-        pass
+        interrupted = True
     finally:
         stop.set()
         proc.join(timeout=5.0)
         if proc.is_alive():
             proc.terminate()
             proc.join(timeout=2.0)
+        drain_health()
         for q in (events_q, rate_q):
             q.cancel_join_thread()
     print("  publisher stopped")
-    return 0
+    if interrupted:
+        return 130
+    return int(failed or not published or proc.exitcode != 0)
 
 
 async def main():
@@ -1847,7 +1784,7 @@ async def main():
             sub_filter=args.sub_filter,
             interval_s=args.scenario.interval_s,
             stagger=args.stagger,
-            keep_alive_interval=args.keepalive,
+            transport_options=_cli.transport_kwargs(args),
         )
     else:
         # BW mode. SP loopback runs publisher + subscriber as in-process
@@ -1890,6 +1827,7 @@ async def main():
                     initial_rate_ops=args.scenario.aggregate_ops(
                         args.scenario.start_mbps),
                     debug=args.debug,
+                    **_cli.transport_kwargs(args),
                 )
                 sub_cfg = dict(
                     sub_id=0,
@@ -1901,6 +1839,7 @@ async def main():
                     force_quic=False,
                     sub_filter=int(FilterType.LATEST_OBJECT),
                     debug=args.debug,
+                    **_cli.transport_kwargs(args),
                 )
                 pub_proc = mp.Process(
                     target=loopback_server_entry,
@@ -1925,6 +1864,7 @@ async def main():
                     debug=args.debug,
                     keylogfile=(f"{args.keylogfile}.pub"
                                 if args.keylogfile else None),
+                    **_cli.transport_kwargs(args),
                 )
                 sub_cfg = dict(
                     sub_id=0,
@@ -1938,6 +1878,7 @@ async def main():
                     debug=args.debug,
                     keylogfile=(f"{args.keylogfile}.sub"
                                 if args.keylogfile else None),
+                    **_cli.transport_kwargs(args),
                 )
                 pub_proc = mp.Process(
                     target=pub_worker_entry,
@@ -1981,6 +1922,7 @@ async def main():
     subs_pub_proc = None
     subs_pub_stop = None
     lag_task = None
+    interrupted = False
     try:
         if relay_mode or (args.mode == "bw" and args.mp_loopback):
             if args.mode == "bw" and pub_proc is not None and sub_proc is not None:
@@ -2052,7 +1994,7 @@ async def main():
                     pub_ns=args.pub_ns,
                     pub_both=args.pub_both,
                     debug=args.debug,
-                    keep_alive_interval=args.keepalive,
+                    **_cli.transport_kwargs(args),
                 )
                 subs_pub_proc = mp.Process(
                     target=pub_worker_entry,
@@ -2130,7 +2072,7 @@ async def main():
         try:
             await ctrl_task
         except asyncio.CancelledError:
-            pass
+            interrupted = True
     finally:
         state.stop.set()
         if lag_task is not None:
@@ -2176,7 +2118,9 @@ async def main():
         if csv_file:
             csv_file.close()
         _print_summary(state, controller, controller.samples, args)
-    return 0
+    if interrupted:
+        return 130
+    return int(state.failed or not state.received_data)
 
 
 def cli():
@@ -2185,10 +2129,8 @@ def cli():
         sys.exit(asyncio.run(main()))
     except KeyboardInterrupt:
         print("\n  Interrupted.")
+        sys.exit(130)
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(asyncio.run(main()))
-    except KeyboardInterrupt:
-        print("\n  Interrupted.")
+    cli()

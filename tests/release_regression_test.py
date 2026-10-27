@@ -541,21 +541,24 @@ def _moqdev_smoke(keys: str, out: Path,
 # ---------------------------------------------------------------------------
 def _loopback_adaptive_bench(log_dir: Path) -> tuple[str, str]:
     log = log_dir / "loopback-adaptive-bench.log"
-    # Loopback self-test: short ramp, kill after ~30s so the runner
-    # isn't held open by the forever-probing controller.
-    cmd = ["timeout", "--signal=INT", "--kill-after=3", "30",
+    # Loopback self-test, capped by -t; timeout is the backstop.
+    cmd = ["timeout", "--signal=INT", "--kill-after=3", "40",
            sys.executable, "-m", "aiomoqt.tools.adaptive_bench",
            "--start-mbps", "10", "--step-mbps", "10",
-           "--max-mbps", "500", "--interval", "3",
+           "--max-mbps", "500", "--interval", "3", "-t", "30",
            "--latency-threshold", "100", "-k"]
-    _run(cmd, log, 45)
+    rc = _run_rc(cmd, log, 55)
     text = log.read_text()
-    # fmt_bps emits e.g. "80Mbps" or "1.2Gbps" (no space) — match both
-    # space-and-no-space forms.
+    # fmt_bps emits e.g. "80Mbps" or "1.2Gbps" (no space).
     m = re.search(r"High-water:\s+([\d.]+)\s*([KMGT]?bps)", text)
-    if m:
-        return "PASS", f"high-water {m.group(1)} {m.group(2)}"
-    return "FAIL", "(no summary — check log)"
+    if rc != 0:
+        return "FAIL", f"exit {rc}" + (f", high-water {m.group(1)} {m.group(2)}"
+                                        if m else "")
+    if not m:
+        return "FAIL", "(no summary — check log)"
+    if float(m.group(1)) <= 0:
+        return "FAIL", f"high-water {m.group(1)} {m.group(2)}"
+    return "PASS", f"high-water {m.group(1)} {m.group(2)}"
 
 
 # ---------------------------------------------------------------------------

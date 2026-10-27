@@ -131,6 +131,14 @@ def _post(q, msg):
         pass
 
 
+def _transport_options(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Forward explicit transport settings, retaining None to disable a budget."""
+    return {key: config[key] for key in (
+        'congestion_control_algorithm', 'tx_max_queued_bytes',
+        'tx_max_inflight_bytes', 'keep_alive_interval',
+    ) if key in config}
+
+
 async def _subscriber_task(config: Dict[str, Any], mp_stop_event,
                            events_queue):
     sub_id = config['sub_id']
@@ -143,8 +151,8 @@ async def _subscriber_task(config: Dict[str, Any], mp_stop_event,
         verify_tls=not config.get('insecure', False),
         supported_drafts=config.get('draft'),
         keylog_filename=config.get('keylogfile'),
-        keep_alive_interval=config.get('keep_alive_interval'),
         libquicr_compat=apply_compat(config.get('compat')),
+        **_transport_options(config),
     )
 
     stop_ev = _bridge_stop_event(mp_stop_event)
@@ -329,8 +337,8 @@ async def _slot_supervisor(config, relay, stop_ev, stats, state,
                 use_quic=relay.use_quic,
                 verify_tls=not insecure,
                 supported_drafts=config.get('draft'),
-                keep_alive_interval=config.get('keep_alive_interval'),
                 libquicr_compat=apply_compat(config.get('compat')),
+                **_transport_options(config),
             )
             async with client.connect() as session:
                 await session.client_session_init()
@@ -499,8 +507,8 @@ async def _publisher_task(config: Dict[str, Any], mp_stop_event,
         verify_tls=not config.get('insecure', False),
         supported_drafts=config.get('draft'),
         keylog_filename=config.get('keylogfile'),
-        keep_alive_interval=config.get('keep_alive_interval'),
         libquicr_compat=apply_compat(config.get('compat')),
+        **_transport_options(config),
     )
 
     stop_ev = _bridge_stop_event(mp_stop_event)
@@ -789,6 +797,7 @@ async def _loopback_server_task(config: Dict[str, Any], mp_stop_event,
         private_key=config['key'],
         path=config.get('path', ''),
         supported_drafts=config.get('draft'),
+        **_transport_options(config),
     )
     server.register_handler(MOQTMessageType.SUBSCRIBE, _on_subscribe)
     await server.serve()

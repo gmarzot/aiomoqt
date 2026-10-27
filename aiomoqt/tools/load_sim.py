@@ -64,7 +64,7 @@ from typing import Any, Dict, List
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.track import SubscribedTrack, TrackState
-from aiomoqt.types import MOQT_DEFAULT_DRAFTS, FilterType, parse_draft_spec
+from aiomoqt.types import FilterType
 from aiomoqt.utils import cli as _cli
 from aiomoqt.utils.cli import endpoint_url
 from aiomoqt.utils.url import parse_relay_url
@@ -75,6 +75,7 @@ from aiomoqt.utils.workers import (
     _bridge_stop_event,
     _post,
     _setup_quiet_logging,
+    _transport_options,
     apply_compat,
     pub_worker_entry,
     MP_CTX,
@@ -173,6 +174,9 @@ async def _slot_task(cfg, relay, slot, events_q, group, shard,
     if start_delay > 0:
         try:
             await asyncio.wait_for(stop_ev.wait(), timeout=start_delay)
+            slot["done"] = True
+            _post(events_q, {"kind": "evt", "ev": "join_cancelled",
+                             "group": group, "shard": shard})
             return
         except asyncio.TimeoutError:
             pass
@@ -183,6 +187,7 @@ async def _slot_task(cfg, relay, slot, events_q, group, shard,
                         subgroup_id)
 
     outcome = "died"
+    detail = None
     try:
         client = MOQTClient(
             relay.host, relay.port,
@@ -190,8 +195,9 @@ async def _slot_task(cfg, relay, slot, events_q, group, shard,
             use_quic=relay.use_quic,
             verify_tls=not cfg.get("insecure", False),
             supported_drafts=cfg.get("draft"),
-            keep_alive_interval=cfg.get("keep_alive_interval"),
+            keylog_filename=cfg.get("keylogfile"),
             libquicr_compat=apply_compat(cfg.get("compat")),
+            **_transport_options(cfg),
         )
         async with client.connect() as session:
             await session.client_session_init()
@@ -226,7 +232,9 @@ async def _slot_task(cfg, relay, slot, events_q, group, shard,
                         continue
                     break
             if not subscribed:
-                _post(events_q, {"kind": "evt", "ev": "join_failed",
+                # Stopped mid-join is a cancellation, not a failure.
+                ev = "join_cancelled" if stop_ev.is_set() else "join_failed"
+                _post(events_q, {"kind": "evt", "ev": ev,
                                  "group": group, "shard": shard,
                                  "why": last_err})
                 outcome = "reported"   # finally must not post again
@@ -244,16 +252,22 @@ async def _slot_task(cfg, relay, slot, events_q, group, shard,
             else:
                 outcome = "left"
             session.close()
-    except Exception:
+    except Exception as e:
         if not slot["live"]:
-            outcome = "join_failed"
+            outcome = ("join_cancelled" if stop_ev.is_set()
+                       else "join_failed")
+        # str() of some exceptions (TimeoutError) is empty.
+        detail = f"{type(e).__name__}: {e}"
     finally:
         was_live = slot["live"]
         slot["live"] = False
         slot["done"] = True
-        if outcome != "reported" and (was_live or outcome == "died"):
+        if outcome != "reported" and (
+                was_live
+                or outcome in ("died", "join_failed", "join_cancelled")):
             _post(events_q, {"kind": "evt", "ev": outcome,
-                             "group": group, "shard": shard})
+                             "group": group, "shard": shard,
+                             "why": detail})
 
 
 async def _group_host_task(cfg, mp_stop_event, cmd_q, events_q):
@@ -589,6 +603,9 @@ def _drain_sub_events(events_q, groups: Dict[int, GroupRT]):
                 shard.live += 1
                 g.iv["join"] += 1
                 g.max_live = max(g.max_live, g.live())
+            elif ev == "join_cancelled":
+                if shard.pending:
+                    shard.pending.popleft()
             elif ev == "join_failed":
                 if shard.pending:
                     shard.pending.popleft()
@@ -688,13 +705,7 @@ def parse_args(argv=None):
                         "(lenient-extensions, missing-request-credit, libquicr, "
                         "all) — same keys "
                         "as moq_interop_client")
-    p.add_argument("-k", "--insecure", action="store_true",
-                   help="Skip TLS verification")
-    p.add_argument("--draft", type=parse_draft_spec, default=None,
-                   help="MoQT draft: "
-                        f"{', '.join(map(str, sorted(MOQT_DEFAULT_DRAFTS)))}; "
-                        "a comma list offers several in order. Default: "
-                        f"offer {','.join(map(str, MOQT_DEFAULT_DRAFTS))}")
+    _cli.add_session(p)
     p.add_argument("--duration-scale", type=float, default=1.0,
                    help="Multiply publisher start/duration timelines")
     p.add_argument("--subs-per-proc", type=int, default=100,
@@ -789,6 +800,7 @@ def main():
           f"(duration-scale {args.duration_scale:g})")
     print(f"  worst-case egress if all peaks align: "
           f"{fmt_bps(total_bps)}")
+    print(f"  transport:   {_cli.describe_transport(args)}")
     for ps in pub_specs:
         subs = per_track_subs.get(ps.key, 0)
         print(f"    {ps.key:<28} {fmt_bps(ps.bps):>10} x {subs:>4} subs"
@@ -800,7 +812,8 @@ def main():
     common = dict(
         relay_url=relay_url, force_quic=False, insecure=args.insecure,
         draft=args.draft, debug=args.debug, logdir=args.logdir,
-        compat=args.compat,
+        compat=args.compat, keylogfile=args.keylogfile,
+        **_cli.transport_kwargs(args),
     )
 
     stopping = False
