@@ -1567,11 +1567,9 @@ def parse_args():
                         "worker (publisher / subscriber) gets a "
                         "process-suffixed file: PATH.pub.<pid>, "
                         "PATH.sub.<pid> — combined when decrypting.")
-    p.add_argument("--cc-algo", type=str, default=None,
-                   help="Congestion control algorithm "
-                        "(bbr | bbr1 | newreno | cubic | dcubic | "
-                        "prague | fast). Default: aiopquic default "
-                        "(bbr1)")
+    p.add_argument("--cc-algo", type=str, default="bbr",
+                   help="Congestion control (bbr | bbr1 | c4 | cubic | "
+                        "dcubic | fast | newreno | prague). Default: bbr")
     p.add_argument("--keepalive", type=float, default=None, metavar="SEC",
                    help="QUIC keep-alive interval in seconds (PING) so a "
                         "flow-controlled, consumer-stalled connection "

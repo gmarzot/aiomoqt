@@ -249,10 +249,9 @@ def add_session(p):
     p.add_argument('--keylogfile', type=str, default=None,
                    help='TLS secrets log (NSS Key Log Format) for '
                         'Wireshark decryption')
-    p.add_argument('--cc-algo', type=str, default=None,
-                   help='Congestion control (bbr | bbr1 | newreno | '
-                        'cubic | dcubic | prague | fast). Default: '
-                        'aiopquic default (bbr1)')
+    p.add_argument('--cc-algo', type=str, default='bbr',
+                   help='Congestion control (bbr | bbr1 | c4 | cubic | '
+                        'dcubic | fast | newreno | prague). Default: bbr')
     p.add_argument('--max-queued-bytes', type=int, default=None,
                    help='Aggregate publisher TX budget across ALL '
                         'streams. Default: aiopquic default (4 MiB). '
@@ -289,7 +288,7 @@ def describe_transport(args) -> str:
             return default
         return 'off' if value == 0 else f'{value} B'
     keepalive = getattr(args, 'keepalive', None)
-    return (f"cc={getattr(args, 'cc_algo', None) or 'aiopquic default'}  "
+    return (f"cc={getattr(args, 'cc_algo', None) or 'default'}  "
             f"queued={budget(getattr(args, 'max_queued_bytes', None), 'default')}  "
             f"inflight={budget(getattr(args, 'max_inflight_bytes', None), 'default')}  "
             f"keepalive={'off' if not keepalive else f'{keepalive:g}s'}")
