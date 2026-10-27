@@ -2,6 +2,11 @@
 
 ## v0.14.0
 
+- pub_media exits 69 when no relay is reachable or every relay is lost, and 70 on an internal error or a source it cannot read (both were 1); `--help` lists the codes, and a relay that has not answered within 10 s counts as down.
+- pub_media `--stats-json`: `ready` only once a relay is up.
+- pub_media on SIGINT/SIGTERM: after PUBLISH_DONE on each track it withdraws an announced namespace, refuses SUBSCRIBE and FETCH arriving meanwhile, and closes its sessions, within about a second.
+- pub_media `--reconnect`: a lost relay is redialled 1, 2, 4 … s apart (at most 30 s) at the draft it negotiated and published to again while the media timeline runs on; `@mtt` events `endpoint_lost` and `endpoint_up`.
+- `session.drain()` refuses the peer's later SUBSCRIBE and FETCH (GOING_AWAY from d18, INTERNAL_ERROR before); `FanoutPublisher.add_session()` adds or restores a relay mid-run.
 - Data streams use their track's publisher priority as the transport band, FIFO within a band (`MOQTPeer.stream_scheduling`, `PublishedTrack(stream_scheduling=)`, aiomoqt-relay `--stream-scheduling` select round_robin); undeclared streams sit at the neutral 128, and pub_media declares audio 64 above video 128.
 - aiomoqt-relay: each subscriber has its own bounded send lane, so a slow subscriber no longer throttles a track for the others or starves a late joiner; past the bound it loses whole groups, their streams reset; status shows each subscriber's lane depth and sheds.
 - A control message that closes the session (such as a request at the MAX_REQUEST_ID ceiling) no longer logs a second close as a parse failure.
