@@ -121,7 +121,9 @@ def parse_args():
     _cli.add_interval(parser)
     _cli.add_session(parser)
     _cli.add_keepalive(parser)
-    _cli.add_timestamp_checking(parser)
+    _cli.add_timestamp_checking(parser, default=None,
+                                default_help='report with --analyze, '
+                                             'else cancel')
     _cli.add_logging(parser)
     _cli.add_help(parser)
     args = parser.parse_args()
@@ -267,6 +269,12 @@ class _Writers:
         for fh in self.cmaf.values():
             if fh is not sys.stdout.buffer:
                 fh.close()
+
+
+def _timestamp_policy(args) -> str:
+    """--timestamp-errors, else report under --analyze (a diagnosis keeps
+    the track) and cancel otherwise."""
+    return args.timestamp_errors or ('report' if args.analyze else 'cancel')
 
 
 def _status(*parts):
@@ -438,7 +446,7 @@ async def run(args):
         sub = MediaSubscriber(
             session, args.namespace, discover=args.discover,
             track_filter=_select, loc_bare=args.loc_bare,
-            timestamp_errors=args.timestamp_errors,
+            timestamp_errors=_timestamp_policy(args),
             on_catalog=((lambda c: _status(c.to_json(indent=2)))
                         if args.show_catalog else None))
         writers = (None if args.analyze

@@ -170,7 +170,9 @@ class TrackStatusOk(MOQTMessage):
         request_id = buf.pull_vint()
         track_alias = buf.pull_vint()
         expires = buf.pull_vint()
-        group_order = GroupOrder(buf.pull_uint8())
+        group_order = buf.pull_uint8()
+        MOQTMessage._check_range("group order", group_order, 1, 2)
+        group_order = GroupOrder(group_order)
         content_exists = buf.pull_uint8()
 
         largest_group_id = None

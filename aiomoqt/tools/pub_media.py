@@ -37,6 +37,12 @@ their timestamps (--no-pace to blast).
 With --player-base or $AIOMOQT_PLAYER_URL set, each run prints a
 ready-to-paste player URL per relay. Relays on different drafts need a
 --draft all of them accept.
+
+Exit status: 0 when the duration ends or on SIGINT/SIGTERM; 2 for a usage
+error; 64 when an object does not fit a datagram; 69 when no relay can be
+reached, or every relay is lost (with --reconnect: none is back when the
+duration ends); 70 for an internal error, including a source pub_media
+cannot read.
 """
 import argparse
 import asyncio
@@ -49,6 +55,7 @@ import signal
 import sys
 import threading
 import time
+import traceback
 import uuid
 from typing import Optional
 
@@ -80,6 +87,17 @@ from aiomoqt.utils.url import parse_relay_url
 
 # Exit status when an object does not fit a datagram.
 EXIT_DATAGRAM_TOO_LARGE = 64
+# No relay reachable, or every relay lost.
+EXIT_UNAVAILABLE = 69
+# An internal error, including a source pub_media cannot read.
+EXIT_SOFTWARE = 70
+
+# A relay that has not answered by then is down.
+_DIAL_TIMEOUT_S = 10.0
+# --reconnect: redial 1, 2, 4 ... s apart, at most this.
+_RECONNECT_MAX_S = 30.0
+# Signal shutdown: the most spent waiting for PUBLISH_DONEs to go out.
+_SHUTDOWN_DRAIN_S = 0.5
 
 _SAMPLERATE = 48000
 _CHANNELS = 2
@@ -223,6 +241,12 @@ def parse_args():
     parser.add_argument('--stats', type=float, default=5.0, metavar='SECS',
                         help='Print per-track publish metrics every SECS '
                              'seconds (0 disables; default: 5)')
+    parser.add_argument('--reconnect', action='store_true',
+                        help='Redial a lost relay 1, 2, 4 ... s apart (at '
+                             'most 30 s) at the draft it negotiated, until '
+                             'the duration ends, and publish to it again; '
+                             'the media timeline runs on meanwhile. '
+                             'Default: a lost relay is dropped')
     map_group = parser.add_argument_group('object mapping')
     map_group.add_argument(
         '--video-subgroups', choices=('group', 'object'), default='group',
@@ -260,9 +284,9 @@ def parse_args():
     out_group = parser.add_argument_group('machine output')
     out_group.add_argument(
         '--stats-json', action='store_true',
-        help='Events as "@mtt <json>" lines on stdout (ready, stats every '
-             '--stats interval, endpoint_lost, done); human output goes '
-             'to stderr')
+        help='Events as "@mtt <json>" lines on stdout (ready once a relay '
+             'is up, stats every --stats interval, endpoint_lost, '
+             'endpoint_up, done); human output goes to stderr')
     _cli.add_run(parser, duration=30)
     _cli.add_session(parser)
     _cli.add_keepalive(parser, default=10)
@@ -355,6 +379,18 @@ def _init_data(args, ref: str, config: bytes, prop_id: int) -> InitData:
     if kind == INIT_TYPE_INLINE:
         return InitData.from_bytes(ref, config)
     return InitData(id=ref, data=f'0x{prop_id:02X}', type=kind)
+
+
+class _SourceError(SystemExit):
+    """Exit EXIT_SOFTWARE for a source pub_media cannot use; main()
+    prints the message."""
+
+    def __init__(self, message: str):
+        super().__init__(EXIT_SOFTWARE)
+        self.message = message
+
+    def __str__(self) -> str:
+        return self.message
 
 
 def _wt_url(relay, url: str) -> str:
@@ -478,13 +514,13 @@ async def _open_ingest(args) -> Ingest:
         stop.set()
         raise
     except ImportError as e:
-        raise SystemExit(f"  error: {e}")
+        raise _SourceError(f"  error: {e}")
     except Exception as e:
-        raise SystemExit(f"  error: {args.input}: {type(e).__name__}: {e}")
+        raise _SourceError(f"  error: {args.input}: {type(e).__name__}: {e}")
     unknown = [t.name for t in ingest.tracks if t.codec is None]
     if unknown:
         ingest.close()
-        raise SystemExit(f"  error: no codec string for {', '.join(unknown)}")
+        raise _SourceError(f"  error: no codec string for {', '.join(unknown)}")
     for t in ingest.tracks:
         size = f" {t.width}x{t.height}" if t.kind == 'video' else ''
         print(f"  input {t.name}: {t.codec}{size}"
@@ -543,7 +579,7 @@ def _open_live_h264(args):
     while asm.config is None:
         chunk = fh.read1(65536)
         if not chunk:
-            raise SystemExit('  error: h264 stream ended before SPS/PPS')
+            raise _SourceError('  error: h264 stream ended before SPS/PPS')
         first += asm.feed(chunk)
     return fh, asm, first, _LiveVideo(asm)
 
@@ -597,7 +633,7 @@ def _open_live_ts(args):
     while not ready():
         chunk = fh.read1(65536)
         if not chunk:
-            raise SystemExit('  error: ts stream ended before PMT and codec configs')
+            raise _SourceError('  error: ts stream ended before PMT and codec configs')
         units = dmx.feed(chunk)
         if units and not first:
             dmx.to_us(units[0].pts)  # anchor at arrival, not at first send
@@ -606,8 +642,8 @@ def _open_live_ts(args):
     audio = (_LiveAudio(dmx)
              if dmx.audio_pid is not None and not args.no_audio else None)
     if video is None and audio is None:
-        raise SystemExit('  error: ts stream has no H.264/H.265 video or '
-                         'AAC/Opus audio')
+        raise _SourceError('  error: ts stream has no H.264/H.265 video or '
+                           'AAC/Opus audio')
     return fh, dmx, first, video, audio
 
 
@@ -1028,6 +1064,107 @@ async def _feed_mp4_track(track, source, args, stats: _TrackStats, *,
     await track.finish()
 
 
+class _Endpoint:
+    """One relay URL: a client per dial, the live session, and the draft
+    the first session negotiated, which a redial keeps."""
+
+    def __init__(self, url: str, relay, args, libquicr: bool):
+        self.url = url
+        self.relay = relay
+        self.args = args
+        self.libquicr = libquicr
+        self.session = None
+        self.draft: Optional[int] = None
+        self._stack: Optional[contextlib.AsyncExitStack] = None
+
+    async def open(self):
+        """Dial and set up a session within _DIAL_TIMEOUT_S; None, with
+        the error printed, when the relay does not answer."""
+        args, relay = self.args, self.relay
+        client = MOQTClient(
+            relay.host, relay.port, path=relay.path,
+            use_quic=relay.use_quic, verify_tls=not args.insecure,
+            supported_drafts=([self.draft] if self.draft is not None
+                              else args.draft),
+            debug=args.debug, keylog_filename=args.keylogfile,
+            congestion_control_algorithm=args.cc_algo,
+            keep_alive_interval=args.keepalive,
+            libquicr_compat=self.libquicr)
+        stack = contextlib.AsyncExitStack()
+
+        async def dial():
+            s = await stack.enter_async_context(client.connect())
+            await s.client_session_init()
+            return s
+        try:
+            session = await asyncio.wait_for(dial(), _DIAL_TIMEOUT_S)
+        except BaseException as e:
+            await stack.aclose()
+            if not isinstance(e, Exception):
+                raise
+            print(f"  error: {self.url}: {str(e) or type(e).__name__}")
+            return None
+        self._stack, self.session = stack, session
+        if self.draft is None:
+            self.draft = getattr(session, 'negotiated_draft', None)
+        return session
+
+    async def close(self) -> None:
+        """Leave the session's connection, if one is open."""
+        stack, self._stack, self.session = self._stack, None, None
+        if stack is not None:
+            await stack.aclose()
+
+
+async def _close_endpoints(endpoints) -> None:
+    await asyncio.gather(*(ep.close() for ep in endpoints))
+
+
+async def _redial(ep: _Endpoint, pub: FanoutPublisher, start: dict) -> None:
+    """--reconnect: dial `ep` 1, 2, 4 ... s apart (at most
+    _RECONNECT_MAX_S) until it is up and publishing again; cancelled when
+    the run ends."""
+    delay = 1.0
+    while True:
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, _RECONNECT_MAX_S)
+        session = await ep.open()
+        if session is None:
+            continue
+        try:
+            await pub.add_session(session, **start)
+            return
+        except Exception as e:
+            print(f"  error: {ep.url}: publishing again: "
+                  f"{str(e) or type(e).__name__}")
+            pub.drop(session)
+            await ep.close()
+
+
+async def _shutdown(pub: FanoutPublisher, sessions: list,
+                    announced: bool) -> None:
+    """Signal shutdown in about a second: refuse new SUBSCRIBEs and
+    FETCHes, PUBLISH_DONE on every track, PUBLISH_NAMESPACE_DONE for an
+    announced namespace, then close each session."""
+    for s in sessions:
+        s.drain()
+    for track in pub.tracks.values():
+        track.end()
+    await pub.catalog_track.finish()
+    # A subscription's PUBLISH_DONE follows its streams closing.
+    deadline = time.monotonic() + _SHUTDOWN_DRAIN_S
+    while time.monotonic() < deadline and not all(
+            sub.done for track in pub.tracks.values()
+            for sub in track.subscriptions if sub.session in sessions):
+        await asyncio.sleep(0.02)
+    if announced:
+        for s in sessions:
+            s.publish_namespace_done(namespace=pub.namespace)
+    await asyncio.sleep(0.1)   # the last control messages leave first
+    for s in sessions:
+        s.close()
+
+
 _STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 
 
@@ -1102,51 +1239,30 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
     else:
         catalog = _build_catalog(args, video, mp4_audio or ts_audio, chunkers)
 
-    clients = [MOQTClient(
-        relay.host, relay.port, path=relay.path,
-        use_quic=relay.use_quic, verify_tls=not args.insecure,
-        supported_drafts=args.draft, debug=args.debug,
-        keylog_filename=args.keylogfile,
-        congestion_control_algorithm=args.cc_algo,
-        keep_alive_interval=args.keepalive,
-        libquicr_compat=libquicr,
-    ) for relay in relays]
+    endpoints = [_Endpoint(u, r, args, libquicr)
+                 for u, r in zip(urls, relays)]
     print(f"  relay: {', '.join(str(r) for r in relays)}  "
           f"namespace: {args.namespace}")
     print(f"  tracks: {', '.join(t.name for t in catalog.tracks)}")
     async with contextlib.AsyncExitStack() as stack:
         if ingest is not None:
             stack.callback(ingest.close)
-
-        async def _open(url, client):
-            try:
-                s = await stack.enter_async_context(client.connect())
-                await s.client_session_init()
-                return s
-            except Exception as e:
-                print(f"  error: {url}: {e}")
-                return None
-
+        stack.push_async_callback(_close_endpoints, endpoints)
         # A relay that cannot be reached is left out; the run fails only
         # when none can.
-        opened = await asyncio.gather(*(_open(u, c)
-                                        for u, c in zip(urls, clients)))
-        up = [i for i, s in enumerate(opened) if s is not None]
-        if events is not None:
-            endpoints = [dict(url=u, state='up' if s is not None else 'down',
-                              draft=getattr(s, 'negotiated_draft', None))
-                         for u, s in zip(urls, opened)]
+        await asyncio.gather(*(ep.open() for ep in endpoints))
+        up = [ep for ep in endpoints if ep.session is not None]
         if not up:
-            if events is not None:
-                events.emit('ready', endpoints=endpoints)
-            raise SystemExit(1)
-        urls = [urls[i] for i in up]
-        relays = [relays[i] for i in up]
-        sessions = [opened[i] for i in up]
-        for url, relay, s in zip(urls, relays, sessions):
-            if args.player_base:
-                draft = getattr(s, 'negotiated_draft', None)
-                print(f"  player: {_player_url(args, relay, url, draft)}")
+            print("  error: no relay reachable")
+            raise SystemExit(EXIT_UNAVAILABLE)
+        ready = [dict(url=ep.url,
+                      state='up' if ep.session is not None else 'down',
+                      draft=ep.draft) for ep in endpoints]
+        sessions = [ep.session for ep in up]
+        if args.player_base:
+            for ep in up:
+                print(f"  player: "
+                      f"{_player_url(args, ep.relay, ep.url, ep.draft)}")
 
         def _cs(codec):
             return codec if args.loc_codecstring else None
@@ -1271,19 +1387,20 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
                 gap_us=int(1e6 / (video.fps or 30)),
                 wrap=_cmaf_wrap(v_ck, video=True) if v_ck else None,
                 clock=clock))
-        await pub.start(announce_namespace=(args.pub_ns or args.pub_both),
-                        publish_track=(not args.pub_ns or args.pub_both),
-                        forward=args.forward)
+        start = dict(announce_namespace=(args.pub_ns or args.pub_both),
+                     publish_track=(not args.pub_ns or args.pub_both),
+                     forward=args.forward)
+        await pub.start(**start)
         print("  publishing...")
         if events is not None:
-            events.emit('ready', endpoints=endpoints)
+            events.emit('ready', endpoints=ready)
         reporter = (asyncio.ensure_future(
             _report_stats(stats, args.stats, pub, events))
             if args.stats > 0 and stats else None)
         refresher = (asyncio.ensure_future(
             _refresh_catalog(pub, args.catalog_interval))
             if args.catalog_interval > 0 and not args.no_catalog else None)
-        # SIGINT and SIGTERM: PUBLISH_DONE on every track, drain, exit 0.
+        # SIGINT and SIGTERM: _shutdown(), exit 0.
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
         signals = _on_stop_signals(loop, stop.set)
@@ -1296,49 +1413,56 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
         # Ctrl-C exits quietly instead of logging an unretrieved exception.
         feed.add_done_callback(
             lambda f: f.cancelled() or f.exception())
-        closed = {asyncio.ensure_future(s.async_closed()): s
-                  for s in sessions}
-        # A relay lost mid-run is dropped and the rest continue; the
-        # run fails only when no relay is left.
-        while True:
-            done, _ = await asyncio.wait({feed, stopping, *closed},
-                                         return_when=asyncio.FIRST_COMPLETED)
-            if feed in done or stopping in done:
-                break
-            for fut in done:
-                s = closed.pop(fut)
-                code, reason = getattr(s, '_close_err', None) or ('?', '')
-                url = urls[sessions.index(s)]
-                if events is not None:
-                    events.emit('endpoint_lost', url=url,
-                                reason=f"code={code} {reason}".strip())
-                if closed:
-                    print(f"  error: {url} closed: code={code} "
-                          f"reason='{reason}' — continuing on {len(closed)}")
-                    pub.drop(s)
-                    continue
-                if reporter is not None:
-                    reporter.cancel()
-                if refresher is not None:
-                    refresher.cancel()
-                print(f"  error: session closed: code={code} "
-                      f"reason='{reason}'")
-                feed.cancel()
-                stopping.cancel()
-                raise SystemExit(1)
-        if reporter is not None:
-            reporter.cancel()
-        if refresher is not None:
-            refresher.cancel()
-        for fut in closed:
-            fut.cancel()
-        stopping.cancel()
+        live = {asyncio.ensure_future(ep.session.async_closed()): ep
+                for ep in up}
+        redial = {}
+        # A relay lost mid-run is dropped, or redialled with --reconnect;
+        # without it the run fails once no relay is left.
+        try:
+            while True:
+                done, _ = await asyncio.wait(
+                    {feed, stopping, *live, *redial},
+                    return_when=asyncio.FIRST_COMPLETED)
+                if feed in done or stopping in done:
+                    break
+                for fut in done:
+                    if fut in redial:
+                        ep = redial.pop(fut)
+                        fut.result()
+                        live[asyncio.ensure_future(
+                            ep.session.async_closed())] = ep
+                        print(f"  reconnected: {ep.url} (draft-{ep.draft})")
+                        if events is not None:
+                            events.emit('endpoint_up', url=ep.url,
+                                        draft=ep.draft)
+                        continue
+                    ep = live.pop(fut)
+                    code, reason = (getattr(ep.session, '_close_err', None)
+                                    or ('?', ''))
+                    if events is not None:
+                        events.emit('endpoint_lost', url=ep.url,
+                                    reason=f"code={code} {reason}".strip())
+                    pub.drop(ep.session)
+                    await ep.close()
+                    lost = f"{ep.url} closed: code={code} reason='{reason}'"
+                    if args.reconnect:
+                        print(f"  error: {lost} — reconnecting")
+                        redial[asyncio.ensure_future(
+                            _redial(ep, pub, start))] = ep
+                    elif live:
+                        print(f"  error: {lost} — continuing on {len(live)}")
+                    else:
+                        print(f"  error: {lost}")
+                        feed.cancel()
+                        raise SystemExit(EXIT_UNAVAILABLE)
+        finally:
+            for task in (reporter, refresher, stopping, *live, *redial):
+                if task is not None:
+                    task.cancel()
+        alive = [ep.session for ep in live.values()]
         if stop.is_set():
             feed.cancel()
-            for track in pub.tracks.values():
-                track.end()
-            await pub.catalog_track.finish()
-            await asyncio.sleep(1.0)
+            await _shutdown(pub, alive, start['announce_namespace'])
             print("  done (signal)")
             return 'signal'
         error = None if feed.cancelled() else feed.exception()
@@ -1350,6 +1474,9 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
             await asyncio.sleep(1.0)
             raise SystemExit(EXIT_DATAGRAM_TOO_LARGE)
         await feed
+        if not alive:
+            print("  error: no relay back when the duration ended")
+            raise SystemExit(EXIT_UNAVAILABLE)
         await pub.catalog_track.finish()
         await asyncio.sleep(1.0)  # drain tail before teardown
     print("  done")
@@ -1363,6 +1490,12 @@ def main():
         asyncio.run(run(parse_args()))
     except KeyboardInterrupt:
         pass
+    except _SourceError as e:
+        print(e, file=sys.stderr)
+        raise SystemExit(EXIT_SOFTWARE)
+    except Exception:
+        traceback.print_exc()
+        raise SystemExit(EXIT_SOFTWARE)
 
 
 if __name__ == '__main__':

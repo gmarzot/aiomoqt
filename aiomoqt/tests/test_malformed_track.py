@@ -169,3 +169,62 @@ async def test_object_past_end_of_group_resets_the_stream_and_cancels_the_track(
     finally:
         server.close()
     assert cancelled                                  # our subscription was cancelled
+
+
+# -- an Object whose Properties cannot be parsed ------------------------
+
+_KVP_PORT = 23720
+
+
+def _bad_kvp_server(port, draft, use_quic):
+    server = MOQTServer(
+        host="localhost", port=port, certificate=CERT, private_key=KEY,
+        path="/", use_quic=use_quic, supported_drafts=draft,
+    )
+
+    async def _on_subscribe(session, msg):
+        ok = session.subscribe_ok(request_msg=msg, content_exists=0)
+        await asyncio.sleep(0.05)
+        sid = await session.open_uni_stream()
+        hdr = SubgroupHeader(track_alias=ok.track_alias, group_id=0,
+                             subgroup_id=0, extensions_present=True,
+                             prof=session._profile)
+        session.stream_write(sid, hdr.serialize().data)
+        session.stream_write(sid, hdr.next_object(payload=b"a").data)
+        # Object 1: a 4-byte Properties block holding a KVP that
+        # declares a 10-byte value.
+        session.stream_write(sid, bytes([0x00, 0x04, 0x01, 0x0A])
+                             + b"\xaa" * 10 + b"\x01b")
+
+    server.register_handler(MOQTMessageType.SUBSCRIBE, _on_subscribe)
+    return server
+
+
+@requires_certs
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+@pytest.mark.parametrize("draft", [16, 18])
+async def test_unparseable_object_properties_reset_the_stream(draft, use_quic):
+    port = _KVP_PORT + 2 * (draft == 18) + (not use_quic)
+    server = await _bad_kvp_server(port, draft, use_quic).serve()
+    ended = []
+    try:
+        client = MOQTClient("localhost", port, path="/", use_quic=use_quic,
+                            verify_tls=False, supported_drafts=draft)
+        async with client.connect() as session:
+            await session.client_session_init()
+            got = []
+            session.on_object_received = lambda msg, *a: got.append(msg.object_id)
+            ok = await session.subscribe("mal/ns", "t", wait_response=True)
+            session.register_stream_end_handler(
+                ok.track_alias,
+                lambda g, sg, clean, reset_code: ended.append((sg, clean, reset_code)))
+            for _ in range(150):
+                if ended:
+                    break
+                await asyncio.sleep(0.02)
+            assert ended == [(0, False, StreamResetCode.MALFORMED_TRACK)]
+            assert got == [0]
+            await asyncio.sleep(0.05)
+            assert session._close_err is None         # session survives
+    finally:
+        server.close()

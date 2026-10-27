@@ -15,6 +15,8 @@ import pytest
 
 from aiomoqt.context import profile_for
 from aiomoqt.messages import MOQTMessage
+from aiomoqt.messages.base import MOQTMalformedKVP
+from aiomoqt.types import MOQTProtocolViolation
 from aiomoqt.messages.subscribe import SubscribeOk
 from aiomoqt.utils.buffer import Buffer
 from aiopquic.streamchain import StreamChain
@@ -176,7 +178,7 @@ def test_kvp_overrunning_its_block_is_refused_by_both_codecs(vi64):
     block = _kvp_block(vi64, 4, b"\xaa" * 10)
 
     buf = Buffer(data=block + v(3) + b"pay", vi64=vi64)
-    with pytest.raises(RuntimeError, match="overrun"):
+    with pytest.raises(MOQTMalformedKVP, match="exceeds its block"):
         MOQTMessage._extensions_decode(buf, delta=True)
 
     # The fused parser refuses the declared length before pulling it.
@@ -317,7 +319,7 @@ def test_d18_fetch_end_of_range():
 def test_d18_fetch_first_object_must_be_absolute():
     prof = profile_for(18)
     rb = Buffer(data=bytes([0x00, 0x01, 0x78]), vi64=True)
-    with pytest.raises(ValueError, match="first object"):
+    with pytest.raises(MOQTProtocolViolation, match="first object"):
         FetchObject.deserialize(rb, prior=None, prof=prof)
 
 
@@ -421,7 +423,7 @@ def test_d18_fetch_first_object_sg_prior_rejected():
     # flags GD|OD|PRI|SG=prior (0x1D): prior-Subgroup ref on first object.
     raw = bytes.fromhex("1d0100c80000")
     rb = Buffer(data=raw, vi64=True)
-    with pytest.raises(ValueError, match="prior Subgroup"):
+    with pytest.raises(MOQTProtocolViolation, match="prior Subgroup"):
         FetchObject.deserialize(rb, prior=None, prof=prof)
 
 
@@ -591,7 +593,7 @@ def test_d18_first_object_round_trips():
 
 # -- malformed requests the session MUST close on (§2.4.1, §5.1.2, §10.2) --
 
-from aiomoqt.types import GroupOrder, MOQTProtocolViolation  # noqa: E402
+from aiomoqt.types import GroupOrder  # noqa: E402
 
 
 def _ref_vint(draft, v):
@@ -1487,7 +1489,7 @@ def test_d20_end_of_timed_out_range():
                                   prof=_prof(20))
     assert (got.end_of_range, got.group_id, got.object_id) == (0x20C, 7, 9)
     # Not defined before d20: both directions refuse it.
-    with pytest.raises(ValueError, match="flags 0x20c"):
+    with pytest.raises(MOQTProtocolViolation, match="flags 0x20c"):
         FetchObject.deserialize(Buffer(data=raw, vi64=True),
                                 prof=profile_for(18))
     with pytest.raises(ValueError, match="not defined at d18"):
@@ -1605,14 +1607,14 @@ def test_prior_reference_after_a_leading_marker_is_refused(draft, nxt, match):
     # A marker with no actual Object before it carries no Subgroup or
     # Priority to inherit.
     marker = ref_vi64(0x10C) + b"\x03\x04"
-    with pytest.raises(ValueError, match=match):
+    with pytest.raises(MOQTProtocolViolation, match=match):
         _fetch_stream(marker + nxt, draft)
 
 
 @pytest.mark.parametrize("draft", _D20_DRAFTS)
 @pytest.mark.parametrize("flags", [0x80, 0x30C, 0x40C])
 def test_d20_undefined_range_indicator_is_refused(draft, flags):
-    with pytest.raises(ValueError, match="invalid serialization flags"):
+    with pytest.raises(MOQTProtocolViolation, match="invalid serialization flags"):
         _fetch_stream(ref_vi64(flags) + b"\x03\x04", draft)
 
 
@@ -2049,3 +2051,117 @@ def test_fetch_object_over_the_limit_is_refused_at_its_length(draft):
         Buffer(data=bytes(ok.serialize(prof=prof).data), vi64=prof.vi64),
         prof=prof, max_payload=_LIMIT)
     assert len(got.payload) == _LIMIT
+
+
+# -- malformed input found by fuzzing (test_fuzz_messages.py) ------------
+#
+# Each case once escaped as a Python error (UnicodeDecodeError,
+# ValueError, OverflowError, RuntimeError) rather than a protocol error.
+
+from aiomoqt.messages.data import ObjectDatagramStatus  # noqa: E402
+from aiomoqt.messages.session_setup import GoAway  # noqa: E402
+from aiomoqt.messages.subscribe import TrackStatusOk  # noqa: E402
+
+
+def _control(cls, draft, body, chain=False):
+    prof = profile_for(draft)
+    if chain:
+        buf = StreamChain()
+        buf.extend(body)
+        buf.vi64 = prof.vi64
+    else:
+        buf = Buffer(data=body, vi64=prof.vi64)
+    return cls.deserialize(buf, prof=prof, buf_end=len(body))
+
+
+@pytest.mark.parametrize("draft", [16, 18])
+def test_reason_phrase_with_invalid_utf8_is_read_leniently(draft):
+    v = lambda x: _ref_vint(draft, x)                     # noqa: E731
+    head = b"" if draft >= 18 else v(1)
+    body = head + v(0x10) + v(0) + v(3) + b"a\xffb"
+    msg = _control(RequestError, draft, body)
+    assert msg.reason == "a�b"
+
+
+@pytest.mark.parametrize("draft", [14, 16])
+def test_goaway_uri_with_invalid_utf8_is_a_protocol_violation(draft):
+    with pytest.raises(MOQTProtocolViolation, match="not UTF-8"):
+        _control(GoAway, draft, b"\x04\xff\xfe\xfd\xfc")
+
+
+def test_d14_track_status_ok_group_order_out_of_range():
+    with pytest.raises(MOQTProtocolViolation, match="group order 9"):
+        _control(TrackStatusOk, 14, bytes([0, 1, 0, 9, 0, 0]))
+
+
+@pytest.mark.parametrize("chain", [False, True], ids=["buffer", "chain"])
+@pytest.mark.parametrize("length", [(1 << 63) - 1, 1 << 63, (1 << 64) - 1])
+def test_d18_namespace_field_length_past_the_message(length, chain):
+    # A vi64 length beyond ssize_t: refused before the pull, by both
+    # buffer types.
+    body = ref_vi64(0) + ref_vi64(1) + ref_vi64(length) + b"n"
+    with pytest.raises(MOQTProtocolViolation, match="overruns"):
+        _control(Subscribe, 18, body, chain)
+
+
+@pytest.mark.parametrize("draft", [16, 18])
+def test_truncated_trailing_track_property_is_malformed(draft, monkeypatch):
+    monkeypatch.setattr(MOQTMessage, "_tolerate_trailing_extensions", False)
+    raw = bytes(SubscribeOk(request_id=0, track_alias=1,
+                            track_extensions={0x3B: b"abcdef"}
+                            ).serialize(prof=profile_for(draft)).data)
+    buf = Buffer(data=raw, vi64=draft >= 18)
+    buf.pull_vint()
+    n = buf.pull_uint16()
+    body = raw[buf.tell():buf.tell() + n - 3]
+    with pytest.raises(MOQTMalformedKVP, match="truncated"):
+        _control(SubscribeOk, draft, body)
+
+
+@pytest.mark.parametrize("fused", [True, False], ids=["cython", "python"])
+@pytest.mark.parametrize("draft", [14, 16, 18])
+@pytest.mark.parametrize("case", ["value-overrun", "block-over-limit"])
+def test_object_properties_that_do_not_parse_agree_across_codecs(
+        draft, case, fused):
+    """Both codecs report the Object's Properties as malformed, which the
+    session handles as a malformed track."""
+    v = lambda x: _ref_vint(draft, x)                     # noqa: E731
+    if case == "value-overrun":
+        props = v(4) + v(1) + v(10) + b"\xaa" * 10
+    else:
+        props = v(MOQTMessage.EXTENSIONS_LEN_LIMIT + 1) + v(1) + v(1) + b"x"
+    raw = v(0) + props + v(1) + b"p"
+    with pytest.raises(MOQTMalformedKVP):
+        _parse_subgroup(draft, raw, fused)
+
+
+def test_kvp_value_over_2_16_is_a_protocol_violation():
+    # §1.4.3: a Length over 2^16-1 closes the session.
+    kvps = ref_rfc9000(1) + ref_rfc9000(1 << 16)
+    buf = Buffer(data=kvps + b"x" * 8)
+    with pytest.raises(MOQTProtocolViolation, match="2\\^16-1"):
+        MOQTMessage._extensions_decode(buf, with_length=False,
+                                       buf_end=len(kvps) + 8, delta=True)
+
+
+def test_d18_fetch_object_id_past_2_64_is_a_protocol_violation():
+    first = FetchObject(group_id=1, subgroup_id=0, object_id=(1 << 64) - 1,
+                        publisher_priority=1, payload=b"x")
+    raw = bytes(first.serialize(prof=profile_for(18)).data)
+    # Next object: same group, Object ID = prior + 1 (no Object ID field).
+    nxt = ref_vi64(0x01) + ref_vi64(1) + b"y"
+    with pytest.raises(MOQTProtocolViolation, match="object id past"):
+        _fetch_stream(raw + nxt, 18)
+
+
+@pytest.mark.parametrize("raw, parse", [
+    # d14 FETCH object: zero-length payload with Status 2.
+    (bytes([1, 0, 0, 0x80, 0, 0, 2]),
+     lambda b: FetchObject.deserialize(b, prof=profile_for(14))),
+    # d14 OBJECT_DATAGRAM_STATUS with Status 9.
+    (bytes([1, 2, 3, 0x80, 9]),
+     lambda b: ObjectDatagramStatus.deserialize(b, prof=profile_for(14))),
+], ids=["d14-fetch", "d14-status-datagram"])
+def test_unknown_object_status_is_a_protocol_violation(raw, parse):
+    with pytest.raises(MOQTProtocolViolation, match="unknown object status"):
+        parse(Buffer(data=raw))
