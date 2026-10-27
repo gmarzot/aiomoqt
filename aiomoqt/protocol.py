@@ -3435,6 +3435,23 @@ class _MOQTSessionMixin:
             transport_log.debug(f"stream({stream_id}): priority not applied: {e}")
             return False
 
+    def set_datagram_priority(self, priority: int) -> bool:
+        """Send priority of this connection's datagrams, on the same scale
+        as stream priorities: higher-priority streams go first, equal
+        ones alternate with datagrams. False when the transport offers
+        no setter (aiopquic before 0.7.0)."""
+        quic = getattr(self, '_quic', None)
+        target = super() if quic is self else quic
+        setter = getattr(target, 'set_datagram_priority', None)
+        if setter is None:
+            return False
+        try:
+            setter(priority)
+        except Exception as e:
+            transport_log.debug(f"datagram priority not applied: {e}")
+            return False
+        return True
+
     def set_default_stream_priority(self, priority: int) -> bool:
         """Priority that newly created streams start at.
 
@@ -3805,9 +3822,11 @@ class _MOQTSessionMixin:
         logger.info(f"MOQT session: setup complete: "
                     f"draft-{self.negotiated_draft} "
                     f"({'WT' if self._is_wt else 'raw QUIC'})")
-        # Datagrams stay at picoquic's default 9, above every data band:
-        # aiopquic exposes no datagram priority setter.
-        self.set_default_stream_priority(self.data_stream_band(128))
+        band = self.data_stream_band(128)
+        self.set_default_stream_priority(band)
+        # Datagrams share the neutral band instead of picoquic's 9, which
+        # would put datagram tracks ahead of all stream data.
+        self.set_datagram_priority(band)
 
     def _quiet_peer(self, msg) -> bool:
         """The peer's SETUP names an implementation the server's
