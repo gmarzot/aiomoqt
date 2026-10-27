@@ -34,7 +34,7 @@ class MOQTClient(MOQTPeer):
         quic_debug_log: Optional[str] = None,
         supported_drafts: Optional[Union[int, List[int]]] = None,
         libquicr_compat: Optional[bool] = False,
-        congestion_control_algorithm: Optional[str] = "bbr",
+        congestion_control_algorithm: Optional[str] = None,
         tx_max_inflight_bytes: Optional[int] = DEFAULT_TX_MAX_INFLIGHT_BYTES,
         tx_max_queued_bytes: Optional[int] = None,
         keep_alive_interval: Optional[float] = None,
@@ -78,6 +78,9 @@ class MOQTClient(MOQTPeer):
         # The config a connection actually ran with — the caller's, or
         # the one built here — assigned at connect() on either path.
         self.effective_configuration: Optional[QuicConfiguration] = None
+        # None: the passed configuration's algorithm, else bbr.
+        if congestion_control_algorithm is None and configuration is None:
+            congestion_control_algorithm = "bbr"
         self.congestion_control_algorithm = congestion_control_algorithm
         # Aggregate TX gate budget (QuicConfiguration.tx_max_queued_bytes):
         # bounds publisher run-ahead across ALL streams; steady-state
@@ -144,7 +147,7 @@ class MOQTClient(MOQTPeer):
                 cfg.cafile = self.ca_file
             if self.qlog_dir is not None and cfg.qlog_dir is None:
                 cfg.qlog_dir = self.qlog_dir
-            # None defers to the configuration or aiopquic default.
+            # None keeps the passed configuration's algorithm.
             if self.congestion_control_algorithm is not None:
                 cfg.congestion_control_algorithm = (
                     self.congestion_control_algorithm)
@@ -199,7 +202,7 @@ class MOQTClient(MOQTPeer):
         if self.qlog_dir is not None and wt_cfg.qlog_dir is None:
             wt_cfg.qlog_dir = self.qlog_dir
         self.effective_configuration = wt_cfg
-        # None defers to the configuration or aiopquic default.
+        # None keeps the passed configuration's algorithm.
         if self.congestion_control_algorithm is not None:
             wt_cfg.congestion_control_algorithm = (
                 self.congestion_control_algorithm)
