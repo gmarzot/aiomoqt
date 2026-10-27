@@ -693,6 +693,9 @@
   ".sessions[].loss_pct": [
    "float"
   ],
+  ".sessions[].namespaces": [
+   "int"
+  ],
   ".sessions[].role": [
    "string"
   ],
@@ -707,6 +710,9 @@
   ],
   ".sessions[].since": [
    "float"
+  ],
+  ".sessions[].subscriptions": [
+   "int"
   ],
   ".sessions[].transport": [
    "string"

@@ -4842,6 +4842,30 @@ class _MOQTSessionMixin:
             self._send_reply(request_id, message)
         return message
     
+    def _refuse_peer_request(self, msg: MOQTMessage, error_code: int,
+                             reason: str,
+                             retry_interval: int = 0) -> MOQTMessage:
+        """Refuse a peer's SUBSCRIBE, FETCH, PUBLISH_NAMESPACE or
+        SUBSCRIBE_NAMESPACE with a named code in the draft's encoding:
+        REQUEST_ERROR from d16, the request's own error before."""
+        rid = msg.request_id
+        code = request_error_code(error_code, self._profile,
+                                  fetch=isinstance(msg, Fetch))
+        if is_draft16_or_later(self.negotiated_draft):
+            err = RequestError(request_id=rid, error_code=code,
+                               retry_interval=retry_interval, reason=reason)
+            control_log.info(f"MOQT send: {self._msgstr(err)}")
+            self._peer_requests.pop(rid, None)
+            self._send_on_request_stream(rid, err, fin=True)
+            return err
+        cls = {Subscribe: SubscribeError, Fetch: FetchError,
+               PublishNamespace: PublishNamespaceError,
+               SubscribeNamespace: SubscribeNamespaceError}[type(msg)]
+        err = cls(request_id=rid, error_code=code, reason=reason)
+        control_log.info(f"MOQT send: {self._msgstr(err)}")
+        self.send_control_message(err)
+        return err
+
     def unsubscribe(
         self,
         request_id: int,

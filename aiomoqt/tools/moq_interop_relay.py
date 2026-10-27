@@ -11,8 +11,11 @@ Limits:
   * No authentication, authorization or rate limiting.
   * A per-stream send budget (--max-inflight-bytes) and a send lane per
     subscriber holding at most LANE_BYTES of live objects: a subscriber
-    that falls further behind loses whole groups, their streams reset;
-    no per-session namespace or subscription caps.
+    that falls further behind loses whole groups, their streams reset.
+  * Per session, at most --max-namespaces-per-session namespace requests
+    (PUBLISH_NAMESPACE, SUBSCRIBE_NAMESPACE, SUBSCRIBE_TRACKS) and
+    --max-subscriptions-per-session SUBSCRIBEs held; past either, a
+    request is refused with EXCESSIVE_LOAD (INTERNAL_ERROR at d14/d16).
   * A bounded recent-object cache per track (CACHE_GROUPS / CACHE_BYTES,
     oldest group dropped) under a relay-wide budget (--cache-bytes),
     which drops the oldest group of the least recently used track, never
@@ -345,6 +348,15 @@ CACHE_BUDGET_BYTES = 256 * 1024 * 1024
 
 # Live object bytes a subscriber's send lane holds before it sheds groups.
 LANE_BYTES = 4 * 1024 * 1024
+# Requests one session may hold open; see the module docstring.
+MAX_NAMESPACES_PER_SESSION = 256
+MAX_SUBSCRIPTIONS_PER_SESSION = 1024
+# Retry Interval of a cap refusal: milliseconds before a retry, plus one.
+CAP_RETRY_MS = 1000
+# id(session) -> its SUBSCRIBE handlers still running.
+_subscribing: Counter = Counter()
+# (id(session), cap) already warned about.
+_cap_warned: set = set()
 
 # MAX_FILTER_RANGES advertised at d20+ (§9.1.6).
 MAX_FILTER_RANGES = 16
@@ -1470,6 +1482,9 @@ def _forget_session(session) -> None:
     _ns_subs[:] = [e for e in _ns_subs if e[0] is not session]
     _announce_subs[:] = [e for e in _announce_subs if e[0] is not session]
     _no_datagrams.pop(id(session), None)
+    _subscribing.pop(id(session), None)
+    _cap_warned.difference_update(
+        [k for k in _cap_warned if k[0] == id(session)])
     for k in [k for k in _announce_requests if k[0] == id(session)]:
         del _announce_requests[k]
     for ns in list(_announced):
@@ -1504,8 +1519,47 @@ def _ns_tuple(namespace):
     return tuple()
 
 
+def _session_namespaces(session) -> int:
+    """Namespace requests the session holds."""
+    held = sum(1 for sid, _ in _announce_requests if sid == id(session))
+    subs = {e[2] for table in (_ns_subs, _track_subs, _announce_subs)
+            for e in table if e[0] is session}
+    return held + len(subs)
+
+
+def _session_subscriptions(session) -> int:
+    """SUBSCRIBEs the session has in flight or attached to a track."""
+    return _subscribing[id(session)] + sum(
+        1 for t in _tracks.values() for d in t.downstream
+        if d.session is session)
+
+
+def _refused_over_cap(session, msg, what: str, cap: int, held: int) -> bool:
+    """Refuse `msg` with EXCESSIVE_LOAD when the session holds `cap`
+    of `what`; one WARNING per session and cap."""
+    if held < cap:
+        return False
+    if (id(session), what) not in _cap_warned:
+        _cap_warned.add((id(session), what))
+        logger.warning(f"relay: session {_addr_of(session)} holds {held} "
+                       f"{what} (cap {cap}): refusing more with "
+                       f"EXCESSIVE_LOAD")
+    session._refuse_peer_request(
+        msg, RequestErrorCode.EXCESSIVE_LOAD,
+        f"too many {what} on this session", retry_interval=CAP_RETRY_MS + 1)
+    return True
+
+
+def _namespaces_full(session, msg) -> bool:
+    return _refused_over_cap(session, msg, "namespaces",
+                             MAX_NAMESPACES_PER_SESSION,
+                             _session_namespaces(session))
+
+
 async def _on_publish_namespace(session, msg):
     """Record the announcing session, ack with default OK path."""
+    if _namespaces_full(session, msg):
+        return
     ns = _ns_tuple(msg.namespace)
     _watch_session(session, ns)
     _supersede_namespace(ns, session)
@@ -2517,6 +2571,21 @@ def _update_filters(session, msg, track, d) -> bool:
 
 
 async def _on_subscribe(session, msg):
+    """Relay a SUBSCRIBE within the session's subscription cap."""
+    if _refused_over_cap(session, msg, "subscriptions",
+                         MAX_SUBSCRIPTIONS_PER_SESSION,
+                         _session_subscriptions(session)):
+        return
+    _subscribing[id(session)] += 1
+    try:
+        await _relay_subscribe(session, msg)
+    finally:
+        _subscribing[id(session)] -= 1
+        if _subscribing[id(session)] <= 0:
+            del _subscribing[id(session)]
+
+
+async def _relay_subscribe(session, msg):
     """Relay a SUBSCRIBE: establish upstream, then fan out downstream."""
     ns = _ns_tuple(msg.track_namespace)
 
@@ -2730,6 +2799,17 @@ def parse_args():
                         help="Object cache budget across all tracks; past "
                              "it the least recently used tracks lose their "
                              "oldest groups. Default: 256 MiB")
+    parser.add_argument("--max-namespaces-per-session", type=int,
+                        default=MAX_NAMESPACES_PER_SESSION, metavar="N",
+                        help="PUBLISH_NAMESPACE, SUBSCRIBE_NAMESPACE and "
+                             "SUBSCRIBE_TRACKS requests one session may "
+                             "hold; more are refused with EXCESSIVE_LOAD. "
+                             f"Default: {MAX_NAMESPACES_PER_SESSION}")
+    parser.add_argument("--max-subscriptions-per-session", type=int,
+                        default=MAX_SUBSCRIPTIONS_PER_SESSION, metavar="N",
+                        help="SUBSCRIBEs one session may hold; more are "
+                             "refused with EXCESSIVE_LOAD. Default: "
+                             f"{MAX_SUBSCRIPTIONS_PER_SESSION}")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug logging (= --log-level debug). "
                              "SIGUSR1 steps the level at runtime: INFO, "
@@ -3077,6 +3157,8 @@ async def _on_subscribe_namespace(session, msg):
     with SUBSCRIBE_TRACKS. d16 sends NAMESPACE, a PUBLISH per matching
     track, or both, as its Subscribe Options ask. d14 forwards matching
     PUBLISH_NAMESPACEs and a PUBLISH per matching track."""
+    if _namespaces_full(session, msg):
+        return
     prefix = _ns_tuple(msg.namespace_prefix)
     _watch_session(session, prefix)
     session.subscribe_namespace_ok(
@@ -3195,6 +3277,8 @@ def _retract_namespace(ns) -> None:
 async def _on_subscribe_tracks(session, msg):
     """§9.5: a SUBSCRIBE_TRACKS subscriber gets a PUBLISH for every
     matching track, present and future."""
+    if _namespaces_full(session, msg):
+        return
     prefix = _ns_tuple(msg.namespace_prefix)
     _watch_session(session, prefix)
     session.subscribe_tracks_ok(msg)
@@ -3783,6 +3867,9 @@ class _Status:
             sp["peak"] = self._ns_peak[ns]
 
         sessions, quic = [], {}
+        held_subs = Counter(id(d.session) for t in _tracks.values()
+                            for d in t.downstream)
+        held_subs.update(_subscribing)
         tx = rx = sent = lost = 0
         rtts = []
         for info in live:
@@ -3816,6 +3903,8 @@ class _Status:
                 "rx_bps": bps(d[1]) if last is not None else None,
                 "loss_pct": (round(100 * d[3] / d[2], 2)
                              if delivery and d[2] else None),
+                "namespaces": _session_namespaces(s),
+                "subscriptions": held_subs[id(s)],
             })
         self._quic_prev = quic
 
@@ -4167,6 +4256,15 @@ async def main():
         sys.exit(2)
     global CACHE_BUDGET_BYTES
     CACHE_BUDGET_BYTES = args.cache_bytes
+    if (args.max_namespaces_per_session <= 0
+            or args.max_subscriptions_per_session <= 0):
+        print("Error: --max-namespaces-per-session and "
+              "--max-subscriptions-per-session must be above 0",
+              file=sys.stderr)
+        sys.exit(2)
+    global MAX_NAMESPACES_PER_SESSION, MAX_SUBSCRIPTIONS_PER_SESSION
+    MAX_NAMESPACES_PER_SESSION = args.max_namespaces_per_session
+    MAX_SUBSCRIPTIONS_PER_SESSION = args.max_subscriptions_per_session
     transport = transport_settings(args)
 
     # Primary listener: WebTransport unless --quic; both with --dual.
@@ -4221,6 +4319,8 @@ async def main():
             "watchdog_s": args.watchdog,
             "cache": {"groups": CACHE_GROUPS, "bytes": CACHE_BYTES,
                       "budget": CACHE_BUDGET_BYTES},
+            "per_session": {"namespaces": MAX_NAMESPACES_PER_SESSION,
+                            "subscriptions": MAX_SUBSCRIPTIONS_PER_SESSION},
         }, handles)
         _background.add(asyncio.create_task(status.run()))
 
