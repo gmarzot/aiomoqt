@@ -75,4 +75,5 @@ SIGUSR1.
   least recently used evicted first) for FETCH and JOIN; no authentication, authorization or rate limiting; a per-stream TX budget
   and a bounded send lane per subscriber, shedding whole groups (streams reset) from one that falls
   behind; per-session caps on namespace requests and SUBSCRIBEs (`--max-namespaces-per-session`,
-  `--max-subscriptions-per-session`), refused past them with EXCESSIVE_LOAD; no delivery timeout. Its module docstring has the details.
+  `--max-subscriptions-per-session`), refused past them with EXCESSIVE_LOAD; tracks no subscriber
+  has forwarded for `--pause-after` (60 s) paused upstream until the next one; no delivery timeout. Its module docstring has the details.

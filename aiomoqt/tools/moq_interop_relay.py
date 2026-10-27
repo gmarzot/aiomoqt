@@ -22,8 +22,9 @@ Limits:
     the live group of a subscribed one: enough to answer a FETCH,
     standalone or joining, over what it still holds; a late subscriber
     starts at the live edge.
-  * Upstream Forward State is raised for a forwarding subscriber, never
-    lowered again.
+  * Upstream Forward State is raised for a forwarding subscriber and
+    lowered again once none has forwarded for --pause-after seconds;
+    a --catalog-probe catalog keeps flowing.
   * No delivery-timeout enforcement.
   * Namespace tables are in memory and global to the process.
 
@@ -204,6 +205,11 @@ DEFAULT_GROUP_ORDER_PROPERTY = 0x22
 CATALOG_PROBE_DELAYS_S = (0.5, 2.0)
 CATALOG_PROBE_SKIP = b"moq-test"
 _catalog_probe = False
+# --pause-after: seconds a pulled track may go with no forwarding
+# subscriber before its upstream Forward State drops to 0; 0 = never.
+PAUSE_AFTER_S = 60.0
+_pause_after = PAUSE_AFTER_S
+_pause_sweep = None
 
 
 async def _await_upstream(timeout: float = None) -> bool:
@@ -695,9 +701,15 @@ class _RelayedTrack:
         self.upstream = None
         # Flow B: the publisher's PUBLISH, held until someone subscribes.
         self.pending_publish = None   # (session, Publish msg)
-        # Answered with Forward State 0 because nobody could be offered
-        # the track yet; raised with REQUEST_UPDATE when one arrives.
-        self.parked = None            # (session, Publish msg)
+        # Upstream Forward State is 0: answered so in PUBLISH_OK, or
+        # lowered by --pause-after; a forwarding subscriber raises it.
+        self.paused = False
+        # The PUBLISH feeding this track, once answered.
+        self.publish_msg = None
+        # Loop time since which no subscriber has forwarded, else None.
+        self.unwatched_since = None
+        # Resumed after a pause: the next object sets complete_from.
+        self._resync = False
         self.downstream: list[_Downstream] = []
         # Send lanes still running, including those of subscribers that
         # have left `downstream` and are draining to their PUBLISH_DONE.
@@ -1017,6 +1029,10 @@ class _RelayedTrack:
             self._last_gid = gid
         if msg.object_id == 0:
             self._heads.add(gid)
+        if self._resync:
+            # Objects before this one went unsent while paused.
+            self._resync = False
+            self.complete_from = (gid, msg.object_id)
         if self.key[1] == CATALOG_TRACK and msg.object_id == 0:
             _note_catalog(self.key[0], payload)
         # On arrival, so a SUBSCRIBE sees it; objects for the subscriber
@@ -1866,7 +1882,7 @@ def _spawn(coro) -> None:
     task.add_done_callback(_background.discard)
 
 
-def _parked_publish(key):
+def _live_published(key):
     """The live track a PUBLISH registered for `key`, else None."""
     track = _tracks.get(key)
     if (track is not None and _track_live(track)
@@ -1984,14 +2000,14 @@ async def _subscribe_publishers(entry):
                 pub.unregister_object_handler(upstream.track_alias)
             refusal = _MANDATORY_REFUSAL
             continue
-        parked = _parked_publish(key)
-        if parked is not None:
+        owned = _live_published(key)
+        if owned is not None:
             # A PUBLISH from another session landed meanwhile and owns
             # the track: never overwrite it.
             _cancel_upstream_subscribe(pub, ns, track_name)
             if upstream.track_alias is not None:
                 pub.unregister_object_handler(upstream.track_alias)
-            return parked, None
+            return owned, None
         track.upstream = upstream
         track.upstream_alias = upstream.track_alias
         track.properties = props
@@ -2225,11 +2241,13 @@ def _answer_publish(track, forward=None) -> None:
                        filter_type=FilterType.LATEST_OBJECT)
     logger.info(f"relay: PUBLISH_OK forward={int(forward)} "
                 f"alias={msg.track_alias}"
-                + ("" if forward else " — parked until a subscriber forwards"))
+                + ("" if forward else " — paused until a subscriber forwards"))
     track.upstream = session
     track.upstream_request_id = msg.request_id
-    track.parked = None if forward else (session, msg)
+    track.paused = not forward
+    track.publish_msg = msg
     track.pending_publish = None
+    _ensure_pause_sweep()
 
 
 def _refuse_publish(session, msg, reason, code=None) -> None:
@@ -2257,22 +2275,101 @@ def _publish_ok_location(msg) -> dict:
     return {"start": start, "end_group": 0, "priority": 128}
 
 
-def _resume_parked_publish(track) -> None:
-    """Raise a parked publisher's Forward State once a subscriber
+def _upstream_request(track):
+    """(session, request id, d14 SUBSCRIBE_UPDATE location) of the
+    request feeding `track`, or None."""
+    up = track.upstream
+    if _is_session(up):
+        msg = track.publish_msg
+        if msg is None:
+            return None
+        return up, msg.request_id, _publish_ok_location(msg)
+    session = getattr(up, "session", None)
+    rid = getattr(up, "request_id", None)
+    if session is None or rid is None:
+        return None
+    return session, rid, {}
+
+
+def _resume_paused(track) -> None:
+    """Raise a paused upstream's Forward State once a subscriber
     forwards."""
-    if track.parked is None or not _forwarding(track):
+    if not track.paused or not _forwarding(track):
         return
-    session, msg = track.parked
-    track.parked = None
-    track.complete_from = _publish_ok_location(msg)["start"]
+    req = _upstream_request(track)
+    if req is None:
+        return
+    session, rid, location = req
+    track.paused = False
+    track.unwatched_since = None
+    if track._objects_in:
+        track.complete_from = None
+        track._resync = True
+    elif track.publish_msg is not None:
+        track.complete_from = location["start"]
     try:
-        session.request_update(msg.request_id, forward=1,
-                               **_publish_ok_location(msg))
-        logger.info(f"relay: REQUEST_UPDATE forward=1 "
-                    f"alias={msg.track_alias}")
+        session.request_update(rid, forward=1, **location)
+        logger.info(f"relay: resumed {track.key} upstream: REQUEST_UPDATE "
+                    f"forward=1 request {rid}")
     except Exception:
-        logger.debug("relay: raising the parked forward state failed",
+        logger.debug("relay: raising the upstream forward state failed",
                      exc_info=True)
+
+
+def _pause_upstream(track) -> None:
+    """Lower the upstream Forward State of a track nobody forwards."""
+    track.unwatched_since = None
+    req = _upstream_request(track)
+    if req is None or not _session_live(req[0]):
+        return
+    session, rid, location = req
+    try:
+        session.request_update(rid, forward=0, **location)
+    except Exception:
+        logger.debug("relay: lowering the upstream forward state failed",
+                     exc_info=True)
+        return
+    track.paused = True
+    logger.info(f"relay: paused {track.key} upstream, no forwarding "
+                f"subscriber for {_pause_after:g}s: REQUEST_UPDATE "
+                f"forward=0 request {rid}")
+
+
+def _pausable(track) -> bool:
+    """Pulled from upstream with no subscriber forwarding it."""
+    if (track.paused or track.finished or track._closed or track.attaching
+            or track.pending_publish is not None or track.upstream is None
+            or track.key in _establishing or _probing(track)):
+        return False
+    return not (any(d.forward and _session_live(d.session)
+                    for d in track.downstream)
+                or any(_held_forwards.get(track.key, ())))
+
+
+async def _sweep_unwatched() -> None:
+    """Pause each track left unwatched for --pause-after seconds."""
+    loop = asyncio.get_running_loop()
+    while _pause_after > 0:
+        await asyncio.sleep(min(max(_pause_after / 4, 0.02), 1.0))
+        now = loop.time()
+        for track in list(_tracks.values()):
+            if not _pausable(track):
+                track.unwatched_since = None
+            elif track.unwatched_since is None:
+                track.unwatched_since = now
+            elif now - track.unwatched_since >= _pause_after:
+                _pause_upstream(track)
+
+
+def _ensure_pause_sweep() -> None:
+    """Run the sweep on this loop while --pause-after is on."""
+    global _pause_sweep
+    if _pause_after <= 0:
+        return
+    loop = asyncio.get_running_loop()
+    if (_pause_sweep is None or _pause_sweep.done()
+            or _pause_sweep.get_loop() is not loop):
+        _pause_sweep = loop.create_task(_sweep_unwatched())
 
 
 def _largest_kwargs(track) -> dict:
@@ -2346,6 +2443,7 @@ def _attach_subscriber(session, msg, track, largest) -> bool:
         track._ensure_drain()
         return False
     _watch_session(session, track.key[0])
+    _ensure_pause_sweep()
     ok = session.subscribe_ok(request_msg=msg, **_largest_kwargs(track),
                               track_properties=track.properties)
     # FORWARD omitted means 1 (§10.2.12).
@@ -2554,7 +2652,7 @@ def _apply_update(session, msg, found, d16: bool) -> None:
         control_log.info(f"MOQT send: {session._msgstr(ok)}")
         session._send_reply(msg.request_id, ok)
         _start_fill(track, d, msg)
-    _resume_parked_publish(track)
+    _resume_paused(track)
 
 
 def _update_filters(session, msg, track, d) -> bool:
@@ -2646,7 +2744,7 @@ async def _relay_subscribe(session, msg):
         await _backfill(track, msg, largest)
         if _attach_subscriber(session, msg, track, largest):
             _answer_publish(track)
-            _resume_parked_publish(track)
+            _resume_paused(track)
             logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
                         f"-> SUBSCRIBE_OK (published track, fanout="
                         f"{len(track.downstream)})")
@@ -2672,7 +2770,7 @@ async def _relay_subscribe(session, msg):
             await _backfill(track, msg, largest)
             if _attach_subscriber(session, msg, track, largest):
                 _answer_publish(track)
-                _resume_parked_publish(track)
+                _resume_paused(track)
                 logger.info(f"relay: subscribe ns={ns} "
                             f"track={msg.track_name} -> SUBSCRIBE_OK "
                             f"(fanout={len(track.downstream)})")
@@ -2778,6 +2876,13 @@ def parse_args():
                              "namespace's catalog track at once, so the "
                              "dashboard shows its MSF format before anyone "
                              "plays it. Skips namespaces starting moq-test.")
+    parser.add_argument("--pause-after", type=float, default=PAUSE_AFTER_S,
+                        metavar="SEC",
+                        help="Pause a track upstream (Forward State 0) once "
+                             "no subscriber has forwarded it for SEC "
+                             "seconds; the next subscriber resumes it. "
+                             "--catalog-probe catalogs keep flowing. "
+                             f"0 = never. Default: {PAUSE_AFTER_S:g}")
     parser.add_argument("--control", type=str, default=None, metavar="PATH",
                         help="Serve HTTP on the Unix socket PATH: GET /debug "
                              "reports DEBUG logging, POST /debug toggles it")
@@ -2915,7 +3020,7 @@ async def _offer_track(session, track, key, request_id=None):
         pub_msg.request_id,
         lambda rid, t=track, s=session: t.drop_session(s))
     _answer_publish(track)
-    _resume_parked_publish(track)
+    _resume_paused(track)
     logger.info(f"relay: PUBLISH offer accepted for {key} "
                 f"alias={pub_msg.track_alias} forward={int(bool(forward))} "
                 f"(fanout={len(track.downstream)})")
@@ -3683,8 +3788,8 @@ def _track_state(track, flowing) -> str:
         return "ended"
     if track.pending_publish is not None:
         return "held"
-    if track.parked is not None:
-        return "parked"
+    if track.paused:
+        return "parked"  # dashboard.js state name
     return "live" if flowing else "idle"
 
 
@@ -4242,9 +4347,12 @@ async def _serve_control(path: str) -> None:
 
 
 async def main():
-    global _catalog_probe
+    global _catalog_probe, _pause_after
     args = parse_args()
     _catalog_probe = args.catalog_probe
+    if args.pause_after < 0:
+        sys.exit("error: --pause-after must be 0 or above")
+    _pause_after = args.pause_after
     speaks = sorted(int(d) for d in MOQTDraft)
     wanted = args.draft if isinstance(args.draft, list) else [args.draft]
     if any(d not in speaks for d in wanted):
