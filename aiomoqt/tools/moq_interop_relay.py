@@ -2896,12 +2896,10 @@ def parse_args():
                              f"{LOG_FILE_BYTES >> 20} MB x {LOG_FILE_BACKUPS}) "
                              "and send crash and stall dumps to "
                              "DIR/crash.log. Off by default.")
-    # cubic: about 65% more fan-out than bbr on one worker, whose sends
-    # are syscall-bound; bbr's per-peer pacing defeats send batching.
-    parser.add_argument("--cc-algo", type=str, default="cubic",
-                        help="Congestion control (cubic | bbr | bbr1 | c4 | "
-                             "newreno | dcubic | prague | fast). Default: "
-                             "cubic")
+    parser.add_argument("--cc-algo", type=str, default="bbr",
+                        help="Congestion control (bbr | bbr1 | c4 | cubic | "
+                             "dcubic | fast | newreno | prague). Default: "
+                             "bbr")
     parser.add_argument("--max-connections", type=int, default=4096,
                         help="Most connections held at once (aiopquic "
                              ">= 0.5.1). Default: 4096")

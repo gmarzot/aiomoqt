@@ -137,8 +137,9 @@ sweep.
 
 ### Congestion control
 
-`--cc-algo` selects it: bbr, bbr1, newreno, cubic, dcubic, prague, fast.
-Default is bbr1. **Label every result with the algorithm actually used.**
+`--cc-algo` selects it: bbr, bbr1, c4, cubic, dcubic, fast, newreno, prague.
+Default is bbr (BBRv3) in every tool and the relay.
+**Label every result with the algorithm actually used.**
 "BBR" does not name the same algorithm across implementations, and a
 cubic control run is the one posture every stack shares.
 

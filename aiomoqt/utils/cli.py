@@ -249,10 +249,9 @@ def add_session(p):
     p.add_argument('--keylogfile', type=str, default=None,
                    help='TLS secrets log (NSS Key Log Format) for '
                         'Wireshark decryption')
-    p.add_argument('--cc-algo', type=str, default=None,
-                   help='Congestion control (bbr | bbr1 | newreno | '
-                        'cubic | dcubic | prague | fast). Default: '
-                        'aiopquic default (bbr1)')
+    p.add_argument('--cc-algo', type=str, default='bbr',
+                   help='Congestion control (bbr | bbr1 | c4 | cubic | '
+                        'dcubic | fast | newreno | prague). Default: bbr')
     p.add_argument('--max-queued-bytes', type=int, default=None,
                    help='Aggregate publisher TX budget across ALL '
                         'streams. Default: aiopquic default (4 MiB). '

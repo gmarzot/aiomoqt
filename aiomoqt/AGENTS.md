@@ -62,14 +62,11 @@ SIGUSR1.
 
 - TLS: clients verify the relay's certificate by default. A self-signed relay needs `-k` /
   `verify_tls=False`; a private CA goes in `ca_file=`.
-- Congestion control: aiopquic's default is `bbr1`; `moq-interop-relay` defaults to `cubic`;
-  moqx defaults to BBR2.
-  `--cc-algo` takes `bbr` (v3), `bbr1`, `c4`, `cubic`, `dcubic`, `fast`, `newreno`, `prague`
-  and `reno`. Open theory: BBRv1 ProbeRTT (cwnd floored at 4 packets for ≥200 ms, every 10 s
-  once min-RTT goes stale under jitter) may cause periodic latency spikes on paced flows. It
-  was seen once on a loaded loopback host (10 s-periodic p99 rows of ~70 ms with `bbr1`, none
-  with `newreno`) and is unconfirmed on WAN paths. If you see 10 s-periodic spikes, A/B with
-  `--cc-algo cubic`.
+- Congestion control: the default is `bbr` (BBRv3) everywhere: `MOQTClient`, `MOQTServer`,
+  `aiomoqt-relay`, the tools and the examples, whichever aiopquic is installed.
+  `congestion_control_algorithm=None` defers to a passed `configuration` or to aiopquic's own
+  default. moqx defaults to BBR2. `--cc-algo` takes `bbr`, `bbr1`, `c4`, `cubic`, `dcubic`,
+  `fast`, `newreno`, `prague` and `reno`.
 - Loopback timing: picoquic's BBRv3 is reported to freeze cwnd below 128 µs RTT (upstream
   #2118), not reproduced on the current pin. Use `cubic` or `newreno` for loopback timing runs.
 - `moq-relay-probe --relays-file` reads its own relay-list schema; use `--url` for a single probe.
