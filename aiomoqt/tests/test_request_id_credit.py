@@ -36,6 +36,7 @@ def _stub(draft):
     s._peer_requests = {}
     s._requests = {}
     s._peer_request_max = -1
+    s._peer_request_low = 0
     s._peer_request_seen = set()
     s._track_aliases = {}
     s._published_tracks = {}
@@ -271,3 +272,34 @@ async def test_credit_waits_while_the_peer_holds_too_many_requests_open(
             session.subscribe("credit", "again")
     finally:
         handle.close()
+
+
+def _reorder_stub(draft):
+    s = _stub(draft)
+    s._get_control_entry = lambda _: (TrackStatus, None)
+    s._route_reply = lambda _: None
+    s._resolve_auth_token = lambda _: None
+    s._refuse_request = lambda _: None
+    s._track_handler = lambda _: None
+    return s
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("draft", [18, 20, 22])
+async def test_request_delayed_behind_many_later_ones_is_accepted(draft):
+    s = _reorder_stub(draft)
+    for rid in range(3, 134, 2):
+        _feed(s, rid)
+    _feed(s, 1)
+    assert not s.closed
+    assert s._peer_request_low == 135 and not s._peer_request_seen
+    _feed(s, 77)                                  # a true duplicate
+    assert s.closed and s.closed[0][0] == SessionCloseCode.INVALID_REQUEST_ID
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("draft", [18, 20, 22])
+async def test_request_with_wrong_parity_closes(draft):
+    s = _reorder_stub(draft)
+    _feed(s, 4)
+    assert s.closed and s.closed[0][0] == SessionCloseCode.INVALID_REQUEST_ID
