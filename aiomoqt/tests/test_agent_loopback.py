@@ -70,7 +70,7 @@ async def _publishing(port, use_quic):
 
     async def _on_publish_namespace(session, msg):
         seen["namespaces"].append(_name(msg.namespace))
-        session.publish_namepace_ok(msg)
+        session.publish_namespace_ok(msg)
         _found(session)
 
     async def _on_publish(session, msg):

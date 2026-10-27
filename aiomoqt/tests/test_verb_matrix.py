@@ -156,6 +156,10 @@ MATRIX = [
      lambda s: s.fetch_ok(request_id=7)),
     ("fetch_error", (14, 16, 18), "reply",
      lambda s: s.fetch_error(request_id=7)),
+    ("publish_namespace_ok", (14, 16, 18), "reply",
+     lambda s: s.publish_namespace_ok(
+         PublishNamespace(request_id=7, namespace=(b"a",),
+                          parameters={}))),
     ("publish_namepace_ok", (14, 16, 18), "reply",
      lambda s: s.publish_namepace_ok(
          PublishNamespace(request_id=7, namespace=(b"a",),

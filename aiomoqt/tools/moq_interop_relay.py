@@ -1522,7 +1522,7 @@ async def _on_publish_namespace(session, msg):
     _forward_announcements(ns, session)
     # Reuse the protocol's built-in OK helper. It emits RequestOk on
     # d16+ and PublishNamespaceOk on d14, matching peer expectation.
-    session.publish_namepace_ok(msg)
+    session.publish_namespace_ok(msg)
     if _catalog_probe and _probe_wanted(ns):
         _spawn(_probe_catalog(ns))
 

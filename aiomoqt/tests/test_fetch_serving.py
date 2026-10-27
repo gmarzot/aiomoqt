@@ -148,7 +148,7 @@ async def _loopback(port, use_quic, prefill=3, draft=18, held_groups=None):
     async def _on_publish_namespace(session, msg):
         session.on_fetch_object = (
             lambda obj, _n, _ts, rid: fetched.setdefault(rid, []).append(obj))
-        session.publish_namepace_ok(msg)
+        session.publish_namespace_ok(msg)
         if not peer.done():
             peer.set_result(session)
 

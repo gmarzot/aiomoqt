@@ -34,7 +34,7 @@ async def _peers(port, use_quic, draft, on_tracks):
     peer = asyncio.get_running_loop().create_future()
 
     async def _on_publish_namespace(session, msg):
-        session.publish_namepace_ok(msg)
+        session.publish_namespace_ok(msg)
         if not peer.done():
             peer.set_result(session)
 
