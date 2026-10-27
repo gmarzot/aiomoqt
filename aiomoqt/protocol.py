@@ -6,6 +6,7 @@ import time
 from asyncio import Future
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import (Any, Callable, DefaultDict, Dict, List, Optional, Set,
                     Tuple, Type, Union)
 
@@ -2716,6 +2717,8 @@ class _MOQTSessionMixin:
         self._settle_cancelled_request(request_id, f"FIN (stream {stream_id})")
         self.stream_fin(stream_id)
 
+    # Read-only default for sessions built without __init__.
+    _bidi_stream_requests: Dict[int, int] = MappingProxyType({})
     # Ended halves of bound request streams: stream_id -> bits.
     _LOCAL_HALF, _PEER_HALF = 1, 2
     _request_stream_ends: Optional[Dict[int, int]] = None
