@@ -196,3 +196,9 @@ expected, and the dashboard leaves it out.
 ## Taking it down
 
 `docker compose down` stops everything; `docker stop aiomoqt-relay` stops just the relay.
+
+On SIGTERM the relay drains: it refuses new sessions, sends every session GOAWAY with an empty
+New Session URI (reconnect to the same address), waits up to 5 s (`--drain-timeout`) for them
+to leave, then exits. `stop_grace_period: 15s` gives the drain room before Docker kills it.
+`--goaway-uri URL` points peers at another relay instead. pub_media `--reconnect` redials at
+once on GOAWAY.
