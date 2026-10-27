@@ -112,10 +112,9 @@ def parse_args():
              'd14 server offers only "moq-00" while a d16+ client offers '
              '"moqt-NN", so the asymmetric ALPN offer fails to connect.')
     parser.add_argument(
-        '--cc-algo', type=str, default=None,
-        help='Congestion control algorithm '
-             '(bbr | bbr1 | newreno | cubic | dcubic | prague | fast). '
-             'Default: aiopquic default (bbr1)')
+        '--cc-algo', type=str, default='bbr',
+        help='Congestion control (bbr | bbr1 | c4 | cubic | dcubic | '
+             'fast | newreno | prague). Default: bbr')
     parser.add_argument(
         '--max-inflight-bytes', type=int, default=None,
         help='Per-stream TX budget (aiomoqt tx_max_inflight_bytes): '
@@ -152,7 +151,6 @@ def print_banner(args):
     host = f"[{args.bind}]" if ':' in args.bind else args.bind
     url = (f"moqt://{host}:{args.port}" if args.quic
            else f"https://{host}:{args.port}/")
-    cc = args.cc_algo or "bbr1 (default)"
     if args.rate > 0:
         per_stream = (args.rate / args.streams
                       if args.streams > 1 else args.rate)
@@ -170,7 +168,7 @@ def print_banner(args):
     row("url", url)
     row("transport", transport_label)
     row("delivery", "DATAGRAM" if args.datagram else "subgroup streams")
-    row("cc algorithm", cc)
+    row("cc algorithm", args.cc_algo)
     row("sub-groups", args.streams)
     row("group size", f"{args.group_size} objects")
     row("object size", f"{args.object_size} B")

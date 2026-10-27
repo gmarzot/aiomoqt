@@ -28,10 +28,9 @@ def parse_args():
                         help='Duration seconds (default: 30)')
     parser.add_argument('-d', '--debug', action='store_true', help='Enable debug output')
     parser.add_argument('--keylogfile', type=str, default=None, help='TLS secrets file')
-    parser.add_argument('--cc-algo', type=str, default=None,
-                        help='Congestion control algorithm '
-                             '(bbr | bbr1 | newreno | cubic | dcubic | '
-                             'prague | fast). Default: aiopquic default (bbr1)')
+    parser.add_argument('--cc-algo', type=str, default='bbr',
+                        help='Congestion control (bbr | bbr1 | c4 | cubic | '
+                             'dcubic | fast | newreno | prague). Default: bbr')
     add_help(parser)
     args = parser.parse_args()
     # One positional URL replaces -h/--port/--path/-q: the scheme
@@ -43,7 +42,7 @@ def parse_args():
 
 
 async def main(host: str, port: int, path: str, namespace: str, track_name: str,
-               use_quic: bool, debug: bool, cc_algo: str = None,
+               use_quic: bool, debug: bool, cc_algo: str = 'bbr',
                insecure: bool = False, draft=None, duration: int = 30):
     log_level = logging.DEBUG if debug else logging.INFO
     set_log_level(log_level)

@@ -34,7 +34,7 @@ class MOQTClient(MOQTPeer):
         quic_debug_log: Optional[str] = None,
         supported_drafts: Optional[Union[int, List[int]]] = None,
         libquicr_compat: Optional[bool] = False,
-        congestion_control_algorithm: Optional[str] = None,
+        congestion_control_algorithm: Optional[str] = "bbr",
         tx_max_inflight_bytes: Optional[int] = DEFAULT_TX_MAX_INFLIGHT_BYTES,
         tx_max_queued_bytes: Optional[int] = None,
         keep_alive_interval: Optional[float] = None,
@@ -144,7 +144,7 @@ class MOQTClient(MOQTPeer):
                 cfg.cafile = self.ca_file
             if self.qlog_dir is not None and cfg.qlog_dir is None:
                 cfg.qlog_dir = self.qlog_dir
-            # None defers to the aiopquic default (bbr1).
+            # None defers to the configuration or aiopquic default.
             if self.congestion_control_algorithm is not None:
                 cfg.congestion_control_algorithm = (
                     self.congestion_control_algorithm)
@@ -199,7 +199,7 @@ class MOQTClient(MOQTPeer):
         if self.qlog_dir is not None and wt_cfg.qlog_dir is None:
             wt_cfg.qlog_dir = self.qlog_dir
         self.effective_configuration = wt_cfg
-        # None defers to the aiopquic default (bbr1).
+        # None defers to the configuration or aiopquic default.
         if self.congestion_control_algorithm is not None:
             wt_cfg.congestion_control_algorithm = (
                 self.congestion_control_algorithm)
