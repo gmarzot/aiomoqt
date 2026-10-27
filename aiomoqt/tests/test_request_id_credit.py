@@ -195,7 +195,10 @@ async def test_compat_still_honours_a_max_request_id(draft, missing_credit):
 
 
 def test_apply_compat_sets_missing_request_credit(monkeypatch):
+    from aiomoqt.messages.base import MOQTMessage
     from aiomoqt.utils.workers import apply_compat
+    # "all" also turns on lenient-extensions; restore it after the test.
+    monkeypatch.setattr(MOQTMessage, "_tolerate_trailing_extensions", False)
     monkeypatch.setattr(_MOQTSessionMixin, "_tolerate_missing_request_credit",
                         False)
     apply_compat("missing-request-credit")
