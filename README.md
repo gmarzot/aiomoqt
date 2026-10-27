@@ -11,7 +11,7 @@ It follows the standard `asyncio` transport/protocol pattern via subclasses of `
 | Drafts | draft-14, draft-16, draft-18, draft-20, draft-22 — negotiated newest-first, default offer `(22, 20, 18, 16, 14)` |
 | Transports | raw QUIC (ALPN `moq-00` / `moqt-NN`), H3/WebTransport (WT-Protocol) |
 | Roles | publisher, subscriber, server (origin), single-port dual-transport server |
-| Data delivery | SubgroupHeader streams (TX + RX); OBJECT_DATAGRAM (TX + RX over raw QUIC, RX over WT) |
+| Data delivery | SubgroupHeader streams (TX + RX); OBJECT_DATAGRAM (TX + RX over raw QUIC and WT) |
 | Control | full message set with sync/async response handling; `MOQTRequestError` is draft-independent |
 | Fetch / join | FETCH, JOINING_SUBSCRIBE (relative and absolute) over both transports |
 | Media | MSF catalogs; LOC packaging (draft-ietf-moq-loc); CMSF/CMAF packaging (draft-ietf-moq-cmsf) |
@@ -148,7 +148,7 @@ await session.publish_namespace(namespace='ns', wait_response=True)
 
 A full track name (namespace + name) serves one track per session.
 
-`StreamMapping` selects the data-plane shape: `PER_GROUP` (subgroup stream per group) or `DATAGRAM` (one object per datagram; raw QUIC only — see Limitations).
+`StreamMapping` selects the data-plane shape: `PER_GROUP` (subgroup stream per group) or `DATAGRAM` (one object per datagram, raw QUIC or WebTransport; the object must fit one packet).
 
 ### Auth
 
@@ -411,14 +411,12 @@ aiopquic:  0.6.1 (~/.venv/lib/python3.13/site-packages/aiopquic) [2026-10-21 16:
 
 ## Limitations
 
-- **WebTransport datagram TX is not implemented.** Datagram publishing and reception work over raw QUIC; on WebTransport, datagram reception works but `StreamMapping.DATAGRAM` publishing raises. Use `PER_GROUP` mapping over WebTransport.
 - **`relay_probe -f` and `tests/relays.json` use different schemas.** The probe expects a top-level array of `{id, name, endpoints:[{url}]}`; the interop catalog is `{relays:[{name, urls:{...}, drafts:[...]}]}`. Use `--url` for single-endpoint probes until the loader accepts both.
 - **`aiomoqt-relay` has no authentication or rate limiting** and no delivery timeout; a subscriber that falls more than its send lane's bound behind loses whole groups. Its cache budget (`--cache-bytes`) never drops a subscribed track's live group, so live groups alone can exceed it. See [aiomoqt-relay](#aiomoqt-relay).
 
 ## Roadmap
 
 - Single-port interop-runner adapter — one relay image and one port via `serve_dual()`
-- WebTransport datagram TX
 - Binding-deadline reaper for data streams whose track-alias binding never completes
 - Broader CI test coverage — the workflow currently names a subset of the suite explicitly
 

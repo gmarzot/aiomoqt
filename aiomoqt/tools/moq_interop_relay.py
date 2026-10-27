@@ -1298,8 +1298,8 @@ class _RelayedTrack:
                 session.send_dgram_message(dgram.serialize(prof=prof))
                 return
             except NotImplementedError:
-                # WebTransport datagram TX is not wired in aiopquic yet;
-                # deliver on a subgroup stream rather than drop objects.
+                # A transport with no datagram TX: deliver on a subgroup
+                # stream rather than drop objects.
                 _no_datagrams[id(session)] = True
                 logger.warning("relay: no datagram TX on this session, "
                                "forwarding objects on streams")
