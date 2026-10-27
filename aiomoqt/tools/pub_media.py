@@ -146,8 +146,7 @@ def parse_args():
                         help='Send frames as fast as accepted instead '
                              'of pacing to their timestamps')
     parser.add_argument('-D', '--datagram', action='store_true',
-                        help='Send the AUDIO track as ObjectDatagrams '
-                             '(raw QUIC only)')
+                        help='Send the AUDIO track as ObjectDatagrams')
     parser.add_argument('--no-audio', action='store_true',
                         help='Video only — omit the audio track')
     parser.add_argument('--tone', action='store_true',

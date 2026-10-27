@@ -140,15 +140,20 @@ def test_datagram_guard_allows_fitting_object():
     p = cli.make_parser("t")
     cli.add_publisher_media(p)
     args = p.parse_args(["-D", "-s", str(cli.DGRAM_MAX_OBJECT)])
-    cli.check_datagram(p, args, serve_quic=True)   # no raise
+    cli.check_datagram(p, args)   # no raise
 
 
-def test_datagram_guard_rejects_wt_transport():
-    p = cli.make_parser("t")
-    cli.add_publisher_media(p)
-    args = p.parse_args(["-D", "-s", "512"])
-    with pytest.raises(SystemExit):
-        cli.check_datagram(p, args, serve_quic=False)
+@pytest.mark.parametrize("tool,argv", [
+    ("aiomoqt.tools.pub_bench", ["https://localhost:4433/moq"]),
+    ("aiomoqt.tools.pub_bench", ["localhost:4433"]),
+    ("aiomoqt.tools.pub_server", ["-W"]),
+    ("aiomoqt.tools.loopback_bench", ["-W"]),
+    ("aiomoqt.examples.pub_example", ["https://localhost:4433/moq"]),
+])
+def test_datagram_accepted_over_webtransport(tool, argv, monkeypatch):
+    mod = importlib.import_module(tool)
+    monkeypatch.setattr(sys, "argv", [tool, *argv, "--datagram", "-s", "512"])
+    assert mod.parse_args().datagram is True
 
 
 def test_url_and_listener_options_are_mutually_exclusive():

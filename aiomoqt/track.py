@@ -1090,9 +1090,7 @@ class PublishedTrack(Track):
         if cap == 0:
             raise ValueError(
                 "datagram delivery unavailable on this session "
-                "(peer did not negotiate QUIC datagrams, or the "
-                "transport is WebTransport — WT datagram TX is not "
-                "wired yet)")
+                "(peer did not negotiate QUIC datagrams)")
         if self.object_size + _DGRAM_HEADER_MARGIN > cap:
             raise ValueError(
                 f"object_size={self.object_size} cannot fit one "

@@ -4269,15 +4269,35 @@ class _MOQTSessionMixin:
 
     def datagram_max_payload(self) -> int:
         """Usable per-datagram payload ceiling on this session's
-        transport: min(local TP, peer TP, guaranteed MTU floor). 0 =
-        datagrams unavailable (peer didn't negotiate, handshake not
-        complete, or WT transport — WT datagram TX isn't wired yet)."""
+        transport: min(local TP, peer TP, guaranteed MTU floor), less
+        the HTTP datagram Quarter Stream ID on WebTransport. 0 =
+        datagrams unavailable (peer didn't negotiate, or handshake not
+        complete)."""
         if getattr(self, '_is_wt', False):
-            return 0
+            return self._wt_datagram_max_payload()
         q = self._quic
         if q is None or not hasattr(q, 'max_datagram_payload'):
             return 0
         return q.max_datagram_payload()
+
+    def _wt_datagram_max_payload(self) -> int:
+        tr = getattr(self, '_transport', None)
+        ptr = getattr(self, 'cnx_ptr', 0)
+        if tr is None or not ptr or self._quic is None:
+            return 0
+        try:
+            ceiling = tr.datagram_payload_ceiling(ptr)
+            qsid = self.control_stream_id // 4
+        except (AttributeError, TypeError):
+            return 0
+        if not ceiling:
+            return 0
+        # Quarter Stream ID varint that h3zero prefixes to the payload.
+        qsid_len = 1 if qsid < 0x40 else 2 if qsid < 0x4000 else (
+            4 if qsid < 0x40000000 else 8)
+        # aiopquic's per-session record cap (send_datagram_frame bound).
+        record_cap = getattr(self, '_dgram_max_payload', ceiling)
+        return max(0, min(ceiling - qsid_len, record_cap))
 
     async def send_padding(self, size: int, *,
                            datagram: bool = False) -> Optional[int]:

@@ -2,6 +2,7 @@
 
 ## v0.14.0
 
+- Datagram tracks publish over WebTransport: `datagram_max_payload()` reports the WT session's ceiling, and `-D` is accepted over `https://`.
 - Malformed input is a protocol error: a control message that does not decode, or an invalid FETCH object (formerly a stream reset), closes the session with PROTOCOL_VIOLATION and a short reason; an Object whose Properties do not parse resets its stream as a malformed track; a length past the message is refused before it is read; invalid UTF-8 in a reason phrase is replaced, not an error.
 - Data streams use their track's publisher priority as the transport band, FIFO within a band (`MOQTPeer.stream_scheduling`, `PublishedTrack(stream_scheduling=)`, aiomoqt-relay `--stream-scheduling` select round_robin); undeclared streams sit at the neutral 128, and pub_media declares audio 64 above video 128.
 - aiomoqt-relay: each subscriber has its own bounded send lane, so a slow subscriber no longer throttles a track for the others or starves a late joiner; past the bound it loses whole groups, their streams reset; status shows each subscriber's lane depth and sheds.

@@ -417,17 +417,19 @@ def publish_dones(monkeypatch):
 
 
 @requires_certs
+@pytest.mark.parametrize('use_quic', [True, False], ids=['quic', 'wt'])
 async def test_datagram_too_large_exits_64(tmp_path, monkeypatch, arrivals,
-                                           publish_dones, h264_aac, capsys):
+                                           publish_dones, h264_aac, capsys,
+                                           use_quic):
     from aiomoqt.tests._certs import CERT, KEY
     from aiomoqt.tools import moq_interop_relay as relay
     from aiomoqt.tools import sub_media
-    port = _BASE_PORT + 50
-    url = f'moqt://localhost:{port}/'
+    port = _BASE_PORT + (50 if use_quic else 55)
+    url = f"{'moqt' if use_quic else 'https'}://localhost:{port}/"
     relay._announced.clear()
     relay._tracks.clear()
     handle = await relay._build_server('localhost', port, CERT, KEY,
-                                       use_quic=True, draft=18).serve()
+                                       use_quic=use_quic, draft=18).serve()
     # pcm-s16 tone: 3840 B per 20 ms frame, over any datagram limit.
     pub_args = _argv(monkeypatch, 'pub_media', url, '-k', '--draft', '18',
                      '-t', '6', '--stats', '0', '--pub-ns', '-N', 'mtt/dg',
@@ -461,13 +463,16 @@ async def test_datagram_too_large_exits_64(tmp_path, monkeypatch, arrivals,
 
 
 @requires_certs
+@pytest.mark.parametrize('use_quic', [True, False], ids=['quic', 'wt'])
 async def test_aac_and_opus_fit_datagrams(tmp_path, monkeypatch, arrivals,
-                                          h264_aac):
+                                          h264_aac, use_quic):
     opus = _encode(tmp_path / 'o.mp4', 'mp4', layout='stereo')
     for k, clip in enumerate((h264_aac, opus)):
         arrivals.clear()
-        rows = await _analyze(monkeypatch, tmp_path, _BASE_PORT + 51 + k,
-                              ['--mp4', clip, '--loop', '-D'])
+        rows = await _analyze(monkeypatch, tmp_path,
+                              _BASE_PORT + 51 + k + 2 * (not use_quic),
+                              ['--mp4', clip, '--loop', '-D'],
+                              use_quic=use_quic)
         assert int(rows['audio']['objects']) > 20
         assert {sg for _, sg, _ in _subgroups(arrivals, 'audio')} == {None}
 

@@ -98,8 +98,8 @@ def parse_args():
         help='H3/WebTransport (the default)')
     parser.add_argument(
         '-D', '--datagram', action='store_true',
-        help='ObjectDatagrams instead of subgroup streams (requires '
-             '-q; object must fit one packet, ~1150B max payload). '
+        help='ObjectDatagrams instead of subgroup streams (object '
+             'must fit one packet, ~1150B max payload). '
              'The stream/datagram A/B lever: run twice at the same -s '
              'and -r, once with and once without.')
     parser.add_argument(
@@ -139,9 +139,6 @@ def parse_args():
         args.insecure = args.cert is None
     args.cert = args.cert or CERT
     args.key = args.key or KEY
-    if args.datagram and not args.quic:
-        parser.error("-D/--datagram requires -Q (raw QUIC); "
-                     "WT datagram TX is not wired yet")
     if args.datagram and args.object_size > 1152:
         parser.error(f"--datagram: object_size {args.object_size} can "
                      f"never fit a DATAGRAM frame (max ~1152B payload "

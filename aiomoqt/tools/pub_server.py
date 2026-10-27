@@ -127,15 +127,12 @@ def parse_args():
     _cli.add_help(parser)
     parser.add_argument(
         '-D', '--datagram', action='store_true',
-        help='ObjectDatagrams instead of subgroup streams (requires '
-             '-q raw QUIC; object must fit one packet, ~1150B max)')
+        help='ObjectDatagrams instead of subgroup streams (object '
+             'must fit one packet, ~1150B max)')
     _cli.add_timestamps(parser)
     args = parser.parse_args()
     if not args.quic and not args.wt:
         args.wt = True
-    if args.datagram and not args.quic:
-        parser.error("-D/--datagram requires -Q (raw QUIC); "
-                     "WT datagram TX is not wired yet")
     if args.datagram and args.object_size > 1152:
         parser.error(f"-D/--datagram: object_size {args.object_size} "
                      f"can never fit a DATAGRAM frame (max ~1152B)")

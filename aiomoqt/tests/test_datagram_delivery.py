@@ -1,4 +1,5 @@
-"""End-to-end OBJECT_DATAGRAM delivery over raw QUIC loopback.
+"""End-to-end OBJECT_DATAGRAM delivery over raw QUIC and WebTransport
+loopback.
 
 Covers the pull-model datagram publish path (PublishedTrack
 forwarding=DATAGRAM → dgram_write_drain → aiopquic record ring →
@@ -7,7 +8,8 @@ prepare_datagram) and its guards:
 - delivery e2e per draft (d14/16/18), objects arrive via
   on_object_received with correct ids, payloads, and end-of-group bits
 - oversize object_size refused at publish() (frames cannot fragment)
-- concurrent stream + datagram tracks on one connection
+- concurrent stream + datagram tracks on one connection, both
+  transports
 
 Producer backpressure (bounded record ring) is asserted at the
 transport layer: aiopquic tests/test_loopback.py
@@ -32,16 +34,20 @@ _N_OBJECTS = 12
 _GROUP_SIZE = 4
 
 
-def _server(port, draft=18):
+_TRANSPORTS = pytest.mark.parametrize("use_quic", [True, False],
+                                      ids=["quic", "wt"])
+
+
+def _server(port, draft=18, use_quic=True):
     return MOQTServer(
         host="localhost", port=port, certificate=CERT, private_key=KEY,
-        path="/", use_quic=True, supported_drafts=draft,
+        path="/", use_quic=use_quic, supported_drafts=draft,
     )
 
 
-def _client(port, draft=18):
+def _client(port, draft=18, use_quic=True):
     return MOQTClient(
-        "localhost", port, path="/", use_quic=True,
+        "localhost", port, path="/", use_quic=use_quic,
         verify_tls=False, supported_drafts=draft,
     )
 
@@ -114,18 +120,21 @@ async def test_datagram_track_e2e(draft):
 
 
 @pytest.mark.asyncio
-async def test_datagram_oversize_refused():
-    port = _BASE_PORT + 30
-    moqt = _server(port)
+@_TRANSPORTS
+async def test_datagram_oversize_refused(use_quic):
+    port = _BASE_PORT + (30 if use_quic else 31)
+    moqt = _server(port, use_quic=use_quic)
     moqt.register_handler(
         MOQTMessageType.SUBSCRIBE, _dgram_publisher())
     server = await moqt.serve()
     try:
-        client = _client(port)
+        client = _client(port, use_quic=use_quic)
         async with client.connect() as session:
             await session.client_session_init()
             cap = session.datagram_max_payload()
             assert 0 < cap <= 1200
+            tp = session.peer_transport_parameters
+            assert cap <= tp["max_datagram_frame_size"]
             track = PublishedTrack(
                 session, "big/ns", trackname="t",
                 object_size=cap,  # header margin pushes it over
@@ -138,13 +147,18 @@ async def test_datagram_oversize_refused():
 
 
 @pytest.mark.asyncio
-async def test_stream_and_datagram_tracks_coexist():
+@pytest.mark.parametrize("draft", [18, 22])
+@_TRANSPORTS
+async def test_stream_and_datagram_tracks_coexist(draft, use_quic):
     """One connection carrying a subgroup-stream track and a datagram
-    track concurrently: both deliver, neither corrupts the other."""
-    port = _BASE_PORT + 32
+    track concurrently: both deliver, the datagram track only as
+    OBJECT_DATAGRAMs and the stream track only on streams."""
+    port = _BASE_PORT + 40 + 2 * (draft == 22) + (not use_quic)
+    server_sessions = []
 
     async def _on_subscribe(session, msg):
         name = bytes(msg.track_name)
+        server_sessions.append(session)
         ok = session.subscribe_ok(request_msg=msg, content_exists=0)
         if name == b"dg":
             track = PublishedTrack(
@@ -170,35 +184,83 @@ async def test_stream_and_datagram_tracks_coexist():
             await asyncio.sleep(0.02)
         task.cancel()
 
-    moqt = _server(port)
+    moqt = _server(port, draft=draft, use_quic=use_quic)
     moqt.register_handler(MOQTMessageType.SUBSCRIBE, _on_subscribe)
     server = await moqt.serve()
     try:
-        client = _client(port)
+        client = _client(port, draft=draft, use_quic=use_quic)
         async with client.connect() as session:
             await session.client_session_init()
-            dgrams = []
-            stream_objs = []
-
-            def _on_object(msg, size_bytes, recv_time_ms, gid, sgid):
-                if isinstance(msg, ObjectDatagram):
-                    dgrams.append(msg)
-                else:
-                    stream_objs.append(msg)
-
-            session.on_object_received = _on_object
-            st = SubscribedTrack(session, "mix/ns", trackname="st")
-            await st.subscribe(timeout=5.0)
-            dg = SubscribedTrack(session, "mix/ns", trackname="dg")
-            await dg.subscribe(timeout=5.0)
+            assert session._is_wt is (not use_quic)
+            got = {"st": [], "dg": []}
+            tracks = []
+            for name in got:
+                track = SubscribedTrack(
+                    session, "mix/ns", trackname=name,
+                    on_object=lambda m, *a, n=name: got[n].append(m))
+                await track.subscribe(timeout=5.0)
+                tracks.append(track)
             deadline = asyncio.get_event_loop().time() + 5.0
-            while (len(dgrams) < _N_OBJECTS
-                   or len(stream_objs) < _N_OBJECTS):
+            while any(len(v) < _N_OBJECTS for v in got.values()):
                 if asyncio.get_event_loop().time() > deadline:
                     break
                 await asyncio.sleep(0.05)
-            assert len(dgrams) >= _N_OBJECTS
-            assert len(stream_objs) >= _N_OBJECTS
+            assert len(got["dg"]) >= _N_OBJECTS
+            assert len(got["st"]) >= _N_OBJECTS
+            assert all(isinstance(m, ObjectDatagram) for m in got["dg"])
+            assert not any(isinstance(m, ObjectDatagram) for m in got["st"])
+            assert session._close_err is None
+            pub = server_sessions[0]
+            assert 0 < pub.datagram_max_payload() <= (
+                pub.peer_transport_parameters["max_datagram_frame_size"])
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+@_TRANSPORTS
+async def test_datagram_writer_parks_on_a_full_ring(use_quic):
+    """A burst larger than the datagram record ring parks the writer on
+    the drain event and completes; the subscriber still receives."""
+    port = _BASE_PORT + 44 + (not use_quic)
+    n, size = 400, 1000
+    full = []
+    done = asyncio.Event()
+
+    async def _on_subscribe(session, msg):
+        ok = session.subscribe_ok(request_msg=msg, content_exists=0)
+        send = session._quic.send_datagram_frame
+
+        def counting(data):
+            sent = send(data)
+            if not sent:
+                full.append(1)
+            return sent
+        session._quic.send_datagram_frame = counting
+        for oid in range(n):
+            await session.dgram_write_drain(ObjectDatagram(
+                track_alias=ok.track_alias, group_id=0, object_id=oid,
+                payload=bytes(size)).serialize(prof=session._profile))
+        done.set()
+
+    moqt = _server(port, use_quic=use_quic)
+    moqt.register_handler(MOQTMessageType.SUBSCRIBE, _on_subscribe)
+    server = await moqt.serve()
+    try:
+        client = _client(port, use_quic=use_quic)
+        async with client.connect() as session:
+            await session.client_session_init()
+            got = []
+            session.on_object_received = lambda m, *a: got.append(m)
+            await session.subscribe("bp/ns", "t", wait_response=True)
+            await asyncio.wait_for(done.wait(), 10)
+            for _ in range(100):
+                if len(got) >= n // 2:
+                    break
+                await asyncio.sleep(0.02)
+            assert full, "the burst never filled the datagram ring"
+            assert got and all(isinstance(m, ObjectDatagram) for m in got)
+            assert session._close_err is None
     finally:
         server.close()
 

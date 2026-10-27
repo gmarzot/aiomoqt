@@ -12,9 +12,10 @@ import pytest
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
+from aiomoqt.messages.data import ObjectDatagram
 from aiomoqt.types import (
-    FilterType, MOQTMessageType, MOQTRequestError, RequestErrorCode,
-    SubscribeDoneCode,
+    FilterType, ForwardingPreference, MOQTMessageType, MOQTRequestError,
+    RequestErrorCode, SubscribeDoneCode,
 )
 from aiomoqt.track import PublishedTrack, SubscribedTrack
 from aiomoqt.tools import moq_interop_relay as relay
@@ -1032,3 +1033,54 @@ async def test_relay_flags_reach_the_server(monkeypatch):
     assert (server.congestion_control_algorithm, server.max_connections,
             server.stream_ring_cap, server.tx_max_inflight_bytes) == (
                 "cubic", 4096, 1 << 20, 512 << 10)
+
+
+@requires_certs
+@pytest.mark.asyncio
+@pytest.mark.parametrize("draft", [18, 22])
+@_TRANSPORTS
+async def test_datagram_track_is_relayed_as_datagrams(draft, use_quic):
+    port = _BASE_PORT + 170 + 2 * (draft == 22) + (not use_quic)
+    ns = "relay/dgram"
+    mapping = {"dg": ForwardingPreference.DATAGRAM,
+               "st": ForwardingPreference.SUBGROUP}
+    got = {name: [] for name in mapping}
+    _reset_relay_state()
+    server = relay._build_server("localhost", port, CERT, KEY,
+                                 use_quic=use_quic, draft=draft)
+    handle = await server.serve()
+    try:
+        async with contextlib.AsyncExitStack() as stack:
+            async def _session():
+                client = MOQTClient("localhost", port, path="/",
+                                    use_quic=use_quic, verify_tls=False,
+                                    supported_drafts=draft)
+                s = await stack.enter_async_context(client.connect())
+                await s.client_session_init()
+                assert s._is_wt is (not use_quic)
+                return s
+
+            pub = await _session()
+            for name, fwd in mapping.items():
+                track = PublishedTrack(pub, namespace=ns, trackname=name,
+                                       object_size=200, group_size=_GROUP,
+                                       rate=200, forwarding=fwd)
+                await track.publish(announce_namespace=False,
+                                    publish_track=True)
+            rx = await _session()
+            for name in mapping:
+                await rx.subscribe(
+                    ns, name, forward=1, wait_response=True,
+                    on_object=lambda m, *a, n=name: got[n].append(m))
+            for _ in range(150):
+                if all(len(v) >= 10 for v in got.values()):
+                    break
+                await asyncio.sleep(0.02)
+            assert rx._close_err is None
+    finally:
+        handle.close()
+        _reset_relay_state()
+    assert len(got["dg"]) >= 10 and len(got["st"]) >= 10, {
+        n: len(v) for n, v in got.items()}
+    assert all(isinstance(m, ObjectDatagram) for m in got["dg"])
+    assert not any(isinstance(m, ObjectDatagram) for m in got["st"])

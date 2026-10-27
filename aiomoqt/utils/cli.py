@@ -174,7 +174,7 @@ def add_publisher_media(p):
                         'is rate/streams.')
     p.add_argument('-D', '--datagram', action='store_true',
                    help=f'ObjectDatagrams instead of subgroup streams '
-                        f'(raw QUIC only; object must fit one packet, '
+                        f'(object must fit one packet, '
                         f'<= {DGRAM_MAX_OBJECT} B)')
     p.add_argument('--video', type=str, default=None, metavar='RES',
                    choices=VIDEO_PROFILES,
@@ -321,8 +321,8 @@ def add_timestamp_checking(p):
 
 # -- validation ------------------------------------------------------
 
-def check_datagram(parser, args, serve_quic=None):
-    """-D validity: fits one frame, and raw QUIC is available."""
+def check_datagram(parser, args):
+    """-D validity: the object fits one DATAGRAM frame."""
     if not getattr(args, 'datagram', False):
         return
     size = getattr(args, 'object_size', 0)
@@ -330,9 +330,6 @@ def check_datagram(parser, args, serve_quic=None):
         parser.error(
             f'-D/--datagram: object-size {size} can never fit a DATAGRAM '
             f'frame (max ~{DGRAM_MAX_OBJECT} B; frames cannot fragment)')
-    if serve_quic is False:
-        parser.error('-D/--datagram requires raw QUIC (-Q); '
-                     'WebTransport datagram TX is not wired yet')
 
 
 def check_url_vs_listener(parser, args):
