@@ -357,4 +357,7 @@ def test_transport_kwargs(argv, expected):
     p = argparse.ArgumentParser()
     cli.add_session(p)
     cli.add_keepalive(p)
+    cc_default = p.get_default("cc_algo")
+    if cc_default is not None:
+        expected.setdefault("congestion_control_algorithm", cc_default)
     assert cli.transport_kwargs(p.parse_args(argv)) == expected
