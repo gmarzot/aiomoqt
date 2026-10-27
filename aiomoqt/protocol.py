@@ -3199,7 +3199,8 @@ class _MOQTSessionMixin:
 
     async def async_closed(self) -> bool:
         if not self._moqt_session_closed.done():
-            self._close_err = await self._moqt_session_closed
+            # An observer's cancellation must not cancel the session's signal.
+            self._close_err = await asyncio.shield(self._moqt_session_closed)
         return True
 
 

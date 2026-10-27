@@ -180,7 +180,7 @@ class Track:
         self.num_subgroups = num_subgroups
         self.rate = rate
         self.track_alias: int = 0
-        self.request_id: int = 0
+        self.request_id: Optional[int] = None
         self.state: TrackState = TrackState.IDLE
         self._tasks: set = set()
 
@@ -438,7 +438,7 @@ class _Subscription:
     def __init__(self, session):
         self.session = session
         self.track_alias: int = 0
-        self.request_id: int = 0
+        self.request_id: Optional[int] = None
         # request_id from the relay's SUBSCRIBE, for PUBLISH_DONE.
         self.subscribe_request_id = None
         # Request ids subscribed through this peer; it idles when this
@@ -795,11 +795,11 @@ class PublishedTrack(Track):
         self._subs[0].track_alias = value
 
     @property
-    def request_id(self) -> int:
+    def request_id(self) -> Optional[int]:
         return self._subs[0].request_id
 
     @request_id.setter
-    def request_id(self, value: int) -> None:
+    def request_id(self, value: Optional[int]) -> None:
         self._subs[0].request_id = value
 
     @property
@@ -1576,8 +1576,7 @@ class PublishedTrack(Track):
         sub = self._sub_for(session)
         # d14 carries the relay's SUBSCRIBE request_id; d16's REQUEST_
         # UPDATE flow has none, so fall back to our own PUBLISH
-        # request_id. Sending request_id=0/None makes the relay reject
-        # it as "publishDone for invalid id=0".
+        # request_id. None means no request was assigned; 0 is valid.
         req_id = sub.subscribe_request_id
         if req_id is None:
             req_id = sub.request_id
@@ -1588,7 +1587,7 @@ class PublishedTrack(Track):
         for rid in (*sub.subscribers, sub.request_id,
                     sub.subscribe_request_id):
             session._unbind_request(rid)
-        if not req_id:
+        if req_id is None:
             return
         # Streams this peer was actually sent, which is the delivery's
         # count when one carried the track.
