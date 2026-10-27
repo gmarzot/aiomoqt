@@ -2807,12 +2807,10 @@ def parse_args():
                              f"{LOG_FILE_BYTES >> 20} MB x {LOG_FILE_BACKUPS}) "
                              "and send crash and stall dumps to "
                              "DIR/crash.log. Off by default.")
-    # cubic: about 65% more fan-out than bbr on one worker, whose sends
-    # are syscall-bound; bbr's per-peer pacing defeats send batching.
-    parser.add_argument("--cc-algo", type=str, default="cubic",
-                        help="Congestion control (cubic | bbr | bbr1 | c4 | "
-                             "newreno | dcubic | prague | fast). Default: "
-                             "cubic")
+    parser.add_argument("--cc-algo", type=str, default="bbr",
+                        help="Congestion control (bbr | bbr1 | c4 | cubic | "
+                             "dcubic | fast | newreno | prague). Default: "
+                             "bbr")
     parser.add_argument("--max-connections", type=int, default=4096,
                         help="Most connections held at once (aiopquic "
                              ">= 0.5.1). Default: 4096")
@@ -3707,10 +3705,11 @@ def _track_state(track, flowing) -> str:
 
 
 _HISTORY_KEYS = ("t", "ingress_bps", "egress_bps", "media_in_bps",
-                 "media_out_bps", "sessions", "subscribers", "subscriptions",
-                 "tracks",
+                 "media_out_bps", "sessions", "publishers", "namespaces",
+                 "subscribers", "subscriptions", "tracks",
                  "loss_pct", "rtt_p50_ms", "lag_p99_ms", "objects_in_per_s",
-                 "groups_per_s")
+                 "objects_out_per_s", "groups_per_s", "groups_out_per_s",
+                 "drops")
 _PLATFORM_KEYS = ("t", "cpu", "cpu_user", "cpu_nice", "cpu_system",
                   "cpu_iowait", "cpu_irq", "cpu_steal", "proc_cpu",
                   "proc_user", "proc_system", "proc_rss", "mem_used",
@@ -3966,6 +3965,11 @@ class _Status:
                 sum(r["objects_per_s"] or 0 for _, r in tracks), 1)),
             "groups_per_s": (None if dt is None else round(
                 sum(r["groups_per_s"] or 0 for _, r in tracks), 1)),
+            # Delivered rates: each track's input rate times its subscribers.
+            "objects_out_per_s": (None if dt is None else round(sum(
+                (r["objects_per_s"] or 0) * r["subscribers"] for _, r in tracks), 1)),
+            "groups_out_per_s": (None if dt is None else round(sum(
+                (r["groups_per_s"] or 0) * r["subscribers"] for _, r in tracks), 1)),
             # Share of egress not received upstream ("CDN efficiency").
             "efficiency": (max(0.0, 1 - media_in / media_out)
                            if media_out else None),
@@ -3989,12 +3993,17 @@ class _Status:
             "t": round(wall), "ingress_bps": totals["ingress_bps"],
             "egress_bps": totals["egress_bps"], "media_in_bps": media_in,
             "media_out_bps": media_out, "sessions": totals["sessions"],
+            "publishers": totals["publishers"],
+            "namespaces": totals["namespaces"],
             "subscribers": totals["subscribers"],
             "subscriptions": totals["subscriptions"], "tracks": len(tracks),
             "loss_pct": totals["loss_pct"], "rtt_p50_ms": totals["rtt_p50_ms"],
             "lag_p99_ms": lag["p99"],
             "objects_in_per_s": totals["objects_in_per_s"],
+            "objects_out_per_s": totals["objects_out_per_s"],
             "groups_per_s": totals["groups_per_s"],
+            "groups_out_per_s": totals["groups_out_per_s"],
+            "drops": totals["drops"],
         })
         self._add_track_history(tracks)
         self.platform = self._platform(wall, host, totals, lag)
