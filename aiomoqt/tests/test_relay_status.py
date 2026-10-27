@@ -394,6 +394,10 @@ async def test_snapshot_reports_namespaces_tracks_and_sessions(
     assert totals["rtt_p50_ms"] is not None
     assert sorted(s["role"] for s in snap["sessions"]) == [
         "pub", "sub", "sub"]
+    # What each session holds against its per-session caps.
+    assert sorted((s["role"], s["namespaces"], s["subscriptions"])
+                  for s in snap["sessions"]) == [
+        ("pub", 1, 0), ("sub", 0, 1), ("sub", 0, 2)]
 
     assert [r["namespace"] for r in snap["namespaces"]] == [_NS]
     space = snap["namespaces"][0]
