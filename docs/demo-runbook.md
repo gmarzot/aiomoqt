@@ -229,9 +229,15 @@ arrival. Prefer `--ts`.
   not play and A/V skew grows with runtime.
 - Muxer flags: `-pes_payload_size 0` stops ffmpeg bundling AAC frames into
   ~2930-byte PES (≈180 ms at 128 kbps, up to `muxdelay`/2 on silence);
-  `-omit_video_pes_length 0` lets pub_media emit a video frame when it
-  completes instead of when the next one starts (keyframes > 64 KB still
-  wait); `-muxdelay 0` drops the 0.7 s default bound.
+  `-muxdelay 0` drops the 0.7 s default bound. pub_media emits a video
+  frame at the stuffed last packet of its PES, so `-omit_video_pes_length 0`
+  is no longer needed.
+- A source on a fixed cadence (no B-frames, a key frame every M frames)
+  can say so: `--ts-cadence fps=30,gop=60` sends TIMESCALE 30000 and
+  TIMESTAMP_MAPPING, OBJECT_TIMESTAMP only off schedule, and the catalog
+  framerate. `--catalog-bitrate BPS` sets the catalog bitrate; without
+  it `--ts` measures one over the first seconds and republishes the
+  catalog.
 - Measure: burn-in clock vs player frame (screenshot both), overlay
   latency P50/P95 (pub_media→arrival, see below), cushion, stalls. Glass: 09-09
   640 ms (before the 64 KB read fix and the cushion knob); 09-16 1.17 s

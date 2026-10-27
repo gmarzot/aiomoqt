@@ -44,6 +44,7 @@ reached, or every relay is lost (with --reconnect: none is back when the
 duration ends); 70 for an internal error, including a source pub_media
 cannot read.
 """
+import argparse
 import asyncio
 import contextlib
 import functools
@@ -66,12 +67,14 @@ from aiomoqt.media import (
     StreamMapping,
 )
 from aiomoqt.media.catalog import (
+    INIT_TYPE_INLINE, INIT_TYPE_OBJECT_PROPERTY, INIT_TYPE_TRACK_PROPERTY,
     MEDIA_PACKAGINGS, PACKAGING_CMAF, PACKAGING_LOC, PACKAGING_LOCMAF,
 )
 from aiomoqt.media.cmaf import CmafChunker, chunk_decode_time, prft_box
 from aiomoqt.media.ingest import INSTALL_HINT, RENDITIONS, Ingest
+from aiomoqt.media.loc import LOC_PROP_AUDIO_CONFIG, LOC_PROP_VIDEO_CONFIG
 from aiomoqt.media.locmaf import LOCMAF_VERSION
-from aiomoqt.media.mpegts import TsDemuxer
+from aiomoqt.media.mpegts import TsCadence, TsDemuxer, TsRates
 from aiomoqt.media.sources import (
     AnnexBAssembler, HevcAnnexBAssembler, Mp4Reader, avcc_codec_string,
     hevc_sps_info, hvcc_codec_string, pcm_tone_frames, sps_dimensions,
@@ -211,6 +214,24 @@ def parse_args():
                              '0 (default): send nothing until PUBLISH_OK, '
                              'SUBSCRIBE or an update carries forward=1. '
                              '1: start right after PUBLISH.')
+    parser.add_argument('--no-catalog', action='store_true',
+                        help='Publish no catalog track (LOC only): '
+                             'receivers configure from the media')
+    parser.add_argument('--catalog-bitrate', type=int, default=None,
+                        metavar='BPS',
+                        help='Catalog bitrate of the video track (of audio '
+                             'when there is no video). Default: the '
+                             'mp4\'s mean; --ts measures it, and the '
+                             'catalog omits it until measured.')
+    parser.add_argument('--init-data', choices=('catalog', 'track', 'object'),
+                        default=None,
+                        help='LOC decoder config placement: catalog = '
+                             'catalog initData only; track = '
+                             'VIDEO_CONFIG/AUDIO_CONFIG Track Property; '
+                             'object = Object Property on each group\'s '
+                             'first object. Default: catalog initData and '
+                             'the Object Property. cmaf and locmaf: '
+                             'catalog only.')
     parser.add_argument('--catalog-interval', type=float, default=1.0,
                         metavar='SECS',
                         help='Re-emit the full catalog as a new group every '
@@ -248,8 +269,17 @@ def parse_args():
              'start, group and frame period), OBJECT_TIMESTAMP only on a '
              'frame off schedule, and a prft box on the first CMAF/LOCMAF '
              'object of each group. Sources without a fixed GOP (live '
-             'inputs, irregular keyframes) send OBJECT_TIMESTAMP on every '
-             'object instead. LOC timestamps are unchanged.')
+             'inputs, irregular keyframes; see --ts-cadence) send '
+             'OBJECT_TIMESTAMP on every object instead. LOC timestamps '
+             'are unchanged.')
+    ts_group.add_argument(
+        '--ts-cadence', type=_cadence, default=None,
+        metavar='fps=N[/D],gop=M',
+        help='With --ts: the stream keeps a fixed cadence, N/D frames per '
+             'second and a key frame every M frames. Implies '
+             '--timestamp-mapping, mapped at TIMESCALE 1000 x fps (N for '
+             'a fractional rate) with OBJECT_TIMESTAMP only off schedule, '
+             'and gives the catalog its framerate.')
     out_group = parser.add_argument_group('machine output')
     out_group.add_argument(
         '--stats-json', action='store_true',
@@ -309,7 +339,45 @@ def parse_args():
     if args.input and (n is not None or args.audio_subgroups != 'group'):
         parser.error('--audio-frames-per-group and --audio-subgroups do '
                      'not apply to --input')
+    if args.ts_cadence is not None:
+        if not args.ts:
+            parser.error('--ts-cadence applies to --ts only')
+        args.timestamp_mapping = True
+    if args.catalog_bitrate is not None and args.catalog_bitrate <= 0:
+        parser.error('--catalog-bitrate must be positive')
+    if args.packaging != PACKAGING_LOC:
+        for flag, on in (('--no-catalog', args.no_catalog),
+                         ('--init-data', args.init_data not in
+                          (None, 'catalog'))):
+            if on:
+                parser.error(f'{flag} applies to LOC packaging only')
+    if args.no_catalog and args.init_data == 'catalog':
+        parser.error('--init-data catalog needs a catalog')
     return args
+
+
+def _cadence(text: str) -> TsCadence:
+    try:
+        return TsCadence.parse(text)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e))
+
+
+# --init-data → (catalog initData type, LocTrackPublisher config_property).
+_INIT_DATA = {
+    None: (INIT_TYPE_INLINE, 'object'),
+    'catalog': (INIT_TYPE_INLINE, None),
+    'track': (INIT_TYPE_TRACK_PROPERTY, 'track'),
+    'object': (INIT_TYPE_OBJECT_PROPERTY, 'object'),
+}
+
+
+def _init_data(args, ref: str, config: bytes, prop_id: int) -> InitData:
+    """The catalog initDataList entry for a LOC track's decoder config."""
+    kind = _INIT_DATA[getattr(args, 'init_data', None)][0]
+    if kind == INIT_TYPE_INLINE:
+        return InitData.from_bytes(ref, config)
+    return InitData(id=ref, data=f'0x{prop_id:02X}', type=kind)
 
 
 class _SourceError(SystemExit):
@@ -352,6 +420,8 @@ def _build_catalog(args, video, audio, chunkers=None) -> Catalog:
     chunkers = chunkers or {}
     tracks = []
     init = []
+    live_ts = bool(getattr(args, 'ts', None))
+    explicit = getattr(args, 'catalog_bitrate', None)
     if audio is not None:
         # Opus over LOC needs no decoder description, so no initData.
         a_init = (chunkers['audio'].init_segment() if 'audio' in chunkers
@@ -361,10 +431,13 @@ def _build_catalog(args, video, audio, chunkers=None) -> Catalog:
             renderGroup=1, codec=audio.codec_string,
             samplerate=audio.samplerate,
             channelConfig=str(audio.channels),
-            bitrate=audio.avg_bitrate or 128_000,
+            bitrate=((explicit if video is None else None)
+                     or audio.avg_bitrate or (None if live_ts else 128_000)),
             initRef='a0' if a_init else None))
-        if a_init:
+        if 'audio' in chunkers:
             init.append(InitData.from_bytes('a0', a_init))
+        elif a_init:
+            init.append(_init_data(args, 'a0', a_init, LOC_PROP_AUDIO_CONFIG))
     elif not args.no_audio:
         tracks.append(CatalogTrack(
             name='audio', packaging='loc', isLive=True, role='audio',
@@ -378,13 +451,15 @@ def _build_catalog(args, video, audio, chunkers=None) -> Catalog:
             renderGroup=1, codec=video.codec_string,
             width=video.width, height=video.height,
             framerate=video.fps,
-            bitrate=video.avg_bitrate or 2_000_000,
+            bitrate=(explicit or video.avg_bitrate
+                     or (None if live_ts else 2_000_000)),
             initRef='v0' if (cmaf or video.config) else None))
         if cmaf:
             init.append(InitData.from_bytes(
                 'v0', chunkers['video'].init_segment()))
         elif video.config:
-            init.append(InitData.from_bytes('v0', video.config))
+            init.append(_init_data(args, 'v0', video.config,
+                                   LOC_PROP_VIDEO_CONFIG))
     if getattr(args, 'target_latency', None) is not None:
         for t in tracks:
             t.targetLatency = args.target_latency
@@ -575,14 +650,15 @@ async def _apply_config_change(dmx: TsDemuxer, tracks: dict, pub):
     """A new SPS/PPS or ADTS header: the track's group-start config and
     the catalog follow it, and the catalog is republished."""
     cat = pub.catalog_track.catalog
-    init = {i.id: i for i in (cat.initDataList or [])}
+    init = {i.id: i for i in (cat.initDataList or [])
+            if i.type == INIT_TYPE_INLINE} if cat is not None else {}
     video = tracks.get('video')
     if video is not None and dmx.video.config != video.config:
         video.config = dmx.video.config
         view = _LiveVideo(dmx.video)
         if video.codec_string is not None:
             video.codec_string = view.codec_string
-        for t in cat.tracks:
+        for t in (cat.tracks if cat is not None else ()):
             if t.name == 'video':
                 t.codec, t.width, t.height = (view.codec_string, view.width,
                                               view.height)
@@ -591,7 +667,7 @@ async def _apply_config_change(dmx: TsDemuxer, tracks: dict, pub):
         print(f"  video config changed: {view.width}x{view.height} "
               f"{view.codec_string}")
     audio = tracks.get('audio')
-    entry = cat.find('audio')
+    entry = cat.find('audio') if cat is not None else None
     if audio is not None and (
             dmx.audio_asc != audio.config or (
                 entry is not None
@@ -607,24 +683,49 @@ async def _apply_config_change(dmx: TsDemuxer, tracks: dict, pub):
             init['a0'].data = InitData.from_bytes('a0', view.config).data
         print(f"  audio config changed: {view.codec_string} "
               f"{view.samplerate}Hz {view.channels}ch")
+    await _republish(pub)
+
+
+async def _republish(pub) -> None:
+    cat = pub.catalog_track.catalog
+    if cat is None:
+        return
     cat.generatedAt = int(time.time() * 1000)
     if pub.catalog_track.state == TrackState.SUBSCRIBED:
         await pub.catalog_track.publish_catalog(cat)
 
 
+async def _apply_rates(rates: TsRates, args, pub) -> None:
+    """Measured frame rate and bitrates into catalog entries that lack
+    them; the catalog is republished."""
+    cat = pub.catalog_track.catalog
+    if cat is None:
+        return
+    for t in cat.tracks:
+        if t.role == 'video' and t.framerate is None:
+            t.framerate = rates.fps
+        if t.bitrate is None:
+            t.bitrate = rates.bps.get(t.role)
+    await _republish(pub)
+
+
 async def _feed_ts_live(tracks: dict, fh, dmx: TsDemuxer, first, args,
                         stats: dict, pub, audio_per_group: int = 1):
     """Dispatch demuxed access units to their tracks with PTS-derived
-    stamps; audio opens a group every `audio_per_group` frames."""
+    stamps; audio opens a group every `audio_per_group` frames. Catalog
+    values the stream does not declare are measured from it."""
     loop = asyncio.get_running_loop()
     deadline = time.monotonic() + args.duration
     units = list(first)
     eof = False
     n_audio = 0
+    rates = TsRates()
     while True:
         if dmx.config_changed:
             dmx.config_changed = False
             await _apply_config_change(dmx, tracks, pub)
+        if [u for u in units if rates.add(u)]:
+            await _apply_rates(rates, args, pub)
         for u in units:
             track = tracks.get(u.kind)
             if track is None:
@@ -722,6 +823,22 @@ def _frindell_for(source, wall0: int, per_group=None):
     per_group = per_group or sync_group
     om = dur if per_group > 1 else 0
     return MediaTimestamps(wall0, source.timescale, dur * per_group, om)
+
+
+def _ts_timestamps(args, dmx: TsDemuxer, first, kind: str, wall0: int,
+                   per_group: int = 1) -> MediaTimestamps:
+    """MediaTimestamps for a --ts track: mapped from --ts-cadence at its
+    first group's stamp (audio on its frame size), else explicit."""
+    cadence = args.ts_cadence
+    units = [u for u in first if u.kind == kind]
+    if cadence is None or not units:
+        return MediaTimestamps(wall0)
+    if kind == 'audio':
+        return cadence.audio_timestamps(
+            dmx.to_us(units[0].pts), dmx.audio_samplerate,
+            dmx.audio_frame_samples, per_group)
+    key = next((u for u in units if u.key), units[0])
+    return cadence.video_timestamps(dmx.to_us(key.pts))
 
 
 async def _pace(start: float, ts_us: int, pace: bool):
@@ -1098,6 +1215,10 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
     ts_audio = None
     if ts:
         video, ts_audio = ts[3], ts[4]
+        if args.ts_cadence is not None:
+            ts[1].clock.hold()
+            if video is not None:
+                video.fps = args.ts_cadence.framerate
         if ts_audio is None:
             args.no_audio = True
     mp4_audio = (reader.audio
@@ -1153,6 +1274,7 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
         session = sessions[0]
         # CMAF objects are not LOC: no Private Properties block.
         loc_bare = args.loc_bare or args.packaging == PACKAGING_CMAF
+        cfg_at = _INIT_DATA[args.init_data][1]
 
         def _track(name, **kwargs):
             if args.packaging == PACKAGING_LOCMAF:
@@ -1161,7 +1283,8 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
                                             init=init, **kwargs)
             return LocTrackPublisher(session, args.namespace, name,
                                      loc_bare=loc_bare,
-                                     timescale=args.loc_timescale, **kwargs)
+                                     timescale=args.loc_timescale,
+                                     config_property=cfg_at, **kwargs)
         # One start for every paced feeder; with --timestamp-mapping its
         # wall clock anchors each track's TIMESTAMP_MAPPING.
         timescales = [_SAMPLERATE] + [
@@ -1174,7 +1297,8 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
             if args.timestamp_mapping:
                 track.frindell = frindell
             return track
-        pub = FanoutPublisher(sessions, args.namespace, catalog)
+        pub = FanoutPublisher(sessions, args.namespace,
+                              None if args.no_catalog else catalog)
         stats = {}
         feeders = []
         if ingest is not None:
@@ -1193,18 +1317,18 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
                 tracks['video'] = pub.add_track(_timed(LocTrackPublisher(
                     session, args.namespace, 'video', config=video.config,
                     mapping=v_map, loc01_compat=args.loc01_compat, loc_bare=loc_bare,
-                    timescale=args.loc_timescale,
+                    timescale=args.loc_timescale, config_property=cfg_at,
                     codec_string=_cs(video.codec_string)),
-                    MediaTimestamps(wall0)))
+                    _ts_timestamps(args, dmx, first, 'video', wall0)))
                 stats['video'] = _TrackStats()
             if ts_audio is not None:
                 tracks['audio'] = pub.add_track(_timed(LocTrackPublisher(
                     session, args.namespace, 'audio', media_kind='audio',
                     config=ts_audio.config, mapping=a_map,
                     loc01_compat=args.loc01_compat, loc_bare=loc_bare,
-                    timescale=args.loc_timescale,
+                    timescale=args.loc_timescale, config_property=cfg_at,
                     codec_string=_cs(ts_audio.codec_string)),
-                    MediaTimestamps(wall0)))
+                    _ts_timestamps(args, dmx, first, 'audio', wall0, a_per)))
                 stats['audio'] = _TrackStats()
             feeders.append(_feed_ts_live(tracks, fh, dmx, first, args,
                                          stats, pub, a_per))
@@ -1244,7 +1368,7 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
                 pub.add_track(_timed(LocTrackPublisher(
                     session, args.namespace, 'video', config=video.config,
                     mapping=v_map, loc01_compat=args.loc01_compat, loc_bare=loc_bare,
-                    timescale=args.loc_timescale,
+                    timescale=args.loc_timescale, config_property=cfg_at,
                     codec_string=_cs(video.codec_string)),
                     MediaTimestamps(wall0))),
                 fh, asm, first, args, stats['video']))
@@ -1274,7 +1398,7 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
             if args.stats > 0 and stats else None)
         refresher = (asyncio.ensure_future(
             _refresh_catalog(pub, args.catalog_interval))
-            if args.catalog_interval > 0 else None)
+            if args.catalog_interval > 0 and not args.no_catalog else None)
         # SIGINT and SIGTERM: _shutdown(), exit 0.
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()

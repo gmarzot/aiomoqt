@@ -57,7 +57,7 @@ class CatalogTrackPublisher(PublishedTrack):
     # Queued when forwarding resumes: send the current catalog.
     _RESUME = object()
 
-    def __init__(self, session, namespace: str, catalog: Catalog):
+    def __init__(self, session, namespace: str, catalog: Optional[Catalog]):
         super().__init__(session, namespace, CATALOG_TRACK_NAME,
                          priority=CATALOG_PUBLISHER_PRIORITY)
         self.catalog = catalog
@@ -212,15 +212,19 @@ class CatalogTrackPublisher(PublishedTrack):
 
 class MediaPublisher:
     """Publishes an MSF broadcast: catalog + LOC media tracks on one
-    session, with control demux by track name / request id."""
+    session, with control demux by track name / request id.
 
-    def __init__(self, session, namespace: str, catalog: Catalog):
+    With `catalog` None no catalog track is published or served;
+    `catalog_track` stays, unpublished, so callers need no special case."""
+
+    def __init__(self, session, namespace: str,
+                 catalog: Optional[Catalog]):
         self.session = session
         self.namespace = namespace
         self.catalog_track = CatalogTrackPublisher(session, namespace,
                                                    catalog)
-        self._by_name: Dict[str, PublishedTrack] = {
-            CATALOG_TRACK_NAME: self.catalog_track}
+        self._by_name: Dict[str, PublishedTrack] = (
+            {} if catalog is None else {CATALOG_TRACK_NAME: self.catalog_track})
 
     def add_track(self, track: LocTrackPublisher) -> LocTrackPublisher:
         """A track left at the default priority takes its media kind's."""
