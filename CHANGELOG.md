@@ -2,6 +2,11 @@
 
 ## v0.14.0
 
+- pub_media `--ts`: a video frame is sent when its last TS packet arrives, not when the next frame starts, so LOC video latency no longer reads one frame high.
+- pub_media `--ts-cadence fps=N[/D],gop=M`: a fixed-cadence `--ts` source sends TIMESCALE 1000 × fps (N for a fractional rate) and TIMESTAMP_MAPPING, with OBJECT_TIMESTAMP only off schedule.
+- pub_media `--ts` catalog: framerate from `--ts-cadence` or the PES timing, bitrate from `--catalog-bitrate` or measured, instead of a fixed 2000000 and no framerate.
+- pub_media `--init-data catalog|track|object` places LOC decoder config in the catalog only, a Track Property, or each group's first object; LocTrackSubscriber reads it from Track Properties too.
+- pub_media `--no-catalog` publishes no catalog track (LOC only).
 - Data streams use their track's publisher priority as the transport band, FIFO within a band (`MOQTPeer.stream_scheduling`, `PublishedTrack(stream_scheduling=)`, aiomoqt-relay `--stream-scheduling` select round_robin); undeclared streams sit at the neutral 128, and pub_media declares audio 64 above video 128.
 - aiomoqt-relay: each subscriber has its own bounded send lane, so a slow subscriber no longer throttles a track for the others or starves a late joiner; past the bound it loses whole groups, their streams reset; status shows each subscriber's lane depth and sheds.
 - A control message that closes the session (such as a request at the MAX_REQUEST_ID ceiling) no longer logs a second close as a parse failure.
