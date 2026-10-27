@@ -714,6 +714,9 @@
   ".sessions[].addr": [
    "string"
   ],
+  ".sessions[].dgram_drops": [
+   "int"
+  ],
   ".sessions[].draft": [
    "int"
   ],

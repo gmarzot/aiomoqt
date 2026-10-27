@@ -4415,6 +4415,15 @@ class _MOQTSessionMixin:
         return q.max_datagram_payload()
 
     def _wt_datagram_max_payload(self) -> int:
+        if self._quic is None:
+            return 0
+        own = getattr(super(), 'max_datagram_payload', None)
+        if own is not None:
+            try:
+                return own()
+            except (AttributeError, TypeError):
+                return 0
+        # Fallback for aiopquic 0.7.0rc1, which lacks max_datagram_payload().
         tr = getattr(self, '_transport', None)
         ptr = getattr(self, 'cnx_ptr', 0)
         if tr is None or not ptr or self._quic is None:
