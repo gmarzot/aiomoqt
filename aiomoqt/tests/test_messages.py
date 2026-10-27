@@ -3,6 +3,7 @@ import pytest
 from aiomoqt.tests.conftest import moqt_message_serialization, moqt_test_id
 
 from aiomoqt.types import *
+from aiomoqt.types import MOQTProtocolViolation
 from aiomoqt.messages import *
 from aiomoqt.utils.buffer import Buffer
 
@@ -1931,7 +1932,7 @@ class TestFetchObjectD16:
         buf.push_uint_var(1)
         buf.push_bytes(b'x')
         buf.seek(0)
-        with pytest.raises(ValueError, match="first object"):
+        with pytest.raises(MOQTProtocolViolation, match="first object"):
             FetchObject.deserialize(buf, prior=None, prof=profile_for(16))
 
     def test_invalid_flags_high_bit(self):
@@ -1942,7 +1943,7 @@ class TestFetchObjectD16:
         buf.push_uint_var(0)
         buf.push_uint_var(0)
         buf.seek(0)
-        with pytest.raises(ValueError, match="invalid serialization flags"):
+        with pytest.raises(MOQTProtocolViolation, match="invalid serialization flags"):
             FetchObject.deserialize(buf, prior=None, prof=profile_for(16))
 
 

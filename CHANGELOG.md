@@ -2,6 +2,7 @@
 
 ## v0.14.0
 
+- Malformed input is a protocol error: a control message that does not decode, or an invalid FETCH object (formerly a stream reset), closes the session with PROTOCOL_VIOLATION and a short reason; an Object whose Properties do not parse resets its stream as a malformed track; a length past the message is refused before it is read; invalid UTF-8 in a reason phrase is replaced, not an error.
 - pub_media exits 69 when no relay is reachable or every relay is lost, and 70 on an internal error or a source it cannot read (both were 1); `--help` lists the codes, and a relay that has not answered within 10 s counts as down.
 - pub_media `--stats-json`: `ready` only once a relay is up.
 - pub_media on SIGINT/SIGTERM: after PUBLISH_DONE on each track it withdraws an announced namespace, refuses SUBSCRIBE and FETCH arriving meanwhile, and closes its sessions, within about a second.
