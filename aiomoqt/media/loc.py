@@ -93,9 +93,11 @@ class LocTrackPublisher(PublishedTrack):
     forward-state handling, delivery to each peer, and PUBLISH_DONE come
     from PublishedTrack; produce() consumes the frame queue.
 
-    `config` (codec extradata) is emitted on Object 0 of every group so
-    mid-stream joiners can configure a decoder, under VIDEO_CONFIG or
-    AUDIO_CONFIG per `media_kind`.
+    `config` (codec extradata) rides VIDEO_CONFIG or AUDIO_CONFIG per
+    `media_kind`, where `config_property` says: 'object' on Object 0 of
+    every group, so mid-stream joiners can configure a decoder; 'track'
+    as a Track Property (d16+); None nowhere, for a catalog that carries
+    it.
 
     `codec_string` makes every object self-describing for receivers
     without a catalog: each carries CODECSTRING, and TIMESCALE when
@@ -121,11 +123,15 @@ class LocTrackPublisher(PublishedTrack):
                  queue_size: int = 256,
                  loc01_compat: bool = False,
                  codec_string: Optional[str] = None,
-                 loc_bare: bool = False):
+                 loc_bare: bool = False,
+                 config_property: Optional[str] = 'object'):
         super().__init__(session, namespace, trackname,
                          priority=priority, auth_token=auth_token)
+        if config_property not in ('object', 'track', None):
+            raise ValueError(f"config_property {config_property!r}")
         self.loc_bare = loc_bare
         self.config = config
+        self.config_property = config_property
         self.mapping = mapping
         self.timescale = timescale
         self.media_kind = media_kind
@@ -177,6 +183,13 @@ class LocTrackPublisher(PublishedTrack):
             return super()._timing_properties(vi64)
         return self.frindell.track_properties(vi64)
 
+    def _track_properties(self, session) -> Optional[Dict[int, Any]]:
+        props = super()._track_properties(session)
+        if (self.config_property != 'track' or self.config is None
+                or not session._profile.track_properties):
+            return props
+        return {**(props or {}), self._config_id: self.config}
+
     async def finish(self) -> None:
         """Signal end of track; generation drains the queue then stops."""
         await self._frames.put(None)
@@ -215,7 +228,7 @@ class LocTrackPublisher(PublishedTrack):
         if group_start:
             if self.timescale is not None:
                 exts[LOC_PROP_TIMESCALE] = self.timescale
-            if self.config is not None:
+            if self.config is not None and self.config_property == 'object':
                 exts[self._config_id] = self.config
         return exts
 
@@ -273,7 +286,8 @@ class LocTrackPublisher(PublishedTrack):
 class LocTrackSubscriber(SubscribedTrack):
     """Subscribes to a LOC track and delivers LocFrames in arrival
     order via on_frame(frame, group_id, object_id). Decoder config is
-    captured from VIDEO_CONFIG / AUDIO_CONFIG properties (set_config()
+    captured from VIDEO_CONFIG / AUDIO_CONFIG Object or Track Properties
+    (set_config()
     seeds it from a catalog initRef instead); timestamps are read under
     any LOC numbering, newest first. Arrival order == decode order for
     single-subgroup tracks; temporal-layer merge is not implemented.
@@ -307,6 +321,15 @@ class LocTrackSubscriber(SubscribedTrack):
     def set_config(self, config: Optional[bytes]) -> None:
         """Seed decoder config out-of-band (catalog initRef, §5.2.13)."""
         self.config = config
+
+    def take_track_properties(self, msg) -> None:
+        """Track Properties as SubscribedTrack keeps them, and decoder
+        config from a VIDEO_CONFIG or AUDIO_CONFIG among them."""
+        super().take_track_properties(msg)
+        for prop_id in _CONFIG_IDS:
+            value = (self.properties or {}).get(prop_id)
+            if isinstance(value, (bytes, bytearray, memoryview)):
+                self.config = bytes(value)
 
     def _unpackage(self, msg, group_id: int) -> Optional[bytes]:
         """Frame payload of a received object; None rejects it (no
