@@ -8,7 +8,9 @@ import contextlib
 import pytest
 
 from aiomoqt.client import MOQTClient
-from aiomoqt.delivery import MAX_OBJECT_ID, OBJECT_RECORD_BYTES, ObjectHistory
+from aiomoqt.delivery import (
+    MAX_OBJECT_ID, OBJECT_RECORD_BYTES, ObjectHistory, retained_object_bytes,
+)
 from aiomoqt.messages.data import FETCH_FLAGS_END_UNKNOWN
 from aiomoqt.server import MOQTServer
 from aiomoqt.track import PublishedTrack
@@ -97,13 +99,11 @@ def test_a_whole_group_fetch_of_an_evicted_group_ends_at_a_valid_location():
 
 
 def test_a_whole_group_marker_ends_at_the_groups_last_held_object():
+    # Group 1 is published first, so it is the oldest and goes first.
     h = ObjectHistory(3 * (10 + OBJECT_RECORD_BYTES))
-    for loc in [(0, 0), (0, 1), (1, 0), (0, 2)]:
+    for loc in [(1, 0), (0, 0), (0, 1), (0, 2)]:
         h.add(*loc, b"x" * 10)
-    assert h.evicted_through == (0, 0) and h.last_object(0) == 2
-    h.add(2, 0, b"x" * 10)                  # evicts (0, 1)
-    h.add(3, 0, b"x" * 10)                  # evicts (1, 0)
-    assert h.evicted_through == (1, 0)
+    assert h.evicted_through == (1, 0) and h.last_object(0) == 2
     got = h.fetch((0, 0), (0, 1 << 62))
     assert (got[0].group_id, got[0].object_id) == (0, 2)
     assert got[0].end_of_range == FETCH_FLAGS_END_UNKNOWN
@@ -120,6 +120,64 @@ def test_history_resolves_extensions_and_marks_datagrams():
     obj, = h.fetch((0, 0), (0, 0), "peer")
     assert obj.datagram and obj.extensions == {6: "peer"}
 
+
+
+def _charged(h):
+    return sum(retained_object_bytes(r[2], r[3])
+               for g in h._groups.values() for _, r in g.held())
+
+
+def test_the_oldest_group_goes_whole_when_the_excess_covers_it():
+    cost = 10 + OBJECT_RECORD_BYTES
+    h = ObjectHistory(4 * cost)
+    for loc in [(0, 0), (0, 1), (1, 0), (1, 1)]:
+        h.add(*loc, b"x" * 10)
+    h.add(2, 0, b"y" * (2 * cost - OBJECT_RECORD_BYTES))  # charged 2 records
+    assert list(h._groups) == [1, 2] and h.evicted_through == (0, 1)
+    assert h.bytes == _charged(h) == 4 * cost
+
+
+def test_eviction_takes_records_only_from_the_oldest_group():
+    cost = 10 + OBJECT_RECORD_BYTES
+    h = ObjectHistory(5 * cost)
+    for g in range(2):
+        for o in range(3):
+            h.add(g, o, b"x" * 10)
+    assert [(g, x.head) for g, x in h._groups.items()] == [(0, 1), (1, 0)]
+    assert h.evicted_through == (0, 0)
+    h.add(2, 0, b"x" * 10)
+    assert [(g, x.head) for g, x in h._groups.items()] == [(0, 2), (1, 0), (2, 0)]
+    assert h.evicted_through == (0, 1) and len(h) == 5
+
+
+def test_bytes_follow_retained_object_bytes():
+    h = ObjectHistory(4000)
+    for i in range(40):
+        props = ({0x10: i, 0x09: b"\x20", 0x0B: "abc"} if i % 3 == 0
+                 else {0x10: i} if i % 3 == 1 else None)
+        h.add(i // 4, i % 4, b"p" * (i * 7), extensions=props)
+        assert h.bytes == _charged(h) <= 4000
+
+
+def test_properties_are_held_as_given():
+    h = ObjectHistory(1 << 20)
+    props = {0x10: 7}
+    h.add(0, 0, b"x", extensions=props, priority=9)
+    h.add(0, 1, b"y", priority=200)
+    a, b = h.fetch((0, 0), (0, 1))
+    assert a.extensions is props
+    assert (a.publisher_priority, b.publisher_priority) == (9, 200)
+
+
+def test_a_long_group_compacts_its_evicted_records():
+    h = ObjectHistory(10 * (10 + OBJECT_RECORD_BYTES))
+    for o in range(5000):
+        h.add(0, o, b"x" * 10)
+    grp = h._groups[0]
+    assert len(h) == 10 and len(grp.records) <= 2100
+    assert h.last_object(0) == 4999 and h.evicted_through == (0, 4989)
+    assert _locations(h.fetch((0, 4990), (0, 4999))) == [
+        (0, o) for o in range(4990, 5000)]
 
 # -- over a real session -------------------------------------------------
 

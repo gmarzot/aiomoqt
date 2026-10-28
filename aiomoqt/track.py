@@ -372,11 +372,11 @@ class _SubgroupSender:
         held = {} if history is None else history._held(
             (group_id, first), (group_id, object_id - 1))
         recs = [held.get((group_id, oid)) for oid in missing]
-        if any(r is None or (r[2] or 0) != self.subgroup_id for r in recs):
+        if any(r is None or (r[0] or 0) != self.subgroup_id for r in recs):
             self.short = True
             return
         session = self.session
-        for _, oid, _, payload, exts, _ in recs:
+        for oid, (_, payload, exts, _) in zip(missing, recs):
             if callable(exts):
                 exts = exts(session)
             await session.stream_write_drain(
