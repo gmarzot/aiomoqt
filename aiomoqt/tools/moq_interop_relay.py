@@ -4207,7 +4207,7 @@ TRANSPORT_COUNTERS = (
     "rx_notify_pending_now", "rx_event_ring_count_now",
     "rx_overflow_depth_now", "rx_overflow_max_depth", "rx_overflow_pushed",
     "rx_event_drops", "tx_event_ring_count_now", "tx_event_ring_pops",
-    "tx_worker_idle_now", "loop_callbacks",
+    "tx_worker_idle_now", "tx_wake_lost", "loop_callbacks",
     "wake_calls", "wake_skipped_coalesced")
 
 
