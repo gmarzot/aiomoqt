@@ -444,6 +444,7 @@ class _MOQTSessionMixin:
         self._stream_torn_down_last_sweep: float = 0.0
         self._tasks: Set[asyncio.Task] = set()
         self._close_err = None  # first (error_code, reason_phrase) closed with
+        self._closed_by_us = False  # the first close was ours
 
         self._bidi_streams: Dict[int, int] = {}  # map request_id to bidi stream_id (d16)
         self._bidi_stream_requests: Dict[int, int] = {}  # map bidi stream_id to request_id (d16)
@@ -1350,7 +1351,14 @@ class _MOQTSessionMixin:
             control_log.debug("MOQT: control task cancelled")
         else:
             e = task.exception()
-            if e: logger.error(f"MOQT error: control task failed with exception: {e}")
+            if e is None:
+                return
+            if (isinstance(e, ConnectionError)
+                    and self._moqt_session_closed.done()):
+                # The session's close ended it, e.g. a refused session.
+                control_log.debug(f"MOQT: control task ended by close: {e}")
+            else:
+                logger.error(f"MOQT error: control task failed with exception: {e}")
 
     def _path_match(self, path: Union[bytes,str]):
         configured = getattr(self._session, 'path')
@@ -3024,7 +3032,9 @@ class _MOQTSessionMixin:
                     self._post_close_warned = seen
                 if stream_id not in seen:
                     seen.add(stream_id)
-                    logger.warning(
+                    # Expected after our own close, e.g. a refused session's SETUP.
+                    logger.log(
+                        logging.DEBUG if self._closed_by_us else logging.WARNING,
                         f"QUIC event: stream data after close: stream {stream_id} "
                         f"(rate-limited to once per stream)"
                     )
@@ -3168,6 +3178,7 @@ class _MOQTSessionMixin:
         first = self._close_err is None
         if first:
             self._close_err = (error_code, reason_phrase)
+            self._closed_by_us = transmit
             # Close before failing waiters: an app that exits on the
             # failure stops the transport.
             if transmit:
@@ -3274,8 +3285,23 @@ class _MOQTSessionMixin:
 
         parameters are extra SETUP options merged into the CLIENT_SETUP /
         Setup message — e.g. {SetupParamType.AUTH_TOKEN: b"..."} for
-        session-level auth (Token-wrapped on the wire)."""
+        session-level auth (Token-wrapped on the wire). A server close
+        during setup raises as MOQTException."""
+        try:
+            return await self._client_session_init(timeout, parameters)
+        except (MOQTException, MOQTNegotiationError):
+            raise
+        except (asyncio.CancelledError, ConnectionError):
+            # Over WT a close landing mid-setup surfaces from the stream
+            # calls; a real cancellation still propagates.
+            task = asyncio.current_task()
+            if self._close_err is None or (task and task.cancelling()):
+                raise
+            raise MOQTException(*self._close_err) from None
 
+    async def _client_session_init(self, timeout: int,
+                                   parameters: Optional[Dict[int, bytes]]
+                                   ) -> bool:
         self._check_setup_location(parameters)
         use_quic = not self._is_wt
         _t0 = time.monotonic()

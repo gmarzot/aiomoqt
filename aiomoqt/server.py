@@ -22,6 +22,16 @@ logger = get_logger(__name__)
 
 _WILDCARDS = (None, "", "::", "0.0.0.0")
 
+# Seconds between checks for new sessions to close while close_sessions waits.
+_CLOSE_POLL_S = 0.05
+
+
+def _cnx_ended(session) -> Optional[asyncio.Event]:
+    """Set once the session's connection has ended: raw QUIC's own close,
+    WT's connection close (the peer drops it)."""
+    return (getattr(session, '_cnx_closed', None)
+            or getattr(session, '_closed', None))
+
 
 def _listen_desc(host: Optional[str]) -> str:
     if host in (None, "", "::"):
@@ -137,6 +147,10 @@ class MOQTServer(MOQTPeer):
         self._server_closed: Future[Tuple[int, str]] = self._loop.create_future()
         self._next_subscribe_id = 1
         self._live: weakref.WeakSet = weakref.WeakSet()
+        # Close reason for sessions arriving from now on; None accepts them.
+        self._refusal: Optional[str] = None
+        # Sessions this server closed, until their connections end.
+        self._closing: weakref.WeakSet = weakref.WeakSet()
 
     def serve(self) -> Coroutine[Any, Any, Any]:
         """Start the MOQT server."""
@@ -287,23 +301,48 @@ class MOQTServer(MOQTPeer):
 
     def _adopt(self, session):
         self._live.add(session)
+        if self._refusal is not None:
+            self._loop.call_soon(self.refuse, session)
         return session
 
+    def refuse_sessions(self, reason: str = "server shutting down") -> None:
+        """Close every session that arrives from now on (NO_ERROR) before
+        its setup completes."""
+        self._refusal = reason
+
+    def refuse(self, session: Any) -> None:
+        """Close `session` (NO_ERROR) unless already closed; a SETUP it
+        has in flight no longer completes."""
+        if session._moqt_session_closed.done():
+            return
+        self._closing.add(session)
+        session._close_session(SessionCloseCode.NO_ERROR,
+                               self._refusal or "server shutting down")
+
     async def close_sessions(self, timeout: float = 1.0) -> None:
-        """Close every live session (NO_ERROR) and wait up to `timeout`
-        for the closes to leave. Call before closing the serve() handle,
-        which stops the transport without telling the peers."""
-        live = [s for s in list(self._live) if s._close_err is None]
-        for s in live:
-            s.close(SessionCloseCode.NO_ERROR, "server shutting down")
-        # Raw QUIC: the connection's own close; WT: the peer drops it.
-        done = [getattr(s, '_cnx_closed', None) or getattr(s, '_closed', None)
-                for s in live]
-        waits = [asyncio.ensure_future(ev.wait()) for ev in done
-                 if ev is not None]
-        if waits:
-            _, pending = await asyncio.wait(waits, timeout=timeout)
-            for w in pending:
+        """Close every live session (NO_ERROR), refuse any that arrive
+        from now on, and wait up to `timeout` for these closes to leave.
+        Call before closing the serve() handle, which stops the transport
+        without telling the peers."""
+        if self._refusal is None:
+            self._refusal = "server shutting down"
+        for s in list(self._live):
+            if not s._moqt_session_closed.done():
+                self._closing.add(s)
+                s.close(SessionCloseCode.NO_ERROR, "server shutting down")
+        deadline = self._loop.time() + timeout
+        while True:
+            left = deadline - self._loop.time()
+            pending = [ev for ev in map(_cnx_ended, list(self._closing))
+                       if ev is not None and not ev.is_set()]
+            if not pending or left <= 0:
+                return
+            # Short rounds pick up sessions refused meanwhile.
+            waits = [asyncio.ensure_future(ev.wait()) for ev in pending]
+            _, unfinished = await asyncio.wait(
+                waits, timeout=min(left, _CLOSE_POLL_S),
+                return_when=asyncio.FIRST_COMPLETED)
+            for w in unfinished:
                 w.cancel()
 
     async def closed(self) -> bool:
