@@ -111,14 +111,19 @@ const Dash = (() => {
     return d;
   }
 
-  // Series share one scale; with more than one, each also gets a translucent area.
-  function spark(container, ...series) {
+  function sparkSvg(container) {
     let svg = container.querySelector('svg.spark');
     if (!svg) {
       svg = svgEl('svg', {class: 'spark', viewBox: '0 0 100 24', preserveAspectRatio: 'none',
                           'aria-hidden': 'true'});
       container.append(svg);
     }
+    return svg;
+  }
+
+  // Series share one scale; with more than one, each also gets a translucent area.
+  function spark(container, ...series) {
+    const svg = sparkSvg(container);
     const known = series.flat().filter((v) => !none(v));
     const max = Math.max(...known, 0) || 1;
     const y = (v) => 22 - 20 * v / max;
@@ -128,6 +133,17 @@ const Dash = (() => {
       : [];
     svg.replaceChildren(...areas,
       ...series.map((v, k) => svgEl('path', {class: `line s${k}`, d: pathFor(v, x(v), y)})));
+  }
+
+  // One bar per value over a zero baseline.
+  function bars(container, values) {
+    const svg = sparkSvg(container);
+    const max = Math.max(...values.filter((v) => !none(v)), 0) || 1;
+    const w = 100 / Math.max(values.length, 1);
+    svg.replaceChildren(svgEl('path', {class: 'base', d: 'M0,22.5L100,22.5'}),
+      ...values.flatMap((v, i) => (none(v) || v <= 0) ? [] : [svgEl('rect', {
+        class: 'bar', x: (i * w + w * 0.15).toFixed(1), width: (w * 0.7).toFixed(1),
+        y: (22 - 20 * v / max).toFixed(1), height: (20 * v / max).toFixed(1)})]));
   }
 
   // Legend keys mirror the mark: a line for lines, a block for areas.
@@ -312,6 +328,6 @@ const Dash = (() => {
     document.body.classList.toggle('stale', stale && age !== null);
   }
 
-  return {SERIES, OTHER, $, el, svgEl, none, fmt, niceMax, spark, legend, chart, poll,
+  return {SERIES, OTHER, $, el, svgEl, none, fmt, niceMax, spark, bars, legend, chart, poll,
           showFreshness};
 })();
