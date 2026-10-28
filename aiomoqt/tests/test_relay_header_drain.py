@@ -2,6 +2,7 @@
 TX ring delays a header and never drops it; a header write that cannot
 finish resets its stream; a lane parked on a header still sheds."""
 import asyncio
+import contextlib
 import os
 import signal
 import subprocess
@@ -176,10 +177,13 @@ async def test_a_stalled_viewer_parks_only_its_own_lane(
                            object_size=20_000, group_size=group,
                            rate=rate).attach()
             await pub.publish_namespace(namespace=ns, wait_response=True)
-            proc = await asyncio.create_subprocess_exec(
-                sys.executable, "-c", _STALLED_SUB, str(port), ns, name,
+            # Not an asyncio subprocess: on macOS py3.14 the child watcher
+            # reaps a SIGSTOP'd child with a blocking waitpid on the loop.
+            proc = subprocess.Popen(
+                [sys.executable, "-c", _STALLED_SUB, str(port), ns, name],
                 stdout=subprocess.PIPE, cwd=os.getcwd())
-            line = await asyncio.wait_for(proc.stdout.readline(), 10)
+            line = await asyncio.wait_for(
+                asyncio.to_thread(proc.stdout.readline), 10)
             assert line.strip() == b"subscribed", line
             track = relay._tracks[(relay._ns_tuple(ns), name.encode())]
             (d_stalled,) = track.downstream
@@ -188,7 +192,12 @@ async def test_a_stalled_viewer_parks_only_its_own_lane(
                                   on_object=healthy.on_object).subscribe(
                                       timeout=5)
             os.kill(proc.pid, signal.SIGSTOP)
+            for _ in range(50):
+                if d_stalled.lane is not None:
+                    break
+                await asyncio.sleep(0.1)
             lane = d_stalled.lane
+            assert lane is not None, "the stalled viewer's lane never opened"
             await asyncio.sleep(1.0)
             before = {k[0] for k in healthy.objects}
             sheds0, parked, peak = lane.sheds, 0, 0
@@ -206,5 +215,8 @@ async def test_a_stalled_viewer_parks_only_its_own_lane(
             assert len(got) >= 0.8 * 5 * rate / group, len(got)
     finally:
         if proc is not None:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(proc.pid, signal.SIGCONT)
             proc.kill()
-            await proc.wait()
+            await asyncio.to_thread(proc.wait, 10)
+            proc.stdout.close()
