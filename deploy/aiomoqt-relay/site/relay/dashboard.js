@@ -113,11 +113,11 @@ function setTile(key, value, sub, title) {
   if (title) t.title = title;
 }
 
-// Out and in side by side, each above its sparkline key.
-function setPair(key, rateOut, rateIn, title) {
-  setTile(key, [el('span', {}, fmt.rate(rateOut)), el('span', {}, fmt.rate(rateIn))],
-          [el('span', {}, el('i', {class: 'key-area s0'}), 'out'),
-           el('span', {}, el('i', {class: 'key-area s1'}), 'in')], title);
+// In and out side by side, each above its sparkline key.
+function setPair(key, rateIn, rateOut, title) {
+  setTile(key, [el('span', {}, fmt.rate(rateIn)), el('span', {}, fmt.rate(rateOut))],
+          [el('span', {}, el('i', {class: 'key-area s1'}), 'in'),
+           el('span', {}, el('i', {class: 'key-area s0'}), 'out')], title);
 }
 
 // New drops per minute over the 10-minute history, oldest first; null without drops history.
@@ -176,10 +176,10 @@ function renderTiles(s) {
           `${fmt.num(T.drops)} since start`, 'Subscribers dropped; bars per minute');
   const groupsIn = none(T.groups_per_s) ? groups : T.groups_per_s;
   const out = (k, rate) => (none(T[k]) ? fanout(rate) : T[k]);
-  setPair('groups', out('groups_out_per_s', 'groups_per_s'), groupsIn,
-          'Out = delivered to subscribers: each track\'s group rate times its subscribers; in = received from publishers');
-  setPair('objects', out('objects_out_per_s', 'objects_per_s'), T.objects_in_per_s,
-          'Out = delivered to subscribers: each track\'s object rate times its subscribers; in = received from publishers');
+  setPair('groups', groupsIn, out('groups_out_per_s', 'groups_per_s'),
+          'In = received from publishers; out = delivered to subscribers: each track\'s group rate times its subscribers');
+  setPair('objects', T.objects_in_per_s, out('objects_out_per_s', 'objects_per_s'),
+          'In = received from publishers; out = delivered to subscribers: each track\'s object rate times its subscribers');
   setTile('ingress', fmt.bps(T.ingress_bps), `media ${fmt.bps(T.media_in_bps)}`);
   setTile('egress', fmt.bps(T.egress_bps), `media ${fmt.bps(T.media_out_bps)}`);
   for (const tile of document.querySelectorAll('.tile[data-spark]')) {
