@@ -7,16 +7,20 @@ Measures pure Python throughput on the aiopquic stack without relay overhead.
 Usage:
   python -m aiomoqt.tools.loopback_bench -s 4096 -r 5000 -t 20
   python -m aiomoqt.tools.loopback_bench -P 4 -s 16384 -r 60 -t 20
+  python -m aiomoqt.tools.loopback_bench --fanout -s 4096 -t 20
 """
 import argparse
 import asyncio
 import sys
+import time
 
 from aiomoqt.types import MOQTMessageType, parse_draft_spec
 from aiomoqt.client import MOQTClient
+from aiomoqt.delivery import StreamMapping
 from aiomoqt.server import MOQTServer
-from aiomoqt.track import PublishedTrack, SubscribedTrack
-from aiomoqt.types import ForwardingPreference
+from aiomoqt.track import (_PACED_YIELD_EVERY, PublishedTrack,
+                           SubscribedTrack)
+from aiomoqt.types import LOC_TIMESTAMP, ForwardingPreference
 from aiomoqt.utils import cli as _cli
 from aiomoqt.utils import wait_cond_timeout
 from aiomoqt.tools.sub_bench import BenchReporter
@@ -103,6 +107,11 @@ def parse_args():
              'The stream/datagram A/B lever: run twice at the same -s '
              'and -r, once with and once without.')
     parser.add_argument(
+        '--fanout', action='store_true',
+        help='Publish through produce() and its per-subscriber send lane '
+             '(FanoutDelivery), the path LOC media tracks take, instead '
+             'of the per-subscriber generator. One subgroup per group.')
+    parser.add_argument(
         '--draft', type=parse_draft_spec, default=14,
         help='MoQT draft version to negotiate (e.g. 14, 16, or 18, '
              'default: 14). Applied to BOTH the loopback publisher '
@@ -138,6 +147,8 @@ def parse_args():
         args.insecure = args.cert is None
     args.cert = args.cert or CERT
     args.key = args.key or KEY
+    if args.fanout and args.streams > 1:
+        parser.error("--fanout: one subgroup per group; -P must be 1")
     if args.datagram and args.object_size > 1152:
         parser.error(f"--datagram: object_size {args.object_size} can "
                      f"never fit a DATAGRAM frame (max ~1152B payload "
@@ -167,7 +178,8 @@ def print_banner(args):
     row("draft", args.draft)
     row("url", url)
     row("transport", transport_label)
-    row("delivery", "DATAGRAM" if args.datagram else "subgroup streams")
+    row("delivery", ("DATAGRAM" if args.datagram else "subgroup streams")
+        + (", fanout lane" if args.fanout else ""))
     row("cc algorithm", args.cc_algo)
     row("sub-groups", args.streams)
     row("group size", f"{args.group_size} objects")
@@ -177,9 +189,77 @@ def print_banner(args):
     print("─" * 56)
 
 
+class _FanoutTrack(PublishedTrack):
+    """The default generator's objects, written once through produce()
+    so each takes its subscriber's send lane. Unpaced, it pauses while
+    a lane holds more than _LANE_HIGH objects."""
+
+    _LANE_HIGH = 16
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.mapping = (StreamMapping.DATAGRAM
+                        if self.forwarding == ForwardingPreference.DATAGRAM
+                        else StreamMapping.PER_GROUP)
+        self._lane_moved = asyncio.Event()
+
+    def _on_sent(self, group_id, object_id):
+        self._lane_moved.set()
+
+    def _stamp(self, group_id, object_id):
+        """Stamped now, at production: lane wait counts in latency."""
+        loc = {LOC_TIMESTAMP: int(time.time() * 1_000_000)}
+        if self.timestamps == 'loc':
+            return loc
+        full = self._timestamp_writer().stamp(group_id, object_id)
+        return lambda s: full if s._profile.track_properties else loc
+
+    async def produce(self, out) -> None:
+        pad = self._counted_pad()
+        await self._await_schedule(0, 0)
+        next_t = time.monotonic()
+        tick = 0
+        group_id = 0
+        while True:
+            for object_id in range(self.group_size):
+                payload = (f"{group_id}.{object_id}".encode() + b'|'
+                           + pad)[:self.object_size]
+                await out.write(group_id, object_id, payload,
+                                extensions=self._stamp(group_id, object_id),
+                                group_start=object_id == 0)
+                tick += 1
+                if self.rate > 0:
+                    next_t += 1.0 / self.rate
+                    lead = next_t - time.monotonic()
+                    if lead > 0.0005:
+                        await asyncio.sleep(lead)
+                        continue
+                elif self._backlog(out) > self._LANE_HIGH:
+                    await self._wait_lanes(out)
+                    continue
+                if tick % _PACED_YIELD_EVERY == 0:
+                    await asyncio.sleep(0)
+            group_id += 1
+
+    @staticmethod
+    def _backlog(out) -> int:
+        return max((ln.queue.qsize() for ln in out.lanes), default=0)
+
+    async def _wait_lanes(self, out) -> None:
+        while self._backlog(out) > self._LANE_HIGH:
+            self._lane_moved.clear()
+            # Timeout: a lane skipping to the next group drops objects
+            # without calling _on_sent.
+            try:
+                await asyncio.wait_for(self._lane_moved.wait(), 0.01)
+            except asyncio.TimeoutError:
+                pass
+
+
 async def _on_subscribe(session, msg, args):
     """Server-side subscribe handler using PublishedTrack."""
-    track = PublishedTrack(
+    track_class = _FanoutTrack if args.fanout else PublishedTrack
+    track = track_class(
         session,
         namespace="aiomoqt",
         trackname="track",

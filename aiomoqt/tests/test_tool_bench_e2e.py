@@ -98,6 +98,25 @@ def test_loopback_bench_verifies_its_own_cert(transport):
 
 
 @requires_certs
+@pytest.mark.parametrize("transport", ["-Q", "-W"])
+def test_loopback_bench_fanout_delivers_through_the_lane(transport):
+    rc, out = run("loopback_bench", transport, "--fanout", "-p",
+                  free_udp_port(), "--draft", 18, "-t", 2, "-s", 1200, "-k")
+    assert rc == 0, out
+    assert "fanout lane" in out, out
+    assert objects_received(out) > 0, out
+    assert re.search(r"^\s*Lost:\s+0 ", out, re.MULTILINE), out
+
+
+def test_loopback_bench_fanout_refuses_parallel_subgroups(monkeypatch):
+    import sys
+    from aiomoqt.tools import loopback_bench
+    monkeypatch.setattr(sys, "argv", ["loopback_bench", "--fanout", "-P", "2"])
+    with pytest.raises(SystemExit):
+        loopback_bench.parse_args()
+
+
+@requires_certs
 def test_loopback_bench_reports_through_its_last_second():
     # 2 s intervals: a row printed late still leaves the closing row
     # its half-interval (1 s) on a loaded CPU.
