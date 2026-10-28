@@ -18,6 +18,7 @@ from aiomoqt.types import ForwardingPreference
 from aiomoqt.tools import moq_interop_relay as relay
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
+from aiomoqt.tests._relay_wait import until_published
 
 pytestmark = [requires_certs, pytest.mark.asyncio]
 
@@ -95,6 +96,7 @@ async def _relay(port, draft, names, streamed=()):
             for track in tracks.values():
                 await track.publish(announce_namespace=False,
                                     publish_track=True)
+            await until_published(_NS, tracks)
             rx = await _session(False)
             got = {name: [] for name in tracks}
             for name in tracks:

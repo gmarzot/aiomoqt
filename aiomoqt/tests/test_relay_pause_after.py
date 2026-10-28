@@ -12,6 +12,7 @@ from aiomoqt.tools import moq_interop_relay as relay
 from aiomoqt.track import PublishedTrack
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
+from aiomoqt.tests._relay_wait import until_published
 
 pytestmark = requires_certs
 
@@ -87,6 +88,8 @@ async def _relay(port, use_quic, draft, flow, pause_after, names,
                                         publish_track=True)
                 else:
                     track.attach()
+            if flow == "publish":
+                await until_published(_NS, names)
             if flow == "announce":
                 await pub.publish_namespace(namespace=_NS,
                                             wait_response=True)
