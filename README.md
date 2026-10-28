@@ -363,7 +363,7 @@ uv pip install -e ".[test]"    # or: pip install -e ".[test]"
 pytest aiomoqt/tests/
 ```
 
-Install editable. The standalone bench scripts and the cross-importing loopback tests resolve `certs/` and sibling modules relative to the working tree; a non-editable install skips the loopback suites with "TLS certs not found in certs/". `pytest` generates `certs/` on first run. For the standalone bench scripts, generate them directly:
+Install editable. The standalone bench scripts and the cross-importing loopback tests resolve `certs/` and sibling modules relative to the working tree; a non-editable install skips the loopback suites with "TLS certs not found in certs/". `pytest` generates `certs/` on first run. loopback_bench and adaptive_bench (loopback) need no setup: when they find no cert, they generate a self-signed localhost cert once into `~/.cache/aiomoqt/` (`$XDG_CACHE_HOME`), using the `openssl` CLI or the `cryptography` package. Servers (pub_server, aiomoqt-relay) never self-sign; give them `--cert`/`--key` or generate one:
 
 ```bash
 mkdir -p certs && openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \

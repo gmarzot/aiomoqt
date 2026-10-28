@@ -23,25 +23,12 @@ from aiomoqt.track import (_PACED_YIELD_EVERY, PublishedTrack,
 from aiomoqt.types import LOC_TIMESTAMP, ForwardingPreference
 from aiomoqt.utils import cli as _cli
 from aiomoqt.utils import wait_cond_timeout
+from aiomoqt.utils.certs import ensure_self_signed, find_cert, find_key
 from aiomoqt.tools.sub_bench import BenchReporter
 
 
-def _find_default_cert():
-    """Search common locations for test certificates."""
-    import os
-    candidates = [
-        os.path.join(os.path.dirname(__file__),
-                     '..', '..', 'certs', 'cert.pem'),
-        os.path.expanduser('~/.local/share/moqt/cert.pem'),
-    ]
-    for c in candidates:
-        if os.path.exists(c):
-            return os.path.realpath(c)
-    return None
-
-
-CERT = _find_default_cert()
-KEY = CERT.replace('cert.pem', 'key.pem') if CERT else None
+CERT = find_cert()
+KEY = find_key(CERT)
 
 
 def parse_args():
@@ -372,6 +359,8 @@ async def main():
                           minimal=args.no_stats)
     print_banner(args)
 
+    if not args.cert and not args.key:
+        args.cert, args.key = ensure_self_signed()
     if not args.cert or not args.key:
         print("  Error: TLS certificate required. "
               "Use --cert and --key,")

@@ -2,6 +2,7 @@
 
 ## v0.14.0
 
+- loopback_bench and adaptive_bench (loopback) generate a self-signed localhost cert when none is found; servers still require one.
 - pub_media gives each dial attempt 4 s (was 10 s), so a handshake lost in a relay restart costs a short retry.
 - aiomoqt-relay status: `tx_worker_idle_now` and `tx_event_ring_pops` from the transport.
 - A drained stream write that fails inside the transport ends that stream (or its producer, if the session is closing) instead of returning as if it succeeded; unexpected failures log a WARNING.

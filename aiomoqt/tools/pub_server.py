@@ -14,7 +14,6 @@ Usage:
 """
 import argparse
 import asyncio
-import os
 import signal
 
 from aiomoqt.server import MOQTServer
@@ -23,26 +22,14 @@ from aiomoqt.types import (D18MessageType, MOQT_DEFAULT_DRAFTS, MOQTMessageType,
 from aiomoqt.track import PublishedTrack
 from aiomoqt.types import ForwardingPreference
 from aiomoqt.utils import cli as _cli
+from aiomoqt.utils.certs import find_cert, find_key
 from aiomoqt.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 
-def _find_default_cert():
-    """Search common locations for test certificates."""
-    candidates = [
-        os.path.join(os.path.dirname(__file__),
-                     '..', '..', 'certs', 'cert.pem'),
-        os.path.expanduser('~/.local/share/moqt/cert.pem'),
-    ]
-    for c in candidates:
-        if os.path.exists(c):
-            return os.path.realpath(c)
-    return None
-
-
-CERT = _find_default_cert()
-KEY = CERT.replace('cert.pem', 'key.pem') if CERT else None
+CERT = find_cert()
+KEY = find_key(CERT)
 
 
 def parse_args():

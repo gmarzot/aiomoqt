@@ -38,6 +38,8 @@ from aiomoqt.track import PublishedTrack, SubscribedTrack
 from aiomoqt.types import (FilterType, MOQTMessageType, ObjectStatus,
                            parse_draft_spec)
 from aiomoqt.utils import cli as _cli
+from aiomoqt.utils.certs import (REPO_CERTS_DIR, ensure_self_signed,
+                                 find_cert, find_key)
 from aiomoqt.utils.cli import endpoint_url
 from aiomoqt.utils.format import fmt_bps, fmt_ms, fmt_ms_signed
 from aiomoqt.utils.stats import (CLOCK_OFFSET_MARK, CLOCK_OFFSET_MIN_MS,
@@ -1299,19 +1301,8 @@ class AIMDController:
 # Loopback server: consumer role, hosts the PublishedTrack.
 # ---------------------------------------------------------------------------
 
-def _find_default_cert():
-    candidates = [
-        os.path.join(os.path.dirname(__file__),
-                     '..', '..', 'certs', 'cert.pem'),
-    ]
-    for c in candidates:
-        if os.path.exists(c):
-            return os.path.realpath(c)
-    return None
-
-
-CERT = _find_default_cert()
-KEY = CERT.replace('cert.pem', 'key.pem') if CERT else None
+CERT = find_cert([REPO_CERTS_DIR])
+KEY = find_key(CERT)
 
 
 async def run_loopback_server(args, state: BenchState):
@@ -1782,13 +1773,14 @@ async def main():
     relay_mode = args.relay_url is not None
     # Default to loopback self-test if neither mode flag given
     loopback_port = args.loopback_port or 4435
+    _cli.apply_logging(args)
+    if not relay_mode and not args.cert and not args.key:
+        args.cert, args.key = ensure_self_signed()
     if not relay_mode and (not args.cert or not args.key):
         print("  error: TLS cert/key not found. Set --cert / --key or place "
               "cert.pem/key.pem under <project>/certs/",
               file=sys.stderr)
         return 2
-
-    _cli.apply_logging(args)
 
     state = BenchState()
     stats = LiveStats(object_size=args.scenario.object_size,
