@@ -894,6 +894,8 @@ class _RelayedTrack:
         # Largest group before the last resume: cached groups up to it
         # are stale for subscribers joining since.
         self.fence = None
+        # The publisher's Largest from its REQUEST_OK to the last pause.
+        self.pause_largest = None
         # The PUBLISH feeding this track, once answered.
         self.publish_msg = None
         # Loop time since which no subscriber has forwarded, else None.
@@ -2586,6 +2588,9 @@ def _resume_paused(track, wanted=False):
     wait = wanted and not session._profile.update_has_location
     if track.lowered and track.largest is not None:
         track.fence = track.largest[0]
+        if track.pause_largest is not None:
+            track.fence = max(track.fence, track.pause_largest[0])
+    track.pause_largest = None
     track.paused = track.lowered = False
     track.unwatched_since = None
     if track._objects_in:
@@ -2668,17 +2673,33 @@ def _pause_upstream(track) -> None:
     if req is None or not _session_live(req[0]):
         return
     session, rid, location = req
+    wait = not session._profile.update_has_location
     try:
-        session.request_update(rid, forward=0, **location)
+        reply = session.request_update(rid, forward=0, wait_response=wait,
+                                       **location)
     except Exception:
         logger.debug("relay: lowering the upstream forward state failed",
                      exc_info=True)
         return
     track.paused = True
     track.lowered = True
+    track.pause_largest = None
+    if wait:
+        asyncio.ensure_future(_take_pause_largest(track, reply))
     logger.info(f"relay: paused {track.key} upstream, no forwarding "
                 f"subscriber for {_pause_after:g}s: REQUEST_UPDATE "
                 f"forward=0 request {rid}")
+
+
+async def _take_pause_largest(track, reply) -> None:
+    """Note the Largest a pause's REQUEST_OK reports, if it arrives
+    while the track is still paused."""
+    try:
+        ok = await reply
+    except Exception:
+        return
+    if track.lowered:
+        track.pause_largest = _update_largest(ok)
 
 
 def _pausable(track) -> bool:
