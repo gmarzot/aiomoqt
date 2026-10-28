@@ -226,7 +226,7 @@ async def _dial_refused(port, use_quic, draft):
                         verify_tls=False, supported_drafts=draft)
     setup = False
     t0 = loop.time()
-    # A refused WT client raises CancelledError mid-setup.
+    # Only whether setup completed matters; a refused setup raises.
     with contextlib.suppress(Exception, asyncio.CancelledError):
         async with client.connect() as s:
             with contextlib.suppress(Exception, asyncio.CancelledError):
