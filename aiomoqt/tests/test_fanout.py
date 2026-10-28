@@ -16,6 +16,7 @@ from aiomoqt.delivery import (FanoutDelivery, OBJECT_RECORD_BYTES,
 from aiomoqt.fanout import FanoutPublisher
 from aiomoqt.media import Catalog, CatalogTrack, LocTrackPublisher
 from aiomoqt.media.loc import LOC02_PROP_TIMESTAMP, LOC_PROP_TIMESTAMP
+from aiomoqt import track as track_mod
 from aiomoqt.track import PublishedTrack, TrackState
 from aiomoqt.types import ParamType
 
@@ -603,6 +604,40 @@ async def test_publisher_shares_one_track_across_sessions():
     assert [s.session for s in track.subscriptions] == [b]
     assert [p.session for p in pub.publishers] == [b]
     assert [m.session for m in pub.catalog_track.members] == [b]
+
+
+
+@pytest.mark.asyncio
+async def test_objects_are_timed_only_while_a_lane_has_a_timeout():
+    s = _Session()
+    fan = FanoutDelivery()
+    lane = fan.add(_delivery(s), joining=False)
+    items = []
+    real = lane.offer
+    lane.offer = lambda item: items.append(item) or real(item)
+    await fan.write(0, 0, b"k", group_start=True)
+    lane.deadline = 0.5
+    await fan.write(0, 1, b"p")
+    lane.deadline = None
+    await fan.write(0, 2, b"p")
+    assert [item[3] is not None for item in items] == [False, True, False]
+    await fan.close()
+
+
+@pytest.mark.asyncio
+async def test_a_peer_filter_reaches_its_delivery_only_while_filtered():
+    a = _Session("a")
+    track = _Counter(a, 0)
+    sub = track.subscriptions[0]
+    sub.generating = True
+    track._add_delivery(sub)
+    assert sub.delivery.passes is None
+    sub.window = ((2, 0), None)
+    assert sub.delivery.passes == sub.passes
+    assert not sub.delivery.passes(1, 5) and sub.delivery.passes(2, 0)
+    sub.window = track_mod._UNFILTERED
+    assert sub.delivery.passes is None
+    await track._out.close()
 
 
 # -- the track layer owns fan-out ------------------------------------

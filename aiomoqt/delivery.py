@@ -797,7 +797,9 @@ class SendLane:
         # sent, and the lane resumes at a later group.
         self.gate = True
         # Object delivery timeout in seconds (§8), None for none.
-        self.deadline: Optional[float] = None
+        self._deadline: Optional[float] = None
+        # Called when `deadline` changes.
+        self.on_deadline: Optional[Callable] = None
         # Called with each object item the writer sent.
         self.on_sent: Optional[Callable] = None
         # Called with an error that ends the track; the lane then stops.
@@ -825,6 +827,16 @@ class SendLane:
     @property
     def session(self):
         return self.writer.session
+
+    @property
+    def deadline(self) -> Optional[float]:
+        return self._deadline
+
+    @deadline.setter
+    def deadline(self, value: Optional[float]) -> None:
+        self._deadline = value or None
+        if self.on_deadline is not None:
+            self.on_deadline()
 
     @property
     def idle(self) -> bool:
@@ -1144,7 +1156,7 @@ class SendLane:
                     self._skip(gid, count=False)
                     self.done += 1
                     continue
-                deadline = self.deadline
+                deadline = self._deadline
                 if (deadline is not None and item[3] is not None
                         and time.monotonic() - item[3] > deadline):
                     # §8: not sent; on a stream the group is not resumed.
@@ -1199,6 +1211,8 @@ class FanoutDelivery:
         self.error: Optional[Exception] = None
         # Group of the last object written.
         self._group: Optional[int] = None
+        # Some lane has a delivery timeout: objects are stamped when made.
+        self._timed = False
         for delivery in deliveries:
             self.add(delivery, joining=False)
 
@@ -1211,15 +1225,19 @@ class FanoutDelivery:
         in seconds; the owner updates them on the lane."""
         lane = SendLane(delivery, max_bytes=self.max_bytes, name=self.name)
         lane.gate = gate
-        lane.deadline = deadline or None
         lane.on_sent = self._sent
         lane.on_fatal = self._fail
+        lane.on_deadline = self._retime
         delivery.lane = lane
         if joining and self._group is not None:
             lane.floor = self._group + 1
-        self.lanes.append(lane)
+        self.lanes = [*self.lanes, lane]
+        lane.deadline = deadline
         self._mark_shared_datagrams()
         return lane
+
+    def _retime(self) -> None:
+        self._timed = any(ln.deadline is not None for ln in self.lanes)
 
     def _fail(self, error: Exception) -> None:
         if self.error is None:
@@ -1242,13 +1260,15 @@ class FanoutDelivery:
         """Detach a session's lanes, resetting any open group. True if it
         had one."""
         mine = [ln for ln in self.lanes if ln.session is session]
+        if not mine:
+            return False
+        self.lanes = [ln for ln in self.lanes if ln.session is not session]
         for lane in mine:
             lane.stop()
-            self.lanes.remove(lane)
             lane.writer.reset_group()
-        if mine:
-            self._mark_shared_datagrams()
-        return bool(mine)
+        self._mark_shared_datagrams()
+        self._retime()
+        return True
 
     @property
     def stream_count(self) -> int:
@@ -1268,16 +1288,24 @@ class FanoutDelivery:
             raise self.error
         if self.on_write is not None:
             self.on_write(group_id, object_id, payload, extensions)
+        lanes = self.lanes
         # One encoding per header state, shared by the lanes in it; it
         # lives as long as the item is queued.
-        encoded = [] if len(self.lanes) > 1 else None
-        cost = (retained_object_bytes(payload, extensions) if extensions
-                else OBJECT_RECORD_BYTES + (len(payload) if payload else 0))
-        item = (group_id, cost, True, time.monotonic(), object_id, payload,
-                extensions, group_start, encoded)
+        encoded = [] if len(lanes) > 1 else None
+        cost = OBJECT_RECORD_BYTES + (len(payload) if payload else 0)
+        if extensions.__class__ is dict:
+            # retained_object_bytes, inlined for the common property values.
+            for v in extensions.values():
+                cost += 16 if v.__class__ is int else 16 + (
+                    len(v) if isinstance(v, _BYTES_TYPES) else 0)
+        elif extensions is not None and not callable(extensions):
+            cost = retained_object_bytes(payload, extensions)
+        item = (group_id, cost, True,
+                time.monotonic() if self._timed else None, object_id,
+                payload, extensions, group_start, encoded)
         self._group = group_id
         queued = False
-        for lane in list(self.lanes):
+        for lane in lanes:
             if lane.offer(item):
                 queued = True
         if queued:

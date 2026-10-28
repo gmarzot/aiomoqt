@@ -432,7 +432,7 @@ class _Subscription:
     __slots__ = ('session', 'track_alias', 'request_id',
                  'subscribe_request_id', 'subscribers', 'state', '_forward',
                  'done', 'stream_count', '_generating', 'delivery', 'joining',
-                 'window', 'open_streams', 'end_status', 'senders',
+                 '_window', 'open_streams', 'end_status', 'senders',
                  'fill_streams', 'fills', 'location_filter', 'group_order',
                  'object_timeout', 'subgroup_timeout', 'updated_request')
 
@@ -458,7 +458,7 @@ class _Subscription:
         # reported as its Forward State became 1, None if nothing existed.
         self.joining: Dict[int, Optional[tuple]] = {}
         # Filter window (§5.1.2) and the streams open under it.
-        self.window = _UNFILTERED
+        self._window = _UNFILTERED
         self.open_streams = 0
         # PUBLISH_DONE status for a subscription ended under the track.
         self.end_status = SubscribeDoneCode.SUBSCRIPTION_ENDED
@@ -502,6 +502,21 @@ class _Subscription:
         if lane is not None:
             lane.gate = bool(self._forward and self._generating)
 
+    @property
+    def window(self):
+        return self._window
+
+    @window.setter
+    def window(self, value) -> None:
+        self._window = value
+        self._filter()
+
+    def _filter(self) -> None:
+        """Give the peer's delivery its filter; none while unfiltered."""
+        if self.delivery is not None:
+            self.delivery.passes = (None if self._window is _UNFILTERED
+                                    else self.passes)
+
     def take_timeouts(self, params, prof) -> None:
         """Record the delivery timeouts a SUBSCRIBE, PUBLISH_OK or
         REQUEST_UPDATE carries; absent ones keep their value."""
@@ -517,7 +532,7 @@ class _Subscription:
     def passes(self, group_id: int, object_id: int) -> bool:
         """True when the subscription takes this Location: Forward State 1
         (§5.1) and inside its filter (§5.1.2)."""
-        window = self.window
+        window = self._window
         if not self._forward or isinstance(window, str):
             return False
         end_group = window[1]
@@ -756,7 +771,7 @@ class PublishedTrack(Track):
                                         mapping=self.mapping,
                                         stream_priority=self._stream_band(
                                             sub.session))
-        sub.delivery.passes = sub.passes
+        sub._filter()
         sub.delivery.excludes_end = sub.excludes_end
         self._out.add(sub.delivery,
                       gate=bool(sub.forward and sub.generating),
@@ -966,14 +981,21 @@ class PublishedTrack(Track):
     def _on_produced(self, group_id: int, object_id: int, payload: bytes,
                      extensions) -> None:
         """FanoutDelivery.on_write: a produce() object, numbered once."""
-        if self.mapping is StreamMapping.DATAGRAM:
+        loc = (group_id, object_id)
+        largest = self._largest
+        if largest is None or loc > largest:
+            self._largest = loc
+        if self._history is None:
+            return
+        mapping = self.mapping
+        if mapping is StreamMapping.DATAGRAM:
             subgroup_id = None
-        elif self.mapping is StreamMapping.PER_OBJECT:
+        elif mapping is StreamMapping.PER_OBJECT:
             subgroup_id = object_id
         else:
             subgroup_id = 0
-        self._remember(group_id, object_id, payload,
-                       subgroup_id=subgroup_id, extensions=extensions)
+        self._history.add(group_id, object_id, payload, subgroup_id,
+                          extensions, self.priority)
 
     def _on_sent(self, group_id: int, object_id: int) -> None:
         """FanoutDelivery.on_sent: a produce() object reached one peer's
