@@ -23,7 +23,8 @@ from aiomoqt.server import MOQTServer
 from aiomoqt.tools import moq_interop_relay as relay
 from aiomoqt.track import PublishedTrack
 from aiomoqt.types import (
-    MOQTMessageType, ParamType, StreamResetCode, moqt_alpn_for_version,
+    MOQTMessageType, ObjectStatus, ParamType, StreamResetCode,
+    moqt_alpn_for_version,
 )
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
@@ -134,7 +135,8 @@ async def test_failed_fill_is_seen_at_once(draft, use_quic):
             assert track.subscriptions[0].fill_streams == 1
         assert await _until(lambda: all(len(v) >= 3 for v in live.values()))
         for name, objs in live.items():
-            assert {len(o.payload) for o in objs} == {_SIZES[name]}
+            assert {len(o.payload) for o in objs
+                    if o.status == ObjectStatus.NORMAL} == {_SIZES[name]}
 
 
 # -- through the relay ----------------------------------------------------------
