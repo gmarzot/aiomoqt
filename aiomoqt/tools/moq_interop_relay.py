@@ -894,6 +894,9 @@ class _RelayedTrack:
         # Largest group before the last resume: cached groups up to it
         # are stale for subscribers joining since.
         self.fence = None
+        # Each pause's gap in the cache, [first Location missing, first
+        # received after the resume or None while paused].
+        self._gaps = []
         # The publisher's Largest from its REQUEST_OK to the last pause.
         self.pause_largest = None
         # The PUBLISH feeding this track, once answered.
@@ -1261,6 +1264,8 @@ class _RelayedTrack:
             self._last_gid = gid
         if msg.object_id == 0:
             self._heads.add(gid)
+        if self._gaps and self._gaps[-1][1] is None and not self.paused:
+            self._gaps[-1][1] = (gid, msg.object_id)
         if self._resync:
             # Objects before this one went unsent while paused.
             self._resync = False
@@ -1497,6 +1502,9 @@ class _RelayedTrack:
         floor = (self._cache[0][0] if self._cache
                  else self.largest[0] if self.largest else 0)
         self._lost = {g: o for g, o in self._lost.items() if g >= floor}
+        oldest = (self._cache[0][0], self._cache[0][2]) if self._cache else None
+        self._gaps = [g for g in self._gaps if g[1] is None
+                      or (oldest is not None and g[1] > oldest)]
         if not self._cache:
             _budget.forget(self)
         else:
@@ -1541,6 +1549,19 @@ class _RelayedTrack:
             return False
         first = (self._cache[0][0], self._cache[0][2])
         return start >= first
+
+    def open_gap(self) -> None:
+        """Note a pause: what is published from just past Largest until
+        objects flow again never reaches the cache."""
+        if self.largest is not None and not (self._gaps
+                                             and self._gaps[-1][1] is None):
+            self._gaps.append([(self.largest[0], self.largest[1] + 1), None])
+
+    def crosses_gap(self, start, end) -> bool:
+        """True when [start, end] (None: to the live edge) overlaps a
+        pause's gap, which the cache does not cover."""
+        return any((end is None or g[0] <= end)
+                   and (g[1] is None or start < g[1]) for g in self._gaps)
 
     def group_end(self, group_id, start):
         """The last cached Location of a group, which is its END_OF_GROUP
@@ -2617,25 +2638,36 @@ _resuming: dict = {}
 async def _resume_for(track, msg) -> None:
     """Resume a paused upstream for a forwarding SUBSCRIBE before it is
     answered, so its reply and joining FETCH resolve against the
-    publisher's live Largest rather than the pre-pause one."""
-    if not track.lowered or (msg.forward is not None and not msg.forward):
+    publisher's live Largest rather than the one at the pause or the
+    PUBLISH."""
+    if not track.paused or (msg.forward is not None and not msg.forward):
         return
     task = _resuming.get(track.key)
     if task is None:
+        paused_at = track.pause_largest
         reply = _resume_paused(track, wanted=True)
         if reply is None:
             return
-        task = asyncio.create_task(_take_live_largest(track, reply))
+        task = asyncio.create_task(_take_live_largest(track, reply,
+                                                      paused_at))
         _resuming[track.key] = task
         task.add_done_callback(
             lambda t, k=track.key: _resuming.pop(k, None)
             if _resuming.get(k) is t else None)
-    await asyncio.shield(task)
+    # Objects the resume brings are held for this subscriber, whose
+    # filter resolves against the Largest the publisher reports.
+    track.attaching = True
+    try:
+        await asyncio.shield(task)
+    finally:
+        track.attaching = False
+        track._ensure_drain()
 
 
-async def _take_live_largest(track, reply) -> None:
+async def _take_live_largest(track, reply, paused_at=None) -> None:
     """Note the Largest a resume's REQUEST_OK reports, waiting at most
-    RESUME_REPLY_S."""
+    RESUME_REPLY_S. Past the publisher's Largest at the pause
+    (`paused_at`), its group is live and the fence stops before it."""
     try:
         ok = await asyncio.wait_for(reply, RESUME_REPLY_S)
     except TimeoutError:
@@ -2647,7 +2679,11 @@ async def _take_live_largest(track, reply) -> None:
         logger.info(f"relay: resume {track.key}: upstream refused the "
                     f"update: {e}")
         return
-    track.note_largest(_update_largest(ok))
+    live = _update_largest(ok)
+    track.note_largest(live)
+    if (track.fence is not None and paused_at is not None
+            and live is not None and live > tuple(paused_at)):
+        track.fence = min(track.fence, live[0] - 1)
 
 
 def _update_largest(reply):
@@ -2726,6 +2762,8 @@ async def _sweep_unwatched() -> None:
                 track.unwatched_since = now
             elif now - track.unwatched_since >= _pause_after:
                 _pause_upstream(track)
+                if track.lowered:
+                    track.open_gap()
 
 
 def _ensure_pause_sweep() -> None:
@@ -2879,8 +2917,9 @@ async def _serve_fill(track, d, request_id, fill, rng,
     order = int(fill.get(ParamType.GROUP_ORDER) or d.group_order
                 or GroupOrder.ASCENDING)
     objs, source, serving = None, "cache", False
+    gapped = track.crosses_gap(start, end)
     try:
-        if track.cache_covers(start):
+        if track.cache_covers(start) and not gapped:
             objs = track.cached_range(start, end)
         elif timeout_ms != 0 and _fetch_sources(ns, name):
             wait = FILL_UPSTREAM_S if timeout_ms is None else min(
@@ -2890,14 +2929,14 @@ async def _serve_fill(track, d, request_id, fill, rng,
                 start_object=start[1], end_group=end[0],
                 end_object=0 if end[1] == U64_MAX else end[1] + 1)
             _, up, _ = await _fetch_upstream(ns, name, rng_msg, timeout=wait)
-            if up:
+            if up is not None:
                 objs, source = [(o.group_id, o.subgroup_id, o.object_id,
                                  o.payload, o.extensions,
                                  o.publisher_priority, o.status)
                                 for o in up], "upstream"
-        if objs is None and track.cache_covers(start):
-            # Cached while upstream was asked.
-            objs = track.cached_range(start, end)
+        if track.cache_covers(start) and (objs is None or gapped):
+            # Cached while upstream was asked, or around the gap.
+            objs = _merged(objs, track.cached_range(start, end))
         gap = None
         if objs is None and timeout_ms is not None:
             objs = track.cached_range(start, end)
@@ -2929,6 +2968,16 @@ async def _serve_fill(track, d, request_id, fill, rng,
                      exc_info=True)
         if not serving:
             await _fail_fill(session, request_id)
+
+
+def _merged(objs, cached):
+    """Fetch tuples from `objs` (None: none) and `cached`, one per
+    Location, in Location order."""
+    if not objs:
+        return cached
+    held = {(o[0], o[2]) for o in objs}
+    return sorted([*objs, *(c for c in cached if (c[0], c[2]) not in held)],
+                  key=lambda o: (o[0], o[2]))
 
 
 def _filtered(objs, filters):
@@ -3118,7 +3167,7 @@ async def _relay_subscribe(session, msg):
         track.close()
         _tracks.pop((ns, msg.track_name), None)
         track = None
-    if track is not None and track.lowered and track.upstream is not None:
+    if track is not None and track.paused and track.upstream is not None:
         await _resume_for(track, msg)
     # The relay's Largest as it takes the SUBSCRIBE (§3.1.4).
     seen = None if track is None else track.largest
@@ -3713,8 +3762,9 @@ async def _on_fetch(session, msg):
                     f"{anchor[0]} (anchor {anchor})")
     track = _tracks.get((ns, track_name))
     start, end = _fetch_range(msg, None if track is None else track.largest)
-    have_cache = (track is not None and _track_live(track)
-                  and track.cache_covers(start))
+    live = track is not None and _track_live(track)
+    gapped = live and track.crosses_gap(start, end)
+    have_cache = live and track.cache_covers(start) and not gapped
     objs = track.cached_range(start, end) if have_cache else []
     source = "cache"
     props = track.properties if track is not None else {}
@@ -3747,16 +3797,12 @@ async def _on_fetch(session, msg):
                 error_code=RequestErrorCode.DOES_NOT_EXIST,
                 reason="track does not exist")
             return
-        elif not upstream:
-            session.fetch_error(
-                request_id=msg.request_id,
-                error_code=RequestErrorCode.INVALID_RANGE,
-                reason="requested range unavailable")
-            return
         else:
             objs = [(o.group_id, o.subgroup_id, o.object_id, o.payload,
                      o.extensions, o.publisher_priority, o.status)
                     for o in upstream]
+            if gapped and track.cache_covers(start):
+                objs = _merged(objs, track.cached_range(start, end))
             end_of_track = int(getattr(up_ok, 'end_of_track', 0) or 0)
             props = dict(getattr(up_ok, "track_extensions", None) or {})
             source = "upstream"
@@ -3767,19 +3813,27 @@ async def _on_fetch(session, msg):
             if o[2] == 0:
                 _note_catalog(ns, o[3])
     order = msg.group_order or GroupOrder.ASCENDING
-    last_g, last_o = objs[-1][0], objs[-1][2]
     # FETCH_OK End Location (d22 §9.12): the requested End, at most
     # Largest; a whole End Group ends at its last Object. From upstream,
-    # the last Object served, with the publisher's End Of Track.
-    end_loc = (last_g, last_o)
-    if source == "cache" and end is not None:
-        end_loc = (end if end[1] != U64_MAX
-                   else track.group_end(end[0], start))
+    # the last Object served, with the publisher's End Of Track; with
+    # none served, the publisher's End.
     # fetch_ok() takes End as the last Object plus one at every draft.
+    last = (objs[-1][0], objs[-1][2]) if objs else None
+    if objs:
+        end_loc = last
+        if source == "cache" and end is not None:
+            end_loc = (end if end[1] != U64_MAX
+                       else track.group_end(end[0], start))
+        end_next = (end_loc[0], end_loc[1] + 1)
+    else:
+        end_next = (up_ok.largest_group_id, up_ok.largest_object_id)
+        if not end_next[1] and session._profile.fetch_location_filter:
+            # A d20+ End is inclusive: no whole-group form.
+            end_next = (end_next[0], 1)
     session.fetch_ok(request_id=msg.request_id,
                      end_of_track=end_of_track,
-                     largest_group_id=end_loc[0],
-                     largest_object_id=end_loc[1] + 1,
+                     largest_group_id=end_next[0],
+                     largest_object_id=end_next[1],
                      group_order=int(order), track_extensions=props)
     # Range Filters drop objects, never the FETCH_OK End (§3.2.2).
     objs = _filtered(objs, RangeFilters.from_params(msg.parameters))
@@ -3790,7 +3844,7 @@ async def _on_fetch(session, msg):
         group_order=int(order),
         stream_priority=_stream_band(session, objs[0][5] if objs else None))
     logger.info(f"relay: FETCH ns={ns} track={track_name} served "
-                f"{len(objs)} object(s) {start}..({last_g}.{last_o})")
+                f"{len(objs)} object(s) {start}..{last} from {source}")
 
 
 async def _on_subscribe_namespace(session, msg):
