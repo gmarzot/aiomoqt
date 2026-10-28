@@ -375,6 +375,8 @@ LANE_BYTES = 4 * 1024 * 1024
 LANE_TX_PROBE = 8
 # Seconds between a subscriber's shed log lines after its first.
 SHED_LOG_S = 10.0
+# Seconds a lane with work completes nothing before it is logged stalled.
+LANE_STALL_S = 10.0
 # Requests one session may hold open; see the module docstring.
 MAX_NAMESPACES_PER_SESSION = 256
 MAX_SUBSCRIPTIONS_PER_SESSION = 1024
@@ -400,6 +402,44 @@ def _stream_band(session, priority) -> int:
 
 def _no_tx(_stream_id) -> int:
     return 0
+
+
+def _stream_budget(session):
+    """The per-stream send budget (--max-inflight-bytes)."""
+    return getattr(getattr(session, "_session", None),
+                   "tx_max_inflight_bytes", None)
+
+
+def _conn_gate(session):
+    """The connection's TX gate on new streams (tx_max_queued_bytes)."""
+    quic = getattr(session, "_quic", None)
+    gate = getattr(quic, "tx_max_queued_bytes", None)
+    if gate is None:
+        gate = getattr(getattr(quic, "configuration", None),
+                       "tx_max_queued_bytes", None)
+    return gate
+
+
+def _kib(n) -> str:
+    if not n:
+        return "none"
+    return f"{n >> 20} MiB" if n % (1 << 20) == 0 else f"{n >> 10} KiB"
+
+
+def _check_lanes() -> None:
+    now = time.monotonic()
+    for lane in list(_lanes):
+        lane.check(now)
+
+
+async def _watch_lanes() -> None:
+    """Check every send lane for a stall, a few times per LANE_STALL_S."""
+    while True:
+        await asyncio.sleep(min(STATUS_INTERVAL_S, LANE_STALL_S / 4))
+        try:
+            _check_lanes()
+        except Exception:
+            logger.debug("relay: lane check failed", exc_info=True)
 
 
 def _tx_used(session):
@@ -567,6 +607,13 @@ class _SendLane:
         self.final = False       # PUBLISH_DONE queued: takes nothing more
         self.busy = False        # a write is in progress
         self.opening = False     # that write opens a subgroup stream
+        self.parked = None       # what that write awaits: header or object
+        self.sid = None          # and on which stream
+        self.done = 0            # items completed
+        self.stalls = 0          # stall episodes
+        self._seen = 0
+        self._moved_at = time.monotonic()
+        self._stalled = False
         self.stopped = False
         self._cut = False
         self._closing = False
@@ -706,6 +753,49 @@ class _SendLane:
     def _exit(self) -> None:
         _lanes.discard(self)
         self.track._lanes.discard(self)
+        if self._stalled:
+            self._stalled = False
+            logger.info(f"relay: lane ended stalled after "
+                        f"{time.monotonic() - self._moved_at:.0f}s: "
+                        f"{self._who()}")
+
+    def stalled_s(self, now) -> float:
+        """Seconds stalled in the current episode; 0 while moving."""
+        return now - self._moved_at if self._stalled else 0
+
+    def _who(self) -> str:
+        session = self.d.session
+        info = _sessions.get(id(session))
+        key = self.track.key
+        addr = _addr_of(session)
+        peer = f"{addr[0]}:{addr[1]}" if isinstance(addr, tuple) else addr
+        return (f"sub {info['id'] if info else '?'} {peer}"
+                f" track {_ns_str(key[0])}/{_name_str(key[1])}")
+
+    def check(self, now) -> None:
+        """Track progress: one WARNING when the lane has work and has
+        completed nothing for LANE_STALL_S, one INFO when it moves again."""
+        if self.done != self._seen or not (self.busy or self.items):
+            if self._stalled:
+                self._stalled = False
+                logger.info(f"relay: lane resumed after "
+                            f"{now - self._moved_at:.0f}s: {self._who()}")
+            self._seen, self._moved_at = self.done, now
+            return
+        if self._stalled or now - self._moved_at < LANE_STALL_S:
+            return
+        self._stalled = True
+        self.stalls += 1
+        session = self.d.session
+        backlog = sum(t._tx_queued(session) for t in list(_tracks.values()))
+        ring = _tx_used(session)(self.sid) if self.sid is not None else 0
+        logger.warning(
+            f"relay: lane stalled {now - self._moved_at:.0f}s: {self._who()}"
+            f" parked on {self.parked if self.busy else 'queue'}; "
+            f"lane_bytes={self.bytes + self.replay_bytes} "
+            f"tx_backlog={backlog} stream {self.sid} ring_used={ring} "
+            f"(budget {_kib(_stream_budget(session))}, "
+            f"conn gate {_kib(_conn_gate(session))})")
 
     async def _run(self) -> None:
         try:
@@ -717,6 +807,7 @@ class _SendLane:
                     continue
                 if not await self._handle(self.items.popleft()):
                     return
+                self.done += 1
         finally:
             self._exit()
 
@@ -750,7 +841,8 @@ class _SendLane:
         try:
             await track._forward_one(d.session, d.alias, gid, sgid, oid,
                                      payload, exts, prio, status, shape,
-                                     encoded, start=d.start, lost=d.lost)
+                                     encoded, start=d.start, lost=d.lost,
+                                     lane=self)
         except (Exception, asyncio.CancelledError):
             if _cancelling():
                 raise
@@ -1461,12 +1553,12 @@ class _RelayedTrack:
 
     async def _forward_one(self, session, alias, gid, sgid, oid,
                            payload, exts, prio, status=None, shape=None,
-                           encoded=None, start=None, lost=()):
+                           encoded=None, start=None, lost=(), lane=None):
         """Write one object downstream, opening the (group, subgroup)
         stream on first sight. Group/subgroup identity is preserved from
         upstream so the downstream sees the publisher's structure. A
         stream short of objects from `start` is reset, never FINed
-        (§11.3.2)."""
+        (§11.3.2). `lane` is told what each write awaits."""
         if isinstance(shape, tuple) and shape and shape[0] == "DGRAM":
             prof = session._profile
             is_status = (status or ObjectStatus.NORMAL) != ObjectStatus.NORMAL
@@ -1498,7 +1590,11 @@ class _RelayedTrack:
             self._streams.pop(skey, None)
             return
         if entry is None:
+            if lane is not None:
+                lane.parked, lane.sid = "header", None
             stream_id = await session.open_uni_stream()
+            if lane is not None:
+                lane.sid = stream_id
             session.set_stream_priority(stream_id, _stream_band(session, prio))
             # Mirror the upstream stream's shape: END_OF_GROUP,
             # FIRST_OBJECT and the subgroup-id mode are part of the
@@ -1557,6 +1653,8 @@ class _RelayedTrack:
                 encoded[state] = data
         else:
             header.advance(oid)
+        if lane is not None:
+            lane.parked, lane.sid = "object", stream_id
         try:
             await session.stream_write_drain(stream_id, data)
         except MOQTStreamStopped:
@@ -4216,6 +4314,9 @@ class _Status:
                     "lane_tx_bytes": lane.tx_bytes if lane else 0,
                     "shed_objects": lane.shed if lane else 0,
                     "shed_episodes": lane.sheds if lane else 0,
+                    "lane_stalled_s": (int(lane.stalled_s(time.monotonic()))
+                                       if lane else 0),
+                    "lane_stalls": lane.stalls if lane else 0,
                     "since": info["since"] if info else None})
             tracks.append((key, {
                 "id": "\x1f".join((_ns_str(key[0]), _name_str(key[1]))),
@@ -4798,6 +4899,8 @@ async def main():
                       for url in args.upstream]
     for url in args.upstream:
         print(f"  upstream origin: {url}")
+
+    _background.add(asyncio.create_task(_watch_lanes()))
 
     watchdog = None
     if args.watchdog > 0:
