@@ -3,6 +3,7 @@
 ## v0.14.0
 
 - Requires aiopquic 0.7.0: datagram priority and the server bind host need it (0.6.x silently ignored both).
+- Draft-14 is deprecated and will be removed in 0.15.0; until then it still negotiates and stays in the default offer.
 - aiomoqt-relay `--pause-after SEC` (default 60, 0 = never): a track no subscriber has forwarded for that long is paused upstream (Forward State 0) and resumed by the next subscriber; `--catalog-probe` catalogs keep flowing.
 - aiomoqt-relay `--config PATH` reads flags from a TOML file keyed by long flag name; command-line flags override it, unknown keys and wrong types are errors. The deploy reads `relay.toml`.
 - aiomoqt-relay drains on SIGTERM/SIGINT: it refuses new sessions, sends GOAWAY (`--goaway-uri`, default empty) and waits up to `--drain-timeout` (5 s) before exiting; a second signal exits at once. pub_media `--reconnect` redials at once on GOAWAY, to its New Session URI if given.
