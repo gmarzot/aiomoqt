@@ -221,3 +221,41 @@ plus an inbound allow rule — neither is available to a non-interactive worker.
 Also note: remote arm venv was missing `sortedcontainers` + build deps; installed
 from the local arm freeze (`uv pip install -r`). `bootstrap_seawolf.sh` must be
 fixed to install the full arm freeze, not just the two wheels.
+
+## P1a status (2026-10-28, 18:15Z)
+
+Harness is complete and committed (`66af34b`, pushed to `perf/release-sweep`).
+
+Smoke results in `perf/release-sweep/runs/2026-10-28T17-58-58Z/`:
+- `D-raw` **ok** — 763.67 Mbps, 6 interval samples, hostcheck pre/post, shas recorded
+- `D-WT`  **ok** — 734.06 Mbps, 6 interval samples
+- `R-raw` **aborted_pre** — `relay_probe failed rc=1 after 10 attempts`
+  (`moqt://10.14.25.173:9768  QUIC ✗ connection refused - no response (8001ms)`)
+- `R-WT`  not reached (same pre-check).
+
+Manual control, same config file, same binary:
+
+    moqx serve --config perf/release-sweep/moqx-perf.yaml &
+    relay_probe --url moqt://10.14.25.173:9768 --draft 16 -k   # => draft-16 (128 ms)
+
+so the pinned config, the port and the firewall path are fine; the difference is
+*how the sweep starts the relay*. The rep directory contains no relay log at all,
+so the failure is not observable from the artefacts — that is the next defect to
+fix: capture relay stdout/stderr to `<rep>/relay.log` in the relay step, restart
+the R point, and read the log. Prime suspects, in order:
+
+1. the harness relay step exits immediately (config path resolved relative to a
+   different cwd than the repo root, or the stray-bench guard reaping it), or
+2. the relay binds only after the process is reaped by `Host.kill` on a
+   short-lived step, or
+3. `url_for()` builds a `moqt://` URL while the relay listener for that point is
+   expected on the WebTransport path.
+
+Next concrete step: add the relay log capture (one-line change next to
+`Host.start` for the relay step), rerun
+`sweep.py --manifest manifests/smoke.yaml --only R-raw,R-WT --force`, and only then
+mark the smoke complete.
+
+Known-good acceptance items: `--dry-run` prints all 24 baseline points with argv;
+`--only D-raw --reps 1` passes end to end; collect parser unit test passes;
+no orphan bench processes on either host after the D runs.
