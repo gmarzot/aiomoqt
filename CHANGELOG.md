@@ -3,6 +3,7 @@
 ## v0.14.0
 
 - pub_media gives each dial attempt 4 s (was 10 s), so a handshake lost in a relay restart costs a short retry.
+- aiomoqt-relay status: `tx_worker_idle_now` and `tx_event_ring_pops` from the transport.
 - A drained stream write that fails inside the transport ends that stream (or its producer, if the session is closing) instead of returning as if it succeeded; unexpected failures log a WARNING.
 - A `PublishedTrack` answers FETCH only when given `fetch_history_bytes` (was 1 MiB by default); without it FETCH is refused with NOT_SUPPORTED. The MSF catalog track keeps 64 KiB.
 - pub_bench and pub_server `--fetch-history BYTES`: history kept to answer FETCH (default 0; pub_bench `--prefill` sets 1 MiB).
