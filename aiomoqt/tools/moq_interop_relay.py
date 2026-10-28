@@ -4126,11 +4126,13 @@ async def _heartbeat(stall_s: float) -> None:
         await asyncio.sleep(min(1.0, stall_s / 4))
 
 
-# aiopquic counters that show the RX wake state and worker progress.
+# aiopquic counters that show the RX/TX wake state and worker progress;
+# a key the installed aiopquic lacks reports null.
 TRANSPORT_COUNTERS = (
     "rx_notify_pending_now", "rx_event_ring_count_now",
     "rx_overflow_depth_now", "rx_overflow_max_depth", "rx_overflow_pushed",
-    "rx_event_drops", "tx_event_ring_count_now", "loop_callbacks",
+    "rx_event_drops", "tx_event_ring_count_now", "tx_event_ring_pops",
+    "tx_worker_idle_now", "loop_callbacks",
     "wake_calls", "wake_skipped_coalesced")
 
 
