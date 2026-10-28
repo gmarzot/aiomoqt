@@ -8,7 +8,7 @@ It follows the standard `asyncio` transport/protocol pattern via subclasses of `
 
 | | Supported |
 |---|---|
-| Drafts | draft-14, draft-16, draft-18, draft-20, draft-22 — negotiated newest-first, default offer `(22, 20, 18, 16, 14)` |
+| Drafts | draft-14 (deprecated; removed in 0.15.0), draft-16, draft-18, draft-20, draft-22 — negotiated newest-first, default offer `(22, 20, 18, 16, 14)` |
 | Transports | raw QUIC (ALPN `moq-00` / `moqt-NN`), H3/WebTransport (WT-Protocol) |
 | Roles | publisher, subscriber, server (origin), single-port dual-transport server |
 | Data delivery | SubgroupHeader streams (TX + RX); OBJECT_DATAGRAM (TX + RX over raw QUIC and WT) |

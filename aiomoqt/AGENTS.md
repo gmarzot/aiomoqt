@@ -22,7 +22,8 @@ Do not reach into `_MOQTSessionMixin` or the other `_`-prefixed classes in `prot
 
 ## Drafts
 
-MoQT drafts 14, 16, 18, 20 and 22 are supported; odd-numbered drafts are not. Draft numbers are
+MoQT drafts 14, 16, 18, 20 and 22 are supported; odd-numbered drafts are not. Draft 14 is
+deprecated and will be removed in 0.15.0. Draft numbers are
 plain ints (`draft=18`, `supported_drafts=[18, 16]`). Clients offer newest-first
 `MOQT_DEFAULT_DRAFTS = (22, 20, 18, 16, 14)` unless told otherwise; tools take `--draft`.
 
