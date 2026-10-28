@@ -47,8 +47,10 @@ async def _until(cond, timeout=6.0):
     return cond()
 
 
-async def _source(track, gop):
-    """Frames at _FPS with time-based group ids, as an encoder feeds them."""
+async def _source(track, gop, delay=0.0):
+    """Frames at _FPS with time-based group ids, as an encoder feeds them,
+    from `delay` seconds on."""
+    await asyncio.sleep(delay)
     n = 0
     while True:
         await track.send_frame(f"{track.trackname}-{n}".encode(),
@@ -198,12 +200,12 @@ async def test_a_track_paused_since_publish_joins_at_live(draft, use_quic):
             rx2 = await connect2()
             live2, fetched = _collect(rx2)
             for name in _GOP:
-                ok, rid, _ = await _join(rx2, name, draft)
+                ok, rid, reply = await _join(rx2, name, draft)
                 largest = _reply_largest(ok)
                 assert largest is not None and largest > published[name], (
                     name, largest, published[name])
-                if draft >= 20:
-                    await rx2.await_fetch_done(rid, timeout=3.0)
+                assert not isinstance(reply, Exception), (name, reply)
+                assert await rx2.await_fetch_done(rid, timeout=3.0), name
             assert await _until(lambda: all(live2.values())), live2
             await asyncio.sleep(0.2)
             stale = {rid: [loc for loc in locs
@@ -328,3 +330,48 @@ async def test_a_range_in_the_pause_gap_is_fetched_upstream(
             assert got[:len(want)] == want, (name, want, got)
         for s in (rx, rx2, rx3):
             assert s._close_err is None
+
+
+@requires_certs
+@pytest.mark.asyncio
+@pytest.mark.parametrize("draft", [18, 22])
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+async def test_the_fence_spares_the_live_group(draft, use_quic):
+    """A pause shorter than a GOP: the publisher keeps producing the
+    group open at the pause, so a joiner gets that group whole, from its
+    key frame, out of the cache and from upstream."""
+    port = _PORT + 48 + 2 * [18, 22].index(draft) + (not use_quic)
+    gops = {"video": 200, "audio": 1}
+
+    def make(pub, name, gop):
+        track = _Warm(pub, _NS, name, fetch_history_bytes=_HISTORY,
+                      media_kind="audio" if gop == 1 else "video")
+        return track, _source(track, gops[name], delay=0.3)
+
+    async with _relay(port, use_quic, draft, make,
+                      pause_after=0.3) as (connect, _):
+        rx = await connect()
+        live, _ = _collect(rx)
+        oks = [await rx.subscribe(_NS, name, forward=1, wait_response=True)
+               for name in _GOP]
+        assert await _until(lambda: all(live.values())), live
+        assert live["video"][0] == (0, 0), live["video"][:3]
+        for ok in oks:
+            rx.unsubscribe(ok.request_id)
+        relayed = {name: relay._tracks[_key(name)] for name in _GOP}
+        assert await _until(lambda: all(t.lowered
+                                        for t in relayed.values()))
+        await asyncio.sleep(0.2)
+
+        rx2 = await connect()
+        _, fetched = _collect(rx2)
+        for name in _GOP:
+            ok, rid, reply = await _join(rx2, name, draft)
+            assert not isinstance(reply, Exception), (name, reply)
+            largest = _reply_largest(ok)
+            if name == "video":
+                assert largest[0] == 0, largest
+            assert await rx2.await_fetch_done(rid, timeout=3.0), name
+            want = [(largest[0], o) for o in range(largest[1] + 1)]
+            assert fetched.get(rid) == want, (name, fetched.get(rid))
+        assert rx2._close_err is None

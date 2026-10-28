@@ -2644,10 +2644,12 @@ async def _resume_for(track, msg) -> None:
         return
     task = _resuming.get(track.key)
     if task is None:
+        paused_at = track.pause_largest
         reply = _resume_paused(track, wanted=True)
         if reply is None:
             return
-        task = asyncio.create_task(_take_live_largest(track, reply))
+        task = asyncio.create_task(_take_live_largest(track, reply,
+                                                      paused_at))
         _resuming[track.key] = task
         task.add_done_callback(
             lambda t, k=track.key: _resuming.pop(k, None)
@@ -2662,9 +2664,10 @@ async def _resume_for(track, msg) -> None:
         track._ensure_drain()
 
 
-async def _take_live_largest(track, reply) -> None:
+async def _take_live_largest(track, reply, paused_at=None) -> None:
     """Note the Largest a resume's REQUEST_OK reports, waiting at most
-    RESUME_REPLY_S."""
+    RESUME_REPLY_S. Past the publisher's Largest at the pause
+    (`paused_at`), its group is live and the fence stops before it."""
     try:
         ok = await asyncio.wait_for(reply, RESUME_REPLY_S)
     except TimeoutError:
@@ -2676,7 +2679,11 @@ async def _take_live_largest(track, reply) -> None:
         logger.info(f"relay: resume {track.key}: upstream refused the "
                     f"update: {e}")
         return
-    track.note_largest(_update_largest(ok))
+    live = _update_largest(ok)
+    track.note_largest(live)
+    if (track.fence is not None and paused_at is not None
+            and live is not None and live > tuple(paused_at)):
+        track.fence = min(track.fence, live[0] - 1)
 
 
 def _update_largest(reply):
