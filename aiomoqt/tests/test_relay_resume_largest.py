@@ -1,11 +1,13 @@
 """A track resumed after --pause-after starts at live: the LOC producer
 keeps numbering frames while paused, the relay answers the resuming
 SUBSCRIBE with the Largest from the publisher's REQUEST_OK, and the
-joining FETCH (d16/d18) or current-group fill (d22) serves nothing from
-before the pause, even from a publisher whose Largest stood still. Two
-LOC tracks on one publisher session, over raw QUIC and WebTransport."""
+joining FETCH (d16/d18) or current-group fill (d20+) serves nothing from
+before the pause, even from a publisher whose Largest stood still, where
+a fill the fence empties is reset (§3.4.1). Two LOC tracks on one
+publisher session, over raw QUIC and WebTransport."""
 import asyncio
 import contextlib
+import time
 
 import pytest
 
@@ -23,7 +25,7 @@ _PAUSE_S = 0.3
 _FPS = 100
 # Video opens a group every _GOP frames; every audio frame is a group.
 _GOP = {"video": 10, "audio": 1}
-_DRAFTS = [16, 18, 22]
+_DRAFTS = [16, 18, 20, 22]
 
 
 def _key(name):
@@ -119,7 +121,7 @@ async def _relay(port, use_quic, draft, cls):
 @pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
 @pytest.mark.parametrize("publisher", ["live", "stuck"])
 async def test_a_resumed_track_starts_at_live(publisher, draft, use_quic):
-    port = (_PORT + 6 * (publisher == "stuck") + 2 * _DRAFTS.index(draft)
+    port = (_PORT + 8 * (publisher == "stuck") + 2 * _DRAFTS.index(draft)
             + (not use_quic))
     cls = LocTrackPublisher if publisher == "live" else _Stuck
     async with _relay(port, use_quic, draft, cls) as connect:
@@ -149,10 +151,24 @@ async def test_a_resumed_track_starts_at_live(publisher, draft, use_quic):
         rx2.on_fetch_object = (
             lambda obj, _n, _ts, _rid: fetched.get(
                 _track_of(obj), []).append((obj.group_id, obj.object_id)))
+        fenced_fills = 0
         for name in _GOP:
             if draft >= 20:
                 # SUBSCRIBE with a current-group fill.
                 ok, _ = await rx2.join(_NS, name, wait_response=True)
+                if publisher == "stuck":
+                    # The relay's fence can trail the publisher's Largest
+                    # by an object in flight at the pause.
+                    fence = tracks[name].fence
+                    fenced = (fence is not None
+                              and ok.largest_group_id <= fence)
+                    t0 = time.monotonic()
+                    done = await rx2.await_fetch_done(ok.request_id,
+                                                      timeout=3.0)
+                    waited = time.monotonic() - t0
+                    assert done != fenced and waited < 1.0, (
+                        name, fence, done, waited)
+                    fenced_fills += fenced
             else:
                 ok = await rx2.subscribe(_NS, name, forward=1,
                                          wait_response=True)
@@ -164,6 +180,8 @@ async def test_a_resumed_track_starts_at_live(publisher, draft, use_quic):
                 name, largest, before[name])
             if publisher == "live":
                 assert largest > before[name], (name, largest, before[name])
+        if draft >= 20 and publisher == "stuck":
+            assert fenced_fills, "no fill was fenced"
         assert await _until(lambda: all(live.values())), live
         await asyncio.sleep(0.2)
         for name in _GOP:

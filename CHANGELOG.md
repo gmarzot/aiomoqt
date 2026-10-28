@@ -11,6 +11,7 @@
 - aiomoqt-relay `--pause-after SEC` (default 60, 0 = never): a track no subscriber has forwarded for that long is paused upstream (Forward State 0) and resumed by the next subscriber; `--catalog-probe` catalogs keep flowing.
 - The LOC producer keeps numbering frames while paused (Forward State 0), so its Largest keeps moving; nothing is sent or kept.
 - aiomoqt-relay: a subscriber that resumes a paused track gets the publisher's live Largest (from its REQUEST_OK, waited up to 1 s), not the pre-pause one, and no objects from before the pause in its joining FETCH or fill.
+- aiomoqt-relay: a d20+ fill the resume fence leaves empty is opened and reset (§3.4.1) instead of never opened.
 - aiomoqt-relay `--config PATH` reads flags from a TOML file keyed by long flag name; command-line flags override it, unknown keys and wrong types are errors. The deploy reads `relay.toml`.
 - aiomoqt-relay drains on SIGTERM/SIGINT: it refuses new sessions, sends GOAWAY (`--goaway-uri`, default empty) and waits up to `--drain-timeout` (5 s) before exiting; a second signal exits at once. pub_media `--reconnect` redials at once on GOAWAY, to its New Session URI if given.
 - aiomoqt-relay turns away new sessions from SIGTERM until it exits, and its closes reach the peers before the transport stops; a refused session logs no ERROR. `MOQTServer.close_sessions()` also closes sessions arriving while it waits; `refuse_sessions()` turns them away from then on.

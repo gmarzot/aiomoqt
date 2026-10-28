@@ -2812,19 +2812,28 @@ def _attach_subscriber(session, msg, track, largest) -> bool:
 
 def _start_fill(track, d, msg) -> None:
     """Open the fill fetch stream a FILL_PARAMETERS asks for (d22 §3.4.1),
-    under `msg`'s Request ID: none while paused or for an empty range."""
+    under `msg`'s Request ID: none while paused or for an empty range,
+    reset at once for one that ends at or before the fence."""
     fill = (msg.parameters or {}).get(D20ParamType.FILL_PARAMETERS)
     if (fill is None or not d.forward
             or d.session._profile.param_table < 20):
         return
     rng = fill_range(fill, d.location_filter, track.largest)
-    if rng is not None and d.fence is not None and rng[0][0] <= d.fence:
-        rng = (None if rng[1][0] <= d.fence
-               else ((d.fence + 1, 0), rng[1]))
     if rng is None:
         return
     sid = id(d.session)
     track._sent_streams[sid] = track._sent_streams.get(sid, 0) + 1
+    if d.fence is not None and rng[0][0] <= d.fence:
+        if rng[1][0] <= d.fence:
+            # Non-empty against the reply's Largest: a failure (§3.4.1).
+            logger.info(f"relay: fill {track.key} request {msg.request_id} "
+                        f"{rng[0]}..{rng[1]} at or before fence "
+                        f"{d.fence}, reset")
+            task = asyncio.create_task(_fail_fill(d.session, msg.request_id))
+            d.fills.add(task)
+            task.add_done_callback(d.fills.discard)
+            return
+        rng = ((d.fence + 1, 0), rng[1])
     # FILL_PARAMETERS overrides the subscription's filters by type (§3.4).
     filters = RangeFilters.from_params(
         merge_range_filters(d.range_params, fill)).for_track(
