@@ -270,6 +270,14 @@ class LocTrackPublisher(PublishedTrack):
                 exts[self._config_id] = self.config
         return exts
 
+    @staticmethod
+    def _next_group(frame: LocFrame, group_id: int) -> int:
+        """The group a key frame opens: its `group_id` when above the
+        current one, else the next."""
+        if frame.group_id is not None and frame.group_id > group_id:
+            return frame.group_id
+        return group_id + 1
+
     async def produce(self, out) -> None:
         """Consume the frame queue until finish(), numbering each object
         once; groups rotate on key frames. Properties are built per peer,
@@ -282,10 +290,16 @@ class LocTrackPublisher(PublishedTrack):
             if frame is None:
                 break
             if not self.producing:
-                # Forward State 0: drop the frame unnumbered, reset the open
-                # group, resume only at a key frame in a new group.
+                # Forward State 0: number the frame so Largest follows the
+                # source, but send and keep nothing; reset the open group
+                # and resume only at a key frame in a new group.
                 out.reset_group()
                 resume_on_key = True
+                if frame.key_frame or group_id < 0:
+                    group_id = self._next_group(frame, group_id)
+                    obj_id = 0
+                self._note_largest(group_id, obj_id)
+                obj_id += 1
                 self.frames_dropped += 1
                 continue
             if resume_on_key and not frame.key_frame:
@@ -293,10 +307,7 @@ class LocTrackPublisher(PublishedTrack):
                 continue
             resume_on_key = False
             if frame.key_frame or group_id < 0:
-                if frame.group_id is not None and frame.group_id > group_id:
-                    group_id = frame.group_id
-                else:
-                    group_id += 1
+                group_id = self._next_group(frame, group_id)
                 obj_id = 0
             group_start = obj_id == 0
             if frame.timestamp is None:
