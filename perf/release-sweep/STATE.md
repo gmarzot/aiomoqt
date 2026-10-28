@@ -132,6 +132,7 @@ meaningful.
 | D3 | `relay_probe --url ...` | `relay_probe --url ... -k` | relay is `tls.insecure: true` |
 | D4 | interpreter | CPython 3.14.6 (uv) | 3.14.9 has no uv managed build |
 | D5 | — | `--draft` unset on the probe | offer the full set; result records what negotiated |
+| D6 | push to origin | `origin` URL switched to `ssh://git@github.com/gmarzot/aiomoqt.git` | HTTPS had no stored credentials (non-interactive); SSH key for `gmarzot` authenticates. Only the remote URL in this clone changed. |
 
 No sysctl, qdisc, txqueuelen, governor or relay config was changed. Nothing
 outside `perf-sweep/` was written; no version file, tag, `main` or release
