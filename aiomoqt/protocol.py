@@ -3626,11 +3626,14 @@ class _MOQTSessionMixin:
         self.stream_write(stream_id, b"", end_stream=True)
 
     def stream_reset(self, stream_id: int,
-                      error_code: int = StreamResetCode.CANCELLED) -> None:
+                      error_code: int = StreamResetCode.CANCELLED, *,
+                      reliable_size: int = 0) -> None:
         """RESET_STREAM. Sender-side abrupt termination — UNSUBSCRIBE,
         FETCH_CANCEL on the publisher, track teardown, error abort.
         Also the canonical reply to a peer's STOP_SENDING. A
-        StreamResetCode is encoded for the negotiated draft."""
+        StreamResetCode is encoded for the negotiated draft.
+        reliable_size > 0 keeps that many leading bytes (RESET_STREAM_AT)
+        where the peer supports it."""
         if not self._session_writable():
             return
         if stream_id in self._bidi_stream_requests:
@@ -3638,7 +3641,7 @@ class _MOQTSessionMixin:
         error_code = stream_reset_code(error_code, self._profile)
         if self._tx_deferred:
             self._tx_deferred.pop((stream_id, 'send'), None)
-        self._tx_op(stream_id, 'send', 'reset', error_code)
+        self._tx_op(stream_id, 'send', 'reset', (error_code, reliable_size))
 
     def stream_stop_sending(self, stream_id: int,
                              error_code: int = StreamResetCode.CANCELLED) -> None:
@@ -3662,7 +3665,12 @@ class _MOQTSessionMixin:
         """Hand one op to the transport; False when the ring is full."""
         try:
             if kind == 'reset':
-                self._quic.reset_stream(stream_id, arg)
+                code, reliable_size = arg
+                if reliable_size:
+                    self._quic.reset_stream(stream_id, code,
+                                            reliable_size=reliable_size)
+                else:
+                    self._quic.reset_stream(stream_id, code)
             elif kind == 'stop':
                 self._quic.stop_stream(stream_id, arg)
             else:
