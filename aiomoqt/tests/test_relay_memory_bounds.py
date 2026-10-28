@@ -91,11 +91,12 @@ def test_the_record_charge_covers_a_cached_object(monkeypatch):
 
 async def test_the_record_charge_covers_a_queued_lane_object():
     t = _track()
-    lane = relay._SendLane(t, _subscribe(t))
+    lane = t._lane(_subscribe(t))
     oids = list(range(1 << 20, (1 << 20) + _N))
     pays = [_payload(oid) for oid in oids]
-    per = _traced(lambda: [lane.offer(0, False, 0, oid, p, None, 128,
-                                      ObjectStatus.NORMAL, None)
+    per = _traced(lambda: [lane.offer(relay._item(0, False, 0, oid, p, None,
+                                                  128, ObjectStatus.NORMAL,
+                                                  None))
                            for oid, p in zip(oids, pays)]) / _N
     assert per <= OBJECT_RECORD_BYTES, per
     await _stop(lane)
@@ -141,11 +142,11 @@ def test_empty_objects_are_charged_to_a_subscribed_track(monkeypatch):
 
 async def test_empty_objects_are_charged_to_a_send_lane():
     t = _track()
-    lane = relay._SendLane(t, _subscribe(t))
+    lane = t._lane(_subscribe(t))
     # No yield: a subscriber whose lane never drains.
     for oid in range(_N):
-        lane.offer(0, True, 0, oid, b"", None, 128, ObjectStatus.NORMAL,
-                   None)
+        lane.offer(relay._item(0, True, 0, oid, b"", None, 128,
+                               ObjectStatus.NORMAL, None))
         assert lane.bytes <= relay.LANE_BYTES
     assert lane.shed > 0 and lane.sheds == 1
     assert len(lane.items) <= relay.LANE_BYTES // OBJECT_RECORD_BYTES + 1
@@ -159,8 +160,9 @@ async def test_properties_are_charged():
     t = _track()
     t._remember(0, 0, 0, b"x", exts, 128, ObjectStatus.NORMAL)
     assert t._cache_bytes == relay._budget.bytes == cost
-    lane = relay._SendLane(t, _subscribe(t))
-    lane.offer(0, True, 0, 0, b"x", exts, 128, ObjectStatus.NORMAL, None)
+    lane = t._lane(_subscribe(t))
+    lane.offer(relay._item(0, True, 0, 0, b"x", exts, 128,
+                           ObjectStatus.NORMAL, None))
     assert lane.bytes == cost
     await _stop(lane)
     t._drop_cache()
