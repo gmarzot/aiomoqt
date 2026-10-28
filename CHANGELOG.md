@@ -71,6 +71,7 @@
 - moq_interop_client: namespace-discovery, publish-track-only and publish-track-subscribe report SKIP, not a failure, when the relay refuses PUBLISH as NOT_SUPPORTED.
 - moq_interop_client prints each TAP result as its case finishes, and when SETUP cannot complete it fails the remaining cases unrun instead of waiting out each timeout.
 - aiomoqt-relay: a subscriber that joins as the publisher ends the track still gets its cached objects.
+- A failed d20+ fill keeps its FETCH_HEADER on the reset (RESET_STREAM_AT), so the subscriber sees the failure at once instead of at its timeout.
 
 ## v0.13.3
 

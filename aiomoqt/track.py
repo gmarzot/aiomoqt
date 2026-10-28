@@ -1329,12 +1329,14 @@ class PublishedTrack(Track):
     async def _serve_fill(self, session, sub, msg, largest) -> None:
         try:
             if self._history is None:
-                # d20 §5.1.3: a fill that fails opens its stream and resets it.
+                # d20 §5.1.3: a fill that fails opens its stream and resets
+                # it; the reset keeps the header so the subscriber sees it.
                 stream_id = await session.open_uni_stream()
-                session.stream_write(stream_id, FetchHeader(
-                    request_id=msg.request_id).serialize(
-                        prof=session._profile).data)
-                session.stream_reset(stream_id, StreamResetCode.INTERNAL_ERROR)
+                header = FetchHeader(request_id=msg.request_id).serialize(
+                    prof=session._profile).data
+                session.stream_write(stream_id, header)
+                session.stream_reset(stream_id, StreamResetCode.INTERNAL_ERROR,
+                                     reliable_size=len(header))
                 logger.info(f"Track: fill for request {msg.request_id} "
                             f"failed: no object history")
                 return

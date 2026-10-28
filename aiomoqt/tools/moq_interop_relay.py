@@ -2829,12 +2829,14 @@ def _filtered(objs, filters):
 
 async def _fail_fill(session, request_id) -> None:
     """§3.4.1: a failed fill opens its stream and resets it after the
-    FETCH_HEADER."""
+    FETCH_HEADER, which the reset keeps."""
     try:
         stream_id = await session.open_uni_stream()
-        await session.stream_write_drain(stream_id, FetchHeader(
-            request_id=request_id).serialize(prof=session._profile).data)
-        session.stream_reset(stream_id, StreamResetCode.INTERNAL_ERROR)
+        header = FetchHeader(request_id=request_id).serialize(
+            prof=session._profile).data
+        await session.stream_write_drain(stream_id, header)
+        session.stream_reset(stream_id, StreamResetCode.INTERNAL_ERROR,
+                             reliable_size=len(header))
     except Exception:
         logger.debug("relay: resetting a fill stream failed", exc_info=True)
 
