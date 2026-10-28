@@ -64,6 +64,7 @@
 - Datagrams share the neutral data band (129) instead of picoquic's 9, so a datagram track no longer strictly outranks stream data (needs aiopquic with `set_datagram_priority`, 0.7.0).
 - moq_interop_client: namespace-discovery, publish-track-only and publish-track-subscribe report SKIP, not a failure, when the relay refuses PUBLISH as NOT_SUPPORTED.
 - moq_interop_client prints each TAP result as its case finishes, and when SETUP cannot complete it fails the remaining cases unrun instead of waiting out each timeout.
+- aiomoqt-relay: a subscriber that joins as the publisher ends the track still gets its cached objects.
 
 ## v0.13.3
 
