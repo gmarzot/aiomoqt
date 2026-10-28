@@ -353,10 +353,13 @@ async def test_a_stalled_raw_quic_viewer_is_bounded(monkeypatch, caplog):
                            object_size=20_000, group_size=10,
                            rate=200).attach()
             await pub.publish_namespace(namespace=ns, wait_response=True)
-            proc = await asyncio.create_subprocess_exec(
-                sys.executable, "-c", _STALLED_SUB, str(_PORT), ns, name,
+            # Not an asyncio subprocess: on macOS py3.14 the child watcher
+            # reaps a SIGSTOP'd child with a blocking waitpid on the loop.
+            proc = subprocess.Popen(
+                [sys.executable, "-c", _STALLED_SUB, str(_PORT), ns, name],
                 stdout=subprocess.PIPE, cwd=os.getcwd())
-            line = await asyncio.wait_for(proc.stdout.readline(), 10)
+            line = await asyncio.wait_for(
+                asyncio.to_thread(proc.stdout.readline), 10)
             assert line.strip() == b"subscribed", line
             track = relay._tracks[(relay._ns_tuple(ns), name.encode())]
             (d,) = track.downstream
@@ -375,8 +378,11 @@ async def test_a_stalled_raw_quic_viewer_is_bounded(monkeypatch, caplog):
             assert len(warned) == 1, [r.getMessage() for r in warned]
     finally:
         if proc is not None:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(proc.pid, signal.SIGCONT)
             proc.kill()
-            await proc.wait()
+            await asyncio.to_thread(proc.wait, 10)
+            proc.stdout.close()
         handle.close()
         for table in (relay._announced, relay._announce_requests,
                       relay._tracks):
