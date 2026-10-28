@@ -151,24 +151,22 @@ async def test_a_resumed_track_starts_at_live(publisher, draft, use_quic):
         rx2.on_fetch_object = (
             lambda obj, _n, _ts, _rid: fetched.get(
                 _track_of(obj), []).append((obj.group_id, obj.object_id)))
-        fenced_fills = 0
         for name in _GOP:
             if draft >= 20:
                 # SUBSCRIBE with a current-group fill.
                 ok, _ = await rx2.join(_NS, name, wait_response=True)
                 if publisher == "stuck":
-                    # The relay's fence can trail the publisher's Largest
-                    # by an object in flight at the pause.
+                    # Every fill is fenced: it is reset at once.
                     fence = tracks[name].fence
-                    fenced = (fence is not None
-                              and ok.largest_group_id <= fence)
+                    assert (fence is not None
+                            and ok.largest_group_id <= fence), (
+                        name, fence, ok.largest_group_id)
                     t0 = time.monotonic()
                     done = await rx2.await_fetch_done(ok.request_id,
                                                       timeout=3.0)
                     waited = time.monotonic() - t0
-                    assert done != fenced and waited < 1.0, (
-                        name, fence, done, waited)
-                    fenced_fills += fenced
+                    assert done is False and waited < 1.0, (
+                        name, done, waited)
             else:
                 ok = await rx2.subscribe(_NS, name, forward=1,
                                          wait_response=True)
@@ -180,8 +178,6 @@ async def test_a_resumed_track_starts_at_live(publisher, draft, use_quic):
                 name, largest, before[name])
             if publisher == "live":
                 assert largest > before[name], (name, largest, before[name])
-        if draft >= 20 and publisher == "stuck":
-            assert fenced_fills, "no fill was fenced"
         assert await _until(lambda: all(live.values())), live
         await asyncio.sleep(0.2)
         for name in _GOP:
