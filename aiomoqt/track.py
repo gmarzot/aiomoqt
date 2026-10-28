@@ -36,8 +36,8 @@ from .types import (
     SCHEDULING, to_stream_priority,
 )
 from .delivery import (
-    DatagramTooLarge, FanoutDelivery, ObjectHistory, StreamMapping,
-    SubgroupDelivery, properties_charge,
+    PUBLISHER_LANE_BYTES, DatagramTooLarge, FanoutDelivery, ObjectHistory,
+    StreamMapping, SubgroupDelivery, properties_charge,
 )
 from .messages import (
     FetchHeader, LocationFilter, MOQTMessage, ObjectDatagram, PublishOk,
@@ -602,7 +602,8 @@ class PublishedTrack(Track):
                  track_properties: Optional[
                      Dict[int, Union[int, bytes]]] = None,
                  timestamps: str = 'loc',
-                 stream_scheduling: Optional[str] = None):
+                 stream_scheduling: Optional[str] = None,
+                 lane_bytes: int = PUBLISHER_LANE_BYTES):
         # Before super(): Track.__init__ assigns track_alias/request_id/
         # state, which are properties over this list.
         self._subs = [_Subscription(session)]
@@ -616,6 +617,8 @@ class PublishedTrack(Track):
         if stream_scheduling not in (None, *SCHEDULING):
             raise ValueError(f"stream_scheduling {stream_scheduling!r}")
         self.stream_scheduling = stream_scheduling
+        # Bytes each peer's send lane holds before it sheds groups.
+        self.lane_bytes = lane_bytes
         self.auth_token = auth_token
         self.immutable_properties = _checked_immutable(immutable_properties)
         self.track_properties = _checked_immutable(track_properties,
@@ -743,7 +746,7 @@ class PublishedTrack(Track):
         current alias, replacing any it had. It joins at the next group
         boundary."""
         if self._out is None:
-            self._out = FanoutDelivery()
+            self._out = FanoutDelivery(max_bytes=self.lane_bytes)
             self._out.name = self.fqtn
             self._out.on_write = self._on_produced
             self._out.on_sent = self._on_sent

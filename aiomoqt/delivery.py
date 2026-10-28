@@ -33,8 +33,10 @@ _CUT = ("CUT",)
 _CLOSE = ("CLOSE",)
 
 # Bytes a send lane holds, its queued live objects plus what its streams
-# still hold in the transport, before it sheds groups.
+# still hold in the transport, before it sheds groups: the relay's per
+# subscriber, and a publisher's per peer.
 LANE_BYTES = 4 * 1024 * 1024
+PUBLISHER_LANE_BYTES = 16 * 1024 * 1024
 # Live offers between reads of a lane's transport backlog.
 LANE_TX_PROBE = 8
 # Seconds between a lane's shed log lines after its first.
@@ -1167,7 +1169,8 @@ class FanoutDelivery:
     loses whole groups rather than slowing the others down.
     """
 
-    def __init__(self, deliveries=(), *, max_bytes: int = LANE_BYTES):
+    def __init__(self, deliveries=(), *,
+                 max_bytes: int = PUBLISHER_LANE_BYTES):
         self.max_bytes = max_bytes
         self.name = ""       # the track's, for logs
         self.lanes: list = []

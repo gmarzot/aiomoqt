@@ -6,7 +6,7 @@
 - pub_media gives each dial attempt 4 s (was 10 s), so a handshake lost in a relay restart costs a short retry.
 - aiomoqt-relay status: `tx_worker_idle_now`, `tx_event_ring_pops` and `tx_wake_lost` from the transport.
 - aiomoqt-relay status: a track at Forward State 0 reports state `paused` (was `parked`); the dashboard follows.
-- A publisher's per-subscriber send lane is bounded in bytes like the relay's, 4 MiB plus what its streams still hold in the transport (was 256 objects); past it the lane resets the groups it drops. `FanoutDelivery(queue_size=)` is now `max_bytes=`, and `add()` takes `gate` and `deadline` as values, updated on the lane.
+- A publisher's per-subscriber send lane is bounded in bytes like the relay's, 16 MiB plus what its streams still hold in the transport (was 256 objects; `PublishedTrack(lane_bytes=)`); past it the lane resets the groups it drops. `FanoutDelivery(queue_size=)` is now `max_bytes=`, and `add()` takes `gate` and `deadline` as values, updated on the lane.
 - aiomoqt-relay's send lanes are the library's `SendLane`; its shed WARNING names the subscriber as the stall lines do.
 - A publisher's send lane writes an object straight to the transport while it has nothing queued and the stream takes it without waiting (`MOQTSession.stream_write_nowait()`); it queues only under backpressure, so order is unchanged.
 - A peer whose Forward State returns to 1 mid-group continues that group at its next object, on a new stream with FIRST_OBJECT clear, when the track's FETCH history holds the group's head (`SendLane.resume()`); otherwise it waits for the next group. Other peers are untouched.

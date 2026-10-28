@@ -10,8 +10,9 @@ import pytest
 
 from aiomoqt import delivery as delivery_mod
 from aiomoqt.context import profile_for
-from aiomoqt.delivery import (FanoutDelivery, OBJECT_RECORD_BYTES, SendLane,
-                              StreamMapping, SubgroupDelivery)
+from aiomoqt.delivery import (FanoutDelivery, OBJECT_RECORD_BYTES,
+                              PUBLISHER_LANE_BYTES, SendLane, StreamMapping,
+                              SubgroupDelivery)
 from aiomoqt.fanout import FanoutPublisher
 from aiomoqt.media import Catalog, CatalogTrack, LocTrackPublisher
 from aiomoqt.media.loc import LOC02_PROP_TIMESTAMP, LOC_PROP_TIMESTAMP
@@ -647,6 +648,17 @@ async def test_forward_state_and_timeouts_reach_the_lane():
     assert lane.deadline == 0.25
     track._take_timeouts(sub, {ParamType.DELIVERY_TIMEOUT: 100}, a._profile)
     assert lane.deadline == 0.1
+    await track._out.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kw,bound", [({}, PUBLISHER_LANE_BYTES),
+                                      ({"lane_bytes": 1 << 20}, 1 << 20)])
+async def test_a_tracks_lanes_take_its_bound(kw, bound):
+    track = PublishedTrack(_Session("a"), _NS, "t", **kw)
+    sub = track.subscriptions[0]
+    track._add_delivery(sub)
+    assert sub.delivery.lane.max_bytes == bound
     await track._out.close()
 
 
