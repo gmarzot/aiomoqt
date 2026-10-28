@@ -1345,6 +1345,10 @@ class _RelayedTrack:
                 # Terminal, in queue order: each subscriber's PUBLISH_DONE
                 # follows what its lane already holds.
                 code, reason, key = shape
+                # Replays still queued behind the terminal go first.
+                for d in list(self.downstream):
+                    if d.replaying:
+                        self._replay(d)
                 self.finish(status_code=code, reason=reason)
                 self.release_upstream()
                 self._release_downstream()
