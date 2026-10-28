@@ -164,17 +164,15 @@ The URL scheme selects the transport:
     _cli.add_logging(parser)
     _cli.add_help(parser)
     args = parser.parse_args()
-    if args.video and args.datagram:
-        parser.error('--video cannot use -D/--datagram: profile I-frames '
-                     f'({VideoTrack.PROFILES[args.video]["i_frame"]} B) '
-                     'far exceed the one-packet datagram ceiling')
+    _cli.check_video(parser, args)
     _cli.check_datagram(parser, args)
     if args.prefill and not args.fetch_history:
         args.fetch_history = _PREFILL_HISTORY
     if args.trackname is None:
         import uuid
         sz = args.object_size
-        sz_s = f"{sz // 1000}k" if sz >= 1000 else f"{sz}b"
+        sz_s = (args.video if args.video
+                else f"{sz // 1000}k" if sz >= 1000 else f"{sz}b")
         rate_s = f"{int(args.rate)}fps" if args.rate > 0 else "max"
         mode = "dgram" if args.datagram else f"x{args.streams}"
         args.trackname = f"{sz_s}-{rate_s}-{mode}-{uuid.uuid4().hex[:4]}"
@@ -182,7 +180,9 @@ The URL scheme selects the transport:
 
 
 def print_banner(relay, args):
-    mode = "DATAGRAM" if args.datagram else f"SUBGROUP x{args.streams}"
+    mode = ("DATAGRAM" if args.datagram
+            else f"VIDEO {args.video}" if args.video
+            else f"SUBGROUP x{args.streams}")
     if args.rate > 0:
         # rate is aggregate; per-stream is rate/streams (datagrams = 1 stream)
         n = 1 if args.datagram else args.streams
@@ -201,7 +201,8 @@ def print_banner(relay, args):
     print(f"  namespace:   {args.namespace}")
     print(f"  trackname:   {args.trackname}")
     print(f"  mode:        {mode}")
-    print(f"  object size: {args.object_size} B")
+    print(f"  object size: {args.object_size} B"
+          + (" mean" if args.video else ""))
     print(f"  group size:  {args.group_size} objects")
     print(f"  rate:        {rate_s}")
     print(f"  target:      {target_s}")
@@ -271,13 +272,13 @@ async def run(args):
                 session.track_status(args.namespace, args.trackname)
 
             if args.video:
-                # Profile drives object size, GOP and fps; -r is fps.
                 track = VideoTrack(
                     session,
                     namespace=args.namespace,
                     trackname=args.trackname,
                     resolution=args.video,
-                    fps=args.rate or 30,
+                    fps=args.rate,
+                    gop_size=args.group_size,
                     auth_token=args.auth_token.encode() or None,
                     timestamps=args.timestamps,
                     fetch_history_bytes=args.fetch_history,

@@ -2449,10 +2449,10 @@ class VideoTrack(PublishedTrack):
                  resolution: str = "1080p", fps: float = 30,
                  gop_pattern: str = "ibp", gop_seconds: float = 1.0,
                  i_frame_size: int = None, p_frame_size: int = None,
-                 b_frame_size: int = None,
+                 b_frame_size: int = None, gop_size: int = None,
                  **kwargs):
-        # GOP = 1 second of frames by default
-        gop_size = int(fps * gop_seconds)
+        # GOP = 1 second of frames by default; gop_size overrides.
+        gop_size = gop_size or int(fps * gop_seconds)
 
         profile = self.PROFILES.get(resolution, self.PROFILES["1080p"])
         self.i_frame_size = i_frame_size or profile["i_frame"]
@@ -2476,6 +2476,15 @@ class VideoTrack(PublishedTrack):
             rate=fps,
             **kwargs,
         )
+
+    @classmethod
+    def mean_object_size(cls, resolution: str, gop_size: int,
+                         gop_pattern: str = "ibp") -> int:
+        """Mean frame bytes over one GOP of the profile."""
+        p = cls.PROFILES[resolution]
+        sizes = {'I': p["i_frame"], 'P': p["p_frame"]}
+        gop = cls._build_gop(gop_pattern, gop_size)
+        return sum(sizes.get(ft, p["b_frame"]) for ft in gop) // len(gop)
 
     @staticmethod
     def _build_gop(pattern: str, length: int) -> str:

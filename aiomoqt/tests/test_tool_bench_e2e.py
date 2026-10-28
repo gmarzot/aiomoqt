@@ -50,6 +50,25 @@ def test_sub_bench_receives_from_pub_server(pub_server, listen, dial, draft):
 
 
 @requires_certs
+@pytest.mark.parametrize("listen,dial", [("-Q", "quic"), ("-W", "wt")],
+                         ids=["quic", "wt"])
+def test_sub_bench_receives_a_video_profile_from_pub_server(tmp_path, listen,
+                                                            dial):
+    port = free_udp_port()
+    log = tmp_path / "pub_server.log"
+    proc = spawn("pub_server", "-p", port, "--video", "240p", "-r", 60,
+                 listen, log=log)
+    try:
+        wait_for(log, "publisher server ready", proc)
+        assert "video 240p" in log.read_text()
+        rc, out = run("sub_bench", _url(dial, port), "-k", "-t", 2, "-i", 1)
+    finally:
+        stop(proc)
+    assert objects_received(out) > 0, out
+    assert rc == 0, out
+
+
+@requires_certs
 @pytest.mark.parametrize("dial", ["quic", "wt"])
 def test_sub_bench_fails_on_a_dead_port_within_its_duration(dial):
     t0 = time.monotonic()
