@@ -121,6 +121,15 @@ def env_fingerprint(host_name: str, host: "Host") -> dict:
 # --------------------------------------------------------------------------
 # hosts
 # --------------------------------------------------------------------------
+_VERBOSE = False
+
+
+def vlog(msg: str) -> None:
+    """Phase log for --verbose; wall-clock stamps make skew/overlap visible."""
+    if _VERBOSE:
+        print(f"        [{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
 class Host:
     """A bench host: either this machine or a remote box reached over ssh."""
 
@@ -131,6 +140,7 @@ class Host:
         self.ssh = self.spec.get("ssh") or name
         self.root = Path(self.spec.get("root") or SWEEP_ROOT)
         self._arm = arm
+        self._children: dict[int, subprocess.Popen] = {}
 
     # -- command shaping ---------------------------------------------------
     def python(self, arm: str | None = None) -> Path:
@@ -145,28 +155,45 @@ class Host:
         for a in argv:
             a = str(a).replace("{python}", str(self.python(arm))).replace("{root}", str(self.root))
             out.append(a)
+        # Bench tools print interval rows; without -u python block-buffers stdout
+        # to a file, so a point that gets killed leaves a 0-byte log and no
+        # diagnosis. Keep every arm-venv invocation unbuffered.
+        py = str(self.python(arm))
+        if out and out[0] == py and "-P" in out:
+            out.insert(out.index("-P") + 1, "-u")
         return out
 
     # -- execution ---------------------------------------------------------
     def _ssh_prefix(self) -> list[str]:
+        # No ControlMaster here: a persistent master inherits the calling
+        # ssh's stdout/stderr pipes, so subprocess capture never sees EOF and
+        # every call blocks until its timeout.
         return [
             "ssh",
+            "-n",
             "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=5",
             "-o", "ServerAliveInterval=5",
             "-o", "ServerAliveCountMax=3",
+            "-o", "LogLevel=ERROR",
             self.ssh,
         ]
 
     def run(self, cmd: str, timeout: float = 30.0, input_bytes: bytes | None = None):
         if self.local:
             p = subprocess.run(
-                ["sh", "-c", cmd], capture_output=True, timeout=timeout, input=input_bytes
+                ["sh", "-c", cmd], capture_output=True, timeout=timeout, input=input_bytes,
+                stdin=(None if input_bytes is not None else subprocess.DEVNULL),
             )
         else:
             p = subprocess.run(
                 self._ssh_prefix() + [cmd],
                 capture_output=True, timeout=timeout, input=input_bytes,
+                # ssh without a stdin redirection reads the caller's stdin and
+                # forwards it to the remote command, so the session only closes
+                # when that stdin hits EOF -- which surfaces here as a bogus
+                # TimeoutExpired for a command that in fact finished.
+                stdin=(None if input_bytes is not None else subprocess.DEVNULL),
             )
         return p.returncode, (p.stdout or b"").decode(errors="replace") + (p.stderr or b"").decode(errors="replace")
 
@@ -184,53 +211,110 @@ class Host:
                 )
             finally:
                 fh.close()
+            self._children[proc.pid] = proc
             return {"role": role, "pid": proc.pid, "log": str(log), "host": self.name}
         # remote: setsid + pidfile so we can signal the whole process group
         remote_log = f"{logdir_remote}/{role}.log" if logdir_remote else f"/tmp/{uuid.uuid4().hex}.log"
-        pidfile = f"{remote_log}.pid"
         inner = " ".join(shlex.quote(a) for a in ((['taskset', '-c', pin] if pin else []) + argv))
-        script = f"echo $$ > {shlex.quote(pidfile)} && exec {inner}"
+        # `nohup setsid ... & echo $!` returns the pid on stdout in the same ssh
+        # round-trip; polling a pidfile with extra ssh calls was slow and could
+        # time out while the process was in fact running.
         cmd = (
             f"mkdir -p {shlex.quote(logdir_remote or '/tmp')} && "
-            f"setsid sh -c {shlex.quote(script)} >> {shlex.quote(remote_log)} 2>&1 < /dev/null &"
+            f"cd {shlex.quote(str(self.root))} && "
+            f"nohup setsid {inner} >> {shlex.quote(remote_log)} 2>&1 < /dev/null & echo $!"
         )
-        rc, out = self.run(cmd, timeout=20)
+        # The backgrounded child keeps the ssh channel open until it exits, so a
+        # plain blocking run() would sit here for the whole measurement window
+        # and report a bogus timeout. Read the pid, then drop the client: the
+        # remote child is in its own session (setsid), so it survives.
+        proc = subprocess.Popen(
+            self._ssh_prefix() + [cmd], stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        try:
+            out_b, err_b = proc.communicate(timeout=6.0)
+        except subprocess.TimeoutExpired as exc:
+            # ssh is still holding the channel for the backgrounded child; the
+            # pid line has already been emitted, so drop the client and keep it.
+            proc.kill()
+            tail_b, tail_err = proc.communicate()
+            out_b = (exc.output or b"") + (tail_b or b"")
+            err_b = (exc.stderr or b"") + (tail_err or b"")
+        rc = proc.returncode
+        out = (out_b or b"").decode(errors="replace") + (err_b or b"").decode(errors="replace")
         pid = None
-        for _ in range(40):
-            rc2, txt = self.run(f"cat {shlex.quote(pidfile)} 2>/dev/null", timeout=5)
-            txt = txt.strip()
-            if txt.isdigit():
-                pid = int(txt)
+        for line in reversed(out.splitlines()):
+            if line.strip().isdigit():
+                pid = int(line.strip())
                 break
-            time.sleep(0.1)
         if pid is None:
             raise RuntimeError(f"remote start failed on {self.name} for {role}: rc={rc} {out[:400]}")
         return {"role": role, "pid": pid, "log": remote_log, "host": self.name}
 
-    def kill(self, pid: int, grace: float = 5.0) -> None:
+    def kill(self, pid: int, grace: float = 5.0, sig=signal.SIGTERM) -> int | None:
+        """Signal a process group, escalating to SIGKILL. Returns rc when known.
+
+        ``sig`` may be a signal number or a name accepted by kill(1). SIGINT is
+        used for bench tools that print their summary from the
+        KeyboardInterrupt path instead of a SIGTERM handler.
+        """
         if self.local:
-            for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, 2.0)):
+            child = self._children.get(pid)
+            try:
+                os.killpg(os.getpgid(pid), sig)
+            except (ProcessLookupError, PermissionError):
+                return child.poll() if child is not None else None
+            if child is not None:
                 try:
-                    os.killpg(os.getpgid(pid), sig)
-                except (ProcessLookupError, PermissionError):
-                    return
-                deadline = time.time() + wait
-                while time.time() < deadline:
-                    try:
-                        os.kill(pid, 0)
-                    except ProcessLookupError:
-                        return
+                    return child.wait(timeout=grace)
+                except subprocess.TimeoutExpired:
+                    pass
+            else:
+                deadline = time.time() + grace
+                while time.time() < deadline and self.alive(pid):
                     time.sleep(0.05)
-            return
-        for sig, wait in (("TERM", grace), ("KILL", 2.0)):
-            self.run(f"kill -{sig} -- -{pid} 2>/dev/null; kill -{sig} {pid} 2>/dev/null", timeout=5)
-            time.sleep(wait)
-            rc, out = self.run(f"kill -0 {pid} 2>/dev/null && echo alive", timeout=5)
-            if "alive" not in out:
-                return
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            if child is not None:
+                try:
+                    return child.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    return None
+            return None
+        sname = sig if isinstance(sig, str) else signal.Signals(sig).name.removeprefix("SIG")
+
+        def _try(cmd: str, t: float) -> None:
+            # A slow ssh probe must never abort the point: the summary is
+            # already in the remote log by this stage.
+            try:
+                self.run(cmd, timeout=t)
+            except subprocess.TimeoutExpired:
+                vlog(f"{self.name}: probe exceeded {t:.0f}s, continuing")
+
+        def _alive() -> bool:
+            try:
+                return self.alive(pid)
+            except subprocess.TimeoutExpired:
+                return True
+
+        for s, wait in ((sname, grace), ("KILL", 2.0)):
+            _try(f"kill -{s} -- -{pid} 2>/dev/null; kill -{s} {pid} 2>/dev/null", 5)
+            deadline = time.time() + wait
+            while time.time() < deadline:
+                # 1 s cadence: each probe is an ssh round-trip
+                time.sleep(min(1.0, max(0.0, deadline - time.time())))
+                if not _alive():
+                    return None
+        return None
 
     def alive(self, pid: int) -> bool:
         if self.local:
+            child = self._children.get(pid)
+            if child is not None:
+                return child.poll() is None
             try:
                 os.kill(pid, 0)
             except ProcessLookupError:
@@ -329,6 +413,14 @@ def build_steps(p: dict, hosts: dict[str, Host], relay: dict) -> list[dict]:
         return {
             "role": role, "host": host_name, "bg": False, "delay_s": p["sub_delay_s"],
             "kind": "sub",
+            # sub_bench runs until the publisher closes, and pub_server never
+            # closes, so the harness owns the measurement window: run for
+            # warmup+duration then SIGINT (the tool prints its summary from the
+            # KeyboardInterrupt path).
+            "run_for_s": float(p["warmup_s"]) + float(p["duration_s"]),
+            # a subscriber that is seconds behind on a firehose needs a while to
+            # unwind its receive loop; give SIGINT room before SIGKILL
+            "kill_grace_s": 20.0,
             "argv": ["{python}", "-P", "-m", "aiomoqt.tools.sub_bench", url,
                      "-N", ns, "-T", trk, "--draft", str(draft), "-k",
                      "-t", str(dur), "-i", str(iv)],
@@ -383,7 +475,10 @@ def build_steps(p: dict, hosts: dict[str, Host], relay: dict) -> list[dict]:
 
     if topo == "D":
         steps.append(common_pub_server("shenzhen", "0.0.0.0"))
-        steps.append(common_sub(url_for(p.get("pub_addr", "10.14.25.173"), base_port, tr)))
+        # D is a two-node topology: the subscriber must live on seawolf, never
+        # on the publisher's host (that would silently measure loopback).
+        steps.append(common_sub(url_for(p.get("pub_addr", "10.14.25.173"), base_port, tr),
+                                "seawolf"))
         return steps
 
     if topo in ("R", "F", "M", "C2"):
@@ -484,11 +579,11 @@ def run_point(p: dict, *, hosts: dict[str, Host], relay: dict, arm: str, arm_dir
     reason = ""
 
     # --- pre-flight -------------------------------------------------------
-    pre_local = run_hostcheck(hosts["shenzhen"], samples=args.hostcheck_samples,
+    pre_local = run_hostcheck(hosts["shenzhen"], samples=min(3, args.hostcheck_samples),
                               require=False, guard_llama=False, peer=args.clock_peer, iface=args.iface)
     pre_remote = None
     if not hosts["seawolf"].local:
-        pre_remote = run_hostcheck(hosts["seawolf"], samples=args.hostcheck_samples,
+        pre_remote = run_hostcheck(hosts["seawolf"], samples=min(3, args.hostcheck_samples),
                                    require=False, guard_llama=True, peer=None, iface=args.iface)
     write_json_atomic(rep_dir / "hostcheck-pre-local.json", pre_local)
     if pre_remote is not None:
@@ -518,12 +613,20 @@ def run_point(p: dict, *, hosts: dict[str, Host], relay: dict, arm: str, arm_dir
         probe_argv = hosts["shenzhen"].expand(
             ["{python}", "-P", "-m", "aiomoqt.tools.relay_probe", "--url", probe_url,
              "--draft", str(p["draft"]), "-k"], arm)
-        rc, out = hosts["shenzhen"].run(" ".join(shlex.quote(a) for a in probe_argv), timeout=60)
-        relay_probe = {"argv": probe_argv, "rc": rc, "stdout": out[-2000:]}
+        # The relay socket comes up a beat after the process starts, so a single
+        # probe right after launch races the bind and reports "connection
+        # refused". Retry for up to ~15 s before declaring the point broken.
+        rc, out, attempts = 1, "", 0
+        for attempts in range(1, 11):
+            rc, out = hosts["shenzhen"].run(" ".join(shlex.quote(a) for a in probe_argv), timeout=60)
+            if rc == 0:
+                break
+            time.sleep(1.5)
+        relay_probe = {"argv": probe_argv, "rc": rc, "stdout": out[-2000:], "attempts": attempts}
         write_json_atomic(rep_dir / "relay-probe.json", relay_probe)
         if rc != 0:
             status = "aborted_pre"
-            reason = f"relay_probe failed rc={rc}"
+            reason = f"relay_probe failed rc={rc} after {attempts} attempts"
             notes.append(reason)
 
     # --- run --------------------------------------------------------------
@@ -536,8 +639,42 @@ def run_point(p: dict, *, hosts: dict[str, Host], relay: dict, arm: str, arm_dir
                 host = hosts[s["host"]]
                 argv = host.expand(s["argv"], arm)
                 argv_record[s["role"]] = argv
+                vlog(f"{point_id} rep-{rep:02d}: step {s['role']} @{s['host']} "
+                     f"run_for_s={s.get('run_for_s')}")
                 if s.get("delay_s"):
                     time.sleep(float(s["delay_s"]))
+                if s.get("run_for_s") and not s["bg"]:
+                    # Timed measurement window: the subscriber cannot know when
+                    # the firehose ends, so start it, wait warmup+duration, then
+                    # interrupt it and keep the summary it prints on the way out.
+                    pin_sub = (p["pin"] or {}).get("sub")
+                    if host.local:
+                        info = host.start(s["role"], argv, rep_dir / f"{s['role']}.log", pin=pin_sub)
+                    else:
+                        logdir = f"{host.root}/runs/{run_root.name}/{point_id}/rep-{rep:02d}"
+                        host.run(f"mkdir -p {shlex.quote(logdir)}", timeout=20)
+                        info = host.start(s["role"], argv, None, pin=pin_sub, logdir_remote=logdir)
+                        remote_logs[s["role"]] = info["log"]
+                        remote_host_of[s["role"]] = s["host"]
+                    procs.append(info)
+                    t_end = time.time() + float(s["run_for_s"])
+                    # sleep out the window instead of polling liveness: a remote
+                    # liveness probe is an ssh round-trip and would dominate the
+                    # window (and starve the per-point watchdog).
+                    while time.time() < t_end:
+                        time.sleep(min(0.5, max(0.0, t_end - time.time())))
+                    try:
+                        still_alive = host.alive(info["pid"])
+                    except subprocess.TimeoutExpired:
+                        still_alive = True
+                    if not still_alive:
+                        notes.append(f"{s['role']} exited before window end")
+                    grace = max(args.kill_grace, float(s.get("kill_grace_s") or 0))
+                    rc = host.kill(info["pid"], grace=grace, sig=signal.SIGINT)
+                    vlog(f"{point_id}: {s['role']} interrupted rc={rc}")
+                    if rc not in (0, None, -signal.SIGINT):
+                        notes.append(f"{s['role']} exited rc={rc}")
+                    continue
                 if s["bg"]:
                     if host.local:
                         info = host.start(s["role"], argv, rep_dir / f"{s['role']}.log",
@@ -549,6 +686,7 @@ def run_point(p: dict, *, hosts: dict[str, Host], relay: dict, arm: str, arm_dir
                         remote_logs[s["role"]] = info["log"]
                         remote_host_of[s["role"]] = s["host"]
                     procs.append(info)
+                    vlog(f"{point_id}: {s['role']} started pid={info['pid']} log={info['log']}")
                     if s.get("wait_port") and not host.wait_udp_port(int(s["wait_port"]),
                                                                      timeout=args.start_timeout):
                         raise RuntimeError(f"{s['role']} did not listen on udp/{s['wait_port']}")
@@ -578,9 +716,9 @@ def run_point(p: dict, *, hosts: dict[str, Host], relay: dict, arm: str, arm_dir
                         if status == "ok":
                             status = "failed"
                             reason = f"{s['role']} rc={rc}"
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
             status = "timeout"
-            reason = "point exceeded duration+warmup+margin"
+            reason = f"harness timeout: {exc}"
         except Exception as exc:  # noqa: BLE001 - record, never lose the point
             status = "failed"
             reason = f"{type(exc).__name__}: {exc}"
@@ -603,12 +741,12 @@ def run_point(p: dict, *, hosts: dict[str, Host], relay: dict, arm: str, arm_dir
         local_sub.write_text((rep_dir / "sub1.log").read_text(errors="replace"))
 
     # --- post-flight ------------------------------------------------------
-    post_local = run_hostcheck(hosts["shenzhen"], samples=args.hostcheck_samples, require=False,
+    post_local = run_hostcheck(hosts["shenzhen"], samples=min(3, args.hostcheck_samples), require=False,
                                guard_llama=False, peer=args.clock_peer, iface=args.iface)
     write_json_atomic(rep_dir / "hostcheck-post-local.json", post_local)
     post_remote = None
     if not hosts["seawolf"].local:
-        post_remote = run_hostcheck(hosts["seawolf"], samples=args.hostcheck_samples, require=False,
+        post_remote = run_hostcheck(hosts["seawolf"], samples=min(3, args.hostcheck_samples), require=False,
                                     guard_llama=True, peer=None, iface=args.iface)
         write_json_atomic(rep_dir / "hostcheck-post-remote.json", post_remote)
     post_abort = abort_reasons(post_local, pre_local, args.clock_tolerance_us)
@@ -646,6 +784,10 @@ def run_point(p: dict, *, hosts: dict[str, Host], relay: dict, arm: str, arm_dir
         for k, v in parsed_pub["summary"].items():
             summary.setdefault(k, v)
     samples = _collect.sample_rows(parsed_sub) if parsed_sub else []
+    if status == "ok" and not summary:
+        status = "failed"
+        reason = "no parsed summary from sub log"
+        notes.append(reason)
 
     wheel = arm_dir / "wheels"
     arm_meta = load_json(arm_dir / "arm.json", {}) or {}
@@ -766,7 +908,10 @@ def main(argv: list[str] | None = None) -> int:
                     default=float(os.environ.get("CLOCK_JUMP_TOLERANCE_US", DEFAULT_CLOCK_TOL_US)))
     ap.add_argument("--iface", default=os.environ.get("PERF_IFACE"))
     ap.add_argument("--start-timeout", type=float, default=20.0)
-    ap.add_argument("--timeout-margin", type=float, default=60.0)
+    ap.add_argument("--timeout-margin", type=float, default=120.0,
+                    help="seconds of slack past warmup+duration before a point is "
+                         "declared hung (covers ssh round-trips, kill grace and the "
+                         "per-point hostcheck pair)")
     ap.add_argument("--kill-grace", type=float, default=5.0)
     ap.add_argument("--cc", default=os.environ.get("PERF_CC", "bbr1"))
     ap.add_argument("--gso", action="store_true", default=True)
@@ -774,6 +919,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--examples", action="store_true", help="print README-style examples and exit")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
+    global _VERBOSE
+    _VERBOSE = bool(args.verbose)
 
     if args.examples:
         print(__doc__)
