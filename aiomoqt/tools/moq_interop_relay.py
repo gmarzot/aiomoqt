@@ -4363,7 +4363,7 @@ def _track_state(track, flowing) -> str:
     if track.pending_publish is not None:
         return "held"
     if track.paused:
-        return "parked"  # dashboard.js state name
+        return "paused"
     return "live" if flowing else "idle"
 
 

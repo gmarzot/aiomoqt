@@ -5,7 +5,7 @@
 const {OTHER, $, el, svgEl, none, fmt} = Dash;
 const PLAYER = '/g5-player/';
 const PLAYER_DRAFT = '18';
-const STATES = new Set(['live', 'idle', 'held', 'parked', 'ended']);
+const STATES = new Set(['live', 'idle', 'held', 'paused', 'ended']);
 const TRACK_COLS = 8;
 // Media track colors by name; other tracks take the remaining palette hues in order.
 const NAMED = [[/^catalog$/i, '#d9532b'], [/audio/i, '#6fbff5'], [/video/i, '#a57be6']];
