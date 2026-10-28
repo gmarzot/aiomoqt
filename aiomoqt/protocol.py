@@ -2982,10 +2982,6 @@ class _MOQTSessionMixin:
                 and not isinstance(event, (StopSendingReceived, StreamReset))):
             error = getattr(event, 'error_code', QuicErrorCode.INTERNAL_ERROR)
             reason = getattr(event, 'reason_phrase', None) or class_name(event)
-            if error == 0:
-                logger.info(f"QUIC: connection closed: code: {error}")
-            else:
-                logger.error(f"QUIC error: code: {error} reason: {reason}")
             self._close_session(error, reason, transmit=False)
             return
 
@@ -3115,9 +3111,12 @@ class _MOQTSessionMixin:
                 fut.set_result(False)
 
     def _log_close(self, error_code: int, reason_phrase: str,
-                   by_peer: bool) -> None:
-        """One line per close: side, code name, peer, setup state. A clean
-        code logs INFO, a peer's error WARNING, our own error ERROR."""
+                   transmit: bool) -> None:
+        """One line per close: side, code name, peer, setup state. aiopquic
+        reports only the peer's close code, so a nonzero code without
+        transmit is the peer's; code 0 there may be a local close (idle
+        timeout) and is worded neutrally. Clean codes log INFO, a peer's
+        error WARNING, our own error ERROR."""
         try:
             code = int(error_code)
         except (TypeError, ValueError):
@@ -3132,14 +3131,20 @@ class _MOQTSessionMixin:
                 except ValueError:
                     pass
             label = f"{name} (0x{code:x})" if name else f"0x{code:x}"
-        msg = f"MOQT: {'peer closed' if by_peer else 'closing'}: {label}"
+        if transmit:
+            side, prep = "closing", "to"
+        elif code:
+            side, prep = "peer closed", "from"
+        else:
+            side, prep = "connection closed", "peer"
+        msg = f"MOQT: {side}: {label}"
         try:
             addr = self.peer_address
         except Exception:
             addr = None
         if addr:
             host = f"[{addr[0]}]" if ":" in addr[0] else addr[0]
-            msg += f" {'from' if by_peer else 'to'} {host}:{addr[1]}"
+            msg += f" {prep} {host}:{addr[1]}"
         setup = getattr(self, '_moqt_session_setup', None)
         if setup is not None and not (setup.done() and not setup.cancelled()
                                       and setup.result()):
@@ -3148,10 +3153,10 @@ class _MOQTSessionMixin:
             msg += f"; reason: {reason_phrase}"
         if code == 0 or (self._is_wt and code == _H3_NO_ERROR):
             logger.info(msg)
-        elif by_peer:
-            logger.warning(msg)
-        else:
+        elif transmit:
             logger.error(msg)
+        else:
+            logger.warning(msg)
 
     def _close_session(self,
               error_code: SessionCloseCode = SessionCloseCode.NO_ERROR,
@@ -3159,7 +3164,7 @@ class _MOQTSessionMixin:
               transmit: bool = True) -> None:
         """Close the MoQT session. The first close's code is the one sent;
         transmit=False when the peer already closed the connection."""
-        self._log_close(error_code, reason_phrase, by_peer=not transmit)
+        self._log_close(error_code, reason_phrase, transmit)
         first = self._close_err is None
         if first:
             self._close_err = (error_code, reason_phrase)

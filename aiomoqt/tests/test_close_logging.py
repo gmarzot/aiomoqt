@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from aiopquic.quic.events import ConnectionTerminated
+
 from aiomoqt.protocol import _MOQTSessionMixin
 from aiomoqt.types import SessionCloseCode
 
@@ -51,24 +53,27 @@ def _stub(is_wt=True, setup_done=False):
 
 
 def _close_line(caplog):
-    lines = [r for r in caplog.records if r.getMessage().startswith("MOQT: ")
-             and ("closing:" in r.getMessage() or "peer closed:" in r.getMessage())]
+    sides = ("MOQT: closing:", "MOQT: peer closed:", "MOQT: connection closed:")
+    lines = [r for r in caplog.records if r.getMessage().startswith(sides)]
     assert len(lines) == 1, [r.getMessage() for r in caplog.records]
     return lines[0]
 
 
-@pytest.mark.parametrize("code, level, label", [
-    pytest.param(0, logging.INFO, "NO_ERROR (0x0)", id="peer-0"),
-    pytest.param(0x100, logging.INFO, "H3_NO_ERROR (0x100)", id="peer-h3-no-error"),
-    pytest.param(0x106, logging.WARNING, "H3_FRAME_ERROR (0x106)", id="peer-h3-frame"),
+@pytest.mark.parametrize("code, level, head", [
+    pytest.param(0, logging.INFO, "connection closed: NO_ERROR (0x0) peer",
+                 id="peer-0"),
+    pytest.param(0x100, logging.INFO, "peer closed: H3_NO_ERROR (0x100) from",
+                 id="peer-h3-no-error"),
+    pytest.param(0x106, logging.WARNING, "peer closed: H3_FRAME_ERROR (0x106) from",
+                 id="peer-h3-frame"),
 ])
-async def test_peer_close_on_webtransport(records, code, level, label):
+async def test_peer_close_on_webtransport(records, code, level, head):
     s = _stub()
     s._close_session(code, "WebTransport session closed", transmit=False)
     rec = _close_line(records)
     assert rec.levelno == level
     msg = rec.getMessage()
-    assert msg.startswith(f"MOQT: peer closed: {label} from 158.23.190.70:6983")
+    assert msg.startswith(f"MOQT: {head} 158.23.190.70:6983")
     assert ", before MoQT setup" in msg
     assert s.sent == []
     assert s._close_err == (code, "WebTransport session closed")
@@ -98,3 +103,23 @@ async def test_first_close_wins():
     s._close_session(SessionCloseCode.INTERNAL_ERROR, "second")
     assert s._close_err == (0x106, "first")
     assert s.sent == []
+
+
+async def test_raw_quic_peer_error_close_logs_one_warning(records):
+    s = _stub(is_wt=False, setup_done=True)
+    s._quic_event(ConnectionTerminated(error_code=0x3, reason_phrase="bad"))
+    errors = [r for r in records.records if r.levelno >= logging.WARNING]
+    assert [r.getMessage() for r in errors] == [
+        "MOQT: peer closed: PROTOCOL_VIOLATION (0x3) from "
+        "158.23.190.70:6983; reason: bad"]
+    assert errors[0].levelno == logging.WARNING
+
+
+async def test_transport_close_without_a_code_is_not_called_a_peer_close(records):
+    # A local idle timeout arrives as code 0: the side is unknown.
+    s = _stub(is_wt=False, setup_done=True)
+    s._quic_event(ConnectionTerminated(error_code=0))
+    rec = _close_line(records)
+    assert rec.levelno == logging.INFO
+    assert rec.getMessage().startswith("MOQT: connection closed: NO_ERROR (0x0)")
+    assert "peer closed" not in records.text
