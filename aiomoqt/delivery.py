@@ -415,6 +415,8 @@ class SubgroupDelivery:
         self._datagrams_shared = True
         # The SendLane writing through this delivery, if any.
         self.lane = None
+        # The session's write that never waits, if it has one.
+        self._write_nowait = getattr(session, "stream_write_nowait", None)
         # stream_id -> group_id of FINed streams the transport may still
         # hold bytes of; kept only behind a lane.
         self._tx_streams: dict = {}
@@ -545,6 +547,11 @@ class SubgroupDelivery:
                 self._stream_id = None
                 self._header = None
             return False
+        self._count_sent(group_id, object_id, payload)
+        return True
+
+    def _count_sent(self, group_id: int, object_id: int,
+                    payload: bytes) -> None:
         self._note_largest(group_id, object_id)
         self.objects_sent += 1
         self.bytes_sent += len(payload)
@@ -552,7 +559,6 @@ class SubgroupDelivery:
             data_log.log(TRACE, f"MOQT send: object {group_id}.{object_id} "
                                 f"alias={self.track_alias} {len(payload)} "
                                 f"bytes ({self.mapping.name})")
-        return True
 
     def _datagram_key(self) -> tuple:
         """Every field of this delivery its datagrams' bytes depend on."""
@@ -633,6 +639,39 @@ class SubgroupDelivery:
         return self.write(item[0], item[4], item[5], extensions=item[6],
                           group_start=item[7], encoded=item[8])
 
+    def send_nowait(self, item) -> Optional[bool]:
+        """send(item) when it completes without waiting: an object on the
+        open group stream that the transport takes now. True when
+        written, False when skipped as write() skips it; None, with
+        nothing written, when it has to wait."""
+        sid = self._stream_id
+        write = self._write_nowait
+        if sid is None or item[7] or write is None:
+            return None
+        group_id, object_id = item[0], item[4]
+        if self.passes is not None and not self.passes(group_id, object_id):
+            return False
+        hdr = self._header
+        last = hdr.next_object_id - 1
+        if last < 0:
+            return None
+        payload, extensions = item[5], item[6]
+        if callable(extensions):
+            extensions = extensions(self.session)
+        data = self._object_bytes(hdr, object_id, payload, extensions,
+                                  item[8])
+        try:
+            if not write(sid, data):
+                hdr.advance(last)
+                return None
+        except MOQTStreamStopped:
+            self._stopped_group = group_id
+            self._stream_id = None
+            self._header = None
+            return False
+        self._count_sent(group_id, object_id, payload)
+        return True
+
     def close_streams(self) -> None:
         self.end_group()
 
@@ -704,10 +743,15 @@ class SendLane:
     reset_group(code), reset_below(floor), close_streams(), final(*args),
     tx_queued(floor) and expire(group_id). A writer may set `parked`
     ("header" or "object") and `sid` on the lane while a send waits.
+
+    Write-through: a writer with send_nowait(item) is handed an object
+    inline from offer() while the lane is empty and under its bound; it
+    is queued only when the writer would wait, so order is kept.
     """
 
     log = logger
     prefix = ""
+    write_through = True
 
     def __init__(self, writer, *, max_bytes: int = LANE_BYTES,
                  name: str = ""):
@@ -750,6 +794,8 @@ class SendLane:
         self._cut = False
         self._closing = False
         self._wake = asyncio.Event()
+        self._nowait = (getattr(writer, "send_nowait", None)
+                        if self.write_through else None)
         self.task = asyncio.ensure_future(self._run())
 
     @property
@@ -769,16 +815,36 @@ class SendLane:
         self.items.append(item)
         self._wake.set()
 
-    def offer(self, item) -> None:
-        """Queue an object or stream marker."""
+    def offer(self, item) -> bool:
+        """Write an object or stream marker through, or queue it. True
+        when it was queued."""
         if self.stopped or self.final:
-            return
+            return False
         gid, cost, live = item[0], item[1], item[2]
         floor = self.floor
         if floor is not None and gid < floor:
             if cost and self.gate:
                 self.shed += 1
-            return
+            return False
+        if live:
+            if gid != self._probe_gid or self._probe_n >= LANE_TX_PROBE:
+                self._probe_gid, self._probe_n = gid, 0
+                self.tx_bytes = self.writer.tx_queued(floor)
+            self._probe_n += 1
+        nowait = self._nowait
+        if (nowait is not None and not self.items and not self.busy
+                and self.gate and self.tx_bytes + cost <= self.max_bytes):
+            try:
+                sent = nowait(item)
+            except Exception as e:
+                if not self._failed(item, e):
+                    self.stop()
+                return False
+            if sent is not None:
+                self.done += 1
+                if sent and self.on_sent is not None:
+                    self.on_sent(item)
+                return False
         if cost:
             self.objects += 1
             if live:
@@ -787,13 +853,9 @@ class SendLane:
                 self.replay_bytes += cost
         self.items.append(item)
         self._wake.set()
-        if live:
-            if gid != self._probe_gid or self._probe_n >= LANE_TX_PROBE:
-                self._probe_gid, self._probe_n = gid, 0
-                self.tx_bytes = self.writer.tx_queued(floor)
-            self._probe_n += 1
-            if self.bytes + self.tx_bytes > self.max_bytes:
-                self._shed(gid)
+        if live and self.bytes + self.tx_bytes > self.max_bytes:
+            self._shed(gid)
+        return True
 
     def end_group(self) -> None:
         """Close the writer's open group once what is queued is out."""
@@ -1160,8 +1222,13 @@ class FanoutDelivery:
         item = (group_id, cost, True, time.monotonic(), object_id, payload,
                 extensions, group_start, encoded)
         self._group = group_id
+        queued = False
         for lane in list(self.lanes):
-            lane.offer(item)
+            if lane.offer(item):
+                queued = True
+        if queued:
+            # Let a lane that could not take the object inline catch up.
+            await asyncio.sleep(0)
 
     def end_group(self) -> None:
         for lane in list(self.lanes):

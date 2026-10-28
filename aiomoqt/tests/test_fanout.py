@@ -10,7 +10,7 @@ import pytest
 
 from aiomoqt import delivery as delivery_mod
 from aiomoqt.context import profile_for
-from aiomoqt.delivery import (FanoutDelivery, OBJECT_RECORD_BYTES,
+from aiomoqt.delivery import (FanoutDelivery, OBJECT_RECORD_BYTES, SendLane,
                               StreamMapping, SubgroupDelivery)
 from aiomoqt.fanout import FanoutPublisher
 from aiomoqt.media import Catalog, CatalogTrack, LocTrackPublisher
@@ -390,6 +390,98 @@ async def test_a_lane_counts_what_the_transport_still_holds():
     s.held.clear()
     assert d.tx_queued() == 0 and not d._tx_streams
     await fan.close()
+
+
+
+class _Nowait(_Session):
+    """Takes a write without waiting unless `refuse(n)` says no for the
+    n-th; records the bytes of every stream write in order."""
+
+    def __init__(self, refuse):
+        super().__init__("nowait")
+        self.refuse = refuse
+        self.tries = 0
+        self.inline = 0
+        self.data = []              # (stream_id, bytes, fin)
+
+    def stream_write_nowait(self, sid, data):
+        self.tries += 1
+        if self.refuse(self.tries):
+            return False
+        self.inline += 1
+        self.data.append((sid, bytes(data), False))
+        return True
+
+    def stream_write(self, sid, data, end_stream=False):
+        super().stream_write(sid, data, end_stream)
+        self.data.append((sid, bytes(data), end_stream))
+
+    async def stream_write_drain(self, sid, data):
+        await super().stream_write_drain(sid, data)
+        self.data.append((sid, bytes(data), False))
+
+    def streams(self):
+        """Each stream's writes, streams in header order."""
+        return sorted([(d, fin) for s, d, fin in self.data if s == sid]
+                      for sid in self.opened)
+
+
+async def _two_tracks_mixed(monkeypatch, write_through):
+    """Two tracks on one session; every third inline write is refused and
+    drains park for a stretch of group 1."""
+    monkeypatch.setattr(SendLane, "write_through", write_through)
+    s = _Nowait(lambda n: n % 3 == 0)
+    fans = [FanoutDelivery([_delivery(s, alias)]) for alias in (1, 2)]
+    for gid in range(3):
+        for oid in range(6):
+            if (gid, oid) == (1, 2):
+                s._gate.clear()
+            if (gid, oid) == (1, 5):
+                s.release()
+            for k, fan in enumerate(fans):
+                await fan.write(gid, oid, b"%d.%d.%d" % (k, gid, oid),
+                                group_start=oid == 0)
+        for fan in fans:
+            fan.end_group()
+    for fan in fans:
+        await fan.close()
+    return s
+
+
+@pytest.mark.asyncio
+async def test_write_through_keeps_the_queued_order(monkeypatch):
+    fast = await _two_tracks_mixed(monkeypatch, True)
+    queued = await _two_tracks_mixed(monkeypatch, False)
+    assert fast.inline and fast.tries > fast.inline     # both paths ran
+    assert queued.tries == 0
+    assert len(fast.opened) == len(queued.opened) == 6
+    assert fast.streams() == queued.streams()
+    assert fast.resets == queued.resets == []
+
+
+@pytest.mark.asyncio
+async def test_write_through_respects_gate_floor_and_bound():
+    s = _Nowait(lambda n: False)
+    d = _delivery(s)
+    fan = FanoutDelivery(max_bytes=_TWO)
+    lane = fan.add(d, joining=False)
+    await fan.write(0, 0, b"key", group_start=True)     # opens: queued
+    await _settle()
+    await fan.write(0, 1, b"pred")                      # inline
+    assert s.inline == 1 and not lane.items
+    lane.gate = False
+    await fan.write(0, 2, b"pred")                      # queued, dropped
+    await _settle()
+    assert s.inline == 1 and lane.floor == 1
+    lane.gate = True
+    await fan.write(0, 3, b"pred")                      # below the floor
+    assert s.inline == 1 and lane.shed == 1
+    await fan.write(1, 0, b"key", group_start=True)
+    await _settle()
+    await fan.write(1, 1, b"x" * (2 * _TWO))            # over the bound
+    assert s.inline == 1 and lane.sheds == 1
+    await fan.close()
+    assert d.largest == (1, 0)
 
 
 # -- the track layer -------------------------------------------------

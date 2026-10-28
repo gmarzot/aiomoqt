@@ -144,18 +144,29 @@ class _Paced(PublishedTrack):
 
 def _stall_once(session, after: int, seconds: float):
     """Hold every stream write of the publisher for `seconds`, starting
-    at its `after`-th write: the drain is blocked for all lanes."""
+    at its `after`-th write: the drain is blocked for all lanes, and a
+    write that would not wait is refused."""
     orig = session.stream_write_drain
+    orig_nowait = session.stream_write_nowait
     count, until = [0], [None]
 
-    async def held(sid, data, end_stream=False):
+    def stalled():
         count[0] += 1
         if count[0] == after:
             until[0] = time.monotonic() + seconds
-        if until[0] is not None and time.monotonic() < until[0]:
+        return until[0] is not None and time.monotonic() < until[0]
+
+    async def held(sid, data, end_stream=False):
+        if stalled():
             await asyncio.sleep(until[0] - time.monotonic())
         return await orig(sid, data, end_stream=end_stream)
+
+    def refused(sid, data):
+        if stalled():
+            return False
+        return orig_nowait(sid, data)
     session.stream_write_drain = held
+    session.stream_write_nowait = refused
 
 
 @requires_certs

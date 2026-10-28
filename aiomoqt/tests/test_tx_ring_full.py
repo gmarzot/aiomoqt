@@ -71,6 +71,9 @@ class _Quic:
     def get_tx_data_drain_event(self, sid):
         return self._events.setdefault(sid, asyncio.Event())
 
+    def tx_event_ring_fill(self):
+        return 1.0 if self._transport.full else 0.0
+
 
 def _session(draft=18):
     s = object.__new__(_MOQTSessionMixin)

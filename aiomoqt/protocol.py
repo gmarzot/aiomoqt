@@ -3635,6 +3635,42 @@ class _MOQTSessionMixin:
                 raise MOQTStreamStopped() from e
             raise asyncio.CancelledError() from e
 
+    # TX event ring fill past which a write waits for the transport, as
+    # send_stream_data_drained's hard_wait_at.
+    TX_RING_WAIT_AT = 0.9
+
+    def stream_write_nowait(self, stream_id: int, data: bytes) -> bool:
+        """stream_write_drain() when it would not wait: True once the
+        transport holds `data`. False, with nothing written, when the
+        session is closing, the stream is over its budget or the
+        transport is near full. A stopped stream raises
+        MOQTStreamStopped."""
+        quic = self._quic
+        if not self._session_writable() or getattr(quic, 'closed', False):
+            return False
+        if stream_id in self._stopped_streams:
+            self._stopped_streams.discard(stream_id)
+            raise MOQTStreamStopped()
+        max_bytes = self._session.tx_max_inflight_bytes
+        if (max_bytes is not None
+                and quic.tx_data_ring_used(stream_id) > max_bytes):
+            return False
+        if quic.tx_event_ring_fill() > self.TX_RING_WAIT_AT:
+            return False
+        try:
+            quic.send_stream_data(stream_id, data)
+        except BufferError:
+            return False
+        except (AssertionError, AttributeError, ConnectionError) as e:
+            if (self._session_writable()
+                    and not getattr(self._quic, 'closed', False)):
+                log = (transport_log.debug if isinstance(e, ConnectionError)
+                       else transport_log.warning)
+                log(f"stream({stream_id}): write failed: {e!r}")
+                raise MOQTStreamStopped() from e
+            return False
+        return True
+
     # Fetch streams serve_fetch() has open, by the peer's request id.
     _served_fetch_streams: Optional[Dict[int, int]] = None
     # Send streams the peer stopped; the next write raises MOQTStreamStopped.
