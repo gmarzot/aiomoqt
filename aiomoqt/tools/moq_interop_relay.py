@@ -2612,8 +2612,9 @@ _resuming: dict = {}
 async def _resume_for(track, msg) -> None:
     """Resume a paused upstream for a forwarding SUBSCRIBE before it is
     answered, so its reply and joining FETCH resolve against the
-    publisher's live Largest rather than the pre-pause one."""
-    if not track.lowered or (msg.forward is not None and not msg.forward):
+    publisher's live Largest rather than the one at the pause or the
+    PUBLISH."""
+    if not track.paused or (msg.forward is not None and not msg.forward):
         return
     task = _resuming.get(track.key)
     if task is None:
@@ -2625,7 +2626,14 @@ async def _resume_for(track, msg) -> None:
         task.add_done_callback(
             lambda t, k=track.key: _resuming.pop(k, None)
             if _resuming.get(k) is t else None)
-    await asyncio.shield(task)
+    # Objects the resume brings are held for this subscriber, whose
+    # filter resolves against the Largest the publisher reports.
+    track.attaching = True
+    try:
+        await asyncio.shield(task)
+    finally:
+        track.attaching = False
+        track._ensure_drain()
 
 
 async def _take_live_largest(track, reply) -> None:
@@ -3097,7 +3105,7 @@ async def _relay_subscribe(session, msg):
         track.close()
         _tracks.pop((ns, msg.track_name), None)
         track = None
-    if track is not None and track.lowered and track.upstream is not None:
+    if track is not None and track.paused and track.upstream is not None:
         await _resume_for(track, msg)
     # The relay's Largest as it takes the SUBSCRIBE (§3.1.4).
     seen = None if track is None else track.largest
