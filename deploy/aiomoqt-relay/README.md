@@ -5,7 +5,7 @@ dashboard, and the G5 Broadcast and G5 Player test pages. The relay is open, wit
 
 | Service | Container | What it does |
 |---|---|---|
-| `relay` | `aiomoqt-relay` | `moq_interop_relay` on UDP 4443, raw QUIC and WebTransport, drafts 22/20/18/16/14, `--watchdog 30`, writes `status/` and `relay-logs/` |
+| `relay` | `aiomoqt-relay` | `moq_interop_relay` on UDP 4443, raw QUIC and WebTransport, drafts 22/20/18/16/14, `--watchdog 30`, pauses a track upstream once no viewer has watched it for 60 s (`--pause-after`), writes `status/` and `relay-logs/` |
 | `web` | `relay-web` | nginx on 80/443: landing page, `/g5-broadcast/`, `/g5-player/`, `/relay/` dashboard, `/relay/platform/` and `/relay/logs/`, `/status/{status,platform}.json`, `/private/`, `/stats/` |
 | `goaccess` | `relay-goaccess` | rebuilds the visitor reports in `stats/` every 5 minutes from `logs/`; no network |
 
@@ -25,7 +25,8 @@ again after.
 Everything lives in `~/aiomoqt-relay`; run every `docker compose` command from there.
 
 ```
-compose.yml, nginx.conf   this directory
+compose.yml, nginx.conf, relay.toml
+                          this directory
 site/index.html           landing page (site/ here)
 site/relay/, site/private/
                           dashboard, platform, log viewer and private index (site/ here)
@@ -47,7 +48,7 @@ Create `stats.htpasswd` before the first `up`. If it is missing, Docker creates 
 place and `/stats/` fails.
 
 ```sh
-tar -C deploy/aiomoqt-relay -cf - compose.yml nginx.conf site | ssh ubuntu@aiomoqt-relay.marzresearch.net 'mkdir -p ~/aiomoqt-relay && tar -C ~/aiomoqt-relay -xf -'
+tar -C deploy/aiomoqt-relay -cf - compose.yml nginx.conf relay.toml site | ssh ubuntu@aiomoqt-relay.marzresearch.net 'mkdir -p ~/aiomoqt-relay && tar -C ~/aiomoqt-relay -xf -'
 ssh -t ubuntu@aiomoqt-relay.marzresearch.net
 cd ~/aiomoqt-relay && mkdir -p status relay-logs cores logs stats
 # The relay and GoAccess run with no capabilities, so root must own what they write.
@@ -137,6 +138,14 @@ pnpm -r build      # in the moq-playa checkout
 tar -C examples/dist -cf - assets g5-broadcast g5-player | ssh ubuntu@aiomoqt-relay.marzresearch.net 'tar -C ~/aiomoqt-relay/site -xf -'
 ```
 
+## Relay settings
+
+`relay.toml` holds the relay's flags, mounted read-only and read with `--config`. Its keys are the
+long flag names (`cache-bytes = 268435456`, `catalog-probe = true`, lists for repeatable flags);
+an unknown key or a wrong type stops the relay with an error naming it. Flags added to the
+compose `command:` override the file. Port, certificate and transports stay in the `MOQT_*`
+environment. After copying an edited file over, run `docker compose restart relay`.
+
 ## nginx config
 
 `nginx.conf` is bind-mounted as a single file. Replacing it gives it a new inode, and
@@ -187,3 +196,9 @@ expected, and the dashboard leaves it out.
 ## Taking it down
 
 `docker compose down` stops everything; `docker stop aiomoqt-relay` stops just the relay.
+
+On SIGTERM the relay drains: it refuses new sessions, sends every session GOAWAY with an empty
+New Session URI (reconnect to the same address), waits up to 5 s (`--drain-timeout`) for them
+to leave, then exits. `stop_grace_period: 15s` gives the drain room before Docker kills it.
+`--goaway-uri URL` points peers at another relay instead. pub_media `--reconnect` redials at
+once on GOAWAY.

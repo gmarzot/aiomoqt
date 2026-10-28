@@ -162,4 +162,4 @@ async def test_without_the_flag_nothing_is_probed(use_quic, flow):
         if flow == "announce":
             assert track is None
         else:
-            assert track is not None and track.parked is not None
+            assert track is not None and track.paused

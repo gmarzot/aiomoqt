@@ -55,9 +55,24 @@ class StreamMapping(Enum):
     DATAGRAM = "datagram"      # loc-02 §4.1: one datagram per object
 
 
-# Bookkeeping charged per object on top of its payload, so a run of empty
-# objects is bounded too.
-_HISTORY_ENTRY_BYTES = 64
+# Charged per retained object on top of its payload and properties, so a
+# run of empty objects is bounded too: record tuple, container slot,
+# Object ID and payload object header measure about 185 B.
+OBJECT_RECORD_BYTES = 192
+
+
+def retained_object_bytes(payload, extensions=None) -> int:
+    """Memory charged for holding one object: its payload, its properties
+    (an upper bound of their encoded size) and OBJECT_RECORD_BYTES."""
+    n = OBJECT_RECORD_BYTES + (len(payload) if payload else 0)
+    if extensions:
+        if isinstance(extensions, dict):
+            for v in extensions.values():
+                n += 16 + (len(v) if isinstance(
+                    v, (bytes, bytearray, memoryview, str)) else 0)
+        elif isinstance(extensions, (bytes, bytearray, memoryview)):
+            n += len(extensions)
+    return n
 
 
 class ObjectHistory:
@@ -90,7 +105,7 @@ class ObjectHistory:
         fetches it."""
         self._records.append((group_id, object_id, subgroup_id, payload,
                               extensions, priority))
-        self._bytes += len(payload) + _HISTORY_ENTRY_BYTES
+        self._bytes += retained_object_bytes(payload, extensions)
         if self._bytes > self.max_bytes:
             self._evict()
 
@@ -100,7 +115,7 @@ class ObjectHistory:
         through = self.evicted_through
         while held > self.max_bytes and records:
             rec = records.popleft()
-            held -= len(rec[3]) + _HISTORY_ENTRY_BYTES
+            held -= retained_object_bytes(rec[3], rec[4])
             gone = (rec[0], rec[1])
             if through is None or gone > through:
                 through = gone

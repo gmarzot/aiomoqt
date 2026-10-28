@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from aiomoqt import delivery
 from aiomoqt.client import MOQTClient
 from aiomoqt.context import profile_for, request_error_code
 from aiomoqt.messages.fetch import Fetch
@@ -25,6 +26,8 @@ STANDALONE, RELATIVE_JOINING = 0x1, 0x2
 @pytest.fixture(autouse=True)
 def fresh_budget(monkeypatch):
     monkeypatch.setattr(relay, "_budget", relay._CacheBudget())
+    # Byte counts below are payload only.
+    monkeypatch.setattr(delivery, "OBJECT_RECORD_BYTES", 0)
 
 
 @pytest.fixture

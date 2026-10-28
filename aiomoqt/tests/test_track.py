@@ -448,7 +448,7 @@ class TestD18Discovery:
         ns_msg = MagicMock(spec=[])
         ns_msg.namespace_suffix = suffix
         pub_msg = MagicMock(spec=[])
-        pub_msg.track_namespace = (b"bench",)
+        pub_msg.track_namespace = (b"bench", *suffix)
         pub_msg.track_name = trackname
         pub_msg.request_id = 11
         pub_msg.forward = 0

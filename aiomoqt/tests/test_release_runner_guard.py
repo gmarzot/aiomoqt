@@ -1,5 +1,6 @@
-"""The runner's relay-pub-sub verdict: zero or missing objects, a FAIL or missing
-load_sim RESULT line, or a non-zero exit fail."""
+"""The runner's verdicts. relay-pub-sub: zero or missing objects, a FAIL or
+missing load_sim RESULT line, or a non-zero exit fail. A single-case TAP run:
+ok passes, ok with a SKIP directive is a SKIP, not ok fails."""
 import importlib.util
 import sys
 from pathlib import Path
@@ -85,3 +86,23 @@ def test_loopback_variants_run_this_interpreter(runner, monkeypatch, tmp_path):
     monkeypatch.setattr(runner, "_run", fake_run)
     runner._loopback_pub_sub_variant(tmp_path, "v", ["-t", "1"], 5)
     assert seen and seen[0][0] == sys.executable
+
+
+def _tap(line):
+    return f"TAP version 14\n1..1\n{line}\n  ---\n  message: \"m\"\n  ...\n"
+
+
+def test_a_tap_case_that_passes_is_a_pass(runner):
+    text = _tap("ok 1 - namespace-discovery")
+    assert runner._tap_case_verdict(text, "namespace-discovery") == ("PASS", "ok")
+
+
+def test_a_tap_case_skip_is_a_skip_not_a_pass(runner):
+    text = _tap("ok 1 - namespace-discovery # SKIP relay does not support PUBLISH")
+    assert runner._tap_case_verdict(text, "namespace-discovery") == (
+        "SKIP", "relay does not support PUBLISH")
+
+
+def test_a_tap_case_that_fails_reports_its_message(runner):
+    text = _tap("not ok 1 - namespace-discovery")
+    assert runner._tap_case_verdict(text, "namespace-discovery") == ("FAIL", "m")

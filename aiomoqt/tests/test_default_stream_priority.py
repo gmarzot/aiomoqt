@@ -149,15 +149,6 @@ def test_a_broadcast_declares_audio_above_video():
     assert audio._stream_band(session) < video._stream_band(session)
 
 
-def _has_datagram_priority() -> bool:
-    from aiopquic.asyncio.webtransport import WebTransportSession
-    from aiopquic.quic.connection import QuicConnection
-    return (hasattr(QuicConnection, "set_datagram_priority")
-            and hasattr(WebTransportSession, "set_datagram_priority"))
-
-
-@pytest.mark.skipif(not _has_datagram_priority(),
-                    reason="aiopquic without a datagram priority setter")
 @pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
 async def test_datagrams_share_the_neutral_band(use_quic, monkeypatch):
     calls = []

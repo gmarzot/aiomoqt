@@ -15,6 +15,7 @@ import pytest
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.context import profile_for, request_error_code
+from aiomoqt.delivery import OBJECT_RECORD_BYTES
 from aiomoqt.messages.data import FetchObject
 from aiomoqt.messages import SubgroupHeader
 from aiomoqt.messages.fetch import Fetch
@@ -298,11 +299,12 @@ def test_cache_drops_oldest_groups():
 
 
 def test_cache_drops_on_the_byte_bound(monkeypatch):
-    monkeypatch.setattr(relay, "CACHE_BYTES", 100)
+    bound = 10 * (10 + OBJECT_RECORD_BYTES)
+    monkeypatch.setattr(relay, "CACHE_BYTES", bound)
     t = relay._RelayedTrack(((b"live",), b"cam"))
     for oid in range(20):
         t._remember(0, 0, oid, b"x" * 10, None, 128, None)
-    assert t._cache_bytes <= 100
+    assert t._cache_bytes <= bound
     assert [e[2] for e in t._cache] == list(range(10, 20))
 
 
