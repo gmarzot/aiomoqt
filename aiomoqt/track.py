@@ -1202,6 +1202,19 @@ class PublishedTrack(Track):
         sub.forward = forward
         self._cut_streams(sub)
 
+    def _resume_lane(self, sub) -> None:
+        """Forward State back to 1: the peer's lane continues the open
+        group at its next object when the history holds the group's head,
+        for its joining FETCH or fill to serve; else it waits for the next
+        group."""
+        lane = getattr(sub.delivery, "lane", None)
+        if lane is None or self._largest is None:
+            return
+        group_id = self._largest[0]
+        history = self._history
+        lane.resume(group_id, rejoin=history is not None
+                    and history.first_held(group_id) == 0)
+
     def _cut_streams(self, sub) -> None:
         """Reset the streams whose next object the subscription no longer
         takes: a FIN would claim the rest of the group was delivered
@@ -1291,7 +1304,8 @@ class PublishedTrack(Track):
                 *MOQTMessage._decode_filter(raw_filter, prof=session._profile),
                 self._largest)
             self._cut_streams(sub)
-        if forward and not sub.forward:
+        resumed = bool(forward) and not sub.forward
+        if resumed:
             sub.joining[msg.existing_request_id] = self._largest
         if forward is not None:
             sub.updated_request = msg.existing_request_id
@@ -1307,14 +1321,19 @@ class PublishedTrack(Track):
         self._start_fill(session, sub, msg, largest)
         if forward:
             await self._start_generating(session, "REQUEST_UPDATE")
+            if resumed:
+                self._resume_lane(sub)
 
     async def _on_subscribe_update(self, session, msg):
         """SUBSCRIBE_UPDATE — subscriber changed forward state."""
         sub = self._sub_for(session)
         logger.info(f"Track: SUBSCRIBE_UPDATE: forward={msg.forward}")
+        resumed = bool(msg.forward) and not sub.forward
         self._set_forward(sub, msg.forward)
         if sub.forward:
             await self._start_generating(session, "SUBSCRIBE_UPDATE")
+            if resumed:
+                self._resume_lane(sub)
 
     async def _on_subscribe(self, session, msg):
         """Relay forwarded a subscriber's SUBSCRIBE."""

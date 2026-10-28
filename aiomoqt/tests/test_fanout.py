@@ -230,6 +230,62 @@ async def test_a_paused_peer_is_gated_and_rejoins_at_a_group():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("rejoin", [True, False], ids=["rejoin", "wait"])
+async def test_a_resumed_peer_rejoins_the_open_group_or_waits(rejoin):
+    a, b = _Session("a"), _Session("b")
+    da, db = _delivery(a), _delivery(b)
+    fan = FanoutDelivery()
+    fan.add(da, joining=False)
+    paused = fan.add(db, joining=False)
+
+    await fan.write(0, 0, b"key", group_start=True)
+    await _settle()
+    paused.gate = False
+    db.cancel()                              # cut at Forward State 0
+    await fan.write(0, 1, b"pred")
+    await _settle()
+    paused.gate = True
+    paused.resume(0, rejoin=rejoin)
+    await fan.write(0, 2, b"pred")
+    await _settle()
+    if rejoin:
+        # Group 0 again on a new stream, FIRST_OBJECT clear.
+        assert db.open_group == 0 and not db._header.first_object
+    else:
+        assert db.open_group is None
+    await fan.write(1, 0, b"key", group_start=True)
+    await _settle()
+    assert db.open_group == 1 and db._header.first_object
+    await fan.close()
+
+    assert da.objects_sent == 4 and len(a.opened) == 2 and a.resets == []
+    assert db.objects_sent == (3 if rejoin else 2)
+    assert len(b.opened) == (3 if rejoin else 2)
+    assert b.resets == [b.opened[0]]
+
+
+@pytest.mark.asyncio
+async def test_a_shed_group_is_not_rejoined():
+    slow = _Session("slow", block=True)
+    ds = _delivery(slow)
+    fan = FanoutDelivery(max_bytes=_TWO)
+    lane = fan.add(ds, joining=False)
+
+    await fan.write(0, 0, b"key", group_start=True)
+    await _settle()
+    for oid in range(1, 6):                 # overruns the lane in group 0
+        await fan.write(0, oid, b"pred")
+    assert lane.floor == 1
+    lane.resume(0, rejoin=True)
+    slow.release()
+    await fan.write(0, 6, b"pred")
+    await fan.write(1, 0, b"key", group_start=True)
+    await _settle(30)
+    await fan.close()
+    assert ds.objects_sent == 1 and ds.largest == (1, 0)
+
+
+@pytest.mark.asyncio
 async def test_on_sent_reports_only_written_objects():
     """Once per peer per object written; nothing for a peer that is
     paused, filtered out or shed."""

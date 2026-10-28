@@ -297,6 +297,13 @@ class ObjectHistory:
                     held[key] = (rec[1], rec[2], rec[3], grp.priority_of(i))
         return held
 
+    def first_held(self, group_id: int) -> Optional[int]:
+        """The Object ID of a group's earliest record held, None if none is."""
+        grp = self._groups.get(group_id)
+        if grp is None or grp.head >= len(grp.records):
+            return None
+        return grp.records[grp.head][0]
+
     def last_object(self, group_id: int) -> Optional[int]:
         """The largest Object ID held in a group, None if none is."""
         grp = self._groups.get(group_id)
@@ -766,6 +773,7 @@ class SendLane:
         self._probe_n = 0
         self.objects = 0
         self.floor = None        # objects of groups below it are not sent
+        self._lost = None        # newest group shed, expired or failed
         self.shed = 0            # objects shed
         self.sheds = 0           # shed episodes
         self.expired = 0         # objects past the delivery timeout (§8)
@@ -881,6 +889,32 @@ class SendLane:
             self.final = True
             self._put(("FINAL", *args))
 
+    def resume(self, group_id: int, rejoin: bool = False) -> None:
+        """Forward State back to 1 (§5.1) with the source in `group_id`.
+        What is queued of it and earlier groups is dropped and the
+        writer's open group reset: the peer's joining FETCH covers them.
+        With `rejoin` the lane continues `group_id` from its next object
+        on a new stream (FIRST_OBJECT clear), unless the group was shed,
+        expired or failed; otherwise it waits for the next group."""
+        if self.stopped or self.final:
+            return
+        kept = deque()
+        for item in self.items:
+            gid = item[0]
+            if gid.__class__ is not str:
+                if gid > group_id:
+                    kept.append(item)
+                else:
+                    self._uncount(item)
+            elif gid != "RESET_GROUP" or (item[1] or 0) > group_id:
+                kept.append(item)
+        self.items = kept
+        self.writer.reset_group()
+        if not rejoin or self._lost == group_id:
+            self._skip(group_id, count=False)
+        elif self.floor == group_id + 1:
+            self.floor = group_id
+
     def _uncount(self, item) -> None:
         cost = item[1]
         if cost:
@@ -920,6 +954,7 @@ class SendLane:
             self._drop_below(floor)
             self.tx_bytes = writer.tx_queued(floor)
         self.floor = floor if self.floor is None else max(self.floor, floor)
+        self._lost = self.floor - 1
         if self.busy and self.opening:
             # A parked header write waits on this session's transport
             # backlog, which only these resets free.
@@ -1027,6 +1062,7 @@ class SendLane:
         except Exception:
             pass
         self._skip(item[0])
+        self._lost = item[0]
         return True
 
     def _control(self, item) -> bool:
@@ -1099,6 +1135,7 @@ class SendLane:
                     self.expired += 1
                     if writer.expire(gid):
                         self._skip(gid)
+                        self._lost = gid
                     self.done += 1
                     continue
                 self.busy = True

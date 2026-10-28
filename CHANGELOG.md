@@ -9,6 +9,7 @@
 - A publisher's per-subscriber send lane is bounded in bytes like the relay's, 4 MiB plus what its streams still hold in the transport (was 256 objects); past it the lane resets the groups it drops. `FanoutDelivery(queue_size=)` is now `max_bytes=`, and `add()` takes `gate` and `deadline` as values, updated on the lane.
 - aiomoqt-relay's send lanes are the library's `SendLane`; its shed WARNING names the subscriber as the stall lines do.
 - A publisher's send lane writes an object straight to the transport while it has nothing queued and the stream takes it without waiting (`MOQTSession.stream_write_nowait()`); it queues only under backpressure, so order is unchanged.
+- A peer whose Forward State returns to 1 mid-group continues that group at its next object, on a new stream with FIRST_OBJECT clear, when the track's FETCH history holds the group's head (`SendLane.resume()`); otherwise it waits for the next group. Other peers are untouched.
 - A drained stream write that fails inside the transport ends that stream (or its producer, if the session is closing) instead of returning as if it succeeded; unexpected failures log a WARNING.
 - A `PublishedTrack` answers FETCH only when given `fetch_history_bytes` (was 1 MiB by default); without it FETCH is refused with NOT_SUPPORTED. The MSF catalog track keeps 64 KiB.
 - pub_bench and pub_server `--fetch-history BYTES`: history kept to answer FETCH (default 0; pub_bench `--prefill` sets 1 MiB).
