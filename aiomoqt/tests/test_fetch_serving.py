@@ -194,7 +194,8 @@ def _port(case: int, use_quic: bool) -> int:
 
 
 @contextlib.asynccontextmanager
-async def _loopback(port, use_quic, prefill=3, draft=18, held_groups=None):
+async def _loopback(port, use_quic, prefill=3, draft=18, held_groups=None,
+                    history=True):
     """The client publishes video and audio under _NS, each with `prefill`
     groups already published; yields (tracks, server session, fetched),
     the server being the side that subscribes and fetches. `fetched` maps
@@ -224,12 +225,12 @@ async def _loopback(port, use_quic, prefill=3, draft=18, held_groups=None):
             tracks = {}
             for name, size in _SIZES.items():
                 # Each object also carries one integer property: 16 B.
-                kw = {} if held_groups is None else {
-                    "fetch_history_bytes": held_groups * _GROUP
-                    * (size + 16 + OBJECT_RECORD_BYTES)}
+                held = (0 if not history else 1 << 20 if held_groups is None
+                        else held_groups * _GROUP
+                        * (size + 16 + OBJECT_RECORD_BYTES))
                 track = PublishedTrack(pub, namespace=_NS, trackname=name,
                                        object_size=size, group_size=_GROUP,
-                                       rate=200, **kw)
+                                       rate=200, fetch_history_bytes=held)
                 if prefill:
                     track.prefill(prefill)
                 track.attach()
@@ -335,6 +336,36 @@ async def test_a_whole_group_fetch_of_an_evicted_group_completes(use_quic,
             assert gaps[-1] == (ok.request_id, FETCH_FLAGS_END_UNKNOWN, 0,
                                 MAX_OBJECT_ID)
         assert len(gaps) == len(_SIZES)
+        assert rx._close_err is None
+
+
+@requires_certs
+@_TRANSPORTS
+@pytest.mark.parametrize("draft", [14, 16, 18, 22])
+async def test_a_track_without_history_refuses_fetch(use_quic, draft):
+    port = _port(10 + [14, 16, 18, 22].index(draft), use_quic)
+    async with _loopback(port, use_quic, prefill=0, draft=draft,
+                         history=False) as (tracks, rx, _):
+        assert tracks["video"]._history is None
+        sub = await rx.subscribe(_NS, "video", wait_response=True)
+        for _ in range(100):
+            if tracks["video"]._largest is not None:
+                break
+            await asyncio.sleep(0.02)
+        assert tracks["video"]._largest is not None
+        assert await _refusal(rx.fetch(
+            _NS, "video", start_group=0, start_object=0, end_group=0,
+            end_object=0, wait_response=True)) == RequestErrorCode.NOT_SUPPORTED
+        if draft < 20:
+            assert await _refusal(rx.joining_fetch(
+                sub.request_id, joining_start=0, wait_response=True)) \
+                == RequestErrorCode.NOT_SUPPORTED
+        else:
+            # A joining fetch is a fill: the update stands, and the fill
+            # stream is opened and reset (d22 §3.4).
+            ok = await rx.joining_fetch(sub.request_id, joining_start=0,
+                                        wait_response=True)
+            assert ok.request_id is not None
         assert rx._close_err is None
 
 
@@ -510,7 +541,8 @@ async def test_publish_carries_the_largest_object_and_joining_location(use_quic)
             for name, groups in (("video", 3), ("audio", 1)):
                 track = PublishedTrack(pub, namespace=_NS, trackname=name,
                                        object_size=_SIZES[name],
-                                       group_size=_GROUP, rate=200)
+                                       group_size=_GROUP, rate=200,
+                                       fetch_history_bytes=1 << 20)
                 track.prefill(groups)
                 await track.publish()
                 tracks[name] = track

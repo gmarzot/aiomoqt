@@ -129,7 +129,8 @@ async def test_fetch_bytes_by_source_in_status(use_quic, relay_tables):
                        group_size=5, rate=200).attach()
         for name, size in ((_HIST, 60), (_UNKNOWN, 40)):
             track = _FetchOnly(pub, namespace=_NS, trackname=name,
-                               object_size=size, group_size=_GROUP)
+                               object_size=size, group_size=_GROUP,
+                               fetch_history_bytes=1 << 20)
             track.prefill(1)
             track.attach()
         await pub.publish_namespace(namespace=_NS, wait_response=True)

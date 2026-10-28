@@ -60,9 +60,6 @@ from .utils.timing import (
 logger = get_logger(__name__)
 data_log = get_category_logger("data")
 
-# Bytes of recent objects a PublishedTrack keeps to answer FETCH.
-FETCH_HISTORY_DEFAULT = 1 << 20
-
 
 def _largest_object_param(session, largest: tuple) -> dict:
     """LARGEST_OBJECT for a reply: an inline Location at d18, a
@@ -571,7 +568,7 @@ class PublishedTrack(Track):
                  auth_token: Optional[bytes] = None,
                  forwarding: ForwardingPreference =
                      ForwardingPreference.SUBGROUP,
-                 fetch_history_bytes: int = FETCH_HISTORY_DEFAULT,
+                 fetch_history_bytes: int = 0,
                  immutable_properties: Optional[
                      Dict[int, Union[int, bytes]]] = None,
                  track_properties: Optional[
@@ -611,7 +608,8 @@ class PublishedTrack(Track):
         # the first object exists. Drives ContentExists/Largest Location
         # in SUBSCRIBE_OK. A property of the content, so track-level.
         self._largest = None
-        # Recent objects for FETCH; None refuses FETCH as NOT_SUPPORTED.
+        # Recent objects for FETCH, kept only when `fetch_history_bytes`
+        # is set; None refuses FETCH as NOT_SUPPORTED.
         self._history = (ObjectHistory(fetch_history_bytes)
                          if fetch_history_bytes > 0 else None)
         # Payload pattern built by generate(); set means production has

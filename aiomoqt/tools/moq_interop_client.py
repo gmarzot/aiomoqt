@@ -1356,9 +1356,11 @@ async def _relay_history(host, port, path, use_quic, tls_disable_verify,
     async with pub_client.connect() as pub_session:
         await pub_session.client_session_init()
         sessions["publisher"] = _session_meta(pub_session)
+        # A relay may forward the FETCH here rather than serve its cache.
         track = PublishedTrack(pub_session, namespace=namespace,
                                trackname="track", object_size=64,
-                               group_size=_HISTORY_GROUP, rate=50)
+                               group_size=_HISTORY_GROUP, rate=50,
+                               fetch_history_bytes=1 << 20)
         await track.publish(announce_namespace=True, publish_track=False)
         groups = []
         two_groups = loop.create_future()

@@ -44,6 +44,9 @@ def _token_validator(rules):
 PRIOR_GROUP_ID_GAP = 0x3C
 PRIOR_OBJECT_ID_GAP = 0x3E
 
+# --fetch-history a --prefill track gets when none is given.
+_PREFILL_HISTORY = 1 << 20
+
 
 class _GapTrack(PublishedTrack):
     """Even Group and Object IDs only, each Object carrying the gap
@@ -87,6 +90,7 @@ The URL scheme selects the transport:
     _cli.add_run(parser)
     _cli.add_session(parser)
     _cli.add_timestamps(parser)
+    _cli.add_fetch_history(parser)
     pub_mode = parser.add_mutually_exclusive_group()
     pub_mode.add_argument('--pub-ns', action='store_true',
                           help='Flow A: PUB_NS only, wait for SUBSCRIBE '
@@ -147,7 +151,9 @@ The URL scheme selects the transport:
     content.add_argument('--prefill', type=int, default=0, metavar='GROUPS',
                          help='Hold GROUPS groups as already published, '
                               'ready for FETCH before any subscriber; '
-                              'live objects follow them')
+                              'live objects follow them. Sets '
+                              f'--fetch-history {_PREFILL_HISTORY} when '
+                              'that is 0')
     content.add_argument('--no-objects', action='store_true',
                          help='Serve subscriptions but publish no '
                               'objects: a track with nothing published')
@@ -163,6 +169,8 @@ The URL scheme selects the transport:
                      f'({VideoTrack.PROFILES[args.video]["i_frame"]} B) '
                      'far exceed the one-packet datagram ceiling')
     _cli.check_datagram(parser, args)
+    if args.prefill and not args.fetch_history:
+        args.fetch_history = _PREFILL_HISTORY
     if args.trackname is None:
         import uuid
         sz = args.object_size
@@ -272,6 +280,7 @@ async def run(args):
                     fps=args.rate or 30,
                     auth_token=args.auth_token.encode() or None,
                     timestamps=args.timestamps,
+                    fetch_history_bytes=args.fetch_history,
                 )
             else:
                 track_class = (_EmptyTrack if args.no_objects
@@ -290,6 +299,7 @@ async def run(args):
                                 else ForwardingPreference.SUBGROUP),
                     auth_token=args.auth_token.encode() or None,
                     timestamps=args.timestamps,
+                    fetch_history_bytes=args.fetch_history,
                 )
             if args.prefill:
                 track.prefill(args.prefill)

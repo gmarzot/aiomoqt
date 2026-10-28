@@ -42,6 +42,9 @@ AUDIO_PUBLISHER_PRIORITY = 64
 VIDEO_PUBLISHER_PRIORITY = 128
 _DEFAULT_PUBLISHER_PRIORITY = 128
 
+# Catalog history kept for FETCH: players fetch the catalog.
+CATALOG_FETCH_HISTORY = 64 << 10
+
 
 class CatalogTrackPublisher(PublishedTrack):
     """Publishes the "catalog" track: the current independent catalog
@@ -59,7 +62,8 @@ class CatalogTrackPublisher(PublishedTrack):
 
     def __init__(self, session, namespace: str, catalog: Optional[Catalog]):
         super().__init__(session, namespace, CATALOG_TRACK_NAME,
-                         priority=CATALOG_PUBLISHER_PRIORITY)
+                         priority=CATALOG_PUBLISHER_PRIORITY,
+                         fetch_history_bytes=CATALOG_FETCH_HISTORY)
         self.catalog = catalog
         # The catalog track has content by construction: the current
         # independent catalog is emitted as (0, 0) on first demand, so

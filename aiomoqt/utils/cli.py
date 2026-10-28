@@ -38,6 +38,7 @@ interval          -i/--interval
 session           --draft -k/--insecure --keylogfile --cc-algo
                   --max-queued-bytes --max-inflight-bytes --quic-debug
 keepalive         --keepalive
+fetch history     --fetch-history (long only)
 compat            --compat
 help              -h/-?/--help on every tool (-? is a shell glob: quote it)
 
@@ -302,6 +303,16 @@ def add_keepalive(p, default=None):
                         'flow-controlled quiet connection is not dropped '
                         'on idle timeout. 0 disables. Default: '
                         + ('off' if default is None else f'{default:g}'))
+
+
+def add_fetch_history(p, default=0):
+    """default: bytes of recent objects a published track keeps to
+    answer FETCH; 0 refuses FETCH."""
+    p.add_argument('--fetch-history', type=int, default=default,
+                   metavar='BYTES',
+                   help='Keep BYTES of recently published objects per '
+                        'track to answer FETCH; 0 refuses FETCH. '
+                        f'Default: {default}')
 
 
 def add_compat(p):

@@ -129,6 +129,7 @@ def parse_args():
         help='ObjectDatagrams instead of subgroup streams (object '
              'must fit one packet, ~1150B max)')
     _cli.add_timestamps(parser)
+    _cli.add_fetch_history(parser)
     args = parser.parse_args()
     if not args.quic and not args.wt:
         args.wt = True
@@ -151,6 +152,7 @@ async def _on_subscribe(session, msg, args):
         forwarding=(ForwardingPreference.DATAGRAM if args.datagram
                     else ForwardingPreference.SUBGROUP),
         timestamps=args.timestamps,
+        fetch_history_bytes=args.fetch_history,
     )
     ok = session.subscribe_ok(
         request_msg=msg, track_properties=track._track_properties(session))
@@ -210,6 +212,7 @@ async def _announce_track(session, args):
         forwarding=(ForwardingPreference.DATAGRAM if args.datagram
                     else ForwardingPreference.SUBGROUP),
         timestamps=args.timestamps,
+        fetch_history_bytes=args.fetch_history,
     )
     await track.publish(
         announce_namespace=(args.pub_ns or args.pub_both),

@@ -467,7 +467,8 @@ async def _catalog_relay(port, use_quic, draft):
             pub, sub = sessions
             for name, size in _SIZES.items():
                 track = _FetchOnly(pub, namespace=_NS, trackname=name,
-                                   object_size=size, group_size=_GROUP)
+                                   object_size=size, group_size=_GROUP,
+                                   fetch_history_bytes=1 << 20)
                 track.prefill(1)
                 track.attach()
             await pub.publish_namespace(namespace=_NS, wait_response=True)
@@ -762,7 +763,8 @@ async def _published_relay(port, use_quic, draft):
             pub, sub = sessions
             for name, size in _PUB_SIZES.items():
                 track = _FetchOnly(pub, namespace=_PUB_NS, trackname=name,
-                                   object_size=size, group_size=_GROUP)
+                                   object_size=size, group_size=_GROUP,
+                                   fetch_history_bytes=1 << 20)
                 track.prefill(2)
                 await track.publish(publish_track=True)
             keys = [(relay._ns_tuple(_PUB_NS), n.encode())
