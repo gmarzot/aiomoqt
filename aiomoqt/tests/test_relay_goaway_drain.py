@@ -6,10 +6,14 @@ import asyncio
 import contextlib
 import logging
 import signal
+import types
 
 import pytest
 
+from aiopquic.asyncio.webtransport import WebTransportError
+
 from aiomoqt.client import MOQTClient
+from aiomoqt.protocol import _MOQTSessionMixin
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
 from aiomoqt.tests._procs import free_udp_port, spawn, stop, wait_for
 from aiomoqt.tests.test_pub_media_frindell import _argv
@@ -21,7 +25,7 @@ from aiomoqt.tests.test_pub_media_service import (_groups, _pub_events,
 from aiomoqt.tools import moq_interop_relay as relay
 from aiomoqt.tools import pub_media, sub_media
 from aiomoqt.track import PublishedTrack, SubscribedTrack
-from aiomoqt.types import SessionCloseCode
+from aiomoqt.types import MOQTException, SessionCloseCode
 
 pytestmark = requires_certs
 
@@ -215,6 +219,164 @@ async def test_relay_process_second_signal_exits_at_once(tmp_path,
     assert "Traceback" not in out, out
 
 
+async def _dial_refused(port, use_quic, draft):
+    """Dial and wait for the close: (seconds to it, setup completed)."""
+    loop = asyncio.get_running_loop()
+    client = MOQTClient("127.0.0.1", port, path="/", use_quic=use_quic,
+                        verify_tls=False, supported_drafts=draft)
+    setup = False
+    t0 = loop.time()
+    # Only whether setup completed matters; a refused setup raises.
+    with contextlib.suppress(Exception, asyncio.CancelledError):
+        async with client.connect() as s:
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await s.client_session_init(timeout=3)
+                setup = True
+            await asyncio.wait_for(s.async_closed(), 3)
+    return loop.time() - t0, setup
+
+
+@pytest.mark.parametrize("draft", [16, 22])
+@pytest.mark.parametrize("transport", ["quic", "wt"])
+async def test_relay_process_refuses_newcomers_until_exit(
+        tmp_path, transport, draft, relay_tables):
+    port = free_udp_port()
+    log = tmp_path / "relay.log"
+    proc = spawn("moq_interop_relay", "--bind", "127.0.0.1", "--port", port,
+                 "--dual", "--cert", CERT, "--key", KEY,
+                 "--drain-timeout", 0.5, log=log)
+    try:
+        wait_for(log, "Listening on", proc)
+        async with contextlib.AsyncExitStack() as stack:
+            # A WT session that ignores GOAWAY keeps the close-out open:
+            # its connection outlives the relay's GOAWAY_TIMEOUT close.
+            holder = await _connect(stack, port, False, draft)
+            holder.on_goaway = lambda msg, rid: None
+            proc.send_signal(signal.SIGTERM)
+            await asyncio.to_thread(wait_for, log, "relay: drain timed out",
+                                    proc, 5)
+            elapsed, setup = await _dial_refused(port, transport == "quic",
+                                                 draft)
+            alive = proc.poll() is None
+            rc = await asyncio.to_thread(proc.wait, 10)
+    finally:
+        stop(proc)
+    out = log.read_text(errors="replace")
+    assert alive, out
+    assert not setup, out
+    assert elapsed < 0.5, (elapsed, out)
+    assert rc == 0, out
+    after = out[out.index("relay: SIGTERM: draining"):]
+    assert "relay shutting down" in after, out
+    assert "setup complete" not in after, out
+    assert "stream data after close" not in out, out
+    assert " ERROR " not in out, out
+    assert "Traceback" not in out, out
+
+
+@pytest.mark.parametrize("transport", ["quic", "wt"])
+async def test_close_sessions_refuses_arrivals_while_it_waits(
+        transport, relay_tables):
+    port = free_udp_port()
+    srv = relay._build_server("127.0.0.1", port, CERT, KEY, use_quic=False,
+                              draft=None)
+    handle = await srv.serve_dual()
+    loop = asyncio.get_running_loop()
+    try:
+        async with contextlib.AsyncExitStack() as stack:
+            # A WT peer that keeps its connection holds close_sessions
+            # waiting out its timeout.
+            holder = await _connect(stack, port, False, None)
+            t0 = loop.time()
+            closing = asyncio.ensure_future(srv.close_sessions(timeout=1.5))
+            await asyncio.wait_for(holder.async_closed(), 1)
+            elapsed, setup = await _dial_refused(port, transport == "quic",
+                                                 None)
+            waiting = not closing.done()
+            await asyncio.wait_for(closing, 3)
+            closed_in = loop.time() - t0
+    finally:
+        handle.close()
+    assert waiting
+    assert not setup
+    assert elapsed < 0.5, elapsed
+    assert closed_in < 2.0, closed_in
+
+
+@pytest.mark.parametrize("draft", [16, 22])
+async def test_wt_client_refused_mid_setup_raises_the_close(draft,
+                                                           relay_tables):
+    port = free_udp_port()
+    srv = relay._build_server("127.0.0.1", port, CERT, KEY, use_quic=False,
+                              draft=None)
+    handle = await srv.serve()
+    srv.refuse_sessions("relay shutting down")
+    raised = []
+    try:
+        # The close lands at different points of setup from dial to dial.
+        for _ in range(10):
+            client = MOQTClient("127.0.0.1", port, path="/", use_quic=False,
+                                verify_tls=False, supported_drafts=draft)
+            try:
+                async with client.connect() as s:
+                    await s.client_session_init(timeout=3)
+            except BaseException as e:
+                raised.append(e)
+    finally:
+        handle.close()
+    assert len(raised) == 10
+    for e in raised:
+        assert isinstance(e, MOQTException), repr(e)
+        assert e.error_code == SessionCloseCode.NO_ERROR, repr(e)
+
+
+async def test_client_setup_cancellation_still_propagates():
+    """A close mid-setup raises as MOQTException; cancelling the caller
+    still cancels it."""
+    session = types.SimpleNamespace(_close_err=None)
+
+    async def closed_mid_setup(timeout, parameters):
+        session._close_err = (SessionCloseCode.NO_ERROR, "refused")
+        raise asyncio.CancelledError()
+    session._client_session_init = closed_mid_setup
+    with pytest.raises(MOQTException):
+        await _MOQTSessionMixin.client_session_init(session)
+
+    async def waits(timeout, parameters):
+        session._close_err = (SessionCloseCode.NO_ERROR, "refused")
+        await asyncio.sleep(10)
+    session._client_session_init = waits
+    task = asyncio.ensure_future(_MOQTSessionMixin.client_session_init(session))
+    await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.parametrize("exc, closed, error", [
+    (WebTransportError("WT session closed"), True, False),
+    (ConnectionError("WT session closed"), False, True),
+    (ValueError("boom"), True, True),
+])
+async def test_control_task_ended_by_close_logs_no_error(exc, closed, error,
+                                                         caplog):
+    caplog.set_level(logging.DEBUG)
+    loop = asyncio.get_running_loop()
+    session = types.SimpleNamespace(_tasks=set(),
+                                    _moqt_session_closed=loop.create_future())
+    if closed:
+        session._moqt_session_closed.set_result((0, "refused"))
+
+    async def fail():
+        raise exc
+    task = loop.create_task(fail())
+    with contextlib.suppress(Exception):
+        await task
+    _MOQTSessionMixin._control_task_done(session, task)
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert bool(errors) == error, caplog.text
+
+
 def _announced_on(server):
     return any(s in server._live for held in relay._announced.values()
                for s in held)
@@ -228,6 +390,9 @@ async def test_pub_media_reconnects_on_goaway(
         monkeypatch, capsys, h264_aac, arrivals, use_quic,  # noqa: F811
         migrate):
     port = _BASE_PORT + 20 + 4 * migrate + 2 * (not use_quic)
+    # The relay's close-out runs to its bound on WT; a redial landing in the
+    # restart gap gives up in time for the next one.
+    monkeypatch.setattr(pub_media, "_DIAL_TIMEOUT_S", 2.0)
     url, next_url = _url(port, use_quic), _url(port + 1, use_quic)
     ns = f"drain/media{int(migrate)}"
     pub_args = _argv(monkeypatch, "pub_media", url, "-k", "--draft", "18",

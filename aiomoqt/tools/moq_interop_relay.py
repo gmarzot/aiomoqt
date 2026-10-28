@@ -60,10 +60,11 @@ serve_dispatch). `--quic-port N` remains as the legacy two-listener
 arrangement (second raw-QUIC listener sharing the global namespace
 table) for runners that expect distinct endpoints.
 
-Stopping: SIGTERM or SIGINT drains. The relay refuses new sessions, sends
-GOAWAY to every session (New Session URI from --goaway-uri, else empty:
-reconnect to this address), waits up to --drain-timeout seconds for them
-to leave, closes the rest with GOAWAY_TIMEOUT and exits. A second signal
+Stopping: SIGTERM or SIGINT drains. The relay refuses new sessions until
+it exits, sends GOAWAY to every session (New Session URI from
+--goaway-uri, else empty: reconnect to this address), waits up to
+--drain-timeout seconds for them to leave, closes the rest with
+GOAWAY_TIMEOUT and exits once the closes have left. A second signal
 exits at once.
 """
 
@@ -4862,16 +4863,18 @@ async def _wait_closed(sessions, timeout: float) -> None:
 
 
 async def _drain(servers, uri: str, timeout: float, why: str) -> None:
-    """GOAWAY to every set-up session, refusing any other, then wait up
-    to `timeout` seconds for them to leave; close the rest with
-    GOAWAY_TIMEOUT."""
+    """GOAWAY to every set-up session, refusing any other from now on,
+    then wait up to `timeout` seconds for them to leave; close the rest
+    with GOAWAY_TIMEOUT."""
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
+    for srv in servers:
+        srv.refuse_sessions("relay shutting down")
 
     def live():
-        return [s for srv in servers for s in list(srv._live)
+        return [(srv, s) for srv in servers for s in list(srv._live)
                 if _session_live(s)]
-    held = {s for s in live() if _setup_done(s)}
+    held = {s for _srv, s in live() if _setup_done(s)}
     logger.info(f"relay: {why}: draining {len(held)} sessions, GOAWAY "
                 f"{'to ' + uri if uri else 'to this address'}, up to "
                 f"{timeout:g}s")
@@ -4883,12 +4886,12 @@ async def _drain(servers, uri: str, timeout: float, why: str) -> None:
             logger.debug("relay: GOAWAY failed", exc_info=True)
     while True:
         left = []
-        for s in live():
+        for srv, s in live():
             if s in held:
                 left.append(s)
             else:
                 try:
-                    s.close(SessionCloseCode.NO_ERROR, "relay shutting down")
+                    srv.refuse(s)
                 except Exception:
                     logger.debug("relay: refusing a session failed",
                                  exc_info=True)
