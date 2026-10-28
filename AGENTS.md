@@ -14,7 +14,7 @@ installed package. Keep its API boundary and traps consistent with this file.
 | `aiomoqt/protocol.py` | session state machine, control + data plane (~300 KB) |
 | `aiomoqt/client.py`, `server.py` | `MOQTClient`; `MOQTServer.serve()` / `serve_dual()` |
 | `aiomoqt/track.py` | `Track`, `PublishedTrack`, `SubscribedTrack`, `VideoTrack` |
-| `aiomoqt/delivery.py` | `StreamMapping`, `ObjectHistory`, `SubgroupDelivery`, `FanoutDelivery` |
+| `aiomoqt/delivery.py` | `StreamMapping`, `ObjectHistory`, `SubgroupDelivery`, `SendLane`, `FanoutDelivery` |
 | `aiomoqt/fanout.py` | `FanoutPublisher`: one MSF broadcast on several relays |
 | `aiomoqt/messages/` | sans-I/O encode/decode; `messages/d18/`, `messages/d20/` for draft-specific shapes (d22 shares d20's) |
 | `aiomoqt/agent/` | declarative, JSON-round-tripping specs and `AgentSession` / `Reader` / `Writer` |

@@ -141,7 +141,7 @@ async def test_reset_on_full_ring_leaves_the_lane_alive(draft):
     lane = fan.lanes[0]
     await fan.write(0, 0, b"a", group_start=True)
     await fan.write(0, 1, b"b")
-    assert await _until(lambda: lane.queue.empty() and delivery._stream_id)
+    assert await _until(lambda: not lane.items and delivery._stream_id)
     first = delivery._stream_id
 
     ring.full = True
@@ -160,21 +160,20 @@ async def test_reset_on_full_ring_leaves_the_lane_alive(draft):
 async def test_lane_truncating_on_full_ring_survives(draft):
     s, ring = _session(draft)
     delivery = SubgroupDelivery(s, track_alias=1)
-    gate = SimpleNamespace(forward=True)
     fan = FanoutDelivery()
-    lane = fan.add(delivery, lambda: gate.forward, joining=False)
+    lane = fan.add(delivery, joining=False)
     await fan.write(0, 0, b"a", group_start=True)
-    assert await _until(lambda: lane.queue.empty() and delivery._stream_id)
+    assert await _until(lambda: not lane.items and delivery._stream_id)
     first = delivery._stream_id
 
     ring.full = True
-    gate.forward = False
+    lane.gate = False
     await fan.write(0, 1, b"b")  # gated: the lane resets the open group
-    assert await _until(lambda: lane.queue.empty())
+    assert await _until(lambda: not lane.items)
     await asyncio.sleep(0.01)
     assert not lane.task.done()
     ring.drain()
-    gate.forward = True
+    lane.gate = True
     await fan.write(1, 0, b"c", group_start=True)
     assert await _until(
         lambda: ('reset', first, int(StreamResetCode.CANCELLED)) in ring.ops)

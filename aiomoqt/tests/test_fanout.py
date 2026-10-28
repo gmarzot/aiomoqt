@@ -10,13 +10,17 @@ import pytest
 
 from aiomoqt import delivery as delivery_mod
 from aiomoqt.context import profile_for
-from aiomoqt.delivery import FanoutDelivery, StreamMapping, SubgroupDelivery
+from aiomoqt.delivery import (FanoutDelivery, OBJECT_RECORD_BYTES,
+                              StreamMapping, SubgroupDelivery)
 from aiomoqt.fanout import FanoutPublisher
 from aiomoqt.media import Catalog, CatalogTrack, LocTrackPublisher
 from aiomoqt.media.loc import LOC02_PROP_TIMESTAMP, LOC_PROP_TIMESTAMP
 from aiomoqt.track import PublishedTrack, TrackState
+from aiomoqt.types import ParamType
 
 _NS = "fan/test"
+# A lane bound of two queued objects.
+_TWO = 2 * (OBJECT_RECORD_BYTES + 4)
 
 
 class _Session:
@@ -130,7 +134,7 @@ async def test_every_lane_gets_the_same_ids():
 async def test_a_blocked_lane_sheds_to_the_next_group():
     fast, slow = _Session("fast"), _Session("slow", block=True)
     dfast, dslow = _delivery(fast), _delivery(slow)
-    fan = FanoutDelivery(queue_size=2)
+    fan = FanoutDelivery(max_bytes=_TWO)
     fan.add(dfast, joining=False)
     lane = fan.add(dslow, joining=False)
 
@@ -161,7 +165,7 @@ async def _overrun_at_a_group_boundary(boundary):
     """A blocked lane's queue overflows on the item that ends group 0
     (`boundary` writes it); returns both sessions once drained."""
     fast, slow = _Session("fast"), _Session("slow", block=True)
-    fan = FanoutDelivery(queue_size=2)
+    fan = FanoutDelivery(max_bytes=_TWO)
     fan.add(_delivery(fast), joining=False)
     lane = fan.add(_delivery(slow), joining=False)
     await fan.write(0, 0, b"key", group_start=True)
@@ -186,15 +190,16 @@ async def test_overflow_at_a_group_boundary_resets_the_group(boundary):
 
     async def _end_group(fan):
         fan.end_group()
+        await fan.write(1, 0, b"key", group_start=True)
 
     fast, slow = await _overrun_at_a_group_boundary(
         {"next_group": _next_group, "end_group": _end_group}[boundary])
     # Group 0 lost objects 1 and 2 on the slow peer: reset, no
-    # END_OF_GROUP and no FIN.
+    # END_OF_GROUP and no FIN; the reset lands on the parked header.
     first = slow.opened[0]
     assert slow.resets == [first]
     assert not slow.fins(first)
-    assert len([w for w in slow.writes if w[0] == first]) == 2  # header, object 0
+    assert len([w for w in slow.writes if w[0] == first]) == 1  # header
     assert fast.resets == [] and fast.fins(fast.opened[0])
 
 
@@ -202,20 +207,19 @@ async def test_overflow_at_a_group_boundary_resets_the_group(boundary):
 async def test_a_paused_peer_is_gated_and_rejoins_at_a_group():
     a, b = _Session("a"), _Session("b")
     da, db = _delivery(a), _delivery(b)
-    paused = SimpleNamespace(forward=True)
     fan = FanoutDelivery()
     fan.add(da, joining=False)
-    fan.add(db, lambda: paused.forward, joining=False)
+    paused = fan.add(db, joining=False)
 
     await fan.write(0, 0, b"key", group_start=True)
     await _settle()
-    paused.forward = False
+    paused.gate = False
     await fan.write(0, 1, b"pred")
     await fan.write(1, 0, b"key", group_start=True)
     await _settle()
     assert db.objects_sent == 1              # nothing while paused
 
-    paused.forward = True
+    paused.gate = True
     await fan.write(1, 1, b"pred")           # mid-group: still skipped
     await fan.write(2, 0, b"key", group_start=True)
     await _settle()
@@ -233,11 +237,11 @@ async def test_on_sent_reports_only_written_objects():
     sessions = {n: _Session(n, block=n == "slow") for n in names}
     deliveries = {n: _delivery(s) for n, s in sessions.items()}
     deliveries["filtered"].passes = lambda g, o: o != 1
-    fan = FanoutDelivery(queue_size=2)
+    fan = FanoutDelivery(max_bytes=_TWO)
     sent = []
     fan.on_sent = lambda g, o: sent.append((g, o))
     fan.add(deliveries["all"], joining=False)
-    fan.add(deliveries["paused"], lambda: False, joining=False)
+    fan.add(deliveries["paused"], gate=False, joining=False)
     fan.add(deliveries["filtered"], joining=False)
     slow = fan.add(deliveries["slow"], joining=False)
 
@@ -252,10 +256,10 @@ async def test_on_sent_reports_only_written_objects():
 
     assert slow.shed > 0
     assert deliveries["paused"].objects_sent == 0
+    # The slow peer's one object was reset with its parked header.
     assert sorted(sent) == sorted(
         [(0, o) for o in range(6)]              # all
-        + [(0, o) for o in (0, 2, 3, 4, 5)]     # filtered
-        + [(0, 0)])                             # slow, before it shed
+        + [(0, o) for o in (0, 2, 3, 4, 5)])    # filtered
     assert len(sent) == sum(d.objects_sent for d in deliveries.values())
 
 
@@ -351,6 +355,43 @@ async def test_a_lane_survives_a_failed_write(caplog):
     await fan.close()
 
 
+
+class _Backlogged(_Session):
+    """Reports the bytes the transport still holds per stream."""
+
+    def __init__(self, name="s"):
+        super().__init__(name)
+        self.held = {}
+        self._quic = SimpleNamespace(
+            tx_data_ring_used=lambda sid: self.held.get(sid, 0))
+
+
+@pytest.mark.asyncio
+async def test_a_lane_counts_what_the_transport_still_holds():
+    s = _Backlogged()
+    d = _delivery(s)
+    fan = FanoutDelivery(max_bytes=10_000)
+    lane = fan.add(d, joining=False)
+    await fan.write(0, 0, b"key", group_start=True)
+    await fan.write(0, 1, b"pred")
+    fan.end_group()
+    await _settle()
+    first = s.opened[0]
+    assert s.fins(first)
+    s.held[first] = 20_000              # FINed, not yet sent out
+    await fan.write(1, 0, b"key", group_start=True)
+    await fan.write(1, 1, b"pred")
+    await _settle()
+    # Over the bound on the backlog alone: the group below the floor is
+    # reset, nothing queued is dropped, and group 1 goes out.
+    assert lane.sheds == 1 and lane.shed == 0 and lane.floor == 1
+    assert s.resets == [first]
+    assert d.largest == (1, 1)
+    s.held.clear()
+    assert d.tx_queued() == 0 and not d._tx_streams
+    await fan.close()
+
+
 # -- the track layer -------------------------------------------------
 
 @pytest.mark.asyncio
@@ -437,6 +478,28 @@ async def test_any_produce_track_fans_out_without_knowing():
     await asyncio.gather(track.generate(a, 1), track.generate(b, 2))
     assert len(a.opened) == 3 and len(b.opened) == 3
     assert track._production.done()
+
+
+@pytest.mark.asyncio
+async def test_forward_state_and_timeouts_reach_the_lane():
+    a = _Session("a")
+    track = _Counter(a, 0)
+    sub = track.subscriptions[0]
+    sub.generating = True
+    track._add_delivery(sub)
+    lane = sub.delivery.lane
+    assert lane.gate and lane.deadline is None
+    sub.forward = False
+    assert not lane.gate
+    sub.forward = True
+    assert lane.gate
+    track._generating = False
+    assert not lane.gate
+    track.object_delivery_timeout = 250
+    assert lane.deadline == 0.25
+    track._take_timeouts(sub, {ParamType.DELIVERY_TIMEOUT: 100}, a._profile)
+    assert lane.deadline == 0.1
+    await track._out.close()
 
 
 @pytest.mark.asyncio

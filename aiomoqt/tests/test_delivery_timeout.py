@@ -9,7 +9,8 @@ import pytest
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.context import profile_for
-from aiomoqt.delivery import FanoutDelivery, StreamMapping, SubgroupDelivery
+from aiomoqt.delivery import (FanoutDelivery, OBJECT_RECORD_BYTES,
+                              StreamMapping, SubgroupDelivery)
 from aiomoqt.server import MOQTServer
 from aiomoqt.track import PublishedTrack, _Subscription, _min_nonzero
 from aiomoqt.types import MOQTMessageType, StreamResetCode
@@ -86,11 +87,11 @@ async def _run_lane(mapping, items, timeout):
     session = _FakeSession()
     delivery = SubgroupDelivery(session, 1, mapping=mapping)
     out = FanoutDelivery()
-    lane = out.add(delivery, joining=False, deadline=lambda: timeout)
+    lane = out.add(delivery, joining=False, deadline=timeout)
     for group_id, object_id, age in items:
-        lane.queue.put_nowait((group_id, object_id, b"p", None,
-                               object_id == 0, time.monotonic() - age,
-                               None))
+        lane.offer((group_id, OBJECT_RECORD_BYTES + 1, True,
+                    time.monotonic() - age, object_id, b"p", None,
+                    object_id == 0, None))
     await out.close()
     return session, delivery, lane
 
