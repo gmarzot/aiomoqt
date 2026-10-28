@@ -2,6 +2,7 @@
 
 ## v0.14.0
 
+- aiomoqt-relay refuses new QUIC and WebTransport connections at the transport from the first SIGTERM/SIGINT (aiopquic `set_max_connections`); existing sessions still get GOAWAY and the drain.
 - pub_media gives each dial attempt 4 s (was 10 s), so a handshake lost in a relay restart costs a short retry.
 - aiomoqt-relay status: `tx_worker_idle_now` and `tx_event_ring_pops` from the transport.
 - A drained stream write that fails inside the transport ends that stream (or its producer, if the session is closing) instead of returning as if it succeeded; unexpected failures log a WARNING.

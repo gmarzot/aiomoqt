@@ -267,10 +267,70 @@ async def test_relay_process_refuses_newcomers_until_exit(
     assert elapsed < 0.5, (elapsed, out)
     assert rc == 0, out
     after = out[out.index("relay: SIGTERM: draining"):]
-    assert "relay shutting down" in after, out
+    assert "relay: refusing new connections" in out, out
     assert "setup complete" not in after, out
     assert "stream data after close" not in out, out
     assert " ERROR " not in out, out
+    assert "Traceback" not in out, out
+
+
+async def _dial_transport(port, use_quic, draft):
+    """Dial: (seconds to the failure, exception), the exception None if the
+    connection came up."""
+    loop = asyncio.get_running_loop()
+    client = MOQTClient("127.0.0.1", port, path="/", use_quic=use_quic,
+                        verify_tls=False, supported_drafts=draft)
+    t0 = loop.time()
+    try:
+        async with client.connect():
+            return loop.time() - t0, None
+    except BaseException as e:
+        return loop.time() - t0, e
+
+
+@pytest.mark.parametrize("draft", [16, 22])
+@pytest.mark.parametrize("transport", ["quic", "wt"])
+async def test_relay_process_refuses_connections_while_draining(
+        tmp_path, transport, draft, relay_tables):
+    port = free_udp_port()
+    use_quic = transport == "quic"
+    log = tmp_path / "relay.log"
+    proc = spawn("moq_interop_relay", "--bind", "127.0.0.1", "--port", port,
+                 "--dual", "--cert", CERT, "--key", KEY,
+                 "--drain-timeout", 2, log=log)
+    loop = asyncio.get_running_loop()
+    try:
+        wait_for(log, "Listening on", proc)
+        async with contextlib.AsyncExitStack() as stack:
+            # Ignoring GOAWAY keeps the drain window open.
+            holder = await _connect(stack, port, use_quic, draft)
+            seen = []
+            holder.on_goaway = lambda msg, rid: seen.append(msg)
+            t0 = loop.time()
+            proc.send_signal(signal.SIGTERM)
+            await _until(lambda: seen, 5)
+            elapsed, exc = await _dial_transport(port, use_quic, draft)
+            draining = loop.time() - t0 < 2.0 and proc.poll() is None
+            rc = await asyncio.to_thread(proc.wait, 10)
+            await asyncio.wait_for(holder.async_closed(), 2)
+    finally:
+        stop(proc)
+    out = log.read_text(errors="replace")
+    assert draining, out
+    if use_quic:
+        assert isinstance(exc, ConnectionError), repr(exc)
+        assert "during handshake" in str(exc), repr(exc)
+    else:
+        assert isinstance(exc, WebTransportError), repr(exc)
+        assert "before READY" in str(exc), repr(exc)
+    assert elapsed < 0.5, (elapsed, out)
+    assert len(seen) == 1, out
+    assert holder._close_err[0] == SessionCloseCode.GOAWAY_TIMEOUT, \
+        holder._close_err
+    assert rc == 0, out
+    assert out.index("relay: refusing new connections") < out.index(
+        "relay: SIGTERM: draining 1 sessions"), out
+    assert "relay: drain timed out, 1 sessions left" in out
     assert "Traceback" not in out, out
 
 
