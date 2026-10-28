@@ -78,7 +78,8 @@ async def _relay(port, use_quic, draft):
             for name in _NAMES:
                 track = _EndingTrack(pub, namespace=_NS, trackname=name,
                                           object_size=16,
-                                          group_size=_OBJECTS)
+                                          group_size=_OBJECTS,
+                                          fetch_history_bytes=1 << 20)
                 track.prefill(1)
                 track.attach()
             await pub.publish_namespace(namespace=_NS, wait_response=True)
