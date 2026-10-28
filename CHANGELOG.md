@@ -17,6 +17,7 @@
 - A cancelled subscription, from either side, releases its receive state after the PUBLISH_DONE grace, including timing watches, stream-end handlers and default priority.
 - Track discovery accepts only a PUBLISH inside the requested namespace.
 - `SubscribedTrack.unsubscribe()` cancels the subscription and ends `wait_closed()`, with `cancelled` set and `completed` False.
+- `SubscribedTrack` records a PUBLISH_DONE that arrives right behind its SUBSCRIBE_OK; `wait_closed()` returned only at session end.
 - adaptive_bench bw mode controls on the subscriber's own windowed p90 (it was a percentile of interval means), and an empty window reads n/a, not 0 ms; CSV latency columns are `win_*` (bw) or `worst_*` (subs).
 - adaptive_bench subs mode counts a subscriber only while it receives at least half its rate, and checks the delivering total against `--shortfall-ratio`; the high-water mark counts those subscribers.
 - adaptive_bench exits nonzero when it received no data or its publisher never published, and 130 when interrupted.

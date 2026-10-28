@@ -2183,7 +2183,12 @@ class SubscribedTrack(Track):
                 on_object=self.on_object,
                 location_filter=location_filter,
                 on_reply=self.take_track_properties,
+                # Registered before SUBSCRIBE goes out: a PUBLISH_DONE
+                # can be parsed before this await resumes.
+                on_done=self._publish_done_handler(),
             )
+            if getattr(ok, 'request_id', None) is not None:
+                self.request_id = ok.request_id
             self.largest = _reported_largest(ok)
             # Publisher's SUBSCRIBE_OK alias is authoritative (the
             # discovery path gets it from PUBLISH instead).
@@ -2192,7 +2197,6 @@ class SubscribedTrack(Track):
                 if self.on_object:
                     self.session.register_object_handler(
                         self.track_alias, self._handler())
-            self._watch_done(getattr(ok, 'request_id', None))
             self.state = TrackState.SUBSCRIBED
             self._check_track_timing()
             logger.info(f"Track: subscribed (direct) to {self.fqtn}")
@@ -2352,21 +2356,23 @@ class SubscribedTrack(Track):
         if self.timestamp_errors == 'cancel':
             self._cancel_malformed(self.timing_error)
 
-    def _watch_done(self, request_id) -> None:
-        """Record this subscription's PUBLISH_DONE (§10.11) and release
-        wait_closed(); the session stays up for other work."""
-        if request_id is None:
-            return
-        self.request_id = request_id
-
+    def _publish_done_handler(self) -> Callable:
+        """Handler that records this subscription's PUBLISH_DONE (§10.11)
+        and releases wait_closed(); the session stays up for other work."""
         def _done(msg):
             self.session._timing_watch.pop(self.track_alias, None)
             self.publish_done = msg
             self._done_event.set()
             if self.on_done is not None:
                 self.on_done(msg)
+        return _done
 
-        self.session.register_publish_done_handler(request_id, _done)
+    def _watch_done(self, request_id) -> None:
+        if request_id is None:
+            return
+        self.request_id = request_id
+        self.session.register_publish_done_handler(
+            request_id, self._publish_done_handler())
 
     def unsubscribe(self) -> None:
         """Cancel the subscription and end the track: wait_closed()
