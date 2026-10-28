@@ -3531,14 +3531,17 @@ class _MOQTSessionMixin:
         try:
             await quic.send_stream_data_drained(
                 stream_id, data, end_stream=end_stream)
-        except (AssertionError, AttributeError) as e:
-            transport_log.debug(f"stream({stream_id}): write race: {e}")
-        except ConnectionError as e:
-            # Torn down under the write: never return silently. A stream
-            # gone on a live session ends that stream only.
-            transport_log.debug(f"stream({stream_id}): write after teardown: {e}")
-            if (self._session_writable()
-                    and not getattr(self._quic, 'closed', False)):
+        except (AssertionError, AttributeError, ConnectionError) as e:
+            # Never return silently: a stream gone on a live session ends
+            # that stream only; anything but ConnectionError there is
+            # unexpected.
+            live = (self._session_writable()
+                    and not getattr(self._quic, 'closed', False))
+            log = (transport_log.warning
+                   if live and not isinstance(e, ConnectionError)
+                   else transport_log.debug)
+            log(f"stream({stream_id}): write failed: {e!r}")
+            if live:
                 raise MOQTStreamStopped() from e
             raise asyncio.CancelledError() from e
 
