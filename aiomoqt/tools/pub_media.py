@@ -95,7 +95,7 @@ EXIT_UNAVAILABLE = 69
 EXIT_SOFTWARE = 70
 
 # A relay that has not answered by then is down.
-_DIAL_TIMEOUT_S = 10.0
+_DIAL_TIMEOUT_S = 4.0
 # --reconnect: redial 1, 2, 4 ... s apart, at most this.
 _RECONNECT_MAX_S = 30.0
 # Signal shutdown: the most spent waiting for PUBLISH_DONEs to go out.
