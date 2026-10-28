@@ -2877,7 +2877,7 @@ async def _serve_fill(track, d, request_id, fill, rng,
                 start_object=start[1], end_group=end[0],
                 end_object=0 if end[1] == U64_MAX else end[1] + 1)
             _, up, _ = await _fetch_upstream(ns, name, rng_msg, timeout=wait)
-            if up:
+            if up is not None:
                 objs, source = [(o.group_id, o.subgroup_id, o.object_id,
                                  o.payload, o.extensions,
                                  o.publisher_priority, o.status)
@@ -3734,12 +3734,6 @@ async def _on_fetch(session, msg):
                 error_code=RequestErrorCode.DOES_NOT_EXIST,
                 reason="track does not exist")
             return
-        elif not upstream:
-            session.fetch_error(
-                request_id=msg.request_id,
-                error_code=RequestErrorCode.INVALID_RANGE,
-                reason="requested range unavailable")
-            return
         else:
             objs = [(o.group_id, o.subgroup_id, o.object_id, o.payload,
                      o.extensions, o.publisher_priority, o.status)
@@ -3754,19 +3748,27 @@ async def _on_fetch(session, msg):
             if o[2] == 0:
                 _note_catalog(ns, o[3])
     order = msg.group_order or GroupOrder.ASCENDING
-    last_g, last_o = objs[-1][0], objs[-1][2]
     # FETCH_OK End Location (d22 §9.12): the requested End, at most
     # Largest; a whole End Group ends at its last Object. From upstream,
-    # the last Object served, with the publisher's End Of Track.
-    end_loc = (last_g, last_o)
-    if source == "cache" and end is not None:
-        end_loc = (end if end[1] != U64_MAX
-                   else track.group_end(end[0], start))
+    # the last Object served, with the publisher's End Of Track; with
+    # none served, the publisher's End.
     # fetch_ok() takes End as the last Object plus one at every draft.
+    last = (objs[-1][0], objs[-1][2]) if objs else None
+    if objs:
+        end_loc = last
+        if source == "cache" and end is not None:
+            end_loc = (end if end[1] != U64_MAX
+                       else track.group_end(end[0], start))
+        end_next = (end_loc[0], end_loc[1] + 1)
+    else:
+        end_next = (up_ok.largest_group_id, up_ok.largest_object_id)
+        if not end_next[1] and session._profile.fetch_location_filter:
+            # A d20+ End is inclusive: no whole-group form.
+            end_next = (end_next[0], 1)
     session.fetch_ok(request_id=msg.request_id,
                      end_of_track=end_of_track,
-                     largest_group_id=end_loc[0],
-                     largest_object_id=end_loc[1] + 1,
+                     largest_group_id=end_next[0],
+                     largest_object_id=end_next[1],
                      group_order=int(order), track_extensions=props)
     # Range Filters drop objects, never the FETCH_OK End (§3.2.2).
     objs = _filtered(objs, RangeFilters.from_params(msg.parameters))
@@ -3777,7 +3779,7 @@ async def _on_fetch(session, msg):
         group_order=int(order),
         stream_priority=_stream_band(session, objs[0][5] if objs else None))
     logger.info(f"relay: FETCH ns={ns} track={track_name} served "
-                f"{len(objs)} object(s) {start}..({last_g}.{last_o})")
+                f"{len(objs)} object(s) {start}..{last} from {source}")
 
 
 async def _on_subscribe_namespace(session, msg):

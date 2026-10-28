@@ -1,7 +1,8 @@
 """A joiner after any pause gets live media or nothing, never stale: a
 track paused since its PUBLISH is resumed against the publisher's live
-Largest. Two LOC tracks on one publisher session, over raw QUIC and
-WebTransport."""
+Largest; an upstream FETCH that succeeds with no objects reaches the
+subscriber as an empty FETCH, not an error. Two LOC tracks on one
+publisher session, over raw QUIC and WebTransport."""
 import asyncio
 import contextlib
 
@@ -199,3 +200,49 @@ async def test_a_track_paused_since_publish_joins_at_live(draft, use_quic):
                      for rid, locs in fetched.items()}
             assert not any(stale.values()), (published, stale)
             assert rx2._close_err is None
+
+
+def _idle(history):
+    """make(): a track with Largest (9, 4) and no source, holding groups
+    0..2 when `history`, else no FETCH history."""
+    def make(pub, name, gop):
+        track = LocTrackPublisher(pub, _NS, name,
+                                  fetch_history_bytes=_HISTORY if history
+                                  else 0,
+                                  media_kind="audio" if gop == 1 else "video")
+        if history:
+            track.prefill(3)
+        track._note_largest(9, 4)
+        return track, None
+    return make
+
+
+@requires_certs
+@pytest.mark.asyncio
+@pytest.mark.parametrize("draft", [18, 22])
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+@pytest.mark.parametrize("upstream", ["empty", "refused"])
+async def test_an_empty_upstream_fetch_is_passed_through(upstream, draft,
+                                                         use_quic):
+    """The publisher's FETCH for the current group succeeds with no
+    objects: the joining FETCH gets FETCH_OK and an empty stream, the
+    fill a clean empty stream. A publisher refusing it still fails them."""
+    port = (_PORT + 20 + 8 * (upstream == "refused")
+            + 2 * [18, 22].index(draft) + (not use_quic))
+    async with _relay(port, use_quic, draft,
+                      _idle(upstream == "empty")) as (connect, _):
+        rx = await connect()
+        _, fetched = _collect(rx)
+        for name in _GOP:
+            ok, rid, reply = await _join(rx, name, draft)
+            assert _reply_largest(ok) == (9, 4), (name, ok)
+            if draft < 20:
+                if upstream == "refused":
+                    assert isinstance(reply, MOQTRequestError), reply
+                    continue
+                assert not isinstance(reply, Exception), (name, reply)
+                assert reply.largest_group_id == 9, reply
+            done = await rx.await_fetch_done(rid, timeout=3.0)
+            assert done is (upstream == "empty"), (name, done)
+            assert not fetched.get(rid), (name, fetched.get(rid))
+        assert rx._close_err is None
