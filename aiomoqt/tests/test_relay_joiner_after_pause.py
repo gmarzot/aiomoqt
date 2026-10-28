@@ -1,10 +1,12 @@
 """A joiner after any pause gets live media or nothing, never stale: a
 track paused since its PUBLISH is resumed against the publisher's live
 Largest; an upstream FETCH that succeeds with no objects reaches the
-subscriber as an empty FETCH, not an error. Two LOC tracks on one
-publisher session, over raw QUIC and WebTransport."""
+subscriber as an empty FETCH, not an error; a range in a pause's gap goes
+upstream instead of being answered short from the cache. Two LOC tracks
+on one publisher session, over raw QUIC and WebTransport."""
 import asyncio
 import contextlib
+import logging
 
 import pytest
 
@@ -65,6 +67,15 @@ def _reply_largest(ok):
 def _track_of(msg):
     payload = bytes(msg.payload or b"")
     return next((n for n in _GOP if n.encode() in payload), None)
+
+
+class _Warm(LocTrackPublisher):
+    """Keeps numbering and keeping objects while paused, as a warm start
+    does; only the relay's Forward State gates sending."""
+
+    @property
+    def producing(self):
+        return True
 
 
 @contextlib.asynccontextmanager
@@ -246,3 +257,74 @@ async def test_an_empty_upstream_fetch_is_passed_through(upstream, draft,
             assert done is (upstream == "empty"), (name, done)
             assert not fetched.get(rid), (name, fetched.get(rid))
         assert rx._close_err is None
+
+
+@requires_certs
+@pytest.mark.asyncio
+@pytest.mark.parametrize("draft", [18, 22])
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+async def test_a_range_in_the_pause_gap_is_fetched_upstream(
+        draft, use_quic, caplog):
+    """After a --pause-after pause and resume, a joining FETCH or fill for
+    the current group, and one reaching back into the gap, are answered
+    from the publisher, which kept what it published while paused."""
+    port = _PORT + 40 + 2 * [18, 22].index(draft) + (not use_quic)
+
+    def make(pub, name, gop):
+        track = _Warm(pub, _NS, name, fetch_history_bytes=_HISTORY,
+                      media_kind="audio" if gop == 1 else "video")
+        return track, _source(track, gop)
+
+    caplog.set_level(logging.INFO, logger=relay.logger.name)
+    async with _relay(port, use_quic, draft, make,
+                      pause_after=0.3) as (connect, _):
+        rx = await connect()
+        live, _ = _collect(rx)
+        oks = [await rx.subscribe(_NS, name, forward=1, wait_response=True)
+               for name in _GOP]
+        assert await _until(lambda: all(live.values())), live
+        for ok in oks:
+            rx.unsubscribe(ok.request_id)
+        relayed = {name: relay._tracks[_key(name)] for name in _GOP}
+        assert await _until(lambda: all(t.lowered
+                                        for t in relayed.values()))
+        paused_at = {name: t.largest for name, t in relayed.items()}
+        await asyncio.sleep(0.5)
+
+        # The resuming joiner: the current group was published while
+        # paused.
+        rx2 = await connect()
+        live2, fetched2 = _collect(rx2)
+        current, gapped = {}, 0
+        for name in _GOP:
+            caplog.clear()
+            ok, rid, _ = await _join(rx2, name, draft)
+            largest = _reply_largest(ok)
+            assert largest > paused_at[name], (name, largest)
+            current[name] = largest[0]
+            assert await rx2.await_fetch_done(rid, timeout=3.0), name
+            want = [(largest[0], o) for o in range(largest[1] + 1)]
+            assert fetched2.get(rid) == want, (name, fetched2.get(rid))
+            if relayed[name].crosses_gap((largest[0], 0), largest):
+                gapped += 1
+                assert "upstream FETCH" in caplog.text, name
+        assert gapped, "no joining range fell in a pause gap"
+        assert await _until(lambda: all(live2.values())), live2
+        await asyncio.sleep(0.3)
+
+        # A later joiner reaching back from live groups into the gap.
+        rx3 = await connect()
+        _, fetched3 = _collect(rx3)
+        for name, gop in _GOP.items():
+            ok, rid, _ = await _join(rx3, name, draft,
+                                     joining_start=current[name],
+                                     absolute=True)
+            assert await rx3.await_fetch_done(rid, timeout=3.0), name
+            got = fetched3.get(rid, [])
+            last = _reply_largest(ok)[0]
+            assert last > current[name] + 1, (name, current[name], last)
+            want = [(g, o) for g in range(current[name], last)
+                    for o in range(gop)]
+            assert got[:len(want)] == want, (name, want, got)
+        for s in (rx, rx2, rx3):
+            assert s._close_err is None

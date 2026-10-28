@@ -894,6 +894,9 @@ class _RelayedTrack:
         # Largest group before the last resume: cached groups up to it
         # are stale for subscribers joining since.
         self.fence = None
+        # Each pause's gap in the cache, [first Location missing, first
+        # received after the resume or None while paused].
+        self._gaps = []
         # The PUBLISH feeding this track, once answered.
         self.publish_msg = None
         # Loop time since which no subscriber has forwarded, else None.
@@ -1259,6 +1262,8 @@ class _RelayedTrack:
             self._last_gid = gid
         if msg.object_id == 0:
             self._heads.add(gid)
+        if self._gaps and self._gaps[-1][1] is None and not self.paused:
+            self._gaps[-1][1] = (gid, msg.object_id)
         if self._resync:
             # Objects before this one went unsent while paused.
             self._resync = False
@@ -1495,6 +1500,9 @@ class _RelayedTrack:
         floor = (self._cache[0][0] if self._cache
                  else self.largest[0] if self.largest else 0)
         self._lost = {g: o for g, o in self._lost.items() if g >= floor}
+        oldest = (self._cache[0][0], self._cache[0][2]) if self._cache else None
+        self._gaps = [g for g in self._gaps if g[1] is None
+                      or (oldest is not None and g[1] > oldest)]
         if not self._cache:
             _budget.forget(self)
         else:
@@ -1539,6 +1547,19 @@ class _RelayedTrack:
             return False
         first = (self._cache[0][0], self._cache[0][2])
         return start >= first
+
+    def open_gap(self) -> None:
+        """Note a pause: what is published from just past Largest until
+        objects flow again never reaches the cache."""
+        if self.largest is not None and not (self._gaps
+                                             and self._gaps[-1][1] is None):
+            self._gaps.append([(self.largest[0], self.largest[1] + 1), None])
+
+    def crosses_gap(self, start, end) -> bool:
+        """True when [start, end] (None: to the live edge) overlaps a
+        pause's gap, which the cache does not cover."""
+        return any((end is None or g[0] <= end)
+                   and (g[1] is None or start < g[1]) for g in self._gaps)
 
     def group_end(self, group_id, start):
         """The last cached Location of a group, which is its END_OF_GROUP
@@ -2713,6 +2734,8 @@ async def _sweep_unwatched() -> None:
                 track.unwatched_since = now
             elif now - track.unwatched_since >= _pause_after:
                 _pause_upstream(track)
+                if track.lowered:
+                    track.open_gap()
 
 
 def _ensure_pause_sweep() -> None:
@@ -2866,8 +2889,9 @@ async def _serve_fill(track, d, request_id, fill, rng,
     order = int(fill.get(ParamType.GROUP_ORDER) or d.group_order
                 or GroupOrder.ASCENDING)
     objs, source, serving = None, "cache", False
+    gapped = track.crosses_gap(start, end)
     try:
-        if track.cache_covers(start):
+        if track.cache_covers(start) and not gapped:
             objs = track.cached_range(start, end)
         elif timeout_ms != 0 and _fetch_sources(ns, name):
             wait = FILL_UPSTREAM_S if timeout_ms is None else min(
@@ -2882,9 +2906,9 @@ async def _serve_fill(track, d, request_id, fill, rng,
                                  o.payload, o.extensions,
                                  o.publisher_priority, o.status)
                                 for o in up], "upstream"
-        if objs is None and track.cache_covers(start):
-            # Cached while upstream was asked.
-            objs = track.cached_range(start, end)
+        if track.cache_covers(start) and (objs is None or gapped):
+            # Cached while upstream was asked, or around the gap.
+            objs = _merged(objs, track.cached_range(start, end))
         gap = None
         if objs is None and timeout_ms is not None:
             objs = track.cached_range(start, end)
@@ -2916,6 +2940,16 @@ async def _serve_fill(track, d, request_id, fill, rng,
                      exc_info=True)
         if not serving:
             await _fail_fill(session, request_id)
+
+
+def _merged(objs, cached):
+    """Fetch tuples from `objs` (None: none) and `cached`, one per
+    Location, in Location order."""
+    if not objs:
+        return cached
+    held = {(o[0], o[2]) for o in objs}
+    return sorted([*objs, *(c for c in cached if (c[0], c[2]) not in held)],
+                  key=lambda o: (o[0], o[2]))
 
 
 def _filtered(objs, filters):
@@ -3700,8 +3734,9 @@ async def _on_fetch(session, msg):
                     f"{anchor[0]} (anchor {anchor})")
     track = _tracks.get((ns, track_name))
     start, end = _fetch_range(msg, None if track is None else track.largest)
-    have_cache = (track is not None and _track_live(track)
-                  and track.cache_covers(start))
+    live = track is not None and _track_live(track)
+    gapped = live and track.crosses_gap(start, end)
+    have_cache = live and track.cache_covers(start) and not gapped
     objs = track.cached_range(start, end) if have_cache else []
     source = "cache"
     props = track.properties if track is not None else {}
@@ -3738,6 +3773,8 @@ async def _on_fetch(session, msg):
             objs = [(o.group_id, o.subgroup_id, o.object_id, o.payload,
                      o.extensions, o.publisher_priority, o.status)
                     for o in upstream]
+            if gapped and track.cache_covers(start):
+                objs = _merged(objs, track.cached_range(start, end))
             end_of_track = int(getattr(up_ok, 'end_of_track', 0) or 0)
             props = dict(getattr(up_ok, "track_extensions", None) or {})
             source = "upstream"
