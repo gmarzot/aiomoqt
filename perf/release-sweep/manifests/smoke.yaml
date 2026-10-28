@@ -1,0 +1,58 @@
+# Phase 1a topology smoke — four 30 s points, no tuning, reps=1.
+#
+#   sweep.py --manifest manifests/smoke.yaml --out perf/release-sweep/runs
+#
+# Purpose: prove the orchestration path end to end (hostcheck -> run -> parse ->
+# result.json -> clean kill) on both transports, without and with the relay.
+# These ids are deliberately *not* part of the 24-point baseline matrix.
+
+arm: base-070rc2
+cc: bbr1
+gso: true
+
+hosts:
+  shenzhen:
+    local: true
+    root: /home/gmarzot/Projects/marzresearch/perf-sweep
+    python: arms/{arm}/venv/bin/python
+  seawolf:
+    ssh: seawolf
+    root: /home/gmarzot/perf-sweep
+    python: venv/bin/python
+
+relay:
+  binary: /home/gmarzot/Projects/marzresearch/moqx/build/moqx
+  config: perf/release-sweep/moqx-perf.yaml
+  addr: 10.14.25.173
+  port: 9768
+  wt_path: /moq-relay
+  pub_port: 4434
+
+defaults:
+  draft: 16
+  duration_s: 30
+  interval_s: 5
+  warmup_s: 2
+  sub_delay_s: 2.0
+  reps: 1
+  subs: 1
+  config: {P: 4, s: 4096, g: 200, r: 0}
+  pin: {relay: "0-1", pub: "2-5", sub: "0-3"}
+
+points:
+  - id: D-raw
+    topology: D
+    transport: raw
+    purpose: pub_server shenzhen -> sub_bench seawolf, raw MoQT
+  - id: D-WT
+    topology: D
+    transport: wt
+    purpose: pub_server shenzhen -> sub_bench seawolf, WebTransport
+  - id: R-raw
+    topology: R
+    transport: raw
+    purpose: moqx perf relay :9768, publisher co-located, subscriber on seawolf
+  - id: R-WT
+    topology: R
+    transport: wt
+    purpose: same via WebTransport endpoint /moq-relay

@@ -1,0 +1,42 @@
+# Pinned relay config for the release sweep — a *second* moqx instance.
+#
+# This is deliberately NOT the shared relay on :9668.  The sweep owns udp/9768
+# (MoQT + WebTransport) and the loopback admin listener on :9769 so that a
+# measurement run can never disturb, restart or reconfigure the shared relay.
+#
+#   /home/gmarzot/Projects/marzresearch/moqx/build/moqx serve \
+#       --config perf/release-sweep/moqx-perf.yaml
+#
+# Draft 16 only: PROGRAM §7 pins the relay points to moqx's validated set.
+
+listeners:
+  - name: perf
+    udp:
+      socket:
+        address: "::"
+        port: 9768
+    tls:
+      insecure: true            # bench traffic only, never client-facing
+    endpoint: "/moq-relay"
+    moqt_versions: [16]
+    quic:
+      max_data: 33554432
+
+service_defaults:
+  cache:
+    enabled: true
+    max_tracks: 100
+    max_groups_per_track: 3
+
+services:
+  perf-bench:
+    match:
+      - authority: {any: true}
+        path: {prefix: "/"}
+
+admin:
+  port: 9769
+  address: "::1"
+  plaintext: true
+
+relay_id: "moqx-perf-sweep"

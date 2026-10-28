@@ -30,3 +30,7 @@ wheels/
 media-out/
 *.log
 qlog/
+
+# perf sweep artifacts
+perf/release-sweep/runs/
+perf/release-sweep/certs/

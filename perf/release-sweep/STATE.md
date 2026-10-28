@@ -181,3 +181,43 @@ arms/base-070rc2/venv/bin/python -P -m aiomoqt.tools.loopback_bench -Q \
 
 Builds refuse to overwrite an arm that already has `arm.json`; delete
 `arms/<NAME>/` deliberately if a rebuild is intended.
+
+## Phase 1a progress — harness built, smoke BLOCKED on host reachability
+
+Delivered in `perf/release-sweep/`:
+- `scripts/hostcheck.py` (stdlib-only; `--record`, `--require`, `serve-time`; qdisc,
+  txqueuelen, rings, RPS, §5.3 sysctls, governor, disk, stray procs, llama guard,
+  20-sample min-RTT clock offset). Runs locally and under `ssh seawolf`.
+- `scripts/sweep.py` (manifest-driven; `--manifest/--only/--reps/--arm/--dry-run/
+  --force/--resume/--out`; flock, PID files, SIGTERM->SIGKILL escalation,
+  hostcheck pre/post, atomic per-rep `result.json`). `--dry-run` on
+  `manifests/baseline-v0.yaml` prints all 24 points with argv.
+- `scripts/collect.py` + `scripts/tests/test_collect.py` + captured fixtures
+  (`sub_bench` has no machine-readable output on this branch; interval rows are
+  parsed instead). Unit tests pass.
+- `scripts/gen-certs.sh`, `scripts/bootstrap_seawolf.sh`,
+  `manifests/baseline-v0.yaml` (24 points, §7), `manifests/smoke.yaml`,
+  `moqx-perf.yaml` (udp/9768, endpoint /moq-relay, admin :9769, draft 16).
+
+### BLOCKER: shenzhen (WSL2) accepts no inbound from the LAN
+Verified three ways from seawolf -> 10.14.25.173: ICMP 100% loss,
+UDP send to a bound socket `RECV_TIMEOUT`, TCP connect `TCP_TIMEOUT`.
+Outbound shenzhen -> seawolf works (ssh, and the arm venv is usable there).
+Consequence: the PROGRAM §7 direction "publisher/relay on shenzhen, subscriber on
+seawolf" cannot open an MoQT session at all — `sub_bench` reports
+`Connection failed: no session within 10s`. Windows Firewall / WSL2 NAT blocks
+inbound; fixing it needs admin on the Windows host
+(`netsh interface portproxy` + firewall rule) or WSL `networkingMode=mirrored`
+plus an inbound allow rule — neither is available to a non-interactive worker.
+
+### Next concrete step
+1. Restore inbound reachability (operator action, see above) **or** decide to
+   record mirrored roles (`pub`/relay on seawolf, `sub` on shenzhen) for D/R.
+2. Rerun: `python3 perf/release-sweep/scripts/sweep.py --manifest
+   perf/release-sweep/manifests/smoke.yaml --only D-raw --reps 1`, then D-WT,
+   R-raw, R-WT (relay needs a moqx binary on seawolf: `build/moqx` is not there).
+3. Validate the four `result.json` against Appendix A and commit `README.md`.
+
+Also note: remote arm venv was missing `sortedcontainers` + build deps; installed
+from the local arm freeze (`uv pip install -r`). `bootstrap_seawolf.sh` must be
+fixed to install the full arm freeze, not just the two wheels.

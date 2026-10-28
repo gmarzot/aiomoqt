@@ -1,0 +1,204 @@
+# Baseline matrix v0 — the 24 screening points of PROGRAM §7.
+#
+#   sweep.py --dry-run --manifest manifests/baseline-v0.yaml
+#   sweep.py            --manifest manifests/baseline-v0.yaml --resume
+#
+# Run with the *system* python3 (PyYAML); bench processes run under the arm venv.
+# `r` is the pacing rate in kbit/s (0 = unpaced).  60 s points use reps=3
+# (N=3 screening), the long media/churn points use fewer reps.
+
+arm: base-070rc2
+cc: bbr1
+gso: true
+
+hosts:
+  shenzhen:
+    local: true
+    root: /home/gmarzot/Projects/marzresearch/perf-sweep
+    python: arms/{arm}/venv/bin/python
+  seawolf:
+    ssh: seawolf
+    root: /home/gmarzot/perf-sweep
+    python: venv/bin/python
+
+relay:
+  binary: /home/gmarzot/Projects/marzresearch/moqx/build/moqx
+  config: perf/release-sweep/moqx-perf.yaml
+  addr: 10.14.25.173
+  port: 9768
+  wt_path: /moq-relay
+  pub_port: 4434
+
+defaults:
+  draft: 16
+  duration_s: 60
+  interval_s: 5
+  warmup_s: 5
+  sub_delay_s: 2.0
+  reps: 3
+  subs: 1
+  config: {P: 1, s: 4096, g: 200, r: 0}
+  pin: {relay: "0-1", pub: "2-5", sub: "0-3"}
+
+points:
+  # ---- L: loopback, both processes on shenzhen, no network --------------
+  - id: L1
+    topology: L
+    transport: raw
+    bench_host: shenzhen
+    config: {P: 1, s: 4096, g: 200, r: 0}
+    purpose: single-stream ceiling
+  - id: L2
+    topology: L
+    transport: raw
+    bench_host: shenzhen
+    config: {P: 8, s: 4096, g: 200, r: 0}
+    purpose: multi-subgroup ceiling
+  - id: L3
+    topology: L
+    transport: wt
+    bench_host: shenzhen
+    config: {P: 8, s: 4096, g: 200, r: 0}
+    purpose: WT vs raw at the ceiling
+  - id: L4
+    topology: L
+    transport: raw
+    bench_host: shenzhen
+    config: {P: 8, s: 4096, g: 40, r: 0}
+    purpose: churn at the ceiling
+  - id: L5
+    topology: L
+    transport: raw
+    bench_host: shenzhen
+    config: {P: 8, s: 1200, g: 200, r: 0}
+    purpose: small objects, pps-bound
+
+  # ---- P: two-process pair on shenzhen, no network ----------------------
+  - id: P1
+    topology: P
+    transport: raw
+    config: {P: 4, s: 4096, g: 200, r: 0}
+    purpose: two-process, no network
+  - id: P2
+    topology: P
+    transport: raw
+    config: {P: 4, s: 4096, g: 200, r: 20000}
+    purpose: paced two-process
+  - id: P3
+    topology: P
+    transport: wt
+    config: {P: 4, s: 4096, g: 200, r: 0}
+    purpose: WT two-process
+
+  # ---- D: direct shenzhen -> seawolf ------------------------------------
+  - id: D1
+    topology: D
+    transport: raw
+    config: {P: 1, s: 4096, g: 200, r: 300000}
+    purpose: single stream on the wire, ~300 Mbps
+  - id: D2
+    topology: D
+    transport: raw
+    config: {P: 4, s: 4096, g: 200, r: 600000}
+    purpose: multi-stream on the wire, ~600 Mbps
+  - id: D3
+    topology: D
+    transport: raw
+    config: {P: 4, s: 4096, g: 200, r: 0}
+    purpose: direct ceiling
+  - id: D4
+    topology: D
+    transport: raw
+    config: {P: 8, s: 4096, g: 40, r: 0}
+    purpose: churn at the direct ceiling
+  - id: D5
+    topology: D
+    transport: wt
+    config: {P: 4, s: 4096, g: 200, r: 600000}
+    purpose: WT on the wire
+
+  # ---- R: relay on shenzhen, subscriber(s) on seawolf ------------------
+  - id: R1
+    topology: R
+    transport: raw
+    config: {P: 4, s: 4096, g: 200, r: 200000}
+    subs: 1
+    purpose: relay egress, controlled
+  - id: R2
+    topology: R
+    transport: raw
+    config: {P: 4, s: 4096, g: 200, r: 0}
+    subs: 1
+    purpose: relay ceiling
+  - id: R3
+    topology: R
+    transport: raw
+    config: {P: 8, s: 4096, g: 40, r: 0}
+    subs: 1
+    purpose: relay + churn
+  - id: R4
+    topology: R
+    transport: raw
+    config: {P: 4, s: 4096, g: 200, r: 200000}
+    subs: 5
+    purpose: fan-out 5, ~200 Mbps aggregate
+  - id: R5
+    topology: R
+    transport: raw
+    config: {P: 4, s: 4096, g: 200, r: 400000}
+    subs: 20
+    purpose: fan-out 20, ~400 Mbps aggregate
+  - id: R6
+    topology: R
+    transport: wt
+    config: {P: 4, s: 4096, g: 200, r: 200000}
+    subs: 5
+    purpose: WT fan-out
+  - id: Ri1
+    topology: Ri
+    transport: raw
+    config: {P: 4, s: 4096, g: 200, r: 300000}
+    subs: 1
+    purpose: relay ingress (publisher on seawolf)
+
+  # ---- M: media shape ---------------------------------------------------
+  - id: M1
+    topology: M
+    transport: raw
+    video: 1080p
+    duration_s: 120
+    reps: 2
+    subs: 1
+    config: {P: 1, s: 4096, g: 200, r: 0}
+    purpose: media shape 1080p
+  - id: M2
+    topology: M
+    transport: raw
+    video: 720p
+    duration_s: 120
+    reps: 2
+    subs: 5
+    config: {P: 1, s: 4096, g: 200, r: 0}
+    purpose: media fan-out 720p
+
+  # ---- C: client-behaviour pressure ------------------------------------
+  - id: C1
+    topology: C1
+    transport: raw
+    flow: churn-storm
+    duration_s: 300
+    reps: 1
+    subs: 50
+    config: {P: 4, s: 4096, g: 200, r: 0}
+    validated: false
+    purpose: "join/leave pressure (load_sim; argv pending --help verification)"
+  - id: C2
+    topology: C2
+    transport: raw
+    video: 1080p
+    duration_s: 90
+    reps: 2
+    subs: 1
+    sub_delay_s: 30.0
+    config: {P: 4, s: 4096, g: 200, r: 0}
+    purpose: TTFF and catch-up, late join at t=30 s
