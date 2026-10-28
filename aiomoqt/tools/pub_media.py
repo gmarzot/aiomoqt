@@ -300,6 +300,7 @@ def parse_args():
     _cli.add_run(parser, duration=30)
     _cli.add_session(parser)
     _cli.add_keepalive(parser, default=10)
+    _cli.add_fetch_history(parser)
     _cli.add_compat(parser)
     _cli.add_logging(parser)
     _cli.add_help(parser)
@@ -1352,6 +1353,7 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
         cfg_at = _INIT_DATA[args.init_data][1]
 
         def _track(name, **kwargs):
+            kwargs['fetch_history_bytes'] = args.fetch_history
             if args.packaging == PACKAGING_LOCMAF:
                 init = catalog.resolve_init(catalog.find(name))
                 return LocmafTrackPublisher(session, args.namespace, name,
@@ -1393,7 +1395,8 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
                     session, args.namespace, 'video', config=video.config,
                     mapping=v_map, loc01_compat=args.loc01_compat, loc_bare=loc_bare,
                     timescale=args.loc_timescale, config_property=cfg_at,
-                    codec_string=_cs(v_codec), annexb=annexb),
+                    codec_string=_cs(v_codec), annexb=annexb,
+                    fetch_history_bytes=args.fetch_history),
                     _ts_timestamps(args, dmx, first, 'video', wall0)))
                 stats['video'] = _TrackStats()
             if ts_audio is not None:
@@ -1402,7 +1405,8 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
                     config=ts_audio.config, mapping=a_map,
                     loc01_compat=args.loc01_compat, loc_bare=loc_bare,
                     timescale=args.loc_timescale, config_property=cfg_at,
-                    codec_string=_cs(ts_audio.codec_string)),
+                    codec_string=_cs(ts_audio.codec_string),
+                    fetch_history_bytes=args.fetch_history),
                     _ts_timestamps(args, dmx, first, 'audio', wall0, a_per)))
                 stats['audio'] = _TrackStats()
             feeders.append(_feed_ts_live(tracks, fh, dmx, first, args,
@@ -1444,7 +1448,8 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
                     session, args.namespace, 'video', config=video.config,
                     mapping=v_map, loc01_compat=args.loc01_compat, loc_bare=loc_bare,
                     timescale=args.loc_timescale, config_property=cfg_at,
-                    codec_string=_cs(v_codec), annexb=annexb),
+                    codec_string=_cs(v_codec), annexb=annexb,
+                    fetch_history_bytes=args.fetch_history),
                     MediaTimestamps(wall0))),
                 fh, asm, first, args, stats['video']))
         elif video is not None and ts is None:   # --ts wired both tracks above

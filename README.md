@@ -181,6 +181,9 @@ Auth is control-plane only; there is no per-object authentication.
 python -m aiomoqt.tools.pub_media $RELAY -N demo/live --mp4 clip.mp4 --loop \
     --target-latency 500 --draft 16 -t 3600
 
+# Keep 1 MiB of recent objects per media track to answer FETCH (default 0 refuses it)
+python -m aiomoqt.tools.pub_media $RELAY -N demo/live --mp4 clip.mp4 --loop --fetch-history 1048576
+
 # Same content, CMAF packaging (requires --mp4)
 python -m aiomoqt.tools.pub_media $RELAY -N cmsf/live --mp4 clip.mp4 --packaging cmaf --loop
 
