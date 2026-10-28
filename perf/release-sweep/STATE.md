@@ -1,0 +1,182 @@
+# STATE.md — release-sweep program state
+
+| field | value |
+|---|---|
+| phase | **0 — setup, frozen arms, first smoke: COMPLETE** |
+| program | `perf/release-sweep` (charter: `PROGRAM.md`, this directory) |
+| workspace root | `/home/gmarzot/Projects/marzresearch/perf-sweep` |
+| host | SHENZHEN — Ubuntu 24.04.1 on WSL2, i9-14900KF (16 vCPU) |
+| date | 2026-10-28 |
+| next action | **Phase 1 — harness + baseline matrix v0** (PROGRAM.md §7) |
+
+Arms are frozen and reproducible: `arms/<NAME>/{src,wheels,venv,arm.json,versions.txt,build.log}`,
+built by `scripts/build_arm.sh NAME REF` (which refuses to rebuild an arm that
+already has `arm.json`). Environment and build recipe: `env-freeze.md`.
+Raw captures: `logs/env-freeze-raw.txt`, `logs/env-raw.txt`, `logs/smoke/`.
+
+## 1. Repositories and pins
+
+| repo | role | ref | sha | describe |
+|---|---|---|---|---|
+| aiomoqt | code under test (both arms) | `origin/main` → branch `perf/release-sweep` | `1a444c0f1bc055738ec7cd4b466691b524fb9ede` | `0.13.3` |
+| aiopquic | `base-070rc2` arm | `v0.7.0rc2` (detached worktree) | `51a80c9721609d1bc41f6debd36ae2e4f013da88` | `v0.7.0rc2` |
+| aiopquic | `cmp-061` arm | `v0.6.1` (detached worktree) | `ccf37d8ab0b9fa2919298665779daa3b681642e2` | `v0.6.1` |
+
+`aiomoqt origin/main` is **`1a444c0` = tag `0.13.3`**, exactly the SHA the card
+expected. No drift to report.
+
+Submodules (identical picotls/liburing, **different picoquic**):
+
+| submodule | base-070rc2 | cmp-061 |
+|---|---|---|
+| picoquic | `70b5fd5aafdd2d6c349ff783202ece9d778bcaf2` (1.1.53.0, 2026.10.22) | `c9088724e02f8cab955107cd5b5cd726267c751b` (1.1.53.0, 2026.10.08) |
+| picotls | `f06553b877ada93c860dd1db9002eabf7365292d` | same |
+| liburing | `5227d48b28ad8671e61d444b72678da584d2e6c3` | same |
+
+The aiomoqt clone is `perf-sweep/aiomoqt` (local clone of
+`https://github.com/gmarzot/aiomoqt`, `origin` = GitHub, credentials present).
+The aiopquic clone is `perf-sweep/aiopquic`; both arms are **detached git
+worktrees** of it, so a single object store backs both and the dev checkouts
+under `~/Projects/marzresearch/{aiomoqt,aiopquic}` were never touched.
+
+## 2. Arms
+
+| arm | aiopquic | wheel sha256 | interpreter |
+|---|---|---|---|
+| `base-070rc2` | 0.7.0rc2 | `35a13fd69e27c60b82a727bf4254e09b4b5e120d648a032d31259669419bd31c` | CPython 3.14.6 |
+| `cmp-061` | 0.6.1 | `3220fb9f2dfdebadd6ee810ab20a5b2a56336718b16fc5eb70bcfd4898246f05` | CPython 3.14.6 |
+
+Both print `aiomoqt 0.13.3` (same editable tree) and their own aiopquic version,
+with `aiopquic.__file__` inside the arm's venv — no cross-arm leakage.
+Verbatim version prints are in `env-freeze.md` §6.
+
+`cmp-061` (v0.6.1) built cleanly on CPython 3.14.6; the documented
+`python3.12` fallback was **not** needed.
+
+## 3. Smoke results
+
+### 3.1 Relay probe — PASS
+
+```
+cmd: arms/base-070rc2/venv/bin/python -P -m aiomoqt.tools.relay_probe \
+       --url moqt://127.0.0.1:9668 -k
+out: moqt://127.0.0.1:9668   QUIC   ✓  draft-14,draft-16  (279ms)
+rc=0
+```
+
+Two corrections to the literal card command, both recorded rather than
+silently applied:
+
+1. **`-k` is required.** The shared relay runs `tls.insecure: true`
+   (self-signed), so without `-k` the handshake fails on certificate
+   verification — an artefact of the relay config, not a MoQ result. The
+   original failure is preserved as
+   `logs/smoke/relay_probe.no-insecure.attempt1.log`.
+2. **`--draft` was left unset** so the probe offers its whole set; it
+   negotiated `draft-14,draft-16` in a single session (279 ms).
+
+Relay state (`/tmp/moqx-smoke.log`, `/proc/1492225`): the process started
+2026-10-22 from `build/moqx`, whose on-disk binary is newer (mtime 2026-10-25)
+and `/proc/1492225/exe` is already `(deleted)` — i.e. **the running relay is an
+older build than the tree**. A forced-ALPN probe showed it accepts `moqt-16`
+and rejects `moq-00`, `moqt-14`, `moqt-18`, `moqt-16-meta-05`, `h3`: a
+pre-standard-ALPN stack. It is therefore **not a draft-18 peer** (open question
+O2). No restart, no reconfiguration — read-only, per the card.
+
+### 3.2 Loopback bench — PASS
+
+```
+cmd: arms/base-070rc2/venv/bin/python -P -m aiomoqt.tools.loopback_bench \
+       -Q --cert certs/cert.pem --key certs/key.pem -P 8 -s 4096 -g 200 -t 10
+rc=0
+```
+
+Delivered objects present, p99 present:
+
+| metric | value |
+|---|---|
+| groups | 1,676 |
+| **objects delivered** | **335,125** |
+| bytes | 1,377,028,625 |
+| throughput | **1068.50 Mbps** (133.56 MB/s) |
+| latency | p50 24.6 / p95 35.9 / **p99 39.5** / max 51.1 ms |
+| jitter | 0.11 ms |
+| loss / out-of-order | 0 / 0 |
+| negotiated | draft 14, raw QUIC, subgroup streams, bbr1 |
+
+Deviations from the literal command, both required:
+
+1. `-q` is **not a flag** of `loopback_bench` (usage offers `-Q/--quic` and
+   `-W/--wt`, default `-W` = H3/WebTransport). Interpreted as "validate the
+   raw-QUIC path" and run as `-Q`; a bare `-q` run produced no statistics.
+2. `--cert`/`--key` were needed because the built-in default test cert is not
+   present on this host; a self-signed localhost cert was generated under
+   `perf-sweep/certs/` (CN=localhost, SAN `DNS:localhost,IP:127.0.0.1`) rather
+   than borrowing the dev checkout's.
+
+**First real finding — the latency is the queue budget, not the network.**
+The tool's default `--max-queued-bytes` is 4 MiB. At the measured 133.56 MB/s
+that is a standing latency of `4 MiB / 133.56 MB/s ≈ 31.4 ms`; measured p50 is
+24.6 ms and p99 39.5 ms. So on loopback the observed latency is dominated by
+aiomoqt's aggregate TX budget, and `--max-queued-bytes` (1 MiB → ≈7.9 ms) is a
+first-order lever, not a micro-tune. Phase 1 must sweep it explicitly at fixed
+offered load, for both arms, before any latency comparison between arms is
+meaningful.
+
+## 4. Deviations from the card, in one place
+
+| # | card said | did | why |
+|---|---|---|---|
+| D1 | `loopback_bench -q` | `-Q` | `-q` is not a flag; `-Q` = raw QUIC, the layer under test |
+| D2 | (no TLS args) | `--cert certs/cert.pem --key certs/key.pem` | default test cert absent on host |
+| D3 | `relay_probe --url ...` | `relay_probe --url ... -k` | relay is `tls.insecure: true` |
+| D4 | interpreter | CPython 3.14.6 (uv) | 3.14.9 has no uv managed build |
+| D5 | — | `--draft` unset on the probe | offer the full set; result records what negotiated |
+
+No sysctl, qdisc, txqueuelen, governor or relay config was changed. Nothing
+outside `perf-sweep/` was written; no version file, tag, `main` or release
+branch was touched.
+
+## 5. Next action — Phase 1 (harness + baseline matrix v0)
+
+Per PROGRAM.md §7, the harness must:
+
+1. Run `N` interleaved repetitions of **both** arms per cell (never arm-major
+   blocks), with the pinning map from `env-freeze.md` §2 applied identically.
+2. Sweep the baseline matrix at fixed offered load: `-P ∈ {1,8,32}`,
+   `-s ∈ {1200,4096,65536}` and `--max-queued-bytes ∈ {0,1MiB,4MiB}` (see §3.2),
+   `-t 30`, `-i 5`, `-Q`, draft 14 first.
+3. Emit the Appendix A result schema per cell: arm, sha, wheel sha256, run
+   index, throughput, p50/p95/p99, loss, ooo, jitter, plus the env hash so a
+   row can never be attributed to the wrong environment.
+4. Fail loudly on: non-zero loss, arm-version mismatch, or a missing p99 — the
+   same checks the smoke just used.
+
+Relay-path work (draft-18, fan-out) stays out of Phase 1 until O2 is resolved.
+
+## 6. Open questions
+
+| # | question | who decides / how |
+|---|---|---|
+| O1 | **picoquic is confounded with the arm.** v0.7.0rc2 bundles 2026.10.22, v0.6.1 bundles 2026.10.08. Any base-vs-cmp delta is "aiopquic tag + 2 weeks of picoquic". Add a control arm (`v0.7.0rc2` with picoquic `c908872`, or `v0.6.1` with `70b5fd5`) before Q1 attribution. | Giovanni: is a 3rd control arm in scope for Phase 1, or accept the confound and attribute only to the released-tag pair? |
+| O2 | The running relay is a pre-standard-ALPN build (accepts `moqt-16` only, not `moqt-18`). Restarting it from the current `build/moqx` would fix that but is forbidden in Phase 0 and is a shared service. | Giovanni: schedule a relay restart window? Until then, no draft-18 / relay-path claims. |
+| O3 | **Frequency is not freezable in WSL2** (no governor, no `no_turbo`). Absolute throughput/latency are not comparable across sessions or hosts. | Program stance: report A/B ratios measured in-session. Any absolute number needs a bare-metal host (argo/seawolf) — confirm whether that is ever required. |
+| O4 | `net.core.rmem_max = wmem_max = 208 KiB` may cap throughput before the stack does at higher RTT. Both arms share the ceiling so the A/B holds, but a real deployment would not. | Phase 3a tweak card: raise per-run and re-measure *both* arms; never for one arm only. |
+| O5 | `ulimit -n` soft = 4096 bounds how far `-P` can sweep. | Phase 1: set `ulimit -n 65536` per run and record it in the manifest. |
+| O6 | `-P 8` at 4096 B reached only 1.07 Gbps on loopback — far below a 10 Gb/s synthetic link. Is the wall the queue budget (Q1 above), GSO/batching, or the single publisher thread? | Phase 1 scaling sweep answers it; do not tune before the baseline exists. |
+
+## 7. Reproducing Phase 0
+
+```bash
+cd /home/gmarzot/Projects/marzresearch/perf-sweep
+export ARM_PY_SPEC=/home/gmarzot/.local/share/uv/python/cpython-3.14-linux-x86_64-gnu/bin/python3.14
+aiomoqt/perf/release-sweep/scripts/build_arm.sh base-070rc2 v0.7.0rc2
+aiomoqt/perf/release-sweep/scripts/build_arm.sh cmp-061     v0.6.1
+aiomoqt/perf/release-sweep/scripts/env_probe.sh            # -> logs/env-freeze-raw.txt
+arms/base-070rc2/venv/bin/python -P -m aiomoqt.tools.relay_probe --url moqt://127.0.0.1:9668 -k
+arms/base-070rc2/venv/bin/python -P -m aiomoqt.tools.loopback_bench -Q \
+    --cert certs/cert.pem --key certs/key.pem -P 8 -s 4096 -g 200 -t 10
+```
+
+Builds refuse to overwrite an arm that already has `arm.json`; delete
+`arms/<NAME>/` deliberately if a rebuild is intended.
