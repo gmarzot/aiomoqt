@@ -121,6 +121,7 @@ from aiomoqt import __version__ as AIOMOQT_VERSION
 from aiomoqt.utils.logger import (get_category_logger, get_log_level,
                                   set_log_handler, set_log_level,
                                   step_log_level)
+from aiomoqt.utils.buffer import Buffer, BufferReadError
 from aiomoqt.utils.cli import add_help, add_logging, apply_logging
 from aiomoqt.utils.url import parse_relay_url
 
@@ -191,6 +192,9 @@ FILL_UPSTREAM_S = 10.0
 # Longest a SUBSCRIBE waits on an upstream FETCH for the group head the
 # upstream subscription did not deliver.
 BACKFILL_S = 2.0
+# Longest a SUBSCRIBE that resumes a paused upstream waits for its
+# REQUEST_OK and the publisher's Largest.
+RESUME_REPLY_S = 1.0
 # Watchdog: self-probes failed in a row before exiting, the exit status
 # (EX_SOFTWARE), and the longest one probe may take.
 WATCHDOG_MISSES = 3
@@ -460,7 +464,8 @@ class _Downstream:
 
     __slots__ = ("session", "alias", "request_id", "forward", "window",
                  "joined_at", "replaying", "location_filter", "group_order",
-                 "fills", "range_params", "filters", "lane", "lost")
+                 "fills", "range_params", "filters", "lane", "lost",
+                 "fence")
 
     def __init__(self, session, alias, request_id, forward=True,
                  window=_UNFILTERED):
@@ -491,6 +496,9 @@ class _Downstream:
         # Groups whose replay lacked objects it was owed: their streams
         # end in a reset.
         self.lost = ()
+        # The track's fence when it joined: its joining FETCH and fills
+        # start after that group.
+        self.fence = None
 
     def set_filters(self, params, track_properties) -> None:
         self.range_params = params
@@ -880,6 +888,11 @@ class _RelayedTrack:
         # Upstream Forward State is 0: answered so in PUBLISH_OK, or
         # lowered by --pause-after; a forwarding subscriber raises it.
         self.paused = False
+        # Paused by --pause-after, after taking objects.
+        self.lowered = False
+        # Largest group before the last resume: cached groups up to it
+        # are stale for subscribers joining since.
+        self.fence = None
         # The PUBLISH feeding this track, once answered.
         self.publish_msg = None
         # Loop time since which no subscriber has forwarded, else None.
@@ -1304,6 +1317,7 @@ class _RelayedTrack:
         window go to the subscriber first, then live ones."""
         self.attaching = False
         d = _Downstream(session, track_alias, request_id, forward, window)
+        d.fence = self.fence
         if forward:
             # A joining FETCH from this subscriber backfills to here.
             d.joined_at = self.largest
@@ -2558,16 +2572,20 @@ def _upstream_request(track):
     return session, rid, {}
 
 
-def _resume_paused(track) -> None:
+def _resume_paused(track, wanted=False):
     """Raise a paused upstream's Forward State once a subscriber
-    forwards."""
-    if not track.paused or not _forwarding(track):
-        return
+    forwards, or is about to (`wanted`). With `wanted`, returns the
+    awaitable reply when the upstream draft has one (d16+), else None."""
+    if not track.paused or not (wanted or _forwarding(track)):
+        return None
     req = _upstream_request(track)
     if req is None:
-        return
+        return None
     session, rid, location = req
-    track.paused = False
+    wait = wanted and not session._profile.update_has_location
+    if track.lowered and track.largest is not None:
+        track.fence = track.largest[0]
+    track.paused = track.lowered = False
     track.unwatched_since = None
     if track._objects_in:
         track.complete_from = None
@@ -2575,12 +2593,71 @@ def _resume_paused(track) -> None:
     elif track.publish_msg is not None:
         track.complete_from = location["start"]
     try:
-        session.request_update(rid, forward=1, **location)
+        reply = session.request_update(rid, forward=1, wait_response=wait,
+                                       **location)
         logger.info(f"relay: resumed {track.key} upstream: REQUEST_UPDATE "
                     f"forward=1 request {rid}")
     except Exception:
         logger.debug("relay: raising the upstream forward state failed",
                      exc_info=True)
+        return None
+    return reply if wait else None
+
+
+# Track key -> task taking the Largest from a resume's REQUEST_OK.
+_resuming: dict = {}
+
+
+async def _resume_for(track, msg) -> None:
+    """Resume a paused upstream for a forwarding SUBSCRIBE before it is
+    answered, so its reply and joining FETCH resolve against the
+    publisher's live Largest rather than the pre-pause one."""
+    if not track.lowered or (msg.forward is not None and not msg.forward):
+        return
+    task = _resuming.get(track.key)
+    if task is None:
+        reply = _resume_paused(track, wanted=True)
+        if reply is None:
+            return
+        task = asyncio.create_task(_take_live_largest(track, reply))
+        _resuming[track.key] = task
+        task.add_done_callback(
+            lambda t, k=track.key: _resuming.pop(k, None)
+            if _resuming.get(k) is t else None)
+    await asyncio.shield(task)
+
+
+async def _take_live_largest(track, reply) -> None:
+    """Note the Largest a resume's REQUEST_OK reports, waiting at most
+    RESUME_REPLY_S."""
+    try:
+        ok = await asyncio.wait_for(reply, RESUME_REPLY_S)
+    except TimeoutError:
+        logger.warning(f"relay: resume {track.key}: no REQUEST_OK within "
+                       f"{RESUME_REPLY_S:g}s; answering with the cached "
+                       f"Largest {track.largest}")
+        return
+    except MOQTRequestError as e:
+        logger.info(f"relay: resume {track.key}: upstream refused the "
+                    f"update: {e}")
+        return
+    track.note_largest(_update_largest(ok))
+
+
+def _update_largest(reply):
+    """The LARGEST_OBJECT a REQUEST_OK carries: a Location from d18, a
+    length-prefixed pair of varints at d16; None without one."""
+    value = (getattr(reply, "parameters", None) or {}).get(
+        ParamType.LARGEST_OBJECT)
+    if isinstance(value, (tuple, list)):
+        return tuple(value)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        buf = Buffer(data=bytes(value))
+        try:
+            return (buf.pull_uint_var(), buf.pull_uint_var())
+        except BufferReadError:
+            return None
+    return None
 
 
 def _pause_upstream(track) -> None:
@@ -2597,6 +2674,7 @@ def _pause_upstream(track) -> None:
                      exc_info=True)
         return
     track.paused = True
+    track.lowered = True
     logger.info(f"relay: paused {track.key} upstream, no forwarding "
                 f"subscriber for {_pause_after:g}s: REQUEST_UPDATE "
                 f"forward=0 request {rid}")
@@ -2739,6 +2817,9 @@ def _start_fill(track, d, msg) -> None:
             or d.session._profile.param_table < 20):
         return
     rng = fill_range(fill, d.location_filter, track.largest)
+    if rng is not None and d.fence is not None and rng[0][0] <= d.fence:
+        rng = (None if rng[1][0] <= d.fence
+               else ((d.fence + 1, 0), rng[1]))
     if rng is None:
         return
     sid = id(d.session)
@@ -3006,6 +3087,8 @@ async def _relay_subscribe(session, msg):
         track.close()
         _tracks.pop((ns, msg.track_name), None)
         track = None
+    if track is not None and track.lowered and track.upstream is not None:
+        await _resume_for(track, msg)
     # The relay's Largest as it takes the SUBSCRIBE (§3.1.4).
     seen = None if track is None else track.largest
     if track is not None and (track.pending_publish or track.upstream):
@@ -3581,6 +3664,17 @@ async def _on_fetch(session, msg):
         start_group = int(msg.joining_start or 0)
         if int(msg.fetch_type) == FETCH_RELATIVE_JOINING:
             start_group = max(0, anchor[0] - start_group)
+        if d.fence is not None and start_group <= d.fence:
+            start_group = d.fence + 1
+            if start_group > anchor[0]:
+                logger.info(f"relay: joining FETCH {key} -> INVALID_RANGE "
+                            f"(nothing since the resume after group "
+                            f"{d.fence})")
+                session.fetch_error(
+                    request_id=msg.request_id,
+                    error_code=RequestErrorCode.INVALID_RANGE,
+                    reason="nothing published since the resume")
+                return
         msg.start_group, msg.start_object = start_group, 0
         msg.end_group, msg.end_object = anchor[0], anchor[1] + 1
         ns, track_name = key
