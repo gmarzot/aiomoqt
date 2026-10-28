@@ -19,6 +19,7 @@
 - Draft-14 is deprecated and will be removed in 0.15.0; until then it still negotiates and stays in the default offer.
 - aiomoqt-relay `--pause-after SEC` (default 60, 0 = never): a track no subscriber has forwarded for that long is paused upstream (Forward State 0) and resumed by the next subscriber; `--catalog-probe` catalogs keep flowing.
 - The LOC producer keeps numbering frames while paused (Forward State 0), so its Largest keeps moving; nothing is sent or kept.
+- A LOC track with a FETCH history (pub_media `--fetch-history`) keeps the group in progress while paused and resumes it mid-group, so a joiner's FETCH or fill starts on its key frame at once.
 - aiomoqt-relay: a subscriber that resumes a paused track gets the publisher's live Largest (from its REQUEST_OK, waited up to 1 s), not the pre-pause one, and no objects from before the pause (or the publisher's Largest at the pause) in its joining FETCH or fill; a group the publisher went on producing while paused is served, not fenced.
 - aiomoqt-relay: a d20+ fill the resume fence leaves empty is opened and reset (§3.4.1) instead of never opened.
 - aiomoqt-relay: a track paused since its PUBLISH (forward=0, as after a relay restart) is resumed the same way, so its first subscriber gets the publisher's live Largest, not the PUBLISH's.

@@ -306,6 +306,20 @@ class ObjectHistory:
             return None
         return grp.records[grp.head][0]
 
+    def discard(self, group_id: int) -> None:
+        """Drop a group's records; its Locations then read as absent, not
+        evicted."""
+        grp = self._groups.pop(group_id, None)
+        if grp is None:
+            return
+        self._bytes -= grp.bytes
+        if grp is self._last:
+            self._last_id = self._last = None
+        if grp is self._oldest:
+            groups = self._groups
+            self._oldest_id = next(iter(groups), None)
+            self._oldest = groups.get(self._oldest_id)
+
     def last_object(self, group_id: int) -> Optional[int]:
         """The largest Object ID held in a group, None if none is."""
         grp = self._groups.get(group_id)
