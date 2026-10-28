@@ -222,6 +222,29 @@ class _RequestEntry:
     alias: Optional[int] = None
 
 
+# HTTP/3 error codes (RFC 9114 §8.1) a WebTransport session close may carry.
+_H3_NO_ERROR = 0x100
+_H3_ERROR_NAMES = {
+    0x100: "H3_NO_ERROR",
+    0x101: "H3_GENERAL_PROTOCOL_ERROR",
+    0x102: "H3_INTERNAL_ERROR",
+    0x103: "H3_STREAM_CREATION_ERROR",
+    0x104: "H3_CLOSED_CRITICAL_STREAM",
+    0x105: "H3_FRAME_UNEXPECTED",
+    0x106: "H3_FRAME_ERROR",
+    0x107: "H3_EXCESSIVE_LOAD",
+    0x108: "H3_ID_ERROR",
+    0x109: "H3_SETTINGS_ERROR",
+    0x10a: "H3_MISSING_SETTINGS",
+    0x10b: "H3_REQUEST_REJECTED",
+    0x10c: "H3_REQUEST_CANCELLED",
+    0x10d: "H3_REQUEST_INCOMPLETE",
+    0x10e: "H3_MESSAGE_ERROR",
+    0x10f: "H3_CONNECT_ERROR",
+    0x110: "H3_VERSION_FALLBACK",
+}
+
+
 class _MOQTSessionMixin:
     """MoQT session methods. Mix with an aiopquic transport base —
     QuicConnectionProtocol for raw QUIC, WebTransportSession (via
@@ -3091,16 +3114,52 @@ class _MOQTSessionMixin:
             if not fut.done():
                 fut.set_result(False)
 
+    def _log_close(self, error_code: int, reason_phrase: str,
+                   by_peer: bool) -> None:
+        """One line per close: side, code name, peer, setup state. A clean
+        code logs INFO, a peer's error WARNING, our own error ERROR."""
+        try:
+            code = int(error_code)
+        except (TypeError, ValueError):
+            code = None
+        if code is None:
+            label = str(error_code)
+        else:
+            name = _H3_ERROR_NAMES.get(code) if self._is_wt else None
+            if name is None:
+                try:
+                    name = SessionCloseCode(code).name
+                except ValueError:
+                    pass
+            label = f"{name} (0x{code:x})" if name else f"0x{code:x}"
+        msg = f"MOQT: {'peer closed' if by_peer else 'closing'}: {label}"
+        try:
+            addr = self.peer_address
+        except Exception:
+            addr = None
+        if addr:
+            host = f"[{addr[0]}]" if ":" in addr[0] else addr[0]
+            msg += f" {'from' if by_peer else 'to'} {host}:{addr[1]}"
+        setup = getattr(self, '_moqt_session_setup', None)
+        if setup is not None and not (setup.done() and not setup.cancelled()
+                                      and setup.result()):
+            msg += ", before MoQT setup"
+        if reason_phrase:
+            msg += f"; reason: {reason_phrase}"
+        if code == 0 or (self._is_wt and code == _H3_NO_ERROR):
+            logger.info(msg)
+        elif by_peer:
+            logger.warning(msg)
+        else:
+            logger.error(msg)
+
     def _close_session(self,
               error_code: SessionCloseCode = SessionCloseCode.NO_ERROR,
               reason_phrase: str = "no error", *,
               transmit: bool = True) -> None:
         """Close the MoQT session. The first close's code is the one sent;
         transmit=False when the peer already closed the connection."""
-        if error_code == SessionCloseCode.NO_ERROR:
-            logger.info(f"MOQT: closing: {reason_phrase} ({error_code})")
-        else:
-            logger.error(f"MOQT error: closing: {reason_phrase} ({error_code})")
+        self._log_close(error_code, reason_phrase, by_peer=not transmit)
         first = self._close_err is None
         if first:
             self._close_err = (error_code, reason_phrase)
