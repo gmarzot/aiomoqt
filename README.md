@@ -295,6 +295,7 @@ Common options across clients: `--namespace`, `--trackname`, `--path`, `--draft`
 python -m aiomoqt.examples.pub_example moqt://relay.ex.com
 python -m aiomoqt.examples.sub_example moqt://relay.ex.com
 python -m aiomoqt.tools.loopback_bench -s 4096 -P 4 -t 20
+python -m aiomoqt.tools.loopback_bench --fanout -s 4096 -t 20   # through the send lane
 python -m aiomoqt.tools.pub_bench moqt://relay.ex.com -s 4096 -P 4 -r 120 -t 60
 ```
 
