@@ -84,6 +84,37 @@ async def test_no_relay_reachable_exits_69_without_ready(
     assert events == [{'event': 'done', 'reason': 'error'}]
 
 
+@pytest.mark.parametrize('use_quic', [True, False], ids=['quic', 'wt'])
+async def test_redial_gives_up_each_dead_attempt_within_the_timeout(
+        monkeypatch, use_quic):
+    assert pub_media._DIAL_TIMEOUT_S == 4.0
+    url = _url(_BASE_PORT + 3, use_quic)
+    args = _argv(monkeypatch, 'pub_media', url, '-k', '--reconnect')
+    ep = pub_media._Endpoint(url, pub_media.parse_relay_url(url), args,
+                             False)
+    attempts = []
+    open_orig = ep.open
+
+    async def timed_open():
+        t0 = time.monotonic()
+        s = await open_orig()
+        attempts.append((t0, time.monotonic(), s))
+        return s
+    ep.open = timed_open
+    redial = asyncio.ensure_future(pub_media._redial(ep, None, {}, 0.0))
+    try:
+        await _until(lambda: len(attempts) >= 2, 15)
+    finally:
+        redial.cancel()
+        await asyncio.gather(redial, return_exceptions=True)
+    (a0, a1, s0), (b0, _, s1) = attempts[:2]
+    assert s0 is None and s1 is None
+    # A WebTransport client takes ~1 s more to close.
+    assert a1 - a0 < pub_media._DIAL_TIMEOUT_S + 1.5
+    # Backoff after a 0 s first delay is 1 s.
+    assert 0.9 < b0 - a1 < 2.0
+
+
 def _exit_status(*argv, timeout=30):
     return subprocess.run(
         [sys.executable, '-m', 'aiomoqt.tools.pub_media', *argv],

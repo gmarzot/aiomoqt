@@ -545,7 +545,7 @@ async def test_stats_json_events(monkeypatch, capsys, h264_aac, use_quic):
     port = _BASE_PORT + 70 + (not use_quic)
     scheme = 'moqt' if use_quic else 'https'
     url = f'{scheme}://localhost:{port}/'
-    # Nothing listens there: the dial fails after ~10 s, so only once.
+    # Nothing listens there: the dial fails after ~4 s, so only once.
     dead = [] if use_quic else [f'https://localhost:{port + 5}/']
     pub_args = _argv(monkeypatch, 'pub_media', url, *dead, '-k', '--draft',
                      '18', '-t', '3', '--stats', '0.5', '--pub-ns', '-N',
