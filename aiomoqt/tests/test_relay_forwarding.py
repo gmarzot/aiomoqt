@@ -21,6 +21,7 @@ from aiomoqt.track import PublishedTrack, SubscribedTrack
 from aiomoqt.tools import moq_interop_relay as relay
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
+from aiomoqt.tests._relay_wait import until_published
 
 pytestmark = requires_certs
 
@@ -143,7 +144,7 @@ async def _publish_cycle(port, namespace="relay/ns"):
     await pub_session.client_session_init()
     track = _Pub(pub_session, namespace, "video")
     await track.publish(announce_namespace=False, publish_track=True)
-    await asyncio.sleep(0.1)
+    await until_published(namespace, ["video"])
 
     got = []
     sub_client = MOQTClient("localhost", port, path="/", use_quic=True,
@@ -449,7 +450,7 @@ async def test_tracks_published_on_one_session_each_reach_a_subscriber(draft):
                 track.frames = [name.encode() + f for f in _FRAMES]
                 await track.publish(announce_namespace=False,
                                     publish_track=True)
-            await asyncio.sleep(0.1)
+            await until_published("relay/multi", names)
             sub_client = MOQTClient("localhost", port, path="/",
                                     use_quic=True, verify_tls=False,
                                     supported_drafts=draft)
@@ -1067,6 +1068,7 @@ async def test_datagram_track_is_relayed_as_datagrams(draft, use_quic):
                                        rate=200, forwarding=fwd)
                 await track.publish(announce_namespace=False,
                                     publish_track=True)
+            await until_published(ns, mapping)
             rx = await _session()
             for name in mapping:
                 await rx.subscribe(
