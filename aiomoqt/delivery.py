@@ -61,6 +61,11 @@ class StreamMapping(Enum):
 OBJECT_RECORD_BYTES = 192
 
 
+def properties_charge(extensions) -> int:
+    """The properties' share of retained_object_bytes."""
+    return retained_object_bytes(None, extensions) - OBJECT_RECORD_BYTES
+
+
 def retained_object_bytes(payload, extensions=None) -> int:
     """Memory charged for holding one object: its payload, its properties
     (an upper bound of their encoded size) and OBJECT_RECORD_BYTES."""
@@ -123,19 +128,27 @@ class ObjectHistory:
     """Recently published objects, for answering FETCH (§10.12).
 
     Records are kept per group, bounded by `max_bytes` as charged by
-    retained_object_bytes. The oldest group is evicted first: whole when
-    the excess covers it, else record by record in publication order. The
-    first record of a Location wins, since a published object never
-    changes (§2.1); duplicates are resolved when fetched, keeping the
-    per-object add free of hashing. Properties are held as given and
-    encoded for the fetching session's draft.
+    retained_object_bytes, evicted in batches. The oldest group is evicted
+    first: whole when the excess covers it, else record by record in
+    publication order. The first record of a Location wins, since a
+    published object never changes (§2.1); duplicates are resolved when
+    fetched, keeping the per-object add free of hashing. Properties are
+    held as given and encoded for the fetching session's draft.
     """
 
-    __slots__ = ("max_bytes", "_groups", "_bytes", "_through",
-                 "_last_id", "_last", "_oldest_id", "_oldest")
+    __slots__ = ("max_bytes", "_slack", "_fixed", "_high", "_groups",
+                 "_bytes", "_through", "_last_id", "_last", "_oldest_id",
+                 "_oldest")
 
-    def __init__(self, max_bytes: int):
+    def __init__(self, max_bytes: int, slack: Optional[int] = None):
         self.max_bytes = max_bytes
+        # Held bytes overshoot max_bytes by at most the slack, then are
+        # evicted to max_bytes minus it. The default slack is
+        # max(max_bytes // 8, the added object's charge); 0 evicts on
+        # every add past max_bytes.
+        self._fixed = slack is not None
+        self._slack = max_bytes // 8 if slack is None else slack
+        self._high = max_bytes + self._slack
         # Group ID -> _HeldGroup, oldest first.
         self._groups: Dict[int, _HeldGroup] = {}
         self._bytes = 0
@@ -168,13 +181,15 @@ class ObjectHistory:
 
     def add(self, group_id: int, object_id: int, payload: bytes,
             subgroup_id: Optional[int] = 0, extensions: Any = None,
-            priority: int = 128) -> None:
+            priority: int = 128, charge: Optional[int] = None) -> None:
         """Record one object. `subgroup_id` None marks one sent as a
         datagram; `extensions` may be a callable taking the session that
-        fetches it."""
+        fetches it. `charge`, when given, is properties_charge(extensions)."""
         # retained_object_bytes, inlined for the common property values.
         cost = OBJECT_RECORD_BYTES + (len(payload) if payload else 0)
-        if extensions:
+        if charge is not None:
+            cost += charge
+        elif extensions:
             if extensions.__class__ is dict:
                 for v in extensions.values():
                     cost += 16 if v.__class__ is int else 16 + (
@@ -198,13 +213,17 @@ class ObjectHistory:
             grp.priorities[len(recs)] = priority
         recs.append((object_id, subgroup_id, payload, extensions, cost))
         grp.bytes += cost
-        self._bytes += cost
-        if self._bytes > self.max_bytes:
-            self._evict()
+        held = self._bytes + cost
+        self._bytes = held
+        if held > self._high:
+            if self._fixed:
+                self._evict(self.max_bytes - self._slack)
+            elif held - cost > self.max_bytes:
+                self._evict(self.max_bytes - max(self._slack, cost))
 
-    def _evict(self) -> None:
+    def _evict(self, cap: int) -> None:
+        """Evict down to `cap` bytes held."""
         held = self._bytes
-        cap = self.max_bytes
         grp = self._oldest
         while held > cap:
             recs = grp.records

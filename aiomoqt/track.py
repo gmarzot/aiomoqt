@@ -37,7 +37,7 @@ from .types import (
 )
 from .delivery import (
     DatagramTooLarge, FanoutDelivery, ObjectHistory, StreamMapping,
-    SubgroupDelivery,
+    SubgroupDelivery, properties_charge,
 )
 from .messages import (
     FetchHeader, LocationFilter, MOQTMessage, ObjectDatagram, PublishOk,
@@ -59,6 +59,9 @@ from .utils.timing import (
 
 logger = get_logger(__name__)
 data_log = get_category_logger("data")
+
+# FETCH history charge of the generators' {LOC_TIMESTAMP: int} properties.
+_LOC_TS_CHARGE = properties_charge({LOC_TIMESTAMP: 0})
 
 
 def _largest_object_param(session, largest: tuple) -> dict:
@@ -893,13 +896,15 @@ class PublishedTrack(Track):
                     extensions=extensions)
 
     def _remember(self, group_id: int, object_id: int, payload: bytes,
-                  subgroup_id: Optional[int] = 0, extensions=None) -> None:
+                  subgroup_id: Optional[int] = 0, extensions=None,
+                  charge: Optional[int] = None) -> None:
         """One object published: Largest Location and the FETCH history.
-        `subgroup_id` None marks a datagram."""
+        `subgroup_id` None marks a datagram; `charge` is
+        properties_charge(extensions), when known."""
         self._note_largest(group_id, object_id)
         if self._history is not None:
             self._history.add(group_id, object_id, payload, subgroup_id,
-                              extensions, self.priority)
+                              extensions, self.priority, charge)
 
     def _on_produced(self, group_id: int, object_id: int, payload: bytes,
                      extensions) -> None:
@@ -1723,6 +1728,7 @@ class PublishedTrack(Track):
         report = not getattr(self, '_quiet', False)
         sub = self._sub_for(session)
         stamp = self._stamper(session)
+        ts_charge = _LOC_TS_CHARGE if stamp is None else None
 
         try:
             await self._await_schedule(first_group, 0)
@@ -1752,7 +1758,8 @@ class PublishedTrack(Track):
                 buf = obj.serialize(prof=prof)
                 obj_bytes = buf.tell()
                 self._remember(group_id, cur_obj_id, payload,
-                               subgroup_id=None, extensions=obj.extensions)
+                               subgroup_id=None, extensions=obj.extensions,
+                               charge=ts_charge)
                 admitted = sub.passes(group_id, cur_obj_id)
                 cur_obj_id += 1
 
@@ -1841,6 +1848,7 @@ class PublishedTrack(Track):
         sender = _SubgroupSender(self, session, sub, track_alias,
                                  subgroup_id, priority)
         stamp = self._stamper(session)
+        ts_charge = _LOC_TS_CHARGE if stamp is None else None
 
         local_sent = 0
 
@@ -1872,7 +1880,7 @@ class PublishedTrack(Track):
                     {LOC_TIMESTAMP: int(time.time() * 1_000_000)}
                     if stamp is None else stamp(group_id, cur_obj_id))
                 self._remember(group_id, cur_obj_id, payload, subgroup_id,
-                               extensions)
+                               extensions, ts_charge)
                 data = sender.encode_open(cur_obj_id, payload, extensions)
                 if data is None:
                     obj_bytes = await sender.send(cur_obj_id, payload,
@@ -2530,6 +2538,7 @@ class VideoTrack(PublishedTrack):
         p_pad = b'\x50' * self.p_frame_size  # 'P'
         b_pad = b'\x42' * self.b_frame_size  # 'B'
         stamp = self._stamper(session)
+        ts_charge = _LOC_TS_CHARGE if stamp is None else None
 
         try:
             await self._await_schedule(first_group, subgroup_id)
@@ -2568,7 +2577,7 @@ class VideoTrack(PublishedTrack):
                     {LOC_TIMESTAMP: int(time.time() * 1_000_000)}
                     if stamp is None else stamp(group_id, cur_obj_id))
                 self._remember(group_id, cur_obj_id, payload, subgroup_id,
-                               extensions)
+                               extensions, ts_charge)
                 data = sender.encode_open(cur_obj_id, payload, extensions)
                 if data is None:
                     obj_bytes = await sender.send(cur_obj_id, payload,
