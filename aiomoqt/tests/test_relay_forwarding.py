@@ -517,7 +517,8 @@ async def _flowing(port, use_quic, draft=18):
             for name, size in _SIZES.items():
                 track = PublishedTrack(pub, namespace=_FLOW_NS,
                                        trackname=name, object_size=size,
-                                       group_size=_GROUP, rate=500)
+                                       group_size=_GROUP, rate=500,
+                                       fetch_history_bytes=1 << 20)
                 track.prefill(2)
                 await track.publish(announce_namespace=False,
                                     publish_track=True)

@@ -70,6 +70,8 @@ SIGUSR1.
   `fast`, `newreno`, `prague` and `reno`.
 - Loopback timing: picoquic's BBRv3 is reported to freeze cwnd below 128 µs RTT (upstream
   #2118), not reproduced on the current pin. Use `cubic` or `newreno` for loopback timing runs.
+- FETCH: a `PublishedTrack` keeps no object history unless given `fetch_history_bytes`, and
+  refuses FETCH (NOT_SUPPORTED) without one; the MSF catalog track keeps 64 KiB.
 - `moq-relay-probe --relays-file` reads its own relay-list schema; use `--url` for a single probe.
 - `aiomoqt-relay` (also `moq-interop-relay`) is a MoQT relay in Python: a bounded
   recent-object cache (8 groups / 32 MiB per track, all tracks under one `--cache-bytes` budget,

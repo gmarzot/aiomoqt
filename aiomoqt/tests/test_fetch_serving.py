@@ -8,7 +8,10 @@ import contextlib
 import pytest
 
 from aiomoqt.client import MOQTClient
-from aiomoqt.delivery import MAX_OBJECT_ID, OBJECT_RECORD_BYTES, ObjectHistory
+from aiomoqt.delivery import (
+    MAX_OBJECT_ID, OBJECT_RECORD_BYTES, ObjectHistory, properties_charge,
+    retained_object_bytes,
+)
 from aiomoqt.messages.data import FETCH_FLAGS_END_UNKNOWN
 from aiomoqt.server import MOQTServer
 from aiomoqt.track import PublishedTrack
@@ -23,7 +26,7 @@ from aiomoqt.tests._certs import CERT, KEY, requires_certs
 # -- ObjectHistory ------------------------------------------------------
 
 def _filled(groups=3, objects=2, size=10, cap=1 << 20):
-    h = ObjectHistory(cap)
+    h = ObjectHistory(cap, slack=0)
     for g in range(groups):
         for o in range(objects):
             h.add(g, o, bytes([g, o]) * (size // 2))
@@ -62,7 +65,7 @@ def test_dropped_objects_are_marked_unknown(descending):
 
 def test_out_of_order_adds_evict_oldest_first_and_track_the_largest():
     # Parallel subgroups publish a group's objects out of id order.
-    h = ObjectHistory(3 * (10 + OBJECT_RECORD_BYTES))
+    h = ObjectHistory(3 * (10 + OBJECT_RECORD_BYTES), slack=0)
     for loc in [(0, 1), (0, 0), (0, 3), (0, 2), (1, 0)]:
         h.add(*loc, b"x" * 10)
     assert len(h) == 3 and h.evicted_through == (0, 1)
@@ -72,7 +75,7 @@ def test_out_of_order_adds_evict_oldest_first_and_track_the_largest():
 
 
 def test_a_duplicate_of_a_dropped_location_is_not_served():
-    h = ObjectHistory(2 * (10 + OBJECT_RECORD_BYTES))
+    h = ObjectHistory(2 * (10 + OBJECT_RECORD_BYTES), slack=0)
     h.add(0, 0, b"a" * 10)
     h.add(0, 1, b"b" * 10)
     h.add(0, 0, b"c" * 10)                  # pushes out the first (0, 0)
@@ -97,13 +100,11 @@ def test_a_whole_group_fetch_of_an_evicted_group_ends_at_a_valid_location():
 
 
 def test_a_whole_group_marker_ends_at_the_groups_last_held_object():
-    h = ObjectHistory(3 * (10 + OBJECT_RECORD_BYTES))
-    for loc in [(0, 0), (0, 1), (1, 0), (0, 2)]:
+    # Group 1 is published first, so it is the oldest and goes first.
+    h = ObjectHistory(3 * (10 + OBJECT_RECORD_BYTES), slack=0)
+    for loc in [(1, 0), (0, 0), (0, 1), (0, 2)]:
         h.add(*loc, b"x" * 10)
-    assert h.evicted_through == (0, 0) and h.last_object(0) == 2
-    h.add(2, 0, b"x" * 10)                  # evicts (0, 1)
-    h.add(3, 0, b"x" * 10)                  # evicts (1, 0)
-    assert h.evicted_through == (1, 0)
+    assert h.evicted_through == (1, 0) and h.last_object(0) == 2
     got = h.fetch((0, 0), (0, 1 << 62))
     assert (got[0].group_id, got[0].object_id) == (0, 2)
     assert got[0].end_of_range == FETCH_FLAGS_END_UNKNOWN
@@ -121,6 +122,88 @@ def test_history_resolves_extensions_and_marks_datagrams():
     assert obj.datagram and obj.extensions == {6: "peer"}
 
 
+
+def _charged(h):
+    return sum(retained_object_bytes(r[2], r[3])
+               for g in h._groups.values() for _, r in g.held())
+
+
+def test_the_oldest_group_goes_whole_when_the_excess_covers_it():
+    cost = 10 + OBJECT_RECORD_BYTES
+    h = ObjectHistory(4 * cost, slack=0)
+    for loc in [(0, 0), (0, 1), (1, 0), (1, 1)]:
+        h.add(*loc, b"x" * 10)
+    h.add(2, 0, b"y" * (2 * cost - OBJECT_RECORD_BYTES))  # charged 2 records
+    assert list(h._groups) == [1, 2] and h.evicted_through == (0, 1)
+    assert h.bytes == _charged(h) == 4 * cost
+
+
+def test_eviction_takes_records_only_from_the_oldest_group():
+    cost = 10 + OBJECT_RECORD_BYTES
+    h = ObjectHistory(5 * cost, slack=0)
+    for g in range(2):
+        for o in range(3):
+            h.add(g, o, b"x" * 10)
+    assert [(g, x.head) for g, x in h._groups.items()] == [(0, 1), (1, 0)]
+    assert h.evicted_through == (0, 0)
+    h.add(2, 0, b"x" * 10)
+    assert [(g, x.head) for g, x in h._groups.items()] == [(0, 2), (1, 0), (2, 0)]
+    assert h.evicted_through == (0, 1) and len(h) == 5
+
+
+def test_bytes_follow_retained_object_bytes():
+    h = ObjectHistory(4000)
+    for i in range(40):
+        props = ({0x10: i, 0x09: b"\x20", 0x0B: "abc"} if i % 3 == 0
+                 else {0x10: i} if i % 3 == 1 else None)
+        h.add(i // 4, i % 4, b"p" * (i * 7), extensions=props)
+        cost = retained_object_bytes(b"p" * (i * 7), props)
+        assert h.bytes == _charged(h) <= 4000 + max(4000 // 8, cost)
+
+
+def test_a_given_charge_is_used_as_the_properties_share():
+    h = ObjectHistory(1 << 20)
+    props = {0x10: 5}
+    h.add(0, 0, b"x" * 10, extensions=props,
+          charge=properties_charge(props))
+    assert h.bytes == retained_object_bytes(b"x" * 10, props)
+
+
+def test_eviction_runs_once_per_slack():
+    cost = 10 + OBJECT_RECORD_BYTES
+    cap = 80 * cost
+    h = ObjectHistory(cap)                  # slack: cap // 8 = 10 records
+    evictions = 0
+    for o in range(1000):
+        before = len(h)
+        h.add(o // 20, o % 20, b"x" * 10)
+        if len(h) <= before:
+            evictions += 1
+            assert h.bytes <= cap - cap // 8
+        assert h.bytes == _charged(h) <= cap + cap // 8
+    assert 40 <= evictions <= 50
+
+
+def test_properties_are_held_as_given():
+    h = ObjectHistory(1 << 20)
+    props = {0x10: 7}
+    h.add(0, 0, b"x", extensions=props, priority=9)
+    h.add(0, 1, b"y", priority=200)
+    a, b = h.fetch((0, 0), (0, 1))
+    assert a.extensions is props
+    assert (a.publisher_priority, b.publisher_priority) == (9, 200)
+
+
+def test_a_long_group_compacts_its_evicted_records():
+    h = ObjectHistory(10 * (10 + OBJECT_RECORD_BYTES), slack=0)
+    for o in range(5000):
+        h.add(0, o, b"x" * 10)
+    grp = h._groups[0]
+    assert len(h) == 10 and len(grp.records) <= 2100
+    assert h.last_object(0) == 4999 and h.evicted_through == (0, 4989)
+    assert _locations(h.fetch((0, 4990), (0, 4999))) == [
+        (0, o) for o in range(4990, 5000)]
+
 # -- over a real session -------------------------------------------------
 
 _BASE_PORT = 16200
@@ -136,7 +219,8 @@ def _port(case: int, use_quic: bool) -> int:
 
 
 @contextlib.asynccontextmanager
-async def _loopback(port, use_quic, prefill=3, draft=18, held_groups=None):
+async def _loopback(port, use_quic, prefill=3, draft=18, held_groups=None,
+                    history=True):
     """The client publishes video and audio under _NS, each with `prefill`
     groups already published; yields (tracks, server session, fetched),
     the server being the side that subscribes and fetches. `fetched` maps
@@ -166,12 +250,12 @@ async def _loopback(port, use_quic, prefill=3, draft=18, held_groups=None):
             tracks = {}
             for name, size in _SIZES.items():
                 # Each object also carries one integer property: 16 B.
-                kw = {} if held_groups is None else {
-                    "fetch_history_bytes": held_groups * _GROUP
-                    * (size + 16 + OBJECT_RECORD_BYTES)}
+                held = (0 if not history else 1 << 20 if held_groups is None
+                        else held_groups * _GROUP
+                        * (size + 16 + OBJECT_RECORD_BYTES))
                 track = PublishedTrack(pub, namespace=_NS, trackname=name,
                                        object_size=size, group_size=_GROUP,
-                                       rate=200, **kw)
+                                       rate=200, fetch_history_bytes=held)
                 if prefill:
                     track.prefill(prefill)
                 track.attach()
@@ -262,14 +346,14 @@ async def test_fetch_refusals(use_quic):
 @pytest.mark.parametrize("draft", [16, 18])
 async def test_a_whole_group_fetch_of_an_evicted_group_completes(use_quic,
                                                                  draft):
-    # Each history holds group 2 only; FETCH group 0 whole (End {0, 0}).
+    # Each history has dropped group 0; FETCH it whole (End {0, 0}).
     async with _loopback(_port(8 + (draft == 18), use_quic), use_quic,
                          draft=draft, held_groups=1) as (tracks, rx, fetched):
         gaps = []
         rx.on_fetch_gap = lambda obj, rid: gaps.append(
             (rid, obj.end_of_range, obj.group_id, obj.object_id))
         for name in _SIZES:
-            assert tracks[name]._history.evicted_through == (1, _GROUP - 1)
+            assert tracks[name]._history.evicted_through[0] == 1
             ok, objs = await _fetch(rx, fetched, rx.fetch(
                 _NS, name, start_group=0, start_object=0, end_group=0,
                 end_object=0, wait_response=True))
@@ -277,6 +361,36 @@ async def test_a_whole_group_fetch_of_an_evicted_group_completes(use_quic,
             assert gaps[-1] == (ok.request_id, FETCH_FLAGS_END_UNKNOWN, 0,
                                 MAX_OBJECT_ID)
         assert len(gaps) == len(_SIZES)
+        assert rx._close_err is None
+
+
+@requires_certs
+@_TRANSPORTS
+@pytest.mark.parametrize("draft", [14, 16, 18, 22])
+async def test_a_track_without_history_refuses_fetch(use_quic, draft):
+    port = _port(10 + [14, 16, 18, 22].index(draft), use_quic)
+    async with _loopback(port, use_quic, prefill=0, draft=draft,
+                         history=False) as (tracks, rx, _):
+        assert tracks["video"]._history is None
+        sub = await rx.subscribe(_NS, "video", wait_response=True)
+        for _ in range(100):
+            if tracks["video"]._largest is not None:
+                break
+            await asyncio.sleep(0.02)
+        assert tracks["video"]._largest is not None
+        assert await _refusal(rx.fetch(
+            _NS, "video", start_group=0, start_object=0, end_group=0,
+            end_object=0, wait_response=True)) == RequestErrorCode.NOT_SUPPORTED
+        if draft < 20:
+            assert await _refusal(rx.joining_fetch(
+                sub.request_id, joining_start=0, wait_response=True)) \
+                == RequestErrorCode.NOT_SUPPORTED
+        else:
+            # A joining fetch is a fill: the update stands, and the fill
+            # stream is opened and reset (d22 §3.4).
+            ok = await rx.joining_fetch(sub.request_id, joining_start=0,
+                                        wait_response=True)
+            assert ok.request_id is not None
         assert rx._close_err is None
 
 
@@ -452,7 +566,8 @@ async def test_publish_carries_the_largest_object_and_joining_location(use_quic)
             for name, groups in (("video", 3), ("audio", 1)):
                 track = PublishedTrack(pub, namespace=_NS, trackname=name,
                                        object_size=_SIZES[name],
-                                       group_size=_GROUP, rate=200)
+                                       group_size=_GROUP, rate=200,
+                                       fetch_history_bytes=1 << 20)
                 track.prefill(groups)
                 await track.publish()
                 tracks[name] = track

@@ -111,7 +111,8 @@ async def _publisher(connect, prefill=3):
     pub = await connect()
     for name, size in _SIZES.items():
         track = PublishedTrack(pub, namespace=_NS, trackname=name,
-                               object_size=size, group_size=_GROUP, rate=100)
+                               object_size=size, group_size=_GROUP, rate=100,
+                               fetch_history_bytes=1 << 20)
         if prefill:
             track.prefill(prefill)
         track.attach()

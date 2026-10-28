@@ -120,7 +120,7 @@ async def _loopback(port, use_quic):
             for name, size in _SIZES.items():
                 track = PublishedTrack(pub, namespace=_NS, trackname=name,
                                        object_size=size, group_size=_GROUP,
-                                       rate=500)
+                                       rate=500, fetch_history_bytes=1 << 20)
                 track.prefill(2)
                 track.attach()
                 tracks[name] = track

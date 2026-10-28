@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections import Counter, deque
+from collections import Counter
 from enum import Enum
 from typing import Any, Callable, Dict, Optional
 
@@ -61,6 +61,11 @@ class StreamMapping(Enum):
 OBJECT_RECORD_BYTES = 192
 
 
+def properties_charge(extensions) -> int:
+    """The properties' share of retained_object_bytes."""
+    return retained_object_bytes(None, extensions) - OBJECT_RECORD_BYTES
+
+
 def retained_object_bytes(payload, extensions=None) -> int:
     """Memory charged for holding one object: its payload, its properties
     (an upper bound of their encoded size) and OBJECT_RECORD_BYTES."""
@@ -75,66 +80,208 @@ def retained_object_bytes(payload, extensions=None) -> int:
     return n
 
 
+class _HeldGroup:
+    """One group's records in publication order, each
+    (object_id, subgroup_id, payload, properties, cost). Those before
+    `head` are evicted; `evicted` is the largest Object ID among them."""
+
+    __slots__ = ("records", "head", "bytes", "evicted", "priority",
+                 "priorities")
+
+    def __init__(self, priority: int):
+        self.records: list = []
+        self.head = 0
+        self.bytes = 0
+        self.evicted = -1
+        self.priority = priority
+        # Record index -> priority, for records not at `priority`.
+        self.priorities: Optional[dict] = None
+
+    def held(self):
+        """(record index, record) for each record not evicted."""
+        recs = self.records
+        return ((i, recs[i]) for i in range(self.head, len(recs)))
+
+    def priority_of(self, index: int) -> int:
+        if self.priorities is None:
+            return self.priority
+        return self.priorities.get(index, self.priority)
+
+    def compact(self) -> None:
+        """Drop the evicted slots."""
+        head = self.head
+        del self.records[:head]
+        if self.priorities is not None:
+            self.priorities = {i - head: p for i, p in self.priorities.items()
+                               if i >= head} or None
+        self.head = 0
+
+
+# Evicted slots a group keeps before compacting, so a long group's
+# record list stays bounded.
+_COMPACT_AT = 1024
+
+_BYTES_TYPES = (bytes, bytearray, memoryview, str)
+
+
 class ObjectHistory:
     """Recently published objects, for answering FETCH (§10.12).
 
-    Records are kept in publication order, bounded by `max_bytes`, the
-    oldest dropped first. The first record of a Location wins, since a
+    Records are kept per group, bounded by `max_bytes` as charged by
+    retained_object_bytes, evicted in batches. The oldest group is evicted
+    first: whole when the excess covers it, else record by record in
+    publication order. The first record of a Location wins, since a
     published object never changes (§2.1); duplicates are resolved when
-    fetched, keeping the per-object add free of hashing.
+    fetched, keeping the per-object add free of hashing. Properties are
+    held as given and encoded for the fetching session's draft.
     """
 
-    __slots__ = ("max_bytes", "_records", "_bytes", "evicted_through")
+    __slots__ = ("max_bytes", "_slack", "_fixed", "_high", "_groups",
+                 "_bytes", "_through", "_last_id", "_last", "_oldest_id",
+                 "_oldest")
 
-    def __init__(self, max_bytes: int):
+    def __init__(self, max_bytes: int, slack: Optional[int] = None):
         self.max_bytes = max_bytes
-        # (group, object, subgroup, payload, extensions, priority)
-        self._records: deque = deque()
+        # Held bytes overshoot max_bytes by at most the slack, then are
+        # evicted to max_bytes minus it. The default slack is
+        # max(max_bytes // 8, the added object's charge); 0 evicts on
+        # every add past max_bytes.
+        self._fixed = slack is not None
+        self._slack = max_bytes // 8 if slack is None else slack
+        self._high = max_bytes + self._slack
+        # Group ID -> _HeldGroup, oldest first.
+        self._groups: Dict[int, _HeldGroup] = {}
         self._bytes = 0
-        # Largest Location dropped: below it, status is unknown.
-        self.evicted_through: Optional[tuple] = None
+        # Largest Location of the groups dropped whole.
+        self._through: Optional[tuple] = None
+        # The group the last add went to, and the oldest group.
+        self._last_id: Optional[int] = None
+        self._last: Optional[_HeldGroup] = None
+        self._oldest_id: Optional[int] = None
+        self._oldest: Optional[_HeldGroup] = None
 
     def __len__(self) -> int:
-        return len(self._records)
+        return sum(len(g.records) - g.head for g in self._groups.values())
+
+    @property
+    def bytes(self) -> int:
+        """Bytes charged for the records held."""
+        return self._bytes
+
+    @property
+    def evicted_through(self) -> Optional[tuple]:
+        """Largest Location dropped: below it, status is unknown."""
+        through = self._through
+        oldest = self._oldest
+        if oldest is not None and oldest.evicted >= 0:
+            part = (self._oldest_id, oldest.evicted)
+            if through is None or part > through:
+                return part
+        return through
 
     def add(self, group_id: int, object_id: int, payload: bytes,
             subgroup_id: Optional[int] = 0, extensions: Any = None,
-            priority: int = 128) -> None:
+            priority: int = 128, charge: Optional[int] = None) -> None:
         """Record one object. `subgroup_id` None marks one sent as a
         datagram; `extensions` may be a callable taking the session that
-        fetches it."""
-        self._records.append((group_id, object_id, subgroup_id, payload,
-                              extensions, priority))
-        self._bytes += retained_object_bytes(payload, extensions)
-        if self._bytes > self.max_bytes:
-            self._evict()
-
-    def _evict(self) -> None:
-        records = self._records
-        held = self._bytes
-        through = self.evicted_through
-        while held > self.max_bytes and records:
-            rec = records.popleft()
-            held -= retained_object_bytes(rec[3], rec[4])
-            gone = (rec[0], rec[1])
-            if through is None or gone > through:
-                through = gone
+        fetches it. `charge`, when given, is properties_charge(extensions)."""
+        # retained_object_bytes, inlined for the common property values.
+        cost = OBJECT_RECORD_BYTES + (len(payload) if payload else 0)
+        if charge is not None:
+            cost += charge
+        elif extensions:
+            if extensions.__class__ is dict:
+                for v in extensions.values():
+                    cost += 16 if v.__class__ is int else 16 + (
+                        len(v) if isinstance(v, _BYTES_TYPES) else 0)
+            else:
+                cost = retained_object_bytes(payload, extensions)
+        if group_id == self._last_id:
+            grp = self._last
+        else:
+            grp = self._groups.get(group_id)
+            if grp is None:
+                grp = self._groups[group_id] = _HeldGroup(priority)
+                if self._oldest is None:
+                    self._oldest_id, self._oldest = group_id, grp
+            self._last_id = group_id
+            self._last = grp
+        recs = grp.records
+        if priority != grp.priority:
+            if grp.priorities is None:
+                grp.priorities = {}
+            grp.priorities[len(recs)] = priority
+        recs.append((object_id, subgroup_id, payload, extensions, cost))
+        grp.bytes += cost
+        held = self._bytes + cost
         self._bytes = held
-        self.evicted_through = through
+        if held > self._high:
+            if self._fixed:
+                self._evict(self.max_bytes - self._slack)
+            elif held - cost > self.max_bytes:
+                self._evict(self.max_bytes - max(self._slack, cost))
+
+    def _evict(self, cap: int) -> None:
+        """Evict down to `cap` bytes held."""
+        held = self._bytes
+        grp = self._oldest
+        while held > cap:
+            recs = grp.records
+            head = grp.head
+            if head == len(recs) - 1 or grp.bytes <= held - cap:
+                self._drop_oldest()
+                held -= grp.bytes
+                grp = self._oldest
+                if grp is None:
+                    break
+                continue
+            rec = recs[head]
+            recs[head] = None
+            grp.head = head + 1
+            grp.bytes -= rec[4]
+            held -= rec[4]
+            if rec[0] > grp.evicted:
+                grp.evicted = rec[0]
+            if head >= _COMPACT_AT and 2 * head >= len(recs):
+                grp.compact()
+        self._bytes = held
+
+    def _drop_oldest(self) -> None:
+        """Drop the oldest group whole."""
+        groups = self._groups
+        group_id, grp = self._oldest_id, self._oldest
+        del groups[group_id]
+        gone = (group_id, max(grp.evicted,
+                               max(r[0] for _, r in grp.held())))
+        if self._through is None or gone > self._through:
+            self._through = gone
+        if grp is self._last:
+            self._last_id = self._last = None
+        if groups:
+            self._oldest_id = next(iter(groups))
+            self._oldest = groups[self._oldest_id]
+        else:
+            self._oldest_id = self._oldest = None
 
     def _held(self, start: tuple, end: tuple) -> dict:
-        """Location -> first record of it, for Locations in [start, end]."""
+        """Location -> (subgroup_id, payload, properties, priority) of the
+        first record of it, for Locations in [start, end]."""
         held = {}
-        for rec in self._records:
-            key = (rec[0], rec[1])
-            if start <= key <= end and key not in held:
-                held[key] = rec
+        for group_id, grp in self._groups.items():
+            if not start[0] <= group_id <= end[0]:
+                continue
+            for i, rec in grp.held():
+                key = (group_id, rec[0])
+                if start <= key <= end and key not in held:
+                    held[key] = (rec[1], rec[2], rec[3], grp.priority_of(i))
         return held
 
     def last_object(self, group_id: int) -> Optional[int]:
         """The largest Object ID held in a group, None if none is."""
-        ids = [r[1] for r in self._records if r[0] == group_id]
-        return max(ids) if ids else None
+        grp = self._groups.get(group_id)
+        if grp is None:
+            return None
+        return max(r[0] for _, r in grp.held())
 
     def fetch(self, start: tuple, end: tuple, session=None, *,
               descending: bool = False,
@@ -147,8 +294,9 @@ class ObjectHistory:
         MAX_OBJECT_ID (a whole group) ends the marker at the group's last
         held Object, else at MAX_OBJECT_ID."""
         lost = None
-        if self.evicted_through is not None and start <= self.evicted_through:
-            lost = min(self.evicted_through, end)
+        through = self.evicted_through
+        if through is not None and start <= through:
+            lost = min(through, end)
             if lost[1] > MAX_OBJECT_ID:
                 last = self.last_object(lost[0])
                 lost = (lost[0], MAX_OBJECT_ID if last is None else last)
@@ -159,12 +307,12 @@ class ObjectHistory:
             keys.sort(key=lambda k: (-k[0], k[1]))
         out = []
         for key in keys:
-            group_id, object_id, subgroup_id, payload, exts, priority = held[key]
+            subgroup_id, payload, exts, priority = held[key]
             if callable(exts):
                 exts = exts(session)
             out.append(FetchObject(
-                group_id=group_id, subgroup_id=subgroup_id or 0,
-                object_id=object_id, publisher_priority=priority,
+                group_id=key[0], subgroup_id=subgroup_id or 0,
+                object_id=key[1], publisher_priority=priority,
                 extensions=exts or None, payload=payload,
                 datagram=subgroup_id is None))
         if lost is not None:
