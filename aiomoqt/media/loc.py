@@ -123,6 +123,9 @@ class LocTrackPublisher(PublishedTrack):
     `frindell` (a utils.timing.MediaTimestamps) adds
     draft-frindell-moq-timestamp Track Properties, and OBJECT_TIMESTAMP
     from each frame's `capture_us`, beside the LOC timestamp.
+
+    `fetch_history_bytes` of recent objects are kept to answer FETCH; 0
+    refuses FETCH.
     """
 
     def __init__(self, session, namespace: str, trackname: str, *,
@@ -137,9 +140,11 @@ class LocTrackPublisher(PublishedTrack):
                  codec_string: Optional[str] = None,
                  loc_bare: bool = False,
                  config_property: Optional[str] = 'object',
-                 annexb: Optional[str] = None):
+                 annexb: Optional[str] = None,
+                 fetch_history_bytes: int = 0):
         super().__init__(session, namespace, trackname,
-                         priority=priority, auth_token=auth_token)
+                         priority=priority, auth_token=auth_token,
+                         fetch_history_bytes=fetch_history_bytes)
         if config_property not in ('object', 'track', None):
             raise ValueError(f"config_property {config_property!r}")
         if annexb is not None and (annexb not in _ANNEXB

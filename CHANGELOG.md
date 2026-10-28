@@ -5,6 +5,7 @@
 - A drained stream write that fails inside the transport ends that stream (or its producer, if the session is closing) instead of returning as if it succeeded; unexpected failures log a WARNING.
 - A `PublishedTrack` answers FETCH only when given `fetch_history_bytes` (was 1 MiB by default); without it FETCH is refused with NOT_SUPPORTED. The MSF catalog track keeps 64 KiB.
 - pub_bench and pub_server `--fetch-history BYTES`: history kept to answer FETCH (default 0; pub_bench `--prefill` sets 1 MiB).
+- pub_media `--fetch-history BYTES`: its media tracks keep that much history to answer FETCH (default 0: FETCH refused); `LocTrackPublisher` takes `fetch_history_bytes`.
 - The session close line names who closed, the code (with its H3 or MoQT name), the peer address and whether MoQT setup completed; a WebTransport H3_NO_ERROR (0x100) close logs INFO, a peer error close one WARNING (no separate QUIC ERROR line), our own error close ERROR.
 - Requires aiopquic 0.7.0: datagram priority and the server bind host need it (0.6.x silently ignored both).
 - Draft-14 is deprecated and will be removed in 0.15.0; until then it still negotiates and stays in the default offer.
