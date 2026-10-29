@@ -32,11 +32,12 @@ Limits:
   * Upstream Forward State is raised for a forwarding subscriber and
     lowered again once none has forwarded for --pause-after seconds;
     a --catalog-probe catalog keeps flowing.
-  * A subscriber's send lane drops live objects past their
+  * A subscriber's send lane drops objects past their
     OBJECT_DELIVERY_TIMEOUT (§8: the smaller non-zero of the publisher's
-    and the subscriber's), else past --lag-limit seconds, resetting the
-    subgroup with DELIVERY_TIMEOUT and skipping the rest of the group. A
-    cache replay is not timed.
+    and the subscriber's), else live objects past --lag-limit seconds,
+    resetting the subgroup with DELIVERY_TIMEOUT and skipping the rest of
+    the group. Past the track's MAX_CACHE_DURATION an object is neither
+    sent nor served from the cache: a request for it goes upstream.
   * Namespace tables are in memory and global to the process.
 
 Routing model (cross-session, single relay instance):
@@ -592,13 +593,17 @@ _budget = _CacheBudget()
 _lanes: set = set()
 
 
+def _tightest(*limits):
+    """The smallest of the non-zero, non-None limits; None for none."""
+    return min((x for x in limits if x), default=None)
+
+
 def _item(gid, live, sgid, oid, payload, exts, prio, status, shape,
           encoded=None, cost=None, born=None) -> tuple:
     """A SendLane item for a relayed object, or for a stream marker when
     `oid` is None. `live` objects count against LANE_BYTES, a cache
     replay does not; `cost` is the object's retained_object_bytes, when
-    already known; `born` its arrival time, None for a replay, which
-    never expires."""
+    already known; `born` its arrival time, None to never expire it."""
     if cost is None:
         cost = 0 if oid is None else retained_object_bytes(payload, exts)
     return (gid, cost, live, born, sgid, oid, payload, exts, prio, status,
@@ -887,10 +892,45 @@ class _RelayedTrack:
         ms = _min_nonzero(pub if isinstance(pub, int) else 0, d.timeout)
         return ms / 1000 if ms else None
 
+    def _max_age_s(self):
+        """MAX_CACHE_DURATION (§12.3; d22 §10.3) in seconds, or None."""
+        ms = self.properties.get(ParamType.MAX_CACHE_DURATION)
+        return ms / 1000 if isinstance(ms, int) and ms else None
+
     def time_lane(self, d) -> None:
-        """Set `d`'s lane deadline: its delivery timeout, else --lag-limit."""
+        """Set `d`'s lane deadline: its delivery timeout, else --lag-limit,
+        capped by MAX_CACHE_DURATION."""
         if d.lane is not None:
-            d.lane.deadline = self._timeout_s(d) or _lag_limit or None
+            d.lane.deadline = _tightest(self._timeout_s(d) or _lag_limit,
+                                        self._max_age_s())
+
+    def _expire_cache(self) -> None:
+        """Drop cached objects past MAX_CACHE_DURATION, and every object at
+        or before the newest of them, keeping the cache contiguous: their
+        state is unknown (§12.3), so a request for them goes upstream."""
+        age = self._max_age_s()
+        if age is None or not self._cache:
+            return
+        oldest = time.monotonic() - age
+        last = max(((c[0], c[2]) for c in self._cache if c[8] < oldest),
+                   default=None)
+        if last is None:
+            return
+        kept = deque()
+        size = 0
+        for c in self._cache:
+            if (c[0], c[2]) > last:
+                kept.append(c)
+                continue
+            size += retained_object_bytes(c[3], c[4])
+            self._note_lost(c[0], c[2])
+            left = self._groups.pop(c[0]) - 1
+            if left:
+                self._groups[c[0]] = left
+        self._cache = kept
+        self._cache_bytes -= size
+        _budget.bytes -= size
+        self._prune()
 
     def _expire(self, session, group_id) -> bool:
         """§8: reset the session's open streams of the group with
@@ -1256,7 +1296,7 @@ class _RelayedTrack:
                 cost = retained_object_bytes(payload, exts)
                 born = time.monotonic()
                 self._remember(gid, sgid, oid, payload, exts, prio, status,
-                               shape, cost)
+                               shape, cost, born)
             else:
                 cost = 0
                 born = None
@@ -1288,9 +1328,10 @@ class _RelayedTrack:
                     self.end_downstream(d)
 
     def _remember(self, gid, sgid, oid, payload, exts, prio, status,
-                  shape=None, cost=None) -> None:
-        """Keep one object, with its stream shape or datagram mode, for a
-        later FETCH or replay, dropping oldest past the bound."""
+                  shape=None, cost=None, born=None) -> None:
+        """Keep one object, with its stream shape or datagram mode and
+        arrival time, for a later FETCH or replay, dropping oldest past
+        the bound."""
         if self._uncached is not None:
             if gid == self._uncached:
                 self.note_largest((gid, oid))
@@ -1299,7 +1340,8 @@ class _RelayedTrack:
             if gid > self._uncached:
                 self._uncached = None
         self._cache.append((gid, sgid, oid, payload, exts, prio, status,
-                            shape))
+                            shape, time.monotonic() if born is None
+                            else born))
         size = (retained_object_bytes(payload, exts) if cost is None
                 else cost)
         self._cache_bytes += size
@@ -1390,6 +1432,7 @@ class _RelayedTrack:
         d.replaying = False
         if d not in self.downstream:
             return
+        self._expire_cache()
         d.lost = {g for g, o in self._lost.items() if (g, o) >= d.start}
         objs = sorted((c for c in self._cache if d.passes(c[0], c[2])
                        and d.admits(c[1], c[2], c[5], c[4])),
@@ -1397,9 +1440,14 @@ class _RelayedTrack:
         if objs:
             _budget.touch(self)
         lane = self._lane(d)
-        for gid, sgid, oid, payload, exts, prio, status, shape in objs:
+        # Replays expire by OBJECT_DELIVERY_TIMEOUT or MAX_CACHE_DURATION,
+        # never --lag-limit: stamps shift by that limit minus the deadline.
+        limit = _tightest(self._timeout_s(d), self._max_age_s())
+        shift = None if limit is None else limit - lane.deadline
+        for gid, sgid, oid, payload, exts, prio, status, shape, born in objs:
             lane.offer(_item(gid, False, sgid, oid, payload, exts, prio,
-                             status, shape))
+                             status, shape,
+                             born=None if shift is None else born + shift))
         for gid, sgid in sorted({(c[0], c[1]) for c in objs}):
             if (gid, sgid) in self._ended:
                 lane.offer(_item(gid, False, sgid, None, None, None, None,
@@ -1412,6 +1460,7 @@ class _RelayedTrack:
         oldest object is the boundary: anything before it was evicted
         and has to come from the publisher, or the subscriber gets a
         short answer with no way to tell."""
+        self._expire_cache()
         if not self._cache:
             return False
         first = (self._cache[0][0], self._cache[0][2])
@@ -1441,8 +1490,9 @@ class _RelayedTrack:
         """Cached objects within [start, end], each (group, object)
         inclusive; `end` None means to the live edge. In Location order,
         across subgroups (§3.2.1)."""
+        self._expire_cache()
         out = []
-        for gid, sgid, oid, payload, exts, prio, status, _ in self._cache:
+        for gid, sgid, oid, payload, exts, prio, status, *_ in self._cache:
             if (gid, oid) < start:
                 continue
             if end is not None and (gid, oid) > end:
@@ -1981,8 +2031,9 @@ async def _backfill(track, msg, largest) -> None:
             or track.finished):
         return
     held = {(c[0], c[2]) for c in track._cache}
+    now = time.monotonic()
     new = [(o.group_id, o.subgroup_id, o.object_id, bytes(o.payload),
-            o.extensions or None, o.publisher_priority, o.status, None)
+            o.extensions or None, o.publisher_priority, o.status, None, now)
            for o in objs if (o.group_id, o.object_id) not in held]
     track._cache = deque(sorted([*new, *track._cache],
                                 key=lambda c: (c[0], c[2])))

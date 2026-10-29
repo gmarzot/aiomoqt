@@ -1,7 +1,7 @@
-"""aiomoqt-relay delivery timeouts (§8): a subscriber's lane drops live
-objects older than its OBJECT_DELIVERY_TIMEOUT, else --lag-limit,
-resetting the subgroup with DELIVERY_TIMEOUT and skipping the rest of
-the group. A cache replay is not timed."""
+"""aiomoqt-relay delivery timeouts (§8): a subscriber's lane drops objects
+older than its OBJECT_DELIVERY_TIMEOUT, else live objects older than
+--lag-limit, resetting the subgroup with DELIVERY_TIMEOUT and skipping
+the rest of the group. --lag-limit never times a cache replay."""
 import asyncio
 import contextlib
 from collections import defaultdict
@@ -86,20 +86,38 @@ async def test_lag_limit_zero_expires_nothing(lag):
         track.close()
 
 
-@pytest.mark.parametrize("timeout_ms", [0, 50])
-async def test_a_replay_is_not_expired(lag, timeout_ms):
+@pytest.mark.parametrize("max_cache_ms", [0, 10_000])
+async def test_the_lag_limit_never_expires_a_replay(lag, max_cache_ms):
     lag(0.05)
+    track = relay._RelayedTrack(("ns", "t"))
+    if max_cache_ms:
+        track.properties = {int(ParamType.MAX_CACHE_DURATION): max_cache_ms}
+    try:
+        await _feed(track, 0, 4)
+        await asyncio.sleep(0.1)
+        late = _Fake()
+        d = track.add_downstream(late, 1, 1, replay=True)
+        await _settle()
+        assert d.lane.deadline == 0.05
+        assert len(late.kinds("data")) == 4
+        assert d.lane.expired == 0 and not late.kinds("reset")
+    finally:
+        track.close()
+
+
+async def test_an_explicit_timeout_expires_a_replay(lag):
+    lag(0)
     track = relay._RelayedTrack(("ns", "t"))
     try:
         await _feed(track, 0, 4)
         await asyncio.sleep(0.1)
         late = _Fake()
         d = track.add_downstream(late, 1, 1, replay=True)
-        d.timeout = timeout_ms
+        d.timeout = 50
         await _settle()
-        assert d.lane.deadline == 0.05
-        assert len(late.kinds("data")) == 4
-        assert d.lane.expired == 0 and not late.kinds("reset")
+        # The first object expires and the rest of its group is skipped.
+        assert d.lane.deadline == 0.05 and d.lane.expired == 1
+        assert not late.kinds("data")
     finally:
         track.close()
 
