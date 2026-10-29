@@ -2,6 +2,7 @@
 
 ## v0.14.0
 
+- aiomoqt-relay: a track paused at PUBLISH records a pause gap like a later pause, so the first joiner's FETCH or fill for the open group comes from upstream instead of a short cache answer; a fill the cache answers with nothing asks upstream.
 - loopback_bench `--rtt-ms`, `--link-mbps`, `--loss`: emulated link (netem) on a private network namespace's lo; needs privileges to create one.
 - aiomoqt-relay honours MAX_CACHE_DURATION: an object past it is not forwarded, replayed or served from the cache (a FETCH for it goes upstream), and an explicit OBJECT_DELIVERY_TIMEOUT now also times cache replays (`--lag-limit` still does not). The per-object record charge is 224 bytes (was 192).
 - aiomoqt-relay forwards a subscriber's NEW_GROUP_REQUEST: in its upstream SUBSCRIBE, or to an established upstream in a REQUEST_UPDATE when it is 0 or above the Largest Group and the track declares DYNAMIC_GROUPS=1, once while an equal or larger request is outstanding. `SubscribedTrack.subscribe(parameters=)` adds parameters to a direct SUBSCRIBE.
