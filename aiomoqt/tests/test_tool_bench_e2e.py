@@ -220,3 +220,30 @@ def test_loopback_bench_without_objects_exits_1(monkeypatch):
     monkeypatch.setattr(loopback_bench, "run_subscriber", _nothing)
     monkeypatch.setattr(sys, "argv", ["loopback_bench", "-t", "1"])
     assert asyncio.run(loopback_bench.main()) == 1
+
+
+def _netns_route():
+    import subprocess
+
+    def ok(*argv):
+        try:
+            return subprocess.run(argv, stdin=subprocess.DEVNULL,
+                                  capture_output=True).returncode == 0
+        except OSError:
+            return False
+    return ok("unshare", "-rn", "true") or ok("sudo", "-n", "-E", "unshare",
+                                               "-n", "true")
+
+
+@requires_certs
+def test_loopback_bench_rtt_ms_emulates_the_link():
+    if not _netns_route():
+        pytest.skip("no private netns: unshare -rn and sudo -n both refused")
+    rc, out = run("loopback_bench", "-Q", "-p", free_udp_port(), "--draft", 18,
+                  "-t", 3, "-r", 200, "-s", 1200, "-k", "--rtt-ms", 40)
+    assert rc == 0, out
+    assert "rtt 40 ms" in out, out
+    assert objects_received(out) > 0, out
+    m = re.search(r"^\s+p50=([\d.]+)\s", out, re.MULTILINE)
+    assert m, out
+    assert float(m.group(1)) >= 20, out

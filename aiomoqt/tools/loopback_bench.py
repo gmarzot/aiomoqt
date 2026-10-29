@@ -8,9 +8,14 @@ Usage:
   python -m aiomoqt.tools.loopback_bench -s 4096 -r 5000 -t 20
   python -m aiomoqt.tools.loopback_bench -P 4 -s 16384 -r 60 -t 20
   python -m aiomoqt.tools.loopback_bench --fanout -s 4096 -t 20
+  python -m aiomoqt.tools.loopback_bench -Q --rtt-ms 50 -r 200 -t 10
 """
 import argparse
 import asyncio
+import os
+import shutil
+import signal
+import subprocess
 import sys
 import time
 
@@ -29,6 +34,10 @@ from aiomoqt.tools.sub_bench import BenchReporter
 
 CERT = find_cert()
 KEY = find_key(CERT)
+
+# Set in the re-exec'd child that runs inside the emulated-link netns.
+NETNS_ENV = "AIOMOQT_LOOPBACK_NETNS"
+NETEM_LIMIT = 200000
 
 
 def parse_args():
@@ -129,6 +138,23 @@ def parse_args():
              'at stream rollover while total un-transmitted TX bytes '
              'exceed this. Steady-state latency ~ value / throughput. '
              'Default: aiopquic default (4 MiB). Pass 0 to disable.')
+    parser.add_argument(
+        '--rtt-ms', type=float, default=None, metavar='MS',
+        help='Emulated round-trip time: re-runs the bench in a private '
+             'network namespace with netem delay MS/2 on its lo (each '
+             'packet crosses lo once). The host network is not touched. '
+             'Needs unprivileged user namespaces or passwordless sudo.')
+    parser.add_argument(
+        '--link-mbps', type=float, default=None, metavar='N',
+        help='Emulated link rate cap (netem rate), in the same netns. '
+             f'The netem queue holds {NETEM_LIMIT} packets: a deep '
+             'buffer. One qdisc on lo carries both directions, so the '
+             'cap also applies to ACKs.')
+    parser.add_argument(
+        '--loss', type=float, default=None, metavar='PCT',
+        help='Emulated random loss percent (netem loss), in the same '
+             'netns. One qdisc on lo carries both directions, so ACKs '
+             'are lost too.')
     _cli.add_logging(parser)
     _cli.add_help(parser)
     _cli.add_timestamps(parser)
@@ -148,7 +174,74 @@ def parse_args():
         parser.error(f"--datagram: object_size {args.object_size} can "
                      f"never fit a DATAGRAM frame (max ~1152B payload "
                      f"at 1200B frame ceiling; frames cannot fragment)")
+    if args.rtt_ms is not None and args.rtt_ms < 0:
+        parser.error("--rtt-ms must be >= 0")
+    if args.link_mbps is not None and args.link_mbps <= 0:
+        parser.error("--link-mbps must be > 0")
+    if args.loss is not None and not 0 <= args.loss <= 100:
+        parser.error("--loss must be 0..100")
     return args
+
+
+def _emulated(args) -> bool:
+    return (args.rtt_ms, args.link_mbps, args.loss) != (None, None, None)
+
+
+def _netem_spec(args) -> str:
+    spec = f"delay {(args.rtt_ms or 0) / 2:g}ms"
+    if args.link_mbps:
+        spec += f" rate {args.link_mbps:g}mbit"
+    if args.loss:
+        spec += f" loss {args.loss:g}%"
+    return spec + f" limit {NETEM_LIMIT}"
+
+
+def _succeeds(argv) -> bool:
+    try:
+        return subprocess.run(argv, stdin=subprocess.DEVNULL,
+                              capture_output=True).returncode == 0
+    except OSError:
+        return False
+
+
+def _reexec_in_netns(args) -> int:
+    """Run this command again in a private netns with netem on its lo;
+    return the child's exit code. Never touches the host's lo."""
+    if not sys.platform.startswith("linux"):
+        print("  Error: --rtt-ms/--link-mbps/--loss need Linux network "
+              "namespaces", file=sys.stderr)
+        return 2
+    missing = [t for t in ("unshare", "ip", "tc") if shutil.which(t) is None]
+    if missing:
+        print(f"  Error: emulated link needs {', '.join(missing)}",
+              file=sys.stderr)
+        return 2
+    setup = (f"export {NETNS_ENV}=1 && ip link set lo up && "
+             f"tc qdisc add dev lo root netem {_netem_spec(args)}")
+    cmd = [sys.executable, "-m", "aiomoqt.tools.loopback_bench",
+           *sys.argv[1:]]
+    if _succeeds(["unshare", "-rn", "true"]):
+        argv = ["unshare", "-rn", "sh", "-c", f'{setup} && exec "$@"', "sh"]
+    elif (shutil.which("sudo") and shutil.which("setpriv")
+          and _succeeds(["sudo", "-n", "-E", "unshare", "-n", "true"])):
+        # Root only for the netns and qdisc; the bench runs as the caller.
+        drop = (f"setpriv --reuid={os.getuid()} --regid={os.getgid()} "
+                f"--init-groups")
+        argv = ["sudo", "-n", "-E", "unshare", "-n", "sh", "-c",
+                f'{setup} && exec {drop} "$@"', "sh"]
+        print("  netns: unprivileged user namespaces unavailable, "
+              "using sudo -n unshare", file=sys.stderr)
+    else:
+        print("  Error: emulated link needs a private network namespace: "
+              "'unshare -rn' failed (user namespaces restricted?) and "
+              "'sudo -n unshare -n' is not permitted", file=sys.stderr)
+        return 2
+    # The child gets Ctrl-C from the terminal and exits on its own.
+    prev = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        return subprocess.run(argv + cmd).returncode
+    finally:
+        signal.signal(signal.SIGINT, prev)
 
 
 def print_banner(args):
@@ -177,6 +270,13 @@ def print_banner(args):
         + (", fanout lane" if args.fanout else "")
         + (", per-peer props" if args.per_peer_props else ""))
     row("cc algorithm", args.cc_algo)
+    if _emulated(args):
+        link = f"rtt {args.rtt_ms or 0:g} ms"
+        if args.link_mbps:
+            link += f", rate {args.link_mbps:g} Mbit/s"
+        if args.loss:
+            link += f", loss {args.loss:g}%"
+        row("link", link + " (netem on netns lo)")
     row("sub-groups", args.streams)
     row("group size", f"{args.group_size} objects")
     if args.verify_payload:
@@ -368,6 +468,8 @@ async def run_subscriber(args, stats):
 
 async def main():
     args = parse_args()
+    if _emulated(args) and not os.environ.get(NETNS_ENV):
+        return _reexec_in_netns(args)
     _cli.apply_logging(args)
 
     # AIOMOQT_TASK_DUMP=1 installs SIGUSR1 (task stacks) + SIGUSR2
