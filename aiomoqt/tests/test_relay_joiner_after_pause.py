@@ -199,8 +199,10 @@ async def test_a_track_paused_since_publish_joins_at_live(draft, use_quic):
 
             rx2 = await connect2()
             live2, fetched = _collect(rx2)
+            fetch_of = {}
             for name in _GOP:
                 ok, rid, reply = await _join(rx2, name, draft)
+                fetch_of[rid] = name
                 largest = _reply_largest(ok)
                 assert largest is not None and largest > published[name], (
                     name, largest, published[name])
@@ -209,7 +211,7 @@ async def test_a_track_paused_since_publish_joins_at_live(draft, use_quic):
             assert await _until(lambda: all(live2.values())), live2
             await asyncio.sleep(0.2)
             stale = {rid: [loc for loc in locs
-                           if any(loc <= p for p in published.values())]
+                           if loc <= published[fetch_of[rid]]]
                      for rid, locs in fetched.items()}
             assert not any(stale.values()), (published, stale)
             assert rx2._close_err is None

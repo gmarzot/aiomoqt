@@ -283,46 +283,78 @@ class LocTrackPublisher(PublishedTrack):
             return frame.group_id
         return group_id + 1
 
+    def _prepare(self, frame: LocFrame, group_id: int,
+                 obj_id: int) -> Optional[bytes]:
+        """Stamp a numbered frame and package it; None drops it."""
+        if frame.timestamp is None:
+            frame.timestamp = self._now()
+        if self.frindell is not None and frame.capture_us is not None:
+            frame.extensions = {
+                **(frame.extensions or {}),
+                **self.frindell.object_properties(group_id, obj_id,
+                                                  frame.capture_us)}
+        return self._package(frame.payload, group_id, obj_id)
+
     async def produce(self, out) -> None:
         """Consume the frame queue until finish(), numbering each object
         once; groups rotate on key frames. Properties are built per peer,
-        since the timestamp ids a peer accepts depend on its draft."""
+        since the timestamp ids a peer accepts depend on its draft.
+
+        With a FETCH history, the group in progress while paused is
+        packaged into it, and a resume continues that group at its next
+        object when the history holds its head."""
+        history = self._history
         group_id = -1
         obj_id = 0
         resume_on_key = True  # first group opens on a key frame
+        paused_group = None   # a group opened on a key frame while paused
         while True:
             frame = await self._frames.get()
             if frame is None:
                 break
             if not self.producing:
                 # Forward State 0: number the frame so Largest follows the
-                # source, but send and keep nothing; reset the open group
-                # and resume only at a key frame in a new group.
+                # source, but send nothing; reset the open group. A history
+                # keeps the open group only.
                 out.reset_group()
                 resume_on_key = True
                 if frame.key_frame or group_id < 0:
+                    if paused_group is not None:
+                        history.discard(paused_group)
+                        paused_group = None
                     group_id = self._next_group(frame, group_id)
                     obj_id = 0
-                self._note_largest(group_id, obj_id)
+                    if history is not None and frame.key_frame:
+                        paused_group = group_id
+                if history is not None and (
+                        group_id == paused_group and obj_id == 0
+                        or history.first_held(group_id) == 0):
+                    payload = self._prepare(frame, group_id, obj_id)
+                    if payload is None:
+                        self.frames_dropped += 1
+                        continue
+                    self._on_produced(group_id, obj_id, payload,
+                                      functools.partial(
+                                          self._object_extensions, frame,
+                                          obj_id == 0))
+                else:
+                    self._note_largest(group_id, obj_id)
+                    self.frames_dropped += 1
                 obj_id += 1
-                self.frames_dropped += 1
                 continue
             if resume_on_key and not frame.key_frame:
-                self.frames_dropped += 1
-                continue
+                # With its head held the open group continues; each peer's
+                # lane rejoins it as its Forward State returns to 1.
+                if history is None or history.first_held(group_id) != 0:
+                    self.frames_dropped += 1
+                    continue
             resume_on_key = False
+            paused_group = None
             if frame.key_frame or group_id < 0:
                 group_id = self._next_group(frame, group_id)
                 obj_id = 0
             group_start = obj_id == 0
-            if frame.timestamp is None:
-                frame.timestamp = self._now()
-            if self.frindell is not None and frame.capture_us is not None:
-                frame.extensions = {
-                    **(frame.extensions or {}),
-                    **self.frindell.object_properties(group_id, obj_id,
-                                                      frame.capture_us)}
-            payload = self._package(frame.payload, group_id, obj_id)
+            payload = self._prepare(frame, group_id, obj_id)
             if payload is None:
                 self.frames_dropped += 1
                 continue
