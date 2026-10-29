@@ -407,14 +407,14 @@ async def test_lane_order_with_and_without_write_through(
     seen: dict = {}
     async with _loopback(_port(9, draft, use_quic), draft, rx,
                          use_quic=use_quic) as session:
-        # A per-stream budget under two objects: writes keep alternating
-        # between taken inline and queued behind backpressure.
+        # A per-stream budget under two objects, and every third write
+        # refused: objects alternate between taken inline and queued.
         session._session.tx_max_inflight_bytes = 4000
         tries = {True: 0, False: 0}
         real = session.stream_write_nowait
 
         def counted(sid, data):
-            ok = real(sid, data)
+            ok = sum(tries.values()) % 3 != 2 and real(sid, data)
             tries[ok] += 1
             return ok
         session.stream_write_nowait = counted
