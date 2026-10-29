@@ -248,12 +248,17 @@ Nothing to set: both tools default to namespace `aiomoqt`, so they meet
 there, and `-T v1080p` on both is what selects the track.
 
 
-- `--video` sets object size, rate and GOP together, overriding `-s`,
-  `-r` and `-g`. Flat alternative: `-s 4096 -r 120 -g 240`, which is 2 s
-  groups at 120 objects per second. Stream turnover is rate divided by
-  group size, so lower `-g` to exercise churn.
-- `--video` with `-D/--datagram` is refused: profile I-frames are far
-  past the 1152-byte one-packet ceiling.
+- `--video` takes I/P/B frame sizes from the resolution: one object per
+  frame, one GOP per group opening on the I-frame, one subgroup stream.
+  `-r` stays objects per second, so it is the frame rate (default 30), and
+  `-g` stays objects per group, so it is the GOP length in frames (default
+  one second of frames): `--video 1080p -r 60 -g 120` is 60 fps with 2 s
+  GOPs. pub_bench, pub_server and adaptive_bench subs mode all take it.
+- `--video` refuses `-s`, `-P` and `-D`: the profile sets each frame's
+  size, sends one stream, and its I-frames are far past the 1152-byte
+  one-packet datagram ceiling. Flat alternative: `-s 4096 -r 120 -g 240`,
+  which is 2 s groups at 120 objects per second. Stream turnover is rate
+  divided by group size, so lower `-g` to exercise churn.
 - `--no-stats` counts objects and bytes only, measuring the delivery
   ceiling without the measurement in it.
 
@@ -326,7 +331,9 @@ It prints what it is waiting for:
 `role=sub — expecting an external publisher on perf/subs-ramp at 10 Mbps`.
 
 **Both sides need the same `-N`, `-T` and `--sub-mbps`**, and `-T`
-defaults to a random suffix, so it has to be pinned explicitly.
+defaults to a random suffix, so it has to be pinned explicitly. For a
+video-shaped track, give both sides `--video RES` (and the same `-g`) in
+place of `--sub-mbps` and `-s`; the profile sets the bitrate.
 
 Ramp knobs:
 
