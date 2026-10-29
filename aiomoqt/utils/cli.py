@@ -42,6 +42,7 @@ session           --draft -k/--insecure --keylogfile --cc-algo
 keepalive         --keepalive
 fetch history     --fetch-history (long only)
 compat            --compat
+payload check     --verify-payload [N] (long only)
 help              -h/-?/--help on every tool (-? is a shell glob: quote it)
 
 split execution (tools that can run one end or both)
@@ -223,6 +224,17 @@ def add_video(p):
                         f'the frame rate (default: {VIDEO_FPS}) and -g the '
                         'GOP length in frames (default: 1 s of frames); '
                         'not with -s, -P or -D.')
+
+
+def add_payload_check(p):
+    """Subscriber side: check received objects against the bench layout
+    (aiomoqt.utils.payload)."""
+    p.add_argument('--verify-payload', type=int, nargs='?', const=1,
+                   default=0, metavar='N',
+                   help='Check each received object, or every Nth, '
+                        'against the bench payload layout; a bad object '
+                        'fails the run. Off by default: it adds '
+                        'per-object CPU to the subscriber.')
 
 
 # -- run / session ---------------------------------------------------

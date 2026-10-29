@@ -128,7 +128,8 @@ def _assert_profile_shape(objs, res, gop):
         assert [oid for oid, _ in frames] == list(range(gop)), gid
         for oid, payload in frames:
             ft = pattern[oid]
-            assert payload.startswith(f"{gid}.{oid}.{ft}|".encode())
+            assert payload.startswith(
+                f"{gid}.{oid}.{size[ft]}.{ft}|".encode())
             assert len(payload) == size[ft], (gid, oid, ft)
 
 

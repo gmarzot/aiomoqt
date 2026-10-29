@@ -217,6 +217,16 @@ object of a group can be made as large or small as the question needs.
 **There is no synthetic audio.** The bench tools are video-shaped only.
 Audio lives in the media runbook, as a pcm-s16 tone or real AAC.
 
+**Every payload byte follows from the object's location.** A generated
+object is `{group}.{object}.{size}|` (a video frame:
+`{group}.{object}.{size}.{type}|`), then the 0..255 counting pattern, cut
+to size. `--verify-payload` on sub_bench and loopback_bench checks each
+received object against that and fails the run on a mismatch, so objects
+swapped, shifted, truncated or corrupted on the way show up. The check
+costs the subscriber about 0.4 µs per 1–4 KiB object and 3.6 µs per
+200 KB frame (Ryzen 7 PRO 7840U), so leave it off for ceiling runs, or
+pass `--verify-payload N` to check every Nth object.
+
 ## A — loopback self-test
 
 One process hosting both ends and its own relay. Nothing to set up and

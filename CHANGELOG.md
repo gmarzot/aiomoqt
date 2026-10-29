@@ -83,6 +83,7 @@
 - aiomoqt-relay: a subscriber that joins as the publisher ends the track still gets its cached objects.
 - A failed d20+ fill keeps its FETCH_HEADER on the reset (RESET_STREAM_AT), so the subscriber sees the failure at once instead of at its timeout.
 - pub_server and adaptive_bench (subs mode) take `--video RES`, like pub_bench; with it `-r` is the frame rate (default 30) and `-g` the GOP length in frames (default 1 s), and `-s`, `-P` and `-D` are refused instead of ignored.
+- sub_bench and loopback_bench `--verify-payload [N]` check each received object (or every Nth) against the bench layout and fail the run on a mismatch; generated objects now carry their size (`{group}.{object}.{size}|`) and video frames the counting filler.
 
 ## v0.13.3
 

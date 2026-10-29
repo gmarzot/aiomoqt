@@ -53,6 +53,7 @@ from .messages.fetch import _is_joining
 from .utils.buffer import Buffer, BufferReadError
 from .utils.format import fmt_bps, fmt_rate
 from .utils.logger import TRACE, get_category_logger, get_logger
+from .utils.payload import counted
 from .utils.timing import (
     TimestampMalformed, TimestampWriter, TrackTiming, check_object,
 )
@@ -866,13 +867,12 @@ class PublishedTrack(Track):
         if self._largest is None or (group_id, object_id) > self._largest:
             self._largest = (group_id, object_id)
 
-    def _counted_pad(self) -> bytes:
-        """The default generator's byte pattern (0..255 repeating). With
-        the per-object f"{group}.{obj}|" prefix every byte of every object
-        is predictable — easy to spot duplicates, skips and corruption in
-        a decrypted pcap. The prefix says which object; the count, the
-        offset within it."""
-        return bytes(i & 0xFF for i in range(self.object_size))
+    def _payload_tail(self) -> bytes:
+        """What follows f"{group}.{obj}" in a generated object: ".{size}|"
+        then the counting pattern (aiomoqt.utils.payload). Every byte
+        follows from the object's location, so PayloadCheck, or a
+        decrypted pcap, shows swapped, shifted or truncated objects."""
+        return f".{self.object_size}|".encode() + counted(self.object_size)
 
     def prefill(self, groups: int) -> None:
         """Record `groups` groups of the default generator's objects as
@@ -881,13 +881,13 @@ class PublishedTrack(Track):
         next group."""
         if self._history is None:
             raise ValueError("prefill() needs a FETCH history")
-        pad = self._counted_pad()
+        pad = self._payload_tail()
         first = 0 if self._largest is None else self._largest[0] + 1
         datagram = self.forwarding == ForwardingPreference.DATAGRAM
         extensions = {LOC_TIMESTAMP: int(time.time() * 1_000_000)}
         for group_id in range(first, first + groups):
             for object_id in range(self.group_size):
-                payload = (f"{group_id}.{object_id}".encode() + b'|'
+                payload = (f"{group_id}.{object_id}".encode()
                            + pad)[:self.object_size]
                 self._remember(
                     group_id, object_id, payload,
@@ -1649,7 +1649,7 @@ class PublishedTrack(Track):
             await asyncio.shield(self._ensure_production())
             return
 
-        pad = self._counted_pad()
+        pad = self._payload_tail()
 
         if self.forwarding == ForwardingPreference.DATAGRAM:
             self._check_datagram_fit()
@@ -1744,8 +1744,8 @@ class PublishedTrack(Track):
                         self._range_ended(sub)
                         raise asyncio.CancelledError
 
-                seq_info = f"{group_id}.{cur_obj_id}".encode()
-                payload = (seq_info + b'|' + pad)[:self.object_size]
+                payload = (f"{group_id}.{cur_obj_id}".encode()
+                           + pad)[:self.object_size]
                 obj = ObjectDatagram(
                     track_alias=track_alias,
                     group_id=group_id,
@@ -1875,8 +1875,8 @@ class PublishedTrack(Track):
                         self._range_ended(sub)
                         raise asyncio.CancelledError
 
-                seq_info = f"{group_id}.{cur_obj_id}".encode()
-                payload = (seq_info + b'|' + pad)[:self.object_size]
+                payload = (f"{group_id}.{cur_obj_id}".encode()
+                           + pad)[:self.object_size]
 
                 extensions = (
                     {LOC_TIMESTAMP: int(time.time() * 1_000_000)}
@@ -2550,10 +2550,11 @@ class VideoTrack(PublishedTrack):
                                  subgroup_id, priority)
         local_sent = 0
 
-        # Pre-generate padding per frame type
-        i_pad = b'\x49' * self.i_frame_size  # 'I'
-        p_pad = b'\x50' * self.p_frame_size  # 'P'
-        b_pad = b'\x42' * self.b_frame_size  # 'B'
+        # Per frame type, what follows f"{group}.{obj}": ".{size}.{type}|"
+        # then the counting pattern.
+        i_pad = f".{self.i_frame_size}.I|".encode() + counted(self.i_frame_size)
+        p_pad = f".{self.p_frame_size}.P|".encode() + counted(self.p_frame_size)
+        b_pad = f".{self.b_frame_size}.B|".encode() + counted(self.b_frame_size)
         stamp = self._stamper(session)
         ts_charge = _LOC_TS_CHARGE if stamp is None else None
 
@@ -2586,8 +2587,7 @@ class VideoTrack(PublishedTrack):
                 else:
                     frame_pad = b_pad
 
-                seq_info = f"{group_id}.{cur_obj_id}.{ft}".encode()
-                payload = (seq_info + b'|'
+                payload = (f"{group_id}.{cur_obj_id}".encode()
                            + frame_pad)[:frame_size]
 
                 extensions = (

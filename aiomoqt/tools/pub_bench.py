@@ -54,7 +54,8 @@ class _GapTrack(PublishedTrack):
     ID Gap on the rest."""
 
     async def produce(self, out) -> None:
-        pad = bytes(self.object_size)
+        pad = self._payload_tail()
+        size = self.object_size
         interval = 1.0 / self.rate if self.rate > 0 else 0
         group_id = 0
         while True:
@@ -62,8 +63,9 @@ class _GapTrack(PublishedTrack):
                 object_id = 2 * n
                 props = ({PRIOR_OBJECT_ID_GAP: 1} if object_id
                          else {PRIOR_GROUP_ID_GAP: 1} if group_id else None)
-                await out.write(group_id, object_id, pad, extensions=props,
-                                group_start=object_id == 0)
+                payload = (f"{group_id}.{object_id}".encode() + pad)[:size]
+                await out.write(group_id, object_id, payload,
+                                extensions=props, group_start=object_id == 0)
                 await asyncio.sleep(interval)
             group_id += 2
 
