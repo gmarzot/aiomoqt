@@ -3174,8 +3174,8 @@ class _MOQTSessionMixin:
         reports only the peer's close code, so a nonzero code without
         transmit is the peer's; code 0 there may be a local close (idle
         timeout) and is worded neutrally. kind (see _close_kind) picks the
-        code table. Clean codes log INFO, a peer's error WARNING, our own
-        error ERROR. Only a session's first close is logged."""
+        code table. Clean codes and our GOAWAY_TIMEOUT log INFO, a peer's
+        error WARNING, our own error ERROR. Only a session's first close is logged."""
         if self._close_logged:
             return
         self._close_logged = True
@@ -3219,6 +3219,8 @@ class _MOQTSessionMixin:
         if code == 0 or (self._is_wt and kind != 'transport'
                          and code == _H3_NO_ERROR):
             logger.info(msg)
+        elif transmit and kind is None and code == SessionCloseCode.GOAWAY_TIMEOUT:
+            logger.info(msg)  # an orderly shutdown
         elif transmit:
             logger.error(msg)
         else:

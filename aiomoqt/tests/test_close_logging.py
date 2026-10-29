@@ -99,6 +99,22 @@ async def test_local_error_close_logs_error(records):
     assert s.sent == [()]
 
 
+@pytest.mark.parametrize("is_wt", [False, True], ids=["quic", "wt"])
+async def test_our_goaway_timeout_close_logs_info(records, is_wt):
+    s = _stub(is_wt=is_wt, setup_done=True)
+    s._close_session(SessionCloseCode.GOAWAY_TIMEOUT, "relay restarting")
+    rec = _close_line(records)
+    assert rec.levelno == logging.INFO
+    assert rec.getMessage() == ("MOQT: closing: GOAWAY_TIMEOUT (0x10) to "
+                                "158.23.190.70:6983; reason: relay restarting")
+
+
+async def test_peer_goaway_timeout_close_logs_warning(records):
+    s = _stub(is_wt=False, setup_done=True)
+    s._close_session(SessionCloseCode.GOAWAY_TIMEOUT, "", transmit=False)
+    assert _close_line(records).levelno == logging.WARNING
+
+
 async def test_h3_codes_are_not_named_on_raw_quic(records):
     s = _stub(is_wt=False, setup_done=True)
     s._close_session(0x100, "x", transmit=False)

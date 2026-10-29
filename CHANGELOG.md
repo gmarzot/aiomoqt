@@ -2,7 +2,7 @@
 
 ## v0.14.0
 
-- A session logs one close line, ours included, with the peer address after the transport is gone; it has no `; reason:` part when none was given (no more `ConnectionTerminated` or `no error` placeholders), and the peer's reason is cut to 1024 bytes and escaped outside printable ASCII.
+- A session logs one close line, ours included, with the peer address after the transport is gone; it has no `; reason:` part when none was given (no more `ConnectionTerminated` or `no error` placeholders), and the peer's reason is cut to 1024 bytes and escaped outside printable ASCII. A GOAWAY_TIMEOUT close we send logs INFO.
 - aiomoqt-relay honours MAX_CACHE_DURATION: an object past it is not forwarded, replayed or served from the cache (a FETCH for it goes upstream), and an explicit OBJECT_DELIVERY_TIMEOUT now also times cache replays (`--lag-limit` still does not). The per-object record charge is 224 bytes (was 192).
 - aiomoqt-relay forwards a subscriber's NEW_GROUP_REQUEST: in its upstream SUBSCRIBE, or to an established upstream in a REQUEST_UPDATE when it is 0 or above the Largest Group and the track declares DYNAMIC_GROUPS=1, once while an equal or larger request is outstanding. `SubscribedTrack.subscribe(parameters=)` adds parameters to a direct SUBSCRIBE.
 - aiomoqt-relay honours OBJECT_DELIVERY_TIMEOUT per subscriber (the smaller of the publisher's and the subscriber's, updated by REQUEST_UPDATE); with none set, `--lag-limit SEC` (default 5, 0 = never) drops live objects that old. Expired subgroups are reset with DELIVERY_TIMEOUT; status shows `lane_expired`.
