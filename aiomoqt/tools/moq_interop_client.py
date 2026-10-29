@@ -189,6 +189,10 @@ INTEROP_TRACK = f"track-{_unique_suffix()}"
 # model (e.g. moqtail) rather than a failure. Mirrors moq-rs's 5s.
 _SUBSCRIBE_WAIT = 5.0
 
+# How long publish-track-subscribe waits for the PUBLISH reply before
+# subscribing anyway.
+_PUBLISH_REPLY_WAIT = 1.0
+
 # PUBLISH_NAMESPACE parameters used by the standard tests.
 # Default empty: anonymous tests should look anonymous. AUTH_TOKEN is
 # added only when --auth-token / $AUTH_TOKEN is set explicitly. Some
@@ -385,14 +389,22 @@ def _make_client(host: str, port: int, path: str, use_quic: bool,
     )
 
 
-def _publish_reply(session, request_id: int) -> asyncio.Future:
+def _publish_reply(session, request_id: int, track=None) -> asyncio.Future:
     """The future the relay's reply to our PUBLISH resolves. Take it before
-    the next await; a d14/d16 PUBLISH_OK goes to the track and leaves it
-    pending."""
+    the next await. A d14/d16 PUBLISH_OK goes to the track, not the
+    session, so it resolves the future only through `track`."""
     fut = session._pending_requests.get(request_id)
     if fut is None:
         fut = session._loop.create_future()
         session._pending_requests[request_id] = fut
+    if track is not None:
+        on_ok = track._on_publish_ok
+
+        async def _on_publish_ok(sess, msg):
+            if not fut.done():
+                fut.set_result(msg)
+            await on_ok(sess, msg)
+        track._on_publish_ok = _on_publish_ok
     return fut
 
 
@@ -1661,7 +1673,10 @@ async def test_publish_track_subscribe(host, port, path, use_quic,
                 track._quiet = True
                 track._stats_header_printed = True
                 await track.publish(publish_track=True)
-                reply = _publish_reply(pub_session, track.request_id)
+                reply = _publish_reply(pub_session, track.request_id, track)
+                # The relay holds the track only once it has answered; a
+                # SUBSCRIBE on another connection can overtake the PUBLISH.
+                await asyncio.wait({reply}, timeout=_PUBLISH_REPLY_WAIT)
 
                 async with sub_client.connect() as sub_session:
                     await sub_session.client_session_init()
