@@ -270,6 +270,23 @@ def _close_kind(event: Any) -> Optional[str]:
     return None
 
 
+def _closed_reason(reason: Any) -> str:
+    return f"session closed: {reason}" if reason else "session closed"
+
+
+_LOG_ESCAPES = {c: f"\\x{c:02x}" for c in (*range(0x20), 0x7f)}
+
+
+def _log_safe_reason(reason: Any) -> str:
+    """A Reason Phrase for a log line: cut to REASON_PHRASE_MAX bytes,
+    anything outside printable ASCII backslash-escaped."""
+    raw = (bytes(reason) if isinstance(reason, (bytes, bytearray, memoryview))
+           else str(reason).encode(errors="backslashreplace"))
+    text = raw[:MOQTMessage.REASON_PHRASE_MAX].decode(errors="backslashreplace")
+    return text.translate(_LOG_ESCAPES).encode(
+        "ascii", "backslashreplace").decode()
+
+
 class _MOQTSessionMixin:
     """MoQT session methods. Mix with an aiopquic transport base —
     QuicConnectionProtocol for raw QUIC, WebTransportSession (via
@@ -293,6 +310,9 @@ class _MOQTSessionMixin:
     _goaway_sent = False
     # drain(): every later peer SUBSCRIBE and FETCH is refused.
     _draining = False
+    _close_logged = False
+    # The peer's address, kept for close lines once the transport is gone.
+    _peer_addr: Optional[Tuple[str, int]] = None
     # The peer's control-stream GOAWAY: no new request is sent after it.
     goaway_received: Optional['GoAway'] = None
     # Called as on_goaway(msg, request_id) for each GOAWAY received:
@@ -666,7 +686,7 @@ class _MOQTSessionMixin:
             self._pending_requests.pop(request_id, None)
             raise MOQTRequestError(
                 error_code=int(RequestErrorCode.INTERNAL_ERROR),
-                reason=f"session closed: {self._close_err[1]}",
+                reason=_closed_reason(self._close_err[1]),
                 retry_interval=0)
         try:
             async with asyncio.timeout(timeout):
@@ -3014,12 +3034,13 @@ class _MOQTSessionMixin:
         if (hasattr(event, 'error_code')
                 and not isinstance(event, (StopSendingReceived, StreamReset))):
             error = getattr(event, 'error_code', QuicErrorCode.INTERNAL_ERROR)
-            reason = getattr(event, 'reason_phrase', None) or class_name(event)
+            reason = getattr(event, 'reason_phrase', None) or ""
             self._close_session(error, reason, transmit=False,
                                 kind=_close_kind(event))
             return
 
         if isinstance(event, ProtocolNegotiated):
+            self._note_peer_address()
             # Enforce supported ALPN. WT path runs over H3 inside picoquic;
             # only MoQT-on-raw-QUIC ALPNs surface here.
             alpn = event.alpn_protocol
@@ -3107,6 +3128,7 @@ class _MOQTSessionMixin:
             return
         elif isinstance(event, HandshakeCompleted):
             logger.debug("QUIC: handshake complete")
+            self._note_peer_address()
             return
         elif isinstance(event, StopSendingReceived):
             transport_log.debug(f"MOQT event: StopSendingReceived: stream {event.stream_id}")
@@ -3140,7 +3162,7 @@ class _MOQTSessionMixin:
             if not fut.done():
                 fut.set_exception(MOQTRequestError(
                     error_code=int(RequestErrorCode.INTERNAL_ERROR),
-                    reason=f"session closed: {reason}", retry_interval=0))
+                    reason=_closed_reason(reason), retry_interval=0))
                 fut.exception()  # marks it retrieved if nothing awaits it
         for fut in self._fetch_done_futures.values():
             if not fut.done():
@@ -3152,8 +3174,11 @@ class _MOQTSessionMixin:
         reports only the peer's close code, so a nonzero code without
         transmit is the peer's; code 0 there may be a local close (idle
         timeout) and is worded neutrally. kind (see _close_kind) picks the
-        code table. Clean codes log INFO, a peer's error WARNING, our own
-        error ERROR."""
+        code table. Clean codes and our GOAWAY_TIMEOUT log INFO, a peer's
+        error WARNING, our own error ERROR. Only a session's first close is logged."""
+        if self._close_logged:
+            return
+        self._close_logged = True
         try:
             code = int(error_code)
         except (TypeError, ValueError):
@@ -3180,10 +3205,8 @@ class _MOQTSessionMixin:
         else:
             side, prep = "connection closed", "peer"
         msg = f"MOQT: {side}: {label}"
-        try:
-            addr = self.peer_address
-        except Exception:
-            addr = None
+        self._note_peer_address()
+        addr = self._peer_addr
         if addr:
             host = f"[{addr[0]}]" if ":" in addr[0] else addr[0]
             msg += f" {prep} {host}:{addr[1]}"
@@ -3192,18 +3215,28 @@ class _MOQTSessionMixin:
                                       and setup.result()):
             msg += ", before MoQT setup"
         if reason_phrase:
-            msg += f"; reason: {reason_phrase}"
+            msg += f"; reason: {_log_safe_reason(reason_phrase)}"
         if code == 0 or (self._is_wt and kind != 'transport'
                          and code == _H3_NO_ERROR):
             logger.info(msg)
+        elif transmit and kind is None and code == SessionCloseCode.GOAWAY_TIMEOUT:
+            logger.info(msg)  # an orderly shutdown
         elif transmit:
             logger.error(msg)
         else:
             logger.warning(msg)
 
+    def _note_peer_address(self) -> None:
+        """Keep the peer's address while the transport can report it."""
+        if self._peer_addr is None:
+            try:
+                self._peer_addr = self.peer_address
+            except Exception:
+                pass
+
     def _close_session(self,
               error_code: SessionCloseCode = SessionCloseCode.NO_ERROR,
-              reason_phrase: str = "no error", *,
+              reason_phrase: str = "", *,
               transmit: bool = True, kind: Optional[str] = None) -> None:
         """Close the MoQT session. The first close's code is the one sent;
         transmit=False when the peer already closed the connection; kind
@@ -3247,12 +3280,12 @@ class _MOQTSessionMixin:
 
     def close(self,
               error_code: SessionCloseCode = SessionCloseCode.NO_ERROR,
-              reason_phrase: str = "no error"
+              reason_phrase: str = ""
         ) -> None:
         """Session Protocol Close"""
         if self._close_err is not None:
             error_code, reason_phrase = self._close_err
-        logger.info(f"MOQT session: closing: {reason_phrase} ({error_code})")
+        self._log_close(error_code, reason_phrase, True)
 
         # A graceful close FINs the data streams we write (end_stream on a
         # peer-initiated stream is a RESET_STREAM), never the control stream
@@ -6973,6 +7006,7 @@ class _WTSessionMixin:
 
     def _moqt_wt_finalize(self) -> None:
         self._quic = self
+        self._note_peer_address()
         if not self._wt_session_setup.done():
             self._wt_session_setup.set_result(True)
 
@@ -7008,8 +7042,7 @@ class _WTSessionMixin:
             super()._on_event(ev_tuple)
             reason = bytes(data).decode(errors="replace") if data else ""
             self._close_session(
-                error_code, reason or "WebTransport session closed",
-                transmit=False,
+                error_code, reason, transmit=False,
                 kind=_close_kind(getattr(self, '_session_close_event', None)))
         else:
             super()._on_event(ev_tuple)
@@ -7028,6 +7061,10 @@ class MOQTSessionWTClient(
                          wt_available_protocols=wt_available_protocols,
                          session=session)
         self._moqt_wt_finalize()
+
+    async def open(self, timeout: float = 10.0) -> None:
+        await super().open(timeout=timeout)
+        self._note_peer_address()
 
 
 class MOQTSessionWTServer(

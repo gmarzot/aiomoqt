@@ -4935,12 +4935,8 @@ DRAIN_TIMEOUT_NO_URI_S = 2.0
 
 
 def _shutdown_reason(uri: str) -> str:
-    """Reason Phrase for a shutdown close: `<why>; reconnect-to=<where>`,
-    at most REASON_PHRASE_MAX bytes."""
-    text = (f"relay shutting down; reconnect-to={uri}" if uri
-            else "relay restarting; reconnect-to=same-address")
-    return text.encode()[:MOQTMessage.REASON_PHRASE_MAX].decode(
-        errors="ignore")
+    """Reason Phrase for a shutdown close; GOAWAY carries the successor URI."""
+    return "relay shutting down" if uri else "relay restarting"
 
 
 def _setup_done(session) -> bool:

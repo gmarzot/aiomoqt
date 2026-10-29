@@ -261,8 +261,7 @@ async def test_relay_process_default_drain_wait(tmp_path, transport, uri,
     assert seen[0].new_session_uri == uri, out
     assert seen[0].timeout == int(wait * 1000), out
     assert wait <= elapsed < wait + 1.0, (elapsed, out)
-    reason = (f"relay shutting down; reconnect-to={uri}" if uri
-              else "relay restarting; reconnect-to=same-address")
+    reason = "relay shutting down" if uri else "relay restarting"
     assert holder._close_err == (SessionCloseCode.GOAWAY_TIMEOUT, reason), \
         holder._close_err
     assert any(line.startswith("MOQT: peer closed: GOAWAY_TIMEOUT (0x")

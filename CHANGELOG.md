@@ -3,13 +3,14 @@
 ## v0.14.0
 
 - aiomoqt-relay: a track paused at PUBLISH records a pause gap like a later pause, so the first joiner's FETCH or fill for the open group comes from upstream instead of a short cache answer; a fill the cache answers with nothing asks upstream.
+- A session logs one close line, ours included, with the peer address after the transport is gone; it has no `; reason:` part when none was given (no more `ConnectionTerminated` or `no error` placeholders), and the peer's reason is cut to 1024 bytes and escaped outside printable ASCII. A GOAWAY_TIMEOUT close we send logs INFO.
 - loopback_bench `--rtt-ms`, `--link-mbps`, `--loss`: emulated link (netem) on a private network namespace's lo; needs privileges to create one.
 - aiomoqt-relay honours MAX_CACHE_DURATION: an object past it is not forwarded, replayed or served from the cache (a FETCH for it goes upstream), and an explicit OBJECT_DELIVERY_TIMEOUT now also times cache replays (`--lag-limit` still does not). The per-object record charge is 224 bytes (was 192).
 - aiomoqt-relay forwards a subscriber's NEW_GROUP_REQUEST: in its upstream SUBSCRIBE, or to an established upstream in a REQUEST_UPDATE when it is 0 or above the Largest Group and the track declares DYNAMIC_GROUPS=1, once while an equal or larger request is outstanding. `SubscribedTrack.subscribe(parameters=)` adds parameters to a direct SUBSCRIBE.
 - aiomoqt-relay honours OBJECT_DELIVERY_TIMEOUT per subscriber (the smaller of the publisher's and the subscriber's, updated by REQUEST_UPDATE); with none set, `--lag-limit SEC` (default 5, 0 = never) drops live objects that old. Expired subgroups are reset with DELIVERY_TIMEOUT; status shows `lane_expired`.
 - pub_server exits 2 when it has no TLS certificate (was 0), as aiomoqt-relay and moqtest_origin do.
 - loopback_bench and adaptive_bench (loopback) generate a self-signed localhost cert when none is found; servers still require one.
-- aiomoqt-relay `--drain-timeout` defaults to 2 s when `--goaway-uri` is empty, 5 s with one; GOAWAY's Timeout carries the wait. Its shutdown closes give `relay restarting; reconnect-to=same-address` or `relay shutting down; reconnect-to=<uri>` as the reason (WebTransport clients receive it).
+- aiomoqt-relay `--drain-timeout` defaults to 2 s when `--goaway-uri` is empty, 5 s with one; GOAWAY's Timeout carries the wait. Its shutdown closes give `relay restarting`, or `relay shutting down` with a `--goaway-uri`, as the reason (WebTransport clients receive it).
 - aiomoqt-relay refuses new QUIC and WebTransport connections at the transport from the first SIGTERM/SIGINT (aiopquic `set_max_connections`); existing sessions still get GOAWAY and the drain.
 - pub_media gives each dial attempt 4 s (was 10 s), so a handshake lost in a relay restart costs a short retry.
 - aiomoqt-relay status: `tx_worker_idle_now`, `tx_event_ring_pops` and `tx_wake_lost` from the transport.

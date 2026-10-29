@@ -411,8 +411,8 @@ previous one inside a group; the player rebuilds the chunks. Audio from
   `-analyzeduration 0 -probesize 32768` is fine, but `nobuffer` alone
   yields an empty file. Not retested against an OBS source, which is why
   the flag is still in the demo C command above.
-- Publisher dies ~30 s after start with `session closed: code=0
-  reason='ConnectionTerminated'` and 0 objects sent → **keepalive off**
+- Publisher dies ~30 s after start with `MOQT: connection closed:
+  NO_ERROR (0x0)` and 0 objects sent → **keepalive off**
   (`--keepalive 0`, or aiomoqt before 0.11.0). While Forward State is 0
   the publisher correctly sends nothing, so the QUIC connection is silent
   and moxygen's 30 s idle timeout closes it. Any gap between starting a
