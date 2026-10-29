@@ -224,21 +224,31 @@ def test_loopback_bench_without_objects_exits_1(monkeypatch):
 
 def _netns_route():
     import subprocess
+    try:
+        return subprocess.run(
+            ["unshare", "-rn", "sh", "-c",
+             "ip link set lo up && tc qdisc add dev lo root netem delay 1ms"],
+            stdin=subprocess.DEVNULL, capture_output=True).returncode == 0
+    except OSError:
+        return False
 
-    def ok(*argv):
-        try:
-            return subprocess.run(argv, stdin=subprocess.DEVNULL,
-                                  capture_output=True).returncode == 0
-        except OSError:
-            return False
-    return ok("unshare", "-rn", "true") or ok("sudo", "-n", "-E", "unshare",
-                                               "-n", "true")
+
+def test_loopback_bench_rtt_ms_without_netns_exits_2(monkeypatch, capsys):
+    import sys
+    from aiomoqt.tools import loopback_bench
+    monkeypatch.setattr(loopback_bench, "_succeeds", lambda argv: False)
+    monkeypatch.setattr(loopback_bench.shutil, "which", lambda t: "/bin/" + t)
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sys, "argv", ["loopback_bench", "--rtt-ms", "50"])
+    args = loopback_bench.parse_args()
+    assert loopback_bench._reexec_in_netns(args) == 2
+    assert "need privileges to create a network namespace" in capsys.readouterr().err
 
 
 @requires_certs
 def test_loopback_bench_rtt_ms_emulates_the_link():
     if not _netns_route():
-        pytest.skip("no private netns: unshare -rn and sudo -n both refused")
+        pytest.skip("no private netns with netem: unshare -rn refused")
     rc, out = run("loopback_bench", "-Q", "-p", free_udp_port(), "--draft", 18,
                   "-t", 3, "-r", 200, "-s", 1200, "-k", "--rtt-ms", 40)
     assert rc == 0, out

@@ -132,8 +132,9 @@ Plus file descriptors, since every subscriber costs some:
   adds a rate cap and `--loss` random loss. One qdisc carries both
   directions, so the cap and the loss also hit ACKs, and its queue is
   deep (200000 packets): the cap models a deep buffer. It needs
-  `unshare -rn`, or passwordless `sudo` where user namespaces are
-  restricted (the bench then drops back to the caller's uid).
+  privileges to create a network namespace: unprivileged user
+  namespaces (`unshare -rn`), or run the bench under `sudo`. Without
+  them it exits 2.
 
 ### Verify before trusting a number
 

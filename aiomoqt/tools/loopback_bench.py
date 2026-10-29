@@ -143,7 +143,7 @@ def parse_args():
         help='Emulated round-trip time: re-runs the bench in a private '
              'network namespace with netem delay MS/2 on its lo (each '
              'packet crosses lo once). The host network is not touched. '
-             'Needs unprivileged user namespaces or passwordless sudo.')
+             'Needs privileges to create a network namespace.')
     parser.add_argument(
         '--link-mbps', type=float, default=None, metavar='N',
         help='Emulated link rate cap (netem rate), in the same netns. '
@@ -216,26 +216,16 @@ def _reexec_in_netns(args) -> int:
         print(f"  Error: emulated link needs {', '.join(missing)}",
               file=sys.stderr)
         return 2
-    setup = (f"export {NETNS_ENV}=1 && ip link set lo up && "
-             f"tc qdisc add dev lo root netem {_netem_spec(args)}")
+    setup = f"ip link set lo up && tc qdisc add dev lo root netem {_netem_spec(args)}"
+    if not _succeeds(["unshare", "-rn", "sh", "-c", setup]):
+        print("  Error: --rtt-ms/--link-mbps/--loss need privileges to create "
+              "a network namespace: run with them (e.g. under sudo) or enable "
+              "unprivileged user namespaces", file=sys.stderr)
+        return 2
     cmd = [sys.executable, "-m", "aiomoqt.tools.loopback_bench",
            *sys.argv[1:]]
-    if _succeeds(["unshare", "-rn", "true"]):
-        argv = ["unshare", "-rn", "sh", "-c", f'{setup} && exec "$@"', "sh"]
-    elif (shutil.which("sudo") and shutil.which("setpriv")
-          and _succeeds(["sudo", "-n", "-E", "unshare", "-n", "true"])):
-        # Root only for the netns and qdisc; the bench runs as the caller.
-        drop = (f"setpriv --reuid={os.getuid()} --regid={os.getgid()} "
-                f"--init-groups")
-        argv = ["sudo", "-n", "-E", "unshare", "-n", "sh", "-c",
-                f'{setup} && exec {drop} "$@"', "sh"]
-        print("  netns: unprivileged user namespaces unavailable, "
-              "using sudo -n unshare", file=sys.stderr)
-    else:
-        print("  Error: emulated link needs a private network namespace: "
-              "'unshare -rn' failed (user namespaces restricted?) and "
-              "'sudo -n unshare -n' is not permitted", file=sys.stderr)
-        return 2
+    argv = ["unshare", "-rn", "sh", "-c",
+            f'export {NETNS_ENV}=1 && {setup} && exec "$@"', "sh"]
     # The child gets Ctrl-C from the terminal and exits on its own.
     prev = signal.signal(signal.SIGINT, signal.SIG_IGN)
     try:
