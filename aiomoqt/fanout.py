@@ -62,10 +62,12 @@ class _FanoutCatalog:
             await m.finish()
 
     def drop_session(self, session) -> None:
+        """Forget the member on `session` and cancel its emitter."""
         for m in self.members:
             if m.session is session:
                 self._catalog = m.catalog
                 self._next_group = max(self._next_group, m.next_group)
+                m._stop_producing()
         self.members = [m for m in self.members if m.session is not session]
 
 

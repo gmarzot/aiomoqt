@@ -295,6 +295,53 @@ async def test_reconnect_resumes_the_timeline_after_a_relay_restart(
     assert events[-1]['reason'] == 'duration'
 
 
+@requires_certs
+@pytest.mark.parametrize('use_quic', [True, False], ids=['quic', 'wt'])
+async def test_reconnect_cancels_the_lost_sessions_catalog_emitter(
+        monkeypatch, h264_aac, arrivals, use_quic):  # noqa: F811
+    port = _BASE_PORT + 22 + (not use_quic)
+    url = _url(port, use_quic)
+    ns = 'svc/emitter'
+    pub_args = _argv(monkeypatch, 'pub_media', url, '-k', '--draft', '18',
+                     '-t', '10', '--stats', '0', '--pub-ns', '-N', ns,
+                     '--mp4', h264_aac, '--loop', '--reconnect')
+    sub_args = _argv(monkeypatch, 'sub_media', url, '-k', '--draft', '18',
+                     '-N', ns, '--analyze', '-t', '2', '-i', '1')
+    emitters = []   # (catalog track, its session, emitter task)
+    generate = CatalogTrackPublisher.generate
+
+    async def recording(self, session, track_alias):
+        await generate(self, session, track_alias)
+        emitters.append((self, session, self._emitter))
+    monkeypatch.setattr(CatalogTrackPublisher, 'generate', recording)
+    srv, handle = await _serve(port, use_quic, 18)
+    pub = None
+    try:
+        pub = asyncio.ensure_future(pub_media.run(pub_args))
+        await _until(lambda: relay._announced or pub.done(), 10)
+        assert await sub_media.run(sub_args) == 0
+        old = list(emitters)
+        assert old
+        await _stop(srv, handle)
+        await asyncio.sleep(0.3)
+        srv, handle = await _serve(port, use_quic, 18)
+        await _until(lambda: relay._announced or pub.done(), 10)
+        assert not pub.done()
+        seen = len(arrivals)
+        assert await sub_media.run(sub_args) == 0
+        assert len(arrivals) > seen
+        for _, _, task in old:
+            assert task.done(), task
+        new = [(c, t) for c, s, t in emitters[len(old):]
+               if s not in {s for _, s, _ in old}]
+        assert new and any(c._total_sent for c, _ in new), emitters
+        await asyncio.wait_for(pub, 15)
+    finally:
+        if pub is not None and not pub.done():
+            pub.cancel()
+        await _stop(srv, handle)
+
+
 # -- catalog numbering across sessions -----------------------------------------
 
 async def test_catalog_groups_continue_on_a_new_session():

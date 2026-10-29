@@ -79,9 +79,10 @@ class StreamMapping(Enum):
 
 
 # Charged per retained object on top of its payload and properties, so a
-# run of empty objects is bounded too: record tuple, container slot,
-# Object ID and payload object header measure about 185 B.
-OBJECT_RECORD_BYTES = 192
+# run of empty objects is bounded too: the relay's cache record (tuple,
+# container slot, Object ID, arrival time, payload object header) measures
+# about 217 B.
+OBJECT_RECORD_BYTES = 224
 
 
 def properties_charge(extensions) -> int:

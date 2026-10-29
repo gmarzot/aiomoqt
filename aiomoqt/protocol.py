@@ -245,6 +245,31 @@ _H3_ERROR_NAMES = {
 }
 
 
+def _transport_error_name(code: int) -> Optional[str]:
+    """QUIC transport error name (RFC 9000 §20.1)."""
+    if 0x100 <= code <= 0x1ff:
+        return "CRYPTO_ERROR"
+    try:
+        return QuicErrorCode(code).name
+    except ValueError:
+        return None
+
+
+def _close_kind(event: Any) -> Optional[str]:
+    """'transport' for a QUIC transport close, 'connection' for a QUIC
+    application close ending a WebTransport session, None for a MoQT
+    session close or an aiopquic that does not say."""
+    if event is None:
+        return None
+    frame_type = getattr(event, 'frame_type', None)
+    if getattr(event, 'connection_closed', False):
+        return 'transport' if isinstance(frame_type, int) else 'connection'
+    if (not hasattr(event, 'connection_closed')
+            and isinstance(frame_type, int)):
+        return 'transport'
+    return None
+
+
 class _MOQTSessionMixin:
     """MoQT session methods. Mix with an aiopquic transport base —
     QuicConnectionProtocol for raw QUIC, WebTransportSession (via
@@ -2990,7 +3015,8 @@ class _MOQTSessionMixin:
                 and not isinstance(event, (StopSendingReceived, StreamReset))):
             error = getattr(event, 'error_code', QuicErrorCode.INTERNAL_ERROR)
             reason = getattr(event, 'reason_phrase', None) or class_name(event)
-            self._close_session(error, reason, transmit=False)
+            self._close_session(error, reason, transmit=False,
+                                kind=_close_kind(event))
             return
 
         if isinstance(event, ProtocolNegotiated):
@@ -3121,12 +3147,13 @@ class _MOQTSessionMixin:
                 fut.set_result(False)
 
     def _log_close(self, error_code: int, reason_phrase: str,
-                   transmit: bool) -> None:
+                   transmit: bool, kind: Optional[str] = None) -> None:
         """One line per close: side, code name, peer, setup state. aiopquic
         reports only the peer's close code, so a nonzero code without
         transmit is the peer's; code 0 there may be a local close (idle
-        timeout) and is worded neutrally. Clean codes log INFO, a peer's
-        error WARNING, our own error ERROR."""
+        timeout) and is worded neutrally. kind (see _close_kind) picks the
+        code table. Clean codes log INFO, a peer's error WARNING, our own
+        error ERROR."""
         try:
             code = int(error_code)
         except (TypeError, ValueError):
@@ -3134,12 +3161,17 @@ class _MOQTSessionMixin:
         if code is None:
             label = str(error_code)
         else:
-            name = _H3_ERROR_NAMES.get(code) if self._is_wt else None
-            if name is None:
-                try:
-                    name = SessionCloseCode(code).name
-                except ValueError:
-                    pass
+            if kind == 'transport':
+                name = _transport_error_name(code)
+            elif kind == 'connection':
+                name = _H3_ERROR_NAMES.get(code)
+            else:
+                name = _H3_ERROR_NAMES.get(code) if self._is_wt else None
+                if name is None:
+                    try:
+                        name = SessionCloseCode(code).name
+                    except ValueError:
+                        pass
             label = f"{name} (0x{code:x})" if name else f"0x{code:x}"
         if transmit:
             side, prep = "closing", "to"
@@ -3161,7 +3193,8 @@ class _MOQTSessionMixin:
             msg += ", before MoQT setup"
         if reason_phrase:
             msg += f"; reason: {reason_phrase}"
-        if code == 0 or (self._is_wt and code == _H3_NO_ERROR):
+        if code == 0 or (self._is_wt and kind != 'transport'
+                         and code == _H3_NO_ERROR):
             logger.info(msg)
         elif transmit:
             logger.error(msg)
@@ -3171,10 +3204,11 @@ class _MOQTSessionMixin:
     def _close_session(self,
               error_code: SessionCloseCode = SessionCloseCode.NO_ERROR,
               reason_phrase: str = "no error", *,
-              transmit: bool = True) -> None:
+              transmit: bool = True, kind: Optional[str] = None) -> None:
         """Close the MoQT session. The first close's code is the one sent;
-        transmit=False when the peer already closed the connection."""
-        self._log_close(error_code, reason_phrase, transmit)
+        transmit=False when the peer already closed the connection; kind
+        names the close's code table (see _close_kind)."""
+        self._log_close(error_code, reason_phrase, transmit, kind)
         first = self._close_err is None
         if first:
             self._close_err = (error_code, reason_phrase)
@@ -3260,8 +3294,12 @@ class _MOQTSessionMixin:
             parent_close = functools.partial(
                 super().close, int(error_code), reason)
         else:
+            reason = (reason_phrase.decode(errors="replace")
+                      if isinstance(reason_phrase, bytes)
+                      else str(reason_phrase))
             parent_close = functools.partial(
-                self._quic.close, error_code=int(error_code))
+                self._quic.close, error_code=int(error_code),
+                reason_phrase=reason)
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -6969,8 +7007,10 @@ class _WTSessionMixin:
         elif evt_type == _EVT_WT_SESSION_CLOSED:
             super()._on_event(ev_tuple)
             reason = bytes(data).decode(errors="replace") if data else ""
-            self._close_session(error_code, reason or "WebTransport session closed",
-                                transmit=False)
+            self._close_session(
+                error_code, reason or "WebTransport session closed",
+                transmit=False,
+                kind=_close_kind(getattr(self, '_session_close_event', None)))
         else:
             super()._on_event(ev_tuple)
 

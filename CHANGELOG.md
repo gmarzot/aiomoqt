@@ -3,8 +3,12 @@
 ## v0.14.0
 
 - loopback_bench `--rtt-ms`, `--link-mbps`, `--loss`: emulated link (netem) on a private network namespace's lo; needs privileges to create one.
+- aiomoqt-relay honours MAX_CACHE_DURATION: an object past it is not forwarded, replayed or served from the cache (a FETCH for it goes upstream), and an explicit OBJECT_DELIVERY_TIMEOUT now also times cache replays (`--lag-limit` still does not). The per-object record charge is 224 bytes (was 192).
+- aiomoqt-relay forwards a subscriber's NEW_GROUP_REQUEST: in its upstream SUBSCRIBE, or to an established upstream in a REQUEST_UPDATE when it is 0 or above the Largest Group and the track declares DYNAMIC_GROUPS=1, once while an equal or larger request is outstanding. `SubscribedTrack.subscribe(parameters=)` adds parameters to a direct SUBSCRIBE.
+- aiomoqt-relay honours OBJECT_DELIVERY_TIMEOUT per subscriber (the smaller of the publisher's and the subscriber's, updated by REQUEST_UPDATE); with none set, `--lag-limit SEC` (default 5, 0 = never) drops live objects that old. Expired subgroups are reset with DELIVERY_TIMEOUT; status shows `lane_expired`.
 - pub_server exits 2 when it has no TLS certificate (was 0), as aiomoqt-relay and moqtest_origin do.
 - loopback_bench and adaptive_bench (loopback) generate a self-signed localhost cert when none is found; servers still require one.
+- aiomoqt-relay `--drain-timeout` defaults to 2 s when `--goaway-uri` is empty, 5 s with one; GOAWAY's Timeout carries the wait. Its shutdown closes give `relay restarting; reconnect-to=same-address` or `relay shutting down; reconnect-to=<uri>` as the reason (WebTransport clients receive it).
 - aiomoqt-relay refuses new QUIC and WebTransport connections at the transport from the first SIGTERM/SIGINT (aiopquic `set_max_connections`); existing sessions still get GOAWAY and the drain.
 - pub_media gives each dial attempt 4 s (was 10 s), so a handshake lost in a relay restart costs a short retry.
 - aiomoqt-relay status: `tx_worker_idle_now`, `tx_event_ring_pops` and `tx_wake_lost` from the transport.
@@ -19,6 +23,7 @@
 - pub_bench and pub_server `--fetch-history BYTES`: history kept to answer FETCH (default 0; pub_bench `--prefill` sets 1 MiB).
 - pub_media `--fetch-history BYTES`: its media tracks keep that much history to answer FETCH (default 0: FETCH refused); `LocTrackPublisher` takes `fetch_history_bytes`.
 - The session close line names who closed, the code (with its H3 or MoQT name), the peer address and whether MoQT setup completed; a WebTransport H3_NO_ERROR (0x100) close logs INFO, a peer error close one WARNING (no separate QUIC ERROR line), our own error close ERROR.
+- Raw QUIC session closes send and record their reason phrase; a transport close is logged by its QUIC name (e.g. CONNECTION_REFUSED (0x2)), not a MoQT one. Needs aiopquic's close kind; older aiopquic keeps the MoQT names.
 - Requires aiopquic 0.7.0: datagram priority and the server bind host need it (0.6.x silently ignored both).
 - Draft-14 is deprecated and will be removed in 0.15.0; until then it still negotiates and stays in the default offer.
 - aiomoqt-relay `--pause-after SEC` (default 60, 0 = never): a track no subscriber has forwarded for that long is paused upstream (Forward State 0) and resumed by the next subscriber; `--catalog-probe` catalogs keep flowing.
@@ -29,8 +34,10 @@
 - aiomoqt-relay: a track paused since its PUBLISH (forward=0, as after a relay restart) is resumed the same way, so its first subscriber gets the publisher's live Largest, not the PUBLISH's.
 - aiomoqt-relay: an upstream FETCH that succeeds with no objects is passed on as FETCH_OK and an empty stream (a fill: an empty stream), not INVALID_RANGE or a reset.
 - aiomoqt-relay: a FETCH or fill range reaching into a pause's gap is fetched from the publisher instead of answered short from the cache.
+- aiomoqt-relay: a subscriber that resumes a track before the pause's REQUEST_OK arrives still gets the open group in its joining FETCH or fill, not a reset.
+- aiomoqt-relay: a track that ends, gets PUBLISH_DONE or turns malformed after a newer publisher took its name no longer removes the newer track.
 - aiomoqt-relay `--config PATH` reads flags from a TOML file keyed by long flag name; command-line flags override it, unknown keys and wrong types are errors. The deploy reads `relay.toml`.
-- aiomoqt-relay drains on SIGTERM/SIGINT: it refuses new sessions, sends GOAWAY (`--goaway-uri`, default empty) and waits up to `--drain-timeout` (5 s) before exiting; a second signal exits at once. pub_media `--reconnect` redials at once on GOAWAY, to its New Session URI if given.
+- aiomoqt-relay drains on SIGTERM/SIGINT: it refuses new sessions, sends GOAWAY (`--goaway-uri`, default empty) and waits up to `--drain-timeout` before exiting; a second signal exits at once. pub_media `--reconnect` redials at once on GOAWAY, to its New Session URI if given.
 - aiomoqt-relay turns away new sessions from SIGTERM until it exits, and its closes reach the peers before the transport stops; a refused session logs no ERROR. `MOQTServer.close_sessions()` also closes sessions arriving while it waits; `refuse_sessions()` turns them away from then on.
 - A WT client refused during setup raises the session's close as MOQTException instead of being cancelled.
 - Ending one track, or cancelling or timing out a wait on it or on `async_closed()`, no longer ends other tracks' `wait_closed()` or the session's close signal.
@@ -99,6 +106,8 @@
 - pub_server and adaptive_bench (subs mode) take `--video RES`, like pub_bench; with it `-r` is the frame rate (default 30) and `-g` the GOP length in frames (default 1 s), and `-s`, `-P` and `-D` are refused instead of ignored.
 - sub_bench and loopback_bench `--verify-payload [N]` check each received object (or every Nth) against the bench layout and fail the run on a mismatch; generated objects now carry their size (`{group}.{object}.{size}|`) and video frames the counting filler.
 - moq_interop_client publish-track-subscribe waits for the PUBLISH reply before subscribing, so a relay slow to answer no longer turns a pass or a NOT_SUPPORTED skip into a failure.
+- pub_media stats: each track reports `forwarding`, its peers at Forward State 1 taking objects, and a subscribed track nobody forwards shows ` · paused`.
+- pub_media: a lost session's catalog emitter is cancelled when the session is dropped, instead of left pending until garbage collection.
 
 ## v0.13.3
 

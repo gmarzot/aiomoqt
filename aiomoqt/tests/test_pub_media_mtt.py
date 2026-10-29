@@ -227,6 +227,36 @@ async def test_stats_line_counts_objects_produced_not_frames_discarded(
     assert 'video: 2 obj' in line and 'discarded 3' in line, line
 
 
+async def test_stats_report_paused_and_forwarding(capsys):
+    import io
+    from aiomoqt.media import LocTrackPublisher
+    from aiomoqt.track import TrackState
+    track = LocTrackPublisher(None, 'ns', 'video')
+    sub = track._subs[0]
+    sub.state, sub.generating, sub.forward = TrackState.SUBSCRIBED, True, False
+    pub = SimpleNamespace(tracks={'video': track}, sessions=[None])
+
+    async def one_report():
+        fh = io.StringIO()
+        task = asyncio.ensure_future(pub_media._report_stats(
+            {'video': pub_media._TrackStats()}, 0.01, pub,
+            pub_media._MttEvents(fh)))
+        await asyncio.sleep(0.03)
+        task.cancel()
+        line = capsys.readouterr().out.splitlines()[0]
+        event = json.loads(fh.getvalue().splitlines()[0][len('@mtt '):])
+        return line, event
+
+    line, event = await one_report()
+    assert event['subscribers'] == 1, event
+    assert event['tracks']['video']['forwarding'] == 0, event
+    assert line.endswith(' · paused'), line
+    sub.forward = True
+    line, event = await one_report()
+    assert event['tracks']['video']['forwarding'] == 1, event
+    assert ' · paused' not in line, line
+
+
 # -- T2/T3: object mapping -------------------------------------------------
 
 @pytest.fixture
