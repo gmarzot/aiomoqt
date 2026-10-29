@@ -126,6 +126,16 @@ Plus file descriptors, since every subscriber costs some:
 
   Applied on both hosts, so the resulting RTT is twice the one-way value.
 
+- **Emulated RTT on one host.** `loopback_bench --rtt-ms MS` re-runs
+  itself in a private network namespace and puts `netem delay MS/2` on
+  that namespace's `lo`; the host's network is untouched. `--link-mbps`
+  adds a rate cap and `--loss` random loss. One qdisc carries both
+  directions, so the cap and the loss also hit ACKs, and its queue is
+  deep (200000 packets): the cap models a deep buffer. It needs
+  privileges to create a network namespace: unprivileged user
+  namespaces (`unshare -rn`), or run the bench under `sudo`. Without
+  them it exits 2.
+
 ### Verify before trusting a number
 
 Re-read the settings rather than assuming they took: interface, CPU
