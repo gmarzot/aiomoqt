@@ -1,5 +1,7 @@
 """moq-interop-runner namespace and direct-PUBLISH cases: our interop
 client against aiomoqt-relay, in one process."""
+import asyncio
+
 import pytest
 
 from aiomoqt.tools import moq_interop_client as client
@@ -153,6 +155,45 @@ async def test_case_skips_when_the_relay_does_not_support_publish(
     assert r.skip_reason == "relay does not support PUBLISH"
     assert r.message == ("PUBLISH refused NOT_SUPPORTED: "
                          "PUBLISH is not supported")
+
+
+def _delay_publish(monkeypatch, refuse):
+    """The relay answers PUBLISH 50 ms late, after the subscriber's
+    SUBSCRIBE can arrive."""
+    on_publish = relay._on_publish
+
+    async def late(session, msg):
+        await asyncio.sleep(0.05)
+        if refuse:
+            relay._refuse_publish(session, msg, "PUBLISH is not supported",
+                                  code=RequestErrorCode.NOT_SUPPORTED)
+        else:
+            await on_publish(session, msg)
+    monkeypatch.setattr(relay, "_on_publish", late)
+
+
+@requires_certs
+@_TRANSPORTS
+@pytest.mark.parametrize("draft", [16, 18, 22])
+async def test_publish_track_subscribe_waits_for_publish_ok(
+        monkeypatch, draft, use_quic):
+    _delay_publish(monkeypatch, refuse=False)
+    case = "publish-track-subscribe"
+    r = await _run(case, _port(case, draft, use_quic) + 140, draft, use_quic)
+    assert r.passed and not r.skipped, r.message
+
+
+@requires_certs
+@_TRANSPORTS
+@pytest.mark.parametrize("draft", [16, 18, 22])
+async def test_publish_track_subscribe_skips_on_a_late_refusal(
+        monkeypatch, draft, use_quic):
+    _delay_publish(monkeypatch, refuse=True)
+    case = "publish-track-subscribe"
+    r = await _run(case, _port(case, draft, use_quic) + 160, draft, use_quic,
+                   timeout=3.0)
+    assert r.passed and r.skipped, r.message
+    assert r.skip_reason == "relay does not support PUBLISH"
 
 
 @requires_certs
