@@ -32,7 +32,11 @@ Limits:
   * Upstream Forward State is raised for a forwarding subscriber and
     lowered again once none has forwarded for --pause-after seconds;
     a --catalog-probe catalog keeps flowing.
-  * No delivery-timeout enforcement.
+  * A subscriber's send lane drops live objects past their
+    OBJECT_DELIVERY_TIMEOUT (§8: the smaller non-zero of the publisher's
+    and the subscriber's), else past --lag-limit seconds, resetting the
+    subgroup with DELIVERY_TIMEOUT and skipping the rest of the group. A
+    cache replay is not timed.
   * Namespace tables are in memory and global to the process.
 
 Routing model (cross-session, single relay instance):
@@ -114,7 +118,7 @@ from aiomoqt.messages.publish import Publish, PublishError
 from aiomoqt.messages.request import RequestError, RequestOk
 from aiomoqt.messages.subscribe import Subscribe, SubscribeOk
 from aiomoqt.track import (PublishedTrack, SubscribedTrack, _UNFILTERED,
-                           _filter_window, _largest_object_param,
+                           _filter_window, _largest_object_param, _min_nonzero,
                            _location_window, _subscription_window)
 from aiomoqt.context import (canonical_request_error, canonical_stream_reset,
                              is_draft16_or_later,
@@ -234,6 +238,10 @@ _catalog_probe = False
 # subscriber before its upstream Forward State drops to 0; 0 = never.
 PAUSE_AFTER_S = 60.0
 _pause_after = PAUSE_AFTER_S
+# --lag-limit: delivery deadline in seconds for live objects on a lane
+# with no OBJECT_DELIVERY_TIMEOUT; 0 = none.
+LAG_LIMIT_S = 5.0
+_lag_limit = LAG_LIMIT_S
 _pause_sweep = None
 
 
@@ -453,7 +461,7 @@ class _Downstream:
     __slots__ = ("session", "alias", "request_id", "forward", "window",
                  "joined_at", "replaying", "location_filter", "group_order",
                  "fills", "range_params", "filters", "lane", "lost",
-                 "fence")
+                 "fence", "timeout")
 
     def __init__(self, session, alias, request_id, forward=True,
                  window=_UNFILTERED):
@@ -487,6 +495,17 @@ class _Downstream:
         # The track's fence when it joined: its joining FETCH and fills
         # start after that group.
         self.fence = None
+        # Its OBJECT_DELIVERY_TIMEOUT in ms (§8); 0 sets none.
+        self.timeout = 0
+
+    def take_timeout(self, params) -> bool:
+        """Record the OBJECT_DELIVERY_TIMEOUT a SUBSCRIBE or REQUEST_UPDATE
+        carries; absent keeps it. True when it changed."""
+        value = (params or {}).get(ParamType.DELIVERY_TIMEOUT)
+        if not isinstance(value, int) or value == self.timeout:
+            return False
+        self.timeout = value
+        return True
 
     def set_filters(self, params, track_properties) -> None:
         self.range_params = params
@@ -573,14 +592,15 @@ _lanes: set = set()
 
 
 def _item(gid, live, sgid, oid, payload, exts, prio, status, shape,
-          encoded=None, cost=None) -> tuple:
+          encoded=None, cost=None, born=None) -> tuple:
     """A SendLane item for a relayed object, or for a stream marker when
     `oid` is None. `live` objects count against LANE_BYTES, a cache
     replay does not; `cost` is the object's retained_object_bytes, when
-    already known."""
+    already known; `born` its arrival time, None for a replay, which
+    never expires."""
     if cost is None:
         cost = 0 if oid is None else retained_object_bytes(payload, exts)
-    return (gid, cost, live, None, sgid, oid, payload, exts, prio, status,
+    return (gid, cost, live, born, sgid, oid, payload, exts, prio, status,
             shape, encoded)
 
 
@@ -619,6 +639,9 @@ class _RelayDelivery:
 
     def tx_queued(self, floor=None) -> int:
         return self.track._tx_queued(self.session, floor)
+
+    def expire(self, group_id) -> bool:
+        return self.track._expire(self.session, group_id)
 
 
 class _RelayLane(SendLane):
@@ -770,6 +793,8 @@ class _RelayedTrack:
         self.complete_from = None
         # Where the upstream filter starts; {0, 0} when unfiltered.
         self.upstream_from = None
+        # Some object arrived as a datagram.
+        self._datagrams = False
         # Groups whose Object 0 arrived from upstream: complete from it.
         self._heads = set()
         # Locations a backfill FETCH cached; the live copy is dropped.
@@ -846,7 +871,33 @@ class _RelayedTrack:
     def _lane(self, d) -> "_RelayLane":
         if d.lane is None:
             d.lane = _RelayLane(self, d)
+            self.time_lane(d)
         return d.lane
+
+    def _timeout_s(self, d):
+        """§8: the smaller non-zero of the publisher's and `d`'s
+        OBJECT_DELIVERY_TIMEOUT, in seconds; None when neither sets one."""
+        pub = self.properties.get(ParamType.DELIVERY_TIMEOUT)
+        ms = _min_nonzero(pub if isinstance(pub, int) else 0, d.timeout)
+        return ms / 1000 if ms else None
+
+    def time_lane(self, d) -> None:
+        """Set `d`'s lane deadline: its delivery timeout, else --lag-limit."""
+        if d.lane is not None:
+            d.lane.deadline = self._timeout_s(d) or _lag_limit or None
+
+    def _expire(self, session, group_id) -> bool:
+        """§8: reset the session's open streams of the group with
+        DELIVERY_TIMEOUT. True, skipping the rest of the group, unless the
+        track sends datagrams: those are only dropped."""
+        sk = id(session)
+        streamed = False
+        for k, (sid, _hdr) in list(self._streams.items()):
+            if k[0] == sk and k[1] == group_id:
+                session.stream_reset(sid, StreamResetCode.DELIVERY_TIMEOUT)
+                self._streams.pop(k, None)
+                streamed = True
+        return streamed or not self._datagrams
 
     def _queued(self, d) -> bool:
         """`d`'s lane still holds or is writing something."""
@@ -1092,6 +1143,7 @@ class _RelayedTrack:
         shape = getattr(msg, "stream_flags", None)
         if isinstance(msg, (ObjectDatagram, ObjectDatagramStatus)):
             shape = ("DGRAM", bool(getattr(msg, "end_of_group", False)))
+            self._datagrams = True
         elif isinstance(shape, tuple) and shape:
             # FIRST_OBJECT holds for the object that opened the upstream
             # stream only; a downstream stream opened later must not claim it.
@@ -1195,12 +1247,14 @@ class _RelayedTrack:
                     self._backfilled.discard((gid, oid))
                     continue
                 cost = retained_object_bytes(payload, exts)
+                born = time.monotonic()
                 self._remember(gid, sgid, oid, payload, exts, prio, status,
                                shape, cost)
             else:
                 cost = 0
+                born = None
             item = _item(gid, True, sgid, oid, payload, exts, prio, status,
-                         shape, {}, cost)
+                         shape, {}, cost, born)
             for d in list(self.downstream):
                 if d.replaying:
                     continue
@@ -2669,6 +2723,7 @@ def _attach_subscriber(session, msg, track, largest) -> bool:
     d.group_order = getattr(msg, "group_order", None)
     d.set_filters(merge_range_filters({}, msg.parameters or {}),
                   track.properties)
+    d.take_timeout(msg.parameters)
     session.register_request_cancel_handler(
         msg.request_id, lambda rid, t=track, s=session: t.drop_session(s))
     _start_fill(track, d, msg)
@@ -2873,6 +2928,8 @@ def _apply_update(session, msg, found, d16: bool) -> None:
         lf = (msg.parameters or {}).get(ParamType.SUBSCRIPTION_FILTER)
         if isinstance(lf, LocationFilter):
             d.location_filter = lf
+        if d.take_timeout(msg.parameters):
+            track.time_lane(d)
     else:
         forward = msg.forward
     if forward is not None:
@@ -3103,6 +3160,13 @@ def parse_args(argv=None):
                              "seconds; the next subscriber resumes it. "
                              "--catalog-probe catalogs keep flowing. "
                              f"0 = never. Default: {PAUSE_AFTER_S:g}")
+    parser.add_argument("--lag-limit", type=float, default=LAG_LIMIT_S,
+                        metavar="SEC",
+                        help="Drop a subscriber's live objects older than "
+                             "SEC seconds when no OBJECT_DELIVERY_TIMEOUT "
+                             "applies, resetting the subgroup with "
+                             "DELIVERY_TIMEOUT. Cache replays are exempt. "
+                             f"0 = never. Default: {LAG_LIMIT_S:g}")
     parser.add_argument("--goaway-uri", type=str, default="", metavar="URL",
                         help="New Session URI sent in GOAWAY on SIGTERM or "
                              "SIGINT. Default: empty, peers reconnect to "
@@ -4284,6 +4348,7 @@ class _Status:
                     "lane_tx_bytes": lane.tx_bytes if lane else 0,
                     "shed_objects": lane.shed if lane else 0,
                     "shed_episodes": lane.sheds if lane else 0,
+                    "lane_expired": lane.expired if lane else 0,
                     "lane_stalled_s": (int(lane.stalled_s(time.monotonic()))
                                        if lane else 0),
                     "lane_stalls": lane.stalls if lane else 0,
@@ -4811,12 +4876,15 @@ async def _drain(servers, uri: str, timeout: float, why: str) -> None:
 
 
 async def main():
-    global _catalog_probe, _pause_after
+    global _catalog_probe, _pause_after, _lag_limit
     args = parse_args()
     _catalog_probe = args.catalog_probe
     if args.pause_after < 0:
         sys.exit("error: --pause-after must be 0 or above")
     _pause_after = args.pause_after
+    if args.lag_limit < 0:
+        sys.exit("error: --lag-limit must be 0 or above")
+    _lag_limit = args.lag_limit
     speaks = sorted(int(d) for d in MOQTDraft)
     wanted = args.draft if isinstance(args.draft, list) else [args.draft]
     if any(d not in speaks for d in wanted):

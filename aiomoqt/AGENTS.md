@@ -80,4 +80,6 @@ SIGUSR1.
   behind, and logging a `lane stalled` WARNING for one that makes no progress for 10 s;
   per-session caps on namespace requests and SUBSCRIBEs (`--max-namespaces-per-session`,
   `--max-subscriptions-per-session`), refused past them with EXCESSIVE_LOAD; tracks no subscriber
-  has forwarded for `--pause-after` (60 s) paused upstream until the next one; no delivery timeout. Its module docstring has the details.
+  has forwarded for `--pause-after` (60 s) paused upstream until the next one; live objects past the
+  OBJECT_DELIVERY_TIMEOUT, or past `--lag-limit` (5 s) when none is set, dropped with
+  their subgroup reset. Its module docstring has the details.
