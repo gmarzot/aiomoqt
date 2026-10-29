@@ -2939,7 +2939,7 @@ async def _serve_fill(track, d, request_id, fill, rng,
                                 for o in up], "upstream"
         if track.cache_covers(start) and (objs is None or gapped):
             # Cached while upstream was asked, or around the gap.
-            objs = _merged(objs, track.cached_range(start, end))
+            objs = _merged(objs, track.cached_range(start, end)) or objs
         gap = None
         if objs is None and timeout_ms is not None:
             objs = track.cached_range(start, end)
