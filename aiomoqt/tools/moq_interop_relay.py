@@ -706,6 +706,8 @@ class _RelayedTrack:
         self._gaps = []
         # The publisher's Largest from its REQUEST_OK to the last pause.
         self.pause_largest = None
+        # Task resolving to that Largest, for a resume sent before it.
+        self.pause_reply = None
         # The PUBLISH feeding this track, once answered.
         self.publish_msg = None
         # Loop time since which no subscriber has forwarded, else None.
@@ -1028,7 +1030,7 @@ class _RelayedTrack:
             # Nothing from this track may be served or cached (§2.4.2):
             # drop the fan-out so a later SUBSCRIBE starts clean rather
             # than joining a dead one.
-            _tracks.pop(self.key, None)
+            _drop_track(self.key, self)
             self.close()
             return
         self.queue.put_nowait(
@@ -1180,10 +1182,11 @@ class _RelayedTrack:
                         self._replay(d)
                 self.finish(status_code=code, reason=reason)
                 self.release_upstream()
+                self._release_publish()
                 self._release_downstream()
                 self._drop_cache()
                 self.task = None
-                _tracks.pop(key, None)
+                _drop_track(key, self)
                 return
             if self._finished:
                 continue
@@ -1610,7 +1613,7 @@ def _supersede_namespace(ns: tuple, session) -> None:
                 and not _session_live(owner)):
             logger.info(f"relay: superseding track {key} for a new publisher")
             track.close()
-            _tracks.pop(key, None)
+            _drop_track(key, track)
 
 
 def _forget_session(session) -> None:
@@ -1643,7 +1646,7 @@ def _forget_session(session) -> None:
             # before dropping the fan-out.
             track.finish()
             track.close()
-            _tracks.pop(key, None)
+            _drop_track(key, track)
 
 
 def _ns_tuple(namespace):
@@ -1828,7 +1831,7 @@ async def _establish_upstream(ns, track_name, forward=True, sub=None):
                 return track, None
             logger.info(f"relay: dropping stale track {key}")
             track.close()
-            _tracks.pop(key, None)
+            _drop_track(key, track)
         entry = _Establishing(key)
         entry.filter = _upstream_filter(sub)
         _establishing[key] = entry
@@ -1993,6 +1996,12 @@ def _spawn(coro) -> None:
     task.add_done_callback(_background.discard)
 
 
+def _drop_track(key, track) -> None:
+    """Remove `track` from the table, only if `key` still maps to it."""
+    if _tracks.get(key) is track:
+        del _tracks[key]
+
+
 def _live_published(key):
     """The live track a PUBLISH registered for `key`, else None."""
     track = _tracks.get(key)
@@ -2131,6 +2140,9 @@ async def _subscribe_publishers(entry):
         track.upstream_from = (0, 0) if unfiltered else track.complete_from
         pub.register_stream_end_handler(upstream.track_alias,
                                         track.on_stream_end)
+        old = _tracks.get(key)
+        if old is not None and old is not track:
+            old.close()
         _tracks[key] = track
         logger.info(f"relay: upstream established ns={ns} track={name} "
                     f"alias={upstream.track_alias}")
@@ -2196,7 +2208,7 @@ def _upstream_done(track, key, done) -> None:
         # Nothing queued and no subscriber attached.
         track.finish(status_code=status, reason=reason)
         track.close()
-        _tracks.pop(key, None)
+        _drop_track(key, track)
         return
     track.note_upstream_done(status, reason, key,
                              getattr(done, "stream_count", 0))
@@ -2234,7 +2246,7 @@ async def _on_publish_done(session, msg):
             # Nothing queued and no subscriber attached.
             track.finish(status_code=status, reason=reason)
             track.close()
-            _tracks.pop(key, None)
+            _drop_track(key, track)
         else:
             track.note_upstream_done(status, reason, key,
                                      getattr(msg, "stream_count", 0))
@@ -2279,7 +2291,7 @@ async def _on_publish(session, msg):
             logger.info(f"relay: retiring the track registered for {key}")
             track.finish(reason="superseded by a new publisher")
             track.close()
-            _tracks.pop(key, None)
+            _drop_track(key, track)
             track = None
     if track is None:
         track = _RelayedTrack(key)
@@ -2418,6 +2430,7 @@ def _resume_paused(track, wanted=False):
         if track.pause_largest is not None:
             track.fence = max(track.fence, track.pause_largest[0])
     track.pause_largest = None
+    track.pause_reply = None
     track.paused = track.lowered = False
     track.unwatched_since = None
     if track._objects_in:
@@ -2451,11 +2464,12 @@ async def _resume_for(track, msg) -> None:
     task = _resuming.get(track.key)
     if task is None:
         paused_at = track.pause_largest
+        pause_reply = track.pause_reply if paused_at is None else None
         reply = _resume_paused(track, wanted=True)
         if reply is None:
             return
-        task = asyncio.create_task(_take_live_largest(track, reply,
-                                                      paused_at))
+        task = asyncio.create_task(_take_live_largest(
+            track, reply, paused_at, pause_reply))
         _resuming[track.key] = task
         task.add_done_callback(
             lambda t, k=track.key: _resuming.pop(k, None)
@@ -2470,10 +2484,14 @@ async def _resume_for(track, msg) -> None:
         track._ensure_drain()
 
 
-async def _take_live_largest(track, reply, paused_at=None) -> None:
+async def _take_live_largest(track, reply, paused_at=None,
+                             pause_reply=None) -> None:
     """Note the Largest a resume's REQUEST_OK reports, waiting at most
     RESUME_REPLY_S. Past the publisher's Largest at the pause
-    (`paused_at`), its group is live and the fence stops before it."""
+    (`paused_at`, else what `pause_reply` resolves to), its group is live
+    and the fence stops before it."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + RESUME_REPLY_S
     try:
         ok = await asyncio.wait_for(reply, RESUME_REPLY_S)
     except TimeoutError:
@@ -2487,6 +2505,16 @@ async def _take_live_largest(track, reply, paused_at=None) -> None:
         return
     live = _update_largest(ok)
     track.note_largest(live)
+    if paused_at is None and pause_reply is not None:
+        # The pause's REQUEST_OK precedes this one on the same request.
+        try:
+            paused_at = await asyncio.wait_for(
+                asyncio.shield(pause_reply),
+                max(deadline - loop.time(), 0))
+        except TimeoutError:
+            paused_at = None
+        if paused_at is not None and track.fence is not None:
+            track.fence = max(track.fence, paused_at[0])
     if (track.fence is not None and paused_at is not None
             and live is not None and live > tuple(paused_at)):
         track.fence = min(track.fence, live[0] - 1)
@@ -2526,22 +2554,24 @@ def _pause_upstream(track) -> None:
     track.paused = True
     track.lowered = True
     track.pause_largest = None
-    if wait:
-        asyncio.ensure_future(_take_pause_largest(track, reply))
+    track.pause_reply = (asyncio.ensure_future(
+        _take_pause_largest(track, reply)) if wait else None)
     logger.info(f"relay: paused {track.key} upstream, no forwarding "
                 f"subscriber for {_pause_after:g}s: REQUEST_UPDATE "
                 f"forward=0 request {rid}")
 
 
-async def _take_pause_largest(track, reply) -> None:
-    """Note the Largest a pause's REQUEST_OK reports, if it arrives
-    while the track is still paused."""
+async def _take_pause_largest(track, reply):
+    """The Largest a pause's REQUEST_OK reports, else None; noted on the
+    track if it arrives while the track is still paused."""
     try:
         ok = await reply
     except Exception:
-        return
+        return None
+    largest = _update_largest(ok)
     if track.lowered:
-        track.pause_largest = _update_largest(ok)
+        track.pause_largest = largest
+    return largest
 
 
 def _pausable(track) -> bool:
@@ -2971,7 +3001,7 @@ async def _relay_subscribe(session, msg):
         # Cached from an earlier cycle whose sessions have closed.
         logger.info(f"relay: dropping stale track {(ns, msg.track_name)}")
         track.close()
-        _tracks.pop((ns, msg.track_name), None)
+        _drop_track((ns, msg.track_name), track)
         track = None
     if track is not None and track.paused and track.upstream is not None:
         await _resume_for(track, msg)
