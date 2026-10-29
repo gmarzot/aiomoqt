@@ -156,17 +156,17 @@ async def test_a_resumed_track_starts_at_live(publisher, draft, use_quic):
                 # SUBSCRIBE with a current-group fill.
                 ok, _ = await rx2.join(_NS, name, wait_response=True)
                 if publisher == "stuck":
-                    # Every fill is fenced: it is reset at once.
                     fence = tracks[name].fence
-                    assert (fence is not None
-                            and ok.largest_group_id <= fence), (
-                        name, fence, ok.largest_group_id)
+                    assert fence is not None, name
                     t0 = time.monotonic()
                     done = await rx2.await_fetch_done(ok.request_id,
                                                       timeout=3.0)
                     waited = time.monotonic() - t0
-                    assert done is False and waited < 1.0, (
-                        name, done, waited)
+                    assert waited < 1.0, (name, done, waited)
+                    # A frame produced before the resume's REQUEST_OK moves
+                    # the Largest past the fence: that group is live.
+                    if ok.largest_group_id <= fence:
+                        assert done is False, (name, fence, done)
             else:
                 ok = await rx2.subscribe(_NS, name, forward=1,
                                          wait_response=True)
