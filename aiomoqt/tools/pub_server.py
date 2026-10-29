@@ -16,6 +16,7 @@ Usage:
 import argparse
 import asyncio
 import signal
+import sys
 
 from aiomoqt.server import MOQTServer
 from aiomoqt.types import (D18MessageType, MOQT_DEFAULT_DRAFTS, MOQTMessageType,
@@ -207,8 +208,9 @@ async def main():
 
     if not args.cert or not args.key:
         print("Error: TLS certificate required. "
-              "Use --cert and --key, or place cert.pem/key.pem in certs/")
-        return
+              "Use --cert and --key, or place cert.pem/key.pem in certs/",
+              file=sys.stderr)
+        sys.exit(2)
 
     # Public API takes the draft NUMBER (14, 16, ...); MOQTServer
     # normalizes to the wire-form internally. The MoQT session layer
