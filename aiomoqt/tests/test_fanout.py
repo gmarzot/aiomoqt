@@ -541,6 +541,29 @@ async def test_write_through_respects_gate_floor_and_bound():
     assert d.largest == (1, 0)
 
 
+@pytest.mark.asyncio
+async def test_an_offer_behind_a_queued_object_queues():
+    """An object offered while an earlier one waits in the queue queues
+    too, though the writer would take it inline: order is kept."""
+    s = _Nowait(lambda n: n == 1)
+    fan = FanoutDelivery()
+    lane = fan.add(_delivery(s), joining=False)
+    await fan.write(0, 0, b"key", group_start=True)     # opens: queued
+    await _settle()
+
+    def item(oid, payload):
+        return (0, OBJECT_RECORD_BYTES + len(payload), True, None, oid,
+                payload, None, False, None)
+    assert lane.offer(item(1, b"one"))                  # refused: queued
+    assert lane.offer(item(2, b"two"))                  # no yield between
+    assert s.tries == 1 and len(lane.items) == 2
+    await _settle()
+    await fan.close()
+    sent = [p for _, data, _ in s.data for p in (b"one", b"two")
+            if data.endswith(p)]
+    assert sent == [b"one", b"two"]
+
+
 # -- the track layer -------------------------------------------------
 
 @pytest.mark.asyncio
