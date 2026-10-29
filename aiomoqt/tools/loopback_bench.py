@@ -141,6 +141,7 @@ def parse_args():
     _cli.add_help(parser)
     _cli.add_timestamps(parser)
     _cli.add_timestamp_checking(parser)
+    _cli.add_payload_check(parser)
     args = parser.parse_args()
     if args.insecure is None:
         # The self-signed test cert cannot verify.
@@ -183,6 +184,8 @@ def print_banner(args):
     row("cc algorithm", args.cc_algo)
     row("sub-groups", args.streams)
     row("group size", f"{args.group_size} objects")
+    if args.verify_payload:
+        row("payload", f"checked (every {args.verify_payload})")
     row("object size", f"{args.object_size} B")
     row("object rate", rate_s)
     row("duration", f"{args.duration}s")
@@ -215,14 +218,14 @@ class _FanoutTrack(PublishedTrack):
         return lambda s: full if s._profile.track_properties else loc
 
     async def produce(self, out) -> None:
-        pad = self._counted_pad()
+        pad = self._payload_tail()
         await self._await_schedule(0, 0)
         next_t = time.monotonic()
         tick = 0
         group_id = 0
         while True:
             for object_id in range(self.group_size):
-                payload = (f"{group_id}.{object_id}".encode() + b'|'
+                payload = (f"{group_id}.{object_id}".encode()
                            + pad)[:self.object_size]
                 await out.write(group_id, object_id, payload,
                                 extensions=self._stamp(group_id, object_id),
@@ -369,7 +372,8 @@ async def main():
         _tm.start(25)
 
     stats = BenchReporter(report_interval=args.interval,
-                          minimal=args.no_stats)
+                          minimal=args.no_stats,
+                          verify_payload=args.verify_payload)
     print_banner(args)
 
     if not args.cert or not args.key:
@@ -434,7 +438,7 @@ async def main():
         except Exception as _e2:
             print(f"(post-shutdown counter dump failed: {_e2})",
                   file=_sys2.stderr)
-    return 0 if received else 1
+    return 0 if received and not stats.payload_bad else 1
 
 
 def cli():

@@ -64,9 +64,8 @@ def _dgram_publisher(object_size=64, group_size=_GROUP_SIZE, rate=0.0):
         )
         track._quiet = True
         track.track_alias = ok.track_alias
-        pad = bytes(i & 0xFF for i in range(object_size))
         task = asyncio.create_task(track._generate_datagrams(
-            session, ok.track_alias, pad))
+            session, ok.track_alias, track._payload_tail()))
         for _ in range(200):
             if track._total_sent >= _N_OBJECTS:
                 break
@@ -107,10 +106,11 @@ async def test_datagram_track_e2e(draft):
             await session.client_session_init()
             got = await _collect(session, _N_OBJECTS)
             assert len(got) >= _N_OBJECTS
-            # ids advance per group; payload prefix matches (gid.oid|
+            # ids advance per group; payload prefix matches gid.oid.size|
             first = got[0]
             assert first.payload.startswith(
-                f"{first.group_id}.{first.object_id}|".encode())
+                f"{first.group_id}.{first.object_id}."
+                f"{len(first.payload)}|".encode())
             eog = [m for m in got if m.end_of_group]
             assert eog, "no end_of_group bit seen across groups"
             for m in eog:
