@@ -1030,7 +1030,7 @@ class _RelayedTrack:
             # Nothing from this track may be served or cached (§2.4.2):
             # drop the fan-out so a later SUBSCRIBE starts clean rather
             # than joining a dead one.
-            _tracks.pop(self.key, None)
+            _drop_track(self.key, self)
             self.close()
             return
         self.queue.put_nowait(
@@ -1182,10 +1182,11 @@ class _RelayedTrack:
                         self._replay(d)
                 self.finish(status_code=code, reason=reason)
                 self.release_upstream()
+                self._release_publish()
                 self._release_downstream()
                 self._drop_cache()
                 self.task = None
-                _tracks.pop(key, None)
+                _drop_track(key, self)
                 return
             if self._finished:
                 continue
@@ -1612,7 +1613,7 @@ def _supersede_namespace(ns: tuple, session) -> None:
                 and not _session_live(owner)):
             logger.info(f"relay: superseding track {key} for a new publisher")
             track.close()
-            _tracks.pop(key, None)
+            _drop_track(key, track)
 
 
 def _forget_session(session) -> None:
@@ -1645,7 +1646,7 @@ def _forget_session(session) -> None:
             # before dropping the fan-out.
             track.finish()
             track.close()
-            _tracks.pop(key, None)
+            _drop_track(key, track)
 
 
 def _ns_tuple(namespace):
@@ -1830,7 +1831,7 @@ async def _establish_upstream(ns, track_name, forward=True, sub=None):
                 return track, None
             logger.info(f"relay: dropping stale track {key}")
             track.close()
-            _tracks.pop(key, None)
+            _drop_track(key, track)
         entry = _Establishing(key)
         entry.filter = _upstream_filter(sub)
         _establishing[key] = entry
@@ -1995,6 +1996,12 @@ def _spawn(coro) -> None:
     task.add_done_callback(_background.discard)
 
 
+def _drop_track(key, track) -> None:
+    """Remove `track` from the table, only if `key` still maps to it."""
+    if _tracks.get(key) is track:
+        del _tracks[key]
+
+
 def _live_published(key):
     """The live track a PUBLISH registered for `key`, else None."""
     track = _tracks.get(key)
@@ -2133,6 +2140,9 @@ async def _subscribe_publishers(entry):
         track.upstream_from = (0, 0) if unfiltered else track.complete_from
         pub.register_stream_end_handler(upstream.track_alias,
                                         track.on_stream_end)
+        old = _tracks.get(key)
+        if old is not None and old is not track:
+            old.close()
         _tracks[key] = track
         logger.info(f"relay: upstream established ns={ns} track={name} "
                     f"alias={upstream.track_alias}")
@@ -2198,7 +2208,7 @@ def _upstream_done(track, key, done) -> None:
         # Nothing queued and no subscriber attached.
         track.finish(status_code=status, reason=reason)
         track.close()
-        _tracks.pop(key, None)
+        _drop_track(key, track)
         return
     track.note_upstream_done(status, reason, key,
                              getattr(done, "stream_count", 0))
@@ -2236,7 +2246,7 @@ async def _on_publish_done(session, msg):
             # Nothing queued and no subscriber attached.
             track.finish(status_code=status, reason=reason)
             track.close()
-            _tracks.pop(key, None)
+            _drop_track(key, track)
         else:
             track.note_upstream_done(status, reason, key,
                                      getattr(msg, "stream_count", 0))
@@ -2281,7 +2291,7 @@ async def _on_publish(session, msg):
             logger.info(f"relay: retiring the track registered for {key}")
             track.finish(reason="superseded by a new publisher")
             track.close()
-            _tracks.pop(key, None)
+            _drop_track(key, track)
             track = None
     if track is None:
         track = _RelayedTrack(key)
@@ -2991,7 +3001,7 @@ async def _relay_subscribe(session, msg):
         # Cached from an earlier cycle whose sessions have closed.
         logger.info(f"relay: dropping stale track {(ns, msg.track_name)}")
         track.close()
-        _tracks.pop((ns, msg.track_name), None)
+        _drop_track((ns, msg.track_name), track)
         track = None
     if track is not None and track.paused and track.upstream is not None:
         await _resume_for(track, msg)

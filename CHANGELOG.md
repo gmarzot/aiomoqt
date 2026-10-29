@@ -29,6 +29,7 @@
 - aiomoqt-relay: an upstream FETCH that succeeds with no objects is passed on as FETCH_OK and an empty stream (a fill: an empty stream), not INVALID_RANGE or a reset.
 - aiomoqt-relay: a FETCH or fill range reaching into a pause's gap is fetched from the publisher instead of answered short from the cache.
 - aiomoqt-relay: a subscriber that resumes a track before the pause's REQUEST_OK arrives still gets the open group in its joining FETCH or fill, not a reset.
+- aiomoqt-relay: a track that ends, gets PUBLISH_DONE or turns malformed after a newer publisher took its name no longer removes the newer track.
 - aiomoqt-relay `--config PATH` reads flags from a TOML file keyed by long flag name; command-line flags override it, unknown keys and wrong types are errors. The deploy reads `relay.toml`.
 - aiomoqt-relay drains on SIGTERM/SIGINT: it refuses new sessions, sends GOAWAY (`--goaway-uri`, default empty) and waits up to `--drain-timeout` (5 s) before exiting; a second signal exits at once. pub_media `--reconnect` redials at once on GOAWAY, to its New Session URI if given.
 - aiomoqt-relay turns away new sessions from SIGTERM until it exits, and its closes reach the peers before the transport stops; a refused session logs no ERROR. `MOQTServer.close_sessions()` also closes sessions arriving while it waits; `refuse_sessions()` turns them away from then on.
