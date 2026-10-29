@@ -706,6 +706,8 @@ class _RelayedTrack:
         self._gaps = []
         # The publisher's Largest from its REQUEST_OK to the last pause.
         self.pause_largest = None
+        # Task resolving to that Largest, for a resume sent before it.
+        self.pause_reply = None
         # The PUBLISH feeding this track, once answered.
         self.publish_msg = None
         # Loop time since which no subscriber has forwarded, else None.
@@ -2418,6 +2420,7 @@ def _resume_paused(track, wanted=False):
         if track.pause_largest is not None:
             track.fence = max(track.fence, track.pause_largest[0])
     track.pause_largest = None
+    track.pause_reply = None
     track.paused = track.lowered = False
     track.unwatched_since = None
     if track._objects_in:
@@ -2451,11 +2454,12 @@ async def _resume_for(track, msg) -> None:
     task = _resuming.get(track.key)
     if task is None:
         paused_at = track.pause_largest
+        pause_reply = track.pause_reply if paused_at is None else None
         reply = _resume_paused(track, wanted=True)
         if reply is None:
             return
-        task = asyncio.create_task(_take_live_largest(track, reply,
-                                                      paused_at))
+        task = asyncio.create_task(_take_live_largest(
+            track, reply, paused_at, pause_reply))
         _resuming[track.key] = task
         task.add_done_callback(
             lambda t, k=track.key: _resuming.pop(k, None)
@@ -2470,10 +2474,14 @@ async def _resume_for(track, msg) -> None:
         track._ensure_drain()
 
 
-async def _take_live_largest(track, reply, paused_at=None) -> None:
+async def _take_live_largest(track, reply, paused_at=None,
+                             pause_reply=None) -> None:
     """Note the Largest a resume's REQUEST_OK reports, waiting at most
     RESUME_REPLY_S. Past the publisher's Largest at the pause
-    (`paused_at`), its group is live and the fence stops before it."""
+    (`paused_at`, else what `pause_reply` resolves to), its group is live
+    and the fence stops before it."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + RESUME_REPLY_S
     try:
         ok = await asyncio.wait_for(reply, RESUME_REPLY_S)
     except TimeoutError:
@@ -2487,6 +2495,16 @@ async def _take_live_largest(track, reply, paused_at=None) -> None:
         return
     live = _update_largest(ok)
     track.note_largest(live)
+    if paused_at is None and pause_reply is not None:
+        # The pause's REQUEST_OK precedes this one on the same request.
+        try:
+            paused_at = await asyncio.wait_for(
+                asyncio.shield(pause_reply),
+                max(deadline - loop.time(), 0))
+        except TimeoutError:
+            paused_at = None
+        if paused_at is not None and track.fence is not None:
+            track.fence = max(track.fence, paused_at[0])
     if (track.fence is not None and paused_at is not None
             and live is not None and live > tuple(paused_at)):
         track.fence = min(track.fence, live[0] - 1)
@@ -2526,22 +2544,24 @@ def _pause_upstream(track) -> None:
     track.paused = True
     track.lowered = True
     track.pause_largest = None
-    if wait:
-        asyncio.ensure_future(_take_pause_largest(track, reply))
+    track.pause_reply = (asyncio.ensure_future(
+        _take_pause_largest(track, reply)) if wait else None)
     logger.info(f"relay: paused {track.key} upstream, no forwarding "
                 f"subscriber for {_pause_after:g}s: REQUEST_UPDATE "
                 f"forward=0 request {rid}")
 
 
-async def _take_pause_largest(track, reply) -> None:
-    """Note the Largest a pause's REQUEST_OK reports, if it arrives
-    while the track is still paused."""
+async def _take_pause_largest(track, reply):
+    """The Largest a pause's REQUEST_OK reports, else None; noted on the
+    track if it arrives while the track is still paused."""
     try:
         ok = await reply
     except Exception:
-        return
+        return None
+    largest = _update_largest(ok)
     if track.lowered:
-        track.pause_largest = _update_largest(ok)
+        track.pause_largest = largest
+    return largest
 
 
 def _pausable(track) -> bool:
