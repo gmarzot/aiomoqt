@@ -6,9 +6,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from aiopquic.quic.events import ConnectionTerminated
+from aiopquic.quic.events import ConnectionTerminated, WebTransportSessionClosed
 
-from aiomoqt.protocol import _MOQTSessionMixin
+from aiomoqt.protocol import _MOQTSessionMixin, _close_kind
 from aiomoqt.types import SessionCloseCode
 
 _PEER = ("158.23.190.70", 6983)
@@ -123,3 +123,61 @@ async def test_transport_close_without_a_code_is_not_called_a_peer_close(records
     assert rec.levelno == logging.INFO
     assert rec.getMessage().startswith("MOQT: connection closed: NO_ERROR (0x0)")
     assert "peer closed" not in records.text
+
+
+async def test_raw_quic_transport_close_names_the_transport_code(records):
+    s = _stub(is_wt=False)
+    s._quic_event(ConnectionTerminated(error_code=0x2, frame_type=0))
+    rec = _close_line(records)
+    assert rec.levelno == logging.WARNING
+    assert rec.getMessage().startswith(
+        "MOQT: peer closed: CONNECTION_REFUSED (0x2) from")
+    assert s._close_err == (0x2, "ConnectionTerminated")
+
+
+async def test_raw_quic_application_close_keeps_the_moqt_name(records):
+    s = _stub(is_wt=False, setup_done=True)
+    s._quic_event(ConnectionTerminated(error_code=0x10, frame_type=None,
+                                       reason_phrase="drain"))
+    assert _close_line(records).getMessage().startswith(
+        "MOQT: peer closed: GOAWAY_TIMEOUT (0x10) from")
+    assert s._close_err == (0x10, "drain")
+
+
+@pytest.mark.parametrize("is_wt", [False, True], ids=["quic", "wt"])
+async def test_event_without_close_kind_keeps_moqt_naming(records, is_wt):
+    s = _stub(is_wt=is_wt)
+    s._quic_event(SimpleNamespace(error_code=0x2))
+    assert "peer closed: UNAUTHORIZED (0x2) from" in \
+        _close_line(records).getMessage()
+
+
+@pytest.mark.parametrize("event, kind", [
+    (SimpleNamespace(error_code=0x2), None),
+    (ConnectionTerminated(error_code=0x2), None),
+    (ConnectionTerminated(error_code=0x2, frame_type=0), "transport"),
+    (WebTransportSessionClosed(error_code=0x10), None),
+    (SimpleNamespace(error_code=0x10, connection_closed=False,
+                     frame_type=None), None),
+    (SimpleNamespace(error_code=0x2, connection_closed=True, frame_type=0),
+     "transport"),
+    (SimpleNamespace(error_code=0x106, connection_closed=True,
+                     frame_type=None), "connection"),
+    (None, None),
+])
+def test_close_kind(event, kind):
+    assert _close_kind(event) == kind
+
+
+@pytest.mark.parametrize("kind, code, head", [
+    ("transport", 0x2, "CONNECTION_REFUSED (0x2)"),
+    ("transport", 0x12a, "CRYPTO_ERROR (0x12a)"),
+    ("connection", 0x106, "H3_FRAME_ERROR (0x106)"),
+    ("connection", 0x2, "0x2"),
+    (None, 0x2, "UNAUTHORIZED (0x2)"),
+])
+async def test_webtransport_close_names_by_kind(records, kind, code, head):
+    s = _stub()
+    s._close_session(code, "x", transmit=False, kind=kind)
+    assert _close_line(records).getMessage().startswith(
+        f"MOQT: peer closed: {head} from")
