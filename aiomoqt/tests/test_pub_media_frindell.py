@@ -170,7 +170,8 @@ async def test_analyze_reports_frindell_latency(clip, tmp_path,  # noqa: F811
         assert r['ts_source'] == 'frindell', r
         assert r['ts_malformed'] == '0', r
         assert int(r['objects']) > 0, r
-        assert 0 <= float(r['lat_p50_ms']) < 1000, r
+        # pub_media sends a frame due within 1 ms at once.
+        assert -1 < float(r['lat_p50_ms']) < 1000, r
 
 
 @requires_certs

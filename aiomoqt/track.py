@@ -36,8 +36,8 @@ from .types import (
     SCHEDULING, to_stream_priority,
 )
 from .delivery import (
-    DatagramTooLarge, FanoutDelivery, ObjectHistory, StreamMapping,
-    SubgroupDelivery, properties_charge,
+    PUBLISHER_LANE_BYTES, DatagramTooLarge, FanoutDelivery, ObjectHistory,
+    StreamMapping, SubgroupDelivery, properties_charge,
 )
 from .messages import (
     FetchHeader, LocationFilter, MOQTMessage, ObjectDatagram, PublishOk,
@@ -430,8 +430,8 @@ class _Subscription:
     request, Forward State, subscribers and what PUBLISH_DONE owes it."""
 
     __slots__ = ('session', 'track_alias', 'request_id',
-                 'subscribe_request_id', 'subscribers', 'state', 'forward',
-                 'done', 'stream_count', 'generating', 'delivery', 'joining',
+                 'subscribe_request_id', 'subscribers', 'state', '_forward',
+                 'done', 'stream_count', '_generating', 'delivery', 'joining',
                  'window', 'open_streams', 'end_status', 'senders',
                  'fill_streams', 'fills', 'location_filter', 'group_order',
                  'object_timeout', 'subgroup_timeout', 'updated_request')
@@ -446,14 +446,14 @@ class _Subscription:
         # drains and restarts for the next subscriber.
         self.subscribers: set = set()
         self.state: TrackState = TrackState.IDLE
+        self.delivery = None
         # Subscription Forward State (§5.1): objects flow only while 1.
-        self.forward = True
+        self._forward = True
         # PUBLISH_DONE sent: nothing restarts production after this
         # (relays reject "publish after publishDone").
         self.done = False
         self.stream_count = 0
-        self.generating = False
-        self.delivery = None
+        self._generating = False
         # Request id -> Joining Location (§5.1): the Largest Location
         # reported as its Forward State became 1, None if nothing existed.
         self.joining: Dict[int, Optional[tuple]] = {}
@@ -478,6 +478,30 @@ class _Subscription:
         # Request whose Forward State a REQUEST_UPDATE has set.
         self.updated_request = None
 
+    @property
+    def forward(self):
+        return self._forward
+
+    @forward.setter
+    def forward(self, value) -> None:
+        self._forward = value
+        self._gate()
+
+    @property
+    def generating(self) -> bool:
+        return self._generating
+
+    @generating.setter
+    def generating(self, value: bool) -> None:
+        self._generating = value
+        self._gate()
+
+    def _gate(self) -> None:
+        """Hand the peer's send lane whether objects flow to it."""
+        lane = getattr(self.delivery, "lane", None)
+        if lane is not None:
+            lane.gate = bool(self._forward and self._generating)
+
     def take_timeouts(self, params, prof) -> None:
         """Record the delivery timeouts a SUBSCRIBE, PUBLISH_OK or
         REQUEST_UPDATE carries; absent ones keep their value."""
@@ -494,7 +518,7 @@ class _Subscription:
         """True when the subscription takes this Location: Forward State 1
         (§5.1) and inside its filter (§5.1.2)."""
         window = self.window
-        if not self.forward or isinstance(window, str):
+        if not self._forward or isinstance(window, str):
             return False
         end_group = window[1]
         if (group_id, object_id) < window[0]:
@@ -578,7 +602,8 @@ class PublishedTrack(Track):
                  track_properties: Optional[
                      Dict[int, Union[int, bytes]]] = None,
                  timestamps: str = 'loc',
-                 stream_scheduling: Optional[str] = None):
+                 stream_scheduling: Optional[str] = None,
+                 lane_bytes: int = PUBLISHER_LANE_BYTES):
         # Before super(): Track.__init__ assigns track_alias/request_id/
         # state, which are properties over this list.
         self._subs = [_Subscription(session)]
@@ -592,6 +617,8 @@ class PublishedTrack(Track):
         if stream_scheduling not in (None, *SCHEDULING):
             raise ValueError(f"stream_scheduling {stream_scheduling!r}")
         self.stream_scheduling = stream_scheduling
+        # Bytes each peer's send lane holds before it sheds groups.
+        self.lane_bytes = lane_bytes
         self.auth_token = auth_token
         self.immutable_properties = _checked_immutable(immutable_properties)
         self.track_properties = _checked_immutable(track_properties,
@@ -719,7 +746,7 @@ class PublishedTrack(Track):
         current alias, replacing any it had. It joins at the next group
         boundary."""
         if self._out is None:
-            self._out = FanoutDelivery()
+            self._out = FanoutDelivery(max_bytes=self.lane_bytes)
             self._out.name = self.fqtn
             self._out.on_write = self._on_produced
             self._out.on_sent = self._on_sent
@@ -732,8 +759,8 @@ class PublishedTrack(Track):
         sub.delivery.passes = sub.passes
         sub.delivery.excludes_end = sub.excludes_end
         self._out.add(sub.delivery,
-                      gate=lambda: sub.forward and sub.generating,
-                      deadline=lambda: self._delivery_deadline(sub))
+                      gate=bool(sub.forward and sub.generating),
+                      deadline=self._delivery_deadline(sub))
 
     def _lane_stopped(self, sub) -> bool:
         """True when production runs but this peer's lane task has ended."""
@@ -741,12 +768,42 @@ class PublishedTrack(Track):
                 or self._production is None or self._production.done()):
             return False
         lane = next((ln for ln in self._out.lanes
-                     if ln.delivery is sub.delivery), None)
+                     if ln.writer is sub.delivery), None)
         return lane is None or lane.task.done()
 
     # Track Property delivery timeouts in ms (§8, §12.1-12.2); 0 sets none.
-    object_delivery_timeout: int = 0
-    subgroup_delivery_timeout: int = 0
+    _object_delivery_timeout: int = 0
+    _subgroup_delivery_timeout: int = 0
+
+    @property
+    def object_delivery_timeout(self) -> int:
+        return self._object_delivery_timeout
+
+    @object_delivery_timeout.setter
+    def object_delivery_timeout(self, value: int) -> None:
+        self._object_delivery_timeout = value
+        for sub in getattr(self, "_subs", ()):
+            self._sync_deadline(sub)
+
+    @property
+    def subgroup_delivery_timeout(self) -> int:
+        return self._subgroup_delivery_timeout
+
+    @subgroup_delivery_timeout.setter
+    def subgroup_delivery_timeout(self, value: int) -> None:
+        self._subgroup_delivery_timeout = value
+        for sub in getattr(self, "_subs", ()):
+            self._sync_deadline(sub)
+
+    def _sync_deadline(self, sub) -> None:
+        """Hand the peer's send lane its delivery timeout."""
+        lane = getattr(sub.delivery, "lane", None)
+        if lane is not None:
+            lane.deadline = self._delivery_deadline(sub)
+
+    def _take_timeouts(self, sub, params, prof) -> None:
+        sub.take_timeouts(params, prof)
+        self._sync_deadline(sub)
 
     def _delivery_deadline(self, sub) -> Optional[float]:
         """A peer's object delivery timeout in seconds, None for none:
@@ -1148,6 +1205,19 @@ class PublishedTrack(Track):
         sub.forward = forward
         self._cut_streams(sub)
 
+    def _resume_lane(self, sub) -> None:
+        """Forward State back to 1: the peer's lane continues the open
+        group at its next object when the history holds the group's head,
+        for its joining FETCH or fill to serve; else it waits for the next
+        group."""
+        lane = getattr(sub.delivery, "lane", None)
+        if lane is None or self._largest is None:
+            return
+        group_id = self._largest[0]
+        history = self._history
+        lane.resume(group_id, rejoin=history is not None
+                    and history.first_held(group_id) == 0)
+
     def _cut_streams(self, sub) -> None:
         """Reset the streams whose next object the subscription no longer
         takes: a FIN would claim the rest of the group was delivered
@@ -1167,7 +1237,8 @@ class PublishedTrack(Track):
         logger.info(f"Track: PUBLISH_OK: forward={msg.forward}")
         if self._held_by_subscribe(sub, msg.request_id):
             return
-        sub.take_timeouts(getattr(msg, 'parameters', None), session._profile)
+        self._take_timeouts(sub, getattr(msg, 'parameters', None),
+                            session._profile)
         # An omitted FORWARD means 1 everywhere but REQUEST_UPDATE.
         self._set_forward(sub, 1 if msg.forward is None else msg.forward)
         if sub.forward:
@@ -1199,8 +1270,8 @@ class PublishedTrack(Track):
         if sub.updated_request == request_id:
             forward = None
         logger.info(f"Track: PUBLISH_OK (REQUEST_OK): forward={forward}")
-        sub.take_timeouts(getattr(reply, 'parameters', None),
-                          sub.session._profile)
+        self._take_timeouts(sub, getattr(reply, 'parameters', None),
+                            sub.session._profile)
         self._set_forward(sub, forward)
         if sub.forward:
             await self._start_generating(sub.session, "PUBLISH_OK")
@@ -1221,7 +1292,7 @@ class PublishedTrack(Track):
         """REQUEST_UPDATE — subscriber changes forward state."""
         sub = self._sub_for(session)
         logger.info(f"Track: REQUEST_UPDATE: {msg}")
-        sub.take_timeouts(msg.parameters, session._profile)
+        self._take_timeouts(sub, msg.parameters, session._profile)
         forward = (msg.parameters.get(ParamType.FORWARD)
                    if msg.parameters else None)
         raw_filter = (msg.parameters.get(ParamType.SUBSCRIPTION_FILTER)
@@ -1236,7 +1307,8 @@ class PublishedTrack(Track):
                 *MOQTMessage._decode_filter(raw_filter, prof=session._profile),
                 self._largest)
             self._cut_streams(sub)
-        if forward and not sub.forward:
+        resumed = bool(forward) and not sub.forward
+        if resumed:
             sub.joining[msg.existing_request_id] = self._largest
         if forward is not None:
             sub.updated_request = msg.existing_request_id
@@ -1252,14 +1324,19 @@ class PublishedTrack(Track):
         self._start_fill(session, sub, msg, largest)
         if forward:
             await self._start_generating(session, "REQUEST_UPDATE")
+            if resumed:
+                self._resume_lane(sub)
 
     async def _on_subscribe_update(self, session, msg):
         """SUBSCRIBE_UPDATE — subscriber changed forward state."""
         sub = self._sub_for(session)
         logger.info(f"Track: SUBSCRIBE_UPDATE: forward={msg.forward}")
+        resumed = bool(msg.forward) and not sub.forward
         self._set_forward(sub, msg.forward)
         if sub.forward:
             await self._start_generating(session, "SUBSCRIBE_UPDATE")
+            if resumed:
+                self._resume_lane(sub)
 
     async def _on_subscribe(self, session, msg):
         """Relay forwarded a subscriber's SUBSCRIBE."""
@@ -1304,7 +1381,8 @@ class PublishedTrack(Track):
         sub.window = window
         sub.location_filter = getattr(msg, 'location_filter', None)
         sub.group_order = getattr(msg, 'group_order', None)
-        sub.take_timeouts(getattr(msg, 'parameters', None), session._profile)
+        self._take_timeouts(sub, getattr(msg, 'parameters', None),
+                            session._profile)
         forward = getattr(msg, 'forward', None)
         self._set_forward(sub, 1 if forward is None else forward)
         self._start_fill(session, sub, msg, reported)

@@ -10,6 +10,7 @@ import pytest
 
 import aiomoqt.track as track_module
 from aiomoqt.client import MOQTClient
+from aiomoqt.delivery import SendLane
 from aiomoqt.protocol import _MOQTSessionMixin
 from aiomoqt.server import MOQTServer
 from aiomoqt.track import PublishedTrack
@@ -55,6 +56,20 @@ class _Finite(PublishedTrack):
         for group_id in range(2):
             await out.write(group_id, 0, bytes(self.object_size),
                             group_start=True)
+
+
+class _Produced(PublishedTrack):
+    """Groups of 10 objects at about 200/s through produce(), so each
+    peer is a SendLane."""
+
+    async def produce(self, out):
+        group = 0
+        while True:
+            for oid in range(10):
+                await out.write(group, oid, bytes(self.object_size),
+                                group_start=oid == 0)
+                await asyncio.sleep(0.005)
+            group += 1
 
 
 class _Receiver:
@@ -333,3 +348,100 @@ async def test_app_handler_sees_unpublished_names(draft):
         assert await _until(
             lambda: rx.count(ok.track_alias) >= _MIN_OBJECTS)
         assert set(rx.sizes[ok.track_alias]) == {_SIZES[0]}
+
+
+@pytest.mark.asyncio
+@_TRANSPORTS
+async def test_produced_tracks_keep_their_own_send_lanes(use_quic):
+    draft = 18
+    rx = _Receiver()
+    async with _loopback(_port(8, draft, use_quic), draft, rx,
+                         use_quic=use_quic) as session:
+        tracks = [_Produced(session, namespace=_NS, trackname=n,
+                            object_size=size)
+                  for n, size in zip(_NAMES, _SIZES)]
+        for track in tracks:
+            await track.publish(forward=0)
+        msgs = []
+        for _ in tracks:
+            msg = await asyncio.wait_for(rx.publishes.get(), 5.0)
+            rx.watch(rx.session, msg.track_alias)
+            rx.session.publish_ok(msg, forward=1)
+            msgs.append(msg)
+        flowing = await _until(lambda: all(
+            rx.count(m.track_alias) >= _MIN_OBJECTS for m in msgs))
+        assert flowing, {m.track_name: rx.count(m.track_alias) for m in msgs}
+        lanes = [lane for t in tracks for lane in t._out.lanes]
+        assert len({id(lane) for lane in lanes}) == len(tracks)
+        for track, lane in zip(tracks, lanes):
+            assert lane.writer is track.subscriptions[0].delivery
+            assert lane.session is session and lane.gate
+            assert lane.sheds == 0 and not lane.task.done()
+        expect = dict(zip(_NAMES, _SIZES))
+        for m in msgs:
+            assert set(rx.sizes[m.track_alias]) == {
+                expect[m.track_name.decode()]}
+
+
+class _Bursts(PublishedTrack):
+    """12 groups of 8 objects in unpaced bursts, a pause between groups,
+    then PUBLISH_DONE."""
+
+    async def produce(self, out):
+        for group in range(12):
+            for oid in range(8):
+                await out.write(group, oid, bytes(self.object_size),
+                                group_start=oid == 0)
+            await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+@_TRANSPORTS
+@pytest.mark.parametrize("write_through", [True, False],
+                         ids=["through", "queued"])
+async def test_lane_order_with_and_without_write_through(
+        use_quic, write_through, monkeypatch):
+    monkeypatch.setattr(SendLane, "write_through", write_through)
+    draft = 18
+    rx = _Receiver()
+    seen: dict = {}
+    async with _loopback(_port(9, draft, use_quic), draft, rx,
+                         use_quic=use_quic) as session:
+        # A per-stream budget under two objects, and every third write
+        # refused: objects alternate between taken inline and queued.
+        session._session.tx_max_inflight_bytes = 4000
+        tries = {True: 0, False: 0}
+        real = session.stream_write_nowait
+
+        def counted(sid, data):
+            ok = sum(tries.values()) % 3 != 2 and real(sid, data)
+            tries[ok] += 1
+            return ok
+        session.stream_write_nowait = counted
+        tracks = [_Bursts(session, namespace=_NS, trackname=n,
+                          object_size=1500) for n in _NAMES[:2]]
+        for track in tracks:
+            await track.publish(forward=0)
+        aliases = []
+        for _ in tracks:
+            msg = await asyncio.wait_for(rx.publishes.get(), 5.0)
+
+            def on_object(obj, _size, _ts, group_id, *_, alias=msg.track_alias):
+                if obj.payload:
+                    seen.setdefault(alias, []).append(
+                        (group_id, obj.object_id))
+            rx.session.register_object_handler(msg.track_alias, on_object)
+            rx.session.publish_ok(msg, forward=1)
+            aliases.append(msg.track_alias)
+        done = await _until(lambda: all(
+            len(seen.get(a, ())) >= 12 * 8 for a in aliases), 10.0)
+        assert done, {a: len(seen.get(a, ())) for a in aliases}
+    if write_through:
+        assert tries[True] and tries[False], tries
+    else:
+        assert tries == {True: 0, False: 0}, tries
+    for alias in aliases:
+        by_group: dict = {}
+        for group, oid in seen[alias]:
+            by_group.setdefault(group, []).append(oid)
+        assert by_group == {g: list(range(8)) for g in range(12)}

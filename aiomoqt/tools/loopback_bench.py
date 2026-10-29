@@ -233,7 +233,7 @@ class _FanoutTrack(PublishedTrack):
 
     @staticmethod
     def _backlog(out) -> int:
-        return max((ln.queue.qsize() for ln in out.lanes), default=0)
+        return max((len(ln.items) for ln in out.lanes), default=0)
 
     async def _wait_lanes(self, out) -> None:
         while self._backlog(out) > self._LANE_HIGH:
