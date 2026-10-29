@@ -384,14 +384,17 @@ async def test_produced_tracks_keep_their_own_send_lanes(use_quic):
 
 
 class _Bursts(PublishedTrack):
-    """12 groups of 8 objects in unpaced bursts, a pause between groups,
-    then PUBLISH_DONE."""
+    """12 groups of 8 objects, a pause between groups, then PUBLISH_DONE.
+    Objects 1-7 follow in an unpaced burst once each lane has opened the
+    group's stream, so their offers can be written through."""
 
     async def produce(self, out):
         for group in range(12):
             for oid in range(8):
                 await out.write(group, oid, bytes(self.object_size),
                                 group_start=oid == 0)
+                if oid == 0:
+                    await _until(lambda: all(ln.idle for ln in out.lanes))
             await asyncio.sleep(0.01)
 
 
@@ -407,7 +410,7 @@ async def test_lane_order_with_and_without_write_through(
     seen: dict = {}
     async with _loopback(_port(9, draft, use_quic), draft, rx,
                          use_quic=use_quic) as session:
-        # A per-stream budget under two objects, and every third write
+        # A per-stream budget under three objects, and every third write
         # refused: objects alternate between taken inline and queued.
         session._session.tx_max_inflight_bytes = 4000
         tries = {True: 0, False: 0}
