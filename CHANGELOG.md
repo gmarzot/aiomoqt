@@ -4,6 +4,7 @@
 
 - pub_server exits 2 when it has no TLS certificate (was 0), as aiomoqt-relay and moqtest_origin do.
 - loopback_bench and adaptive_bench (loopback) generate a self-signed localhost cert when none is found; servers still require one.
+- aiomoqt-relay `--drain-timeout` defaults to 2 s when `--goaway-uri` is empty, 5 s with one; GOAWAY's Timeout carries the wait. Its shutdown closes give `relay restarting; reconnect-to=same-address` or `relay shutting down; reconnect-to=<uri>` as the reason (WebTransport clients receive it).
 - aiomoqt-relay refuses new QUIC and WebTransport connections at the transport from the first SIGTERM/SIGINT (aiopquic `set_max_connections`); existing sessions still get GOAWAY and the drain.
 - pub_media gives each dial attempt 4 s (was 10 s), so a handshake lost in a relay restart costs a short retry.
 - aiomoqt-relay status: `tx_worker_idle_now`, `tx_event_ring_pops` and `tx_wake_lost` from the transport.
@@ -31,7 +32,7 @@
 - aiomoqt-relay: a subscriber that resumes a track before the pause's REQUEST_OK arrives still gets the open group in its joining FETCH or fill, not a reset.
 - aiomoqt-relay: a track that ends, gets PUBLISH_DONE or turns malformed after a newer publisher took its name no longer removes the newer track.
 - aiomoqt-relay `--config PATH` reads flags from a TOML file keyed by long flag name; command-line flags override it, unknown keys and wrong types are errors. The deploy reads `relay.toml`.
-- aiomoqt-relay drains on SIGTERM/SIGINT: it refuses new sessions, sends GOAWAY (`--goaway-uri`, default empty) and waits up to `--drain-timeout` (5 s) before exiting; a second signal exits at once. pub_media `--reconnect` redials at once on GOAWAY, to its New Session URI if given.
+- aiomoqt-relay drains on SIGTERM/SIGINT: it refuses new sessions, sends GOAWAY (`--goaway-uri`, default empty) and waits up to `--drain-timeout` before exiting; a second signal exits at once. pub_media `--reconnect` redials at once on GOAWAY, to its New Session URI if given.
 - aiomoqt-relay turns away new sessions from SIGTERM until it exits, and its closes reach the peers before the transport stops; a refused session logs no ERROR. `MOQTServer.close_sessions()` also closes sessions arriving while it waits; `refuse_sessions()` turns them away from then on.
 - A WT client refused during setup raises the session's close as MOQTException instead of being cancelled.
 - Ending one track, or cancelling or timing out a wait on it or on `async_closed()`, no longer ends other tracks' `wait_closed()` or the session's close signal.

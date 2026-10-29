@@ -1,6 +1,6 @@
 """aiomoqt-relay stops by draining: GOAWAY to every session, with
---goaway-uri as the New Session URI, a wait of up to --drain-timeout for
-sessions to leave, GOAWAY_TIMEOUT for the rest, then exit. pub_media
+--goaway-uri as the New Session URI, a wait of up to --drain-timeout (5 s
+with a URI, 2 s without) for sessions to leave, GOAWAY_TIMEOUT for the rest, then exit. pub_media
 --reconnect follows a GOAWAY at once, to the URI when given."""
 import asyncio
 import contextlib
@@ -181,11 +181,84 @@ async def test_relay_process_drains_on_sigterm(tmp_path, transport,
     out = log.read_text(errors="replace")
     assert got, "no objects before the drain"
     assert [m.new_session_uri for m in seen] == [uri, uri], out
+    assert [m.timeout for m in seen] == [2000, 2000], out
     assert rc == 0, out
     assert 2.0 <= elapsed < 4.0, elapsed
     assert f"relay: SIGTERM: draining 2 sessions, GOAWAY to {uri}" in out
     assert "relay: drain timed out, 2 sessions left" in out
     assert "relay: exit" in out
+    assert "Traceback" not in out, out
+
+
+@pytest.mark.parametrize("argv, wait", [
+    ([], 2.0),
+    (["--goaway-uri", "moqt://next.example/"], 5.0),
+    (["--drain-timeout", "3"], 3.0),
+    (["--goaway-uri", "moqt://next.example/", "--drain-timeout", "0.5"], 0.5),
+], ids=["default", "uri", "explicit", "uri-explicit"])
+def test_drain_timeout_default_follows_goaway_uri(tmp_path, argv, wait):
+    assert relay.parse_args(argv).drain_timeout == wait
+    keys = {"--goaway-uri": "goaway-uri", "--drain-timeout": "drain-timeout"}
+    pairs = list(zip(argv[::2], argv[1::2]))
+    toml = tmp_path / "relay.toml"
+    toml.write_text("".join(
+        f"{keys[k]} = {v!r}\n" if k == "--goaway-uri"
+        else f"{keys[k]} = {float(v)}\n" for k, v in pairs))
+    assert relay.parse_args(["--config", str(toml)]).drain_timeout == wait
+
+
+def test_drain_timeout_on_the_command_line_overrides_the_file(tmp_path):
+    toml = tmp_path / "relay.toml"
+    toml.write_text("drain-timeout = 3.0\n")
+    args = relay.parse_args(["--config", str(toml), "--drain-timeout", "0"])
+    assert args.drain_timeout == 0
+
+
+@pytest.mark.parametrize("uri, wait", [("", 2.0),
+                                       ("moqt://relay-next.example/", 5.0)],
+                         ids=["no-uri", "uri"])
+@pytest.mark.parametrize("transport", ["quic", "wt"])
+async def test_relay_process_default_drain_wait(tmp_path, transport, uri,
+                                                wait, relay_tables):
+    """A session that keeps its session after GOAWAY holds the drain for
+    the default wait: 2 s with no New Session URI, 5 s with one."""
+    port = free_udp_port()
+    log = tmp_path / "relay.log"
+    extra = ["--goaway-uri", uri] if uri else []
+    proc = spawn("moq_interop_relay", "--bind", "127.0.0.1", "--port", port,
+                 "--dual", "--cert", CERT, "--key", KEY, "--draft", 22,
+                 *extra, log=log)
+    loop = asyncio.get_running_loop()
+    try:
+        wait_for(log, "Listening on", proc)
+        async with contextlib.AsyncExitStack() as stack:
+            holder = await _connect(stack, port, transport == "quic", 22)
+            seen = []
+            holder.on_goaway = lambda msg, rid: seen.append(msg)
+            t0 = loop.time()
+            proc.send_signal(signal.SIGTERM)
+            await asyncio.wait_for(holder.async_closed(), wait + 3)
+            elapsed = loop.time() - t0
+            rc = await asyncio.to_thread(proc.wait, 10)
+    finally:
+        stop(proc)
+    out = log.read_text(errors="replace")
+    assert len(seen) == 1, out
+    assert seen[0].new_session_uri == uri, out
+    assert seen[0].timeout == int(wait * 1000), out
+    assert wait <= elapsed < wait + 1.0, (elapsed, out)
+    assert holder._close_err[0] == SessionCloseCode.GOAWAY_TIMEOUT, \
+        holder._close_err
+    # Raw QUIC closes carry no reason phrase yet.
+    if transport == "wt":
+        assert holder._close_err[1] == (
+            f"relay shutting down; reconnect-to={uri}" if uri
+            else "relay restarting; reconnect-to=same-address"), \
+            holder._close_err
+    assert rc == 0, out
+    assert "draining 1 sessions, GOAWAY to " in out, out
+    assert f"up to {wait:g}s" in out, out
+    assert "relay: drain timed out, 1 sessions left" in out
     assert "Traceback" not in out, out
 
 
@@ -251,7 +324,8 @@ async def test_relay_process_refuses_newcomers_until_exit(
             # A WT session that ignores GOAWAY keeps the close-out open:
             # its connection outlives the relay's GOAWAY_TIMEOUT close.
             holder = await _connect(stack, port, False, draft)
-            holder.on_goaway = lambda msg, rid: None
+            seen = []
+            holder.on_goaway = lambda msg, rid: seen.append(msg)
             proc.send_signal(signal.SIGTERM)
             await asyncio.to_thread(wait_for, log, "relay: drain timed out",
                                     proc, 5)
@@ -263,6 +337,9 @@ async def test_relay_process_refuses_newcomers_until_exit(
         stop(proc)
     out = log.read_text(errors="replace")
     assert alive, out
+    assert len(seen) == 1, out
+    if draft >= 18:
+        assert seen[0].timeout == 500, out
     assert not setup, out
     assert elapsed < 0.5, (elapsed, out)
     assert rc == 0, out
@@ -325,6 +402,8 @@ async def test_relay_process_refuses_connections_while_draining(
         assert "before READY" in str(exc), repr(exc)
     assert elapsed < 0.5, (elapsed, out)
     assert len(seen) == 1, out
+    if draft >= 18:
+        assert seen[0].timeout == 2000, out
     assert holder._close_err[0] == SessionCloseCode.GOAWAY_TIMEOUT, \
         holder._close_err
     assert rc == 0, out

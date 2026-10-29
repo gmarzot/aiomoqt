@@ -64,7 +64,8 @@ Stopping: SIGTERM or SIGINT drains. From the first signal the transport
 refuses new connections and the relay new sessions until it exits; it
 sends GOAWAY to every session (New Session URI from
 --goaway-uri, else empty: reconnect to this address), waits up to
---drain-timeout seconds for them to leave, closes the rest with
+--drain-timeout seconds (default 5 with --goaway-uri, 2 without: nothing
+else accepts at this address) for them to leave, closes the rest with
 GOAWAY_TIMEOUT and exits once the closes have left. A second signal
 exits at once.
 """
@@ -3137,11 +3138,14 @@ def parse_args(argv=None):
                         help="New Session URI sent in GOAWAY on SIGTERM or "
                              "SIGINT. Default: empty, peers reconnect to "
                              "the same address")
-    parser.add_argument("--drain-timeout", type=float, default=5.0,
+    parser.add_argument("--drain-timeout", type=float, default=None,
                         metavar="SEC",
                         help="On SIGTERM or SIGINT, wait up to SEC seconds "
                              "after GOAWAY for sessions to leave before "
-                             "exiting. Default: 5")
+                             "exiting; GOAWAY's Timeout carries it. "
+                             f"Default: {DRAIN_TIMEOUT_S:g} with "
+                             "--goaway-uri, "
+                             f"{DRAIN_TIMEOUT_NO_URI_S:g} without")
     parser.add_argument("--control", type=str, default=None, metavar="PATH",
                         help="Serve HTTP on the Unix socket PATH: GET /debug "
                              "reports DEBUG logging, POST /debug toggles it")
@@ -3198,7 +3202,11 @@ def parse_args(argv=None):
                              "DEBUG, TRACE, INFO")
     add_logging(parser)
     add_help(parser)
-    return _parse_with_config(parser, argv)
+    args = _parse_with_config(parser, argv)
+    if args.drain_timeout is None:
+        args.drain_timeout = (DRAIN_TIMEOUT_S if args.goaway_uri
+                              else DRAIN_TIMEOUT_NO_URI_S)
+    return args
 
 
 def _parse_with_config(parser, argv=None):
@@ -4741,6 +4749,18 @@ async def _serve_control(path: str) -> None:
 
 # Seconds between drain passes.
 DRAIN_POLL_S = 0.05
+# Default drain wait with a --goaway-uri successor, and without one.
+DRAIN_TIMEOUT_S = 5.0
+DRAIN_TIMEOUT_NO_URI_S = 2.0
+
+
+def _shutdown_reason(uri: str) -> str:
+    """Reason Phrase for a shutdown close: `<why>; reconnect-to=<where>`,
+    at most REASON_PHRASE_MAX bytes."""
+    text = (f"relay shutting down; reconnect-to={uri}" if uri
+            else "relay restarting; reconnect-to=same-address")
+    return text.encode()[:MOQTMessage.REASON_PHRASE_MAX].decode(
+        errors="ignore")
 
 
 def _setup_done(session) -> bool:
@@ -4800,8 +4820,9 @@ async def _drain(servers, uri: str, timeout: float, why: str) -> None:
     with GOAWAY_TIMEOUT."""
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
+    reason = _shutdown_reason(uri)
     for srv in servers:
-        srv.refuse_sessions("relay shutting down")
+        srv.refuse_sessions(reason)
 
     def live():
         return [(srv, s) for srv in servers for s in list(srv._live)
@@ -4834,7 +4855,7 @@ async def _drain(servers, uri: str, timeout: float, why: str) -> None:
             logger.info(f"relay: drain timed out, {len(left)} sessions "
                         f"left")
             for s in left:
-                s.close(SessionCloseCode.GOAWAY_TIMEOUT, "GOAWAY timeout")
+                s.close(SessionCloseCode.GOAWAY_TIMEOUT, reason)
             await _wait_closed(left, 1.0)
             return
         await asyncio.sleep(DRAIN_POLL_S)
@@ -5006,6 +5027,11 @@ async def main():
     except asyncio.CancelledError:
         wait = 0
     finally:
+        reason = _shutdown_reason(args.goaway_uri)
+        for server in servers:
+            server.refuse_sessions(reason)
+            for s in list(server._live):
+                server.refuse(s)
         await asyncio.gather(*(server.close_sessions(timeout=wait)
                                for server in servers))
         for h in handles:

@@ -10,7 +10,8 @@ services:
     container_name: aiomoqt-relay
     network_mode: host
     restart: unless-stopped
-    # Past the relay's --drain-timeout (5 s): SIGTERM drains with GOAWAY.
+    # Past the relay's --drain-timeout (2 s, 5 s with --goaway-uri): SIGTERM
+    # drains with GOAWAY.
     stop_grace_period: 15s
     mem_limit: 2g
     # Off CPU 0, which takes the NIC interrupts (host/relay-irq-affinity.service).
