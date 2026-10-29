@@ -2238,7 +2238,8 @@ class SubscribedTrack(Track):
                         priority: Optional[int] = None,
                         group_order: Optional[GroupOrder] = None,
                         location_filter: Optional[LocationFilter] = None,
-                        expected_trackname: Optional[str] = None):
+                        expected_trackname: Optional[str] = None,
+                        parameters: Optional[Dict[int, Any]] = None):
         """Subscribe to the track.
 
         Auto-routed on trackname presence:
@@ -2263,9 +2264,10 @@ class SubscribedTrack(Track):
                 filter_type form on a direct SUBSCRIBE.
             expected_trackname: discovery only: wait for this track's
                 PUBLISH and drop the namespace's other tracks.
+            parameters: extra parameters for a direct SUBSCRIBE.
         """
         if self.trackname is not None:
-            params = {}
+            params = dict(parameters or {})
             if self.auth_token is not None:
                 params[ParamType.AUTH_TOKEN] = self.auth_token
             ok = await self.session.subscribe(

@@ -795,6 +795,9 @@ class _RelayedTrack:
         self.upstream_from = None
         # Some object arrived as a datagram.
         self._datagrams = False
+        # (value, Largest Group when sent) of the last NEW_GROUP_REQUEST
+        # sent upstream.
+        self.new_group_request = None
         # Groups whose Object 0 arrived from upstream: complete from it.
         self._heads = set()
         # Locations a backfill FETCH cached; the live copy is dropped.
@@ -1852,6 +1855,8 @@ class _Establishing:
         self.forwards: list[bool] = []
         # subscribe() filter kwargs for the upstream SUBSCRIBE.
         self.filter: dict = {}
+        # The SUBSCRIBE's NEW_GROUP_REQUEST, carried upstream (§10.2.13).
+        self.params: dict = {}
         self.task = None
 
     def resolve(self, result) -> None:
@@ -1885,6 +1890,10 @@ async def _establish_upstream(ns, track_name, forward=True, sub=None):
             _tracks.pop(key, None)
         entry = _Establishing(key)
         entry.filter = _upstream_filter(sub)
+        value = (getattr(sub, "parameters", None) or {}).get(
+            ParamType.NEW_GROUP_REQUEST)
+        if isinstance(value, int):
+            entry.params = {ParamType.NEW_GROUP_REQUEST: value}
         _establishing[key] = entry
         entry.task = asyncio.create_task(_subscribe_upstream(entry))
     entry.forwards.append(bool(forward))
@@ -2131,8 +2140,12 @@ async def _subscribe_publishers(entry):
             on_done=lambda done, t=track, k=key: _upstream_done(t, k, done))
         entry.pub = pub
         upstream_filter = _filter_for(pub, entry.filter)
+        # d14 defines no NEW_GROUP_REQUEST.
+        params = ({} if pub._profile.update_has_location
+                  else entry.params)
         try:
-            await upstream.subscribe(timeout=10.0, **upstream_filter)
+            await upstream.subscribe(timeout=10.0, parameters=params,
+                                     **upstream_filter)
         except Exception as e:
             if entry.fut.done():
                 break
@@ -2178,6 +2191,10 @@ async def _subscribe_publishers(entry):
         track.properties = props
         # §10.2.11: Largest includes what the upstream SUBSCRIBE_OK reports.
         track.note_largest(upstream.largest)
+        if params:
+            track.new_group_request = (
+                params[ParamType.NEW_GROUP_REQUEST],
+                None if track.largest is None else track.largest[0])
         track.complete_from = _delivery_start(upstream_filter,
                                               upstream.largest)
         unfiltered = ("location_filter" not in upstream_filter
@@ -2413,6 +2430,45 @@ def _answer_publish(track, forward=None) -> None:
     track.publish_msg = msg
     track.pending_publish = None
     _ensure_pause_sweep()
+
+
+def _new_group_outstanding(track, value) -> bool:
+    """A NEW_GROUP_REQUEST of at least `value` was sent upstream and the
+    Largest Group has not increased since (§10.2.13)."""
+    sent = track.new_group_request
+    largest = None if track.largest is None else track.largest[0]
+    return sent is not None and sent[1] == largest and sent[0] >= value
+
+
+def _forward_new_group(track, params) -> None:
+    """Pass a subscriber's NEW_GROUP_REQUEST to the established upstream
+    in a REQUEST_UPDATE (§10.2.13): when it is 0 or above the Largest
+    Group, the track declares DYNAMIC_GROUPS=1, and no equal or larger
+    request is outstanding."""
+    value = (params or {}).get(ParamType.NEW_GROUP_REQUEST)
+    if not isinstance(value, int):
+        return
+    largest = None if track.largest is None else track.largest[0]
+    if ((value and largest is not None and value <= largest)
+            or track.properties.get(ParamType.DYNAMIC_GROUPS) != 1
+            or _new_group_outstanding(track, value)):
+        return
+    req = _upstream_request(track)
+    if req is None or not _session_live(req[0]):
+        return
+    session, rid, _location = req
+    if session._profile.update_has_location:
+        return
+    try:
+        session.request_update(
+            rid, parameters={ParamType.NEW_GROUP_REQUEST: value})
+    except Exception:
+        logger.debug("relay: forwarding NEW_GROUP_REQUEST failed",
+                     exc_info=True)
+        return
+    track.new_group_request = (value, largest)
+    logger.info(f"relay: NEW_GROUP_REQUEST {value} for {track.key} sent "
+                f"upstream: REQUEST_UPDATE request {rid}")
 
 
 def _refuse_publish(session, msg, reason, code=None) -> None:
@@ -2946,6 +3002,8 @@ def _apply_update(session, msg, found, d16: bool) -> None:
         session._send_reply(msg.request_id, ok)
         _start_fill(track, d, msg)
     _resume_paused(track)
+    if d16:
+        _forward_new_group(track, msg.parameters)
 
 
 def _update_filters(session, msg, track, d) -> bool:
@@ -3040,6 +3098,7 @@ async def _relay_subscribe(session, msg):
         if _attach_subscriber(session, msg, track, largest):
             _answer_publish(track)
             _resume_paused(track)
+            _forward_new_group(track, msg.parameters)
             logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
                         f"-> SUBSCRIBE_OK (published track, fanout="
                         f"{len(track.downstream)})")
@@ -3066,6 +3125,7 @@ async def _relay_subscribe(session, msg):
             if _attach_subscriber(session, msg, track, largest):
                 _answer_publish(track)
                 _resume_paused(track)
+                _forward_new_group(track, msg.parameters)
                 logger.info(f"relay: subscribe ns={ns} "
                             f"track={msg.track_name} -> SUBSCRIBE_OK "
                             f"(fanout={len(track.downstream)})")

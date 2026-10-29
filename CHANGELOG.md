@@ -2,6 +2,7 @@
 
 ## v0.14.0
 
+- aiomoqt-relay forwards a subscriber's NEW_GROUP_REQUEST: in its upstream SUBSCRIBE, or to an established upstream in a REQUEST_UPDATE when it is 0 or above the Largest Group and the track declares DYNAMIC_GROUPS=1, once while an equal or larger request is outstanding. `SubscribedTrack.subscribe(parameters=)` adds parameters to a direct SUBSCRIBE.
 - aiomoqt-relay honours OBJECT_DELIVERY_TIMEOUT per subscriber (the smaller of the publisher's and the subscriber's, updated by REQUEST_UPDATE); with none set, `--lag-limit SEC` (default 5, 0 = never) drops live objects that old. Expired subgroups are reset with DELIVERY_TIMEOUT; status shows `lane_expired`.
 - pub_server exits 2 when it has no TLS certificate (was 0), as aiomoqt-relay and moqtest_origin do.
 - loopback_bench and adaptive_bench (loopback) generate a self-signed localhost cert when none is found; servers still require one.
