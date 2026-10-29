@@ -998,8 +998,10 @@ async def _report_stats(stats: dict, interval: float, pub: FanoutPublisher,
     bitrate over the interval, frames dropped before a subscriber
     arrived, frames the track discarded unnumbered (waiting for a key
     frame, Forward State 0), frames shed per relay (index = URL position)
-    and, with several relays, the demand count. `events` also gets a
-    stats event per interval."""
+    and, with several relays, the demand count. A track with subscribers
+    but no peer at Forward State 1 shows ` · paused`. `events` also gets
+    a stats event per interval; each track's `forwarding` counts its
+    peers taking objects (Forward State 1, not idle)."""
     t0 = time.monotonic()
     prev_obj = {name: 0 for name in stats}
     prev_bytes = {name: 0 for name in stats}
@@ -1015,9 +1017,11 @@ async def _report_stats(stats: dict, interval: float, pub: FanoutPublisher,
             kbps = (st.bytes - prev_bytes[name]) * 8 / interval / 1000
             prev_obj[name] = objects
             prev_bytes[name] = st.bytes
+            forwarding = sum(1 for sub in getattr(track, 'subscriptions', ())
+                             if sub.forward and sub.generating)
             tracks[name] = dict(objects=objects, groups=st.groups,
                                 kbps=round(kbps), dropped=st.dropped,
-                                discarded=discarded)
+                                discarded=discarded, forwarding=forwarding)
             lag = st.take_lag()
             line = (f"{name}: {objects} obj · {ops:.0f} obj/s · {kbps:.0f} kbps"
                     + (f" · lag {lag[0]:.0f}/{lag[1]:.0f} ms" if lag else "")
@@ -1027,6 +1031,8 @@ async def _report_stats(stats: dict, interval: float, pub: FanoutPublisher,
             if track is not None and len(pub.sessions) > 1:
                 have, total = track.demand
                 line += f" · demand {have}/{total}"
+            if track is not None and track.demand[0] > 0 and not forwarding:
+                line += " · paused"
             shed = getattr(track, 'shed', None) or {}
             if shed:
                 line += " · shed " + ",".join(

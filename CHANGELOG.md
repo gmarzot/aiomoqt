@@ -98,6 +98,7 @@
 - pub_server and adaptive_bench (subs mode) take `--video RES`, like pub_bench; with it `-r` is the frame rate (default 30) and `-g` the GOP length in frames (default 1 s), and `-s`, `-P` and `-D` are refused instead of ignored.
 - sub_bench and loopback_bench `--verify-payload [N]` check each received object (or every Nth) against the bench layout and fail the run on a mismatch; generated objects now carry their size (`{group}.{object}.{size}|`) and video frames the counting filler.
 - moq_interop_client publish-track-subscribe waits for the PUBLISH reply before subscribing, so a relay slow to answer no longer turns a pass or a NOT_SUPPORTED skip into a failure.
+- pub_media stats: each track reports `forwarding`, its peers at Forward State 1 taking objects, and a subscribed track nobody forwards shows ` · paused`.
 
 ## v0.13.3
 
