@@ -116,8 +116,7 @@ def test_adaptive_bench_loopback_makes_its_own_cert(fresh_home):
                                   "pub_server"])
 def test_servers_do_not_self_sign(fresh_home, tool):
     rc, out = _run_fresh(tool, "--port", free_udp_port(), timeout=30)
-    if tool != "pub_server":
-        assert rc != 0, out
+    assert rc != 0, out
     assert re.search(r"TLS (cert/key|certificate) required", out), out
     assert not fresh_home.exists()
 
