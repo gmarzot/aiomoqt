@@ -1467,11 +1467,14 @@ class _RelayedTrack:
         return start >= first
 
     def open_gap(self) -> None:
-        """Note a pause: what is published from just past Largest until
-        objects flow again never reaches the cache."""
-        if self.largest is not None and not (self._gaps
-                                             and self._gaps[-1][1] is None):
-            self._gaps.append([(self.largest[0], self.largest[1] + 1), None])
+        """Note a pause: what is published from just past Largest, or
+        from (0, 0) with none known, until objects flow again may never
+        reach the cache."""
+        if self._gaps and self._gaps[-1][1] is None:
+            return
+        start = ((0, 0) if self.largest is None
+                 else (self.largest[0], self.largest[1] + 1))
+        self._gaps.append([start, None])
 
     def crosses_gap(self, start, end) -> bool:
         """True when [start, end] (None: to the live edge) overlaps a
@@ -2491,6 +2494,8 @@ def _answer_publish(track, forward=None) -> None:
     track.upstream = session
     track.upstream_request_id = msg.request_id
     track.paused = not forward
+    if track.paused:
+        track.open_gap()
     track.publish_msg = msg
     track.pending_publish = None
     _ensure_pause_sweep()
@@ -2715,6 +2720,7 @@ def _pause_upstream(track) -> None:
         return
     track.paused = True
     track.lowered = True
+    track.open_gap()
     track.pause_largest = None
     track.pause_reply = (asyncio.ensure_future(
         _take_pause_largest(track, reply)) if wait else None)
@@ -2760,8 +2766,6 @@ async def _sweep_unwatched() -> None:
                 track.unwatched_since = now
             elif now - track.unwatched_since >= _pause_after:
                 _pause_upstream(track)
-                if track.lowered:
-                    track.open_gap()
 
 
 def _ensure_pause_sweep() -> None:
@@ -2919,8 +2923,8 @@ async def _serve_fill(track, d, request_id, fill, rng,
     gapped = track.crosses_gap(start, end)
     try:
         if track.cache_covers(start) and not gapped:
-            objs = track.cached_range(start, end)
-        elif timeout_ms != 0 and _fetch_sources(ns, name):
+            objs = track.cached_range(start, end) or None
+        if objs is None and timeout_ms != 0 and _fetch_sources(ns, name):
             wait = FILL_UPSTREAM_S if timeout_ms is None else min(
                 timeout_ms / 1000, FILL_UPSTREAM_S)
             rng_msg = SimpleNamespace(
@@ -2935,7 +2939,7 @@ async def _serve_fill(track, d, request_id, fill, rng,
                                 for o in up], "upstream"
         if track.cache_covers(start) and (objs is None or gapped):
             # Cached while upstream was asked, or around the gap.
-            objs = _merged(objs, track.cached_range(start, end))
+            objs = _merged(objs, track.cached_range(start, end)) or objs
         gap = None
         if objs is None and timeout_ms is not None:
             objs = track.cached_range(start, end)

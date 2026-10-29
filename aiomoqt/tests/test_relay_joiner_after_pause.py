@@ -1,8 +1,9 @@
 """A joiner after any pause gets live media or nothing, never stale: a
 track paused since its PUBLISH is resumed against the publisher's live
 Largest; an upstream FETCH that succeeds with no objects reaches the
-subscriber as an empty FETCH, not an error; a range in a pause's gap goes
-upstream instead of being answered short from the cache. Two LOC tracks
+subscriber as an empty FETCH, not an error; a range in a pause's gap,
+including one opened at PUBLISH, goes upstream instead of being answered
+short from the cache. Two LOC tracks
 on one publisher session, over raw QUIC and WebTransport."""
 import asyncio
 import contextlib
@@ -24,6 +25,7 @@ _FPS = 100
 # Video opens a group every _GOP frames; every audio frame is a group.
 _GOP = {"video": 10, "audio": 1}
 _HISTORY = 1 << 20
+_LATE_S = 0.2
 
 
 def _key(name):
@@ -80,12 +82,25 @@ class _Warm(LocTrackPublisher):
         return True
 
 
+class _Late(_Warm):
+    """Takes the relay's Forward State 0 _LATE_S late, so objects sent
+    meanwhile reach the relay after its pause."""
+
+    async def _on_request_update(self, session, msg):
+        await asyncio.sleep(_LATE_S)
+        await super()._on_request_update(session, msg)
+
+    async def _await_publish_reply(self, request_id, sub=None):
+        await asyncio.sleep(_LATE_S)
+        await super()._await_publish_reply(request_id, sub)
+
+
 @contextlib.asynccontextmanager
-async def _relay(port, use_quic, draft, make, pause_after=None):
+async def _relay(port, use_quic, draft, make, pause_after=None, forward=0):
     """Yields (connect, tracks): a relay fed by one publisher session
     with a track per _GOP entry, `make(pub, name, gop)` building each and
-    returning it with its source coroutine or None; no publisher when
-    `make` is None."""
+    returning it with its source coroutine or None, PUBLISHed with
+    `forward`; no publisher when `make` is None."""
     _reset()
     if pause_after is not None:
         relay._pause_after = pause_after
@@ -108,7 +123,7 @@ async def _relay(port, use_quic, draft, make, pause_after=None):
             for name, gop in (_GOP.items() if make else ()):
                 track, source = make(pub, name, gop)
                 await track.publish(announce_namespace=False,
-                                    publish_track=True)
+                                    publish_track=True, forward=forward)
                 tracks[name] = track
                 if source is not None:
                     sources.append(asyncio.create_task(source))
@@ -292,6 +307,9 @@ async def test_a_range_in_the_pause_gap_is_fetched_upstream(
         relayed = {name: relay._tracks[_key(name)] for name in _GOP}
         assert await _until(lambda: all(t.lowered
                                         for t in relayed.values()))
+        assert all(t._gaps and t._gaps[-1][1] is None
+                   for t in relayed.values()), {
+                       n: t._gaps for n, t in relayed.items()}
         paused_at = {name: t.largest for name, t in relayed.items()}
         await asyncio.sleep(0.5)
 
@@ -377,3 +395,50 @@ async def test_the_fence_spares_the_live_group(draft, use_quic):
             want = [(largest[0], o) for o in range(largest[1] + 1)]
             assert fetched.get(rid) == want, (name, fetched.get(rid))
         assert rx2._close_err is None
+
+
+@requires_certs
+@pytest.mark.asyncio
+@pytest.mark.parametrize("draft", [18, 22])
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+@pytest.mark.parametrize("cached", ["none", "part"])
+async def test_a_pause_at_publish_fills_the_open_group_from_upstream(
+        cached, draft, use_quic):
+    """A PUBLISH nobody forwards is paused at once, but objects sent
+    before Forward State 0 lands are cached, and the publisher keeps
+    producing. The first joiner's FETCH or fill holds the open group
+    whole from object 0, whether none or part of it was cached."""
+    port = (_PORT + 56 + 4 * (cached == "part")
+            + 2 * [18, 22].index(draft) + (not use_quic))
+    gops = {"video": 200 if cached == "part" else 10, "audio": 1}
+
+    def make(pub, name, gop):
+        track = _Late(pub, _NS, name, fetch_history_bytes=_HISTORY,
+                      media_kind="audio" if gop == 1 else "video")
+        return track, _source(track, gops[name])
+
+    async with _relay(port, use_quic, draft, make,
+                      forward=1) as (connect, _):
+        relayed = {name: relay._tracks[_key(name)] for name in _GOP}
+        assert await _until(lambda: all(t.paused and t._objects_in
+                                        for t in relayed.values()))
+        assert all(not t.lowered for t in relayed.values())
+        await asyncio.sleep(0.5)
+        held = {name: [(c[0], c[2]) for c in t._cache]
+                for name, t in relayed.items()}
+
+        rx = await connect()
+        live, fetched = _collect(rx)
+        for name in _GOP:
+            ok, rid, reply = await _join(rx, name, draft)
+            assert not isinstance(reply, Exception), (name, reply)
+            largest = _reply_largest(ok)
+            if name == "video":
+                cached_open = [c for c in held[name] if c[0] == largest[0]]
+                assert bool(cached_open) is (cached == "part"), (
+                    largest, held[name])
+            assert await rx.await_fetch_done(rid, timeout=3.0), name
+            want = [(largest[0], o) for o in range(largest[1] + 1)]
+            assert fetched.get(rid) == want, (name, fetched.get(rid))
+        assert await _until(lambda: all(live.values())), live
+        assert rx._close_err is None

@@ -2,6 +2,7 @@
 
 ## v0.14.0
 
+- aiomoqt-relay: a track paused at PUBLISH records a pause gap like a later pause, so the first joiner's FETCH or fill for the open group comes from upstream instead of a short cache answer; a fill the cache answers with nothing asks upstream.
 - A session logs one close line, ours included, with the peer address after the transport is gone; it has no `; reason:` part when none was given (no more `ConnectionTerminated` or `no error` placeholders), and the peer's reason is cut to 1024 bytes and escaped outside printable ASCII. A GOAWAY_TIMEOUT close we send logs INFO.
 - loopback_bench `--rtt-ms`, `--link-mbps`, `--loss`: emulated link (netem) on a private network namespace's lo; needs privileges to create one.
 - aiomoqt-relay honours MAX_CACHE_DURATION: an object past it is not forwarded, replayed or served from the cache (a FETCH for it goes upstream), and an explicit OBJECT_DELIVERY_TIMEOUT now also times cache replays (`--lag-limit` still does not). The per-object record charge is 224 bytes (was 192).

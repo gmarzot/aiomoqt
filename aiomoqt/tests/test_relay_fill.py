@@ -4,6 +4,7 @@ while paused, and reset, or reported as a Timed-Out gap, when nothing
 holds the range. Two tracks per session; payload sizes tell them apart."""
 import asyncio
 import contextlib
+from types import SimpleNamespace
 
 import pytest
 
@@ -240,3 +241,43 @@ async def test_unheld_fill_resets_or_reports_a_timed_out_gap(use_quic):
         assert rx.gaps[gap.request_id] == [(0x20C, 2, 2)]
         assert rx.sizes(gap.request_id) == {_SIZES["audio"]}
         assert rx.session._close_err is None
+
+
+@pytest.mark.parametrize("timeout_ms", [None, 500], ids=["reset", "gap"])
+async def test_an_empty_cache_and_a_failed_upstream_fail_the_fill(
+        timeout_ms, monkeypatch):
+    # The cache covers the start but holds nothing in range and the
+    # upstream FETCH fails: the fill is reset, or under FILL_TIMEOUT
+    # served as a Timed-Out gap, never as an empty stream.
+    served, failed = {}, []
+
+    async def serve_fetch(request_id, objs, **_kw):
+        served[request_id] = list(objs)
+
+    async def no_upstream(*_a, **_kw):
+        return None, None, None
+
+    async def fail_fill(_session, request_id):
+        failed.append(request_id)
+
+    monkeypatch.setattr(relay, "_fetch_sources", lambda *_: [object()])
+    monkeypatch.setattr(relay, "_fetch_upstream", no_upstream)
+    monkeypatch.setattr(relay, "_fail_fill", fail_fill)
+    d = SimpleNamespace(session=SimpleNamespace(serve_fetch=serve_fetch),
+                        group_order=None)
+    fill = ({} if timeout_ms is None
+            else {D20ParamType.FILL_TIMEOUT: timeout_ms})
+    for rid, name in enumerate(_SIZES):
+        track = SimpleNamespace(
+            key=((b"relay", b"fill"), name.encode()),
+            crosses_gap=lambda *_: False, cache_covers=lambda _: True,
+            cached_range=lambda *_: [])
+        await relay._serve_fill(track, d, rid, fill, ((2, 0), (2, 4)))
+    if timeout_ms is None:
+        assert failed == [0, 1] and not served, (failed, served)
+        return
+    assert not failed, failed
+    for rid in (0, 1):
+        assert [(o.end_of_range, o.group_id, o.object_id)
+                for o in served[rid]] == [
+                    (relay.FETCH_FLAGS_END_TIMED_OUT, 2, 4)], served
