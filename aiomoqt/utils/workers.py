@@ -537,6 +537,24 @@ def sub_batch_worker_entry(config: Dict[str, Any], mp_stop_event,
 # Publisher worker — for adaptive_bench BW mode + (eventually) loopback bench
 # ---------------------------------------------------------------------------
 
+def bench_track(session, config: Dict[str, Any], *, rate: float,
+                num_subgroups: int, **kwargs):
+    """The bench publisher's track: a VideoTrack when config names a
+    'video' profile ('video_fps', and 'group_size' as the GOP), else
+    object_size x num_subgroups at `rate`."""
+    from aiomoqt.track import PublishedTrack, VideoTrack
+    if config.get('video'):
+        return VideoTrack(session, config['namespace'], config['trackname'],
+                          resolution=config['video'],
+                          fps=config['video_fps'],
+                          gop_size=config['group_size'])
+    return PublishedTrack(session, namespace=config['namespace'],
+                          trackname=config['trackname'],
+                          object_size=config['object_size'],
+                          group_size=config.get('group_size', 10000),
+                          num_subgroups=num_subgroups, rate=rate, **kwargs)
+
+
 async def _publisher_task(config: Dict[str, Any], mp_stop_event,
                           rate_queue, events_queue):
     """Connect to relay, publish a track, drive paced object generation
@@ -546,8 +564,6 @@ async def _publisher_task(config: Dict[str, Any], mp_stop_event,
     events_queue stats: {'kind':'pub_stats', 't', 'tx_bytes', 'tx_objs',
                           'cumulative_bytes', 'cumulative_objs'} every 1s.
     """
-    from aiomoqt.track import PublishedTrack
-
     relay = parse_relay_url(config['relay_url'],
                             force_quic=config.get('force_quic', False))
     client = MOQTClient(
@@ -576,14 +592,10 @@ async def _publisher_task(config: Dict[str, Any], mp_stop_event,
             _fwd = (ForwardingPreference.DATAGRAM
                     if config.get('delivery') == 'datagram'
                     else ForwardingPreference.SUBGROUP)
-            track = PublishedTrack(
-                session,
-                namespace=config['namespace'],
-                trackname=config['trackname'],
-                object_size=config['object_size'],
-                group_size=config.get('group_size', 10000),
-                num_subgroups=_num_sg,
+            track = bench_track(
+                session, config,
                 rate=config.get('initial_rate_ops', 0.0),
+                num_subgroups=_num_sg,
                 forwarding=_fwd,
             )
             track._stats_header_printed = True
@@ -745,7 +757,6 @@ async def _loopback_server_task(config: Dict[str, Any], mp_stop_event,
                                   rate_queue, events_queue):
     from aiomoqt.server import MOQTServer
     from aiomoqt.types import MOQTMessageType
-    from aiomoqt.track import PublishedTrack
 
     stop_ev = _bridge_stop_event(mp_stop_event)
     _num_sg = max(1, config.get('num_subgroups', 1))
@@ -753,15 +764,8 @@ async def _loopback_server_task(config: Dict[str, Any], mp_stop_event,
     track_holder: Dict[str, Any] = {'track': None}
 
     async def _on_subscribe(session, msg):
-        track = PublishedTrack(
-            session,
-            namespace=config['namespace'],
-            trackname=config['trackname'],
-            object_size=config['object_size'],
-            group_size=config.get('group_size', 10000),
-            num_subgroups=_num_sg,
-            rate=initial_rate,
-        )
+        track = bench_track(session, config, rate=initial_rate,
+                            num_subgroups=_num_sg)
         track._stats_header_printed = True
         track._quiet = True
         ok = session.subscribe_ok(request_msg=msg)

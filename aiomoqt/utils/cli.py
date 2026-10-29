@@ -30,7 +30,9 @@ addressing
 
 identity          -N/--namespace  -T/--trackname
 publisher media   -s/--object-size -g/--group-size -P/--streams
-                  -r/--rate -D/--datagram --video
+                  -r/--rate -D/--datagram, plus video
+video             --video RES: -r = frame rate, -g = GOP frames; refuses
+                  -s/-P/-D (check_video)
 run               -t/--duration -d/--debug --no-stats
 logging           --log-level --log (long only; -d/--debug = --log-level
                   debug)
@@ -67,6 +69,36 @@ DGRAM_MAX_OBJECT = 1152
 
 VIDEO_PROFILES = ('240p', '270p', '360p', '480p',
                   '720p', '1080p', '1440p', '4k')
+VIDEO_FPS = 30
+
+
+def _note_given(namespace, dest):
+    given_set = getattr(namespace, '_given', None)
+    if given_set is None:
+        given_set = set()
+        setattr(namespace, '_given', given_set)
+    given_set.add(dest)
+
+
+class StoreGiven(argparse._StoreAction):
+    """store, noting that the flag was given (see given())."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        super().__call__(parser, namespace, values, option_string)
+        _note_given(namespace, self.dest)
+
+
+class StoreTrueGiven(argparse._StoreTrueAction):
+    """store_true, noting that the flag was given (see given())."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        super().__call__(parser, namespace, values, option_string)
+        _note_given(namespace, self.dest)
+
+
+def given(args):
+    """Dests set on the command line by a StoreGiven/StoreTrueGiven flag."""
+    return getattr(args, '_given', set())
 
 
 def make_parser(description, epilog=None):
@@ -157,30 +189,40 @@ def add_identity(p, namespace='aiomoqt', trackname=None,
 def add_publisher_media(p):
     """Fixed publisher-side media set. Subscriber tools don't call this
     — a subscriber chooses neither object shape nor rate."""
-    p.add_argument('-s', '--object-size', type=int,
+    p.add_argument('-s', '--object-size', type=int, action=StoreGiven,
                    default=DEFAULT_OBJECT_SIZE,
                    help=f'Object payload bytes '
                         f'(default: {DEFAULT_OBJECT_SIZE})')
-    p.add_argument('-g', '--group-size', type=int,
+    p.add_argument('-g', '--group-size', type=int, action=StoreGiven,
                    default=DEFAULT_GROUP_SIZE,
                    help=f'Objects per group (default: '
                         f'{DEFAULT_GROUP_SIZE}). Stream turnover rate = '
                         f'rate / group-size; lower it to exercise churn '
                         f'(e.g. -g 240 for 2 s GOPs at 120 obj/s).')
     p.add_argument('-P', '--streams', type=int, default=1,
+                   action=StoreGiven,
                    help='Parallel subgroup streams (default: 1)')
-    p.add_argument('-r', '--rate', type=float, default=0,
+    p.add_argument('-r', '--rate', type=float, default=0, action=StoreGiven,
                    help='Aggregate objects/sec across all streams '
                         '(0 = max, default: max). Per-stream emit rate '
                         'is rate/streams.')
-    p.add_argument('-D', '--datagram', action='store_true',
+    p.add_argument('-D', '--datagram', action=StoreTrueGiven,
                    help=f'ObjectDatagrams instead of subgroup streams '
                         f'(object must fit one packet, '
                         f'<= {DGRAM_MAX_OBJECT} B)')
+    add_video(p)
+
+
+def add_video(p):
+    """--video: a video-shaped track. Validate with check_video()."""
     p.add_argument('--video', type=str, default=None, metavar='RES',
                    choices=VIDEO_PROFILES,
-                   help='Video profile — sets object size, rate and GOP '
-                        'from the resolution. Overrides -s/-r/-g.')
+                   help='Video profile: one object per frame, one GOP per '
+                        'group opening on an I-frame, I/P/B frame sizes '
+                        'from the resolution, one subgroup stream. -r is '
+                        f'the frame rate (default: {VIDEO_FPS}) and -g the '
+                        'GOP length in frames (default: 1 s of frames); '
+                        'not with -s, -P or -D.')
 
 
 # -- run / session ---------------------------------------------------
@@ -371,6 +413,35 @@ def check_datagram(parser, args):
         parser.error(
             f'-D/--datagram: object-size {size} can never fit a DATAGRAM '
             f'frame (max ~{DGRAM_MAX_OBJECT} B; frames cannot fragment)')
+
+
+def check_video(parser, args):
+    """--video: refuse the flags a profile replaces (-s, -P, -D); -r and
+    -g keep their meaning as frame rate and GOP length. Sets object_size
+    to the profile's mean frame size and streams to 1."""
+    if not getattr(args, 'video', None):
+        return
+    clash = [flag for flag, dest in (('-s', 'object_size'),
+                                     ('-P', 'streams'), ('-D', 'datagram'))
+             if dest in given(args)]
+    if clash:
+        parser.error(f"--video cannot be combined with {', '.join(clash)}: "
+                     "the profile sets each frame's size and sends one "
+                     "subgroup stream")
+    fps = args.rate if 'rate' in given(args) else VIDEO_FPS
+    if fps <= 0:
+        parser.error('--video needs a frame rate: -r must be above 0')
+    gop = (args.group_size if 'group_size' in given(args)
+           else max(1, round(fps)))
+    if gop < 1:
+        parser.error('--video: -g must be at least 1 frame')
+    from aiomoqt.track import VideoTrack
+    if hasattr(args, 'rate'):
+        args.rate = fps
+    args.video_fps = fps
+    args.group_size = gop
+    args.streams = 1
+    args.object_size = VideoTrack.mean_object_size(args.video, gop)
 
 
 def check_url_vs_listener(parser, args):

@@ -60,8 +60,9 @@ serve_dispatch). `--quic-port N` remains as the legacy two-listener
 arrangement (second raw-QUIC listener sharing the global namespace
 table) for runners that expect distinct endpoints.
 
-Stopping: SIGTERM or SIGINT drains. The relay refuses new sessions until
-it exits, sends GOAWAY to every session (New Session URI from
+Stopping: SIGTERM or SIGINT drains. From the first signal the transport
+refuses new connections and the relay new sessions until it exits; it
+sends GOAWAY to every session (New Session URI from
 --goaway-uri, else empty: reconnect to this address), waits up to
 --drain-timeout seconds for them to leave, closes the rest with
 GOAWAY_TIMEOUT and exits once the closes have left. A second signal
@@ -4186,7 +4187,7 @@ TRANSPORT_COUNTERS = (
     "rx_notify_pending_now", "rx_event_ring_count_now",
     "rx_overflow_depth_now", "rx_overflow_max_depth", "rx_overflow_pushed",
     "rx_event_drops", "tx_event_ring_count_now", "tx_event_ring_pops",
-    "tx_worker_idle_now", "loop_callbacks",
+    "tx_worker_idle_now", "tx_wake_lost", "loop_callbacks",
     "wake_calls", "wake_skipped_coalesced")
 
 
@@ -4342,7 +4343,7 @@ def _track_state(track, flowing) -> str:
     if track.pending_publish is not None:
         return "held"
     if track.paused:
-        return "parked"  # dashboard.js state name
+        return "paused"
     return "live" if flowing else "idle"
 
 
@@ -4927,6 +4928,39 @@ async def _wait_closed(sessions, timeout: float) -> None:
             w.cancel()
 
 
+# Bound on retries while a transport's TX event ring is full.
+REFUSE_RETRIES = 50
+REFUSE_RETRY_S = 0.01
+
+
+async def _refuse_connections(handles) -> None:
+    """Have each listener's transport refuse new connections; existing
+    ones keep running."""
+    transports = {}
+    for h in handles:
+        t = _transport_of(h)
+        if t is not None:
+            transports[id(t)] = t
+    for t in transports.values():
+        refuse = getattr(t, "set_max_connections", None)
+        if refuse is None:
+            logger.debug("relay: aiopquic lacks set_max_connections")
+            return
+        try:
+            for _ in range(REFUSE_RETRIES):
+                if refuse(0) == 0:
+                    break
+                await asyncio.sleep(REFUSE_RETRY_S)
+            else:
+                logger.warning("relay: refusing new connections: TX event "
+                               "ring full")
+        except (ConnectionError, ValueError):
+            logger.debug("relay: refusing new connections failed",
+                         exc_info=True)
+    if transports:
+        logger.info("relay: refusing new connections")
+
+
 async def _drain(servers, uri: str, timeout: float, why: str) -> None:
     """GOAWAY to every set-up session, refusing any other from now on,
     then wait up to `timeout` seconds for them to leave; close the rest
@@ -5133,6 +5167,7 @@ async def main():
         await stop.wait()
         if watchdog is not None:
             watchdog.cancel()
+        await _refuse_connections(handles)
         await _drain(servers, args.goaway_uri, args.drain_timeout,
                      stopped_by[0])
     except asyncio.CancelledError:

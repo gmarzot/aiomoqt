@@ -491,6 +491,9 @@
   ".transport[].tx_event_ring_pops": [
    "int"
   ],
+  ".transport[].tx_wake_lost": [
+   "int"
+  ],
   ".transport[].tx_worker_idle_now": [
    "int"
   ],

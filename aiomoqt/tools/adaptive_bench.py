@@ -34,7 +34,7 @@ from typing import Optional
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
-from aiomoqt.track import PublishedTrack, SubscribedTrack
+from aiomoqt.track import SubscribedTrack
 from aiomoqt.types import (FilterType, MOQTMessageType, ObjectStatus,
                            parse_draft_spec)
 from aiomoqt.utils import cli as _cli
@@ -1317,14 +1317,14 @@ async def run_loopback_server(args, state: BenchState):
         # PublishedTrack.rate is AGGREGATE across subgroups (the track
         # divides by num_subgroups in its send loop) — pass rate_ops
         # straight through.
-        track = PublishedTrack(
+        from aiomoqt.utils.workers import bench_track
+        track = bench_track(
             session,
-            namespace=args.namespace,
-            trackname=args.trackname,
-            object_size=args.scenario.object_size,
-            group_size=args.group_size,
-            num_subgroups=args.scenario.subgroups,
+            dict(namespace=args.namespace, trackname=args.trackname,
+                 object_size=args.scenario.object_size,
+                 group_size=args.group_size, **_video_cfg(args)),
             rate=state.rate_ops,
+            num_subgroups=args.scenario.subgroups,
         )
         # Silence the per-track stats printer — we print our own.
         track._quiet = True
@@ -1439,12 +1439,15 @@ def parse_args():
         description="aiomoqt adaptive bench — feedback-driven bitrate ramp",
     )
     p.add_argument("-s", "--object-size", type=int, default=4096,
-                   metavar="B", help="bytes per MoQT object (default: 4096)")
+                   metavar="B", action=_cli.StoreGiven,
+                   help="bytes per MoQT object (default: 4096)")
     p.add_argument("-P", "--streams", type=int, default=1,
+                   action=_cli.StoreGiven,
                    help="parallel subgroup streams (default: 1)")
     p.add_argument("-g", "--group-size", type=int, default=4096,
-                   dest="group_size",
+                   dest="group_size", action=_cli.StoreGiven,
                    help="objects per group (default: 4096)")
+    _cli.add_video(p)
     p.add_argument("--start-mbps", type=float, default=10.0,
                    help="initial aggregate bitrate (default: 10)")
     p.add_argument("--step-mbps", type=float, default=10.0,
@@ -1518,8 +1521,9 @@ def parse_args():
                    help="subs-mode: cap; the run ends on reaching it "
                         "(default: 200)")
     p.add_argument("--sub-mbps", type=float, default=10.0,
+                   action=_cli.StoreGiven,
                    help="subs-mode: fixed per-track publisher bitrate "
-                        "(default: 10 Mbps)")
+                        "(default: 10 Mbps; with --video, the profile's)")
     p.add_argument("-j", "--join-rate", type=float, default=None,
                    dest="join_rate", metavar="SEC",
                    help="subs-mode: seconds between subscriber GROUPS "
@@ -1623,6 +1627,16 @@ def parse_args():
     if args.trackname is None:
         args.trackname = f"adaptive-bench-{uuid.uuid4().hex[:4]}"
 
+    if args.video:
+        # A profile has a fixed bitrate: nothing for bw mode to ramp.
+        if args.mode != "subs":
+            p.error("--video is subs-mode only: bw mode ramps the "
+                    "publisher's bitrate, which a video profile fixes")
+        if "sub_mbps" in _cli.given(args):
+            p.error("--video sets the track's bitrate; drop --sub-mbps")
+        _cli.check_video(p, args)
+        args.sub_mbps = args.object_size * 8 * args.video_fps / 1e6
+
     args.scenario = Scenario(
         object_size=args.object_size,
         subgroups=args.streams,
@@ -1633,6 +1647,13 @@ def parse_args():
         settle_s=15.0,
     )
     return args
+
+
+def _video_cfg(args) -> dict:
+    """Worker config keys for a --video publisher; empty without one."""
+    if not args.video:
+        return {}
+    return dict(video=args.video, video_fps=args.video_fps)
 
 
 def _print_banner(args):
@@ -1655,7 +1676,11 @@ def _print_banner(args):
     else:
         print(f"  relay:              loopback self-test ({draft_s})")
     print(f"  trackname:          {args.namespace}/{args.trackname}")
-    publish_parts = [pub_mode, f"obj={sc.object_size}B", f"P={sc.subgroups}"]
+    publish_parts = [pub_mode,
+                     (f"video={args.video} gop={args.group_size}"
+                      f" obj={sc.object_size}B mean" if args.video
+                      else f"obj={sc.object_size}B"),
+                     f"P={sc.subgroups}"]
     if args.mode == "subs":
         publish_parts.append(f"rate={args.sub_mbps:.1f}Mbps")
     print(f"  publish:            {', '.join(publish_parts)}")
@@ -1710,6 +1735,7 @@ async def _run_fixed_publisher(args) -> int:
         object_size=args.scenario.object_size,
         group_size=args.group_size,
         num_subgroups=args.scenario.subgroups,
+        **_video_cfg(args),
         initial_rate_ops=args.scenario.aggregate_ops(args.sub_mbps),
         pub_ns=args.pub_ns, pub_both=args.pub_both,
         debug=args.debug,
@@ -1720,9 +1746,10 @@ async def _run_fixed_publisher(args) -> int:
     proc.start()
     print(f"  role=pub — publishing {args.namespace}/{args.trackname} "
           f"at {args.sub_mbps} Mbps; run the subscriber host with:")
+    shape = (f"--video {args.video} -g {args.group_size}" if args.video
+             else f"--sub-mbps {args.sub_mbps}")
     print(f"    moq-adaptive-bench {args.relay_url} --mode subs "
-          f"--role sub -N {args.namespace} -T {args.trackname} "
-          f"--sub-mbps {args.sub_mbps}")
+          f"--role sub -N {args.namespace} -T {args.trackname} {shape}")
     published = failed = interrupted = False
 
     def drain_health():
@@ -1869,6 +1896,7 @@ async def main():
                     object_size=args.scenario.object_size,
                     group_size=args.group_size,
                     num_subgroups=args.scenario.subgroups,
+                    **_video_cfg(args),
                     initial_rate_ops=args.scenario.aggregate_ops(
                         args.scenario.start_mbps),
                     debug=args.debug,
@@ -1902,6 +1930,7 @@ async def main():
                     object_size=args.scenario.object_size,
                     group_size=args.group_size,
                     num_subgroups=args.scenario.subgroups,
+                    **_video_cfg(args),
                     initial_rate_ops=args.scenario.aggregate_ops(
                         args.scenario.start_mbps),
                     pub_ns=args.pub_ns,
@@ -2035,6 +2064,7 @@ async def main():
                     object_size=args.scenario.object_size,
                     group_size=args.group_size,
                     num_subgroups=args.scenario.subgroups,
+                    **_video_cfg(args),
                     initial_rate_ops=args.scenario.aggregate_ops(
                         args.sub_mbps),
                     pub_ns=args.pub_ns,

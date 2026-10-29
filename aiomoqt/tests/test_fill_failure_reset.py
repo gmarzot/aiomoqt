@@ -133,10 +133,12 @@ async def test_failed_fill_is_seen_at_once(draft, use_quic):
         for track in tracks.values():
             assert track._history is None
             assert track.subscriptions[0].fill_streams == 1
-        assert await _until(lambda: all(len(v) >= 3 for v in live.values()))
+        def normal(objs):
+            return [o for o in objs if o.status == ObjectStatus.NORMAL]
+        assert await _until(
+            lambda: all(len(normal(v)) >= 3 for v in live.values()))
         for name, objs in live.items():
-            assert {len(o.payload) for o in objs
-                    if o.status == ObjectStatus.NORMAL} == {_SIZES[name]}
+            assert {len(o.payload) for o in normal(objs)} == {_SIZES[name]}
 
 
 # -- through the relay ----------------------------------------------------------

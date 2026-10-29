@@ -8,6 +8,7 @@ testing where each side gets its own CPU core.
 Usage:
   # Shell 1: start publisher server
   python -m aiomoqt.tools.pub_server -s 16384 -g 10000 -P 4 -r 0
+  python -m aiomoqt.tools.pub_server --video 1080p        # media profile
 
   # Shell 2: connect subscriber
   python -m aiomoqt.tools.sub_bench https://localhost:4434/ -k -t 30 -i 5
@@ -19,7 +20,7 @@ import signal
 from aiomoqt.server import MOQTServer
 from aiomoqt.types import (D18MessageType, MOQT_DEFAULT_DRAFTS, MOQTMessageType,
                            parse_draft_spec)
-from aiomoqt.track import PublishedTrack
+from aiomoqt.track import PublishedTrack, VideoTrack
 from aiomoqt.types import ForwardingPreference
 from aiomoqt.utils import cli as _cli
 from aiomoqt.utils.certs import find_cert, find_key
@@ -45,19 +46,7 @@ def parse_args():
     parser.add_argument(
         '-p', '--port', type=int, default=4434,
         help='Listen port (default: 4434)')
-    parser.add_argument(
-        '-s', '--object-size', type=int, default=4096,
-        help='Object payload size bytes (default: 4096)')
-    parser.add_argument(
-        '-g', '--group-size', type=int, default=4096,
-        help='Objects per group (default: 10000)')
-    parser.add_argument(
-        '-P', '--streams', type=int, default=1,
-        help='Parallel subgroup streams (default: 1)')
-    parser.add_argument(
-        '-r', '--rate', type=float, default=0,
-        help='Aggregate objects/sec across all streams (0=max, '
-             'default: max). Per-stream emit rate is rate/streams.')
+    _cli.add_publisher_media(parser)
     parser.add_argument(
         '--max-inflight-bytes', type=int, default=None,
         help='Per-stream TX budget (aiomoqt tx_max_inflight_bytes): '
@@ -111,36 +100,39 @@ def parse_args():
              'fast | newreno | prague). Default: bbr')
     _cli.add_logging(parser)
     _cli.add_help(parser)
-    parser.add_argument(
-        '-D', '--datagram', action='store_true',
-        help='ObjectDatagrams instead of subgroup streams (object '
-             'must fit one packet, ~1150B max)')
     _cli.add_timestamps(parser)
     _cli.add_fetch_history(parser)
     args = parser.parse_args()
     if not args.quic and not args.wt:
         args.wt = True
-    if args.datagram and args.object_size > 1152:
-        parser.error(f"-D/--datagram: object_size {args.object_size} "
-                     f"can never fit a DATAGRAM frame (max ~1152B)")
+    _cli.check_video(parser, args)
+    _cli.check_datagram(parser, args)
     return args
 
 
-async def _on_subscribe(session, msg, args):
-    """Server-side subscribe handler using PublishedTrack."""
-    track = PublishedTrack(
+def _make_track(session, args):
+    """The served track: a video profile under --video, else the -s/-g/-P/-r
+    shape."""
+    common = dict(namespace=args.namespace, trackname=args.trackname,
+                  timestamps=args.timestamps,
+                  fetch_history_bytes=args.fetch_history)
+    if args.video:
+        return VideoTrack(session, resolution=args.video, fps=args.rate,
+                          gop_size=args.group_size, **common)
+    return PublishedTrack(
         session,
-        namespace=args.namespace,
-        trackname=args.trackname,
         object_size=args.object_size,
         group_size=args.group_size,
         num_subgroups=args.streams,
         rate=args.rate,
         forwarding=(ForwardingPreference.DATAGRAM if args.datagram
                     else ForwardingPreference.SUBGROUP),
-        timestamps=args.timestamps,
-        fetch_history_bytes=args.fetch_history,
-    )
+        **common)
+
+
+async def _on_subscribe(session, msg, args):
+    """Server-side subscribe handler: generate the served track."""
+    track = _make_track(session, args)
     ok = session.subscribe_ok(
         request_msg=msg, track_properties=track._track_properties(session))
     track.track_alias = ok.track_alias
@@ -188,19 +180,7 @@ async def _announce_track(session, args):
     trackname and replies PUBLISH_OK(forward=1), which the track's own
     handler turns into generation. Keeps the track alive for the
     session via wait_closed()."""
-    track = PublishedTrack(
-        session,
-        namespace=args.namespace,
-        trackname=args.trackname,
-        object_size=args.object_size,
-        group_size=args.group_size,
-        num_subgroups=args.streams,
-        rate=args.rate,
-        forwarding=(ForwardingPreference.DATAGRAM if args.datagram
-                    else ForwardingPreference.SUBGROUP),
-        timestamps=args.timestamps,
-        fetch_history_bytes=args.fetch_history,
-    )
+    track = _make_track(session, args)
     await track.publish(
         announce_namespace=(args.pub_ns or args.pub_both),
         publish_track=(not args.pub_ns or args.pub_both),
@@ -274,7 +254,11 @@ async def main():
     print(f"MoQT publisher server ready on {args.host}:{args.port}")
     print(f"  transport: {transport}")
     print(f"  namespace: {args.namespace}/{args.trackname}")
-    print(f"  objects:   {args.object_size}B x {args.streams} streams")
+    if args.video:
+        print(f"  objects:   video {args.video}, mean {args.object_size}B,"
+              f" 1 stream")
+    else:
+        print(f"  objects:   {args.object_size}B x {args.streams} streams")
     print(f"  groups:    {args.group_size} objects/group")
     print(f"  rate:      {rate_s}")
     print("\nConnect subscriber (track-name discovery; -t on the sub):")

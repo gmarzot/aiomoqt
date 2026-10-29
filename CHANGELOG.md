@@ -3,8 +3,10 @@
 ## v0.14.0
 
 - loopback_bench and adaptive_bench (loopback) generate a self-signed localhost cert when none is found; servers still require one.
+- aiomoqt-relay refuses new QUIC and WebTransport connections at the transport from the first SIGTERM/SIGINT (aiopquic `set_max_connections`); existing sessions still get GOAWAY and the drain.
 - pub_media gives each dial attempt 4 s (was 10 s), so a handshake lost in a relay restart costs a short retry.
-- aiomoqt-relay status: `tx_worker_idle_now` and `tx_event_ring_pops` from the transport.
+- aiomoqt-relay status: `tx_worker_idle_now`, `tx_event_ring_pops` and `tx_wake_lost` from the transport.
+- aiomoqt-relay status: a track at Forward State 0 reports state `paused` (was `parked`); the dashboard follows.
 - A drained stream write that fails inside the transport ends that stream (or its producer, if the session is closing) instead of returning as if it succeeded; unexpected failures log a WARNING.
 - A `PublishedTrack` answers FETCH only when given `fetch_history_bytes` (was 1 MiB by default); without it FETCH is refused with NOT_SUPPORTED. The MSF catalog track keeps 64 KiB.
 - pub_bench and pub_server `--fetch-history BYTES`: history kept to answer FETCH (default 0; pub_bench `--prefill` sets 1 MiB).
@@ -86,6 +88,7 @@
 - moq_interop_client prints each TAP result as its case finishes, and when SETUP cannot complete it fails the remaining cases unrun instead of waiting out each timeout.
 - aiomoqt-relay: a subscriber that joins as the publisher ends the track still gets its cached objects.
 - A failed d20+ fill keeps its FETCH_HEADER on the reset (RESET_STREAM_AT), so the subscriber sees the failure at once instead of at its timeout.
+- pub_server and adaptive_bench (subs mode) take `--video RES`, like pub_bench; with it `-r` is the frame rate (default 30) and `-g` the GOP length in frames (default 1 s), and `-s`, `-P` and `-D` are refused instead of ignored.
 
 ## v0.13.3
 
