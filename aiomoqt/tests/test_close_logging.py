@@ -1,14 +1,22 @@
 """The session close line names the side that closed, the code, the peer
-and whether MoQT setup completed; its level follows who closed and why."""
+and whether MoQT setup completed; its level follows who closed and why.
+A session logs one close line; the peer's reason is logged escaped."""
 import asyncio
+import contextlib
 import logging
+import re
 from types import SimpleNamespace
 
 import pytest
 
 from aiopquic.quic.events import ConnectionTerminated, WebTransportSessionClosed
 
+from aiomoqt.client import MOQTClient
+from aiomoqt.messages.base import MOQTMessage
 from aiomoqt.protocol import _MOQTSessionMixin, _close_kind
+from aiomoqt.server import MOQTServer
+from aiomoqt.tests._certs import CERT, KEY, requires_certs
+from aiomoqt.tests._procs import free_udp_port
 from aiomoqt.types import SessionCloseCode
 
 _PEER = ("158.23.190.70", 6983)
@@ -52,9 +60,11 @@ def _stub(is_wt=True, setup_done=False):
     return s
 
 
+_SIDES = ("MOQT: closing:", "MOQT: peer closed:", "MOQT: connection closed:")
+
+
 def _close_line(caplog):
-    sides = ("MOQT: closing:", "MOQT: peer closed:", "MOQT: connection closed:")
-    lines = [r for r in caplog.records if r.getMessage().startswith(sides)]
+    lines = [r for r in caplog.records if r.getMessage().startswith(_SIDES)]
     assert len(lines) == 1, [r.getMessage() for r in caplog.records]
     return lines[0]
 
@@ -132,7 +142,8 @@ async def test_raw_quic_transport_close_names_the_transport_code(records):
     assert rec.levelno == logging.WARNING
     assert rec.getMessage().startswith(
         "MOQT: peer closed: CONNECTION_REFUSED (0x2) from")
-    assert s._close_err == (0x2, "ConnectionTerminated")
+    assert s._close_err == (0x2, "")
+    assert "; reason:" not in _close_line(records).getMessage()
 
 
 async def test_raw_quic_application_close_keeps_the_moqt_name(records):
@@ -181,3 +192,139 @@ async def test_webtransport_close_names_by_kind(records, kind, code, head):
     s._close_session(code, "x", transmit=False, kind=kind)
     assert _close_line(records).getMessage().startswith(
         f"MOQT: peer closed: {head} from")
+
+
+@pytest.mark.parametrize("is_wt", [False, True], ids=["quic", "wt"])
+async def test_peer_close_without_a_reason_logs_none(records, is_wt):
+    s = _stub(is_wt=is_wt, setup_done=True)
+    s._quic_event(SimpleNamespace(error_code=0x10))
+    msg = _close_line(records).getMessage()
+    assert "; reason:" not in msg and "SimpleNamespace" not in msg, msg
+    assert s._close_err == (0x10, "")
+
+
+async def test_local_close_without_a_reason_logs_none(records):
+    s = _stub(is_wt=False, setup_done=True)
+    s._close_session()
+    assert _close_line(records).getMessage() == (
+        "MOQT: closing: NO_ERROR (0x0) to 158.23.190.70:6983")
+
+
+async def test_close_line_keeps_the_recorded_peer_address(records):
+    s = _stub(is_wt=False, setup_done=True)
+    s._note_peer_address()
+    s._quic = SimpleNamespace(peer_address=lambda: None)
+    s._close_session(0x10, "", transmit=False)
+    assert "from 158.23.190.70:6983" in _close_line(records).getMessage()
+
+
+async def test_a_second_close_logs_nothing(records):
+    s = _stub(is_wt=False, setup_done=True)
+    s._close_session(SessionCloseCode.PROTOCOL_VIOLATION, "bad")
+    s._quic_event(ConnectionTerminated(error_code=0x3, reason_phrase="bad"))
+    _close_line(records)
+
+
+@pytest.mark.parametrize("reason, logged", [
+    ("\x1b[31mred\x1b[0m", "\\x1b[31mred\\x1b[0m"),
+    ("one\r\nMOQT: fake line\x00", "one\\x0d\\x0aMOQT: fake line\\x00"),
+    ("caf\u00e9 \u202e", "caf\\xe9 \\u202e"),
+    (b"\xff\x7f", "\\xff\\x7f"),
+])
+async def test_peer_reason_is_logged_escaped(records, reason, logged):
+    s = _stub(is_wt=False, setup_done=True)
+    s._close_session(0x10, reason, transmit=False)
+    msg = _close_line(records).getMessage()
+    assert msg.endswith(f"; reason: {logged}"), msg
+    assert s._close_err == (0x10, reason)
+
+
+async def test_peer_reason_is_cut_to_the_reason_phrase_max(records):
+    s = _stub(is_wt=False, setup_done=True)
+    s._close_session(0x10, "x" * 5000, transmit=False)
+    msg = _close_line(records).getMessage()
+    assert msg.endswith("; reason: " + "x" * MOQTMessage.REASON_PHRASE_MAX)
+
+
+# Real sessions over raw QUIC and WebTransport.
+
+@contextlib.asynccontextmanager
+async def _pair(use_quic):
+    """A set-up client session and the server's side of it."""
+    port = free_udp_port()
+    server = MOQTServer(host="127.0.0.1", port=port, certificate=CERT,
+                        private_key=KEY, path="/", supported_drafts=22)
+    handle = await server.serve_dual()
+    try:
+        client = MOQTClient("127.0.0.1", port, path="/", use_quic=use_quic,
+                            verify_tls=False, supported_drafts=22)
+        async with client.connect() as session:
+            await session.client_session_init()
+            async with asyncio.timeout(5):
+                while not server._live:
+                    await asyncio.sleep(0.01)
+            yield session, next(iter(server._live)), port
+    finally:
+        handle.close()
+
+
+async def _closed(*sessions):
+    async with asyncio.timeout(5):
+        for s in sessions:
+            await s.async_closed()
+    await asyncio.sleep(0.3)  # a late transport event would log here
+
+
+def _lines(caplog, port=None):
+    """Close lines; with port, those naming that peer port."""
+    out = [r.getMessage() for r in caplog.records
+           if r.getMessage().startswith(_SIDES)]
+    if port is not None:
+        out = [m for m in out if re.search(rf"127\.0\.0\.1:{port}\b", m)]
+    return out
+
+
+_REAL = [
+    pytest.param(True, id="quic"),
+    pytest.param(False, id="wt"),
+]
+
+
+@requires_certs
+@pytest.mark.parametrize("use_quic", _REAL)
+async def test_session_close_without_a_reason(records, use_quic):
+    async with _pair(use_quic) as (client, peer, port):
+        peer.close(SessionCloseCode.GOAWAY_TIMEOUT)
+        await _closed(client, peer)
+    seen = _lines(records, port)
+    assert seen == [f"MOQT: peer closed: GOAWAY_TIMEOUT (0x10) from "
+                    f"127.0.0.1:{port}"], _lines(records)
+    assert client._close_err == (SessionCloseCode.GOAWAY_TIMEOUT, "")
+
+
+@requires_certs
+@pytest.mark.parametrize("use_quic", _REAL)
+@pytest.mark.parametrize("how", ["close", "_close_session"])
+async def test_local_close_is_one_line(records, use_quic, how):
+    async with _pair(use_quic) as (client, peer, port):
+        getattr(client, how)(SessionCloseCode.NO_ERROR, "bye")
+        await _closed(client, peer)
+    assert _lines(records, port) == [
+        f"MOQT: closing: NO_ERROR (0x0) to 127.0.0.1:{port}; reason: bye"], \
+        _lines(records)
+    assert not any("MOQT session: closing" in r.getMessage()
+                   for r in records.records)
+    peer_lines = [m for m in _lines(records) if m not in _lines(records, port)]
+    assert len(peer_lines) == 1, _lines(records)
+    assert peer_lines[0].endswith("; reason: bye"), peer_lines
+
+
+@requires_certs
+@pytest.mark.parametrize("use_quic", _REAL)
+async def test_peer_reason_with_escapes_over_the_wire(records, use_quic):
+    async with _pair(use_quic) as (client, peer, port):
+        peer.close(SessionCloseCode.GOAWAY_TIMEOUT, "\x1b[2Jgone\nfake")
+        await _closed(client, peer)
+    assert _lines(records, port) == [
+        f"MOQT: peer closed: GOAWAY_TIMEOUT (0x10) from 127.0.0.1:{port}"
+        "; reason: \\x1b[2Jgone\\x0afake"], _lines(records)
