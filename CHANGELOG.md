@@ -99,6 +99,7 @@
 - sub_bench and loopback_bench `--verify-payload [N]` check each received object (or every Nth) against the bench layout and fail the run on a mismatch; generated objects now carry their size (`{group}.{object}.{size}|`) and video frames the counting filler.
 - moq_interop_client publish-track-subscribe waits for the PUBLISH reply before subscribing, so a relay slow to answer no longer turns a pass or a NOT_SUPPORTED skip into a failure.
 - pub_media stats: each track reports `forwarding`, its peers at Forward State 1 taking objects, and a subscribed track nobody forwards shows ` · paused`.
+- pub_media: a lost session's catalog emitter is cancelled when the session is dropped, instead of left pending until garbage collection.
 
 ## v0.13.3
 
