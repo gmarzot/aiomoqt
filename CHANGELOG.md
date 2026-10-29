@@ -7,7 +7,7 @@
 - aiomoqt-relay honours OBJECT_DELIVERY_TIMEOUT per subscriber (the smaller of the publisher's and the subscriber's, updated by REQUEST_UPDATE); with none set, `--lag-limit SEC` (default 5, 0 = never) drops live objects that old. Expired subgroups are reset with DELIVERY_TIMEOUT; status shows `lane_expired`.
 - pub_server exits 2 when it has no TLS certificate (was 0), as aiomoqt-relay and moqtest_origin do.
 - loopback_bench and adaptive_bench (loopback) generate a self-signed localhost cert when none is found; servers still require one.
-- aiomoqt-relay `--drain-timeout` defaults to 2 s when `--goaway-uri` is empty, 5 s with one; GOAWAY's Timeout carries the wait. Its shutdown closes give `relay restarting; reconnect-to=same-address` or `relay shutting down; reconnect-to=<uri>` as the reason (WebTransport clients receive it).
+- aiomoqt-relay `--drain-timeout` defaults to 2 s when `--goaway-uri` is empty, 5 s with one; GOAWAY's Timeout carries the wait. Its shutdown closes give `relay restarting`, or `relay shutting down` with a `--goaway-uri`, as the reason (WebTransport clients receive it).
 - aiomoqt-relay refuses new QUIC and WebTransport connections at the transport from the first SIGTERM/SIGINT (aiopquic `set_max_connections`); existing sessions still get GOAWAY and the drain.
 - pub_media gives each dial attempt 4 s (was 10 s), so a handshake lost in a relay restart costs a short retry.
 - aiomoqt-relay status: `tx_worker_idle_now`, `tx_event_ring_pops` and `tx_wake_lost` from the transport.
