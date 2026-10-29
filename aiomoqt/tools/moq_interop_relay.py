@@ -120,6 +120,8 @@ from aiomoqt.context import (canonical_request_error, canonical_stream_reset,
                              request_error_code)
 from aiomoqt.tools import relay_status
 from aiomoqt import __version__ as AIOMOQT_VERSION
+from aiomoqt.utils.certs import (SERVER_KEY_NAMES, find_cert, find_key,
+                                 server_cert_dirs)
 from aiomoqt.utils.logger import (get_category_logger, get_log_level,
                                   set_log_handler, set_log_level,
                                   step_log_level)
@@ -3224,29 +3226,6 @@ async def _relay_subscribe(session, msg):
                             reason="track does not exist")
 
 
-def _find_default_cert():
-    candidates = [
-        '/certs/cert.pem',
-        os.path.join(os.path.dirname(__file__),
-                     '..', '..', 'certs', 'cert.pem'),
-        os.path.expanduser('~/.local/share/moqt/cert.pem'),
-    ]
-    for c in candidates:
-        if os.path.exists(c):
-            return os.path.realpath(c)
-    return None
-
-
-def _find_default_key(cert_path):
-    if not cert_path:
-        return None
-    for name in ('priv.key', 'key.pem'):
-        candidate = os.path.join(os.path.dirname(cert_path), name)
-        if os.path.exists(candidate):
-            return candidate
-    return None
-
-
 def transport_settings(args) -> dict:
     """MOQTServer transport settings from the relay's flags."""
     return {"congestion_control_algorithm": args.cc_algo,
@@ -5056,8 +5035,8 @@ async def main():
             sys.exit(f"error: --control {args.control}: {e.strerror or e}")
     logger.info(f"relay: start {_versions_line()} pid {os.getpid()}")
 
-    cert = args.cert or _find_default_cert()
-    key = args.key or _find_default_key(cert)
+    cert = args.cert or find_cert(server_cert_dirs())
+    key = args.key or find_key(cert, SERVER_KEY_NAMES)
     if not cert or not key:
         print("Error: TLS cert/key required. Use --cert/--key or place "
               "cert.pem+priv.key at /certs/", file=sys.stderr)

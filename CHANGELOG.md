@@ -2,6 +2,7 @@
 
 ## v0.14.0
 
+- loopback_bench and adaptive_bench (loopback) generate a self-signed localhost cert when none is found; servers still require one.
 - aiomoqt-relay refuses new QUIC and WebTransport connections at the transport from the first SIGTERM/SIGINT (aiopquic `set_max_connections`); existing sessions still get GOAWAY and the drain.
 - pub_media gives each dial attempt 4 s (was 10 s), so a handshake lost in a relay restart costs a short retry.
 - aiomoqt-relay status: `tx_worker_idle_now`, `tx_event_ring_pops` and `tx_wake_lost` from the transport.

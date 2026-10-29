@@ -37,9 +37,8 @@ from aiomoqt.types import (
     GroupOrder, MOQTMessageType, ObjectStatus, RequestErrorCode,
     SubscribeDoneCode, parse_draft_spec,
 )
-from aiomoqt.tools.moq_interop_relay import (
-    _find_default_cert, _find_default_key,
-)
+from aiomoqt.utils.certs import (SERVER_KEY_NAMES, find_cert, find_key,
+                                 server_cert_dirs)
 from aiomoqt.utils.cli import add_help, add_logging, apply_logging
 from aiomoqt.utils.logger import get_logger
 
@@ -414,8 +413,8 @@ async def main():
     apply_logging(args, default=logging.INFO)
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                         format="%(asctime)s %(levelname)s %(message)s")
-    cert = args.cert or _find_default_cert()
-    key = args.key or _find_default_key(cert)
+    cert = args.cert or find_cert(server_cert_dirs())
+    key = args.key or find_key(cert, SERVER_KEY_NAMES)
     if not cert or not key:
         print("Error: TLS cert/key required", file=sys.stderr)
         sys.exit(2)
