@@ -49,6 +49,19 @@ def relay_tables():
     _clear_relay()
 
 
+@pytest.fixture
+def close_lines(caplog):
+    """This process's session close lines (aiomoqt loggers do not
+    propagate)."""
+    lg = logging.getLogger("aiomoqt.protocol")
+    lg.addHandler(caplog.handler)
+    sides = ("MOQT: peer closed:", "MOQT: connection closed:")
+    with caplog.at_level(logging.INFO, logger="aiomoqt.protocol"):
+        yield lambda: [r.getMessage() for r in caplog.records
+                       if r.getMessage().startswith(sides)]
+    lg.removeHandler(caplog.handler)
+
+
 async def _connect(stack, port, use_quic, draft):
     client = MOQTClient("localhost", port, path="/", use_quic=use_quic,
                         verify_tls=False, supported_drafts=draft)
@@ -219,7 +232,8 @@ def test_drain_timeout_on_the_command_line_overrides_the_file(tmp_path):
                          ids=["no-uri", "uri"])
 @pytest.mark.parametrize("transport", ["quic", "wt"])
 async def test_relay_process_default_drain_wait(tmp_path, transport, uri,
-                                                wait, relay_tables):
+                                                wait, relay_tables,
+                                                close_lines):
     """A session that keeps its session after GOAWAY holds the drain for
     the default wait: 2 s with no New Session URI, 5 s with one."""
     port = free_udp_port()
@@ -247,14 +261,13 @@ async def test_relay_process_default_drain_wait(tmp_path, transport, uri,
     assert seen[0].new_session_uri == uri, out
     assert seen[0].timeout == int(wait * 1000), out
     assert wait <= elapsed < wait + 1.0, (elapsed, out)
-    assert holder._close_err[0] == SessionCloseCode.GOAWAY_TIMEOUT, \
+    reason = (f"relay shutting down; reconnect-to={uri}" if uri
+              else "relay restarting; reconnect-to=same-address")
+    assert holder._close_err == (SessionCloseCode.GOAWAY_TIMEOUT, reason), \
         holder._close_err
-    # Raw QUIC closes carry no reason phrase yet.
-    if transport == "wt":
-        assert holder._close_err[1] == (
-            f"relay shutting down; reconnect-to={uri}" if uri
-            else "relay restarting; reconnect-to=same-address"), \
-            holder._close_err
+    assert any(line.startswith("MOQT: peer closed: GOAWAY_TIMEOUT (0x")
+               and line.endswith(f"; reason: {reason}")
+               for line in close_lines()), close_lines()
     assert rc == 0, out
     assert "draining 1 sessions, GOAWAY to " in out, out
     assert f"up to {wait:g}s" in out, out
@@ -368,7 +381,7 @@ async def _dial_transport(port, use_quic, draft):
 @pytest.mark.parametrize("draft", [16, 22])
 @pytest.mark.parametrize("transport", ["quic", "wt"])
 async def test_relay_process_refuses_connections_while_draining(
-        tmp_path, transport, draft, relay_tables):
+        tmp_path, transport, draft, relay_tables, close_lines):
     port = free_udp_port()
     use_quic = transport == "quic"
     log = tmp_path / "relay.log"
@@ -388,6 +401,7 @@ async def test_relay_process_refuses_connections_while_draining(
             await _until(lambda: seen, 5)
             elapsed, exc = await _dial_transport(port, use_quic, draft)
             draining = loop.time() - t0 < 2.0 and proc.poll() is None
+            refused = close_lines()
             rc = await asyncio.to_thread(proc.wait, 10)
             await asyncio.wait_for(holder.async_closed(), 2)
     finally:
@@ -400,6 +414,9 @@ async def test_relay_process_refuses_connections_while_draining(
     else:
         assert isinstance(exc, WebTransportError), repr(exc)
         assert "before READY" in str(exc), repr(exc)
+    assert any(line.startswith("MOQT: peer closed: CONNECTION_REFUSED (0x2)")
+               for line in refused), refused
+    assert not any("UNAUTHORIZED" in line for line in refused), refused
     assert elapsed < 0.5, (elapsed, out)
     assert len(seen) == 1, out
     if draft >= 18:
