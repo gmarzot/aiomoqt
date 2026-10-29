@@ -99,6 +99,11 @@ def parse_args():
              '(FanoutDelivery), the path LOC media tracks take, instead '
              'of the per-subscriber generator. One subgroup per group.')
     parser.add_argument(
+        '--per-peer-props', action='store_true',
+        help='With --fanout: object properties as a callable resolved '
+             'per subscriber, as LOC media tracks build them, instead of '
+             'the generator\'s one dict per object.')
+    parser.add_argument(
         '--draft', type=parse_draft_spec, default=14,
         help='MoQT draft version to negotiate (e.g. 14, 16, or 18, '
              'default: 14). Applied to BOTH the loopback publisher '
@@ -137,6 +142,8 @@ def parse_args():
     args.key = args.key or KEY
     if args.fanout and args.streams > 1:
         parser.error("--fanout: one subgroup per group; -P must be 1")
+    if args.per_peer_props and not args.fanout:
+        parser.error("--per-peer-props needs --fanout")
     if args.datagram and args.object_size > 1152:
         parser.error(f"--datagram: object_size {args.object_size} can "
                      f"never fit a DATAGRAM frame (max ~1152B payload "
@@ -167,7 +174,8 @@ def print_banner(args):
     row("url", url)
     row("transport", transport_label)
     row("delivery", ("DATAGRAM" if args.datagram else "subgroup streams")
-        + (", fanout lane" if args.fanout else ""))
+        + (", fanout lane" if args.fanout else "")
+        + (", per-peer props" if args.per_peer_props else ""))
     row("cc algorithm", args.cc_algo)
     row("sub-groups", args.streams)
     row("group size", f"{args.group_size} objects")
@@ -181,10 +189,13 @@ def print_banner(args):
 
 class _FanoutTrack(PublishedTrack):
     """The default generator's objects, written once through produce()
-    so each takes its subscriber's send lane. Unpaced, it pauses while
-    a lane holds more than _LANE_HIGH objects."""
+    so each takes its subscriber's send lane. Unpaced, it pauses once a
+    lane holds more than _LANE_HIGH objects, until it is down to
+    _LANE_LOW. `per_peer_props` builds properties per subscriber."""
 
     _LANE_HIGH = 16
+    _LANE_LOW = 8
+    per_peer_props = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -192,11 +203,13 @@ class _FanoutTrack(PublishedTrack):
                         if self.forwarding == ForwardingPreference.DATAGRAM
                         else StreamMapping.PER_GROUP)
         self._lane_moved = asyncio.Event()
+        self._waiting = False
 
     def _on_sent(self, group_id, object_id):
-        self._lane_moved.set()
+        if self._waiting:
+            self._lane_moved.set()
 
-    def _stamp(self, group_id, object_id):
+    def _stamp_per_peer(self, group_id, object_id):
         """Stamped now, at production: lane wait counts in latency."""
         loc = {LOC_TIMESTAMP: int(time.time() * 1_000_000)}
         if self.timestamps == 'loc':
@@ -207,6 +220,9 @@ class _FanoutTrack(PublishedTrack):
     async def produce(self, out) -> None:
         pad = self._payload_tail()
         await self._await_schedule(0, 0)
+        # As the generator stamps: per object, for the first peer's draft.
+        stamp = self._stamper(self._subs[0].session)
+        per_peer = self.per_peer_props
         next_t = time.monotonic()
         tick = 0
         group_id = 0
@@ -214,8 +230,14 @@ class _FanoutTrack(PublishedTrack):
             for object_id in range(self.group_size):
                 payload = (f"{group_id}.{object_id}".encode()
                            + pad)[:self.object_size]
+                if per_peer:
+                    extensions = self._stamp_per_peer(group_id, object_id)
+                elif stamp is None:
+                    extensions = {LOC_TIMESTAMP: int(time.time() * 1_000_000)}
+                else:
+                    extensions = stamp(group_id, object_id)
                 await out.write(group_id, object_id, payload,
-                                extensions=self._stamp(group_id, object_id),
+                                extensions=extensions,
                                 group_start=object_id == 0)
                 tick += 1
                 if self.rate > 0:
@@ -236,14 +258,18 @@ class _FanoutTrack(PublishedTrack):
         return max((len(ln.items) for ln in out.lanes), default=0)
 
     async def _wait_lanes(self, out) -> None:
-        while self._backlog(out) > self._LANE_HIGH:
-            self._lane_moved.clear()
-            # Timeout: a lane skipping to the next group drops objects
-            # without calling _on_sent.
-            try:
-                await asyncio.wait_for(self._lane_moved.wait(), 0.01)
-            except asyncio.TimeoutError:
-                pass
+        self._waiting = True
+        try:
+            while self._backlog(out) > self._LANE_LOW:
+                self._lane_moved.clear()
+                # Timeout: a lane skipping to the next group drops objects
+                # without calling _on_sent.
+                try:
+                    await asyncio.wait_for(self._lane_moved.wait(), 0.01)
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            self._waiting = False
 
 
 async def _on_subscribe(session, msg, args):
@@ -261,6 +287,8 @@ async def _on_subscribe(session, msg, args):
                     else ForwardingPreference.SUBGROUP),
         timestamps=args.timestamps,
     )
+    if args.fanout:
+        track.per_peer_props = args.per_peer_props
     # Suppress publisher periodic stats in loopback mode —
     # both sides print to the same terminal, causing interleaved output
     track._stats_header_printed = True  # skip header

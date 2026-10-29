@@ -169,14 +169,18 @@ def test_loopback_bench_verifies_its_own_cert(transport):
 
 
 @requires_certs
+@pytest.mark.parametrize("props", [(), ("--per-peer-props",)],
+                         ids=["generator", "per-peer"])
 @pytest.mark.parametrize("transport", ["-Q", "-W"])
-def test_loopback_bench_fanout_delivers_through_the_lane(transport):
-    rc, out = run("loopback_bench", transport, "--fanout", "-p",
-                  free_udp_port(), "--draft", 18, "-t", 2, "-s", 1200, "-k")
+def test_loopback_bench_fanout_delivers_through_the_lane(transport, props):
+    rc, out = run("loopback_bench", transport, "--fanout", *props, "-p",
+                  free_udp_port(), "--draft", 18, "-t", 2, "-s", 1200, "-k",
+                  "--verify-payload")
     assert rc == 0, out
     assert "fanout lane" in out, out
     assert objects_received(out) > 0, out
     assert re.search(r"^\s*Lost:\s+0 ", out, re.MULTILINE), out
+    assert _payload_bad(out) == 0, out
 
 
 def test_loopback_bench_fanout_refuses_parallel_subgroups(monkeypatch):
