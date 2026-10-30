@@ -2,6 +2,7 @@
 
 ## v0.14.0
 
+- `--cc-options` (session grid, aiomoqt-relay) and `congestion_control_options=` on `MOQTClient` / `MOQTServer` pass an option string to the congestion controller, e.g. `Q0.02` for bbr's send quantum; needs aiopquic with `QuicConfiguration.congestion_control_options`.
 - aiomoqt-relay: a track paused at PUBLISH records a pause gap like a later pause, so the first joiner's FETCH or fill for the open group comes from upstream instead of a short cache answer; a fill the cache answers with nothing asks upstream.
 - A session logs one close line, ours included, with the peer address after the transport is gone; it has no `; reason:` part when none was given (no more `ConnectionTerminated` or `no error` placeholders), and the peer's reason is cut to 1024 bytes and escaped outside printable ASCII. A GOAWAY_TIMEOUT close we send logs INFO.
 - loopback_bench `--rtt-ms`, `--link-mbps`, `--loss`: emulated link (netem) on a private network namespace's lo; needs privileges to create one.

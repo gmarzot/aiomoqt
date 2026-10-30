@@ -1,2 +1,2 @@
 # Build aiopquic from its 0.7.0 dev branch until 0.7.0 is on PyPI; remove at the 0.14.0 release.
-gmarzot/aiopquic@gmarzot-0.7.0
+gmarzot/aiopquic@gmarzot-cc-options

@@ -35,6 +35,7 @@ class MOQTClient(MOQTPeer):
         supported_drafts: Optional[Union[int, List[int]]] = None,
         libquicr_compat: Optional[bool] = False,
         congestion_control_algorithm: Optional[str] = None,
+        congestion_control_options: Optional[str] = None,
         tx_max_inflight_bytes: Optional[int] = DEFAULT_TX_MAX_INFLIGHT_BYTES,
         tx_max_queued_bytes: Optional[int] = None,
         keep_alive_interval: Optional[float] = None,
@@ -82,6 +83,9 @@ class MOQTClient(MOQTPeer):
         if congestion_control_algorithm is None and configuration is None:
             congestion_control_algorithm = "bbr"
         self.congestion_control_algorithm = congestion_control_algorithm
+        # Algorithm option string, e.g. "Q0.02" for bbr; None keeps the
+        # configuration's.
+        self.congestion_control_options = congestion_control_options
         # Aggregate TX gate budget (QuicConfiguration.tx_max_queued_bytes):
         # bounds publisher run-ahead across ALL streams; steady-state
         # added latency ≈ value / drain rate. None = honor the aiopquic
@@ -151,6 +155,8 @@ class MOQTClient(MOQTPeer):
             if self.congestion_control_algorithm is not None:
                 cfg.congestion_control_algorithm = (
                     self.congestion_control_algorithm)
+            if self.congestion_control_options is not None:
+                cfg.congestion_control_options = self.congestion_control_options
             if self.tx_max_queued_bytes is not None:
                 cfg.tx_max_queued_bytes = self.tx_max_queued_bytes
             if self.keep_alive_interval is not None:
@@ -206,6 +212,10 @@ class MOQTClient(MOQTPeer):
         if self.congestion_control_algorithm is not None:
             wt_cfg.congestion_control_algorithm = (
                 self.congestion_control_algorithm)
+        if self.congestion_control_options is not None:
+            wt_cfg.congestion_control_options = self.congestion_control_options
+        # Passed only when set: older aiopquic has no such start() argument.
+        cc_options = getattr(wt_cfg, "congestion_control_options", None)
         if self.tx_max_queued_bytes is not None:
             wt_cfg.tx_max_queued_bytes = self.tx_max_queued_bytes
         if wt_cfg.event_ring_capacity is not None:
@@ -226,6 +236,8 @@ class MOQTClient(MOQTPeer):
             idle_timeout_ms=int(wt_cfg.idle_timeout * 1000),
             congestion_control_algorithm=(
                 wt_cfg.congestion_control_algorithm),
+            **({"congestion_control_options": cc_options}
+               if cc_options is not None else {}),
             keep_alive_interval_ms=int(
                 (self.keep_alive_interval or 0) * 1000),
             socket_buffer_size=(self.socket_buffer_size or 0),

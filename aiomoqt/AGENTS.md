@@ -67,7 +67,8 @@ SIGUSR1.
   `aiomoqt-relay`, the tools and the examples, whichever aiopquic is installed.
   `congestion_control_algorithm=None` defers to a passed `configuration` or to aiopquic's own
   default. moqx defaults to BBR2. `--cc-algo` takes `bbr`, `bbr1`, `c4`, `cubic`, `dcubic`,
-  `fast`, `newreno`, `prague` and `reno`.
+  `fast`, `newreno`, `prague` and `reno`. `--cc-options` / `congestion_control_options=`
+  passes an option string to that algorithm, e.g. `Q0.02` for bbr's send quantum.
 - Loopback timing: picoquic's BBRv3 is reported to freeze cwnd below 128 µs RTT (upstream
   #2118), not reproduced on the current pin. Use `cubic` or `newreno` for loopback timing runs.
 - FETCH: a `PublishedTrack` keeps no object history unless given `fetch_history_bytes`, and
