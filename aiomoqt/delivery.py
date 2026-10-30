@@ -15,9 +15,9 @@ from enum import Enum
 from typing import Any, Callable, Dict, Optional
 
 from .messages import SubgroupHeader
-from .types import MOQTStreamStopped, StreamResetCode
+from .types import MOQTStreamStopped, ObjectStatus, StreamResetCode
 from .messages.data import (
-    FETCH_FLAGS_END_UNKNOWN, FetchObject, ObjectDatagram,
+    FETCH_FLAGS_END_UNKNOWN, FetchObject, ObjectDatagram, ObjectDatagramStatus,
 )
 from .utils.logger import TRACE, get_category_logger, get_logger
 
@@ -473,6 +473,54 @@ class SubgroupDelivery:
         self._stream_id = None
         self._header = None
 
+    async def end_track(self, largest: Optional[tuple]) -> None:
+        """Mark the end of the track with an End of Track status object:
+        one past the last object on the open group stream, which then
+        closes; otherwise at the first Location of the group after
+        `largest`, on a new stream, or in a datagram for a datagram
+        track. Nothing is sent where the peer's filter excludes it."""
+        if self._stream_id is not None:
+            hdr = self._header
+            end_id = hdr.next_object_id
+            if (self.excludes_end is not None
+                    and self.excludes_end(hdr.group_id, end_id)):
+                self.end_group()
+                return
+            buf = hdr.next_object(payload=b"", object_id=end_id,
+                                  status=ObjectStatus.END_OF_TRACK)
+            self.session.stream_write(self._stream_id, buf.data,
+                                      end_stream=True)
+            if self.lane is not None:
+                self._tx_streams[self._stream_id] = hdr.group_id
+            self._stream_id = None
+            self._header = None
+            return
+        group_id = 0 if largest is None else largest[0] + 1
+        if self.passes is not None and not self.passes(group_id, 0):
+            return
+        prof = self._prof
+        if self.mapping is StreamMapping.DATAGRAM:
+            cls = (ObjectDatagram if prof is not None
+                   and prof.merged_datagram_layout else ObjectDatagramStatus)
+            msg = cls(track_alias=self.track_alias, group_id=group_id,
+                      object_id=0, publisher_priority=self.priority,
+                      status=ObjectStatus.END_OF_TRACK)
+            await self.session.dgram_write_drain(msg.serialize(prof=prof).data)
+            return
+        sid = await self.session.open_uni_stream()
+        self.stream_count += 1
+        if self.stream_priority is not None:
+            self.session.set_stream_priority(sid, self.stream_priority)
+        hdr = SubgroupHeader(
+            track_alias=self.track_alias, group_id=group_id, subgroup_id=0,
+            publisher_priority=self.priority, extensions_present=True,
+            prof=prof, first_object=True)
+        data = hdr.serialize().data + hdr.next_object(
+            payload=b"", object_id=0, status=ObjectStatus.END_OF_TRACK).data
+        self.session.stream_write(sid, data, end_stream=True)
+        if self.lane is not None:
+            self._tx_streams[sid] = group_id
+
     async def write(self, group_id: int, object_id: int, payload: bytes, *,
                     extensions: Optional[Dict[int, Any]] = None,
                     group_start: bool = False,
@@ -765,7 +813,8 @@ class SendLane:
     not; `born` is the monotonic time it was produced, or None. The
     writer is the peer's delivery: send(item), end_group(),
     reset_group(code), reset_below(floor), close_streams(), final(*args),
-    tx_queued(floor) and expire(group_id). A writer may set `parked`
+    tx_queued(floor) and expire(group_id), and end_track(largest) when
+    the lane is given end_track(). A writer may set `parked`
     ("header" or "object") and `sid` on the lane while a send waits.
 
     Write-through: a writer with send_nowait(item) is handed an object
@@ -898,6 +947,11 @@ class SendLane:
         """Close the writer's open group once what is queued is out."""
         if not self.stopped and not self.final:
             self._put(_END_GROUP)
+
+    def end_track(self, largest: Optional[tuple]) -> None:
+        """writer.end_track(largest) once what is queued is out."""
+        if not self.stopped and not self.final:
+            self._put(("END_TRACK", largest))
 
     def reset_group(self, group_id: Optional[int] = None) -> None:
         """Reset the writer's open group once what is queued is out; the
@@ -1120,6 +1174,18 @@ class SendLane:
             return kind != "FINAL"
         return True
 
+    async def _end_track(self, largest) -> None:
+        if not self.gate:
+            return  # §5.1: no Objects at Forward State 0
+        self.busy = True
+        try:
+            await self.writer.end_track(largest)
+        except Exception:
+            self.log.debug(f"{self.prefix}END_TRACK on a send lane failed",
+                           exc_info=True)
+        finally:
+            self.busy = False
+
     async def _run(self) -> None:
         writer = self.writer
         woke = True
@@ -1139,7 +1205,9 @@ class SendLane:
                 item = items.popleft()
                 gid = item[0]
                 if gid.__class__ is str:
-                    if not self._control(item):
+                    if gid == "END_TRACK":
+                        await self._end_track(item[1])
+                    elif not self._control(item):
                         return
                     self.done += 1
                     continue
@@ -1316,6 +1384,11 @@ class FanoutDelivery:
     def end_group(self) -> None:
         for lane in list(self.lanes):
             lane.end_group()
+
+    def end_track(self, largest: Optional[tuple]) -> None:
+        """End of Track on every lane, after what each holds."""
+        for lane in list(self.lanes):
+            lane.end_track(largest)
 
     def reset_group(self) -> None:
         """Truncate the open group on every lane; each resumes at the

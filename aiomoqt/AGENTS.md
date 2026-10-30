@@ -76,6 +76,10 @@ SIGUSR1.
   #2118), not reproduced on the current pin. Use `cubic` or `newreno` for loopback timing runs.
 - FETCH: a `PublishedTrack` keeps no object history unless given `fetch_history_bytes`, and
   refuses FETCH (NOT_SUPPORTED) without one; the MSF catalog track keeps 64 KiB.
+- Ending a track: a `produce()` track sends End of Track after its last object, then
+  PUBLISH_DONE TRACK_ENDED, when `produce()` returns or on `end()`; `end()` cancels `produce()`
+  at its next await, so keep each object's write whole. A generator track (no `produce()`)
+  resets its open streams on `end()` and sends no End of Track.
 - `moq-relay-probe --relays-file` reads its own relay-list schema; use `--url` for a single probe.
 - `aiomoqt-relay` (also `moq-interop-relay`) is a MoQT relay in Python: a bounded
   recent-object cache (8 groups / 32 MiB per track, all tracks under one `--cache-bytes` budget,

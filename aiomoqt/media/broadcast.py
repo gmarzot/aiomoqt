@@ -139,6 +139,25 @@ class CatalogTrackPublisher(PublishedTrack):
                               priority=self.priority)
         await super()._on_fetch(session, msg)
 
+    async def _end_track(self, session, track_alias: int, header,
+                         stream_id) -> None:
+        """End of Track one past the last object on the open stream, else
+        at the start of the next group on a new stream."""
+        data = b""
+        if stream_id is None:
+            stream_id = await session.open_uni_stream()
+            session.set_stream_priority(stream_id, self._stream_band(session))
+            self._stream_count += 1
+            header = SubgroupHeader(
+                track_alias=track_alias, group_id=self._next_group,
+                subgroup_id=0, publisher_priority=self.priority,
+                prof=session._profile)
+            self._next_group += 1
+            data = header.serialize().data
+        data += header.next_object(payload=b"", object_id=header.next_object_id,
+                                   status=ObjectStatus.END_OF_TRACK).data
+        session.stream_write(stream_id, data, end_stream=True)
+
     async def _emit_loop(self, session, track_alias: int):
         sub = self._sub_for(session)
         prof = session._profile
@@ -208,7 +227,12 @@ class CatalogTrackPublisher(PublishedTrack):
             if session._close_err is None:
                 logger.warning(f"Catalog: emitter stopped: {e}")
             return
-        if stream_id is not None:
+        if sub.forward:
+            try:
+                await self._end_track(session, track_alias, header, stream_id)
+            except Exception as e:
+                logger.debug(f"Catalog: End of Track not sent: {e!r}")
+        elif stream_id is not None:
             buf = header.end_group(object_id=header.next_object_id)
             session.stream_write(stream_id, buf.data, end_stream=True)
         self._send_publish_done(session)

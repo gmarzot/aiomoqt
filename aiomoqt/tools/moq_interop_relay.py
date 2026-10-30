@@ -1600,7 +1600,8 @@ class _RelayedTrack:
             return
         if status in (ObjectStatus.END_OF_GROUP, ObjectStatus.END_OF_TRACK):
             # Upstream sent an explicit marker: forward it, then FIN.
-            buf = header.end_group(
+            buf = header.next_object(
+                payload=b"", status=status,
                 object_id=header.next_object_id if oid is None else oid)
             session.stream_write(stream_id, buf.data, end_stream=True)
             self._streams.pop(skey, None)

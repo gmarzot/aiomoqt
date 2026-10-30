@@ -40,6 +40,10 @@ With --player-base or $AIOMOQT_PLAYER_URL set, each run prints a
 ready-to-paste player URL per relay. Relays on different drafts need a
 --draft all of them accept.
 
+When the duration ends, or on SIGINT/SIGTERM, each track ends with End of
+Track, then PUBLISH_DONE TRACK_ENDED, then PUBLISH_NAMESPACE_DONE for an
+announced namespace.
+
 Exit status: 0 when the duration ends or on SIGINT/SIGTERM; 2 for a usage
 error; 64 when an object does not fit a datagram; 69 when no relay can be
 reached, or every relay is lost (with --reconnect: none is back when the
@@ -1220,18 +1224,23 @@ async def _redial(ep: _Endpoint, pub: FanoutPublisher, start: dict,
 async def _shutdown(pub: FanoutPublisher, sessions: list,
                     announced: bool) -> None:
     """Signal shutdown in about a second: refuse new SUBSCRIBEs and
-    FETCHes, PUBLISH_DONE on every track, PUBLISH_NAMESPACE_DONE for an
-    announced namespace, then close each session."""
+    FETCHes, End of Track and PUBLISH_DONE on every track,
+    PUBLISH_NAMESPACE_DONE for an announced namespace, then close each
+    session."""
     for s in sessions:
         s.drain()
     for track in pub.tracks.values():
         track.end()
     await pub.catalog_track.finish()
-    # A subscription's PUBLISH_DONE follows its streams closing.
+    catalogs = getattr(pub.catalog_track, "members", [pub.catalog_track])
+    tracks = [*pub.tracks.values(), *catalogs]
+    # A subscription's PUBLISH_DONE follows its End of Track.
     deadline = time.monotonic() + _SHUTDOWN_DRAIN_S
     while time.monotonic() < deadline and not all(
-            sub.done for track in pub.tracks.values()
-            for sub in track.subscriptions if sub.session in sessions):
+            sub.done or (sub.request_id is None
+                         and sub.subscribe_request_id is None)
+            for track in tracks for sub in track.subscriptions
+            if sub.session in sessions):
         await asyncio.sleep(0.02)
     if announced:
         for s in sessions:

@@ -26,7 +26,7 @@ from aiomoqt.tests.test_pub_media_mtt import (  # noqa: F401  (fixtures)
 from aiomoqt.tools import moq_interop_relay as relay
 from aiomoqt.tools import pub_media, sub_media
 from aiomoqt.track import PublishedTrack
-from aiomoqt.types import MOQTRequestError, RequestErrorCode
+from aiomoqt.types import MOQTRequestError, ObjectStatus, RequestErrorCode
 
 _BASE_PORT = 21000
 
@@ -60,6 +60,20 @@ def _pub_events(out: str):
     """pub_media's events; an in-process sub_media prints there too."""
     return _mtt_events('\n'.join(ln for ln in out.splitlines()
                                   if ln.startswith('@mtt ')))
+
+
+def _relay_end_of_track(monkeypatch) -> set:
+    """Names of the tracks whose End of Track reached the relay."""
+    seen = set()
+    remember = relay._RelayedTrack._remember
+
+    def spy(self, gid, sgid, oid, payload, exts, prio, status, *a, **kw):
+        if status == ObjectStatus.END_OF_TRACK:
+            seen.add(self.key[1].decode())
+        return remember(self, gid, sgid, oid, payload, exts, prio, status,
+                        *a, **kw)
+    monkeypatch.setattr(relay._RelayedTrack, '_remember', spy)
+    return seen
 
 
 async def _until(cond, timeout):
@@ -192,6 +206,7 @@ async def test_signal_withdraws_refuses_and_closes(
                 probes.append(e.error_code)
         probes.append(asyncio.ensure_future(late_subscribe()))
     monkeypatch.setattr(_MOQTSessionMixin, 'drain', drain)
+    ended = _relay_end_of_track(monkeypatch)
 
     srv, handle = await _serve(port, use_quic, draft)
     try:
@@ -223,8 +238,35 @@ async def test_signal_withdraws_refuses_and_closes(
             else RequestErrorCode.INTERNAL_ERROR)
     assert probes[1:] == [int(want)], probes
     assert {n for n, *_ in arrivals} >= {'video', 'audio'}
+    assert ended == {'video', 'audio', 'catalog'}, ended
     events = _pub_events(capsys.readouterr().out)
     assert events[-1] == {'event': 'done', 'reason': 'signal'}
+
+
+@requires_certs
+@pytest.mark.parametrize('use_quic', [True, False], ids=['quic', 'wt'])
+async def test_the_duration_end_sends_end_of_track(
+        monkeypatch, h264_aac, arrivals, use_quic):  # noqa: F811
+    port = _BASE_PORT + 30 + (not use_quic)
+    url = _url(port, use_quic)
+    ns = 'svc/duration'
+    pub_args = _argv(monkeypatch, 'pub_media', url, '-k', '--draft', '22',
+                     '-t', '3', '--stats', '0', '--pub-ns', '-N', ns,
+                     '--mp4', h264_aac, '--loop')
+    sub_args = _argv(monkeypatch, 'sub_media', url, '-k', '--draft', '22',
+                     '-N', ns, '--analyze', '-t', '6', '-i', '1')
+    ended = _relay_end_of_track(monkeypatch)
+    srv, handle = await _serve(port, use_quic, 22)
+    try:
+        pub = asyncio.ensure_future(pub_media.run(pub_args))
+        await _until(lambda: relay._announced or pub.done(), 10)
+        sub = asyncio.ensure_future(sub_media.run(sub_args))
+        await asyncio.wait_for(pub, 10)
+        sub.cancel()
+    finally:
+        await _stop(srv, handle)
+    assert {n for n, *_ in arrivals} >= {'video', 'audio'}
+    assert ended == {'video', 'audio', 'catalog'}, ended
 
 
 # -- --reconnect ---------------------------------------------------------------
