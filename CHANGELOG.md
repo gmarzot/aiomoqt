@@ -2,6 +2,7 @@
 
 ## v0.14.0
 
+- A close the transport made itself names its cause: an idle timeout logs `connection closed: idle timeout` at INFO (was `NO_ERROR (0x0)`), another local error its picoquic name at WARNING (aiopquic `local_error`, `local_reason`).
 - aiomoqt-relay: a track paused at PUBLISH records a pause gap like a later pause, so the first joiner's FETCH or fill for the open group comes from upstream instead of a short cache answer; a fill the cache answers with nothing asks upstream.
 - A session logs one close line, ours included, with the peer address after the transport is gone; it has no `; reason:` part when none was given (no more `ConnectionTerminated` or `no error` placeholders), and the peer's reason is cut to 1024 bytes and escaped outside printable ASCII. A GOAWAY_TIMEOUT close we send logs INFO.
 - loopback_bench `--rtt-ms`, `--link-mbps`, `--loss`: emulated link (netem) on a private network namespace's lo; needs privileges to create one.
