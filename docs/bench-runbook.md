@@ -134,7 +134,10 @@ Plus file descriptors, since every subscriber costs some:
   deep (200000 packets): the cap models a deep buffer. It needs
   privileges to create a network namespace: unprivileged user
   namespaces (`unshare -rn`), or run the bench under `sudo`. Without
-  them it exits 2.
+  them it exits 2. One stream carries at most one flow-control window
+  per RTT (16 MiB: 2.7 Gbps at 50 ms, 0.9 Gbps at 150 ms); raise it with
+  `--fc-window`, or cap the link below it with `--link-mbps` so that
+  congestion control sets the rate.
 
 ### Verify before trusting a number
 
