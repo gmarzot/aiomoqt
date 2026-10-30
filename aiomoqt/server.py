@@ -90,6 +90,7 @@ class MOQTServer(MOQTPeer):
         tx_max_queued_bytes: Optional[int] = None,
         congestion_control_algorithm: Optional[str] = "bbr",
         congestion_control_options: Optional[str] = None,
+        flow_control_window: Optional[int] = None,
         keep_alive_interval: Optional[float] = None,
         socket_buffer_size: Optional[int] = None,
         stream_ring_cap: Optional[int] = None,
@@ -124,6 +125,8 @@ class MOQTServer(MOQTPeer):
         self.congestion_control_algorithm = congestion_control_algorithm
         # Algorithm option string, e.g. "Q0.02" for bbr.
         self.congestion_control_options = congestion_control_options
+        # QUIC flow-control window, per stream and per connection; None = 16 MiB.
+        self.flow_control_window = flow_control_window
         # QUIC keep-alive interval (seconds). None = disabled. PING
         # frames hold a flow-controlled, consumer-stalled connection
         # open past the idle timeout instead of dropping it.
@@ -178,6 +181,8 @@ class MOQTServer(MOQTPeer):
                     self.congestion_control_algorithm)
             if self.congestion_control_options is not None:
                 cfg.congestion_control_options = self.congestion_control_options
+            if self.flow_control_window is not None:
+                cfg.max_data = cfg.max_stream_data = self.flow_control_window
             if self.tx_max_queued_bytes is not None:
                 cfg.tx_max_queued_bytes = self.tx_max_queued_bytes
             if self.keep_alive_interval is not None:
@@ -225,6 +230,8 @@ class MOQTServer(MOQTPeer):
                 self.congestion_control_algorithm)
         if self.congestion_control_options is not None:
             wt_cfg.congestion_control_options = self.congestion_control_options
+        if self.flow_control_window is not None:
+            wt_cfg.max_data = wt_cfg.max_stream_data = self.flow_control_window
         if self.tx_max_queued_bytes is not None:
             wt_cfg.tx_max_queued_bytes = self.tx_max_queued_bytes
         if self.keep_alive_interval is not None:
@@ -276,6 +283,8 @@ class MOQTServer(MOQTPeer):
                 self.congestion_control_algorithm)
         if self.congestion_control_options is not None:
             cfg.congestion_control_options = self.congestion_control_options
+        if self.flow_control_window is not None:
+            cfg.max_data = cfg.max_stream_data = self.flow_control_window
         if self.tx_max_queued_bytes is not None:
             cfg.tx_max_queued_bytes = self.tx_max_queued_bytes
         if self.keep_alive_interval is not None:

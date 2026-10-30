@@ -2,6 +2,7 @@
 
 ## v0.14.0
 
+- `--fc-window` (session grid, loopback_bench) and `flow_control_window=` on `MOQTClient` / `MOQTServer` set the QUIC flow-control window per stream and per connection (default 16 MiB), which caps one stream at a window per RTT.
 - A peer's control-message violation logs one ERROR, the close line; the handler's line and the rejected message's hex dump are DEBUG.
 - `--cc-options` (session grid, aiomoqt-relay) and `congestion_control_options=` on `MOQTClient` / `MOQTServer` pass an option string to the congestion controller, e.g. `Q0.02` for bbr's send quantum; needs aiopquic with `QuicConfiguration.congestion_control_options`.
 - A close the transport made itself names its cause: an idle timeout logs `connection closed: idle timeout` at INFO (was `NO_ERROR (0x0)`), another local error its picoquic name at WARNING (aiopquic `local_error`, `local_reason`).
