@@ -3235,6 +3235,7 @@ async def _relay_subscribe(session, msg):
 def transport_settings(args) -> dict:
     """MOQTServer transport settings from the relay's flags."""
     return {"congestion_control_algorithm": args.cc_algo,
+            "congestion_control_options": args.cc_options,
             "max_connections": args.max_connections,
             "stream_ring_cap": args.stream_ring_cap,
             "tx_max_inflight_bytes": args.max_inflight_bytes}
@@ -3342,6 +3343,11 @@ def parse_args(argv=None):
                         help="Congestion control (bbr | bbr1 | c4 | cubic | "
                              "dcubic | fast | newreno | prague). Default: "
                              "bbr")
+    parser.add_argument("--cc-options", type=str, default=None,
+                        metavar="OPTS",
+                        help="Option string for the congestion controller, "
+                             "e.g. Q0.02: bbr sends bursts of 20 ms of "
+                             "pacing rate")
     parser.add_argument("--max-connections", type=int, default=4096,
                         help="Most connections held at once (aiopquic "
                              ">= 0.5.1). Default: 4096")

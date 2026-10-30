@@ -29,6 +29,7 @@ def test_the_file_sets_flags(tmp_path):
 cache-bytes = 1048576
 catalog-probe = true
 cc-algo = "bbr"
+cc-options = "Q0.02"
 watchdog = 30
 draft = "22,18"
 upstream = ["moqt://origin.example:4433/", "https://origin.example/moq"]
@@ -39,6 +40,7 @@ stream-scheduling = "round_robin"
     assert args.cache_bytes == 1048576
     assert args.catalog_probe is True
     assert args.cc_algo == "bbr"
+    assert args.cc_options == "Q0.02"
     assert args.watchdog == 30.0 and isinstance(args.watchdog, float)
     assert args.draft == [22, 18]
     assert args.upstream == ["moqt://origin.example:4433/",
