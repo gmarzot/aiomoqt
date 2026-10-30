@@ -1610,13 +1610,13 @@ class _MOQTSessionMixin:
             # control stream forever.
             error = (f"malformed control message: type=0x{int(msg_type):x} "
                      f"len={msg_len}: {type(e).__name__}")
-            logger.error(f"handle_control_message: {error}")
+            logger.debug(f"handle_control_message: {error}")
             self._close_session(SessionCloseCode.PROTOCOL_VIOLATION, error)
             return None
         except MOQTException as e:
             # MOQTProtocolViolation and peers like INVALID_REQUEST_ID:
-            # close with the exception's own code.
-            logger.error(
+            # close with the exception's own code; the close line logs it.
+            logger.debug(
                 f"handle_control_message: protocol violation: "
                 f"{e.reason_phrase}"
             )
@@ -2708,7 +2708,9 @@ class _MOQTSessionMixin:
                 return
             if msg is None:
                 # The handler logged why and, normally, closed the session.
-                logger.error(
+                logger.log(
+                    logging.DEBUG if self._close_err is not None
+                    else logging.ERROR,
                     f"MOQT control stream({stream_id}): rejected message head_hex="
                     f"{chain.data_slice(0, min(64, chain.capacity)).hex()}")
                 if self._close_err is None:
