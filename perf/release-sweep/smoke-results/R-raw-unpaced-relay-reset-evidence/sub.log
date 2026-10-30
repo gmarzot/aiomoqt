@@ -1,0 +1,33 @@
+────────────────────────────────────────────────────────
+  aiomoqt-bench subscriber
+────────────────────────────────────────────────────────
+  relay:       moqt://10.14.25.173:9768
+  transport:   QUIC
+  namespace:   aiomoqt
+  trackname:   track
+  duration:    30s
+  interval:    5.0s
+────────────────────────────────────────────────────────
+  Connecting...
+  Subscribed to 'aiomoqt/track', receiving...
+
+  Interval  Grps   GrpRate   Objs      ObjRate   Bitrate   Latency              Jitter   Loss            
+  ─────────────────────────────────────────────────────────────────────────────────────────────────────
+stream 2047 reset by peer: error=3
+
+════════════════════════════════════════════════════════
+  aiomoqt-bench results  (1.2s active / 1.5s elapsed)
+════════════════════════════════════════════════════════
+  Groups:      128
+  Objects:     25,550
+  Bytes:       104,984,950
+  GrpRate:     110.5 grp/s
+  ObjRate:     22060.9 obj/s
+  Throughput:  725.18 Mbps
+  Latency:     min=354.4  avg=872.9  max=1111.3  sd=242.1 ms
+               p50=1032.5  p95=1098.9  p99=1103.9 ms
+  Timestamps:  loc
+  Jitter:      0.01 ms
+  Lost:        0 (0.00%)
+  Out-of-order:   0
+════════════════════════════════════════════════════════

@@ -1,0 +1,21 @@
+────────────────────────────────────────────────────────
+  aiomoqt-bench publisher
+────────────────────────────────────────────────────────
+  relay:       moqt://10.14.25.173:9768
+  transport:   QUIC
+  namespace:   aiomoqt
+  trackname:   track
+  mode:        SUBGROUP x4
+  object size: 4096 B
+  group size:  200 objects
+  rate:        max
+  target:      max
+  duration:    30s
+────────────────────────────────────────────────────────
+  Connecting...
+  Published 'aiomoqt/track', waiting for subscriber...
+
+  Sent: 26,800 objects, 135 groups, 52826/s, 1.7Gbps (0.5s)
+
+  Duration 30s reached.
+  Done.

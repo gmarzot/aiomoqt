@@ -1,0 +1,37 @@
+I1030 14:24:17.356653 172226 main.cpp:135] Admin server listening on [::1]:9769
+W1030 14:24:17.496663 172228 ServiceMatcher.cpp:93] Empty path in CLIENT_SETUP for authority '10.14.25.173:9768', normalizing to '/'
+W1030 14:24:17.724032 172228 ServiceMatcher.cpp:93] Empty path in CLIENT_SETUP for authority '10.14.25.173:9768', normalizing to '/'
+W1030 14:24:20.358971 172228 ServiceMatcher.cpp:93] Empty path in CLIENT_SETUP for authority '10.14.25.173:9768', normalizing to '/'
+I1030 14:24:20.364462 172228 MoqxRelay.cpp:997] Updating forward for aiomoqt/track forward=1
+E1030 14:24:20.869387 172228 MoQSession.cpp:1546] Failed to create uni stream tp=0x77a2dc05a1b0
+E1030 14:24:20.869415 172228 MoQForwarder.cpp:531] Removing subscriber after error in beginSubgroup err=Failed to create uni stream.
+E1030 14:24:20.869448 172228 MoQSession.cpp:3363] Error parsing/consuming stream id=2050 sess=0x77a2dc049710
+I1030 14:24:20.869493 172228 MoqxRelay.cpp:969] Last subscriber removed for aiomoqt/track
+E1030 14:24:20.870212 172228 MoQSession.cpp:3363] Error parsing/consuming stream id=2054 sess=0x77a2dc049710
+E1030 14:24:20.871197 172228 MoQSession.cpp:3363] Error parsing/consuming stream id=2058 sess=0x77a2dc049710
+E1030 14:24:20.871920 172228 MoQSession.cpp:3363] Error parsing/consuming stream id=2062 sess=0x77a2dc049710
+E1030 14:24:20.874006 172228 MoQSession.cpp:3363] Error parsing/consuming stream id=2066 sess=0x77a2dc049710
+E1030 14:24:20.874293 172228 MoQSession.cpp:3299] proxygen::WebTransport::Exception: received reset_stream with error=1 id=2134 sess=0x77a2dc049710
+E1030 14:24:20.874300 172228 MoQSession.cpp:3309] dataStreamReadLoop terminating for unknown stream id=2134 sess=0x77a2dc049710
+E1030 14:24:20.874316 172228 MoQSession.cpp:3299] proxygen::WebTransport::Exception: received reset_stream with error=1 id=2138 sess=0x77a2dc049710
+E1030 14:24:20.874319 172228 MoQSession.cpp:3309] dataStreamReadLoop terminating for unknown stream id=2138 sess=0x77a2dc049710
+E1030 14:24:20.874373 172228 MoQSession.cpp:3299] proxygen::WebTransport::Exception: received reset_stream with error=1 id=2130 sess=0x77a2dc049710
+E1030 14:24:20.874376 172228 MoQSession.cpp:3309] dataStreamReadLoop terminating for unknown stream id=2130 sess=0x77a2dc049710
+E1030 14:24:20.875038 172228 MoQSession.cpp:3363] Error parsing/consuming stream id=2070 sess=0x77a2dc049710
+E1030 14:24:20.875812 172228 MoQSession.cpp:3363] Error parsing/consuming stream id=2074 sess=0x77a2dc049710
+E1030 14:24:20.876830 172228 MoQSession.cpp:3363] Error parsing/consuming stream id=2078 sess=0x77a2dc049710
+E1030 14:24:20.877484 172228 MoQSession.cpp:3363] Error parsing/consuming stream id=2082 sess=0x77a2dc049710
+E1030 14:24:20.878635 172228 MoQSession.cpp:3363] Error parsing/consuming stream id=2086 sess=0x77a2dc049710
+E1030 14:24:20.879214 172228 MoQSession.cpp:3363] Error parsing/consuming stream id=2090 sess=0x77a2dc049710
+E1030 14:24:20.880317 172228 MoQSession.cpp:3363] Error parsing/consuming stream id=2094 sess=0x77a2dc049710
+E1030 14:24:20.880910 172228 MoQSession.cpp:3363] Error parsing/consuming stream id=2098 sess=0x77a2dc049710
+E1030 14:24:20.881444 172228 MoQSession.cpp:3363] Error parsing/consuming stream id=2102 sess=0x77a2dc049710
+E1030 14:24:20.882613 172228 MoQSession.cpp:3363] Error parsing/consuming stream id=2106 sess=0x77a2dc049710
+E1030 14:24:20.883255 172228 MoQSession.cpp:3363] Error parsing/consuming stream id=2110 sess=0x77a2dc049710
+E1030 14:24:20.884056 172228 MoQSession.cpp:3363] Error parsing/consuming stream id=2114 sess=0x77a2dc049710
+E1030 14:24:20.884868 172228 MoQSession.cpp:3363] Error parsing/consuming stream id=2118 sess=0x77a2dc049710
+E1030 14:24:20.886014 172228 MoQSession.cpp:3363] Error parsing/consuming stream id=2122 sess=0x77a2dc049710
+E1030 14:24:20.886759 172228 MoQSession.cpp:3363] Error parsing/consuming stream id=2126 sess=0x77a2dc049710
+E1030 14:24:20.887418 172228 MoQSession.cpp:3363] Error parsing/consuming stream id=2142 sess=0x77a2dc049710
+E1030 14:24:20.888149 172228 MoQSession.cpp:3363] Error parsing/consuming stream id=2146 sess=0x77a2dc049710
+I1030 14:24:57.654064 172226 main.cpp:50] Received signal 15, shutting down
