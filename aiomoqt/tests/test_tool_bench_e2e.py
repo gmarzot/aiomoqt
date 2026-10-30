@@ -245,6 +245,51 @@ def test_loopback_bench_rtt_ms_without_netns_exits_2(monkeypatch, capsys):
     assert "need privileges to create a network namespace" in capsys.readouterr().err
 
 
+def test_loopback_bench_rtt_ms_child_takes_ctrl_c(monkeypatch):
+    import signal
+    import subprocess
+    import sys
+    from aiomoqt.tools import loopback_bench
+    real_run = subprocess.run
+    probe = ("import signal, sys; sys.exit(0 if signal.getsignal("
+             "signal.SIGINT) is signal.default_int_handler else 3)")
+    monkeypatch.setattr(loopback_bench, "_succeeds", lambda argv: True)
+    monkeypatch.setattr(loopback_bench.shutil, "which", lambda t: "/bin/" + t)
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(loopback_bench.subprocess, "run",
+                        lambda argv: real_run([sys.executable, "-c", probe]))
+    monkeypatch.setattr(sys, "argv", ["loopback_bench", "--rtt-ms", "50"])
+    before = signal.getsignal(signal.SIGINT)
+    assert loopback_bench._reexec_in_netns(loopback_bench.parse_args()) == 0
+    assert signal.getsignal(signal.SIGINT) is before
+
+
+@requires_certs
+def test_loopback_bench_rtt_ms_stops_on_ctrl_c(tmp_path):
+    import os
+    import signal
+    import subprocess
+    from aiomoqt.tests._procs import ENV, REPO, tool_cmd
+    if not _netns_route():
+        pytest.skip("no private netns with netem: unshare -rn refused")
+    log = tmp_path / "loopback.log"
+    with open(log, "w") as f:
+        proc = subprocess.Popen(
+            tool_cmd("loopback_bench", "-Q", "-p", free_udp_port(), "-t", 60,
+                     "-r", 200, "-k", "--rtt-ms", 20),
+            stdout=f, stderr=subprocess.STDOUT, cwd=REPO, env=ENV,
+            start_new_session=True)
+    try:
+        wait_for(log, "rtt 20 ms", proc)
+        time.sleep(1)
+        os.killpg(proc.pid, signal.SIGINT)  # as a terminal's Ctrl-C does
+        assert proc.wait(timeout=10) == 130, log.read_text()
+    finally:
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+
+
 @requires_certs
 def test_loopback_bench_rtt_ms_emulates_the_link():
     if not _netns_route():

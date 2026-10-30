@@ -226,8 +226,9 @@ def _reexec_in_netns(args) -> int:
            *sys.argv[1:]]
     argv = ["unshare", "-rn", "sh", "-c",
             f'export {NETNS_ENV}=1 && {setup} && exec "$@"', "sh"]
-    # The child gets Ctrl-C from the terminal and exits on its own.
-    prev = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    # The child gets Ctrl-C from the terminal and exits on its own. A no-op
+    # handler, unlike SIG_IGN, is not inherited by the child.
+    prev = signal.signal(signal.SIGINT, lambda *_: None)
     try:
         return subprocess.run(argv + cmd).returncode
     finally:
