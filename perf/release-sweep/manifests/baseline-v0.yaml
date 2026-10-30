@@ -4,7 +4,11 @@
 #   sweep.py            --manifest manifests/baseline-v0.yaml --resume
 #
 # Run with the *system* python3 (PyYAML); bench processes run under the arm venv.
-# `r` is the pacing rate in kbit/s (0 = unpaced).  60 s points use reps=3
+# `r` is the pacing rate in objects/sec, the unit every aiomoqt tool takes for -r
+# (0 = unpaced).  Bit-rate points: r = Mbps*1e6/(s*8) at s=4096 B => 300 Mbps =
+# 9155, 600 Mbps = 18311, 200 Mbps = 6104, 400 Mbps = 12207.  P1b/P1c found the
+# earlier values authored as kbit/s (300000) put the pacer above line rate, i.e.
+# every paced point silently ran unpaced; corrected here.  60 s points use reps=3
 # (N=3 screening), the long media/churn points use fewer reps.
 
 arm: base-070rc2
@@ -94,12 +98,12 @@ points:
   - id: D1
     topology: D
     transport: raw
-    config: {P: 1, s: 4096, g: 200, r: 300000}
+    config: {P: 1, s: 4096, g: 200, r: 9155}
     purpose: single stream on the wire, ~300 Mbps
   - id: D2
     topology: D
     transport: raw
-    config: {P: 4, s: 4096, g: 200, r: 600000}
+    config: {P: 4, s: 4096, g: 200, r: 18311}
     purpose: multi-stream on the wire, ~600 Mbps
   - id: D3
     topology: D
@@ -114,14 +118,14 @@ points:
   - id: D5
     topology: D
     transport: wt
-    config: {P: 4, s: 4096, g: 200, r: 600000}
+    config: {P: 4, s: 4096, g: 200, r: 18311}
     purpose: WT on the wire
 
   # ---- R: relay on shenzhen, subscriber(s) on seawolf ------------------
   - id: R1
     topology: R
     transport: raw
-    config: {P: 4, s: 4096, g: 200, r: 200000}
+    config: {P: 4, s: 4096, g: 200, r: 6104}
     subs: 1
     purpose: relay egress, controlled
   - id: R2
@@ -139,25 +143,25 @@ points:
   - id: R4
     topology: R
     transport: raw
-    config: {P: 4, s: 4096, g: 200, r: 200000}
+    config: {P: 4, s: 4096, g: 200, r: 6104}
     subs: 5
     purpose: fan-out 5, ~200 Mbps aggregate
   - id: R5
     topology: R
     transport: raw
-    config: {P: 4, s: 4096, g: 200, r: 400000}
+    config: {P: 4, s: 4096, g: 200, r: 12207}
     subs: 20
     purpose: fan-out 20, ~400 Mbps aggregate
   - id: R6
     topology: R
     transport: wt
-    config: {P: 4, s: 4096, g: 200, r: 200000}
+    config: {P: 4, s: 4096, g: 200, r: 6104}
     subs: 5
     purpose: WT fan-out
   - id: Ri1
     topology: Ri
     transport: raw
-    config: {P: 4, s: 4096, g: 200, r: 300000}
+    config: {P: 4, s: 4096, g: 200, r: 9155}
     subs: 1
     purpose: relay ingress (publisher on seawolf)
 

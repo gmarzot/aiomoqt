@@ -360,3 +360,34 @@ rep), L-topology `--cert/--key/--draft` plumbing, L subscriber summary parsed fr
 CPU fallback for single-process points, two warm-up remote hostcheck probes and an implausible-offset
 re-probe to stop a stale first reply poisoning the clock baseline. New scripts: `noise_floor.py`,
 `summarize.py`. Manifests: `noise-floor.yaml`, `phase1b-partb.yaml`, `phase1b-smoke.yaml`.
+
+## Phase 1c — two-node direct baseline (D1–D5 + Ri1) — DONE
+
+Run block `runs/2026-10-30T22-56-13Z-p1c2` (tag p1c2), 18/18 reps recorded, N=3 x 6 points,
+60 s / 10 s gaps. Report: `baselines/base-070rc2/SUMMARY-part2.md`.
+
+Delivered (subscriber side, Mbps mean +/- sd): D1 286.49 +/- 1.02 (CV 0.35%), D2 576.87 +/-
+2.37 (0.41%), D3 812.11 +/- 30.20 (3.72%), D4 787.14 +/- 3.93 (0.50%), D5 569.69 +/- 0.25
+(0.04%), Ri1 317.94 +/- 0.42 (0.13%). Publisher-side met every command (301/602/602).
+
+Ceiling: **the 1 GbE NIC**. D3 = 812 Mbps payload (856 pub-side) while the Windows Realtek
+GbE adapter (the physical NIC owning 10.14.25.173) counted 836.6 Mbps TX in a 45 s window =
+89% of the 941 Mbps MTU-1500 payload ceiling; CPU 0.61 core/16 (pub) and 1.4 cores/6 (sub),
+steal 0.00%; loopback on the same stack does 1731.8 Mbps (2.1x); P=8 unpaced (D4) does not
+exceed P=4 unpaced (D3). Note both ends are WSL2 guests whose sysfs reports a cosmetic
+10 Gb/s vNIC - do not trust it for link-rate math.
+
+Cost vs loopback: -53.1% (1731.8 -> 812.1); RTT 4.25-5.96 ms (min/avg/max, 5 pings) is
+dominated by the WSL2/Hyper-V virtual path, not the switch. Churn at the ceiling is -3.1%
+(D4 vs D3) versus -15.8% on loopback. WT costs -1.3% (D5 vs D2).
+
+Still open: cross-host latency percentiles (p50/p95/p99 null on all 18 reps; tcp-peer clock
+offset moved up to 393 692 us inside one 60 s point against a 2000 us tolerance, so every rep
+is `dirty` on clock alone). Throughput/CPU unaffected (per-host monotonic clock). Resolve
+clock discipline before any latency claim.
+
+Manifest fix in this phase: `r` was kbit/s (300000) but every aiomoqt tool takes objects/sec,
+so paced points silently ran unpaced; rescaled (200M=6104, 300M=9155, 400M=12207, 600M=18311)
+and documented in the manifest header. Pre-fix block 2026-10-30T22-52-58Z-p1c must not be cited.
+
+Next action: Phase 1d (relay egress) - see PLAN/board; carry the clock-discipline item forward.
