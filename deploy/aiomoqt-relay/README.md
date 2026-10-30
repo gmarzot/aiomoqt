@@ -140,7 +140,7 @@ how the config differs. Run it after each swap.
 
 ## G5 pages
 
-The pages are built from the fork gmarzot/moq-playa, branch `gmarzot-playa-dev`, which is forked from
+The pages are built from the fork gmarzot/moq-playa, branch `gmarzot-g5-dev`, which is forked from
 openmoq/moq-playa:
 
 ```sh
