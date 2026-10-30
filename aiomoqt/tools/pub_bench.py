@@ -233,6 +233,7 @@ async def run(args):
         debug=args.debug,
         keylog_filename=args.keylogfile,
         congestion_control_algorithm=args.cc_algo,
+        congestion_control_options=args.cc_options,
         tx_max_queued_bytes=args.max_queued_bytes,
         **({'tx_max_inflight_bytes':
             (None if args.max_inflight_bytes == 0

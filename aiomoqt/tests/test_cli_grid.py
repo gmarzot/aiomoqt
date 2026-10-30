@@ -347,9 +347,10 @@ def test_every_tool_takes_the_logging_flags(tool):
 
 @pytest.mark.parametrize("argv, expected", [
     ([], {}),
-    (["--cc-algo", "cubic", "--max-queued-bytes", "0",
+    (["--cc-algo", "cubic", "--cc-options", "Q0.02", "--max-queued-bytes", "0",
       "--max-inflight-bytes", "0", "--keepalive", "2.5"],
-     {"congestion_control_algorithm": "cubic", "tx_max_queued_bytes": 0,
+     {"congestion_control_algorithm": "cubic",
+      "congestion_control_options": "Q0.02", "tx_max_queued_bytes": 0,
       "tx_max_inflight_bytes": None, "keep_alive_interval": 2.5}),
     (["--max-inflight-bytes", "4096"], {"tx_max_inflight_bytes": 4096}),
 ])

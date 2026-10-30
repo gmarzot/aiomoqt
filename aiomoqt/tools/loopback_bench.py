@@ -126,6 +126,10 @@ def parse_args():
         help='Congestion control (bbr | bbr1 | c4 | cubic | dcubic | '
              'fast | newreno | prague). Default: bbr')
     parser.add_argument(
+        '--cc-options', type=str, default=None, metavar='OPTS',
+        help='Option string for the congestion controller, e.g. Q0.02: '
+             'bbr sends bursts of 20 ms of pacing rate')
+    parser.add_argument(
         '--max-inflight-bytes', type=int, default=None,
         help='Per-stream TX budget (aiomoqt tx_max_inflight_bytes): '
              'producer pauses while one stream\'s un-transmitted bytes '
@@ -259,7 +263,8 @@ def print_banner(args):
     row("delivery", ("DATAGRAM" if args.datagram else "subgroup streams")
         + (", fanout lane" if args.fanout else "")
         + (", per-peer props" if args.per_peer_props else ""))
-    row("cc algorithm", args.cc_algo)
+    row("cc algorithm", args.cc_algo
+        + (f" {args.cc_options}" if args.cc_options else ""))
     if _emulated(args):
         link = f"rtt {args.rtt_ms or 0:g} ms"
         if args.link_mbps:
@@ -402,6 +407,7 @@ async def run_server(args):
         use_quic=args.quic,
         supported_drafts=args.draft,
         congestion_control_algorithm=args.cc_algo,
+        congestion_control_options=args.cc_options,
         # None = honor protocol default (16 MB); 0 = opt out.
         **({'tx_max_inflight_bytes':
             (None if args.max_inflight_bytes == 0
@@ -427,6 +433,7 @@ async def run_subscriber(args, stats):
         ca_file=None if args.insecure else args.cert,
         debug=args.debug,
         congestion_control_algorithm=args.cc_algo,
+        congestion_control_options=args.cc_options,
     )
 
     try:
