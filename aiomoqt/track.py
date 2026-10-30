@@ -665,6 +665,8 @@ class PublishedTrack(Track):
         # produce() tracks: the shared delivery and the one production run.
         self._out: Optional[FanoutDelivery] = None
         self._production: Optional[asyncio.Future] = None
+        # end() stopped production: it ends with End of Track.
+        self._ending = False
         # The error that ended production, if one did.
         self.error: Optional[Exception] = None
         # Aggregate stats across all subgroup streams; subgroup 0 reports.
@@ -837,22 +839,27 @@ class PublishedTrack(Track):
         return self._production
 
     async def _run_production(self) -> None:
-        """Run produce() once, flush every peer, then send each peer that
-        was served its PUBLISH_DONE. A datagram over the path limit ends
-        the track: PUBLISH_DONE INTERNAL_ERROR, the error kept in
-        `error`."""
+        """Run produce() once, flush every peer and mark the end of the
+        track, then send each peer that was served its PUBLISH_DONE. A
+        datagram over the path limit ends the track: PUBLISH_DONE
+        INTERNAL_ERROR, the error kept in `error`."""
         out = self._out
         status, reason = SubscribeDoneCode.TRACK_ENDED, None
         try:
             await self.produce(out)
         except asyncio.CancelledError:
-            out.abort()
-            raise
+            if not self._ending:
+                out.abort()
+                raise
+            asyncio.current_task().uncancel()
+            out.end_track(self._largest)
+            await out.close()
         except DatagramTooLarge as e:
             out.abort()
             self.error = e
             status, reason = SubscribeDoneCode.INTERNAL_ERROR, str(e)
         else:
+            out.end_track(self._largest)
             await out.close()
         finally:
             for sub in list(self._subs):
@@ -1624,9 +1631,16 @@ class PublishedTrack(Track):
         self._finish_range(sub)
 
     def end(self) -> None:
-        """End the track: each peer's open streams close, then its
-        subscription gets PUBLISH_DONE TRACK_ENDED (§10.11), and nothing
-        restarts production."""
+        """End the track; nothing restarts production. A running
+        produce() stops at an object boundary: each peer gets its queued
+        objects and End of Track, then PUBLISH_DONE TRACK_ENDED.
+        Otherwise each peer's open streams close, then its subscription
+        gets PUBLISH_DONE TRACK_ENDED (§10.11)."""
+        prod = self._production
+        if prod is not None and not prod.done():
+            self._ending = True
+            prod.cancel()
+            return
         for sub in list(self._subs):
             self._end_subscription(sub, SubscribeDoneCode.TRACK_ENDED)
 

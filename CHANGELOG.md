@@ -2,6 +2,7 @@
 
 ## v0.14.0
 
+- A `produce()` track that ends, by returning or by `end()`, sends End of Track after its last object (one past it on the open group stream, else at the next group on a new stream, or as a status datagram), then PUBLISH_DONE TRACK_ENDED; `end()` no longer resets the open group. pub_media's tracks and catalog do this on `-t` expiry and SIGINT/SIGTERM. aiomoqt-relay forwards End of Track as received (it wrote End of Group).
 - `--cc-options` (session grid, aiomoqt-relay) and `congestion_control_options=` on `MOQTClient` / `MOQTServer` pass an option string to the congestion controller, e.g. `Q0.02` for bbr's send quantum; needs aiopquic with `QuicConfiguration.congestion_control_options`.
 - A close the transport made itself names its cause: an idle timeout logs `connection closed: idle timeout` at INFO (was `NO_ERROR (0x0)`), another local error its picoquic name at WARNING (aiopquic `local_error`, `local_reason`).
 - aiomoqt-relay: a track paused at PUBLISH records a pause gap like a later pause, so the first joiner's FETCH or fill for the open group comes from upstream instead of a short cache answer; a fill the cache answers with nothing asks upstream.
