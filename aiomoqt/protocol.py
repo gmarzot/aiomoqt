@@ -270,6 +270,21 @@ def _close_kind(event: Any) -> Optional[str]:
     return None
 
 
+_PICOQUIC_ERROR_IDLE_TIMEOUT = 0x433
+
+
+def _local_cause(event: Any) -> Optional[str]:
+    """The cause of a close the transport made itself (aiopquic's
+    local_error, a picoquic code, and its local_reason), or None."""
+    code = getattr(event, 'local_error', 0)
+    if not isinstance(code, int) or not code:
+        return None
+    if code == _PICOQUIC_ERROR_IDLE_TIMEOUT:
+        return "idle timeout"
+    return (getattr(event, 'local_reason', '')
+            or f"local error 0x{code:x}")
+
+
 def _closed_reason(reason: Any) -> str:
     return f"session closed: {reason}" if reason else "session closed"
 
@@ -3036,7 +3051,8 @@ class _MOQTSessionMixin:
             error = getattr(event, 'error_code', QuicErrorCode.INTERNAL_ERROR)
             reason = getattr(event, 'reason_phrase', None) or ""
             self._close_session(error, reason, transmit=False,
-                                kind=_close_kind(event))
+                                kind=_close_kind(event),
+                                local=_local_cause(event))
             return
 
         if isinstance(event, ProtocolNegotiated):
@@ -3169,13 +3185,15 @@ class _MOQTSessionMixin:
                 fut.set_result(False)
 
     def _log_close(self, error_code: int, reason_phrase: str,
-                   transmit: bool, kind: Optional[str] = None) -> None:
-        """One line per close: side, code name, peer, setup state. aiopquic
-        reports only the peer's close code, so a nonzero code without
-        transmit is the peer's; code 0 there may be a local close (idle
-        timeout) and is worded neutrally. kind (see _close_kind) picks the
-        code table. Clean codes and our GOAWAY_TIMEOUT log INFO, a peer's
-        error WARNING, our own error ERROR. Only a session's first close is logged."""
+                   transmit: bool, kind: Optional[str] = None,
+                   local: Optional[str] = None) -> None:
+        """One line per close: side, code name, peer, setup state. A nonzero
+        code without transmit is the peer's; local (see _local_cause) names
+        a close the transport made itself; code 0 with neither is worded
+        neutrally. kind (see _close_kind) picks the code table. Clean codes,
+        an idle timeout and our GOAWAY_TIMEOUT log INFO, a peer's or another
+        local error WARNING, our own error ERROR. Only a session's first
+        close is logged."""
         if self._close_logged:
             return
         self._close_logged = True
@@ -3183,7 +3201,11 @@ class _MOQTSessionMixin:
             code = int(error_code)
         except (TypeError, ValueError):
             code = None
-        if code is None:
+        if transmit or code:
+            local = None
+        if local:
+            label = local
+        elif code is None:
             label = str(error_code)
         else:
             if kind == 'transport':
@@ -3216,8 +3238,10 @@ class _MOQTSessionMixin:
             msg += ", before MoQT setup"
         if reason_phrase:
             msg += f"; reason: {_log_safe_reason(reason_phrase)}"
-        if code == 0 or (self._is_wt and kind != 'transport'
-                         and code == _H3_NO_ERROR):
+        if local:
+            (logger.info if local == "idle timeout" else logger.warning)(msg)
+        elif code == 0 or (self._is_wt and kind != 'transport'
+                           and code == _H3_NO_ERROR):
             logger.info(msg)
         elif transmit and kind is None and code == SessionCloseCode.GOAWAY_TIMEOUT:
             logger.info(msg)  # an orderly shutdown
@@ -3237,11 +3261,13 @@ class _MOQTSessionMixin:
     def _close_session(self,
               error_code: SessionCloseCode = SessionCloseCode.NO_ERROR,
               reason_phrase: str = "", *,
-              transmit: bool = True, kind: Optional[str] = None) -> None:
+              transmit: bool = True, kind: Optional[str] = None,
+              local: Optional[str] = None) -> None:
         """Close the MoQT session. The first close's code is the one sent;
         transmit=False when the peer already closed the connection; kind
-        names the close's code table (see _close_kind)."""
-        self._log_close(error_code, reason_phrase, transmit, kind)
+        names the close's code table (see _close_kind), local a close the
+        transport made itself (see _local_cause)."""
+        self._log_close(error_code, reason_phrase, transmit, kind, local)
         first = self._close_err is None
         if first:
             self._close_err = (error_code, reason_phrase)
@@ -7040,10 +7066,12 @@ class _WTSessionMixin:
             self.quic_event_received(DatagramFrameReceived(data=data))
         elif evt_type == _EVT_WT_SESSION_CLOSED:
             super()._on_event(ev_tuple)
+            ev = getattr(self, '_session_close_event', None)
+            if ev is not None:
+                error_code, data = ev.error_code, ev.reason
             reason = bytes(data).decode(errors="replace") if data else ""
-            self._close_session(
-                error_code, reason, transmit=False,
-                kind=_close_kind(getattr(self, '_session_close_event', None)))
+            self._close_session(error_code, reason, transmit=False,
+                                kind=_close_kind(ev), local=_local_cause(ev))
         else:
             super()._on_event(ev_tuple)
 
