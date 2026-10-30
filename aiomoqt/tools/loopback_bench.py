@@ -130,6 +130,11 @@ def parse_args():
         help='Option string for the congestion controller, e.g. Q0.02: '
              'bbr sends bursts of 20 ms of pacing rate')
     parser.add_argument(
+        '--fc-window', type=int, default=None, metavar='BYTES',
+        help='QUIC flow-control window, per stream and per connection; the '
+             'receiver buffers this much per stream. Above rate x RTT for '
+             '--rtt-ms runs. Default: 16 MiB')
+    parser.add_argument(
         '--max-inflight-bytes', type=int, default=None,
         help='Per-stream TX budget (aiomoqt tx_max_inflight_bytes): '
              'producer pauses while one stream\'s un-transmitted bytes '
@@ -265,6 +270,8 @@ def print_banner(args):
         + (", per-peer props" if args.per_peer_props else ""))
     row("cc algorithm", args.cc_algo
         + (f" {args.cc_options}" if args.cc_options else ""))
+    if args.fc_window:
+        row("fc window", f"{args.fc_window} B")
     if _emulated(args):
         link = f"rtt {args.rtt_ms or 0:g} ms"
         if args.link_mbps:
@@ -408,6 +415,7 @@ async def run_server(args):
         supported_drafts=args.draft,
         congestion_control_algorithm=args.cc_algo,
         congestion_control_options=args.cc_options,
+        flow_control_window=args.fc_window,
         # None = honor protocol default (16 MB); 0 = opt out.
         **({'tx_max_inflight_bytes':
             (None if args.max_inflight_bytes == 0
@@ -434,6 +442,7 @@ async def run_subscriber(args, stats):
         debug=args.debug,
         congestion_control_algorithm=args.cc_algo,
         congestion_control_options=args.cc_options,
+        flow_control_window=args.fc_window,
     )
 
     try:

@@ -69,6 +69,9 @@ SIGUSR1.
   default. moqx defaults to BBR2. `--cc-algo` takes `bbr`, `bbr1`, `c4`, `cubic`, `dcubic`,
   `fast`, `newreno`, `prague` and `reno`. `--cc-options` / `congestion_control_options=`
   passes an option string to that algorithm, e.g. `Q0.02` for bbr's send quantum.
+- Flow-control window: 16 MiB per stream and per connection, so one stream carries at most
+  16 MiB per RTT (2.7 Gbps at 50 ms). `--fc-window` / `flow_control_window=` raises it; the
+  receiver buffers that much per stream.
 - Loopback timing: picoquic's BBRv3 is reported to freeze cwnd below 128 µs RTT (upstream
   #2118), not reproduced on the current pin. Use `cubic` or `newreno` for loopback timing runs.
 - FETCH: a `PublishedTrack` keeps no object history unless given `fetch_history_bytes`, and
