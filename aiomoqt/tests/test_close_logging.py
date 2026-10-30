@@ -3,17 +3,25 @@ and whether MoQT setup completed; its level follows who closed and why.
 A session logs one close line; the peer's reason is logged escaped."""
 import asyncio
 import contextlib
+import dataclasses
 import logging
+import os
 import re
+import signal
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
 
+from aiopquic.quic.configuration import QuicConfiguration
 from aiopquic.quic.events import ConnectionTerminated, WebTransportSessionClosed
+
+import aiomoqt.server
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.messages.base import MOQTMessage
-from aiomoqt.protocol import _MOQTSessionMixin, _close_kind
+from aiomoqt.protocol import _MOQTSessionMixin, _close_kind, _local_cause
 from aiomoqt.server import MOQTServer
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
 from aiomoqt.tests._procs import free_udp_port
@@ -142,13 +150,49 @@ async def test_raw_quic_peer_error_close_logs_one_warning(records):
 
 
 async def test_transport_close_without_a_code_is_not_called_a_peer_close(records):
-    # A local idle timeout arrives as code 0: the side is unknown.
+    # Code 0 with no local cause: the side is unknown.
     s = _stub(is_wt=False, setup_done=True)
     s._quic_event(ConnectionTerminated(error_code=0))
     rec = _close_line(records)
     assert rec.levelno == logging.INFO
     assert rec.getMessage().startswith("MOQT: connection closed: NO_ERROR (0x0)")
     assert "peer closed" not in records.text
+
+
+@pytest.mark.parametrize("is_wt", [False, True], ids=["quic", "wt"])
+@pytest.mark.parametrize("local, level, label", [
+    (0x433, logging.INFO, "idle timeout"),
+    (0x41e, logging.WARNING, "local error 0x41e"),
+])
+async def test_a_local_close_names_its_cause(records, is_wt, local, level,
+                                             label):
+    s = _stub(is_wt=is_wt, setup_done=True)
+    s._quic_event(SimpleNamespace(error_code=0, frame_type=0,
+                                  local_error=local))
+    rec = _close_line(records)
+    assert rec.levelno == level
+    assert rec.getMessage() == (f"MOQT: connection closed: {label} "
+                                "peer 158.23.190.70:6983")
+
+
+async def test_a_peer_code_wins_over_a_local_cause(records):
+    s = _stub(is_wt=False, setup_done=True)
+    s._quic_event(SimpleNamespace(error_code=0x3, local_error=0x433))
+    assert _close_line(records).getMessage().startswith(
+        "MOQT: peer closed: PROTOCOL_VIOLATION (0x3) from")
+
+
+@pytest.mark.parametrize("event, cause", [
+    (SimpleNamespace(local_error=0x433), "idle timeout"),
+    (SimpleNamespace(local_error=0x41e), "local error 0x41e"),
+    (SimpleNamespace(local_error=0x41e, local_reason="disconnected"),
+     "disconnected"),
+    (SimpleNamespace(local_error=0), None),
+    (SimpleNamespace(error_code=0), None),
+    (None, None),
+])
+def test_local_cause(event, cause):
+    assert _local_cause(event) == cause
 
 
 async def test_raw_quic_transport_close_names_the_transport_code(records):
@@ -344,3 +388,67 @@ async def test_peer_reason_with_escapes_over_the_wire(records, use_quic):
     assert _lines(records, port) == [
         f"MOQT: peer closed: GOAWAY_TIMEOUT (0x10) from 127.0.0.1:{port}"
         "; reason: \\x1b[2Jgone\\x0afake"], _lines(records)
+
+
+_SILENT_CLIENT = r"""
+import asyncio, sys
+from aiomoqt.client import MOQTClient
+
+async def main(port, use_quic):
+    client = MOQTClient("127.0.0.1", port, path="/", use_quic=use_quic,
+                        verify_tls=False, supported_drafts=22)
+    async with client.connect() as s:
+        await s.client_session_init()
+        print("ready", flush=True)
+        await asyncio.sleep(3600)
+
+asyncio.run(main(int(sys.argv[1]), sys.argv[2] == "quic"))
+"""
+
+
+@dataclasses.dataclass
+class _ShortIdle(QuicConfiguration):
+    idle_timeout: float = 1.0
+
+
+@requires_certs
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGSTOP")
+@pytest.mark.parametrize("use_quic", _REAL)
+async def test_idle_timeout_close_line(records, monkeypatch, use_quic):
+    monkeypatch.setattr(aiomoqt.server, "QuicConfiguration", _ShortIdle)
+    port = free_udp_port()
+    server = MOQTServer(host="127.0.0.1", port=port, certificate=CERT,
+                        private_key=KEY, path="/", supported_drafts=22)
+    handle = await server.serve_dual()
+    proc = None
+    try:
+        # Not an asyncio subprocess: on macOS py3.14 the child watcher
+        # reaps a SIGSTOP'd child with a blocking waitpid on the loop.
+        proc = subprocess.Popen(
+            [sys.executable, "-c", _SILENT_CLIENT, str(port),
+             "quic" if use_quic else "wt"],
+            stdout=subprocess.PIPE, cwd=os.getcwd())
+        line = await asyncio.wait_for(
+            asyncio.to_thread(proc.stdout.readline), 10)
+        assert line.strip() == b"ready", line
+        async with asyncio.timeout(5):
+            while not server._live:
+                await asyncio.sleep(0.01)
+        peer = next(iter(server._live))
+        os.kill(proc.pid, signal.SIGSTOP)
+        async with asyncio.timeout(10):
+            await peer.async_closed()
+        await asyncio.sleep(0.3)
+    finally:
+        if proc is not None:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(proc.pid, signal.SIGCONT)
+            proc.kill()
+            await asyncio.to_thread(proc.wait, 10)
+            proc.stdout.close()
+        handle.close()
+    (rec,) = [r for r in records.records if r.getMessage().startswith(_SIDES)]
+    assert rec.levelno == logging.INFO
+    assert re.fullmatch(r"MOQT: connection closed: idle timeout "
+                        r"peer 127\.0\.0\.1:\d+", rec.getMessage()), \
+        rec.getMessage()
