@@ -253,6 +253,21 @@ def apply_offset(parsed: dict, offset_ms: float) -> None:
     s["clock_offset_ms"] = offset_ms
 
 
+# Latency figures that depend on the pub/sub clock offset. Everything else the
+# parser emits (throughput, counts, jitter, lat_sd_ms, loss) is offset-free.
+LAT_KEYS = ("p50", "p95", "p99", "p99_9", "lat_min_ms", "lat_avg_ms", "lat_max_ms",
+            "p50_of_interval_avgs")
+
+
+def correction_ms(sub_minus_pub_us: float) -> float:
+    """Milliseconds to ADD to subscriber-measured one-way latency.
+
+    measured = rx_stamp(sub clock) - tx_stamp(pub clock) = true + (sub - pub),
+    therefore corrected = measured - (sub - pub).
+    """
+    return -float(sub_minus_pub_us) / 1000.0
+
+
 def sample_rows(parsed: dict) -> list[dict]:
     """Appendix A `samples` block: one row per interval."""
     rows = []

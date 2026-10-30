@@ -1,0 +1,666 @@
+{
+  "point_id": "R-raw",
+  "arm": "base-070rc2",
+  "topology": "R",
+  "transport": "raw",
+  "draft": 16,
+  "config": {
+    "P": 4,
+    "s": 4096,
+    "g": 200,
+    "r": 0,
+    "t": 30
+  },
+  "hosts": {
+    "relay": "shenzhen",
+    "pub": "shenzhen",
+    "load": "seawolf",
+    "subs": 1
+  },
+  "shas": {
+    "aiomoqt": "b811c16",
+    "aiomoqt_dist": "0.13.4.dev3+ged6dbdc3c",
+    "aiomoqt_dirty": false,
+    "seawolf_wheels_sha256": {
+      "aiomoqt-0.13.4.dev3+ged6dbdc3c-py3-none-any.whl": "b0b6fc4656a6f4f3256f0d82d02a31ab8132ad3f03b6ec31df66e7759f7cfe9a",
+      "aiopquic-0.7.0rc2-cp314-cp314-linux_x86_64.whl": "35a13fd69e27c60b82a727bf4254e09b4b5e120d648a032d31259669419bd31c"
+    },
+    "aiopquic": "v0.7.0rc2",
+    "aiopquic_sha": "51a80c9721609d1bc41f6debd36ae2e4f013da88",
+    "picoquic": "70b5fd5aafdd2d6c349ff783202ece9d778bcaf2",
+    "picotls": "f06553b877ada93c860dd1db9002eabf7365292d",
+    "liburing": "5227d48b28ad8671e61d444b72678da584d2e6c3",
+    "aiopquic_wheel_sha256": "35a13fd69e27c60b82a727bf4254e09b4b5e120d648a032d31259669419bd31c",
+    "python": "Python 3.14.6"
+  },
+  "env": {
+    "cc": "bbr1",
+    "jemalloc": false,
+    "gso": true,
+    "qdisc": "mq",
+    "pinning": "relay 0-1 pub 2-5 sub 0-3",
+    "clock_offset_us": null,
+    "clock_method": "tcp-peer",
+    "clock_error_us": 2301.5,
+    "clock_tolerance_us": 2000.0,
+    "fingerprint": {
+      "shenzhen": {
+        "host": "shenzhen",
+        "kernel": "6.6.87.2-microsoft-standard-WSL2",
+        "nproc": 16,
+        "governor": "n/a"
+      },
+      "seawolf": {
+        "host": "seawolf",
+        "kernel": "6.18.54.1-microsoft-standard-WSL2",
+        "nproc": 6,
+        "governor": "n/a"
+      }
+    }
+  },
+  "started_utc": "2026-10-30T18:24:14Z",
+  "duration_s": 48.023,
+  "samples": [],
+  "summary": {
+    "objects": 25550.0,
+    "groups": 128.0,
+    "bytes": 104984950.0,
+    "grp_s": 110.5,
+    "obj_s": 22060.9,
+    "mbps": 725.18,
+    "lat_min_ms": null,
+    "lat_avg_ms": null,
+    "lat_max_ms": null,
+    "lat_sd_ms": 242.1,
+    "p50": null,
+    "p95": null,
+    "p99": null,
+    "jitter_ms": 0.01,
+    "lost": 0,
+    "lost_pct": 0.0,
+    "ooo": 0,
+    "timestamps": "loc",
+    "active_s": 1.2,
+    "elapsed_s": 1.5,
+    "pub_objects": 26800.0,
+    "pub_groups": 135.0,
+    "pub_obj_s": 52826.0,
+    "pub_mbps": 1700.0,
+    "p99_9": null,
+    "cpu_pub": 2.1,
+    "cpu_sub": null,
+    "cpu_relay": 2.2,
+    "rss_max_mb": 92.2,
+    "not_measured": {
+      "p50": "clock offset moved 356572 us during the point (> 4390 us = max(tolerance, pre+post error)): one-way latency not measurable",
+      "p95": "clock offset moved 356572 us during the point (> 4390 us = max(tolerance, pre+post error)): one-way latency not measurable",
+      "p99": "clock offset moved 356572 us during the point (> 4390 us = max(tolerance, pre+post error)): one-way latency not measurable",
+      "p99_9": "clock offset moved 356572 us during the point (> 4390 us = max(tolerance, pre+post error)): one-way latency not measurable",
+      "lat_min_ms": "clock offset moved 356572 us during the point (> 4390 us = max(tolerance, pre+post error)): one-way latency not measurable",
+      "lat_avg_ms": "clock offset moved 356572 us during the point (> 4390 us = max(tolerance, pre+post error)): one-way latency not measurable",
+      "lat_max_ms": "clock offset moved 356572 us during the point (> 4390 us = max(tolerance, pre+post error)): one-way latency not measurable",
+      "p50_of_interval_avgs": "clock offset moved 356572 us during the point (> 4390 us = max(tolerance, pre+post error)): one-way latency not measurable",
+      "samples.p50": "sub_bench interval rows carry avg and p99, not p50",
+      "cpu_sub": "no /proc sample for this role/topology"
+    }
+  },
+  "artifacts": [
+    "pub.log",
+    "relay.log",
+    "sub.log",
+    "sub1.log"
+  ],
+  "meta": {
+    "schema_version": 1,
+    "run_id": "2026-10-30T18-22-25Z-smoke",
+    "rep": 1,
+    "status": "dirty",
+    "reason": "",
+    "notes": [
+      "waived pre-flight violations (smoke): shenzhen:stray_bench_process: 2 process(es) already running",
+      "latency not measured: clock offset moved 356572 us during the point (> 4390 us = max(tolerance, pre+post error)): one-way latency not measurable",
+      "waived post-flight violations (smoke): shenzhen:stray_bench_process: 2 process(es) already running; seawolf:clock_offset_jump: 179250us -> 535822us (moved 356572us > 4390us)"
+    ],
+    "arm": "base-070rc2",
+    "arm_dir": "/home/gmarzot/Projects/marzresearch/perf-sweep/arms/base-070rc2",
+    "manifest": "../manifests/smoke.yaml",
+    "point_argv": {
+      "relay": [
+        "/home/gmarzot/Projects/marzresearch/moqx/build/moqx",
+        "serve",
+        "--config",
+        "/home/gmarzot/Projects/marzresearch/perf-sweep/aiomoqt/perf/release-sweep/moqx-perf.yaml"
+      ],
+      "pub": [
+        "/home/gmarzot/Projects/marzresearch/perf-sweep/arms/base-070rc2/venv/bin/python",
+        "-P",
+        "-u",
+        "-m",
+        "aiomoqt.tools.pub_bench",
+        "moqt://10.14.25.173:9768",
+        "-N",
+        "aiomoqt",
+        "-T",
+        "track",
+        "-s",
+        "4096",
+        "-g",
+        "200",
+        "-P",
+        "4",
+        "-t",
+        "30",
+        "--draft",
+        "16",
+        "-k"
+      ],
+      "sub1": [
+        "/home/gmarzot/perf-sweep/venv/bin/python",
+        "-P",
+        "-u",
+        "-m",
+        "aiomoqt.tools.sub_bench",
+        "moqt://10.14.25.173:9768",
+        "-N",
+        "aiomoqt",
+        "-T",
+        "track",
+        "--draft",
+        "16",
+        "-k",
+        "-t",
+        "30",
+        "-i",
+        "5"
+      ]
+    },
+    "relay_probe": {
+      "argv": [
+        "/home/gmarzot/Projects/marzresearch/perf-sweep/arms/base-070rc2/venv/bin/python",
+        "-P",
+        "-u",
+        "-m",
+        "aiomoqt.tools.relay_probe",
+        "--url",
+        "moqt://10.14.25.173:9768",
+        "--draft",
+        "16",
+        "-k"
+      ],
+      "rc": 0,
+      "stdout": "moqt://10.14.25.173:9768                          QUIC   \u2713  draft-16  (128ms)\n",
+      "attempts": 1
+    },
+    "hostcheck_pre_local": {
+      "host": "SHENZHEN",
+      "ts_utc": "2026-10-30T18:24:14+00:00",
+      "qdisc": {
+        "status": "ok",
+        "root": "mq",
+        "detail": "qdisc mq 0: root \nqdisc pfifo_fast 0: parent :8 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1\nqdisc pfifo_fast 0: parent :7 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1\nqdisc pfifo_fast 0: parent :6 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1\nqdisc pfifo_fast 0: parent :5 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1\nqdisc pfifo_fast 0: parent :4 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1\nqdisc pfifo_fast 0: parent :3 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1\nqdisc pfifo_fast 0: parent :2 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1\nqdisc pfifo_fast 0: parent :1 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1"
+      },
+      "qdisc_root": null,
+      "txqueuelen": 1000,
+      "rings": {
+        "status": "unavailable"
+      },
+      "rps": {
+        "queues": {
+          "rx-0": "0000",
+          "rx-1": "0000",
+          "rx-2": "0000",
+          "rx-3": "0000",
+          "rx-4": "0000",
+          "rx-5": "0000",
+          "rx-6": "0000",
+          "rx-7": "0000"
+        },
+        "rps_flow_cnt": "0",
+        "enabled": false
+      },
+      "sysctls": {
+        "net.core.rmem_max": 212992,
+        "net.core.wmem_max": 212992,
+        "net.core.rmem_default": 212992,
+        "net.core.wmem_default": 212992,
+        "net.core.udp_mem": [
+          1152624,
+          1536833,
+          2305248
+        ],
+        "net.core.netdev_max_backlog": 1000,
+        "net.core.netdev_budget": 300,
+        "net.core.netdev_budget_usecs": 8000,
+        "net.core.optmem_max": 20480,
+        "fs.nr_open": 1048576,
+        "rlimit_nofile": 4096
+      },
+      "governor": [
+        "unavailable"
+      ],
+      "disk": {
+        "path": "/home/gmarzot/Projects/marzresearch/perf-sweep/aiomoqt/perf/release-sweep/scripts",
+        "free_gib": 736.84,
+        "total_gib": 1006.85
+      },
+      "link": {
+        "iface": "eth1",
+        "speed_mbps": 10000,
+        "carrier": "1",
+        "rx_bytes": null,
+        "tx_bytes": null
+      },
+      "steal_pct": 0.0,
+      "clock": {
+        "method": "ntp",
+        "available": true,
+        "server": "time.cloudflare.com",
+        "samples": 3,
+        "used": 3,
+        "offset_us": 94882.3,
+        "error_us": 8183.8,
+        "min_rtt_us": 16367.7
+      },
+      "llama": {
+        "checked": false
+      },
+      "abort": [
+        {
+          "rule": "stray_bench_process",
+          "detail": "2 process(es) already running"
+        }
+      ]
+    },
+    "hostcheck_post_local": {
+      "host": "SHENZHEN",
+      "ts_utc": "2026-10-30T18:24:58+00:00",
+      "qdisc": {
+        "status": "ok",
+        "root": "mq",
+        "detail": "qdisc mq 0: root \nqdisc pfifo_fast 0: parent :8 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1\nqdisc pfifo_fast 0: parent :7 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1\nqdisc pfifo_fast 0: parent :6 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1\nqdisc pfifo_fast 0: parent :5 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1\nqdisc pfifo_fast 0: parent :4 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1\nqdisc pfifo_fast 0: parent :3 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1\nqdisc pfifo_fast 0: parent :2 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1\nqdisc pfifo_fast 0: parent :1 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1"
+      },
+      "txqueuelen": 1000,
+      "rings": {
+        "status": "unavailable"
+      },
+      "rps": {
+        "queues": {
+          "rx-0": "0000",
+          "rx-1": "0000",
+          "rx-2": "0000",
+          "rx-3": "0000",
+          "rx-4": "0000",
+          "rx-5": "0000",
+          "rx-6": "0000",
+          "rx-7": "0000"
+        },
+        "rps_flow_cnt": "0",
+        "enabled": false
+      },
+      "sysctls": {
+        "net.core.rmem_max": 212992,
+        "net.core.wmem_max": 212992,
+        "net.core.rmem_default": 212992,
+        "net.core.wmem_default": 212992,
+        "net.core.udp_mem": [
+          1152624,
+          1536833,
+          2305248
+        ],
+        "net.core.netdev_max_backlog": 1000,
+        "net.core.netdev_budget": 300,
+        "net.core.netdev_budget_usecs": 8000,
+        "net.core.optmem_max": 20480,
+        "fs.nr_open": 1048576,
+        "rlimit_nofile": 4096
+      },
+      "governor": [
+        "unavailable"
+      ],
+      "disk": {
+        "path": "/home/gmarzot/Projects/marzresearch/perf-sweep/aiomoqt/perf/release-sweep/scripts",
+        "free_gib": 736.82,
+        "total_gib": 1006.85
+      },
+      "link": {
+        "iface": "eth1",
+        "speed_mbps": 10000,
+        "carrier": "1",
+        "rx_bytes": null,
+        "tx_bytes": null
+      },
+      "steal_pct": 0.0,
+      "clock": {
+        "method": "ntp",
+        "available": true,
+        "server": "time.cloudflare.com",
+        "samples": 3,
+        "used": 1,
+        "offset_us": 435718.1,
+        "error_us": 6883.1,
+        "min_rtt_us": 13766.3
+      },
+      "llama": {
+        "checked": false
+      },
+      "abort": [
+        {
+          "rule": "stray_bench_process",
+          "detail": "2 process(es) already running"
+        }
+      ]
+    },
+    "hostcheck_pre_remote": {
+      "ok": true,
+      "host": "SeaWolf",
+      "ts_utc": "2026-10-30T18:24:16+00:00",
+      "uname": "6.18.54.1-microsoft-standard-WSL2",
+      "nproc": 6,
+      "iface": "eth0",
+      "qdisc": {
+        "status": "ok",
+        "root": "mq",
+        "detail": "qdisc mq 0: root \nqdisc pfifo_fast 0: parent :6 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1\nqdisc pfifo_fast 0: parent :5 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1\nqdisc pfifo_fast 0: parent :4 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1\nqdisc pfifo_fast 0: parent :3 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1\nqdisc pfifo_fast 0: parent :2 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1\nqdisc pfifo_fast 0: parent :1 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1"
+      },
+      "txqueuelen": 1000,
+      "rings": {
+        "status": "ok",
+        "max": {
+          "RX": 18139,
+          "TX": 2560
+        },
+        "current": {
+          "RX": 9362,
+          "TX": 170
+        }
+      },
+      "rps": {
+        "queues": {
+          "rx-0": "00",
+          "rx-1": "00",
+          "rx-2": "00",
+          "rx-3": "00",
+          "rx-4": "00",
+          "rx-5": "00"
+        },
+        "rps_flow_cnt": "0",
+        "enabled": false
+      },
+      "sysctls": {
+        "net.core.rmem_max": 4194304,
+        "net.core.wmem_max": 4194304,
+        "net.core.rmem_default": 212992,
+        "net.core.wmem_default": 212992,
+        "net.core.udp_mem": [
+          670992,
+          894656,
+          1341984
+        ],
+        "net.core.netdev_max_backlog": 1000,
+        "net.core.netdev_budget": 300,
+        "net.core.netdev_budget_usecs": 8000,
+        "net.core.optmem_max": 131072,
+        "fs.nr_open": 1048576,
+        "rlimit_nofile": 1024
+      },
+      "governor": [
+        "unavailable"
+      ],
+      "disk": {
+        "path": "/home/gmarzot",
+        "free_gib": 790.82,
+        "total_gib": 1006.85
+      },
+      "link": {
+        "iface": "eth0",
+        "speed_mbps": 10000,
+        "carrier": "1",
+        "rx_bytes": null,
+        "tx_bytes": null
+      },
+      "bench_procs": [],
+      "llama": {
+        "url": "http://127.0.0.1:8080",
+        "reachable": true,
+        "slots": 1,
+        "busy": false,
+        "busy_slots": []
+      },
+      "steal_pct": 0.0,
+      "clock": {
+        "method": "tcp-peer",
+        "peer": "10.14.25.173:9876",
+        "available": true,
+        "samples": 20,
+        "used": 20,
+        "offset_us": -179249.8,
+        "error_us": 2301.5,
+        "min_rtt_us": 4602.9
+      },
+      "abort": [],
+      "baseline": null,
+      "_exit_code": 0
+    },
+    "hostcheck_post_remote": {
+      "ok": true,
+      "host": "SeaWolf",
+      "ts_utc": "2026-10-30T18:25:00+00:00",
+      "uname": "6.18.54.1-microsoft-standard-WSL2",
+      "nproc": 6,
+      "iface": "eth0",
+      "qdisc": {
+        "status": "ok",
+        "root": "mq",
+        "detail": "qdisc mq 0: root \nqdisc pfifo_fast 0: parent :6 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1\nqdisc pfifo_fast 0: parent :5 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1\nqdisc pfifo_fast 0: parent :4 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1\nqdisc pfifo_fast 0: parent :3 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1\nqdisc pfifo_fast 0: parent :2 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1\nqdisc pfifo_fast 0: parent :1 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1"
+      },
+      "txqueuelen": 1000,
+      "rings": {
+        "status": "ok",
+        "max": {
+          "RX": 18139,
+          "TX": 2560
+        },
+        "current": {
+          "RX": 9362,
+          "TX": 170
+        }
+      },
+      "rps": {
+        "queues": {
+          "rx-0": "00",
+          "rx-1": "00",
+          "rx-2": "00",
+          "rx-3": "00",
+          "rx-4": "00",
+          "rx-5": "00"
+        },
+        "rps_flow_cnt": "0",
+        "enabled": false
+      },
+      "sysctls": {
+        "net.core.rmem_max": 4194304,
+        "net.core.wmem_max": 4194304,
+        "net.core.rmem_default": 212992,
+        "net.core.wmem_default": 212992,
+        "net.core.udp_mem": [
+          670992,
+          894656,
+          1341984
+        ],
+        "net.core.netdev_max_backlog": 1000,
+        "net.core.netdev_budget": 300,
+        "net.core.netdev_budget_usecs": 8000,
+        "net.core.optmem_max": 131072,
+        "fs.nr_open": 1048576,
+        "rlimit_nofile": 1024
+      },
+      "governor": [
+        "unavailable"
+      ],
+      "disk": {
+        "path": "/home/gmarzot",
+        "free_gib": 790.82,
+        "total_gib": 1006.85
+      },
+      "link": {
+        "iface": "eth0",
+        "speed_mbps": 10000,
+        "carrier": "1",
+        "rx_bytes": null,
+        "tx_bytes": null
+      },
+      "bench_procs": [],
+      "llama": {
+        "url": "http://127.0.0.1:8080",
+        "reachable": true,
+        "slots": 1,
+        "busy": false,
+        "busy_slots": []
+      },
+      "steal_pct": 0.0,
+      "clock": {
+        "method": "tcp-peer",
+        "peer": "10.14.25.173:9876",
+        "available": true,
+        "samples": 20,
+        "used": 20,
+        "offset_us": -535821.7,
+        "error_us": 2088.3,
+        "min_rtt_us": 4176.6
+      },
+      "abort": [],
+      "baseline": null,
+      "_exit_code": 0
+    },
+    "strays": {
+      "shenzhen": [],
+      "seawolf": []
+    },
+    "orphans": {
+      "shenzhen": [],
+      "seawolf": []
+    },
+    "foreign_bench_procs": {
+      "shenzhen": [],
+      "seawolf": []
+    },
+    "smoke": true,
+    "waived_violations": [
+      {
+        "host": "shenzhen",
+        "rule": "stray_bench_process",
+        "detail": "2 process(es) already running"
+      },
+      {
+        "host": "shenzhen",
+        "rule": "stray_bench_process",
+        "detail": "2 process(es) already running"
+      },
+      {
+        "host": "seawolf",
+        "rule": "clock_offset_jump",
+        "detail": "179250us -> 535822us (moved 356572us > 4390us)"
+      }
+    ],
+    "proc_stats": {
+      "relay": {
+        "cpu_s": 0.74,
+        "age_s": 34.37,
+        "cpu_pct": 2.2,
+        "rss_hwm_mb": 92.2,
+        "host": "shenzhen",
+        "pid": 172226
+      },
+      "pub": {
+        "cpu_s": 0.7,
+        "age_s": 34.1,
+        "cpu_pct": 2.1,
+        "rss_hwm_mb": null,
+        "host": "shenzhen",
+        "pid": 172237
+      }
+    },
+    "not_measured": {
+      "p50": "clock offset moved 356572 us during the point (> 4390 us = max(tolerance, pre+post error)): one-way latency not measurable",
+      "p95": "clock offset moved 356572 us during the point (> 4390 us = max(tolerance, pre+post error)): one-way latency not measurable",
+      "p99": "clock offset moved 356572 us during the point (> 4390 us = max(tolerance, pre+post error)): one-way latency not measurable",
+      "p99_9": "clock offset moved 356572 us during the point (> 4390 us = max(tolerance, pre+post error)): one-way latency not measurable",
+      "lat_min_ms": "clock offset moved 356572 us during the point (> 4390 us = max(tolerance, pre+post error)): one-way latency not measurable",
+      "lat_avg_ms": "clock offset moved 356572 us during the point (> 4390 us = max(tolerance, pre+post error)): one-way latency not measurable",
+      "lat_max_ms": "clock offset moved 356572 us during the point (> 4390 us = max(tolerance, pre+post error)): one-way latency not measurable",
+      "p50_of_interval_avgs": "clock offset moved 356572 us during the point (> 4390 us = max(tolerance, pre+post error)): one-way latency not measurable",
+      "samples.p50": "sub_bench interval rows carry avg and p99, not p50",
+      "cpu_sub": "no /proc sample for this role/topology"
+    },
+    "latency_corrected": false,
+    "clock": {
+      "convention": "w_minus_s_us = seawolf clock - shenzhen clock; corrected latency = measured - (sub clock - pub clock)",
+      "pre": {
+        "w_minus_s_us": 179249.8,
+        "error_us": 2301.5,
+        "min_rtt_us": 4602.9,
+        "samples": 20,
+        "used": 20,
+        "peer": "10.14.25.173:9876"
+      },
+      "post": {
+        "w_minus_s_us": 535821.7,
+        "error_us": 2088.3,
+        "min_rtt_us": 4176.6,
+        "samples": 20,
+        "used": 20,
+        "peer": "10.14.25.173:9876"
+      },
+      "sub_minus_pub_us": null,
+      "applied_correction_ms": null,
+      "latency_why": "clock offset moved 356572 us during the point (> 4390 us = max(tolerance, pre+post error)): one-way latency not measurable",
+      "ntp_shenzhen": {
+        "method": "ntp",
+        "available": true,
+        "server": "time.cloudflare.com",
+        "samples": 3,
+        "used": 3,
+        "offset_us": 94882.3,
+        "error_us": 8183.8,
+        "min_rtt_us": 16367.7
+      }
+    },
+    "diagnostics": {
+      "raw_latency_uncorrected_do_not_quote": {
+        "p50": 1032.5,
+        "p95": 1098.9,
+        "p99": 1103.9,
+        "lat_min_ms": 354.4,
+        "lat_avg_ms": 872.9,
+        "lat_max_ms": 1111.3
+      }
+    },
+    "config_fingerprint": {
+      "arm": "base-070rc2",
+      "transport": "raw",
+      "draft": 16,
+      "config": {
+        "P": 4,
+        "s": 4096,
+        "g": 200,
+        "r": 0
+      },
+      "duration_s": 30,
+      "subs": 1,
+      "video": null
+    },
+    "sweep_version": "1.0",
+    "hosts": {
+      "shenzhen": {
+        "local": true,
+        "ssh": "shenzhen",
+        "root": "/home/gmarzot/Projects/marzresearch/perf-sweep"
+      },
+      "seawolf": {
+        "local": false,
+        "ssh": "seawolf",
+        "root": "/home/gmarzot/perf-sweep"
+      }
+    }
+  }
+}

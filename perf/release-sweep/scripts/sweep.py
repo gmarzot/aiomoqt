@@ -164,13 +164,17 @@ class Host:
         return out
 
     # -- execution ---------------------------------------------------------
-    def _ssh_prefix(self) -> list[str]:
+    def _ssh_prefix(self, no_stdin: bool = True) -> list[str]:
         # No ControlMaster here: a persistent master inherits the calling
         # ssh's stdout/stderr pipes, so subprocess capture never sees EOF and
         # every call blocks until its timeout.
+        # `-n` is only safe when nothing is piped in: hostcheck.py is shipped to
+        # the remote end *on stdin*, so `-n` made ssh read /dev/null instead and
+        # the remote `python3 -` ran an empty program -- hostcheck then reported
+        # nothing at all (ok=false, empty error, exit 0).
         return [
             "ssh",
-            "-n",
+            *(["-n"] if no_stdin else []),
             "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=5",
             "-o", "ServerAliveInterval=5",
@@ -187,7 +191,7 @@ class Host:
             )
         else:
             p = subprocess.run(
-                self._ssh_prefix() + [cmd],
+                self._ssh_prefix(no_stdin=input_bytes is None) + [cmd],
                 capture_output=True, timeout=timeout, input=input_bytes,
                 # ssh without a stdin redirection reads the caller's stdin and
                 # forwards it to the remote command, so the session only closes
@@ -222,7 +226,7 @@ class Host:
         cmd = (
             f"mkdir -p {shlex.quote(logdir_remote or '/tmp')} && "
             f"cd {shlex.quote(str(self.root))} && "
-            f"nohup setsid {inner} >> {shlex.quote(remote_log)} 2>&1 < /dev/null & echo $!"
+            f"{{ nohup setsid {inner} >> {shlex.quote(remote_log)} 2>&1 < /dev/null & echo $!; }}"
         )
         # The backgrounded child keeps the ssh channel open until it exits, so a
         # plain blocking run() would sit here for the whole measurement window
@@ -388,6 +392,12 @@ def url_for(host_addr: str, port: int, transport: str, path: str = "") -> str:
     return f"moqt://{host_addr}:{port}"
 
 
+def _resolve_relay_path(path) -> Path:
+    """Relay argv inherits the caller's cwd, so pin relative paths to the repo."""
+    p = Path(str(path))
+    return p if p.is_absolute() else (REPO / p)
+
+
 def build_steps(p: dict, hosts: dict[str, Host], relay: dict) -> list[dict]:
     """Return the ordered step list for a point.
 
@@ -453,7 +463,7 @@ def build_steps(p: dict, hosts: dict[str, Host], relay: dict) -> list[dict]:
             "role": "relay", "host": host_name, "bg": True, "delay_s": 0.0,
             "kind": "relay", "wait_port": relay_port,
             "argv": [str(relay.get("binary", "/home/gmarzot/Projects/marzresearch/moqx/build/moqx")),
-                     "serve", "--config", str(relay.get("config", RS / "moqx-perf.yaml"))],
+                     "serve", "--config", str(_resolve_relay_path(relay.get("config", RS / "moqx-perf.yaml")))],
         }
 
     if topo == "L":
@@ -547,20 +557,68 @@ def run_hostcheck(host: Host, *, samples: int, require: bool, guard_llama: bool,
     return payload
 
 
-def abort_reasons(pre: dict, post: dict | None, clock_tol_us: float) -> list[dict]:
-    reasons = list(pre.get("abort") or [])
-    if post:
-        reasons += list(post.get("abort") or [])
-        a = (pre.get("clock") or {}).get("offset_us")
-        b = (post.get("clock") or {}).get("offset_us")
-        if a is not None and b is not None and abs(b - a) > clock_tol_us:
-            reasons.append({"rule": "clock_offset_jump",
-                            "detail": f"{a}us -> {b}us (> {clock_tol_us}us)"})
-        qa = (pre.get("qdisc") or {}).get("root")
-        qb = (post.get("qdisc") or {}).get("root")
-        if qa and qb and qa != qb:
-            reasons.append({"rule": "qdisc_changed", "detail": f"{qa} -> {qb}"})
-    return reasons
+CLK_TCK = 100  # getconf CLK_TCK, verified on both hosts
+
+
+def tag_reasons(host: str, reasons) -> list[dict]:
+    return [{"host": host, **r} for r in (reasons or [])]
+
+
+def _reusable(existing: dict, args) -> bool:
+    """A prior result may be skipped on re-run only if it was clean ('ok'); a
+    'dirty' (waived-violation) result is reusable for smoke runs only."""
+    st = (existing.get("meta") or {}).get("status")
+    return st == "ok" or (st == "dirty" and bool(args.smoke))
+
+
+def cross_clock(hc: dict | None) -> dict | None:
+    """seawolf-minus-shenzhen clock offset from a seawolf-side tcp-peer probe.
+
+    The probe runs on seawolf against the responder on shenzhen, so hostcheck's
+    raw offset is (shenzhen - seawolf); negate it. None means *not measured*.
+    """
+    c = (hc or {}).get("clock") or {}
+    if c.get("method") != "tcp-peer" or not c.get("available") or c.get("offset_us") is None:
+        return None
+    return {"w_minus_s_us": -float(c["offset_us"]), "error_us": float(c.get("error_us") or 0.0),
+            "min_rtt_us": c.get("min_rtt_us"), "samples": c.get("samples"),
+            "used": c.get("used"), "peer": c.get("peer")}
+
+
+def proc_sample(host: "Host", pid: int) -> dict | None:
+    """CPU seconds, age and peak RSS of one pid from /proc (None if it is gone)."""
+    rc, out = host.run(f"cat /proc/{pid}/stat /proc/uptime 2>/dev/null; "
+                       f"grep -E '^VmHWM' /proc/{pid}/status 2>/dev/null", timeout=15)
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    if len(lines) < 2 or ") " not in lines[0]:
+        return None
+    try:
+        f = lines[0].rsplit(") ", 1)[1].split()
+        cpu_s = (int(f[11]) + int(f[12])) / CLK_TCK
+        age = float(lines[1].split()[0]) - int(f[19]) / CLK_TCK
+        hwm = (int(lines[2].split()[1]) / 1024.0
+               if len(lines) > 2 and lines[2].startswith("VmHWM") else None)
+    except (ValueError, IndexError):
+        return None
+    return {"cpu_s": round(cpu_s, 2), "age_s": round(age, 2),
+            "cpu_pct": round(100.0 * cpu_s / age, 1) if age > 0 else None,
+            "rss_hwm_mb": round(hwm, 1) if hwm else None}
+
+
+def start_clock_responder(host: "Host", run_root: Path, peer: str) -> dict:
+    """TCP clock responder on shenzhen; seawolf probes it (pre/post each point)."""
+    port = int(peer.rpartition(":")[2])
+    info = host.start("clockd", [sys.executable, str(HOSTCHECK), "serve-time", "--port", str(port)],
+                      run_root / "clockd.log", pin=None)
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        rc, out = host.run(f"ss -ltnH 2>/dev/null | grep -c ':{port} '", timeout=5)
+        last = out.strip().splitlines()[-1].strip() if out.strip() else ""
+        if last.isdigit() and int(last) > 0:
+            return info
+        time.sleep(0.2)
+    host.kill(info["pid"], grace=1.0)
+    raise RuntimeError(f"clock responder did not listen on tcp/{port}")
 
 
 # --------------------------------------------------------------------------
@@ -575,29 +633,53 @@ def run_point(p: dict, *, hosts: dict[str, Host], relay: dict, arm: str, arm_dir
     t0 = time.time()
     notes: list[str] = []
     procs: list[dict] = []
+    proc_stats: dict[str, dict] = {}
     status = "ok"
     reason = ""
 
     # --- pre-flight -------------------------------------------------------
+    # shenzhen: local state + NTP (secondary: absolute-time sanity only).
+    # seawolf : state + llama.cpp guard + the cross-host TCP clock probe against the
+    #           responder this sweep runs on shenzhen (the primary clock source).
     pre_local = run_hostcheck(hosts["shenzhen"], samples=min(3, args.hostcheck_samples),
-                              require=False, guard_llama=False, peer=args.clock_peer, iface=args.iface)
+                              require=False, guard_llama=False, peer=None, iface=args.iface)
     pre_remote = None
     if not hosts["seawolf"].local:
-        pre_remote = run_hostcheck(hosts["seawolf"], samples=min(3, args.hostcheck_samples),
-                                   require=False, guard_llama=True, peer=None, iface=args.iface)
+        pre_remote = run_hostcheck(hosts["seawolf"], samples=args.hostcheck_samples,
+                                   require=False, guard_llama=True, peer=args.clock_peer,
+                                   iface=args.iface)
     write_json_atomic(rep_dir / "hostcheck-pre-local.json", pre_local)
     if pre_remote is not None:
         write_json_atomic(rep_dir / "hostcheck-pre-remote.json", pre_remote)
 
-    pre_abort = abort_reasons(pre_local, None, args.clock_tolerance_us)
-    if pre_abort or pre_local.get("_exit_code") not in (0,) or pre_remote and pre_remote.get("_exit_code") not in (0,):
+    pre_abort = tag_reasons("shenzhen", pre_local.get("abort"))
+    if pre_remote is not None:
+        pre_abort += tag_reasons("seawolf", pre_remote.get("abort"))
+    waived_pre = [a for a in pre_abort if a["rule"] in args.waive]
+    blocking_pre = [a for a in pre_abort if a["rule"] not in args.waive]
+    hc_failed = (pre_local.get("_exit_code") not in (0,)
+                 or (pre_remote is not None and pre_remote.get("_exit_code") not in (0,)))
+    if blocking_pre or hc_failed:
         status = "aborted_pre"
-        reason = "; ".join(f"{a['rule']}: {a.get('detail', '')}" for a in pre_abort) or "hostcheck exit != 0"
+        reason = ("; ".join(f"{a['host']}:{a['rule']}: {a.get('detail', '')}" for a in blocking_pre)
+                  or "hostcheck exit != 0")
         notes.append(f"pre-flight abort: {reason}")
 
-    clock = (pre_local.get("clock") or {})
-    offset_us = clock.get("offset_us") or 0
-    offset_ms = float(offset_us) / 1000.0
+    clk_pre = cross_clock(pre_remote)
+    steps0 = build_steps(p, hosts, relay)
+    need_clock = len({s["host"] for s in steps0 if s["kind"] in ("pub", "sub")}) > 1
+    if need_clock and clk_pre is None:
+        miss = {"host": "seawolf", "rule": "clock_unavailable",
+                "detail": f"tcp clock probe to {args.clock_peer} failed"}
+        if "clock_unavailable" in args.waive:
+            waived_pre.append(miss)
+        elif status == "ok":
+            status = "aborted_pre"
+            reason = f"seawolf:clock_unavailable: {miss['detail']}"
+            notes.append(f"pre-flight abort: {reason}")
+    if waived_pre:
+        notes.append("waived pre-flight violations (smoke): " +
+                     "; ".join(f"{a['host']}:{a['rule']}: {a.get('detail', '')}" for a in waived_pre))
 
     steps = build_steps(p, hosts, relay)
     argv_record = {}
@@ -605,9 +687,50 @@ def run_point(p: dict, *, hosts: dict[str, Host], relay: dict, arm: str, arm_dir
         host = hosts[s["host"]]
         argv_record.setdefault(s["role"], host.expand(s["argv"], arm))
 
-    # --- relay probe (relay topologies only) ------------------------------
+    # --- relay: start, wait for bind, then probe --------------------------
+    # relay_probe used to run before anything was listening, so every R point
+    # aborted with "connection refused" and looked like a network fault. Start
+    # the relay, wait for its socket, and only then let the probe (and the
+    # load) reach it.
+    remote_logs: dict[str, str] = {}
+    remote_host_of: dict[str, str] = {}
+    started_roles: set[str] = set()
+
+    def pin_for(s: dict):
+        pins = p["pin"] or {}
+        if s.get("run_for_s") and not s["bg"]:
+            return pins.get("sub")
+        return pins.get("pub" if s["kind"] == "pub" else "relay")
+
+    def start_bg(s: dict) -> dict:
+        host = hosts[s["host"]]
+        argv = host.expand(s["argv"], arm)
+        argv_record[s["role"]] = argv
+        if host.local:
+            info = host.start(s["role"], argv, rep_dir / f"{s['role']}.log", pin=pin_for(s))
+        else:
+            logdir = f"{host.root}/runs/{run_root.name}/{point_id}/rep-{rep:02d}"
+            host.run(f"mkdir -p {shlex.quote(logdir)}", timeout=20)
+            info = host.start(s["role"], argv, None, pin=pin_for(s), logdir_remote=logdir)
+            remote_logs[s["role"]] = info["log"]
+            remote_host_of[s["role"]] = s["host"]
+        procs.append(info)
+        vlog(f"{point_id}: {s['role']} started pid={info['pid']} log={info['log']}")
+        return info
+
     relay_probe = None
-    if status == "ok" and any(s["kind"] == "relay" for s in steps):
+    if status == "ok":
+        for s in [x for x in steps if x["kind"] == "relay"]:
+            start_bg(s)
+            started_roles.add(s["role"])
+            if s.get("wait_port") and not hosts[s["host"]].wait_udp_port(
+                    int(s["wait_port"]), timeout=args.start_timeout):
+                status = "aborted_pre"
+                reason = f"{s['role']} did not listen on udp/{s['wait_port']}"
+                notes.append(reason)
+                break
+
+    if status == "ok" and started_roles:
         probe_url = url_for(p.get("relay_addr") or relay.get("addr") or "10.14.25.173",
                             int(relay.get("port", 9768)), p["transport"], relay.get("wt_path", ""))
         probe_argv = hosts["shenzhen"].expand(
@@ -629,13 +752,19 @@ def run_point(p: dict, *, hosts: dict[str, Host], relay: dict, arm: str, arm_dir
             reason = f"relay_probe failed rc={rc} after {attempts} attempts"
             notes.append(reason)
 
+    if status != "ok" and procs:
+        # A relay this point started must not outlive an aborted point.
+        for info in reversed(procs):
+            hosts[info["host"]].kill(info["pid"], grace=args.kill_grace)
+        procs.clear()
+
     # --- run --------------------------------------------------------------
-    remote_logs: dict[str, str] = {}
-    remote_host_of: dict[str, str] = {}
     if status == "ok":
         deadline = time.time() + float(p["duration_s"]) + float(p["warmup_s"]) + args.timeout_margin
         try:
             for s in steps:
+                if s["role"] in started_roles:
+                    continue
                 host = hosts[s["host"]]
                 argv = host.expand(s["argv"], arm)
                 argv_record[s["role"]] = argv
@@ -661,14 +790,26 @@ def run_point(p: dict, *, hosts: dict[str, Host], relay: dict, arm: str, arm_dir
                     # sleep out the window instead of polling liveness: a remote
                     # liveness probe is an ssh round-trip and would dominate the
                     # window (and starve the per-point watchdog).
-                    while time.time() < t_end:
-                        time.sleep(min(0.5, max(0.0, t_end - time.time())))
+                    while time.time() < t_end - 6.0:
+                        time.sleep(min(0.5, max(0.0, t_end - 6.0 - time.time())))
+                    # The subscriber self-exits via -t shortly before the window ends, so sample
+                    # everything once while it is alive and again at the very end (a process
+                    # that is gone keeps its earlier sample).
+                    for sample_pass in (1, 2):
+                        for r_info in procs:
+                            smp = proc_sample(hosts[r_info["host"]], r_info["pid"])
+                            if smp:
+                                proc_stats[r_info["role"]] = {**smp, "host": r_info["host"],
+                                                              "pid": r_info["pid"]}
+                        if sample_pass == 1:
+                            while time.time() < t_end:
+                                time.sleep(min(0.5, max(0.0, t_end - time.time())))
                     try:
                         still_alive = host.alive(info["pid"])
                     except subprocess.TimeoutExpired:
                         still_alive = True
                     if not still_alive:
-                        notes.append(f"{s['role']} exited before window end")
+                        vlog(f"{point_id}: {s['role']} had already exited at window end (self-terminated via -t)")
                     grace = max(args.kill_grace, float(s.get("kill_grace_s") or 0))
                     rc = host.kill(info["pid"], grace=grace, sig=signal.SIGINT)
                     vlog(f"{point_id}: {s['role']} interrupted rc={rc}")
@@ -742,25 +883,92 @@ def run_point(p: dict, *, hosts: dict[str, Host], relay: dict, arm: str, arm_dir
 
     # --- post-flight ------------------------------------------------------
     post_local = run_hostcheck(hosts["shenzhen"], samples=min(3, args.hostcheck_samples), require=False,
-                               guard_llama=False, peer=args.clock_peer, iface=args.iface)
+                               guard_llama=False, peer=None, iface=args.iface)
     write_json_atomic(rep_dir / "hostcheck-post-local.json", post_local)
     post_remote = None
     if not hosts["seawolf"].local:
-        post_remote = run_hostcheck(hosts["seawolf"], samples=min(3, args.hostcheck_samples), require=False,
-                                    guard_llama=True, peer=None, iface=args.iface)
+        post_remote = run_hostcheck(hosts["seawolf"], samples=args.hostcheck_samples, require=False,
+                                    guard_llama=True, peer=args.clock_peer, iface=args.iface)
         write_json_atomic(rep_dir / "hostcheck-post-remote.json", post_remote)
-    post_abort = abort_reasons(post_local, pre_local, args.clock_tolerance_us)
-    if post_abort and status == "ok":
-        status = "aborted_post"
-        reason = "; ".join(f"{a['rule']}: {a.get('detail', '')}" for a in post_abort)
-        notes.append(f"post-flight abort: {reason}")
+    clk_post = cross_clock(post_remote)
 
-    # --- strays -----------------------------------------------------------
+    # --- cross-host clock: correction + validity --------------------------
+    # measured = rx_stamp(sub clock) - tx_stamp(pub clock) = true + (sub - pub), so
+    # corrected = measured - (sub - pub). One clock (same host) needs no correction.
+    lat_hosts = {s["host"] for s in steps if s["kind"] in ("pub", "sub")}
+    sub_host = next((s["host"] for s in steps if s["kind"] == "sub"), None)
+    latency_ok, latency_why = True, ""
+    sub_minus_pub_us = None
+    clk_jump = None
+    if len(lat_hosts) <= 1:
+        sub_minus_pub_us = 0.0
+    elif clk_pre is None or clk_post is None:
+        latency_ok = False
+        latency_why = ("cross-host clock offset not measured ("
+                       + ("pre" if clk_pre is None else "post") + " probe failed)")
+    else:
+        sign = 1.0 if sub_host == "seawolf" else -1.0
+        ca, cb = clk_pre["w_minus_s_us"], clk_post["w_minus_s_us"]
+        jump = abs(cb - ca)
+        thr = max(float(args.clock_tolerance_us), clk_pre["error_us"] + clk_post["error_us"])
+        if jump > thr:
+            latency_ok = False
+            latency_why = (f"clock offset moved {jump:.0f} us during the point (> {thr:.0f} us "
+                           f"= max(tolerance, pre+post error)): one-way latency not measurable")
+            clk_jump = {"host": "seawolf", "rule": "clock_offset_jump",
+                        "detail": f"{ca:.0f}us -> {cb:.0f}us (moved {jump:.0f}us > {thr:.0f}us)"}
+        else:
+            sub_minus_pub_us = sign * (ca + cb) / 2.0
+    offset_us = sub_minus_pub_us
+    offset_ms = (-sub_minus_pub_us / 1000.0) if (latency_ok and sub_minus_pub_us) else 0.0
+    if not latency_ok:
+        notes.append(f"latency not measured: {latency_why}")
+
+    post_abort = tag_reasons("shenzhen", post_local.get("abort"))
+    if post_remote is not None:
+        post_abort += tag_reasons("seawolf", post_remote.get("abort"))
+    qa = (pre_local.get("qdisc") or {}).get("root")
+    qb = (post_local.get("qdisc") or {}).get("root")
+    if qa and qb and qa != qb:
+        post_abort.append({"host": "shenzhen", "rule": "qdisc_changed", "detail": f"{qa} -> {qb}"})
+    if clk_jump:
+        post_abort.append(clk_jump)
+    waived_post = [a for a in post_abort if a["rule"] in args.waive]
+    blocking_post = [a for a in post_abort if a["rule"] not in args.waive]
+    if blocking_post and status == "ok":
+        status = "aborted_post"
+        reason = "; ".join(f"{a['host']}:{a['rule']}: {a.get('detail', '')}" for a in blocking_post)
+        notes.append(f"post-flight abort: {reason}")
+    if waived_post:
+        notes.append("waived post-flight violations (smoke): " +
+                     "; ".join(f"{a['host']}:{a['rule']}: {a.get('detail', '')}" for a in waived_post))
+    all_waived = waived_pre + waived_post
+
+    # --- strays / orphans -------------------------------------------------
+    # 'orphan' = a bench process running OUR arm interpreter that outlived the
+    # point (killed here). Everything else matching a bench pattern belongs to
+    # another job on the host: recorded, never touched.
+    for info in procs:
+        h = hosts[info["host"]]
+        if h.alive(info["pid"]):
+            notes.append(f"{info['role']} pid {info['pid']} still alive after kill; SIGKILL")
+            h.kill(info["pid"], grace=1.0, sig=signal.SIGKILL)
+            if status == "ok":
+                status = "dirty"
+    own_py = {n: h.expand(["{python}"], arm)[0] for n, h in hosts.items()}
     strays = {"shenzhen": hosts["shenzhen"].stray_procs()}
     if not hosts["seawolf"].local:
         strays["seawolf"] = hosts["seawolf"].stray_procs()
-    if any(strays.values()):
-        notes.append(f"stray bench processes after point: {strays}")
+    orphans = {n: [ln for ln in lines if own_py[n] in ln] for n, lines in strays.items()}
+    foreign = {n: [ln for ln in lines if own_py[n] not in ln] for n, lines in strays.items()}
+    for n, lines in orphans.items():
+        for ln in lines:
+            try:
+                hosts[n].kill(int(ln.split()[0]), grace=args.kill_grace)
+            except Exception as exc:  # noqa: BLE001
+                notes.append(f"orphan kill failed on {n}: {exc}")
+    if any(orphans.values()):
+        notes.append(f"ORPHAN bench processes after point (killed): {orphans}")
         if status == "ok":
             status = "dirty"
 
@@ -789,6 +997,60 @@ def run_point(p: dict, *, hosts: dict[str, Host], relay: dict, arm: str, arm_dir
         reason = "no parsed summary from sub log"
         notes.append(reason)
 
+    # --- finalize summary: Appendix A completeness, nothing implied ---------
+    nm: dict[str, str] = {}
+    raw_latency = {k: summary.get(k) for k in _collect.LAT_KEYS if k in summary}
+    if not latency_ok:
+        for k in _collect.LAT_KEYS:
+            if k in summary:
+                summary[k] = None
+            nm[k] = latency_why
+        for row in samples:
+            for k in ("lat_ms", "p99"):
+                if k in row:
+                    row[k] = None
+    for row in samples:
+        row.setdefault("p50", None)
+    nm.setdefault("p99_9", "sub_bench reports p50/p95/p99 only; no p99.9 on this branch")
+    summary.setdefault("p99_9", None)
+    nm["samples.p50"] = "sub_bench interval rows carry avg and p99, not p50"
+
+    def _cpu(prefix: str):
+        vals = [v["cpu_pct"] for r, v in proc_stats.items()
+                if r.startswith(prefix) and v.get("cpu_pct") is not None]
+        return round(max(vals), 1) if vals else None
+
+    summary["cpu_pub"] = _cpu("pub")
+    summary["cpu_sub"] = _cpu("sub")
+    summary["cpu_relay"] = _cpu("relay")
+    rss = [v["rss_hwm_mb"] for v in proc_stats.values() if v.get("rss_hwm_mb")]
+    summary["rss_max_mb"] = round(max(rss), 1) if rss else None
+    for k in ("cpu_pub", "cpu_sub", "rss_max_mb"):
+        if summary[k] is None:
+            nm[k] = "no /proc sample for this role/topology"
+    if summary["cpu_relay"] is None:
+        summary.pop("cpu_relay")
+    summary["not_measured"] = nm
+    exp_s = float(p["duration_s"])
+    el_s = summary.get("elapsed_s")
+    if status in ("ok", "dirty") and el_s is not None and float(el_s) < 0.8 * exp_s:
+        status = "failed"
+        reason = (f"short run: subscriber measured {float(el_s):.1f}s of {exp_s:.0f}s "
+                  f"(see sub.log / relay.log)")
+        notes.append(reason)
+    if status == "ok" and all_waived:
+        status = "dirty"
+
+    remote_wheel_sha = None
+    if not hosts["seawolf"].local:
+        try:
+            _rc, _o = hosts["seawolf"].run(
+                f"sha256sum {shlex.quote(str(hosts['seawolf'].root))}/wheels/*.whl", timeout=20)
+            remote_wheel_sha = {Path(ln.split()[1]).name: ln.split()[0]
+                                for ln in _o.splitlines() if len(ln.split()) == 2}
+        except Exception as exc:  # noqa: BLE001
+            notes.append(f"seawolf wheel sha256 not recorded: {exc}")
+
     wheel = arm_dir / "wheels"
     arm_meta = load_json(arm_dir / "arm.json", {}) or {}
     aiopquic_whl = sorted(wheel.glob("aiopquic-*.whl")) if wheel.exists() else []
@@ -806,7 +1068,13 @@ def run_point(p: dict, *, hosts: dict[str, Host], relay: dict, arm: str, arm_dir
         "shas": {
             "aiomoqt": args.aiomoqt_sha,
             "aiomoqt_dist": args.aiomoqt_dist,
-            "aiopquic": arm_meta.get("aiopquic", "unknown"),
+            "aiomoqt_dirty": args.aiomoqt_dirty,
+            "seawolf_wheels_sha256": remote_wheel_sha,
+            "aiopquic": arm_meta.get("aiopquic_describe") or arm_meta.get("ref") or "unknown",
+            "aiopquic_sha": arm_meta.get("aiopquic_sha"),
+            "picoquic": arm_meta.get("picoquic_sha"),
+            "picotls": arm_meta.get("picotls_sha"),
+            "liburing": arm_meta.get("liburing_sha"),
             "aiopquic_wheel_sha256": sha256_file(aiopquic_whl[0]) if aiopquic_whl else None,
             "python": (arm_meta.get("python") or ""),
         },
@@ -816,9 +1084,10 @@ def run_point(p: dict, *, hosts: dict[str, Host], relay: dict, arm: str, arm_dir
             "gso": args.gso,
             "qdisc": ((pre_local.get("qdisc") or {}).get("root")),
             "pinning": " ".join(f"{k} {v}" for k, v in (p["pin"] or {}).items()),
-            "clock_offset_us": offset_us,
-            "clock_method": (pre_local.get("clock") or {}).get("method"),
-            "clock_error_us": (pre_local.get("clock") or {}).get("error_us"),
+            "clock_offset_us": offset_us,  # sub clock minus pub clock; None = not measured
+            "clock_method": ("same-host" if len(lat_hosts) <= 1 else ("tcp-peer" if clk_pre else None)),
+            "clock_error_us": (max(clk_pre["error_us"], clk_post["error_us"])
+                               if clk_pre and clk_post else None),
             "clock_tolerance_us": args.clock_tolerance_us,
             "fingerprint": {"shenzhen": env_fingerprint("shenzhen", hosts["shenzhen"]),
                             **({"seawolf": env_fingerprint("seawolf", hosts["seawolf"])}
@@ -850,6 +1119,24 @@ def run_point(p: dict, *, hosts: dict[str, Host], relay: dict, arm: str, arm_dir
             "hostcheck_pre_remote": pre_remote,
             "hostcheck_post_remote": post_remote,
             "strays": strays,
+            "orphans": orphans,
+            "foreign_bench_procs": foreign,
+            "smoke": bool(args.smoke),
+            "waived_violations": all_waived,
+            "proc_stats": proc_stats,
+            "not_measured": nm,
+            "latency_corrected": latency_ok,
+            "clock": {
+                "convention": ("w_minus_s_us = seawolf clock - shenzhen clock; "
+                               "corrected latency = measured - (sub clock - pub clock)"),
+                "pre": clk_pre, "post": clk_post,
+                "sub_minus_pub_us": sub_minus_pub_us,
+                "applied_correction_ms": offset_ms if latency_ok else None,
+                "latency_why": latency_why or None,
+                "ntp_shenzhen": pre_local.get("clock"),
+            },
+            "diagnostics": {"raw_latency_uncorrected_do_not_quote":
+                            (raw_latency if not latency_ok else None)},
             "config_fingerprint": {
                 "arm": arm,
                 "transport": p["transport"],
@@ -903,7 +1190,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--lock-wait", type=float, default=0.0)
     ap.add_argument("--tag", default="", help="suffix appended to the run block name")
     ap.add_argument("--hostcheck-samples", type=int, default=20)
-    ap.add_argument("--clock-peer", default=os.environ.get("CLOCK_PEER", "10.14.25.37:9876"))
+    ap.add_argument("--clock-peer", default=os.environ.get("CLOCK_PEER", "10.14.25.173:9876"),
+                    help="host:port of the TCP clock responder this sweep starts on shenzhen; "
+                         "seawolf probes it before/after every point")
     ap.add_argument("--clock-tolerance-us", type=float,
                     default=float(os.environ.get("CLOCK_JUMP_TOLERANCE_US", DEFAULT_CLOCK_TOL_US)))
     ap.add_argument("--iface", default=os.environ.get("PERF_IFACE"))
@@ -916,11 +1205,26 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--cc", default=os.environ.get("PERF_CC", "bbr1"))
     ap.add_argument("--gso", action="store_true", default=True)
     ap.add_argument("--no-gso", dest="gso", action="store_false")
+    ap.add_argument("--smoke", action="store_true",
+                    help="topology smoke: waive stray_bench_process, clock_offset_jump and "
+                         "clock_unavailable (recorded; the point becomes 'dirty'). Never baseline-grade.")
+    ap.add_argument("--waive", default="",
+                    help="comma-separated hostcheck rule names to record but not abort on "
+                         "(the point becomes 'dirty')")
     ap.add_argument("--examples", action="store_true", help="print README-style examples and exit")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
     global _VERBOSE
     _VERBOSE = bool(args.verbose)
+    args.waive = {x.strip() for x in args.waive.split(",") if x.strip()}
+    if args.smoke:
+        args.waive |= {"stray_bench_process", "clock_offset_jump", "clock_unavailable"}
+
+    def _on_term(signum, _frame):  # let finally-blocks kill children before we die
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, _on_term)
+    signal.signal(signal.SIGHUP, _on_term)
 
     if args.examples:
         print(__doc__)
@@ -941,7 +1245,8 @@ def main(argv: list[str] | None = None) -> int:
             return ""
 
     args.aiomoqt_sha = git("rev-parse", "--short", "HEAD")
-    args.aiomoqt_dirty = bool(git("status", "--porcelain", "--untracked-files=no"))
+    args.aiomoqt_dirty = bool(git("status", "--porcelain", "--untracked-files=no", "--", ".",
+                                  ":(exclude)perf"))
     local_whl = sorted((Path("/tmp/aiomoqt-wheels")).glob("aiomoqt-*.whl"))
     args.aiomoqt_dist = (local_whl[-1].stem.split("-")[1] if local_whl else
                          git("describe", "--tags", "--always"))
@@ -1002,9 +1307,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     lock = acquire_lock(runs, args.lock_wait)
+    clockd = None
     try:
         run_root.mkdir(parents=True, exist_ok=True)
         print(f"run block: {run_root}")
+        try:
+            clockd = start_clock_responder(hosts["shenzhen"], run_root, args.clock_peer)
+        except Exception as exc:  # noqa: BLE001 - latency becomes "not measured"; throughput is unaffected
+            print(f"  warn  clock responder unavailable: {exc}", file=sys.stderr)
         for p in points:
             for rep in range(1, int(p["reps"]) + 1):
                 rep_dir = run_root / p["id"] / f"rep-{rep:02d}"
@@ -1015,7 +1325,7 @@ def main(argv: list[str] | None = None) -> int:
                     same = (fp.get("arm") == arm and fp.get("transport") == p["transport"]
                             and fp.get("config") == p["config"]
                             and fp.get("duration_s") == int(p["duration_s"]))
-                    if (existing.get("meta") or {}).get("status") in ("ok", "dirty") and same:
+                    if _reusable(existing, args) and same:
                         print(f"  skip  {p['id']} rep-{rep:02d} (valid result)")
                         continue
                 print(f"  run   {p['id']} rep-{rep:02d} ...", flush=True)
@@ -1041,6 +1351,8 @@ def main(argv: list[str] | None = None) -> int:
                     return 1
         return 0
     finally:
+        if clockd:
+            hosts["shenzhen"].kill(clockd["pid"], grace=2.0)
         fcntl.flock(lock, fcntl.LOCK_UN)
         lock.close()
 

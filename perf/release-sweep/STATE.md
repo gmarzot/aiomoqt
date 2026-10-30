@@ -259,3 +259,61 @@ mark the smoke complete.
 Known-good acceptance items: `--dry-run` prints all 24 baseline points with argv;
 `--only D-raw --reps 1` passes end to end; collect parser unit test passes;
 no orphan bench processes on either host after the D runs.
+
+## P1a status (2026-10-30, 18:35Z) - harness complete; four topology smokes ran (status dirty = waived violations)
+
+Block `runs/2026-10-30T18-28-46Z-smoke-final/` (gitignored); committed copies of the four
+result.json files are in `perf/release-sweep/smoke-results/2026-10-30T18-28-46Z-smoke-final/`.
+All four pass `scripts/validate_result.py` (Appendix A + honesty rules). Smoke only, no tuning.
+D rows are unpaced (r=0, queue-depth regime), R rows are paced (r=8000, Appendix B shape).
+
+| point | status | Mbps | obj/s | lost | cpu pub/sub/relay % | peak RSS MB | measured s |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| D-raw | dirty | 804.2 | 24464 | 0 | 62.8 / 148.1 / - | 224.2 | 33.0 |
+| D-WT | dirty | 783.1 | 23823 | 49 | 61.5 / 167.3 / - | 394.1 | 31.4 |
+| R-raw | dirty | 249.0 | 7576 | 0 | 19.2 / 27.4 / 23.6 | 43.5 | 29.5 |
+| R-WT | dirty | 247.1 | 7516 | 0 | 19.5 / 29.7 / 23.4 | 50.5 | 29.1 |
+
+Latency (p50/p95/p99/lat_*) is **not measured** in all four: see blocker 1. p99.9 is **not measured**
+(sub_bench prints p50/p95/p99 only). cpu_* is the mean over the process lifetime (includes connect).
+
+### What changed in this round
+- Clock: the first harness applied the cross-host offset with the wrong sign, never started the TCP
+  clock responder (so the offset silently became 0), and judged drift on single-host NTP whose error
+  (~9 ms) exceeds the 2 ms tolerance. Now: sweep.py runs the responder on shenzhen, seawolf probes it
+  (20 samples) before and after every point, correction = measured - mean(pre, post), and latency is
+  nulled with a reason when the probe fails or the offset moves more than max(tol, pre+post error).
+  Sign is covered by tests/test_clock.py.
+- Remote pid bug: the ssh launch backgrounded an `a && b && c` list, so `$!` was a wrapper shell;
+  kill/alive//proc sampling hit the wrapper while the real process lived on (an orphan whenever a
+  remote process did not self-exit). Now the pid is the real process (own session); verified with a
+  probe: kill leaves nothing behind.
+- seawolf abort reasons (busy llama.cpp slot) were never evaluated; now enforced and never waivable.
+- `--smoke` / `--waive`: record-but-do-not-enforce stray_bench_process, clock_offset_jump,
+  clock_unavailable; point becomes dirty. Foreign bench-pattern processes are listed, never touched;
+  only our own interpreter outliving a point counts as an orphan (killed).
+- Short-run guard: a subscriber that measured under 80 percent of the window is `failed`, not `ok`.
+- Appendix A completeness: shas now carry real aiopquic/picoquic/picotls/liburing SHAs (was
+  "unknown"), per-process cpu/rss from /proc, every null explained in summary.not_measured.
+- bootstrap_seawolf.sh installs the FULL arm freeze (sortedcontainers was missing) and verifies
+  freeze, CPython, wheel sha256 and imports; modes ensure / --rebuild / --verify-only. Run: identical.
+
+### Blockers and findings for P1b (read before the baseline)
+1. **One-way latency is not measurable on this host pair right now.** The seawolf-minus-shenzhen
+   clock offset moves by hundreds of ms to seconds inside one 30 s point and steps (R-raw: 1.63 s to
+   0.29 s). Raw LOC-timestamp latencies are dominated by it (kept only under
+   meta.diagnostics.raw_latency_uncorrected_do_not_quote). Needs host-level time discipline on both WSL2
+   VMs (admin), or a same-host pub/sub pair for latency. Tail latency is the headline metric, so this gates P1b.
+2. **The host is not exclusive.** Jobs from the moq-analytics board (load_sim, moqx serve, regression
+   runners) were running on shenzhen during every point (meta.foreign_bench_procs). The smoke waived
+   stray_bench_process; a baseline run will abort until the host is quiet or the work is scheduled.
+3. **Unpaced relay run fails**: P=4 s=4096 r=0 through moqx made the relay log "Error parsing/consuming
+   stream" and reset the subscriber stream (error=3) after 1.2 s. Evidence:
+   `smoke-results/R-raw-unpaced-relay-reset-evidence/`. Triage before any R point with r=0.
+4. Tuning (PROGRAM 5.3) was NOT applied (smoke): qdisc is mq/pfifo_fast, not fq_codel. hostcheck reports
+   eth1 at 10000 Mbps (virtual) while goodput plateaus near 800 Mbps; do not read the plateau as the stack.
+5. aiomoqt provenance: shenzhen runs the editable tree at HEAD, seawolf runs the wheel built from
+   ed6dbdc; the only non-perf file that differs between them is .gitignore. Wheel sha256s are in shas.
+
+Next concrete step: resolve blocker 1 (time discipline) and 2 (exclusive host or schedule), then P1b
+baseline on manifests/baseline-v0.yaml without --smoke.

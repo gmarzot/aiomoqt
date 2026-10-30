@@ -5,6 +5,11 @@
 # Purpose: prove the orchestration path end to end (hostcheck -> run -> parse ->
 # result.json -> clean kill) on both transports, without and with the relay.
 # These ids are deliberately *not* part of the 24-point baseline matrix.
+#
+# D points run unpaced (r: 0). R points are paced (r: 8000, Appendix B): an unpaced
+# P=4 s=4096 firehose through moqx made the relay log 'Error parsing/consuming stream'
+# and reset the subscriber's stream after ~1.2 s (runs/2026-10-30T18-22-25Z-smoke) - a
+# finding for the R matrix, not something a topology smoke should trip over.
 
 arm: base-070rc2
 cc: bbr1
@@ -51,8 +56,10 @@ points:
   - id: R-raw
     topology: R
     transport: raw
+    config: {P: 4, s: 4096, g: 200, r: 8000}   # paced: PROGRAM Appendix B relay shape
     purpose: moqx perf relay :9768, publisher co-located, subscriber on seawolf
   - id: R-WT
     topology: R
     transport: wt
+    config: {P: 4, s: 4096, g: 200, r: 8000}   # paced: PROGRAM Appendix B relay shape
     purpose: same via WebTransport endpoint /moq-relay
