@@ -21,6 +21,7 @@ import aiomoqt.server
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.messages.base import MOQTMessage
+from aiomoqt.messages.subscribe import TrackStatus
 from aiomoqt.protocol import _MOQTSessionMixin, _close_kind, _local_cause
 from aiomoqt.server import MOQTServer
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
@@ -309,15 +310,15 @@ async def test_peer_reason_is_cut_to_the_reason_phrase_max(records):
 # Real sessions over raw QUIC and WebTransport.
 
 @contextlib.asynccontextmanager
-async def _pair(use_quic):
+async def _pair(use_quic, draft=22):
     """A set-up client session and the server's side of it."""
     port = free_udp_port()
     server = MOQTServer(host="127.0.0.1", port=port, certificate=CERT,
-                        private_key=KEY, path="/", supported_drafts=22)
+                        private_key=KEY, path="/", supported_drafts=draft)
     handle = await server.serve_dual()
     try:
         client = MOQTClient("127.0.0.1", port, path="/", use_quic=use_quic,
-                            verify_tls=False, supported_drafts=22)
+                            verify_tls=False, supported_drafts=draft)
         async with client.connect() as session:
             await session.client_session_init()
             async with asyncio.timeout(5):
@@ -377,6 +378,23 @@ async def test_local_close_is_one_line(records, use_quic, how):
     peer_lines = [m for m in _lines(records) if m not in _lines(records, port)]
     assert len(peer_lines) == 1, _lines(records)
     assert peer_lines[0].endswith("; reason: bye"), peer_lines
+
+
+@requires_certs
+@pytest.mark.parametrize("use_quic", _REAL)
+async def test_a_peer_violation_logs_one_error(records, use_quic):
+    async with _pair(use_quic, draft=16) as (client, peer, port):
+        rid = peer._local_request_max
+        client.send_control_message(TrackStatus(
+            request_id=rid, track_namespace=(b"n",), track_name=b"t"))
+        await _closed(client, peer)
+    errors = [r.getMessage() for r in records.records
+              if r.levelno >= logging.ERROR]
+    assert len(errors) == 1, errors
+    assert re.fullmatch(
+        rf"MOQT: closing: TOO_MANY_REQUESTS \(0x7\) to 127\.0\.0\.1:\d+; "
+        rf"reason: peer request_id {rid} at or beyond our MAX_REQUEST_ID {rid}",
+        errors[0]), errors
 
 
 @requires_certs
