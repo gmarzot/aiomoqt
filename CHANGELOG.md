@@ -31,7 +31,7 @@
 - pub_media `--fetch-history BYTES`: its media tracks keep that much history to answer FETCH (default 0: FETCH refused); `LocTrackPublisher` takes `fetch_history_bytes`.
 - The session close line names who closed, the code (with its H3 or MoQT name), the peer address and whether MoQT setup completed; a WebTransport H3_NO_ERROR (0x100) close logs INFO, a peer error close one WARNING (no separate QUIC ERROR line), our own error close ERROR.
 - Raw QUIC session closes send and record their reason phrase; a transport close is logged by its QUIC name (e.g. CONNECTION_REFUSED (0x2)), not a MoQT one. Needs aiopquic's close kind; older aiopquic keeps the MoQT names.
-- Requires aiopquic 0.7.0: datagram priority and the server bind host need it (0.6.x silently ignored both).
+- Requires aiopquic 0.7.0 (0.7.0rc3 or later until it ships): datagram priority, the server bind host, close kinds and reasons, the local close cause and congestion-control options need it (0.6.x silently ignored the first two).
 - Draft-14 is deprecated and will be removed in 0.15.0; until then it still negotiates and stays in the default offer.
 - aiomoqt-relay `--pause-after SEC` (default 60, 0 = never): a track no subscriber has forwarded for that long is paused upstream (Forward State 0) and resumed by the next subscriber; `--catalog-probe` catalogs keep flowing.
 - The LOC producer keeps numbering frames while paused (Forward State 0), so its Largest keeps moving; nothing is sent or kept.
