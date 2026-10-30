@@ -317,3 +317,46 @@ Latency (p50/p95/p99/lat_*) is **not measured** in all four: see blocker 1. p99.
 
 Next concrete step: resolve blocker 1 (time discipline) and 2 (exclusive host or schedule), then P1b
 baseline on manifests/baseline-v0.yaml without --smoke.
+
+## P1b status (2026-10-30, 22:39Z) — noise floor + L/P baseline delivered; cross-host latency still blocked
+
+| field | value |
+|---|---|
+| phase | **1b — noise floor + loopback/two-process baseline: DELIVERED** |
+| completed points | Part A: N1 ×7, N2 ×7 (`runs/2026-10-30T21-40-50Z-partA`) · Part B: L1–L5, P1–P3 ×3 (`runs/2026-10-30T22-04-13Z-partB`, 24/24 `ok`) |
+| noise floor | `noise-floor.md` — N1 mbps CV 2.38 % → MDE(N=3) **3.8 %**; N2 mbps CV 0.27 % → MDE(N=3) **0.43 %**; `interval_cv` unusable at N<10 (CV 72 %/36 %) |
+| summary | `baselines/base-070rc2/SUMMARY-part1.md` (L/P table, loopback caveat, same-host latency CVs) |
+| next action | **Phase 1c** — resolve the clock blocker, then D/R rows (D1–D5, R1–R6, Ri1) + M1/M2 at 120 s |
+
+**What P1b established**
+
+1. The process boundary is free: L2 1731.8 vs P1 1728.2 Mbps (0.2 %), L3 vs P3 +1.7 % — both inside
+   the N=3 floor. The two-process harness path needs no correction; L/P rows with matching shapes
+   can be pooled.
+2. Latency at the ceiling is still the 4 MiB queue budget (`≈19 ms` predicted, p50 15.1–15.7 ms
+   measured at 1.73 Gbps). `--max-queued-bytes` remains the first-order latency lever; L4/L5
+   (p50 ≈ 1 ms) confirm it because they never fill the queue.
+3. Churn costs throughput, not tail (L4 −15.8 % vs L2 at unchanged p99); small objects are
+   pps-bound but healthy (L5 97 k obj/s, p99 7.3 ms); the pacer is exact (P2 20,000.2 obj/s, CV 0.0 %).
+4. **First rep of a block is cold** (L1 rep-01 −18 %). Screening blocks should run one throwaway
+   warmup rep, or flag rep-01, on any point that opens a block.
+5. Same-host p99 is the noisy metric (CV 1.6–46 % across points, worst at churn/small objects):
+   same-host p99 claims need N≥5, churn p99 needs N≥10.
+
+**Blocker 1 (clock) is now root-caused but not fixed.** A 20-sample probe sequence 2 s apart on a
+4 ms RTT link returned offsets of −912 ms, −990 ms, −1058 ms, −27 ms, −96 ms — physically impossible,
+so the `tcp-peer` estimate is unreliable (WSL2 `time.time()` is the suspect; `timedatectl` reports
+synced). Part A attempts 1 and 2 aborted on `seawolf:clock_offset_jump`; attempt 3 ran with
+`--waive clock_offset_jump`, giving 14 screening-grade `dirty` reps with `latency: null` and an
+explicit note per rep. **Cross-host p50/p99 is not measurable on this host pair** until either the
+clock is disciplined on both ends (admin on two WSL2 VMs) or latency is redefined from the QUIC
+stack's own RTT. Same-host L/P latency is unaffected and is reported above.
+
+**Blocker 2 (exclusive host) did not recur**: no foreign bench process appeared during either block,
+and no waiver was needed for `stray_bench_process`.
+
+Harness changes made during P1b (all committed): `--gap` (protocol 10 s idle, skipped after the last
+rep), L-topology `--cert/--key/--draft` plumbing, L subscriber summary parsed from `bench.log`,
+CPU fallback for single-process points, two warm-up remote hostcheck probes and an implausible-offset
+re-probe to stop a stale first reply poisoning the clock baseline. New scripts: `noise_floor.py`,
+`summarize.py`. Manifests: `noise-floor.yaml`, `phase1b-partb.yaml`, `phase1b-smoke.yaml`.

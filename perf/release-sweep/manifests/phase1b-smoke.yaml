@@ -1,0 +1,53 @@
+# Throwaway pre-flight for Phase 1b: shortest possible L/P runs to prove the
+# harness paths work (short duration -> not baseline grade; do not report).
+arm: base-070rc2
+cc: bbr1
+gso: true
+
+hosts:
+  shenzhen:
+    local: true
+    root: /home/gmarzot/Projects/marzresearch/perf-sweep
+    python: arms/{arm}/venv/bin/python
+  seawolf:
+    ssh: seawolf
+    root: /home/gmarzot/perf-sweep
+    python: venv/bin/python
+
+relay:
+  binary: /home/gmarzot/Projects/marzresearch/moqx/build/moqx
+  config: perf/release-sweep/moqx-perf.yaml
+  addr: 10.14.25.173
+  port: 9768
+  wt_path: /moq-relay
+  pub_port: 4434
+
+defaults:
+  draft: 16
+  duration_s: 10
+  interval_s: 5
+  warmup_s: 2
+  sub_delay_s: 1.0
+  reps: 1
+  subs: 1
+  config: {P: 1, s: 4096, g: 200, r: 0}
+  pin: {relay: "0-1", pub: "2-5", sub: "6-9"}
+
+points:
+  - id: L1
+    topology: L
+    transport: raw
+    bench_host: shenzhen
+    config: {P: 8, s: 4096, g: 200, r: 0}
+    pin: {relay: "0-5", pub: "0-5", sub: "0-5"}
+    purpose: pre-flight
+  - id: P1
+    topology: P
+    transport: raw
+    config: {P: 4, s: 4096, g: 200, r: 0}
+    purpose: pre-flight
+  - id: P3
+    topology: P
+    transport: wt
+    config: {P: 4, s: 4096, g: 200, r: 0}
+    purpose: pre-flight

@@ -1,0 +1,93 @@
+# Phase 1b Part B — loopback (L1..L5) + two-process (P1..P3), N=3, 60 s, 10 s gap.
+#   python3 perf/release-sweep/scripts/sweep.py \
+#     --manifest perf/release-sweep/manifests/phase1b-partb.yaml --gap 10
+#
+# Pinning note: L is one process doing both ends, so it gets the union of the
+# pub and relay budgets (0-5).  P is two processes on one host: publisher 2-5,
+# subscriber 6-9 - the PROGRAM map's "sub 0-3" is the seawolf-side pin and
+# would overlap the publisher on shenzhen.
+
+arm: base-070rc2
+cc: bbr1
+gso: true
+
+hosts:
+  shenzhen:
+    local: true
+    root: /home/gmarzot/Projects/marzresearch/perf-sweep
+    python: arms/{arm}/venv/bin/python
+  seawolf:
+    ssh: seawolf
+    root: /home/gmarzot/perf-sweep
+    python: venv/bin/python
+
+relay:
+  binary: /home/gmarzot/Projects/marzresearch/moqx/build/moqx
+  config: perf/release-sweep/moqx-perf.yaml
+  addr: 10.14.25.173
+  port: 9768
+  wt_path: /moq-relay
+  pub_port: 4434
+
+defaults:
+  draft: 16
+  duration_s: 60
+  interval_s: 5
+  warmup_s: 5
+  sub_delay_s: 2.0
+  reps: 3
+  subs: 1
+  config: {P: 1, s: 4096, g: 200, r: 0}
+  pin: {relay: "0-1", pub: "2-5", sub: "6-9"}
+
+points:
+  - id: L1
+    topology: L
+    transport: raw
+    bench_host: shenzhen
+    config: {P: 1, s: 4096, g: 200, r: 0}
+    pin: {relay: "0-5", pub: "0-5", sub: "0-5"}
+    purpose: single-stream ceiling
+  - id: L2
+    topology: L
+    transport: raw
+    bench_host: shenzhen
+    config: {P: 8, s: 4096, g: 200, r: 0}
+    pin: {relay: "0-5", pub: "0-5", sub: "0-5"}
+    purpose: multi-subgroup ceiling
+  - id: L3
+    topology: L
+    transport: wt
+    bench_host: shenzhen
+    config: {P: 8, s: 4096, g: 200, r: 0}
+    pin: {relay: "0-5", pub: "0-5", sub: "0-5"}
+    purpose: WT vs raw at the ceiling
+  - id: L4
+    topology: L
+    transport: raw
+    bench_host: shenzhen
+    config: {P: 8, s: 4096, g: 40, r: 0}
+    pin: {relay: "0-5", pub: "0-5", sub: "0-5"}
+    purpose: churn at the ceiling
+  - id: L5
+    topology: L
+    transport: raw
+    bench_host: shenzhen
+    config: {P: 8, s: 1200, g: 200, r: 0}
+    pin: {relay: "0-5", pub: "0-5", sub: "0-5"}
+    purpose: small objects, pps-bound
+  - id: P1
+    topology: P
+    transport: raw
+    config: {P: 4, s: 4096, g: 200, r: 0}
+    purpose: two-process, no network
+  - id: P2
+    topology: P
+    transport: raw
+    config: {P: 4, s: 4096, g: 200, r: 20000}
+    purpose: paced two-process
+  - id: P3
+    topology: P
+    transport: wt
+    config: {P: 4, s: 4096, g: 200, r: 0}
+    purpose: WT two-process

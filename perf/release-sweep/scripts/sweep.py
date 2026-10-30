@@ -469,11 +469,11 @@ def build_steps(p: dict, hosts: dict[str, Host], relay: dict) -> list[dict]:
     if topo == "L":
         argv = ["{python}", "-P", "-m", "aiomoqt.tools.loopback_bench",
                 "-P", str(cfg["P"]), "-s", str(cfg["s"]), "-g", str(cfg["g"]),
-                "-t", str(dur), "-i", str(iv)]
+                "-t", str(dur), "-i", str(iv), transport_flag(tr),
+                "--draft", str(p["draft"]),
+                "--cert", str(certs) + "/cert.pem", "--key", str(certs) + "/key.pem"]
         if cfg.get("r"):
             argv += ["-r", str(cfg["r"])]
-        if tr.lower() in ("wt", "webtransport", "h3"):
-            argv += ["--wt"]
         steps.append({"role": "bench", "host": p.get("bench_host", "shenzhen"),
                       "bg": False, "delay_s": 0.0, "kind": "bench", "argv": argv})
         return steps
@@ -666,6 +666,20 @@ def run_point(p: dict, *, hosts: dict[str, Host], relay: dict, arm: str, arm_dir
         notes.append(f"pre-flight abort: {reason}")
 
     clk_pre = cross_clock(pre_remote)
+    # A sub-millisecond LAN link never has a ~50 ms offset; if the probe reports
+    # one, the peer had not settled and the sample is junk - re-probe before it
+    # becomes the baseline for the jump test.
+    for _ in range(2):
+        if clk_pre is None or abs(clk_pre["w_minus_s_us"]) < 50_000:
+            break
+        notes.append(f"re-probed clock baseline: implausible offset "
+                     f"{clk_pre['w_minus_s_us']:.0f} us")
+        time.sleep(0.5)
+        again = run_hostcheck(hosts["seawolf"], samples=args.hostcheck_samples,
+                              require=False, guard_llama=True, peer=args.clock_peer,
+                              iface=args.iface)
+        write_json_atomic(rep_dir / "hostcheck-pre-remote-retry.json", again)
+        clk_pre = cross_clock(again) or clk_pre
     steps0 = build_steps(p, hosts, relay)
     need_clock = len({s["host"] for s in steps0 if s["kind"] in ("pub", "sub")}) > 1
     if need_clock and clk_pre is None:
@@ -878,6 +892,10 @@ def run_point(p: dict, *, hosts: dict[str, Host], relay: dict, arm: str, arm_dir
             subprocess.run(argv_cat, stdout=fh, stderr=subprocess.DEVNULL, timeout=60)
 
     local_sub = rep_dir / "sub.log"
+    if not local_sub.exists() and (rep_dir / "bench.log").exists():
+        # L topology: one process plays both ends and prints the subscriber
+        # summary block; parse it as the sub transcript.
+        local_sub = rep_dir / "bench.log"
     if not local_sub.exists() and (rep_dir / "sub1.log").exists():
         local_sub.write_text((rep_dir / "sub1.log").read_text(errors="replace"))
 
@@ -1022,6 +1040,8 @@ def run_point(p: dict, *, hosts: dict[str, Host], relay: dict, arm: str, arm_dir
 
     summary["cpu_pub"] = _cpu("pub")
     summary["cpu_sub"] = _cpu("sub")
+    if summary["cpu_pub"] is None and summary["cpu_sub"] is None:
+        summary["cpu_pub"] = summary["cpu_sub"] = _cpu("bench")
     summary["cpu_relay"] = _cpu("relay")
     rss = [v["rss_hwm_mb"] for v in proc_stats.values() if v.get("rss_hwm_mb")]
     summary["rss_max_mb"] = round(max(rss), 1) if rss else None
@@ -1202,6 +1222,8 @@ def main(argv: list[str] | None = None) -> int:
                          "declared hung (covers ssh round-trips, kill grace and the "
                          "per-point hostcheck pair)")
     ap.add_argument("--kill-grace", type=float, default=5.0)
+    ap.add_argument("--gap", type=float, default=0.0,
+                    help="seconds to idle after each completed repeat (measurement protocol: 10)")
     ap.add_argument("--cc", default=os.environ.get("PERF_CC", "bbr1"))
     ap.add_argument("--gso", action="store_true", default=True)
     ap.add_argument("--no-gso", dest="gso", action="store_false")
@@ -1313,6 +1335,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"run block: {run_root}")
         try:
             clockd = start_clock_responder(hosts["shenzhen"], run_root, args.clock_peer)
+            # The responder's first reply can be stale by ~1 s (cold start: the
+            # process has just been exec'd and the first probe sees the queueing
+            # delay).  That poisons the baseline offset and makes the post-point
+            # "offset jumped" abort fire spuriously, so burn two probes on the
+            # remote side before any point measures its baseline.
+            for _ in range(2):
+                run_hostcheck(hosts["seawolf"], samples=min(3, args.hostcheck_samples),
+                              require=False, guard_llama=False, peer=args.clock_peer,
+                              iface=args.iface)
+                time.sleep(0.3)
         except Exception as exc:  # noqa: BLE001 - latency becomes "not measured"; throughput is unaffected
             print(f"  warn  clock responder unavailable: {exc}", file=sys.stderr)
         for p in points:
@@ -1349,6 +1381,8 @@ def main(argv: list[str] | None = None) -> int:
                 if st not in ("ok", "dirty"):
                     print(f"        aborted: {(result.get('meta') or {}).get('reason')}", file=sys.stderr)
                     return 1
+                if args.gap and not (p is points[-1] and rep == int(p["reps"])):
+                    time.sleep(float(args.gap))
         return 0
     finally:
         if clockd:

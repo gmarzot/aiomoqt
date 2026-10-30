@@ -1,0 +1,53 @@
+# Phase 1b Part A — noise floor.  Two points, 7 repetitions each, 10 s gap.
+#   python3 perf/release-sweep/scripts/sweep.py \
+#     --manifest perf/release-sweep/manifests/noise-floor.yaml --gap 10
+#
+# N1: D-raw, shenzhen -> seawolf, P=4 s=4096 g=200 unpaced, 60 s.
+# N2: M1 media shape, 1080p through moqx, 60 s (card overrides M1's 120 s).
+# Same arm throughout; nothing alternates; runs are back to back with the gap.
+
+arm: base-070rc2
+cc: bbr1
+gso: true
+
+hosts:
+  shenzhen:
+    local: true
+    root: /home/gmarzot/Projects/marzresearch/perf-sweep
+    python: arms/{arm}/venv/bin/python
+  seawolf:
+    ssh: seawolf
+    root: /home/gmarzot/perf-sweep
+    python: venv/bin/python
+
+relay:
+  binary: /home/gmarzot/Projects/marzresearch/moqx/build/moqx
+  config: perf/release-sweep/moqx-perf.yaml
+  addr: 10.14.25.173
+  port: 9768
+  wt_path: /moq-relay
+  pub_port: 4434
+
+defaults:
+  draft: 16
+  duration_s: 60
+  interval_s: 5
+  warmup_s: 5
+  sub_delay_s: 2.0
+  reps: 7
+  subs: 1
+  config: {P: 1, s: 4096, g: 200, r: 0}
+  pin: {relay: "0-1", pub: "2-5", sub: "0-3"}
+
+points:
+  - id: N1
+    topology: D
+    transport: raw
+    config: {P: 4, s: 4096, g: 200, r: 0}
+    purpose: noise floor, direct raw unpaced
+  - id: N2
+    topology: M
+    transport: raw
+    video: 1080p
+    config: {P: 1, s: 4096, g: 200, r: 0}
+    purpose: noise floor, M1 video 1080p
