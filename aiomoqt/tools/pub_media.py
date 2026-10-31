@@ -1226,7 +1226,7 @@ async def _shutdown(pub: FanoutPublisher, sessions: list,
     """Signal shutdown in about a second: refuse new SUBSCRIBEs and
     FETCHes, End of Track and PUBLISH_DONE on every track,
     PUBLISH_NAMESPACE_DONE for an announced namespace, then close each
-    session."""
+    session once its peer has acknowledged all of it."""
     for s in sessions:
         s.drain()
     for track in pub.tracks.values():
@@ -1245,7 +1245,7 @@ async def _shutdown(pub: FanoutPublisher, sessions: list,
     if announced:
         for s in sessions:
             s.publish_namespace_done(namespace=pub.namespace)
-    await asyncio.sleep(0.1)   # the last control messages leave first
+    await asyncio.gather(*(s.wait_delivered() for s in sessions))
     for s in sessions:
         s.close()
 
