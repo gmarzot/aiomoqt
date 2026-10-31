@@ -81,7 +81,8 @@ function render(p) {
   plot('bw', H, [['ingress_bps', 'ingress'], ['egress_bps', 'egress']], {fmt: fmt.bps});
   const bw = p.bandwidth || {};
   $('bw-stats').textContent = `${fmt.bps(bw.ingress_bps)} in · ${fmt.bps(bw.egress_bps)} out · `
-    + `delivery loss ${fmt.pct(bw.loss_pct, 2)}`;
+    + `delivery loss ${fmt.pct(bw.loss_pct, 2)}`
+    + (bw.spurious_pct == null ? '' : ` · spurious ${fmt.pct(bw.spurious_pct, 2)}`);
 
   plot('net', H, [['rx_bps', 'receive'], ['tx_bps', 'transmit']], {fmt: fmt.bps});
   fill($('t-ifaces'), (h.ifaces || []).map((i) => el('tr', {},

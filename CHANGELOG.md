@@ -2,6 +2,8 @@
 
 ## v0.14.0
 
+- aiomoqt-relay status: `loss_pct` toward viewers is real loss (declared lost minus acknowledged later); the new `spurious_pct` reports the rest, per session, in the totals and on the dashboard's Loss tile.
+- aiomoqt-relay status: a session that both publishes and subscribes reports no `loss_pct` and stays out of the total loss, since its loss count can't be split by direction; `lost_packets` is picoquic's raw count, unacknowledged ACK-only packets toward a publisher included.
 - The transport TRACE line for received request-stream data ends with ` FIN` when the peer closed the stream, so a FIN no longer reads as `len: 0`.
 - A SubscribedTrack that discovers its track gets a PUBLISH_DONE that arrived while the PUBLISH was still queued (up to 1024 queued PUBLISHes), as the direct path already did.
 - Over WebTransport, `request_update()` right after its request no longer raises "no request stream bound": the update waits for the request's stream to open, then follows the request in order.
