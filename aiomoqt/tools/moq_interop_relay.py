@@ -50,7 +50,9 @@ Routing model (cross-session, single relay instance):
     every downstream subscriber of that track. With no match, send
     SUBSCRIBE_ERROR / REQUEST_ERROR with TRACK_DOES_NOT_EXIST (d14 code
     0x04, d16+ code 0x10) so a conformance suite sees a spec-correct
-    rejection.
+    rejection. For --startup-hold seconds after start, such a SUBSCRIBE
+    first waits for a publisher, so viewers that reconnect after a
+    restart before their publishers are answered.
   - PUBLISH_NAMESPACE_DONE: drop that session's hold on the namespace.
 
 Run on UDP/4443 with the runner's /certs convention:
@@ -240,6 +242,11 @@ _catalog_probe = False
 # subscriber before its upstream Forward State drops to 0; 0 = never.
 PAUSE_AFTER_S = 60.0
 _pause_after = PAUSE_AFTER_S
+# --startup-hold: seconds after start that a SUBSCRIBE no publisher can
+# serve waits for one; 0 = off.
+STARTUP_HOLD_S = 2.0
+# Loop time the startup hold ends, None when off.
+_hold_until = None
 # --lag-limit: delivery deadline in seconds for live objects on a lane
 # with no OBJECT_DELIVERY_TIMEOUT; 0 = none.
 LAG_LIMIT_S = 5.0
@@ -247,6 +254,20 @@ _lag_limit = LAG_LIMIT_S
 # --trace-subscribers: count what each subscription is sent.
 _trace_subscribers = False
 _pause_sweep = None
+
+
+def _begin_startup_hold(seconds: float) -> None:
+    """Hold SUBSCRIBEs for unserved tracks for `seconds` from now."""
+    global _hold_until
+    _hold_until = (asyncio.get_running_loop().time() + seconds
+                   if seconds > 0 else None)
+
+
+def _startup_hold_s() -> float:
+    """Seconds left of the startup hold; 0 once over."""
+    if _hold_until is None:
+        return 0.0
+    return max(_hold_until - asyncio.get_running_loop().time(), 0.0)
 
 
 async def _await_upstream(timeout: float = None) -> bool:
@@ -3207,12 +3228,15 @@ async def _relay_subscribe(session, msg):
     """Relay a SUBSCRIBE: establish upstream, then fan out downstream."""
     ns = _ns_tuple(msg.track_namespace)
 
-    # §10.2.6: hold for a publisher up to RENDEZVOUS_TIMEOUT, then TIMEOUT.
+    # §10.2.6: hold for a publisher up to RENDEZVOUS_TIMEOUT, then TIMEOUT;
+    # else, within the startup hold, until it ends, then refuse as usual.
     # Once one appears the SUBSCRIBE proceeds as if it had just arrived.
-    wait_s = _rendezvous_s(session, msg)
+    rendezvous_s = _rendezvous_s(session, msg)
+    wait_s = rendezvous_s or _startup_hold_s()
     if wait_s and not _publisher_known(ns, msg.track_name):
         logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
-                    f"held up to {wait_s:.3f}s for a publisher")
+                    f"held up to {wait_s:.3f}s for a publisher"
+                    + ("" if rendezvous_s else " (startup hold)"))
         key = (ns, msg.track_name)
         wants = msg.forward is None or bool(msg.forward)
         _held_forwards.setdefault(key, []).append(wants)
@@ -3226,12 +3250,14 @@ async def _relay_subscribe(session, msg):
         if not found:
             if not _still_wanted(session, msg.request_id):
                 return
-            logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
-                        f"-> ERROR (rendezvous timeout)")
-            session.subscribe_error(
-                msg.request_id, error_code=RequestErrorCode.TIMEOUT,
-                reason="no publisher within the rendezvous timeout")
-            return
+            if rendezvous_s:
+                logger.info(f"relay: subscribe ns={ns} "
+                            f"track={msg.track_name} "
+                            f"-> ERROR (rendezvous timeout)")
+                session.subscribe_error(
+                    msg.request_id, error_code=RequestErrorCode.TIMEOUT,
+                    reason="no publisher within the rendezvous timeout")
+                return
 
     # Flow B first: a track already offered by PUBLISH is served from
     # that offer, no upstream SUBSCRIBE needed.
@@ -3375,6 +3401,14 @@ def parse_args(argv=None):
                              "seconds; the next subscriber resumes it. "
                              "--catalog-probe catalogs keep flowing. "
                              f"0 = never. Default: {PAUSE_AFTER_S:g}")
+    parser.add_argument("--startup-hold", type=float,
+                        default=STARTUP_HOLD_S, metavar="SEC",
+                        help="For SEC seconds after start, hold a SUBSCRIBE "
+                             "for a track no publisher serves until one "
+                             "does, then refuse it as usual, so viewers "
+                             "reconnecting after a restart before their "
+                             "publishers are answered. 0 = off. Default: "
+                             f"{STARTUP_HOLD_S:g}")
     parser.add_argument("--trace-subscribers", action="store_true",
                         help="Count the objects and bytes each subscription "
                              "is sent, for status and GET /sessions; off, "
@@ -5191,6 +5225,8 @@ async def main():
     if args.lag_limit < 0:
         sys.exit("error: --lag-limit must be 0 or above")
     _lag_limit = args.lag_limit
+    if args.startup_hold < 0:
+        sys.exit("error: --startup-hold must be 0 or above")
     speaks = sorted(int(d) for d in MOQTDraft)
     wanted = args.draft if isinstance(args.draft, list) else [args.draft]
     if any(d not in speaks for d in wanted):
@@ -5271,6 +5307,7 @@ async def main():
 
     handles = [await (server.serve_dual() if args.dual else server.serve())
                for server, _port, _label in listeners]
+    _begin_startup_hold(args.startup_hold)
 
     # Dial origins after the listeners are up: an origin may itself be
     # waiting on us, and a failed dial retries rather than aborting.
