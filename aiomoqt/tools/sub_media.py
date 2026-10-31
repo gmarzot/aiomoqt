@@ -60,6 +60,7 @@ from aiomoqt.utils.media_stats import (
     CSV_FIELDS, MediaAnalysis, csv_row, format_interval, format_summary,
     interval_header, wall_clock_us,
 )
+from aiomoqt.utils.hostinfo import CPU_FIELDS, cpu_fields, cpu_summary
 from aiomoqt.utils.timing import TimestampMalformed, capture_time_us
 from aiomoqt.utils.url import parse_relay_url
 
@@ -367,7 +368,8 @@ async def _analyze(args, analysis: MediaAnalysis, closed, report) -> None:
         _table(report, format_interval(t0, t1, rows))
         if report:
             for r in rows:
-                report[1].writerow(csv_row('interval', t0, t1, r, skew))
+                report[1].writerow(csv_row('interval', t0, t1, r, skew)
+                                   + cpu_fields())
             report[0].flush()
 
 
@@ -377,7 +379,7 @@ def _open_report(path):
         return None
     fh = sys.stdout if path == '-' else open(path, 'w', newline='')
     w = csv.writer(fh)
-    w.writerow(CSV_FIELDS)
+    w.writerow((*CSV_FIELDS, *CPU_FIELDS))
     return fh, w
 
 
@@ -385,12 +387,12 @@ def _finish_analysis(analysis: MediaAnalysis, start_us: int, end_us: int,
                      report) -> int:
     """Print the summary; exit code 1 when any track delivered nothing."""
     rows, skew = analysis.summary(end_us)
-    _table(report, format_summary(rows, skew))
+    _table(report, [*format_summary(rows, skew), f"  host: {cpu_summary()}"])
     if report:
         elapsed = (end_us - start_us) / 1e6
         for r in rows:
             report[1].writerow(csv_row('summary', 0.0, elapsed, r,
-                                       skew['p50_ms']))
+                                       skew['p50_ms']) + cpu_fields())
         report[0].flush()
         if report[0] is not sys.stdout:
             report[0].close()

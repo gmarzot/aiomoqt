@@ -183,6 +183,18 @@ def test_loopback_bench_fanout_delivers_through_the_lane(transport, props):
     assert _payload_bad(out) == 0, out
 
 
+@requires_certs
+@pytest.mark.parametrize("transport", ["-Q", "-W"])
+def test_loopback_bench_fanout_paced_ends_without_a_shed(transport):
+    # 32 MB/s fills a 16 MiB lane in 0.5 s if the subscriber stops first.
+    rc, out = run("loopback_bench", transport, "--fanout", "-p",
+                  free_udp_port(), "--draft", 18, "-t", 2, "-s", 16384,
+                  "-r", 2000, "-k")
+    assert rc == 0, out
+    assert objects_received(out) > 0, out
+    assert "send lane" not in out, out
+
+
 def test_loopback_bench_fanout_refuses_parallel_subgroups(monkeypatch):
     import sys
     from aiomoqt.tools import loopback_bench
@@ -211,10 +223,10 @@ def test_loopback_bench_without_objects_exits_1(monkeypatch):
         def close(self):
             pass
 
-    async def _serve(args):
+    async def _serve(args, tracks):
         return _Server()
 
-    async def _nothing(args, stats):
+    async def _nothing(args, stats, tracks):
         pass
     monkeypatch.setattr(loopback_bench, "run_server", _serve)
     monkeypatch.setattr(loopback_bench, "run_subscriber", _nothing)

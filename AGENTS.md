@@ -77,7 +77,8 @@ test with at least two tracks on one session, over raw QUIC and WebTransport
 
 ## CI
 
-- `ci.yml` (pull requests, push to main): `pin-guard`; `core` = unit + integration on the full
+- `ci.yml` (pull requests, push to main): `pin-guard`; `lint` (ruff); `types` (ty, report only);
+  `core` = unit + integration on the full
   matrix, macOS adding `--skip-suite loopback-fetch` (the native QUIC close stalls ~10 s on an
   un-drained fetch stream); `multi-proc` = `pub_server` against `sub_bench`; `peer-interop` =
   cloudflare `moq-rs` plus the `ghcr.io/openmoq/moqx` image; `microbenchmark`
@@ -114,7 +115,9 @@ branch: check releases with `git diff <commit> <tag>`, not ancestry.
 ## Lint and types
 
 `[tool.ruff]` in `pyproject.toml`: `line-length = 100`, `select = ["E","F","W"]`,
-`ignore = ["E501"]`. `ruff` and `ty` are `[dev]` extras, run locally; there is no CI lint job.
+`ignore = ["E501"]`, with per-file ignores for the star-import modules. CI's `lint` job runs a
+pinned ruff and must pass. `types` runs a pinned `ty` and reports a count above
+`.github/ty-baseline` without failing the run; lower the baseline as diagnostics are fixed.
 Do not run `ruff format` across existing files: it reflows code the change never touched.
 
 The package ships `py.typed`, so downstream `mypy --strict` follows these annotations. Keep

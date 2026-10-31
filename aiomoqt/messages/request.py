@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from .base import MOQTMessage, BUF_SIZE
 from ..types import D16MessageType
 from ..context import DraftProfile
-from ..utils.buffer import Buffer, BufferReadError
+from ..utils.buffer import Buffer
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)

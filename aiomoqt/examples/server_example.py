@@ -54,12 +54,12 @@ async def main(args):
     try:
         # run until closed
         if args.quic and args.wt:
-            quic_server = await server.serve_dual()
+            await server.serve_dual()
         else:
-            quic_server = await server.serve()
+            await server.serve()
 
         await server.closed()
-            
+
     except Exception as e:
         logger.error(f"MOQT server: session exception: {e}")
     finally:
@@ -69,6 +69,6 @@ if __name__ == "__main__":
     try:
         args = parse_args()
         asyncio.run(main(args), debug=args.debug)
-    
+
     except KeyboardInterrupt:
         pass

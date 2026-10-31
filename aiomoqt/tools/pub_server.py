@@ -25,6 +25,7 @@ from aiomoqt.track import PublishedTrack, VideoTrack
 from aiomoqt.types import ForwardingPreference
 from aiomoqt.utils import cli as _cli
 from aiomoqt.utils.certs import find_cert, find_key
+from aiomoqt.utils.hostinfo import cpu_summary
 from aiomoqt.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -263,6 +264,7 @@ async def main():
         print(f"  objects:   {args.object_size}B x {args.streams} streams")
     print(f"  groups:    {args.group_size} objects/group")
     print(f"  rate:      {rate_s}")
+    print(f"  cpu:       {cpu_summary()}")
     print("\nConnect subscriber (track-name discovery; -t on the sub):")
     # WT serves at "/" (path="/" above). -k: self-signed loopback cert.
     urls = []
