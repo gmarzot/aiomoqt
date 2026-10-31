@@ -244,6 +244,8 @@ _pause_after = PAUSE_AFTER_S
 # with no OBJECT_DELIVERY_TIMEOUT; 0 = none.
 LAG_LIMIT_S = 5.0
 _lag_limit = LAG_LIMIT_S
+# --trace-subscribers: count what each subscription is sent.
+_trace_subscribers = False
 _pause_sweep = None
 
 
@@ -463,7 +465,8 @@ class _Downstream:
     __slots__ = ("session", "alias", "request_id", "forward", "window",
                  "joined_at", "replaying", "location_filter", "group_order",
                  "fills", "range_params", "filters", "lane", "lost",
-                 "fence", "timeout")
+                 "fence", "timeout", "objects_sent", "bytes_sent",
+                 "largest_sent")
 
     def __init__(self, session, alias, request_id, forward=True,
                  window=_UNFILTERED):
@@ -499,6 +502,9 @@ class _Downstream:
         self.fence = None
         # Its OBJECT_DELIVERY_TIMEOUT in ms (§8); 0 sets none.
         self.timeout = 0
+        # What its lane sent, counted with --trace-subscribers.
+        self.objects_sent = self.bytes_sent = 0
+        self.largest_sent = None
 
     def take_timeout(self, params) -> bool:
         """Record the OBJECT_DELIVERY_TIMEOUT a SUBSCRIBE or REQUEST_UPDATE
@@ -650,6 +656,24 @@ class _RelayDelivery:
         return self.track._expire(self.session, group_id)
 
 
+class _TracedRelayDelivery(_RelayDelivery):
+    """--trace-subscribers: also counts what the subscription is sent."""
+
+    __slots__ = ()
+
+    async def send(self, item) -> bool:
+        await super().send(item)
+        oid = item[5]
+        if oid is not None:
+            d = self.d
+            d.objects_sent += 1
+            d.bytes_sent += len(item[6] or b"")
+            loc = (item[0], oid)
+            if d.largest_sent is None or loc > d.largest_sent:
+                d.largest_sent = loc
+        return True
+
+
 class _RelayLane(SendLane):
     """One subscriber's SendLane, bounded by LANE_BYTES and registered
     for the stall check and the status page. A failed write drops the
@@ -659,7 +683,8 @@ class _RelayLane(SendLane):
     prefix = "relay: "
 
     def __init__(self, track, d):
-        writer = _RelayDelivery(track, d)
+        writer = (_TracedRelayDelivery if _trace_subscribers
+                  else _RelayDelivery)(track, d)
         super().__init__(writer, max_bytes=LANE_BYTES)
         writer.lane = self
         self.track = track
@@ -3308,6 +3333,10 @@ def parse_args(argv=None):
                              "seconds; the next subscriber resumes it. "
                              "--catalog-probe catalogs keep flowing. "
                              f"0 = never. Default: {PAUSE_AFTER_S:g}")
+    parser.add_argument("--trace-subscribers", action="store_true",
+                        help="Count the objects and bytes each subscription "
+                             "is sent, for status and GET /sessions; off, "
+                             "nothing is counted per object")
     parser.add_argument("--lag-limit", type=float, default=LAG_LIMIT_S,
                         metavar="SEC",
                         help="Drop a subscriber's live objects older than "
@@ -3329,7 +3358,10 @@ def parse_args(argv=None):
                              f"{DRAIN_TIMEOUT_NO_URI_S:g} without")
     parser.add_argument("--control", type=str, default=None, metavar="PATH",
                         help="Serve HTTP on the Unix socket PATH: GET /debug "
-                             "reports DEBUG logging, POST /debug toggles it")
+                             "reports DEBUG logging, POST /debug toggles it, "
+                             "GET /sessions reports each session's transport "
+                             "state (and, with --trace-subscribers, what each "
+                             "subscription was sent)")
     parser.add_argument("--status-dir", type=str, default=None, metavar="DIR",
                         help="Write DIR/status.json every "
                              f"{STATUS_INTERVAL_S:g}s for the dashboard: "
@@ -4512,7 +4544,8 @@ class _Status:
                     "lane_stalled_s": (int(lane.stalled_s(time.monotonic()))
                                        if lane else 0),
                     "lane_stalls": lane.stalls if lane else 0,
-                    "since": info["since"] if info else None})
+                    "since": info["since"] if info else None,
+                    **(_sent_fields(d) if _trace_subscribers else {})})
             tracks.append((key, {
                 "id": "\x1f".join((_ns_str(key[0]), _name_str(key[1]))),
                 "namespace": _ns_str(key[0]), "name": _name_str(key[1]),
@@ -4615,6 +4648,15 @@ class _Status:
                 "rx_bps": bps(d[1]) if last is not None else None,
                 "loss_pct": (round(100 * d[3] / d[2], 2)
                              if delivery and d[2] else None),
+                "rtt_max_ms": (round(pq["rtt_max"] / 1000, 1)
+                               if pq.get("rtt_max") else None),
+                "cwin_bytes": pq.get("cwin"),
+                "in_transit_bytes": pq.get("bytes_in_transit"),
+                "pacing_bps": (round(pq["pacing_rate"] * 8)
+                               if pq.get("pacing_rate") else None),
+                "lost_packets": pq.get("lost"),
+                "timer_losses": pq.get("timer_losses"),
+                "spurious_losses": pq.get("spurious_losses"),
                 "namespaces": _session_namespaces(s),
                 "subscriptions": held_subs[id(s)],
                 "dgram_drops": _dgram_drops.get(id(s), 0),
@@ -4898,13 +4940,59 @@ def _toggle_debug() -> None:
         logger.info("relay: debug logging on")
 
 
+def _sent_fields(d) -> dict:
+    return {"objects_sent": d.objects_sent, "bytes_sent": d.bytes_sent,
+            "largest_sent": list(d.largest_sent) if d.largest_sent else None}
+
+
+# GET /sessions: path_quality() fields, in picoquic's units (µs, bytes,
+# bytes/s, packets).
+_PATH_QUALITY_KEYS = ("rtt", "rtt_min", "rtt_max", "cwin", "bytes_in_transit",
+                      "pacing_rate", "sent", "lost", "timer_losses",
+                      "spurious_losses", "bytes_sent", "bytes_received")
+
+
+def _sessions_report() -> dict:
+    """GET /sessions: each live session's transport state now and, with
+    --trace-subscribers, what each of its subscriptions was sent."""
+    subs: dict = {}
+    if _trace_subscribers:
+        for key, t in list(_tracks.items()):
+            track = "\x1f".join((_ns_str(key[0]), _name_str(key[1])))
+            for d in t.downstream:
+                lane = d.lane
+                subs.setdefault(id(d.session), []).append({
+                    "track": track, **_sent_fields(d),
+                    "lane_bytes": (lane.bytes + lane.replay_bytes
+                                   if lane else 0),
+                    "lane_tx_bytes": lane.tx_bytes if lane else 0,
+                    "shed_objects": lane.shed if lane else 0,
+                    "lane_expired": lane.expired if lane else 0})
+    rows = []
+    for info in list(_sessions.values()):
+        s = info["session"]
+        if not _session_live(s) or _internal_session(info):
+            continue
+        pq = _path_quality(s)
+        row = {"id": info["id"], "addr": relay_status.display_addr(_addr_of(s)),
+               "transport": _transport(s), "draft": _draft(s),
+               **{k: pq.get(k) for k in _PATH_QUALITY_KEYS}}
+        if _trace_subscribers:
+            row["subscriptions"] = subs.get(id(s), [])
+        rows.append(row)
+    return {"time": time.time(), "trace_subscribers": _trace_subscribers,
+            "sessions": rows}
+
+
 async def _on_control(reader, writer) -> None:
     """One HTTP/1.1 request on the control socket."""
     try:
         head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5.0)
         method, path = (head.split(b"\r\n", 1)[0].decode("latin-1")
                         .split(" ")[:2])
-        if path != "/debug" or method not in ("GET", "POST"):
+        if path == "/sessions" and method == "GET":
+            status, body = "200 OK", _sessions_report()
+        elif path != "/debug" or method not in ("GET", "POST"):
             status, body = "404 Not Found", {"error": "not found"}
         else:
             if method == "POST":
@@ -5045,8 +5133,9 @@ async def _drain(servers, uri: str, timeout: float, why: str) -> None:
 
 
 async def main():
-    global _catalog_probe, _pause_after, _lag_limit
+    global _catalog_probe, _pause_after, _lag_limit, _trace_subscribers
     args = parse_args()
+    _trace_subscribers = args.trace_subscribers
     _catalog_probe = args.catalog_probe
     if args.pause_after < 0:
         sys.exit("error: --pause-after must be 0 or above")
