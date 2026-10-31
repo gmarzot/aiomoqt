@@ -4543,6 +4543,9 @@ class _MOQTSessionMixin:
                 # round-trips to picoquic), so defer the open+send to a
                 # task. The reply correlates by request_id once the stream
                 # is bound, and it cannot arrive before we send on it.
+                if self._unbound_updates is None:
+                    self._unbound_updates = {}
+                self._unbound_updates[request_id] = []
                 task = asyncio.create_task(
                     self._d18_open_request_stream(request_id, msg))
                 self._tasks.add(task)
@@ -4554,11 +4557,24 @@ class _MOQTSessionMixin:
                                        msg: MOQTMessage) -> None:
         """Open a d18 request bidi stream over WebTransport (async
         create_stream) and send the opener on it. Raw QUIC uses the
-        synchronous path in _send_request instead."""
-        stream_id = await self.open_bidi_stream()
+        synchronous path in _send_request instead. REQUEST_UPDATEs sent
+        meanwhile follow the opener, in order."""
+        try:
+            stream_id = await self.open_bidi_stream()
+        except BaseException:
+            self._unbound_updates.pop(request_id, None)
+            self._fail_waiting_updates(request_id,
+                                       "request stream did not open")
+            raise
         self._bidi_streams[request_id] = stream_id
         self._bidi_stream_requests[stream_id] = request_id
+        updates = self._unbound_updates.pop(request_id, ())
         self.send_stream_message(stream_id, msg)
+        for update in updates:
+            self.send_stream_message(stream_id, update)
+
+    # WT request id -> REQUEST_UPDATEs sent before its stream opened.
+    _unbound_updates: Optional[Dict[int, List[MOQTMessage]]] = None
 
     # Messages that open a request stream (must be the first message on a
     # new bidi stream). d16 only uses SUBSCRIBE_NAMESPACE here; d18 routes
@@ -4972,14 +4988,21 @@ class _MOQTSessionMixin:
                                 params.get(ParamType.FORWARD))
         if self._profile.control_uni_pair:
             sid = self._bidi_streams.get(existing_request_id)
-            if sid is None:
+            unbound = (self._unbound_updates or {}).get(existing_request_id)
+            if sid is None and unbound is not None:
+                # WT: the request's stream is still opening.
+                self._tx_updates.setdefault(existing_request_id,
+                                            deque()).append(request_id)
+                unbound.append(message)
+            elif sid is None:
                 raise MOQTException(
                     SessionCloseCode.INTERNAL_ERROR,
                     f"no request stream bound for request_id="
                     f"{existing_request_id}: cannot send REQUEST_UPDATE")
-            self._tx_updates.setdefault(existing_request_id,
-                                        deque()).append(request_id)
-            self.send_stream_message(sid, message)
+            else:
+                self._tx_updates.setdefault(existing_request_id,
+                                            deque()).append(request_id)
+                self.send_stream_message(sid, message)
         else:
             self.send_control_message(message)
         if not wait_response:

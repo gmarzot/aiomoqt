@@ -2,6 +2,7 @@
 
 ## v0.14.0
 
+- Over WebTransport, `request_update()` right after its request no longer raises "no request stream bound": the update waits for the request's stream to open, then follows the request in order.
 - Every control message we send logs one INFO `MOQT send:` line as it is written, replies from default handlers, tracks and the relay included; a reply dropped for a cancelled request logs none.
 - `MOQTSession.wait_delivered(timeout=0.5)` waits until everything written has been sent and acknowledged. pub_media's shutdown closes each session once it returns (was a fixed 0.1 s), so the close no longer drops an End of Track, FIN or PUBLISH_DONE still in flight.
 - aiomoqt-relay status: each session shows `cwin_bytes`, `in_transit_bytes`, `pacing_bps`, `lost_packets`, `timer_losses`, `spurious_losses` and `rtt_max_ms`; `--trace-subscribers` (off by default) adds each subscription's `objects_sent`, `bytes_sent` and `largest_sent`; the control socket's `GET /sessions` returns these on demand.
