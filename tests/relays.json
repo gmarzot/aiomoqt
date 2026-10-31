@@ -24,6 +24,9 @@
       "gating": [16, 18],
       "pub_mode": "publish",
       "disabled_suites": [],
+      "xfail_suites": {
+        "relay-data": "intermittently drops group 2 object 4 (moqx issue 903)"
+      },
       "notes": "openmoq moqx CI relay. Covers drafts 16/18 over both raw-QUIC and H3/WT (/moq-relay); moqx dropped d14."
     },
     {
