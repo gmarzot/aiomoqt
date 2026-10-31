@@ -37,6 +37,10 @@ relay-logs/               relay.log (10 MB, 4 rotations) and crash.log, written 
                           read-only to nginx
 cores/                    relay core files
 logs/                     nginx access log, read by GoAccess
+relay-swap.sh, relay-rollback.sh
+                          make an image the relay, and undo that (deploy/aiomoqt-relay here)
+rollback/                 per swap: the image it replaced (also tagged aiomoqt:rollback),
+                          relay.toml and compose.yml; rollback/last is the newest
 stats/                    GoAccess reports: index.html (visitors), crawlers.html
 stats.htpasswd            the password for /private/, /stats/ and /relay/logs/
 build/                    relay image build context
@@ -48,7 +52,7 @@ Create `stats.htpasswd` before the first `up`. If it is missing, Docker creates 
 place and `/stats/` fails.
 
 ```sh
-tar -C deploy/aiomoqt-relay -cf - compose.yml nginx.conf relay.toml site | ssh ubuntu@aiomoqt-relay.marzresearch.net 'mkdir -p ~/aiomoqt-relay && tar -C ~/aiomoqt-relay -xf -'
+tar -C deploy/aiomoqt-relay -cf - compose.yml nginx.conf relay.toml relay-swap.sh relay-rollback.sh site | ssh ubuntu@aiomoqt-relay.marzresearch.net 'mkdir -p ~/aiomoqt-relay && tar -C ~/aiomoqt-relay -xf -'
 ssh -t ubuntu@aiomoqt-relay.marzresearch.net
 cd ~/aiomoqt-relay && mkdir -p status relay-logs cores logs stats
 # The relay and GoAccess run with no capabilities, so root must own what they write.
@@ -125,12 +129,18 @@ COPY aiopquic-*.whl /tmp/
 RUN pip install --no-cache-dir --no-deps --force-reinstall /tmp/aiopquic-*.whl && rm /tmp/aiopquic-*.whl
 ```
 
-Tag the result `aiomoqt:dev`, then `docker compose up -d relay`. To roll back, re-tag an earlier
-image (`docker image ls aiomoqt`) and run `up -d relay` again.
+Then, in `~/aiomoqt-relay`, `./relay-swap.sh aiomoqt:<sha> [HHMMSS]` makes it the relay, at that
+UTC time if one is given. It checks the image starts, records the live image, `relay.toml` and
+`compose.yml` in `rollback/`, re-tags `aiomoqt:dev`, restarts the relay, and probes raw QUIC and
+WebTransport until both connect (about 5 s, 2 s of it the drain).
+
+`./relay-rollback.sh` puts back what the last swap recorded and restarts the relay the same way.
+`./relay-rollback.sh --check` changes nothing: it shows the recorded image, that it starts, and
+how the config differs. Run it after each swap.
 
 ## G5 pages
 
-The pages are built from the fork gmarzot/moq-playa, branch `gmarzot-playa-dev`, which is forked from
+The pages are built from the fork gmarzot/moq-playa, branch `gmarzot-g5-dev`, which is forked from
 openmoq/moq-playa:
 
 ```sh
