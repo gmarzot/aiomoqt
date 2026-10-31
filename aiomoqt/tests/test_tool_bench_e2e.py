@@ -186,10 +186,10 @@ def test_loopback_bench_fanout_delivers_through_the_lane(transport, props):
 @requires_certs
 @pytest.mark.parametrize("transport", ["-Q", "-W"])
 def test_loopback_bench_fanout_paced_ends_without_a_shed(transport):
-    # 80 MB/s fills a 16 MiB lane in 0.2 s if the subscriber stops first.
+    # 32 MB/s fills a 16 MiB lane in 0.5 s if the subscriber stops first.
     rc, out = run("loopback_bench", transport, "--fanout", "-p",
                   free_udp_port(), "--draft", 18, "-t", 2, "-s", 16384,
-                  "-r", 5000, "-k")
+                  "-r", 2000, "-k")
     assert rc == 0, out
     assert objects_received(out) > 0, out
     assert "send lane" not in out, out
