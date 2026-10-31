@@ -723,6 +723,9 @@
   ".sessions[].addr": [
    "string"
   ],
+  ".sessions[].cwin_bytes": [
+   "int"
+  ],
   ".sessions[].dgram_drops": [
    "int"
   ],
@@ -732,14 +735,26 @@
   ".sessions[].id": [
    "int"
   ],
+  ".sessions[].in_transit_bytes": [
+   "int"
+  ],
   ".sessions[].loss_pct": [
    "float"
+  ],
+  ".sessions[].lost_packets": [
+   "int"
   ],
   ".sessions[].namespaces": [
    "int"
   ],
+  ".sessions[].pacing_bps": [
+   "int"
+  ],
   ".sessions[].role": [
    "string"
+  ],
+  ".sessions[].rtt_max_ms": [
+   "float"
   ],
   ".sessions[].rtt_min_ms": [
    "float"
@@ -753,7 +768,13 @@
   ".sessions[].since": [
    "float"
   ],
+  ".sessions[].spurious_losses": [
+   "int"
+  ],
   ".sessions[].subscriptions": [
+   "int"
+  ],
+  ".sessions[].timer_losses": [
    "int"
   ],
   ".sessions[].transport": [

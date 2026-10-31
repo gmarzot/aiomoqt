@@ -2,6 +2,7 @@
 
 ## v0.14.0
 
+- aiomoqt-relay status: each session shows `cwin_bytes`, `in_transit_bytes`, `pacing_bps`, `lost_packets`, `timer_losses`, `spurious_losses` and `rtt_max_ms`; `--trace-subscribers` (off by default) adds each subscription's `objects_sent`, `bytes_sent` and `largest_sent`; the control socket's `GET /sessions` returns these on demand.
 - A `produce()` track that ends, by returning or by `end()`, sends End of Track after its last object (one past it on the open group stream, else at the next group on a new stream, or as a status datagram), then PUBLISH_DONE TRACK_ENDED; `end()` no longer resets the open group. pub_media's tracks and catalog do this on `-t` expiry and SIGINT/SIGTERM. aiomoqt-relay forwards End of Track as received (it wrote End of Group).
 - `--fc-window` (session grid, loopback_bench) and `flow_control_window=` on `MOQTClient` / `MOQTServer` set the QUIC flow-control window per stream and per connection (default 16 MiB), which caps one stream at a window per RTT.
 - A peer's control-message violation logs one ERROR, the close line; the handler's line and the rejected message's hex dump are DEBUG.

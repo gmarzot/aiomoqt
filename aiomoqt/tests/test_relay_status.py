@@ -15,9 +15,10 @@ from aiomoqt.media.catalog import Catalog, CatalogTrack
 from aiomoqt.tools import moq_interop_relay as relay
 from aiomoqt.tools import relay_status
 from aiomoqt.track import PublishedTrack, SubscribedTrack
-from aiomoqt.types import MOQTMessageType
+from aiomoqt.types import FilterType, MOQTMessageType
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
+from aiomoqt.tests._procs import free_udp_port
 
 _PORT = 17500
 _NS = "status/live"
@@ -709,3 +710,101 @@ def test_live_tracks_keep_their_slots(tmp_path):
     _tick(status, live + [_row("late")])
     assert len(status.track_history) == cap
     assert "late" not in status.track_history
+
+
+# -- --trace-subscribers and GET /sessions ---------------------------------
+
+class _ThreeGroups(PublishedTrack):
+    """Three groups of three objects once `go` is set; the track stays
+    open, so the relay keeps its subscribers."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.go = asyncio.Event()
+
+    async def produce(self, out):
+        await self.go.wait()
+        for group_id in range(3):
+            for object_id in range(3):
+                await out.write(group_id, object_id, b"x" * 64,
+                                group_start=object_id == 0)
+        await asyncio.Event().wait()
+
+
+@requires_certs
+@_TRANSPORTS
+async def test_trace_subscribers_counts_what_each_subscription_is_sent(
+        use_quic, relay_tables, monkeypatch, tmp_path):
+    monkeypatch.setattr(relay, "_trace_subscribers", True)
+    names = ("video", "audio")
+    async with _relay(free_udp_port(), use_quic, 22) as connect:
+        pub = await connect()
+        tracks = {n: _ThreeGroups(pub, namespace=_NS, trackname=n,
+                                  object_size=64, group_size=3, rate=0)
+                  for n in names}
+        for t in tracks.values():
+            t.attach()
+        await pub.publish_namespace(namespace=_NS, wait_response=True)
+        got = {}
+        for i in range(2):
+            s = await connect()
+            for n in names:
+                ok = await s.subscribe(_NS, n, forward=1,
+                                       filter_type=FilterType.LATEST_OBJECT,
+                                       wait_response=True)
+                got[i, n] = 0
+
+                def count(*_, key=(i, n)):
+                    got[key] += 1
+                s.register_object_handler(ok.track_alias, count)
+        for t in tracks.values():
+            t.go.set()
+        # 3 groups of 3 objects and End of Group on the two closed groups.
+        async with asyncio.timeout(10):
+            while any(v < 11 for v in got.values()):
+                await asyncio.sleep(0.02)
+        await asyncio.sleep(0.2)
+        report = relay._sessions_report()
+        lanes_of = [d for t in relay._tracks.values() for d in t.downstream]
+        status = relay._Status(str(tmp_path / "status.json"),
+                               {"started": time.time()}, [connect.handle])
+        snap = status.snapshot(asyncio.get_running_loop().time(), time.time())
+    assert report["trace_subscribers"] is True
+    sent = {}
+    for row in report["sessions"]:
+        for sub in row.get("subscriptions", ()):
+            sent.setdefault(sub["track"].split("\x1f")[-1], []).append(
+                sub["objects_sent"])
+    for n in names:
+        assert sorted(sent[n]) == sorted(got[i, n] for i in range(2)) \
+            == [11, 11], (n, sent, got)
+    assert all(type(d.lane.writer) is relay._TracedRelayDelivery
+               for d in lanes_of), lanes_of
+    listed = {t["name"]: t["subscriber_list"] for t in snap["tracks"]}
+    for n in names:
+        assert sorted(r["objects_sent"] for r in listed[n]) == [11, 11]
+        assert all(r["largest_sent"] == [2, 2] and r["bytes_sent"] == 9 * 64
+                   for r in listed[n]), listed[n]
+
+
+@requires_certs
+async def test_untraced_relay_counts_nothing_per_object(relay_tables):
+    # Off, a subscription's writer is the plain delivery: nothing extra runs
+    # per object.
+    assert relay._trace_subscribers is False
+    async with _relay(free_udp_port(), True, 22) as connect:
+        pub = await connect()
+        PublishedTrack(pub, namespace=_NS, trackname="video", object_size=64,
+                       group_size=5, rate=200).attach()
+        await pub.publish_namespace(namespace=_NS, wait_response=True)
+        got = asyncio.Event()
+        sub = await connect()
+        await sub.subscribe(_NS, "video", forward=1,
+                            on_object=lambda *_: got.set(), wait_response=True)
+        await asyncio.wait_for(got.wait(), 5)
+        lanes = [d.lane for t in relay._tracks.values() for d in t.downstream]
+        report = relay._sessions_report()
+    assert lanes and all(type(lane.writer) is relay._RelayDelivery
+                         for lane in lanes), lanes
+    assert report["trace_subscribers"] is False
+    assert all("subscriptions" not in row for row in report["sessions"])
