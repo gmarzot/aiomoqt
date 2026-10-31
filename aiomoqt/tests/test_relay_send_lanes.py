@@ -207,7 +207,11 @@ class _Fake:
         self._unwritten.add(sid)
         if initial:
             # The header write carries the stream's first object.
-            await self.stream_write_drain(sid, initial)
+            try:
+                await self.stream_write_drain(sid, initial)
+            except BaseException:
+                self.stream_reset(sid, StreamResetCode.CANCELLED)
+                raise
             self.log.append(("data", sid))
         return sid
 
