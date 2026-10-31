@@ -3110,7 +3110,6 @@ def _apply_update(session, msg, found, d16: bool) -> None:
         params = ({} if track.largest is None
                   else _largest_object_param(session, track.largest))
         ok = RequestOk(request_id=msg.request_id, parameters=params)
-        control_log.info(f"MOQT send: {session._msgstr(ok)}")
         session._send_reply(msg.request_id, ok)
         _start_fill(track, d, msg)
     _resume_paused(track)
@@ -4615,23 +4614,27 @@ class _Status:
         held_subs = Counter(id(d.session) for t in _tracks.values()
                             for d in t.downstream)
         held_subs.update(_subscribing)
-        tx = rx = sent = lost = 0
+        tx = rx = sent = lost = spurious = 0
         rtts = []
         for info in live:
             s = info["session"]
             pq = pqs[id(s)]
             cur = (pq.get("bytes_sent", 0), pq.get("bytes_received", 0),
-                   pq.get("sent", 0), pq.get("lost", 0))
+                   pq.get("sent", 0), pq.get("lost", 0),
+                   pq.get("spurious_losses", 0))
             last = self._quic_prev.get(id(s))
             quic[id(s)] = cur
             d = ([max(0, c - p) for c, p in zip(cur, last)]
-                 if last is not None else [0, 0, 0, 0])
+                 if last is not None else [0, 0, 0, 0, 0])
             tx, rx = tx + d[0], rx + d[1]
             # Loss counts on delivery only: toward a publisher the relay sends
-            # mostly ACK-only packets, which picoquic counts lost unacked.
-            delivery = id(s) in subs
+            # mostly ACK-only packets, which picoquic counts lost unacked, and
+            # a session that also publishes can't split its count by direction.
+            delivery = id(s) in subs and id(s) not in pubs
+            # Real loss excludes packets declared lost and acknowledged later.
+            real = max(0, d[3] - d[4])
             if delivery:
-                sent, lost = sent + d[2], lost + d[3]
+                sent, lost, spurious = sent + d[2], lost + real, spurious + d[4]
             rtt = round(pq.get("rtt") / 1000, 2) if pq.get("rtt") else None
             if rtt is not None:
                 rtts.append(rtt)
@@ -4646,14 +4649,17 @@ class _Status:
                                if pq.get("rtt_min") else None),
                 "tx_bps": bps(d[0]) if last is not None else None,
                 "rx_bps": bps(d[1]) if last is not None else None,
-                "loss_pct": (round(100 * d[3] / d[2], 2)
+                "loss_pct": (round(100 * real / d[2], 2)
                              if delivery and d[2] else None),
+                "spurious_pct": (round(100 * d[4] / d[2], 2)
+                                 if delivery and d[2] else None),
                 "rtt_max_ms": (round(pq["rtt_max"] / 1000, 1)
                                if pq.get("rtt_max") else None),
                 "cwin_bytes": pq.get("cwin"),
                 "in_transit_bytes": pq.get("bytes_in_transit"),
                 "pacing_bps": (round(pq["pacing_rate"] * 8)
                                if pq.get("pacing_rate") else None),
+                # picoquic's raw count, ACK-only packets toward a publisher included.
                 "lost_packets": pq.get("lost"),
                 "timer_losses": pq.get("timer_losses"),
                 "spurious_losses": pq.get("spurious_losses"),
@@ -4701,6 +4707,7 @@ class _Status:
             "cache_evictions": _budget.evictions,
             "cache_truncations": _budget.truncations,
             "loss_pct": round(100 * lost / sent, 2) if sent else 0.0,
+            "spurious_pct": round(100 * spurious / sent, 2) if sent else 0.0,
             "rtt_p50_ms": relay_status.percentile(rtts, 50),
             "rtt_p99_ms": relay_status.percentile(rtts, 99),
             "loop_lag_ms": lag,
@@ -4834,7 +4841,8 @@ class _Status:
             "host": host,
             "bandwidth": {"ingress_bps": totals["ingress_bps"],
                           "egress_bps": totals["egress_bps"],
-                          "loss_pct": totals["loss_pct"]},
+                          "loss_pct": totals["loss_pct"],
+                          "spurious_pct": totals["spurious_pct"]},
             "loop_lag_ms": lag,
             "transport": transport_counters(self.handles),
             "history": self.platform_history.to_json(),
@@ -5226,8 +5234,8 @@ async def main():
 
     # Dial origins after the listeners are up: an origin may itself be
     # waiting on us, and a failed dial retries rather than aborting.
-    upstream_tasks = [asyncio.create_task(_dial_upstream(url, args.draft))
-                      for url in args.upstream]
+    _background.update(asyncio.create_task(_dial_upstream(url, args.draft))
+                       for url in args.upstream)
     for url in args.upstream:
         print(f"  upstream origin: {url}")
 

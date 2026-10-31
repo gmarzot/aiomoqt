@@ -26,7 +26,7 @@ _DEBUG_ONLY = ("MOQT event: handle", "MOQT receive:", "control write-uni",
 
 class _Records(logging.Handler):
     def __init__(self):
-        super().__init__(logging.DEBUG)
+        super().__init__(logging.NOTSET)
         self.records = []
 
     def emit(self, record):
@@ -91,6 +91,11 @@ async def test_info_logs_each_control_message_once_where_it_crosses(
     assert _count(info, "MOQT send: Subscribe(") == 1
     assert _count(info, "control message parsed: Subscribe(") == 1
     assert _count(info, "control message parsed: Setup(") == 2
+    assert _count(info, "MOQT send: Setup(") == 2
+    assert _count(info, "MOQT send: RequestError(") == 1
+    # Each message logs once on each side.
+    assert (_count(info, "MOQT send: ")
+            == _count(info, "control message parsed: ") == 4)
     assert not [m for m in info if any(s in m for s in _DEBUG_ONLY)]
 
 
@@ -108,9 +113,30 @@ async def test_a_quiet_peer_session_logs_nothing_below_warning(use_quic):
     finally:
         server.close()
     info = records.at(logging.INFO)
-    # The server's view of the probe: its SETUP names probe/1.
-    assert not [m for m in info if "probe/1" in m]
+    # The server's view of the probe: its SETUP names probe/1. The probe's
+    # own SETUP send is the client side, which is not quiet.
+    assert not [m for m in info if "probe/1" in m
+                and not m.startswith("MOQT send: Setup(")]
     # Client side of both sessions, server side of the ordinary one only.
     assert _count(info, "setup complete: draft-18") == 3
     assert _count(info, "control message parsed: Subscribe(") == 1
     assert [m for m in debug.at(logging.DEBUG) if "probe/1" in m]
+
+
+@_TRANSPORTS
+@pytest.mark.asyncio
+async def test_trace_shows_a_request_stream_fin_apart_from_its_length(
+        use_quic):
+    from aiomoqt.utils.logger import TRACE
+    port = _BASE_PORT + 4 + (not use_quic)
+    server = await _server(port, use_quic).serve()
+    try:
+        with _captured(TRACE) as records:
+            await _session(port, use_quic)
+    finally:
+        server.close()
+    lines = [m for m in records.at(TRACE) if "StreamDataReceived:" in m]
+    # The refused SUBSCRIBE's REQUEST_ERROR carries a FIN.
+    assert [m for m in lines if m.endswith(" FIN")]
+    assert [m for m in lines if not m.endswith(" FIN")
+            and not m.endswith(" len: 0")]

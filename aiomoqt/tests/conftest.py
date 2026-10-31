@@ -2,11 +2,9 @@ import inspect
 import os
 from dataclasses import fields
 
-import pytest
 
 from aiomoqt.messages import MOQTMessageType
 from aiomoqt.types import D16MessageType
-from aiomoqt.context import is_draft16_or_later
 from aiomoqt.context import get_major_version, profile_for
 from aiomoqt.utils.certs import generate_self_signed
 

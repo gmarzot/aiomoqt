@@ -4,6 +4,12 @@
 
 - The bench tools print the CPU model, CPU count and clock in their banner and results; adaptive_bench, load_sim and sub_media `--report` CSVs add `cpu_model`, `cpu_count` and `cpu_mhz` columns.
 - loopback_bench `--fanout` ends its publisher's track before the subscriber leaves, so a paced run no longer ends with a send-lane shed WARNING.
+- aiomoqt-relay status: `loss_pct` toward viewers is real loss (declared lost minus acknowledged later); the new `spurious_pct` reports the rest, per session, in the totals and on the dashboard's Loss tile.
+- aiomoqt-relay status: a session that both publishes and subscribes reports no `loss_pct` and stays out of the total loss, since its loss count can't be split by direction; `lost_packets` is picoquic's raw count, unacknowledged ACK-only packets toward a publisher included.
+- The transport TRACE line for received request-stream data ends with ` FIN` when the peer closed the stream, so a FIN no longer reads as `len: 0`.
+- A SubscribedTrack that discovers its track gets a PUBLISH_DONE that arrived while the PUBLISH was still queued (up to 1024 queued PUBLISHes), as the direct path already did.
+- Over WebTransport, `request_update()` right after its request no longer raises "no request stream bound": the update waits for the request's stream to open, then follows the request in order.
+- Every control message we send logs one INFO `MOQT send:` line as it is written, replies from default handlers, tracks and the relay included; a reply dropped for a cancelled request logs none.
 - `MOQTSession.wait_delivered(timeout=0.5)` waits until everything written has been sent and acknowledged. pub_media's shutdown closes each session once it returns (was a fixed 0.1 s), so the close no longer drops an End of Track, FIN or PUBLISH_DONE still in flight.
 - aiomoqt-relay status: each session shows `cwin_bytes`, `in_transit_bytes`, `pacing_bps`, `lost_packets`, `timer_losses`, `spurious_losses` and `rtt_max_ms`; `--trace-subscribers` (off by default) adds each subscription's `objects_sent`, `bytes_sent` and `largest_sent`; the control socket's `GET /sessions` returns these on demand.
 - A `produce()` track that ends, by returning or by `end()`, sends End of Track after its last object (one past it on the open group stream, else at the next group on a new stream, or as a status datagram), then PUBLISH_DONE TRACK_ENDED; `end()` no longer resets the open group. pub_media's tracks and catalog do this on `-t` expiry and SIGINT/SIGTERM. aiomoqt-relay forwards End of Track as received (it wrote End of Group).
