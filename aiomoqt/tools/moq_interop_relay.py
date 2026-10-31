@@ -50,7 +50,9 @@ Routing model (cross-session, single relay instance):
     every downstream subscriber of that track. With no match, send
     SUBSCRIBE_ERROR / REQUEST_ERROR with TRACK_DOES_NOT_EXIST (d14 code
     0x04, d16+ code 0x10) so a conformance suite sees a spec-correct
-    rejection.
+    rejection. For --startup-hold seconds after start, such a SUBSCRIBE
+    first waits for a publisher, so viewers that reconnect after a
+    restart before their publishers are answered.
   - PUBLISH_NAMESPACE_DONE: drop that session's hold on the namespace.
 
 Run on UDP/4443 with the runner's /certs convention:
@@ -240,6 +242,11 @@ _catalog_probe = False
 # subscriber before its upstream Forward State drops to 0; 0 = never.
 PAUSE_AFTER_S = 60.0
 _pause_after = PAUSE_AFTER_S
+# --startup-hold: seconds after start that a SUBSCRIBE no publisher can
+# serve waits for one; 0 = off.
+STARTUP_HOLD_S = 2.0
+# Loop time the startup hold ends, None when off.
+_hold_until = None
 # --lag-limit: delivery deadline in seconds for live objects on a lane
 # with no OBJECT_DELIVERY_TIMEOUT; 0 = none.
 LAG_LIMIT_S = 5.0
@@ -247,6 +254,20 @@ _lag_limit = LAG_LIMIT_S
 # --trace-subscribers: count what each subscription is sent.
 _trace_subscribers = False
 _pause_sweep = None
+
+
+def _begin_startup_hold(seconds: float) -> None:
+    """Hold SUBSCRIBEs for unserved tracks for `seconds` from now."""
+    global _hold_until
+    _hold_until = (asyncio.get_running_loop().time() + seconds
+                   if seconds > 0 else None)
+
+
+def _startup_hold_s() -> float:
+    """Seconds left of the startup hold; 0 once over."""
+    if _hold_until is None:
+        return 0.0
+    return max(_hold_until - asyncio.get_running_loop().time(), 0.0)
 
 
 async def _await_upstream(timeout: float = None) -> bool:
@@ -777,6 +798,8 @@ class _RelayedTrack:
         # A downstream SUBSCRIBE is establishing this track: an upstream
         # terminal that lands first waits in the queue for it.
         self.attaching = False
+        # Newest Location received, including objects still queued.
+        self.arrived = None
         # (id(session), group, subgroup) -> (stream_id, SubgroupHeader)
         self._streams = {}
         # id(session) -> {(group, subgroup): stream_id} of the streams
@@ -1193,6 +1216,8 @@ class _RelayedTrack:
             self._last_gid = gid
         if msg.object_id == 0:
             self._heads.add(gid)
+        if self.arrived is None or (gid, msg.object_id) > self.arrived:
+            self.arrived = (gid, msg.object_id)
         if self._gaps and self._gaps[-1][1] is None and not self.paused:
             self._gaps[-1][1] = (gid, msg.object_id)
         if self._resync:
@@ -1490,6 +1515,14 @@ class _RelayedTrack:
             return False
         first = (self._cache[0][0], self._cache[0][2])
         return start >= first
+
+    def holds_through(self, end) -> bool:
+        """The cache reaches `end`: it holds an object at or past it, the
+        End of Group of `end`'s group, or End of Track."""
+        return any((c[0], c[2]) >= end
+                   or c[6] == ObjectStatus.END_OF_TRACK
+                   or (c[0] == end[0] and c[6] == ObjectStatus.END_OF_GROUP)
+                   for c in reversed(self._cache))
 
     def open_gap(self) -> None:
         """Note a pause: what is published from just past Largest, or
@@ -1843,6 +1876,9 @@ async def _on_publish_namespace(session, msg):
     ns = _ns_tuple(msg.namespace)
     _watch_session(session, ns)
     _supersede_namespace(ns, session)
+    if not any(_session_live(s) for s in _announced.get(ns, ())):
+        # A new broadcast under this namespace: probe its catalog again.
+        _catalogs.pop(ns, None)
     holders = _announced.setdefault(ns, {})
     holders[session] = holders.get(session, 0) + 1
     _announce_requests[(id(session), msg.request_id)] = ns
@@ -2448,6 +2484,8 @@ async def _on_publish(session, msg):
     if track is None:
         track = _RelayedTrack(key)
         _tracks[key] = track
+        if msg.track_name == CATALOG_TRACK:
+            _catalogs.pop(ns, None)
     entry = _establishing.get(key)
     crossing = (entry is not None and entry.pub is session
                 and not entry.fut.done())
@@ -2805,14 +2843,20 @@ def _ensure_pause_sweep() -> None:
         _pause_sweep = loop.create_task(_sweep_unwatched())
 
 
-def _largest_kwargs(track) -> dict:
-    """SUBSCRIBE_OK Largest Location (§10.2.11); none when nothing has
-    been published."""
-    if track.largest is None:
+def _reply_largest(track):
+    """The Largest a SUBSCRIBE_OK reports (§10.2.11): the newest the
+    relay knows, objects still queued included; None before any."""
+    return max(filter(None, (track.largest, track.arrived)), default=None)
+
+
+def _largest_kwargs(largest) -> dict:
+    """SUBSCRIBE_OK Largest Location fields; none when nothing has been
+    published."""
+    if largest is None:
         return {}
     return {"content_exists": 1,
-            "largest_group_id": track.largest[0],
-            "largest_object_id": track.largest[1]}
+            "largest_group_id": largest[0],
+            "largest_object_id": largest[1]}
 
 
 def _resolve_against(msg, seen, track):
@@ -2861,8 +2905,8 @@ async def _await_publisher(session, ns: tuple, track_name,
 def _attach_subscriber(session, msg, track, largest) -> bool:
     """SUBSCRIBE_OK and join the fan-out with the SUBSCRIBE's Forward
     State and filter window, resolved against `largest` (§5.1.2); the
-    reply and a joining FETCH take the Largest the relay knows now
-    (§10.2.11). False when the End Group is already behind, answered
+    reply and its fill take the newest Largest the relay holds, a
+    joining FETCH the Largest it has taken in (§10.2.11). False when the End Group is already behind, answered
     INVALID_RANGE."""
     window = _subscription_window(msg, largest)
     if (window[1] is not None and track.largest is not None
@@ -2877,7 +2921,9 @@ def _attach_subscriber(session, msg, track, largest) -> bool:
         return False
     _watch_session(session, track.key[0])
     _ensure_pause_sweep()
-    ok = session.subscribe_ok(request_msg=msg, **_largest_kwargs(track),
+    reply_largest = _reply_largest(track)
+    ok = session.subscribe_ok(request_msg=msg,
+                              **_largest_kwargs(reply_largest),
                               track_properties=track.properties)
     # FORWARD omitted means 1 (§10.2.12).
     forward = msg.forward is None or bool(msg.forward)
@@ -2894,19 +2940,20 @@ def _attach_subscriber(session, msg, track, largest) -> bool:
     d.take_timeout(msg.parameters)
     session.register_request_cancel_handler(
         msg.request_id, lambda rid, t=track, s=session: t.drop_session(s))
-    _start_fill(track, d, msg)
+    _start_fill(track, d, msg, reply_largest)
     return True
 
 
-def _start_fill(track, d, msg) -> None:
+def _start_fill(track, d, msg, largest) -> None:
     """Open the fill fetch stream a FILL_PARAMETERS asks for (d22 §3.4.1),
-    under `msg`'s Request ID: none while paused or for an empty range,
-    reset at once for one that ends at or before the fence."""
+    under `msg`'s Request ID, its range resolved against the `largest`
+    the reply reported: none while paused or for an empty range, reset
+    at once for one that ends at or before the fence."""
     fill = (msg.parameters or {}).get(D20ParamType.FILL_PARAMETERS)
     if (fill is None or not d.forward
             or d.session._profile.param_table < 20):
         return
-    rng = fill_range(fill, d.location_filter, track.largest)
+    rng = fill_range(fill, d.location_filter, largest)
     if rng is None:
         return
     sid = id(d.session)
@@ -2947,9 +2994,16 @@ async def _serve_fill(track, d, request_id, fill, rng,
                 or GroupOrder.ASCENDING)
     objs, source, serving = None, "cache", False
     gapped = track.crosses_gap(start, end)
+
+    def cached():
+        # Only a range held from start to end: a short answer would
+        # claim the range is complete.
+        if (track.cache_covers(start) and not gapped
+                and track.holds_through(end)):
+            return track.cached_range(start, end) or None
+        return None
     try:
-        if track.cache_covers(start) and not gapped:
-            objs = track.cached_range(start, end) or None
+        objs = cached()
         if objs is None and timeout_ms != 0 and _fetch_sources(ns, name):
             wait = FILL_UPSTREAM_S if timeout_ms is None else min(
                 timeout_ms / 1000, FILL_UPSTREAM_S)
@@ -2963,16 +3017,24 @@ async def _serve_fill(track, d, request_id, fill, rng,
                                  o.payload, o.extensions,
                                  o.publisher_priority, o.status)
                                 for o in up], "upstream"
-        if track.cache_covers(start) and (objs is None or gapped):
-            # Cached while upstream was asked, or around the gap.
+        if gapped and track.cache_covers(start):
+            # Around the gap.
             objs = _merged(objs, track.cached_range(start, end)) or objs
-        gap = None
+        elif objs is None:
+            # Cached while upstream was asked.
+            objs = cached()
+        gap = tail = None
         if objs is None and timeout_ms is not None:
+            # What is held, with Timed-Out gaps for a missing head or tail.
             objs = track.cached_range(start, end)
             g, o = (objs[0][0], objs[0][2]) if objs else (end[0], end[1] + 1)
-            gap = FetchObject(group_id=g if o else g - 1,
-                              object_id=o - 1 if o else U64_MAX,
-                              end_of_range=FETCH_FLAGS_END_TIMED_OUT)
+            if (g, o) > start:
+                gap = FetchObject(group_id=g if o else g - 1,
+                                  object_id=o - 1 if o else U64_MAX,
+                                  end_of_range=FETCH_FLAGS_END_TIMED_OUT)
+            if objs and not track.holds_through(end):
+                tail = FetchObject(group_id=end[0], object_id=end[1],
+                                   end_of_range=FETCH_FLAGS_END_TIMED_OUT)
         if objs is None:
             logger.info(f"relay: fill {track.key} request {request_id} "
                         f"{start}..{end} unavailable, reset")
@@ -2981,9 +3043,10 @@ async def _serve_fill(track, d, request_id, fill, rng,
         objs = _filtered(objs, filters)
         if order == int(GroupOrder.DESCENDING):
             objs = sorted(objs, key=lambda o: (-o[0], o[2]))
-        served = _counted_fetch(objs, track, source)
-        if gap is not None:
-            served = itertools.chain((gap,), served)
+        served = itertools.chain(
+            () if gap is None else (gap,),
+            _counted_fetch(objs, track, source),
+            () if tail is None else (tail,))
         serving = True
         await session.serve_fetch(
             request_id, served, group_order=order,
@@ -3111,7 +3174,7 @@ def _apply_update(session, msg, found, d16: bool) -> None:
                   else _largest_object_param(session, track.largest))
         ok = RequestOk(request_id=msg.request_id, parameters=params)
         session._send_reply(msg.request_id, ok)
-        _start_fill(track, d, msg)
+        _start_fill(track, d, msg, track.largest)
     _resume_paused(track)
     if d16:
         _forward_new_group(track, msg.parameters)
@@ -3164,12 +3227,15 @@ async def _relay_subscribe(session, msg):
     """Relay a SUBSCRIBE: establish upstream, then fan out downstream."""
     ns = _ns_tuple(msg.track_namespace)
 
-    # §10.2.6: hold for a publisher up to RENDEZVOUS_TIMEOUT, then TIMEOUT.
+    # §10.2.6: hold for a publisher up to RENDEZVOUS_TIMEOUT, then TIMEOUT;
+    # else, within the startup hold, until it ends, then refuse as usual.
     # Once one appears the SUBSCRIBE proceeds as if it had just arrived.
-    wait_s = _rendezvous_s(session, msg)
+    rendezvous_s = _rendezvous_s(session, msg)
+    wait_s = rendezvous_s or _startup_hold_s()
     if wait_s and not _publisher_known(ns, msg.track_name):
         logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
-                    f"held up to {wait_s:.3f}s for a publisher")
+                    f"held up to {wait_s:.3f}s for a publisher"
+                    + ("" if rendezvous_s else " (startup hold)"))
         key = (ns, msg.track_name)
         wants = msg.forward is None or bool(msg.forward)
         _held_forwards.setdefault(key, []).append(wants)
@@ -3183,12 +3249,14 @@ async def _relay_subscribe(session, msg):
         if not found:
             if not _still_wanted(session, msg.request_id):
                 return
-            logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
-                        f"-> ERROR (rendezvous timeout)")
-            session.subscribe_error(
-                msg.request_id, error_code=RequestErrorCode.TIMEOUT,
-                reason="no publisher within the rendezvous timeout")
-            return
+            if rendezvous_s:
+                logger.info(f"relay: subscribe ns={ns} "
+                            f"track={msg.track_name} "
+                            f"-> ERROR (rendezvous timeout)")
+                session.subscribe_error(
+                    msg.request_id, error_code=RequestErrorCode.TIMEOUT,
+                    reason="no publisher within the rendezvous timeout")
+                return
 
     # Flow B first: a track already offered by PUBLISH is served from
     # that offer, no upstream SUBSCRIBE needed.
@@ -3332,6 +3400,14 @@ def parse_args(argv=None):
                              "seconds; the next subscriber resumes it. "
                              "--catalog-probe catalogs keep flowing. "
                              f"0 = never. Default: {PAUSE_AFTER_S:g}")
+    parser.add_argument("--startup-hold", type=float,
+                        default=STARTUP_HOLD_S, metavar="SEC",
+                        help="For SEC seconds after start, hold a SUBSCRIBE "
+                             "for a track no publisher serves until one "
+                             "does, then refuse it as usual, so viewers "
+                             "reconnecting after a restart before their "
+                             "publishers are answered. 0 = off. Default: "
+                             f"{STARTUP_HOLD_S:g}")
     parser.add_argument("--trace-subscribers", action="store_true",
                         help="Count the objects and bytes each subscription "
                              "is sent, for status and GET /sessions; off, "
@@ -3559,6 +3635,15 @@ async def _offer_track(session, track, key, request_id=None):
         _forget_session(session)
         return
     ns, name = key
+    # The relay's Largest as it makes the offer: the reply's filter
+    # resolves against it, as a SUBSCRIBE's does (§3.1.4).
+    seen = track.largest
+    if track.paused and track.upstream is not None:
+        # As for a SUBSCRIBE: resume first, so the offer carries the
+        # publisher's live Largest and the subscriber takes the fence.
+        await _resume_for(track, SimpleNamespace(forward=1))
+        if not _session_live(session):
+            return
     # A session that subscribed to a prefix gets every track under it,
     # including one it publishes itself: the subscription is explicit,
     # and moq-test's publish cases use one session for both roles.
@@ -3579,7 +3664,7 @@ async def _offer_track(session, track, key, request_id=None):
         # §10.2.12: FORWARD omitted from PUBLISH_OK means 1.
         forward = (getattr(reply, 'parameters', None) or {}).get(
             ParamType.FORWARD, 1)
-    window = _reply_window(session, reply, track.largest) or _UNFILTERED
+    window = _reply_window(session, reply, seen) or _UNFILTERED
     # Cached objects inside the subscriber's window go first.
     d = track.add_downstream(session, pub_msg.track_alias,
                              pub_msg.request_id, forward=bool(forward),
@@ -5151,6 +5236,8 @@ async def main():
     if args.lag_limit < 0:
         sys.exit("error: --lag-limit must be 0 or above")
     _lag_limit = args.lag_limit
+    if args.startup_hold < 0:
+        sys.exit("error: --startup-hold must be 0 or above")
     speaks = sorted(int(d) for d in MOQTDraft)
     wanted = args.draft if isinstance(args.draft, list) else [args.draft]
     if any(d not in speaks for d in wanted):
@@ -5231,6 +5318,7 @@ async def main():
 
     handles = [await (server.serve_dual() if args.dual else server.serve())
                for server, _port, _label in listeners]
+    _begin_startup_hold(args.startup_hold)
 
     # Dial origins after the listeners are up: an origin may itself be
     # waiting on us, and a failed dial retries rather than aborting.
