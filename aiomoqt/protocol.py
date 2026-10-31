@@ -4607,13 +4607,13 @@ class _MOQTSessionMixin:
         try:
             stream_id = await self.open_bidi_stream()
         except BaseException:
-            self._unbound_updates.pop(request_id, None)
+            (self._unbound_updates or {}).pop(request_id, None)
             self._fail_waiting_updates(request_id,
                                        "request stream did not open")
             raise
         self._bidi_streams[request_id] = stream_id
         self._bidi_stream_requests[stream_id] = request_id
-        updates = self._unbound_updates.pop(request_id, ())
+        updates = (self._unbound_updates or {}).pop(request_id, ())
         self.send_stream_message(stream_id, msg)
         for update in updates:
             self.send_stream_message(stream_id, update)
@@ -6730,7 +6730,9 @@ class _MOQTSessionMixin:
         unclaimed = self._unclaimed_publishes
         if unclaimed is None:
             unclaimed = self._unclaimed_publishes = OrderedDict()
-        unclaimed[getattr(msg, 'request_id', None)] = None
+        rid = getattr(msg, 'request_id', None)
+        if rid is not None:
+            unclaimed[rid] = None
         if len(unclaimed) > self.ANNOUNCEMENT_QUEUE_MAX:
             unclaimed.popitem(last=False)
 
