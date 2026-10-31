@@ -1843,6 +1843,9 @@ async def _on_publish_namespace(session, msg):
     ns = _ns_tuple(msg.namespace)
     _watch_session(session, ns)
     _supersede_namespace(ns, session)
+    if not any(_session_live(s) for s in _announced.get(ns, ())):
+        # A new broadcast under this namespace: probe its catalog again.
+        _catalogs.pop(ns, None)
     holders = _announced.setdefault(ns, {})
     holders[session] = holders.get(session, 0) + 1
     _announce_requests[(id(session), msg.request_id)] = ns
@@ -2448,6 +2451,8 @@ async def _on_publish(session, msg):
     if track is None:
         track = _RelayedTrack(key)
         _tracks[key] = track
+        if msg.track_name == CATALOG_TRACK:
+            _catalogs.pop(ns, None)
     entry = _establishing.get(key)
     crossing = (entry is not None and entry.pub is session
                 and not entry.fut.done())

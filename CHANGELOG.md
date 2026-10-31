@@ -2,6 +2,7 @@
 
 ## v0.14.0
 
+- aiomoqt-relay `--catalog-probe` probes a namespace again when a new PUBLISH_NAMESPACE or catalog PUBLISH replaces its broadcast, so the dashboard shows the new catalog format.
 - `MOQTSession.wait_delivered(timeout=0.5)` waits until everything written has been sent and acknowledged. pub_media's shutdown closes each session once it returns (was a fixed 0.1 s), so the close no longer drops an End of Track, FIN or PUBLISH_DONE still in flight.
 - aiomoqt-relay status: each session shows `cwin_bytes`, `in_transit_bytes`, `pacing_bps`, `lost_packets`, `timer_losses`, `spurious_losses` and `rtt_max_ms`; `--trace-subscribers` (off by default) adds each subscription's `objects_sent`, `bytes_sent` and `largest_sent`; the control socket's `GET /sessions` returns these on demand.
 - A `produce()` track that ends, by returning or by `end()`, sends End of Track after its last object (one past it on the open group stream, else at the next group on a new stream, or as a status datagram), then PUBLISH_DONE TRACK_ENDED; `end()` no longer resets the open group. pub_media's tracks and catalog do this on `-t` expiry and SIGINT/SIGTERM. aiomoqt-relay forwards End of Track as received (it wrote End of Group).
