@@ -3306,6 +3306,33 @@ class _MOQTSessionMixin:
         if not self._moqt_session_closed.done():
             self._moqt_session_closed.set_result((error_code, reason_phrase))
 
+    DELIVER_POLL_S = 0.005
+
+    async def wait_delivered(self, timeout: float = 0.5) -> bool:
+        """Wait at most `timeout` s until everything written has been sent
+        and acknowledged; True if it was. A connection close drops what the
+        peer has not acknowledged, so a graceful close waits here first."""
+        quic = self._quic
+        backlog = getattr(quic, '_tx_backlog', None)
+        stats = getattr(quic, 'path_quality', None)
+        deadline = time.monotonic() + timeout
+        quiet = 0
+        while self._session_writable():
+            # Queues before flight: what has left them is in flight by now.
+            idle = (not self._tx_deferred
+                    and not (backlog() if backlog else 0)
+                    and not ((stats() if stats else None) or {}).get(
+                        'bytes_in_transit'))
+            # Twice in a row: a FIN or bytes the worker has taken but not
+            # yet sent are in no count.
+            quiet = quiet + 1 if idle else 0
+            if quiet == 2:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(self.DELIVER_POLL_S)
+        return False
+
     def close(self,
               error_code: SessionCloseCode = SessionCloseCode.NO_ERROR,
               reason_phrase: str = ""

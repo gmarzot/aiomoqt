@@ -1,8 +1,8 @@
 """pub_media as a service: exit codes, no ready until a relay is up, a
-signal shutdown that withdraws the namespace and refuses late requests,
-and --reconnect keeping the media timeline across a relay restart. Audio
-and video on one session, over raw QUIC and WebTransport, through the
-interop relay."""
+signal shutdown that withdraws the namespace, refuses late requests and
+closes once the relay has acknowledged everything, and --reconnect
+keeping the media timeline across a relay restart. Audio and video on one
+session, over raw QUIC and WebTransport, through the interop relay."""
 import asyncio
 import csv
 import os
@@ -207,6 +207,20 @@ async def test_signal_withdraws_refuses_and_closes(
         probes.append(asyncio.ensure_future(late_subscribe()))
     monkeypatch.setattr(_MOQTSessionMixin, 'drain', drain)
     ended = _relay_end_of_track(monkeypatch)
+    delivered = {}
+    deliver_orig = _MOQTSessionMixin.wait_delivered
+
+    async def wait_delivered(self, *a, **kw):
+        ok = await deliver_orig(self, *a, **kw)
+        delivered[id(self)] = ok
+        return ok
+    monkeypatch.setattr(_MOQTSessionMixin, 'wait_delivered', wait_delivered)
+    close_orig = _MOQTSessionMixin.close
+
+    def close(self, *a, **kw):
+        log.append(('close', id(self), delivered.get(id(self))))
+        return close_orig(self, *a, **kw)
+    monkeypatch.setattr(_MOQTSessionMixin, 'close', close)
 
     srv, handle = await _serve(port, use_quic, draft)
     try:
@@ -239,6 +253,10 @@ async def test_signal_withdraws_refuses_and_closes(
     assert probes[1:] == [int(want)], probes
     assert {n for n, *_ in arrivals} >= {'video', 'audio'}
     assert ended == {'video', 'audio', 'catalog'}, ended
+    # The publisher closes only once its peer has acknowledged everything.
+    assert delivered and all(delivered.values()), delivered
+    assert [e[2] for e in log if e[0] == 'close' and e[1] in delivered] \
+        == [True] * len(delivered), log
     events = _pub_events(capsys.readouterr().out)
     assert events[-1] == {'event': 'done', 'reason': 'signal'}
 
@@ -267,6 +285,59 @@ async def test_the_duration_end_sends_end_of_track(
         await _stop(srv, handle)
     assert {n for n, *_ in arrivals} >= {'video', 'audio'}
     assert ended == {'video', 'audio', 'catalog'}, ended
+
+
+class _Wire:
+    """A connection whose send queue and flight read from scripted polls."""
+    def __init__(self, backlog, in_transit):
+        self.polls, self._backlog, self._in_transit = 0, backlog, in_transit
+
+    def _tx_backlog(self):
+        self.polls += 1
+        return self._backlog(self.polls)
+
+    def path_quality(self):
+        return {'bytes_in_transit': self._in_transit(self.polls)}
+
+
+class _Delivering:
+    DELIVER_POLL_S = 0.001
+    wait_delivered = _MOQTSessionMixin.wait_delivered
+
+    def __init__(self, wire, deferred=None):
+        self._quic, self._tx_deferred, self._close_err = wire, deferred, None
+
+    def _session_writable(self):
+        return self._close_err is None and self._quic is not None
+
+
+async def test_wait_delivered_waits_for_the_queue_and_the_flight():
+    wire = _Wire(lambda n: 1200 if n < 3 else 0,
+                 lambda n: 3000 if n < 6 else 0)
+    assert await _Delivering(wire).wait_delivered(timeout=1)
+    assert wire.polls == 7   # idle from poll 6, confirmed on poll 7
+
+
+async def test_wait_delivered_holds_for_a_deferred_fin():
+    s = _Delivering(_Wire(lambda n: 0, lambda n: 0),
+                    deferred={(2, 'send'): (('fin', b''), 0.0)})
+    assert not await s.wait_delivered(timeout=0.02)
+    s._tx_deferred = None
+    assert await s.wait_delivered(timeout=0.02)
+
+
+async def test_wait_delivered_gives_up_at_the_timeout():
+    s = _Delivering(_Wire(lambda n: 0, lambda n: 1500))
+    t = time.monotonic()
+    assert not await s.wait_delivered(timeout=0.05)
+    assert 0.05 <= time.monotonic() - t < 0.5
+
+
+async def test_wait_delivered_on_a_closed_session_returns_at_once():
+    s = _Delivering(_Wire(lambda n: 0, lambda n: 1500))
+    s._close_err = (0, '')
+    assert not await s.wait_delivered(timeout=5)
+    assert s._quic.polls == 0
 
 
 # -- --reconnect ---------------------------------------------------------------
