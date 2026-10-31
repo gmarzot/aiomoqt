@@ -2945,7 +2945,7 @@ class _MOQTSessionMixin:
         if transport_log.isEnabledFor(TRACE):
             transport_log.log(
                 TRACE, f"MOQT event: StreamDataReceived: stream: "
-                f"{stream_id} len: {len(data)}")
+                f"{stream_id} len: {len(data)}{' FIN' if end_stream else ''}")
 
         # d18: control is a uni pair, so every bidi stream is a request
         # stream (SUBSCRIBE/FETCH/...). Pre-d18 the first bidi stream is

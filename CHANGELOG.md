@@ -2,6 +2,7 @@
 
 ## v0.14.0
 
+- The transport TRACE line for received request-stream data ends with ` FIN` when the peer closed the stream, so a FIN no longer reads as `len: 0`.
 - A SubscribedTrack that discovers its track gets a PUBLISH_DONE that arrived while the PUBLISH was still queued (up to 1024 queued PUBLISHes), as the direct path already did.
 - Over WebTransport, `request_update()` right after its request no longer raises "no request stream bound": the update waits for the request's stream to open, then follows the request in order.
 - Every control message we send logs one INFO `MOQT send:` line as it is written, replies from default handlers, tracks and the relay included; a reply dropped for a cancelled request logs none.
