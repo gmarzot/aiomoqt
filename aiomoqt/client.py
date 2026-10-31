@@ -36,6 +36,7 @@ class MOQTClient(MOQTPeer):
         libquicr_compat: Optional[bool] = False,
         congestion_control_algorithm: Optional[str] = None,
         congestion_control_options: Optional[str] = None,
+        packet_train_mode: bool = False,
         flow_control_window: Optional[int] = None,
         tx_max_inflight_bytes: Optional[int] = DEFAULT_TX_MAX_INFLIGHT_BYTES,
         tx_max_queued_bytes: Optional[int] = None,
@@ -87,6 +88,8 @@ class MOQTClient(MOQTPeer):
         # Algorithm option string, e.g. "Q0.02" for bbr; None keeps the
         # configuration's.
         self.congestion_control_options = congestion_control_options
+        # Paced sends release up to 10 packets at once (picoquic train mode).
+        self.packet_train_mode = packet_train_mode
         # QUIC flow-control window, per stream and per connection; None keeps
         # the configuration's (16 MiB built here).
         self.flow_control_window = flow_control_window
@@ -161,6 +164,8 @@ class MOQTClient(MOQTPeer):
                     self.congestion_control_algorithm)
             if self.congestion_control_options is not None:
                 cfg.congestion_control_options = self.congestion_control_options
+            if self.packet_train_mode:
+                cfg.packet_train_mode = True
             if self.flow_control_window is not None:
                 cfg.max_data = cfg.max_stream_data = self.flow_control_window
             if self.tx_max_queued_bytes is not None:
@@ -246,6 +251,7 @@ class MOQTClient(MOQTPeer):
                 wt_cfg.congestion_control_algorithm),
             **({"congestion_control_options": cc_options}
                if cc_options is not None else {}),
+            **({"packet_train_mode": True} if self.packet_train_mode else {}),
             keep_alive_interval_ms=int(
                 (self.keep_alive_interval or 0) * 1000),
             socket_buffer_size=(self.socket_buffer_size or 0),

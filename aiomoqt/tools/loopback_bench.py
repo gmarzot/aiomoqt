@@ -130,6 +130,10 @@ def parse_args():
         help='Option string for the congestion controller, e.g. Q0.02: '
              'bbr sends bursts of 20 ms of pacing rate')
     parser.add_argument(
+        '--pacing-trains', action='store_true',
+        help='When pacing holds a connection back, send up to 10 packets '
+             'at once instead of one or two')
+    parser.add_argument(
         '--fc-window', type=int, default=None, metavar='BYTES',
         help='QUIC flow-control window, per stream and per connection; the '
              'receiver buffers this much per stream. Above rate x RTT for '
@@ -270,7 +274,8 @@ def print_banner(args):
         + (", fanout lane" if args.fanout else "")
         + (", per-peer props" if args.per_peer_props else ""))
     row("cc algorithm", args.cc_algo
-        + (f" {args.cc_options}" if args.cc_options else ""))
+        + (f" {args.cc_options}" if args.cc_options else "")
+        + (" trains" if args.pacing_trains else ""))
     if args.fc_window:
         row("fc window", f"{args.fc_window} B")
     if _emulated(args):
@@ -416,6 +421,7 @@ async def run_server(args):
         supported_drafts=args.draft,
         congestion_control_algorithm=args.cc_algo,
         congestion_control_options=args.cc_options,
+        packet_train_mode=args.pacing_trains,
         flow_control_window=args.fc_window,
         # None = honor protocol default (16 MB); 0 = opt out.
         **({'tx_max_inflight_bytes':
@@ -443,6 +449,7 @@ async def run_subscriber(args, stats):
         debug=args.debug,
         congestion_control_algorithm=args.cc_algo,
         congestion_control_options=args.cc_options,
+        packet_train_mode=args.pacing_trains,
         flow_control_window=args.fc_window,
     )
 
