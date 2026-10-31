@@ -248,6 +248,7 @@ def test_d16_setup_send_log_names_the_draft_not_a_d14_code(caplog):
     lg.setLevel(logging.INFO)
     try:
         s = _session(16, is_client=False)
+        s.send_control_message = s._log_send
         s._is_wt = False
         s.server_setup()
         s.client_setup(versions=[0xff00000e])
