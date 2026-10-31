@@ -6,7 +6,7 @@ from . import MOQTMessage, BUF_SIZE
 from .params import LocationFilter, uses_location_filter
 from ..types import ParamType, SubscribeDoneCode
 from ..context import is_draft16_or_later, DraftProfile
-from ..utils.buffer import Buffer, BufferReadError
+from ..utils.buffer import Buffer
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -716,7 +716,7 @@ class SubscribeDone(MOQTMessage):
             code = self._D18_WIRE_SWAP.get(code, code)
         payload.push_vint(code)
         payload.push_vint(self.stream_count)
-        
+
         reason_bytes = self.reason.encode()
         payload.push_vint(len(reason_bytes))
         payload.push_bytes(reason_bytes)

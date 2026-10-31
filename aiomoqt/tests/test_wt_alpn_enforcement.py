@@ -3,7 +3,6 @@ it is one we offered; with no WT-Protocol, a d14 offer settles d14 in-band.
 Anything else closes the WT session with WT_ALPN_ERROR
 (draft-ietf-webtrans-http3-16 §3.3) and raises MOQTNegotiationError.
 """
-import asyncio
 
 import pytest
 from aiopquic.asyncio.webtransport import serve_webtransport

@@ -468,7 +468,7 @@ class MOQTMessage:
             exts = KeyValuePairs(exts)
             exts.duplicates = frozenset(dups)
         return exts if exts else None
-          
+
     @staticmethod
     def _bytes_encode(value: Any) -> bytes:
         if isinstance(value, int):
@@ -482,7 +482,7 @@ class MOQTMessage:
         buf = Buffer(capacity=8)
         buf.push_uint_var(value)
         return buf.data
-    
+
     @staticmethod
     def _varint_decode(data: bytes) -> int:
         buf = Buffer(data=data)
@@ -570,45 +570,45 @@ class MOQTMessage:
     def describe(self, prof: Optional[DraftProfile] = None) -> str:
         """All fields, with Message Parameters named at `prof`'s draft."""
         parts = []
-        
-        for field in fields(self.__class__):
-            value = getattr(self, field.name)
-            
+
+        for fld in fields(self.__class__):
+            value = getattr(self, fld.name)
+
             # Skip redundant type field
-            if field.name == 'type':
+            if fld.name == 'type':
                 continue
-                
+
             if value is None:
-                parts.append(f"{field.name}=None")
+                parts.append(f"{fld.name}=None")
                 continue
-            
+
             # Format based on value type
-            if "version" in field.name.lower():
+            if "version" in fld.name.lower():
                 # Version fields - show in hex
                 if isinstance(value, (list, tuple)):
                     str_val = "[" + ", ".join(f"0x{x:x}" for x in value) + "]"
                 else:
                     str_val = f"0x{value:x}"
-                    
-            elif field.name == "parameters":
+
+            elif fld.name == "parameters":
                 # Parameters dict - special formatting
                 str_val = self._format_parameters(value, class_name(self), prof)
-                
+
             elif (isinstance(value, (list, tuple)) and value
                   and all(isinstance(v, bytes) for v in value)):
                 # Namespace tuple - decode each part
                 items = [self._format_bytes(item, prefer_text=True) for item in value]
                 str_val = "[" + ", ".join(items) + "]"
-                
+
             elif isinstance(value, bytes):
                 # Bytes field - try UTF-8 decode
                 str_val = self._format_bytes(value, prefer_text=True)
-                
+
             else:
                 # Everything else - use default string representation
                 str_val = str(value)
-                
-            parts.append(f"{field.name}={str_val}")
+
+            parts.append(f"{fld.name}={str_val}")
 
         return f"{class_name(self)}({', '.join(parts)})"
 
@@ -618,10 +618,10 @@ class MOQTMessage:
         """Format parameters dict for display."""
         if not params:
             return "{}"
-        
+
         # Determine which enum to use based on message type
         is_setup = message_class_name.endswith('Setup')
-        
+
         items = []
         for k, v in params.items():
             if is_setup:
@@ -631,7 +631,7 @@ class MOQTMessage:
                     pname = f"0x{k:02x}"
             else:
                 pname = param_name(k, prof)
-            
+
             # Format value - even types are ints, odd types are bytes
             if k % 2 == 0:
                 items.append(f"{pname}={v}")
@@ -640,7 +640,7 @@ class MOQTMessage:
                     items.append(f"{pname}={MOQTMessage._format_bytes(v, prefer_text=True)}")
                 else:
                     items.append(f"{pname}=\"{v}\"")
-        
+
         return "{" + ", ".join(items) + "}"
 
 
@@ -648,7 +648,7 @@ class MOQTMessage:
     def _format_bytes(data: bytes, prefer_text: bool = False, max_len: int = 32) -> str:
         """
         Format bytes for display, trying UTF-8 decode when appropriate.
-        
+
         Args:
             data: Bytes to format
             prefer_text: If True, strongly prefer text representation
@@ -656,7 +656,7 @@ class MOQTMessage:
         """
         if not data:
             return '""' if prefer_text else "0x"
-        
+
         try:
             decoded = data.decode('utf-8')
             # Check if it's reasonable text (all printable or common whitespace)
@@ -682,7 +682,7 @@ class MOQTMessage:
             truncated = hex_output[:max_len]
             suffix = "..." if len(hex_output) > max_len else ""
             return f"0x{truncated}{suffix}"
-    
+
     @staticmethod
     def _serialize_params(payload: Buffer, parameters: Dict[int, Any],
                           *, prof: DraftProfile,

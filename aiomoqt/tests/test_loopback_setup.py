@@ -13,7 +13,6 @@ import pytest
 
 from aiomoqt.types import (
     MOQTMessageType, ParamType,
-    MOQT_VERSION_DRAFT14, MOQT_VERSION_DRAFT16,
 )
 from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer

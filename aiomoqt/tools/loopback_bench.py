@@ -29,6 +29,7 @@ from aiomoqt.types import LOC_TIMESTAMP, ForwardingPreference
 from aiomoqt.utils import cli as _cli
 from aiomoqt.utils import wait_cond_timeout
 from aiomoqt.utils.certs import ensure_self_signed, find_cert, find_key
+from aiomoqt.utils.hostinfo import cpu_summary
 from aiomoqt.tools.sub_bench import BenchReporter
 
 
@@ -287,6 +288,7 @@ def print_banner(args):
     row("object size", f"{args.object_size} B")
     row("object rate", rate_s)
     row("duration", f"{args.duration}s")
+    row("cpu", cpu_summary())
     print("─" * 56)
 
 
@@ -375,8 +377,9 @@ class _FanoutTrack(PublishedTrack):
             self._waiting = False
 
 
-async def _on_subscribe(session, msg, args):
-    """Server-side subscribe handler using PublishedTrack."""
+async def _on_subscribe(session, msg, args, tracks):
+    """Server-side subscribe handler using PublishedTrack; the track is
+    added to `tracks`."""
     track_class = _FanoutTrack if args.fanout else PublishedTrack
     track = track_class(
         session,
@@ -392,6 +395,7 @@ async def _on_subscribe(session, msg, args):
     )
     if args.fanout:
         track.per_peer_props = args.per_peer_props
+    tracks.append(track)
     # Suppress publisher periodic stats in loopback mode —
     # both sides print to the same terminal, causing interleaved output
     track._stats_header_printed = True  # skip header
@@ -404,7 +408,7 @@ async def _on_subscribe(session, msg, args):
     await track.generate(session, ok.track_alias)
 
 
-async def run_server(args):
+async def run_server(args, tracks):
     """Run a MOQTServer that generates data when subscribers connect."""
     from functools import partial
 
@@ -427,12 +431,13 @@ async def run_server(args):
     )
     server.register_handler(
         MOQTMessageType.SUBSCRIBE,
-        partial(_on_subscribe, args=args))
+        partial(_on_subscribe, args=args, tracks=tracks))
     return await server.serve()
 
 
-async def run_subscriber(args, stats):
-    """Connect as subscriber and collect stats."""
+async def run_subscriber(args, stats, tracks):
+    """Connect as subscriber and collect stats. With --fanout the
+    publisher's `tracks` end first, so no lane fills that nobody reads."""
     client = MOQTClient(
         args.bind, args.port,
         path="/",
@@ -469,6 +474,12 @@ async def run_subscriber(args, stats):
                     track.wait_closed(), timeout=args.duration):
                 track.completed = True
             stats.finish()
+            if args.fanout:
+                # End of Track, then PUBLISH_DONE; generator tracks stop
+                # with the session, as they have no lane to fill.
+                for pub in tracks:
+                    pub.end()
+                await wait_cond_timeout(track.wait_closed(), timeout=1.0)
     except Exception as e:
         print(f"  Subscriber error: {e}")
 
@@ -509,7 +520,8 @@ async def main():
         return 1
 
     print("  Starting server...")
-    quic_server = await run_server(args)
+    tracks = []
+    quic_server = await run_server(args, tracks)
 
     # Give server a moment
     await asyncio.sleep(0.5)
@@ -524,7 +536,7 @@ async def main():
 
     # Run subscriber
     print("  Connecting subscriber...")
-    await run_subscriber(args, stats)
+    await run_subscriber(args, stats, tracks)
 
     # End tracemalloc snap before cleanup; diff against baseline.
     if _trace_enabled and _baseline_snap[0] is not None:

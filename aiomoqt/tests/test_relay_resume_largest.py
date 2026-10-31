@@ -4,7 +4,8 @@ SUBSCRIBE with the Largest from the publisher's REQUEST_OK, and the
 joining FETCH (d16/d18) or current-group fill (d20+) serves nothing from
 before the pause, even from a publisher whose Largest stood still, where
 a fill the fence empties is reset (§3.4.1). A join that beats the
-pause's REQUEST_OK still gets the open group. Two LOC tracks on one
+pause's REQUEST_OK still gets the open group, and a PUBLISH offer to a
+SUBSCRIBE_TRACKS subscriber resumes the same way. Two LOC tracks on one
 publisher session, over raw QUIC and WebTransport."""
 import asyncio
 import contextlib
@@ -305,3 +306,74 @@ async def test_loc_largest_moves_while_paused():
     await produce
     assert out.written[2:] == [(5, 0, b"\x0a\x00k"), (5, 1, b"\x0a\x00p")]
     assert track._largest == (5, 1)
+
+
+@requires_certs
+@pytest.mark.asyncio
+@pytest.mark.parametrize("draft", [18, 22])
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+async def test_a_paused_track_offered_by_publish_starts_at_live(
+        draft, use_quic):
+    # A SUBSCRIBE_TRACKS subscriber offered a paused track: the relay
+    # resumes it before the PUBLISH, which carries the live Largest, and
+    # the subscription takes the fence: its joining FETCH (d18) serves
+    # nothing from before the pause.
+    port = _PORT + 60 + 2 * (draft == 22) + (not use_quic)
+    async with _relay(port, use_quic, (draft,),
+                      LocTrackPublisher) as connect:
+        rx = await connect()
+        live = {name: [] for name in _GOP}
+        rx.on_object_received = (
+            lambda msg, _n, _ts, g, _sg: live.get(_track_of(msg), []).append(
+                (g, msg.object_id)))
+        oks = [await rx.subscribe(_NS, name, forward=1, wait_response=True)
+               for name in _GOP]
+        assert await _until(lambda: all(live.values())), live
+        for ok in oks:
+            rx.unsubscribe(ok.request_id)
+        tracks = {name: relay._tracks[_key(name)] for name in _GOP}
+        assert await _until(lambda: all(t.paused for t in tracks.values()))
+        await asyncio.sleep(0.2)
+        before = {name: t.largest for name, t in tracks.items()}
+        await asyncio.sleep(0.5)
+
+        rx2 = await connect()
+        got = {name: [] for name in _GOP}
+        fetched = {name: [] for name in _GOP}
+        rx2.on_fetch_object = (
+            lambda obj, _n, _ts, _rid: fetched.get(
+                _track_of(obj), []).append((obj.group_id, obj.object_id)))
+        offers = {}
+        await rx2.subscribe_tracks(namespace=_NS)
+        for _ in _GOP:
+            offer = await rx2.await_publish(timeout=5.0)
+            name = offer.track_name.decode()
+            largest = (offer.largest_group_id, offer.largest_object_id)
+            assert largest > before[name], (name, largest, before[name])
+            rx2._track_aliases[offer.track_alias] = offer.request_id
+            rx2.register_object_handler(
+                offer.track_alias,
+                lambda m, _n, _ts, g, _sg, n=name: got[n].append(
+                    (g, m.object_id)))
+            rx2.publish_ok(offer, forward=1)
+            offers[name] = offer
+        assert await _until(lambda: all(
+            len(t.downstream) == 1 for t in tracks.values()))
+        for name, t in tracks.items():
+            assert t.fence is not None and t.downstream[0].fence == t.fence, (
+                name, t.fence, t.downstream[0].fence)
+        assert await _until(lambda: all(got.values())), got
+        if draft < 20:
+            for offer in offers.values():
+                with contextlib.suppress(MOQTRequestError):
+                    await rx2.joining_fetch(offer.request_id,
+                                            joining_start=0,
+                                            wait_response=True)
+        await asyncio.sleep(0.2)
+        # From d20 PUBLISH_OK carries no filter: the subscription is
+        # unfiltered and replays the cache, so only fetches are checked.
+        for name in _GOP:
+            seen = fetched[name] + (got[name] if draft < 20 else [])
+            stale = [loc for loc in seen if loc <= before[name]]
+            assert not stale, (name, before[name], stale)
+        assert rx2._close_err is None

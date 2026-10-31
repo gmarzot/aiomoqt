@@ -171,7 +171,9 @@ function renderTiles(s) {
   setTile('rtt', fmt.ms(T.rtt_p50_ms), `p99 ${fmt.ms(T.rtt_p99_ms)}`);
   const lag = T.loop_lag_ms || {};
   setTile('lag', fmt.ms(lag.p99), `p50 ${fmt.ms(lag.p50)}`);
-  setTile('loss', fmt.pct(T.loss_pct, 2), 'delivery sessions');
+  setTile('loss', fmt.pct(T.loss_pct, 2),
+          none(T.spurious_pct) ? 'delivery sessions' : `spurious ${fmt.pct(T.spurious_pct, 2)}`,
+          'Packets lost toward viewers; spurious = declared lost, acknowledged later');
   setTile('drops', drops ? fmt.num(drops.reduce((a, b) => a + b, 0)) : '—',
           `${fmt.num(T.drops)} since start`, 'Subscribers dropped; bars per minute');
   const groupsIn = none(T.groups_per_s) ? groups : T.groups_per_s;
