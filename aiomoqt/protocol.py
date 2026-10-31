@@ -640,6 +640,10 @@ class _MOQTSessionMixin:
         self._publish_announcements: asyncio.Queue = asyncio.Queue(
             maxsize=self.ANNOUNCEMENT_QUEUE_MAX)
         self._announcements_overflowing: Set[str] = set()
+        # Queued PUBLISH request id -> its PUBLISH_DONE, None until one
+        # arrives; dropped once a done handler registers. Bounded.
+        self._unclaimed_publishes: "OrderedDict[int, Optional[SubscribeDone]]" = \
+            OrderedDict()
 
     ANNOUNCEMENT_QUEUE_MAX = 1024
 
@@ -1074,7 +1078,14 @@ class _MOQTSessionMixin:
                                       callback: Callable) -> None:
         """Called as callback(msg) when PUBLISH_DONE ends the
         subscription `request_id` (§10.11). Once per request; the
-        session stays up."""
+        session stays up. A queued PUBLISH's PUBLISH_DONE that already
+        arrived is delivered at once."""
+        held = self._unclaimed_publishes.pop(request_id, None)
+        if held is not None:
+            # PUBLISH_DONE came while its PUBLISH waited to be claimed.
+            self._release_track_later(request_id)
+            callback(held)
+            return
         self._publish_done_handlers[request_id] = callback
 
     def register_fetch_object_handler(self, request_id: int,
@@ -6432,6 +6443,8 @@ class _MOQTSessionMixin:
                 cb(msg)
             except Exception:
                 logger.debug("publish-done handler raised", exc_info=True)
+        elif msg.request_id in self._unclaimed_publishes:
+            self._unclaimed_publishes[msg.request_id] = msg
         # Terminal for that subscription only: the session stays up.
         # Owners learn of it through register_publish_done_handler().
         self._subscriptions.pop(msg.request_id, None)
@@ -6679,6 +6692,10 @@ class _MOQTSessionMixin:
     async def _handle_publish(self, msg: Publish) -> None:
         control_log.debug(f"MOQT event: handle {self._msgstr(msg)}")
         self._queue_announcement(self._publish_announcements, msg, "PUBLISH")
+        unclaimed = self._unclaimed_publishes
+        unclaimed[msg.request_id] = None
+        if len(unclaimed) > self.ANNOUNCEMENT_QUEUE_MAX:
+            unclaimed.popitem(last=False)
 
     async def _handle_publish_ok(self, msg: PublishOk) -> None:
         """Subscriber accepted our PUBLISH.
