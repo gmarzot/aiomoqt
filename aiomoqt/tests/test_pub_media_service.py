@@ -1,8 +1,8 @@
 """pub_media as a service: exit codes, no ready until a relay is up, a
 signal shutdown that withdraws the namespace, refuses late requests and
-closes once the relay has acknowledged everything, and --reconnect keeping the media timeline across a relay restart. Audio
-and video on one session, over raw QUIC and WebTransport, through the
-interop relay."""
+closes once the relay has acknowledged everything, and --reconnect
+keeping the media timeline across a relay restart. Audio and video on one
+session, over raw QUIC and WebTransport, through the interop relay."""
 import asyncio
 import csv
 import os
