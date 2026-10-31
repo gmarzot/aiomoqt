@@ -2,6 +2,8 @@
 
 ## v0.14.0
 
+- The bench tools print the CPU model, CPU count and clock in their banner and results; adaptive_bench, load_sim and sub_media `--report` CSVs add `cpu_model`, `cpu_count` and `cpu_mhz` columns.
+- loopback_bench `--fanout` ends its publisher's track before the subscriber leaves, so a paced run no longer ends with a send-lane shed WARNING.
 - aiomoqt-relay status: `loss_pct` toward viewers is real loss (declared lost minus acknowledged later); the new `spurious_pct` reports the rest, per session, in the totals and on the dashboard's Loss tile.
 - aiomoqt-relay status: a session that both publishes and subscribes reports no `loss_pct` and stays out of the total loss, since its loss count can't be split by direction; `lost_packets` is picoquic's raw count, unacknowledged ACK-only packets toward a publisher included.
 - The transport TRACE line for received request-stream data ends with ` FIN` when the peer closed the stream, so a FIN no longer reads as `len: 0`.
