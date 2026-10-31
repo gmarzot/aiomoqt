@@ -1244,9 +1244,7 @@ async def _shutdown(pub: FanoutPublisher, sessions: list,
         await asyncio.sleep(0.02)
     if announced:
         for s in sessions:
-            # Behind the PUBLISH_DONEs still waiting on their data.
-            s.send_after_data(functools.partial(
-                s.publish_namespace_done, namespace=pub.namespace))
+            s.publish_namespace_done(namespace=pub.namespace)
     await asyncio.gather(*(s.wait_delivered() for s in sessions))
     for s in sessions:
         s.close()
