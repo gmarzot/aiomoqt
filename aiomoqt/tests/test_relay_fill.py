@@ -270,7 +270,7 @@ async def test_an_empty_cache_and_a_failed_upstream_fail_the_fill(
         track = SimpleNamespace(
             key=((b"relay", b"fill"), name.encode()),
             crosses_gap=lambda *_: False, cache_covers=lambda _: True,
-            cached_range=lambda *_: [])
+            holds_through=lambda _: True, cached_range=lambda *_: [])
         await relay._serve_fill(track, d, rid, fill, ((2, 0), (2, 4)))
     if timeout_ms is None:
         assert failed == [0, 1] and not served, (failed, served)
@@ -280,3 +280,66 @@ async def test_an_empty_cache_and_a_failed_upstream_fail_the_fill(
         assert [(o.end_of_range, o.group_id, o.object_id)
                 for o in served[rid]] == [
                     (relay.FETCH_FLAGS_END_TIMED_OUT, 2, 4)], served
+
+
+class _Short(PublishedTrack):
+    """Holds objects 0..4 of group 2 and PUBLISHes Largest (2, 4), but
+    sends objects 0..2 only."""
+
+    written = False
+
+    async def generate(self, session, track_alias):
+        if self.written:
+            return
+        self.written = True
+        sid = await session.open_uni_stream()
+        hdr = SubgroupHeader(track_alias=track_alias, group_id=2,
+                             subgroup_id=0, publisher_priority=128,
+                             extensions_present=True, prof=session._profile)
+        session.stream_write(sid, hdr.serialize().data)
+        for oid in range(3):
+            await session.stream_write_drain(sid, hdr.next_object(
+                payload=b"x" * _SIZES[self.trackname], extensions=None,
+                object_id=oid).data)
+
+
+@_TRANSPORTS
+@pytest.mark.parametrize("mode", ["upstream", "reset", "gap"])
+async def test_a_fill_past_the_cache_is_not_served_short(use_quic, mode):
+    # The relay holds (2, 0)..(2, 2) and the Largest is (2, 4): the fill
+    # goes upstream for the range, else is reset, or under FILL_TIMEOUT 0
+    # serves what is held and a Timed-Out gap for the rest.
+    case = 3 + ["upstream", "reset", "gap"].index(mode)
+    async with _relay(_port(case, use_quic), use_quic) as connect:
+        pub = await connect()
+        history = (1 << 20) if mode == "upstream" else 0
+        for name in _SIZES:
+            track = _Short(pub, namespace=_NS, trackname=name,
+                           fetch_history_bytes=history)
+            for oid in range(_GROUP):
+                if history:
+                    track._remember(2, oid, b"x" * _SIZES[name])
+                else:
+                    track._note_largest(2, oid)
+            await track.publish(publish_track=True, forward=1)
+        assert await _until(lambda: all(
+            _relayed(n) is not None and len(_relayed(n)._cache) == 3
+            and _relayed(n).largest == (2, 4) for n in _SIZES))
+        rx = _Rx(await connect())
+        fill = {ParamType.LOCATION_FILTER: LocationFilter.relative(1)}
+        if mode == "gap":
+            fill[D20ParamType.FILL_TIMEOUT] = 0
+        oks = dict(zip(_SIZES, await asyncio.gather(*(
+            _sub(rx, n, fill) for n in _SIZES))))
+        for name, ok in oks.items():
+            assert (ok.largest_group_id, ok.largest_object_id) == (2, 4)
+            clean, got = await rx.done(ok.request_id)
+            if mode == "upstream":
+                assert (clean, got) == (True, _span((2, 0), (2, 4))), name
+                assert rx.sizes(ok.request_id) == {_SIZES[name]}
+            elif mode == "reset":
+                assert (clean, got) == (False, []), name
+            else:
+                assert (clean, got) == (True, _span((2, 0), (2, 2))), name
+                assert rx.gaps[ok.request_id] == [(0x20C, 2, 4)], name
+        assert rx.session._close_err is None

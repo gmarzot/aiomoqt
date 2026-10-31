@@ -2,6 +2,7 @@
 
 ## v0.14.0
 
+- aiomoqt-relay: a fill whose range runs past what the cache holds asks upstream for it, else is reset, or under FILL_TIMEOUT serves what is held and a Timed-Out gap for the rest, instead of a short stream that ends cleanly.
 - aiomoqt-relay: a SUBSCRIBE_OK reports the newest Largest the relay holds, objects that arrived while the subscription was being set up included, and its fill range resolves against that Largest.
 - aiomoqt-relay `--catalog-probe` probes a namespace again when a new PUBLISH_NAMESPACE or catalog PUBLISH replaces its broadcast, so the dashboard shows the new catalog format.
 - `MOQTSession.wait_delivered(timeout=0.5)` waits until everything written has been sent and acknowledged. pub_media's shutdown closes each session once it returns (was a fixed 0.1 s), so the close no longer drops an End of Track, FIN or PUBLISH_DONE still in flight.

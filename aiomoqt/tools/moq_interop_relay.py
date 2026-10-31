@@ -1495,6 +1495,14 @@ class _RelayedTrack:
         first = (self._cache[0][0], self._cache[0][2])
         return start >= first
 
+    def holds_through(self, end) -> bool:
+        """The cache reaches `end`: it holds an object at or past it, the
+        End of Group of `end`'s group, or End of Track."""
+        return any((c[0], c[2]) >= end
+                   or c[6] == ObjectStatus.END_OF_TRACK
+                   or (c[0] == end[0] and c[6] == ObjectStatus.END_OF_GROUP)
+                   for c in reversed(self._cache))
+
     def open_gap(self) -> None:
         """Note a pause: what is published from just past Largest, or
         from (0, 0) with none known, until objects flow again may never
@@ -2965,9 +2973,16 @@ async def _serve_fill(track, d, request_id, fill, rng,
                 or GroupOrder.ASCENDING)
     objs, source, serving = None, "cache", False
     gapped = track.crosses_gap(start, end)
+
+    def cached():
+        # Only a range held from start to end: a short answer would
+        # claim the range is complete.
+        if (track.cache_covers(start) and not gapped
+                and track.holds_through(end)):
+            return track.cached_range(start, end) or None
+        return None
     try:
-        if track.cache_covers(start) and not gapped:
-            objs = track.cached_range(start, end) or None
+        objs = cached()
         if objs is None and timeout_ms != 0 and _fetch_sources(ns, name):
             wait = FILL_UPSTREAM_S if timeout_ms is None else min(
                 timeout_ms / 1000, FILL_UPSTREAM_S)
@@ -2981,16 +2996,24 @@ async def _serve_fill(track, d, request_id, fill, rng,
                                  o.payload, o.extensions,
                                  o.publisher_priority, o.status)
                                 for o in up], "upstream"
-        if track.cache_covers(start) and (objs is None or gapped):
-            # Cached while upstream was asked, or around the gap.
+        if gapped and track.cache_covers(start):
+            # Around the gap.
             objs = _merged(objs, track.cached_range(start, end)) or objs
-        gap = None
+        elif objs is None:
+            # Cached while upstream was asked.
+            objs = cached()
+        gap = tail = None
         if objs is None and timeout_ms is not None:
+            # What is held, with Timed-Out gaps for a missing head or tail.
             objs = track.cached_range(start, end)
             g, o = (objs[0][0], objs[0][2]) if objs else (end[0], end[1] + 1)
-            gap = FetchObject(group_id=g if o else g - 1,
-                              object_id=o - 1 if o else U64_MAX,
-                              end_of_range=FETCH_FLAGS_END_TIMED_OUT)
+            if (g, o) > start:
+                gap = FetchObject(group_id=g if o else g - 1,
+                                  object_id=o - 1 if o else U64_MAX,
+                                  end_of_range=FETCH_FLAGS_END_TIMED_OUT)
+            if objs and not track.holds_through(end):
+                tail = FetchObject(group_id=end[0], object_id=end[1],
+                                   end_of_range=FETCH_FLAGS_END_TIMED_OUT)
         if objs is None:
             logger.info(f"relay: fill {track.key} request {request_id} "
                         f"{start}..{end} unavailable, reset")
@@ -2999,9 +3022,10 @@ async def _serve_fill(track, d, request_id, fill, rng,
         objs = _filtered(objs, filters)
         if order == int(GroupOrder.DESCENDING):
             objs = sorted(objs, key=lambda o: (-o[0], o[2]))
-        served = _counted_fetch(objs, track, source)
-        if gap is not None:
-            served = itertools.chain((gap,), served)
+        served = itertools.chain(
+            () if gap is None else (gap,),
+            _counted_fetch(objs, track, source),
+            () if tail is None else (tail,))
         serving = True
         await session.serve_fetch(
             request_id, served, group_order=order,
