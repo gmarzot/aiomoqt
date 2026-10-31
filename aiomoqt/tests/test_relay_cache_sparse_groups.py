@@ -85,13 +85,16 @@ async def test_fill_and_fetch_of_a_previous_sparse_group_come_from_cache(
             t.attach()
         await pub.publish_namespace(namespace=_NS, wait_response=True)
         rx = fill._Rx(await connect())
-        current = {ParamType.LOCATION_FILTER: LocationFilter.relative(1)}
+        # The SUBSCRIBE opened a new group, already in when it is answered.
+        previous = {ParamType.LOCATION_FILTER: LocationFilter.absolute(
+            _BASE, 0, _BASE, 0)}
         oks = {n: await rx.session.subscribe(
             _NS, n, location_filter=LocationFilter.next_object(),
-            parameters={D20ParamType.FILL_PARAMETERS: current},
+            parameters={D20ParamType.FILL_PARAMETERS: previous},
             wait_response=True) for n in _SIZES}
         for name, ok in oks.items():
-            assert (ok.largest_group_id, ok.largest_object_id) == (_BASE, 0)
+            assert (ok.largest_group_id, ok.largest_object_id) == (
+                tracks[name].current, 0)
             assert await rx.done(ok.request_id) == (True, [(_BASE, 0)])
             assert rx.sizes(ok.request_id) == {_SIZES[name]}
             relayed = relay._tracks[((b"relay", b"sparse"), name.encode())]

@@ -130,8 +130,9 @@ def _sub(rx, name, fill, **kw):
 @_TRANSPORTS
 async def test_fill_from_upstream_then_from_the_cache(use_quic):
     # A fresh upstream holds nothing older than the live edge, so the fill
-    # comes from the publisher's FETCH; a later subscriber's comes from
-    # the cache. Each carries its SUBSCRIBE's Request ID.
+    # comes from the publisher's FETCH, directly or through the relay's
+    # backfill; a later subscriber's comes from the cache. Each carries
+    # its SUBSCRIBE's Request ID.
     async with _relay(_port(0, use_quic), use_quic) as connect:
         await _publisher(connect)
         rx = _Rx(await connect())
@@ -146,8 +147,6 @@ async def test_fill_from_upstream_then_from_the_cache(use_quic):
             end = min(largest, (1, 1)) if name == "audio" else largest
             assert await rx.done(ok.request_id) == (True, _span(start, end))
             assert rx.sizes(ok.request_id) == {_SIZES[name]}
-            assert relay._tracks[((b"relay", b"fill"), name.encode())] \
-                ._fetch_bytes["upstream"] > 0
         # Warm cache: the current group from object 0.
         for name in _SIZES:
             t = _relayed(name)
