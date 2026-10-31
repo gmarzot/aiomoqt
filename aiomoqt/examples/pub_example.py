@@ -3,6 +3,7 @@ import argparse
 import asyncio
 import logging
 import uuid
+from typing import Any
 
 from aiomoqt.types import MOQT_DEFAULT_DRAFTS, ForwardingPreference, parse_draft_spec
 from aiomoqt.client import MOQTClient
@@ -91,6 +92,10 @@ async def main(host: str, port: int, path: str, namespace: str, trackname: str,
     set_log_level(log_level)
     logger = get_logger(__name__)
 
+    inflight: dict[str, Any] = (
+        {'tx_max_inflight_bytes':
+         (None if max_inflight_bytes == 0 else max_inflight_bytes)}
+        if max_inflight_bytes is not None else {})
     client = MOQTClient(
         host,
         port,
@@ -102,9 +107,7 @@ async def main(host: str, port: int, path: str, namespace: str, trackname: str,
         keylog_filename=args.keylogfile,
         congestion_control_algorithm=cc_algo,
         tx_max_queued_bytes=max_queued_bytes,
-        **({'tx_max_inflight_bytes':
-            (None if max_inflight_bytes == 0 else max_inflight_bytes)}
-           if max_inflight_bytes is not None else {}),
+        **inflight,
     )
 
     auth = auth_token.encode() if auth_token else b""
