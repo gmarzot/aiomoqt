@@ -3,13 +3,15 @@
 import asyncio
 import argparse
 import logging
+import time
 
-from aiomoqt.types import (MOQT_DEFAULT_DRAFTS, ParamType, MOQTException, MOQTRequestError,
+from aiomoqt.types import (MOQT_DEFAULT_DRAFTS, MOQTException, MOQTRequestError,
                            parse_draft_spec)
 from aiomoqt.client import MOQTClient
 from aiomoqt.utils.cli import add_help
 from aiomoqt.utils.url import parse_relay_url
 from aiomoqt.track import SubscribedTrack
+from aiomoqt.utils.stats import send_time_us
 from aiomoqt.utils import wait_cond_timeout
 from aiomoqt.utils.logger import *
 
@@ -48,10 +50,6 @@ def parse_args():
     args.host, args.port = _r.host, _r.port
     args.path, args.use_quic = _r.path or "", _r.use_quic
     return args
-
-import time
-
-from aiomoqt.utils.stats import send_time_us
 
 
 class SimpleStats:
@@ -191,7 +189,7 @@ async def main(host: str, port: int, path: str, namespace: str, track_name: str,
                 if not await wait_cond_timeout(
                         track.wait_closed(), timeout=duration):
                     track.completed = True
-                logger.info(f"MOQT app: exiting client session")
+                logger.info("MOQT app: exiting client session")
 
             except MOQTRequestError as e:
                 logger.error(f"MOQT app: request error: {e}")
