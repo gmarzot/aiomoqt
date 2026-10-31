@@ -151,10 +151,37 @@ sweep.
 ### Congestion control
 
 `--cc-algo` selects it: bbr, bbr1, c4, cubic, dcubic, fast, newreno, prague.
-Default is bbr (BBRv3) in every tool and the relay.
+Since 0.14.0 (with aiopquic 0.7.0) the default is bbr (BBRv3) in every
+tool, the examples and aiomoqt-relay; before that the relay defaulted to
+cubic.
 **Label every result with the algorithm actually used.**
 "BBR" does not name the same algorithm across implementations, and a
 cubic control run is the one posture every stack shares.
+
+**Use bbr for playback over real paths, not cubic.** cubic, newreno and
+dcubic are loss-based: they read every lost packet as congestion and cut
+the window. On a long-RTT path with some real loss (Wi-Fi, a busy peering
+link) the window is cut faster than it regrows, which takes many RTTs at
+long RTT, so the rate settles below what the path carries and can fall
+below the video's bitrate, which stalls playback. bbr paces to the
+measured bandwidth and RTT and does not back off on scattered losses.
+Loopback and a clean LAN hide the difference: there they measure CPU
+cost, not congestion control. Compare algorithms on the real path.
+
+**`--cc-options` for fan-out relays.** `--cc-options OPTS` passes an
+option string to the controller; the session-flag tools and aiomoqt-relay
+take it (`cc-options` in the relay's `--config` TOML). For bbr,
+`Q<ratio>` sets the send quantum, the burst it may send at once as a
+fraction of a second of pacing rate: `Q0.02` is 20 ms. A relay serving
+many subscribers pays CPU per paced packet; a larger quantum sends fewer,
+larger bursts, which raises how many subscribers one relay process can
+carry at the cost of burstier traffic per subscriber. Measure it on your
+relay and path before adopting it, and label results with it like the
+algorithm:
+
+```
+aiomoqt-relay --port 4443 --cert cert.pem --key key.pem --cc-algo bbr --cc-options Q0.02
+```
 
 ## Leave no trace
 
@@ -252,6 +279,42 @@ python -m aiomoqt.tools.adaptive_bench
 
 No URL selects the loopback self-test. `-P 4 --step-mbps 20` for
 parallel subgroup streams and a larger ramp step.
+
+## Loopback ceiling — moq-loopback-bench
+
+`loopback_bench` (console script `moq-loopback-bench`) runs a publisher
+as a server and a subscriber dialing it, in one process, with no relay.
+It measures what the Python stack and aiopquic deliver on this machine:
+the build and host health check, and the number to compare across
+builds.
+
+```
+python -m aiomoqt.tools.loopback_bench -Q --draft 18 -s 4096 -t 20
+python -m aiomoqt.tools.loopback_bench -Q --draft 18 -s 16384 -P 4 -r 60 -t 20
+python -m aiomoqt.tools.loopback_bench --draft 18 --fanout -s 4096 -t 20
+python -m aiomoqt.tools.loopback_bench -Q --draft 18 --rtt-ms 50 -r 200 -t 10
+```
+
+- `-Q` raw QUIC, else H3/WebTransport. `--draft` applies to both ends
+  (default 14, deprecated: pass 18, 20 or 22).
+- `-s` object size, `-r` aggregate objects/s (0 = as fast as it goes),
+  `-P` parallel subgroup streams, `-g` objects per group, `-t` seconds,
+  `-i` report interval.
+- `-D` sends ObjectDatagrams instead of streams (object at most ~1150 B);
+  run it at the same `-s` and `-r` as a stream run to compare the two.
+- `--fanout` publishes through `produce()` and the per-subscriber send
+  lane, the path LOC media tracks take; `--per-peer-props` adds
+  per-subscriber object properties.
+- `--no-stats` counts objects and bytes only, for the delivery ceiling;
+  `--verify-payload` checks each payload.
+- `--rtt-ms`, `--link-mbps`, `--loss` emulate a link (see Host tuning).
+- `--cc-algo`, `--cc-options`, `--fc-window`, `--max-queued-bytes` and
+  `--max-inflight-bytes` set the transport as on the other tools.
+
+It prints a results block (objects, throughput, latency percentiles,
+jitter, loss) and exits 1 when no object arrived or a payload check
+failed. The publisher and subscriber share one Python event loop,
+so a loopback figure is a CPU figure: quote it with the `cpu:` line.
 
 ## B — fixed-rate pair at a video profile
 
