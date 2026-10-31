@@ -2,6 +2,7 @@
 
 ## v0.14.0
 
+- aiomoqt-relay status: `loss_pct` toward viewers is real loss (declared lost minus acknowledged later); the new `spurious_pct` reports the rest, per session, in the totals and on the dashboard's Loss tile.
 - aiomoqt-relay status: a session that both publishes and subscribes reports no `loss_pct` and stays out of the total loss, since its loss count can't be split by direction; `lost_packets` is picoquic's raw count, unacknowledged ACK-only packets toward a publisher included.
 - `MOQTSession.wait_delivered(timeout=0.5)` waits until everything written has been sent and acknowledged. pub_media's shutdown closes each session once it returns (was a fixed 0.1 s), so the close no longer drops an End of Track, FIN or PUBLISH_DONE still in flight.
 - aiomoqt-relay status: each session shows `cwin_bytes`, `in_transit_bytes`, `pacing_bps`, `lost_packets`, `timer_losses`, `spurious_losses` and `rtt_max_ms`; `--trace-subscribers` (off by default) adds each subscription's `objects_sent`, `bytes_sent` and `largest_sent`; the control socket's `GET /sessions` returns these on demand.
