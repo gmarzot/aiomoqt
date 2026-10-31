@@ -163,6 +163,25 @@ points:
     config: {P: 4, s: 4096, g: 200, r: 6104}
     subs: 5
     purpose: WT fan-out
+  # R5/R6 above pace `r` *per subscriber* (every subscriber receives the full
+  # track), so R5 asks for 20 x 400 = 8000 Mb/s and R6 for 5 x 200 = 1000 Mb/s
+  # of relay egress - i.e. their `purpose` lines ("~400 Mbps aggregate") were
+  # wrong by a factor of N.  R5b/R6b keep the fan-out shape and pace the
+  # *aggregate* at the 1 Gb/s link so the fan-out ratio is measurable:
+  #   20 x 50 Mb/s = 1000 Mb/s  (r = 50e6/(4096*8)  = 1526 obj/s)
+  #    5 x 160 Mb/s =  800 Mb/s  (r = 160e6/(4096*8) = 4882 obj/s)
+  - id: R5b
+    topology: R
+    transport: raw
+    config: {P: 4, s: 4096, g: 200, r: 1526}
+    subs: 20
+    purpose: fan-out 20 at the link (20 x 50 Mb/s = 1 Gb/s aggregate)
+  - id: R6b
+    topology: R
+    transport: wt
+    config: {P: 4, s: 4096, g: 200, r: 4882}
+    subs: 5
+    purpose: WT fan-out under the link (5 x 160 Mb/s = 800 Mb/s aggregate)
   - id: Ri1
     topology: Ri
     transport: raw

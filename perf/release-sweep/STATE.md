@@ -394,40 +394,112 @@ Next action: Phase 1d (relay egress) - see PLAN/board; carry the clock-disciplin
 
 ## Phase 1d - relay egress baseline (R1..R6)
 
+### Phase 1d final outcome (2026-10-31)
+
+Blocks: `runs/2026-10-30T23-42-43Z-p1d` (R1), `runs/2026-10-30T23-57-24Z-p1d-b2`
+(R2..R6), `runs/2026-10-31T16-47-31Z-p1d-b3` (R5b). R1..R6 = 3 reps each.
+
+- **Wall: neither relay CPU nor the link.** Relay CPU 0.17 core @197.6 Mb/s (R1),
+  0.24-0.25 @~602 Mb/s (R4/R6), **0.11 core @~820 Mb/s / 20 subs (R5b)**;
+  `fc_block_stream = 0` and `fc_block_conn = 0` in every sampler row of every point.
+- **The relay evicts 25-40% of subscribers in every fan-out config**: R4 3/5, R6 3/5,
+  R5 1/20 (8 Gb/s offered by construction), **R5b 14/15/14 of 20 at 47.4 Mb/s/sub**.
+  Cause: per-connection QUIC uni-stream budget of 1024, never replenished
+  (`MaxStreamsUni` logged "Unhandled" in `PicoWebTransportBase.cpp`); the relay turns
+  the transient block into `removeSubscriberOnError` -> permanent removal.
+  Subscriber side: `stream 4095 reset by peer` = the 1024th server uni stream.
+- **R5b:** agg_all 836.4 / 815.8 / 814.2 Mb/s; sustained 663.2 / 714.5 / 666.2;
+  evicted 6/5/6 per rep with 24-58% loss (sustained subs 0.00%);
+  **14 of 17 evictions stopped at exactly 7 of 12 intervals (~35 s), 3 at 3 (~15 s)**
+  -- clustered, consistent with a hard credit budget; eviction is rate-set, the clock
+  is not. Lower per-sub rate only postpones eviction past the window for most subs.
+- **R6b never ran**: `sweep.py` aborted the block on its short-run guard, which reads
+  only `sub.log` (= duplicate of `sub1.log`) -- sub1 was evicted at 35 s in rep-03.
+  Rep-03's own aggregate (814.2 Mb/s) is valid; R6b is a documented gap.
+- Corrections vs the partial: R4 is **602.3 Mb/s sustained = 3/5 = 64% of the 941 Mb/s
+  link**, not 848.8 / 4.24-of-5 / 90% (that was peak-inclusive). `sub.log` duplicates
+  `sub1.log` (glob hazard, now excluded). p50/p95/p99 still null (clock offset
+  373,493 us vs 4,496 us tolerance) -- no tail claim exists.
+- Next action unchanged: **Phase 1e (media/churn + consolidation)**. Top bug for the
+  stack: uni-stream credit exhaustion -> permanent eviction (Reproduce: R5b).
+
 Relay: program's own moqx on :9768 from `moqx-perf.yaml`, CPU pinned 0-1; shared :9668
 untouched. Publisher co-located, subscribers on seawolf. Blocks
-`runs/2026-10-30T23-42-43Z-p1d` (R1 x3) and `runs/2026-10-30T23-57-24Z-p1d-b2` (R2..R6 x3),
-60 s, 10 s gaps, sampled at 1 Hz by `scripts/relay_sampler.py`, folded by
-`scripts/relay_report.py`.
+`runs/2026-10-30T23-42-43Z-p1d` (R1 x3), `runs/2026-10-30T23-57-24Z-p1d-b2` (R2..R6 x3),
+`runs/2026-10-31T16-47-31Z-p1d-b3` (R5b/R6b x3), 60 s, 10 s gaps, 1 Hz sampling by
+`scripts/relay_sampler.py` (standalone - it is not started or stopped by `sweep.py`).
 
 Harness: no documented subscriber stagger existed in the repo or harness, so a knob was
 authored - `sub_stagger_s: 0.5` in the relay block of `manifests/baseline-v0.yaml`, honoured
-per point, every joiner recorded in `fanout.json` (`join_index`, `t_join_s`). R4 joined at
-+2.3..+4.4 s over 5 subs. `run_subs()` launches all joiners concurrently into their stagger
-slots so the 60 s window is shared, not serialised.
+per point, every joiner recorded in `fanout.json` (`join_index`, `t_join_s`). `run_subs()`
+launches all joiners concurrently into their stagger slots so the 60 s window is shared, not
+serialised.
 
-Findings so far:
-- Relay CPU is not the wall: 0.175-0.181 core for 197.6 Mb/s to one subscriber
-  (0.9 millicore/Mb/s, spread 1.7% over 3 reps); R4 carried 848.8 Mb/s aggregate over 5 subs
-  for 0.161 core. ~1 core would saturate a 1 Gbps link; the host has 6.
-- The wall is the 1 Gbps path: R4 fan-out ratio 4.24 of 5 and 848.8 Mb/s = 90% of the 941 Mb/s
-  payload ceiling already found in 1c. R4 is link-limited, not fan-out-limited; per-sub
-  169.8 Mb/s vs 197.6 solo.
-- Relay byte counters undercount and are not absolute meters: 146.5 (relay) / 151.4 (NIC tx)
-  vs 197.6 Mb/s delivered in R1; 253.7 / 262.4 vs 848.8 in R4. Subscriber-side totals are the
-  primary egress number; relay counters only as within-rep ratios. CPU from /proc is sound.
+Accepted-rep rule (new, matters): a subscriber is **sustained** only with >= 8 of the twelve
+5 s interval lines; 1-2 interval subscribers are startup bursts and are never averaged in;
+zero-interval subscribers never received. All "delivered" numbers sum sustained subscribers
+only. The harness writes `sub.log` as a byte-identical duplicate of `sub1.log`, so any
+`sub*.log` glob double-counts subscriber 1 - count only stems containing a digit.
+
+**Results (sustained, subscriber-measured).** R1 197.6 / 197.2 / 201.0 Mb/s, relay
+0.173-0.174 core (0.87-0.88 millicore/Mb/s). R4 5 subs -> **3 sustained, 602.3 / 601.0 /
+602.9 Mb/s**, relay 0.241-0.253 core (0.40-0.42 millicore/Mb/s). R6 (WT) 5 subs -> **3
+sustained, 602.5 / 600.6 / 603.7 Mb/s**, relay 0.241-0.253 core. R5 20 subs -> **1 sustained,
+402.4 / 401.1 / 401.9 Mb/s**, relay 0.122-0.125 core. R2/R3 abort (see below).
+
+Findings:
+- **The relay is not the wall.** 0.24-0.25 core delivers 602 Mb/s of fan-out (R4/R6, 6/6 reps,
+  5% spread); fan-out *lowers* per-bit cost (0.40 mcore/Mb/s at 5-way vs 0.88 at 1-way) because
+  one ingress pass is amortised over N egresses. Extrapolated, a saturated 1 Gbps egress costs
+  under 0.5 core of the 2 it is pinned to.
+- **It is not byte-level flow control.** `fc_block_stream` and `fc_block_conn` are 0 in every
+  sampler row of every point, including reps that dropped 19 of 20 subscribers.
+- **CORRECTION to the earlier 1c/1d-partial reading.** R4's "848.8 Mb/s aggregate, fan-out ratio
+  4.24 of 5, 90% of the link" was peak-inclusive - it summed each subscriber's best interval,
+  including two subscribers that lived one interval. Sustained, R4 is **602.3 Mb/s = 3 of 5 =
+  64% of the 941 Mb/s payload ceiling**. The conclusion inverts: R4 is NOT on the link; a third
+  of the link is idle while the relay drops 2 of 5 subscribers.
+- **The wall is the stack: it drops subscribers instead of pausing them.** Relay-side each
+  removal is `Removing subscriber after error in beginSubgroup: Failed to create uni stream`
+  (`deps/moxygen/moxygen/relay/MoQForwarder.cpp`, `removeSubscriberOnError`); subscriber-side
+  the same event is `stream 4095 reset by peer: error=3`, and server uni ids are 3,7,11,... so
+  **4095 is the 1024th server-initiated uni stream on that connection** - the peer's
+  `MAX_STREAMS_UNI` credit exhausted. Both paths that can fail *inside* stream creation log at
+  `XLOG(ERR)` (`Failed to reserve stream ID`, `failed to create egress handle`) and neither
+  string appears in any relay log at a level that did surface `ERR` messages, which leaves
+  `MoQSession::createUniStream()` failing because the session was already closed. Sequence:
+  subscriber stops draining -> outstanding uni streams accumulate against a fixed
+  per-connection credit -> relay cannot open the next subgroup stream -> transient credit block
+  is escalated to permanent subscriber removal. A merely slow subscriber is gone for the rest
+  of the rep: sustained subscribers show **0.00% loss in 9/9 fan-out reps**, dropped ones show
+  **43-74%**. Survival is ordered, not random - sub4/sub5 survived all 6 R4/R6 reps while
+  exactly one of sub1..sub3 survived each - the shape of a startup-time credit crunch that the
+  late joiners skip.
+- **R5 as authored is over-subscribed ~8.5x by construction**: `r: 12207` is 400 Mb/s *per
+  subscriber*, so 20 subs = 8 Gb/s of demand on a 1 Gbps link. 19 of 20 were evicted inside
+  ~10 s and the survivor took the full 402 Mb/s; R5 is a link-limited floor plus a documented
+  over-subscription, not a fan-out scaling measurement. R5b (20 x 50 Mb/s) and R6b (5 x 160
+  Mb/s, WT) were added to separate fan-out from over-subscription and are recorded in
+  `SUMMARY-part3.md`.
 - R2 (unpaced) and R3 (unpaced P=8 g=40) do not ceiling - the relay resets the subscriber
-  stream (`stream 2047 reset by peer: error=3`) after 0.4-1.3 s, 3/3 in both points. The
-  736-765 Mb/s figures are startup bursts, not throughput. Unpaced load tears the
-  subscription down instead of applying backpressure: stack finding.
+  stream (`stream 2047 reset by peer: error=3`, i.e. the **512th** server uni stream) after
+  0.4-1.3 s, 3/3 in both points. The 736-765 (R2) and 587-630 (R3) Mb/s figures are startup
+  bursts, not throughput. Same escalation policy as the fan-out evictions: **one bug, two
+  triggers** - over-rate and slow-drain both end in a torn-down subscription rather than
+  backpressure.
+- Relay byte counters undercount ~25-30% and are not absolute meters: 146.5 (relay) / 151.4
+  (NIC tx) vs 197.6 Mb/s delivered in R1; 253.7 / 262.4 vs 602 in R4. `relay_report.py` also
+  reports peak-inclusive aggregates (R5 "402 Mb/s" is one subscriber, R4 "848.84"). Subscriber
+  totals are the primary egress meter; relay counters only as within-rep ratios; relay CPU from
+  /proc is sound.
 - Clock still waived (`--waive clock_offset_jump,clock_unavailable`); p50/p95/p99 null on every
-  rep, offset moved 373 493 us vs 4 496 us tolerance. Latency tail of 1d is still unmeasured.
+  rep, offset moved 373 493 us vs 4 496 us tolerance. **No fan-out tail-latency claim exists**;
+  what fan-out does measurably is remove members, not raise a tail.
 - `short_run` was made waivable so R2/R3 stay in the block as `dirty` instead of aborting the
   sweep; before that patch the first R2 rep killed the whole block.
 
-Open: R5 (20 subs, over-subscribed ~8.5x by construction - link-limited floor, plus 20 sub
-processes on 6 cores) and R6 (WT fan-out) were still running when this section was written;
-per-sub logs and R5/R6 fan-out ratios go into `baselines/base-070rc2/SUMMARY-part3.md`.
-
-Next action: Phase 1e (media/churn + consolidation). Carry forward: clock discipline, a paced
-relay-ceiling point, and relay byte-counter accuracy.
+Next action: Phase 1e (media/churn + consolidation). Carry forward, in priority order:
+(1) the uni-stream-credit eviction is now the top stack bug - reproduce it from R5 as authored,
+deterministic 3/3; (2) clock discipline, without which no tail-latency number is publishable;
+(3) a paced relay-ceiling point (R2/R3 cannot answer it unpapered); (4) relay byte-counter
+accuracy.
