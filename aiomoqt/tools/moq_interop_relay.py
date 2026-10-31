@@ -3636,6 +3636,9 @@ async def _offer_track(session, track, key, request_id=None):
         _forget_session(session)
         return
     ns, name = key
+    # The relay's Largest as it makes the offer: the reply's filter
+    # resolves against it, as a SUBSCRIBE's does (§3.1.4).
+    seen = track.largest
     if track.paused and track.upstream is not None:
         # As for a SUBSCRIBE: resume first, so the offer carries the
         # publisher's live Largest and the subscriber takes the fence.
@@ -3662,7 +3665,7 @@ async def _offer_track(session, track, key, request_id=None):
         # §10.2.12: FORWARD omitted from PUBLISH_OK means 1.
         forward = (getattr(reply, 'parameters', None) or {}).get(
             ParamType.FORWARD, 1)
-    window = _reply_window(session, reply, track.largest) or _UNFILTERED
+    window = _reply_window(session, reply, seen) or _UNFILTERED
     # Cached objects inside the subscriber's window go first.
     d = track.add_downstream(session, pub_msg.track_alias,
                              pub_msg.request_id, forward=bool(forward),
