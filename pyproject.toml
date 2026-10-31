@@ -82,6 +82,17 @@ line-length = 100
 select = ["E", "F", "W"]
 ignore = ["E501"]  # line length handled by formatter
 
+[tool.ruff.lint.per-file-ignores]
+# Star imports carry the message and type namespaces.
+"aiomoqt/messages/*.py" = ["F403", "F405"]
+"aiomoqt/utils/__init__.py" = ["F403", "F405"]
+"aiomoqt/protocol.py" = ["F403", "F405"]
+"aiomoqt/client.py" = ["F403", "F405"]
+"aiomoqt/server.py" = ["F403", "F405"]
+"aiomoqt/examples/*.py" = ["F403", "F405"]
+# Section imports shadow star-imported names for the tests below them.
+"aiomoqt/tests/test_messages.py" = ["F403", "F405", "E402"]
+
 [build-system]
 requires = ["setuptools>=77", "setuptools_scm[toml]>=8"]
 build-backend = "setuptools.build_meta"

@@ -174,7 +174,8 @@ class MOQTClient(MOQTPeer):
                 cfg.keep_alive_interval = self.keep_alive_interval
             if self.socket_buffer_size is not None:
                 cfg.socket_buffer_size = self.socket_buffer_size
-            protocol = lambda *a, **kw: MOQTSessionQuic(*a, **kw, session=self)
+            def protocol(*a, **kw):
+                return MOQTSessionQuic(*a, **kw, session=self)
             # quic_debug_log not wired on raw-QUIC path yet: aiopquic
             # 0.3.1's `connect()` helper doesn't forward debug_log to
             # TransportContext.start. Tracked for aiopquic 0.3.2.

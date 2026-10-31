@@ -30,6 +30,7 @@ from aiomoqt.client import MOQTClient
 from aiomoqt.track import SubscribedTrack
 from aiomoqt.utils import wait_cond_timeout
 from aiomoqt.utils import cli as _cli
+from aiomoqt.utils.hostinfo import cpu_summary
 from aiomoqt.utils.payload import PayloadCheck
 from aiomoqt.utils.stats import TrackStats
 from aiomoqt.utils.logger import get_logger
@@ -109,6 +110,7 @@ class BenchReporter:
         print(f"  aiomoqt-bench results  ({s['active_s']:.1f}s active "
               f"/ {s['duration_s']:.1f}s elapsed)")
         print("═" * 56)
+        print(f"  Host:        {cpu_summary()}")
         blind = s.get('datagram') or s.get('minimal')
         grps = 'n/a' if blind else f"{s['groups']:,}"
         print(f"  Groups:      {grps}")
@@ -190,6 +192,7 @@ def print_banner(relay, args):
     print(f"  interval:    {args.interval}s")
     if args.verify_payload:
         print(f"  payload:     checked (every {args.verify_payload})")
+    print(f"  cpu:         {cpu_summary()}")
     print("─" * 56)
 
 

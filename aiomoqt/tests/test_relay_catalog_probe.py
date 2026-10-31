@@ -163,3 +163,63 @@ async def test_without_the_flag_nothing_is_probed(use_quic, flow):
             assert track is None
         else:
             assert track is not None and track.paused
+
+
+_REPUBLISHED = ("probe/one", "probe/two")
+_CMAF = json.dumps({"version": 1, "tracks": [
+    {"name": "video", "packaging": "cmaf"}]}).encode()
+
+
+async def _broadcast(port, use_quic, flow, payload):
+    """A publisher session carrying a catalog of `payload` under each of
+    _REPUBLISHED; returns (session, its exit stack)."""
+    stack = contextlib.AsyncExitStack()
+    client = MOQTClient("localhost", port, path="/", use_quic=use_quic,
+                        verify_tls=False, supported_drafts=(22,))
+    pub = await stack.enter_async_context(client.connect())
+    await pub.client_session_init()
+    tracks = [_Groups(pub, namespace=ns, trackname="catalog",
+                      payload=payload, fetch_history_bytes=1 << 20)
+              for ns in _REPUBLISHED]
+    for t in tracks:
+        t.attach()
+        t.write(0)
+    if flow == "announce":
+        for ns in _REPUBLISHED:
+            await pub.publish_namespace(namespace=ns, wait_response=True)
+    else:
+        for t in tracks:
+            await t.publish()
+    return pub, stack
+
+
+@_TRANSPORTS
+@_FLOWS
+async def test_a_republished_broadcast_is_probed_again(use_quic, flow):
+    port = _port(4 if flow == "announce" else 5, use_quic)
+    _reset()
+    relay._catalog_probe = True
+    server = relay._build_server("localhost", port, CERT, KEY,
+                                 use_quic=use_quic, draft=(22, 18))
+    handle = await server.serve()
+    stacks = []
+    try:
+        _pub, first = await _broadcast(port, use_quic, flow, _CATALOG)
+        stacks.append(first)
+        assert await _until(lambda: all(
+            relay._catalogs.get(_ns(n)) == "MSF" for n in _REPUBLISHED)), \
+            relay._catalogs
+        await first.aclose()
+        stacks.remove(first)
+        # The same namespaces, a new session and a new catalog format.
+        _pub, second = await _broadcast(port, use_quic, flow, _CMAF)
+        stacks.append(second)
+        assert await _until(lambda: all(
+            relay._catalogs.get(_ns(n)) == "CMSF" for n in _REPUBLISHED)), \
+            relay._catalogs
+    finally:
+        for stack in stacks:
+            await stack.aclose()
+        relay._catalog_probe = False
+        handle.close()
+        _reset()

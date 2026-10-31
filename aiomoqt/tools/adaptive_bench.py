@@ -42,6 +42,7 @@ from aiomoqt.utils.certs import (REPO_CERTS_DIR, ensure_self_signed,
                                  find_cert, find_key)
 from aiomoqt.utils.cli import endpoint_url
 from aiomoqt.utils.format import fmt_bps, fmt_ms, fmt_ms_signed
+from aiomoqt.utils.hostinfo import CPU_FIELDS, cpu_fields, cpu_summary
 from aiomoqt.utils.stats import (CLOCK_OFFSET_MARK, CLOCK_OFFSET_MIN_MS,
                                  KEY_PRUNE_EVERY, KEY_REORDER_SLACK,
                                  note_clock_offset, send_time_us)
@@ -930,6 +931,7 @@ class AIMDController:
         self._tpr = max(1, round(self.report_s / self.tick_s))
         self._last_report_t = 0.0
         self.writer = writer
+        self._cpu = cpu_fields() if writer else []
         self.latency_threshold_ms = latency_threshold_ms
         self.backoff_factor = backoff_factor
         self.loss_threshold_pct = loss_threshold_pct
@@ -1194,6 +1196,7 @@ class AIMDController:
                 f"{sig.latency_mean_ms:.2f}",
                 f"{sig.latency_p90_ms:.2f}",
                 f"{sig.loss_pct:.3f}",
+                *self._cpu,
             ])
         self._print_row(sig, action)
 
@@ -1666,6 +1669,7 @@ def _print_banner(args):
     print("  aiomoqt adaptive bench")
     print("─" * 68)
     print(f"  host:               {platform.node()} ({platform.machine()})")
+    print(f"  cpu:                {cpu_summary()}")
     if args.relay_url:
         from aiomoqt.utils.url import parse_relay_url
         relay = parse_relay_url(args.relay_url)
@@ -1715,6 +1719,7 @@ def _print_summary(state: BenchState, controller, samples: int, args):
     if state.ceiling_reason:
         print(f"  Reason:      {state.ceiling_reason}")
     print(f"  Samples:     {samples}")
+    print(f"  Host:        {cpu_summary()}")
     print("═" * 68)
 
 
@@ -1825,7 +1830,7 @@ async def main():
                     else ["worst_mean_ms", "worst_p90_ms"])
         csv_writer.writerow([
             "t_monotonic", "target_mbps", "tx_mbps", "rx_mbps",
-            *lat_cols, "loss_pct",
+            *lat_cols, "loss_pct", *CPU_FIELDS,
         ])
 
     mp_cleanup_queues: list = []

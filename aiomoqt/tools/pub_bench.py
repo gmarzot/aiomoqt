@@ -18,6 +18,7 @@ from aiomoqt.types import (ForwardingPreference, MOQTMessageType,
 from aiomoqt.track import PublishedTrack, VideoTrack
 from aiomoqt.utils import wait_cond_timeout
 from aiomoqt.utils import cli as _cli
+from aiomoqt.utils.hostinfo import cpu_summary
 from aiomoqt.utils.url import parse_relay_url
 
 
@@ -209,6 +210,7 @@ def print_banner(relay, args):
     print(f"  rate:        {rate_s}")
     print(f"  target:      {target_s}")
     print(f"  duration:    {args.duration}s")
+    print(f"  cpu:         {cpu_summary()}")
     print("─" * 56)
 
 

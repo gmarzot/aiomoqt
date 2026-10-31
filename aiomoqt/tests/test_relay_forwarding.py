@@ -11,7 +11,6 @@ import contextlib
 import pytest
 
 from aiomoqt.client import MOQTClient
-from aiomoqt.server import MOQTServer
 from aiomoqt.messages.data import ObjectDatagram
 from aiomoqt.types import (
     FilterType, ForwardingPreference, MOQTMessageType, MOQTRequestError,

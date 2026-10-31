@@ -15,6 +15,9 @@
   ".bandwidth.loss_pct": [
    "float"
   ],
+  ".bandwidth.spurious_pct": [
+   "float"
+  ],
   ".generated": [
    "float"
   ],
@@ -771,6 +774,9 @@
   ".sessions[].spurious_losses": [
    "int"
   ],
+  ".sessions[].spurious_pct": [
+   "float"
+  ],
   ".sessions[].subscriptions": [
    "int"
   ],
@@ -876,6 +882,9 @@
   ],
   ".totals.sessions": [
    "int"
+  ],
+  ".totals.spurious_pct": [
+   "float"
   ],
   ".totals.subscribers": [
    "int"
