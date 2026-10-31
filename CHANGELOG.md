@@ -2,6 +2,7 @@
 
 ## v0.14.0
 
+- The bench tools print the CPU model, CPU count and clock in their banner and results; adaptive_bench, load_sim and sub_media `--report` CSVs add `cpu_model`, `cpu_count` and `cpu_mhz` columns.
 - loopback_bench `--fanout` ends its publisher's track before the subscriber leaves, so a paced run no longer ends with a send-lane shed WARNING.
 - `MOQTSession.wait_delivered(timeout=0.5)` waits until everything written has been sent and acknowledged. pub_media's shutdown closes each session once it returns (was a fixed 0.1 s), so the close no longer drops an End of Track, FIN or PUBLISH_DONE still in flight.
 - aiomoqt-relay status: each session shows `cwin_bytes`, `in_transit_bytes`, `pacing_bps`, `lost_packets`, `timer_losses`, `spurious_losses` and `rtt_max_ms`; `--trace-subscribers` (off by default) adds each subscription's `objects_sent`, `bytes_sent` and `largest_sent`; the control socket's `GET /sessions` returns these on demand.

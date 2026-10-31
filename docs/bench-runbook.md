@@ -428,7 +428,8 @@ Shell 2 — the audience. Paste the namespace Shell 1 printed:
 python -m aiomoqt.tools.load_sim "$RELAY_WT" -f viewers --role sub -N aiomoqt/demo-XXXX --draft 18 -k -i 5
 ```
 
-Observed on 2026-09-15: subscribers climb to 42–43 of the 43 target,
+Observed on 2026-09-15 against the deployed moqx relay (the load
+host's hardware was not recorded): subscribers climb to 42–43 of the 43 target,
 `rx` settles at 21–44 Mbps and the failure counter stays at `x0`. If
 subs stays at 0 and `x` climbs, nothing is publishing that namespace —
 the tool now prints the reason on the first failure.
@@ -449,4 +450,9 @@ namespace at the same time.
 
 Record the tuning state, the congestion control algorithm and the
 emulated RTT alongside every result. Without those three a number cannot
-be compared with another number.
+be compared with another number. The hardware is recorded for you: the
+bench tools (pub_bench, sub_bench, loopback_bench, adaptive_bench,
+load_sim, pub_server, sub_media `--analyze`) print the CPU model, CPU
+count and clock in their banner (`cpu:`) and results (`Host:`), and
+`--report` CSVs carry them as `cpu_model`, `cpu_count` and `cpu_mhz`
+columns.

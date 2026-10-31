@@ -29,6 +29,7 @@ from aiomoqt.types import LOC_TIMESTAMP, ForwardingPreference
 from aiomoqt.utils import cli as _cli
 from aiomoqt.utils import wait_cond_timeout
 from aiomoqt.utils.certs import ensure_self_signed, find_cert, find_key
+from aiomoqt.utils.hostinfo import cpu_summary
 from aiomoqt.tools.sub_bench import BenchReporter
 
 
@@ -287,6 +288,7 @@ def print_banner(args):
     row("object size", f"{args.object_size} B")
     row("object rate", rate_s)
     row("duration", f"{args.duration}s")
+    row("cpu", cpu_summary())
     print("─" * 56)
 
 

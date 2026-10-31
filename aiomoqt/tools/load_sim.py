@@ -51,6 +51,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
+import io
 import json
 import logging
 import math
@@ -69,6 +71,7 @@ from aiomoqt.utils import cli as _cli
 from aiomoqt.utils.cli import endpoint_url
 from aiomoqt.utils.url import parse_relay_url
 from aiomoqt.utils.format import fmt_bps
+from aiomoqt.utils.hostinfo import CPU_FIELDS, cpu_fields, cpu_summary
 from aiomoqt.utils.stats import TrackStats
 
 from aiomoqt.utils.workers import (
@@ -810,6 +813,7 @@ def main():
     print(f"  worst-case egress if all peaks align: "
           f"{fmt_bps(total_bps)}")
     print(f"  transport:   {_cli.describe_transport(args)}")
+    print(f"  cpu:         {cpu_summary()}")
     for ps in pub_specs:
         subs = per_track_subs.get(ps.key, 0)
         print(f"    {ps.key:<28} {fmt_bps(ps.bps):>10} x {subs:>4} subs"
@@ -864,7 +868,8 @@ def main():
     if args.report:
         csv_f = open(args.report, "w")
         csv_f.write("t,namespace,track,live,target,rx_mbps,p90_ms,"
-                    "joins,leaves,fails\n")
+                    f"joins,leaves,fails,{','.join(CPU_FIELDS)}\n")
+        cpu_csv = _csv_line(cpu_fields())
 
     start = time.monotonic()
     last_report = start
@@ -968,7 +973,7 @@ def main():
                         ns, tr = key.split("/", 1)
                         csv_f.write(f"{t:.0f},{ns},{tr},{row[0]},{row[1]},"
                                     f"{row[2] * 8 / 1e6:.2f},"
-                                    f"{row[3]:.1f},,,\n")
+                                    f"{row[3]:.1f},,,,{cpu_csv}\n")
                     csv_f.flush()
 
             # --- end conditions ---
@@ -1074,8 +1079,16 @@ def _verdict(groups: Dict[int, "GroupRT"],
         lines.append(f"  Total objects: {all_objs}")
         lines.append(f"  Total bytes: {all_bytes}")
         lines.append(f"  Expected objects: {all_expected}")
+    lines.append(f"  Host: {cpu_summary()}")
     lines.append(f"  {'RESULT: FAIL' if failed else 'RESULT: OK'}")
     return lines, failed
+
+
+def _csv_line(values) -> str:
+    """`values` as one CSV line, quoted where needed, no newline."""
+    buf = io.StringIO()
+    csv.writer(buf, lineterminator="").writerow(values)
+    return buf.getvalue()
 
 
 def _run():
