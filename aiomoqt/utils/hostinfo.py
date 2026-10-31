@@ -68,8 +68,8 @@ def _macos() -> tuple[Optional[str], Optional[float]]:
 
 @functools.lru_cache(maxsize=None)
 def cpu_info() -> dict:
-    """{'cpu_model': str, 'cpu_count': int, 'cpu_mhz': float}; each None
-    when unavailable. cpu_count is logical CPUs (vCPUs on a VM)."""
+    """cpu_model (str), cpu_count (logical CPUs, vCPUs on a VM), cpu_mhz
+    (int) and machine (str); each None when unavailable."""
     try:
         if sys.platform.startswith("linux"):
             model, mhz = _linux()
