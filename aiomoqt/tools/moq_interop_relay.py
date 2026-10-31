@@ -4628,8 +4628,9 @@ class _Status:
                  if last is not None else [0, 0, 0, 0])
             tx, rx = tx + d[0], rx + d[1]
             # Loss counts on delivery only: toward a publisher the relay sends
-            # mostly ACK-only packets, which picoquic counts lost unacked.
-            delivery = id(s) in subs
+            # mostly ACK-only packets, which picoquic counts lost unacked, and
+            # a session that also publishes can't split its count by direction.
+            delivery = id(s) in subs and id(s) not in pubs
             if delivery:
                 sent, lost = sent + d[2], lost + d[3]
             rtt = round(pq.get("rtt") / 1000, 2) if pq.get("rtt") else None
@@ -4654,6 +4655,7 @@ class _Status:
                 "in_transit_bytes": pq.get("bytes_in_transit"),
                 "pacing_bps": (round(pq["pacing_rate"] * 8)
                                if pq.get("pacing_rate") else None),
+                # picoquic's raw count, ACK-only packets toward a publisher included.
                 "lost_packets": pq.get("lost"),
                 "timer_losses": pq.get("timer_losses"),
                 "spurious_losses": pq.get("spurious_losses"),

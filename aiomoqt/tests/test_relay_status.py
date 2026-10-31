@@ -550,6 +550,41 @@ async def test_session_loss_only_on_delivery(relay_tables, tmp_path, monkeypatch
         assert 0 <= s["rtt_min_ms"] <= s["rtt_ms"], s
 
 
+@requires_certs
+async def test_publishing_subscriber_reports_no_loss(relay_tables, tmp_path,
+                                                     monkeypatch):
+    # One loss count per connection: a session that publishes and subscribes
+    # can't split it, so it reports no loss_pct and stays out of the total.
+    real = relay._path_quality
+
+    def lossy(session):
+        pq = dict(real(session))
+        pq["lost"] = pq.get("sent", 0) // 2
+        return pq
+    monkeypatch.setattr(relay, "_path_quality", lossy)
+    async with _relay(_PORT + 11, True, 18) as connect:
+        pub = await connect()
+        PublishedTrack(pub, namespace=_NS, trackname="video",
+                       object_size=200, group_size=10, rate=200).attach()
+        await pub.publish_namespace(namespace=_NS, wait_response=True)
+        both = await connect()
+        PublishedTrack(both, namespace="status/both", trackname="audio",
+                       object_size=100, group_size=10, rate=100).attach()
+        await both.publish_namespace(namespace="status/both", wait_response=True)
+        await SubscribedTrack(both, _NS, "video").subscribe(timeout=5)
+        status = relay._Status(str(tmp_path / "status.json"),
+                               {"started": time.time()}, [connect.handle])
+        loop = asyncio.get_running_loop()
+        status.snapshot(loop.time(), time.time())
+        await asyncio.sleep(0.3)
+        snap = status.snapshot(loop.time(), time.time())
+    by_role = {s["role"]: s for s in snap["sessions"]}
+    assert set(by_role) == {"pub", "pub+sub"}, by_role.keys()
+    assert by_role["pub+sub"]["loss_pct"] is None
+    assert by_role["pub+sub"]["lost_packets"] > 0
+    assert snap["totals"]["loss_pct"] == 0.0
+
+
 _KINDS = ((dict, "object"), (list, "array"), (str, "string"), (bool, "bool"),
           (int, "int"), (float, "float"))
 
