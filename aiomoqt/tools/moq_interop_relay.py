@@ -3602,6 +3602,12 @@ async def _offer_track(session, track, key, request_id=None):
         _forget_session(session)
         return
     ns, name = key
+    if track.paused and track.upstream is not None:
+        # As for a SUBSCRIBE: resume first, so the offer carries the
+        # publisher's live Largest and the subscriber takes the fence.
+        await _resume_for(track, SimpleNamespace(forward=1))
+        if not _session_live(session):
+            return
     # A session that subscribed to a prefix gets every track under it,
     # including one it publishes itself: the subscription is explicit,
     # and moq-test's publish cases use one session for both roles.
