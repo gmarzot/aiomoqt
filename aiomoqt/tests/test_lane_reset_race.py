@@ -63,11 +63,13 @@ class _Receiver:
 
 
 def _hold_drains(session):
-    """Park each drained write on a unidirectional (data) stream, after
-    it is written, until the returned event is set: the writer is
-    suspended as on backpressure. The list holds the streams parked."""
+    """Park each drained write on a unidirectional (data) stream, and
+    each stream open that carries the first header, after it is written,
+    until the returned event is set: the writer is suspended as on
+    backpressure. The list holds the streams parked."""
     release, parked = asyncio.Event(), []
     real = session.stream_write_drain
+    real_open = session.open_uni_stream
 
     async def held(stream_id, data, *args, **kw):
         await real(stream_id, data, *args, **kw)
@@ -75,7 +77,15 @@ def _hold_drains(session):
             parked.append(stream_id)
             await release.wait()
 
+    async def held_open(*args, **kw):
+        stream_id = await real_open(*args, **kw)
+        if kw.get("initial") and not release.is_set():
+            parked.append(stream_id)
+            await release.wait()
+        return stream_id
+
     session.stream_write_drain = held
+    session.open_uni_stream = held_open
     return release, parked
 
 

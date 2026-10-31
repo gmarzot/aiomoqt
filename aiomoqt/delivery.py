@@ -418,6 +418,8 @@ class SubgroupDelivery:
         # caller; None leaves the session default.
         self.stream_priority = stream_priority
         self.mapping = mapping
+        # Group whose PER_GROUP stream open is in flight.
+        self._opening: Optional[int] = None
         self.stream_count = 0
         self.largest: Optional[tuple] = None
         self.objects_sent = 0
@@ -556,22 +558,18 @@ class SubgroupDelivery:
                 lane = self.lane
                 if lane is not None:
                     lane.parked, lane.sid = "header", None
-                sid = await self.session.open_uni_stream()
-                self.stream_count += 1
-                if lane is not None:
-                    lane.sid = sid
-                if self.stream_priority is not None:
-                    self.session.set_stream_priority(sid, self.stream_priority)
                 hdr = SubgroupHeader(
                     track_alias=self.track_alias, group_id=group_id,
                     subgroup_id=object_id, publisher_priority=self.priority,
                     extensions_present=True, prof=self._prof)
-                await self.session.stream_write_drain(sid, hdr.serialize().data)
+                # The header and the object open the stream together.
+                first = hdr.serialize().data + self._object_bytes(
+                    hdr, object_id, payload, extensions, encoded)
+                sid = await self.session.open_uni_stream(
+                    initial=first, priority=self.stream_priority)
+                self.stream_count += 1
                 if lane is not None:
-                    lane.parked = "object"
-                data = self._object_bytes(hdr, object_id, payload,
-                                          extensions, encoded)
-                await self.session.stream_write_drain(sid, data)
+                    lane.sid, lane.parked = sid, "object"
                 self.session.stream_write(sid, b"", end_stream=True)
                 if lane is not None:
                     self._tx_streams[sid] = group_id
@@ -583,34 +581,36 @@ class SubgroupDelivery:
                     lane = self.lane
                     if lane is not None:
                         lane.parked, lane.sid = "header", None
-                    sid = await self.session.open_uni_stream()
+                    hdr = SubgroupHeader(
+                        track_alias=self.track_alias, group_id=group_id,
+                        subgroup_id=0, publisher_priority=self.priority,
+                        extensions_present=True, prof=self._prof,
+                        first_object=group_start)
+                    # The header and the first object open the stream together.
+                    first = hdr.serialize().data + self._object_bytes(
+                        hdr, object_id, payload, extensions, encoded)
+                    self._opening = group_id
+                    try:
+                        sid = await self.session.open_uni_stream(
+                            initial=first, priority=self.stream_priority)
+                    finally:
+                        self._opening = None
                     self.stream_count += 1
                     if lane is not None:
                         lane.sid = sid
                     if self._epoch != epoch:
                         self.session.stream_reset(sid, StreamResetCode.CANCELLED)
                         return False
-                    if self.stream_priority is not None:
-                        self.session.set_stream_priority(
-                            sid, self.stream_priority)
-                    hdr = SubgroupHeader(
-                        track_alias=self.track_alias, group_id=group_id,
-                        subgroup_id=0, publisher_priority=self.priority,
-                        extensions_present=True, prof=self._prof,
-                        first_object=group_start)
                     self._stream_id, self._header = sid, hdr
-                    await self.session.stream_write_drain(
-                        sid, hdr.serialize().data)
                     if lane is not None:
                         lane.parked = "object"
+                else:
+                    sid, hdr = self._stream_id, self._header
+                    data = self._object_bytes(hdr, object_id, payload,
+                                              extensions, encoded)
+                    await self.session.stream_write_drain(sid, data)
                     if self._epoch != epoch:
                         return False
-                sid, hdr = self._stream_id, self._header
-                data = self._object_bytes(hdr, object_id, payload,
-                                          extensions, encoded)
-                await self.session.stream_write_drain(sid, data)
-                if self._epoch != epoch:
-                    return False
         except MOQTStreamStopped:
             # The session has reset the stream; a group's is not reopened.
             if (self.mapping is StreamMapping.PER_GROUP
@@ -784,7 +784,8 @@ class SubgroupDelivery:
     def reset_below(self, floor: int) -> None:
         """Reset the streams of groups below `floor`: the open one, and
         FINed ones the transport has not yet sent out."""
-        if self._header is not None and self._header.group_id < floor:
+        if ((self._header is not None and self._header.group_id < floor)
+                or (self._opening is not None and self._opening < floor)):
             self.reset_group()
         tx = self._tx_streams
         if tx:

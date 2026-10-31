@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import functools
+import inspect
 import logging
 import time
 from asyncio import Future
@@ -52,9 +53,14 @@ from .utils.logger import TRACE, get_category_logger, quiet_session
 from .utils.url import moqt_setup_path
 from .utils.timing import TIMING_IDS
 from aiopquic.streamchain import StreamChain
-from aiopquic.asyncio.webtransport import WebTransportError
+from aiopquic.asyncio.webtransport import (
+    WebTransportError, WebTransportSession as _AioPWTSession)
 
 USER_AGENT = f"aiomoqt/{version('aiomoqt')}"
+
+# aiopquic before 0.8.0 takes no first bytes with a WT stream create.
+_WT_CREATE_WITH_DATA = "initial" in inspect.signature(
+    _AioPWTSession.create_stream).parameters
 
 
 # WebTransport stream header wire constants (draft-ietf-webtrans-http3).
@@ -3552,21 +3558,42 @@ class _MOQTSessionMixin:
         self._established_ms = (time.monotonic() - _t0) * 1000.0
         self._on_setup_complete()
 
-    async def open_uni_stream(self) -> int:
-        """Open a unidirectional data stream. Returns the stream ID."""
+    async def open_uni_stream(self, initial: bytes = b"",
+                              priority: Optional[int] = None) -> int:
+        """Open a unidirectional data stream, set its transport priority
+        and write `initial` to it. Returns the stream ID. Over WebTransport
+        both travel with the create, so the stream header and the first
+        object leave in one send."""
         if not self._is_wt:
-            return self._quic.get_next_available_stream_id(is_unidirectional=True)
-        # aiopquic-WT: round-trip to picoquic for stream-id allocation
-        try:
-            return await self.create_stream(bidir=False)
-        except WebTransportError:
-            # Session torn down while a producer was at a stream
-            # rollover. Convert to the cancellation path the track
-            # generators already handle cleanly instead of surfacing
-            # a task exception at every shutdown.
-            if not self._session_writable():
-                raise asyncio.CancelledError()
-            raise
+            sid = self._quic.get_next_available_stream_id(is_unidirectional=True)
+        else:
+            with_data = (_WT_CREATE_WITH_DATA
+                         and (initial or priority is not None)
+                         and len(initial) <= self.stream_ring_cap)
+            # aiopquic-WT: round-trip to picoquic for stream-id allocation
+            try:
+                if with_data:
+                    return await self.create_stream(
+                        bidir=False, initial=initial, priority=priority)
+                sid = await self.create_stream(bidir=False)
+            except WebTransportError:
+                # Session torn down while a producer was at a stream
+                # rollover. Convert to the cancellation path the track
+                # generators already handle cleanly instead of surfacing
+                # a task exception at every shutdown.
+                if not self._session_writable():
+                    raise asyncio.CancelledError()
+                raise
+        if priority is not None:
+            self.set_stream_priority(sid, priority)
+        if initial:
+            try:
+                await self.stream_write_drain(sid, initial)
+            except BaseException:
+                # The caller never learns the id: reset the stream here.
+                self.stream_reset(sid, StreamResetCode.CANCELLED)
+                raise
+        return sid
 
     async def open_bidi_stream(self) -> int:
         """Open a bidirectional stream. Returns the stream ID."""
