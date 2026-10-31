@@ -3110,7 +3110,6 @@ def _apply_update(session, msg, found, d16: bool) -> None:
         params = ({} if track.largest is None
                   else _largest_object_param(session, track.largest))
         ok = RequestOk(request_id=msg.request_id, parameters=params)
-        control_log.info(f"MOQT send: {session._msgstr(ok)}")
         session._send_reply(msg.request_id, ok)
         _start_fill(track, d, msg)
     _resume_paused(track)

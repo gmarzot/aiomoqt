@@ -91,6 +91,11 @@ async def test_info_logs_each_control_message_once_where_it_crosses(
     assert _count(info, "MOQT send: Subscribe(") == 1
     assert _count(info, "control message parsed: Subscribe(") == 1
     assert _count(info, "control message parsed: Setup(") == 2
+    assert _count(info, "MOQT send: Setup(") == 2
+    assert _count(info, "MOQT send: RequestError(") == 1
+    # Each message logs once on each side.
+    assert (_count(info, "MOQT send: ")
+            == _count(info, "control message parsed: ") == 4)
     assert not [m for m in info if any(s in m for s in _DEBUG_ONLY)]
 
 
@@ -108,8 +113,10 @@ async def test_a_quiet_peer_session_logs_nothing_below_warning(use_quic):
     finally:
         server.close()
     info = records.at(logging.INFO)
-    # The server's view of the probe: its SETUP names probe/1.
-    assert not [m for m in info if "probe/1" in m]
+    # The server's view of the probe: its SETUP names probe/1. The probe's
+    # own SETUP send is the client side, which is not quiet.
+    assert not [m for m in info if "probe/1" in m
+                and not m.startswith("MOQT send: Setup(")]
     # Client side of both sessions, server side of the ordinary one only.
     assert _count(info, "setup complete: draft-18") == 3
     assert _count(info, "control message parsed: Subscribe(") == 1
