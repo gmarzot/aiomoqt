@@ -5225,8 +5225,8 @@ async def main():
 
     # Dial origins after the listeners are up: an origin may itself be
     # waiting on us, and a failed dial retries rather than aborting.
-    upstream_tasks = [asyncio.create_task(_dial_upstream(url, args.draft))
-                      for url in args.upstream]
+    _background.update(asyncio.create_task(_dial_upstream(url, args.draft))
+                       for url in args.upstream)
     for url in args.upstream:
         print(f"  upstream origin: {url}")
 

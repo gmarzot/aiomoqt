@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import Dict, List, Any, Optional
 
-from . import MOQTMessageType, MOQTMessage, SetupParamType, BUF_SIZE
+from . import MOQTMessageType, MOQTMessage, BUF_SIZE
 from ..context import DraftProfile
 from ..types import MOQTProtocolViolation
 from ..utils.buffer import Buffer, BufferReadError
@@ -94,7 +94,7 @@ class ClientSetup(MOQTMessage):
         params = MOQTMessage._deserialize_params(buf, prof=prof,
                                                  buf_end=buf_end)
         return cls(versions=versions, parameters=params)
-        
+
 
 @dataclass(slots=True)
 class GoAway(MOQTMessage):

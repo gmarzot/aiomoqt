@@ -14,7 +14,6 @@ import pytest
 
 from aiomoqt.types import (
     MOQTMessageType, MOQT_TIMESTAMP_EXT,
-    MOQT_VERSION_DRAFT16,
 )
 from aiomoqt.messages import Subscribe
 from aiomoqt.messages.data import SubgroupHeader
