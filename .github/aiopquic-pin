@@ -1,2 +1,2 @@
-# Build aiopquic from gmarzot-wt-create-with-data until it merges into gmarzot-0.8.0.
-gmarzot/aiopquic@gmarzot-wt-create-with-data
+# Build aiopquic from its 0.8.0 dev branch until 0.8.0 is on PyPI.
+gmarzot/aiopquic@gmarzot-0.8.0
