@@ -35,6 +35,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -495,9 +496,17 @@ def build_steps(p: dict, hosts: dict[str, Host], relay: dict) -> list[dict]:
         steps.append(relay_step("shenzhen"))
         steps.append(common_pub_bench(url_for(relay_addr, relay_port, tr, wt_path), "shenzhen"))
         nsubs = int(p["subs"])
+        # Fan-out points start their subscribers on a documented stagger so the
+        # relay sees a ramp instead of 20 simultaneous joins (each join is an
+        # ssh round-trip plus a QUIC handshake; starting them serially would
+        # burn the whole measurement window).
+        stag = float(p.get("sub_stagger_s", relay.get("sub_stagger_s", 0.0)))
         for i in range(nsubs):
-            steps.append(common_sub(url_for(relay_addr, relay_port, tr, wt_path), "seawolf",
-                                    role=f"sub{i + 1}"))
+            st = common_sub(url_for(relay_addr, relay_port, tr, wt_path), "seawolf",
+                            role=f"sub{i + 1}")
+            st["delay_s"] = float(p["sub_delay_s"]) + i * stag
+            st["join_index"] = i
+            steps.append(st)
         return steps
 
     if topo == "Ri":
@@ -772,8 +781,129 @@ def run_point(p: dict, *, hosts: dict[str, Host], relay: dict, arm: str, arm_dir
             hosts[info["host"]].kill(info["pid"], grace=args.kill_grace)
         procs.clear()
 
+    def run_subs(subs: list[dict]) -> None:
+        """Start every timed subscriber concurrently on its own stagger slot.
+
+        One subscriber is the classic single-window case; N subscribers share
+        one measurement window: joiner i starts at sub_delay_s + i*stagger, all
+        run for the same run_for_s, and the harness interrupts them at the end
+        of the first joiner's window (the rest have already self-exited via -t).
+        """
+        pin_sub = (p["pin"] or {}).get("sub")
+        role_argv: dict[str, list[str]] = {}
+        remotes = [s for s in subs if not hosts[s["host"]].local]
+        logdir_remote = None
+        if remotes:
+            logdir_remote = (f"{hosts[remotes[0]['host']].root}/runs/{run_root.name}/"
+                             f"{point_id}/rep-{rep:02d}")
+            hosts[remotes[0]["host"]].run(f"mkdir -p {shlex.quote(logdir_remote)}", timeout=30)
+        t0_mono = time.monotonic()
+        t0_unix = time.time()
+        started: list[dict] = []
+        lock = threading.Lock()
+        errs: list[str] = []
+
+        def _launch(s: dict) -> None:
+            host = hosts[s["host"]]
+            argv = host.expand(s["argv"], arm)
+            with lock:
+                role_argv[s["role"]] = argv
+            wait = (t0_mono + float(s.get("delay_s") or 0.0)) - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            try:
+                if host.local:
+                    info = host.start(s["role"], argv, rep_dir / f"{s['role']}.log", pin=pin_sub)
+                else:
+                    info = host.start(s["role"], argv, None, pin=pin_sub,
+                                      logdir_remote=logdir_remote)
+                t_join = time.monotonic()
+                with lock:
+                    started.append({"role": s["role"], "host": s["host"], "pid": info["pid"],
+                                    "log": info["log"], "t_join_s": round(t_join - t0_mono, 2),
+                                    "run_for_s": float(s["run_for_s"]), "t_join_mono": t_join})
+                    procs.append(info)
+                    if not host.local:
+                        remote_logs[s["role"]] = info["log"]
+                        remote_host_of[s["role"]] = s["host"]
+                vlog(f"{point_id}: {s['role']} joined at +{t_join - t0_mono:.1f}s pid={info['pid']}")
+            except Exception as exc:  # noqa: BLE001 - a lost joiner must not lose the point
+                with lock:
+                    errs.append(f"{s['role']}: {type(exc).__name__}: {exc}")
+
+        ths = [threading.Thread(target=_launch, args=(s,), daemon=True) for s in subs]
+        for th in ths:
+            th.start()
+        join_budget = max(60.0, max(float(s.get("delay_s") or 0.0) for s in subs) + 90.0)
+        for th in ths:
+            th.join(timeout=join_budget)
+        with lock:
+            argv_record.update(role_argv)
+            got = list(started)
+            failures = list(errs)
+        if failures:
+            notes.append("subscriber start failures: " + "; ".join(failures))
+        if not got:
+            raise RuntimeError("no subscriber started")
+        if len(got) < len(subs):
+            notes.append(f"fan-out: only {len(got)}/{len(subs)} subscribers started")
+
+        first_end = min(j["t_join_mono"] + j["run_for_s"] for j in got)
+        # CPU while the window is live (relay/pub included, so cpu_relay and
+        # cpu_pub keep the same meaning as in the single-subscriber path).
+        while time.monotonic() < first_end - 4.0:
+            for r_info in list(procs):
+                smp = proc_sample(hosts[r_info["host"]], r_info["pid"])
+                if smp:
+                    proc_stats[r_info["role"]] = {**smp, "host": r_info["host"],
+                                                  "pid": r_info["pid"]}
+            time.sleep(min(6.0, max(0.2, first_end - 4.0 - time.monotonic())))
+        while time.monotonic() < first_end:
+            time.sleep(min(0.5, max(0.0, first_end - time.monotonic())))
+        for r_info in list(procs):
+            smp = proc_sample(hosts[r_info["host"]], r_info["pid"])
+            if smp:
+                proc_stats[r_info["role"]] = {**smp, "host": r_info["host"],
+                                              "pid": r_info["pid"]}
+
+        # Batched teardown: one round-trip per host instead of one per pid.
+        grace = max(args.kill_grace, max(float(s.get("kill_grace_s") or 0.0) for s in subs))
+        by_host: dict[str, list[dict]] = {}
+        for j in got:
+            by_host.setdefault(j["host"], []).append(j)
+        for hid, joins in by_host.items():
+            host = hosts[hid]
+            pids = [j["pid"] for j in joins]
+            if host.local:
+                for pid in pids:
+                    host.kill(pid, grace=min(grace, 5.0), sig=signal.SIGINT)
+                continue
+            host.run("kill -INT " + " ".join(f"-- -{pid}" for pid in pids) + " 2>/dev/null; true",
+                     timeout=30)
+            time.sleep(min(grace, 8.0))
+            host.run("kill -KILL " + " ".join(f"-- -{pid}" for pid in pids) + " 2>/dev/null; true",
+                     timeout=30)
+        done_pids = {j["pid"] for j in got}
+        # the teardown above owns these pids; keep the outer finally from re-killing them
+        procs[:] = [i for i in procs if i["pid"] not in done_pids]
+
+        fanout = {"count": len(got), "window_start_unix": round(t0_unix + (first_end - t0_mono)
+                                                                - min(j["run_for_s"] for j in got), 3),
+                  "first_join_s": min(j["t_join_s"] for j in got),
+                  "last_join_s": max(j["t_join_s"] for j in got),
+                  "steady_window_s": round(max(j["t_join_s"] for j in got) + 0.0, 2),
+                  "subs": [{k: j[k] for k in ("role", "host", "pid", "t_join_s", "run_for_s")}
+                           for j in got]}
+        fanout["steady_start_unix"] = round(t0_unix + max(j["t_join_s"] for j in got), 3)
+        fanout["first_end_unix"] = round(t0_unix + (first_end - t0_mono), 3)
+        write_json_atomic(rep_dir / "fanout.json", fanout)
+        notes.append(f"fan-out: {len(got)} subscribers, joins +{fanout['first_join_s']}s.."
+                     f"+{fanout['last_join_s']}s, first end +{first_end - t0_mono:.1f}s")
+
     # --- run --------------------------------------------------------------
     if status == "ok":
+        sub_steps = [s for s in steps if s.get("run_for_s") and not s["bg"]]
+        subs_done = False
         deadline = time.time() + float(p["duration_s"]) + float(p["warmup_s"]) + args.timeout_margin
         try:
             for s in steps:
@@ -787,48 +917,10 @@ def run_point(p: dict, *, hosts: dict[str, Host], relay: dict, arm: str, arm_dir
                 if s.get("delay_s"):
                     time.sleep(float(s["delay_s"]))
                 if s.get("run_for_s") and not s["bg"]:
-                    # Timed measurement window: the subscriber cannot know when
-                    # the firehose ends, so start it, wait warmup+duration, then
-                    # interrupt it and keep the summary it prints on the way out.
-                    pin_sub = (p["pin"] or {}).get("sub")
-                    if host.local:
-                        info = host.start(s["role"], argv, rep_dir / f"{s['role']}.log", pin=pin_sub)
-                    else:
-                        logdir = f"{host.root}/runs/{run_root.name}/{point_id}/rep-{rep:02d}"
-                        host.run(f"mkdir -p {shlex.quote(logdir)}", timeout=20)
-                        info = host.start(s["role"], argv, None, pin=pin_sub, logdir_remote=logdir)
-                        remote_logs[s["role"]] = info["log"]
-                        remote_host_of[s["role"]] = s["host"]
-                    procs.append(info)
-                    t_end = time.time() + float(s["run_for_s"])
-                    # sleep out the window instead of polling liveness: a remote
-                    # liveness probe is an ssh round-trip and would dominate the
-                    # window (and starve the per-point watchdog).
-                    while time.time() < t_end - 6.0:
-                        time.sleep(min(0.5, max(0.0, t_end - 6.0 - time.time())))
-                    # The subscriber self-exits via -t shortly before the window ends, so sample
-                    # everything once while it is alive and again at the very end (a process
-                    # that is gone keeps its earlier sample).
-                    for sample_pass in (1, 2):
-                        for r_info in procs:
-                            smp = proc_sample(hosts[r_info["host"]], r_info["pid"])
-                            if smp:
-                                proc_stats[r_info["role"]] = {**smp, "host": r_info["host"],
-                                                              "pid": r_info["pid"]}
-                        if sample_pass == 1:
-                            while time.time() < t_end:
-                                time.sleep(min(0.5, max(0.0, t_end - time.time())))
-                    try:
-                        still_alive = host.alive(info["pid"])
-                    except subprocess.TimeoutExpired:
-                        still_alive = True
-                    if not still_alive:
-                        vlog(f"{point_id}: {s['role']} had already exited at window end (self-terminated via -t)")
-                    grace = max(args.kill_grace, float(s.get("kill_grace_s") or 0))
-                    rc = host.kill(info["pid"], grace=grace, sig=signal.SIGINT)
-                    vlog(f"{point_id}: {s['role']} interrupted rc={rc}")
-                    if rc not in (0, None, -signal.SIGINT):
-                        notes.append(f"{s['role']} exited rc={rc}")
+                    if subs_done:
+                        continue
+                    subs_done = True
+                    run_subs(sub_steps)
                     continue
                 if s["bg"]:
                     if host.local:
@@ -1054,10 +1146,17 @@ def run_point(p: dict, *, hosts: dict[str, Host], relay: dict, arm: str, arm_dir
     exp_s = float(p["duration_s"])
     el_s = summary.get("elapsed_s")
     if status in ("ok", "dirty") and el_s is not None and float(el_s) < 0.8 * exp_s:
-        status = "failed"
-        reason = (f"short run: subscriber measured {float(el_s):.1f}s of {exp_s:.0f}s "
-                  f"(see sub.log / relay.log)")
-        notes.append(reason)
+        if "short_run" in args.waive:
+            # Relay-ceiling points (r=0) can abort the subscriber stream early;
+            # the abort itself is the finding, so keep the rep and mark it dirty.
+            status = "dirty"
+            notes.append(f"waived short run: subscriber measured {float(el_s):.1f}s "
+                         f"of {exp_s:.0f}s (see sub.log / relay.log)")
+        else:
+            status = "failed"
+            reason = (f"short run: subscriber measured {float(el_s):.1f}s of {exp_s:.0f}s "
+                      f"(see sub.log / relay.log)")
+            notes.append(reason)
     if status == "ok" and all_waived:
         status = "dirty"
 

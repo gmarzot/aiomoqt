@@ -391,3 +391,43 @@ so paced points silently ran unpaced; rescaled (200M=6104, 300M=9155, 400M=12207
 and documented in the manifest header. Pre-fix block 2026-10-30T22-52-58Z-p1c must not be cited.
 
 Next action: Phase 1d (relay egress) - see PLAN/board; carry the clock-discipline item forward.
+
+## Phase 1d - relay egress baseline (R1..R6)
+
+Relay: program's own moqx on :9768 from `moqx-perf.yaml`, CPU pinned 0-1; shared :9668
+untouched. Publisher co-located, subscribers on seawolf. Blocks
+`runs/2026-10-30T23-42-43Z-p1d` (R1 x3) and `runs/2026-10-30T23-57-24Z-p1d-b2` (R2..R6 x3),
+60 s, 10 s gaps, sampled at 1 Hz by `scripts/relay_sampler.py`, folded by
+`scripts/relay_report.py`.
+
+Harness: no documented subscriber stagger existed in the repo or harness, so a knob was
+authored - `sub_stagger_s: 0.5` in the relay block of `manifests/baseline-v0.yaml`, honoured
+per point, every joiner recorded in `fanout.json` (`join_index`, `t_join_s`). R4 joined at
++2.3..+4.4 s over 5 subs. `run_subs()` launches all joiners concurrently into their stagger
+slots so the 60 s window is shared, not serialised.
+
+Findings so far:
+- Relay CPU is not the wall: 0.175-0.181 core for 197.6 Mb/s to one subscriber
+  (0.9 millicore/Mb/s, spread 1.7% over 3 reps); R4 carried 848.8 Mb/s aggregate over 5 subs
+  for 0.161 core. ~1 core would saturate a 1 Gbps link; the host has 6.
+- The wall is the 1 Gbps path: R4 fan-out ratio 4.24 of 5 and 848.8 Mb/s = 90% of the 941 Mb/s
+  payload ceiling already found in 1c. R4 is link-limited, not fan-out-limited; per-sub
+  169.8 Mb/s vs 197.6 solo.
+- Relay byte counters undercount and are not absolute meters: 146.5 (relay) / 151.4 (NIC tx)
+  vs 197.6 Mb/s delivered in R1; 253.7 / 262.4 vs 848.8 in R4. Subscriber-side totals are the
+  primary egress number; relay counters only as within-rep ratios. CPU from /proc is sound.
+- R2 (unpaced) and R3 (unpaced P=8 g=40) do not ceiling - the relay resets the subscriber
+  stream (`stream 2047 reset by peer: error=3`) after 0.4-1.3 s, 3/3 in both points. The
+  736-765 Mb/s figures are startup bursts, not throughput. Unpaced load tears the
+  subscription down instead of applying backpressure: stack finding.
+- Clock still waived (`--waive clock_offset_jump,clock_unavailable`); p50/p95/p99 null on every
+  rep, offset moved 373 493 us vs 4 496 us tolerance. Latency tail of 1d is still unmeasured.
+- `short_run` was made waivable so R2/R3 stay in the block as `dirty` instead of aborting the
+  sweep; before that patch the first R2 rep killed the whole block.
+
+Open: R5 (20 subs, over-subscribed ~8.5x by construction - link-limited floor, plus 20 sub
+processes on 6 cores) and R6 (WT fan-out) were still running when this section was written;
+per-sub logs and R5/R6 fan-out ratios go into `baselines/base-070rc2/SUMMARY-part3.md`.
+
+Next action: Phase 1e (media/churn + consolidation). Carry forward: clock discipline, a paced
+relay-ceiling point, and relay byte-counter accuracy.

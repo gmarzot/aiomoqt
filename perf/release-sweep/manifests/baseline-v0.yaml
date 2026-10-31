@@ -32,6 +32,11 @@ relay:
   port: 9768
   wt_path: /moq-relay
   pub_port: 4434
+  # Fan-out joiner i starts at sub_delay_s + i*sub_stagger_s (Phase 1d). Each
+  # join is an ssh round-trip plus a QUIC handshake, so a stagger keeps joiners
+  # from contending for the load host's sshd and the relay's accept path.
+  sub_stagger_s: 0.5
+  admin_url: "http://[::1]:9769/metrics"
 
 defaults:
   draft: 16
