@@ -3307,6 +3307,46 @@ class _MOQTSessionMixin:
             self._moqt_session_closed.set_result((error_code, reason_phrase))
 
     DELIVER_POLL_S = 0.005
+    AFTER_DATA_POLL_S = 0.001
+    AFTER_DATA_TIMEOUT_S = 0.05
+    _after_data: Optional[deque] = None
+    _after_data_task: Optional[asyncio.Task] = None
+
+    def _data_queued(self) -> bool:
+        backlog = getattr(self._quic, '_tx_backlog', None)
+        return bool(self._tx_deferred) or bool(backlog() if backlog else 0)
+
+    def send_after_data(self, send: Callable[[], Any]) -> None:
+        """Call `send` once the stream data written so far has left the
+        send queues, at most AFTER_DATA_TIMEOUT_S from the first queued
+        call; queued calls run in order. Control messages outrank data on
+        the wire, so a PUBLISH_DONE sent at once can overtake the End of
+        Track it follows."""
+        if (self._after_data is None
+                and not (self._session_writable() and self._data_queued())):
+            send()
+            return
+        if self._after_data is None:
+            self._after_data = deque()
+        self._after_data.append(send)
+        if self._after_data_task is None:
+            self._after_data_task = asyncio.ensure_future(
+                self._run_after_data())
+
+    async def _run_after_data(self) -> None:
+        deadline = time.monotonic() + self.AFTER_DATA_TIMEOUT_S
+        try:
+            while (self._session_writable() and self._data_queued()
+                   and time.monotonic() < deadline):
+                await asyncio.sleep(self.AFTER_DATA_POLL_S)
+        finally:
+            sends, self._after_data = self._after_data, None
+            self._after_data_task = None
+            for send in sends or ():
+                try:
+                    send()
+                except Exception:
+                    logger.debug("deferred send failed", exc_info=True)
 
     async def wait_delivered(self, timeout: float = 0.5) -> bool:
         """Wait at most `timeout` s until everything written has been sent
@@ -3319,7 +3359,7 @@ class _MOQTSessionMixin:
         quiet = 0
         while self._session_writable():
             # Queues before flight: what has left them is in flight by now.
-            idle = (not self._tx_deferred
+            idle = (not self._tx_deferred and not self._after_data
                     and not (backlog() if backlog else 0)
                     and not ((stats() if stats else None) or {}).get(
                         'bytes_in_transit'))

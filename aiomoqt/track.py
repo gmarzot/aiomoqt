@@ -1721,13 +1721,20 @@ class PublishedTrack(Track):
         )
         logger.info(f"Track: PUBLISH_DONE request_id={req_id} "
                     f"streams={count}")
-        try:
-            # d18 §10.11: PUBLISH_DONE rides the subscription's request
-            # stream, FIN after; pre-d18 _send_reply routes to the
-            # control stream.
-            session._send_reply(req_id, msg, fin=True)
-        except Exception:
-            pass  # session may already be closing
+
+        def send():
+            try:
+                # d18 §10.11: PUBLISH_DONE rides the subscription's request
+                # stream, FIN after; pre-d18 _send_reply routes to the
+                # control stream.
+                session._send_reply(req_id, msg, fin=True)
+            except Exception:
+                pass  # session may already be closing
+        after_data = getattr(session, 'send_after_data', None)
+        if after_data is None:
+            send()
+        else:
+            after_data(send)
 
     _stats_header_printed = False
 

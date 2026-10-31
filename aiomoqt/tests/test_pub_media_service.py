@@ -12,6 +12,7 @@ import sys
 import time
 
 import pytest
+from aiopquic.quic.connection import stream_is_unidirectional
 
 from aiomoqt.media.broadcast import CatalogTrackPublisher
 from aiomoqt.media.catalog import Catalog
@@ -26,6 +27,7 @@ from aiomoqt.tests.test_pub_media_mtt import (  # noqa: F401  (fixtures)
 from aiomoqt.tools import moq_interop_relay as relay
 from aiomoqt.tools import pub_media, sub_media
 from aiomoqt.track import PublishedTrack
+from aiomoqt.messages import SubscribeDone
 from aiomoqt.types import MOQTRequestError, ObjectStatus, RequestErrorCode
 
 _BASE_PORT = 21000
@@ -221,6 +223,25 @@ async def test_signal_withdraws_refuses_and_closes(
         log.append(('close', id(self), delivered.get(id(self))))
         return close_orig(self, *a, **kw)
     monkeypatch.setattr(_MOQTSessionMixin, 'close', close)
+    monkeypatch.setattr(_MOQTSessionMixin, 'AFTER_DATA_TIMEOUT_S', 2.0)
+    fins = {}
+    write_orig = _MOQTSessionMixin.stream_write
+
+    def stream_write(self, stream_id, data, end_stream=False):
+        if end_stream and stream_is_unidirectional(stream_id):
+            fins.setdefault(id(self), set()).add(stream_id)
+        return write_orig(self, stream_id, data, end_stream=end_stream)
+    monkeypatch.setattr(_MOQTSessionMixin, 'stream_write', stream_write)
+    reply_orig = _MOQTSessionMixin._send_reply
+
+    def send_reply(self, request_id, msg, fin=False):
+        if isinstance(msg, SubscribeDone):
+            # Bytes still queued on the data streams closed so far.
+            log.append(('done_sent', id(self), sum(
+                self._quic.tx_data_ring_used(sid)
+                for sid in fins.get(id(self), ()))))
+        return reply_orig(self, request_id, msg, fin=fin)
+    monkeypatch.setattr(_MOQTSessionMixin, '_send_reply', send_reply)
 
     srv, handle = await _serve(port, use_quic, draft)
     try:
@@ -253,6 +274,9 @@ async def test_signal_withdraws_refuses_and_closes(
     assert probes[1:] == [int(want)], probes
     assert {n for n, *_ in arrivals} >= {'video', 'audio'}
     assert ended == {'video', 'audio', 'catalog'}, ended
+    # Each PUBLISH_DONE leaves after the data it follows, End of Track included.
+    sent = [e for e in log if e[0] == 'done_sent' and e[1] in delivered]
+    assert len(sent) >= 3 and not any(e[2] for e in sent), log
     # The publisher closes only once its peer has acknowledged everything.
     assert delivered and all(delivered.values()), delivered
     assert [e[2] for e in log if e[0] == 'close' and e[1] in delivered] \
@@ -301,8 +325,13 @@ class _Wire:
 
 
 class _Delivering:
-    DELIVER_POLL_S = 0.001
+    DELIVER_POLL_S = AFTER_DATA_POLL_S = 0.001
+    AFTER_DATA_TIMEOUT_S = 0.05
+    _after_data = _after_data_task = None
     wait_delivered = _MOQTSessionMixin.wait_delivered
+    send_after_data = _MOQTSessionMixin.send_after_data
+    _run_after_data = _MOQTSessionMixin._run_after_data
+    _data_queued = _MOQTSessionMixin._data_queued
 
     def __init__(self, wire, deferred=None):
         self._quic, self._tx_deferred, self._close_err = wire, deferred, None
@@ -338,6 +367,33 @@ async def test_wait_delivered_on_a_closed_session_returns_at_once():
     s._close_err = (0, '')
     assert not await s.wait_delivered(timeout=5)
     assert s._quic.polls == 0
+
+
+async def test_send_after_data_sends_at_once_with_nothing_queued():
+    sent = []
+    _Delivering(_Wire(lambda n: 0, lambda n: 0)).send_after_data(
+        lambda: sent.append(1))
+    assert sent == [1]
+
+
+async def test_send_after_data_waits_for_the_queue_in_order():
+    wire = _Wire(lambda n: 900 if n < 5 else 0, lambda n: 0)
+    s, sent = _Delivering(wire), []
+    s.send_after_data(lambda: sent.append(('done', wire.polls)))
+    s.send_after_data(lambda: sent.append(('ns_done', wire.polls)))
+    assert sent == [] and s._after_data
+    assert not await s.wait_delivered(timeout=0)   # a send is pending
+    await s._after_data_task
+    assert sent == [('done', 5), ('ns_done', 5)]   # queue empty on poll 5
+    assert s._after_data is None and s._after_data_task is None
+
+
+async def test_send_after_data_sends_at_the_timeout():
+    s, sent = _Delivering(_Wire(lambda n: 900, lambda n: 0)), []
+    t = time.monotonic()
+    s.send_after_data(lambda: sent.append(1))
+    await s._after_data_task
+    assert sent == [1] and 0.05 <= time.monotonic() - t < 0.5
 
 
 # -- --reconnect ---------------------------------------------------------------
