@@ -39,7 +39,6 @@ skew are built from differences and do not.
 import asyncio
 import csv
 import functools
-import logging
 import os
 import sys
 import time
@@ -54,10 +53,9 @@ from aiomoqt.media.cmaf import init_timescale
 from aiomoqt.media.loc import LOC_PROP_TIMESCALE
 from aiomoqt.types import MOQTRequestError
 from aiomoqt.media.sources import (
-    IvfWriter, adts_frame, avcc_param_sets, lp_to_annexb,
+    IvfWriter, adts_frame, as_annexb, avcc_param_sets,
 )
 from aiomoqt.utils import cli as _cli
-from aiomoqt.utils.logger import set_log_level
 from aiomoqt.utils.media_stats import (
     CSV_FIELDS, MediaAnalysis, csv_row, format_interval, format_summary,
     interval_header, wall_clock_us,
@@ -123,7 +121,10 @@ def parse_args():
     _cli.add_interval(parser)
     _cli.add_session(parser)
     _cli.add_keepalive(parser)
-    _cli.add_timestamp_checking(parser)
+    _cli.add_timestamp_checking(parser, default=None,
+                                default_help='report with --analyze, '
+                                             'else cancel')
+    _cli.add_logging(parser)
     _cli.add_help(parser)
     args = parser.parse_args()
     if args.analyze and args.pipe:
@@ -215,13 +216,13 @@ class _Writers:
             param_sets = (avcc_param_sets(config)
                           if frame.key_frame and config else b'')
             if self.pipe_role == 'video':
-                self._pipe(param_sets + lp_to_annexb(frame.payload))
+                self._pipe(param_sets + as_annexb(frame.payload))
                 return
             if self.video is None:
                 self.video = open(os.path.join(self.out, 'video.h264'),
                                   'wb')
             self.video.write(param_sets)
-            self.video.write(lp_to_annexb(frame.payload))
+            self.video.write(as_annexb(frame.payload))
         elif role == 'audio' and (entry.codec or '').startswith('mp4a'):
             # Raw AAC AUs; the AudioSpecificConfig arrives via catalog
             # initRef. ADTS-wrapped output is directly playable.
@@ -268,6 +269,12 @@ class _Writers:
         for fh in self.cmaf.values():
             if fh is not sys.stdout.buffer:
                 fh.close()
+
+
+def _timestamp_policy(args) -> str:
+    """--timestamp-errors, else report under --analyze (a diagnosis keeps
+    the track) and cancel otherwise."""
+    return args.timestamp_errors or ('report' if args.analyze else 'cancel')
 
 
 def _status(*parts):
@@ -398,7 +405,7 @@ def _finish_analysis(analysis: MediaAnalysis, start_us: int, end_us: int,
 
 
 async def run(args):
-    set_log_level(logging.DEBUG if args.debug else logging.WARNING)
+    _cli.apply_logging(args)
     relay = parse_relay_url(args.url)
     if not args.analyze:
         os.makedirs(args.out, exist_ok=True)
@@ -421,8 +428,7 @@ async def run(args):
         use_quic=relay.use_quic, verify_tls=not args.insecure,
         supported_drafts=args.draft, debug=args.debug,
         keylog_filename=args.keylogfile,
-        congestion_control_algorithm=args.cc_algo,
-        keep_alive_interval=args.keepalive,
+        **_cli.transport_kwargs(args),
     )
     _status(f"  relay: {relay}  namespace: {args.namespace}")
     rc = 0
@@ -439,7 +445,7 @@ async def run(args):
         sub = MediaSubscriber(
             session, args.namespace, discover=args.discover,
             track_filter=_select, loc_bare=args.loc_bare,
-            timestamp_errors=args.timestamp_errors,
+            timestamp_errors=_timestamp_policy(args),
             on_catalog=((lambda c: _status(c.to_json(indent=2)))
                         if args.show_catalog else None))
         writers = (None if args.analyze

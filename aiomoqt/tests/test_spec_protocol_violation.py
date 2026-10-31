@@ -75,3 +75,104 @@ def test_well_formed_params_round_trip(draft):
     buf.seek(0)
     params = MOQTMessage._deserialize_params(buf, prof=profile_for(draft), buf_end=end)
     assert params == {0x20: 7, 0x22: 1}
+
+
+# -- malformed control messages through a live session ------------------
+
+import asyncio  # noqa: E402
+
+from aiomoqt.client import MOQTClient  # noqa: E402
+from aiomoqt.messages.subscribe import SubscribeOk  # noqa: E402
+from aiomoqt.protocol import _MOQTSessionMixin  # noqa: E402
+from aiomoqt.server import MOQTServer  # noqa: E402
+from aiomoqt.tests._certs import CERT, KEY, requires_certs  # noqa: E402
+
+_PORT = 23700
+
+
+def _wire(draft, msg_type, body):
+    """A control message: type, 16-bit Length, body."""
+    buf = Buffer(capacity=len(body) + 16, vi64=profile_for(draft).vi64)
+    buf.push_vint(msg_type)
+    buf.push_uint16(len(body))
+    buf.push_bytes(body)
+    return bytes(buf.data_slice(0, buf.tell()))
+
+
+def _truncated_track_extension():
+    """d16 SUBSCRIBE_OK whose trailing Track Extension declares a value
+    longer than the message."""
+    raw = bytes(SubscribeOk(request_id=0, track_alias=1,
+                            track_extensions={0x3B: b"abcdef"}
+                            ).serialize(prof=profile_for(16)).data)
+    return _wire(16, 0x04, raw[3:-3])
+
+
+_MALFORMED = {
+    # Invalid UTF-8 in the New Session URI.
+    "goaway-uri": (16, False, lambda: _wire(16, 0x10, b"\x04\xff\xfe\xfd\xfc")),
+    # Group Order 9 in a d14 TRACK_STATUS_OK.
+    "group-order": (14, False, lambda: _wire(
+        14, 0x0E, bytes([0, 1, 0, 9, 0, 0]))),
+    "track-extension": (16, False, _truncated_track_extension),
+    # A namespace field declaring 2^63 bytes, on a d18 request stream.
+    "namespace-length": (18, True, lambda: _wire(
+        18, 0x03, b"\x00\x01\xff" + (1 << 63).to_bytes(8, "big"))),
+}
+
+
+@requires_certs
+@pytest.mark.parametrize("case", list(_MALFORMED))
+async def test_malformed_control_message_closes_the_session_once(
+        case, monkeypatch, caplog):
+    draft, request_stream, build = _MALFORMED[case]
+    closes = []
+    orig = _MOQTSessionMixin._close_session
+
+    def record(self, code=SessionCloseCode.NO_ERROR, reason="no error",
+               **kw):
+        if not self._is_client and kw.get("transmit", True):
+            closes.append((code, reason))
+        return orig(self, code, reason, **kw)
+    monkeypatch.setattr(_MOQTSessionMixin, "_close_session", record)
+    monkeypatch.setattr(MOQTMessage, "_tolerate_trailing_extensions", False)
+
+    port = _PORT + list(_MALFORMED).index(case)
+    server = await MOQTServer(host="localhost", port=port, certificate=CERT,
+                              private_key=KEY, path="/", use_quic=True).serve()
+    try:
+        client = MOQTClient("localhost", port, path="/", use_quic=True,
+                            verify_tls=False, supported_drafts=draft)
+        async with client.connect() as session:
+            await session.client_session_init()
+            if request_stream:
+                sid = await session.open_bidi_stream()
+                session.stream_write(sid, build())
+            else:
+                session._quic.send_stream_data(
+                    stream_id=session._control_write_stream_id,
+                    data=build(), end_stream=False)
+            for _ in range(150):
+                if session._close_err is not None:
+                    break
+                await asyncio.sleep(0.02)
+            assert session._close_err is not None
+            assert session._close_err[0] == SessionCloseCode.PROTOCOL_VIOLATION
+    finally:
+        server.close()
+    # One close, sent by the server, with a short reason.
+    assert len(closes) == 1, closes
+    code, reason = closes[0]
+    assert code == SessionCloseCode.PROTOCOL_VIOLATION
+    assert 0 < len(reason) < 120 and "\n" not in reason
+    assert "traceback" not in caplog.text.lower()
+
+
+def test_decode_reports_an_unexpected_fault_as_a_protocol_violation(
+        monkeypatch):
+    def broken(cls, buf, **kw):
+        raise IndexError("tuple index out of range")
+    monkeypatch.setattr(SubscribeOk, "deserialize", classmethod(broken))
+    with pytest.raises(MOQTProtocolViolation, match="malformed SubscribeOk"):
+        SubscribeOk.decode(Buffer(data=b"\x00"), prof=profile_for(16),
+                           buf_end=1)

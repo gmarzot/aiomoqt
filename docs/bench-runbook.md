@@ -126,6 +126,19 @@ Plus file descriptors, since every subscriber costs some:
 
   Applied on both hosts, so the resulting RTT is twice the one-way value.
 
+- **Emulated RTT on one host.** `loopback_bench --rtt-ms MS` re-runs
+  itself in a private network namespace and puts `netem delay MS/2` on
+  that namespace's `lo`; the host's network is untouched. `--link-mbps`
+  adds a rate cap and `--loss` random loss. One qdisc carries both
+  directions, so the cap and the loss also hit ACKs, and its queue is
+  deep (200000 packets): the cap models a deep buffer. It needs
+  privileges to create a network namespace: unprivileged user
+  namespaces (`unshare -rn`), or run the bench under `sudo`. Without
+  them it exits 2. One stream carries at most one flow-control window
+  per RTT (16 MiB: 2.7 Gbps at 50 ms, 0.9 Gbps at 150 ms); raise it with
+  `--fc-window`, or cap the link below it with `--link-mbps` so that
+  congestion control sets the rate.
+
 ### Verify before trusting a number
 
 Re-read the settings rather than assuming they took: interface, CPU
@@ -137,8 +150,9 @@ sweep.
 
 ### Congestion control
 
-`--cc-algo` selects it: bbr, bbr1, newreno, cubic, dcubic, prague, fast.
-Default is bbr1. **Label every result with the algorithm actually used.**
+`--cc-algo` selects it: bbr, bbr1, c4, cubic, dcubic, fast, newreno, prague.
+Default is bbr (BBRv3) in every tool and the relay.
+**Label every result with the algorithm actually used.**
 "BBR" does not name the same algorithm across implementations, and a
 cubic control run is the one posture every stack shares.
 
@@ -216,6 +230,16 @@ object of a group can be made as large or small as the question needs.
 **There is no synthetic audio.** The bench tools are video-shaped only.
 Audio lives in the media runbook, as a pcm-s16 tone or real AAC.
 
+**Every payload byte follows from the object's location.** A generated
+object is `{group}.{object}.{size}|` (a video frame:
+`{group}.{object}.{size}.{type}|`), then the 0..255 counting pattern, cut
+to size. `--verify-payload` on sub_bench and loopback_bench checks each
+received object against that and fails the run on a mismatch, so objects
+swapped, shifted, truncated or corrupted on the way show up. The check
+costs the subscriber about 0.4 µs per 1–4 KiB object and 3.6 µs per
+200 KB frame (Ryzen 7 PRO 7840U), so leave it off for ceiling runs, or
+pass `--verify-payload N` to check every Nth object.
+
 ## A — loopback self-test
 
 One process hosting both ends and its own relay. Nothing to set up and
@@ -247,12 +271,17 @@ Nothing to set: both tools default to namespace `aiomoqt`, so they meet
 there, and `-T v1080p` on both is what selects the track.
 
 
-- `--video` sets object size, rate and GOP together, overriding `-s`,
-  `-r` and `-g`. Flat alternative: `-s 4096 -r 120 -g 240`, which is 2 s
-  groups at 120 objects per second. Stream turnover is rate divided by
-  group size, so lower `-g` to exercise churn.
-- `--video` with `-D/--datagram` is refused: profile I-frames are far
-  past the 1152-byte one-packet ceiling.
+- `--video` takes I/P/B frame sizes from the resolution: one object per
+  frame, one GOP per group opening on the I-frame, one subgroup stream.
+  `-r` stays objects per second, so it is the frame rate (default 30), and
+  `-g` stays objects per group, so it is the GOP length in frames (default
+  one second of frames): `--video 1080p -r 60 -g 120` is 60 fps with 2 s
+  GOPs. pub_bench, pub_server and adaptive_bench subs mode all take it.
+- `--video` refuses `-s`, `-P` and `-D`: the profile sets each frame's
+  size, sends one stream, and its I-frames are far past the 1152-byte
+  one-packet datagram ceiling. Flat alternative: `-s 4096 -r 120 -g 240`,
+  which is 2 s groups at 120 objects per second. Stream turnover is rate
+  divided by group size, so lower `-g` to exercise churn.
 - `--no-stats` counts objects and bytes only, measuring the delivery
   ceiling without the measurement in it.
 
@@ -279,13 +308,23 @@ samples say stop.
 python -m aiomoqt.tools.adaptive_bench "$RELAY_QUIC" -k --draft 18 --start-mbps 10 --step-mbps 10 --max-mbps 500 --latency-threshold 100 --report bw-ramp.csv
 ```
 
-Add `--mp` when chasing a transmit ceiling: one Python process is
-GIL-bound, so without it the interpreter can be what you measure.
+Against a relay the publisher and subscriber always run in separate
+processes. `--mp` matters only for the loopback self-test (flow A), where
+one Python process is GIL-bound and can be what you measure.
 
-Stops on p90 latency over `-l` (default 100 ms) for two intervals
-running, or achieved-over-commanded below `--shortfall-ratio` (0.85).
+Latency is the subscriber's p90 over its last 5 s. The controller backs
+off when it stays over `--latency-threshold` (default 100 ms) for two
+intervals. A shortfall, achieved below `--shortfall-ratio` (0.85) of
+commanded, holds the ramp and backs off once it lasts three intervals.
 Back-off multiplies by `--backoff-factor` (0.9; closer to 1.0 for gentler
-steps). Hard caps are `--max-mbps` and `-t` seconds.
+steps). Hard caps are `--max-mbps` and `-t` seconds. A run that receives
+nothing exits nonzero.
+
+**Set the threshold relative to the path RTT.** Absolute latency
+includes the path, and the ramp takes full steps only while p90 is under
+half the threshold; once it has backed off, it probes upward only then.
+On a 49 ms path a 100 ms threshold freezes the ramp well below the
+relay's ceiling. Use about 250 ms against a remote relay.
 
 **Bandwidth mode cannot be split across hosts.** The controller actuates
 the publisher while measuring at the subscriber, so separating them with
@@ -315,7 +354,9 @@ It prints what it is waiting for:
 `role=sub — expecting an external publisher on perf/subs-ramp at 10 Mbps`.
 
 **Both sides need the same `-N`, `-T` and `--sub-mbps`**, and `-T`
-defaults to a random suffix, so it has to be pinned explicitly.
+defaults to a random suffix, so it has to be pinned explicitly. For a
+video-shaped track, give both sides `--video RES` (and the same `-g`) in
+place of `--sub-mbps` and `-s`; the profile sets the bitrate.
 
 Ramp knobs:
 
@@ -326,6 +367,17 @@ Ramp knobs:
 | `-S` / `--stagger` | seconds between individual joins inside a group (default 0.1). Spaces the QUIC Initials so a group does not burst the relay; 0 opens the batch at once |
 | `--sub-filter` | `next-group-start` skips the current-group replay some relays do on `latest-object`, the default |
 
+A subscriber counts toward the high-water mark only while it receives at
+least half of `--sub-mbps`, judged over the last few seconds and 3 s
+after its latest subscribe. Fewer such subscribers than the mature
+target, or a total below `--shortfall-ratio` of their combined rate, is a
+shortfall; a lossy or starved subscriber is not counted as capacity. The
+latency threshold works as in flow C, so set it from the path RTT here
+too.
+
+The ramp ends at `--max-subs`; it cannot hold a fixed count. For a fixed
+audience use `load_sim --subs N` (flow E).
+
 **Latency comes from the object's LOC timestamp** (property 0x10,
 wall-clock µs): pub_bench and pub_media both stamp it, so an audience run
 against a live broadcast reports real delivery latency. pub_media
@@ -334,10 +386,11 @@ time — latency then reads 0.
 
 **Absolute latency is not trustworthy across hosts.** It is the
 receiver's clock minus the sender's timestamp, so a split run carries the
-hosts' clock offset straight into the back-off signal. adaptive_bench
-knows: whenever the role is not `both` it sets a skew-safe flag and leans
-on signals that are differences or counts — jitter is a difference of
-differences, shortfall is a count — and neither inherits the offset.
+hosts' clock offset. Whenever the role is not `both`, adaptive_bench
+measures p90 over a running baseline — the lowest p90 seen, its 1st
+percentile once it has 100 samples — which cancels a constant offset.
+The threshold is then the queueing delay allowed over that baseline, and
+the banner says so. A clock that drifts during the run still leaks in.
 
 ## E — scenario load and churn
 

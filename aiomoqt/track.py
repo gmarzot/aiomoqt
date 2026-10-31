@@ -33,10 +33,11 @@ from .types import (
     FetchType, MOQTRequestError, MOQTStreamStopped, ParamType, FilterType,
     ForwardingPreference, GroupOrder, LOC_TIMESTAMP, ObjectStatus,
     RequestErrorCode, StreamResetCode, SubscribeDoneCode,
+    SCHEDULING, to_stream_priority,
 )
 from .delivery import (
-    DatagramTooLarge, FanoutDelivery, ObjectHistory, StreamMapping,
-    SubgroupDelivery,
+    PUBLISHER_LANE_BYTES, DatagramTooLarge, FanoutDelivery, ObjectHistory,
+    StreamMapping, SubgroupDelivery, properties_charge,
 )
 from .messages import (
     FetchHeader, LocationFilter, MOQTMessage, ObjectDatagram, PublishOk,
@@ -51,15 +52,17 @@ from .context import is_draft16_or_later
 from .messages.fetch import _is_joining
 from .utils.buffer import Buffer, BufferReadError
 from .utils.format import fmt_bps, fmt_rate
-from .utils.logger import get_logger
+from .utils.logger import TRACE, get_category_logger, get_logger
+from .utils.payload import counted
 from .utils.timing import (
     TimestampMalformed, TimestampWriter, TrackTiming, check_object,
 )
 
 logger = get_logger(__name__)
+data_log = get_category_logger("data")
 
-# Bytes of recent objects a PublishedTrack keeps to answer FETCH.
-FETCH_HISTORY_DEFAULT = 1 << 20
+# FETCH history charge of the generators' {LOC_TIMESTAMP: int} properties.
+_LOC_TS_CHARGE = properties_charge({LOC_TIMESTAMP: 0})
 
 
 def _largest_object_param(session, largest: tuple) -> dict:
@@ -178,7 +181,7 @@ class Track:
         self.num_subgroups = num_subgroups
         self.rate = rate
         self.track_alias: int = 0
-        self.request_id: int = 0
+        self.request_id: Optional[int] = None
         self.state: TrackState = TrackState.IDLE
         self._tasks: set = set()
 
@@ -274,6 +277,7 @@ class _SubgroupSender:
         self.track_alias = track_alias
         self.subgroup_id = subgroup_id
         self.priority = priority
+        self.band = track._stream_band(session, priority)
         self.header = None
         self.stream_id = None
         # The peer stopped this group's stream (§11.3.2: not reopened).
@@ -334,6 +338,7 @@ class _SubgroupSender:
         try:
             if self.stream_id is None:
                 self.stream_id = await session.open_uni_stream()
+                session.set_stream_priority(self.stream_id, self.band)
                 self.track._stream_count += 1
                 self.track._stream_opened(self.sub)
                 self.sub.senders.add(self)
@@ -368,11 +373,11 @@ class _SubgroupSender:
         held = {} if history is None else history._held(
             (group_id, first), (group_id, object_id - 1))
         recs = [held.get((group_id, oid)) for oid in missing]
-        if any(r is None or (r[2] or 0) != self.subgroup_id for r in recs):
+        if any(r is None or (r[0] or 0) != self.subgroup_id for r in recs):
             self.short = True
             return
         session = self.session
-        for _, oid, _, payload, exts, _ in recs:
+        for oid, (_, payload, exts, _) in zip(missing, recs):
             if callable(exts):
                 exts = exts(session)
             await session.stream_write_drain(
@@ -425,35 +430,35 @@ class _Subscription:
     request, Forward State, subscribers and what PUBLISH_DONE owes it."""
 
     __slots__ = ('session', 'track_alias', 'request_id',
-                 'subscribe_request_id', 'subscribers', 'state', 'forward',
-                 'done', 'stream_count', 'generating', 'delivery', 'joining',
-                 'window', 'open_streams', 'end_status', 'senders',
+                 'subscribe_request_id', 'subscribers', 'state', '_forward',
+                 'done', 'stream_count', '_generating', 'delivery', 'joining',
+                 '_window', 'open_streams', 'end_status', 'senders',
                  'fill_streams', 'fills', 'location_filter', 'group_order',
                  'object_timeout', 'subgroup_timeout', 'updated_request')
 
     def __init__(self, session):
         self.session = session
         self.track_alias: int = 0
-        self.request_id: int = 0
+        self.request_id: Optional[int] = None
         # request_id from the relay's SUBSCRIBE, for PUBLISH_DONE.
         self.subscribe_request_id = None
         # Request ids subscribed through this peer; it idles when this
         # drains and restarts for the next subscriber.
         self.subscribers: set = set()
         self.state: TrackState = TrackState.IDLE
+        self.delivery = None
         # Subscription Forward State (§5.1): objects flow only while 1.
-        self.forward = True
+        self._forward = True
         # PUBLISH_DONE sent: nothing restarts production after this
         # (relays reject "publish after publishDone").
         self.done = False
         self.stream_count = 0
-        self.generating = False
-        self.delivery = None
+        self._generating = False
         # Request id -> Joining Location (§5.1): the Largest Location
         # reported as its Forward State became 1, None if nothing existed.
         self.joining: Dict[int, Optional[tuple]] = {}
         # Filter window (§5.1.2) and the streams open under it.
-        self.window = _UNFILTERED
+        self._window = _UNFILTERED
         self.open_streams = 0
         # PUBLISH_DONE status for a subscription ended under the track.
         self.end_status = SubscribeDoneCode.SUBSCRIPTION_ENDED
@@ -473,6 +478,45 @@ class _Subscription:
         # Request whose Forward State a REQUEST_UPDATE has set.
         self.updated_request = None
 
+    @property
+    def forward(self):
+        return self._forward
+
+    @forward.setter
+    def forward(self, value) -> None:
+        self._forward = value
+        self._gate()
+
+    @property
+    def generating(self) -> bool:
+        return self._generating
+
+    @generating.setter
+    def generating(self, value: bool) -> None:
+        self._generating = value
+        self._gate()
+
+    def _gate(self) -> None:
+        """Hand the peer's send lane whether objects flow to it."""
+        lane = getattr(self.delivery, "lane", None)
+        if lane is not None:
+            lane.gate = bool(self._forward and self._generating)
+
+    @property
+    def window(self):
+        return self._window
+
+    @window.setter
+    def window(self, value) -> None:
+        self._window = value
+        self._filter()
+
+    def _filter(self) -> None:
+        """Give the peer's delivery its filter; none while unfiltered."""
+        if self.delivery is not None:
+            self.delivery.passes = (None if self._window is _UNFILTERED
+                                    else self.passes)
+
     def take_timeouts(self, params, prof) -> None:
         """Record the delivery timeouts a SUBSCRIBE, PUBLISH_OK or
         REQUEST_UPDATE carries; absent ones keep their value."""
@@ -488,8 +532,8 @@ class _Subscription:
     def passes(self, group_id: int, object_id: int) -> bool:
         """True when the subscription takes this Location: Forward State 1
         (§5.1) and inside its filter (§5.1.2)."""
-        window = self.window
-        if not self.forward or isinstance(window, str):
+        window = self._window
+        if not self._forward or isinstance(window, str):
             return False
         end_group = window[1]
         if (group_id, object_id) < window[0]:
@@ -567,12 +611,14 @@ class PublishedTrack(Track):
                  auth_token: Optional[bytes] = None,
                  forwarding: ForwardingPreference =
                      ForwardingPreference.SUBGROUP,
-                 fetch_history_bytes: int = FETCH_HISTORY_DEFAULT,
+                 fetch_history_bytes: int = 0,
                  immutable_properties: Optional[
                      Dict[int, Union[int, bytes]]] = None,
                  track_properties: Optional[
                      Dict[int, Union[int, bytes]]] = None,
-                 timestamps: str = 'loc'):
+                 timestamps: str = 'loc',
+                 stream_scheduling: Optional[str] = None,
+                 lane_bytes: int = PUBLISHER_LANE_BYTES):
         # Before super(): Track.__init__ assigns track_alias/request_id/
         # state, which are properties over this list.
         self._subs = [_Subscription(session)]
@@ -580,10 +626,14 @@ class PublishedTrack(Track):
                          object_size, group_size, num_subgroups, rate)
         self.forwarding = forwarding
         self.priority = priority
-        # Transport send priority for this track's streams; None leaves
-        # them at the transport default. Opt-in, so a track that never
-        # asks for scheduling behaves exactly as before.
+        # Transport band for this track's data streams; None derives it
+        # from `priority` and `stream_scheduling` (None: the session's).
         self.stream_priority = None
+        if stream_scheduling not in (None, *SCHEDULING):
+            raise ValueError(f"stream_scheduling {stream_scheduling!r}")
+        self.stream_scheduling = stream_scheduling
+        # Bytes each peer's send lane holds before it sheds groups.
+        self.lane_bytes = lane_bytes
         self.auth_token = auth_token
         self.immutable_properties = _checked_immutable(immutable_properties)
         self.track_properties = _checked_immutable(track_properties,
@@ -604,7 +654,8 @@ class PublishedTrack(Track):
         # the first object exists. Drives ContentExists/Largest Location
         # in SUBSCRIBE_OK. A property of the content, so track-level.
         self._largest = None
-        # Recent objects for FETCH; None refuses FETCH as NOT_SUPPORTED.
+        # Recent objects for FETCH, kept only when `fetch_history_bytes`
+        # is set; None refuses FETCH as NOT_SUPPORTED.
         self._history = (ObjectHistory(fetch_history_bytes)
                          if fetch_history_bytes > 0 else None)
         # Payload pattern built by generate(); set means production has
@@ -614,6 +665,8 @@ class PublishedTrack(Track):
         # produce() tracks: the shared delivery and the one production run.
         self._out: Optional[FanoutDelivery] = None
         self._production: Optional[asyncio.Future] = None
+        # end() stopped production: it ends with End of Track.
+        self._ending = False
         # The error that ended production, if one did.
         self.error: Optional[Exception] = None
         # Aggregate stats across all subgroup streams; subgroup 0 reports.
@@ -695,12 +748,22 @@ class PublishedTrack(Track):
     def _produces(self) -> bool:
         return type(self).produce is not PublishedTrack.produce
 
+    def _stream_band(self, session, priority: Optional[int] = None) -> int:
+        """Transport band for this track's data streams on `session`."""
+        if self.stream_priority is not None:
+            return self.stream_priority
+        sched = self.stream_scheduling or getattr(
+            session, 'stream_scheduling', "fifo")
+        return to_stream_priority(
+            self.priority if priority is None else priority,
+            discipline=sched)
+
     def _add_delivery(self, sub) -> None:
         """Give a peer its delivery of the object sequence under its
         current alias, replacing any it had. It joins at the next group
         boundary."""
         if self._out is None:
-            self._out = FanoutDelivery()
+            self._out = FanoutDelivery(max_bytes=self.lane_bytes)
             self._out.name = self.fqtn
             self._out.on_write = self._on_produced
             self._out.on_sent = self._on_sent
@@ -708,12 +771,13 @@ class PublishedTrack(Track):
         sub.delivery = SubgroupDelivery(sub.session, sub.track_alias,
                                         priority=self.priority,
                                         mapping=self.mapping,
-                                        stream_priority=self.stream_priority)
-        sub.delivery.passes = sub.passes
+                                        stream_priority=self._stream_band(
+                                            sub.session))
+        sub._filter()
         sub.delivery.excludes_end = sub.excludes_end
         self._out.add(sub.delivery,
-                      gate=lambda: sub.forward and sub.generating,
-                      deadline=lambda: self._delivery_deadline(sub))
+                      gate=bool(sub.forward and sub.generating),
+                      deadline=self._delivery_deadline(sub))
 
     def _lane_stopped(self, sub) -> bool:
         """True when production runs but this peer's lane task has ended."""
@@ -721,12 +785,42 @@ class PublishedTrack(Track):
                 or self._production is None or self._production.done()):
             return False
         lane = next((ln for ln in self._out.lanes
-                     if ln.delivery is sub.delivery), None)
+                     if ln.writer is sub.delivery), None)
         return lane is None or lane.task.done()
 
     # Track Property delivery timeouts in ms (§8, §12.1-12.2); 0 sets none.
-    object_delivery_timeout: int = 0
-    subgroup_delivery_timeout: int = 0
+    _object_delivery_timeout: int = 0
+    _subgroup_delivery_timeout: int = 0
+
+    @property
+    def object_delivery_timeout(self) -> int:
+        return self._object_delivery_timeout
+
+    @object_delivery_timeout.setter
+    def object_delivery_timeout(self, value: int) -> None:
+        self._object_delivery_timeout = value
+        for sub in getattr(self, "_subs", ()):
+            self._sync_deadline(sub)
+
+    @property
+    def subgroup_delivery_timeout(self) -> int:
+        return self._subgroup_delivery_timeout
+
+    @subgroup_delivery_timeout.setter
+    def subgroup_delivery_timeout(self, value: int) -> None:
+        self._subgroup_delivery_timeout = value
+        for sub in getattr(self, "_subs", ()):
+            self._sync_deadline(sub)
+
+    def _sync_deadline(self, sub) -> None:
+        """Hand the peer's send lane its delivery timeout."""
+        lane = getattr(sub.delivery, "lane", None)
+        if lane is not None:
+            lane.deadline = self._delivery_deadline(sub)
+
+    def _take_timeouts(self, sub, params, prof) -> None:
+        sub.take_timeouts(params, prof)
+        self._sync_deadline(sub)
 
     def _delivery_deadline(self, sub) -> Optional[float]:
         """A peer's object delivery timeout in seconds, None for none:
@@ -745,22 +839,27 @@ class PublishedTrack(Track):
         return self._production
 
     async def _run_production(self) -> None:
-        """Run produce() once, flush every peer, then send each peer that
-        was served its PUBLISH_DONE. A datagram over the path limit ends
-        the track: PUBLISH_DONE INTERNAL_ERROR, the error kept in
-        `error`."""
+        """Run produce() once, flush every peer and mark the end of the
+        track, then send each peer that was served its PUBLISH_DONE. A
+        datagram over the path limit ends the track: PUBLISH_DONE
+        INTERNAL_ERROR, the error kept in `error`."""
         out = self._out
         status, reason = SubscribeDoneCode.TRACK_ENDED, None
         try:
             await self.produce(out)
         except asyncio.CancelledError:
-            out.abort()
-            raise
+            if not self._ending:
+                out.abort()
+                raise
+            asyncio.current_task().uncancel()
+            out.end_track(self._largest)
+            await out.close()
         except DatagramTooLarge as e:
             out.abort()
             self.error = e
             status, reason = SubscribeDoneCode.INTERNAL_ERROR, str(e)
         else:
+            out.end_track(self._largest)
             await out.close()
         finally:
             for sub in list(self._subs):
@@ -777,11 +876,11 @@ class PublishedTrack(Track):
         self._subs[0].track_alias = value
 
     @property
-    def request_id(self) -> int:
+    def request_id(self) -> Optional[int]:
         return self._subs[0].request_id
 
     @request_id.setter
-    def request_id(self, value: int) -> None:
+    def request_id(self, value: Optional[int]) -> None:
         self._subs[0].request_id = value
 
     @property
@@ -847,13 +946,12 @@ class PublishedTrack(Track):
         if self._largest is None or (group_id, object_id) > self._largest:
             self._largest = (group_id, object_id)
 
-    def _counted_pad(self) -> bytes:
-        """The default generator's byte pattern (0..255 repeating). With
-        the per-object f"{group}.{obj}|" prefix every byte of every object
-        is predictable — easy to spot duplicates, skips and corruption in
-        a decrypted pcap. The prefix says which object; the count, the
-        offset within it."""
-        return bytes(i & 0xFF for i in range(self.object_size))
+    def _payload_tail(self) -> bytes:
+        """What follows f"{group}.{obj}" in a generated object: ".{size}|"
+        then the counting pattern (aiomoqt.utils.payload). Every byte
+        follows from the object's location, so PayloadCheck, or a
+        decrypted pcap, shows swapped, shifted or truncated objects."""
+        return f".{self.object_size}|".encode() + counted(self.object_size)
 
     def prefill(self, groups: int) -> None:
         """Record `groups` groups of the default generator's objects as
@@ -862,13 +960,13 @@ class PublishedTrack(Track):
         next group."""
         if self._history is None:
             raise ValueError("prefill() needs a FETCH history")
-        pad = self._counted_pad()
+        pad = self._payload_tail()
         first = 0 if self._largest is None else self._largest[0] + 1
         datagram = self.forwarding == ForwardingPreference.DATAGRAM
         extensions = {LOC_TIMESTAMP: int(time.time() * 1_000_000)}
         for group_id in range(first, first + groups):
             for object_id in range(self.group_size):
-                payload = (f"{group_id}.{object_id}".encode() + b'|'
+                payload = (f"{group_id}.{object_id}".encode()
                            + pad)[:self.object_size]
                 self._remember(
                     group_id, object_id, payload,
@@ -877,25 +975,34 @@ class PublishedTrack(Track):
                     extensions=extensions)
 
     def _remember(self, group_id: int, object_id: int, payload: bytes,
-                  subgroup_id: Optional[int] = 0, extensions=None) -> None:
+                  subgroup_id: Optional[int] = 0, extensions=None,
+                  charge: Optional[int] = None) -> None:
         """One object published: Largest Location and the FETCH history.
-        `subgroup_id` None marks a datagram."""
+        `subgroup_id` None marks a datagram; `charge` is
+        properties_charge(extensions), when known."""
         self._note_largest(group_id, object_id)
         if self._history is not None:
             self._history.add(group_id, object_id, payload, subgroup_id,
-                              extensions, self.priority)
+                              extensions, self.priority, charge)
 
     def _on_produced(self, group_id: int, object_id: int, payload: bytes,
                      extensions) -> None:
         """FanoutDelivery.on_write: a produce() object, numbered once."""
-        if self.mapping is StreamMapping.DATAGRAM:
+        loc = (group_id, object_id)
+        largest = self._largest
+        if largest is None or loc > largest:
+            self._largest = loc
+        if self._history is None:
+            return
+        mapping = self.mapping
+        if mapping is StreamMapping.DATAGRAM:
             subgroup_id = None
-        elif self.mapping is StreamMapping.PER_OBJECT:
+        elif mapping is StreamMapping.PER_OBJECT:
             subgroup_id = object_id
         else:
             subgroup_id = 0
-        self._remember(group_id, object_id, payload,
-                       subgroup_id=subgroup_id, extensions=extensions)
+        self._history.add(group_id, object_id, payload, subgroup_id,
+                          extensions, self.priority)
 
     def _on_sent(self, group_id: int, object_id: int) -> None:
         """FanoutDelivery.on_sent: a produce() object reached one peer's
@@ -1016,6 +1123,13 @@ class PublishedTrack(Track):
                         f"peer, no PUBLISH")
             publish_track = False
 
+        if publish_track and sess._publishing(
+                sess._track_key(self.namespace, self.trackname)):
+            # One PUBLISH per track per session, here or from SUBSCRIBE_TRACKS.
+            logger.info(f"Track: {self.fqtn} already PUBLISHed on this "
+                        f"session")
+            publish_track = False
+
         if publish_track:
             pub_msg = sess.publish(
                 namespace=self.namespace,
@@ -1065,9 +1179,7 @@ class PublishedTrack(Track):
         if cap == 0:
             raise ValueError(
                 "datagram delivery unavailable on this session "
-                "(peer did not negotiate QUIC datagrams, or the "
-                "transport is WebTransport — WT datagram TX is not "
-                "wired yet)")
+                "(peer did not negotiate QUIC datagrams)")
         if self.object_size + _DGRAM_HEADER_MARGIN > cap:
             raise ValueError(
                 f"object_size={self.object_size} cannot fit one "
@@ -1122,6 +1234,19 @@ class PublishedTrack(Track):
         sub.forward = forward
         self._cut_streams(sub)
 
+    def _resume_lane(self, sub) -> None:
+        """Forward State back to 1: the peer's lane continues the open
+        group at its next object when the history holds the group's head,
+        for its joining FETCH or fill to serve; else it waits for the next
+        group."""
+        lane = getattr(sub.delivery, "lane", None)
+        if lane is None or self._largest is None:
+            return
+        group_id = self._largest[0]
+        history = self._history
+        lane.resume(group_id, rejoin=history is not None
+                    and history.first_held(group_id) == 0)
+
     def _cut_streams(self, sub) -> None:
         """Reset the streams whose next object the subscription no longer
         takes: a FIN would claim the rest of the group was delivered
@@ -1141,7 +1266,8 @@ class PublishedTrack(Track):
         logger.info(f"Track: PUBLISH_OK: forward={msg.forward}")
         if self._held_by_subscribe(sub, msg.request_id):
             return
-        sub.take_timeouts(getattr(msg, 'parameters', None), session._profile)
+        self._take_timeouts(sub, getattr(msg, 'parameters', None),
+                            session._profile)
         # An omitted FORWARD means 1 everywhere but REQUEST_UPDATE.
         self._set_forward(sub, 1 if msg.forward is None else msg.forward)
         if sub.forward:
@@ -1173,8 +1299,8 @@ class PublishedTrack(Track):
         if sub.updated_request == request_id:
             forward = None
         logger.info(f"Track: PUBLISH_OK (REQUEST_OK): forward={forward}")
-        sub.take_timeouts(getattr(reply, 'parameters', None),
-                          sub.session._profile)
+        self._take_timeouts(sub, getattr(reply, 'parameters', None),
+                            sub.session._profile)
         self._set_forward(sub, forward)
         if sub.forward:
             await self._start_generating(sub.session, "PUBLISH_OK")
@@ -1195,7 +1321,7 @@ class PublishedTrack(Track):
         """REQUEST_UPDATE — subscriber changes forward state."""
         sub = self._sub_for(session)
         logger.info(f"Track: REQUEST_UPDATE: {msg}")
-        sub.take_timeouts(msg.parameters, session._profile)
+        self._take_timeouts(sub, msg.parameters, session._profile)
         forward = (msg.parameters.get(ParamType.FORWARD)
                    if msg.parameters else None)
         raw_filter = (msg.parameters.get(ParamType.SUBSCRIPTION_FILTER)
@@ -1210,7 +1336,8 @@ class PublishedTrack(Track):
                 *MOQTMessage._decode_filter(raw_filter, prof=session._profile),
                 self._largest)
             self._cut_streams(sub)
-        if forward and not sub.forward:
+        resumed = bool(forward) and not sub.forward
+        if resumed:
             sub.joining[msg.existing_request_id] = self._largest
         if forward is not None:
             sub.updated_request = msg.existing_request_id
@@ -1226,14 +1353,19 @@ class PublishedTrack(Track):
         self._start_fill(session, sub, msg, largest)
         if forward:
             await self._start_generating(session, "REQUEST_UPDATE")
+            if resumed:
+                self._resume_lane(sub)
 
     async def _on_subscribe_update(self, session, msg):
         """SUBSCRIBE_UPDATE — subscriber changed forward state."""
         sub = self._sub_for(session)
         logger.info(f"Track: SUBSCRIBE_UPDATE: forward={msg.forward}")
+        resumed = bool(msg.forward) and not sub.forward
         self._set_forward(sub, msg.forward)
         if sub.forward:
             await self._start_generating(session, "SUBSCRIBE_UPDATE")
+            if resumed:
+                self._resume_lane(sub)
 
     async def _on_subscribe(self, session, msg):
         """Relay forwarded a subscriber's SUBSCRIBE."""
@@ -1278,7 +1410,8 @@ class PublishedTrack(Track):
         sub.window = window
         sub.location_filter = getattr(msg, 'location_filter', None)
         sub.group_order = getattr(msg, 'group_order', None)
-        sub.take_timeouts(getattr(msg, 'parameters', None), session._profile)
+        self._take_timeouts(sub, getattr(msg, 'parameters', None),
+                            session._profile)
         forward = getattr(msg, 'forward', None)
         self._set_forward(sub, 1 if forward is None else forward)
         self._start_fill(session, sub, msg, reported)
@@ -1303,19 +1436,22 @@ class PublishedTrack(Track):
     async def _serve_fill(self, session, sub, msg, largest) -> None:
         try:
             if self._history is None:
-                # d20 §5.1.3: a fill that fails opens its stream and resets it.
+                # d20 §5.1.3: a fill that fails opens its stream and resets
+                # it; the reset keeps the header so the subscriber sees it.
                 stream_id = await session.open_uni_stream()
-                session.stream_write(stream_id, FetchHeader(
-                    request_id=msg.request_id).serialize(
-                        prof=session._profile).data)
-                session.stream_reset(stream_id, StreamResetCode.INTERNAL_ERROR)
+                header = FetchHeader(request_id=msg.request_id).serialize(
+                    prof=session._profile).data
+                session.stream_write(stream_id, header)
+                session.stream_reset(stream_id, StreamResetCode.INTERNAL_ERROR,
+                                     reliable_size=len(header))
                 logger.info(f"Track: fill for request {msg.request_id} "
                             f"failed: no object history")
                 return
             await session.serve_fill(
                 msg, self._history, largest,
                 subscription_filter=sub.location_filter,
-                group_order=sub.group_order)
+                group_order=sub.group_order,
+                stream_priority=self._stream_band(session))
         except asyncio.CancelledError:
             pass  # serve_fetch reset the stream
         except Exception:
@@ -1450,7 +1586,9 @@ class PublishedTrack(Track):
         session.register_request_cancel_handler(rid, lambda _: task.cancel())
         session._bind_fetch(rid, self)
         try:
-            await session.serve_fetch(rid, objects, group_order=int(order))
+            await session.serve_fetch(rid, objects, group_order=int(order),
+                                      stream_priority=self._stream_band(
+                                          session))
         finally:
             session._request_cancel_handlers.pop(rid, None)
             session._unbind_request(rid)
@@ -1493,9 +1631,16 @@ class PublishedTrack(Track):
         self._finish_range(sub)
 
     def end(self) -> None:
-        """End the track: each peer's open streams close, then its
-        subscription gets PUBLISH_DONE TRACK_ENDED (§10.11), and nothing
-        restarts production."""
+        """End the track; nothing restarts production. A running
+        produce() stops at an object boundary: each peer gets its queued
+        objects and End of Track, then PUBLISH_DONE TRACK_ENDED.
+        Otherwise each peer's open streams close, then its subscription
+        gets PUBLISH_DONE TRACK_ENDED (§10.11)."""
+        prod = self._production
+        if prod is not None and not prod.done():
+            self._ending = True
+            prod.cancel()
+            return
         for sub in list(self._subs):
             self._end_subscription(sub, SubscribeDoneCode.TRACK_ENDED)
 
@@ -1550,8 +1695,7 @@ class PublishedTrack(Track):
         sub = self._sub_for(session)
         # d14 carries the relay's SUBSCRIBE request_id; d16's REQUEST_
         # UPDATE flow has none, so fall back to our own PUBLISH
-        # request_id. Sending request_id=0/None makes the relay reject
-        # it as "publishDone for invalid id=0".
+        # request_id. None means no request was assigned; 0 is valid.
         req_id = sub.subscribe_request_id
         if req_id is None:
             req_id = sub.request_id
@@ -1562,7 +1706,7 @@ class PublishedTrack(Track):
         for rid in (*sub.subscribers, sub.request_id,
                     sub.subscribe_request_id):
             session._unbind_request(rid)
-        if not req_id:
+        if req_id is None:
             return
         # Streams this peer was actually sent, which is the delivery's
         # count when one carried the track.
@@ -1619,7 +1763,7 @@ class PublishedTrack(Track):
             await asyncio.shield(self._ensure_production())
             return
 
-        pad = self._counted_pad()
+        pad = self._payload_tail()
 
         if self.forwarding == ForwardingPreference.DATAGRAM:
             self._check_datagram_fit()
@@ -1700,6 +1844,7 @@ class PublishedTrack(Track):
         report = not getattr(self, '_quiet', False)
         sub = self._sub_for(session)
         stamp = self._stamper(session)
+        ts_charge = _LOC_TS_CHARGE if stamp is None else None
 
         try:
             await self._await_schedule(first_group, 0)
@@ -1708,12 +1853,13 @@ class PublishedTrack(Track):
                 if cur_obj_id >= self.group_size:
                     group_id += 1
                     cur_obj_id = 0
+                    trace = data_log.isEnabledFor(TRACE)
                     if sub.past_end(group_id):
                         self._range_ended(sub)
                         raise asyncio.CancelledError
 
-                seq_info = f"{group_id}.{cur_obj_id}".encode()
-                payload = (seq_info + b'|' + pad)[:self.object_size]
+                payload = (f"{group_id}.{cur_obj_id}".encode()
+                           + pad)[:self.object_size]
                 obj = ObjectDatagram(
                     track_alias=track_alias,
                     group_id=group_id,
@@ -1728,7 +1874,8 @@ class PublishedTrack(Track):
                 buf = obj.serialize(prof=prof)
                 obj_bytes = buf.tell()
                 self._remember(group_id, cur_obj_id, payload,
-                               subgroup_id=None, extensions=obj.extensions)
+                               subgroup_id=None, extensions=obj.extensions,
+                               charge=ts_charge)
                 admitted = sub.passes(group_id, cur_obj_id)
                 cur_obj_id += 1
 
@@ -1736,6 +1883,11 @@ class PublishedTrack(Track):
                     raise asyncio.CancelledError
                 if admitted:
                     await session.dgram_write_drain(buf)
+                    if trace:
+                        data_log.log(TRACE, f"MOQT send: object {group_id}."
+                                            f"{cur_obj_id - 1} alias="
+                                            f"{track_alias} {obj_bytes} bytes"
+                                            f" (datagram)")
                     self._total_sent += 1
                     self._total_bytes += obj_bytes
                     self._iv_objects += 1
@@ -1812,6 +1964,7 @@ class PublishedTrack(Track):
         sender = _SubgroupSender(self, session, sub, track_alias,
                                  subgroup_id, priority)
         stamp = self._stamper(session)
+        ts_charge = _LOC_TS_CHARGE if stamp is None else None
 
         local_sent = 0
 
@@ -1831,18 +1984,19 @@ class PublishedTrack(Track):
                     if session._close_err:
                         raise asyncio.CancelledError
                     sender.new_group(group_id)
+                    trace = data_log.isEnabledFor(TRACE)
                     if sub.past_end(group_id):
                         self._range_ended(sub)
                         raise asyncio.CancelledError
 
-                seq_info = f"{group_id}.{cur_obj_id}".encode()
-                payload = (seq_info + b'|' + pad)[:self.object_size]
+                payload = (f"{group_id}.{cur_obj_id}".encode()
+                           + pad)[:self.object_size]
 
                 extensions = (
                     {LOC_TIMESTAMP: int(time.time() * 1_000_000)}
                     if stamp is None else stamp(group_id, cur_obj_id))
                 self._remember(group_id, cur_obj_id, payload, subgroup_id,
-                               extensions)
+                               extensions, ts_charge)
                 data = sender.encode_open(cur_obj_id, payload, extensions)
                 if data is None:
                     obj_bytes = await sender.send(cur_obj_id, payload,
@@ -1857,6 +2011,10 @@ class PublishedTrack(Track):
                     except MOQTStreamStopped:
                         sender.stop()
                         obj_bytes = 0
+                if trace and obj_bytes:
+                    data_log.log(TRACE, f"MOQT send: object {group_id}."
+                                        f"{cur_obj_id} alias={track_alias} "
+                                        f"{obj_bytes} bytes")
                 cur_obj_id += self.num_subgroups
                 if obj_bytes:
                     local_sent += 1
@@ -1988,6 +2146,7 @@ class SubscribedTrack(Track):
         self.auth_token = auth_token
         self.publish_done: Optional[object] = None  # received PUBLISH_DONE
         self.completed = False  # True if track ended cleanly
+        self.cancelled = False  # True once unsubscribe() ended it
         # Largest Location the publisher reported in SUBSCRIBE_OK or
         # PUBLISH, as (group, object); None when it reported none.
         self.largest: Optional[tuple] = None
@@ -2092,7 +2251,9 @@ class SubscribedTrack(Track):
                         end_group: int = 0,
                         priority: Optional[int] = None,
                         group_order: Optional[GroupOrder] = None,
-                        location_filter: Optional[LocationFilter] = None):
+                        location_filter: Optional[LocationFilter] = None,
+                        expected_trackname: Optional[str] = None,
+                        parameters: Optional[Dict[int, Any]] = None):
         """Subscribe to the track.
 
         Auto-routed on trackname presence:
@@ -2115,9 +2276,12 @@ class SubscribedTrack(Track):
             group_order: delivery order across groups. None omits it.
             location_filter: d20+ Location Filter, sent in place of the
                 filter_type form on a direct SUBSCRIBE.
+            expected_trackname: discovery only: wait for this track's
+                PUBLISH and drop the namespace's other tracks.
+            parameters: extra parameters for a direct SUBSCRIBE.
         """
         if self.trackname is not None:
-            params = {}
+            params = dict(parameters or {})
             if self.auth_token is not None:
                 params[ParamType.AUTH_TOKEN] = self.auth_token
             ok = await self.session.subscribe(
@@ -2135,7 +2299,12 @@ class SubscribedTrack(Track):
                 on_object=self.on_object,
                 location_filter=location_filter,
                 on_reply=self.take_track_properties,
+                # Registered before SUBSCRIBE goes out: a PUBLISH_DONE
+                # can be parsed before this await resumes.
+                on_done=self._publish_done_handler(),
             )
+            if getattr(ok, 'request_id', None) is not None:
+                self.request_id = ok.request_id
             self.largest = _reported_largest(ok)
             # Publisher's SUBSCRIBE_OK alias is authoritative (the
             # discovery path gets it from PUBLISH instead).
@@ -2144,7 +2313,6 @@ class SubscribedTrack(Track):
                 if self.on_object:
                     self.session.register_object_handler(
                         self.track_alias, self._handler())
-            self._watch_done(getattr(ok, 'request_id', None))
             self.state = TrackState.SUBSCRIBED
             self._check_track_timing()
             logger.info(f"Track: subscribed (direct) to {self.fqtn}")
@@ -2173,6 +2341,7 @@ class SubscribedTrack(Track):
         ns_params = {}
         if self.auth_token is not None:
             ns_params[ParamType.AUTH_TOKEN] = self.auth_token
+        tracks_reply = None
         await self.session.subscribe_namespace(
             namespace_prefix=self.namespace,
             parameters=ns_params,
@@ -2194,8 +2363,10 @@ class SubscribedTrack(Track):
                 part for part in (self.namespace, *suffix) if part)
             logger.info(f"Track: d18 namespace discovered: {full_ns}")
             self.namespace = full_ns
-            await self.session.subscribe_tracks(
-                namespace=full_ns, parameters=ns_params)
+            # The reply races the PUBLISH that answers it; a refusal ends
+            # discovery at once.
+            tracks_reply = asyncio.ensure_future(self.session.subscribe_tracks(
+                namespace=full_ns, parameters=ns_params, wait_response=True))
 
         if not getattr(self, '_quiet', False):
             if self.trackname is None:
@@ -2203,8 +2374,8 @@ class SubscribedTrack(Track):
                       f"'{self.namespace}'...")
             else:
                 print(f"  Waiting for track '{self.fqtn}'...")
-        pub_msg = await self.session.await_publish(
-            timeout=timeout, trackname=self.trackname)
+        pub_msg = await self._await_discovery(
+            timeout, expected_trackname, tracks_reply)
 
         # Extract namespace/trackname from PUBLISH (namespace may have
         # grown past the prefix we subscribed to).
@@ -2240,6 +2411,59 @@ class SubscribedTrack(Track):
         self._check_track_timing()
         logger.info(f"Track: subscribed to {self.fqtn}")
 
+    async def _await_discovery(self, timeout: float,
+                               trackname: Optional[str],
+                               tracks_reply: Optional[asyncio.Future]):
+        """The discovered PUBLISH, or the peer's refusal of SUBSCRIBE_TRACKS.
+        A reply that times out leaves the PUBLISH wait running; a PUBLISH
+        wait that times out names the tracks offered instead."""
+        from .protocol import _MOQTSessionMixin
+        offered = []
+        prefix = _MOQTSessionMixin._make_namespace_tuple(self.namespace)
+
+        async def _matching():
+            try:
+                async with asyncio.timeout(timeout):
+                    while True:
+                        msg = await self.session.await_publish(timeout=timeout)
+                        name = (msg.track_name.decode()
+                                if isinstance(msg.track_name, bytes)
+                                else msg.track_name)
+                        ns = tuple(p.encode() if isinstance(p, str) else p
+                                   for p in msg.track_namespace)
+                        if ns[:len(prefix)] != prefix:
+                            # Outside the requested namespace.
+                            offered.append('/'.join(
+                                [p.decode(errors='replace') for p in ns]
+                                + [name]))
+                            continue
+                        if trackname is None or name == trackname:
+                            return msg
+                        offered.append(name)
+            except TimeoutError:
+                if offered:
+                    raise TimeoutError(
+                        f"no PUBLISH for '{trackname}'; offered: "
+                        f"{', '.join(offered)}") from None
+                raise
+
+        publish = asyncio.ensure_future(_matching())
+        if tracks_reply is None:
+            return await publish
+        tracks_reply.add_done_callback(
+            lambda f: f.cancelled() or f.exception())
+        try:
+            done, _ = await asyncio.wait(
+                {publish, tracks_reply}, return_when=asyncio.FIRST_COMPLETED)
+            if publish not in done and not tracks_reply.cancelled():
+                err = tracks_reply.exception()
+                if (isinstance(err, MOQTRequestError)
+                        and err.response is not None):
+                    raise err
+            return await publish
+        finally:
+            publish.cancel()
+
     def _check_track_timing(self) -> None:
         if self.timing_error is None:
             return
@@ -2248,25 +2472,38 @@ class SubscribedTrack(Track):
         if self.timestamp_errors == 'cancel':
             self._cancel_malformed(self.timing_error)
 
-    def _watch_done(self, request_id) -> None:
-        """Record this subscription's PUBLISH_DONE (§10.11) and release
-        wait_closed(); the session stays up for other work."""
-        if request_id is None:
-            return
-        self.request_id = request_id
-
+    def _publish_done_handler(self) -> Callable:
+        """Handler that records this subscription's PUBLISH_DONE (§10.11)
+        and releases wait_closed(); the session stays up for other work."""
         def _done(msg):
             self.session._timing_watch.pop(self.track_alias, None)
             self.publish_done = msg
             self._done_event.set()
             if self.on_done is not None:
                 self.on_done(msg)
+        return _done
 
-        self.session.register_publish_done_handler(request_id, _done)
+    def _watch_done(self, request_id) -> None:
+        if request_id is None:
+            return
+        self.request_id = request_id
+        self.session.register_publish_done_handler(
+            request_id, self._publish_done_handler())
+
+    def unsubscribe(self) -> None:
+        """Cancel the subscription and end the track: wait_closed()
+        returns, with `cancelled` set and `completed` False."""
+        if self.cancelled:
+            return
+        self.cancelled = True
+        if self.request_id is not None and self.publish_done is None:
+            self.session._timing_watch.pop(self.track_alias, None)
+            self.session.unsubscribe(self.request_id)
+        self._done_event.set()
 
     async def wait_closed(self) -> None:
-        """Wait for this track to end: its PUBLISH_DONE, or the session
-        closing under it.
+        """Wait for this track to end: its PUBLISH_DONE, unsubscribe(),
+        or the session closing under it.
 
         Sets self.completed if the track ended cleanly (no StreamReset).
         """
@@ -2280,7 +2517,7 @@ class SubscribedTrack(Track):
                 if not fut.done():
                     fut.cancel()
         self.state = TrackState.CLOSED
-        if self.malformed is not None:
+        if self.malformed is not None or self.cancelled:
             self.completed = False
             return
         if self.publish_done is not None:
@@ -2328,10 +2565,10 @@ class VideoTrack(PublishedTrack):
                  resolution: str = "1080p", fps: float = 30,
                  gop_pattern: str = "ibp", gop_seconds: float = 1.0,
                  i_frame_size: int = None, p_frame_size: int = None,
-                 b_frame_size: int = None,
+                 b_frame_size: int = None, gop_size: int = None,
                  **kwargs):
-        # GOP = 1 second of frames by default
-        gop_size = int(fps * gop_seconds)
+        # GOP = 1 second of frames by default; gop_size overrides.
+        gop_size = gop_size or int(fps * gop_seconds)
 
         profile = self.PROFILES.get(resolution, self.PROFILES["1080p"])
         self.i_frame_size = i_frame_size or profile["i_frame"]
@@ -2355,6 +2592,15 @@ class VideoTrack(PublishedTrack):
             rate=fps,
             **kwargs,
         )
+
+    @classmethod
+    def mean_object_size(cls, resolution: str, gop_size: int,
+                         gop_pattern: str = "ibp") -> int:
+        """Mean frame bytes over one GOP of the profile."""
+        p = cls.PROFILES[resolution]
+        sizes = {'I': p["i_frame"], 'P': p["p_frame"]}
+        gop = cls._build_gop(gop_pattern, gop_size)
+        return sum(sizes.get(ft, p["b_frame"]) for ft in gop) // len(gop)
 
     @staticmethod
     def _build_gop(pattern: str, length: int) -> str:
@@ -2420,11 +2666,13 @@ class VideoTrack(PublishedTrack):
                                  subgroup_id, priority)
         local_sent = 0
 
-        # Pre-generate padding per frame type
-        i_pad = b'\x49' * self.i_frame_size  # 'I'
-        p_pad = b'\x50' * self.p_frame_size  # 'P'
-        b_pad = b'\x42' * self.b_frame_size  # 'B'
+        # Per frame type, what follows f"{group}.{obj}": ".{size}.{type}|"
+        # then the counting pattern.
+        i_pad = f".{self.i_frame_size}.I|".encode() + counted(self.i_frame_size)
+        p_pad = f".{self.p_frame_size}.P|".encode() + counted(self.p_frame_size)
+        b_pad = f".{self.b_frame_size}.B|".encode() + counted(self.b_frame_size)
         stamp = self._stamper(session)
+        ts_charge = _LOC_TS_CHARGE if stamp is None else None
 
         try:
             await self._await_schedule(first_group, subgroup_id)
@@ -2440,6 +2688,7 @@ class VideoTrack(PublishedTrack):
                     if session._close_err:
                         raise asyncio.CancelledError
                     sender.new_group(group_id)
+                    trace = data_log.isEnabledFor(TRACE)
                     if sub.past_end(group_id):
                         self._range_ended(sub)
                         raise asyncio.CancelledError
@@ -2454,15 +2703,14 @@ class VideoTrack(PublishedTrack):
                 else:
                     frame_pad = b_pad
 
-                seq_info = f"{group_id}.{cur_obj_id}.{ft}".encode()
-                payload = (seq_info + b'|'
+                payload = (f"{group_id}.{cur_obj_id}".encode()
                            + frame_pad)[:frame_size]
 
                 extensions = (
                     {LOC_TIMESTAMP: int(time.time() * 1_000_000)}
                     if stamp is None else stamp(group_id, cur_obj_id))
                 self._remember(group_id, cur_obj_id, payload, subgroup_id,
-                               extensions)
+                               extensions, ts_charge)
                 data = sender.encode_open(cur_obj_id, payload, extensions)
                 if data is None:
                     obj_bytes = await sender.send(cur_obj_id, payload,
@@ -2477,6 +2725,10 @@ class VideoTrack(PublishedTrack):
                     except MOQTStreamStopped:
                         sender.stop()
                         obj_bytes = 0
+                if trace and obj_bytes:
+                    data_log.log(TRACE, f"MOQT send: object {group_id}."
+                                        f"{cur_obj_id} alias={track_alias} "
+                                        f"{obj_bytes} bytes")
                 cur_obj_id += self.num_subgroups
                 if obj_bytes:
                     local_sent += 1

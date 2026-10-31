@@ -47,7 +47,7 @@ async def _loopback(port, draft, use_quic, publishes):
 
     async def on_publish_namespace(session, msg):
         await publishes.put((session, msg))
-        session.publish_namepace_ok(msg)
+        session.publish_namespace_ok(msg)
 
     server = MOQTServer(host="localhost", port=port, certificate=CERT,
                         private_key=KEY, path="/", use_quic=use_quic,

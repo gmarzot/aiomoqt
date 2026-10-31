@@ -1,5 +1,6 @@
 """pub_server and sub_bench as processes: each listener mode, both
 transports, d18 and d22."""
+import re
 import time
 
 import pytest
@@ -44,6 +45,79 @@ def test_sub_bench_receives_from_pub_server(pub_server, listen, dial, draft):
                   "--draft", draft)
     assert objects_received(out) > 0, out
     assert rc == 0, out
+    rows = re.findall(r"^\s+\d+-(\d+)s\s", out, re.MULTILINE)
+    assert rows and rows[-1] == "2", out
+
+
+@requires_certs
+@pytest.mark.parametrize("listen,dial", [("-Q", "quic"), ("-W", "wt")],
+                         ids=["quic", "wt"])
+def test_sub_bench_receives_a_video_profile_from_pub_server(tmp_path, listen,
+                                                            dial):
+    port = free_udp_port()
+    log = tmp_path / "pub_server.log"
+    proc = spawn("pub_server", "-p", port, "--video", "240p", "-r", 60,
+                 listen, log=log)
+    try:
+        wait_for(log, "publisher server ready", proc)
+        assert "video 240p" in log.read_text()
+        rc, out = run("sub_bench", _url(dial, port), "-k", "-t", 2, "-i", 1,
+                      "--verify-payload")
+    finally:
+        stop(proc)
+    assert objects_received(out) > 0, out
+    assert _payload_bad(out) == 0, out
+    assert rc == 0, out
+
+
+def _payload_bad(out):
+    """The summary's bad-payload count; fails if the line is missing."""
+    m = re.search(r"^\s*Payload:\s+[\d,]+ checked.*?, (\d+) bad$", out,
+                  re.MULTILINE)
+    assert m, out
+    return int(m.group(1))
+
+
+@requires_certs
+@pytest.mark.parametrize("transport", ["-Q", "-W"])
+def test_loopback_bench_payloads_check_clean(transport):
+    rc, out = run("loopback_bench", transport, "-p", free_udp_port(),
+                  "--draft", 18, "-t", 2, "-s", 1200, "-P", 2, "-k",
+                  "--verify-payload")
+    assert objects_received(out) > 0, out
+    assert _payload_bad(out) == 0, out
+    assert rc == 0, out
+
+
+@requires_certs
+@pytest.mark.parametrize("scheme", ["moqt", "https"])
+def test_payloads_check_clean_through_the_relay(tmp_path, scheme):
+    port = free_udp_port()
+    url = (f"moqt://127.0.0.1:{port}" if scheme == "moqt"
+           else f"https://127.0.0.1:{port}/")
+    log = tmp_path / "relay.log"
+    relay = spawn("moq_interop_relay", "--bind", "127.0.0.1", "--port", port,
+                  "--dual", "--cert", CERT, "--key", KEY, log=log)
+    pubs = []
+    try:
+        wait_for(log, "Listening on", relay)
+        for name, shape in (("plain", ("-s", 900, "-r", 200, "-P", 2)),
+                            ("video", ("--video", "240p", "-r", 60))):
+            plog = tmp_path / f"pub-{name}.log"
+            pubs.append(spawn("pub_bench", url, "-k", "-T", name, "-t", 30,
+                              *shape, log=plog))
+            wait_for(plog, "Published", pubs[-1])
+        results = [run("sub_bench", url, "-k", "-T", name, "-t", 2,
+                       "--verify-payload", timeout=30)
+                   for name in ("plain", "video")]
+    finally:
+        for p in pubs:
+            stop(p)
+        stop(relay)
+    for rc, out in results:
+        assert objects_received(out) > 0, out
+        assert _payload_bad(out) == 0, out
+        assert rc == 0, out
 
 
 @requires_certs
@@ -94,6 +168,40 @@ def test_loopback_bench_verifies_its_own_cert(transport):
     assert objects_received(out) > 0
 
 
+@requires_certs
+@pytest.mark.parametrize("props", [(), ("--per-peer-props",)],
+                         ids=["generator", "per-peer"])
+@pytest.mark.parametrize("transport", ["-Q", "-W"])
+def test_loopback_bench_fanout_delivers_through_the_lane(transport, props):
+    rc, out = run("loopback_bench", transport, "--fanout", *props, "-p",
+                  free_udp_port(), "--draft", 18, "-t", 2, "-s", 1200, "-k",
+                  "--verify-payload")
+    assert rc == 0, out
+    assert "fanout lane" in out, out
+    assert objects_received(out) > 0, out
+    assert re.search(r"^\s*Lost:\s+0 ", out, re.MULTILINE), out
+    assert _payload_bad(out) == 0, out
+
+
+def test_loopback_bench_fanout_refuses_parallel_subgroups(monkeypatch):
+    import sys
+    from aiomoqt.tools import loopback_bench
+    monkeypatch.setattr(sys, "argv", ["loopback_bench", "--fanout", "-P", "2"])
+    with pytest.raises(SystemExit):
+        loopback_bench.parse_args()
+
+
+@requires_certs
+def test_loopback_bench_reports_through_its_last_second():
+    # 2 s intervals: a row printed late still leaves the closing row
+    # its half-interval (1 s) on a loaded CPU.
+    rc, out = run("loopback_bench", "-Q", "-p", free_udp_port(), "--draft", 18,
+                  "-t", 4, "-i", 2, "-s", 1200, "-k")
+    assert rc == 0, out
+    rows = re.findall(r"^\s+(\d+)-(\d+)s\s", out, re.MULTILINE)
+    assert len(rows) == 2 and rows[-1][1] == "4", out
+
+
 def test_loopback_bench_without_objects_exits_1(monkeypatch):
     import asyncio
     import sys
@@ -112,3 +220,85 @@ def test_loopback_bench_without_objects_exits_1(monkeypatch):
     monkeypatch.setattr(loopback_bench, "run_subscriber", _nothing)
     monkeypatch.setattr(sys, "argv", ["loopback_bench", "-t", "1"])
     assert asyncio.run(loopback_bench.main()) == 1
+
+
+def _netns_route():
+    import subprocess
+    try:
+        return subprocess.run(
+            ["unshare", "-rn", "sh", "-c",
+             "ip link set lo up && tc qdisc add dev lo root netem delay 1ms"],
+            stdin=subprocess.DEVNULL, capture_output=True).returncode == 0
+    except OSError:
+        return False
+
+
+def test_loopback_bench_rtt_ms_without_netns_exits_2(monkeypatch, capsys):
+    import sys
+    from aiomoqt.tools import loopback_bench
+    monkeypatch.setattr(loopback_bench, "_succeeds", lambda argv: False)
+    monkeypatch.setattr(loopback_bench.shutil, "which", lambda t: "/bin/" + t)
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sys, "argv", ["loopback_bench", "--rtt-ms", "50"])
+    args = loopback_bench.parse_args()
+    assert loopback_bench._reexec_in_netns(args) == 2
+    assert "need privileges to create a network namespace" in capsys.readouterr().err
+
+
+def test_loopback_bench_rtt_ms_child_takes_ctrl_c(monkeypatch):
+    import signal
+    import subprocess
+    import sys
+    from aiomoqt.tools import loopback_bench
+    real_run = subprocess.run
+    probe = ("import signal, sys; sys.exit(0 if signal.getsignal("
+             "signal.SIGINT) is signal.default_int_handler else 3)")
+    monkeypatch.setattr(loopback_bench, "_succeeds", lambda argv: True)
+    monkeypatch.setattr(loopback_bench.shutil, "which", lambda t: "/bin/" + t)
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(loopback_bench.subprocess, "run",
+                        lambda argv: real_run([sys.executable, "-c", probe]))
+    monkeypatch.setattr(sys, "argv", ["loopback_bench", "--rtt-ms", "50"])
+    before = signal.getsignal(signal.SIGINT)
+    assert loopback_bench._reexec_in_netns(loopback_bench.parse_args()) == 0
+    assert signal.getsignal(signal.SIGINT) is before
+
+
+@requires_certs
+def test_loopback_bench_rtt_ms_stops_on_ctrl_c(tmp_path):
+    import os
+    import signal
+    import subprocess
+    from aiomoqt.tests._procs import ENV, REPO, tool_cmd
+    if not _netns_route():
+        pytest.skip("no private netns with netem: unshare -rn refused")
+    log = tmp_path / "loopback.log"
+    with open(log, "w") as f:
+        proc = subprocess.Popen(
+            tool_cmd("loopback_bench", "-Q", "-p", free_udp_port(), "-t", 60,
+                     "-r", 200, "-k", "--rtt-ms", 20),
+            stdout=f, stderr=subprocess.STDOUT, cwd=REPO, env=ENV,
+            start_new_session=True)
+    try:
+        wait_for(log, "rtt 20 ms", proc)
+        time.sleep(1)
+        os.killpg(proc.pid, signal.SIGINT)  # as a terminal's Ctrl-C does
+        assert proc.wait(timeout=10) == 130, log.read_text()
+    finally:
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+
+
+@requires_certs
+def test_loopback_bench_rtt_ms_emulates_the_link():
+    if not _netns_route():
+        pytest.skip("no private netns with netem: unshare -rn refused")
+    rc, out = run("loopback_bench", "-Q", "-p", free_udp_port(), "--draft", 18,
+                  "-t", 3, "-r", 200, "-s", 1200, "-k", "--rtt-ms", 40)
+    assert rc == 0, out
+    assert "rtt 40 ms" in out, out
+    assert objects_received(out) > 0, out
+    m = re.search(r"^\s+p50=([\d.]+)\s", out, re.MULTILINE)
+    assert m, out
+    assert float(m.group(1)) >= 20, out

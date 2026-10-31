@@ -1,0 +1,11 @@
+# aiomoqt-relay settings, read with --config. Keys are the relay's long flag
+# names (moq-interop-relay -h); flags on the command line override them.
+# Port, certificate and transports come from MOQT_* in compose.yml.
+draft = "22,20,18,16,14"
+watchdog = 30
+status-dir = "/status"
+log-dir = "/logs"
+control = "/status/control.sock"
+catalog-probe = true
+cache-bytes = 268435456
+cc-algo = "bbr"

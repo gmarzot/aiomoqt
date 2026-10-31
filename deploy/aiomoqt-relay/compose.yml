@@ -1,4 +1,4 @@
-# MoQ Ersatz Relay: the aiomoqt ersatz relay, nginx for the pages and the relay's
+# aiomoqt-relay: the relay, nginx for the pages and the relay's
 # status and logs, and GoAccess for the password-protected visitor report.
 # Run from this directory; see README.md.
 name: aiomoqt-relay
@@ -7,9 +7,12 @@ services:
   relay:
     image: aiomoqt:dev
     # The certbot renewal hook restarts it by this name.
-    container_name: ersatz-relay
+    container_name: aiomoqt-relay
     network_mode: host
     restart: unless-stopped
+    # Past the relay's --drain-timeout (2 s, 5 s with --goaway-uri): SIGTERM
+    # drains with GOAWAY.
+    stop_grace_period: 15s
     mem_limit: 2g
     # Off CPU 0, which takes the NIC interrupts (host/relay-irq-affinity.service).
     cpuset: "1,2"
@@ -32,9 +35,10 @@ services:
       MOQT_PORT: "4443"
       MOQT_CERT: /etc/letsencrypt/live/aiomoqt-relay.marzresearch.net/fullchain.pem
       MOQT_KEY: /etc/letsencrypt/live/aiomoqt-relay.marzresearch.net/privkey.pem
-    command: ["--draft", "22,20,18,16,14", "--watchdog", "30", "--status-dir", "/status",
-              "--log-dir", "/logs", "--control", "/status/control.sock"]
+    # Relay flags live in relay.toml; flags added here override it.
+    command: ["--config", "/etc/aiomoqt-relay/relay.toml"]
     volumes:
+      - ./relay.toml:/etc/aiomoqt-relay/relay.toml:ro
       # This certificate only; live/ links into archive/.
       - /etc/letsencrypt/live/aiomoqt-relay.marzresearch.net:/etc/letsencrypt/live/aiomoqt-relay.marzresearch.net:ro
       - /etc/letsencrypt/archive/aiomoqt-relay.marzresearch.net:/etc/letsencrypt/archive/aiomoqt-relay.marzresearch.net:ro
@@ -90,11 +94,11 @@ services:
         while :; do
           logs | goaccess - --log-format=COMBINED \
             --no-global-config --ignore-crawlers \
-            --html-report-title="MoQ Ersatz Relay visitors" -o /report/new.html \
+            --html-report-title="aiomoqt-relay visitors" -o /report/new.html \
             && mv /report/new.html /report/index.html
           logs | goaccess - --log-format=COMBINED \
             --no-global-config --crawlers-only \
-            --html-report-title="MoQ Ersatz Relay crawlers" -o /report/new-crawlers.html \
+            --html-report-title="aiomoqt-relay crawlers" -o /report/new-crawlers.html \
             && mv /report/new-crawlers.html /report/crawlers.html
           sleep 300
         done

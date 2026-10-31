@@ -88,7 +88,7 @@ async def test_abort_mid_group_resets_and_complete_group_fins(draft, use_quic):
 
     async def _on_ns(session, msg):
         rx['session'] = session
-        session.publish_namepace_ok(msg)
+        session.publish_namespace_ok(msg)
 
     server = MOQTServer(host="localhost", port=port, certificate=CERT,
                         private_key=KEY, path="/", use_quic=use_quic,

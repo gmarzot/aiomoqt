@@ -1,11 +1,11 @@
-// MoQ Ersatz Relay dashboard: relay status, namespaces and tracks, scoped to a
+// aiomoqt-relay dashboard: relay status, namespaces and tracks, scoped to a
 // namespace, from /status/status.json. Uses Dash from common.js.
 'use strict';
 
 const {OTHER, $, el, svgEl, none, fmt} = Dash;
 const PLAYER = '/g5-player/';
 const PLAYER_DRAFT = '18';
-const STATES = new Set(['live', 'idle', 'held', 'parked', 'ended']);
+const STATES = new Set(['live', 'idle', 'held', 'paused', 'ended']);
 const TRACK_COLS = 8;
 // Media track colors by name; other tracks take the remaining palette hues in order.
 const NAMED = [[/^catalog$/i, '#d9532b'], [/audio/i, '#6fbff5'], [/video/i, '#a57be6']];
@@ -49,7 +49,7 @@ function renderRelay(s, urls) {
   $('url-quic').textContent = urls.quic;
   $('drafts').textContent = (r.drafts || []).join(', ');
   const badge = $('badge-version');
-  badge.textContent = v.aiomoqt ? `aiomoqt ${v.aiomoqt}` : 'aiomoqt ersatz relay';
+  badge.textContent = v.aiomoqt ? `aiomoqt ${v.aiomoqt}` : 'aiomoqt-relay';
   badge.title = [['aiopquic', v.aiopquic], ['picoquic', v.picoquic], ['Python', v.python]]
     .filter(([, x]) => x).map(([k, x]) => `${k} ${x}`).join(' · ');
   $('uptime').textContent = fmt.uptime(r.uptime_s)
@@ -105,11 +105,32 @@ function renderGauges(h) {
 
 // -- tiles ----------------------------------------------------------------------
 
+// `value`, `sub`: text, or an array of text and nodes.
 function setTile(key, value, sub, title) {
   const t = document.querySelector(`.tile[data-key="${key}"]`);
-  t.querySelector('.value').textContent = value;
-  t.querySelector('.sub').textContent = sub || '';
+  t.querySelector('.value').replaceChildren(...[].concat(value));
+  t.querySelector('.sub').replaceChildren(...[].concat(sub || ''));
   if (title) t.title = title;
+}
+
+// In and out side by side, each above its sparkline key.
+function setPair(key, rateIn, rateOut, title) {
+  setTile(key, [el('span', {}, fmt.rate(rateIn)), el('span', {}, fmt.rate(rateOut))],
+          [el('span', {}, el('i', {class: 'key-area s1'}), 'in'),
+           el('span', {}, el('i', {class: 'key-area s0'}), 'out')], title);
+}
+
+// New drops per minute over the 10-minute history, oldest first; null without drops history.
+function dropsPerMinute(h) {
+  const t = h.t || [], d = h.drops;
+  if (!d || !t.length) return null;
+  const buckets = new Array(10).fill(0);
+  for (let i = 1; i < t.length; i++) {
+    if (none(d[i]) || none(d[i - 1])) continue;
+    const k = 9 - Math.floor((t[t.length - 1] - t[i]) / 60);
+    if (k >= 0) buckets[k] += Math.max(d[i] - d[i - 1], 0);
+  }
+  return buckets;
 }
 
 // Transport and draft counts of `list`: "2 wt · 1 quic", "d18: 2, d22: 1".
@@ -131,13 +152,14 @@ function renderTiles(s) {
   const pubList = sessions.filter((x) => (x.role || '').includes('pub'));
   const subList = sessions.filter((x) => (x.role || '').includes('sub'));
   const pubs = sessionMix(pubList), subs = sessionMix(subList);
+  const drops = dropsPerMinute(s.history);
   const playable = s.namespaces.filter((r) => r.format).length;
   const live = s.tracks.filter((r) => r.state === 'live').length;
   const groups = s.tracks.reduce((n, r) => n + (r.groups_per_s || 0), 0);
   // Delivered rates: each track's input rate times its subscribers.
   const fanout = (k) => s.tracks.reduce((n, r) => n + (r[k] || 0) * (r.subscribers || 0), 0);
-  setTile('publishers', fmt.num(T.publishers), pubs.transports || 'publishing sessions',
-          pubList.length ? `By draft: ${pubs.drafts}` : 'No publishing sessions');
+  setTile('publishers', fmt.num(T.publishers), 'publishing sessions',
+          pubList.length ? `${pubs.transports}; by draft: ${pubs.drafts}` : 'No publishing sessions');
   // A viewer counts once; without totals.subscriptions, count sub-role sessions.
   const subscriptions = T.subscriptions ?? T.subscribers;
   const viewers = none(T.subscriptions) ? subList.length : T.subscribers;
@@ -150,17 +172,20 @@ function renderTiles(s) {
   const lag = T.loop_lag_ms || {};
   setTile('lag', fmt.ms(lag.p99), `p50 ${fmt.ms(lag.p50)}`);
   setTile('loss', fmt.pct(T.loss_pct, 2), 'delivery sessions');
-  setTile('drops', fmt.num(T.drops), 'subscribers dropped');
+  setTile('drops', drops ? fmt.num(drops.reduce((a, b) => a + b, 0)) : '—',
+          `${fmt.num(T.drops)} since start`, 'Subscribers dropped; bars per minute');
   const groupsIn = none(T.groups_per_s) ? groups : T.groups_per_s;
-  setTile('groups', fmt.rate(fanout('groups_per_s')), `out · ${fmt.rate(groupsIn)} in`,
-          'Delivered to subscribers: each track\'s group rate times its subscribers; in = received from publishers');
-  setTile('objects', fmt.rate(fanout('objects_per_s')), `out · ${fmt.rate(T.objects_in_per_s)} in`,
-          'Delivered to subscribers: each track\'s object rate times its subscribers; in = received from publishers');
+  const out = (k, rate) => (none(T[k]) ? fanout(rate) : T[k]);
+  setPair('groups', groupsIn, out('groups_out_per_s', 'groups_per_s'),
+          'In = received from publishers; out = delivered to subscribers: each track\'s group rate times its subscribers');
+  setPair('objects', T.objects_in_per_s, out('objects_out_per_s', 'objects_per_s'),
+          'In = received from publishers; out = delivered to subscribers: each track\'s object rate times its subscribers');
   setTile('ingress', fmt.bps(T.ingress_bps), `media ${fmt.bps(T.media_in_bps)}`);
   setTile('egress', fmt.bps(T.egress_bps), `media ${fmt.bps(T.media_out_bps)}`);
   for (const tile of document.querySelectorAll('.tile[data-spark]')) {
-    Dash.spark(tile, s.history[tile.dataset.spark] || []);
+    Dash.spark(tile, ...tile.dataset.spark.split(' ').map((k) => s.history[k] || []));
   }
+  Dash.bars(document.querySelector('.tile[data-key="drops"]'), drops || []);
 }
 
 // -- namespaces and scope -------------------------------------------------------
@@ -201,11 +226,18 @@ function originCell(r) {
   return td;
 }
 
+// The namespace, breakable after each "/" when the cell wraps.
+function nsCode(ns) {
+  const parts = ns.split('/');
+  return el('code', {}, ...parts.flatMap((p, i) =>
+    i < parts.length - 1 ? [`${p}/`, el('wbr', {})] : [p]));
+}
+
 function renderNamespaces(rows, wtUrl) {
   fill($('t-namespaces'), rows.map((r) => {
     const tr = el('tr', {class: `pick${r.namespace === scope ? ' selected' : ''}`, tabindex: '0',
                          title: `${fmt.bytes(r.bytes_out)} delivered`},
-      el('td', {}, el('code', {}, r.namespace)),
+      el('td', {class: 'ns'}, nsCode(r.namespace)),
       originCell(r),
       num(fmt.num(r.tracks)), num(fmt.num(r.subscribers)), num(fmt.num(r.peak)),
       inOut(r.in_bps, r.out_bps),
@@ -257,12 +289,16 @@ const inOut = (i, o) => el('td', {class: 'n', title: `in ${fmt.bps(i)} · out ${
 // Everything the row leaves out, for its hover text.
 function trackDetail(r) {
   const now = Date.now() / 1000;
+  const T = (latest && latest.totals) || {};
   const lines = [
     `${r.namespace} / ${r.name}`,
     `peak ${fmt.num(r.peak)} subscribers · ${fmt.bytes(r.bytes_out)} delivered · `
       + `${fmt.plural(r.fetches, 'fetch', 'fetches')} · ${fmt.plural(r.drops, 'drop')}`,
     `cache ${fmt.num(r.cache_groups)} groups, ${fmt.bytes(r.cache_bytes)}`
       + (r.largest ? ` · largest ${r.largest[0]} · ${r.largest[1]}` : ''),
+    ...(none(T.cache_budget) ? [] : [
+      `relay cache ${fmt.bytes(T.cache_bytes)} of ${fmt.bytes(T.cache_budget)} · `
+        + fmt.plural(T.cache_evictions, 'eviction')]),
     `from ${peer(r.origin_addr, viaOrigin(r.origin))} · RTT up ${fmt.ms(r.rtt_up_ms)}, down p50 ${fmt.ms(r.rtt_down_ms)}`,
   ];
   const subs = r.subscriber_list || [];

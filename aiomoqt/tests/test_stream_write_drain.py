@@ -6,12 +6,14 @@ before the session-close event. Either must end the producer through the
 cancellation path: not escape as a task exception, not return silently.
 """
 import asyncio
+import logging
 from types import SimpleNamespace
 
 import pytest
 from aiopquic.asyncio.webtransport import WebTransportError
 
 from aiomoqt.protocol import _MOQTSessionMixin
+from aiomoqt.types import MOQTStreamStopped
 
 
 def _drain_session(exc):
@@ -61,6 +63,31 @@ async def test_unpaced_producer_ends_cancelled():
     assert written == 0
 
 
-async def test_write_race_still_swallowed():
-    s = _drain_session(AssertionError("stream gone"))
-    await s.stream_write_drain(4, b"x")
+@pytest.mark.parametrize("exc", [AssertionError("stream gone"),
+                                 AttributeError("'NoneType' object")],
+                         ids=["assert", "attr"])
+async def test_write_race_ends_the_stream_loudly(exc, caplog):
+    s = _drain_session(exc)
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(MOQTStreamStopped) as info:
+            await s.stream_write_drain(4, b"x")
+    assert info.value.__cause__ is exc
+    assert any(r.levelno == logging.WARNING and "write failed" in r.message
+               for r in caplog.records)
+
+
+async def test_write_race_while_closing_cancels_quietly(caplog):
+    exc = AssertionError("stream gone")
+    s = _drain_session(exc)
+
+    async def closing_send(stream_id, data, end_stream=False):
+        s._quic.closed = True  # the connection closes under the write
+        raise exc
+
+    s._quic.send_stream_data_drained = closing_send
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(asyncio.CancelledError) as info:
+            await s.stream_write_drain(4, b"x")
+    assert not isinstance(info.value, MOQTStreamStopped)
+    assert info.value.__cause__ is exc
+    assert not any(r.levelno >= logging.WARNING for r in caplog.records)

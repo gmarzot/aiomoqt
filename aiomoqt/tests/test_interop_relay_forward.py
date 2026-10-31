@@ -16,6 +16,9 @@ class _Downstream:
         self.writes = []            # (stream_id, nbytes, fin)
         self.dones = []             # (request_id, PUBLISH_DONE status)
 
+    def set_stream_priority(self, _sid, _band):
+        return True
+
     async def open_uni_stream(self):
         sid = self._next
         self._next += 4
@@ -180,7 +183,7 @@ async def test_each_object_is_encoded_once_per_stream_state(monkeypatch):
     finally:
         track.task.cancel()
 
-    assert calls == [0, 1, 2, 2, 3], calls
+    assert sorted(calls) == [0, 1, 2, 2, 3], calls
     # Every subscriber's stream carries exactly what its own header would
     # have encoded.
     for down, oids in [*((d, range(4)) for d in early), (late, range(2, 4))]:
