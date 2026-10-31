@@ -93,7 +93,7 @@ async def main(host: str, port: int, path: str, namespace: str, track_name: str,
 
                 # process subscription - publisher will open stream and send data
                 await session.async_closed()
-                logger.info(f"MOQT app: exiting client session")
+                logger.info("MOQT app: exiting client session")
             except MOQTException as e:
                 logger.error(f"MOQT app: session exception: {e}")
                 session.close(e.error_code, e.reason_phrase)

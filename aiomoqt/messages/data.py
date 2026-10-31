@@ -3,13 +3,6 @@ from dataclasses import dataclass, field
 from sortedcontainers import SortedDict
 from typing import Optional, Dict, Tuple, Union
 
-# Set AIOMOQT_STRICT_SERIALIZE=1 to enable per-object payload-length
-# self-check in ObjectHeader.serialize (catches publisher-side
-# declared-vs-actual byte mismatches that surface downstream as
-# 'framer desync ext_len exceeds limit'). Off by default; one extra
-# tell() per object on the hot path, so leave it gated.
-_STRICT_SERIALIZE = bool(int(os.environ.get('AIOMOQT_STRICT_SERIALIZE', '0')))
-
 from . import (MOQTUnderflow, MOQTMessage, MOQTMalformedKVP, ObjectStatus, DataStreamType,
                MOQT_DEFAULT_PRIORITY, BUF_SIZE,
                SUBGROUP_HEADER_BASE, SUBGROUP_ID_ZERO, SUBGROUP_ID_FIRST_OBJ, SUBGROUP_ID_EXPLICIT,
@@ -23,6 +16,13 @@ from aiopquic._binding._streamchain import (
     encode_object_subgroup, encode_object_subgroup_vi64)
 
 logger = get_logger(__name__)
+
+# Set AIOMOQT_STRICT_SERIALIZE=1 to enable per-object payload-length
+# self-check in ObjectHeader.serialize (catches publisher-side
+# declared-vs-actual byte mismatches that surface downstream as
+# 'framer desync ext_len exceeds limit'). Off by default; one extra
+# tell() per object on the hot path, so leave it gated.
+_STRICT_SERIALIZE = bool(int(os.environ.get('AIOMOQT_STRICT_SERIALIZE', '0')))
 
 
 

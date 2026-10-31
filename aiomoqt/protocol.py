@@ -4,10 +4,10 @@ import functools
 import logging
 import time
 from asyncio import Future
-from collections import OrderedDict, defaultdict, deque
-from dataclasses import dataclass, field
+from collections import OrderedDict, deque
+from dataclasses import dataclass
 from types import MappingProxyType
-from typing import (Any, Callable, DefaultDict, Dict, List, Optional, Set,
+from typing import (Any, Callable, Dict, List, Optional, Set,
                     Tuple, Type, Union)
 
 from aiopquic.quic.connection import QuicErrorCode, stream_is_unidirectional
@@ -53,6 +53,16 @@ from .utils.url import moqt_setup_path
 from .utils.timing import TIMING_IDS
 from aiopquic.streamchain import StreamChain
 from aiopquic.asyncio.webtransport import WebTransportError
+from aiopquic.asyncio.protocol import (
+    QuicConnectionProtocol as _AioPQuicConnectionProtocol,
+)
+from aiopquic.asyncio.webtransport import (
+    WebTransportClient as _AioPWTClient,
+    WebTransportServerSession as _AioPWTServerSession,
+    _EVT_WT_STREAM_DATA, _EVT_WT_STREAM_FIN,
+    _EVT_WT_STREAM_RESET, _EVT_WT_STOP_SENDING,
+    _EVT_WT_DATAGRAM, _EVT_WT_SESSION_CLOSED,
+)
 
 USER_AGENT = f"aiomoqt/{version('aiomoqt')}"
 
@@ -1711,7 +1721,7 @@ class _MOQTSessionMixin:
                   f"chain_bytes={cap:<10} parsed={parsed:<12} "
                   f"group={gid} object={oid} parser={pt}",
                   file=file, flush=True)
-        print(f"=== end chain-dump ===", file=file, flush=True)
+        print("=== end chain-dump ===", file=file, flush=True)
         return out
 
     def _cleanup_stream(self, stream_id: int,
@@ -2492,7 +2502,7 @@ class _MOQTSessionMixin:
 
                 if msg_header is None:
                     error = f"MOQT stream({stream_id}): ObjectHeader parse failed at: {buf.tell()}"
-                    logger.error(f"MOQT error: " + error)
+                    logger.error("MOQT error: " + error)
                     self._close_session(SessionCloseCode.PROTOCOL_VIOLATION, error)
                     return None
 
@@ -2531,7 +2541,7 @@ class _MOQTSessionMixin:
             msg = ObjectDatagram.deserialize(buf, buf.capacity, type_val=dgram_type, prof=self._profile)
             if msg is None:
                 error = f"datagram parsing failed at: {buf.tell()}"
-                logger.error(f"MOQT error: " + error)
+                logger.error("MOQT error: " + error)
                 self._close_session(SessionCloseCode.PROTOCOL_VIOLATION, error)
                 return msg
 
@@ -2547,7 +2557,7 @@ class _MOQTSessionMixin:
             msg = ObjectDatagramStatus.deserialize(buf, type_val=dgram_type, prof=self._profile)
             if msg is None:
                 error = f"datagram parsing failed at: {buf.tell()}"
-                logger.error(f"MOQT error: " + error)
+                logger.error("MOQT error: " + error)
                 self._close_session(SessionCloseCode.PROTOCOL_VIOLATION, error)
                 return msg
 
@@ -2560,7 +2570,7 @@ class _MOQTSessionMixin:
             return msg
         else:
             error = f"datagram type unknown: 0x{dgram_type:x}"
-            logger.error(f"MOQT error: " + error)
+            logger.error("MOQT error: " + error)
             self._close_session(SessionCloseCode.PROTOCOL_VIOLATION, error)
             return
 
@@ -2581,7 +2591,7 @@ class _MOQTSessionMixin:
         valid_form = (dgram_type & ~0x2F) == 0 and (dgram_type & 0x10) == 0
         if (not valid_form) or dgram_type in self._D18_DGRAM_INVALID:
             error = f"invalid d18 datagram type: 0x{dgram_type:x}"
-            logger.error(f"MOQT error: " + error)
+            logger.error("MOQT error: " + error)
             self._close_session(SessionCloseCode.PROTOCOL_VIOLATION, error)
             return
         try:
@@ -2599,7 +2609,7 @@ class _MOQTSessionMixin:
         if error is None and msg.status:
             error = self._status_object_fault(msg.status, msg.extensions)
         if error is not None:
-            logger.error(f"MOQT error: " + error)
+            logger.error("MOQT error: " + error)
             self._close_session(SessionCloseCode.PROTOCOL_VIOLATION, error)
             return None
         if dgram_type & 0x08:
@@ -3434,7 +3444,7 @@ class _MOQTSessionMixin:
         params = {}
         if use_quic:
             # Raw QUIC flow. _wt_session_setup is pre-resolved in __init__.
-            logger.info(f"MOQT: Using raw QUIC transport")
+            logger.info("MOQT: Using raw QUIC transport")
             if self._profile.control_uni_pair:
                 # d18: control is a uni-stream pair. Open our write-control
                 # uni now; the peer's read-control uni is bound on the first
@@ -3526,7 +3536,7 @@ class _MOQTSessionMixin:
                 versions = [moqt_version_from_draft(d) for d in drafts]
             else:
                 versions = MOQT_VERSIONS
-            client_setup = self.client_setup(
+            self.client_setup(
                 versions=versions,
                 parameters=params
             )
@@ -3536,7 +3546,7 @@ class _MOQTSessionMixin:
 
         # Wait for SERVER_SETUP
         session_setup = False
-        try: 
+        try:
             async with asyncio.timeout(timeout):
                 session_setup = await self._moqt_session_setup
         except asyncio.TimeoutError:
@@ -3544,11 +3554,11 @@ class _MOQTSessionMixin:
             logger.error("MOQT error: " + error)
             self._close_session(SessionCloseCode.CONTROL_MESSAGE_TIMEOUT, error)
             pass
-        
+
         if not session_setup or self._close_err is not None:
             logger.error(f"MOQT error: session setup failed: {session_setup}")
             raise MOQTException(*self._close_err)
-        
+
         self._established_ms = (time.monotonic() - _t0) * 1000.0
         self._on_setup_complete()
 
@@ -5233,7 +5243,7 @@ class _MOQTSessionMixin:
             control_log.info(f"MOQT send: {self._msgstr(message)}")
             self._send_reply(request_id, message)
         return message
-    
+
     def _refuse_peer_request(self, msg: MOQTMessage, error_code: int,
                              reason: str,
                              retry_interval: int = 0) -> MOQTMessage:
@@ -6250,7 +6260,7 @@ class _MOQTSessionMixin:
     ###############################################################################################
     #  Inbound MoQT message handlers                                                              #
     ###############################################################################################
-    
+
     def register_handler(self, msg_type: int, handler: Callable) -> None:
         """Register a custom handler, overriding the default handler for
         this message type on this session. A message addressed to a
@@ -6262,7 +6272,7 @@ class _MOQTSessionMixin:
         self._control_msg_overrides[msg_type] = handler
         for alias in HANDLER_ALIASES.get(msg_type, ()):
             self._control_msg_overrides[alias] = handler
-    
+
     async def _handle_server_setup(self, msg: ServerSetup) -> None:
         control_log.debug(f"MOQT event: handle {self._msgstr(msg)}")
 
@@ -6756,11 +6766,8 @@ class _MOQTSessionMixin:
     async def _handle_subgroup_header(self, msg: SubgroupHeader, buf: Buffer) -> None:
         """Handle subgroup header message."""
         control_log.debug(f"MOQT event: handle {self._msgstr(msg)}")
-        # Process subgroup header - 
-        sub_id = self._track_aliases.get(msg.track_alias)
-        if sub_id is not None:
-            sub_state = self._subscriptions[sub_id]
-        else:
+        # Process subgroup header -
+        if self._track_aliases.get(msg.track_alias) is None:
             logger.warning(f"MOQT: unrecognized track alias: {msg.track_alias}")
 
     async def _handle_fetch_header(self, msg: FetchHeader) -> None:
@@ -6903,7 +6910,7 @@ class _MOQTSessionMixin:
        # Subscribe messages
        MOQTMessageType.SUBSCRIBE_UPDATE: (SubscribeUpdate, _handle_subscribe_update),
        MOQTMessageType.SUBSCRIBE: (Subscribe, _handle_subscribe),
-       MOQTMessageType.SUBSCRIBE_OK: (SubscribeOk, _handle_subscribe_ok), 
+       MOQTMessageType.SUBSCRIBE_OK: (SubscribeOk, _handle_subscribe_ok),
        MOQTMessageType.SUBSCRIBE_ERROR: (SubscribeError, _handle_subscribe_error),
 
        # PublishNamespace messages
@@ -7027,18 +7034,6 @@ class _MOQTSessionMixin:
         DataStreamType.FETCH_HEADER: (FetchHeader, _handle_fetch_header),
         # SubgroupHeader: types 0x10-0x1D dispatched by range check
     }
-
-
-from aiopquic.asyncio.protocol import (
-    QuicConnectionProtocol as _AioPQuicConnectionProtocol,
-)
-from aiopquic.asyncio.webtransport import (
-    WebTransportClient as _AioPWTClient,
-    WebTransportServerSession as _AioPWTServerSession,
-    _EVT_WT_STREAM_DATA, _EVT_WT_STREAM_FIN,
-    _EVT_WT_STREAM_RESET, _EVT_WT_STOP_SENDING,
-    _EVT_WT_DATAGRAM, _EVT_WT_SESSION_CLOSED,
-)
 
 
 class MOQTSessionQuic(_MOQTSessionMixin, _AioPQuicConnectionProtocol):

@@ -194,8 +194,8 @@ class MOQTServer(MOQTPeer):
             if self.max_connections is not None:
                 cfg.max_connections = self.max_connections
             cfg.load_cert_chain(self.certificate, self.private_key)
-            protocol = lambda *a, **kw: self._adopt(
-                MOQTSessionQuic(*a, **kw, session=self))
+            def protocol(*a, **kw):
+                return self._adopt(MOQTSessionQuic(*a, **kw, session=self))
             return aiopquic_serve(
                 self.host, self.port,
                 configuration=cfg,
