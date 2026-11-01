@@ -519,6 +519,22 @@ _SCHEMA = os.path.join(os.path.dirname(__file__), "vectors",
 _DATA_KEYED = ("track_history", "by_draft", "by_transport")
 
 
+async def _delivery_window(status, timeout=3.0):
+    """A snapshot whose window saw the relay send to a subscriber. The
+    first snapshot only sets the baseline; a slow host can send nothing
+    in one short window."""
+    loop = asyncio.get_running_loop()
+    status.snapshot(loop.time(), time.time())
+    deadline = loop.time() + timeout
+    while True:
+        await asyncio.sleep(0.3)
+        snap = status.snapshot(loop.time(), time.time())
+        if loop.time() > deadline or any(
+                "sub" in (s["role"] or "") and s["tx_bps"]
+                for s in snap["sessions"]):
+            return snap
+
+
 @requires_certs
 async def test_session_loss_only_on_delivery(relay_tables, tmp_path, monkeypatch):
     # A publisher session carries mostly unacked ACK-only packets from the
@@ -539,10 +555,7 @@ async def test_session_loss_only_on_delivery(relay_tables, tmp_path, monkeypatch
         await SubscribedTrack(sub, _NS, "video").subscribe(timeout=5)
         status = relay._Status(str(tmp_path / "status.json"),
                                {"started": time.time()}, [connect.handle])
-        loop = asyncio.get_running_loop()
-        status.snapshot(loop.time(), time.time())
-        await asyncio.sleep(0.3)
-        snap = status.snapshot(loop.time(), time.time())
+        snap = await _delivery_window(status)
     by_role = {s["role"]: s for s in snap["sessions"]}
     assert by_role["pub"]["loss_pct"] is None
     assert by_role["sub"]["loss_pct"] is not None
@@ -571,10 +584,7 @@ async def test_viewer_loss_excludes_spurious(relay_tables, tmp_path, monkeypatch
         await SubscribedTrack(sub, _NS, "video").subscribe(timeout=5)
         status = relay._Status(str(tmp_path / "status.json"),
                                {"started": time.time()}, [connect.handle])
-        loop = asyncio.get_running_loop()
-        status.snapshot(loop.time(), time.time())
-        await asyncio.sleep(0.5)
-        snap = status.snapshot(loop.time(), time.time())
+        snap = await _delivery_window(status)
     viewer = next(s for s in snap["sessions"] if s["role"] == "sub")
     assert viewer["loss_pct"] == 25.0, viewer
     assert viewer["spurious_pct"] == 25.0, viewer
@@ -606,10 +616,7 @@ async def test_publishing_subscriber_reports_no_loss(relay_tables, tmp_path,
         await SubscribedTrack(both, _NS, "video").subscribe(timeout=5)
         status = relay._Status(str(tmp_path / "status.json"),
                                {"started": time.time()}, [connect.handle])
-        loop = asyncio.get_running_loop()
-        status.snapshot(loop.time(), time.time())
-        await asyncio.sleep(0.3)
-        snap = status.snapshot(loop.time(), time.time())
+        snap = await _delivery_window(status)
     by_role = {s["role"]: s for s in snap["sessions"]}
     assert set(by_role) == {"pub", "pub+sub"}, by_role.keys()
     assert by_role["pub+sub"]["loss_pct"] is None
