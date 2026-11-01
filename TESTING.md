@@ -44,7 +44,7 @@ Pass criteria:
 - **(1)** all green. Blocking.
 - **(2)** active relays green; known `unverified` / `unreachable` OK.
 - **(3)** reports a ceiling without crashing. Not a gate.
-- **(4)** build clean; `-l` lists 8 cases; live run exits 0.
+- **(4)** build clean; `-l` lists 22 cases; live run exits 0.
 - **(5)** > 100 Mbps sustained, zero loss, p50 < ~5 ms.
 - **(6)** N/N subscribers ok, zero resets.
 

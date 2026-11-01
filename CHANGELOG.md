@@ -2,6 +2,7 @@
 
 ## v0.14.0
 
+- moq_interop_client: the standard run adds the eight `moq-test-*` cases moq-rs's moq-test-client runs (draft-afrind-moq-test tuples, same names): the subscriber SUBSCRIBEs first with RENDEZVOUS_TIMEOUT, the client PUBLISHes the track, and every object, End of Group marker, extension and the PUBLISH_DONE Stream Count is checked; SKIP below d18.
 - A REQUEST_UPDATE that arrives in the same read as its SUBSCRIBE reaches the PublishedTrack instead of being refused as not supported.
 - aiomoqt-relay `--startup-hold SEC` (default 2, 0 = off; `startup-hold` in `--config`): for SEC seconds after start, a SUBSCRIBE for a track no publisher serves waits for one and is answered when it appears, else refused as before when the window ends.
 - aiomoqt-relay: offering a paused track to a SUBSCRIBE_TRACKS (or d16 SUBSCRIBE_NAMESPACE) subscriber resumes it first, as a SUBSCRIBE does, so the PUBLISH carries the live Largest and the subscription takes the resume fence.
