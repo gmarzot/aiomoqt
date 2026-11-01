@@ -6,6 +6,7 @@
 
 ## v0.14.0
 
+- A REQUEST_UPDATE that arrives in the same read as its SUBSCRIBE reaches the PublishedTrack instead of being refused as not supported.
 - aiomoqt-relay `--startup-hold SEC` (default 2, 0 = off; `startup-hold` in `--config`): for SEC seconds after start, a SUBSCRIBE for a track no publisher serves waits for one and is answered when it appears, else refused as before when the window ends.
 - aiomoqt-relay: offering a paused track to a SUBSCRIBE_TRACKS (or d16 SUBSCRIBE_NAMESPACE) subscriber resumes it first, as a SUBSCRIBE does, so the PUBLISH carries the live Largest and the subscription takes the resume fence.
 - aiomoqt-relay: a fill whose range runs past what the cache holds asks upstream for it, else is reset, or under FILL_TIMEOUT serves what is held and a Timed-Out gap for the rest, instead of a short stream that ends cleanly.
@@ -50,7 +51,7 @@
 - pub_media `--fetch-history BYTES`: its media tracks keep that much history to answer FETCH (default 0: FETCH refused); `LocTrackPublisher` takes `fetch_history_bytes`.
 - The session close line names who closed, the code (with its H3 or MoQT name), the peer address and whether MoQT setup completed; a WebTransport H3_NO_ERROR (0x100) close logs INFO, a peer error close one WARNING (no separate QUIC ERROR line), our own error close ERROR.
 - Raw QUIC session closes send and record their reason phrase; a transport close is logged by its QUIC name (e.g. CONNECTION_REFUSED (0x2)), not a MoQT one. Needs aiopquic's close kind; older aiopquic keeps the MoQT names.
-- Requires aiopquic 0.7.0 (0.7.0rc3 or later until it ships): datagram priority, the server bind host, close kinds and reasons, the local close cause and congestion-control options need it (0.6.x silently ignored the first two).
+- Requires aiopquic 0.7.0: datagram priority, the server bind host, close kinds and reasons, the local close cause and congestion-control options need it (0.6.x silently ignored the first two).
 - Draft-14 is deprecated and will be removed in 0.15.0; until then it still negotiates and stays in the default offer.
 - aiomoqt-relay `--pause-after SEC` (default 60, 0 = never): a track no subscriber has forwarded for that long is paused upstream (Forward State 0) and resumed by the next subscriber; `--catalog-probe` catalogs keep flowing.
 - The LOC producer keeps numbering frames while paused (Forward State 0), so its Largest keeps moving; nothing is sent or kept.

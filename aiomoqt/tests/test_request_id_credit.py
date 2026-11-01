@@ -280,7 +280,7 @@ def _reorder_stub(draft):
     s._route_reply = lambda _: None
     s._resolve_auth_token = lambda _: None
     s._refuse_request = lambda _: None
-    s._track_handler = lambda _: None
+    s._track_handler = lambda *_: None
     return s
 
 
