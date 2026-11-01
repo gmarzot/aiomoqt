@@ -23,6 +23,7 @@ import secrets
 import sys
 import time
 from dataclasses import dataclass, field, replace
+from typing import Optional
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.context import is_draft16_or_later, profile_for
@@ -386,7 +387,7 @@ def _session_meta(session) -> dict:
 
 def _make_client(host: str, port: int, path: str, use_quic: bool,
                  tls_disable_verify: bool, debug: bool,
-                 supported_drafts: int = None) -> MOQTClient:
+                 supported_drafts: Optional[int] = None) -> MOQTClient:
     """Create a configured MOQTClient."""
     return MOQTClient(
         host, port,
@@ -1742,7 +1743,6 @@ _MOQ_TEST_HEAD_START_S = 0.2
 # relay's TIMEOUT surfaces first, and eight cases stay well inside the
 # runner's 120 s per pair.
 _MOQ_TEST_CASE_S = 10.0
-# Delivery stops this long before the budget, leaving time for a verdict.
 _MOQ_TEST_VERDICT_S = 0.5
 # How long the publisher waits for a Forward State 0 to become 1.
 _MOQ_TEST_FORWARD_WAIT_S = 1.0
@@ -1871,8 +1871,8 @@ class _MoqTestPublisher:
 
     def __init__(self, case: MoqTestCase):
         self.case = case
-        self.request_id = None
-        self.alias = None
+        self.request_id = 0          # set by publish()
+        self.alias = 0
         self.forward = 1            # what our PUBLISH carried
         self.forward_changed = asyncio.Event()
         self.replied = asyncio.Event()
@@ -2208,8 +2208,8 @@ class _MoqTestScoreboard:
 
 async def run_moq_test_case(name: str, host, port, path, use_quic,
                             tls_disable_verify, debug, supported_drafts=None,
-                            compat=frozenset(), case: MoqTestCase = None
-                            ) -> TestResult:
+                            compat=frozenset(),
+                            case: Optional[MoqTestCase] = None) -> TestResult:
     """One moq-test scenario through the relay: subscribe first, then
     PUBLISH, generate and verify."""
     case = case or MOQ_TEST_CASES[name]
@@ -2246,7 +2246,6 @@ async def run_moq_test_case(name: str, host, port, path, use_quic,
         track = SubscribedTrack(sub_session, "/".join(namespace), track_name,
                                 on_object=board.on_object,
                                 on_done=board.on_done)
-        track._quiet = True
         await track.subscribe(
             timeout=_MOQ_TEST_CASE_S,
             forward=0 if case.forward_zero else None,
@@ -2256,8 +2255,11 @@ async def run_moq_test_case(name: str, host, port, path, use_quic,
                                                 board.on_stream_end)
 
     step = "subscriber SETUP"
+    # Delivery stops short of the budget, leaving time for a verdict.
+    deadline = (asyncio.get_running_loop().time() + _MOQ_TEST_CASE_S
+                - _MOQ_TEST_VERDICT_S)
     try:
-        async with asyncio.timeout(_MOQ_TEST_CASE_S) as budget:
+        async with asyncio.timeout(_MOQ_TEST_CASE_S):
             async with sub_client.connect() as sub_session:
                 await sub_session.client_session_init()
                 sessions["subscriber"] = _session_meta(sub_session)
@@ -2301,13 +2303,15 @@ async def run_moq_test_case(name: str, host, port, path, use_quic,
                                        f"{refused.error_code:#x} "
                                        f"{getattr(refused, 'reason', '')}"),
                                 reply)
-                        if (reply.done() and not reply.cancelled()
-                                and reply.exception() is not None):
-                            raise reply.exception()
-                        if (sub_task.done()
-                                and sub_task.exception() is not None):
+                        error = (reply.exception() if reply.done()
+                                 and not reply.cancelled() else None)
+                        if error is not None:
+                            raise error
+                        error = (sub_task.exception() if sub_task.done()
+                                 else None)
+                        if error is not None:
                             step = "SUBSCRIBE"
-                            raise sub_task.exception()
+                            raise error
                         await pub.replied.wait()
 
                         step = "SUBSCRIBE_OK"
@@ -2317,7 +2321,7 @@ async def run_moq_test_case(name: str, host, port, path, use_quic,
 
                         step = "object delivery"
                         await pub.send(pub_session)
-                        await board.drain(budget.when() - _MOQ_TEST_VERDICT_S)
+                        await board.drain(deadline)
                         pub_session.close()
                 finally:
                     # A SUBSCRIBE the relay still holds must not keep the
