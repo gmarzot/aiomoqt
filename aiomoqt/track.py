@@ -1485,7 +1485,10 @@ class PublishedTrack(Track):
 
     async def _on_track_status(self, session, msg) -> None:
         """TRACK_STATUS (§10.14): the SUBSCRIBE_OK this track would send,
-        as a REQUEST_OK that ends the request."""
+        as a REQUEST_OK that ends the request; TRACK_STATUS_OK at d14."""
+        if not is_draft16_or_later(session.negotiated_draft):
+            session._d14_track_status_ok(msg.request_id, self._largest)
+            return
         params = ({} if self._largest is None
                   else _largest_object_param(session, self._largest))
         session._send_reply(msg.request_id,

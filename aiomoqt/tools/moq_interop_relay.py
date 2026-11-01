@@ -4134,9 +4134,14 @@ async def _on_track_status(session, msg):
     ns = _ns_tuple(msg.track_namespace)
     _watch_session(session, ns)
     track = _tracks.get((ns, msg.track_name))
+    d14 = not is_draft16_or_later(session.negotiated_draft)
     if track is None or not _track_live(track):
         logger.info(f"relay: track-status ns={ns} track={msg.track_name} "
                     f"-> DOES_NOT_EXIST")
+        if d14:
+            session._refuse_peer_request(msg, RequestErrorCode.DOES_NOT_EXIST,
+                                         "track not served here")
+            return
         err = RequestError(
             request_id=msg.request_id,
             error_code=request_error_code(RequestErrorCode.DOES_NOT_EXIST,
@@ -4151,6 +4156,9 @@ async def _on_track_status(session, msg):
               else _largest_object_param(session, largest))
     logger.info(f"relay: track-status ns={ns} track={msg.track_name} "
                 f"-> OK largest={largest}")
+    if d14:
+        session._d14_track_status_ok(msg.request_id, largest)
+        return
     ok = RequestOk(request_id=msg.request_id, parameters=params,
                    track_properties=track.properties)
     session._send_reply(msg.request_id, ok, fin=True)
@@ -4170,6 +4178,10 @@ def _answered(handler):
             if request_id is None:
                 return
             try:
+                if not is_draft16_or_later(session.negotiated_draft):
+                    session._refuse_peer_request(
+                        msg, RequestErrorCode.INTERNAL_ERROR, "relay error")
+                    return
                 session._send_reply(request_id, RequestError(
                     request_id=request_id,
                     error_code=int(RequestErrorCode.INTERNAL_ERROR),

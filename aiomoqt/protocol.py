@@ -1048,9 +1048,8 @@ class _MOQTSessionMixin:
                 (tuple(msg.track_namespace), msg.track_name))
             return None if track is None else track._on_subscribe
         if isinstance(msg, TrackStatus):
-            track = (self._published_tracks.get(
+            track = self._published_tracks.get(
                 (tuple(msg.track_namespace), msg.track_name))
-                if is_draft16_or_later(self.negotiated_draft) else None)
             return None if track is None else track._on_track_status
         if isinstance(msg, Fetch):
             if _is_joining(msg.fetch_type):
@@ -5332,10 +5331,10 @@ class _MOQTSessionMixin:
 
     def _refuse_peer_request(self, msg: MOQTMessage, error_code: int,
                              reason: str,
-                             retry_interval: int = 0) -> MOQTMessage:
-        """Refuse a peer's SUBSCRIBE, FETCH, PUBLISH_NAMESPACE or
-        SUBSCRIBE_NAMESPACE with a named code in the draft's encoding:
-        REQUEST_ERROR from d16, the request's own error before."""
+                             retry_interval: int = 0) -> Optional[MOQTMessage]:
+        """Refuse a peer's request with a named code in the draft's
+        encoding: REQUEST_ERROR from d16, the request's own error before.
+        None for a d14 message that has no error reply (SUBSCRIBE_UPDATE)."""
         rid = msg.request_id
         code = request_error_code(error_code, self._profile,
                                   fetch=isinstance(msg, Fetch))
@@ -5347,10 +5346,30 @@ class _MOQTSessionMixin:
             return err
         cls = {Subscribe: SubscribeError, Fetch: FetchError,
                PublishNamespace: PublishNamespaceError,
-               SubscribeNamespace: SubscribeNamespaceError}[type(msg)]
+               SubscribeNamespace: SubscribeNamespaceError,
+               TrackStatus: TrackStatusError,
+               Publish: PublishError}.get(type(msg))
+        if cls is None:
+            return None
         err = cls(request_id=rid, error_code=code, reason=reason)
         self.send_control_message(err)
         return err
+
+    def _d14_track_status_ok(self, request_id: int,
+                             largest: Optional[Tuple[int, int]]) -> MOQTMessage:
+        """d14 TRACK_STATUS_OK: SUBSCRIBE_OK's fields with Track Alias 0
+        (§9.21)."""
+        exists = largest is not None
+        message = TrackStatusOk(
+            request_id=request_id, track_alias=0, expires=0,
+            group_order=GroupOrder.ASCENDING,
+            content_exists=(ContentExistsCode.EXISTS if exists
+                            else ContentExistsCode.NO_CONTENT),
+            largest_group_id=largest[0] if exists else None,
+            largest_object_id=largest[1] if exists else None,
+            parameters={})
+        self._send_reply(request_id, message)
+        return message
 
     def unsubscribe(
         self,
@@ -6634,6 +6653,9 @@ class _MOQTSessionMixin:
                 reason="track status not supported",
             )
             self._send_reply(msg.request_id, err, fin=True)
+        else:
+            self._refuse_peer_request(msg, RequestErrorCode.NOT_SUPPORTED,
+                                      "track status not supported")
 
     async def _handle_track_status_ok(self, msg: TrackStatusOk) -> None:
         control_log.debug(f"MOQT event: handle {self._msgstr(msg)}")

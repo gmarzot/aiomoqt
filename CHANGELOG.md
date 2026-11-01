@@ -7,6 +7,7 @@
 
 ## v0.14.0
 
+- Draft-14: TRACK_STATUS gets TRACK_STATUS_OK or TRACK_STATUS_ERROR from a PublishedTrack, the session default and aiomoqt-relay, and the relay's fallback error reply is the request's own d14 error, instead of d16's REQUEST_OK / REQUEST_ERROR or no reply.
 - A REQUEST_UPDATE that arrives in the same read as its SUBSCRIBE reaches the PublishedTrack instead of being refused as not supported.
 - aiomoqt-relay `--startup-hold SEC` (default 2, 0 = off; `startup-hold` in `--config`): for SEC seconds after start, a SUBSCRIBE for a track no publisher serves waits for one and is answered when it appears, else refused as before when the window ends.
 - aiomoqt-relay: offering a paused track to a SUBSCRIBE_TRACKS (or d16 SUBSCRIBE_NAMESPACE) subscriber resumes it first, as a SUBSCRIBE does, so the PUBLISH carries the live Largest and the subscription takes the resume fence.
@@ -117,7 +118,7 @@
 - A publisher session answers SUBSCRIBE_TRACKS itself: a PUBLISH for each attached track under the prefix, and for each attached while it is open, filtered by TRACK_PROPERTY_FILTER; an application handler for the type still answers instead. PublishedTrack.publish() sends no second PUBLISH while one is bound on the session.
 - Logging: a TRACE level below DEBUG holds per-object, per-chunk and wire-hex detail; category loggers `aiomoqt.control`, `.data`, `.fetch`, `.transport`, `.relay`; tools take `--log-level` and `--log CAT=LEVEL`, `AIOMOQT_LOG` the same spec; the relay's SIGUSR1 steps INFO, DEBUG, TRACE.
 - aiomoqt-relay `--catalog-probe` (on in the deploy): the relay subscribes to an announced or published namespace's catalog at once, so the dashboard's play button shows before anyone plays it.
-- The ersatz relay is now aiomoqt-relay: an `aiomoqt-relay` command (`moq-interop-relay` still works), and the deploy's container is `aiomoqt-relay`.
+- The interop relay is now aiomoqt-relay: an `aiomoqt-relay` command (`moq-interop-relay` still works), and the deploy's container is `aiomoqt-relay`.
 - aiomoqt-relay: `--cache-bytes` (default 256 MiB) caps the object cache across all tracks, evicting the least recently used track's oldest group; status totals `cache_budget`, `cache_bytes`, `cache_evictions`.
 - Servers bind the address they are given (aiopquic 0.7.0): `--bind` and `MOQTServer(host=...)` default to all interfaces, IPv4 and IPv6; `0.0.0.0` is IPv4 only; an address or hostname binds only that. The image passes `--bind` only when `MOQT_BIND` is set.
 - aiomoqt-relay: a REQUEST_UPDATE that arrives while its SUBSCRIBE waits on the upstream is answered after the SUBSCRIBE_OK instead of ahead of it with NOT_SUPPORTED; update replies log `MOQT send:` at INFO.
