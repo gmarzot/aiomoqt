@@ -92,8 +92,10 @@ class _StubSession:
     def set_stream_priority(self, _sid, _band):
         return True
 
-    async def open_uni_stream(self):
+    async def open_uni_stream(self, initial=b"", priority=None):
         self._sid += 4
+        if initial:
+            await self.stream_write_drain(self._sid, initial)
         return self._sid
 
     def stream_write(self, sid, data, end_stream=False):

@@ -59,8 +59,10 @@ class _FakeSession:
         self.resets, self.fins, self.writes, self.dgrams = [], [], [], []
         self._next = 2
 
-    async def open_uni_stream(self):
+    async def open_uni_stream(self, initial=b"", priority=None):
         self._next += 4
+        if initial:
+            await self.stream_write_drain(self._next, initial)
         return self._next
 
     def set_stream_priority(self, *_):
@@ -112,7 +114,7 @@ async def test_a_late_subgroup_object_resets_its_stream():
     first, second = sorted(set(session.writes))
     assert session.resets == [(first, StreamResetCode.DELIVERY_TIMEOUT)]
     # Nothing more on group 0's subgroup, no reopen; group 1 flows.
-    assert session.writes.count(first) == 3  # header + objects 0, 1
+    assert session.writes.count(first) == 2  # header with object 0, object 1
     assert session.fins == [second]
     assert delivery.largest == (1, 1)
     assert lane.expired == 1

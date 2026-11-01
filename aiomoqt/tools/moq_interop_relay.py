@@ -1612,10 +1612,6 @@ class _RelayedTrack:
         if entry is None:
             if lane is not None:
                 lane.parked, lane.sid = "header", None
-            stream_id = await session.open_uni_stream()
-            if lane is not None:
-                lane.sid = stream_id
-            session.set_stream_priority(stream_id, _stream_band(session, prio))
             # Mirror the upstream stream's shape: END_OF_GROUP,
             # FIRST_OBJECT and the subgroup-id mode are part of the
             # delivery semantics a subscriber checks, and re-encoding
@@ -1626,22 +1622,28 @@ class _RelayedTrack:
                 publisher_priority=prio, extensions_present=True,
                 end_of_group=eog, first_object=first_obj,
                 prof=session._profile)
+            initial = header.serialize().data
+            first = None
+            if status not in _STREAM_ENDS:
+                # The header and the first object open the stream together.
+                first = _object_data(header, payload, exts, oid, encoded)
+                initial += first
             try:
-                await session.stream_write_drain(stream_id,
-                                                 header.serialize().data)
+                stream_id = await session.open_uni_stream(
+                    initial=initial, priority=_stream_band(session, prio))
             except MOQTStreamStopped:
                 self._stopped.add(skey)
                 return
-            except BaseException:
-                # Never leave a stream open without its header.
-                session.stream_reset(stream_id, StreamResetCode.CANCELLED)
-                raise
+            if lane is not None:
+                lane.sid = stream_id
             entry = (stream_id, header)
             self._streams[skey] = entry
             self._tx_streams.setdefault(id(session), {})[(gid, sgid)] = \
                 stream_id
             self._sent_streams[id(session)] = \
                 self._sent_streams.get(id(session), 0) + 1
+            if first is not None:
+                return
         stream_id, header = entry
         if status in ("END", ObjectStatus.END_OF_GROUP,
                       ObjectStatus.END_OF_TRACK) and (
@@ -1664,16 +1666,7 @@ class _RelayedTrack:
             session.stream_write(stream_id, buf.data, end_stream=True)
             self._streams.pop(skey, None)
             return
-        # One encoding per object per stream state, shared by subscribers.
-        state = header.encoding_state()
-        data = None if encoded is None else encoded.get(state)
-        if data is None:
-            data = header.next_object_bytes(payload=payload, extensions=exts,
-                                            object_id=oid)
-            if encoded is not None:
-                encoded[state] = data
-        else:
-            header.advance(oid)
+        data = _object_data(header, payload, exts, oid, encoded)
         if lane is not None:
             lane.parked, lane.sid = "object", stream_id
         try:
@@ -1682,6 +1675,25 @@ class _RelayedTrack:
             # The session has reset the stream; the subscription goes on.
             self._streams.pop(skey, None)
             self._stopped.add(skey)
+
+
+# Statuses that end a subgroup stream instead of carrying an object.
+_STREAM_ENDS = ("END", ObjectStatus.END_OF_GROUP, ObjectStatus.END_OF_TRACK)
+
+
+def _object_data(header, payload, exts, oid, encoded):
+    """The object's bytes on header's stream. One encoding per object per
+    stream state, shared by subscribers through `encoded`."""
+    state = header.encoding_state()
+    data = None if encoded is None else encoded.get(state)
+    if data is None:
+        data = header.next_object_bytes(payload=payload, extensions=exts,
+                                        object_id=oid)
+        if encoded is not None:
+            encoded[state] = data
+    else:
+        header.advance(oid)
+    return data
 
 
 _watched: set = set()

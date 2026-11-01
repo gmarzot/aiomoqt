@@ -3,6 +3,7 @@
 ## v0.15.0 (unreleased)
 
 - `--pacing-trains` (session grid, aiomoqt-relay, loopback_bench; relay.toml `pacing-trains`) and `packet_train_mode=` on `MOQTClient` / `MOQTServer`: when pacing holds a connection back, picoquic sends up to 10 packets at once instead of one or two. Off by default; needs aiopquic with `QuicConfiguration.packet_train_mode`.
+- A new subgroup stream opens with its header and first object; over WebTransport they travel with the stream create (aiopquic `create_stream(initial=)`) and leave in one send instead of two. `MOQTSession.open_uni_stream(initial=, priority=)` sets the stream priority and writes its first bytes on either transport.
 
 ## v0.14.0
 
