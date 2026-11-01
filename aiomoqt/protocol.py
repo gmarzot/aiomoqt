@@ -3614,13 +3614,14 @@ class _MOQTSessionMixin:
         else:
             with_data = (_WT_CREATE_WITH_DATA
                          and (initial or priority is not None)
-                         and len(initial) <= self.stream_ring_cap)
+                         and len(initial) <= getattr(self, "stream_ring_cap", 0))
+            create = self.create_stream
             # aiopquic-WT: round-trip to picoquic for stream-id allocation
             try:
                 if with_data:
-                    return await self.create_stream(
+                    return await create(
                         bidir=False, initial=initial, priority=priority)
-                sid = await self.create_stream(bidir=False)
+                sid = await create(bidir=False)
             except WebTransportError:
                 # Session torn down while a producer was at a stream
                 # rollover. Convert to the cancellation path the track
