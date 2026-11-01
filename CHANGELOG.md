@@ -2,6 +2,7 @@
 
 ## v0.14.0
 
+- Draft-14: TRACK_STATUS gets TRACK_STATUS_OK or TRACK_STATUS_ERROR from a PublishedTrack, the session default and aiomoqt-relay, and the relay's fallback error reply is the request's own d14 error, instead of d16's REQUEST_OK / REQUEST_ERROR or no reply.
 - A REQUEST_UPDATE that arrives in the same read as its SUBSCRIBE reaches the PublishedTrack instead of being refused as not supported.
 - aiomoqt-relay `--startup-hold SEC` (default 2, 0 = off; `startup-hold` in `--config`): for SEC seconds after start, a SUBSCRIBE for a track no publisher serves waits for one and is answered when it appears, else refused as before when the window ends.
 - aiomoqt-relay: offering a paused track to a SUBSCRIBE_TRACKS (or d16 SUBSCRIBE_NAMESPACE) subscriber resumes it first, as a SUBSCRIBE does, so the PUBLISH carries the live Largest and the subscription takes the resume fence.
