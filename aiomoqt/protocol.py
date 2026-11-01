@@ -1034,9 +1034,9 @@ class _MOQTSessionMixin:
     def _unbind_request(self, request_id: int) -> None:
         self._requests.pop(request_id, None)
 
-    def _track_handler(self, msg) -> Optional[Callable]:
+    def _track_handler(self, msg, default=None) -> Optional[Callable]:
         """The published track's handler for a message addressed to it,
-        else None."""
+        else None. `default` is the session's own handler for `msg`."""
         if isinstance(msg, Subscribe):
             track = self._published_tracks.get(
                 (tuple(msg.track_namespace), msg.track_name))
@@ -1075,7 +1075,30 @@ class _MOQTSessionMixin:
         else:
             return None
         entry = self._requests.get(rid)
-        return None if entry is None else getattr(entry.track, name)
+        if entry is not None:
+            return getattr(entry.track, name)
+        if isinstance(msg, PublishOk):
+            return None
+        return self._update_behind_subscribe(rid, name, default)
+
+    def _update_behind_subscribe(self, rid, name, default):
+        """An update whose SUBSCRIBE came in the same read: admitted, not
+        yet bound. Handler tasks run in order and the track binds before
+        its first await, so the update follows the SUBSCRIBE to the
+        track; one the track refused meanwhile gets `default`."""
+        peer = self._peer_requests.get(rid)
+        track = (self._published_tracks.get(peer[1])
+                 if peer is not None and peer[0] is Subscribe else None)
+        if track is None:
+            return None
+
+        async def run(session, msg):
+            entry = session._requests.get(rid)
+            if entry is not None and entry.track is track:
+                return await getattr(track, name)(session, msg)
+            if default is not None:
+                return await default(session, msg)
+        return run
 
     def register_request_cancel_handler(self, request_id: int,
                                         callback: Callable) -> None:
@@ -1612,7 +1635,7 @@ class _MOQTSessionMixin:
             control_log.info(f"MOQT event: control message parsed: {self._msgstr(msg)})")
             refusal = (self._resolve_auth_token(msg)
                        or self._refuse_request(msg))
-            routed = refusal or self._track_handler(msg)
+            routed = refusal or self._track_handler(msg, handler)
             if routed is not None:
                 handler = routed
 
@@ -4584,13 +4607,13 @@ class _MOQTSessionMixin:
         try:
             stream_id = await self.open_bidi_stream()
         except BaseException:
-            self._unbound_updates.pop(request_id, None)
+            (self._unbound_updates or {}).pop(request_id, None)
             self._fail_waiting_updates(request_id,
                                        "request stream did not open")
             raise
         self._bidi_streams[request_id] = stream_id
         self._bidi_stream_requests[stream_id] = request_id
-        updates = self._unbound_updates.pop(request_id, ())
+        updates = (self._unbound_updates or {}).pop(request_id, ())
         self.send_stream_message(stream_id, msg)
         for update in updates:
             self.send_stream_message(stream_id, update)
@@ -6707,7 +6730,9 @@ class _MOQTSessionMixin:
         unclaimed = self._unclaimed_publishes
         if unclaimed is None:
             unclaimed = self._unclaimed_publishes = OrderedDict()
-        unclaimed[getattr(msg, 'request_id', None)] = None
+        rid = getattr(msg, 'request_id', None)
+        if rid is not None:
+            unclaimed[rid] = None
         if len(unclaimed) > self.ANNOUNCEMENT_QUEUE_MAX:
             unclaimed.popitem(last=False)
 
