@@ -11,7 +11,6 @@
 - aiomoqt-relay `--startup-hold SEC` (default 2, 0 = off; `startup-hold` in `--config`): for SEC seconds after start, a SUBSCRIBE for a track no publisher serves waits for one and is answered when it appears, else refused as before when the window ends.
 - aiomoqt-relay: offering a paused track to a SUBSCRIBE_TRACKS (or d16 SUBSCRIBE_NAMESPACE) subscriber resumes it first, as a SUBSCRIBE does, so the PUBLISH carries the live Largest and the subscription takes the resume fence.
 - aiomoqt-relay: a fill whose range runs past what the cache holds asks upstream for it, else is reset, or under FILL_TIMEOUT serves what is held and a Timed-Out gap for the rest, instead of a short stream that ends cleanly.
-- aiomoqt-relay: a SUBSCRIBE_OK reports the newest Largest the relay holds, objects that arrived while the subscription was being set up included, and its fill range resolves against that Largest.
 - aiomoqt-relay `--catalog-probe` probes a namespace again when a new PUBLISH_NAMESPACE or catalog PUBLISH replaces its broadcast, so the dashboard shows the new catalog format.
 - The bench tools print the CPU model, CPU count and clock in their banner and results; adaptive_bench, load_sim and sub_media `--report` CSVs add `cpu_model`, `cpu_count` and `cpu_mhz` columns.
 - loopback_bench `--fanout` ends its publisher's track before the subscriber leaves, so a paced run no longer ends with a send-lane shed WARNING.

@@ -798,8 +798,6 @@ class _RelayedTrack:
         # A downstream SUBSCRIBE is establishing this track: an upstream
         # terminal that lands first waits in the queue for it.
         self.attaching = False
-        # Newest Location received, including objects still queued.
-        self.arrived = None
         # (id(session), group, subgroup) -> (stream_id, SubgroupHeader)
         self._streams = {}
         # id(session) -> {(group, subgroup): stream_id} of the streams
@@ -1216,8 +1214,6 @@ class _RelayedTrack:
             self._last_gid = gid
         if msg.object_id == 0:
             self._heads.add(gid)
-        if self.arrived is None or (gid, msg.object_id) > self.arrived:
-            self.arrived = (gid, msg.object_id)
         if self._gaps and self._gaps[-1][1] is None and not self.paused:
             self._gaps[-1][1] = (gid, msg.object_id)
         if self._resync:
@@ -2855,20 +2851,14 @@ def _ensure_pause_sweep() -> None:
         _pause_sweep = loop.create_task(_sweep_unwatched())
 
 
-def _reply_largest(track):
-    """The Largest a SUBSCRIBE_OK reports (§10.2.11): the newest the
-    relay knows, objects still queued included; None before any."""
-    return max(filter(None, (track.largest, track.arrived)), default=None)
-
-
-def _largest_kwargs(largest) -> dict:
-    """SUBSCRIBE_OK Largest Location fields; none when nothing has been
-    published."""
-    if largest is None:
+def _largest_kwargs(track) -> dict:
+    """SUBSCRIBE_OK Largest Location (§10.2.11); none when nothing has
+    been published."""
+    if track.largest is None:
         return {}
     return {"content_exists": 1,
-            "largest_group_id": largest[0],
-            "largest_object_id": largest[1]}
+            "largest_group_id": track.largest[0],
+            "largest_object_id": track.largest[1]}
 
 
 def _resolve_against(msg, seen, track):
@@ -2917,8 +2907,8 @@ async def _await_publisher(session, ns: tuple, track_name,
 def _attach_subscriber(session, msg, track, largest) -> bool:
     """SUBSCRIBE_OK and join the fan-out with the SUBSCRIBE's Forward
     State and filter window, resolved against `largest` (§5.1.2); the
-    reply and its fill take the newest Largest the relay holds, a
-    joining FETCH the Largest it has taken in (§10.2.11). False when the End Group is already behind, answered
+    reply and a joining FETCH take the Largest the relay knows now
+    (§10.2.11). False when the End Group is already behind, answered
     INVALID_RANGE."""
     window = _subscription_window(msg, largest)
     if (window[1] is not None and track.largest is not None
@@ -2933,9 +2923,7 @@ def _attach_subscriber(session, msg, track, largest) -> bool:
         return False
     _watch_session(session, track.key[0])
     _ensure_pause_sweep()
-    reply_largest = _reply_largest(track)
-    ok = session.subscribe_ok(request_msg=msg,
-                              **_largest_kwargs(reply_largest),
+    ok = session.subscribe_ok(request_msg=msg, **_largest_kwargs(track),
                               track_properties=track.properties)
     # FORWARD omitted means 1 (§10.2.12).
     forward = msg.forward is None or bool(msg.forward)
@@ -2952,20 +2940,19 @@ def _attach_subscriber(session, msg, track, largest) -> bool:
     d.take_timeout(msg.parameters)
     session.register_request_cancel_handler(
         msg.request_id, lambda rid, t=track, s=session: t.drop_session(s))
-    _start_fill(track, d, msg, reply_largest)
+    _start_fill(track, d, msg)
     return True
 
 
-def _start_fill(track, d, msg, largest) -> None:
+def _start_fill(track, d, msg) -> None:
     """Open the fill fetch stream a FILL_PARAMETERS asks for (d22 §3.4.1),
-    under `msg`'s Request ID, its range resolved against the `largest`
-    the reply reported: none while paused or for an empty range, reset
-    at once for one that ends at or before the fence."""
+    under `msg`'s Request ID: none while paused or for an empty range,
+    reset at once for one that ends at or before the fence."""
     fill = (msg.parameters or {}).get(D20ParamType.FILL_PARAMETERS)
     if (fill is None or not d.forward
             or d.session._profile.param_table < 20):
         return
-    rng = fill_range(fill, d.location_filter, largest)
+    rng = fill_range(fill, d.location_filter, track.largest)
     if rng is None:
         return
     sid = id(d.session)
@@ -3186,7 +3173,7 @@ def _apply_update(session, msg, found, d16: bool) -> None:
                   else _largest_object_param(session, track.largest))
         ok = RequestOk(request_id=msg.request_id, parameters=params)
         session._send_reply(msg.request_id, ok)
-        _start_fill(track, d, msg, track.largest)
+        _start_fill(track, d, msg)
     _resume_paused(track)
     if d16:
         _forward_new_group(track, msg.parameters)
