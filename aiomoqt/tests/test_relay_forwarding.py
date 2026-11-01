@@ -1027,6 +1027,7 @@ async def test_relay_flags_reach_the_server(monkeypatch):
     transport = relay.transport_settings(relay.parse_args())
     assert transport == {"congestion_control_algorithm": "bbr",
                          "congestion_control_options": None,
+                         "packet_train_mode": False,
                          "max_connections": 4096,
                          "stream_ring_cap": 1 << 20,
                          "tx_max_inflight_bytes": 512 << 10}

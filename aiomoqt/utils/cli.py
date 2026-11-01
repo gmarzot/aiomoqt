@@ -38,8 +38,8 @@ logging           --log-level --log (long only; -d/--debug = --log-level
                   debug)
 interval          -i/--interval
 session           --draft -k/--insecure --keylogfile --cc-algo
-                  --cc-options --fc-window --max-queued-bytes
-                  --max-inflight-bytes --quic-debug
+                  --cc-options --pacing-trains --fc-window
+                  --max-queued-bytes --max-inflight-bytes --quic-debug
 keepalive         --keepalive
 fetch history     --fetch-history (long only)
 compat            --compat
@@ -311,6 +311,9 @@ def add_session(p):
     p.add_argument('--cc-options', type=str, default=None, metavar='OPTS',
                    help='Option string for the congestion controller, e.g. '
                         'Q0.02: bbr sends bursts of 20 ms of pacing rate')
+    p.add_argument('--pacing-trains', action='store_true', default=None,
+                   help='When pacing holds a connection back, send up to '
+                        '10 packets at once instead of one or two')
     p.add_argument('--fc-window', type=int, default=None, metavar='BYTES',
                    help='QUIC flow-control window, per stream and per '
                         'connection; the receiver buffers this much per '
@@ -329,13 +332,14 @@ def add_session(p):
 
 def transport_kwargs(args) -> dict:
     """MOQTClient / MOQTServer transport kwargs from the --cc-algo,
-    --cc-options, --fc-window, --max-queued-bytes, --max-inflight-bytes and
-    --keepalive flags. An
+    --cc-options, --pacing-trains, --fc-window, --max-queued-bytes,
+    --max-inflight-bytes and --keepalive flags. An
     unset flag is left out so the library default applies;
     --max-inflight-bytes 0 maps to None (disabled)."""
     kw = {}
     for attr, key in (('cc_algo', 'congestion_control_algorithm'),
                       ('cc_options', 'congestion_control_options'),
+                      ('pacing_trains', 'packet_train_mode'),
                       ('fc_window', 'flow_control_window'),
                       ('max_queued_bytes', 'tx_max_queued_bytes'),
                       ('keepalive', 'keep_alive_interval')):
@@ -359,6 +363,8 @@ def describe_transport(args) -> str:
     cc_options = getattr(args, 'cc_options', None)
     if cc_options:
         cc += f" {cc_options}"
+    if getattr(args, 'pacing_trains', None):
+        cc += " trains"
     return (f"cc={cc}  "
             f"queued={budget(getattr(args, 'max_queued_bytes', None), 'default')}  "
             f"inflight={budget(getattr(args, 'max_inflight_bytes', None), 'default')}  "

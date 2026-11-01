@@ -3341,6 +3341,7 @@ def transport_settings(args) -> dict:
     """MOQTServer transport settings from the relay's flags."""
     return {"congestion_control_algorithm": args.cc_algo,
             "congestion_control_options": args.cc_options,
+            "packet_train_mode": args.pacing_trains,
             "max_connections": args.max_connections,
             "stream_ring_cap": args.stream_ring_cap,
             "tx_max_inflight_bytes": args.max_inflight_bytes}
@@ -3468,6 +3469,9 @@ def parse_args(argv=None):
                         help="Option string for the congestion controller, "
                              "e.g. Q0.02: bbr sends bursts of 20 ms of "
                              "pacing rate")
+    parser.add_argument("--pacing-trains", action="store_true",
+                        help="When pacing holds a connection back, send up "
+                             "to 10 packets at once instead of one or two")
     parser.add_argument("--max-connections", type=int, default=4096,
                         help="Most connections held at once (aiopquic "
                              ">= 0.5.1). Default: 4096")

@@ -236,6 +236,7 @@ async def run(args):
         keylog_filename=args.keylogfile,
         congestion_control_algorithm=args.cc_algo,
         congestion_control_options=args.cc_options,
+        packet_train_mode=bool(args.pacing_trains),
         flow_control_window=args.fc_window,
         tx_max_queued_bytes=args.max_queued_bytes,
         **({'tx_max_inflight_bytes':
