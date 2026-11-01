@@ -23,13 +23,15 @@ import secrets
 import sys
 import time
 from dataclasses import dataclass, field, replace
+from typing import Optional
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.context import is_draft16_or_later, profile_for
-from aiomoqt.messages import SubgroupHeader
+from aiomoqt.messages import ObjectDatagram, RequestOk, SubgroupHeader
 from aiomoqt.messages.base import MOQTMessage
 from aiomoqt.protocol import _MOQTSessionMixin
-from aiomoqt.track import PublishedTrack, SubscribedTrack
+from aiomoqt.track import (PublishedTrack, SubscribedTrack,
+                           _largest_object_param)
 from aiomoqt.tools.moqtest_origin import parse_namespace as parse_moq_test
 from aiomoqt.types import (
     ParamType, FetchType, MOQTRequestError, MOQTMessageType,
@@ -213,6 +215,14 @@ STANDARD_TESTS = [
     "namespace-discovery",
     "publish-track-only",
     "publish-track-subscribe",
+    "moq-test-subgroup-per-group-eog",
+    "moq-test-subgroup-per-object",
+    "moq-test-two-subgroups-eog",
+    "moq-test-datagram",
+    "moq-test-datagram-eog",
+    "moq-test-extensions",
+    "moq-test-increments",
+    "moq-test-forward-zero",
 ]
 
 # Leading Track Namespace fields from --namespace-prefix.
@@ -377,7 +387,7 @@ def _session_meta(session) -> dict:
 
 def _make_client(host: str, port: int, path: str, use_quic: bool,
                  tls_disable_verify: bool, debug: bool,
-                 supported_drafts: int = None) -> MOQTClient:
+                 supported_drafts: Optional[int] = None) -> MOQTClient:
     """Create a configured MOQTClient."""
     return MOQTClient(
         host, port,
@@ -1716,6 +1726,643 @@ async def test_publish_track_subscribe(host, port, path, use_quic,
 
 
 # ---------------------------------------------------------------------------
+# moq-test-* scenarios (draft-afrind-moq-test)
+# ---------------------------------------------------------------------------
+# The eight cases moq-rs's moq-test-client runs, under the same names and
+# tuples, with its choreography: the subscriber SUBSCRIBEs first with
+# RENDEZVOUS_TIMEOUT, then the publisher PUBLISHes the same track, sends the
+# object set its 16-field tuple describes and ends it with PUBLISH_DONE. The
+# subscriber checks every object, marker and extension against that set,
+# then the PUBLISH_DONE status and Stream Count.
+
+_MOQ_TEST_PRIORITY = 128
+_MOQ_TEST_RENDEZVOUS_MS = 5000
+# The subscriber's head start, so its SUBSCRIBE reaches the relay first.
+_MOQ_TEST_HEAD_START_S = 0.2
+# Whole-case budget, as moq-rs's: twice the rendezvous window, so the
+# relay's TIMEOUT surfaces first, and eight cases stay well inside the
+# runner's 120 s per pair.
+_MOQ_TEST_CASE_S = 10.0
+_MOQ_TEST_VERDICT_S = 0.5
+# How long the publisher waits for a Forward State 0 to become 1.
+_MOQ_TEST_FORWARD_WAIT_S = 1.0
+# Datagrams and stray streams may trail PUBLISH_DONE.
+_MOQ_TEST_TRAILING_S = 0.25
+_MOQ_TEST_VAR_EXT_MAX = 20
+
+
+@dataclass(frozen=True)
+class MoqTestCase:
+    """A moq-test tuple plus FORWARD=0. The defaults are moq-rs's base
+    case: one subgroup per group, group 0 and object 0, unit increments,
+    2 ms pacing, 64- and 32-byte objects, no markers or extensions."""
+    fp: int = 0
+    start_group: int = 0
+    start_object: int = 0
+    last_group: int = 0
+    last_object: int = 0
+    objects_per_group: int = 1
+    size0: int = 64
+    size_rest: int = 32
+    freq_ms: int = 2
+    g_inc: int = 1
+    o_inc: int = 1
+    eog: bool = False
+    int_ext: int = -1
+    var_ext: int = -1
+    forward_zero: bool = False
+
+    def fields(self) -> tuple:
+        """The 16 Track Namespace fields."""
+        return ("moq-test-00", *(str(v) for v in (
+            self.fp, self.start_group, self.start_object, self.last_group,
+            self.last_object, self.objects_per_group, self.size0,
+            self.size_rest, self.freq_ms, self.g_inc, self.o_inc,
+            int(self.eog), self.int_ext, self.var_ext, 0)))
+
+    def groups(self) -> range:
+        return range(self.start_group, self.last_group + 1, self.g_inc)
+
+    def objects(self) -> range:
+        """Object IDs per group, the End of Group slot included."""
+        return range(self.start_object, self.last_object + 1, self.o_inc)
+
+    def is_marker(self, object_id: int) -> bool:
+        return self.eog and object_id == self.last_object
+
+    def size(self, object_id: int) -> int:
+        return self.size0 if object_id == self.start_object else self.size_rest
+
+    def subgroup(self, object_id: int):
+        """The Subgroup ID an object travels on; None for datagrams."""
+        if self.fp == 0:
+            return 0
+        if self.fp == 1:
+            return object_id
+        if self.fp == 2:
+            return (object_id - self.start_object) % 2
+        return None
+
+    def extension_ids(self) -> frozenset:
+        ids = set()
+        if self.int_ext >= 0:
+            ids.add(2 * self.int_ext)
+        if self.var_ext >= 0:
+            ids.add(2 * self.var_ext + 1)
+        return frozenset(ids)
+
+    def expected_data(self) -> set:
+        return {(g, o) for g in self.groups() for o in self.objects()
+                if not self.is_marker(o)}
+
+    def expected_markers(self) -> set:
+        return ({(g, self.last_object) for g in self.groups()}
+                if self.eog else set())
+
+    def stream_count(self) -> int:
+        """PUBLISH_DONE Stream Count: the data streams the publisher opens."""
+        if self.forward_zero:
+            return 0
+        groups = len(self.groups())
+        return {0: groups, 1: groups * len(self.objects()),
+                2: 2 * groups}.get(self.fp, 0)
+
+
+MOQ_TEST_CASES = {
+    "moq-test-subgroup-per-group-eog": MoqTestCase(
+        last_group=2, last_object=5, objects_per_group=5, eog=True),
+    "moq-test-subgroup-per-object": MoqTestCase(
+        fp=1, last_group=1, last_object=3, objects_per_group=4),
+    "moq-test-two-subgroups-eog": MoqTestCase(
+        fp=2, last_group=2, last_object=6, objects_per_group=6, eog=True),
+    # 20 ms pacing: a datagram that outruns a hop is lost, not queued.
+    "moq-test-datagram": MoqTestCase(
+        fp=3, last_group=2, last_object=4, objects_per_group=5, freq_ms=20),
+    "moq-test-datagram-eog": MoqTestCase(
+        fp=3, last_group=2, last_object=5, objects_per_group=5, freq_ms=20,
+        eog=True),
+    "moq-test-extensions": MoqTestCase(
+        last_group=2, last_object=5, objects_per_group=5, eog=True,
+        int_ext=1, var_ext=2),
+    "moq-test-increments": MoqTestCase(
+        start_group=10, start_object=3, last_group=24, last_object=7,
+        objects_per_group=3, size0=40, size_rest=24, g_inc=7, o_inc=2),
+    "moq-test-forward-zero": MoqTestCase(
+        last_group=1, last_object=2, objects_per_group=3, forward_zero=True),
+}
+
+
+def _moq_test_extensions(case: MoqTestCase):
+    """Object extensions per tuple fields 13 and 14: random values, so the
+    subscriber checks the IDs and their count."""
+    ext = {}
+    if case.int_ext >= 0:
+        ext[2 * case.int_ext] = secrets.randbits(32)
+    if case.var_ext >= 0:
+        ext[2 * case.var_ext + 1] = os.urandom(
+            1 + secrets.randbelow(_MOQ_TEST_VAR_EXT_MAX))
+    return ext or None
+
+
+class _MoqTestPublisher:
+    """Publisher role: PUBLISHes one track and follows the Forward State
+    the relay signals in its reply or in later updates. Bound to the
+    request with _bind_request, so PUBLISH_OK and updates reach it."""
+
+    def __init__(self, case: MoqTestCase):
+        self.case = case
+        self.request_id = 0          # set by publish()
+        self.alias = 0
+        self.forward = 1            # what our PUBLISH carried
+        self.forward_changed = asyncio.Event()
+        self.replied = asyncio.Event()
+        # An update follows the reply on the request stream, but its handler
+        # can run before the reply's future resolves: it is the newer state.
+        self.updated = False
+        # The relay ended the request (STOP_SENDING, reset or UNSUBSCRIBE).
+        self.cancelled = False
+        self.largest = None
+        self.streams = 0
+        self.done_sent = False
+
+    def publish(self, session, namespace: tuple, track_name: str) -> None:
+        msg = session.publish(namespace=namespace, track_name=track_name,
+                              forward=1)
+        self.request_id, self.alias = msg.request_id, msg.track_alias
+        session._bind_request(msg.request_id, self, None, alias=msg.track_alias)
+        session.register_request_cancel_handler(
+            msg.request_id, lambda _rid: setattr(self, "cancelled", True))
+
+    def set_forward(self, forward) -> None:
+        if forward is None:
+            return
+        self.forward = int(forward)
+        self.forward_changed.set()
+
+    def take_reply(self, reply) -> None:
+        """The relay's REQUEST_OK or PUBLISH_OK. An omitted FORWARD means
+        1; from d20 the reply carries none and the PUBLISH's value stands
+        until a REQUEST_UPDATE changes it."""
+        forward = getattr(reply, "forward", None)
+        if forward is None:
+            forward = (getattr(reply, "parameters", None) or {}).get(
+                ParamType.FORWARD)
+        if not self.updated:
+            self.set_forward(forward)
+        self.replied.set()
+
+    # d14/d16 route PUBLISH_OK here rather than to the request's future.
+    async def _on_publish_ok(self, session, msg):
+        self.take_reply(msg)
+
+    async def _on_request_update(self, session, msg):
+        params = ({} if self.largest is None
+                  else _largest_object_param(session, self.largest))
+        session._send_reply(msg.request_id,
+                            RequestOk(request_id=msg.request_id,
+                                      parameters=params))
+        forward = (msg.parameters or {}).get(ParamType.FORWARD)
+        if forward is not None:
+            self.updated = True
+        self.set_forward(forward)
+
+    async def _on_subscribe_update(self, session, msg):
+        forward = getattr(msg, "forward", None)
+        if forward is not None:
+            self.updated = True
+        self.set_forward(forward)
+
+    async def await_forward(self, timeout: float) -> None:
+        """Until the Forward State is 1 or `timeout` passes."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while not self.forward and not self.cancelled:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return
+            self.forward_changed.clear()
+            try:
+                async with asyncio.timeout(remaining):
+                    await self.forward_changed.wait()
+            except TimeoutError:
+                return
+
+    async def _pace(self) -> None:
+        await asyncio.sleep(self.case.freq_ms / 1000 if self.case.freq_ms
+                            else 0)
+
+    async def _write(self, session, sid, hdr, object_id) -> None:
+        case = self.case
+        if case.is_marker(object_id):
+            buf = hdr.end_group(object_id=object_id)
+            await session.stream_write_drain(sid, buf.data)
+        else:
+            data = hdr.next_object_bytes(
+                payload=b"t" * case.size(object_id),
+                extensions=_moq_test_extensions(case), object_id=object_id)
+            await session.stream_write_drain(sid, data)
+        self.largest = (hdr.group_id, object_id)
+
+    async def _open(self, session, group_id, subgroup_id):
+        sid = await session.open_uni_stream()
+        self.streams += 1
+        hdr = session.subgroup_header(
+            track_alias=self.alias, group_id=group_id,
+            subgroup_id=subgroup_id, publisher_priority=_MOQ_TEST_PRIORITY,
+            extensions_present=bool(self.case.extension_ids()))
+        await session.stream_write_drain(sid, hdr.serialize().data)
+        return sid, hdr
+
+    async def send(self, session) -> None:
+        """The tuple's object set, then PUBLISH_DONE TRACK_ENDED with the
+        number of streams opened. Nothing is sent at Forward State 0."""
+        case = self.case
+        if self.forward and not self.cancelled:
+            if case.fp == 0:
+                for g in case.groups():
+                    sid, hdr = await self._open(session, g, 0)
+                    for o in case.objects():
+                        await self._write(session, sid, hdr, o)
+                        await self._pace()
+                    session.stream_fin(sid)
+            elif case.fp == 1:
+                for g in case.groups():
+                    for o in case.objects():
+                        sid, hdr = await self._open(session, g, o)
+                        await self._write(session, sid, hdr, o)
+                        session.stream_fin(sid)
+                        await self._pace()
+            elif case.fp == 2:
+                for g in case.groups():
+                    pair = [await self._open(session, g, sg) for sg in (0, 1)]
+                    for o in case.objects():
+                        sid, hdr = pair[case.subgroup(o)]
+                        await self._write(session, sid, hdr, o)
+                        await self._pace()
+                    for sid, _ in pair:
+                        session.stream_fin(sid)
+            else:
+                for g in case.groups():
+                    for o in case.objects():
+                        if case.is_marker(o):
+                            obj = ObjectDatagram(
+                                track_alias=self.alias, group_id=g,
+                                object_id=o,
+                                publisher_priority=_MOQ_TEST_PRIORITY,
+                                status=ObjectStatus.END_OF_GROUP, payload=b"")
+                        else:
+                            obj = ObjectDatagram(
+                                track_alias=self.alias, group_id=g,
+                                object_id=o,
+                                publisher_priority=_MOQ_TEST_PRIORITY,
+                                extensions=_moq_test_extensions(case),
+                                payload=b"t" * case.size(o))
+                        await session.dgram_write_drain(
+                            obj.serialize(prof=session._profile))
+                        self.largest = (g, o)
+                        await self._pace()
+        if not self.cancelled:
+            session.subscribe_done(
+                request_id=self.request_id,
+                status_code=SubscribeDoneCode.TRACK_ENDED,
+                stream_count=self.streams, reason="track ended")
+            self.done_sent = True
+
+
+class _MoqTestScoreboard:
+    """Subscriber role: the object set the tuple implies, checked off as
+    objects arrive. Per-stream order is checked; order across streams and
+    groups is not, since the relay may interleave them."""
+
+    _MAX_PROBLEMS = 50
+
+    def __init__(self, case: MoqTestCase):
+        self.case = case
+        self.data_expected = case.expected_data()
+        self.markers_expected = case.expected_markers()
+        self.data = set()
+        self.markers = set()
+        self.last_on_stream = {}
+        self.problems = []
+        self.streams_ended = 0
+        self.streams_reset = 0
+        self.done = None
+        self.objects = 0
+        self._changed = asyncio.Event()
+
+    def _fail(self, problem: str) -> None:
+        if len(self.problems) < self._MAX_PROBLEMS:
+            self.problems.append(problem)
+
+    def on_object(self, msg, size, ts, group_id, subgroup_id):
+        case = self.case
+        self.objects += 1
+        gid = group_id if group_id is not None else msg.group_id
+        oid = msg.object_id
+        loc = f"({gid}, {oid})"
+        if self.case.forward_zero:
+            return
+        prio = getattr(msg, "publisher_priority", None)
+        if prio != _MOQ_TEST_PRIORITY:
+            self._fail(f"object {loc} priority {prio}, expected "
+                       f"{_MOQ_TEST_PRIORITY}")
+        if subgroup_id is None and getattr(msg, "end_of_group", False):
+            self._fail(f"datagram {loc} has the end-of-group type bit")
+        status = getattr(msg, "status", None)
+        if not _is_normal(status):
+            if status != ObjectStatus.END_OF_GROUP:
+                self._fail(f"status {status} at {loc}, expected END_OF_GROUP")
+            elif (gid, oid) not in self.markers_expected:
+                self._fail(f"unexpected End of Group marker at {loc}")
+            elif (gid, oid) in self.markers:
+                self._fail(f"duplicate End of Group marker at {loc}")
+            else:
+                self.markers.add((gid, oid))
+                self._check_stream(gid, oid, subgroup_id)
+            return
+        if (gid, oid) in self.markers_expected:
+            self._fail(f"data object at {loc} where End of Group was expected")
+            return
+        if (gid, oid) not in self.data_expected:
+            self._fail(f"unexpected object {loc}")
+            return
+        if (gid, oid) in self.data:
+            self._fail(f"duplicate object {loc}")
+            return
+        self.data.add((gid, oid))
+        payload = bytes(msg.payload or b"")
+        size = case.size(oid)
+        if len(payload) != size:
+            self._fail(f"object {loc} payload {len(payload)} bytes, "
+                       f"expected {size}")
+        elif payload != b"t" * size:
+            self._fail(f"object {loc} payload bytes are not all 0x74")
+        ids = set((getattr(msg, "extensions", None) or {}).keys())
+        if ids != case.extension_ids():
+            self._fail(f"object {loc} extensions {sorted(ids)}, expected "
+                       f"{sorted(case.extension_ids())}")
+        self._check_stream(gid, oid, subgroup_id)
+
+    def _check_stream(self, gid, oid, subgroup_id) -> None:
+        expected = self.case.subgroup(oid)
+        if subgroup_id is None:
+            if expected is not None:
+                self._fail(f"object ({gid}, {oid}) arrived as a datagram, "
+                           f"expected subgroup {expected}")
+            return
+        if expected is None:
+            self._fail(f"object ({gid}, {oid}) arrived on subgroup "
+                       f"{subgroup_id}, expected a datagram")
+            return
+        if subgroup_id != expected:
+            self._fail(f"object ({gid}, {oid}) on subgroup {subgroup_id}, "
+                       f"expected {expected}")
+        last = self.last_on_stream.get((gid, subgroup_id))
+        if last is not None and oid <= last:
+            self._fail(f"object ({gid}, {oid}) after {last} on subgroup "
+                       f"{subgroup_id}")
+        self.last_on_stream[(gid, subgroup_id)] = oid
+
+    def on_stream_end(self, group_id, subgroup_id, clean=True, reset_code=0):
+        self.streams_ended += 1
+        if not clean:
+            self.streams_reset += 1
+        self._changed.set()
+
+    def on_done(self, msg):
+        self.done = msg
+        self._changed.set()
+
+    def _drained(self) -> bool:
+        if self.done is None:
+            return False
+        count = self.done.stream_count
+        return (count != _UNKNOWN_STREAM_COUNT
+                and self.streams_ended >= (count or 0))
+
+    async def drain(self, deadline: float) -> None:
+        """Until PUBLISH_DONE and its Stream Count of stream ends, then a
+        short wait for trailing datagrams or stray streams."""
+        loop = asyncio.get_running_loop()
+        while not self._drained():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return
+            self._changed.clear()
+            try:
+                async with asyncio.timeout(remaining):
+                    await self._changed.wait()
+            except TimeoutError:
+                return
+        await asyncio.sleep(_MOQ_TEST_TRAILING_S)
+
+    def verdict(self) -> list:
+        """Every problem: object problems in arrival order, then what is
+        missing, then the PUBLISH_DONE."""
+        case = self.case
+        problems = list(self.problems)
+        if case.forward_zero:
+            if self.objects:
+                problems.append(f"FORWARD=0, but {self.objects} objects "
+                                f"were forwarded")
+        else:
+            missing = sorted(self.data_expected - self.data)
+            if missing:
+                first = ", ".join(f"({g}, {o})" for g, o in missing[:5])
+                problems.append(f"missing {len(missing)} objects "
+                                f"(first 5): {first}")
+            for g, o in sorted(self.markers_expected - self.markers):
+                problems.append(f"missing End of Group marker at ({g}, {o})")
+        done = self.done
+        if done is None:
+            problems.append("no PUBLISH_DONE")
+            return problems
+        if done.status_code != SubscribeDoneCode.TRACK_ENDED:
+            problems.append(f"PUBLISH_DONE status {done.status_code}, "
+                            f"expected TRACK_ENDED")
+        if done.stream_count != case.stream_count():
+            count = ("unknown" if done.stream_count == _UNKNOWN_STREAM_COUNT
+                     else done.stream_count)
+            problems.append(f"PUBLISH_DONE Stream Count {count}, "
+                            f"expected {case.stream_count()}")
+        elif self.streams_ended < case.stream_count():
+            problems.append(f"{self.streams_ended} of {case.stream_count()} "
+                            f"streams ended")
+        return problems
+
+    def summary(self) -> str:
+        case = self.case
+        data = (0 if case.forward_zero else len(self.data_expected))
+        marks = (0 if case.forward_zero else len(self.markers_expected))
+        done = self.done
+        done_s = ("none" if done is None else
+                  f"status={done.status_code} stream_count="
+                  f"{done.stream_count}")
+        text = (f"objects {len(self.data)}/{data}, eog {len(self.markers)}/"
+                f"{marks}, streams {self.streams_ended}, "
+                f"publish_done {done_s}")
+        if self.streams_reset:
+            text += f"; {self.streams_reset} stream(s) reset"
+        return text
+
+
+async def run_moq_test_case(name: str, host, port, path, use_quic,
+                            tls_disable_verify, debug, supported_drafts=None,
+                            compat=frozenset(),
+                            case: Optional[MoqTestCase] = None) -> TestResult:
+    """One moq-test scenario through the relay: subscribe first, then
+    PUBLISH, generate and verify."""
+    case = case or MOQ_TEST_CASES[name]
+    t0 = time.monotonic()
+    sessions = {}
+    namespace = (*_NS_PREFIX, *case.fields())
+    track_name = f"moq-test-{secrets.token_hex(8)}"
+    board = _MoqTestScoreboard(case)
+    pub = _MoqTestPublisher(case)
+    reply = None
+    sub_client = _make_client(host, port, path, use_quic, tls_disable_verify,
+                              debug, supported_drafts=supported_drafts)
+    pub_client = _make_client(host, port, path, use_quic, tls_disable_verify,
+                              debug, supported_drafts=supported_drafts)
+
+    def result(passed: bool, message: str, **kw) -> TestResult:
+        return TestResult(name=name, passed=passed,
+                          duration_ms=(time.monotonic() - t0) * 1000,
+                          sessions=sessions, message=message, **kw)
+
+    def refusal(fut):
+        """The relay's refusal of our PUBLISH, if that is what `fut` holds."""
+        if not fut.done() or fut.cancelled() or fut.exception() is not None:
+            return None
+        msg = fut.result()
+        return msg if _MOQTSessionMixin._is_error_response(msg) else None
+
+    def on_reply(fut):
+        if (not fut.cancelled() and fut.exception() is None
+                and refusal(fut) is None):
+            pub.take_reply(fut.result())
+
+    async def subscribe(sub_session):
+        track = SubscribedTrack(sub_session, "/".join(namespace), track_name,
+                                on_object=board.on_object,
+                                on_done=board.on_done)
+        await track.subscribe(
+            timeout=_MOQ_TEST_CASE_S,
+            forward=0 if case.forward_zero else None,
+            filter_type=None,
+            parameters={_RENDEZVOUS_TIMEOUT: _MOQ_TEST_RENDEZVOUS_MS})
+        sub_session.register_stream_end_handler(track.track_alias,
+                                                board.on_stream_end)
+
+    step = "subscriber SETUP"
+    # Delivery stops short of the budget, leaving time for a verdict.
+    deadline = (asyncio.get_running_loop().time() + _MOQ_TEST_CASE_S
+                - _MOQ_TEST_VERDICT_S)
+    try:
+        async with asyncio.timeout(_MOQ_TEST_CASE_S):
+            async with sub_client.connect() as sub_session:
+                await sub_session.client_session_init()
+                sessions["subscriber"] = _session_meta(sub_session)
+                draft = sub_session.negotiated_draft
+                if draft < 18:
+                    sub_session.close()
+                    return result(True, "", skipped=True,
+                                  skip_reason=f"RENDEZVOUS_TIMEOUT is "
+                                              f"draft-18; negotiated "
+                                              f"draft-{draft}")
+                step = "SUBSCRIBE"
+                sub_task = asyncio.ensure_future(subscribe(sub_session))
+                try:
+                    await asyncio.sleep(_MOQ_TEST_HEAD_START_S)
+
+                    step = "publisher SETUP"
+                    async with pub_client.connect() as pub_session:
+                        await pub_session.client_session_init()
+                        sessions["publisher"] = _session_meta(pub_session)
+                        if (case.fp == 3
+                                and not pub_session.datagram_max_payload()):
+                            return result(False, "publisher session "
+                                                 "negotiated no QUIC "
+                                                 "datagrams")
+
+                        step = "PUBLISH"
+                        pub.publish(pub_session, namespace, track_name)
+                        reply = _publish_reply(pub_session, pub.request_id)
+                        reply.add_done_callback(on_reply)
+                        replied = asyncio.ensure_future(pub.replied.wait())
+                        try:
+                            await asyncio.wait(
+                                {reply, sub_task, replied},
+                                return_when=asyncio.FIRST_COMPLETED)
+                        finally:
+                            replied.cancel()
+                        refused = refusal(reply)
+                        if refused is not None:
+                            return _skip_unsupported_publish(result(
+                                False, f"PUBLISH refused: code="
+                                       f"{refused.error_code:#x} "
+                                       f"{getattr(refused, 'reason', '')}"),
+                                reply)
+                        error = (reply.exception() if reply.done()
+                                 and not reply.cancelled() else None)
+                        if error is not None:
+                            raise error
+                        error = (sub_task.exception() if sub_task.done()
+                                 else None)
+                        if error is not None:
+                            step = "SUBSCRIBE"
+                            raise error
+                        await pub.replied.wait()
+
+                        step = "SUBSCRIBE_OK"
+                        await sub_task
+                        if not case.forward_zero:
+                            await pub.await_forward(_MOQ_TEST_FORWARD_WAIT_S)
+
+                        step = "object delivery"
+                        await pub.send(pub_session)
+                        await board.drain(deadline)
+                        pub_session.close()
+                finally:
+                    # A SUBSCRIBE the relay still holds must not keep the
+                    # session open for the rest of its rendezvous window.
+                    if not sub_task.done():
+                        sub_task.cancel()
+                sub_session.close()
+    except TimeoutError:
+        return _skip_unsupported_publish(
+            result(False, f"timed out waiting for {step}"), reply)
+    except MOQTRequestError as e:
+        return _skip_unsupported_publish(
+            result(False, f"{step} refused: code={e.error_code:#x} "
+                          f"{e.reason}"), reply)
+    except Exception as e:
+        return _skip_unsupported_publish(
+            result(False, f"{step} failed: {_format_exc(e)}"), reply)
+
+    problems = board.verdict()
+    if not pub.done_sent:
+        problems.insert(0, "relay cancelled the PUBLISH before PUBLISH_DONE")
+    elif not pub.forward and not case.forward_zero:
+        problems.insert(0, "relay left the PUBLISH at Forward State 0")
+    summary = board.summary()
+    if problems:
+        return result(False, f"{problems[0]} ({len(problems)} problem(s)); "
+                             f"{summary}")
+    return result(True, summary)
+
+
+def _moq_test_function(name: str):
+    async def run(host, port, path, use_quic, tls_disable_verify, debug,
+                  supported_drafts=None, compat=frozenset()) -> TestResult:
+        return await run_moq_test_case(
+            name, host, port, path, use_quic, tls_disable_verify, debug,
+            supported_drafts=supported_drafts, compat=compat)
+    run.__name__ = "test_" + name.replace("-", "_")
+    return run
+
+
+# ---------------------------------------------------------------------------
 # Test dispatch
 # ---------------------------------------------------------------------------
 
@@ -1734,6 +2381,7 @@ TEST_FUNCTIONS = {
     "subscribe-namespace-lifecycle": test_subscribe_namespace_lifecycle,
     "publish-track-only": test_publish_track_only,
     "publish-track-subscribe": test_publish_track_subscribe,
+    **{name: _moq_test_function(name) for name in MOQ_TEST_CASES},
 }
 
 

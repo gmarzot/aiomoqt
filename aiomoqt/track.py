@@ -2243,9 +2243,9 @@ class SubscribedTrack(Track):
         self._done_event.set()
 
     async def subscribe(self, timeout: float = 30.0,
-                        forward: int = 1,
+                        forward: Optional[int] = 1,
                         subscribe_options: int = None,
-                        filter_type: FilterType = FilterType.LATEST_OBJECT,
+                        filter_type: Optional[FilterType] = FilterType.LATEST_OBJECT,
                         start_group: int = 0,
                         start_object: int = 0,
                         end_group: int = 0,
