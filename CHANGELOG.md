@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.15.0 (unreleased)
+
+- `--pacing-trains` (session grid, aiomoqt-relay, loopback_bench; relay.toml `pacing-trains`) and `packet_train_mode=` on `MOQTClient` / `MOQTServer`: when pacing holds a connection back, picoquic sends up to 10 packets at once instead of one or two. Off by default; needs aiopquic with `QuicConfiguration.packet_train_mode`.
+
 ## v0.14.0
 
 - A REQUEST_UPDATE that arrives in the same read as its SUBSCRIBE reaches the PublishedTrack instead of being refused as not supported.

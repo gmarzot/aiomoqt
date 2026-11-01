@@ -17,6 +17,7 @@ import argparse
 import asyncio
 import signal
 import sys
+from typing import Any
 
 from aiomoqt.server import MOQTServer
 from aiomoqt.types import (D18MessageType, MOQT_DEFAULT_DRAFTS, MOQTMessageType,
@@ -226,7 +227,7 @@ async def main():
         _tx_max = None  # explicit opt-out
     else:
         _tx_max = args.max_inflight_bytes
-    _server_kwargs = dict(
+    _server_kwargs: dict[str, Any] = dict(
         host=args.host, port=args.port,
         certificate=args.cert, private_key=args.key,
         path="/",
