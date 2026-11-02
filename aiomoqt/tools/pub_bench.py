@@ -5,6 +5,7 @@
   moq-pub-bench https://relay.example.com/moq -s 4096 -P 4 -r 120 -t 60
   moq-pub-bench moqt://relay:4433 -D -s 1100 -r 500      # datagrams
   moq-pub-bench moqt://relay:4433 --video 1080p          # media profile
+  moq-pub-bench moqt://relay:4433 --video 720p -r 30 -g 60 --audio --catalog
 """
 import argparse
 import asyncio
@@ -47,6 +48,12 @@ PRIOR_OBJECT_ID_GAP = 0x3E
 
 # --fetch-history a --prefill track gets when none is given.
 _PREFILL_HISTORY = 1 << 20
+
+# --audio: AAC at 128 kbps, 1024-sample frames at 48 kHz.
+AUDIO_RATE = 48000 / 1024
+AUDIO_OBJECT_SIZE = 341
+CATALOG_RATE = 1.0
+CATALOG_OBJECT_SIZE = 512
 
 
 class _GapTrack(PublishedTrack):
@@ -139,6 +146,17 @@ The URL scheme selects the transport:
     parser.add_argument('--second-track', action='store_true',
                         help='Also PUBLISH <trackname>-2, whose objects '
                              'differ, with the --forward state')
+    parser.add_argument('--audio', action='store_true',
+                        help="With --video: also publish 'audio', "
+                             f"{AUDIO_OBJECT_SIZE} B objects at "
+                             f"{AUDIO_RATE:g}/s (AAC, 128 kbps), one "
+                             "object per group")
+    parser.add_argument('--catalog', action='store_true',
+                        help="With --video: also publish 'catalog', "
+                             f"{CATALOG_OBJECT_SIZE} B objects at "
+                             f"{CATALOG_RATE:g}/s, one object per group. "
+                             "With --audio or --catalog, -T defaults to "
+                             "'video'")
     parser.add_argument('--goaway-after', type=float, default=None,
                         metavar='SECONDS',
                         help='Send GOAWAY this long after publishing; '
@@ -169,6 +187,14 @@ The URL scheme selects the transport:
     args = parser.parse_args()
     _cli.check_video(parser, args)
     _cli.check_datagram(parser, args)
+    side = [n for n in ('audio', 'catalog') if getattr(args, n)]
+    for name in side:
+        if not args.video:
+            parser.error(f'--{name} needs --video')
+    if side and args.trackname is None:
+        args.trackname = 'video'
+    if args.trackname in side:
+        parser.error(f"-T {args.trackname} clashes with --{args.trackname}")
     if args.prefill and not args.fetch_history:
         args.fetch_history = _PREFILL_HISTORY
     if args.trackname is None:
@@ -180,6 +206,41 @@ The URL scheme selects the transport:
         mode = "dgram" if args.datagram else f"x{args.streams}"
         args.trackname = f"{sz_s}-{rate_s}-{mode}-{uuid.uuid4().hex[:4]}"
     return args
+
+
+class _SideTrack(PublishedTrack):
+    """A --catalog or --audio track: no stats table of its own."""
+    _quiet = True
+
+
+def _side_tracks(session, args):
+    """The --catalog and --audio tracks: one object per group, so each
+    object opens a subgroup stream."""
+    shapes = ([('catalog', CATALOG_OBJECT_SIZE, CATALOG_RATE)]
+              if args.catalog else [])
+    if args.audio:
+        shapes.append(('audio', AUDIO_OBJECT_SIZE, AUDIO_RATE))
+    tracks = []
+    for name, size, rate in shapes:
+        t = _SideTrack(
+            session,
+            namespace=args.namespace,
+            trackname=name,
+            object_size=size,
+            group_size=1,
+            rate=rate,
+            auth_token=args.auth_token.encode() or None,
+            timestamps=args.timestamps,
+        )
+        tracks.append(t)
+    return tracks
+
+
+def print_track_totals(tracks):
+    """One sent-totals line per track."""
+    for t in tracks:
+        print(f"  {t.trackname + ':':<10} {t._total_sent:,} objects, "
+              f"{t._total_groups:,} groups, {t._total_bytes:,} bytes")
 
 
 def print_banner(relay, args):
@@ -209,6 +270,9 @@ def print_banner(relay, args):
     print(f"  group size:  {args.group_size} objects")
     print(f"  rate:        {rate_s}")
     print(f"  target:      {target_s}")
+    side = [n for n in ('catalog', 'audio') if getattr(args, n, False)]
+    if side:
+        print(f"  with:        {', '.join(side)}")
     print(f"  duration:    {args.duration}s")
     print(f"  cpu:         {cpu_summary()}")
     print("─" * 56)
@@ -253,6 +317,7 @@ async def run(args):
 
     print("  Connecting...")
     failed = False
+    side = []
     async with contextlib.AsyncExitStack() as stack:
         try:
             async with asyncio.timeout(args.duration or None):
@@ -317,6 +382,13 @@ async def run(args):
                 forward=args.forward,
             )
             print(f"  Published '{track.fqtn}', waiting for subscriber...")
+            side = _side_tracks(session, args)
+            for t in side:
+                if args.pub_ns and not args.pub_both:
+                    t.attach()
+                else:
+                    await t.publish(forward=args.forward)
+                print(f"  Published '{t.fqtn}'")
             if args.second_track:
                 second = PublishedTrack(
                     session,
@@ -334,7 +406,8 @@ async def run(args):
             if args.goaway_after is not None:
                 loop.call_later(args.goaway_after, session.goaway)
             if args.end_after is not None:
-                loop.call_later(args.end_after, track.end)
+                for t in (track, *side):
+                    loop.call_later(args.end_after, t.end)
             if args.withdraw_after is not None:
                 loop.call_later(args.withdraw_after, functools.partial(
                     session.publish_namespace_done, namespace=args.namespace))
@@ -349,6 +422,8 @@ async def run(args):
             print(f"  Error: {e}")
             failed = True
 
+    if side:
+        print_track_totals([track, *side])
     print("  Done.")
     return 1 if failed else 0
 
