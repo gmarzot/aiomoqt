@@ -5,6 +5,7 @@ keeping the media timeline across a relay restart. Audio and video on one
 session, over raw QUIC and WebTransport, through the interop relay."""
 import asyncio
 import csv
+import itertools
 import os
 import signal
 import subprocess
@@ -15,6 +16,7 @@ import pytest
 
 from aiomoqt.media.broadcast import CatalogTrackPublisher
 from aiomoqt.media.catalog import Catalog
+from aiomoqt.media.sources import pcm_tone_frames
 from aiomoqt.fanout import _FanoutCatalog
 from aiomoqt.protocol import _MOQTSessionMixin
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
@@ -274,6 +276,13 @@ async def test_the_duration_end_sends_end_of_track(
     sub_args = _argv(monkeypatch, 'sub_media', url, '-k', '--draft', '22',
                      '-N', ns, '--analyze', '-t', '6', '-i', '1')
     ended = _relay_end_of_track(monkeypatch)
+    withdrawals = []
+    withdraw_orig = relay._withdraw_namespace
+
+    def withdraw(session, request_id=None, ns=None):
+        withdrawals.append(session._close_err is None)
+        return withdraw_orig(session, request_id=request_id, ns=ns)
+    monkeypatch.setattr(relay, '_withdraw_namespace', withdraw)
     srv, handle = await _serve(port, use_quic, 22)
     try:
         pub = asyncio.ensure_future(pub_media.run(pub_args))
@@ -285,6 +294,52 @@ async def test_the_duration_end_sends_end_of_track(
         await _stop(srv, handle)
     assert {n for n, *_ in arrivals} >= {'video', 'audio'}
     assert ended == {'video', 'audio', 'catalog'}, ended
+    # PUBLISH_NAMESPACE_DONE arrives while the session is still open.
+    assert withdrawals[:1] == [True], withdrawals
+
+
+@requires_certs
+async def test_duration_zero_runs_until_stopped(
+        monkeypatch, h264_aac, arrivals):  # noqa: F811
+    port = _BASE_PORT + 32
+    url = _url(port, True)
+    ns = 'svc/forever'
+    pub_args = _argv(monkeypatch, 'pub_media', url, '-k', '--draft', '22',
+                     '-t', '0', '--stats', '0', '--pub-ns', '-N', ns,
+                     '--mp4', h264_aac, '--loop')
+    sub_args = _argv(monkeypatch, 'sub_media', url, '-k', '--draft', '22',
+                     '-N', ns, '--analyze', '-t', '8', '-i', '1')
+    srv, handle = await _serve(port, True, 22)
+    try:
+        pub = asyncio.ensure_future(pub_media.run(pub_args))
+        await _until(lambda: relay._announced or pub.done(), 10)
+        sub = asyncio.ensure_future(sub_media.run(sub_args))
+        # Past one pass of the 3 s clip, objects still arrive.
+        await asyncio.sleep(4.0)
+        seen = len(arrivals)
+        await asyncio.sleep(1.0)
+        assert not pub.done()
+        assert len(arrivals) > seen
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.wait_for(pub, 5)
+        sub.cancel()
+    finally:
+        await _stop(srv, handle)
+
+
+def test_negative_duration_is_refused(monkeypatch, capsys):
+    monkeypatch.setattr(sys, 'argv',
+                        ['pub_media', 'moqt://localhost:1/', '-t', '-1'])
+    with pytest.raises(SystemExit) as e:
+        pub_media.parse_args()
+    assert e.value.code == 2
+    assert '-t/--duration' in capsys.readouterr().err
+
+
+def test_tone_runs_endlessly_without_a_duration():
+    frames = list(itertools.islice(pcm_tone_frames(None, frame_ms=20), 400))
+    assert len(frames) == 400
+    assert frames[-1][1] == 399 * 20_000
 
 
 class _Wire:
