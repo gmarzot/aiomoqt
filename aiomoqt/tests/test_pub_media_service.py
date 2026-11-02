@@ -402,7 +402,8 @@ async def test_reconnect_resumes_the_timeline_after_a_relay_restart(
             assert 0 <= float(row['lat_p50_ms']) < 1000, row
     events = _pub_events(capsys.readouterr().out)
     kinds = [e['event'] for e in events if e['event'] != 'stats']
-    assert kinds == ['ready', 'endpoint_lost', 'endpoint_up', 'done'], kinds
+    assert kinds == ['ready', 'anchor', 'endpoint_lost', 'endpoint_up',
+                     'done'], kinds
     up = next(e for e in events if e['event'] == 'endpoint_up')
     assert up == {'event': 'endpoint_up', 'url': url, 'draft': 18}
     assert events[-1]['reason'] == 'duration'

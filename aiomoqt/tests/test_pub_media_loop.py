@@ -100,17 +100,21 @@ async def _feed(path, passes, mapping=False):
     """Loop a clip `passes` times as pub_media does: (video, audio)
     recorders and their _Mp4Pass."""
     reader = Mp4Reader(path)
-    mp4s = pub_media._mp4_passes(reader, reader.audio, True)
-    _, wall0 = pub_media._media_clock([p.timescale for p in mp4s], True)
+    mp4s = pub_media._mp4_passes(reader, reader.audio, True, mapping)
+    timings = [pub_media._frindell_for(p) for p in mp4s]
+    _, wall0 = pub_media._media_clock(
+        pub_media._grid(*timings) if mapping else None)
     period = mp4s[0].period
     args = NS(duration=float(passes * period) - 0.001, no_pace=True,
-              loop=True)
+              loop=True, timestamp_mapping=mapping)
     recs = []
-    for mp4, frames in zip(mp4s, (None, 1)):
-        rec = _Rec(pub_media._frindell_for(mp4, wall0) if mapping else None)
+    for mp4, m, frames in zip(mp4s, timings, (None, 1)):
+        off = (pub_media._audio_delay(wall0, mp4.times[0], m)
+               if mapping and frames else Fraction(0))
+        rec = _Rec(m if mapping else None)
         await pub_media._feed_mp4_track(
             rec, mp4, args, pub_media._TrackStats(), group_frames=frames,
-            clock=(0, wall0))
+            clock=(0, wall0), offset=off)
         recs.append(rec)
     return recs, mp4s
 
@@ -202,7 +206,9 @@ async def test_loop_passes_start_together_and_groups_increase(tmp_path):
         first = rec.sent[0].payload
         starts.append([s.ts for s in rec.sent if s.payload == first])
     assert [len(s) for s in starts] == [3, 3]
-    assert all(abs(v - a) <= 1_000_000 / 48000 for v, a in zip(*starts))
+    # Mapped audio starts on its own frame grid, within a frame.
+    assert all(abs(v - a) <= 1_000_000 * 1024 / 48000
+               for v, a in zip(*starts))
     for rec in (video, audio):
         hints = [s.hint for s in rec.sent if s.key]
         assert all(a < b for a, b in zip(hints, hints[1:]))
@@ -237,7 +243,7 @@ async def test_near_regular_audio_maps_on_its_frame_grid(starts, timescale):
                              samplerate=48000)
     assert mp4.cadence == (48000, 1024, 1)
     assert mp4.timescale == 48000
-    m = pub_media._frindell_for(mp4, 1_767_225_600_000_000)
+    m = pub_media._frindell_for(mp4)
     rec = _Rec(m)
     await pub_media._feed_mp4_track(
         rec, mp4, NS(duration=10.0, no_pace=True, loop=False),
@@ -253,4 +259,4 @@ def test_irregular_audio_falls_back_to_explicit_timestamps():
     mp4 = pub_media._Mp4Pass(_audio(starts, 48000), Fraction(0),
                              samplerate=48000)
     assert mp4.cadence is None
-    assert not pub_media._frindell_for(mp4, 0).mapped
+    assert not pub_media._frindell_for(mp4).mapped
