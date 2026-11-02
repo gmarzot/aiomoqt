@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import itertools
 import logging
 import math
 import struct
@@ -23,15 +24,17 @@ log = logging.getLogger(__name__)
 
 # -- audio ------------------------------------------------------------
 
-def pcm_tone_frames(duration_s: float = 5.0, freq: float = 440.0,
+def pcm_tone_frames(duration_s: Optional[float] = 5.0, freq: float = 440.0,
                     samplerate: int = 48000, channels: int = 2,
                     frame_ms: int = 20,
                     amplitude: float = 0.25) -> Iterator[Tuple[bytes, int]]:
-    """Yield (payload, timestamp_us) pcm-s16 interleaved sine frames."""
+    """Yield (payload, timestamp_us) pcm-s16 interleaved sine frames;
+    endlessly with `duration_s` None."""
     spf = samplerate * frame_ms // 1000
     peak = int(32767 * amplitude)
-    n_frames = int(duration_s * 1000 / frame_ms)
-    for f in range(n_frames):
+    frames = (itertools.count() if duration_s is None
+              else range(int(duration_s * 1000 / frame_ms)))
+    for f in frames:
         base = f * spf
         pcm = bytearray()
         for i in range(spf):
